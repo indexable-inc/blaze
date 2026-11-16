@@ -283,9 +283,13 @@ fn file(names: &Names<'_>, key: LibKey, module: LibKey) -> Filed {
 /// followed by a type, "Trait implementations" are written `impl Trait for Type`), so a header
 /// that is refused, not lowered, or lowered without its trait is still known to be a trait
 /// impl, and a trait impl is never a candidate of an inherent question.
-fn written_trait<'n>(names: &Names<'_>, at: &super::index::ImplAt<'n>) -> Option<&'n str> {
-    let h = blaze_file_items::impl_header(at.header, names.edition(at.krate), blaze_own::Alloc::global()).ok()?;
-    h.trait_
+/// With it, whether the impl is a BLANKET trait impl: its self type as written is one name that
+/// is one of its own generic parameters (`impl<T> Tr<..> for T`), read from the same tokens
+/// ([`Homes::blanket`] says which questions such an impl can answer).
+fn written_trait<'n>(names: &Names<'_>, at: &super::index::ImplAt<'n>) -> (Option<&'n str>, bool) {
+    let Ok(h) = blaze_file_items::impl_header(at.header, names.edition(at.krate), blaze_own::Alloc::global()) else { return (None, false) };
+    let blanket = h.trait_.is_some() && h.params.iter().any(|p| *p == h.self_ty);
+    (h.trait_, blanket)
 }
 
 /// Whether the trait path `trait_text` of a header is written with no type or const argument:

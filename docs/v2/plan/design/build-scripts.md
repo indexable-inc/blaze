@@ -498,6 +498,52 @@ by default; bindgen's text holds no paths. Proven by a two-run byte compare once
 
 ## For a successor
 
+- **Runner 11: native on the real path, host tools (D71), the builder confined, 2026-11-16.**
+  WRITTEN, NEVER COMPILED (the integrator's lines go here when they come back).
+  - The real path: `script_unit::outputs` asks `native_unit::placed` (`native::runner` of the
+    closure, then `toolchain::placement` by `Setting::mode`) before anything runs. Wasm: as
+    before. Native: `native_unit::native_outputs`: the `script.bin` record with exactly the
+    unit's features (`module_of_native`, identity line `target <host>`; `module_of` now skips
+    those), the env from the same `Given` as wasm (the unit's features, the SERVED unit's cfg:
+    no hard-coded table), the key (`RunnerKey::Native` with the shelf digest, `macos-sdk
+    <Version>`, host tools), `find`, else the package written out under `work/pkg/<key>` (a
+    record's files) or used in place (a member), `OUT_DIR` `work/out/<key>`, `run_script`, and
+    `keep_as` with a coarse read list (every package file's digest). `Setting::native: None`
+    refuses a native script by name (`NativeUnitError::NoNativeSetting`); never wasm after.
+  - D71: `clang.json` `host_tools` (macOS: `perl` at `/usr/bin/perl`, reads
+    `/System/Library/Perl`, `needed_by` `sha3-asm`; Linux none), read by `host_tools`. Found
+    without running perl: `/usr/bin/perl` and `perl5.34` are both a real perl (`otool -L`: each
+    links `/System/Library/Perl/5.34/darwin-thread-multi-2level/CORE/libperl.dylib`; no
+    version wrapper on this host); libperl's `Config.pm` says privlib `/System/Library/Perl/5.34`,
+    archlib its `darwin-thread-multi-2level`, vendorlib `/System/Library/Perl/Extras/5.34`, site
+    `/Library/Perl/5.34`. Granted: the binary (read, execute) and `/System/Library/Perl` (the
+    sealed system volume; already inside the loader's `/System/Library`). NOT granted:
+    `/Library/Perl`, `/Network/Library/Perl` (user-installed modules: not keyed; perl skips an
+    `@INC` folder it cannot read). sha3-asm calls `Command::new("perl")` and reads no variable,
+    so `PATH` is exactly the tools' folders (`/usr/bin`): any other program found there is not
+    granted and its start is refused. Key: `HostToolKey { name, digest }` (the binary's
+    SHA-256), hashed only when a tool is granted (old native keys stand). Mark: the read list
+    is filed under the note `build-script run host-tool` (`host_tools::RUN_KIND_HOST_TOOL`,
+    `host_tools::marked`); the origin's refusal is the store writer's (below).
+  - The builder: `proc_macro_modules`' native mode runs cargo under `native::seatbelt_with`
+    (the deny-by-default profile, one home; `exec_under` adds the toolchain's and the shelf's
+    `bin` and the target folder): reads the vendored sources, the script's own source folder,
+    the pinned toolchain, the shelf, the SDK; writes its workspace, target, `CARGO_HOME`,
+    `TMPDIR`. The wasm mode keeps `seatbelt(work)`.
+  - Which path was refused (design, not built). (a) The unified log: Seatbelt reports every
+    denial not marked `no-report` as a kernel line `Sandbox: <proc>(<pid>) deny(1) <op>
+    <path>`; blaze reads it after a failed run with `/usr/bin/log show --start <t0> --predicate
+    'sender == "Sandbox"'` run outside the sandbox. Needs: attribution to this run (children's
+    pids are short-lived; parallel runs interleave), and it lags by up to a second. (b) A tag:
+    `(deny default (with message "<run key>"))` puts the run's key in each line, which solves
+    (a)'s attribution if macOS 27 honours it (one hostile test decides). (c) A second run under
+    `(allow default (with report))`: rejected: it runs user code wider than its grant (rule 9)
+    and is a second run of the script. (d) An interposer (`DYLD_INSERT_LIBRARIES`): rejected:
+    SIP strips it for `/usr/bin` tools and a static call escapes it. PICK (a) with (b)'s tag:
+    `native_sandbox::run` keeps `t0`, and on a non-zero exit `NativeScriptError::Failed` gains
+    `refused: [(op, path)]` from the tagged lines, each printed beside the script's own error.
+    Not written: it runs `/usr/bin/log`, which needs the tag test first.
+
 - **Runner 10: the first native scripts ran (D69), 2026-11-16.** Built: the pin table
   `crates/hir-ty-codegen/clang.json` (both 23.1.4 rows; `sysroots`: macOS `macos-sdk`, Linux
   `null`, a typed `PinError::NoSysroot`), read by `blaze_build_script::toolchain` (`clang_pin`,

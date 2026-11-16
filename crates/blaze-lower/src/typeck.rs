@@ -6,7 +6,7 @@
 //! dropped: `let` in a condition, a break or continue
 //! with no target (an error already reported), `become`, `yield` and coroutines,
 //! `try` blocks, struct defaults (`..` alone), box patterns, `c"..."` literals, macro calls,
-//! inline assembly, `offset_of!`, const arguments other than literals, a path anchor (`<T as Tr>::x`) in a struct
+//! inline assembly, `offset_of!`, a path anchor (`<T as Tr>::x`) in a struct
 //! path or with more than one segment after it. Lifetime arguments are dropped (the checker
 //! erases regions). A desugaring's lang-item path goes over as one
 //! (`BodyPath::lang`), resolved by the world's `lang_path`. What is dropped because it changes no type: the match and loop
@@ -72,7 +72,118 @@ pub trait Types {
     /// evaluates an array length, its one home. Anything else is a typed refusal at `c`'s
     /// range ([`no_const_arg`] for a caller with no constants).
     fn const_arg(&mut self, view: &View<'_>, c: ConstIdx, tys: &mut PortableTys<'_>) -> Result<PTy, Refused>;
+
+    /// [`Types::const_arg`], or the GAP that leaves the argument a hole ([`ConstTerm::Gap`]):
+    /// what [`to_typeck`] asks. One const argument the caller cannot value must not stop the
+    /// whole body: for a caller that reads the gaps ([`Types::takes_const_gaps`]) the body is
+    /// converted with a hole there (`PNode::Infer`, which the checker makes a const
+    /// variable) and the gap is listed in [`TypeckBody::const_gaps`]. The
+    /// default takes [`no_const_arg`]'s refusal (a caller that evaluates no constant) as
+    /// [`ConstGapWhy::NoEvaluator`]; any other refusal stays one (a caller's "make this
+    /// record first, then convert again" must not be turned into a hole).
+    fn const_term(&mut self, view: &View<'_>, c: ConstIdx, tys: &mut PortableTys<'_>) -> Result<ConstTerm, Refused> {
+        match self.const_arg(view, c, tys) {
+            Ok(t) => Ok(ConstTerm::Is(t)),
+            Err(Refused::Form { what, .. }) if what == NO_CONST_ARG => Ok(ConstTerm::Gap(ConstGapWhy::NoEvaluator)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// The repeat length `len` of `[x; len]` as a const term (the Reference, "Array
+    /// expressions": "the length operand must be either an inferred const or a constant
+    /// expression of type `usize` (e.g. a literal or a constant item)", and a const parameter
+    /// is one, "Const generics": "Const parameters can be used anywhere a const item can be
+    /// used"): a `usize` `ConstValue`, the enclosing item's `ConstParam`, or a gap. The
+    /// default is [`Types::repeat_len`]'s value.
+    fn repeat_term(&mut self, view: &View<'_>, len: ExprId, tys: &mut PortableTys<'_>) -> Result<ConstTerm, Refused> {
+        let n = self.repeat_len(view, len)?;
+        Ok(ConstTerm::Is(tys.usize_value(n).map_err(Refused::Check)?))
+    }
+
+    /// A generic argument of a body path or a method call written as ONE plain name `name`
+    /// (`foo::<N>()`, `W::<SIZE>`; `t` is its type row, found by [`bare_arg_name`]). The
+    /// Reference, "Generic parameters", "Const generics": "When there is ambiguity if a
+    /// generic argument could be resolved as either a type or const argument, it is always
+    /// resolved as a type." So: a type when the name resolves in the type namespace, else a
+    /// const term (a const parameter's `ConstParam`, a constant item's `ConstValue`), or a
+    /// gap. The default reads it as a type ([`Types::ty`]): a caller that resolves no name.
+    fn name_arg(&mut self, view: &View<'_>, t: TypeId, name: &str, tys: &mut PortableTys<'_>) -> Result<ConstTerm, Refused> {
+        let _ = name;
+        self.ty(view, t, tys).map(ConstTerm::Is)
+    }
+
+    /// Whether this caller READS [`TypeckBody::const_gaps`] and reports a body with one as
+    /// not checked clean. Only then is a gap a hole and the body converted; otherwise
+    /// (the default) a gap is the body's refusal by name ([`ConstGapWhy::refusal`]), as
+    /// before there were gaps: a hole is a const variable that takes any value, so a caller
+    /// that did not look would pass a body it never checked.
+    fn takes_const_gaps(&self) -> bool {
+        false
+    }
 }
+
+impl ConstGapWhy {
+    /// The words of the body's refusal for a caller that takes no gaps
+    /// ([`Types::takes_const_gaps`]).
+    pub const fn refusal(self) -> &'static str {
+        match self {
+            ConstGapWhy::NoEvaluator => NO_CONST_ARG,
+            ConstGapWhy::OverGeneric => "a constant expression over a generic parameter",
+            ConstGapWhy::AnonInBody => "an anonymous constant in a body",
+            ConstGapWhy::NegativeNoSuffix => "a negative const argument with no suffix",
+        }
+    }
+}
+
+/// What a caller answers for a const term of a body: its portable form, or why it has none
+/// yet (the body goes on with a hole there).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConstTerm {
+    Is(PTy),
+    Gap(ConstGapWhy),
+}
+
+/// Why a const term of a body is a hole. None is an error of the program: each is a form
+/// blaze cannot value yet.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ConstGapWhy {
+    /// The caller evaluates no constant ([`no_const_arg`]).
+    NoEvaluator,
+    /// A constant expression over a generic parameter (`{ N + 1 }`, `{ size_of::<T>() }`,
+    /// `T::LEN`): blaze-typeck's type form has `ConstParam` and `ConstValue` only, no node for
+    /// an unevaluated expression.
+    OverGeneric,
+    /// An anonymous constant in a body (`{ A + 1 }`, `{ u32::MAX }`, `Ty::LEN`) whose type is
+    /// not known where the body is converted (the parameter it is an argument of is the
+    /// checker's to find), so no constant item can be made of it.
+    AnonInBody,
+    /// A negated literal with no suffix (`Foo::<-1>`): its bits depend on the width of the
+    /// parameter's type, which the checker finds.
+    NegativeNoSuffix,
+}
+
+/// Where a const term of a body is written.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ConstSite {
+    /// A generic argument of a path segment or a method call.
+    Arg,
+    /// The length of `[x; len]`.
+    RepeatLen,
+}
+
+/// One const term of a body left a hole: why, where it is written and its range in the
+/// item's text (the constant is named by that text). A body with one is CHECKED, never
+/// checked clean: its caller reports the gap and takes no diagnostic and no record from the
+/// check as final (a hole unifies with any value).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConstGap {
+    pub why: ConstGapWhy,
+    pub site: ConstSite,
+    pub range: blaze_surface::Range,
+}
+
+/// [`no_const_arg`]'s words: what [`Types::const_term`]'s default takes as a gap.
+pub const NO_CONST_ARG: &str = "a const argument that is no literal (this caller evaluates no constant)";
 
 /// [`Types::const_arg`]'s refusal for a caller that evaluates no constant, at `c`'s range.
 pub fn no_const_arg(view: &View<'_>, c: ConstIdx) -> Refused {
@@ -80,7 +191,23 @@ pub fn no_const_arg(view: &View<'_>, c: ConstIdx) -> Refused {
         Ok(r) => r,
         Err(e) => return e,
     };
-    Refused::Form { what: "a const argument that is no literal (this caller evaluates no constant)", range }
+    Refused::Form { what: NO_CONST_ARG, range }
+}
+
+/// The name of a type argument written as one plain identifier with no arguments (`N`, `T`,
+/// `u8`): the form [`Types::name_arg`] decides (a type or a constant by what it resolves to).
+pub fn bare_arg_name<'v>(view: &View<'v>, t: TypeId) -> Result<Option<&'v str>, Refused> {
+    let TypeRef::Path(p) = view.ty(t)? else { return Ok(None) };
+    let path = view.path(p)?;
+    let [n] = view.segments(path)? else { return Ok(None) };
+    let s = Segment::decode(*n)?;
+    if path.absolute || s.has_args || s.parenthesized || s.kind != SegKind::Ident {
+        return Ok(None);
+    }
+    match s.name {
+        Some(name) => Ok(Some(view.name_text(name)?)),
+        None => Ok(None),
+    }
 }
 
 /// A body in blaze-typeck's form: the columns [`TypeckBody::view`] lends.
@@ -106,6 +233,9 @@ pub struct TypeckBody<'a> {
     pub opt_types: AVec<'a, Option<PTy>>,
     pub fmt_uses: AVec<'a, tc::FmtUse>,
     pub coroutine: Option<tc::CoroutineKind>,
+    /// Every const term of the body left a hole ([`ConstGap`]), in the order met. Not empty:
+    /// the body is checked, never checked clean.
+    pub const_gaps: AVec<'a, ConstGap>,
 }
 
 impl<'a> TypeckBody<'a> {
@@ -427,7 +557,16 @@ impl Conv<'_, '_, '_, '_, '_> {
         let mut at: AVec<'_, PTy> = Vec::new_in(*self.out.type_lists.allocator());
         for &n in rows {
             match GenericArg::decode(n)? {
-                GenericArg::Type(t) => at.push(self.ty(t)?),
+                // One plain name (`foo::<N>()`, `W::<SIZE>`) parses as a type and is a type
+                // or a constant by what it resolves to: the caller's ([`Types::name_arg`]).
+                GenericArg::Type(t) => match bare_arg_name(self.v, t)? {
+                    Some(name) => {
+                        let term = self.types.name_arg(self.v, t, name, self.tys)?;
+                        let tr = self.v.type_range(t)?;
+                        at.push(self.term(term, ConstSite::Arg, tr)?);
+                    }
+                    None => at.push(self.ty(t)?),
+                },
                 GenericArg::Lifetime(_) => {}
                 GenericArg::Const(c) => at.push(self.const_arg(c)?),
                 _ => return self.refuse("an associated item constraint", r),
@@ -438,24 +577,45 @@ impl Conv<'_, '_, '_, '_, '_> {
         Ok((List { start, len: len(at.len()) }, !at.is_empty()))
     }
 
+    /// The caller's answer for a const term written at `r`: its type, or a hole (`_`, which
+    /// the checker makes a const variable) with the gap listed ([`TypeckBody::const_gaps`]):
+    /// the body goes on.
+    fn term(&mut self, term: ConstTerm, site: ConstSite, r: BodyRange) -> Result<PTy, Refused> {
+        match term {
+            ConstTerm::Is(t) => Ok(t),
+            ConstTerm::Gap(why) => {
+                let range = self.v.site(r)?;
+                // A caller that does not read the gaps must never get a hole it would take
+                // for a checked constant: for it the gap is the body's refusal, by name.
+                if !self.types.takes_const_gaps() {
+                    return Err(Refused::Form { what: why.refusal(), range });
+                }
+                self.out.const_gaps.push(ConstGap { why, site, range });
+                Ok(self.tys.intern(tc::PNode::Infer).map_err(Refused::Check)?)
+            }
+        }
+    }
+
     /// A const argument written as a constant (the Reference, "Generic arguments": a literal,
     /// a negated literal or a block; a path parses as a type argument and comes through
-    /// [`Types::ty`]): `true`/`false`, a plain `char` and an integer become a
+    /// [`Types::name_arg`]): `true`/`false`, a plain `char` and an integer become a
     /// `ConstValue`. An unsuffixed integer's type is a hole the checker fills from the
-    /// parameter's declared type. A block or a path is the caller's ([`Types::const_arg`]);
-    /// a negated literal without a suffix is refused by name.
+    /// parameter's declared type. A block or a path is the caller's ([`Types::const_term`]);
+    /// what it cannot value, and a negated literal without a suffix, is a hole with its gap
+    /// listed ([`Conv::term`]), never the body's refusal.
     fn const_arg(&mut self, c: ConstIdx) -> Result<PTy, Refused> {
         let r = self.v.const_range(c)?;
         let text = self.v.text_at(r)?.trim();
         let Some(value) = const_literal(text) else {
-            return self.types.const_arg(self.v, c, self.tys);
+            let term = self.types.const_term(self.v, c, self.tys)?;
+            return self.term(term, ConstSite::Arg, r);
         };
         let ty = match value.ty {
             ConstLitTy::Bool => tc::PNode::Bool,
             ConstLitTy::Char => tc::PNode::Char,
             ConstLitTy::Int(s) => match int_suffix_node(s) {
                 Some(n) => n,
-                None if value.negative => return self.refuse("a negative const argument with no suffix", r),
+                None if value.negative => return self.term(ConstTerm::Gap(ConstGapWhy::NegativeNoSuffix), ConstSite::Arg, r),
                 None => tc::PNode::Infer,
             },
         };
@@ -641,8 +801,9 @@ impl Conv<'_, '_, '_, '_, '_> {
             Expr::Tuple { elems } => tc::Expr::Tuple { elems: self.exprs(elems)? },
             Expr::Array { elems } => tc::Expr::Array { elems: self.exprs(elems)? },
             Expr::Repeat { elem, len } => {
-                let n = self.types.repeat_len(self.v, len)?;
-                tc::Expr::Repeat { elem, len: self.tys.usize_value(n)?, count: Some(len) }
+                let term = self.types.repeat_term(self.v, len, self.tys)?;
+                let lr = self.v.expr_range(len)?;
+                tc::Expr::Repeat { elem, len: self.term(term, ConstSite::RepeatLen, lr)?, count: Some(len) }
             }
             Expr::Struct { path, fields, base } => {
                 let base = match base {
@@ -870,6 +1031,7 @@ pub fn to_typeck<'a>(
         opt_types: Vec::new_in(alloc),
         fmt_uses: Vec::new_in(alloc),
         coroutine: None,
+        const_gaps: Vec::new_in(alloc),
     };
     let mut slice_rest: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(view.pats.len(), alloc);
     slice_rest.resize(view.pats.len(), false);

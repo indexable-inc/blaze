@@ -221,7 +221,7 @@ pub struct Front2Program<'n> {
 /// The lang traits the seam's own `Option` answers name (`drop_trait`, `lang_trait_fn`):
 /// each looked up once in [`Front2Program::make`], a refusal stopping the program by the item's
 /// name there, so those answers never meet a lookup that fails.
-const SEAM_LANGS: [LangItem; 6] = [LangItem::Drop, LangItem::Deref, LangItem::DerefMut, LangItem::Fn, LangItem::FnMut, LangItem::FnOnce];
+const SEAM_LANGS: [LangItem; 8] = [LangItem::Drop, LangItem::Deref, LangItem::DerefMut, LangItem::Fn, LangItem::FnMut, LangItem::FnOnce, LangItem::Index, LangItem::IndexMut];
 
 fn lang_of(front: &Front2<'_>, item: LangItem) -> Result<Option<ItemKey>, crate::seam::LangRefusal> {
     match super::langs::find(&front.index, front.resolver, item) {
@@ -257,6 +257,30 @@ const MOST_OBJECT_TRAITS: usize = 1024;
 /// The constants one ADT head may name before its row is given up on (reach.rs's
 /// `MOST_LENS`): a pattern type's ends, an array length.
 const MOST_ADT_LENS: u32 = 64;
+
+/// Every static `bodies` name, evaluated once ([`super::statics::static_values`]); one
+/// refused is named: in a survey filed in `left_out` and left out (each reader's build then
+/// names it: the builder's `NoStatic`), in a run the program's refusal.
+fn made_statics<'c>(
+    r: &mut Records<'_, '_>,
+    bodies: impl Iterator<Item = &'c Checked<'static>>,
+    mut left_out: Option<&mut Vec<(Box<str>, Box<str>), Global>>,
+    left: &mut HashMap<ItemKey, Box<str>, Global>,
+) -> Result<super::statics::Statics, Front2Refusal> {
+    let (statics, refused) = super::statics::static_values(r, bodies);
+    for (k, why) in refused {
+        let static_ = fn_shown(r, k).into_boxed_str();
+        match left_out.as_deref_mut() {
+            Some(out) => {
+                let class = format!("static: {why}").into_boxed_str();
+                left.insert(k, class.clone());
+                out.push((static_, class));
+            }
+            None => return Err(Front2Refusal::Static { static_, why }),
+        }
+    }
+    Ok(statics)
+}
 
 /// Each constant item `bodies` read by value (`Def::Const` in a checked body's `expr_defs`:
 /// what the builder's `Adts::const_value` asks), evaluated once by front2's evaluator
@@ -465,7 +489,7 @@ impl<'n> Front2Program<'n> {
             },
         };
         let first = match &mut checked {
-            Some(c) => First::Checked(c),
+            Some(c) => First::CheckedBody(&main, c),
             None => First::Unchecked(&main),
         };
         let census = reach(&mut records, prepared, main.owner, first, &scope);
@@ -1153,8 +1177,13 @@ impl FrontEnd for Front2Program<'_> {
         self.fns.get(*self.by_key.get(&key)?)?.intrinsic
     }
 
-    fn static_item(&self, _: ItemKey) -> Option<StaticItem> {
-        None
+    /// A static the program reaches: its head's mutability and `#[thread_local]` (statics.rs).
+    fn static_item(&self, key: ItemKey) -> Option<StaticItem> {
+        self.statics.kind(key)
+    }
+
+    fn static_records(&self) -> &[(ItemKey, DataRecord<Global>)] {
+        &self.statics.values
     }
 
     /// A tuple struct's or variant's ctor: its ADT and the variant's index there.

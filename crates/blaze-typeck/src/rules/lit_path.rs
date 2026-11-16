@@ -20,6 +20,9 @@ use crate::portable::{PNode, PTy, PTys};
 use crate::ty::{Cause, Goal, Ty, TyList, TyView, TypeCtx, VarKind};
 use crate::world::{AssocKind, CtorKind, Def, FnSig, PathRes, Shape, World};
 
+/// The segment `Self` (`Name::of`, as the world spells every name).
+const SELF_NAME: Name = Name::of("Self");
+
 /// Why a body path has no definition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Unresolved {
@@ -198,6 +201,14 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
             return self.lower_body_ty(t, at);
         };
+        // A hole for a const parameter is a const variable, as an array length's hole is
+        // (`lower_len`), never a type variable (which is E0747 below): `_` as written (the
+        // Reference, "Const generics": a const argument may be an "inferred const"), and a
+        // const argument the front end could not value (blaze-lower `ConstGap`: the gap is
+        // the front end's to report; here it takes the one value that makes the body check).
+        if let PNode::Infer = node {
+            return self.ty.fresh(VarKind::Const).map_err(Stop::from);
+        }
         let empty = self.mk_list(&[])?;
         let d = self.lower(dtypes, d, Lower::Args(empty), at.cause())?;
         if let PNode::ConstValue { ty, bits } = node
@@ -293,6 +304,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         };
         let consumed = res.consumed as usize;
         if consumed == segs.len() {
+            // The world answers `Self` in an impl of an ADT with its type (`Def::Adt`, one
+            // segment): as a value it is the struct's constructor ([`Self::self_ctor_value`]).
+            if let (Def::Adt(adt), [seg]) = (res.def, segs) {
+                if seg.name == SELF_NAME {
+                    return self.self_ctor_value(at, cause, adt, *seg);
+                }
+            }
             return self.value_def(at, cause, res.def, segs);
         }
         if consumed + 1 != segs.len() || consumed == 0 {
@@ -423,6 +441,56 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         };
         self.register_trait(tr, trait_args, cause)?;
         self.assoc_item_ty(at, cause, item.item, item.kind, trait_args, Some(*seg))
+    }
+
+    /// `Self` used as a value in an impl (the Reference, "Paths", "`Self`": "In an
+    /// implementation, it refers to the type being implemented. When implementing a tuple or
+    /// unit struct, it also refers to the constructor in the value namespace."): the struct's
+    /// ctor through the one home for ctors ([`Self::ctor_ty`]), at the arguments of the impl's
+    /// own self type as the body sees them (`Self(t)` in `impl<T> W<T>` builds `W<T>`, not a
+    /// `W` at fresh arguments). A braced struct, an enum or a union has no ctor in the value
+    /// namespace: E0423, as its name gives. Only the segment `Self` takes this rule: a `type`
+    /// alias does not (the Reference, "Type aliases": "A type alias to a tuple-struct or
+    /// unit-struct cannot be used to qualify that type's constructor"), so `type A = S; A(1)`
+    /// stays E0423 through [`Self::value_def`].
+    fn self_ctor_value(&mut self, at: At, cause: Cause, adt: ItemKey, seg: Segment) -> Result<Ty, Stop> {
+        let name = Some(seg.name);
+        let header = match self.reads.assoc_parent(self.body.owner)? {
+            Some(parent) => self.reads.impl_header(parent.container)?,
+            None => None,
+        };
+        // `Self` outside an impl (a trait's default body answers `Def::TyParam`, not here).
+        let Some(h) = header else {
+            self.diag(DiagCode::NotAValue, at, None, None, name);
+            return Ok(self.common.err);
+        };
+        let self_ty = self.lower(h.types, h.self_ty, Lower::Body, cause)?;
+        let self_ty = self.try_structurally_resolve(self_ty)?;
+        let args = match self.view(self_ty) {
+            TyView::Adt(k, args) if k == adt => args,
+            // The world's `Self` and the impl's header name different types: no value to give.
+            _ => {
+                self.diag(DiagCode::UnresolvedPath, at, None, Some(self_ty), name);
+                return Ok(self.common.err);
+            }
+        };
+        let Some(info) = self.reads.adt(adt)? else {
+            self.diag(DiagCode::UnresolvedPath, at, None, None, name);
+            return Ok(self.common.err);
+        };
+        let first = info.variants.first().map(|v| (v.key, v.ctor));
+        let (vkey, ctor) = match (info.kind, first) {
+            (crate::world::AdtKind::Struct, Some(v)) => v,
+            _ => {
+                self.diag(DiagCode::NotAValue, at, None, Some(self_ty), name);
+                return Ok(self.common.err);
+            }
+        };
+        let t = self.ctor_ty(at, adt, Some(vkey), ctor, args, name)?;
+        if !self.is_err(t) {
+            self.defs.push((at, Def::Ctor { adt, variant: 0, kind: ctor }));
+        }
+        Ok(t)
     }
 
     /// A fully resolved value definition, recorded at its node (`Checked::expr_defs`,

@@ -28,6 +28,7 @@ use blaze_typeck as tc;
 use super::types::Why;
 use super::spell::Spelling;
 use crate::front::FnLang;
+use super::back_needs::BackNeeds;
 
 /// The most fns one walk visits (rule 18: a table has a cap), sized by need: a walk reaches
 /// only fns of the program's crates, and the toolchain's core alone holds 29,243 fn heads
@@ -77,7 +78,11 @@ pub struct Census<'n> {
 /// Where a walk starts: a body that checked, or one that did not, whose calls by name are
 /// still followed ([`queue_by_name`]) so the walk is total.
 pub enum First<'a, 'c, 'n> {
+    /// A body that checked, without its lowering: what the builder calls for a
+    /// `format_args!` or an overloaded index it writes is not read ([`BackNeeds`]).
     Checked(&'a mut Checked<'c>),
+    /// A body that checked, with its lowering: read whole, as every body the walk checks.
+    CheckedBody(&'a Body<'n>, &'a mut Checked<'c>),
     Unchecked(&'a Body<'n>),
 }
 
@@ -249,9 +254,17 @@ pub fn reach<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, owner: ItemKe
         });
     }
     let mut census = Census { fns: Vec::new_in(Global), bodies: Vec::new_in(Global), capped: false, queued: 0, not_followed: 0 };
+    // What the builder calls on its own for what the reached bodies write, queued as read.
+    let mut needs = BackNeeds::new();
     let first: Option<&Checked<'_>> = match first {
         First::Checked(c) => {
             queue_targets(r, scope, owner, c, &mut queue);
+            needs.read(r, owner, None, c, &mut queue, &mut census.fns);
+            Some(c)
+        }
+        First::CheckedBody(body, c) => {
+            queue_targets(r, scope, owner, c, &mut queue);
+            needs.read(r, owner, Some(body), c, &mut queue, &mut census.fns);
             Some(c)
         }
         First::Unchecked(body) => {
@@ -333,6 +346,7 @@ pub fn reach<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, owner: ItemKe
             Ok(mut c) => {
                 queue_targets(r, &scope, body.owner, &mut c, &mut queue);
                 census.fns.push((k, Reached::Checked));
+                needs.read(r, body.owner, Some(&body), &c, &mut queue, &mut census.fns);
                 Some(c)
             }
             Err(e) => {
@@ -348,7 +362,7 @@ pub fn reach<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, owner: ItemKe
             census.bodies.push((body, c));
         }
     }
-    if census.capped || !instances.round(r, first, &census, &mut queue) {
+    if census.capped || !instances.round(r, first, &census, &needs, &mut queue) {
         break;
     }
     }
@@ -377,7 +391,7 @@ struct Instances {
 
 impl Instances {
     /// Queues the impl fns of the questions not asked yet; whether it queued any.
-    fn round(&mut self, r: &mut Records<'_, '_>, first: Option<&Checked<'_>>, census: &Census<'_>, queue: &mut Vec<(ItemKey, Option<Reached>), Global>) -> bool {
+    fn round(&mut self, r: &mut Records<'_, '_>, first: Option<&Checked<'_>>, census: &Census<'_>, needs: &BackNeeds, queue: &mut Vec<(ItemKey, Option<Reached>), Global>) -> bool {
         let mut add = |tys: tc::PTys<'_>, shapes: &mut HashMap<tc::Shape, (), Global>| {
             for i in 0..tys.nodes.len() {
                 if let Some(s) = shape_of(tys, tc::PTy(i as u32)) {
@@ -405,6 +419,16 @@ impl Instances {
         }
         if let Some(Ok(drop)) = r.index.lang("drop").map(|lib| r.keys.item(lib)) {
             traits.push((drop, Box::from("drop")));
+        }
+        // `a[b]` on a type that is not an array or a slice: the builder calls the selected
+        // `Index::index` / `IndexMut::index_mut` impl fn, which no checked body names
+        // (back_needs.rs). Asked only once a reached body writes one.
+        if needs.overloaded_index {
+            for (lang, name) in [("index", "index"), ("index_mut", "index_mut")] {
+                if let Some(Ok(tr)) = r.index.lang(lang).map(|lib| r.keys.item(lib)) {
+                    traits.push((tr, Box::from(name)));
+                }
+            }
         }
         traits.sort_unstable();
         traits.dedup();

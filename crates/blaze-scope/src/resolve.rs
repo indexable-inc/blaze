@@ -1928,7 +1928,10 @@ fn make_blocks<'a, S: SourceTexts<'a>>(base: &Base<'_, 'a, S>, run: &Run<'a>, bo
     while let Some(body) = work.pop() {
         let nested = blaze_file_items::nested::scan(body.text, alloc);
         // An unbalanced body is the parser's error to report; nothing is read from it.
-        if nested.end != blaze_file_items::nested::NestedEnd::Whole || !nested.has_impl() {
+        // A block is a module when it holds an impl, or a struct, enum, union or type alias
+        // (its head is made in the block's module by the ordinary code; front2's
+        // `Locals::keep` derives the same module key with `blocks::block_modules`).
+        if nested.end != blaze_file_items::nested::NestedEnd::Whole || !nested.makes_module() {
             continue;
         }
         if body.depth >= MAX_BLOCK_DEPTH {

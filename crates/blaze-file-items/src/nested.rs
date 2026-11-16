@@ -99,6 +99,25 @@ impl Nested<'_> {
     pub fn has_impl(&self) -> bool {
         self.items.iter().any(|i| i.kind == NestedKind::Impl)
     }
+
+    /// Whether any block holds an item that makes it a scope record
+    /// ([`NestedKind::makes_module`]).
+    pub fn makes_module(&self) -> bool {
+        self.items.iter().any(|i| i.kind.makes_module())
+    }
+}
+
+impl NestedKind {
+    /// Whether an item of this kind makes its block a scope record of the names library (an
+    /// unnamed module of the item's module): an `impl` (it holds for its type in the whole
+    /// program, and its header is read in the block), and a struct, enum, union or type alias
+    /// (the Reference, "Statements", "Item declarations": "Declaring an item within a
+    /// statement block restricts its scope to the block containing the statement": a type
+    /// with a head of its own, named by the bodies and impls of that block). A block's `fn`,
+    /// `const`, `static` and `use` alone make none: the body's own lowering resolves them.
+    pub fn makes_module(self) -> bool {
+        matches!(self, NestedKind::Impl | NestedKind::Struct | NestedKind::Enum | NestedKind::Union | NestedKind::TypeAlias)
+    }
 }
 
 /// An open bracket of the body.

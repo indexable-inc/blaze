@@ -26,6 +26,14 @@
 //! not change between the arm's test and its drop). Refused by name: a move out of a type that
 //! implements `Drop` (E0509), from behind a reference, inside an or-pattern or a slice, a guard
 //! on an arm that moves, a zero-sized part, and more than 64 parts of one value.
+//!
+//! The same bits serve a move by a place expression (`let a = t.0;`, `move_field`: the local
+//! gets its word in `scan_field_moves`) and an assignment over a local's part (`assign_over`:
+//! [expr.assign.drop-target]: "It then has the effect of first dropping the value at the
+//! assigned place, unless the place is an uninitialized local variable or an uninitialized
+//! field of a local variable": the old
+//! value drops by its bits, then every bit at or under the place is set again). An assignment
+//! is walked once, so a part first moved later inside the same loop is refused (`part_bit`).
 
 use core::alloc::Allocator;
 
@@ -33,7 +41,7 @@ use blaze_lir::builder::MemAttrs;
 use blaze_lir::func::{SlotId, SlotKind};
 use blaze_lir::{Block, Flags, IntCond, Op, Ty, Value};
 use blaze_own::Vec;
-use blaze_typeck::{Expr, ExprId, PNode, PTy, Pat, PatId};
+use blaze_typeck::{AdjustKind, Expr, ExprId, PNode, PTy, Pat, PatId};
 
 use super::{Held, NO_EXPR, Owner, Repr, Shape, V, Walk, malformed, unsupported};
 use crate::BuildError;
@@ -501,11 +509,12 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     }
 
     /// `let a = t.f.g;`: a move out of a local's field by a place expression `e` (its value
-    /// at `at`, held as `repr`, which needs drop). The Reference, "Moved and copied types":
-    /// "When a place expression is evaluated in a value expression context ... If the type of
-    /// that value implements `Copy`, then the value will be copied. ... Otherwise, if the place
-    /// is a field of a local variable, the value is moved out of the field" (partially moving
-    /// the variable); "Destructors": "If a variable has been partially initialized, only its
+    /// at `at`, held as `repr`, which needs drop). The Reference, [expr.move.movable-place]:
+    /// "Only the following place expressions may be moved out of: Variables which are not
+    /// currently borrowed. Temporary values. Fields of a place expression which can be moved
+    /// out of and don't implement `Drop`. ..."; [expr.move.deinitialization]: "After moving out
+    /// of a place expression that evaluates to a local variable, the location is deinitialized
+    /// and cannot be read from again until it is reinitialized"; "Destructors": "If a variable has been partially initialized, only its
     /// initialized fields are dropped". The part's bit in the local's word is cleared; the
     /// local's scope end drops the rest (`drop_moved`). The value is copied out first: a later
     /// assignment over the field in the same expression must not change it. Refused by name: a
@@ -529,25 +538,114 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     }
 
     /// `lhs = v` over a value of type `g` at `at` (held as `repr`, needing drop), not a whole
-    /// local. The Reference, "Assignment expressions": "Assigning to an operand drops the
-    /// current value of the assigned place unless the place is an uninitialized local variable
-    /// or an uninitialized field of a local variable." For a field of a local with field flags:
+    /// local. The Reference, [expr.assign.drop-target]: "It then has the effect of first
+    /// dropping the value at the assigned place, unless the place is an uninitialized local
+    /// variable or an uninitialized field of a local variable." For a field of a local with field flags:
     /// the old value drops minus its moved parts (each part's bit tested: a statically moved
     /// field is not dropped, one moved under a branch is dropped by its bit), then the store,
     /// then the bits of the field and of every part under it are set: it is initialized
     /// again, dropped at the scope's end. The assigned field gets a bit of its own, so a move
     /// of it walked later shares it. Anything else: the old value drops whole.
     pub(super) fn assign_over(&mut self, lhs: ExprId, g: PTy, at: (Value, i32), v: V, repr: Repr) -> Result<(), BuildError> {
-        let Some((_, mask, start, len, _)) = self.field_path(lhs)? else {
+        let path = self.field_path(lhs)?;
+        // Under a type that implements `Drop` nothing moves (E0509), and its glue must run
+        // whole: no part there.
+        let Some((_, mask, start, len, false)) = path else {
+            if let Some((.., start, _, true)) = path {
+                self.moves.steps.truncate(start as usize);
+            }
             self.drop_at(g, at)?;
             return self.store(v, repr, at);
         };
-        if self.part_bit(mask, start, len, 0, None)?.is_none() {
+        let Some(bit) = self.part_bit(mask, start, len, 0, None)? else {
             return Err(unsupported(lhs, "an assignment naming more than 64 parts of one local (its word)"));
+        };
+        // The part `part_bit` found or made (an equal one found gives the steps back).
+        let me = *self.moves.parts.iter().find(|q| q.mask == mask && q.bit == bit).ok_or(malformed("an assigned part missing from its word"))?;
+        self.moves.assigned.push(Assigned { mask, start: me.start, len: me.len, by: lhs });
+        let mut ps: Vec<u32, A> = Vec::new_in(self.alloc.clone());
+        let mut bits = 0u64;
+        for (i, q) in self.moves.parts.iter().enumerate() {
+            if q.mask == mask && self.part_under(*q, me.start, me.len) {
+                ps.push(i as u32);
+                bits |= 1u64 << q.bit;
+            }
         }
-        // The part `part_bit` found or made: its path (the steps pushed may have gone back).
-        let me = self.moves.parts.iter().rposition(|q| q.mask == mask && q.len == len && self.part_under(*q, q.start, len)).copied();
-        let _ = me;
+        self.drop_tree(Node { g, off: 0, depth: me.len, rep: ps.first().copied(), field_bit: None }, at, mask, false, &ps)?;
+        self.store(v, repr, at)?;
+        let fa = self.b.slot_addr(mask);
+        let word = self.b.load(Ty::I64, Flags::NONE, fa, 0, MemAttrs::aligned(3));
+        let set = self.b.iconst(Ty::I64, u128::from(bits));
+        let held = self.b.binary(Op::Or, Flags::NONE, word, set);
+        self.b.store(Flags::NONE, held, fa, 0, MemAttrs::aligned(3));
+        Ok(())
+    }
+
+    /// `p = v` over a whole local `p` with field flags, by expression `e` (walk.rs drops what
+    /// it holds by `drop_owned` and sets every bit by `hold_all`): kept so a part moved later
+    /// in the same loop is refused (`part_bit`), as this drop, walked first, does not test it.
+    pub(super) fn note_whole_assign(&mut self, e: ExprId, p: PatId) {
+        if let Some(mask) = self.owned[p.ix()].and_then(|o| o.rest) {
+            // The empty path: every part is under it.
+            self.moves.assigned.push(Assigned { mask, start: 0, len: 0, by: e });
+        }
+    }
+
+    /// `scan_flags`, with `parent` per expression: a local some field of which is moved out by
+    /// a place expression (`let a = t.f;`: a chain of fields of the local, of a type that needs
+    /// drop, in a value context) gets field flags (`partial`). A chain used in place (borrowed,
+    /// assigned to, the base of a further field or index, matched) moves nothing.
+    pub(super) fn scan_field_moves(&mut self, parent: &[(u32, bool)]) -> Result<(), BuildError> {
+        for i in 0..self.body.exprs.len() {
+            let e = ExprId(i as u32);
+            if !matches!(self.expr(e)?, Expr::Field { .. } | Expr::TupleField { .. }) {
+                continue;
+            }
+            // The context: the parent of the outermost parenthesis around it.
+            let mut c = i as u32;
+            while let Some(&(up, _)) = parent.get(c as usize)
+                && up != NO_EXPR
+                && let Expr::Paren(_) = self.expr(ExprId(up))?
+            {
+                c = up;
+            }
+            let up = parent.get(c as usize).map_or(NO_EXPR, |&(up, _)| up);
+            let rows = self.adjust_rows(ExprId(c));
+            let borrowed_first = matches!(
+                self.checked.adjusts.column::<1>().get(rows.start).filter(|_| !rows.is_empty()),
+                Some(AdjustKind::Borrow { .. } | AdjustKind::Deref { .. })
+            );
+            let in_place = borrowed_first
+                || up != NO_EXPR
+                    && match self.expr(ExprId(up))? {
+                        Expr::Ref { operand, .. } | Expr::RawRef { operand, .. } => operand.0 == c,
+                        Expr::Field { base, .. } | Expr::TupleField { base, .. } | Expr::Index { base, .. } => base.0 == c,
+                        Expr::Assign { lhs, .. } | Expr::AssignOp { lhs, .. } => lhs.0 == c,
+                        Expr::Match { scrutinee, .. } => scrutinee.0 == c,
+                        Expr::Let { init, .. } => init.0 == c,
+                        _ => false,
+                    };
+            if in_place {
+                continue;
+            }
+            // Down the chain to its local, if it is one (locals only: an inline constant's body
+            // names none, so every chain reached is typed in this body).
+            let mut cur = e;
+            let x = loop {
+                match self.expr(cur)? {
+                    Expr::Paren(inner) | Expr::Field { base: inner, .. } | Expr::TupleField { base: inner, .. } => cur = inner,
+                    Expr::Local(x) => break Some(x),
+                    _ => break None,
+                }
+            };
+            let Some(x) = x else { continue };
+            // The field's own type: what moves (a coercion after it applies to the moved value).
+            let t = self.expr_ty(e)?;
+            let g = self.ground_ty(t).map_err(|error| Self::ty_err(e, error))?;
+            if self.needs_drop(g).map_err(|error| Self::ty_err(e, error))? {
+                *self.partial.get_mut(x.ix()).ok_or(malformed("a local past `pats`"))? = true;
+            }
+        }
         Ok(())
     }
 

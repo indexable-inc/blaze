@@ -37,6 +37,7 @@ mod numbers;
 mod moves;
 mod strs;
 mod temps;
+mod unsized_tail;
 
 /// The target's pointer width: the ladder runs on AArch64.
 const PTR_BITS: u32 = 64;
@@ -388,6 +389,9 @@ struct Walk<'x, 'c, 't, A: Allocator + Clone> {
     layout_field_tys: Vec<PTy, A>,
     /// Per enum variant laid out: its fields' range of `layout_fields` (first, len).
     layout_variants: Vec<(u32, u32), A>,
+    /// The rows of `layouts` that are a struct or tuple whose last field is unsized (a slice
+    /// or `str` tail: walk/unsized_tail.rs); never held by value.
+    unsized_tails: Vec<u32, A>,
     /// Per pattern: the binding's home and how its value is held.
     slots: Vec<Option<(Home, Repr)>, A>,
     /// Per block made: whether a reachable edge leads to it.
@@ -641,6 +645,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         layout_fields: Vec::new_in(alloc.clone()),
         layout_field_tys: Vec::new_in(alloc.clone()),
         layout_variants: Vec::new_in(alloc.clone()),
+        unsized_tails: Vec::new_in(alloc.clone()),
         slots,
         reached: Vec::new_in(alloc.clone()),
         live: true,
@@ -784,6 +789,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             // A closure: a struct of one field, its environment (closure.rs).
             PNode::Adt(..) | PNode::Tuple(_) | PNode::Array(..) | PNode::Closure { .. } => {
                 let l = self.layout(g)?;
+                // An unsized tail's struct is only ever behind a pointer (walk/unsized_tail.rs).
+                if self.has_unsized_tail(l) {
+                    return Err(TyErr::Unsupported(unsized_tail::UNSIZED_BY_VALUE));
+                }
                 if self.layouts[l as usize].size == 0 { Repr::None } else { Repr::Agg(l) }
             }
             // A wide pointer (lib.rs, "Wide pointers") when its pointee is unsized, by `ls`.
@@ -1049,9 +1058,15 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             // The size, alignment and every offset are `ls`'s (rule 30: one layout).
             let id = self.ls_of(t)?;
             let lt = *self.ls.get(id);
-            if lt.tail != Tail::Sized {
-                return Err(TyErr::Malformed("an unsized type held by value"));
-            }
+            // A struct or tuple ending in a slice or `str` (walk/unsized_tail.rs): a row of its
+            // fields at `ls`'s offsets, the tail's with no representation; `repr` refuses it by
+            // value. A `dyn` tail's offset is the vtable's alignment's, a run-time value.
+            let unsized_tail = match lt.tail {
+                Tail::Sized => false,
+                Tail::Slice { .. } if !is_enum && !is_union && array_len.is_none() => true,
+                Tail::Slice { .. } => return Err(TyErr::Malformed("an enum, union or array with an unsized tail")),
+                Tail::Dyn => return Err(TyErr::Unsupported("a struct with a `dyn` tail: its tail's offset needs the vtable's alignment")),
+            };
             let size = u32::try_from(lt.size).ok().filter(|&s| s <= i32::MAX as u32).ok_or_else(too_big)?;
             let align = lt.align;
             let offset = |at: Option<u64>| -> Result<u32, TyErr> {
@@ -1117,13 +1132,18 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     let first = self.layout_fields.len() as u32;
                     let mut leaves = 0u64;
                     for (j, &(name, pt)) in parts.iter().enumerate() {
-                        let repr = self.repr(pt)?;
+                        // The unsized tail has no representation of its own: it is reached
+                        // only as an unsized place (walk/unsized_tail.rs).
+                        let repr = if unsized_tail && j + 1 == parts.len() { Repr::None } else { self.repr(pt)? };
                         let at = offset(self.ls.field_offset(id, j as u32))?;
                         self.layout_fields.push((name, at, repr));
                         self.layout_field_tys.push(pt);
                         leaves = leaves.saturating_add(self.leaves(repr));
                     }
                     let len = parts.len() as u32;
+                    if unsized_tail {
+                        self.unsized_tails.push(self.layouts.len() as u32);
+                    }
                     Layout { ty: t, size, align, leaves, shape: Shape::Fields { first, len }, needs_drop, drop_fn, is_union }
                 }
             };
@@ -2217,6 +2237,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 c = up;
             }
         }
+        // A field moved out by a place expression gives its local field flags (walk/moves.rs).
+        self.scan_field_moves(&parent)?;
         self.expr_parent = parent;
         self.scan_temp_scopes()
     }
@@ -3171,6 +3193,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     };
                     match self.local_of(lhs)? {
                         Some(p) if self.owned[p.ix()].is_some() => {
+                            self.note_whole_assign(e, p);
                             self.drop_local(p, false)?;
                             self.store(v, repr, at)?;
                             self.set_flag(p, true);
@@ -3181,8 +3204,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                         None => {
                             let Repr::Agg(l) = repr else { return Err(malformed("a value that needs drop not held as an aggregate")) };
                             let g = self.layouts[l as usize].ty;
-                            self.drop_at(g, at)?;
-                            self.store(v, repr, at)?;
+                            // A field of a local with field flags drops by its bits (walk/moves.rs).
+                            self.assign_over(lhs, g, at, v, repr)?;
                         }
                     }
                 } else {
@@ -3216,15 +3239,19 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 };
                 self.store(v, repr, (p, at + off as i32))?;
             }
+            // A field of an unsized place: of a struct ending in a slice or `str`, reached
+            // through its wide pointer (walk/unsized_tail.rs).
+            Task::Field(e) | Task::FieldPlace(e) if matches!(self.vals.last(), Some(V::Unsized(..))) => {
+                self.unsized_field(e, matches!(task, Task::FieldPlace(_)))?;
+            }
             Task::Field(e) | Task::FieldPlace(e) => {
                 let (field_off, repr) = self.field(e)?;
                 let v = self.pop()?;
                 let (p, off) = self.place_any(v)?;
                 let at = (p, off + field_off as i32);
                 let v = match task {
-                    Task::Field(_) if self.repr_needs_drop(repr) => {
-                        return Err(unsupported(e, "a move out of a field whose type needs drop (a partial move)"));
-                    }
+                    // A partial move out of a local (walk/moves.rs).
+                    Task::Field(_) if self.repr_needs_drop(repr) => self.move_field(e, at, repr)?,
                     Task::Field(_) => self.load(repr, at),
                     _ => V::Place(at.0, at.1),
                 };
@@ -3653,6 +3680,12 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         }
         let rows = self.adjust_rows(base);
         let kinds = &self.checked.adjusts.column::<1>()[rows];
+        // A struct's slice tail (`p.body[i]`, `body: [u8]` last): its place is an unsized
+        // place, held as its wide pointer (walk/unsized_tail.rs).
+        if kinds.is_empty() && matches!(self.expr(base)?, Expr::Field { .. } | Expr::TupleField { .. }) {
+            self.work.push(Task::Place(base));
+            return Ok(());
+        }
         let lead = kinds.iter().take_while(|k| matches!(k, AdjustKind::Deref { .. })).count();
         if lead == 0 || lead != kinds.len() || !matches!(kinds[lead - 1], AdjustKind::Deref { overloaded: None }) {
             return Err(unsupported(base, "indexing a slice not reached by a builtin dereference of a wide pointer"));

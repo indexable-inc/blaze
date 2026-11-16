@@ -79,6 +79,14 @@ pub trait Facts {
     fn own_text(&self) -> Option<&str> {
         None
     }
+    /// Whether the caller checks each closure's BODY on its own (its captures as inputs of
+    /// their modes). The lowering makes a closure expression the borrows and moves of its
+    /// captures and does not descend into its body; while nothing checks that body, a body
+    /// holding a closure is refused (`Form::Closure`: not checked, never accepted), which is
+    /// what `false` says.
+    fn closure_bodies_checked(&self) -> bool {
+        false
+    }
     /// The index of field `name` of `variant`.
     fn field(&self, adt: ItemKey, variant: u32, name: Name) -> Option<u32>;
     /// The number of fields of `variant`.
@@ -183,6 +191,9 @@ pub enum Plant {
     /// A callee's `'static` is instantiated afresh at each call like any other region: a fn
     /// pointer's `fn(&'static T)` then takes a local's reference.
     StaticIgnored,
+    /// A call of unknown head is related through one origin instead of refused (the form
+    /// before `Form::CalleeUnknown`): census 1's "invalidated in a derived `fmt`" comes back.
+    UnknownUnified,
     /// A closure's captures are not lowered: the closure value holds no loan and moves nothing.
     NoCaptures,
 }
@@ -516,11 +527,95 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                     stack.extend_from_slice(self.list(l, e)?);
                 }
                 PNode::Opaque(_, _) | PNode::Alias { .. } | PNode::Dynamic(_) => n += 1,
+                // A closure of this body is its captures (the Reference, "Closure types": "A
+                // closure expression produces a closure value with a unique, anonymous type",
+                // "roughly" a struct of the captured variables): one position per capture by
+                // reference, then the captured type's own.
+                PNode::Closure { owner, ordinal, .. } if owner == self.body.owner => {
+                    let ck: &'c Checked<'c> = self.ck;
+                    let Some(&ce) = ck.closures.column::<0>().get(ordinal as usize) else {
+                        return self.refuse(Form::Malformed, e);
+                    };
+                    for (i, x) in ck.captures.column::<0>().iter().enumerate() {
+                        if *x != ce {
+                            continue;
+                        }
+                        if ck.captures.column::<2>()[i] != blaze_typeck::CaptureKind::ByValue {
+                            n += 1;
+                        }
+                        match ck.pat_ty.get(ck.captures.column::<1>()[i].ix()) {
+                            Some(&t) => stack.push(t),
+                            None => return self.refuse(Form::Malformed, e),
+                        }
+                    }
+                }
                 PNode::Closure { .. } | PNode::Future(..) => return self.refuse(Form::TypeNode, e),
                 _ => {}
             }
         }
         Ok(n)
+    }
+
+    /// A closure expression: an `Aggregate` of its captures, each a borrow or a move of the
+    /// captured local at this point, as the type checker decided (the Reference, "Closure
+    /// types", "Capture modes": "The compiler prefers to capture a closed-over variable by
+    /// immutable borrow, followed by unique immutable borrow, by mutable borrow, and finally by
+    /// move"; with `move`, "all captures are by move or, for `Copy` types, by copy"). The loans
+    /// go into the closure value's own positions, so they are live as long as it is. The
+    /// closure's BODY is not lowered here (see [`Facts::closure_bodies_checked`]).
+    fn closure_value(&mut self, e: ExprId) -> Result<(), Refusal> {
+        let ty = TyD::of(self.expr_ty(e)?);
+        let c = self.temp(ty, e)?;
+        let cp = self.place_of(c);
+        let ci = self.info(cp);
+        let ck: &'c Checked<'c> = self.ck;
+        let mut ops: Vec<Operand, A> = Vec::new_in(self.alloc.clone());
+        // What each capture relates once the aggregate is made: its place, where its positions
+        // start in the closure's, how many, and its type.
+        let mut rel: Vec<(Place, u32, u32, TyD), A> = Vec::new_in(self.alloc.clone());
+        let mut at = ci.start;
+        for (i, x) in ck.captures.column::<0>().iter().enumerate() {
+            if *x != e {
+                continue;
+            }
+            let p = ck.captures.column::<1>()[i];
+            let l = match self.pat_local.get(p.ix()) {
+                Some(&l) if l != u32::MAX => Local(l),
+                _ => return self.refuse(Form::UnknownLocal, e),
+            };
+            let (pl, lt) = (self.place_of(l), self.local_ty[l.0 as usize]);
+            let (src, st) = match ck.captures.column::<2>()[i] {
+                blaze_typeck::CaptureKind::ByValue => (pl, lt),
+                kind => {
+                    let (m, bk) = if kind == blaze_typeck::CaptureKind::ByRef { (Mutbl::Not, BorrowKind::Shared) } else { (Mutbl::Mut, BorrowKind::Mut) };
+                    if lt.wrap.is_some() {
+                        return self.refuse(Form::Closure, e);
+                    }
+                    let rt = TyD { ty: lt.ty, wrap: Some(m) };
+                    let t = self.temp(rt, e)?;
+                    if self.plant != Plant::NoCaptures {
+                        self.borrow(pl, lt, bk, t, e)?;
+                    }
+                    (self.place_of(t), rt)
+                }
+            };
+            let n = self.npos_d(st, e)?;
+            if self.plant != Plant::NoCaptures {
+                ops.push(self.operand(Val { at: At::Place(src), ty: st }, e)?);
+                rel.push((src, at, n, st));
+            }
+            at += n;
+        }
+        if at != ci.start + ci.len {
+            return self.refuse(Form::Malformed, e);
+        }
+        self.b.aggregate(cp, &ops, self.span(e));
+        for j in 0..rel.len() {
+            let (src, start, n, st) = rel[j];
+            self.relate_at(src, start, n, st, e)?;
+        }
+        self.push_place(cp, ty);
+        Ok(())
     }
 
     fn npos_d(&self, t: TyD, e: ExprId) -> Result<u32, Refusal> {
@@ -1765,7 +1860,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 self.tasks.push(Task::Eval(index, false));
                 self.tasks.push(Task::Eval(base, m));
             }
-            Expr::Closure { .. } => return self.refuse(Form::Closure, e),
+            Expr::Closure { is_async, .. } => {
+                if is_async || !self.facts.closure_bodies_checked() {
+                    return self.refuse(Form::Closure, e);
+                }
+                self.closure_value(e)?;
+            }
             Expr::AsyncBlock { .. } => return self.refuse(Form::AsyncBlock, e),
             Expr::Await(_) => return self.refuse(Form::Await, e),
             Expr::Underscore => return self.refuse(Form::Malformed, e),
@@ -2129,6 +2229,29 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             }
         }
         let value_callee = value_callee && by_type.is_none();
+        // A call of a closure is a use of the closure value: by shared reference when it is
+        // `Fn`, by mutable reference when `FnMut`, by value when `FnOnce` (the Reference,
+        // "Closure types", "Call traits and coercions").
+        if value_callee {
+            let c = self.vals[at];
+            if c.ty.wrap.is_none()
+                && let At::Place(p) = c.at
+                && let PNode::Closure { ordinal, .. } = self.node(c.ty.ty, e)?
+            {
+                let by = match self.ck.closures.column::<1>().get(ordinal as usize) {
+                    Some(blaze_typeck::ClosureKind::Fn) => Some((Mutbl::Not, BorrowKind::Shared)),
+                    Some(blaze_typeck::ClosureKind::FnMut) => Some((Mutbl::Mut, BorrowKind::Mut)),
+                    Some(blaze_typeck::ClosureKind::FnOnce) => None,
+                    None => return self.refuse(Form::Malformed, e),
+                };
+                if let Some((m, bk)) = by {
+                    let rt = TyD { ty: c.ty.ty, wrap: Some(m) };
+                    let t = self.temp(rt, e)?;
+                    self.borrow(p, c.ty, bk, t, e)?;
+                    self.vals[at] = Val { at: At::Place(self.place_of(t)), ty: rt };
+                }
+            }
+        }
         let mut vs: Vec<Val, A> = Vec::new_in(self.alloc.clone());
         vs.extend_from_slice(&self.vals[at + usize::from(by_type.is_some())..]);
         self.vals.truncate(at);
@@ -2236,7 +2359,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 // `'static`" (`spawn(&local)`), so where anything carries a lifetime the body
                 // is refused by name, not accepted. A known head that writes no lifetime, called
                 // with generic arguments that carry origins, keeps the one origin.
-                if sig.is_none() {
+                if sig.is_none() && self.plant != Plant::UnknownUnified {
                     let mut any = out.len > 0;
                     for v in vs.iter() {
                         any |= self.npos_d(v.ty, e)? > 0;

@@ -132,6 +132,18 @@ impl Sv for K5 {
     type Tok<'a> = <u8 as Sv>::Tok<'a>;
 }
 fn c9() -> K5 { needs(K5) }
+struct NotSelf;
+impl NotSelf { fn d1() -> Self { Self } }
+impl From<()> for NotSelf {
+    fn from(_tuple: ()) -> Self { Self }
+}
+struct Pair(u8, u8);
+impl Pair {
+    fn d2() -> Self { Self(1, 2) }
+    fn d3() -> fn(u8, u8) -> Pair { Self }
+}
+struct Wrap<V>(V);
+impl<V> Wrap<V> { fn d4(v: V) -> Self { Self(v) } }
 ";
 
 /// The free bodies that must check clean, each with what it proves.
@@ -150,7 +162,15 @@ const FREE: [(&str, &str); 11] = [
 ];
 
 /// The impl members that must check clean.
-const MEMBERS: [(&str, &str); 7] = [
+const MEMBERS: [(&str, &str); 12] = [
+    // tempo-front-7 "347 diag E0423": `Self` as a value (the Reference, "Paths", "`Self`":
+    // "When implementing a tuple or unit struct, it also refers to the constructor in the value
+    // namespace."); alloy's `sol!` writes `fn from(tuple: UnderlyingRustTuple<'_>) -> Self { Self }`.
+    ("d1", "(D1) `Self` as a unit struct's value"),
+    ("from", "(D1) alloy's form: `Self` as the unit value in `impl From<_> for NotSelf`"),
+    ("d2", "(D2) `Self(1, 2)`: a tuple struct's ctor called"),
+    ("d3", "(D2) bare `Self`: the ctor fn, coerced to `fn(u8, u8) -> Pair`"),
+    ("d4", "(D3) `Self(v)` in `impl<V> Wrap<V>`: the ctor at the impl's arguments"),
     ("a1", "(A1) `Self::K`: an inherent constant"),
     ("a2", "(A2) `Self::K`: the inherent constant shadows `Tr::K`, in scope and implemented"),
     ("a3", "(A3) `Self::K` as a path pattern"),

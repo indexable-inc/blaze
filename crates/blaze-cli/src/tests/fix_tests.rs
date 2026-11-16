@@ -256,8 +256,8 @@ fn a_crash_mid_fix_leaves_each_file_old_or_new() {
         }
     }
     let caught = (0..12).flat_map(|seed| (0..=2).map(move |cut| (seed, cut))).find_map(|(seed, cut)| crash_case(seed, cut, fix::InPlace).err());
+    // Caught as: "seed 0, cut after 2: a.rs is neither old nor new: 3605 bytes".
     assert!(caught.is_some(), "the planted in-place write must be caught");
-    eprintln!("planted bug caught: {}", caught.unwrap_or_default());
 }
 
 /// Between `blaze check` and `blaze check --fix <id>`, an edit is drawn: none, above the line,

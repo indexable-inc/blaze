@@ -281,3 +281,42 @@ fn an_edit_in_one_worktree_reruns_its_body_alone_and_leaves_the_other() {
     let repeat = check_in(&io, TWO, Keys::FromText);
     assert!(repeat.certified && repeat.runs == 0, "the second worktree's repeat: certified {}, {} runs:\n{}", repeat.certified, repeat.runs, repeat.profile);
 }
+
+/// (iv) Both worktrees warm, then one body edited in worktree two: its check runs exactly two
+/// tasks, the edited file's outline (`FileItems`: a file's text is its key) and that body's
+/// `BodyCheck`, and no names task (`CrateScope` made 0: the file's `Surface` did not move).
+/// Worktree one's next check runs zero tasks and stays certified. Then worktree one takes the
+/// same edit (the same text at another path): it runs zero tasks, both records found in the
+/// machine's store, nothing written there. The first line is the cause this file's two older
+/// tests failed on: worktree two's cold check found the names task's shape in the store before
+/// its files' `Surface`s were listed, keyed its value with them absent, missed and reran it
+/// (blaze-drive request.rs `value`, `walk_quiet`).
+/// Prints: `test store::worktree_tests::a_body_edit_runs_two_tasks_there_and_none_in_the_other_worktree ... ok`.
+#[test]
+fn a_body_edit_runs_two_tasks_there_and_none_in_the_other_worktree() {
+    let io = Io::simulated(SimWorld::new(13, Limits::USUAL));
+    worktree(&io, ONE);
+    worktree(&io, TWO);
+    let one = check_in(&io, ONE, Keys::FromText);
+    let two = check_in(&io, TWO, Keys::FromText);
+    assert_eq!((two.runs, made(&two.profile, "CrateScope")), (0, 0), "the second worktree's cold check reran what the first made:\n{}", two.profile);
+    // Warm: each worktree's repeat is its certificate.
+    let warm = (check_in(&io, ONE, Keys::FromText), check_in(&io, TWO, Keys::FromText));
+    assert!(warm.0.certified && warm.1.certified && warm.0.runs + warm.1.runs == 0, "the warm repeats: {} and {} runs", warm.0.runs, warm.1.runs);
+    write(&io, TWO, "src/b.rs", B_EDITED);
+    let edited = check_in(&io, TWO, Keys::FromText);
+    assert_eq!(
+        (edited.runs, made(&edited.profile, "FileItems"), made(&edited.profile, "BodyCheck"), made(&edited.profile, "CrateScope"), made(&edited.profile, "Surface")),
+        (2, 1, 1, 0, 0),
+        "a body edit in worktree two runs its file's outline and its body's check, nothing else:\n{}",
+        edited.profile
+    );
+    assert_eq!((edited.errors, &edited.findings), (two.errors, &two.findings), "a body edit moved worktree two's findings");
+    let other = check_in(&io, ONE, Keys::FromText);
+    assert!(other.certified && other.runs == 0, "worktree one after two's edit: certified {}, {} runs:\n{}", other.certified, other.runs, other.profile);
+    // The same edit in worktree one: every record it needs is the one worktree two made.
+    write(&io, ONE, "src/b.rs", B_EDITED);
+    let adopted = check_in(&io, ONE, Keys::FromText);
+    assert_eq!((adopted.runs, adopted.machine_put), (0, 0), "worktree one, given the text worktree two built, ran or wrote:\n{}", adopted.profile);
+    assert_eq!((adopted.errors, &adopted.findings), (one.errors, &one.findings), "the same edit moved worktree one's findings");
+}

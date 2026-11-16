@@ -230,6 +230,8 @@ pub fn native_outputs<'a>(
         features: features.iter().map(|f| (*f).to_owned()).collect(),
         store: setting.store.display().to_string(),
     })?;
+    // Seatbelt matches resolved paths: the store may be named through a link.
+    let module = std::fs::canonicalize(&module).map_err(|e| NativeUnitError::Read { path: module.display().to_string(), why: e.to_string() })?;
     let module = module.to_str().ok_or_else(|| NativeUnitError::Read { path: module.display().to_string(), why: "not UTF-8".to_owned() })?.to_owned();
     let program = format!("{module}/script.bin");
     let module_digest = blaze_sha256::digest(&read_file(&module, "script.bin")?);

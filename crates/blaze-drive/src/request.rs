@@ -717,6 +717,13 @@ pub struct Request<'a> {
     /// Every `Units` job this run, in the order added: a file no answer holds and no record
     /// listed yet waits on one still open, as a member's units may list it.
     units_jobs: AVec<'a, Name>,
+    /// Jobs in `Value` whose shape came from the store with no row of this checkout (another
+    /// worktree's, [`Request::value`]) and names a read nothing has listed yet this run: they
+    /// wait for the walk to go quiet, when a name still not listed is absent today.
+    unwalked: AVec<'a, Name>,
+    /// The jobs [`Request::walk_quiet`] released, sorted: a read of theirs no one listed is
+    /// `ABSENT`. A job leaves when its value key is asked for.
+    walked: AVec<'a, Name>,
 
     gate: Gate,
     /// The class the walk's jobs take: `Gate` beside a running program, else the person's.
@@ -844,6 +851,8 @@ impl<'a> Request<'a> {
             old_findings_loading: false,
             units_at: None,
             units_jobs: Vec::new_in(a.clone()),
+            unwalked: Vec::new_in(a.clone()),
+            walked: Vec::new_in(a.clone()),
             gate: ask.gate,
             walk: match (ask.command, ask.gate) {
                 (Command::Run | Command::Test, Gate::Beside) => Class::Gate,
@@ -1788,6 +1797,9 @@ impl<'a> Request<'a> {
             }
             self.emit_ready(out);
             if self.phase == Phase::Working && self.quiet() {
+                if self.walk_quiet() {
+                    continue;
+                }
                 if self.unsettled() {
                     self.break_cycle()?;
                     continue;
@@ -1804,6 +1816,27 @@ impl<'a> Request<'a> {
 
     fn quiet(&self) -> bool {
         self.wake.is_empty() && self.gets.is_empty() && self.tickets.is_empty() && self.queued == 0 && self.opening.is_empty()
+    }
+
+    /// The walk is quiet: every record found or made so far has listed its parts and each part
+    /// has a job (`settle`), so a name with no job now is listed by nothing today. The jobs that
+    /// waited for this ([`Request::value`], `unwalked`) are woken to look up their value with
+    /// such a read as `ABSENT`. `true` when one was woken. Each wake asks for one value key, and
+    /// a job comes back only by being dirtied (capped by its settles), so this ends.
+    fn walk_quiet(&mut self) -> bool {
+        let waiting = core::mem::replace(&mut self.unwalked, Vec::new_in(self.alloc));
+        let mut woke = false;
+        for name in waiting.iter() {
+            if self.state(*name) != Some(State::Value) {
+                continue;
+            }
+            if let Err(at) = self.walked.binary_search(name) {
+                self.walked.insert(at, *name);
+                self.wake.push_back(*name);
+                woke = true;
+            }
+        }
+        woke
     }
 
     /// `waiter` waits on the file `file`, opening it if no one has yet: `Open` is emitted once.
@@ -2199,8 +2232,17 @@ impl<'a> Request<'a> {
         let shape = core::mem::replace(&mut self.jobs.get_mut(&name).expect("a job").shape, Vec::new_in(self.alloc));
         let mut reads = Vec::with_capacity_in(shape.len(), self.alloc);
         let mut waiting = false;
+        // A shape with no row of this checkout behind it is another checkout's (a second
+        // worktree's cold command) or an unanswered command's: no watch row here says which of
+        // its reads were absent. A read nothing has listed YET is then not known absent: the
+        // file that lists it may still be on its way through the walk, and a value key made
+        // with `ABSENT` for it misses the record the store holds. Such a job waits for the walk
+        // to go quiet ([`Request::walk_quiet`]); only then is an unlisted name absent today.
+        let unanswered = self.current(name).is_none() && self.walked.binary_search(&name).is_err();
+        let mut unlisted = false;
         for read in shape.iter() {
             match self.digest(*read, name, out) {
+                Digest::Ready(None) if unanswered && *read != self.space_name && self.state(*read).is_none() && !self.dropped.contains(read) => unlisted = true,
                 Digest::Ready(now) => reads.push((*read, now.map_or(ABSENT, |now| now.out))),
                 Digest::Wait => waiting = true,
             }
@@ -2211,8 +2253,16 @@ impl<'a> Request<'a> {
             job.state = State::Value;
             return Ok(());
         }
+        if unlisted {
+            job.state = State::Value;
+            self.unwalked.push(name);
+            return Ok(());
+        }
         let at = key::value_key(job.key, &reads);
         job.state = State::Valuing;
+        if let Ok(released) = self.walked.binary_search(&name) {
+            self.walked.remove(released);
+        }
         self.get(at, Purpose::Value(name), out);
         Ok(())
     }

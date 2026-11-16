@@ -20,7 +20,8 @@ use blaze_flow::flow::Flow;
 use blaze_flow::loans::{BorrowFinding, TierOne, facts, tier_one, tier_two};
 use blaze_flow::moves::check_moves_planted;
 use blaze_flow::record::Plant as FlowPlant;
-use blaze_flow_lower::{AdtFacts, CalleeFacts, Facts, SigBuf, SigLife, lower, read_signature};
+use blaze_flow_lower::{AdtFacts, CalleeFacts, Facts, Region as TextRegion, SigBuf, SigLife, lower, read_signature};
+use blaze_ladder::front2::lifetimes::{FnLife, Region as FrontRegion};
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::Front2;
 use blaze_ladder::front2::body::{BodyError, lower_fn, lower_member};
@@ -63,6 +64,49 @@ struct Gathered {
     sigs: BTreeMap<u128, SigBuf<Alloc<'static>>>,
     /// Why the others were not read, by the refusal's name.
     sig_refused: BTreeMap<String, usize>,
+    /// The front end's lifetime part (front2/lifetimes.rs, `Store::fn_life`) against the text's,
+    /// per signature, by outcome: a comparison only, the lowering still reads `sigs`.
+    front: BTreeMap<String, usize>,
+    /// Each signature where both answered and the answers differ.
+    front_lines: Vec<String>,
+}
+
+/// Whether the text's lifetime part and the front end's say the same where both answer: the
+/// same positions and ends; position by position the same kind of region, and one renaming of
+/// the text's regions onto the front end's (the text numbers a named lifetime by first
+/// appearance, the front end by declaration, the impl's first); every bound the text declares
+/// among the front end's. A position the text calls `Self`'s is not compared: the front end
+/// says the impl's lifetimes there, which the text cannot.
+fn sigs_agree(text: SigLife<'_>, front: &FnLife) -> Result<(), String> {
+    if text.regions.len() != front.regions.len() {
+        return Err(format!("{} positions in the text, {} in the front end", text.regions.len(), front.regions.len()));
+    }
+    if !text.ends.iter().eq(front.ends.iter()) {
+        return Err(format!("the inputs end at {:?} in the text, {:?} in the front end", text.ends, front.ends));
+    }
+    let mut to_front: BTreeMap<TextRegion, FrontRegion> = BTreeMap::new();
+    let mut to_text: BTreeMap<FrontRegion, TextRegion> = BTreeMap::new();
+    for (i, (&t, &f)) in text.regions.iter().zip(front.regions.iter()).enumerate() {
+        let same_kind = match (t, f) {
+            (TextRegion::SelfTy(_), _) => continue,
+            (TextRegion::Static, FrontRegion::Static)
+            | (TextRegion::Named(_), FrontRegion::Named(_))
+            | (TextRegion::Anon(_), FrontRegion::Anon(_))
+            | (TextRegion::Hidden(_), FrontRegion::Hidden(_)) => true,
+            _ => false,
+        };
+        let one_renaming = *to_front.entry(t).or_insert(f) == f && *to_text.entry(f).or_insert(t) == t;
+        if !same_kind || !one_renaming {
+            return Err(format!("position {i}: the text says {t:?}, the front end {f:?} (text {:?}, front end {:?})", text.regions, front.regions));
+        }
+    }
+    for &(a, b) in text.bounds {
+        let (Some(&fa), Some(&fb)) = (to_front.get(&a), to_front.get(&b)) else { continue };
+        if !front.bounds.iter().any(|x| *x == (fa, fb)) {
+            return Err(format!("the text's bound {a:?}: {b:?} is not among the front end's {:?}", front.bounds));
+        }
+    }
+    Ok(())
 }
 
 impl Facts for Gathered {
@@ -184,6 +228,7 @@ fn gather(r: &mut Records<'_, '_>, owner: tc::ItemKey, c: &tc::Checked<'_>, copy
             Some(keys.library(a).and_then(|lib| names.item_text(lib)).is_some_and(|t| t.text.split(['{', '(', ';']).next().unwrap_or("").contains('\'')))
         };
         let mut buf = SigBuf::new_in(Alloc::global());
+        let head_text = f.text.split('{').next().unwrap_or("").trim();
         match read_signature(f.text, r.store.tys.view(), &f.inputs[..], f.output, &adt_lifetimes, &mut buf, Alloc::global()) {
             Ok(()) => {
                 g.sigs.insert(k, buf);
@@ -194,6 +239,21 @@ fn gather(r: &mut Records<'_, '_>, owner: tc::ItemKey, c: &tc::Checked<'_>, copy
                 *g.sig_refused.entry(name).or_default() += 1;
             }
         }
+        // The front end's answer for the same signature, as a second source: compared only.
+        let refusal = |why: &dyn std::fmt::Debug| format!("{why:?}").split([' ', '{']).next().unwrap_or("").to_string();
+        let outcome = match (g.sigs.get(&k), r.store.fn_life(r.names, &*r.keys, key)) {
+            (Some(t), Ok(front)) => match sigs_agree(t.life(), front) {
+                Ok(()) => "agree".to_string(),
+                Err(what) => {
+                    g.front_lines.push(format!("`{head_text}`: {what}"));
+                    "disagree".to_string()
+                }
+            },
+            (None, Ok(_)) => "front end read, text refused".to_string(),
+            (Some(_), Err(why)) => format!("text read, front end refused: {}", refusal(&why)),
+            (None, Err(why)) => format!("both refused, front end: {}", refusal(&why)),
+        };
+        *g.front.entry(outcome).or_default() += 1;
     }
     g
 }
@@ -221,6 +281,9 @@ struct Done {
     sig_read: bool,
     /// Signatures (the body's and its callees') whose text was not read, by refusal.
     sig_refused: BTreeMap<String, usize>,
+    /// The front end's lifetime part against the text's, by outcome, and each disagreement.
+    front: BTreeMap<String, usize>,
+    front_lines: Vec<String>,
 }
 
 fn snippet(text: &str, lo: u32, hi: u32) -> String {
@@ -312,6 +375,8 @@ fn take<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, t: Target<'_>, lan
                 calls_by_signature: l.stats.calls_by_signature,
                 sig_read: l.stats.sig_read,
                 sig_refused: g.sig_refused.clone(),
+                front: g.front.clone(),
+                front_lines: g.front_lines.clone(),
             }))
         }
     }
@@ -407,6 +472,8 @@ fn flow_census() {
     let (mut elided, mut unified, mut sig_lt) = (0u64, 0u64, 0usize);
     let (mut by_sig, mut sig_read) = (0u64, 0usize);
     let mut sig_refused: BTreeMap<String, usize> = BTreeMap::new();
+    let mut front_all: BTreeMap<String, usize> = BTreeMap::new();
+    let mut front_lines: BTreeSet<String> = BTreeSet::new();
     let mut slowest: Vec<(Duration, String)> = Vec::new();
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
@@ -465,6 +532,10 @@ fn flow_census() {
                 for (name, n) in &d.sig_refused {
                     *sig_refused.entry(name.clone()).or_default() += n;
                 }
+                for (name, n) in &d.front {
+                    *front_all.entry(name.clone()).or_default() += n;
+                }
+                front_lines.extend(d.front_lines.iter().cloned());
                 let all = d.lower_t + d.moves_t + d.tier1_t + d.tier2_t.unwrap_or_default();
                 slowest.push((all, path.clone()));
                 if let Some(x) = d.tier2_t {
@@ -505,6 +576,13 @@ fn flow_census() {
     out.push_str(&format!(
         "signatures: bodies whose own lifetime part was read {sig_read}; calls related through the callee's {by_sig}; signature texts not read (of lowered bodies, a callee counted once per body), by refusal: {sig_refused:?}\n"
     ));
+    // The front end's lifetime part (front2/lifetimes.rs) beside the text's: where both answer
+    // they must agree; each disagreement once, then every outcome's count.
+    out.push_str(&format!("signatures: front end and text disagree: {}\n", front_all.get("disagree").copied().unwrap_or(0)));
+    out.push_str(&format!("signatures: front end against text (of lowered bodies, a callee counted once per body), by outcome: {front_all:?}\n"));
+    for l in front_lines.iter().take(60) {
+        out.push_str(&format!("  DISAGREE {l}\n"));
+    }
     let mut sorted: Vec<(&String, &(usize, Vec<String>))> = refusals.iter().collect();
     sorted.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(b.0)));
     out.push_str(&format!("REFUSED by form ({}), largest first:\n", sorted.len()));

@@ -24,7 +24,7 @@ use blaze_id::ItemKey as LibKey;
 use blaze_lower::by_name::ByName;
 use blaze_lower::form as lf;
 use blaze_lower::scoped::{Prepares, Scoped};
-use blaze_lower::typeck::{Refused, TypeckBody, Types, to_typeck};
+use blaze_lower::typeck::{ConstGapWhy, ConstTerm, Refused, TypeckBody, Types, to_typeck};
 use blaze_lower::{Lowered, View};
 use blaze_own::Alloc;
 use blaze_scope::resolve::Names;
@@ -246,11 +246,42 @@ struct BodyTypes<'b, 'n> {
     builder: Builder<'b, 'n, Maps>,
     env: Env<'b>,
     failed: Option<Why>,
+    /// The body's blocks that are modules of the names library holding a struct, enum, union
+    /// or type alias ([`super::locals::BodyLocals::blocks`]); empty for most bodies.
+    blocks: &'b [super::locals::BlockModule],
+}
+
+impl<'b> BodyTypes<'b, '_> {
+    /// Where the type `t` is written: the body's names, read at the module of the innermost
+    /// block around it that declares a type (the Reference, "Statements", "Item
+    /// declarations": "Declaring an item within a statement block restricts its scope to the
+    /// block containing the statement"; the block's module is its items plus a glob import of
+    /// the scope outside, so every other name reads as before). The body's generic
+    /// parameters and `Self` stay in scope: they are the body's, not the block's items'.
+    /// A type an expansion wrote has no place in the body's text, and one written with
+    /// `super` names nothing of a block (a block's item has no path): both read at the
+    /// body's module, where `super` is the module's parent.
+    fn env_at(&self, view: &View<'_>, t: lf::TypeId) -> Result<Env<'b>, Refused> {
+        let mut env = self.env;
+        if self.blocks.is_empty() {
+            return Ok(env);
+        }
+        let range = view.type_range(t)?;
+        let Some(r) = view.item_relative(range) else { return Ok(env) };
+        if view.text_at(range)?.contains("super") {
+            return Ok(env);
+        }
+        if let Some(b) = self.blocks.iter().rev().find(|b| b.open <= r.start && r.start < b.close) {
+            env.module = b.module;
+        }
+        Ok(env)
+    }
 }
 
 impl Types for BodyTypes<'_, '_> {
     fn ty(&mut self, view: &View<'_>, t: lf::TypeId, tys: &mut PortableTys<'_>) -> Result<PTy, Refused> {
-        match self.builder.ty(tys, &self.env, view, t) {
+        let env = self.env_at(view, t)?;
+        match self.builder.ty(tys, &env, view, t) {
             Ok(ty) => Ok(ty),
             Err(why) => {
                 self.failed = Some(why);
@@ -316,6 +347,100 @@ impl Types for BodyTypes<'_, '_> {
                 self.failed = Some(why);
                 Err(Refused::Form { what: "a const argument", range })
             }
+        }
+    }
+
+    /// [`Types::const_arg`], with what blaze cannot value yet a GAP ([`const_gap`]): the body
+    /// is converted with a hole there and goes on to its check, which reports the gap
+    /// (check.rs, `Gap::BodyConst`). Every other refusal stays one (`Why::Need`,
+    /// `Why::NeedConst`: the driver makes the record and converts again; a program's error).
+    fn const_term(&mut self, view: &View<'_>, c: lf::ConstIdx, tys: &mut PortableTys<'_>) -> Result<ConstTerm, Refused> {
+        match self.const_arg(view, c, tys) {
+            Ok(t) => Ok(ConstTerm::Is(t)),
+            Err(refused) => match self.failed.as_ref().and_then(const_gap) {
+                Some(gap) => {
+                    self.failed = None;
+                    Ok(ConstTerm::Gap(gap))
+                }
+                None => Err(refused),
+            },
+        }
+    }
+
+    /// `[x; len]`'s length as a const term, by the one home for written constants
+    /// ([`Builder::const_term`], at `usize`: the Reference, "Array expressions"): `_` a hole,
+    /// the fn's own const parameter its `ConstParam` (`[0u8; N]`), a literal or a constant's
+    /// value a `ConstValue` ([`Why::NeedConst`] until the driver has evaluated it), and a gap
+    /// for an expression over a generic parameter (`[0u8; N * 2]`).
+    fn repeat_term(&mut self, view: &View<'_>, len: ExprId, tys: &mut PortableTys<'_>) -> Result<ConstTerm, Refused> {
+        let at = view.expr_range(len)?;
+        let range = view.site(at)?;
+        let text = view.text_at(at)?.trim();
+        let made = self.builder.const_term(tys, &self.env, text, range, &|tys| super::types::intern(tys, blaze_typeck::PNode::Uint(blaze_typeck::UintTy::Usize)));
+        self.term(made, "an array repeat length", range)
+    }
+
+    /// A generic argument of a body path written as one plain name (`foo::<N>()`,
+    /// `W::<SIZE>`). The Reference, "Generic parameters", "Const generics": "When there is
+    /// ambiguity if a generic argument could be resolved as either a type or const argument,
+    /// it is always resolved as a type." So, as a written type's argument is decided
+    /// ([`Builder::path_args`], the same rule): a type parameter, or a name the names library
+    /// answers as a type, is a type ([`Types::ty`]); a const parameter of the fn is its
+    /// `ConstParam`; a name that resolves as a value is a constant ([`Builder::const_term`],
+    /// its type left to the checker, which takes the parameter's). A name that resolves as
+    /// neither is read as a type, whose refusal names it.
+    fn name_arg(&mut self, view: &View<'_>, t: lf::TypeId, name: &str, tys: &mut PortableTys<'_>) -> Result<ConstTerm, Refused> {
+        use crate::resolve::{Kind, Ns};
+        let param = self.env.params.iter().find(|(n, _)| *n == Name::of(name)).map(|&(_, i)| i);
+        let is_const = param.is_some_and(|i| self.env.consts.iter().any(|(c, _)| *c == i));
+        if !is_const {
+            let a_type = param.is_some()
+                || match self.builder.resolver.path(self.env.module, false, &[name], Ns::Type) {
+                    Ok(f) => f.consumed == 1 && matches!(f.kind, Kind::Struct | Kind::Enum | Kind::Union | Kind::TypeAlias | Kind::Builtin(_) | Kind::WideInt { .. }),
+                    Err(_) => false,
+                };
+            if a_type || self.builder.resolver.path(self.env.module, false, &[name], Ns::Value).is_err() {
+                return Types::ty(self, view, t, tys).map(ConstTerm::Is);
+            }
+        }
+        let range = view.site(view.type_range(t)?)?;
+        let made = self.builder.const_term(tys, &self.env, name, range, &|tys| super::types::intern(tys, blaze_typeck::PNode::Infer));
+        self.term(made, "a const argument", range)
+    }
+
+    /// The check reports every const gap of a body (check.rs `check_body_counted`:
+    /// `Gap::BodyConst`), so a body with one is converted and checked, never passed clean.
+    fn takes_const_gaps(&self) -> bool {
+        true
+    }
+}
+
+/// The gap a refused const term of a BODY is, when blaze cannot value it yet (the body goes
+/// on with a hole): an expression over a generic parameter (types.rs `const_value_bits`
+/// refuses it by these words: blaze-typeck's type form has no node for an unevaluated
+/// expression), or an anonymous constant whose type is not known where the body is converted
+/// or that the evaluator refused ([`Why::ConstPath`]). `None`: a refusal that stays one.
+fn const_gap(why: &Why) -> Option<ConstGapWhy> {
+    match why {
+        Why::Unsupported(what, _) if *what == "a constant expression over a generic parameter" => Some(ConstGapWhy::OverGeneric),
+        Why::ConstPath(..) => Some(ConstGapWhy::AnonInBody),
+        _ => None,
+    }
+}
+
+impl BodyTypes<'_, '_> {
+    /// A made const term: the term, its gap ([`const_gap`]), or the refusal `what` at `range`
+    /// with the builder's reason kept.
+    fn term(&mut self, made: Result<PTy, Why>, what: &'static str, range: Range) -> Result<ConstTerm, Refused> {
+        match made {
+            Ok(t) => Ok(ConstTerm::Is(t)),
+            Err(why) => match const_gap(&why) {
+                Some(gap) => Ok(ConstTerm::Gap(gap)),
+                None => {
+                    self.failed = Some(why);
+                    Err(Refused::Form { what, range })
+                }
+            },
         }
     }
 }
@@ -444,6 +569,9 @@ fn lower_at<'n>(names: &'n Names<'n>, prepared: &Prepares<'n>, keys: &mut Keys, 
     let at = super::locals::Enclosing { owner, item, krate, module, text };
     store.locals.keep(names, keys, at, &view, Alloc::global()).map_err(|error| BodyError::Head { item, error })?;
 
+    // The body's blocks that are modules holding a local type: a written type is read there.
+    let blocks: &'n [super::locals::BlockModule] = store.locals.body(owner).map_or(&[], |b| b.blocks);
+
     let mut last = item;
     let mut typeck = None;
     for _ in 0..MOST_ROUNDS {
@@ -451,6 +579,7 @@ fn lower_at<'n>(names: &'n Names<'n>, prepared: &Prepares<'n>, keys: &mut Keys, 
             builder: Builder { resolver: Resolver { names }, heads: &store.maps },
             env: Env { module, params: &params, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &[], consts: &consts },
             failed: None,
+            blocks,
         };
         // Each round converts into a fresh copy of the records' table: a refused round's
         // types are dropped with it, and none reaches `store.tys`.

@@ -3357,6 +3357,7 @@ mod projections;
 mod places;
 mod casts;
 mod matches;
+mod moves;
 #[cfg(target_arch = "aarch64")]
 mod temps;
 mod lets;

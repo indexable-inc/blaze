@@ -67,7 +67,18 @@ impl core::fmt::Display for HeadError {
             HeadError::NoText(k) => write!(f, "the names library holds no text for item {k:?}"),
             HeadError::Cfg(k) => write!(f, "item {k:?} asks for cfg atoms its crate's set does not answer"),
             HeadError::NotAHead(k, what) => write!(f, "item {k:?} is {what}, not a struct, enum, union, trait, impl or fn"),
-            HeadError::Cycle(ks) => write!(f, "these items need each other's heads in a cycle: {ks:?}"),
+            // Each key whole: a key's short form is its crate's part, so two items of one
+            // crate printed short read as one item needing itself.
+            HeadError::Cycle(ks) => {
+                write!(f, "these items need each other's heads in a cycle: [")?;
+                for (i, k) in ks.iter().enumerate() {
+                    if i > 0 {
+                        write!(f, ", ")?;
+                    }
+                    write!(f, "{k:x}")?;
+                }
+                write!(f, "]")
+            }
             HeadError::NeedMade { need, by } => write!(f, "{by:?} needs {need:?}, which is made, yet asks for it again (its lookup reads what that want does not make)"),
             HeadError::Key(c) => write!(f, "{c}"),
             HeadError::Item(k, why) => write!(f, "item {k:?}: {why:?}"),
@@ -132,9 +143,15 @@ pub struct Maps {
     /// [`Heads::const_params`] reads), an impl's own, and a fn's with its container's first
     /// (the checker's `const_params`). An item with none has an empty row once made.
     pub const_params: HashMap<LibKey, Vec<(u32, PTy), Global>, Global>,
+    /// How many lowerings of a written bound's arguments are nested right now
+    /// ([`Heads::written_depth`]): zero between any two heads.
+    pub written_depth: core::cell::Cell<u32>,
 }
 
 impl Heads for Maps {
+    fn written_depth(&self) -> Option<&core::cell::Cell<u32>> {
+        Some(&self.written_depth)
+    }
     fn const_len(&self, key: LibKey) -> Option<u64> {
         self.const_lens.get(&key).copied()
     }
@@ -411,6 +428,10 @@ pub struct Store<'n> {
     /// The items declared inside the bodies lowered so far, kept in the command's frame: a
     /// local item's head is made from its row ([`super::locals`]).
     pub locals: super::locals::Locals<'n>,
+    /// Each head's lifetime part, made when first asked for ([`super::lifetimes`]:
+    /// `Store::fn_life`, `Store::adt_life`, `Store::container_life`): what the erased types
+    /// above leave out and the borrow check reads.
+    pub lives: super::lifetimes::Lives,
 }
 
 /// A trait's clauses on `Self` and its associated types with their keys and defaults (in the
@@ -632,6 +653,7 @@ impl<'n> Store<'n> {
             statics: HashMap::new_in(Global),
             opaques: HashMap::new_in(Global),
             locals: super::locals::Locals::new(frame),
+            lives: super::lifetimes::Lives::new_in(Alloc::global()),
         }
     }
 
@@ -955,8 +977,22 @@ impl<'n> Store<'n> {
                     let mk = keys.member(ck, MemberKind::Const, m.name).map_err(|c| Why::Program(format!("{c}").into_boxed_str(), whole))?;
                     let at = Range::new(0, m.text.len() as u32);
                     let t = mv.head_opt(head::TY).ok_or(Why::Unsupported("an associated constant with no type", at))?;
+                    consts.push((Name::of(m.name), mk));
                     let b = Builder { resolver: Resolver { names }, heads: &self.maps };
-                    let output = b.ty(&mut self.tys, &env, &mv, lf::TypeId(t))?;
+                    // As a member fn's signature ([`Store::member_fn_head`]): a need is passed
+                    // up; any other refusal of the constant's type is filed in `fn_gaps` and
+                    // the trait's head goes on (core's `SizedTypeProperties` has six
+                    // constants: one unread type must not hide `SIZE`); a body that names the
+                    // constant then gets the gap, by name.
+                    let output = match b.ty(&mut self.tys, &env, &mv, lf::TypeId(t)) {
+                        Ok(output) => output,
+                        Err(why @ (Why::Need(_) | Why::NeedConst(..))) => return Err(why),
+                        Err(why) => {
+                            self.fn_gaps.insert(mk, why);
+                            continue;
+                        }
+                    };
+                    self.fn_gaps.remove(&mk);
                     let mut own_bounds = Vec::with_capacity_in(bounds.len(), Global);
                     own_bounds.extend_from_slice(&bounds);
                     let mut cp = Preds::new();
@@ -966,7 +1002,6 @@ impl<'n> Store<'n> {
                     let has_body = mv.head[head::FLAGS] & sig::HAS_BODY != 0;
                     let row = FnHead { lib: key, text: m.text, container: Some(ck), parent: own + 1, own: 0, declared: 0, self_param: false, header, inputs: Vec::new_in(Global), output, has_body, module, params: ps.clone(), consts: cs.clone(), bounds: own_bounds, self_: env.self_, self_assoc: Vec::new_in(Global) };
                     self.fns.insert(mk, row);
-                    consts.push((Name::of(m.name), mk));
                 }
                 _ => {}
             }

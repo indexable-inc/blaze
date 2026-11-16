@@ -12,10 +12,12 @@ use std::vec::Vec;
 
 use blaze_id::{CrateItemKey, ItemKey};
 use blaze_own::Alloc;
-use blaze_scope::names::{self, PathError, Why, Written};
-use blaze_scope::resolve::{Names, Place};
+use blaze_scope::names::{PathError, Why, Written};
+use blaze_scope::resolve::Names;
 use blaze_scope::task::to_path;
-use blaze_surface::{Def, DefKind, ItemDetail, Namespace};
+use blaze_surface::{Def, DefKind, ItemDetail, ItemKind, Namespace};
+
+use crate::front2::source::NamesSource;
 
 /// The namespace a path's last segment is looked up in first; the other is tried next, as a
 /// struct named in an expression (`S { .. }`) is a type and a unit struct is also a value.
@@ -82,13 +84,19 @@ impl core::fmt::Display for ResolveError {
     }
 }
 
-/// The front end's view of every crate's resolved names.
+/// The front end's view of the names of every crate, over any source of them
+/// ([`NamesSource`]: the solved names, or each crate's records): a written path's meaning as
+/// the front end lowers by it. `Paths { names }` over a `&Names` is [`Resolver`].
 #[derive(Clone, Copy)]
-pub struct Resolver<'n> {
-    pub names: &'n Names<'n>,
+pub struct Paths<S> {
+    pub names: S,
 }
 
-impl<'n> Resolver<'n> {
+/// The front end's view of every crate's resolved names: [`Paths`] over the solved names (the
+/// name every function not yet switched to a source says).
+pub type Resolver<'n> = Paths<&'n Names<'n>>;
+
+impl<'n, S: NamesSource<'n>> Paths<S> {
     /// `segments` written in `module` (with a leading `::` when `abs`), its last segment looked
     /// up in `ns` and then in the other namespace.
     pub fn path(&self, module: ItemKey, abs: bool, segments: &[&str], ns: Ns) -> Result<Target, ResolveError> {
@@ -103,17 +111,17 @@ impl<'n> Resolver<'n> {
             Ns::Type => Namespace::Values,
             Ns::Value => Namespace::Types,
         };
-        let found = match names::path(self.names, module, first, w, Alloc::global()) {
+        let found = match self.names.walk(module, first, w) {
             Err(PathError { at, why: Why::NotFound, .. }) if at + 1 == w.segments.len() => {
-                names::path(self.names, module, other, w, Alloc::global())
+                self.names.walk(module, other, w)
             }
             // `E::V` asked as a value that stops at the enum `E`: a struct-like variant is in
             // the type namespace only (the Reference, "Namespaces"; "Struct expressions": its
             // path names the variant), so the whole path is asked there; a value answer that
             // is not a variant stays as it was (`E::assoc_fn` is type-relative).
             Ok(f) if ns == Ns::Value && f.def.kind == DefKind::Enum && f.consumed + 1 == w.segments.len() => {
-                match names::path(self.names, module, Namespace::Types, w, Alloc::global()) {
-                    Ok(t) if t.consumed == w.segments.len() && self.names.place(t.def.key).is_none() => Ok(t),
+                match self.names.walk(module, Namespace::Types, w) {
+                    Ok(t) if t.consumed == w.segments.len() && !self.names.has_text(t.def.key) => Ok(t),
                     _ => Ok(f),
                 }
             }
@@ -125,9 +133,9 @@ impl<'n> Resolver<'n> {
         let head = (segments.len() - w.segments.len()) as u32;
         let consumed = found.consumed as u32 + head;
         // A variant is no item of a module: its enum is the prefix one segment shorter.
-        if self.names.place(found.def.key).is_none() && found.def.kind != DefKind::Module && found.consumed >= 2 {
+        if !self.names.has_text(found.def.key) && found.def.kind != DefKind::Module && found.consumed >= 2 {
             let prefix = Written { kind: w.kind, segments: &w.segments[..found.consumed - 1] };
-            if let Ok(e) = names::path(self.names, module, Namespace::Types, prefix, Alloc::global()) {
+            if let Ok(e) = self.names.walk(module, Namespace::Types, prefix) {
                 if e.def.kind == DefKind::Enum {
                     if let Some(index) = self.variant_index(e.def.key, found.def.key) {
                         return Ok(Target { key: found.def.key, kind: Kind::Variant { adt: e.def.key, index }, consumed });
@@ -154,7 +162,9 @@ impl<'n> Resolver<'n> {
                 None => Err(ResolveError::NoText { key: def.key }),
             };
         }
-        let Some(detail) = self.detail(def.key) else {
+        // The entry's kind decides (asked without its detail's data, which a crate's records
+        // do not hold for every kind); only a kind a path does not name carries its detail.
+        let Some(kind) = self.names.kind_of_item(def.key) else {
             // A variant reached with no enum before it (`Ok` through the prelude's `use`): its
             // enum is the row of its crate's `enums` table that holds it.
             return match self.variant_of(def.key) {
@@ -162,73 +172,68 @@ impl<'n> Resolver<'n> {
                 None => Err(ResolveError::NoText { key: def.key }),
             };
         };
-        Ok(match detail {
-            ItemDetail::Fn { .. } => Kind::Fn,
-            ItemDetail::Const { .. } => Kind::Const,
-            ItemDetail::Static { .. } => Kind::Static,
-            ItemDetail::Struct => Kind::Struct,
-            ItemDetail::Enum => Kind::Enum,
-            ItemDetail::Union => Kind::Union,
-            ItemDetail::Trait => Kind::Trait,
-            ItemDetail::TraitAlias => Kind::TraitAlias,
-            ItemDetail::TypeAlias => Kind::TypeAlias,
-            ItemDetail::Mod { .. } | ItemDetail::ExternCrate { .. } => Kind::Module,
-            ItemDetail::MacroRules { .. } | ItemDetail::MacroDef => Kind::Macro,
-            other => Kind::Other(other),
+        Ok(match kind {
+            ItemKind::Function => Kind::Fn,
+            ItemKind::Const => Kind::Const,
+            ItemKind::Static => Kind::Static,
+            ItemKind::Struct => Kind::Struct,
+            ItemKind::Enum => Kind::Enum,
+            ItemKind::Union => Kind::Union,
+            ItemKind::Trait => Kind::Trait,
+            ItemKind::TraitAlias => Kind::TraitAlias,
+            ItemKind::TypeAlias => Kind::TypeAlias,
+            ItemKind::Module | ItemKind::ExternCrate => Kind::Module,
+            ItemKind::MacroRules | ItemKind::Macro2 => Kind::Macro,
+            _ => Kind::Other(self.detail(def.key).ok_or(ResolveError::NoText { key: def.key })?),
         })
     }
 
     /// The outline entry of an item with text.
     pub fn detail(&self, key: ItemKey) -> Option<ItemDetail> {
-        let Place { krate, at, item } = self.names.place(key)?;
-        let (_, outline) = self.names.outline_at(krate, at)?;
-        Some(outline.item(item).detail)
+        self.names.detail_of(key)
     }
 
     /// The enum `variant` is in and its index there, from its crate's `enums` table.
     pub fn variant_of(&self, variant: ItemKey) -> Option<(ItemKey, u32)> {
-        let c = self.names.crate_of(variant)?;
-        self.names.krate(c).tables.enums.iter().find_map(|(e, vs)| vs.iter().position(|v| v.key == variant).map(|i| (*e, i as u32)))
+        self.names.variant_of(variant)
     }
 
     /// The trait or impl `member` (a member's library key) is of, and its name, from its
     /// crate's `members` table.
     pub fn member_of(&self, member: ItemKey) -> Option<(ItemKey, &'n str)> {
-        let c = self.names.crate_of(member)?;
-        self.names.krate(c).tables.members.iter().find_map(|(owner, ms)| ms.iter().find(|m| m.key == member).and_then(|m| m.name.map(|n| (*owner, n))))
+        self.names.member_owner(member)
     }
 
     /// The index of `variant` among `adt`'s variants.
     pub fn variant_index(&self, adt: ItemKey, variant: ItemKey) -> Option<u32> {
-        let c = self.names.crate_of(adt)?;
-        let vs = self.names.krate(c).tables.enums.get(&adt)?;
+        let vs = self.names.variants(adt)?;
         vs.iter().position(|v| v.key == variant).map(|i| i as u32)
     }
 
     /// The traits method resolution may use in `module`, sorted.
     pub fn traits_in_scope(&self, module: ItemKey) -> Result<Vec<ItemKey, Global>, ResolveError> {
-        let found = names::traits_in_scope(self.names, module, Alloc::global()).map_err(ResolveError::Path)?;
+        let found = self.names.traits_in_scope(module, Alloc::global()).map_err(ResolveError::Path)?;
         let mut out = Vec::with_capacity_in(found.len(), Global);
         out.extend_from_slice(&found);
         Ok(out)
     }
 
-    /// The crate key of the crate `module` is in; a module of no crate the names hold is the
-    /// library's `NotRead`.
     /// The definition the macro path `segments` written in `module` names, as the names
     /// library holds it (`None`: a definition with no source record).
     pub fn macro_body(&self, module: ItemKey, abs: bool, segments: &[&str]) -> Result<Option<blaze_scope::task::MacroBody<'n>>, ResolveError> {
         let krate = self.krate_key(module)?;
         let written = to_path(abs, segments, krate, Alloc::global());
         let w = Written { kind: written.kind, segments: &written.segments };
-        let found = self.names.item_at(module, Namespace::Macros, w, Alloc::global()).map_err(ResolveError::Path)?;
-        Ok(found.macro_src.map(|s| s.body))
+        self.names.macro_body_of(module, w).map_err(ResolveError::Path)
     }
 
+    /// The crate key of the crate `module` is in; a module of no crate the names hold is the
+    /// library's `NotRead`.
     fn krate_key(&self, module: ItemKey) -> Result<CrateItemKey, ResolveError> {
+        let not_read = ResolveError::Path(PathError { module, at: 0, why: Why::NotRead { module } });
         match self.names.crate_of(module) {
-            Some(c) => Ok(self.names.krate(c).key),
-            None => Err(ResolveError::Path(PathError { module, at: 0, why: Why::NotRead { module } })),
+            Some(c) => self.names.crate_key(c).ok_or(not_read),
+            None => Err(not_read),
         }
     }
 }

@@ -11,8 +11,14 @@
 //! crate's impl table like any impl, with the block's module as the module its header and
 //! members are read in.
 //!
-//! Only a block on the way to an `impl` is written (a body with none makes nothing), with
-//! EVERY item statement of it, in text order (a `macro_rules!` before its uses). A block's
+//! Only a block on the way to an `impl`, a struct, an enum, a union or a type alias is
+//! written (a body with none makes nothing: a block's `fn`, `const`, `static` and `use` are
+//! resolved by the body's own lowering), with
+//! EVERY item statement of it, in text order (a `macro_rules!` before its uses). A struct,
+//! enum, union or alias of a block is so an item of the block's module: its head is made by
+//! the ordinary code, in a scope without the enclosing function's generics and locals (the
+//! quote above), and its derives expand there; [`block_modules`] gives a reader of the body
+//! the module's key. A block's
 //! module is named by its ordinal among the body's written blocks, in text order, so its key
 //! and its impls' keys change only with an edit to the same body.
 //!
@@ -30,6 +36,7 @@
 use core::fmt::Write as _;
 
 use blaze_file_items::nested::{Nested, NestedKind};
+use blaze_id::{CrateItemKey, ItemKey};
 use blaze_own::{AString, AVec, Alloc};
 
 /// The name of the module of a body's `ordinal`th written block.
@@ -43,14 +50,14 @@ enum Event {
     Call(u32),
 }
 
-/// The module text of the blocks of `text` (one item's whole text, scanned to `nested`) that
-/// hold an impl or a block that does; empty when no block holds one.
-pub fn module_text<'a>(text: &str, nested: &Nested<'_>, alloc: Alloc<'a>) -> AString<'a> {
-    let mut out = AString::new_in(alloc);
+/// Which blocks of `nested` are written as modules: one that holds an item that makes a
+/// module ([`NestedKind::makes_module`]: an impl, a struct, an enum, a union, a type alias),
+/// and every block around it.
+fn written_blocks<'a>(nested: &Nested<'_>, alloc: Alloc<'a>) -> AVec<'a, bool> {
     let blocks = &nested.blocks;
     let mut written: AVec<'a, bool> = AVec::new_in(alloc);
     written.resize(blocks.len(), false);
-    for item in nested.items.iter().filter(|i| i.kind == NestedKind::Impl) {
+    for item in nested.items.iter().filter(|i| NestedKind::makes_module(i.kind)) {
         let mut at = Some(item.block);
         // A chain is at most as long as the body's blocks.
         for _ in 0..blocks.len() {
@@ -61,6 +68,49 @@ pub fn module_text<'a>(text: &str, nested: &Nested<'_>, alloc: Alloc<'a>) -> ASt
             at = blocks[b as usize].parent;
         }
     }
+    written
+}
+
+/// The key of the module of each block of `nested` (the scan of the whole text of the item or
+/// member `body` of the crate `krate`), `None` for a block that is not written: the keys
+/// `resolve.rs` `make_blocks` and the lowering give the modules of [`module_text`], derived
+/// here from the same scan so a reader of the body (front2's `Locals::keep`) names a block's
+/// module without a table: the fragment is `(body, "blocks", "", 0)`, a block's module
+/// `(the fragment or the written block around it, "mod", its name, 0)`, its name
+/// [`BLOCK_MODULE`] and its ordinal among the written blocks in text order (the order of
+/// [`Nested::blocks`], which is the order their `{` is written).
+pub fn block_modules<'a>(krate: CrateItemKey, body: ItemKey, nested: &Nested<'_>, alloc: Alloc<'a>) -> AVec<'a, Option<ItemKey>> {
+    let written = written_blocks(nested, alloc);
+    let fragment = crate::task::key_of(krate, body, "blocks", "", 0);
+    let mut keys: AVec<'a, Option<ItemKey>> = AVec::new_in(alloc);
+    keys.resize(nested.blocks.len(), None);
+    let mut ordinal = 0u32;
+    for (b, block) in nested.blocks.iter().enumerate() {
+        if !written[b] {
+            continue;
+        }
+        // A block's `{` is written after its parent's, so the parent's key is made; a written
+        // block's parent is written.
+        let outer = match block.parent {
+            Some(p) => keys.get(p as usize).copied().flatten(),
+            None => Some(fragment),
+        };
+        let mut name = AString::new_in(alloc);
+        // Writing to an own string does not fail.
+        let _ = write!(name, "{BLOCK_MODULE}{ordinal}");
+        ordinal += 1;
+        keys[b] = outer.map(|o| crate::task::key_of(krate, o, "mod", name.as_str(), 0));
+    }
+    keys
+}
+
+/// The module text of the blocks of `text` (one item's whole text, scanned to `nested`) that
+/// hold an impl, a struct, an enum, a union or a type alias, or a block that does; empty when
+/// no block holds one.
+pub fn module_text<'a>(text: &str, nested: &Nested<'_>, alloc: Alloc<'a>) -> AString<'a> {
+    let mut out = AString::new_in(alloc);
+    let blocks = &nested.blocks;
+    let written = written_blocks(nested, alloc);
     let mut events: AVec<'a, (u32, Event)> = AVec::new_in(alloc);
     for (b, block) in blocks.iter().enumerate() {
         if written[b] {
@@ -149,7 +199,32 @@ mod tests {
 
     #[test]
     fn no_impl_no_module() {
-        assert_eq!(made("fn f() { fn g() {} struct S; m!{ impl A for B {} } let s = \"impl\"; }"), "");
+        assert_eq!(made("fn f() { fn g() {} const K: u8 = 1; use a::b; m!{ impl A for B {} } let s = \"impl struct\"; }"), "");
+    }
+
+    /// A block that declares a struct, an enum, a union or a type alias is a module too (the
+    /// Reference, "Statements", "Item declarations": the item's "scope" is "the block
+    /// containing the statement"), with its attributes, so a derive on it expands there; and
+    /// `block_modules` names each written block's module as the lowering keys it: the
+    /// fragment `(body, "blocks", "", 0)`, then `(outer, "mod", "__blaze_block_N", 0)`.
+    #[test]
+    fn a_block_with_a_type_is_a_module() {
+        let text = "fn f() { if c { } { #[derive(Clone)] enum F { A, B } } struct V<'de> { m: P<&'de ()> } type Al = u8; let v = V { m: P }; }";
+        assert_eq!(
+            made(text),
+            "mod __blaze_block_0 {\nuse super::*;\nmod __blaze_block_1 {\nuse super::*;\n#[derive(Clone)] enum F { A, B }\n}\nstruct V<'de> { m: P<&'de ()> }\ntype Al = u8;\n}\n"
+        );
+        let alloc = Alloc::global();
+        let krate = blaze_id::CrateItemKey(blaze_id::ContentId::of("a test crate", b"a_block_with_a_type_is_a_module"));
+        let body = crate::task::root_key(krate);
+        let keys = super::block_modules(krate, body, &scan(text, alloc), alloc);
+        let fragment = crate::task::key_of(krate, body, "blocks", "", 0);
+        let outer = crate::task::key_of(krate, fragment, "mod", "__blaze_block_0", 0);
+        let inner = crate::task::key_of(krate, outer, "mod", "__blaze_block_1", 0);
+        let made: std::vec::Vec<_> = keys.iter().copied().flatten().collect();
+        assert_eq!(made, [outer, inner]);
+        // The `if`'s block and the struct literal's braces are not written.
+        assert_eq!(keys.iter().filter(|k| k.is_none()).count(), keys.len() - 2);
     }
 
     #[test]

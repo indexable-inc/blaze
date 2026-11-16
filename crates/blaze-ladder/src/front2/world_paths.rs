@@ -43,14 +43,41 @@ impl BodyWorld<'_, '_> {
         // The items of the body's blocks, innermost first, before the module's
         // ([`super::locals`]); a local `use` names its path, resolved at the module.
         let mut via_use = None;
+        // The module the path is resolved at: the body's, or the block's module of the local
+        // struct, enum, union or alias its first segment names.
+        let mut at_module = self.module;
+        let mut local_type = None;
         let ns = if written.len() == 1 { LocalNs::Value } else { LocalNs::Type };
-        if let Some(row) = self.store.locals.find(self.owner, Some(scope.0), first, ns) {
+        let mut found = self.store.locals.find(self.owner, Some(scope.0), first, ns);
+        if found.is_none() && ns == LocalNs::Value {
+            // A one-segment path may be a type's name (a struct expression's or a pattern's
+            // path: an enum, a union, an alias). Only a type of a block's module is taken
+            // here: the name solver at that module then answers for the value namespace too,
+            // so a value of the same name outside the block is still found first.
+            found = self.store.locals.find(self.owner, Some(scope.0), first, LocalNs::Type).filter(|r| r.kind.in_block_module());
+        }
+        if let Some(row) = found {
             let k = checker_of(row.key);
             let def = match row.kind {
                 LocalKind::Use => {
                     via_use = Some(row);
                     None
                 }
+                // A struct, enum, union or alias of a block is an item of the block's module
+                // in the names library (blaze-scope blocks.rs): the path is resolved there by
+                // the one name solver, whose answer carries the item's key, and the code
+                // below treats it as any module's item (its head by `Store::step`). The
+                // Reference, "Statements", "Item declarations": "There is no implicit capture
+                // of the containing function's generic parameters, parameters, and local
+                // variables": a module's item sees none of them.
+                LocalKind::Struct | LocalKind::Enum | LocalKind::Union | LocalKind::TypeAlias => match row.module {
+                    Some(m) => {
+                        at_module = m;
+                        local_type = Some(row);
+                        None
+                    }
+                    None => return self.gap(Gap::Local(LocalGap { item: row.key, form: row.kind.unplaced(), range: row.range })),
+                },
                 LocalKind::Fn | LocalKind::Const if self.store.fns.contains_key(&k) => Some(if row.kind == LocalKind::Fn { Def::Fn(k) } else { Def::Const(k) }),
                 LocalKind::Fn | LocalKind::Const | LocalKind::Static if !self.store.fns.contains_key(&k) => return self.fill(Fill::Store(Want::Fn(row.key))),
                 LocalKind::Static => match self.store.statics.get(&k) {
@@ -82,8 +109,15 @@ impl BodyWorld<'_, '_> {
             _ => (false, &written[..]),
         };
         let lead = (written.len() - rest.len()) as u32;
-        let target = match self.resolver().path(self.module, abs, rest, Ns::Value) {
+        let target = match self.resolver().path(at_module, abs, rest, Ns::Value) {
             Ok(t) => t,
+            // A block's item the body's lowering listed, which the name solver does not find
+            // under its block's module (a later segment it cannot read): never "the program
+            // names nothing" for a name that is declared.
+            Err(ResolveError::Path(_)) if written.len() == 1 => match local_type {
+                Some(row) => return self.gap(Gap::Local(LocalGap { item: row.key, form: row.kind.unplaced(), range: row.range })),
+                None => return Ok(None),
+            },
             // The program names nothing: the checker's own diagnostic.
             Err(ResolveError::Path(_)) => return Ok(None),
             Err(e @ ResolveError::NoText { .. }) => return self.gap(Gap::Resolve(e)),

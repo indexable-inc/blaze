@@ -213,6 +213,13 @@ pub trait Heads {
     fn const_params(&self, item: LibKey) -> Option<&[(u32, PTy)]>;
     /// The checker key of a library key (filed in the key map at the start).
     fn checker(&self, key: LibKey) -> ItemKey;
+    /// How many lowerings of a written bound's arguments are nested right now
+    /// ([`super::written`], which bounds it: a bound read to find the trait of a path written
+    /// in itself is a cycle of the program, refused by name, never a stack that runs out).
+    /// `None` (the default): these heads count none, and such a path is refused by name.
+    fn written_depth(&self) -> Option<&core::cell::Cell<u32>> {
+        None
+    }
 }
 
 /// A trait alias's head. The unstable book, `trait_alias`: "Trait aliases ... `trait Foo = Bar
@@ -824,6 +831,15 @@ impl<'b, 'n, H: Heads> Builder<'b, 'n, H> {
                 (1, SelfTy::Ty(t, _)) => Ok(t),
                 (2, SelfTy::Trait(tr)) => {
                     let (g, _) = self.heads.trait_head(tr).ok_or(Why::Need(tr))?;
+                    // The trait's supertraits are filed when its own bounds are lowered
+                    // (heads.rs `trait_members`); until then `v` IS its header, and a name the
+                    // trait does not declare is found through the bounds written there
+                    // ([`super::written`]): asking for the filed supertraits here is the trait's
+                    // members needing themselves (reth's `trait Call: LoadState<Error:
+                    // From<Self::Evm>> + ..`, the cycle that stopped tempo's contracts).
+                    if self.heads.trait_supers(tr).is_none() && !self.heads.trait_has_assoc(tr, Name::of(texts[1])).ok_or(Why::Need(tr))? {
+                        return self.written_self_assoc(tys, env, v, Name::of(texts[1]), r, shown);
+                    }
                     let mut args = Vec::with_capacity_in(g as usize, Global);
                     for i in 0..g {
                         args.push(intern(tys, PNode::Param(i))?);
@@ -861,7 +877,7 @@ impl<'b, 'n, H: Heads> Builder<'b, 'n, H> {
                 if !kids.is_empty() {
                     return Err(Why::Unsupported("type arguments on a parameter's associated type (`T::X<A>`)", r));
                 }
-                return self.param_assoc(tys, env, i, Name::of(texts[1]), r, shown);
+                return self.param_assoc(tys, env, v, i, Name::of(texts[1]), r, shown);
             }
         }
         let found = match self.resolver.path(env.module, abs, &texts, Ns::Type) {
@@ -920,8 +936,12 @@ impl<'b, 'n, H: Heads> Builder<'b, 'n, H> {
     }
 
     /// `T::name` with `T` the parameter `param`: `<T as Tr>::name` for the one trait `Tr` among
-    /// `T`'s bounds in `env`, supertraits included, that declares `name`.
-    fn param_assoc(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, param: u32, name: Name, r: Range, shown: &str) -> Result<PTy, Why> {
+    /// `T`'s bounds in `env`, supertraits included, that declares `name`. While the bounds are
+    /// themselves being lowered (`Bounds::Building`) and none lowered so far declares it, the
+    /// bounds of `T` as written in the header `v` are read ([`super::written`]: `T:
+    /// Tr<T::X> + Declares`, a bound naming `X` before the bound that declares it).
+    #[expect(clippy::too_many_arguments, reason = "the path, where it is written, and the parameter")]
+    fn param_assoc(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, param: u32, name: Name, r: Range, shown: &str) -> Result<PTy, Why> {
         let (bounds, done) = match env.bounds {
             Bounds::Building(b) => (b, false),
             Bounds::Done(b) => (b, true),
@@ -936,7 +956,10 @@ impl<'b, 'n, H: Heads> Builder<'b, 'n, H> {
         }
         match found.as_slice() {
             &[(t, a)] => self.alias(tys, t, name, a, r, shown),
-            [] if !done => Err(Why::Unsupported("`T::X` in a bound written before the bound of `T` that declares `X`", r)),
+            [] if !done => match self.written_param_assoc(tys, env, v, param, name, r, shown)? {
+                Some(t) => Ok(t),
+                None => Err(Why::Unsupported("`T::X` in a bound written before the bound of `T` that declares `X`", r)),
+            },
             [] => Err(Why::AssocNotFound(Box::from(shown), r)),
             many => {
                 let mut traits = Vec::with_capacity_in(many.len(), Global);

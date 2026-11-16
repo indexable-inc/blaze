@@ -161,7 +161,11 @@ pub fn check_body_counted(
         }
         // A failed candidate is a gap only of a question it is a candidate of (the world's
         // `impls_of`/`inherent`), never of every body checked after it failed.
-        let gaps = world.gaps.into_inner();
+        let mut gaps = world.gaps.into_inner();
+        // A const term the body's conversion left a hole (`[0u8; N * 2]`, `f::<{ N + 1 }>()`)
+        // was checked as a const variable, which takes any value: a gap of every round, so
+        // the finished check is no answer and none of its diagnostics is the program's.
+        gaps.extend(body.typeck.const_gaps.iter().map(|&gap| Gap::BodyConst { owner, gap }));
         let round_gaps = !gaps.is_empty();
         for gap in gaps {
             // `Gap` holds checker questions and library errors with no `Eq`: one gap is one

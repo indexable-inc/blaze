@@ -174,3 +174,146 @@ fn two_bounds_with_one_name_are_ambiguous() {
     let d = param_path(&fx, both, "N", &Want { exprs: &[], pats: &[], diags: &[(DiagCode::AmbiguousMethod, ExprId(0))] });
     assert!(d.is_empty(), "\n{}", d.join("\n"));
 }
+
+/// `Self` as a VALUE in an impl: tempo's "347 diag E0423" (alloy's `sol!` writes
+/// `fn from(tuple: UnderlyingRustTuple<'_>) -> Self { Self }` for an error with no fields,
+/// `Self(tuple.0, ..)` for a tuple-shaped one). The Reference, "Paths", "`Self`": "In an
+/// implementation, it refers to the type being implemented. When implementing a tuple or unit
+/// struct, it also refers to the constructor in the value namespace." A braced struct has no
+/// such constructor (E0423 kept), and a `type` alias gets no such rule (the Reference, "Type
+/// aliases": "A type alias to a tuple-struct or unit-struct cannot be used to qualify that
+/// type's constructor"). The world answers `Self` with `Def::Adt` consuming one segment, as
+/// blaze-ladder front2/world_paths.rs does; the real-front-end form is blaze-ladder
+/// tests/front2_selfpaths.rs (`d1`).
+///
+/// ```text
+/// struct U;          impl U  { fn mk() -> Self { Self } }
+/// struct T2(u8, u8); impl T2 { fn mk() -> Self { Self(1u8, 2u8) } fn f() -> fn(u8, u8) -> T2 { Self } }
+/// struct W<T>(T);    impl<T> W<T> { fn new(t: T) -> Self { Self(t) } fn g() -> W<u8> { Self(1u8) } }
+/// struct B { a: u8 } impl B  { fn bad() -> Self { Self } }      // E0423
+/// ```
+///
+/// Each test fails without `Machine::self_ctor_value` (rules/lit_path.rs): `Self` is then
+/// E0423 at expression 0; `g` fails if the ctor took fresh arguments instead of the impl's.
+/// The world of one struct `name` and an inherent impl of it: `fields` gives a unit or tuple
+/// struct's field types in the world's table (`None`: braced, `{ a: u8 }`).
+fn self_ctor_world(name: &str, generics: u32, fields: Option<fn(&mut Fx) -> Vec<crate::portable::PTy>>) -> (Fx, ItemKey, ItemKey) {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let u8_ = fx.u8();
+    let k = match fields {
+        Some(make) => {
+            let tys = make(&mut fx);
+            fx.tuple_strukt(name, generics, &tys)
+        }
+        None => fx.strukt(name, generics, &[("a", u8_)]),
+    };
+    let params: Vec<crate::portable::PTy> = (0..generics).map(|i| fx.param(i)).collect();
+    let self_t = fx.adt(k, &params);
+    fx.use_path("Self", Def::Adt(k));
+    let imp = fx.imp("impl", generics, self_t, None, &[], Vec::new());
+    (fx, k, imp)
+}
+
+/// `struct U; impl U { fn mk() -> Self { Self } }`: `Self` is the unit value `U`.
+#[test]
+fn self_is_a_unit_structs_value() {
+    let (mut fx, k, imp) = self_ctor_world("U", 0, Some(|_| Vec::new()));
+    let u_t = fx.adt(k, &[]);
+    let mk = fx.impl_fn(imp, "mk", false, &[], u_t);
+    fx.finish();
+    let mut b = Bb::new();
+    let s = b.path(&["Self"]);
+    let root = b.block(&[], Some(s));
+    let c = check_body(&fx, &b, mk, root, Plant::None, InferPlant::None);
+    let want = Want { exprs: &[(ExprId(0), "U"), (ExprId(1), "U")], pats: &[], diags: &[] };
+    let d = written(differences(&fx, &b, &c, &want));
+    assert!(d.is_empty(), "\n{}", d.join("\n"));
+}
+
+/// `struct T2(u8, u8)`: `Self(1u8, 2u8)` calls the ctor; bare `Self` is the ctor fn, which
+/// coerces to `fn(u8, u8) -> T2`.
+#[test]
+fn self_is_a_tuple_structs_constructor() {
+    let (mut fx, k, imp) = self_ctor_world("T2", 0, Some(|fx| {
+        let u8_ = fx.u8();
+        std::vec![u8_, u8_]
+    }));
+    let u8_ = fx.u8();
+    let t_t = fx.adt(k, &[]);
+    let mk = fx.impl_fn(imp, "mk", false, &[], t_t);
+    let io = fx.list(&[u8_, u8_, t_t]);
+    let ptr = fx.ty(crate::portable::PNode::FnPtr(io, crate::ids::FnPtrHeader::RUST));
+    let f = fx.impl_fn(imp, "f", false, &[], ptr);
+    fx.finish();
+
+    let mut b = Bb::new();
+    let s = b.path(&["Self"]);
+    let one = b.int(Some(IntSuffix::Uint(UintTy::U8)));
+    let two = b.int(Some(IntSuffix::Uint(UintTy::U8)));
+    let call = b.call(s, &[one, two]);
+    let root = b.block(&[], Some(call));
+    let c = check_body(&fx, &b, mk, root, Plant::None, InferPlant::None);
+    let want = Want { exprs: &[(ExprId(0), "fn T2"), (ExprId(1), "u8"), (ExprId(2), "u8"), (ExprId(3), "T2"), (ExprId(4), "T2")], pats: &[], diags: &[] };
+    let d = written(differences(&fx, &b, &c, &want));
+    assert!(d.is_empty(), "mk:\n{}", d.join("\n"));
+
+    let mut b = Bb::new();
+    let s = b.path(&["Self"]);
+    let root = b.block(&[], Some(s));
+    let c = check_body(&fx, &b, f, root, Plant::None, InferPlant::None);
+    let want = Want { exprs: &[(ExprId(0), "fn T2")], pats: &[], diags: &[] };
+    let d = written(differences(&fx, &b, &c, &want));
+    assert!(d.is_empty(), "f:\n{}", d.join("\n"));
+}
+
+/// `impl<T> W<T> { fn new(t: T) -> Self { Self(t) } }` is clean; `fn g() -> W<u8> { Self(1u8) }`
+/// is E0308: `Self` is `W<T>`'s ctor at the impl's `T`, not `W` at fresh arguments.
+#[test]
+fn self_constructor_takes_the_impls_arguments() {
+    let (mut fx, k, imp) = self_ctor_world("W", 1, Some(|fx| std::vec![fx.param(0)]));
+    let p0 = fx.param(0);
+    let u8_ = fx.u8();
+    let w_t = fx.adt(k, &[p0]);
+    let w_u8 = fx.adt(k, &[u8_]);
+    let new = fx.impl_fn(imp, "new", false, &[p0], w_t);
+    let g = fx.impl_fn(imp, "g", false, &[], w_u8);
+    fx.finish();
+
+    let mut b = Bb::new();
+    let t = b.param("t");
+    let s = b.path(&["Self"]);
+    let arg = b.local(t);
+    let call = b.call(s, &[arg]);
+    let root = b.block(&[], Some(call));
+    let c = check_body(&fx, &b, new, root, Plant::None, InferPlant::None);
+    let want = Want { exprs: &[(ExprId(1), "P0"), (ExprId(2), "W<P0>"), (ExprId(3), "W<P0>")], pats: &[], diags: &[] };
+    let d = written(differences(&fx, &b, &c, &want));
+    assert!(d.is_empty(), "new:\n{}", d.join("\n"));
+
+    let mut b = Bb::new();
+    let s = b.path(&["Self"]);
+    let one = b.int(Some(IntSuffix::Uint(UintTy::U8)));
+    let call = b.call(s, &[one]);
+    let root = b.block(&[], Some(call));
+    let c = check_body(&fx, &b, g, root, Plant::None, InferPlant::None);
+    assert!(c.diags.iter().any(|d| d.code == DiagCode::Mismatch), "g: want E0308, got {:?}", c.diags.iter().map(|d| d.code).collect::<Vec<_>>());
+}
+
+/// `struct B { a: u8 } impl B { fn bad() -> Self { Self } }`: E0423 (a braced struct has no
+/// ctor in the value namespace), at `Self`.
+#[test]
+fn self_of_a_braced_struct_is_not_a_value() {
+    let (mut fx, k, imp) = self_ctor_world("B", 0, None);
+    let b_t = fx.adt(k, &[]);
+    let bad = fx.impl_fn(imp, "bad", false, &[], b_t);
+    fx.finish();
+    let mut b = Bb::new();
+    let s = b.path(&["Self"]);
+    let root = b.block(&[], Some(s));
+    let c = check_body(&fx, &b, bad, root, Plant::None, InferPlant::None);
+    let want = Want { exprs: &[], pats: &[], diags: &[(DiagCode::NotAValue, ExprId(0))] };
+    let d = written(differences(&fx, &b, &c, &want));
+    assert!(d.is_empty(), "\n{}", d.join("\n"));
+}

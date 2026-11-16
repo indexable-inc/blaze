@@ -139,6 +139,29 @@ impl LocalKind {
         matches!(self, LocalKind::Struct | LocalKind::Enum | LocalKind::Union | LocalKind::Trait | LocalKind::TypeAlias | LocalKind::Mod | LocalKind::Use)
     }
 
+    /// Whether an item of this kind is an item of its block's MODULE in the names library
+    /// (blaze-scope blocks.rs; `blaze_file_items::nested::NestedKind::makes_module`): a
+    /// struct, enum, union or type alias. Its key is the library's, its head is made by the
+    /// ordinary code ([`super::heads`]'s `Store::step`), and a path naming it is resolved by
+    /// the one name solver at that module ([`Row::module`]).
+    pub fn in_block_module(self) -> bool {
+        matches!(self, LocalKind::Struct | LocalKind::Enum | LocalKind::Union | LocalKind::TypeAlias)
+    }
+
+    /// The gap's words for a struct, enum, union or alias whose block has no module in the
+    /// names library: one a macro call in the body wrote (the scan of the body's text does
+    /// not see it), or one in the body of an item that is itself local to a body (that item
+    /// has front2's derived key, not the library's: typeck.md, "Impls inside blocks", owed).
+    pub fn unplaced(self) -> &'static str {
+        match self {
+            LocalKind::Struct => "a struct in a block that a macro call wrote or that is in a local item's body",
+            LocalKind::Enum => "an enum in a block that a macro call wrote or that is in a local item's body",
+            LocalKind::Union => "a union in a block that a macro call wrote or that is in a local item's body",
+            LocalKind::TypeAlias => "a type alias in a block that a macro call wrote or that is in a local item's body",
+            other => other.form(),
+        }
+    }
+
     /// The outline entry its head is made from (as the names library's for a module item);
     /// `None` for a kind whose head the store does not make here.
     pub fn detail(self) -> Option<ItemDetail> {
@@ -172,6 +195,23 @@ pub struct Row<'n> {
     /// A `use`'s path to what it binds, and whether written with a leading `::`; empty else.
     pub path: &'n [&'n str],
     pub abs: bool,
+    /// For a struct, enum, union or type alias ([`LocalKind::in_block_module`]) written in
+    /// the body's own text: its block's module in the names library, which binds its name
+    /// (checked when kept). A path that names the item is resolved AT this module by the one
+    /// name solver, whose answer carries the item's one key (the library's). `None`: the
+    /// library made no such module ([`LocalKind::unplaced`]); for every other kind, unused.
+    pub module: Option<LibKey>,
+}
+
+/// A block of a body that is a module of the names library (blaze-scope blocks.rs): where
+/// its braces are in the body's text, and the module's key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlockModule {
+    /// The offset of its `{` in the body's text.
+    pub open: u32,
+    /// The offset after its `}`.
+    pub close: u32,
+    pub module: LibKey,
 }
 
 /// A body's local items: each block's parent, and the rows.
@@ -179,6 +219,11 @@ pub struct Row<'n> {
 pub struct BodyLocals<'n> {
     pub parents: &'n [Option<u32>],
     pub rows: &'n [Row<'n>],
+    /// The body's blocks that are modules holding a kept struct, enum, union or alias (and
+    /// the blocks around them), in the order their `{` is written: a type written at an
+    /// offset of the body's text is read at the LAST of these that holds the offset (the
+    /// innermost), else at the body's module (body.rs `BodyTypes::env_at`).
+    pub blocks: &'n [BlockModule],
 }
 
 /// What a local item's head is made from: its text, its module (its enclosing body's) and
@@ -291,6 +336,18 @@ impl<'n> Locals<'n> {
         }
         let parent = Self::parent(names, at);
         let frame = self.frame;
+        // The body's blocks as the names library made them modules: the same scan of the same
+        // text, so the same keys (`blaze_scope::blocks::block_modules`). None when the body
+        // is not an item or member of the library (a local item's own body).
+        let nested = blaze_file_items::nested::scan(at.text, alloc);
+        let modules = match Self::library_body(names, at) {
+            Some(body) if nested.end == blaze_file_items::nested::NestedEnd::Whole => Some(blaze_scope::blocks::block_modules(names.krate(at.krate).key, body, &nested, alloc)),
+            _ => None,
+        };
+        // The blocks whose module is known to exist: one that binds a kept item's name, and
+        // the blocks around it.
+        let mut known: blaze_own::AVec<'_, bool> = blaze_own::AVec::new_in(alloc);
+        known.resize(nested.blocks.len(), false);
         let parents: &'n mut [Option<u32>] = frame.alloc_slice_fill_with(scopes, |_| None);
         let mut rows: blaze_own::Vec<Row<'n>, &'n Frame> = blaze_own::Vec::new_in(frame);
         for (s, slot) in parents.iter_mut().enumerate() {
@@ -326,11 +383,33 @@ impl<'n> Locals<'n> {
                             UseForm::Glob => return Err(bad(Why::Unsupported("a glob use in a block", range))),
                         };
                         let path: &'n [&'n str] = frame.alloc_slice_copy(&leaf.segments);
-                        rows.push(Row { scope: s as u32, kind, name: bound, key: parent, range, path, abs: leaf.abs });
+                        rows.push(Row { scope: s as u32, kind, name: bound, key: parent, range, path, abs: leaf.abs, module: None });
                     }
                     continue;
                 }
-                rows.push(Row { scope: s as u32, kind, name, key: parent, range, path: &[], abs: false });
+                // A struct, enum, union or alias written in the body's text is an item of
+                // its block's module: the block the scan found its statement in, when the
+                // library's module there binds its name.
+                let mut in_module = None;
+                if let (true, Some(r), Some(ms)) = (kind.in_block_module(), view.item_relative(it.range), modules.as_ref()) {
+                    let stmt = nested.items.iter().find(|i| i.range.start <= r.start && r.start < i.range.end);
+                    let module = stmt.and_then(|i| ms.get(i.block as usize).copied().flatten());
+                    if let (Some(i), Some(m)) = (stmt, module) {
+                        if names.lookup(m, blaze_surface::Namespace::Types, name).is_some() {
+                            in_module = Some(m);
+                            let mut b = Some(i.block);
+                            // A chain is at most as long as the body's blocks.
+                            for _ in 0..nested.blocks.len() {
+                                let Some(here) = b else { break };
+                                if core::mem::replace(&mut known[here as usize], true) {
+                                    break;
+                                }
+                                b = nested.blocks[here as usize].parent;
+                            }
+                        }
+                    }
+                }
+                rows.push(Row { scope: s as u32, kind, name, key: parent, range, path: &[], abs: false, module: in_module });
                 // The key: derived from the body's, by kind, name and ordinal among the rows
                 // before it of the same kind and name (text order: no dependence on which body
                 // was checked first).
@@ -344,8 +423,29 @@ impl<'n> Locals<'n> {
             }
         }
         let rows: &'n [Row<'n>] = frame.alloc_slice_copy(&rows);
-        self.bodies.insert(at.owner, BodyLocals { parents, rows });
+        let mut blocks: blaze_own::Vec<BlockModule, &'n Frame> = blaze_own::Vec::new_in(frame);
+        if let Some(ms) = modules.as_ref() {
+            for (b, block) in nested.blocks.iter().enumerate() {
+                if let (true, Some(module)) = (known[b], ms.get(b).copied().flatten()) {
+                    blocks.push(BlockModule { open: block.open, close: block.close, module });
+                }
+            }
+        }
+        let blocks: &'n [BlockModule] = frame.alloc_slice_copy(&blocks);
+        self.bodies.insert(at.owner, BodyLocals { parents, rows, blocks });
         Ok(())
+    }
+
+    /// The library's key of the body `at` when it is an item or a member of the names
+    /// library: the item whose text is the body's text itself (the same slice), or the member
+    /// of `at.item` (a member's body is kept under its container) whose text is. `None`: a
+    /// body the library does not list under `at.item` (a local item's own body).
+    fn library_body(names: &Names<'_>, at: Enclosing<'_>) -> Option<LibKey> {
+        let same = |t: &str| core::ptr::eq(t.as_ptr(), at.text.as_ptr()) && t.len() == at.text.len();
+        if names.item_text(at.item).is_some_and(|it| same(it.text)) {
+            return Some(at.item);
+        }
+        names.members(at.item)?.iter().find(|m| same(m.text)).map(|m| m.key)
     }
 
     /// The local item `name` names in `ns`, written in block `scope` of the body `owner`: the

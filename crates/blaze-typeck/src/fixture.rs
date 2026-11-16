@@ -322,6 +322,43 @@ impl Fx {
         key
     }
 
+    /// A unit struct (`fields` empty) or a tuple struct (generics `generics`); NO path is put
+    /// in scope for it (a caller names it with [`Fx::use_path`], in the namespace its case
+    /// needs). A tuple struct's ctor is a fn of its own key, printed as the struct's name
+    /// (`fn_sig`: the struct's generics as its own, the fields as inputs, the struct as
+    /// output), as [`Fx::enum_`] makes a tuple variant's. Returns the struct's key.
+    pub fn tuple_strukt(&mut self, name: &str, generics: u32, tys: &[PTy]) -> ItemKey {
+        let key = self.key(name);
+        let params: Vec<PTy> = (0..generics).map(|i| self.param(i)).collect();
+        let self_ty = self.adt(key, &params);
+        let fields: Vec<Field> = tys.iter().enumerate().map(|(j, &ty)| Field { name: Name::of_index(j as u32), ty }).collect();
+        let ctor = if tys.is_empty() { CtorKind::Unit } else { CtorKind::Tuple };
+        let vkey = match ctor {
+            CtorKind::Tuple => self.key(name),
+            _ => key,
+        };
+        if ctor == CtorKind::Tuple {
+            let mut clauses = Vec::new();
+            self.implied_sized(0, generics, &mut clauses);
+            self.fns.push(FnRow {
+                key: vkey,
+                name: Name::of(name),
+                container: None,
+                parent: 0,
+                own: generics,
+                anon: 0,
+                self_param: false,
+                header: FnPtrHeader::RUST,
+                inputs: tys.to_vec(),
+                output: self_ty,
+                clauses,
+            });
+        }
+        let v = Variant { key: vkey, name: Name::of(name), ctor, fields: List { start: 0, len: fields.len() as u32 } };
+        self.adts.push(AdtRow { key, kind: AdtKind::Struct, generics, variants: std::vec![v], fields });
+        key
+    }
+
     /// An enum of tuple and unit variants (`(name, field types)`; no fields is a unit
     /// variant), its name a path in scope and each variant `Enum::Variant`. Each tuple
     /// variant's ctor is a fn (`fn_sig`: the enum's generics as its own, the fields as inputs,

@@ -71,6 +71,36 @@ impl<'n> Index<'n> {
         Ok(Index { impls, langs })
     }
 
+    /// The lang items the crates `lang_crates` declare, from any source of names, and no impl
+    /// (`impls` stays empty: over records an impl is filed by `buckets::Buckets::lazy` when a
+    /// question's home admits its crate, never listed up front). A proc-macro unit's lang rows
+    /// are skipped as [`Index::new`] skips the unit. Crates are read in the order given, so
+    /// which of two clashing declarations is `first` is a function of that order alone.
+    pub fn from_source<S: super::source::NamesSource<'n>>(names: S, lang_crates: &[usize]) -> Result<Index<'n>, LangTwice> {
+        let mut langs: HashMap<&'n str, LibKey, Global> = HashMap::new_in(Global);
+        let mut twice: Option<LangTwice> = None;
+        for &krate in lang_crates {
+            if names.proc_macro(krate) == Some(true) {
+                continue;
+            }
+            names.each_lang(krate, &mut |name, key| match langs.get(name) {
+                Some(&first) if first != key => {
+                    if twice.is_none() {
+                        twice = Some(LangTwice { name: name.into(), first, second: key });
+                    }
+                }
+                Some(_) => {}
+                None => {
+                    langs.insert(name, key);
+                }
+            });
+            if let Some(twice) = twice {
+                return Err(twice);
+            }
+        }
+        Ok(Index { impls: Vec::new_in(Global), langs })
+    }
+
     /// The item `#[lang = "name"]` declares.
     pub fn lang(&self, name: &str) -> Option<LibKey> {
         self.langs.get(name).copied()

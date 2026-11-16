@@ -23,14 +23,17 @@
 //! workspace unit's package name, version and source as the lock writes them, its kind (and
 //! binary name), its side and its features; a toolchain unit's pack digest and features.
 //!
-//! cfg. A workspace unit's cfg is [`Unit::cfg`] as is. A unit with a build script is counted
-//! apart ([`UnitCrates::build_scripts`]): its script's `rustc-cfg` is not joined yet.
+//! cfg. A workspace unit's cfg is [`Unit::cfg`] (the target's atoms, the profile's and the
+//! unit's features) and, for a unit with a build script, its script's `rustc-cfg` atoms once
+//! [`UnitCrates::join_scripts`] is given the script's outputs record; a unit with a build
+//! script and no record joined is counted apart ([`UnitCrates::build_scripts`]).
 
 #![blaze::sans_io]
 
 use core::fmt;
 use core::fmt::Write as _;
 
+use blaze_build_script::OutputsRef;
 use blaze_id::{ContentId, CrateItemKey};
 use blaze_manifest::lock::{Lock, LockId};
 use blaze_own::{AVec, Alloc};
@@ -45,6 +48,10 @@ use crate::resolve::CrateInput;
 #[cfg(test)]
 #[path = "tests/units.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/units_script.rs"]
+mod script_tests;
 
 /// The profile's atoms a toolchain unit is lowered under, beside its target's: `dev`, as the
 /// unit graph gives a workspace unit.
@@ -74,8 +81,12 @@ pub struct UnitCrate<'a> {
     /// The name it calls each dependency, and that crate's index in [`UnitCrates::crates`].
     pub deps: AVec<'a, (&'a str, usize)>,
     pub cfg: AVec<'a, (&'a str, Option<&'a str>)>,
-    /// A workspace unit with a build script, whose `rustc-cfg` is not in [`Self::cfg`].
+    /// A workspace unit with a build script. Its script's `rustc-cfg` atoms are in
+    /// [`Self::cfg`] exactly when [`Self::script`] is `Some` ([`UnitCrates::join_scripts`]).
     pub build_script: bool,
+    /// Its build script's outputs record, once joined: its cfg atoms are in [`Self::cfg`] and
+    /// its crate digest in [`Self::key`].
+    pub script: Option<OutputsRef<'a>>,
 }
 
 /// The crates of a workspace and its toolchain, by index (a [`CrateId`]).
@@ -84,7 +95,7 @@ pub struct UnitCrates<'a> {
     pub sysroot: Sysroot,
     /// How many toolchain crates lead [`Self::crates`]; the workspace's follow.
     pub toolchain: usize,
-    /// Of the workspace's crates, those with a build script (its cfg not joined).
+    /// Of the workspace's crates, those with a build script whose record is not joined.
     pub build_scripts: usize,
     alloc: Alloc<'a>,
 }
@@ -104,11 +115,67 @@ impl<'a> UnitCrates<'a> {
                 features: &c.features,
                 deps: &c.deps,
                 cfg: &c.cfg,
-                script: None,
+                script: c.script,
             });
         }
         out
     }
+
+    /// Joins each crate's build-script outputs record, by the same index (`None`: no record
+    /// for that crate): the record's `cargo::rustc-cfg` atoms go into the crate's cfg (bare
+    /// names and `key="value"` pairs alike), its crate digest into the crate's key (rule 21:
+    /// the cfg is an input of the names), and the record itself into [`UnitCrate::script`],
+    /// which [`Self::inputs`] hands on. This is the one place a script's cfg reaches a
+    /// crate of this list; a crate is matched by its index, so two versions of one package
+    /// take each its own record.
+    ///
+    /// Refused: a list of another length, a record for a crate with no build script, and a
+    /// crate joined twice.
+    pub fn join_scripts(&mut self, scripts: &[Option<OutputsRef<'a>>]) -> Result<(), UnitsError<'a>> {
+        if scripts.len() != self.crates.len() {
+            return Err(UnitsError::ScriptsCount { crates: self.crates.len(), given: scripts.len() });
+        }
+        let alloc = self.alloc;
+        let mut joined = 0;
+        for (c, record) in self.crates.iter_mut().zip(scripts) {
+            let Some(record) = *record else { continue };
+            if !c.build_script {
+                return Err(UnitsError::RecordWithoutScript { krate: c.name });
+            }
+            if c.script.is_some() {
+                return Err(UnitsError::ScriptJoinedTwice { krate: c.name });
+            }
+            let (cfg, key) = script_joined(&c.cfg, c.key, record, alloc);
+            c.cfg = cfg;
+            c.key = key;
+            c.script = Some(record);
+            joined += 1;
+        }
+        self.build_scripts -= joined;
+        Ok(())
+    }
+}
+
+/// A crate's cfg and key with its build script's outputs `record` joined: the cfg is the
+/// unit's atoms and the record's `cargo::rustc-cfg` atoms (a bare name, or a name with its
+/// value: `curve25519_dalek_bits="64"`), sorted and each once; the key is the unit's key and
+/// the record's crate digest ([`OutputsRef::crate_digest`]: what of the record the crate's
+/// text can read, its cfgs among it).
+pub fn script_joined<'a>(
+    cfg: &[(&'a str, Option<&'a str>)],
+    key: CrateItemKey,
+    record: OutputsRef<'a>,
+    alloc: Alloc<'a>,
+) -> (AVec<'a, (&'a str, Option<&'a str>)>, CrateItemKey) {
+    let mut joined = AVec::with_capacity_in(cfg.len(), alloc);
+    joined.extend(cfg.iter().copied());
+    joined.extend(record.cfgs());
+    joined.sort_unstable();
+    joined.dedup();
+    let mut bytes = AVec::with_capacity_in(64, alloc);
+    bytes.extend_from_slice(&key.0.0);
+    bytes.extend_from_slice(&record.crate_digest().0);
+    (joined, CrateItemKey(ContentId::of("blaze workspace unit with script 1", &bytes)))
 }
 
 /// Why no crate list: each names the crates and what of them.
@@ -122,6 +189,12 @@ pub enum UnitsError<'a> {
     ToolchainEdition { krate: &'a str, written: &'a str },
     /// A unit's root file leaves its package's folder (`..` past it).
     RootLeavesPackage { krate: &'a str, root: &'a str },
+    /// [`UnitCrates::join_scripts`] was given a list not as long as the crate list.
+    ScriptsCount { crates: usize, given: usize },
+    /// A build-script outputs record was given for a crate with no build script.
+    RecordWithoutScript { krate: &'a str },
+    /// A crate was given a build-script outputs record after one was joined.
+    ScriptJoinedTwice { krate: &'a str },
 }
 
 impl fmt::Display for UnitsError<'_> {
@@ -136,6 +209,15 @@ impl fmt::Display for UnitsError<'_> {
                 write!(f, "the toolchain crate `{krate}` has the edition `{written}`, no Rust edition")
             }
             UnitsError::RootLeavesPackage { krate, root } => write!(f, "crate `{krate}`: its root `{root}` leaves its package's folder"),
+            UnitsError::ScriptsCount { crates, given } => {
+                write!(f, "build-script records were given for {given} crates; the crate list holds {crates} (one entry per crate, by index)")
+            }
+            UnitsError::RecordWithoutScript { krate } => {
+                write!(f, "crate `{krate}` was given a build-script outputs record and has no build script")
+            }
+            UnitsError::ScriptJoinedTwice { krate } => {
+                write!(f, "crate `{krate}` was given a build-script outputs record twice (rule 21: one record per crate)")
+            }
         }
     }
 }
@@ -236,6 +318,7 @@ pub fn unit_crates<'a>(
             deps,
             cfg,
             build_script: u.build_script.is_some(),
+            script: None,
         });
     }
     Ok(UnitCrates { crates, sysroot, toolchain: first, build_scripts, alloc })
@@ -350,6 +433,7 @@ fn toolchain_crates<'a>(
             deps,
             cfg,
             build_script: false,
+            script: None,
         });
     }
     Ok(sysroot)

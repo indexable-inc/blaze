@@ -35,7 +35,8 @@ const DOC: &str = r#"ambient: what each crate takes from `std` and `alloc`, and 
                       with `base`, no count of a row is above the base's (CI)
               write   write the list from the tree as it is
               findings  print every site as a `blaze_script::finding` document (for `advise`)
-    root      the checkout (".")
+              tests-check, tests-write, tests-report  the tests' count (D72), at the end
+    root     the checkout (".")
     base      the commit the change is against, or null: its list (`git show`) holds every
               row down, and the lines added since it (`git diff --unified=0`) name a crate's
               new sites
@@ -89,7 +90,8 @@ The count is read from the text, with no names resolved, so it misses and it ove
 blaze's lints are the definition (`blaze::implicit_allocator`, and a crate's root check once
 blaze checks its own crates); this list is the count the gate can hold before then.
 
-A site in test code is not counted. Test code is, and nothing else is:
+A site in test code is not counted here (the tests' count, at the end, counts it). Test code
+is, and nothing else is:
   - a file under a directory named `tests` or `benches`, or named `tests.rs` or `test.rs`;
   - a file that says `#![cfg(test)]`;
   - the item after `#[cfg(test)]` or `#[cfg(all(test, ...))]`, or after `#[test]` or another
@@ -121,6 +123,11 @@ use blaze_script::{
     input::{self, Fields, Input, InputError},
     read_text, universal_newlines,
 };
+
+/// The tests' count (decision D72): the code this count skips, read by the same walk.
+#[path = "ambient/in_tests.rs"]
+mod in_tests;
+use in_tests::Effect;
 
 const SCRIPT: &str = "ambient";
 /// The list, from the root.
@@ -179,7 +186,7 @@ impl Input for Args {
 
     fn parse(f: &Fields<'_>) -> Result<Args, InputError> {
         Ok(Args {
-            command: f.one_of("command", &["check", "write", "findings"], None)?,
+            command: f.one_of("command", &["check", "write", "findings", "tests-check", "tests-write", "tests-report"], None)?,
             root: f.str("root", Some("."))?,
             base: f.str_or_null("base")?,
         })
@@ -443,6 +450,14 @@ struct Scanned {
     mods: Vec<(String, bool)>,
     /// `#![cfg(test)]`: the whole file is test code.
     test: bool,
+    /// The sites on its test code's lines (every line when `test`): the other side of the same
+    /// line, for the tests' count (in_tests.rs).
+    test_sites: Vec<(usize, Kind)>,
+    /// The ambient effects ([`Effect`]) outside its test code, and on it.
+    effects: Vec<(usize, Effect)>,
+    test_effects: Vec<(usize, Effect)>,
+    /// Its text says `#![no_std]` (read for a test target's root).
+    no_std: bool,
 }
 
 /// The sites of one file's text and the modules it declares out of line.
@@ -471,13 +486,17 @@ fn scan_file(text: &str) -> Scanned {
         }
         start += line.len() + 1;
     }
-    if out.test {
+    let whole = out.test;
+    if whole {
         for it in &mut out.mods {
             it.1 = true;
         }
-        return out;
     }
-    out.sites = code_sites(text).into_iter().filter(|(line, _)| !test[line - 1]).collect();
+    // One scan; each site is on test code's side of the line or on the other, by `test`.
+    let (sites, effects) = all_sites(text);
+    (out.test_sites, out.sites) = sites.into_iter().partition(|(line, _)| whole || test[line - 1]);
+    (out.test_effects, out.effects) = effects.into_iter().partition(|(line, _)| whole || test[line - 1]);
+    out.no_std = declares_no_std(text);
     out
 }
 
@@ -631,8 +650,16 @@ fn path_head(text: &str, at: usize) -> Option<&str> {
 /// each column it holds, by line and then column. Comments, strings and characters are skipped
 /// as [`item_end`] skips them.
 fn code_sites(text: &str) -> Vec<(usize, Kind)> {
+    all_sites(text).0
+}
+
+/// [`code_sites`], and in the same pass each line in each ambient effect it names
+/// ([`in_tests::effect_of`]; a `std` `HashMap` or `HashSet` where `vec_box` reads it as
+/// `std`'s), by line and then effect: the tests' count reads both (in_tests.rs).
+fn all_sites(text: &str) -> (Vec<(usize, Kind)>, Vec<(usize, Effect)>) {
     let bytes = text.as_bytes();
     let mut sites: BTreeSet<(usize, Kind)> = BTreeSet::new();
+    let mut effects: BTreeSet<(usize, Effect)> = BTreeSet::new();
     // The bare collection names, each with its line: whether they are `std`'s waits for the
     // file's imports, which may come after them.
     let mut bare: Vec<(usize, &str)> = Vec::new();
@@ -664,30 +691,32 @@ fn code_sites(text: &str) -> Vec<(usize, Kind)> {
                 let end = word_end(text, at);
                 let word = &text[at..end];
                 let after = text[end..].trim_start();
-                let mut site = |kind: Kind| {
-                    line += text[counted..at].matches('\n').count();
-                    counted = at;
-                    sites.insert((line, kind));
-                };
+                // The line of this word: `counted` only moves forward, so the text is read once.
+                line += text[counted..at].matches('\n').count();
+                counted = at;
+                if let Some(effect) = in_tests::effect_of(text, at, end) {
+                    effects.insert((line, effect));
+                }
                 let was_defining = std::mem::replace(&mut defining, DEFINING.contains(&word));
                 match word {
                     "use" if use_from.is_none() => use_from = Some(end),
                     "std" | "alloc" if path_head(text, at).is_none() => {
                         let before = trailing_word(&text[..at]);
                         if after.starts_with("::") || before == "use" || before == "crate" {
-                            site(if word == "std" { Kind::Std } else { Kind::Alloc });
+                            sites.insert((line, if word == "std" { Kind::Std } else { Kind::Alloc }));
                         }
                     }
                     _ if COLLECTIONS.contains(&word) && use_from.is_none() && !was_defining => {
                         let shaped = word == TEXT || after.starts_with('<') || after.starts_with("::");
                         match path_head(text, at) {
                             _ if !shaped => {}
-                            None => {
-                                line += text[counted..at].matches('\n').count();
-                                counted = at;
-                                bare.push((line, word));
+                            None => bare.push((line, word)),
+                            Some(head) if STD_HEADS.contains(&head) => {
+                                sites.insert((line, Kind::VecBox));
+                                if in_tests::HASHES.contains(&word) {
+                                    effects.insert((line, Effect::StdHash));
+                                }
                             }
-                            Some(head) if STD_HEADS.contains(&head) => site(Kind::VecBox),
                             Some(_) => {}
                         }
                     }
@@ -706,9 +735,12 @@ fn code_sites(text: &str) -> Vec<(usize, Kind)> {
     for (line, name) in bare {
         if !own.holds(name) {
             sites.insert((line, Kind::VecBox));
+            if in_tests::HASHES.contains(&name) {
+                effects.insert((line, Effect::StdHash));
+            }
         }
     }
-    sites.into_iter().collect()
+    (sites.into_iter().collect(), effects.into_iter().collect())
 }
 
 /// The byte after the `}` or `;` that ends the item starting at byte `from` of `text`: the
@@ -956,9 +988,47 @@ fn crate_root(root: &Path, parts: &[String]) -> Result<Option<String>, TreeError
     Err(TreeError::NoRoot { manifest })
 }
 
+/// The tree as both counts read it: each `.rs` file under crates/ scanned, the files that are
+/// test code by path, by `#![cfg(test)]` or by a declaration in test code (the ONE definition:
+/// `count` skips them, in_tests.rs counts them), the modules each file declares, and the
+/// packages' manifests.
+struct Walked {
+    scanned: Vec<(Vec<String>, Scanned)>,
+    skipped: BTreeSet<String>,
+    children: BTreeMap<String, Vec<String>>,
+    packages: Vec<Vec<String>>,
+}
+
 /// Each crate's sites outside test code, in file and line order, its root's `is_std` first; a
 /// crate with none is absent.
 fn count(root: &Path) -> Result<BTreeMap<String, Vec<Site>>, TreeError> {
+    let Walked { scanned, skipped, packages, .. } = walk(root)?;
+    let mut out: BTreeMap<String, Vec<Site>> = BTreeMap::new();
+    // A package under a `tests` or `benches` directory is a test's fixture, not a crate.
+    for parts in packages.iter().filter(|it| !test_path(it)) {
+        let Some(path) = crate_root(root, parts)? else { continue };
+        let text = std::fs::read(root.join(&path)).map_err(|e| TreeError::Unreadable { path: path.clone(), why: e.to_string() })?;
+        if !declares_no_std(&universal_newlines(String::from_utf8_lossy(&text).into_owned())) {
+            let krate = parts[1..parts.len() - 1].join("/");
+            out.entry(krate).or_default().push(Site { path, line: 1, kind: Kind::IsStd });
+        }
+    }
+    let mut manifests: BTreeMap<Vec<String>, bool> = BTreeMap::new();
+    for (parts, found) in scanned {
+        let path = parts.join("/");
+        if found.sites.is_empty() || skipped.contains(&path) {
+            continue;
+        }
+        let krate = crate_of(root, &parts, &mut manifests);
+        out.entry(krate)
+            .or_default()
+            .extend(found.sites.iter().map(|(line, kind)| Site { path: path.clone(), line: *line, kind: *kind }));
+    }
+    Ok(out)
+}
+
+/// The tree's files scanned, and which are test code (see [`Walked`]).
+fn walk(root: &Path) -> Result<Walked, TreeError> {
     let (files, packages) = tree_files(root);
     let known: BTreeSet<String> = files.iter().map(|it| it.join("/")).collect();
     let mut scanned: Vec<(Vec<String>, Scanned)> = Vec::new();
@@ -998,28 +1068,7 @@ fn count(root: &Path) -> Result<BTreeMap<String, Vec<Site>>, TreeError> {
             }
         }
     }
-    let mut out: BTreeMap<String, Vec<Site>> = BTreeMap::new();
-    // A package under a `tests` or `benches` directory is a test's fixture, not a crate.
-    for parts in packages.iter().filter(|it| !test_path(it)) {
-        let Some(path) = crate_root(root, parts)? else { continue };
-        let text = std::fs::read(root.join(&path)).map_err(|e| TreeError::Unreadable { path: path.clone(), why: e.to_string() })?;
-        if !declares_no_std(&universal_newlines(String::from_utf8_lossy(&text).into_owned())) {
-            let krate = parts[1..parts.len() - 1].join("/");
-            out.entry(krate).or_default().push(Site { path, line: 1, kind: Kind::IsStd });
-        }
-    }
-    let mut manifests: BTreeMap<Vec<String>, bool> = BTreeMap::new();
-    for (parts, found) in scanned {
-        let path = parts.join("/");
-        if found.sites.is_empty() || skipped.contains(&path) {
-            continue;
-        }
-        let krate = crate_of(root, &parts, &mut manifests);
-        out.entry(krate)
-            .or_default()
-            .extend(found.sites.iter().map(|(line, kind)| Site { path: path.clone(), line: *line, kind: *kind }));
-    }
-    Ok(out)
+    Ok(Walked { scanned, skipped, children, packages })
 }
 
 /// The list as `write` writes it: the header, then `<crate><TAB><std><TAB><is_std><TAB><alloc>
@@ -1222,6 +1271,10 @@ fn main_with(it: &Args) {
         std::fs::canonicalize(&it.root).unwrap_or_else(|_| std::env::current_dir().unwrap_or_default().join(&it.root));
     if !root.join("crates").is_dir() {
         fail(SCRIPT, &format!("{} has no crates/ directory", root.display()));
+    }
+    if it.command.starts_with("tests-") {
+        in_tests::main_with(&it.command, it.base.as_deref(), &root);
+        return;
     }
     let counts = count(&root).unwrap_or_else(|e| fail(SCRIPT, &e.to_string()));
     if it.command == "findings" {
@@ -1558,6 +1611,7 @@ fn selftest() {
             && parse_rows("\t1\t0\t0\t0\n").is_err(),
         "a bad row is refused, naming its line",
     );
+    in_tests::selftest();
     println!("{SCRIPT} selftest: ok");
 }
 
@@ -1567,7 +1621,7 @@ fn main() {
         [one] if one == "selftest" => selftest(),
         [one] => main_with(&input::parse::<Args>(one, SCRIPT)),
         _ => {
-            eprintln!("usage: {SCRIPT} '<json>' | selftest\n\n{DOC}");
+            eprintln!("usage: {SCRIPT} '<json>' | selftest\n\n{DOC}{}", in_tests::TESTS_DOC);
             std::process::exit(1);
         }
     }

@@ -269,7 +269,9 @@ impl ConstsWorld<'_, '_> {
     /// writes the constant or leaves it to the trait's default (`declared`, the trait's own
     /// constant item, then evaluated at `args`). By coherence (the Reference, "Trait
     /// implementation coherence": no two impls of a trait overlap) that impl is the one that
-    /// applies. Anything else (a generic impl, an impl whose head is not made) is `None`:
+    /// applies. One more form is selected, for any ground `Self`: the blanket impl `impl<T> Tr
+    /// for T` whose only clauses are `T: Sized` (see the loop). Anything else (another generic
+    /// impl of `Self`, an impl whose head is not made) is `None`:
     /// the evaluation refuses, naming the item; never a guessed impl. The impls are scanned
     /// whole and the answer is the only match, so the map's order does not reach it.
     fn impl_const(&self, declared: ItemKey, trait_: ItemKey, name: tc::Name, args: List, ground: &mut PortableTys<'_>) -> Option<(ItemKey, List)> {
@@ -280,22 +282,43 @@ impl ConstsWorld<'_, '_> {
             match g.node(*self_ty).ok()? {
                 n @ (tc::PNode::Bool | tc::PNode::Char | tc::PNode::Int(_) | tc::PNode::Uint(_)) => (Some(n), None),
                 tc::PNode::Adt(k, l) if g.list(l).ok()?.is_empty() => (None, Some(k)),
-                _ => return None,
+                // Any other ground type: only a blanket impl (below) can be selected for it.
+                _ => (None, None),
             }
         };
         let s = self.store.tys.view();
+        let sized = self.store.sized.map(super::keys::checker_of);
         let mut found: Option<ItemKey> = None;
-        for (_, h) in self.store.impls.iter() {
-            if h.trait_ != Some(trait_) || h.generics != 0 {
+        let mut blanket = false;
+        for (ik, h) in self.store.impls.iter() {
+            if h.trait_ != Some(trait_) {
                 continue;
             }
-            let same = match (s.node(h.self_ty).ok()?, asked) {
-                (tc::PNode::Adt(k, l), (None, Some(a))) => k == a && s.list(l).ok()?.is_empty(),
-                (n, (Some(a), None)) => n == a,
-                _ => false,
-            };
-            if !same {
-                continue;
+            // A blanket impl `impl<T> Tr for T {}` (the pinned core, library/core/src/mem/
+            // mod.rs: "impl<T> SizedTypeProperties for T {}", through which `size_of::<T>()`
+            // is "<T as SizedTypeProperties>::SIZE"): it applies to every type its clauses
+            // admit. Selected only when those are nothing but `T: Sized` (the implied bound;
+            // the body that named the constant was checked, so `Self: Tr` holds and the type
+            // is sized); with any other clause the choice needs the solver: `None`.
+            if matches!(s.node(h.self_ty).ok()?, tc::PNode::Param(0)) {
+                let clauses = &self.store.preds.get(ik)?.clauses;
+                let only_sized = clauses.iter().all(|c| matches!(*c, tc::PClause::Trait { trait_: t, .. } if Some(t) == sized));
+                if h.generics != 1 || !only_sized {
+                    return None;
+                }
+                blanket = true;
+            } else {
+                if h.generics != 0 {
+                    continue;
+                }
+                let same = match (s.node(h.self_ty).ok()?, asked) {
+                    (tc::PNode::Adt(k, l), (None, Some(a))) => k == a && s.list(l).ok()?.is_empty(),
+                    (n, (Some(a), None)) => n == a,
+                    _ => false,
+                };
+                if !same {
+                    continue;
+                }
             }
             // The impl's own definition, or, where the impl writes none, the trait's default
             // (the Reference, "Associated Items", "Associated Constants", its example "Using
@@ -313,7 +336,10 @@ impl ConstsWorld<'_, '_> {
                 return None;
             }
         }
-        found.map(|c| (c, if c == declared { args } else { List::EMPTY }))
+        // The trait's default is generic over `Self`, and a blanket impl's own definition over
+        // its one parameter, which is `Self`: both are evaluated at `args`. A non-generic
+        // impl's definition has no parameters.
+        found.map(|c| (c, if c == declared || blanket { args } else { List::EMPTY }))
     }
 
     /// Whether `item` is a member of a trait (its call is selected at the instance).

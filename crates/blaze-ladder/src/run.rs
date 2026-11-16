@@ -759,6 +759,16 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
         f.map(Some).ok_or(BuildError::Malformed { what: "the `drop` lang trait has no `drop` fn" })
     }
 
+    /// The `index` / `index_mut` lang traits' methods, as looked up when the program was made
+    /// (front2's `SEAM_LANGS`); the instance loop resolves a call at `[Self, Idx]` to the
+    /// selected impl's, as for `deref_fn`.
+    fn index_fn(&self, mutbl: Mutbl) -> Option<ItemKey> {
+        match mutbl {
+            Mutbl::Not => self.0.lang_trait_fn(LangItem::Index, "index"),
+            Mutbl::Mut => self.0.lang_trait_fn(LangItem::IndexMut, "index_mut"),
+        }
+    }
+
     fn deref_fn(&self, mutbl: Mutbl) -> Option<ItemKey> {
         match mutbl {
             Mutbl::Not => self.0.lang_trait_fn(LangItem::Deref, "deref"),

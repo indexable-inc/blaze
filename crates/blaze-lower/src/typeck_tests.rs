@@ -1190,6 +1190,72 @@ fn a_const_parameter_is_a_value_in_its_body() {
     assert_eq!(findings(wrong, &c), [(blaze_typeck::DiagCode::Mismatch, "N")]);
 }
 
+/// A const argument the caller cannot value does not stop the body: it is a hole with its gap
+/// listed (`TypeckBody::const_gaps`: why, where, and the constant's own text by its range),
+/// and the rest of the body is converted and checked. `NoTypes` evaluates no constant
+/// (`no_const_arg`), so `{ 1 + 2 }` is `ConstGapWhy::NoEvaluator`; a negated literal with no
+/// suffix is `NegativeNoSuffix`. The hole is a const variable the declared `[u8; 3]` settles
+/// (the Reference, "Const generics": a const argument may be inferred): no diagnostic, the
+/// call typed `[u8; 3]`. Before, `to_typeck` refused the whole body ("a const argument that
+/// is no literal"): the `expect` below fails on that.
+///
+/// Prints: `test typeck_tests::a_const_argument_with_no_value_is_a_gap_and_the_body_goes_on ... ok`
+#[test]
+fn a_const_argument_with_no_value_is_a_gap_and_the_body_goes_on() {
+    use crate::typeck::{ConstGapWhy, ConstSite};
+    /// `NoTypes`, as a caller that reads the gaps (`Types::takes_const_gaps`).
+    struct GapsRead;
+    impl Types for GapsRead {
+        fn ty(&mut self, view: &View<'_>, t: TypeId, tys: &mut PortableTys<'_>) -> Result<blaze_typeck::PTy, Refused> {
+            NoTypes.ty(view, t, tys)
+        }
+        fn repeat_len(&mut self, view: &View<'_>, len: ExprId) -> Result<u64, Refused> {
+            NoTypes.repeat_len(view, len)
+        }
+        fn const_arg(&mut self, view: &View<'_>, c: crate::ConstIdx, tys: &mut PortableTys<'_>) -> Result<blaze_typeck::PTy, Refused> {
+            NoTypes.const_arg(view, c, tys)
+        }
+        fn takes_const_gaps(&self) -> bool {
+            true
+        }
+    }
+    // A caller that does not read the gaps still gets the refusal, by name: never a hole.
+    {
+        let text = "fn main3() -> [u8; 3] {\n    n::<{ 1 + 2 }>()\n}";
+        let alloc = Alloc::global();
+        let lowered = lower_body(text, Edition::E2024, &mut NoCfg, &mut crate::NoModule, alloc).unwrap_or_else(|need| panic!("needs {:?}", need.atoms));
+        let view = lowered.view();
+        let mut tys = PortableTys::new_in(alloc);
+        match to_typeck(&view, ItemKey(0), &mut tys, &mut NoTypes, alloc) {
+            Err(Refused::Form { what, .. }) => assert_eq!(what, crate::typeck::NO_CONST_ARG),
+            Err(e) => panic!("another refusal: {e:?}"),
+            Ok(_) => panic!("a caller that reads no gap was handed a hole"),
+        }
+    }
+    let (fx, [_, _, _, main3, _, _]) = const_world();
+    let gaps_of = |text: &'static str| {
+        let alloc = Alloc::global();
+        let lowered = match lower_body(text, Edition::E2024, &mut NoCfg, &mut crate::NoModule, alloc) {
+            Ok(l) => l,
+            Err(need) => panic!("{text}: needs {:?}", need.atoms),
+        };
+        let view = lowered.view();
+        let mut tys = PortableTys::new_in(alloc);
+        let body = to_typeck(&view, main3, &mut tys, &mut GapsRead, alloc).unwrap_or_else(|e| panic!("a const gap is no refusal of the body: {e:?}"));
+        body.const_gaps.iter().map(|g| (g.why, g.site, &text[g.range.start as usize..g.range.end as usize])).collect::<std::vec::Vec<_>>()
+    };
+    let block = "fn main3() -> [u8; 3] {\n    n::<{ 1 + 2 }>()\n}";
+    assert_eq!(gaps_of(block), [(ConstGapWhy::NoEvaluator, ConstSite::Arg, "{ 1 + 2 }")]);
+    let (c, ranges, _) = lower_and_check_with(&fx, main3, block, &mut GapsRead);
+    let lines = typed_lines(&fx, block, &c, &ranges);
+    assert!(c.diags.is_empty(), "diagnostics {:?}\n{lines}", c.diags);
+    assert!(lines.contains("n::<{ 1 + 2 }>() => [u8; 3]"), "{lines}");
+    let negative = "fn main3() -> [u8; 3] {\n    n::<-1>()\n}";
+    assert_eq!(gaps_of(negative), [(ConstGapWhy::NegativeNoSuffix, ConstSite::Arg, "-1")]);
+    // A literal is still a value, with no gap: the control.
+    assert_eq!(gaps_of("fn main3() -> [u8; 3] {\n    n::<3>()\n}"), []);
+}
+
 /// The literal forms a const argument may take (the Reference, "Generic arguments"): its
 /// value is read from its text, a negative one in two's complement at its suffix's width.
 #[test]

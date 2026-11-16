@@ -116,6 +116,16 @@ const _: () = {
 };
 fn attr_alias(x: Xj) -> u8 { x.f() }
 
+trait De<'de> { type Out; fn go(self) -> Self::Out; }
+fn serde_shape() -> u8 {
+    enum F { A, B }
+    struct V<'de> { m: core::marker::PhantomData<&'de ()> }
+    impl<'de> De<'de> for V<'de> { type Out = F; fn go(self) -> F { F::A } }
+    type Al = u8;
+    let one: Al = 1;
+    match (V { m: core::marker::PhantomData }).go() { F::A => one, F::B => 2 }
+}
+
 struct Xn;
 fn no_impl(x: Xn) -> u8 { x.f() }
 ";
@@ -138,6 +148,18 @@ const CLEAN: &[(&str, &str)] = &[
     // type UnderlyingSolTuple<'a> = ..;` then `#[automatically_derived] #[doc(hidden)] impl ..`
     // (the census's "156 lower Convert: Form .. Resolve/Path").
     ("attr_alias", "alloy's real text: a block's type alias and impl written after attributes with arguments"),
+    // serde_derive's `Deserialize` writes, inside `fn deserialize`, `enum __Field { .. }`,
+    // `struct __FieldVisitor;`, `struct __Visitor<'de> { marker: PhantomData<Role>, lifetime:
+    // PhantomData<&'de ()> }` and their impls, and the body names them (the tempo census's "1190
+    // gap Local: a struct in a block"). The Reference, "Statements", "Item declarations":
+    // "Declaring an item within a statement block restricts its scope to the block containing the
+    // statement" and "There is no implicit capture of the containing function's generic
+    // parameters, parameters, and local variables": the enum, the struct and the alias are items
+    // of the block's module (one key each, the names library's), their heads made by the
+    // ordinary code. Expected lines: "serde_shape: clean" and "member `go` of `impl<'de> De<'de>
+    // for V<'de>`: clean"; "NESTED impls in the index" one more than before this fixture. Without
+    // the change: "serde_shape: .. a struct in a block (.., at ..) has no record yet".
+    ("serde_shape", "serde's Deserialize shape: a body names the enum, the generic struct and the alias declared in its own block"),
 ];
 
 /// (a body through an impl in a block, the same body through a module-level impl): the two

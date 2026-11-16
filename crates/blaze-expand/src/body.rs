@@ -110,11 +110,14 @@ pub fn local_hygiene(stream: &TokenStream<'_>, mut ctx: Ctx, this: ContentId) ->
 }
 
 /// One parser word of an expansion: its source text (a range of [`BodyWords::text`]), the
-/// stream's token it starts at, and that token's [`local_hygiene`].
+/// stream's tokens it is (`token..end`: two for a lifetime, `'` and its name, else one), and
+/// its [`local_hygiene`] (a lifetime's is its name's).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BodyWord {
     pub text: (u32, u32),
     pub token: u32,
+    /// One past the word's last token.
+    pub end: u32,
     pub hygiene: u64,
     /// Whether a space may go before the word's text: not after a joint punctuation, which
     /// would no longer glue to it when the text is lexed again (`::`, `->`, `..=`).
@@ -146,15 +149,31 @@ pub fn body_words<'a>(stream: &TokenStream<'_>, this: ContentId, alloc: Alloc<'a
     let mut words: AVec<'a, BodyWord> = Vec::with_capacity_in(tokens.len(), alloc);
     let mut text = AString::new_in(alloc);
     let mut glued = false;
+    // The token before was a lifetime's `'`, which started the word its name ends.
+    let mut after_quote = false;
     for (at, token) in tokens.iter().enumerate() {
-        // A token starts a word when the next token's word is a later one: a lifetime's name
-        // and an invisible group's delimiters join the word before.
-        if parser.word_at[at + 1] > parser.word_at[at] {
+        // A lifetime is two tokens, `'` and its name, and one parser word (`words_of`: the
+        // `'` takes the next token, whatever it is, as its name): the word starts at the `'`,
+        // so its text is the whole `'name` the lowering keys a label by, and its hygiene is
+        // the name's. Any other token starts a word when the next token's word is a later
+        // one: an invisible group's delimiters start none and join the word before.
+        let name_of_lifetime = after_quote;
+        let quote = !name_of_lifetime
+            && matches!(token.kind, TokenKind::Punct { char: '\'', .. })
+            && at + 1 < tokens.len();
+        after_quote = quote;
+        let starts = quote || (!name_of_lifetime && parser.word_at[at + 1] > parser.word_at[at]);
+        if starts {
             let start = crate::tokens::index(text.len());
+            let ctx = match quote {
+                true => tokens[at + 1].ctx,
+                false => token.ctx,
+            };
             words.push(BodyWord {
                 text: (start, start),
                 token: crate::tokens::index(at),
-                hygiene: local_hygiene(stream, token.ctx, this),
+                end: crate::tokens::index(at + if quote { 2 } else { 1 }),
+                hygiene: local_hygiene(stream, ctx, this),
                 space_before: !glued,
             });
         }

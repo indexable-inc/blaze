@@ -1169,3 +1169,54 @@ fn a_pattern_type_expands_to_its_one_form() {
         other => panic!("{other:?}"),
     }
 }
+
+fn label_diags(defs: &[(&'static str, &str)], text: &str) -> StdVec<DiagKind> {
+    let l = expanding(defs, text);
+    let v = l.view();
+    let unhandled: StdVec<_> = v.unhandled().collect();
+    assert!(unhandled.is_empty(), "{text}: unhandled {unhandled:?}\n{}", dump_of(&l));
+    v.diags().filter_map(Result::ok).map(|d| d.kind).collect()
+}
+
+/// A label written at the call site keeps the call site's hygiene through the expansion; one
+/// the macro writes does not see the caller's. The Reference, "Macros By Example", Hygiene:
+/// "Macros by example have mixed-site hygiene. This means that loop labels, block labels,
+/// and local variables are looked up at the macro definition site while other symbols are
+/// looked up at the macro invocation site." A label token keeps the site that wrote it: one
+/// the caller wrote and passed in is looked up at the caller's. So a `break 'outer` passed in
+/// as `$b` is the caller's, and leaves the caller's loop (tempo's `'event_loop: loop {
+/// tokio::select! { .. => { break 'event_loop; } } }`); a `break 'outer` in the macro's own
+/// body is looked up at the definition, where no loop declares it: `UndeclaredLabel`.
+/// The cause: an expansion's `'outer` is two tokens, `'` and `outer`, and one parser word;
+/// the word began at the name, so the lowering read the label as `outer`, not `'outer`, and
+/// never found the caller's loop. Expected: `test expand_tests::a_callers_label_resolves_through_a_macro ... ok`.
+#[test]
+fn a_callers_label_resolves_through_a_macro() {
+    // (1) Passed in as a block: the caller's label.
+    let pass = ("pass", "($b:block) => { $b }");
+    let kinds = label_diags(&[pass], "fn f() { 'outer: loop { pass!({ break 'outer; }) } }");
+    assert!(kinds.is_empty(), "the caller's `break 'outer` is the caller's: {kinds:?}");
+    // Passed through a nested call as an expression, as `tokio::select!` passes `$handle`.
+    let outer = ("again", "($e:expr) => { pass!({ $e }) }");
+    let kinds = label_diags(&[pass, outer], "fn f() -> u8 { 'outer: loop { again!(break 'outer 1) } }");
+    assert!(kinds.is_empty(), "through two expansions: {kinds:?}");
+    // (2) Written by the macro: its `'outer` is not the caller's.
+    let brk = ("brk", "() => { break 'outer; }");
+    let kinds = label_diags(&[brk], "fn f() { 'outer: loop { brk!(); } }");
+    assert_eq!(kinds, vec![DiagKind::UndeclaredLabel], "the macro's own `'outer` is hygienic");
+    // A macro's own loop and label see each other.
+    let spin = ("spin", "() => { 'l: loop { break 'l; } }");
+    let kinds = label_diags(&[spin], "fn f() { spin!(); }");
+    assert!(kinds.is_empty(), "the macro's label is its own: {kinds:?}");
+    // (3) A label passed as `$l:lifetime` and used by the expansion: the caller's.
+    let to = ("to", "($l:lifetime) => { break $l; }");
+    let kinds = label_diags(&[to], "fn f() { 'outer: loop { to!('outer); } }");
+    assert!(kinds.is_empty(), "a `$l:lifetime` is the caller's label: {kinds:?}");
+    // And a nested call whose input ends in a lifetime takes the whole `'outer`.
+    // (`to!($l);` with its `;`: a statement call, so `to!`'s `break $l;` is read as statements;
+    // without it the call is the expansion's tail expression and the `;` in `to!`'s body is
+    // not an expression's.)
+    let fwd = ("fwd", "($l:lifetime) => { to!($l); }");
+    let kinds = label_diags(&[to, fwd], "fn f() { 'outer: loop { fwd!('outer); } }");
+    assert!(kinds.is_empty(), "a lifetime at a nested call's end is whole: {kinds:?}");
+}

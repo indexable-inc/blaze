@@ -409,10 +409,27 @@ OrPatternBinding 4. Findings: 309 UnprovenOutlives, 224 Invalidated, 3 moves. Th
   accessor goes to tier two, which costs 46 ms a body today: the dense tier two is the floor's
   problem, and this is its first common customer. Excusing a loan's own statement in tier one is
   NOT sound (in a loop the earlier iteration's loan is live there).
-- OPEN SOUNDNESS HOLE, older than this leg: a call whose callee's head is not known (and a call
-  through a fn pointer or closure value) is related through one origin, which cannot say "this
-  argument must be `'static`": `spawn(&local)` with an unknown `spawn` is accepted. The census
-  now asks the store for every callee's head first; what is still unknown after that should be
-  refused by name (a new `Form`), and a fn pointer's type needs its lifetimes from the type
-  checker (question T3: `[(expr, the callee value's signature regions)]`). Count them in the
-  census ("calls unified") before deciding.
+- The hole "an unknown callee cannot say `'static`" is CLOSED (leg 3): a call whose head is
+  unknown, with an argument or result that carries a lifetime, is refused (`Form::CalleeUnknown`);
+  a call through a value is related by the value's own signature, read from the written type of
+  the body's parameter it is (`sig/value.rs`, `read_callable_param`: fn pointers, `dyn Fn`,
+  `impl Fn`, `F: Fn(..)`; every region but `'static` fresh per call, `'static` the body's), else
+  refused (`Form::CalleeValueUnknown`). Still to do there: the census's facts must answer
+  `Facts::own_text`; a callable that names the enclosing fn's lifetime, or is a field or a
+  local, is refused until T3 exists.
+- STILL OPEN, the same hole in other clothes: (1) a struct literal or ctor whose field type
+  writes `'static` (`struct K { r: &'static u8 }`, `K { r: &local }`) is related through one
+  origin and accepted: needs the ADT part of H1, or a refusal until then; (2) a known head that
+  writes no lifetime but whose bounds imply one (`T: Any`) called with generic arguments that
+  carry origins keeps the one origin.
+- The 131 "invalidated in a derived `fmt`": cause confirmed by putting it back
+  (`Plant::UnknownUnified`, fixture `a_builder_chain_keeps_each_loan_in_its_result`): the one
+  origin of an unknown-head call carried the receiver's loan into the receiver's own lifetime
+  position. Such calls are now by signature (accepted) or refused; none is related that way.
+- Closures: a closure expression is lowered as the borrows and moves of its captures
+  (`closure_value`; its type's positions are its captures'), and a call of it borrows the
+  closure value by its kind. Its BODY is not lowered, so the form stays refused unless the
+  caller says it checks closure bodies (`Facts::closure_bodies_checked`, default false). NEXT:
+  lower each closure body as its own flow (captured locals as inputs: by value like a
+  parameter, by reference never dropped there), then answer `true` in the census. A closure
+  call whose arguments or result carry a lifetime is refused (`CalleeValueUnknown`).

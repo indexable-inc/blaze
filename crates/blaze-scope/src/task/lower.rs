@@ -1480,7 +1480,11 @@ impl<'t> BodySrc<'t> {
             detail,
             ItemDetail::Fn { body_holds_items: true } | ItemDetail::Const { body_holds_items: true } | ItemDetail::Static { body_holds_items: true }
         );
-        (holds && text.contains("impl")).then_some(BodySrc { key, module, text, loc, depth })
+        // The words of the items that make a block a module
+        // (`blaze_file_items::nested::NestedKind::makes_module`): a body without one costs
+        // five substring searches and no scan.
+        const WORDS: [&str; 5] = ["impl", "struct", "enum", "union", "type"];
+        (holds && WORDS.iter().any(|w| text.contains(w))).then_some(BodySrc { key, module, text, loc, depth })
     }
 }
 

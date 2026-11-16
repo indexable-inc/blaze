@@ -477,7 +477,14 @@ pub fn load(root: &Path, store: &Path, modules: Option<(&Path, &Path)>, scripts:
     let manifest = blaze_toolchain::shelf::open_manifest(&mut shelf, id).map_err(|e| LoadError::Toolchain(format!("{}: {e}", shelf.place)))?;
     let manifest: &'static [u8] = Box::leak(manifest.into_boxed_slice());
     let view = ToolchainView::open(manifest, id).map_err(|e| LoadError::Toolchain(e.to_string()))?;
-    let crates = leak(unit_crates(graph, lock, &member_ids, view, TRIPLE, alloc).map_err(|e| LoadError::Crates(e.to_string()))?);
+    // Each build script's record is joined to its crate BEFORE anything reads the list: the
+    // script's `rustc-cfg` atoms are part of the cfg the crate's names are resolved under
+    // (nix's `apple_targets`, rustix's `libc`, curve25519-dalek's `curve25519_dalek_bits="64"`)
+    // and of its key.
+    let mut unit_list = unit_crates(graph, lock, &member_ids, view, TRIPLE, alloc).map_err(|e| LoadError::Crates(e.to_string()))?;
+    let script_list = script_records(scripts, graph, &unit_list)?;
+    unit_list.join_scripts(&script_list).map_err(|e| LoadError::Crates(e.to_string()))?;
+    let crates = leak(unit_list);
     let mut places = Vec::with_capacity(crates.crates.len());
     let mut read_roots = Vec::with_capacity(crates.crates.len());
     let (member_origin, checkout) = source_root(root);
@@ -538,12 +545,9 @@ pub fn load(root: &Path, store: &Path, modules: Option<(&Path, &Path)>, scripts:
         None => None,
     };
     let texts: &'static Texts = leak(Texts { places, roots: read_roots, procs });
-    let scripts = script_records(scripts, graph, crates)?;
-    let mut inputs = crates.inputs();
-    for (input, script) in inputs.iter_mut().zip(&scripts) {
-        input.script = *script;
-    }
-    let inputs = leak(inputs);
+    // `inputs` carries each joined record (`UnitCrates::join_scripts`, above).
+    let scripts = script_list;
+    let inputs = leak(crates.inputs());
     let start = Instant::now();
     let names = resolve_crates(inputs, crates.sysroot, texts, &Serial, alloc).map_err(|e| LoadError::Names(e.to_string()))?;
     let resolve_ms = start.elapsed().as_secs_f64() * 1e3;
@@ -557,7 +561,7 @@ pub fn load(root: &Path, store: &Path, modules: Option<(&Path, &Path)>, scripts:
 fn script_records(
     dir: Option<&Path>,
     graph: &'static blaze_unit_graph::UnitGraph<'static>,
-    crates: &'static UnitCrates<'static>,
+    crates: &UnitCrates<'static>,
 ) -> Result<Vec<Option<blaze_build_script::OutputsRef<'static>>>, LoadError> {
     let Some(dir) = dir else { return Ok(vec![None; crates.crates.len()]) };
     let mut given = Vec::new();

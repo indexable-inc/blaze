@@ -1936,6 +1936,27 @@ on eight correct bodies (the census's E0599, E0576 and E0277).
 - A const generic argument in braces in a nested item's header before its body
   (`impl Tr<{ N }> for X {}`) ends the item early in the scan.
 
+## Types inside blocks (2026-11-16; WRITTEN, NEVER COMPILED)
+
+The first owed line above, for the tempo census's "1190 gap Local: a struct in a block" (serde's
+`Deserialize` derive: `enum __Field`, `struct __FieldVisitor;`, `struct __Visitor<'de>` in
+`fn deserialize`). A struct, enum, union or type alias of a block is an item of the block's
+MODULE, with one key (the library's) and a head made by the ordinary code:
+- blaze-file-items nested.rs `NestedKind::makes_module` (impl, struct, enum, union, alias);
+  blaze-scope lower.rs `BodySrc::of` (the word gate is those five words), resolve.rs
+  `make_blocks` and blocks.rs `module_text` write a block that holds any of them; blocks.rs
+  `block_modules(krate, body, nested)` derives each written block's module key from the same scan.
+- front2 locals.rs `Locals::keep` scans the body's text, finds the library's body key (the item,
+  or the container's member, whose text is the same slice), and gives each ADT/alias row its
+  block's module (`Row::module`, checked with `names.lookup`); world_paths.rs `path` resolves a
+  path whose first segment is such a row AT that module with the one name solver; body.rs
+  `BodyTypes::env_at` reads a written TYPE at the innermost such block's module.
+- Still `Gap::Local`, named: a trait or `mod` in a block; a struct, enum, union or alias that a
+  macro call in the body wrote, or that is in the body of an item itself local to a body
+  (`LocalKind::unplaced`). Owed: a type written with `super` in a body with block types reads at
+  the body's module only; a block's `use` is not read for a written type unless the block also
+  declares a type; a local fn of a written block still has two keys.
+
 ## Impls inside blocks, runner 2 (2026-11-16)
 
 A WRITE-ONLY leg: every line below marked NEVER COMPILED was written and not run by its writer.
@@ -1997,6 +2018,27 @@ as a trait impl (`written_trait`, `file_by_text`): never a candidate of an inher
 one impl reach 4,567 bodies is `unread_any`: an unread trait impl whose self type has no shape
 is a candidate of every trait question its crate's `Home` allows. Not changed here (the file is
 the ITEMS lane's); with `_serde` bound the class should be gone.
+
+**Run by the front-end build integrator (12:34 to 12:49, tree 2805c7ecac, load 21.5).** One slip
+fixed by it (tests/blocks.rs `println!` -> `std::println!`). "test blaze-file-items: exit 0; 9
+passed, 0 failed"; blaze-scope blocks filter "8 passed, 0 failed", whole suite "172 passed, 1
+failed" (the known `a_deep_cold_fill_equals_the_plain_reference`); front2_nested "1 passed, 0
+failed"; front2_order "3 passed". Census tempo-front-7.txt: "TEMPO tempo_contracts (crate 853,
+edition E2024): heads 36707, built 36707 (100.0%); bodies 20000, clean 12749 (63.7%); 24.3s"
+(6b: built 29198 of 48693, clean 2394; before nested impls 3056). "container head: Resolve
+Path", the `_serde` UnreadImpl class and the SolTypeValue Convert class are gone; no SolCall /
+SolEvent / SolError class; 0 "does not read as items"; names once 23.7s (6b 46.3s). The fix was
+not run with its cause removed (the planted-bug run of rule 8 is owed). The printed lines
+"NESTED impls in the index" and "BLOCK impls by textual scope" were not seen (lanecheck prints
+summaries only).
+
+**The census's next classes (tempo-front-7.txt), none this leg's code.** "2851 gap UnreadImpl:
+at" (impl e97737e3.. at /package/907/src/core.rs:458, offered to bodies of tempo_contracts:
+`unread_any` again); "1190 gap Local: a struct in a block" (`<impl<'de> _serde::Deserialize<'de>
+for Role>::deserialize`: serde's `struct __Visitor` named in its own body: item 3 below, now the
+largest class this design owns); "849 RefusedImpl [PartialEq]" (the refused alias
+`FieldElement`, /package/317/src/field.rs:86); "831 RefusedImpl [Error]" and "704 RefusedImpl
+[Debug]" (Resolve/Path at /package/650/src/errno.rs:176 and /package/965/src/io/errno.rs:41).
 
 **Owed, in order.**
 1. A statement call in a body with NO written impl is not expanded (the body makes no module;

@@ -38,6 +38,7 @@ mod anon_params;
 mod async_fmt;
 mod closure_identity;
 mod closures;
+mod const_args;
 mod const_enum;
 mod const_terms;
 mod coroutine;

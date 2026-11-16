@@ -63,6 +63,11 @@ pub enum Gap {
     AliasHead(LibKey, Box<str>),
     /// An associated type of an impl, asked as an associated item (its key is not made yet).
     ImplAssocType(ItemKey, Name),
+    /// A const term of the body `owner` (a const generic argument, a repeat length) that its
+    /// conversion left a hole (blaze-lower `TypeckBody::const_gaps`): why, and where in the
+    /// item's text the constant is written. The body was checked with a const variable
+    /// there, which unifies with any value: its check is no answer.
+    BodyConst { owner: ItemKey, gap: blaze_lower::typeck::ConstGap },
     /// A name the body's lowering holds no text for.
     Unspelled(Unspelled),
     /// The names library named an item with no text (a gap in the library, not the program).
@@ -96,6 +101,20 @@ impl core::fmt::Display for Gap {
             Gap::TypeAlias(k) => write!(f, "the type alias {k:x} named in a body path aliases a type with fixed arguments; the checker's `Def` has no form for it"),
             Gap::AliasHead(k, why) => write!(f, "the type alias {k:x} named in a body path has a refused head: {why}"),
             Gap::ImplAssocType(k, n) => write!(f, "the associated type {n:?} of impl {k:?} has no key yet"),
+            Gap::BodyConst { owner, gap } => {
+                use blaze_lower::typeck::{ConstGapWhy, ConstSite};
+                let site = match gap.site {
+                    ConstSite::Arg => "const argument",
+                    ConstSite::RepeatLen => "array repeat length",
+                };
+                let why = match gap.why {
+                    ConstGapWhy::NoEvaluator => "its converter evaluates no constant",
+                    ConstGapWhy::OverGeneric => "a constant expression over a generic parameter (the checker's type form has no node for an unevaluated expression)",
+                    ConstGapWhy::AnonInBody => "an anonymous constant in a body (its type is the checker's to find, or the evaluator refused it)",
+                    ConstGapWhy::NegativeNoSuffix => "a negated literal with no suffix (its bits wait for the parameter's type)",
+                };
+                write!(f, "the {site} at {}..{} of the body {owner:?} has no value yet: {why}", gap.range.start, gap.range.end)
+            }
             Gap::Unspelled(u) => write!(f, "the body names {:?}, whose text its lowering does not hold", u.0),
             Gap::Resolve(e) => write!(f, "{e}"),
             Gap::Fill(e) => write!(f, "{e}"),

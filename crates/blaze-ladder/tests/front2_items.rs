@@ -560,6 +560,12 @@ fn adt_rows(text: &str, adts: &[&str]) -> Vec<(String, String)> {
                             }
                             format!("{:?} is [{}]", view.node(base).expect("the base"), runs.join(", "))
                         }
+                        // An array: its element's node and its length's value (`array of
+                        // Uint(..) len 2`), the length a node only when it is not a value.
+                        Ok(PNode::Array(elem, len)) => match view.value_u64(len) {
+                            Some(n) => format!("array of {:?} len {n}", view.node(elem).expect("the element")),
+                            None => format!("array of {:?} len {:?}", view.node(elem).expect("the element"), view.node(len)),
+                        },
                         other => format!("{other:?}"),
                     });
                 }
@@ -678,4 +684,72 @@ fn main() {}
     // "Solve(Malformed(Sort { term: 6 }))" (the census's 662). The third checker lane's fixture.
     let got = check_fns(TEXT, &["chunks", "question", "index_mut", "q1"]);
     all_clean("sort probe", &got);
+}
+
+/// A trait's associated constant read through a qualified path in an array length (tempo's
+/// primitives: `[u8; (((<B4 as ::modular_bitfield::Specifier>::BITS + <B1 as ..>::BITS) ..`,
+/// about 68 refused signatures). The Reference, "Associated Items", "Associated Constants":
+/// "An associated constant declaration declares a signature for associated constant
+/// definitions"; "An associated constant definition defines a constant associated with a
+/// type"; its example "Using default values" has `trait ConstantIdDefault { const ID: i32 = 1;
+/// }`, `impl ConstantIdDefault for Struct {}` and `assert_eq!(1, <Struct as
+/// ConstantIdDefault>::ID)`: an impl that writes no definition has the trait's default.
+/// `Packed`: `<B4 as Spec>::BITS` is 4 and `<B1 as Spec>::BITS` is 1 (each impl's own
+/// definition), so the length is (4 + 1 + 3) / 8 + 1 = 8 / 8 + 1 = 2. `Padded`: `B4` writes no
+/// `PAD`, so its value is the trait's default 3; `B1` writes 5; the length is 3 + 5 = 8.
+/// Before the change a trait's constant had no head (heads.rs `trait_members` filed no row,
+/// world_items.rs `assoc_item` answered `None`), so each row printed "refused: ..". Expected
+/// lines: "trait constants: Packed: fields [array of Uint(U8) len 2] discrs []" and "trait
+/// constants: Padded: fields [array of Uint(U8) len 8] discrs []" (the element's node as the
+/// checker prints `u8`; the assertions read only the length).
+#[test]
+fn a_trait_constant_in_an_array_length_is_its_impls_value() {
+    const TEXT: &str = "trait Spec { const BITS: usize; const PAD: usize = 3; }
+struct B4;
+impl Spec for B4 { const BITS: usize = 4; }
+struct B1;
+impl Spec for B1 { const BITS: usize = 1; const PAD: usize = 5; }
+struct Packed([u8; (<B4 as Spec>::BITS + <B1 as Spec>::BITS + 3) / 8 + 1]);
+struct Padded([u8; <B4 as Spec>::PAD + <B1 as Spec>::PAD]);
+fn main() {}
+";
+    let got = adt_rows(TEXT, &["Packed", "Padded"]);
+    for (n, o) in &got {
+        println!("trait constants: {n}: {o}");
+    }
+    assert!(got[0].1.starts_with("fields [array of ") && got[0].1.ends_with(" len 2] discrs []"), "{got:?}");
+    assert!(got[1].1.starts_with("fields [array of ") && got[1].1.ends_with(" len 8] discrs []"), "{got:?}");
+}
+
+/// A struct's size in a constant: `size_of::<S>()` reaches the constant evaluator's layout,
+/// which reads the store's row of `S` (front2/consts.rs `LayoutFacts::adt`, the row made on
+/// demand by `adt_row` through `Store::ensure(Want::Adt)`, the run path's maker). The pinned
+/// core, library/core/src/mem/mod.rs: `size_of::<T>()` is "<T as SizedTypeProperties>::SIZE",
+/// the trait's default "const SIZE: usize = intrinsics::size_of::<Self>();" through "impl<T>
+/// SizedTypeProperties for T {}": so this also runs a trait default selected through a
+/// blanket impl. The value: the Reference, "Type layout", "The Rust representation": the only
+/// guarantees are that "The fields are properly aligned", "The fields do not overlap" and
+/// "The alignment of the type is at least the maximum alignment of its fields"; "Size and
+/// Alignment": "The size of a value is always a multiple of its alignment". `S { a: u8, b:
+/// u32 }` holds 1 + 4 bytes that do not overlap (N >= 5) and is aligned to at least `u32`'s 4
+/// (N % 4 == 0, on every target blaze builds for: `u32` is 4-aligned on arm64 and x86-64).
+/// Nothing more is guaranteed, so nothing more is asserted: 8 is what a layout with no waste
+/// gives, and any N >= 5 that is a multiple of 4 is accepted. Before the change `adt` answered
+/// `None` and the row printed "refused: the constant .. the world has no ADT definition for
+/// ..". Expected line: "struct size: T: fields [array of Uint(U8) len 8] discrs []".
+#[test]
+fn a_structs_size_in_a_constant_is_its_layouts() {
+    const TEXT: &str = "struct S { a: u8, b: u32 }
+const N: usize = core::mem::size_of::<S>();
+struct T([u8; N]);
+fn main() {}
+";
+    let got = adt_rows(TEXT, &["T"]);
+    for (n, o) in &got {
+        println!("struct size: {n}: {o}");
+    }
+    let row = &got[0].1;
+    let len: Option<u64> = row.strip_suffix("] discrs []").and_then(|r| r.rsplit_once(" len ")).and_then(|(_, n)| n.parse().ok());
+    let n = len.unwrap_or_else(|| panic!("the row has no array length that is a value: {got:?}"));
+    assert!(n >= 5 && n % 4 == 0, "size_of::<S>() = {n}: {got:?}");
 }

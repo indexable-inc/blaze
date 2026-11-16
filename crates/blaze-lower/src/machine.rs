@@ -325,6 +325,8 @@ pub(crate) struct ExpWord {
     pub(crate) hygiene: u64,
     pub(crate) expansion: u32,
     pub(crate) token: u32,
+    /// One past the word's last token: `token + 2` for a lifetime (`'` and its name).
+    pub(crate) end: u32,
 }
 
 /// A `macro_rules!` a body defines: its name's range and the item's, and the depth of the
@@ -573,7 +575,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             (Some(a), Some(b)) if a.expansion == b.expansion => crate::driver::CallInput::Expanded {
                 expansion: a.expansion,
                 start: a.token,
-                end: b.token + 1,
+                end: b.end,
             },
             _ => crate::driver::CallInput::Text(r.of(self.text())),
         }
@@ -603,7 +605,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             grown.push_str(&out.words.text[w.text.0 as usize..w.text.1 as usize]);
             let end = idx(grown.len());
             ranges.push(Range::new(start, end));
-            self.words.push(ExpWord { start, hygiene: w.hygiene, expansion, token: w.token });
+            self.words.push(ExpWord { start, hygiene: w.hygiene, expansion, token: w.token, end: w.end });
         }
         ranges
     }

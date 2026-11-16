@@ -11,6 +11,7 @@
 //! | [`types`] | a written type to a portable one through the resolver; `Why::Need` for a head not lowered yet |
 
 pub mod anon;
+mod back_needs;
 pub mod body;
 pub mod buckets;
 pub mod check;
@@ -23,18 +24,21 @@ pub mod heads;
 pub mod index;
 pub mod keys;
 pub mod langs;
+pub mod lifetimes;
 pub mod locals;
 pub mod pattern_ty;
 pub mod preds;
 pub mod program;
 pub mod project;
 pub mod reach;
+pub mod source;
 pub mod spell;
 pub mod statics;
 pub mod texts;
 pub mod types;
 pub mod world_items;
 pub mod world_paths;
+mod written;
 
 use blaze_scope::resolve::Names;
 
@@ -73,10 +77,12 @@ impl core::fmt::Display for FrontError {
     }
 }
 
-/// The front end over one program's names.
-pub struct Front2<'n> {
-    pub names: &'n Names<'n>,
-    pub resolver: Resolver<'n>,
+/// The front end over one program's names, from the source `S` ([`source::NamesSource`]): the
+/// names this command solved (`Front2<'n>`, made by [`Front2::new`]) or each crate's records
+/// (`Front2<'n, &source::Records>`, made by [`Front2::from_records`]).
+pub struct Front2<'n, S = &'n Names<'n>> {
+    pub names: S,
+    pub resolver: crate::resolve::Paths<S>,
     pub texts: texts::Texts<'n>,
     pub keys: keys::Keys,
     pub index: index::Index<'n>,
@@ -111,5 +117,25 @@ impl<'n> Front2<'n> {
             keys.item(i.key).map_err(FrontError::Key)?;
         }
         Ok(Front2 { names, resolver: Resolver { names }, texts, keys, index, frame })
+    }
+}
+
+impl<'n> Front2<'n, &'n source::Records<'n>> {
+    /// The front end over each crate's records, nothing solved in this command. Per crate it
+    /// does NOTHING up front: no key is filed (a key is filed in `keys` when a head or a body
+    /// first meets it, where a clash is then reported), no text is listed (`texts` starts
+    /// empty), no impl is filed (`buckets::Buckets::lazy` files a crate's impls the first time
+    /// a question's home admits that crate).
+    ///
+    /// The one thing read here: the lang rows of `lang_crates` (the crates that can declare a
+    /// lang item: core, alloc, std and the program's own, as the driver's crate graph names
+    /// them), from their items records, which this opens. A lang item declared in a crate not
+    /// listed is not found; two crates declaring one name differently is `FrontError::Lang`.
+    ///
+    /// A crate with no record, a record that does not read and a question no record answers
+    /// are in `records.errors()` (see [`source`]): read it after each body.
+    pub fn from_records(records: &'n source::Records<'n>, frame: &'n blaze_mem::Frame, lang_crates: &[usize]) -> Result<Front2<'n, &'n source::Records<'n>>, FrontError> {
+        let index = index::Index::from_source(records, lang_crates).map_err(FrontError::Lang)?;
+        Ok(Front2 { names: records, resolver: crate::resolve::Paths { names: records }, texts: texts::Texts::empty(), keys: keys::Keys::new(), index, frame })
     }
 }
