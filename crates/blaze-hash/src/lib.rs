@@ -11,9 +11,10 @@
 //! - Keys that are hashes already (a content ID, a store key, a fingerprint): [`ByHash`] and
 //!   [`ByHashSet`], on [`KeyHasher`], which takes the key's first word and hashes nothing, in
 //!   a named allocator as above.
-//! - Keys that are their bytes (integers, indices, digests, arrays of them, [`PlainKey`]):
-//!   [`PlainMap`] and [`PlainSet`], on [`Plain`], which hashes the bytes in one step
-//!   ([`hash_plain`]) with no `Hasher`; a digest's first word is its hash, as [`KeyHasher`]'s.
+//! - Keys that are their bytes: a [`HashMap`] or [`HashSet`] of them ([`PlainKey`]: integers,
+//!   indices, digests, arrays of them) hashes those bytes in one step ([`hash_plain`]) with no
+//!   `Hasher`, by a specialization of [`KeyHash`] for [`FixedState`] (`plain`'s documentation
+//!   says why it is sound); a digest's first word is its hash, as [`KeyHasher`]'s.
 //! - A table whose iteration reaches an output, or whose entries are named by position:
 //!   [`IndexMap`] and [`IndexSet`] ([`order`]), which iterate in insertion order whatever the
 //!   hasher, the capacity or the process: dense entries and a table of `u32` indices, in a
@@ -51,6 +52,9 @@
 #![feature(allocator_ext)]
 // `#[may_dangle]` on the table's drop, as std's and hashbrown's tables have.
 #![feature(dropck_eyepatch)]
+// `KeyHash` for `FixedState` over a `PlainKey`, within the sound subset (`plain`'s
+// documentation), and `PlainKey` marked as a trait that subset may specialize on.
+#![feature(min_specialization, rustc_attrs)]
 // blaze's lints (`blaze::trust`) name their tool; inert under rustc.
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
@@ -96,7 +100,7 @@ pub use blake3::{Blake3, Blake3Hasher};
 pub use key::{BuildKeyHasher, ByHash, ByHashSet, KeyHasher};
 pub use sip::{LazyKey, SipHasher, SipKey};
 pub use order::{OrderMap, OrderSet};
-pub use plain::{KeyHash, Plain, PlainKey, hash_plain};
+pub use plain::{KeyHash, PlainKey, hash_plain};
 pub use hash_map::Map;
 pub use hash_set::Set;
 /// Why a `try_reserve` was refused: blaze-own's, the one allocation failure of the tree.
@@ -125,15 +129,6 @@ pub type HashMap<K, V, A> = Map<K, V, FixedState, A>;
 
 /// A set of ordinary keys in the allocator `A`, which every use names, as for [`HashMap`].
 pub type HashSet<K, A> = Set<K, FixedState, A>;
-
-/// A map of keys that are their bytes ([`PlainKey`]: integers, indices, digests, arrays of
-/// them) in the allocator `A`, made by `PlainMap::plain_in(alloc)`: a lookup hashes the key's
-/// bytes in one step ([`hash_plain`]) instead of feeding a `Hasher` field by field.
-pub type PlainMap<K, V, A> = Map<K, V, Plain, A>;
-
-/// A set of [`PlainKey`]s, as [`PlainMap`]: `PlainSet::plain_in(alloc)`.
-pub type PlainSet<K, A> = Set<K, Plain, A>;
-
 /// A map of ordinary keys that iterates in insertion order, in the allocator `A`, which every
 /// use names: `IndexMap::new_in(frame)`, `IndexMap::with_capacity_in(n, frame)`.
 pub type IndexMap<K, V, A> = OrderMap<K, V, FixedState, A>;

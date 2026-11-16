@@ -45,7 +45,7 @@
 
 #![blaze::sans_io]
 
-use core::alloc::Allocator;
+
 use core::fmt;
 
 use blaze_own::{Vec, soa};

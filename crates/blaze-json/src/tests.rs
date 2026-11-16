@@ -119,15 +119,57 @@ fn nesting_is_bounded() {
     let deep = |n: usize| format!("{}{}", "[".repeat(n), "]".repeat(n));
     assert!(read_in(deep(128).as_bytes(), Limits::DEFAULT, Global).is_ok());
     assert_eq!(refused(deep(129).as_bytes()), Error { at: 128, what: What::TooDeep { most: 128 } });
-    let thousand = Limits { most_depth: 1024, ..Limits::DEFAULT };
-    assert!(read_in(deep(1024).as_bytes(), thousand, Global).is_ok());
-    let past = Limits { most_depth: 1025, ..Limits::DEFAULT };
-    assert_eq!(
-        read_in(b"1", past, Global).unwrap_err().what,
-        What::DepthLimitPastMost { asked: 1025, most: 1024 }
-    );
     let small = Limits { most_bytes: 3, ..Limits::DEFAULT };
     assert_eq!(read_in(b"[1] ", small, Global).unwrap_err().what, What::TooLarge { len: 4, most: 3 });
+}
+
+/// `body` on a thread with a 64 KiB stack, where a recursion on depth overflows long before a
+/// million levels.
+fn small_stack(body: impl FnOnce() + Send + 'static) {
+    let thread = std::thread::Builder::new().stack_size(64 << 10).spawn(body).unwrap();
+    thread.join().unwrap();
+}
+
+/// `n` levels, lists and maps by turns, around a `0`.
+fn nested_text(n: usize) -> StdString {
+    let mut text = StdString::new();
+    for i in 0..n {
+        text.push_str(if i % 2 == 0 { "[" } else { "{\"k\":" });
+    }
+    text.push('0');
+    for i in (0..n).rev() {
+        text.push(if i % 2 == 0 { ']' } else { '}' });
+    }
+    text
+}
+
+#[test]
+fn deep_nesting_reads_writes_and_drops_in_a_small_stack() {
+    for (n, limits) in [(128, Limits::DEFAULT), (1_000_000, Limits { most_depth: 1_000_000, ..Limits::DEFAULT })] {
+        small_stack(move || {
+            let text = nested_text(n);
+            let value = read_in(text.as_bytes(), limits, Global).unwrap();
+            let written = to_string_in(&value, WriteOptions::COMPACT, Global).unwrap();
+            assert_eq!(written.as_str(), text, "write(read(text)) is the text");
+            // Pretty text indents each level, so it is quadratic in the depth: the default only.
+            let options = if n <= 128 { WriteOptions::PRETTY } else { WriteOptions::COMPACT };
+            let pretty = to_string_in(&value, options, Global).unwrap();
+            // Compared as text: `==` on values recurses, the one walk here that may.
+            let again = read_in(pretty.as_bytes(), limits, Global).unwrap().copy_in(Global);
+            assert_eq!(to_string_in(&again, WriteOptions::COMPACT, Global).unwrap().as_str(), text);
+            let mut out = String::new_in(Global);
+            let mut writer = Writer::new_in(&mut out, Global);
+            let mut reader = Reader::new_in(text.as_bytes(), limits, Global).unwrap();
+            while let Some(item) = reader.next().unwrap() {
+                writer.event(&item.event).unwrap();
+            }
+            writer.finish().unwrap();
+            assert_eq!(out.as_str(), text, "the event writer at the same depth");
+            let past = nested_text(n + 1);
+            assert_eq!(read_in(past.as_bytes(), limits, Global).unwrap_err().what, What::TooDeep { most: n });
+            drop(value);
+        });
+    }
 }
 
 #[test]
@@ -175,7 +217,7 @@ fn what_json_cannot_say_is_refused_by_path() {
 #[test]
 fn the_reader_streams_events() {
     let text = br#"{"a": [1, "x\n"], "b": "y"}"#;
-    let mut reader = Reader::new(text, Limits::DEFAULT).unwrap();
+    let mut reader = Reader::new_in(text, Limits::DEFAULT, Global).unwrap();
     let mut seen = StdVec::new();
     while let Some(item) = reader.next().unwrap() {
         let shown = match item.event {
@@ -193,7 +235,7 @@ fn the_reader_streams_events() {
 #[test]
 fn the_event_writer_checks_its_order() {
     let mut out = String::new_in(Global);
-    let mut writer = Writer::new(&mut out);
+    let mut writer = Writer::new_in(&mut out, Global);
     let a = crate::Str::plain("a");
     assert_eq!(writer.event(&Event::Key(a)).unwrap_err().what, StreamWhat::KeyHere);
     writer.event(&Event::StartMap).unwrap();
@@ -252,8 +294,9 @@ fn round_trip(tape: &Tape) -> Result<(), Broke> {
     }
     let text = to_string_in(&v, WriteOptions::COMPACT, Global).map_err(|e| Broke::Harness(e.to_string()))?;
     let mut out = String::new_in(Global);
-    let mut writer = Writer::new(&mut out);
-    let mut reader = Reader::new(text.as_bytes(), Limits::DEFAULT).map_err(|e| Broke::Harness(e.to_string()))?;
+    let mut writer = Writer::new_in(&mut out, Global);
+    let mut reader =
+        Reader::new_in(text.as_bytes(), Limits::DEFAULT, Global).map_err(|e| Broke::Harness(e.to_string()))?;
     while let Some(item) = reader.next().map_err(|e| Broke::Oracle(format!("the round trip's reader: {e}")))? {
         writer.event(&item.event).map_err(|e| Broke::Oracle(format!("the round trip's writer: {e:?}")))?;
     }

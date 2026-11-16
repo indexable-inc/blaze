@@ -18,6 +18,7 @@ use core::alloc::Allocator;
 use blaze_id::ContentId;
 use blaze_own::Vec;
 
+use crate::condition::Var;
 use crate::key::{Key, Name};
 use crate::wire::{NAME_BYTES, Reader, WireError, WireWhy, Writer};
 
@@ -72,6 +73,10 @@ pub(crate) struct Whole<'a> {
     pub(crate) parts: &'a [Part],
     pub(crate) findings: &'a [Finding<'a>],
     pub(crate) payload: &'a [u8],
+    /// A split: the task read this cfg variable unfixed, and its parts are its job re-entered
+    /// once per value the space allows (`Locate` as its own; each fork's name is
+    /// `key::at_condition`). `None` for every other record.
+    pub(crate) split: Option<Var>,
 }
 
 pub(crate) fn write_whole<A: Allocator>(whole: &Whole<'_>, alloc: A) -> Vec<u8, A> {
@@ -80,6 +85,7 @@ pub(crate) fn write_whole<A: Allocator>(whole: &Whole<'_>, alloc: A) -> Vec<u8, 
     w.name(whole.name);
     w.id(&whole.source);
     w.id(&whole.out);
+    w.split(whole.split);
     w.count(whole.reads.len());
     for (name, saw) in whole.reads {
         w.name(*name);
@@ -147,6 +153,8 @@ pub struct WholeView<'a> {
     pub name: Name,
     pub source: ContentId,
     pub out: ContentId,
+    /// See [`Whole::split`].
+    pub split: Option<Var>,
     reads: &'a [u8],
     parts: &'a [u8],
     findings: &'a [u8],
@@ -170,6 +178,7 @@ pub fn open(bytes: &[u8]) -> Result<Stored<'_>, WireError> {
             let name = r.name()?;
             let source = r.id()?;
             let out = r.id()?;
+            let split = r.split()?;
             let reads = fixed(&mut r, bytes, READ_BYTES, |r| {
                 r.name()?;
                 r.id()?;
@@ -197,7 +206,7 @@ pub fn open(bytes: &[u8]) -> Result<Stored<'_>, WireError> {
             r.pad_to(PAYLOAD_ALIGN)?;
             let payload = r.take_bytes(len)?;
             r.done()?;
-            Ok(Stored::Whole(WholeView { name, source, out, reads, parts, findings, nfindings, payload }))
+            Ok(Stored::Whole(WholeView { name, source, out, split, reads, parts, findings, nfindings, payload }))
         }
         SHAPE => {
             let name = r.name()?;

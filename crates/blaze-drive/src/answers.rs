@@ -9,10 +9,12 @@ use core::alloc::Allocator;
 use blaze_id::ContentId;
 use blaze_own::{SortedMap, Vec};
 
+use crate::condition::{Condition, Var};
 use crate::key::{Key, Name};
-use crate::wire::{NAME_BYTES, Reader, WireError, Writer};
+use crate::wire::{NAME_BYTES, Reader, WireError, WireWhy, Writer};
 
-const PAGE_MAGIC: &[u8; 4] = b"BDP1";
+/// 2: a row holds its split and its condition.
+const PAGE_MAGIC: &[u8; 4] = b"BDP2";
 const ROOT_MAGIC: &[u8; 4] = b"BDA1";
 const LAST_MAGIC: &[u8; 4] = b"BDL1";
 
@@ -43,6 +45,12 @@ pub struct Row<A: Allocator + Clone> {
     pub parts: Vec<Name, A>,
     /// The names whose read lists hold it, sorted: the reverse index.
     pub readers: Vec<Name, A>,
+    /// Its record's split variable: its parts are then its forks, one per allowed value.
+    pub split: Option<Var>,
+    /// The name it is a fork of and the condition it runs under; `None` under
+    /// [`Condition::ANY`] (the name is then its own base). Kept so a fork walked from a hint
+    /// next run runs under its condition with no parent walked first.
+    pub cond: Option<(Name, Condition)>,
 }
 
 /// The rows of one page, by name.
@@ -80,6 +88,15 @@ pub(crate) fn write_page<'r, A: Allocator + Clone + 'r, B: Allocator>(
         w.id(&row.out);
         w.name(row.home);
         w.u32(row.place);
+        w.split(row.split);
+        match &row.cond {
+            None => w.u8(0),
+            Some((base, condition)) => {
+                w.u8(1);
+                w.name(*base);
+                w.condition(condition);
+            }
+        }
         w.count(row.reads.len());
         for (read, saw) in row.reads.iter() {
             w.name(*read);
@@ -99,7 +116,7 @@ pub(crate) fn write_page<'r, A: Allocator + Clone + 'r, B: Allocator>(
 
 pub(crate) fn read_page<A: Allocator + Clone>(bytes: &[u8], alloc: A) -> Result<Page<A>, WireError> {
     let mut r = Reader::new(bytes, PAGE_MAGIC, "answer page")?;
-    let n = r.count(NAME_BYTES * 3 + 32 * 4 + 4 + 12)?;
+    let n = r.count(NAME_BYTES * 3 + 32 * 4 + 4 + 4 + 1 + 12)?;
     let mut rows = Vec::with_capacity_in(n, alloc.clone());
     for _ in 0..n {
         let name = r.name()?;
@@ -109,6 +126,12 @@ pub(crate) fn read_page<A: Allocator + Clone>(bytes: &[u8], alloc: A) -> Result<
         let out = r.id()?;
         let home = r.name()?;
         let place = r.u32()?;
+        let split = r.split()?;
+        let cond = match r.u8()? {
+            0 => None,
+            1 => Some((r.name()?, r.condition()?)),
+            tag => return Err(r.error(WireWhy::Tag(tag))),
+        };
         let nreads = r.count(NAME_BYTES + 32)?;
         let mut reads = Vec::with_capacity_in(nreads, alloc.clone());
         for _ in 0..nreads {
@@ -124,7 +147,7 @@ pub(crate) fn read_page<A: Allocator + Clone>(bytes: &[u8], alloc: A) -> Result<
         for _ in 0..nreaders {
             readers.push(r.name()?);
         }
-        rows.push((name, Row { key, at, source, out, home, place, reads, parts, readers }));
+        rows.push((name, Row { key, at, source, out, home, place, reads, parts, readers, split, cond }));
     }
     r.done()?;
     SortedMap::from_sorted(rows).map_err(|_| r.error(crate::wire::WireWhy::Unsorted))

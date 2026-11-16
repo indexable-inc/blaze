@@ -20,12 +20,13 @@ use core::{alloc::Allocator, fmt, iter::FusedIterator, ops::Index};
 use blaze_own::AllocFailure;
 
 use crate::{
-    Equivalent, KeyHash, Plain,
+    Equivalent, KeyHash,
     raw::{self, RawTable},
 };
 
-/// A map on the hasher `S`, in the allocator `A`: `S` is a `BuildHasher` over `Hash` keys, or
-/// [`Plain`] over [`PlainKey`](crate::PlainKey)s, one seam ([`KeyHash`]).
+/// A map on the hasher `S`, in the allocator `A`; it hashes through [`KeyHash`], a
+/// `BuildHasher`'s `hash_one`, or for `FixedState` and a [`PlainKey`](crate::PlainKey) the
+/// key's bytes.
 pub struct Map<K, V, S, A: Allocator> {
     pub(crate) table: RawTable<(K, V), A>,
     pub(crate) hasher: S,
@@ -36,16 +37,6 @@ pub struct Map<K, V, S, A: Allocator> {
 fn by_key<K, V, S: KeyHash<K>>(hasher: &S) -> impl Fn(&(K, V)) -> u64 + '_ {
     move |entry| hasher.hash_key(&entry.0)
 }
-
-impl<K, V, A: Allocator> Map<K, V, Plain, A> {
-    /// An empty map in `alloc` hashed by [`hash_plain`](crate::hash_plain): a lookup hashes
-    /// the key's bytes in one step and builds no `Hasher`.
-    #[inline]
-    pub const fn plain_in(alloc: A) -> Self {
-        Map::with_hasher_in(Plain, alloc)
-    }
-}
-
 impl<K, V, S: Default, A: Allocator> Map<K, V, S, A> {
     /// An empty map in `alloc`; it allocates nothing until the first insert.
     #[inline]

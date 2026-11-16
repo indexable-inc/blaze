@@ -343,10 +343,10 @@ mod tests {
         assert_ne!(folded_multiply(1 << 48, PLAIN_MUL), (1u64 << 48).wrapping_mul(PLAIN_MUL));
     }
 
-    /// One case: a `PlainMap` and a `BTreeMap` given the same inserts, removes, gets and entry
-    /// updates agree at every step and at the end.
+    /// One case: a `HashMap` of plain keys (so on `hash_plain`) and a `BTreeMap` given the same
+    /// inserts, removes, gets and entry updates agree at every step and at the end.
     fn agrees_with_btree<K: PlainKey + Ord + core::fmt::Debug>(tape: &Tape, key: impl Fn(&Tape) -> K) {
-        let mut map: PlainMap<K, u32, Global> = PlainMap::plain_in(Global);
+        let mut map: HashMap<K, u32, Global> = HashMap::new_in(Global);
         let mut model = BTreeMap::new();
         let ops = tape.range(0..if cfg!(miri) { 64 } else { 512 }, "ops");
         for _ in 0..ops {
@@ -379,7 +379,7 @@ mod tests {
     const CASES: u32 = if cfg!(miri) { 16 } else { 256 };
 
     #[test]
-    fn a_plain_map_of_u32_is_a_btree_map() {
+    fn a_hash_map_of_u32_is_a_btree_map() {
         // Keys from a small range, so removes and entries meet held keys.
         blaze_sim::check(Config::cases(CASES), |tape: &Tape| {
             agrees_with_btree(tape, |tape| tape.below(64, "key") as u32)
@@ -387,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn a_plain_map_of_byte_arrays_is_a_btree_map() {
+    fn a_hash_map_of_byte_arrays_is_a_btree_map() {
         blaze_sim::check(Config::cases(CASES), |tape: &Tape| {
             agrees_with_btree(tape, |tape| {
                 let mut key = [0u8; 16];

@@ -1,8 +1,6 @@
 //! The two traits: everything the type checker may ask of the item layer
 //! (docs/v2/plan/design/bottom.md, point 4).
 
-use core::alloc::Allocator;
-
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 
 use crate::crate_graph::CrateGraphView;
@@ -115,27 +113,27 @@ pub trait Items {
     }
 
     /// [`Items::place`] of a task's local.
-    fn local_place<A: Allocator + Clone>(
+    fn local_place(
         &self,
-        locals: &LocalTable<AnyItem, A>,
+        locals: &LocalTable<'_, AnyItem>,
         item: Local<AnyItem>,
     ) -> Result<Place, SurfaceError> {
         self.place(locals.key(item)?)
     }
 
     /// [`Items::kind`] of a task's local.
-    fn local_kind<A: Allocator + Clone>(
+    fn local_kind(
         &self,
-        locals: &LocalTable<AnyItem, A>,
+        locals: &LocalTable<'_, AnyItem>,
         item: Local<AnyItem>,
     ) -> Result<ItemKind, SurfaceError> {
         self.kind(locals.key(item)?)
     }
 
     /// [`Items::parent`] of a task's local, the parent numbered in the task's table.
-    fn local_parent<A: Allocator + Clone>(
+    fn local_parent(
         &self,
-        locals: &mut LocalTable<AnyItem, A>,
+        locals: &mut LocalTable<'_, AnyItem>,
         item: Local<AnyItem>,
     ) -> Result<Option<Local<AnyItem>>, SurfaceError> {
         match self.parent(locals.key(item)?)? {
@@ -145,9 +143,9 @@ pub trait Items {
     }
 
     /// [`Items::scope`] of a task's local module.
-    fn local_scope<A: Allocator + Clone>(
+    fn local_scope(
         &self,
-        locals: &LocalTable<AnyItem, A>,
+        locals: &LocalTable<'_, AnyItem>,
         module: Local<AnyItem>,
     ) -> Result<ScopeView<'_>, SurfaceError> {
         self.scope(locals.key(module)?)
@@ -155,9 +153,9 @@ pub trait Items {
 
     /// [`Items::lookup`] in a task's local module: the binding, and its target numbered in the
     /// task's table.
-    fn local_lookup<A: Allocator + Clone>(
+    fn local_lookup(
         &self,
-        locals: &mut LocalTable<AnyItem, A>,
+        locals: &mut LocalTable<'_, AnyItem>,
         module: Local<AnyItem>,
         ns: Namespace,
         name: &str,
@@ -210,20 +208,20 @@ pub trait Source: Items {
     }
 
     /// [`Source::signature_text`] of a task's local.
-    fn local_signature_text<A: Allocator + Clone>(
+    fn local_signature_text(
         &self,
         proof: HasText,
-        locals: &LocalTable<AnyItem, A>,
+        locals: &LocalTable<'_, AnyItem>,
         item: Local<AnyItem>,
     ) -> Result<&str, SurfaceError> {
         self.signature_text(proof, locals.key(item)?)
     }
 
     /// [`Source::body_text`] of a task's local.
-    fn local_body_text<A: Allocator + Clone>(
+    fn local_body_text(
         &self,
         proof: HasText,
-        locals: &LocalTable<AnyItem, A>,
+        locals: &LocalTable<'_, AnyItem>,
         item: Local<AnyItem>,
     ) -> Result<&str, SurfaceError> {
         self.body_text(proof, locals.key(item)?)

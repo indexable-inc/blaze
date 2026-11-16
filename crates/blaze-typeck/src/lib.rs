@@ -37,7 +37,7 @@ mod tests;
 #[cfg(test)]
 mod toy;
 
-use core::alloc::Allocator;
+use blaze_own::Alloc;
 
 pub use body::{Arm, BinOp, BindAnn, BodyPath, BodyView, Expr, FieldInit, FieldPat, IntSuffix, Lit, Pat, Segment, Stmt, UnOp};
 pub use columns::{AdjustKind, Adjusts, Callees, CaptureKind, Captures, Checked, Fields};
@@ -58,11 +58,11 @@ pub use world::{
 use machine::{Machine, Plant};
 
 /// What a check gives: the record, or the questions it needed and the world could not answer.
-pub enum Outcome<A: Allocator + Clone> {
-    Done(Checked<A>),
+pub enum Outcome<'a> {
+    Done(Checked<'a>),
     /// Every question asked before the stop and the one the world missed. The caller fetches
     /// them and checks again with these as the hints; that run equals one that never stopped.
-    Need(Needs<A>),
+    Need(Needs<'a>),
 }
 
 /// Checks one body (typeck.md, "The function").
@@ -100,7 +100,7 @@ pub(crate) fn check_with<'a, W: World, C: TypeCtx>(
 }
 
 /// The walk and the end sequence (typeck.md, "The walk and its queues").
-fn walk<'a, W: World, C: TypeCtx>(m: &mut Machine<'_, '_, '_, 'a, W, C>) -> Result<(), Stop> {
+fn walk<W: World, C: TypeCtx>(m: &mut Machine<'_, '_, '_, '_, W, C>) -> Result<(), Stop> {
     let output = m.start_body()?;
     m.run()?;
     m.finish_body(output)?;

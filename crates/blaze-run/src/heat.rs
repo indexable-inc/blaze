@@ -17,9 +17,7 @@
 
 #![blaze::sans_io]
 
-use core::alloc::Allocator;
-
-use blaze_own::Vec;
+use blaze_own::{AVec, Alloc, Vec};
 
 use crate::{Plant, SlotId};
 
@@ -50,15 +48,15 @@ impl core::fmt::Display for Error {
 impl core::error::Error for Error {}
 
 /// Which of one program's slots are hot. See the module's documentation.
-pub struct Heat<A: Allocator> {
+pub struct Heat<'a> {
     config: Config,
     /// A flag a slot: given to the tier (once, for the run). One column, scanned by nothing.
-    hot: Vec<bool, A>,
+    hot: AVec<'a, bool>,
     pub(crate) plant: Plant,
 }
 
-impl<A: Allocator> Heat<A> {
-    pub fn new(slots: u32, config: Config, alloc: A) -> Result<Heat<A>, Error> {
+impl<'a> Heat<'a> {
+    pub fn new(slots: u32, config: Config, alloc: Alloc<'a>) -> Result<Heat<'a>, Error> {
         if config.bound == 0 {
             return Err(Error::Config { what: "a bound of 0 makes every function hot", value: 0 });
         }
@@ -79,7 +77,7 @@ impl<A: Allocator> Heat<A> {
     /// `slot`'s count stub reached zero. Pushes `slot` to `hot` the one time it becomes hot;
     /// a later event of the same slot (a stub that fired again before its word was gone) is
     /// nothing.
-    pub fn reached<B: Allocator>(&mut self, slot: SlotId, hot: &mut Vec<SlotId, B>) -> Result<(), Error> {
+    pub fn reached(&mut self, slot: SlotId, hot: &mut AVec<'_, SlotId>) -> Result<(), Error> {
         let slots = self.hot.len() as u32;
         let Some(was) = self.hot.get_mut(slot.index()) else {
             return Err(Error::NoSlot { slot, slots });

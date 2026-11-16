@@ -1006,6 +1006,12 @@ impl Pool {
         (worker.stole_near.load(Ordering::Relaxed), worker.stole_far.load(Ordering::Relaxed))
     }
 
+    /// How many workers are parked now: for a test that needs them idle first.
+    #[cfg(test)]
+    pub(crate) fn parked(&self) -> u32 {
+        self.0.idle.counts().1
+    }
+
     /// The victims worker `at` tries, in order: for a test of the order.
     #[cfg(test)]
     pub(crate) fn victims(&self, at: u32) -> Vec<u32, Global> {

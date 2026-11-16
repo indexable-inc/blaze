@@ -9,8 +9,7 @@
 
 #![blaze::sans_io]
 
-use blaze_own::{Soa, Vec};
-use core::alloc::Allocator;
+use blaze_own::{Alloc, Soa, Vec};
 
 use crate::columns::columns_eq;
 use crate::error::Stop;
@@ -306,13 +305,13 @@ pub struct Needs<A: Allocator + Clone> {
 
 impl<A: Allocator + Clone> Needs<A> {
     /// No needs.
-    pub fn new_in(alloc: A) -> Needs<A> {
+    pub fn new_in(alloc: Alloc<'a>) -> Needs<'a> {
         Needs { questions: Vec::new_in(alloc) }
     }
 }
 
 /// The recorder: owns the world's borrow and the read list. The only caller of `World`.
-pub struct Reads<'w, W: World, A: Allocator + Clone> {
+pub struct Reads<'w, 'a, W: World> {
     world: &'w W,
     entries: Vec<(Question, u64), A>,
 }
@@ -323,9 +322,9 @@ fn hash_of(domain: &str, v: &impl ContentHash) -> u64 {
     h.finish()
 }
 
-impl<'w, W: World, A: Allocator + Clone> Reads<'w, W, A> {
+impl<'w, 'a, W: World> Reads<'w, 'a, W> {
     /// The recorder for one run.
-    pub(crate) fn new_in(world: &'w W, alloc: A) -> Reads<'w, W, A> {
+    pub(crate) fn new_in(world: &'w W, alloc: Alloc<'a>) -> Reads<'w, 'a, W> {
         Reads { world, entries: Vec::new_in(alloc) }
     }
 
@@ -426,10 +425,10 @@ impl<'w, W: World, A: Allocator + Clone> Reads<'w, W, A> {
     }
 
     /// The read list and the needs of the run, sorted and deduplicated (rule 25).
-    pub(crate) fn finish(mut self, alloc: A) -> (ReadList<A>, Needs<A>) {
+    pub(crate) fn finish(mut self, alloc: Alloc<'a>) -> (ReadList<'a>, Needs<'a>) {
         self.entries.sort_unstable();
         self.entries.dedup();
-        let mut rows = Soa::with_capacity_in(self.entries.len(), alloc.clone());
+        let mut rows = Soa::with_capacity_in(self.entries.len(), alloc);
         let mut needs = Vec::with_capacity_in(self.entries.len(), alloc);
         for &(q, h) in self.entries.iter() {
             rows.push((q, h));

@@ -13,7 +13,7 @@
 
 #![blaze::sans_io]
 
-use core::alloc::Allocator;
+
 use core::mem;
 
 use blaze_hash::HashMap;

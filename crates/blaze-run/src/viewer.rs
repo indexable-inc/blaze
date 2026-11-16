@@ -8,7 +8,7 @@
 //! value; a decoder refuses any other form by name, and bounds the slots by its caller's cap
 //! before it takes one (network CBOR decoded with limits).
 
-use core::alloc::Allocator;
+
 use core::fmt;
 
 use blaze_own::Vec;
