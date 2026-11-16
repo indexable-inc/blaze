@@ -685,6 +685,7 @@ pub(crate) fn innermost_name() -> Option<String> {
 /// Where `key` is on no run of this task (the flight said it was), or where a run in the cycle
 /// declared no recovery: the cycle's path is the message.
 pub(crate) fn reenter(
+    memo: &Memo,
     kind: &'static Kind,
     hash: u64,
     key: *const (),
@@ -733,7 +734,7 @@ pub(crate) fn reenter(
     crate::counts::cycle();
     if found.provisional.get().is_null() {
         let mut last = last_of(head_ref, kind, hash, key);
-        if last.is_null() {
+        if last.is_null() && memo.plant() != Plant::ReenterOwnBookOnly {
             last = last_below(found, kind, hash, key);
         }
         found.provisional.set(if last.is_null() { make() } else { last });
