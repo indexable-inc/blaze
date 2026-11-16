@@ -268,6 +268,7 @@ fn gap_class(g: &Gap, names: &Names<'_>) -> String {
         }
         Gap::FnHead(_, s) => format!("gap FnHead: {}", nest(s)),
         Gap::Unspelled(u) => format!("gap Unspelled: {}", nest(&format!("{u:?}"))),
+        Gap::Local(g) => format!("gap Local: {}", g.form),
         Gap::Resolve(e) => format!("gap Resolve: {}", nest(&format!("{e:?}"))),
         Gap::Fill(e) => format!("gap Fill: {}", nest(&format!("{e:?}"))),
         Gap::BodyRecord(q) => format!("gap BodyRecord: {}", nest(&format!("{q:?}"))),
@@ -544,7 +545,7 @@ fn heads<'n>(names: &'n Names<'n>, front: &mut Front2<'n>, krate: usize, cname: 
     ordered.truncate(cap);
 
     let prepared = Prepares::new_in(Alloc::global());
-    let mut store = Store::new(front.index.lang("sized"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame);
     let mut buckets = None;
     let mut consts = Consts::default();
     // (kind, path, place, outcome)
@@ -762,9 +763,7 @@ struct Recs<'n> {
 }
 
 impl<'n> Recs<'n> {
-    fn new(sized: Option<blaze_id::ItemKey>) -> Recs<'n> {
-        Recs { store: Store::new(sized), buckets: None, consts: Consts::default(), heads: BTreeMap::new(), blocked: (Vec::new(), false) }
-    }
+    fn new(sized: Option<blaze_id::ItemKey>, frame: &'n blaze_mem::Frame) -> Recs<'n> { Recs { store: Store::new(sized, frame), buckets: None, consts: Consts::default(), heads: BTreeMap::new(), blocked: (Vec::new(), false) } }
 }
 
 fn one<'n>(names: &'n Names<'n>, front: &mut Front2<'n>, recs: &mut Recs<'n>, prepared: &Prepares<'n>, t: Target<'_>) -> Result<Option<()>, (String, String)> {
@@ -865,7 +864,7 @@ fn bodies<'n>(
 
     let prepared = Prepares::new_in(Alloc::global());
     let sized = front.index.lang("sized");
-    let mut shared = Recs::new(sized);
+    let mut shared = Recs::new(sized, front.frame);
     let mut classes: Table = BTreeMap::new();
     let (mut clean, mut checked, mut no_body, mut impl_only) = (0usize, 0usize, 0usize, 0usize);
     let mut stopped = None;
@@ -934,7 +933,7 @@ fn bodies<'n>(
         if start.elapsed().as_secs() > secs {
             break;
         }
-        let mut fresh = Recs::new(sized);
+        let mut fresh = Recs::new(sized, front.frame);
         let got = one(names, front, &mut fresh, &prepared, e.target);
         if matches!(got, Ok(None)) {
             continue;
@@ -1034,7 +1033,9 @@ fn main() {
     println!("names: {} crates in {names_s:.1}s (resolve {:.1}s); {}", names.crates().len(), loaded.resolve_ms / 1e3, mem());
     let mut blockers: BTreeMap<blaze_id::ItemKey, Blocker> = BTreeMap::new();
     let t1 = Instant::now();
-    let mut front = match Front2::new(names, &[]) {
+    // The command's frame, alive as long as the names (the whole run).
+    let frame: &'static blaze_mem::Frame = Box::leak(Box::new(blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame")));
+    let mut front = match Front2::new(names, frame, &[]) {
         Ok(f) => f,
         Err(e) => {
             println!("stopped: Front2::new: {e}");

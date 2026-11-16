@@ -29,7 +29,53 @@ use parser::SyntaxKind::{self, *};
 
 use crate::columns::{Columns, Lens, head};
 use crate::form::*;
-use crate::{Cfg, CfgAnswer, Lowered, Need, lit};
+use crate::columns::View;
+use crate::{Cfg, CfgAnswer, Lowered, Need, ValueName, ValueNames, lit};
+
+/// What an item declared in one of the body's blocks makes `name` at `scope`, for a pattern:
+/// `None` when no such item is in the value namespace there (the module's answer is asked).
+fn local_value(v: &View<'_>, scope: ScopeId, name: NameIdx) -> Option<ValueName> {
+    let hash = v.name(name).expect("a name the lowering wrote");
+    let row = crate::resolve::local_item(v, Some(scope), hash).expect("the lowering's own scopes")?;
+    let item = v.local_item(v.row(row).expect("a local item's row")).expect("a local item");
+    let kind = item.syntax;
+    if kind == CONST as u16 {
+        Some(ValueName::Const)
+    } else if kind == STATIC as u16 {
+        Some(ValueName::Static)
+    } else if kind == FN as u16 {
+        Some(ValueName::Nothing)
+    } else if kind == STRUCT as u16 {
+        struct_shape(v.text_at(item.range).expect("a local item's text"))
+    } else {
+        None
+    }
+}
+
+/// A struct item's value: its constructor when it is a unit or a tuple struct (`struct S;`,
+/// `struct S<T>(T);`), `None` for one with named fields, which is no value. Read after the
+/// `struct` keyword: the name, the generics, then `;` or `(`.
+fn struct_shape(text: &str) -> Option<ValueName> {
+    let at = text.match_indices("struct").find(|(i, _)| {
+        let before = text[..*i].chars().next_back();
+        let after = text[i + 6..].chars().next();
+        before.is_none_or(|c| !(c.is_alphanumeric() || c == '_')) && after.is_some_and(char::is_whitespace)
+    })?;
+    let rest = text[at.0 + 6..].trim_start();
+    let rest = rest.trim_start_matches(|c: char| c.is_alphanumeric() || c == '_').trim_start();
+    let mut depth = 0u32;
+    for c in rest.chars() {
+        match c {
+            '<' => depth += 1,
+            '>' if depth > 0 => depth -= 1,
+            c if depth > 0 || c.is_whitespace() => {}
+            ';' => return Some(ValueName::UnitStruct),
+            '(' => return Some(ValueName::TupleCtor),
+            _ => return None,
+        }
+    }
+    None
+}
 
 /// What a lowering makes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -179,6 +225,15 @@ impl Val {
     }
 }
 
+/// An identifier pattern as written: its `Pat::Bind`, the block it is in, and whether it is a
+/// bare name (no `ref`, `mut` or `@`), the one form a path pattern can take.
+#[derive(Clone, Copy)]
+struct Ident {
+    pat: u32,
+    scope: u32,
+    bare: bool,
+}
+
 /// A binding in scope.
 #[derive(Clone, Copy)]
 struct Local {
@@ -215,6 +270,11 @@ pub struct Machine<'t, 'c, 'a> {
     /// The cfg set; `None` only while it is lent to the expander for one call
     /// ([`Machine::lend_cfg`]), when no step runs.
     cfg: Option<&'c mut dyn Cfg>,
+    /// What a name is at the body's module, for identifier patterns; `None` for a signature
+    /// or a type, whose patterns (a signature's parameters) no check reads.
+    values: Option<&'c mut dyn ValueNames>,
+    /// Every identifier pattern, settled by [`Machine::settle_patterns`] at the end.
+    idents: AVec<'a, Ident>,
     pub(crate) out: Columns<'a>,
     frames: AVec<'a, Frame>,
     pub(crate) vals: AVec<'a, Val>,
@@ -379,6 +439,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         mode: Mode,
         edition: Edition,
         cfg: &'c mut dyn Cfg,
+        values: Option<&'c mut dyn ValueNames>,
         alloc: Alloc<'a>,
     ) -> Machine<'t, 'c, 'a> {
         let mut out = Columns::new_in(alloc);
@@ -401,6 +462,8 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             mode,
             edition,
             cfg: Some(cfg),
+            values,
+            idents: Vec::new_in(alloc),
             out,
             frames: Vec::new_in(alloc),
             vals: Vec::new_in(alloc),
@@ -568,11 +631,12 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
     }
 
     pub(crate) fn finish(mut self) -> Result<Lowered<'a, 't>, Need<'a>> {
-        if !self.needs.is_empty() {
-            return Err(Need { atoms: self.needs });
-        }
         if let Some(grown) = &self.grown {
             self.out.expanded.extend_from_slice(&grown.as_bytes()[self.text.len()..]);
+        }
+        self.settle_patterns();
+        if !self.needs.is_empty() {
+            return Err(Need { atoms: self.needs });
         }
         if self.mode == Mode::AnonConst
             && let Some(v) = self.vals.iter().rev().find(|v| v.v == V::Expr)
@@ -587,6 +651,94 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             self.out.head[head::TY] = v.id;
         }
         Ok(Lowered { columns: self.out, item: self.text })
+    }
+
+    /// Settles every identifier pattern by what its name is where it is written, innermost
+    /// first: an item declared in one of the body's blocks, else the world's answer at the
+    /// body's module ([`ValueNames`], each answer kept in the read list `value_reads`). The
+    /// Reference, "Identifier patterns": "Path patterns take precedence over identifier
+    /// patterns", so a bare name of a constant, a unit struct or a unit variant is a
+    /// [`Pat::Path`], and each use its binding was given becomes that path; a binding of a
+    /// static, a tuple struct or a tuple variant, or a `ref`, `mut` or `@` binding of any of
+    /// those, is [`DiagKind::PatternShadows`] at the name (E0530). Run once, at the end, when
+    /// every block's items are known; one pass over the patterns, one over what names a binding.
+    fn settle_patterns(&mut self) {
+        let Some(values) = self.values.as_deref_mut() else { return };
+        let alloc = self.vals.allocator().clone();
+        // Each pattern's settling: (pattern, name, block, answer).
+        let mut settled: AVec<'_, (u32, u32, u32, ValueName)> = Vec::new_in(alloc.clone());
+        let mut reads: AVec<'_, Node> = Vec::new_in(alloc.clone());
+        {
+            let v = self.out.view(self.text);
+            for id in self.idents.iter() {
+                let Ok(Pat::Bind { name, .. }) = v.pat(PatId(id.pat)) else {
+                    unreachable!("an identifier pattern is the binding the lowering wrote");
+                };
+                let answer = match local_value(&v, ScopeId(id.scope), name) {
+                    Some(a) => a,
+                    None => {
+                        let text = v.name_text(name).expect("a name the lowering wrote has its text");
+                        let a = values.value_name(text);
+                        reads.push(Node { a: name.0, ..Node::of(a as u16) });
+                        a
+                    }
+                };
+                if answer != ValueName::Nothing {
+                    settled.push((id.pat, name.0, if id.bare { id.scope } else { NONE }, answer));
+                }
+            }
+        }
+        self.out.value_reads.extend_from_slice(&reads);
+        // (pattern made a path, the binding it hid), in pattern order.
+        let mut moved: AVec<'_, (u32, Option<PatId>)> = Vec::new_in(alloc);
+        for &(pat, name, scope, answer) in settled.iter() {
+            let at = self.out.name_ranges[name as usize];
+            if answer == ValueName::Need {
+                self.needs.push(at);
+                continue;
+            }
+            if !answer.is_path() || scope == NONE {
+                self.diag(DiagKind::PatternShadows, at);
+                continue;
+            }
+            let seg = Segment {
+                kind: SegKind::Ident,
+                name: Some(NameIdx(name)),
+                args: List { start: 0, len: 0 },
+                has_args: false,
+                parenthesized: false,
+                return_notation: false,
+                ty: None,
+                trait_: None,
+            };
+            let mut node = seg.encode();
+            node.f = 0;
+            let segments = self.put_rows_of(&[(node, at)]);
+            let path = self.put_path(PathRef { segments, absolute: false, scope: Some(ScopeId(scope)), lang: None }, at);
+            let Ok(Pat::Bind { shadows, .. }) = Pat::decode(self.out.pats[pat as usize]) else {
+                unreachable!("an identifier pattern is the binding the lowering wrote");
+            };
+            self.out.pats[pat as usize] = Pat::Path(path).encode();
+            moved.push((pat, shadows));
+        }
+        if moved.is_empty() {
+            return;
+        }
+        let find = |p: PatId| moved.binary_search_by_key(&p.0, |m| m.0).ok().map(|i| moved[i].1);
+        for e in self.out.exprs.iter_mut() {
+            if let Ok(Expr::Local { pat, path }) = Expr::decode(*e)
+                && find(pat).is_some()
+            {
+                *e = Expr::Path(path).encode();
+            }
+        }
+        for p in self.out.pats.iter_mut() {
+            if let Ok(Pat::Bind { ann, name, sub, shadows: Some(s) }) = Pat::decode(*p)
+                && let Some(hid) = find(s)
+            {
+                *p = Pat::Bind { ann, name, sub, shadows: hid }.encode();
+            }
+        }
     }
 
     // -----------------------------------------------------------------------------------------
@@ -2151,9 +2303,12 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 self.done(f);
                 let Some(name) = name else { return };
                 let ann = BindAnn { by_ref: by_ref.then_some(if mutable { Mutbl::Mut } else { Mutbl::Not }), mutable: mutable && !by_ref };
-                let candidate = !by_ref && !mutable && sub.is_none();
                 let name = NameIdx(name.id);
-                let p = self.put_pat(Pat::Bind { ann, name, sub, shadows: None, candidate }, r);
+                let p = self.put_pat(Pat::Bind { ann, name, sub, shadows: None }, r);
+                // Settled at the end, when every block's items are known: a bare name that
+                // is a constant, a unit struct or a unit variant becomes a path pattern.
+                let bare = !by_ref && !mutable && sub.is_none();
+                self.idents.push(Ident { pat: p.0, scope: self.scope().0, bare });
                 let hash = self.local_key(name);
                 self.push_pending(hash, p);
                 self.push(V::Pat, p.0, r);
@@ -2636,7 +2791,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             None => self.synth_name("self", r),
         };
         let ann = BindAnn { by_ref: None, mutable: mutable && !amp };
-        let pat = self.put_pat(Pat::Bind { ann, name, sub: None, shadows: None, candidate: false }, r);
+        let pat = self.put_pat(Pat::Bind { ann, name, sub: None, shadows: None }, r);
         let hash = self.local_key(name);
         self.push_pending(hash, pat);
         let p = Param { pat: Some(pat), ty, self_kind, lifetime, variadic: false, attrs: List { start: 0, len: 0 } };

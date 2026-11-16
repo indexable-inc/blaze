@@ -83,7 +83,8 @@ fn shared_records_hold_no_body_type() {
     let crates = inputs.crates();
     let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: BODY }];
-    let mut front = Front2::new(&names, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
+        let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
     let key = |n: &str| {
         let found = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &[n] }, Alloc::global())
             .unwrap_or_else(|e| panic!("`{n}`: {e}"));
@@ -94,7 +95,7 @@ fn shared_records_hold_no_body_type() {
     let sized = front.index.lang("sized");
     // Each fn of `order` lowered and checked in turn over one store; the outcomes by fn.
     let mut run = |order: &[blaze_id::ItemKey]| -> Vec<(blaze_id::ItemKey, String)> {
-        let (mut store, mut buckets, mut consts) = (Store::new(sized), None, Consts::default());
+        let (mut store, mut buckets, mut consts) = (Store::new(sized, front.frame), None, Consts::default());
         let mut got = Vec::new();
         for &k in order {
             let body = lower_fn(&names, prepared, &mut front.keys, &mut store, k).unwrap_or_else(|e| panic!("lowering {k:x}: {e}"));
@@ -134,11 +135,12 @@ fn a_macro_written_member_checks() {
     let crates = inputs.crates();
     let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: BODY }];
-    let mut front = Front2::new(&names, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
+        let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
     let found = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &["main"] }, Alloc::global())
         .unwrap_or_else(|e| panic!("`main`: {e}"));
     let main = found.whole(1).unwrap_or_else(|| panic!("`main` not named")).key;
-    let mut store = Store::new(front.index.lang("sized"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame);
     let mut buckets = None;
     let prepared = Prepares::new_in(Alloc::global());
     let body = lower_fn(&names, prepared, &mut front.keys, &mut store, main).unwrap_or_else(|e| panic!("lowering `main`: {e}"));
@@ -174,11 +176,12 @@ fn his_main_through_the_checker() {
     let crate_names: Vec<&str> = crates.iter().map(|c| c.name).collect();
 
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
-    let mut front = Front2::new(&names, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
+        let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
     let found = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &["main"] }, Alloc::global())
         .unwrap_or_else(|e| panic!("`main` from his crate root: {e}"));
     let main = found.whole(1).unwrap_or_else(|| panic!("`main` not named")).key;
-    let mut store = Store::new(front.index.lang("sized"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame);
     let mut buckets = None;
 
     let mut out = format!("front2 on his main: names resolved in {resolved:?}\n");
@@ -215,8 +218,9 @@ fn his_main_through_the_checker() {
     // same: its diagnostics, its gaps (or refusal) and its recorded callees.
     let first = outcome(&checked);
     {
-        let mut front_r = Front2::new(&names, &sources).unwrap_or_else(|e| panic!("front2 (reversed): {e}"));
-        let mut store_r = Store::new(front_r.index.lang("sized"));
+        // The command's one frame (the names' lifetime is the frame's).
+        let mut front_r = Front2::new(&names, front.frame, &sources).unwrap_or_else(|e| panic!("front2 (reversed): {e}"));
+        let mut store_r = Store::new(front_r.index.lang("sized"), front_r.frame);
         let mut buckets_r = None;
         let body_r = lower_fn(&names, prepared, &mut front_r.keys, &mut store_r, main).unwrap_or_else(|e| panic!("lowering main again: {e}"));
         let view_r = body_r.lowered.view();
@@ -377,7 +381,8 @@ fn his_main_through_the_checker() {
     // seam; a refusal is filed by its typed name and the walk goes on.
     {
         let mut left_out = Vec::new_in(std::alloc::Global);
-        match blaze_ladder::front2::program::Front2Program::survey(&names, &sources, &mut left_out) {
+        let survey_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the survey's frame");
+        match blaze_ladder::front2::program::Front2Program::survey(&names, &survey_frame, &sources, &mut left_out) {
             Err(e) => out.push_str(&format!("BUILDS: no survey: {e}\n")),
             Ok(mut program) => {
                 let mut refused = Vec::new_in(std::alloc::Global);

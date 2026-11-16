@@ -60,7 +60,7 @@ fn lower_and_check_with(
     types: &mut dyn Types,
 ) -> (blaze_typeck::Checked<'static>, std::vec::Vec<blaze_typeck::Range>, ExprId) {
     let alloc = Alloc::global();
-    let lowered = match lower_body(text, Edition::E2024, &mut NoCfg, alloc) {
+    let lowered = match lower_body(text, Edition::E2024, &mut NoCfg, &mut crate::NoModule, alloc) {
         Ok(l) => l,
         Err(need) => panic!("{text}: needs {:?}", need.atoms),
     };
@@ -99,7 +99,7 @@ fn typed_lines(fx: &blaze_typeck::fixture::Fx, text: &str, c: &blaze_typeck::Che
 #[test]
 fn rung_7c_main_from_text_checks_clean() {
     let alloc = Alloc::global();
-    let lowered = match lower_body(MAIN_7C, Edition::E2024, &mut NoCfg, alloc) {
+    let lowered = match lower_body(MAIN_7C, Edition::E2024, &mut NoCfg, &mut crate::NoModule, alloc) {
         Ok(l) => l,
         Err(need) => panic!("rung 7c main: needs {:?}", need.atoms),
     };
@@ -1086,7 +1086,7 @@ fn literal_patterns_and_references() {
 fn global_path_starts_at_the_root() {
     let alloc = Alloc::global();
     let text = "fn f() -> u32 {\n    ::give()\n}";
-    let lowered = lower_body(text, Edition::E2024, &mut NoCfg, alloc).expect("lowers");
+    let lowered = lower_body(text, Edition::E2024, &mut NoCfg, &mut crate::NoModule, alloc).expect("lowers");
     let view = lowered.view();
     let mut tys = PortableTys::new_in(alloc);
     let body = to_typeck(&view, ItemKey(1), &mut tys, &mut NoTypes, alloc).expect("converts");

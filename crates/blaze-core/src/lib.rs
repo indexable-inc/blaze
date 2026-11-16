@@ -131,6 +131,7 @@ pub use crate::journal::{
 pub use crate::descriptors::Opens;
 pub use crate::spans::{DIRECT_ALIGN, Memory, Registered, Span, SpanRegion, Spans};
 pub use crate::tags::Tags;
+pub use crate::lock::{SharedByHash, SharedMap, SharedSet};
 pub use crate::boot::{Boot, NoBoot};
 
 /// Makes the sandbox of a process: given to a driver by whoever owns the platform's sandbox

@@ -107,7 +107,7 @@ fn queue_by_name(r: &mut Records<'_, '_>, body: &Body<'_>, scope: &BodyScope<'_>
                     let (start, len) = (bp.segments.start as usize, bp.segments.len as usize);
                     let Some(segs) = view.segments.get(start..start + len) else { continue };
                     names.extend(segs.iter().map(|s| s.name));
-                    match world.path(&names) {
+                    match world.path(bp.scope, &names) {
                         Ok(Some(p)) if p.consumed as usize == names.len() => Some(p.def),
                         // `Type::f`: the fn is found on the type's impls, by its type.
                         Ok(Some(_)) => {

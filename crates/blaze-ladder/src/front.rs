@@ -1412,7 +1412,7 @@ fn shape_of(t: PTys<'_>, p: PTy) -> Option<Shape> {
         PNode::FnDef(k, _) => Shape::FnDef(k),
         PNode::FnPtr(l, _) => Shape::FnPtr(l.len.saturating_sub(1)),
         PNode::Opaque(k, _) => Shape::Opaque(k),
-        PNode::Closure(..) | PNode::Future(..) => Shape::Closure,
+        PNode::Closure { .. } | PNode::Future(..) => Shape::Closure,
         PNode::Param(_) | PNode::Alias { .. } | PNode::Infer | PNode::Error => return None,
         PNode::ConstValue { .. } | PNode::ConstParam(_) => return None,
         PNode::Dynamic(l) => Shape::Dynamic(blaze_typeck::object_principal(t, l)),
@@ -2467,9 +2467,12 @@ impl<'f> Front<'f> {
             }
             let (at, text, key) = (row.at, row.text, row.key);
             let whole = Range::new(0, text.len() as u32);
+            // OWED: this front end's module answers (its `resolve_path` lives on the check's
+            // world); until then an identifier pattern here binds (front2 answers: body.rs
+            // `ModuleValues`).
             let lowered = match row.condition {
-                Some(r) => blaze_lower::lower_anon_const(text, r, EDITION, &mut NoCfg, Alloc::global()),
-                None => blaze_lower::lower_body(text, EDITION, &mut NoCfg, Alloc::global()),
+                Some(r) => blaze_lower::lower_anon_const(text, r, EDITION, &mut NoCfg, &mut blaze_lower::NoModule, Alloc::global()),
+                None => blaze_lower::lower_body(text, EDITION, &mut NoCfg, &mut blaze_lower::NoModule, Alloc::global()),
             }
             .map_err(|need| Why::Unsupported("`cfg`", need.atoms.first().copied().unwrap_or(whole)).at(at))?;
             let view = lowered.view();
@@ -2881,7 +2884,10 @@ impl World for FrontWorld<'_, '_> {
     fn opaque_hidden(&self, _: Seal, _: ItemKey) -> Fetch<Option<Hidden<'_>>> {
         Ok(None)
     }
-
+    /// The old front end keeps no checked records: a closure of another body is not known.
+    fn closure(&self, _: Seal, _: ItemKey, _: u32) -> Fetch<Option<blaze_typeck::ClosureFacts<'_>>> {
+        Ok(None)
+    }
     fn attrs(&self, _: Seal, _: ItemKey) -> Fetch<TypeAttrs> {
         Ok(TypeAttrs(0))
     }

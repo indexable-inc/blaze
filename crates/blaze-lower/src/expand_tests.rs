@@ -95,7 +95,7 @@ fn expanding_defs<'t>(defs: &[Def<'_>], text: &'t str) -> Lowered<'static, 't> {
     }
     let rules: &'static [(&'static str, Prepared<'static>)] = Box::leak(rules.into_boxed_slice());
     let mut expander = ByName::new(rules, at(), Host, Alloc::global());
-    let l = match lower_body_expanding(text, Edition::E2024, &mut Unix, &mut expander, Alloc::global()) {
+    let l = match lower_body_expanding(text, Edition::E2024, &mut Unix, &mut crate::NoModule, &mut expander, Alloc::global()) {
         Ok(l) => l,
         Err(need) => panic!("{text}: needs {:?}", need.atoms),
     };
@@ -238,7 +238,7 @@ fn lower_items(defs: &[(&'static str, &str)], text: &str) -> (crate::FileStats, 
     let rules: &'static [(&'static str, Prepared<'static>)] = Box::leak(rules.into_boxed_slice());
     let mut expander = ByName::new(rules, at(), Host, Alloc::global());
     let mut records = Records::default();
-    let stats = crate::lower_file(text, Edition::E2024, &mut Unix, &mut expander, &mut records, Alloc::global());
+    let stats = crate::lower_file(text, Edition::E2024, &mut Unix, &mut crate::NoModule, &mut expander, &mut records, Alloc::global());
     (stats, records)
 }
 
@@ -510,7 +510,7 @@ enum Reach {
     let rules: &'static [(&'static str, Prepared<'static>)] = &[];
     let mut expander = ByName::new(rules, at(), Host, Alloc::global());
     let mut records = Records::default();
-    let stats = crate::lower_file(text, Edition::E2024, &mut Unix, &mut expander, &mut records, Alloc::global());
+    let stats = crate::lower_file(text, Edition::E2024, &mut Unix, &mut crate::NoModule, &mut expander, &mut records, Alloc::global());
     assert_eq!((stats.macro_calls_expanded, stats.macro_calls_unsupported, stats.macro_calls_failed), (2, 0, 0));
     let unclean: StdVec<_> = records.0.iter().filter(|(_, _, d)| d.starts_with("UNCLEAN")).collect();
     assert!(unclean.is_empty(), "{unclean:#?}");
@@ -597,7 +597,7 @@ pub fn main(cx: &Cx, io: Io) -> Result<(), Error> {
     let rules: &'static [(&'static str, Prepared<'static>)] = Box::leak(rules.into_boxed_slice());
     let mut expander = ByName::new(rules, at(), Host, Alloc::global());
     let mut records = Records::default();
-    let stats = crate::lower_file(text, Edition::E2024, &mut Unix, &mut expander, &mut records, Alloc::global());
+    let stats = crate::lower_file(text, Edition::E2024, &mut Unix, &mut crate::NoModule, &mut expander, &mut records, Alloc::global());
     let unclean: StdVec<_> = records.0.iter().filter(|(_, _, d)| d.starts_with("UNCLEAN")).collect();
     assert!(unclean.is_empty(), "{unclean:#?}");
     assert_eq!((stats.macro_calls_expanded, stats.macro_calls_failed), (1, 0), "{:#?}", records.0);
@@ -691,7 +691,7 @@ fn derived(text: &str) -> (crate::FileStats, Records) {
     let rules: &'static [(&'static str, Prepared<'static>)] = &[];
     let mut expander = ByName::new(rules, at(), Host, Alloc::global());
     let mut records = Records::default();
-    let stats = crate::lower_file(text, Edition::E2024, &mut Unix, &mut expander, &mut records, Alloc::global());
+    let stats = crate::lower_file(text, Edition::E2024, &mut Unix, &mut crate::NoModule, &mut expander, &mut records, Alloc::global());
     (stats, records)
 }
 
@@ -964,7 +964,7 @@ fn g() {}
     let lists = crate::by_name::Lists { rules: &[], builtin_at: at(), then: Some(&Procs) };
     let mut expander = ByName::with_names(&lists, ProcHost, Alloc::global());
     let mut records = Records::default();
-    let stats = crate::lower_file(text, Edition::E2024, &mut Unix, &mut expander, &mut records, Alloc::global());
+    let stats = crate::lower_file(text, Edition::E2024, &mut Unix, &mut crate::NoModule, &mut expander, &mut records, Alloc::global());
     assert_eq!((stats.macro_calls_expanded, stats.macro_calls_failed), (2, 0), "{stats:#?}");
     assert_eq!(stats.body_calls_expanded, 1, "{stats:#?}");
     let unclean: StdVec<_> = records.0.iter().filter(|(_, _, d)| d.starts_with("UNCLEAN")).collect();
@@ -1052,7 +1052,7 @@ fn a_braced_cfg_select_in_a_block_is_answered_by_the_body_s_cfg_set() {
 }";
     let rules: &'static [(&'static str, Prepared<'static>)] = &[];
     let mut expander = ByName::new(rules, at(), Host, Alloc::global());
-    let Ok(l) = lower_body_expanding(text, Edition::E2024, &mut Unix, &mut expander, Alloc::global()) else { panic!("needs a cfg") };
+    let Ok(l) = lower_body_expanding(text, Edition::E2024, &mut Unix, &mut crate::NoModule, &mut expander, Alloc::global()) else { panic!("needs a cfg") };
     let f = expander.findings();
     assert!(f.is_empty(), "{f:#?}\n{}", dump_of(&l));
     assert_eq!(l.view().unhandled().count(), 0, "{}", dump_of(&l));
@@ -1073,7 +1073,7 @@ fn an_item_position_cfg_select_is_answered_by_the_file_s_cfg_set() {
     let rules: &'static [(&'static str, Prepared<'static>)] = &[];
     let mut expander = ByName::new(rules, at(), Host, Alloc::global());
     let mut records = Records::default();
-    let stats = crate::lower_file(text, Edition::E2024, &mut Unix, &mut expander, &mut records, Alloc::global());
+    let stats = crate::lower_file(text, Edition::E2024, &mut Unix, &mut crate::NoModule, &mut expander, &mut records, Alloc::global());
     assert_eq!((stats.macro_calls_expanded, stats.macro_calls_unsupported, stats.macro_calls_failed), (1, 0, 0));
     let made: StdVec<&String> = records.0.iter().filter(|(_, w, _)| *w == crate::What::Signature).map(|(t, _, _)| t).collect();
     assert!(made.iter().any(|t| t.contains("on_unix")) && !made.iter().any(|t| t.contains("elsewhere")), "{made:#?}");
@@ -1137,7 +1137,7 @@ fn a_failed_body_call_is_a_finding_naming_its_path_and_error() {
     let rules: &'static [(&'static str, Prepared<'static>)] = &[];
     let mut expander = ByName::new(rules, at(), Host, Alloc::global());
     let text = "fn f() { compile_error!(\"no way\") }";
-    let Ok(_) = lower_body_expanding(text, Edition::E2024, &mut Unix, &mut expander, Alloc::global()) else { panic!("needs a cfg") };
+    let Ok(_) = lower_body_expanding(text, Edition::E2024, &mut Unix, &mut crate::NoModule, &mut expander, Alloc::global()) else { panic!("needs a cfg") };
     let f = expander.findings();
     assert_eq!(f.len(), 1, "{f:#?}");
     assert_eq!(f[0].path.as_str(), "compile_error");

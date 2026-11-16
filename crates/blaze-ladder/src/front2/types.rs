@@ -185,6 +185,8 @@ pub trait Heads {
     /// A type alias's parameter defaults, made with its head (`None` where none is written;
     /// empty before its head is made).
     fn alias_defaults(&self, alias: LibKey) -> &[Option<PTy>];
+    /// Why a type alias's head was refused (`Some(None)` from [`Heads::alias`]).
+    fn alias_gap(&self, alias: LibKey) -> Option<&Why>;
     /// A trait alias's head (`trait A<T> = B<T> + C where ..;`): what a bound naming it stands
     /// for. `None` when not lowered yet.
     fn trait_alias(&self, alias: LibKey) -> Option<&TraitAliasHead>;
@@ -794,7 +796,11 @@ impl<'b, 'n, H: Heads> Builder<'b, 'n, H> {
             // `core::result::Result<Self, Error>` for `type Result<T, E = Error>`).
             Kind::TypeAlias => {
                 let made = self.heads.alias(found.key).ok_or(Why::Need(found.key))?;
-                let (g, t) = made.ok_or(Why::Unsupported("a type alias whose aliased type is refused (its why: the store's `alias_gaps`)", r))?;
+                // The alias's own refusal is named, so a census line shows the real cause.
+                let Some((g, t)) = made else {
+                    let why = self.heads.alias_gap(found.key).map_or_else(|| format!("(no why kept)"), |w| format!("{w:?}"));
+                    return Err(program(format!("the type alias `{shown}` is refused: {why}"), r));
+                };
                 let args = with_defaults(tys, kids, g, self.heads.alias_defaults(found.key), shown, r)?;
                 subst(tys, t, &args)
             }
@@ -1048,7 +1054,10 @@ pub fn subst(tys: &mut PortableTys<'_>, t: PTy, args: &[PTy]) -> Result<PTy, Why
                     PNode::Ptr(m, _) => intern(tys, PNode::Ptr(m, new[0]))?,
                     PNode::Slice(_) => intern(tys, PNode::Slice(new[0]))?,
                     PNode::Array(..) => intern(tys, PNode::Array(new[0], new[1]))?,
-                    PNode::Closure(e, _) => intern(tys, PNode::Closure(e, new[0]))?,
+                    PNode::Closure { owner, ordinal, .. } => {
+                        let l = intern_list(tys, &new)?;
+                        intern(tys, PNode::Closure { owner, ordinal, args: l })?
+                    }
                     PNode::Future(e, _, _) => intern(tys, PNode::Future(e, new[0], new[1]))?,
                     PNode::Tuple(_) => {
                         let l = intern_list(tys, &new)?;
@@ -1101,7 +1110,8 @@ pub(super) fn fn_ptr_abi(written: &str, r: Range) -> Result<tc::Abi, Why> {
 /// The types `t` is made of, in order; `None` past the table.
 pub fn children_of(t: blaze_typeck::PTys<'_>, ty: PTy, out: &mut Vec<PTy, Global>) -> Option<()> {
     match *t.nodes.get(ty.0 as usize)? {
-        PNode::Ref(_, i) | PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Closure(_, i) => out.push(i),
+        PNode::Ref(_, i) | PNode::Ptr(_, i) | PNode::Slice(i) => out.push(i),
+        PNode::Closure { args, .. } => out.extend_from_slice(t.list(args).ok()?),
         PNode::Future(_, o, i) | PNode::Array(o, i) => {
             out.push(o);
             out.push(i);

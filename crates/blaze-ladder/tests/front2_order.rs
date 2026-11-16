@@ -40,9 +40,10 @@ fn check_runs(text: &str, runs: &[&[&str]]) -> Vec<Vec<(String, String)>> {
     let sources = [SourceFile { path: "src/main.rs", text }];
     let mut out = Vec::new();
     for fns in runs {
-        let mut front = Front2::new(&names, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+        let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
+            let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
         let prepared = Prepares::new_in(Alloc::global());
-        let mut store = Store::new(front.index.lang("sized"));
+        let mut store = Store::new(front.index.lang("sized"), front.frame);
         let (mut buckets, mut consts) = (None, Consts::default());
         let mut got = Vec::new();
         for &n in *fns {

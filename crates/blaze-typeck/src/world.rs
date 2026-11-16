@@ -93,8 +93,7 @@ pub enum Question {
     ConstHolds(ItemKey, u64),
     /// The const generic parameters of an item's generics ([`ConstParams`]).
     ConstParams(ItemKey),
-    /// The facts of closure `ordinal` of `owner`'s body ([`ClosureFacts`]): a body record, the
-    /// owner's `Checked::closures` row (typeck.md, "A closure's identity").
+    /// The facts of closure `ordinal` of `owner`'s body ([`ClosureFacts`]): its owner's check.
     Closure(ItemKey, u32),
 }
 
@@ -113,9 +112,7 @@ impl Question {
     /// The kind of record the question reads (typeck.md, "Item records and body records").
     pub const fn record_kind(self) -> RecordKind {
         match self {
-            Question::Opaque(_) | Question::Const(_) | Question::ConstHolds(..) | Question::Closure(..) => {
-                RecordKind::Body
-            }
+            Question::Opaque(_) | Question::Const(_) | Question::ConstHolds(..) | Question::Closure(..) => RecordKind::Body,
             Question::FnSig(_)
             | Question::Predicates(_)
             | Question::Adt(_)
@@ -476,38 +473,20 @@ pub enum DiscrRepr {
     Uint(UintTy),
 }
 
-/// A closure's facts, from its owner's check (`Checked::closures`, the row at its ordinal): its
-/// kind, the strongest `Fn*` it implements, and its signature, a `FnPtr` in the owner's generics
-/// (`Param(i)` the owner's parameter `i`). Its captures stay in the owner's `Checked::captures`.
-#[derive(Clone, Copy, Debug)]
-pub struct ClosureFacts<'w> {
-    pub kind: crate::ty::ClosureKind,
-    pub sig: PTy,
-    pub types: PTys<'w>,
-}
-
-impl Tabled for ClosureFacts<'_> {
-    fn parts(&self, roots: &mut Vec<Root, Alloc<'_>>) -> Option<PTys<'_>> {
-        roots.push(Root::Ty(self.sig));
-        Some(self.types)
-    }
-    fn untabled(&self) -> Self {
-        ClosureFacts { types: PTys::EMPTY, ..*self }
-    }
-}
-
-impl ContentHash for ClosureFacts<'_> {
-    fn hash_into(&self, h: &mut StableHasher) {
-        h.tag(self.kind as u8);
-        h.u32(self.sig.0);
-        self.types.hash_into(h);
-    }
-}
-
 /// An opaque type's hidden type.
 #[derive(Clone, Copy, Debug)]
 pub struct Hidden<'w> {
     pub ty: PTy,
+    pub types: PTys<'w>,
+}
+
+/// A closure's facts, from its owner's check (`Checked::closures[ordinal]`): its kind and its
+/// signature (a `FnPtr` of `types`, in the owner's parameters: `Param(i)` is the closure
+/// type's `args[i]`). Its captures stay in the owner's `Checked::captures`.
+#[derive(Clone, Copy, Debug)]
+pub struct ClosureFacts<'w> {
+    pub kind: crate::ty::ClosureKind,
+    pub sig: PTy,
     pub types: PTys<'w>,
 }
 
@@ -548,8 +527,8 @@ pub trait World {
     fn lang_path(&self, seal: Seal, item: LangItem) -> Fetch<Option<Def>>;
     fn const_value(&self, seal: Seal, item: ItemKey) -> Fetch<Option<u64>>;
     fn opaque_hidden(&self, seal: Seal, item: ItemKey) -> Fetch<Option<Hidden<'_>>>;
-    /// Closure `ordinal` of `owner`'s body (`None`: the checked owner has no such closure;
-    /// `Missing` until the owner is checked).
+    /// The facts of closure `ordinal` of `owner`'s body (`Question::Closure`): `Missing` while
+    /// the owner's body is not checked; `None` when its record has no such closure.
     fn closure(&self, seal: Seal, owner: ItemKey, ordinal: u32) -> Fetch<Option<ClosureFacts<'_>>>;
     fn attrs(&self, seal: Seal, item: ItemKey) -> Fetch<TypeAttrs>;
     /// The definition of trait `trait_` (`None`: not a trait).
@@ -577,7 +556,7 @@ pub struct ReadList<'a> {
     pub rows: Soa<(Question, u64), Alloc<'a>>,
 }
 
-columns_eq!(Needs { questions });
+columns_eq!(Needs { questions, missing, first });
 
 impl<'a> PartialEq for ReadList<'a> {
     fn eq(&self, other: &ReadList<'a>) -> bool {
@@ -616,20 +595,97 @@ impl<'a> ReadList<'a> {
 /// The questions a check needed: what the next check of the body fetches up front.
 #[derive(Clone)]
 pub struct Needs<'a> {
+    /// Every question the run asked, answered or not, sorted, without duplicates: the hints.
     pub questions: Vec<Question, Alloc<'a>>,
+    /// The holes: each question the world had no answer to, sorted, without duplicates.
+    pub missing: Vec<Question, Alloc<'a>>,
+    /// The first hole the run met: the one need that is not speculative (`Hole`).
+    pub first: Option<Question>,
 }
 
 impl<'a> Needs<'a> {
     /// No needs.
     pub fn new_in(alloc: Alloc<'a>) -> Needs<'a> {
-        Needs { questions: Vec::new_in(alloc) }
+        Needs { questions: Vec::new_in(alloc), missing: Vec::new_in(alloc), first: None }
     }
+}
+
+/// A HOLE: a record that is not here YET, this round (typeck.md, "Speed on real code").
+///
+/// The world answered `Missing` to `question`. The run records it, reads the answer's stand-in
+/// ([`Holed::hole`]) and goes on, so one round finds every record the body needs, not one.
+/// A run that met any hole ends `Outcome::Need` with all of them and makes NO result (lib.rs
+/// `run`): nothing computed past a hole (a diagnostic, a type, an error) ever leaves the run,
+/// so the stand-in can never change an answer. Questions asked after the first hole are
+/// speculative: the real run might not ask them.
+///
+/// Not a GAP: a gap is a question the front end cannot answer at all (the world's gap list,
+/// a `CheckError`): it is reported and the body is not checked. A hole only waits for a fill.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Hole {
+    pub question: Question,
+}
+
+/// An answer type's stand-in for a hole: the value a rule reads in its place.
+pub trait Holed {
+    fn hole() -> Self;
+}
+
+impl<T> Holed for Option<T> {
+    fn hole() -> Self {
+        None
+    }
+}
+
+impl<T> Holed for &[T] {
+    fn hole() -> Self {
+        &[]
+    }
+}
+
+impl Holed for Predicates<'_> {
+    fn hole() -> Self {
+        Predicates { clauses: &[], types: PTys::EMPTY }
+    }
+}
+
+impl Holed for ConstParams<'_> {
+    fn hole() -> Self {
+        ConstParams { params: &[], types: PTys::EMPTY }
+    }
+}
+
+impl Holed for TypeAttrs {
+    fn hole() -> Self {
+        TypeAttrs(0)
+    }
+}
+
+impl Holed for ConstHolds {
+    fn hole() -> Self {
+        ConstHolds::True
+    }
+}
+
+/// A planted bug of the hole tests (`tests::a_hole_*`); `None` outside them.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HolePlant {
+    None,
+    /// A run that met a hole still makes a result from the stand-ins.
+    AnswerThroughHoles,
+    /// The hints (an earlier round's questions) enter the read list.
+    KeepEarlierReads,
 }
 
 /// The recorder: owns the world's borrow and the read list. The only caller of `World`.
 pub struct Reads<'w, 'a, W: World> {
     world: &'w W,
     entries: Vec<(Question, u64), Alloc<'a>>,
+    /// The holes this run met, in the order met (`Hole`).
+    holes: Vec<Hole, Alloc<'a>>,
+    #[cfg(test)]
+    pub(crate) hole_plant: HolePlant,
     /// The ask log, when the run measures re-entry (asks.rs); `None` otherwise.
     log: Option<AskRecorder<'w, 'a>>,
     /// The tally, when the run counts (asks.rs `Tally`); `None` otherwise.
@@ -845,6 +901,24 @@ impl Tabled for ImplHeader<'_> {
     }
 }
 
+impl Tabled for ClosureFacts<'_> {
+    fn parts(&self, roots: &mut Vec<Root, Alloc<'_>>) -> Option<PTys<'_>> {
+        roots.push(Root::Ty(self.sig));
+        Some(self.types)
+    }
+    fn untabled(&self) -> Self {
+        ClosureFacts { types: PTys::EMPTY, ..*self }
+    }
+}
+
+impl ContentHash for ClosureFacts<'_> {
+    fn hash_into(&self, h: &mut StableHasher) {
+        h.u32(self.kind as u32);
+        h.u32(self.sig.0);
+        self.types.hash_into(h);
+    }
+}
+
 impl Tabled for Hidden<'_> {
     fn parts(&self, roots: &mut Vec<Root, Alloc<'_>>) -> Option<PTys<'_>> {
         roots.push(Root::Ty(self.ty));
@@ -871,12 +945,49 @@ pub fn ground_args_digest(args: &[PTy], types: PTys<'_>) -> u64 {
 impl<'w, 'a, W: World> Reads<'w, 'a, W> {
     /// The recorder for one run.
     pub(crate) fn new_in(world: &'w W, alloc: Alloc<'a>) -> Reads<'w, 'a, W> {
-        Reads { world, entries: Vec::new_in(alloc), log: None, tally: None, hashes: Hashes::new_in(alloc) }
+        Self::made(world, None, None, alloc)
+    }
+
+    /// The recorder with its log and tally, each optional: the one place a `Reads` is built.
+    fn made(world: &'w W, log: Option<AskRecorder<'w, 'a>>, tally: Option<Tallying<'w>>, alloc: Alloc<'a>) -> Reads<'w, 'a, W> {
+        Reads {
+            world,
+            entries: Vec::new_in(alloc),
+            holes: Vec::new_in(alloc),
+            #[cfg(test)]
+            hole_plant: HolePlant::None,
+            log,
+            tally,
+            hashes: Hashes::new_in(alloc),
+        }
     }
 
     /// The recorder for one run that also keeps `tally`, reading `clock`.
     pub(crate) fn counted_in(world: &'w W, tally: &'w mut Tally, clock: &'w dyn Clock, alloc: Alloc<'a>) -> Reads<'w, 'a, W> {
-        Reads { world, entries: Vec::new_in(alloc), log: None, tally: Some(Tallying { tally, clock }), hashes: Hashes::new_in(alloc) }
+        Self::made(world, None, Some(Tallying { tally, clock }), alloc)
+    }
+
+    /// Counts one solver call that began at `at` (the tally's clock), when the run counts.
+    pub(crate) fn count_solve(&mut self, at: u64) {
+        let end = self.stamp();
+        if let Some(t) = self.tally() {
+            t.solve.calls += 1;
+            t.solve.ns += end.saturating_sub(at);
+        }
+    }
+
+    /// Whether this run met a hole: then it makes no result (`Hole`).
+    pub(crate) fn holed(&self) -> bool {
+        #[cfg(test)]
+        if self.hole_plant == HolePlant::AnswerThroughHoles {
+            return false;
+        }
+        !self.holes.is_empty()
+    }
+
+    /// How many holes this run met so far: a fill compares it before and after.
+    pub(crate) fn hole_count(&self) -> usize {
+        self.holes.len()
     }
 
     /// The tally's clock now, when the run counts (0 otherwise).
@@ -893,7 +1004,7 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
     pub(crate) fn logged_in(world: &'w W, clock: &'w dyn Clock, alloc: Alloc<'a>) -> Reads<'w, 'a, W> {
         let start_ns = clock.now_ns();
         let log = AskRecorder { asks: Vec::new_in(alloc), clock, start_ns, cursor: Cursor::default() };
-        Reads { world, entries: Vec::new_in(alloc), log: Some(log), tally: None, hashes: Hashes::new_in(alloc) }
+        Self::made(world, Some(log), None, alloc)
     }
 
     /// Whether the run writes the ask log (the machine then reports where it is).
@@ -929,7 +1040,7 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
 
     /// The one seam every read of another item's record goes through: asks the world, logs
     /// the ask when measuring, and enters the answer's hash into the read list.
-    fn record<T: ContentHash>(&mut self, q: Question, got: Fetch<T>, asked_at: u64) -> Result<T, Stop> {
+    fn record<T: ContentHash + Holed>(&mut self, q: Question, got: Fetch<T>, asked_at: u64) -> Result<T, Stop> {
         self.record_with(q, got, asked_at, |_, v| Ok(hash_of("answer", v)))
     }
 
@@ -939,11 +1050,11 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
     }
 
     /// `record` for an answer with a table: its digest covers only the terms it reaches.
-    fn record_tabled<T: Tabled>(&mut self, q: Question, got: Fetch<T>, asked_at: u64) -> Result<T, Stop> {
+    fn record_tabled<T: Tabled + Holed>(&mut self, q: Question, got: Fetch<T>, asked_at: u64) -> Result<T, Stop> {
         self.record_with(q, got, asked_at, |h, v| h.rooted(v))
     }
 
-    fn record_with<T>(
+    fn record_with<T: Holed>(
         &mut self,
         q: Question,
         got: Fetch<T>,
@@ -970,8 +1081,10 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
                 Ok(v)
             }
             Err(Missing) => {
+                // A hole: record the need and read the stand-in; the run goes on (`Hole`).
                 self.count(q, true, asked_at, answered_at);
-                Err(Stop::Need(q))
+                self.holes.push(Hole { question: q });
+                Ok(T::hole())
             }
         }
     }
@@ -1053,6 +1166,10 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
 
     /// Hands the last run's questions to the world.
     pub(crate) fn prefetch(&mut self, questions: &[Question]) {
+        #[cfg(test)]
+        if self.hole_plant == HolePlant::KeepEarlierReads {
+            self.entries.extend(questions.iter().map(|&q| (q, 0)));
+        }
         self.world.prefetch(Self::seal(), questions);
     }
 
@@ -1087,7 +1204,12 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
                 let got = self.world.impl_header(Self::seal(), item);
         let h = self.record_tabled(Question::ImplHeader(item), got, asked_at)?;
         if let Some(ImplHeader { trait_: Some(trait_), trait_args, .. }) = h {
+            let holes = self.holes.len();
             let Some(def) = self.trait_def(trait_)? else {
+                if self.holes.len() > holes {
+                    // The trait's record is a hole: no arity to compare yet (`Hole`).
+                    return Ok(h);
+                }
                 return Err(CheckError::Malformed(Malformed::NoRecord(Question::TraitDef(trait_))).into());
             };
             let expected = def.generics.saturating_sub(1);
@@ -1156,7 +1278,6 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
         let got = self.world.closure(Self::seal(), owner, ordinal);
         self.record_tabled(Question::Closure(owner, ordinal), got, asked_at)
     }
-
     pub fn attrs(&mut self, item: ItemKey) -> Result<TypeAttrs, Stop> {
         let asked_at = self.stamp();
                 let got = self.world.attrs(Self::seal(), item);
@@ -1206,20 +1327,26 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
                 needs.push(q);
             }
         }
-        (ReadList { rows }, Needs { questions: needs })
+        (ReadList { rows }, Needs { questions: needs, missing: Vec::new_in(alloc), first: None })
     }
 
-    /// The needs of a run stopped by the missing answer to `missing`: every question asked
-    /// before it and `missing` itself, sorted, so the next run fetches them in one batch.
-    pub(crate) fn finish_need(self, missing: Question, alloc: Alloc<'a>) -> Needs<'a> {
-        let mut questions = Vec::with_capacity_in(self.entries.len() + 1, alloc);
-        for &(q, _) in self.entries.iter() {
-            questions.push(q);
-        }
-        questions.push(missing);
+    /// The needs of a run that met a hole: every hole, sorted and without duplicates (rule
+    /// 25), the first one met, and every question asked as the next run's hints. `stopped` is a
+    /// need that ended the walk instead of becoming a hole (a `Stop::Need` made by a rule or
+    /// the solver, not by this seam): a hole like the others, the last one met.
+    pub(crate) fn finish_need(self, stopped: Option<Question>, alloc: Alloc<'a>) -> Needs<'a> {
+        let first = self.holes.first().map(|h| h.question).or(stopped);
+        let mut missing = Vec::with_capacity_in(self.holes.len() + 1, alloc);
+        missing.extend(self.holes.iter().map(|h| h.question));
+        missing.extend(stopped);
+        missing.sort_unstable();
+        missing.dedup();
+        let mut questions = Vec::with_capacity_in(self.entries.len() + missing.len(), alloc);
+        questions.extend(self.entries.iter().map(|&(q, _)| q));
+        questions.extend_from_slice(&missing);
         questions.sort_unstable();
         questions.dedup();
-        Needs { questions }
+        Needs { questions, missing, first }
     }
 }
 

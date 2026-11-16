@@ -53,7 +53,7 @@ use blaze_own::Alloc;
 
 pub use infer::{InferCtx, InferSnapshot};
 pub use instance::{ResolveError, Resolved, resolve_instance, select_impl};
-pub use asks::{Ask, AskLog, Clock, Order, QUESTION_KINDS, R_THRESHOLD, Restarts, Tally, entries_histogram, question_kind, restarts};
+pub use asks::{Ask, AskLog, Clock, Order, QUESTION_KINDS, R_THRESHOLD, Restarts, Solve, Tally, entries_histogram, question_kind, restarts};
 pub use body::{
     Anchor, Arm, BinOp, BindAnn, BodyPath, BodyView, Capture, CoroutineKind, Expr, FieldInit, FieldPat, FmtTrait, FmtUse,
     IntSuffix, Lit, Pat, Segment, Stmt, UnOp,
@@ -166,17 +166,32 @@ fn run<'a, 'w, W: World, C: TypeCtx>(
         reads.prefetch(&hints.questions);
     }
     let mut m = Machine::new_in(*body, reads, ty, plant, alloc)?;
-    match walk(&mut m) {
-        Ok(()) => {
-            let log = m.reads.take_log();
-            Ok((Outcome::Done(m.writeback()?), log))
-        }
-        Err(Stop::Need(q)) => {
-            let log = m.reads.take_log();
-            Ok((Outcome::Need(m.reads.finish_need(q, alloc)), log))
-        }
+    let walked = walk(&mut m);
+    let log = m.reads.take_log();
+    // A run that met a hole makes no result: not its types, not its diagnostics, not an
+    // error met past the hole (world.rs `Hole`). Only a run that met none answers.
+    match walked {
+        Ok(()) if !m.reads.holed() => Ok((Outcome::Done(m.writeback()?), log)),
+        Ok(()) | Err(Stop::Error(_)) if m.reads.holed() => Ok((Outcome::Need(m.reads.finish_need(None, alloc)), log)),
+        Err(Stop::Need(q)) => Ok((Outcome::Need(m.reads.finish_need(Some(q), alloc)), log)),
+        Ok(()) => Err(CheckError::Malformed(Malformed::HoleInAnswer)),
         Err(Stop::Error(e)) => Err(e),
     }
+}
+
+/// `check` with a planted bug of the hole tests (world.rs `HolePlant`).
+#[cfg(test)]
+pub(crate) fn check_hole_plant<'a, W: World, C: TypeCtx>(
+    body: &BodyView<'_>,
+    world: &W,
+    ty: &mut C,
+    hints: &Needs<'_>,
+    plant: world::HolePlant,
+    alloc: Alloc<'a>,
+) -> Result<Outcome<'a>, CheckError> {
+    let mut reads = Reads::new_in(world, alloc);
+    reads.hole_plant = plant;
+    run(body, reads, ty, hints, Plant::None, alloc).map(|(o, _)| o)
 }
 
 /// The walk and the end sequence (typeck.md, "The walk and its queues").

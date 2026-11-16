@@ -66,16 +66,6 @@ mod sync {
     #[cfg(blaze_check)]
     pub(super) use blaze_check::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 
-    #[cfg(not(blaze_check))]
-    #[expect(
-        clippy::disallowed_types,
-        reason = "below blaze-core: blaze-hash is a dependency of blaze-core, whose named locks it cannot take; a shard's writers' lock, which no reader takes"
-    )]
-    pub(super) type Lock<T> = std::sync::Mutex<T>;
-
-    #[cfg(blaze_check)]
-    pub(super) type Lock<T> = blaze_check::sync::Mutex<T>;
-
     /// The bytes at `at` are written: a model checks every earlier access happens before.
     #[inline(always)]
     pub(super) fn wrote<T>(at: *const T) {
@@ -101,7 +91,29 @@ mod sync {
     }
 }
 
-use sync::{AtomicPtr, AtomicUsize, Lock, Ordering};
+use sync::{AtomicPtr, AtomicUsize, Ordering};
+
+/// The blocking lock a shard's writers take, given by the crate that instantiates the map
+/// (decision D64): blaze-core's named lock (`blaze_core::SharedMap`), whose wait is a deadline
+/// wait with a span, which this crate below blaze-core cannot name; blaze-check's lock under the
+/// model. A family rather than one lock type, so the map's private writer state is never named
+/// in a public bound. No reader takes it: only writers of one shard.
+///
+/// # Safety
+///
+/// The map's soundness rests on it: while a [`ShardLock::Guard`] lives, no other guard of the
+/// same lock does (mutual exclusion), and the value it lends is the one [`ShardLock::new`] was
+/// given, with every write under an earlier guard happening before the next guard is handed out.
+pub unsafe trait ShardLock {
+    /// A lock holding a `T`.
+    type Lock<T>;
+    /// Its hold: lends the value and lets the lock go when it drops.
+    type Guard<'a, T: 'a>: core::ops::DerefMut<Target = T>;
+    /// A lock named `name` (what a wait on it is called in the profile) holding `value`.
+    fn new<T>(name: &'static str, value: T) -> Self::Lock<T>;
+    /// The lock, waiting for it while another writer holds it.
+    fn lock<T>(lock: &Self::Lock<T>) -> Self::Guard<'_, T>;
+}
 
 /// A bug a model test plants, to show its model catches it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -230,21 +242,21 @@ struct Writer {
 
 /// One part of a table, by the top bits of the hash, on lines of its own.
 #[repr(align(128))]
-struct Shard<K, V, A: Allocator> {
+struct Shard<K, V, A: Allocator, L: ShardLock> {
     table: AtomicPtr<Table<K, V, A>>,
     len: AtomicUsize,
     /// How many values `limbo` holds, read before the lock to skip the scan of a collect.
     held: AtomicUsize,
-    writer: Lock<Writer>,
+    writer: L::Lock<Writer>,
 }
 
-impl<K, V, A: Allocator> Shard<K, V, A> {
-    fn new() -> Shard<K, V, A> {
+impl<K, V, A: Allocator, L: ShardLock> Shard<K, V, A, L> {
+    fn new(name: &'static str) -> Shard<K, V, A, L> {
         Shard {
             table: AtomicPtr::new(ptr::null_mut()),
             len: AtomicUsize::new(0),
             held: AtomicUsize::new(0),
-            writer: Lock::new(Writer { used: 0, limbo: Limbo::new() }),
+            writer: L::new(name, Writer { used: 0, limbo: Limbo::new() }),
         }
     }
 
@@ -263,8 +275,8 @@ impl<K, V, A: Allocator> Shard<K, V, A> {
 /// every entry are in it. A write retires what it unlinks into a limbo that may outlive the
 /// call, so the allocator is a cloneable handle that lives as long as the program
 /// (`Send + Sync + 'static` for a write): the global heap, or a region kept for the run.
-pub struct Map<K, V, S, A: Allocator + Clone> {
-    shards: Box<[Shard<K, V, A>], A>,
+pub struct Map<K, V, S, A: Allocator + Clone, L: ShardLock> {
+    shards: Box<[Shard<K, V, A, L>], A>,
     hasher: S,
     alloc: A,
     _owns: PhantomData<Box<Entry<K, V>, A>>,
@@ -274,30 +286,33 @@ pub struct Map<K, V, S, A: Allocator + Clone> {
 // drops the map or an entry's grace passes on, so they are `Send`; any thread may read them
 // through a pin, so they are `Sync`. The rest is atomics, a lock and the allocator handle,
 // which every thread that writes or drops uses.
-unsafe impl<K: Send + Sync, V: Send + Sync, S: Send, A: Allocator + Clone + Send + Sync> Send for Map<K, V, S, A> {}
+unsafe impl<K: Send + Sync, V: Send + Sync, S: Send, A: Allocator + Clone + Send + Sync, L: ShardLock> Send for Map<K, V, S, A, L> {}
 
 // SAFETY: as for `Send`: a shared map lends `&K` and `&V` to every thread and moves them to
 // the thread whose write unlinks them; any thread's write allocates through `&A`.
-unsafe impl<K: Send + Sync, V: Send + Sync, S: Sync, A: Allocator + Clone + Send + Sync> Sync for Map<K, V, S, A> {}
+unsafe impl<K: Send + Sync, V: Send + Sync, S: Sync, A: Allocator + Clone + Send + Sync, L: ShardLock> Sync for Map<K, V, S, A, L> {}
 
-impl<K, V, S: Default, A: Allocator + Clone> Map<K, V, S, A> {
-    /// An empty table on a default hasher (the fixed seed's, for the crate's aliases) in `alloc`.
-    pub fn new_in(alloc: A) -> Map<K, V, S, A> {
-        Map::with_hasher_in(S::default(), alloc)
+impl<K, V, S: Default, A: Allocator + Clone, L: ShardLock> Map<K, V, S, A, L> {
+    /// An empty table on a default hasher (the fixed seed's, for the crate's aliases) in `alloc`,
+    /// its shards' writer locks named `name` (what a wait on one is called: say what the table
+    /// holds, `"cas.packs"`).
+    pub fn new_in(name: &'static str, alloc: A) -> Map<K, V, S, A, L> {
+        Map::with_hasher_in(name, S::default(), alloc)
     }
 }
 
-impl<K, V, S, A: Allocator + Clone> Map<K, V, S, A> {
-    /// An empty table on `hasher` in `alloc`: the shards, and no slot until a first insert.
-    pub fn with_hasher_in(hasher: S, alloc: A) -> Map<K, V, S, A> {
+impl<K, V, S, A: Allocator + Clone, L: ShardLock> Map<K, V, S, A, L> {
+    /// An empty table on `hasher` in `alloc`, its writer locks named `name`: the shards, and no
+    /// slot until a first insert.
+    pub fn with_hasher_in(name: &'static str, hasher: S, alloc: A) -> Map<K, V, S, A, L> {
         let mut shards = Vec::with_capacity_in(SHARDS, alloc.clone());
-        shards.resize_with(SHARDS, Shard::new);
+        shards.resize_with(SHARDS, || Shard::new(name));
         Map { shards: shards.into_boxed_slice(), hasher, alloc, _owns: PhantomData }
     }
 
     /// Lends the table to this thread's task: what it reads stays valid until the pin drops.
     /// The pin may be held across a wait (`blaze_reclaim::enter`).
-    pub fn pin(&self) -> Pinned<'_, K, V, S, A> {
+    pub fn pin(&self) -> Pinned<'_, K, V, S, A, L> {
         Pinned { map: self, _task: blaze_reclaim::enter() }
     }
 
@@ -315,7 +330,7 @@ impl<K, V, S, A: Allocator + Clone> Map<K, V, S, A> {
     }
 }
 
-impl<K, V, S, A: Allocator + Clone> Drop for Map<K, V, S, A> {
+impl<K, V, S, A: Allocator + Clone, L: ShardLock> Drop for Map<K, V, S, A, L> {
     fn drop(&mut self) {
         for shard in &*self.shards {
             // Relaxed: `&mut self`, so every store to it happened before.
@@ -338,7 +353,7 @@ impl<K, V, S, A: Allocator + Clone> Drop for Map<K, V, S, A> {
     }
 }
 
-impl<K: fmt::Debug, V: fmt::Debug, S, A: Allocator + Clone> fmt::Debug for Map<K, V, S, A> {
+impl<K: fmt::Debug, V: fmt::Debug, S, A: Allocator + Clone, L: ShardLock> fmt::Debug for Map<K, V, S, A, L> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let pinned = self.pin();
         f.debug_map().entries(pinned.iter()).finish()
@@ -346,8 +361,8 @@ impl<K: fmt::Debug, V: fmt::Debug, S, A: Allocator + Clone> fmt::Debug for Map<K
 }
 
 /// A [`Map`] lent to this thread's task ([`Map::pin`]); what it lends lives as long as it does.
-pub struct Pinned<'m, K, V, S, A: Allocator + Clone> {
-    map: &'m Map<K, V, S, A>,
+pub struct Pinned<'m, K, V, S, A: Allocator + Clone, L: ShardLock> {
+    map: &'m Map<K, V, S, A, L>,
     _task: Guard,
 }
 
@@ -366,7 +381,7 @@ impl<V: fmt::Debug> fmt::Debug for OccupiedError<'_, V> {
     }
 }
 
-impl<K, V, S, A: Allocator + Clone> Pinned<'_, K, V, S, A> {
+impl<K, V, S, A: Allocator + Clone, L: ShardLock> Pinned<'_, K, V, S, A, L> {
     pub fn len(&self) -> usize {
         self.map.len()
     }
@@ -398,8 +413,8 @@ impl<K, V, S, A: Allocator + Clone> Pinned<'_, K, V, S, A> {
     }
 }
 
-impl<K, V, S: BuildHasher, A: Allocator + Clone> Pinned<'_, K, V, S, A> {
-    fn shard_of(&self, hash: u64) -> &Shard<K, V, A> {
+impl<K, V, S: BuildHasher, A: Allocator + Clone, L: ShardLock> Pinned<'_, K, V, S, A, L> {
+    fn shard_of(&self, hash: u64) -> &Shard<K, V, A, L> {
         &self.map.shards[(hash >> (u64::BITS - SHARDS.trailing_zeros())) as usize]
     }
 
@@ -517,8 +532,8 @@ enum Wrote<'g, K, V> {
     Kept(&'g Entry<K, V>, V),
 }
 
-impl<K: Hash + Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: BuildHasher, A: Allocator + Clone + Send + Sync + 'static>
-    Pinned<'_, K, V, S, A>
+impl<K: Hash + Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: BuildHasher, A: Allocator + Clone + Send + Sync + 'static, L: ShardLock>
+    Pinned<'_, K, V, S, A, L>
 {
     /// Puts `value` for `key`; the value it replaced, readable while this pin lives.
     pub fn insert(&self, key: K, value: V) -> Option<&V> {
@@ -641,7 +656,7 @@ impl<K: Hash + Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: BuildHas
 
     /// The scan of every thread's epoch slot, taken before the lock (`blaze_reclaim::scans`),
     /// when the shard holds enough retired values to free.
-    fn horizon(&self, shard: &Shard<K, V, A>) -> Option<Horizon> {
+    fn horizon(&self, shard: &Shard<K, V, A, L>) -> Option<Horizon> {
         (shard.held.load(Ordering::Relaxed) >= COLLECT_AT).then(Horizon::now)
     }
 
@@ -743,15 +758,16 @@ impl<K: Hash + Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: BuildHas
     }
 }
 
-/// Takes `shard`'s writers' lock; one a panicking writer left is taken as it was left, which
-/// is whole: a writer changes a slot with one store, after anything that can panic.
-fn lock<K, V, A: Allocator>(shard: &Shard<K, V, A>) -> impl core::ops::DerefMut<Target = Writer> + '_ {
-    shard.writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+/// Takes `shard`'s writers' lock. A lock a panicking writer left is whole as it was left (a
+/// writer changes a slot with one store, after anything that can panic), so a family that
+/// poisons takes a poisoned lock as it is.
+fn lock<K, V, A: Allocator, L: ShardLock>(shard: &Shard<K, V, A, L>) -> L::Guard<'_, Writer> {
+    L::lock(&shard.writer)
 }
 
 /// Under the lock: the current table, made or grown in `alloc` so that one more slot can be used.
-fn room<'s, K: Send + Sync + 'static, V: Send + Sync + 'static, A: Allocator + Clone + Send + Sync + 'static>(
-    shard: &'s Shard<K, V, A>,
+fn room<'s, K: Send + Sync + 'static, V: Send + Sync + 'static, A: Allocator + Clone + Send + Sync + 'static, L: ShardLock>(
+    shard: &'s Shard<K, V, A, L>,
     writer: &mut Writer,
     alloc: &A,
 ) -> &'s Table<K, V, A> {
@@ -791,8 +807,8 @@ fn room<'s, K: Send + Sync + 'static, V: Send + Sync + 'static, A: Allocator + C
 }
 
 /// Under the lock: `entry`, unlinked just now, held until no reader can be in it.
-fn retire_entry<K: Send + Sync + 'static, V: Send + Sync + 'static, A: Allocator + Clone + Send + Sync + 'static>(
-    shard: &Shard<K, V, A>,
+fn retire_entry<K: Send + Sync + 'static, V: Send + Sync + 'static, A: Allocator + Clone + Send + Sync + 'static, L: ShardLock>(
+    shard: &Shard<K, V, A, L>,
     writer: &mut Writer,
     alloc: &A,
     entry: *mut Entry<K, V>,
@@ -816,8 +832,8 @@ fn retire_entry<K: Send + Sync + 'static, V: Send + Sync + 'static, A: Allocator
 
 /// Under the lock: `table`, unlinked just now, held until no reader can be in it. Its slots are
 /// pointers: the entries are the map's or the limbo's, never the table's.
-fn retire_table<K: Send + Sync + 'static, V: Send + Sync + 'static, A: Allocator + Clone + Send + Sync + 'static>(
-    shard: &Shard<K, V, A>,
+fn retire_table<K: Send + Sync + 'static, V: Send + Sync + 'static, A: Allocator + Clone + Send + Sync + 'static, L: ShardLock>(
+    shard: &Shard<K, V, A, L>,
     writer: &mut Writer,
     alloc: &A,
     table: *mut Table<K, V, A>,
@@ -830,28 +846,28 @@ fn retire_table<K: Send + Sync + 'static, V: Send + Sync + 'static, A: Allocator
 
 /// Under the lock: what passed its grace by `horizon`, taken out to be dropped once the lock is
 /// let go.
-fn collect<K, V, A: Allocator>(shard: &Shard<K, V, A>, writer: &mut Writer, horizon: Horizon) -> blaze_reclaim::Passed {
+fn collect<K, V, A: Allocator, L: ShardLock>(shard: &Shard<K, V, A, L>, writer: &mut Writer, horizon: Horizon) -> blaze_reclaim::Passed {
     let passed = writer.limbo.collect_passed(horizon);
     shard.held.store(writer.limbo.len(), Ordering::Relaxed);
     passed
 }
 
 /// A set shared between threads: a [`Map`] to `()`.
-pub struct Set<K, S, A: Allocator + Clone>(Map<K, (), S, A>);
+pub struct Set<K, S, A: Allocator + Clone, L: ShardLock>(Map<K, (), S, A, L>);
 
-impl<K, S: Default, A: Allocator + Clone> Set<K, S, A> {
+impl<K, S: Default, A: Allocator + Clone, L: ShardLock> Set<K, S, A, L> {
     /// An empty set on a default hasher in `alloc`, as [`Map::new_in`].
-    pub fn new_in(alloc: A) -> Set<K, S, A> {
-        Set(Map::new_in(alloc))
+    pub fn new_in(name: &'static str, alloc: A) -> Set<K, S, A, L> {
+        Set(Map::new_in(name, alloc))
     }
 }
 
-impl<K, S, A: Allocator + Clone> Set<K, S, A> {
-    pub fn with_hasher_in(hasher: S, alloc: A) -> Set<K, S, A> {
-        Set(Map::with_hasher_in(hasher, alloc))
+impl<K, S, A: Allocator + Clone, L: ShardLock> Set<K, S, A, L> {
+    pub fn with_hasher_in(name: &'static str, hasher: S, alloc: A) -> Set<K, S, A, L> {
+        Set(Map::with_hasher_in(name, hasher, alloc))
     }
 
-    pub fn pin(&self) -> PinnedSet<'_, K, S, A> {
+    pub fn pin(&self) -> PinnedSet<'_, K, S, A, L> {
         PinnedSet(self.0.pin())
     }
 
@@ -864,7 +880,7 @@ impl<K, S, A: Allocator + Clone> Set<K, S, A> {
     }
 }
 
-impl<K: fmt::Debug, S, A: Allocator + Clone> fmt::Debug for Set<K, S, A> {
+impl<K: fmt::Debug, S, A: Allocator + Clone, L: ShardLock> fmt::Debug for Set<K, S, A, L> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let pinned = self.pin();
         f.debug_set().entries(pinned.iter()).finish()
@@ -872,9 +888,9 @@ impl<K: fmt::Debug, S, A: Allocator + Clone> fmt::Debug for Set<K, S, A> {
 }
 
 /// A [`Set`] lent to this thread's task.
-pub struct PinnedSet<'m, K, S, A: Allocator + Clone>(Pinned<'m, K, (), S, A>);
+pub struct PinnedSet<'m, K, S, A: Allocator + Clone, L: ShardLock>(Pinned<'m, K, (), S, A, L>);
 
-impl<K, S, A: Allocator + Clone> PinnedSet<'_, K, S, A> {
+impl<K, S, A: Allocator + Clone, L: ShardLock> PinnedSet<'_, K, S, A, L> {
     pub fn len(&self) -> usize {
         self.0.len()
     }
@@ -888,7 +904,7 @@ impl<K, S, A: Allocator + Clone> PinnedSet<'_, K, S, A> {
     }
 }
 
-impl<K, S: BuildHasher, A: Allocator + Clone> PinnedSet<'_, K, S, A> {
+impl<K, S: BuildHasher, A: Allocator + Clone, L: ShardLock> PinnedSet<'_, K, S, A, L> {
     pub fn contains<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> bool {
         self.0.contains_key(key)
     }
@@ -918,8 +934,8 @@ impl<K, S: BuildHasher, A: Allocator + Clone> PinnedSet<'_, K, S, A> {
     }
 }
 
-impl<K: Hash + Eq + Send + Sync + 'static, S: BuildHasher, A: Allocator + Clone + Send + Sync + 'static>
-    PinnedSet<'_, K, S, A>
+impl<K: Hash + Eq + Send + Sync + 'static, S: BuildHasher, A: Allocator + Clone + Send + Sync + 'static, L: ShardLock>
+    PinnedSet<'_, K, S, A, L>
 {
     /// Puts `key`; whether it was not held.
     pub fn insert(&self, key: K) -> bool {

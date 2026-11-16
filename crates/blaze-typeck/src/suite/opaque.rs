@@ -39,7 +39,10 @@ fn world() -> (Fx, ItemKey, ItemKey) {
     let opaque = fx.ty(PNode::Opaque(o, ps));
     let is_tr = fx.bound(tr, &[opaque]);
     let out_is_t = fx.proj(tr, &[opaque], "Out", p0);
-    fx.set_opaque_bounds(o, std::vec![is_tr, out_is_t]);
+    // `Sized` is among an opaque's bounds unless `?Sized` is written, as the front end's heads
+    // file it (front2/heads.rs `fn_head`): without it `need`'s implied `X: Sized` is E0277.
+    let is_sized = fx.bound(sized, &[opaque]);
+    fx.set_opaque_bounds(o, std::vec![is_tr, out_is_t, is_sized]);
     fx.func("mk", 1, &[p0], opaque, Vec::new());
     let out = fx.alias(tr, "Out", &[p0]);
     let x_tr = fx.bound(tr, &[p0]);
@@ -90,6 +93,115 @@ fn an_opaque_types_projection_is_its_bound_and_nothing_else() {
     let (b, root) = body();
     let c = check_body(&fx, &b, user16, root, Plant::None, InferPlant::None);
     let want = Want { exprs: &[(ExprId(4), "u8")], pats: &[], diags: &[(DiagCode::Mismatch, ExprId(4))] };
+    let d = written(differences(&fx, &b, &c, &want));
+    assert!(d.is_empty(), "\n{}", d.join("\n"));
+}
+
+/// A generic fn's opaque at two instances in one body: `{ let a = need(mk(1u8)); need(mk(1u16)) }`
+/// under `-> u16`. The Reference, "Impl trait", [type.impl-trait.generic-captures]: "For this
+/// concrete type to use a generic parameter, that generic parameter must be captured by the
+/// abstract type": `mk::<u8>`'s opaque and `mk::<u16>`'s are two types, each with its own `Out`.
+#[test]
+fn a_generic_opaque_at_two_instances_is_two_types() {
+    let (fx, _, user16) = world();
+    let mut b = Bb::new();
+    let need = b.path(&["need"]);
+    let mk = b.path(&["mk"]);
+    let one = b.int(Some(IntSuffix::Uint(UintTy::U8)));
+    let inner = b.call(mk, &[one]);
+    let first = b.call(need, &[inner]);
+    let a = b.bind("a");
+    let s = b.let_(a, None, first);
+    let need2 = b.path(&["need"]);
+    let mk2 = b.path(&["mk"]);
+    let two = b.int(Some(IntSuffix::Uint(UintTy::U16)));
+    let inner2 = b.call(mk2, &[two]);
+    let second = b.call(need2, &[inner2]);
+    let root = b.block(&[s], Some(second));
+    let c = check_body(&fx, &b, user16, root, Plant::None, InferPlant::None);
+    let want = Want { exprs: &[(first, "u8"), (second, "u16"), (root, "u16")], pats: &[], diags: &[] };
+    let d = written(differences(&fx, &b, &c, &want));
+    assert!(d.is_empty(), "\n{}", d.join("\n"));
+}
+
+/// The DEFINING side (rules/opaque_def.rs): `trait Tr2 {}`, `impl Tr2 for u8 {}` and
+/// `fn d() -> impl Tr2`, the opaque's bounds `Tr2` and `Sized`.
+fn defining_world() -> (Fx, ItemKey) {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let tr = fx.tr("Tr2", 1, Vec::new(), &[]);
+    let u8_ = fx.u8();
+    fx.imp("impl Tr2 for u8", 0, u8_, Some((tr, &[])), &[], Vec::new());
+    let o = fx.opaque_key("d::{opaque#0}");
+    let none = fx.list(&[]);
+    let opaque = fx.ty(PNode::Opaque(o, none));
+    let is_tr = fx.bound(tr, &[opaque]);
+    let is_sized = fx.bound(sized, &[opaque]);
+    fx.set_opaque_bounds(o, std::vec![is_tr, is_sized]);
+    let d = fx.func("d", 0, &[], opaque, Vec::new());
+    fx.finish();
+    (fx, d)
+}
+
+/// `{ return 1u8; TAIL }` checked as `d`'s body.
+fn defining_body(tail: fn(&mut Bb) -> ExprId) -> (Fx, Bb, ExprId, crate::columns::Checked<'static>) {
+    let (fx, d) = defining_world();
+    let mut b = Bb::new();
+    let one = b.int(Some(IntSuffix::Uint(UintTy::U8)));
+    let r = b.ret(Some(one));
+    let s = b.semi(r);
+    let t = tail(&mut b);
+    let root = b.block(&[s], Some(t));
+    let c = check_body(&fx, &b, d, root, Plant::None, InferPlant::None);
+    (fx, b, t, c)
+}
+
+/// [type.impl-trait.return.constraint-body]: "Each possible return value from the function must
+/// resolve to the same concrete type". `{ return 1u8; 2u8 }`: two return points of one type, the
+/// hidden type `u8`, which has `Tr2`: clean. Without the rule the body's `u8` is compared with
+/// the opaque itself, E0308.
+#[test]
+fn a_defining_body_with_two_returns_of_one_type_is_clean() {
+    let (fx, b, t, c) = defining_body(|b| b.int(Some(IntSuffix::Uint(UintTy::U8))));
+    let want = Want { exprs: &[(t, "u8")], pats: &[], diags: &[] };
+    let d = written(differences(&fx, &b, &c, &want));
+    assert!(d.is_empty(), "\n{}", d.join("\n"));
+}
+
+/// The planted bug: the output kept as the opaque itself (the state before rules/opaque_def.rs)
+/// makes `{ 1u8 }` fail: the rigid opaque against `u8` ends as an `Unsatisfied` with no place
+/// (run of 2026-11-16: "`d`: DiagWithoutPlace { code: Unsatisfied, name: None }"), so the test
+/// above checks the rule.
+#[test]
+#[should_panic(expected = "DiagWithoutPlace { code: Unsatisfied")]
+fn control_opaque_not_opened() {
+    let (fx, d) = defining_world();
+    let mut b = Bb::new();
+    let one = b.int(Some(IntSuffix::Uint(UintTy::U8)));
+    let root = b.block(&[], Some(one));
+    let _ = check_body(&fx, &b, d, root, Plant::OpaqueNotOpened, InferPlant::None);
+}
+
+/// The same sentence: `{ return 1u8; "a" }` returns two types: E0308 at the second.
+#[test]
+fn a_defining_body_with_two_returned_types_is_a_mismatch() {
+    let (fx, b, t, c) = defining_body(|b| b.str_());
+    let want = Want { exprs: &[], pats: &[], diags: &[(DiagCode::Mismatch, t)] };
+    let d = written(differences(&fx, &b, &c, &want));
+    assert!(d.is_empty(), "\n{}", d.join("\n"));
+}
+
+/// "the function chooses the return type, but only promises that it will implement Trait":
+/// `{ "a" }` makes `&str` the hidden type, which lacks `Tr2`: E0277 at the body, naming `Tr2`.
+#[test]
+fn a_hidden_type_that_lacks_a_bound_is_unsatisfied() {
+    let (fx, d) = defining_world();
+    let mut b = Bb::new();
+    let a = b.str_();
+    let root = b.block(&[], Some(a));
+    let c = check_body(&fx, &b, d, root, Plant::None, InferPlant::None);
+    let want = Want { exprs: &[], pats: &[], diags: &[(DiagCode::Unsatisfied, root)] };
     let d = written(differences(&fx, &b, &c, &want));
     assert!(d.is_empty(), "\n{}", d.join("\n"));
 }

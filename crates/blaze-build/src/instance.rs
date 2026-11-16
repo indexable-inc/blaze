@@ -11,9 +11,10 @@
 
 use blaze_ids::{ContentId, Hasher};
 use blaze_own::{Alloc, Vec};
-use blaze_typeck::{ItemKey, List, PNode, PTy, PTys, PortableTys};
+use blaze_typeck::{ExprId, ItemKey, List, PNode, PTy, PTys, PortableTys};
 
 use crate::BuildError;
+use crate::layout::LayoutFacts;
 
 /// A fn item and its generic arguments, interned in the ground table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -73,8 +74,14 @@ pub fn instance_key(code: ContentId, args: List, ground: PTys<'_>, scratch: Allo
             PNode::ExTrait(key, _) => (17, key.0),
             PNode::ExProj { trait_, name, .. } => (18, (u128::from(name.0) << 64) | u128::from(trait_.0)),
             PNode::ExAuto(key) => (19, key.0),
+            // A closure (typeck.md, "A closure's identity"): its owner and its ORDINAL among the
+            // owner body's closures (never a body-local expression id); its children the
+            // owner's arguments. Its signature, kind and environment are facts of that identity.
+            PNode::Closure { owner, ordinal, .. } => {
+                h.update(&ordinal.to_le_bytes());
+                (20, owner.0)
+            }
             PNode::FnPtr(..)
-            | PNode::Closure(..)
             | PNode::Future(..)
             | PNode::Alias { .. }
             | PNode::Opaque(..)
@@ -93,18 +100,54 @@ pub fn instance_key(code: ContentId, args: List, ground: PTys<'_>, scratch: Allo
     Ok(InstanceKey(h.finish()))
 }
 
-/// `ty` of table `from`, in `ground` with `Param(i)` replaced by `args[i]` (`args` are types of
-/// `ground`). Refused, naming the node: a parameter past `args`, a hole, an error, an alias,
-/// an opaque type, a closure, a fn pointer: none has a ground form the ladder builds yet.
-/// `scratch` is the allocator of the walk's two columns.
+/// The key of the instance of fn `code` at `args` (a list of `ground`), covering what each
+/// projection of the fn's own types `from` normalizes to at those arguments: two instances that
+/// differ only there (an impl's `type Item` edited) never share a key. Made as [`instance_key`]
+/// over `args` followed by each projection's normalized type, in `from`'s index order; the
+/// argument count is part of the hash and fixed by `code`, so the list is unambiguous, and a fn
+/// with no projection keys exactly as [`instance_key`] keys it.
+pub fn instance_key_normalized(
+    code: ContentId,
+    args: List,
+    from: PTys<'_>,
+    ground: &mut PortableTys<'_>,
+    facts: &dyn LayoutFacts,
+    scratch: Alloc<'_>,
+) -> Result<InstanceKey, BuildError> {
+    let malformed = |_| BuildError::Malformed { what: "an instance's arguments past the ground table" };
+    let mut all: Vec<PTy, Alloc<'_>> = Vec::new_in(scratch);
+    all.extend_from_slice(ground.view().list(args).map_err(malformed)?);
+    let given = all.len();
+    for (at, node) in from.nodes.iter().enumerate() {
+        if matches!(node, PNode::Alias { .. }) {
+            let normalized = crate::instance::ground(from, PTy(at as u32), &all[..given], ground, scratch, facts)?;
+            all.push(normalized);
+        }
+    }
+    if all.len() == given {
+        return instance_key(code, args, ground.view(), scratch);
+    }
+    let list = ground.intern_list(&all).map_err(|_| BuildError::Malformed { what: "the ground table is full" })?;
+    instance_key(code, list, ground.view(), scratch)
+}
+
+/// The one function every type lowered at an instance passes through (signatures, locals,
+/// fields, casts, a callee's signature): `ty` of table `from`, in `ground` with `Param(i)`
+/// replaced by `args[i]` (`args` are types of `ground`), every projection then normalized by
+/// `facts` (normalize.rs). A closure grounds like a fn item: its arguments mapped. Refused,
+/// naming the node: a parameter past `args`, a hole, an error, a projection the solver does not
+/// answer, an opaque type, an async block's future. `scratch` is the allocator of the walk's
+/// columns.
 pub fn ground(
     from: PTys<'_>,
     ty: PTy,
     args: &[PTy],
     ground: &mut PortableTys<'_>,
     scratch: Alloc<'_>,
+    facts: &dyn LayoutFacts,
 ) -> Result<PTy, BuildError> {
     let malformed = |_| BuildError::Malformed { what: "a type index past its table" };
+    let mut projections = false;
     // Which nodes of `from` `ty` reaches: marked, then mapped in index order.
     let top = ty.0 as usize;
     let mut reached: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(top + 1, scratch);
@@ -152,9 +195,12 @@ pub fn ground(
             PNode::Adt(key, l) => PNode::Adt(key, map_list(l, &mut list)?),
             PNode::FnDef(key, l) => PNode::FnDef(key, map_list(l, &mut list)?),
             PNode::FnPtr(l, header) => PNode::FnPtr(map_list(l, &mut list)?, header),
-            PNode::Closure(..) => return Err(BuildError::UnsupportedSig { what: "a closure type in an instance" }),
+            PNode::Closure { owner, ordinal, args } => PNode::Closure { owner, ordinal, args: map_list(args, &mut list)? },
             PNode::Future(..) => return Err(BuildError::UnsupportedSig { what: "an async block's future in an instance" }),
-            PNode::Alias { .. } => return Err(BuildError::UnsupportedSig { what: "an associated type in an instance" }),
+            PNode::Alias { trait_, name, args } => {
+                projections = true;
+                PNode::Alias { trait_, name, args: map_list(args, &mut list)? }
+            }
             PNode::Opaque(..) => return Err(BuildError::UnsupportedSig { what: "an `impl Trait` type in an instance" }),
             // The predicates' order is by (kind, trait, name), which no argument changes: the
             // mapped list keeps the one form (`PortableTys::dynamic`).
@@ -168,18 +214,21 @@ pub fn ground(
         };
         mapped[at] = ground.intern(node).map_err(|_| BuildError::Malformed { what: "the ground table is full" })?;
     }
+    if projections {
+        return crate::normalize::normalize_ground(ground, mapped[top], facts, scratch);
+    }
     Ok(mapped[top])
 }
 
 /// The children of `node` (of table `from`), pushed to `out`.
-fn each_child(from: PTys<'_>, node: PNode, out: &mut Vec<PTy, Alloc<'_>>) -> Result<(), BuildError> {
+pub(crate) fn each_child(from: PTys<'_>, node: PNode, out: &mut Vec<PTy, Alloc<'_>>) -> Result<(), BuildError> {
     let malformed = |_| BuildError::Malformed { what: "a list past its table" };
     match node {
         PNode::Tuple(l) | PNode::Adt(_, l) | PNode::FnDef(_, l) | PNode::FnPtr(l, _) | PNode::Opaque(_, l) => {
             out.extend_from_slice(from.list(l).map_err(malformed)?);
         }
-        PNode::Alias { args, .. } => out.extend_from_slice(from.list(args).map_err(malformed)?),
-        PNode::Ref(_, t) | PNode::Ptr(_, t) | PNode::Slice(t) | PNode::Closure(_, t) | PNode::ConstValue { ty: t, .. } => out.push(t),
+        PNode::Alias { args, .. } | PNode::Closure { args, .. } => out.extend_from_slice(from.list(args).map_err(malformed)?),
+        PNode::Ref(_, t) | PNode::Ptr(_, t) | PNode::Slice(t) | PNode::ConstValue { ty: t, .. } => out.push(t),
         PNode::Future(_, o, i) | PNode::Array(o, i) => {
             out.push(o);
             out.push(i);

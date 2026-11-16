@@ -265,6 +265,9 @@ struct TestWorld {
     deref_fn: Option<ItemKey>,
     /// The ADT `Adts::lang_adt(ManuallyDrop)` answers.
     manually_drop: Option<ItemKey>,
+    /// The fixture solver of `LayoutFacts::normalize`: `<self_ as Deref>::Target = target`,
+    /// both types of this world's table (tests/projections.rs).
+    projs: Vec<(PTy, PTy), Global>,
 }
 
 const DEREF: ItemKey = ItemKey(90);
@@ -291,6 +294,7 @@ impl TestWorld {
             deref_assoc: Vec::new_in(Global),
             deref_fn: None,
             manually_drop: None,
+            projs: Vec::new_in(Global),
         }
     }
 
@@ -420,6 +424,10 @@ impl World for TestWorld {
         Ok(self.sig(item))
     }
 
+    fn closure(&self, _: Seal, _: ItemKey, _: u32) -> Fetch<Option<blaze_typeck::ClosureFacts<'_>>> {
+        Ok(None)
+    }
+
     fn predicates(&self, _: Seal, _: ItemKey) -> Fetch<Predicates<'_>> {
         Ok(Predicates { clauses: &[] as &[PClause], types: PTys::EMPTY })
     }
@@ -489,7 +497,12 @@ impl World for TestWorld {
     }
 
     fn lang_item(&self, _: Seal, item: LangItem) -> Fetch<Option<ItemKey>> {
-        Ok((item == LangItem::Deref && self.deref.is_some()).then_some(DEREF))
+        Ok(match item {
+            LangItem::Deref => self.deref.is_some().then_some(DEREF),
+            // forms.rs: `c"..."`'s referent, when the test declares it.
+            LangItem::CStr => self.structs.iter().any(|s| s.key == forms::CSTR).then_some(forms::CSTR),
+            _ => None,
+        })
     }
 
     fn lang_path(&self, _: Seal, _: LangItem) -> Fetch<Option<Def>> {
@@ -503,7 +516,6 @@ impl World for TestWorld {
     fn opaque_hidden(&self, _: Seal, _: ItemKey) -> Fetch<Option<Hidden<'_>>> {
         Ok(None)
     }
-
     fn attrs(&self, _: Seal, _: ItemKey) -> Fetch<TypeAttrs> {
         Ok(TypeAttrs(0))
     }
@@ -613,6 +625,11 @@ impl Adts for TestAdts<'_> {
 
     fn str_lit(&self, _: ItemKey, expr: ExprId) -> Option<&str> {
         self.body.strs.iter().find(|(e, _)| *e == expr).map(|&(_, s)| s)
+    }
+
+    /// forms.rs: a float literal's bits ride in `lits` as an integer's value does.
+    fn float_lit(&self, owner: ItemKey, expr: ExprId) -> Option<u128> {
+        self.int_lit(owner, expr)
     }
 
     fn byte_str(&self, owner: ItemKey, expr: ExprId) -> Option<&[u8]> {
@@ -3222,3 +3239,8 @@ fn a_match_by_value_refuses_what_it_does_not_build() {
 
 #[cfg(target_arch = "aarch64")]
 mod objects;
+
+#[cfg(target_arch = "aarch64")]
+mod closures;
+
+mod forms;

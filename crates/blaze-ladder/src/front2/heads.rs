@@ -52,6 +52,9 @@ pub enum HeadError {
     NotAHead(LibKey, &'static str),
     /// Each item needs the next's head and the last the first's.
     Cycle(Vec<LibKey, Global>),
+    /// `by` needs `need`, which was just made, yet its lookup still fails: a lookup asking for
+    /// a want that does not make what it reads.
+    NeedMade { need: Want, by: Want },
     /// A member's key clashed.
     Key(KeyClash),
     /// The item's types: what and where in its text.
@@ -65,6 +68,7 @@ impl core::fmt::Display for HeadError {
             HeadError::Cfg(k) => write!(f, "item {k:?} asks for cfg atoms its crate's set does not answer"),
             HeadError::NotAHead(k, what) => write!(f, "item {k:?} is {what}, not a struct, enum, union, trait, impl or fn"),
             HeadError::Cycle(ks) => write!(f, "these items need each other's heads in a cycle: {ks:?}"),
+            HeadError::NeedMade { need, by } => write!(f, "{by:?} needs {need:?}, which is made, yet asks for it again (its lookup reads what that want does not make)"),
             HeadError::Key(c) => write!(f, "{c}"),
             HeadError::Item(k, why) => write!(f, "item {k:?}: {why:?}"),
         }
@@ -131,6 +135,9 @@ impl Heads for Maps {
     }
     fn alias_defaults(&self, alias: LibKey) -> &[Option<PTy>] {
         self.alias_defaults.get(&alias).map_or(&[], |d| &d[..])
+    }
+    fn alias_gap(&self, alias: LibKey) -> Option<&Why> {
+        self.alias_gaps.get(&alias)
     }
     fn trait_alias(&self, alias: LibKey) -> Option<&TraitAliasHead> {
         self.trait_aliases.get(&alias)
@@ -351,6 +358,9 @@ pub struct Store<'n> {
     /// `impl Future`), by its key ([`super::keys::opaque_key`]): its fn and its index. Its
     /// bounds are in `preds` under the same key, with the opaque type as `Self`.
     pub opaques: HashMap<ItemKey, (ItemKey, u32), Global>,
+    /// The items declared inside the bodies lowered so far, kept in the command's frame: a
+    /// local item's head is made from its row ([`super::locals`]).
+    pub locals: super::locals::Locals<'n>,
 }
 
 /// A trait's clauses on `Self` and its associated types with their keys and defaults (in the
@@ -552,7 +562,8 @@ fn members<'n>(names: &'n Names<'n>, key: LibKey) -> Result<Vec<Member<'n>, Glob
 impl<'n> Store<'n> {
     /// An empty store; `sized` is the program's `#[lang = "sized"]` trait (none in a
     /// `no_core` rung that declares none).
-    pub fn new(sized: Option<LibKey>) -> Store<'n> {
+    /// `frame` is the command's ([`super::Front2::frame`]), where bodies' local items are kept.
+    pub fn new(sized: Option<LibKey>, frame: &'n blaze_mem::Frame) -> Store<'n> {
         Store {
             tys: PortableTys::new_in(Alloc::global()),
             maps: Maps::default(),
@@ -566,6 +577,7 @@ impl<'n> Store<'n> {
             ctors: HashMap::new_in(Global),
             statics: HashMap::new_in(Global),
             opaques: HashMap::new_in(Global),
+            locals: super::locals::Locals::new(frame),
         }
     }
 
@@ -579,17 +591,24 @@ impl<'n> Store<'n> {
     pub fn ensure(&mut self, names: &'n Names<'n>, keys: &mut Keys, want: Want) -> Result<(), HeadError> {
         let mut stack = Vec::new_in(Global);
         stack.push(want);
+        // The want made by the step before: asked again at once, it was made and its lookup
+        // still fails (no progress), which is named, never looped until `MOST_STEPS`.
+        let mut just_made = None;
         for _ in 0..MOST_STEPS {
             let Some(&top) = stack.last() else { return Ok(()) };
             match self.step(names, keys, top)? {
                 Step::Done => {
-                    stack.pop();
+                    just_made = stack.pop();
                 }
                 Step::Need(k) => {
                     let need = self.need(k);
+                    if just_made == Some(need) {
+                        return Err(HeadError::NeedMade { need, by: top });
+                    }
                     if stack.iter().any(|w| *w == need) {
                         return Err(HeadError::Cycle(cycle(&stack)));
                     }
+                    just_made = None;
                     stack.push(need);
                 }
             }
@@ -611,9 +630,15 @@ impl<'n> Store<'n> {
             return Ok(Step::Done);
         }
         let resolver = Resolver { names };
-        let detail = resolver.detail(key).ok_or(HeadError::NoText(key))?;
-        let text = names.item_text(key).ok_or(HeadError::NoText(key))?.text;
-        let module = names.module_of(key).ok_or(HeadError::NoText(key))?;
+        // An item declared in a body: its row's text and its enclosing body's module.
+        let (detail, text, module) = match self.locals.head_of(key) {
+            Some(local) => local?,
+            None => (
+                resolver.detail(key).ok_or(HeadError::NoText(key))?,
+                names.item_text(key).ok_or(HeadError::NoText(key))?.text,
+                names.module_of(key).ok_or(HeadError::NoText(key))?,
+            ),
+        };
         let low = lower(names, key, text)?;
         let v = low.view();
         let got = match (want, detail) {

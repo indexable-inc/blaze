@@ -466,7 +466,7 @@ fn outline_root(script: &Script, served: &blaze_unit_graph::Unit<'_>, out: &blaz
     };
     let mut by_name = ByName::new(rules, at, ScriptCx { inner: host, out: opened }, Alloc::global());
     let mut sink = Made(0, true);
-    let stats = lower_file(&text, edition, &mut cfg, &mut by_name, &mut sink, Alloc::global());
+    let stats = lower_file(&text, edition, &mut cfg, &mut blaze_lower::NoModule, &mut by_name, &mut sink, Alloc::global());
     println!("  outline of {rel}: {} items, {} made by expansions", stats.items, sink.0);
     // The control: the same file over the same host with no outputs laid over it.
     let mut empty = AVec::new_in(Alloc::global());
@@ -477,7 +477,7 @@ fn outline_root(script: &Script, served: &blaze_unit_graph::Unit<'_>, out: &blaz
     };
     let mut by_name = ByName::new(rules, at, ScriptCx { inner: Bare { env: script.env.clone() }, out: none }, Alloc::global());
     let mut quiet = Made(0, false);
-    let stats = lower_file(&text, edition, &mut cfg, &mut by_name, &mut quiet, Alloc::global());
+    let stats = lower_file(&text, edition, &mut cfg, &mut blaze_lower::NoModule, &mut by_name, &mut quiet, Alloc::global());
     println!("  control without the outputs: {} items, {} made by expansions", stats.items, quiet.0);
 }
 

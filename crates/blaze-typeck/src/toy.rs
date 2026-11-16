@@ -225,7 +225,10 @@ impl World for ToyWorld {
         self.held(Question::Opaque(item))?;
         Ok(None)
     }
-
+    fn closure(&self, _: Seal, owner: ItemKey, ordinal: u32) -> Fetch<Option<crate::world::ClosureFacts<'_>>> {
+        self.held(Question::Closure(owner, ordinal))?;
+        Ok(None)
+    }
     fn attrs(&self, _: Seal, item: ItemKey) -> Fetch<TypeAttrs> {
         self.held(Question::Attrs(item))?;
         Ok(TypeAttrs(0))

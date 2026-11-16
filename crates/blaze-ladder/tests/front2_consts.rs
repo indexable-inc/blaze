@@ -48,8 +48,9 @@ fn constants_evaluate_through_front2() {
     let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     note("names resolved");
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
-    let mut front = Front2::new(&names, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
-    let mut store = Store::new(front.index.lang("sized"));
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
+        let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame);
     let mut buckets = None;
     let prepared = Prepares::new_in(Alloc::global());
     let root = names.root(0);

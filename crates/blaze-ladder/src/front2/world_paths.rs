@@ -6,7 +6,9 @@
 use std::alloc::Global;
 use std::vec::Vec;
 
-use blaze_typeck::{Def, Fetch, Name, PNode, PTy, PathRes, Prim};
+use blaze_typeck::{Def, Fetch, Name, PNode, PTy, PathRes, Prim, ScopeId};
+
+use super::locals::{LocalGap, LocalKind, LocalNs};
 
 use super::heads::Want;
 use super::keys::checker_of;
@@ -16,7 +18,7 @@ use crate::resolve::{Kind, Ns, ResolveError};
 
 impl BodyWorld<'_, '_> {
     /// What `segments`, written in the body, name.
-    pub(super) fn path(&self, segments: &[Name]) -> Fetch<Option<PathRes>> {
+    pub(super) fn path(&self, scope: ScopeId, segments: &[Name]) -> Fetch<Option<PathRes>> {
         let mut written = Vec::with_capacity_in(segments.len(), Global);
         for &s in segments {
             match self.spell.get(s) {
@@ -38,6 +40,42 @@ impl BodyWorld<'_, '_> {
         if let Some(&(_, i)) = self.params.iter().find(|(n, _)| *n == segments[0]) {
             return Ok(Some(PathRes { def: Def::TyParam(i), consumed: 1 }));
         }
+        // The items of the body's blocks, innermost first, before the module's
+        // ([`super::locals`]); a local `use` names its path, resolved at the module.
+        let mut via_use = None;
+        let ns = if written.len() == 1 { LocalNs::Value } else { LocalNs::Type };
+        if let Some(row) = self.store.locals.find(self.owner, Some(scope.0), first, ns) {
+            let k = checker_of(row.key);
+            let def = match row.kind {
+                LocalKind::Use => {
+                    via_use = Some(row);
+                    None
+                }
+                LocalKind::Fn | LocalKind::Const if self.store.fns.contains_key(&k) => Some(if row.kind == LocalKind::Fn { Def::Fn(k) } else { Def::Const(k) }),
+                LocalKind::Fn | LocalKind::Const | LocalKind::Static if !self.store.fns.contains_key(&k) => return self.fill(Fill::Store(Want::Fn(row.key))),
+                LocalKind::Static => match self.store.statics.get(&k) {
+                    Some(&m) => Some(Def::Static(k, m)),
+                    None => return self.want(k),
+                },
+                _ => return self.gap(Gap::Local(LocalGap { item: row.key, form: row.kind.form(), range: row.range })),
+            };
+            if let Some(def) = def {
+                return Ok(Some(PathRes { def, consumed: 1 }));
+            }
+        }
+        // A local `use`'s binding stands for its path: `max` of `use core::cmp::max` is
+        // `core::cmp::max`, the rest of the written path after it.
+        let mut shift = 0u32;
+        if let Some(row) = via_use {
+            let mut through = Vec::with_capacity_in(row.path.len() + written.len(), Global);
+            if row.abs {
+                through.push("{{root}}");
+            }
+            through.extend(row.path.iter().copied());
+            through.extend(written[1..].iter().copied());
+            shift = (through.len() - written.len()) as u32;
+            written = through;
+        }
         // `::x`: blaze-lower writes the global root as a first segment `{{root}}`.
         let (abs, rest) = match written.split_first() {
             Some((&"{{root}}", rest)) => (true, rest),
@@ -50,7 +88,9 @@ impl BodyWorld<'_, '_> {
             Err(ResolveError::Path(_)) => return Ok(None),
             Err(e @ ResolveError::NoText { .. }) => return self.gap(Gap::Resolve(e)),
         };
-        let consumed = target.consumed + lead;
+        // Counted in the segments as written (a `use`'s path stands for its one binding).
+        let Some(consumed) = (target.consumed + lead).checked_sub(shift) else { return Ok(None) };
+        let written = &written[shift as usize..];
         let all = consumed as usize == written.len();
         let k = checker_of(target.key);
         let def = match target.kind {

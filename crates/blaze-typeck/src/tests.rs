@@ -24,7 +24,7 @@ use crate::machine::Plant;
 use crate::portable::PTys;
 use crate::infer::InferCtx;
 use crate::toy::{FieldTy, ToyStruct, ToyWorld, struct_key};
-use crate::world::{Needs, Question};
+use crate::world::{HolePlant, Needs, Question};
 use crate::{Outcome, check_with};
 
 /// A body under construction: owned columns a `BodyView` borrows.
@@ -273,9 +273,34 @@ fn the_oracle_catches_an_unrecorded_read() {
     blaze_sim::control(Config::cases(300), Plant::None, Plant::PeekFields, "read list missed", read_list_property);
 }
 
+/// `run` with a planted bug of the hole tests.
+fn run_holes(case: &Case, w: &ToyWorld, hints: &Needs<'_>, plant: HolePlant) -> Result<Outcome<'static>, CheckError> {
+    let mut ty = InferCtx::new_in(Alloc::global());
+    let body = case.body.view(w.owner, case.root);
+    crate::check_hole_plant(&body, w, &mut ty, hints, plant, Alloc::global())
+}
+
 #[test]
 fn a_need_then_reentry_equals_one_run() {
-    blaze_sim::check(Config::cases(300), |tape: &Tape| -> Result<(), Broke> {
+    blaze_sim::check(Config::cases(300), |tape: &Tape| reentry_property(tape, HolePlant::None));
+}
+
+/// The oracle of rounds: a record made after N rounds over a world that withholds records is
+/// byte for byte the record of one run over the world that had them all. Its control lets the
+/// hints (an earlier round's questions) into the read list.
+#[test]
+fn the_rounds_oracle_catches_an_earlier_read_kept() {
+    blaze_sim::control(Config::cases(300), HolePlant::None, HolePlant::KeepEarlierReads, "re-entry differs", reentry_property);
+}
+
+/// A run that met a hole makes no result. Its control makes a result from the stand-ins.
+#[test]
+fn the_rounds_oracle_catches_an_answer_through_a_hole() {
+    blaze_sim::control(Config::cases(300), HolePlant::None, HolePlant::AnswerThroughHoles, "re-entry differs", reentry_property);
+}
+
+fn reentry_property(tape: &Tape, plant: HolePlant) -> Result<(), Broke> {
+    {
         let case = draw_case(tape);
         let full = done(&case, &world(&case), Plant::None)?;
         let mut w = world(&case);
@@ -287,7 +312,7 @@ fn a_need_then_reentry_equals_one_run() {
         let mut hints = Needs::new_in(Alloc::global());
         // Each stop fetches at least the question it missed.
         for _ in 0..=full.reads.questions().len() + 1 {
-            match run(&case, &w, &hints, Plant::None) {
+            match run_holes(&case, &w, &hints, plant) {
                 Ok(Outcome::Done(c)) => {
                     return if c == full {
                         Ok(())
@@ -296,7 +321,7 @@ fn a_need_then_reentry_equals_one_run() {
                     };
                 }
                 Ok(Outcome::Need(n)) => {
-                    let missed = n.questions.iter().filter(|q| w.missing.contains(q)).count();
+                    let missed = n.missing.iter().filter(|q| w.missing.contains(q)).count();
                     if missed == 0 {
                         return Err(Broke::Oracle(format!("a need named nothing missing: {:?}", n.questions)));
                     }
@@ -313,7 +338,7 @@ fn a_need_then_reentry_equals_one_run() {
             }
         }
         Err(Broke::Oracle(String::from("re-entry did not end within its bound")))
-    });
+    }
 }
 
 /// A clock that counts its reads: deterministic nanoseconds for the ask log.
@@ -362,21 +387,28 @@ fn restarts_property(tape: &Tape, hints_mode: Hints) -> Result<(), Broke> {
         w.missing.push(q);
     }
     let mut hints = Needs::new_in(Alloc::global());
-    let bound = full.reads.questions().len() as u32 + 2;
+    // Room for the control's lost rounds (at most the prediction, itself at most this).
+    let bound = 2 * (full.reads.questions().len() as u32 + 2);
     for entries in 1..=bound {
         match run(&case, &w, &hints, Plant::None) {
             Ok(Outcome::Done(_)) => {
-                return if entries == predicted.entries {
+                // The log models a run that stops at its first missing answer (asks.rs
+                // `Order::Pull`). A run goes on past a hole (world.rs `Hole`): it is the same run
+                // up to its first hole and fetches at least what the model fetches, so the model
+                // is a bound, never exceeded.
+                return if entries <= predicted.entries {
                     Ok(())
                 } else {
                     Err(Broke::Oracle(format!(
-                        "the log predicted {} entries, re-entry took {entries}",
+                        "the log predicted at most {} entries, re-entry took {entries}",
                         predicted.entries
                     )))
                 };
             }
             Ok(Outcome::Need(n)) => {
-                let lose = matches!(hints_mode, Hints::LoseFirstFetch) && entries == 1;
+                // The control loses the fetches of as many rounds as the bound allows: the next
+                // round past them still misses, so the bound is exceeded.
+                let lose = matches!(hints_mode, Hints::LoseFirstFetch) && entries <= predicted.entries;
                 let mut kept = Vec::new_in(Global);
                 for &q in w.missing.iter() {
                     if !n.questions.contains(&q) || lose {
@@ -538,4 +570,107 @@ fn deep_binary_ops_do_not_grow_the_stack() {
         b.expr(Expr::Binary { op: BinOp::Add, lhs, rhs })
     });
     assert_eq!(got, Ok(()));
+}
+
+/// Five structs, a parameter of each, and `let a_k = p_k.f0;` for each: five independent
+/// records the body reads (typeck.md, "Speed on real code": rounds).
+fn five_fields() -> Case {
+    let mut structs = Vec::new_in(Global);
+    let mut params = Vec::new_in(Global);
+    let mut body = BodyBuf::new(Edition::E2021);
+    let mut stmt_ids: Vec<StmtId, Global> = Vec::new_in(Global);
+    for k in 0..5u32 {
+        let mut fields = Vec::new_in(Global);
+        fields.push((field_name(0), FieldTy::I32));
+        structs.push(ToyStruct { fields });
+        params.push(FieldTy::Struct(k));
+        let p = body.bind(u64::from(k));
+        body.params.push(p);
+    }
+    for k in 0..5u32 {
+        let base = body.expr(Expr::Local(body.params[k as usize]));
+        let e = body.expr(Expr::Field { base, name: field_name(0) });
+        let a = body.bind(1000 + u64::from(k));
+        stmt_ids.push(StmtId(body.stmts.len() as u32));
+        body.stmts.push(Stmt::Let { pat: a, ty: None, init: Some(e), else_: None });
+    }
+    let start = body.stmt_lists.len() as u32;
+    body.stmt_lists.extend_from_slice(&stmt_ids);
+    let tail = Some(body.expr(Expr::Lit(Lit::Int(None))));
+    let root = body.expr(Expr::Block { stmts: List { start, len: stmt_ids.len() as u32 }, tail, scope: ScopeId(0) });
+    Case { structs, params, body, root }
+}
+
+/// The world of `five_fields` with the five structs' records withheld.
+fn five_withheld(case: &Case) -> ToyWorld {
+    let mut w = world(case);
+    for k in 0..5u32 {
+        w.missing.push(Question::Adt(struct_key(k)));
+    }
+    w
+}
+
+/// Runs `case` over `w` until it is done, fetching each round's missing records; the rounds.
+fn rounds_to_done(case: &Case, w: &mut ToyWorld, plant: Plant) -> Result<(Checked<'static>, u32), String> {
+    let mut hints = Needs::new_in(Alloc::global());
+    for round in 1..=8u32 {
+        match run(case, w, &hints, plant) {
+            Ok(Outcome::Done(c)) => return Ok((c, round)),
+            Ok(Outcome::Need(n)) => {
+                let before = w.missing.len();
+                w.missing.retain(|q| !n.questions.contains(q));
+                if w.missing.len() == before {
+                    return Err(format!("round {round} needed nothing withheld: {:?}", n.questions));
+                }
+                hints = n;
+            }
+            Err(e) => return Err(format!("round {round} failed: {e}")),
+        }
+    }
+    Err(String::from("not done in 8 rounds"))
+}
+
+#[test]
+fn five_missing_records_come_back_in_one_round() {
+    let case = five_fields();
+    let w = five_withheld(&case);
+    let n = match run(&case, &w, &Needs::new_in(Alloc::global()), Plant::None) {
+        Ok(Outcome::Need(n)) => n,
+        Ok(Outcome::Done(c)) => panic!("a check over a world missing five records made a result: {c:?}"),
+        Err(e) => panic!("the first round failed: {e}"),
+    };
+    let named: Vec<Question, Global> = {
+        let mut v = Vec::new_in(Global);
+        v.extend(n.questions.iter().copied().filter(|q| w.missing.contains(q)));
+        v
+    };
+    assert_eq!(named.len(), 5, "the first round named {} of the 5 missing records: {:?}", named.len(), n.questions);
+    assert_eq!(&n.missing[..], &w.missing[..], "the holes are the five withheld records, sorted");
+    assert_eq!(n.first, Some(Question::Adt(struct_key(0))), "the first hole is the first field's struct");
+    let mut w = five_withheld(&case);
+    let (c, rounds) = match rounds_to_done(&case, &mut w, Plant::None) {
+        Ok(v) => v,
+        Err(e) => panic!("{e}"),
+    };
+    assert_eq!(rounds, 2, "five independent records took {rounds} rounds");
+    assert!(c.diags.is_empty(), "the second round was not clean: {:?}", c.diags);
+}
+
+/// No diagnostic leaves a run that met a hole; the control answers through the stand-ins,
+/// where a field of a struct whose record is a hole reads as no field.
+#[test]
+fn a_hole_never_makes_a_diagnostic() {
+    let case = five_fields();
+    let w = five_withheld(&case);
+    let first = |plant| run_holes(&case, &w, &Needs::new_in(Alloc::global()), plant);
+    match first(HolePlant::None) {
+        Ok(Outcome::Need(n)) => assert_eq!(n.missing.len(), 5),
+        Ok(Outcome::Done(c)) => panic!("a holed run made a result: {c:?}"),
+        Err(e) => panic!("a holed run failed: {e}"),
+    }
+    match first(HolePlant::AnswerThroughHoles) {
+        Ok(Outcome::Done(c)) => assert!(!c.diags.is_empty(), "the control made no diagnostic: the test shows nothing"),
+        Ok(Outcome::Need(n)) => panic!("the control still needed {:?}", n.missing),
+        Err(e) => panic!("the control failed: {e}"),
+    }
 }

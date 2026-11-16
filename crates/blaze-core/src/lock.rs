@@ -900,3 +900,42 @@ impl fmt::Debug for Signal {
         f.debug_struct("Signal").field("name", &self.name).finish()
     }
 }
+
+// --- The shared map's lock (decision D64) -----------------------------------------------------
+
+/// The lock blaze-hash's shared map takes for a shard's writers: this crate's [`Lock`], so a
+/// writer's wait is a named, recorded deadline wait. blaze-hash sits below this crate and cannot
+/// name it, so its map takes the lock as a type parameter and this is the one instantiation.
+pub enum MapLock {}
+
+// SAFETY: a `Lock` hands its value to one guard at a time, and its release happens before the
+// next acquire (the raw lock's Release unlock and Acquire lock).
+#[expect(unsafe_code, reason = "the shared map's lock contract (D64): `Lock` is a mutex")]
+unsafe impl blaze_hash::shared::ShardLock for MapLock {
+    type Lock<T> = Lock<T>;
+    type Guard<'a, T: 'a> = LockGuard<'a, T>;
+
+    fn new<T>(name: &'static str, value: T) -> Lock<T> {
+        Lock::new(name, value)
+    }
+
+    #[track_caller]
+    fn lock<T>(lock: &Lock<T>) -> LockGuard<'_, T> {
+        lock.lock()
+    }
+}
+
+/// A map of ordinary keys shared between threads (rule standard-structures): read with no lock,
+/// written under a shard's [`MapLock`]; made by `SharedMap::new_in(name, alloc)`, `name` saying
+/// what it holds. The `.clippy.toml` ban on `blaze_hash::SharedMap` keeps every other crate on
+/// this instantiation.
+#[expect(clippy::disallowed_types, reason = "the one instantiation of the shared map (D64)")]
+pub type SharedMap<K, V, A> = blaze_hash::SharedMap<K, V, A, MapLock>;
+
+/// A set shared between threads, as [`SharedMap`].
+#[expect(clippy::disallowed_types, reason = "the one instantiation of the shared set (D64)")]
+pub type SharedSet<K, A> = blaze_hash::SharedSet<K, A, MapLock>;
+
+/// A map on hashes shared between threads, indexed by the hash itself, as [`SharedMap`].
+#[expect(clippy::disallowed_types, reason = "the one instantiation of the shared map (D64)")]
+pub type SharedByHash<K, V, A> = blaze_hash::SharedByHash<K, V, A, MapLock>;

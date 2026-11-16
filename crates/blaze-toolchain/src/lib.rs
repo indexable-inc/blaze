@@ -9,7 +9,7 @@
 //!   trait the driver implements: sizes held to their limits before a byte is read, digests
 //!   checked once, a typed [`ToolchainError`] naming the digest and the folder looked in.
 //!
-//! The tool that cuts a toolchain from the tree is `src/bin/blaze-toolchain.rs`.
+//! The tool that cuts a toolchain from the tree is the script `scripts/src/bin/toolchain_cut.rs`.
 
 #![feature(allocator_api, register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]

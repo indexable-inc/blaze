@@ -483,7 +483,7 @@ fn ground_list(ground: &mut PortableTys<'_>, args: &[PTy], types: PTys<'_>) -> O
             PNode::Adt(k, l) => PNode::Adt(k, ground_of_list(ground, types, &map, l)?),
             PNode::FnDef(k, l) => PNode::FnDef(k, ground_of_list(ground, types, &map, l)?),
             PNode::FnPtr(l, h) => PNode::FnPtr(ground_of_list(ground, types, &map, l)?, h),
-            PNode::Closure(e, t) => PNode::Closure(e, *map.get(t.0 as usize)?),
+            PNode::Closure { owner, ordinal, args } => PNode::Closure { owner, ordinal, args: ground_of_list(ground, types, &map, args)? },
             PNode::Future(e, o, i) => PNode::Future(e, *map.get(o.0 as usize)?, *map.get(i.0 as usize)?),
             PNode::Alias { trait_, name, args } => PNode::Alias { trait_, name, args: ground_of_list(ground, types, &map, args)? },
             PNode::Opaque(k, l) => PNode::Opaque(k, ground_of_list(ground, types, &map, l)?),
@@ -853,7 +853,8 @@ pub fn build_new(files: &[SourceFile<'_>], root: &str, new: NewFront<'_>) -> Res
     let inputs = Inputs::new(&user, &tc).map_err(RunError::Crates)?;
     let crates = inputs.crates();
     let names = inputs.resolve(&crates).map_err(|e| RunError::Names { shown: std::format!("{e}").into_boxed_str() })?;
-    let mut program = Front2Program::new(&names, files).map_err(RunError::Front2)?;
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).map_err(|e| RunError::Names { shown: std::format!("the command's frame: {e}").into_boxed_str() })?;
+    let mut program = Front2Program::new(&names, &frame, files).map_err(RunError::Front2)?;
     build_with(&mut program).map_err(|error| match (appended, error.function_at()) {
         // A finding inside text the user never wrote is reported at `main`'s parameters.
         (Some(a), Some(at)) if at.file as usize == root_file && at.place >= a.user_len => RunError::Entry {

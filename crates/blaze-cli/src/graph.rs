@@ -192,10 +192,10 @@ pub fn target(cx: &Cx, env: &crate::fetch::FetchEnv<'_>, frame: &Frame) -> Resul
     if TRIPLE.is_empty() {
         return Err(CliError::Text { what: "this build's machine has no target triple the toolchain is cut for" });
     }
-    let (Some(start), Some(home)) = (env.start, env.home) else {
-        return Err(CliError::Text { what: "`PWD` or `HOME` is not set: the toolchain's shelf, which states the target's cfg, cannot be found" });
+    let Some(home) = env.home else {
+        return Err(CliError::Text { what: "`HOME` is not set: the toolchain's shelf, which states the target's cfg, cannot be found" });
     };
-    let mut shelf = crate::toolchain::HomeShelf::open(cx, &env.fs, start, home, frame).map_err(CliError::Shelf)?;
+    let mut shelf = crate::toolchain::HomeShelf::open(cx, &env.fs, home, frame).map_err(CliError::Shelf)?;
     let id = env.toolchain;
     let manifest = blaze_toolchain::shelf::open_manifest(&mut shelf, id).map_err(CliError::Toolchain)?;
     let view = blaze_toolchain::ToolchainView::open(manifest.as_ref(), id)

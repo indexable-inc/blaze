@@ -17,7 +17,8 @@
 use std::alloc::Global;
 use std::{hint::black_box, time::Instant};
 
-use blaze_hash::{SharedMap, shared::SHARED_BATCH};
+use blaze_core::SharedMap;
+use blaze_hash::shared::SHARED_BATCH;
 use blaze_hashcons::{Consed, HashCons};
 use blaze_ids::{Domain, Hasher};
 
@@ -140,7 +141,7 @@ fn main() {
         "table", "entries", "", "one", "4", "8", "16", "32", "64", "slice", "best/1", "/floor"
     );
     for n in [1_000u64, 100_000, 10_000_000] {
-        let map: SharedMap<u64, u64, Global> = SharedMap::new_in(Global);
+        let map: SharedMap<u64, u64, Global> = SharedMap::new_in("batch_cost", Global);
         {
             let pinned = map.pin();
             for at in 0..n {

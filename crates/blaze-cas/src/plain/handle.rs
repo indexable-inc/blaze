@@ -25,8 +25,7 @@ use std::{
     thread::ThreadId,
 };
 
-use blaze_core::{Driver, Mapping, Native, lock::Lock};
-use blaze_hash::SharedMap;
+use blaze_core::{Driver, Mapping, Native, SharedMap, lock::Lock};
 use blaze_keyed::{
     kind::{Key as KeyOf, Kind, Namespace, Tag},
     store::{Compacted, ENTRY, Generation, Put, Read, RootRef, Store, StoreError},
@@ -137,14 +136,14 @@ impl<D: Driver> PlainStore<D> {
         needles.extend(driven.core().needles().iter().cloned());
         let it = PlainStore {
             writer: Lock::new("store.plain.writer", driven),
-            table: SharedMap::new_in(Global),
+            table: SharedMap::new_in("store.plain.table", Global),
             len: AtomicUsize::new(0),
             reads,
             writes,
             needles,
-            lanes: SharedMap::new_in(Global),
+            lanes: SharedMap::new_in("store.plain.lanes", Global),
             next_lane: AtomicUsize::new(0),
-            by_thread: SharedMap::new_in(Global),
+            by_thread: SharedMap::new_in("store.plain.by_thread", Global),
             generation: AtomicU64::new(0),
             released: AtomicU64::new(0),
         };

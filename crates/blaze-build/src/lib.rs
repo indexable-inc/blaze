@@ -196,6 +196,7 @@ pub mod imports;
 pub mod instance;
 pub mod intrinsics;
 pub mod layout;
+mod normalize;
 #[cfg(any(test, feature = "testing"))]
 pub mod read_back;
 pub mod tls;
@@ -210,9 +211,9 @@ use core::fmt;
 use std::alloc::Global;
 
 use blaze_lir::{Func, VerifyError};
-use blaze_typeck::{Adt, BodyView, Checked, ExprId, FnSig, ItemKey, LangItem, Mutbl, PTy, PatId, PortableTys};
+use blaze_typeck::{Adt, BodyView, Checked, Expr, ExprId, FnSig, ItemKey, LangItem, List, Mutbl, PTy, PTys, PatId, PortableTys};
 
-pub use instance::{Instance, InstanceKey, ground, instance_key};
+pub use instance::{Instance, InstanceKey, ground, instance_key, instance_key_normalized};
 
 /// The instance being built: its generic arguments, types of `ground`, the program's one table
 /// of ground types. Every type the build lays out is first carried into `ground` with each
@@ -248,7 +249,16 @@ pub trait Adts {
         None
     }
 
-    /// The bytes of byte string literal `expr` of the body of `owner`.
+    /// The bits of float literal `expr` of the body of `owner` at its type (an `f32`'s in the
+    /// low 32), the literal's text rounded to the nearest value of the type (the Reference,
+    /// "Floating-point literal expressions").
+    fn float_lit(&self, owner: ItemKey, expr: ExprId) -> Option<u128> {
+        let _ = (owner, expr);
+        None
+    }
+
+    /// The bytes of byte string literal `expr` of the body of `owner` (of a C string literal,
+    /// its bytes without the nul).
     fn byte_str(&self, owner: ItemKey, expr: ExprId) -> Option<&[u8]> {
         let _ = (owner, expr);
         None
@@ -258,6 +268,15 @@ pub trait Adts {
     /// declares it. The build refuses a use of an absent one with [`BuildError::NoLangFn`].
     fn lang_fn(&self, name: &str) -> Option<ItemKey> {
         let _ = name;
+        None
+    }
+
+    /// The trait method `which` names (`Fn::call`, `FnMut::call_mut`, `FnOnce::call_once`): a
+    /// closure's body is the instance of its kind's at `[closure, (args..)]`, and a direct call
+    /// of a closure calls it (codegen.md, "Closures and the Fn traits"). With no answer the
+    /// call is refused with [`BuildError::NoLangFn`] naming `call`, `call_mut` or `call_once`.
+    fn fn_trait_method(&self, which: FnTrait) -> Option<ItemKey> {
+        let _ = which;
         None
     }
 
@@ -370,6 +389,41 @@ pub enum Abi {
     RustCall,
 }
 
+/// The `Fn*` trait a closure is called through, weakest bound first: a closure's kind is the
+/// strongest its captures need (codegen.md, "Closures and the Fn traits"). The builder's own
+/// until the checker records and exports its kind (one home then: the checker's).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash)]
+pub enum FnTrait {
+    /// `Fn::call(&self, args)`.
+    Fn = 0,
+    /// `FnMut::call_mut(&mut self, args)`.
+    FnMut = 1,
+    /// `FnOnce::call_once(self, args)`.
+    FnOnce = 2,
+}
+
+/// A closure's identity, read from its ground type (typeck.md, "A closure's identity"): what
+/// names the instances of its `Fn*` methods across bodies. Its kind, signature and environment
+/// are facts of it ([`layout::LayoutFacts::closure`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ClosureOf {
+    /// The owner fn item whose body the closure is written in.
+    pub owner: ItemKey,
+    /// The owner's instance: its ground generic arguments.
+    pub owner_args: List,
+    /// Its position among the owner body's closures in expression order (typeck.md, "A
+    /// closure's identity"): no handle local to one body.
+    pub ordinal: u32,
+}
+
+/// Ground type `ty` as a closure, or `None`.
+pub fn closure_of(ground: PTys<'_>, ty: PTy) -> Option<ClosureOf> {
+    match ground.node(ty).ok()? {
+        blaze_typeck::PNode::Closure { owner, ordinal, args } => Some(ClosureOf { owner, owner_args: args, ordinal }),
+        _ => None,
+    }
+}
+
 /// One built function.
 pub struct Built<A: Allocator> {
     /// The function, verified.
@@ -423,6 +477,10 @@ pub enum BuildError {
     /// A type names ADT `adt`, which [`Adts::adt`] does not describe: the seam tabled no row
     /// for it. The key is kept so the caller can name the ADT by its path.
     NoAdt { adt: ItemKey },
+    /// The projection `<_ as trait_>::name` met at an instance was not normalized: the
+    /// solver ([`layout::LayoutFacts::normalize`]) gave no answer, or its answers did not settle
+    /// within a bounded count (normalize.rs).
+    Projection { trait_: ItemKey, name: blaze_typeck::Name },
     /// Intrinsic call `expr` of `which` was not built: its arguments are not of the
     /// intrinsic's signature, or (`unsupported`) a use blaze does not build yet, named by `why`.
     Intrinsic { expr: ExprId, which: intrinsics::Which, why: &'static str, unsupported: bool },
@@ -477,6 +535,11 @@ impl fmt::Display for BuildError {
             BuildError::NoAdt { adt } => {
                 write!(f, "a type names ADT {:#x}, which the build's `Adts` does not describe", adt.0)
             }
+            BuildError::Projection { trait_, name } => write!(
+                f,
+                "the associated type {:#x} of trait {:#x} at this instance was not normalized by the seam's `normalize`",
+                name.0, trait_.0
+            ),
             BuildError::Intrinsic { expr, which, why, unsupported: false } => {
                 write!(f, "expression {}: intrinsic `{}`: {why}", expr.0, which.entry().name)
             }
@@ -513,6 +576,34 @@ pub fn build<A: Allocator + Clone>(
         return Err(BuildError::Malformed { what: "an instance whose argument count is not its fn's generic count" });
     }
     walk::build(body, checked, sig, subst, adts, walk::Kind::Body, alloc)
+}
+
+/// Builds the instance of trait method `which` at the `ordinal`-th closure written in `body`
+/// (the owner's, checked once as `checked`), at the owner's instance `subst` names: `Fn::call`,
+/// `FnMut::call_mut` or `FnOnce::call_once` at `[closure, (args..)]` (codegen.md, "Closures
+/// and the Fn traits"): the closure's body when `which` is its kind, a thin entry over the body
+/// when weaker. The caller finds the owner, its arguments and the ordinal from the closure's
+/// ground type ([`closure_of`]) and `which` from the instance's item.
+pub fn build_closure<A: Allocator + Clone>(
+    body: &BodyView<'_>,
+    checked: &Checked<'_>,
+    ordinal: u32,
+    which: FnTrait,
+    sig: &FnSig<'_>,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    alloc: A,
+) -> Result<Built<A>, BuildError> {
+    if !checked.diags.is_empty() {
+        return Err(BuildError::Diagnostics { count: u32::try_from(checked.diags.len()).unwrap_or(u32::MAX) });
+    }
+    let closure = walk::closures_in(body).find(|c| c.0 == ordinal).map(|c| c.1).ok_or(BuildError::Malformed { what: "a closure ordinal past its owner body's closures" })?;
+    let Some(Expr::Closure { params, body: root, .. }) = body.exprs.get(closure.ix()).copied() else {
+        return Err(BuildError::Malformed { what: "a closure body asked of an expression that is not a closure" });
+    };
+    let params = body.pat_lists.get(params.range()).ok_or(BuildError::Malformed { what: "a closure's parameters past `pat_lists`" })?;
+    let view = BodyView { params, root, ..*body };
+    walk::build(&view, checked, sig, subst, adts, walk::Kind::Closure(closure, which), alloc)
 }
 
 /// What the instance `subst` names of `body` reads of trait shapes, before it is built: its

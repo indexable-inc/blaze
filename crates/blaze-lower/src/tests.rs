@@ -28,7 +28,7 @@ impl Cfg for Unix {
 }
 
 fn body(text: &str) -> Lowered<'static, '_> {
-    match lower_body(text, Edition::E2024, &mut Unix, Alloc::global()) {
+    match lower_body(text, Edition::E2024, &mut Unix, &mut crate::NoModule, Alloc::global()) {
         Ok(l) => l,
         Err(need) => panic!("{text}: needs {:?}", need.atoms),
     }
@@ -481,7 +481,7 @@ const NOISE: &[&str] = &["\n", "// a comment\n", "    ", "/* a block */", "fn no
 
 fn records(text: &str) -> StdVec<(ContentId, What, StdVec<u8>)> {
     let mut sink = Collect(StdVec::new());
-    lower_file(text, Edition::E2024, &mut Unix, &mut NoMacros, &mut sink, Alloc::global());
+    lower_file(text, Edition::E2024, &mut Unix, &mut crate::NoModule, &mut NoMacros, &mut sink, Alloc::global());
     sink.0
 }
 
@@ -548,7 +548,8 @@ fn deep(text: &str) -> usize {
                 let pe = crate::parser_edition(Edition::E2024);
                 let lexed = parser::LexedStr::new(pe, text);
                 let mut cfg = Unix;
-                let mut m = crate::machine::Machine::new(text, crate::Mode::Body, Edition::E2024, &mut cfg, Alloc::global());
+                let mut module = crate::NoModule;
+                let mut m = crate::machine::Machine::new(text, crate::Mode::Body, Edition::E2024, &mut cfg, Some(&mut module), Alloc::global());
                 crate::feed::feed_steps(&mut m, &lexed, steps.into_iter(), 0);
                 let l = m.finish().unwrap_or_else(|_| panic!("no cfg in it"));
                 let mut out = String::new();
@@ -780,4 +781,102 @@ fn a_rest_in_a_tuple_or_struct_pattern_converts() {
     ] {
         assert_eq!(convert(text), Ok(()), "{text}");
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Identifier patterns
+
+/// A module around the body: `MCall` a unit struct, `None` and `A`/`B` unit variants (the
+/// prelude's, a glob's), `LIMIT` a constant, `ST` a static, `Tup` a tuple struct.
+struct Module;
+
+impl crate::ValueNames for Module {
+    fn value_name(&mut self, name: &str) -> crate::ValueName {
+        use crate::ValueName as V;
+        match name {
+            "MCall" => V::UnitStruct,
+            "None" | "A" | "B" => V::UnitVariant,
+            "LIMIT" => V::Const,
+            "ST" => V::Static,
+            "Tup" => V::TupleCtor,
+            _ => V::Nothing,
+        }
+    }
+}
+
+fn body_in<'t>(text: &'t str, values: &mut dyn crate::ValueNames) -> Lowered<'static, 't> {
+    match lower_body(text, Edition::E2024, &mut Unix, values, Alloc::global()) {
+        Ok(l) => l,
+        Err(need) => panic!("{text}: needs {:?}", need.atoms),
+    }
+}
+
+/// The Reference, "Identifier patterns": "Path patterns take precedence over identifier
+/// patterns": an identifier pattern with no `ref`, `mut` or `@` that names a constant, a unit
+/// struct or a unit variant in scope is a path pattern, and the arm's use of the name is that
+/// path; "It is an error if identifier patterns ... shadow ... statics" and tuple structs or
+/// tuple variants (rustc E0530), and a `ref`, `mut` or `@` binding of any of them is one too.
+/// Each case: (body, name, binds, uses the binding, PatternShadows errors).
+#[test]
+fn identifier_patterns_are_paths_where_the_name_is_one() {
+    let cases: [(&str, &str, usize, usize, usize); 11] = [
+        ("fn f(x: MCall) -> MCall { match x { MCall => MCall } }", "MCall", 0, 0, 0),
+        ("fn f(o: Option<u8>) -> u8 { match o { None => 0, Some(v) => v } }", "None", 0, 0, 0),
+        ("fn f(e: E) -> u8 { match e { A => 1, B => 2 } }", "B", 0, 0, 0),
+        ("fn f(n: u8) -> u8 { match n { LIMIT => 1, _ => 0 } }", "LIMIT", 0, 0, 0),
+        ("fn f(n: u8) -> u8 { const LOCAL: u8 = 4; match n { LOCAL => 1, _ => 0 } }", "LOCAL", 0, 0, 0),
+        ("fn f(x: &MCall) -> MCall { let MCall = x; MCall }", "MCall", 0, 0, 0),
+        ("fn f(MCall: MCall) -> MCall { MCall }", "MCall", 0, 0, 0),
+        ("fn f(n: u8) -> u8 { match n { other => other } }", "other", 1, 1, 0),
+        ("fn f(x: MCall) -> u8 { match x { ref MCall => 0 } }", "MCall", 1, 0, 1),
+        ("fn f(n: u8) -> u8 { match n { ST => 0, _ => 1 } }", "ST", 1, 0, 1),
+        ("fn f(t: Tup) -> u8 { match t { Tup => 0 } }", "Tup", 1, 0, 1),
+    ];
+    let mut wrong = StdVec::new();
+    for (text, name, want_binds, want_uses, want_errors) in cases {
+        let l = body_in(text, &mut Module);
+        let v = l.view();
+        let bound = binds(&v, name);
+        // A use of a name made a path pattern would point at a non-binding: counted as a use.
+        let uses = locals(&v).iter().filter(|p| bound.contains(p) || !matches!(v.pat(**p), Ok(Pat::Bind { .. }))).count();
+        let errors = v.diags().filter(|d| matches!(d, Ok(d) if d.kind == DiagKind::PatternShadows)).count();
+        let paths = (0..v.pats.len() as u32).filter(|p| matches!(v.pat(PatId(*p)), Ok(Pat::Path(_)))).count();
+        let got = (bound.len(), uses, errors);
+        std::eprintln!("CASE {text}: binds {}, uses of the binding {uses}, PatternShadows {errors}, path patterns {paths}", bound.len());
+        if got != (want_binds, want_uses, want_errors) {
+            wrong.push(format!("{text}: got {got:?}, want {:?}", (want_binds, want_uses, want_errors)));
+        }
+    }
+    assert!(wrong.is_empty(), "identifier patterns lowered wrong:\n{}", wrong.join("\n"));
+}
+
+/// A module whose `LIMIT` is a constant or not, as a test asks.
+struct Limit(bool);
+
+impl crate::ValueNames for Limit {
+    fn value_name(&mut self, name: &str) -> crate::ValueName {
+        if self.0 && name == "LIMIT" { crate::ValueName::Const } else { crate::ValueName::Nothing }
+    }
+}
+
+/// Each module answer is in the record's read list: lowered while `LIMIT` names nothing, the
+/// body binds it; once `LIMIT` is a constant the read list no longer holds, and the body
+/// lowered again holds a path pattern and no binding.
+#[test]
+fn a_binding_that_becomes_a_constant_is_lowered_again() {
+    let text = "fn f(n: u8) -> u8 { match n { LIMIT => LIMIT } }";
+    let before = body_in(text, &mut Limit(false));
+    let v = before.view();
+    assert_eq!(binds(&v, "LIMIT").len(), 1, "no constant: a binding");
+    assert_eq!(crate::value_reads_hold(&v, &mut Limit(false)), Ok(true), "the same world: the record holds");
+    assert_eq!(crate::value_reads_hold(&v, &mut Limit(true)), Ok(false), "`LIMIT` became a constant: lowered again");
+    let after = body_in(text, &mut Limit(true));
+    let v = after.view();
+    assert_eq!(binds(&v, "LIMIT").len(), 0, "a constant: no binding");
+    let paths = (0..v.pats.len() as u32).filter(|p| matches!(v.pat(PatId(*p)), Ok(Pat::Path(_)))).count();
+    assert_eq!(paths, 1, "a path pattern");
+    // `match n` is the one local left; the arm's `LIMIT` is the constant's path.
+    assert!(locals(&v).iter().all(|p| matches!(v.pat(*p), Ok(Pat::Bind { .. }))), "every local is a binding");
+    assert_eq!(locals(&v).len(), 1, "`n` alone: the arm's `LIMIT` is no local");
+    assert_eq!(crate::value_reads_hold(&v, &mut Limit(true)), Ok(true));
 }

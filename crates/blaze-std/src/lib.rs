@@ -315,10 +315,8 @@ pub mod map {
     /// Sorted by key, with range queries: `alloc`'s B-tree, which takes its allocator on this
     /// nightly (`SortedMap::new_in(alloc)`).
     pub use alloc::collections::BTreeMap as SortedMap;
-    pub use blaze_hash::{
-        ByHash, Equivalent, HashMap, IndexMap, KeyedMap, OrderMap, SharedByHash,
-        SharedMap, hash_map::Entry,
-    };
+    pub use blaze_core::{SharedByHash, SharedMap};
+    pub use blaze_hash::{ByHash, Equivalent, HashMap, IndexMap, KeyedMap, OrderMap, hash_map::Entry};
     pub use blaze_hashcons::{Consed as Content, ContentMap, Mismatch, content_of};
 }
 
@@ -326,7 +324,8 @@ pub mod map {
 pub mod set {
     /// Sorted, with range queries: `alloc`'s B-tree set, in a named allocator.
     pub use alloc::collections::BTreeSet as SortedSet;
-    pub use blaze_hash::{ByHashSet, HashSet, IndexSet, KeyedSet, OrderSet, SharedSet};
+    pub use blaze_core::SharedSet;
+    pub use blaze_hash::{ByHashSet, HashSet, IndexSet, KeyedSet, OrderSet};
 }
 
 /// The hashers behind [`map`] and [`set`]: the fixed seed, the identity hasher for keys that are

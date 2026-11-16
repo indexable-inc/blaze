@@ -93,14 +93,12 @@ fn kind_of(q: &Question) -> usize {
         Question::TraitDef(_) => 14,
         Question::AssocParent(_) => 15,
         Question::ConstHolds(..) => 16,
-        Question::ConstParams(_) => 17,
-        Question::Closure(..) => 18,
-    }
+        Question::ConstParams(_) => 17,    }
 }
 
 const KIND_NAMES: [&str; KINDS] = [
     "FnSig", "Predicates", "Adt", "ImplsOf", "ImplHeader", "Inherent", "AssocItem", "TraitsInScope", "Path", "Lang",
-    "LangPath", "Const", "Opaque", "Attrs", "TraitDef", "AssocParent", "ConstHolds", "ConstParams", "Closure", "prefetch",
+    "LangPath", "Const", "Opaque", "Attrs", "TraitDef", "AssocParent", "ConstHolds", "ConstParams", "prefetch", "Closure",
 ];
 
 struct Tally {
@@ -166,9 +164,8 @@ impl<W: World> World for Timed<'_, W> {
         self.time(12, || self.inner.opaque_hidden(seal, item))
     }
     fn closure(&self, seal: Seal, owner: ItemKey, ordinal: u32) -> Fetch<Option<blaze_typeck::ClosureFacts<'_>>> {
-        self.time(18, || self.inner.closure(seal, owner, ordinal))
-    }
-    fn attrs(&self, seal: Seal, item: ItemKey) -> Fetch<TypeAttrs> {
+        self.time(19, || self.inner.closure(seal, owner, ordinal))
+    }    fn attrs(&self, seal: Seal, item: ItemKey) -> Fetch<TypeAttrs> {
         self.time(13, || self.inner.attrs(seal, item))
     }
     fn trait_def(&self, seal: Seal, trait_: ItemKey) -> Fetch<Option<TraitDef<'_>>> {
@@ -190,7 +187,7 @@ impl<W: World> World for Timed<'_, W> {
         self.time(17, || self.inner.const_params(seal, item))
     }
     fn prefetch(&self, seal: Seal, questions: &[Question]) {
-        self.time(19,|| self.inner.prefetch(seal, questions))
+        self.time(18,|| self.inner.prefetch(seal, questions))
     }
 }
 
@@ -878,8 +875,7 @@ impl World for Empty {
     }
     fn closure(&self, _: Seal, _: ItemKey, _: u32) -> Fetch<Option<blaze_typeck::ClosureFacts<'_>>> {
         Ok(None)
-    }
-    fn attrs(&self, _: Seal, _: ItemKey) -> Fetch<TypeAttrs> {
+    }    fn attrs(&self, _: Seal, _: ItemKey) -> Fetch<TypeAttrs> {
         Ok(TypeAttrs::default())
     }
     fn trait_def(&self, _: Seal, _: ItemKey) -> Fetch<Option<TraitDef<'_>>> {
@@ -924,7 +920,7 @@ fn forms_file(rel: &str, text: &str, rules: &'static [(&'static str, blaze_expan
         let Some(item_text) = text.get(base..item.range.end as usize) else { continue };
         let place = format!("{rel}:{}", line_of(text, base));
         let mut by_name = blaze_lower::by_name::ByName::new(rules, body_def_at(), BodyHost, alloc);
-        let Ok(lowered) = blaze_lower::lower_body_expanding(item_text, EDITION, &mut HostCfg, &mut by_name, alloc) else {
+        let Ok(lowered) = blaze_lower::lower_body_expanding(item_text, EDITION, &mut HostCfg, &mut blaze_lower::NoModule, &mut by_name, alloc) else {
             out.census.body(&[("lower: a cfg atom left unanswered".to_string(), place)]);
             continue;
         };

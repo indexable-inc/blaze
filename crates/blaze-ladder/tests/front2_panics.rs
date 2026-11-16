@@ -72,8 +72,9 @@ fn panics_through_front2() {
     let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let core_ix = crates.iter().position(|c| c.name == "core").expect("core among the crates");
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
-    let mut front = Front2::new(&names, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
-    let mut store = Store::new(front.index.lang("sized"));
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
+        let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame);
     let find = |krate: usize, segments: &[&str]| {
         names::path(&names, names.root(krate), Namespace::Values, Written { kind: PathKind::Plain, segments }, Alloc::global())
             .ok()

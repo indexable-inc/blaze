@@ -1052,10 +1052,10 @@ impl Expr {
 pub enum Pat {
     Missing,
     Wild,
-    /// `shadows` is the binding of the same name this one hides where it comes into scope;
-    /// `candidate` that it is a bare name, which the resolution step turns into a
-    /// [`Pat::Path`] when the name is a constant, a unit struct or a unit variant.
-    Bind { ann: BindAnn, name: NameIdx, sub: Option<PatId>, shadows: Option<PatId>, candidate: bool },
+    /// `shadows` is the binding of the same name this one hides where it comes into scope. A
+    /// bare name that is a constant, a unit struct or a unit variant is never one: the
+    /// lowering writes it as a [`Pat::Path`] (machine.rs `settle_patterns`).
+    Bind { ann: BindAnn, name: NameIdx, sub: Option<PatId>, shadows: Option<PatId> },
     /// `rest` the position of `..`, if any; `elems` in `ids`.
     Tuple { elems: List, rest: Option<u32> },
     Ref { mutbl: Mutbl, inner: PatId },
@@ -1106,11 +1106,11 @@ impl Pat {
         match self {
             P::Missing => n(0),
             P::Wild => n(1),
-            P::Bind { ann, name, sub, shadows, candidate } => Node {
+            P::Bind { ann, name, sub, shadows } => Node {
                 a: name.0,
                 b: opt(sub.map(|p| p.0)),
                 c: opt(shadows.map(|p| p.0)),
-                ..n(2).with(ann_bits(ann) | (candidate as u16) << 3)
+                ..n(2).with(ann_bits(ann))
             },
             P::Tuple { elems, rest } => Node { a: elems.start, b: elems.len, c: opt(rest), ..n(3) },
             P::Ref { mutbl, inner } => Node { a: inner.0, ..n(4).with(mut_bit(mutbl)) },
@@ -1151,7 +1151,6 @@ impl Pat {
                 name: NameIdx(n.a),
                 sub: unopt(n.b).map(PatId),
                 shadows: unopt(n.c).map(PatId),
-                candidate: n.flags & (1 << 3) != 0,
             },
             3 => P::Tuple { elems: list(n.a, n.b), rest: unopt(n.c) },
             4 => P::Ref { mutbl: mutbl(n.flags & 1 != 0), inner: PatId(n.a) },
@@ -1962,6 +1961,11 @@ pub enum DiagKind {
     /// Reference, "Destructuring assignments"; rustc: "functional record updates are not
     /// allowed in destructuring assignments"), at the base.
     FruInDestructuringAssignment,
+    /// An identifier pattern that may not bind its name (E0530), at the name: a bare name of a
+    /// static, a tuple struct or a tuple variant, or a `ref`, `mut` or `@` binding of any of
+    /// those or of a constant, a unit struct or a unit variant (the Reference, "Identifier
+    /// patterns"; rustc: "match bindings cannot shadow statics").
+    PatternShadows,
 }
 
 /// A diagnostic, at a range of the record (its position: [`crate::View::site`]).
@@ -1971,7 +1975,7 @@ pub struct Diag {
     pub range: BodyRange,
 }
 
-const DIAG_KINDS: [DiagKind; 9] = [
+const DIAG_KINDS: [DiagKind; 10] = [
     DiagKind::Syntax,
     DiagKind::BreakOutsideLoop,
     DiagKind::UndeclaredLabel,
@@ -1981,6 +1985,7 @@ const DIAG_KINDS: [DiagKind; 9] = [
     DiagKind::InclusiveRangeNoEnd,
     DiagKind::FormatArgMissing,
     DiagKind::FruInDestructuringAssignment,
+    DiagKind::PatternShadows,
 ];
 
 impl Diag {

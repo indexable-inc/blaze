@@ -57,6 +57,8 @@ blaze-build-script.workspace = true
 # `run::refusals`: names, check, build and emit of one small program, for the `extensions`
 # example's probe of each language extension. By path, as blaze-lower.
 blaze-ladder = { path = "../blaze-ladder" }
+# The frame `Front2::new` keeps a body's local items in (tempo_front).
+blaze-mem.workspace = true
 
 [lints]
 workspace = true

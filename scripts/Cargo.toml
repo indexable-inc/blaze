@@ -27,6 +27,12 @@ blaze-text.workspace = true
 blaze-own = { workspace = true, features = ["std"] }
 blaze-lex.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }
+# toolchain_cut: the toolchain record it writes and the reader it checks against; the sysroot's
+# units (blaze-unit-graph), the layouts and lockfiles it resolves (blaze-manifest), and editions.
+blaze-toolchain.workspace = true
+blaze-unit-graph.workspace = true
+blaze-manifest = { workspace = true, default-features = false }
+edition.workspace = true
 
 [lints]
 workspace = true

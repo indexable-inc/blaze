@@ -11,11 +11,12 @@
 //! function of the questions asked, never of the order a worker asked them in.
 
 use core::fmt::{self, Debug};
-use std::sync::Mutex;
+use core::ptr;
+use core::sync::atomic::{AtomicPtr, Ordering};
 
 use blaze_hash::HashMap;
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
-use blaze_own::{AVec, Alloc};
+use blaze_own::{AVec, Alloc, Box};
 use blaze_surface::{Binding, Namespace};
 
 use crate::crate_scope::{Dep, DepScope};
@@ -132,22 +133,60 @@ pub(crate) mod plant {
     }
 }
 
-/// The questions one solve asks, from every worker of its fill.
-pub(crate) struct Asked<'a> {
-    list: Mutex<AVec<'a, Question<'a>>>,
+/// One question in [`Asked`]'s list, in the solve's arena.
+struct AskedNode<'a> {
+    question: Question<'a>,
+    next: *mut AskedNode<'a>,
 }
+
+/// The questions one solve asks, from every worker of its fill: a push-only list with no lock.
+/// A worker writes its node in the arena, then publishes it with one compare-exchange on the
+/// head; nothing is ever removed while workers push, so the head can only grow (no ABA). The
+/// order of the list is the order of the exchanges, which is a worker's: the record boundary
+/// ([`encode`]) sorts and dedups it, so the bytes are a function of the questions alone.
+pub(crate) struct Asked<'a> {
+    head: AtomicPtr<AskedNode<'a>>,
+    alloc: Alloc<'a>,
+}
+
+// SAFETY: a node is reached only through `head`; it is written once by the pushing worker before
+// the `Release` exchange publishes it and only read after, in `take`, which owns the list (every
+// pushing borrow has ended; the fill joined its workers). A `Question` is plain keys and arena
+// `&str`, safe to read from another thread.
+unsafe impl Sync for Asked<'_> {}
+// SAFETY: as for `Sync`: the nodes are arena memory of `'a`, owned by no thread.
+unsafe impl Send for Asked<'_> {}
 
 impl<'a> Asked<'a> {
     pub(crate) fn new_in(alloc: Alloc<'a>) -> Asked<'a> {
-        Asked { list: Mutex::new(AVec::new_in(alloc)) }
+        Asked { head: AtomicPtr::new(ptr::null_mut()), alloc }
     }
 
     pub(crate) fn push(&self, question: Question<'a>) {
-        self.list.lock().unwrap_or_else(|p| panic!("the asked list's lock was poisoned: {p}")).push(question);
+        let node: *mut AskedNode<'a> = Box::leak(Box::new_in(AskedNode { question, next: ptr::null_mut() }, self.alloc));
+        let mut head = self.head.load(Ordering::Acquire);
+        loop {
+            // SAFETY: `node` is this worker's alone until the exchange below publishes it.
+            unsafe { (*node).next = head };
+            match self.head.compare_exchange_weak(head, node, Ordering::Release, Ordering::Acquire) {
+                Ok(_) => return,
+                Err(now) => head = now,
+            }
+        }
     }
 
+    /// Every question pushed, in no particular order ([`encode`] sorts them).
     pub(crate) fn take(self) -> AVec<'a, Question<'a>> {
-        self.list.into_inner().unwrap_or_else(|p| panic!("the asked list's lock was poisoned: {p}"))
+        let mut out = AVec::new_in(self.alloc);
+        let mut at = self.head.into_inner();
+        while !at.is_null() {
+            // SAFETY: every non-null pointer in the list is a published node of the arena `'a`,
+            // written before its `Release` publish; `self` is owned here, so no push races.
+            let node = unsafe { &*at };
+            out.push(node.question);
+            at = node.next;
+        }
+        out
     }
 }
 

@@ -45,12 +45,11 @@ pub enum PNode {
     FnDef(ItemKey, List),
     /// A fn pointer: the inputs, then the output last; its ABI and safety.
     FnPtr(List, FnPtrHeader),
-    /// A closure type (the Reference, "Closure types": each closure expression has a unique
-    /// anonymous type): the item whose body holds the expression, the closure's ordinal among
-    /// that body's closures in expression order, and the owner's generic arguments in scope
-    /// (`Param(0..n)` in its own record). Its signature, kind and captures are facts of the
-    /// owner's `Checked::closures`, asked as `Question::Closure` (typeck.md, "A closure's
-    /// identity"); never part of the type.
+    /// A closure (the Reference, "Closure types": each closure expression has its own type):
+    /// `owner` the item whose body holds the expression, `ordinal` its index among that body's
+    /// closure expressions in `ExprId` order, `args` the owner's generic arguments in scope
+    /// (`Param(0..n)` in the owner's own record). Its signature and kind are facts, not
+    /// identity: the owner's `Checked::closures[ordinal]`, `Question::Closure` from elsewhere.
     Closure { owner: ItemKey, ordinal: u32, args: List },
     /// An async block's future, by its expression: its output and its interior
     /// (`TyView::Future`).

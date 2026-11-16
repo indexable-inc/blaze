@@ -111,8 +111,9 @@ fn clones_through_front2() {
     let crates = inputs.crates();
     let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
-    let mut front = Front2::new(&names, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
-    let mut store = Store::new(front.index.lang("sized"));
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
+        let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame);
     let find = |krate: usize, segments: &[&str]| {
         names::path(&names, names.root(krate), Namespace::Values, Written { kind: PathKind::Plain, segments }, Alloc::global())
             .ok()
@@ -211,7 +212,39 @@ pub enum Calls {
     N(NCall),
 }
 fn by_hand(a: &MCall) -> MCall { match a { MCall => MCall } }
+pub enum E { A, B }
+use E::*;
+const LIMIT: u8 = 3;
+static ST: u8 = 1;
+pub struct Tup(pub u8);
+fn prelude(o: Option<u8>) -> u8 { match o { None => 0, Some(v) => v } }
+fn glob(e: E) -> u8 { match e { A => 1, B => 2 } }
+fn module_const(n: u8) -> u8 { match n { LIMIT => 1, _ => 0 } }
+fn local_const(n: u8) -> u8 { const LOCAL: u8 = 4; match n { LOCAL => 1, _ => 0 } }
+fn let_unit(x: &MCall) -> MCall { let MCall = x; MCall }
+fn param_unit(MCall: MCall) -> MCall { MCall }
+fn ordinary(n: u8) -> u8 { match n { other => other } }
+fn ref_unit(x: MCall) -> u8 { match x { ref MCall => 0 } }
+fn static_pat(n: u8) -> u8 { match n { ST => 0, _ => 1 } }
+fn tuple_pat(t: Tup) -> u8 { match t { Tup => 0 } }
 ";
+
+/// Each case of the Reference's "Identifier patterns" rule, by the fn that writes it, with what
+/// its body must give: `Ok(binds)` (checks clean; `binds` whether a binding of the case's name is
+/// left in the record) or `Err(())` (a lowering error, E0530).
+const CASES: [(&str, &str, Result<bool, ()>); 11] = [
+    ("by_hand", "MCall", Ok(false)),
+    ("prelude", "None", Ok(false)),
+    ("glob", "A", Ok(false)),
+    ("module_const", "LIMIT", Ok(false)),
+    ("local_const", "LOCAL", Ok(false)),
+    ("let_unit", "MCall", Ok(false)),
+    ("param_unit", "MCall", Ok(false)),
+    ("ordinary", "other", Ok(true)),
+    ("ref_unit", "MCall", Err(())),
+    ("static_pat", "ST", Err(())),
+    ("tuple_pat", "Tup", Err(())),
+];
 
 /// The Reference, "Identifier patterns": "Path patterns take precedence over identifier
 /// patterns"; "Path patterns": a path to a unit struct is a pattern, and it matches through a
@@ -234,19 +267,51 @@ fn unit_struct_patterns_through_front2() {
     let crates = inputs.crates();
     let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: UNIT }];
-    let mut front = Front2::new(&names, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
-    let mut store = Store::new(front.index.lang("sized"));
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
+        let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame);
     let prepared = Prepares::new_in(Alloc::global());
     let mut buckets = None;
     let mut notes: Vec<String> = Vec::new();
     let mut bodies = Vec::new();
-    let key = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &["by_hand"] }, Alloc::global())
-        .ok()
-        .and_then(|f| f.whole(1))
-        .map(|d| d.key)
-        .expect("`by_hand` from the crate's root");
-    store.ensure(&names, &mut front.keys, Want::Fn(key)).unwrap_or_else(|e| panic!("by_hand: no head: {e:?}"));
-    bodies.push(("by_hand".to_string(), lower_fn(&names, prepared, &mut front.keys, &mut store, key).unwrap_or_else(|e| panic!("by_hand: {e}"))));
+    let mut outcomes: Vec<String> = Vec::new();
+    for (f, bound, want) in CASES {
+        let key = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &[f] }, Alloc::global())
+            .ok()
+            .and_then(|found| found.whole(1))
+            .map(|d| d.key)
+            .unwrap_or_else(|| panic!("`{f}` from the crate's root"));
+        store.ensure(&names, &mut front.keys, Want::Fn(key)).unwrap_or_else(|e| panic!("{f}: no head: {e:?}"));
+        let got: Result<bool, String> = match lower_fn(&names, prepared, &mut front.keys, &mut store, key) {
+            Err(e) => Err(format!("{e:?}")),
+            Ok(body) => {
+                let view = body.lowered.view();
+                let binds = (0..view.pats.len()).any(|i| {
+                    matches!(view.pat(blaze_lower::PatId(i as u32)), Ok(blaze_lower::Pat::Bind { name, .. }) if view.name_text(name) == Ok(bound))
+                });
+                let spell = Spelling::of(&view).expect("spelling");
+                let scope = body.scope(&spell);
+                let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: None };
+                match check_body(&mut records, &body, &scope) {
+                    Ok(done) if done.diags.is_empty() => Ok(binds),
+                    Ok(done) => Err(format!("binds {bound}: {binds}; Ok with {} diagnostics", done.diags.len())),
+                    Err(CheckFail::Diags { diags, .. }) => Err(format!("binds {bound}: {binds}; diagnostics {diags:?}")),
+                    Err(other) => Err(format!("binds {bound}: {binds}; {other:?}")),
+                }
+            }
+        };
+        let line = format!("{f}: {got:?}");
+        eprintln!("CASE {line}");
+        let right = match (&got, want) {
+            (Ok(b), Ok(w)) => *b == w,
+            (Err(e), Err(())) => e.contains("PatternShadows"),
+            _ => false,
+        };
+        if !right {
+            outcomes.push(line);
+        }
+    }
+    assert!(outcomes.is_empty(), "identifier patterns that are wrong:\n{}", outcomes.join("\n"));
     for (k, _, _) in names.items(0) {
         let Some(header) = names.item_text(k).and_then(|t| t.impl_header) else { continue };
         store.ensure(&names, &mut front.keys, Want::Impl(k)).unwrap_or_else(|e| panic!("impl `{header}`: no head: {e:?}"));
@@ -254,7 +319,7 @@ fn unit_struct_patterns_through_front2() {
         let b = lower_member(&names, prepared, &mut front.keys, &mut store, mk).unwrap_or_else(|e| panic!("{header}: {e}"));
         bodies.push((format!("<{header}>::clone"), b));
     }
-    assert_eq!(bodies.len(), 4, "`by_hand` and the three derived `clone`s were taken");
+    assert_eq!(bodies.len(), 3, "the three derived `clone`s were taken");
     for (name, body) in &bodies {
         let view = body.lowered.view();
         let spell = Spelling::of(&view).expect("spelling");

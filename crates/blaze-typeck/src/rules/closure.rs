@@ -34,6 +34,9 @@ use crate::portable::PTy;
 use crate::ty::{Ty, TyList, TyView, TypeCtx, Var, VarKind};
 use crate::world::World;
 
+/// A capture walk's usage: the expression's value is taken (moved, or copied when `Copy`).
+const USE_MOVE: u8 = 2;
+
 impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// The expected signature: inputs, and the output if known.
     fn deduce_sig(&mut self, ex: Expectation) -> Result<Option<(TyList, Option<Ty>)>, Stop> {
@@ -196,22 +199,19 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         // One row per (closure, local), the strongest use kept (rule 25: sorted).
         self.captures.sort_unstable_by_key(|&(c, p, k)| (c, p, core::cmp::Reverse(k as u8)));
         self.captures.dedup_by_key(|&mut (c, p, _)| (c, p));
-        // Each closure's kind from its strongest capture (upvar.rs `closure_kind`): a mutable
-        // use makes it `FnMut`, else `Fn`. Deviation: a capture moved out of (`FnOnce`) is not
-        // yet told apart, since captures are only by reference here.
+        // Each closure's kind from its strongest USE of a capture (upvar.rs `closure_kind`): a
+        // value moved out makes it `FnOnce`, a mutable use `FnMut`, else `Fn`, whatever the
+        // capture modes (`move` changes the modes, not the kind).
         for ci in 0..self.closures.len() {
             let closure = self.closures[ci].expr;
             let mut kind = crate::ty::ClosureKind::Fn;
-            for &(c, _, k) in self.captures.iter() {
+            for &(c, k) in self.capture_uses.iter() {
                 if c == closure {
-                    kind = kind.max(match k {
-                        CaptureKind::ByRef => crate::ty::ClosureKind::Fn,
-                        CaptureKind::ByMutRef => crate::ty::ClosureKind::FnMut,
-                        CaptureKind::ByValue => crate::ty::ClosureKind::FnOnce,
-                    });
+                    kind = kind.max(k);
                 }
             }
             self.ty.settle_closure_kind(closure, kind)?;
+            self.closure_kinds.push((closure, kind));
         }
         Ok(())
     }
@@ -233,8 +233,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         pats.extend_from_slice(self.body.pat_list(params)?);
         self.mark_bound(pats, bound)?;
         exprs.clear();
-        // The u8 is how the expression is used: 0 read, 1 assigned or mutably borrowed.
-        exprs.push((body, 0));
+        // The u8 is how the expression is used: 0 read, 1 assigned or mutably borrowed,
+        // `USE_MOVE` taken by value (the closure's result is returned: by value).
+        exprs.push((body, USE_MOVE));
         let mut steps = 0usize;
         let bound_steps = self.body.exprs.len() + self.body.stmts.len() + 1;
         while let Some((x, usage)) = exprs.pop() {
@@ -255,9 +256,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let mut exprs: Vec<(ExprId, u8), Alloc<'a>> = Vec::new_in(self.alloc);
         let mut pats: Vec<PatId, Alloc<'a>> = Vec::new_in(self.alloc);
         let before = self.captures.len();
+        let uses_before = self.capture_uses.len();
         self.walk_captures(closure, &mut bound, &mut exprs, &mut pats)?;
         let none = self.captures.len() == before;
         self.captures.truncate(before);
+        self.capture_uses.truncate(uses_before);
         Ok(none)
     }
 
@@ -275,15 +278,36 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         match self.body.expr(x)? {
             Expr::Local(p) => {
                 if !bound.get(p.ix()).copied().unwrap_or(true) {
-                    let kind = if usage == 1 { CaptureKind::ByMutRef } else { CaptureKind::ByRef };
+                    // The Reference, "Closure types", "Capture modes": a `move` closure captures
+                    // every place by value; otherwise by the least mode its uses need, a value
+                    // moved out (not `Copy`) by value.
+                    // The closure's kind follows the use, not the mode ("Closure types": a
+                    // `move` closure that only reads its captures is still `Fn`).
+                    let is_move = matches!(self.body.expr(closure)?, Expr::Closure { is_move: true, .. });
+                    let moved = usage == USE_MOVE && self.moved_out(x)?;
+                    let kind = if is_move || moved {
+                        CaptureKind::ByValue
+                    } else if usage == 1 {
+                        CaptureKind::ByMutRef
+                    } else {
+                        CaptureKind::ByRef
+                    };
+                    let needs = if moved {
+                        crate::ty::ClosureKind::FnOnce
+                    } else if usage == 1 {
+                        crate::ty::ClosureKind::FnMut
+                    } else {
+                        crate::ty::ClosureKind::Fn
+                    };
                     self.captures.push((closure, p, kind));
+                    self.capture_uses.push((closure, needs));
                 }
             }
             Expr::Missing | Expr::Lit(_) | Expr::Path(_) | Expr::Continue { .. } => {}
             Expr::Paren(i) => exprs.push((i, usage)),
             Expr::Block { stmts, tail, .. } => {
                 if let Some(t) = tail {
-                    exprs.push((t, 0));
+                    exprs.push((t, if usage == USE_MOVE { USE_MOVE } else { 0 }));
                 }
                 for &s in self.body.stmt_list(stmts)? {
                     match self.body.stmt(s)? {
@@ -292,7 +316,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                             pats.push(pat);
                             self.mark_bound(pats, bound)?;
                             if let Some(i) = init {
-                                exprs.push((i, 0));
+                                exprs.push((i, USE_MOVE));
                             }
                             if let Some(e) = else_ {
                                 exprs.push((e, 0));
@@ -331,22 +355,26 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             Expr::Loop { body } => exprs.push((body, 0)),
             Expr::Break { value, .. } | Expr::Return { value } => {
                 if let Some(v) = value {
-                    exprs.push((v, 0));
+                    exprs.push((v, USE_MOVE));
                 }
             }
             Expr::Call { callee, args } => {
                 exprs.push((callee, 0));
                 for &a in el(args)? {
-                    exprs.push((a, 0));
+                    exprs.push((a, USE_MOVE));
                 }
             }
             Expr::MethodCall { receiver, args, .. } => {
                 exprs.push((receiver, self.receiver_usage(x)));
                 for &a in el(args)? {
-                    exprs.push((a, 0));
+                    exprs.push((a, USE_MOVE));
                 }
             }
-            Expr::Field { base, .. } | Expr::TupleField { base, .. } => exprs.push((base, usage)),
+            // A field read is a place use of its base (moving a field out is not yet told
+            // apart: rustc captures the field's place by value, we capture the base by ref).
+            Expr::Field { base, .. } | Expr::TupleField { base, .. } => {
+                exprs.push((base, if usage == USE_MOVE { 0 } else { usage }))
+            }
             Expr::Unary { op, operand } => exprs.push((operand, if op == UnOp::Deref { usage } else { 0 })),
             Expr::Binary { lhs, rhs, .. } => {
                 exprs.push((lhs, 0));
@@ -377,7 +405,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 }
             }
             Expr::Index { base, index } => {
-                exprs.push((base, usage));
+                exprs.push((base, if usage == USE_MOVE { 0 } else { usage }));
                 exprs.push((index, 0));
             }
             Expr::Closure { params, body, .. } => {
@@ -400,6 +428,23 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             Expr::Underscore | Expr::OffsetOf { .. } => {}
         }
         Ok(())
+    }
+
+    /// Whether a use of a local taken by value at `x` moves it: no autoref borrows it there
+    /// and its type is not `Copy` (the Reference, "Capture modes": a moved non-`Copy` value is
+    /// captured by value). An unknown type (`Copy` may hold) is not a move; with no `Copy`
+    /// lang item in the world no type is known `Copy`-free, so nothing moves.
+    fn moved_out(&mut self, x: ExprId) -> Result<bool, Stop> {
+        let exprs = self.adjust.column::<0>();
+        let kinds = self.adjust.column::<1>();
+        if exprs.iter().zip(kinds).any(|(&e, k)| e == x && matches!(k, crate::columns::AdjustKind::Borrow { .. })) {
+            return Ok(false);
+        }
+        let Some(copy) = self.lang(LangItem::Copy)? else { return Ok(false) };
+        let Some(&t) = self.expr_ty.get(x.ix()) else { return Ok(false) };
+        let t = self.ty.resolve(t)?;
+        let args = self.mk_list(&[t])?;
+        Ok(!self.ty.may_hold(crate::ty::Goal::Trait { trait_: copy, args }, &mut self.reads)?)
     }
 
     /// A method receiver borrowed `&mut` by its autoref is a mutable use.

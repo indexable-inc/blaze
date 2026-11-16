@@ -458,6 +458,9 @@ The design (2026-11-16, built in blaze-build src/closure.rs, a child module of w
 - ENTRIES: the weaker kinds' methods are thin instances of their own key over the body: `call_mut` on an
   `Fn` closure passes its pointer on; `call_once` on an `Fn`/`FnMut` closure takes the environment by
   value, calls the body with its address and drops it after.
+- STATE (11:15): environment, ground form, value, direct call and body built; native tests in
+  blaze-build src/tests/closures.rs (3, 42, 1313). Not built yet: the entries, the generic `apply<F>` test,
+  the fn item / fn pointer shims, `ClosureFnPointer` (ladder README "Code builder: closures").
 
 ## Queries
 

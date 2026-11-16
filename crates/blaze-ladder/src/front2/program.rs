@@ -206,6 +206,10 @@ fn dispatchable(m: &tc::dyn_compat::MemberFacts, f: &tc::dyn_compat::FnFacts) ->
 /// The most traits one program's objects reach, supertraits included (rule 18).
 const MOST_OBJECT_TRAITS: usize = 1024;
 
+/// The constants one ADT head may name before its row is given up on (reach.rs's
+/// `MOST_LENS`): a pattern type's ends, an array length.
+const MOST_ADT_LENS: u32 = 64;
+
 /// The table of every trait a type in `views` names as a `dyn` principal, and of every
 /// supertrait under it (each after its supertraits, by a work list: its shape hashes theirs).
 /// A trait whose table cannot be made is refused by name: in a survey filed in `left_out`
@@ -315,25 +319,26 @@ fn object_tables(
 impl<'n> Front2Program<'n> {
     /// `main` of the program's crate (index 0 of `names`), lowered and checked; refused by name
     /// where the back half would ask what front2 cannot answer yet.
-    pub fn new(names: &'n Names<'n>, user: &[SourceFile<'_>]) -> Result<Front2Program<'n>, Front2Refusal> {
-        Self::make(names, user, None)
+    /// `frame` is the caller's, alive for the command (`Front2::new`).
+    pub fn new(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>]) -> Result<Front2Program<'n>, Front2Refusal> {
+        Self::make(names, frame, user, None)
     }
 
     /// The program with every fn that checks clean tabled and every other one LEFT OUT (each
     /// named in `left_out` with its cause), for a survey of what the back half builds
     /// ([`crate::run::build_survey`]); never run: a left-out fn's caller cannot be built.
-    pub fn survey(names: &'n Names<'n>, user: &[SourceFile<'_>], left_out: &mut Vec<(Box<str>, Box<str>), Global>) -> Result<Front2Program<'n>, Front2Refusal> {
-        Self::make(names, user, Some(left_out))
+    pub fn survey(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], left_out: &mut Vec<(Box<str>, Box<str>), Global>) -> Result<Front2Program<'n>, Front2Refusal> {
+        Self::make(names, frame, user, Some(left_out))
     }
 
-    fn make(names: &'n Names<'n>, user: &[SourceFile<'_>], mut left_out: Option<&mut Vec<(Box<str>, Box<str>), Global>>) -> Result<Front2Program<'n>, Front2Refusal> {
-        let mut front = Front2::new(names, user).map_err(Front2Refusal::Front)?;
+    fn make(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], mut left_out: Option<&mut Vec<(Box<str>, Box<str>), Global>>) -> Result<Front2Program<'n>, Front2Refusal> {
+        let mut front = Front2::new(names, frame, user).map_err(Front2Refusal::Front)?;
         let written = Written { kind: PathKind::Plain, segments: &["main"] };
         let found = names::path(names, names.root(0), Namespace::Values, written, Alloc::global()).map_err(|_| Front2Refusal::NoMain)?;
         let rust_main: LibKey = found.whole(1).ok_or(Front2Refusal::NoMain)?.key;
         // The walk and `entry()` start at the process's entry (the rule: [`exported_entry`]).
         let main_lib = exported_entry(names)?.unwrap_or(rust_main);
-        let mut store = Store::new(front.index.lang("sized"));
+        let mut store = Store::new(front.index.lang("sized"), front.frame);
         let mut buckets = None;
         let prepared = Prepares::new_in(Alloc::global());
         let main = lower_fn(names, prepared, &mut front.keys, &mut store, main_lib).map_err(Front2Refusal::Lower)?;
@@ -438,11 +443,25 @@ impl<'n> Front2Program<'n> {
             for k in missing {
                 let why = match records.keys.library(k) {
                     None => Some(String::from("no library key")),
-                    Some(lib) => match records.store.ensure(names, records.keys, super::heads::Want::Adt(lib)) {
-                        Err(e) => Some(format!("{e:?}")),
-                        Ok(()) if !records.store.adts.contains_key(&k) => Some(String::from("made, but no row filed under its key")),
-                        Ok(()) => None,
-                    },
+                    // A constant a head names (a pattern type's range end, `UsizeNoHighBit`'s
+                    // `HALF_USIZE`) is evaluated as met and the head made again, at most
+                    // `MOST_ADT_LENS` times, as a body's lowering does.
+                    Some(lib) => {
+                        let mut lens = 0;
+                        loop {
+                            match records.store.ensure(names, records.keys, super::heads::Want::Adt(lib)) {
+                                Err(super::heads::HeadError::Item(_, Why::NeedConst(c, _))) if lens < MOST_ADT_LENS => {
+                                    lens += 1;
+                                    if let Err(e) = super::check::eval_len(&mut records, c) {
+                                        break Some(format!("the constant {c:x} its head names: {e:?}"));
+                                    }
+                                }
+                                Err(e) => break Some(format!("{e:?}")),
+                                Ok(()) if !records.store.adts.contains_key(&k) => break Some(String::from("made, but no row filed under its key")),
+                                Ok(()) => break None,
+                            }
+                        }
+                    }
                 };
                 let Some(why) = why else { continue };
                 let (adt, why) = (fn_shown(&records, k).into_boxed_str(), why.into_boxed_str());
@@ -606,6 +625,7 @@ impl<'n> Front2Program<'n> {
             index: &self.front.index,
             store: &self.store,
             buckets: self.buckets.as_ref(),
+            owner: scope.owner,
             module: scope.module,
             params: scope.params,
             self_: scope.self_,

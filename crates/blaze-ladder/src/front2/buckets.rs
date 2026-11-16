@@ -70,7 +70,7 @@ pub(crate) fn shape_of(t: PTys<'_>, p: PTy) -> Option<Shape> {
         PNode::FnDef(k, _) => Shape::FnDef(k),
         PNode::FnPtr(l, _) => Shape::FnPtr(l.len.saturating_sub(1)),
         PNode::Opaque(k, _) => Shape::Opaque(k),
-        PNode::Closure(..) | PNode::Future(..) => Shape::Closure,
+        PNode::Closure { .. } | PNode::Future(..) => Shape::Closure,
         // A const generic's value is no type: never an impl's self type.
         PNode::Param(_) | PNode::Alias { .. } | PNode::Infer | PNode::Error | PNode::ConstValue { .. } | PNode::ConstParam(_) => return None,
         PNode::Dynamic(l) => Shape::Dynamic(blaze_typeck::object_principal(t, l)),
@@ -104,7 +104,8 @@ fn prim_shape(name: &str) -> Option<Shape> {
 
 /// Where a header as written files its impl.
 enum Filed {
-    Trait(ItemKey, Option<Shape>),
+    /// Its trait, its self type's shape, and whether the trait is written with no arguments.
+    Trait(ItemKey, Option<Shape>, bool),
     Inherent(Option<Shape>),
     /// Unread, with its self type's constructor where that was read: a trait impl whose trait
     /// path fails is still only a candidate at its self type's shape.
@@ -264,9 +265,12 @@ fn file(names: &Names<'_>, key: LibKey, module: LibKey) -> Filed {
     let Ok(lf::TypeRef::Path(p)) = v.ty(lf::TypeId(t)) else { return Filed::Unread(Unread::TraitNotAPath, self_shape) };
     let Ok((abs, texts, _, _)) = path_texts(&v, p) else { return Filed::Unread(Unread::PathUnread, self_shape) };
     let path: Box<str> = format!("{}{}", if abs { "::" } else { "" }, texts.join("::")).into_boxed_str();
+    // Its trait written with no generic arguments ([`Homes::bare`]).
+    let mut args = Vec::new_in(Global);
+    let bare = children(&v, lf::TypeId(t), &mut args).is_ok() && args.is_empty();
     match (Resolver { names }).path(module, abs, &texts, Ns::Type) {
         Ok(f) if f.kind == Kind::Trait && f.consumed as usize == texts.len() && v.head[head::FLAGS] & sig::NEGATIVE != 0 => Filed::Negative(checker_of(f.key)),
-        Ok(f) if f.kind == Kind::Trait && f.consumed as usize == texts.len() => Filed::Trait(checker_of(f.key), self_shape),
+        Ok(f) if f.kind == Kind::Trait && f.consumed as usize == texts.len() => Filed::Trait(checker_of(f.key), self_shape, bare),
         Ok(f) => Filed::Unread(Unread::NotATrait { path, kind: f.kind, consumed: f.consumed, written: texts.len() as u32 }, self_shape),
         Err(why) => Filed::Unread(Unread::Resolve { path, why }, self_shape),
     }
@@ -281,14 +285,27 @@ pub enum Home {
     /// The trait's crate (or, for an inherent question, the type's), and the crate of the
     /// one local type the goal's self type can be, if any.
     In(usize, Option<usize>),
+    /// The crates that may write an inherent impl of a type they do not define (a built-in
+    /// type's, `impl u32`): only those whose root turns on `rustc_attrs`
+    /// ([`Buckets::may_write_incoherent`]).
+    Incoherent,
 }
 
-impl Home {
-    pub fn admits(self, krate: usize) -> bool {
-        match self {
-            Home::Any => true,
-            Home::In(a, b) => krate == a || b == Some(krate),
-        }
+/// Where the impls answering one trait question can be written: `all` for any impl, `bare`
+/// for an impl whose trait path is written with no arguments, its trait's parameters all
+/// defaulting to `Self` (`impl PartialEq for A`: `Rhs = Self`, so `T1` is `T0` and only `T0`
+/// can be the local type).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Homes {
+    pub all: Home,
+    pub bare: Home,
+}
+
+impl Homes {
+    pub const ANY: Homes = Homes { all: Home::Any, bare: Home::Any };
+
+    fn one(h: Home) -> Homes {
+        Homes { all: h, bare: h }
     }
 }
 
@@ -324,60 +341,81 @@ fn adt_marks(names: &Names<'_>, lib: LibKey) -> Option<Marks> {
 /// uncovered type parameters `P1..=Pn` may appear in `T0..Ti` (excluding `Ti`)" (`&Local`,
 /// `&mut Local`, `Box<Local>`, `Pin<Local>` are local too: fundamental). Only the necessary
 /// half is used (the uncovered clause narrows further and is not read). So
-/// for a trait with no type or const parameter but `Self`, an impl in crate C answers
-/// `T0: Trait` only if C defines `Trait`, or `T0` is a nominal type of C (or a trait object of
-/// a trait of C). Anything else read here (a trait with parameters, a reference, a fundamental
+/// for a trait with no type or const parameter but `Self` (or an impl writing none of them, each
+/// defaulting to `Self`: [`Homes::bare`]), an impl in crate C answers `T0: Trait` only if C
+/// defines `Trait`, or `T0` is a nominal type of C (or a trait object of a trait of C).
+/// Anything else read here (a trait with parameters an impl writes, a reference, a fundamental
 /// wrapper, an opaque type, a closure) is `Any`: the conservative side.
-pub fn trait_home(names: &Names<'_>, keys: &Keys, store: &Store<'_>, trait_: ItemKey, shape: Shape) -> Home {
-    let Some(lib) = keys.library(trait_) else { return Home::Any };
-    let Some(home) = names.crate_of(lib) else { return Home::Any };
-    // Its type and const parameters, `Self` included: from its head, else as written.
-    let generics = match store.maps.traits.get(&lib) {
-        Some(t) => Some(t.generics),
-        None => names.item_text(lib).and_then(|it| lower(names, lib, it.text).ok()).and_then(|low| {
-            let mut ps = Vec::new_in(Global);
-            super::heads::param_names(&low.view(), 1, &mut ps, super::heads::Consts::Keep).ok()
-        }),
-    };
-    if generics != Some(1) {
-        return Home::Any;
-    }
+pub fn trait_home(names: &Names<'_>, keys: &Keys, store: &Store<'_>, trait_: ItemKey, shape: Shape) -> Homes {
+    let Some(lib) = keys.library(trait_) else { return Homes::ANY };
+    let Some(home) = names.crate_of(lib) else { return Homes::ANY };
     let local = match shape {
         Shape::Adt(k) => {
-            let Some(adt) = keys.library(k) else { return Home::Any };
+            let Some(adt) = keys.library(k) else { return Homes::ANY };
             match adt_marks(names, adt) {
                 Some(m) if !m.fundamental => {}
-                _ => return Home::Any,
+                _ => return Homes::ANY,
             }
-            let Some(c) = names.crate_of(adt) else { return Home::Any };
+            let Some(c) = names.crate_of(adt) else { return Homes::ANY };
             Some(c)
         }
         Shape::Dynamic(Some(t)) => {
-            let Some(c) = keys.library(t).and_then(|l| names.crate_of(l)) else { return Home::Any };
+            let Some(c) = keys.library(t).and_then(|l| names.crate_of(l)) else { return Homes::ANY };
             Some(c)
         }
         // Never a local type of any crate (no fundamental type is built in but references).
         Shape::Bool | Shape::Char | Shape::Int(_) | Shape::Uint(_) | Shape::Float(_) | Shape::AnyInt | Shape::AnyFloat | Shape::Str | Shape::Never | Shape::Tuple(_) | Shape::Slice | Shape::Array | Shape::Ptr(_) | Shape::FnPtr(_) => None,
-        _ => return Home::Any,
+        _ => return Homes::ANY,
     };
-    Home::In(home, local)
+    let by_self = Home::In(home, local);
+    // Its type and const parameters, `Self` included, and whether each after `Self` defaults
+    // to `Self`: from its head, else (the count only) as written.
+    let (generics, self_defaults) = match store.maps.traits.get(&lib) {
+        Some(t) => {
+            let view = store.tys.view();
+            let all_self = t.defaults.iter().all(|d| d.is_some_and(|p| matches!(view.nodes.get(p.0 as usize), Some(PNode::Param(0)))));
+            (Some(t.generics), all_self)
+        }
+        None => {
+            let n = names.item_text(lib).and_then(|it| lower(names, lib, it.text).ok()).and_then(|low| {
+                let mut ps = Vec::new_in(Global);
+                super::heads::param_names(&low.view(), 1, &mut ps, super::heads::Consts::Keep).ok()
+            });
+            (n, false)
+        }
+    };
+    match generics {
+        Some(1) => Homes::one(by_self),
+        Some(_) if self_defaults => Homes { all: Home::Any, bare: by_self },
+        _ => Homes::ANY,
+    }
 }
 
 /// Where an inherent impl of `shape` can be written. The Reference, "Implementations",
 /// "Inherent implementations": "An implementing type must be defined within the same crate as
-/// the original type definition." The standard library's `#[rustc_has_incoherent_inherent_impls]`
-/// types are the exception, as are the built-in types (`impl u32` in core, `impl f32` in std):
-/// only a nominal type without that mark narrows.
-pub fn inherent_home(names: &Names<'_>, keys: &Keys, shape: Shape) -> Home {
-    let Shape::Adt(k) = shape else { return Home::Any };
-    let Some(adt) = keys.library(k) else { return Home::Any };
-    match adt_marks(names, adt) {
+/// the original type definition." rustc's E0116: "An inherent implementation was defined for a
+/// type outside the current crate"; E0390: "A method or constant was implemented on a primitive
+/// type". The exceptions are the standard library's: core's `#![rustc_coherence_is_core]` and
+/// alloc's and std's `#[rustc_allow_incoherent_impl]` (on a built-in type, or a type or trait
+/// marked `#[rustc_has_incoherent_inherent_impls]`): each is an internal attribute a crate can
+/// write only with `#![feature(rustc_attrs)]` at its root ([`Home::Incoherent`]).
+pub fn inherent_home(names: &Names<'_>, keys: &Keys, shape: Shape) -> Homes {
+    let nominal = match shape {
+        Shape::Adt(k) | Shape::Dynamic(Some(k)) => k,
+        Shape::Bool | Shape::Char | Shape::Int(_) | Shape::Uint(_) | Shape::Float(_) | Shape::AnyInt | Shape::AnyFloat | Shape::Str | Shape::Never | Shape::Tuple(_) | Shape::Slice | Shape::Array | Shape::Ptr(_) | Shape::Ref(_) | Shape::FnPtr(_) => {
+            return Homes::one(Home::Incoherent);
+        }
+        _ => return Homes::ANY,
+    };
+    let Some(lib) = keys.library(nominal) else { return Homes::ANY };
+    match adt_marks(names, lib) {
         Some(m) if !m.incoherent => {}
-        _ => return Home::Any,
+        Some(_) => return Homes::one(Home::Incoherent),
+        None => return Homes::ANY,
     }
-    match names.crate_of(adt) {
-        Some(c) => Home::In(c, None),
-        None => Home::Any,
+    match names.crate_of(lib) {
+        Some(c) => Homes::one(Home::In(c, None)),
+        None => Homes::ANY,
     }
 }
 
@@ -425,7 +463,11 @@ pub struct Buckets {
     /// Each impl's crate, by key (the index's order): known without reading its header.
     krates: Vec<(LibKey, usize), Global>,
     /// The home each answered trait question was narrowed to ([`trait_home`]).
-    homes: HashMap<(ItemKey, Shape), Home, Global>,
+    homes: HashMap<(ItemKey, Shape), Homes, Global>,
+    /// The trait impls whose trait path is written with no generic arguments, sorted.
+    bare: Vec<LibKey, Global>,
+    /// Per crate: whether its root turns on `rustc_attrs` ([`Home::Incoherent`]).
+    incoherent: Vec<bool, Global>,
 }
 
 impl Buckets {
@@ -452,12 +494,21 @@ impl Buckets {
             gapped: HashMap::new_in(Global),
             krates: Vec::new_in(Global),
             homes: HashMap::new_in(Global),
+            bare: Vec::new_in(Global),
+            incoherent: Vec::new_in(Global),
         };
         b.krates.extend(index.impls.iter().map(|at| (at.key, at.krate)));
         b.krates.sort_unstable_by_key(|k| k.0);
+        // `#![feature(rustc_attrs)]` is an inner attribute of the crate root, the first file
+        // read; a mention anywhere in that text keeps the crate on the wide side.
+        b.incoherent.extend(names.crates().iter().map(|c| c.files.first().is_none_or(|f| f.text.contains("rustc_attrs") || f.text.contains("rustc_coherence_is_core"))));
         for at in index.impls.iter() {
-            match file(names, at.key, at.module) {
-                Filed::Trait(tr, Some(s)) => {
+            let filed = file(names, at.key, at.module);
+            if let Filed::Trait(_, _, true) = filed {
+                b.bare.push(at.key);
+            }
+            match filed {
+                Filed::Trait(tr, Some(s), _) => {
                     push(&mut b.by_shape, (tr, s), at.key);
                     match s {
                         Shape::Int(_) | Shape::Uint(_) => push(&mut b.by_shape, (tr, Shape::AnyInt), at.key),
@@ -465,7 +516,7 @@ impl Buckets {
                         _ => {}
                     }
                 }
-                Filed::Trait(tr, None) => push(&mut b.any, tr, at.key),
+                Filed::Trait(tr, None, _) => push(&mut b.any, tr, at.key),
                 Filed::Inherent(Some(s)) => push(&mut b.inherent_by_shape, s, at.key),
                 Filed::Inherent(None) => b.inherent_any.push(at.key),
                 Filed::NoCheckerType => b.no_checker_type += 1,
@@ -489,6 +540,7 @@ impl Buckets {
             }
         }
         b.unread.sort_unstable();
+        b.bare.sort_unstable();
         for v in b.negative.values_mut() {
             v.sort_unstable();
         }
@@ -496,7 +548,7 @@ impl Buckets {
     }
 
     /// The candidates for `trait_` at `shape`, each once.
-    pub fn trait_candidates(&self, trait_: ItemKey, shape: Shape, home: Home) -> Vec<LibKey, Global> {
+    pub fn trait_candidates(&self, trait_: ItemKey, shape: Shape, home: Homes) -> Vec<LibKey, Global> {
         let mut out = Vec::new_in(Global);
         out.extend_from_slice(self.by_shape.get(&(trait_, shape)).map_or(&[], |v| v.as_slice()));
         out.extend_from_slice(self.any.get(&trait_).map_or(&[], |v| v.as_slice()));
@@ -509,12 +561,26 @@ impl Buckets {
         out
     }
 
-    /// Drops the impls written outside `home` (an impl of no known crate stays).
-    fn keep_home(&self, out: &mut Vec<LibKey, Global>, home: Home) {
-        if home == Home::Any {
+    /// Drops the impls written outside `home` (an impl of no known crate stays; a bare trait
+    /// impl is judged by `home.bare`, any other by `home.all`).
+    fn keep_home(&self, out: &mut Vec<LibKey, Global>, home: Homes) {
+        if home == Homes::ANY {
             return;
         }
-        out.retain(|k| self.krate(*k).is_none_or(|c| home.admits(c)));
+        out.retain(|k| {
+            let h = if self.bare.binary_search(k).is_ok() { home.bare } else { home.all };
+            self.krate(*k).is_none_or(|c| self.admits(h, c))
+        });
+    }
+
+    /// Whether an impl written in crate `krate` can be in `home`.
+    pub fn admits(&self, home: Home, krate: usize) -> bool {
+        match home {
+            Home::Any => true,
+            Home::In(a, b) => krate == a || b == Some(krate),
+            // A crate the names library has no row for stays on the wide side.
+            Home::Incoherent => self.incoherent.get(krate).copied().unwrap_or(true),
+        }
     }
 
     /// The crate impl `k` is written in.
@@ -524,8 +590,8 @@ impl Buckets {
     }
 
     /// The home the answered trait question was narrowed to.
-    pub fn home_of(&self, trait_: ItemKey, shape: Shape) -> Home {
-        self.homes.get(&(trait_, shape)).copied().unwrap_or(Home::Any)
+    pub fn home_of(&self, trait_: ItemKey, shape: Shape) -> Homes {
+        self.homes.get(&(trait_, shape)).copied().unwrap_or(Homes::ANY)
     }
 
     /// The negative impls of `trait_` (any self type), sorted by key.
@@ -534,7 +600,7 @@ impl Buckets {
     }
 
     /// The candidates for an inherent fn of `shape`, each once.
-    pub fn inherent_candidates(&self, shape: Shape, home: Home) -> Vec<LibKey, Global> {
+    pub fn inherent_candidates(&self, shape: Shape, home: Homes) -> Vec<LibKey, Global> {
         let mut out = Vec::new_in(Global);
         out.extend_from_slice(self.inherent_by_shape.get(&shape).map_or(&[], |v| v.as_slice()));
         out.extend_from_slice(&self.inherent_any);
@@ -571,7 +637,7 @@ impl Buckets {
     }
 
     /// Answers `trait_` at `shape` from its candidates' headers, which `store` must hold.
-    pub fn answer(&mut self, store: &Store<'_>, trait_: ItemKey, shape: Shape, home: Home) -> Result<(), Unfilled> {
+    pub fn answer(&mut self, store: &Store<'_>, trait_: ItemKey, shape: Shape, home: Homes) -> Result<(), Unfilled> {
         let view = store.tys.view();
         let mut got = Vec::new_in(Global);
         // Candidates come sorted, so the first failed one is the least key.
@@ -602,7 +668,7 @@ impl Buckets {
     }
 
     /// Answers every inherent fn of `shape` from its candidates' headers and signatures.
-    pub fn answer_inherent(&mut self, store: &Store<'_>, shape: Shape, home: Home) -> Result<(), Unfilled> {
+    pub fn answer_inherent(&mut self, store: &Store<'_>, shape: Shape, home: Homes) -> Result<(), Unfilled> {
         let view = store.tys.view();
         let mut first_failed = None;
         for k in self.inherent_candidates(shape, home) {

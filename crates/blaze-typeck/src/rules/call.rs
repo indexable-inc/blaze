@@ -128,7 +128,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                             None => None,
                         },
                         TyView::FnPtr(l, _) => Some(self.fn_ptr_sig(l)?),
-                        TyView::Closure(_, sig) => match self.view(sig) {
+                        TyView::Closure(_, sig) | TyView::ClosureOf { sig, .. } => match self.view(sig) {
                             TyView::FnPtr(l, _) => {
                                 let (inputs, output) = self.fn_ptr_sig(l)?;
                                 // A closure is called through its `Fn*` impl (the Reference,

@@ -90,9 +90,7 @@ struct St<'n> {
 }
 
 impl<'n> St<'n> {
-    fn new(sized: Option<blaze_id::ItemKey>) -> St<'n> {
-        St { store: Store::new(sized), buckets: None, consts: Consts::default(), containers: BTreeSet::new(), failed_containers: BTreeSet::new() }
-    }
+    fn new(sized: Option<blaze_id::ItemKey>, frame: &'n blaze_mem::Frame) -> St<'n> { St { store: Store::new(sized, frame), buckets: None, consts: Consts::default(), containers: BTreeSet::new(), failed_containers: BTreeSet::new() } }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -160,6 +158,14 @@ fn tally_lines(label: &str, recs: &[&Rec], out: &mut String) {
         hist[4],
         hist[5]
     ));
+    out.push_str(&format!("{label} speculative needs dropped {} (fills past a hole that could not be made)\n", t.dropped));
+    let mut late = String::new();
+    for (i, name) in QUESTION_KINDS.iter().enumerate() {
+        if t.late_holes[i] > 0 {
+            late.push_str(&format!(" {name} {};", t.late_holes[i]));
+        }
+    }
+    out.push_str(&format!("{label} holes met by second and later runs (what makes a third round):{late}\n"));
     let mut asks = String::new();
     let mut total = 0;
     for (i, name) in QUESTION_KINDS.iter().enumerate() {
@@ -184,6 +190,25 @@ fn tally_lines(label: &str, recs: &[&Rec], out: &mut String) {
         ms(t.hash_ns),
         ms(t.check_ns.saturating_sub(t.world_ns + t.hash_ns)),
         ms(t.convert_ns)
+    ));
+    let s = t.solve;
+    out.push_str(&format!(
+        "{label} solver: {} calls in {} ({:.1} us each), {} repeated after a fact fill; frames {} ({:.1} per call); cache hits {}; ground fast path {}; impl candidates {} ({:.2} per frame); cycle reruns {}\n",
+        s.calls,
+        ms(s.ns),
+        s.ns as f64 / 1000.0 / s.calls.max(1) as f64,
+        s.refills,
+        s.frames,
+        s.frames as f64 / s.calls.max(1) as f64,
+        s.cache_hits,
+        s.fast_path,
+        s.candidates,
+        s.candidates as f64 / s.frames.max(1) as f64,
+        s.reruns
+    ));
+    out.push_str(&format!(
+        "{label} checker phases: walk and rules (all less world answers, hashing, solver calls and fact fills; a fill's asks are taken off twice, so a lower bound) {}\n",
+        ms(t.check_ns.saturating_sub(t.world_ns + t.hash_ns + s.ns + t.convert_ns))
     ));
 }
 
@@ -427,7 +452,8 @@ fn main() {
     out.push_str(&format!("phase names: toolchain opened and names resolved in {} (not the subject)\n", ms(ns(t0))));
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
     let t0 = Instant::now();
-    let mut front = Front2::new(&names, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
+        let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
     out.push_str(&format!("phase front2: Front2::new (keys filed, index) in {}\n", ms(ns(t0))));
     out.push_str(&format!(
         "sync: Names {} send {}; Front2 {} send {}; Store {} send {}; Buckets {} send {}; Consts {} send {}; Prepares {} send {}; Alloc {} send {}\n",
@@ -525,7 +551,7 @@ fn main() {
     // Phase 1: every head of the crate, one shared store.
     let prepared = Prepares::new_in(Alloc::global());
     let sized = front.index.lang("sized");
-    let mut st = St::new(sized);
+    let mut st = St::new(sized, front.frame);
     let kinds_order = ["struct/enum/union", "trait", "trait alias", "impl", "fn", "const", "static", "type alias"];
     let mut by_kind: Vec<(u64, usize, usize)> = vec![(0, 0, 0); kinds_order.len()];
     let t0 = Instant::now();
@@ -622,7 +648,7 @@ fn main() {
     out.push_str("ten slowest checks of pass A (A check, B warm check, bytes, heads made in A; then alone from empty records: lower, check, heads in the store after):\n");
     for &i in idx.iter().take(10) {
         let e = &entries[i];
-        let mut fresh = St::new(sized);
+        let mut fresh = St::new(sized, front.frame);
         let f0 = Instant::now();
         let r = one(&names, &mut front, &mut fresh, &prepared, e.target);
         let all = ns(f0);
@@ -665,7 +691,7 @@ fn main() {
     let picks: Vec<(&str, usize)> = [("smallest clean", clean.first().copied()), ("median clean", clean.get(clean.len() / 2).copied())].into_iter().filter_map(|(l, i)| i.map(|i| (l, i))).collect();
     for (label, i) in picks {
         let e = &entries[i];
-        let mut fresh = St::new(sized);
+        let mut fresh = St::new(sized, front.frame);
         let f0 = Instant::now();
         let r = one(&names, &mut front, &mut fresh, &prepared, e.target);
         let all = ns(f0);
@@ -681,7 +707,7 @@ fn main() {
             fresh.buckets.is_some(),
             kinds(&fresh.store)
         ));
-        let mut pre = St::new(sized);
+        let mut pre = St::new(sized, front.frame);
         pre.buckets = Some(Buckets::new(&names, &front.index));
         let f0 = Instant::now();
         let r2 = one(&names, &mut front, &mut pre, &prepared, e.target);
@@ -738,10 +764,11 @@ fn main() {
                             let crates = inputs.crates();
                             let names: Names<'_> = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
                             let srcs = [SourceFile { path: "src/main.rs", text: MAIN }];
-                            let mut fr = Front2::new(&names, &srcs).unwrap_or_else(|e| panic!("front2: {e}"));
+                            let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
+                                let mut fr = Front2::new(&names, &frame, &srcs).unwrap_or_else(|e| panic!("front2: {e}"));
                             let front_ns = ns(f0);
                             let prep = Prepares::new_in(Alloc::global());
-                            let mut st = St::new(fr.index.lang("sized"));
+                            let mut st = St::new(fr.index.lang("sized"), fr.frame);
                             let (mut low, mut chk, mut done) = (0u64, 0u64, 0usize);
                             for (i, (k, name)) in entries_r.iter().enumerate() {
                                 if i % n != t {

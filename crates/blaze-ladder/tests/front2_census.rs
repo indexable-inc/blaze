@@ -199,6 +199,7 @@ fn gap_class(g: &Gap, names: &Names<'_>) -> String {
         }
         Gap::FnHead(_, s) => format!("gap FnHead: {}", nest(s)),
         Gap::Unspelled(u) => format!("gap Unspelled: {}", nest(&format!("{u:?}"))),
+        Gap::Local(g) => format!("gap Local: {}", g.form),
         Gap::Resolve(e) => format!("gap Resolve: {}", nest(&format!("{e:?}"))),
         Gap::Fill(e) => format!("gap Fill: {}", nest(&format!("{e:?}"))),
         Gap::BodyRecord(q) => format!("gap BodyRecord: {}", nest(&format!("{q:?}"))),
@@ -357,7 +358,8 @@ fn census_with_the_world() {
     let crate_names: Vec<&str> = crates.iter().map(|c| c.name).collect();
     let mut out = format!("census with the world: names resolved in {:?}; crates {crate_names:?}\n", start.elapsed());
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
-    let mut front = Front2::new(&names, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
+        let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
     // A comma-separated list of crates, each its own census and table, in the order given.
     let list = want.unwrap_or_else(|| if crate_names.contains(&"bstd") { "bstd".to_string() } else { "blaze_std".to_string() });
     for w in list.split(',') {
@@ -482,7 +484,7 @@ fn census_crate<'n>(names: &'n Names<'n>, front: &mut Front2<'n>, krate: usize, 
     let mut ex_idx: BTreeMap<String, Vec<usize>> = BTreeMap::new();
     let prepared = Prepares::new_in(Alloc::global());
     let sized = front.index.lang("sized");
-    let mut shared_store = Store::new(sized);
+    let mut shared_store = Store::new(sized, front.frame);
     let mut shared_buckets = None;
     let mut shared_consts = Consts::default();
     let mut heads: BTreeMap<String, Result<(), (String, String)>> = BTreeMap::new();
@@ -501,7 +503,7 @@ fn census_crate<'n>(names: &'n Names<'n>, front: &mut Front2<'n>, krate: usize, 
         }
         let got = if fresh {
             heads.clear();
-            let (mut fs, mut fb, mut fc) = (Store::new(sized), None, Consts::default());
+            let (mut fs, mut fb, mut fc) = (Store::new(sized, front.frame), None, Consts::default());
             one(names, front, &mut fs, &mut fb, &mut fc, prepared, &mut heads, e.target)
         } else {
             one(names, front, &mut shared_store, &mut shared_buckets, &mut shared_consts, prepared, &mut heads, e.target)
@@ -542,7 +544,7 @@ fn census_crate<'n>(names: &'n Names<'n>, front: &mut Front2<'n>, krate: usize, 
             let mut other = Vec::new();
             for &i in idx {
                 heads.clear();
-                let (mut fs, mut fb, mut fc) = (Store::new(sized), None, Consts::default());
+                let (mut fs, mut fb, mut fc) = (Store::new(sized, front.frame), None, Consts::default());
                 match one(names, front, &mut fs, &mut fb, &mut fc, prepared, &mut heads, entries[i].target) {
                     Err((c, _)) if &c == class => same += 1,
                     Err((c, _)) => other.push(c),
@@ -565,6 +567,9 @@ fn census_crate<'n>(names: &'n Names<'n>, front: &mut Front2<'n>, krate: usize, 
         "HEAD crate {cname}: bodies {bodies}, clean {clean} ({pct:.1}%); {no_body} listed members had no body (required trait methods); {}\n",
         stopped.as_deref().unwrap_or("all listed bodies taken")
     ));
+    // Bodies whose lowering was kept for the command because they hold local items (the
+    // shared store's; a fresh store's per-body reruns keep their own).
+    out.push_str(&format!("LOCALS: bodies that kept their local items (shared store): {}\n", shared_store.locals.kept()));
     let mut sorted: Vec<(&String, &(usize, Vec<String>))> = classes.iter().collect();
     sorted.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(b.0)));
     out.push_str(&format!("CLASSES ({}), largest first:\n", sorted.len()));

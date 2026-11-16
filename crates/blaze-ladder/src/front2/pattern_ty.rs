@@ -82,15 +82,23 @@ impl<H: Heads> Builder<'_, '_, H> {
             .find(|(n, _)| *n == "target_pointer_width")
             .and_then(|(_, w)| w.and_then(|w| w.parse::<u32>().ok()))
             .ok_or_else(|| refused(format!("the crate's cfg has no `target_pointer_width`"), r))?;
-        let mut path_end: Option<String> = None;
+        // A path end (`HALF_USIZE` in core's `UsizeNoHighBit(usize is 0..=HALF_USIZE)`) is a
+        // constant item's value, read as an array length's is: `Why::NeedConst` names it until
+        // the evaluator has filled it (the caller's `eval_len` loop), then its value.
+        let mut need: Option<Why> = None;
         let mut eval = |p: &str| -> Result<u128, Refused> {
-            path_end = Some(String::from(p));
-            Err(Refused::Form { what: "a constant path end", range: r })
+            match self.array_len(env, p, r) {
+                Ok(value) => Ok(value),
+                Err(why) => {
+                    need = Some(why);
+                    Err(Refused::Form { what: "a constant path end", range: r })
+                }
+            }
         };
         let made = pattern_type(tys, base, &text, bits, r, &mut eval);
-        match (made, path_end) {
+        match (made, need) {
             (Ok(t), _) => Ok(t),
-            (Err(_), Some(p)) => Err(Why::ConstPath(p.into_boxed_str(), r)),
+            (Err(_), Some(why)) => Err(why),
             (Err(e), None) => Err(refused(format!("{e:?}"), r)),
         }
     }

@@ -468,7 +468,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                     stack.extend_from_slice(self.list(l, e)?);
                 }
                 PNode::Opaque(_, _) | PNode::Alias { .. } | PNode::Dynamic(_) => n += 1,
-                PNode::Closure(..) | PNode::Future(..) => return self.refuse(Form::TypeNode, e),
+                PNode::Closure { .. } | PNode::Future(..) => return self.refuse(Form::TypeNode, e),
                 _ => {}
             }
         }

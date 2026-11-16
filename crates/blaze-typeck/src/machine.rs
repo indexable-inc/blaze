@@ -45,6 +45,10 @@ pub(crate) enum Plant {
     /// (`suite::async_block::control_output_from_first`).
     #[cfg(test)]
     AsyncOutputFromFirst,
+    /// A defining body's output keeps its opaque as written: no hidden-type variable, no bounds
+    /// (`suite::opaque::control_opaque_not_opened`).
+    #[cfg(test)]
+    OpaqueNotOpened,
     /// A method call registers none of its method's own where-clauses, so a `where Self: Sized`
     /// method is callable on a trait object (`suite::dyn_objects::control_sized_method_callable`).
     #[cfg(test)]
@@ -277,6 +281,13 @@ pub(crate) struct Machine<'b, 'w, 'c, 'a, W: World, C: TypeCtx> {
     pub numeric: Vec<Ty, Alloc<'a>>,
     pub diverging: Vec<Ty, Alloc<'a>>,
     pub closures: Vec<PendingClosure, Alloc<'a>>,
+    /// The owner's generic parameter count (parents first), from its signature: a closure of
+    /// this body is written back with the arguments `Param(0..own_params)`.
+    pub own_params: u32,
+    /// What each capture's use needs of its closure (`analyze_closures`' scratch).
+    pub capture_uses: Vec<(ExprId, crate::ty::ClosureKind), Alloc<'a>>,
+    /// Each analysed closure's settled kind, for `Checked::closures`.
+    pub closure_kinds: Vec<(ExprId, crate::ty::ClosureKind), Alloc<'a>>,
     pub futures: Vec<PendingFuture, Alloc<'a>>,
     /// Each `.await` in an async context and the future it holds while suspended
     /// (`<T as IntoFuture>::IntoFuture`): part of the enclosing future's interior.
@@ -289,6 +300,10 @@ pub(crate) struct Machine<'b, 'w, 'c, 'a, W: World, C: TypeCtx> {
     pub async_sites: Vec<bool, Alloc<'a>>,
     /// The adjustments of the coercion being tried, moved to `adjust` once it commits.
     pub adj_scratch: Vec<(AdjustKind, Ty), Alloc<'a>>,
+    /// Each opaque this body defines and its hidden type's variable (rules/opaque_def.rs).
+    pub defining: Vec<(ItemKey, Ty), Alloc<'a>>,
+    /// While set, `lower` makes an opaque its hidden type's variable (rules/opaque_def.rs).
+    pub opening: bool,
 }
 
 impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
@@ -351,6 +366,9 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             numeric: Vec::new_in(alloc),
             diverging: Vec::new_in(alloc),
             closures: Vec::new_in(alloc),
+            own_params: 0,
+            capture_uses: Vec::new_in(alloc),
+            closure_kinds: Vec::new_in(alloc),
             futures: Vec::new_in(alloc),
             awaited: Vec::new_in(alloc),
             coerce_many: Vec::new_in(alloc),
@@ -358,6 +376,8 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             ret_sites: Vec::new_in(alloc),
             async_sites: Vec::new_in(alloc),
             adj_scratch: Vec::new_in(alloc),
+            defining: Vec::new_in(alloc),
+            opening: false,
             alloc,
         })
     }
@@ -1133,7 +1153,16 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             PNode::Adt(k, l) => TyView::Adt(k, self.lowered_list(memo, types, l)?),
             PNode::FnDef(k, l) => TyView::FnDef(k, self.lowered_list(memo, types, l)?),
             PNode::FnPtr(l, h) => TyView::FnPtr(self.lowered_list(memo, types, l)?, h),
-            PNode::Closure(e, sig) => TyView::Closure(e, Self::lowered(memo, sig)?),
+            // A closure of another body: its identity from the record, its signature and kind
+            // from its owner's check (typeck.md, "A closure's identity").
+            PNode::Closure { owner, ordinal, args } => {
+                let args = self.lowered_list(memo, types, args)?;
+                let Some(facts) = self.reads.closure(owner, ordinal)? else {
+                    return Err(CheckError::Malformed(Malformed::BodyTypeInRecord(crate::world::Question::Closure(owner, ordinal))).into());
+                };
+                let sig = self.lower(facts.types, facts.sig, Lower::Args(args), cause)?;
+                TyView::ClosureOf { owner, ordinal, args, sig, kind: facts.kind }
+            }
             PNode::Future(e, o, i) => TyView::Future(e, Self::lowered(memo, o)?, Self::lowered(memo, i)?),
             PNode::Param(i) => match mode {
                 Lower::Args(args) => {
@@ -1168,6 +1197,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 })?;
                 return Ok(term);
             }
+            PNode::Opaque(k, _) if self.opening => return self.defining_var(k),
             PNode::Opaque(k, l) => TyView::Opaque(k, self.lowered_list(memo, types, l)?),
             // The rows are in `PortableTys::dynamic`'s order, which lowering keeps.
             PNode::Dynamic(l) => TyView::Dynamic(self.lowered_list(memo, types, l)?),
@@ -1329,7 +1359,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             TyView::FnPtr(l, _) => Shape::FnPtr(self.ty.list_len(l).saturating_sub(1)),
             // A future buckets with closures: neither can be named in an impl header, so only
             // blanket impls apply to either.
-            TyView::Closure(..) | TyView::Future(..) => Shape::Closure,
+            TyView::Closure(..) | TyView::ClosureOf { .. } | TyView::Future(..) => Shape::Closure,
             TyView::Param(_) => Shape::Param,
             TyView::Opaque(k, _) => Shape::Opaque(k),
             TyView::Dynamic(l) => Shape::Dynamic(self.principal(l)),
@@ -1413,8 +1443,9 @@ pub(crate) fn children(node: PNode, types: PTys<'_>, out: &mut Vec<PTy, Alloc<'_
         | PNode::FnDef(_, l)
         | PNode::FnPtr(l, _)
         | PNode::Opaque(_, l)
+        | PNode::Closure { args: l, .. }
         | PNode::Alias { args: l, .. } => out.extend_from_slice(types.list(l)?),
-        PNode::Ref(_, t) | PNode::Ptr(_, t) | PNode::Slice(t) | PNode::Closure(_, t) | PNode::ConstValue { ty: t, .. } => {
+        PNode::Ref(_, t) | PNode::Ptr(_, t) | PNode::Slice(t) | PNode::ConstValue { ty: t, .. } => {
             out.push(t);
         }
         PNode::Future(_, o, i) | PNode::Array(o, i) => {

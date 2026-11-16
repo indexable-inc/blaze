@@ -124,7 +124,7 @@ fn lower_type<'a, 't>(
             }
         }
     }
-    let mut m = Machine::new(text, Mode::Type, edition, cfg, alloc);
+    let mut m = Machine::new(text, Mode::Type, edition, cfg, None, alloc);
     match expand {
         Some(expand) => feed::feed_expanding(&mut m, &lexed, &output, 0, expand),
         None => feed::feed(&mut m, &lexed, &output, 0),

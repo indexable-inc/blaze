@@ -997,6 +997,7 @@ dependencies = [
  "blaze-launch",
  "blaze-launch-rt",
  "blaze-lower",
+ "blaze-mem",
  "blaze-own",
  "blaze-scope",
  "blaze-sim",
@@ -1362,6 +1363,7 @@ dependencies = [
  "blaze-lint",
  "blaze-lower",
  "blaze-manifest",
+ "blaze-mem",
  "blaze-own",
  "blaze-proc-macro",
  "blaze-scope",
@@ -1778,14 +1780,9 @@ name = "blaze-toolchain"
 version = "0.0.0"
 dependencies = [
  "blaze-fetch",
- "blaze-manifest",
  "blaze-own",
- "blaze-script",
  "blaze-text",
- "blaze-toml",
  "blaze-unit-graph",
- "edition",
- "serde_json",
 ]
 
 [[package]]
@@ -3854,11 +3851,15 @@ dependencies = [
  "blaze-fetch",
  "blaze-git-fetch",
  "blaze-lex",
+ "blaze-manifest",
  "blaze-own",
  "blaze-script",
  "blaze-sha256",
  "blaze-text",
  "blaze-toml",
+ "blaze-toolchain",
+ "blaze-unit-graph",
+ "edition",
  "serde_json",
 ]
 

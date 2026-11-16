@@ -89,6 +89,9 @@ blaze_format_core::record! {
         pub consts: Slice<Range>,
         pub unhandled: Slice<Node>,
         pub diags: Slice<Node>,
+        /// The read list of identifier patterns: each name asked of the world (its name
+        /// index) and the [`crate::ValueName`] answered, in pattern order.
+        pub value_reads: Slice<Node>,
         pub cfg: Slice<Node>,
         /// The text of the expansions lowered in place, after the item's own: a range from
         /// the item's length on is of this, from there.
@@ -124,6 +127,7 @@ pub struct Columns<'a> {
     pub(crate) consts: AVec<'a, Range>,
     pub(crate) unhandled: AVec<'a, Node>,
     pub(crate) diags: AVec<'a, Node>,
+    pub(crate) value_reads: AVec<'a, Node>,
     pub(crate) cfg: AVec<'a, Node>,
     pub(crate) expanded: AVec<'a, u8>,
     pub(crate) expansion_calls: AVec<'a, Range>,
@@ -154,6 +158,7 @@ impl<'a> Columns<'a> {
             consts: Vec::new_in(alloc),
             unhandled: Vec::new_in(alloc),
             diags: Vec::new_in(alloc),
+            value_reads: Vec::new_in(alloc),
             cfg: Vec::new_in(alloc),
             expanded: Vec::new_in(alloc),
             expansion_calls: Vec::new_in(alloc),
@@ -189,6 +194,7 @@ impl<'a> Columns<'a> {
             consts: &self.consts,
             unhandled: &self.unhandled,
             diags: &self.diags,
+            value_reads: &self.value_reads,
             cfg: &self.cfg,
             expanded: &self.expanded,
             expansion_calls: &self.expansion_calls,
@@ -218,6 +224,7 @@ impl<'a> Columns<'a> {
         let consts = Column::push(&mut out, &self.consts);
         let unhandled = Column::push(&mut out, &self.unhandled);
         let diags = Column::push(&mut out, &self.diags);
+        let value_reads = Column::push(&mut out, &self.value_reads);
         let cfg = Column::push(&mut out, &self.cfg);
         let expanded = Column::push(&mut out, &self.expanded);
         let expansion_calls = Column::push(&mut out, &self.expansion_calls);
@@ -244,6 +251,7 @@ impl<'a> Columns<'a> {
             consts: consts.slice(at, offset_of!(LoweredRoot, consts)),
             unhandled: unhandled.slice(at, offset_of!(LoweredRoot, unhandled)),
             diags: diags.slice(at, offset_of!(LoweredRoot, diags)),
+            value_reads: value_reads.slice(at, offset_of!(LoweredRoot, value_reads)),
             cfg: cfg.slice(at, offset_of!(LoweredRoot, cfg)),
             expanded: expanded.slice(at, offset_of!(LoweredRoot, expanded)),
             expansion_calls: expansion_calls.slice(at, offset_of!(LoweredRoot, expansion_calls)),
@@ -328,6 +336,7 @@ pub fn open<'b>(buffer: &'b [u8], item: &'b str) -> Result<View<'b>, Open> {
         consts: root.consts.follow(buffer)?,
         unhandled: root.unhandled.follow(buffer)?,
         diags: root.diags.follow(buffer)?,
+        value_reads: root.value_reads.follow(buffer)?,
         cfg: root.cfg.follow(buffer)?,
         expanded,
         expansion_calls: root.expansion_calls.follow(buffer)?,
@@ -464,6 +473,7 @@ pub struct View<'b> {
     consts: &'b [Range],
     pub unhandled: &'b [Node],
     pub diags: &'b [Node],
+    pub value_reads: &'b [Node],
     pub cfg: &'b [Node],
     expanded: &'b [u8],
     expansion_calls: &'b [Range],
@@ -711,6 +721,15 @@ impl<'b> View<'b> {
     pub fn diags(&self) -> impl Iterator<Item = Result<Diag, BadRow>> + 'b {
         let lens = self.lens;
         self.diags.iter().map(move |n| Diag::decode(*n, lens))
+    }
+
+    /// The identifier patterns' read list: each name asked of the world and its answer
+    /// ([`crate::value_reads_hold`] asks them again).
+    pub fn value_reads(&self) -> impl Iterator<Item = Result<(NameIdx, crate::ValueName), BadRow>> + 'b {
+        self.value_reads.iter().map(|n| match crate::ValueName::of_code(n.tag) {
+            Some(answer) => Ok((NameIdx(n.a), answer)),
+            None => Err(BadRow { column: "value_reads", tag: n.tag }),
+        })
     }
 
     pub fn cfg_reads(&self) -> impl Iterator<Item = CfgRead> + 'b {

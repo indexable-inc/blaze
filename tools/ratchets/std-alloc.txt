@@ -133,7 +133,7 @@ blaze-testsel	9	1	1	110
 blaze-text	11	0	1	10
 blaze-text-size	0	0	2	4
 blaze-toml	0	0	3	0
-blaze-toolchain	26	1	0	68
+blaze-toolchain	0	1	0	5
 blaze-trace	2	0	6	25
 blaze-tree	13	1	0	108
 blaze-ty	2	0	0	0

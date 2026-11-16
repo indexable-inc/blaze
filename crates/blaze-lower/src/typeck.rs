@@ -689,6 +689,7 @@ impl Conv<'_, '_, '_, '_, '_> {
                     ret,
                     body: c.body,
                     is_async,
+                    is_move: c.capture_by_value,
                 }
             }
             Expr::FormatArgs { row } => self.format_args(row, r)?,

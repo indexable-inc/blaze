@@ -117,25 +117,15 @@ fn encodings() {
 /// Emitting refuses what is outside the subset, naming the instruction.
 #[test]
 fn refuses_what_it_does_not_emit() {
-    let wide = one(&[Ty::I128, Ty::I128], Ty::I128, |b, v| b.binary(Op::Add, Flags::NONE, v[0], v[1]));
-    assert!(matches!(emitted(wide.view(), &[]), Err(EmitError::Signature { .. })));
+    // `i128` division calls compiler_builtins' `__udivti3`, not linked yet (pass/wide.rs).
+    let wide = one(&[Ty::I128, Ty::I128], Ty::I128, |b, v| b.binary(Op::Udiv, Flags::NONE, v[0], v[1]));
+    let refused = emitted(wide.view(), &[]).err();
+    assert!(matches!(refused, Some(EmitError::Unsupported { op: Op::Udiv, .. })), "{refused:?}");
 
-    let float = one(&[Ty::I64], Ty::I64, |b, v| {
-        let f = b.fconst(Ty::F64, 0);
-        let g = b.binary(Op::Fadd, Flags::NONE, f, f);
-        let bits = b.convert(Op::Bitcast, Flags::NONE, Ty::I64, g);
-        b.binary(Op::Add, Flags::NONE, bits, v[0])
-    });
+    // `frem` is a call of `fmod` (pass/float.rs).
+    let float = one(&[Ty::F64, Ty::F64], Ty::F64, |b, v| b.binary(Op::Frem, Flags::NONE, v[0], v[1]));
     let refused = emitted(float.view(), &[]).err();
-    assert!(matches!(refused, Some(EmitError::Unsupported { inst: 1, .. })), "{refused:?}");
-
-    let wide_inside = one(&[Ty::I64], Ty::I64, |b, v| {
-        let w = b.convert(Op::Zext, Flags::NONE, Ty::I128, v[0]);
-        let w = b.binary(Op::Add, Flags::NONE, w, w);
-        b.convert(Op::Trunc, Flags::NONE, Ty::I64, w)
-    });
-    let refused = emitted(wide_inside.view(), &[]).err();
-    assert!(matches!(refused, Some(EmitError::Unsupported { inst: 1, op: Op::Zext, .. })), "{refused:?}");
+    assert!(matches!(refused, Some(EmitError::Unsupported { op: Op::Frem, .. })), "{refused:?}");
 
     let (caller, _) = caller_of(Ty::I32);
     assert_eq!(emitted(caller.view(), &[]).err(), Some(EmitError::NoVia { place: 0 }));

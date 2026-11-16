@@ -76,6 +76,9 @@ pub enum BodyError {
     Rounds { item: LibKey, last: LibKey },
     /// The body's own type table (a copy of the records' table) could not be made.
     Table { item: LibKey, error: blaze_typeck::CheckError },
+    /// An identifier pattern's name, asked at the fn's module ([`ModuleValues`]), names an item
+    /// no outline holds.
+    PatternName { item: LibKey, error: crate::resolve::ResolveError },
     /// The traits in scope at its module could not be read.
     Traits { item: LibKey, error: blaze_scope::names::PathError },
     /// A member fn whose head the store has not made (its container's head is made first).
@@ -109,7 +112,75 @@ impl core::fmt::Display for BodyError {
             BodyError::Rounds { item, last } => write!(f, "fn {item:x}: still needs the head of {last:x} after {MOST_ROUNDS} conversions"),
             BodyError::Traits { item, error } => write!(f, "fn {item:x}: the traits in scope at its module: {error}"),
             BodyError::Table { item, error } => write!(f, "fn {item:x}: its own type table: {error:?}"),
+            BodyError::PatternName { item, error } => write!(f, "fn {item:x}: an identifier pattern's name at its module: {error:?}"),
         }
+    }
+}
+
+/// Why [`ModuleValues`] could not answer.
+enum ValuesFail {
+    Resolve(crate::resolve::ResolveError),
+    Head(HeadError),
+}
+
+/// The module's answer for an identifier pattern of a body lowered in `module`
+/// ([`blaze_lower::ValueNames`]): the name resolved as a one-segment value path written there,
+/// through the same [`Resolver::path`] a body's paths take (its `use`s, globs and the
+/// prelude), and a constructor's shape from its ADT's head in the store. The first failure is
+/// kept and the lowering's `Need` turned into it.
+struct ModuleValues<'n, 's> {
+    names: &'n Names<'n>,
+    module: LibKey,
+    store: &'s mut Store<'n>,
+    keys: &'s mut Keys,
+    failed: Option<ValuesFail>,
+}
+
+impl ModuleValues<'_, '_> {
+    /// The shape of `adt`'s variant `index` (0 for a struct), its head made when not yet.
+    fn shape(&mut self, adt: LibKey, index: u32, unit: blaze_lower::ValueName) -> Result<blaze_lower::ValueName, ValuesFail> {
+        use blaze_lower::ValueName as V;
+        use blaze_typeck::CtorKind;
+        let k = checker_of(adt);
+        if !self.store.adts.contains_key(&k) {
+            self.store.ensure(self.names, self.keys, Want::Adt(adt)).map_err(ValuesFail::Head)?;
+        }
+        let ctor = self.store.adts.get(&k).and_then(|a| a.variants.get(index as usize)).map(|v| v.ctor);
+        Ok(match ctor {
+            Some(CtorKind::Unit) => unit,
+            Some(CtorKind::Tuple) => V::TupleCtor,
+            Some(CtorKind::Braces) | None => V::Nothing,
+        })
+    }
+}
+
+impl blaze_lower::ValueNames for ModuleValues<'_, '_> {
+    fn value_name(&mut self, name: &str) -> blaze_lower::ValueName {
+        use crate::resolve::{Kind, Ns, ResolveError};
+        use blaze_lower::ValueName as V;
+        if self.failed.is_some() {
+            return V::Need;
+        }
+        let target = match (Resolver { names: self.names }).path(self.module, false, &[name], Ns::Value) {
+            Ok(t) => t,
+            // Nothing by that name: the pattern binds it.
+            Err(ResolveError::Path(_)) => return V::Nothing,
+            Err(e @ ResolveError::NoText { .. }) => {
+                self.failed = Some(ValuesFail::Resolve(e));
+                return V::Need;
+            }
+        };
+        let answer = match target.kind {
+            Kind::Const => Ok(V::Const),
+            Kind::Static => Ok(V::Static),
+            Kind::Struct if self.names.ctor(target.key).is_some() => self.shape(target.key, 0, V::UnitStruct),
+            Kind::Variant { adt, index } => self.shape(adt, index, V::UnitVariant),
+            _ => Ok(V::Nothing),
+        };
+        answer.unwrap_or_else(|fail| {
+            self.failed = Some(fail);
+            V::Need
+        })
     }
 }
 
@@ -135,7 +206,7 @@ impl<'n> Body<'n> {
     /// The scope the check loop resolves the body's paths in; `spell` is
     /// `Spelling::of(&self.lowered.view())`.
     pub fn scope<'s>(&'s self, spell: &'s Spelling<'s>) -> BodyScope<'s> {
-        BodyScope { module: self.module, params: &self.params, self_: &self.self_, spell, traits: &self.traits }
+        BodyScope { owner: self.owner, module: self.module, params: &self.params, self_: &self.self_, spell, traits: &self.traits }
     }
 }
 
@@ -268,9 +339,12 @@ pub fn lower_again<'n>(names: &'n Names<'n>, prepared: &Prepares<'n>, keys: &mut
 }
 
 fn lower_fn_into<'n>(names: &'n Names<'n>, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, item: LibKey, into: Option<&mut PortableTys<'static>>) -> Result<Body<'n>, BodyError> {
-    let it = names.item_text(item).ok_or(BodyError::NoText(item))?;
     let krate = names.crate_of(item).ok_or(BodyError::NoText(item))?;
-    let (module, text) = (it.module, it.text);
+    // A fn declared in a body: its kept text, in its enclosing body's module.
+    let (module, text) = match store.locals.head(checker_of(item)) {
+        Some(h) => (h.module, h.text),
+        None => names.item_text(item).map(|it| (it.module, it.text)).ok_or(BodyError::NoText(item))?,
+    };
     let atoms = names.krate(krate).cfg.atoms();
     let sig = blaze_lower::lower_signature(text, names.edition(krate), &mut CrateCfg(atoms), Alloc::global()).map_err(|_| BodyError::Cfg(item))?;
     let mut params = Vec::new_in(Global);
@@ -337,7 +411,14 @@ fn lower_at<'n>(names: &'n Names<'n>, prepared: &Prepares<'n>, keys: &mut Keys, 
 
     let scoped = Scoped { names, module, prepared: Some(prepared) };
     let mut expand = ByName::with_names(&scoped, NoHost, Alloc::global());
-    let lowered = blaze_lower::lower_body_expanding(text, edition, &mut CrateCfg(atoms), &mut expand, Alloc::global()).map_err(|_| BodyError::Cfg(item))?;
+    let mut values = ModuleValues { names, module, store: &mut *store, keys: &mut *keys, failed: None };
+    let lowered = blaze_lower::lower_body_expanding(text, edition, &mut CrateCfg(atoms), &mut values, &mut expand, Alloc::global());
+    match values.failed {
+        Some(ValuesFail::Resolve(error)) => return Err(BodyError::PatternName { item, error }),
+        Some(ValuesFail::Head(error)) => return Err(BodyError::Head { item, error }),
+        None => {}
+    }
+    let lowered = lowered.map_err(|_| BodyError::Cfg(item))?;
     let view = lowered.view();
     let mut findings = Vec::new_in(Global);
     for m in expand.findings() {
@@ -359,6 +440,9 @@ fn lower_at<'n>(names: &'n Names<'n>, prepared: &Prepares<'n>, keys: &mut Keys, 
     if !findings.is_empty() {
         return Err(BodyError::Lowered { item, findings });
     }
+    // The items declared in the body: kept for the command (their text, keys and blocks).
+    let at = super::locals::Enclosing { owner, item, krate, module, text };
+    store.locals.keep(names, keys, at, &view, Alloc::global()).map_err(|error| BodyError::Head { item, error })?;
 
     let mut last = item;
     let mut typeck = None;

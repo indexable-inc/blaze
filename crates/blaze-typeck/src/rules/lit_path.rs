@@ -297,6 +297,28 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     return Ok(self.common.err);
                 };
                 let args = self.explicit_args(at, Some(segs[consumed - 1]), k, 0, adt.generics)?;
+                // `Self::A`, `Alias::A`: a variant of the enum the prefix names, in an
+                // expression or a pattern, before any associated item of that name (rustc's
+                // `associated_path_to_ty` checks the variants first; its deny-by-default lint
+                // `ambiguous_associated_items` refuses a variant and an associated item of one
+                // name through `Self` or an alias, so either order types such a program alike).
+                let seg = segs[consumed];
+                if adt.kind == crate::world::AdtKind::Enum {
+                    if let Some((i, v)) = adt.variants.iter().enumerate().find(|(_, v)| v.name == seg.name) {
+                        let (vkey, ctor) = (v.key, v.ctor);
+                        let def = Def::Ctor { adt: k, variant: i as u32, kind: ctor };
+                        let args = match seg.has_args {
+                            // `E::A::<T>`: the arguments on the variant's segment.
+                            true => self.explicit_args(at, Some(seg), k, 0, adt.generics)?,
+                            false => args,
+                        };
+                        let t = self.ctor_ty(at, k, Some(vkey), ctor, args, Some(seg.name))?;
+                        if !self.is_err(t) {
+                            self.defs.push((at, def));
+                        }
+                        return Ok(t);
+                    }
+                }
                 self.mk(TyView::Adt(k, args))?
             }
             Def::TyParam(i) => self.mk(TyView::Param(i))?,
@@ -436,20 +458,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 // `E::V::<T>`): the last segment that has them.
                 let written = segs.iter().rev().find(|s| s.has_args).copied();
                 let args = self.explicit_args(at, written, adt, 0, info.generics)?;
-                match kind {
-                    CtorKind::Unit => self.mk(TyView::Adt(adt, args)),
-                    CtorKind::Tuple => {
-                        let Some(v) = info.variants.get(variant as usize) else {
-                            self.diag(DiagCode::UnresolvedPath, at, None, None, name);
-                            return Ok(self.common.err);
-                        };
-                        self.mk(TyView::FnDef(v.key, args))
-                    }
-                    CtorKind::Braces => {
-                        self.diag(DiagCode::NotAValue, at, None, None, name);
-                        Ok(self.common.err)
-                    }
-                }
+                let vkey = info.variants.get(variant as usize).map(|v| v.key);
+                self.ctor_ty(at, adt, vkey, kind, args, name)
             }
             // A const parameter is a value of its declared type (the Reference, "Const
             // generics": "const parameters may be used ... as a standalone expression").
@@ -470,14 +480,51 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
     }
 
-    /// `T::name` for a value: inherent items of `T` first, then the traits in scope (and the
-    /// traits of `T`'s bounds when `T` is a parameter).
+    /// The value of a struct's or variant's ctor at the ADT's `args`: the ADT for a unit ctor,
+    /// the ctor's fn item for a tuple one; a braces-only ctor is not a value (E0533's class).
+    fn ctor_ty(
+        &mut self,
+        at: At,
+        adt: ItemKey,
+        variant: Option<ItemKey>,
+        kind: CtorKind,
+        args: TyList,
+        name: Option<Name>,
+    ) -> Result<Ty, Stop> {
+        match kind {
+            CtorKind::Unit => self.mk(TyView::Adt(adt, args)),
+            CtorKind::Tuple => {
+                let Some(v) = variant else {
+                    self.diag(DiagCode::UnresolvedPath, at, None, None, name);
+                    return Ok(self.common.err);
+                };
+                self.mk(TyView::FnDef(v, args))
+            }
+            CtorKind::Braces => {
+                self.diag(DiagCode::NotAValue, at, None, None, name);
+                Ok(self.common.err)
+            }
+        }
+    }
+
+    /// `T::name` for a value: ONE home for an associated value item named `name` of `T`.
+    /// Inherent items of `T` first; an applicable inherent item ends the search (the Reference,
+    /// "Method call expressions": "1. `T`'s inherent methods (methods implemented directly on
+    /// `T`). 2. Any of the methods provided by a visible trait implemented by `T`", the order
+    /// rustc's path probe also keeps). Then the traits in scope, the traits of `T`'s bounds when
+    /// `T` is a parameter, and the trait of the impl the body is a member of (rustc_resolve
+    /// counts the current impl's trait in scope: `Self::g()` in `impl Tr for E` needs no
+    /// `use`). An item reached twice is one candidate: candidates are counted by item key.
     fn assoc_value(&mut self, at: At, cause: Cause, self_ty: Ty, seg: Segment, scope: ScopeId) -> Result<Ty, Stop> {
         if let Some(shape) = self.shape(self_ty) {
             let cands = self.reads.inherent(shape, seg.name)?;
             let mut found: Option<(ItemKey, ItemKey, AssocKind)> = None;
             let mut count = 0u32;
-            for cand in cands {
+            // An item listed twice counts once (a handful of candidates: the scan is short).
+            for (i, cand) in cands.iter().enumerate() {
+                if cands[..i].iter().any(|c| c.item == cand.item) {
+                    continue;
+                }
                 if self.impl_applies(cand.container, self_ty)? {
                     count += 1;
                     if found.is_none() {
@@ -503,6 +550,14 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         if let TyView::Param(i) = self.view(self_ty) {
             self.param_bound_traits(i, &mut traits)?;
         }
+        if let Some(parent) = self.reads.assoc_parent(self.body.owner)? {
+            if let Some(tr) = self.reads.impl_header(parent.container)?.and_then(|h| h.trait_) {
+                traits.push(tr);
+            }
+        }
+        // A trait reached twice (in scope and as a bound, say) is one candidate.
+        traits.sort_unstable();
+        traits.dedup();
         let mut picked: Option<(ItemKey, ItemKey, AssocKind, TyList)> = None;
         let mut count = 0u32;
         for &tr in traits.iter() {

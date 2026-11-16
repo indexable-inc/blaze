@@ -1207,7 +1207,66 @@ Twenty-third port lane (2026-11-16 ~11:00; handing on).
   written into leaked memory before the edit; slot words filled from `place.thunk` on the first
   `RelocTo::Vtable`. ladder_front2 runs `7b-dyn` and `front2/f3-dyn` (blaze-2026.11: the test now
   passes the toolchain shelf for a blaze edition). f3-dyn is refused by the expansion lane's
-  class (`ptr::add`'s `ub_checks` E0425), see rungs-X.
+  class (`ptr::add`'s `ub_checks` E0425), see rungs-X. rungs-X: "7b-dyn: PASS (status 42,
+  stdout byte-equal)" (now in PASSING; 15 PASS).
+- program.rs: a missing head in a survey is filed in `left_out`; `tc::Abi::RustCall` (and a
+  foreign block's "rust-call") maps to the builder's new `Abi::RustCall`.
+- THE FIRST BUILDER TABLE, list-AC: "REACHABLE: 2478 of 2953", "BUILDS: 577 of 1687 clean
+  reachable functions' instances (1110 refused; 849 generic with no instance; 496 left out
+  unchecked)"; largest: 302 UnsupportedSig (associated type in an instance), 145 NoAdt
+  `core::num::niche_types::UsizeNoHighBit` (first: `main`), 58 NoAdt `AlignmentEnum`, 38
+  callee not tabled, 35 Malformed place/scalar. Sent to main.
+- NEXT (mine): the two NoAdt rows (why the seam has no row for a pattern-type/niche ADT: the 145
+  stop `main`), the 38 callees, the 8 NoAbi. The entry's proof is still owed: with the append
+  off (entry-off-2.txt) and on (entry-on-2.txt) the five lines are the same, since no entry
+  program gets past checking yet (`panic_fmt`'s E0425 `panic_impl`; `main(io)` "reaches more
+  than 4096 fns").
+- Told after handing on (not yet run): items-inside-bodies lane: `Front2::new`/`Store::new` take a
+  frame, `make` gets it from its caller, `lower_at` registers local items. Closure identity lane:
+  `PNode::Closure { owner, ordinal, args }`; run.rs ~486's remap arm changed by them; front2's
+  BodyWorld answers `Question::Closure(owner, ordinal)` with `Gap::BodyRecord` today: answering it
+  from the owner's checked record (owner checked first) is the RUN path's job. Rerun rungs and the
+  walk (list-AD) first.
+
+Twenty-fourth port lane (2026-11-16 ~12:00; handing on at the context limit). NOTHING BELOW IS
+COMPILED: blaze-typeck was mid-batch (closure identity: `TyView::ClosureOf`, `Checked::closures`)
+for every check I ran, and mixcheck stopped in check.rs (the speed lane's `add_solver_counts`).
+FIRST JOB: `lanecheck.sh blaze-ladder test "--test front2_project"`, fix my files until it is green.
+- STEP 1 (driver's entry), written: src/front2/project.rs (`ProjectWorld::new(names, frame, user,
+  alloc)`, `bodies(alloc)` (crate 0's free fns and impl/trait fn members, with `BodyAt` file and
+  start), `check(BodyRef, alloc) -> BodyVerdict { diagnostics, gaps, refused, reads }`); `pub mod
+  project` in mod.rs; tests/front2_project.rs (his main clean, `let x: u8 = "a";` one E0308 over
+  the literal, prints "COST: names ..; world ..; first body ..; next body .."). The driver
+  (a0bef5c62a83219e4) was told the signature; it OWES THE COSTS once measured. `reads` is Some
+  only for a clean body (CheckFail::Diags carries no read list). Names from records is not
+  possible: no decoder makes a `CrateNames` from a CrateScope record (told the driver: owner the
+  names library, main).
+- STEP 2 (NoAdt), cause found: both ADT heads are refused in heads, so the seam never files a row.
+  `UsizeNoHighBit(usize is 0..=HALF_USIZE)` (core num/niche_types.rs:129, `HALF_USIZE` :113):
+  pattern_ty.rs's path end was `Why::ConstPath`; NOW `self.array_len(env, p, r)` (a const item's
+  value, `Why::NeedConst` until evaluated) and program.rs's ADT-row loop evaluates a
+  `NeedConst` with `eval_len` and retries (`MOST_ADT_LENS` = 64). `AlignmentEnum`
+  (`#[repr(usize)]`, `_Align1Shl0 = 1 << 0`, core mem/alignment.rs:378-403): heads.rs
+  `discriminants` takes only a literal or a const item: `1 << 0` needs an anonymous constant
+  through the evaluator (consts.rs evaluates items by key only): NOT DONE. The items lane
+  (ac37b21e1a002c5b3) said yes to us writing both functions. Rung owed: the walk's BUILDS line
+  against "577 of 1687" and `main`'s next refusal.
+- STEP 3 (associated types): agreed with the strings/numbers builder lane (now handing on):
+  `Adts::normalize(&self, trait_: ItemKey, name: tc::Name, args: &[PTy], ground: &mut
+  PortableTys<'_>) -> Result<PTy, BuildError>`, default `Err(BuildError::Projection { trait_, name
+  })`; the result must be fully ground (inner projections normalized). Builder side unwritten
+  (its successor's item 1); ours: the impl in program.rs using reach.rs's selection
+  (`callee_target`'s impl choice). Rung: a generic fn over `I: Iterator` naming `I::Item`.
+  SUPERSEDED by the builder's runner 2 (acc14ec1a32420e11), which is building against: ONE
+  defaulted method on `blaze_build::LayoutFacts` (layout.rs): `fn normalize(&self, trait_:
+  ItemKey, name: Name, args: List, ground: &mut PortableTys<'_>) -> Option<PTy> { None }`; `args`
+  a GROUND list, concrete, inner projections already normalized by the builder; the answer MAY
+  hold projections (the builder re-normalizes by a bounded work list); None is its refusal
+  `BuildError::Unnormalized { trait_, name, args }`. OURS: fill it in run.rs's FrontAdts (~531)
+  and FrontConsts LayoutFacts impls; when it lands switch run.rs ~1010's instance key to
+  `blaze_build::instance_key_normalized(code, args, from, ground, facts, scratch)`.
+- ALSO OWED to the builder lane: fill `Adts::float_lit` and add `tc::Lit::CStr` to the strings arm
+  of `literals` (program.rs ~736). Steps 4 (38 callees, 8 NoAbi), 5 (the 4096 cap), 6 not started.
 
 #### Heads lane (2026-11-16, first runner; handing on)
 
@@ -1337,6 +1396,43 @@ Twenty-third port lane (2026-11-16 ~11:00; handing on).
   RefusedImpl" (was 57). NoCheckerType 22 (`u24`, `i24`, `u40`: blaze's wide ints in core's
   num/arbitrary.rs) is the checker's (`IntTy` has standard widths only): told main.
 
+#### Heads lane: types and bounds (2026-11-16, fourth runner; opaque types)
+
+- BUILT (uncommitted), return-position `impl Trait` and `async fn` HEADS, the shape the checker
+  lane (aa7dc8037a6d77238) restated in its message: keys.rs `opaque_key(fn, index)` (a pure
+  function of the fn's key and the index: no build-order dependence; not filed in `Keys`);
+  index = types.rs `return_impls` preorder over the written return type, into bounds' args and
+  `Item = ..` bindings; an `async fn`'s `impl Future` is index 0, written ones follow. heads.rs
+  `fn_head`: `Env.anon` is now `(TypeId, PTy)` (a `Param(i)` for an argument `impl`, an
+  `Opaque(k, identity of all 0..parent+own generics)` for a return one: the 2024 capture rule;
+  lifetimes are erased so older editions give the same list). Each opaque's bounds go to
+  `store.preds[k]` via preds.rs `impl_bounds` (the one home for both positions; was
+  `anon_predicates`), + `Sized` unless `?Sized`; `store.opaques[k] = (fn, index)`;
+  world_items `opaque_hidden` is `Ok(None)` for those keys. Async: `Future` found by
+  langs.rs `future_trait` (core::future::Future through the names library from `Sized`: the
+  store has no lang table); clauses `Future`, `Output == T`, `Sized`. Trait methods (RPITIT):
+  keyed by the trait's fn; an impl's method has its own key; normalizing the trait's opaque to
+  an impl's is NOT done (callers through `M: Tr` see the trait's bounds, which is right).
+- Fixtures (front2_bounds.rs, 35 bodies): mixcheck "bodies ... did not: [\"use_opt_next\"]"
+  (all seven new callers clean; `use_opt_next`, a nested opaque bound by a pattern then
+  `.next()`, is the checker's `Unsatisfied`: moved out of CLEAN, told the checker). Without the
+  fix (opaques not made, async refused): "did not: [\"use_evens\", \"use_evens_bound\",
+  \"use_wrap\", \"use_opt\", \"use_nested\", \"use_make\", \"use_af\", \"an impl member's
+  signature\"]". Whole crate (mixcheck, 11:12): "17 passed, 1 failed": front2_dyn asserted the
+  old `rpit` refusal; updated to expect the head built (front2_dyn.rs ~94): NOT rerun.
+- NEXT RUNNER, in order: rerun `"--test front2_dyn"` and `"--test front2_bounds"`; the core
+  head census (`FRONT2_HEADS_CRATE=core FRONT2_HEADS_OUT=port27/front2/heads-4.txt`, against
+  heads-3 "built 46859 (96.3%)") and the owner's walk (list-CB, against "2347 of 2816", "82 x
+  check: Head"): neither ran: at 11:15 the tree did not build (items lane's `Home`/`Homes`
+  port in buckets.rs/check.rs; tests/front2_project.rs:52 "lifetime may not live long
+  enough", not ours). Expect the walk's Head class to move into checker classes for the
+  DEFINING bodies (see NOT DONE).
+- NOT DONE: the defining bodies: an async fn's body is lowered as a plain block
+  (blaze-lower desugar.rs:280) and the checker must read `sig::ASYNC` (coroutine.rs has async
+  BLOCKS: `TyView::Future(block, output, interior)`); a `-> impl Tr` body checking its
+  returned expression against the bounds: both told to the checker lane. Auto-trait leakage
+  needs the defining body's record.
+
 #### Heads lane: items (2026-11-16, first runner; handing on)
 
 - Const generics are built in every head. `heads::own_generics` gives each const param its
@@ -1461,6 +1557,64 @@ Twenty-third port lane (2026-11-16 ~11:00; handing on).
 - NOT DONE: step 4 (const expressions in signatures: every bstd one is `size_of::<X>()`,
   needing the evaluator to run a generic call with layout), step 5 (trait consts, enum-typed
   const params), the alloc and core census. census-gen-3 ran BEFORE the alias fix.
+
+##### Fourth runner (2026-11-16, ~11:20; handing on)
+
+- Step 1: the third runner's edit compiled ("blaze-ladder: check ok (all targets)"; front2_items
+  "10 passed, 0 failed").
+- NARROWING (a), BY CRATE (buckets.rs `Home`, `trait_home`, `inherent_home`, `adt_marks`;
+  check.rs `make_once` computes the home and every candidate list is cut by it: read, unread,
+  blind, refused alike; each impl's crate comes from `Index::impls[].krate`, no header read).
+  Inherent at `Adt(k)`: only k's crate, unless k has `#[rustc_has_incoherent_inherent_impls]`;
+  every other inherent shape is `Any`. Trait goal `T0: Tr`: only when `Tr` has no parameter but
+  `Self` (head's `generics == 1`, else its text's `param_names`): Tr's crate, plus T0's crate
+  when T0 is a non-`#[fundamental]` ADT or `dyn` of a trait; primitives, tuples, slices, arrays,
+  raw pointers, fn pointers add none; references, `Box`/`Pin`, opaque, closures: `Any`. Fixture
+  `a_refused_impl_blocks_only_its_crates_goals` passes; with `keep_home` disabled:
+  "foreign_inherent: not checked: .. 1 gaps .. main.rs:6, a candidate of this question, has a
+  refused header", FAILED. Suite: "13 passed, 0 failed" (mixcheck 11:11, tree 5afd4638b0).
+- (b) needed nothing new beyond (a) for tempo's cases: the trait path alone and the self head
+  constructor were already read (`file`/`written_shape`). The curve25519 aliases (`type
+  UnpackedScalar`, `type FieldElement`, scalar.rs:1173, field.rs:86) are chosen by
+  `cfg(curve25519_dalek_bits = "64")`, set by its build.rs; without it the 32-bit alias names a
+  module that does not exist (my reading, told to main). `impl PartialEq for FieldElement` still
+  reaches every `PartialEq` question: `PartialEq<Rhs>` has a parameter, so (a) cannot narrow it
+  without the goal's arguments (`Shape` carries only T0): a sound next step is to pass the
+  goal's trait arguments' head constructors to `trait_home`.
+- (c) NOT STARTED: a proof by a built impl standing beside a refused candidate needs a new
+  answer shape from `World::impls_of` (proved-by / candidates-unread): the checker's batch.
+- Type-alias DEFAULTS (tempo's 207 "`alloy_sol_types :: Result < Self >` is written with 1 type
+  arguments; it takes 2"): `Maps::alias_defaults` made in `Store::alias`; types.rs
+  `with_defaults` is the one home for a struct's and an alias's left-out arguments. Fixture
+  `a_type_alias_default_fills_a_left_out_argument` passes.
+- impl 972b915ddd50 = discv5 src/kbucket/key.rs:29, `uint`'s `construct_uint!`: the path
+  `$crate::core_::ops::Mul` answers `Private`; uint lib.rs:19 is `pub use core as core_;`: sent
+  to main (names library). front2 applies no visibility rule of its own.
+- THE SELF-CYCLE (impl e97737e3dcaa, reth_rpc_eth_api core.rs:458, `impl<T> EthApiServer<
+  RpcTxReq<T::NetworkTypes>, ..> for T where T: FullEthApi, ErrorObject<'static>:
+  From<T::Error>`): NOT FOUND. `Store::ensure` prints the stack's keys; [e977, e977] means the
+  stack held two wants of the impl's key (or `MOST_STEPS` ran out with a want popped and pushed
+  forever: a `Need(k)` whose `Store::need(k)` want is "done" at once but whose lookup still
+  fails, e.g. `trait_supers` missing for a trait whose `preds` row exists). Fixture
+  `an_impl_header_needs_not_itself` (a blanket impl with `T::N` in its trait's arguments through
+  an alias and a supertrait) passes: it does NOT reproduce. Added (UNVERIFIED by a compile:
+  the tree was broken by the speed lane's check.rs `add_solver_counts` batch):
+  `HeadError::NeedMade { need, by }` in `Store::ensure`: a want asked again right after it was
+  made is named instead of looping to `MOST_STEPS`. Rerun tempo_contracts and read which.
+- After tempo-front-4 (contracts 909 -> 2070 clean): `Homes { all, bare }` replaces the single
+  home. `bare`: a trait impl written with no trait arguments whose trait's parameters all default
+  to `Self` (`impl PartialEq for A`: `Rhs = Self`) is judged as if the trait had none (filed in
+  `Buckets::bare`). `Home::Incoherent`: an inherent question at a built-in type, reference, or a
+  `#[rustc_has_incoherent_inherent_impls]` type/trait admits only crates whose root text names
+  `rustc_attrs`/`rustc_coherence_is_core` (`Buckets::incoherent`, from each crate's first file,
+  the root). The fixture gained `builtin_inherent` (`7u8.count_ones()`) and `bare_trait`
+  (`u16: PartialEq` against a refused `impl PartialEq for dyn Tr<..>`): both must be clean;
+  the lib compiled with this (mixcheck tree 0565c1a339 failed only in another lane's
+  front2_project.rs); the fixture's run is NOT done yet. A refused alias now names its own
+  refusal ("the type alias `X` is refused: <why>") via `Heads::alias_gap`.
+- Seen in the all-suites mixcheck: front2_main `his_main_through_the_checker` and
+  `the_entry_programs_as_far_as_each_gets` panic at blaze-ty infer.rs:247 (index out of
+  bounds, a variable of another table) against the typeck green snapshot: not attributed.
 
 ## For a successor lane (2026-11-16 03:20, rung 8: the port onto real names)
 
@@ -1872,4 +2026,67 @@ ours): use mixcheck.
   named), Malformed (a record the checker does not make), Diagnostics, NoLiteralValue/NoPatValue,
   NoLangFn, Select, NoAbi, NoStatic, NoConstValue, MissingRecord, NoAdt, Intrinsic, CAbi, Vtable, Lir,
   Verify. The RUN lane's build survey, when relayed, replaces this order.
+
+### Code builder: closures (2026-11-16 ~11:15; handing on)
+
+Uncommitted, in /Volumes/Projects/blaze-fresh-1115. Read codegen.md "Closures and the Fn traits", "The
+design" list first. blaze-emit was red under lanecheck at 11:14 (`enc::sxtw`, not ours): use mixcheck.
+- DONE: a closure's ENVIRONMENT (a tuple of its captures, checker's order), its builder GROUND FORM
+  `Closure(e, (sig, env, FnDef(owner, owner_args), kind))` (instance.rs `ground_with`, `NOT_READY`, key tag
+  20; layout.rs `parts` and the tuple arm), the closure VALUE, a DIRECT CALL, and its BODY as the instance
+  of its kind's `Fn*` method at `[C, (A..)]` (src/closure.rs, a child module of walk.rs; lib.rs `FnTrait`,
+  `ClosureOf`, `closure_of`, `build_closure`, `Adts::fn_trait_method` defaulted). walk.rs touched only at:
+  `Kind`, `build`, `run` (tail moved to `walk_root`), `Walk` fields/`new`, `ground_in`, `repr`, `is_agg`,
+  `layout`'s arm, `raw`'s `Expr::Closure`, the `Expr::Call` dispatch, `call`'s `PNode::Closure` arm.
+- Tests (src/tests/closures.rs, native): no capture (3), by shared reference (42), by mutable reference
+  called twice (1313): "mixcheck test blaze-build: exit 0; 3 passed, 0 failed (against green: blaze-emit)".
+  Whole suite at 11:15: "mixcheck test blaze-build: exit 101; 101 passed, 1 failed": the one red test is
+  `tests::forms::offset_of_adds_each_steps_offset` ("`offset_of!` through a field of a zero-sized or
+  scalar type is not built to LIR yet"), a file this lane never touched; whether it is the other builder
+  lane's work in progress was not checked: check it first.
+- NEXT, in order: `apply<F: Fn/FnMut/FnOnce>` (the overloaded call reaches the same `Fn::call` instance;
+  the test's `run` must build generic fns from refs); the ENTRIES (`call_mut`/`call_once` over a stronger
+  body: `Kind::ClosureEntry`, a thin fn over the ground type alone); zero and three parameters; a closure
+  returning a closure; fn ITEM and fn POINTER shims; `&F: Fn`; `ClosureFnPointer` (walk.rs `adjust`).
+- GAPS (checker's, named): no `move` on `Expr::Closure` and no `ByValue` capture is ever recorded (rules/
+  closure.rs: "captures are only by reference here"), so a by-move capture and its drop cannot be tested
+  through the checker (the builder handles `ByValue`: moved in, owned and dropped by an `FnOnce` body);
+  captures are whole bindings, not places ("Capture precision"); the kind is derived, not recorded.
+- Rule slip to own: instance.rs's one import line was edited with `sed -i` (rule 72); content checked.
+- The other builder lane (strings, slices, numbers) has no id in OWNERS.md yet: not messaged.
+
+### Code builder: strings, slices and numbers (2026-11-16 ~11:25; handing on)
+
+Uncommitted, in /Volumes/Projects/blaze-fresh-1115. Suite: "mixcheck test blaze-build: exit 0; 103 passed,
+0 failed (against green: blaze-core)" (tree 70497c7576); "test blaze-emit: exit 0; 45 passed, 0 failed".
+A later `mixcheck ... test forms` was red only in the closures lane's mid-edit tests/closures.rs.
+- DONE, builder (crates/blaze-build/src/walk/strs.rs, walk/numbers.rs; walk.rs only dispatch):
+  `char` is `Repr::Int { I32, unsigned }` (literal from `int_lit`, checked against the scalar
+  values; char patterns); `c"..."` is data with its nul and a (address, len+nul) pair (literal's
+  bytes from `Adts::byte_str`, nul appended); `offset_of!` sums layout offsets (its `ty` is the
+  BODY's type table: grounded with `ground_in(self.body.types, ..)`; enum steps refused by name);
+  `Repr::Float(F32|F64)` (literals from the NEW `Adts::float_lit`, default None: the RUN lane must
+  fill it from the literal text, and add `tc::Lit::CStr` to `literals`' strings arm in
+  front2/program.rs:736); float arithmetic, `fcmp` oeq/une/olt/ole/ogt/oge, `fneg`, casts both ways;
+  `u128`/`i128` are `Repr::Int { I128 }`. Tests (tests/forms.rs, native): char 1_165_233, CStr 3097
+  and `bytes "616200"`, offset_of 416, f64 3_749_973, u128 0xFFFF_FFFF_FFFF_FFFE.
+- DONE, emitter (blaze-emit pass/float.rs, pass/wide.rs, `Regs`/`Loc` in pass.rs): floats in
+  `v0..v7` (cell holds bits), saturating `fcvtz*` with 8/16-bit clamps, `scvtf`/`ucvtf`, `fcvt`;
+  `i128` in register pairs: add/sub/mul/and/or/xor/neg/not/shifts/icmp/zext/sext/trunc/load/store/
+  select. FINDING: Apple's arm64 does NOT round an `i128` to an even register pair (num_tests.rs
+  failed "Add 0x0 0x0 left: 590295810358705651712" while it did; Linux keeps AAPCS64 C.8). Refused by
+  name: `frem` (fmod), i128 div/rem (`__udivti3`, `__divti3`, `__umodti3`, `__modti3`), i128<->float,
+  `f16`/`f128`, `fcmp one/ueq`.
+- STEP 1 TABLE (what exists): `&str` literal pair, `&[u8]` from an array (unsizing), slice index
+  with the bounds call, `ptr_metadata`/`aggregate_raw_ptr` all existed before (tests
+  a_string_literal_is_data_and_a_length, an_array_reference_unsizes_to_a_slice_pair,
+  an_index_out_of_range_calls_the_bounds_fn); slice patterns `[first, .., last]` still refused
+  ("a slice pattern of a slice", walk.rs); `b"ab"` built (`Lit::ByteStr`); not tried natively:
+  subslice through `Index` (needs ranges + overloaded index: refused "an overloaded index").
+- NEXT, in the survey's order (port27/front2/list-AC.txt "BUILDS"): (1) 302+61 associated-type
+  projections at an instance: wait for the RUN lane's seam method, normalize every lowered type
+  through it; (2) 35 "a place where a scalar was expected" + 6 the reverse: name the form;
+  (3) char/u128/i128 signature refusals should now pass: re-run the survey to confirm; (4) casts of
+  fn items to pointers; (5) `match` on references, tuples, ranges, slices; then slice patterns and
+  overloaded `Index`.
 

@@ -60,6 +60,8 @@ pub struct InferCtx<'a> {
     /// The next error `next_error` hands out.
     error_at: usize,
     closures: HashMap<u128, ClosureRow, Alloc<'a>>,
+    /// Each closure of another body this context made, by its type.
+    foreign: HashMap<Ty, ForeignClosure, Alloc<'a>>,
     /// Each async block's future this body made, by its def: its expression.
     futures: HashMap<u128, ExprId, Alloc<'a>>,
     /// Solver reads (the solver's own log; the body's read list is `Reads`).
@@ -96,6 +98,17 @@ struct ClosureRow {
     expr: ExprId,
     sig: Ty,
     kind: blaze_ty::Const,
+}
+
+/// A closure of another body as typeck sees it (`TyView::ClosureOf`), by the solver type `mk`
+/// made for it: `view` gives it back.
+#[derive(Clone, Copy, Debug)]
+struct ForeignClosure {
+    owner: ItemKey,
+    ordinal: u32,
+    args: TyList,
+    sig: Ty,
+    kind: crate::ty::ClosureKind,
 }
 
 /// A snapshot of the context: the arena's tables and the obligation columns.
@@ -139,6 +152,7 @@ impl<'a> InferCtx<'a> {
             errors: Vec::new_in(alloc),
             error_at: 0,
             closures: HashMap::new_in(alloc),
+            foreign: HashMap::new_in(alloc),
             futures: HashMap::new_in(alloc),
             solver_reads: Vec::new_in(alloc),
             need_rounds: 0,
@@ -180,6 +194,17 @@ impl<'a> InferCtx<'a> {
         self.obs.len()
     }
 
+    /// Adds what this context's solver did into `s` (a measurement: asks.rs `Solve`).
+    pub fn add_solver_counts(&self, s: &mut crate::asks::Solve) {
+        let st = self.solver.stats;
+        s.refills += self.need_rounds;
+        s.frames += st.frames;
+        s.cache_hits += st.cache_hits;
+        s.fast_path += st.fast_path;
+        s.candidates += st.candidates;
+        s.reruns += st.reruns;
+    }
+
     fn node(&self, bits: u32) -> Node {
         match self.terms.cx.tys.node_at(bits) {
             Some(n) => n,
@@ -189,6 +214,24 @@ impl<'a> InferCtx<'a> {
 
     fn bty(&self, t: Ty) -> blaze_ty::Ty {
         ty_of(self.node(t.0))
+    }
+
+    /// A closure's signature (a `FnPtr`, inputs then output) in the solver's "rust-call" form:
+    /// its one input the tuple of the closure's inputs (blaze-solve builtin.rs `callable`).
+    fn rust_call_sig(&mut self, sig: Ty) -> Result<blaze_ty::Ty, CheckError> {
+        let TyView::FnPtr(io, _) = self.view(sig) else {
+            panic!("blaze-typeck: a closure's signature {sig:?} is not a fn pointer")
+        };
+        let n = self.list_len(io);
+        let mut ins: Vec<blaze_ty::Ty, Alloc<'a>> = Vec::with_capacity_in(n.saturating_sub(1) as usize, self.alloc);
+        for i in 0..n.saturating_sub(1) {
+            let t = self.list_get(io, i);
+            ins.push(self.bty(t));
+        }
+        let tupled = self.terms.cx.tys.tuple_of(&ins);
+        let out = self.bty(self.list_get(io, n.saturating_sub(1)));
+        let io = self.terms.cx.tys.mk_list(&[tupled.arg(), out.arg()]);
+        Ok(self.terms.cx.tys.fn_ptr(io, FnHeader::RUST))
     }
 
     fn blist(&self, l: TyList) -> blaze_ty::List {
@@ -302,7 +345,10 @@ impl<'a> InferCtx<'a> {
         }
         for _ in 0..MAX_FILLS {
             let clauses = &self.env_clauses;
-            match self.solver.env(&mut self.terms, &self.facts, clauses, &mut self.solver_reads) {
+            let at = reads.stamp();
+            let r = self.solver.env(&mut self.terms, &self.facts, clauses, &mut self.solver_reads);
+            reads.count_solve(at);
+            match r {
                 Ok(e) => {
                     self.env = Some(e);
                     return Ok(e);
@@ -322,7 +368,10 @@ impl<'a> InferCtx<'a> {
         let env = self.env(reads)?;
         for _ in 0..MAX_FILLS {
             let g = SGoal { env, pred, bound: 0 };
-            match self.solver.evaluate(&mut self.terms, &self.facts, TypingMode::Analysis, g, &mut self.solver_reads) {
+            let at = reads.stamp();
+            let r = self.solver.evaluate(&mut self.terms, &self.facts, TypingMode::Analysis, g, &mut self.solver_reads);
+            reads.count_solve(at);
+            match r {
                 Ok(a) => return Ok(a),
                 Err(blaze_solve::Stop::Need(q)) => {
                     self.fill(q, reads)?;
@@ -348,7 +397,9 @@ impl<'a> InferCtx<'a> {
             if ids.is_empty() {
                 return Ok(());
             }
+            let at = reads.stamp();
             let r = f.select(&mut self.solver, &mut self.terms, &self.facts, TypingMode::Analysis, &mut self.solver_reads);
+            reads.count_solve(at);
             for (j, &i) in ids.iter().enumerate() {
                 let s = f.state[j];
                 if s == State::Fails && self.state[i] == State::Pending {
@@ -454,23 +505,41 @@ impl<'a> TypeCtx for InferCtx<'a> {
                 };
                 self.closures.insert(d, ClosureRow { expr: e, sig, kind });
                 let def = self.terms.bdef(SDef(d));
-                // The solver's closure signature is the reference's "rust-call" form: its one
-                // input is the tuple of the closure's inputs (blaze-solve builtin.rs `callable`).
-                let TyView::FnPtr(io, _) = self.view(sig) else {
-                    panic!("blaze-typeck: closure {e:?}'s signature is not a fn pointer")
-                };
-                let n = self.list_len(io);
-                let mut ins: Vec<blaze_ty::Ty, Alloc<'a>> = Vec::with_capacity_in(n.saturating_sub(1) as usize, self.alloc);
-                for i in 0..n.saturating_sub(1) {
-                    let t = self.list_get(io, i);
-                    ins.push(self.bty(t));
-                }
-                let tupled = self.terms.cx.tys.tuple_of(&ins);
-                let out = self.bty(self.list_get(io, n.saturating_sub(1)));
-                let io = self.terms.cx.tys.mk_list(&[tupled.arg(), out.arg()]);
-                let sig = self.terms.cx.tys.fn_ptr(io, FnHeader::RUST);
+                let sig = self.rust_call_sig(sig)?;
                 let args = self.terms.cx.tys.mk_list(&[kind.arg(), sig.arg(), B::UNIT.arg()]);
                 self.terms.cx.tys.closure(def, args)
+            }
+            // A closure of another body: its def from its identity, its arguments the owner's
+            // then rustc's `[kind, sig, upvars]` (upvars `()`: the captures are the owner's).
+            TyView::ClosureOf { owner, ordinal, args, sig, kind } => {
+                use blaze_solve::term::{CLOSURE_FN, CLOSURE_FN_MUT, CLOSURE_FN_ONCE};
+                let mut h = crate::hash::StableHasher::new("blaze-typeck closure of");
+                h.u128(owner.0);
+                h.u32(ordinal);
+                let def = self.terms.bdef(SDef(u128::from(h.finish())));
+                let k = match kind {
+                    crate::ty::ClosureKind::Fn => CLOSURE_FN,
+                    crate::ty::ClosureKind::FnMut => CLOSURE_FN_MUT,
+                    crate::ty::ClosureKind::FnOnce => CLOSURE_FN_ONCE,
+                };
+                let k = self.terms.cx.tys.const_value(blaze_ty::Ty::uint(blaze_ty::UintTy::Usize), u128::from(k));
+                let solver_sig = self.rust_call_sig(sig)?;
+                let bl = self.blist(args);
+                let n = self.terms.cx.tys.list_len(bl);
+                let mut all: Vec<blaze_ty::Arg, Alloc<'a>> = Vec::with_capacity_in(n as usize + 3, self.alloc);
+                for i in 0..n {
+                    let Some(a) = self.terms.cx.tys.list_get(bl, i) else {
+                        panic!("blaze-typeck: argument {i} of a list of {n}")
+                    };
+                    all.push(a);
+                }
+                all.push(k.arg());
+                all.push(solver_sig.arg());
+                all.push(B::UNIT.arg());
+                let l = self.terms.cx.tys.mk_list(&all);
+                let t = self.terms.cx.tys.closure(def, l);
+                self.foreign.insert(Ty(t.node().bits()), ForeignClosure { owner, ordinal, args, sig, kind });
+                t
             }
             // `Coroutine(def, [output, interior])`; its def a hash of the block's expression, as
             // a closure's (one per block of this body; the owner's key separates bodies).
@@ -575,11 +644,14 @@ impl<'a> TypeCtx for InferCtx<'a> {
                 let k = def_of(tys.item_key(d));
                 // Typeck's view keeps the signature untupled, as the closure was made; the
                 // solver's tupled form (`mk`) shares its variables.
-                let Some(r) = self.closures.get(&k) else { panic!("blaze-typeck: a closure this body did not make") };
                 if tys.list_len(l) < 3 {
                     panic!("blaze-typeck: a closure without its signature")
                 }
-                TyView::Closure(r.expr, r.sig)
+                if let Some(r) = self.closures.get(&k) {
+                    return TyView::Closure(r.expr, r.sig);
+                }
+                let Some(f) = self.foreign.get(&t) else { panic!("blaze-typeck: a closure this context did not make") };
+                TyView::ClosureOf { owner: f.owner, ordinal: f.ordinal, args: f.args, sig: f.sig, kind: f.kind }
             }
             TyKind::Coroutine(d, l) => {
                 let k = def_of(tys.item_key(d));

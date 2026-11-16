@@ -10,7 +10,7 @@
 
 use blaze_toolchain::shelf::Shelf;
 use bstd::cx::Cx;
-use bstd::fs::{Ancestor, Dir, Fs, ReadOnly};
+use bstd::fs::{Dir, Fs, ReadOnly};
 use bstd::mem::{Bytes, Frame};
 use bstd::path::Path;
 
@@ -33,17 +33,10 @@ impl core::fmt::Display for ShelfError {
 
 impl core::error::Error for ShelfError {}
 
-enum At {
-    /// Beneath the start folder.
-    Beneath(Dir<ReadOnly>),
-    /// Beneath an ancestor of the start: every read is under `prefix`.
-    Above { ancestor: Ancestor, prefix: String },
-}
-
 /// The shelf, opened once per command that needs it; files read into `frame`.
 pub struct HomeShelf<'f> {
     place: String,
-    at: At,
+    dir: Dir<ReadOnly>,
     cx: &'f Cx,
     frame: &'f Frame,
 }
@@ -63,41 +56,19 @@ impl AsRef<[u8]> for Held<'_> {
     }
 }
 
-/// The parts of an absolute path, `None` for one that is not absolute or has `.`/`..`.
-fn parts(path: &str) -> Option<Vec<&str>> {
-    let rest = path.strip_prefix('/')?;
-    let parts: Vec<&str> = rest.split('/').filter(|p| !p.is_empty()).collect();
-    (!parts.iter().any(|p| *p == "." || *p == "..")).then_some(parts)
-}
-
 impl<'f> HomeShelf<'f> {
-    /// The shelf under `home`, as seen from the command's start folder `start` (both absolute,
-    /// as the driver gave them).
-    pub fn open(cx: &'f Cx, fs: &Fs, start: &str, home: &str, frame: &'f Frame) -> Result<HomeShelf<'f>, ShelfError> {
+    /// The shelf under `home` (absolute, as the driver gave it), through the effect layer's
+    /// home capability (`Fs::home`): the one way a command reaches a folder outside its root.
+    pub fn open(cx: &'f Cx, fs: &Fs, home: &str, frame: &'f Frame) -> Result<HomeShelf<'f>, ShelfError> {
         let place = format!("{}/{SHELF}", home.trim_end_matches('/'));
         let failed = |said: String| ShelfError { place: place.clone(), said };
-        let (Some(start_parts), Some(shelf_parts)) = (parts(start), parts(&place)) else {
-            return Err(failed(format!("the start folder `{start}` and the home must be absolute")));
-        };
-        let common = start_parts.iter().zip(&shelf_parts).take_while(|(a, b)| a == b).count();
-        let below = shelf_parts[common..].join("/");
-        let at = if common == start_parts.len() {
-            let path = Path::new(&below).map_err(|e| failed(format!("{e}")))?;
-            At::Beneath(fs.open_dir(cx, &path).map_err(|e| failed(format!("{e}")))?.read_only())
-        } else {
-            let up = u8::try_from(start_parts.len() - common).map_err(|_| failed("more than 255 folders above the start".into()))?;
-            At::Above { ancestor: fs.ancestor(cx, up).map_err(|e| failed(format!("{e}")))?, prefix: below }
-        };
-        Ok(HomeShelf { place, at, cx, frame })
+        let folder = Path::new(SHELF).map_err(|e| failed(format!("{e}")))?;
+        let dir = fs.home(cx, home, &folder).map_err(|e| failed(format!("{e}")))?.read_only();
+        Ok(HomeShelf { place, dir, cx, frame })
     }
 
     fn path(&self, name: &str) -> Result<Path, String> {
-        let joined = match &self.at {
-            At::Beneath(_) => name.to_string(),
-            At::Above { prefix, .. } if prefix.is_empty() => name.to_string(),
-            At::Above { prefix, .. } => format!("{prefix}/{name}"),
-        };
-        Path::new(&joined).map_err(|e| format!("{e}"))
+        Path::new(name).map_err(|e| format!("{e}"))
     }
 }
 
@@ -111,10 +82,7 @@ impl<'f> Shelf for HomeShelf<'f> {
 
     fn size(&mut self, name: &str) -> Result<Option<u64>, String> {
         let path = self.path(name)?;
-        let meta = match &self.at {
-            At::Beneath(dir) => dir.stat(self.cx, &path).map_err(|e| format!("{e}"))?,
-            At::Above { ancestor, .. } => ancestor.stat(self.cx, &path).map_err(|e| format!("{e}"))?,
-        };
+        let meta = self.dir.stat(self.cx, &path).map_err(|e| format!("{e}"))?;
         Ok(meta.filter(|m| !m.dir).map(|m| m.len))
     }
 
@@ -122,10 +90,7 @@ impl<'f> Shelf for HomeShelf<'f> {
         let path = self.path(name)?;
         let mut bytes = Bytes::new_in(self.frame, "the toolchain's shelf");
         bytes.try_reserve(usize::try_from(size).map_err(|_| "a file past this machine's address space".to_string())?).map_err(|e| format!("{e}"))?;
-        match &self.at {
-            At::Beneath(dir) => dir.read_all(self.cx, &path, &mut bytes).map_err(|e| format!("{e}"))?,
-            At::Above { ancestor, .. } => ancestor.read_all(self.cx, &path, &mut bytes).map_err(|e| format!("{e}"))?,
-        };
+        self.dir.read_all(self.cx, &path, &mut bytes).map_err(|e| format!("{e}"))?;
         Ok(Held(bytes))
     }
 }
@@ -151,9 +116,10 @@ mod tests {
         let fs = io.need_fs().expect("files");
         let manifest = record::write(&[], &[], blaze_own::Alloc::global()).expect("a record");
         let id = ToolchainView::id_of_bytes(&manifest);
-        let path = Path::new(&format!("{SHELF}/{id}")).expect("a path");
+        // The simulation keeps the home beneath its one root (`Fs::home`).
+        let path = Path::new(&format!("u/me/{SHELF}/{id}")).expect("a path");
         fs.root().publish(&cx, &path, Content::bytes(&manifest), Durable::No).expect("write");
-        let mut home = HomeShelf::open(&cx, &fs, "/u/me", "/u/me", frame).expect("the shelf");
+        let mut home = HomeShelf::open(&cx, &fs, "/u/me", frame).expect("the shelf");
         let opened = shelf::open_manifest(&mut home, id).expect("the manifest");
         assert_eq!(opened.as_ref(), &manifest[..]);
         let other = ToolchainId([3; 32]);

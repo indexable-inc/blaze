@@ -132,6 +132,14 @@ pub const WORDINGS: &[Wording] = &[
         args: 1,
     },
     Wording {
+        area: Area::Cli,
+        number: 14,
+        name: "unresolved",
+        headline: "no {0} in {1}",
+        label: "nothing of this name is here",
+        args: 2,
+    },
+    Wording {
         area: Area::Drive,
         number: 0xC0F6,
         name: "too-many-configurations",

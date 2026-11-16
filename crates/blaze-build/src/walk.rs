@@ -22,6 +22,11 @@ use crate::layout::{LayoutCx, LayoutError, LayoutId, Layouts, Prim, Refusal, Tai
 use crate::vtable::ObjectRead;
 use crate::{Abi, Adts, BuildError, Built, Instance, Intrinsic, Subst, ground};
 
+#[path = "closure.rs"]
+mod closure;
+pub(crate) use closure::closures_in;
+
+mod numbers;
 mod strs;
 
 /// The target's pointer width: the ladder runs on AArch64.
@@ -45,6 +50,8 @@ enum Repr {
     /// `()`, `!`, a fn item: no value.
     None,
     Int { ty: Ty, signed: bool },
+    /// An `f32` or `f64` (walk/numbers.rs).
+    Float(Ty),
     /// An `i8` of 0 or 1.
     Bool,
     Ptr,
@@ -56,7 +63,7 @@ impl Repr {
     /// The LIR type of a scalar.
     fn scalar(self) -> Option<Ty> {
         match self {
-            Repr::Int { ty, .. } => Some(ty),
+            Repr::Int { ty, .. } | Repr::Float(ty) => Some(ty),
             Repr::Bool => Some(Ty::I8),
             Repr::Ptr => Some(Ty::PTR),
             Repr::None | Repr::Agg(_) => None,
@@ -390,7 +397,7 @@ fn int_ty(i: IntTy) -> Result<Ty, TyErr> {
         IntTy::I16 => Ty::I16,
         IntTy::I32 => Ty::I32,
         IntTy::I64 | IntTy::Isize => Ty::I64,
-        IntTy::I128 => return Err(TyErr::Unsupported("i128")),
+        IntTy::I128 => Ty::I128,
     })
 }
 
@@ -400,7 +407,7 @@ fn uint_ty(u: UintTy) -> Result<Ty, TyErr> {
         UintTy::U16 => Ty::I16,
         UintTy::U32 => Ty::I32,
         UintTy::U64 | UintTy::Usize => Ty::I64,
-        UintTy::U128 => return Err(TyErr::Unsupported("u128")),
+        UintTy::U128 => Ty::I128,
     })
 }
 
@@ -425,7 +432,7 @@ fn abi_param(repr: Repr, ty: Ty) -> Param {
                 Ext::Zext
             }
         }
-        Repr::Int { .. } | Repr::Ptr | Repr::None | Repr::Agg(_) => Ext::None,
+        Repr::Int { .. } | Repr::Float(_) | Repr::Ptr | Repr::None | Repr::Agg(_) => Ext::None,
     };
     Param { ext, ..Param::of(ty) }
 }
@@ -468,6 +475,10 @@ pub(crate) enum Kind {
     Body,
     /// The drop glue of its one type argument (`drop_in_place`'s instance).
     DropGlue,
+    /// The instance of trait method `FnTrait` at the closure at this expression (closure.rs):
+    /// its body when the trait is the closure's kind, else a thin entry over the body; the
+    /// body view's root and parameters are the closure's.
+    Closure(ExprId, crate::FnTrait),
 }
 
 pub(crate) fn build<A: Allocator + Clone>(
@@ -480,10 +491,17 @@ pub(crate) fn build<A: Allocator + Clone>(
     alloc: A,
 ) -> Result<Built<A>, BuildError> {
     let mut w = Walk::new(body, checked, subst, adts, alloc);
-    if kind == Kind::Body {
-        w.scan_flags()?;
+    match kind {
+        Kind::Body => {
+            w.scan_flags()?;
+            w.run(sig, kind)?;
+        }
+        Kind::DropGlue => w.run(sig, kind)?,
+        Kind::Closure(closure, which) => {
+            w.scan_flags()?;
+            w.run_closure(closure, which)?;
+        }
     }
-    w.run(sig, kind)?;
     let Walk { b, refs, statics, thread_locals, vtables, .. } = w;
     let func = b.finish().map_err(|error| match error {
         blaze_lir::BuildError::Verify(v) => BuildError::Verify(v),
@@ -641,7 +659,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
 
     /// `t` of table `from` (a signature's, a struct's), grounded at the instance's arguments.
     fn ground_in(&mut self, from: PTys<'_>, t: PTy) -> Result<PTy, TyErr> {
-        ground(from, t, self.args, self.ground, self.scratch).map_err(ground_err)
+        crate::instance::ground(from, t, self.args, self.ground, self.scratch, self.adts.facts()).map_err(ground_err)
     }
 
     /// Type `t` of the record, grounded at the instance's arguments, once per type.
@@ -692,7 +710,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             PNode::Uint(u) => Repr::Int { ty: uint_ty(u)?, signed: false },
             PNode::Never | PNode::FnDef(..) => Repr::None,
             PNode::Tuple(l) if l.len == 0 => Repr::None,
-            PNode::Adt(..) | PNode::Tuple(_) | PNode::Array(..) => {
+            // A closure: a struct of one field, its environment (closure.rs).
+            PNode::Adt(..) | PNode::Tuple(_) | PNode::Array(..) | PNode::Closure { .. } => {
                 let l = self.layout(g)?;
                 if self.layouts[l as usize].size == 0 { Repr::None } else { Repr::Agg(l) }
             }
@@ -708,10 +727,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             PNode::FnPtr(..) => Repr::Ptr,
             // strs.rs: "`char` ... has the same size and alignment as `u32`" (the Reference).
             PNode::Char => Repr::Int { ty: Ty::I32, signed: false },
-            PNode::Float(_) => return Err(TyErr::Unsupported("a float")),
+            PNode::Float(f) => numbers::float_repr(f)?,
             PNode::Str => return Err(TyErr::Unsupported("str")),
             PNode::Slice(_) => return Err(TyErr::Unsupported("a slice")),
-            PNode::Closure(..) => return Err(TyErr::Unsupported("a closure")),
             PNode::Future(..) => return Err(TyErr::Unsupported("an async block's future")),
             PNode::Dynamic(_) => return Err(TyErr::Unsupported("a trait object (`dyn`)")),
             PNode::ExTrait(..) | PNode::ExProj { .. } | PNode::ExAuto(_) => {
@@ -732,7 +750,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             Repr::None => (0, 0),
             Repr::Bool => (1, 0),
             Repr::Ptr => (PTR_BITS / 8, 3),
-            Repr::Int { ty, .. } => {
+            // "Type layout": each primitive's alignment is its size on this target (`u128` and
+            // `i128` 16 since the 1.77 toolchains, `f64` 8).
+            Repr::Int { ty, .. } | Repr::Float(ty) => {
                 let bytes = ty.bits(PTR_BITS) / 8;
                 (bytes, bytes.trailing_zeros() as u8)
             }
@@ -748,7 +768,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         match repr {
             Repr::None => 0,
             Repr::Agg(l) => self.layouts[l as usize].leaves,
-            Repr::Int { .. } | Repr::Bool | Repr::Ptr => 1,
+            Repr::Int { .. } | Repr::Float(_) | Repr::Bool | Repr::Ptr => 1,
         }
     }
 
@@ -765,6 +785,14 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         Ok(match self.ground_node(g)? {
             PNode::Adt(..) | PNode::Array(..) => true,
             PNode::Tuple(l) => l.len > 0,
+            // Its environment is a tuple: an aggregate when it captures something.
+            PNode::Closure { .. } => {
+                let env = self.closure_parts(g)?.env;
+                match self.ground_node(env)? {
+                    PNode::Tuple(l) => l.len > 0,
+                    _ => return Err(TyErr::Malformed("a closure's environment that is not a tuple")),
+                }
+            }
             PNode::Ref(..) | PNode::Ptr(..) => {
                 let id = self.ls_of(g)?;
                 self.ls.get(id).pair.is_some()
@@ -887,7 +915,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                             .get(variant.fields.range())
                             .ok_or(TyErr::Malformed("an ADT's fields past their column"))?;
                         for f in fields {
-                            let ft = ground(adt.types, f.ty, &args, self.ground, self.scratch).map_err(ground_err)?;
+                            let ft = ground(adt.types, f.ty, &args, self.ground, self.scratch, self.adts.facts()).map_err(ground_err)?;
                             parts.push((f.name, ft));
                         }
                         variant_ends.push(parts.len() as u32);
@@ -910,6 +938,11 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 PNode::Array(et, n) => {
                     parts.push((Name(0), et));
                     array_len = Some(self.ground_len(n)?);
+                }
+                // A closure: a struct of one field, its environment (closure.rs).
+                PNode::Closure { .. } => {
+                    let env = self.closure_parts(t)?.env;
+                    parts.push((Name(0), env));
                 }
                 _ => return Err(TyErr::Malformed("a layout asked of other than an aggregate")),
             }
@@ -2290,6 +2323,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let abi = match kind {
             Kind::DropGlue => Abi::Rust,
             Kind::Body => self.adts.abi(owner).ok_or(BuildError::NoAbi { item: owner })?,
+            Kind::Closure(..) => return Err(malformed("a closure's body built as a fn's (closure.rs builds it)")),
         };
         let mut reprs = Vec::with_capacity_in(sig.inputs.len(), self.alloc.clone());
         let mut passes = Vec::with_capacity_in(sig.inputs.len(), self.alloc.clone());
@@ -2383,6 +2417,12 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             }
             self.own_pat(p)?;
         }
+        self.walk_root()
+    }
+
+    /// Walks the body's root to its value and returns it: the rest of a fn after its parameters
+    /// are bound (`run`, closure.rs `run_closure`).
+    fn walk_root(&mut self) -> Result<(), BuildError> {
         self.work.push(Task::Eval(self.body.root));
         while let Some(task) = self.work.pop() {
             self.step(task)?;
@@ -2959,6 +2999,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     (UnOp::Not, Repr::Int { ty, .. }) => {
                         let x = self.scalar(v, ty)?;
                         self.b.unary(Op::Not, Flags::NONE, x)
+                    }
+                    (UnOp::Neg, Repr::Float(ty)) => {
+                        let x = self.scalar(v, ty)?;
+                        self.b.unary(Op::Fneg, Flags::NONE, x)
                     }
                     (UnOp::Not, Repr::Bool) => {
                         let x = self.scalar(v, Ty::I8)?;
@@ -4220,9 +4264,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                         self.work.push(Task::Eval(callee));
                         return Ok(());
                     }
-                    // A closure called directly: its body is not built yet (codegen.md,
-                    // "Closures and the Fn traits").
-                    PNode::Closure(..) => return Err(unsupported(e, "a direct call of a closure")),
+                    // A closure called directly: a call of its body, the instance of its kind's
+                    // `Fn*` method, with its environment as `self` (closure.rs).
+                    PNode::Closure { .. } => return self.push_closure_call(e, callee, list),
                     // An overloaded call through `Fn*` (the checker's callee row): the callee is
                     // `self`, evaluated with its adjustments (the borrow of `call`/`call_mut`),
                     // then the arguments, each a field of the method's tuple (lib.rs
@@ -4410,7 +4454,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.work.push(Task::Eval(index));
                 self.push_index_base(base)?;
             }
-            Expr::Closure { .. } => return Err(unsupported(e, "a closure")),
+            // Its environment, built from the captured bindings (closure.rs).
+            Expr::Closure { .. } => self.closure_value(e)?,
         }
         Ok(())
     }
@@ -4456,7 +4501,11 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.vals.push(v);
                 return Ok(());
             }
-            Lit::Float(_) => return Err(unsupported(e, "a float literal")),
+            Lit::Float(_) => {
+                let v = self.float_lit(e)?;
+                self.vals.push(v);
+                return Ok(());
+            }
         };
         self.vals.push(V::Scalar(v));
         Ok(())
@@ -4523,6 +4572,12 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let rty = rrepr.scalar().ok_or(unsupported(e, "a binary operator on a non-scalar"))?;
         let l = self.scalar(l, lty)?;
         let r = self.scalar(r, rty)?;
+        // walk/numbers.rs: IEEE comparisons and arithmetic.
+        if let Repr::Float(_) = lrepr {
+            let v = self.float_binary(e, op, l, r)?;
+            self.vals.push(V::Scalar(v));
+            return Ok(());
+        }
         let signed = matches!(lrepr, Repr::Int { signed: true, .. });
         let cond = match op {
             BinOp::Eq => Some(IntCond::Eq),
@@ -4572,7 +4627,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 let addr = self.resize(x, ty, Ty::I64, signed);
                 V::Scalar(self.b.convert(Op::FromExposed, Flags::NONE, Ty::PTR, addr))
             }
-            _ => return Err(unsupported(e, "this cast (a float, a char, a fn item to a pointer)")),
+            (Repr::Float(_), _) | (_, Repr::Float(_)) => self.float_cast(e, v, from, to)?,
+            _ => return Err(unsupported(e, "this cast (a fn item to a pointer)")),
         };
         self.vals.push(out);
         Ok(())
@@ -4612,6 +4668,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                         list.extend_from_slice(written);
                         return self.call_pointer(e, &list, header.abi);
                     }
+                    // A closure called directly (closure.rs `push_closure_call`).
+                    PNode::Closure { .. } => return self.closure_call(e, callee, written),
                     // The checker's `Fn*::call*` at `[callee's type, tuple of the arguments]`,
                     // the callee (adjusted: borrowed for `call` and `call_mut`) its `self`.
                     _ => {

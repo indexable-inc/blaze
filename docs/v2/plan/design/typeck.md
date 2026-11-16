@@ -1493,6 +1493,65 @@ started, its result line not captured. The rust-call test: passed (not in the fa
 - NOT STARTED: step 5 (`{ None }` for an `Option<u8>` const parameter: `variant_value` makes
   `Adt(enum, [])`, without the enum's arguments; then E0283 in bstd::kv::<impl Kv<P>>::get).
 
+(12) Runner after (11) (2026-11-16):
+- tempo's "347 diag E0308" is NOT a method-probe bug and not the checker's: alloy `sol!` writes
+  a no-parameter function or error as `#[derive(Clone)] pub struct MCall;` (alloy-sol-macro-
+  expander 1.7.3 expand/function.rs `pub struct #call_name;`, expand/error.rs), and blaze-
+  expand's derive writes `match self { MCall => MCall, }`. blaze-lower machine.rs:2154 makes
+  the pattern `Pat::Bind { candidate: true }`; no step reads `candidate`, and the arm's
+  `MCall` resolves to that binding (the Reference, "Identifier patterns": "Path patterns take
+  precedence over identifier patterns"). Reduction: front2_clone.rs
+  `unit_struct_patterns_through_front2` (#[ignore]d, owner named): "by_hand: diagnostics
+  [(Mismatch, Range { start: 52, end: 57 }, \"found Some(\\\"&MCall\\\"), expected
+  Some(\\\"MCall\\\")\")]", the same for the derived `clone`s of `MCall` and `NCall`; the
+  enum's derived `clone` (`Clone::clone(__self_0)`, a path call: no probe) is clean. Owner:
+  blaze-lower's scoped resolution (the items-inside-bodies lane handed on; told the
+  coordinator). The fix needs the world (is the name a unit struct, unit variant or const?),
+  so the decision belongs in resolve.rs, re-pointing the arm's uses from the binding to the path.
+- The probe rule asked for ("a candidate whose applicability is unknown stops the probe") holds
+  by construction, so nothing was added: `instantiate_method` reaches the world through
+  `impl_header`/`fn_sig` (`Fetch` `Missing` becomes `Stop` through `?`) and `may_hold`, whose
+  `evaluate` fills a `Need` from the world or stops; `Answer::Maybe` counts as applying (picked,
+  or E0034 with another). A candidate is passed over only on `None` (no such item) or
+  `Answer::No`. No fixture: there is no rule to remove. CHANGING: the speed lane
+  (a654be8e86b3bc929) is making a world `Missing` a HOLE: `Reads` returns a stand-in (`None`,
+  `&[]`) and records the question, so the probe WILL pass over a candidate on a hole; it stays
+  sound only because a run that met any hole returns `Outcome::Need` and no result (lib.rs
+  `run`). Keep that invariant: no diagnostic may leave a run with a hole.
+- Return-position `impl Trait`, the checker's side: the solver already instantiates an opaque's
+  bounds at the alias's arguments (`bound_pred` then `import_pred(portable, p, largs)`, alias.rs
+  :701); `OpaqueDef.generics` is read by no opaque path (grep), so the hard-coded 0 in facts.rs
+  is harmless as long as the front end numbers the bounds' parameters as the identity list.
+  Fixture world: `Fx::opaque_key`/`set_opaque_bounds`; suite/opaque.rs (a generic `mk<T>() ->
+  impl Tr<Out = T>`: the caller proves `Tr` and normalizes `Out` to `u8`; a `u16` return is
+  E0308). NOT RUN: blaze-typeck did not compile under the closure-identity lane's open batch
+  (`PNode::Closure { .. }`, 15 errors in its files). Run `lanecheck.sh blaze-typeck test opaque`
+  first. Not built: the defining body (hidden type = the returned expression's type, which must
+  satisfy the bounds), auto-trait leakage (structural.rs asks `hidden`; `None` is ambiguous).
+  The types-and-bounds lane (a5cc7587e39092659) BUILT the world side, uncommitted:
+  front2/keys.rs `opaque_key(fn_key, index)` (preorder over the return type; an async fn's
+  `impl Future` is 0), `Opaque(k, L)` with L = Param/ConstParam over parent+own incl. APIT,
+  `predicates(k)` = bounds + Sized + bindings as projections (async: `Future`, `Output == T`),
+  `opaque_hidden` = Ok(None). Its fixtures (front2_bounds.rs) were clean before the closure
+  batch. TWO for this lane: (a) `match opt_iter() { Some(mut i) => i.next(), None => None }`
+  (an opaque inside `Option`, then a method) gives `DiagWithoutPlace { code: Unsatisfied }`
+  while `let mut i = evens(); i.next()` is clean; (b) the defining body: an async fn's body is
+  lowered as a plain block (blaze-lower desugar.rs:280), so the checker must read `sig::ASYNC`
+  (tail type = the future's `Output`), and a `-> impl Tr` body must check its returned expr
+  against the bounds.
+- Head census questions: (1) `u24`/`i24`/`u40` (core num/arbitrary.rs): `IntTy`/`UintTy` hold
+  the standard widths only; the type needs a width-carrying form (`Int { signed, bits }`) in
+  ids.rs, portable.rs and blaze-ty, literal range checks by bits, casts by bits, and the
+  operator impls are the library's: one batch with the code builder. Not built. (2) `T::X<A>`
+  (a GAT with type arguments): the projection term is `Alias(trait, args)`: the associated
+  type's own arguments go after the trait's (rustc's `AliasTy` args are the trait's then the
+  item's own), and `AssocTy.own_generics` (facts.rs, 0 today) says how many. Not built.
+- bstd census-gen-3: "6 diag E0308" (`None` against `Option<Arc<Budget>>`, `Ok(None)` found
+  `Error`) and "7 diag E0283" (`Error: Rights` at `Self::refuse`) look like (11)'s step 5
+  (`variant_value` without the enum's arguments): unproven. "13 diag E0599": `P::WRITE` (an
+  associated const through a parameter's bound) and `self.code.hash(state)` on `ContentId`.
+  Not reduced.
+
 ## Closures against `Fn` bounds (2026-11-16, closures lane)
 
 The library's definitions (library/core/src/ops/function.rs): `#[lang = "fn_once"] pub trait
@@ -1564,6 +1623,25 @@ its signature substituted by `args`; the solver sees rustc's layout `[args.., ki
 so its `Fn*` rules read the signature and the kind from the type with no change. Inside the
 owner's body nothing changes: a closure is `TyView::Closure(expr, sig)` while its signature is
 inferred, and writeback names it by ordinal.
+
+Counting (decided 2026-11-16): the owner is always the ITEM; every `Expr::Closure` of its body,
+nested ones included (a closure inside a closure is the item's too, not the outer closure's), is
+numbered in `ExprId` order, which is the lowering's order of the text. An edit inside one closure
+can renumber the closures after it; that is harmless, because any edit in the body changes the
+owner's body key, so no record keyed by the old text survives it. `move` comes from the lowering's
+`Closure::capture_by_value` (blaze-lower already records it) through `tc::Expr::Closure::is_move`.
+
+The sites of the one batch (found by search, 2026-11-16): blaze-typeck: portable.rs (the variant,
+`node_children`, `hash_node`), ty.rs (`TyView::ClosureOf`), columns.rs (`Checked::closures`), world.rs
+(`Question::Closure`, `World::closure`, `Reads::closure`, `ClosureFacts`), asks.rs (kind 18),
+machine.rs (`lower_node`, `children`, `shape`), infer/mod.rs (`mk`, `view`), infer/facts.rs
+(`convert` refuses), instance.rs (`import` through the question, `export`, `shape_of`),
+rules/writeback.rs (export by ordinal, the closures table), rules/closure.rs (`ByValue`, `move`),
+rules/call.rs (a direct call of a foreign closure), body.rs (`is_move`), fixture.rs (`Fx.closures`,
+`World::closure`, `show`), toy.rs; blaze-lower typeck.rs (`is_move`); blaze-build instance.rs,
+closure.rs, walk.rs, layout.rs, tests.rs (only what must compile); blaze-ladder front2 types.rs,
+check.rs, buckets.rs, world_items.rs (`closure`: a `Gap::BodyRecord`), front.rs, run.rs; blaze-real
+examples/check.rs; blaze-flow-lower lib.rs.
 
 ## Overloaded deref and `?` on the real world (2026-11-16, second checker lane)
 
@@ -1643,6 +1721,39 @@ asks only the names library at the body's module.
 core macro's case, the 74 E0425 of census-gen-3 and the 275 of the owner's walk), then `use`,
 `struct`/`enum` with inherent impls, then item 5.
 
+**Runner 2: what is built (2026-11-16, ~11:40; handing on, NOT YET RUN).** Written, compiled
+once for step 1 only (mixcheck "check ok (all targets) at 11:16; tree d3616b8a88"); steps 2 to 3
+are written but never compiled: every later build stopped in other lanes' mid-edits (buckets.rs
+`Home::admits`, check.rs `add_solver_counts` against blaze-typeck, blaze-typeck's closure
+`PNode::Closure`). The next runner's FIRST call: `lanecheck.sh blaze-ladder test "--test
+front2_locals"` (or mixcheck), fix what is mine, quote the line.
+- THE TEXT (coordinator's decision): `Front2::new(names, frame, user)` takes the caller's
+  `&'n blaze_mem::Frame` (kept as `front.frame`); `Store::new(sized, frame)`; `Store.locals`
+  (front2/locals.rs `Locals<'n>`, its maps and slices in the frame). `Front2Program::new` and
+  `survey` take the frame too; run.rs makes it. Every caller updated (tests, examples,
+  tempo_front leaks one for 'static). `Names<'n>` is invariant: a frame made in an inner block
+  does not live long enough; front2_main's reversed run reuses `front.frame`.
+- body.rs `lower_at` calls `store.locals.keep(..)` after a clean lowering: a body with no
+  LocalItem row keeps nothing; else each row: kind (syntax), name, item-relative site, text (a
+  slice of the fn's own text, or a frame copy where an expansion wrote it), key
+  `key_of(crate, key_of(crate, item, "Body", hex(owner), 0), tag, name, ordinal)` with INNER set,
+  filed in `Keys`; a `use` row per leaf of `blaze_scope::task::use_leaves` (a glob in a block
+  is refused by name). `lower_fn_into` reads a local fn's text/module from `store.locals`.
+- LOOKUP `Locals::find(owner, scope, name, ns)`: the block chain innermost first, then (for a
+  local item's own body) the blocks around its declaration; bounded loops, no recursion.
+  world_paths.rs `BodyWorld::path(scope, ..)` asks it after `Self` and the generics, before the
+  module: fn/const/static answer with the derived key (a fill of `Want::Fn` first if the head
+  is not made); a local `use` rewrites the path to its target and resolves at the module; any
+  other form (struct, enum, impl, trait, mod, alias) is `Gap::Local(LocalGap{item, form,
+  range})`. `BodyWorld.owner` and `BodyScope.owner` carry the body's key; reach.rs passes
+  `bp.scope`.
+- HEADS: heads.rs `Store::step` takes (detail, text, module) from `locals.head_of` first (fn,
+  const, static; other kinds an `Unsupported(form, range)` refusal), so the head is made by the
+  same `fn_head` from the frame's text, in the enclosing module with no outer generics.
+- Census prints "LOCALS: bodies that kept their local items (shared store): N".
+- NOT DONE: steps 3's local structs and impls (gap, not built: `adt` reads variants and ctors
+  from the names library), the census and walk numbers, `front2_order` fixtures, front2_panics.
+
 ## Speed on real code (2026-11-16)
 
 Stage one of D62, the checker's side. Measured with `crates/blaze-ladder/examples/check_speed.rs`
@@ -1702,8 +1813,53 @@ blaze-typeck's suite (114 passed) held after each change.
    203.3 questions per check, ratio 25.0x to the no-world floor: the next profile is the
    solver's, not the world's (world answers 85.9 ms, hashing 47.9 ms).
 
+**Holes: every need in one round (built 2026-11-16, second runner).** A missing world answer
+is a HOLE (world.rs `Hole`), a different thing from a GAP: the seam (`Reads::record_with`)
+records the question and hands the rule the answer type's stand-in (`Holed`: `None`, `&[]`,
+empty predicates), and the walk goes on. A run that met any hole makes NO result (lib.rs
+`run`): not its types, not its diagnostics, not an error met past the hole; it returns
+`Need { missing: every hole sorted, first: the one firm need, questions: the hints }`. So a
+hole can change no answer, and a rule needs no case for it. Holes met after the first are
+speculative; the caller (front2 check.rs `make_round`) drops a fill it cannot make while
+another fill of the round was made (counted: "speculative needs dropped N"); a round that
+made nothing names the least refusal, as before. A `Stop::Need` a rule or the solver makes
+itself still ends the walk (it joins the holes): a fact fill that reads a hole's `None`
+answers `Malformed`, so the solver's chains stop the walk early: what is left of rounds.
+Tests (blaze-typeck tests.rs): `five_missing_records_come_back_in_one_round` failed before
+the change with "the first round named 1 of the 5 missing records: [FnSig(ItemKey(1)),
+Predicates(ItemKey(1)), Adt(ItemKey(327680)), Lang(Deref)]" and passes after (two rounds,
+clean); the rounds oracle (a record after N rounds equals one run over the full world, byte
+for byte) with two planted bugs, each caught: `HolePlant::KeepEarlierReads` (an earlier
+round's questions enter the read list) and `HolePlant::AnswerThroughHoles` (a holed run makes a
+result; `a_hole_never_makes_a_diagnostic` shows the control's stand-in diagnostics). The ask
+log's `Order::Pull` model (stop at the first miss) is now an upper bound on rounds, and its
+control loses as many rounds' fetches as the bound allows.
+Counters added for the solver's profile (asks.rs `Solve`, printed by check_speed as "solver:"
+and "checker phases:"), and `late_holes`: the holes second and later runs meet, by kind.
+
 ## Not decided here
 
 - Whether a run stopped at `Need` should save its state instead of re-entering: decided by a
   profile of re-entries on reth and tempo.
 - Regions: typeck erases them as rustc does; the borrow checker keeps its own.
+
+## Path patterns (2026-11-16)
+
+- Built (blaze-lower): every identifier pattern is settled once, at the end of the lowering
+  (machine.rs `settle_patterns`), innermost first: an item declared in the body's blocks
+  (`local_value`: const, static, fn, unit/tuple struct by its text), else the caller's oracle
+  `ValueNames::value_name` (lib.rs; one question, the module's value-namespace answer as a
+  `ValueName`). A bare const / unit struct / unit variant becomes `Pat::Path`, and every
+  `Expr::Local` that named its binding becomes `Expr::Path`; static, tuple ctor, or a
+  `ref`/`mut`/`@` binding of any of those is `DiagKind::PatternShadows` (E0530) at the name.
+  `Pat::Bind`'s `candidate` field is gone. Every oracle answer is in the record's read list
+  (`value_reads` column, `View::value_reads`, `value_reads_hold`); key domains bumped.
+- `None =>` had no special case: it bound a variable named `None` (the arm always matched).
+- front2 answers through `Resolver::path` and the store's ADT heads (body.rs `ModuleValues`).
+  OWED: front.rs (the old front) and the census/stats examples pass the `NoModule` fixture;
+  a local `use E::*;` inside a body is not seen (local `use` items carry no name: the
+  items-inside-bodies lane's resolution); const generic parameters as patterns (E0158).
+- Tests: blaze-lower tests.rs `identifier_patterns_are_paths_where_the_name_is_one`,
+  `a_binding_that_becomes_a_constant_is_lowered_again` (115 passed). front2_clone.rs
+  `unit_struct_patterns_through_front2` (11 cases) NOT RUN: blaze-consteval red under the code
+  builder's `blaze_build::ground` batch; still `#[ignore]`d.

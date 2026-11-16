@@ -17,8 +17,10 @@ use crate::{
 
 mod atomic;
 mod bulk;
+mod float;
 mod int;
 mod tls;
+mod wide;
 
 /// `brk` immediates of the traps the pass makes itself; a LIR `trap`'s code is its own `brk`
 /// immediate, so codes from here up are refused.
@@ -105,7 +107,7 @@ pub(crate) fn run<A: Allocator>(
     }
     let sig = view.sigs.get(view.head.sig as usize).map(|_| view.sig(SigId(view.head.sig)));
     let Some(sig) = sig else { return Err(EmitError::Signature { why: "no signature row" }) };
-    check_sig(view, view.sigs[view.head.sig as usize], sig.params, sig.rets)
+    check_sig(view, isa, view.sigs[view.head.sig as usize], sig.params, sig.rets)
         .map_err(|why| EmitError::Signature { why })?;
 
     // The frame: a 16-byte cell per value, then each slot at its alignment, then the staging
@@ -175,18 +177,28 @@ pub(crate) fn run<A: Allocator>(
     }
     // The parameters arrive in x0..x7, their bits above the width unspecified; an `sret`
     // pointer in x8, a `byval` one as the next integer parameter.
-    let mut gpr: Reg = 0;
+    // A float in the next `v` register, an `i128` in an even pair (`Regs`).
+    let mut regs = Regs::new(isa.os);
     for (inst, param) in view.params(Block(0)).zip(sig.params) {
-        let width = pass.width(view.ty(Value(inst as u32))).ok_or(EmitError::Signature {
-            why: "an entry parameter that is not an integer or pointer of at most 64 bits",
-        })?;
+        let ty = view.ty(Value(inst as u32));
         let reg = match param.kind == ParamKind::Sret as u8 {
             true => X8,
-            false => {
-                gpr += 1;
-                gpr - 1
-            }
+            false => match regs.next(ty) {
+                Some(Loc::X(r)) => r,
+                Some(Loc::Pair(r)) => {
+                    pass.st2(r, r + 1, inst);
+                    continue;
+                }
+                Some(Loc::V(v)) => {
+                    pass.float_in(v, inst, ty == Ty::F64);
+                    continue;
+                }
+                None => return Err(EmitError::Signature { why: "an entry parameter past the registers" }),
+            },
         };
+        let width = pass.width(ty).ok_or(EmitError::Signature {
+            why: "an entry parameter that is not an integer, a pointer, an `f32`, an `f64` or an `i128`",
+        })?;
         match width < 64 {
             true => {
                 pass.put(enc::zext(X9, reg, width));
@@ -209,7 +221,7 @@ pub(crate) fn run<A: Allocator>(
 }
 
 /// Why a signature is outside the subset, if it is.
-fn check_sig(view: View<'_>, rec: SigRec, params: &[ParamRec], rets: &[ParamRec]) -> Result<(), &'static str> {
+fn check_sig(view: View<'_>, isa: Isa, rec: SigRec, params: &[ParamRec], rets: &[ParamRec]) -> Result<(), &'static str> {
     if rec.conv != Conv::C as u8 {
         return Err("a calling convention other than the target's C one");
     }
@@ -220,11 +232,20 @@ fn check_sig(view: View<'_>, rec: SigRec, params: &[ParamRec], rets: &[ParamRec]
     if srets > 1 {
         return Err("more than one `sret` parameter");
     }
-    if params.len() - srets > 8 {
-        return Err("more than 8 integer parameters past an `sret` (the rest go on the stack)");
+    let mut regs = Regs::new(isa.os);
+    for param in params.iter().filter(|it| it.kind != ParamKind::Sret as u8) {
+        if regs.next(Ty(param.ty)).is_none() {
+            return Err("more than 8 integer or 8 float parameters past an `sret` (the rest go on the stack)");
+        }
     }
-    if rets.len() > 2 {
-        return Err("more than two returns (a composite past 16 bytes returns through `sret`)");
+    let mut regs = Regs::new(isa.os);
+    for ret in rets {
+        match regs.next(Ty(ret.ty)) {
+            Some(Loc::X(r)) if r < 2 => {}
+            Some(Loc::Pair(0)) => {}
+            Some(Loc::V(v)) if v < 4 => {}
+            _ => return Err("returns past `x0:x1` and `v0..v3` (a composite past 16 bytes returns through `sret`)"),
+        }
     }
     for param in params {
         match ParamKind::from_byte(param.kind) {
@@ -244,13 +265,64 @@ fn check_sig(view: View<'_>, rec: SigRec, params: &[ParamRec], rets: &[ParamRec]
         let fits = ty.is_scalar()
             && matches!(
                 ty.elem(),
-                Scalar::I1 | Scalar::I8 | Scalar::I16 | Scalar::I32 | Scalar::I64 | Scalar::Ptr
+                Scalar::I1
+                    | Scalar::I8
+                    | Scalar::I16
+                    | Scalar::I32
+                    | Scalar::I64
+                    | Scalar::I128
+                    | Scalar::Ptr
+                    | Scalar::F32
+                    | Scalar::F64
             );
         if !fits {
-            return Err("a parameter or return that is not an integer or pointer of at most 64 bits");
+            return Err("a parameter or return that is not an integer, a pointer, an `f32` or an `f64`");
         }
     }
     Ok(())
+}
+
+/// Where one parameter or return goes (AAPCS64 C.1..C.16): the next `x` register, an `i128`'s
+/// even-numbered pair of `x` registers (C.8: "rounded up to the next even number"), or the
+/// next vector register for a float (C.1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Loc {
+    X(Reg),
+    Pair(Reg),
+    V(u32),
+}
+
+/// The next general and vector registers of one signature walk.
+pub(crate) struct Regs {
+    x: Reg,
+    v: u32,
+    /// AAPCS64 C.8 rounds an `i128`'s first register up to even; Apple's variant does not
+    /// (measured: num_tests.rs, the host's `extern "C" fn(u128, u64, u128)` passes the second
+    /// `u128` in `x3:x4` on macOS).
+    even: bool,
+}
+
+impl Regs {
+    pub(crate) fn new(os: crate::Os) -> Regs {
+        Regs { x: 0, v: 0, even: os != crate::Os::MacOs }
+    }
+
+    /// The place of the next value of `ty`, or `None` past `x7` or `v7` (the stack).
+    pub(crate) fn next(&mut self, ty: Ty) -> Option<Loc> {
+        if ty.is_scalar() && matches!(ty.elem(), Scalar::F32 | Scalar::F64) {
+            let v = self.v;
+            self.v += 1;
+            return (v < 8).then_some(Loc::V(v));
+        }
+        if ty == Ty::I128 {
+            let x = if self.even { self.x.next_multiple_of(2) } else { self.x };
+            self.x = x + 2;
+            return (x + 1 < 8).then_some(Loc::Pair(x));
+        }
+        let x = self.x;
+        self.x += 1;
+        (x < 8).then_some(Loc::X(x))
+    }
 }
 
 /// The most alignment a `byval` copy may ask: what `sp` has.
@@ -546,8 +618,10 @@ impl<A: Allocator> Pass<'_, '_, A> {
 
     /// How many 8-byte words of its cell a value of `ty` takes: 2 for a pair, else 1.
     fn words_of(&self, value: Value) -> u32 {
-        match self.view.ty(value).compound_row() {
+        let ty = self.view.ty(value);
+        match ty.compound_row() {
             Some(_) => 2,
+            None if Self::is_wide(ty) => 2,
             None => 1,
         }
     }
@@ -623,6 +697,64 @@ impl<A: Allocator> Pass<'_, '_, A> {
         };
         if op.info().flags.meanings_only(flags).0 & !honoured != 0 {
             return Err(unsupported(inst, op, "a flag that is a meaning it does not honour (`volatile` on a bulk operation)"));
+        }
+        // Floats (pass/float.rs) and `i128` (pass/wide.rs), by the type they compute in.
+        let result = view.ty(Value(inst as u32));
+        let first = |view: View<'_>| view.operands(inst).value();
+        match op {
+            Op::Fconst
+            | Op::FconstWide
+            | Op::Fadd
+            | Op::Fsub
+            | Op::Fmul
+            | Op::Fdiv
+            | Op::Frem
+            | Op::Fneg
+            | Op::Fcmp
+            | Op::Fpext
+            | Op::Fptrunc
+            | Op::FptoUi
+            | Op::FptoSi
+            | Op::UitoFp
+            | Op::SitoFp
+            | Op::Bitcast => return self.float(inst, op),
+            Op::Load if Self::float_ty(result).is_some() => return self.float(inst, op),
+            Op::Store if Self::float_ty(view.ty(first(view))).is_some() => return self.float(inst, op),
+            Op::Load
+            | Op::Iconst
+            | Op::IconstWide
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::And
+            | Op::Or
+            | Op::Xor
+            | Op::Neg
+            | Op::Not
+            | Op::Shl
+            | Op::Lshr
+            | Op::Ashr
+            | Op::Udiv
+            | Op::Sdiv
+            | Op::Urem
+            | Op::Srem
+            | Op::Zext
+            | Op::Sext
+            | Op::Freeze
+            | Op::Select
+                if Self::is_wide(result) =>
+            {
+                return self.wide(inst, op);
+            }
+            Op::Store | Op::Trunc if Self::is_wide(view.ty(first(view))) => return self.wide(inst, op),
+            Op::Icmp => {
+                let mut ops = view.operands(inst);
+                ops.int_cond();
+                if Self::is_wide(view.ty(ops.value())) {
+                    return self.wide(inst, op);
+                }
+            }
+            _ => {}
         }
         let mut o = view.operands(inst);
         match op {
@@ -950,8 +1082,20 @@ impl<A: Allocator> Pass<'_, '_, A> {
                     return Err(unsupported(inst, op, "a return of other than the signature's values"));
                 }
                 let rets = self.rets;
-                for (reg, (value, ret)) in values.iter().zip(rets).enumerate() {
-                    let reg = reg as Reg;
+                let mut regs = Regs::new(self.isa.os);
+                for (value, ret) in values.iter().zip(rets) {
+                    let reg = match regs.next(Ty(ret.ty)) {
+                        Some(Loc::X(reg)) => reg,
+                        Some(Loc::Pair(reg)) => {
+                            self.ld2(reg, reg + 1, value);
+                            continue;
+                        }
+                        Some(Loc::V(v)) => {
+                            self.float_out(v, value, Ty(ret.ty) == Ty::F64);
+                            continue;
+                        }
+                        None => return Err(unsupported(inst, op, "a return past the registers")),
+                    };
                     let width = self.width_of(inst, op, value)?;
                     self.ld(reg, value);
                     // Apple's convention: a sub-32-bit return is extended as the signature says.
@@ -1006,7 +1150,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
             | Op::FptoSi
             | Op::UitoFp
             | Op::SitoFp
-            | Op::Bitcast => return Err(unsupported(inst, op, "a float operation (the baseline tier has no float registers yet)")),
+            | Op::Bitcast => return Err(unsupported(inst, op, "a float operation past the router (pass/float.rs)")),
             Op::Vconst
             | Op::Splat
             | Op::Extract
@@ -1068,7 +1212,8 @@ impl<A: Allocator> Pass<'_, '_, A> {
         };
         let (sig_id, args) = (o.sig(), o.values());
         let sig = view.sig(sig_id);
-        check_sig(view, view.sigs[sig_id.index()], sig.params, sig.rets).map_err(|why| unsupported(inst, op, why))?;
+        let isa = self.isa;
+        check_sig(view, isa, view.sigs[sig_id.index()], sig.params, sig.rets).map_err(|why| unsupported(inst, op, why))?;
         if args.len() != sig.params.len() {
             return Err(unsupported(inst, op, "arguments other than the signature's parameters"));
         }
@@ -1092,26 +1237,30 @@ impl<A: Allocator> Pass<'_, '_, A> {
             area = area.checked_add(size).ok_or(EmitError::TooLarge { what: "a call's `byval` copies" })?;
         }
         self.byval_most = self.byval_most.max(area);
-        let mut gpr: Reg = 0;
+        let mut regs = Regs::new(isa.os);
         let mut copy = copies.iter();
         for (arg, param) in args.iter().zip(sig.params) {
-            match ParamKind::from_byte(param.kind) {
-                Some(ParamKind::Sret) => self.ld(X8, arg),
-                Some(ParamKind::Byval) => {
+            if param.kind == ParamKind::Sret as u8 {
+                self.ld(X8, arg);
+                continue;
+            }
+            let at = regs.next(Ty(param.ty)).ok_or(unsupported(inst, op, "an argument past the registers"))?;
+            match (ParamKind::from_byte(param.kind), at) {
+                (Some(ParamKind::Byval), Loc::X(gpr)) => {
                     let Some(&at) = copy.next() else {
                         return Err(unsupported(inst, op, "a `byval` argument without its copy"));
                     };
                     self.byval_addr(gpr, at);
-                    gpr += 1;
                 }
-                _ => {
+                (_, Loc::X(gpr)) => {
                     self.ld(gpr, arg);
                     if param.ext == Ext::Sext as u8 {
                         let width = self.width_of(inst, op, arg)?;
                         self.widen_signed(gpr, width);
                     }
-                    gpr += 1;
                 }
+                (_, Loc::Pair(gpr)) => self.ld2(gpr, gpr + 1, arg),
+                (_, Loc::V(v)) => self.float_out(v, arg, Ty(param.ty) == Ty::F64),
             }
         }
         match (callee, indirect) {
@@ -1125,11 +1274,20 @@ impl<A: Allocator> Pass<'_, '_, A> {
             (None, None) => return Err(unsupported(inst, op, "a call that names no callee")),
         }
         self.put(enc::blr(X16));
+        // Two returns are a pair in one cell (lib.rs, "Pairs"); one `i128` or float is the cell.
+        let mut regs = Regs::new(isa.os);
         for (k, ret) in sig.rets.iter().enumerate() {
-            let width = self.width(Ty(ret.ty)).ok_or(unsupported(inst, op, "a return wider than 64 bits"))?;
-            let reg = k as Reg;
-            self.narrow(reg, width);
-            self.st_sp(reg, inst as u32 * 16 + 8 * k as u32);
+            let ty = Ty(ret.ty);
+            match regs.next(ty).ok_or(unsupported(inst, op, "a return past the registers"))? {
+                Loc::X(reg) => {
+                    let width = self.width(ty).ok_or(unsupported(inst, op, "a return wider than 64 bits"))?;
+                    self.narrow(reg, width);
+                    self.st_sp(reg, inst as u32 * 16 + 8 * k as u32);
+                }
+                Loc::Pair(reg) if sig.rets.len() == 1 => self.st2(reg, reg + 1, inst),
+                Loc::V(v) if sig.rets.len() == 1 => self.float_in(v, inst, ty == Ty::F64),
+                _ => return Err(unsupported(inst, op, "an `i128` or float return beside another return")),
+            }
         }
         Ok(())
     }

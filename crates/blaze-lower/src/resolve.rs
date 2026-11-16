@@ -132,7 +132,7 @@ fn uses(v: &View<'_>, ns: &mut [Option<Ns>]) -> Result<(), BadRow> {
 }
 
 /// The item a one-segment path names among the body's own, through its scope chain.
-fn local_item(v: &View<'_>, scope: Option<ScopeId>, name: u64) -> Result<Option<RowIdx>, BadRow> {
+pub(crate) fn local_item(v: &View<'_>, scope: Option<ScopeId>, name: u64) -> Result<Option<RowIdx>, BadRow> {
     let mut at = scope;
     // A chain is at most as long as the scopes column: a cycle is a malformed record.
     for _ in 0..=v.scopes.len() {

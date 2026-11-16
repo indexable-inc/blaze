@@ -8,6 +8,7 @@ use blaze_own::{Alloc, Soa, Vec};
 use crate::diag::Diag;
 use crate::ids::{ExprId, ItemKey, List, Mutbl, PatId};
 use crate::portable::{PTy, PortableTys};
+use crate::ty::ClosureKind;
 use crate::world::{Def, Needs, ReadList};
 
 /// One adjustment step, applied to an expression's value in order (rustc's `Adjust`).
@@ -59,11 +60,10 @@ pub type PatDefs<'a> = Soa<(PatId, Def), Alloc<'a>>;
 pub type Fields<'a> = Soa<(ExprId, u32, u32), Alloc<'a>>;
 /// Each capture: the closure, the binding captured, how.
 pub type Captures<'a> = Soa<(ExprId, PatId, CaptureKind), Alloc<'a>>;
-/// Each closure of the body, its ordinal the row's index (expression order, the
-/// `PNode::Closure` ordinal): its expression, its kind (the strongest `Fn*` it implements) and
-/// its signature (a `FnPtr`). What `Question::Closure` answers.
-pub type Closures<'a> = Soa<(ExprId, crate::ty::ClosureKind, PTy), Alloc<'a>>;
-
+/// One row per closure expression of the body, row `i` the closure of ordinal `i`
+/// (`PNode::Closure`: closure expressions in `ExprId` order): its expression, its kind (the
+/// strongest `Fn*` trait it implements, from its captures) and its signature (a `FnPtr`).
+pub type Closures<'a> = Soa<(ExprId, ClosureKind, PTy), Alloc<'a>>;
 /// The record of one body.
 pub struct Checked<'a> {
     /// Every type the record names.

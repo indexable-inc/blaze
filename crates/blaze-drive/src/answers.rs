@@ -53,6 +53,15 @@ pub struct Row<'a> {
     pub cond: Option<(Name, Condition)>,
 }
 
+impl Row<'_> {
+    /// A watch row: no record, only the readers that read the name ABSENT (a read that found
+    /// nothing is a read, rule 21): when the name appears, they are found here and rerun.
+    /// Its key is the zero key, which no task key is.
+    pub fn watching(&self) -> bool {
+        self.key == Key::default()
+    }
+}
+
 /// The rows of one page, by name.
 pub type Page<'a> = ASortedMap<'a, Name, Row<'a>>;
 

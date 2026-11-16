@@ -278,7 +278,7 @@ impl World {
         let alloc = Alloc::global();
         // A written type is lowered in a body: a `let`'s.
         let probe = std::format!("const T: () = {{ let _x: {text}; }};");
-        let lowered = lower_body(&probe, Edition::E2024, &mut NoCfg, alloc).unwrap_or_else(|_| panic!("`{text}`: cfg"));
+        let lowered = lower_body(&probe, Edition::E2024, &mut NoCfg, &mut blaze_lower::NoModule, alloc).unwrap_or_else(|_| panic!("`{text}`: cfg"));
         let view = lowered.view();
         let mut tys = PortableTys::new_in(alloc);
         let body = to_typeck(&view, ItemKey(0), &mut tys, &mut Names { adts: &self.adt_names }, alloc)
@@ -467,7 +467,7 @@ impl World {
         let alloc = Alloc::global();
         let mut failed = StdVec::new();
         for (key, text) in core::mem::take(&mut self.texts) {
-            let lowered = lower_body(&text, Edition::E2024, &mut NoCfg, alloc).unwrap_or_else(|_| panic!("{text}: cfg"));
+            let lowered = lower_body(&text, Edition::E2024, &mut NoCfg, &mut blaze_lower::NoModule, alloc).unwrap_or_else(|_| panic!("{text}: cfg"));
             if let Err(why) = self.check_body(key, &lowered.view()) {
                 failed.push((key, why));
             }

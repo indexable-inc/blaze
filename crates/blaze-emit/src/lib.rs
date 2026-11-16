@@ -186,6 +186,9 @@ mod abi_tests;
 #[cfg(test)]
 mod tls_tests;
 
+#[cfg(test)]
+mod num_tests;
+
 /// The most bytes a `memcpy` or `memset` of a constant length is emitted inline; past it, the
 /// system routine is called. Measured on this Mac (Apple M-series, 2026-11-16) by
 /// `bulk_tests::inline_or_call` (`#[ignore]`d): 10^7 copies of each size in an emitted loop,

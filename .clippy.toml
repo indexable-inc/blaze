@@ -108,7 +108,13 @@ disallowed-types = [
     { path = "std::sync::mpsc::Receiver", replacement = "blaze_core::chan::Receiver", reason = "one channel for every thread handoff: `blaze_core::chan`, bounded or unbounded, many senders and receivers, each wait named and deadlined" },
     { path = "std::collections::LinkedList", replacement = "std::collections::VecDeque", reason = "a heap allocation per element and a pointer chase per step" },
     # AGENTS.md rule 12, standard-structures: one choice per need.
-    { path = "dashmap::DashMap", replacement = "blaze_hash::SharedMap", reason = "a shared map is `blaze_hash::SharedMap` (AGENTS.md rule 12), read with no lock: each shard of a DashMap is an RwLock its readers take", allow-invalid = true },
+    # D64: the shared map takes its shard lock as a type parameter; blaze-core's aliases are its one instantiation (with its named lock). Naming blaze-hash's generic forms picks another lock: only blaze-core's aliases and blaze-hash itself may.
+    { path = "blaze_hash::SharedMap", replacement = "blaze_core::SharedMap", reason = "D64: the shared map's lock is blaze-core's named lock; name blaze-core's alias, never blaze-hash's generic one with another lock" },
+    { path = "blaze_hash::SharedSet", replacement = "blaze_core::SharedSet", reason = "D64: the shared set's lock is blaze-core's named lock; name blaze-core's alias" },
+    { path = "blaze_hash::SharedByHash", replacement = "blaze_core::SharedByHash", reason = "D64: the shared map's lock is blaze-core's named lock; name blaze-core's alias" },
+    { path = "blaze_hash::shared::Map", replacement = "blaze_core::SharedMap", reason = "D64: the shared map's lock is blaze-core's named lock; name blaze-core's alias" },
+    { path = "blaze_hash::shared::Set", replacement = "blaze_core::SharedSet", reason = "D64: the shared set's lock is blaze-core's named lock; name blaze-core's alias" },
+    { path = "dashmap::DashMap", replacement = "blaze_core::SharedMap", reason = "a shared map is `blaze_core::SharedMap` (AGENTS.md rule 12), read with no lock: each shard of a DashMap is an RwLock its readers take", allow-invalid = true },
     { path = "std::sync::OnceLock", reason = "global state: build the value where the program starts (or as a query) and pass it to what needs it; a process-wide singleton (the allocator, the profile ring) says why with #[expect(clippy::disallowed_types, reason = ..)]" },
     { path = "std::sync::LazyLock", reason = "global state: build the value where the program starts (or as a query) and pass it to what needs it; a process-wide singleton (the allocator, the profile ring) says why with #[expect(clippy::disallowed_types, reason = ..)]" },
     { path = "std::cell::OnceCell", reason = "global state: build the value where the program starts (or as a query) and pass it to what needs it; a process-wide singleton (the allocator, the profile ring) says why with #[expect(clippy::disallowed_types, reason = ..)]" },

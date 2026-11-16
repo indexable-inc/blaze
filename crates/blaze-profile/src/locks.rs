@@ -182,7 +182,7 @@ pub struct Ranked {
 pub const SITES_SHOWN: usize = 3;
 
 pub const ARC_SWAP: &str = "arc-swap or RCU";
-pub const MAP: &str = "blaze_hash::SharedMap (shared) or blaze_hash::HashMap behind one owner";
+pub const MAP: &str = "blaze_core::SharedMap (shared) or blaze_hash::HashMap behind one owner";
 pub const ATOMIC: &str = "an atomic";
 pub const CHANNEL: &str = "a crossbeam channel";
 pub const OWNER: &str = "move it into its owner and send it messages";
@@ -197,7 +197,7 @@ const ATOMIC_TYPES: [&str; 13] = [
 /// that holds:
 /// - reads are 80% or more of the waits and most holders that said themselves wrote: arc-swap
 ///   or RCU;
-/// - a map or set: `blaze_hash::SharedMap`, or `blaze_hash::HashMap` behind one owner;
+/// - a map or set: `blaze_core::SharedMap`, or `blaze_hash::HashMap` behind one owner;
 /// - an integer or bool: an atomic;
 /// - a `VecDeque` or `Vec` that waiters on two threads or more wait for: a crossbeam channel;
 /// - every holder that said itself is one thread: move the value into that owner;

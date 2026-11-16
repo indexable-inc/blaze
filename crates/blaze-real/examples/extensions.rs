@@ -96,7 +96,7 @@ fn line_text(text: &str, at: usize) -> &str {
 /// `to_typeck`'s first refused form. `None` when the body is clean, cfg'd out or has none.
 fn body_refusal(text: &str, edition: Edition) -> Option<(String, usize)> {
     let alloc = Alloc::global();
-    let lowered = match lower_body(text, edition, &mut HostCfg, alloc) {
+    let lowered = match lower_body(text, edition, &mut HostCfg, &mut blaze_lower::NoModule, alloc) {
         Ok(lowered) => lowered,
         Err(_) => return Some(("lower_body: a cfg atom left unanswered".to_string(), 0)),
     };

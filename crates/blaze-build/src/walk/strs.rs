@@ -68,7 +68,10 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
 
     /// `offset_of!(ty, a.b.c)`: each step's offset in its container's layout, summed.
     pub(super) fn offset_of(&mut self, e: ExprId, ty: blaze_typeck::PTy, fields: blaze_typeck::List) -> Result<V, BuildError> {
-        let mut repr = self.repr_at(e, ty)?;
+        // `ty` is the body's written type (`BodyView::types`), not the record's table.
+        let types = self.body.types;
+        let g = self.ground_in(types, ty).map_err(|error| Self::ty_err(e, error))?;
+        let mut repr = self.repr(g).map_err(|error| Self::ty_err(e, error))?;
         let steps = self.body.segments.get(fields.range()).ok_or(malformed("an `offset_of!` path past `segments`"))?;
         if steps.is_empty() {
             return Err(malformed("an `offset_of!` with no field"));

@@ -81,6 +81,8 @@ pub enum Gap {
     /// A member fn whose signature could not be made (its container's head is made without
     /// it): the signature's error. Only a body that uses it stops on it.
     FnHead(ItemKey, Box<str>),
+    /// A body names an item declared in a block whose form has no record here yet.
+    Local(super::locals::LocalGap),
 }
 
 impl core::fmt::Display for Gap {
@@ -99,6 +101,7 @@ impl core::fmt::Display for Gap {
             Gap::Fill(e) => write!(f, "{e}"),
             Gap::VariantOfNoEnum(k) => write!(f, "the lang variant {k:x} is in no enum of its crate"),
             Gap::FnHead(k, why) => write!(f, "the member fn {k:?} has no signature: {why}"),
+            Gap::Local(g) => write!(f, "{g}"),
             Gap::UnreadImpl(k, why) => write!(f, "the impl {k:x}, a candidate filed without its trait or self type (unread as written), has no header: {why}"),
             Gap::RefusedImpl { impl_, place, why } => write!(f, "the impl {impl_:x} at {place}, a candidate of this question, has a refused header: {why}"),
         }
@@ -140,6 +143,8 @@ pub struct BodyWorld<'w, 'n> {
     pub store: &'w Store<'n>,
     /// `None` until the loop made them.
     pub buckets: Option<&'w Buckets>,
+    /// The body's checker key: whose local items its blocks hold ([`super::locals`]).
+    pub owner: ItemKey,
     /// The body's module, its generic parameters by name and its `Self`.
     pub module: LibKey,
     pub params: &'w [(Name, u32)],
@@ -369,8 +374,8 @@ impl World for BodyWorld<'_, '_> {
         Ok(self.traits)
     }
 
-    fn resolve_path(&self, _: Seal, _: ScopeId, _: PathIdx, segments: &[Name]) -> Fetch<Option<PathRes>> {
-        self.path(segments)
+    fn resolve_path(&self, _: Seal, scope: ScopeId, _: PathIdx, segments: &[Name]) -> Fetch<Option<PathRes>> {
+        self.path(scope, segments)
     }
 
     fn lang_item(&self, _: Seal, item: LangItem) -> Fetch<Option<ItemKey>> {
@@ -419,7 +424,11 @@ impl World for BodyWorld<'_, '_> {
             None => self.gap(Gap::BodyRecord(tc::Question::Opaque(item))),
         }
     }
-
+    /// A closure of another body: its facts are in the owner's checked record, which this
+    /// world does not hold yet (the RUN path's, typeck.md "A closure's identity"): a gap.
+    fn closure(&self, _: Seal, owner: ItemKey, ordinal: u32) -> Fetch<Option<tc::ClosureFacts<'_>>> {
+        self.gap(Gap::BodyRecord(tc::Question::Closure(owner, ordinal)))
+    }
     /// No attribute is read into the store yet (`#[non_exhaustive]`, `#[fundamental]`): the
     /// open item "attrs" in the README; answered empty as the old front end did.
     /// An enum's discriminant type ([`super::heads::discr_ty`]: `isize` with no primitive

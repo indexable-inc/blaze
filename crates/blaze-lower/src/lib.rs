@@ -460,11 +460,81 @@ pub use crate::machine::Mode;
 pub use crate::type_text::{TypeTextRefused, lower_type_text, lower_type_text_expanding};
 
 /// The domain of [`signature_key`]: this lowering's version and the parser's.
-pub const SIGNATURE_KEY_DOMAIN: &str = "blaze v2 lower signature 2, parser 1";
+pub const SIGNATURE_KEY_DOMAIN: &str = "blaze v2 lower signature 3, parser 1";
 /// The domain of [`body_key`].
-pub const BODY_KEY_DOMAIN: &str = "blaze v2 lower body 5, parser 1";
+pub const BODY_KEY_DOMAIN: &str = "blaze v2 lower body 6, parser 1";
 /// The domain of [`anon_const_key`].
-pub const ANON_CONST_KEY_DOMAIN: &str = "blaze v2 lower anon const 2, parser 1";
+pub const ANON_CONST_KEY_DOMAIN: &str = "blaze v2 lower anon const 3, parser 1";
+
+/// What one name is in the value namespace at a body's module, as an identifier pattern sees
+/// it (the Reference, "Identifier patterns": "Path patterns take precedence over identifier
+/// patterns"; a binding may not shadow a static, a tuple struct or a tuple variant).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum ValueName {
+    /// Nothing a pattern cares about (no item, a fn, a local): the name binds.
+    Nothing = 0,
+    Const = 1,
+    UnitStruct = 2,
+    UnitVariant = 3,
+    Static = 4,
+    /// A tuple struct's or a tuple variant's constructor.
+    TupleCtor = 5,
+    /// Not known yet: the lowering finishes its pass and returns [`Need`] with the name's range.
+    Need = 6,
+}
+
+impl ValueName {
+    /// A path pattern: the name is matched against, never bound.
+    pub fn is_path(self) -> bool {
+        matches!(self, ValueName::Const | ValueName::UnitStruct | ValueName::UnitVariant)
+    }
+
+    pub(crate) fn of_code(code: u16) -> Option<ValueName> {
+        [
+            ValueName::Nothing,
+            ValueName::Const,
+            ValueName::UnitStruct,
+            ValueName::UnitVariant,
+            ValueName::Static,
+            ValueName::TupleCtor,
+            ValueName::Need,
+        ]
+        .get(code as usize)
+        .copied()
+    }
+}
+
+/// The one question a body's lowering asks of the world: what `name`, one identifier, names in
+/// the value namespace at the body's module, resolved exactly as a one-segment value path
+/// written there (its `use`s, globs and the prelude included). Items declared in the body's own
+/// blocks are the lowering's, asked before this. Every answer is in the record's read list
+/// ([`View::value_reads`]).
+pub trait ValueNames {
+    fn value_name(&mut self, name: &str) -> ValueName;
+}
+
+/// A test fixture's world, with no module around the body: every name is [`ValueName::Nothing`].
+/// A real caller answers from its module.
+pub struct NoModule;
+
+impl ValueNames for NoModule {
+    fn value_name(&mut self, _: &str) -> ValueName {
+        ValueName::Nothing
+    }
+}
+
+/// Whether every answer `view`'s lowering read of `names` still holds: when one does not (a
+/// name it bound is now a constant), the body is lowered again.
+pub fn value_reads_hold(view: &View<'_>, names: &mut dyn ValueNames) -> Result<bool, TextAt> {
+    for read in view.value_reads() {
+        let (name, answer) = read.map_err(TextAt::Row)?;
+        if names.value_name(view.name_text(name)?) != answer {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
 
 /// What a `cfg` atom is in the build: blaze-surface's cfg set, asked one atom at a time.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -494,8 +564,8 @@ pub fn cfg_outcome(predicate: &blaze_expand::TokenStream<'_>, cfg: &mut dyn Cfg,
     blaze_expand::cfg_predicate(predicate, alloc, &mut atom).map_err(|_| refused)
 }
 
-/// A lowering that met `cfg` atoms not known yet: their ranges, item-relative. Nothing else
-/// of the pass is kept.
+/// A lowering that met `cfg` atoms, or identifier patterns' names ([`ValueName::Need`]), not
+/// known yet: their ranges, item-relative. Nothing else of the pass is kept.
 #[derive(Debug)]
 pub struct Need<'a> {
     pub atoms: AVec<'a, Range>,
@@ -578,7 +648,7 @@ pub fn lower_signature<'a, 't>(
     let lexed = parser::LexedStr::new(pe, text);
     let input = lexed.to_input(pe);
     let output = parser::Reparser::top_level_item().parse_outline(input.tokens());
-    let mut m = machine::Machine::new(text, Mode::Signature, edition, cfg, alloc);
+    let mut m = machine::Machine::new(text, Mode::Signature, edition, cfg, None, alloc);
     feed::feed(&mut m, &lexed, &output, 0);
     m.finish()
 }
@@ -593,13 +663,14 @@ pub fn lower_body<'a, 't>(
     text: &'t str,
     edition: Edition,
     cfg: &mut dyn Cfg,
+    values: &mut dyn ValueNames,
     alloc: Alloc<'a>,
 ) -> Result<Lowered<'a, 't>, Need<'a>> {
     let pe = parser_edition(edition);
     let lexed = parser::LexedStr::new(pe, text);
     let input = lexed.to_input(pe);
     let output = parser::Reparser::top_level_item().parse(input.tokens());
-    let mut m = machine::Machine::new(text, Mode::Body, edition, cfg, alloc);
+    let mut m = machine::Machine::new(text, Mode::Body, edition, cfg, Some(values), alloc);
     feed::feed(&mut m, &lexed, &output, 0);
     m.finish()
 }
@@ -612,6 +683,7 @@ pub fn lower_body_expanding<'a, 't>(
     text: &'t str,
     edition: Edition,
     cfg: &mut dyn Cfg,
+    values: &mut dyn ValueNames,
     expand: &mut dyn Expand,
     alloc: Alloc<'a>,
 ) -> Result<Lowered<'a, 't>, Need<'a>> {
@@ -619,7 +691,7 @@ pub fn lower_body_expanding<'a, 't>(
     let lexed = parser::LexedStr::new(pe, text);
     let input = lexed.to_input(pe);
     let output = parser::Reparser::top_level_item().parse(input.tokens());
-    let mut m = machine::Machine::new(text, Mode::Body, edition, cfg, alloc);
+    let mut m = machine::Machine::new(text, Mode::Body, edition, cfg, Some(values), alloc);
     expand.begin_body();
     feed::feed_expanding(&mut m, &lexed, &output, 0, expand);
     m.finish()
@@ -644,7 +716,7 @@ pub fn lower_signature_words<'a, 't>(
     alloc: Alloc<'a>,
 ) -> Result<Lowered<'a, 't>, Need<'a>> {
     let output = parser::Reparser::top_level_item().parse_outline(parser::Tokens::new(words.words, false));
-    let mut m = machine::Machine::new(text, Mode::Signature, edition, cfg, alloc);
+    let mut m = machine::Machine::new(text, Mode::Signature, edition, cfg, None, alloc);
     feed::feed_words(&mut m, &output, words.ranges, None);
     m.finish()
 }
@@ -655,11 +727,12 @@ pub fn lower_body_words_expanding<'a, 't>(
     words: ItemWords<'_>,
     edition: Edition,
     cfg: &mut dyn Cfg,
+    values: &mut dyn ValueNames,
     expand: &mut dyn Expand,
     alloc: Alloc<'a>,
 ) -> Result<Lowered<'a, 't>, Need<'a>> {
     let output = parser::Reparser::top_level_item().parse(parser::Tokens::new(words.words, false));
-    let mut m = machine::Machine::new(text, Mode::Body, edition, cfg, alloc);
+    let mut m = machine::Machine::new(text, Mode::Body, edition, cfg, Some(values), alloc);
     expand.begin_body();
     feed::feed_words(&mut m, &output, words.ranges, Some(expand));
     m.finish()
@@ -672,6 +745,7 @@ pub fn lower_anon_const<'a, 't>(
     range: Range,
     edition: Edition,
     cfg: &mut dyn Cfg,
+    values: &mut dyn ValueNames,
     alloc: Alloc<'a>,
 ) -> Result<Lowered<'a, 't>, Need<'a>> {
     let pe = parser_edition(edition);
@@ -679,7 +753,7 @@ pub fn lower_anon_const<'a, 't>(
     let lexed = parser::LexedStr::new(pe, sub);
     let input = lexed.to_input(pe);
     let output = parser::TopEntryPoint::Expr.parse(input.tokens());
-    let mut m = machine::Machine::new(text, Mode::AnonConst, edition, cfg, alloc);
+    let mut m = machine::Machine::new(text, Mode::AnonConst, edition, cfg, Some(values), alloc);
     feed::feed(&mut m, &lexed, &output, range.start);
     m.finish()
 }
@@ -691,6 +765,7 @@ pub fn lower_anon_const_expanding<'a, 't>(
     range: Range,
     edition: Edition,
     cfg: &mut dyn Cfg,
+    values: &mut dyn ValueNames,
     expand: &mut dyn Expand,
     alloc: Alloc<'a>,
 ) -> Result<Lowered<'a, 't>, Need<'a>> {
@@ -698,7 +773,7 @@ pub fn lower_anon_const_expanding<'a, 't>(
     let lexed = parser::LexedStr::new(pe, range.of(text));
     let input = lexed.to_input(pe);
     let output = parser::TopEntryPoint::Expr.parse(input.tokens());
-    let mut m = machine::Machine::new(text, Mode::AnonConst, edition, cfg, alloc);
+    let mut m = machine::Machine::new(text, Mode::AnonConst, edition, cfg, Some(values), alloc);
     expand.begin_body();
     feed::feed_expanding(&mut m, &lexed, &output, range.start, expand);
     m.finish()

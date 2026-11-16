@@ -1,6 +1,50 @@
 //! The shared table on real threads (every value met once, every entry dropped once), and
 //! under `cfg(blaze_check)` against the model checker, each with a planted bug it must catch.
 
+use super::ShardLock;
+
+/// The tests' shard lock (D64): std's on real threads, blaze-check's under the model, as
+/// blaze-core (above this crate) gives the build its named lock.
+pub(super) enum TestLock {}
+
+#[cfg(not(blaze_check))]
+#[expect(
+    clippy::disallowed_types,
+    reason = "a test below blaze-core, whose named lock gives the build's instantiation"
+)]
+// SAFETY: std's mutex: one guard at a time, each lock's writes before its next guard.
+unsafe impl ShardLock for TestLock {
+    type Lock<T> = std::sync::Mutex<T>;
+    type Guard<'a, T: 'a> = std::sync::MutexGuard<'a, T>;
+
+    fn new<T>(_name: &'static str, value: T) -> std::sync::Mutex<T> {
+        std::sync::Mutex::new(value)
+    }
+
+    fn lock<T>(lock: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+        lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+#[cfg(blaze_check)]
+// SAFETY: the model checker's mutex, which it explores as a mutex.
+unsafe impl ShardLock for TestLock {
+    type Lock<T> = blaze_check::sync::Mutex<T>;
+    type Guard<'a, T: 'a> = blaze_check::sync::MutexGuard<'a, T>;
+
+    fn new<T>(_name: &'static str, value: T) -> blaze_check::sync::Mutex<T> {
+        blaze_check::sync::Mutex::new(value)
+    }
+
+    fn lock<T>(lock: &blaze_check::sync::Mutex<T>) -> blaze_check::sync::MutexGuard<'_, T> {
+        lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+type SharedMap<K, V, A> = crate::SharedMap<K, V, A, TestLock>;
+#[cfg(not(blaze_check))]
+type SharedSet<K, A> = crate::SharedSet<K, A, TestLock>;
+
 #[cfg(not(blaze_check))]
 mod threads {
     use std::{
@@ -13,7 +57,7 @@ mod threads {
         vec::Vec,
     };
 
-    use crate::SharedMap;
+    use super::SharedMap;
 
     const THREADS: usize = 8;
     const EACH: usize = 5_000;
@@ -41,8 +85,8 @@ mod threads {
         use blaze_sim::Config;
 
         blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
-            let map: SharedMap<u64, u64, Global> = SharedMap::new_in(Global);
-            let set: crate::SharedSet<u64, Global> = crate::SharedSet::new_in(Global);
+            let map: SharedMap<u64, u64, Global> = SharedMap::new_in("test.map", Global);
+            let set: super::SharedSet<u64, Global> = super::SharedSet::new_in("test.set", Global);
             let (pinned, pinned_set) = (map.pin(), set.pin());
             let range = 1 + tape.below(300, "range");
             for _ in 0..tape.below(if cfg!(miri) { 40 } else { 300 }, "held") {
@@ -85,7 +129,7 @@ mod threads {
         use blaze_sim::Config;
 
         blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
-            let map: SharedMap<std::string::String, u64, Global> = SharedMap::new_in(Global);
+            let map: SharedMap<std::string::String, u64, Global> = SharedMap::new_in("test.map", Global);
             let pinned = map.pin();
             let mut model = std::collections::BTreeMap::new();
             let (mut made, mut put) = (0usize, 0usize);
@@ -112,7 +156,7 @@ mod threads {
 
     #[test]
     fn every_key_is_found_after_its_insert_and_gone_after_its_remove() {
-        let map: Arc<SharedMap<usize, usize, Global>> = Arc::new(SharedMap::new_in(Global));
+        let map: Arc<SharedMap<usize, usize, Global>> = Arc::new(SharedMap::new_in("test.map", Global));
         let workers: Vec<_> = (0..THREADS)
             .map(|t| {
                 let map = Arc::clone(&map);
@@ -150,7 +194,7 @@ mod threads {
         let drops = Arc::new(AtomicUsize::new(0));
         let made;
         {
-            let map: SharedMap<usize, Counted, Global> = SharedMap::new_in(Global);
+            let map: SharedMap<usize, Counted, Global> = SharedMap::new_in("test.map", Global);
             let pinned = map.pin();
             for i in 0..1_000 {
                 pinned.insert(i, Counted(i, Arc::clone(&drops)));
@@ -172,7 +216,7 @@ mod threads {
 
     #[test]
     fn get_or_insert_gives_every_thread_the_first_value() {
-        let map: Arc<SharedMap<u32, usize, Global>> = Arc::new(SharedMap::new_in(Global));
+        let map: Arc<SharedMap<u32, usize, Global>> = Arc::new(SharedMap::new_in("test.map", Global));
         let workers: Vec<_> = (0..THREADS)
             .map(|t| {
                 let map = Arc::clone(&map);
@@ -191,14 +235,15 @@ mod checked {
 
     use blaze_check::{model, sync::Arc, thread};
 
-    use crate::{SharedMap, shared::Plant};
+    use super::SharedMap;
+    use crate::shared::Plant;
 
     /// A writer replaces a key a reader reads: the reader meets the old value or the new,
     /// whole. Relaxed publish: the reader's read of the new entry is unordered with its write.
     /// Freed at once: the reader reads an entry freed under it.
     fn replace_under_a_reader(plant: Plant) {
         model(move || {
-            let map: Arc<SharedMap<u32, u64, Global>> = Arc::new(SharedMap::new_in(Global));
+            let map: Arc<SharedMap<u32, u64, Global>> = Arc::new(SharedMap::new_in("test.map", Global));
             map.pin().insert(1, 10);
             let writer = {
                 let map = Arc::clone(&map);
@@ -240,7 +285,7 @@ mod checked {
     #[test]
     fn model_shared_map_grows_under_two_writers() {
         model(|| {
-            let map: Arc<SharedMap<u32, u32, Global>> = Arc::new(SharedMap::new_in(Global));
+            let map: Arc<SharedMap<u32, u32, Global>> = Arc::new(SharedMap::new_in("test.map", Global));
             let other = {
                 let map = Arc::clone(&map);
                 thread::spawn(move || {

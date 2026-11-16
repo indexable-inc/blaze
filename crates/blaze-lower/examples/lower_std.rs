@@ -297,7 +297,7 @@ fn main() {
         let mut mine = Tally::default();
         let mut by_name = ByName::new(rules_of().0, def_at(), Census, Alloc::global());
         let expand: &mut dyn Expand = if expanding { &mut by_name } else { &mut NoExpand };
-        let stats = lower_file(text, Edition::E2024, &mut Host, expand, &mut mine, Alloc::global());
+        let stats = lower_file(text, Edition::E2024, &mut Host, &mut blaze_lower::NoModule, expand, &mut mine, Alloc::global());
         add(&mut total.lock().expect("no thread panicked holding the stats"), &stats);
         let mut all = tally.lock().expect("no thread panicked holding the tally");
         all.needs += mine.needs;

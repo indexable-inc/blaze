@@ -538,6 +538,14 @@
    "why": "The owner: \"i thought we already had sans io http/1,2,3 so make sure we are just doing things properly\", and \"make sure everything is using bstd as base\". The survey (docs/v2/plan/design/remote-read.md, \"HTTP in the tree\", with files and lines) shows the parser is already one and sans-IO; what is triplicated is the driving, and the richest driver is the one outside the effect layer, so crate fetching is neither simulated nor crash-tested. Putting the client in bstd makes the standard library the base it is meant to be, gives the simulation one client to run (its begin/finish split is what lets a simulated server and a client interleave: the stand-alone driver's test could not), and removes a thread and an ambient read (rule 75).",
    "recommended": "Stage one: bstd's `Http` gains ranges, limits, the redirect policy and deadlines from blaze-h1 and blaze-h1-net; the shared cache's HTTP origin is an adapter over it; the simulated servers (pieces, a stall, an early close, a wrong range, a wrong length, a longer body, a redirect, a 404) are each refused by name; measured against a local server. Stage two: TLS and the pool; crate fetching moves; the two other drivers are deleted.",
    "state": "decided by the coordinator; stage one started"
+  },
+  {
+   "id": "D64",
+   "date": "2026-11-16",
+   "decision": "The concurrent map takes its lock as a type parameter, and blaze-core gives it one. blaze-hash's shared map (shared.rs) names no lock of its own: its per-shard writer lock is a type parameter bounded by a small raw-lock trait that blaze-hash defines. blaze-core, which sits above blaze-hash and owns the tree's one blocking lock (`blaze_core::lock`: named, with a deadline and a span), instantiates the map with it and exports the alias every user names; a `.clippy.toml` ban keeps other crates from instantiating it with any other lock. The interleaving tests instantiate it with blaze-check's lock.",
+   "why": "The std-out lane found shared.rs holding `std::sync::Mutex` and could not replace it: blaze-core depends on blaze-hash (its stall table uses the plain map), so the map cannot name `blaze_core::lock`; and a blocking lock cannot move below blaze-core, because its wait is a kernel wait that must go through `blaze_core::wait` with a deadline (rules 44, 15, 18). A data structure below with its policy passed in from above is the shape the allocator already has (rule 75) and is rule 78's strategy as a type parameter at one seam. Moving the map up into blaze-core would put a collection in the effect layer; a spin lock would be an unbounded wait under preemption.",
+   "recommended": "The std-out lane builds it: the trait and the parameter in blaze-hash, the instantiation and alias in blaze-core, callers moved by name in one batch, both planted bugs of the interleaving test still caught, blaze-hash's ratchet row lowered.",
+   "state": "decided by the coordinator; assigned"
   }
  ]
 }

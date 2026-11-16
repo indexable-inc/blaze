@@ -16,7 +16,7 @@ use crate::columns::View;
 use crate::form::ROW_LOCAL_ITEM;
 use crate::{
     Cfg, CfgAnswer, ItemWords, Lowered, Need, anon_const_key, body_key, lower_anon_const_expanding, lower_body_expanding,
-    lower_body_words_expanding, lower_signature, lower_signature_words, signature_key,
+    lower_body_words_expanding, lower_signature, lower_signature_words, signature_key, ValueNames,
 };
 
 /// How deep item macros may expand into item macros (rustc's `recursion_limit` default).
@@ -306,6 +306,7 @@ impl<'a> ExpansionWords<'a> {
 struct Driver<'d, 'a> {
     edition: Edition,
     cfg: &'d mut dyn Cfg,
+    values: &'d mut dyn ValueNames,
     sink: &'d mut dyn Sink,
     alloc: Alloc<'a>,
     stats: FileStats,
@@ -397,7 +398,7 @@ impl<'a> Driver<'_, 'a> {
         let text = if grown.is_empty() { at.item_text() } else { grown.as_str() };
         while let Some(range) = consts.pop() {
             let key = anon_const_key(text, range, self.edition);
-            let result = lower_anon_const_expanding(text, range, self.edition, self.cfg, expand, self.alloc);
+            let result = lower_anon_const_expanding(text, range, self.edition, self.cfg, self.values, expand, self.alloc);
             self.stats.anon_consts += 1;
             self.emit(at, What::AnonConst(range), key, &result, consts, None);
         }
@@ -499,8 +500,8 @@ impl<'a> Driver<'_, 'a> {
             if has_body {
                 let key = body_key(item_text, self.edition);
                 let result = match item_words {
-                    None => lower_body_expanding(item_text, self.edition, self.cfg, expand, self.alloc),
-                    Some(w) => lower_body_words_expanding(item_text, w, self.edition, self.cfg, expand, self.alloc),
+                    None => lower_body_expanding(item_text, self.edition, self.cfg, self.values, expand, self.alloc),
+                    Some(w) => lower_body_words_expanding(item_text, w, self.edition, self.cfg, self.values, expand, self.alloc),
                 };
                 self.stats.bodies += 1;
                 self.emit(&at, What::Body, key, &result, &mut consts, Some((jobs, own.as_ref())));
@@ -660,11 +661,12 @@ pub fn lower_file(
     text: &str,
     edition: Edition,
     cfg: &mut dyn Cfg,
+    values: &mut dyn ValueNames,
     expand: &mut dyn Expand,
     sink: &mut dyn Sink,
     alloc: Alloc<'_>,
 ) -> FileStats {
-    let mut d = Driver { edition, cfg, sink, alloc, stats: FileStats::default(), grown: String::new_in(alloc), spent: Vec::new_in(alloc), root: 0 };
+    let mut d = Driver { edition, cfg, values, sink, alloc, stats: FileStats::default(), grown: String::new_in(alloc), spent: Vec::new_in(alloc), root: 0 };
     let mut jobs: AVec<'_, Job<'_>> = Vec::new_in(alloc);
     jobs.push(Job { text: None, words: None, source: Source::File, root: None });
     while let Some(job) = jobs.pop() {

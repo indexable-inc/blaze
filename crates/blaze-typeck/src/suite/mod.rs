@@ -36,6 +36,7 @@ use crate::fixture::{Bb, Fx, show};
 
 mod anon_params;
 mod async_fmt;
+mod closure_identity;
 mod closures;
 mod const_enum;
 mod const_terms;
@@ -47,6 +48,7 @@ mod fn_traits;
 mod lower_forms;
 mod opaque;
 mod pattern_types;
+mod self_paths;
 mod where_const;
 mod where_projection;
 

@@ -33,9 +33,10 @@ fn check_fns(text: &str, fns: &[&str]) -> Vec<(String, String)> {
     let crates = inputs.crates();
     let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text }];
-    let mut front = Front2::new(&names, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
+        let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
     let prepared = Prepares::new_in(Alloc::global());
-    let mut store = Store::new(front.index.lang("sized"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame);
     let (mut buckets, mut consts) = (None, Consts::default());
     let mut got = Vec::new();
     for &n in fns {
@@ -288,8 +289,12 @@ fn main() {}
 /// (the evaluator runs no call yet) and their self type has no constructor read as written, so
 /// each is a candidate of every inherent question and of every `Display` question. `Option`'s
 /// inherent `is_some` and `u16: Display` are answered (core's type, core's trait: no impl of
-/// this crate can answer them); `S`'s inherent `s` and `S: Display` (S is this crate's) stay
-/// the gap naming the refused impl. Before the fix all four were the gap.
+/// this crate can answer them); so are `u8`'s inherent `count_ones` (a built-in type's inherent
+/// impls are written only in a crate with `#![feature(rustc_attrs)]`: rustc's E0390) and
+/// `u16: PartialEq` against a refused `impl PartialEq for ..` written with no arguments (`Rhs`
+/// defaults to `Self`, so only the self type can be this crate's); `S`'s inherent `s` and
+/// `S: Display` (S is this crate's) stay the gap naming the refused impl. Before the fix all
+/// six were the gap.
 #[test]
 fn a_refused_impl_blocks_only_its_crates_goals() {
     const TEXT: &str = "trait Tr<T> {}
@@ -299,17 +304,21 @@ impl S { fn s(&self) -> u8 { 1 } }
 impl core::fmt::Display for S { fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { Ok(()) } }
 impl dyn Tr<W<{ core::mem::size_of::<u8>() }>> { fn d(&self) -> u8 { 0 } }
 impl core::fmt::Display for dyn Tr<W<{ core::mem::size_of::<u16>() }>> { fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { Ok(()) } }
+impl PartialEq for dyn Tr<W<{ core::mem::size_of::<u32>() }>> { fn eq(&self, _o: &Self) -> bool { true } }
 fn need<T: core::fmt::Display>(_t: T) {}
+fn need_eq<T: PartialEq>(_t: T) {}
 fn foreign_inherent() -> bool { Some(1u8).is_some() }
 fn foreign_trait() { need(7u16) }
+fn builtin_inherent() -> u32 { 7u8.count_ones() }
+fn bare_trait() { need_eq(7u16) }
 fn local_inherent() -> u8 { S.s() }
 fn local_trait() { need(S) }
 fn main() {}
 ";
-    let got = check_fns(TEXT, &["foreign_inherent", "foreign_trait", "local_inherent", "local_trait"]);
+    let got = check_fns(TEXT, &["foreign_inherent", "foreign_trait", "builtin_inherent", "bare_trait", "local_inherent", "local_trait"]);
     println!("by crate: {got:?}");
-    all_clean("by crate", &got[..2]);
-    for i in [2, 3] {
+    all_clean("by crate", &got[..4]);
+    for i in [4, 5] {
         assert!(got[i].1.contains("has a refused header"), "{got:?}");
     }
 }

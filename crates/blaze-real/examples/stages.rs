@@ -1751,7 +1751,7 @@ fn lower_bodies(file: &File, edition: Edition) -> BodyTally {
 fn lower_one(out: &mut BodyTally, text: &str, edition: Edition, place: &dyn Fn(usize) -> String, expand: &mut dyn Expand) {
     let alloc = Alloc::global();
     {
-        let lowered = match lower_body_expanding(text, edition, &mut HostCfg, expand, alloc) {
+        let lowered = match lower_body_expanding(text, edition, &mut HostCfg, &mut blaze_lower::NoModule, expand, alloc) {
             Ok(lowered) => lowered,
             Err(_) => {
                 out.first.add("lower_body: a cfg atom left unanswered", || place(0));

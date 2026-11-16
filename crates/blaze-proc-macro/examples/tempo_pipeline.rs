@@ -667,7 +667,7 @@ fn main() {
                         let lists = Lists { rules, builtin_at: at, then: Some(&resolve) };
                         let mut by_name = Noted { inner: ByName::with_names(&lists, cx, Alloc::global()), failed: &failed, attrs: BTreeMap::new() };
                         let mut sink = Records(0, 0, Bodies::default());
-                        let stats = lower_file(&text, edition, &mut HostCfg, &mut by_name, &mut sink, Alloc::global());
+                        let stats = lower_file(&text, edition, &mut HostCfg, &mut blaze_lower::NoModule, &mut by_name, &mut sink, Alloc::global());
                         // `#[tokio::test` written in the file (doc comments aside) against the calls expanded.
                         for (name, head) in [("tokio::test", "#[tokio::test"), ("contract", "#[contract")] {
                             let written = text.lines().filter(|l| l.trim_start().starts_with(head)).count() as u64;

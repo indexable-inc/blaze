@@ -182,7 +182,7 @@ fn lowered_in(krate: usize, text: &str) -> (String, usize, StdVec<(String, u32, 
     let names = names();
     let scoped = Scoped { names, module: names.root(krate), prepared: Some(Prepares::new_in(Alloc::global())) };
     let mut expander = ByName::with_names(&scoped, Host, Alloc::global());
-    let l = lower_body_expanding(text, names.edition(krate), &mut Unix, &mut expander, Alloc::global()).unwrap_or_else(|need| panic!("{text}: needs {:?}", need.atoms));
+    let l = lower_body_expanding(text, names.edition(krate), &mut Unix, &mut crate::NoModule, &mut expander, Alloc::global()).unwrap_or_else(|need| panic!("{text}: needs {:?}", need.atoms));
     let findings = expander.findings().iter().map(|f| (String::from(&*f.path), f.at.start, std::format!("{}", f.why))).collect();
     (dump_of(&l), l.view().unhandled().count(), findings)
 }
@@ -307,7 +307,7 @@ fn asked_paths(krate: usize, text: &str) -> (StdVec<(String, Option<blaze_id::It
     let names = names();
     let scoped = Scoped { names, module: names.root(krate), prepared: Some(Prepares::new_in(Alloc::global())) };
     let mut expander = ByName::with_names(&scoped, Host, Alloc::global());
-    let l = lower_body_expanding(text, names.edition(krate), &mut Unix, &mut expander, Alloc::global()).unwrap_or_else(|need| panic!("{text}: needs {:?}", need.atoms));
+    let l = lower_body_expanding(text, names.edition(krate), &mut Unix, &mut crate::NoModule, &mut expander, Alloc::global()).unwrap_or_else(|need| panic!("{text}: needs {:?}", need.atoms));
     let name = ["user", "dep", "old"][krate];
     let key = CrateItemKey(ContentId::of("blaze-lower scoped test crate", name.as_bytes()));
     let mut ask = Ask(names, krate, key, StdVec::new());
@@ -334,7 +334,7 @@ fn an_environment_read_joins_the_body_s_read_list() {
     let scoped = Scoped { names, module: names.root(0), prepared: Some(Prepares::new_in(Alloc::global())) };
     let mut expander = ByName::with_names(&scoped, Host, Alloc::global());
     let text = "fn r() { let _ = dep::option_env!(\"ABSENT\"); }";
-    let l = lower_body_expanding(text, names.edition(0), &mut Unix, &mut expander, Alloc::global()).unwrap_or_else(|need| panic!("{text}: needs {:?}", need.atoms));
+    let l = lower_body_expanding(text, names.edition(0), &mut Unix, &mut crate::NoModule, &mut expander, Alloc::global()).unwrap_or_else(|need| panic!("{text}: needs {:?}", need.atoms));
     assert_eq!(l.view().unhandled().count(), 0, "{}", dump_of(&l));
     let reads = expander.reads();
     let seen: StdVec<(blaze_expand::ReadKind, &str)> = reads.list().iter().map(|r| (r.kind, reads.subject(r))).collect();
@@ -351,7 +351,7 @@ fn a_call_past_the_read_list_s_cap_is_a_finding_naming_the_cap() {
     let scoped = Scoped { names, module: names.root(0), prepared: Some(Prepares::new_in(Alloc::global())) };
     let mut expander = ByName::with_names(&scoped, Host, Alloc::global()).with_read_cap(1);
     let text = "fn r() { let _ = dep::option_env!(\"A\"); let _ = dep::option_env!(\"B\"); }";
-    let l = lower_body_expanding(text, names.edition(0), &mut Unix, &mut expander, Alloc::global()).unwrap_or_else(|need| panic!("{text}: needs {:?}", need.atoms));
+    let l = lower_body_expanding(text, names.edition(0), &mut Unix, &mut crate::NoModule, &mut expander, Alloc::global()).unwrap_or_else(|need| panic!("{text}: needs {:?}", need.atoms));
     assert_eq!(l.view().unhandled().count(), 1, "{}", dump_of(&l));
     let reads = expander.reads();
     let seen: StdVec<&str> = reads.list().iter().map(|r| reads.subject(r)).collect();
@@ -418,7 +418,7 @@ fn included_over<C: blaze_expand::ExpandCx>(text: &str, cx: C) -> (usize, StdVec
     let names = names();
     let scoped = Scoped { names, module: names.root(0), prepared: Some(Prepares::new_in(Alloc::global())) };
     let mut expander = ByName::with_names(&scoped, cx, Alloc::global());
-    let l = lower_body_expanding(text, names.edition(0), &mut Unix, &mut expander, Alloc::global()).unwrap_or_else(|need| panic!("{text}: needs {:?}", need.atoms));
+    let l = lower_body_expanding(text, names.edition(0), &mut Unix, &mut crate::NoModule, &mut expander, Alloc::global()).unwrap_or_else(|need| panic!("{text}: needs {:?}", need.atoms));
     let reads = expander.reads();
     (l.view().unhandled().count(), reads.list().iter().map(|r| (r.kind, String::from(reads.subject(r)))).collect())
 }
@@ -472,7 +472,7 @@ fn an_include_reads_under_the_unit_s_source_root_and_is_refused_past_it() {
     let past = FileHost { root: ReadRoot { origin: Package, package: "reg" }, files: &[] };
     let mut expander = ByName::with_names(&scoped, past, Alloc::global());
     let text = call("../../x");
-    lower_body_expanding(&text, names.edition(0), &mut Unix, &mut expander, Alloc::global()).unwrap_or_else(|need| panic!("needs {:?}", need.atoms));
+    lower_body_expanding(&text, names.edition(0), &mut Unix, &mut crate::NoModule, &mut expander, Alloc::global()).unwrap_or_else(|need| panic!("needs {:?}", need.atoms));
     let why: StdVec<String> = expander.findings().iter().map(|f| std::format!("{}", f.why)).collect();
     assert_eq!(why, [String::from("its expansion's error Include (the path leaves the unit's source root: decision D60): `../../x`")]);
 }
@@ -490,7 +490,7 @@ fn an_edit_of_an_included_file_changes_only_the_including_body_s_reads() {
         let scoped = Scoped { names, module: names.root(0), prepared: Some(Prepares::new_in(Alloc::global())) };
         let host = FileHost { root: ReadRoot { origin: Checkout, package: "a" }, files: std::vec![("b/g.json", bytes)].leak() };
         let mut expander = ByName::with_names(&scoped, host, Alloc::global());
-        lower_body_expanding(text, names.edition(0), &mut Unix, &mut expander, Alloc::global()).unwrap_or_else(|need| panic!("needs {:?}", need.atoms));
+        lower_body_expanding(text, names.edition(0), &mut Unix, &mut crate::NoModule, &mut expander, Alloc::global()).unwrap_or_else(|need| panic!("needs {:?}", need.atoms));
         let mut bytes = blaze_own::Vec::new_in(Alloc::global());
         expander.reads().encode(&mut bytes);
         StdVec::from(&bytes[..])

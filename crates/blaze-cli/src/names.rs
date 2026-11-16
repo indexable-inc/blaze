@@ -168,6 +168,145 @@ struct Resolved {
     /// Each checkout file looked for and not found (a `mod x;` whose file is missing, a
     /// module's other place): read as its `Surface`, absent, so creating it reruns the crate.
     absent: std::vec::Vec<String, Global>,
+    /// Each unresolved path of the crate's own code, as its record's finding ([`unresolved`]).
+    findings: blaze_own::Vec<Unresolved, Global>,
+}
+
+/// The rule of a `use` or macro path in a project's own crate that names nothing.
+pub(crate) const UNRESOLVED: u16 = 14;
+
+/// One unresolved path of a project crate, placed item-relative (rule 71): the range of the
+/// failing segment from its item's start, and the message: the file, the item's chain digest
+/// ([`crate::work::item_chain`]; 16 hex digits, or empty for a path with no place), the
+/// file's edition byte, then the words' two pieces, all split by 0x1F. A body edit moves no
+/// byte of it; the printer finds the item's start in the file as it is ([`placed`]).
+struct Unresolved {
+    at: (u32, u32),
+    message: blaze_own::Vec<u8, Global>,
+}
+
+/// The pieces before the words in an [`UNRESOLVED`] finding's message.
+const PLACE_PIECES: usize = 3;
+
+/// The byte offset of `word` in `text` at or after `from`, as a whole identifier.
+fn find_word(text: &str, word: &str, from: usize) -> Option<usize> {
+    let ident = |b: u8| b == b'_' || b.is_ascii_alphanumeric();
+    let bytes = text.as_bytes();
+    let mut at = from;
+    while let Some(found) = text.get(at..).and_then(|rest| rest.find(word)) {
+        let start = at + found;
+        let end = start + word.len();
+        let before = start.checked_sub(1).is_some_and(|b| ident(bytes[b]));
+        let after = bytes.get(end).is_some_and(|b| ident(*b));
+        if !before && !after && !word.is_empty() {
+            return Some(start);
+        }
+        at = start + word.len().max(1);
+    }
+    None
+}
+
+/// Every `use` and macro path of crate `c` that resolved to nothing. The project's own (a
+/// checkout file, `/0/`) are findings in `own`, sorted; the number of the others (a fetched or
+/// toolchain crate's: not the project's to fix) is returned, counted in one note.
+fn unresolved(c: &blaze_scope::resolve::CrateNames<'_>, own: &mut blaze_own::Vec<Unresolved, Global>) -> u32 {
+    use blaze_surface::{PathKind, ScopeError};
+    let project = c.files.iter().any(|file| file.path.starts_with("/0/"));
+    let mut elsewhere = 0u32;
+    for r in c.done.values() {
+        for error in r.scope.errors.iter() {
+            let (loc, path, segment) = match error {
+                ScopeError::Import { site, path, segment, .. } => {
+                    let fragment = site.expansion.unwrap_or(r.scope.module);
+                    (c.tables.use_locs.get(&fragment).and_then(|locs| locs.get(site.index as usize).copied()), path, *segment as usize)
+                }
+                ScopeError::Macro { call, path, segment, .. } => (c.tables.calls.get(call).map(|src| src.loc), path, *segment as usize),
+                _ => continue,
+            };
+            if !project {
+                elsewhere += 1;
+                continue;
+            }
+            let mut message = blaze_own::Vec::new_in(Global);
+            let mut at = (0u32, 0u32);
+            let file = loc.and_then(|loc| c.files.get(loc.file as usize).map(|file| (loc, *file)));
+            match file.and_then(|(loc, file)| Some((loc, file, crate::work::item_holding(&file.outline, loc.offset)?))) {
+                Some((_, file, item)) => {
+                    let text = file.text;
+                    let entry = item.range.of(text);
+                    // The failing segment: the path's segments found in order in the item's text.
+                    let mut from = 0usize;
+                    let mut found = None;
+                    for seg in path.segments.iter().take(segment + 1) {
+                        found = find_word(entry, seg, from).map(|start| (start, start + seg.len()));
+                        from = found.map_or(from, |(_, end)| end);
+                    }
+                    at = found.map_or((0, 0), |(s, e)| (s as u32, e as u32));
+                    message.extend_from_slice(file.path.trim_start_matches("/0/").as_bytes());
+                    message.push(0x1F);
+                    let chain = crate::work::item_chain(&file.outline, item, text);
+                    for shift in (0..16).rev() {
+                        message.push(b"0123456789abcdef"[((chain >> (shift * 4)) & 0xF) as usize]);
+                    }
+                }
+                None => message.push(0x1F),
+            }
+            message.push(0x1F);
+            message.push(b'0' + c.edition.byte());
+            message.push(0x1F);
+            message.push(b'`');
+            message.extend_from_slice(path.segments.get(segment).copied().unwrap_or("").as_bytes());
+            message.extend_from_slice(b"`\x1F");
+            let before = &path.segments[..segment.min(path.segments.len())];
+            let head: &[u8] = match path.kind {
+                PathKind::Plain | PathKind::DollarCrate(_) => b"",
+                PathKind::Crate => b"crate",
+                PathKind::SelfMod => b"self",
+                PathKind::Super(_) => b"super",
+                PathKind::Abs => b"::",
+            };
+            match (head.is_empty(), before.is_empty()) {
+                (true, true) => message.extend_from_slice(b"this scope"),
+                _ => {
+                    message.push(b'`');
+                    message.extend_from_slice(head);
+                    for (i, seg) in before.iter().enumerate() {
+                        if i > 0 || (!head.is_empty() && head != b"::") {
+                            message.extend_from_slice(b"::");
+                        }
+                        message.extend_from_slice(seg.as_bytes());
+                    }
+                    message.push(b'`');
+                }
+            }
+            own.push(Unresolved { at, message });
+        }
+    }
+    // The scopes are a map: its order reaches the record only sorted (rule 25).
+    own.sort_unstable_by(|a, b| (&a.message[..], a.at).cmp(&(&b.message[..], b.at)));
+    elsewhere
+}
+
+/// Where an [`UNRESOLVED`] finding is drawn: its file, its item's start there today (by the
+/// item's chain, in the file as it is) and the words. `None` for one with no file or whose item
+/// is no longer there: drawn at its crate's name.
+pub(crate) fn placed<'f>(cx: &Cx, root: &Dir<ReadWrite>, message: &'f [u8], frame: &'f Frame) -> Result<(Option<(&'f str, u32)>, &'f [u8]), CliError> {
+    let mut pieces = message.splitn(PLACE_PIECES + 1, |b| *b == 0x1F);
+    let (Some(path), Some(chain), Some(edition), Some(words)) = (pieces.next(), pieces.next(), pieces.next(), pieces.next()) else {
+        return Err(CliError::Text { what: "an unresolved path's finding holds no place pieces" });
+    };
+    if path.is_empty() || chain.len() != 16 {
+        return Ok((None, words));
+    }
+    let path = core::str::from_utf8(path).map_err(|_| CliError::Text { what: "a path is not UTF-8" })?;
+    let chain = core::str::from_utf8(chain).ok().and_then(|hex| u64::from_str_radix(hex, 16).ok()).ok_or(CliError::Text { what: "an unresolved path's item digest is not hex" })?;
+    let edition = edition.first().and_then(|b| b.checked_sub(b'0')).and_then(blaze_surface::Edition::from_byte).ok_or(CliError::Text { what: "an unresolved path's finding holds no edition" })?;
+    let mut bytes = Bytes::new_in(frame, "a file to place an unresolved path in");
+    root.read_all(cx, &Path::new(path)?, &mut bytes)?;
+    let text = core::str::from_utf8(blaze_own::Vec::from_slice_in(bytes.as_slice(), frame).leak()).map_err(|_| CliError::Text { what: "a source file is not UTF-8" })?;
+    let erased = blaze_own::Erased::new(frame);
+    let outline = blaze_file_items::outline(text, edition, erased.handle());
+    Ok((crate::work::item_by_chain(&outline, text, chain).map(|start| (path, start)), words))
 }
 
 /// The names step's state for a command: the world, each crate by subject, and what the
@@ -195,7 +334,7 @@ pub(crate) fn world<'f>(cx: &Cx, root: &Dir<ReadWrite>, graph_record: &[u8], loc
     let lock: &'f Lock<'f> = lock.ok_or(NamesError::NoLock)?;
     // The command's allocator for the world and the records: the global one, held to the end.
     let alloc: Alloc<'f> = Alloc::global();
-    let (Some(home), Some(start)) = (env.home, env.start) else { return Err(NamesError::NoHome) };
+    let Some(home) = env.home else { return Err(NamesError::NoHome) };
     let decoded = blaze_unit_graph::record::decode(graph_record, Alloc::global()).map_err(NamesError::Graph)?;
     let decoded: &'static blaze_unit_graph::record::Decoded<'static> = std::boxed::Box::leak(std::boxed::Box::new(decoded));
     let graph = &decoded.graph;
@@ -204,7 +343,7 @@ pub(crate) fn world<'f>(cx: &Cx, root: &Dir<ReadWrite>, graph_record: &[u8], loc
     // command's (its deadline) and a frame of their own, both held to the end.
     let cx: &'static Cx = std::boxed::Box::leak(std::boxed::Box::new(cx.until(cx.deadline())));
     let frame: &'static Frame = std::boxed::Box::leak(std::boxed::Box::new(Frame::with_reserve(NAMES_FRAME, bstd::mem::Tag::Other).map_err(|_| NamesError::Frame)?));
-    let mut shelf = crate::toolchain::HomeShelf::open(cx, &env.fs, start, home, frame).map_err(NamesError::Shelf)?;
+    let mut shelf = crate::toolchain::HomeShelf::open(cx, &env.fs, home, frame).map_err(NamesError::Shelf)?;
     let toolchain = Toolchain::open(&mut shelf, env.toolchain, crate::graph::TRIPLE, needs, Alloc::global())
         .map_err(|e| NamesError::Toolchain(std::format!("{e}")))?;
     let toolchain: &'f Toolchain<'f, crate::toolchain::Held<'static>> = std::boxed::Box::leak(std::boxed::Box::new(toolchain));
@@ -444,7 +583,8 @@ pub(crate) fn run<'f, 'b>(
                 return Ok(Did::FailedSaying(refused("the crate's names could not be resolved"), held_str(words.as_str(), held)));
             }
         };
-        let unresolved = done.names.notes.len() as u32;
+        let mut findings = blaze_own::Vec::new_in(Global);
+        let unresolved = done.names.notes.len() as u32 + unresolved(&done.names, &mut findings);
         let mut payload = std::vec::Vec::with_capacity(HEAD + done.record.len() + 16 + done.inner.len());
         payload.extend_from_slice(&(done.record.len() as u64).to_le_bytes());
         payload.extend_from_slice(&unresolved.to_le_bytes());
@@ -461,7 +601,7 @@ pub(crate) fn run<'f, 'b>(
         absent.retain(|path| files.binary_search(path).is_err());
         names.resolved += 1;
         names.unresolved += u64::from(unresolved);
-        let resolved = Resolved { out: ContentId::of(OUT_DOMAIN, &done.record), payload, files, absent };
+        let resolved = Resolved { out: ContentId::of(OUT_DOMAIN, &done.record), payload, files, absent, findings };
         let i = names.made.binary_search_by_key(&name.subject, |(subject, _)| *subject).unwrap_err();
         names.made.insert(i, (name.subject, resolved));
     }
@@ -479,6 +619,10 @@ pub(crate) fn run<'f, 'b>(
     let mut made = Made::new_in(name, held);
     made.out = resolved.out;
     made.payload.extend_from_slice(&resolved.payload);
+    for finding in resolved.findings.iter() {
+        let words = core::str::from_utf8(&finding.message).map_err(|_| CliError::Text { what: "a path's segment is not UTF-8" })?;
+        made.find(UNRESOLVED, finding.at, &[words]);
+    }
     for path in resolved.files.iter() {
         let input = task.inputs.iter().find(|input| input.name == surface(path)).expect("checked above");
         made.reads.push((input.name, input.out));

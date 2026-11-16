@@ -24,7 +24,7 @@
 //!   read takes no lock and writes no shared memory, and nothing is held across a call, so no
 //!   thread waits on another's lookup; a write locks one shard of 64. Its values are lent
 //!   (`map.pin().get(..)`), never moved out: a table whose entries are taken by value stays a
-//!   locked [`HashMap`]. Each takes its allocator from its caller (`SharedMap::new_in(Global)`):
+//!   locked [`HashMap`]. Each takes its allocator from its caller (`blaze_core::SharedMap::new_in(name, Global)`):
 //!   a shared table is long-lived (a daemon's, a view's), so its allocator is one of its
 //!   lifetime, most often the global heap, named by the caller.
 //! - Keys an attacker may pick (a source's names and literals, a tree's file names, a path a
@@ -78,10 +78,6 @@
 #[macro_use]
 extern crate std;
 
-// The shared tables lock a shard with std's lock and box their entries on std's heap.
-#[cfg(all(feature = "shared", not(test)))]
-extern crate std;
-
 use core::hash::{BuildHasher, Hasher};
 
 pub mod adaptive;
@@ -98,6 +94,10 @@ mod raw;
 #[cfg(test)]
 mod raw_tests;
 #[cfg(feature = "shared")]
+#[expect(
+    clippy::disallowed_types,
+    reason = "the generic shared map's own home (D64): the ban keeps other crates on blaze-core's alias"
+)]
 pub mod shared;
 mod sip;
 #[cfg(test)]
@@ -151,20 +151,26 @@ pub type KeyedMap<K, V, A> = Map<K, V, SipKey, A>;
 /// A set of keys an attacker may pick, as [`KeyedMap`].
 pub type KeyedSet<K, A> = Set<K, SipKey, A>;
 
-/// A map of ordinary keys shared between threads, made by `SharedMap::new_in(alloc)`
-/// ([`shared`]) in the allocator its caller names: one that lives as long as the table, as a
-/// shared table is long-lived (see the crate's documentation). Behind the `shared` feature,
-/// which the crates that share a table turn on (the root manifest's entry).
+/// A map of ordinary keys shared between threads ([`shared`]), in the allocator its caller
+/// names (one that lives as long as the table, as a shared table is long-lived: see the crate's
+/// documentation), its shards locked by `L` (decision D64). Code names blaze-core's
+/// instantiation, `blaze_core::SharedMap`, made by `SharedMap::new_in(name, alloc)`; the root
+/// `.clippy.toml` bans naming this one elsewhere. Behind the `shared` feature, which the crates
+/// that share a table turn on (the root manifest's entry).
 #[cfg(feature = "shared")]
-pub type SharedMap<K, V, A> = shared::Map<K, V, FixedState, A>;
+#[expect(clippy::disallowed_types, reason = "the generic alias blaze-core instantiates (D64)")]
+pub type SharedMap<K, V, A, L> = shared::Map<K, V, FixedState, A, L>;
 
-/// A set of ordinary keys shared between threads, made by `SharedSet::new_in(alloc)`.
+/// A set of ordinary keys shared between threads, as [`SharedMap`]: `blaze_core::SharedSet`.
 #[cfg(feature = "shared")]
-pub type SharedSet<K, A> = shared::Set<K, FixedState, A>;
+#[expect(clippy::disallowed_types, reason = "the generic alias blaze-core instantiates (D64)")]
+pub type SharedSet<K, A, L> = shared::Set<K, FixedState, A, L>;
 
-/// A map on hashes shared between threads, indexed by the hash itself.
+/// A map on hashes shared between threads, indexed by the hash itself, as [`SharedMap`]:
+/// `blaze_core::SharedByHash`.
 #[cfg(feature = "shared")]
-pub type SharedByHash<K, V, A> = shared::Map<K, V, BuildKeyHasher, A>;
+#[expect(clippy::disallowed_types, reason = "the generic alias blaze-core instantiates (D64)")]
+pub type SharedByHash<K, V, A, L> = shared::Map<K, V, BuildKeyHasher, A, L>;
 
 /// The `BuildHasher` of [`HashMap`] and [`HashSet`], and of any other table of ordinary keys
 /// (`OrderMap`, the shared tables): every hasher it builds is [`FixedHasher::default`].

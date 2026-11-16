@@ -84,7 +84,7 @@ use core::alloc::Allocator;
 use core::fmt;
 
 use blaze_own::Alloc;
-use blaze_typeck::{Adt, AdtKind, FloatTy, IntTy, ItemKey, PNode, PTy, PortableTys, UintTy};
+use blaze_typeck::{Adt, AdtKind, FloatTy, IntTy, ItemKey, Name, PNode, PTy, PortableTys, UintTy};
 
 use crate::{BuildError, ground};
 
@@ -147,6 +147,111 @@ pub trait LayoutFacts {
     /// [`Refusal::Missing`] and caches nothing.
     fn discriminant(&self, key: ItemKey, variant: u32) -> Result<Option<i128>, Missing>;
     fn valid_range(&self, key: ItemKey) -> ValidRange;
+
+    /// The projection `<args[0] as trait_<args[1..]>>::name` (as `PNode::Alias` holds it) at
+    /// concrete arguments, normalized by the front end's solver: `args` are types of `ground`
+    /// with no parameter and no projection inside; the answer is interned in `ground` and holds
+    /// no projection (the build still checks, and normalizes one it meets again: normalize.rs).
+    /// The default, and an answer the solver cannot give: [`crate::BuildError::Projection`]
+    /// naming it. The Reference, "Associated Items", "Associated types". Here, not on `Adts`,
+    /// because layout grounds a field of projection type too and reads only these facts; the
+    /// walk reaches it through `Adts::facts`.
+    fn normalize(&self, trait_: ItemKey, name: Name, args: &[PTy], ground: &mut PortableTys<'_>) -> Result<PTy, crate::BuildError> {
+        let _ = (args, ground);
+        Err(crate::BuildError::Projection { trait_, name })
+    }
+
+    /// The facts of closure `ordinal` of `owner`'s body (typeck.md, "A closure's identity";
+    /// codegen.md, "Closures and the Fn traits"): its kind, signature and environment, in the
+    /// owner's generic parameters, made from the owner's check record by [`closure_facts`].
+    /// `None`: not answered, and the build refuses naming the closure.
+    fn closure(&self, owner: ItemKey, ordinal: u32) -> Option<ClosureFacts<'_>> {
+        let _ = (owner, ordinal);
+        None
+    }
+}
+
+/// A closure's facts, of its owner's generic parameters (`Param(i)`) in `types`.
+#[derive(Clone, Copy)]
+pub struct ClosureFacts<'a> {
+    pub types: blaze_typeck::PTys<'a>,
+    /// The checker's kind (`Checked::closures`): the trait method that is its body.
+    pub kind: crate::FnTrait,
+    /// Its signature, a `FnPtr`: the inputs, then the output.
+    pub sig: PTy,
+    /// Its ENVIRONMENT: a tuple with one field per capture in the checker's order
+    /// (`Checked::captures`): `&T` for `ByRef`, `&mut T` for `ByMutRef`, `T` for `ByValue`.
+    pub env: PTy,
+}
+
+/// The facts of closure `ordinal` of the body `checked` records, written into `out` (the seam's
+/// own table; `generics` the owner's parameter count, parents first): the kind and signature
+/// the checker recorded (`Checked::closures[ordinal]`), and the environment from its captures.
+/// The answer of [`LayoutFacts::closure`]; it holds no expression id of the body.
+pub fn closure_facts(
+    checked: &blaze_typeck::Checked<'_>,
+    ordinal: u32,
+    generics: u32,
+    out: &mut PortableTys<'_>,
+    scratch: Alloc<'_>,
+) -> Result<(crate::FnTrait, PTy, PTy), BuildError> {
+    let full = |_| BuildError::Malformed { what: "a closure's facts table is full" };
+    let row = ordinal as usize;
+    let rows = &checked.closures;
+    if row >= rows.len() {
+        return Err(BuildError::Malformed { what: "a closure ordinal past its owner's `Checked::closures`" });
+    }
+    let (e, kind, sig) = (rows.column::<0>()[row], rows.column::<1>()[row], rows.column::<2>()[row]);
+    let mut params: Vec<PTy, Alloc<'_>> = Vec::with_capacity_in(generics as usize, scratch);
+    for i in 0..generics {
+        params.push(out.intern(PNode::Param(i)).map_err(full)?);
+    }
+    let from = checked.types.view();
+    let sig = ground(from, sig, &params, out, scratch, &NoFacts)?;
+    let mut fields: Vec<PTy, Alloc<'_>> = Vec::new_in(scratch);
+    let caps = &checked.captures;
+    for c in 0..caps.len() {
+        if caps.column::<0>()[c] != e {
+            continue;
+        }
+        let (p, by) = (caps.column::<1>()[c], caps.column::<2>()[c]);
+        let lt = *checked.local_ty.get(p.ix()).ok_or(BuildError::Malformed { what: "a captured binding without a type" })?;
+        let t = ground(from, lt, &params, out, scratch, &NoFacts)?;
+        fields.push(match by {
+            blaze_typeck::CaptureKind::ByRef => out.intern(PNode::Ref(blaze_typeck::Mutbl::Not, t)).map_err(full)?,
+            blaze_typeck::CaptureKind::ByMutRef => out.intern(PNode::Ref(blaze_typeck::Mutbl::Mut, t)).map_err(full)?,
+            blaze_typeck::CaptureKind::ByValue => t,
+        });
+    }
+    let l = out.intern_list(&fields).map_err(full)?;
+    let env = out.intern(PNode::Tuple(l)).map_err(full)?;
+    let kind = match kind {
+        blaze_typeck::ClosureKind::Fn => crate::FnTrait::Fn,
+        blaze_typeck::ClosureKind::FnMut => crate::FnTrait::FnMut,
+        blaze_typeck::ClosureKind::FnOnce => crate::FnTrait::FnOnce,
+    };
+    Ok((kind, sig, env))
+}
+
+/// Facts that answer nothing: copying a record's types keeps its projections as written.
+struct NoFacts;
+
+impl LayoutFacts for NoFacts {
+    fn adt(&self, _: ItemKey) -> Option<Adt<'_>> {
+        None
+    }
+
+    fn repr(&self, _: ItemKey) -> ReprAttrs {
+        ReprAttrs::RUST
+    }
+
+    fn discriminant(&self, _: ItemKey, _: u32) -> Result<Option<i128>, Missing> {
+        Ok(None)
+    }
+
+    fn valid_range(&self, _: ItemKey) -> ValidRange {
+        ValidRange::default()
+    }
 }
 
 /// What a layout reads and where it grounds field types.
@@ -712,6 +817,15 @@ impl<A: Allocator + Clone> Layouts<A> {
         match node {
             PNode::Tuple(l) => out.extend_from_slice(view.list(l).map_err(|_| Refusal::Malformed("a list past the ground table"))?),
             PNode::Array(e, _) | PNode::Slice(e) | PNode::Pat(e, _) => out.push(e),
+            // A closure (codegen.md, "Closures and the Fn traits"): a struct of one field, its
+            // environment, a fact of its identity grounded at the owner's arguments.
+            PNode::Closure { owner, ordinal, args: l } => {
+                let facts = cx.facts;
+                let c = facts.closure(owner, ordinal).ok_or(Refusal::Unsupported("a closure whose facts the world did not answer"))?;
+                let mut args: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+                args.extend_from_slice(view.list(l).map_err(|_| Refusal::Malformed("a list past the ground table"))?);
+                out.push(ground(c.types, c.env, &args, cx.ground, cx.scratch, facts).map_err(Refusal::Ground)?);
+            }
             PNode::Adt(key, l) => {
                 let facts = cx.facts;
                 let adt = facts.adt(key).ok_or(Refusal::NoAdt(key))?;
@@ -721,7 +835,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                     return Err(Refusal::Malformed("an ADT type whose argument count is not its generic count"));
                 }
                 for f in adt.fields.iter() {
-                    out.push(ground(adt.types, f.ty, &args, cx.ground, cx.scratch).map_err(Refusal::Ground)?);
+                    out.push(ground(adt.types, f.ty, &args, cx.ground, cx.scratch, cx.facts).map_err(Refusal::Ground)?);
                 }
             }
             _ => {}
@@ -893,12 +1007,11 @@ impl<A: Allocator + Clone> Layouts<A> {
                     discrs: (0, 0),
                 }
             }
-            PNode::Tuple(_) => {
+            PNode::Tuple(_) | PNode::Closure { .. } => {
                 let u = self.univariant(parts, Order::Decreasing, ReprAttrs::RUST, 0, 0)?;
                 self.struct_row(t, u)
             }
             PNode::Adt(key, _) => return self.adt(t, key, cx, parts),
-            PNode::Closure(..) => return Err(Refusal::Unsupported("a closure (its captures are not in the portable form)")),
             PNode::Future(..) => return Err(Refusal::Unsupported("an async block's future (its state machine is built by codegen)")),
             // codegen.md "Trait objects": unsized, its size and alignment the vtable's words 1
             // and 2; no field is visible through it.
@@ -968,7 +1081,7 @@ impl<A: Allocator + Clone> Layouts<A> {
                     let Some(last) = adt.fields.last() else { return Ok(None) };
                     let mut args: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
                     args.extend_from_slice(view.list(l).map_err(|_| Refusal::Malformed("a list past the ground table"))?);
-                    p = ground(adt.types, last.ty, &args, cx.ground, cx.scratch).map_err(Refusal::Ground)?;
+                    p = ground(adt.types, last.ty, &args, cx.ground, cx.scratch, cx.facts).map_err(Refusal::Ground)?;
                 }
                 PNode::Param(_) | PNode::Alias { .. } | PNode::Opaque(..) | PNode::Infer | PNode::Error => {
                     return Err(Refusal::Malformed("a pointee with no ground form"));

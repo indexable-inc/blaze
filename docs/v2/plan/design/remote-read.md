@@ -382,6 +382,55 @@ only; bstd `Net::roots` gives `blaze_core::trust::Roots`. Moving blaze-fetch: re
 fetch.rs:418-571 (`Handle::spawn`, `mailbox::block_on`) with the one driver on `Net` once the
 coordinator picks the home above.
 
+**Stage one of D63 built (fourth runner, 2026-11-16; supersedes the two paragraphs above where
+they differ).** The home is bstd's `Http` (D63), and blaze-h1-net is DELETED (its folder
+`crates/blaze-h1-net/` with Cargo.toml, src/{lib,client,plant,tests,tls}.rs, and its
+`[workspace.dependencies]` line). bstd `requests.rs` gained, all by blaze-h1's functions:
+`Request::range` (sent as `Range`; the answer must be a 206 of exactly it, `Response::ranged`,
+checked as the head ends, also before a head the body bound refuses); the body held to
+`Wire::body_most` or the range's length, whichever is less, by `Limits` before a byte past it;
+a byte after the answer's end is `AfterEnd` (it reads on to the close it asked for);
+`Wire::redirects` (`Follow`; `NO_REDIRECTS` refuses with `RedirectsOver { most: 0 }`), a
+followed hop is `Finished::Redirected(Exchange)` already sent, so begin/finish holds across
+hops; `Wire::wait_most` bounds the connect, the send and each receive, a silent host being
+`HttpKind::Silent` (the error's URL names the host). New feature `requests` (blaze-h1 only);
+`net` = `requests` + blaze-http/h3. blaze-cli takes `requests`, not blaze-http.
+Proof: blaze-std `tests/requests_servers.rs` (honest in tape-cut pieces, stall, early close,
+wrong range, wrong length, longer than promised, redirect, 404; each refused by name, nothing
+handed on) and its plant `requests::plant` (the range check skipped): `mixcheck test blaze-std
+requests` "5 passed, 0 failed" (both new tests and the old three); whole suite "256 passed, 0
+failed"; blaze-core "check ok". It found one real bug on its first run: a 404 to a ranged ask
+was named `TooBig { most: 2 }` (blaze-h1 refuses a long `Content-Length` before `has_head`),
+now `RangeStatus { status: 404 }`. `HttpOrigin` (store.rs) is on bstd's `Http`
+(`read_with(.., between)` runs the test's server between send and read) and
+`store_http_tests.rs` is wired: `mixcheck test blaze-cli http_tests` "2 passed, 0 failed"
+(folder and HTTP byte-equal; a liar refused by the digest chain).
+
+**Stage two, for the next runner (by file and line, read before writing):**
+1. TLS as a sans-IO layer between `Conn` and the parser in bstd `requests.rs` (`send` and
+   `read_answer`: today `https` is `NoTls`). blaze-http does it with rustls's unbuffered
+   sans-IO API inside its `Client` (crates/blaze-http/src/client.rs; roots by
+   `blaze_core::trust::system`, roots.rs:49). In bstd the roots come from `Net::roots`
+   (net.rs:322, `Effect::Roots`) and are already held in `Provider::Over::roots`. A seam:
+   the provider takes a TLS state machine fed bytes in and out; the simulation's server then
+   speaks TLS too (test certificates in the simulation's roots).
+2. The pool: keep-alive per origin (`close: false`, `Response::reusable`), bounded by count and
+   idle time on the `Clock`; `Exchange::finish` hands its connection back to it.
+3. Crate fetching onto bstd's `Http`: blaze-cli fetch.rs:418-571 (`FetchIo` over
+   `blaze_http::driver::Handle::spawn` :571, roots :569, `mailbox::block_on` :472) becomes
+   blaze-fetch's `Effect::Http` performed by `Http::request` on the command's `Net`; a proxy a
+   value from main.rs, not `proxy_env.rs:14`. Then delete from crates/blaze-http: `driver.rs`
+   (its thread), `proxy_env.rs`, the HTTP/1.1 `Client` core and its tests; HTTP/3 (`h3/`) stays
+   behind its feature until it runs on `Net`'s datagrams.
+   Measured on this leg's release (greenmix 89688b5872, `exp2.sh e5 .. proto`, load 14.5 to
+   15.5): A cold "names resolved for 15 crates", `38 runs`, 2657.583 ms; B cold `10 runs, 34
+   store reads (27 found)`, 28.712 ms, 104,399,568 bytes, no names line; B again `0 runs`,
+   0.680 ms, profile row `machine found 0 written 0; packs 1 read whole 0`.
+4. Not done in this leg: the HTTP origin's cold run. Nothing seals A's records into an origin
+   from the pack store (crates/blaze-remote/examples/seal_origin.rs reads the old file store
+   `.blaze/v2/records/`), so that measurement needs the sealing tool on packs first, then a
+   ranged server under port27/shared-1116/.
+
 ## Not built
 
 - **Cache writes.** Only CI writes an origin, through `publish`. Nothing here uploads.

@@ -103,7 +103,8 @@ fn expand_census() {
     let names: Names<'_> = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let crate_names: Vec<&str> = crates.iter().map(|c| c.name).collect();
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
-    let front = Front2::new(&names, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
+    let front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
     let prepared = Prepares::new_in(Alloc::global());
     let mut out = format!("expand census: names resolved in {:?}\n", start.elapsed());
 
@@ -151,7 +152,7 @@ fn expand_census() {
             cb += 1;
             let scoped = Scoped { names: &names, module: *module, prepared: Some(&prepared) };
             let mut expand = ByName::with_names(&scoped, NoHost, Alloc::global());
-            if blaze_lower::lower_body_expanding(text, ed, &mut CrateCfg(atoms), &mut expand, Alloc::global()).is_err() {
+            if blaze_lower::lower_body_expanding(text, ed, &mut CrateCfg(atoms), &mut blaze_lower::NoModule, &mut expand, Alloc::global()).is_err() {
                 continue;
             }
             let mut seen: Vec<String> = Vec::new();

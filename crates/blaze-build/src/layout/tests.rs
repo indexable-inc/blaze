@@ -604,7 +604,7 @@ fn random_types(tape: &Tape) -> Result<(), Broke> {
                 let adt = w.adt(k).unwrap();
                 let mut ps = Vec::new();
                 for f in adt.fields {
-                    ps.push(crate::ground(adt.types, f.ty, &args, &mut g.t, Alloc::global()).unwrap());
+                    ps.push(crate::ground(adt.types, f.ty, &args, &mut g.t, Alloc::global(), &w).unwrap());
                 }
                 (ps, w.repr(k).packed, Some(adt.kind))
             }

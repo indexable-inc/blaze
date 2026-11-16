@@ -63,9 +63,10 @@ pub enum TyView {
     FnPtr(TyList, FnPtrHeader),
     /// A closure of this body and its signature (a `FnPtr`).
     Closure(ExprId, Ty),
-    /// A closure of another body (`PNode::Closure`): its owner, its ordinal there and the
-    /// owner's arguments, with the facts the world answered for it (`Question::Closure`): its
-    /// signature (a `FnPtr`, substituted by `args`) and its kind.
+    /// A closure of another body (`PNode::Closure`): its identity (`owner`, `ordinal`, the
+    /// owner's arguments `args`) and the facts the owner's check recorded (`Question::Closure`):
+    /// its signature (a `FnPtr`, substituted by `args`) and its kind. The solver sees
+    /// `Closure(hash(owner, ordinal), [args.., kind, sig, ()])`.
     ClosureOf { owner: ItemKey, ordinal: u32, args: TyList, sig: Ty, kind: ClosureKind },
     /// An async block's (or an async closure's call's) future, by its expression: its output,
     /// then its interior, the tuple of what it holds (its captures by capture kind and the

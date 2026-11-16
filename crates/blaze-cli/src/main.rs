@@ -804,8 +804,19 @@ fn draw(
 ) -> Result<(), CliError> {
     // (file, position, the request's finding or the program's refusal, its index).
     let mut order: Vec<(Option<&str>, u32, bool, usize), &Frame> = Vec::new_in(frame);
+    // Each finding's (item start, words): a crate's unresolved path carries its file and item
+    // in its message, placed now in the file as it is (names.rs `placed`; rule 71).
+    let mut places: Vec<(u32, &[u8]), &Frame> = Vec::with_capacity_in(prints.len(), frame);
     for (i, finding) in prints.iter().enumerate() {
-        order.push((print::file_of(req, found, finding, frame)?, finding.place.saturating_add(finding.start), false, i));
+        let (path, place, words) = match finding.rule == names::UNRESOLVED && finding.file.is_none() {
+            true => match names::placed(cx, root, &finding.message, frame)? {
+                (Some((path, place)), words) => (Some(path), place, words),
+                (None, words) => (None, finding.place, words),
+            },
+            false => (print::file_of(req, found, finding, frame)?, finding.place, &finding.message[..]),
+        };
+        places.push((place, words));
+        order.push((path, place.saturating_add(finding.start), false, i));
     }
     if let Some(program) = program {
         for (i, refusal) in program.refusals.iter().enumerate() {
@@ -818,7 +829,7 @@ fn draw(
     for &(path, _, of_program, i) in order.iter() {
         match (of_program, program) {
             (true, Some(program)) => print::refusal(cx, &program.refusals[i], &program.texts, shown, frame, out)?,
-            _ => print::framed(cx, root, path, &prints[i], shown, frame, out)?,
+            _ => print::framed(cx, root, path, places[i].0, places[i].1, &prints[i], shown, frame, out)?,
         }
     }
     // A failed task is the tool's, not the code's: named with its file, and the command fails
@@ -1127,6 +1138,32 @@ mod tests {
         assert!(out.contains("lib.rs:3:12"), "{out}");
     }
 
+    /// A `use` of nothing in the project's own crate is one error at the failing segment's
+    /// line and column, exit 1; its record holds the place relative to the `use` item, so a body
+    /// edit above it moves the printed line with the file and reruns no names; the import fixed,
+    /// no error is left.
+    #[test]
+    fn a_bad_import_is_one_error_at_its_segment() {
+        let io = Io::simulated(SimWorld::new(9, Limits::USUAL));
+        write(&io, "Cargo.toml", MANIFEST);
+        write(&io, "src/lib.rs", "pub fn f() -> u8 { 1 }\nuse crate::nope::Thing;\n");
+        let bad = check(&io, work::Sizes::USUAL);
+        assert!(bad.failed.is_empty(), "{:?}", bad.failed);
+        let out = stdout(&io);
+        assert_eq!((bad.errors, bad.status), (1, Some(1)), "{out}\n{}", bad.profile);
+        assert!(out.contains("lib.rs:2:12: error[unresolved]: no `nope` in `crate`"), "{out}");
+        let seen = out.len();
+        write(&io, "src/lib.rs", "pub fn f() -> u8 {\n    1\n}\nuse crate::nope::Thing;\n");
+        let moved = check(&io, work::Sizes::USUAL);
+        let out = stdout(&io);
+        assert_eq!((moved.errors, moved.status), (1, Some(1)), "{out}\n{}", moved.profile);
+        assert!(out[seen..].contains("lib.rs:4:12: error[unresolved]: no `nope` in `crate`"), "{}", &out[seen..]);
+        assert_eq!(made(&moved.profile, "CrateScope"), 0, "a body edit reruns no names:\n{}", moved.profile);
+        write(&io, "src/lib.rs", "pub fn f() -> u8 {\n    1\n}\nmod nope { pub struct Thing; }\nuse crate::nope::Thing;\n");
+        let fixed = check(&io, work::Sizes::USUAL);
+        assert_eq!((fixed.errors, fixed.status), (0, Some(3)), "{}", &stdout(&io)[seen..]);
+    }
+
     /// The `made` count of `kind`'s profile row.
     fn made(profile: &str, kind: &str) -> u32 {
         let row = profile.lines().find(|line| line.split_whitespace().next() == Some(kind)).unwrap_or("");
@@ -1253,7 +1290,7 @@ mod tests {
             assert!(edited.failed.is_empty() && edited.runs >= 1, "edit {edit}: {} runs", edited.runs);
         }
         let again = check(&io, SMALL);
-        assert!(again.certified && again.runs == 0, "a repeat after the merge: certified {}, {} runs: {:?}", again.certified, again.runs, again.profile);
+        assert!(again.certified && again.runs == 0, "a repeat after the merge: certified {}, {} runs:\n{}", again.certified, again.runs, again.profile);
         write(&io, "src/m3.rs", &functions(100));
         let undone = check(&io, SMALL);
         assert!(undone.certified && undone.runs == 0 && undone.checked == cold.checked, "the undo: {} runs", undone.runs);

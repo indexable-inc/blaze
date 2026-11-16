@@ -936,6 +936,65 @@ once; the plant `RanUnderCondition` (an asker served a fork it does not imply) i
       profile in full. Left: (3c); this test; step 5 (toolchain shelf through
       `Fs::home(cx, home, &Path::new(SHELF))` in toolchain.rs `HomeShelf::open`, dropping
       `At::Above` and the `start` argument at its two callers, graph.rs:198 and names.rs:207).
+    - RUNNER 7 2026-11-16, step 1 (a bad import). names.rs `unresolved`: each
+      `ScopeError::Import`/`Macro` of a crate whose files are the checkout's (`/0/`) is a
+      finding `UNRESOLVED` (Cli 14, "unresolved": "no `x` in `a::b`") of the `CrateScope`
+      record; its range is the failing segment's, RELATIVE to the item holding the `use`'s
+      `Loc` (work.rs `item_holding`), and its message carries the file, the item's chain digest
+      (work.rs `item_chain`: kind, name, disambiguator up to the file, as `body_name`) and the
+      edition. The printer (main.rs `draw`, names.rs `placed`) outlines the file as it is and
+      finds the item by its chain: a body edit above moves the printed line, not the record.
+      A dependency's unresolved paths join the one counted note. Approximate: the segment is
+      found by its text in order inside the item (a `use` tree with a repeated name may pick
+      the first). Scopes are a map: findings are sorted before the record.
+    - RUNNER 7, step 2 design (the types stage). A `BodyTypes` part per checked body (the
+      `BodyCheck` body's name under its own kind), keyed by the body's item text and edition and
+      read-listed by what its check read (the front end's read list; first cut, coarser and
+      still correct: every `Surface` of its crate and the toolchain's id). Its task calls ONE
+      entry of blaze-ladder front2 over a world made ONCE a command from the `CrateScope`
+      records (never `resolve_crates` from scratch: measured "names resolved in 36.65s" on the
+      owner's hello world through the ladder's own path). Its record: each checker diagnostic
+      a finding (`TYPES`, the checker's code and text, range relative to the fn item), or a
+      GAP with its typed reason. `CHECK_STAGES` "types": checked for the bodies with a record
+      and no gap; each gap is listed "not checked: types" with a count and the first three
+      reasons; never a pass. Blocked on the entry (asked of the RUN lane, 11:0x): a front2
+      world from records, and `check_one(world, body item) -> {findings, gaps, reads digest}`.
+    - RUNNER 7 (uncommitted; handing on). Step 1 seen: "mixcheck test blaze-cli: exit 0; 1
+      passed" for `a_bad_import_is_one_error_at_its_segment` (prints "lib.rs:2:12:
+      error[unresolved]: no `nope` in `crate`", status 1; a body edit above moves it to 4:12 with
+      `CrateScope made 0`; the fix clears it, status 3); with the record's findings filtered out
+      it fails "left: (0, Some(3))". NEW RED it exposed: `creating_a_missing_module_file_clears_its_error`
+      (`mod x;` + `pub use x::f;`, then create src/x.rs): the created run's profile has NO
+      `CrateScope` row, so the crate's record stood and its stale unresolved `x::f` stays: the
+      `CrateScope` read list does not hold the absent `src/x.rs` (names.rs `Recording` lists
+      `absent` only for probes through `/0/`; check what path the missing `mod x;` probe uses).
+      A real invalidation hole, invisible while the record carried no findings: fix it first.
+      Step 2: design above; the RUN lane (now a6703adf2352e6b0f, relay 24) asked for and was sent
+      the exact signature (`ProjectWorld::new(names, user, alloc)`, `check(item) -> BodyVerdict
+      { diagnostics (item-relative), gaps, refused, reads }`) and told the blocker: a front2 world
+      from the `CrateScope` records, not `resolve_crates` (36.65 s). No code yet.
+      Its answer (written, NOT compiled: blaze-typeck mid-batch): blaze-ladder
+      src/front2/project.rs `ProjectWorld::new(names, frame, user, alloc)`, `bodies(&self,
+      alloc) -> AVec<(BodyRef, Option<BodyAt { file, start }>)>` (use it to map a body to its
+      file and item start; None = macro-written), `check(&mut self, body, alloc) ->
+      BodyVerdict { diagnostics {code, text, start, end} relative to the item text, gaps
+      (world_items::Gap, Display), refused: Option<Refused> (text()), reads: Option<ContentId>
+      (Some only for a clean body) }`; test tests/front2_project.rs. NAMES FROM RECORDS: not
+      possible today: `Names::of_crates` needs each crate's in-memory `CrateNames`; no decoder
+      makes one from the `CrateScope` exports + inner records. That decoder is the missing piece
+      (Names library row, main, paused): ask main for it; until then the types stage can only
+      run by resolving every crate from scratch, which is not shippable.
+      Step 3: NOT the merge: with `0..2` edits (under `PACKS_MOST`) it fails the same; a second
+      repeat fails the same ("certified false, 2 runs"), so every repeat after a signature edit
+      of m3 re-finds m3's `FileItems`/`Surface`/new body by key (not standing) and re-enters the
+      project's `CrateScope` (entries 2, needs 1, made 0). Suspect: m3's stamp is racy in the
+      simulation (sweep.rs `Stamp::settled`) and stays unstamped, or the edit command's settled
+      rows for remade jobs are not kept; next: print `again`'s leaf row for src/m3.rs.
+      Step 4 written: toolchain.rs `HomeShelf::open(cx, fs, home, frame)` opens
+      `Fs::home(cx, home, SHELF)`; `At::Above`, `Ancestor` and `start` gone at graph.rs and
+      names.rs; its test publishes under `u/me/` (the simulation's home). Suite: "mixcheck test
+      blaze-cli: exit 101; 50 passed, 2 failed (against green: blaze-typeck blaze-lower
+      blaze-ladder)": the two above.
 - Owed, not now: `run` after `check` writes its own certificate, because the command is in
   the key. That costs 3.5 ms against the second run's 1.0 ms on hello-world. A coarse proof
   covers all under it: `check`'s certificate should stand for `run`'s check part.

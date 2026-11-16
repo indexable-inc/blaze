@@ -798,6 +798,35 @@ fn body_name(file: Name, outline: &blaze_file_items::Outline<'_>, item: &blaze_s
     Name::new(Kind::BodyCheck, h.finish())
 }
 
+/// The domain of an item's chain digest ([`item_chain`]).
+const CHAIN_DOMAIN: &str = "blaze-cli item chain 1";
+
+/// An item's identity in its file that no edit elsewhere moves (rule 71): the digest of its
+/// chain up to the file (each kind, name as written and disambiguator), as [`body_name`] names
+/// a body. A record that places a finding in an item holds this and the range from the item's
+/// start; the printer finds the item's start in the file as it is today ([`item_by_chain`]).
+pub(crate) fn item_chain(outline: &blaze_file_items::Outline<'_>, item: &blaze_surface::Item, text: &str) -> u64 {
+    let mut h = blaze_ids::Hasher::new(CHAIN_DOMAIN);
+    let mut at = Some(item);
+    while let Some(entry) = at {
+        let name = entry.name.map_or("", |range| entry.text(text, range));
+        h.update(&[entry.kind() as u8]).update(&(name.len() as u32).to_le_bytes()).update(name.as_bytes()).update(&entry.disambiguator.to_le_bytes());
+        at = entry.parent.map(|up| outline.item(up));
+    }
+    let digest = h.finish();
+    u64::from_le_bytes(digest.0[..8].try_into().expect("a digest holds 8 bytes"))
+}
+
+/// The item of `outline` whose [`item_chain`] is `chain`: its start in the file today.
+pub(crate) fn item_by_chain(outline: &blaze_file_items::Outline<'_>, text: &str, chain: u64) -> Option<u32> {
+    outline.items().iter().find(|item| item_chain(outline, item, text) == chain).map(|item| item.range.start)
+}
+
+/// The innermost item of `outline` whose range holds `offset`.
+pub(crate) fn item_holding<'o>(outline: &'o blaze_file_items::Outline<'_>, offset: u32) -> Option<&'o blaze_surface::Item> {
+    outline.items().iter().filter(|item| item.range.start <= offset && offset < item.range.end).min_by_key(|item| item.range.end - item.range.start)
+}
+
 /// The parser's edition of a part's edition byte.
 fn parser_edition(edition: Edition) -> parser::Edition {
     match edition {

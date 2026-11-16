@@ -56,11 +56,24 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
         let (inputs, output, rust_call) = match self.reads.fn_sig(owner)? {
             Some(sig) => {
+                self.own_params = sig.parent_count + sig.own_count;
                 let mut inputs: blaze_own::Vec<Ty, Alloc<'a>> = blaze_own::Vec::with_capacity_in(sig.inputs.len(), self.alloc);
                 for &t in sig.inputs {
                     inputs.push(self.lower_sig_ty(sig.types, t)?);
                 }
-                let output = self.lower_sig_ty(sig.types, sig.output)?;
+                // Each opaque the output names is this body's to define (rules/opaque_def.rs);
+                // an async fn's is its body's future, below.
+                let output = match self.body.coroutine {
+                    None => {
+                        let t = self.lower_defining_output(sig.types, sig.output)?;
+                        // rustc's order (`replace_opaque_types_with_inference_vars`): the
+                        // bounds are obligations from the start, so a returned closure is
+                        // typed from its `Fn` bound.
+                        self.close_opaques()?;
+                        t
+                    }
+                    Some(_) => self.lower_sig_ty(sig.types, sig.output)?,
+                };
                 (inputs, output, sig.header.abi == crate::ids::Abi::RustCall)
             }
             None => (blaze_own::Vec::new_in(self.alloc), self.fresh()?, false),

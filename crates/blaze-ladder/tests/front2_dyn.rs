@@ -50,8 +50,9 @@ fn dyn_types_through_front2() {
     let crates = inputs.crates();
     let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
-    let mut front = Front2::new(&names, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
-    let mut store = Store::new(front.index.lang("sized"));
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
+        let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+    let mut store = Store::new(front.index.lang("sized"), front.frame);
     let sized_key = checker_of(front.index.lang("sized").expect("core's `Sized` is a lang item"));
     let root = names.root(0);
     let lib = |name: &'static str| {
@@ -90,9 +91,9 @@ fn dyn_types_through_front2() {
     let u = head("fn_ptr_unit").expect("`unsafe extern \"C\" fn(u8)` is built").expect("an input");
     // (`impl Trait` parameters, read below.)
     head("apit").expect("`impl Trait` parameters are built");
-    // In return position it is an opaque type: refused by name.
-    let r = head("rpit");
-    assert!(matches!(&r, Err(HeadError::Item(_, Why::Unsupported(w, _))) if w.contains("impl Trait")), "a return-position `impl Trait` stays refused by name: {r:?}");
+    // In return position it is an opaque type (the Reference, "Impl trait", "Abstract return
+    // types"): built; its callers are proved in tests/front2_bounds.rs.
+    head("rpit").expect("a return-position `impl Trait` is built as an opaque type");
     let tys = store.tys.view();
     match (tys.node(p), tys.node(u)) {
         (Ok(blaze_typeck::PNode::FnPtr(lp, hp)), Ok(blaze_typeck::PNode::FnPtr(lu, hu))) => {

@@ -15,7 +15,8 @@
 
 use blaze_own::{Alloc, Soa, Vec};
 
-use crate::columns::{Adjusts, Callees, Captures, Checked, ExprDefs, Fields, PatDefs};
+use crate::columns::{Adjusts, Callees, Captures, Checked, Closures, ExprDefs, Fields, PatDefs};
+use crate::ty::ClosureKind;
 use crate::diag::{At, Diag, DiagCode};
 use crate::error::{CheckError, Limit};
 use blaze_hash::HashMap;
@@ -66,7 +67,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             TyView::Tuple(l) | TyView::Adt(_, l) | TyView::FnDef(_, l) | TyView::FnPtr(l, _) | TyView::Opaque(_, l) => {
                 list(l, out)
             }
-            TyView::Alias { args, .. } => list(args, out),
+            TyView::Alias { args, .. } | TyView::ClosureOf { args, .. } => list(args, out),
             TyView::Dynamic(l) | TyView::ExTrait(_, l) | TyView::ExProj { args_term: l, .. } => list(l, out),
             TyView::Ref(_, t) | TyView::Ptr(_, t) | TyView::Slice(t) | TyView::Closure(_, t) | TyView::ConstValue { ty: t, .. } => {
                 out.push(t)
@@ -195,7 +196,17 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 TyView::Adt(k, l) => PNode::Adt(k, self.export_list(ex, l)?),
                 TyView::FnDef(k, l) => PNode::FnDef(k, self.export_list(ex, l)?),
                 TyView::FnPtr(l, h) => PNode::FnPtr(self.export_list(ex, l)?, h),
-                TyView::Closure(e, sig) => PNode::Closure(e, one(ex, sig, self.ty)?),
+                // A closure of this body is named by its ordinal at the owner's own parameters
+                // (typeck.md, "A closure's identity"); its signature goes to `Checked::closures`.
+                TyView::Closure(e, _) => {
+                    let ordinal = self.closure_ordinal(e)?;
+                    let mut ps: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(self.own_params as usize, self.alloc);
+                    for i in 0..self.own_params {
+                        ps.push(ex.out.intern(PNode::Param(i))?);
+                    }
+                    PNode::Closure { owner: self.body.owner, ordinal, args: ex.out.intern_list(&ps)? }
+                }
+                TyView::ClosureOf { owner, ordinal, args, .. } => PNode::Closure { owner, ordinal, args: self.export_list(ex, args)? },
                 TyView::Future(e, o, i) => PNode::Future(e, one(ex, o, self.ty)?, one(ex, i, self.ty)?),
                 TyView::Param(i) => PNode::Param(i),
                 TyView::Alias { trait_, name, args } => PNode::Alias { trait_, name, args: self.export_list(ex, args)? },
@@ -225,6 +236,15 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             ex.insert(x_res, p, false);
         }
         ex.cached(t).ok_or(CheckError::Limit(Limit::Export))
+    }
+
+    /// Closure `e`'s ordinal: the number of closure expressions before it in `ExprId` order
+    /// (typeck.md, "A closure's identity": nested closures count in the item's sequence).
+    fn closure_ordinal(&self, e: ExprId) -> Result<u32, CheckError> {
+        let Some(before) = self.body.exprs.get(..e.ix()) else {
+            return Err(CheckError::Malformed(crate::error::Malformed::Unreached(e)));
+        };
+        Ok(before.iter().filter(|x| matches!(x, crate::body::Expr::Closure { .. })).count() as u32)
     }
 
     /// `resolve_type_vars_in_body`: the record.
@@ -290,6 +310,27 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let mut captures: Captures<'a> = Soa::with_capacity_in(self.captures.len(), alloc);
         for &(c, p, k) in self.captures.iter() {
             captures.push((c, p, k));
+        }
+        // One row per closure expression, in `ExprId` order: row `i` is ordinal `i`. The kind
+        // is the strongest of its captures' (`analyze_closures`'s rule, which settled it).
+        let mut closures: Closures<'a> = Soa::new_in(alloc);
+        for i in 0..self.body.exprs.len() {
+            let e = ExprId(i as u32);
+            if !matches!(self.body.exprs[i], crate::body::Expr::Closure { .. }) {
+                continue;
+            }
+            let mut kind = ClosureKind::Fn;
+            for &(c, k) in self.closure_kinds.iter() {
+                if c == e {
+                    kind = k;
+                }
+            }
+            let t = self.ty.resolve(self.expr_ty[i])?;
+            let sig = match self.ty.view(t) {
+                TyView::Closure(_, sig) => self.export(&mut ex, sig, At::Expr(e))?,
+                _ => ex.out.intern(PNode::Error)?,
+            };
+            closures.push((e, kind, sig));
         }
         let mut diags: Vec<Diag, Alloc<'a>> = Vec::with_capacity_in(self.diags.len(), alloc);
         let mut i = 0;
@@ -363,6 +404,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             pat_defs,
             fields,
             captures,
+            closures,
             diags,
             reads,
             needs,
@@ -422,7 +464,8 @@ fn first_unknown(r: Recs<'_, '_>, alloc: Alloc<'_>) -> Result<Option<crate::erro
             | PNode::Param(_)
             | PNode::ConstParam(_)
             | PNode::ExAuto(_) => false,
-            PNode::Ref(_, c) | PNode::Ptr(_, c) | PNode::Slice(c) | PNode::Closure(_, c) | PNode::ConstValue { ty: c, .. } => one(c),
+            PNode::Ref(_, c) | PNode::Ptr(_, c) | PNode::Slice(c) | PNode::ConstValue { ty: c, .. } => one(c),
+            PNode::Closure { args, .. } => any(args)?,
             PNode::Array(a, b) | PNode::Future(_, a, b) => one(a) || one(b),
             PNode::Pat(c, l) => one(c) || any(l)?,
             PNode::ExProj { args, term, .. } => one(term) || any(args)?,

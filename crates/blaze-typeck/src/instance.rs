@@ -73,8 +73,51 @@ impl From<Stop> for ResolveError {
     }
 }
 
+/// Where [`import`] finds a closure's facts (typeck.md, "A closure's identity").
+pub(crate) trait ClosureSource {
+    /// `Question::Closure(owner, ordinal)`'s answer imported at `args`: `TyView::ClosureOf`.
+    fn closure_of(&mut self, cx: &mut InferCtx<'_>, owner: ItemKey, ordinal: u32, args: crate::ty::TyList, depth: u32) -> Result<Ty, CheckError>;
+}
+
+/// No closure can occur (an impl header, a where-clause): one is refused as a body type.
+pub(crate) struct NoClosures;
+
+impl ClosureSource for NoClosures {
+    fn closure_of(&mut self, _: &mut InferCtx<'_>, owner: ItemKey, ordinal: u32, _: crate::ty::TyList, _: u32) -> Result<Ty, CheckError> {
+        Err(CheckError::Malformed(crate::error::Malformed::BodyTypeInRecord(Question::Closure(owner, ordinal))))
+    }
+}
+
+/// The world, through the read seam; a missing answer is kept in `need` (the caller's
+/// `ResolveError::Missing`), since `import` speaks `CheckError`.
+pub(crate) struct Asked<'r, 'w, 'a, W: World> {
+    pub reads: &'r mut Reads<'w, 'a, W>,
+    pub need: Option<Question>,
+}
+
+impl<W: World> ClosureSource for Asked<'_, '_, '_, W> {
+    fn closure_of(&mut self, cx: &mut InferCtx<'_>, owner: ItemKey, ordinal: u32, args: crate::ty::TyList, depth: u32) -> Result<Ty, CheckError> {
+        let facts = match self.reads.closure(owner, ordinal) {
+            Ok(Some(f)) => f,
+            Ok(None) => return Err(CheckError::Malformed(crate::error::Malformed::BodyTypeInRecord(Question::Closure(owner, ordinal)))),
+            Err(Stop::Error(e)) => return Err(e),
+            Err(Stop::Need(q)) => {
+                self.need = Some(q);
+                return Err(CheckError::Limit(Limit::Export));
+            }
+        };
+        let n = cx.list_len(args);
+        let mut subst: Vec<Ty, Alloc<'_>> = Vec::with_capacity_in(n as usize, Alloc::global());
+        for i in 0..n {
+            subst.push(cx.list_get(args, i));
+        }
+        let sig = import(cx, &mut NoClosures, facts.types, facts.sig, &subst, depth)?;
+        cx.mk(TyView::ClosureOf { owner, ordinal, args, sig, kind: facts.kind })
+    }
+}
+
 /// Imports portable type `t` of `types` into `cx`, `Param(i)` becoming `subst[i]`.
-fn import(cx: &mut InferCtx<'_>, types: PTys<'_>, t: PTy, subst: &[Ty], depth: u32) -> Result<Ty, CheckError> {
+fn import(cx: &mut InferCtx<'_>, src: &mut dyn ClosureSource, types: PTys<'_>, t: PTy, subst: &[Ty], depth: u32) -> Result<Ty, CheckError> {
     if depth > MAX_DEPTH {
         return Err(CheckError::Limit(Limit::Export));
     }
@@ -87,49 +130,54 @@ fn import(cx: &mut InferCtx<'_>, types: PTys<'_>, t: PTy, subst: &[Ty], depth: u
         PNode::Float(f) => TyView::Float(f),
         PNode::Str => TyView::Str,
         PNode::Never => TyView::Never,
-        PNode::Tuple(l) => TyView::Tuple(import_list(cx, types, l, subst, d)?),
-        PNode::Ref(m, p) => TyView::Ref(m, import(cx, types, p, subst, d)?),
-        PNode::Ptr(m, p) => TyView::Ptr(m, import(cx, types, p, subst, d)?),
-        PNode::Array(e, n) => TyView::Array(import(cx, types, e, subst, d)?, import(cx, types, n, subst, d)?),
-        PNode::Slice(e) => TyView::Slice(import(cx, types, e, subst, d)?),
-        PNode::Pat(b, l) => TyView::Pat(import(cx, types, b, subst, d)?, import_list(cx, types, l, subst, d)?),
-        PNode::Adt(k, l) => TyView::Adt(k, import_list(cx, types, l, subst, d)?),
-        PNode::FnDef(k, l) => TyView::FnDef(k, import_list(cx, types, l, subst, d)?),
-        PNode::FnPtr(l, h) => TyView::FnPtr(import_list(cx, types, l, subst, d)?, h),
+        PNode::Tuple(l) => TyView::Tuple(import_list(cx, src, types,l, subst, d)?),
+        PNode::Ref(m, p) => TyView::Ref(m, import(cx, src, types,p, subst, d)?),
+        PNode::Ptr(m, p) => TyView::Ptr(m, import(cx, src, types,p, subst, d)?),
+        PNode::Array(e, n) => TyView::Array(import(cx, src, types,e, subst, d)?, import(cx, src, types,n, subst, d)?),
+        PNode::Slice(e) => TyView::Slice(import(cx, src, types,e, subst, d)?),
+        PNode::Pat(b, l) => TyView::Pat(import(cx, src, types,b, subst, d)?, import_list(cx, src, types,l, subst, d)?),
+        PNode::Adt(k, l) => TyView::Adt(k, import_list(cx, src, types,l, subst, d)?),
+        PNode::FnDef(k, l) => TyView::FnDef(k, import_list(cx, src, types,l, subst, d)?),
+        PNode::FnPtr(l, h) => TyView::FnPtr(import_list(cx, src, types,l, subst, d)?, h),
         PNode::Param(i) => match subst.get(i as usize) {
             Some(&s) => return Ok(s),
             None => TyView::Param(i),
         },
         PNode::Alias { trait_, name, args } => {
-            TyView::Alias { trait_, name, args: import_list(cx, types, args, subst, d)? }
+            TyView::Alias { trait_, name, args: import_list(cx, src, types,args, subst, d)? }
         }
-        PNode::Opaque(k, l) => TyView::Opaque(k, import_list(cx, types, l, subst, d)?),
+        PNode::Opaque(k, l) => TyView::Opaque(k, import_list(cx, src, types,l, subst, d)?),
         PNode::Error => TyView::Error,
         PNode::ConstParam(i) => match subst.get(i as usize) {
             Some(&s) => return Ok(s),
             None => TyView::ConstParam(i),
         },
-        PNode::ConstValue { ty, bits } => TyView::ConstValue { ty: import(cx, types, ty, subst, d)?, bits },
+        PNode::ConstValue { ty, bits } => TyView::ConstValue { ty: import(cx, src, types,ty, subst, d)?, bits },
         // A trait object's rows keep their order: substitution changes no sort key.
-        PNode::Dynamic(l) => TyView::Dynamic(import_list(cx, types, l, subst, d)?),
-        PNode::ExTrait(k, l) => TyView::ExTrait(k, import_list(cx, types, l, subst, d)?),
+        PNode::Dynamic(l) => TyView::Dynamic(import_list(cx, src, types,l, subst, d)?),
+        PNode::ExTrait(k, l) => TyView::ExTrait(k, import_list(cx, src, types,l, subst, d)?),
         PNode::ExProj { trait_, name, args, term } => {
             let mut v: Vec<Ty, Alloc<'_>> = Vec::with_capacity_in(args.len as usize + 1, Alloc::global());
             for &a in types.list(args)? {
-                v.push(import(cx, types, a, subst, d)?);
+                v.push(import(cx, src, types,a, subst, d)?);
             }
-            v.push(import(cx, types, term, subst, d)?);
+            v.push(import(cx, src, types,term, subst, d)?);
             TyView::ExProj { trait_, name, args_term: cx.mk_list(&v)? }
         }
         PNode::ExAuto(k) => TyView::ExAuto(k),
         // Body-only nodes never reach a ground table or an item's record.
-        PNode::Closure(..) | PNode::Future(..) | PNode::Infer => return Err(CheckError::Limit(Limit::Export)),
+        PNode::Closure { owner, ordinal, args } => {
+            let args = import_list(cx, src, types, args, subst, d)?;
+            return src.closure_of(cx, owner, ordinal, args, d);
+        }
+        PNode::Future(..) | PNode::Infer => return Err(CheckError::Limit(Limit::Export)),
     };
     cx.mk(v)
 }
 
 fn import_list(
     cx: &mut InferCtx<'_>,
+    src: &mut dyn ClosureSource,
     types: PTys<'_>,
     l: List,
     subst: &[Ty],
@@ -138,7 +186,7 @@ fn import_list(
     let items = types.list(l)?;
     let mut v: Vec<Ty, Alloc<'_>> = Vec::with_capacity_in(items.len(), Alloc::global());
     for &p in items {
-        v.push(import(cx, types, p, subst, depth)?);
+        v.push(import(cx, src, types,p, subst, depth)?);
     }
     cx.mk_list(&v)
 }
@@ -230,6 +278,10 @@ pub(crate) fn export(cx: &mut InferCtx<'_>, t: Ty, ground: &mut PortableTys<'_>,
             PNode::ExProj { trait_, name, args: ground.intern_list(args)?, term }
         }
         TyView::ExAuto(k) => PNode::ExAuto(k),
+        TyView::ClosureOf { owner, ordinal, args, .. } => match export_list(cx, args, ground, d)? {
+            Some(args) => PNode::Closure { owner, ordinal, args },
+            None => return Ok(None),
+        },
         TyView::Closure(..)
         | TyView::Future(..)
         | TyView::Param(_)
@@ -287,7 +339,7 @@ pub(crate) fn shape_of(v: TyView, cx: &InferCtx<'_>) -> Option<Shape> {
         TyView::Adt(k, _) => Shape::Adt(k),
         TyView::FnDef(k, _) => Shape::FnDef(k),
         TyView::FnPtr(l, _) => Shape::FnPtr(cx.list_len(l).saturating_sub(1)),
-        TyView::Closure(..) | TyView::Future(..) => Shape::Closure,
+        TyView::Closure(..) | TyView::ClosureOf { .. } | TyView::Future(..) => Shape::Closure,
         TyView::Opaque(k, _) => Shape::Opaque(k),
         TyView::Dynamic(l) => Shape::Dynamic(principal(cx, l)),
         TyView::Param(_) | TyView::Alias { .. } | TyView::Infer(_) | TyView::Error => return None,
@@ -312,12 +364,12 @@ pub(crate) fn unify_header(
     for _ in 0..h.generics {
         fresh.push(cx.fresh(crate::ty::VarKind::Ty)?);
     }
-    let self_ty = import(cx, h.types, h.self_ty, &fresh, 0)?;
+    let self_ty = import(cx, &mut NoClosures, h.types,h.self_ty, &fresh, 0)?;
     if !cx.unify(self_ty, cx.list_get(args, 0))? {
         return Ok(None);
     }
     for (i, &p) in rest.iter().enumerate() {
-        let t = import(cx, h.types, p, &fresh, 0)?;
+        let t = import(cx, &mut NoClosures, h.types,p, &fresh, 0)?;
         if !cx.unify(t, cx.list_get(args, i as u32 + 1))? {
             return Ok(None);
         }
@@ -347,14 +399,14 @@ fn try_impl<W: World>(
         let wc = reads.predicates(imp)?;
         for c in wc.clauses {
             let goal = match *c {
-                PClause::Trait { trait_, args } => Goal::Trait { trait_, args: import_list(cx, wc.types, args, &fresh, 0)? },
+                PClause::Trait { trait_, args } => Goal::Trait { trait_, args: import_list(cx, &mut NoClosures, wc.types,args, &fresh, 0)? },
                 PClause::Projection { trait_, args, name, term } => Goal::Projection {
                     trait_,
-                    args: import_list(cx, wc.types, args, &fresh, 0)?,
+                    args: import_list(cx, &mut NoClosures, wc.types,args, &fresh, 0)?,
                     name,
-                    term: import(cx, wc.types, term, &fresh, 0)?,
+                    term: import(cx, &mut NoClosures, wc.types,term, &fresh, 0)?,
                 },
-                PClause::Const { cond, args } => Goal::ConstHolds { cond, args: import_list(cx, wc.types, args, &fresh, 0)? },
+                PClause::Const { cond, args } => Goal::ConstHolds { cond, args: import_list(cx, &mut NoClosures, wc.types,args, &fresh, 0)? },
             };
             cx.register(Obligation { goal, cause: Cause::Body })?;
         }
@@ -395,7 +447,17 @@ fn select_in<W: World>(
     }
     let mut tys: Vec<Ty, Alloc<'_>> = Vec::with_capacity_in(args.len(), Alloc::global());
     for &p in args {
-        tys.push(import(cx, ground.view(), p, &[], 0)?);
+        // A closure among the arguments is imported through `Question::Closure`.
+        let mut src = Asked { reads: &mut *reads, need: None };
+        match import(cx, &mut src, ground.view(), p, &[], 0) {
+            Ok(t) => tys.push(t),
+            Err(e) => {
+                return Err(match src.need {
+                    Some(q) => ResolveError::Missing(q),
+                    None => ResolveError::Check(e),
+                });
+            }
+        }
     }
     let goal_args = cx.mk_list(&tys)?;
     let self_ty = cx.list_get(goal_args, 0);

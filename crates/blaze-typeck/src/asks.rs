@@ -131,6 +131,60 @@ pub struct Tally {
     pub convert_ns: u64,
     /// Time inside the checks, all of the above included.
     pub check_ns: u64,
+    /// Fills of a round's needs that could not be made and were dropped as speculative (the
+    /// caller's count: front2 check.rs `make_round`).
+    pub dropped: u64,
+    /// The solver's work, by its counters (blaze-solve `Stats`, added by the caller from the
+    /// context after each check) and the time inside its calls (`Solve`).
+    pub solve: Solve,
+    /// The holes the second and later runs of a body met, by question kind (`QUESTION_KINDS`):
+    /// what makes a body take three rounds or more (a record that names a record). The
+    /// caller's count, from each round's `Needs::missing`.
+    pub late_holes: [u64; QUESTION_KINDS.len()],
+}
+
+/// What the trait solver did in the checks counted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Solve {
+    /// Calls into the solver (one goal evaluated, one selection over the pending goals, one
+    /// environment built), and the time inside them, fact fills excluded.
+    pub calls: u64,
+    pub ns: u64,
+    /// Solver calls repeated after a fact was filled (`InferCtx::need_rounds`).
+    pub refills: u64,
+    /// Goal frames the solver entered, cache hits, ground fast-path answers, impl candidates
+    /// assembled, and cycle reruns (blaze-solve `Stats`).
+    pub frames: u64,
+    pub cache_hits: u64,
+    pub fast_path: u64,
+    pub candidates: u64,
+    pub reruns: u64,
+}
+
+impl Solve {
+    fn add(&mut self, o: &Solve) {
+        self.calls += o.calls;
+        self.ns += o.ns;
+        self.refills += o.refills;
+        self.frames += o.frames;
+        self.cache_hits += o.cache_hits;
+        self.fast_path += o.fast_path;
+        self.candidates += o.candidates;
+        self.reruns += o.reruns;
+    }
+
+    fn since(&self, e: &Solve) -> Solve {
+        Solve {
+            calls: self.calls - e.calls,
+            ns: self.ns - e.ns,
+            refills: self.refills - e.refills,
+            frames: self.frames - e.frames,
+            cache_hits: self.cache_hits - e.cache_hits,
+            fast_path: self.fast_path - e.fast_path,
+            candidates: self.candidates - e.candidates,
+            reruns: self.reruns - e.reruns,
+        }
+    }
 }
 
 impl Tally {
@@ -149,6 +203,11 @@ impl Tally {
         self.hash_ns += o.hash_ns;
         self.convert_ns += o.convert_ns;
         self.check_ns += o.check_ns;
+        self.dropped += o.dropped;
+        self.solve.add(&o.solve);
+        for (a, b) in self.late_holes.iter_mut().zip(o.late_holes.iter()) {
+            *a += *b;
+        }
     }
 
     /// `self - earlier`: what happened between two readings of one tally.
@@ -169,6 +228,9 @@ impl Tally {
             hash_ns: self.hash_ns - earlier.hash_ns,
             convert_ns: self.convert_ns - earlier.convert_ns,
             check_ns: self.check_ns - earlier.check_ns,
+            dropped: self.dropped - earlier.dropped,
+            solve: self.solve.since(&earlier.solve),
+            late_holes: core::array::from_fn(|i| self.late_holes[i] - earlier.late_holes[i]),
         }
     }
 }
@@ -224,7 +286,8 @@ pub const R_THRESHOLD: f64 = 0.10;
 /// Simulates a cold body under `order` from the log of one run that had every answer.
 ///
 /// A run asks the log's questions in order; it stops at the first one not yet fetched and
-/// costs the work up to that ask. The questions that run asked (the hints) and the one it
+/// costs the work up to that ask. A real run goes on past a missing answer (world.rs `Hole`)
+/// and fetches every hole in one round, so under `Pull` this is an upper bound on its entries. The questions that run asked (the hints) and the one it
 /// missed are fetched before the next run. Each restart repeats the work before its stop.
 pub fn restarts(log: &AskLog<'_>, order: Order, alloc: Alloc<'_>) -> Restarts {
     let mut have: Vec<Question, Alloc<'_>> = Vec::new_in(alloc);

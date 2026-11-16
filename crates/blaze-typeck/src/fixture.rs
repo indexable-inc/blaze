@@ -82,6 +82,9 @@ pub struct Fx {
     /// Return-position `impl Trait` occurrences: each one's bounds, `Self` the occurrence's
     /// `Opaque(k, generics in scope)`, as the front end answers `Predicates(k)`.
     opaques: Vec<(ItemKey, Vec<PClause>)>,
+    /// Closures of other bodies (`PNode::Closure`): owner, ordinal, kind and signature (a
+    /// `FnPtr` of `t` in the owner's parameters), as the owner's check records them.
+    pub closures: Vec<(ItemKey, u32, crate::ty::ClosureKind, PTy)>,
     fns: Vec<FnRow>,
     adts: Vec<AdtRow>,
     traits: Vec<TraitRow>,
@@ -131,7 +134,7 @@ fn shape_of(t: PTys<'_>, p: PTy) -> Option<Shape> {
         PNode::FnDef(k, _) => Shape::FnDef(k),
         PNode::FnPtr(l, _) => Shape::FnPtr(l.len.saturating_sub(1)),
         PNode::Opaque(k, _) => Shape::Opaque(k),
-        PNode::Closure(..) | PNode::Future(..) => Shape::Closure,
+        PNode::Closure { .. } | PNode::Future(..) => Shape::Closure,
         PNode::Param(_) | PNode::Alias { .. } | PNode::Infer | PNode::Error => return None,
         PNode::ConstValue { .. } | PNode::ConstParam(_) => return None,
         PNode::Dynamic(l) => Shape::Dynamic(match t.lists.get(l.range()).and_then(|r| r.first()) {
@@ -152,6 +155,7 @@ impl Fx {
             next: 0x5157_0000,
             names: Vec::new(),
             opaques: Vec::new(),
+            closures: Vec::new(),
             fns: Vec::new(),
             adts: Vec::new(),
             traits: Vec::new(),
@@ -864,7 +868,14 @@ impl World for Fx {
     fn opaque_hidden(&self, _: Seal, _: ItemKey) -> Fetch<Option<Hidden<'_>>> {
         Ok(None)
     }
-
+    /// The [`Fx::closures`] row: the facts another body's check recorded.
+    fn closure(&self, _: Seal, owner: ItemKey, ordinal: u32) -> Fetch<Option<crate::world::ClosureFacts<'_>>> {
+        Ok(self.closures.iter().find(|r| r.0 == owner && r.1 == ordinal).map(|r| crate::world::ClosureFacts {
+            kind: r.2,
+            sig: r.3,
+            types: self.t.view(),
+        }))
+    }
     fn attrs(&self, _: Seal, item: ItemKey) -> Fetch<TypeAttrs> {
         if let Some(&(_, a)) = self.attrs.iter().find(|(k, _)| *k == item) {
             return Ok(a);
@@ -1140,7 +1151,7 @@ impl Bb {
             self.opt_types.push(None);
         }
         let n = params.len() as u32;
-        self.e(Expr::Closure { params: List { start, len: n }, param_tys: List { start: tstart, len: n }, ret: None, body, is_async: false })
+        self.e(Expr::Closure { params: List { start, len: n }, param_tys: List { start: tstart, len: n }, ret: None, body, is_async: false, is_move: false })
     }
 
     pub fn let_(&mut self, pat: PatId, ty: Option<PTy>, init: ExprId) -> StmtId {
@@ -1203,6 +1214,15 @@ impl Bb {
     /// `async { body }`, or `async move { body }` with `Capture::Move`.
     pub fn async_block(&mut self, body: ExprId, capture: crate::body::Capture) -> ExprId {
         self.e(Expr::AsyncBlock { body, capture })
+    }
+
+    /// `move |params| body`, parameters unannotated.
+    pub fn move_closure(&mut self, params: &[PatId], body: ExprId) -> ExprId {
+        let c = self.closure(params, body);
+        if let Some(Expr::Closure { is_move, .. }) = self.exprs.get_mut(c.0 as usize) {
+            *is_move = true;
+        }
+        c
     }
 
     /// `async |params| body`, parameters unannotated.
@@ -1291,7 +1311,7 @@ pub fn show(fx: &Fx, t: PTys<'_>, p: PTy) -> String {
             };
             format!("{unsafe_}{abi}fn({}){out}", ins.join(", "))
         }
-        PNode::Closure(e, sig) => format!("closure#{}{}", e.0, show(fx, t, sig)),
+        PNode::Closure { owner, ordinal, args } => format!("closure#{ordinal} of {}<{}>", fx.name_of(owner), list(args)),
         PNode::Future(e, o, i) => format!("future#{}<{}; {}>", e.0, show(fx, t, o), show(fx, t, i)),
         PNode::Param(i) => format!("P{i}"),
         PNode::Alias { trait_, name, args } => format!("<{} as {}>::{:x}", list(args), fx.name_of(trait_), name.0),

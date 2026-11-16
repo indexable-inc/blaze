@@ -21,9 +21,11 @@ pub mod heads;
 pub mod index;
 pub mod keys;
 pub mod langs;
+pub mod locals;
 pub mod pattern_ty;
 pub mod preds;
 pub mod program;
+pub mod project;
 pub mod reach;
 pub mod spell;
 pub mod texts;
@@ -75,13 +77,17 @@ pub struct Front2<'n> {
     pub texts: texts::Texts<'n>,
     pub keys: keys::Keys,
     pub index: index::Index<'n>,
+    /// The command's frame: what a body's lowering keeps for the command (its local items'
+    /// rows and an expansion's text, [`locals`]); a [`heads::Store`] is made over it.
+    pub frame: &'n blaze_mem::Frame,
 }
 
 impl<'n> Front2<'n> {
     /// The front end over `names`, the program's crate at index 0 and its files `user` as the
     /// caller gave them. Every item, variant and impl the library keys is filed in the key map
-    /// here, so a clash stops the program before any item is lowered.
-    pub fn new(names: &'n Names<'n>, user: &[SourceFile<'_>]) -> Result<Front2<'n>, FrontError> {
+    /// here, so a clash stops the program before any item is lowered. `frame` is the caller's,
+    /// alive for the command.
+    pub fn new(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>]) -> Result<Front2<'n>, FrontError> {
         let texts = texts::Texts::new(names, user).map_err(FrontError::Texts)?;
         let index = index::Index::new(names).map_err(FrontError::Lang)?;
         let mut keys = keys::Keys::new();
@@ -101,6 +107,6 @@ impl<'n> Front2<'n> {
         for i in index.impls.iter() {
             keys.item(i.key).map_err(FrontError::Key)?;
         }
-        Ok(Front2 { names, resolver: Resolver { names }, texts, keys, index })
+        Ok(Front2 { names, resolver: Resolver { names }, texts, keys, index, frame })
     }
 }

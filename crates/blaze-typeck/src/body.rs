@@ -121,7 +121,8 @@ pub enum Expr {
     /// `params` in `pat_lists`; `param_tys` in `BodyView::opt_types`, one per param.
     /// `is_async`: `async |..| body`, whose call returns a future of `body` (and `ret`, when
     /// written, is that future's output).
-    Closure { params: List, param_tys: List, ret: Option<PTy>, body: ExprId, is_async: bool },
+    /// `is_move`: written `move` (every capture by value: the Reference, "Capture modes").
+    Closure { params: List, param_tys: List, ret: Option<PTy>, body: ExprId, is_async: bool, is_move: bool },
     /// `format_args!(..)`, not desugared: `core::fmt::Arguments`. `args` in `expr_lists`;
     /// `uses` in `BodyView::fmt_uses`, one per placeholder that reads an argument (an argument
     /// used twice has two).

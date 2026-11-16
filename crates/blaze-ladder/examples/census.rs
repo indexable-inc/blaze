@@ -244,7 +244,7 @@ fn tally(root: &Path) -> Tally {
                 let stages: &[Stage] = if has_body { &[Stage::Signature, Stage::Body] } else { &[Stage::Signature] };
                 for &stage in stages {
                     let lowered = match stage {
-                        Stage::Body => blaze_lower::lower_body(item_text, EDITION, &mut HostCfg, Alloc::global()),
+                        Stage::Body => blaze_lower::lower_body(item_text, EDITION, &mut HostCfg, &mut blaze_lower::NoModule, Alloc::global()),
                         _ => blaze_lower::lower_signature(item_text, EDITION, &mut HostCfg, Alloc::global()),
                     };
                     let lowered = match lowered {
@@ -432,7 +432,7 @@ fn first_refusal(shown: &str, text: &str, item: &blaze_surface::Item, outline_ok
     let item_text = item.range.of(text);
     for stage in [Stage::Signature, Stage::Body] {
         let lowered = match stage {
-            Stage::Body => blaze_lower::lower_body(item_text, EDITION, &mut HostCfg, Alloc::global()),
+            Stage::Body => blaze_lower::lower_body(item_text, EDITION, &mut HostCfg, &mut blaze_lower::NoModule, Alloc::global()),
             _ => blaze_lower::lower_signature(item_text, EDITION, &mut HostCfg, Alloc::global()),
         };
         let Ok(lowered) = lowered else {

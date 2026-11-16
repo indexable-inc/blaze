@@ -1730,8 +1730,13 @@ impl<'a> Request<'a> {
         }
     }
 
-    /// The old row of `name`, its page loaded.
+    /// The old row of `name`, its page loaded; a watch row (readers only) is no row.
     fn old(&self, name: Name) -> Option<&Row<'a>> {
+        self.old_or_watch(name).filter(|row| !row.watching())
+    }
+
+    /// The old row of `name` or its watch row ([`Row::watching`]): for its readers.
+    fn old_or_watch(&self, name: Name) -> Option<&Row<'a>> {
         let root = self.root.as_ref()?;
         match self.pages.get(&answers::page_of(name, root.bits))? {
             PageState::Loaded(page) => page.get(&name),
@@ -2417,7 +2422,8 @@ impl<'a> Request<'a> {
             }
             Some((at, view)) => {
                 let old = self.current(name);
-                let readers = old.map(|row| row.readers.clone()).unwrap_or_else(|| Vec::new_in(a.clone()));
+                // A name read absent before it existed keeps those readers (its watch row's).
+                let readers = self.new.get(&name).or_else(|| self.old_or_watch(name)).map(|row| row.readers.clone()).unwrap_or_else(|| Vec::new_in(a.clone()));
                 let old_parts = old.map(|row| row.parts.clone()).unwrap_or_else(|| Vec::new_in(a.clone()));
                 let mut reads = Vec::with_capacity_in(view.reads().len(), a.clone());
                 reads.extend(view.reads());
@@ -2556,7 +2562,7 @@ impl<'a> Request<'a> {
             return Ok(());
         }
         let mut readers = Vec::new_in(self.alloc);
-        if let Some(row) = self.old(name) {
+        if let Some(row) = self.old_or_watch(name) {
             readers.extend_from_slice(&row.readers);
         }
         if let Some(posted) = self.posted.get(&name) {
@@ -2728,6 +2734,22 @@ impl<'a> Request<'a> {
         if loading {
             return Ok(());
         }
+        // A dropped name's readers read it absent now: a watch row keeps them, so the name's
+        // coming back reruns them (rule 21: a read that found nothing is a read).
+        if self.plant != Plant::ForgetAbsentReaders {
+            let gone: Vec<Name, Alloc<'a>> = self.dropped.iter().copied().collect_in(a.clone());
+            for name in gone.iter() {
+                if self.new.get(name).is_some_and(|row| row.watching()) {
+                    continue;
+                }
+                let Some(was) = self.new.get(name).or_else(|| self.old_or_watch(*name)) else { continue };
+                if was.readers.is_empty() {
+                    continue;
+                }
+                let readers = was.readers.clone();
+                self.new.insert(*name, watch_row(*name, readers, a.clone()));
+            }
+        }
         // Apply the reverse index's updates: sorted by target once, then each target's readers
         // rebuilt in one merge, so a name read by r readers costs O(r + its updates), never an
         // insert per update.
@@ -2738,12 +2760,21 @@ impl<'a> Request<'a> {
             let end = at + updates[at..].iter().take_while(|(t, _, _)| *t == target).count();
             let group = &updates[at..end];
             at = end;
-            if self.dropped.contains(&target) {
-                continue;
-            }
-            if !self.new.contains_key(&target) {
-                let Some(old) = self.old(target).cloned() else { continue };
-                self.new.insert(target, old);
+            // A target with no record (never made, or dropped this run) keeps its readers in a
+            // watch row: a read that found nothing is a read, so the name's appearing reruns
+            // them (rule 21). The planted bug forgets them.
+            let dropped = self.dropped.contains(&target);
+            if self.new.get(&target).is_none_or(|row| dropped && !row.watching()) {
+                let held = match dropped {
+                    false => self.old_or_watch(target).cloned(),
+                    true => None,
+                };
+                let row = match held {
+                    Some(row) => row,
+                    None if self.plant == Plant::ForgetAbsentReaders => continue,
+                    None => watch_row(target, Vec::new_in(a.clone()), a.clone()),
+                };
+                self.new.insert(target, row);
             }
             let row = self.new.get_mut(&target).expect("inserted above");
             let mut readers = Vec::with_capacity_in(row.readers.len() + group.len(), a.clone());
@@ -2778,6 +2809,11 @@ impl<'a> Request<'a> {
                 }
             }
             row.readers = readers;
+            // A watch row no one reads any more goes.
+            if row.watching() && row.readers.is_empty() {
+                self.new.remove(&target);
+                self.dropped.insert(target);
+            }
         }
         // The touched pages, rewritten whole, and the root.
         let mut touched = Vec::new_in(a.clone());
@@ -2825,7 +2861,7 @@ impl<'a> Request<'a> {
             }
         }
         for (name, row) in self.new.iter() {
-            if !self.dropped.contains(name) {
+            if !self.dropped.contains(name) || row.watching() {
                 bucket(&mut buckets, *name, row);
             }
         }

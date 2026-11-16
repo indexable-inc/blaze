@@ -38,8 +38,14 @@ pub(crate) enum Cond {
     Hs = 2,
     /// Unsigned `<` (`cc`).
     Lo = 3,
-    /// Signed overflow.
+    /// Negative (after `fcmp`: ordered less).
+    Mi = 4,
+    /// Not negative (after `fcmp`: greater, equal or unordered).
+    Pl = 5,
+    /// Signed overflow (after `fcmp`: unordered).
     Vs = 6,
+    /// No overflow (after `fcmp`: ordered).
+    Vc = 7,
     /// Unsigned `>`.
     Hi = 8,
     /// Unsigned `<=`.
@@ -430,6 +436,79 @@ pub(crate) const fn fmov_to_d(rd: Reg, rn: Reg) -> u32 {
 /// `fmov xd, dn`.
 pub(crate) const fn fmov_from_d(rd: Reg, rn: Reg) -> u32 {
     0x9e66_0000 | (rn << 5) | rd
+}
+
+// Scalar floating point (C7.2; `ftype` 00 single, 01 double at bits 22..24) and the 128-bit
+// integer carries (C6.2): pass/float.rs and pass/wide.rs.
+
+const fn ftype(double: bool) -> u32 {
+    (double as u32) << 22
+}
+
+/// `fmov sd, wn`.
+pub(crate) const fn fmov_to_s(rd: Reg, rn: Reg) -> u32 {
+    0x1e27_0000 | (rn << 5) | rd
+}
+
+/// `fmov wd, sn`.
+pub(crate) const fn fmov_from_s(rd: Reg, rn: Reg) -> u32 {
+    0x1e26_0000 | (rn << 5) | rd
+}
+
+/// `fadd`, `fsub`, `fmul`, `fdiv` (`opcode` 0010, 0011, 0000, 0001 at bits 12..16).
+pub(crate) const fn fbin(opcode: u32, double: bool, rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x1e20_0800 | ftype(double) | (rm << 16) | (opcode << 12) | (rn << 5) | rd
+}
+
+/// `fneg`.
+pub(crate) const fn fneg(double: bool, rd: Reg, rn: Reg) -> u32 {
+    0x1e21_4000 | ftype(double) | (rn << 5) | rd
+}
+
+/// `fcmp n, m`: NZCV is 0110 equal, 1000 less, 0010 greater, 0011 unordered.
+pub(crate) const fn fcmp(double: bool, rn: Reg, rm: Reg) -> u32 {
+    0x1e20_2000 | ftype(double) | (rm << 16) | (rn << 5)
+}
+
+/// `fcvt dd, sn` (`to_double`) or `fcvt sd, dn`.
+pub(crate) const fn fcvt(to_double: bool, rd: Reg, rn: Reg) -> u32 {
+    match to_double {
+        true => 0x1e22_c000 | (rn << 5) | rd,
+        false => 0x1e62_4000 | (rn << 5) | rd,
+    }
+}
+
+/// `fcvtzs` / `fcvtzu` (`signed`) to `x` (`wide`) or `w`: round toward zero, saturating, NaN
+/// to 0 (C7.2, "FCVTZS (scalar, integer)": "out of range ... saturates").
+pub(crate) const fn fcvtz(signed: bool, wide: bool, double: bool, rd: Reg, rn: Reg) -> u32 {
+    let op = if signed { 0x1e38_0000 } else { 0x1e39_0000 };
+    op | ((wide as u32) << 31) | ftype(double) | (rn << 5) | rd
+}
+
+/// `scvtf` / `ucvtf` from `x` (`wide`) or `w`, rounding by FPCR (round to nearest, ties to even).
+pub(crate) const fn cvtf(signed: bool, wide: bool, double: bool, rd: Reg, rn: Reg) -> u32 {
+    let op = if signed { 0x1e22_0000 } else { 0x1e23_0000 };
+    op | ((wide as u32) << 31) | ftype(double) | (rn << 5) | rd
+}
+
+/// `adc xd, xn, xm`.
+pub(crate) const fn adc(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x9a00_0000 | (rm << 16) | (rn << 5) | rd
+}
+
+/// `sbc xd, xn, xm`.
+pub(crate) const fn sbc(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0xda00_0000 | (rm << 16) | (rn << 5) | rd
+}
+
+/// `sbcs xd, xn, xm`.
+pub(crate) const fn sbcs(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0xfa00_0000 | (rm << 16) | (rn << 5) | rd
+}
+
+/// `madd xd, xn, xm, xa`: `xa + xn * xm`.
+pub(crate) const fn madd(rd: Reg, rn: Reg, rm: Reg, ra: Reg) -> u32 {
+    0x9b00_0000 | (rm << 16) | (ra << 10) | (rn << 5) | rd
 }
 
 /// `cnt vd.8b, vn.8b`.

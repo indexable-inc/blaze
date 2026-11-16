@@ -36,6 +36,8 @@ pub const MOST_ROUNDS: u32 = 256;
 
 /// Where a body is written: what its paths are resolved against.
 pub struct BodyScope<'s> {
+    /// The body's checker key (its blocks' local items are its).
+    pub owner: ItemKey,
     pub module: LibKey,
     pub params: &'s [(Name, u32)],
     pub self_: &'s SelfTy,
@@ -141,7 +143,7 @@ pub fn check_body_counted(
     let owner = body.typeck.owner;
     let mut hints = Needs::new_in(Alloc::global());
     let mut all_gaps: Vec<Gap, Global> = Vec::new_in(Global);
-    for _ in 0..MOST_ROUNDS {
+    for round in 0..MOST_ROUNDS {
         let view: BodyView<'_> = body.typeck.view(body.tys.view());
         let world = world_at(r, scope);
         let mut cx = InferCtx::new_in(Alloc::global());
@@ -150,6 +152,9 @@ pub fn check_body_counted(
             None => tc::check(&view, &world, &mut cx, &hints, Alloc::global()),
         }
         .map_err(|error| CheckFail::Check { owner, error })?;
+        if let Some((tally, _)) = &mut count {
+            cx.add_solver_counts(&mut tally.solve);
+        }
         let mut fills = world.fills.into_inner();
         if r.order == BuildOrder::Reversed {
             fills.reverse();
@@ -189,12 +194,50 @@ pub fn check_body_counted(
             questions.extend_from_slice(&needs.questions);
             return Err(CheckFail::NothingToFill { owner, questions });
         }
-        make_all(r, fills, owner)?;
+        let dropped = make_round(r, fills, owner)?;
+        if let Some((tally, _)) = &mut count {
+            tally.dropped += dropped;
+            if round > 0 {
+                for &q in needs.missing.iter() {
+                    tally.late_holes[tc::question_kind(q)] += 1;
+                }
+            }
+        }
         hints = needs;
     }
     let mut last = Vec::new_in(Global);
     last.extend_from_slice(&hints.questions);
     Err(CheckFail::Rounds { owner, last })
+}
+
+/// Makes every fill a round of the check noted; the number dropped.
+///
+/// The run went on past its holes (blaze-typeck world.rs `Hole`), so a fill noted after the
+/// first hole is SPECULATIVE: the real run might never ask it. A fill that cannot be made
+/// (no such item, a refused head) is therefore DROPPED WITHOUT ERROR while another fill of
+/// the round was made: the next run asks it for real if it matters, and meets the real
+/// refusal then. A round that made nothing new is the real refusal: the least one by its
+/// `Debug` text, as `make_all` names it, so the error does not depend on the order.
+fn make_round(r: &mut Records<'_, '_>, fills: Vec<Fill, Global>, owner: ItemKey) -> Result<u64, CheckFail> {
+    let mut made = 0u64;
+    let mut refused: Option<(String, MakeFail)> = None;
+    let mut dropped = 0u64;
+    for fill in fills {
+        match make(r, fill) {
+            Ok(()) => made += 1,
+            Err(e) => {
+                dropped += 1;
+                let shown = format!("{fill:?}");
+                if refused.as_ref().is_none_or(|(at, _)| shown < *at) {
+                    refused = Some((shown, e));
+                }
+            }
+        }
+    }
+    match refused {
+        Some((_, e)) if made == 0 => Err(e.at(owner)),
+        _ => Ok(dropped),
+    }
 }
 
 /// An item's name for a finding: its written name, else its key.
@@ -312,6 +355,7 @@ pub(super) fn world_at<'w, 'n>(r: &'w Records<'_, 'n>, scope: &'w BodyScope<'w>)
         index: r.index,
         store: &*r.store,
         buckets: r.buckets.as_ref(),
+        owner: scope.owner,
         module: scope.module,
         params: scope.params,
         self_: scope.self_,
@@ -405,7 +449,8 @@ fn holds_param(v: tc::PTys<'_>, args: tc::List) -> Result<bool, tc::CheckError> 
             | tc::PNode::Infer
             | tc::PNode::Error
             | tc::PNode::ExAuto(_) => None,
-            tc::PNode::Ref(_, a) | tc::PNode::Ptr(_, a) | tc::PNode::Slice(a) | tc::PNode::Closure(_, a) | tc::PNode::ConstValue { ty: a, .. } => {
+            tc::PNode::Closure { args: l, .. } => Some(l),
+            tc::PNode::Ref(_, a) | tc::PNode::Ptr(_, a) | tc::PNode::Slice(a) | tc::PNode::ConstValue { ty: a, .. } => {
                 work.push(a);
                 None
             }

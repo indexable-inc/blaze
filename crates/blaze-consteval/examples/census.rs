@@ -253,7 +253,7 @@ fn main() {
     for (fi, text) in texts.iter().enumerate() {
         let mut keep = Keep::default();
         let mut by_name = ByName::new(rules, def_at(), NoHost, Alloc::global());
-        lower_file(text, Edition::E2024, &mut Host, &mut by_name, &mut keep, Alloc::global());
+        lower_file(text, Edition::E2024, &mut Host, &mut blaze_lower::NoModule, &mut by_name, &mut keep, Alloc::global());
         let recs = keep.recs;
         let place = |r: &Rec| {
             let tree = dirs.iter().find(|d| files[fi].starts_with(d)).unwrap_or(&files[fi]);

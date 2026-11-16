@@ -55,11 +55,16 @@ pub fn file_of<'f>(req: &Request<'_>, found: &crate::sweep::Found<'_>, finding: 
 
 /// A finding drawn as its frame (or, off a terminal, its one line): its rule's words from
 /// blaze-report's table, its arguments the message's pieces between 0x1F bytes.
-/// `path` is the file it is drawn in ([`file_of`]).
+/// `path` is the file it is drawn in ([`file_of`]), `place` its item's start there and
+/// `message` its words' pieces (the finding's own, but for a finding that carries its place in
+/// its message: names.rs `placed`).
+#[expect(clippy::too_many_arguments, reason = "a finding's drawing: its place found by the caller, each argument one part of it")]
 pub fn framed(
     cx: &Cx,
     root: &Dir<ReadWrite>,
     path: Option<&str>,
+    place: u32,
+    message: &[u8],
     finding: &Print<'_>,
     shown: &mut Shown<'_>,
     frame: &Frame,
@@ -69,7 +74,7 @@ pub fn framed(
         OVER_CAP_RULE | blaze_drive::request::MODULE_FILE_MISSING_RULE | blaze_drive::request::PATH_FILE_MISSING_RULE => Area::Drive,
         _ => Area::Cli,
     };
-    let message = core::str::from_utf8(&finding.message).map_err(|_| CliError::Text { what: "a finding's message is not UTF-8" })?;
+    let message = core::str::from_utf8(message).map_err(|_| CliError::Text { what: "a finding's message is not UTF-8" })?;
     let Some(path) = path else {
         // A text-less crate's finding: no source to draw, its name is its place.
         shown.counts.add(Severity::Error, false);
@@ -79,9 +84,9 @@ pub fn framed(
     let mut text = Bytes::new_in(frame, "a file to draw a finding in");
     root.read_all(cx, &Path::new(path)?, &mut text)?;
     shown.file(path);
-    let start = finding.place.saturating_add(finding.start);
-    let end = finding.place.saturating_add(finding.end).max(start);
-    draw(cx, shown, Severity::Error, area, finding.rule, message, path, text.as_slice(), Some(finding.place), (start, end), None, frame, out)
+    let start = place.saturating_add(finding.start);
+    let end = place.saturating_add(finding.end).max(start);
+    draw(cx, shown, Severity::Error, area, finding.rule, message, path, text.as_slice(), Some(place), (start, end), None, frame, out)
 }
 
 /// A refusal of `blaze run`'s lowering drawn as its frame: `texts` the (path, text) of each
@@ -245,6 +250,7 @@ mod tests {
             (Area::Cli, crate::units::UNREAD),
             (Area::Cli, crate::units::TOOLCHAIN_NAMED),
             (Area::Cli, crate::work::MODULE_AT_BOTH),
+            (Area::Cli, crate::names::UNRESOLVED),
             (Area::Drive, OVER_CAP_RULE),
             (Area::Drive, blaze_drive::request::MODULE_FILE_MISSING_RULE),
             (Area::Drive, blaze_drive::request::PATH_FILE_MISSING_RULE),
