@@ -163,6 +163,13 @@ impl Domain {
     fn key(&self) -> &ContextKey {
         self.key.get_or_init(|| b3::context_key(self.name))
     }
+
+    /// The domain's BLAKE3 context key, derived on first use: what a batch of inputs is
+    /// hashed under side by side (`blaze_blake3::derive_key_many`), each one's digest the
+    /// [`ContentId::of_domain`] of it.
+    pub fn context_key(&self) -> &[u8; 32] {
+        self.key()
+    }
 }
 
 /// How many domain names [`Hasher::new`] keeps the context keys of: about 500 literals name a

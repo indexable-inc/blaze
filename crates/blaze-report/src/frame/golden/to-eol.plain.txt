@@ -1,0 +1,7 @@
+warning  a `;` is missing after this statement
+  ╭─ src/main.rs:2:18
+1 │ fn main() {
+2 │     let answer = compute(1, 2) // and the rest of this line
+  │                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  │                  ╰─ add `;` here
+  ╰─ blaze explain syntax:semicolon

@@ -55,6 +55,7 @@ impl Cache {
 
     /// Every entry of `shard`, when its head and every block of it are held (each checked once,
     /// when it was kept): a merge that needs the shard again takes them without a fetch.
+    #[cfg(feature = "sign")]
     pub(crate) fn whole(&self, shard: &ShardRef) -> Option<Vec<Entry>> {
         let head = self.heads.get(&shard.digest)?;
         let mut out = Vec::with_capacity(shard.count as usize);

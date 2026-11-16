@@ -19,6 +19,8 @@ doctest = false
 blaze-fetch.workspace = true
 # The advisories' version ranges and the lock's exact versions.
 blaze-semver.workspace = true
+# `Cargo.lock`, read by the one lock reader (rule 30; the audit's own reader is gone).
+blaze-manifest = { workspace = true, default-features = false }
 # The advisories' front matter, blaze.lock's tables and the workspace's settings.
 blaze-toml.workspace = true
 # `--json`, and the sparse index's lines the yanked check reads.
@@ -28,6 +30,8 @@ blaze-own.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true
+# `Alloc::global()`: the tests' locks are read in the global allocator.
+blaze-own = { workspace = true, features = ["std"] }
 
 [lints]
 workspace = true

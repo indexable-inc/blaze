@@ -17,7 +17,10 @@ impl Ty {
     pub const NONE: Ty = Ty(u32::MAX);
 }
 
-/// A list of terms: a range of the arena's list pool (or of a portable answer's `lists`).
+/// A list of terms. In a portable answer, `start..start + len` is a range of its `lists`. In
+/// an arena, `start` is a handle the `Tys` made and only `len` has a meaning to the solver:
+/// elements are read with `Tys::list_get`, never by arithmetic on `start` (blaze-ty's lists
+/// are interned ids; the tests' arena happens to use ranges).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct List {
     pub start: u32,
@@ -59,6 +62,55 @@ pub enum FloatTy {
     F32,
     F64,
     F128,
+}
+
+/// The type of a const generic value: the Reference ("Const generics") allows only integer
+/// types, `char` and `bool`. Two values are one term only when type and bits are both equal
+/// (`4u8` and `4usize` are different arguments), as rustc's `ty::Value` carries its type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ValTy {
+    Bool,
+    Char,
+    Int(IntTy),
+    Uint(UintTy),
+    /// A fieldless enum without generics, by its definition (`adt_const_params`: the pinned
+    /// library's `const ORD: AtomicOrdering`, `AtomicOrdering` deriving `ConstParamTy`): the
+    /// value's bits are its variant's index, as `Def::Ctor` counts.
+    Enum(Def),
+}
+
+impl ValTy {
+    /// `usize`, the type of an array length and of a closure's kind term.
+    pub const USIZE: ValTy = ValTy::Uint(UintTy::Usize);
+
+    /// One word for canonical forms: 0 `bool`, 1 `char`, 2..=7 the signed integers, 8..=13
+    /// the unsigned ones, in declaration order.
+    pub const fn code(self) -> u32 {
+        match self {
+            ValTy::Bool => 0,
+            ValTy::Char => 1,
+            ValTy::Int(i) => 2 + i as u32,
+            ValTy::Uint(u) => 8 + u as u32,
+            ValTy::Enum(_) => ValTy::ENUM_CODE,
+        }
+    }
+
+    /// [`ValTy::code`] of an enum: its definition follows in four more words
+    /// ([`Def`]'s bits, low first), which `from_code` does not read.
+    pub const ENUM_CODE: u32 = 14;
+
+    /// The type of `code`, `None` past the last.
+    pub const fn from_code(code: u32) -> Option<ValTy> {
+        const INTS: [IntTy; 6] = [IntTy::I8, IntTy::I16, IntTy::I32, IntTy::I64, IntTy::I128, IntTy::Isize];
+        const UINTS: [UintTy; 6] = [UintTy::U8, UintTy::U16, UintTy::U32, UintTy::U64, UintTy::U128, UintTy::Usize];
+        match code {
+            0 => Some(ValTy::Bool),
+            1 => Some(ValTy::Char),
+            2..=7 => Some(ValTy::Int(INTS[(code - 2) as usize])),
+            8..=13 => Some(ValTy::Uint(UINTS[(code - 8) as usize])),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -118,6 +170,76 @@ pub const CLOSURE_FN: u64 = 0;
 pub const CLOSURE_FN_MUT: u64 = 1;
 pub const CLOSURE_FN_ONCE: u64 = 2;
 
+/// A fn pointer's calling convention. Each is its own type: `extern "C" fn()` and
+/// `extern "C-unwind" fn()` relate to nothing but themselves (the reference, "Function pointer
+/// types"; rustc's `ExternAbi`, cut to the ABIs a fn pointer on the hosts in scope is written
+/// with).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Abi {
+    Rust,
+    C,
+    CUnwind,
+    System,
+    SystemUnwind,
+    /// `extern "rust-call"` (unstable `unboxed_closures`): the ABI of `FnOnce::call_once`,
+    /// `FnMut::call_mut` and `Fn::call` in the pinned library (library/core/src/ops/function.rs).
+    /// At the type level a fn of it takes its last parameter, a tuple, as one value; only the
+    /// call's ABI spreads that tuple. Not `Fn*`-compatible (`ExternAbi::is_fn_trait_compatible`).
+    RustCall,
+}
+
+/// Whether calling through a fn pointer needs `unsafe`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Safety {
+    Safe,
+    Unsafe,
+}
+
+/// A fn pointer's header: its ABI and safety. Part of the type: two fn pointers relate only
+/// when their headers are equal; a safe one coerces to the unsafe one of the same ABI
+/// (`UnsafeFnPointer`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct FnPtrHeader {
+    pub abi: Abi,
+    pub safety: Safety,
+}
+
+impl FnPtrHeader {
+    /// `fn(..)`: the safe Rust ABI.
+    pub const RUST: FnPtrHeader = FnPtrHeader { abi: Abi::Rust, safety: Safety::Safe };
+
+    /// One byte: the ABI in the low bits, `unsafe` in bit 7 (a key's and a canonical form's).
+    pub const fn bits(self) -> u8 {
+        let abi = match self.abi {
+            Abi::Rust => 0,
+            Abi::C => 1,
+            Abi::CUnwind => 2,
+            Abi::System => 3,
+            Abi::SystemUnwind => 4,
+            Abi::RustCall => 5,
+        };
+        match self.safety {
+            Safety::Safe => abi,
+            Safety::Unsafe => abi | 0x80,
+        }
+    }
+
+    /// The inverse of [`FnPtrHeader::bits`]; `None` for a byte it never writes.
+    pub const fn from_bits(b: u8) -> Option<FnPtrHeader> {
+        let abi = match b & 0x7f {
+            0 => Abi::Rust,
+            1 => Abi::C,
+            2 => Abi::CUnwind,
+            3 => Abi::System,
+            4 => Abi::SystemUnwind,
+            5 => Abi::RustCall,
+            _ => return None,
+        };
+        let safety = if b & 0x80 != 0 { Safety::Unsafe } else { Safety::Safe };
+        Some(FnPtrHeader { abi, safety })
+    }
+}
+
 /// One level of a term. Children are handles; a closure's args end with its kind (a const),
 /// its signature (a `FnPtr`) and its upvars (a `Tuple`), after the parent's generics.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -136,12 +258,22 @@ pub enum TyKind {
     /// Element, length (a const).
     Array(Ty, Ty),
     Slice(Ty),
+    /// A pattern type `base is PAT` (core's `pattern_type!`; typeck.md "Pattern types"): the
+    /// base, then its valid values as `ConstValue` terms in pairs, `start ..= end` each, sorted,
+    /// merged, `start > end` meaning a range that wraps. Equal by structure; no relation to the
+    /// base but a transmute.
+    Pat(Ty, List),
     Adt(Def, List),
     Foreign(Def),
     FnDef(Def, List),
-    /// Inputs, then the output last.
-    FnPtr(List),
+    /// Inputs, then the output last; the header.
+    FnPtr(List, FnPtrHeader),
     Closure(Def, List),
+    /// An async block's future (the Reference, "Async blocks"): `[output, interior]`, where
+    /// `interior` is the tuple of what the future holds (its captures, by capture kind, and
+    /// the values live across an `.await`): the constituents of its auto traits. The only
+    /// coroutine kind built: async, so immovable (never `Unpin`, `Copy` or `Clone`).
+    Coroutine(Def, List),
     /// Existential predicates (`ExTrait` principal first, then `ExProj`s, then `ExAuto`s,
     /// each sorted), then the region bound.
     Dynamic(List, Ty),
@@ -164,7 +296,8 @@ pub enum TyKind {
     ReParam(u32),
     ReErased,
     // Consts.
-    ConstValue(u64),
+    /// A value of a const generic: its type and its bits, little-endian as consteval writes them.
+    ConstValue(ValTy, u128),
     ConstParam(u32),
     // Existential predicates, the elements of `Dynamic`'s list.
     /// `dyn Trait<args>`: the args after `Self`.
@@ -301,6 +434,11 @@ pub enum Pred {
     DynCompatible(Def),
     /// `args[0]: [const] trait_<args[1..]>`.
     HostEffect { trait_: Def, args: List, constness: Constness },
+    /// `where const { COND }` (blaze's `blaze_comptime`): the condition `cond`, an anonymous
+    /// constant over its item's generics, is `true` at `args`. Decided by the world once every
+    /// argument is ground (`Facts::const_holds`); ambiguous while one is an inference variable;
+    /// never decided over a generic parameter; never proves two impls disjoint (coherence).
+    ConstHolds { cond: Def, args: List },
     /// The const `ct` has type `ty`.
     ConstArgHasType { ct: Ty, ty: Ty },
     /// Internal to a probe: unify `a` and `b` now (never canonicalized, never a query).
@@ -411,12 +549,18 @@ pub enum Lang {
     PhantomData,
     OwnedBox,
     ManuallyDrop,
+    /// The trait `Future` (`future_trait`).
+    Future,
+    /// `Future::Output` (`future_output`).
+    FutureOutput,
 }
 
 /// The shape of a self type impls are bucketed by (rustc's `SimplifiedType`, blaze-impls'
 /// `SelfShape`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Shape {
+    /// A pattern type (`TyKind::Pat`): its impls are its own, not its base's.
+    Pat,
     Bool,
     Char,
     Int(IntTy),
@@ -434,6 +578,7 @@ pub enum Shape {
     FnDef(Def),
     FnPtr(u32),
     Closure(Def),
+    Coroutine(Def),
     /// `dyn Trait`: the principal, or 0 for `dyn Send` and the like.
     Dynamic(Def),
     /// An integer variable: the impls for every integer shape.
@@ -460,11 +605,13 @@ pub fn shape_of_kind(k: TyKind) -> Option<Shape> {
         TyKind::RawPtr(_, m) => Shape::Ptr(m),
         TyKind::Array(..) => Shape::Array,
         TyKind::Slice(_) => Shape::Slice,
+        TyKind::Pat(..) => Shape::Pat,
         TyKind::Adt(d, _) => Shape::Adt(d),
         TyKind::Foreign(d) => Shape::Foreign(d),
         TyKind::FnDef(d, _) => Shape::FnDef(d),
-        TyKind::FnPtr(l) => Shape::FnPtr(l.len.saturating_sub(1)),
+        TyKind::FnPtr(l, _) => Shape::FnPtr(l.len.saturating_sub(1)),
         TyKind::Closure(d, _) => Shape::Closure(d),
+        TyKind::Coroutine(d, _) => Shape::Coroutine(d),
         TyKind::Dynamic(..) => Shape::Dynamic(Def(0)),
         TyKind::Infer(Var { kind: VarKind::Int, .. }) => Shape::AnyInt,
         TyKind::Infer(Var { kind: VarKind::Float, .. }) => Shape::AnyFloat,
@@ -478,7 +625,7 @@ pub fn shape_of_kind(k: TyKind) -> Option<Shape> {
         | TyKind::ReStatic
         | TyKind::ReParam(_)
         | TyKind::ReErased
-        | TyKind::ConstValue(_)
+        | TyKind::ConstValue(..)
         | TyKind::ConstParam(_)
         | TyKind::ExTrait(..)
         | TyKind::ExProj(..)
@@ -516,14 +663,16 @@ pub fn children(k: TyKind) -> Children {
         TyKind::Tuple(l)
         | TyKind::Adt(_, l)
         | TyKind::FnDef(_, l)
-        | TyKind::FnPtr(l)
+        | TyKind::FnPtr(l, _)
         | TyKind::Closure(_, l)
+        | TyKind::Coroutine(_, l)
         | TyKind::Alias(_, _, _, l)
         | TyKind::ExTrait(_, l) => Children::List(l),
         TyKind::Ref(r, t, _) => Children::Two(r, t),
         TyKind::Array(t, n) => Children::Two(t, n),
         TyKind::RawPtr(t, _) | TyKind::Slice(t) => Children::One(t),
         TyKind::Dynamic(l, r) => Children::ListThen(l, r),
+        TyKind::Pat(base, ranges) => Children::ListThen(ranges, base),
         TyKind::ExProj(_, l, t) => Children::ListThen(l, t),
         TyKind::Bool
         | TyKind::Char
@@ -542,7 +691,7 @@ pub fn children(k: TyKind) -> Children {
         | TyKind::ReStatic
         | TyKind::ReParam(_)
         | TyKind::ReErased
-        | TyKind::ConstValue(_)
+        | TyKind::ConstValue(..)
         | TyKind::ConstParam(_)
         | TyKind::ExAuto(_) => Children::None,
     }

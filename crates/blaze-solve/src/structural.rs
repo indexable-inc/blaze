@@ -50,7 +50,7 @@ pub enum Rule {
 pub fn assemble_auto<T: Tys, F: Facts>(
     cx: &mut Cx<'_, '_, T, F>,
     g: TraitGoal,
-    _def: TraitDef<'_>,
+    def: TraitDef<'_>,
     out: &mut Vec<Cand, Alloc<'_>>,
 ) -> Result<(), Stop> {
     if g.polarity != Polarity::Positive {
@@ -58,6 +58,11 @@ pub fn assemble_auto<T: Tys, F: Facts>(
     }
     let self_ty = cx.resolve(g.self_ty);
     let k = cx.tys.kind(self_ty);
+    // "Coroutines can only be `Unpin` if they are movable": an async block's coroutine is
+    // immovable (it may borrow its own locals across an `.await`), so never `Unpin`.
+    if matches!(k, TyKind::Coroutine(..)) && def.lang == Some(Lang::Unpin) {
+        return Ok(());
+    }
     let row = || seeded(cand(BuiltinSource::Misc, CandRule::Structural(Rule::Auto)), self_ty, Ty::NONE, g.trait_);
     // `disqualify_auto_trait_candidate_due_to_possible_impl`.
     match k {
@@ -148,7 +153,7 @@ fn step_auto<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result
         | TyKind::Bool
         | TyKind::Float(_)
         | TyKind::FnDef(..)
-        | TyKind::FnPtr(_)
+        | TyKind::FnPtr(..)
         | TyKind::Error
         | TyKind::Infer(Var { kind: VarKind::Int | VarKind::Float, .. })
         | TyKind::Never
@@ -158,7 +163,8 @@ fn step_auto<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result
             let u8_ = cx.mk(TyKind::Uint(UintTy::U8))?;
             tys.push(cx.mk(TyKind::Slice(u8_))?);
         }
-        TyKind::RawPtr(e, _) | TyKind::Ref(_, e, _) | TyKind::Array(e, _) | TyKind::Slice(e) => tys.push(e),
+        // A pattern type holds its base's bits (typeck.md "Pattern types").
+        TyKind::RawPtr(e, _) | TyKind::Ref(_, e, _) | TyKind::Array(e, _) | TyKind::Slice(e) | TyKind::Pat(e, _) => tys.push(e),
         TyKind::Tuple(l) => tys.extend_from_slice(&cx.list(l)),
         // The closure's tupled upvars.
         TyKind::Closure(_, args) => {
@@ -166,6 +172,14 @@ fn step_auto<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result
                 return Err(malformed());
             }
             tys.push(cx.arg(args, args.len - 1));
+        }
+        // An async block's future: its interior, the tuple of its captures and the values it
+        // holds across an `.await` (rustc's upvars and witness in one).
+        TyKind::Coroutine(_, args) => {
+            if args.len != 2 {
+                return Err(malformed());
+            }
+            tys.push(cx.arg(args, 1));
         }
         TyKind::Adt(d, args) => {
             if cx.adt(d)?.flags.has(AdtFlags::PHANTOM_DATA) {
@@ -208,7 +222,7 @@ fn is_wf_leaf(k: TyKind) -> bool {
             | TyKind::Param(_)
             | TyKind::Placeholder(..)
             | TyKind::Foreign(_)
-            | TyKind::ConstValue(_)
+            | TyKind::ConstValue(..)
             | TyKind::ConstParam(_)
             | TyKind::Infer(Var { kind: VarKind::Int | VarKind::Float | VarKind::Region, .. })
     ) || is_region(k)
@@ -277,7 +291,7 @@ fn step_wf<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result<S
         // where-clauses are not in `FnSigDef` (module doc); its arguments are checked.
         TyKind::FnDef(_, args) => kids.extend_from_slice(&cx.list(args)),
         // wf.rs: "ty::FnPtr(..) => {}", then its inputs and output are visited.
-        TyKind::FnPtr(l) => kids.extend_from_slice(&cx.list(l)),
+        TyKind::FnPtr(l, _) => kids.extend_from_slice(&cx.list(l)),
         // wf.rs: "ty::Closure(did, args) => { .. Only check the upvar types for WF, not the
         // rest of the types (#93611) .. }".
         TyKind::Closure(_, args) => {
@@ -285,6 +299,14 @@ fn step_wf<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result<S
                 return Err(malformed());
             }
             kids.push(cx.arg(args, args.len - 1));
+        }
+        // wf.rs: "ty::Coroutine(did, args) => { .. Only check the upvar types for WF .. }": the
+        // interior here.
+        TyKind::Coroutine(_, args) => {
+            if args.len != 2 {
+                return Err(malformed());
+            }
+            kids.push(cx.arg(args, 1));
         }
         // wf.rs: "ty::Dynamic(data, r) => { .. if let Some(principal) = data.principal_def_id()
         // { ClauseKind::DynCompatible(principal) } .. }", then the predicates' terms.

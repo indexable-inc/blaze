@@ -11,8 +11,8 @@
 //!
 //! [`Http::only`] narrows whichever it is to one [`Origin`], and never widens.
 //!
-//! **What `over` does and refuses.** It drives blaze-http's `h1` core (the request writer, the
-//! head parser and the body decoder, bytes in and bytes out) with a thin driver over a
+//! **What `over` does and refuses.** It drives blaze-h1's core (the request writer and the
+//! response parser, bytes in and bytes out) with a thin driver over a
 //! [`Conn`]: one connection a request, closed when its answer is read; no pool, no redirects
 //! and no gzip, which blaze-http's `Client` core adds. `https://` is refused
 //! ([`HttpKind::NoTls`]): the only TLS in the tree is inside blaze-http's `Client`, over a
@@ -29,7 +29,7 @@
 use alloc::{borrow::ToOwned, string::{String, ToString}, sync::Arc, vec::Vec};
 use core::fmt;
 
-use blaze_http::h1;
+use blaze_h1::HeaderFault;
 
 use crate::{
     Plant, Stopped,
@@ -76,21 +76,22 @@ pub enum Method {
 }
 
 impl Method {
-    fn of_core(self) -> ::http::Method {
+    /// Its name on the wire.
+    fn as_str(self) -> &'static str {
         match self {
-            Method::Get => ::http::Method::GET,
-            Method::Head => ::http::Method::HEAD,
-            Method::Post => ::http::Method::POST,
-            Method::Put => ::http::Method::PUT,
-            Method::Patch => ::http::Method::PATCH,
-            Method::Delete => ::http::Method::DELETE,
+            Method::Get => "GET",
+            Method::Head => "HEAD",
+            Method::Post => "POST",
+            Method::Put => "PUT",
+            Method::Patch => "PATCH",
+            Method::Delete => "DELETE",
         }
     }
 }
 
-/// A request header, checked as it is made: a name that is a token, a value with no line
-/// break, and not one of the headers that frame the body (`Content-Length`,
-/// `Transfer-Encoding`, `Connection`), which are the client's to say.
+/// A request header, checked as it is made: a name that is a token, a value with no control
+/// byte, and not one of the headers the writer sets itself (`Host`, `Range`,
+/// `Content-Length`, `Transfer-Encoding`, `Connection`).
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: refcounts
 pub struct Header {
     name: Arc<str>,
@@ -115,9 +116,14 @@ impl core::error::Error for HeaderError {}
 impl Header {
     #[blaze::nonblocking]
     pub fn new(name: &str, value: &str) -> Result<Header, HeaderError> {
-        if let Some(why) = h1::refuse_header(name, value) {
+        if let Err(fault) = blaze_h1::check_header(name, value) {
+            let why = match fault {
+                HeaderFault::NotToken => "is no header name",
+                HeaderFault::Owned => "is the client's to say: it frames the body, keeps the connection or is a field of the request",
+                HeaderFault::ControlByte => "has a line break, a NUL or another control byte in its value",
+            };
             // alloc: an error's message.
-            return Err(HeaderError { name: name.to_owned(), why });
+            return Err(HeaderError { name: name.to_owned(), why: why.to_owned() });
         }
         // alloc: once per header, its name and value.
         Ok(Header { name: Arc::from(name), value: Arc::from(value) })
@@ -191,8 +197,8 @@ pub enum HttpKind {
     Net(NetError),
     /// A wait or an allocation stopped first.
     Stopped(Stopped),
-    /// The answer is not HTTP/1.1 as the core reads it, which said this.
-    Protocol(String),
+    /// The answer is not HTTP/1.1 as blaze-h1 reads it, which said why and at which byte.
+    Protocol(blaze_h1::Error),
     /// The answer's body passed its [`Wire::body_most`], `most` bytes.
     TooBig { most: usize },
     /// Its [`Wire::reads_most`], `reads` receives, did not bring the answer's end.
@@ -353,20 +359,34 @@ impl Http {
         if origin.scheme().as_str() == "https" {
             return Err(refuse(HttpKind::NoTls));
         }
-        // The core's input: blaze-http's h1 writes a request's head into a `Vec`.
+        // The core's input: blaze-h1 writes a request's head into a `Vec`.
         let host = match origin.scheme().default_port() == Some(origin.at().port()) {
             // alloc: once per request, its `Host`.
             true => origin.at().host().to_owned(),
             // alloc: once per request, its `Host`.
             false => origin.at().to_string(),
         };
-        // alloc: once per request, its headers as the core takes them.
-        let headers: Vec<(String, String)> =
-            request.headers.iter().map(|it| (it.name().to_owned(), it.value().to_owned())).collect();
+        // alloc: once per request, its headers as the core takes them: the user agent, then
+        // the request's.
+        let mut headers: Vec<(&str, &str)> = Vec::with_capacity(1 + request.headers.len());
+        headers.push(("user-agent", wire.user_agent));
+        headers.extend(request.headers.iter().map(|it| (it.name(), it.value())));
+        let body = request.body.len() as u64;
+        let carries = matches!(request.method, Method::Post | Method::Put | Method::Patch);
+        let head = blaze_h1::Request {
+            method: request.method.as_str(),
+            target: request.url.target(),
+            host: &host,
+            range: None,
+            headers: &headers,
+            body_len: (body > 0 || carries).then_some(body),
+            close: true,
+        };
         // alloc: once per request, its head and body as sent.
         let mut sent = Vec::new();
-        let method = request.method.of_core();
-        h1::write_request(&mut sent, &method, request.url.target(), &host, wire.user_agent, false, &headers, request.body.len(), None);
+        if let Err(error) = blaze_h1::write_request(&head, &mut sent) {
+            return Err(refuse(HttpKind::Protocol(error)));
+        }
         sent.extend_from_slice(request.body);
         // clone: the address connected to, a refcount.
         let conn = match net.connect(cx, &Addr::Tcp(origin.at().clone())) {
@@ -492,49 +512,31 @@ fn read_answer(
     into: &mut Bytes<'_>,
 ) -> Result<u16, HttpKind> {
     let cx = cx.span("bstd::requests: an answer's bytes");
-    let start = into.len();
-    // alloc: the core's input and output: blaze-http's h1 parses a head from, and decodes a
-    // body into, a `Vec`. Freed as this returns.
-    let (mut unread, mut decoded): (Vec<u8>, Vec<u8>) = (Vec::new(), Vec::new());
+    // The body is held to `body_most` by the core itself, before a byte past it is written; the
+    // head to 64 KiB and 100 lines.
+    let limits = blaze_h1::Limits { most_head: 64 << 10, most_headers: 100, most_body: wire.body_most as u64 };
+    // alloc: the core's head and its body's next piece, `Vec`s freed as this returns.
+    let mut answer = blaze_h1::Response::new_in(limits, request.method == Method::Head, alloc::alloc::Global);
+    let mut decoded: Vec<u8> = Vec::new();
     let mut received = cx.bytes();
-    let mut head: Option<h1::Head> = None;
+    let over = |error: blaze_h1::Error| match error.why {
+        blaze_h1::Why::BodyOver { .. } => HttpKind::TooBig { most: wire.body_most },
+        _ => HttpKind::Protocol(error),
+    };
     for _ in 0..wire.reads_most {
-        if head.is_none() {
-            match h1::parse_head(&unread, request.method == Method::Head).map_err(HttpKind::Protocol)? {
-                Some(parsed) => {
-                    unread.drain(..parsed.len);
-                    // An informational answer (1xx) is not the answer: the next head is.
-                    if (100..200).contains(&parsed.status) {
-                        continue;
-                    }
-                    head = Some(parsed);
-                }
-                None => {}
-            }
-        }
-        if let Some(head) = &mut head {
-            let (took, ended) = head.body.decode(&unread, &mut decoded).map_err(HttpKind::Protocol)?;
-            unread.drain(..took);
-            into.try_extend(&decoded)?;
-            decoded.clear();
-            if into.len() - start > wire.body_most {
-                return Err(HttpKind::TooBig { most: wire.body_most });
-            }
-            if ended {
-                return Ok(head.status);
-            }
-        }
         received.clear();
         let got = conn.recv(&cx, RECV, &mut received).map_err(HttpKind::Net)?;
         if got == 0 {
             // The peer closed: that ends a body framed by the close, and nothing else.
-            return match &head {
-                Some(head) => head.body.closed().map(|()| head.status).map_err(HttpKind::Protocol),
-                // alloc: an error's message.
-                None => Err(HttpKind::Protocol("the connection closed before an answer's head was whole".to_owned())),
-            };
+            answer.closed().map_err(HttpKind::Protocol)?;
+            return Ok(answer.status());
         }
-        unread.extend_from_slice(received.as_slice());
+        let fed = answer.feed(received.as_slice(), &mut decoded).map_err(over)?;
+        into.try_extend(&decoded)?;
+        decoded.clear();
+        if fed.done {
+            return Ok(answer.status());
+        }
     }
     Err(HttpKind::Unending { reads: wire.reads_most })
 }

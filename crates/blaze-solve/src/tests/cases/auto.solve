@@ -141,6 +141,10 @@ goal dyn Debug + Send: Send => yes
 case auto_dyn_without_bound_no = trait_goals.rs::disqualify_auto_trait_candidate_due_to_possible_impl
 goal dyn Debug: Send => no
 
+case auto_dyn_other_auto_no = assembly/mod.rs::assemble_object_bound_candidates
+# The Reference, "Trait object types": the object implements "its auto traits": those listed only.
+goal dyn Debug + Sync: Send => no
+
 case auto_param_no = trait_goals.rs::disqualify_auto_trait_candidate_due_to_possible_impl
 params T
 goal T: Send => no

@@ -5,6 +5,12 @@
 //! whose stamp equals the tail is free for that push; one whose stamp is the head plus one
 //! holds the value that pop takes. A push stores `tail + 1` in its slot's stamp once the value
 //! is written; a pop stores `head + one_lap`, the slot's turn on the next lap.
+//!
+//! A slot keeps its turn less its own index (wrapping), so slot `i`'s first turn, `i`, is kept
+//! as 0 and a new ring is all zero bytes: it is allocated zeroed (`calloc`, fresh pages for a
+//! large ring), and no page of it is touched until a value passes through it. A ring of 4,096
+//! slots made at start and never used costs the address space, not 4,096 stamp writes and the
+//! faults under them. [`Slot::turn`] and [`Slot::set_turn`] are the only reads and writes.
 
 use alloc::{alloc::Global, boxed::Box, vec::Vec};
 use core::{cell::UnsafeCell, fmt, mem::MaybeUninit};
@@ -20,9 +26,24 @@ use crate::{
 };
 
 struct Slot<T> {
-    /// The turn: the tail of the push that may write it, or that plus one once written.
+    /// The turn (the tail of the push that may write it, or that plus one once written) less
+    /// the slot's index, wrapping: zero is slot `i`'s first turn, `i` (the module's doc).
     stamp: AtomicUsize,
     value: UnsafeCell<MaybeUninit<T>>,
+}
+
+impl<T> Slot<T> {
+    /// The turn of this slot, the one at `index`.
+    #[inline(always)]
+    fn turn(&self, index: usize, order: Ordering) -> usize {
+        self.stamp.load(order).wrapping_add(index)
+    }
+
+    /// Sets the turn of this slot, the one at `index`.
+    #[inline(always)]
+    fn set_turn(&self, index: usize, turn: usize, order: Ordering) {
+        self.stamp.store(turn.wrapping_sub(index), order);
+    }
 }
 
 /// A bounded queue of `T` that any number of threads push to and pop from.
@@ -41,26 +62,42 @@ unsafe impl<T: Send> Send for ArrayQueue<T> {}
 unsafe impl<T: Send> Sync for ArrayQueue<T> {}
 
 impl<T> ArrayQueue<T> {
-    /// A ring of `cap` slots, allocated now from `Global`.
+    /// A ring of `cap` slots, allocated now from `Global`, zeroed and untouched (the module's
+    /// doc).
     ///
     /// # Panics
     ///
     /// When `cap` is 0.
     pub fn new(cap: usize) -> ArrayQueue<T> {
         assert!(cap > 0, "an ArrayQueue of no slots");
-        let mut buffer = Vec::with_capacity_in(cap, Global);
-        buffer.extend((0..cap).map(|turn| Slot {
-            stamp: AtomicUsize::new(turn),
-            value: UnsafeCell::new(MaybeUninit::uninit()),
-        }));
         let one_lap = (cap + 1).next_power_of_two();
         ArrayQueue {
             head: Padded(AtomicUsize::new(0)),
             tail: Padded(AtomicUsize::new(0)),
-            buffer: buffer.into_boxed_slice(),
+            buffer: Self::slots(cap),
             cap,
             one_lap,
         }
+    }
+
+    /// `cap` slots each at its first turn: zero bytes, from `Global`'s zeroed allocation.
+    #[cfg(not(blaze_check))]
+    fn slots(cap: usize) -> Box<[Slot<T>], Global> {
+        let zeroed = Box::<[Slot<T>], Global>::new_zeroed_slice_in(cap, Global);
+        // SAFETY: a slot of zero bytes is valid: its stamp is an `AtomicUsize` (any bits are
+        // one), 0, slot `i`'s first turn less `i`; its value is a `MaybeUninit` (any bytes).
+        unsafe { zeroed.assume_init() }
+    }
+
+    /// The same under the model checker, whose atomics are not plain bytes: each made.
+    #[cfg(blaze_check)]
+    fn slots(cap: usize) -> Box<[Slot<T>], Global> {
+        let mut buffer = Vec::with_capacity_in(cap, Global);
+        buffer.extend(
+            (0..cap)
+                .map(|_| Slot { stamp: AtomicUsize::new(0), value: UnsafeCell::new(MaybeUninit::uninit()) }),
+        );
+        buffer.into_boxed_slice()
     }
 
     /// Pushes `value`, or hands it back when the ring is full.
@@ -76,7 +113,7 @@ impl<T> ArrayQueue<T> {
             let next =
                 if index + 1 < self.cap { tail + 1 } else { lap.wrapping_add(self.one_lap) };
             let slot = &self.buffer[index];
-            let stamp = slot.stamp.load(Ordering::Acquire);
+            let stamp = slot.turn(index, Ordering::Acquire);
             if tail == stamp {
                 // The slot's turn is this push's: take the tail.
                 match self.tail.compare_exchange_weak(
@@ -102,7 +139,7 @@ impl<T> ArrayQueue<T> {
                             _ = plant;
                             Ordering::Release
                         };
-                        slot.stamp.store(tail + 1, publish);
+                        slot.set_turn(index, tail + 1, publish);
                         return Ok(());
                     }
                     Err(now) => tail = now,
@@ -117,7 +154,7 @@ impl<T> ArrayQueue<T> {
                 // A pop has taken the head and not yet freed the slot: wait for a change
                 // before looking again, as a retry at once would spin with no back-off.
                 SpinWait::until("a slot of an ArrayQueue a pop is freeing", || {
-                    slot.stamp.load(Ordering::Acquire) != stamp
+                    slot.turn(index, Ordering::Acquire) != stamp
                         || self.tail.load(Ordering::Relaxed) != tail
                         || self.head.load(Ordering::Relaxed) != head
                 });
@@ -125,7 +162,7 @@ impl<T> ArrayQueue<T> {
             } else {
                 // Another push or pop is mid-way through the slot.
                 SpinWait::until("a slot of an ArrayQueue another thread is writing", || {
-                    slot.stamp.load(Ordering::Acquire) != stamp
+                    slot.turn(index, Ordering::Acquire) != stamp
                         || self.tail.load(Ordering::Relaxed) != tail
                 });
                 tail = self.tail.load(Ordering::Relaxed);
@@ -140,7 +177,7 @@ impl<T> ArrayQueue<T> {
             let index = head & (self.one_lap - 1);
             let lap = head & !(self.one_lap - 1);
             let slot = &self.buffer[index];
-            let stamp = slot.stamp.load(Ordering::Acquire);
+            let stamp = slot.turn(index, Ordering::Acquire);
             if head + 1 == stamp {
                 let next =
                     if index + 1 < self.cap { head + 1 } else { lap.wrapping_add(self.one_lap) };
@@ -157,7 +194,7 @@ impl<T> ArrayQueue<T> {
                         // after the push's release) says the slot holds a written value no
                         // other pop takes.
                         let value = unsafe { at.read().assume_init() };
-                        slot.stamp.store(head.wrapping_add(self.one_lap), Ordering::Release);
+                        slot.set_turn(index, head.wrapping_add(self.one_lap), Ordering::Release);
                         return Some(value);
                     }
                     Err(now) => head = now,
@@ -172,14 +209,14 @@ impl<T> ArrayQueue<T> {
                 // A push has taken the tail and not yet filled the slot: wait for a change
                 // before looking again, as a retry at once would spin with no back-off.
                 SpinWait::until("a slot of an ArrayQueue a push is filling", || {
-                    slot.stamp.load(Ordering::Acquire) != stamp
+                    slot.turn(index, Ordering::Acquire) != stamp
                         || self.head.load(Ordering::Relaxed) != head
                         || self.tail.load(Ordering::Relaxed) != tail
                 });
                 head = self.head.load(Ordering::Relaxed);
             } else {
                 SpinWait::until("a slot of an ArrayQueue another thread is writing", || {
-                    slot.stamp.load(Ordering::Acquire) != stamp
+                    slot.turn(index, Ordering::Acquire) != stamp
                         || self.head.load(Ordering::Relaxed) != head
                 });
                 head = self.head.load(Ordering::Relaxed);

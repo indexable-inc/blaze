@@ -388,13 +388,22 @@ enum LayerOp {
     Put(usize, Option<usize>),
     /// The job's end: the layer flushed, its commit a task after the answer.
     Flush,
+    /// Every effect in flight completed: a commit asked before it is done, so puts after it
+    /// are not in it.
+    Settle,
 }
 
 fn build_ops(units: usize, plant: LayerPlant) -> Vec<LayerOp> {
     let mut ops = Vec::new();
     for unit in 0..units {
         if plant == LayerPlant::RecordFirst {
-            ops.extend([LayerOp::Put(unit, None), LayerOp::Flush, LayerOp::Put(unit, Some(0)), LayerOp::Put(unit, Some(1))]);
+            ops.extend([
+                LayerOp::Put(unit, None),
+                LayerOp::Flush,
+                LayerOp::Settle,
+                LayerOp::Put(unit, Some(0)),
+                LayerOp::Put(unit, Some(1)),
+            ]);
             continue;
         }
         ops.extend([LayerOp::Put(unit, Some(0)), LayerOp::Put(unit, Some(1)), LayerOp::Put(unit, None)]);
@@ -524,9 +533,14 @@ fn std_race(seed: u64, plant: LayerPlant) -> Result<(), String> {
                 }
             }
             LayerOp::Flush => writer.flush(&mut effects),
+            LayerOp::Settle => {}
         }
+        let polls = match op {
+            LayerOp::Settle => None,
+            _ => Some(rng.below(3)),
+        };
         let [one, two] = &mut writers;
-        pump_all(&mut sim, &mut [one, two], &mut effects, Some(rng.below(3)))?;
+        pump_all(&mut sim, &mut [one, two], &mut effects, polls)?;
         for (home, writer) in writers.iter().enumerate() {
             waiting[home].retain(|(unit, ticket)| {
                 let durable = writer.durable(*ticket);

@@ -76,6 +76,14 @@ use crate::{
 /// else: a struct opts in with `impl Share for X {}` when every field is `Copy` or `Share`. Under
 /// blaze that is checked by reflection over the fields (later); under rustc it is the author's
 /// promise.
+///
+/// # Where a share belongs
+///
+/// A counted handle's share writes one cache line every thread holding the value also writes.
+/// Measured on 18 threads (2026-11-15, `alloc_cost arc`), ns a share and drop: one `Arc` all
+/// threads share 215.6, a value per thread 4.16, a borrow from a scope 0.52. So a value many
+/// workers share is borrowed from a scope (`std::thread::scope`, a task's frame), or shared once
+/// per worker at spawn; a share of a shared handle inside a per-item loop is a defect.
 pub trait Share: Clone {
     /// Another handle to the same thing.
     #[inline]

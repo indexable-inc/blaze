@@ -58,7 +58,7 @@ libc.workspace = true
 default = ["net"]
 # `http::HyperHttp` over blaze-http, rustls on ring. Without it (the seed profile, which builds
 # offline from vendored sources) every request is `http::NoNet`, naming its URL.
-net = ["dep:blaze-http", "blaze-http/native-roots"]
+net = ["dep:blaze-http"]
 
 [lints]
 workspace = true

@@ -8,12 +8,11 @@
 //! is taken when it closes, from its range or from the tokens recorded while it was open (a
 //! visibility, a rename, an attribute). No node is kept past its exit.
 
-use blaze_hash::ByHash;
-use blaze_ids::{ContentId, Hasher};
+use blaze_ids::ContentId;
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_surface::{
-    Attr, AttrKind, AttrSpan, ErrorOrigin, Item, ItemDetail, ItemIndex, Range, Rename, SyntaxError,
-    WrittenVis,
+    Attr, AttrKind, AttrSpan, ErrorOrigin, Item, ItemDetail, ItemFlags, ItemIndex, Range, Rename,
+    SyntaxError, WrittenVis,
 };
 use parser::{
     Edition, Input, LexedStr, OutlineStep, Reparser, Step,
@@ -22,15 +21,10 @@ use parser::{
 
 use blaze_lex::Cpu;
 
+use crate::flags::Scan;
 use crate::skeleton::{Skipped, skeleton};
-use crate::{ITEM_DOMAIN, Outline};
-
-/// The domain of an unnamed entry's head: its signature's bytes from its first token outside
-/// its attributes, which stand for its name among its siblings.
-const HEAD_DOMAIN: &str = "blaze v2 file item head 1";
-
-/// The domain of a sibling group's key: the parent, the kind and the name (or head).
-const SIBLING_DOMAIN: &str = "blaze v2 file item siblings 1";
+use crate::Outline;
+use crate::digest::{By, Compress, Keyed, digest};
 
 /// What an entry is before the walk closes it.
 const PLACEHOLDER: Item = Item {
@@ -46,21 +40,197 @@ const PLACEHOLDER: Item = Item {
     disambiguator: 0,
     hash: ContentId([0; 32]),
     signature_hash: ContentId([0; 32]),
+    flags: ItemFlags::NONE,
 };
 
-pub(crate) fn outline<'a>(text: &str, edition: Edition, bodies: Bodies, alloc: Alloc<'a>) -> Outline<'a> {
+/// The outline of `text`, walked whole.
+pub(crate) fn outline<'a, C: Compress>(
+    text: &str,
+    edition: Edition,
+    bodies: Bodies,
+    alloc: Alloc<'a>,
+) -> Outline<'a> {
+    let whole = Range::new(0, u32::try_from(text.len()).unwrap_or(u32::MAX));
+    outline_parts::<C>(text, [whole], edition, bodies, alloc)
+}
+
+/// The outline of `text` walked part by part, `parts` in order (crate::split_top_level's, or
+/// the whole text as one): each part's walk appends its entries, attributes and errors to the
+/// file's one outline, its ranges moved by the part's start as they are written, so no part
+/// has an outline of its own and nothing is copied to put them together. Then the digests of
+/// every entry, in fixed batches (crate::digest).
+///
+/// # Panics
+///
+/// When a part but the first holds file attributes or file flags, which `split_top_level`
+/// never cuts for: a file's own attribute is before its first item.
+pub(crate) fn outline_parts<'a, C: Compress>(
+    text: &str,
+    parts: impl IntoIterator<Item = Range>,
+    edition: Edition,
+    bodies: Bodies,
+    alloc: Alloc<'a>,
+) -> Outline<'a> {
     assert!(
         u32::try_from(text.len()).is_ok(),
         "a source file of {} bytes: an outline's ranges are u32 pairs",
         text.len()
     );
-    let (skipped, skeleton) = match bodies {
-        Bodies::Parsed => (Vec::new_in(alloc), Vec::new_in(alloc)),
-        Bodies::Skipped => skeleton(text, Cpu::BASELINE, alloc),
-    };
+    let mut buffers = blaze_mem::scratch::lend::<Buffers>();
+    let Buffers { out, working } = &mut *buffers;
+    for (index, part) in parts.into_iter().enumerate() {
+        let own = (out.file_attrs, out.own_flags);
+        walk_part(text, part, edition, bodies, working, out);
+        assert!(
+            index == 0 || (out.file_attrs, out.own_flags) == own,
+            "a part but the first holds file attributes or file flags"
+        );
+    }
+    // The lexer's errors come after every part's parser errors, as a whole-file walk has them.
+    let Lexer { errors, messages } = &working.lexer;
+    let shift = u32::try_from(out.messages.len()).expect("messages under 4 GiB");
+    out.messages.extend_from_slice(messages);
+    out.errors.extend(errors.iter().map(|error| SyntaxError { message: error.message.shifted(shift), ..*error }));
+    out.flags = out.items.iter().fold(out.own_flags, |flags, item| flags | item.flags);
+    digest::<C>(text, edition_byte(edition), out, &mut working.digest);
+    out.copy_in(alloc)
+}
+
+/// What [`outline_parts`] grows and no caller keeps, one set per worker at the most it ever
+/// held (`blaze_mem::scratch`, docs/v2/plan/design/memory.md, "Scratch buffers reused per
+/// worker"), like the parser's events: the outline as the walk appends to it and the walk's
+/// working vectors. In a bump frame two vectors that grow by turns copy each other at every
+/// step, and a working vector is never freed while a kept one is above it, so the frame would
+/// hold twice the outline and the working set beside it; here the frame takes the outline
+/// once, at its exact size ([`Outline::copy_in`]), and the worker's set stops growing once
+/// warm. The heap is `Alloc::global`'s, named here and nowhere else in the crate.
+struct Buffers {
+    out: Outline<'static>,
+    working: Working<'static>,
+}
+
+impl Default for Buffers {
+    fn default() -> Buffers {
+        let alloc = Alloc::global();
+        Buffers {
+            out: Outline {
+                items: Vec::new_in(alloc),
+                attrs: Vec::new_in(alloc),
+                file_attrs: AttrSpan::default(),
+                errors: Vec::new_in(alloc),
+                messages: Vec::new_in(alloc),
+                keys: Vec::new_in(alloc),
+                own_flags: ItemFlags::NONE,
+                flags: ItemFlags::NONE,
+            },
+            working: Working::new_in(alloc),
+        }
+    }
+}
+
+std::thread_local! {
+    /// The thread's [`Buffers`], when none is lent.
+    static BUFFERS: core::cell::Cell<Option<Buffers>> = const { core::cell::Cell::new(None) };
+}
+
+impl blaze_mem::scratch::Shelved for Buffers {
+    fn empty(&mut self) {
+        let Buffers { out, working } = self;
+        let Outline { items, attrs, file_attrs, errors, messages, keys, own_flags, flags } = out;
+        items.clear();
+        attrs.clear();
+        errors.clear();
+        messages.clear();
+        keys.clear();
+        *file_attrs = AttrSpan::default();
+        *own_flags = ItemFlags::NONE;
+        *flags = ItemFlags::NONE;
+        working.lexer.errors.clear();
+        working.lexer.messages.clear();
+    }
+
+    fn held(&self) -> usize {
+        self.out.items.capacity() + self.working.skeleton.capacity()
+    }
+
+    fn unshelve() -> Option<Buffers> {
+        BUFFERS.try_with(core::cell::Cell::take).ok().flatten()
+    }
+
+    fn shelve(self) {
+        // A thread that is ending: the buffers are freed.
+        let _ = BUFFERS.try_with(|shelf| shelf.set(Some(self)));
+    }
+}
+
+/// The working vectors of a walk, which no outline keeps: the skeleton and its cut bodies, and
+/// the walk's stacks. One set serves every part of a file in turn, cleared and never freed, so
+/// in a task's frame a file's walks hold one set at the size of its largest part, not one per
+/// part (rule 11; docs/v2/plan/design/memory.md, the frame reset per item). Beside them, the
+/// lexer's errors of every part, which go after all the parser's.
+pub(crate) struct Working<'a> {
+    skipped: AVec<'a, Skipped>,
+    skeleton: AVec<'a, u8>,
+    stacks: Stacks<'a>,
+    lexer: Lexer<'a>,
+    digest: crate::digest::Scratch<'a>,
+}
+
+/// The lexer's errors of the parts walked so far, in file offsets, and their messages one
+/// after another: empty, and nothing allocated, in nine files in ten.
+struct Lexer<'a> {
+    errors: AVec<'a, SyntaxError>,
+    messages: AVec<'a, u8>,
+}
+
+impl<'a> Working<'a> {
+    /// Empty: nothing is allocated until the first walk.
+    pub(crate) fn new_in(alloc: Alloc<'a>) -> Working<'a> {
+        Working {
+            skipped: Vec::new_in(alloc),
+            skeleton: Vec::new_in(alloc),
+            stacks: Stacks::new_in(alloc),
+            lexer: Lexer { errors: Vec::new_in(alloc), messages: Vec::new_in(alloc) },
+            digest: crate::digest::Scratch::new_in(alloc),
+        }
+    }
+}
+
+/// The stacks a [`Walk`] keeps while it runs and gives back at [`Walk::finish`], empty.
+struct Stacks<'a> {
+    frames: AVec<'a, Frame>,
+    open: AVec<'a, Open>,
+    tokens: AVec<'a, Tok>,
+}
+
+impl<'a> Stacks<'a> {
+    fn new_in(alloc: Alloc<'a>) -> Stacks<'a> {
+        Stacks { frames: Vec::new_in(alloc), open: Vec::new_in(alloc), tokens: Vec::new_in(alloc) }
+    }
+}
+
+/// Walks `part` of `file` into `out`, the file's outline, its digests not yet taken (each new
+/// entry's `hash` holds its sibling key's makings, crate::digest::Keyed): file ranges are the
+/// part's moved by its start, entries and attributes are counted on from those `out` holds.
+/// Its working vectors are `working`'s, given back cleared.
+fn walk_part<'a>(
+    file: &str,
+    part: Range,
+    edition: Edition,
+    bodies: Bodies,
+    working: &mut Working<'a>,
+    out: &mut Outline<'a>,
+) {
+    let text = &file[part.to_usize()];
+    working.skipped.clear();
+    working.skeleton.clear();
+    if bodies == Bodies::Skipped {
+        skeleton(text, Cpu::BASELINE, &mut working.skipped, &mut working.skeleton);
+    }
+    let (skipped, skeleton) = (&working.skipped, &working.skeleton);
     let parsed_text = match bodies {
         Bodies::Parsed => text,
-        Bodies::Skipped => match blaze_lex::validate(Cpu::BASELINE, &skeleton) {
+        Bodies::Skipped => match blaze_lex::validate(Cpu::BASELINE, skeleton) {
             Ok(valid) => valid.as_str(),
             Err(invalid) => unreachable!("a text cut at ASCII braces is UTF-8, not at byte {}", invalid.valid_up_to),
         },
@@ -71,7 +241,8 @@ pub(crate) fn outline<'a>(text: &str, edition: Edition, bodies: Bodies, alloc: A
         Bodies::Parsed => parser::TopEntryPoint::SourceFile.parse(input.tokens()),
         Bodies::Skipped => parser::TopEntryPoint::SourceFile.parse_outline(input.tokens()),
     };
-    let mut walk = Walk::new(text, &lexed, &skipped, edition, alloc);
+    let stacks = core::mem::replace(&mut working.stacks, Stacks::new_in(*working.skeleton.allocator()));
+    let mut walk = Walk::new(text, part.start, &lexed, skipped, stacks, edition, out, &mut working.lexer);
     for step in output.steps() {
         match step {
             OutlineStep::Step(step) => walk.step(step),
@@ -81,7 +252,7 @@ pub(crate) fn outline<'a>(text: &str, edition: Edition, bodies: Bodies, alloc: A
             }
         }
     }
-    walk.finish()
+    working.stacks = walk.finish();
 }
 
 /// Whether the parser has a `{ .. }` body that holds an item or a macro call at any depth
@@ -205,24 +376,24 @@ struct Open {
     holds_items: bool,
     attrs: AttrSpan,
     children: u32,
-    /// Where its child entries' digests start in [`Walk::closed`].
-    closed_from: usize,
+    /// What its own tokens so far set (crate::flags).
+    flags: ItemFlags,
 }
 
-/// The tag of a run of an entry's own bytes in its digest.
-const BYTES: u8 = 0;
-/// The tag of a child entry's digest in its parent's.
-const CHILD: u8 = 1;
-
-struct Walk<'t, 'l, 'a> {
-    /// The file. The lexer's tokens are the skeleton's (crate::skeleton), the same as the
-    /// file's but inside each skipped body.
+struct Walk<'t, 'l, 'o, 'a> {
+    /// The part of the file walked. The lexer's tokens are the skeleton's (crate::skeleton),
+    /// the same as the part's but inside each skipped body. Offsets in the walk are the part's.
     text: &'t str,
+    /// Where the part starts in the file: what a file range the walk writes is moved by.
+    base: u32,
     lexed: &'l LexedStr<'l>,
     /// The bodies the skeleton cut, in order, and the next one the walk has not passed.
     skipped: &'l [Skipped],
     next_skipped: usize,
-    edition: u8,
+    /// The edition a skipped body is lexed in for its flags.
+    lex_edition: Edition,
+    /// The flags machine, fed every token the parser takes.
+    scan: Scan,
     /// The next lexer token.
     pos: usize,
     /// Where token `pos` starts in the file, or the trivia before it.
@@ -234,46 +405,81 @@ struct Walk<'t, 'l, 'a> {
     /// The depth of the node whose tokens are being recorded into `tokens`.
     recorded: Option<usize>,
     tokens: AVec<'a, Tok>,
-    /// How many entries of each sibling key the walk has closed. `ByHash` is a general table,
-    /// generic over its allocator; here it is the handle's.
-    siblings: ByHash<ContentId, u32, Alloc<'a>>,
     file_children: u32,
     /// The input tokens (trivia not counted) the parser has taken.
     taken: usize,
     /// A body is being walked from its own parse ([`Walk::lazy_body`]): its errors are not the
     /// outline's.
     body_errors_muted: bool,
-    out: Outline<'a>,
+    /// The file's outline, which the walk appends to.
+    out: &'o mut Outline<'a>,
+    /// The lexer's errors of the file, which go after all the parser's.
+    lexer: &'o mut Lexer<'a>,
 }
 
-impl<'t, 'l, 'a> Walk<'t, 'l, 'a> {
-    fn new(text: &'t str, lexed: &'l LexedStr<'l>, skipped: &'l [Skipped], edition: Edition, alloc: Alloc<'a>) -> Self {
+impl<'t, 'l, 'o, 'a> Walk<'t, 'l, 'o, 'a> {
+    #[expect(clippy::too_many_arguments, reason = "the part, its tokens, and where its outline goes")]
+    fn new(
+        text: &'t str,
+        base: u32,
+        lexed: &'l LexedStr<'l>,
+        skipped: &'l [Skipped],
+        stacks: Stacks<'a>,
+        edition: Edition,
+        out: &'o mut Outline<'a>,
+        lexer: &'o mut Lexer<'a>,
+    ) -> Self {
+        let Stacks { frames, open, tokens } = stacks;
+        debug_assert!(frames.is_empty() && open.is_empty(), "a walk's stacks come back empty");
         Walk {
             text,
+            base,
             lexed,
             skipped,
             next_skipped: 0,
-            edition: edition_byte(edition),
+            lex_edition: edition,
+            scan: Scan::new(),
             pos: 0,
             offset: 0,
             prev_end: None,
-            frames: Vec::new_in(alloc),
-            open: Vec::new_in(alloc),
+            frames,
+            open,
             recorded: None,
-            tokens: Vec::new_in(alloc),
-            siblings: ByHash::new_in(alloc),
+            tokens,
             file_children: 0,
             taken: 0,
             body_errors_muted: false,
-            out: Outline {
-                items: Vec::new_in(alloc),
-                attrs: Vec::new_in(alloc),
-                file_attrs: AttrSpan::default(),
-                errors: Vec::new_in(alloc),
-                messages: Vec::new_in(alloc),
-                keys: Vec::new_in(alloc),
-            },
+            out,
+            lexer,
         }
+    }
+
+    /// `flags` are the innermost open entry's, or the file's outside every entry.
+    fn flag(&mut self, flags: ItemFlags) {
+        if flags.is_empty() {
+            return;
+        }
+        match self.open.last_mut() {
+            Some(open) => open.flags |= flags,
+            None => self.out.own_flags |= flags,
+        }
+    }
+
+    /// The flags of a skipped body's tokens, `{` to `}` (so no shebang or frontmatter is read
+    /// at its start), from a fresh machine: where a whole-file walk stands after the `{`.
+    fn body_flags(&self, body: Skipped) -> ItemFlags {
+        let at = |offset: u32| usize::try_from(offset).expect("a file offset fits usize");
+        let lexed = LexedStr::new(self.lex_edition, &self.text[at(body.open)..=at(body.close)]);
+        let mut scan = Scan::new();
+        let mut flags = ItemFlags::NONE;
+        // The `{` and `}` decide nothing from where a fresh machine stands.
+        for token in 0..lexed.len() {
+            let kind = lexed.kind(token);
+            if !kind.is_trivia() {
+                flags |= scan.token(kind, || lexed.text(token));
+            }
+        }
+        flags
     }
 
     fn token_len(&self, at: usize) -> u32 {
@@ -417,13 +623,20 @@ impl<'t, 'l, 'a> Walk<'t, 'l, 'a> {
         self.prev_end = Some(range.end);
         self.offset = range.end;
         self.pos += 1;
+        let text = self.text;
+        let flags = self.scan.token(kind, || range.of(text));
+        self.flag(flags);
         // A skipped body's `{`: its inside is not in the skeleton, and its `}` is next.
-        if let Some(body) = self.skipped.get(self.next_skipped)
+        if let Some(&body) = self.skipped.get(self.next_skipped)
             && range.start == body.open
         {
             assert_eq!(kind, L_CURLY, "a skipped body starts at its `{{`");
             self.offset = body.close;
             self.next_skipped += 1;
+            if body.may_flag {
+                let flags = self.body_flags(body);
+                self.flag(flags);
+            }
         }
     }
 
@@ -517,7 +730,7 @@ impl<'t, 'l, 'a> Walk<'t, 'l, 'a> {
             holds_items: false,
             attrs: AttrSpan { start: at, end: at },
             children: 0,
-            closed_from: self.closed.len(),
+            flags: ItemFlags::NONE,
         });
     }
 
@@ -712,97 +925,46 @@ impl<'t, 'l, 'a> Walk<'t, 'l, 'a> {
             ERROR | ATTR | DOC_COMMENT => ItemDetail::Error,
             syntax => ItemDetail::Unhandled { syntax: u16::from(syntax) },
         };
-        let mut sibling = Hasher::new(SIBLING_DOMAIN);
-        sibling
-            .update(&open.parent.map_or(0u64, |parent| u64::from(parent.0) + 1).to_le_bytes())
-            .update(&[tag_of(kind)]);
-        let bytes = self.text.as_bytes();
-        let at = |offset: u32| usize::try_from(offset).expect("a file offset fits usize");
-        match open.syntax {
+        // The sibling key's makings, in file offsets, kept in the entry's `hash` until it and
+        // the digests are hashed when the whole file is walked (crate::digest).
+        let base = self.base;
+        let by = match open.syntax {
             // A tuple field is told apart by its position alone.
-            TUPLE_FIELD => {}
-            syntax if is_named(syntax) => {
-                sibling.opt_part(open.name.map(|name| {
-                    let name = name.of(self.text);
-                    name.strip_prefix("r#").unwrap_or(name)
-                }));
-            }
-            _ => {
-                let head_start = open.head_start.unwrap_or(signature_end).min(signature_end);
-                let mut head = Hasher::new(HEAD_DOMAIN);
-                head.update(&bytes[at(head_start)..at(signature_end)]);
-                sibling.id(&head.finish());
-            }
-        }
-        let key = sibling.finish();
-        if open.parent.is_none() {
-            self.out.keys.push(key);
-        }
-        let count = self.siblings.entry(key).or_insert(0);
-        let disambiguator = *count;
-        *count += 1;
-        // The Merkle step (crate docs, "Identity"): the entry's own bytes, each child entry's
-        // digest where the child stands, and the signature's digest read from the same hasher
-        // at the cut. Every byte goes through one hasher, its innermost entry's.
-        let mut digest = Hasher::new(ITEM_DOMAIN);
-        digest.update(&[self.edition]);
-        let mut fed = start;
-        let mut signature_hash = None;
-        for &(child, child_digest) in &self.closed[open.closed_from..] {
-            if signature_hash.is_none() && signature_end <= child.start {
-                digest.update(&[BYTES]).part(&bytes[at(fed)..at(signature_end)]);
-                signature_hash = Some(digest.finish());
-                fed = signature_end;
-            }
-            digest.update(&[BYTES]).part(&bytes[at(fed)..at(child.start)]);
-            digest.update(&[CHILD]).id(&child_digest);
-            fed = child.end;
-        }
-        let signature_hash = match signature_hash {
-            Some(signature_hash) => signature_hash,
-            None => {
-                assert!(fed <= signature_end, "an entry's signature ends outside its children");
-                digest.update(&[BYTES]).part(&bytes[at(fed)..at(signature_end)]);
-                fed = signature_end;
-                digest.finish()
-            }
+            TUPLE_FIELD => By::Position,
+            syntax if is_named(syntax) => By::Name(open.name.map(|name| {
+                let raw = name.of(self.text).starts_with("r#");
+                Range::new(name.start + if raw { 2 } else { 0 }, name.end).shifted(base)
+            })),
+            _ => By::Head(
+                Range::new(open.head_start.unwrap_or(signature_end).min(signature_end), signature_end).shifted(base),
+            ),
         };
-        digest.update(&[BYTES]).part(&bytes[at(fed)..at(end)]);
-        let hash = digest.finish();
-        self.closed.truncate(open.closed_from);
-        if open.parent.is_some() {
-            self.closed.push((Range::new(start, end), hash));
-        }
         let after = u32::try_from(self.out.items.len()).expect("an outline's entries are counted in u32");
         self.out.items[open.index.at()] = Item {
             detail: kind,
             parent: open.parent,
             end: ItemIndex(after),
-            range: Range::new(start, end),
+            range: Range::new(start, end).shifted(base),
             name: open.name.map(rel),
             visibility: open.visibility.map(rel),
             signature: Range::new(0, signature_end - start),
             body: open.body.map(rel),
             attrs: open.attrs,
-            disambiguator,
-            hash,
-            signature_hash,
+            disambiguator: 0,
+            hash: Keyed { tag: tag_of(kind), by }.stash(),
+            signature_hash: ContentId([0; 32]),
+            flags: open.flags,
         };
     }
 
     fn parser_error(&mut self, message: &str) {
-        let range = Range::new(self.offset, self.offset);
-        self.push_error(range, ErrorOrigin::Parser, message);
+        let range = Range::new(self.offset, self.offset).shifted(self.base);
+        push_error(&mut self.out.errors, &mut self.out.messages, range, ErrorOrigin::Parser, message);
     }
 
-    fn push_error(&mut self, range: Range, origin: ErrorOrigin, message: &str) {
-        let start = u32::try_from(self.out.messages.len()).expect("messages under 4 GiB");
-        self.out.messages.extend_from_slice(message.as_bytes());
-        let end = u32::try_from(self.out.messages.len()).expect("messages under 4 GiB");
-        self.out.errors.push(SyntaxError { range, origin, message: Range::new(start, end) });
-    }
-
-    fn finish(mut self) -> Outline<'a> {
+    /// The walk done: the part's lexer errors put by for the file's end, and its stacks given
+    /// back for the next part's walk, empty.
+    fn finish(self) -> Stacks<'a> {
         assert!(
             self.frames.is_empty() && self.open.is_empty(),
             "the parser's output closes every node it opens"
@@ -813,13 +975,16 @@ impl<'t, 'l, 'a> Walk<'t, 'l, 'a> {
             let range = Range::new(
                 self.in_file(u32::try_from(at.start).expect("a file under 4 GiB")),
                 self.in_file(u32::try_from(at.end).expect("a file under 4 GiB")),
-            );
-            self.push_error(range, ErrorOrigin::Lexer, message);
+            )
+            .shifted(self.base);
+            push_error(&mut self.lexer.errors, &mut self.lexer.messages, range, ErrorOrigin::Lexer, message);
         }
-        self.out
+        let mut tokens = self.tokens;
+        tokens.clear();
+        Stacks { frames: self.frames, open: self.open, tokens }
     }
 
-    /// The file's offset of the skeleton's `offset` (none falls inside a skipped body, whose
+    /// The part's offset of the skeleton's `offset` (none falls inside a skipped body, whose
     /// skeleton is `{}`).
     fn in_file(&self, offset: u32) -> u32 {
         let mut cut = 0;
@@ -832,6 +997,14 @@ impl<'t, 'l, 'a> Walk<'t, 'l, 'a> {
         }
         offset + cut
     }
+}
+
+/// Pushes an error at `range` with `message`, copied onto the end of `messages`.
+fn push_error(errors: &mut AVec<'_, SyntaxError>, messages: &mut AVec<'_, u8>, range: Range, origin: ErrorOrigin, message: &str) {
+    let start = u32::try_from(messages.len()).expect("messages under 4 GiB");
+    messages.extend_from_slice(message.as_bytes());
+    let end = u32::try_from(messages.len()).expect("messages under 4 GiB");
+    errors.push(SyntaxError { range, origin, message: Range::new(start, end) });
 }
 
 /// `part`, a range of the file inside an item starting at `base`, relative to the item.

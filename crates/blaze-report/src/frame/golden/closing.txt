@@ -1,0 +1,15 @@
+1 error · 1 file checked · 1.1 ms
+ok · 14 files checked · 0.5 ms · nothing changed
+2 errors · 3 warnings · 1 fixable: blaze check --fix · 213 files checked · 2.4 s
+[0;1;31m1 error[0;2m · 1 file checked · 1.1 ms[0m
+[0;1;32mok[0;2m · 14 files checked · 0.5 ms · nothing changed[0m
+[0;1;31m2 errors[0;2m · [0;1;33m3 warnings[0;2m · 1 fixable: blaze check --fix · 213 files checked · 2.4 s[0m
+[0;1;31m1 error[0;2m · 1 file checked · 1.1 ms[0m
+[0;1;32mok[0;2m · 14 files checked · 0.5 ms · nothing changed[0m
+[0;1;31m2 errors[0;2m · [0;1;33m3 warnings[0;2m · 1 fixable: blaze check --fix · 213 files checked · 2.4 s · 12 rebuilt[0m
+[0;1;31m1 error[0;2m - 1 file checked - 1.1 ms[0m
+[0;1;32mok[0;2m - 14 files checked - 0.5 ms[0m
+[0;1;31m2 errors[0;2m - [0;1;33m3 warnings[0m
+1 error · 1 file checked · 1.1 ms
+ok · 14 files checked · 0.5 ms · nothing changed
+2 errors · 3 warnings · 1 fixable: blaze check --fix · 213 files checked · 2.4 s

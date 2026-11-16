@@ -24,7 +24,7 @@ use std::{
 };
 
 use blaze_http::{
-    Client, Config, Request,
+    Client, Config, Method, Range, Request,
     driver::{Fetched, Handle},
     mailbox::{self, Rx, Tx},
 };
@@ -79,12 +79,12 @@ pub fn request(access: &Access, op: Op, unix_s: u64) -> Result<(Request, Want), 
     let anonymous = anonymous(&op);
     if anonymous && let Some(public_url) = &access.public_url {
         let url = s3::public(public_url, op.name());
-        let (method, want, most, headers) = match op {
-            Op::Get { range: Some((at, len)), most, .. } => (http::Method::GET, Want::Get { ranged: true }, most.min(len), vec![("range".to_owned(), format!("bytes={at}-{}", at + len.max(1) - 1))]),
-            Op::Get { most, .. } => (http::Method::GET, Want::Get { ranged: false }, most, Vec::new()),
-            _ => (http::Method::HEAD, Want::Head, 0, Vec::new()),
+        let (method, want, most, range) = match op {
+            Op::Get { range: Some((at, len)), most, .. } => (Method::Get, Want::Get { ranged: true }, most.min(len), Some(range_of(at, len))),
+            Op::Get { most, .. } => (Method::Get, Want::Get { ranged: false }, most, None),
+            _ => (Method::Head, Want::Head, 0, None),
         };
-        return Ok((Request { method, url, headers, body: Vec::new(), gzip: false, most, https_only: true }, want));
+        return Ok((Request { method, url, headers: Vec::new(), body: Vec::new(), gzip: false, most, https_only: true, range }, want));
     }
     let (Some(endpoint), Some(bucket), Some(credentials)) = (&access.endpoint, &access.bucket, &access.credentials) else {
         let mut missing = Vec::new();
@@ -104,27 +104,42 @@ pub fn request(access: &Access, op: Op, unix_s: u64) -> Result<(Request, Want), 
     };
     let name = op.name().to_owned();
     let sign = |method: &str, query: &[(&str, &str)], extra: &[(&str, String)], body: &[u8]| s3::sign(method, endpoint, bucket, &name, query, extra, body, credentials, unix_s);
+    let op_range = match &op {
+        Op::Get { range, .. } => *range,
+        _ => None,
+    };
     let (method, want, most, signed, body) = match op {
         Op::Get { range, most, .. } => {
             let extra: Vec<(&str, String)> = range.map(|(at, len)| ("range", format!("bytes={at}-{}", at + len.max(1) - 1))).into_iter().collect();
             let most = range.map_or(most, |(_, len)| most.min(len));
-            (http::Method::GET, Want::Get { ranged: range.is_some() }, most, sign("GET", &[], &extra, b""), Vec::new())
+            (Method::Get, Want::Get { ranged: range.is_some() }, most, sign("GET", &[], &extra, b""), Vec::new())
         }
-        Op::Head { .. } => (http::Method::HEAD, Want::Head, 0, sign("HEAD", &[], &[], b""), Vec::new()),
-        Op::Put { bytes, cond, .. } => (http::Method::PUT, Want::Put, XML_MOST, sign("PUT", &[], &cond_header(&cond), &bytes), bytes),
-        Op::Begin { .. } => (http::Method::POST, Want::Begin, XML_MOST, sign("POST", &[("uploads", "")], &[], b""), Vec::new()),
+        Op::Head { .. } => (Method::Head, Want::Head, 0, sign("HEAD", &[], &[], b""), Vec::new()),
+        Op::Put { bytes, cond, .. } => (Method::Put, Want::Put, XML_MOST, sign("PUT", &[], &cond_header(&cond), &bytes), bytes),
+        Op::Begin { .. } => (Method::Post, Want::Begin, XML_MOST, sign("POST", &[("uploads", "")], &[], b""), Vec::new()),
         Op::Part { upload, number, bytes, .. } => {
             let number = number.to_string();
-            (http::Method::PUT, Want::Part, XML_MOST, sign("PUT", &[("partNumber", number.as_str()), ("uploadId", upload.as_str())], &[], &bytes), bytes)
+            (Method::Put, Want::Part, XML_MOST, sign("PUT", &[("partNumber", number.as_str()), ("uploadId", upload.as_str())], &[], &bytes), bytes)
         }
         Op::Finish { upload, parts, cond, .. } => {
             let body = s3::complete_body(&parts);
-            (http::Method::POST, Want::Finish, XML_MOST, sign("POST", &[("uploadId", upload.as_str())],&cond_header(&cond), &body), body)
+            (Method::Post, Want::Finish, XML_MOST, sign("POST", &[("uploadId", upload.as_str())],&cond_header(&cond), &body), body)
         }
     };
-    // The client sends its own host header; the signed one is the same value.
-    let headers = signed.headers.into_iter().filter(|(k, _)| k != "host").collect();
-    Ok((Request { method, url: signed.url, headers, body, gzip: false, most, https_only: true }, want))
+    // The client writes `Host` and `Range` itself, from the URL and the typed range; the signed
+    // values are the same bytes (`bytes=a-b`), so the signature holds.
+    let range = match op_range {
+        Some((at, len)) => Some(range_of(at, len)),
+        None => None,
+    };
+    let headers = signed.headers.into_iter().filter(|(k, _)| k != "host" && k != "range").collect();
+    Ok((Request { method, url: signed.url, headers, body, gzip: false, most, https_only: true, range }, want))
+}
+
+/// The inclusive byte range `len` bytes from `at` covers, as the client writes it (`bytes=a-b`);
+/// one byte at least.
+fn range_of(at: u64, len: u64) -> Range {
+    Range { first: at, last: Some(at + len.max(1) - 1) }
 }
 
 fn header<'h>(headers: &'h [(String, String)], name: &str) -> Option<&'h str> {
@@ -196,7 +211,9 @@ impl HttpBucket {
             });
         }
         let access = Access { endpoint: bucket.endpoint.clone(), bucket: bucket.name.clone(), public_url: bucket.public_url.clone(), credentials: settings.credentials.clone() };
-        let tls = blaze_http::roots::native().map_err(|e| Failure::Misused(format!("the machine's TLS roots: {e}")))?;
+        let (cert_file, cert_dir) = (std::env::var_os("SSL_CERT_FILE"), std::env::var_os("SSL_CERT_DIR"));
+        let places = blaze_http::roots::Places { cert_file: cert_file.as_deref(), cert_dir: cert_dir.as_deref() };
+        let tls = blaze_http::roots::system(places).map_err(|e| Failure::Misused(format!("the machine's TLS roots: {e}")))?;
         let proxies = blaze_http::proxy_env::from_env().map_err(|e| Failure::Misused(format!("the proxy settings: {e}")))?;
         let config = Config { idle_most: crate::push::IN_FLIGHT, proxies, redirects: 0, ..Config::new(tls, "blaze (https://github.com/indexable-inc/blaze)", Duration::from_secs(30)) };
         let http = Handle::spawn(Client::new(config), crate::push::IN_FLIGHT).map_err(|e| Failure::Misused(format!("starting the cache's HTTP driver: {e}")))?;

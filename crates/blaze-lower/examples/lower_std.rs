@@ -17,7 +17,13 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
+use blaze_expand::{
+    DefAt, DefSite, ExpandCx, Export, HostAsk, HostError, HostWhy, IncludeAs, Included, LocalInner, MacroDefinition,
+    NestedKind, Place, PlaceOf, Prepared, ProcCall, Produced, TokenStream, find_calls, lex, prepare,
+};
+use blaze_id::CrateItemKey;
 use blaze_ids::ContentId;
+use blaze_lower::by_name::ByName;
 use blaze_lower::{
     Cfg, CfgAnswer, Edition, Expand, Expansion, FileStats, ItemRef, Outcome, Sink, What, lower_file,
 };
@@ -44,13 +50,111 @@ impl Cfg for Host {
     }
 }
 
-/// No expander: every item macro call is counted, not expanded.
+/// No expander (`--no-expand`): every macro call is counted, not expanded.
 struct NoExpand;
 
 impl Expand for NoExpand {
-    fn expand(&mut self, _: &str, _: &str, _: Edition, _: &mut blaze_own::AString<'_>) -> Expansion {
+    fn expand(&mut self, _: &str, _: &str, _: Edition, _: &mut dyn Cfg, _: &mut blaze_lower::BodyOut<'_>) -> Expansion {
         Expansion::Unsupported
     }
+    fn expand_body(&mut self, _: blaze_lower::BodyCall<'_>, _: &mut dyn Cfg, _: &mut blaze_lower::BodyOut<'_>) -> Expansion {
+        Expansion::Unsupported
+    }
+    fn derive(
+        &mut self,
+        _: &str,
+        _: &blaze_expand::TokenStream<'_>,
+        _: blaze_expand::DeriveFacts,
+        _: Edition,
+        _: &mut blaze_lower::BodyOut<'_>,
+    ) -> Expansion {
+        Expansion::Unsupported
+    }
+    fn attr(
+        &mut self,
+        _: &str,
+        _: Option<&blaze_expand::TokenStream<'_>>,
+        _: &blaze_expand::TokenStream<'_>,
+        _: Edition,
+        _: &mut blaze_lower::BodyOut<'_>,
+    ) -> Expansion {
+        Expansion::Unsupported
+    }
+}
+
+/// The census's host for expansions: an empty environment, no files to include, and no
+/// answer for a position (each such call is counted as failed, never guessed); `cfg!` answered
+/// under [`Host`]'s cfg set.
+struct Census;
+
+impl ExpandCx for Census {
+    fn env(&self, _: &str) -> Result<Option<&str>, HostError> {
+        Ok(None)
+    }
+    fn cfg(&self, predicate: &TokenStream<'_>) -> Result<bool, HostError> {
+        blaze_lower::cfg_outcome(predicate, &mut Host, Alloc::global())
+    }
+    fn include(&self, _: &str, _: IncludeAs) -> Result<Included<'_>, HostError> {
+        Ok(Included::Missing)
+    }
+    fn place(&self, _: PlaceOf) -> Result<Place<'_>, HostError> {
+        Err(HostError { ask: HostAsk::Place, why: HostWhy::Refused })
+    }
+    fn run_proc_macro<'a>(
+        &self,
+        _: &MacroDefinition<'_>,
+        _: ProcCall<'_>,
+        _: Alloc<'a>,
+    ) -> Result<Produced<'a>, HostError> {
+        Err(HostError { ask: HostAsk::ProcMacro, why: HostWhy::Refused })
+    }
+}
+
+fn def_at() -> DefAt {
+    DefAt {
+        site: DefSite { krate: CrateItemKey(ContentId([1; 32])), module: None },
+        edition: Edition::E2024,
+        export: Export::Exported,
+        local_inner: LocalInner::No,
+        transparency: None,
+    }
+}
+
+/// Every `macro_rules!` definition in `texts`, by name, compiled once (leaked: they live as
+/// long as the run). A definition `prepare` refuses is counted and left out.
+fn definitions(texts: &[String]) -> (&'static [(&'static str, Prepared<'static>)], usize) {
+    let mut defs = Vec::new();
+    let mut refused = 0;
+    for text in texts {
+        let Ok(stream) = lex(text, Edition::E2024, Alloc::global()) else { continue };
+        let stream: &'static TokenStream<'static> = Box::leak(Box::new(stream));
+        let Ok(found) = find_calls(stream, Alloc::global()) else { continue };
+        for call in found.iter() {
+            let Some(name_at) = call.name else { continue };
+            let inner = call.inner();
+            let Ok(body) = stream.copy_in(inner.start as usize..inner.end as usize, Alloc::global()) else { continue };
+            let def = match call.kind {
+                NestedKind::MacroRules => MacroDefinition::rules(body, def_at()),
+                NestedKind::Macro2 => {
+                    let params = match call.params {
+                        None => None,
+                        Some(p) => match stream.copy_in(p.start as usize + 1..p.end as usize - 1, Alloc::global()) {
+                            Ok(params) => Some(params),
+                            Err(_) => continue,
+                        },
+                    };
+                    MacroDefinition::macro2(params, body, def_at())
+                }
+                _ => continue,
+            };
+            let def: &'static MacroDefinition<'static> = Box::leak(Box::new(def));
+            match prepare(def) {
+                Ok(prepared) => defs.push((stream.text_at(name_at as usize), prepared)),
+                Err(_) => refused += 1,
+            }
+        }
+    }
+    (Box::leak(defs.into_boxed_slice()), refused)
 }
 
 #[derive(Default)]
@@ -66,18 +170,26 @@ struct Tally {
 }
 
 impl Sink for Tally {
-    fn record(&mut self, item: &ItemRef<'_>, _what: What, _key: ContentId, outcome: Outcome<'_, '_>) {
+    fn refused(&mut self, item: &ItemRef<'_>, refusal: blaze_lower::Refusal<'_>) {
+        let entry = self.unhandled.entry(format!("macro call refused ({:?})", refusal.bound)).or_default();
+        entry.count += 1;
+        if entry.examples.len() < 3 {
+            entry.examples.push(format!("{} on {}", refusal.path, item.item_text().chars().take(60).collect::<String>().replace('\n', " ")));
+        }
+    }
+
+    fn record(&mut self, _item: &ItemRef<'_>, _what: What, _key: ContentId, outcome: Outcome<'_, '_>) {
         let Outcome::Record { view, .. } = outcome else {
             self.needs += 1;
             return;
         };
-        let text = item.item_text();
         for u in view.unhandled() {
             let kind = format!("{:?} ({:?})", blaze_file_items::syntax_kind(u.syntax), u.why);
             let entry = self.unhandled.entry(kind).or_default();
             entry.count += 1;
             if entry.examples.len() < 3 {
-                let snippet: String = u.range.get(text).unwrap_or("<out of the item>").chars().take(80).collect();
+                let snippet: String =
+                    view.text_at(u.range).unwrap_or("<no text at this range>").chars().take(80).collect();
                 entry.examples.push(snippet.replace('\n', " "));
             }
         }
@@ -98,14 +210,21 @@ fn add(into: &mut FileStats, s: &FileStats) {
     into.macro_calls_failed += s.macro_calls_failed;
     into.macro_calls_too_deep += s.macro_calls_too_deep;
     into.body_items += s.body_items;
+    into.body_calls_expanded += s.body_calls_expanded;
     into.unhandled += s.unhandled;
     into.record_bytes += s.record_bytes;
 }
 
 fn main() {
-    let mut args = std::env::args_os().skip(1);
+    let mut args = std::env::args_os().skip(1).peekable();
+    let expanding = if args.peek().is_some_and(|a| a == "--no-expand") {
+        args.next();
+        false
+    } else {
+        true
+    };
     let Some(library) = args.next().map(PathBuf::from) else {
-        eprintln!("usage: lower_std <rust-src>/library [threads]");
+        eprintln!("usage: lower_std [--no-expand] <rust-src>/library|<crate dir> [threads]");
         std::process::exit(2);
     };
     let threads: usize = match args.next().map(|a| a.to_string_lossy().parse()) {
@@ -117,7 +236,12 @@ fn main() {
         }
     };
     let mut files: Vec<PathBuf> = Vec::new();
-    let mut stack: Vec<PathBuf> = ["core", "alloc", "std"].iter().map(|c| library.join(c).join("src")).collect();
+    // A library's core, alloc and std, or one crate's `src`.
+    let mut stack: Vec<PathBuf> = if library.join("core").join("src").is_dir() {
+        ["core", "alloc", "std"].iter().map(|c| library.join(c).join("src")).collect()
+    } else {
+        vec![library.join("src")]
+    };
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             eprintln!("not a directory that reads: {}", dir.display());
@@ -154,11 +278,26 @@ fn main() {
         std::hint::black_box(output.steps().count());
     });
 
+    // The definitions the expander finds by name: the texts' own `macro_rules!`, compiled
+    // once a thread (a stream's allocator handle is not shared across threads). The first
+    // file of each thread pays for it inside the lowering's time.
+    thread_local! {
+        static RULES: std::cell::OnceCell<(&'static [(&'static str, Prepared<'static>)], usize)> =
+            const { std::cell::OnceCell::new() };
+    }
+    let rules_of = || RULES.with(|r| *r.get_or_init(|| if expanding { definitions(&texts) } else { (&[][..], 0) }));
+    let (rule_count, refused_rules) = {
+        let (rules, refused) = rules_of();
+        (rules.len(), refused)
+    };
+
     let total = Mutex::new(FileStats::default());
     let tally = Mutex::new(Tally::default());
     let took = run(&texts, threads, |text| {
         let mut mine = Tally::default();
-        let stats = lower_file(text, Edition::E2024, &mut Host, &mut NoExpand, &mut mine, Alloc::global());
+        let mut by_name = ByName::new(rules_of().0, def_at(), Census, Alloc::global());
+        let expand: &mut dyn Expand = if expanding { &mut by_name } else { &mut NoExpand };
+        let stats = lower_file(text, Edition::E2024, &mut Host, expand, &mut mine, Alloc::global());
         add(&mut total.lock().expect("no thread panicked holding the stats"), &stats);
         let mut all = tally.lock().expect("no thread panicked holding the tally");
         all.needs += mine.needs;
@@ -184,6 +323,14 @@ fn main() {
         "not lowered: use/extern crate/macro_rules/macro {} (by design) | outline errors {} | item macro calls: {} expanded, {} no expander, {} failed, {} too deep",
         s.not_lowered, s.errors, s.macro_calls_expanded, s.macro_calls_unsupported, s.macro_calls_failed, s.macro_calls_too_deep
     );
+    match expanding {
+        true => println!(
+            "expander: by name over {} `macro_rules!` and `macro` ({refused_rules} refused by `prepare`) and the builtins | body calls expanded {}",
+            rule_count,
+            s.body_calls_expanded
+        ),
+        false => println!("expander: none (--no-expand)"),
+    }
     println!("unhandled forms: {} in all", s.unhandled);
     let mut by_count: Vec<_> = t.unhandled.iter().collect();
     by_count.sort_by(|a, b| b.1.count.cmp(&a.1.count).then(a.0.cmp(b.0)));

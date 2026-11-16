@@ -538,7 +538,8 @@ fn each_planted_bug_is_caught() {
             Plant::BarriersNotKept
             | Plant::RenameFlushesOthers
             | Plant::PutBackWithBarriers
-            | Plant::SyncCoversLess => {
+            | Plant::SyncCoversLess
+            | Plant::FileSyncKeepsName => {
                 unreachable!("{plant:?} is the disk's, caught by its own controls (sim/world.rs)")
             }
         })

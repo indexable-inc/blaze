@@ -311,11 +311,19 @@ impl World {
                 let bytes = self.disk.files.get(file.as_str()).map(|it| it.bytes.clone());
                 (tag, Done::Read(bytes.unwrap_or_default()))
             }
-            Ask::Look(Effect::Entries { dir, tag }) => match self.disk.dirs.contains_key(dir.as_str()) {
+            // The watcher lists the directories under its workspace, never the driver's root.
+            Ask::Look(Effect::Entries { dir: blaze_core::DirName::Root, .. }) => {
+                panic!("the watcher listed the driver's root")
+            }
+            Ask::Look(Effect::Entries { dir: blaze_core::DirName::Named(dir), tag }) => match self.disk.dirs.contains_key(dir.as_str()) {
                 true => {
                     let children = self.disk.children(dir.as_str());
-                    let entries = children.iter().map(|it| (name(it), self.disk.stamp(it)));
-                    (tag, Done::Entries(entries.collect()))
+                    let mut listed = blaze_core::ListingBuilder::new(dir.clone());
+                    for it in &children {
+                        let leaf = &it[dir.as_str().len() + 1..];
+                        listed.push(leaf.as_bytes(), self.disk.stamp(it)).unwrap();
+                    }
+                    (tag, Done::Entries(Box::new(listed.finish().unwrap())))
                 }
                 false => (tag, Done::Failed(IoError(format!("{dir}: not a directory")))),
             },

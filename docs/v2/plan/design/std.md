@@ -191,6 +191,17 @@ program about 1.0 ms and 11 M instructions (measured 2026-11-16). So:
   before the load), and an error naming the framework and symbol when either is absent, with no
   fallback. A test finds every symbol on the OS it runs on. blaze-core's FSEvents driver is the
   first (`fsevents.rs`, `Frameworks`): a check that never watches loads neither framework.
+- **The command line and environment are read where the kernel left them**, never copied.
+  `Args` and `Env` are views over the process's start block (`bstd::rt::block`): on macOS through
+  `_NSGetArgv`/`_NSGetArgc`/`_NSGetEnviron` (libSystem's `crt_externs.h`), on Linux through the
+  `(argc, argv, envp)` glibc hands each `.init_array` function. At start the arguments are
+  checked to be UTF-8 (a refusal names the first that is not) and the environment's pointer
+  array is taken, nothing more: a variable is found by a scan when asked, a non-UTF-8 one is
+  unset, and nothing is sorted. A world from a run spec, or a simulated one, holds owned text
+  instead: one type, two sources. An ordinary start's `RunSpec` holds no command line,
+  environment or directory: the program's world reads the process's own. The current directory
+  is not read at start: the native driver's root is `.`, made absolute only where a call needs
+  an absolute path (a watch, a sandbox's scratch folder).
 - **The binary is linked with `-dead_strip_dylibs`** on macOS (blaze-cli's `build.rs`), and
   `tests/links.rs` fails when `blaze` links anything but libSystem.
 
@@ -267,6 +278,46 @@ worth testing with no host, or reused under several drivers.
 A program can also be a machine at the top: `impl Worker { fn event(&mut self, cx, ev) }`, called
 once per batch with no runtime underneath. That is the right shape for a wasm guest and for the
 hottest paths.
+
+### Every reach goes through the driver
+
+Everything a program does outside its own memory goes through one seam: the driver behind its
+`Io` (`io.rs`, `Backend`: the native driver, the simulation, or a host's table in a hosted run,
+run.md "The hosted world"). Record, replay, a fake, a dry run and asking all hold a run by holding
+that seam. A text check in the crate's tests (`tests/reach.rs`) keeps it true: no file but the
+backends (`rt.rs`, `rt/`, `native.rs`, and the one line of `io.rs` that makes the native driver)
+names a system call or a std function that reaches the system. It sees names, not calls: an
+aliased import, a macro-built path, another crate that reaches the system itself, or inline
+assembly are outside it.
+
+Inventory, as built on 2026-11-16. "Varies" says whether two runs can answer differently, so a
+replay must supply the answer.
+
+| capability | how it reaches the system | varies |
+|---|---|---|
+| arguments (`need_args`) | given to the world by the launcher when the driver is opened (native: a view of the kernel's start block; spec: the spec's; hosted: the table's `arg`), held, read in place | yes |
+| environment (`need_env`) | as arguments (hosted: none yet) | yes |
+| standard input | no capability yet | (yes) |
+| output and error (`need_out`, `need_err`) | `Backend::write_out`, one call per flush of an `Out`'s buffer, made on the calling thread: native through `rt::write_out`, simulated into `SimHost`, hosted the table's `write`. Not an `Effect`: the native driver performs one on a thread per stream, which `hello` cannot pay for | no |
+| files (`need_fs`) | `Effect`s through `Io::submit` and `Io::poll` | yes |
+| monotonic clock (`need_clock`, `Clock::now`) | `Backend::now`, a reading through the driver per call (hosted: the table's `clock`). Not an `Effect`: a reading per call as an effect costs a wait per `now` | yes |
+| wall clock (`Clock::wall`) | `Backend::wall_ns`, as above | yes |
+| since process start (`Clock::since_process_start`) | the host facts' `born`, read once at open (`native.rs`) | yes |
+| sleeping (`Clock::sleep`) | `Effect::Timer` | yes |
+| randomness (`need_rng`) | one `Effect::Random` of 8 bytes at the first ask, kept as the seed; every number after is SplitMix64's from it, so the seed replays them all | yes |
+| host facts (`need_host`: pid, cores, name, build id) | read once at open by the native backend (`native.rs`), kept in the world | yes |
+| memory (`need_mem`) | inside the process (frames, arenas); nothing reaches out | no |
+| network (`need_net`) | `Effect`s | yes |
+| child processes (`Procs`) | simulation only (`SimHost`); no native provider | (yes) |
+| terminal, keys, roots, locale, user, code, windows, automation, opener, power, sound, devices, http and streams by the host | simulation only (`SimHost`); a native world withholds them | (yes) |
+| exit (`Host::exit`, end of `main`) | direct by design: flush, then `rt::exit` (hosted: the table's `exit`) | no |
+| the entry's last words (`rt::error_line`) and the manifest a launcher prints | direct, in `rt`, before or after any world | no |
+| the scheduler's clock and the machine's topology (`rt::pool`, `rt::machine`) | direct, in `rt`: they decide where work runs, never what a program sees | no |
+
+Bypasses counted before this change: three. The host facts were read in `Io::native` (cores,
+process age, pid, build id): now in `native.rs`, the native backend. Output was written by
+`Io::write_out` calling `rt::write_out` itself: now `Backend::write_out`. The generator's seed was
+std's `RandomState`, then `std::random` in `Io::rng`: now one `Effect::Random`.
 
 ### When a capability is missing
 
@@ -571,7 +622,17 @@ rt.rs). Each point below says whether it is built (**built**) or designed only (
    single order, so either the sleeper sees the task or the spawner sees the sleeper: no wake is
    lost. The wake itself is a compare-and-swap of the sleeper's state `Parked -> Searching` and an
    unpark (a token: an unpark before the park makes the park return). A blaze-check model runs
-   this protocol on the shims with a planted wake that skips the fence.
+   this protocol on the shims with a planted wake that skips the fence. The lazy start (a
+   pool's threads begun by its first spawn, `Pool::begin`'s compare-and-swap) is modelled too:
+   two first spawns at once start the worker once and lose neither task, and a begin without
+   its compare-and-swap is caught with its own message. Run 2026-11-16 on snapshot 6f08c0ba7e
+   (`--cfg blaze_check`, release): `model_lazy_start` 2 passed, `model_idle` 2 passed,
+   `model_deque` 3 passed, every planted control caught. A `must_overlap` task is reserved
+   for the worker whose mailbox holds it, and its joiner can never claim it (task/claim.rs:
+   the state says which kind it is, and the joiner's claim takes only open tasks); before the
+   lazy start that held only by timing. Modelled as a joiner racing the worker's arrival, with
+   a planted joiner claim of a reserved task: run 2026-11-16 on snapshot b4bf3a4528,
+   `model_claim` 2 passed, the plant caught.
 5. **Placement** (**built**). On Linux each worker is pinned to its CPU (`sched_setaffinity`),
    so first touch keeps its frame on its node. macOS has no affinity: each worker sets a QoS
    class instead (`pthread_set_qos_class_self_np`, rule macos-private-apis: a public but
@@ -750,6 +811,367 @@ substitute:
 | an unsynced rename or publish that costs no sync on a real disk | built: an `_unsynced` call renames by `Effect::RenameUnsynced`; only a `_synced` one by the syncing `Effect::Rename`. The unsynced rename takes the caller's `Unsynced`, the synced one gives the proof `sync_names` takes; `tests/syncs.rs` asserts each call's effects, with a plant for each mistake | |
 | a read that does not copy | `Done::Read` hands back a buffer the driver made, copied into the caller's `Bytes` | the page pool (`file.pin`, S1f) |
 | a write that does not copy | each write's bytes are copied once into the effect, which owns them | registered buffers (`WriteFrom`), with S4 |
+
+**Folders above the start folder** (decided 2026-11-16; a command finds its workspace's manifest
+above the folder it was started in). `fs.ancestors(cx)` yields a `Dir<ReadOnly>` per folder
+above the start, nearest first, ending at the granted top: the filesystem's root for a command,
+the run spec's directory itself (so none) for a launched program unless its grant names more
+levels. An ancestor is named relative to the start, by leading `..` steps alone (`..`,
+`../..`), and its files beneath it the same way (`../Cargo.toml`): the driver's root stays the
+start folder, so no absolute path enters a name or a key, and the kernel walks no more of a path
+than before. The depth is read through the driver once, at the first call (the start's own
+names in each ancestor, one `getcwd`), never at start. A name that walks back down into the start
+(`../proj/x` for `x`) is refused, so one file has one name; the ancestors are read-only.
+Built: blaze-core's `Above` (made only by `Ancestors::above` on the driver's answer to
+`Effect::Ancestors`, taken only by the reading `Effect::Above`) and bstd's `fs.ancestors(cx)`,
+an `Ancestor` with `stat`, `read_all` and `list` and nothing that writes.
+
+**One level of a folder is columns** (built 2026-11-16). `Effect::Entries` completes with
+`Done::Entries(Box<Listing>)` (blaze-core `listing.rs`): the leaf names in one byte buffer with
+`u32` ends (blaze-own's `SortedTexts`), and beside them a `Stamp` column and a `Kind` column
+(file, dir, link, other, gone, unknown). It is sorted by the names' bytes, whatever order the
+kernel gave (rule 25), so `find(leaf)` and `find_file(dir/leaf)` are binary searches and two
+drivers give equal listings. Every driver builds it through one `ListingBuilder`: getattrlistbulk
+on macOS (`fs/bulk.rs`), `read_dir` plus `statx` elsewhere, WASI, IOCP, and the simulation's
+journal. The rule for what is not a name: `.` and `..` are skipped; an empty name, or one holding
+`/` or NUL, is `ListingError::NotAName`; bytes that are not UTF-8 (Linux allows them) fail the
+whole listing with `NotUtf8`, naming the folder and the name escaped, since blaze's names are
+text; a name twice is `Twice`. The caps are 2^20 entries and 64 MiB of names, each refused by
+a typed error naming the folder (`TooManyEntries`, `TooManyNameBytes`); memory comes by
+`try_reserve`, refused as `OutOfMemory`. No adapter rebuilds the old pairs: blaze-vfs (`watch.rs`,
+which now finds a relisted file by binary search instead of a hash map), blaze-solo, blaze-cas
+`peers.rs` and blaze-storemodel read the columns. bstd's `Dir::entries(cx, path) ->
+Result<Option<Entries>, FsError>` is the one-level listing for programs: `None` for a folder
+not there, `NotADirectory` for a file, then by index `name(i)`, `kind(i)`, `len_of(i)`,
+`path(i)`, `find(name)` and `iter()`. The recursive `Effect::List` (`Done::Listed`, pairs of
+name and `Meta`) is unchanged; its callers are blaze-cas `lib.rs` and `plain/core.rs`,
+blaze-certify `kept.rs`, blaze-profile `history/files.rs`, blaze-storemodel and bstd `fs.rs`.
+Cost, measured by `fs/bulk.rs`'s ignored `listing_cost`: see the table under "For a successor".
+
+A known gap, not closed by this: **a link inside the root is followed out of it.** The native
+drivers open a `FileName` as the root's path joined with the name, through calls that follow
+symbolic links at every component but the last (the last too, except where an effect says
+`O_NOFOLLOW`), and Linux's `openat(AT_FDCWD, ..)` has no `RESOLVE_BENEATH`. So `FileName`
+keeps `..` out of the text, but a link in the tree (`src -> /etc`) still reaches outside the
+root. Closing it: on Linux, `openat2` with `RESOLVE_BENEATH` (and `RESOLVE_NO_MAGICLINKS`)
+from the root's descriptor for every open, `statx` and directory read; on macOS, which has no
+`openat2`, `openat` from the root's descriptor with `O_RESOLVE_BENEATH` (0x1000, in this SDK's
+`sys/fcntl.h`, with `AT_RESOLVE_BENEATH` for the `*at` calls), or `O_NOFOLLOW_ANY` (0x20000000)
+where no link at all is wanted; both are in the macOS 27 SDK.
+
+**The disk model's gap (closed 2026-11-16 by the strict name rule; see the second hand-off's
+item 3 below; kept as its history).** The simulation (blaze-core's `Sim`, and the model it refines,
+`blaze_core::world::disk`) ties a rename's durability to the renamed file, not to its
+directory. Two ways:
+- **Stricter than a disk:** `Effect::SyncDir` makes nothing durable in it, so an unsynced
+  rename whose directory was synced afterwards can still be undone by a crash. A real disk keeps
+  it. `sim.rs`'s `a_rename_kept_by_its_directorys_sync_survives_a_crash` fails on purpose
+  (`should_panic`) until this is fixed. This side hides no loss, but it fails correct code.
+- **Looser than a disk:** a file sync that leaves no change unsynced clears the file's undo
+  (`File::sync`: "nothing is left to undo"), so a crash keeps the rename. On a real disk that
+  needs the directory's sync. This side can hide a bug: rename unsynced, sync the file, never
+  sync the directory. The simulation passes it; a crash on APFS or XFS can put the old file
+  back. The first side even pushes code toward this, since the file sync is what makes the
+  simulation keep the rename.
+
+The proved statement that rests on the loose rule is
+`blaze_core.world.disk.a_crash_keeps_a_synced_file` (`crates/blaze-core/lean/BlazeCore/World/Disk.lean`).
+Closing the gap means moving the undo from the file to its directory: the directory's sync
+clears it, and the file's sync does not. That restates this theorem and
+`a_synced_append_survives_a_crash`. The Lean sources are unchanged until then.
+
+**For a successor** (2026-11-16, the bstd-items lane, handing off three items the coordinator
+set in this order):
+
+1. **The listing as columns.** Done (2026-11-16, see "One level of a folder is columns"; no
+   `pairs` adapter was kept, by the coordinator's brief). Measured on APFS, macOS arm64, best
+   of 100 interleaved runs, `listing_cost`:
+
+   | entries | floor: one getattrlistbulk pass | columns | old pairs |
+   |---|---|---|---|
+   | 1,000 | 380 µs, 1 allocation | 442 µs (1.16x), 35 allocations, 58 KB kept | 470 µs, 1,010 allocations |
+   | 10,000 | 7.53 ms, 1 allocation | 8.48 ms (1.13x), 47 allocations, 580 KB kept | 8.39 ms, 10,014 allocations |
+
+   What stays above the floor: the growth of the two columns (no size is known before the
+   pass; `ATTR_DIR_ENTRYCOUNT` of the folder would give one) and the sort's copy, since APFS
+   does not return names in byte order. Item as first written:
+   - Replace `Done::Entries(Vec<(FileName, Stamp)>)`, the one-level listing, with a sorted `Listing`. It holds:
+     - `names: Vec<u8>`, all the names in one buffer;
+     - `ends: Vec<u32>`, the offset where each name ends;
+     - parallel `stamps` and `kinds` columns.
+   - Keep the old pairs only as an adapter (`Listing::pairs`). Leave the recursive `Effect::List` as it is, and list its callers: blaze-cas `lib.rs` and `plain/core.rs`, blaze-certify `kept.rs`, blaze-profile `history/files.rs`, blaze-storemodel, and bstd `fs.rs`.
+   - Port every `Entries` consumer in one batch:
+     - blaze-vfs `watch.rs` and `watch/reference.rs`;
+     - blaze-solo `run.rs`;
+     - blaze-cas `peers.rs`;
+     - blaze-storemodel `fs.rs`;
+     - blaze-core: sim, `journal.rs`, and the drivers `fs/bulk.rs` (getattrlistbulk), `fs/wasi.rs` and the statx path.
+   - Count the allocations of a listing of 1,000 entries before and after.
+   - Then build bstd's `Dir::entries(&self, cx, path, frame) -> Result<Option<Vec<(Path, Meta), &Frame>>, FsError>`: one level, `None` when the folder is absent, sorted by name. When it lands, tell the driver lane (agent a11fa75d6a6d4471e).
+   - `FileName` stays unchanged: 1313 mentions in 141 files across 17 crates, 256 fields typed `FileName`, 168 collections of it.
+2. **Make the disk model strict** (see "The disk model's gap" above).
+   - A create, rename or unlink is durable only once its directory is synced. A file's sync makes its bytes durable, never its name. `SyncDir` makes the names in that directory durable.
+   - In code: the undo moves from `File` to its directory, in `blaze_core::world::disk` and in `Sim`'s `SimFile::undo` and `flushed`, where a file sync clears the undo today. The `SyncDir` arm in `Sim::complete` and in `world/asks.rs` then clears the undos of names in that directory.
+   - Say which call the macOS driver makes for a file sync and a directory sync (F_FULLFSYNC), and that the model matches it.
+   - `a_rename_kept_by_its_directorys_sync_survives_a_crash` then loses its `should_panic`.
+   - Run every test that crashes the simulated disk: blaze-core, blaze-std, blaze-cas, blaze-drive's seal and `last`, the store, blaze-remote. Classify each new failure:
+     - a real missing directory sync in the code under test: send the tape to that crate's lane;
+     - a test that leaned on the loose rule: fix the test.
+     Never weaken the model to make a test pass.
+   - Report how `blaze_core.world.disk.a_crash_keeps_a_synced_file` must change (its file must also have had its name synced) and which proofs use it. Find them with `rg a_crash_keeps_a_synced_file crates/blaze-core/lean lean`. Edit the Lean only where the proofs build here.
+3. **Close the symlink gap above.**
+   - Every open, stat, list and rename target under a `Dir`, and under the driver's root, resolves beneath its root:
+     - macOS: `O_RESOLVE_BENEATH` and `AT_RESOLVE_BENEATH`, from this SDK's `sys/fcntl.h`;
+     - Linux: `openat2` with `RESOLVE_BENEATH`.
+   - Probe once at start, with a real escaping link in a scratch folder, that the kernel honours the flag.
+   - Where a host has neither, stop with a typed error naming what is missing. Never fall back to following links.
+   - A link that stays beneath the root keeps working. One that leaves is a typed refusal naming the path and the link.
+   - The simulation gets links under the same rule in `SimWorld`. Add a property test (no sequence of names, links and renames reaches outside the root) and a planted bug (the flag left off one call) that the test catches.
+   - Measure 1,000 opens with the flag and 1,000 without.
+
+State at hand-off: items 5, 7 and 8 are accepted. Their code is in the tree and passes: blaze-std "241 passed, 0 failed". None of the three items above is started.
+
+**For a successor (2026-11-16, second hand-off, the bstd and effect-layer lane)**
+
+1. **Listing a folder as columns: done and accepted.** On top of that, `Effect::Entries { dir }` now takes a `DirName`, and `DirName::Root` lists the driver's root. This is built in every driver, the simulation and blaze-storemodel. `Dir::own_entries(cx)` lists a `Dir` itself, whether it is the root or a named folder. `Entries::folder()` returns `Option<&Path>`. The every-driver test lists the root. Results: blaze-core 365 passed, blaze-std 252, blaze-vfs 138. The driver lane (agent af4ff0d27ddf27bfd) uses `own_entries` for its sweep's root.
+
+2. **The two blaze-cas controls bite again.** Both had been failing since at least 2026-11-14 (the notes' port27 list). In both cases the test had gone blind; the simulation was not at fault.
+   - `layers::the_oracle_catches_a_record_visible_before_its_outputs`: the outputs were put while the record's commit was still in flight. The store's commit takes puts made during it, so the record and its outputs became durable together. Fix: a `LayerOp::Settle` after the record's flush.
+   - `place_crash::the_oracle_catches_a_derived_file_accepted_as_a_crash_left_it`: the test's reopen set `store.plant` only after `drive` had already run the open's sweep of `placed/`. That sweep removed the torn `.derived` file before the plant could keep it. The crash did tear the file: in 94 of 192 runs it was left torn. Fix: set the plant before the open is driven.
+   - The cause was tested both ways for each fix: without it, every seed missed; with it, the control is caught.
+   - blaze-cas now: 397 passed, 3 failed. The three failures are the ones that have failed on main since 11-14: `a_clone_placed_where_a_program_starts_is_prewarmed_before_its_rename`, `a_damaged_value_in_another_writers_store_is_never_served` and `a_flipped_byte_of_a_value_is_never_served`.
+
+3. **The strict name rule: in the tree (2026-11-16) and accepted.** blaze-core: 380 passed, and
+   the one failure was a test pinning the old sweep chunk, now fixed. Three sim tests leaned on
+   the loose rule (their files' names were never synced). They were fixed by making each file and
+   syncing its directory first; the model was not weakened. The Lean proofs over the disk world
+   are owed (decision D55; storemodel.md, "The disk world's proofs under the strict rule"). The
+   native calls the model matches:
+   - macOS: a file's sync is `F_FULLFSYNC` (`File::sync_all`), and a directory's sync opens the
+     directory and does `F_FULLFSYNC` on it;
+   - Linux: `fsync` of the file, and `fsync` of the directory's descriptor.
+   Miri: the strict rule is safe Rust in the simulation and the world model (`ready for Miri:
+   blaze-core sim::`). No Miri run covers the native drivers' unsafe calls (kqueue, io_uring,
+   `boot::system`'s sysctl). What covers them is the every-driver equality tests in `tests.rs`,
+   which run each driver against the simulation on a real disk. The history of the design
+   follows:
+   - **The rule:** a name (create, rename, unlink) is durable only once its directory is synced. A file's sync covers its bytes, never its name.
+   - **What is in the tree:** `world/disk.rs` keeps a log of names (`Named { Put, Gone, Moved }`)
+     that `sync_names()` clears, and a crash is `Cuts { files, undone }`, undone entries closed
+     forward (undoing one undoes every later entry that shares a name) and undone newest first.
+     `world/asks.rs` and `sim.rs` follow it: SyncDir clears its directory's entries, and a synced
+     Write or Rename syncs its directory. `Plant::FileSyncKeepsName` brings the loose rule back as
+     the control.
+   - **Other crash suites under the strict rule:** blaze-std's `tests::syncs` oracle expected a
+     `SyncDir` after a synced rename. Under the rule, the rename syncs its directories, so the
+     oracle was fixed to the contract (a test leaning on the loose rule). The other suites'
+     results are in the lane's reports.
+   - **Lean:**
+     - The statement change: `blaze_core.world.disk.a_crash_keeps_a_synced_file` gains a premise, "the file's name is not in the unsynced name log": `disk.named(file) = false`. Its `cut` becomes a `Crash`.
+     - Proofs that use it: `lean/BlazeCore/World/DiskCrash.lean` (~1089), which is named in `Disk.lean:170`, and row V14 of `lean/theorems.json` (line 112).
+     - A new control theorem: `a_synced_file_whose_name_was_not_synced_may_be_gone`.
+     - Regenerate the model with hir-ty-lean's `blaze_cores_world_models_are_its_sources` under `UPDATE_EXPECT`. Do not hand-edit the proofs; they are built where Lean exists.
+
+4. **Links beneath the root: the spec (2026-11-16), being built by the effect-layer lane.**
+   - **One seam:** every driver holds its root as a directory descriptor, opened once. Every
+     name under it is resolved relative to that descriptor with the kernel's beneath rule:
+     - macOS: `openat(.., O_RESOLVE_BENEATH)`, `fstatat`/`unlinkat`/`linkat`/`mkdirat` with
+       `AT_RESOLVE_BENEATH`, and `renameatx_np(.., RENAME_RESOLVE_BENEATH)`;
+     - Linux: `openat2` with `RESOLVE_BENEATH`, and `IORING_OP_OPENAT2` on the ring, with an
+       `O_PATH` descriptor of the parent for the calls that take no `how`;
+     - Windows: refused by name until there is a design (reparse points).
+     The threads driver's `at(root, name, ..)` (39 call sites) becomes `beneath(root_fd, name,
+     ..)`, and a path joined to the root is used nowhere else.
+   - **Probe:** once per driver, at its making. Put a link to `/` in a scratch directory under
+     the root, open through it with the flag, and require `EXDEV` on Linux or the documented
+     refusal on macOS. A kernel that follows the link, or does not know the flag (`EINVAL`), is a
+     typed `NoBeneath { call, why }` the driver's maker returns. There is no fallback.
+   - **Refusal:** a name whose resolution leaves the root completes `Done::Failed` naming the
+     name and that it escaped through a link. A link that stays beneath the root resolves.
+   - **The simulation:** `Sim` gets links whose targets are names, resolved under the same rule.
+     The property test: no sequence of makes, links and renames lets a later effect read or write
+     outside the root. The planted bug: one effect's resolution follows links freely, and the
+     property test must catch it.
+   - **Cost:** 1,000 opens with and without the flag, by an example under examplerun.sh.
+   - **Order:** after the `Effect::Roots` wiring (item 6 below).
+
+6. **For a successor (2026-11-16, third hand-off, the effect-layer lane at about 70% of its context).**
+   - **Done, checked and accepted:**
+     - the strict name rule (item 3);
+     - the Boot fact: `blaze_core::Boot` and `NoBoot`, `Driver::boot()`, and bstd's `Io::boot()`;
+     - `Effect::Stamp` as the batched stat: `STAMP_MOST` with a typed refusal, and `SWEEP_CHUNK`
+       256. Measured at 544 µs for 870 rows, 1.09x the 0.5 ms floor (examples/stat_cost.rs).
+     - The Lean debt is written down: decision D55, and storemodel.md's "The disk world's proofs
+       under the strict rule".
+     - blaze-std's `tests::syncs` oracle is fixed to the strict contract: a synced rename syncs
+       its directories, so no `SyncDir` follows it.
+   - **`Effect::Roots`: written, not in the tree.** It was reverted after other lanes' checks met
+     the tree between two of its saves. Every file is kept whole at
+     /Volumes/Projects/blaze-int-1112-notes/port27/roots-wip/: the files under `crates/`, and
+     blaze-std's io, disk, net and layers.
+     - What it does:
+       - `Effect::Roots { cert_file, cert_dir }` takes `Option<String>`, so the `#![no_std]` bstd
+         can name it. It completes `Done::Roots(Box<Roots<Global>>)` or `Done::Untrusted`.
+       - A Unix driver runs it on a host thread named `blaze-host-roots`. Windows and WASI refuse
+         it by name.
+       - In the simulation, `Sim::roots` sets the roots and `Sim::roots_read` counts the reads.
+       - `blaze_core::trust` loses its cfg gate, and blaze-base64 moves to the ordinary
+         dependencies. Only `trust::system` stays per OS.
+       - bstd gains `Net::roots(cx, env)` and `RootsError`. It does not cache: the client keeps
+         the answer.
+       - The test is `roots_are_the_worlds_and_each_ask_is_counted` in blaze-core's tests.rs.
+     - To put it back:
+       1. Check that the live files still equal `refs/green/blaze-core` and `refs/green/blaze-std`.
+       2. If they do, copy every kept file into the tree in one step, then run
+          `lanecheck.sh blaze-core` at once, and blaze-std after it.
+       3. If another lane changed a file since, port the hunks into it by hand, then save every
+          file back to back.
+   - **Crash suites under the strict rule (2026-11-16):**
+     - blaze-std: 249 passed, 1 failed. The failure was
+       `explicit::no_unsynced_call_waits_for_the_device_and_each_synced_one_does`: the syncing
+       rename's name sync was not counted as a wait. `sync_names` now counts it
+       (`io.names_synced()`), and `tests::` gives 244 passed, 0 failed.
+     - blaze-http: 30 passed, 0 failed.
+     - blaze-cas: 381 passed, 19 failed. Three of these failed before the rule. The 16 new ones
+       are all `plain::tests` crash and oracle tests, likely the plain store's missing directory
+       syncs. Not classified yet.
+     - blaze-vfs: 135 passed, 3 failed: `image::tests::a_stop_at_any_step_of_moving_onto_an_image_loads_what_was_durable`,
+       `tests::stamps::stamps_survive_a_crash_with_the_bytes_they_vouch_for` and
+       `tests::the_journal_survives_crashes_and_failures`. Not classified yet.
+     - blaze-profile: 267 passed, 3 failed. These are flight-span and account tests, not crash
+       tests.
+     - blaze-certify is no package in this tree.
+     - Not run: blaze-drive, blaze-storemodel, blaze-remote, blaze-fetch, blaze-pack,
+       blaze-image, blaze-solo and blaze-cargo.
+   - **Lean models: not regenerated.** `hir-ty-lean` is in the workspace's `exclude` list, so
+     `mixcheck.sh hir-ty-lean` "did not match any packages". Regenerating needs it built some
+     other way, which is main's call. The DiskCrash proof is owed (D55). The `lean` job turns
+     red by name and blocks merges, and it never skips.
+   - **Not started:** links beneath the root (item 4); the store model's blind control, and why
+     the store model's suite takes more than 900 s, with a bounded run in its place.
+
+8. **Built (2026-11-16, fifth lane): the crash tears by sectors.** The world's `Torn` is now
+   `Nothing | Sectors { upto, len, landed }` (world/disk.rs; `File::after`, `mixed`); the
+   simulation draws that same value in `crash_cut` (per file in name order: `kept`, then `upto`
+   only where changes are unsynced; after the barriers: the length (longer, shorter or any
+   between, one in three each), then all sectors landed (one in three) or each on its own) and
+   applies it with the world's `mixed`. Grain: `SECTOR` (512), not 4096: finer, every 4096-grain
+   outcome is one at 512, and one constant. Results: blaze-core "382 passed, 0 failed" (the
+   refinement, the reserve's `a_crash_at_any_point_leaves_no_record_or_the_whole_one` and its
+   plant among them); bstd `tests::` "244 passed, 0 failed"; blaze-cli `store::tests` "10 passed,
+   0 failed" with both plants un-ignored (were "8 passed, 2 failed"). Oracles that assumed a
+   prefix were fixed (not code): sim.rs `a_write_at_an_offset_is_durable_after_its_sync_on_every_seed`,
+   bstd tests/crash.rs and tests/durable.rs (through `blaze_core::sim::appended_and_torn`).
+   The prefix theorem is replaced (D55, storemodel.md "The crash tears by sectors"); Lean owed.
+   The roots test's count is now the value's (`Roots::reads`). blaze-storemodel does not use
+   blaze-core's disk (its own `CrashFs`, still prefix-only: its own debt); its full suite times
+   out at 900 s, so run it with a filter. Still open from item 7: plain/core.rs's `SyncDir` fix.
+
+7. **For a successor (2026-11-16, fourth hand-off, at the budget).**
+   - **`Effect::Roots` is in the tree.** The kept files were copied in one step. Two holes
+     were fixed at once: `trust::Roots` now has a hand-written `PartialEq`/`Eq` (a derive asked
+     for `A: PartialEq`, which `Global` lacks), and bstd's `pending.rs` has the arms
+     `Done::Roots`/`Done::Untrusted`. blaze-storemodel's fs.rs refuses `Effect::Roots` by name.
+     The checks: blaze-core, blaze-std, blaze-http, blaze-fetch and blaze-storemodel each "check
+     ok (all targets)". blaze-cli is unverified: blaze-consteval (`Lit::CStr`, not this lane's)
+     does not compile under it. `lanecheck.sh blaze-core test roots` failed one test:
+     `trust::tests::this_macs_store_gives_roots_and_is_read_only_when_asked` asserts "left: 2,
+     right: 1" on the process-wide `macos::reads()` counter. The likely cause, not yet shown by
+     a run, is that the new roots test read the system store in parallel with it. The fix to
+     make: count reads per call (return the count from the read) or serialize the two tests.
+     Never loosen the `+ 1` check. blaze-std was red for about 20 minutes between the copy and the
+     pending.rs fix. The WIP had missed that file, and the checks after blaze-core had not been
+     run back to back with it. blaze-cli's check, the roots test and the message to the driver's
+     lane were in flight at hand-off: run `lanecheck.sh blaze-cli` and `lanecheck.sh blaze-core
+     test roots`, then tell the driver's lane (OWNERS.md), in one message, that the client can
+     take its roots through `Net::roots`.
+   - **FIRST, owed (the coordinator's order): the crash is too kind to unsynced data.** The
+     pack store's plants were un-ignored. Neither was caught: "the planted VerifySkipped was not
+     caught in 5560 starts", and the same for SelfVouching. A cut tears only the NEXT change, and
+     an append only to a prefix (`Op::torn`; the world's `Torn::Prefix`), so a cut pack always
+     loses its footer and the open refuses it before verifying. POSIX leaves unsynced data after
+     a crash unspecified (`fsync`, `write`: no ordering or atomicity promise without a sync).
+     ALICE (Pillai et al., OSDI 2014) observed real file systems reorder and drop unsynced
+     block writes, and ext4 `data=writeback` and XFS leave zero-filled blocks under a grown
+     size. Both plants are re-ignored with that reason. The design to build:
+     - Grain: the 4096-byte block (`SECTOR`), the device and page-cache unit that writeback
+       flushes as a whole.
+     - A `Cut` keeps `kept` (the changes whole, in order, as now) and draws `upto` in
+       `kept..=ops.len()`.
+     - In `crash_with`: let `old` be the file after `sync(kept)`, and `new` be `old` with ops
+       `kept..upto` applied.
+     - The length is drawn between `old.len()` and `new.len()`.
+     - Each block where they differ is, on its own, `new` or `old`, or zeros where the block
+       starts at or past `old.len()` (newly allocated). Synced bytes never change.
+     - Barriers: a file's reach is `upto`, not `kept + 1`. When a barrier raises `kept`, set
+       `upto = upto.max(kept)`; do not clear it.
+     - What the change must reach beyond sim.rs, in one save: the disk world's `Kept`/`Torn`
+       (world/disk.rs: `fits`, `reach`, `keeps`, `crash`), the refinement's `kept()`
+       (sim/world.rs:540), asks.rs:835/861, and the Lean statement
+       `a_crash_cuts_an_appended_file_to_a_prefix`, which becomes false as stated. Its
+       replacement is "synced bytes and synced length survive". Record it with D55.
+     - Then un-ignore the two plants in crates/blaze-cli/src/store.rs and quote the lines.
+       Rerun blaze-core's and bstd's crash suites and classify each new failure (code or
+       oracle), with no oracle weakened.
+     - It was not started: it is a change to the spec the proofs state, too large to write
+       whole and check at once at the end of this budget.
+   - **The new path's crash suites under the strict rule (each line quoted from a run):**
+     blaze-drive "36 passed, 0 failed", blaze-fetch "12 passed", blaze-git-fetch "12 passed",
+     blaze-build-script "36 passed", blaze-toolchain "5 passed", blaze-remote (bare) "6 passed",
+     and blaze-proc-macro "48 passed". The proc-macro run was through mixcheck, because
+     blaze-scope's resolve.rs did not compile. None of these crash suites runs on blaze-core's
+     simulated disk, so the rule changes none of them. The pack store's suite (blaze-cli
+     store::tests) gives "8 passed, 2 failed" with the plants un-ignored: the failures are the
+     two plants above.
+   - **Where each crate's on-disk state is written, and on which simulation (for main):**
+
+     | Crate: state | Writes through the effect layer? | Crash test runs on | Never read torn? |
+     |---|---|---|---|
+     | **blaze-proc-macro: expansion records (`record::DirStore`, used on the binary's path by blaze-world's `ProcMacros`)** | **no: ambient `std::fs::write` + `rename`, no sync** | **none** | **no: no whole-record digest; a torn note can decode as other tokens** |
+     | blaze-proc-macro: compiled modules + seals (host.rs `write_renamed`) | no: ambient std::fs | none | yes: the seal's digest is checked on every read; a mismatch is removed and rebuilt |
+     | blaze-cli: the pack store, boot record, `last` | yes (bstd `publish`, `Durable::No` by decision) | blaze-core's disk | yes in design, unproven: the model cannot tear a pack's middle |
+     | blaze-fetch / blaze-git-fetch: source records | yes (`blaze_core::reserve`: synced rename) | its own machine model (a BTreeMap store, crash at an effect: no tearing); the reserve's crash proof is on blaze-core's disk | yes |
+     | blaze-build-script: script records | through proc-macro's script.rs: ambient `std::fs::rename` (script.rs:376) | none on a disk | not checked |
+     | blaze-toolchain: the shelf | read-only on the binary's path; written by the `blaze-toolchain` bin (ambient std::fs) | none | yes: BLAKE3 checked against the name |
+     | blaze-remote: local write-through | in-memory model in read/tests.rs | its own model | per its oracle |
+     | blaze-world: names records | not found written by the driver in this tree | none | n/a |
+     | blaze-storemodel | models the OLD `blaze_cas::Store` on its own `CrashFs` (ALICE: prefix plus last torn; POSIX entries as an option): no middle tear | its own | finding 2 (POSIX entries) stays ignored |
+   - **Step 3 (old layer), from searches:** blaze-vfs and blaze-profile are used by neither
+     blaze-remote nor blaze-storemodel: old layer; deleted at the switch; they fail 3 tests
+     each under the strict rule (vfs: three crash tests; profile: not crash tests): not fixed.
+     blaze-remote's binary shape uses only blaze-cas `plain`'s pure format code (`Namespace`,
+     `seal_segment`, `check_segment`, `find_many`). Only `cmd` (feature `sign`: the pusher and
+     `blaze cache`) opens the disk store `plain::Driven`.
+     - The 16 `plain::tests` failures are, by reading, a CODE fault: plain/core.rs makes its
+       head, segments and manifest logs by `WriteAt`/`Truncate`, syncs each file, and never
+       emits `SyncDir`, so under the strict rule a head can name a segment whose name a cut
+       lost.
+     - The fix: in durable mode, one `SyncDir` of `cfg.dir` after `LOG_SYNC`, before
+       `write_slot`. It covers every new segment and the log, since all are in one directory.
+       Add one more after the head's first sync (`HEAD_MAKE` index 1).
+     - The cost: one directory fsync per flip, plus one at the store's birth.
+     - Not yet applied or run.
+   - **Lean models, for main (do not build here):** `blaze_cores_world_models_are_its_sources`
+     (crates/hir-ty-lean/src/tests.rs:1797) writes `lean/BlazeModel/blaze_core/world/{clock,
+     disk}/…` when `UPDATE_EXPECT=1`.
+     - hir-ty-lean and its deps hir-ty, hir-ty-borrowck and hir-ty-mir (dev) are all in the
+       root Cargo.toml's `exclude`, and their manifests inherit `workspace = true`. So
+       `--manifest-path crates/hir-ty-lean/Cargo.toml` cannot load them: an excluded package
+       finds no workspace to inherit from.
+     - The way: on a Lean host, in a scratch worktree, delete those four lines from `exclude`
+       (`members` is `crates/*`, so they become members). Then run
+       `UPDATE_EXPECT=1 cargo test -p hir-ty-lean blaze_cores_world_models_are_its_sources`.
+       Add the asks world's `a_synced_append_survives_a_crash` to that test's list first
+       (storemodel.md). Then build the proofs with `lake build` under
+       crates/blaze-core/lean.
+     - Unverified: whether hir-ty still compiles after the old layers' deletion (8e87a017ff).
+       If it does not, the generator has to move off hir-ty first.
+
+5. **What other lanes need from the effect layer:**
+   - The fetch area (now `main`'s; lane aee48fa9980e2272a is retired) is adding `Effect::Reserve { key, room }` to blaze-core, in every driver and the simulation: a large record written into a mapped file, visible only on finish. Its crash proof depends on the strict name rule, because finish ends in a directory sync.
+   - Agreed with that lane:
+     - the mapping's bytes fold into `SimFile` as ordinary ops (`push_op`), so the crash cut tears them, with no second durability path;
+     - finish uses a synced `Rename` alone, or `RenameUnsynced` plus `SyncDir`, never both.
 
 With records, `publish(path, content, { durable: Durable::No, .. })`; `durable` stays a field
 with no default.
@@ -1629,7 +2051,7 @@ single-file program); two that disagree, or a version that is no edition's, are 
 
 | | under the edition | built |
 |---|---|---|
-| `std` | names the dependency called `bstd`; Rust's `std` has no name in the crate (`core` is unchanged, `alloc` is by `extern crate alloc`). So `std::fs`, `std::env`, `println!` and the rest of Rust std's ambient authority are not reachable by any path | yes |
+| `std` | names the dependency called `bstd`; Rust's `std` has no name in the crate (`core` is unchanged, `alloc` is by `extern crate alloc`). So `std::fs`, `std::env`, `println!` and the rest of Rust std's ambient authority are not reachable by any path. Decided 2026-11-16 (toolchain.md): the toolchain's bstd is bound to one extern name, `std`; `bstd` is not a second name (rule 30), and a path written `bstd::..` is a finding whose fix rewrites it to `std::..`. Canonical item paths in records and in what tools print stay the crate's own (`bstd::cx::Cx`). A Rust-edition crate that depends on bstd names it by its manifest line, as before. There is no opt-in to Rust's `std` under the edition | yes |
 | the prelude | `std::prelude::blaze_2026_11`: `core`'s Rust 2024 prelude, `Cx`, `Io`, the entry's `Error`, `core`'s macros (`assert_eq!`, `panic!`, `write!`, ..), and for memory `Vec`, `Box`, bstd's `String` and `format_in!` ("Memory under the edition") | yes |
 | the entry | rule `entry-takes-roots`: `main`'s parameters are roots the runtime makes, each at most once, in the runtime's order, `&Cx` then `Io`. So `fn main()`, `fn main(cx: &Cx)`, `fn main(io: Io)` and `fn main(cx: &Cx, io: Io)`, by the rule and not by a list (`hir_ty::entry::takes`). It returns anything that is a `bstd::entry::Outcome` (a trait: `()`, a `Status`, a `Result` of one and an error that can be shown; a program's own type may implement it) | yes |
 | the root context | `main(cx, ..)` gets one with the named bounds `entry::MAIN_BUDGET` (no deadline) and `MAIN_SCRATCH`; a program that wants others takes `io` alone and calls `io.cx(budget, scratch)` | yes |
@@ -1859,11 +2281,11 @@ State as of 2026-11-15.
 
 | what std makes easy | what it costs | bstd's form | state |
 |---|---|---|---|
-| `Vec<Vec<T>>`, `Vec<String>`, `HashMap<K, Vec<V>>` | an allocation and a pointer a row; rows scattered over the heap | `Lists<T>`: one array of items and one of row ends; `Texts`: one byte buffer and its offsets; a multimap as sorted pairs | to build, blaze-own |
-| `map.entry(key.to_string())` | the key is allocated on every hit | `get_or_insert_with(&key, make)`: the owned key is made only on a miss | to build |
-| `v.remove(i)`, `v.insert(0, x)`, `v.contains(&x)`, `s.chars().nth(i)` | linear work behind a short name; quadratic in a loop | the name says the cost: `remove_shift`, `remove_swap`, `insert_shift`, `scan_for`; text has no `nth` | to build; old names deprecated first |
-| one `Vec` grown to a gigabyte | each doubling copies everything and holds old and new at once | `Segs<T>`: append-only segments, nothing moves, an index is two shifts | to build |
-| `Arc::clone` in a hot path on many cores | every clone writes one shared cache line | borrow from the scope; `share()` is visible; a biased count (the owning thread counts without atomics) where a handle must travel | measure on 18 and 128 cores, then build |
+| `Vec<Vec<T>>`, `Vec<String>`, `HashMap<K, Vec<V>>` | an allocation and a pointer a row; rows scattered over the heap | `Lists<T>`: one array of items and one of row ends; `Texts`: one byte buffer and its offsets; a multimap as sorted pairs | built in blaze-own (`Lists::from_pairs_in` is the multimap). At 1e6 rows: `Lists` bytes 1.00x the floor sized, 1.78x grown, against `Vec<Vec>` 2.32x; build 6.74 ns a row against a 5.52 floor; `Texts` 1.04x the floor against `Vec<String>` 4.31x |
+| `map.entry(key.to_string())` | the key is allocated on every hit | `get_or_insert_with(&key, make)`: the owned key is made only on a miss | built on blaze-own's `SortedMap` and `BTreeMap`; the hash maps are the foundation lane's |
+| `v.remove(i)`, `v.insert(0, x)`, `v.contains(&x)`, `s.chars().nth(i)` | linear work behind a short name; quadratic in a loop | the name says the cost: `remove_shift`, `remove_swap`, `insert_shift`, `scan_for`; text has no `nth` | built on `Vec`, `VecDeque`, `Soa`, `FixedVec`; old names deprecated, callers to move by tool |
+| one `Vec` grown to a gigabyte | each doubling copies everything and holds old and new at once | `Segs<T>`: append-only segments, nothing moves, an index is two shifts; `SharedSegs` for one appender and many readers | built. 1e8 `u64`: append 1.07 ns against `Vec` 1.20; random reads 4.71 against a slice 4.10. Peak memory equal (802 against 804 MB): macOS remaps a large realloc, so `Vec` holds no old-plus-new physically there; the gain is no copy and stable references |
+| `Arc::clone` in a hot path on many cores | every clone writes one shared cache line | a value many workers share is borrowed from a scope, or cloned once per worker at spawn; a clone of a shared handle inside a per-item loop is a defect; `share()` makes each one visible | measured 2026-11-15 on 18 threads (Mac, `alloc_cost arc`), ns a clone and drop: one shared `Arc` 215.6, a value per thread 4.16, a scope borrow 0.52. No biased count: the owner's plain count leaves the other 17 threads on the shared atomic, the case measured |
 | `read_dir`, then `metadata` on each entry | a system call a file | the names and stamps of a directory in one call | being built |
 | `File::open(path)` from the root each time, then `read_to_end` | a path walk a component, an `fstat`, a buffer filled with zeros first | open relative to a `Dir`; the size from the stamp; read into unfilled capacity; a small file in one open, read, close | partly there |
 | `sync_all` by habit; a rename that syncs | about 5 ms a file on macOS | durability is in the type; derived data is unsynced by default | a bstd bug of exactly this kind was found on 2026-11-15 (unsynced publishes renamed through the syncing rename); fixed, and asserted per call by `tests/syncs.rs` |
@@ -1874,6 +2296,65 @@ State as of 2026-11-15.
 | a `String` for every short text | 24 bytes and a heap block each; equality follows a pointer | interned ids for names; for columns of text a 16-byte string (length, a 4-byte prefix, inline up to 12 bytes) | to build with the query engine |
 | fresh memory for each task | a page fault every 16 KiB | a worker's frame is reset, not returned; large pages for big tables on Linux | to measure on Linux |
 | per-thread counters side by side | false sharing | `PerWorker<T>` padded to the target's cache line (128 bytes on Apple silicon) | to check |
+
+## The fast path is chosen by the type
+
+Andrew, 2026-11-15: "add specialization EVERYWHERE for optimization, i.e. sort should =
+sort_unstable if plain old data, and stuff like that". The library picks the fastest algorithm
+from the element type, without the caller asking, wherever the faster path gives the same
+result for every input. That last part is the rule: a fast path must be unobservable.
+
+"Plain old data" is not the condition for a sort. A `(key, payload)` struct with a
+hand-written `Ord` on the key is plain data, and a stable sort of it differs from an unstable
+one. Stability is unobservable exactly when values that compare equal are one value: integers,
+`bool`, `char`, floats under `total_cmp`, arrays and tuples of those. That is
+`blaze_sort::RadixKey`. A struct is one only when its type says so (`radix_key!`).
+
+Three tools, chosen per case:
+
+- A specialization trait (`#[rustc_specialization_trait]`, under `min_specialization`) when a
+  generic method must choose for its caller: `RadixKey` (order is the image's, equal is the same
+  value), blaze-hash's `PlainKey` (`==` is byte equality), core's `TrivialClone` (a clone is a
+  copy), core's `TrustedLen` (an exact length).
+- A `const { .. }` branch on `size_of`, `align_of`, `needs_drop` or an associated const, when the
+  bound is already there and only the kernel differs. The dead arm is removed.
+- Reflection (`core::mem::type_info`) only for a property a type's shape decides. Whether `Ord`
+  is derived is not in the shape, so sorting does not use it; and reflection on a tuple panics
+  the pinned compiler (crates/blaze-std/src/own/raw.rs).
+
+Each path is tested equal to the general form on random input, and timed against it in its
+crate's cost example. State as of 2026-11-15, from reading the five crates; "who" is the lane
+that owns the crate.
+
+| operation | where | there now | missing | unobservable because | who |
+|---|---|---|---|---|---|
+| sort, sort by key, search, `==`, `cmp`, `is_sorted`, `dedup`, `min` | crates/blaze-sort | radix sorts for `RadixKey`, a stable radix sort by key for any `T`, branch-free search, vector `position`/`==`/`cmp` for `PlainKey`; measured in its crate notes | `RadixKey` for blaze-kit's `NonMax` and `id!` types | equal keys are one value; `==` is byte equality | blaze-sort (done) |
+| radix sort, twice | crates/blaze-radix and crates/blaze-sort | two LSD sorts: blaze-radix on std, parallel past 100,000 keys, used by blaze-core and blaze-graph; blaze-sort `no_std`, serial, with the in-place sort and the specialized front doors | one home (rule 30): blaze-sort's kernels with blaze-radix's parallel passes and CSR; then ban the other name | same algorithm, same output | blaze-sort and blaze-radix lanes |
+| `RawTable::clone` (every hash map and set) | blaze-hash/src/raw.rs:506 | each live slot cloned and its control word set one by one | control words and slots as two block copies when `T: TrivialClone` | `TrivialClone`; same slots, so same iteration order | blaze-hash |
+| fill: `resize`, `vec_in![x; n]` | blaze-own/src/vec.rs:463, :85 | a clone and a write each | a fill with no per-value count for `TrivialClone`; `allocate_zeroed` when the value's bytes are all zero and the vector is new | the bytes written are the same | blaze-own |
+| zeroed tables | blaze-kit/src/sparse.rs:94; blaze-swiss/src/lib.rs:286; blaze-own/src/lists.rs:84; blaze-kit/src/table.rs:509 | `resize(n, 0)`, `resize_with(n, empty)` | the fill row's `allocate_zeroed`: fresh pages are zero already | 0 (or `None` of a niche id, or an empty control word) is all-zero bytes | blaze-kit, blaze-swiss, blaze-own |
+| `Dict` hashing | blaze-kit/src/dict.rs:58 | `FixedState.hash_one`, through `Hash` | `hash_plain` for `K: PlainKey` | `==` is byte equality; codes follow push order, so slots are never seen | blaze-kit |
+| ids as keys | blaze-kit/src/id.rs:44, :113 | `NonMax` and `id!` types hash through `write_u32`; no `PlainKey`, no `RadixKey`, no `SearchKey` | the three impls in `id!` (one line each) | the stored complement is one-to-one, and the order is the index's | blaze-kit |
+| `SortedMap`/`SortedSet` `Extend`; `BTreeMap` `Extend`, `append` | blaze-own/src/sorted.rs:416, :709; btree.rs:1504, :1226 | one `insert` an item: `O(n)` moves each in the sorted vector | append, sort (stable, by key), keep the last of equal keys; a tree built bottom-up | the same later-wins map | blaze-own |
+| `SortedSet::from_vec`, `Soa::sort_by_key`, `OrderMap::sort_keys` | blaze-own/src/sorted.rs:597; soa.rs:808; blaze-hash/src/order.rs:370 | comparison sorts (`sort_unstable`, pairs with a row tie-break) | `blaze_sort::sort` for `RadixKey` keys; `sort_by_key_in`, stable, so no tie-break | a set's equal keys are one value; the by-key sort is stable by construction | blaze-own, blaze-hash |
+| search in sorted vectors and B-tree nodes | blaze-own/src/sorted.rs:84, :618; btree.rs:231, :247 | `binary_search_by`; a linear scan with an early exit per node | `blaze_sort::lower_bound` for `RadixKey` keys; a branch-free count of keys below in a node (as `StaticSearch` does) | the order is the image's | blaze-own |
+| `SortedMap::try_clone_in` | blaze-own/src/sorted.rs:436 | one `try_clone_in` a key and a value; spec.rs's table says it takes the `Copy` block copy, and it does not | delegate to the entries' `try_clone_in`, which does | `(K, V): Copy` | blaze-own |
+| `BTreeMap` clone | blaze-own/src/btree.rs:818, :1447 | a closure call an entry | a node's key and value columns as block copies | `TrivialClone` | blaze-own |
+| `VecDeque` `==`, `cmp` | blaze-own/src/deque.rs:726-740 | `iter().eq`, `iter().cmp` | compare the two `as_slices` halves, so core's `memcmp` (or `blaze_sort::cmp`) applies | byte equality (`PlainKey`) | blaze-own |
+| `BTreeMap` `==`, `cmp` | blaze-own/src/btree.rs:1462, :1476 | entry iterators | leaf by leaf over slices when the shapes match | byte equality | blaze-own |
+| `contains`, `position` | blaze-own/src/spec.rs:120 (`Find`) | blaze-memchr for `u8`, `i8`, `bool` | 2-, 4- and 8-byte plain keys by vector compare: `blaze_sort::position` has it | `==` is byte equality | blaze-own |
+| decimal text of `u8`, `u16`, `u32` | blaze-text/src/int.rs:46, :168 | every width through the `u64` writer into a 40-byte buffer zeroed each call | a buffer and digit count by width (3, 5, 10 digits), not zeroed | the same digits | blaze-text |
+| hex and binary text | blaze-text/src/int.rs:101; write.rs:75-111 | `u128` arithmetic for every width | a `u32`/`u64` loop by width | the same digits | blaze-text |
+| `SortedTexts` | blaze-own/src/texts.rs:210 | indices sorted by comparing their strings, then deduplicated | an MSD radix sort on the bytes | equal strings are merged anyway | blaze-own |
+| `RawTable::allocate` | blaze-hash/src/raw.rs:600 | `write_bytes` over the control words | `allocate_zeroed` for the block | 0 is empty | blaze-hash |
+| drop of values with no drop glue | blaze-kit/src/inline_vec.rs:542; blaze-hash/src/raw.rs:554 | skipped by `needs_drop` | nothing | no code runs either way | there |
+| slice `==` and hashing in the collections | `Vec`, `FixedVec`, `InlineVec`, `Lists`, `Texts`, `SortedMap` | through slices: core's `memcmp` for same-width integers; `hash_slice` | nothing beyond `blaze_sort::eq` for arrays and newtypes core does not mark | byte equality | there |
+
+The five worth most, in order: the hash table clone (every map copy); zeroed allocation for
+fills (sparse sets, swiss tables, lists); bulk `Extend` of the sorted and B-tree maps
+(quadratic today); `PlainKey` and `RadixKey` for blaze-kit's ids, with `Dict` hashing by bytes;
+and the sorts and searches of blaze-own's sorted collections moved onto blaze-sort, with
+blaze-radix merged into it.
 
 ## Prior art
 
@@ -1980,3 +2461,111 @@ The coordinator runs these on the whole tree; each names what to measure.
   promised; the count of failures is the measure.
 - Miri's many-seeds mode (`-Zmiri-many-seeds`): the crates with `unsafe` (blaze-own,
   blaze-kit, blaze-swiss) under 64 seeds; the measure is seeds that fail.
+
+### Round 2 (2026-11-16)
+
+Same pin, an Apple M5 Max. Logs are under /Volumes/Projects/blaze-int-1112-notes/nightly-probes/:
+`flags/` for the binary, `out/` for the probes.
+
+#### The `blaze` binary's own build
+
+Each variant was built by `flagbuild.sh` from blaze-cli's green snapshot b3c8abd52b into its own
+target directory (the build line and time: `flags/<name>.txt`). `flags/measure.py` ran each binary
+on copies of two inputs: the hello package, and core's module tree as one package without
+dependencies (267 files; `mod.rs` files renamed to the sibling form and `io`, `panic`, `f16` to
+`f64` left out, since this blaze stops on `#[path]` and on `x/mod.rs`). Instructions retired and
+footprint are the median of 5 runs under `/usr/bin/time -l`; wall time is the best of 50 runs,
+the variants alternated. Instructions are the column to trust: wall times of one binary moved by
+several percent between rounds. Results: `flags/round-a.txt` (and `.json`).
+
+| variant | build (s) | size (bytes) | imports | no command | hello repeat | cold | repeat | edit | cold wall (ms) | edit wall (ms) |
+|---|---|---|---|---|---|---|---|---|---|---|
+| release as it is (incremental, 16 units) | 22 cold, 14 rebuild | 5,255,856 | 187 | 23.88M | 27.07M | 1,970.9M | 47.26M | 1,796.7M | 128.8 | 119.0 |
+| incremental off, 1 unit | 31 | 4,499,920 | 187 | 23.88M | 26.91M | 1,909.6M | 47.01M | 1,754.5M | 126.9 | 115.7 |
+| + thin LTO (`dist` as it is) | 29 | 4,490,208 | 187 | 23.78M | 27.05M | 1,798.7M | 46.91M | 1,640.5M | 120.6 | 112.4 |
+| + fat LTO | 40 cold, 34 rebuild | 4,061,472 | 187 | 23.72M | 26.73M | 1,798.9M | 47.05M | 1,634.5M | 121.1 | 111.9 |
+| fat + `target-cpu=apple-m1` | 41 | 4,061,472 | 187 | 23.75M | 26.81M | 1,803.4M | 46.77M | 1,627.0M | 121.1 | 111.2 |
+| fat + `target-cpu=native` (apple-m5) | 40 | 4,028,752 | 187 | 23.79M | 26.78M | 1,795.3M | 46.87M | 1,624.5M | 124.0 | 112.1 |
+| fat + `panic=abort` | 39 | 3,492,336 | 185 | 23.55M | 26.57M | 1,783.5M | 46.56M | 1,616.0M | 124.1 | 112.7 |
+| + `-Zlocation-detail=none -Zfmt-debug=none` | 36 | 3,245,104 | 185 | 23.36M | 26.43M | 1,783.1M | 46.36M | 1,615.8M | 123.5 | 109.0 |
+| fat + `-Zbuild-std=std,panic_unwind` | 45 | 4,055,520 | 187 | 23.71M | 26.75M | 1,793.7M | 46.65M | 1,632.6M | 123.0 | 110.1 |
+| previous row's flags + std built `optimize_for_size`, `panic=immediate-abort` | 38 | 2,522,464 | 168 | 22.22M | 25.17M | 1,796.7M | 45.46M | 1,637.0M | 123.8 | 112.1 |
+
+Profile-guided, a fair pair at the later snapshot f1c9352cc3 (`flags/round-b.txt`): fat 1,800.9M
+cold, 1,631.8M edit; fat with `-Cprofile-use` 1,800.7M and 1,628.0M (0.998 on the edit); the release
+profile as it is 1,948.9M and 1,780.9M. The profile came from 390 runs of the workloads
+(`flags/train.sh`); the instrumented build took 89 s.
+
+What the columns are. "cold" is a check of the large package with an empty `.blaze` (267 runs);
+"repeat" a check with nothing changed (the certificate stands); "edit" a check after a comment is
+appended to `src/lib.rs`, from a fresh store each time: it reruns 266 of the 267 files, so it is a
+near-cold check, not an incremental one. Footprint was 65 to 66 MB for cold and edit and 2.9 to
+3.1 MB for repeat in every variant. "no command" prints the usage line: 23.9M instructions and
+2.4 ms, against 15.8M for a Rust program that prints one line and exits and 9.0M for
+`/usr/bin/true` (`flags/startup.txt`); no build setting moves it.
+
+What it says:
+- Thin LTO with one unit is where the work goes down: 8.7% fewer instructions cold and 8.7% on the
+  edit than the release profile, 6% less wall. Fat LTO does the same work as thin, in a binary 9.5%
+  smaller, for 11 s more build. Nothing else moves the work by more than 1%.
+- `target-cpu`: `apple-m1` is already the target's default; `native` saves 0.2%. Neither is worth it,
+  and `native` would refuse older Macs.
+- `panic=abort` saves 0.9% of the work and 14% of the size. blaze-std's task runner catches each
+  task's panic (crates/blaze-std/src/task.rs, `catch_unwind` at lines 506 and 576) so one job
+  fails and the build goes on (rule 20): abort breaks that. Never. `immediate-abort` and
+  `optimize_for_size` take the binary to 2.52 MB (48% of the release profile's) but need abort too.
+- `-Zlocation-detail=none` and `-Zfmt-debug=none` take 7% more off the size and nothing off the
+  work, and take the file and line out of every panic message (rule 19). Not for blaze.
+- Rebuilding std inside the LTO: 0.3% cold, 0.1% edit. Not worth a build of std.
+- Profile-guided: 0.2% on the edit at 2 builds and a training run. Not now; the `dist` comment's
+  PGO buys nothing on these workloads today.
+- `-Zshare-generics`, `-Zcross-crate-inline-threshold`, `-Zmir-opt-level=3`: not built. Fat LTO
+  did no less work than thin, so whole-program inlining had nothing left to give; these three
+  act on what LTO already sees.
+
+Recommended `dist`: `incremental = false`, `codegen-units = 1`, `lto = "fat"`, unwinding kept,
+no `target-cpu`, no `-Z` flags. Against the release profile it buys 8.7% cold, 9.0% edit, 6%
+wall, and 1.19 MB (23%) of size; against `dist` as it is (thin), 0.43 MB of size for 11 s of build.
+The everyday release profile stays as it is: its rebuild after this snapshot change was 14 s
+against fat LTO's 34 s, and the 9% is not worth 2.4 times the rebuild in the edit loop.
+
+Found on the way, for the owning lanes: in this blaze an edit of any file but the root, or a
+second edit in one store, stops with "a part's edition byte is no edition"; a cold check of the
+large package reports no findings, the edit check of the same text reports 5 (parse errors in
+`future/async_drop.rs` and `iter/traits/iterator.rs`); at f1c9352cc3 a repeat check sometimes
+misses its certificate ("3 store reads (2 found), certificate missed"). For profile-guided builds:
+Xcode's `llvm-profdata` (Apple LLVM 21) refuses this pin's raw format ("version = 11; expected
+version = 10"); the llvm-tools of nightly-2026-10-25 (LLVM 23.1.4) merge it. `-Cprofile-generate`
+in `RUSTFLAGS` is passed on by cc 1.4.3 to Apple clang for zstd, blake3's NEON part and ring,
+whose format-10 counters make the runtime write empty profiles ("Runtime and instrumentation
+version mismatch"); `CARGO_PROFILE_RELEASE_RUSTFLAGS` with `-Zprofile-rustflags` keeps it to Rust
+(`flags/findings.txt`, `flags/pgogen2.txt`).
+
+#### Features, round 2
+
+Probes are one file each, built by `run.sh` (`-O -C target-cpu=native`) unless the row says
+otherwise; times are best of 5 to 15, the noise band as above (0.90 to 1.10 is no effect).
+Instruction counts and folded functions are read from the `.s` files in `out/round2_asm.log`.
+
+| feature | the probe's result (log) | verdict | where |
+|---|---|---|---|
+| `link_llvm_intrinsics` | `llvm.prefetch.p0` write/keep on a scatter into 256 MB: 3.52 against 3.46 ns (1.017); read/no-locality (`pldl1strm`) 4.90 (1.416, worse); `llvm.expect.with.probability` at 0.999: same instructions, LLVM folded the two functions into one (llvm_intrinsics.log) | never: `core::intrinsics::prefetch_*` emit the same instructions | none |
+| `hint::assert_unchecked` | a gather by ids into a 64K table: the bounds check and its panic call go, the loop unrolls (21 to 46 instructions), 0.359 to 0.343 ns (0.955) (intrinsics2.log) | behind a measured twin, where the assembly shows a check | typed-id table lookups |
+| `raw_eq`, `compare_bytes`, `carrying_mul_add`, `disjoint_bitor` | each compiled to the same instructions as `==`, `Ord`, the `u128` form and `\|`: 0.995, 1.001, 1.003, and one `orr` (intrinsics2.log) | never: no gain on arm64 | none |
+| `three_way_compare`, `typed_swap_nonoverlapping`, `unchecked_add` | right answers (intrinsics2.log) | use where they read better | |
+| `const_eval_select` | a byte count with a `while` loop in `const` and a 16-lane `portable_simd` path at run time: 3 in a `const`, 143 at run time, both right (intrinsics2.log) | use now for `const fn`s with a vector path | blaze-text, blaze-hash |
+| `adt_const_params` | a `SizeClass { bytes, align }` as a pool's const parameter, 30 classes: right; compile 0.248 against 0.238 s for the `u32, u32` twin (const_params_time.log) | use now | blaze-own's size classes |
+| `generic_const_exprs` | `[u64; (W * N).div_ceil(64)]` columns: right and exactly sized, but the crate falls back from the next trait solver: "`generic_const_exprs` is not supported with the next-generation trait solver ... reverted the setting to `-Znext-solver=coherence`" (const_params.log) | not yet | |
+| `asm_goto_with_outputs` | `adds` then `b.cs` to a label: the same loop as `checked_add` (`adds`, `b.hs`), 1.009 (asm_goto.log) | never for arithmetic; only for a sequence no intrinsic gives | |
+| CRC-32C by instruction (stable) | `crc32cx` 5.85 ms over 64 MB (11.47 GB/s) against slicing-by-8 29.27 ms (2.29 GB/s) and a byte table 131.66 ms: 0.200 of slicing-by-8 (aarch64.log) | use now, with the table as its twin | the store's record checksums |
+| carry-less multiply fold (stable `vmull_p64`) | a dependent 64-bit hash fold: 3.453 ns against 1.260 for `mul` + `umulh` (2.741 slower) (aarch64.log) | never for a scalar fold | |
+| unstable AArch64 families | at the pin unstable: SVE (5,562 intrinsics), SM4, RNG (`__rndr`), MTE, `_prefetch`, f16, FCMA, I8MM, LUT, RCPC3, FAMINMAX, FP8; detecting `sme`, `lut`, `rcpc3`, `faminmax`, `fp8` needs `stdarch_aarch64_feature_detection`; no pointer-authentication intrinsics. CRC, AES/PMULL, SHA3 are stable. All the unstable ones compiled (aarch64_unstable.log). This CPU has CRC, AES, SHA3, SME, MTE, PAuth, BTI, I8MM, FCMA; not SVE outside streaming mode, SM4, RNG, LUT (aarch64.log) | not yet: nothing blaze needs is unstable | |
+| `naked_functions_rustic_abi` | `#[unsafe(naked)] extern "Rust"`: `add x0, x0, #1; ret` called right; a trampoline template `ldr x16, 8; br x16; .quad` read back as bytes equals the hand encoding `0x58000050 0xd61f0200` (naked.log) | use now: the assembler encodes stubs, their bytes copied from the template | blaze-link's thunk.rs and table.rs, blaze-launch-rt's arch.rs |
+| `effective_target_features` | `#[unsafe(force_target_feature(enable = "crc"))]` on a safe trait method, built with `-Ctarget-feature=-crc`: right CRC; without it E0133 (effective_tf_nocrc.log) | try where a trait implementation needs a feature its `Cpu` was checked for | the `Cpu`-chosen implementations (lane rule 7) |
+| `used_with_arg` | entries in a `__DATA,__blzreg` section walked by `section$start`/`section$end`, no initialiser: the 2 `#[used(linker)]` entries survive `-dead_strip`, the `#[used(compiler)]` one is dropped (linkage_U.log) | use now, `used(linker)` only | link-time tables (rules, commands) |
+| `linkage = "extern_weak"` | on Mach-O the link fails, "Undefined symbols", unless `-Wl,-U,_name`; then the address is null (linkage.log, linkage_U.log) | not yet | |
+| `fn_align`, `-Zmin-function-alignment` | a byte-class loop at 4, 16, 32 and 0 mod 64: 0.998 to 1.022 against the `#[rustc_align(64)]` copy; the local `__text` moved under 1 KB (align2.log) | `fn_align` stays as round 1 says; the flag: no | |
+| `-Zrandomize-layout` | a `repr(Rust)` header read at byte 12 and a size assumed to be 8: both hold without it; under 8 seeds the offset assumption broke 8 times and the size one 5 (16 bytes became 24) (randomize.log) | use now in a test build | the flag list above |
+| `-Zprint-type-sizes` | mirrors of blaze-drive's `Job` 280 bytes (no padding), `Task` 312 (1 byte), `Print` 160 (7), `Part` 72 (2), `Condition` 66 (1); a `Name` is 33 bytes at alignment 1 (type_sizes.log) | no padding to win; the size is four 32-byte `Vec`s and the 33-byte names | |
+
+No probe panicked the compiler; no `rustc-ice-*.txt` was left.

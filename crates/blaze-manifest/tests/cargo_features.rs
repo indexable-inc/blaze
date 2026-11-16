@@ -23,7 +23,7 @@ fn tree(name: &str, files: &[(&str, &str)]) -> (TempDir, PathBuf) {
     std::fs::create_dir_all(root.join("cargo-home")).unwrap();
     // As cargo is given it: not the `\\?\` form `canonicalize` gives on Windows, which a
     // path read back from a `file:` URL is not.
-    let root = dunce::canonicalize(root).unwrap();
+    let root = std::fs::canonicalize(root).unwrap();
     (dir, root)
 }
 

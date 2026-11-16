@@ -272,6 +272,47 @@ fn naming_a_span_reads_nothing_into_its_query() {
     }
 }
 
+/// A macro file's span is named by its chain of calls and the source file the chain ends in, a
+/// few dozen bytes, never its call id's `Debug` print (up to 64 KB, the profile's largest
+/// column): the four expansions of two nested calls are four short names.
+#[test]
+fn a_macro_files_span_is_named_by_its_calls_not_its_id_dump() {
+    let text = r#"
+//- /lib.rs crate:nested
+pub struct NonZero<T>(T);
+macro_rules! nonzero {
+    ($t:ty, outer) => { nonzero!($t); };
+    ($t:ty) => { impl NonZero<$t> { pub fn get(self) -> Self { self } } };
+}
+nonzero!(u32, outer);
+nonzero!(u64, outer);
+"#;
+    let fixture = fixture::db(text);
+    let db = fixture.db();
+    let named: &'static Named = Box::leak(Box::default());
+    blaze_trace::with_thread_sink(named, || {
+        _ = crate_def_map(db, fixture::test_crate(db));
+    });
+    let functions = named.functions.lock();
+    let macros: HashSet<&str, Global> = {
+        let mut set = HashSet::new_in(Global);
+        set.extend(functions.iter().filter(|it| it.starts_with("{macro")).map(String::as_str));
+        set
+    };
+    assert_eq!(macros.len(), 4, "the macro files' names are {macros:?}");
+    for name in &macros {
+        assert!(
+            name.starts_with("{macro call ") && name.ends_with("}") && name.len() < 120,
+            "`{name}` is not a short name of its calls"
+        );
+    }
+    assert_eq!(
+        macros.iter().filter(|it| it.matches(" in macro call ").count() == 1).count(),
+        2,
+        "the inner calls are named by the outer ones: {macros:?}"
+    );
+}
+
 /// A crate's label tells apart the builds of one package a profile would otherwise add up as
 /// one: a library, its `cfg(test)` copy, a binary's, a proc macro and a build script.
 #[test]

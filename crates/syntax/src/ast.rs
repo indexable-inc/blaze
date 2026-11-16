@@ -193,6 +193,21 @@ fn test_doc_comment_none() {
     assert!(doc_comment_text(&module).is_none());
 }
 
+/// A doc comment's text in a CR LF file is its LF form's: the line form's break CR is no part
+/// of it, and a block's value drops the CR of each CR LF (parser::line_break).
+#[test]
+fn a_doc_comment_s_text_in_a_cr_lf_file() {
+    let file = SourceFile::parse("/// a\r\n/** b\r\n c */\r\nmod foo {}\r\n", parser::Edition::CURRENT).ok().unwrap();
+    let docs: Vec<_> = file.syntax().descendants().filter_map(DocComment::cast).collect();
+    assert_eq!(docs.len(), 2, "{docs:?}");
+    assert_eq!(docs[0].text(), " a");
+    let token = docs[1].text_with_markers();
+    assert_eq!(docs[1].text(), " b\r\n c ", "raw");
+    let value: std::string::String =
+        parser::line_break::doc_comment_value(token, false).expect("a doc comment").collect();
+    assert_eq!(value, " b\n c ");
+}
+
 #[test]
 fn test_outer_doc_comment_of_items() {
     let file = SourceFile::parse(

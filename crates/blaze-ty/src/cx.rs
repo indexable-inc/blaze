@@ -159,6 +159,80 @@ impl<'a> TyCx<'a> {
         }
     }
 
+    /// [`TyCx::shallow_resolve`] without writing: no path halving, no row interned, so it
+    /// takes `&self` (the solver's walks read terms through a shared borrow). An unbound
+    /// variable gives its root's row, which exists: a variable's row is interned when the
+    /// variable is made, and a root is a variable some term named.
+    #[inline]
+    pub fn probe(&self, mut t: Ty) -> Ty {
+        loop {
+            let i = crate::ids::ix(t.0);
+            let k = self.tys.ty.kind(i);
+            let table = match k {
+                ty::TY_VAR => Table::Ty,
+                ty::INT_VAR => Table::Int,
+                ty::FLOAT_VAR => Table::Float,
+                _ => return t,
+            };
+            let v = self.tys.ty.a(i);
+            let r = self.vars.root(table, v);
+            match self.vars.value(table, r) {
+                Some(x) => t = Ty(x),
+                None if r == v => return t,
+                None => return Ty(self.var_row(crate::ids::TAG_TY, k, r)),
+            }
+        }
+    }
+
+    /// [`TyCx::probe`] of a const.
+    #[inline]
+    pub fn probe_const(&self, mut c: Const) -> Const {
+        loop {
+            if self.tys.ct_kind_of(c) != ct::VAR {
+                return c;
+            }
+            let v = self.tys.ct.a(crate::ids::ix(c.0));
+            let r = self.vars.root(Table::Const, v);
+            match self.vars.value(Table::Const, r) {
+                Some(x) => c = Const(x),
+                None if r == v => return c,
+                None => return Const(self.var_row(crate::ids::TAG_CONST, ct::VAR, r)),
+            }
+        }
+    }
+
+    /// The row of variable `v` of kind `k` in class `tag`, which must exist.
+    pub(crate) fn var_row(&self, tag: u32, k: u8, v: u32) -> u32 {
+        let rows = if tag == crate::ids::TAG_TY { &self.tys.ty } else { &self.tys.ct };
+        match rows.find(k, v, 0) {
+            crate::index::Probe::Found(id) => id,
+            crate::index::Probe::Vacant(_) => {
+                panic!("blaze-ty: variable {v} of kind {k} is a class's root but has no row (a variable made without its row)")
+            }
+        }
+    }
+
+    /// The term of variable `v` (its row exists: a variable's row is interned when it is
+    /// made), as a node: what a caller that names variables by [`crate::VarId`] (blaze-solve's
+    /// bridge, reading the binding log) turns back into a term. `None` past the variable count.
+    pub fn var_node(&self, v: crate::infer::VarId) -> Option<Node> {
+        use crate::ids::VarKind;
+        if v.index as usize >= self.vars.var_count(v.kind) {
+            return None;
+        }
+        let (rows, k, tag) = match v.kind {
+            VarKind::Ty => (&self.tys.ty, ty::TY_VAR, crate::ids::TAG_TY),
+            VarKind::Int => (&self.tys.ty, ty::INT_VAR, crate::ids::TAG_TY),
+            VarKind::Float => (&self.tys.ty, ty::FLOAT_VAR, crate::ids::TAG_TY),
+            VarKind::Const => (&self.tys.ct, ct::VAR, crate::ids::TAG_CONST),
+            VarKind::Region => (&self.tys.re, crate::kind::re::VAR, crate::ids::TAG_REGION),
+        };
+        match rows.find(k, v.index, 0) {
+            crate::index::Probe::Found(id) => Some(Node((id << 2) | tag)),
+            crate::index::Probe::Vacant(_) => None,
+        }
+    }
+
     /// [`TyCx::shallow_resolve`] of a const.
     #[inline]
     pub fn shallow_resolve_const(&mut self, mut c: Const) -> Const {

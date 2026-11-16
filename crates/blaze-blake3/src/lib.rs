@@ -8,13 +8,37 @@
 //! outside the workspace (docs/v2/plan/design/bottom.md, "Also decided on 2026-11-15").
 //!
 //! How it is fast without assembly of its own: a hasher fed more than a batch of whole chunks
-//! hashes the batch's chunks side by side, a SIMD lane each ([`lanes::compress`], safe code that
-//! LLVM vectorizes): 16 chunks in AVX-512 registers where the CPU has them, 8 in AVX2 ones, and
-//! 8 at the target's baseline elsewhere (two NEON registers a word on AArch64). Parent nodes,
-//! the last chunk and inputs of one chunk are compressed one block at a time. Which path runs is
-//! dispatch on the CPU, not a fallback: every path computes the same bytes, held to the official
-//! test vectors and to the `blake3` crate (`tests/`). The CPU's features are [`cpu`]'s, found on
-//! `core` alone: the crate is `no_std` and allocates nothing.
+//! hashes the batch's chunks side by side, a SIMD lane each ([`lanes::compress`], safe
+//! `core::simd` code): 16 chunks in AVX-512 registers where the CPU has them, 8 in AVX2 ones,
+//! and 8 at the target's baseline elsewhere (two NEON registers a word on AArch64). Many
+//! independent short inputs go the same way through [`hash_many`] (and [`keyed_hash_many`],
+//! [`derive_key_many`]), an input a lane. Parent nodes, the last chunk and one input of one
+//! chunk are compressed one block at a time by the scalar [`compress`], where they lie, with no
+//! copy. Which path runs is dispatch on the CPU, not a fallback: every path computes the same
+//! bytes, held to the official test vectors, to the `blake3` crate at every length to 4,097
+//! bytes and every alignment, and lane by lane to the scalar compression (`tests/`). The CPU's
+//! features are [`cpu`]'s, found on `core` alone: the crate is `no_std` and allocates nothing.
+//!
+//! # Cost, and the floor (rule 67)
+//!
+//! `examples/cost.rs`, 2026-11-15, the owner's M5 Max (one P core at 4.25 GHz, measured by a
+//! chain of dependent adds), best of seven runs, hot in cache:
+//!
+//! | input | before | now | floor | now / floor |
+//! |---|---|---|---|---|
+//! | 64 B, one call | 63.2 ns | 46.6 ns | 46 ns | 1.01 |
+//! | 1 KiB, one call | 1,010 ns | 784 ns | 738 ns | 1.06 |
+//! | 16 MiB, one call | 756 MB/s | 2,958 MB/s | 3,760 MB/s | 1.27 |
+//! | 64 B each, `hash_many` | 14.6 M/s | 41.6 M/s | 62.5 M/s | 1.50 |
+//! | 1 KiB each, `hash_many` | 0.93 M/s | 3.10 M/s | 3.91 M/s | 1.26 |
+//!
+//! The floor of one input is the latency of its chain of compressions: each block's seven
+//! rounds are fourteen half-rounds of fourteen dependent one-cycle operations, 196 cycles, 46
+//! ns a block, and a chunk's blocks run one after another. Only independent inputs (lanes) beat
+//! it. The floor of lanes is the compression alone at 8 lanes with nothing around it, 16.0 ns a
+//! block a lane (blaze-int-1112-notes/nightly-probes/blake3_lanes.rs), plus one parent block a
+//! chunk for a long input. What `hash_many` spends above it is gathering each lane's block,
+//! the transpose into columns and the lanes' bookkeeping.
 
 #![no_std]
 #![feature(portable_simd)]
@@ -57,6 +81,27 @@ pub const IV: [u32; 8] = [
 /// word `SCHEDULE[i]` of this round's.
 pub const SCHEDULE: [usize; 16] = [2, 6, 3, 10, 7, 0, 4, 13, 1, 11, 12, 5, 9, 14, 15, 8];
 
+/// Which word of the block each of a round's sixteen message slots reads: [`SCHEDULE`] composed
+/// with itself once a round, so no round moves the message.
+pub(crate) const MESSAGE: [[usize; 16]; 7] = {
+    let mut table = [[0; 16]; 7];
+    let mut word = 0;
+    while word < 16 {
+        table[0][word] = word;
+        word += 1;
+    }
+    let mut round = 1;
+    while round < 7 {
+        let mut word = 0;
+        while word < 16 {
+            table[round][word] = table[round - 1][SCHEDULE[word]];
+            word += 1;
+        }
+        round += 1;
+    }
+    table
+};
+
 /// The most chaining values a hasher holds: one per level of a tree of 2^54 chunks, 2^64 bytes.
 const MAX_DEPTH: usize = 54;
 
@@ -66,6 +111,24 @@ const MOST_LANES: usize = 16;
 /// The hash of `input`, BLAKE3's plain mode.
 pub fn hash(input: &[u8]) -> [u8; OUT_LEN] {
     one_shot(&IV, 0, input)
+}
+
+/// [`hash`] of each of `inputs`, into the same place of `out`: inputs of at most a chunk side
+/// by side, one a SIMD lane (see [`many`]); a longer one by [`hash`] where it comes.
+pub fn hash_many(inputs: &[&[u8]], out: &mut [[u8; OUT_LEN]]) {
+    many(&IV, 0, inputs, out);
+}
+
+/// [`keyed_hash`] under `key` of each of `inputs`, into the same place of `out`, as
+/// [`hash_many`] runs them.
+pub fn keyed_hash_many(key: &[u8; OUT_LEN], inputs: &[&[u8]], out: &mut [[u8; OUT_LEN]]) {
+    many(&words_of(key), KEYED_HASH, inputs, out);
+}
+
+/// [`derive_key_with`] under the context key `key` of each of `inputs`, into the same place of
+/// `out`, as [`hash_many`] runs them.
+pub fn derive_key_many(key: &[u8; OUT_LEN], inputs: &[&[u8]], out: &mut [[u8; OUT_LEN]]) {
+    many(&words_of(key), DERIVE_KEY_MATERIAL, inputs, out);
 }
 
 /// The hash of `input` under `key`, BLAKE3's keyed mode.
@@ -94,13 +157,40 @@ pub fn derive_key_with(key: &[u8; OUT_LEN], material: &[u8]) -> [u8; OUT_LEN] {
 /// value stack to set up); a longer one goes through [`Hasher`].
 fn one_shot(key: &[u32; 8], flags: u32, input: &[u8]) -> [u8; OUT_LEN] {
     if input.len() <= CHUNK_LEN {
-        let mut chunk = ChunkState::new(key, 0, flags);
-        chunk.update(input);
-        return first_32(&chunk.output().root_block(0));
+        return one_chunk(key, flags, input);
     }
     let mut hasher = Hasher::with_key(*key, flags);
     hasher.update(input);
     hasher.finalize()
+}
+
+/// The root of an input of at most a chunk: its blocks compressed where they lie, the last one
+/// read by [`lanes::padded_words`], with no buffer and no copy.
+fn one_chunk(key: &[u32; 8], flags: u32, input: &[u8]) -> [u8; OUT_LEN] {
+    let mut cv = *key;
+    let mut start = CHUNK_START;
+    let mut rest = input;
+    while let Some((block, after)) = rest.split_first_chunk::<BLOCK_LEN>()
+        && !after.is_empty()
+    {
+        let full = const { Cast::<usize, u32>::narrow_or_stop(BLOCK_LEN) };
+        cv = first_8(&compress(&cv, &lanes::block_words(block), 0, full, flags | start));
+        start = 0;
+        rest = after;
+    }
+    // At most `BLOCK_LEN` (64) bytes are left: the length fits a `u32`.
+    let len = rest.len().narrow_or_stop::<u32>();
+    let flags = flags | start | CHUNK_END | ROOT;
+    bytes_of(&first_8(&compress(&cv, &lanes::padded_words(rest), 0, len, flags)))
+}
+
+/// Eight words as their 32 little-endian bytes.
+fn bytes_of(words: &[u32; 8]) -> [u8; OUT_LEN] {
+    let mut out = [0; OUT_LEN];
+    for (bytes, word) in out.chunks_exact_mut(4).zip(words) {
+        bytes.copy_from_slice(&word.to_le_bytes());
+    }
+    out
 }
 
 /// `bytes`' eight little-endian words.
@@ -135,6 +225,18 @@ fn g(state: &mut [u32; 16], [a, b, c, d]: [usize; 4], x: u32, y: u32) {
     state[b] = (state[b] ^ state[c]).rotate_right(7);
 }
 
+#[inline(always)]
+fn round(state: &mut [u32; 16], m: &[u32; 16], t: &[usize; 16]) {
+    g(state, [0, 4, 8, 12], m[t[0]], m[t[1]]);
+    g(state, [1, 5, 9, 13], m[t[2]], m[t[3]]);
+    g(state, [2, 6, 10, 14], m[t[4]], m[t[5]]);
+    g(state, [3, 7, 11, 15], m[t[6]], m[t[7]]);
+    g(state, [0, 5, 10, 15], m[t[8]], m[t[9]]);
+    g(state, [1, 6, 11, 12], m[t[10]], m[t[11]]);
+    g(state, [2, 7, 8, 13], m[t[12]], m[t[13]]);
+    g(state, [3, 4, 9, 14], m[t[14]], m[t[15]]);
+}
+
 /// BLAKE3's compression function, all sixteen words of its output: the first eight are the
 /// next chaining value, all sixteen a root's 64 bytes of output.
 pub fn compress(
@@ -163,20 +265,17 @@ pub fn compress(
         block_len,
         flags,
     ];
-    let mut m = *block;
-    for round in 0..7 {
-        g(&mut state, [0, 4, 8, 12], m[0], m[1]);
-        g(&mut state, [1, 5, 9, 13], m[2], m[3]);
-        g(&mut state, [2, 6, 10, 14], m[4], m[5]);
-        g(&mut state, [3, 7, 11, 15], m[6], m[7]);
-        g(&mut state, [0, 5, 10, 15], m[8], m[9]);
-        g(&mut state, [1, 6, 11, 12], m[10], m[11]);
-        g(&mut state, [2, 7, 8, 13], m[12], m[13]);
-        g(&mut state, [3, 4, 9, 14], m[14], m[15]);
-        if round < 6 {
-            m = SCHEDULE.map(|word| m[word]);
-        }
-    }
+    // Seven rounds written out, each reading the block where `MESSAGE` says: every index a
+    // constant, the state in registers, no round moving the message (49.4 ns a compression on
+    // the owner's M5 Max, from 63.6 ns with the message permuted by a map each round:
+    // blaze-int-1112-notes/nightly-probes/blake3_compress.rs).
+    round(&mut state, block, &MESSAGE[0]);
+    round(&mut state, block, &MESSAGE[1]);
+    round(&mut state, block, &MESSAGE[2]);
+    round(&mut state, block, &MESSAGE[3]);
+    round(&mut state, block, &MESSAGE[4]);
+    round(&mut state, block, &MESSAGE[5]);
+    round(&mut state, block, &MESSAGE[6]);
     for word in 0..8 {
         state[word] ^= state[word + 8];
         state[word + 8] ^= cv[word];
@@ -257,25 +356,47 @@ impl ChunkState {
         if self.blocks_compressed == 0 { CHUNK_START } else { 0 }
     }
 
-    /// Feeds `input`; the caller gives a chunk at most [`CHUNK_LEN`] bytes in all.
+    /// Compresses `block` as one of the chunk's blocks before its last.
+    fn compress_block(&mut self, block: &[u8; BLOCK_LEN]) {
+        let words = lanes::block_words(block);
+        let flags = self.flags | self.start_flag();
+        let block_len = const { Cast::<usize, u32>::narrow_or_stop(BLOCK_LEN) };
+        self.cv = first_8(&compress(&self.cv, &words, self.counter, block_len, flags));
+        self.blocks_compressed += 1;
+    }
+
+    /// Feeds `input`; the caller gives a chunk at most [`CHUNK_LEN`] bytes in all. The held
+    /// block is topped up first; after it, every block with input after it is compressed where
+    /// it lies, and only the last (at most a block) is copied, held back as maybe the chunk's
+    /// last.
     fn update(&mut self, mut input: &[u8]) {
-        while !input.is_empty() {
-            if self.block_len.widen_to::<usize>() == BLOCK_LEN {
-                let words = lanes::block_words(&self.block);
-                let flags = self.flags | self.start_flag();
-                let block_len = const { Cast::<usize, u32>::narrow_or_stop(BLOCK_LEN) };
-                let out = compress(&self.cv, &words, self.counter, block_len, flags);
-                self.cv = first_8(&out);
-                self.blocks_compressed += 1;
-                self.block = [0; BLOCK_LEN];
-                self.block_len = 0;
-            }
-            let take = (BLOCK_LEN - self.block_len.widen_to::<usize>()).min(input.len());
-            self.block[self.block_len.widen_to::<usize>()..][..take].copy_from_slice(&input[..take]);
+        if input.is_empty() {
+            return;
+        }
+        if self.block_len > 0 {
+            let held = self.block_len.widen_to::<usize>();
+            let take = (BLOCK_LEN - held).min(input.len());
+            self.block[held..][..take].copy_from_slice(&input[..take]);
             // `take` is at most `BLOCK_LEN` (64) less what the block holds, so it fits a `u8`.
             self.block_len += take.narrow_or_stop::<u8>();
             input = &input[take..];
+            if input.is_empty() {
+                return;
+            }
+            let block = self.block;
+            self.compress_block(&block);
+            self.block_len = 0;
         }
+        while let Some((block, after)) = input.split_first_chunk::<BLOCK_LEN>()
+            && !after.is_empty()
+        {
+            self.compress_block(block);
+            input = after;
+        }
+        self.block = [0; BLOCK_LEN];
+        self.block[..input.len()].copy_from_slice(input);
+        // At most `BLOCK_LEN` (64) bytes are left: the length fits a `u8`.
+        self.block_len = input.len().narrow_or_stop::<u8>();
     }
 
     fn output(&self) -> Output {
@@ -455,7 +576,14 @@ impl OutputReader {
     }
 }
 
-/// Chunks a batch hashes side by side on this CPU: 16 where it has AVX-512F, else 8.
+/// Chunks a batch hashes side by side at the target's baseline: 8, two NEON registers a word of
+/// the state (one AVX2 register, two SSE2 ones). On the owner's M5 Max a block a lane took
+/// 25.1 ns at 4 lanes, 16.0 at 8 and 14.3 at 16 (blaze-int-1112-notes/nightly-probes/
+/// blake3_lanes.rs): 8 is within 12% of 16 at half the batch, so inputs of 8 to 16 KiB get it.
+const CHUNK_LANES: usize = 8;
+
+/// Chunks a batch hashes side by side on this CPU: 16 where it has AVX-512F, else
+/// [`CHUNK_LANES`].
 fn lanes_for_this_cpu() -> usize {
     #[cfg(target_arch = "x86_64")]
     {
@@ -463,7 +591,7 @@ fn lanes_for_this_cpu() -> usize {
             return 16;
         }
     }
-    8
+    CHUNK_LANES
 }
 
 /// The chaining values of `out.len()` whole chunks (`input`, `out.len() * CHUNK_LEN` bytes),
@@ -478,7 +606,7 @@ fn hash_chunks(key: &[u32; 8], input: &[u8], counter: u64, flags: u32, out: &mut
             return x86::chunks_avx2(key, input, counter, flags, out);
         }
     }
-    chunks_of::<8>(key, input, counter, flags, out);
+    chunks_of::<CHUNK_LANES>(key, input, counter, flags, out);
 }
 
 /// [`hash_chunks`] at `N` lanes. Always inlined, so it is vectorized for the features of the
@@ -527,6 +655,109 @@ fn chunks_of<const N: usize>(
     }
 }
 
+/// Short inputs [`many`] hashes side by side at the target's baseline: 8, as [`CHUNK_LANES`].
+const MANY_LANES: usize = 8;
+
+/// The roots of `inputs` under `key` and `flags`, into `out`: 16 lanes in AVX-512 registers
+/// and 8 in AVX2 ones where the CPU has them, else [`MANY_LANES`].
+fn many(key: &[u32; 8], flags: u32, inputs: &[&[u8]], out: &mut [[u8; OUT_LEN]]) {
+    assert_eq!(inputs.len(), out.len(), "a digest for each input");
+    #[cfg(target_arch = "x86_64")]
+    {
+        if cpu::has(cpu::Feature::Avx512f) {
+            return x86::many_avx512(key, flags, inputs, out);
+        }
+        if cpu::has(cpu::Feature::Avx2) {
+            return x86::many_avx2(key, flags, inputs, out);
+        }
+    }
+    many_of::<MANY_LANES>(key, flags, inputs, out);
+}
+
+/// No input in a lane of [`many_of`].
+const IDLE: usize = usize::MAX;
+
+/// [`many`] at `N` lanes. Each lane hashes one input of at most a chunk, a block a step, and
+/// takes the next input the step after its last block, so lanes of unequal inputs never wait
+/// for each other and no input is sorted or grouped: a tape of mixed lengths costs its blocks
+/// divided by `N` steps, plus the last few steps with lanes empty. That needs no buffer, so the
+/// crate stays without allocation. An input longer than a chunk is hashed one shot where it
+/// comes. Always inlined, so it is vectorized for the features of the function it is inlined
+/// into.
+#[inline(always)]
+fn many_of<const N: usize>(key: &[u32; 8], flags: u32, inputs: &[&[u8]], out: &mut [[u8; OUT_LEN]]) {
+    let full = const { Cast::<usize, u32>::narrow_or_stop(BLOCK_LEN) };
+    let mut cv: [[u32; N]; 8] = key.map(|word| [word; N]);
+    // Each lane's input (its place in `inputs`, or `IDLE`), the bytes of it not yet compressed,
+    // and `CHUNK_START` until its first block is.
+    let mut owner = [IDLE; N];
+    let mut rest: [&[u8]; N] = [&[]; N];
+    let mut start = [0; N];
+    let mut next = 0;
+    loop {
+        let mut live = false;
+        for lane in 0..N {
+            if owner[lane] == IDLE {
+                while let Some(input) = inputs.get(next)
+                    && input.len() > CHUNK_LEN
+                {
+                    out[next] = one_shot(key, flags, input);
+                    next += 1;
+                }
+                if let Some(input) = inputs.get(next) {
+                    owner[lane] = next;
+                    rest[lane] = input;
+                    start[lane] = CHUNK_START;
+                    next += 1;
+                    for (word, value) in key.iter().enumerate() {
+                        cv[word][lane] = *value;
+                    }
+                }
+            }
+            live |= owner[lane] != IDLE;
+        }
+        if !live {
+            return;
+        }
+        let mut rows = [[0; 16]; N];
+        let mut block_len = [0; N];
+        let mut lane_flags = [0; N];
+        let mut last = [false; N];
+        for lane in 0..N {
+            if let Some((block, after)) = rest[lane].split_first_chunk::<BLOCK_LEN>()
+                && !after.is_empty()
+            {
+                rows[lane] = lanes::block_words(block);
+                block_len[lane] = full;
+                lane_flags[lane] = flags | start[lane];
+                rest[lane] = after;
+            } else {
+                // An idle lane hashes an empty block, and nothing reads its result.
+                rows[lane] = lanes::padded_words(rest[lane]);
+                // At most `BLOCK_LEN` (64) bytes: the length fits a `u32`.
+                block_len[lane] = rest[lane].len().narrow_or_stop::<u32>();
+                lane_flags[lane] = flags | start[lane] | CHUNK_END | ROOT;
+                last[lane] = owner[lane] != IDLE;
+            }
+            start[lane] = 0;
+        }
+        cv = lanes::compress_each(
+            &cv,
+            &lanes::columns(&rows),
+            [0; N],
+            [0; N],
+            block_len,
+            lane_flags,
+        );
+        for lane in 0..N {
+            if last[lane] {
+                out[owner[lane]] = bytes_of(&core::array::from_fn(|word| cv[word][lane]));
+                owner[lane] = IDLE;
+            }
+        }
+    }
+}
+
 /// [`chunks_of`] compiled for AVX-512F at 16 lanes (each word of the transposed state one
 /// 512-bit register, the rotates `vprord`) and for AVX2 at 8 (one 256-bit register a word),
 /// where the baseline would give them SSE2's two 128-bit registers a word and three
@@ -558,6 +789,40 @@ mod x86 {
         // SAFETY: a `target_feature` function may run only on a CPU with the feature, and this
         // one has AVX2, asserted just above.
         unsafe { chunks_narrow(key, input, counter, flags, out) }
+    }
+
+    pub(super) fn many_avx512(
+        key: &[u32; 8],
+        flags: u32,
+        inputs: &[&[u8]],
+        out: &mut [[u8; super::OUT_LEN]],
+    ) {
+        assert!(super::cpu::has(super::cpu::Feature::Avx512f), "AVX-512F lanes on a CPU without it");
+        // SAFETY: a `target_feature` function may run only on a CPU with the feature, and this
+        // one has AVX-512F, asserted just above.
+        unsafe { many_wide(key, flags, inputs, out) }
+    }
+
+    pub(super) fn many_avx2(
+        key: &[u32; 8],
+        flags: u32,
+        inputs: &[&[u8]],
+        out: &mut [[u8; super::OUT_LEN]],
+    ) {
+        assert!(super::cpu::has(super::cpu::Feature::Avx2), "AVX2 lanes on a CPU without it");
+        // SAFETY: a `target_feature` function may run only on a CPU with the feature, and this
+        // one has AVX2, asserted just above.
+        unsafe { many_narrow(key, flags, inputs, out) }
+    }
+
+    #[target_feature(enable = "avx512f")]
+    fn many_wide(key: &[u32; 8], flags: u32, inputs: &[&[u8]], out: &mut [[u8; super::OUT_LEN]]) {
+        super::many_of::<16>(key, flags, inputs, out);
+    }
+
+    #[target_feature(enable = "avx2")]
+    fn many_narrow(key: &[u32; 8], flags: u32, inputs: &[&[u8]], out: &mut [[u8; super::OUT_LEN]]) {
+        super::many_of::<8>(key, flags, inputs, out);
     }
 
     #[target_feature(enable = "avx512f")]

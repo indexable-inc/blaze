@@ -11,9 +11,14 @@ use blaze_lir::{
 };
 
 use crate::{
-    EmitError, Fixup, Via,
-    enc::{self, Cond, FP, Field, LR, Reg, SP, Size, X0, X9, X10, X11, X12, X16, ZR},
+    EmitError, Fixup, Isa, Reloc, RelocTo, Via,
+    enc::{self, Cond, FP, Field, LR, Reg, SP, Size, X0, X1, X8, X9, X10, X11, X12, X16, ZR},
 };
+
+mod atomic;
+mod bulk;
+mod int;
+mod tls;
 
 /// `brk` immediates of the traps the pass makes itself; a LIR `trap`'s code is its own `brk`
 /// immediate, so codes from here up are refused.
@@ -36,6 +41,8 @@ enum Label {
     Literal(u32),
     /// The data row placed `i`th.
     Data(u32),
+    /// The literal word placement fills for `words[i]`.
+    Word(u32),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -48,9 +55,22 @@ struct Patch {
 struct Pass<'a, 'c, A: Allocator> {
     view: View<'a>,
     via: &'a [Via],
+    isa: Isa,
+    /// The most bytes a bulk operation of a constant length is inline.
+    inline_most: u64,
     code: &'c mut Vec<u8, A>,
     /// One per literal word, in order; `at` is filled when the words are placed.
     fixups: &'c mut Vec<Fixup, A>,
+    /// The absolute address words, filled as the literal words and data are placed.
+    relocs: &'c mut Vec<Reloc, A>,
+    /// The literal words placement fills, other than the fixups': each once, in order.
+    words: Vec<RelocTo, Global>,
+    /// The `add`s that make an address in the stretch of the frame where a call's `byval`
+    /// copies go, placed after the staging words once their count is known: (the first of
+    /// the two words, its register, the offset in the stretch).
+    byval_fixes: Vec<(u32, Reg, u32), Global>,
+    /// The most bytes one call's `byval` copies took.
+    byval_most: u32,
     /// The function's own returns.
     rets: &'a [ParamRec],
     patches: Vec<Patch, Global>,
@@ -74,15 +94,18 @@ struct Pass<'a, 'c, A: Allocator> {
 pub(crate) fn run<A: Allocator>(
     view: View<'_>,
     via: &[Via],
+    isa: Isa,
+    inline_most: u64,
     bytes: &mut Vec<u8, A>,
     fixups: &mut Vec<Fixup, A>,
+    relocs: &mut Vec<Reloc, A>,
 ) -> Result<(), EmitError> {
     if view.head.ptr_bits != 64 {
         return Err(EmitError::Signature { why: "a target whose pointers are not 64 bits" });
     }
     let sig = view.sigs.get(view.head.sig as usize).map(|_| view.sig(SigId(view.head.sig)));
     let Some(sig) = sig else { return Err(EmitError::Signature { why: "no signature row" }) };
-    check_sig(view.sigs[view.head.sig as usize], sig.params, sig.rets)
+    check_sig(view, view.sigs[view.head.sig as usize], sig.params, sig.rets)
         .map_err(|why| EmitError::Signature { why })?;
 
     // The frame: a 16-byte cell per value, then each slot at its alignment, then the staging
@@ -118,8 +141,14 @@ pub(crate) fn run<A: Allocator>(
     let mut pass = Pass {
         view,
         via,
+        isa,
+        inline_most,
         code: bytes,
         fixups,
+        relocs,
+        words: Vec::new_in(Global),
+        byval_fixes: Vec::new_in(Global),
+        byval_most: 0,
         rets: sig.rets,
         patches: Vec::new_in(Global),
         block_at,
@@ -144,12 +173,20 @@ pub(crate) fn run<A: Allocator>(
         pass.put(enc::lsl_imm(X16, X16, log2));
         pass.put(enc::add_imm(SP, X16, 0, false));
     }
-    // The parameters arrive in x0..x7, their bits above the width unspecified.
-    for (reg, inst) in view.params(Block(0)).enumerate() {
+    // The parameters arrive in x0..x7, their bits above the width unspecified; an `sret`
+    // pointer in x8, a `byval` one as the next integer parameter.
+    let mut gpr: Reg = 0;
+    for (inst, param) in view.params(Block(0)).zip(sig.params) {
         let width = pass.width(view.ty(Value(inst as u32))).ok_or(EmitError::Signature {
             why: "an entry parameter that is not an integer or pointer of at most 64 bits",
         })?;
-        let reg = reg as Reg;
+        let reg = match param.kind == ParamKind::Sret as u8 {
+            true => X8,
+            false => {
+                gpr += 1;
+                gpr - 1
+            }
+        };
         match width < 64 {
             true => {
                 pass.put(enc::zext(X9, reg, width));
@@ -172,23 +209,37 @@ pub(crate) fn run<A: Allocator>(
 }
 
 /// Why a signature is outside the subset, if it is.
-fn check_sig(rec: SigRec, params: &[ParamRec], rets: &[ParamRec]) -> Result<(), &'static str> {
+fn check_sig(view: View<'_>, rec: SigRec, params: &[ParamRec], rets: &[ParamRec]) -> Result<(), &'static str> {
     if rec.conv != Conv::C as u8 {
         return Err("a calling convention other than the target's C one");
     }
     if rec.bits & SigRec::VARIADIC != 0 {
         return Err("a variadic signature (Apple passes the variable arguments on the stack)");
     }
-    if params.len() > 8 {
-        return Err("more than 8 parameters (the rest go on the stack)");
+    let srets = params.iter().filter(|it| it.kind == ParamKind::Sret as u8).count();
+    if srets > 1 {
+        return Err("more than one `sret` parameter");
     }
-    if rets.len() > 1 {
-        return Err("more than one return");
+    if params.len() - srets > 8 {
+        return Err("more than 8 integer parameters past an `sret` (the rest go on the stack)");
+    }
+    if rets.len() > 2 {
+        return Err("more than two returns (a composite past 16 bytes returns through `sret`)");
+    }
+    for param in params {
+        match ParamKind::from_byte(param.kind) {
+            Some(ParamKind::Value) => {}
+            Some(ParamKind::Sret) if Ty(param.ty) == Ty::PTR => {}
+            Some(ParamKind::Byval) if Ty(param.ty) == Ty::PTR => {
+                byval_of(view, param)?;
+            }
+            _ => return Err("an `sret` or `byval` parameter that is not a pointer"),
+        }
+    }
+    if rets.iter().any(|it| it.kind != ParamKind::Value as u8) {
+        return Err("a return passed other than by value");
     }
     for param in params.iter().chain(rets) {
-        if param.kind != ParamKind::Value as u8 {
-            return Err("an `sret` or `byval` parameter");
-        }
         let ty = Ty(param.ty);
         let fits = ty.is_scalar()
             && matches!(
@@ -200,6 +251,18 @@ fn check_sig(rec: SigRec, params: &[ParamRec], rets: &[ParamRec]) -> Result<(), 
         }
     }
     Ok(())
+}
+
+/// The most alignment a `byval` copy may ask: what `sp` has.
+const MOST_BYVAL_ALIGN: u8 = 4;
+
+/// A `byval` parameter's pointee: its size and log2 alignment, from its facts.
+fn byval_of(view: View<'_>, param: &ParamRec) -> Result<(u32, u8), &'static str> {
+    let Some(facts) = view.facts(param) else { return Err("a `byval` parameter whose size is not told") };
+    if facts.align > MOST_BYVAL_ALIGN {
+        return Err("a `byval` parameter aligned past 16 bytes");
+    }
+    Ok((facts.size, facts.align))
 }
 
 fn unsupported(inst: usize, op: Op, why: &'static str) -> EmitError {
@@ -420,6 +483,19 @@ impl<A: Allocator> Pass<'_, '_, A> {
         }
     }
 
+    /// Data row `row`'s index among the rows placed after the code, placed once.
+    fn place_data(&mut self, row: u32) -> u32 {
+        match self.data_index[row as usize] {
+            NONE => {
+                self.placed.push(row);
+                let index = self.placed.len() as u32 - 1;
+                self.data_index[row as usize] = index;
+                index
+            }
+            index => index,
+        }
+    }
+
     /// The literal word of function reference `r`, made once per place, and how it is called.
     fn literal(&mut self, inst: usize, op: Op, r: RefId) -> Result<(u32, Via), EmitError> {
         let rec = self.view.reference(r);
@@ -443,6 +519,39 @@ impl<A: Allocator> Pass<'_, '_, A> {
         Ok((index, via))
     }
 
+    /// `ldr rt, <the literal word placement fills for to>`, the word made once per `to`.
+    fn ld_word(&mut self, rt: Reg, to: RelocTo) {
+        let index = match self.words.iter().position(|&it| it == to) {
+            Some(it) => it as u32,
+            None => {
+                self.words.push(to);
+                self.words.len() as u32 - 1
+            }
+        };
+        self.put_to(enc::ldr_lit(rt, 0), Field::Imm19, Label::Word(index));
+    }
+
+    /// Calls the system routine `routine` with the arguments already in `x0..x2`.
+    fn call_routine(&mut self, routine: crate::Routine) {
+        self.ld_word(X16, RelocTo::Routine(routine));
+        self.put(enc::blr(X16));
+    }
+
+    /// Whether a value of `ty` is a pair: a compound of two integers or pointers of at most
+    /// 64 bits (lib.rs, "Pairs").
+    fn is_pair(&self, ty: Ty) -> bool {
+        let members = self.view.members(ty);
+        ty.compound_row().is_some() && members.len() == 2 && members.iter().all(|&it| self.width(Ty(it)).is_some())
+    }
+
+    /// How many 8-byte words of its cell a value of `ty` takes: 2 for a pair, else 1.
+    fn words_of(&self, value: Value) -> u32 {
+        match self.view.ty(value).compound_row() {
+            Some(_) => 2,
+            None => 1,
+        }
+    }
+
     /// Moves `to`'s arguments into its block's parameters (all read before any is written)
     /// and branches there, unless it is `next`, the block placed after this one.
     fn edge(&mut self, to: Target<'_>, next: Option<u32>) -> Result<(), EmitError> {
@@ -454,28 +563,35 @@ impl<A: Allocator> Pass<'_, '_, A> {
             let at = arg.index();
             at >= start && at < start + n && at - start < k
         });
+        // A pair moves both of its words.
         match clobbered {
             false => {
                 for (k, arg) in to.args.iter().enumerate() {
                     if arg.index() != start + k {
-                        self.ld(X9, arg);
-                        self.st(X9, start + k);
+                        for w in 0..self.words_of(arg) {
+                            self.ld_sp(X9, arg.0 * 16 + 8 * w);
+                            self.st_sp(X9, (start + k) as u32 * 16 + 8 * w);
+                        }
                     }
                 }
             }
             true => {
-                let words = u32::try_from(n).map_err(|_| EmitError::TooLarge { what: "a block's arguments" })?;
+                let words = u32::try_from(2 * n).map_err(|_| EmitError::TooLarge { what: "a block's arguments" })?;
                 if u64::from(self.staging_at) + 8 * u64::from(words) >= FRAME_LIMIT {
                     return Err(EmitError::TooLarge { what: "the frame (16 MiB)" });
                 }
                 self.staging = self.staging.max(words);
                 for (k, arg) in to.args.iter().enumerate() {
-                    self.ld(X9, arg);
-                    self.st_sp(X9, self.staging_at + 8 * k as u32);
+                    for w in 0..self.words_of(arg) {
+                        self.ld_sp(X9, arg.0 * 16 + 8 * w);
+                        self.st_sp(X9, self.staging_at + 16 * k as u32 + 8 * w);
+                    }
                 }
-                for k in 0..n {
-                    self.ld_sp(X9, self.staging_at + 8 * k as u32);
-                    self.st(X9, start + k);
+                for (k, arg) in to.args.iter().enumerate() {
+                    for w in 0..self.words_of(arg) {
+                        self.ld_sp(X9, self.staging_at + 16 * k as u32 + 8 * w);
+                        self.st_sp(X9, (start + k) as u32 * 16 + 8 * w);
+                    }
                 }
             }
         }
@@ -493,15 +609,26 @@ impl<A: Allocator> Pass<'_, '_, A> {
         // Promises and hints only allow UB or say nothing, so they are dropped; a meaning must
         // be honoured. `volatile` on a load or store is: each is exactly one access of its
         // width, never merged, split or removed.
+        // An atomic's ordering is honoured (raised where the machine has no weaker form), a
+        // weak `cmpxchg` made strong, a single-thread fence widened to nothing more than
+        // program order (lib.rs, "Atomics").
+        const ORDERING: u8 = 0x7;
+        const ORDERINGS: u8 = 0x3f;
         let honoured = match op {
             Op::Load | Op::Store => Flags::VOLATILE.0,
+            Op::AtomicLoad | Op::AtomicStore | Op::AtomicRmw => ORDERING | Flags::VOLATILE.0,
+            Op::Cmpxchg => ORDERINGS | Flags::WEAK.0 | Flags::VOLATILE.0,
+            Op::Fence => ORDERING | Flags::SINGLE_THREAD.0,
             _ => 0,
         };
         if op.info().flags.meanings_only(flags).0 & !honoured != 0 {
-            return Err(unsupported(inst, op, "a flag that is a meaning (an atomic ordering, `volatile` on a bulk operation)"));
+            return Err(unsupported(inst, op, "a flag that is a meaning it does not honour (`volatile` on a bulk operation)"));
         }
         let mut o = view.operands(inst);
         match op {
+            // Unspecified bits: the value's cell is left as it is. No code, and correct
+            // whatever the type is: any bits are a valid `uninit`.
+            Op::Uninit => {}
             Op::Iconst => {
                 let width = self.result_width(inst, op)?;
                 let word = o.imm();
@@ -642,13 +769,50 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 self.put(enc::csel(X9, X10, X11, Cond::Ne));
                 self.st(X9, inst);
             }
-            Op::Zext | Op::Freeze | Op::PtrAddr => {
+            Op::Zext | Op::Freeze | Op::PtrAddr | Op::Expose | Op::FromExposed => {
                 self.result_width(inst, op)?;
                 let a = o.value();
                 self.width_of(inst, op, a)?;
                 self.ld(X9, a);
                 self.st(X9, inst);
             }
+            Op::PtrWithAddr => {
+                self.result_width(inst, op)?;
+                let (_, addr) = (o.value(), o.value());
+                self.ld(X9, addr);
+                self.st(X9, inst);
+            }
+            Op::Project => {
+                let (pair, k) = (o.value(), o.imm());
+                self.result_width(inst, op)?;
+                if !self.is_pair(view.ty(pair)) || k > 1 {
+                    return Err(unsupported(inst, op, "a member of a compound that is not a pair of integers or pointers"));
+                }
+                self.ld_sp(X9, pair.0 * 16 + 8 * k);
+                self.st(X9, inst);
+            }
+            Op::Rotl
+            | Op::Rotr
+            | Op::Umulhi
+            | Op::Smulhi
+            | Op::UaddSat
+            | Op::SaddSat
+            | Op::UsubSat
+            | Op::SsubSat
+            | Op::Umin
+            | Op::Umax
+            | Op::Smin
+            | Op::Smax => self.int_binary(inst, op)?,
+            Op::UaddOverflow
+            | Op::SaddOverflow
+            | Op::UsubOverflow
+            | Op::SsubOverflow
+            | Op::UmulOverflow
+            | Op::SmulOverflow => self.overflow(inst, op)?,
+            Op::Clz | Op::Ctz | Op::Popcnt | Op::Bswap | Op::Bitrev => self.bits(inst, op)?,
+            Op::AtomicLoad | Op::AtomicStore | Op::AtomicRmw | Op::Cmpxchg | Op::Fence => self.atomic(inst, op)?,
+            Op::Memcpy | Op::Memmove | Op::Memset => self.bulk(inst, op)?,
+            Op::TlsAddr => self.tls_addr(inst, op)?,
             Op::Sext | Op::Trunc => {
                 let width = self.result_width(inst, op)?;
                 let a = o.value();
@@ -699,43 +863,45 @@ impl<A: Allocator> Pass<'_, '_, A> {
             Op::DataAddr => {
                 self.result_width(inst, op)?;
                 let rec = view.reference(o.reference());
+                if rec.kind == RefKind::Static as u32 {
+                    // A static's address is a literal word placement fills (`Reloc`).
+                    self.ld_word(X9, RelocTo::Static(rec.place));
+                    self.st(X9, inst);
+                    return Ok(());
+                }
+                if rec.kind == RefKind::Vtable as u32 {
+                    // A vtable's address is a literal word placement fills, as a static's.
+                    self.ld_word(X9, RelocTo::Vtable(rec.place));
+                    self.st(X9, inst);
+                    return Ok(());
+                }
                 if rec.kind != RefKind::Data as u32 {
-                    return Err(unsupported(inst, op, "the address of a static (only the function's own data is placed with its code)"));
+                    return Err(unsupported(inst, op, "`data_addr` of other than a static, a vtable or the function's own data"));
                 }
                 let row = rec.place;
                 let data = view.datas[row as usize];
-                if data.relocs_len != 0 {
-                    return Err(unsupported(inst, op, "data with addresses in it (relocations placement would fill)"));
-                }
                 if data.align > MOST_DATA_ALIGN {
                     return Err(unsupported(inst, op, "data aligned past 16 bytes (placement aligns the code to 16)"));
                 }
-                let index = match self.data_index[row as usize] {
-                    NONE => {
-                        self.placed.push(row);
-                        let index = self.placed.len() as u32 - 1;
-                        self.data_index[row as usize] = index;
-                        index
-                    }
-                    index => index,
-                };
+                let index = self.place_data(row);
                 self.put_to(enc::adr(X9, 0), Field::Adr, Label::Data(index));
                 self.st(X9, inst);
             }
             Op::FuncAddr => {
                 self.result_width(inst, op)?;
-                let (literal, via) = self.literal(inst, op, o.reference())?;
-                if via == Via::Slot {
-                    return Err(unsupported(
-                        inst,
-                        op,
-                        "the address of a function called through a launcher slot (its literal holds the slot word's address, not the function's)",
-                    ));
+                let reference = o.reference();
+                let place = view.reference(reference).place;
+                match self.via.get(place as usize) {
+                    // A slot function's address is its slot stub's, stable across patches.
+                    Some(Via::Slot) => self.ld_word(X9, RelocTo::SlotStub(place)),
+                    _ => {
+                        let (literal, _) = self.literal(inst, op, reference)?;
+                        self.put_to(enc::ldr_lit(X9, 0), Field::Imm19, Label::Literal(literal));
+                    }
                 }
-                self.put_to(enc::ldr_lit(X9, 0), Field::Imm19, Label::Literal(literal));
                 self.st(X9, inst);
             }
-            Op::Call => self.call(inst, op)?,
+            Op::Call | Op::CallIndirect => self.call(inst, op)?,
             Op::Jump => self.edge(o.target(), next)?,
             Op::Br => {
                 let cond = o.value();
@@ -783,12 +949,14 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 if values.len() != self.rets.len() {
                     return Err(unsupported(inst, op, "a return of other than the signature's values"));
                 }
-                if let (Some(value), Some(ret)) = (values.iter().next(), self.rets.first()) {
+                let rets = self.rets;
+                for (reg, (value, ret)) in values.iter().zip(rets).enumerate() {
+                    let reg = reg as Reg;
                     let width = self.width_of(inst, op, value)?;
-                    self.ld(X0, value);
+                    self.ld(reg, value);
                     // Apple's convention: a sub-32-bit return is extended as the signature says.
                     if ret.ext == Ext::Sext as u8 {
-                        self.widen_signed(X0, width);
+                        self.widen_signed(reg, width);
                     }
                 }
                 self.put(enc::add_imm(SP, FP, 0, false));
@@ -804,7 +972,73 @@ impl<A: Allocator> Pass<'_, '_, A> {
             }
             Op::Unreachable => self.put(enc::brk(BRK_UNREACHABLE)),
             Op::Param => return Err(unsupported(inst, op, "a parameter after a block's first instruction")),
-            _ => return Err(unsupported(inst, op, "an operation outside the baseline tier's integer subset")),
+            // A promise only allows UB, so it is dropped (as `Freeze`'s flags are).
+            Op::Assume => {}
+            // Every op is named here, never by `_`, so an op added to LIR is a compile error
+            // in this match until it has an emit or a named refusal (the class: the walk making
+            // an instruction the emitter cannot lower, found three crates up; rule 54).
+            Op::Fconst
+            | Op::FconstWide
+            | Op::Fadd
+            | Op::Fsub
+            | Op::Fmul
+            | Op::Fdiv
+            | Op::Frem
+            | Op::FminNum
+            | Op::FmaxNum
+            | Op::Fminimum
+            | Op::Fmaximum
+            | Op::Fcopysign
+            | Op::Fneg
+            | Op::Fabs
+            | Op::Sqrt
+            | Op::Floor
+            | Op::Ceil
+            | Op::Ftrunc
+            | Op::Nearest
+            | Op::Fround
+            | Op::Fma
+            | Op::Fmuladd
+            | Op::Fcmp
+            | Op::Fpext
+            | Op::Fptrunc
+            | Op::FptoUi
+            | Op::FptoSi
+            | Op::UitoFp
+            | Op::SitoFp
+            | Op::Bitcast => return Err(unsupported(inst, op, "a float operation (the baseline tier has no float registers yet)")),
+            Op::Vconst
+            | Op::Splat
+            | Op::Extract
+            | Op::Insert
+            | Op::Shuffle
+            | Op::Swizzle
+            | Op::ReduceAdd
+            | Op::ReduceMul
+            | Op::ReduceAnd
+            | Op::ReduceOr
+            | Op::ReduceXor
+            | Op::ReduceUmin
+            | Op::ReduceUmax
+            | Op::ReduceSmin
+            | Op::ReduceSmax
+            | Op::ReduceFadd
+            | Op::ReduceFmul
+            | Op::ReduceFmin
+            | Op::ReduceFmax
+            | Op::Bitmask
+            | Op::MaskedLoad
+            | Op::MaskedStore
+            | Op::Gather
+            | Op::Scatter => return Err(unsupported(inst, op, "a vector operation")),
+            Op::Invoke | Op::InvokeIndirect | Op::Resume => return Err(unsupported(inst, op, "unwinding")),
+            Op::TailCall | Op::TailCallIndirect => return Err(unsupported(inst, op, "a tail call")),
+            Op::Asm | Op::AsmBr => return Err(unsupported(inst, op, "inline assembly")),
+            Op::TargetIntrinsic => return Err(unsupported(inst, op, "a target intrinsic")),
+            Op::FrameAddress | Op::ReturnAddress | Op::StackPointer => {
+                return Err(unsupported(inst, op, "a machine register read (frame or return address, stack pointer)"));
+            }
+            Op::Memcmp => return Err(unsupported(inst, op, "`memcmp`")),
         }
         Ok(())
     }
@@ -820,37 +1054,92 @@ impl<A: Allocator> Pass<'_, '_, A> {
         }
     }
 
-    /// A `call`: AAPCS64 with Apple's rule that the caller extends a sub-32-bit argument as
-    /// its parameter's `ext` says (a cell's value is already zero-extended to 64 bits).
+    /// A `call` or `call_indirect`: AAPCS64 with Apple's rule that the caller extends a
+    /// sub-32-bit argument as its parameter's `ext` says (a cell's value is already
+    /// zero-extended to 64 bits). An `sret` argument goes in x8; a `byval` one is copied into
+    /// the frame first (a copy may itself call `memcpy`, so every copy is made before any
+    /// argument register is loaded) and its copy's address passed.
     fn call(&mut self, inst: usize, op: Op) -> Result<(), EmitError> {
         let view = self.view;
         let mut o = view.operands(inst);
-        let (callee, sig_id, args) = (o.reference(), o.sig(), o.values());
+        let (direct, indirect) = match op {
+            Op::Call => (Some(o.reference()), None),
+            _ => (None, Some(o.value())),
+        };
+        let (sig_id, args) = (o.sig(), o.values());
         let sig = view.sig(sig_id);
-        check_sig(view.sigs[sig_id.index()], sig.params, sig.rets).map_err(|why| unsupported(inst, op, why))?;
+        check_sig(view, view.sigs[sig_id.index()], sig.params, sig.rets).map_err(|why| unsupported(inst, op, why))?;
         if args.len() != sig.params.len() {
             return Err(unsupported(inst, op, "arguments other than the signature's parameters"));
         }
-        let (literal, via) = self.literal(inst, op, callee)?;
-        for (reg, (arg, param)) in args.iter().zip(sig.params).enumerate() {
-            let reg = reg as Reg;
-            self.ld(reg, arg);
-            if param.ext == Ext::Sext as u8 {
-                let width = self.width_of(inst, op, arg)?;
-                self.widen_signed(reg, width);
+        let callee = match direct {
+            Some(reference) => Some(self.literal(inst, op, reference)?),
+            None => None,
+        };
+        // The copies, each at its alignment in this call's stretch of the frame.
+        let mut copies: Vec<u32, Global> = Vec::new_in(Global);
+        let mut area = 0u32;
+        for (arg, param) in args.iter().zip(sig.params) {
+            if param.kind != ParamKind::Byval as u8 {
+                continue;
+            }
+            let (size, align) = byval_of(view, param).map_err(|why| unsupported(inst, op, why))?;
+            area = area.next_multiple_of(1 << align);
+            copies.push(area);
+            self.byval_addr(X9, area);
+            self.ld(X10, arg);
+            self.copy(X9, X10, u64::from(size));
+            area = area.checked_add(size).ok_or(EmitError::TooLarge { what: "a call's `byval` copies" })?;
+        }
+        self.byval_most = self.byval_most.max(area);
+        let mut gpr: Reg = 0;
+        let mut copy = copies.iter();
+        for (arg, param) in args.iter().zip(sig.params) {
+            match ParamKind::from_byte(param.kind) {
+                Some(ParamKind::Sret) => self.ld(X8, arg),
+                Some(ParamKind::Byval) => {
+                    let Some(&at) = copy.next() else {
+                        return Err(unsupported(inst, op, "a `byval` argument without its copy"));
+                    };
+                    self.byval_addr(gpr, at);
+                    gpr += 1;
+                }
+                _ => {
+                    self.ld(gpr, arg);
+                    if param.ext == Ext::Sext as u8 {
+                        let width = self.width_of(inst, op, arg)?;
+                        self.widen_signed(gpr, width);
+                    }
+                    gpr += 1;
+                }
             }
         }
-        self.put_to(enc::ldr_lit(X16, 0), Field::Imm19, Label::Literal(literal));
-        if via == Via::Slot {
-            self.put(enc::ldr(Size::X, X16, X16, 0));
+        match (callee, indirect) {
+            (Some((literal, via)), _) => {
+                self.put_to(enc::ldr_lit(X16, 0), Field::Imm19, Label::Literal(literal));
+                if via == Via::Slot {
+                    self.put(enc::ldr(Size::X, X16, X16, 0));
+                }
+            }
+            (None, Some(pointer)) => self.ld(X16, pointer),
+            (None, None) => return Err(unsupported(inst, op, "a call that names no callee")),
         }
         self.put(enc::blr(X16));
-        if let Some(ret) = sig.rets.first() {
+        for (k, ret) in sig.rets.iter().enumerate() {
             let width = self.width(Ty(ret.ty)).ok_or(unsupported(inst, op, "a return wider than 64 bits"))?;
-            self.narrow(X0, width);
-            self.st(X0, inst);
+            let reg = k as Reg;
+            self.narrow(reg, width);
+            self.st_sp(reg, inst as u32 * 16 + 8 * k as u32);
         }
         Ok(())
+    }
+
+    /// `rd = ` the address of byte `off` of the frame's stretch for `byval` copies, two `add`s
+    /// patched once the stretch's place is known.
+    fn byval_addr(&mut self, rd: Reg, off: u32) {
+        self.byval_fixes.push((self.here(), rd, off));
+        self.put(enc::add_imm(rd, SP, 0, true));
+        self.put(enc::add_imm(rd, rd, 0, false));
     }
 
     /// Places the literal words and the data after the code, patches every field and the
@@ -863,13 +1152,56 @@ impl<A: Allocator> Pass<'_, '_, A> {
             self.fixups[at].at = self.here();
             self.code.extend_from_slice(&[0; 8]);
         }
+        let words_at = self.here();
+        for (i, &to) in self.words.iter().enumerate() {
+            self.relocs.push(Reloc { at: words_at + 8 * i as u32, to, addend: 0 });
+        }
+        self.code.resize(self.code.len() + 8 * self.words.len(), 0);
+        // Data rows, then the rows their relocations reach (the list grows as it is walked).
         let mut data_at = Vec::with_capacity_in(self.placed.len(), Global);
-        for at in 0..self.placed.len() {
+        // (word, index of the data row it reaches, addend), resolved once every row is placed.
+        let mut inner: Vec<(u32, u32, i64), Global> = Vec::new_in(Global);
+        let mut at = 0;
+        while at < self.placed.len() {
             let row = self.placed[at];
             let rec = self.view.datas[row as usize];
+            if rec.align > MOST_DATA_ALIGN {
+                return Err(EmitError::Data { row, why: "data aligned past 16 bytes (placement aligns the code to 16)" });
+            }
             self.pad_to(8usize.max(1 << rec.align));
-            data_at.push(self.here());
+            let start = self.here();
+            data_at.push(start);
             self.code.extend_from_slice(self.view.data_bytes_of(DataId(row)));
+            for r in self.view.data_relocs_of(DataId(row)) {
+                if u64::from(r.offset) + 8 > u64::from(rec.bytes_len) {
+                    return Err(EmitError::Data { row, why: "a relocation past its row's end" });
+                }
+                let word = start + r.offset;
+                let target = self.view.reference(RefId(r.target));
+                let to = match RefKind::from_word(target.kind) {
+                    Some(RefKind::Static) => RelocTo::Static(target.place),
+                    Some(RefKind::Vtable) => RelocTo::Vtable(target.place),
+                    Some(RefKind::Data) => {
+                        let index = self.place_data(target.place);
+                        inner.push((word, index, r.addend));
+                        continue;
+                    }
+                    Some(RefKind::Func) => match self.via.get(target.place as usize) {
+                        Some(Via::Address) => RelocTo::Func(target.place),
+                        // A function pointer to program code is its slot stub's address.
+                        Some(Via::Slot) => RelocTo::SlotStub(target.place),
+                        None => return Err(EmitError::NoVia { place: target.place }),
+                    },
+                    Some(RefKind::Tls) | None => {
+                        return Err(EmitError::Data { row, why: "the address of a thread-local in data (it differs per thread)" });
+                    }
+                };
+                self.relocs.push(Reloc { at: word, to, addend: r.addend });
+            }
+            at += 1;
+        }
+        for &(word, index, addend) in inner.iter() {
+            self.relocs.push(Reloc { at: word, to: RelocTo::Code(data_at[index as usize]), addend });
         }
         if self.code.len() > u32::MAX as usize / 2 {
             return Err(EmitError::TooLarge { what: "the code (2 GiB)" });
@@ -880,6 +1212,7 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 Label::Block(block) => self.block_at[block as usize],
                 Label::Literal(index) => literals_at + 8 * index,
                 Label::Data(index) => data_at[index as usize],
+                Label::Word(index) => words_at + 8 * index,
             };
             let word = patch
                 .field
@@ -888,7 +1221,18 @@ impl<A: Allocator> Pass<'_, '_, A> {
             let at = patch.at as usize;
             self.code[at..at + 4].copy_from_slice(&word.to_le_bytes());
         }
-        let used = u64::from(self.staging_at) + 8 * u64::from(self.staging);
+        // The `byval` copies' stretch, after the staging words.
+        let byval_at = (u64::from(self.staging_at) + 8 * u64::from(self.staging)).next_multiple_of(16);
+        let used = byval_at + u64::from(self.byval_most);
+        if used >= FRAME_LIMIT {
+            return Err(EmitError::TooLarge { what: "the frame (16 MiB)" });
+        }
+        let fixes = core::mem::replace(&mut self.byval_fixes, Vec::new_in(Global));
+        for &(at, rd, off) in fixes.iter() {
+            let to = byval_at as u32 + off;
+            self.set(at, enc::add_imm(rd, SP, to >> 12, true));
+            self.set(at + 4, enc::add_imm(rd, rd, to & 0xfff, false));
+        }
         let frame = used.next_multiple_of(16) + (most_align - 16);
         if frame >= FRAME_LIMIT {
             return Err(EmitError::TooLarge { what: "the frame (16 MiB)" });

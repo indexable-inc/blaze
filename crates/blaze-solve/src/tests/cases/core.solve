@@ -161,3 +161,45 @@ case growing_goal_overflows = search_graph/mod.rs stack_overflow_result
 trait Foo
 impl<T> Foo for T where Vec<T>: Foo
 goal u8: Foo => overflow
+
+# ---- `where const` conditions (blaze's `blaze_comptime`; eval.rs const_holds) ----
+
+case where_const_true_holds = eval.rs const_holds
+trait Flat
+impl<T> Flat for T where const yes(T)
+goal u8: Flat => yes
+
+case where_const_false_fails = eval.rs const_holds
+# `false` fails the impl's goal; nothing else is tried.
+trait Flat
+impl<T> Flat for T where const no(T)
+goal u8: Flat => no
+
+case where_const_error_fails = eval.rs const_holds
+# An evaluation error is never true.
+trait Flat
+impl<T> Flat for T where const err(T)
+goal u8: Flat => no
+
+case where_const_generic_undecided = eval.rs const_holds
+# Over a generic parameter the condition is not decided: the clause fails, even one that would
+# hold at every type.
+trait Flat
+impl<T> Flat for T where const yes(T)
+params U
+goal U: Flat => no
+
+case where_const_inference_variable_stalls = eval.rs const_holds
+trait Flat
+impl<T> Flat for T where const yes(T)
+goal ?0: Flat => maybe
+
+case where_const_assumed_in_env = eval.rs const_holds
+# Inside an item with the same clause, the assumption meets it at the same arguments, whatever
+# the condition's value would be; at other arguments it does not.
+trait Flat
+impl<T> Flat for T where const no(T)
+params U V
+env const no(U)
+goal U: Flat => yes
+goal V: Flat => no

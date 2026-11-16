@@ -16,7 +16,10 @@ pub enum CallKind<'a> {
     FnLike { args: &'a TokenStream<'a> },
     /// `#[m]` (`args` `None`) or `#[m(args)]` on `item`: the item without this attribute.
     Attr { args: Option<&'a TokenStream<'a>>, item: &'a TokenStream<'a> },
-    /// `#[derive(m)]` or `#[derive_const(m)]` on `item`.
+    /// `#[derive(m)]` or `#[derive_const(m)]` on `item`. `item` is the item as the derive sees
+    /// it: `#[cfg]` and `#[cfg_attr]` applied, the `#[derive]` attribute that names this macro
+    /// removed, and every other attribute kept (helper attributes included), in source order.
+    /// The caller builds it.
     Derive { item: &'a TokenStream<'a>, facts: DeriveFacts },
 }
 
@@ -103,6 +106,17 @@ impl<'a> Call<'a> {
         Call { kind: CallKind::FnLike { args }, site, eager: Eager::plain() }
     }
 
+    /// `#[m]` or `#[m(args)]` on `item` (the item without the attribute), as
+    /// [`crate::ItemAttrs::attr_call`] gives them.
+    pub fn attr(args: Option<&'a TokenStream<'a>>, item: &'a TokenStream<'a>, site: CallSite) -> Self {
+        Call { kind: CallKind::Attr { args, item }, site, eager: Eager::plain() }
+    }
+
+    /// `#[derive(m)]` on `item` (the item as a derive sees it), as [`crate::Derives`] gives it.
+    pub fn derive(item: &'a TokenStream<'a>, facts: DeriveFacts, site: CallSite) -> Self {
+        Call { kind: CallKind::Derive { item, facts }, site, eager: Eager::plain() }
+    }
+
     pub fn shape(&self) -> CallShape {
         match self.kind {
             CallKind::FnLike { .. } => CallShape::FnLike,
@@ -141,8 +155,8 @@ impl<'a> Call<'a> {
     }
 
     /// Refuses a call whose streams do not pair their delimiters or carry an expansion's own
-    /// marks: either would be read wrong.
-    pub(crate) fn check(&self) -> Result<(), ExpandError> {
+    /// marks: either would be read wrong. The proof is what code that pairs delimiters takes.
+    pub(crate) fn check(&self) -> Result<Checked, ExpandError> {
         for (stream, tokens) in self.streams() {
             if let Some(token) = tokens.unbalanced() {
                 return Err(ExpandError::Unbalanced { stream, token });
@@ -151,8 +165,16 @@ impl<'a> Call<'a> {
                 return Err(ExpandError::Unsealed { stream });
             }
         }
-        Ok(())
+        Ok(Checked(()))
     }
+}
+
+/// The proof that a call's streams pair their delimiters and carry no mark of their own
+/// expansion ([`Call::check`]), made once a call.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Checked(());
+
+impl Call<'_> {
 
     /// The call's canonical bytes: its kind, call site, eager facts and every stream.
     pub(crate) fn encode<S: Sink>(&self, out: &mut S) {

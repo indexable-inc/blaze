@@ -18,13 +18,17 @@ doctest = false
 blaze-file-items.workspace = true
 blaze-surface.workspace = true
 parser.workspace = true
-# The body form, the checker, and its toy type context (until blaze-ty implements `TypeCtx`).
-blaze-typeck = { workspace = true, features = ["toy"] }
+# The body form, the checker and its type context (`InferCtx`).
+blaze-typeck = { workspace = true }
 blaze-own = { workspace = true, features = ["std"] }
+# Signatures and bodies lowered from text, and bodies converted to the checker's form.
+blaze-lower = { path = "../blaze-lower" }
 blaze-hash = { path = "../blaze-hash" }
 # A checked body to LIR, and LIR to AArch64 code (the baseline tier).
 blaze-build.workspace = true
 blaze-emit.workspace = true
+# A `const` item's value: evaluated once, its record the build reads (`Adts::const_value`).
+blaze-consteval.workspace = true
 # The slot table and code area the program's bodies are placed in, and its wire types.
 blaze-launch.workspace = true
 blaze-launch-rt.workspace = true
@@ -32,9 +36,22 @@ blaze-launch-rt.workspace = true
 blaze-ids = { path = "../blaze-ids" }
 # `dlsym`: an outside symbol's address in this process.
 libc.workspace = true
+# The program's crates: the toolchain's verified packs, their units and edition rule, and
+# every crate's names resolved together (src/crates.rs).
+blaze-toolchain.workspace = true
+blaze-fetch.workspace = true
+blaze-unit-graph.workspace = true
+edition.workspace = true
+blaze-scope.workspace = true
+blaze-id.workspace = true
+# A body's macro calls expanded through the names library (front2/body.rs: blaze-lower's
+# `Scoped` and `ByName`, whose host is an `ExpandCx`).
+blaze-expand.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true
+# tests/hosted.rs: the host table a hosted rung is started with, its calls recorded.
+blaze-std.workspace = true
 
 [lints]
 workspace = true

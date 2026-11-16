@@ -21,7 +21,7 @@ use crate::body::Stmt;
 use crate::diag::{At, DiagCode};
 use crate::error::Stop;
 use crate::ids::{ExprId, List, StmtId};
-use crate::machine::{BreakCtx, Expectation, Flow, Frame, Machine, Then};
+use crate::machine::{BreakCtx, Expectation, Flow, Frame, Machine, Source, Then};
 use crate::ty::TypeCtx;
 use crate::world::World;
 
@@ -49,7 +49,7 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
                 return Ok(Flow::Wait);
             }
             if !self.diverges {
-                self.coerce_many_push(f.a, None, self.common.unit)?;
+                self.coerce_many_push(f.a, Source::Unit(e), self.common.unit)?;
             }
         }
         let ctx = self.breaks.pop();
@@ -100,7 +100,7 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
     ) -> Result<bool, Stop> {
         if f.state == 0 {
             f.t = match ty {
-                Some(t) => self.lower_body_ty(t)?,
+                Some(t) => self.lower_body_ty(t, At::Pat(pat))?,
                 None => self.fresh()?,
             };
             if let Some(init) = init {

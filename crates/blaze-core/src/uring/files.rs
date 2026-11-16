@@ -75,10 +75,13 @@ pub(super) const LOADS: usize = 1024;
 pub(super) const SPREAD_LEAST: usize = 64;
 
 /// `struct statx`'s size, and the mask of what [`Kind::Stat`] asks of it: the type, the mode,
-/// the modification time and the size.
+/// the modification and change times, the inode and the size (the device `statx` always
+/// fills).
 const STATX_SIZE: usize = 256;
-const STATX_META: u32 = 0x0001 | 0x0002 | 0x0040 | 0x0200;
+const STATX_META: u32 = 0x0001 | 0x0002 | 0x0040 | 0x0080 | 0x0100 | 0x0200;
 const STATX_MTIME: u32 = 0x0040;
+const STATX_CTIME: u32 = 0x0080;
+const STATX_INO: u32 = 0x0100;
 /// How a kept file is opened: for reading and appending.
 const KEEP: i32 = libc::O_RDWR | libc::O_APPEND;
 /// How a kept file for reads into and writes from memory is opened: for reading and writing at
@@ -1401,15 +1404,20 @@ impl Uring {
         let statx = self.statx_of(id, &hot);
         let wide = |at: usize| u64::from(word(&statx, at)) | u64::from(word(&statx, at + 4)) << 32;
         let (mask, mode, size) = (word(&statx, 0), word(&statx, 28) & 0xffff, wide(40));
-        let (seconds, nanos) = (wide(112) as i64, word(&statx, 120));
-        let modified_ns = match (mask & STATX_MTIME != 0, u64::try_from(seconds)) {
+        // `stx_mtime` at 112 and `stx_ctime` at 96, each a 64-bit second and a 32-bit nanosecond.
+        let time = |at: usize, bit: u32| match (mask & bit != 0, u64::try_from(wide(at) as i64)) {
             (true, Ok(seconds)) => {
-                seconds.saturating_mul(1_000_000_000).saturating_add(u64::from(nanos))
+                seconds.saturating_mul(1_000_000_000).saturating_add(u64::from(word(&statx, at + 8)))
             }
             _ => 0,
         };
+        let (modified_ns, changed_ns) = (time(112, STATX_MTIME), time(96, STATX_CTIME));
+        let ino = if mask & STATX_INO != 0 { wide(32) } else { 0 };
+        // `stx_dev_major` at 136 and `stx_dev_minor` at 140, as `st_dev` encodes them.
+        let dev = libc::makedev(word(&statx, 136), word(&statx, 140));
         let dir = mode & libc::S_IFMT == libc::S_IFDIR;
-        Step::Ends(Some(Done::Stat(Some(crate::Meta { len: size, dir, modified_ns }))))
+        let meta = crate::Meta { len: size, dir, modified_ns, changed_ns, ino, dev };
+        Step::Ends(Some(Done::Stat(Some(meta))))
     }
 
     /// The request `id`, whose path's directory was missing, makes the directories its path

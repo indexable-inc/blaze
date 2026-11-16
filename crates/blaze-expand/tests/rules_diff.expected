@@ -1,0 +1,367 @@
+== m!(x y) of ($($a:ident)* $b:ident) => {} in E2021
+! LeftoverTokens { at: Some(Made(Transparent)) }
+contexts []
+arm None
+== m!(x, y, z) of ($($a:ident),*) => { $( ${ignore($a)} ${index()} ${len()} )* ${count($a)} } in E2021
+Literal { kind: Integer, suffix_len: 0, spacing: Alone } `0` Made(Transparent) ([Mark { of: This, transparency: Transparent, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Literal { kind: Integer, suffix_len: 0, spacing: Alone } `0` Made(Transparent) ([Mark { of: This, transparency: Transparent, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Literal { kind: Integer, suffix_len: 0, spacing: Alone } `1` Made(Transparent) ([Mark { of: This, transparency: Transparent, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Literal { kind: Integer, suffix_len: 0, spacing: Alone } `0` Made(Transparent) ([Mark { of: This, transparency: Transparent, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Literal { kind: Integer, suffix_len: 0, spacing: Alone } `2` Made(Transparent) ([Mark { of: This, transparency: Transparent, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Literal { kind: Integer, suffix_len: 0, spacing: Alone } `0` Made(Transparent) ([Mark { of: This, transparency: Transparent, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Literal { kind: Integer, suffix_len: 0, spacing: Alone } `3` Made(Transparent) ([Mark { of: This, transparency: Transparent, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+contexts [CtxNode { parent: Ctx(2), mark: Mark { of: This, transparency: Transparent, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } } }]
+arm Some(0)
+== m!() of ($($a:ident)*;)*) => {} in E2021
+! bad definition: expected `=`
+contexts []
+arm None
+== m!(a b; c) of ($( $($a:ident)* );*) => { ${count($a, 0)} ${count($a, 1)} } in E2021
+Literal { kind: Integer, suffix_len: 0, spacing: Alone } `2` Made(Transparent) ([Mark { of: This, transparency: Transparent, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Literal { kind: Integer, suffix_len: 0, spacing: Alone } `3` Made(Transparent) ([Mark { of: This, transparency: Transparent, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+contexts [CtxNode { parent: Ctx(2), mark: Mark { of: This, transparency: Transparent, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } } }]
+arm Some(0)
+== m!(b struct) of (a $x:ident) => {}; (b $y:expr) => {} in E2021
+! binding at Some(Input(1)): expected expression
+contexts []
+arm None
+== m!(z) of ($x:ident) => { $crate::f($x); let y = $x; } in E2021
+Ident { raw: No, spacing: JointHidden } `$crate` Def(10) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Punct { char: ':', spacing: Joint } `` Def(11) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Punct { char: ':', spacing: Alone } `` Def(12) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: JointHidden } `f` Def(13) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Open(Paren) `` Def(14) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `z` Input(0) ([], Some(E2021)) ctx2
+Close(Paren) `` Def(17) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Punct { char: ';', spacing: Alone } `` Def(18) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `let` Def(19) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `y` Def(20) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Punct { char: '=', spacing: Alone } `` Def(21) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `z` Input(0) ([], Some(E2021)) ctx2
+Punct { char: ';', spacing: Alone } `` Def(24) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+contexts [CtxNode { parent: Ctx(2), mark: Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } } }]
+arm Some(0)
+== m!(f) of ($a:ident) => { ${concat($a, _x, 1)} } in E2021
+Ident { raw: No, spacing: Alone } `f_x1` Def(11) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+contexts [CtxNode { parent: Ctx(2), mark: Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } } }]
+arm Some(0)
+== m!(c) of (a) => {} in E2021
+! no rule of 1 matched at Some(Input(0)): found Some("`c`"), expected "`a`"
+contexts []
+arm None
+== m!(f) of ($a:ident) => { ${concat($a, -)} } in E2021
+! bad definition: invalid metavariable expression
+contexts []
+arm None
+== m!(pub(crate) x Vec<u8>, Some(_), a + b * c, let y = 2, { 1 }, 'a, derive(Debug), a::b::<C>, -1, fn f() {}, [z]) of ($v:vis $i:ident $t:ty, $p:pat, $e:expr, $s:stmt, $b:block, $l:lifetime, $m:meta, $pa:path, $lit:literal, $it:item, $tt:tt) => { $v $i $t $p $e $s $b $l $m $pa $lit $it $tt } in E2021
+Ident { raw: No, spacing: JointHidden } `pub` Input(0) ([], Some(E2021)) ctx2
+Open(Paren) `` Input(1) ([], Some(E2021)) ctx2
+Ident { raw: No, spacing: JointHidden } `crate` Input(2) ([], Some(E2021)) ctx2
+Close(Paren) `` Input(3) ([], Some(E2021)) ctx2
+Ident { raw: No, spacing: Alone } `x` Input(4) ([], Some(E2021)) ctx2
+Open(Invisible) `` Def(72) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: JointHidden } `Vec` Input(5) ([], Some(E2021)) ctx2
+Punct { char: '<', spacing: Alone } `` Input(6) ([], Some(E2021)) ctx2
+Ident { raw: No, spacing: JointHidden } `u8` Input(7) ([], Some(E2021)) ctx2
+Punct { char: '>', spacing: Alone } `` Input(8) ([], Some(E2021)) ctx2
+Close(Invisible) `` Def(72) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: JointHidden } `Some` Input(10) ([], Some(E2021)) ctx2
+Open(Paren) `` Input(11) ([], Some(E2021)) ctx2
+Ident { raw: No, spacing: JointHidden } `_` Input(12) ([], Some(E2021)) ctx2
+Close(Paren) `` Input(13) ([], Some(E2021)) ctx2
+Open(Invisible) `` Def(76) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Open(Paren) `` Def(76) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `a` Input(15) ([], Some(E2021)) ctx2
+Punct { char: '+', spacing: Alone } `` Input(16) ([], Some(E2021)) ctx2
+Ident { raw: No, spacing: Alone } `b` Input(17) ([], Some(E2021)) ctx2
+Punct { char: '*', spacing: Alone } `` Input(18) ([], Some(E2021)) ctx2
+Ident { raw: No, spacing: Alone } `c` Input(19) ([], Some(E2021)) ctx2
+Close(Paren) `` Def(76) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Close(Invisible) `` Def(76) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Open(Invisible) `` Def(78) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `let` Input(21) ([], Some(E2021)) ctx2
+Ident { raw: No, spacing: Alone } `y` Input(22) ([], Some(E2021)) ctx2
+Punct { char: '=', spacing: Alone } `` Input(23) ([], Some(E2021)) ctx2
+Literal { kind: Integer, suffix_len: 0, spacing: Alone } `2` Input(24) ([], Some(E2021)) ctx2
+Close(Invisible) `` Def(78) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Open(Invisible) `` Def(80) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Open(Brace) `` Input(26) ([], Some(E2021)) ctx2
+Literal { kind: Integer, suffix_len: 0, spacing: Alone } `1` Input(27) ([], Some(E2021)) ctx2
+Close(Brace) `` Input(28) ([], Some(E2021)) ctx2
+Close(Invisible) `` Def(80) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Punct { char: '\'', spacing: Joint } `` Input(30) ([], Some(E2021)) ctx2
+Ident { raw: No, spacing: Alone } `a` Input(31) ([], Some(E2021)) ctx2
+Ident { raw: No, spacing: JointHidden } `derive` Input(33) ([], Some(E2021)) ctx2
+Open(Paren) `` Input(34) ([], Some(E2021)) ctx2
+Ident { raw: No, spacing: JointHidden } `Debug` Input(35) ([], Some(E2021)) ctx2
+Close(Paren) `` Input(36) ([], Some(E2021)) ctx2
+Open(Invisible) `` Def(86) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: JointHidden } `a` Input(38) ([], Some(E2021)) ctx2
+Punct { char: ':', spacing: Joint } `` Input(39) ([], Some(E2021)) ctx2
+Punct { char: ':', spacing: Alone } `` Input(40) ([], Some(E2021)) ctx2
+Ident { raw: No, spacing: JointHidden } `b` Input(41) ([], Some(E2021)) ctx2
+Punct { char: ':', spacing: Joint } `` Input(42) ([], Some(E2021)) ctx2
+Punct { char: ':', spacing: Joint } `` Input(43) ([], Some(E2021)) ctx2
+Punct { char: '<', spacing: Alone } `` Input(44) ([], Some(E2021)) ctx2
+Ident { raw: No, spacing: JointHidden } `C` Input(45) ([], Some(E2021)) ctx2
+Punct { char: '>', spacing: Joint } `` Input(46) ([], Some(E2021)) ctx2
+Close(Invisible) `` Def(86) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Punct { char: '-', spacing: Alone } `` Input(48) ([], Some(E2021)) ctx2
+Literal { kind: Integer, suffix_len: 0, spacing: Alone } `1` Input(49) ([], Some(E2021)) ctx2
+Ident { raw: No, spacing: Alone } `fn` Input(51) ([], Some(E2021)) ctx2
+Ident { raw: No, spacing: JointHidden } `f` Input(52) ([], Some(E2021)) ctx2
+Open(Paren) `` Input(53) ([], Some(E2021)) ctx2
+Close(Paren) `` Input(54) ([], Some(E2021)) ctx2
+Open(Brace) `` Input(55) ([], Some(E2021)) ctx2
+Close(Brace) `` Input(56) ([], Some(E2021)) ctx2
+Open(Bracket) `` Input(58) ([], Some(E2021)) ctx2
+Ident { raw: No, spacing: JointHidden } `z` Input(59) ([], Some(E2021)) ctx2
+Close(Bracket) `` Input(60) ([], Some(E2021)) ctx2
+contexts [CtxNode { parent: Ctx(2), mark: Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } } }]
+arm Some(0)
+== m!(x * 2) of ($e:expr) => { { let x = 1; $e + x } } in E2021
+Open(Brace) `` Def(9) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `let` Def(10) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `x` Def(11) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Punct { char: '=', spacing: Alone } `` Def(12) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Literal { kind: Integer, suffix_len: 0, spacing: JointHidden } `1` Def(13) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Punct { char: ';', spacing: Alone } `` Def(14) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Open(Invisible) `` Def(16) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Open(Paren) `` Def(16) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `x` Input(0) ([], Some(E2021)) ctx2
+Punct { char: '*', spacing: Alone } `` Input(1) ([], Some(E2021)) ctx2
+Literal { kind: Integer, suffix_len: 0, spacing: Alone } `2` Input(2) ([], Some(E2021)) ctx2
+Close(Paren) `` Def(16) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Close(Invisible) `` Def(16) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Punct { char: '+', spacing: Alone } `` Def(17) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `x` Def(18) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Close(Brace) `` Def(19) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+contexts [CtxNode { parent: Ctx(2), mark: Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } } }]
+arm Some(0)
+== m!(f: 1, 2 + 3; g: ; h: x.y()) of ($($a:ident: $($b:expr),*);*) => { $( fn $a() { $( let _ = $b; )* } )* } in E2021
+Ident { raw: No, spacing: Alone } `fn` Def(26) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `f` Input(0) ([], Some(E2021)) ctx2
+Open(Paren) `` Def(29) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Close(Paren) `` Def(30) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Open(Brace) `` Def(31) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `let` Def(34) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `_` Def(35) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Punct { char: '=', spacing: Alone } `` Def(36) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Open(Invisible) `` Def(38) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Literal { kind: Integer, suffix_len: 0, spacing: Alone } `1` Input(2) ([], Some(E2021)) ctx2
+Close(Invisible) `` Def(38) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Punct { char: ';', spacing: Alone } `` Def(39) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `let` Def(34) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `_` Def(35) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Punct { char: '=', spacing: Alone } `` Def(36) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Open(Invisible) `` Def(38) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Open(Paren) `` Def(38) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Literal { kind: Integer, suffix_len: 0, spacing: Alone } `2` Input(4) ([], Some(E2021)) ctx2
+Punct { char: '+', spacing: Alone } `` Input(5) ([], Some(E2021)) ctx2
+Literal { kind: Integer, suffix_len: 0, spacing: Alone } `3` Input(6) ([], Some(E2021)) ctx2
+Close(Paren) `` Def(38) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Close(Invisible) `` Def(38) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Punct { char: ';', spacing: Alone } `` Def(39) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Close(Brace) `` Def(42) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `fn` Def(26) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `g` Input(8) ([], Some(E2021)) ctx2
+Open(Paren) `` Def(29) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Close(Paren) `` Def(30) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Open(Brace) `` Def(31) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Close(Brace) `` Def(42) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `fn` Def(26) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `h` Input(11) ([], Some(E2021)) ctx2
+Open(Paren) `` Def(29) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Close(Paren) `` Def(30) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Open(Brace) `` Def(31) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `let` Def(34) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `_` Def(35) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Punct { char: '=', spacing: Alone } `` Def(36) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Open(Invisible) `` Def(38) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Open(Paren) `` Def(38) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: JointHidden } `x` Input(13) ([], Some(E2021)) ctx2
+Punct { char: '.', spacing: Alone } `` Input(14) ([], Some(E2021)) ctx2
+Ident { raw: No, spacing: JointHidden } `y` Input(15) ([], Some(E2021)) ctx2
+Open(Paren) `` Input(16) ([], Some(E2021)) ctx2
+Close(Paren) `` Input(17) ([], Some(E2021)) ctx2
+Close(Paren) `` Def(38) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Close(Invisible) `` Def(38) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Punct { char: ';', spacing: Alone } `` Def(39) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Close(Brace) `` Def(42) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+contexts [CtxNode { parent: Ctx(2), mark: Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } } }]
+arm Some(0)
+== m!(a b) of (a) => {} in E2021
+! no rule of 1 matched at Some(Input(1)): found Some("`b`"), expected "`a`"
+contexts []
+arm None
+== m!(a + b) of ($e:expr) => { $e.len() } in E2021
+Open(Invisible) `` Def(10) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Open(Paren) `` Def(10) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `a` Input(0) ([], Some(E2021)) ctx2
+Punct { char: '+', spacing: Alone } `` Input(1) ([], Some(E2021)) ctx2
+Ident { raw: No, spacing: Alone } `b` Input(2) ([], Some(E2021)) ctx2
+Close(Paren) `` Def(10) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Close(Invisible) `` Def(10) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Punct { char: '.', spacing: Alone } `` Def(11) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: JointHidden } `len` Def(12) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Open(Paren) `` Def(13) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Close(Paren) `` Def(14) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+contexts [CtxNode { parent: Ctx(2), mark: Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } } }]
+arm Some(0)
+== m!(x, y) of ($($a:ident),*) => { $( let $a = 1; )* } in E2021
+Ident { raw: No, spacing: Alone } `let` Def(16) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `x` Input(0) ([], Some(E2021)) ctx2
+Punct { char: '=', spacing: Alone } `` Def(19) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Literal { kind: Integer, suffix_len: 0, spacing: JointHidden } `1` Def(20) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Punct { char: ';', spacing: Alone } `` Def(21) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `let` Def(16) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `y` Input(2) ([], Some(E2021)) ctx2
+Punct { char: '=', spacing: Alone } `` Def(19) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Literal { kind: Integer, suffix_len: 0, spacing: JointHidden } `1` Def(20) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Punct { char: ';', spacing: Alone } `` Def(21) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+contexts [CtxNode { parent: Ctx(2), mark: Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } } }]
+arm Some(0)
+== m!() of () => { x } in E2021
+Ident { raw: No, spacing: Alone } `x` Def(5) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+contexts [CtxNode { parent: Ctx(2), mark: Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } } }]
+arm Some(0)
+== m!(a => b => c) of ($($a:ident)=>*) => { $($a)=>* } in E2021
+Ident { raw: No, spacing: Alone } `a` Input(0) ([], Some(E2021)) ctx2
+Punct { char: '=', spacing: Joint } `` Def(20) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Punct { char: '>', spacing: Joint } `` Def(21) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `b` Input(3) ([], Some(E2021)) ctx2
+Punct { char: '=', spacing: Joint } `` Def(20) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Punct { char: '>', spacing: Joint } `` Def(21) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `c` Input(6) ([], Some(E2021)) ctx2
+contexts [CtxNode { parent: Ctx(2), mark: Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } } }]
+arm Some(0)
+== m!(-1) of ($e:expr) => { $e.len() } in E2021
+Open(Invisible) `` Def(10) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Open(Paren) `` Def(10) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Punct { char: '-', spacing: Alone } `` Input(0) ([], Some(E2021)) ctx2
+Literal { kind: Integer, suffix_len: 0, spacing: Alone } `1` Input(1) ([], Some(E2021)) ctx2
+Close(Paren) `` Def(10) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Close(Invisible) `` Def(10) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Punct { char: '.', spacing: Alone } `` Def(11) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: JointHidden } `len` Def(12) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Open(Paren) `` Def(13) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Close(Paren) `` Def(14) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+contexts [CtxNode { parent: Ctx(2), mark: Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } } }]
+arm Some(0)
+== m!(x y) of ($($a:ident)*) => { $a } in E2021
+! binding at Some(Def(14)): expected simple binding, found nested binding `a`
+contexts []
+arm None
+== m!(a::b::c) of ($($a:ident)::*) => { $($a)::* } in E2021
+Ident { raw: No, spacing: Alone } `a` Input(0) ([], Some(E2021)) ctx2
+Punct { char: ':', spacing: Joint } `` Def(20) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Punct { char: ':', spacing: Joint } `` Def(21) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `b` Input(3) ([], Some(E2021)) ctx2
+Punct { char: ':', spacing: Joint } `` Def(20) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Punct { char: ':', spacing: Joint } `` Def(21) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `c` Input(6) ([], Some(E2021)) ctx2
+contexts [CtxNode { parent: Ctx(2), mark: Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } } }]
+arm Some(0)
+== m!(p q) of ($($a:ident)*) => { $(x)* } in E2021
+contexts []
+arm Some(0)
+== m!(Vec<u8>) of ($t:ty) => { <$t>::f() } in E2021
+Punct { char: '<', spacing: Joint } `` Def(9) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Open(Invisible) `` Def(11) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: JointHidden } `Vec` Input(0) ([], Some(E2021)) ctx2
+Punct { char: '<', spacing: Alone } `` Input(1) ([], Some(E2021)) ctx2
+Ident { raw: No, spacing: JointHidden } `u8` Input(2) ([], Some(E2021)) ctx2
+Punct { char: '>', spacing: Alone } `` Input(3) ([], Some(E2021)) ctx2
+Close(Invisible) `` Def(11) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Punct { char: '>', spacing: Joint } `` Def(12) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Punct { char: ':', spacing: Joint } `` Def(13) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Punct { char: ':', spacing: Alone } `` Def(14) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: JointHidden } `f` Def(15) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Open(Paren) `` Def(16) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Close(Paren) `` Def(17) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+contexts [CtxNode { parent: Ctx(2), mark: Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } } }]
+arm Some(0)
+== m!(a 'x b) of ($($a:ident)'x*) => { $($a)'x* } in E2021
+Ident { raw: No, spacing: Alone } `a` Input(0) ([], Some(E2021)) ctx2
+Punct { char: '\'', spacing: Joint } `` Def(20) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `x` Def(21) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `b` Input(3) ([], Some(E2021)) ctx2
+contexts [CtxNode { parent: Ctx(2), mark: Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } } }]
+arm Some(0)
+== m!() of ($($a:ident)*) => { $($a)+ } in E2021
+! UnexpectedToken { at: Some(Made(Transparent)) }
+contexts []
+arm None
+== m!(Vec<u8>) of ($p:path) => { $p::f() } in E2021
+Open(Invisible) `` Def(10) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `Vec` Input(0) ([], Some(E2021)) ctx2
+Punct { char: ':', spacing: Joint } `` Made(Transparent) ([Mark { of: This, transparency: Transparent, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx5
+Punct { char: ':', spacing: Alone } `` Made(Transparent) ([Mark { of: This, transparency: Transparent, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx5
+Punct { char: '<', spacing: Alone } `` Input(1) ([], Some(E2021)) ctx2
+Ident { raw: No, spacing: JointHidden } `u8` Input(2) ([], Some(E2021)) ctx2
+Punct { char: '>', spacing: Alone } `` Input(3) ([], Some(E2021)) ctx2
+Close(Invisible) `` Def(10) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Punct { char: ':', spacing: Joint } `` Def(11) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Punct { char: ':', spacing: Alone } `` Def(12) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: JointHidden } `f` Def(13) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Open(Paren) `` Def(14) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Close(Paren) `` Def(15) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+contexts [CtxNode { parent: Ctx(2), mark: Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } } }, CtxNode { parent: Ctx(2), mark: Mark { of: This, transparency: Transparent, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } } }]
+arm Some(0)
+== m!() of () => { $nope } in E2021
+Punct { char: '$', spacing: Alone } `` Def(6) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `nope` Def(6) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+contexts [CtxNode { parent: Ctx(2), mark: Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } } }]
+arm Some(0)
+== m!(1; "s"; 'c') of ($($a:literal);*) => { [$($a),*] } in E2021
+Open(Bracket) `` Def(14) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Literal { kind: Integer, suffix_len: 0, spacing: Alone } `1` Input(0) ([], Some(E2021)) ctx2
+Punct { char: ',', spacing: Joint } `` Def(20) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Literal { kind: Str, suffix_len: 0, spacing: Alone } `s` Input(2) ([], Some(E2021)) ctx2
+Punct { char: ',', spacing: Joint } `` Def(20) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Literal { kind: Char, suffix_len: 0, spacing: Alone } `c` Input(4) ([], Some(E2021)) ctx2
+Close(Bracket) `` Def(22) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+contexts [CtxNode { parent: Ctx(2), mark: Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } } }]
+arm Some(0)
+== m!(_) of ($e:expr) => { $e } in E2021
+! no rule of 1 matched at Some(Input(0)): found Some("reserved identifier `_`"), expected "meta-variable `$e:expr`"
+contexts []
+arm None
+== m!() of ($($a:tt)?) => { $($a)? } in E2021
+contexts []
+arm Some(0)
+== m!(const { 1 }) of ($e:expr) => { $e } in E2024
+Open(Invisible) `` Def(10) ([Mark { of: This, transparency: SemiOpaque, edition: E2024, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2024)) ctx4
+Open(Paren) `` Def(10) ([Mark { of: This, transparency: SemiOpaque, edition: E2024, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2024)) ctx4
+Ident { raw: No, spacing: Alone } `const` Input(0) ([], Some(E2024)) ctx3
+Open(Brace) `` Input(1) ([], Some(E2024)) ctx3
+Literal { kind: Integer, suffix_len: 0, spacing: Alone } `1` Input(2) ([], Some(E2024)) ctx3
+Close(Brace) `` Input(3) ([], Some(E2024)) ctx3
+Close(Paren) `` Def(10) ([Mark { of: This, transparency: SemiOpaque, edition: E2024, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2024)) ctx4
+Close(Invisible) `` Def(10) ([Mark { of: This, transparency: SemiOpaque, edition: E2024, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2024)) ctx4
+contexts [CtxNode { parent: Ctx(3), mark: Mark { of: This, transparency: SemiOpaque, edition: E2024, site: DefSite { krate: CrateItemKey(070707070707), module: None } } }]
+arm Some(0)
+== m!(!) of ($($a:tt)?) => { $($a)? } in E2021
+Punct { char: '!', spacing: Alone } `` Input(0) ([], Some(E2021)) ctx2
+contexts []
+arm Some(0)
+== m!(_) of ($e:expr_2021) => { $e } in E2024
+! no rule of 1 matched at Some(Input(0)): found Some("reserved identifier `_`"), expected "meta-variable `$e:expr_2021`"
+contexts []
+arm None
+== m!(+) of ($t:ty) => {} in E2021
+! binding at Some(Input(0)): expected type
+contexts []
+arm None
+== m!((a b) () (c)) of ($( ($($x:tt)*) )*) => { $( [$($x)*] )* } in E2021
+Open(Bracket) `` Def(21) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `a` Input(1) ([], Some(E2021)) ctx2
+Ident { raw: No, spacing: Alone } `b` Input(2) ([], Some(E2021)) ctx2
+Close(Bracket) `` Def(28) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Open(Bracket) `` Def(21) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Close(Bracket) `` Def(28) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Open(Bracket) `` Def(21) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+Ident { raw: No, spacing: Alone } `c` Input(7) ([], Some(E2021)) ctx2
+Close(Bracket) `` Def(28) ([Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } }], Some(E2021)) ctx4
+contexts [CtxNode { parent: Ctx(2), mark: Mark { of: This, transparency: SemiOpaque, edition: E2021, site: DefSite { krate: CrateItemKey(070707070707), module: None } } }]
+arm Some(0)

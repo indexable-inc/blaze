@@ -54,14 +54,45 @@ struct Written {
 }
 
 impl Machine<'_, '_, '_> {
+    /// Lowers `builtin # format_args(template, args..)`, the form the expander's
+    /// `format_args!` gives back once its template is expanded: the same node as
+    /// `format_args!(..)`. Its template and arguments are already lowered (`template` the
+    /// first expression, `args` the [`FmtArg`] rows of its `name = expr` arguments), so an
+    /// argument keeps its words' hygiene and `$crate`; only the template's text is read.
+    pub(crate) fn builtin_format_args(
+        &mut self,
+        template: Option<(ExprId, Range)>,
+        args: &[(Node, Range)],
+        r: Range,
+    ) -> Result<ExprId, Why> {
+        let Some((t, tr)) = template else { return Err(Why::NonStringTemplate) };
+        if !matches!(Expr::decode(self.out.exprs[t.0 as usize]), Ok(Expr::Lit(_))) {
+            return Err(Why::NonStringTemplate);
+        }
+        let Some((cs, ce)) = string_contents(tr.of(self.text())) else { return Err(Why::NonStringTemplate) };
+        let template = Range::new(tr.start + idx(cs), tr.start + idx(ce));
+        let alloc = *self.vals.allocator();
+        let mut written: AVec<'_, Written> = Vec::new_in(alloc);
+        for &(node, range) in args {
+            let a = FmtArg::decode(node).map_err(|_| Why::NonStringTemplate)?;
+            written.push(Written { name: a.name, expr: a.expr, range });
+        }
+        self.format_args_of(template, &written, false, r)
+    }
+
     /// Lowers `format_args!(input)` (`input` the token tree's range, delimiters included).
     /// `Err` names why it is no builtin form: its template is not a string literal.
     pub(crate) fn format_args(&mut self, newline: bool, input: Range, r: Range) -> Result<ExprId, Why> {
-        let text = self.text();
         let pe = crate::parser_edition(self.edition);
         let inner = Range::new(input.start + 1, input.end.saturating_sub(1).max(input.start + 1));
+        // The input's text, copied out of the machine's (which an expansion lowered here may
+        // grow), and read by ranges of the machine's.
+        let alloc = *self.vals.allocator();
+        let mut owned = blaze_own::AString::new_in(alloc);
+        owned.push_str(inner.of(self.text()));
+        let of = |r: Range| &owned[(r.start - inner.start) as usize..(r.end - inner.start) as usize];
         // The template: the first token, a string, then `,` or the end.
-        let lexed = LexedStr::new(pe, inner.of(text));
+        let lexed = LexedStr::new(pe, of(inner));
         let Some(first) = non_trivia(&lexed, 0) else { return Err(Why::NonStringTemplate) };
         if lexed.kind(first) != SyntaxKind::STRING {
             return Err(Why::NonStringTemplate);
@@ -72,11 +103,10 @@ impl Machine<'_, '_, '_> {
         let template = Range::new(tok_start + idx(cs), tok_start + idx(ce));
         let mut at = inner.start + idx(lexed.text_start(first) + lexed.text_len(first));
         // The written arguments, each `, [name =] expr`.
-        let alloc = *self.vals.allocator();
         let mut written: AVec<'_, Written> = Vec::new_in(alloc);
         loop {
             let rest = Range::new(at, inner.end);
-            let lexed = LexedStr::new(pe, rest.of(text));
+            let lexed = LexedStr::new(pe, of(rest));
             let Some(comma) = non_trivia(&lexed, 0) else { break };
             if lexed.kind(comma) != SyntaxKind::COMMA {
                 self.diag(DiagKind::Syntax, Range::new(rest.start + idx(lexed.text_start(comma)), rest.end));
@@ -97,7 +127,7 @@ impl Machine<'_, '_, '_> {
             }
             let expr_start = rest.start + idx(lexed.text_start(expr_at));
             let expr_text = Range::new(expr_start, inner.end);
-            let sub = LexedStr::new(pe, expr_text.of(text));
+            let sub = LexedStr::new(pe, of(expr_text));
             let sub_input = sub.to_input(pe);
             let output = PrefixEntryPoint::Expr.parse(sub_input.tokens());
             let base = self.open_container();
@@ -128,11 +158,21 @@ impl Machine<'_, '_, '_> {
             }
             at = end_at;
         }
+        self.format_args_of(template, &written, newline, r)
+    }
+
+    /// The node of `format_args!` with `template` (its string's contents) and the `written`
+    /// arguments: the template's pieces, and the arguments it captures.
+    fn format_args_of(&mut self, template: Range, written: &[Written], newline: bool, r: Range) -> Result<ExprId, Why> {
+        let alloc = *self.vals.allocator();
+        let mut owned = blaze_own::AString::new_in(alloc);
+        owned.push_str(template.of(self.text()));
+        let of = |x: Range| &owned[(x.start - template.start) as usize..(x.end - template.start) as usize];
         // The template's pieces, and the arguments it captures.
         let mut pieces: AVec<'_, (Node, Range)> = Vec::new_in(alloc);
         let mut captured: AVec<'_, (u64, NameIdx, ExprId, Range)> = Vec::new_in(alloc);
         let mut next = 0u32;
-        let bytes = template.of(text).as_bytes();
+        let bytes = of(template).as_bytes();
         let base = template.start;
         let mut i = 0usize;
         let mut run = 0usize;
@@ -142,7 +182,8 @@ impl Machine<'_, '_, '_> {
                 b'}' if bytes.get(i + 1) == Some(&b'}') => i += 2,
                 b'{' => {
                     if run < i {
-                        pieces.push((FmtPiece::Text(Range::new(base + idx(run), base + idx(i))).encode(), template));
+                        let text = BodyRange::building(Range::new(base + idx(run), base + idx(i)));
+                        pieces.push((FmtPiece::Text(text).encode(), template));
                     }
                     let Some(close) = bytes[i + 1..].iter().position(|b| *b == b'}').map(|p| i + 1 + p) else {
                         self.diag(DiagKind::Syntax, Range::new(base + idx(i), template.end));
@@ -156,7 +197,7 @@ impl Machine<'_, '_, '_> {
                         None => (inside, Range::new(base + idx(close), base + idx(close))),
                     };
                     let arg_at = base + idx(i + 1);
-                    let spec_text = spec.of(text);
+                    let spec_text = of(spec);
                     // `name$` and `n$` in the spec name arguments; `.*` takes a positional
                     // before the value's own.
                     for (d, _) in spec_text.match_indices('$') {
@@ -177,17 +218,25 @@ impl Machine<'_, '_, '_> {
                         next += 1;
                     }
                     let arg_text = core::str::from_utf8(arg).unwrap_or("").trim();
+                    let positional = |index: u32| (index as usize) < written.len();
                     let index = if arg_text.is_empty() {
                         next += 1;
+                        if !positional(next - 1) {
+                            self.diag(DiagKind::FormatArgMissing, Range::new(base + idx(i), base + idx(close + 1)));
+                        }
                         next - 1
                     } else if let Ok(n) = arg_text.parse::<u32>() {
+                        if !positional(n) {
+                            self.diag(DiagKind::FormatArgMissing, Range::new(base + idx(i), base + idx(close + 1)));
+                        }
                         n
                     } else {
                         let lead = arg.len() - core::str::from_utf8(arg).unwrap_or("").trim_start().len();
                         let wr = Range::new(arg_at + idx(lead), arg_at + idx(lead + arg_text.len()));
                         self.fmt_named(&written, &mut captured, wr)
                     };
-                    pieces.push((FmtPiece::Arg { arg: index, spec }.encode(), Range::new(base + idx(i), base + idx(close + 1))));
+                    let piece = FmtPiece::Arg { arg: index, spec: BodyRange::building(spec) };
+                    pieces.push((piece.encode(), Range::new(base + idx(i), base + idx(close + 1))));
                     i = close + 1;
                     run = i;
                 }
@@ -200,7 +249,8 @@ impl Machine<'_, '_, '_> {
             }
         }
         if run < bytes.len() {
-            pieces.push((FmtPiece::Text(Range::new(base + idx(run), template.end)).encode(), template));
+            let text = BodyRange::building(Range::new(base + idx(run), template.end));
+            pieces.push((FmtPiece::Text(text).encode(), template));
         }
         let pieces = self.put_rows_of(&pieces);
         let mut args: AVec<'_, (Node, Range)> = Vec::new_in(alloc);
@@ -211,7 +261,7 @@ impl Machine<'_, '_, '_> {
             args.push((FmtArg { name: Some(name), expr, captured: true }.encode(), range));
         }
         let args = self.put_rows_of(&args);
-        let row = self.put_row(FormatArgs { template, pieces, args, newline }.encode(), r);
+        let row = self.put_row(FormatArgs { template: BodyRange::building(template), pieces, args, newline }.encode(), r);
         Ok(self.put_expr(Expr::FormatArgs { row }, r))
     }
 

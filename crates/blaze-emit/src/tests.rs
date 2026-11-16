@@ -12,9 +12,12 @@ use blaze_lir::{
 };
 
 use crate::{
-    Code, EmitError, Via, emit,
+    Code, EmitError, Isa, Os, Via, emit,
     enc::{self, Cond, Size},
 };
+
+/// What the tests emit for: this Mac (every Apple M-series core has FEAT_LSE).
+pub(crate) const ISA: Isa = Isa { lse: true, os: Os::MacOs };
 
 /// The forms, each against the word `clang -c -arch arm64` assembles for it (the text in the
 /// comment), and the patched fields against the assembler's PC-relative words.
@@ -136,8 +139,7 @@ fn refuses_what_it_does_not_emit() {
 
     let (caller, _) = caller_of(Ty::I32);
     assert_eq!(emitted(caller.view(), &[]).err(), Some(EmitError::NoVia { place: 0 }));
-    let refused = func_addr(Via::Slot);
-    assert!(matches!(refused, Some(EmitError::Unsupported { op: Op::FuncAddr, .. })), "{refused:?}");
+    assert_eq!(func_addr(Via::Slot), None, "a slot function's address is its slot stub's");
 }
 
 fn func_addr(via: Via) -> Option<EmitError> {
@@ -156,16 +158,20 @@ fn func_addr(via: Via) -> Option<EmitError> {
 // Running emitted code.
 
 /// Instructions an evaluated run may take.
-const FUEL: u64 = 1_000_000;
+pub(crate) const FUEL: u64 = 1_000_000;
 
-fn emitted(view: View<'_>, via: &[Via]) -> Result<Code<Global>, EmitError> {
+pub(crate) fn emitted(view: View<'_>, via: &[Via]) -> Result<Code<Global>, EmitError> {
+    emitted_for(view, via, ISA)
+}
+
+pub(crate) fn emitted_for(view: View<'_>, via: &[Via], isa: Isa) -> Result<Code<Global>, EmitError> {
     let mut code = Code::new_in(Global);
-    emit(view, via, &mut code)?;
+    emit(view, via, isa, &mut code)?;
     Ok(code)
 }
 
 /// `f(params) = body(params)`, returning the one value `body` gives, of type `ret`.
-fn one(
+pub(crate) fn one(
     params: &[Ty],
     ret: Ty,
     body: impl FnOnce(&mut Builder<Global, Full>, &[Value]) -> Value,
@@ -182,7 +188,7 @@ fn one(
     b.finish_checked().expect("a hand-built function builds")
 }
 
-const fn mask(bits: u32) -> u64 {
+pub(crate) const fn mask(bits: u32) -> u64 {
     match bits {
         64.. => u64::MAX,
         bits => (1 << bits) - 1,
@@ -190,20 +196,39 @@ const fn mask(bits: u32) -> u64 {
 }
 
 #[cfg(target_arch = "aarch64")]
-mod run {
+pub(crate) mod run {
     use std::alloc::Global;
 
     use blaze_inproc::exec::Executable;
 
-    use crate::{Code, Fixup};
+    use crate::{Code, Fixup, RelocTo};
 
     /// `code` placed, each literal word filled by `fill`.
-    pub(super) fn place(code: &Code<Global>, fill: impl Fn(Fixup) -> u64) -> Executable {
+    pub(crate) fn place(code: &Code<Global>, fill: impl Fn(Fixup) -> u64) -> Executable {
+        place_all(code, fill, |to| panic!("an unexpected relocation {to:?}"))
+    }
+
+    /// `code` placed, each fixup's word filled by `fill`, each relocation's by `reloc` (but
+    /// `Code`, its own bytes) plus its addend.
+    pub(crate) fn place_all(
+        code: &Code<Global>,
+        fill: impl Fn(Fixup) -> u64,
+        reloc: impl Fn(RelocTo) -> u64,
+    ) -> Executable {
         Executable::written(code.bytes.len(), 0, |out, _| {
+            let base = out.as_ptr() as u64;
             out.copy_from_slice(&code.bytes);
             for &fixup in code.fixups.iter() {
                 let at = fixup.at as usize;
                 out[at..at + 8].copy_from_slice(&fill(fixup).to_le_bytes());
+            }
+            for r in code.relocs.iter() {
+                let to = match r.to {
+                    RelocTo::Code(off) => base + u64::from(off),
+                    other => reloc(other),
+                };
+                let at = r.at as usize;
+                out[at..at + 8].copy_from_slice(&to.wrapping_add_signed(r.addend).to_le_bytes());
             }
         })
         .expect("the code maps")
@@ -211,7 +236,7 @@ mod run {
 
     /// Calls the function at `exec`'s first byte with four integer arguments (a function of
     /// fewer parameters ignores the rest: AAPCS64 passes each in its own register).
-    pub(super) fn call(exec: &Executable, args: [u64; 4]) -> u64 {
+    pub(crate) fn call(exec: &Executable, args: [u64; 4]) -> u64 {
         // SAFETY: every caller's code is an emitted function of the C convention whose
         // parameters are at most four integers and whose return is at most one integer,
         // mapped executable for as long as `exec` lives; its literal words were filled with
@@ -227,7 +252,7 @@ mod run {
 /// machine's return (of width `ret_bits`) and the evaluator's, or `None` where the evaluator
 /// traps or calls the run undefined. `garbage` goes in the arguments' bits above their widths.
 #[cfg(target_arch = "aarch64")]
-fn both(func: &Func<Global>, args: &[u128], garbage: u64) -> Option<(u64, u64)> {
+pub(crate) fn both(func: &Func<Global>, args: &[u128], garbage: u64) -> Option<(u64, u64)> {
     let view = func.view();
     let vals: Vec<Val> = args.iter().map(|&it| Val::Int(it)).collect();
     let reference = eval::run_in(view, &vals, FUEL, Global).expect("the evaluator runs it");
@@ -252,7 +277,7 @@ fn both(func: &Func<Global>, args: &[u128], garbage: u64) -> Option<(u64, u64)> 
 }
 
 #[cfg(target_arch = "aarch64")]
-fn agrees(func: &Func<Global>, args: &[u128]) {
+pub(crate) fn agrees(func: &Func<Global>, args: &[u128]) {
     for garbage in [0, u64::MAX, 0x5a5a_a5a5_0f0f_f0f0] {
         if let Some((got, want)) = both(func, args, garbage) {
             assert_eq!(got, want, "args {args:x?} (garbage {garbage:#x})\n{}", blaze_lir::print(func.view()));
@@ -261,7 +286,7 @@ fn agrees(func: &Func<Global>, args: &[u128]) {
 }
 
 /// Edge values of a width, as unsigned bits.
-fn edges(bits: u32) -> Vec<u128> {
+pub(crate) fn edges(bits: u32) -> Vec<u128> {
     let m = u128::from(mask(bits));
     let mut out: Vec<u128> =
         [0, 1, 2, 3, 7, m, m - 1, m >> 1, (m >> 1) + 1, 0x5a5a_5a5a_5a5a_5a5a, 0x8000, 100].map(|it| it & m).into();
@@ -270,7 +295,7 @@ fn edges(bits: u32) -> Vec<u128> {
     out
 }
 
-const WIDTHS: [Ty; 5] = [Ty::I1, Ty::I8, Ty::I16, Ty::I32, Ty::I64];
+pub(crate) const WIDTHS: [Ty; 5] = [Ty::I1, Ty::I8, Ty::I16, Ty::I32, Ty::I64];
 
 #[cfg(target_arch = "aarch64")]
 #[test]
@@ -344,8 +369,88 @@ fn arithmetic_agrees_with_the_evaluator() {
 
 /// `sum(n) = 1 + 2 + .. + n`, a loop through block parameters.
 #[cfg(target_arch = "aarch64")]
+/// `uninit` is no code: its cell is left as it is (the walk makes one for a match arm with no
+/// value, as in `from_residual`'s uninhabited `Ok(Infallible)`).
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn uninit_emits_nothing() {
+    let with = one(&[Ty::I64], Ty::I64, |b, v| {
+        let _ = b.uninit(Ty::I64);
+        let _ = b.uninit(Ty::I8);
+        let one = b.iconst(Ty::I64, 1);
+        b.binary(Op::Add, Flags::NONE, v[0], one)
+    });
+    let without = one(&[Ty::I64], Ty::I64, |b, v| {
+        let one = b.iconst(Ty::I64, 1);
+        b.binary(Op::Add, Flags::NONE, v[0], one)
+    });
+    let a = emitted(with.view(), &[]).expect("uninit emits");
+    let b = emitted(without.view(), &[]).expect("emits");
+    // The frame differs by the two cells only: compare the code after the prologue's size.
+    assert_eq!(a.bytes.len(), b.bytes.len(), "no instruction for either `uninit`");
+    let exec = run::place(&a, |_| unreachable!("no literal words"));
+    assert_eq!(run::call(&exec, [41, 0, 0, 0]), 42);
+}
+
 #[test]
 fn a_loop_sums() {
+    let func = sum_func();
+    for n in [0u128, 1, 2, 10, 1000] {
+        agrees(&func, &[n]);
+    }
+    let code = emitted(func.view(), &[]).expect("emits");
+    let exec = run::place(&code, |_| unreachable!());
+    assert_eq!(run::call(&exec, [100, 0, 0, 0]), 5050);
+}
+
+/// The cost of a stack cell per value (codegen.md, "The baseline's cost"): `sum(n)` as this
+/// tier emits it against the same loop with every value in a register (the floor a register
+/// allocator reaches: `cmp; b.hi; add; add; b`, five instructions an iteration). Prints the
+/// code size and the time an iteration of each; asserts only that both agree.
+#[cfg(target_arch = "aarch64")]
+#[test]
+fn the_cell_baseline_against_registers() {
+    let code = emitted(sum_func().view(), &[]).expect("emits");
+    let exec = run::place(&code, |_| unreachable!());
+    let n: u64 = 100_000_000;
+    let floor = |n: u64| -> u64 {
+        let (mut i, mut acc) = (1u64, 0u64);
+        // SAFETY: register arithmetic and branches within the block only; no memory.
+        unsafe {
+            core::arch::asm!(
+                "2:", "cmp {i}, {n}", "b.hi 3f", "add {acc}, {acc}, {i}", "add {i}, {i}, #1", "b 2b", "3:",
+                i = inout(reg) i, acc = inout(reg) acc, n = in(reg) n, options(nomem, nostack),
+            );
+        }
+        let _ = i;
+        acc
+    };
+    let time = |f: &dyn Fn() -> u64| {
+        let mut best = u128::MAX;
+        let mut out = 0;
+        for _ in 0..3 {
+            let start = std::time::Instant::now();
+            out = core::hint::black_box(f());
+            best = best.min(start.elapsed().as_nanos());
+        }
+        (out, best)
+    };
+    let (cells, cells_ns) = time(&|| run::call(&exec, [core::hint::black_box(n), 0, 0, 0]));
+    let (regs, regs_ns) = time(&|| floor(core::hint::black_box(n)));
+    assert_eq!(cells, regs);
+    println!(
+        "cell baseline: sum({n}) code {} bytes ({} instructions); cells {:.3} ns/iter, registers {:.3} ns/iter, ratio {:.2}",
+        code.bytes.len(),
+        code.bytes.len() / 4,
+        cells_ns as f64 / n as f64,
+        regs_ns as f64 / n as f64,
+        cells_ns as f64 / regs_ns as f64,
+    );
+}
+
+/// `sum(n) = 1 + 2 + .. + n` through block parameters: entry, a head testing `i > n`, a body
+/// adding, the exit returning.
+fn sum_func() -> Func<Global> {
     let mut b = Builder::<Global, Full>::new_in(64, Global);
     let sig = b.sig(Conv::C, Variadic::No, &[Param::of(Ty::I64)], &[Param::of(Ty::I64)]);
     b.set_signature(sig);
@@ -371,13 +476,7 @@ fn a_loop_sums() {
     b.begin(exit);
     let out = b.param(Ty::I64);
     b.ret(&[out]);
-    let func = b.finish_checked().expect("builds");
-    for n in [0u128, 1, 2, 10, 1000] {
-        agrees(&func, &[n]);
-    }
-    let code = emitted(func.view(), &[]).expect("emits");
-    let exec = run::place(&code, |_| unreachable!());
-    assert_eq!(run::call(&exec, [100, 0, 0, 0]), 5050);
+    b.finish_checked().expect("builds")
 }
 
 /// A loop whose back edge swaps its parameters: the arguments are all read before any

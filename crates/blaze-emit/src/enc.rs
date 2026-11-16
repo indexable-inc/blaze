@@ -10,10 +10,17 @@
 pub(crate) type Reg = u32;
 
 pub(crate) const X0: Reg = 0;
+pub(crate) const X1: Reg = 1;
+pub(crate) const X2: Reg = 2;
+/// The indirect result register: an `sret` pointer (AAPCS64 6.9, B.4).
+pub(crate) const X8: Reg = 8;
 pub(crate) const X9: Reg = 9;
 pub(crate) const X10: Reg = 10;
 pub(crate) const X11: Reg = 11;
 pub(crate) const X12: Reg = 12;
+pub(crate) const X13: Reg = 13;
+pub(crate) const X14: Reg = 14;
+pub(crate) const X15: Reg = 15;
 pub(crate) const X16: Reg = 16;
 pub(crate) const FP: Reg = 29;
 pub(crate) const LR: Reg = 30;
@@ -31,6 +38,8 @@ pub(crate) enum Cond {
     Hs = 2,
     /// Unsigned `<` (`cc`).
     Lo = 3,
+    /// Signed overflow.
+    Vs = 6,
     /// Unsigned `>`.
     Hi = 8,
     /// Unsigned `<=`.
@@ -119,7 +128,6 @@ pub(crate) const fn mvn(rd: Reg, rm: Reg) -> u32 {
 }
 
 /// `orr xd, xzr, xm`.
-#[cfg_attr(not(test), expect(dead_code, reason = "a form pinned by the encoding tests, which the pass does not use yet"))]
 pub(crate) const fn mov(rd: Reg, rm: Reg) -> u32 {
     orr(rd, ZR, rm)
 }
@@ -179,7 +187,6 @@ pub(crate) const fn asrv(rd: Reg, rn: Reg, rm: Reg) -> u32 {
     0x9ac0_2800 | (rm << 16) | (rn << 5) | rd
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "a form pinned by the encoding tests, which the pass does not use yet"))]
 pub(crate) const fn rorv(rd: Reg, rn: Reg, rm: Reg) -> u32 {
     0x9ac0_2c00 | (rm << 16) | (rn << 5) | rd
 }
@@ -337,6 +344,196 @@ pub(crate) const fn ret() -> u32 {
 
 pub(crate) const fn brk(imm16: u32) -> u32 {
     0xd420_0000 | (imm16 << 5)
+}
+
+// The forms below are pinned by `new_encodings` (src/enc_tests.rs) against words computed by
+// hand from the Arm ARM's field layouts (C6.2, each instruction's page named in the test).
+
+/// `adds xd, xn, xm` (shifted register, no shift).
+pub(crate) const fn adds(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0xab00_0000 | (rm << 16) | (rn << 5) | rd
+}
+
+/// `subs xd, xn, xm` (shifted register, no shift).
+pub(crate) const fn subs(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0xeb00_0000 | (rm << 16) | (rn << 5) | rd
+}
+
+/// `umulh xd, xn, xm`: the high 64 bits of the unsigned 128-bit product.
+pub(crate) const fn umulh(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x9bc0_7c00 | (rm << 16) | (rn << 5) | rd
+}
+
+/// `smulh xd, xn, xm`: the high 64 bits of the signed 128-bit product.
+pub(crate) const fn smulh(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x9b40_7c00 | (rm << 16) | (rn << 5) | rd
+}
+
+/// `asr xd, xn, #shift` (`sbfm xd, xn, #shift, #63`).
+pub(crate) const fn asr_imm(rd: Reg, rn: Reg, shift: u32) -> u32 {
+    sbfm(rd, rn, shift, 63)
+}
+
+/// `rorv wd, wn, wm`: the 32-bit rotation, amount modulo 32, the upper half zeroed.
+pub(crate) const fn rorv_w(rd: Reg, rn: Reg, rm: Reg) -> u32 {
+    0x1ac0_2c00 | (rm << 16) | (rn << 5) | rd
+}
+
+// Data processing, one source.
+
+pub(crate) const fn clz(rd: Reg, rn: Reg) -> u32 {
+    0xdac0_1000 | (rn << 5) | rd
+}
+
+pub(crate) const fn rbit(rd: Reg, rn: Reg) -> u32 {
+    0xdac0_0000 | (rn << 5) | rd
+}
+
+/// `rev16 wd, wn`: the bytes of each halfword swapped, the upper half zeroed.
+pub(crate) const fn rev16_w(rd: Reg, rn: Reg) -> u32 {
+    0x5ac0_0400 | (rn << 5) | rd
+}
+
+/// `rev wd, wn`, the upper half zeroed.
+pub(crate) const fn rev_w(rd: Reg, rn: Reg) -> u32 {
+    0x5ac0_0800 | (rn << 5) | rd
+}
+
+/// `rev xd, xn`.
+pub(crate) const fn rev(rd: Reg, rn: Reg) -> u32 {
+    0xdac0_0c00 | (rn << 5) | rd
+}
+
+// Logical, immediate: the bitmask fields as the encoding has them (`n`, `immr`, `imms`).
+
+pub(crate) const fn and_imm(rd: Reg, rn: Reg, n: u32, immr: u32, imms: u32) -> u32 {
+    0x9200_0000 | (n << 22) | (immr << 16) | (imms << 10) | (rn << 5) | rd
+}
+
+pub(crate) const fn orr_imm(rd: Reg, rn: Reg, n: u32, immr: u32, imms: u32) -> u32 {
+    0xb200_0000 | (n << 22) | (immr << 16) | (imms << 10) | (rn << 5) | rd
+}
+
+/// `orr xd, xn, #(1 << bit)`, `bit` in 0..=63: one set bit is the 64-bit element of one 1
+/// (`imms` 0) rotated right by `64 - bit`.
+pub(crate) const fn orr_bit(rd: Reg, rn: Reg, bit: u32) -> u32 {
+    orr_imm(rd, rn, 1, (64 - bit) % 64, 0)
+}
+
+// SIMD: a population count through a vector register (no CSSC `cnt` on M1).
+
+/// `fmov dd, xn`.
+pub(crate) const fn fmov_to_d(rd: Reg, rn: Reg) -> u32 {
+    0x9e67_0000 | (rn << 5) | rd
+}
+
+/// `fmov xd, dn`.
+pub(crate) const fn fmov_from_d(rd: Reg, rn: Reg) -> u32 {
+    0x9e66_0000 | (rn << 5) | rd
+}
+
+/// `cnt vd.8b, vn.8b`.
+pub(crate) const fn cnt_8b(rd: Reg, rn: Reg) -> u32 {
+    0x0e20_5800 | (rn << 5) | rd
+}
+
+/// `addv bd, vn.8b`.
+pub(crate) const fn addv_8b(rd: Reg, rn: Reg) -> u32 {
+    0x0e31_b800 | (rn << 5) | rd
+}
+
+// Loads and stores, more forms.
+
+/// `ldr xt, [xn, xm, lsl #3]`.
+pub(crate) const fn ldr_lsl3(rt: Reg, rn: Reg, rm: Reg) -> u32 {
+    0xf860_7800 | (rm << 16) | (rn << 5) | rt
+}
+
+// Exclusive and ordered accesses (Armv8.0): `size` in bits 30..32; the unused register
+// fields are all ones.
+
+/// `ldar{b,h,,} rt, [rn]`: a load-acquire.
+pub(crate) const fn ldar(size: Size, rt: Reg, rn: Reg) -> u32 {
+    0x08df_fc00 | ((size as u32) << 30) | (rn << 5) | rt
+}
+
+/// `stlr{b,h,,} rt, [rn]`: a store-release.
+pub(crate) const fn stlr(size: Size, rt: Reg, rn: Reg) -> u32 {
+    0x089f_fc00 | ((size as u32) << 30) | (rn << 5) | rt
+}
+
+/// `ld{a}xr{b,h,,} rt, [rn]`: a load-exclusive, acquiring when `acq`.
+pub(crate) const fn ldxr(size: Size, acq: bool, rt: Reg, rn: Reg) -> u32 {
+    0x085f_7c00 | ((size as u32) << 30) | ((acq as u32) << 15) | (rn << 5) | rt
+}
+
+/// `st{l}xr{b,h,,} ws, rt, [rn]`: a store-exclusive, releasing when `rel`; `ws` is 0 when it
+/// stored, 1 when it lost the reservation.
+pub(crate) const fn stxr(size: Size, rel: bool, rs: Reg, rt: Reg, rn: Reg) -> u32 {
+    0x0800_7c00 | ((size as u32) << 30) | (rs << 16) | ((rel as u32) << 15) | (rn << 5) | rt
+}
+
+/// `clrex`: drops this core's exclusive reservation.
+pub(crate) const fn clrex() -> u32 {
+    0xd503_3f5f
+}
+
+/// The `dmb` domain and kind (`CRm`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub(crate) enum Barrier {
+    /// Inner shareable, loads before loads and stores.
+    IshLd = 0b1001,
+    /// Inner shareable, all accesses.
+    Ish = 0b1011,
+}
+
+pub(crate) const fn dmb(barrier: Barrier) -> u32 {
+    0xd503_30bf | ((barrier as u32) << 8)
+}
+
+// Large System Extensions (FEAT_LSE, Armv8.1): atomic memory operations and compare-and-swap.
+
+/// The operation of an LSE atomic (`o3` and `opc`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u32)]
+pub(crate) enum Lse {
+    Add = 0b0_000,
+    Clr = 0b0_001,
+    Eor = 0b0_010,
+    Set = 0b0_011,
+    Smax = 0b0_100,
+    Smin = 0b0_101,
+    Umax = 0b0_110,
+    Umin = 0b0_111,
+    Swp = 0b1_000,
+}
+
+/// `ld<op>{a,l,al}{b,h,,} rs, rt, [rn]` (`swp` for [`Lse::Swp`]): memory becomes `old op rs`,
+/// `rt` the old value, zero-extended from `size`.
+pub(crate) const fn lse(op: Lse, size: Size, acq: bool, rel: bool, rs: Reg, rt: Reg, rn: Reg) -> u32 {
+    0x3820_0000
+        | ((size as u32) << 30)
+        | ((acq as u32) << 23)
+        | ((rel as u32) << 22)
+        | (rs << 16)
+        | ((op as u32) << 12)
+        | (rn << 5)
+        | rt
+}
+
+/// `cas{a,l,al}{b,h,,} rs, rt, [rn]`: if memory equals `rs`, it becomes `rt`; `rs` gets the
+/// old value either way, zero-extended from `size`.
+pub(crate) const fn cas(size: Size, acq: bool, rel: bool, rs: Reg, rt: Reg, rn: Reg) -> u32 {
+    0x08a0_7c00 | ((size as u32) << 30) | ((acq as u32) << 22) | (rs << 16) | ((rel as u32) << 15) | (rn << 5) | rt
+}
+
+// System registers.
+
+/// `mrs xt, tpidrro_el0` (op0 3, op1 3, CRn 13, CRm 0, op2 3): the read-only thread pointer,
+/// which macOS points at the thread's specific-data slots.
+pub(crate) const fn mrs_tpidrro_el0(rt: Reg) -> u32 {
+    0xd53b_d060 | rt
 }
 
 /// The offset of a branch's or literal's field, for patching once its target is placed.

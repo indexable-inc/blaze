@@ -102,12 +102,26 @@ impl Output {
     pub fn steps(&self) -> impl Iterator<Item = OutlineStep<'_>> {
         let mut at = 0;
         std::iter::from_fn(move || {
+            let (step, next) = self.step(at)?;
+            at = next;
+            Some(step)
+        })
+    }
+
+    /// The step at word `at` (0 for the first) and the word of the next: an index a reader
+    /// can keep beside the output it reads, with no borrow held between steps.
+    pub fn step(&self, at: usize) -> Option<(OutlineStep<'_>, usize)> {
+        let mut at = at;
+        {
             let event = *self.event.get(at)?;
             at += 1;
             if event & Self::EVENT_MASK == 0 {
-                return Some(OutlineStep::Step(Step::Error {
-                    msg: &self.error[(event as usize) >> Self::ERROR_SHIFT],
-                }));
+                return Some((
+                    OutlineStep::Step(Step::Error {
+                        msg: &self.error[(event as usize) >> Self::ERROR_SHIFT],
+                    }),
+                    at,
+                ));
             }
             let tag = ((event & Self::TAG_MASK) >> Self::TAG_SHIFT) as u8;
             let kind = || -> SyntaxKind {
@@ -127,12 +141,12 @@ impl Output {
                 Self::LAZY_EVENT => {
                     let n_input_tokens = self.event[at];
                     at += 1;
-                    return Some(OutlineStep::Lazy { kind: kind(), n_input_tokens });
+                    return Some((OutlineStep::Lazy { kind: kind(), n_input_tokens }, at));
                 }
                 _ => unreachable!(),
             };
-            Some(OutlineStep::Step(step))
-        })
+            Some((OutlineStep::Step(step), at))
+        }
     }
 
     /// The steps of the first node alone, its kind, and the number of input tokens it took:

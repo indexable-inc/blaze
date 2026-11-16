@@ -7,7 +7,7 @@
 use std::{collections::VecDeque, sync::Arc};
 
 use blaze_core::{
-    Completion, Cursor, Done, Effect, FileName, IoError, Lost, Names, S_IFMT, Stamp, Tag,
+    Completion, Cursor, Done, Effect, FileName, IoError, Listing, Lost, Names, S_IFMT, Stamp, Tag,
 };
 use blaze_hash::{HashMap, HashSet};
 use blaze_ids::ContentId;
@@ -231,7 +231,7 @@ enum Pending {
     /// The signature of the tag at a slot of a batch whose stamp moved.
     Probe(u64, usize),
     /// The signature of the tag a listing found, with the listing's entries and the tag's stamp.
-    Listing(u64, FileName, Vec<(FileName, Stamp)>, Stamp),
+    Listing(u64, FileName, Box<Listing>, Stamp),
 }
 
 pub struct Watcher {
@@ -711,7 +711,7 @@ impl Watcher {
         let number = self.push(batch);
         // clone: once per relisting.
         let tag = self.tag(Pending::Entries(number, dir.clone()));
-        effects.push(Effect::Entries { dir, tag });
+        effects.push(Effect::Entries { dir: dir.into(), tag });
     }
 
     /// A batch of `slots`, and the stamp of each asked for in one effect. Returns its number.
@@ -885,7 +885,7 @@ impl Watcher {
         for dir in lists {
             // clone: per directory whose stamp moved.
             let tag = self.tag(Pending::Entries(number, dir.clone()));
-            effects.push(Effect::Entries { dir, tag });
+            effects.push(Effect::Entries { dir: dir.into(), tag });
         }
         for dir in uncached {
             self.uncache(vfs, &dir, effects);
@@ -986,25 +986,32 @@ impl Watcher {
         vfs: &Vfs,
         number: u64,
         dir: &FileName,
-        mut entries: Vec<(FileName, Stamp)>,
+        mut entries: Box<Listing>,
         effects: &mut Vec<Effect>,
     ) {
         let below = self.below.len();
         let rel = self.rel(dir).unwrap_or_default().to_owned();
         self.caches.remove(&rel);
         let caches = &self.caches;
-        entries.retain(|(file, _)| file.as_str().get(below..).is_none_or(|it| !caches.hides(it)));
+        let mut file = String::new();
+        entries.retain(|leaf, _| {
+            file.clear();
+            file.push_str(dir.as_str());
+            file.push('/');
+            file.push_str(leaf.as_str());
+            file.get(below..).is_none_or(|it| !caches.hides(it))
+        });
+        // As the watcher was before it found the tag by name: each entry's whole name tried.
         let tag = match rel.is_empty() {
             true => None,
-            false => entries.iter().position(|(file, stamp)| {
-                file.as_str().get(below..).and_then(tag_of) == Some(rel.as_str())
-                    && may_be_tag(stamp)
+            false => (0..entries.len()).find(|&at| {
+                entries.file_into(at, &mut file).get(below..).and_then(tag_of) == Some(rel.as_str())
+                    && may_be_tag(&entries.stamp(at))
             }),
         };
         match tag {
             Some(at) => {
-                // clone: the probe's name.
-                let (file, stamp) = (entries[at].0.clone(), entries[at].1);
+                let (file, stamp) = (entries.file(at), entries.stamp(at));
                 // clone: per listing that waits on its tag.
                 let tag = self.tag(Pending::Listing(number, dir.clone(), entries, stamp));
                 effects.push(probe(file, tag));
@@ -1021,7 +1028,7 @@ impl Watcher {
         vfs: &Vfs,
         number: u64,
         dir: &FileName,
-        entries: Vec<(FileName, Stamp)>,
+        entries: Box<Listing>,
         effects: &mut Vec<Effect>,
     ) {
         let head = self.head_root(vfs);
@@ -1035,9 +1042,9 @@ impl Watcher {
             let Some(batch) = self.batch(number) else { unreachable!("a listing of no batch") };
             batch.open -= 1;
             if batch.relist.as_ref() == Some(dir) {
-                let there: HashMap<&str, Stamp, Global> =
-                    // alloc: once per batch.
-                    entries.iter().map(|(it, stamp)| (it.as_str(), *stamp)).collect();
+                let mut there: HashMap<String, Stamp, Global> = HashMap::default();
+                // alloc: once per batch.
+                there.extend((0..entries.len()).map(|at| (entries.file(at).as_str().to_owned(), entries.stamp(at))));
                 for (at, slot) in
                     batch.slots.iter_mut().enumerate().filter(|(_, it)| it.look.is_none())
                 {
@@ -1066,7 +1073,8 @@ impl Watcher {
                 }
                 batch.went(disk, &vfs.tree, head, below);
             }
-            for (file, stamp) in entries {
+            for entry in 0..entries.len() {
+                let (file, stamp) = (entries.file(entry), entries.stamp(entry));
                 if batch.known(file.as_str()) || file.as_str().len() <= below {
                     continue;
                 }
@@ -1107,7 +1115,7 @@ impl Watcher {
                 None => {
                     // clone: per new directory.
                     let tag = self.tag(Pending::Entries(number, file.clone()));
-                    effects.push(Effect::Entries { dir: file, tag });
+                    effects.push(Effect::Entries { dir: file.into(), tag });
                 }
             }
         }

@@ -22,7 +22,8 @@ use crate::error::CheckError;
 use crate::ids::{Edition, ExprId, IntTy, ItemKey, List, Name, PatId, Range, ScopeId, StmtId};
 use crate::machine::Plant;
 use crate::portable::PTys;
-use crate::toy::{FieldTy, ToyCtx, ToyStruct, ToyWorld, struct_key};
+use crate::infer::InferCtx;
+use crate::toy::{FieldTy, ToyStruct, ToyWorld, struct_key};
 use crate::world::{Needs, Question};
 use crate::{Outcome, check_with};
 
@@ -88,6 +89,8 @@ impl BodyBuf {
             types: PTys::EMPTY,
             type_lists: &[],
             opt_types: &[],
+            fmt_uses: &[],
+            coroutine: None,
         }
     }
 }
@@ -212,7 +215,7 @@ fn world(case: &Case) -> ToyWorld {
 }
 
 fn run(case: &Case, w: &ToyWorld, hints: &Needs<'_>, plant: Plant) -> Result<Outcome<'static>, CheckError> {
-    let mut ty = ToyCtx::new();
+    let mut ty = InferCtx::new_in(Alloc::global());
     let body = case.body.view(w.owner, case.root);
     check_with(&body, w, &mut ty, hints, plant, Alloc::global())
 }
@@ -313,6 +316,99 @@ fn a_need_then_reentry_equals_one_run() {
     });
 }
 
+/// A clock that counts its reads: deterministic nanoseconds for the ask log.
+struct Ticks(core::cell::Cell<u64>);
+
+impl crate::asks::Clock for Ticks {
+    fn now_ns(&self) -> u64 {
+        let t = self.0.get();
+        self.0.set(t + 1);
+        t
+    }
+}
+
+/// The re-entry loop's fetch: every question a need names (`Kept`), or, planted, the first
+/// round's missed question lost once (a fetch that did not land).
+#[derive(Clone, Copy, Debug)]
+enum Hints {
+    Kept,
+    LoseFirstFetch,
+}
+
+/// The ask log's prediction equals re-entry run for real: a cold body (every question held
+/// back) under pull order runs exactly `restarts(.., Order::Pull).entries` times, and the
+/// logged run's outcome equals the unlogged one's.
+fn restarts_property(tape: &Tape, hints_mode: Hints) -> Result<(), Broke> {
+    let case = draw_case(tape);
+    let full = done(&case, &world(&case), Plant::None)?;
+    let w0 = world(&case);
+    let clock = Ticks(core::cell::Cell::new(0));
+    let view = case.body.view(w0.owner, case.root);
+    let mut ty = InferCtx::new_in(Alloc::global());
+    let (o, log) = match crate::check_logged(&view, &w0, &mut ty, &Needs::new_in(Alloc::global()), &clock, Alloc::global()) {
+        Ok(v) => v,
+        Err(e) => return Err(Broke::Oracle(format!("the logged check failed: {e}"))),
+    };
+    match o {
+        Outcome::Done(c) if c == full => {}
+        _ => return Err(Broke::Oracle(String::from("the logged run's outcome differs from the unlogged one"))),
+    }
+    if log.asks.iter().any(|a| a.missing) {
+        return Err(Broke::Oracle(String::from("a full world's log has a missing ask")));
+    }
+    let predicted = crate::asks::restarts(&log, crate::asks::Order::Pull, Alloc::global());
+    let mut w = world(&case);
+    for &q in full.reads.questions() {
+        w.missing.push(q);
+    }
+    let mut hints = Needs::new_in(Alloc::global());
+    let bound = full.reads.questions().len() as u32 + 2;
+    for entries in 1..=bound {
+        match run(&case, &w, &hints, Plant::None) {
+            Ok(Outcome::Done(_)) => {
+                return if entries == predicted.entries {
+                    Ok(())
+                } else {
+                    Err(Broke::Oracle(format!(
+                        "the log predicted {} entries, re-entry took {entries}",
+                        predicted.entries
+                    )))
+                };
+            }
+            Ok(Outcome::Need(n)) => {
+                let lose = matches!(hints_mode, Hints::LoseFirstFetch) && entries == 1;
+                let mut kept = Vec::new_in(Global);
+                for &q in w.missing.iter() {
+                    if !n.questions.contains(&q) || lose {
+                        kept.push(q);
+                    }
+                }
+                w.missing = kept;
+                hints = n;
+            }
+            Err(e) => return Err(Broke::Oracle(format!("a re-entered run failed: {e}"))),
+        }
+    }
+    Err(Broke::Oracle(String::from("re-entry did not end within its bound")))
+}
+
+#[test]
+fn the_ask_log_predicts_reentry() {
+    blaze_sim::check(Config::cases(300), |tape: &Tape| restarts_property(tape, Hints::Kept));
+}
+
+/// The control: a first fetch that did not land costs one more entry than the log predicts.
+#[test]
+fn the_ask_log_control_catches_a_lost_fetch() {
+    blaze_sim::control(
+        Config::cases(300),
+        Hints::Kept,
+        Hints::LoseFirstFetch,
+        "the log predicted",
+        restarts_property,
+    );
+}
+
 /// What a probe or a failed `commit_if` may leave behind: a diagnostic, an error count, a
 /// queued variable, a pending obligation, a variable's binding. Each is written inside the
 /// snapshot and must be gone after; the committed case shows the test sees each write.
@@ -329,7 +425,7 @@ fn a_rolled_back_snapshot_leaves_nothing_behind() {
     let case = Case { structs: Vec::new_in(Global), params: Vec::new_in(Global), body, root };
     let w = world(&case);
     let view = case.body.view(w.owner, case.root);
-    let mut ty = ToyCtx::new();
+    let mut ty = InferCtx::new_in(Alloc::global());
     let reads = Reads::new_in(&w, Alloc::global());
     let mut m = match Machine::new_in(view, reads, &mut ty, Plant::None, Alloc::global()) {
         Ok(m) => m,
@@ -340,7 +436,7 @@ fn a_rolled_back_snapshot_leaves_nothing_behind() {
         Err(e) => panic!("{e:?}"),
     };
     // Every undoable write a rule makes, then the variable's binding.
-    let write = |m: &mut Machine<'_, '_, '_, '_, ToyWorld, ToyCtx>| -> Result<Option<()>, Stop> {
+    let write = |m: &mut Machine<'_, '_, '_, '_, ToyWorld, InferCtx<'static>>| -> Result<Option<()>, Stop> {
         m.diag(DiagCode::Mismatch, At::Body, None, None, None);
         let n = m.fresh_int()?;
         let unit = m.common.unit;
@@ -349,7 +445,7 @@ fn a_rolled_back_snapshot_leaves_nothing_behind() {
         Ok(Some(()))
     };
     let before = (m.diags.len(), m.errors, m.numeric.len(), m.ty.pending_len());
-    let left = |m: &mut Machine<'_, '_, '_, '_, ToyWorld, ToyCtx>| {
+    let left = |m: &mut Machine<'_, '_, '_, '_, ToyWorld, InferCtx<'static>>| {
         // `var` is bound to `n`, itself an unbound integer variable, so "bound" is "resolves
         // to something else", not "resolves to a non-variable".
         let bound = m.ty.shallow_resolve(var) != var;
@@ -374,6 +470,41 @@ fn a_rolled_back_snapshot_leaves_nothing_behind() {
         (before.0 + 1, before.1 + 1, before.2 + 1, before.3 + 1, true),
         "a committed snapshot lost a write"
     );
+}
+
+/// The checker's invariant: a finding points at its place. A diagnostic that lost its place
+/// (empty range) is `DiagWithoutPlace` naming it, unless its kind is about the whole item (a
+/// missing lang item), which is kept.
+#[test]
+fn a_diagnostic_with_no_place_is_an_internal_error() {
+    use crate::diag::{At, DiagCode};
+    use crate::error::CheckError;
+    use crate::machine::Machine;
+    use crate::world::Reads;
+
+    let mut body = BodyBuf::new(Edition::E2021);
+    let root = body.expr(Expr::Lit(Lit::Int(None)));
+    let case = Case { structs: Vec::new_in(Global), params: Vec::new_in(Global), body, root };
+    let w = world(&case);
+    let view = case.body.view(w.owner, case.root);
+    let outcome = |code: DiagCode| {
+        let mut ty = InferCtx::new_in(Alloc::global());
+        let reads = Reads::new_in(&w, Alloc::global());
+        let mut m = match Machine::new_in(view, reads, &mut ty, Plant::None, Alloc::global()) {
+            Ok(m) => m,
+            Err(e) => panic!("the machine could not be made: {e}"),
+        };
+        m.diag(code, At::Body, None, None, None);
+        match m.writeback() {
+            Ok(c) => Ok(c.diags.len()),
+            Err(e) => Err(e),
+        }
+    };
+    match outcome(DiagCode::Unsatisfied) {
+        Err(CheckError::DiagWithoutPlace { code: DiagCode::Unsatisfied, name: None }) => {}
+        other => panic!("an E0277 with an empty range passed: {other:?}"),
+    }
+    assert!(matches!(outcome(DiagCode::MissingLangItem), Ok(1)), "a whole-item finding was refused");
 }
 
 /// A body of `depth` nested nodes made by `wrap` around an integer literal.

@@ -1,0 +1,6 @@
+status 42
+stdout
+drop c
+drop d
+drop b
+drop a

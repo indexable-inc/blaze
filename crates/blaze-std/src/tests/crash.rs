@@ -85,7 +85,7 @@ fn acts(plan: &Plan, io: &Io, cx: &Cx, dir: &Dir<ReadWrite>, file: &File<ReadWri
     let fail_syncs = |io: &Io| {
         if plan.fail_syncs {
             // clone: the directory's name, a refcount.
-            let name = dir.name().clone();
+            let name = dir.name().name().expect("the directory under test is named").clone();
             io.with_sim(|sim| sim.fail_syncs(name));
         }
     };
@@ -146,10 +146,11 @@ fn acts(plan: &Plan, io: &Io, cx: &Cx, dir: &Dir<ReadWrite>, file: &File<ReadWri
                     return Err("harness: the world is not simulated".to_owned());
                 }
                 let got = read(at)?;
-                let fits = got.starts_with(&durable) && pending.starts_with(&got[durable.len().min(got.len())..]);
-                if !fits || got.len() < durable.len() {
+                // Each unsynced sector on its own: landed, or a hole (the crash a real disk
+                // may make), never a byte not written in that place.
+                if !blaze_core::sim::appended_and_torn(&durable, &pending, &got) {
                     return Err(format!(
-                        "act {at}: after a crash the file holds {} bytes: not the {} made durable then a prefix of the {} after",
+                        "act {at}: after a crash the file holds {} bytes: not the {} made durable then the {} after torn by sectors",
                         got.len(),
                         durable.len(),
                         pending.len()

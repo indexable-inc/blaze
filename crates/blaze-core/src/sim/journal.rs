@@ -29,6 +29,10 @@ enum Entry {
     Lost(FileName, Lost),
 }
 
+/// The device every simulated file is on: not 0, which a real driver reports where it knows
+/// none.
+pub(super) const SIM_DEV: u64 = 0x5155;
+
 #[derive(Clone, Copy)]
 struct Inode {
     ino: u64,
@@ -252,9 +256,24 @@ impl Disk {
         true
     }
 
-    /// The mtime of `name`'s inode, where it has one, without making one.
-    pub(super) fn mtime(&self, name: &FileName) -> Option<u64> {
-        self.inodes.get(name).map(|it| it.mtime)
+    /// A stat or a listing's [`crate::Meta`] of `name`, there with the length `len`, a directory
+    /// if `dir`: its inode (one is given to a name first seen) and both times, which every
+    /// change moves, on the one simulated device, [`SIM_DEV`].
+    pub(super) fn meta(&mut self, name: &FileName, len: u64, dir: bool) -> crate::Meta {
+        if !self.inodes.contains_key(name) {
+            let inode = self.new_inode();
+            // clone: the simulated disk's name of a file or directory first seen.
+            self.inodes.insert(name.clone(), inode);
+        }
+        let inode = self.inodes[name];
+        crate::Meta {
+            len,
+            dir,
+            modified_ns: inode.mtime,
+            changed_ns: inode.ctime,
+            ino: inode.ino,
+            dev: SIM_DEV,
+        }
     }
 
     /// What `name` is now.
@@ -299,34 +318,33 @@ impl Disk {
     /// What is directly in `dir`, sorted; `None` when it is no directory.
     pub(super) fn entries(
         &mut self,
-        dir: &FileName,
+        dir: &crate::DirName,
         files: &HashMap<FileName, SimFile, Global>,
-    ) -> Option<Vec<(FileName, Stamp)>> {
-        if files.contains_key(dir) {
+    ) -> Option<crate::Listing> {
+        if dir.name().is_some_and(|name| files.contains_key(name)) {
             return None;
         }
-        let mut names: Vec<FileName> = files
-            .keys()
-            .filter(|it| *it != dir && it.is_under(dir))
-            .filter_map(|it| {
-                let rest = &it.as_str()[dir.as_str().len() + 1..];
-                let first = rest.split('/').next().expect("a part");
-                // alloc: the listing's payload, a name of it.
-                FileName::new(&format!("{dir}/{first}"))
-            })
-            // alloc: the listing's payload.
-            .collect();
-        if names.is_empty() {
+        // Each entry directly in `dir`, once: a file's own name, or the first part of a deeper
+        // one (a directory).
+        let mut firsts: Vec<&str, Global> = Vec::new_in(Global);
+        firsts.extend(files.keys().filter(|it| Some(*it) != dir.name() && dir.holds(it)).map(|it| {
+            let rest = &it.as_str()[dir.start()..];
+            rest.split('/').next().expect("a part")
+        }));
+        // The root is always there, empty or not.
+        if firsts.is_empty() && dir.name().is_some() {
             return None;
         }
-        names.sort_unstable();
-        names.dedup();
-        let stamped = names.into_iter().map(|name| {
+        firsts.sort_unstable();
+        firsts.dedup();
+        // clone: the listing's directory, a refcount.
+        let mut listing = crate::ListingBuilder::new(dir.clone());
+        for first in firsts {
+            let name = dir.child(first).expect("a directory's name and one part are a name");
             let stamp = self.stamp(&name, files);
-            (name, stamp)
-        });
-        // alloc: the listing's payload.
-        Some(stamped.collect())
+            listing.push(first.as_bytes(), stamp).expect("the simulation's names are names, under the caps");
+        }
+        Some(listing.finish().expect("the simulation's names, sorted, each once"))
     }
 
     /// The batches an [`crate::Effect::Journal`] of `dir` from `since` is told first: the
@@ -518,7 +536,7 @@ mod tests {
             assert!(names.push_str(it));
         }
         let mut effects = vec![Effect::Stamp { files: std::sync::Arc::new(names), tag: Tag(1) }];
-        effects.push(Effect::Entries { dir: name("src"), tag: Tag(2) });
+        effects.push(Effect::Entries { dir: name("src").into(), tag: Tag(2) });
         let mut done = Vec::new();
         sim.submit(&mut effects);
         while sim.in_flight() > 0 {
@@ -528,7 +546,9 @@ mod tests {
         let b = stamp(&mut sim, "src/b.rs");
         let src = stamp(&mut sim, "src");
         assert_eq!(done[0].done, Done::Stamped(vec![b, Stamp::GONE, src]));
-        assert_eq!(done[1].done, Done::Entries(vec![(name("src/b.rs"), b)]));
+        let mut listed = crate::ListingBuilder::new(name("src"));
+        listed.push(b"b.rs", b).unwrap();
+        assert_eq!(done[1].done, Done::Entries(Box::new(listed.finish().unwrap())));
     }
 
     #[test]

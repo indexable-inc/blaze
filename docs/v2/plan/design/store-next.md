@@ -242,3 +242,106 @@ blaze-run's `Parent`:
 - `a_startup_image_round_trips_and_reads_in_place_order`.
 - The format test now also refuses format 3 heads and manifests.
 - blaze-solo: `a_sweep_asks_a_stamp_batch_per_file_thread`.
+
+## The digest under every key
+
+Every item, record and segment is named by BLAKE3 of its bytes (`crates/blaze-blake3`, our own;
+`blaze-ids` wraps it). Most items are under 1 KiB, one BLAKE3 chunk, so the tree's lanes never
+engaged on them. On 2026-11-15 the outline of the standard library hashed at 736 MB/s, and the
+digests were 12.59 ms of a 17.78 ms edit to one item of a 10 MB file (blaze-file-items).
+
+### What was fixed in blaze-blake3
+
+- The scalar compression read its message through a permutation applied each round. It now
+  reads from a table of indices, every round written out: 49.4 ns a block from 63.6 ns.
+- One input of a chunk or less is compressed where it lies, with its last block read by
+  overlapping loads. Before, it was copied block by block into a buffer.
+- The lanes were arrays left to the autovectorizer: 756 MB/s at 16 MiB, slower than one block at
+  a time. They are now `core::simd`, eight lanes, with rotations by 8 and 16 done as one byte
+  shuffle. The same code makes 16 lanes on AVX-512 and 8 on AVX2.
+- New: `hash_many`, `keyed_hash_many` and `derive_key_many` hash many independent inputs, one
+  input to a lane. A lane that finishes takes the next input on the next step, so inputs of
+  different lengths need no sorting, no grouping and no buffer.
+
+### The table
+
+`examples/cost.rs`, one run, the owner's M5 Max (one P core, 4.25 GHz), best of seven, hot in
+cache. SHA-256 and SHA-512 use the CPU's own instructions (ARMv8 SHA2 and ARMv8.2 SHA512). They
+are a probe inside the example, checked against FIPS 180's examples; nothing in the tree calls
+them. One input per call:
+
+| bytes | BLAKE3 before | BLAKE3 now | official `blake3` crate | SHA-256 (hardware) | SHA-512 (hardware) |
+|---|---|---|---|---|---|
+| 16 | 61.4 ns | 46.6 ns | 47.2 ns | 26.0 ns | 148.2 ns |
+| 64 | 63.2 ns, 1,012 MB/s | 46.6 ns, 1,373 MB/s | 1,357 MB/s | 38.6 ns, 1,660 MB/s | 443 MB/s |
+| 256 | 1,017 MB/s | 1,324 MB/s | 1,367 MB/s | 2,810 MB/s | 671 MB/s |
+| 1,024 | 1,014 MB/s | 1,306 MB/s | 1,362 MB/s | 3,141 MB/s | 924 MB/s |
+| 4,096 | 953 MB/s | 1,224 MB/s | 2,444 MB/s | 3,207 MB/s | 1,027 MB/s |
+| 65,536 | 767 MB/s | 2,542 MB/s | 2,504 MB/s | 3,266 MB/s | 1,063 MB/s |
+| 16 MiB | 756 MB/s | 2,958 MB/s | 2,503 MB/s | 3,268 MB/s | 1,038 MB/s |
+
+A tape of 65,536 inputs per call, in millions of inputs a second. "SHA-256 four" runs four
+messages of one length together so that their rounds overlap, which is the fair rival of lanes:
+
+| input bytes | BLAKE3 one at a time | BLAKE3 `hash_many` | SHA-256 one at a time | SHA-256 four |
+|---|---|---|---|---|
+| 16 | 20.9 | 42.8 | 33.5 | 49.8 |
+| 64 | 21.3 | 41.6 | 24.8 | 29.9 |
+| 256 | 5.07 | 12.0 | 10.6 | 12.5 |
+| 1,024 | 1.26 | 3.10 | 3.05 | 3.86 |
+| 1 to 1,024, log-uniform | 6.62 | 13.7 | 14.4 | not measured |
+
+### What wins
+
+- **Under 1 KiB, one at a time:** hardware SHA-256 wins, by 1.21x at 64 B and 2.41x at 1 KiB.
+  One BLAKE3 input is a chain of compressions, 46 ns a block at its latency floor. BLAKE3 now
+  stands at 1.01x that floor at 64 B and 1.06x at 1 KiB, so this gap stays.
+- **Under 1 KiB, batched:** about even. BLAKE3 `hash_many` wins at 64 B by 1.39x, because
+  SHA-256's padding makes 64 B two blocks. SHA-256 four wins at 1 KiB by 1.25x, at 16 B by
+  1.17x and at 256 B by 1.04x. On mixed lengths, batched BLAKE3 is 5% behind SHA-256 one at a
+  time.
+- **Large blobs:** on one thread, SHA-256 leads by 1.10x at 16 MiB. That is not the whole
+  comparison. BLAKE3's tree splits one blob across cores and across 16 AVX-512 lanes, and
+  SHA-256 cannot split one blob at all. Neither the multi-core case nor x86-64 was measured
+  here.
+- **SHA-512** is out on this CPU: 144.5 ns at 64 B and 1,038 MB/s at 16 MiB.
+
+### What a switch would touch, and what it would not gain
+
+- Code: `blaze-blake3`, the one crate that computes the digest. `blaze-ids` (`b3.rs` wraps
+  `hash`, `context_key`, `derive_key_with` and `Hasher`; `many.rs` builds `of_many` on
+  `blaze_blake3::lanes`). `blaze-cond` (`Hasher::new_derive_key`). The 90 crates that depend on
+  `blaze-ids` reach the digest only through `ContentId` and `b3`, so their source would not
+  change. `blaze-launch-host`, `blaze-launch-rt`, `blaze-codegen-code` and `ix-prof` use the
+  official `blake3` crate directly. They are outside item keys.
+- Data: every content ID, key, record and segment name changes. Every home is rebuilt, and the
+  shared cache and its precompiled std are filled again.
+- Lost: BLAKE3's modes. `derive_key` gives each kind of ID its own domain, and SHA-256 would need
+  a prefix block or a stored midstate to do the same. The keyed mode is a MAC in one pass, where
+  SHA-256 needs HMAC's two because of length extension. The extended output goes too. So does
+  the tree, which a range fetch from R2 could verify piece by piece.
+- Not gained: the edit loop's digest share. Batching alone is 2.07x on the mixed tape (6.62 to
+  13.7 M/s). Hardware SHA-256 adds at most another 1.25x, its best row. For the outline's
+  12.59 ms that is a projection, not a measurement: about 6.1 ms batched, and about 4.9 ms with
+  SHA-256 at its best.
+
+### Keys must resist collisions
+
+The shared cache is read by people who did not write it. A record is served to whoever asks for
+its key. If someone who can choose inputs (a pull request that CI builds) could make two inputs
+share a key, one input's record would be served for the other. So a key must be
+collision-resistant. A non-cryptographic hash (xxh3, wyhash, CRC) is out for keys, however fast
+it is. CRC-32C stays where it is: a checksum over bytes already named by BLAKE3.
+
+### Recommendation
+
+Keep BLAKE3 for keys, and batch the digests. The number that decides it: on the outline's mix of
+lengths, batched BLAKE3 runs at 13.7 M inputs a second against hardware SHA-256's 14.4, a 5%
+gap. SHA-256's best batched row is 1.25x ahead (1 KiB). Its worst is 1.39x behind (64 B). No row
+reaches the 1.5x that would pay for rebuilding every record and losing the modes and the tree.
+The work is in the callers, not here: the outline and `blaze-items` should hash each file's items
+in one `derive_key_many` (or `ContentId::of_many`) call, not one by one. One more step for the
+coordinator: `blaze-ids`' `many.rs` duplicates `hash_many`, with its own grouping by block count
+and its own `padded_words`, and could call `derive_key_many` instead (rule 30). Revisit if a
+measurement on x86-64 with SHA-NI and AVX-512, or of SHA-256 run four at a time over unequal
+lengths, moves the mixed-length row by more than 1.5x.

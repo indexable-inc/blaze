@@ -38,12 +38,23 @@
 //!   outside its attributes; for a tuple field: its position). Two builders of one text agree
 //!   on it, and an edit outside the item's earlier equals does not move it. It is the index
 //!   among equals the inherited layer's AST ids carry (`span::ast_id`).
-//! - [`Item::hash`]: the [`ContentId`] in [`ITEM_DOMAIN`] of the edition and the item's bytes,
-//!   from its first token (an outer attribute's or doc comment's) to its last, and
-//!   [`Item::signature_hash`] of the edition and the prefix of those bytes before its body:
-//!   one hasher is fed the signature's bytes, read at the cut, then fed the rest, so no byte is
-//!   hashed twice. An entry's hash covers the entries written inside it (a module's covers its
-//!   items), and its signature hash covers none of its body.
+//! - [`Item::signature_hash`] and [`Item::hash`]: a Merkle step over the item's bytes, from its
+//!   first token (an outer attribute's or doc comment's) to its last, cut where the signature
+//!   ends (before the body, a direct `=` or a direct `;`). The item's own bytes are runs
+//!   between its child entries, each fed as the tag 0 and the run with its length
+//!   (`Hasher::part`; the runs before, between and after the children, empty ones too, and
+//!   the run that holds the cut as two runs, cut there); each child entry is fed as the tag 1
+//!   and the child's own `hash` (32 bytes). The signature hash, in [`SIGNATURE_DOMAIN`], takes
+//!   the edition (one byte), then the runs and children before the cut; the hash, in
+//!   [`ITEM_DOMAIN`], takes the signature hash (32 bytes), then the runs and children after
+//!   it. So every byte is compressed once, by its innermost entry's one digest, and each digest
+//!   is one short input that can be hashed side by side with others (crate::digest); an
+//!   entry's hash changes whenever any byte under it does (a module's covers its items); an
+//!   edit to a child rehashes the child's own bytes and the 33 bytes it stands for in each
+//!   ancestor; and the signature hash covers none of the body. (Until 2026-11-16 the
+//!   signature hash was one hasher read at the cut and the hash the same hasher read at the
+//!   end, in `merkle 1`; it was split so that no prefix is compressed twice when hashed side by
+//!   side.)
 //!
 //! ## Why bytes, not tokens (decided 2026-11-15 by the coordinator of the rebuild)
 //!
@@ -54,8 +65,8 @@
 //! `blaze_lex::skip_body` (bracket depth over a structural mask, about 3.4 GB/s on one core)
 //! and its bytes go to BLAKE3 as one slice (crate::skeleton). Positions stay byte offsets
 //! relative to the item, which the diagnostics read anyway. The floor of an outline is then
-//! one skip of the file plus one BLAKE3 pass over each byte times the number of entries
-//! enclosing it.
+//! one skip of the file plus one BLAKE3 pass over each byte (the Merkle step above; before
+//! it, a byte was hashed once for each entry enclosing it).
 //!
 //! Measured 2026-11-15, one run on the owner's Mac, `examples/time.rs` over library/ (3,130
 //! files, 57.0 MB, one thread): the outline took 1,005.7 ms before (token digests, bodies
@@ -71,6 +82,27 @@
 //! 18, assembly 0.8 ms); an edit to one part with every other part's outline in hand, 17.8 ms,
 //! of which the digest of every part to look it up is 12.6 ms and the split 4.5 ms.
 //!
+//! After the Merkle step, the same day: library/ in 694.6 ms on one thread (82 MB/s); the
+//! floor 16.8 ms of skip and 72.9 ms of BLAKE3 (782 MB/s), 89.7 ms, so 7.7x. On the 10.0 MB
+//! file, with [`resplit`] and the previous text in hand, an edit to one part costs 0.94 ms:
+//! the resplit 0.24 ms (its compare alone 0.224 ms, 44.8 GB/s; 3,204 bytes scanned and
+//! digested again), the outline of the one changed part 0.05 ms, the assembly 0.63 ms (a copy
+//! of every entry, the one file-sized step left). Its floor, the compare and the changed
+//! part's outline, is 0.27 ms. The split and digest of the whole file take 9.99 ms on one
+//! thread and 1.58 ms on 18 ([`speculate`] per chunk 0.59 ms, [`join`] 0.19 ms with 5,311
+//! bytes scanned again at the seams, the digests 0.78 ms).
+//!
+//! 2026-11-16, with the entry flags, [`Assembled`] in place of the copy, the faster
+//! `blaze_blake3` and the digests split at the cut and hashed side by side (crate::digest):
+//! library/ in 671.6 ms on one thread (85 MB/s), against 710.3 to 747.8 ms for the same tree
+//! with digests streamed one entry at a time, rounds interleaved; 59.3 ms on 18 threads.
+//! BLAKE3 over every byte is now 24.1 ms (2,366 MB/s), so the floor is about 41 ms and the
+//! outline 16x it: the parser and the walk are what is left. The 10.0 MB file: cold 104.8 ms
+//! on one thread, 8.8 ms on 18; an edit to one part 0.31 ms (resplit 0.24 ms, the part's
+//! outline 0.04 ms, assembly 0.02 ms) against a floor of about 0.27 ms. Its parts' digests
+//! gain nothing side by side (4.59 ms against 4.66 ms one by one): a part is kilobytes long,
+//! and one input that long already fills the vector lanes chunk by chunk.
+//!
 //! # A file is outlined item by item
 //!
 //! 1. [`split_top_level`] cuts a file at its top-level item boundaries by a structural scan, no
@@ -78,10 +110,21 @@
 //!    (found by `blaze_lex::skip_body`, unlexed) when an item's first token follows.
 //! 2. [`outline_item`] outlines one part from its bytes and the edition alone, so its result
 //!    is a record keyed by the part's digest, made on any thread or found made before.
-//! 3. [`assemble`] concatenates the parts' outlines: it moves file positions and indices by
-//!    each part's base, and recounts the top-level disambiguators across parts.
-//! 4. [`outline`] is the three in a row on one thread, tested equal to a whole-file walk on
-//!    every file of library/; an edit to one item costs the scan, one part and the assembly.
+//! 3. [`Assembled`] puts the parts' outlines together without copying them: an entry is moved
+//!    by its part's base when read, and the top-level disambiguators recounted across parts
+//!    are a side table of the few that differ. An edit to one item costs the scan, one part,
+//!    and a step a part and a probe a top-level entry to assemble.
+//! 4. [`outline`], the cold path on one thread, walks each part straight into the file's one
+//!    outline, its ranges moved by the part's start as they are written, then takes every
+//!    entry's digests in fixed batches: no part has an outline of its own. Both it and 1 to 3
+//!    are tested equal to a whole-file walk on every file of library/.
+//!
+//! # Flags
+//!
+//! Each entry carries [`ItemFlags`] read from its own tokens in the walk's one token pass
+//! (crate::flags): `unsafe`, foreign code, inline assembly, and a macro call not yet expanded.
+//! A body the skeleton leaves unlexed is lexed for them only when its bytes hold the word
+//! `unsafe` or a `#`, the only forms a body with no item keyword and no call can hold.
 //!
 //! # What the outline is the input of
 //!
@@ -92,11 +135,23 @@
 //!
 //! # Allocation
 //!
-//! Every allocation this crate makes is in the allocator the caller names. The lexer and the
-//! parser it calls keep their own columns (tokens, the parser's input words, events), in the
-//! worker's scratch (`blaze_mem::scratch`) and the global heap; all are freed or back on the
-//! shelf before [`outline`] returns. Taking them into the caller's allocator is the parser's
-//! change to make, not this crate's.
+//! What an outline keeps is in the allocator the caller names, at its exact size and copied
+//! there once. What it only works in (the outline as the walk grows it, the skeleton, the
+//! walk's stacks, the digests' key counts) is the worker's scratch (`blaze_mem::scratch`, on
+//! the global heap) kept at its high-water mark, like the lexer's and the parser's columns
+//! (tokens, input words, events); all are back on the shelf before [`outline`] returns. In a
+//! bump frame the kept columns, growing by turns, would copy each other at each doubling, and
+//! the working set would sit beneath them. Bytes per item in the frame, `scratch` example,
+//! 2026-11-16 (before: each part's outline, then assembled and copied, all in the frame):
+//!
+//! | input                                   | items  | before   | after   | time before, after  |
+//! |-----------------------------------------|--------|----------|---------|---------------------|
+//! | 1,000 one-line `fn`s                    | 1,000  | 1,713 B  | 220 B   | 0.63 ms, 0.53 ms    |
+//! | library/core, 299 files                 | 13,428 | 1,961 B  | 358 B   | 59.96 ms, 57.66 ms  |
+//! | tempo's tt_2d_pool.rs, 315 kB           | 359    | 1,850 B  | 213 B   | 3.72 ms, 3.70 ms    |
+//!
+//! The floor is the kept outline, 172 B an item and its attributes, keys and errors: library/
+//! core's 358 B is its attributes (`#[stable]`, `#[inline]`, ...), 24 B each.
 //!
 //! The crate is `#![no_std]`: its collections are blaze-own's. The parser it calls
 //! (crates/parser) is on `std` (`tracing`, `blaze_mem`'s per-thread scratch), which this crate
@@ -104,7 +159,13 @@
 
 #![no_std]
 #![feature(allocator_api)]
+#![feature(portable_simd)]
 
+// `thread_local!`: the worker's scratch outline (crate::walk).
+extern crate std;
+
+mod digest;
+mod flags;
 mod header;
 mod skeleton;
 mod split;
@@ -114,7 +175,8 @@ use core::fmt;
 
 use blaze_own::{AVec, Alloc};
 use blaze_surface::{
-    Attr, AttrSpan, BuildError, Edition, FileItems, Item, ItemIndex, RecordBytes, SyntaxError,
+    Attr, AttrSpan, BuildError, Edition, FileItems, Item, ItemFlags, ItemIndex, RecordBytes,
+    SyntaxError,
 };
 
 pub use blaze_ids::ContentId;
@@ -122,9 +184,13 @@ pub use header::{HeaderError, ImplHeader, impl_header};
 pub use walk::Bodies;
 pub use parser::SyntaxKind;
 
-/// The domain of [`Item::hash`] and [`Item::signature_hash`]: the edition and an item's bytes,
-/// whole or before its body.
-pub const ITEM_DOMAIN: &str = "blaze v2 file item bytes 1";
+/// The domain of [`Item::hash`]: the Merkle step over an item's signature digest, the rest of
+/// its own bytes and its children's digests (crate docs, "Identity").
+pub const ITEM_DOMAIN: &str = "blaze v2 file item merkle 2";
+
+/// The domain of [`Item::signature_hash`]: the edition, an item's own bytes before its body
+/// and the digests of its children there (crate docs, "Identity").
+pub const SIGNATURE_DOMAIN: &str = "blaze v2 file item signature 1";
 
 /// The outline of `text`, a source file of `edition`, in `alloc`: every item it declares at any
 /// module-level nesting, in source order, and the syntax errors of the parse. It always
@@ -143,28 +209,35 @@ pub const ITEM_DOMAIN: &str = "blaze v2 file item bytes 1";
 /// the syntax errors are those outside the bodies it leaves unread.
 pub fn outline<'a>(text: &str, edition: Edition, alloc: Alloc<'a>) -> Outline<'a> {
     let parts = split_top_level(text, alloc);
-    let mut outlines: AVec<'a, (u32, Outline<'a>)> = AVec::with_capacity_in(parts.len(), alloc);
-    for part in &parts {
-        outlines.push((part.start, outline_item(&text[part.to_usize()], edition, alloc)));
-    }
-    assemble(outlines.iter().map(|(base, outline)| (*base, outline)), alloc)
+    walk::outline_parts::<SideBySide>(text, parts.iter().copied(), parser_edition(edition), Bodies::Skipped, alloc)
 }
 
 /// The outline of one part of a file ([`split_top_level`]), from its bytes and the edition
 /// alone: positions are relative to the part's start, and the top-level disambiguators count
-/// only the part's entries until [`assemble`] recounts them.
+/// only the part's entries until [`Assembled`] recounts them.
 pub fn outline_item<'a>(part: &str, edition: Edition, alloc: Alloc<'a>) -> Outline<'a> {
-    walk::outline(part, parser_edition(edition), Bodies::Skipped, alloc)
+    walk::outline::<SideBySide>(part, parser_edition(edition), Bodies::Skipped, alloc)
 }
 
 /// The whole file walked at once, with `fn` bodies read as `bodies` says: the reference
 /// [`outline`] is tested equal to ([`Bodies::Skipped`]), and the reference that is to
 /// ([`Bodies::Parsed`]).
 pub fn outline_with<'a>(text: &str, edition: Edition, bodies: Bodies, alloc: Alloc<'a>) -> Outline<'a> {
-    walk::outline(text, parser_edition(edition), bodies, alloc)
+    walk::outline::<SideBySide>(text, parser_edition(edition), bodies, alloc)
 }
 
-pub use split::{assemble, split_top_level};
+/// [`outline_with`], its digests hashed by `C`: the seam [`SideBySide`] and its twin
+/// [`OneByOne`] are tested equal at.
+pub fn outline_hashed_by<'a, C: Compress>(text: &str, edition: Edition, bodies: Bodies, alloc: Alloc<'a>) -> Outline<'a> {
+    walk::outline::<C>(text, parser_edition(edition), bodies, alloc)
+}
+
+pub use digest::{Compress, OneByOne, SideBySide, part_digests};
+
+pub use split::{
+    Assembled, PART_DOMAIN, Part, Resplit, Speculated, chunk_starts, common_prefix, common_suffix, join, part_digest,
+    resplit, speculate, split_top_level,
+};
 
 /// The schema's edition as the parser's.
 fn parser_edition(edition: Edition) -> parser::Edition {
@@ -192,12 +265,45 @@ pub struct Outline<'a> {
     errors: AVec<'a, SyntaxError>,
     /// The errors' messages, one after another, each copied from a `&str`.
     messages: AVec<'a, u8>,
-    /// Each top-level entry's sibling key (its parent, kind and name or head), in order: what
-    /// its disambiguator counts.
-    keys: AVec<'a, ContentId>,
+    /// Each top-level entry and its sibling key (its parent, kind and name or head), in order:
+    /// what its disambiguator counts.
+    keys: AVec<'a, (ItemIndex, ContentId)>,
+    /// The flags of the file's own tokens, outside every entry.
+    own_flags: ItemFlags,
+    /// `own_flags` and every entry's together.
+    flags: ItemFlags,
 }
 
 impl Outline<'_> {
+    /// This outline in `alloc`, each column at its exact length.
+    fn copy_in<'b>(&self, alloc: Alloc<'b>) -> Outline<'b> {
+        fn exact<'b, T: Copy>(from: &[T], alloc: Alloc<'b>) -> AVec<'b, T> {
+            let mut to = AVec::with_capacity_in(from.len(), alloc);
+            to.extend_from_slice(from);
+            to
+        }
+        Outline {
+            items: exact(&self.items, alloc),
+            attrs: exact(&self.attrs, alloc),
+            file_attrs: self.file_attrs,
+            errors: exact(&self.errors, alloc),
+            messages: exact(&self.messages, alloc),
+            keys: exact(&self.keys, alloc),
+            own_flags: self.own_flags,
+            flags: self.flags,
+        }
+    }
+
+    /// Every flag the file's tokens set, its own and its entries' ([`ItemFlags`]).
+    pub fn flags(&self) -> ItemFlags {
+        self.flags
+    }
+
+    /// The flags of the file's own tokens, outside every entry (`#![..]`).
+    pub fn own_flags(&self) -> ItemFlags {
+        self.own_flags
+    }
+
     /// The `FileItems` record of this outline of `text`, the file whose content is `file`, in
     /// `alloc`: every value the outline holds, and each entry's name's text. Refused only when
     /// the outline is not one of `text`, whose names it would cut.
@@ -215,6 +321,7 @@ impl Outline<'_> {
             file_attrs: self.file_attrs,
             errors: &self.errors,
             messages: &self.messages,
+            file_flags: self.own_flags,
         };
         parts.write(alloc)
     }
@@ -294,6 +401,8 @@ impl PartialEq for Outline<'_> {
             && self.errors[..] == other.errors[..]
             && self.messages[..] == other.messages[..]
             && self.keys[..] == other.keys[..]
+            && self.own_flags == other.own_flags
+            && self.flags == other.flags
     }
 }
 

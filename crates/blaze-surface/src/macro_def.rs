@@ -53,6 +53,23 @@ byte_enum! {
         CfgSelect = 23 => "cfg_select",
         TraceMacros = 24 => "trace_macros",
         LogSyntax = 25 => "log_syntax",
+        /// core's `pattern_type!(T is PAT)` (library/core/src/pat.rs): written
+        /// `builtin # pattern_type(T is PAT)`, the form the parser reads a pattern type in.
+        PatternType = 26 => "pattern_type",
+    }
+}
+
+impl BuiltinFn {
+    /// The builtin a library definition names: the argument of its `#[rustc_builtin_macro(..)]`,
+    /// or the macro's own name when the attribute has none. The library's `core::panic!` is
+    /// `rustc_builtin_macro(core_panic)` and `std::panic!` is `rustc_builtin_macro(std_panic)`:
+    /// both are [`BuiltinFn::Panic`], whose expansion names `$crate::panic::panic_2015` or
+    /// `panic_2021`, and `$crate` is the defining crate, so one form serves both.
+    pub fn of_library(name: &str) -> Option<BuiltinFn> {
+        match name {
+            "core_panic" | "std_panic" => Some(BuiltinFn::Panic),
+            _ => BuiltinFn::ALL.into_iter().find(|it| it.name() == name),
+        }
     }
 }
 

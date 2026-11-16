@@ -501,6 +501,10 @@ impl Driver for Timed<'_> {
         Driver::wall_ns(&*self.sim)
     }
 
+    fn boot(&self) -> Result<blaze_core::Boot, blaze_core::NoBoot> {
+        Driver::boot(&*self.sim)
+    }
+
     fn waker(&self) -> Option<Waker> {
         self.sim.waker()
     }

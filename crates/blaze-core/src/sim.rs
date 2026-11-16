@@ -1,8 +1,8 @@
 //! A deterministic [`Driver`]: one thread, a virtual clock and a seeded scheduler, so a state
 //! machine's run under it is a function of the seed. It delays completions, delivers the ones
 //! that are ready in a shuffled order, fails effects at a chosen rate, and [`Sim::crash`]
-//! loses what was not synced, keeping a random prefix of it (a torn append), as a power cut
-//! does. A failing seed replays exactly.
+//! loses what was not synced in any of the ways a power cut may: each unsynced [`SECTOR`] on
+//! its own, so an append may lose its middle and keep its end. A failing seed replays exactly.
 //!
 //! Processes are the test's: [`Sim::program`] says what a program does when it is spawned, how
 //! long it takes and what it ends with; a memory limit it passes kills it, as a cgroup does.
@@ -27,10 +27,15 @@
 //! [`Sim::fail_reads`], [`Sim::short_reads`] and [`Sim::rot`] aim faults at the reads of the
 //! store's pool.
 //!
-//! A whole-file write and a rename that wait for no sync ([`Effect::WriteUnsynced`],
-//! [`Effect::RenameUnsynced`]) are as their synced forms until a crash, which may undo either
-//! (the name holds what it held before, a renamed file is back under its old name) and tears
-//! the bytes of an unsynced write by [`SECTOR`]s whether or not it undoes it. A clone holds
+//! A name is durable only once its directory is synced, as on a real disk: a file made (an
+//! append, a cut, a lock, a clone, a copy, a link), written whole in place of another without a
+//! sync ([`Effect::WriteUnsynced`]), renamed without one ([`Effect::RenameUnsynced`]) or
+//! removed is a change of a name a crash may undo (the name holds what it held before, a
+//! renamed file is back under its old name), until [`Effect::SyncDir`] of its directory (for a
+//! rename, the new name's). A file's [`Effect::Sync`] makes its bytes durable, never its name.
+//! [`Effect::Write`] and [`Effect::Rename`] sync their directories before they complete, as
+//! the native drivers do. A crash tears the bytes of an unsynced write by [`SECTOR`]s whether
+//! or not it undoes it. A clone holds
 //! its source's bytes as they are when it completes, whole and durable: a file system that
 //! shares blocks writes its source's dirty pages out before it shares them. That write is the
 //! clone's cost, and the simulation charges it: the bytes written to a file since its last
@@ -207,10 +212,6 @@ struct SimFile {
     mode: u32,
     /// A symbolic link, its bytes its target.
     link: bool,
-    /// What a whole-file write or a rename that waited for no sync
-    /// ([`Effect::WriteUnsynced`], [`Effect::RenameUnsynced`]) put this file in place of, until
-    /// a sync covers the file: a crash may undo it.
-    undo: Option<Box<Undo>>,
     /// How many of `ops`, from the first, were written back to the device
     /// ([`Effect::WriteBack`], or a clone that forced them out): not durable, but no longer
     /// only in memory. The ops after them are the file's dirty data.
@@ -230,13 +231,57 @@ struct SimFile {
     blocks: std::collections::BTreeSet<u64>,
 }
 
-/// What a crash puts back when it undoes a write or a rename that waited for no sync.
+/// A change of a name no sync of its directory has covered yet ([`Sim::names`]): a crash may
+/// undo it, and what it holds is what the undo puts back. The disk world's
+/// [`crate::world::disk::Named`], by name.
 #[derive(Debug)]
-struct Undo {
-    /// The file that was under the name before; none when there was no file.
-    was: Option<SimFile>,
-    /// A rename's source: the name the file is back under.
-    from: Option<FileName>,
+enum Named {
+    /// A file put under `file`: made where none was (`was` none), or written whole in place
+    /// of the file that was. Undone, the file goes and `was` is back as far as it was durable.
+    Put { file: FileName, was: Option<SimFile> },
+    /// The file under `file` removed. Undone, it is back as far as it was durable.
+    Gone { file: FileName, was: SimFile },
+    /// The file under `from` renamed to `to`, in place of `was`. Undone, the file is back
+    /// under `from` and `was` under `to`.
+    Moved { from: FileName, to: FileName, was: Option<SimFile> },
+}
+
+impl Named {
+    /// Whether it changes the name `name`.
+    fn touches(&self, name: &FileName) -> bool {
+        match self {
+            Named::Put { file, .. } | Named::Gone { file, .. } => file == name,
+            Named::Moved { from, to, .. } => from == name || to == name,
+        }
+    }
+
+    /// Whether it and `other` change a name in common: undoing the earlier of the two undoes
+    /// the later.
+    fn shares(&self, other: &Named) -> bool {
+        match self {
+            Named::Put { file, .. } | Named::Gone { file, .. } => other.touches(file),
+            Named::Moved { from, to, .. } => other.touches(from) || other.touches(to),
+        }
+    }
+
+    /// The directory whose sync makes it durable: the file's, or for a rename the new name's
+    /// (`fs.rs`'s `rename` and the ring's syncs that one first, and the old name's directory
+    /// too where it is another).
+    fn dir(&self) -> &str {
+        match self {
+            Named::Put { file, .. } | Named::Gone { file, .. } => parent_of(file),
+            Named::Moved { to, .. } => parent_of(to),
+        }
+    }
+}
+
+/// The directory `name` is directly in: everything before its last `/`, or the root's empty
+/// name.
+fn parent_of(name: &FileName) -> &str {
+    match name.as_str().rsplit_once('/') {
+        Some((dir, _)) => dir,
+        None => "",
+    }
 }
 
 /// What a crash keeps of one file's changes not synced ([`Sim::crash_cut`]).
@@ -245,10 +290,20 @@ struct Cut {
     name: FileName,
     /// How many of them, from the first, are kept whole.
     kept: usize,
-    /// The part of the next that landed, as changes.
-    torn: Vec<Op>,
-    /// Whether the write or rename that put the file under its name without a sync is undone.
-    undone: bool,
+    /// How many of them, from the first, may have landed in part: at least `kept`. The tear
+    /// is drawn after the barriers have had their say ([`Sim::crash_cut`]).
+    upto: usize,
+    /// What landed of the changes after those kept whole: the disk world's own value.
+    torn: crate::world::disk::Torn,
+}
+
+/// What a crash does ([`Sim::crash_cut`]): what it keeps of each file, by name, and of each
+/// change of a name not synced ([`Sim::names`], in its order) whether it is undone, each later
+/// change that shares a name with one undone undone too.
+#[derive(Debug)]
+struct Cuts {
+    files: Vec<Cut>,
+    undone: Vec<bool>,
 }
 
 impl Default for SimFile {
@@ -259,7 +314,6 @@ impl Default for SimFile {
             ops: Vec::new(),
             mode: 0o644,
             link: false,
-            undo: None,
             back: 0,
             // alloc: none, two empty vectors.
             stamps: Vec::new(),
@@ -313,7 +367,22 @@ impl SimFile {
 
     /// Its length with every change applied, without making its bytes.
     fn len(&self) -> u64 {
-        self.ops.iter().fold(self.durable.len() as u64, |len, op| match op {
+        self.len_after(self.ops.len())
+    }
+
+    /// Its durable bytes with its first `count` changes made: what a crash tears between.
+    fn after(&self, count: usize) -> Vec<u8> {
+        // clone: a crash, not an op: a copy of the bytes a tear mixes.
+        let mut bytes = self.durable.clone();
+        for op in &self.ops[..count.min(self.ops.len())] {
+            op.apply(&mut bytes);
+        }
+        bytes
+    }
+
+    /// Its length with its first `count` changes applied, without making its bytes.
+    fn len_after(&self, count: usize) -> u64 {
+        self.ops[..count.min(self.ops.len())].iter().fold(self.durable.len() as u64, |len, op| match op {
             Op::Append(more) => len + more.len() as u64,
             Op::At(at, more) | Op::Sectors(at, more) => len.max(at + more.len() as u64),
             Op::Cut(to) => *to,
@@ -345,7 +414,7 @@ impl SimFile {
 
     /// The first `covers` of its changes made durable.
     fn sync(&mut self, covers: usize) {
-        let SimFile { durable, ops, undo, back, stamps, barriers, .. } = self;
+        let SimFile { durable, ops, back, stamps, barriers, .. } = self;
         let covered = covers.min(ops.len());
         for op in ops.drain(..covered) {
             op.apply(durable);
@@ -356,12 +425,21 @@ impl SimFile {
             *covers = covers.saturating_sub(covered);
             *covers > 0
         });
-        // What a sync covers it writes out; what came after it is as dirty as it was.
+        // What a sync covers it writes out; what came after it is as dirty as it was. Its name
+        // is its directory's to make durable ([`Sim::sync_names`]), never this.
         *back = back.saturating_sub(covered);
-        // A file synced whole is on the disk under its name: nothing is left to undo.
-        if ops.is_empty() {
-            *undo = None;
+    }
+
+    /// As it is on the disk after a crash that keeps none of its changes not synced: what a
+    /// crash puts back when it undoes the change of a name that replaced or removed it.
+    fn durable_only(mut self, keep_barriers: bool) -> SimFile {
+        self.ops.clear();
+        self.back = 0;
+        if !keep_barriers {
+            self.stamps.clear();
+            self.barriers.clear();
         }
+        self
     }
 }
 
@@ -390,19 +468,29 @@ impl Op {
         }
     }
 
-    /// The change cut short, as a power cut leaves a write it was in the middle of: a prefix
-    /// of an append or a write at an offset, any of a write from memory's sectors.
-    fn torn(&self, rng: &mut Rng) -> Vec<Op> {
-        // alloc: a crash, not an op: the part of the change that landed.
-        let part =
-            |more: &[u8], rng: &mut Rng| more[..rng.below(more.len() as u64) as usize].to_vec();
-        match self {
-            Op::Append(more) => vec![Op::Append(part(more, rng))],
-            Op::At(at, more) => vec![Op::At(*at, part(more, rng))],
-            Op::Sectors(at, more) => some_sectors(*at, more, rng),
-            Op::Cut(_) => Vec::new(),
-        }
+}
+
+/// Whether `after`, a file read after a crash, is one the crash may leave of a file whose bytes
+/// `durable` were synced and to which `appended` was then appended, unsynced, in one or more
+/// appends: a test's oracle. It begins with all of `durable` and is no longer than both; each
+/// [`SECTOR`] of it past `durable` holds `appended`'s bytes in their places up to some point
+/// (an append kept whole may end inside a sector), then zeros (a hole) — a later sector may be
+/// whole while an earlier one is zeros.
+pub fn appended_and_torn(durable: &[u8], appended: &[u8], after: &[u8]) -> bool {
+    if !after.starts_with(durable) || after.len() > durable.len() + appended.len() {
+        return false;
     }
+    let mut from = durable.len();
+    while from < after.len() {
+        let to = ((from / SECTOR + 1) * SECTOR).min(after.len());
+        let new = &appended[from - durable.len()..to - durable.len()];
+        let landed = after[from..to].iter().zip(new).take_while(|(a, b)| a == b).count();
+        if after[from + landed..to].iter().any(|it| *it != 0) {
+            return false;
+        }
+        from = to;
+    }
+    true
 }
 
 /// Any of the [`SECTOR`]s of `bytes` at `at`, each kept or not, as writes at their offsets: what
@@ -471,11 +559,35 @@ struct Receiving {
     into: Vec<u8>,
 }
 
+/// One folder above a simulation's root ([`Sim::set_above`]).
+#[derive(Clone, Debug, Default)] // clone: a test's world, copied into each run
+pub struct SimAbove {
+    /// The name in it of the folder on the way down to the root.
+    pub toward: std::sync::Arc<str>,
+    /// Its other files, by names relative to it, with their bytes.
+    pub files: Vec<(FileName, Vec<u8>)>,
+}
+
 pub struct Sim {
     rng: Rng,
     faults: Faults,
     now: Duration,
+    /// The simulated machine's boot ([`Driver::boot`]): drawn from the seed, and drawn anew at
+    /// every power cut ([`Sim::crash_with`]).
+    boot: crate::Boot,
+    /// The generator boots are drawn from: the seed's own, apart from `rng`, so that drawing a
+    /// boot moves no other draw of a seed's run.
+    boots: Rng,
     files: HashMap<FileName, SimFile, Global>,
+    /// The changes of names no sync of their directory has covered, oldest first: a crash may
+    /// undo any of them, with every later one that shares a name ([`Sim::crash`]). A name is
+    /// durable only once its directory is synced; a file's sync makes its bytes durable,
+    /// never its name. Directories made ([`Effect::MakeDir`]) are not in it: a directory's own
+    /// name is durable as it is made, which is looser than a disk (std.md, "The disk model").
+    names: Vec<Named>,
+    /// The folders above the root, nearest first ([`Sim::set_above`]): read-only, so they are
+    /// plain bytes, outside the disk's journal and its crashes.
+    above: Vec<SimAbove>,
     /// Whose a file or directory is and who else can write it, where a test said it is not
     /// the user's alone ([`Sim::set_access`]).
     access: HashMap<FileName, Access, Global>,
@@ -559,6 +671,9 @@ pub struct Sim {
     /// them ([`Sim::bytes_read`]).
     bytes_written: u64,
     bytes_read: u64,
+    /// Files mapped for writing ([`Effect::MapWrite`]) whose mapping may still be held: folded
+    /// into their file by [`Sim::fold_drawn`] once it is dropped; forgotten at a crash.
+    drawn: Vec<(FileName, Drawn)>,
     /// Data bytes kernel copies copied ([`Sim::bytes_copied`]).
     bytes_copied: u64,
     /// UDP sockets, the standard streams, the wall clock and directories made (`sim/host.rs`).
@@ -596,6 +711,12 @@ fn after_told(told: &[Told], at: Duration, a: Tag, b: Tag) -> Duration {
         .fold(at, Duration::max)
 }
 
+/// The slot a simulated [`Effect::MapWrite`]'s bytes come back through: empty while the task's
+/// [`crate::MappingWrite`] holds them, filled when it is dropped. The simulator drains it at
+/// its next effect ([`Sim::fold_drawn`]) and folds the bytes into the file as unsynced writes
+/// from memory ([`Op::Sectors`]), so a crash before a sync tears them by sectors as any other.
+pub(crate) type Drawn = std::sync::Arc<crate::lock::Lock<Option<Vec<u8>>>>;
+
 /// The file `name` of the simulated disk, made empty if it is not there.
 fn file_mut<'a>(
     files: &'a mut HashMap<FileName, SimFile, Global>,
@@ -614,7 +735,13 @@ impl Sim {
             rng: Rng::new(seed),
             faults,
             now: Duration::ZERO,
+            // Drawn below, once the boots' generator is there.
+            boot: crate::Boot([0; 16]),
+            boots: Rng::new(seed ^ 0xB007_B007_B007_B007),
             files: HashMap::new_in(Global),
+            names: Vec::new_in(Global),
+            // alloc: none until a test sets folders above the root.
+            above: Vec::new(),
             access: HashMap::new_in(Global),
             pending: Wheel::new(),
             spawns: Tagged::new(RESERVE),
@@ -661,6 +788,8 @@ impl Sim {
             stall_holders: None,
             bytes_written: 0,
             bytes_read: 0,
+            // alloc: none until a file is mapped for writing.
+            drawn: Vec::new(),
             bytes_copied: 0,
             host: host::Host::new(seed),
             bytes_forced: 0,
@@ -671,7 +800,17 @@ impl Sim {
         };
         // The disk's clock is the wall clock from the start, so its first stamps are of then.
         sim.disk.at(sim.wall_ns());
+        sim.boot = sim.draw_boot();
         sim
+    }
+
+    /// A new boot of the simulated machine: 16 bytes from the boots' generator.
+    fn draw_boot(&mut self) -> crate::Boot {
+        let (high, low) = (self.boots.next_u64(), self.boots.next_u64());
+        let mut bytes = [0u8; 16];
+        bytes[..8].copy_from_slice(&high.to_le_bytes());
+        bytes[8..].copy_from_slice(&low.to_le_bytes());
+        crate::Boot(bytes)
     }
 
     /// How many files reads into memory opened, and how many descriptors closed, as a real
@@ -798,17 +937,25 @@ impl Sim {
     /// The machine loses power: every effect in flight is gone without a completion, every
     /// watch, process, listen and connection with it, and each file keeps what was synced plus
     /// a random prefix of the changes after (appends, writes at an offset, writes from memory,
-    /// truncations), the last of which may be torn: an append or a write at an offset to a
-    /// prefix, a write from memory to any of its [`SECTOR`]s. A write from memory in flight
+    /// truncations) whole; of the changes after those, up to any of them, each [`SECTOR`] of
+    /// the file on its own is the new bytes or the old (zeros past the old end), and the
+    /// length is anywhere between ([`crate::world::disk::Torn`]): a later sector may survive
+    /// an earlier one, as unsynced data on a real disk may. A write from memory in flight
     /// may have landed any of its sectors first. A whole-file write or rename that completed is
-    /// kept whole; one in flight is not there. One that waited for no sync
-    /// ([`Effect::WriteUnsynced`], [`Effect::RenameUnsynced`]) and completed may be undone (the
-    /// name holds what it held before, a renamed file is back under the name it had), and an
-    /// unsynced write's bytes are torn by [`SECTOR`]s as any change not synced is.
+    /// kept whole; one in flight is not there. Each change of a name no sync of its directory
+    /// covered ([`Sim::names`]: a file made, written whole or renamed without a sync, removed)
+    /// may be undone, with every later change that shares a name with it (the name holds what
+    /// it held before, as far as that was durable; a renamed file is back under the name it
+    /// had), and an unsynced write's bytes are torn by [`SECTOR`]s as any change not synced is.
     ///
     /// Every lock goes with the processes that held them, another process's too
     /// ([`Sim::hold_lock`]), and a disk filled up ([`Sim::fill`]) has room again.
     pub fn crash(&mut self) {
+        // A mapping for writing let go wrote the page cache: its bytes are unsynced writes the
+        // cut tears. One still held is taken to have landed none (one of the outcomes its
+        // contract allows).
+        self.fold_drawn();
+        self.drawn.clear();
         let cut = self.crash_cut();
         self.crash_with(cut);
     }
@@ -817,7 +964,7 @@ impl Sim {
     /// gone, and what each file keeps is drawn, the files in the order of their names.
     /// [`Sim::crash_with`] makes the disk of it. The two are apart so that the disk world's
     /// refinement test (`sim/world.rs`) can ask the world whether it allows the cut drawn.
-    fn crash_cut(&mut self) -> Vec<Cut> {
+    fn crash_cut(&mut self) -> Cuts {
         seeds::crashed(self);
         // A write from memory in flight may have landed any of its sectors, unsynced: the cut
         // below keeps or tears them as it does every change since the last sync.
@@ -860,22 +1007,29 @@ impl Sim {
         self.crash_wakes();
         self.stamp_epochs();
         // By name, so the seed's numbers go to the same files whatever the table's order.
-        // alloc: a crash, not an op.
-        let mut files: Vec<(&FileName, &SimFile)> = self.files.iter().collect();
+        let mut files: Vec<(&FileName, &SimFile)> = Vec::with_capacity_in(self.files.len(), Global);
+        files.extend(self.files.iter());
         files.sort_unstable_by(|a, b| a.0.cmp(b.0));
-        // What each file keeps of its changes not synced, drawn file by file as before
-        // barriers were modelled (a run with none draws the same numbers): whether its write
-        // or rename that waited for no sync is undone (a file with nothing to undo draws no
-        // number for it, so a run without them is as it was), how many changes, and the part
-        // of the next that landed.
-        // alloc: a crash, not an op.
-        let mut cuts: Vec<Cut> = Vec::with_capacity(files.len());
+        // What each file keeps of its changes not synced, drawn file by file: how many changes
+        // whole, then (only where some are not) how many more may have landed in part. A file
+        // with nothing unsynced draws one number, as before tears by sectors.
+        let mut cuts: Vec<Cut> = Vec::with_capacity_in(files.len(), Global);
         for (name, file) in &files {
-            let undone = file.undo.is_some() && self.rng.one_in(3);
-            let kept = self.rng.below(file.ops.len() as u64 + 1) as usize;
-            let torn = file.ops.get(kept).map(|op| op.torn(&mut self.rng)).unwrap_or_default();
+            let all = file.ops.len();
+            let kept = self.rng.below(all as u64 + 1) as usize;
+            let upto = match kept < all {
+                true => kept + self.rng.below((all - kept) as u64 + 1) as usize,
+                false => kept,
+            };
             // clone: a crash, not an op: the name the cut is of.
-            cuts.push(Cut { name: (*name).clone(), kept, torn, undone });
+            cuts.push(Cut { name: (*name).clone(), kept, upto, torn: crate::world::disk::Torn::Nothing });
+        }
+        // Which changes of names not synced are undone: any of them, each later one that
+        // shares a name with one undone undone with it (a name's changes are kept in order).
+        let mut undone: Vec<bool> = Vec::with_capacity_in(self.names.len(), Global);
+        for (i, named) in self.names.iter().enumerate() {
+            let forced = (0..i).any(|earlier| undone[earlier] && self.names[earlier].shares(named));
+            undone.push(forced || self.rng.one_in(3));
         }
         // A barrier's promise: a change made after it completed is on the disk only if what
         // it covers is. So whatever is kept of a later epoch than a barrier keeps that
@@ -885,9 +1039,9 @@ impl Sim {
                 .iter()
                 .zip(cuts)
                 .filter_map(|((_, file), cut)| {
-                    // A change torn in part is on the disk in part: it counts as kept.
-                    let reach =
-                        (cut.kept + usize::from(!cut.torn.is_empty())).min(file.stamps.len());
+                    // A change that may have landed in part is on the disk in part: it counts
+                    // as kept, whatever its sectors draw.
+                    let reach = cut.upto.max(cut.kept).min(file.stamps.len());
                     file.stamps[..reach].iter().max().copied()
                 })
                 .max()
@@ -909,8 +1063,8 @@ impl Sim {
                     .unwrap_or(0);
                 if covered > cut.kept {
                     cut.kept = covered;
-                    // The change after what a barrier covers may still be torn; none before.
-                    cut.torn.clear();
+                    // What a barrier covers is whole; what came after it may still be torn.
+                    cut.upto = cut.upto.max(covered);
                     forced = true;
                 }
             }
@@ -918,50 +1072,120 @@ impl Sim {
                 break;
             }
         }
-        cuts
+        // The tears, drawn last, file by file in the order of the names: of the changes after
+        // those kept whole, up to `upto`, the file's length between the two files they leave
+        // (the longer, the shorter or any between, one in three each), then whether every sector under it landed (a clean cut, one in three), else each
+        // sector on its own.
+        for ((_, file), cut) in files.iter().zip(&mut cuts) {
+            if cut.upto <= cut.kept {
+                continue;
+            }
+            let old = file.len_after(cut.kept);
+            let new = file.len_after(cut.upto);
+            let (low, high) = (old.min(new), old.max(new));
+            // The ends weighed as heavily as everything between: a file whose length grew
+            // whole (its end there, its middle any) is the case a reader must check for.
+            let len = match self.rng.below(3) {
+                0 => high,
+                1 => low,
+                _ => low + self.rng.below(high - low + 1),
+            } as usize;
+            let count = crate::world::disk::sectors(len);
+            // alloc: a crash, not an op: one bit for each sector of the file kept.
+            let mut landed: Vec<bool> = Vec::with_capacity_in(count, Global);
+            match self.rng.one_in(3) {
+                true => landed.resize(count, true),
+                false => landed.extend((0..count).map(|_| self.rng.one_in(2))),
+            }
+            cut.torn = crate::world::disk::Torn::Sectors { upto: cut.upto, len, landed };
+        }
+        Cuts { files: cuts, undone }
     }
 
-    /// The second half of a crash: the disk a power cut that kept `cuts` leaves.
-    fn crash_with(&mut self, cuts: Vec<Cut>) {
-        // The writes and renames that waited for no sync and are undone, by name.
-        // alloc: a crash, not an op.
-        let mut undone: Vec<(FileName, Undo)> = Vec::new();
-        for Cut { name, kept, torn, undone: undo } in cuts {
+    /// The second half of a crash: the disk a power cut that made `cuts` leaves. Each file
+    /// keeps what its cut says, all of it durable; then each change of a name undone is
+    /// undone, the newest first, and what is left of the names is durable.
+    fn crash_with(&mut self, cuts: Cuts) {
+        // The machine comes back as another boot.
+        self.boot = self.draw_boot();
+        for Cut { name, kept, torn, .. } in cuts.files {
             let file = self.files.get_mut(&name).expect("a cut is of the files there are");
-            // Whatever a crash did not undo is on the disk under its name from here on.
-            let taken = file.undo.take();
-            file.sync(kept);
-            for op in torn {
-                op.apply(&mut file.durable);
+            match torn {
+                crate::world::disk::Torn::Nothing => file.sync(kept),
+                crate::world::disk::Torn::Sectors { upto, len, landed } => {
+                    let new = file.after(upto);
+                    file.sync(kept);
+                    // The world's own function: what the refinement test checks is what runs.
+                    file.durable = crate::world::disk::mixed(&file.durable, &new, len, &landed);
+                }
             }
             file.ops.clear();
             file.back = 0;
             file.stamps.clear();
             file.barriers.clear();
-            if undo && let Some(taken) = taken {
-                undone.push((name, *taken));
+        }
+        let keep_barriers = self.planted(host::Plant::PutBackWithBarriers);
+        let mut names = mem::take(&mut self.names);
+        while let Some(named) = names.pop() {
+            if !cuts.undone.get(names.len()).copied().unwrap_or(false) {
+                continue;
+            }
+            // Every later change that shares a name with this one is undone already, so the
+            // names it puts back are free.
+            match named {
+                Named::Put { file, was } => {
+                    self.files.remove(&file);
+                    if let Some(was) = was {
+                        self.files.insert(file, was.durable_only(keep_barriers));
+                    }
+                }
+                Named::Gone { file, was } => {
+                    self.files.insert(file, was.durable_only(keep_barriers));
+                }
+                Named::Moved { from, to, was } => {
+                    if let Some(moved) = self.files.remove(&to) {
+                        self.files.insert(from, moved);
+                    }
+                    if let Some(was) = was {
+                        self.files.insert(to, was.durable_only(keep_barriers));
+                    }
+                }
             }
         }
-        for (name, Undo { was, from }) in undone {
-            let file = self.files.remove(&name);
-            // A renamed file is back under its old name, unless another file took it since.
-            if let (Some(from), Some(file)) = (from, file)
-                && !self.files.contains_key(&from)
-            {
-                self.files.insert(from, file);
-            }
-            // What the name held before is back, as far as it was synced: no change of it,
-            // and so no stamp or barrier of one, is left.
-            if let Some(mut was) = was {
-                was.ops.clear();
-                was.back = 0;
-                was.undo = None;
-                if !self.planted(host::Plant::PutBackWithBarriers) {
-                    was.stamps.clear();
-                    was.barriers.clear();
+    }
+
+    /// A sync of the directory `dir` (`""`, the root) completed: every change of a name in it
+    /// is durable, and every earlier change that shares a name with one of those (undoing it
+    /// would undo the later one).
+    fn sync_names(&mut self, dir: &str) {
+        let mut synced: Vec<bool> = Vec::with_capacity_in(self.names.len(), Global);
+        synced.extend(self.names.iter().map(|named| named.dir() == dir));
+        for i in (0..self.names.len()).rev() {
+            if synced[i] {
+                for earlier in 0..i {
+                    if self.names[earlier].shares(&self.names[i]) {
+                        synced[earlier] = true;
+                    }
                 }
-                self.files.insert(name, was);
             }
+        }
+        let mut at = 0;
+        self.names.retain(|_| {
+            at += 1;
+            !synced[at - 1]
+        });
+    }
+
+    /// The change of a name `named` made: durable once its directory is synced.
+    fn named(&mut self, named: Named) {
+        self.names.push(named);
+    }
+
+    /// `file` made where no file is: a change of its name.
+    fn made(&mut self, file: &FileName) {
+        if !self.files.contains_key(file) {
+            // clone: the log's own name of the file, a refcount.
+            self.named(Named::Put { file: file.clone(), was: None });
         }
     }
 
@@ -1192,6 +1416,7 @@ impl Sim {
     pub fn change(&mut self, file: &FileName, bytes: &[u8]) {
         // alloc: the world changed by the test, not an op.
         *file_mut(&mut self.files, file) = SimFile::whole(bytes.to_vec());
+        self.outside_named(file);
         self.changed(file);
     }
 
@@ -1210,6 +1435,7 @@ impl Sim {
         // alloc: the world changed by the test, not an op.
         *file_mut(&mut self.files, file) =
             SimFile { mode: 0o777, link: true, ..SimFile::whole(target.into()) };
+        self.outside_named(file);
         self.changed(file);
     }
 
@@ -1220,6 +1446,7 @@ impl Sim {
         // clone: the copy's own record of which sectors hold blocks
         let blocks = self.files[from].blocks.clone();
         let bytes = self.contents(from);
+        self.made(to);
         *file_mut(&mut self.files, to) = SimFile { mode, link, blocks, ..SimFile::whole(bytes) };
         self.changed(to);
     }
@@ -1329,45 +1556,119 @@ impl Sim {
     /// a stat, a directory is there while some file is under it; a name that is a file and has
     /// files under it is listed as the file.
     /// The root ([`crate::DirName::Root`]) is always there, and lists every name.
-    fn list(&self, dir: &crate::DirName) -> Done {
+    /// The folders above the root, nearest first, each the name in it of the folder on the way
+    /// down and its other files (names relative to it, which must not start with that name:
+    /// that is the root's side). Read by [`Effect::Ancestors`] and [`Effect::Above`].
+    pub fn set_above(&mut self, levels: Vec<SimAbove>) {
+        for level in &levels {
+            assert!(
+                level.files.iter().all(|(name, _)| name.as_str().split('/').next() != Some(&*level.toward)),
+                "a folder above the root holds a file under {:?}, its way down to the root",
+                level.toward
+            );
+        }
+        self.above = levels;
+    }
+
+    /// [`Effect::Above`]: `op` on `name` in the folders [`Sim::set_above`] gave.
+    fn read_above(&self, op: crate::AboveOp, name: &crate::Above) -> Done {
+        let missing = || {
+            // alloc: an error's message.
+            Done::Failed(IoError(format!("{name}: no such file or directory")))
+        };
+        let Some(level) = self.above.get(usize::from(name.up().get()) - 1) else { return missing() };
+        let meta = |len: u64, dir: bool| Meta { len, dir, modified_ns: 0, changed_ns: 0, ino: 0, dev: 0 };
+        let file = name.rest().and_then(|rest| level.files.iter().find(|(it, _)| it == rest));
+        let is_dir = |dir: Option<&FileName>| match dir {
+            None => true,
+            Some(dir) => level.files.iter().any(|(it, _)| it != dir && it.is_under(dir)),
+        };
+        match op {
+            crate::AboveOp::Stat => Done::Stat(match file {
+                Some((_, bytes)) => Some(meta(bytes.len() as u64, false)),
+                None if is_dir(name.rest()) => Some(meta(0, true)),
+                None => None,
+            }),
+            crate::AboveOp::Read => match file {
+                // clone: the read's payload.
+                Some((_, bytes)) => Done::Read(bytes.clone()),
+                None => missing(),
+            },
+            crate::AboveOp::List => {
+                if file.is_some() || !is_dir(name.rest()) {
+                    return missing();
+                }
+                let start = name.rest().map_or(0, |it| it.as_str().len() + 1);
+                // alloc: the listing's payload.
+                let mut names: Vec<(FileName, Meta)> = Vec::new();
+                if name.rest().is_none() {
+                    // The way down to the root is a folder in it.
+                    names.push((FileName::new(&level.toward).expect("a folder's name"), meta(0, true)));
+                }
+                for (it, bytes) in &level.files {
+                    if name.rest().is_some_and(|dir| !it.is_under(dir) || it == dir) {
+                        continue;
+                    }
+                    let inner = &it.as_str()[start..];
+                    let entry = match inner.split_once('/') {
+                        Some((first, _)) => (FileName::new(first).expect("a part of a name"), meta(0, true)),
+                        None => (FileName::new(inner).expect("a name"), meta(bytes.len() as u64, false)),
+                    };
+                    if !names.iter().any(|(had, _)| *had == entry.0) {
+                        names.push(entry);
+                    }
+                }
+                names.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                Done::Listed(names)
+            }
+        }
+    }
+
+    fn list(&mut self, dir: &crate::DirName) -> Done {
         if dir.name().is_some_and(|name| self.files.contains_key(name)) {
             // alloc: an error's message.
             return Done::Failed(IoError(format!("{dir}: not a directory")));
         }
         let start = dir.start();
-        // alloc: the listing, which the completion carries.
-        let mut listed: Vec<(FileName, Meta)> = Vec::new();
+        // Each name with its length and whether it is a directory, then its meta.
+        // alloc: the names gathered, freed when the listing is made.
+        let mut names: Vec<(FileName, u64, bool)> = Vec::new();
         for (file, sim) in self.files.iter().filter(|(it, _)| dir.holds(it)) {
             for (at, _) in file.as_str()[start..].match_indices('/') {
                 let inner = FileName::new(&file.as_str()[..start + at]).expect("a part of a name");
-                let modified_ns = self.disk.mtime(&inner).unwrap_or(0);
-                listed.push((inner, Meta { len: 0, dir: true, modified_ns }));
+                names.push((inner, 0, true));
             }
-            let modified_ns = self.disk.mtime(file).unwrap_or(0);
             // clone: a name of the listing.
-            listed.push((file.clone(), Meta { len: sim.len(), dir: false, modified_ns }));
+            names.push((file.clone(), sim.len(), false));
         }
         // A directory made is listed as a file's directories are, with those it is under.
         for made in self.made_under(dir) {
             for (at, _) in made.as_str()[start..].match_indices('/') {
                 let inner = FileName::new(&made.as_str()[..start + at]).expect("a part of a name");
-                let modified_ns = self.disk.mtime(&inner).unwrap_or(0);
-                listed.push((inner, Meta { len: 0, dir: true, modified_ns }));
+                names.push((inner, 0, true));
             }
-            let modified_ns = self.disk.mtime(made).unwrap_or(0);
             // clone: a name of the listing.
-            listed.push((made.clone(), Meta { len: 0, dir: true, modified_ns }));
+            names.push((made.clone(), 0, true));
         }
-        if listed.is_empty() && dir.name().is_none_or(|name| self.was_made(name)) {
-            return Done::Listed(listed);
-        }
-        if listed.is_empty() {
+        if names.is_empty() && !dir.name().is_none_or(|name| self.was_made(name)) {
             // alloc: an error's message.
             return Done::Failed(IoError(format!("{dir}: no such directory")));
         }
-        listed.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.dir.cmp(&b.1.dir)));
-        listed.dedup_by(|later, first| later.0 == first.0);
+        names.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
+        names.dedup_by(|later, first| later.0 == first.0);
+        // alloc: the listing, which the completion carries.
+        let mut listed: Vec<(FileName, Meta)> = Vec::with_capacity(names.len());
+        for (name, len, is_dir) in names {
+            let meta = self.disk.meta(&name, len, is_dir);
+            listed.push((name, meta));
+        }
         Done::Listed(listed)
+    }
+
+    /// A stat's [`Meta`] of `file`, a file there or (`dir`) a directory.
+    fn meta(&mut self, file: &FileName, dir: bool) -> Meta {
+        let len = if dir { 0 } else { self.files.get(file).map_or(0, SimFile::len) };
+        self.disk.meta(file, len, dir)
     }
 
     /// [`Effect::Private`] on the simulated disk, whose directories are made 0o700: the first,
@@ -1399,8 +1700,15 @@ impl Sim {
         // A descriptor kept of it holds its inode, and reads the bytes it held.
         self.orphan_kept(file);
         self.files.remove(file);
+        self.outside_named(file);
         self.unlink_locks(file);
         self.changed(file);
+    }
+
+    /// `file`'s name changed durably by something outside the state machine: no crash undoes
+    /// a change of it made before.
+    fn outside_named(&mut self, file: &FileName) {
+        self.names.retain(|named| !named.touches(file));
     }
 
     pub fn rng(&mut self) -> &mut Rng {
@@ -1537,6 +1845,8 @@ impl Sim {
         if let Some(sim) = self.files.remove(from) {
             // clone: the world changed by the test, not an op.
             self.files.insert(to.clone(), sim);
+            self.outside_named(from);
+            self.outside_named(to);
             self.disk.renamed(from, to);
             self.move_locks(from, to);
             self.changed(from);
@@ -1562,6 +1872,7 @@ impl Sim {
         // Opened to read and write, made if missing, whether or not the lock is taken, as a
         // real driver opens it.
         if !self.files.contains_key(file) {
+            self.made(file);
             file_mut(&mut self.files, file);
             self.changed(file);
         }
@@ -1686,6 +1997,7 @@ impl Sim {
         match effect {
             Effect::Append { file, mut bytes, .. } => {
                 bytes.truncate(fits);
+                self.made(&file);
                 file_mut(&mut self.files, &file).push_op(Op::Append(bytes));
                 if fits > 0 {
                     self.changed(&file);
@@ -1935,7 +2247,33 @@ impl Sim {
         Ok(ran)
     }
 
+    /// Every mapping for writing that its task has dropped, folded into its file: each
+    /// [`SECTOR`] that differs from the file as an unsynced write from memory, in order.
+    fn fold_drawn(&mut self) {
+        let mut at = 0;
+        while at < self.drawn.len() {
+            let Some(bytes) = self.drawn[at].1.lock().take() else {
+                at += 1;
+                continue;
+            };
+            // In the order drawn: two mappings of one file fold as they were let go.
+            let (file, _) = self.drawn.remove(at);
+            let Some(sim) = self.files.get_mut(&file) else { continue };
+            let was = sim.contents();
+            for (index, sector) in bytes.chunks(SECTOR).enumerate() {
+                let from = index * SECTOR;
+                if was.get(from..from + sector.len()) != Some(sector) {
+                    // alloc: the sector's bytes, as a write from memory carries them.
+                    sim.push_op(Op::Sectors(from as u64, sector.to_vec()));
+                    self.bytes_written += sector.len() as u64;
+                }
+            }
+            self.changed(&file);
+        }
+    }
+
     fn complete(&mut self, pending: Pending) -> Completion {
+        self.fold_drawn();
         let Pending { effect, covers, spawn } = pending;
         let tag = effect.tag();
         // Before any fault: a torn append never lands in a file the kernel would not open.
@@ -1952,6 +2290,8 @@ impl Sim {
             if let Effect::Append { file, mut bytes, .. } = effect {
                 let torn = self.rng.below(bytes.len() as u64) as usize;
                 bytes.truncate(torn);
+                // Opened, and so made, before the write failed.
+                self.made(&file);
                 file_mut(&mut self.files, &file).push_op(Op::Append(bytes));
                 if torn > 0 {
                     self.changed(&file);
@@ -2030,12 +2370,20 @@ impl Sim {
             }
             Effect::Append { file, bytes, .. } => {
                 self.bytes_written += bytes.len() as u64;
+                self.made(&file);
                 file_mut(&mut self.files, &file).push_op(Op::Append(bytes));
                 self.changed(&file);
                 Done::Appended
             }
+            // The file's bytes made durable (`fsync`; `F_FULLFSYNC` on Apple's systems), never
+            // its name: that is its directory's sync.
             Effect::Sync { file, .. } => {
                 let less = self.planted(host::Plant::SyncCoversLess);
+                // The planted bug: the loose rule, a file's sync keeping its name too.
+                if self.planted(host::Plant::FileSyncKeepsName) {
+                    self.names.retain(|named| !named.touches(&file));
+                }
+                self.made(&file);
                 let sim = self.files.entry(file).or_default();
                 // The planted bug: one change fewer made durable than the sync covered.
                 let covers = match less && covers.min(sim.ops.len()) > 0 {
@@ -2053,6 +2401,7 @@ impl Sim {
             Effect::Barrier { file, .. } => {
                 self.stamp_epochs();
                 let epoch = self.epoch;
+                self.made(&file);
                 let sim = self.files.entry(file).or_default();
                 let covered = covers.min(sim.ops.len());
                 if covered > 0 {
@@ -2073,22 +2422,41 @@ impl Sim {
                 // alloc: an error's message.
                 None => Done::Failed(IoError(format!("{file}: no such file"))),
             },
-            // This simulation keeps every name change through a crash (its names are
-            // durable as they are made); what a crash may undo of names not synced is
-            // modelled above it (bstd's ledger), which this completion tells.
-            Effect::SyncDir { .. } => {
+            // The directory's names made durable (`fsync` of the directory; `F_FULLFSYNC` on
+            // Apple's systems, which also flushes the drive's cache).
+            Effect::SyncDir { dir, .. } => {
+                self.sync_names(dir.name().map_or("", FileName::as_str));
                 self.flushed();
                 Done::Synced
             }
             Effect::Truncate { file, len, .. } => {
+                self.made(&file);
                 file_mut(&mut self.files, &file).push_op(Op::Cut(len));
                 self.changed(&file);
                 Done::Truncated
             }
+            // Cut to nothing and grown to `len` zeros (a hole), unsynced; the bytes are
+            // drawn into a buffer the task writes and folded in once it lets go.
+            Effect::MapWrite { file, len, .. } => {
+                self.made(&file);
+                let sim = file_mut(&mut self.files, &file);
+                sim.push_op(Op::Cut(0));
+                sim.push_op(Op::Cut(len));
+                self.changed(&file);
+                // alloc: the slot the bytes come back through.
+                let drawn: Drawn = std::sync::Arc::new(crate::lock::Lock::new("sim.drawn", None));
+                // clone: the simulator's hold on the slot, to fold the bytes in later.
+                self.drawn.push((file, drawn.clone()));
+                // alloc: the mapping's bytes, which the task writes.
+                Done::MappedWrite(crate::MappingWrite::sim(vec![0; len as usize], drawn))
+            }
             // Made beside it and renamed over it: a lock of the file it replaced is of that one.
+            // Its directory synced after the rename (`fs.rs`'s `write_atomically`): the new
+            // name is durable, with every change of a name in that directory.
             Effect::Write { file, bytes, .. } => {
                 self.bytes_written += bytes.len() as u64;
                 *file_mut(&mut self.files, &file) = SimFile::whole(bytes);
+                self.sync_names(parent_of(&file));
                 self.flushed();
                 self.unlink_locks(&file);
                 self.changed(&file);
@@ -2106,8 +2474,6 @@ impl Sim {
                     ops: vec![Op::Sectors(0, bytes)],
                     mode: SimFile::default().mode,
                     link: false,
-                    // alloc: what a crash may put back, once per unsynced write.
-                    undo: Some(Box::new(Undo { was, from: None })),
                     back: 0,
                     // alloc: none, two empty vectors.
                     stamps: Vec::new(),
@@ -2117,6 +2483,8 @@ impl Sim {
                 };
                 let mut new = new;
                 new.allocate(0, new.len());
+                // clone: the log's own name of the file, a refcount.
+                self.named(Named::Put { file: file.clone(), was });
                 *file_mut(&mut self.files, &file) = new;
                 self.unlink_locks(&file);
                 self.changed(&file);
@@ -2135,11 +2503,10 @@ impl Sim {
             // As a rename, but the new name is not on the disk: a crash may put the file back
             // under `from` and what `to` held back under `to`.
             Effect::RenameUnsynced { from, to, .. } => match self.files.remove(&from) {
-                Some(mut sim) => {
+                Some(sim) => {
                     let was = self.files.remove(&to);
-                    // alloc: what a crash may put back, once per unsynced rename.
-                    // clone: the name the file came from, which the undo keeps.
-                    sim.undo = Some(Box::new(Undo { was, from: Some(from.clone()) }));
+                    // clone: the log's own names of the files, refcounts.
+                    self.named(Named::Moved { from: from.clone(), to: to.clone(), was });
                     *file_mut(&mut self.files, &to) = sim;
                     self.disk.renamed(&from, &to);
                     self.move_locks(&from, &to);
@@ -2158,9 +2525,13 @@ impl Sim {
                     if !self.planted(host::Plant::RenameFlushesOthers) {
                         sim.flushed();
                     }
-                    // The new name is on the disk: nothing of the name is left to undo.
-                    sim.undo = None;
                     *file_mut(&mut self.files, &to) = sim;
+                    // Both directories synced after it (`fs.rs`'s `rename`, the ring's chain):
+                    // the new name is durable, and the old one's going.
+                    self.sync_names(parent_of(&to));
+                    if parent_of(&from) != parent_of(&to) {
+                        self.sync_names(parent_of(&from));
+                    }
                     self.disk.renamed(&from, &to);
                     self.move_locks(&from, &to);
                     self.changed(&from);
@@ -2274,6 +2645,7 @@ impl Sim {
                 // clone: the second name's own record of which sectors hold blocks
                 let blocks = self.files[&from].blocks.clone();
                 let bytes = self.contents(&from);
+                self.made(&to);
                 *file_mut(&mut self.files, &to) = SimFile { mode, link, blocks, ..SimFile::whole(bytes) };
                 self.disk.linked(&from, &to, &self.files);
                 self.changed(&to);
@@ -2281,15 +2653,19 @@ impl Sim {
             }
             // A link is a file of its own length either way: the simulated disk follows none.
             Effect::Stat { file, .. } | Effect::Lstat { file, .. } => Done::Stat({
-                let modified_ns = self.disk.mtime(&file).unwrap_or(0);
-                match self.files.get(&file) {
-                    Some(it) => Some(Meta { len: it.len(), dir: false, modified_ns }),
-                    None if self.is_dir(&file) => Some(Meta { len: 0, dir: true, modified_ns }),
-                    None => None,
+                match self.files.contains_key(&file) {
+                    true => Some(self.meta(&file, false)),
+                    false if self.is_dir(&file) => Some(self.meta(&file, true)),
+                    false => None,
                 }
             }),
             Effect::List { dir, .. } => self.list(&dir),
             Effect::Private { dir, .. } => self.private(&dir),
+            Effect::Stamp { files, .. } if files.len() > crate::STAMP_MOST => {
+                let refused = crate::journal::stamp_rows(&files).expect_err("past the cap");
+                // alloc: the refusal's text, once.
+                Done::Failed(crate::IoError(refused.to_string()))
+            }
             Effect::Stamp { files, .. } => Done::Stamped(
                 files
                     .iter()
@@ -2302,13 +2678,15 @@ impl Sim {
                     .collect(),
             ),
             Effect::Entries { dir, .. } => match self.disk.entries(&dir, &self.files) {
-                Some(entries) => Done::Entries(entries),
+                Some(entries) => Done::Entries(Box::new(entries)),
                 // alloc: an error's message.
                 None => Done::Failed(IoError(format!("{dir}: no such directory"))),
             },
             Effect::Remove { file, .. } if self.was_made(&file) => self.remove_made(&file),
             Effect::Remove { file, .. } => {
-                if self.files.remove(&file).is_some() {
+                if let Some(was) = self.files.remove(&file) {
+                    // clone: the log's own name of the file, a refcount.
+                    self.named(Named::Gone { file: file.clone(), was });
                     self.unlink_locks(&file);
                     self.changed(&file);
                 }
@@ -2317,6 +2695,12 @@ impl Sim {
             Effect::Lock { file, mode, tag } => self.lock(&file, mode, tag),
             Effect::MakeDir { dir, .. } => self.make_dir(dir),
             Effect::RemoveDir { dir, .. } => self.remove_dir(&dir),
+            Effect::Ancestors { most, .. } => Done::Ancestors(crate::Ancestors::answered(
+                // clone: the answer's names, refcounts.
+                self.above.iter().map(|it| it.toward.clone()).collect(),
+                most,
+            )),
+            Effect::Above { op, name, .. } => self.read_above(op, &name),
             Effect::Timer { .. } => Done::Fired,
             Effect::Map { file, extent, .. } => {
                 let bytes = self.contents(&file);
@@ -2371,7 +2755,8 @@ impl Sim {
             | Effect::ReadStdin { .. }
             | Effect::WriteOut { .. }
             | Effect::Now { .. }
-            | Effect::Random { .. } => {
+            | Effect::Random { .. }
+            | Effect::Roots { .. } => {
                 unreachable!(
                     "watches, kills, sockets, unlocks and the host's effects are not pending \
                      effects"
@@ -2718,7 +3103,8 @@ impl Driver for Sim {
                 | Effect::ReadStdin { .. }
                 | Effect::WriteOut { .. }
                 | Effect::Now { .. }
-                | Effect::Random { .. }) => {
+                | Effect::Random { .. }
+                | Effect::Roots { .. }) => {
                     self.hosted(effect);
                     continue;
                 }
@@ -2879,6 +3265,10 @@ impl Driver for Sim {
         self.wall_ns()
     }
 
+    fn boot(&self) -> Result<crate::Boot, crate::NoBoot> {
+        Ok(self.boot)
+    }
+
     /// The simulation's waker, once a test asked for one ([`Sim::give_wakers`]); from this
     /// call on a poll keeps the rule a native driver keeps.
     fn waker(&self) -> Option<crate::Waker> {
@@ -3029,26 +3419,96 @@ mod tests {
         FileName::new(it).unwrap()
     }
 
+    /// What a crash leaves of a file with 1000 synced bytes and two unsynced appends after
+    /// them (1000 and 1000 more, never zero): over many seeds, the synced bytes are equal in
+    /// every outcome; each [`SECTOR`] past them is wholly the new bytes or wholly zeros; the
+    /// length is between the two; and every class a real disk may leave occurs: the whole
+    /// of it kept, the whole of it lost, a clean prefix, a zeroed sector at the end under a
+    /// grown length, and a hole in the middle with the end intact. A seed replays its crash.
     #[test]
-    fn a_crash_keeps_what_was_synced_and_a_prefix_of_the_rest() {
-        for seed in 0..200 {
+    fn a_crash_keeps_what_was_synced_and_any_sectors_of_the_rest() {
+        let synced: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8 + 1).collect();
+        let more: Vec<u8> = (0..2000u32).map(|i| (i % 241) as u8 + 3).collect();
+        let mut all = synced.clone();
+        all.extend_from_slice(&more);
+        let crashed = |seed: u64| {
             let mut sim = Sim::new(seed, Faults::default());
             let file = name("log");
-            let mut effects =
-                vec![Effect::Append { file: file.clone(), bytes: b"synced".to_vec(), tag: Tag(0) }];
+            let mut effects = vec![Effect::Append { file: file.clone(), bytes: synced.clone(), tag: Tag(0) }];
             run_until_idle(&mut sim, &mut effects, |_, _| {}).expect("the effects end");
             effects.push(Effect::Sync { file: file.clone(), tag: Tag(1) });
+            // The file's sync keeps its bytes; its name is kept by its directory's sync.
+            effects.push(Effect::SyncDir { dir: crate::DirName::Root, tag: Tag(3) });
             run_until_idle(&mut sim, &mut effects, |_, _| {}).expect("the effects end");
-            effects.push(Effect::Append {
-                file: file.clone(),
-                bytes: b"-lost".to_vec(),
-                tag: Tag(2),
-            });
+            effects.push(Effect::Append { file: file.clone(), bytes: more[..1000].to_vec(), tag: Tag(2) });
+            run_until_idle(&mut sim, &mut effects, |_, _| {}).expect("the effects end");
+            effects.push(Effect::Append { file: file.clone(), bytes: more[1000..].to_vec(), tag: Tag(4) });
             run_until_idle(&mut sim, &mut effects, |_, _| {}).expect("the effects end");
             sim.crash();
-            let left = sim.contents(&file);
-            assert!(left.starts_with(b"synced") && b"synced-lost".starts_with(&left), "{left:?}");
+            sim.contents(&file)
+        };
+        let (mut whole, mut lost, mut prefix, mut zeroed_end, mut hole) = (0, 0, 0, 0, 0);
+        for seed in 0..2000 {
+            let left = crashed(seed);
+            assert_eq!(left[..synced.len().min(left.len())], synced[..synced.len().min(left.len())], "seed {seed}");
+            assert!(left.len() >= synced.len() && left.len() <= all.len(), "seed {seed}: {} bytes", left.len());
+            // Each sector past the synced bytes: all new, or as it was after a change kept
+            // whole (the new bytes up to the end of the synced part or of the first append),
+            // then zeros past that end. All written bytes are non-zero.
+            let mut from = synced.len();
+            let mut kinds = Vec::new();
+            while from < left.len() {
+                let to = ((from / SECTOR + 1) * SECTOR).min(left.len());
+                let written = from + left[from..to].iter().zip(&all[from..to]).take_while(|(a, b)| a == b).count();
+                let ends_a_change = written == from || written == synced.len() || written == synced.len() + 1000;
+                assert!(
+                    left[written..to].iter().all(|it| *it == 0) && (written == to || ends_a_change),
+                    "seed {seed}: the sector at {from} is new to {written}, then not zeros or not at a change's end"
+                );
+                kinds.push(written == to);
+                from = to;
+            }
+            if left == all {
+                whole += 1;
+            } else if left.len() == synced.len() {
+                lost += 1;
+            } else if kinds.iter().all(|it| *it) {
+                prefix += 1;
+            }
+            if kinds.last() == Some(&false) {
+                zeroed_end += 1;
+            }
+            if left.len() == all.len() && kinds.contains(&false) && kinds.last() == Some(&true) {
+                hole += 1;
+            }
         }
+        eprintln!(
+            "of 2000 crashes: {whole} kept whole, {lost} lost whole, {prefix} a clean prefix, \
+             {zeroed_end} a zeroed sector at the end, {hole} a hole in the middle with the end intact"
+        );
+        assert!(whole > 0 && lost > 0 && prefix > 0 && zeroed_end > 0 && hole > 0);
+        assert_eq!(crashed(7), crashed(7), "a seed replays its crash");
+        assert!((0..20).any(|seed| crashed(seed) != crashed(7)), "the seeds draw different crashes");
+    }
+
+    /// The boot is one fact until a power cut, and another after each one; a seed draws the
+    /// same boots each time it runs.
+    #[test]
+    fn a_power_cut_is_a_new_boot() {
+        let boots = |seed| {
+            let mut sim = Sim::new(seed, Faults::default());
+            let first = Driver::boot(&sim).expect("the simulation has a boot");
+            ran(&mut sim, vec![Effect::Append { file: name("f"), bytes: b"x".to_vec(), tag: Tag(1) }]);
+            assert_eq!(Driver::boot(&sim), Ok(first), "seed {seed}: the boot moved without a cut");
+            sim.crash();
+            let second = Driver::boot(&sim).expect("a boot after the cut");
+            sim.crash();
+            let third = Driver::boot(&sim).expect("a boot after the second cut");
+            assert!(first != second && second != third && first != third, "seed {seed}");
+            [first, second, third]
+        };
+        assert_eq!(boots(3), boots(3));
+        assert_ne!(boots(3), boots(4));
     }
 
     #[test]
@@ -3076,6 +3536,11 @@ mod tests {
         let (data, commits) = (name("log/data"), name("log/commits"));
         let rounds = 1 + sim.rng.below(6);
         let crash_after = sim.rng.below(rounds * 3 + 1);
+        // Both files made and their names synced before the log starts: what is tested is
+        // the order of their bytes, not whether a crash keeps their names.
+        ran(&mut sim, vec![Effect::Truncate { file: data.clone(), len: 0, tag: Tag(4) }]);
+        ran(&mut sim, vec![Effect::Truncate { file: commits.clone(), len: 0, tag: Tag(5) }]);
+        ran(&mut sim, vec![Effect::SyncDir { dir: name("log").into(), tag: Tag(6) }]);
         let mut steps = 0;
         let mut step = |sim: &mut Sim, effect: Effect| {
             if steps == crash_after {
@@ -3161,12 +3626,19 @@ mod tests {
     fn what_a_barrier_covers_is_durable_once_a_later_sync_of_any_file_completes() {
         let (data, other) = (name("log/data"), name("log/other"));
         let mut lost = false;
+        // The file made and its name synced first: what is tested is its bytes.
+        let made = |sim: &mut Sim| {
+            ran(sim, vec![Effect::Truncate { file: data.clone(), len: 0, tag: Tag(4) }]);
+            ran(sim, vec![Effect::SyncDir { dir: name("log").into(), tag: Tag(5) }]);
+        };
         for seed in 0..200 {
             let mut sim = Sim::new(seed, Faults::default());
+            made(&mut sim);
             ran(&mut sim, vec![Effect::Append { file: data.clone(), bytes: b"ordered".to_vec(), tag: Tag(1) }]);
             let done = ran(&mut sim, vec![Effect::Barrier { file: data.clone(), tag: Tag(2) }]);
             assert_eq!(done[&Tag(2)], Done::Ordered);
             let mut after = Sim::new(seed, Faults::default());
+            made(&mut after);
             ran(&mut after, vec![Effect::Append { file: data.clone(), bytes: b"ordered".to_vec(), tag: Tag(1) }]);
             ran(&mut after, vec![Effect::Barrier { file: data.clone(), tag: Tag(2) }]);
             ran(&mut after, vec![Effect::Sync { file: other.clone(), tag: Tag(3) }]);
@@ -3254,11 +3726,13 @@ mod tests {
             if synced {
                 assert_eq!(after, b"aabbbb", "seed {seed}");
             } else {
-                // Some first part of the bbbb landed over aaaa, lengthening it past its end.
-                let landed = after.iter().skip(2).take_while(|&&b| b == b'b').count();
-                let mut want = b"aaaa".to_vec();
-                Op::At(2, vec![b'b'; landed]).apply(&mut want);
-                assert_eq!(after, want, "seed {seed}");
+                // Its one sector landed or not, the length anywhere from the old to the new:
+                // the new bytes to that length, or the old with zeros past their end.
+                let len = after.len();
+                assert!((4..=6).contains(&len), "seed {seed}: {after:?}");
+                let mut old = b"aaaa".to_vec();
+                old.resize(len, 0);
+                assert!(after == b"aabbbb"[..len] || after == old, "seed {seed}: {after:?}");
             }
         }
         let mut sim = Sim::new(1, Faults::default());
@@ -3365,16 +3839,11 @@ mod tests {
             ];
             run_until_idle(&mut sim, &mut effects, |it, _| _ = seen.insert(it.tag.0, it.done))
             .expect("the effects end");
-            assert_eq!(
-                seen[&2],
-                Done::Stat(Some(Meta { len: 33, dir: false, modified_ns: at })),
-                "seed {seed}"
-            );
+            let Done::Stat(Some(stat)) = seen[&2] else { panic!("seed {seed}: {:?}", seen[&2]) };
+            assert_eq!((stat.len, stat.dir, stat.modified_ns), (33, false, at), "seed {seed}");
             let Done::Listed(listed) = &seen[&3] else { panic!("seed {seed}: {:?}", seen[&3]) };
-            assert!(
-                listed.contains(&(file.clone(), Meta { len: 33, dir: false, modified_ns: at })),
-                "seed {seed}"
-            );
+            // A listing and a stat of one file say the same of it, the inode and device too.
+            assert!(listed.contains(&(file.clone(), stat)), "seed {seed}");
             sim.crash();
             assert_eq!(
                 sim.stamp(&file).mtime_ns,
@@ -3450,7 +3919,7 @@ mod tests {
     #[test]
     fn an_unsynced_write_is_old_new_or_torn_after_a_crash() {
         let new: Vec<u8> = (0..4 * SECTOR).map(|n| (n / SECTOR) as u8 + 1).collect();
-        let (mut olds, mut news, mut torns) = (0, 0, 0);
+        let (mut olds, mut news, mut torns, mut named_lost) = (0, 0, 0, 0);
         for seed in 0..2_000 {
             let mut sim = Sim::new(seed, Faults::default());
             let file = name("store/placed/value");
@@ -3462,9 +3931,16 @@ mod tests {
             };
             assert_eq!(ran(&mut sim, vec![write])[&Tag(1)], Done::Written, "seed {seed}");
             assert_eq!(sim.contents(&file), new, "seed {seed}: read whole before a crash");
+            // Synced: its bytes by the file's sync, its name by its directory's. A file's
+            // sync alone keeps the bytes and not the name (the strict rule).
             let synced = seed % 4 == 0;
-            if synced {
+            let bytes_only = seed % 4 == 1;
+            if synced || bytes_only {
                 ran(&mut sim, vec![Effect::Sync { file: file.clone(), tag: Tag(2) }]);
+            }
+            if synced {
+                let sync = Effect::SyncDir { dir: name("store/placed").into(), tag: Tag(3) };
+                ran(&mut sim, vec![sync]);
             }
             sim.crash();
             let left = sim.contents(&file);
@@ -3472,9 +3948,12 @@ mod tests {
                 news += 1;
             } else if left == b"old contents" {
                 assert!(!synced, "seed {seed}: a synced write was undone");
+                if bytes_only {
+                    named_lost += 1;
+                }
                 olds += 1;
             } else {
-                assert!(!synced, "seed {seed}: a synced write was torn");
+                assert!(!synced && !bytes_only, "seed {seed}: a synced write was torn");
                 assert!(left.len() <= new.len(), "seed {seed}");
                 for (n, sector) in left.chunks(SECTOR).enumerate() {
                     let kept = &new[n * SECTOR..n * SECTOR + sector.len()];
@@ -3487,6 +3966,7 @@ mod tests {
             }
         }
         assert!(olds > 0 && news > 0 && torns > 0, "{olds} old, {news} new, {torns} torn");
+        assert!(named_lost > 0, "a file's sync without its directory's never lost the name");
     }
 
     /// A clone of a file with bytes written since its last write-back is charged those bytes
@@ -3552,6 +4032,75 @@ mod tests {
             }
         }
         assert!(done > 0 && undone > 0, "{done} done, {undone} undone");
+    }
+
+    /// A publish that renames a synced file into place without waiting, then syncs the new
+    /// name's directory (`fsync` of it; `F_FULLFSYNC` on Apple's systems), is kept by every
+    /// crash: the directory's sync makes the rename durable.
+    #[test]
+    fn a_rename_kept_by_its_directorys_sync_survives_a_crash() {
+        for seed in 0..500 {
+            let mut sim = Sim::new(seed, Faults::default());
+            let (from, to) = (name("out/.staged"), name("out/program"));
+            sim.change(&from, b"new");
+            sim.change(&to, b"old");
+            let rename = Effect::RenameUnsynced { from: from.clone(), to: to.clone(), tag: Tag(1) };
+            assert_eq!(ran(&mut sim, vec![rename])[&Tag(1)], Done::Renamed, "seed {seed}");
+            let sync = Effect::SyncDir { dir: name("out").into(), tag: Tag(2) };
+            assert_eq!(ran(&mut sim, vec![sync])[&Tag(2)], Done::Synced, "seed {seed}");
+            sim.crash();
+            assert_eq!(
+                (sim.contents(&to).as_slice(), sim.exists(&from)),
+                (&b"new"[..], false),
+                "seed {seed}: an unsynced rename was undone after its directory was synced"
+            );
+        }
+    }
+
+    /// One publish of `new` to `out/program`: written to a staged name, renamed into place
+    /// without a wait, its bytes synced under the new name, and its directory synced unless
+    /// `dir_sync` is false (the planted bug: the publish that leaves the directory's sync
+    /// out). After a crash, whether the program is the new one.
+    fn publish(sim: &mut Sim, dir_sync: bool) -> bool {
+        let (staged, program) = (name("out/.staged"), name("out/program"));
+        sim.change(&program, b"old");
+        let mut asked = vec![
+            Effect::Append { file: staged.clone(), bytes: b"new".to_vec(), tag: Tag(1) },
+            Effect::RenameUnsynced { from: staged.clone(), to: program.clone(), tag: Tag(2) },
+            Effect::Sync { file: program.clone(), tag: Tag(3) },
+        ];
+        if dir_sync {
+            asked.push(Effect::SyncDir { dir: name("out").into(), tag: Tag(4) });
+        }
+        // One at a time, each after the last completed, as a publish asks them.
+        for effect in asked {
+            let tag = effect.tag();
+            assert!(!matches!(ran(sim, vec![effect])[&tag], Done::Failed(_)));
+        }
+        sim.crash();
+        sim.contents(&program) == b"new"
+    }
+
+    /// The strict rule's control: a publish that syncs the file and never the directory is
+    /// caught by a crash (the old program is back on some seed), and the same publish with
+    /// the directory's sync is kept on every seed. The loose rule planted (a file's sync keeps
+    /// its name) hides the missing sync: the control is what tells the two apart.
+    #[test]
+    fn a_publish_without_its_directorys_sync_is_caught_by_a_crash() {
+        let (mut lost, mut lost_loose) = (0, 0);
+        for seed in 0..500 {
+            assert!(publish(&mut Sim::new(seed, Faults::default()), true), "seed {seed}: a synced publish was lost");
+            if !publish(&mut Sim::new(seed, Faults::default()), false) {
+                lost += 1;
+            }
+            let mut loose = Sim::new(seed, Faults::default());
+            loose.plant(host::Plant::FileSyncKeepsName);
+            if !publish(&mut loose, false) {
+                lost_loose += 1;
+            }
+        }
+        assert!(lost > 0, "no crash lost a publish whose directory was never synced");
+        assert_eq!(lost_loose, 0, "under the loose rule the missing directory sync is hidden");
     }
 
     #[test]

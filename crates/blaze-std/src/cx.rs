@@ -33,7 +33,7 @@
 
 use alloc::{rc::Rc, sync::Arc};
 use core::{
-    cell::Cell,
+    cell::{Cell, OnceCell},
     sync::atomic::{AtomicBool, Ordering},
 };
 
@@ -53,20 +53,40 @@ use crate::{
 
 /// The task's context. Not `Send`: it shares its task's frame, which is not `Sync`, and its
 /// placement, an `Rc`; a task on another thread gets its own from a [`Seed`].
+///
+/// What a context that never uses something does not build (std.md, "What a program pays for
+/// at start"): a root whose budget is unbounded has no deadline to read the clock for, a root
+/// has no cancellation (nothing can cancel it), and a task's frame is made at its first use.
+/// A hosted run's root context is no allocation and no atomic: its placement is held by the
+/// run ([`Placement::HostedRoot`]).
 pub struct Cx {
-    deadline: Deadline,
-    cancel: Arc<Cancel>,
+    /// `None`: never; no wait or check under it reads the clock for it.
+    deadline: Option<Deadline>,
+    /// `None`: never cancelled (a root); a scope's is `Some`, its outer chain the scopes it
+    /// is in.
+    cancel: Option<Arc<Cancel>>,
     span: &'static str,
-    frame: Arc<Frame>,
     /// The world the root context came from: where its spans and events are recorded.
     world: Io,
     plant: Plant,
     /// The class of the scope the context is in: a background scope's tasks run on the
     /// pool's background queues (std.md, "`Threads`", point 5), and so do its scopes'.
     class: Class,
-    /// Where its task runs, and its task's lock-order token: one per task, shared by the
-    /// task's contexts.
-    placed: Rc<Placed>,
+    /// Where its task runs, its task's lock-order token and its frame: one per task, shared
+    /// by the task's contexts.
+    placed: Placement,
+}
+
+/// Where a context's task placement is held.
+#[derive(Clone)]
+enum Placement {
+    /// Shared by the task's contexts: one allocation per task.
+    Task(Rc<Placed>),
+    /// The root task of a hosted run: held by the run itself ([`crate::guest::Run`], in
+    /// `bstd_hosted_start`'s frame), reached through the calling thread's run as every hosted
+    /// reach is, so it needs no allocation and no count. A context of it used outside its run
+    /// stops with the run's panic.
+    HostedRoot,
 }
 
 /// Where the code holding a context runs: worker `n` of its pool, or a thread outside the pool
@@ -79,16 +99,19 @@ pub(crate) enum Here {
 
 /// Where a task runs, kept from its start (std.md, "Layouts": a started task never changes its
 /// thread), and whether its lock-order token is out.
-struct Placed {
+pub(crate) struct Placed {
     /// The worker it was placed on at its start. Under `Inline` every task runs on the thread
     /// that spawned it, so the worker is the scope's count of spawns, a model of the placement
     /// a pool makes; a simulated migration is [`Plant::TaskMigrates`]. On a pool's worker it is
     /// that worker's index.
     worker: Cell<u32>,
-    /// The OS thread it started on: a debug build checks each resume against it (rustc's
-    /// builds only: blaze's lets a task move).
+    /// The OS thread it runs on, marked at the start of its first wait: a debug build checks
+    /// each resume against it (rustc's builds only: blaze's lets a task move). Marked there,
+    /// not at the task's start, because a task changes thread only across a wait: until its
+    /// first, it is on the thread it started on, and a task that never waits (a hello) never
+    /// asks the thread who it is.
     #[cfg(all(debug_assertions, not(blaze)))]
-    thread: crate::rt::ThreadMark,
+    thread: Cell<Option<crate::rt::ThreadMark>>,
     /// Whether [`Cx::lock_order`]'s token is out.
     order_out: Cell<bool>,
     /// The pool its tasks are spawned on: none for an `Inline` root and what is under it.
@@ -96,18 +119,47 @@ struct Placed {
     /// The thread it runs on, as the pool knows it: a spawn from worker `n` goes to `n`'s own
     /// queue, which only `n` pushes to.
     here: Here,
+    /// The task's frame: given by its spawner (reserved there, so one that cannot be had
+    /// fails the spawn), or, for a root, made at its first use with `scratch` bytes.
+    frame: OnceCell<Frame>,
+    scratch: usize,
 }
 
 impl Placed {
-    fn on(worker: u32, pool: Option<Pool>, here: Here) -> Rc<Placed> {
-        // alloc: once per task, where it runs.
-        Rc::new(Placed {
+    fn on(worker: u32, pool: Option<Pool>, here: Here, frame: Option<Frame>, scratch: usize) -> Placement {
+        // alloc: once per task, where it runs and its frame.
+        Placement::Task(Rc::new(Placed::new(worker, pool, here, frame, scratch)))
+    }
+
+    /// A hosted run's root task's placement, held by the run: on no pool, outside, its frame
+    /// of `scratch` bytes made at its first use.
+    pub(crate) fn hosted_root(scratch: usize) -> Placed {
+        Placed::new(0, None, Here::Outside, None, scratch)
+    }
+
+    fn new(worker: u32, pool: Option<Pool>, here: Here, frame: Option<Frame>, scratch: usize) -> Placed {
+        let made = OnceCell::new();
+        if let Some(frame) = frame {
+            // A fresh cell takes its value: `set` cannot find one there.
+            _ = made.set(frame);
+        }
+        Placed {
             worker: Cell::new(worker),
             #[cfg(all(debug_assertions, not(blaze)))]
-            thread: crate::rt::thread_mark(),
+            thread: Cell::new(None),
             order_out: Cell::new(false),
             pool,
             here,
+            frame: made,
+            scratch,
+        }
+    }
+
+    /// The task's frame, made now if this is its first use.
+    fn frame(&self) -> &Frame {
+        self.frame.get_or_init(|| match Frame::with_reserve(self.scratch, blaze_mem::Tag::Frames) {
+            Ok(frame) => frame,
+            Err(why) => panic!("bstd::cx: the task's frame of {} bytes could not be made: {why:?}", self.scratch),
         })
     }
 }
@@ -128,8 +180,8 @@ impl Placed {
 /// it runs, as is the debug check of its thread), and anything a closure borrowed, which is the
 /// closure's to be `Send` about (both spawns take `Send` closures and results).
 pub(crate) struct Seed {
-    deadline: Deadline,
-    cancel: Arc<Cancel>,
+    deadline: Option<Deadline>,
+    cancel: Option<Arc<Cancel>>,
     span: &'static str,
     frame: Frame,
     world: Io,
@@ -158,7 +210,7 @@ impl Seed {
             Here::Worker(at) => at,
             Here::Outside => worker,
         };
-        Cx { deadline, cancel, span, frame: shared(frame), world, plant, class, placed: Placed::on(worker, pool, here) }
+        Cx { deadline, cancel, span, world, plant, class, placed: Placed::on(worker, pool, here, Some(frame), 0) }
     }
 }
 
@@ -198,47 +250,64 @@ impl Cancel {
     }
 }
 
-/// `frame` shared by a task's contexts.
-#[expect(
-    clippy::arc_with_non_send_sync,
-    reason = "a task's contexts share its frame on the task's thread; `Cx` is not `Send` on purpose"
-)]
-fn shared(frame: Frame) -> Arc<Frame> {
-    // alloc: once per task, the owner of its frame.
-    Arc::new(frame)
-}
-
 impl Cx {
-    /// The root context of `world`: `deadline`, never cancelled, named `main`.
-    pub(crate) fn root(deadline: Deadline, frame: Frame, world: Io) -> Cx {
+    /// The root context of `world`: ending at `deadline` (`None`: never), never cancelled,
+    /// named `main`, its frame of `scratch` bytes made at its first use.
+    pub(crate) fn root(deadline: Option<Deadline>, scratch: usize, world: Io) -> Cx {
         let plant = world.plant();
         world.record_trace("main", RecordKind::Opened { parent: "main" });
         Cx {
             deadline,
-            cancel: Cancel::new(None),
+            cancel: None,
             span: "main",
-            frame: shared(frame),
             world,
             plant,
             class: Class::Foreground,
-            placed: Placed::on(0, None, Here::Outside),
+            placed: Placed::on(0, None, Here::Outside, None, scratch),
+        }
+    }
+
+    /// The root context of a hosted run, `world` its hosted `Io`: as [`Cx::root`], its
+    /// placement the one the run holds ([`Placement::HostedRoot`]). Only `bstd_hosted_start`
+    /// makes it, once per run; a root the program makes itself (`io.cx`) has its own.
+    pub(crate) fn hosted_root(deadline: Option<Deadline>, world: Io) -> Cx {
+        let plant = world.plant();
+        world.record_trace("main", RecordKind::Opened { parent: "main" });
+        Cx { deadline, cancel: None, span: "main", world, plant, class: Class::Foreground, placed: Placement::HostedRoot }
+    }
+
+    /// Where its task runs: shared by the task's contexts, or the hosted run's root's.
+    fn placed(&self) -> &Placed {
+        match &self.placed {
+            Placement::Task(placed) => placed,
+            Placement::HostedRoot => crate::guest::Run::current().placed(),
         }
     }
 
     /// The root context of `world` on `pool` (std.md, "`Threads`"): as [`Cx::root`], its tasks
     /// spawned on the pool's workers, its own code on the calling thread, outside the pool.
     pub(crate) fn root_on(deadline: Deadline, frame: Frame, world: Io, pool: Pool) -> Cx {
-        let cx = Cx::root(deadline, frame, world);
-        Cx { placed: Placed::on(0, Some(pool), Here::Outside), ..cx }
+        let plant = world.plant();
+        world.record_trace("main", RecordKind::Opened { parent: "main" });
+        Cx {
+            deadline: Some(deadline),
+            // A pool's fold may cancel its root (`PerWorker`'s tally): it has one from the start.
+            cancel: Some(Cancel::new(None)),
+            span: "main",
+            world,
+            plant,
+            class: Class::Foreground,
+            placed: Placed::on(0, Some(pool), Here::Outside, Some(frame), 0),
+        }
     }
 
     /// A child whose deadline is the earlier of this one's and `deadline`: never later.
     pub fn until(&self, deadline: Deadline) -> Cx {
         let deadline = match self.plant {
             Plant::UntilWidens => deadline,
-            Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::UnsyncedRenameSyncs | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned | Plant::ParJoinsInRunOrder | Plant::FreezeLeaks | Plant::SwapFreesAtOnce | Plant::FlightComputesTwice | Plant::ChanPassesCapacity | Plant::PublishOnceOverwrites | Plant::OrderTokenTwice | Plant::TaskMigrates => self.deadline.min(deadline),
+            Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::UnsyncedRenameSyncs | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned | Plant::ParJoinsInRunOrder | Plant::FreezeLeaks | Plant::SwapFreesAtOnce | Plant::FlightComputesTwice | Plant::ChanPassesCapacity | Plant::PublishOnceOverwrites | Plant::OrderTokenTwice | Plant::TaskMigrates | Plant::AncestorsUnbounded => self.deadline().min(deadline),
         };
-        Cx { deadline, ..self.child() }
+        Cx { deadline: Some(deadline), ..self.child() }
     }
 
     /// A child named `name`, inside this one's span: its waits say they are `name`'s, and the
@@ -258,7 +327,10 @@ impl Cx {
     #[blaze::noalloc]
     #[blaze::nonblocking]
     pub fn deadline(&self) -> Deadline {
-        self.deadline
+        match self.deadline {
+            Some(deadline) => deadline,
+            None => Deadline::NEVER,
+        }
     }
 
     /// The span's name.
@@ -273,7 +345,10 @@ impl Cx {
     #[blaze::noalloc]
     #[blaze::nonblocking]
     pub fn cancelled(&self) -> bool {
-        self.cancel.is_set()
+        match &self.cancel {
+            Some(cancel) => cancel.is_set(),
+            None => false,
+        }
     }
 
     /// [`Stopped::Cancelled`] once its scope was cancelled: the line a long computation calls.
@@ -286,20 +361,19 @@ impl Cx {
         }
     }
 
-    /// The task's frame, for `Vec::new_in(cx.frame())`: freed when the task ends.
-    #[blaze::nopanic]
+    /// The task's frame, for `Vec::new_in(cx.frame())`: freed when the task ends. A root's is
+    /// made at this first ask (it reserves nothing until it hands out bytes).
     #[blaze::noalloc]
     #[blaze::nonblocking]
     pub fn frame(&self) -> &Frame {
-        &self.frame
+        self.placed().frame()
     }
 
     /// Empty bytes in the task's frame, named by the span when they run out of room.
-    #[blaze::nopanic]
     #[blaze::noalloc]
     #[blaze::nonblocking]
     pub fn bytes(&self) -> Bytes<'_> {
-        Bytes::new_in(&self.frame, self.span)
+        Bytes::new_in(self.placed().frame(), self.span)
     }
 
     #[blaze::nopanic]
@@ -352,8 +426,9 @@ impl Cx {
     pub(crate) fn wait(&self, io: &Io, tag: Tag, ends: Ends) -> Result<Done, Stopped> {
         let deadline = match self.plant {
             Plant::WaitIgnoresDeadline => Deadline::NEVER,
-            Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::UnsyncedRenameSyncs | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned | Plant::ParJoinsInRunOrder | Plant::FreezeLeaks | Plant::SwapFreesAtOnce | Plant::FlightComputesTwice | Plant::ChanPassesCapacity | Plant::PublishOnceOverwrites | Plant::OrderTokenTwice | Plant::TaskMigrates => self.deadline,
+            Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::UnsyncedRenameSyncs | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned | Plant::ParJoinsInRunOrder | Plant::FreezeLeaks | Plant::SwapFreesAtOnce | Plant::FlightComputesTwice | Plant::ChanPassesCapacity | Plant::PublishOnceOverwrites | Plant::OrderTokenTwice | Plant::TaskMigrates | Plant::AncestorsUnbounded => self.deadline(),
         };
+        self.waits();
         let mut idle = 0;
         loop {
             if let Some(done) = io.take(tag) {
@@ -398,8 +473,9 @@ impl Cx {
     pub(crate) fn wait_for<T>(&self, io: &Io, mut ready: impl FnMut() -> Option<T>) -> Result<T, Stopped> {
         let deadline = match self.plant {
             Plant::WaitIgnoresDeadline => Deadline::NEVER,
-            Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::UnsyncedRenameSyncs | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned | Plant::ParJoinsInRunOrder | Plant::FreezeLeaks | Plant::SwapFreesAtOnce | Plant::FlightComputesTwice | Plant::ChanPassesCapacity | Plant::PublishOnceOverwrites | Plant::OrderTokenTwice | Plant::TaskMigrates => self.deadline,
+            Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::UnsyncedRenameSyncs | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned | Plant::ParJoinsInRunOrder | Plant::FreezeLeaks | Plant::SwapFreesAtOnce | Plant::FlightComputesTwice | Plant::ChanPassesCapacity | Plant::PublishOnceOverwrites | Plant::OrderTokenTwice | Plant::TaskMigrates | Plant::AncestorsUnbounded => self.deadline(),
         };
+        self.waits();
         let mut idle = 0;
         loop {
             if let Some(got) = ready() {
@@ -427,13 +503,22 @@ impl Cx {
     /// checks; a fiber layout's park returns here, and its scheduler must put the task back
     /// where it ran. Built by blaze the rule is lifted: a task may move, because blaze refuses
     /// a value that is not `Send` live across a call that can wait, and the check goes.
+    /// The task is about to wait: at its first, a debug build marks the thread it is on, which
+    /// is the one it started on (it has not waited yet, so it has not moved).
+    fn waits(&self) {
+        #[cfg(all(debug_assertions, not(blaze)))]
+        if self.placed().thread.get().is_none() {
+            self.placed().thread.set(Some(crate::rt::thread_mark()));
+        }
+    }
+
     fn resumed(&self) {
         if self.plant == Plant::TaskMigrates {
-            let placed = &self.placed;
+            let placed = self.placed();
             placed.worker.set(placed.worker.get() + 1);
         }
         #[cfg(all(debug_assertions, not(blaze)))]
-        if crate::rt::thread_mark() != self.placed.thread {
+        if Some(crate::rt::thread_mark()) != self.placed().thread.get() {
             panic!(
                 "bstd::cx task {}: resumed from a wait on another thread than it started on \
                  (std.md, \"Layouts\": a started task never changes its thread)",
@@ -447,7 +532,7 @@ impl Cx {
     #[blaze::noalloc]
     #[blaze::nonblocking]
     pub(crate) fn worker(&self) -> u32 {
-        self.placed.worker.get()
+        self.placed().worker.get()
     }
 
     /// Takes the task's lock-order token: `false` when it is out already.
@@ -455,7 +540,7 @@ impl Cx {
     #[blaze::noalloc]
     #[blaze::nonblocking]
     pub(crate) fn take_order(&self) -> bool {
-        let was_out = self.placed.order_out.replace(true);
+        let was_out = self.placed().order_out.replace(true);
         !was_out || self.plant == Plant::OrderTokenTwice
     }
 
@@ -464,7 +549,7 @@ impl Cx {
     #[blaze::noalloc]
     #[blaze::nonblocking]
     pub(crate) fn give_order(&self) {
-        self.placed.order_out.set(false);
+        self.placed().order_out.set(false);
     }
 
     /// Whether this context stopped already at `now`: then a call asks nothing of the driver.
@@ -474,15 +559,32 @@ impl Cx {
         if self.plant != Plant::WaitIgnoresCancel {
             self.check()?;
         }
-        if self.plant != Plant::WaitIgnoresDeadline && self.deadline.passed(now) {
-            return Err(Stopped::Deadline { span: self.span, at: self.deadline.get() });
+        if let Some(deadline) = self.deadline
+            && self.plant != Plant::WaitIgnoresDeadline
+            && deadline.passed(now)
+        {
+            return Err(Stopped::Deadline { span: self.span, at: deadline.get() });
         }
         Ok(())
     }
 
+    /// [`Cx::stopped_by`] at `io`'s now, read only when there is a deadline to compare it
+    /// with: a context with none (a hello's root) asks the clock nothing.
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn stopped(&self, io: &Io) -> Result<(), Stopped> {
+        match self.deadline {
+            Some(_) => self.stopped_by(io.now()),
+            None => match self.plant {
+                Plant::WaitIgnoresCancel => Ok(()),
+                _ => self.check(),
+            },
+        }
+    }
+
     /// The context of a scope inside this task: its own cancellation, under this one's.
     pub(crate) fn scoped(&self) -> Cx {
-        Cx { cancel: Cancel::new(Some(Arc::clone(&self.cancel))), ..self.child() }
+        Cx { cancel: Some(Cancel::new(self.cancel.clone())), ..self.child() }
     }
 
     /// The context of a task of the scope `self` is: the scope's deadline and cancellation,
@@ -490,8 +592,8 @@ impl Cx {
     /// It is placed on `worker` and stays there (std.md, "Layouts").
     pub(crate) fn task(&self, name: &'static str, frame: Frame, worker: u32) -> Cx {
         self.world.record_trace(name, RecordKind::Opened { parent: self.span });
-        let placed = Placed::on(worker, self.placed.pool.clone(), self.placed.here);
-        Cx { span: name, frame: shared(frame), placed, ..self.child() }
+        let placed = Placed::on(worker, self.placed().pool.clone(), self.placed().here, Some(frame), 0);
+        Cx { span: name, placed, ..self.child() }
     }
 
     /// What of the context of a task of the scope `self` is crosses to the thread that will
@@ -502,12 +604,12 @@ impl Cx {
         self.world.record_trace(name, RecordKind::Opened { parent: self.span });
         Seed {
             deadline: self.deadline,
-            cancel: Arc::clone(&self.cancel),
+            cancel: self.cancel.clone(),
             span: name,
             frame,
             world: self.world.clone(),
             plant: self.plant,
-            pool: self.placed.pool.clone(),
+            pool: self.placed().pool.clone(),
             class,
             worker,
         }
@@ -518,7 +620,7 @@ impl Cx {
     #[blaze::noalloc]
     #[blaze::nonblocking]
     pub(crate) fn pool(&self) -> Option<&Pool> {
-        self.placed.pool.as_ref()
+        self.placed().pool.as_ref()
     }
 
     /// Where the code holding this context runs, as its pool knows it.
@@ -526,7 +628,7 @@ impl Cx {
     #[blaze::noalloc]
     #[blaze::nonblocking]
     pub(crate) fn here(&self) -> Here {
-        self.placed.here
+        self.placed().here
     }
 
     /// How many workers its scopes run tasks on: the pool's count, one under `Inline`. What a
@@ -551,15 +653,27 @@ impl Cx {
     #[blaze::noalloc]
     #[blaze::nonblocking]
     pub(crate) fn layout(&self) -> Layout {
-        match &self.placed.pool {
+        match &self.placed().pool {
             Some(pool) => Layout::Threads { workers: pool.workers() },
             None => Layout::Inline,
         }
     }
 
     /// This context's cancellation, to be set from another thread (a task's failure).
+    ///
+    /// # Panics
+    ///
+    /// On a context with no cancellation (an `Inline` root, which nothing cancels): only a
+    /// scope's contexts, and a pool's root, are cancelled.
     pub(crate) fn canceller(&self) -> Canceller {
-        Canceller(Arc::clone(&self.cancel))
+        Canceller(Arc::clone(self.cancellation()))
+    }
+
+    fn cancellation(&self) -> &Arc<Cancel> {
+        match &self.cancel {
+            Some(cancel) => cancel,
+            None => panic!("bstd::cx {}: cancelled outside a scope (a root is never cancelled; std.md, \"Cancellation\")", self.span),
+        }
     }
 
     /// This context, in a scope of `class`: what a narrowed scope gives the tasks it runs.
@@ -572,19 +686,18 @@ impl Cx {
     #[blaze::noalloc]
     #[blaze::nonblocking]
     pub(crate) fn cancel(&self) {
-        self.cancel.set.store(true, Ordering::Release);
+        self.cancellation().set.store(true, Ordering::Release);
     }
 
     fn child(&self) -> Cx {
         Cx {
             deadline: self.deadline,
-            cancel: Arc::clone(&self.cancel),
+            cancel: self.cancel.clone(),
             span: self.span,
-            frame: Arc::clone(&self.frame),
             world: self.world.clone(),
             plant: self.plant,
             class: self.class,
-            placed: Rc::clone(&self.placed),
+            placed: self.placed.clone(),
         }
     }
 }

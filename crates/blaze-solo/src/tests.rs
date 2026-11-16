@@ -441,7 +441,7 @@ fn floor(done: &mut Done) {
     };
     match done {
         Done::Stamped(stamps) => stamps.iter_mut().for_each(floor),
-        Done::Entries(entries) => entries.iter_mut().for_each(|(_, stamp)| floor(stamp)),
+        Done::Entries(entries) => entries.map_stamps(floor),
         _ => {}
     }
 }

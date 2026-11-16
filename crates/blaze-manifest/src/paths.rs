@@ -49,6 +49,46 @@ pub fn normalize_path(path: &Path) -> PathBuf {
     ret
 }
 
+/// `path` relative to `base`, both taken lexically (cargo prints these with pathdiff 0.2's
+/// `diff_paths`, whose rules this keeps): an absolute `path` under a relative `base` is
+/// itself; a relative `path` under an absolute `base` has no answer, nor has a `base` with a
+/// `..` past the common part.
+pub(crate) fn relative_to(path: &Path, base: &Path) -> Option<PathBuf> {
+    if path.is_absolute() != base.is_absolute() {
+        return path.is_absolute().then(|| path.to_path_buf());
+    }
+    let mut ita = path.components();
+    let mut itb = base.components();
+    let mut out = PathBuf::new();
+    // Whether a component has been written: the common prefix is skipped only before that.
+    let mut started = false;
+    loop {
+        match (ita.next(), itb.next()) {
+            (None, None) => break,
+            (Some(a), None) => {
+                out.push(a);
+                out.extend(ita.by_ref());
+                break;
+            }
+            (None, Some(_)) => out.push(Component::ParentDir),
+            (Some(a), Some(b)) if !started && a == b => continue,
+            (Some(a), Some(Component::CurDir)) => out.push(a),
+            (Some(_), Some(Component::ParentDir)) => return None,
+            (Some(a), Some(_)) => {
+                out.push(Component::ParentDir);
+                for _ in itb.by_ref() {
+                    out.push(Component::ParentDir);
+                }
+                out.push(a);
+                out.extend(ita.by_ref());
+                break;
+            }
+        }
+        started = true;
+    }
+    Some(out)
+}
+
 /// The path, then each of its parents, stopping after `stop_at` when given (cargo's
 /// `paths::ancestors`, which also stops at `__CARGO_TEST_ROOT`).
 pub(crate) fn ancestors<'a>(

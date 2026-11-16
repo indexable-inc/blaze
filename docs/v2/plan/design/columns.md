@@ -143,3 +143,82 @@ whole cold segments of the store that no build has touched in a while (decompres
 segment that is then read in place) and bytes moving between machines (the shared cache, remote
 execution). Never on a path a build reads: a lightweight-encoded record is already small, and
 zstd on top of it gains little and costs a copy on every read.
+
+## Cold and moving bytes, measured (2026-11-16)
+
+`examples/squeeze.rs` in blaze-squeeze (release, Apple arm64, best of 5) on real record sets:
+`core`'s scope, decls and impl-bucket records (blaze-scope's pipeline `--dump`), every
+`library/` file outlined to `FileItems`, the ladder's drive envelopes, two leaf tables, 4 KiB
+pieces of linked AArch64 code, and a build session's profile Parquet. Bytes, and in brackets
+the time to have one record from the middle in hand. The dictionary column is the odd half of
+each set (trained on the even half) beside plain zstd 3 on that same half; the dictionary's
+own bytes are added. Solid blocks add an index of 8 bytes a record.
+
+| kind | raw | ours | zstd 3 a record | odd half: zstd 3 → + 16 KiB dict | solid 64 KiB |
+|---|---|---|---|---|---|
+| scope (406) | 2,833,776 [13 ns] | 2,085,082 [2.9 us a row] | 1,485,118 [286 ns] | 720,642 → 260,426 [308 ns] | 654,895 [7.6 us] |
+| decls (406) | 1,329,408 [10 ns] | - | 625,315 [264 ns] | 277,679 → 261,938 [310 ns] | 548,542 [27 us] |
+| impl bucket (4,003) | 1,333,584 [3 ns] | - | 1,196,567 [48 ns] | 621,010 → 476,090 [49 ns] | 824,524 [7.1 us] |
+| `FileItems` (3,130) | 44,759,792 [103 ns] | 28,849,347 (rest estimated) [3.7 us a row] | 20,428,333 [4.5 us] | 11,042,885 → 10,916,539 [1.6 us] | 19,481,215 [208 us] |
+| ladder envelopes (180) | 87,696 [3 ns] | - | 61,236 [36 ns] | 29,708 → 28,579 [34 ns] | 17,868 [4.5 us] |
+| leaf tables (2) | 1,823,766 [18 us] | - | 1,052,567 [493 us] | - | 1,052,599 |
+| code, 4 KiB (756) | 3,095,152 [38 ns] | - | 1,874,807 [3.7 us] | 936,652 → 885,736 [3.5 us] | 1,606,270 [36 us] |
+| profile Parquet (174) | 67,856,798 [40 us] | Parquet's own | 22,965,306 [972 us] | 10,604,785 → 10,610,393 | 22,956,980 [1.0 ms] |
+
+Others measured: zstd 1 is within 1 to 3% of zstd 3 everywhere and zstd 19 gains 2 to 10% at
+8 to 16 MB/s; LZ4 is 15 to 25% larger than zstd 3 at a similar read cost; 112 KiB dictionaries
+lose to 16 KiB ones once their bytes are counted; ours then zstd 3: scope 1,475,113,
+`FileItems` columns 16,943,435. New-layer code records call through fixups kept apart from
+their bytes (`blaze-emit` `Code { bytes, fixups }`), holding no `bl` displacements, so the branch
+filter was measured on the linked binary only: 3.8% smaller under zstd 3, at 4,491 MB/s. Not
+measured: the old `~/.cache/blaze` code records, held in blaze-cas `.pack` files this example
+does not parse.
+
+What the numbers chose:
+
+- (a) A trained dictionary beats plain zstd by more than 1.5 times on scope records only
+  (2.77 times, its bytes counted; impl buckets 1.30, the rest 1.01 to 1.08). Built in
+  blaze-squeeze: `Dictionary::train` (and `examples/train.rs` as the tool), the dictionary a
+  record named by the BLAKE3 id of its bytes, a squeezed record (`BSQ1`, the id it needs, one
+  zstd frame with its size and checksum) refused by name without it, its size checked against
+  the caller's limit before the output grows. Tests are `blaze_sim::check` properties with
+  planted-bug controls.
+- (b) Cascades inside the encodings (column-level runs, a sorted dictionary with delta values,
+  deltas then the chooser) against the single-level chooser: 3.8% (scope) and 0.3%
+  (`FileItems`) fewer bytes within 1.3 times the get cost, 6.2% and 12.5% at any cost. Under
+  15%: not added. Strings already cascade (dictionary then FSST, chosen on both sets).
+- (c) Solid 64 KiB blocks win for transfer of small records (2.27 times zstd a record on scope
+  records, 3.4 on ladder envelopes) and gain nothing on large ones. Design only: a transfer pack
+  sorts records by kind into about 64 KiB zstd blocks, the manifest naming each record's block
+  and offset; a reader asks for the block with a bound on its decompressed size and checks each
+  record's digest after (docs/v2/plan/design/remote-read.md, "Not built"). Cold segments in
+  the store keep per-record frames, so one read stays under 1 us.
+
+Part of the profile: `spans.function` named a macro file by a Debug dump of its ids, up to
+64 KB a value. Named by its calls and source file instead, a session's profile is 150,658,004
+→ 67,856,798 bytes encoded without a codec, 30,722,873 → 28,390,672 under LZ4 and 24,670,107
+→ 23,756,638 under zstd 3.
+
+### A zstd decoder in safe Rust (a plan)
+
+Scope: frames (header, window, content size, checksum), raw, RLE and compressed blocks, the
+literals section (raw, RLE, Huffman with 1 or 4 streams), the sequences section (predefined,
+RLE and FSE tables; repeat offsets), FSE and Huffman table decoding, and dictionaries (their
+entropy tables and content). No encoder: CI and the remote workers write with C zstd.
+
+Why: every fetched byte goes through the decoder before its digest is checked, and today that is
+C (vendor/zstd-sys) or its c2rust translation on wasm (vendor/libzstd-rs-sys, 12,738 lines of
+decompress and common code, 953 `unsafe` across the crate). A safe decoder makes the limit and
+the in-range reads blaze's own promise, takes the allocator as a value, returns typed errors,
+and runs on wasm without the translation.
+
+Size: ruzstd 0.8.2's decoding side is about 7,100 lines without comments (decoding 4,189,
+fse 834 and huff0 824 with their encoders, bit_io 595, dictionary 360, blocks 341); blaze's is
+expected at 4,000 to 5,000. Speed is an expectation: within 1.3 times of C with four
+interleaved Huffman streams, a branchless bit reader over 64-bit loads, and bounds checks
+hoisted by checking a block's lengths once; ruzstd is reported 2 to 3 times slower than C.
+
+Corpus: zstd's golden frames and dictionaries (`tests/golden-*`), frames made by its
+`decodecorpus` generator, every record set above compressed by C zstd at levels 1 to 19 with
+and without dictionaries, and a `blaze_sim` property against the C decoder on drawn and mutated
+frames, with planted bugs.

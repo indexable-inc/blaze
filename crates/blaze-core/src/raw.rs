@@ -93,7 +93,7 @@ mod unix {
         let mut rusage: libc::rusage = unsafe { std::mem::zeroed() };
         // SAFETY: `status` and `rusage` are live locals the call writes and does not keep; a
         // pid that is not a child fails with `ECHILD`, touching neither.
-        let reaped = unsafe { libc::wait4(pid, &mut status, 0, &mut rusage) };
+        let reaped = unsafe { libc::wait4(pid, &mut status, 0, (&raw mut rusage).cast()) };
         match reaped == pid {
             true => Ok((status, rusage)),
             false => Err(io::Error::last_os_error()),
@@ -110,7 +110,7 @@ mod unix {
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         // SAFETY: `info` is a live local the call writes and does not keep.
         let waited = unsafe {
-            libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT)
+            libc::waitid(libc::P_PID, pid as libc::id_t, (&raw mut info).cast(), libc::WEXITED | libc::WNOWAIT)
         };
         checked(waited).map(drop)
     }
@@ -122,12 +122,10 @@ mod unix {
         let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
         // SAFETY: `info` is a live local the call writes and does not keep.
         let waited = unsafe {
-            libc::waitid(
-                libc::P_PID,
-                pid as libc::id_t,
-                &mut info,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            )
+            libc::waitid(libc::P_PID,
+            pid as libc::id_t,
+            (&raw mut info).cast(),
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,)
         };
         checked(waited)?;
         // With `WNOHANG` a child that has not exited leaves `info` as it was: its pid 0.
@@ -243,7 +241,7 @@ mod unix {
     pub(crate) fn utimens(path: &CStr, times: &[libc::timespec; 2]) -> io::Result<()> {
         // SAFETY: a NUL-terminated path and two `timespec`s, both borrowed across the call,
         // which reads them and keeps neither; no flags.
-        checked(unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) })
+        checked(unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr().cast(), 0) })
             .map(drop)
     }
 
@@ -266,12 +264,7 @@ mod unix {
         // SAFETY: `dir` is borrowed open, `name` NUL-terminated, and `stat` room for one
         // `libc::stat` the call writes whole on success and does not keep.
         let failed = unsafe {
-            libc::fstatat(
-                dir.as_raw_fd(),
-                name.as_ptr(),
-                stat.as_mut_ptr(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
+            libc::fstatat(dir.as_raw_fd(), name.as_ptr(), stat.as_mut_ptr().cast(), libc::AT_SYMLINK_NOFOLLOW)
         };
         checked(failed)?;
         // SAFETY: the call succeeded, so it filled the `stat`; read before then it would be
@@ -296,7 +289,7 @@ mod unix {
         let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
         // SAFETY: `path` NUL-terminated and borrowed across the call, `stat` room for one
         // `libc::statfs` the call writes whole on success and does not keep.
-        checked(unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) })?;
+        checked(unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr().cast()) })?;
         // SAFETY: the call succeeded, so it filled the `statfs`.
         Ok(unsafe { stat.assume_init() })
     }
@@ -317,12 +310,7 @@ mod unix {
     pub(crate) fn chmod_no_follow(path: &CStr, mode: u32) -> io::Result<()> {
         // SAFETY: a NUL-terminated path borrowed across the call.
         checked(unsafe {
-            libc::fchmodat(
-                libc::AT_FDCWD,
-                path.as_ptr(),
-                mode as libc::mode_t,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
+            libc::fchmodat(libc::AT_FDCWD, path.as_ptr(), mode as libc::mode_t, libc::AT_SYMLINK_NOFOLLOW)
         })
         .map(drop)
     }
@@ -333,12 +321,7 @@ mod unix {
     pub(crate) fn touch(path: &CStr) -> io::Result<()> {
         // SAFETY: a NUL-terminated path borrowed across the call; a null `times` means now.
         checked(unsafe {
-            libc::utimensat(
-                libc::AT_FDCWD,
-                path.as_ptr(),
-                std::ptr::null(),
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
+            libc::utimensat(libc::AT_FDCWD, path.as_ptr(), std::ptr::null(), libc::AT_SYMLINK_NOFOLLOW)
         })
         .map(drop)
     }
@@ -370,13 +353,11 @@ mod unix {
         // room for `into.len()` bytes the call writes and does not keep. No option is set:
         // an entry holds only the attributes its returned set names.
         let count = checked(unsafe {
-            libc::getattrlistbulk(
-                dir.as_raw_fd(),
-                (&raw mut list).cast(),
-                into.as_mut_ptr().cast(),
-                into.len(),
-                0,
-            )
+            libc::getattrlistbulk(dir.as_raw_fd(),
+            (&raw mut list).cast(),
+            into.as_mut_ptr().cast(),
+            into.len(),
+            0,)
         })?;
         Ok(count as usize)
     }

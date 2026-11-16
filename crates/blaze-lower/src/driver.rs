@@ -7,33 +7,142 @@
 //! Nothing recurses: the texts to lower (the file, each expansion, each body's items) wait on
 //! one work list, and each one's anonymous constants on another.
 
+use blaze_expand::TokenStream;
 use blaze_ids::ContentId;
 use blaze_own::{AString, AVec, Alloc, String, Vec};
-use blaze_surface::{Edition, Item, ItemDetail, ItemIndex, ItemKind, Range};
+use blaze_surface::{Attr, AttrKind, Edition, Item, ItemDetail, ItemIndex, ItemKind, Range};
 
 use crate::columns::View;
-use crate::form::{ROW_LOCAL_ITEM, LocalItem};
-use crate::{Cfg, Lowered, Need, anon_const_key, body_key, lower_anon_const, lower_body, lower_signature, signature_key};
+use crate::form::ROW_LOCAL_ITEM;
+use crate::{
+    Cfg, CfgAnswer, ItemWords, Lowered, Need, anon_const_key, body_key, lower_anon_const_expanding, lower_body_expanding,
+    lower_body_words_expanding, lower_signature, lower_signature_words, signature_key,
+};
 
 /// How deep item macros may expand into item macros (rustc's `recursion_limit` default).
 pub const EXPANSION_DEPTH: u32 = 128;
 
-/// What an item macro call became.
+/// How many macro expansions one item of the file may make, every descendant counted, and
+/// how many one body's lowering may make: the depth bound alone lets a macro whose output
+/// holds two calls of itself make 2^128. Tempo's most in one file is 1,569 (one `sol!`); its
+/// deepest item chain 3.
+pub const EXPANSION_BUDGET: u32 = 1 << 16;
+
+/// The bound a macro call was refused by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bound {
+    /// It would be past [`EXPANSION_DEPTH`] expansions deep.
+    Depth,
+    /// Its item has made [`EXPANSION_BUDGET`] expansions already.
+    Budget,
+}
+
+impl core::fmt::Display for Bound {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Bound::Depth => write!(f, "past {EXPANSION_DEPTH} nested expansions (rule 18)"),
+            Bound::Budget => write!(f, "past {EXPANSION_BUDGET} expansions from one item (rule 18)"),
+        }
+    }
+}
+
+/// An item macro call a bound refused: the macro's path, written on the item the sink is
+/// given, and the bound it passed. Nothing of the call is lowered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Refusal<'r> {
+    pub path: &'r str,
+    pub bound: Bound,
+}
+
+/// What a macro call became.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Expansion {
-    /// Its items' text is in the output string.
-    Items,
-    /// The expander has no way to expand it (a proc macro not built, a builtin not taken).
+    /// It expanded: an item call's items' text is in the output string, a body call's words
+    /// in its [`BodyOut`].
+    Expanded,
+    /// The expander has no way to expand it (no definition found, a proc macro not built, a
+    /// builtin not taken).
     Unsupported,
     /// It expanded to an error, which the expander reports.
     Failed,
 }
 
-/// Item macro expansion: blaze-expand's, through the caller.
+/// Where a body macro call's input is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CallInput<'s> {
+    /// In the item's own text: the token tree's text, delimiters included.
+    Text(&'s str),
+    /// In an expansion this body's lowering asked for earlier: its tokens `start..end`
+    /// (delimiters included), `expansion` counting the [`Expand::expand_body`] calls that
+    /// expanded, from 0. The expander keeps those expansions while the body is lowered.
+    Expanded { expansion: u32, start: u32, end: u32 },
+}
+
+/// A macro call in a body.
+#[derive(Clone, Copy, Debug)]
+pub struct BodyCall<'s> {
+    /// The path as written (in an expansion, its words with a space between each two).
+    pub path: &'s str,
+    pub input: CallInput<'s>,
+    /// The whole call's range in the body's text (past the item's length: in an expansion
+    /// appended to it), for a finding about it.
+    pub range: Range,
+    /// What its position takes; the expansion is parsed as this.
+    pub fragment: blaze_expand::Fragment,
+    pub edition: Edition,
+    /// The `macro_rules!` the body defines that are in textual scope at the call, in the
+    /// order written (the last of a name wins): tried before any path-based resolution.
+    pub locals: &'s [LocalMacro<'s>],
+}
+
+/// A `macro_rules!` written in a body: its name and its rules (inside its delimiters).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LocalMacro<'s> {
+    pub name: &'s str,
+    pub rules: &'s str,
+}
+
+/// What a body macro call expanded to, as the expander writes it: the expansion's words
+/// ([`blaze_expand::body_words`]) and the key of the call it expanded, which joins the body
+/// record's read list.
+pub struct BodyOut<'a> {
+    pub key: ContentId,
+    pub words: blaze_expand::BodyWords<'a>,
+}
+
+impl<'a> BodyOut<'a> {
+    pub fn new_in(alloc: Alloc<'a>) -> BodyOut<'a> {
+        BodyOut { key: ContentId([0; 32]), words: blaze_expand::BodyWords::new_in(alloc) }
+    }
+}
+
+/// Macro expansion: blaze-expand's, through the caller, who resolves each call's path.
 pub trait Expand {
-    /// Expands the call of `path` (as written) on `input` (its token tree's text, delimiters
-    /// included) into `out`.
-    fn expand(&mut self, path: &str, input: &str, edition: Edition, out: &mut AString<'_>) -> Expansion;
+    /// Expands the item call of `path` (as written) on `input` (its token tree's text,
+    /// delimiters included) into `out`: its words, which the driver lowers in place of a text
+    /// lexed again. `cfg` is the set the file is lowered under: a `cfg!` or `cfg_select!` of
+    /// the call is answered by it, as the items' `#[cfg]`s are ([`crate::cfg_outcome`]), the
+    /// one home of that answer in item and body position alike, never the expander's host.
+    fn expand(&mut self, path: &str, input: &str, edition: Edition, cfg: &mut dyn crate::Cfg, out: &mut BodyOut<'_>) -> Expansion;
+
+    /// Expands a macro call in a body into `out`. A new body's calls start when
+    /// [`Expand::begin_body`] is called. `cfg` is the set the body is lowered under: a `cfg!`
+    /// of the call (or of its eager input) is answered by it, as the body's `#[cfg]`s are
+    /// ([`crate::cfg_outcome`]), never by the expander's host.
+    fn expand_body(&mut self, call: BodyCall<'_>, cfg: &mut dyn crate::Cfg, out: &mut BodyOut<'_>) -> Expansion;
+    /// Expands the derive of `path` (as written in `#[derive(..)]`) on `item`, the struct, enum
+    /// or union as a derive sees it (blaze-expand's `Derives::input`), into `out`: items, an
+    /// impl for a builtin derive.
+    fn derive(&mut self, path: &str, item: &TokenStream<'_>, facts: blaze_expand::DeriveFacts, edition: Edition, out: &mut BodyOut<'_>) -> Expansion;
+    /// Expands the attribute macro of `path` (as written) with `args` (inside the attribute's
+    /// delimiters, `None` for `#[path]`) on `item`, the item without that attribute
+    /// (blaze-expand's `ItemAttrs::attr_call`), into `out`: what replaces the item.
+    /// [`Expansion::Unsupported`] when `path` names no attribute macro (`#[inline]`, a tool
+    /// attribute): the walk goes on to the next attribute.
+    fn attr(&mut self, path: &str, args: Option<&TokenStream<'_>>, item: &TokenStream<'_>, edition: Edition, out: &mut BodyOut<'_>) -> Expansion;
+
+    /// A new body's lowering starts: the expansions of the last are no longer asked for.
+    fn begin_body(&mut self) {}
 }
 
 /// Where a text being lowered came from.
@@ -83,6 +192,8 @@ pub enum Outcome<'r, 'a> {
 /// Where records go.
 pub trait Sink {
     fn record(&mut self, item: &ItemRef<'_>, what: What, key: ContentId, outcome: Outcome<'_, '_>);
+    /// A macro call on `item` (its attribute, derive or the call itself) refused by a bound.
+    fn refused(&mut self, item: &ItemRef<'_>, refusal: Refusal<'_>);
 }
 
 /// The counts of a file's lowering, by what was done.
@@ -105,9 +216,13 @@ pub struct FileStats {
     pub macro_calls_expanded: u64,
     pub macro_calls_unsupported: u64,
     pub macro_calls_failed: u64,
-    /// Expansions past [`EXPANSION_DEPTH`].
+    /// Item macro calls refused past [`EXPANSION_DEPTH`].
     pub macro_calls_too_deep: u64,
+    /// Item macro calls refused past [`EXPANSION_BUDGET`].
+    pub macro_calls_over_budget: u64,
     pub body_items: u64,
+    /// Macro calls in bodies expanded and lowered in place.
+    pub body_calls_expanded: u64,
     /// Unhandled rows across every record.
     pub unhandled: u64,
     pub record_bytes: u64,
@@ -116,7 +231,76 @@ pub struct FileStats {
 /// A text waiting to be outlined and lowered: the file (`None`) or a text of its own.
 struct Job<'a> {
     text: Option<AString<'a>>,
+    /// An item macro's expansion: the words it was written as, read in place of its text.
+    words: Option<ExpansionWords<'a>>,
     source: Source,
+    /// The file's item this text descends from, an index into [`Driver::spent`]; `None` for
+    /// the file itself.
+    root: Option<u32>,
+}
+
+/// An item macro's expansion as words: the parser's words (no `EOF` padding) and each one's
+/// range in the expansion's text.
+struct ExpansionWords<'a> {
+    words: AVec<'a, u32>,
+    ranges: AVec<'a, Range>,
+}
+
+impl<'a> ExpansionWords<'a> {
+    /// `out`'s words, which [`Expand::expand`] or [`Expand::derive`] wrote, and their text:
+    /// each word's, a space before it where one may go, so the outline reads `fn clone`, not
+    /// `fnclone`.
+    fn of(out: &BodyOut<'_>, alloc: Alloc<'a>) -> (AString<'a>, ExpansionWords<'a>) {
+        let n = out.words.words.len();
+        let mut words = Vec::with_capacity_in(n, alloc);
+        words.extend_from_slice(&out.words.parser.words[..n]);
+        let mut ranges = Vec::with_capacity_in(n, alloc);
+        let mut text = String::with_capacity_in(out.words.text.len() + n, alloc);
+        for w in out.words.words.iter() {
+            if w.space_before && !text.is_empty() {
+                text.push(' ');
+            }
+            let start = u32::try_from(text.len()).expect("an expansion under 4 GiB");
+            text.push_str(&out.words.text[w.text.0 as usize..w.text.1 as usize]);
+            ranges.push(Range::new(start, u32::try_from(text.len()).expect("an expansion under 4 GiB")));
+        }
+        (text, ExpansionWords { words, ranges })
+    }
+
+    /// The words inside `range` of the text, their ranges in `range`'s own text.
+    fn slice(&self, range: Range, alloc: Alloc<'a>) -> ExpansionWords<'a> {
+        let first = self.ranges.partition_point(|r| r.start < range.start);
+        let past = self.ranges.partition_point(|r| r.end <= range.end);
+        let mut words = Vec::with_capacity_in(past.saturating_sub(first) + parser::Tokens::PAD, alloc);
+        let mut ranges = Vec::with_capacity_in(past.saturating_sub(first), alloc);
+        if first < past {
+            words.extend_from_slice(&self.words[first..past]);
+            ranges.extend(self.ranges[first..past].iter().map(|r| Range::new(r.start - range.start, r.end - range.start)));
+        }
+        ExpansionWords { words, ranges }
+    }
+
+    /// The words, padded for the parser.
+    fn padded(&self, alloc: Alloc<'a>) -> AVec<'a, u32> {
+        let mut words = Vec::with_capacity_in(self.words.len() + parser::Tokens::PAD, alloc);
+        words.extend_from_slice(&self.words);
+        words.extend(core::iter::repeat_n(parser::Tokens::EOF_WORD, parser::Tokens::PAD));
+        words
+    }
+
+    /// `text` with each `$crate` word's `$` a space: what the outline reads, which finds
+    /// items and their ranges (same bytes, same places) and lowers nothing.
+    fn outline_text(&self, text: &str, alloc: Alloc<'a>) -> AString<'a> {
+        let mut out = String::with_capacity_in(text.len(), alloc);
+        let mut at = 0usize;
+        for r in self.ranges.iter().filter(|r| r.of(text) == "$crate") {
+            out.push_str(&text[at..r.start as usize]);
+            out.push(' ');
+            at = r.start as usize + 1;
+        }
+        out.push_str(&text[at..]);
+        out
+    }
 }
 
 struct Driver<'d, 'a> {
@@ -125,6 +309,13 @@ struct Driver<'d, 'a> {
     sink: &'d mut dyn Sink,
     alloc: Alloc<'a>,
     stats: FileStats,
+    /// The current item's text with its body's expansions after it, when it has any: what
+    /// the ranges of its anonymous constants and local items are of.
+    grown: AString<'a>,
+    /// The expansions each of the file's items has made, its descendants' counted.
+    spent: AVec<'a, u32>,
+    /// The file's item the current item descends from, an index into `spent`.
+    root: u32,
 }
 
 impl<'a> Driver<'_, 'a> {
@@ -135,9 +326,9 @@ impl<'a> Driver<'_, 'a> {
         at: &ItemRef<'_>,
         what: What,
         key: ContentId,
-        result: &Result<Lowered<'a>, Need<'a>>,
+        result: &Result<Lowered<'a, '_>, Need<'a>>,
         consts: &mut AVec<'a, Range>,
-        jobs: Option<&mut AVec<'a, Job<'a>>>,
+        jobs: Option<(&mut AVec<'a, Job<'a>>, Option<&ExpansionWords<'a>>)>,
     ) -> bool {
         match result {
             Ok(l) => {
@@ -148,20 +339,42 @@ impl<'a> Driver<'_, 'a> {
                 if view.cfg_out() {
                     self.stats.cfg_out += 1;
                 }
-                consts.extend(view.consts.iter().copied());
-                if let Some(jobs) = jobs {
-                    let text = at.item_text();
+                // An anonymous constant's range is of the item's text with the expansions
+                // after it, which its own lowering takes whole.
+                consts.extend(view.raw_consts().iter().copied());
+                self.stats.body_calls_expanded += view.expansion_calls().count() as u64;
+                if !view.expanded().is_empty() {
+                    let expanded = core::str::from_utf8(view.expanded()).expect("an expansion's text is UTF-8");
+                    self.grown.clear();
+                    self.grown.push_str(at.item_text());
+                    self.grown.push_str(expanded);
+                }
+                if let Some((jobs, item_words)) = jobs {
                     for n in view.rows {
                         if n.tag != ROW_LOCAL_ITEM {
                             continue;
                         }
-                        let Ok(item) = LocalItem::decode(*n) else { continue };
+                        // A row that does not read back is a record this lowering wrote wrong:
+                        // counted as an error, never lowered from wrong bytes.
+                        let Ok(item) = view.local_item(*n) else {
+                            self.stats.errors += 1;
+                            continue;
+                        };
                         if item.range.is_empty() {
                             continue;
                         }
+                        let Ok(item_text) = view.text_at(item.range) else {
+                            self.stats.errors += 1;
+                            continue;
+                        };
                         let mut s = String::new_in(self.alloc);
-                        s.push_str(item.range.of(text));
-                        jobs.push(Job { text: Some(s), source: Source::BodyItem });
+                        s.push_str(item_text);
+                        // An item of a body written by a macro is read from its words too,
+                        // when it is in the item's own text (not a call's expansion in it).
+                        let words = item_words
+                            .filter(|_| !item.range.in_expansion())
+                            .map(|w| w.slice(item.range.raw(), self.alloc));
+                        jobs.push(Job { text: Some(s), words, source: Source::BodyItem, root: Some(self.root) });
                         self.stats.body_items += 1;
                     }
                 }
@@ -178,11 +391,13 @@ impl<'a> Driver<'_, 'a> {
     }
 
     /// Lowers the anonymous constants queued in `consts`, and theirs.
-    fn anon_consts(&mut self, at: &ItemRef<'_>, consts: &mut AVec<'a, Range>) {
-        let text = at.item_text();
+    fn anon_consts(&mut self, at: &ItemRef<'_>, consts: &mut AVec<'a, Range>, expand: &mut dyn Expand) {
+        // Taken out while the constants lower: one in an expansion is of the grown text.
+        let grown = core::mem::replace(&mut self.grown, String::new_in(self.alloc));
+        let text = if grown.is_empty() { at.item_text() } else { grown.as_str() };
         while let Some(range) = consts.pop() {
             let key = anon_const_key(text, range, self.edition);
-            let result = lower_anon_const(text, range, self.edition, self.cfg, self.alloc);
+            let result = lower_anon_const_expanding(text, range, self.edition, self.cfg, expand, self.alloc);
             self.stats.anon_consts += 1;
             self.emit(at, What::AnonConst(range), key, &result, consts, None);
         }
@@ -190,14 +405,33 @@ impl<'a> Driver<'_, 'a> {
 
     /// One text: its outline, then each entry in order. An entry whose signature is off by
     /// `cfg`, or not known yet, takes its descendants with it.
-    fn text(&mut self, text: &str, source: Source, expand: &mut dyn Expand, jobs: &mut AVec<'a, Job<'a>>) {
-        let outline = blaze_file_items::outline(text, self.edition, self.alloc);
+    fn text(
+        &mut self,
+        text: &str,
+        words: Option<&ExpansionWords<'a>>,
+        source: Source,
+        root: Option<u32>,
+        expand: &mut dyn Expand,
+        jobs: &mut AVec<'a, Job<'a>>,
+    ) {
+        if let Some(root) = root {
+            self.root = root;
+        }
+        let outline = match words {
+            None => blaze_file_items::outline(text, self.edition, self.alloc),
+            Some(w) => blaze_file_items::outline(&w.outline_text(text, self.alloc), self.edition, self.alloc),
+        };
         let items = outline.items();
         let mut consts: AVec<'a, Range> = Vec::new_in(self.alloc);
         let mut i = 0usize;
         while i < items.len() {
             let item = &items[i];
             let index = ItemIndex(u32::try_from(i).expect("an outline's entries are counted in u32"));
+            // Each of the file's own items is a root with a budget of its own.
+            if root.is_none() {
+                self.root = u32::try_from(self.spent.len()).expect("a file's items are counted in u32");
+                self.spent.push(0);
+            }
             let at = ItemRef { source, text, index, item };
             let item_text = at.item_text();
             let next = i + 1;
@@ -227,6 +461,11 @@ impl<'a> Driver<'_, 'a> {
                 }
                 _ => {}
             }
+            // An attribute macro takes the item: its expansion is lowered in its place.
+            if self.attr_macro(&at, outline.attrs(item), source, expand, jobs) {
+                i = past;
+                continue;
+            }
             let has_body = matches!(item.detail, ItemDetail::Fn { .. } | ItemDetail::Const { .. } | ItemDetail::Static { .. })
                 && item.body.is_some();
             // A fn's, const's or static's signature is keyed by its text before the body; every
@@ -239,7 +478,13 @@ impl<'a> Driver<'_, 'a> {
                 _ => item_text,
             };
             let key = signature_key(key_text, self.edition, has_body);
-            let result = lower_signature(item_text, self.edition, self.cfg, self.alloc);
+            let own = words.map(|w| w.slice(item.range, self.alloc));
+            let padded = own.as_ref().map(|w| w.padded(self.alloc));
+            let item_words = own.as_ref().zip(padded.as_ref()).map(|(o, p)| ItemWords { words: p, ranges: &o.ranges });
+            let result = match item_words {
+                None => lower_signature(item_text, self.edition, self.cfg, self.alloc),
+                Some(w) => lower_signature_words(item_text, w, self.edition, self.cfg, self.alloc),
+            };
             self.stats.signatures += 1;
             let live = self.emit(&at, What::Signature, key, &result, &mut consts, None);
             drop(result);
@@ -248,14 +493,143 @@ impl<'a> Driver<'_, 'a> {
                 i = past;
                 continue;
             }
+            if matches!(item.kind(), ItemKind::Struct | ItemKind::Enum | ItemKind::Union) {
+                self.derives(&at, outline.attrs(item), source, expand, jobs);
+            }
             if has_body {
                 let key = body_key(item_text, self.edition);
-                let result = lower_body(item_text, self.edition, self.cfg, self.alloc);
+                let result = match item_words {
+                    None => lower_body_expanding(item_text, self.edition, self.cfg, expand, self.alloc),
+                    Some(w) => lower_body_words_expanding(item_text, w, self.edition, self.cfg, expand, self.alloc),
+                };
                 self.stats.bodies += 1;
-                self.emit(&at, What::Body, key, &result, &mut consts, Some(jobs));
+                self.emit(&at, What::Body, key, &result, &mut consts, Some((jobs, own.as_ref())));
             }
-            self.anon_consts(&at, &mut consts);
+            self.anon_consts(&at, &mut consts, expand);
             i = next;
+        }
+    }
+
+    /// The derives written on `at` (`attrs`, its attributes): each path of each `#[derive(..)]`
+    /// in order, its expansion queued as a text of its own, as an item macro call's is. A
+    /// `#[cfg_attr(pred, ..)]` is applied under the unit's cfg set first, its derives read in
+    /// its place; one whose predicate meets a cfg atom not known yet is counted unsupported.
+    /// The item's `cfg`s are the signature's, already true here.
+    fn derives(&mut self, at: &ItemRef<'_>, attrs: &[Attr], source: Source, expand: &mut dyn Expand, jobs: &mut AVec<'a, Job<'a>>) {
+        let depth = match source {
+            Source::Expansion { depth } => depth + 1,
+            Source::File | Source::BodyItem => 1,
+        };
+        let text = at.item_text();
+        if !attrs.iter().any(|a| !a.inner && matches!(a.kind, AttrKind::Other | AttrKind::CfgAttr)) {
+            return;
+        }
+        let Ok(tokens) = blaze_expand::lex(text, self.edition, self.alloc) else { return };
+        let cfg = &mut *self.cfg;
+        let derives = blaze_expand::ItemAttrs::new(tokens).derives(&mut |name, value| match cfg.atom(name, value) {
+            CfgAnswer::Yes => Ok(true),
+            CfgAnswer::No => Ok(false),
+            CfgAnswer::Need => Err(()),
+        });
+        let derives = match derives {
+            Ok(Some(derives)) => derives,
+            Ok(None) => return,
+            // A cfg atom not known yet, or a malformed attribute: its derives, if any, are not run.
+            Err(_) => {
+                if text.contains("derive") {
+                    self.stats.macro_calls_unsupported += 1;
+                }
+                return;
+            }
+        };
+        for u in derives.uses.iter() {
+            if let Some(bound) = self.bound(depth) {
+                self.refuse(at, &u.path, bound);
+                continue;
+            }
+            let mut out = BodyOut::new_in(self.alloc);
+            let expansion = expand.derive(&u.path, &derives.input, derives.facts(u), self.edition, &mut out);
+            self.queue_expansion(expansion, &out, depth, jobs);
+        }
+    }
+
+    /// The first outer attribute of `at` that is an attribute macro, expanded on the item
+    /// without it and queued: whether one took the item (expanded, or refused, which leaves
+    /// nothing of the item to lower). The attributes after it are the expansion's to meet.
+    fn attr_macro(&mut self, at: &ItemRef<'_>, attrs: &[Attr], source: Source, expand: &mut dyn Expand, jobs: &mut AVec<'a, Job<'a>>) -> bool {
+        if !attrs.iter().any(|a| !a.inner && matches!(a.kind, AttrKind::Other | AttrKind::CfgAttr)) {
+            return false;
+        }
+        let Ok(tokens) = blaze_expand::lex(at.item_text(), self.edition, self.alloc) else { return false };
+        let mut walk = blaze_expand::ItemAttrs::new(tokens);
+        loop {
+            let cfg = &mut *self.cfg;
+            let next = walk.next(&mut |name, value| match cfg.atom(name, value) {
+                CfgAnswer::Yes => Ok(true),
+                CfgAnswer::No => Ok(false),
+                CfgAnswer::Need => Err(()),
+            });
+            // The item's own `cfg`s and a cfg atom not known yet are the signature's to report.
+            let (path, attr) = match next {
+                Ok(blaze_expand::NextAttr::Call { path, attr }) => (path, attr),
+                Ok(blaze_expand::NextAttr::End | blaze_expand::NextAttr::Removed) | Err(_) => return false,
+            };
+            let depth = match source {
+                Source::Expansion { depth } => depth + 1,
+                Source::File | Source::BodyItem => 1,
+            };
+            let Ok(call) = walk.attr_call(attr) else {
+                self.stats.macro_calls_unsupported += 1;
+                return true;
+            };
+            // Checked before the run: the attribute may be inert (`#[inline]`), but no item
+            // reaches this deep but by a chain of expansions that is already past the bound.
+            if let Some(bound) = self.bound(depth) {
+                self.refuse(at, &path, bound);
+                return true;
+            }
+            let mut out = BodyOut::new_in(self.alloc);
+            match expand.attr(&path, call.args.as_ref(), &call.item, self.edition, &mut out) {
+                Expansion::Unsupported => continue,
+                expansion => {
+                    self.queue_expansion(expansion, &out, depth, jobs);
+                    return true;
+                }
+            }
+        }
+    }
+
+    /// The bound a call `depth` expansions deep, from the current item, would pass.
+    fn bound(&self, depth: u32) -> Option<Bound> {
+        if depth > EXPANSION_DEPTH {
+            Some(Bound::Depth)
+        } else if self.spent[self.root as usize] >= EXPANSION_BUDGET {
+            Some(Bound::Budget)
+        } else {
+            None
+        }
+    }
+
+    /// The call of `path` on `at`, refused by `bound`: counted and handed to the sink.
+    fn refuse(&mut self, at: &ItemRef<'_>, path: &str, bound: Bound) {
+        match bound {
+            Bound::Depth => self.stats.macro_calls_too_deep += 1,
+            Bound::Budget => self.stats.macro_calls_over_budget += 1,
+        }
+        self.sink.refused(at, Refusal { path, bound });
+    }
+
+    /// Queues an item macro's expansion, `out`, as a text of its own read from its words.
+    fn queue_expansion(&mut self, expansion: Expansion, out: &BodyOut<'_>, depth: u32, jobs: &mut AVec<'a, Job<'a>>) {
+        match expansion {
+            Expansion::Expanded => {
+                self.stats.macro_calls_expanded += 1;
+                self.spent[self.root as usize] += 1;
+                let (text, words) = ExpansionWords::of(out, self.alloc);
+                jobs.push(Job { text: Some(text), words: Some(words), source: Source::Expansion { depth }, root: Some(self.root) });
+            }
+            Expansion::Unsupported => self.stats.macro_calls_unsupported += 1,
+            Expansion::Failed => self.stats.macro_calls_failed += 1,
         }
     }
 
@@ -268,20 +642,14 @@ impl<'a> Driver<'_, 'a> {
             Source::Expansion { depth } => depth + 1,
             Source::File | Source::BodyItem => 1,
         };
-        if depth > EXPANSION_DEPTH {
-            self.stats.macro_calls_too_deep += 1;
+        let text = at.item_text();
+        if let Some(bound) = self.bound(depth) {
+            self.refuse(at, path.of(text), bound);
             return;
         }
-        let text = at.item_text();
-        let mut out = String::new_in(self.alloc);
-        match expand.expand(path.of(text), input.of(text), self.edition, &mut out) {
-            Expansion::Items => {
-                self.stats.macro_calls_expanded += 1;
-                jobs.push(Job { text: Some(out), source: Source::Expansion { depth } });
-            }
-            Expansion::Unsupported => self.stats.macro_calls_unsupported += 1,
-            Expansion::Failed => self.stats.macro_calls_failed += 1,
-        }
+        let mut out = BodyOut::new_in(self.alloc);
+        let expansion = expand.expand(path.of(text), input.of(text), self.edition, &mut *self.cfg, &mut out);
+        self.queue_expansion(expansion, &out, depth, jobs);
     }
 }
 
@@ -296,13 +664,13 @@ pub fn lower_file(
     sink: &mut dyn Sink,
     alloc: Alloc<'_>,
 ) -> FileStats {
-    let mut d = Driver { edition, cfg, sink, alloc, stats: FileStats::default() };
+    let mut d = Driver { edition, cfg, sink, alloc, stats: FileStats::default(), grown: String::new_in(alloc), spent: Vec::new_in(alloc), root: 0 };
     let mut jobs: AVec<'_, Job<'_>> = Vec::new_in(alloc);
-    jobs.push(Job { text: None, source: Source::File });
+    jobs.push(Job { text: None, words: None, source: Source::File, root: None });
     while let Some(job) = jobs.pop() {
         match &job.text {
-            None => d.text(text, job.source, expand, &mut jobs),
-            Some(owned) => d.text(owned.as_str(), job.source, expand, &mut jobs),
+            None => d.text(text, None, job.source, job.root, expand, &mut jobs),
+            Some(owned) => d.text(owned.as_str(), job.words.as_ref(), job.source, job.root, expand, &mut jobs),
         }
     }
     d.stats

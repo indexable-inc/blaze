@@ -560,11 +560,6 @@ impl Command {
                 }
             }
             (Pending::List { dir }, Done::Entries(entries)) => {
-                let entries: Vec<(String, Stamp)> = entries
-                    .iter()
-                    // alloc: one name a listed entry
-                    .map(|(name, stamp)| (name.as_str().rsplit('/').next().unwrap_or_default().to_owned(), *stamp))
-                    .collect();
                 let walk = self.sweep.as_mut().expect("sweeping").listed(&dir, &entries);
                 self.walking -= 1;
                 self.walk(walk, effects);
@@ -757,7 +752,7 @@ impl Command {
         for dir in walk.lists {
             let file = self.full(&dir);
             let tag = self.ask(Pending::List { dir });
-            effects.push(Effect::Entries { dir: file, tag });
+            effects.push(Effect::Entries { dir: file.into(), tag });
             self.walking += 1;
         }
         for path in walk.probes {

@@ -179,6 +179,73 @@ fn main() {
             black_box(theirs.as_str());
         },
     );
+
+    // A whole site as one expression: a new string each time, against `format!`.
+    bench.pair(
+        "text_in: \"{}: {} of {}\" into a new string",
+        |i| {
+            let (name, done) = (names[i & 3], spread[i] >> 40);
+            let made = blaze_text::text_in(Global, |out| out.str(black_box(name)).str(": ").int(done).str(" of ").int(done + 7));
+            black_box(made.as_str());
+        },
+        |i| {
+            let (name, done) = (names[i & 3], spread[i] >> 40);
+            let made = format!("{}: {} of {}", black_box(name), done, done + 7);
+            black_box(made.as_str());
+        },
+    );
+    bench.pair(
+        "text_exact_in: the same, one exact allocation",
+        |i| {
+            let (name, done) = (names[i & 3], spread[i] >> 40);
+            let made = blaze_text::text_exact_in(Global, |out| out.str(black_box(name)).str(": ").int(done).str(" of ").int(done + 7));
+            black_box(made.as_str());
+        },
+        |i| {
+            let (name, done) = (names[i & 3], spread[i] >> 40);
+            let made = format!("{}: {} of {}", black_box(name), done, done + 7);
+            black_box(made.as_str());
+        },
+    );
+    // What was `format_args!` handed on: a closure `Show` against `fmt::Arguments`.
+    bench.pair(
+        "show_with against format_args!",
+        |i| {
+            let (name, done) = (names[i & 3], spread[i] >> 40);
+            let later = blaze_text::show_with(move |out| _ = out.str(black_box(name)).str(": ").int(done));
+            ours.clear();
+            ours.show(&later);
+            black_box(ours.as_str());
+        },
+        |i| {
+            let (name, done) = (names[i & 3], spread[i] >> 40);
+            theirs.clear();
+            let _ = theirs.write_fmt(format_args!("{}: {}", black_box(name), done));
+            black_box(theirs.as_str());
+        },
+    );
+    // `{:?}` of a derived-`Debug` value, against the debug form read by reflection.
+    #[derive(Debug)]
+    struct Progress<'a> {
+        name: &'a str,
+        done: u64,
+        state: Option<(u32, bool)>,
+    }
+    bench.pair(
+        "{:?} of a struct: debug against derive",
+        |i| {
+            let p = Progress { name: names[i & 3], done: spread[i] >> 40, state: Some((7, i & 1 == 0)) };
+            ours.clear();
+            ours.debug(black_box(&p));
+            black_box(ours.as_str());
+        },
+        |i| {
+            let p = Progress { name: names[i & 3], done: spread[i] >> 40, state: Some((7, i & 1 == 0)) };
+            theirs.clear();
+            let _ = write!(theirs, "{:?}", black_box(&p));
+            black_box(theirs.as_str());
+        },
+    );
     println!();
 
     for digits in [1u32, 5, 10, 20, 0] {

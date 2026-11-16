@@ -27,6 +27,7 @@ const ORDERED: Model = Model {
     persist: Persist::Ordered,
     clones: Clones::Made,
     failures: 0,
+    dies: false,
     reorder_io: false,
     wait: Wait::Everything,
 };
@@ -395,12 +396,14 @@ fn the_oracle_catches_a_kept_answer_relied_on_before_its_tickets_were_durable() 
 
 /// The control of [`what_is_kept_after_an_answer_survives_any_crash_and_no_lost_value_is_served`]:
 /// a settling that ends with the store stopped and says nothing is caught: the build answered,
-/// and what it left was neither kept nor said lost.
+/// and what it left was neither kept nor said lost. The device dies ([`Model::dies`]): the
+/// store asks failed IO again, so a failure of one IO alone is retried away, the store never
+/// stops, and the control was blind (it found nothing in 16 executions, 2026-11-16).
 #[test]
 fn the_oracle_catches_a_settling_failure_dropped_silently() {
     let result = store(
         "a settling that says nothing",
-        Model { failures: 1, ..ORDERED },
+        Model { failures: 1, dies: true, ..ORDERED },
         Search::Exhaustive,
         &[script("w0", &[put(1, 1), Op::Answer, Op::Flush, Op::SettleSilently])],
     );

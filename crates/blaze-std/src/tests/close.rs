@@ -57,7 +57,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     let written = appends(plan, &cx, &file);
     if plan.fail {
         // clone: the directory's name, a refcount.
-        let name = dir.name().clone();
+        let name = dir.name().name().expect("the directory under test is named").clone();
         io.with_sim(|sim| sim.fail_syncs(name));
     }
     let closed = file.close_synced(&cx).map(|_| ());

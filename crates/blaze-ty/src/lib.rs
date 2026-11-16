@@ -10,6 +10,17 @@
 //!
 //! The reference is the vendored rustc at this nightly: `vendor/rustc_type_ir` and
 //! `vendor/rustc_next_trait_solver`; each module names the files it follows.
+//!
+//! What blaze-solve reads: the solver names terms by bare `u32`s and reads them through a
+//! shared borrow (its canonicalizer, folds and prefilter walk with `&T`), so blaze-typeck's
+//! context bridges it to this crate with four things:
+//! 1. [`Tys::node_at`]: a node from its bits, checked against its class's row count (and
+//!    [`Node::as_ty`], `as_region`, `as_const`, `as_list`); a handle is meaningful only for
+//!    the arena that made it.
+//! 2. [`TyCx::probe`] and [`TyCx::probe_const`]: `shallow_resolve` without a write.
+//! 3. [`Vars::bindings`]: the binding log, each variable that stopped being an unbound root,
+//!    truncated by a rollback; fulfillment wakes the obligations stalled on it.
+//! 4. [`Vars::var_count`]: how many variables of each kind exist.
 
 #![no_std]
 #![feature(allocator_api, portable_simd, register_tool, custom_inner_attributes)]
@@ -46,6 +57,7 @@ pub use canon::{CanonBuf, CanonKind, CanonVar, Canonical, Mode};
 pub use cx::{Outlives, Snapshot, TyCx};
 pub use error::{FoldError, ResponseError, TypeError};
 pub use flags::{Flags, markers};
+pub use infer::{VarId, VarSnapshot, Vars};
 pub use fold::{AllInvariant, BoundTo, VarianceOf};
 pub use ids::{
     Arg, ArgKind, Const, Def, FloatTy, InferTy, IntTy, List, Mutability, Node, Pred, Region, Ty, UintTy, Universe,

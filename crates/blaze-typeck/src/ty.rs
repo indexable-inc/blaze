@@ -3,7 +3,7 @@
 //! The tests implement them over a toy type language (`crate::toy`).
 
 use crate::error::{CheckError, Stop};
-use crate::ids::{ExprId, FloatTy, IntTy, ItemKey, Mutbl, Name, PatId, UintTy};
+use crate::ids::{ExprId, FloatTy, FnPtrHeader, IntTy, ItemKey, Mutbl, Name, PatId, UintTy};
 use crate::world::{Reads, World};
 
 /// A type: a 4-byte handle into the context's tables. Becomes blaze-ty's `Ty`.
@@ -25,6 +25,8 @@ pub enum VarKind {
     Int,
     /// A float type (from an unsuffixed float literal).
     Float,
+    /// A const generic argument not yet known (`f::<_>()`, an array length to infer).
+    Const,
 }
 
 /// An inference variable: its kind and its index in the context.
@@ -48,20 +50,56 @@ pub enum TyView {
     Tuple(TyList),
     Ref(Mutbl, Ty),
     Ptr(Mutbl, Ty),
-    Array(Ty, u64),
+    /// `[elem; len]`: `len` a const term of type `usize` (`ConstValue`, `ConstParam`,
+    /// `ConstInfer`).
+    Array(Ty, Ty),
     Slice(Ty),
+    /// A pattern type `base is PAT`: `PNode::Pat`'s view, its ranges `ConstValue` terms in
+    /// pairs. Opaque to the checker: no coercion, deref, field or method reaches the base.
+    Pat(Ty, TyList),
     Adt(ItemKey, TyList),
     FnDef(ItemKey, TyList),
-    /// Inputs, then the output last.
-    FnPtr(TyList),
+    /// Inputs, then the output last; its ABI and safety.
+    FnPtr(TyList, FnPtrHeader),
     /// A closure of this body and its signature (a `FnPtr`).
     Closure(ExprId, Ty),
+    /// An async block's (or an async closure's call's) future, by its expression: its output,
+    /// then its interior, the tuple of what it holds (its captures by capture kind and the
+    /// values live across an `.await`): a variable until the end sequence fixes it.
+    /// `Future<Output = output>`; its auto traits are its interior's; never `Unpin`.
+    Future(ExprId, Ty, Ty),
     Param(u32),
     /// `<args[0] as trait_<args[1..]>>::name`, not yet normalized.
     Alias { trait_: ItemKey, name: Name, args: TyList },
     Opaque(ItemKey, TyList),
+    /// A type variable (`kind` `Ty`, `Int` or `Float`); never a `Const` variable.
     Infer(Var),
     Error,
+    // Const terms: a handle is any generic argument, so an array length or a const generic
+    // argument is a `Ty` handle whose view is one of these (typeck.md, "Const generics").
+    /// A value of a const generic: its type (an integer, `char` or `bool`) and its bits,
+    /// little-endian as consteval writes them.
+    ConstValue { ty: Ty, bits: u128 },
+    /// A const generic parameter, by its index in the item's generics (as `Param`).
+    ConstParam(u32),
+    /// A const variable (`kind` is `VarKind::Const`).
+    ConstInfer(Var),
+    /// A trait object: `PNode::Dynamic`'s view, its predicates in that one order (made by
+    /// `TypeCtx::mk` from a `PNode::Dynamic`, never reordered here).
+    Dynamic(TyList),
+    /// The predicate rows of a `Dynamic` (`PNode::ExTrait`, `ExProj`, `ExAuto`): not types.
+    ExTrait(ItemKey, TyList),
+    /// `name = term` of `trait_`: `args_term` is the trait's args after `Self`, then the term
+    /// last (blaze-ty's `ex_projection` row, read without interning).
+    ExProj { trait_: ItemKey, name: Name, args_term: TyList },
+    ExAuto(ItemKey),
+}
+
+impl TyView {
+    /// Whether this is a const term, not a type.
+    pub fn is_const(&self) -> bool {
+        matches!(self, TyView::ConstValue { .. } | TyView::ConstParam(_) | TyView::ConstInfer(_))
+    }
 }
 
 /// What an obligation asks. `args[0]` is the self type.
@@ -73,6 +111,8 @@ pub enum Goal {
     Projection { trait_: ItemKey, args: TyList, name: Name, term: Ty },
     /// `ty` is well formed.
     WellFormed(Ty),
+    /// The `where const` condition `cond` holds at `args` (`PClause::Const`).
+    ConstHolds { cond: ItemKey, args: TyList },
 }
 
 /// Where an obligation came from, for its error.
@@ -106,6 +146,8 @@ pub enum FulfillErrorKind {
 pub struct FulfillError {
     pub obligation: Obligation,
     pub kind: FulfillErrorKind,
+    /// An unmet trait bound's reason, when it is an impl's `where const` condition.
+    pub because: Option<crate::diag::Because>,
 }
 
 /// The type tables, the inference table and the solver, as the driver uses them. Becomes the
@@ -183,4 +225,17 @@ pub trait TypeCtx {
     /// tuple elements, and the term of a pending `<var as FnOnce<..>>::Output` projection
     /// (`output` is its name) if there is one. `None` when no such obligation is pending.
     fn closure_hint(&mut self, var: Ty, fn_traits: [ItemKey; 3], output: Name) -> Option<(TyList, Option<Ty>)>;
+
+    /// Fixes closure `closure`'s kind once its captures are known (rustc's upvar analysis,
+    /// `closure_kind`), so its `Fn*` obligations select. `false` when the kind was already
+    /// fixed to another.
+    fn settle_closure_kind(&mut self, closure: ExprId, kind: ClosureKind) -> Result<bool, CheckError>;
+}
+
+/// A closure's kind (`rustc_type_ir::ClosureKind`), weakest trait first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ClosureKind {
+    Fn,
+    FnMut,
+    FnOnce,
 }

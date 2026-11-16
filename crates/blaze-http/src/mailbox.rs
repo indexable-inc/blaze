@@ -1,4 +1,4 @@
-//! The handles' side of the drivers ([`crate::driver`], [`crate::h3::driver`]): what an asker
+//! The handles' side of the drivers ([`crate::driver`], and h3's under `h3`): what an asker
 //! on another thread hands a driver's loop and waits on, with no runtime under it.
 //!
 //! - [`channel`]: a queue of items from any number of senders to one reader (which may be

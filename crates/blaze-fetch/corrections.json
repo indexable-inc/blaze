@@ -1,0 +1,15 @@
+{
+  "rows": [
+    {
+      "name": "synstructure",
+      "versions": ">=0.13, <0.15",
+      "files": ["src/lib.rs", "src/macros.rs"],
+      "find": "all(target_arch = \"wasm32\", any(target_os = \"unknown\", target_os = \"wasi\"))",
+      "replace": "any()",
+      "reason": "The gate dates from when proc_macro did not exist on WebAssembly; in blaze's sandbox (wasm32-wasip1) it does, so `extern crate proc_macro`, `decl_derive!` and `decl_attribute!` must not be switched off there.",
+      "decision": "D58",
+      "upstream": "https://github.com/mystor/synstructure",
+      "issue": ""
+    }
+  ]
+}

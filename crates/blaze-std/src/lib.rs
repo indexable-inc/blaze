@@ -123,6 +123,7 @@
     marker_trait_attr,
     register_tool,
     rustc_attrs,
+    thread_local,
     type_info,
     unsize
 )]
@@ -222,13 +223,35 @@ pub mod par;
 )]
 pub mod own;
 pub mod path;
+// `main`'s parameters as grants, and the run spec that grants them (run.md).
+pub mod grant;
+pub mod spec;
+// The hosted world (run.md, "The hosted world"): the wire, the program's side, the host's.
+pub mod wire;
+#[expect(
+    unsafe_code,
+    reason = "copies into and out of the host's exchange and calls through its table, each with its SAFETY"
+)]
+pub mod guest;
+#[expect(
+    unsafe_code,
+    reason = "the C table's entries, its pointer back to its host and views of the exchange, each with its SAFETY"
+)]
+pub mod hosting;
+// The `dry` and `ask` layers and the `fake` providers, at the host's seam (run.md).
+pub mod layers;
+/// The native backend's reads of its host's facts.
+#[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
+mod native;
 pub mod pending;
 /// Power: the battery, and keeping the machine awake.
 pub mod power;
 /// Other processes: `Procs`, from `Host`, narrowed to one.
 pub mod procs;
+#[cfg(feature = "net")]
 pub mod quic;
-/// Making requests: `Http`, one type over a `Net`, the host or a handler.
+/// Making requests: `Http`, one type over a `Net`, the host or a handler. Behind `net`.
+#[cfg(feature = "net")]
 pub mod requests;
 /// Name lookup alone: `Resolver`, from a `Net`, with no connect.
 pub mod resolver;
@@ -371,14 +394,16 @@ pub mod report {
 }
 
 /// HTTP/1.1 as a sans-IO core: blaze-http's [`http::Client`], bytes and completions in, IO to
-/// do, events and the next deadline out, with its request writer and head parser ([`http::h1`])
+/// do, events and the next deadline out, over blaze-h1's request writer and response parser ([`http::h1`])
 /// and proxies. Its tokio driver is behind blaze-http's `tokio` feature, which bstd does not
 /// turn on; `roots` and `proxy_env` read the machine and are left out. HTTP/3 and WebTransport
-/// are [`quic`].
+/// are [`quic`]. Behind `net`.
+#[cfg(feature = "net")]
 pub mod http {
+    pub use blaze_h1 as h1;
     pub use blaze_http::{
-        Client, Completion, Config, ConnId, Error, Event, IDLE_FOR, IDLE_MOST, Io, Kind, Proxies,
-        Proxy, ProxyError, ProxyKind, REDIRECTS, Request, RequestId, Step, WINDOW, h1,
+        Client, Completion, Config, ConnId, Error, Event, IDLE_FOR, IDLE_MOST, Io, Kind, Method,
+        Proxies, Proxy, ProxyError, ProxyKind, REDIRECTS, Range, Request, RequestId, Step, WINDOW,
     };
 }
 
@@ -395,7 +420,7 @@ pub mod test {
     pub use blaze_alloc_count::{Counting, Used, assert_at_most, installed, measure};
     pub use blaze_check::{Builder, MAX_THREADS, model};
     pub use blaze_core::sim::{
-        Faults, Journal, KILLED, Program, Ran, Sim,
+        Faults, Journal, KILLED, Program, Ran, Sim, SimAbove,
         seeds::{Broke, Counts, Ended, Failed, Fault, Given, Passed, Plan, Replay, Run, Seeds},
     };
 
@@ -451,8 +476,11 @@ pub use crate::{
     net::HostPort,
     path::Path,
     pending::Pending,
-    requests::Http,
     task::{Scope, Task},
+};
+#[cfg(feature = "net")]
+pub use crate::requests::Http;
+pub use crate::{
     url::{Origin, Url},
 };
 pub use blaze_core::wait::Deadline;
@@ -575,4 +603,7 @@ pub(crate) enum Plant {
     OrderTokenTwice,
     /// A task resumed from a wait is put on another worker than the one it started on.
     TaskMigrates,
+    /// `Fs::ancestors` asks the driver for every folder above the start, not only the granted
+    /// ones: the bound not checked.
+    AncestorsUnbounded,
 }

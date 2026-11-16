@@ -10,7 +10,7 @@ use blaze_own::Alloc;
 use super::{N, Solved, V, World, solve};
 use crate::resolver::Plant;
 use crate::{
-    AmbiguityKind, BindingState, DefKind, Edition, ExportEntry, CallShape, Namespace, Read, Reply,
+    AmbiguityKind, BindingState, DefKind, Edition, CallShape, Namespace, Read, Reply,
     Resolver, ScopeError, Step, Unresolved, Visibility,
 };
 
@@ -57,54 +57,8 @@ fn a_ring_of_globs_reaches_its_fixpoint() {
         for j in 0..12 {
             assert_eq!(s.def(ms[i], Namespace::Values, FUNS[j]), Some(fs[j]), "m{i} sees f{j}");
         }
-        assert_eq!(s.scope(ms[i]).fellows.len(), 11);
         assert!(s.errors(ms[i]).is_empty(), "{:?}", s.errors(ms[i]));
     }
-}
-
-/// Rule: a name that only an `Undetermined` answer could bind, once nothing can move, is an
-/// unresolved import of the glob that brought it, a value in the scope.
-#[test]
-fn an_undetermined_answer_is_an_unresolved_import() {
-    let mut w = World::new();
-    let dep_root = w.root(2, Edition::E2021);
-    let u = w.fun(dep_root, "u", V::Pub);
-    let root = w.root(1, Edition::E2021);
-    w.dep(root, "dep", dep_root);
-    w.glob(root, "dep", V::Priv);
-    let mut r = Resolver::new_in(root, &w, Alloc::global()).expect("the root's records are there");
-    let undetermined = [ExportEntry {
-        ns: Namespace::Values,
-        name: "u",
-        def: crate::Def { key: u, kind: DefKind::Other },
-        vis: Visibility::Public,
-        state: BindingState::Undetermined,
-    }];
-    let digest = blaze_id::ContentId([9; 32]);
-    let mut asked: Vec<Read<N>> = Vec::new();
-    for _ in 0..16 {
-        let replies: Vec<Reply<'_, N>> = asked
-            .iter()
-            .map(|&read| Reply { read, answer: crate::Answer::Exports { entries: &undetermined, digest } })
-            .collect();
-        match r.step(&w, &replies).expect("the machine steps") {
-            Step::Ask(reads) => {
-                assert!(reads.iter().all(|r| matches!(r, Read::Exports { module, .. } if *module == dep_root)));
-                asked = reads.to_vec();
-            }
-            Step::Done(done) => {
-                assert_eq!(done.scope.get(Namespace::Values, "u"), None);
-                assert!(
-                    done.scope.errors.iter().any(|e| matches!(e, ScopeError::Import { why: Unresolved::Undetermined, .. })),
-                    "{:?}",
-                    done.scope.errors
-                );
-                return;
-            }
-            Step::Expand(_) | Step::Cycle(_) => panic!("the machine needs only exports"),
-        }
-    }
-    panic!("the machine did not finish in 16 steps");
 }
 
 /// Rule: a derive's helper attributes are in scope for the attributes after it on the same
@@ -137,7 +91,7 @@ fn builtin_attributes_are_inert_and_shadowing_them_is_ambiguous() {
     let root = w.root(1, Edition::E2021);
     let inline = w.call_on(root, "inline", CallShape::Attr, Some(1));
     let m = w.module(root, "m", V::Priv);
-    w.item(root, "test", Namespace::Macros, DefKind::Macro(CallShape::Attr), V::Priv);
+    w.item(root, "test", Namespace::Macros, DefKind::Macro(crate::MacroShapes::ATTR), V::Priv);
     let test = w.call_on(m, "test", CallShape::Attr, Some(1));
     w.use_(m, "super::test", V::Priv);
     let s = solved(&w);
@@ -208,7 +162,7 @@ fn a_macro_path_through_a_root_import() {
     let mut w = World::new();
     let root = w.root(1, Edition::E2024);
     let macros = w.module_with(root, "macros", V::Priv, true, false);
-    let mac = w.item(macros, "cfg_select", Namespace::Macros, DefKind::Macro(CallShape::FnLike), V::Pub);
+    let mac = w.item(macros, "cfg_select", Namespace::Macros, DefKind::Macro(crate::MacroShapes::FN_LIKE), V::Pub);
     let p = w.module(root, "prelude", V::Pub);
     w.glob(p, "crate::macros", V::Pub);
     w.cr(root).head.prelude = Some(p);

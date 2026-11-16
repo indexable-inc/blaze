@@ -8,8 +8,8 @@
 
 use crate::error::{CheckError, Malformed};
 use crate::ids::{
-    Edition, ExprId, FloatTy, IntTy, ItemKey, List, Mutbl, Name, PatId, PathIdx, Range, ScopeId,
-    StmtId, UintTy,
+    Edition, ExprId, FloatTy, IntTy, ItemKey, LangItem, List, Mutbl, Name, PatId, PathIdx, Range,
+    ScopeId, StmtId, UintTy,
 };
 use crate::portable::{PTy, PTys};
 
@@ -22,6 +22,9 @@ pub enum Lit {
     Str,
     /// A byte string literal of `len` bytes: `&'static [u8; len]`.
     ByteStr(u64),
+    /// A C string literal (`c"..."`, `cr#"..."#`): `&'static core::ffi::CStr` (the Reference,
+    /// "Literal expressions": "C string literal expressions"), `CStr` found by its lang item.
+    CStr,
     /// An integer literal and its suffix, if any.
     Int(Option<IntSuffix>),
     /// A float literal and its suffix, if any.
@@ -80,6 +83,9 @@ pub enum Expr {
     /// `{ stmts; tail }`; `stmts` in `BodyView::stmt_lists`.
     Block { stmts: List, tail: Option<ExprId>, scope: ScopeId },
     If { cond: ExprId, then: ExprId, else_: Option<ExprId> },
+    /// `let pat = init` in a condition (`if let`, `while let`, a let chain's operand): `bool`,
+    /// `pat`'s bindings in scope in the branch the condition guards (rustc's `ExprKind::Let`).
+    Let { pat: PatId, init: ExprId },
     /// `arms` in `BodyView::arms`.
     Match { scrutinee: ExprId, arms: List },
     Loop { body: ExprId },
@@ -102,12 +108,99 @@ pub enum Expr {
     Cast { operand: ExprId, ty: PTy },
     Tuple { elems: List },
     Array { elems: List },
-    Repeat { elem: ExprId, len: u64 },
+    /// `[elem; len]`: `len` in `BodyView::types`, a const term of `usize` (a `ConstValue`, a
+    /// `ConstParam`, or an `Infer` hole for `_`). `count` is the length's own expression when
+    /// the body holds one (`[0; HELD]`'s `HELD`, `[0; 4]`'s `4`; none for `_`): it is checked
+    /// as an expression of type `usize` (the Reference, "Array expressions": "`len` ... a
+    /// constant expression ... of type `usize`") and its type recorded like any other's. It is
+    /// a constant context: it captures nothing.
+    Repeat { elem: ExprId, len: PTy, count: Option<ExprId> },
     /// `fields` in `BodyView::field_inits`.
     Struct { path: PathIdx, fields: List, base: Option<ExprId> },
     Index { base: ExprId, index: ExprId },
     /// `params` in `pat_lists`; `param_tys` in `BodyView::opt_types`, one per param.
-    Closure { params: List, param_tys: List, ret: Option<PTy>, body: ExprId },
+    /// `is_async`: `async |..| body`, whose call returns a future of `body` (and `ret`, when
+    /// written, is that future's output).
+    Closure { params: List, param_tys: List, ret: Option<PTy>, body: ExprId, is_async: bool },
+    /// `format_args!(..)`, not desugared: `core::fmt::Arguments`. `args` in `expr_lists`;
+    /// `uses` in `BodyView::fmt_uses`, one per placeholder that reads an argument (an argument
+    /// used twice has two).
+    FormatArgs { args: List, uses: List },
+    /// `operand.await`: `<T as IntoFuture>::Output`; only in an async body.
+    Await(ExprId),
+    /// `async { body }` / `async move { body }`.
+    AsyncBlock { body: ExprId, capture: Capture },
+    /// `_`: only the left side of an assignment (`_ = f()`), where it discards the value.
+    Underscore,
+    /// `builtin # offset_of(ty, a.0.b)` (`core::mem::offset_of!`): a `usize`, each step of the
+    /// field path (in `BodyView::segments`, no arguments) a field of the type before it; a
+    /// tuple's or a tuple struct's field named by its digits ([`Name::of_index`]); an enum's step names a variant, the next one its field
+    /// (`offset_of_enum`). Its value is the layout's, not this crate's.
+    OffsetOf { ty: PTy, fields: List },
+    /// `&raw const place` / `&raw mut place`: `*const T` / `*mut T`, no reference made.
+    RawRef { mutbl: Mutbl, operand: ExprId },
+    /// `const { stmts; tail }`: an inline constant, a block typed in this body's inference (as
+    /// rustc types it with its typeck root) that sees no local of the body.
+    ConstBlock { stmts: List, tail: Option<ExprId>, scope: ScopeId },
+}
+
+/// How a closure or an async block captures what it names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Capture {
+    /// By the least the use needs (a reference where one does).
+    Ref,
+    /// `move`: by value.
+    Move,
+}
+
+/// What kind of coroutine a body is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CoroutineKind {
+    /// An `async fn`: the body is checked against `output`, the written return type (in
+    /// `BodyView::types`); the fn's signature gives callers `impl Future<Output = output>`.
+    Async { output: PTy },
+}
+
+/// One placeholder's use of a `format_args!` argument.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct FmtUse {
+    /// The argument's index in `Expr::FormatArgs::args`.
+    pub arg: u32,
+    pub trait_: FmtTrait,
+}
+
+/// What a placeholder asks of its argument: a formatting trait, or `usize` for a width or
+/// precision (`{:w$}`, `{:.p$}`, `{:.*}`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum FmtTrait {
+    Display,
+    Debug,
+    LowerHex,
+    UpperHex,
+    Octal,
+    Binary,
+    LowerExp,
+    UpperExp,
+    Pointer,
+    Count,
+}
+
+impl FmtTrait {
+    /// The trait's lang item; `None` for `Count`.
+    pub const fn lang(self) -> Option<LangItem> {
+        Some(match self {
+            FmtTrait::Display => LangItem::FmtDisplay,
+            FmtTrait::Debug => LangItem::FmtDebug,
+            FmtTrait::LowerHex => LangItem::FmtLowerHex,
+            FmtTrait::UpperHex => LangItem::FmtUpperHex,
+            FmtTrait::Octal => LangItem::FmtOctal,
+            FmtTrait::Binary => LangItem::FmtBinary,
+            FmtTrait::LowerExp => LangItem::FmtLowerExp,
+            FmtTrait::UpperExp => LangItem::FmtUpperExp,
+            FmtTrait::Pointer => LangItem::FmtPointer,
+            FmtTrait::Count => return None,
+        })
+    }
 }
 
 /// A binding's annotation as written.
@@ -137,7 +230,10 @@ pub enum Pat {
     /// `fields` in `BodyView::field_pats`.
     Struct { path: PathIdx, fields: List, rest: bool },
     Or { alts: List },
-    Slice { elems: List },
+    /// `elems` holds the `..` (a `Wild`, or `x @ ..`) at `rest`, if any.
+    Slice { elems: List, rest: Option<u32> },
+    /// `lo..=hi`, `lo..hi`, `lo..`, `..=hi`: each end a `Lit`, `NegLit` or `Path` pattern.
+    Range { lo: Option<PatId>, hi: Option<PatId>, inclusive: bool },
 }
 
 /// A statement.
@@ -182,11 +278,24 @@ pub struct Segment {
     pub has_args: bool,
 }
 
-/// A path written in the body: its block scope and its segments (in `BodyView::segments`).
+/// A path written in the body: its block scope and its segments (in `BodyView::segments`), or
+/// the lang item a desugaring names (`lang`, with no segments: rustc's `QPath::LangItem`),
+/// resolved by `World::lang_path` instead of by name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BodyPath {
     pub scope: ScopeId,
     pub segments: List,
+    pub lang: Option<LangItem>,
+    /// A qualified path's anchor (`<T as Tr>::x`, `<T>::x`): `segments` then follow it.
+    pub anchor: Option<Anchor>,
+}
+
+/// The `<T as Tr>` or `<T>` that starts a qualified path (the Reference, "Qualified paths").
+/// `ty` is in `BodyView::types`; `trait_` is the trait's own path, which has no anchor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Anchor {
+    pub ty: PTy,
+    pub trait_: Option<PathIdx>,
 }
 
 /// One body, borrowed from its lowering.
@@ -218,6 +327,10 @@ pub struct BodyView<'b> {
     pub type_lists: &'b [PTy],
     /// A closure parameter's written type, if any.
     pub opt_types: &'b [Option<PTy>],
+    /// `Expr::FormatArgs`' uses.
+    pub fmt_uses: &'b [FmtUse],
+    /// `Some` for an `async fn`'s body.
+    pub coroutine: Option<CoroutineKind>,
 }
 
 fn slice<'b, T>(column: &'static str, all: &'b [T], l: List) -> Result<&'b [T], CheckError> {
@@ -243,6 +356,10 @@ impl<'b> BodyView<'b> {
 
     pub(crate) fn expr_list(&self, l: List) -> Result<&'b [ExprId], CheckError> {
         slice("expr_lists", self.expr_lists, l)
+    }
+
+    pub(crate) fn fmt_use_list(&self, l: List) -> Result<&'b [FmtUse], CheckError> {
+        slice("fmt_uses", self.fmt_uses, l)
     }
 
     pub(crate) fn pat_list(&self, l: List) -> Result<&'b [PatId], CheckError> {

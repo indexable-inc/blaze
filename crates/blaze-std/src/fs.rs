@@ -64,9 +64,9 @@
 //!   resolution: a symbolic link inside a directory is followed by the driver. Both need an
 //!   open that returns a handle with rights, resolved beneath a directory.
 //! - A rename is one of two effects: an `_unsynced` call's is `Effect::RenameUnsynced`,
-//!   which syncs nothing; a `_synced` call's is `Effect::Rename`, which on a real driver
-//!   syncs both directories (`F_FULLFSYNC` on macOS) before it completes, so its
-//!   `sync_names` pays no second sync there. Which one goes is the call's types: the unsynced
+//!   which syncs nothing; a `_synced` call's is `Effect::Rename`, which syncs both
+//!   directories (`F_FULLFSYNC` on macOS; the simulation as the drivers do) before it
+//!   completes, so its `sync_names` pays no second sync. Which one goes is the call's types: the unsynced
 //!   rename takes the caller's [`Unsynced`], the synced one gives the proof `sync_names`
 //!   takes.
 //! - A directory's names are synced by an effect (`Effect::SyncDir`), which every `_synced`
@@ -98,6 +98,10 @@ use crate::{
     pending::{self, Pending},
     unfinished::Unfinished,
 };
+
+// The folders above the start folder, read-only.
+mod ancestors;
+pub use ancestors::{Ancestor, AncestorError, AncestorKind};
 
 mod sealed {
     pub trait Sealed {}
@@ -147,11 +151,129 @@ impl Rights for ReadWrite {
     const WRITE: bool = true;
 }
 
-/// What a file or directory is.
+/// What an entry of a listing is ([`Entries::kind`]): blaze-core's, one byte each.
+pub use blaze_core::Kind as EntryKind;
+
+/// What is directly in one folder ([`Dir::entries`], or the directory itself,
+/// [`Dir::own_entries`]): each entry's own name, kind and length as columns, sorted by the
+/// names' bytes, read by index (`0..len()`) or found by name. No `Vec` of pairs is made: a
+/// caller that wants one entry's path asks for that one ([`Entries::path`]).
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: a test keeping what it saw
+pub struct Entries {
+    listing: alloc::boxed::Box<blaze_core::Listing>,
+    /// The folder listed, beneath the directory it was asked of; `None` for that directory.
+    path: Option<Path>,
+}
+
+impl Entries {
+    /// The folder listed, beneath the directory it was asked of; `None` when the listing is of
+    /// that directory itself.
+    pub fn folder(&self) -> Option<&Path> {
+        self.path.as_ref()
+    }
+
+    pub fn len(&self) -> usize {
+        self.listing.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.listing.is_empty()
+    }
+
+    /// Entry `i`'s own name: one part, UTF-8, never `.` or `..`.
+    #[track_caller]
+    pub fn name(&self, i: usize) -> &str {
+        self.listing.leaf(i).as_str()
+    }
+
+    #[track_caller]
+    pub fn kind(&self, i: usize) -> EntryKind {
+        self.listing.kind(i)
+    }
+
+    /// Entry `i`'s length in bytes (a symbolic link's own, not followed).
+    #[track_caller]
+    pub fn len_of(&self, i: usize) -> u64 {
+        self.listing.stamp(i).size
+    }
+
+    /// The kinds, in the names' order: a walk that wants the folders reads a byte each.
+    pub fn kinds(&self) -> &[EntryKind] {
+        self.listing.kinds()
+    }
+
+    /// The index of the entry named `name` (one part), by binary search.
+    pub fn find(&self, name: &str) -> Option<usize> {
+        self.listing.find(name)
+    }
+
+    /// Each entry's own name and kind, in order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&str, EntryKind)> + '_ {
+        self.listing.iter().zip(self.listing.kinds()).map(|((leaf, _), kind)| (leaf.as_str(), *kind))
+    }
+
+    /// Entry `i`'s path beneath the directory the listing was asked of (`folder/name`, or
+    /// `name` for that directory's own listing), made; refused for a name a [`Path`] cannot
+    /// hold (one with a `\`, which Unix allows).
+    #[track_caller]
+    pub fn path(&self, i: usize) -> Result<Path, crate::path::PathError> {
+        match &self.path {
+            Some(folder) => {
+                // alloc: one path made, the caller's.
+                let joined = format!("{}/{}", folder.as_str(), self.name(i));
+                Path::new(&joined)
+            }
+            None => Path::new(self.name(i)),
+        }
+    }
+}
+
+/// What a file or directory is, and the [`Stamp`] of this version of it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Meta {
     pub len: u64,
     pub dir: bool,
+    pub stamp: Stamp,
+}
+
+/// What identifies one version of a file, from the call that found it: equal stamps of one
+/// name at two looks say its bytes did not change between them, with one exception below.
+/// Compared whole, for equality only; nothing of it is ordered or read alone.
+///
+/// macOS fills it from the `getattrlistbulk` that lists a directory (`ATTR_CMN_DEVID`,
+/// `FILEID`, `MODTIME`, `CHGTIME`: one call per buffer of entries, where a `stat` each costs
+/// a call each), Linux from `fstatat`/`statx` of each entry; the simulation's change on every
+/// write, as each write moves its times.
+///
+/// What it cannot prove: a write that keeps the length and lands within the file system's
+/// clock step of the look before it (a racy write) leaves the stamp equal. A caller trusts an
+/// equal stamp only when its times are more than that step before the first look began (the
+/// sweep's `settled`); a file system with no inode numbers, or none that are stable (some
+/// network mounts, FAT), gives stamps that prove nothing, which `ino == 0` says.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Stamp {
+    pub len: u64,
+    /// The content's last change, in ns since the epoch on the file system's clock.
+    pub modified_ns: u64,
+    /// The inode's last change (a chmod, a rename, a link): every change moves it.
+    pub changed_ns: u64,
+    /// The inode and the device it is on: a file replaced by a rename, or one on another
+    /// mount, has another pair.
+    pub ino: u64,
+    pub dev: u64,
+}
+
+impl Meta {
+    fn of(meta: &blaze_core::Meta) -> Meta {
+        let stamp = Stamp {
+            len: meta.len,
+            modified_ns: meta.modified_ns,
+            changed_ns: meta.changed_ns,
+            ino: meta.ino,
+            dev: meta.dev,
+        };
+        Meta { len: meta.len, dir: meta.dir, stamp }
+    }
 }
 
 
@@ -359,6 +481,7 @@ pub enum FsOp {
     SyncNames,
     Close,
     List,
+    Entries,
 }
 
 impl FsOp {
@@ -381,6 +504,7 @@ impl FsOp {
             FsOp::SyncNames => "sync_names",
             FsOp::Close => "close",
             FsOp::List => "list",
+            FsOp::Entries => "entries",
         }
     }
 }
@@ -414,8 +538,28 @@ pub enum FsKind {
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
 pub struct FsError {
     pub op: FsOp,
-    pub path: FileName,
+    /// The file or directory, under the driver's root; the root itself shows as `.`.
+    pub path: DirName,
     pub kind: FsKind,
+}
+
+/// What an [`FsError`] names: a file's name, or a directory's that may be the root.
+trait Named {
+    fn named(&self) -> DirName;
+}
+
+impl Named for FileName {
+    fn named(&self) -> DirName {
+        // clone: an error's name of its file, a refcount.
+        DirName::Named(self.clone())
+    }
+}
+
+impl Named for DirName {
+    fn named(&self) -> DirName {
+        // clone: an error's name of its directory, a refcount.
+        self.clone()
+    }
 }
 
 impl fmt::Display for FsError {
@@ -449,10 +593,46 @@ impl fmt::Display for FsError {
 
 impl core::error::Error for FsError {}
 
+/// The user's home could not be opened as a second tree ([`Fs::home`]): the home and why.
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
+pub struct HomeError {
+    pub home: String,
+    pub why: HomeWhy,
+}
+
+/// Why [`Fs::home`] refused.
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
+pub enum HomeWhy {
+    /// The home's path does not start at the filesystem's root.
+    NotAbsolute,
+    /// A part of it is `.` or `..`, or empty.
+    Dotted,
+    /// No driver could be made over it, the driver saying this.
+    Open(String),
+    /// The folder in it could not be opened: a file is there, or the wait stopped.
+    Fs(FsError),
+    /// This world has no second tree (a hosted guest).
+    NoSecondTree,
+}
+
+impl fmt::Display for HomeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let home = &self.home;
+        match &self.why {
+            HomeWhy::NotAbsolute => write!(f, "the home `{home}` is not an absolute path"),
+            HomeWhy::Dotted => write!(f, "the home `{home}` has an empty, `.` or `..` part"),
+            HomeWhy::Open(why) => write!(f, "no driver over the home `{home}`: {why}"),
+            HomeWhy::Fs(error) => write!(f, "in the home `{home}`: {error}"),
+            HomeWhy::NoSecondTree => write!(f, "the home `{home}`: this world has no tree beside its root"),
+        }
+    }
+}
+
+impl core::error::Error for HomeError {}
+
 impl FsError {
-    fn new(op: FsOp, path: &FileName, kind: FsKind) -> FsError {
-        // clone: an error's name of its file, a refcount.
-        FsError { op, path: path.clone(), kind }
+    fn new(op: FsOp, path: &(impl Named + ?Sized), kind: FsKind) -> FsError {
+        FsError { op, path: path.named(), kind }
     }
 
     /// The stop, if the wait stopped.
@@ -468,7 +648,7 @@ impl FsError {
 }
 
 /// `done`, which was not what `op` expects, as its error.
-fn unexpected(op: FsOp, path: &FileName, done: Done) -> FsError {
+fn unexpected(op: FsOp, path: &(impl Named + ?Sized), done: Done) -> FsError {
     let kind = match done {
         // alloc: an error's message.
         Done::Failed(error) => FsKind::Driver(error.0),
@@ -483,7 +663,7 @@ fn call(
     io: &Io,
     cx: &Cx,
     op: FsOp,
-    path: &FileName,
+    path: &(impl Named + ?Sized),
     effect: impl FnOnce(Tag) -> Effect,
 ) -> Result<Done, FsError> {
     io.call(cx, effect).map_err(|stopped| FsError::new(op, path, FsKind::Stopped(stopped)))
@@ -546,28 +726,29 @@ fn names_started(io: &Io, name: &FileName, unsynced: Unsynced) {
 
 /// The names of `name`'s directory made durable and waited for, for a `_synced` call: the
 /// directory's sync ([`Effect::SyncDir`]). `renamed` is the proof that the name change was
-/// a syncing rename ([`rename_synced`]): a real driver's has synced its directories itself by
-/// the time it completes, so no second sync is paid there. A name directly beneath the
-/// driver's root syncs the root ([`DirName::Root`]).
+/// a syncing rename ([`rename_synced`]): every driver's, the simulation's included, has synced
+/// its directories itself by the time it completes, so no second sync is paid. A name
+/// directly beneath the driver's root syncs the root ([`DirName::Root`]).
 fn sync_names(io: &Io, cx: &Cx, op: FsOp, name: &FileName, renamed: Option<Renamed>) -> Result<(), FsError> {
     if io.plant() == Plant::DurableSkipsNameSync {
         return Ok(());
     }
-    if let Some(Renamed(())) = renamed
-        && io.rename_syncs_names()
-    {
+    if let Some(Renamed(())) = renamed {
+        // The syncing rename synced its directories and was waited for: one wait for the names,
+        // counted as a directory sync would be.
+        io.names_synced();
         return Ok(());
     }
     sync_dir(io, cx, op, name, dir_of(name))
 }
 
 /// The directory `dir`'s names synced and waited for, on behalf of the call `op` on `path`.
-fn sync_dir(io: &Io, cx: &Cx, op: FsOp, path: &FileName, dir: &str) -> Result<(), FsError> {
+fn sync_dir(io: &Io, cx: &Cx, op: FsOp, path: &(impl Named + ?Sized), dir: &str) -> Result<(), FsError> {
     // The driver's root (`dir` empty) is synced as any directory: `DirName::Root`.
     let named = FileName::new(dir).map_or(DirName::Root, DirName::Named);
     match call(io, cx, op, path, |tag| Effect::SyncDir { dir: named, tag })? {
         Done::Synced => {
-            io.names_synced(dir);
+            io.names_synced();
             Ok(())
         }
         done => Err(unexpected(op, path, done)),
@@ -715,7 +896,7 @@ fn stat(io: &Io, cx: &Cx, op: FsOp, name: &FileName) -> Result<Option<Meta>, FsE
     // clone: the effect's name, a refcount.
     let file = name.clone();
     match call(io, cx, op, name, |tag| Effect::Stat { file, tag })? {
-        Done::Stat(meta) => Ok(meta.map(|it| Meta { len: it.len, dir: it.dir })),
+        Done::Stat(meta) => Ok(meta.as_ref().map(Meta::of)),
         done => Err(unexpected(op, name, done)),
     }
 }
@@ -765,15 +946,60 @@ impl Fs {
                 Err(FsError::new(FsOp::OpenDir, path.name(), FsKind::NotADirectory))
             }
             // clone: the directory's name, a refcount.
-            Some(_) | None => Ok(Dir { io: self.io.clone(), base: path.name().clone(), quota: None, rights: PhantomData }),
+            Some(_) | None => Ok(Dir { io: self.io.clone(), base: DirName::Named(path.name().clone()), quota: None, rights: PhantomData }),
         }
+    }
+
+    /// `folder` beneath the user's home `home`, read and write, made by the first file made in
+    /// it: a second tree beside the driver's root, for what outlives one project (a command's
+    /// machine-wide store). `home` is an absolute path the program's start read from its
+    /// environment and hands down (rule 75); nothing here reads a variable. Natively it is a
+    /// second driver over `home`; the simulation keeps every tree under its one root, so there
+    /// `home` names a folder beneath it. A path that is not absolute or has `.` or `..` in it,
+    /// a file where `folder` should be, or a driver that cannot be made over `home`, is a
+    /// [`HomeError`] naming `home`.
+    pub fn home(&self, cx: &Cx, home: &str, folder: &Path) -> Result<Dir<ReadWrite>, HomeError> {
+        // alloc: an error's path.
+        let refused = |why| HomeError { home: String::from(home), why };
+        let Some(below) = home.strip_prefix('/') else { return Err(refused(HomeWhy::NotAbsolute)) };
+        let below = below.trim_end_matches('/');
+        if below.split('/').any(|part| part == "." || part == "..") {
+            return Err(refused(HomeWhy::Dotted));
+        }
+        let (tree, at) = match self.io.beside(crate::rt::RootPath::new(home)) {
+            Some(Ok(io)) => (Fs::new(io), folder.clone()),
+            Some(Err(error)) => return Err(refused(HomeWhy::Open(error.why))),
+            None if self.io.is_sim() => {
+                let joined = match below.is_empty() {
+                    true => folder.clone(),
+                    false => Path::new(below).map_err(|_| refused(HomeWhy::Dotted))?.join(folder),
+                };
+                // clone: authority held, a refcount.
+                (self.clone(), joined)
+            }
+            None => return Err(refused(HomeWhy::NoSecondTree)),
+        };
+        tree.open_dir(cx, &at).map_err(|error| refused(HomeWhy::Fs(error)))
+    }
+
+    /// The driver's root itself, read and write: the folder the program was given (for a
+    /// command, the one it started in), listed and synced as any other. It is always there,
+    /// so nothing is asked of the driver to make it; and it is [`DirName::Root`], with nothing
+    /// of its absolute path in it, so none enters a key.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn root(&self) -> Dir<ReadWrite> {
+        // clone: authority held, a refcount.
+        Dir { io: self.io.clone(), base: DirName::Root, quota: None, rights: PhantomData }
     }
 }
 
 /// A directory: the files beneath it, by relative path only.
 pub struct Dir<#[blaze::linear] P: Rights> {
     io: Io,
-    base: FileName,
+    /// Where it is under the driver's root, or the root itself.
+    base: DirName,
     /// The bytes that may still be written through it, if it has a quota ([`Dir::quota`]).
     quota: Option<Arc<Budget>>,
     rights: PhantomData<P>,
@@ -797,7 +1023,7 @@ impl Dir<ReadWrite> {
     /// The directory named `base` under the driver's root, read and write: for a capability
     /// that holds a directory's name as authority ([`crate::user::User::home`]).
     pub(crate) fn at(io: &Io, base: FileName) -> Dir<ReadWrite> {
-        Dir { io: io.clone(), base, quota: None, rights: PhantomData }
+        Dir { io: io.clone(), base: DirName::Named(base), quota: None, rights: PhantomData }
     }
 
     /// The same directory with a quota: at most `bytes` bytes are written through the `Dir`
@@ -836,11 +1062,11 @@ impl Dir<ReadWrite> {
 }
 
 impl<#[blaze::linear] P: Rights> Dir<P> {
-    /// Where it is, under the driver's root.
+    /// Where it is, under the driver's root, or the root itself.
     #[blaze::nopanic]
     #[blaze::noalloc]
     #[blaze::nonblocking]
-    pub fn name(&self) -> &FileName {
+    pub fn name(&self) -> &DirName {
         &self.base
     }
 
@@ -849,7 +1075,7 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
         let base = match self.io.plant() {
             // clone: the planted bug keeps the parent's name, a refcount.
             Plant::SubdirKeepsParent => self.base.clone(),
-            Plant::None | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::UnsyncedRenameSyncs | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned | Plant::ParJoinsInRunOrder | Plant::FreezeLeaks | Plant::SwapFreesAtOnce | Plant::FlightComputesTwice | Plant::ChanPassesCapacity | Plant::PublishOnceOverwrites | Plant::OrderTokenTwice | Plant::TaskMigrates => self.beneath(path),
+            Plant::None | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::UnsyncedRenameSyncs | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned | Plant::ParJoinsInRunOrder | Plant::FreezeLeaks | Plant::SwapFreesAtOnce | Plant::FlightComputesTwice | Plant::ChanPassesCapacity | Plant::PublishOnceOverwrites | Plant::OrderTokenTwice | Plant::TaskMigrates | Plant::AncestorsUnbounded => DirName::Named(self.beneath(path)),
         };
         // clone: the quota shared, a refcount.
         Dir { io: self.io.clone(), base, quota: self.quota.clone(), rights: PhantomData }
@@ -880,20 +1106,23 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
     /// file was made under it) has none.
     pub fn list<'a>(&self, cx: &Cx, frame: &'a Frame) -> Result<Vec<(Path, Meta), &'a Frame>, FsError> {
         let mut found = Vec::new_in(frame);
-        match stat(&self.io, cx, FsOp::List, &self.base)? {
-            None => return Ok(found),
-            Some(Meta { dir: false, .. }) => return Err(FsError::new(FsOp::List, &self.base, FsKind::NotADirectory)),
-            Some(_) => {}
+        // The root is always there; a named directory may not be yet.
+        if let DirName::Named(base) = &self.base {
+            match stat(&self.io, cx, FsOp::List, base)? {
+                None => return Ok(found),
+                Some(Meta { dir: false, .. }) => return Err(FsError::new(FsOp::List, base, FsKind::NotADirectory)),
+                Some(_) => {}
+            }
         }
         // clone: the effect's name, a refcount.
-        let dir = DirName::Named(self.base.clone());
+        let dir = self.base.clone();
         let listed = match call(&self.io, cx, FsOp::List, &self.base, |tag| Effect::List { dir, tag })? {
             Done::Listed(listed) => listed,
             done => return Err(unexpected(FsOp::List, &self.base, done)),
         };
-        let start = self.base.as_str().len() + 1;
+        let start = self.base.start();
         for (name, meta) in listed.iter().filter(|(_, meta)| !meta.dir) {
-            let rest = name.is_under(&self.base).then(|| name.as_str().get(start..)).flatten();
+            let rest = self.base.holds(name).then(|| name.as_str().get(start..)).flatten();
             let beneath = rest.and_then(|rest| Path::new(rest).ok());
             let Some(path) = beneath else {
                 // alloc: an error's message.
@@ -904,16 +1133,64 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
                 let stopped = Stopped::OutOfMemory { arena: "bstd::fs list", asked: size_of::<(Path, Meta)>() };
                 FsError::new(FsOp::List, &self.base, FsKind::Stopped(stopped))
             })?;
-            found.push((path, Meta { len: meta.len, dir: false }));
+            found.push((path, Meta::of(meta)));
         }
         Ok(found)
     }
 
+    /// What is directly in the folder `path` beneath this directory, one level, as columns
+    /// sorted by the names' bytes ([`Entries`]); `None` when nothing is there. One
+    /// `getattrlistbulk` pass a buffer on macOS, a `statx` an entry on Linux. The columns are
+    /// the driver's, moved here whole: nothing is copied into pairs. A name that is not UTF-8,
+    /// and a folder past the listing's caps (2^20 entries, 64 MiB of names), fail naming the
+    /// folder (blaze-core's `listing`).
+    pub fn entries(&self, cx: &Cx, path: &Path) -> Result<Option<Entries>, FsError> {
+        let name = self.beneath(path);
+        match stat(&self.io, cx, FsOp::Entries, &name)? {
+            None => return Ok(None),
+            Some(Meta { dir: false, .. }) => return Err(FsError::new(FsOp::Entries, &name, FsKind::NotADirectory)),
+            Some(_) => {}
+        }
+        // clone: the folder's path beneath this directory, a refcount.
+        self.list_one(cx, DirName::Named(name), Some(path.clone())).map(Some)
+    }
+
+    /// What is directly in this directory itself, one level: the same columns, caps and order
+    /// as [`Dir::entries`], for the root and a named directory alike. The directory gone, or
+    /// a file in its place, fails naming it. [`Entries::folder`] is `None`, and
+    /// [`Entries::path`] is the entry's own name.
+    pub fn own_entries(&self, cx: &Cx) -> Result<Entries, FsError> {
+        // clone: the directory's name, a refcount.
+        self.list_one(cx, self.base.clone(), None)
+    }
+
+    /// The one listing of `dir` (named `path` beneath this directory, or this one).
+    fn list_one(&self, cx: &Cx, dir: DirName, path: Option<Path>) -> Result<Entries, FsError> {
+        // clone: the effect's name, a refcount.
+        let asked = dir.clone();
+        let listing = match call(&self.io, cx, FsOp::Entries, &dir, |tag| Effect::Entries { dir: asked, tag })? {
+            Done::Entries(listing) => listing,
+            done => return Err(unexpected(FsOp::Entries, &dir, done)),
+        };
+        if listing.dir() != &dir {
+            // alloc: an error's message.
+            let said = format!("a listing of {}, not of the folder asked", listing.dir());
+            return Err(FsError::new(FsOp::Entries, &dir, FsKind::Answered(said)));
+        }
+        Ok(Entries { listing, path })
+    }
+
     /// The name of `path` beneath this directory.
     fn beneath(&self, path: &Path) -> FileName {
-        // alloc: once per name joined.
-        let joined = format!("{}/{}", self.base, path.as_str());
-        FileName::new(&joined).expect("a directory's name and a path joined are a name")
+        match &self.base {
+            // clone: the path's name under the root, a refcount.
+            DirName::Root => path.name().clone(),
+            DirName::Named(base) => {
+                // alloc: once per name joined.
+                let joined = format!("{base}/{}", path.as_str());
+                FileName::new(&joined).expect("a directory's name and a path joined are a name")
+            }
+        }
     }
 
     /// The name `raw` would have beneath this directory if its `..` were resolved by text:
@@ -921,7 +1198,8 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
     #[cfg(test)]
     pub(crate) fn beneath_by_text(&self, raw: &str) -> Option<FileName> {
         // alloc: a test's planted join.
-        let mut parts: Vec<&str> = self.base.as_str().split('/').collect();
+        let base = self.base.name().map_or("", FileName::as_str);
+        let mut parts: Vec<&str> = base.split('/').filter(|it| !it.is_empty()).collect();
         for part in raw.split('/') {
             match part {
                 ".." => _ = parts.pop(),
@@ -1192,7 +1470,7 @@ impl Dir<ReadWrite> {
         if self.io.plant() == Plant::DurableSkipsNameSync {
             return Ok(());
         }
-        sync_dir(&self.io, cx, FsOp::SyncNames, &self.base, self.base.as_str())
+        sync_dir(&self.io, cx, FsOp::SyncNames, &self.base, self.base.name().map_or("", FileName::as_str))
     }
 }
 

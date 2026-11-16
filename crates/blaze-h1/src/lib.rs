@@ -14,10 +14,13 @@
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 
+extern crate alloc;
+
 #[cfg(test)]
 extern crate std;
 
 mod error;
+mod out;
 mod plant;
 mod redirect;
 mod request;
@@ -27,6 +30,7 @@ mod response;
 mod tests;
 
 pub use error::{Error, Why};
+pub use out::Out;
 pub use redirect::{Follow, Hop, Origin, Redirects, is_redirect};
-pub use request::{Range, Request, write_request};
+pub use request::{HeaderFault, Range, Request, check_header, write_request};
 pub use response::{ContentRange, Fed, Limits, Response};

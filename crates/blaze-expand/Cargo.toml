@@ -26,18 +26,14 @@ blaze-surface.workspace = true
 blaze-own.workspace = true
 # `Hasher`: the keys and a definition's content hash.
 blaze-ids.workspace = true
-# `frame::task`: the task frame mbe writes its output tree into.
+# `frame::task`: the task frame a `macro_rules!` call's matcher lists live in.
 blaze-mem.workspace = true
-# `DeclarativeMacro`: the matcher and transcriber of `macro_rules!` and `macro`, driven pure.
-mbe.workspace = true
-# The token trees mbe and the derives read and write, converted to and from the portable form.
-tt.workspace = true
-span.workspace = true
-intern.workspace = true
-# `parse_to_token_tree`: text to tokens, for `lex_through_tt`; `is_single_token_op`.
-syntax-bridge.workspace = true
-# `LexedStr`: the lexer's kinds and lengths, which `lex` reads straight into a stream.
+# `LexedStr`: the lexer's kinds and lengths, which `lex` reads straight into a stream; the
+# fragment entry points the matcher parses `expr`, `ty`, `pat` and the rest with.
 parser.workspace = true
+# `tokenize`: a literal token's kind, quotes and suffix; `is_ident`: whether the text
+# `${concat(..)}` makes is an identifier.
+rustc_lexer.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true

@@ -11,10 +11,12 @@
 
 use blaze_own::{Alloc, Soa, Vec};
 
+use crate::asks::{Ask, AskLog, Clock, Cursor};
+use crate::body::BodyView;
 use crate::columns::columns_eq;
-use crate::error::Stop;
+use crate::error::{CheckError, Malformed, Stop};
 use crate::hash::{ContentHash, StableHasher};
-use crate::ids::{FloatTy, IntTy, ItemKey, LangItem, List, Mutbl, Name, PathIdx, ScopeId, UintTy};
+use crate::ids::{FloatTy, FnPtrHeader, IntTy, ItemKey, LangItem, List, Mutbl, Name, PathIdx, ScopeId, UintTy};
 use crate::portable::{PTy, PTys};
 
 /// The proof that a call to a `World` method is made by the recorder. Its field is private to
@@ -45,12 +47,23 @@ pub enum Shape {
     Ptr(Mutbl),
     Array,
     Slice,
+    /// A pattern type (typeck.md "Pattern types"): its impls are its own (core's pat.rs).
+    Pat,
     Adt(ItemKey),
     FnDef(ItemKey),
     FnPtr(u32),
     Closure,
     Param,
     Opaque(ItemKey),
+    /// An extern type.
+    Foreign(ItemKey),
+    /// A trait object, by its principal trait (`None`: auto traits only).
+    Dynamic(Option<ItemKey>),
+    /// An integer of a type not yet known (`{integer}`): the impls for every integer type,
+    /// blanket impls included.
+    AnyInt,
+    /// A float of a type not yet known (`{float}`).
+    AnyFloat,
 }
 
 /// A question to the world: what a read list holds and a `Need` names.
@@ -66,9 +79,137 @@ pub enum Question {
     TraitsInScope(ScopeId),
     Path(ScopeId, PathIdx),
     Lang(LangItem),
+    /// The definition a desugaring's path names (`BodyPath::lang`).
+    LangPath(LangItem),
     Const(ItemKey),
     Opaque(ItemKey),
     Attrs(ItemKey),
+    TraitDef(ItemKey),
+    AssocParent(ItemKey),
+    /// A `where const` condition (its anonymous constant) at ground arguments, named by the
+    /// content digest of their portable table ([`ground_args_digest`]): the record is keyed by
+    /// the condition's code identity and the arguments, so each pair is evaluated once.
+    ConstHolds(ItemKey, u64),
+    /// The const generic parameters of an item's generics ([`ConstParams`]).
+    ConstParams(ItemKey),
+}
+
+/// Whether a question's record is made from items alone or from another body's check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RecordKind {
+    /// Signatures, generics, where-clauses, ADT definitions, impl headers and buckets, trait
+    /// definitions, paths, lang items, attributes: settled before any body of their scope is
+    /// queued (the kind-order gate), so a body never waits on one once the gate exists.
+    Item,
+    /// A fact only another body's check makes: an opaque type's hidden type, a const's value.
+    Body,
+}
+
+impl Question {
+    /// The kind of record the question reads (typeck.md, "Item records and body records").
+    pub const fn record_kind(self) -> RecordKind {
+        match self {
+            Question::Opaque(_) | Question::Const(_) | Question::ConstHolds(..) => RecordKind::Body,
+            Question::FnSig(_)
+            | Question::Predicates(_)
+            | Question::Adt(_)
+            | Question::ImplsOf(..)
+            | Question::ImplHeader(_)
+            | Question::Inherent(..)
+            | Question::AssocItem(..)
+            | Question::TraitsInScope(_)
+            | Question::Path(..)
+            | Question::Lang(_)
+            | Question::LangPath(_)
+            | Question::Attrs(_)
+            | Question::TraitDef(_)
+            | Question::AssocParent(_)
+            | Question::ConstParams(_) => RecordKind::Item,
+        }
+    }
+}
+
+/// A trait's definition: what the solver reads of a trait (its `TraitDef`).
+#[derive(Clone, Copy, Debug)]
+pub struct TraitDef<'w> {
+    /// Generic parameters, `Self` (index 0) included.
+    pub generics: u32,
+    pub flags: TraitFlags,
+    /// The lang item the trait is, if any (`#[lang = ".."]`).
+    pub lang: Option<LangItem>,
+    /// The supertrait bounds and the trait's where-clauses on `Self`, `Self` as `Param(0)`:
+    /// what elaborating a `T: Trait` bound adds.
+    pub supertraits: &'w [PClause],
+    pub assoc_types: &'w [AssocTyDef],
+    pub types: PTys<'w>,
+    /// Its members' facts for dyn compatibility (`crate::dyn_compat`, the rule's one home).
+    pub members: TraitMembers<'w>,
+}
+
+/// A trait's members as the world read them, or a typed "not known yet": a `dyn` of a trait
+/// whose members are not known is a named gap (`CheckError::DynUndecided`), never compatible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TraitMembers<'w> {
+    Known(&'w [crate::dyn_compat::MemberFacts]),
+    NotKnown,
+}
+
+/// A trait's flags.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct TraitFlags(pub u32);
+
+impl TraitFlags {
+    /// `auto trait`.
+    pub const AUTO: u32 = 1;
+    /// `#[marker]`: impls may overlap.
+    pub const MARKER: u32 = 1 << 1;
+    pub const UNSAFE: u32 = 1 << 2;
+    /// `#[fundamental]`.
+    pub const FUNDAMENTAL: u32 = 1 << 3;
+    /// `#[rustc_coinductive]` (and every auto trait).
+    pub const COINDUCTIVE: u32 = 1 << 4;
+    /// `#[const_trait]`.
+    pub const CONST: u32 = 1 << 5;
+
+    pub const fn has(self, bits: u32) -> bool {
+        self.0 & bits != 0
+    }
+}
+
+/// An associated type of a trait.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AssocTyDef {
+    pub name: Name,
+    pub item: ItemKey,
+    /// The default (`type A = T;` in the trait), in the trait's table.
+    pub default: Option<PTy>,
+}
+
+/// Where an associated item is: its trait or impl, and its name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct AssocParent {
+    pub container: ItemKey,
+    pub name: Name,
+    pub kind: AssocKind,
+}
+
+/// The const generic parameters of an item (the Reference, "Generic parameters": `const N:
+/// usize`): over all its generics, the parent's (impl or trait) first, each by its index in
+/// that full list (the index `PNode::Param` and `PNode::ConstParam` use) with its declared
+/// type in `types`. A parameter not listed is a type parameter. The declared type is an
+/// integer, `bool` or `char` (the only types stable Rust admits), so it names no parameter.
+#[derive(Clone, Copy, Debug)]
+pub struct ConstParams<'w> {
+    /// Sorted by index.
+    pub params: &'w [(u32, PTy)],
+    pub types: PTys<'w>,
+}
+
+impl ConstParams<'_> {
+    /// The declared type of parameter `index`, when it is a const parameter.
+    pub fn type_of(&self, index: u32) -> Option<PTy> {
+        self.params.iter().find(|(i, _)| *i == index).map(|&(_, t)| t)
+    }
 }
 
 /// A fn item's signature (a method's too), in its own portable table.
@@ -78,8 +219,16 @@ pub struct FnSig<'w> {
     pub parent_count: u32,
     /// The fn's own generic parameters.
     pub own_count: u32,
+    /// How many of the own parameters are declared in `<..>` (the first ones); the rest, to
+    /// `own_count`, are the anonymous parameters of its `impl Trait` arguments, which explicit
+    /// generic arguments never give (the Reference, "Impl trait": "explicit generic arguments
+    /// cannot be given for an anonymous type parameter"). At most `own_count`.
+    pub declared_count: u32,
     /// Whether the first input is a `self` parameter (a method).
     pub self_param: bool,
+    /// The fn's ABI and safety (`unsafe fn`, `extern "C" fn`): the header of the fn pointer
+    /// it reifies to.
+    pub header: FnPtrHeader,
     pub inputs: &'w [PTy],
     pub output: PTy,
     pub types: PTys<'w>,
@@ -90,7 +239,15 @@ pub struct FnSig<'w> {
 pub enum PClause {
     Trait { trait_: ItemKey, args: List },
     Projection { trait_: ItemKey, args: List, name: Name, term: PTy },
+    /// `where const { COND }`: `cond` is the condition's anonymous constant, whose generics are
+    /// its item's; `args` are those generics as this item's table writes them (the identity
+    /// for the item's own clause), substituted as a trait clause's are.
+    Const { cond: ItemKey, args: List },
 }
+
+/// The value of a `where const` condition at ground arguments: blaze-solve's answer type,
+/// one home (rule 30).
+pub use blaze_solve::facts::ConstHolds;
 
 /// An item's where-clauses, own and inherited, its own generics' implied `Sized` included.
 #[derive(Clone, Copy, Debug)]
@@ -152,11 +309,65 @@ pub struct ImplHeader<'w> {
     pub self_ty: PTy,
     /// The trait, for a trait impl; `None` for an inherent impl.
     pub trait_: Option<ItemKey>,
-    /// The trait's arguments after `Self`.
-    pub trait_args: List,
+    /// The trait's arguments after `Self`: a type of its own, so a self-first list cannot be
+    /// handed in by mistake (it once was, and every trait goal silently matched no impl).
+    pub trait_args: ArgsAfterSelf,
     /// Associated types the impl defines.
     pub assoc_types: &'w [(Name, PTy)],
     pub types: PTys<'w>,
+    /// `impl Trait for T` is positive, `impl !Trait for T` negative (core's
+    /// `impl<T: PointeeSized> !Send for *const T`): it says the trait does NOT hold, which also
+    /// keeps an auto trait from being proven by the type's parts. `#[rustc_reservation_impl]`
+    /// is a reservation. The solver's own type: one home for the concept.
+    pub polarity: ImplPolarity,
+}
+
+pub use blaze_solve::facts::ImplPolarity;
+
+/// A trait's arguments AFTER `Self` (`[A, B]` of `impl Trait<A, B> for T`), as a list of the
+/// answer's table. Built only by [`ArgsAfterSelf::split`], which takes a trait reference's
+/// whole list (`Self` first, the way a where-clause writes it) apart against the self type,
+/// or as [`ArgsAfterSelf::NONE`]. Where a world's answer enters the checker
+/// ([`Reads::impl_header`]), the count is checked against the trait's parameters.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default)]
+pub struct ArgsAfterSelf(List);
+
+/// Why a trait reference's list could not be taken apart into `Self` and the rest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SplitSelf {
+    /// The list is not in the table.
+    OutsideTable,
+    /// The list is empty: no `Self`.
+    NoSelf,
+    /// The list's first argument is not the self type it was split against.
+    OtherSelf { found: PTy, self_ty: PTy },
+}
+
+impl ArgsAfterSelf {
+    /// A trait with no parameters besides `Self`.
+    pub const NONE: ArgsAfterSelf = ArgsAfterSelf(List::EMPTY);
+
+    /// Takes `with_self` (`[Self, A, B]`, a trait reference's whole list) apart: its first
+    /// argument must be `self_ty`; the rest is the list after `Self`, the same table's slice.
+    pub fn split(types: PTys<'_>, with_self: List, self_ty: PTy) -> Result<ArgsAfterSelf, SplitSelf> {
+        let all = types.list(with_self).map_err(|_| SplitSelf::OutsideTable)?;
+        match all.first() {
+            None => Err(SplitSelf::NoSelf),
+            Some(&found) if found != self_ty => Err(SplitSelf::OtherSelf { found, self_ty }),
+            Some(_) => Ok(ArgsAfterSelf(List { start: with_self.start + 1, len: with_self.len - 1 })),
+        }
+    }
+
+    /// A list the checker's own tests write as is, so a test can hand in a wrong one.
+    #[cfg(any(test, feature = "testing"))]
+    pub(crate) const fn unchecked(l: List) -> ArgsAfterSelf {
+        ArgsAfterSelf(l)
+    }
+
+    /// The list after `Self`.
+    pub const fn list(self) -> List {
+        self.0
+    }
 }
 
 /// What kind of associated item.
@@ -189,6 +400,21 @@ pub enum Def {
     Trait(ItemKey),
     /// A generic parameter of the body's item.
     TyParam(u32),
+    /// A built-in type named by its path (the Reference, "Primitive types"; "Paths": `u32` in
+    /// `u32::MAX` is a type, and the segment after it is its associated item).
+    Prim(Prim),
+}
+
+/// A built-in type a path can name: the first segment of `u32::MAX`, `str::len`,
+/// `char::from_u32`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Prim {
+    Bool,
+    Char,
+    Str,
+    Int(IntTy),
+    Uint(UintTy),
+    Float(FloatTy),
 }
 
 /// A path's resolution: the definition and how many segments it consumed. Segments after
@@ -206,6 +432,42 @@ pub struct TypeAttrs(pub u32);
 impl TypeAttrs {
     pub const NON_EXHAUSTIVE: u32 = 1;
     pub const FUNDAMENTAL: u32 = 2;
+    /// Bits 8..12: an enum's discriminant type ([`DiscrRepr`]); 0 is `Unread`.
+    const DISCR: u32 = 0xf << 8;
+
+    /// These attributes with an enum's discriminant type set.
+    pub const fn with_discr(self, d: DiscrRepr) -> Self {
+        let code = match d {
+            DiscrRepr::Unread => 0,
+            DiscrRepr::Int(i) => 1 + i as u32,
+            DiscrRepr::Uint(u) => 7 + u as u32,
+        };
+        TypeAttrs((self.0 & !Self::DISCR) | (code << 8))
+    }
+
+    /// An enum's discriminant type, as the world read it.
+    pub const fn discr(self) -> DiscrRepr {
+        const I: [IntTy; 6] = [IntTy::Isize, IntTy::I8, IntTy::I16, IntTy::I32, IntTy::I64, IntTy::I128];
+        const U: [UintTy; 6] = [UintTy::Usize, UintTy::U8, UintTy::U16, UintTy::U32, UintTy::U64, UintTy::U128];
+        match (self.0 & Self::DISCR) >> 8 {
+            c @ 1..=6 => DiscrRepr::Int(I[c as usize - 1]),
+            c @ 7..=12 => DiscrRepr::Uint(U[c as usize - 7]),
+            _ => DiscrRepr::Unread,
+        }
+    }
+}
+
+/// An enum's discriminant type, answered with its [`TypeAttrs`] (`TypeAttrs::with_discr`).
+/// Reference, "Enumerations", "Discriminants": "Under the default representation, the
+/// discriminant is interpreted as an `isize` value" (write `Int(Isize)`); under a primitive
+/// representation, `#[repr(u8)]` and the rest ("Type Layout", "Primitive representations"), it
+/// is that integer. `Unread`: the world does not read `repr` yet; the checker then stops on
+/// `<E as DiscriminantKind>::Discriminant` naming the enum, never guessing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum DiscrRepr {
+    Unread,
+    Int(IntTy),
+    Uint(UintTy),
 }
 
 /// An opaque type's hidden type.
@@ -244,9 +506,26 @@ pub trait World {
         segments: &[Name],
     ) -> Fetch<Option<PathRes>>;
     fn lang_item(&self, seal: Seal, item: LangItem) -> Fetch<Option<ItemKey>>;
+    /// The definition a desugaring's path to `item` names (`BodyPath::lang`): `Def::Fn` for a
+    /// fn or a trait's fn (`Try::branch`), `Def::Ctor` for a variant (`ControlFlow::Continue`),
+    /// `Def::Adt` for a struct (`Range`); `None` when the crate graph declares no such item.
+    /// A variant's ctor key answers `fn_sig` as rustc's ctor fn: the ADT's generics as its own,
+    /// the fields as inputs, the ADT as output.
+    fn lang_path(&self, seal: Seal, item: LangItem) -> Fetch<Option<Def>>;
     fn const_value(&self, seal: Seal, item: ItemKey) -> Fetch<Option<u64>>;
     fn opaque_hidden(&self, seal: Seal, item: ItemKey) -> Fetch<Option<Hidden<'_>>>;
     fn attrs(&self, seal: Seal, item: ItemKey) -> Fetch<TypeAttrs>;
+    /// The definition of trait `trait_` (`None`: not a trait).
+    fn trait_def(&self, seal: Seal, trait_: ItemKey) -> Fetch<Option<TraitDef<'_>>>;
+    /// The container and name of an associated item (`None`: not an associated item).
+    fn assoc_parent(&self, seal: Seal, item: ItemKey) -> Fetch<Option<AssocParent>>;
+    /// The `where const` condition `cond` (an anonymous constant) at `args`, ground types of
+    /// `types` (no parameter, no inference variable): `True` or `False` from its value, `Error`
+    /// when evaluating it failed (a panic included: never taken as false). `Missing` is the
+    /// evaluator's own need.
+    fn const_holds(&self, seal: Seal, cond: ItemKey, args: &[PTy], types: PTys<'_>) -> Fetch<ConstHolds>;
+    /// The const generic parameters of `item`'s generics, the parent's first ([`ConstParams`]).
+    fn const_params(&self, seal: Seal, item: ItemKey) -> Fetch<ConstParams<'_>>;
     /// The questions the last check of this body asked, before the walk starts: fetch them in
     /// one batch. Answers nothing.
     fn prefetch(&self, seal: Seal, questions: &[Question]) {
@@ -314,6 +593,16 @@ impl<'a> Needs<'a> {
 pub struct Reads<'w, 'a, W: World> {
     world: &'w W,
     entries: Vec<(Question, u64), Alloc<'a>>,
+    /// The ask log, when the run measures re-entry (asks.rs); `None` otherwise.
+    log: Option<AskRecorder<'w, 'a>>,
+}
+
+/// The ask log being written, with the clock it reads and where the walk is.
+pub(crate) struct AskRecorder<'w, 'a> {
+    pub asks: Vec<Ask, Alloc<'a>>,
+    pub clock: &'w dyn Clock,
+    pub start_ns: u64,
+    pub cursor: Cursor,
 }
 
 fn hash_of(domain: &str, v: &impl ContentHash) -> u64 {
@@ -322,17 +611,77 @@ fn hash_of(domain: &str, v: &impl ContentHash) -> u64 {
     h.finish()
 }
 
+/// The content digest of ground arguments `args` of a table `types` holding only them (as
+/// exported, hash-consed: its bytes are a function of the arguments' structure), which names a
+/// `where const` condition's record with the condition's key ([`Question::ConstHolds`]).
+pub fn ground_args_digest(args: &[PTy], types: PTys<'_>) -> u64 {
+    let mut h = StableHasher::new("where const args");
+    h.u32(args.len() as u32);
+    for a in args {
+        h.u32(a.0);
+    }
+    types.hash_into(&mut h);
+    h.finish()
+}
+
 impl<'w, 'a, W: World> Reads<'w, 'a, W> {
     /// The recorder for one run.
     pub(crate) fn new_in(world: &'w W, alloc: Alloc<'a>) -> Reads<'w, 'a, W> {
-        Reads { world, entries: Vec::new_in(alloc) }
+        Reads { world, entries: Vec::new_in(alloc), log: None }
+    }
+
+    /// The recorder for one run that also writes the ask log, reading `clock`.
+    pub(crate) fn logged_in(world: &'w W, clock: &'w dyn Clock, alloc: Alloc<'a>) -> Reads<'w, 'a, W> {
+        let start_ns = clock.now_ns();
+        let log = AskRecorder { asks: Vec::new_in(alloc), clock, start_ns, cursor: Cursor::default() };
+        Reads { world, entries: Vec::new_in(alloc), log: Some(log) }
+    }
+
+    /// Whether the run writes the ask log (the machine then reports where it is).
+    pub(crate) fn logging(&self) -> bool {
+        self.log.is_some()
+    }
+
+    /// Where the walk is: the step and the checker's state in bytes.
+    pub(crate) fn at(&mut self, step: u32, state_bytes: u64) {
+        if let Some(l) = &mut self.log {
+            l.cursor.step = step;
+            l.cursor.state_bytes = state_bytes;
+        }
+    }
+
+    /// Marks the asks that follow as a ground solver goal's (`true`) or not.
+    pub(crate) fn in_ground_goal(&mut self, ground: bool) {
+        if let Some(l) = &mut self.log {
+            l.cursor.ground_goal = ground;
+        }
+    }
+
+    /// The ask log of the run, with its end.
+    pub(crate) fn take_log(&mut self) -> Option<AskLog<'a>> {
+        let l = self.log.take()?;
+        let end_ns = l.clock.now_ns().saturating_sub(l.start_ns);
+        Some(AskLog { asks: l.asks, end_step: l.cursor.step, end_ns })
     }
 
     fn seal() -> Seal {
         Seal { _private: () }
     }
 
+    /// The one seam every read of another item's record goes through: asks the world, logs
+    /// the ask when measuring, and enters the answer's hash into the read list.
     fn record<T: ContentHash>(&mut self, q: Question, got: Fetch<T>) -> Result<T, Stop> {
+        if let Some(l) = &mut self.log {
+            l.asks.push(Ask {
+                question: q,
+                kind: q.record_kind(),
+                step: l.cursor.step,
+                at_ns: l.clock.now_ns().saturating_sub(l.start_ns),
+                state_bytes: l.cursor.state_bytes,
+                missing: got.is_err(),
+                ground_goal: l.cursor.ground_goal,
+            });
+        }
         match got {
             Ok(v) => {
                 self.entries.push((q, hash_of("answer", &v)));
@@ -340,6 +689,70 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
             }
             Err(Missing) => Err(Stop::Need(q)),
         }
+    }
+
+    /// The syntactic prefetch of a body with no record (typeck.md, "Re-entry"): every path its
+    /// text names, resolved where the world already can, and what each resolution's use will
+    /// read; every method name, as the associated item of each trait in scope. Asked at once
+    /// as prefetches, so a cold body stops once per round of fetches, not once per signature.
+    /// Not reads: nothing enters the read list, and no answer here changes the run.
+    pub(crate) fn prefetch_syntactic(&mut self, body: &BodyView<'_>, alloc: Alloc<'a>) {
+        let mut first: Vec<Question, Alloc<'a>> = Vec::new_in(alloc);
+        let mut names: Vec<Name, Alloc<'a>> = Vec::new_in(alloc);
+        for (i, bp) in body.paths.iter().enumerate() {
+            first.push(match bp.lang {
+                Some(l) => Question::LangPath(l),
+                None => Question::Path(bp.scope, PathIdx(i as u32)),
+            });
+        }
+        let mut scopes: Vec<ScopeId, Alloc<'a>> = Vec::new_in(alloc);
+        for e in body.exprs {
+            if let crate::body::Expr::MethodCall { scope, .. } = *e
+                && !scopes.contains(&scope)
+            {
+                scopes.push(scope);
+                first.push(Question::TraitsInScope(scope));
+            }
+        }
+        self.world.prefetch(Self::seal(), &first);
+        // The second round: what the answers already there name.
+        let mut second: Vec<Question, Alloc<'a>> = Vec::new_in(alloc);
+        for (i, bp) in body.paths.iter().enumerate() {
+            let def = match bp.lang {
+                Some(l) => self.world.lang_path(Self::seal(), l),
+                None => {
+                    names.clear();
+                    let Ok(segs) = body.segment_list(bp.segments) else { continue };
+                    names.extend(segs.iter().map(|s| s.name));
+                    self.world.resolve_path(Self::seal(), bp.scope, PathIdx(i as u32), &names).map(|r| r.map(|r| r.def))
+                }
+            };
+            let Ok(Some(def)) = def else { continue };
+            match def {
+                Def::Fn(k) => {
+                    second.push(Question::FnSig(k));
+                    second.push(Question::Predicates(k));
+                }
+                Def::Ctor { adt: k, .. } | Def::Adt(k) => {
+                    second.push(Question::Adt(k));
+                    second.push(Question::Predicates(k));
+                }
+                Def::Trait(k) => second.push(Question::TraitDef(k)),
+                Def::Const(k) | Def::Static(k, _) => second.push(Question::FnSig(k)),
+                Def::TyParam(_) | Def::Prim(_) => {}
+            }
+        }
+        for e in body.exprs {
+            let crate::body::Expr::MethodCall { scope, name, .. } = *e else { continue };
+            let Ok(traits) = self.world.traits_in_scope(Self::seal(), scope) else { continue };
+            for &t in traits {
+                second.push(Question::AssocItem(t, name));
+                second.push(Question::TraitDef(t));
+            }
+        }
+        second.sort_unstable();
+        second.dedup();
+        self.world.prefetch(Self::seal(), &second);
     }
 
     /// Hands the last run's questions to the world.
@@ -367,9 +780,21 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
         self.record(Question::ImplsOf(trait_, shape), got)
     }
 
+    /// An impl's header, checked where it enters: a trait impl's arguments after `Self` must
+    /// number the trait's parameters besides `Self` (`CheckError::ImplTraitArity` names it).
     pub fn impl_header(&mut self, item: ItemKey) -> Result<Option<ImplHeader<'w>>, Stop> {
         let got = self.world.impl_header(Self::seal(), item);
-        self.record(Question::ImplHeader(item), got)
+        let h = self.record(Question::ImplHeader(item), got)?;
+        if let Some(ImplHeader { trait_: Some(trait_), trait_args, .. }) = h {
+            let Some(def) = self.trait_def(trait_)? else {
+                return Err(CheckError::Malformed(Malformed::NoRecord(Question::TraitDef(trait_))).into());
+            };
+            let expected = def.generics.saturating_sub(1);
+            if trait_args.list().len != expected {
+                return Err(CheckError::ImplTraitArity { impl_: item, trait_, expected, got: trait_args.list().len }.into());
+            }
+        }
+        Ok(h)
     }
 
     pub fn inherent(&mut self, shape: Shape, name: Name) -> Result<&'w [AssocItem], Stop> {
@@ -402,6 +827,11 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
         self.record(Question::Lang(item), got)
     }
 
+    pub fn lang_path(&mut self, item: LangItem) -> Result<Option<Def>, Stop> {
+        let got = self.world.lang_path(Self::seal(), item);
+        self.record(Question::LangPath(item), got)
+    }
+
     pub fn const_value(&mut self, item: ItemKey) -> Result<Option<u64>, Stop> {
         let got = self.world.const_value(Self::seal(), item);
         self.record(Question::Const(item), got)
@@ -415,6 +845,26 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
     pub fn attrs(&mut self, item: ItemKey) -> Result<TypeAttrs, Stop> {
         let got = self.world.attrs(Self::seal(), item);
         self.record(Question::Attrs(item), got)
+    }
+
+    pub fn trait_def(&mut self, trait_: ItemKey) -> Result<Option<TraitDef<'w>>, Stop> {
+        let got = self.world.trait_def(Self::seal(), trait_);
+        self.record(Question::TraitDef(trait_), got)
+    }
+
+    pub fn assoc_parent(&mut self, item: ItemKey) -> Result<Option<AssocParent>, Stop> {
+        let got = self.world.assoc_parent(Self::seal(), item);
+        self.record(Question::AssocParent(item), got)
+    }
+
+    pub fn const_holds(&mut self, cond: ItemKey, args: &[PTy], types: PTys<'_>) -> Result<ConstHolds, Stop> {
+        let got = self.world.const_holds(Self::seal(), cond, args, types);
+        self.record(Question::ConstHolds(cond, ground_args_digest(args, types)), got)
+    }
+
+    pub fn const_params(&mut self, item: ItemKey) -> Result<ConstParams<'w>, Stop> {
+        let got = self.world.const_params(Self::seal(), item);
+        self.record(Question::ConstParams(item), got)
     }
 
     /// The test build's one backdoor: an ADT read that is not recorded. Only the planted bug
@@ -460,6 +910,7 @@ impl ContentHash for FnSig<'_> {
         h.u32(self.parent_count);
         h.u32(self.own_count);
         h.tag(u8::from(self.self_param));
+        h.tag(self.header.bits());
         self.inputs.hash_into(h);
         h.u32(self.output.0);
         self.types.hash_into(h);
@@ -483,13 +934,36 @@ impl ContentHash for PClause {
                 h.u64(name.0);
                 h.u32(term.0);
             }
+            PClause::Const { cond, args } => {
+                h.tag(2);
+                h.u128(cond.0);
+                h.u32(args.start);
+                h.u32(args.len);
+            }
         }
+    }
+}
+
+impl ContentHash for ConstHolds {
+    fn hash_into(&self, h: &mut StableHasher) {
+        h.tag(*self as u8);
     }
 }
 
 impl ContentHash for Predicates<'_> {
     fn hash_into(&self, h: &mut StableHasher) {
         self.clauses.hash_into(h);
+        self.types.hash_into(h);
+    }
+}
+
+impl ContentHash for ConstParams<'_> {
+    fn hash_into(&self, h: &mut StableHasher) {
+        h.u32(self.params.len() as u32);
+        for &(i, t) in self.params {
+            h.u32(i);
+            h.u32(t.0);
+        }
         self.types.hash_into(h);
     }
 }
@@ -532,14 +1006,19 @@ impl ContentHash for ImplHeader<'_> {
         h.u32(self.generics);
         h.u32(self.self_ty.0);
         self.trait_.hash_into(h);
-        h.u32(self.trait_args.start);
-        h.u32(self.trait_args.len);
+        h.u32(self.trait_args.list().start);
+        h.u32(self.trait_args.list().len);
         h.u64(self.assoc_types.len() as u64);
         for (n, t) in self.assoc_types {
             h.u64(n.0);
             h.u32(t.0);
         }
         self.types.hash_into(h);
+        h.u32(match self.polarity {
+            ImplPolarity::Positive => 0,
+            ImplPolarity::Negative => 1,
+            ImplPolarity::Reservation => 2,
+        });
     }
 }
 
@@ -567,7 +1046,13 @@ impl ContentHash for &[AssocItem] {
 impl ContentHash for PathRes {
     fn hash_into(&self, h: &mut StableHasher) {
         h.u32(self.consumed);
-        match self.def {
+        self.def.hash_into(h);
+    }
+}
+
+impl ContentHash for Def {
+    fn hash_into(&self, h: &mut StableHasher) {
+        match *self {
             Def::Fn(k) => {
                 h.tag(0);
                 h.u128(k.0);
@@ -599,6 +1084,26 @@ impl ContentHash for PathRes {
                 h.tag(6);
                 h.u32(i);
             }
+            Def::Prim(p) => {
+                h.tag(7);
+                match p {
+                    Prim::Bool => h.tag(0),
+                    Prim::Char => h.tag(1),
+                    Prim::Str => h.tag(2),
+                    Prim::Int(i) => {
+                        h.tag(3);
+                        h.tag(i as u8);
+                    }
+                    Prim::Uint(u) => {
+                        h.tag(4);
+                        h.tag(u as u8);
+                    }
+                    Prim::Float(f) => {
+                        h.tag(5);
+                        h.tag(f as u8);
+                    }
+                }
+            }
         }
     }
 }
@@ -606,6 +1111,97 @@ impl ContentHash for PathRes {
 impl ContentHash for TypeAttrs {
     fn hash_into(&self, h: &mut StableHasher) {
         h.u32(self.0);
+    }
+}
+
+impl ContentHash for TraitDef<'_> {
+    fn hash_into(&self, h: &mut StableHasher) {
+        h.u32(self.generics);
+        h.u32(self.flags.0);
+        match self.lang {
+            Some(l) => {
+                h.tag(1);
+                l.hash_into(h);
+            }
+            None => h.tag(0),
+        }
+        self.supertraits.hash_into(h);
+        h.u64(self.assoc_types.len() as u64);
+        for a in self.assoc_types {
+            h.u64(a.name.0);
+            h.u128(a.item.0);
+            match a.default {
+                Some(t) => {
+                    h.tag(1);
+                    h.u32(t.0);
+                }
+                None => h.tag(0),
+            }
+        }
+        self.types.hash_into(h);
+        self.members.hash_into(h);
+    }
+}
+
+impl ContentHash for TraitMembers<'_> {
+    fn hash_into(&self, h: &mut StableHasher) {
+        use crate::dyn_compat::{MemberShape, Receiver, Unread};
+        let ms = match self {
+            TraitMembers::NotKnown => return h.tag(0),
+            TraitMembers::Known(ms) => ms,
+        };
+        h.tag(1);
+        h.u64(ms.len() as u64);
+        for m in *ms {
+            h.u64(m.name.0);
+            match m.shape {
+                MemberShape::Const => h.tag(0),
+                MemberShape::Type { generic } => {
+                    h.tag(1);
+                    h.tag(u8::from(generic));
+                }
+                MemberShape::Fn(f) => {
+                    h.tag(2);
+                    h.tag(match f.receiver {
+                        Receiver::Absent => 0,
+                        Receiver::Value => 1,
+                        Receiver::Ref => 2,
+                        Receiver::RefMut => 3,
+                        Receiver::Box => 4,
+                        Receiver::Rc => 5,
+                        Receiver::Arc => 6,
+                        Receiver::PinOfPointer => 7,
+                        Receiver::Other => 8,
+                    });
+                    h.u32(f.own_non_lifetime_params);
+                    for b in [f.where_self_sized, f.is_async, f.opaque_return, f.self_outside_receiver] {
+                        h.tag(u8::from(b));
+                    }
+                }
+                MemberShape::Unread(u) => {
+                    h.tag(3);
+                    h.tag(match u {
+                        Unread::TypedReceiver => 0,
+                        Unread::SignatureType => 1,
+                    });
+                }
+            }
+        }
+    }
+}
+
+impl ContentHash for AssocParent {
+    fn hash_into(&self, h: &mut StableHasher) {
+        h.u128(self.container.0);
+        h.u64(self.name.0);
+        match self.kind {
+            AssocKind::Fn { self_param } => {
+                h.tag(0);
+                h.tag(u8::from(self_param));
+            }
+            AssocKind::Const => h.tag(1),
+            AssocKind::Type => h.tag(2),
+        }
     }
 }
 

@@ -65,6 +65,8 @@ fn lang_of(name: &str) -> Option<Lang> {
         "phantom_data" => Lang::PhantomData,
         "owned_box" => Lang::OwnedBox,
         "manually_drop" => Lang::ManuallyDrop,
+        "future_trait" => Lang::Future,
+        "future_output" => Lang::FutureOutput,
         _ => return None,
     })
 }
@@ -121,12 +123,12 @@ impl Sink for Table {
 }
 
 /// A case's arena with its named variables.
-pub struct Arena<'x> {
-    pub tys: &'x mut TestTys,
+pub struct Arena<'x, T: Tys = TestTys> {
+    pub tys: &'x mut T,
     pub vars: &'x mut HashMap<String, Ty>,
 }
 
-impl Sink for Arena<'_> {
+impl<T: Tys> Sink for Arena<'_, T> {
     fn node(&mut self, k: TyKind) -> Result<Ty, SolveError> {
         self.tys.mk(k)
     }
@@ -218,7 +220,7 @@ impl Names {
             TyA::Str => TyKind::Str,
             TyA::Never => TyKind::Never,
             TyA::Error => TyKind::Error,
-            TyA::Const(n) | TyA::Kind(n) => TyKind::ConstValue(*n),
+            TyA::Const(n) | TyA::Kind(n) => TyKind::ConstValue(crate::term::ValTy::USIZE, u128::from(*n)),
             TyA::Placeholder(i) => TyKind::Placeholder(1, *i),
             TyA::Region(lt) => return self.region(s, line, lt),
             TyA::Tuple(xs) => {
@@ -261,7 +263,7 @@ impl Names {
                     v.push(self.ty(s, sc, line, x)?);
                 }
                 v.push(self.ty(s, sc, line, out)?);
-                TyKind::FnPtr(s.list(&v).map_err(e)?)
+                TyKind::FnPtr(s.list(&v).map_err(e)?, crate::term::FnPtrHeader::RUST)
             }
             TyA::FnItem(name, args) => {
                 let d = *self.fns.get(name).ok_or_else(|| err(line, format!("no fn `{name}`")))?;
@@ -433,6 +435,14 @@ impl Names {
                 let b = self.ty(s, sc, line, b)?;
                 preds.push(Pred::Subtype { a, b });
             }
+            PredA::Const(name, args) => {
+                let mut v = Vec::with_capacity(args.len());
+                for a in args {
+                    v.push(self.ty(s, sc, line, a)?);
+                }
+                let args = s.list(&v).map_err(e)?;
+                preds.push(Pred::ConstHolds { cond: def_of("const", name), args });
+            }
             PredA::ForAll(..) => return Err(err(line, "nested `for<..>`".to_string())),
         }
         let _ = e;
@@ -464,7 +474,7 @@ impl Names {
     }
 
     /// `P: Sized` for every case parameter (a case's params are a fn's).
-    pub fn case_sized(&self, s: &mut Arena<'_>, line: u32, n: u32, out: &mut Vec<Clause>) -> Parsed<()> {
+    pub fn case_sized<T: Tys>(&self, s: &mut Arena<'_, T>, line: u32, n: u32, out: &mut Vec<Clause>) -> Parsed<()> {
         let mut preds = Vec::new();
         for i in 0..n {
             let t = s.node(TyKind::Param(i)).map_err(|x| solve_err(line, x))?;
@@ -1015,6 +1025,12 @@ impl Facts for World {
             fields: &r.fields,
             variants: &r.variants,
             sized_tail: r.sized_tail,
+            // The test language writes no `repr`: an enum has the default one.
+            discr: if r.flags.has(AdtFlags::ENUM) {
+                crate::facts::Discr::Int(crate::term::IntTy::Isize)
+            } else {
+                crate::facts::Discr::Unread
+            },
             where_clauses: &r.wheres,
             portable: self.portable(),
             digest: r.digest,
@@ -1046,5 +1062,16 @@ impl Facts for World {
     fn is_local(&self, _: Seal, d: Def) -> Fetch<bool> {
         self.ask();
         Ok(self.local.contains(&d))
+    }
+
+    /// By the condition's name (`PredA::Const`), whatever the arguments.
+    fn const_holds(&self, _: Seal, cond: Def, _: &[Ty]) -> Fetch<crate::facts::ConstHolds> {
+        self.ask();
+        use crate::facts::ConstHolds;
+        [("yes", ConstHolds::True), ("no", ConstHolds::False), ("err", ConstHolds::Error)]
+            .into_iter()
+            .find(|&(name, _)| def_of("const", name) == cond)
+            .map(|(_, v)| v)
+            .ok_or(Missing)
     }
 }

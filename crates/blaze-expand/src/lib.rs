@@ -1,3 +1,22 @@
+//! # For a successor
+//!
+//! State on 2026-11-16, for whoever takes this crate next:
+//!
+//! - `macro_rules!` runs on this crate's own engine (`rules/`): a definition is compiled once
+//!   (`rules::compile`, at [`prepare`]) to flat arrays with jump targets, matched and
+//!   transcribed on explicit stacks, bounded by `STEP_BOUND` and `DEPTH_BOUND`
+//!   ([`ExpandError::RulesBound`]). mbe, tt, span, intern and syntax-bridge are gone.
+//! - The gate: `tests/rules_diff.rs` (Rust's defined cases against renderings recorded from
+//!   mbe, planted bugs) and `examples/rules_core.rs --check
+//!   examples/rules_compare/library-nightly-2026-10-27.digests` (every call in core, alloc,
+//!   std: 0 differ). Re-record only for a change you can explain token by token.
+//! - Open: the compiled `rules::Program` is held in [`Prepared`] in memory, not yet a stored
+//!   record keyed by the definition's bytes; the output tables grow by reallocation and
+//!   `find_calls` runs after the write (`Out::finish`): size from a counting pass and index
+//!   calls as written. Cost now: 1.83x the floor's time, 1.48x its bytes.
+//! - Body-position calls (expression, statements, pattern, type) are being wired into
+//!   blaze-lower; see that crate's doc for where that stands.
+//!
 //! Macro expansion for the item layer (docs/v2/plan/design/bottom.md, the `Expansion` and
 //! `MacroDef` rows): one pure function per macro call, from the macro's definition and the
 //! call's tokens to an [`Expansion`], a value that is written as a record and read in any
@@ -43,48 +62,58 @@
 //!
 //! # What is reused
 //!
-//! mbe's matcher and transcriber run `macro_rules!` and `macro`, on token trees made from the
-//! portable form and read back into it ([`crate::bridge`]). The builtin derives and the
-//! builtin function-like macros are written here, token to token, and a literal's escapes are
-//! read here too: no database and no syntax tree is involved.
+//! The lexer's kinds and the parser's fragment entry points (`expr`, `ty`, `pat`, ...) are
+//! rust-analyzer's `parser` crate. Everything else is written here over the portable form:
+//! `macro_rules!` and `macro` are compiled once into a matching program (`rules`), the builtin
+//! derives and function-like macros write token to token, and a literal's escapes are read
+//! here too. No token tree, interner, database or syntax tree is involved.
 
 #![no_std]
 #![feature(allocator_api)]
 
 mod adt;
-mod bridge;
+mod body;
 mod builtin;
 mod call;
+mod cfg;
 mod cx;
-mod declarative;
 mod def;
 mod derive;
 mod error;
 mod expand;
 mod expansion;
+mod item;
 mod key;
 mod limit;
 mod literal;
 mod nested;
 mod record;
+mod rules;
 mod tokens;
 
 pub use crate::{
+    body::{
+        BodyWord, BodyWords, Fragment, ParserWords, body_words, local_hygiene, parser_words,
+        write_token, write_tokens,
+    },
     call::{AlsoCopy, Call, CallKind, CallShape, CallSite, Constness, DeriveFacts, Eager, Inside},
+    cfg::{CfgAttrError, CfgPredicateError, cfg_attr_metas, cfg_predicate, cfg_predicate_at},
+    derive::{attr_call, derive_attr, derive_meta},
     cx::{
-        ExpandCx, HostAsk, HostError, HostWhy, IncludeAs, Included, Place, PlaceOf, ProcCall,
-        Produced,
+        ExpandCx, HostAsk, HostError, HostWhy, IncludeAs, Included, OutsideRoot, Place, PlaceOf,
+        ProcCall, ProcDiagnostic, ProcLimit, Produced, ReadRoot, SourceOrigin, include_target,
     },
     def::{
         BuiltinAttr, BuiltinDerive, BuiltinFn, DefAt, DefinitionError, DefinitionRecords, Export,
         LocalInner, MacroContent, MacroDefinition, MacroKind, ProcKind,
     },
-    error::{ExpandError, LexError, Stream, StreamError, Table, Unbuilt},
+    error::{ExpandError, LexError, RulesLimit, Stream, StreamError, Table, Unbuilt},
     expand::{Prepared, expand, expand_prepared, prepare},
     expansion::{
         Diagnostic, Expanded, Expansion, Hole, HoleOf, IncludeFailure, NestedCall, NestedKind,
-        PathScope, Range, Read, ReadAnswer, ReadKind, Reads, TokenOrigin,
+        PathScope, ProcLevel, Range, Read, ReadAnswer, ReadKind, Reads, TokenOrigin,
     },
+    item::{AttrCall, DeriveUse, Derives, ItemAttrs, ItemAttrsError, NextAttr},
     key::{CallKey, ExpansionKey, call_key, expansion_key},
     limit::{Depth, LimitReached, RecursionLimit},
     nested::find_calls,
@@ -93,6 +122,6 @@ pub use crate::{
     },
     tokens::{
         Ctx, CtxNode, DefSite, Delim, Edition, LitKind, Mark, MarkOf, Raw, Sink, Spacing, Text,
-        Token, TokenHygiene, TokenKind, TokenStream, Transparency, lex, lex_through_tt,
+        Token, TokenHygiene, TokenKind, TokenStream, Transparency, lex,
     },
 };

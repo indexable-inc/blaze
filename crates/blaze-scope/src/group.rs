@@ -1,8 +1,10 @@
 //! [`Group`]: the machines of a cycle of modules, solved together. Each member reads the
 //! others live (their declarations and their state as it is), so the group reaches the least
 //! fixpoint of the cycle: a name is bound only where some member's text binds it, never by
-//! the members justifying each other. It then writes one scope per member, each naming its
-//! fellows, and each with the reads of modules outside the group it used.
+//! the members justifying each other. It then writes one scope per member, each with every
+//! read it used, its fellows' included: `settle_reads` runs each member's final pass alone
+//! with its fellows answered from the group's finished scopes, so the record is the same
+//! whatever the schedule and names no fellow.
 
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
@@ -13,7 +15,7 @@ use blaze_own::{AVec, Alloc};
 use crate::error::ResolveError;
 use crate::facts::{Name, ScopeFacts};
 use crate::read::{Reply, Step};
-use crate::resolver::{Outbox, Ran, Resolver, run};
+use crate::resolver::{Outbox, Ran, Resolver};
 use crate::scope::Resolved;
 
 /// The machines of one cycle, sorted by module.
@@ -45,10 +47,11 @@ impl<'a, N: Name> Group<'a, N> {
             if m.finished {
                 return Err(ResolveError::Finished { module: m.module });
             }
-            // What a member waited on may now be a fellow, read live: every plan is made again,
-            // on the group's clock.
-            m.stamps.reset();
+            // What a member waited on may now be a fellow, read live: every item is evaluated
+            // again.
             m.block_all();
+            // A member's own worklist is of it alone: the group's is made at its first step.
+            m.out.work = None;
         }
         Ok(Group { members, out: Outbox::new_in(alloc), alloc, finished: false })
     }
@@ -71,7 +74,7 @@ impl<'a, N: Name> Group<'a, N> {
         for m in self.members.iter_mut() {
             m.absorb(replies)?;
         }
-        match run(self.members.as_mut_slice(), facts, &mut self.out, self.alloc)? {
+        match crate::work::run(self.members.as_mut_slice(), facts, replies, &mut self.out, self.alloc)? {
             Ran::Ask => Ok(Step::Ask(&self.out.asks)),
             Ran::Expand => Ok(Step::Expand(&self.out.expand)),
             Ran::Cycle => Ok(Step::Cycle(&self.out.cycle)),

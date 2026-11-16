@@ -17,7 +17,7 @@ use crate::answers::{self, Last, Page, Root, Row};
 use crate::condition::{Condition, ConditionError, MOST_ATOMS, MOST_CONDITIONS, OVER_CAP_RULE, Space, Var};
 use crate::key::{self, ABSENT, Key, Kind, Name, Tool};
 use crate::profile::Profile;
-use crate::record::{self, Finding, Locate, Part, Stored, Whole, WholeView};
+use crate::record::{self, Finding, Locate, Part, PathOf, Stored, Whole, WholeView};
 use crate::table::{Hashed, Set, Table, spread};
 use crate::wire::{NAME_BYTES, Reader, WireError, Writer};
 
@@ -77,6 +77,42 @@ pub enum Command {
 }
 
 impl Command {
+    /// The task kinds the command is defined to cover: what its answer claims was done. A
+    /// caller whose worker builds fewer says which stages it left out (blaze-cli's closing
+    /// note), so the note shrinks as kinds are built and is gone when all are.
+    pub fn needs(self) -> &'static [Kind] {
+        const CHECK: [Kind; 10] = [
+            Kind::Units,
+            Kind::UnitGraph,
+            Kind::Fetch,
+            Kind::FileItems,
+            Kind::ModuleScope,
+            Kind::Group,
+            Kind::Expansion,
+            Kind::Signature,
+            Kind::ImplBucket,
+            Kind::BodyCheck,
+        ];
+        const RUN: [Kind; 11] = [
+            Kind::Units,
+            Kind::UnitGraph,
+            Kind::Fetch,
+            Kind::FileItems,
+            Kind::ModuleScope,
+            Kind::Group,
+            Kind::Expansion,
+            Kind::Signature,
+            Kind::ImplBucket,
+            Kind::BodyCheck,
+            Kind::Code,
+        ];
+        match self {
+            Command::Check => &CHECK,
+            Command::Run => &RUN,
+            Command::Test => &Kind::ALL,
+        }
+    }
+
     fn byte(self) -> u8 {
         match self {
             Command::Check => 1,
@@ -106,7 +142,8 @@ pub struct FileEntry<'a> {
     pub id: ContentId,
     /// Its content differs from the leaf table the last answer was made with.
     pub changed: bool,
-    /// A manifest (`Cargo.toml`, `Cargo.lock`): the units' source.
+    /// A manifest (`Cargo.toml`, `Cargo.lock`): its path is in the root units' source, and an
+    /// edit of it re-reads its own units ([`Name::manifest`]).
     pub manifest: bool,
 }
 
@@ -140,8 +177,20 @@ pub const MOST_BATCH: usize = 256;
 
 /// What happened.
 pub enum Event<'a> {
-    /// The sweep's files, sorted by path; the paths gone since the last answer; the `last` file.
-    Start { files: &'a [FileEntry<'a>], gone: &'a [&'a [u8]], last: Option<&'a [u8]> },
+    /// The files the last answer read (the leaf table's, each checked today), sorted by path; the
+    /// paths gone since; the `last` file; the units' source (the digest of what the workspace
+    /// layout read: manifests, absent ones, listings). `cold`: there was no leaf table, so
+    /// `files` is not what an answer reads and no certificate is looked up (files are opened as
+    /// the walk reaches them, [`Effect::Open`]).
+    ///
+    /// `graph`: the `UnitGraph` job's source (blaze_drive::unit_graph_task::source), given when
+    /// the caller read a lock this command (the layout moved, or no table): one job of the
+    /// person's class, which asks `Fetch` for only the packages the roots reach, level by
+    /// level. A lock entry nothing reaches is never asked for. The lock is one of the layout's
+    /// reads, so a lock edit moves `units`, and with it the certificate.
+    Start { files: &'a [FileEntry<'a>], gone: &'a [&'a [u8]], last: Option<&'a [u8]>, units: ContentId, cold: bool, graph: Option<ContentId> },
+    /// An [`Effect::Open`]'s answer: the file's content id, or none (no such file).
+    Opened { name: Name, id: Option<ContentId> },
     /// A [`Effect::Get`]'s answer: the bytes at `key`, or none.
     Got { key: Key, bytes: Option<&'a [u8]> },
     /// A [`Effect::Run`]'s answer: one outcome per task of the batch, together.
@@ -185,6 +234,8 @@ pub struct Output<'a> {
     /// What it read, sorted by name, each with the out digest its input had.
     pub reads: &'a [(Name, ContentId)],
     pub parts: &'a [Part],
+    /// The path of each `Locate::File` part, so a walk can open it ([`PathOf`]).
+    pub paths: &'a [PathOf<'a>],
     pub findings: &'a [Finding<'a>],
     pub payload: &'a [u8],
 }
@@ -196,14 +247,43 @@ pub struct Want {
     pub home: Name,
 }
 
-/// A task that could not answer: not a user's error (that is a finding), the tool's.
+/// A task that could not answer: not a user's error (that is a finding), the tool's. It fails
+/// that one job (rule 20): the request goes on, every other record is written, and the answer
+/// is not (no certificate, no `last`), so the next command runs the job again.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct TaskFailure {
     pub name: Name,
-    /// What could not be done (`"the body checker over the store is not built"`).
-    pub what: &'static str,
-    /// The rule or the crate that says so.
-    pub rule: &'static str,
+    pub why: Why,
+}
+
+/// Why a task failed, typed (rule 19); the caller names the file ([`Request::file_of`]).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Why {
+    /// No task of the name's kind is built on the new item layer yet (drive.md, "Tasks and Need").
+    NotBuilt,
+    /// The task panicked (its message went to the error stream): an allocation its frame
+    /// refused, or a bug. `used` is the most its scratch frame held, `limit` that frame's size.
+    Panicked { used: u64, limit: u64 },
+    /// The task's input is one this build refuses: `what`, under `rule`.
+    Refused { what: &'static str, rule: &'static str },
+    /// A task this one needs failed this command (its own failure is printed); this one has
+    /// no record and prints nothing of its own: the closing note counts it.
+    Waited { on: Name },
+}
+
+impl fmt::Display for TaskFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.why {
+            Why::NotBuilt => write!(f, "{}: this task kind is not built on the new item layer yet (drive.md, \"Tasks and Need\")", self.name),
+            Why::Panicked { used, limit } => write!(
+                f,
+                "{}: the task panicked (its message is above) with {used} of its frame's {limit} bytes used; it failed alone (rule 20)",
+                self.name
+            ),
+            Why::Refused { what, rule } => write!(f, "{}: {what} ({rule})", self.name),
+            Why::Waited { on } => write!(f, "{}: needs {on}, which failed this command; no record is kept (rule 3)", self.name),
+        }
+    }
 }
 
 /// Which work a task is: the person's (what the command asked) or background (speculative code,
@@ -260,6 +340,10 @@ pub struct Task<'a> {
     pub edition: u8,
     /// Its inputs: last time's read list first, then what it needed since.
     pub inputs: Vec<Input, Alloc<'a>>,
+    /// What it needed that settled with no record: each's task failed this command (rule 20),
+    /// sorted. A task tells "not asked yet" from "asked and failed" by it, so it never asks
+    /// again for what failed (drive.md, "Owed, step 1").
+    pub failed: Vec<Name, Alloc<'a>>,
     /// A `Group`'s members.
     pub members: Vec<Name, Alloc<'a>>,
 }
@@ -286,6 +370,9 @@ pub struct Print<'a> {
 #[derive(Debug)]
 pub enum Effect<'a> {
     Get { key: Key },
+    /// A part names a file the request does not hold: read it at `path` (a `module` slot is
+    /// `x.rs`, else `x/mod.rs`), and answer [`Event::Opened`].
+    Open { name: Name, path: Vec<u8, Alloc<'a>>, module: bool },
     /// Write `bytes` at `key` once; bytes already there under the key stand.
     Put { key: Key, bytes: Vec<u8, Alloc<'a>> },
     Run { batch: Batch<'a> },
@@ -313,6 +400,9 @@ pub struct Answer {
     pub findings: u32,
     /// Where the units' record is, for `run` and `test` to find the entry.
     pub units: Option<Key>,
+    /// Tasks that failed ([`Request::failures`]): when any did, the answer was not written and
+    /// the command fails.
+    pub failed: u32,
 }
 
 /// Who makes a record a text-less crate lacks.
@@ -343,6 +433,10 @@ pub enum DriveError {
     WrongRecord { key: Key, asked: Name, held: Name },
     /// A task answered a record for a name no job asked.
     UnaskedOutput { name: Name, by: Name },
+    /// An `Opened` for a file no `Open` asked for, or answered twice.
+    UnaskedOpen { file: Name },
+    /// A file's job settled with no edition to read it in: the machine's bug.
+    Unlocated { name: Name },
     UnknownTicket(Ticket),
     /// An answer to a batch that is not out (answered twice, or never sent).
     UnknownBatch(BatchId),
@@ -353,7 +447,6 @@ pub enum DriveError {
     NeedCycle { names: [Option<Name>; 8] },
     /// A task needed itself.
     SelfNeed { name: Name },
-    Task(TaskFailure),
     TooManyJobs { most: u32, name: Name },
     /// A step after the answer.
     Finished,
@@ -375,7 +468,7 @@ impl fmt::Display for DriveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DriveError::Wire { key, error } => write!(f, "the record at {key}: {error}"),
-            DriveError::LastFile(error) => write!(f, "the checkout's last answer: {error}; remove .blaze/v2/last to start over"),
+            DriveError::LastFile(error) => write!(f, "the checkout's last answer .blaze/v2/last, of this build's form, is malformed: {error}"),
             DriveError::Unsorted { what } => write!(f, "{what} handed unsorted (drive.md: the sweep sorts by path)"),
             DriveError::NoFile { file, home } => write!(f, "{home} lists the file {file}, which is not in the checkout"),
             DriveError::NoPart { name, home } => write!(f, "a task wanted {name} of {home}, which does not list it"),
@@ -385,6 +478,8 @@ impl fmt::Display for DriveError {
             },
             DriveError::WrongRecord { key, asked, held } => write!(f, "the record at {key} is {held}'s, asked as {asked}'s (rule 21: a key covers every input)"),
             DriveError::UnaskedOutput { name, by } => write!(f, "{by} answered a record of {name}, which no job asked"),
+            DriveError::UnaskedOpen { file } => write!(f, "the file {file} was answered as opened, and no `Open` of it is waiting"),
+            DriveError::Unlocated { name } => write!(f, "the file {name} settled with no edition to read it in (blaze-drive's bug)"),
             DriveError::UnknownTicket(ticket) => write!(f, "an answer to run {}, which is not out in that batch", ticket.0),
             DriveError::UnknownBatch(batch) => write!(f, "an answer to batch {}, which is not out (a batch is answered once)", batch.0),
             DriveError::UnaskedGet(key) => write!(f, "an answer to a get of {key}, which is not out"),
@@ -403,7 +498,6 @@ impl fmt::Display for DriveError {
                 Ok(())
             }
             DriveError::SelfNeed { name } => write!(f, "{name} needed itself"),
-            DriveError::Task(failure) => write!(f, "{}: {} ({})", failure.name, failure.what, failure.rule),
             DriveError::TooManyJobs { most, name } => write!(f, "more than {most} jobs, at {name} (rule 18)"),
             DriveError::Finished => write!(f, "a step after the request answered"),
             DriveError::NoProgram => write!(f, "a program's exit, with no program running"),
@@ -431,6 +525,7 @@ soa! {
         path_at: u32 => path_ats / path_ats_mut,
         path_len: u32 => path_lens / path_lens_mut,
         changed: bool => changeds / changeds_mut,
+        manifest: bool => manifests / manifests_mut,
     }
 }
 
@@ -549,9 +644,25 @@ pub struct Request<'a> {
     phase: Phase,
     profile: Profile,
 
+    /// The files held, in the order they joined (`Start`'s, then each `Opened`): a row's index is
+    /// stable for the request ([`Task::file`]).
     files: FileRows<Alloc<'a>>,
+    /// A file's name ([`Name::file`]) to its row.
+    file_at: Table<Name, u32, Alloc<'a>>,
+    /// The paths of the files and of the parts' files ([`PathOf`]), in one buffer.
     paths: Vec<u8, Alloc<'a>>,
+    /// A `Locate::File` part's path (at, len in `paths`) and whether it is a module slot.
+    part_paths: Table<Name, (u32, u32, bool), Alloc<'a>>,
+    /// Files asked for by [`Effect::Open`] and not answered yet: the jobs that wait on each.
+    opening: Table<Name, Vec<Name, Alloc<'a>>, Alloc<'a>>,
+    /// Files opened and found absent.
+    absent_files: Set<Name, Alloc<'a>>,
+    /// No leaf table: no certificate is looked up, and `files` is not an answer's read set.
+    cold: bool,
     gone: Vec<ContentId, Alloc<'a>>,
+    /// The `UnitGraph` job's source `Start` gave (`unit_graph_task::source`): its one job at
+    /// `begin`, which asks `Fetch` for each level's sources as it reaches them.
+    graph: Option<ContentId>,
     cert: Key,
     last: Option<Last>,
     forward: bool,
@@ -601,6 +712,9 @@ pub struct Request<'a> {
     old_findings: SortedMap<Name, Held<'a>, Alloc<'a>>,
     old_findings_loading: bool,
     units_at: Option<Key>,
+    /// Every `Units` job this run, in the order added: a file no answer holds and no record
+    /// listed yet waits on one still open, as a member's units may list it.
+    units_jobs: AVec<'a, Name>,
 
     gate: Gate,
     /// The class the walk's jobs take: `Gate` beside a running program, else the person's.
@@ -610,6 +724,8 @@ pub struct Request<'a> {
     held: Option<Answer>,
     /// Error-level findings settled this run.
     errors: u32,
+    /// Tasks that failed this run, in the order they came (rule 20: each fails its own job).
+    failures: Vec<TaskFailure, Alloc<'a>>,
 
     /// The request's space, owned (the caller's borrow ends with the constructor).
     space_values: Vec<u16, Alloc<'a>>,
@@ -646,10 +762,10 @@ enum Program {
 
 /// The digest domain of a request's shape.
 const SHAPE_DOMAIN: &str = "blaze-drive request shape 1";
-const UNITS_SOURCE_DOMAIN: &str = "blaze-drive units source 1";
 const GROUP_DOMAIN: &str = "blaze-drive group 1";
 /// 2: each finding's item carries its base and condition.
-const CERT_MAGIC: &[u8; 4] = b"BDC2";
+/// BDC3: the answer's root first. BDC2 had none.
+pub(crate) const CERT_MAGIC: &[u8; 4] = b"BDC3";
 
 impl<'a> Request<'a> {
     pub fn new_in(config: Config, ask: Ask<'_>, alloc: Alloc<'a>) -> Request<'a> {
@@ -681,8 +797,14 @@ impl<'a> Request<'a> {
             phase: Phase::Idle,
             profile: Profile::default(),
             files: FileRows::new_in(a.clone()),
+            file_at: Table::new_in(a.clone()),
             paths: Vec::new_in(a.clone()),
+            part_paths: Table::new_in(a.clone()),
+            opening: Table::new_in(a.clone()),
+            absent_files: Set::new_in(a.clone()),
+            cold: false,
             gone: Vec::new_in(a.clone()),
+            graph: None,
             cert: Key::default(),
             last: None,
             forward: false,
@@ -719,6 +841,7 @@ impl<'a> Request<'a> {
             old_findings: SortedMap::new_in(a.clone()),
             old_findings_loading: false,
             units_at: None,
+            units_jobs: Vec::new_in(a.clone()),
             gate: ask.gate,
             walk: match (ask.command, ask.gate) {
                 (Command::Run | Command::Test, Gate::Beside) => Class::Gate,
@@ -727,8 +850,28 @@ impl<'a> Request<'a> {
             program: Program::Unstarted,
             held: None,
             errors: 0,
+            failures: Vec::new_in(alloc.clone()),
             alloc,
         }
+    }
+
+    /// The tasks that failed this run, in the order they came.
+    pub fn failures(&self) -> &[TaskFailure] {
+        &self.failures
+    }
+
+    fn failed(&self) -> u32 {
+        u32::try_from(self.failures.len()).unwrap_or(u32::MAX)
+    }
+
+    /// The path of the file a task is about or in: a `FileItems` task's own, else its home's
+    /// when that is a file (an item's task); `None` for a manifest's or a crate's.
+    pub fn file_of(&self, task: &Task<'_>) -> Option<&[u8]> {
+        if let Some(index) = task.file {
+            return Some(self.path(index));
+        }
+        let index = self.file_index(&file_of(task.base, task.home).subject)?;
+        Some(self.path(u32::try_from(index).ok()?))
     }
 
     /// `run` or `test`: a program is part of the answer.
@@ -739,7 +882,12 @@ impl<'a> Request<'a> {
     /// The units are known: under `Beside` and `Reached` the program starts now, unless an
     /// error is already found.
     fn units_known(&mut self, at: Key, out: &mut AVec<'_, Effect<'a>>) {
-        if self.runs_program() && self.gate != Gate::Before && self.program == Program::Unstarted && self.errors == 0 {
+        if self.runs_program()
+            && self.gate != Gate::Before
+            && self.program == Program::Unstarted
+            && self.errors == 0
+            && self.failures.is_empty()
+        {
             self.program = Program::Running;
             out.push(Effect::StartProgram { units: at });
         }
@@ -764,13 +912,12 @@ impl<'a> Request<'a> {
             Program::Running | Program::Stopped => {}
             Program::Unstarted | Program::Ended { .. } => return Err(DriveError::NoProgram),
         }
-        if self.program == Program::Running {
-            self.program = Program::Ended { ok };
-        }
+        // Stopped or not, it has ended now: what `conclude` waits for.
+        self.program = Program::Ended { ok };
         if self.plant == Plant::EarlySuccess && ok && self.phase != Phase::Held {
             // The planted bug: success reported at the program's exit, the gate's work not done.
             self.phase = Phase::Answered;
-            let answer = Answer { profile: self.profile, verdict: Verdict::Passed, findings: self.errors, units: self.units_at };
+            let answer = Answer { profile: self.profile, verdict: Verdict::Passed, findings: self.errors, units: self.units_at, failed: self.failed() };
             out.push(Effect::Done(answer));
             return Ok(());
         }
@@ -778,7 +925,7 @@ impl<'a> Request<'a> {
             // Only what ran was checked: the verdict is the program's, said as such.
             self.phase = Phase::Answered;
             let verdict = if ok { Verdict::PassedReached } else { Verdict::ProgramFailed };
-            out.push(Effect::Done(Answer { profile: self.profile, verdict, findings: self.errors, units: self.units_at }));
+            out.push(Effect::Done(Answer { profile: self.profile, verdict, findings: self.errors, units: self.units_at, failed: self.failed() }));
             return Ok(());
         }
         self.conclude(out);
@@ -792,7 +939,15 @@ impl<'a> Request<'a> {
         let started = self.program != Program::Unstarted;
         let verdict = match (self.runs_program(), self.program) {
             (false, _) => Verdict::Checked,
-            _ if self.errors > 0 => Verdict::Failed { errors: self.errors, started },
+            // A started program is waited for, stopped or not: its `Exited` is the last event,
+            // and the answer comes after it. Answering first left the caller holding a start it
+            // had not performed, and its exit stepped an answered machine (`blaze run` after
+            // `blaze check` with a stood error, 2026-11-16: "a step after the request answered").
+            (true, Program::Running | Program::Stopped) if self.plant != Plant::AnswerWhileRunning => return,
+            // A failed task is a scope not checked: no success is reported over it.
+            _ if self.errors > 0 || !self.failures.is_empty() => Verdict::Failed { errors: self.errors, started },
+            // Only under the plant: a running program without an error is still waited for.
+            (true, Program::Running | Program::Stopped) => return,
             (true, Program::Unstarted) => {
                 // Before: the check is clean, the program starts now.
                 let units = answer.units.unwrap_or_default();
@@ -800,15 +955,35 @@ impl<'a> Request<'a> {
                 out.push(Effect::StartProgram { units });
                 return;
             }
-            (true, Program::Running) => return,
             (true, Program::Ended { ok: true }) => Verdict::Passed,
-            (true, Program::Ended { ok: false } | Program::Stopped) => Verdict::ProgramFailed,
+            (true, Program::Ended { ok: false }) => Verdict::ProgramFailed,
         };
         answer.verdict = verdict;
         answer.profile = self.profile;
+        answer.failed = self.failed();
         self.held = None;
         self.phase = Phase::Answered;
         out.push(Effect::Done(answer));
+    }
+
+    /// An `Open` answered: the file joins the table (new to this answer, so `changed`) or is
+    /// absent; the jobs that waited on it go on.
+    fn opened(&mut self, name: Name, id: Option<ContentId>) -> Result<(), DriveError> {
+        let waiters = self.opening.remove(&name).ok_or(DriveError::UnaskedOpen { file: name })?;
+        let (at, len, _) = *self.part_paths.get(&name).expect("an opened file's path was a part's");
+        match id {
+            Some(id) => {
+                let path = Vec::from_slice_in(&self.paths[at as usize..(at + len) as usize], self.alloc);
+                self.add_file(&path, id, true, false);
+            }
+            None => {
+                self.absent_files.insert(name);
+            }
+        }
+        for waiter in waiters.iter() {
+            self.wake.push_back(*waiter);
+        }
+        Ok(())
     }
 
     /// The running program waits on `want`: its job runs in the person's class.
@@ -856,7 +1031,11 @@ impl<'a> Request<'a> {
         }
         self.profile.steps += 1;
         match event {
-            Event::Start { files, gone, last } => self.start(files, gone, last, out)?,
+            Event::Start { files, gone, last, units, cold, graph } => {
+                self.graph = graph;
+                self.start(files, gone, last, units, cold, out)?
+            }
+            Event::Opened { name, id } => self.opened(name, id)?,
             Event::Got { key, bytes } => self.got(key, bytes, out)?,
             Event::Ran { batch, results } => self.ran_batch(batch, results, out)?,
             Event::Want(want) => self.wanted(want)?,
@@ -929,6 +1108,8 @@ impl<'a> Request<'a> {
         files: &[FileEntry<'_>],
         gone: &[&[u8]],
         last: Option<&[u8]>,
+        units: ContentId,
+        cold: bool,
         out: &mut AVec<'_, Effect<'a>>,
     ) -> Result<(), DriveError> {
         if files.windows(2).any(|w| w[0].path >= w[1].path) {
@@ -937,37 +1118,71 @@ impl<'a> Request<'a> {
         if !self.space_closed {
             return Err(DriveError::SpaceNotClosed);
         }
-        let mut units = Hasher::new(UNITS_SOURCE_DOMAIN);
-        let mut rows = Vec::with_capacity_in(files.len(), self.alloc);
         for file in files {
-            if file.manifest {
-                units.part(file.path).id(&file.id);
-            }
-            let at = u32::try_from(self.paths.len()).expect("the checkout's paths fit 4 GiB");
-            self.paths.extend_from_slice(file.path);
-            let len = u32::try_from(file.path.len()).expect("a path fits 4 GiB");
-            rows.push(FileRow { subject: Name::file(file.path).subject, id: file.id, path_at: at, path_len: len, changed: file.changed });
-        }
-        // Sorted by subject, the way a job finds its file.
-        rows.sort_unstable_by_key(|row| row.subject);
-        for row in rows {
-            self.files.push(row);
+            self.add_file(file.path, file.id, file.changed, file.manifest);
         }
         for path in gone {
             self.gone.push(Name::file(path).subject);
         }
-        self.units_source = units.finish();
-        let mut command = [0u8; 33];
-        command[0] = self.command.byte();
-        command[1..].copy_from_slice(&self.shape_digest.0);
-        self.cert = key::cert_key(self.config.tool, &command, files.iter().map(|f| (f.path, &f.id)));
+        // The root units' source (drive.md, "Units"): what the workspace's layout read, as the
+        // cli found it today (each manifest, each manifest probed absent, each listing).
+        self.units_source = units;
+        self.cold = cold;
+        self.cert = self.cert_of(files.iter().map(|f| (f.path, &f.id)));
         self.last = match last {
             None => None,
             Some(bytes) => Some(answers::read_last(bytes).map_err(DriveError::LastFile)?),
         };
+        if cold {
+            // No leaf table: the files are not an answer's read set, so no certificate is keyed
+            // by them. The one written at the finish is keyed by the files the answer read.
+            return self.begin(out);
+        }
         self.phase = Phase::Certifying;
         self.get(self.cert, Purpose::Cert, out);
         Ok(())
+    }
+
+    /// The certificate key of `files` (sorted by path): the tool, the command and its shape, the
+    /// units' source, and each (path, id).
+    fn cert_of<'p>(&self, files: impl Iterator<Item = (&'p [u8], &'p ContentId)>) -> Key {
+        let mut command = [0u8; 65];
+        command[0] = self.command.byte();
+        command[1..33].copy_from_slice(&self.shape_digest.0);
+        command[33..].copy_from_slice(&self.units_source.0);
+        key::cert_key(self.config.tool, &command, files)
+    }
+
+    /// A file joins the table: `Start`'s, or an `Opened` one.
+    fn add_file(&mut self, path: &[u8], id: ContentId, changed: bool, manifest: bool) {
+        let name = Name::file(path);
+        let at = u32::try_from(self.paths.len()).expect("the checkout's paths fit 4 GiB");
+        self.paths.extend_from_slice(path);
+        let len = u32::try_from(path.len()).expect("a path fits 4 GiB");
+        let index = u32::try_from(self.files.len()).expect("the checkout's files fit u32");
+        self.files.push(FileRow { subject: name.subject, id, path_at: at, path_len: len, changed, manifest });
+        self.file_at.insert(name, index);
+    }
+
+    /// Whether the answer reads the file at `path`: it was in the last answer's read set and
+    /// stands, or this run settled its job; and no home dropped it. A manifest is the layout's,
+    /// held while it is. What the cli's leaf table keeps (drive.md, "The system side").
+    pub fn holds(&self, path: &[u8]) -> bool {
+        let name = Name::file(path);
+        let Some(&index) = self.file_at.get(&name) else { return false };
+        let i = index as usize;
+        // A certificate's key is every file of the checkout by path and content: on a hit
+        // (an undo back to a certified tree among them) each file it names is held as it is now,
+        // changed since `last` or not, though nothing was walked. Dropping a changed one here
+        // left it out of the leaf table, and the next request's walk met its part with no file
+        // (`NoFile`, tempo, 2026-11-16).
+        if self.files.manifests()[i] || self.profile.certified {
+            return true;
+        }
+        if self.dropped.contains(&name) {
+            return false;
+        }
+        self.now.contains_key(&name) || !self.files.changeds()[i]
     }
 
     /// The certificate missed: start the walk.
@@ -980,30 +1195,60 @@ impl<'a> Request<'a> {
             self.get(last.root, Purpose::Root, out);
             self.old_findings_loading = true;
             self.get(last.cert, Purpose::OldCert, out);
-            self.forward = last.shape == self.shape_digest && last.units == self.units_source;
+            self.forward = last.shape == self.shape_digest;
         }
         if self.forward {
+            // A changed or gone file seeds its outline. A seed no answer holds is outside the
+            // build and goes (`locate`). A manifest is read by the layout alone: its change
+            // moves the units' source, which re-makes the root units below, and the root's
+            // record re-locates each member's units by its share.
             let mut seeds = Vec::new_in(self.alloc);
-            for (subject, changed) in self.files.subjects().iter().zip(self.files.changeds()) {
-                if *changed {
-                    seeds.push(*subject);
+            let rows = self.files.subjects().iter().zip(self.files.changeds()).zip(self.files.manifests());
+            for ((subject, changed), manifest) in rows {
+                if *changed && !*manifest {
+                    seeds.push(Name::new(Kind::FileItems, *subject));
                 }
             }
-            seeds.extend_from_slice(&self.gone);
-            for subject in seeds.iter() {
-                let name = Name::new(Kind::FileItems, *subject);
-                self.add_job(name, name, None, true, self.walk)?;
+            for subject in self.gone.iter() {
+                seeds.push(Name::new(Kind::FileItems, *subject));
+            }
+            for name in seeds.iter() {
+                self.add_job(*name, *name, None, true, self.walk)?;
+            }
+            // What the layout read moved: the units are read again (parts that stand cost no read).
+            if self.last.is_some_and(|last| last.units != self.units_source) {
+                self.add_root_units()?;
             }
         } else {
-            let units = Name::units();
-            self.add_job(units, units, Some(Locate::Source(self.units_source)), false, Class::Foreground)?;
+            self.add_root_units()?;
+        }
+        // The dependency graph, ahead of what reads it (unit_graph_task.rs): a graph whose
+        // record stands costs one get; one the store lacks asks `Fetch` for what it reaches.
+        if let Some(source) = self.graph.take() {
+            let name = Name::unit_graph();
+            self.add_job(name, name, Some(Locate::Source(source)), false, Class::Foreground)?;
         }
         Ok(())
     }
 
+    /// The root units' job, located by today's source: never by its row, whose source is the
+    /// last answer's.
+    fn add_root_units(&mut self) -> Result<(), DriveError> {
+        let units = Name::units();
+        self.add_job(units, units, Some(Locate::Source(self.units_source)), false, Class::Foreground)
+    }
+
     fn certified(&mut self, bytes: &[u8], out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
-        let (units, held) = read_cert(bytes, self.alloc).map_err(|error| DriveError::Wire { key: self.cert, error })?;
+        let (root, units, held) = read_cert(bytes, self.alloc).map_err(|error| DriveError::Wire { key: self.cert, error })?;
         self.profile.certified = true;
+        // A `last` that names another answer (none, an older form's, or the tree's before an
+        // undo) is replaced by this one's, so the next edit walks forward from this answer and
+        // the leaf table written beside it matches the tree.
+        let tool = self.config.tool.0;
+        if self.last.is_none_or(|last| last.cert != self.cert || last.tool != tool || last.root != root) {
+            let last = Last { tool, shape: self.shape_digest, units: self.units_source, cert: self.cert, root };
+            out.push(Effect::WriteLast { bytes: answers::write_last(&last, self.alloc) });
+        }
         let count = self.print(&held, out);
         let is_error = self.config.is_error;
         let errors = held.values().flat_map(|entry| entry.findings.iter()).filter(|f| is_error(f.rule)).count();
@@ -1011,7 +1256,7 @@ impl<'a> Request<'a> {
         self.units_at = units;
         // The repeat: the walk stands whole. A stored error refuses the start at this one read
         // (every gate); a clean one starts the program now, nothing left to check beside it.
-        self.held = Some(Answer { profile: self.profile, verdict: Verdict::Checked, findings: count, units });
+        self.held = Some(Answer { profile: self.profile, verdict: Verdict::Checked, findings: count, units, failed: 0 });
         self.phase = Phase::Held;
         if self.runs_program() && self.errors == 0 {
             match units {
@@ -1060,7 +1305,7 @@ impl<'a> Request<'a> {
                 Purpose::OldCert => {
                     self.old_findings_loading = false;
                     if let Some(bytes) = bytes {
-                        self.old_findings = read_cert(bytes, self.alloc).map_err(|error| DriveError::Wire { key, error })?.1;
+                        self.old_findings = read_cert(bytes, self.alloc).map_err(|error| DriveError::Wire { key, error })?.2;
                     }
                 }
                 Purpose::Root => {
@@ -1076,8 +1321,7 @@ impl<'a> Request<'a> {
                         self.last = None;
                         if self.forward {
                             self.forward = false;
-                            let units = Name::units();
-                            self.add_job(units, units, Some(Locate::Source(self.units_source)), false, Class::Foreground)?;
+                            self.add_root_units()?;
                         }
                     }
                     let waiters = core::mem::replace(&mut self.root_waiters, Vec::new_in(self.alloc));
@@ -1119,13 +1363,18 @@ impl<'a> Request<'a> {
         // A run of a name its home dropped while it was out answers for nothing in the build:
         // not an error, and not quietly kept (its record is not written, its row is gone).
         if self.dropped.contains(&name) {
-            return match ran {
-                Ran::Failed(failure) => Err(DriveError::Task(*failure)),
-                Ran::Done(_) | Ran::Need(_) | Ran::Cfg(_) => Ok(()),
-            };
+            return Ok(());
         }
         match *ran {
-            Ran::Failed(failure) => Err(DriveError::Task(failure)),
+            // Rule 20: the job settles with no record (a read of it sees none), its waiters go
+            // on, and the answer is not written (`finish`), so the next command runs it again.
+            Ran::Failed(failure) => {
+                self.failures.push(failure);
+                self.now.remove(&name);
+                self.set_state(name, State::Settled);
+                self.wake_waiters(name);
+                Ok(())
+            }
             Ran::Cfg(var) => {
                 self.profile.of(name.kind).needs += 1;
                 self.split(name, var, out)
@@ -1157,7 +1406,9 @@ impl<'a> Request<'a> {
                     }
                     if !self.jobs.contains_key(&want.name) {
                         let class = self.jobs.get(&name).map_or(self.walk, |job| job.class);
-                        self.add_job(want.name, want.home, None, false, class)?;
+                        // A name whose subject is its source is located by it, never by a home.
+                        let locate = want.name.located_by_subject().then_some(Locate::Source(want.name.subject));
+                        self.add_job(want.name, want.home, locate, false, class)?;
                     } else if self.plant == Plant::DoubleFlight
                         && self.jobs.get(&want.name).is_some_and(|job| job.state == State::Running)
                     {
@@ -1211,8 +1462,16 @@ impl<'a> Request<'a> {
                 members: Vec::new_in(a),
             },
         );
+        if name.kind == Kind::Units {
+            self.units_jobs.push(name);
+        }
         self.wake.push_back(name);
         Ok(())
+    }
+
+    /// A `Units` job not settled yet: what lists files may still list a file wanted now.
+    fn units_open(&self) -> Option<Name> {
+        self.units_jobs.iter().copied().find(|units| self.state(*units).is_some_and(|s| s != State::Settled))
     }
 
     /// Every state change goes here, so the settled count is kept without a scan.
@@ -1350,6 +1609,7 @@ impl<'a> Request<'a> {
                 out: key::digest("blaze-drive over cap 1", &message[..len]),
                 reads: &space_read,
                 parts: &[],
+                paths: &[],
                 findings: &findings,
                 payload: &[],
             };
@@ -1366,7 +1626,7 @@ impl<'a> Request<'a> {
             parts.push(Part { name: *fork, locate, place });
             h.update(&[fork.kind as u8]).id(&fork.subject);
         }
-        let output = Output { name, out: h.finish(), reads: &space_read, parts: &parts, findings: &[], payload: &[] };
+        let output = Output { name, out: h.finish(), reads: &space_read, parts: &parts, paths: &[], findings: &[], payload: &[] };
         self.made_split(&output, Some(var), out)
     }
 
@@ -1507,7 +1767,7 @@ impl<'a> Request<'a> {
     }
 
     fn file_index(&self, subject: &ContentId) -> Option<usize> {
-        self.files.subjects().binary_search(subject).ok()
+        self.file_at.get(&Name::new(Kind::FileItems, *subject)).map(|i| *i as usize)
     }
 
     fn pump(&mut self, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
@@ -1533,7 +1793,23 @@ impl<'a> Request<'a> {
     }
 
     fn quiet(&self) -> bool {
-        self.wake.is_empty() && self.gets.is_empty() && self.tickets.is_empty() && self.queued == 0
+        self.wake.is_empty() && self.gets.is_empty() && self.tickets.is_empty() && self.queued == 0 && self.opening.is_empty()
+    }
+
+    /// `waiter` waits on the file `file`, opening it if no one has yet: `Open` is emitted once.
+    /// `false` when the path is not known (no part this run gave one).
+    fn wait_on_open(&mut self, file: Name, waiter: Name, out: &mut AVec<'_, Effect<'a>>) -> bool {
+        let Some(&(at, len, module)) = self.part_paths.get(&file) else { return false };
+        if !self.opening.contains_key(&file) {
+            let path = Vec::from_slice_in(&self.paths[at as usize..(at + len) as usize], self.alloc);
+            out.push(Effect::Open { name: file, path, module });
+            self.opening.insert(file, Vec::new_in(self.alloc));
+            self.profile.opens += 1;
+        }
+        if self.park(waiter) {
+            self.opening.get_mut(&file).expect("inserted above").push(waiter);
+        }
+        true
     }
 
     /// Queue a job to run: its class's ring of its kind, at the back.
@@ -1638,6 +1914,7 @@ impl<'a> Request<'a> {
         self.next_ticket += 1;
         let a = self.alloc;
         let mut inputs = Vec::new_in(a.clone());
+        let mut failed = Vec::new_in(a.clone());
         let mut members = Vec::new_in(a.clone());
         let (base, condition) = self.cond_of(name);
         let job = self.jobs.get(&name).expect("a queued job is a job");
@@ -1645,21 +1922,24 @@ impl<'a> Request<'a> {
             // Handed by its base name, with what the record the task's condition implies
             // holds (`gather` waited for every node on the way).
             let leaf = self.resolve_settled(*need, &condition);
-            if let Some(now) = self.now.get(&leaf).copied().or_else(|| self.old(leaf).map(|row| Now { at: row.at, out: row.out })) {
-                inputs.push(Input { name: self.cond_of(*need).0, at: now.at, out: now.out });
+            match self.now.get(&leaf).copied().or_else(|| self.old(leaf).map(|row| Now { at: row.at, out: row.out })) {
+                Some(now) => inputs.push(Input { name: self.cond_of(*need).0, at: now.at, out: now.out }),
+                // Settled with no record: its task failed this command (rule 20).
+                None => failed.push(self.cond_of(*need).0),
             }
         }
         inputs.sort_unstable_by_key(|input| input.name);
         inputs.dedup_by_key(|input| input.name);
+        failed.sort_unstable();
+        failed.dedup();
         members.extend_from_slice(&job.members);
         let edition = match job.locate {
             Some(Locate::File { edition }) => edition,
             _ => 0,
         };
-        let file = match name.kind {
-            Kind::FileItems => self.file_index(&base.subject).map(|i| i as u32),
-            _ => None,
-        };
+        // A file's outline and a manifest's units read their file; the root units read the root
+        // manifest.
+        let file = base.text_file().and_then(|file| self.file_index(&file.subject)).map(|i| i as u32);
         let task = Task {
             name,
             base,
@@ -1673,6 +1953,7 @@ impl<'a> Request<'a> {
             file,
             edition,
             inputs,
+            failed,
             members,
         };
         let job = self.jobs.get_mut(&name).expect("a queued job is a job");
@@ -1723,10 +2004,24 @@ impl<'a> Request<'a> {
                 self.wait_on(home, name);
                 return Ok(());
             }
+            // Its home failed this command (rule 20): it lists nothing today, and a row of last
+            // time's text is not today's. The part fails `Waited` on it, alone: its waiters see
+            // it in `Task::failed` and fail in turn; the request goes on.
+            if home != name && self.state(home) == Some(State::Settled) && self.failures.iter().any(|failure| failure.name == home) {
+                self.failures.push(TaskFailure { name, why: Why::Waited { on: home } });
+                self.now.remove(&name);
+                self.set_state(name, State::Settled);
+                self.wake_waiters(name);
+                return Ok(());
+            }
             match self.old(name).map(|row| (row.source, row.place, row.home)) {
                 Some((source, at, by)) => {
+                    // A file's text is found by today's sweep, never by the row's source.
                     locate = Some(match name.kind {
                         Kind::FileItems => Locate::File { edition: at as u8 },
+                        Kind::Units if name == Name::units() => Locate::Source(self.units_source),
+                        // A member's units are found by their share of the layout, which the
+                        // root's record lists ([`Locate::Source`]): the row's is the last one's.
                         _ => Locate::Source(source),
                     });
                     place = at;
@@ -1744,7 +2039,15 @@ impl<'a> Request<'a> {
                     self.wait_on(home, name);
                     return Ok(());
                 }
-                None => return Err(DriveError::NoPart { name, home }),
+                // A workspace's member units list their files after the root lists them: a file
+                // wanted before then waits for them; with every units settled it is no part.
+                None => match self.units_open() {
+                    Some(units) => {
+                        self.wait_on(units, name);
+                        return Ok(());
+                    }
+                    None => return Err(DriveError::NoPart { name, home }),
+                },
             }
         }
         let locate = locate.expect("found above");
@@ -1756,6 +2059,12 @@ impl<'a> Request<'a> {
                 Some(index) => {
                     let source = key::file_source(self.files.ids()[index], edition);
                     (source, key::task_key(self.config.tool, name, &source))
+                }
+                // A file the request does not hold yet, its path named by a part: open it.
+                None if !self.absent_files.contains(&Name::new(Kind::FileItems, self.cond_of(name).0.subject))
+                    && self.wait_on_open(Name::new(Kind::FileItems, self.cond_of(name).0.subject), name, out) =>
+                {
+                    return Ok(());
                 }
                 // A file gone from the checkout: an error only if its home, decided this run,
                 // still lists it; a home re-made without it drops it first.
@@ -1987,6 +2296,7 @@ impl<'a> Request<'a> {
             out: output.out,
             reads: &reads,
             parts: output.parts,
+            paths: output.paths,
             findings: output.findings,
             payload: output.payload,
             split,
@@ -2022,7 +2332,16 @@ impl<'a> Request<'a> {
         let a = self.alloc;
         let before = self.now.get(&name).copied().or_else(|| self.old(name).map(|row| Now { at: row.at, out: row.out }));
         let job = self.jobs.get(&name).expect("a job");
-        let (key, source, home, place, settles) = (job.key, job.source, job.home, job.place, job.settles);
+        let (key, source, home, settles) = (job.key, job.source, job.home, job.settles);
+        // A file's row keeps the edition it is read in (a repeat that does not run its home finds
+        // it there, [`Request::locate`]); its findings are placed in its own text, from 0. Any
+        // other name's row and findings keep its start in its home's file.
+        let (place, held_place) = match (name.kind, job.locate) {
+            (Kind::FileItems, Some(Locate::File { .. })) if self.plant == Plant::EditionAsPlace => (job.place, job.place),
+            (Kind::FileItems, Some(Locate::File { edition })) => (u32::from(edition), 0),
+            (Kind::FileItems, _) => return Err(DriveError::Unlocated { name }),
+            _ => (job.place, job.place),
+        };
         if settles >= self.config.most_entries {
             let mut last_needs = [None; 4];
             for (slot, need) in last_needs.iter_mut().zip(job.needs.iter()) {
@@ -2058,6 +2377,16 @@ impl<'a> Request<'a> {
                     parts.push(part.name);
                     self.part_locs.insert(part.name, (part.locate, part.place, name));
                 }
+                // Where each file part's file is, for one the request does not hold yet.
+                for path in view.paths() {
+                    let file = Name::file(path.path);
+                    if !self.file_at.contains_key(&file) && !self.part_paths.contains_key(&file) {
+                        let at = u32::try_from(self.paths.len()).expect("the checkout's paths fit 4 GiB");
+                        self.paths.extend_from_slice(path.path);
+                        let len = u32::try_from(path.path.len()).expect("a path fits 4 GiB");
+                        self.part_paths.insert(file, (at, len, path.module));
+                    }
+                }
                 parts.sort_unstable();
                 parts_now.extend_from_slice(&parts);
                 for gone in old_parts.iter() {
@@ -2076,7 +2405,7 @@ impl<'a> Request<'a> {
                         }
                     }
                 }
-                let held = Held { file: file_of(base, home), place, base, condition, findings: hold(view, a.clone()) };
+                let held = Held { file: file_of(base, home), place: held_place, base, condition, findings: hold(view, a.clone()) };
                 let is_error = self.config.is_error;
                 let errors = held.findings.iter().filter(|f| is_error(f.rule)).count();
                 self.findings.insert(name, held);
@@ -2090,8 +2419,8 @@ impl<'a> Request<'a> {
         };
         self.now.insert(name, now);
         self.dropped.remove(&name);
-        if name.kind == Kind::Units {
-            // Standing or made, the units' record is where the program's entry is.
+        if name == Name::units() {
+            // Standing or made, the root units' record is where the program's entry is.
             self.units_at = Some(now.at);
             self.units_known(now.at, out);
         }
@@ -2513,16 +2842,34 @@ impl<'a> Request<'a> {
             }
         }
         let units = self.units_at.or_else(|| self.old(Name::units()).map(|row| row.at));
-        let cert = write_cert(&all, units, a.clone());
-        self.put(self.cert, cert, out);
-        let last = Last {
-            tool: self.config.tool.0,
-            shape: self.shape_digest,
-            units: self.units_source,
-            cert: self.cert,
-            root: root_key,
-        };
-        out.push(Effect::WriteLast { bytes: answers::write_last(&last, a) });
+        let cert = write_cert(&all, root_key, units, a.clone());
+        // Keyed by the files this answer read, the leaf table the cli writes beside it: the next
+        // request's `Start` hands exactly these when none changed (`Request::holds`).
+        let mut held_files = Vec::with_capacity_in(self.files.len(), a.clone());
+        for i in 0..self.files.len() {
+            let path = self.path(i as u32);
+            if self.holds(path) {
+                held_files.push((path, self.files.ids()[i]));
+            }
+        }
+        held_files.sort_unstable_by(|x, y| x.0.cmp(y.0));
+        let read = self.cert_of(held_files.iter().map(|(path, id)| (*path, id)));
+        drop(held_files);
+        // A failed task leaves a hole in the answer: neither the certificate nor `last` is
+        // written, so the next command walks from the last whole answer and runs it again.
+        // The records this run made stay in the store under their keys and are found there.
+        if self.failures.is_empty() {
+            self.cert = read;
+            self.put(self.cert, cert, out);
+            let last = Last {
+                tool: self.config.tool.0,
+                shape: self.shape_digest,
+                units: self.units_source,
+                cert: self.cert,
+                root: root_key,
+            };
+            out.push(Effect::WriteLast { bytes: answers::write_last(&last, a) });
+        }
         let count = self.print(&all, out);
         // Every finding of the answer counts, the stood ones too: an unchanged item's error is
         // still an error of the scope.
@@ -2533,7 +2880,7 @@ impl<'a> Request<'a> {
             self.program = Program::Stopped;
             out.push(Effect::Stop { errors: self.errors });
         }
-        self.held = Some(Answer { profile: self.profile, verdict: Verdict::Checked, findings: count, units });
+        self.held = Some(Answer { profile: self.profile, verdict: Verdict::Checked, findings: count, units, failed: self.failed() });
         self.phase = Phase::Held;
         self.conclude(out);
         Ok(())
@@ -2602,10 +2949,8 @@ fn over_cap_message(buf: &mut [u8; MESSAGE_BYTES], span: u32, under: &Condition,
 }
 
 fn file_of(name: Name, home: Name) -> Name {
-    match name.kind {
-        Kind::FileItems => name,
-        _ => home,
-    }
+    // A manifest's units are read from that manifest: their findings are on its lines.
+    name.text_file().unwrap_or(home)
 }
 
 fn hold<'a>(view: &WholeView<'_>, alloc: Alloc<'a>) -> Vec<HeldFinding<'a>, Alloc<'a>> {
@@ -2618,10 +2963,11 @@ fn hold<'a>(view: &WholeView<'_>, alloc: Alloc<'a>) -> Vec<HeldFinding<'a>, Allo
     held
 }
 
-/// The certificate: the units' record (so a repeat `run` starts at one read), then every
-/// finding of the answer.
-fn write_cert<'a>(held: &SortedMap<Name, Held<'a>, Alloc<'a>>, units: Option<Key>, alloc: Alloc<'a>) -> Vec<u8, Alloc<'a>> {
+/// The certificate: the answer's root (so one that stands can write `last` naming it), the
+/// units' record (so a repeat `run` starts at one read), then every finding of the answer.
+fn write_cert<'a>(held: &SortedMap<Name, Held<'a>, Alloc<'a>>, root: Key, units: Option<Key>, alloc: Alloc<'a>) -> Vec<u8, Alloc<'a>> {
     let mut w = Writer::new_in(CERT_MAGIC, alloc);
+    w.raw(&root.0.0);
     w.u32(u32::from(units.is_some()));
     w.raw(&units.unwrap_or_default().0.0);
     w.count(held.len());
@@ -2642,10 +2988,14 @@ fn write_cert<'a>(held: &SortedMap<Name, Held<'a>, Alloc<'a>>, units: Option<Key
     w.finish()
 }
 
-type Cert<'a> = (Option<Key>, SortedMap<Name, Held<'a>, Alloc<'a>>);
+/// A certificate read: the answer's root, the units' record, the findings.
+type Cert<'a> = (Key, Option<Key>, SortedMap<Name, Held<'a>, Alloc<'a>>);
 
 fn read_cert<'a>(bytes: &[u8], alloc: Alloc<'a>) -> Result<Cert<'a>, WireError> {
     let mut r = Reader::new(bytes, CERT_MAGIC, "certificate")?;
+    let mut root = [0u8; 32];
+    root.copy_from_slice(r.take_bytes(32)?);
+    let root = Key(ContentId(root));
     let has_units = r.u32()? == 1;
     let mut units = [0u8; 32];
     units.copy_from_slice(r.take_bytes(32)?);
@@ -2673,5 +3023,5 @@ fn read_cert<'a>(bytes: &[u8], alloc: Alloc<'a>) -> Result<Cert<'a>, WireError> 
     }
     r.done()?;
     let held = SortedMap::from_sorted(entries).map_err(|_| r.error(crate::wire::WireWhy::Unsorted))?;
-    Ok((units, held))
+    Ok((root, units, held))
 }

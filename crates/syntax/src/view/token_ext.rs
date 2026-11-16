@@ -107,7 +107,10 @@ impl<'t> AnyComment<'t> {
             // The `*/` may not exist because of recovery.
             text.strip_suffix("*/").unwrap_or(text)
         } else {
-            text
+            // The token ends before its LF, so a CR LF break leaves its CR in it
+            // (parser::line_break).
+            let followed_by_lf = self.syntax.next_token().is_some_and(|it| it.text().starts_with('\n'));
+            parser::line_break::line_comment_text(text, followed_by_lf)
         }
     }
 }

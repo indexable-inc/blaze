@@ -92,7 +92,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     fn is_scalar(&mut self, t: Ty) -> bool {
         self.is_integral(t)
             || self.is_float(t)
-            || matches!(self.view(t), TyView::Bool | TyView::Char | TyView::Ptr(..) | TyView::FnPtr(_))
+            || matches!(self.view(t), TyView::Bool | TyView::Char | TyView::Ptr(..) | TyView::FnPtr(..))
     }
 
     /// `is_builtin_binop`.
@@ -140,7 +140,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
 
     pub(crate) fn expr_assign_op(&mut self, f: Frame, e: ExprId, op: BinOp, lhs: ExprId, rhs: ExprId) -> Result<Flow, Stop> {
         if f.state == 0 {
-            self.check_place(lhs)?;
+            self.check_place_code(lhs, DiagCode::InvalidCompoundLhs)?;
         }
         self.binop(f, e, op, lhs, rhs, true)
     }
@@ -185,10 +185,18 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 f.b = 0;
                 f.a = self.common.err.0;
                 if let Some(item) = op_lang(op, assign) {
-                    if let Some(tr) = self.lang(item)? {
+                    // `f.b == 2`: the world has no `item`; reported at the end unless builtin.
+                    let tr = self.lang(item)?;
+                    if tr.is_none() {
+                        f.b = 2;
+                    }
+                    if let Some(tr) = tr {
                         let args = self.mk_list(&[lhs_ty, rhs_var])?;
                         let goal = Goal::Trait { trait_: tr, args };
-                        if !self.is_ty_var(lhs_ty) && self.ty.may_hold(goal, &mut self.reads)? {
+                        // `lookup_method_in_trait`: only `predicate_may_hold`. A left side that
+                        // is still a variable (`|a, b| a + b`) may hold: the obligation is
+                        // registered ambiguous and `Output` projected, both settled by a later use.
+                        if self.ty.may_hold(goal, &mut self.reads)? {
                             self.register_trait(tr, args, Cause::Expr(e))?;
                             let out = match category(op) {
                                 Category::Comparison => self.common.bool_,
@@ -217,6 +225,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 }
                 if f.b == 1 {
                     return Ok(Flow::Done(out));
+                }
+                if f.b == 2
+                    && let Some(item) = op_lang(op, assign)
+                {
+                    self.missing_lang(item, At::Expr(e));
+                    return Ok(Flow::Done(self.common.err));
                 }
                 if !self.is_err(lhs_ty) {
                     self.diag(DiagCode::BinOp, At::Expr(e), None, Some(lhs_ty), None);
@@ -250,6 +264,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     self.adjust.push((operand, kind, target));
                     return Ok(Flow::Done(target));
                 }
+                if self.need_lang(LangItem::Deref, At::Expr(e))?.is_none() {
+                    return Ok(Flow::Done(self.common.err));
+                }
                 self.diag(DiagCode::CantDeref, At::Expr(e), None, Some(t), None);
                 Ok(Flow::Done(self.common.err))
             }
@@ -263,13 +280,14 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     return Ok(Flow::Done(t));
                 }
                 let item = if op == UnOp::Not { LangItem::Not } else { LangItem::Neg };
-                if let Some(tr) = self.lang(item)? {
-                    let args = self.mk_list(&[t])?;
-                    if self.ty.may_hold(Goal::Trait { trait_: tr, args }, &mut self.reads)? {
-                        self.register_trait(tr, args, Cause::Expr(e))?;
-                        let out = self.project(tr, args, Name::of("Output"), Cause::Expr(e))?;
-                        return Ok(Flow::Done(out));
-                    }
+                let Some(tr) = self.need_lang(item, At::Expr(e))? else {
+                    return Ok(Flow::Done(self.common.err));
+                };
+                let args = self.mk_list(&[t])?;
+                if self.ty.may_hold(Goal::Trait { trait_: tr, args }, &mut self.reads)? {
+                    self.register_trait(tr, args, Cause::Expr(e))?;
+                    let out = self.project(tr, args, Name::of("Output"), Cause::Expr(e))?;
+                    return Ok(Flow::Done(out));
                 }
                 self.diag(DiagCode::UnOp, At::Expr(e), None, Some(t), None);
                 Ok(Flow::Done(self.common.err))
@@ -279,7 +297,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
 
     /// `check_expr_addr_of`: the expectation of the operand is the expected pointee, as an
     /// rvalue hint when it is unsized.
-    pub(crate) fn expr_ref(&mut self, f: Frame, _e: ExprId, mutbl: Mutbl, operand: ExprId) -> Result<Flow, Stop> {
+    pub(crate) fn expr_ref(&mut self, f: Frame, e: ExprId, mutbl: Mutbl, operand: ExprId) -> Result<Flow, Stop> {
+        self.expr_borrow(f, e, mutbl, operand, false)
+    }
+
+    /// `&` (`raw` false: a reference) and `&raw` (`raw` true: a raw pointer).
+    fn expr_borrow(&mut self, f: Frame, _e: ExprId, mutbl: Mutbl, operand: ExprId, raw: bool) -> Result<Flow, Stop> {
         if f.state == 0 {
             let hint = match f.expect.to_option() {
                 Some(t) => match self.view(t) {
@@ -302,11 +325,43 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         if self.is_err(inner) {
             return Ok(Flow::Done(inner));
         }
-        Ok(Flow::Done(self.mk(TyView::Ref(mutbl, inner))?))
+        let made = if raw { TyView::Ptr(mutbl, inner) } else { TyView::Ref(mutbl, inner) };
+        Ok(Flow::Done(self.mk(made)?))
+    }
+
+    /// `&raw const place` is `*const T` and `&raw mut place` is `*mut T` for a place of type
+    /// `T`; the operand must be a place (E0745), and an expected `*_ U` is its hint, as `&`'s.
+    pub(crate) fn expr_raw_ref(&mut self, f: Frame, e: ExprId, mutbl: Mutbl, operand: ExprId) -> Result<Flow, Stop> {
+        if f.state == 0 {
+            self.check_place_code(operand, DiagCode::RawBorrowOfTemporary)?;
+        }
+        self.expr_borrow(f, e, mutbl, operand, true)
+    }
+
+    /// `_` outside the left side of an assignment, which `expr_assign` types without this rule.
+    pub(crate) fn expr_underscore(&mut self, e: ExprId) -> Result<Flow, Stop> {
+        self.diag(DiagCode::UnderscoreExpr, At::Expr(e), None, None, None);
+        Ok(Flow::Done(self.common.err))
     }
 
     /// `check_expr_assign`: the left side first, then the right coerced to it; `()`.
+    ///
+    /// `_ = rhs` is `let _ = rhs;` (rustc's destructuring-assignment lowering): the right side
+    /// is checked with no expectation, its value dropped, and `_` takes its type.
     pub(crate) fn expr_assign(&mut self, mut f: Frame, _e: ExprId, lhs: ExprId, rhs: ExprId) -> Result<Flow, Stop> {
+        if self.body.expr(lhs)? == Expr::Underscore {
+            return match f.state {
+                0 => {
+                    self.resume(f, 1)?;
+                    self.push_expr(rhs, Expectation::None, Then::Nothing)?;
+                    Ok(Flow::Wait)
+                }
+                _ => {
+                    self.expr_ty[lhs.ix()] = self.ret;
+                    Ok(Flow::Done(self.common.unit))
+                }
+            };
+        }
         match f.state {
             0 => {
                 self.check_place(lhs)?;
@@ -327,6 +382,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
 
     /// `is_syntactic_place_expr`, else E0070. Bounded by the body's expression count.
     fn check_place(&mut self, lhs: ExprId) -> Result<(), Stop> {
+        self.check_place_code(lhs, DiagCode::InvalidLhs)
+    }
+
+    /// `is_syntactic_place_expr`, else `code` at `lhs`.
+    fn check_place_code(&mut self, lhs: ExprId, code: DiagCode) -> Result<(), Stop> {
         let mut cur = lhs;
         for _ in 0..=self.body.exprs.len() {
             match self.body.expr(cur)? {
@@ -338,19 +398,24 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 Expr::Path(p) => {
                     // A static is a place; anything else a path names is not.
                     let bp = self.body.path(p)?;
+                    // `<T as Tr>::x` names an associated fn or const: never a place.
+                    if bp.anchor.is_some() {
+                        self.diag(code, At::Expr(lhs), None, None, None);
+                        return Ok(());
+                    }
                     let segs = self.body.segment_list(bp.segments)?;
                     let mut names: blaze_own::Vec<Name, Alloc<'a>> = blaze_own::Vec::with_capacity_in(segs.len(), self.alloc);
                     for s in segs {
                         names.push(s.name);
                     }
-                    let res = self.reads.resolve_path(bp.scope, p, &names)?;
-                    if !matches!(res.map(|r| r.def), Some(Def::Static(..)) | None) {
-                        self.diag(DiagCode::InvalidLhs, At::Expr(lhs), None, None, None);
+                    let res = self.path_res(bp, p, &names, At::Expr(lhs))?;
+                    if !matches!(res.map(|r| r.def), Ok(Def::Static(..)) | Err(_)) {
+                        self.diag(code, At::Expr(lhs), None, None, None);
                     }
                     return Ok(());
                 }
                 _ => {
-                    self.diag(DiagCode::InvalidLhs, At::Expr(lhs), None, None, None);
+                    self.diag(code, At::Expr(lhs), None, None, None);
                     return Ok(());
                 }
             }

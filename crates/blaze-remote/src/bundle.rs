@@ -14,8 +14,13 @@ use blaze_cas::plain::Namespace;
 use crate::{
     name::{self, Toolchain},
     segment::SegmentRef,
-    trust::{PublicKey, Refusal, Signer, Why, verify_sig},
-    wire::{Bounded, key_at, put_u32, put_u64, sig_at, u32_at, u64_at},
+    trust::{PublicKey, Refusal, Why, verify_sig},
+    wire::{Bounded, key_at, sig_at, u32_at, u64_at},
+};
+#[cfg(feature = "sign")]
+use crate::{
+    trust::Signer,
+    wire::{put_u32, put_u64},
 };
 
 const DOMAIN: &str = "blaze-remote bundle 1";
@@ -55,6 +60,7 @@ pub struct Bundle {
     pub segments: Bounded<SegmentRef, SEGMENTS_MOST>,
 }
 
+#[cfg(feature = "sign")]
 fn padded(out: &mut Vec<u8>, text: &str) {
     let mut field = [0u8; 64];
     field[..text.len()].copy_from_slice(text.as_bytes());
@@ -67,6 +73,7 @@ fn unpadded(field: &[u8]) -> Option<&str> {
 }
 
 impl Bundle {
+    #[cfg(feature = "sign")]
     pub fn encode(&self, signer: &Signer) -> Vec<u8> {
         let mut out = Vec::with_capacity(HEADER + self.segments.len() * ROW + 96);
         out.extend_from_slice(b"BLRB");
@@ -104,8 +111,8 @@ impl Bundle {
         }
         let body = bytes.len() - 64;
         let signer = PublicKey(key_at(bytes, body - 32));
-        if !verify_sig(&signer, DOMAIN, &bytes[..body], &sig_at(bytes, body)) {
-            return Err(Refusal::new(object, Some(signer.to_string()), Why::Signature));
+        if let Err(why) = verify_sig(&signer, DOMAIN, &bytes[..body], &sig_at(bytes, body)) {
+            return Err(Refusal::new(object, Some(signer.to_string()), Why::Signature(why)));
         }
         if u64_at(bytes, 8) != namespace.0 && !crate::planted(crate::Plant::SkipNamespace) {
             return Err(refuse(Why::Namespace { found: u64_at(bytes, 8), wanted: namespace.0 }));

@@ -138,7 +138,10 @@ pub(crate) fn build<'r, 'db>(
     files: Snap<'r, 'db>,
 ) -> anyhow::Result<Config<Snap<'r, 'db>>> {
     // clone: the variables, which the configuration takes owned.
-    let mut config = Config::load_with(Path::new(&read.cwd), read.env.clone(), files)?;
+    // The system's record of the user is read here, at the build's top, until `ConfigRead`
+    // carries it as it carries the variables.
+    let user = blaze_manifest::UserRecord::of_process();
+    let mut config = Config::load_with(Path::new(&read.cwd), read.env.clone(), user, files)?;
     config.start(&read.command, &read.cli)?;
     config.cli_unstable(&read.unstable)?;
     config.ensure_loaded()?;

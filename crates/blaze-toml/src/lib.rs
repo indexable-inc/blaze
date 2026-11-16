@@ -30,6 +30,8 @@
 
 use core::fmt;
 
+use blaze_text::{Put, Show, Shown, Writes as _};
+
 mod doc;
 mod edit;
 mod lower;
@@ -101,9 +103,9 @@ pub enum Expected {
     DatetimePart,
 }
 
-impl fmt::Display for Expected {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
+impl Show for Expected {
+    fn show<P: Put + ?Sized>(&self, out: &mut P) {
+        out.put_str(match self {
             Expected::Key => "a key",
             Expected::Equals => "`=`",
             Expected::Value => "a value",
@@ -116,7 +118,14 @@ impl fmt::Display for Expected {
             Expected::Hex => "hex digits",
             Expected::Quote => "the closing quote",
             Expected::DatetimePart => "the rest of a date or time",
-        })
+        });
+    }
+}
+
+/// The bridge for `{}` users: the text is [`Show`]'s.
+impl fmt::Display for Expected {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&Shown(self), f)
     }
 }
 
@@ -157,35 +166,38 @@ pub enum What {
     NotAnArrayOfTables { first: usize },
 }
 
+impl Show for What {
+    fn show<P: Put + ?Sized>(&self, out: &mut P) {
+        match *self {
+            What::TooLarge { len, most } => out.str("the text is ").int(len).str(" bytes, past the limit of ").int(most),
+            What::TooDeep { most } => out.str("more than ").int(most).str(" arrays and inline tables are open"),
+            What::TooManyNodes { most } => out.str("more than ").int(most).str(" tables, arrays and values"),
+            What::KeyTooLong { most } => out.str("a dotted key of more than ").int(most).str(" parts"),
+            What::End { expected } => out.str("the text ends where ").show(&expected).str(" was wanted"),
+            What::Unexpected { found, expected } => out.debug(&found).str(" where ").show(&expected).str(" was wanted"),
+            What::Control { ch } => out.str("control character ").debug(&ch).str(" is not allowed here"),
+            What::BareCarriageReturn => out.str("a carriage return not followed by a newline"),
+            What::BadEscape { found } => out.str("`\\").char(found).str("` is no escape"),
+            What::NotAScalar { value } => out.str("U+").hex_upper_fixed(value, 4).str(" is not a Unicode scalar value"),
+            What::LeadingZero => out.str("a number with a leading zero"),
+            What::Underscore => out.str("`_` must stand between two digits"),
+            What::NumberTooLong { most } => out.str("a float longer than ").int(most).str(" characters"),
+            What::IntegerOutOfRange => out.str("an integer outside i64"),
+            What::FloatOutOfRange => out.str("a number too large for a float"),
+            What::NoSuchDatetime => out.str("no such date or time"),
+            What::Duplicate { first } => out.str("the key is already defined at byte ").int(first),
+            What::Redefined { first } => out.str("the table is already defined at byte ").int(first),
+            What::NotATable { first } => out.str("the key at byte ").int(first).str(" is not a table"),
+            What::Closed { first } => out.str("the inline table or array at byte ").int(first).str(" is closed once written"),
+            What::NotAnArrayOfTables { first } => out.str("the key at byte ").int(first).str(" is not an array of tables"),
+        };
+    }
+}
+
+/// The bridge for `{}` users: the text is [`Show`]'s.
 impl fmt::Display for What {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            What::TooLarge { len, most } => write!(f, "the text is {len} bytes, past the limit of {most}"),
-            What::TooDeep { most } => write!(f, "more than {most} arrays and inline tables are open"),
-            What::TooManyNodes { most } => write!(f, "more than {most} tables, arrays and values"),
-            What::KeyTooLong { most } => write!(f, "a dotted key of more than {most} parts"),
-            What::End { expected } => write!(f, "the text ends where {expected} was wanted"),
-            What::Unexpected { found, expected } => write!(f, "{found:?} where {expected} was wanted"),
-            What::Control { ch } => write!(f, "control character {ch:?} is not allowed here"),
-            What::BareCarriageReturn => f.write_str("a carriage return not followed by a newline"),
-            What::BadEscape { found } => write!(f, "`\\{found}` is no escape"),
-            What::NotAScalar { value } => write!(f, "U+{value:04X} is not a Unicode scalar value"),
-            What::LeadingZero => f.write_str("a number with a leading zero"),
-            What::Underscore => f.write_str("`_` must stand between two digits"),
-            What::NumberTooLong { most } => write!(f, "a float longer than {most} characters"),
-            What::IntegerOutOfRange => f.write_str("an integer outside i64"),
-            What::FloatOutOfRange => f.write_str("a number too large for a float"),
-            What::NoSuchDatetime => f.write_str("no such date or time"),
-            What::Duplicate { first } => write!(f, "the key is already defined at byte {first}"),
-            What::Redefined { first } => write!(f, "the table is already defined at byte {first}"),
-            What::NotATable { first } => write!(f, "the key at byte {first} is not a table"),
-            What::Closed { first } => {
-                write!(f, "the inline table or array at byte {first} is closed once written")
-            }
-            What::NotAnArrayOfTables { first } => {
-                write!(f, "the key at byte {first} is not an array of tables")
-            }
-        }
+        fmt::Display::fmt(&Shown(self), f)
     }
 }
 
@@ -202,22 +214,26 @@ impl Error {
         line_col(text, self.at)
     }
 
-    /// `line L, column C: what`, for a person.
-    pub fn display<'e>(&'e self, text: &'e str) -> impl fmt::Display + 'e {
-        struct Shown<'e>(&'e Error, &'e str);
-        impl fmt::Display for Shown<'_> {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                let (line, col) = self.0.line_col(self.1);
-                write!(f, "line {line}, column {col}: {}", self.0.what)
-            }
-        }
-        Shown(self, text)
+    /// `line L, column C: what`, for a person: a [`Show`], and a `Display` through [`Shown`].
+    pub fn display<'e>(&'e self, text: &'e str) -> Shown<impl Show + 'e> {
+        Shown(blaze_text::show_with(move |out| {
+            let (line, col) = self.line_col(text);
+            out.str("line ").int(line).str(", column ").int(col).str(": ").show(&self.what);
+        }))
     }
 }
 
+/// `what at byte N`.
+impl Show for Error {
+    fn show<P: Put + ?Sized>(&self, out: &mut P) {
+        out.show(&self.what).str(" at byte ").int(self.at);
+    }
+}
+
+/// The bridge `core::error::Error` needs: the text is [`Show`]'s.
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} at byte {}", self.what, self.at)
+        fmt::Display::fmt(&Shown(self), f)
     }
 }
 

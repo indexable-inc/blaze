@@ -22,7 +22,7 @@ const HASH_BITS: u32 = 12;
 const MOST_OFFSET: usize = 65_535;
 
 /// The most bytes `n` bytes compress to.
-pub(crate) const fn bound(n: usize) -> usize {
+pub const fn bound(n: usize) -> usize {
     n + n / 255 + 16
 }
 
@@ -63,7 +63,7 @@ fn sequence<A: Allocator>(out: &mut Vec<u8, A>, literals: &[u8], matched: Option
 }
 
 /// `input` as one LZ4 block, appended to `out`.
-pub(crate) fn compress<A: Allocator>(input: &[u8], out: &mut Vec<u8, A>) {
+pub fn compress<A: Allocator>(input: &[u8], out: &mut Vec<u8, A>) {
     let n = input.len();
     out.reserve(bound(n));
     let mut anchor = 0;
@@ -101,7 +101,7 @@ pub(crate) fn compress<A: Allocator>(input: &[u8], out: &mut Vec<u8, A>) {
 
 /// Why an LZ4 block could not be read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Corrupt(pub(crate) &'static str);
+pub struct Corrupt(pub &'static str);
 
 fn read_length(input: &[u8], at: &mut usize, mut len: usize) -> Result<usize, Corrupt> {
     if len == 15 {
@@ -118,7 +118,7 @@ fn read_length(input: &[u8], at: &mut usize, mut len: usize) -> Result<usize, Co
 }
 
 /// The LZ4 block `input` into `out`, which it must fill exactly.
-pub(crate) fn decompress(input: &[u8], out: &mut [u8]) -> Result<(), Corrupt> {
+pub fn decompress(input: &[u8], out: &mut [u8]) -> Result<(), Corrupt> {
     let (mut i, mut o) = (0, 0);
     loop {
         let token = *input.get(i).ok_or(Corrupt("a block that ends before its last literals"))?;

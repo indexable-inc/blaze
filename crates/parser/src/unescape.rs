@@ -18,6 +18,8 @@
 
 use core::{num::NonZero, ops::Range, str::Chars};
 
+use crate::line_break::{is_bare_cr, line_break_len};
+
 #[cfg(test)]
 mod tests;
 
@@ -202,17 +204,28 @@ pub fn unescape_byte(src: &str) -> Result<u8, EscapeError> {
 
 /// Each value of `".."`'s text, with the range it came from.
 pub fn unescape_str(src: &str, callback: impl FnMut(Range<usize>, Result<char, EscapeError>)) {
-    quoted(src, callback);
+    quoted(src, line_break_len, callback);
+}
+
+/// [`unescape_str`] with the continuation's line break recognised by `line_break`: the seam a
+/// test plants a wrong rule through (crate::line_break's tests).
+#[cfg(test)]
+pub(crate) fn unescape_str_breaking(
+    src: &str,
+    line_break: fn(&[u8]) -> Option<usize>,
+    callback: impl FnMut(Range<usize>, Result<char, EscapeError>),
+) {
+    quoted(src, line_break, callback);
 }
 
 /// Each value of `b".."`'s text, with the range it came from.
 pub fn unescape_byte_str(src: &str, callback: impl FnMut(Range<usize>, Result<u8, EscapeError>)) {
-    quoted(src, callback);
+    quoted(src, line_break_len, callback);
 }
 
 /// Each value of `c".."`'s text, with the range it came from.
 pub fn unescape_c_str(src: &str, callback: impl FnMut(Range<usize>, Result<MixedUnit, EscapeError>)) {
-    quoted(src, callback);
+    quoted(src, line_break_len, callback);
 }
 
 /// Each character of `r".."`'s text.
@@ -264,9 +277,19 @@ fn raw<T>(
     unit: impl Fn(char) -> Result<T, EscapeError>,
     mut callback: impl FnMut(Range<usize>, Result<T, EscapeError>),
 ) {
-    for (at, c) in src.char_indices() {
-        let value = if c == '\r' { Err(EscapeError::BareCarriageReturnInRawString) } else { unit(c) };
-        callback(at..at + c.len_utf8(), value);
+    let mut chars = src.char_indices();
+    while let Some((at, c)) = chars.next() {
+        let rest = &src.as_bytes()[at..];
+        // A CR LF is one line break, whose value is LF (crate::line_break).
+        let (value, len) = match line_break_len(rest) {
+            Some(2) => {
+                chars.next();
+                (unit('\n'), 2)
+            }
+            _ if is_bare_cr(rest) => (Err(EscapeError::BareCarriageReturnInRawString), 1),
+            _ => (unit(c), c.len_utf8()),
+        };
+        callback(at..at + len, value);
     }
 }
 
@@ -275,6 +298,11 @@ fn single<T: Unit>(chars: &mut Chars<'_>) -> Result<T, EscapeError> {
     let value = match chars.next().ok_or(EscapeError::ZeroChars)? {
         '\\' => escape(chars),
         '\n' | '\t' | '\'' => Err(EscapeError::EscapeOnlyChar),
+        // A CR LF is a line break, which a character literal may not hold unescaped.
+        '\r' if chars.as_str().starts_with('\n') => {
+            chars.next();
+            Err(EscapeError::EscapeOnlyChar)
+        }
         '\r' => Err(EscapeError::BareCarriageReturn),
         c => T::char(c),
     }?;
@@ -349,18 +377,32 @@ fn unicode_escape(chars: &mut Chars<'_>) -> Result<u32, EscapeError> {
 
 /// Each value of a quoted string's text: a character, an escape, or a line continuation, which
 /// yields no value, only its warnings.
-fn quoted<T: Unit>(src: &str, mut callback: impl FnMut(Range<usize>, Result<T, EscapeError>)) {
+///
+/// `line_break` is [`line_break_len`], the one rule; a test passes a planted one.
+fn quoted<T: Unit>(
+    src: &str,
+    line_break: fn(&[u8]) -> Option<usize>,
+    mut callback: impl FnMut(Range<usize>, Result<T, EscapeError>),
+) {
     let mut chars = src.chars();
     while let Some(c) = chars.next() {
         let start = src.len() - chars.as_str().len() - c.len_utf8();
         let value = match c {
-            '\\' if chars.as_str().starts_with('\n') => {
-                chars.next();
-                skip_whitespace(&mut chars, start, &mut callback);
+            // `\` before a line break, LF or CR LF (crate::line_break): a continuation.
+            '\\' if let Some(brk) = line_break(chars.as_str().as_bytes()) => {
+                for _ in 0..brk {
+                    chars.next();
+                }
+                skip_whitespace(&mut chars, start, 1 + brk, &mut callback);
                 continue;
             }
             '\\' => escape(&mut chars),
             '"' => Err(EscapeError::EscapeOnlyChar),
+            // A CR LF is one line break, whose value is LF.
+            '\r' if chars.as_str().starts_with('\n') => {
+                chars.next();
+                T::char('\n')
+            }
             '\r' => Err(EscapeError::BareCarriageReturn),
             c => T::char(c),
         };
@@ -368,13 +410,18 @@ fn quoted<T: Unit>(src: &str, mut callback: impl FnMut(Range<usize>, Result<T, E
     }
 }
 
-/// After `\` and a newline at `start`: skip ASCII whitespace, warning when it spans another
-/// newline or stops at whitespace that is not ASCII.
-fn skip_whitespace<T>(chars: &mut Chars<'_>, start: usize, callback: &mut impl FnMut(Range<usize>, Result<T, EscapeError>)) {
+/// After `\` and a line break at `start`, `taken` bytes of both: skip ASCII whitespace, warning
+/// when it spans another line break or stops at whitespace that is not ASCII.
+fn skip_whitespace<T>(
+    chars: &mut Chars<'_>,
+    start: usize,
+    taken: usize,
+    callback: &mut impl FnMut(Range<usize>, Result<T, EscapeError>),
+) {
     let rest = chars.as_str();
     let skipped = rest.bytes().position(|b| !matches!(b, b' ' | b'\t' | b'\n' | b'\r')).unwrap_or(rest.len());
     let (space, rest) = rest.split_at(skipped);
-    let end = start + 2 + skipped;
+    let end = start + taken + skipped;
     if space.contains('\n') {
         callback(start..end, Err(EscapeError::MultipleSkippedLinesWarning));
     }

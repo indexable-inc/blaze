@@ -20,10 +20,11 @@
 use blaze_own::Alloc;
 
 use crate::diag::{At, DiagCode};
+use crate::body::CoroutineKind;
 use crate::error::{CheckError, Malformed, Stop};
-use crate::ids::{ExprId, List};
-use crate::machine::{BreakCtx, Expectation, Flow, Frame, Lower, Machine, Then};
-use crate::ty::{Goal, Ty, TypeCtx};
+use crate::ids::{ExprId, LangItem, List, PatId};
+use crate::machine::{BreakCtx, Expectation, Flow, Frame, Lower, Machine, Source, Then};
+use crate::ty::{Cause, Goal, Ty, TypeCtx};
 use crate::world::{PClause, World};
 
 impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
@@ -41,25 +42,50 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 }
                 PClause::Projection { trait_, args, name, term } => {
                     let args = self.lower_body_list(preds.types, args)?;
-                    let term = self.lower(preds.types, term, Lower::Body)?;
+                    let term = self.lower(preds.types, term, Lower::Assumed, Cause::Body)?;
                     Goal::Projection { trait_, args, name, term }
                 }
+                // The body's own `where const` condition is assumed, as its other clauses are.
+                PClause::Const { cond, args } => Goal::ConstHolds { cond, args: self.lower_body_list(preds.types, args)? },
             };
+            #[cfg(test)]
+            if self.plant == crate::machine::Plant::IgnoreWhereClauses {
+                continue;
+            }
             self.ty.assume(goal)?;
         }
-        let (inputs, output) = match self.reads.fn_sig(owner)? {
+        let (inputs, output, rust_call) = match self.reads.fn_sig(owner)? {
             Some(sig) => {
                 let mut inputs: blaze_own::Vec<Ty, Alloc<'a>> = blaze_own::Vec::with_capacity_in(sig.inputs.len(), self.alloc);
                 for &t in sig.inputs {
-                    inputs.push(self.lower(sig.types, t, Lower::Body)?);
+                    inputs.push(self.lower_sig_ty(sig.types, t)?);
                 }
-                let output = self.lower(sig.types, sig.output, Lower::Body)?;
-                (inputs, output)
+                let output = self.lower_sig_ty(sig.types, sig.output)?;
+                (inputs, output, sig.header.abi == crate::ids::Abi::RustCall)
             }
-            None => (blaze_own::Vec::new_in(self.alloc), self.fresh()?),
+            None => (blaze_own::Vec::new_in(self.alloc), self.fresh()?, false),
+        };
+        // `extern "rust-call"` (the `unboxed_closures` feature; core's `Fn*::call*` are the
+        // form: `extern "rust-call" fn call(&self, args: Args)` with `Args: Tuple`): the
+        // arguments come as one tuple, so the last parameter's type must be `Tuple` (E0277 at
+        // that parameter, the bound core's `Tuple` reports as "functions with the \"rust-call\"
+        // ABI must take a single non-self tuple argument"); a type parameter passes by its bound.
+        // OWED (typeck.md): a "rust-call" fn with no parameter has no place in the body to
+        // report at; its finding belongs to the fn head's reader.
+        if rust_call && let (Some(&p), Some(&last)) = (self.body.params.last(), inputs.last()) {
+            if let Some(tuple) = self.need_lang(LangItem::Tuple, At::Pat(p))? {
+                let args = self.mk_list(&[last])?;
+                self.register_trait(tuple, args, Cause::Pat(p))?;
+            }
+        }
+        // An `async fn`'s body returns the written type; its signature's output is the future.
+        let output = match self.body.coroutine {
+            Some(CoroutineKind::Async { output }) => self.lower_body_ty(output, At::Body)?,
+            None => output,
         };
         let site = self.new_coerce_many(output)?;
         self.ret_sites.push(site);
+        self.async_sites.push(self.body.coroutine.is_some());
         let root = self.body.root;
         self.push_expr(root, Expectation::HasType(output), Then::CoerceMany(site))?;
         let params = self.body.params;
@@ -75,10 +101,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
 
     /// `check_fn`'s end: the return site's type must be the declared output, `!` excepted.
     pub(crate) fn finish_body(&mut self, output: Ty) -> Result<(), Stop> {
+        self.async_sites.pop();
         let Some(site) = self.ret_sites.pop() else { return Ok(()) };
         let actual = self.coerce_many_complete(site);
         if !self.is_never(actual) && !self.is_err(actual) {
-            self.demand_eq(At::Body, output, actual)?;
+            // The body's value against the declared output: reported at the body's block.
+            let root = self.body.root;
+            self.demand_eq(At::Expr(root), output, actual)?;
         }
         Ok(())
     }
@@ -87,14 +116,34 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let src = types.list(l)?;
         let mut v: blaze_own::Vec<Ty, Alloc<'a>> = blaze_own::Vec::with_capacity_in(src.len(), self.alloc);
         for &t in src {
-            v.push(self.lower(types, t, Lower::Body)?);
+            v.push(self.lower(types, t, Lower::Assumed, Cause::Body)?);
         }
         self.mk_list(&v)
     }
 
     /// `check_then_else`. `f.a` is the site, `f.b` bit 0 the condition's divergence and bit 1
     /// the then-branch's.
-    pub(crate) fn expr_if(&mut self, mut f: Frame, _e: ExprId, cond: ExprId, then: ExprId, else_: Option<ExprId>) -> Result<Flow, Stop> {
+    /// `let pat = init` as a condition (`check_expr_let`, through `check_decl`): the binding
+    /// type a fresh variable, `init` coercible to it, `pat` checked against it as a `let`
+    /// statement's is; the expression is `bool`.
+    pub(crate) fn expr_let(&mut self, mut f: Frame, pat: PatId, init: ExprId) -> Result<Flow, Stop> {
+        match f.state {
+            0 => {
+                f.t = self.fresh()?;
+                self.resume(f, 1)?;
+                self.push_coercible(init, f.t)?;
+                Ok(Flow::Wait)
+            }
+            1 => {
+                self.resume(f, 2)?;
+                self.push_pat(pat, f.t, 0)?;
+                Ok(Flow::Wait)
+            }
+            _ => Ok(Flow::Done(self.common.bool_)),
+        }
+    }
+
+    pub(crate) fn expr_if(&mut self, mut f: Frame, e: ExprId, cond: ExprId, then: ExprId, else_: Option<ExprId>) -> Result<Flow, Stop> {
         match f.state {
             0 => {
                 self.resume(f, 1)?;
@@ -115,7 +164,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 self.diverges = false;
                 let target = self.coercion_target(f.expect)?;
                 f.a = self.new_coerce_many(target)?;
-                self.coerce_many_push(f.a, Some(then), then_ty)?;
+                self.coerce_many_push(f.a, Source::Expr(then), then_ty)?;
                 match else_ {
                     Some(els) => {
                         self.resume(f, 3)?;
@@ -123,7 +172,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                         Ok(Flow::Wait)
                     }
                     None => {
-                        self.if_fallback(f.a)?;
+                        self.if_fallback(e, f.a)?;
                         self.diverges = f.b & 1 != 0;
                         Ok(Flow::Done(self.coerce_many_complete(f.a)))
                     }
@@ -138,7 +187,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     }
 
     /// `if_fallback_coercion`: an `if` without `else` is `()`; otherwise E0317.
-    fn if_fallback(&mut self, site: u32) -> Result<(), Stop> {
+    fn if_fallback(&mut self, e: ExprId, site: u32) -> Result<(), Stop> {
         let cm = self.coerce_many[site as usize];
         let merged = cm.final_ty.unwrap_or(cm.expected);
         if self.is_err(merged) {
@@ -150,7 +199,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             entry.final_ty = Some(unit);
             entry.pushed += 1;
         } else {
-            self.diag(DiagCode::IfWithoutElse, At::Body, Some(merged), Some(unit), None);
+            self.diag(DiagCode::IfWithoutElse, At::Expr(e), Some(merged), Some(unit), None);
             self.coerce_many[site as usize].final_ty = Some(self.common.err);
         }
         Ok(())
@@ -250,7 +299,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     }
 
     /// `check_expr_break`. `f.a` is the break context's index.
-    pub(crate) fn expr_break(&mut self, mut f: Frame, _e: ExprId, value: Option<ExprId>, target: ExprId) -> Result<Flow, Stop> {
+    pub(crate) fn expr_break(&mut self, mut f: Frame, e: ExprId, value: Option<ExprId>, target: ExprId) -> Result<Flow, Stop> {
         if f.state == 0 {
             let i = self.find_break(target)?;
             f.a = i as u32;
@@ -264,7 +313,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     self.push_expr(v, Expectation::HasType(hint), Then::CoerceMany(site))?;
                     return Ok(Flow::Wait);
                 }
-                None => self.coerce_many_push(site, None, self.common.unit)?,
+                None => self.coerce_many_push(site, Source::Unit(e), self.common.unit)?,
             }
         }
         if !self.diverges {
@@ -286,7 +335,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     self.push_expr(v, Expectation::HasType(hint), Then::CoerceMany(site))?;
                     return Ok(Flow::Wait);
                 }
-                None => self.coerce_many_push(site, None, self.common.unit)?,
+                None => self.coerce_many_push(site, Source::Unit(e), self.common.unit)?,
             }
         }
         Ok(Flow::Done(self.common.never))

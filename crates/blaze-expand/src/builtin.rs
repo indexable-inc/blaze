@@ -11,7 +11,6 @@ use blaze_own::{AVec, Alloc, Vec};
 use blaze_id::ContentId;
 
 use crate::{
-    bridge::{self, Role},
     call::Inside,
     cx::{ExpandCx, HostAsk, HostError, HostWhy, IncludeAs, Included, Place, PlaceOf},
     def::BuiltinFn,
@@ -62,6 +61,7 @@ pub(crate) fn expand<'a>(
         BuiltinFn::ModulePath => place(out, cx, HoleOf::ModulePath)?,
         BuiltinFn::Panic => panic(out, "panic")?,
         BuiltinFn::Unreachable => panic(out, "unreachable")?,
+        BuiltinFn::PatternType => pattern_type(out)?,
         BuiltinFn::Asm
         | BuiltinFn::GlobalAsm
         | BuiltinFn::NakedAsm
@@ -156,6 +156,31 @@ impl Args<'_> {
             }
         }
         self.stream.len()
+    }
+
+    /// Where the expression that starts the input ends (rustc's `parse_expr`, as
+    /// `expand_assert` reads its condition): a comma in `f::<A, B>()` is in no delimiter but
+    /// ends no argument. `None` when the input does not start with an expression, or it is
+    /// followed by something other than a `,`.
+    fn expr_end(&self, alloc: Alloc<'_>) -> Option<usize> {
+        let words = crate::body::parser_words(self.stream, alloc);
+        let output = parser::PrefixEntryPoint::Expr.parse(parser::Tokens::new(&words.words, true));
+        if output.iter().any(|step| matches!(step, parser::Step::Error { .. })) {
+            return None;
+        }
+        let taken = crate::rules::consumed(&output);
+        let len = self.stream.len();
+        let tokens = self.stream.tokens();
+        let mut end = (0..len).find(|&at| words.word_at[at] as usize >= taken).unwrap_or(len);
+        // An invisible group's delimiters start no word: the close of a `$e:expr` that held
+        // the expression belongs to it.
+        while tokens.get(end).is_some_and(|t| t.kind == TokenKind::Close(Delim::Invisible)) {
+            end += 1;
+        }
+        match tokens.get(end).map(|t| t.kind) {
+            None | Some(TokenKind::Punct { char: ',', .. }) => Some(end),
+            Some(_) => None,
+        }
     }
 
     /// What one argument is, for the builtins that take literals.
@@ -570,6 +595,11 @@ fn include(
             out.diagnose(Diagnostic::Include { path, why: IncludeFailure::Missing });
             return Ok(());
         }
+        Included::Outside => {
+            let path = out.note(path.as_str())?;
+            out.diagnose(Diagnostic::Include { path, why: IncludeFailure::Outside });
+            return Ok(());
+        }
     };
     let digest = ContentId::of("blaze v2 expand included file 1", bytes);
     out.exp.reads.push(kind, path.as_str(), ReadAnswer::Digest(digest))?;
@@ -638,7 +668,9 @@ fn included_tokens(
 fn assert(out: &mut Out<'_, '_>) -> Result<(), ExpandError> {
     let input = out.call.input();
     let args = Args { stream: input, from: None };
-    let end = args.first_end();
+    let Some(end) = args.expr_end(out.alloc) else {
+        return refuse(out, "`assert!` takes a boolean expression, then optionally `,` and a message", None);
+    };
     let cond = args.unwrap(0..end);
     if cond.is_empty() {
         return refuse(out, "`assert!` takes a boolean expression", None);
@@ -674,7 +706,7 @@ fn assert(out: &mut Out<'_, '_>) -> Result<(), ExpandError> {
             let cond = input.copy_in(cond, out.alloc)?;
             let mut text = Buf::new_in(out.alloc);
             text.push_str("assertion failed: ");
-            stringified(&cond, out.call.site.edition, &mut text)?;
+            stringified(&cond, out.alloc, &mut text)?;
             crate_path(out, &["panicking", "panic"])?;
             out.made(TokenKind::Open(Delim::Paren), "", MADE)?;
             push_str_literal(out, text.as_str())?;
@@ -684,8 +716,9 @@ fn assert(out: &mut Out<'_, '_>) -> Result<(), ExpandError> {
     out.made(TokenKind::Close(Delim::Brace), "", MADE)
 }
 
-/// `cfg_select! { pred => { tokens } .. _ => { tokens } }`: the tokens inside the braces of the
-/// first arm whose predicate holds (`_` always does). Every arm is read; the predicates are
+/// `cfg_select! { pred => { tokens } .. _ => expr }`: the tokens inside the braces of the
+/// first arm whose predicate holds (`_` always does), or its expression up to its `,`. Every
+/// arm is read; the predicates are
 /// asked of the context in order up to the first that holds, each outcome recorded.
 fn cfg_select(
     out: &mut Out<'_, '_>,
@@ -725,14 +758,33 @@ fn cfg_select(
             return refuse(out, "expected a cfg predicate or `_` before `=>`", input_at(arrow));
         }
         let open = arrow + 2;
-        let close = match tokens.get(open).map(|it| it.kind) {
-            Some(TokenKind::Open(Delim::Brace)) => input.close_of(open),
-            _ => None,
+        // An arm is `{ tokens }`, or an expression up to the next `,` outside any group
+        // (rustc's arms since `cfg_select!` took expressions).
+        let body = match tokens.get(open).map(|it| it.kind) {
+            Some(TokenKind::Open(Delim::Brace)) => match input.close_of(open) {
+                Some(close) => {
+                    at = close + 1;
+                    open + 1..close
+                }
+                None => return refuse(out, "a `{` in `cfg_select!` that does not close", input_at(open)),
+            },
+            None => return refuse(out, "expected an arm after `=>` in `cfg_select!`", input_at(arrow)),
+            Some(_) => {
+                let mut depth = 0u32;
+                let mut end = open;
+                while let Some(token) = tokens.get(end) {
+                    match token.kind {
+                        TokenKind::Open(_) => depth += 1,
+                        TokenKind::Close(_) => depth = depth.saturating_sub(1),
+                        TokenKind::Punct { char: ',', .. } if depth == 0 => break,
+                        _ => {}
+                    }
+                    end += 1;
+                }
+                at = end;
+                open..end
+            }
         };
-        let Some(close) = close else {
-            return refuse(out, "expected `{` after `=>` in `cfg_select!`", input_at(open));
-        };
-        at = close + 1;
         if matches!(tokens.get(at).map(|it| it.kind), Some(TokenKind::Punct { char: ',', .. })) {
             at += 1;
         }
@@ -751,12 +803,12 @@ fn cfg_select(
             let predicate = input.copy_in(start..arrow, out.alloc)?;
             let outcome = cx.cfg(&predicate)?;
             let mut subject = Buf::new_in(out.alloc);
-            stringified(&predicate, out.call.site.edition, &mut subject)?;
+            stringified(&predicate, out.alloc, &mut subject)?;
             out.exp.reads.push(ReadKind::Cfg, subject.as_str(), ReadAnswer::Bool(outcome))?;
             outcome
         };
         if holds {
-            chosen = Some(open + 1..close);
+            chosen = Some(body);
         }
     }
     let Some(body) = chosen else {
@@ -851,23 +903,165 @@ fn format_args(
 }
 
 /// `stringify!`: the input's text, spaced as rustc spaces it.
+/// `builtin # pattern_type ( input )`, the form the parser reads a pattern type in
+/// (`T is PAT`; library/core/src/pat.rs: "Creates a pattern type. `type Positive =
+/// std::pat::pattern_type!(i32 is 1..);`"): the input's tokens kept, each from its place, so
+/// the base and the pattern lower as written and the parser refuses what is no pattern type.
+fn pattern_type(out: &mut Out<'_, '_>) -> Result<(), ExpandError> {
+    let input = out.call.input();
+    if input.is_empty() {
+        return refuse(out, "`pattern_type!` takes a type, `is` and a pattern", None);
+    }
+    ident(out, "builtin")?;
+    punct(out, '#', Spacing::Alone)?;
+    ident(out, "pattern_type")?;
+    out.made(TokenKind::Open(Delim::Paren), "", MADE)?;
+    for at in 0..input.len() {
+        let token = input.tokens()[at];
+        out.push(token.kind, input.text_of(&token), TokenOrigin::Input(index(at)))?;
+    }
+    out.made(TokenKind::Close(Delim::Paren), "", MADE)
+}
+
 fn stringify(out: &mut Out<'_, '_>) -> Result<(), ExpandError> {
     let input = out.call.input();
     let mut text = Buf::new_in(out.alloc);
-    stringified(input, out.call.site.edition, &mut text)?;
+    stringified(input, out.alloc, &mut text)?;
     push_str_literal(out, text.as_str())
 }
 
-/// The text of `stream`, by tt's printer, its spacing the stream's, appended to `into`.
+/// The text of `stream` appended to `into`, spaced as rustc's `print_tts` spaces it: a space
+/// goes after a token the stream has `Alone`, unless it is one of the places rustc never puts
+/// one (`space_between`); after a joint one, only between two identifiers. A brace group is
+/// written `{ .. }` when its opening brace is `Alone` and it is not empty.
+///
+/// One pass over the tokens, the trees of each level paired on an explicit stack: the space
+/// between two trees is decided when the second one starts.
 fn stringified(
     stream: &TokenStream<'_>,
-    edition: crate::tokens::Edition,
+    alloc: Alloc<'_>,
     into: &mut Buf<'_>,
 ) -> Result<(), ExpandError> {
-    let tree = bridge::to_tt(stream, Role::Input, Stream::Input, edition)?;
-    let joined = |span, _: &str| bridge::source_joined(stream, span);
-    into.push_str(&tt::stringify(tree.token_trees(), &joined, false));
+    if let Some(token) = stream.unbalanced() {
+        return Err(ExpandError::Unbalanced { stream: Stream::Input, token });
+    }
+    let tokens = stream.tokens();
+    // Per open group: whether its brace was written spaced. The tree before a group is not
+    // needed once the group starts, so it is not kept.
+    let mut levels: AVec<'_, bool> = Vec::new_in(alloc);
+    let mut prev: Option<Printed> = None;
+    for (at, token) in tokens.iter().enumerate() {
+        let next = match token.kind {
+            TokenKind::Close(delim) => {
+                let spaced = levels.pop().expect("the stream was checked balanced");
+                into.push_str(match (delim, spaced) {
+                    (Delim::Brace, true) => " }",
+                    (Delim::Brace, false) => "}",
+                    (Delim::Bracket, _) => "]",
+                    (Delim::Paren, _) => ")",
+                    (Delim::Invisible, _) => "",
+                });
+                prev = Some(Printed::Group { delim, joint: token.kind.spacing() != Spacing::Alone });
+                continue;
+            }
+            TokenKind::Open(delim) => Printed::Group { delim, joint: false },
+            TokenKind::Punct { char, spacing } => Printed::Punct { char, joint: spacing != Spacing::Alone },
+            TokenKind::Ident { raw, spacing } => Printed::Ident {
+                keyword: raw == Raw::No && KEYWORDS.contains(&stream.text_of(token)),
+                joint: spacing != Spacing::Alone,
+            },
+            TokenKind::Literal { spacing, .. } => Printed::Literal { joint: spacing != Spacing::Alone },
+        };
+        if let Some(prev) = prev
+            && prev.space_before(next)
+        {
+            into.push_char(' ');
+        }
+        match token.kind {
+            TokenKind::Open(delim) => {
+                let empty = matches!(tokens.get(at + 1), Some(t) if matches!(t.kind, TokenKind::Close(_)));
+                let spaced = delim == Delim::Brace && !empty && token.kind.spacing() == Spacing::Alone;
+                into.push_str(match (delim, spaced) {
+                    (Delim::Brace, true) => "{ ",
+                    (Delim::Brace, false) => "{",
+                    (Delim::Bracket, _) => "[",
+                    (Delim::Paren, _) => "(",
+                    (Delim::Invisible, _) => "",
+                });
+                levels.push(spaced);
+                prev = None;
+                continue;
+            }
+            TokenKind::Punct { char, .. } => into.push_char(char),
+            TokenKind::Ident { raw, .. } => {
+                if raw == Raw::Yes {
+                    into.push_str("r#");
+                }
+                into.push_str(stream.text_of(token));
+            }
+            TokenKind::Literal { kind, suffix_len, .. } => {
+                crate::rules::write_literal(into, kind, stream.text_of(token), suffix_len)
+                    .expect("writing to a `Buf` does not fail");
+            }
+            TokenKind::Close(_) => unreachable!("a close is written above"),
+        }
+        prev = Some(next);
+    }
     Ok(())
+}
+
+/// What `stringified` needs of the tree before: its kind, and whether rustc's token for its
+/// end is joint with what follows (a group's: its closing delimiter's).
+#[derive(Clone, Copy)]
+enum Printed {
+    Punct { char: char, joint: bool },
+    Ident { keyword: bool, joint: bool },
+    Literal { joint: bool },
+    Group { delim: Delim, joint: bool },
+}
+
+/// The words `space_between` writes no space between and a parenthesis.
+const KEYWORDS: &[&str] = &[
+    "as", "break", "const", "continue", "crate", "else", "enum", "extern", "false", "for", "if",
+    "impl", "in", "let", "loop", "match", "mod", "move", "mut", "ref", "return", "self", "static",
+    "struct", "super", "trait", "true", "type", "unsafe", "use", "where", "while", "async",
+    "await", "dyn", "abstract", "become", "box", "do", "final", "macro", "override", "priv",
+    "typeof", "unsized", "virtual", "yield", "try", "gen",
+];
+
+impl Printed {
+    fn punct(self) -> Option<char> {
+        match self {
+            Printed::Punct { char, .. } => Some(char),
+            _ => None,
+        }
+    }
+
+    /// Whether a space goes between `self` and `next`, the tree after it at its level.
+    fn space_before(self, next: Printed) -> bool {
+        let joined = match self {
+            // A lifetime is one token to rustc.
+            Printed::Punct { char: '\'', .. } if matches!(next, Printed::Ident { .. }) => true,
+            Printed::Group { delim: Delim::Invisible, .. } => false,
+            Printed::Punct { joint, .. }
+            | Printed::Ident { joint, .. }
+            | Printed::Literal { joint }
+            | Printed::Group { joint, .. } => joint,
+        };
+        if joined {
+            // rustc's `idents_would_merge`.
+            return matches!((self, next), (Printed::Ident { .. }, Printed::Ident { .. }));
+        }
+        // rustc's `space_between`.
+        match (self, next) {
+            _ if self.punct() == Some('.') && next.punct().is_none() => false,
+            (_, Printed::Ident { .. }) if self.punct() == Some('$') => false,
+            _ if self.punct().is_none() && matches!(next.punct(), Some(',' | ';' | '.')) => false,
+            (Printed::Ident { keyword, .. }, Printed::Group { delim: Delim::Paren, .. }) => keyword,
+            (_, Printed::Group { delim, .. }) if self.punct() == Some('#') => delim != Delim::Bracket,
+            _ => true,
+        }
+    }
 }
 
 /// `cfg!(predicate)`: `true` or `false`, the outcome read.
@@ -878,7 +1072,7 @@ fn cfg(out: &mut Out<'_, '_>, cx: &impl ExpandCx) -> Result<(), ExpandError> {
     }
     let outcome = cx.cfg(input)?;
     let mut subject = Buf::new_in(out.alloc);
-    stringified(input, out.call.site.edition, &mut subject)?;
+    stringified(input, out.alloc, &mut subject)?;
     out.exp.reads.push(ReadKind::Cfg, subject.as_str(), ReadAnswer::Bool(outcome))?;
     ident(out, if outcome { "true" } else { "false" })
 }

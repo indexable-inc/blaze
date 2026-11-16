@@ -8,9 +8,11 @@ use blaze_own::{AVec, Alloc};
 
 use crate::{
     def::{MacroDefinition, ProcKind},
-    expansion::{TokenOrigin, Reads},
-    tokens::TokenStream,
+    expansion::{ProcLevel, Reads, TokenOrigin},
+    tokens::{Text, TokenStream},
 };
+#[cfg(doc)]
+use crate::expansion::Diagnostic;
 
 /// The outside of an expansion. The expansion asks it for nothing it does not record.
 pub trait ExpandCx {
@@ -51,6 +53,10 @@ pub enum Included<'a> {
     Bytes(&'a [u8]),
     /// No file at that path.
     Missing,
+    /// The path leaves the unit's [`ReadRoot`] (decision D60: [`include_target`]); a build
+    /// script's output folder is answered from its record before a host is asked. Decided by
+    /// the written path and the calling file's place alone, so it is no read.
+    Outside,
 }
 
 /// A position a call in eager input asks for.
@@ -88,6 +94,20 @@ pub struct Produced<'a> {
     pub tokens: TokenStream<'a>,
     pub origins: AVec<'a, TokenOrigin>,
     pub reads: Reads<'a>,
+    /// The macro's diagnostics; each `Text` is a range of `text`.
+    pub diagnostics: AVec<'a, ProcDiagnostic>,
+    pub text: AVec<'a, u8>,
+}
+
+/// A diagnostic a proc macro's run gives: only the two kinds a proc macro can make, so a host
+/// cannot hand back another kind's (a type, not a check). Each becomes a [`Diagnostic`] of the
+/// expansion, its text copied into the expansion's notes.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ProcDiagnostic {
+    /// `proc_macro::Diagnostic::emit`: [`Diagnostic::ProcMacro`].
+    Emitted { level: ProcLevel, message: Text, at: Option<TokenOrigin> },
+    /// The macro panicked: [`Diagnostic::ProcMacroPanicked`].
+    Panicked { message: Text },
 }
 
 /// Which outside question failed.
@@ -111,6 +131,17 @@ pub enum HostWhy {
     Failed,
     /// The answer did not come within its deadline.
     TimedOut,
+    /// A limit stopped the proc macro's run.
+    Limit(ProcLimit),
+}
+
+/// Which limit stopped a proc macro's run.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ProcLimit {
+    Fuel,
+    Memory,
+    Output,
+    Paths,
 }
 
 /// An outside question the context could not answer: it stops the expansion, and is never an
@@ -128,3 +159,99 @@ impl fmt::Display for HostError {
 }
 
 impl core::error::Error for HostError {}
+
+/// Where a unit's sources came from: what bounds the files its includes may read (decision
+/// D60, docs/v2/plan/decisions.json).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum SourceOrigin {
+    /// A workspace member inside a version-control checkout: it reads under the checkout's root.
+    Checkout,
+    /// A workspace member with no checkout around it: it reads under the workspace's root.
+    Workspace,
+    /// A git source: it reads under the whole fetched checkout.
+    GitCheckout,
+    /// A registry source (or any unit fetched as a package alone): it reads under its package.
+    Package,
+}
+
+/// The tree a unit's `include!`, `include_str!` and `include_bytes!` read in: a value the host
+/// is given per unit, never found from the machine by the expander (D60). Paths under it are
+/// `/`-separated and written without `.` or `..`, so no key holds where the tree is.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct ReadRoot<'s> {
+    pub origin: SourceOrigin,
+    /// The unit's package folder under the root; empty when the package is the root.
+    pub package: &'s str,
+}
+
+impl ReadRoot<'_> {
+    /// The folder under the root no read may leave: the package for
+    /// [`SourceOrigin::Package`], the whole root otherwise.
+    fn bound(&self) -> &str {
+        match self.origin {
+            SourceOrigin::Package => self.package,
+            SourceOrigin::Checkout | SourceOrigin::Workspace | SourceOrigin::GitCheckout => "",
+        }
+    }
+}
+
+/// An include path that leaves its unit's [`ReadRoot`] ([`Included::Outside`]): refused by
+/// decision D60, by the written path and the calling file's place alone.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct OutsideRoot {
+    pub origin: SourceOrigin,
+}
+
+impl fmt::Display for OutsideRoot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let bound = match self.origin {
+            SourceOrigin::Checkout => "the workspace's checkout",
+            SourceOrigin::Workspace => "the workspace's root",
+            SourceOrigin::GitCheckout => "its fetched git checkout",
+            SourceOrigin::Package => "its fetched package",
+        };
+        write!(f, "the path leaves {bound} (decision D60: includes read only under the unit's source root)")
+    }
+}
+
+impl core::error::Error for OutsideRoot {}
+
+/// The file `include!`, `include_str!` or `include_bytes!` reads when the call is written in a
+/// file of the folder `folder` (under the package of `root`) and names `written`, as segments
+/// under the root. The rule is the pinned library's own (core `macros/mod.rs`, `include_str!`:
+/// "The file is located relative to the current file (similarly to how modules are found)");
+/// it may leave the package (D60) but never the root's bound ([`ReadRoot::bound`]), and an
+/// absolute path names the machine, so it is outside. `.` and `..` are taken lexically, never
+/// through the file system. The segments borrow `root`, `folder` and `written`; nothing is read.
+pub fn include_target<'s, 'a>(
+    root: ReadRoot<'s>,
+    folder: &'s str,
+    written: &'s str,
+    alloc: Alloc<'a>,
+) -> Result<AVec<'a, &'s str>, OutsideRoot> {
+    let outside = OutsideRoot { origin: root.origin };
+    if written.starts_with('/') {
+        return Err(outside);
+    }
+    let mut at = AVec::new_in(alloc);
+    for segment in root.package.split('/').chain(folder.split('/')).chain(written.split('/')) {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                if at.pop().is_none() {
+                    return Err(outside);
+                }
+            }
+            name => at.push(name),
+        }
+    }
+    let mut bound = root.bound().split('/').filter(|s| !s.is_empty());
+    let mut ours = at.iter();
+    loop {
+        match (bound.next(), ours.next()) {
+            (None, _) => return Ok(at),
+            (Some(want), Some(have)) if want == *have => {}
+            _ => return Err(outside),
+        }
+    }
+}

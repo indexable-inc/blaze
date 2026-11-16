@@ -1,5 +1,5 @@
-//! A commit's files: its tree walked from a [`Pack`], each file handed out with its path, mode
-//! and bytes. A name that could leave the checkout or mean something to git (`..`, `.`, `.git`
+//! A commit's files: its tree walked from an [`Index`], each file handed out with its path,
+//! mode and the blob to read. A name that could leave the checkout or mean something to git (`..`, `.`, `.git`
 //! in any case, a `/` or `\`, not UTF-8) is refused naming its path, as is a submodule (a
 //! gitlink), which needs a second fetch this walk does not make.
 
@@ -11,7 +11,7 @@ use blaze_own::{AllocFailure, Vec};
 
 use crate::{
     oid::{Kind, Oid},
-    pack::Pack,
+    pack::{Found, Index, PackError, PackWhy},
     plant::{self, Plant},
 };
 
@@ -41,7 +41,8 @@ pub struct File<'a> {
     pub path: &'a str,
     pub mode: Mode,
     pub oid: Oid,
-    pub bytes: &'a [u8],
+    /// The blob: its size, and what [`Index::read`] takes.
+    pub object: Found,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -62,6 +63,8 @@ pub enum TreeWhy {
     PathOver { most: u16 },
     FilesOver { most: u32 },
     DepthOver { most: u16 },
+    /// A tree or commit whose bytes did not read back from the pack.
+    Read(PackWhy),
     Alloc(AllocFailure),
 }
 
@@ -108,6 +111,7 @@ impl fmt::Display for TreeError {
             TreeWhy::PathOver { most } => write!(f, "a path longer than the most allowed, {most} bytes"),
             TreeWhy::FilesOver { most } => write!(f, "more files than the most allowed, {most}"),
             TreeWhy::DepthOver { most } => write!(f, "directories deeper than the most allowed, {most}"),
+            TreeWhy::Read(why) => write!(f, "{}", PackError { entry: None, at: 0, why }),
             TreeWhy::Alloc(e) => write!(f, "{e}"),
         }
     }
@@ -122,28 +126,32 @@ impl fmt::Debug for TreeError {
 impl core::error::Error for TreeError {}
 
 /// One directory being walked: its bytes, the next entry's offset, and its path's length.
-#[derive(Clone, Copy)]
-struct Open<'p> {
-    tree: &'p [u8],
+struct Open<B: Allocator> {
+    tree: Vec<u8, B>,
     pos: usize,
     path_len: usize,
 }
 
-/// Every file of `commit`'s tree, handed to `visit` in tree order.
-pub fn files<'p, A: Allocator, B: Allocator + Clone>(
-    pack: &'p Pack<A>,
+/// Every file of `commit`'s tree, handed to `visit` in tree order: its path, mode and the
+/// object to read ([`Index::read`]). Only the trees on the path being walked are held.
+pub fn files<A: Allocator + Clone, B: Allocator + Clone>(
+    index: &mut Index<'_, A>,
     commit: Oid,
     limits: Limits,
     alloc: B,
     mut visit: impl FnMut(File<'_>),
 ) -> Result<(), TreeError> {
     let at_root = |why| TreeError::new(b"", why);
-    let body = object(pack, commit, Kind::Commit, b"")?;
+    let mut body = Vec::new_in(alloc.clone());
+    object(index, commit, Kind::Commit, b"", &mut body)?;
     let hex = body.strip_prefix(b"tree ").and_then(|rest| rest.get(..40)).ok_or(at_root(TreeWhy::Commit))?;
     let root = Oid::parse_hex(hex).ok_or(at_root(TreeWhy::Commit))?;
+    drop(body);
     let mut path: Vec<u8, B> = Vec::new_in(alloc.clone());
-    let mut stack: Vec<Open<'p>, B> = Vec::new_in(alloc);
-    stack.push(Open { tree: object(pack, root, Kind::Tree, b"")?, pos: 0, path_len: 0 });
+    let mut stack: Vec<Open<B>, B> = Vec::new_in(alloc.clone());
+    let mut tree = Vec::new_in(alloc.clone());
+    object(index, root, Kind::Tree, b"", &mut tree)?;
+    stack.try_push(Open { tree, pos: 0, path_len: 0 }).map_err(|r| at_root(TreeWhy::Alloc(r.why)))?;
     let mut count = 0u32;
     while let Some(top) = stack.last_mut() {
         if top.pos == top.tree.len() {
@@ -158,8 +166,9 @@ pub fn files<'p, A: Allocator, B: Allocator + Clone>(
             path.try_push(b'/').map_err(|r| TreeError::new(&[], TreeWhy::Alloc(r.why)))?;
         }
         path.try_extend_from_slice(name).map_err(|e| TreeError::new(&[], TreeWhy::Alloc(e)))?;
+        let good = good_name(name);
         let refuse = |why| TreeError::new(&path, why);
-        if !good_name(name) {
+        if !good {
             return Err(refuse(TreeWhy::Name));
         }
         if path.len() > usize::from(limits.most_path) {
@@ -170,7 +179,8 @@ pub fn files<'p, A: Allocator, B: Allocator + Clone>(
                 if stack.len() > usize::from(limits.most_depth) {
                     return Err(refuse(TreeWhy::DepthOver { most: limits.most_depth }));
                 }
-                let tree = object(pack, oid, Kind::Tree, &path)?;
+                let mut tree = Vec::new_in(alloc.clone());
+                object(index, oid, Kind::Tree, &path, &mut tree)?;
                 let len = path.len();
                 stack.try_push(Open { tree, pos: 0, path_len: len }).map_err(|r| refuse(TreeWhy::Alloc(r.why)))?;
                 continue;
@@ -185,19 +195,31 @@ pub fn files<'p, A: Allocator, B: Allocator + Clone>(
         if count > limits.most_files {
             return Err(refuse(TreeWhy::FilesOver { most: limits.most_files }));
         }
-        let bytes = object(pack, oid, Kind::Blob, &path)?;
+        let found = find(index, oid, Kind::Blob, &path)?;
         let text = core::str::from_utf8(&path).map_err(|_| refuse(TreeWhy::Name))?;
-        visit(File { path: text, mode, oid, bytes });
+        visit(File { path: text, mode, oid, object: found });
     }
     Ok(())
 }
 
-fn object<'p, A: Allocator>(pack: &'p Pack<A>, oid: Oid, want: Kind, path: &[u8]) -> Result<&'p [u8], TreeError> {
-    let found = pack.get(&oid).ok_or(TreeError::new(path, TreeWhy::Missing { oid }))?;
+fn find<A: Allocator + Clone>(index: &Index<'_, A>, oid: Oid, want: Kind, path: &[u8]) -> Result<Found, TreeError> {
+    let found = index.find(&oid).ok_or(TreeError::new(path, TreeWhy::Missing { oid }))?;
     if found.kind != want {
         return Err(TreeError::new(path, TreeWhy::NotKind { oid, want }));
     }
-    Ok(found.bytes)
+    Ok(found)
+}
+
+/// The object `oid`, of kind `want`, read whole into `out`.
+fn object<A: Allocator + Clone, B: Allocator>(
+    index: &mut Index<'_, A>,
+    oid: Oid,
+    want: Kind,
+    path: &[u8],
+    out: &mut Vec<u8, B>,
+) -> Result<(), TreeError> {
+    let found = find(index, oid, want, path)?;
+    index.read_vec(found, out).map_err(|e| TreeError::new(path, TreeWhy::Read(e.why)))
 }
 
 /// One tree entry: its mode, name, id and length.

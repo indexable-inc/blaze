@@ -333,7 +333,8 @@ pub(crate) mod tests {
             ("__CARGO_TEST_ROOT".to_owned(), root.to_owned()),
             ("BLAZE_HOME".to_owned(), format!("{root}/blaze")),
         ];
-        let config = crate::Config::load_with(Path::new(root), env, files).unwrap();
+        let no_record = crate::config::UserRecord(Err(blaze_core::home::NoRecord::NoEntry { uid: 0 }));
+        let config = crate::Config::load_with(Path::new(root), env, no_record, files).unwrap();
         let ctx = crate::Context::new(config);
         let manifest = crate::metadata::root_manifest(None, &ctx).unwrap();
         let ws = crate::Workspace::new(&manifest, &ctx).unwrap();

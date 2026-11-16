@@ -139,7 +139,7 @@ pub use self::core::{
     SEGMENTS_MOST, SLICE_BYTES, Scrubbed, Sliced, TAGS, WINDOW,
 };
 pub use self::driven::{Driven, LocalDir, Opened, lower_this_thread};
-pub use self::format::{Described, Entry, FORMAT, SEGMENT_FORMAT, Segment, check_segment, describe, record_crc, seal_segment};
+pub use self::format::{Described, Entry, FORMAT, SEGMENT_FORMAT, Segment, check_segment, describe, find_many, record_crc, seal_segment};
 pub use self::handle::{LANES_MOST, LaneId, PlainStore};
 pub use self::image::{IMAGE_TAG, ImageError, Placement, StartupImage};
 pub use self::settings::{Form, Settings};

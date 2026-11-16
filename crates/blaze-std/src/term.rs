@@ -27,6 +27,18 @@ pub struct Size {
     pub rows: u16,
 }
 
+/// What a standard stream is drawn on: what [`crate::out::Out::is_terminal`] and
+/// [`crate::out::Out::size`] read. A fact of the process's own descriptor, so no grant is
+/// needed for it (unlike a [`Term`], which reads keys and changes modes).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Tty {
+    /// A file, a pipe or a socket: nothing to size, and no one to read colours.
+    #[default]
+    NotTerminal,
+    /// A terminal, with its size in cells when the kernel says one.
+    Terminal(Option<Size>),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Color {
     /// The terminal's own.

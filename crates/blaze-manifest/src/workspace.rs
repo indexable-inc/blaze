@@ -5,7 +5,6 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use annotate_snippets::{Level, Renderer};
 use blaze_core::home::NoHome;
 use blaze_data::Value;
 use blaze_hash::{HashMap, HashSet};
@@ -17,9 +16,9 @@ use crate::files::Files;
 use crate::manifest::{
     Context, EitherManifest, Manifest, WorkspaceConfig, WorkspaceRootConfig, read_manifest,
 };
-use crate::paths::{ancestors, normalize_path};
+use crate::paths::{ancestors, normalize_path, relative_to};
 use crate::schema::TomlProfiles;
-use crate::source;
+use crate::{snippet, source};
 
 /// What cargo refuses of a workspace's shape, in its words.
 #[derive(Debug)]
@@ -282,7 +281,7 @@ impl<'c, F: Files> Workspace<'c, F> {
         let config = &self.ctx.config;
         let root = crate::home::root(
             |name| config.env(name).map(std::ffi::OsString::from),
-            blaze_core::home::record,
+            || config.user().0.clone(),
         );
         let root = root.map_err(|why| WorkspaceError::NoBuildHome {
             workspace: self.root().to_owned(),
@@ -585,7 +584,7 @@ impl<'c, F: Files> Workspace<'c, F> {
         let root = self.root_manifest.as_ref().unwrap();
         let root_dir = normalize_path(root.parent().unwrap());
         let current_dir = normalize_path(self.current_manifest.parent().unwrap());
-        let members_msg = match pathdiff::diff_paths(&current_dir, &root_dir) {
+        let members_msg = match relative_to(&current_dir, &root_dir) {
             Some(rel) => format!(
                 "this may be fixable by adding `{}` to the \
                  `workspace.members` array of the manifest \
@@ -668,18 +667,21 @@ impl<'c, F: Files> Workspace<'c, F> {
             && let Some(edition) = max_member_edition
         {
             let resolver = edition.default_resolve_behavior().to_manifest();
-            let report = Level::WARNING
-                .primary_title(format!(
-                    "virtual workspace defaulting to `resolver = \"1\"` despite one or more workspace members being on edition {edition} which implies `resolver = \"{resolver}\"`"
-                ))
-                .elements([
-                    Level::NOTE.message("to keep the current resolver, specify `workspace.resolver = \"1\"` in the workspace root's manifest"),
-                    Level::NOTE.message(format!(
-                        "to use the edition {edition} resolver, specify `workspace.resolver = \"{resolver}\"` in the workspace root's manifest"
-                    )),
-                    Level::NOTE.message("for more details see https://doc.rust-lang.org/cargo/reference/resolver.html#resolver-versions"),
-                ]);
-            let rendered = Renderer::plain().render(&[report]);
+            let title = format!(
+                "virtual workspace defaulting to `resolver = \"1\"` despite one or more workspace members being on edition {edition} which implies `resolver = \"{resolver}\"`"
+            );
+            let to_use = format!(
+                "to use the edition {edition} resolver, specify `workspace.resolver = \"{resolver}\"` in the workspace root's manifest"
+            );
+            let rendered = snippet::with_notes(
+                snippet::Level::Warning,
+                &title,
+                &[
+                    (snippet::Level::Note, "to keep the current resolver, specify `workspace.resolver = \"1\"` in the workspace root's manifest"),
+                    (snippet::Level::Note, &to_use),
+                    (snippet::Level::Note, "for more details see https://doc.rust-lang.org/cargo/reference/resolver.html#resolver-versions"),
+                ],
+            );
             self.warnings.push(rendered.strip_prefix("warning: ").unwrap_or(&rendered).to_owned());
         }
     }

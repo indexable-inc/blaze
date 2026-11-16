@@ -19,20 +19,46 @@ pub enum ResolveError {
     TooManyExpansions { module: ItemKey },
     /// A run of passes that kept changing state past the bound the work allows: a bug.
     NoProgressBound { module: ItemKey, passes: u32 },
-    /// A group's glob fixpoint of one name kept changing past its bound: a bug.
-    GlobFixpointBound { module: ItemKey },
+    /// A lookup through globs broke one of its own invariants, `why` says which: a bug.
+    GlobLookup { module: ItemKey, why: GlobBug },
     /// The final pass found a name of `module` still undetermined with every answer in:
     /// `glob_of` names the module whose glob left it so (none: no glob did), `unexpanded`
     /// the calls of `module` that may still add names. A bug.
     Undecided { module: ItemKey, glob_of: Option<ItemKey>, unexpanded: u32 },
     /// A member's final pass waited on something with every answer in: a bug.
     MemberUnfinished { module: ItemKey },
+    /// A member's final pass made alone, its fellows read by the records the group wrote,
+    /// gave another scope than the group's: the group's result is no fixpoint of the records.
+    /// A bug.
+    Unsettled { module: ItemKey },
+    /// The scope of `module` marks no place for its child `child`'s `mod` line: a bug.
+    NoMark { module: ItemKey, child: ItemKey },
+    /// The worklist went quiet with an item of `module` that would move: a change it read
+    /// did not wake it. A bug, found by the check test builds make at every quiet point.
+    MissedWake { module: ItemKey },
     /// An answer of the wrong kind for its read.
     WrongAnswer { module: ItemKey, read_of: ItemKey },
     /// A step after the machine finished.
     Finished { module: ItemKey },
     /// A group made of no machine, or of two machines of one module.
     BadGroup { module: Option<ItemKey> },
+}
+
+/// Which invariant of a lookup through globs broke. Each is its own value so a refusal names
+/// its cause: one flag for all of them once hid which (the seed-518 hunt). The group's own
+/// fixpoint, and its three ways to break, went with the one walk (members and records alike).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum GlobBug {
+    /// A walk through glob edges (`blaze_surface::through`) passed its bound.
+    ThroughUnbounded,
+}
+
+impl fmt::Display for GlobBug {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            GlobBug::ThroughUnbounded => "a walk through glob edges passed its bound",
+        })
+    }
 }
 
 impl fmt::Display for ResolveError {
@@ -55,10 +81,9 @@ impl fmt::Display for ResolveError {
                 f,
                 "name resolution of module {module:x}: {passes} passes changed state, past the bound its work allows"
             ),
-            ResolveError::GlobFixpointBound { module } => write!(
-                f,
-                "name resolution of the group of module {module:x}: a glob fixpoint changed past its bound"
-            ),
+            ResolveError::GlobLookup { module, why } => {
+                write!(f, "name resolution of the group of module {module:x}: {why}")
+            }
             ResolveError::Undecided { module, glob_of, unexpanded } => {
                 write!(f, "name resolution of module {module:x}: a name undetermined in the final pass (")?;
                 match glob_of {
@@ -69,6 +94,16 @@ impl fmt::Display for ResolveError {
             }
             ResolveError::MemberUnfinished { module } => {
                 write!(f, "name resolution of module {module:x}: the final pass waited with every answer in")
+            }
+            ResolveError::Unsettled { module } => write!(
+                f,
+                "name resolution of module {module:x}: its scope read against its fellows' records differs from its group's"
+            ),
+            ResolveError::NoMark { module, child } => {
+                write!(f, "name resolution of module {module:x}: its scope marks no place for child {child:x}")
+            }
+            ResolveError::MissedWake { module } => {
+                write!(f, "name resolution of module {module:x}: the worklist missed a wake (an item would still move)")
             }
             ResolveError::WrongAnswer { module, read_of } => write!(
                 f,

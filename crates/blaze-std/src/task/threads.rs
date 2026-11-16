@@ -27,7 +27,7 @@
 //!   task/idle.rs that loses no wake and wakes at most one worker per spawn.
 //! - **Per-worker state** is padded to [`LINE`], the target's cache line.
 
-use alloc::alloc::Global;
+use alloc::{alloc::Global, boxed::Box};
 use core::{
     cell::UnsafeCell,
     fmt,
@@ -48,6 +48,7 @@ use blaze_own::{Arc, Vec, VecDeque};
 
 use super::{
     TaskError,
+    claim::{Claim, ClaimPlant, Start},
     deque::{DEQUE, Deque, DequePlant, Steal},
     idle::{Idle, IdlePlant, Mark, Woke},
 };
@@ -153,16 +154,12 @@ impl Plants {
     pub(crate) const NONE: Plants = Plants { deque: DequePlant::None, idle: IdlePlant::None };
 }
 
-const QUEUED: u8 = 0;
-const CLAIMED: u8 = 1;
-const DONE: u8 = 2;
-
 /// The type-erased head of every queued task (a [`Job`]): what a queue holds a pointer to.
 #[repr(C)]
 pub(crate) struct Header {
-    /// `QUEUED`, then `CLAIMED` by whoever starts it (a worker, or its joiner running it
-    /// inline), then `DONE`. Each move is a compare-and-swap or the claimer's store.
-    state: AtomicU8,
+    /// Who may start it, and whether it ended (task/claim.rs): a worker, or for an open task
+    /// its joiner running it inline; never the joiner of a reserved (`must_overlap`) one.
+    claim: Claim,
     /// Runs the claimed task's body on `Here` and marks it done.
     run: unsafe fn(NonNull<Header>, Here),
     /// Drops the claimed task's body unrun and marks it done.
@@ -173,14 +170,9 @@ pub(crate) struct Header {
 }
 
 impl Header {
-    /// Takes the task to start it: `false` when another took it.
-    fn claim(&self) -> bool {
-        self.state.compare_exchange(QUEUED, CLAIMED, Ordering::AcqRel, Ordering::Acquire).is_ok()
-    }
-
     /// Whether it ended: `Acquire`, ordered after the body's writes of its result.
     fn done(&self) -> bool {
-        self.state.load(Ordering::Acquire) == DONE
+        self.claim.done()
     }
 }
 
@@ -302,11 +294,11 @@ impl<T> Queued<T> {
         unsafe { &self.head.as_ref().header }
     }
 
-    /// Takes the task to run it on this thread, if no worker started it: `Some` with what it
-    /// made.
+    /// Takes the task to run it on this thread, if no worker started it and it is not reserved
+    /// for one (task/claim.rs): `Some` with what it made.
     pub(crate) fn run_here(&self, here: Here) -> Option<Ran<T>> {
         let header = self.header();
-        if !header.claim() {
+        if !header.claim.by_joiner() {
             return None;
         }
         // SAFETY: claimed by this thread, so the body is this thread's to run, once.
@@ -329,15 +321,24 @@ impl<T> Queued<T> {
         unsafe { &self.head.as_ref().tally }
     }
 
-    /// Drops the task unrun if nobody started it: whether it did.
+    /// Drops the task unrun if nobody started it and it is not reserved for a worker: whether
+    /// it did. A reserved one is left to its worker, which runs it.
     pub(crate) fn drop_unstarted(&self) -> bool {
         let header = self.header();
-        if !header.claim() {
+        if !header.claim.by_joiner() {
             return false;
         }
         // SAFETY: claimed by this thread just now.
         unsafe { (header.discard)(NonNull::from(header)) };
         true
+    }
+
+    /// Drops unrun a reserved task whose reservation was refused, so no worker ever saw it.
+    pub(crate) fn withdraw(&self) {
+        let header = self.header();
+        header.claim.withdraw();
+        // SAFETY: claimed by this thread just now.
+        unsafe { (header.discard)(NonNull::from(header)) };
     }
 
     /// Drops what it made, if it is still held: once [`Queued::done`].
@@ -375,7 +376,7 @@ impl<T> Drop for Queued<T> {
 /// `body` may borrow what lives only as long as its scope: the caller makes sure the job has
 /// run or been dropped unrun before that ends (a scope never returns while a task of it is
 /// queued or running: its join waits, and a task past its deadline stops the process).
-pub(crate) unsafe fn job<F, T>(name: &'static str, tally: &Arc<Tally, Global>, body: F) -> (Queued<T>, JobPtr)
+pub(crate) unsafe fn job<F, T>(name: &'static str, tally: &Arc<Tally, Global>, start: Start, body: F) -> (Queued<T>, JobPtr)
 where
     F: FnOnce(Here) -> Ran<T> + Send,
     T: Send,
@@ -383,7 +384,7 @@ where
     let job = Job {
         head: JobHead::<T> {
             header: Header {
-                state: AtomicU8::new(QUEUED),
+                claim: Claim::new(start, ClaimPlant::None),
                 run: run::<F, T>,
                 discard: discard::<F, T>,
                 release: release::<F, T>,
@@ -425,7 +426,7 @@ where
     // SAFETY: claimed and not yet done: this thread alone touches the result until the store
     // of `DONE` below publishes it.
     unsafe { *job.head.out.get() = Some(ran) };
-    job.head.header.state.store(DONE, Ordering::Release);
+    job.head.header.claim.finish();
     job.head.tally.ended();
 }
 
@@ -439,7 +440,7 @@ unsafe fn discard<F, T>(header: NonNull<Header>) {
     let job = unsafe { header.cast::<Job<F, T>>().as_ref() };
     // SAFETY: claimed, so this thread alone touches the body.
     drop(unsafe { (*job.body.get()).take() });
-    job.head.header.state.store(DONE, Ordering::Release);
+    job.head.header.claim.finish();
     job.head.tally.ended();
 }
 
@@ -470,6 +471,8 @@ struct Worker {
     parker: Parker,
     group: u32,
     class: Class,
+    /// Its core, by the kernel's number: where its thread pins itself when the topology asks.
+    cpu: u32,
     /// The task it runs now, for a stop's report: a lock taken once at each task's start and
     /// end, never contended but by that report.
     current: Lock<&'static str>,
@@ -491,7 +494,8 @@ struct GroupState {
     background: Lock<VecDeque<JobPtr, Global>>,
 }
 
-/// The pool's shared state.
+/// The pool's shared state, made from the machine's topology when the pool is first asked
+/// anything about its workers ([`Pool::shared`]).
 struct Shared {
     workers: Vec<Padded<Worker>, Global>,
     groups: Vec<GroupState, Global>,
@@ -499,12 +503,57 @@ struct Shared {
     stop: Padded<AtomicBool>,
     /// The group an outside spawn goes to next (round robin).
     next_group: Padded<AtomicU32>,
-    clock: Monotonic,
+    /// Whether each thread pins itself to its core (Linux) or sets its class's QoS (macOS).
+    pin: bool,
 }
+
+/// What the pool is before it is asked about its workers, and what is the same after: no
+/// topology read, no table made, no thread started, until a program asks for one.
+struct Lazy {
+    /// The workers' tables once made: null until then, set once by a compare-and-swap (a
+    /// second maker's are freed), and freed with this.
+    made: AtomicPtr<Shared>,
+    /// What reads the machine: the driver's (rt.rs), called by the first that asks; `None`
+    /// for a pool made from a topology given ([`Pool::new`]), whose tables are made at once.
+    read: Option<Reader>,
+    plants: Plants,
+    clock: Monotonic,
+    /// Whether the threads were asked for: set once, by the first spawn ([`Pool::begin`]).
+    begun: AtomicBool,
+    /// What starts the threads: the driver's (rt.rs), called once by the first spawn.
+    starter: Starter,
+    /// How many workers have left their loops: the last one wakes [`Lazy::stopper`].
+    left: AtomicU32,
+    /// Where a stop waits for the last worker to leave.
+    stopper: Parker,
+    /// How many workers' threads have reached their loops: a test waits for all, since an
+    /// unstarted worker is counted parked too (task/idle.rs).
+    #[cfg(test)]
+    arrived: AtomicU32,
+}
+
+impl Drop for Lazy {
+    fn drop(&mut self) {
+        let made = *self.made.get_mut();
+        if !made.is_null() {
+            // SAFETY: set once from `Box::into_raw_with_allocator` of a `Box<Shared, Global>`
+            // ([`Pool::shared`]), and this is its last owner.
+            drop(unsafe { Box::from_raw_in(made, Global) });
+        }
+    }
+}
+
+/// Starts a pool's threads, from the first spawn on it (the caller's thread): the driver's,
+/// since threads are Rust std's (rt.rs). Each thread runs [`Pool::work`] for its worker.
+pub(crate) type Starter = fn(&Pool);
+
+/// Reads the machine's topology for a pool, when it is first asked about its workers: the
+/// driver's (rt.rs). It returns the topology or stops the process naming why.
+pub(crate) type Reader = fn() -> Topology;
 
 /// A handle on the pool: cloned into every context that spawns on it.
 #[derive(Clone)] // clone: an `Arc` handle
-pub(crate) struct Pool(Arc<Shared, Global>);
+pub(crate) struct Pool(Arc<Lazy, Global>);
 
 const _: () = {
     const fn crosses<T: Send + Sync>() {}
@@ -549,7 +598,77 @@ impl core::error::Error for Hung {}
 pub(crate) struct Full(pub(crate) JobPtr);
 
 impl Pool {
-    pub(crate) fn new(topology: &Topology, clock: Monotonic, plants: Plants) -> Pool {
+    /// The pool of `topology`, its tables made now and no thread of it started: `starter`
+    /// starts them at the first spawn, and until it has, every worker is parked (task/idle.rs,
+    /// "A worker whose thread has not started is parked"). A test's pool.
+    pub(crate) fn new(topology: &Topology, clock: Monotonic, plants: Plants, starter: Starter) -> Pool {
+        let made = Box::into_raw_with_allocator(Box::new_in(Pool::make(topology, plants), Global)).0;
+        Pool::with(AtomicPtr::new(made), None, clock, plants, starter)
+    }
+
+    /// The pool of the machine `read` reads, nothing of it made: the topology is read and the
+    /// tables made when it is first asked about its workers (a scope's layout, a spawn), and
+    /// its threads start at the first spawn. A program that does neither reads no topology,
+    /// makes no table and starts no thread.
+    pub(crate) fn lazy(read: Reader, clock: Monotonic, plants: Plants, starter: Starter) -> Pool {
+        Pool::with(AtomicPtr::new(ptr::null_mut()), Some(read), clock, plants, starter)
+    }
+
+    fn with(made: AtomicPtr<Shared>, read: Option<Reader>, clock: Monotonic, plants: Plants, starter: Starter) -> Pool {
+        let lazy = Lazy {
+            made,
+            read,
+            plants,
+            clock,
+            begun: AtomicBool::new(false),
+            starter,
+            left: AtomicU32::new(0),
+            stopper: Parker::new(),
+            #[cfg(test)]
+            arrived: AtomicU32::new(0),
+        };
+        Pool(Arc::new_in(lazy, Global))
+    }
+
+    /// The workers' tables, made now if they were not: the first caller reads the topology and
+    /// makes them; two at once each make theirs and the compare-and-swap keeps one (the other
+    /// is freed), so every caller sees the same tables. `Acquire` pairs with the `AcqRel`
+    /// that published them.
+    #[inline]
+    fn shared(&self) -> &Shared {
+        let made = self.0.made.load(Ordering::Acquire);
+        if !made.is_null() {
+            // SAFETY: set once to a live `Box<Shared, Global>` that lives as long as `self.0`.
+            return unsafe { &*made };
+        }
+        self.make_now()
+    }
+
+    #[cold]
+    fn make_now(&self) -> &Shared {
+        let read = self.0.read.expect("a pool without a reader was made with its tables");
+        let mine = Box::into_raw_with_allocator(Box::new_in(Pool::make(&read(), self.0.plants), Global)).0;
+        let made = match self.0.made.compare_exchange(ptr::null_mut(), mine, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => mine,
+            Err(theirs) => {
+                // SAFETY: `mine` is the box made above, never published.
+                drop(unsafe { Box::from_raw_in(mine, Global) });
+                theirs
+            }
+        };
+        // SAFETY: as in `shared`.
+        unsafe { &*made }
+    }
+
+    /// Whether the tables were made: a stop of a pool never asked about its workers has none
+    /// to stop.
+    fn made(&self) -> Option<&Shared> {
+        let made = self.0.made.load(Ordering::Acquire);
+        // SAFETY: as in `shared`.
+        (!made.is_null()).then(|| unsafe { &*made })
+    }
+
+    fn make(topology: &Topology, plants: Plants) -> Shared {
         let count = topology.workers();
         let mut workers = Vec::with_capacity_in(count as usize, Global);
         let mut groups = Vec::with_capacity_in(topology.groups.len(), Global);
@@ -557,14 +676,15 @@ impl Pool {
         for (at, group) in topology.groups.iter().enumerate() {
             let len = u32::try_from(group.cpus.len()).unwrap_or(u32::MAX);
             let at = u32::try_from(at).unwrap_or(u32::MAX);
-            for _ in 0..len {
+            for &cpu in group.cpus.iter() {
                 workers.push(Padded(Worker {
+                    cpu,
                     lifo: AtomicPtr::new(ptr::null_mut()),
                     lifo_run: AtomicU32::new(0),
                     deque: Deque::new(plants.deque),
                     mailbox: AtomicPtr::new(ptr::null_mut()),
                     pinned: Lock::new("bstd.task.pinned", VecDeque::with_capacity_in(PINNED, Global)),
-                    mark: Mark::new(),
+                    mark: Mark::unstarted(),
                     parker: Parker::new(),
                     group: at,
                     class: group.class,
@@ -584,20 +704,62 @@ impl Pool {
             });
             first += len;
         }
-        let shared = Shared {
+        Shared {
             workers,
             groups,
-            idle: Idle::new(count, plants.idle),
+            idle: Idle::unstarted(count, plants.idle),
             stop: Padded(AtomicBool::new(false)),
             next_group: Padded(AtomicU32::new(0)),
-            clock,
-        };
-        Pool(Arc::new_in(shared, Global))
+            pin: topology.pin,
+        }
+    }
+
+    /// The threads are started if they were not: the first caller, of any thread, calls the
+    /// starter, once (the compare-and-swap); every other returns at once. A task published
+    /// after this, before the threads run, waits as for a parked worker (task/idle.rs).
+    pub(crate) fn begin(&self) {
+        let lazy = &*self.0;
+        if lazy.begun.load(Ordering::Acquire) {
+            return;
+        }
+        if lazy.begun.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+            (lazy.starter)(self);
+        }
+    }
+
+    /// Where worker `at`'s thread places itself: its core and class, and `None` when the
+    /// topology asks for no placement.
+    pub(crate) fn placement(&self, at: u32) -> Option<(u32, Class)> {
+        let worker = &self.shared().workers[at as usize].0;
+        self.shared().pin.then_some((worker.cpu, worker.class))
+    }
+
+    /// Whether the threads were asked for ([`Pool::begin`]).
+    pub(crate) fn begun(&self) -> bool {
+        self.0.begun.load(Ordering::Acquire)
+    }
+
+    /// Waits until every worker has left its loop, or `until` on the pool's clock: whether all
+    /// have. The last to leave unparks this wait; a pool whose threads never began has none
+    /// to wait for. One thread waits at a time (the stop's).
+    pub(crate) fn wait_left(&self, until: Deadline) -> Result<bool, WaitError> {
+        let lazy = &*self.0;
+        if !self.begun() {
+            return Ok(true);
+        }
+        let count = self.shared().workers.len();
+        while lazy.left.load(Ordering::Acquire) as usize != count {
+            if until.passed(lazy.clock.now()) {
+                return Ok(false);
+            }
+            lazy.stopper.park("bstd.rt.pool.stop", Some(until), &lazy.clock)?;
+        }
+        Ok(true)
     }
 
     /// How many workers it has.
     pub(crate) fn workers(&self) -> u32 {
-        u32::try_from(self.0.workers.len()).unwrap_or(u32::MAX)
+        u32::try_from(self.shared().workers.len()).unwrap_or(u32::MAX)
     }
 
     /// The clock its parks are timed on.
@@ -607,14 +769,15 @@ impl Pool {
 
     /// The class of worker `at`.
     pub(crate) fn class_of(&self, at: u32) -> Class {
-        self.0.workers[at as usize].0.class
+        self.shared().workers[at as usize].0.class
     }
 
     /// A task spawned from `here` in `class`: onto the spawner's own LIFO slot and deque when it
     /// is a worker and the task is foreground, else onto an injection queue; then at most one
     /// worker woken. `Err` when the queue is full: the caller runs it inline.
     pub(crate) fn spawn(&self, here: Here, class: Class, job: JobPtr) -> Result<(), Full> {
-        let shared = &*self.0;
+        self.begin();
+        let shared = self.shared();
         let near = match (here, class) {
             (Here::Worker(at), Class::Foreground) => {
                 let worker = &shared.workers[at as usize].0;
@@ -653,7 +816,7 @@ impl Pool {
     /// The group a background task from `group` goes to: `group` if it is a background group,
     /// else the first that is, else `group` (a machine with one kind of core).
     fn background_group(&self, group: u32) -> u32 {
-        let groups = &self.0.groups;
+        let groups = &self.shared().groups;
         if groups[group as usize].class == Class::Background {
             return group;
         }
@@ -662,7 +825,7 @@ impl Pool {
     }
 
     fn inject(&self, group: u32, class: Class, job: JobPtr) -> Result<(), Full> {
-        let group = &self.0.groups[group as usize];
+        let group = &self.shared().groups[group as usize];
         let queue = match class {
             Class::Foreground => &group.foreground,
             Class::Background => &group.background,
@@ -677,7 +840,8 @@ impl Pool {
             Here::Outside => {
                 // SAFETY: the queue's reference, which the full queue handed back.
                 let head = unsafe { job.0.as_ref() };
-                if head.claim() {
+                // A full queue hands back only open tasks: a reserved one goes to a mailbox.
+                if head.claim.by_joiner() {
                     // SAFETY: claimed by this thread just now.
                     unsafe { (head.run)(job.0, Here::Outside) };
                 }
@@ -690,7 +854,7 @@ impl Pool {
     /// After a task is published: wakes at most one parked worker, its group `near` first,
     /// when no worker is searching (task/idle.rs).
     fn notify(&self, near: u32) {
-        let shared = &*self.0;
+        let shared = self.shared();
         let groups = shared.groups.len();
         let order = (0..groups).flat_map(move |step| {
             let group = &shared.groups[(near as usize + step) % groups];
@@ -704,7 +868,8 @@ impl Pool {
     /// `must_overlap`: hands `job` to a worker that is idle now (searching or parked), not
     /// `here`, its own group first, which starts it next. `Err` when none is.
     pub(crate) fn reserve(&self, here: Here, job: JobPtr) -> Result<u32, JobPtr> {
-        let shared = &*self.0;
+        self.begin();
+        let shared = self.shared();
         let (near, me) = match here {
             Here::Worker(at) => (shared.workers[at as usize].0.group, Some(at)),
             Here::Outside => (0, None),
@@ -735,7 +900,8 @@ impl Pool {
     /// A task that must run on worker `at` (a fold's visit): onto its pinned queue, and it
     /// woken if parked. `Err` when the queue is full.
     pub(crate) fn spawn_on(&self, at: u32, job: JobPtr) -> Result<(), Full> {
-        let shared = &*self.0;
+        self.begin();
+        let shared = self.shared();
         let worker = &shared.workers[at as usize].0;
         bounded_push(&mut worker.pinned.lock(), PINNED, job)?;
         if shared.idle.wake_this(&worker.mark) {
@@ -784,7 +950,7 @@ impl Pool {
 
     /// A task of worker `at`'s own: its pinned queue, its LIFO slot, its deque.
     fn own(&self, at: u32) -> Option<JobPtr> {
-        let worker = &self.0.workers[at as usize].0;
+        let worker = &self.shared().workers[at as usize].0;
         if let Some(job) = worker.pinned.lock().pop_front() {
             return Some(job);
         }
@@ -805,11 +971,11 @@ impl Pool {
 
     /// Runs `job` on worker `at` if it is still unstarted, then gives up the queue's reference.
     fn run_job(&self, at: u32, job: JobPtr) {
-        let worker = &self.0.workers[at as usize].0;
+        let worker = &self.shared().workers[at as usize].0;
         let header = job.0;
         // SAFETY: the queue's reference keeps the job alive until the release below.
         let head = unsafe { header.as_ref() };
-        if head.claim() {
+        if head.claim.by_worker() {
             let outer = core::mem::replace(&mut *worker.current.lock(), head.name);
             // SAFETY: claimed by this thread just now.
             unsafe { (head.run)(header, Here::Worker(at)) };
@@ -822,9 +988,13 @@ impl Pool {
     /// Worker `at`'s loop, on its own thread, until the pool stops and nothing is left where it
     /// looks.
     pub(crate) fn work(&self, at: u32) {
-        let shared = &*self.0;
+        let shared = self.shared();
         let worker = &shared.workers[at as usize].0;
-        let mut searching = false;
+        // The thread was parked before it existed (task/idle.rs): it comes back as from a
+        // park, a searcher if a spawn woke it, its mailbox first if it was reserved.
+        let mut searching = shared.idle.back(&worker.mark) == Woke::Searching;
+        #[cfg(test)]
+        self.0.arrived.fetch_add(1, Ordering::SeqCst);
         let mut looks = 0;
         loop {
             if worker.mark.reserved() {
@@ -882,7 +1052,7 @@ impl Pool {
             let woke = if self.visible(at) || shared.stop.0.load(Ordering::Acquire) {
                 shared.idle.back(&worker.mark)
             } else {
-                let clock = &shared.clock;
+                let clock = &self.0.clock;
                 let parked = worker.parker.park("bstd.task.worker.idle", Some(Deadline::after(clock.now(), PARK_SLICE)), clock);
                 let woke = shared.idle.back(&worker.mark);
                 if let Err(why) = parked {
@@ -897,10 +1067,13 @@ impl Pool {
             searching = woke == Woke::Searching;
         }
         worker.exited.store(true, Ordering::Release);
+        if self.0.left.fetch_add(1, Ordering::AcqRel) as usize + 1 == shared.workers.len() {
+            self.0.stopper.unpark();
+        }
     }
 
     fn take_mailbox(&self, at: u32) {
-        let worker = &self.0.workers[at as usize].0;
+        let worker = &self.shared().workers[at as usize].0;
         let job = worker.mailbox.swap(ptr::null_mut(), Ordering::Acquire);
         worker.mark.took_mailbox();
         match NonNull::new(job) {
@@ -912,7 +1085,7 @@ impl Pool {
     /// The next task for worker `at`, in the module doc's order. `searching` says whether it
     /// is counted a searcher; it asks to become one before it steals.
     fn find(&self, at: u32, searching: &mut bool) -> Option<JobPtr> {
-        let shared = &*self.0;
+        let shared = self.shared();
         let worker = &shared.workers[at as usize].0;
         let own = &shared.groups[worker.group as usize];
         if let Some(job) = self.own(at) {
@@ -966,7 +1139,7 @@ impl Pool {
 
     /// Whether any task is visible to worker `at`: the idle protocol's re-check.
     fn visible(&self, at: u32) -> bool {
-        let shared = &*self.0;
+        let shared = self.shared();
         let worker = &shared.workers[at as usize].0;
         !worker.pinned.lock().is_empty()
             || shared.workers.iter().any(|it| !it.0.deque.looks_empty())
@@ -975,21 +1148,23 @@ impl Pool {
 
     /// Asks every worker to stop once it finds nothing more to run, and wakes them.
     pub(crate) fn stop(&self) {
-        self.0.stop.0.store(true, Ordering::SeqCst);
-        for worker in &self.0.workers {
+        let Some(shared) = self.made() else { return };
+        shared.stop.0.store(true, Ordering::SeqCst);
+        for worker in &shared.workers {
             worker.0.parker.unpark();
         }
     }
 
     /// Whether worker `at`'s thread left its loop.
     pub(crate) fn exited(&self, at: u32) -> bool {
-        self.0.workers[at as usize].0.exited.load(Ordering::Acquire)
+        self.shared().workers[at as usize].0.exited.load(Ordering::Acquire)
     }
 
     /// The workers left running after a stop, or broken, by worker: `None` when there are none.
     pub(crate) fn hung(&self) -> Option<Hung> {
         let mut stuck = Vec::new_in(Global);
-        for (at, worker) in self.0.workers.iter().enumerate() {
+        let Some(shared) = self.made() else { return None };
+        for (at, worker) in shared.workers.iter().enumerate() {
             let at = u32::try_from(at).unwrap_or(u32::MAX);
             let broken = worker.0.broken.lock().take();
             if broken.is_some() || !worker.0.exited.load(Ordering::Acquire) {
@@ -1002,20 +1177,26 @@ impl Pool {
     /// Steals by worker `at` from its own group and from the others: for a test.
     #[cfg(test)]
     pub(crate) fn steals(&self, at: u32) -> (u64, u64) {
-        let worker = &self.0.workers[at as usize].0;
+        let worker = &self.shared().workers[at as usize].0;
         (worker.stole_near.load(Ordering::Relaxed), worker.stole_far.load(Ordering::Relaxed))
     }
 
     /// How many workers are parked now: for a test that needs them idle first.
     #[cfg(test)]
     pub(crate) fn parked(&self) -> u32 {
-        self.0.idle.counts().1
+        self.shared().idle.counts().1
+    }
+
+    /// How many workers' threads have reached their loops: for a test that needs them all up.
+    #[cfg(test)]
+    pub(crate) fn arrived(&self) -> u32 {
+        self.0.arrived.load(Ordering::SeqCst)
     }
 
     /// The victims worker `at` tries, in order: for a test of the order.
     #[cfg(test)]
     pub(crate) fn victims(&self, at: u32) -> Vec<u32, Global> {
-        let shared = &*self.0;
+        let shared = self.shared();
         let me = shared.workers[at as usize].0.group as usize;
         let groups = shared.groups.len();
         let mut order = Vec::new_in(Global);
@@ -1080,7 +1261,7 @@ impl Drop for Shared {
         for job in left {
             // SAFETY: the queue's reference, taken out of its queue here.
             let head = unsafe { job.0.as_ref() };
-            assert!(!head.claim(), "bstd::task::threads: the pool stopped with task {} never run", head.name);
+            assert!(!head.claim.by_worker(), "bstd::task::threads: the pool stopped with task {} never run", head.name);
             // SAFETY: the queue's reference, given up once.
             unsafe { (head.release)(job.0) };
         }

@@ -41,6 +41,23 @@ pub enum Question {
     Opaque(Def),
     Lang(Lang),
     IsLocal(Def),
+    /// A `where const` condition at ground arguments (`Pred::ConstHolds`). The list is a span
+    /// of the caller's arena, valid for the solve that stopped on it: the world reads its terms
+    /// before the solve runs again.
+    ConstHolds(Def, List),
+}
+
+/// The value of a `where const` condition at ground arguments (`Facts::const_holds`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ConstHolds {
+    /// The condition evaluated to `true`: the clause holds.
+    True,
+    /// The condition evaluated to `false`: the clause fails, and so does the goal it is
+    /// nested in (it never sends selection to another impl).
+    False,
+    /// The evaluation failed (a panic, an error of the evaluator, a condition the evaluator
+    /// cannot answer yet): a finding on the clause, which is never taken as true or false.
+    Error,
 }
 
 /// One read: the question and the digest of its answer.
@@ -198,6 +215,19 @@ impl AdtFlags {
     }
 }
 
+/// An enum's discriminant type. Reference, "Enumerations", "Discriminants": "Under the
+/// default representation, the discriminant is interpreted as an `isize` value", and under a
+/// primitive representation (`#[repr(u8)]` etc.) it is that integer ("Type Layout",
+/// "Primitive representations").
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Discr {
+    /// The world did not say (no `repr` read): a projection to it is an error naming the enum,
+    /// never a guess.
+    Unread,
+    Int(crate::term::IntTy),
+    Uint(crate::term::UintTy),
+}
+
 /// An ADT's definition, as solving needs it: its field types (every variant's, flattened, each
 /// variant a range) and the tail field whose sizedness is the ADT's.
 #[derive(Clone, Copy, Debug)]
@@ -209,6 +239,10 @@ pub struct AdtDef<'w> {
     pub variants: &'w [(u32, u32)],
     /// The last field of a struct, when it has one.
     pub sized_tail: Option<Ty>,
+    /// An enum's discriminant type (`DiscriminantKind::Discriminant`); `Unread` for a struct or
+    /// union (whose discriminant type is `u8` whatever this says) and for an enum whose world
+    /// does not read `repr` yet.
+    pub discr: Discr,
     /// The ADT's where-clauses (for well-formedness).
     pub where_clauses: &'w [Pred],
     pub portable: Portable<'w>,
@@ -230,6 +264,8 @@ impl FnSigDef<'_> {
     pub const CONST: u16 = 1 << 0;
     pub const UNSAFE: u16 = 1 << 1;
     pub const TARGET_FEATURE: u16 = 1 << 2;
+    /// `extern "rust-call"`: not `Fn*`-compatible (`ExternAbi::is_fn_trait_compatible`).
+    pub const RUST_CALL: u16 = 1 << 3;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -282,6 +318,10 @@ pub trait Facts {
     /// Whether `d` is of the crate being compiled (coherence's orphan check and unknowable
     /// candidates).
     fn is_local(&self, seal: Seal, d: Def) -> Fetch<bool>;
+    /// The value of the `where const` condition `cond` at `args`, every one ground and
+    /// resolved (hash-consed, so equal arguments are equal terms). `Missing` stops the solve
+    /// with `Need(Question::ConstHolds(cond, list))`, the list holding these terms.
+    fn const_holds(&self, seal: Seal, cond: Def, args: &[Ty]) -> Fetch<ConstHolds>;
 }
 
 /// The digest of a lang item's answer (its def, or none).
@@ -377,5 +417,17 @@ impl<'f, F: Facts> Ask<'f, F> {
     pub fn is_local(&self, log: &mut blaze_own::Vec<Read, blaze_own::Alloc<'_>>, d: Def) -> Result<bool, Stop> {
         let got = self.facts.is_local(Self::seal(), d);
         Self::note(log, Question::IsLocal(d), got, |a| u64::from(*a))
+    }
+
+    /// `cond` at the ground `args`, which `list` holds (the question a `Need` names).
+    pub fn const_holds(
+        &self,
+        log: &mut blaze_own::Vec<Read, blaze_own::Alloc<'_>>,
+        cond: Def,
+        list: List,
+        args: &[Ty],
+    ) -> Result<ConstHolds, Stop> {
+        let got = self.facts.const_holds(Self::seal(), cond, args);
+        Self::note(log, Question::ConstHolds(cond, list), got, |a| *a as u64)
     }
 }

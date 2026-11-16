@@ -9,7 +9,8 @@ use blaze_sim::{Config, Tape};
 
 use crate::advisory::{Advisory, AdvisoryRefused, Database, MOST_ADVISORY_BYTES};
 use crate::audit::{DatabaseInput, Index, Input, audit, verify_database};
-use crate::cargo_lock::{Lock, LockRefused, MOST_LOCK_BYTES};
+use blaze_manifest::lock::Lock;
+use blaze_own::Alloc;
 use crate::date::Date;
 use crate::fetch::{Effect, Event, Fetch, Refused};
 use crate::pins::{DatabasePin, GitPin, SourcePins};
@@ -292,12 +293,6 @@ fn an_oversized_advisory_is_refused_before_it_is_read() {
     assert!(matches!(&said, Err(AdvisoryRefused::TooBig { file, .. }) if file == "crates/foo/RUSTSEC-2026-0101.md"), "{said:?}");
 }
 
-#[test]
-fn an_oversized_lock_is_refused_before_it_is_read() {
-    let text = vec![b'#'; MOST_LOCK_BYTES + 1];
-    assert_eq!(Lock::parse(&text), Err(LockRefused::TooBig { bytes: MOST_LOCK_BYTES + 1 }));
-}
-
 // ---------------------------------------------------------------------------------------
 // A workspace: a lock, a database, settings, pins.
 
@@ -316,14 +311,19 @@ fn blocks() -> Vec<String> {
     ]
 }
 
-fn lock_of(order: &[usize]) -> Lock {
+/// `text` read by the one lock reader, in the global allocator.
+fn read_lock(text: &str) -> Lock<'static> {
+    Lock::read(text.as_bytes(), Alloc::global()).unwrap()
+}
+
+fn lock_of(order: &[usize]) -> Lock<'static> {
     let blocks = blocks();
     let mut text = "version = 4\n".to_owned();
     for at in order {
         text.push('\n');
         text.push_str(&blocks[*at]);
     }
-    Lock::parse(text.as_bytes()).unwrap()
+    read_lock(&text)
 }
 
 fn database() -> Database {
@@ -547,7 +547,7 @@ fn an_outside_path_is_refused_unless_allowed() {
 #[test]
 fn a_registry_package_without_a_checksum_is_refused() {
     let text = "version = 4\n\n[[package]]\nname = \"foo\"\nversion = \"1.0.0\"\nsource = \"registry+https://github.com/rust-lang/crates.io-index\"\n";
-    let lock = Lock::parse(text.as_bytes()).unwrap();
+    let lock = read_lock(text);
     let (refused, _) = check(&lock, &[], &SourcePins::default(), &Settings::default(), &mut fork_on_disk(Ok(None)));
     assert!(matches!(&refused[..], [PinRefused::NoChecksum { package, .. }] if package == "foo"), "{refused:?}");
 }

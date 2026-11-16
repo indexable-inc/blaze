@@ -54,6 +54,21 @@ impl<A: Allocator> Version<A> {
         Version::parse_in(text, Limits::CARGO, A::default())
     }
 
+    /// The same version in `alloc`: its identifiers were validated when it was made, so they
+    /// are copied, not parsed again (a lock's versions, in the lock's allocator, compared with
+    /// ranges parsed in another).
+    pub fn clone_in<B: Allocator + Clone>(&self, alloc: B) -> Version<B> {
+        let pre = match self.pre.is_empty() {
+            true => Prerelease::EMPTY,
+            false => Prerelease(Ident::from_valid(self.pre.as_str(), alloc.clone())),
+        };
+        let build = match self.build.is_empty() {
+            true => BuildMetadata::EMPTY,
+            false => BuildMetadata(Ident::from_valid(self.build.as_str(), alloc)),
+        };
+        Version { major: self.major, minor: self.minor, patch: self.patch, pre, build }
+    }
+
     /// The order of SemVer 2.0.0's section 11: by the numbers, then a pre-release before the
     /// release; build metadata does not count.
     pub fn cmp_precedence(&self, other: &Version<A>) -> Ordering {

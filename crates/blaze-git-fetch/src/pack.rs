@@ -1,18 +1,36 @@
 // adapted from makepad/relax (MIT), libs/relax/base/src/git/unpack.rs
-//! A packfile read whole (version 2 or 3): its trailer checked, every entry inflated and held
-//! to the [`Limits`], deltas (by offset and by base id) applied, and each object's id computed.
-//! The objects live in one arena in the caller's allocator.
+//! A packfile (version 2 or 3) indexed in place and read one object at a time.
+//!
+//! [`Index::new_in`] borrows the pack's bytes and checks its trailer, then walks it twice:
+//!
+//! 1. Every entry in order: its header, its base (an offset delta's must be an entry's exact
+//!    start), and its payload inflated into one reused buffer to learn where the next entry
+//!    starts and how large it is. A whole object's id is its bytes' SHA-1, computed there.
+//! 2. Every delta, in rounds (one whose base is not resolved yet waits for the next): its chain
+//!    walked back to a whole object or a cached base, applied forward, and its id computed from
+//!    the result.
+//!
+//! So every object's id is computed from its bytes before any lookup can find it: an id the
+//! server only states (a reference delta's base) names nothing until an object hashes to it.
+//! What is kept is a row per object (offset, kind, size, id, base: [`Index::row_bytes`] each)
+//! and a base cache bounded in bytes ([`Limits::most_cache`]); no object is held once read.
+//!
+//! [`Index::read`] then inflates one object straight into the caller's slice (a whole object)
+//! or resolves its chain through the cache (a delta), and checks the bytes hash to the object's
+//! id before handing them over: a read is a second computation of the same bytes, and the id
+//! binds them.
 //!
 //! From Relax: the entry header's size varint, the offset delta's base distance
 //! (`((back + 1) << 7) | low`), the delta opcodes (a copy's size 0 meaning `0x10000`) and
 //! resolving in rounds. Changed here: everything is bounded (objects, each object's size, the
-//! total, the delta depth, inflate's ratio), the objects sit in one arena instead of a map of
-//! vectors, and an offset delta's base must be an entry's exact start.
+//! total, the delta depth, the cache, inflate's ratio), nothing is held but the rows and the
+//! cache, and an offset delta's base must be an entry's exact start.
 
 #![blaze::sans_io]
 
 use core::{alloc::Allocator, fmt};
 
+use blaze_deflate::ZlibInto;
 use blaze_own::{AllocFailure, Vec};
 
 use crate::{
@@ -21,7 +39,7 @@ use crate::{
     sha1::sha1,
 };
 
-/// How much a pack may hold: every field is the caller's choice.
+/// How much a pack may hold, and the cache that reads it: every field is the caller's choice.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Limits {
     pub most_objects: u32,
@@ -31,6 +49,10 @@ pub struct Limits {
     pub most_total: u64,
     /// The most deltas on one object's chain.
     pub most_depth: u16,
+    /// The most bytes of resolved bases kept to read deltas against (an object larger is not
+    /// kept). The index's own memory is its rows, three buffers of the largest object read, and
+    /// this.
+    pub most_cache: u64,
 }
 
 /// Why a pack was refused.
@@ -59,6 +81,8 @@ pub enum PackWhy {
     DepthOver { most: u16 },
     /// Bytes between the last entry and the trailer.
     Trailing { extra: u64 },
+    /// An object read again whose bytes do not hash to the id it was indexed under.
+    Id { want: Oid },
     Alloc(AllocFailure),
 }
 
@@ -107,6 +131,7 @@ impl fmt::Display for PackError {
             PackWhy::MissingBase { base } => write!(f, "a delta's base {base} is not in the pack"),
             PackWhy::DepthOver { most } => write!(f, "a delta chain longer than the most allowed, {most}"),
             PackWhy::Trailing { extra } => write!(f, "{extra} bytes after the last entry"),
+            PackWhy::Id { want } => write!(f, "read again, its bytes do not hash to its id {want}"),
             PackWhy::Alloc(e) => write!(f, "{e}"),
         }
     }
@@ -114,47 +139,93 @@ impl fmt::Display for PackError {
 
 impl core::error::Error for PackError {}
 
+/// No base yet: a whole object's, or a reference delta's before its base is found.
+const NO_BASE: u32 = u32::MAX;
+
 #[derive(Clone, Copy)]
 enum Base {
-    None(Kind),
-    /// The base entry's index.
-    Ofs(u32),
+    Whole,
+    /// An offset delta: its base entry is known from the start.
+    Ofs,
+    /// A reference delta: its base is the entry that hashes to this id, once one does.
     Ref(Oid),
 }
 
+/// One entry of the pack: where it is, and once resolved, what it is.
 #[derive(Clone, Copy)]
 struct Entry {
+    /// The entry's header.
     at: u64,
+    /// Its zlib stream.
+    data: u64,
+    /// Its payload inflated: the object's bytes, or the delta's.
+    raw: u64,
     base: Base,
-    /// The inflated payload in the raw arena: the object, or the delta.
-    raw: (usize, usize),
-    /// Once resolved: its kind, id, place in the data arena and chain depth.
-    done: Option<(Kind, Oid, (usize, usize), u16)>,
+    /// The base entry's index ([`NO_BASE`] for a whole object, or a reference delta not yet
+    /// resolved).
+    base_at: u32,
+    /// The object's size: a whole object's payload, a delta's declared result.
+    size: u64,
+    /// Once resolved: its kind and its id, computed from its bytes.
+    kind: Option<Kind>,
+    oid: Oid,
+    depth: u16,
 }
 
-/// An object of a pack.
+/// An object the index holds: where, of what kind, how large, and its id.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Object<'a> {
+pub struct Found {
+    /// Its entry's index: what [`Index::read`] takes.
+    pub at: u32,
     pub kind: Kind,
+    pub size: u64,
     pub oid: Oid,
-    pub bytes: &'a [u8],
 }
 
-/// A pack read: its objects, found by id.
-pub struct Pack<A: Allocator> {
-    data: Vec<u8, A>,
-    /// Per object: kind, id and range in `data`, in pack order.
-    objects: Vec<(Kind, Oid, usize, usize), A>,
-    /// Per object: its delta chain's depth (0 for a whole object).
-    depths: Vec<u16, A>,
-    /// Indices into `objects`, sorted by id.
+/// How the base cache did: a read of a delta starts from a cached base (a hit) or inflates
+/// its chain's whole object from the pack again (a miss).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct CacheStats {
+    pub hits: u64,
+    pub misses: u64,
+    /// The most bytes the cache held at once.
+    pub held_most: u64,
+    /// Bytes inflated from the pack after indexing began, deltas and bases again included.
+    pub inflated: u64,
+}
+
+/// The most bases cached at once: the cache is searched in turn.
+const SLOTS: usize = 64;
+
+struct Slot<A: Allocator> {
+    entry: u32,
+    used: u64,
+    bytes: Vec<u8, A>,
+}
+
+/// A pack indexed in place: see the module.
+pub struct Index<'p, A: Allocator + Clone> {
+    /// The pack without its trailer.
+    pack: &'p [u8],
+    limits: Limits,
+    entries: Vec<Entry, A>,
+    /// Indices of resolved entries, sorted by id.
     by_oid: Vec<u32, A>,
+    slots: Vec<Slot<A>, A>,
+    held: u64,
+    tick: u64,
+    stats: CacheStats,
+    /// A chain being resolved, and three buffers: the object so far, the next, a delta.
+    chain: Vec<u32, A>,
+    now: Vec<u8, A>,
+    next: Vec<u8, A>,
+    delta: Vec<u8, A>,
+    alloc: A,
 }
 
-
-impl<A: Allocator + Clone> Pack<A> {
-    /// The pack that is all of `pack`, read under `limits`.
-    pub fn read_in(pack: &[u8], limits: Limits, alloc: A) -> Result<Pack<A>, PackError> {
+impl<'p, A: Allocator + Clone> Index<'p, A> {
+    /// The index of the pack that is all of `pack`, under `limits`.
+    pub fn new_in(pack: &'p [u8], limits: Limits, alloc: A) -> Result<Index<'p, A>, PackError> {
         let fail = |at: u64, entry: Option<u32>, why| PackError { entry, at, why };
         if pack.len() < 32 {
             return Err(fail(0, None, PackWhy::Short));
@@ -174,179 +245,339 @@ impl<A: Allocator + Clone> Pack<A> {
         if count > limits.most_objects {
             return Err(fail(8, None, PackWhy::ObjectsOver { count, most: limits.most_objects }));
         }
-        let alloc_failed = |at: u64, e| fail(at, None, PackWhy::Alloc(e));
-        let mut entries: Vec<Entry, A> = Vec::new_in(alloc.clone());
-        entries.try_reserve(count as usize).map_err(|e| alloc_failed(8, e))?;
-        let mut raw = Vec::new_in(alloc.clone());
+        let mut index = Index {
+            pack: &pack[..end],
+            limits,
+            entries: Vec::new_in(alloc.clone()),
+            by_oid: Vec::new_in(alloc.clone()),
+            slots: Vec::new_in(alloc.clone()),
+            held: 0,
+            tick: 0,
+            stats: CacheStats::default(),
+            chain: Vec::new_in(alloc.clone()),
+            now: Vec::new_in(alloc.clone()),
+            next: Vec::new_in(alloc.clone()),
+            delta: Vec::new_in(alloc.clone()),
+            alloc,
+        };
+        index.entries.try_reserve_exact(count as usize).map_err(|e| fail(8, None, PackWhy::Alloc(e)))?;
+        let total = index.walk(count)?;
+        index.resolve_all(total)?;
+        index.stats.inflated = 0;
+        Ok(index)
+    }
+
+    /// Pass 1: every entry's header, base and payload size; a whole object's id. Returns the
+    /// bytes of whole objects.
+    fn walk(&mut self, count: u32) -> Result<u64, PackError> {
+        let pack = self.pack;
+        let limits = self.limits;
         let mut pos = 12usize;
         let mut total = 0u64;
         for index in 0..count {
             let at = pos as u64;
-            let refuse = |why| fail(at, Some(index), why);
-            let (number, size) = entry_header(&pack[..end], &mut pos).ok_or(refuse(PackWhy::Header))?;
-            if size > limits.most_object {
-                return Err(refuse(PackWhy::ObjectOver { size, most: limits.most_object }));
+            let refuse = |why| PackError { entry: Some(index), at, why };
+            let (number, raw) = entry_header(pack, &mut pos).ok_or(refuse(PackWhy::Header))?;
+            if raw > limits.most_object {
+                return Err(refuse(PackWhy::ObjectOver { size: raw, most: limits.most_object }));
             }
-            let base = match number {
+            let (base, base_at) = match number {
                 6 => {
-                    let back = ofs_back(&pack[..end], &mut pos).ok_or(refuse(PackWhy::Header))?;
+                    let back = ofs_back(pack, &mut pos).ok_or(refuse(PackWhy::Header))?;
                     let base_at = at.checked_sub(back).filter(|_| back > 0).ok_or(refuse(PackWhy::BaseOffset { back }))?;
-                    let found = entries.binary_search_by_key(&base_at, |e| e.at);
-                    Base::Ofs(found.map_err(|_| refuse(PackWhy::BaseOffset { back }))? as u32)
+                    let found = self.entries.binary_search_by_key(&base_at, |e| e.at);
+                    (Base::Ofs, found.map_err(|_| refuse(PackWhy::BaseOffset { back }))? as u32)
                 }
                 7 => {
-                    let id = pack.get(pos..pos + 20).filter(|_| pos + 20 <= end).ok_or(refuse(PackWhy::Header))?;
+                    let id = pack.get(pos..pos + 20).ok_or(refuse(PackWhy::Header))?;
                     pos += 20;
                     let mut oid = [0u8; 20];
                     oid.copy_from_slice(id);
-                    Base::Ref(Oid(oid))
+                    (Base::Ref(Oid(oid)), NO_BASE)
                 }
-                n => Base::None(Kind::of_pack(n).ok_or(refuse(PackWhy::Type { number: n }))?),
+                n => {
+                    Kind::of_pack(n).ok_or(refuse(PackWhy::Type { number: n }))?;
+                    (Base::Whole, NO_BASE)
+                }
             };
-            total += size;
-            if total > limits.most_total {
-                return Err(refuse(PackWhy::TotalOver { most: limits.most_total }));
-            }
-            let start = raw.len();
-            let bound = blaze_deflate::Limits { most_out: size, most_ratio: blaze_deflate::MAX_RATIO, most_header: 0 };
-            let used = blaze_deflate::unzlib_prefix(&pack[pos..end], bound, alloc.clone(), &mut raw)
-                .map_err(|e| refuse(PackWhy::Inflate(e)))?;
-            let got = (raw.len() - start) as u64;
-            if got != size {
-                return Err(refuse(PackWhy::Size { declared: size, got }));
-            }
+            let used = inflate(pack, pos, raw, &mut self.now).map_err(refuse)?;
+            let (kind, size, oid) = match base {
+                Base::Whole => {
+                    let kind = Kind::of_pack(number).expect("checked above");
+                    total += raw;
+                    if total > limits.most_total {
+                        return Err(refuse(PackWhy::TotalOver { most: limits.most_total }));
+                    }
+                    (Some(kind), raw, Oid::of(kind, &self.now))
+                }
+                Base::Ofs | Base::Ref(_) => {
+                    let mut p = 0;
+                    delta_size(&self.now, &mut p).map_err(refuse)?;
+                    let size = delta_size(&self.now, &mut p).map_err(refuse)?;
+                    if size > limits.most_object {
+                        return Err(refuse(PackWhy::ObjectOver { size, most: limits.most_object }));
+                    }
+                    (None, size, Oid([0; 20]))
+                }
+            };
+            let entry = Entry { at, data: pos as u64, raw, base, base_at, size, kind, oid, depth: 0 };
+            self.entries.try_push(entry).map_err(|refused| refuse(PackWhy::Alloc(refused.why)))?;
             pos += used;
-            entries.push(Entry { at, base, raw: (start, raw.len()), done: None });
         }
-        if pos != end {
-            return Err(fail(pos as u64, None, PackWhy::Trailing { extra: (end - pos) as u64 }));
+        if pos != pack.len() {
+            return Err(PackError { entry: None, at: pos as u64, why: PackWhy::Trailing { extra: (pack.len() - pos) as u64 } });
         }
-        let mut pack = Pack {
-            data: Vec::new_in(alloc.clone()),
-            objects: Vec::new_in(alloc.clone()),
-            depths: Vec::new_in(alloc.clone()),
-            by_oid: Vec::new_in(alloc.clone()),
-        };
-        pack.resolve(&mut entries, &raw, limits, &alloc)?;
-        Ok(pack)
+        Ok(total)
     }
 
-    /// Every entry resolved, in rounds: one whose base is not yet resolved waits for the next.
-    fn resolve(&mut self, entries: &mut [Entry], raw: &[u8], limits: Limits, alloc: &A) -> Result<(), PackError> {
-        let mut scratch = Vec::new_in(alloc.clone());
-        let mut left = entries.len();
+    /// Pass 2: every delta resolved, in rounds, its id computed from its bytes.
+    fn resolve_all(&mut self, mut total: u64) -> Result<(), PackError> {
+        let limits = self.limits;
+        let mut left = self.entries.iter().filter(|e| e.kind.is_none()).count();
         let mut rounds = 0u32;
-        let mut total = 0u64;
         while left > 0 {
-            self.index()?;
+            self.sort_ids()?;
             let before = left;
-            for index in 0..entries.len() {
-                let entry = entries[index];
-                if entry.done.is_some() {
+            for index in 0..self.entries.len() {
+                let entry = self.entries[index];
+                if entry.kind.is_some() {
                     continue;
                 }
                 let refuse = |why| PackError { entry: Some(index as u32), at: entry.at, why };
-                let payload = &raw[entry.raw.0..entry.raw.1];
                 let base = match entry.base {
-                    Base::None(kind) => {
-                        let start = self.data.len();
-                        self.data.try_extend_from_slice(payload).map_err(|e| refuse(PackWhy::Alloc(e)))?;
-                        Some((kind, start, self.data.len(), 0))
-                    }
-                    Base::Ofs(base) => entries[base as usize].done.map(|(kind, _, (s, e), depth)| (kind, s, e, depth + 1)),
-                    Base::Ref(oid) => self.find(&oid).map(|i| {
-                        let (kind, _, s, e) = self.objects[i];
-                        (kind, s, e, self.depths[i] + 1)
-                    }),
+                    Base::Ofs if self.entries[entry.base_at as usize].kind.is_some() => entry.base_at,
+                    Base::Ref(oid) => match self.find_at(&oid) {
+                        Some(base) => base,
+                        None => continue,
+                    },
+                    _ => continue,
                 };
-                let Some((kind, s, e, depth)) = base else { continue };
+                let base_entry = self.entries[base as usize];
+                let depth = base_entry.depth + 1;
                 if depth > limits.most_depth {
                     return Err(refuse(PackWhy::DepthOver { most: limits.most_depth }));
                 }
-                let range = match entry.base {
-                    Base::None(_) => (s, e),
-                    _ => {
-                        scratch.clear();
-                        apply(&self.data[s..e], payload, limits.most_object, &mut scratch).map_err(refuse)?;
-                        total += scratch.len() as u64;
-                        if total > limits.most_total {
-                            return Err(refuse(PackWhy::TotalOver { most: limits.most_total }));
-                        }
-                        let start = self.data.len();
-                        self.data.try_extend_from_slice(&scratch).map_err(|e| refuse(PackWhy::Alloc(e)))?;
-                        (start, self.data.len())
-                    }
-                };
-                let oid = Oid::of(kind, &self.data[range.0..range.1]);
-                entries[index].done = Some((kind, oid, range, depth));
-                self.objects
-                    .try_push((kind, oid, range.0, range.1))
-                    .map_err(|refused| refuse(PackWhy::Alloc(refused.why)))?;
-                self.depths.try_push(depth).map_err(|refused| refuse(PackWhy::Alloc(refused.why)))?;
+                self.entries[index].base_at = base;
+                self.resolve(index as u32).map_err(refuse)?;
+                total += self.now.len() as u64;
+                if total > limits.most_total {
+                    return Err(refuse(PackWhy::TotalOver { most: limits.most_total }));
+                }
+                let kind = base_entry.kind.expect("a resolved base");
+                let entry = &mut self.entries[index];
+                entry.kind = Some(kind);
+                entry.oid = Oid::of(kind, &self.now);
+                entry.depth = depth;
                 left -= 1;
             }
             if left == before {
                 // Nothing moved: some reference delta's base is not in the pack (every chain
                 // that is stuck ends at one, since an offset delta's base is an entry).
-                let stuck = entries.iter().enumerate().find(|(_, e)| e.done.is_none() && matches!(e.base, Base::Ref(_)));
-                let error = match stuck {
+                let stuck = self.entries.iter().enumerate().find(|(_, e)| e.kind.is_none() && matches!(e.base, Base::Ref(_)));
+                return Err(match stuck {
                     Some((index, &Entry { at, base: Base::Ref(base), .. })) => {
                         PackError { entry: Some(index as u32), at, why: PackWhy::MissingBase { base } }
                     }
                     _ => PackError { entry: None, at: 0, why: PackWhy::DepthOver { most: limits.most_depth } },
-                };
-                return Err(error);
+                });
             }
             rounds += 1;
             if rounds > u32::from(limits.most_depth) + 1 {
                 return Err(PackError { entry: None, at: 0, why: PackWhy::DepthOver { most: limits.most_depth } });
             }
         }
-        self.index()
+        self.sort_ids()
     }
 
-    /// `by_oid` rebuilt over the objects resolved so far.
-    fn index(&mut self) -> Result<(), PackError> {
-        let objects = &self.objects;
+    /// `by_oid` rebuilt over the entries resolved so far.
+    fn sort_ids(&mut self) -> Result<(), PackError> {
+        let entries = &self.entries;
         self.by_oid.clear();
         let fail = |e| PackError { entry: None, at: 0, why: PackWhy::Alloc(e) };
-        self.by_oid.try_reserve(objects.len()).map_err(fail)?;
-        for i in 0..objects.len() {
-            self.by_oid.push(i as u32);
+        self.by_oid.try_reserve(entries.len()).map_err(fail)?;
+        for (at, entry) in entries.iter().enumerate() {
+            if entry.kind.is_some() {
+                self.by_oid.push(at as u32);
+            }
         }
-        self.by_oid.sort_unstable_by_key(|&i| objects[i as usize].1);
+        self.by_oid.sort_unstable_by_key(|&at| entries[at as usize].oid);
         Ok(())
     }
-}
 
-impl<A: Allocator> Pack<A> {
-    fn find(&self, oid: &Oid) -> Option<usize> {
-        let at = self.by_oid.binary_search_by_key(oid, |&i| self.objects[i as usize].1).ok()?;
-        Some(self.by_oid[at] as usize)
+    /// The object `at` resolved into `self.now`: its chain walked back to a cached base or a
+    /// whole object, then each delta applied forward, each result kept in the cache.
+    fn resolve(&mut self, at: u32) -> Result<(), PackWhy> {
+        self.chain.clear();
+        let mut cur = at;
+        loop {
+            if let Some(slot) = self.cached(cur) {
+                self.now.clear();
+                self.now.try_extend_from_slice(&self.slots[slot].bytes).map_err(PackWhy::Alloc)?;
+                self.stats.hits += 1;
+                break;
+            }
+            let entry = self.entries[cur as usize];
+            if let Base::Whole = entry.base {
+                inflate(self.pack, entry.data as usize, entry.raw, &mut self.now)?;
+                self.stats.inflated += entry.raw;
+                self.stats.misses += 1;
+                if !self.chain.is_empty() {
+                    self.keep(cur)?;
+                }
+                break;
+            }
+            if self.chain.len() > usize::from(self.limits.most_depth) {
+                return Err(PackWhy::DepthOver { most: self.limits.most_depth });
+            }
+            self.chain.try_push(cur).map_err(|refused| PackWhy::Alloc(refused.why))?;
+            cur = entry.base_at;
+        }
+        for step in (0..self.chain.len()).rev() {
+            let delta_at = self.chain[step];
+            let entry = self.entries[delta_at as usize];
+            inflate(self.pack, entry.data as usize, entry.raw, &mut self.delta)?;
+            self.stats.inflated += entry.raw;
+            self.next.clear();
+            apply(&self.now, &self.delta, self.limits.most_object, &mut self.next)?;
+            core::mem::swap(&mut self.now, &mut self.next);
+            self.keep(delta_at)?;
+        }
+        Ok(())
     }
 
-    /// The object `oid`, if the pack holds it.
-    pub fn get(&self, oid: &Oid) -> Option<Object<'_>> {
-        self.find(oid).map(|i| self.object(i))
+    /// The cache slot holding `entry`, marked used.
+    fn cached(&mut self, entry: u32) -> Option<usize> {
+        let slot = self.slots.iter().position(|slot| slot.entry == entry)?;
+        self.tick += 1;
+        self.slots[slot].used = self.tick;
+        Some(slot)
+    }
+
+    /// `self.now`, the resolved bytes of `entry`, kept as a base: the least recently used
+    /// bases go first to make room; one past the cache's bound is not kept.
+    fn keep(&mut self, entry: u32) -> Result<(), PackWhy> {
+        let len = self.now.len() as u64;
+        if len > self.limits.most_cache || self.cached(entry).is_some() {
+            return Ok(());
+        }
+        while self.slots.len() >= SLOTS || self.held + len > self.limits.most_cache {
+            let (oldest, _) =
+                self.slots.iter().enumerate().min_by_key(|(_, slot)| slot.used).expect("a full cache has a slot");
+            let gone = self.slots.swap_remove(oldest);
+            self.held -= gone.bytes.len() as u64;
+        }
+        let mut bytes = Vec::try_with_capacity_in(self.now.len(), self.alloc.clone()).map_err(PackWhy::Alloc)?;
+        bytes.extend_from_slice(&self.now);
+        self.tick += 1;
+        self.slots.try_push(Slot { entry, used: self.tick, bytes }).map_err(|refused| PackWhy::Alloc(refused.why))?;
+        self.held += len;
+        self.stats.held_most = self.stats.held_most.max(self.held);
+        Ok(())
+    }
+
+    fn find_at(&self, oid: &Oid) -> Option<u32> {
+        let entries = &self.entries;
+        match self.by_oid.binary_search_by_key(oid, |&at| entries[at as usize].oid) {
+            Ok(found) => Some(self.by_oid[found]),
+            // A planted lookup that takes the entry where the id would be: an object accepted
+            // without its id matching.
+            Err(near) if plant::on(Plant::NearestId) && near < self.by_oid.len() => Some(self.by_oid[near]),
+            Err(_) => None,
+        }
+    }
+
+    /// The object `oid`, if an object of the pack hashes to it.
+    pub fn find(&self, oid: &Oid) -> Option<Found> {
+        self.find_at(oid).map(|at| self.found(at))
+    }
+
+    fn found(&self, at: u32) -> Found {
+        let entry = self.entries[at as usize];
+        Found { at, kind: entry.kind.expect("only resolved entries are indexed"), size: entry.size, oid: entry.oid }
+    }
+
+    /// Every object, in pack order.
+    pub fn objects(&self) -> impl Iterator<Item = Found> + '_ {
+        (0..self.entries.len() as u32).map(|at| self.found(at))
     }
 
     pub fn len(&self) -> usize {
-        self.objects.len()
+        self.entries.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.objects.is_empty()
+        self.entries.is_empty()
     }
 
-    /// Every object, in the order resolved.
-    pub fn objects(&self) -> impl Iterator<Item = Object<'_>> {
-        (0..self.objects.len()).map(|i| self.object(i))
+    /// Bytes the index keeps per object.
+    pub const fn row_bytes() -> usize {
+        size_of::<Entry>() + size_of::<u32>()
     }
 
-    fn object(&self, i: usize) -> Object<'_> {
-        let (kind, oid, s, e) = self.objects[i];
-        Object { kind, oid, bytes: &self.data[s..e] }
+    pub fn stats(&self) -> CacheStats {
+        self.stats
     }
+
+    /// The object `found` (from [`Index::find`]) into `out`, which must be its size: a whole
+    /// object inflated straight into it, a delta resolved through the cache. Its bytes are
+    /// checked to hash to its id before this returns.
+    pub fn read(&mut self, found: Found, out: &mut [u8]) -> Result<(), PackError> {
+        let entry = self.entries[found.at as usize];
+        let refuse = |why| PackError { entry: Some(found.at), at: entry.at, why };
+        if out.len() as u64 != entry.size {
+            return Err(refuse(PackWhy::Size { declared: entry.size, got: out.len() as u64 }));
+        }
+        match (entry.base, self.cached(found.at)) {
+            (Base::Whole, None) => {
+                inflate_into(&self.pack[entry.data as usize..], out).map_err(refuse)?;
+                self.stats.inflated += entry.raw;
+            }
+            _ => {
+                self.resolve(found.at).map_err(refuse)?;
+                out.copy_from_slice(&self.now);
+            }
+        }
+        let kind = entry.kind.expect("only resolved entries are found");
+        if Oid::of(kind, out) != entry.oid {
+            return Err(refuse(PackWhy::Id { want: entry.oid }));
+        }
+        Ok(())
+    }
+
+    /// The object `found` into `out`, cleared first: for a tree or a commit, read whole.
+    pub fn read_vec<B: Allocator>(&mut self, found: Found, out: &mut Vec<u8, B>) -> Result<(), PackError> {
+        let refuse = |why| PackError { entry: Some(found.at), at: 0, why };
+        out.clear();
+        let size = usize::try_from(found.size).map_err(|_| refuse(PackWhy::ObjectOver { size: found.size, most: self.limits.most_object }))?;
+        out.try_reserve_exact(size).map_err(|e| refuse(PackWhy::Alloc(e)))?;
+        out.resize(size, 0);
+        self.read(found, out.as_mut_slice())
+    }
+}
+
+/// The zlib stream at `pack[data..]` inflated into `out`, sized to `raw` first: returns the
+/// stream's length.
+pub(crate) fn inflate<B: Allocator>(pack: &[u8], data: usize, raw: u64, out: &mut Vec<u8, B>) -> Result<usize, PackWhy> {
+    out.clear();
+    let size = usize::try_from(raw).map_err(|_| PackWhy::ObjectOver { size: raw, most: usize::MAX as u64 })?;
+    out.try_reserve(size).map_err(PackWhy::Alloc)?;
+    out.resize(size, 0);
+    inflate_into(&pack[data..], out.as_mut_slice())
+}
+
+/// The zlib stream at the start of `input` inflated into all of `out`, no byte more or fewer:
+/// returns the stream's length.
+fn inflate_into(input: &[u8], out: &mut [u8]) -> Result<usize, PackWhy> {
+    let bound = blaze_deflate::Limits { most_out: out.len() as u64, most_ratio: blaze_deflate::MAX_RATIO, most_header: 0 };
+    let mut zlib = ZlibInto::new(bound);
+    let fed = zlib.feed(input, out).map_err(PackWhy::Inflate)?;
+    if !fed.done {
+        zlib.finish().map_err(PackWhy::Inflate)?;
+    }
+    if zlib.written() != out.len() as u64 {
+        return Err(PackWhy::Size { declared: out.len() as u64, got: zlib.written() });
+    }
+    Ok(zlib.stream_len() as usize)
 }
 
 fn be32(bytes: &[u8]) -> u32 {
@@ -354,7 +585,7 @@ fn be32(bytes: &[u8]) -> u32 {
 }
 
 /// An entry's type and inflated size.
-fn entry_header(pack: &[u8], pos: &mut usize) -> Option<(u8, u64)> {
+pub(crate) fn entry_header(pack: &[u8], pos: &mut usize) -> Option<(u8, u64)> {
     let mut byte = *pack.get(*pos)?;
     *pos += 1;
     let number = (byte >> 4) & 7;
@@ -373,7 +604,7 @@ fn entry_header(pack: &[u8], pos: &mut usize) -> Option<(u8, u64)> {
 }
 
 /// An offset delta's distance back to its base.
-fn ofs_back(pack: &[u8], pos: &mut usize) -> Option<u64> {
+pub(crate) fn ofs_back(pack: &[u8], pos: &mut usize) -> Option<u64> {
     let mut byte = *pack.get(*pos)?;
     *pos += 1;
     let mut back = u64::from(byte & 0x7f);

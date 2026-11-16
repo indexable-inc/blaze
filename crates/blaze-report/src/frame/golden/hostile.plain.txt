@@ -1,0 +1,8 @@
+error  a message with ␛]0;title␇ and ␛[2J in it
+  ╭─ src/␛[2Jevil.rs:3:14
+1 │ fn evil() {
+2 │     let s = "␛]0;pwned␇␛[2J";
+3 │     let t = "␛]8;;http://evil.example␛\\click␛]8;;␛\\"; // \u{202e}desrever
+  │              ^^^^^^^^^^^^
+  │              ╰─ label ␛[5m blinks
+  ╰─ blaze explain evil␛[31m

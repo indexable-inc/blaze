@@ -3,7 +3,10 @@
 //! - SHA-1 is FIPS 180-4's, and an object id is git's;
 //! - a pack built here (whole objects, offset deltas, reference deltas before their bases)
 //!   reads back to the files it was built from;
-//! - a corrupted pack, a missing base and an oversized object are refused;
+//!   through a base cache of any bound;
+//! - a corrupted pack, a missing base and an oversized object are refused, and so is an
+//!   object a lying server changed deep in a delta chain (the trailer made right): no object
+//!   hashes to the id its tree names;
 //! - a tree name that could leave the checkout is refused;
 //! - the protocol's requests are v2's bytes, and its answers are read as v2 says.
 
@@ -20,13 +23,14 @@ use blaze_own::Vec;
 use blaze_sim::{Broke, Config, Tape, check, control};
 
 use crate::{
-    Kind, Mode, Oid, Pack, PackLimits, PackWhy, Pkt, TreeLimits, TreeWhy, check_advertisement, fetch_request,
+    Index, Kind, Mode, Oid, PackLimits, PackWhy, Pkt, TreeLimits, TreeWhy, check_advertisement, fetch_request,
     fetched_pack, files, find_ref, ls_refs,
     plant::{self, Plant},
     sha1::{Sha1, sha1},
 };
 
-const PACK: PackLimits = PackLimits { most_objects: 10_000, most_object: 1 << 24, most_total: 1 << 26, most_depth: 64 };
+const PACK: PackLimits =
+    PackLimits { most_objects: 10_000, most_object: 1 << 24, most_total: 1 << 26, most_depth: 64, most_cache: 1 << 20 };
 const TREE: TreeLimits = TreeLimits { most_files: 10_000, most_path: 4096, most_depth: 64 };
 
 fn hex(bytes: &[u8]) -> String {
@@ -277,19 +281,30 @@ fn build(tape: &Tape) -> Built {
     Built { pack: write_pack(&objects, &deltas, &early), commit: commit_oid, files }
 }
 
-fn read_back(built: &Built) -> Result<BTreeMap<String, (Mode, StdVec<u8>)>, String> {
-    let pack = Pack::read_in(&built.pack, PACK, Global).map_err(|e| e.to_string())?;
-    let mut got = BTreeMap::new();
-    files(&pack, built.commit, TREE, Global, |file| {
-        got.insert(file.path.to_string(), (file.mode, file.bytes.to_vec()));
+/// Every file of the built commit read back through an index whose base cache holds at most
+/// `cache` bytes: none, a little, or all.
+fn read_back(built: &Built, cache: u64) -> Result<BTreeMap<String, (Mode, StdVec<u8>)>, String> {
+    let mut index = Index::new_in(&built.pack, PackLimits { most_cache: cache, ..PACK }, Global).map_err(|e| e.to_string())?;
+    let mut listed = StdVec::new();
+    files(&mut index, built.commit, TREE, Global, |file| {
+        listed.push((file.path.to_string(), file.mode, file.object));
     })
     .map_err(|e| e.to_string())?;
+    let mut got = BTreeMap::new();
+    for (path, mode, object) in listed {
+        let mut bytes = vec![0u8; object.size as usize];
+        index.read(object, &mut bytes).map_err(|e| e.to_string())?;
+        got.insert(path, (mode, bytes));
+    }
     Ok(got)
 }
 
+const CACHES: [u64; 3] = [0, 700, 1 << 20];
+
 fn round_trip(tape: &Tape) -> Result<(), Broke> {
     let built = build(tape);
-    match read_back(&built) {
+    let cache = CACHES[tape.index(CACHES.len(), "cache")];
+    match read_back(&built, cache) {
         Ok(got) if got == built.files => Ok(()),
         Ok(_) => Err(Broke::Oracle(String::from("the files read back differ from those packed"))),
         Err(e) => Err(Broke::Oracle(format!("the files read back differ: refused: {e}"))),
@@ -313,10 +328,75 @@ fn corruption(tape: &Tape) -> Result<(), Broke> {
     // A byte flipped in an entry, past the header: the trailer must catch it.
     let at = 12 + tape.index(built.pack.len() - 32, "byte");
     built.pack[at] ^= 1 << tape.index(8, "bit");
-    match Pack::read_in(&built.pack, PACK, Global) {
+    match Index::new_in(&built.pack, PACK, Global) {
         Err(e) if e.why == PackWhy::Checksum => Ok(()),
         _ => Err(Broke::Oracle(format!("a byte flipped at {at} was not refused by the trailer"))),
     }
+}
+
+/// A pack whose last blob is a delta three deep, then that delta's inserted bytes changed and
+/// the trailer made right again (a server that lies, not a wire that flips): the tree still
+/// names the honest blob's id, which no object of the pack now hashes to.
+fn deep_chain(tape: &Tape) -> (Built, usize) {
+    let mut objects: StdVec<(Kind, StdVec<u8>, How)> = StdVec::new();
+    let mut deltas: StdVec<StdVec<u8>> = StdVec::new();
+    let mut content = tape.bytes(64..=400, "base");
+    objects.push((Kind::Blob, content.clone(), How::Whole));
+    deltas.push(StdVec::new());
+    for depth in 0..3 {
+        let insert = tape.bytes(8..=40, "insert");
+        let (d, target) = delta(&content, &[Op::Copy(0, content.len() / 2), Op::Insert(insert)]);
+        let how = if tape.coin("by ref") { How::Ref(depth) } else { How::Ofs(depth) };
+        objects.push((Kind::Blob, target.clone(), how));
+        deltas.push(d);
+        content = target;
+    }
+    let deepest = objects.len() - 1;
+    let mut entries = StdVec::new();
+    for (at, (_, bytes, _)) in objects.iter().enumerate() {
+        entries.push((format!("f{at}"), 0o100644, Oid::of(Kind::Blob, bytes)));
+    }
+    let tree = tree_bytes(&mut entries);
+    let commit = format!("tree {}\n\nm\n", Oid::of(Kind::Tree, &tree)).into_bytes();
+    let commit_oid = Oid::of(Kind::Commit, &commit);
+    objects.push((Kind::Tree, tree, How::Whole));
+    objects.push((Kind::Commit, commit, How::Whole));
+    deltas.push(StdVec::new());
+    deltas.push(StdVec::new());
+    let mut files = BTreeMap::new();
+    for (at, (_, bytes, _)) in objects.iter().take(deepest + 1).enumerate() {
+        files.insert(format!("f{at}"), (Mode::File, bytes.clone()));
+    }
+    // The deepest delta's last insert changed: one byte of what it adds.
+    let last = deltas[deepest].len() - 1;
+    deltas[deepest][last] ^= 1 << tape.index(8, "bit");
+    let early = vec![false; objects.len()];
+    (Built { pack: write_pack(&objects, &deltas, &early), commit: commit_oid, files }, deepest)
+}
+
+fn corrupted_deep_in_a_chain(tape: &Tape) -> Result<(), Broke> {
+    let (built, deepest) = deep_chain(tape);
+    let cache = CACHES[tape.index(CACHES.len(), "cache")];
+    match read_back(&built, cache) {
+        Err(e) if e.contains("is not in the pack") => Ok(()),
+        Err(e) => Err(Broke::Oracle(format!("refused for another reason: {e}"))),
+        Ok(got) if got.get(&format!("f{deepest}")) == built.files.get(&format!("f{deepest}")) => {
+            Err(Broke::Oracle(String::from("the corruption did not change the blob")))
+        }
+        Ok(_) => Err(Broke::Oracle(String::from("a corrupted object deep in a chain was accepted: not refused"))),
+    }
+}
+
+#[test]
+fn an_object_corrupted_deep_in_a_delta_chain_is_refused() {
+    check(Config::cases(64), corrupted_deep_in_a_chain);
+}
+
+#[test]
+fn the_oracle_catches_an_object_taken_by_the_nearest_id() {
+    control(Config::cases(64), Plant::Clean, Plant::NearestId, "not refused", |tape, p| {
+        plant::with(p, || corrupted_deep_in_a_chain(tape))
+    });
 }
 
 #[test]
@@ -348,13 +428,17 @@ fn a_missing_base_and_an_oversized_object_are_refused() {
         out.extend_from_slice(&trailer);
         out
     };
-    let refused = Pack::read_in(&alone, PACK, Global).map(|_| ()).map_err(|e| e.why);
+    let refused = Index::new_in(&alone, PACK, Global).map(|_| ()).map_err(|e| e.why);
     assert_eq!(refused, Err(PackWhy::MissingBase { base: Oid::of(Kind::Blob, b"the base") }));
     let small = PackLimits { most_object: 4, ..PACK };
-    let refused = Pack::read_in(&full, small, Global).map(|_| ()).map_err(|e| e.why);
+    let refused = Index::new_in(&full, small, Global).map(|_| ()).map_err(|e| e.why);
     assert_eq!(refused, Err(PackWhy::ObjectOver { size: 8, most: 4 }));
-    let ok = Pack::read_in(&full, PACK, Global).expect("read");
-    assert_eq!(ok.get(&Oid::of(Kind::Blob, b"the!")).map(|o| o.bytes), Some(&b"the!"[..]));
+    let mut ok = Index::new_in(&full, PACK, Global).expect("read");
+    let found = ok.find(&Oid::of(Kind::Blob, b"the!")).expect("found by its id");
+    let mut bytes = [0u8; 4];
+    ok.read(found, &mut bytes).expect("read back");
+    assert_eq!(&bytes, b"the!");
+    assert!(ok.read(found, &mut [0u8; 3]).is_err(), "a slice of another size is refused");
 }
 
 fn one_entry_tree(name: &[u8], mode: u32) -> (StdVec<u8>, Oid) {
@@ -372,9 +456,9 @@ fn one_entry_tree(name: &[u8], mode: u32) -> (StdVec<u8>, Oid) {
 
 fn walk(name: &[u8], mode: u32) -> Result<usize, TreeWhy> {
     let (bytes, commit) = one_entry_tree(name, mode);
-    let pack = Pack::read_in(&bytes, PACK, Global).expect("read");
+    let mut index = Index::new_in(&bytes, PACK, Global).expect("read");
     let mut n = 0;
-    files(&pack, commit, TREE, Global, |_| n += 1).map_err(|e| e.why)?;
+    files(&mut index, commit, TREE, Global, |_| n += 1).map_err(|e| e.why)?;
     Ok(n)
 }
 

@@ -346,7 +346,8 @@ mod tests {
             ("CARGO_HOME".to_owned(), format!("{ROOT}/home")),
             ("BLAZE_HOME".to_owned(), format!("{ROOT}/blaze")),
         ];
-        let mut config = crate::Config::load_with(Path::new(ROOT), env, files)?;
+        let no_record = crate::config::UserRecord(Err(blaze_core::home::NoRecord::NoEntry { uid: 0 }));
+        let mut config = crate::Config::load_with(Path::new(ROOT), env, no_record, files)?;
         config.cli_unstable(&kinds(flags))?;
         Ok(config)
     }

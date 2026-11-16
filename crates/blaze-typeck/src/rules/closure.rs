@@ -17,7 +17,10 @@
 //!
 //! Omitted for now: `move` closures and by-value captures of moved non-`Copy` values (the body
 //! lowering does not yet say `move`), precise place paths (rustc captures `a.b`, not `a`),
-//! the closure kind (`Fn`/`FnMut`/`FnOnce`, which follows from the captures), and coroutines.
+//! and the closure kind (`Fn`/`FnMut`/`FnOnce`, which follows from the captures).
+//!
+//! An `async` closure returns a future of its body per call (`open_async_closure`; the future
+//! itself is rules/coroutine.rs's).
 
 use blaze_own::{Alloc, Vec};
 
@@ -25,7 +28,7 @@ use crate::body::{Expr, Pat, Stmt, UnOp};
 use crate::columns::CaptureKind;
 use crate::diag::At;
 use crate::error::{CheckError, Limit, Stop};
-use crate::ids::{ExprId, LangItem, List, Mutbl, Name, PatId};
+use crate::ids::{ExprId, FnPtrHeader, LangItem, List, Mutbl, Name, PatId};
 use crate::machine::{Expectation, Flow, Frame, Machine, PendingClosure, Then};
 use crate::portable::PTy;
 use crate::ty::{Ty, TyList, TyView, TypeCtx, Var, VarKind};
@@ -37,7 +40,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let Some(t) = ex.to_option() else { return Ok(None) };
         let t = self.ty.shallow_resolve(t);
         match self.view(t) {
-            TyView::FnPtr(l) => {
+            // rustc `deduce_closure_signature`: any fn pointer's inputs and output (its header
+            // is not the closure's: a closure is a safe Rust fn).
+            TyView::FnPtr(l, _) => {
                 let (inputs, output) = self.fn_ptr_sig(l)?;
                 Ok(Some((inputs, Some(output))))
             }
@@ -64,43 +69,29 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         param_tys: List,
         ret: Option<PTy>,
         body: ExprId,
+        is_async: bool,
     ) -> Result<Flow, Stop> {
         if f.state == 0 {
-            let pats = self.body.pat_list(params)?;
-            let written = self.body.opt_type_list(param_tys)?;
-            let expected = self.deduce_sig(f.expect)?;
-            let arity_ok = expected.is_some_and(|(l, _)| self.ty.list_len(l) as usize == pats.len());
-            let mut inputs: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(pats.len() + 1, self.alloc);
-            for i in 0..pats.len() {
-                let exp = match expected {
-                    Some((l, _)) if arity_ok => Some(self.ty.list_get(l, i as u32)),
-                    _ => None,
-                };
-                let t = match (written.get(i).copied().flatten(), exp) {
-                    (Some(w), Some(x)) => {
-                        let w = self.lower_body_ty(w)?;
-                        self.demand_eq(At::Pat(pats[i]), x, w)?;
-                        w
-                    }
-                    (Some(w), None) => self.lower_body_ty(w)?,
-                    (None, Some(x)) => x,
-                    (None, None) => self.fresh()?,
-                };
-                inputs.push(t);
+            if is_async {
+                return self.open_async_closure(f, e, params, param_tys, ret, body);
             }
+            let pats = self.body.pat_list(params)?;
+            let expected = self.deduce_sig(f.expect)?;
+            let mut inputs = self.closure_inputs(pats, param_tys, expected)?;
             let output = match (ret, expected.and_then(|(_, o)| o)) {
-                (Some(r), _) => self.lower_body_ty(r)?,
+                (Some(r), _) => self.lower_body_ty(r, At::Expr(e))?,
                 (None, Some(o)) => o,
                 (None, None) => self.fresh()?,
             };
             inputs.push(output);
             let sig_list = self.mk_list(&inputs)?;
-            let sig = self.mk(TyView::FnPtr(sig_list))?;
+            let sig = self.mk(TyView::FnPtr(sig_list, FnPtrHeader::RUST))?;
             f.t = self.mk(TyView::Closure(e, sig))?;
             f.u = output;
             f.a = self.new_coerce_many(output)?;
             f.b = u32::from(self.diverges);
             self.ret_sites.push(f.a);
+            self.async_sites.push(false);
             self.closures.push(PendingClosure { expr: e });
             self.resume(f, 1)?;
             self.push_expr(body, Expectation::HasType(output), Then::CoerceMany(f.a))?;
@@ -110,12 +101,87 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             return Ok(Flow::Wait);
         }
         self.ret_sites.pop();
+        self.async_sites.pop();
         let actual = self.coerce_many_complete(f.a);
         if !self.is_never(actual) && !self.is_err(actual) {
             self.demand_eq(At::Expr(body), f.u, actual)?;
         }
         self.diverges = f.b != 0;
         Ok(Flow::Done(f.t))
+    }
+
+    /// A closure's parameter types: the written one (unified with the expected one when the
+    /// arity matches), else the expected one, else a fresh variable. Capacity for the output.
+    fn closure_inputs(
+        &mut self,
+        pats: &[PatId],
+        param_tys: List,
+        expected: Option<(TyList, Option<Ty>)>,
+    ) -> Result<Vec<Ty, Alloc<'a>>, Stop> {
+        let written = self.body.opt_type_list(param_tys)?;
+        let arity_ok = expected.is_some_and(|(l, _)| self.ty.list_len(l) as usize == pats.len());
+        let mut inputs: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(pats.len() + 1, self.alloc);
+        for i in 0..pats.len() {
+            let exp = match expected {
+                Some((l, _)) if arity_ok => Some(self.ty.list_get(l, i as u32)),
+                _ => None,
+            };
+            let t = match (written.get(i).copied().flatten(), exp) {
+                (Some(w), Some(x)) => {
+                    let w = self.lower_body_ty(w, At::Pat(pats[i]))?;
+                    self.demand_eq(At::Pat(pats[i]), x, w)?;
+                    w
+                }
+                (Some(w), None) => self.lower_body_ty(w, At::Pat(pats[i]))?,
+                (None, Some(x)) => x,
+                (None, None) => self.fresh()?,
+            };
+            inputs.push(t);
+        }
+        Ok(inputs)
+    }
+
+    /// `async |..| body` (the Reference, "Closure expressions": an async closure's call returns
+    /// a future of its body): a closure whose output is `Future(e, body_out, interior)`, the
+    /// body checked against `body_out` as its own return site and async site. A written `-> T`
+    /// is the future's output. Its frame ends in `expr_closure`'s second state: `f.u` is the
+    /// body's output there.
+    fn open_async_closure(
+        &mut self,
+        mut f: Frame,
+        e: ExprId,
+        params: List,
+        param_tys: List,
+        ret: Option<PTy>,
+        body: ExprId,
+    ) -> Result<Flow, Stop> {
+        let pats = self.body.pat_list(params)?;
+        let expected = self.deduce_sig(f.expect)?;
+        let mut inputs = self.closure_inputs(pats, param_tys, expected)?;
+        let body_out = match ret {
+            Some(r) => self.lower_body_ty(r, At::Expr(e))?,
+            None => self.fresh()?,
+        };
+        // Captures are not told apart by kind here: `Ref` keeps both `T` and `&T` in the interior.
+        let fut = self.open_future(e, body, body_out, crate::body::Capture::Ref)?;
+        if let Some((_, Some(o))) = expected {
+            self.demand_eq(At::Expr(e), o, fut)?;
+        }
+        inputs.push(fut);
+        let sig_list = self.mk_list(&inputs)?;
+        let sig = self.mk(TyView::FnPtr(sig_list, FnPtrHeader::RUST))?;
+        f.t = self.mk(TyView::Closure(e, sig))?;
+        f.u = body_out;
+        f.a = self.new_coerce_many(body_out)?;
+        f.b = u32::from(self.diverges);
+        self.ret_sites.push(f.a);
+        self.closures.push(PendingClosure { expr: e });
+        self.resume(f, 1)?;
+        self.push_expr(body, Expectation::HasType(body_out), Then::CoerceMany(f.a))?;
+        for (i, &p) in pats.iter().enumerate().rev() {
+            self.push_pat(p, inputs[i], 0)?;
+        }
+        Ok(Flow::Wait)
     }
 
     /// `closure_analyze`: the captures of every closure, innermost first as the walk met them.
@@ -125,29 +191,74 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let mut pats: Vec<PatId, Alloc<'a>> = Vec::new_in(self.alloc);
         for ci in 0..self.closures.len() {
             let closure = self.closures[ci].expr;
-            let Expr::Closure { params, body, .. } = self.body.expr(closure)? else { continue };
-            bound.clear();
-            bound.resize(self.body.pats.len(), false);
-            pats.clear();
-            pats.extend_from_slice(self.body.pat_list(params)?);
-            self.mark_bound(&mut pats, &mut bound)?;
-            exprs.clear();
-            // The u8 is how the expression is used: 0 read, 1 assigned or mutably borrowed.
-            exprs.push((body, 0));
-            let mut steps = 0usize;
-            let bound_steps = self.body.exprs.len() + self.body.stmts.len() + 1;
-            while let Some((x, usage)) = exprs.pop() {
-                steps += 1;
-                if steps > bound_steps {
-                    return Err(CheckError::Limit(Limit::Steps).into());
-                }
-                self.visit_for_captures(closure, x, usage, &mut exprs, &mut pats, &mut bound)?;
-            }
+            self.walk_captures(closure, &mut bound, &mut exprs, &mut pats)?;
         }
         // One row per (closure, local), the strongest use kept (rule 25: sorted).
         self.captures.sort_unstable_by_key(|&(c, p, k)| (c, p, core::cmp::Reverse(k as u8)));
         self.captures.dedup_by_key(|&mut (c, p, _)| (c, p));
+        // Each closure's kind from its strongest capture (upvar.rs `closure_kind`): a mutable
+        // use makes it `FnMut`, else `Fn`. Deviation: a capture moved out of (`FnOnce`) is not
+        // yet told apart, since captures are only by reference here.
+        for ci in 0..self.closures.len() {
+            let closure = self.closures[ci].expr;
+            let mut kind = crate::ty::ClosureKind::Fn;
+            for &(c, _, k) in self.captures.iter() {
+                if c == closure {
+                    kind = kind.max(match k {
+                        CaptureKind::ByRef => crate::ty::ClosureKind::Fn,
+                        CaptureKind::ByMutRef => crate::ty::ClosureKind::FnMut,
+                        CaptureKind::ByValue => crate::ty::ClosureKind::FnOnce,
+                    });
+                }
+            }
+            self.ty.settle_closure_kind(closure, kind)?;
+        }
         Ok(())
+    }
+
+    /// Pushes onto `captures` one row per use of a local of an enclosing body in `closure`'s
+    /// body: a walk of its syntax alone (rustc's `upvars_mentioned`), so it can run before
+    /// the closure's types are known.
+    fn walk_captures(
+        &mut self,
+        closure: ExprId,
+        bound: &mut Vec<bool, Alloc<'a>>,
+        exprs: &mut Vec<(ExprId, u8), Alloc<'a>>,
+        pats: &mut Vec<PatId, Alloc<'a>>,
+    ) -> Result<(), Stop> {
+        let Expr::Closure { params, body, .. } = self.body.expr(closure)? else { return Ok(()) };
+        bound.clear();
+        bound.resize(self.body.pats.len(), false);
+        pats.clear();
+        pats.extend_from_slice(self.body.pat_list(params)?);
+        self.mark_bound(pats, bound)?;
+        exprs.clear();
+        // The u8 is how the expression is used: 0 read, 1 assigned or mutably borrowed.
+        exprs.push((body, 0));
+        let mut steps = 0usize;
+        let bound_steps = self.body.exprs.len() + self.body.stmts.len() + 1;
+        while let Some((x, usage)) = exprs.pop() {
+            steps += 1;
+            if steps > bound_steps {
+                return Err(CheckError::Limit(Limit::Steps).into());
+            }
+            self.visit_for_captures(closure, x, usage, exprs, pats, bound)?;
+        }
+        Ok(())
+    }
+
+    /// Whether `closure` captures no variable (the Reference, "Type coercions", "Coercion
+    /// types": "Non capturing closures to `fn` pointers"): its body names no local of an
+    /// enclosing body. The rows the walk finds are dropped: `analyze_closures` records them.
+    pub(crate) fn captures_nothing(&mut self, closure: ExprId) -> Result<bool, Stop> {
+        let mut bound: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(self.body.pats.len(), self.alloc);
+        let mut exprs: Vec<(ExprId, u8), Alloc<'a>> = Vec::new_in(self.alloc);
+        let mut pats: Vec<PatId, Alloc<'a>> = Vec::new_in(self.alloc);
+        let before = self.captures.len();
+        self.walk_captures(closure, &mut bound, &mut exprs, &mut pats)?;
+        let none = self.captures.len() == before;
+        self.captures.truncate(before);
+        Ok(none)
     }
 
     fn visit_for_captures(
@@ -199,6 +310,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     exprs.push((e, 0));
                 }
             }
+            Expr::Let { pat, init } => {
+                pats.clear();
+                pats.push(pat);
+                self.mark_bound(pats, bound)?;
+                exprs.push((init, 0));
+            }
             Expr::Match { scrutinee, arms } => {
                 exprs.push((scrutinee, 0));
                 for arm in self.body.arm_list(arms)? {
@@ -239,7 +356,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 exprs.push((lhs, 1));
                 exprs.push((rhs, 0));
             }
-            Expr::Ref { mutbl, operand } => exprs.push((operand, u8::from(mutbl == Mutbl::Mut))),
+            Expr::Ref { mutbl, operand } | Expr::RawRef { mutbl, operand } => {
+                exprs.push((operand, u8::from(mutbl == Mutbl::Mut)));
+            }
+            // An inline constant sees no local of the body: it captures nothing.
+            Expr::ConstBlock { .. } => {}
             Expr::Cast { operand, .. } => exprs.push((operand, 0)),
             Expr::Tuple { elems } | Expr::Array { elems } => {
                 for &a in el(elems)? {
@@ -267,6 +388,16 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 self.mark_bound(pats, bound)?;
                 exprs.push((body, 0));
             }
+            // Each argument is borrowed shared: a read.
+            Expr::FormatArgs { args, .. } => {
+                for &a in self.body.expr_list(args)? {
+                    exprs.push((a, 0));
+                }
+            }
+            // `.await` takes its operand by value.
+            Expr::Await(operand) => exprs.push((operand, 0)),
+            Expr::AsyncBlock { body, .. } => exprs.push((body, 0)),
+            Expr::Underscore | Expr::OffsetOf { .. } => {}
         }
         Ok(())
     }
@@ -295,7 +426,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
             match self.body.pat(p)? {
                 Pat::Bind { sub: Some(s), .. } | Pat::Ref { inner: s, .. } => stack.push(s),
-                Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Or { alts: elems } | Pat::Slice { elems } => {
+                Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Or { alts: elems } | Pat::Slice { elems, .. } => {
                     stack.extend_from_slice(self.body.pat_list(elems)?);
                 }
                 Pat::Struct { fields, .. } => {
@@ -303,7 +434,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                         stack.push(fp.pat);
                     }
                 }
-                Pat::Missing | Pat::Wild | Pat::Bind { sub: None, .. } | Pat::Lit(_) | Pat::NegLit(_) | Pat::Path(_) => {}
+                Pat::Missing
+                | Pat::Wild
+                | Pat::Bind { sub: None, .. }
+                | Pat::Lit(_)
+                | Pat::NegLit(_)
+                | Pat::Path(_)
+                | Pat::Range { .. } => {}
             }
         }
         Ok(())

@@ -215,6 +215,26 @@ impl Node {
         self.0
     }
 
+    /// The type (or predicate) this node is, if it is of the type class.
+    pub const fn as_ty(self) -> Option<Ty> {
+        if self.0 & 3 == TAG_TY { Some(Ty(self.0 >> 2)) } else { None }
+    }
+
+    /// The region this node is, if it is of the region class.
+    pub const fn as_region(self) -> Option<Region> {
+        if self.0 & 3 == TAG_REGION { Some(Region(self.0 >> 2)) } else { None }
+    }
+
+    /// The const this node is, if it is of the const class.
+    pub const fn as_const(self) -> Option<Const> {
+        if self.0 & 3 == TAG_CONST { Some(Const(self.0 >> 2)) } else { None }
+    }
+
+    /// The list this node is, if it is of the list class.
+    pub const fn as_list(self) -> Option<List> {
+        if self.0 & 3 == TAG_LIST { Some(List(self.0 >> 2)) } else { None }
+    }
+
     pub(crate) const fn ty(self) -> Ty {
         Ty(self.0 >> 2)
     }

@@ -8,7 +8,7 @@ use blaze_own::{Alloc, Soa, Vec};
 use crate::diag::Diag;
 use crate::ids::{ExprId, ItemKey, List, Mutbl, PatId};
 use crate::portable::{PTy, PortableTys};
-use crate::world::{Needs, ReadList};
+use crate::world::{Def, Needs, ReadList};
 
 /// One adjustment step, applied to an expression's value in order (rustc's `Adjust`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -23,6 +23,11 @@ pub enum AdjustKind {
     Borrow { mutbl: Mutbl, two_phase: bool, raw: bool },
     /// A fn item to a fn pointer.
     ReifyFnPointer,
+    /// A closure that captures nothing to a fn pointer (the Reference, "Type coercions": "Non
+    /// capturing closures to `fn` pointers"); the target is the pointer type, safe or `unsafe`.
+    ClosureFnPointer,
+    /// A safe fn pointer to the `unsafe` one of its ABI (`fn()` to `unsafe fn()`).
+    UnsafeFnPointer,
     /// `*mut T` to `*const T`.
     MutToConstPointer,
     /// An unsizing coercion (`&[T; N]` to `&[T]`).
@@ -43,6 +48,13 @@ pub type Adjusts<'a> = Soa<(ExprId, AdjustKind, PTy), Alloc<'a>>;
 /// The resolved callee of each call and method call: the expression, the item, and its generic
 /// arguments (a list of the record's `types`).
 pub type Callees<'a> = Soa<(ExprId, ItemKey, List), Alloc<'a>>;
+/// What each resolved value path (`Expr::Path`) and struct expression's path names, by
+/// expression: a variant is `Def::Ctor` with its index, a struct `Def::Adt` (variant 0), a
+/// type-relative `T::f` the picked associated item. A path that failed has no row.
+pub type ExprDefs<'a> = Soa<(ExprId, Def), Alloc<'a>>;
+/// The same for `Pat::Path`, `Pat::TupleStruct` and `Pat::Struct`, by pattern: the variant a
+/// `match` switches on.
+pub type PatDefs<'a> = Soa<(PatId, Def), Alloc<'a>>;
 /// Each field access: the expression, the variant and the field's index.
 pub type Fields<'a> = Soa<(ExprId, u32, u32), Alloc<'a>>;
 /// Each capture: the closure, the binding captured, how.
@@ -60,6 +72,8 @@ pub struct Checked<'a> {
     pub local_ty: Vec<PTy, Alloc<'a>>,
     pub adjusts: Adjusts<'a>,
     pub callees: Callees<'a>,
+    pub expr_defs: ExprDefs<'a>,
+    pub pat_defs: PatDefs<'a>,
     pub fields: Fields<'a>,
     pub captures: Captures<'a>,
     /// The body's diagnostics, in the order found.
@@ -67,6 +81,11 @@ pub struct Checked<'a> {
     /// What the check read, and what to fetch next time.
     pub reads: ReadList<'a>,
     pub needs: Needs<'a>,
+}
+
+/// Two two-column tables are equal column by column.
+fn soa2_eq<X: PartialEq, Y: PartialEq>(a: &Soa<(X, Y), Alloc<'_>>, b: &Soa<(X, Y), Alloc<'_>>) -> bool {
+    a.column::<0>() == b.column::<0>() && a.column::<1>() == b.column::<1>()
 }
 
 /// Two three-column tables are equal column by column.
@@ -109,6 +128,8 @@ impl<'a> Checked<'a> {
             && self.local_ty == other.local_ty
             && soa3_eq(&self.adjusts, &other.adjusts)
             && soa3_eq(&self.callees, &other.callees)
+            && soa2_eq(&self.expr_defs, &other.expr_defs)
+            && soa2_eq(&self.pat_defs, &other.pat_defs)
             && soa3_eq(&self.fields, &other.fields)
             && soa3_eq(&self.captures, &other.captures)
             && self.diags == other.diags

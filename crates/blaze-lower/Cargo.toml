@@ -22,6 +22,12 @@ blaze-own.workspace = true
 blaze-surface.workspace = true
 blaze-file-items.workspace = true
 blaze-typeck.workspace = true
+# `Fragment`: what a body's macro call is parsed as. The expansion itself comes through the
+# caller's `Expand` (this crate stays sans-IO and names no definition).
+blaze-expand.workspace = true
+# `Names::macro_definition`: `scoped::Scoped`, a body call's path resolved in its module, any
+# crate (a read of the names already made: no IO).
+blaze-scope.workspace = true
 parser.workspace = true
 
 [dev-dependencies]
@@ -29,6 +35,15 @@ parser.workspace = true
 blaze-sim.workspace = true
 # `Alloc::global()`: the tests' and the example's handle.
 blaze-own = { workspace = true, features = ["std"] }
+# `fixture`: rung 7c's world, for `typeck_tests` (bodies from text checked by `InferCtx`).
+blaze-typeck = { workspace = true, features = ["testing"] }
+# `CrateItemKey`: the crate the tests' `macro_rules!` definitions are written in.
+blaze-id.workspace = true
+# `scoped_tests`: the two crates' `Implicit` (Rust's std and prelude) for `resolve_crates`.
+blaze-unit-graph.workspace = true
+# `ScriptCx` over a script record: `include!(concat!(env!("OUT_DIR"), ..))` in `scoped_tests`.
+blaze-build-script.workspace = true
+edition.workspace = true
 
 [lints]
 workspace = true

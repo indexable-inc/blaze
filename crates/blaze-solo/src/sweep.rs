@@ -259,7 +259,7 @@ impl Sweep {
     }
 
     /// The listing of `dir`: each entry's last name and stamp, as the driver gave them.
-    pub fn listed(&mut self, dir: &str, entries: &[(String, Stamp)]) -> Walk {
+    pub fn listed(&mut self, dir: &str, entries: &blaze_core::Listing) -> Walk {
         let mut walk = Walk::default();
         // Out of the view since it was asked for (a tag probed hid it, or it went).
         if !self.rows.get(dir).is_some_and(|row| row.kind == Kind::Dir) {
@@ -271,7 +271,7 @@ impl Sweep {
         let seen: BTreeMap<String, Stamp> = entries
             .iter()
             // alloc: one path an entry of the listing
-            .map(|(name, stamp)| (format!("{prefix}{name}"), *stamp))
+            .map(|(name, stamp)| (format!("{prefix}{name}"), stamp))
             .filter(|(path, _)| !fixed_out(path))
             .collect();
         let held: Vec<String> = self

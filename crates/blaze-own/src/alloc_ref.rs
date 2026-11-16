@@ -47,7 +47,7 @@ use core::{
     ptr::NonNull,
 };
 
-use crate::{Arc, BTreeMap, BTreeSet, Box, Rc, Soa, SortedMap, SortedSet, String, Vec, VecDeque};
+use crate::{Arc, BTreeMap, BTreeSet, Box, Lists, Paths, Rc, Soa, SortedMap, SortedSet, String, Texts, Vec, VecDeque};
 #[cfg(test)]
 use crate::plant::{self, Plant};
 
@@ -515,3 +515,9 @@ pub type ABTreeMap<'a, K, V> = BTreeMap<K, V, Alloc<'a>>;
 pub type ABTreeSet<'a, T> = BTreeSet<T, Alloc<'a>>;
 /// A [`Soa`] over the handle; a table made by `soa!` is `Rows<Alloc<'a>>`.
 pub type ASoa<'a, C> = Soa<C, Alloc<'a>>;
+/// A [`Lists`] over the handle: rows of `T` in one item array and one array of row ends.
+pub type ALists<'a, T> = Lists<T, Alloc<'a>>;
+/// A [`Texts`] over the handle: short strings in one byte buffer.
+pub type ATexts<'a> = Texts<Alloc<'a>>;
+/// A [`Paths`] over the handle: directories and files as rows, each name once a directory.
+pub type APaths<'a> = Paths<Alloc<'a>>;

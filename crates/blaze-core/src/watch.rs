@@ -140,8 +140,7 @@ pub(crate) fn looks_under(effect: &crate::Effect, mut under: impl FnMut(&str) ->
         | Effect::ReadAll { file, .. }
         | Effect::Read { file, .. }
         | Effect::ReadLink { file, .. } => under(file.as_str()),
-        Effect::Entries { dir, .. } => under(dir.as_str()),
-        Effect::List { dir, .. } => match dir.name() {
+        Effect::List { dir, .. } | Effect::Entries { dir, .. } => match dir.name() {
             Some(dir) => under(dir.as_str()),
             // A listing of the root looks under every directory, so under every watch still
             // starting (each caller asks only while one is).

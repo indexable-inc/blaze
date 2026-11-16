@@ -453,12 +453,14 @@ impl World {
         self.since_open = [false; PATHS.len()];
         let mut effects = Vec::new();
         let mut store = Store::open(config("store"), &mut effects);
+        // Planted before the open is driven: its look through `placed/` sweeps or keeps what
+        // a crash left, which is what a plant may change.
+        store.plant = self.plant;
+        store.names.plant_one_name = self.plant == PlacePlant::OneName;
         drive(&mut self.sim, &mut store, &mut effects);
         if !store.ready() {
             return Err(format!("the store does not open: {:?}", store.broken()));
         }
-        store.plant = self.plant;
-        store.names.plant_one_name = self.plant == PlacePlant::OneName;
         store.starts(&path(STARTED), true);
         self.store = Some(store);
         Ok(())

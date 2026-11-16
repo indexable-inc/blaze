@@ -621,6 +621,97 @@ fn the_round_trip_and_the_edit_hold() {
     blaze_sim::check(Config::cases(400), round_trip);
 }
 
+/// The text the errors and datetimes said through `write!` before they were `Show`: the
+/// oracle the conversion is held to, byte for byte.
+fn said_before(what: What) -> StdString {
+    match what {
+        What::TooLarge { len, most } => format!("the text is {len} bytes, past the limit of {most}"),
+        What::TooDeep { most } => format!("more than {most} arrays and inline tables are open"),
+        What::Unexpected { found, expected } => format!("{found:?} where {} was wanted", expected_text(expected)),
+        What::Control { ch } => format!("control character {ch:?} is not allowed here"),
+        What::BadEscape { found } => format!("`\\{found}` is no escape"),
+        What::NotAScalar { value } => format!("U+{value:04X} is not a Unicode scalar value"),
+        What::Closed { first } => format!("the inline table or array at byte {first} is closed once written"),
+        other => panic!("no oracle for {other:?}"),
+    }
+}
+
+fn expected_text(expected: Expected) -> &'static str {
+    match expected {
+        Expected::Key => "a key",
+        Expected::Quote => "the closing quote",
+        _ => "`,` or `]`",
+    }
+}
+
+fn shows_as_before(tape: &Tape) -> Result<(), Broke> {
+    let chars = ['a', '\'', '"', '\n', '\u{1}', '\u{7f}', 'é'];
+    let pick = |tape: &Tape| *tape.one_of(&chars, "char");
+    let expected = *tape.one_of(&[Expected::Key, Expected::Quote, Expected::CommaOrEndArray], "expected");
+    let n = usize::try_from(tape.next_u64("n")).unwrap_or(0);
+    let what = match tape.below(7, "what") {
+        0 => What::TooLarge { len: n, most: n / 3 },
+        1 => What::TooDeep { most: n },
+        2 => What::Unexpected { found: pick(tape), expected },
+        3 => What::Control { ch: pick(tape) },
+        4 => What::BadEscape { found: pick(tape) },
+        5 => What::NotAScalar { value: tape.next_u32("scalar") >> tape.below(32, "shift") },
+        _ => What::Closed { first: n },
+    };
+    let error = Error { at: n, what };
+    let datetime = Datetime {
+        date: tape.coin("date").then(|| crate::doc::Date { year: 1979, month: 5, day: 7 }),
+        time: tape.coin("time").then(|| crate::doc::Time { hour: 7, minute: 3, second: 0, nanosecond: tape.next_u32("ns") % 1_000_000_000 }),
+        offset: match tape.below(3, "offset") {
+            0 => None,
+            1 => Some(crate::doc::Offset::Z),
+            _ => Some(crate::doc::Offset::Minutes(i16::try_from(tape.below(1440, "minutes")).unwrap_or(0) - 720)),
+        },
+    };
+    let datetime_before = {
+        let mut s = StdString::new();
+        if let Some(d) = datetime.date {
+            s.push_str(&format!("{:04}-{:02}-{:02}", d.year, d.month, d.day));
+            if datetime.time.is_some() {
+                s.push('T');
+            }
+        }
+        if let Some(t) = datetime.time {
+            s.push_str(&format!("{:02}:{:02}:{:02}", t.hour, t.minute, t.second));
+            if t.nanosecond > 0 {
+                let fraction = format!("{:09}", t.nanosecond);
+                s.push('.');
+                s.push_str(fraction.trim_end_matches('0'));
+            }
+        }
+        match datetime.offset {
+            None => {}
+            Some(crate::doc::Offset::Z) => s.push('Z'),
+            Some(crate::doc::Offset::Minutes(m)) => {
+                let sign = if m < 0 { '-' } else { '+' };
+                let m = m.unsigned_abs();
+                s.push_str(&format!("{sign}{:02}:{:02}", m / 60, m % 60));
+            }
+        }
+        s
+    };
+    for (got, want) in [
+        (what.to_string(), said_before(what)),
+        (error.to_string(), format!("{} at byte {n}", said_before(what))),
+        (datetime.to_string(), datetime_before),
+    ] {
+        if got != want {
+            return Err(Broke::Oracle(format!("the Show form says {got:?}; write! said {want:?}")));
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn errors_and_datetimes_show_as_write_said() {
+    blaze_sim::check(Config::cases(500), shows_as_before);
+}
+
 #[test]
 fn the_oracle_catches_a_short_body_end() {
     let run = |tape: &Tape, p: Plant| plant::with(p, || round_trip(tape));

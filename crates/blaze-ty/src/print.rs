@@ -148,6 +148,7 @@ impl Printer<'_, '_> {
             TyKind::Foreign(d) => self.push(Item::Def(d)),
             TyKind::Array(e, c) => self.seq(&[Text("["), N(e.node()), Text("; "), N(c.node()), Text("]")]),
             TyKind::Slice(e) => self.seq(&[Text("["), N(e.node()), Text("]")]),
+            TyKind::Pat(b, l) => self.seq(&[Text("pattern_type!("), N(b.node()), Text(" is "), N(l.node()), Text(")")]),
             TyKind::RawPtr(e, m) => {
                 let p = if m == Mutability::Mut { "*mut " } else { "*const " };
                 self.seq(&[Text(p), N(e.node())]);

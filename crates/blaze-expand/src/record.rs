@@ -25,7 +25,7 @@ use crate::{
     error::StreamError,
     expansion::{
         Diagnostic, Expansion, Hole, HoleOf, IncludeFailure, NestedCall, NestedKind, TokenOrigin,
-        PathScope, Range, ReadAnswer, ReadKind,
+        PathScope, ProcLevel, Range, ReadAnswer, ReadKind,
     },
     tokens::{
         Ctx, CtxNode, DefSite, Delim, Edition, LitKind, Mark, MarkOf, Raw, Spacing, Text,
@@ -481,6 +481,7 @@ fn write_diagnostic(c: &mut Columns<'_>, diagnostic: Diagnostic) {
                 IncludeFailure::Missing => 0,
                 IncludeFailure::NotUtf8 => 1,
                 IncludeFailure::DoesNotLex => 2,
+                IncludeFailure::Outside => 3,
             };
             c.put(column, &[8, why]);
             c.note(path);
@@ -493,6 +494,15 @@ fn write_diagnostic(c: &mut Columns<'_>, diagnostic: Diagnostic) {
             tag(c, 10);
             c.note(message);
             origin(c, at);
+        }
+        Diagnostic::ProcMacro { level, message, at } => {
+            c.put(column, &[11, level.byte()]);
+            c.note(message);
+            origin(c, at);
+        }
+        Diagnostic::ProcMacroPanicked { message } => {
+            tag(c, 12);
+            c.note(message);
         }
     }
 }
@@ -918,6 +928,7 @@ fn read_diagnostics(
                     0 => IncludeFailure::Missing,
                     1 => IncludeFailure::NotUtf8,
                     2 => IncludeFailure::DoesNotLex,
+                    3 => IncludeFailure::Outside,
                     _ => return Err(col.bad("an include failure of no kind")),
                 };
                 Diagnostic::Include { path: note(col)?, why }
@@ -927,6 +938,12 @@ fn read_diagnostics(
                 let message = note(col)?;
                 Diagnostic::Builtin { message, at: origin(col)? }
             }
+            11 => {
+                let level = ProcLevel::from_byte(col.byte()?).ok_or_else(|| col.bad("a proc macro level of no kind"))?;
+                let message = note(col)?;
+                Diagnostic::ProcMacro { level, message, at: origin(col)? }
+            }
+            12 => Diagnostic::ProcMacroPanicked { message: note(col)? },
             _ => return Err(col.bad("a diagnostic of no kind")),
         };
         read.push(diagnostic);

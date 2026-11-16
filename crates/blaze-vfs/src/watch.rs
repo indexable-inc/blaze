@@ -57,7 +57,7 @@
 use std::{cmp::Ordering, collections::VecDeque, sync::Arc};
 
 use blaze_core::{
-    Completion, Cursor, Done, Effect, FileName, IoError, Lost, Names, S_IFMT, Stamp, Tag,
+    Completion, Cursor, Done, Effect, FileName, IoError, Listing, Lost, Names, S_IFMT, Stamp, Tag,
 };
 use blaze_hash::{HashMap, HashSet};
 use blaze_ids::ContentId;
@@ -437,7 +437,7 @@ enum Pending {
 struct Held {
     number: u64,
     dir: PathId,
-    entries: Vec<(FileName, Stamp)>,
+    entries: Box<Listing>,
     tag: Stamp,
 }
 
@@ -1175,7 +1175,7 @@ impl Watcher {
         self.work.root = root;
         let number = self.push(batch);
         let tag = self.tag(Pending::Entries(number, id));
-        effects.push(Effect::Entries { dir, tag });
+        effects.push(Effect::Entries { dir: dir.into(), tag });
     }
 
     /// A batch of slots, and the stamp of each asked for in one effect.
@@ -1349,7 +1349,7 @@ impl Watcher {
         for at in 0..self.work.lists.len() {
             let dir = self.work.lists[at];
             let tag = self.tag(Pending::Entries(number, dir));
-            effects.push(Effect::Entries { dir: self.file_name(dir), tag });
+            effects.push(Effect::Entries { dir: self.file_name(dir).into(), tag });
         }
         self.work.lists.clear();
         let mut uncached = std::mem::take(&mut self.work.uncached);
@@ -1467,24 +1467,33 @@ impl Watcher {
         vfs: &Vfs,
         number: u64,
         dir: PathId,
-        mut entries: Vec<(FileName, Stamp)>,
+        mut entries: Box<Listing>,
         effects: &mut Vec<Effect>,
     ) {
         let below = self.below.len();
         let Watcher { paths, caches, .. } = self;
         let rel = paths.rel(dir, below);
         caches.remove(rel);
-        entries.retain(|(file, _)| file.as_str().get(below..).is_none_or(|it| !caches.hides(it)));
+        // clone: the listing's directory, a refcount, read while the listing is changed.
+        let listed = entries.dir().clone();
+        // alloc: once per listing, each entry's name under the root written into it in turn.
+        let mut file = String::new();
+        entries.retain(|leaf, _| {
+            file.clear();
+            if let Some(dir) = listed.name() {
+                file.push_str(dir.as_str());
+                file.push('/');
+            }
+            file.push_str(leaf.as_str());
+            file.get(below..).is_none_or(|it| !caches.hides(it))
+        });
+        // A tag is the file of that name directly in the directory listed: found by name.
         let tag = (!rel.is_empty())
-            .then(|| {
-                entries.iter().position(|(file, stamp)| {
-                    file.as_str().get(below..).and_then(tag_of) == Some(rel) && may_be_tag(stamp)
-                })
-            })
+            .then(|| entries.find(TAG_NAME).filter(|&at| may_be_tag(&entries.stamp(at))))
             .flatten();
         match tag {
             Some(at) => {
-                let (file, stamp) = (entries[at].0.clone(), entries[at].1); // clone: the probe's name
+                let (file, stamp) = (entries.file(at), entries.stamp(at)); // alloc: the probe's name
                 // alloc: per listing that holds a file named as a tag.
                 let held = Box::new(Held { number, dir, entries, tag: stamp });
                 let tag = self.tag(Pending::Listing(held));
@@ -1503,7 +1512,7 @@ impl Watcher {
         vfs: &Vfs,
         number: u64,
         dir: PathId,
-        entries: Vec<(FileName, Stamp)>,
+        entries: Box<Listing>,
         effects: &mut Vec<Effect>,
     ) {
         let head = self.head_root(vfs);
@@ -1517,13 +1526,12 @@ impl Watcher {
             };
             batch.open -= 1;
             if batch.relist == Some(dir) {
-                let there: HashMap<&str, Stamp, Global> =
-                    // alloc: once per relisting, by the directory's names.
-                    entries.iter().map(|(it, stamp)| (it.as_str(), *stamp)).collect();
                 for (at, slot) in
                     batch.slots.iter_mut().enumerate().filter(|(_, it)| it.look.is_none())
                 {
-                    let Some(&now) = there.get(paths.get(slot.name)) else {
+                    // By binary search in the listing's sorted names: no map is built.
+                    let there = entries.find_file(paths.get(slot.name));
+                    let Some(now) = there.map(|it| entries.stamp(it)) else {
                         slot.stamp = Some(Stamp::GONE);
                         slot.look = Some(Look::Gone);
                         continue;
@@ -1549,18 +1557,23 @@ impl Watcher {
                 }
                 batch.went(paths, scratch, disk, &vfs.tree, head, below);
             }
-            for (file, stamp) in entries {
-                if batch.known(paths, file.as_str()) || file.as_str().len() <= below {
+            // alloc: once per listing, each entry's name under the root written into it in turn.
+            let mut full = String::new();
+            for entry in 0..entries.len() {
+                let stamp = entries.stamp(entry);
+                let file = entries.file_into(entry, &mut full);
+                if batch.known(paths, file) || file.len() <= below {
                     continue;
                 }
-                let name = paths.intern(file.as_str());
+                let name = paths.intern(file);
                 let at = batch.slots.len();
                 batch.index.insert(name, at);
                 let was = seen(&vfs.tree, head, paths.rel(name, below));
                 let look = if stamp.is_gone() {
                     Some(Look::Gone)
                 } else if stamp.is_dir() {
-                    asks.push((None, name, file));
+                    // alloc: the name the listing hands the driver, which takes it owned.
+                    asks.push((None, name, entries.file(entry)));
                     batch.open += 1;
                     Some(Look::Dir)
                 } else if too_large(&stamp) {
@@ -1568,7 +1581,8 @@ impl Watcher {
                 } else if let Some(from) = batch.moved(&stamp) {
                     Some(Look::Moved(from))
                 } else {
-                    asks.push((Some((at, stamp)), name, file));
+                    // alloc: the name the read hands the driver, which takes it owned.
+                    asks.push((Some((at, stamp)), name, entries.file(entry)));
                     None
                 };
                 batch.slots.push(Slot {
@@ -1590,7 +1604,7 @@ impl Watcher {
                 }
                 None => {
                     let tag = self.tag(Pending::Entries(number, name));
-                    effects.push(Effect::Entries { dir: file, tag });
+                    effects.push(Effect::Entries { dir: file.into(), tag });
                 }
             }
         }

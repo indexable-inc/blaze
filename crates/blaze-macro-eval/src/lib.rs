@@ -1,3 +1,5 @@
+//! (2026-11-16: `protocol.rs`, `wire.rs` and `guest/entry.rs` moved to `crates/blaze-proc-macro`: `src/protocol.rs`, `src/wire.rs`, `guest/shim.rs`.)
+//!
 //! Proc macros run in process, behind blaze's server of the real `library/proc_macro` bridge
 //! (docs/v2/plan/design/compile-time.md, change 20). The client's one call into its server
 //! (`Closure::call`) is answered by blaze's server ([`server`]), which speaks the pinned

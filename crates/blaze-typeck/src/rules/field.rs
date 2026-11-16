@@ -65,12 +65,12 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
                     if !matches!(adt.kind, AdtKind::Struct | AdtKind::Union) {
                         None
                     } else {
-                        let want = name.unwrap_or(Name(u64::from(index)));
+                        let want = name.unwrap_or(Name::of_index(index));
                         let Some(v) = adt.variants.first() else { continue };
                         let fields = adt.fields.get(v.fields.range()).unwrap_or(&[]);
                         match fields.iter().position(|fl| fl.name == want) {
                             Some(at) => {
-                                let ty = self.lower(adt.types, fields[at].ty, Lower::Args(args))?;
+                                let ty = self.lower(adt.types, fields[at].ty, Lower::Args(args), Cause::Expr(e))?;
                                 Some((ty, 0, at as u32))
                             }
                             None => None,
@@ -95,6 +95,74 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
         };
         self.diag(code, At::Expr(e), None, Some(base_ty), name);
         Ok(Flow::Done(self.common.err))
+    }
+
+    /// `offset_of!(T, a.b.0)` (the pinned library's `core::mem::offset_of!`: "Expands to the
+    /// offset in bytes of a field from the beginning of the given type. The type may be a
+    /// `struct`, `enum`, `union`, or tuple. The field may be a nested field (`field1.field2`),
+    /// but not an array index ... The offset is returned as a `usize`"; `offset_of_enum`:
+    /// "allows `enum` variants to be traversed as if they were fields"): `usize`. Each step is
+    /// looked up on the type the step before reached, with no autoderef (a reference's
+    /// pointee is not inside it); a step that type lacks is E0609 naming the type and the
+    /// step, as is a path that ends on a variant. Omitted: privacy (the world gives no field's
+    /// visibility yet). The value is the layout's, not this crate's.
+    pub(crate) fn expr_offset_of(&mut self, e: ExprId, ty: crate::PTy, fields: crate::List) -> Result<Flow, Stop> {
+        let at = At::Expr(e);
+        let usize_ = self.common.usize_;
+        let mut cur = self.lower_body_ty(ty, at)?;
+        let steps = self.body.segment_list(fields)?;
+        // The variant the step before named, when it named one of an enum's.
+        let mut variant: Option<usize> = None;
+        for s in steps {
+            let want = s.name;
+            let here = self.structurally_resolve(cur, at)?;
+            if self.is_err(here) {
+                return Ok(Flow::Done(usize_));
+            }
+            let next = match self.view(here) {
+                TyView::Tuple(l) if variant.is_none() => {
+                    let n = self.ty.list_len(l);
+                    (0..n).find(|&i| Name::of_index(i) == want).map(|i| self.ty.list_get(l, i))
+                }
+                TyView::Adt(k, args) => match self.field_adt(k)? {
+                    Some(adt) if adt.kind == AdtKind::Enum && variant.is_none() => {
+                        if let Some(i) = adt.variants.iter().position(|v| v.name == want) {
+                            variant = Some(i);
+                            continue;
+                        }
+                        None
+                    }
+                    Some(adt) => {
+                        let fs = match adt.variants.get(variant.unwrap_or(0)) {
+                            Some(v) => adt.fields.get(v.fields.range()).unwrap_or(&[]),
+                            None => &[],
+                        };
+                        match fs.iter().position(|fl| fl.name == want) {
+                            Some(i) => {
+                                variant = None;
+                                Some(self.lower(adt.types, fs[i].ty, Lower::Args(args), Cause::Expr(e))?)
+                            }
+                            None => None,
+                        }
+                    }
+                    None => None,
+                },
+                _ => None,
+            };
+            match next {
+                Some(t) => cur = t,
+                None => {
+                    self.diag(DiagCode::NoField, at, None, Some(here), Some(want));
+                    return Ok(Flow::Done(usize_));
+                }
+            }
+        }
+        if variant.is_some() {
+            // `offset_of!(E, V)`: a variant is no field.
+            let last = steps.last().map(|s| s.name);
+            self.diag(DiagCode::NoField, at, None, Some(cur), last);
+        }
+        Ok(Flow::Done(usize_))
     }
 
     pub(crate) fn expr_index(&mut self, mut f: Frame, e: ExprId, base: ExprId, index: ExprId) -> Result<Flow, Stop> {
@@ -141,6 +209,10 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx> Machine<'b, 'w, 'c, '_, W, C> {
                             return Ok(Flow::Done(out));
                         }
                     }
+                }
+                if index_trait.is_none() {
+                    self.missing_lang(LangItem::Index, At::Expr(e));
+                    return Ok(Flow::Done(self.common.err));
                 }
                 self.diag(DiagCode::CantIndex, At::Expr(e), None, Some(base_ty), None);
                 Ok(Flow::Done(self.common.err))

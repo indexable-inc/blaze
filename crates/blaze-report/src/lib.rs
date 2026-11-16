@@ -50,6 +50,7 @@
 // The field order promised above, held by `blaze::cbor_field_order`.
 #![blaze::canonical_cbor]
 
+pub mod frame;
 pub mod out;
 pub mod palette;
 mod render;

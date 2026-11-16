@@ -16,6 +16,8 @@ doctest = false
 [dependencies]
 # `ContentId` and `Hasher`: an item's content hashes, in named domains.
 blaze-ids.workspace = true
+# `derive_key_many`: an outline's short digests hashed side by side, one input a vector lane.
+blaze-blake3.workspace = true
 # `ByHash`: the count of earlier siblings of each kind and name, for the disambiguator.
 blaze-hash.workspace = true
 # The lexer and the parser's event stream, `SyntaxKind`, and the parser's `Edition`, which
@@ -25,8 +27,12 @@ parser.workspace = true
 # `Range`, `ItemIndex`, `WrittenVis` and `Edition`, defined once there, and the `FileItems`
 # record an outline is written as.
 blaze-surface.workspace = true
-# `Vec`: an outline's columns, in the allocator its caller names.
-blaze-own.workspace = true
+# `Vec`: an outline's columns, in the allocator its caller names; `std` for `Alloc::global`,
+# the heap the worker's scratch outline grows in.
+blaze-own = { workspace = true, features = ["std"] }
+# `scratch::Shelved`: the walk's working vectors and the outline it grows, kept per worker at
+# their high-water mark, so the caller's frame holds the outline at its exact size.
+blaze-mem.workspace = true
 # `tokenize` and `skip_body`: the bodies an outline leaves unlexed; `validate`: the skeleton's
 # UTF-8.
 blaze-lex.workspace = true
@@ -35,8 +41,6 @@ blaze-memchr.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true
-# `Alloc::global()`: the handle the tests and the example outline in.
-blaze-own = { workspace = true, features = ["std"] }
 # `Aligned`: a record's bytes at the alignment its view reads them at.
 blaze-format.workspace = true
 

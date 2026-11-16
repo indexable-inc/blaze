@@ -19,6 +19,7 @@
 //! second set of rules: the tests check both agree at every offset of every test file.
 
 use blaze_phf::{name_hash_finish, name_hash_start, name_hash_word};
+use crate::line_break::has_bare_cr;
 use crate::unescape::{Mode, unescape_byte, unescape_byte_str, unescape_char, unescape_str};
 
 use super::{
@@ -335,7 +336,9 @@ pub(super) fn special(text: &str, at: usize, classes: &Classes<'_>) -> Option<(S
                     Some(b'/') if byte(at + 3) != Some(b'/') => SyntaxKind::OUTER_DOC_COMMENT,
                     _ => SyntaxKind::COMMENT,
                 };
-                Some((kind, classes.next_bit(NEWLINE, at + 2) - at))
+                let end = classes.next_bit(NEWLINE, at + 2);
+                // A doc comment's bare CR is the converter's error to report.
+                (kind == SyntaxKind::COMMENT || !has_bare_cr(bytes, at..end)).then_some((kind, end - at))
             }
             Some(b'*') => block_comment(bytes, at, classes),
             _ => Some((T![/], 1)),
@@ -347,8 +350,12 @@ pub(super) fn special(text: &str, at: usize, classes: &Classes<'_>) -> Option<(S
         b'"' => {
             let (close, escaped) = close_quote(bytes, at + 1, classes)?;
             let end = suffix_end(bytes, close + 1, classes)?;
-            (!escaped || clean_str(&text[at + 1..close], Mode::Str))
-                .then_some((SyntaxKind::STRING, end - at))
+            let clean = match escaped {
+                true => clean_str(&text[at + 1..close], Mode::Str),
+                // A bare CR is the converter's error to report; a CR LF is a line break.
+                false => !has_bare_cr(bytes, at + 1..close),
+            };
+            clean.then_some((SyntaxKind::STRING, end - at))
         }
         b'\'' => lifetime_or_char(text, at, classes),
         b'r' | b'b' => prefixed(text, at, classes),
@@ -461,7 +468,9 @@ fn block_comment(bytes: &[u8], at: usize, classes: &Classes<'_>) -> Option<(Synt
                 depth -= 1;
                 from = found + 2;
                 if depth == 0 {
-                    return Some((kind, from - at));
+                    // A doc comment's bare CR is the converter's error to report.
+                    return (kind == SyntaxKind::COMMENT || !has_bare_cr(bytes, at..from))
+                        .then_some((kind, from - at));
                 }
             }
             _ => from = found + 1,
@@ -633,6 +642,10 @@ fn raw_string(
             Some(_) => from = found + 1,
         }
     };
+    // A bare CR is the converter's error to report.
+    if has_bare_cr(bytes, open + 1..close) {
+        return None;
+    }
     Some((kind, suffix_end(bytes, close, classes)? - at))
 }
 

@@ -14,6 +14,9 @@ pub(crate) enum Plant {
     CopyOffsetOffByOne,
     /// A tree entry named `..` is taken.
     ParentNameTaken,
+    /// A lookup by id that misses takes the entry where the id would be (an object accepted
+    /// without its id matching).
+    NearestId,
 }
 
 #[cfg(test)]

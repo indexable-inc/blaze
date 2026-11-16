@@ -10,20 +10,19 @@
 use blaze_own::{AVec, Alloc, Vec};
 
 use blaze_id::{ContentId, CrateItemKey, ItemKey, Portable};
-use span::{EditionedFileId, FileId, ROOT_ERASED_FILE_AST_ID, SpanAnchor, SyntaxContext};
 
 use crate::error::{LexError, StreamError, Table};
 
 /// The edition a token is read in: the schema's one `Edition`.
 pub use blaze_surface::Edition;
 
-/// `edition` as the span crate's, for mbe and the lexer.
-pub(crate) fn span_edition(edition: Edition) -> span::Edition {
+/// `edition` as the parser's, for the lexer and the fragment parser.
+pub(crate) fn parser_edition(edition: Edition) -> parser::Edition {
     match edition {
-        Edition::E2015 => span::Edition::Edition2015,
-        Edition::E2018 => span::Edition::Edition2018,
-        Edition::E2021 => span::Edition::Edition2021,
-        Edition::E2024 => span::Edition::Edition2024,
+        Edition::E2015 => parser::Edition::Edition2015,
+        Edition::E2018 => parser::Edition::Edition2018,
+        Edition::E2021 => parser::Edition::Edition2021,
+        Edition::E2024 => parser::Edition::Edition2024,
     }
 }
 
@@ -49,24 +48,6 @@ impl Delim {
             Delim::Invisible => 3,
         }
     }
-
-    pub(crate) fn of_tt(kind: tt::DelimiterKind) -> Delim {
-        match kind {
-            tt::DelimiterKind::Parenthesis => Delim::Paren,
-            tt::DelimiterKind::Brace => Delim::Brace,
-            tt::DelimiterKind::Bracket => Delim::Bracket,
-            tt::DelimiterKind::Invisible => Delim::Invisible,
-        }
-    }
-
-    pub(crate) fn to_tt(self) -> tt::DelimiterKind {
-        match self {
-            Delim::Paren => tt::DelimiterKind::Parenthesis,
-            Delim::Brace => tt::DelimiterKind::Brace,
-            Delim::Bracket => tt::DelimiterKind::Bracket,
-            Delim::Invisible => tt::DelimiterKind::Invisible,
-        }
-    }
 }
 
 /// Whether a token is written right against the next one (rustc's `Spacing`).
@@ -86,22 +67,6 @@ impl Spacing {
             Spacing::Alone => 0,
             Spacing::Joint => 1,
             Spacing::JointHidden => 2,
-        }
-    }
-
-    pub(crate) fn of_tt(spacing: tt::Spacing) -> Spacing {
-        match spacing {
-            tt::Spacing::Alone => Spacing::Alone,
-            tt::Spacing::Joint => Spacing::Joint,
-            tt::Spacing::JointHidden => Spacing::JointHidden,
-        }
-    }
-
-    pub(crate) fn to_tt(self) -> tt::Spacing {
-        match self {
-            Spacing::Alone => tt::Spacing::Alone,
-            Spacing::Joint => tt::Spacing::Joint,
-            Spacing::JointHidden => tt::Spacing::JointHidden,
         }
     }
 }
@@ -139,38 +104,6 @@ impl LitKind {
             LitKind::Err => [10, 0],
         }
     }
-
-    pub(crate) fn of_tt(kind: tt::LitKind) -> LitKind {
-        match kind {
-            tt::LitKind::Byte => LitKind::Byte,
-            tt::LitKind::Char => LitKind::Char,
-            tt::LitKind::Integer => LitKind::Integer,
-            tt::LitKind::Float => LitKind::Float,
-            tt::LitKind::Str => LitKind::Str,
-            tt::LitKind::StrRaw(hashes) => LitKind::StrRaw(hashes),
-            tt::LitKind::ByteStr => LitKind::ByteStr,
-            tt::LitKind::ByteStrRaw(hashes) => LitKind::ByteStrRaw(hashes),
-            tt::LitKind::CStr => LitKind::CStr,
-            tt::LitKind::CStrRaw(hashes) => LitKind::CStrRaw(hashes),
-            tt::LitKind::Err(()) => LitKind::Err,
-        }
-    }
-
-    pub(crate) fn to_tt(self) -> tt::LitKind {
-        match self {
-            LitKind::Byte => tt::LitKind::Byte,
-            LitKind::Char => tt::LitKind::Char,
-            LitKind::Integer => tt::LitKind::Integer,
-            LitKind::Float => tt::LitKind::Float,
-            LitKind::Str => tt::LitKind::Str,
-            LitKind::StrRaw(hashes) => tt::LitKind::StrRaw(hashes),
-            LitKind::ByteStr => tt::LitKind::ByteStr,
-            LitKind::ByteStrRaw(hashes) => tt::LitKind::ByteStrRaw(hashes),
-            LitKind::CStr => tt::LitKind::CStr,
-            LitKind::CStrRaw(hashes) => tt::LitKind::CStrRaw(hashes),
-            LitKind::Err => tt::LitKind::Err(()),
-        }
-    }
 }
 
 /// Whether an identifier is written `r#name`.
@@ -197,6 +130,14 @@ impl Text {
         core::str::from_utf8(&table[at..at + len])
             .expect("a text table holds whole `&str`s, and a `Text` is the range of one")
     }
+
+    /// The text in `table` when this range is a whole `str` of it; `None` past its end or off
+    /// a character's boundary. For a table from outside (a proc macro's), never trusted.
+    pub fn get(self, table: &[u8]) -> Option<&str> {
+        let at = self.at as usize;
+        let bytes = table.get(at..at.checked_add(self.len as usize)?)?;
+        core::str::from_utf8(bytes).ok()
+    }
 }
 
 /// Appends `text` to `table`, giving its range.
@@ -220,7 +161,7 @@ pub enum TokenKind {
     Ident { raw: Raw, spacing: Spacing },
     /// One punctuation character; its text is empty.
     Punct { char: char, spacing: Spacing },
-    /// A literal; its text is tt's, the inside of the quotes then the suffix, and
+    /// A literal; its text is the inside of the quotes then the suffix, and
     /// `suffix_len` the suffix's length in bytes.
     Literal { kind: LitKind, suffix_len: u32, spacing: Spacing },
     /// A group's opening delimiter; its text is empty.
@@ -539,7 +480,46 @@ impl<'a> TokenStream<'a> {
 
     /// Appends a token of `kind`, `text` and `ctx`, a context of this stream.
     pub fn push(&mut self, kind: TokenKind, text: &str, ctx: Ctx) -> Result<(), StreamError> {
-        self.push_joined(kind, text, "", ctx)
+        self.push_bytes(kind, text.as_bytes(), ctx)
+    }
+
+    /// [`TokenStream::push`] of text given as bytes: a `&str`'s, or a whole token's text of a
+    /// stream ([`TokenStream::bytes_at`]), so the table holds only whole `&str`s. A copy of a
+    /// token reads and writes its text so, with no UTF-8 check.
+    pub(crate) fn push_bytes(
+        &mut self,
+        kind: TokenKind,
+        text: &[u8],
+        ctx: Ctx,
+    ) -> Result<(), StreamError> {
+        if let Some(at) = ctx.node()
+            && at as usize >= self.contexts.len()
+        {
+            return Err(StreamError::NoSuchContext { ctx: ctx.0 });
+        }
+        u32::try_from(self.tokens.len() + 1)
+            .map_err(|_| StreamError::TooLarge { table: Table::Tokens })?;
+        let too_large = StreamError::TooLarge { table: Table::Text };
+        let at = u32::try_from(self.text.len()).map_err(|_| too_large)?;
+        let len = u32::try_from(text.len()).map_err(|_| too_large)?;
+        at.checked_add(len).ok_or(too_large)?;
+        if !text.is_empty() {
+            self.text.extend_from_slice(text);
+        }
+        self.tokens.push(Token { kind, text: Text { at, len }, ctx });
+        Ok(())
+    }
+
+    /// The text of the token at `at` as bytes, for a copy or a comparison.
+    pub(crate) fn bytes_at(&self, at: usize) -> &[u8] {
+        let text = self.tokens[at].text;
+        &self.text[text.at as usize..text.at as usize + text.len as usize]
+    }
+
+    /// Room for `tokens` more tokens and `text` more bytes of text.
+    pub(crate) fn reserve(&mut self, tokens: usize, text: usize) {
+        self.tokens.reserve(tokens);
+        self.text.reserve(text);
     }
 
     /// [`TokenStream::push`] of a token whose text is `head` then `tail`: a literal's inside
@@ -675,6 +655,36 @@ impl<'a> TokenStream<'a> {
         self.text.clear();
         self.contexts.clear();
     }
+
+    /// Where the stream's three tables end now, for [`TokenStream::truncate`].
+    pub(crate) fn mark(&self) -> StreamMark {
+        StreamMark {
+            tokens: self.tokens.len(),
+            text: self.text.len(),
+            contexts: self.contexts.len(),
+        }
+    }
+
+    /// Back to `mark`: the tokens pushed since, their text and the contexts made since go. A
+    /// mark at or past the end (one taken before an earlier, deeper truncate) changes nothing.
+    /// A context made since is one only a token pushed since can name: a context is pushed
+    /// once, before the first token of it.
+    pub(crate) fn truncate(&mut self, mark: StreamMark) {
+        if mark.tokens >= self.tokens.len() {
+            return;
+        }
+        self.tokens.truncate(mark.tokens);
+        self.text.truncate(mark.text);
+        self.contexts.truncate(mark.contexts);
+    }
+}
+
+/// The lengths of a stream's tables at one moment ([`TokenStream::mark`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct StreamMark {
+    pub(crate) tokens: usize,
+    text: usize,
+    contexts: usize,
 }
 
 /// An index of a table this crate keeps under `u32::MAX` entries ([`TokenStream::push`] refuses
@@ -688,8 +698,9 @@ pub(crate) fn index(at: usize) -> u32 {
 ///
 /// Read straight from the lexer's kinds and lengths into the stream's own text table: no token
 /// tree, no span and no interned symbol, so a call shares nothing with another thread and
-/// everything it allocates is in `alloc`. [`lex_through_tt`] is the same function through tt,
-/// kept as the reference the tests hold this one equal to.
+/// everything it allocates is in `alloc`. Groups and spacing are read as rust-analyzer's token
+/// trees read them (a stray closer is punctuation; a group left open is closed at the end),
+/// which the tests held it equal to while that path was in the tree.
 pub fn lex<'a>(
     text: &str,
     edition: Edition,
@@ -700,7 +711,7 @@ pub fn lex<'a>(
         R_CURLY, R_PAREN, UNDERSCORE,
     };
 
-    let lexed = parser::LexedStr::new(span_edition(edition), text);
+    let lexed = parser::LexedStr::new(parser_edition(edition), text);
     if lexed.errors().next().is_some() {
         return Err(LexError::Refused { edition });
     }
@@ -731,7 +742,7 @@ pub fn lex<'a>(
             _ => None,
         };
         // A closer closes the innermost group it matches and every group inside that one; one
-        // that matches none is a punctuation token, as tt reads it.
+        // that matches none is a punctuation token.
         let depth = closes.and_then(|delim| open.iter().rev().position(|it| *it == delim));
         if let Some(delim) = opens {
             joined_to(&mut out, &mut last, start);
@@ -746,11 +757,11 @@ pub fn lex<'a>(
         } else if kind == INNER_DOC_COMMENT || kind == OUTER_DOC_COMMENT {
             joined_to(&mut out, &mut last, start);
             last = None;
-            doc_comment(&mut out, &mut scratch, token, kind == INNER_DOC_COMMENT, ctx)
+            doc_comment(&mut out, &mut scratch, token, text.as_bytes().get(offset) == Some(&b'\n'), kind == INNER_DOC_COMMENT, ctx)
                 .ok_or(refused)??;
         } else if kind.is_punct() && kind != UNDERSCORE {
             joined_to(&mut out, &mut last, start);
-            let joint = i + 1 < lexed.len() && syntax_bridge::is_single_token_op(lexed.kind(i + 1));
+            let joint = i + 1 < lexed.len() && glues_after(lexed.kind(i + 1));
             let spacing = if joint { Spacing::Joint } else { Spacing::Alone };
             let char = token.chars().next().ok_or(refused)?;
             out.punct(char, spacing, ctx)?;
@@ -764,28 +775,21 @@ pub fn lex<'a>(
             last = Some((out.len() - 1, offset));
         } else if kind.is_literal() {
             joined_to(&mut out, &mut last, start);
-            // The compiler reads a source file with `\n` line endings.
+            // A literal's value holds LF for each CR LF break (parser::line_break).
             let source = if token.contains('\r') {
                 scratch.clear();
-                for (at, line) in token.split("\r\n").enumerate() {
-                    if at > 0 {
-                        scratch.push('\n');
-                    }
-                    scratch.push_str(line);
+                for piece in parser::line_break::without_break_crs(token) {
+                    scratch.push_str(piece);
                 }
                 scratch.as_str()
             } else {
                 token
             };
-            let parts = tt::literal_parts(source);
-            let suffix_len = u32::try_from(parts.suffix.len())
+            let (lit, text, suffix) = literal_parts(source);
+            let suffix_len = u32::try_from(suffix.len())
                 .map_err(|_| StreamError::TooLarge { table: Table::Text })?;
-            let kind = TokenKind::Literal {
-                kind: LitKind::of_tt(parts.kind),
-                suffix_len,
-                spacing: Spacing::Alone,
-            };
-            out.push_joined(kind, parts.text, parts.suffix, ctx)?;
+            let kind = TokenKind::Literal { kind: lit, suffix_len, spacing: Spacing::Alone };
+            out.push_joined(kind, text, suffix, ctx)?;
             last = Some((out.len() - 1, offset));
         } else if kind == LIFETIME_IDENT {
             joined_to(&mut out, &mut last, start);
@@ -796,12 +800,84 @@ pub fn lex<'a>(
         }
         // Anything else (spaces, comments, a shebang) is not a token.
     }
-    // A group the text leaves open is closed at its end, as tt closes it.
+    // A group the text leaves open is closed at its end.
     while let Some(delim) = open.pop() {
         joined_to(&mut out, &mut last, 0usize);
         out.close(delim, ctx)?;
     }
     Ok(out)
+}
+
+/// Whether a punctuation token is joint with a next token of `kind`: one that is punctuation
+/// alone, or a lifetime (its `'`), as rustc's lexer glues operators.
+fn glues_after(kind: parser::SyntaxKind) -> bool {
+    use parser::SyntaxKind::{
+        AMP, AT, BANG, CARET, COLON, COMMA, DOLLAR, DOT, EQ, L_ANGLE, LIFETIME_IDENT, MINUS,
+        PERCENT, PIPE, PLUS, POUND, QUESTION, R_ANGLE, SEMICOLON, SLASH, STAR, TILDE,
+    };
+    matches!(
+        kind,
+        EQ | L_ANGLE
+            | R_ANGLE
+            | BANG
+            | AMP
+            | PIPE
+            | TILDE
+            | AT
+            | DOT
+            | COMMA
+            | SEMICOLON
+            | COLON
+            | POUND
+            | DOLLAR
+            | QUESTION
+            | PLUS
+            | MINUS
+            | STAR
+            | SLASH
+            | PERCENT
+            | CARET
+            | LIFETIME_IDENT
+    )
+}
+
+/// A literal token's kind, the text inside its quotes (a number's digits) and its suffix (none
+/// for `_`). A quoted literal keeps its suffix as rustc's lexer does: a suffix where none is
+/// allowed is an error of the literal's use. Text that is no literal is an `Err` literal.
+fn literal_parts(text: &str) -> (LitKind, &str, &str) {
+    use rustc_lexer::LiteralKind as L;
+    let token = rustc_lexer::tokenize(text, rustc_lexer::FrontmatterAllowed::No).next();
+    let Some(rustc_lexer::Token { kind: rustc_lexer::TokenKind::Literal { kind, suffix_start }, .. }) =
+        token
+    else {
+        return (LitKind::Err, text, "");
+    };
+    let raw = |hashes: Option<u8>| hashes.unwrap_or_default();
+    let (lit, start, end) = match kind {
+        L::Int { .. } => (LitKind::Integer, 0, 0),
+        L::Float { .. } => (LitKind::Float, 0, 0),
+        L::Char { terminated } => (LitKind::Char, 1, usize::from(terminated)),
+        L::Byte { terminated } => (LitKind::Byte, 2, usize::from(terminated)),
+        L::Str { terminated } => (LitKind::Str, 1, usize::from(terminated)),
+        L::ByteStr { terminated } => (LitKind::ByteStr, 2, usize::from(terminated)),
+        L::CStr { terminated } => (LitKind::CStr, 2, usize::from(terminated)),
+        L::RawStr { n_hashes } => {
+            (LitKind::StrRaw(raw(n_hashes)), 2 + usize::from(raw(n_hashes)), 1 + usize::from(raw(n_hashes)))
+        }
+        L::RawByteStr { n_hashes } => (
+            LitKind::ByteStrRaw(raw(n_hashes)),
+            3 + usize::from(raw(n_hashes)),
+            1 + usize::from(raw(n_hashes)),
+        ),
+        L::RawCStr { n_hashes } => (
+            LitKind::CStrRaw(raw(n_hashes)),
+            3 + usize::from(raw(n_hashes)),
+            1 + usize::from(raw(n_hashes)),
+        ),
+    };
+    let (quoted, suffix) = text.split_at(suffix_start as usize);
+    let inside = &quoted[start..quoted.len() - end];
+    (lit, inside, if suffix == "_" { "" } else { suffix })
 }
 
 /// The doc comment `token` as the attribute it stands for, `#[doc = ".."]` (`#![..]` when
@@ -810,14 +886,23 @@ fn doc_comment(
     out: &mut TokenStream<'_>,
     scratch: &mut blaze_own::AString<'_>,
     token: &str,
+    followed_by_lf: bool,
     inner: bool,
     ctx: Ctx,
 ) -> Option<Result<(), StreamError>> {
+    // A line comment's token ends before its LF, so its break's CR is no part of it; inside, each
+    // CR LF is one LF of the value (parser::line_break).
+    let token = match token.starts_with("//") {
+        true => parser::line_break::line_comment_text(token, followed_by_lf),
+        false => token,
+    };
     let from_end = if token.starts_with("/*") && token.ends_with("*/") { 2 } else { 0 };
     let body = token.get(3..token.len().checked_sub(from_end)?)?;
     scratch.clear();
-    for char in body.escape_debug() {
-        scratch.push(char);
+    for piece in parser::line_break::without_break_crs(body) {
+        for char in piece.escape_debug() {
+            scratch.push(char);
+        }
     }
     let write = |out: &mut TokenStream<'_>| -> Result<(), StreamError> {
         out.punct('#', Spacing::Alone, ctx)?;
@@ -834,97 +919,12 @@ fn doc_comment(
     Some(write(out))
 }
 
-/// [`lex`] through a tt token tree, every identifier and literal interned in the process-wide
-/// table: the reference [`lex`] is tested equal to, and the "before" of the pipeline example's
-/// expansion timing (parallelism audit, change 7).
-#[doc(hidden)]
-pub fn lex_through_tt<'a>(
-    text: &str,
-    edition: Edition,
-    alloc: Alloc<'a>,
-) -> Result<TokenStream<'a>, LexError> {
-    let anchor = SpanAnchor {
-        file_id: EditionedFileId::new(FileId::from_raw(0), span_edition(edition)),
-        ast_id: ROOT_ERASED_FILE_AST_ID,
-    };
-    let root = SyntaxContext::root(span_edition(edition));
-    let tree = syntax_bridge::parse_to_token_tree(span_edition(edition), anchor, root, text)
-        .ok_or(LexError::Refused { edition })?;
-    let mut out = TokenStream::new_in(alloc);
-    let mut last = None;
-    let ctx = Ctx::root(edition);
-    // A text that is one group (`[[1]]`) is built with that group as the top, whose delimiters
-    // `iter` does not yield: they are tokens of the text, so they are written here.
-    let top = tree.top_subtree().delimiter;
-    let wrapped = (top.kind != tt::DelimiterKind::Invisible).then(|| Delim::of_tt(top.kind));
-    if let Some(delim) = wrapped {
-        out.open(delim, ctx)?;
-    }
-    lex_walk(&mut out, tree.iter(), ctx, &mut last)?;
-    if let Some(delim) = wrapped {
-        // As a nested group's close in `lex_walk`: what ends where it starts is joint with it.
-        joined_to(&mut out, &mut last, top.close.range.start());
-        out.close(delim, ctx)?;
-    }
-    Ok(out)
-}
-
 /// The last identifier or literal pushed, and where its text ends: it is joint with the next
 /// token if that one starts there.
 type Pending = Option<(usize, usize)>;
 
-fn lex_walk(
-    out: &mut TokenStream<'_>,
-    iter: tt::TtIter<'_>,
-    ctx: Ctx,
-    last: &mut Pending,
-) -> Result<(), StreamError> {
-    for element in iter {
-        match element {
-            tt::TtElement::Leaf(leaf) => {
-                let range = leaf.span().range;
-                joined_to(out, last, range.start());
-                match leaf {
-                    tt::Leaf::Ident(ident) => {
-                        let raw = if ident.is_raw.yes() { Raw::Yes } else { Raw::No };
-                        let kind = TokenKind::Ident { raw, spacing: Spacing::Alone };
-                        out.push(kind, ident.sym.as_str(), ctx)?;
-                        *last = Some((out.len() - 1, range.end().into()));
-                    }
-                    tt::Leaf::Punct(punct) => {
-                        out.punct(punct.char, Spacing::of_tt(punct.spacing), ctx)?;
-                    }
-                    tt::Leaf::Literal(literal) => {
-                        let kind = TokenKind::Literal {
-                            kind: LitKind::of_tt(literal.kind),
-                            suffix_len: literal.suffix_len,
-                            spacing: Spacing::Alone,
-                        };
-                        out.push(kind, literal.text_and_suffix.as_str(), ctx)?;
-                        *last = Some((out.len() - 1, range.end().into()));
-                    }
-                }
-            }
-            tt::TtElement::Subtree(subtree, inner) => {
-                let delim = Delim::of_tt(subtree.delimiter.kind);
-                joined_to(out, last, subtree.delimiter.open.range.start());
-                out.open(delim, ctx)?;
-                lex_walk(out, inner, ctx, last)?;
-                joined_to(out, last, subtree.delimiter.close.range.start());
-                out.close(delim, ctx)?;
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Marks the pending identifier or literal joint when the next token starts where it ends.
-fn joined_to(
-    out: &mut TokenStream<'_>,
-    last: &mut Pending,
-    next: impl Into<usize>,
-) {
-    let next: usize = next.into();
+fn joined_to(out: &mut TokenStream<'_>, last: &mut Pending, next: usize) {
     if let Some((at, end)) = last.take()
         && end == next
     {

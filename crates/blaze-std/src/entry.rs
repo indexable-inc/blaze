@@ -50,6 +50,9 @@ impl Status {
     pub const OK: Status = Status(0);
     /// `main` returned an error, or its world could not be made.
     pub const FAILED: Status = Status(1);
+    /// `main` was not started: a grant it takes is missing or wrong, or the run spec was
+    /// refused (crate::grant). 77 is `EX_NOPERM` of sysexits.h: permission denied.
+    pub const REFUSED: Status = Status(77);
 }
 
 /// What a `main` of the blaze edition may return: anything that says how the program ended.
@@ -58,17 +61,17 @@ impl Status {
 pub trait Outcome {
     /// The status the process exits with; what a failure has to say is written to `said`,
     /// which the entry puts on standard error.
-    fn status(self, said: &mut dyn fmt::Write) -> Status;
+    fn status<W: fmt::Write + ?Sized>(self, said: &mut W) -> Status;
 }
 
 impl Outcome for () {
-    fn status(self, _said: &mut dyn fmt::Write) -> Status {
+    fn status<W: fmt::Write + ?Sized>(self, _said: &mut W) -> Status {
         Status::OK
     }
 }
 
 impl Outcome for Status {
-    fn status(self, _said: &mut dyn fmt::Write) -> Status {
+    fn status<W: fmt::Write + ?Sized>(self, _said: &mut W) -> Status {
         self
     }
 }
@@ -76,7 +79,7 @@ impl Outcome for Status {
 /// `Ok` ends as its value does; `Err` says the error, as its `Display` writes it, and ends
 /// [`Status::FAILED`].
 impl<T: Outcome, E: fmt::Display> Outcome for Result<T, E> {
-    fn status(self, said: &mut dyn fmt::Write) -> Status {
+    fn status<W: fmt::Write + ?Sized>(self, said: &mut W) -> Status {
         match self {
             Ok(value) => value.status(said),
             Err(error) => {
@@ -162,110 +165,101 @@ pub(crate) fn run_on<R: Outcome>(
     main(&cx, io).status(said)
 }
 
-/// A parameter `main` may take: the root context, the world, or a capability the world hands
-/// out by type. `#[bstd::main]` ([`crate::main!`]) gives each of `main`'s parameters
-/// `<Type as Root>::root(cx, &io)`, so which roots exist is this trait's impls, never a list
-/// in a macro or the compiler; a capability the host does not offer stops the program before
-/// `main` with its [`Missing`]. `Out` is not one: standard output and standard error are both
-/// `Out`, so `main` takes `io` and asks [`Io::need_out`] or [`Io::need_err`].
-#[diagnostic::on_unimplemented(
-    message = "`main` cannot take a `{Self}`",
-    label = "not a root of `main`",
-    note = "the roots: `&Cx`, `Io`, `Fs`, `Clock`, `Rng`, `Env`, `Args`, `Host`, `Mem`, `Net`, \
-            `Http`, `Streams`, `Term`, `Keys`, `Roots`, `Locale`, `User`, `Code`, `Window`, \
-            `Automation`, `Opener`, `Power`, `Audio`, `Camera`, `Screen`, `Location`, \
-            `Bluetooth`, `Usb`, `Serial`, `Clipboard`, `Notify` (bstd::entry::Root)"
-)]
-pub trait Root<'cx>: Sized {
-    /// The root out of the context `main` is run in and its world.
-    fn root(cx: &'cx Cx, io: &Io) -> Result<Self, Missing>;
-}
+/// The process's `main` of a `#[bstd::main]` program (the run spec read from file descriptor 3).
+pub use crate::rt::{SPEC_MARK, SPEC_MARK_VALUE, launch};
 
-impl<'cx> Root<'cx> for &'cx Cx {
-    fn root(cx: &'cx Cx, _io: &Io) -> Result<&'cx Cx, Missing> {
-        Ok(cx)
-    }
-}
-
-impl Root<'_> for Io {
-    fn root(_cx: &Cx, io: &Io) -> Result<Io, Missing> {
-        // clone: the world's handle, one for `main`, as `run_in` hands one.
-        Ok(io.clone())
-    }
-}
-
-macro_rules! roots {
-    ($($ty:path => $need:ident),* $(,)?) => {$(
-        impl Root<'_> for $ty {
-            fn root(_cx: &Cx, io: &Io) -> Result<$ty, Missing> {
-                io.$need()
+/// [`launch`] on a world its caller made: what file descriptor 3 would hold is
+/// `delivered` (`None`: closed), the process's world is `io`, and a manifest asked for is
+/// written to `io`'s standard output. A test runs a `#[bstd::main]`-shaped program with it on
+/// [`Io::sim`]: the macro's `body` is [`launch_body!`](crate::launch_body).
+pub fn launch_in<R: Outcome>(
+    manifest: &'static crate::grant::Manifest,
+    delivered: Option<&[u8]>,
+    io: Io,
+    said: &mut dyn fmt::Write,
+    body: impl FnOnce(&mut crate::grant::Given<'_>) -> Result<R, crate::grant::Refused>,
+) -> Status {
+    let alloc = blaze_own::SharedAlloc::global();
+    let defaults = || {
+        let (args, env) = (blaze_own::Vec::new_in(alloc), blaze_own::Vec::new_in(alloc));
+        crate::spec::RunSpec::defaults(args, env, blaze_own::String::from_str_in("/", alloc), alloc)
+    };
+    match crate::grant::prepare(manifest, delivered, defaults) {
+        crate::grant::Prepared::Manifest(text) => match io.write_out(crate::out::Stream::Out, &[text.as_bytes(), b"\n"]) {
+            Ok(()) => Status::OK,
+            Err(why) => {
+                let _ = write!(said, "{why}");
+                Status::FAILED
             }
+        },
+        crate::grant::Prepared::Refuse(text) => {
+            let _ = write!(said, "{}", text.as_str());
+            Status::REFUSED
         }
-    )*};
+        crate::grant::Prepared::Run { spec, started, fake } => {
+            run_in(io, said, crate::grant::main_of(manifest, &spec, started, fake.as_ref(), body))
+        }
+    }
 }
 
-roots! {
-    crate::fs::Fs => need_fs,
-    crate::clock::Clock => need_clock,
-    crate::rng::Rng => need_rng,
-    crate::env::Env => need_env,
-    crate::args::Args => need_args,
-    crate::host::Host => need_host,
-    crate::mem::Mem => need_mem,
-    crate::net::Net => need_net,
-    crate::requests::Http => need_http,
-    crate::streams::Streams => need_streams,
-    crate::term::Term => need_term,
-    crate::keys::Keys => need_keys,
-    crate::roots::Roots => need_roots,
-    crate::locale::Locale => need_locale,
-    crate::user::User => need_user,
-    crate::code::Code => need_code,
-    crate::window::Window => need_windows,
-    crate::automation::Automation => need_automation,
-    crate::opener::Opener => need_opener,
-    crate::power::Power => need_power,
-    crate::audio::Audio => need_audio,
-    crate::device::Camera => need_camera,
-    crate::device::Screen => need_screen,
-    crate::device::Location => need_location,
-    crate::device::Bluetooth => need_bluetooth,
-    crate::device::Usb => need_usb,
-    crate::device::Serial => need_serial,
-    crate::device::Clipboard => need_clipboard,
-    crate::device::Notify => need_notify,
-}
-
-/// `#[bstd::main]`: a `main` that takes its world, one spelling for rustc and for blaze. It
-/// keeps the function as written and makes the process's `main` the call [`run`] of a closure
-/// that hands it each root by its type ([`Root`]):
+/// `#[bstd::main]`: a `main` that says what it takes in its signature, one spelling for rustc
+/// and for blaze (docs/v2/plan/design/run.md, "What a program is given"). After `cx: &Cx`,
+/// each parameter is a grant: its type the kind ([`crate::grant::Grant`]) and its name the
+/// grant's name:
 ///
 /// ```ignore
 /// #[bstd::main]
-/// fn main(cx: &Cx, io: Io, fs: Fs) -> Result<(), bstd::entry::Error> { .. }
+/// fn main(cx: &Cx, out: Out, data: Dir<ReadOnly>) -> Result<(), bstd::entry::Error> { .. }
 /// ```
 ///
-/// A parameter is a name or `_`, then its type; a type that is not a root is the error of
-/// [`Root`], which lists them. What `main` returns is an [`Outcome`]. It is a `macro_rules!`
-/// attribute (`macro_attr`), as `#[bstd::test]` is, so it needs no proc macro and nothing
-/// to run on `wasm32-wasip1` under blaze. A crate of the blaze edition needs none of it: its
-/// front end appends the same call (this module's doc).
+/// It keeps the function as written, puts the program's manifest in the binary as a `static`
+/// ([`crate::grant::Manifest`]), and makes the process's `main` the launcher
+/// ([`crate::rt::launch`]): every parameter made from the run spec before `main` runs, or every
+/// problem printed with its fix and [`Status::REFUSED`]. A type that is not a `Grant` is a
+/// compile error at its parameter; an `Out` not named `out` or `err` is one too. What `main`
+/// returns is an [`Outcome`]. It is a `macro_rules!` attribute (`macro_attr`), as
+/// `#[bstd::test]` is, so it needs no proc macro.
 #[macro_export]
 macro_rules! main {
     attr() (
         $(#[$meta:meta])*
-        $vis:vis fn main($($root:tt : $ty:ty),* $(,)?) $(-> $returns:ty)? $body:block
+        $vis:vis fn main($cx:tt : $cxty:ty $(, $name:tt : $ty:ty)* $(,)?) $(-> $returns:ty)? $body:block
     ) => {
         $(#[$meta])*
         $vis fn main() -> $crate::entry::Exit {
-            fn main($($root: $ty),*) $(-> $returns)? $body
-            $crate::entry::run(
-                |_bstd_cx: &$crate::Cx, _bstd_io: $crate::Io| -> ::core::result::Result<_, $crate::Missing> {
-                    ::core::result::Result::Ok(main($(
-                        <$ty as $crate::entry::Root<'_>>::root(_bstd_cx, &_bstd_io)?
-                    ),*))
-                },
-            )
+            fn main($cx: $cxty $(, $name: $ty)*) $(-> $returns)? $body
+            /// The program's manifest: what it takes, as data in the binary.
+            static MANIFEST: $crate::grant::Manifest = $crate::grant::Manifest::new(&[
+                $( $crate::grant::Param::new(stringify!($name), <$ty as $crate::grant::Grant>::KIND) ),*
+            ]);
+            /// The start of the program hosted by `blaze run` (run.md, "The hosted world"):
+            /// each parameter asked of the host, then `main`, over the host's table.
+            #[unsafe(no_mangle)]
+            pub extern "C" fn bstd_hosted_start(table: *const $crate::wire::HostTable) -> i32 {
+                fn hosted(cx: &$crate::Cx, io: $crate::Io) -> $crate::entry::Status {
+                    let ran = main(cx $(, match $crate::guest::grant::<$ty>(&io, stringify!($name)) {
+                        ::core::option::Option::Some(granted) => granted,
+                        ::core::option::Option::None => return $crate::entry::Status::REFUSED,
+                    })*);
+                    $crate::guest::finish(&io, ran)
+                }
+                $crate::guest::start(table, hosted)
+            }
+            $crate::entry::launch(&MANIFEST, $crate::launch_body!(main; $($name : $ty),*))
+        }
+    };
+}
+
+/// The launcher's body for a `main` whose parameters after `cx` are `$name: $ty`: each checked,
+/// then, when every one passed, each made and `main` called. For [`main!`] and for a test that
+/// runs a program through [`launch_in`].
+#[macro_export]
+macro_rules! launch_body {
+    ($main:ident; $($name:tt : $ty:ty),*) => {
+        |given: &mut $crate::grant::Given<'_>| {
+            $( given.check::<$ty>(stringify!($name)); )*
+            let filled = given.filled()?;
+            ::core::result::Result::Ok($main(filled.cx() $(, filled.make::<$ty>(stringify!($name)))*))
         }
     };
 }

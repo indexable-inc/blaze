@@ -1,0 +1,4 @@
+[package]
+name = "support-s1-layout"
+version = "0.1.0"
+edition = "2024"

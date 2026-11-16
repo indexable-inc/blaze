@@ -223,3 +223,32 @@ fn requests_are_written_in_one_order_and_checked() {
     assert_eq!(refuse(Request { target: "/a b", ..request }), Err(Why::Target));
     assert_eq!(refuse(Request { range: Some(Range { first: 5, last: Some(4) }), ..request }), Err(Why::RangeOrder { first: 5, last: 4 }));
 }
+
+/// `feed_head` stops where the body starts, interim heads read past; the rest is the body's.
+/// A connection is kept only as RFC 9112 section 9.3 says.
+#[test]
+fn the_head_alone_is_taken_and_the_connection_kept_by_the_rules() {
+    let bytes = b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc";
+    for cut in 1..bytes.len() {
+        let mut r = Response::new_in(LIMITS, false, Global);
+        let first = r.feed_head(&bytes[..cut]).expect("a head");
+        let second = r.feed_head(&bytes[first.consumed..]).expect("a head");
+        assert_eq!(first.consumed + second.consumed, bytes.len() - 3, "cut at {cut}");
+        assert!(r.has_head() && !second.done && r.content_length() == Some(3), "cut at {cut}");
+        let mut out = StdVec::new();
+        assert_eq!(r.feed(b"abc", &mut out).map(|it| it.done), Ok(true));
+        assert_eq!(out, b"abc");
+        assert!(r.reusable());
+    }
+    let kept = |head: &[u8], method_head: bool| {
+        let mut r = Response::new_in(LIMITS, method_head, Global);
+        r.feed_head(head).expect("a head");
+        (r.reusable(), r.content_length())
+    };
+    assert_eq!(kept(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", false), (true, Some(0)));
+    assert_eq!(kept(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n", false), (false, Some(0)));
+    assert_eq!(kept(b"HTTP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n", false), (false, Some(0)));
+    assert_eq!(kept(b"HTTP/1.0 200 OK\r\nConnection: Keep-Alive\r\nContent-Length: 0\r\n\r\n", false), (true, Some(0)));
+    assert_eq!(kept(b"HTTP/1.1 200 OK\r\n\r\n", false), (false, None));
+    assert_eq!(kept(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\n", true), (true, None));
+}

@@ -7,7 +7,6 @@
 use core::fmt::{self, Write};
 
 use blaze_own::{AVec, Alloc, Vec};
-use blaze_surface::Range;
 
 use crate::columns::{View, head};
 use crate::form::*;
@@ -15,13 +14,10 @@ use crate::form::*;
 use blaze_typeck::Name;
 
 /// The names desugarings make, by their hashes.
-const MADE: [(&str, Name); 8] = [
+const MADE: [(&str, Name); 5] = [
     ("$iter", Name::of("iter")),
     ("$val", Name::of("val")),
     ("$residual", Name::of("residual")),
-    ("$__awaitee", Name::of("__awaitee")),
-    ("$result", Name::of("result")),
-    ("$_task_context", Name::of("_task_context")),
     ("$start", Name::of("start")),
     ("$end", Name::of("end")),
 ];
@@ -37,10 +33,12 @@ enum W {
     Path(PathIdx),
     Stmt(StmtId),
     Name(NameIdx),
-    Src(Range),
+    Src(BodyRange),
     Num(u32),
     Target(Option<ExprId>),
     Exprs(List),
+    /// Names in `ids` (`offset_of!`'s field path).
+    Names(List),
     Pats(List),
     Stmts(List),
     Types(List),
@@ -51,13 +49,12 @@ enum W {
 }
 
 struct Printer<'v, 'b, 'o> {
-    text: &'v str,
     v: &'v View<'b>,
     out: &'o mut dyn Write,
     space: bool,
 }
 
-impl<'v> Printer<'v, '_, '_> {
+impl<'b> Printer<'_, 'b, '_> {
     fn atom(&mut self, s: &str) -> fmt::Result {
         if self.space {
             self.out.write_char(' ')?;
@@ -90,25 +87,40 @@ impl<'v> Printer<'v, '_, '_> {
         Ok(())
     }
 
-    fn name(&self, n: NameIdx) -> &'v str {
-        match self.v.name_ranges.get(n.0 as usize) {
+    fn name(&self, n: NameIdx) -> &'b str {
+        match self.v.name_range(n) {
             // A desugaring's name: printed `$name`, its hygiene shown.
-            Some(r) if r.start == r.end => {
+            Ok(r) if r.is_empty() => {
                 let hash = self.v.names.get(n.0 as usize).copied();
                 MADE.iter().find(|(_, h)| Some(h.0) == hash).map_or("$made", |(s, _)| s)
             }
-            Some(r) => r.of(self.text),
-            None => "<bad name>",
+            Ok(r) => self.src(r),
+            Err(_) => "<bad name>",
         }
+    }
+
+    /// The text at `r`, through the view; a range it refuses prints as a mark, so a dump
+    /// shows a malformed record rather than stopping.
+    fn src(&self, r: BodyRange) -> &'b str {
+        self.v.text_at(r).unwrap_or("<no text at this range>")
     }
 }
 
-/// Dumps the record `v` of the item `text` to `out`, using `alloc` for its work stack.
-pub fn dump(text: &str, v: &View<'_>, alloc: Alloc<'_>, out: &mut dyn Write) -> fmt::Result {
-    let mut p = Printer { text, v, out, space: false };
+/// Dumps the record `v` to `out`, using `alloc` for its work stack.
+pub fn dump(v: &View<'_>, alloc: Alloc<'_>, out: &mut dyn Write) -> fmt::Result {
+    let mut p = Printer { v, out, space: false };
     let mut work: AVec<'_, W> = Vec::new_in(alloc);
     match v.head[head::MODE] {
         0 => signature(&mut p, &mut work)?,
+        3 => match v.type_root() {
+            Some(t) => {
+                p.open("type")?;
+                work.push(W::Close);
+                work.push(W::Ty(t));
+                run(&mut p, &mut work)?;
+            }
+            None => p.atom("(no type)")?,
+        },
         _ => match v.body() {
             Some((root, params)) => {
                 p.open("body")?;
@@ -125,11 +137,13 @@ pub fn dump(text: &str, v: &View<'_>, alloc: Alloc<'_>, out: &mut dyn Write) -> 
     p.out.write_char('\n')?;
     for u in v.unhandled() {
         let kind = syntax_name(u.syntax);
-        writeln!(p.out, "unhandled {kind:?} {:?} {:?}", u.why, u.range.of(text))?;
+        let text = p.src(u.range);
+        writeln!(p.out, "unhandled {kind:?} {:?} {text:?}", u.why)?;
     }
     for d in v.diags() {
-        match d {
-            Ok(d) => writeln!(p.out, "diag {:?} {}..{}", d.kind, d.range.start, d.range.end)?,
+        match d.map(|d| (d, v.site(d.range))) {
+            Ok((d, Ok(at))) => writeln!(p.out, "diag {:?} {}..{}", d.kind, at.start, at.end)?,
+            Ok((d, Err(e))) => writeln!(p.out, "diag {:?} at no place: {e:?}", d.kind)?,
             Err(e) => writeln!(p.out, "bad diag {e:?}")?,
         }
     }
@@ -146,6 +160,15 @@ pub fn dump(text: &str, v: &View<'_>, alloc: Alloc<'_>, out: &mut dyn Write) -> 
 
 fn syntax_name(code: u16) -> parser::SyntaxKind {
     if code <= parser::SyntaxKind::__LAST as u16 { parser::SyntaxKind::from(code) } else { parser::SyntaxKind::ERROR }
+}
+
+/// Dumps the type `t` of `v` to `out`, as [`dump`] prints it inside any record: the one
+/// printing a lone type's record and a signature's types share.
+pub fn dump_type(v: &View<'_>, t: TypeId, alloc: Alloc<'_>, out: &mut dyn Write) -> fmt::Result {
+    let mut p = Printer { v, out, space: false };
+    let mut work: AVec<'_, W> = Vec::new_in(alloc);
+    work.push(W::Ty(t));
+    run(&mut p, &mut work)
 }
 
 fn signature(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>) -> fmt::Result {
@@ -167,13 +190,13 @@ fn signature(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>) -> fmt::Result
     if vis != Vis::Private {
         p.atom_fmt(format_args!("{vis:?}"))?;
     }
-    if let Some(start) = p.v.head_opt(head::ABI) {
-        let end = h[head::ABI + 1];
-        if start == NONE - 1 {
-            p.atom("extern")?;
-        } else {
-            let abi = Range::new(start, end).of(p.text);
-            p.atom_fmt(format_args!("extern={abi}"))?;
+    if p.v.head_opt(head::ABI).is_some() {
+        match p.v.abi() {
+            None => p.atom("extern")?,
+            Some(r) => {
+                let abi = p.src(r);
+                p.atom_fmt(format_args!("extern={abi}"))?;
+            }
         }
     }
     work.push(W::Close);
@@ -222,7 +245,7 @@ fn run(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>) -> fmt::Result {
                 p.atom(s)?;
             }
             W::Src(r) => {
-                let s = r.of(p.text);
+                let s = p.src(r);
                 p.atom(s)?;
             }
             W::Target(t) => match t {
@@ -232,6 +255,10 @@ fn run(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>) -> fmt::Result {
             W::Bad(b) => p.atom_fmt(format_args!("<bad {} {}>", b.column, b.tag))?,
             W::Exprs(l) => match p.v.ids(l) {
                 Ok(ids) => push_ids(work, ids, |i| W::Expr(ExprId(i))),
+                Err(b) => work.push(W::Bad(b)),
+            },
+            W::Names(l) => match p.v.ids(l) {
+                Ok(ids) => push_ids(work, ids, |i| W::Name(NameIdx(i))),
                 Err(b) => work.push(W::Bad(b)),
             },
             W::Pats(l) => match p.v.ids(l) {
@@ -303,7 +330,10 @@ fn expr(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>, e: ExprId) -> fmt::
         Ok(x) => x,
         Err(b) => return p.atom_fmt(format_args!("<bad {} {}>", b.column, b.tag)),
     };
-    let r = p.v.expr_range(e);
+    let r = match p.v.expr_range(e) {
+        Ok(r) => r,
+        Err(b) => return p.atom_fmt(format_args!("<bad {} {}>", b.column, b.tag)),
+    };
     match x {
         Expr::Missing => p.atom("(missing)"),
         Expr::Lit(_) => node(p, work, "lit", &[W::Src(r)]),
@@ -347,7 +377,6 @@ fn expr(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>, e: ExprId) -> fmt::
                 MatchSource::Normal => "match",
                 MatchSource::ForLoop => "match/for",
                 MatchSource::Try => "match/try",
-                MatchSource::Await => "match/await",
             };
             node(p, work, head, &[W::Expr(scrutinee), W::Rows(arms)])
         }
@@ -433,8 +462,9 @@ fn expr(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>, e: ExprId) -> fmt::
             Ok(())
         }
         Expr::Asm => node(p, work, "asm", &[W::Src(r)]),
-        Expr::OffsetOf { ty, fields } => node(p, work, "offset-of", &[W::Ty(ty), W::Exprs(fields)]),
+        Expr::OffsetOf { ty, fields } => node(p, work, "offset-of", &[W::Ty(ty), W::Names(fields)]),
         Expr::Underscore => p.atom("_"),
+        Expr::Await(e) => node(p, work, "await", &[W::Expr(e)]),
     }
 }
 
@@ -469,13 +499,12 @@ fn pat(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>, x: PatId) -> fmt::Re
         Pat::Tuple { elems, .. } => node(p, work, "tuple", &[W::Pats(elems)]),
         Pat::Ref { inner, .. } => node(p, work, "ref", &[W::Pat(inner)]),
         Pat::Box(inner) => node(p, work, "box", &[W::Pat(inner)]),
-        Pat::Lit(_) => {
-            let r = p.v.pat_ranges.get(x.0 as usize).copied().unwrap_or_default();
-            node(p, work, "lit", &[W::Src(r)])
-        }
-        Pat::NegLit(_) => {
-            let r = p.v.pat_ranges.get(x.0 as usize).copied().unwrap_or_default();
-            node(p, work, "neg-lit", &[W::Src(r)])
+        Pat::Lit(_) | Pat::NegLit(_) => {
+            let word = if matches!(q, Pat::Lit(_)) { "lit" } else { "neg-lit" };
+            match p.v.pat_range(x) {
+                Ok(r) => node(p, work, word, &[W::Src(r)]),
+                Err(b) => node(p, work, word, &[W::Bad(b)]),
+            }
         }
         Pat::Path(path) => {
             work.push(W::Path(path));
@@ -562,6 +591,8 @@ fn ty(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>, t: TypeId) -> fmt::Re
             Ok(())
         }
         TypeRef::For { binder, inner } => node(p, work, "for", &[W::Rows(binder), W::Ty(inner)]),
+        TypeRef::Pat { base, pat: TyPat::NotNull } => node(p, work, "pattern_type", &[W::Ty(base), W::S("!null")]),
+        TypeRef::Pat { base, pat: TyPat::Of(pat) } => node(p, work, "pattern_type", &[W::Ty(base), W::Pat(pat)]),
         TypeRef::Error => p.atom("(error)"),
     }
 }
@@ -619,7 +650,6 @@ fn row(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>, r: RowIdx) -> fmt::R
                 let head = match (c.kind, c.source) {
                     (CoroutineKind::None, _) => "closure",
                     (CoroutineKind::Async, CoroutineSource::Block) => "async-block",
-                    (CoroutineKind::Async, CoroutineSource::Fn) => "async-fn",
                     (CoroutineKind::Async, CoroutineSource::Closure) => "async-closure",
                     (CoroutineKind::Gen, _) => "gen",
                     (CoroutineKind::AsyncGen, _) => "async-gen",
@@ -627,9 +657,6 @@ fn row(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>, r: RowIdx) -> fmt::R
                 p.open(head)?;
                 if c.capture_by_value {
                     p.atom("move")?;
-                }
-                if let Some(t) = c.resume {
-                    p.atom_fmt(format_args!("resume=p{}", t.0))?;
                 }
                 work.push(W::Close);
                 work.push(W::Expr(c.body));
@@ -667,10 +694,11 @@ fn row(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>, r: RowIdx) -> fmt::R
             }
             Err(b) => p.atom_fmt(format_args!("<bad {}>", b.column)),
         },
-        ROW_FORMAT => match FormatArgs::decode(n) {
+        ROW_FORMAT => match p.v.format_args(n) {
             Ok(f) => {
                 p.open(if f.newline { "format-args-nl" } else { "format-args" })?;
-                p.atom_fmt(format_args!("{:?}", f.template.of(p.text)))?;
+                let template = p.src(f.template);
+                p.atom_fmt(format_args!("{template:?}"))?;
                 work.push(W::Close);
                 work.push(W::Rows(f.args));
                 work.push(W::Rows(f.pieces));
@@ -678,9 +706,15 @@ fn row(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>, r: RowIdx) -> fmt::R
             }
             Err(b) => p.atom_fmt(format_args!("<bad {}>", b.column)),
         },
-        ROW_FMT_PIECE => match FmtPiece::decode(n) {
-            Ok(FmtPiece::Text(t)) => p.atom_fmt(format_args!("{:?}", t.of(p.text))),
-            Ok(FmtPiece::Arg { arg, spec }) => p.atom_fmt(format_args!("{{{arg}:{}}}", spec.of(p.text))),
+        ROW_FMT_PIECE => match p.v.fmt_piece(n) {
+            Ok(FmtPiece::Text(t)) => {
+                let t = p.src(t);
+                p.atom_fmt(format_args!("{t:?}"))
+            }
+            Ok(FmtPiece::Arg { arg, spec }) => {
+                let spec = p.src(spec);
+                p.atom_fmt(format_args!("{{{arg}:{spec}}}"))
+            }
             Err(b) => p.atom_fmt(format_args!("<bad {}>", b.column)),
         },
         ROW_FMT_ARG => match FmtArg::decode(n) {
@@ -695,11 +729,11 @@ fn row(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>, r: RowIdx) -> fmt::R
             }
             Err(b) => p.atom_fmt(format_args!("<bad {}>", b.column)),
         },
-        ROW_MACRO => match MacroCall::decode(n) {
+        ROW_MACRO => match p.v.macro_call(n) {
             Ok(m) => node(p, work, "macro", &[W::Path(m.path), W::Src(m.input)]),
             Err(b) => p.atom_fmt(format_args!("<bad {}>", b.column)),
         },
-        ROW_LOCAL_ITEM | ROW_ASSOC => match LocalItem::decode(n) {
+        ROW_LOCAL_ITEM | ROW_ASSOC => match p.v.local_item(n) {
             Ok(i) => {
                 p.open("item")?;
                 p.atom_fmt(format_args!("{:?}", syntax_name(i.syntax)))?;
@@ -830,12 +864,16 @@ fn row(p: &mut Printer<'_, '_, '_>, work: &mut AVec<'_, W>, r: RowIdx) -> fmt::R
                 }
             }
             Ok(WherePred::Lifetime { name, bounds }) => node(p, work, "pred", &[W::Name(name), W::Rows(bounds)]),
+            Ok(WherePred::Const { cond }) => match p.v.const_range(cond) {
+                Ok(r) => node(p, work, "const-pred", &[W::Src(r)]),
+                Err(b) => node(p, work, "const-pred", &[W::Bad(b)]),
+            },
             Err(b) => p.atom_fmt(format_args!("<bad {}>", b.column)),
         },
-        ROW_ATTR => match Attr::decode(n) {
+        ROW_ATTR => match p.v.attr(n) {
             Ok(a) => {
-                let path = a.path.of(p.text);
-                let args = a.args.of(p.text);
+                let path = p.src(a.path);
+                let args = p.src(a.args);
                 if args.is_empty() {
                     p.atom_fmt(format_args!("#[{path}]"))
                 } else {

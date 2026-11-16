@@ -329,7 +329,7 @@ fn structure_tables(view: &View<'_>) -> Result {
             Some(RefKind::Data) if rec.place as usize >= view.datas.len() => {
                 return Err(row("refs", r, "data past `datas`"));
             }
-            Some(RefKind::Data | RefKind::Func | RefKind::Static | RefKind::Tls) => {}
+            Some(RefKind::Data | RefKind::Func | RefKind::Static | RefKind::Tls | RefKind::Vtable) => {}
         }
     }
     for (r, rec) in view.datas.iter().enumerate() {
@@ -1017,7 +1017,7 @@ fn types(
             let ok = if op == Op::FuncAddr {
                 kind == Some(RefKind::Func)
             } else if op == Op::DataAddr {
-                matches!(kind, Some(RefKind::Static | RefKind::Data))
+                matches!(kind, Some(RefKind::Static | RefKind::Data | RefKind::Vtable))
             } else {
                 kind == Some(RefKind::Tls)
             };

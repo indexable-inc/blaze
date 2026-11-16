@@ -107,7 +107,7 @@ pub enum Length {
 /// A request.
 #[derive(Clone, Debug)]
 pub struct Request {
-    pub method: http::Method,
+    pub method: crate::Method,
     pub authority: String,
     /// `:path`, with the query.
     pub path: String,
@@ -140,13 +140,13 @@ impl Early {
         length: Length,
         deadline: Duration,
     ) -> Early {
-        Early(Request { method: http::Method::GET, authority, path, range, length, deadline })
+        Early(Request { method: crate::Method::Get, authority, path, range, length, deadline })
     }
 
     /// A HEAD of `path` at `authority`.
     pub fn head(authority: String, path: String, deadline: Duration) -> Early {
         Early(Request {
-            method: http::Method::HEAD,
+            method: crate::Method::Head,
             authority,
             path,
             range: None,

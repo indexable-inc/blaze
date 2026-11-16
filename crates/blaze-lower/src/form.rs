@@ -8,6 +8,9 @@
 //! blaze-typeck's form lacks".
 
 use blaze_surface::Range;
+
+pub use crate::columns::BodyRange;
+use crate::columns::Lens;
 pub use blaze_typeck::{
     BinOp, BindAnn, ExprId, FloatTy, IntSuffix, IntTy, List, Mutbl, PatId, PathIdx, ScopeId, StmtId, UintTy,
     UnOp,
@@ -231,22 +234,12 @@ pub enum LangItem {
     RangeInclusiveNew,
     /// `RangeToInclusive`, by `..=b`.
     RangeToInclusive,
-    /// `IntoFuture::into_future`, by `.await`.
-    IntoFutureIntoFuture,
-    /// `Future::poll`, by `.await`.
-    FuturePoll,
-    /// `Pin::new_unchecked`, by `.await`.
-    PinNewUnchecked,
-    /// `core::future::get_context`, by `.await`.
-    GetContext,
-    /// `Poll::Ready`, by `.await`.
-    PollReady,
-    /// `Poll::Pending`, by `.await`.
-    PollPending,
+    /// `Try::from_output`, by a `try` block's tail. Last, so the earlier codes stay.
+    TryTraitFromOutput,
 }
 
 impl LangItem {
-    pub const ALL: [LangItem; 20] = [
+    pub const ALL: [LangItem; 15] = [
         LangItem::IntoIterIntoIter,
         LangItem::IteratorNext,
         LangItem::OptionSome,
@@ -261,12 +254,7 @@ impl LangItem {
         LangItem::RangeFull,
         LangItem::RangeInclusiveNew,
         LangItem::RangeToInclusive,
-        LangItem::IntoFutureIntoFuture,
-        LangItem::FuturePoll,
-        LangItem::PinNewUnchecked,
-        LangItem::GetContext,
-        LangItem::PollReady,
-        LangItem::PollPending,
+        LangItem::TryTraitFromOutput,
     ];
 
     /// The text of its `#[lang = ".."]` in `core`, rustc's `rustc_hir::LangItem` symbol.
@@ -286,12 +274,7 @@ impl LangItem {
             LangItem::RangeFull => "RangeFull",
             LangItem::RangeInclusiveNew => "range_inclusive_new",
             LangItem::RangeToInclusive => "RangeToInclusive",
-            LangItem::IntoFutureIntoFuture => "into_future",
-            LangItem::FuturePoll => "poll",
-            LangItem::PinNewUnchecked => "new_unchecked",
-            LangItem::GetContext => "get_context",
-            LangItem::PollReady => "Ready",
-            LangItem::PollPending => "Pending",
+            LangItem::TryTraitFromOutput => "from_output",
         }
     }
 
@@ -373,7 +356,7 @@ impl Segment {
         }
     }
 
-    pub(crate) fn decode(n: Node) -> Result<Segment, BadRow> {
+    pub fn decode(n: Node) -> Result<Segment, BadRow> {
         if n.tag != ROW_SEGMENT {
             return Err(bad("segments", n.tag));
         }
@@ -476,7 +459,7 @@ impl GenericArg {
         n
     }
 
-    pub(crate) fn decode(n: Node) -> Result<GenericArg, BadRow> {
+    pub fn decode(n: Node) -> Result<GenericArg, BadRow> {
         if n.tag != ROW_ARG {
             return Err(bad("generic args", n.tag));
         }
@@ -550,7 +533,7 @@ impl Bound {
         n
     }
 
-    pub(crate) fn decode(n: Node) -> Result<Bound, BadRow> {
+    pub fn decode(n: Node) -> Result<Bound, BadRow> {
         if n.tag != ROW_BOUND {
             return Err(bad("bounds", n.tag));
         }
@@ -588,7 +571,7 @@ impl GenericParam {
         }
     }
 
-    pub(crate) fn decode(n: Node) -> Result<GenericParam, BadRow> {
+    pub fn decode(n: Node) -> Result<GenericParam, BadRow> {
         if n.tag != ROW_GENERIC_PARAM {
             return Err(bad("generic params", n.tag));
         }
@@ -608,6 +591,10 @@ pub enum WherePred {
     Type { binder: List, ty: TypeId, bounds: List },
     /// `'a: 'b`.
     Lifetime { name: NameIdx, bounds: List },
+    /// `where const { COND }` (blaze's `#![feature(blaze_comptime)]`, ownership.md): the
+    /// condition, an anonymous constant of type `bool` over the item's generics (its range
+    /// covers the `const` block); the item applies only where it evaluates to `true`.
+    Const { cond: ConstIdx },
 }
 
 impl WherePred {
@@ -618,16 +605,18 @@ impl WherePred {
                 Node { a: binder.start, b: binder.len, c: ty.0, d: bounds.start, e: bounds.len, ..n }
             }
             WherePred::Lifetime { name, bounds } => Node { a: name.0, d: bounds.start, e: bounds.len, ..n.with(1) },
+            WherePred::Const { cond } => Node { a: cond.0, ..n.with(2) },
         }
     }
 
-    pub(crate) fn decode(n: Node) -> Result<WherePred, BadRow> {
+    pub fn decode(n: Node) -> Result<WherePred, BadRow> {
         if n.tag != ROW_WHERE {
             return Err(bad("where predicates", n.tag));
         }
         Ok(match n.flags {
             0 => WherePred::Type { binder: list(n.a, n.b), ty: TypeId(n.c), bounds: list(n.d, n.e) },
             1 => WherePred::Lifetime { name: NameIdx(n.a), bounds: list(n.d, n.e) },
+            2 => WherePred::Const { cond: ConstIdx(n.a) },
             _ => return Err(bad("where predicates", n.tag)),
         })
     }
@@ -649,7 +638,7 @@ pub enum TypeRef {
     Slice(TypeId),
     /// `params` rows of [`Param`]; `abi` the ABI string's range, `None` with no `extern`
     /// or with `extern` alone (then `extern_` is set and the ABI is `"C"`).
-    FnPtr { params: List, ret: Option<TypeId>, abi: Option<Range>, unsafety: bool, extern_: bool, variadic: bool },
+    FnPtr { params: List, ret: Option<TypeId>, abi: Option<BodyRange>, unsafety: bool, extern_: bool, variadic: bool },
     /// `dyn A + B`; rows of [`Bound`].
     Dyn(List),
     /// `impl A + B`; rows of [`Bound`].
@@ -660,8 +649,21 @@ pub enum TypeRef {
     Macro(RowIdx),
     /// `for<'a> fn(&'a u8)`; `binder` rows of [`GenericParam`].
     For { binder: List, inner: TypeId },
+    /// A pattern type, `builtin # pattern_type(base is pat)`: what core's built-in
+    /// `pattern_type!` expands to in every type position (library/core/src/pat.rs: "Creates a
+    /// pattern type. `type Positive = std::pat::pattern_type!(i32 is 1..);`").
+    Pat { base: TypeId, pat: TyPat },
     /// What the lowering cannot make (counted in `unhandled`).
     Error,
+}
+
+/// The pattern of a [`TypeRef::Pat`]: `!null` (core's `NonNull` pointer), or a pattern node
+/// (a [`Pat::Range`] with optional ends, a [`Pat::Lit`] or [`Pat::NegLit`] standing for
+/// itself, or a [`Pat::Or`] of those): the set the pinned library writes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TyPat {
+    NotNull,
+    Of(PatId),
 }
 
 impl TypeRef {
@@ -680,8 +682,8 @@ impl TypeRef {
                 a: params.start,
                 b: params.len,
                 c: opt(ret.map(|t| t.0)),
-                d: abi.map_or(NONE, |r| r.start),
-                e: abi.map_or(NONE, |r| r.end),
+                d: abi.map_or(NONE, |r| r.raw().start),
+                e: abi.map_or(NONE, |r| r.raw().end),
                 ..n.with(6 | (unsafety as u16) << 8 | (extern_ as u16) << 9 | (variadic as u16) << 10)
             },
             TypeRef::Dyn(l) => Node { a: l.start, b: l.len, ..n.with(7) },
@@ -691,10 +693,12 @@ impl TypeRef {
             TypeRef::Macro(r) => Node { a: r.0, ..n.with(11) },
             TypeRef::For { binder, inner } => Node { a: binder.start, b: binder.len, c: inner.0, ..n.with(12) },
             TypeRef::Error => n.with(13),
+            TypeRef::Pat { base, pat: TyPat::NotNull } => Node { a: base.0, ..n.with(14 | 1 << 8) },
+            TypeRef::Pat { base, pat: TyPat::Of(p) } => Node { a: base.0, b: p.0, ..n.with(14) },
         }
     }
 
-    pub(crate) fn decode(n: Node) -> Result<TypeRef, BadRow> {
+    pub(crate) fn decode(n: Node, lens: Lens) -> Result<TypeRef, BadRow> {
         let m = mutbl(n.flags & (1 << 8) != 0);
         Ok(match n.flags & 0xff {
             0 => TypeRef::Path(PathIdx(n.a)),
@@ -708,7 +712,7 @@ impl TypeRef {
                 ret: unopt(n.c).map(TypeId),
                 abi: match n.d {
                     NONE => None,
-                    start => Some(Range::new(start, n.e)),
+                    start => Some(BodyRange::new(Range::new(start, n.e), lens)),
                 },
                 unsafety: n.flags & (1 << 8) != 0,
                 extern_: n.flags & (1 << 9) != 0,
@@ -721,6 +725,8 @@ impl TypeRef {
             11 => TypeRef::Macro(RowIdx(n.a)),
             12 => TypeRef::For { binder: list(n.a, n.b), inner: TypeId(n.c) },
             13 => TypeRef::Error,
+            14 if n.flags & (1 << 8) != 0 => TypeRef::Pat { base: TypeId(n.a), pat: TyPat::NotNull },
+            14 => TypeRef::Pat { base: TypeId(n.a), pat: TyPat::Of(PatId(n.b)) },
             _ => return Err(bad("types", n.tag)),
         })
     }
@@ -747,7 +753,6 @@ pub enum MatchSource {
     Normal,
     ForLoop,
     Try,
-    Await,
 }
 
 /// What a `loop` was written as: rustc's `hir::LoopSource`.
@@ -827,6 +832,8 @@ pub enum Expr {
     OffsetOf { ty: TypeId, fields: List },
     /// `_` on the left of an assignment.
     Underscore,
+    /// `operand.await`, in an async body.
+    Await(ExprId),
 }
 
 const BIN_OPS: [BinOp; 18] = [
@@ -873,7 +880,6 @@ const fn match_code(s: MatchSource) -> u16 {
         MatchSource::Normal => 0,
         MatchSource::ForLoop => 1,
         MatchSource::Try => 2,
-        MatchSource::Await => 3,
     }
 }
 
@@ -951,6 +957,7 @@ impl Expr {
             E::Asm => n(33),
             E::OffsetOf { ty, fields } => Node { a: ty.0, b: fields.start, c: fields.len, ..n(34) },
             E::Underscore => n(35),
+            E::Await(e) => Node { a: e.0, ..n(36) },
         }
     }
 
@@ -984,7 +991,6 @@ impl Expr {
                     0 => MatchSource::Normal,
                     1 => MatchSource::ForLoop,
                     2 => MatchSource::Try,
-                    3 => MatchSource::Await,
                     _ => return Err(err),
                 },
             },
@@ -1032,6 +1038,7 @@ impl Expr {
             33 => E::Asm,
             34 => E::OffsetOf { ty: TypeId(n.a), fields: list(n.b, n.c) },
             35 => E::Underscore,
+            36 => E::Await(ExprId(n.a)),
             _ => return Err(err),
         })
     }
@@ -1345,18 +1352,15 @@ pub enum CoroutineSource {
     Block,
     /// `async |x| ..`
     Closure,
-    /// `async fn`'s body.
-    Fn,
 }
 
-/// A closure or a coroutine. `params` rows of [`Param`]; `resume` the coroutine's resume
-/// argument (`_task_context` of `.await`'s desugaring), made at its first `.await`.
+/// A closure or a coroutine. `params` rows of [`Param`]. An `async fn`'s body is none: its
+/// head says async ([`crate::machine::sig::ASYNC`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Closure {
     pub params: List,
     pub ret: Option<TypeId>,
     pub body: ExprId,
-    pub resume: Option<PatId>,
     pub kind: CoroutineKind,
     pub source: CoroutineSource,
     pub capture_by_value: bool,
@@ -1377,7 +1381,6 @@ impl Closure {
         let source = match self.source {
             CoroutineSource::Block => 0,
             CoroutineSource::Closure => 1,
-            CoroutineSource::Fn => 2,
         };
         let flags = kind
             | source << 2
@@ -1389,7 +1392,6 @@ impl Closure {
             b: self.params.len,
             c: opt(self.ret.map(|t| t.0)),
             d: self.body.0,
-            e: opt(self.resume.map(|p| p.0)),
             ..Node::of(ROW_CLOSURE).with(flags)
         }
     }
@@ -1400,7 +1402,6 @@ impl Closure {
             params: list(n.a, n.b),
             ret: unopt(n.c).map(TypeId),
             body: ExprId(n.d),
-            resume: unopt(n.e).map(PatId),
             kind: match n.flags & 3 {
                 0 => CoroutineKind::None,
                 1 => CoroutineKind::Async,
@@ -1410,7 +1411,6 @@ impl Closure {
             source: match (n.flags >> 2) & 3 {
                 0 => CoroutineSource::Block,
                 1 => CoroutineSource::Closure,
-                2 => CoroutineSource::Fn,
                 _ => return Err(bad("closures", n.tag)),
             },
             capture_by_value: n.flags & (1 << 4) != 0,
@@ -1467,7 +1467,7 @@ impl Param {
         }
     }
 
-    pub(crate) fn decode(n: Node) -> Result<Param, BadRow> {
+    pub fn decode(n: Node) -> Result<Param, BadRow> {
         check_tag!(n, ROW_PARAM, "params");
         Ok(Param {
             pat: unopt(n.a).map(PatId),
@@ -1492,7 +1492,7 @@ impl Param {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FormatArgs {
     /// The string literal's contents (no quotes).
-    pub template: Range,
+    pub template: BodyRange,
     pub pieces: List,
     pub args: List,
     /// `format_args_nl!`: a `\n` follows the last piece.
@@ -1502,8 +1502,8 @@ pub struct FormatArgs {
 impl FormatArgs {
     pub(crate) fn encode(self) -> Node {
         Node {
-            a: self.template.start,
-            b: self.template.end,
+            a: self.template.raw().start,
+            b: self.template.raw().end,
             c: self.pieces.start,
             d: self.pieces.len,
             e: self.args.start,
@@ -1512,10 +1512,10 @@ impl FormatArgs {
         }
     }
 
-    pub(crate) fn decode(n: Node) -> Result<FormatArgs, BadRow> {
+    pub(crate) fn decode(n: Node, lens: Lens) -> Result<FormatArgs, BadRow> {
         check_tag!(n, ROW_FORMAT, "format args");
         Ok(FormatArgs {
-            template: Range::new(n.a, n.b),
+            template: BodyRange::new(Range::new(n.a, n.b), lens),
             pieces: list(n.c, n.d),
             args: list(n.e, n.f),
             newline: n.flags & 1 != 0,
@@ -1527,27 +1527,28 @@ impl FormatArgs {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FmtPiece {
     /// Text, by its range in the template (`{{` and `}}` each one brace of output).
-    Text(Range),
+    Text(BodyRange),
     /// `{arg:spec}`: the argument's position among the [`FormatArgs`]' args, the spec's range
     /// (empty with none).
-    Arg { arg: u32, spec: Range },
+    Arg { arg: u32, spec: BodyRange },
 }
 
 impl FmtPiece {
     pub(crate) fn encode(self) -> Node {
         match self {
-            FmtPiece::Text(r) => Node { a: r.start, b: r.end, ..Node::of(ROW_FMT_PIECE) },
+            FmtPiece::Text(r) => Node { a: r.raw().start, b: r.raw().end, ..Node::of(ROW_FMT_PIECE) },
             FmtPiece::Arg { arg, spec } => {
-                Node { a: spec.start, b: spec.end, c: arg, ..Node::of(ROW_FMT_PIECE).with(1) }
+                Node { a: spec.raw().start, b: spec.raw().end, c: arg, ..Node::of(ROW_FMT_PIECE).with(1) }
             }
         }
     }
 
-    pub(crate) fn decode(n: Node) -> Result<FmtPiece, BadRow> {
+    pub(crate) fn decode(n: Node, lens: Lens) -> Result<FmtPiece, BadRow> {
         check_tag!(n, ROW_FMT_PIECE, "format pieces");
+        let r = BodyRange::new(Range::new(n.a, n.b), lens);
         Ok(match n.flags {
-            0 => FmtPiece::Text(Range::new(n.a, n.b)),
-            _ => FmtPiece::Arg { arg: n.c, spec: Range::new(n.a, n.b) },
+            0 => FmtPiece::Text(r),
+            _ => FmtPiece::Arg { arg: n.c, spec: r },
         })
     }
 }
@@ -1586,7 +1587,7 @@ pub enum MacroPlace {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MacroCall {
     pub path: PathIdx,
-    pub input: Range,
+    pub input: BodyRange,
     pub place: MacroPlace,
 }
 
@@ -1599,14 +1600,15 @@ impl MacroCall {
             MacroPlace::Stmt => 3,
             MacroPlace::Item => 4,
         };
-        Node { a: self.path.0, b: self.input.start, c: self.input.end, ..Node::of(ROW_MACRO).with(place) }
+        let input = self.input.raw();
+        Node { a: self.path.0, b: input.start, c: input.end, ..Node::of(ROW_MACRO).with(place) }
     }
 
-    pub(crate) fn decode(n: Node) -> Result<MacroCall, BadRow> {
+    pub(crate) fn decode(n: Node, lens: Lens) -> Result<MacroCall, BadRow> {
         check_tag!(n, ROW_MACRO, "macro calls");
         Ok(MacroCall {
             path: PathIdx(n.a),
-            input: Range::new(n.b, n.c),
+            input: BodyRange::new(Range::new(n.b, n.c), lens),
             place: match n.flags {
                 0 => MacroPlace::Expr,
                 1 => MacroPlace::Pat,
@@ -1628,7 +1630,7 @@ pub struct LocalItem {
     pub name: Option<NameIdx>,
     /// Where it is, item-relative; empty for an associated item's entry, whose range is only
     /// in the `row_ranges` side column (an edit of its body leaves the signature's rows equal).
-    pub range: Range,
+    pub range: BodyRange,
     /// The block it is declared in; `None` in a trait or impl.
     pub scope: Option<ScopeId>,
 }
@@ -1637,22 +1639,22 @@ impl LocalItem {
     pub(crate) fn encode(self, tag: u16) -> Node {
         Node {
             a: opt(self.name.map(|n| n.0)),
-            b: self.range.start,
-            c: self.range.end,
+            b: self.range.raw().start,
+            c: self.range.raw().end,
             d: opt(self.scope.map(|s| s.0)),
             e: u32::from(self.syntax),
             ..Node::of(tag)
         }
     }
 
-    pub(crate) fn decode(n: Node) -> Result<LocalItem, BadRow> {
+    pub(crate) fn decode(n: Node, lens: Lens) -> Result<LocalItem, BadRow> {
         if n.tag != ROW_LOCAL_ITEM && n.tag != ROW_ASSOC {
             return Err(bad("local items", n.tag));
         }
         Ok(LocalItem {
             syntax: u16::try_from(n.e).map_err(|_| bad("local items", n.tag))?,
             name: unopt(n.a).map(NameIdx),
-            range: Range::new(n.b, n.c),
+            range: BodyRange::new(Range::new(n.b, n.c), lens),
             scope: unopt(n.d).map(ScopeId),
         })
     }
@@ -1676,8 +1678,8 @@ pub enum AttrMeta {
 /// kept.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Attr {
-    pub path: Range,
-    pub args: Range,
+    pub path: BodyRange,
+    pub args: BodyRange,
     pub meta: AttrMeta,
     pub inner: bool,
 }
@@ -1691,19 +1693,19 @@ impl Attr {
             AttrMeta::Unsafe => 3,
         };
         Node {
-            a: self.path.start,
-            b: self.path.end,
-            c: self.args.start,
-            d: self.args.end,
+            a: self.path.raw().start,
+            b: self.path.raw().end,
+            c: self.args.raw().start,
+            d: self.args.raw().end,
             ..Node::of(ROW_ATTR).with(meta | (self.inner as u16) << 2)
         }
     }
 
-    pub(crate) fn decode(n: Node) -> Result<Attr, BadRow> {
+    pub(crate) fn decode(n: Node, lens: Lens) -> Result<Attr, BadRow> {
         check_tag!(n, ROW_ATTR, "attrs");
         Ok(Attr {
-            path: Range::new(n.a, n.b),
-            args: Range::new(n.c, n.d),
+            path: BodyRange::new(Range::new(n.a, n.b), lens),
+            args: BodyRange::new(Range::new(n.c, n.d), lens),
             meta: match n.flags & 3 {
                 0 => AttrMeta::Path,
                 1 => AttrMeta::KeyValue,
@@ -1781,7 +1783,7 @@ impl Field {
         }
     }
 
-    pub(crate) fn decode(n: Node) -> Result<Field, BadRow> {
+    pub fn decode(n: Node) -> Result<Field, BadRow> {
         check_tag!(n, ROW_FIELD, "fields");
         Ok(Field {
             name: unopt(n.a).map(NameIdx),
@@ -1846,7 +1848,7 @@ impl Variant {
         }
     }
 
-    pub(crate) fn decode(n: Node) -> Result<Variant, BadRow> {
+    pub fn decode(n: Node) -> Result<Variant, BadRow> {
         check_tag!(n, ROW_VARIANT, "variants");
         Ok(Variant {
             name: NameIdx(n.a),
@@ -1881,8 +1883,8 @@ impl Scope {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Unhandled {
     pub syntax: u16,
-    pub range: Range,
-    /// Why, when the kind alone does not say (a destructuring assignment, a field default).
+    pub range: BodyRange,
+    /// Why, when the kind alone does not say (a macro not expanded, a field default).
     pub why: Why,
 }
 
@@ -1890,27 +1892,46 @@ pub struct Unhandled {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Why {
     Kind,
-    DestructuringAssignment,
     NonStringTemplate,
+    /// A macro call the expander has no way to expand: no definition found, or a macro not
+    /// built (a proc macro, `asm!`).
+    NotExpanded,
+    /// A macro call that expanded to an error, which the expander reports.
+    ExpansionFailed,
+    /// A macro call past [`crate::EXPANSION_DEPTH`] expansions deep.
+    TooDeep,
+    /// `asm!`, `global_asm!` or `naked_asm!`: inline assembly has no lowering yet.
+    Asm,
+    /// A macro call after its body had made [`crate::EXPANSION_BUDGET`] expansions. The
+    /// call's row names its path and range.
+    TooMany,
 }
 
 impl Unhandled {
     pub(crate) fn encode(self) -> Node {
         let why = match self.why {
             Why::Kind => 0,
-            Why::DestructuringAssignment => 1,
             Why::NonStringTemplate => 2,
+            Why::NotExpanded => 3,
+            Why::ExpansionFailed => 4,
+            Why::TooDeep => 5,
+            Why::Asm => 6,
+            Why::TooMany => 7,
         };
-        Node { a: self.range.start, b: self.range.end, ..Node::of(self.syntax).with(why) }
+        Node { a: self.range.raw().start, b: self.range.raw().end, ..Node::of(self.syntax).with(why) }
     }
 
-    pub(crate) fn decode(n: Node) -> Unhandled {
+    pub(crate) fn decode(n: Node, lens: Lens) -> Unhandled {
         Unhandled {
             syntax: n.tag,
-            range: Range::new(n.a, n.b),
+            range: BodyRange::new(Range::new(n.a, n.b), lens),
             why: match n.flags {
-                1 => Why::DestructuringAssignment,
                 2 => Why::NonStringTemplate,
+                3 => Why::NotExpanded,
+                4 => Why::ExpansionFailed,
+                5 => Why::TooDeep,
+                6 => Why::Asm,
+                7 => Why::TooMany,
                 _ => Why::Kind,
             },
         }
@@ -1934,16 +1955,23 @@ pub enum DiagKind {
     YieldOutsideCoroutine,
     /// `a..=` with no end (E0586).
     InclusiveRangeNoEnd,
+    /// A format string's `{}` or `{n}` names a positional argument that is not written (the
+    /// Reference's `format_args!`; rustc: "invalid reference to positional argument").
+    FormatArgMissing,
+    /// `S { a, ..base } = e`: a destructuring assignment's struct takes `..` alone (the
+    /// Reference, "Destructuring assignments"; rustc: "functional record updates are not
+    /// allowed in destructuring assignments"), at the base.
+    FruInDestructuringAssignment,
 }
 
-/// A diagnostic, at an item-relative range.
+/// A diagnostic, at a range of the record (its position: [`crate::View::site`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Diag {
     pub kind: DiagKind,
-    pub range: Range,
+    pub range: BodyRange,
 }
 
-const DIAG_KINDS: [DiagKind; 7] = [
+const DIAG_KINDS: [DiagKind; 9] = [
     DiagKind::Syntax,
     DiagKind::BreakOutsideLoop,
     DiagKind::UndeclaredLabel,
@@ -1951,18 +1979,20 @@ const DIAG_KINDS: [DiagKind; 7] = [
     DiagKind::AwaitOutsideAsync,
     DiagKind::YieldOutsideCoroutine,
     DiagKind::InclusiveRangeNoEnd,
+    DiagKind::FormatArgMissing,
+    DiagKind::FruInDestructuringAssignment,
 ];
 
 impl Diag {
     pub(crate) fn encode(self) -> Node {
         let code = DIAG_KINDS.iter().position(|k| *k == self.kind).map_or(0, |i| i as u16);
-        Node { a: self.range.start, b: self.range.end, ..Node::of(code) }
+        Node { a: self.range.raw().start, b: self.range.raw().end, ..Node::of(code) }
     }
 
-    pub(crate) fn decode(n: Node) -> Result<Diag, BadRow> {
+    pub(crate) fn decode(n: Node, lens: Lens) -> Result<Diag, BadRow> {
         Ok(Diag {
             kind: *DIAG_KINDS.get(n.tag as usize).ok_or(bad("diags", n.tag))?,
-            range: Range::new(n.a, n.b),
+            range: BodyRange::new(Range::new(n.a, n.b), lens),
         })
     }
 }

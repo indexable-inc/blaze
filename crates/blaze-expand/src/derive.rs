@@ -71,6 +71,136 @@ pub(crate) fn expand(
     }
 }
 
+/// What an outer attribute's tokens (`#[..]`, from the `#`) ask to derive: `#[derive(A, b::C)]`
+/// or `#[derive_const(..)]`, each path's token range in `attr` in order. `None` for another
+/// attribute, or a derive list that is not paths between commas (the attribute's own checker
+/// names that).
+pub fn derive_attr<'a>(attr: &TokenStream<'_>, alloc: blaze_own::Alloc<'a>) -> Option<(Constness, blaze_own::AVec<'a, Range<u32>>)> {
+    let tokens = attr.tokens();
+    let is_hash = matches!(tokens.first().map(|t| t.kind), Some(TokenKind::Punct { char: '#', .. }));
+    let is_bracket = matches!(tokens.get(1).map(|t| t.kind), Some(TokenKind::Open(Delim::Bracket)));
+    if !(is_hash && is_bracket) {
+        return None;
+    }
+    derive_meta(attr, 2..index(attr.close_of(1)?), alloc)
+}
+
+/// [`derive_attr`] of the meta at `meta` of `tokens` (`derive(A, b::C)`, as a
+/// [`crate::cfg_attr_metas`] range gives it).
+pub fn derive_meta<'a>(
+    attr: &TokenStream<'_>,
+    meta: Range<u32>,
+    alloc: blaze_own::Alloc<'a>,
+) -> Option<(Constness, blaze_own::AVec<'a, Range<u32>>)> {
+    let tokens = attr.tokens();
+    let punct = |at: usize, want: char| matches!(tokens.get(at).map(|t| t.kind), Some(TokenKind::Punct { char, .. }) if char == want);
+    let open = |at: usize, want: Delim| matches!(tokens.get(at).map(|t| t.kind), Some(TokenKind::Open(d)) if d == want);
+    let ident = |at: usize| matches!(tokens.get(at).map(|t| t.kind), Some(TokenKind::Ident { .. }));
+    let mut name = meta.start as usize;
+    // A built-in attribute may be named by its path in a standard library prelude (the
+    // Reference, Attributes: built-in attributes are in the prelude, so
+    // `::core::prelude::v1::derive` names `derive`; libc's `s!` writes it): an optional `::`,
+    // `core`, `std` or `alloc`, `::prelude::`, any prelude module, `::`. The names library's
+    // lowering reads the same set (blaze-scope task/lower.rs `prelude_attr`).
+    {
+        let mut at = name;
+        if punct(at, ':') && punct(at + 1, ':') {
+            at += 2;
+        }
+        let sep = |at: usize| punct(at, ':') && punct(at + 1, ':');
+        if ident(at)
+            && matches!(attr.text_at(at), "core" | "std" | "alloc")
+            && sep(at + 1)
+            && ident(at + 3)
+            && attr.text_at(at + 3) == "prelude"
+            && sep(at + 4)
+            && ident(at + 6)
+            && sep(at + 7)
+        {
+            name = at + 9;
+        }
+    }
+    if !ident(name) {
+        return None;
+    }
+    let constness = match attr.text_at(name) {
+        "derive" => Constness::NotConst,
+        "derive_const" => Constness::Const,
+        _ => return None,
+    };
+    let close = attr.close_of(name + 1)?;
+    if !open(name + 1, Delim::Paren) || close + 1 != meta.end as usize {
+        return None;
+    }
+    let mut paths = blaze_own::Vec::new_in(alloc);
+    let mut at = name + 2;
+    while at < close {
+        let start = at;
+        // A path: `::`? ident (`::` ident)*.
+        loop {
+            if punct(at, ':') && punct(at + 1, ':') {
+                at += 2;
+            }
+            if !ident(at) {
+                return None;
+            }
+            at += 1;
+            if !(punct(at, ':') && punct(at + 1, ':')) {
+                break;
+            }
+        }
+        paths.push(index(start)..index(at));
+        match at == close {
+            true => {}
+            false if punct(at, ',') => at += 1,
+            false => return None,
+        }
+    }
+    Some((constness, paths))
+}
+
+/// What an outer attribute's tokens (`#[..]`, from the `#`) call, when it may be an
+/// attribute macro: `#[path]` or `#[path(args)]` (any delimiter), the path's token range and
+/// the range inside the arguments' delimiters. `None` for `#[name = value]`, an `unsafe(..)`
+/// attribute, or tokens that are no attribute.
+pub fn attr_call(attr: &TokenStream<'_>) -> Option<(Range<u32>, Option<Range<u32>>)> {
+    let tokens = attr.tokens();
+    let punct = |at: usize, want: char| matches!(tokens.get(at).map(|t| t.kind), Some(TokenKind::Punct { char, .. }) if char == want);
+    let ident = |at: usize| matches!(tokens.get(at).map(|t| t.kind), Some(TokenKind::Ident { .. }));
+    if !(punct(0, '#') && matches!(tokens.get(1).map(|t| t.kind), Some(TokenKind::Open(Delim::Bracket)))) {
+        return None;
+    }
+    let close = attr.close_of(1)?;
+    if close + 1 != tokens.len() {
+        return None;
+    }
+    let start = 2;
+    let mut at = start;
+    loop {
+        if punct(at, ':') && punct(at + 1, ':') {
+            at += 2;
+        }
+        if !ident(at) {
+            return None;
+        }
+        at += 1;
+        if !(punct(at, ':') && punct(at + 1, ':')) {
+            break;
+        }
+    }
+    let path = index(start)..index(at);
+    if at == close {
+        return Some((path, None));
+    }
+    match tokens[at].kind {
+        TokenKind::Open(_) => {
+            let args_close = attr.close_of(at)?;
+            (args_close + 1 == close).then(|| (path, Some(index(at + 1)..index(args_close))))
+        }
+        _ => None,
+    }
+}
+
 /// The derive's error, `message`; it makes nothing else.
 fn refuse(out: &mut Out<'_, '_>, message: &str) -> Result<(), ExpandError> {
     let message = out.note(message)?;

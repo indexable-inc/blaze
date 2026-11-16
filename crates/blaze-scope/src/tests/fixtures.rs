@@ -242,7 +242,7 @@ pub(crate) fn macro_export() -> (World, Export) {
     let dep_root = w.root(2, Edition::E2021);
     let inner = w.module(dep_root, "inner", V::Priv);
     let exp = w.rules(inner, "exp");
-    w.cr(dep_root).macro_exports.push(("exp", exp));
+    w.cr(dep_root).macro_exports.push(("exp", exp, crate::MacroShapes::FN_LIKE));
     let root = w.root(1, Edition::E2021);
     w.dep(root, "dep", dep_root);
     w.call(root, "dep::exp", CallShape::FnLike);
@@ -304,7 +304,7 @@ pub(crate) fn negative() -> (World, Negative) {
     let dep_root = w.root(2, Edition::E2021);
     let std_root = w.root(3, Edition::E2021);
     let prelude = w.module(std_root, "prelude", V::Pub);
-    w.item(prelude, "pm", Namespace::Macros, DefKind::Macro(CallShape::FnLike), V::Pub);
+    w.item(prelude, "pm", Namespace::Macros, DefKind::Macro(crate::MacroShapes::FN_LIKE), V::Pub);
     let root = w.root(1, Edition::E2021);
     w.cr(root).macro_use.push(dep_root);
     w.cr(root).head.prelude = Some(prelude);

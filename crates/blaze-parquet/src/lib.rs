@@ -88,7 +88,9 @@ mod compress;
 mod concat;
 mod delta;
 mod levels;
-mod lz4;
+/// The LZ4 block codec, public for the transfer measurement (blaze-squeeze's example), which
+/// compares it per record with zstd and blaze's column encodings.
+pub mod lz4;
 pub mod meta;
 mod read;
 mod thrift;

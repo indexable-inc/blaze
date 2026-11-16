@@ -16,18 +16,23 @@ use std::path::{Path, PathBuf};
 
 use blaze_toml::{Document, Item, Kind, Limits};
 
-/// blaze's home: `$BLAZE_HOME`, else `.blaze` in the user's home ([`blaze_core::home::user`]:
-/// `HOME`, else the system's record of the user).
+/// blaze's home from the variables `var` reads and the system's record of the user (`record`,
+/// asked only when no variable answers): `$BLAZE_HOME`, else `.blaze` in the user's home
+/// ([`blaze_core::home::decide`]: `HOME`, else the record). A driver passes its process's
+/// (`|name| std::env::var_os(name)`, [`blaze_core::home::record`]).
 ///
 /// # Errors
 ///
 /// [`blaze_core::home::NoHome`] when `BLAZE_HOME` is unset and the user has no home, saying
 /// what was tried; the caller says what needed it.
-pub fn home() -> Result<PathBuf, blaze_core::home::NoHome> {
-    if let Some(home) = std::env::var_os("BLAZE_HOME").filter(|it| !it.is_empty()) {
+pub fn home(
+    var: impl Fn(&str) -> Option<std::ffi::OsString>,
+    record: impl FnOnce() -> Result<PathBuf, blaze_core::home::NoRecord>,
+) -> Result<PathBuf, blaze_core::home::NoHome> {
+    if let Some(home) = var("BLAZE_HOME").filter(|it| !it.is_empty()) {
         return Ok(PathBuf::from(home));
     }
-    Ok(blaze_core::home::user()?.join(".blaze"))
+    Ok(blaze_core::home::decide(&var, record)?.join(".blaze"))
 }
 
 /// `config.toml` under `home`.

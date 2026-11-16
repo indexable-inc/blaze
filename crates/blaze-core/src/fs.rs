@@ -5,8 +5,8 @@
 #[allow(unsafe_code, reason = "mmap and MapViewOfFile, and the byte view of what they map")]
 mod mapped;
 
-pub(crate) use mapped::{map, map_extent};
-pub use mapped::{Advice, MapOptions, Mapped, granularity};
+pub(crate) use mapped::{map, map_extent, map_write};
+pub use mapped::{Advice, MapOptions, Mapped, MappedWrite, granularity};
 
 mod private;
 
@@ -791,6 +791,15 @@ pub(crate) fn stat(path: &Path, follow: bool) -> io::Result<Option<Meta>> {
 }
 
 fn meta_of(meta: &std::fs::Metadata) -> Meta {
+    #[cfg(unix)]
+    let (changed_ns, ino, dev) = {
+        use std::os::unix::fs::MetadataExt as _;
+        let ns = |s: i64, n: i64| (s as u64).wrapping_mul(1_000_000_000).wrapping_add(n as u64);
+        (ns(meta.ctime(), meta.ctime_nsec()), meta.ino(), meta.dev())
+    };
+    // Windows' file index and volume serial are not on std's stable `Metadata`, nor WASI's.
+    #[cfg(not(unix))]
+    let (changed_ns, ino, dev) = (0, 0, 0);
     Meta {
         len: meta.len(),
         dir: meta.is_dir(),
@@ -799,11 +808,29 @@ fn meta_of(meta: &std::fs::Metadata) -> Meta {
             .ok()
             .and_then(|it| it.duration_since(UNIX_EPOCH).ok())
             .map_or(0, |it| u64::try_from(it.as_nanos()).unwrap_or(u64::MAX)),
+        changed_ns,
+        ino,
+        dev,
+    }
+}
+
+/// The name of the entry `leaf` directly in `parent`, the root's or a directory's.
+fn name_under(
+    parent: &crate::DirName,
+    leaf: &std::ffi::OsStr,
+    path: impl FnOnce() -> PathBuf,
+) -> io::Result<FileName> {
+    match parent {
+        crate::DirName::Named(dir) => child_name(dir, leaf, path),
+        crate::DirName::Root => root_child(leaf, path),
     }
 }
 
 /// Every file and directory under `dir` (named `name` under the root, or the root itself),
-/// sorted by name; symbolic links are not followed.
+/// sorted by name, each with its [`Meta`] from the listing's own call: on macOS one
+/// `getattrlistbulk` per buffer of a directory's entries ([`bulk::listed`]), on the other
+/// Unixes an `fstatat` of each entry relative to its open directory. Symbolic links are not
+/// followed; an entry gone between the listing and its stat is left out.
 pub(crate) fn list(dir: &Path, name: &crate::DirName) -> io::Result<Vec<(FileName, Meta)>> {
     // alloc: the listing's payload.
     let mut found: Vec<(FileName, Meta)> = Vec::new();
@@ -811,37 +838,123 @@ pub(crate) fn list(dir: &Path, name: &crate::DirName) -> io::Result<Vec<(FileNam
     let mut todo: Vec<Option<usize>> = Vec::with_capacity(16); // alloc: once per listing.
     todo.push(None);
     while let Some(at) = todo.pop() {
-        let read = blaze_mem::scratch::with_path(|path| {
+        let parent = match at {
+            // clone: the directory's name, a refcount: `found` grows under it.
+            Some(at) => crate::DirName::Named(found[at].0.clone()),
+            None => name.clone(),
+        };
+        let first = found.len();
+        blaze_mem::scratch::with_path(|path| {
             path.push(dir);
-            if let Some(at) = at {
-                let file: &FileName = &found[at].0;
-                path.push(&file.as_str()[name.start()..]);
+            if let crate::DirName::Named(inner) = &parent
+                && at.is_some()
+            {
+                path.push(&inner.as_str()[name.start()..]);
             }
-            // alloc: once per directory, std's handle of it.
-            std::fs::read_dir(&*path).map_err(|error| {
-                io::Error::new(error.kind(), format!("{}: {error}", path.display()))
-            })
+            listed(path, &parent, &mut found)
         })?;
-        for entry in read {
-            let entry = entry?;
-            // Of the entry itself, not followed through a symlink.
-            let meta = entry.metadata()?;
-            // alloc: std's copy of the entry's name, and the name, the listing's payload.
-            let file = match at {
-                Some(at) => child_name(&found[at].0, &entry.file_name(), || entry.path())?,
-                None => match name {
-                    crate::DirName::Named(dir) => child_name(dir, &entry.file_name(), || entry.path())?,
-                    crate::DirName::Root => root_child(&entry.file_name(), || entry.path())?,
-                },
-            };
-            if meta.is_dir() {
-                todo.push(Some(found.len()));
-            }
-            found.push((file, meta_of(&meta)));
-        }
+        todo.extend((first..found.len()).filter(|it| found[*it].1.dir).map(Some));
     }
     found.sort_unstable_by(|a, b| a.0.cmp(&b.0));
     Ok(found)
+}
+
+#[cfg(target_os = "macos")]
+use bulk::listed;
+
+/// The folders above `root`, at most `most`, nearest first ([`crate::Effect::Ancestors`]):
+/// for each, the name in it of the folder on the way down, from the root's real path
+/// (`realpath`, so a root reached through a link has the parents its `..` reaches). Read when
+/// asked; a folder name that is not UTF-8 is refused, naming the root.
+pub(crate) fn ancestors(root: &Path, most: u8) -> io::Result<crate::Ancestors> {
+    // alloc: the root's real path, once per ask.
+    let real = std::fs::canonicalize(root)
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: the start folder's path: {error}", root.display())))?;
+    // alloc: the names, the answer's payload.
+    let mut toward: Vec<std::sync::Arc<str>> = Vec::new();
+    for part in real.components().rev() {
+        let std::path::Component::Normal(name) = part else { continue };
+        if toward.len() == usize::from(most) {
+            break;
+        }
+        let Some(name) = name.to_str() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{}: a folder above the start folder has a name that is not UTF-8", real.display()),
+            ));
+        };
+        // alloc: one name of the answer.
+        toward.push(std::sync::Arc::from(name));
+    }
+    Ok(crate::Ancestors::answered(toward, most))
+}
+
+/// `op` on `name`, above `root` ([`crate::Effect::Above`]): reads only.
+pub(crate) fn above(root: &Path, op: crate::AboveOp, name: &crate::Above) -> io::Result<crate::Done> {
+    let named = |error: io::Error| io::Error::new(error.kind(), format!("{name}: {error}"));
+    blaze_mem::scratch::with_path(|path| {
+        path.push(root);
+        path.push(name.relative());
+        match op {
+            crate::AboveOp::Stat => stat(path, false).map(crate::Done::Stat).map_err(named),
+            // alloc: the read's payload.
+            crate::AboveOp::Read => std::fs::read(&*path).map(crate::Done::Read).map_err(named),
+            crate::AboveOp::List => {
+                // alloc: the listing's payload.
+                let mut found = Vec::new();
+                listed(path, &crate::DirName::Root, &mut found).map_err(named)?;
+                found.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                Ok(crate::Done::Listed(found))
+            }
+        }
+    })
+}
+
+/// What is directly in `dir` (named `parent`), each with its [`Meta`], appended to `out`:
+/// one `fstatat` of each entry relative to the open directory, which gives the device too.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn listed(dir: &Path, parent: &crate::DirName, out: &mut Vec<(FileName, Meta)>) -> io::Result<()> {
+    use std::os::fd::AsFd as _;
+    let fd = open_dir(dir)?;
+    // alloc: once per directory, std's handle of it.
+    let read = std::fs::read_dir(dir)
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", dir.display())))?;
+    for entry in read {
+        let entry = entry?;
+        // alloc: std's copy of the entry's name.
+        let leaf = entry.file_name();
+        let stat = match with_c_path(Path::new(&leaf), |it| crate::raw::stat_at(fd.as_fd(), it)) {
+            Ok(stat) => stat,
+            // Removed since it was listed: not in the listing.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            // alloc: an error path.
+            Err(error) => return Err(io::Error::new(error.kind(), format!("{}: {error}", entry.path().display()))),
+        };
+        // alloc: the name, the listing's payload.
+        let file = name_under(parent, &leaf, || entry.path())?;
+        #[allow(clippy::unnecessary_cast, reason = "st_dev is u64 on Linux, narrower on other Unixes")]
+        let dev = stat.st_dev as u64;
+        out.push((file, Meta::of(&stamp_of(&stat), dev)));
+    }
+    Ok(())
+}
+
+/// What is directly in `dir` (named `parent`), each with its [`Meta`] as std's listing has it,
+/// appended to `out`.
+#[cfg(not(unix))]
+fn listed(dir: &Path, parent: &crate::DirName, out: &mut Vec<(FileName, Meta)>) -> io::Result<()> {
+    // alloc: once per directory, std's handle of it.
+    let read = std::fs::read_dir(dir)
+        .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", dir.display())))?;
+    for entry in read {
+        let entry = entry?;
+        // Of the entry itself, not followed through a symlink.
+        let meta = entry.metadata()?;
+        // alloc: std's copy of the entry's name, and the name, the listing's payload.
+        let file = name_under(parent, &entry.file_name(), || entry.path())?;
+        out.push((file, meta_of(&meta)));
+    }
+    Ok(())
 }
 
 /// `path` gone, a file or symbolic link unlinked, an empty directory removed; one call for a
@@ -1324,11 +1437,12 @@ fn stamp_at(dir: std::os::fd::BorrowedFd<'_>, name: &std::ffi::CStr) -> Stamp {
 
 /// How many names one thread of a sweep stamps.
 #[cfg(unix)]
-const SWEEP_CHUNK: usize = 2048;
+const SWEEP_CHUNK: usize = 256;
 
 /// How many threads stamp `names` names: one per [`SWEEP_CHUNK`] of them, at most one per core.
-/// A cached `fstatat` is some 0.4 µs, so a thread spawned for 2,048 of them (some 0.8 ms) costs
-/// it a few percent.
+/// Measured by `examples/stat_cost.rs` on APFS (macOS arm64, warm, 870 names): one thread at a
+/// chunk of 2,048 took a median 673 µs (0.77 µs a name); four at 256 take 544 µs (0.63 µs), the
+/// spawns costing back much of the split, for about three times the CPU.
 #[cfg(unix)]
 fn sweepers(names: usize, cores: usize) -> usize {
     names.div_ceil(SWEEP_CHUNK).clamp(1, cores.max(1))
@@ -1369,11 +1483,11 @@ pub(crate) fn stamps(root: &Path, names: &Names) -> io::Result<Vec<Stamp>> {
 /// name; symbolic links are stamped themselves. macOS lists with `getattrlistbulk`
 /// ([`bulk::entries`]).
 #[cfg(all(unix, not(target_os = "macos")))]
-pub(crate) fn entries(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, Stamp)>> {
-    use std::os::fd::AsFd as _;
+pub(crate) fn entries(dir: &Path, name: &crate::DirName) -> io::Result<crate::Listing> {
+    use std::os::{fd::AsFd as _, unix::ffi::OsStrExt as _};
     let fd = open_dir(dir)?;
-    // alloc: the listing's payload.
-    let mut found = Vec::new();
+    // clone: the listing's directory, a refcount.
+    let mut found = crate::ListingBuilder::new(name.clone());
     // alloc: once per listing, std's handle of the directory.
     let read = std::fs::read_dir(dir)
         .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", dir.display())));
@@ -1381,13 +1495,10 @@ pub(crate) fn entries(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, 
         let entry = entry?;
         // alloc: std's copy of the entry's name.
         let leaf = entry.file_name();
-        // alloc: the name, the listing's payload.
-        let file = child_name(name, &leaf, || entry.path())?;
         let stamp = with_c_path(Path::new(&leaf), |leaf| Ok(stamp_at(fd.as_fd(), leaf)))?;
-        found.push((file, stamp));
+        found.push(leaf.as_bytes(), stamp)?;
     }
-    found.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    Ok(found)
+    Ok(found.finish()?)
 }
 
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
@@ -1651,15 +1762,15 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
-    /// A sweep takes a thread per 2,048 names, never more than the cores and never none; the
-    /// chunks the threads take cover every name once.
+    /// A sweep takes a thread per [`SWEEP_CHUNK`] names, never more than the cores and never
+    /// none; the chunks the threads take cover every name once.
     #[test]
     fn a_sweep_takes_a_thread_per_chunk_up_to_the_cores() {
         assert_eq!(sweepers(0, 16), 1);
         assert_eq!(sweepers(SWEEP_CHUNK, 16), 1);
         assert_eq!(sweepers(SWEEP_CHUNK + 1, 16), 2);
         assert_eq!(sweepers(50_000, 16), 16);
-        assert_eq!(sweepers(50_000, 64), 50_000usize.div_ceil(SWEEP_CHUNK));
+        assert_eq!(sweepers(50_000, 256), 50_000usize.div_ceil(SWEEP_CHUNK));
         assert_eq!(sweepers(50_000, 0), 1);
         for names in [1, SWEEP_CHUNK, SWEEP_CHUNK + 1, 50_000, 1 << 20] {
             for cores in [1, 3, 8, 16, 64, 256] {

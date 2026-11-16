@@ -22,7 +22,6 @@ use crate::{
     name::{AppName, DeviceName, ModuleName, ServiceName},
     power::Battery,
     procs::{ProcId, Signal, SimProc},
-    requests::SimHttp,
     roots::Anchor,
     streams::SimStreams,
     term::{KeyEvent, SimTerm},
@@ -89,6 +88,9 @@ pub struct SimHost {
     pub out: Vec<u8>,
     /// Everything written to standard error, in order.
     pub err: Vec<u8>,
+    /// What standard output and standard error are drawn on, in that order: what
+    /// `Out::is_terminal` and `Out::size` read. Not terminals unless a test says so.
+    pub ttys: [crate::term::Tty; 2],
     pub term: SimTerm,
     /// The keychain.
     pub keys: Vec<SimKey>,
@@ -128,8 +130,9 @@ pub struct SimHost {
     pub position: Position,
     /// What a name resolves to: the simulation's name service ([`crate::resolver`]).
     pub names: Vec<(String, IpAddr)>,
-    /// The requests the host makes for the program ([`Io::http`]).
-    pub http: SimHttp,
+    /// The requests the host makes for the program ([`Io::http`]). Behind bstd's `net`.
+    #[cfg(feature = "net")]
+    pub http: crate::requests::SimHttp,
     /// The streams the host carries for the program ([`Io::streams`]).
     pub streams: SimStreams,
 }
@@ -144,6 +147,7 @@ impl SimHost {
             // alloc: none, nothing written yet.
             out: Vec::new(),
             err: Vec::new(),
+            ttys: [crate::term::Tty::NotTerminal; 2],
             term: SimTerm::new(),
             // alloc: none, the simulated host's empty tables (this and each below).
             keys: Vec::new(),
@@ -168,7 +172,8 @@ impl SimHost {
             notices: Vec::new(),
             position: Position { lat_e7: 0, lon_e7: 0 },
             names: Vec::new(),
-            http: SimHttp::default(),
+            #[cfg(feature = "net")]
+            http: crate::requests::SimHttp::default(),
             streams: SimStreams::default(),
         }
     }

@@ -159,6 +159,53 @@ fn cycle_cases(t: &Tape) -> Result<(), Broke> {
     Ok(())
 }
 
+/// The cases named in `names` (exact names), each answering as written: the trait-object
+/// controls' subject.
+fn named_cases(t: &Tape, names: &[&str]) -> Result<(), Broke> {
+    let _ = t.below(2, "draw");
+    let r = run_all(&|n: &str| names.contains(&n)).map_err(|e| Broke::Harness(format!("{e}")))?;
+    if r.cases != names.len() as u32 {
+        return Err(Broke::Harness(format!("{} of {} named cases found", r.cases, names.len())));
+    }
+    if let Some(f) = r.failures.first() {
+        return Err(Broke::Oracle(format!("an object case answers wrong: {f}")));
+    }
+    Ok(())
+}
+
+/// The Reference, "Dynamically sized types": trait objects are DSTs, so `dyn Tr: Sized` fails;
+/// with the bug (an object is `Sized`) `sized_dyn_no` answers yes.
+#[test]
+fn control_object_sized() {
+    blaze_sim::control(Config::cases(2), Plant::None, Plant::ObjectSized, "an object case answers wrong", |t, p| {
+        plant::with(p, || named_cases(t, &["sized_dyn_no", "meta_sized_dyn_yes"]))
+    });
+}
+
+/// The Reference, "Trait object types": "the trait object implements the base trait, its auto
+/// traits, and any supertraits of the base trait": an unlisted auto trait does not hold.
+#[test]
+fn control_object_any_auto() {
+    blaze_sim::control(Config::cases(2), Plant::None, Plant::ObjectAnyAuto, "an object case answers wrong", |t, p| {
+        plant::with(p, || {
+            named_cases(t, &["auto_dyn_with_auto_bound_yes", "auto_dyn_without_bound_no", "auto_dyn_other_auto_no"])
+        })
+    });
+}
+
+/// The Reference, "Trait object types" (`dyn Iterator<Item = u32>`): the object's associated
+/// type is its binding, so `<dyn Iterator<Item = u32> as Iterator>::Item == u8` fails.
+#[test]
+fn control_object_projection_ignores_binding() {
+    blaze_sim::control(
+        Config::cases(2),
+        Plant::None,
+        Plant::ObjectProjIgnoresBinding,
+        "an object case answers wrong",
+        |t, p| plant::with(p, || named_cases(t, &["dyn_projection", "dyn_projection_mismatch"])),
+    );
+}
+
 #[test]
 fn control_coinductive_cycle_as_inductive() {
     blaze_sim::control(Config::cases(2), Plant::None, Plant::CoinductiveAsInductive, "a cycle case answers wrong", |t, p| {

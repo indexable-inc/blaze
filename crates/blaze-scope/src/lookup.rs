@@ -10,19 +10,19 @@ use core::cmp::Ordering;
 use blaze_id::ItemKey;
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_surface::{
-    AmbiguityKind, BindingState, CallShape, Def, DefKind, Edition, Namespace, Origin, Path,
-    PathKind, TextualDef, Unresolved, Visibility, VisibilityClass,
+    AmbiguityKind, BindingState, CallShape, Def, DefKind, Edition, GlobEdge, Namespace, Origin, Path,
+    PathKind, TextualDef, Unresolved, Visibility,
 };
 
-use crate::error::ResolveError;
+use crate::error::{GlobBug, ResolveError};
 use crate::facts::{Name, ScopeFacts};
 use crate::read::{NameAnswer, Read};
 use crate::resolver::{
-    Amb, At, CallState, Cached, Env, Hit, ImportOutcome, Item, Layer, Mark, Memo, NsRes, Plan,
+    Amb, At, Blame, CallState, Cached, Env, Hit, ImportOutcome, Item, Layer, NsRes,
     Query, Res, Resolver, Scan, Sink, Slot, Source, MAX_MODULE_DEPTH,
 };
-use crate::scope::SeenFrom;
-use crate::watch::Kind;
+use blaze_surface::{Node, Passed, SeenFrom, Sources, Through, through};
+use crate::work::Key;
 
 /// What a path is resolved for: a 2015 `use` path begins at the crate root.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -41,7 +41,7 @@ pub(crate) struct LexQuery<N> {
     pub(crate) want: Option<CallShape>,
     /// Whether the `macro_rules!` textual scope is searched (a one-segment bang path).
     pub(crate) textual: bool,
-    pub(crate) ignore: Option<(ItemKey, u32)>,
+    pub(crate) ignore: Option<(ItemKey, Asking)>,
 }
 
 /// A path's prefix, resolved to a module or an enum.
@@ -59,6 +59,8 @@ pub(crate) struct GlobFound {
     pub(crate) found: Option<(At, Hit)>,
     pub(crate) undet: bool,
     pub(crate) wait: bool,
+    /// A record some glob's walk reads is not given yet: nothing is decided until it is.
+    pub(crate) answer: bool,
 }
 
 /// A walk back through textual scope.
@@ -70,8 +72,8 @@ enum Tex {
     Wait,
 }
 
-pub(crate) struct GlobOutcome<'a> {
-    pub(crate) source: Option<Source<'a>>,
+pub(crate) struct GlobOutcome {
+    pub(crate) source: Option<Source>,
     pub(crate) first: Option<Def>,
     pub(crate) wait: bool,
 }
@@ -95,113 +97,171 @@ fn seg(i: usize) -> u32 {
     u32::try_from(i).unwrap_or(u32::MAX)
 }
 
-/// The glob edges among members that the binding of a name in member `from` can depend on:
-/// every edge into `from`, and backward from each edge's source, every edge into it. Sorted,
-/// as `(source, importer)`.
-fn glob_closure<'a, N: Name>(from: usize, env: Env<'_, 'a, N>, alloc: Alloc<'a>) -> AVec<'a, (usize, usize)> {
-    let mut inside: AVec<'a, bool> = Vec::with_capacity_in(env.members.len(), alloc.clone());
-    inside.resize(env.members.len(), false);
-    let mut stack: AVec<'a, usize> = Vec::new_in(alloc.clone());
-    let mut edges: AVec<'a, (usize, usize)> = Vec::new_in(alloc);
-    inside[from] = true;
-    stack.push(from);
-    while let Some(y) = stack.pop() {
-        for g in env.members[y].globs.iter() {
-            if let Source::Resolved { def, .. } = &g.source {
-                if let Some(x) = env.index(def.key) {
-                    if x != y {
-                        edges.push((x, y));
-                        if !inside[x] {
-                            inside[x] = true;
-                            stack.push(x);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    edges.sort_unstable();
-    edges.dedup();
-    edges
+/// The item of a module whose own path a lookup resolves, which never sees itself (rustc's
+/// `ignore_import`): a named import or a glob, by its index among the module's imports or
+/// globs. A glob that waited on itself left `use crate::m::m::*` (with `m` reached through
+/// `m`'s own `use crate::*`) unresolved (the cold-fill oracle, scope lead 20).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Asking {
+    Import(u32),
+    Glob(u32),
+    /// A call's own path, which does not wait on the call itself.
+    Call(u32),
 }
 
-/// Extends the group's least fixpoint for `key` in `sink.memo` over `edges` (a backward-closed
-/// set: a value depends only on edges into its source, all in the table once this returns):
-/// for each new edge, a fellow `f` and an importer `i`, what `f` binds the name to as `i` sees
-/// it, from none, each round from the table's last values, until a round changes nothing.
-/// Values already in the table are final. A round past the bound sets `sink.overrun`, which
-/// the pass stops on.
-fn group_fixpoint<'a, N: Name>(
-    key: (Namespace, N, Option<(ItemKey, u32)>),
-    edges: &[(usize, usize)],
-    env: Env<'_, 'a, N>,
-    sink: &mut Sink<'a, N>,
-    alloc: Alloc<'a>,
-) {
-    let start = (sink.touched.len(), sink.need.len(), sink.waits.len());
-    let memo = sink
-        .memo
-        .entry(key)
-        .or_insert_with(|| Memo { table: Vec::new_in(alloc.clone()), keys: Vec::new_in(alloc.clone()), unsettled: false });
-    let mut fresh: AVec<'a, (usize, usize)> = Vec::new_in(alloc.clone());
-    for &(f, i) in edges.iter() {
-        if memo.table.binary_search_by(|&(tf, ti, _)| (tf, ti).cmp(&(f, i))).is_err() {
-            fresh.push((f, i));
+/// Why a source of a lookup through globs cannot be read now.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Stop {
+    /// A record it is read from is not given yet: never an open node (the record is a fact
+    /// still to arrive, not an item undecided).
+    Answer,
+    /// A pending item of a member, blocked on an answer, may still bind it.
+    Wait,
+    /// A pending item of a member may still bind it, and nothing outstanding decides it.
+    Undet,
+}
+
+/// The sources of a lookup through globs as a machine sees them: itself by its own bindings
+/// (its globs are its own lookup's), a fellow live, any other module or enum by its records
+/// (`Name` for its own binding, `Globs` for its edges), each read kept in the read list.
+struct Live<'e, 's, 'a, N> {
+    at: &'e Resolver<'a, N>,
+    ns: Namespace,
+    name: N,
+    ignore: Option<(ItemKey, Asking)>,
+    env: Env<'e, 'a, N>,
+    sink: &'s mut Sink<'a, N>,
+    /// A source the walk follows has a glob still pending: if the walk finds nothing, it is
+    /// undecided (the stronger of the stops met), not absent.
+    pend: Option<Stop>,
+}
+
+/// The stronger of two stops: an answer outstanding, then a wait, then undetermined.
+fn join(a: Option<Stop>, b: Stop) -> Option<Stop> {
+    match (a, b) {
+        (Some(Stop::Answer), _) | (_, Stop::Answer) => Some(Stop::Answer),
+        (Some(Stop::Wait), _) | (_, Stop::Wait) => Some(Stop::Wait),
+        (Some(Stop::Undet) | None, Stop::Undet) => Some(Stop::Undet),
+    }
+}
+
+impl<'e, N> Live<'e, '_, '_, N> {
+    /// The walk's result with what its sources still had pending: nothing found and a glob
+    /// pending is undecided.
+    fn settle(&self, walked: Result<Option<Passed>, Through<Stop>>) -> Result<Option<Passed>, Through<Stop>> {
+        match (walked, self.pend) {
+            (Ok(None), Some(stop)) => Err(Through::Stop(stop)),
+            (Err(Through::Stop(a)), Some(b)) => Err(Through::Stop(join(Some(a), b).unwrap_or(a))),
+            (other, _) => other,
         }
     }
-    memo.table.extend(fresh.iter().map(|&(f, i)| (f, i, Res::None)));
-    memo.table.sort_unstable_by_key(|&(f, i, _)| (f, i));
-    let (ns, name, ignore) = key;
-    // Each value only rises (none, a binding, a wider or ambiguous one, undetermined), so a
-    // few rounds per edge settle it.
-    let bound = 4 * fresh.len() + 4;
-    sink.stats.fixpoints += 1;
-    sink.computing.push(key);
-    let mut settled = false;
-    for _ in 0..bound {
-        let mut changed = false;
-        for &(f, i) in fresh.iter() {
-            sink.stats.fixpoint_evals += 1;
-            let q = Query { asker: env.members[i].asker(), restricted: false, ignore };
-            let r = env.members[f].lookup_module(ns, name, q, env, sink);
-            if let Some(memo) = sink.memo.get_mut(&key) {
-                if let Ok(k) = memo.table.binary_search_by(|&(tf, ti, _)| (tf, ti).cmp(&(f, i))) {
-                    if memo.table[k].2 != r {
-                        memo.table[k].2 = r;
-                        changed = true;
-                    }
+}
+
+impl<'e, 'a, N: Name> Sources<'e> for Live<'e, '_, 'a, N> {
+    type Stop = Stop;
+
+    /// A member's source held by a pending item gives no value: a binding found elsewhere is
+    /// not held by it (the stall rule: never a glob behind a glob once bound). A record not
+    /// given yet stops the walk.
+    fn open(stop: &Stop) -> bool {
+        *stop != Stop::Answer
+    }
+
+    fn node(&mut self, source: Def) -> Result<Node<'e>, Stop> {
+        let at = self.at;
+        let passed = |r: Res| match r {
+            Res::Found(hit) => Ok(Node::Value(Some(Passed { def: hit.def, vis: hit.vis, state: hit.state }))),
+            Res::None => Ok(Node::Value(None)),
+            Res::Undet { .. } => Err(Stop::Undet),
+            Res::Wait => Err(Stop::Wait),
+        };
+        if source.key == at.module {
+            self.sink.touch(Key::Name(at.module, self.name));
+            let q = Query { asker: at.asker(), restricted: false, ignore: self.ignore };
+            return match at.own_lookup(self.ns, self.name, q) {
+                Some(r @ (Res::Undet { .. } | Res::Wait)) => {
+                    at.blame_named(self.ns, self.name, q, self.sink);
+                    passed(r)
                 }
+                Some(r) => passed(r),
+                None => Ok(Node::Value(None)),
+            };
+        }
+        if let Some(f) = self.env.fellow(source.key) {
+            return at.member_node(f, self.ns, self.name, self.ignore, &mut self.pend, self.sink);
+        }
+        let (ns, name) = (self.ns, self.name);
+        match at.cached(Read::Name { module: source.key, ns, name }, self.sink) {
+            Some(Cached::Name(NameAnswer::Found { def, vis, state, .. })) => {
+                #[cfg(test)]
+                let vis = if at.plant == crate::resolver::Plant::GlobLeaksPrivate { &Visibility::Public } else { vis };
+                return Ok(Node::Value(Some(Passed { def: *def, vis: *vis, state: *state })));
+            }
+            Some(Cached::Name(NameAnswer::Absent)) if source.kind == DefKind::Enum => return Ok(Node::Value(None)),
+            Some(Cached::Name(NameAnswer::Absent)) => {}
+            Some(Cached::Globs { .. } | Cached::Textual { .. } | Cached::Helpers { .. } | Cached::InProgress(_)) | None => {
+                return Err(Stop::Answer);
             }
         }
-        if !changed {
-            settled = true;
-            break;
+        match at.cached(Read::Globs { module: source.key }, self.sink) {
+            Some(Cached::Globs { edges, krate, chain, .. }) => Ok(Node::Edges { edges, krate: *krate, chain }),
+            Some(Cached::Name(_) | Cached::Textual { .. } | Cached::Helpers { .. } | Cached::InProgress(_)) | None => {
+                Err(Stop::Answer)
+            }
         }
-    }
-    sink.computing.pop();
-    if !settled {
-        sink.overrun = true;
-    }
-    let unsettled = sink.need.len() > start.1 || sink.waits.len() > start.2;
-    let Sink { memo, touched, .. } = sink;
-    if let Some(memo) = memo.get_mut(&key) {
-        memo.keys.extend_from_slice(&touched[start.0..]);
-        memo.keys.sort_unstable();
-        memo.keys.dedup();
-        memo.unsettled |= unsettled;
     }
 }
 
 impl<'a, N: Name> Resolver<'a, N> {
-    /// Whether a call may still add names, and whether one pending waits on an answer.
-    fn calls_state(&self) -> (bool, bool) {
-        let mut unexpanded = false;
-        let mut wait = false;
-        for c in self.calls.iter() {
-            unexpanded |= c.state.unexpanded();
-            wait |= c.state == CallState::Pending && c.blocked;
+    /// What [`Resolver::calls_but`] answers from: calls not expanded, and pending calls blocked,
+    /// each counted up to two. A change to either is a `CallsState` event. `calls_but` takes
+    /// away at most one call (the asker's own) and asks "more than zero", so a count past two
+    /// changes no reader's answer: counted in full, each expansion of a module with N calls
+    /// woke every walk that read the module (N events; libc's linux module, 2026-11-16).
+    pub(crate) fn calls_state(&self) -> (u32, u32) {
+        (self.unexpanded.min(2), self.blocked_calls.min(2))
+    }
+
+    /// Whether a call but `except` may still add names, and whether one pending but `except`
+    /// waits on an answer: constant time, from the counts the setters keep.
+    pub(crate) fn calls_but(&self, except: Option<u32>) -> (bool, bool) {
+        let (mut unexpanded, mut blocked) = (self.unexpanded, self.blocked_calls);
+        if let Some(c) = except {
+            let call = &self.calls[c as usize];
+            if call.state.unexpanded() {
+                unexpanded -= 1;
+            }
+            if call.state == CallState::Pending && call.blocked {
+                blocked -= 1;
+            }
         }
-        (unexpanded, wait)
+        (unexpanded > 0, blocked > 0)
+    }
+
+    /// The call of this module a lookup is made for, which never waits on itself.
+    fn asking_call(&self, ignore: Option<(ItemKey, Asking)>) -> Option<u32> {
+        match ignore {
+            Some((m, Asking::Call(c))) if m == self.module => Some(c),
+            Some(_) | None => None,
+        }
+    }
+
+    /// In a [`Scan::Stall`] evaluation: blames the pending named imports of `name` that `q`'s
+    /// asker sees (what made [`Resolver::own_lookup`] undecided).
+    fn blame_named(&self, ns: Namespace, name: N, q: Query<'_>, sink: &mut Sink<'a, N>) {
+        if sink.scan != Scan::Stall {
+            return;
+        }
+        let Some(list) = self.named.get(&name) else { return };
+        for &i in list.iter() {
+            if q.ignore == Some((self.module, Asking::Import(i))) {
+                continue;
+            }
+            let imp = &self.imports[i as usize];
+            if imp.imports(ns) && imp.failed.is_none() && imp.ns[ns.index()] == NsRes::Pending && imp.vis.visible_from(q.asker) {
+                sink.blame(Blame::Import(self.module, i));
+            }
+        }
     }
 
     /// The binding of `name` in `ns` of this machine's module, as `q` sees it (rustc's
@@ -216,16 +276,33 @@ impl<'a, N: Name> Resolver<'a, N> {
         sink: &mut Sink<'a, N>,
     ) -> Res {
         sink.stats.lookups += 1;
-        sink.touch(self.module, Some(name));
+        sink.touch(Key::Name(self.module, name));
+        if let Some(r) = self.own_lookup(ns, name, q) {
+            if matches!(r, Res::Undet { .. } | Res::Wait) {
+                self.blame_named(ns, name, q, sink);
+            }
+            return r;
+        }
+        let mark = sink.blame.len();
+        let r = self.globs_res(ns, name, q, env, sink);
+        if matches!(r, Res::Found(_) | Res::None) {
+            sink.blame.truncate(mark);
+        }
+        r
+    }
+
+    /// What this module's own bindings decide of `name` in `ns`: a declaration, else a named
+    /// import, with rustc's determinacy (`None`: nothing of its own, the globs decide).
+    pub(crate) fn own_lookup(&self, ns: Namespace, name: N, q: Query<'_>) -> Option<Res> {
         if let Some(e) = self.defs.get(&(ns, name)) {
-            return Res::Found(e.hit());
+            return Some(Res::Found(e.hit()));
         }
         let mut best: Option<(At, Hit)> = None;
         let mut undet = false;
         let mut wait = false;
         if let Some(list) = self.named.get(&name) {
             for &i in list.iter() {
-                if q.ignore == Some((self.module, i)) {
+                if q.ignore == Some((self.module, Asking::Import(i))) {
                     continue;
                 }
                 let imp = &self.imports[i as usize];
@@ -262,29 +339,42 @@ impl<'a, N: Name> Resolver<'a, N> {
             }
         }
         if let Some((_, hit)) = best {
-            return Res::Found(hit);
+            return Some(Res::Found(hit));
         }
         if wait {
-            return Res::Wait;
+            return Some(Res::Wait);
         }
         if undet {
-            return Res::Undet { weak: false };
+            return Some(Res::Undet { weak: false });
         }
+        None
+    }
+
+    /// What this module's globs decide of `name` in `ns`, by the stall rule's wait relation
+    /// (bottom.md section 6): bound through globs, it waits only on the calls not expanded yet
+    /// (outside the macro namespace), never on a glob; unbound, on the globs still pending
+    /// and the calls. The asking call never waits on itself.
+    fn globs_res(&self, ns: Namespace, name: N, q: Query<'_>, env: Env<'_, 'a, N>, sink: &mut Sink<'a, N>) -> Res {
         let g = self.glob_lookup(ns, name, q, env, sink);
-        let (unexpanded, calls_wait) = self.calls_state();
+        sink.touch(Key::CallsState(self.module));
+        let except = self.asking_call(q.ignore);
+        let (unexpanded, calls_wait) = self.calls_but(except);
         match g.found {
             Some((_, hit)) => {
-                if g.wait {
+                if g.answer {
                     Res::Wait
-                } else if q.restricted || (!g.undet && (ns == Namespace::Macros || !unexpanded)) {
+                } else if q.restricted || ns == Namespace::Macros || !unexpanded {
+                    sink.via_glob = true;
                     Res::Found(hit)
-                } else if calls_wait {
-                    Res::Wait
                 } else {
-                    Res::Undet { weak: false }
+                    sink.blame(Blame::Calls(self.module, except));
+                    if calls_wait { Res::Wait } else { Res::Undet { weak: false } }
                 }
             }
             None => {
+                if unexpanded {
+                    sink.blame(Blame::Calls(self.module, except));
+                }
                 if g.wait || calls_wait {
                     Res::Wait
                 } else if g.undet || unexpanded {
@@ -307,12 +397,17 @@ impl<'a, N: Name> Resolver<'a, N> {
         env: Env<'_, 'a, N>,
         sink: &mut Sink<'a, N>,
     ) -> GlobFound {
-        let mut out = GlobFound { found: None, undet: false, wait: false };
+        let mut out = GlobFound { found: None, undet: false, wait: false, answer: false };
+        sink.touch(Key::Globs(self.module));
         let importer = self.asker();
         for (gi, g) in self.globs.iter().enumerate() {
-            let (def, clamp, classes) = match &g.source {
+            if q.ignore == Some((self.module, Asking::Glob(seg(gi)))) {
+                continue;
+            }
+            let (def, clamp) = match &g.source {
                 Source::Pending => {
                     if g.vis.visible_from(q.asker) {
+                        sink.blame(Blame::Glob(self.module, seg(gi)));
                         if g.blocked {
                             out.wait = true;
                         } else {
@@ -323,52 +418,44 @@ impl<'a, N: Name> Resolver<'a, N> {
                     continue;
                 }
                 Source::Itself | Source::Failed(..) => continue,
-                Source::Resolved { def, clamp, classes } => (*def, *clamp, classes),
+                Source::Resolved { def, clamp } => (*def, *clamp),
             };
-            let cand = if let Some(f) = env.index(def.key) {
-                if def.key == self.module {
-                    None
-                } else {
-                    match self.fellow_res(f, ns, name, q.ignore, env, sink) {
-                        Res::Found(hit) if hit.vis.visible_from(importer) => Some((hit.def, hit.vis, hit.state)),
-                        Res::Found(_) | Res::None => None,
-                        Res::Undet { .. } => {
-                            out.undet = true;
-                            self.note_undet(gi, sink);
-                            None
-                        }
-                        Res::Wait => {
-                            out.wait = true;
-                            None
-                        }
-                    }
-                }
+            let cand = if def.key == self.module {
+                None
             } else {
-                let mut found = None;
-                for &class in classes.iter() {
-                    match self.cached(Read::Exports { module: def.key, class }, sink) {
-                        Some(Cached::Exports { entries, .. }) => {
-                            if let Ok(at) = entries.binary_search_by(|e| (e.ns, e.name).cmp(&(ns, name))) {
-                                let e = entries[at];
-                                if e.vis.visible_from(importer) {
-                                    found = Some((e.def, e.vis, e.state));
-                                }
-                            }
-                        }
-                        Some(Cached::Name(_) | Cached::Textual { .. } | Cached::Helpers { .. } | Cached::InProgress)
-                        | None => {
-                            out.wait = true;
-                        }
+                #[cfg(test)]
+                let was = core::mem::replace(&mut sink.probing, true);
+                let mut sources = Live { at: self, ns, name, ignore: q.ignore, env, sink: &mut *sink, pend: None };
+                let walked = through(&mut sources, def, self.alloc.clone());
+                let walked = sources.settle(walked);
+                #[cfg(test)]
+                {
+                    sink.probing = was;
+                }
+                match walked {
+                    Ok(Some(p)) if p.vis.visible_from(importer) => Some((p.def, p.vis, p.state)),
+                    Ok(_) => None,
+                    Err(Through::Stop(Stop::Undet)) => {
+                        out.undet = true;
+                        self.note_undet(gi, sink);
+                        None
+                    }
+                    Err(Through::Stop(Stop::Wait)) => {
+                        out.wait = true;
+                        None
+                    }
+                    Err(Through::Stop(Stop::Answer)) => {
+                        out.wait = true;
+                        out.answer = true;
+                        None
+                    }
+                    Err(Through::Unbounded) => {
+                        sink.broke(GlobBug::ThroughUnbounded);
+                        None
                     }
                 }
-                found
             };
             let Some((d, vis, state)) = cand else { continue };
-            if state == BindingState::Undetermined {
-                out.undet = true;
-                self.note_undet(gi, sink);
-                continue;
-            }
             let mut vis = Visibility::narrower(g.vis, vis, importer);
             if let Some(c) = clamp {
                 vis = Visibility::narrower(vis, c, importer);
@@ -418,67 +505,66 @@ impl<'a, N: Name> Resolver<'a, N> {
         }
     }
 
-    /// What fellow `f` binds `name` in `ns` to, as this module sees it through a glob: the
-    /// group's least fixpoint for the name, computed once per pass (each member's value from
-    /// the others' last values, from none, until nothing changes), so a cycle of globs binds
-    /// what is bound somewhere on it and nothing more, in time polynomial in the group.
-    fn fellow_res(
+    /// Member `f` of this module's group as a source of a walk through globs, by its CURRENT
+    /// facts (docs/v2/plan/design/bottom.md section 6, "one walk"): its own binding if it has
+    /// one, else its resolved glob edges, the walk's least fixpoint joining them with every
+    /// other source, member or finished record alike. A member's facts only grow while it is
+    /// solved (a binding is added, never taken back), so the walk is monotone. What may still
+    /// add a binding that shadows its globs (a named import, a glob or a call not decided yet,
+    /// that the asker could see) stops the walk: `Wait` while an answer is outstanding,
+    /// `Undet` otherwise, rustc's determinacy. Every fact read is touched, so a change to it
+    /// wakes the item that read it.
+    fn member_node<'e>(
         &self,
-        f: usize,
+        f: &'e Resolver<'a, N>,
         ns: Namespace,
         name: N,
-        ignore: Option<(ItemKey, u32)>,
-        env: Env<'_, 'a, N>,
+        ignore: Option<(ItemKey, Asking)>,
+        pend: &mut Option<Stop>,
         sink: &mut Sink<'a, N>,
-    ) -> Res {
-        let Some(me) = env.index(self.module) else {
-            // Only a member looks up through a fellow: a machine's own bug, stopped on.
-            sink.overrun = true;
-            return Res::Wait;
-        };
-        // The ignored import matters only where it binds this name, in a module whose bindings
-        // the fixpoint reads: otherwise the fixpoint is the one with no import ignored, shared.
-        let ignore = ignore.filter(|&(m, i)| {
-            env.fellow(m).is_none_or(|r| r.imports.get(i as usize).is_none_or(|imp| imp.bound == Some(name)))
-        });
-        let at = |sink: &Sink<'a, N>, key| {
-            sink.memo.get(&key).and_then(|memo: &Memo<'a, N>| {
-                let t = &memo.table;
-                t.binary_search_by(|&(tf, ti, _)| (tf, ti).cmp(&(f, me))).ok().map(|k| t[k].2)
-            })
-        };
-        let mut key = (ns, name, ignore);
-        let mut found = at(sink, key);
-        if found.is_none() {
-            let edges = glob_closure(me, env, self.alloc);
-            if let Some((m, _)) = ignore {
-                let read = env.index(m).is_some_and(|mi| edges.iter().any(|&(x, _)| x == mi));
-                if !read {
-                    key = (ns, name, None);
-                    found = at(sink, key);
-                }
+    ) -> Result<Node<'e>, Stop> {
+        sink.touch(Key::Name(f.module, name));
+        let q = Query { asker: self.asker(), restricted: false, ignore };
+        match f.own_lookup(ns, name, q) {
+            Some(Res::Found(hit)) => return Ok(Node::Value(Some(Passed { def: hit.def, vis: hit.vis, state: hit.state }))),
+            Some(Res::None) => return Ok(Node::Value(None)),
+            Some(Res::Wait) => {
+                f.blame_named(ns, name, q, sink);
+                return Err(Stop::Wait);
             }
-            if found.is_none() {
-                group_fixpoint(key, &edges, env, sink, self.alloc);
-                found = at(sink, key);
+            Some(Res::Undet { .. }) => {
+                f.blame_named(ns, name, q, sink);
+                return Err(Stop::Undet);
+            }
+            None => {}
+        }
+        sink.touch(Key::Globs(f.module));
+        sink.touch(Key::CallsState(f.module));
+        // A call not expanded yet may add a binding: the source is open (no value, no edges);
+        // in the macro namespace a macro found through globs is taken (a call's own path must
+        // not wait on the calls).
+        let except = f.asking_call(ignore);
+        let (unexpanded, calls_wait) = f.calls_but(except);
+        if unexpanded && ns != Namespace::Macros {
+            sink.blame(Blame::Calls(f.module, except));
+            return Err(if calls_wait { Stop::Wait } else { Stop::Undet });
+        }
+        // Its globs still pending leave the walk undecided only if it finds nothing: its
+        // decided edges are followed.
+        for (gi, g) in f.globs.iter().enumerate() {
+            if ignore == Some((f.module, Asking::Glob(seg(gi)))) {
+                continue;
+            }
+            if matches!(g.source, Source::Pending) && g.vis.visible_from(q.asker) {
+                sink.blame(Blame::Glob(f.module, seg(gi)));
+                *pend = join(*pend, if g.blocked { Stop::Wait } else { Stop::Undet });
             }
         }
-        // A fixpoint being computed keeps what it reads itself; any other is replayed into the
-        // record of the item being planned.
-        if sink.scan == Scan::Early && !sink.computing.contains(&key) {
-            let Sink { memo, touched, unsettled, .. } = sink;
-            if let Some(memo) = memo.get(&key) {
-                touched.extend_from_slice(&memo.keys);
-                *unsettled |= memo.unsettled;
-            }
-        }
-        match found {
-            Some(r) => r,
-            None => {
-                sink.overrun = true;
-                Res::Wait
-            }
-        }
+        let edges: &'e [GlobEdge] = f.edges();
+        sink.stats.member_nodes += 1;
+        sink.stats.member_edge_bytes += core::mem::size_of_val(edges) as u64;
+        let asker = f.asker();
+        Ok(Node::Edges { edges, krate: asker.krate, chain: asker.chain })
     }
 
     /// The binding of `name` in `ns` of the module or enum `def`, from this module.
@@ -487,7 +573,7 @@ impl<'a, N: Name> Resolver<'a, N> {
         def: Def,
         ns: Namespace,
         name: N,
-        ignore: Option<(ItemKey, u32)>,
+        ignore: Option<(ItemKey, Asking)>,
         env: Env<'_, 'a, N>,
         sink: &mut Sink<'a, N>,
     ) -> Res {
@@ -506,7 +592,7 @@ impl<'a, N: Name> Resolver<'a, N> {
                 other => other,
             };
         }
-        self.read_name(def.key, ns, name, Layer::Path, sink)
+        self.read_name(def, ns, name, Layer::Path, ignore, env, sink)
     }
 
     /// The binding of `name` in `ns` of `module` as a lexical layer (the standard prelude, a
@@ -515,7 +601,7 @@ impl<'a, N: Name> Resolver<'a, N> {
     /// member is never asked for: its answer would be `InProgress` for good.
     fn layer_name(&self, module: ItemKey, ns: Namespace, name: N, layer: Layer, env: Env<'_, 'a, N>, sink: &mut Sink<'a, N>) -> Res {
         let live = if module == self.module { Some(self) } else { env.fellow(module) };
-        let Some(f) = live else { return self.read_name(module, ns, name, layer, sink) };
+        let Some(f) = live else { return self.read_name(Def::module(module), ns, name, layer, None, env, sink) };
         let q = Query { asker: self.asker(), restricted: false, ignore: None };
         match f.lookup_module(ns, name, q, env, sink) {
             Res::Found(hit) => Res::Found(Hit { origin: Origin::Prelude, expansion: 0, frag: None, layer, ..hit }),
@@ -523,27 +609,39 @@ impl<'a, N: Name> Resolver<'a, N> {
         }
     }
 
-    /// A `Name` read of another module.
-    fn read_name(&self, module: ItemKey, ns: Namespace, name: N, layer: Layer, sink: &mut Sink<'a, N>) -> Res {
-        match self.cached(Read::Name { module, ns, name }, sink) {
-            Some(Cached::Name(NameAnswer::Absent)) => Res::None,
-            Some(Cached::Name(NameAnswer::Found { def, vis, state })) => {
-                if *state == BindingState::Undetermined {
-                    Res::Undet { weak: false }
-                } else {
-                    Res::Found(Hit {
-                        def: *def,
-                        vis: *vis,
-                        origin: Origin::Prelude,
-                        expansion: 0,
-                        frag: None,
-                        state: *state,
-                        layer,
-                    })
-                }
+    /// `name` in `ns` of another module or an enum, `def`, by its records: its own binding by
+    /// a `Name` read, else through its glob edges. `ignore` (the import being resolved) is
+    /// passed on: a walk that comes back to this module through another's globs must not be
+    /// held up by the import it is resolving.
+    fn read_name(
+        &self,
+        def: Def,
+        ns: Namespace,
+        name: N,
+        layer: Layer,
+        ignore: Option<(ItemKey, Asking)>,
+        env: Env<'_, 'a, N>,
+        sink: &mut Sink<'a, N>,
+    ) -> Res {
+        let mut sources = Live { at: self, ns, name, ignore, env, sink: &mut *sink, pend: None };
+        let walked = through(&mut sources, def, self.alloc.clone());
+        match sources.settle(walked) {
+            Ok(None) => Res::None,
+            Ok(Some(p)) => Res::Found(Hit {
+                def: p.def,
+                vis: p.vis,
+                origin: Origin::Prelude,
+                expansion: 0,
+                frag: None,
+                state: p.state,
+                layer,
+            }),
+            Err(Through::Stop(Stop::Undet)) => Res::Undet { weak: false },
+            Err(Through::Stop(Stop::Wait | Stop::Answer)) => Res::Wait,
+            Err(Through::Unbounded) => {
+                sink.broke(GlobBug::ThroughUnbounded);
+                Res::Wait
             }
-            Some(Cached::Exports { .. } | Cached::Textual { .. } | Cached::Helpers { .. } | Cached::InProgress)
-            | None => Res::Wait,
         }
     }
 
@@ -560,6 +658,65 @@ impl<'a, N: Name> Resolver<'a, N> {
         })
     }
 
+    /// `name` in the extern prelude (the Reference, "Extern prelude"; "Extern crate
+    /// declarations"): the crate's dependencies, then an `extern crate` item of the crate ROOT,
+    /// also one a macro's expansion wrote (libc's root `cfg_if! { extern crate
+    /// rustc_std_workspace_core as core; }`). So the extern prelude is not fixed before
+    /// expansion: while the root is solved in this group (itself or a fellow) and has calls not
+    /// expanded, a miss waits on those calls as a module lookup does. Only the root's own
+    /// `extern crate` entries count (never a `use .. as name`, never a glob), and a pending
+    /// import or glob of the root is not waited on: neither can add to the extern prelude. A
+    /// root solved outside this group is read by a `Name` read of the root: a binding whose
+    /// origin is `extern crate` is in the extern prelude (the crate's other modules, libc's
+    /// `unix`, reach the root's macro-written `core` this way).
+    /// The miss is a WEAK undeterminacy (rustc's `Determinacy::determined(unexpanded
+    /// invocations of the root are none)`): a lexical lookup goes on outward, so `Option`
+    /// still comes from the standard prelude. The asking call is not waited on (a derive of
+    /// the root asking for `::core` must not wait on itself).
+    fn extern_prelude_res(&self, name: N, ignore: Option<(ItemKey, Asking)>, env: Env<'_, 'a, N>, sink: &mut Sink<'a, N>) -> Res {
+        if let Some(hit) = self.extern_prelude_hit(name) {
+            return Res::Found(hit);
+        }
+        let live = if self.root == self.module { Some(self) } else { env.fellow(self.root) };
+        let Some(root) = live else {
+            return match self.cached(Read::Name { module: self.root, ns: Namespace::Types, name }, sink) {
+                Some(Cached::Name(NameAnswer::Found { def, origin: Origin::ExternCrate, .. })) => Res::Found(Hit {
+                    def: *def,
+                    vis: Visibility::Public,
+                    origin: Origin::Prelude,
+                    expansion: 0,
+                    frag: None,
+                    state: BindingState::Determined,
+                    layer: Layer::ExternPrelude,
+                }),
+                Some(Cached::Name(_)) => Res::None,
+                Some(Cached::Globs { .. } | Cached::Textual { .. } | Cached::Helpers { .. } | Cached::InProgress(_)) | None => Res::Wait,
+            };
+        };
+        sink.touch(Key::Name(root.module, name));
+        if let Some(e) = root.defs.get(&(Namespace::Types, name)) {
+            if e.origin == Origin::ExternCrate {
+                return Res::Found(Hit {
+                    def: e.def,
+                    vis: Visibility::Public,
+                    origin: Origin::Prelude,
+                    expansion: e.expansion,
+                    frag: None,
+                    state: BindingState::Determined,
+                    layer: Layer::ExternPrelude,
+                });
+            }
+        }
+        sink.touch(Key::CallsState(root.module));
+        let except = root.asking_call(ignore);
+        let (unexpanded, _) = root.calls_but(except);
+        if !unexpanded {
+            return Res::None;
+        }
+        sink.blame(Blame::Calls(root.module, except));
+        Res::Undet { weak: true }
+    }
+
     /// The module a path that does not begin with a name begins at.
     pub(crate) fn start_module(&self, path: &Path<'_, N>) -> Result<Hit, (u32, Unresolved)> {
         match path.kind {
@@ -569,16 +726,11 @@ impl<'a, N: Name> Resolver<'a, N> {
                 Some(&m) => Ok(Hit::module(m)),
                 None => Err((0, Unresolved::NoParent)),
             },
-            PathKind::DollarCrate(k) => {
-                if k == self.krate {
-                    Ok(Hit::module(self.root))
-                } else {
-                    match self.deps.iter().find(|d| d.krate == k) {
-                        Some(d) => Ok(Hit::module(d.root)),
-                        None => Err((0, Unresolved::NoCrate)),
-                    }
-                }
-            }
+            // `$crate` names the crate that defines the macro, wherever the call is (the
+            // Reference, "Macros By Example", "Hygiene"), also one the caller has no extern name
+            // for (fluent-bundle: `a`'s macro re-exported by `b`, called in `c`). That crate is in
+            // the caller's dependency cone, and every crate root's key is `root_key(krate)`.
+            PathKind::DollarCrate(k) => Ok(Hit::module(if k == self.krate { self.root } else { crate::task::root_key(k) })),
             PathKind::Plain | PathKind::Abs => Err((0, Unresolved::NotFound)),
         }
     }
@@ -591,7 +743,7 @@ impl<'a, N: Name> Resolver<'a, N> {
         ns: Namespace,
         name: N,
         at: At,
-        ignore: Option<(ItemKey, u32)>,
+        ignore: Option<(ItemKey, Asking)>,
         env: Env<'_, 'a, N>,
         sink: &mut Sink<'a, N>,
     ) -> Res {
@@ -601,8 +753,11 @@ impl<'a, N: Name> Resolver<'a, N> {
             return self.lookup_in(Def::module(self.root), ns, name, ignore, env, sink);
         }
         if kind == PathKind::Abs {
-            return match (ns, self.extern_prelude_hit(name)) {
-                (Namespace::Types, Some(hit)) => Res::Found(hit),
+            return match ns {
+                Namespace::Types => match self.extern_prelude_res(name, ignore, env, sink) {
+                    Res::Undet { .. } => Res::Undet { weak: false },
+                    r => r,
+                },
                 _ => Res::None,
             };
         }
@@ -618,6 +773,15 @@ impl<'a, N: Name> Resolver<'a, N> {
     /// and a weak undeterminacy goes on outward; in the final pass the outer layers are read
     /// too where they could make the innermost ambiguous, and the ambiguity goes to the sink.
     pub(crate) fn lexical(&self, lq: LexQuery<N>, env: Env<'_, 'a, N>, sink: &mut Sink<'a, N>) -> Res {
+        let mark = sink.blame.len();
+        let r = self.lexical_layers(lq, env, sink);
+        if matches!(r, Res::Found(_) | Res::None) {
+            sink.blame.truncate(mark);
+        }
+        r
+    }
+
+    fn lexical_layers(&self, lq: LexQuery<N>, env: Env<'_, 'a, N>, sink: &mut Sink<'a, N>) -> Res {
         let mut inner: Option<Hit> = None;
         let mut undet = false;
         if lq.textual && lq.ns == Namespace::Macros {
@@ -651,7 +815,7 @@ impl<'a, N: Name> Resolver<'a, N> {
         }
         if self.implicit_prelude {
             if lq.ns == Namespace::Types {
-                let r = self.extern_prelude_hit(lq.name).map_or(Res::None, Res::Found);
+                let r = self.extern_prelude_res(lq.name, lq.ignore, env, sink);
                 if let Some(stop) = self.layer(r, &lq, &mut inner, &mut undet, sink) {
                     return stop;
                 }
@@ -679,7 +843,7 @@ impl<'a, N: Name> Resolver<'a, N> {
             }
         }
         if lq.ns == Namespace::Types {
-            if let Some(def) = crate::builtin_type(lq.name.as_ref()) {
+            if let Some(def) = crate::builtin_type_in(lq.name.as_ref(), self.arbitrary_ints) {
                 let hit = Hit {
                     def,
                     vis: Visibility::Public,
@@ -704,7 +868,7 @@ impl<'a, N: Name> Resolver<'a, N> {
     fn kind_ok(&self, hit: &Hit, want: Option<CallShape>) -> bool {
         match want {
             None => true,
-            Some(k) => hit.def.kind == DefKind::Macro(k),
+            Some(k) => matches!(hit.def.kind, DefKind::Macro(s) if s.accepts(k)),
         }
     }
 
@@ -786,13 +950,14 @@ impl<'a, N: Name> Resolver<'a, N> {
     /// expanded calls and `#[macro_use]` children, out through the call a fragment expands,
     /// then the module's entry.
     fn textual(&self, name: N, at: At, env: Env<'_, 'a, N>, sink: &mut Sink<'a, N>) -> Res {
-        sink.touch(self.module, None);
         let mut frag = at.frag;
         let mut end = at.slot as usize;
         loop {
             match self.textual_back(name, frag, end, env, sink) {
                 Tex::Hit(hit) => return Res::Found(hit),
-                Tex::Undet => return Res::Undet { weak: true },
+                // A call before it not expanded yet may still define the name: the call waits
+                // on it (the stall rule's textual read), and no outer layer decides meanwhile.
+                Tex::Undet => return Res::Undet { weak: false },
                 Tex::Wait => return Res::Wait,
                 Tex::Start => {}
             }
@@ -811,8 +976,8 @@ impl<'a, N: Name> Resolver<'a, N> {
         let f = &self.frags[frag as usize];
         for s in (0..end).rev() {
             match f.slots[s] {
-                Slot::Rules { name: n, def, export } if n == name => {
-                    let hit = self.textual_hit(&TextualDef { name: n, def, expansion: f.expansion });
+                Slot::Rules { name: n, def, export, shapes } if n == name => {
+                    let hit = self.textual_hit(&TextualDef { name: n, def, expansion: f.expansion, shapes });
                     // rustc's `define_macro`: a `#[macro_export]` macro's textual binding is
                     // public, so `pub use m;` beside it re-exports it (core's `ub_checks`).
                     let vis = if export { Visibility::Public } else { hit.vis };
@@ -820,15 +985,26 @@ impl<'a, N: Name> Resolver<'a, N> {
                 }
                 Slot::Call(i) => {
                     let call = &self.calls[i as usize];
+                    if call.state.unexpanded() {
+                        sink.touch(Key::Call(self.module, i));
+                    }
                     match call.state {
                         CallState::Expanded { frag: inner, .. } => {
-                            let len = self.frags[inner as usize].slots.len();
+                            let fr = &self.frags[inner as usize];
+                            // Nothing in it defines a name of the textual scope or waits.
+                            if !fr.textual && fr.open == 0 {
+                                continue;
+                            }
+                            let len = fr.slots.len();
                             match self.textual_back(name, inner, len, env, sink) {
                                 Tex::Start => {}
                                 other => return other,
                             }
                         }
-                        CallState::Pending => return if call.blocked { Tex::Wait } else { Tex::Undet },
+                        CallState::Pending => {
+                            sink.blame(Blame::Call(self.module, i));
+                            return if call.blocked { Tex::Wait } else { Tex::Undet };
+                        }
                         CallState::Resolved(_) => return Tex::Undet,
                         CallState::Inert | CallState::Failed(..) | CallState::TooDeep => {}
                     }
@@ -850,7 +1026,7 @@ impl<'a, N: Name> Resolver<'a, N> {
     /// from another module stays crate-wide.
     fn textual_hit(&self, d: &TextualDef<N>) -> Hit {
         Hit {
-            def: Def { key: d.def, kind: DefKind::Macro(CallShape::FnLike) },
+            def: Def { key: d.def, kind: DefKind::Macro(d.shapes) },
             vis: Visibility::Crate(self.krate),
             origin: Origin::Declared,
             expansion: d.expansion,
@@ -864,7 +1040,6 @@ impl<'a, N: Name> Resolver<'a, N> {
     fn textual_out(&self, name: N, child: ItemKey, env: Env<'_, 'a, N>, sink: &mut Sink<'a, N>) -> Tex {
         if child != self.module {
             if let Some(f) = env.fellow(child) {
-                sink.touch(child, None);
                 let len = f.frags[0].slots.len();
                 return match f.textual_back(name, 0, len, env, sink) {
                     Tex::Hit(hit) => {
@@ -881,39 +1056,48 @@ impl<'a, N: Name> Resolver<'a, N> {
                 Some(d) => Tex::Hit(self.textual_hit(d)),
                 None => Tex::Start,
             },
-            Some(Cached::Name(_) | Cached::Exports { .. } | Cached::Helpers { .. } | Cached::InProgress) | None => {
+            Some(Cached::Name(_) | Cached::Globs { .. } | Cached::Helpers { .. } | Cached::InProgress(_)) | None => {
                 Tex::Wait
             }
         }
     }
 
-    /// The `macro_rules!` visible at this module's `mod` line.
+    /// The `macro_rules!` visible at this module's `mod` line: up the chain of modules, at each
+    /// level the parent's own definitions before the child's `mod` line (one `TextualEntry`
+    /// read of the child, which waits on that parent only), innermost first; at the first
+    /// ancestor of this group, its live textual scope at that line (which goes on up itself).
+    /// Every read names the one module it waits on, so no read of a finished parent can wait
+    /// on a member above it (std's `MemberUnfinished`, bottom.md section 6, scope lead 19).
     fn textual_entry(&self, name: N, env: Env<'_, 'a, N>, sink: &mut Sink<'a, N>) -> Res {
-        let Some(&parent) = self.chain.get(1) else { return Res::None };
-        if let Some(p) = env.fellow(parent) {
-            sink.touch(parent, None);
-            return match p.find_mod(self.module) {
-                Some(at) => match p.textual(name, at, env, sink) {
-                    Res::Found(hit) => {
-                        let mut hit = hit;
-                        hit.frag = None;
-                        Res::Found(hit)
+        for k in 1..self.chain.len() {
+            let (parent, child) = (self.chain[k], self.chain[k - 1]);
+            if let Some(p) = env.fellow(parent) {
+                sink.touch(Key::Frags(parent));
+                return match p.find_mod(child) {
+                    Some(at) => match p.textual(name, at, env, sink) {
+                        Res::Found(hit) => {
+                            let mut hit = hit;
+                            hit.frag = None;
+                            Res::Found(hit)
+                        }
+                        other => other,
+                    },
+                    // The line is in an expansion still to come.
+                    None => Res::Undet { weak: true },
+                };
+            }
+            match self.cached(Read::TextualEntry { module: child }, sink) {
+                Some(Cached::Textual { defs, .. }) => {
+                    if let Some(d) = defs.iter().rev().find(|d| d.name == name) {
+                        return Res::Found(self.textual_hit(d));
                     }
-                    other => other,
-                },
-                // The line is in an expansion still to come.
-                None => Res::Undet { weak: true },
-            };
-        }
-        match self.cached(Read::TextualEntry { module: self.module }, sink) {
-            Some(Cached::Textual { defs, .. }) => match defs.iter().rev().find(|d| d.name == name) {
-                Some(d) => Res::Found(self.textual_hit(d)),
-                None => Res::None,
-            },
-            Some(Cached::Name(_) | Cached::Exports { .. } | Cached::Helpers { .. } | Cached::InProgress) | None => {
-                Res::Wait
+                }
+                Some(Cached::Name(_) | Cached::Globs { .. } | Cached::Helpers { .. } | Cached::InProgress(_)) | None => {
+                    return Res::Wait;
+                }
             }
         }
+        Res::None
     }
 
     /// Where the `mod child` line is.
@@ -937,11 +1121,10 @@ impl<'a, N: Name> Resolver<'a, N> {
         upto: usize,
         used: PathUse,
         at: At,
-        ignore: Option<(ItemKey, u32)>,
+        ignore: Option<(ItemKey, Asking)>,
         env: Env<'_, 'a, N>,
         sink: &mut Sink<'a, N>,
     ) -> Prefix {
-        let force = sink.scan == Scan::Force;
         let segs = &path.segments;
         let (mut cur, mut i, first) = match path.kind {
             PathKind::Plain | PathKind::Abs => {
@@ -954,13 +1137,7 @@ impl<'a, N: Name> Resolver<'a, N> {
                         (hit, 1, Some(hit.def))
                     }
                     Res::None => return Prefix::Fail(0, Unresolved::NotFound),
-                    Res::Undet { weak } => {
-                        return if force {
-                            Prefix::Fail(0, if weak { Unresolved::NotFound } else { Unresolved::Undetermined })
-                        } else {
-                            Prefix::Undet
-                        };
-                    }
+                    Res::Undet { .. } => return Prefix::Undet,
                     Res::Wait => return Prefix::Wait,
                 }
             }
@@ -980,10 +1157,6 @@ impl<'a, N: Name> Resolver<'a, N> {
                 Res::Found(hit) => {
                     match hit.state {
                         BindingState::Ambiguous(k) => return Prefix::Fail(s, Unresolved::Ambiguous(k)),
-                        BindingState::Undetermined => {
-                            // Forced, nothing more will decide it: the path fails here.
-                            return if force { Prefix::Fail(s, Unresolved::Undetermined) } else { Prefix::Undet };
-                        }
                         BindingState::Determined => {}
                     }
                     if !hit.vis.visible_from(self.asker()) {
@@ -992,9 +1165,7 @@ impl<'a, N: Name> Resolver<'a, N> {
                     cur = hit;
                 }
                 Res::None => return Prefix::Fail(s, Unresolved::NotFound),
-                Res::Undet { .. } => {
-                    return if force { Prefix::Fail(s, Unresolved::Undetermined) } else { Prefix::Undet };
-                }
+                Res::Undet { .. } => return Prefix::Undet,
                 Res::Wait => return Prefix::Wait,
             }
             i += 1;
@@ -1010,7 +1181,6 @@ impl<'a, N: Name> Resolver<'a, N> {
                     out.failed = Some((last, Unresolved::Ambiguous(k)));
                     NsRes::Absent
                 }
-                BindingState::Undetermined => NsRes::Pending,
                 BindingState::Determined => {
                     if hit.vis.visible_from(self.asker()) { NsRes::Found(hit) } else { NsRes::Private(hit) }
                 }
@@ -1027,7 +1197,7 @@ impl<'a, N: Name> Resolver<'a, N> {
     /// Import `i` resolved from the state as it is, every namespace from scratch.
     pub(crate) fn resolve_import(&self, i: usize, env: Env<'_, 'a, N>, sink: &mut Sink<'a, N>) -> ImportOutcome {
         let imp = &self.imports[i];
-        let ignore = Some((self.module, seg(i)));
+        let ignore = Some((self.module, Asking::Import(seg(i))));
         let mut out = ImportOutcome { ns: [NsRes::Pending; 3], failed: None, first: None, wait: false };
         for ns in Namespace::ALL {
             if !imp.imports(ns) {
@@ -1081,36 +1251,6 @@ impl<'a, N: Name> Resolver<'a, N> {
         out
     }
 
-    /// The visibility classes of `target` this module can see: what a glob of it reads.
-    fn classes_for<F: ScopeFacts<Name = N>>(
-        &self,
-        target: ItemKey,
-        facts: &F,
-    ) -> Result<AVec<'a, VisibilityClass>, ResolveError> {
-        let mut classes = Vec::new_in(self.alloc.clone());
-        classes.push(VisibilityClass::Public);
-        if !target.is_of(self.krate) {
-            return Ok(classes);
-        }
-        classes.push(VisibilityClass::Crate);
-        let mut cur = Some(target);
-        let mut steps = 0usize;
-        while let Some(m) = cur {
-            if m == self.root {
-                break;
-            }
-            if self.chain.contains(&m) {
-                classes.push(VisibilityClass::Restricted(m));
-            }
-            steps += 1;
-            if steps > MAX_MODULE_DEPTH {
-                return Err(ResolveError::ModuleTooDeep { module: target });
-            }
-            cur = facts.module(m).map_err(|error| ResolveError::Surface { module: self.module, error })?.parent;
-        }
-        Ok(classes)
-    }
-
     /// Glob `g`'s source resolved from the state as it is.
     pub(crate) fn resolve_glob<F: ScopeFacts<Name = N>>(
         &self,
@@ -1118,7 +1258,7 @@ impl<'a, N: Name> Resolver<'a, N> {
         facts: &F,
         env: Env<'_, 'a, N>,
         sink: &mut Sink<'a, N>,
-    ) -> Result<GlobOutcome<'a>, ResolveError> {
+    ) -> Result<GlobOutcome, ResolveError> {
         let glob = &self.globs[g];
         let n = glob.path.segments.len();
         let pre = if n == 0 {
@@ -1127,7 +1267,7 @@ impl<'a, N: Name> Resolver<'a, N> {
                 Err((s, why)) => Prefix::Fail(s, why),
             }
         } else {
-            self.resolve_prefix(&glob.path, n, PathUse::Import, glob.at, None, env, sink)
+            self.resolve_prefix(&glob.path, n, PathUse::Import, glob.at, Some((self.module, Asking::Glob(seg(g)))), env, sink)
         };
         Ok(match pre {
             Prefix::Found { hit, first } => {
@@ -1136,11 +1276,9 @@ impl<'a, N: Name> Resolver<'a, N> {
                 } else if hit.def.key == self.module {
                     Source::Itself
                 } else if hit.def.kind == DefKind::Enum {
-                    let mut classes = Vec::new_in(self.alloc.clone());
-                    classes.push(VisibilityClass::Public);
-                    Source::Resolved { def: hit.def, clamp: Some(hit.vis), classes }
+                    Source::Resolved { def: hit.def, clamp: Some(hit.vis) }
                 } else {
-                    Source::Resolved { def: hit.def, clamp: None, classes: self.classes_for(hit.def.key, facts)? }
+                    Source::Resolved { def: hit.def, clamp: None }
                 };
                 GlobOutcome { source: Some(source), first, wait: false }
             }
@@ -1150,10 +1288,10 @@ impl<'a, N: Name> Resolver<'a, N> {
         })
     }
 
-    /// Call `c`'s path resolved from the state as it is; forced in a `Force` pass.
+    /// Call `c`'s path resolved from the state as it is; it never waits on itself.
     pub(crate) fn resolve_call(&self, c: usize, env: Env<'_, 'a, N>, sink: &mut Sink<'a, N>) -> CallOutcome {
         let call = &self.calls[c];
-        let force = sink.scan == Scan::Force;
+        let ignore = Some((self.module, Asking::Call(seg(c))));
         let segs = &call.path.segments;
         let n = segs.len();
         let fail = |s: u32, why: Unresolved| CallOutcome { state: Some(CallState::Failed(s, why)), first: None, wait: false };
@@ -1179,7 +1317,7 @@ impl<'a, N: Name> Resolver<'a, N> {
         if one_attr {
             // rustc's innermost scope for an attribute: the helpers of the derives before it
             // on its item.
-            match self.derive_helper(c, segs[0], force, sink) {
+            match self.derive_helper(c, segs[0], sink) {
                 Helper::Is => return inert,
                 Helper::Wait => return wait,
                 Helper::Undet => return stay,
@@ -1187,9 +1325,6 @@ impl<'a, N: Name> Resolver<'a, N> {
             }
         }
         let last = seg(n - 1);
-        let undetermined = |weak: bool| {
-            if force { fail(last, if weak { Unresolved::NotFound } else { Unresolved::Undetermined }) } else { stay }
-        };
         let (r, first) = if single {
             let lq = LexQuery {
                 ns: Namespace::Macros,
@@ -1197,16 +1332,16 @@ impl<'a, N: Name> Resolver<'a, N> {
                 at: call.at,
                 want: Some(call.kind),
                 textual: call.kind == CallShape::FnLike,
-                ignore: None,
+                ignore,
             };
             (self.lexical(lq, env, sink), None)
         } else {
-            match self.resolve_prefix(&call.path, n - 1, PathUse::Macro, call.at, None, env, sink) {
+            match self.resolve_prefix(&call.path, n - 1, PathUse::Macro, call.at, ignore, env, sink) {
                 Prefix::Found { hit, first } => {
                     if !hit.def.has_scope() {
                         return fail(last, Unresolved::NotAModule);
                     }
-                    (self.lookup_in(hit.def, Namespace::Macros, segs[n - 1], None, env, sink), first)
+                    (self.lookup_in(hit.def, Namespace::Macros, segs[n - 1], ignore, env, sink), first)
                 }
                 Prefix::Fail(s, why) => return fail(s, why),
                 Prefix::Undet => return stay,
@@ -1224,16 +1359,13 @@ impl<'a, N: Name> Resolver<'a, N> {
                     fail(last, Unresolved::Ambiguous(AmbiguityKind::BuiltinAttr))
                 }
                 Res::Found(_) | Res::None => inert,
-                Res::Undet { .. } => {
-                    if force { inert } else { stay }
-                }
+                Res::Undet { .. } => stay,
                 Res::Wait => wait,
             };
         }
         match r {
             Res::Found(hit) => match hit.state {
                 BindingState::Ambiguous(k) => fail(last, Unresolved::Ambiguous(k)),
-                BindingState::Undetermined => undetermined(false),
                 BindingState::Determined => {
                     if !single && !hit.vis.visible_from(self.asker()) {
                         fail(last, Unresolved::Private)
@@ -1249,24 +1381,27 @@ impl<'a, N: Name> Resolver<'a, N> {
                 }
             },
             Res::None => fail(last, Unresolved::NotFound),
-            Res::Undet { weak } => undetermined(weak),
+            Res::Undet { .. } => stay,
             Res::Wait => wait,
         }
     }
 
     /// Whether `name` is a helper attribute of a derive written before call `c` on its item.
-    fn derive_helper(&self, c: usize, name: N, force: bool, sink: &mut Sink<'a, N>) -> Helper {
+    fn derive_helper(&self, c: usize, name: N, sink: &mut Sink<'a, N>) -> Helper {
         let call = &self.calls[c];
         let Some(item) = call.item else { return Helper::Not };
         let mut wait = false;
         let mut undet = false;
-        for d in self.calls.iter() {
+        for (di, d) in self.calls.iter().enumerate() {
             if d.kind != CallShape::Derive
                 || d.item != Some(item)
                 || d.at.frag != call.at.frag
                 || d.at.slot >= call.at.slot
             {
                 continue;
+            }
+            if d.state == CallState::Pending {
+                sink.touch(Key::Call(self.module, seg(di)));
             }
             match d.state {
                 CallState::Resolved(def) | CallState::Expanded { def, .. } => {
@@ -1276,12 +1411,13 @@ impl<'a, N: Name> Resolver<'a, N> {
                                 return Helper::Is;
                             }
                         }
-                        Some(Cached::Name(_) | Cached::Exports { .. } | Cached::Textual { .. } | Cached::InProgress)
+                        Some(Cached::Name(_) | Cached::Globs { .. } | Cached::Textual { .. } | Cached::InProgress(_))
                         | None => wait = true,
                     }
                 }
-                // Forced, a derive still pending gives no helper: it fails in the same pass.
-                CallState::Pending if !force => {
+                // A derive still pending may still give the helper: the call waits on it.
+                CallState::Pending => {
+                    sink.blame(Blame::Call(self.module, seg(di)));
                     if d.blocked { wait = true } else { undet = true }
                 }
                 CallState::Pending | CallState::Inert | CallState::Failed(..) | CallState::TooDeep => {}
@@ -1294,154 +1430,5 @@ impl<'a, N: Name> Resolver<'a, N> {
         } else {
             Helper::Not
         }
-    }
-
-    /// Plans one pass: every import, glob and call that can move, from the state as it is (in
-    /// a `Force` pass, only the calls).
-    /// Starts planning one item: it reads its own module's fragments, globs and calls.
-    fn begin_item(&self, sink: &mut Sink<'a, N>) -> Mark {
-        sink.stats.plans += 1;
-        let mark = sink.begin();
-        sink.touch(self.module, None);
-        mark
-    }
-
-    /// Whether item `i` of `kind` is clean: planned early, not sticky, and nothing it read
-    /// changed since. Its last plan's wait, if so.
-    fn clean(&self, kind: Kind, i: usize, env: Env<'_, 'a, N>) -> Option<bool> {
-        let w = crate::watch::watch(&self.stamps, kind, i)?;
-        let epoch = w.epoch?;
-        if w.sticky {
-            return None;
-        }
-        for &(module, name) in w.keys.iter() {
-            let stamps = if module == self.module { &self.stamps } else { &env.fellow(module)?.stamps };
-            if stamps.changed(name, epoch) {
-                return None;
-            }
-        }
-        Some(w.wait)
-    }
-
-    pub(crate) fn plan<F: ScopeFacts<Name = N>>(
-        &self,
-        facts: &F,
-        env: Env<'_, 'a, N>,
-        sink: &mut Sink<'a, N>,
-    ) -> Result<Plan<'a, N>, ResolveError> {
-        let a = self.alloc.clone();
-        let mut plan = Plan {
-            watched: Vec::new_in(a.clone()),
-            imports: Vec::new_in(a.clone()),
-            globs: Vec::new_in(a.clone()),
-            calls: Vec::new_in(a.clone()),
-            waiting: Vec::new_in(a),
-            upto: self.upto(),
-        };
-        let early = sink.scan == Scan::Early;
-        if sink.scan != Scan::Force {
-            for g in 0..self.globs.len() {
-                match &self.globs[g].source {
-                    Source::Pending => {
-                        if early {
-                            if let Some(wait) = self.clean(Kind::Glob, g, env) {
-                                sink.stats.skipped += 1;
-                                if wait {
-                                    plan.waiting.push(Item::Glob(seg(g)));
-                                }
-                                continue;
-                            }
-                        }
-                        let mark = self.begin_item(sink);
-                        let o = self.resolve_glob(g, facts, env, sink)?;
-                        if o.wait {
-                            plan.waiting.push(Item::Glob(seg(g)));
-                        }
-                        let moved = o.source.is_some();
-                        if let Some(source) = o.source {
-                            plan.globs.push((seg(g), source, o.first));
-                        }
-                        if early {
-                            let w = sink.end(mark, self.stamps.clock, o.wait, moved, self.alloc);
-                            plan.watched.push((Kind::Glob, seg(g), w));
-                        }
-                    }
-                    Source::Resolved { def, classes, .. } => {
-                        // A glob's source is read whole once known: its names, and the
-                        // absence of any other, decide the module's glob bindings.
-                        if env.fellow(def.key).is_none() {
-                            for &class in classes.iter() {
-                                let _ = self.cached(Read::Exports { module: def.key, class }, sink);
-                            }
-                        }
-                    }
-                    Source::Itself | Source::Failed(..) => {}
-                }
-            }
-            for i in 0..self.imports.len() {
-                let stored = &self.imports[i];
-                if stored.done() {
-                    continue;
-                }
-                if early {
-                    if let Some(wait) = self.clean(Kind::Import, i, env) {
-                        sink.stats.skipped += 1;
-                        if wait {
-                            plan.waiting.push(Item::Import(seg(i)));
-                        }
-                        continue;
-                    }
-                }
-                let mark = self.begin_item(sink);
-                let o = self.resolve_import(i, env, sink);
-                if o.wait {
-                    plan.waiting.push(Item::Import(seg(i)));
-                }
-                let mut ns = stored.ns;
-                for k in 0..3 {
-                    if ns[k] == NsRes::Pending {
-                        ns[k] = o.ns[k];
-                    }
-                }
-                let failed = stored.failed.or(o.failed);
-                let moved = ns != stored.ns || failed != stored.failed;
-                if moved {
-                    plan.imports.push((seg(i), ns, failed, o.first));
-                }
-                if early {
-                    let w = sink.end(mark, self.stamps.clock, o.wait, moved, self.alloc);
-                    plan.watched.push((Kind::Import, seg(i), w));
-                }
-            }
-        }
-        for c in 0..self.calls.len() {
-            if self.calls[c].state != CallState::Pending {
-                continue;
-            }
-            if early {
-                if let Some(wait) = self.clean(Kind::Call, c, env) {
-                    sink.stats.skipped += 1;
-                    if wait {
-                        plan.waiting.push(Item::Call(seg(c)));
-                    }
-                    continue;
-                }
-            }
-            let mark = self.begin_item(sink);
-            let o = self.resolve_call(c, env, sink);
-            if o.wait {
-                plan.waiting.push(Item::Call(seg(c)));
-            }
-            let moved = o.state.is_some();
-            if let Some(state) = o.state {
-                plan.calls.push((seg(c), state, o.first));
-            }
-            if early {
-                let w = sink.end(mark, self.stamps.clock, o.wait, moved, self.alloc);
-                plan.watched.push((Kind::Call, seg(c), w));
-            }
-        }
-        plan.waiting.sort_unstable();
-        Ok(plan)
     }
 }

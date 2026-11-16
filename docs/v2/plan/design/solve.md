@@ -221,6 +221,34 @@ says `Missing`; `Missing` unwinds the stack (rolling back every snapshot) and th
 Completed, cycle-free subgoals stay in the task cache, so re-entry resumes in effect where it
 stopped. Every read goes through the recorder.
 
+**Goal tasks.** A goal that misses a fact and holds none of the asking body's inference
+variables (after resolving them; parameters and placeholders are fine) has a canonical key by
+(e) that names nothing of the body. It becomes its own job: the body records the goal as a
+need of kind `Goal(key)` instead of the fact the goal stopped on, and stops; the goal task
+evaluates the canonical goal alone, re-entering only itself once per link of a chain of missing
+facts, and writes its response as a record (e). The body re-enters once, when the goal record
+is there, and reads it as a cached result. What blaze-drive needs for a `Goal` kind: a job keyed
+by the canonical words (the record key of (e)), its input the words themselves (no body), its
+own read list and `Need`s scheduled as any job's, its output the response record; a body job
+waits on it as on any record; two bodies asking one goal share one job by key. The solver's
+side: `Facts` is asked with a flag saying whether the current goal stack is ground (the bottom
+goal's canonical input holds no inference variable of the body), and blaze-typeck's ask log
+marks such asks (`ground_goal`) so the measurement under `KindWithGoals` counts them.
+
+**Async: `Send` of a callee's future.** Sending a future across threads raises
+`<F as Send>` on an async fn's return type, an opaque whose hidden type is the callee body's
+generator; proving it needs the callee's checked body (its hidden type and its captures' types)
+and so on down the call chain. These obligations are solved at the end of the asking body,
+where a restart costs the whole body. Once the callee's type is named (`Opaque(def, args)` with
+args free of the body's inference variables, which by the end of the body they are), the goal
+`Opaque(def, args): Send` is ground: it becomes a goal task as above. The task asks
+`Opaque(def)` (a body record) and recurses into the callee's own `Send` goals as further goal
+tasks, each re-entering only itself; auto-trait goals are coinductive, so a recursive call chain
+is a cycle the task's search handles, not a deadlock. The asking body waits once, for the top
+goal's record. The rule that keeps it so: the end sequence registers every such goal before
+selecting, and the solver turns each ground `Opaque` miss into a `Goal` need without
+unwinding the others, so all of a body's async `Send` goals become tasks in one round.
+
 **(g) Nothing shared on the solving path.** Each task has its own arena, pools and task cache;
 the shared record cache is immutable while tasks run and read without a lock. Floor: no atomic
 and no lock per goal.

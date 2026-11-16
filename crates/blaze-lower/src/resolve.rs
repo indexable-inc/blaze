@@ -12,7 +12,7 @@
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_typeck::ItemKey;
 
-use crate::columns::View;
+use crate::columns::{TextAt, View};
 use crate::form::*;
 
 /// A namespace of names.
@@ -79,11 +79,22 @@ pub enum Unresolved<'a> {
     /// The world did not know these yet; the caller fetches them and resolves again.
     Need(AVec<'a, Read>),
     Bad(BadRow),
+    /// A name's range is no text of the record.
+    Text(TextAt),
 }
 
 impl From<BadRow> for Unresolved<'_> {
     fn from(b: BadRow) -> Self {
         Unresolved::Bad(b)
+    }
+}
+
+impl From<TextAt> for Unresolved<'_> {
+    fn from(t: TextAt) -> Self {
+        match t {
+            TextAt::Row(b) => Unresolved::Bad(b),
+            t => Unresolved::Text(t),
+        }
     }
 }
 
@@ -98,7 +109,7 @@ fn uses(v: &View<'_>, ns: &mut [Option<Ns>]) -> Result<(), BadRow> {
         match v.expr(ExprId(i as u32))? {
             Expr::Path(p) => set(p, Ns::Value),
             Expr::Struct { path, .. } => set(path, Ns::Type),
-            Expr::MacroCall { row } => set(MacroCall::decode(v.row(row)?)?.path, Ns::Macro),
+            Expr::MacroCall { row } => set(v.macro_call(v.row(row)?)?.path, Ns::Macro),
             _ => {}
         }
     }
@@ -106,14 +117,14 @@ fn uses(v: &View<'_>, ns: &mut [Option<Ns>]) -> Result<(), BadRow> {
         match v.pat(PatId(i as u32))? {
             Pat::Path(p) | Pat::TupleStruct { path: p, .. } => set(p, Ns::Value),
             Pat::Struct { path, .. } => set(path, Ns::Type),
-            Pat::MacroCall { row } => set(MacroCall::decode(v.row(row)?)?.path, Ns::Macro),
+            Pat::MacroCall { row } => set(v.macro_call(v.row(row)?)?.path, Ns::Macro),
             _ => {}
         }
     }
     for i in 0..v.types.len() {
         match v.ty(TypeId(i as u32))? {
             TypeRef::Path(p) => set(p, Ns::Type),
-            TypeRef::Macro(row) => set(MacroCall::decode(v.row(row)?)?.path, Ns::Macro),
+            TypeRef::Macro(row) => set(v.macro_call(v.row(row)?)?.path, Ns::Macro),
             _ => {}
         }
     }
@@ -128,7 +139,7 @@ fn local_item(v: &View<'_>, scope: Option<ScopeId>, name: u64) -> Result<Option<
         let Some(s) = at else { return Ok(None) };
         let scope = v.scope(s)?;
         for i in scope.items.start..scope.items.start + scope.items.len {
-            let item = LocalItem::decode(v.row(RowIdx(i))?)?;
+            let item = v.local_item(v.row(RowIdx(i))?)?;
             if let Some(n) = item.name
                 && v.name(n)? == name
             {
@@ -140,8 +151,8 @@ fn local_item(v: &View<'_>, scope: Option<ScopeId>, name: u64) -> Result<Option<
     Err(BadRow { column: "scopes", tag: u16::MAX })
 }
 
-/// Resolves every path of `v` (the record of the item `text`) through `names`, in `alloc`.
-pub fn resolve<'a>(v: &View<'_>, text: &str, names: &mut dyn Names, alloc: Alloc<'a>) -> Result<Resolution<'a>, Unresolved<'a>> {
+/// Resolves every path of `v` through `names`, in `alloc`.
+pub fn resolve<'a>(v: &View<'_>, names: &mut dyn Names, alloc: Alloc<'a>) -> Result<Resolution<'a>, Unresolved<'a>> {
     let mut ns: AVec<'_, Option<Ns>> = Vec::from_elem_in(None, v.paths.len(), alloc);
     uses(v, &mut ns)?;
     let mut out = Resolution { paths: Vec::new_in(alloc), reads: Vec::new_in(alloc) };
@@ -163,7 +174,7 @@ pub fn resolve<'a>(v: &View<'_>, text: &str, names: &mut dyn Names, alloc: Alloc
                 let word = match (s.kind, s.name) {
                     (SegKind::Ident, Some(nm)) => {
                         name_hash = Some(v.name(nm)?);
-                        v.name_text(text, nm)
+                        v.name_text(nm)?
                     }
                     (SegKind::SelfMod, _) => "self",
                     (SegKind::Super, _) => "super",

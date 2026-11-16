@@ -159,8 +159,9 @@ impl TestTys {
             TyKind::Slice(x) => TyKind::Slice(sub(self, x)?),
             TyKind::Adt(d, l) => TyKind::Adt(d, list(self, l)?),
             TyKind::FnDef(d, l) => TyKind::FnDef(d, list(self, l)?),
-            TyKind::FnPtr(l) => TyKind::FnPtr(list(self, l)?),
+            TyKind::FnPtr(l, h) => TyKind::FnPtr(list(self, l)?, h),
             TyKind::Closure(d, l) => TyKind::Closure(d, list(self, l)?),
+            TyKind::Coroutine(d, l) => TyKind::Coroutine(d, list(self, l)?),
             TyKind::Dynamic(l, r) => TyKind::Dynamic(list(self, l)?, sub(self, r)?),
             TyKind::Alias(r, a, d, l) => TyKind::Alias(r, a, d, list(self, l)?),
             TyKind::ExTrait(d, l) => TyKind::ExTrait(d, list(self, l)?),
@@ -182,16 +183,17 @@ fn same_head(a: TyKind, b: TyKind) -> bool {
         (Adt(d, _), Adt(e, _))
         | (FnDef(d, _), FnDef(e, _))
         | (Closure(d, _), Closure(e, _))
+        | (Coroutine(d, _), Coroutine(e, _))
         | (ExTrait(d, _), ExTrait(e, _))
         | (ExProj(d, _, _), ExProj(e, _, _)) => d == e,
         (Foreign(d), Foreign(e)) | (ExAuto(d), ExAuto(e)) => d == e,
         (Alias(_, k, d, _), Alias(_, l, e, _)) => k == l && d == e,
-        (FnPtr(x), FnPtr(y)) => x.len == y.len,
+        (FnPtr(x, h), FnPtr(y, i)) => x.len == y.len && h == i,
         (Dynamic(x, _), Dynamic(y, _)) => x.len == y.len,
         (Array(..), Array(..)) | (Slice(_), Slice(_)) => true,
         (Param(i), Param(j)) | (ConstParam(i), ConstParam(j)) => i == j,
         (Placeholder(u, i), Placeholder(v, j)) | (Bound(u, i), Bound(v, j)) => u == v && i == j,
-        (ConstValue(x), ConstValue(y)) => x == y,
+        (ConstValue(a, x), ConstValue(b, y)) => a == b && x == y,
         (Canonical(i), Canonical(j)) => i == j,
         _ => core::mem::discriminant(&a) == core::mem::discriminant(&b) && children_free(a),
     }

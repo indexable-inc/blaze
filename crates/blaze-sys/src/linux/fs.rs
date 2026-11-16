@@ -661,6 +661,35 @@ const FICLONE: usize = 0x4004_9409;
 /// `FICLONERANGE`: `_IOW(0x94, 13, struct file_clone_range)`.
 const FICLONERANGE: usize = 0x4020_940d;
 
+/// `TCGETS` (asm-generic/ioctls.h): a terminal's settings, which only a terminal has.
+const TCGETS: usize = 0x5401;
+/// `TIOCGWINSZ` (asm-generic/ioctls.h): a terminal's size.
+const TIOCGWINSZ: usize = 0x5413;
+/// `struct termios` (asm-generic/termbits.h) is 60 bytes on every Linux target; read whole and
+/// dropped.
+const TERMIOS: usize = 60;
+
+/// Whether `fd` is a terminal: `ioctl(TCGETS)` succeeds on one only (glibc's `isatty`). Used
+/// by `bstd::out::Out::is_terminal`.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn is_terminal(fd: Fd) -> bool {
+    let mut termios = [0u8; TERMIOS];
+    // SAFETY: TCGETS writes one `struct termios`, `TERMIOS` bytes, into the buffer given.
+    raw::check(unsafe { raw::syscall3(nr::IOCTL, arg(fd), TCGETS, termios.as_mut_ptr() as usize) }).is_ok()
+}
+
+/// `ioctl(TIOCGWINSZ)`: the terminal `fd`'s size in cells; [`Errno::NoTty`] when `fd` is not a
+/// terminal. Used by `bstd::out::Out::size`.
+#[blaze::noalloc]
+#[blaze::nopanic]
+pub fn window_size(fd: Fd) -> Result<crate::WindowSize, Errno> {
+    let mut size = crate::types::Winsize::default();
+    // SAFETY: TIOCGWINSZ writes one `struct winsize` into the one given.
+    raw::check(unsafe { raw::syscall3(nr::IOCTL, arg(fd), TIOCGWINSZ, core::ptr::from_mut(&mut size) as usize) })?;
+    Ok(crate::WindowSize { cols: size.cols, rows: size.rows })
+}
+
 /// `ioctl(FICLONE)`: `to` made to share all of `from`'s blocks (a reflink). [`Errno::XDev`]
 /// across file systems, [`Errno::OpNotSupp`] or [`Errno::Inval`] where the file system cannot
 /// share blocks; nothing copies in its place. A source with dirty pages is written out first,

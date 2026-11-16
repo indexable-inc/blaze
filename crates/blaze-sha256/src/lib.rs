@@ -304,5 +304,60 @@ mod x86 {
     }
 }
 
+/// HMAC-SHA-256 (RFC 2104 over this SHA-256; the vectors are RFC 4231's): what signs a
+/// request to an S3 bucket (SigV4's chain of keyed digests). A key longer than SHA-256's block
+/// (64 bytes) is hashed first, a shorter one padded with zeros, as RFC 2104 says.
+///
+/// The padded key lives in this value's two hashers' states, already mixed, and in no buffer
+/// that outlives [`HmacSha256::new`]; the stack copies made there are not wiped (no volatile
+/// write is made: this crate has no unsafe code), so a caller holding a long-lived secret keeps
+/// the key's own copies as it would anyway.
+#[derive(Clone)]
+pub struct HmacSha256 {
+    inner: Sha256,
+    outer: Sha256,
+}
+
+impl HmacSha256 {
+    pub fn new(key: &[u8]) -> HmacSha256 {
+        let mut block = [0u8; 64];
+        if key.len() > 64 {
+            block[..32].copy_from_slice(&digest(key));
+        } else {
+            block[..key.len()].copy_from_slice(key);
+        }
+        let mut inner_pad = [0x36u8; 64];
+        let mut outer_pad = [0x5cu8; 64];
+        for ((inner, outer), byte) in inner_pad.iter_mut().zip(outer_pad.iter_mut()).zip(block) {
+            *inner ^= byte;
+            *outer ^= byte;
+        }
+        let mut inner = Sha256::new();
+        inner.update(&inner_pad);
+        let mut outer = Sha256::new();
+        outer.update(&outer_pad);
+        HmacSha256 { inner, outer }
+    }
+
+    pub fn update(&mut self, bytes: &[u8]) -> &mut HmacSha256 {
+        self.inner.update(bytes);
+        self
+    }
+
+    /// The tag of everything given so far; the value may take more after it.
+    pub fn finish(&self) -> [u8; 32] {
+        let mut outer = self.outer.clone(); // clone: 104 bytes of hasher state, so `finish` borrows
+        outer.update(&self.inner.finish());
+        outer.finish()
+    }
+}
+
+/// The HMAC-SHA-256 of `message` under `key`.
+pub fn hmac(key: &[u8], message: &[u8]) -> [u8; 32] {
+    let mut mac = HmacSha256::new(key);
+    mac.update(message);
+    mac.finish()
+}
+
 #[cfg(test)]
 mod tests;

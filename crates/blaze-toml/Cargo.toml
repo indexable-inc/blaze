@@ -18,6 +18,9 @@ doctest = false
 blaze-data.workspace = true
 # `Soa` columns for the document's nodes; `String` and `Vec` in the caller's allocator.
 blaze-own.workspace = true
+# The errors' and datetimes' text: `Show`, with `Shown` for `Display` where `core::error::Error`
+# and `{}` users want it.
+blaze-text.workspace = true
 
 [dev-dependencies]
 # Properties: write then read gives a value back, and an edit changes only what it names;

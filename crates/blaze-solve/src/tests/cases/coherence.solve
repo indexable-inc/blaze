@@ -386,3 +386,10 @@ mode coherence
 extern trait S1
 extern trait S2: S1
 goal Vec<u32>: S2 => maybe
+
+case where_const_never_disjoint = eval.rs const_holds
+# Opposite conditions never prove two impls disjoint: a condition is ambiguous under coherence.
+trait Foo
+impl@a<T> Foo for T where const yes(T)
+impl@b<T> Foo for T where const no(T)
+overlap @a @b => may_overlap

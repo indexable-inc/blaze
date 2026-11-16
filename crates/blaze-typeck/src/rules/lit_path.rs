@@ -11,28 +11,49 @@
 
 use blaze_own::{Alloc, Vec};
 
-use crate::body::{IntSuffix, Lit, Segment};
+use crate::body::{BodyPath, IntSuffix, Lit, Segment};
 use crate::diag::{At, DiagCode};
-use crate::error::Stop;
+use crate::error::{CheckError, Malformed, Stop};
 use crate::ids::{ExprId, ItemKey, Mutbl, Name, PathIdx, ScopeId};
 use crate::machine::{Expectation, Flow, Frame, Lower, Machine, Then};
-use crate::ty::{Cause, Goal, Ty, TyList, TyView, TypeCtx};
-use crate::world::{AssocKind, CtorKind, Def, World};
+use crate::portable::{PNode, PTy, PTys};
+use crate::ty::{Cause, Goal, Ty, TyList, TyView, TypeCtx, VarKind};
+use crate::world::{AssocKind, CtorKind, Def, FnSig, PathRes, World};
+
+/// Why a body path has no definition.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Unresolved {
+    /// Not found by its name: E0425 naming it.
+    ByName,
+    /// A desugaring's lang path the world cannot answer: already reported as
+    /// `DiagCode::MissingLangItem` naming the lang item.
+    Reported,
+}
 
 impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// `check_lit`.
-    pub(crate) fn expr_lit(&mut self, f: Frame, lit: Lit) -> Result<Flow, Stop> {
-        Ok(Flow::Done(self.lit_ty(lit, f.expect)?))
+    pub(crate) fn expr_lit(&mut self, f: Frame, e: ExprId, lit: Lit) -> Result<Flow, Stop> {
+        Ok(Flow::Done(self.lit_ty(lit, f.expect, At::Expr(e))?))
     }
 
-    /// A literal's type under an expectation.
-    pub(crate) fn lit_ty(&mut self, lit: Lit, expect: Expectation) -> Result<Ty, Stop> {
+    /// A literal's type under an expectation; `at` is the literal, named when a lang item it
+    /// needs is missing.
+    pub(crate) fn lit_ty(&mut self, lit: Lit, expect: Expectation, at: At) -> Result<Ty, Stop> {
         let c = self.common;
         Ok(match lit {
             Lit::Bool(_) => c.bool_,
             Lit::Char => c.char_,
             Lit::Str => c.static_str,
+            Lit::CStr => match self.need_lang(crate::ids::LangItem::CStr, at)? {
+                Some(k) => {
+                    let none = self.mk_list(&[])?;
+                    let cstr = self.mk(TyView::Adt(k, none))?;
+                    self.mk(TyView::Ref(Mutbl::Not, cstr))?
+                }
+                None => c.err,
+            },
             Lit::ByteStr(n) => {
+                let n = self.len_value(n)?;
                 let arr = self.mk(TyView::Array(c.u8_, n))?;
                 self.mk(TyView::Ref(Mutbl::Not, arr))?
             }
@@ -45,7 +66,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     Some(t) => match self.view(t) {
                         TyView::Int(_) | TyView::Uint(_) => Some(self.ty.shallow_resolve(t)),
                         TyView::Char => Some(c.u8_),
-                        TyView::Ptr(..) | TyView::FnDef(..) | TyView::FnPtr(_) => Some(c.usize_),
+                        TyView::Ptr(..) | TyView::FnDef(..) | TyView::FnPtr(..) => Some(c.usize_),
                         _ => None,
                     },
                     None => None,
@@ -90,22 +111,116 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         Ok(Flow::Done(ty))
     }
 
-    /// Explicit generic arguments of a segment (`::<..>`), or `count` fresh variables. A wrong
-    /// count is E0107, and the arguments are then fresh.
-    pub(crate) fn explicit_args(&mut self, at: At, seg: Option<Segment>, count: u32) -> Result<TyList, Stop> {
+    /// Explicit generic arguments of a segment (`::<..>`) for parameters `from..from + count`
+    /// of `item`'s generics, or fresh ones. A wrong count is E0107, and the arguments are then
+    /// fresh. Type and const parameters are counted together, in declaration order (the
+    /// Reference, "Generic arguments"). A const argument is checked against its parameter's
+    /// declared type (the Reference, "Const generics": "the type of the const argument must
+    /// match the type of the const parameter"): E0308 on a mismatch; a constant given for a
+    /// type parameter, or a type for a const parameter, is E0747. Either error leaves the
+    /// argument fresh.
+    pub(crate) fn explicit_args(
+        &mut self,
+        at: At,
+        seg: Option<Segment>,
+        item: ItemKey,
+        from: u32,
+        count: u32,
+    ) -> Result<TyList, Stop> {
+        self.explicit_args_declared(at, seg, item, from, count, count)
+    }
+
+    /// A fn's own generic arguments: [`Self::explicit_args`] for `sig.own_count` parameters of
+    /// which only the first `sig.declared_count` may be written; the anonymous ones of its
+    /// `impl Trait` arguments are always fresh (the Reference, "Impl trait").
+    pub(crate) fn explicit_fn_args(&mut self, at: At, seg: Option<Segment>, item: ItemKey, sig: &FnSig<'_>) -> Result<TyList, Stop> {
+        if sig.declared_count > sig.own_count {
+            return Err(CheckError::Malformed(Malformed::Param { index: sig.declared_count, args: sig.own_count }).into());
+        }
+        self.explicit_args_declared(at, seg, item, sig.parent_count, sig.declared_count, sig.own_count)
+    }
+
+    /// Parameters `from..from + count` of `item`, the first `declared` of them written in `seg`
+    /// (all or none), the rest fresh.
+    fn explicit_args_declared(
+        &mut self,
+        at: At,
+        seg: Option<Segment>,
+        item: ItemKey,
+        from: u32,
+        declared: u32,
+        count: u32,
+    ) -> Result<TyList, Stop> {
         let Some(seg) = seg.filter(|s| s.has_args) else {
-            return self.fresh_args(count);
+            return self.fresh_generic_args(item, from, count);
         };
         let written = self.body.type_list(seg.generic_args)?;
-        if written.len() != count as usize {
+        if written.len() != declared as usize {
             self.diag(DiagCode::GenericArgCount, at, None, None, Some(seg.name));
-            return self.fresh_args(count);
+            let got = u32::try_from(written.len()).unwrap_or(u32::MAX);
+            if let Some(d) = self.diags.last_mut() {
+                d.because = Some(crate::diag::Because::ArgCount { item, expected: declared, got });
+            }
+            return self.fresh_generic_args(item, from, count);
         }
-        let mut v: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(written.len(), self.alloc);
-        for &t in written {
-            v.push(self.lower_body_ty(t)?);
+        let consts = if count == 0 { None } else { Some(self.reads.const_params(item)?) };
+        let mut v: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(count as usize, self.alloc);
+        for (i, &t) in written.iter().enumerate() {
+            let declared = consts.and_then(|c| c.type_of(from + i as u32).map(|d| (d, c.types)));
+            v.push(self.generic_arg(at, t, declared)?);
+        }
+        // The anonymous parameters: type parameters, inferred from the arguments.
+        for _ in declared..count {
+            v.push(self.fresh()?);
         }
         self.mk_list(&v)
+    }
+
+    /// One written generic argument `t` for a parameter whose declared type is `declared`
+    /// (a const parameter) or `None` (a type parameter). An unsuffixed integer constant takes
+    /// the parameter's type, as an integer literal takes its expected type.
+    fn generic_arg(&mut self, at: At, t: PTy, declared: Option<(PTy, PTys<'_>)>) -> Result<Ty, Stop> {
+        let node = self.body.types.node(t)?;
+        let Some((d, dtypes)) = declared else {
+            if let PNode::ConstValue { .. } = node {
+                self.diag(DiagCode::GenericArgKind, at, None, None, None);
+                return self.fresh();
+            }
+            return self.lower_body_ty(t, at);
+        };
+        let empty = self.mk_list(&[])?;
+        let d = self.lower(dtypes, d, Lower::Args(empty), at.cause())?;
+        if let PNode::ConstValue { ty, bits } = node
+            && let PNode::Infer = self.body.types.node(ty)?
+        {
+            if !matches!(self.view(d), TyView::Int(_) | TyView::Uint(_)) {
+                self.diag(DiagCode::Mismatch, at, Some(d), None, None);
+                return self.ty.fresh(VarKind::Const).map_err(Stop::from);
+            }
+            return self.mk(TyView::ConstValue { ty: d, bits });
+        }
+        let arg = self.lower_body_ty(t, at)?;
+        let found = match self.view(arg) {
+            TyView::ConstValue { ty, .. } => ty,
+            TyView::ConstParam(j) => {
+                let owner = self.body.owner;
+                let own = self.reads.const_params(owner)?;
+                let Some(pt) = own.type_of(j) else {
+                    return Err(CheckError::Malformed(Malformed::Param { index: j, args: 0 }).into());
+                };
+                let empty = self.mk_list(&[])?;
+                self.lower(own.types, pt, Lower::Args(empty), at.cause())?
+            }
+            TyView::ConstInfer(_) => return Ok(arg),
+            _ => {
+                self.diag(DiagCode::GenericArgKind, at, None, Some(arg), None);
+                return self.ty.fresh(VarKind::Const).map_err(Stop::from);
+            }
+        };
+        if !self.demand_eq(at, d, found)? {
+            return self.ty.fresh(VarKind::Const).map_err(Stop::from);
+        }
+        Ok(arg)
     }
 
     /// `parent` followed by `own`.
@@ -114,6 +229,36 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let own = self.list(own);
         v.extend_from_slice(&own);
         self.mk_list(&v)
+    }
+
+    /// A body path's resolution: by name, or, for a desugaring's path, the lang item's
+    /// definition with nothing consumed (it has no segments).
+    /// A lang path the world cannot answer is the finding naming the lang item, at `at`, and
+    /// `Unresolved::Reported`: never an E0425 without a name.
+    pub(crate) fn path_res(
+        &mut self,
+        bp: BodyPath,
+        path: PathIdx,
+        names: &[Name],
+        at: At,
+    ) -> Result<Result<PathRes, Unresolved>, Stop> {
+        match bp.lang {
+            Some(l) => match self.reads.lang_path(l)? {
+                Some(def) => Ok(Ok(PathRes { def, consumed: 0 })),
+                None => {
+                    self.missing_lang(l, at);
+                    Ok(Err(Unresolved::Reported))
+                }
+            },
+            None => Ok(self.reads.resolve_path(bp.scope, path, names)?.ok_or(Unresolved::ByName)),
+        }
+    }
+
+    /// E0425 naming `name` for a path not found by name; nothing for one already reported.
+    pub(crate) fn unresolved(&mut self, why: Unresolved, at: At, name: Option<Name>) {
+        if why == Unresolved::ByName {
+            self.diag(DiagCode::UnresolvedPath, at, None, None, name);
+        }
     }
 
     /// The type of a value path (`instantiate_value_path`).
@@ -126,9 +271,15 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
         let last = segs.last().copied();
         let last_name = last.map(|s| s.name);
-        let Some(res) = self.reads.resolve_path(bp.scope, path, &names)? else {
-            self.diag(DiagCode::UnresolvedPath, at, None, None, last_name);
-            return Ok(self.common.err);
+        if let Some(anchor) = bp.anchor {
+            return self.anchored_value(at, cause, anchor, segs, bp.scope);
+        }
+        let res = match self.path_res(bp, path, &names, at)? {
+            Ok(res) => res,
+            Err(why) => {
+                self.unresolved(why, at, last_name);
+                return Ok(self.common.err);
+            }
         };
         let consumed = res.consumed as usize;
         if consumed == segs.len() {
@@ -145,10 +296,20 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     self.diag(DiagCode::UnresolvedPath, at, None, None, last_name);
                     return Ok(self.common.err);
                 };
-                let args = self.explicit_args(at, Some(segs[consumed - 1]), adt.generics)?;
+                let args = self.explicit_args(at, Some(segs[consumed - 1]), k, 0, adt.generics)?;
                 self.mk(TyView::Adt(k, args))?
             }
             Def::TyParam(i) => self.mk(TyView::Param(i))?,
+            // The Reference, "Paths": a type-relative path may begin at a primitive type; its
+            // items are its inherent impls' (core's `impl u32 { .. }`), then traits in scope.
+            Def::Prim(p) => self.mk(match p {
+                crate::world::Prim::Bool => TyView::Bool,
+                crate::world::Prim::Char => TyView::Char,
+                crate::world::Prim::Str => TyView::Str,
+                crate::world::Prim::Int(i) => TyView::Int(i),
+                crate::world::Prim::Uint(u) => TyView::Uint(u),
+                crate::world::Prim::Float(f) => TyView::Float(f),
+            })?,
             _ => {
                 self.diag(DiagCode::UnresolvedPath, at, None, None, last_name);
                 return Ok(self.common.err);
@@ -158,8 +319,91 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         self.assoc_value(at, cause, self_ty, seg, bp.scope)
     }
 
-    /// A fully resolved value definition.
+    /// A qualified value path (the Reference, "Qualified paths"). `<T>::x` is `x` looked up on
+    /// `T` as `T::x` is (inherent items, then traits in scope). `<T as Tr>::x` is `Tr`'s own
+    /// associated item `x` (no inherent item, no other trait, no supertrait) with `Self = T` and
+    /// `Tr`'s arguments as written on its path (fresh when none are), and registers `T: Tr`.
+    /// `<T as Tr>::Assoc::x` is `x` looked up on the projection `<T as Tr>::Assoc` as on any
+    /// type. The lowering admits one segment after `<T>` and at most two after `<T as Tr>`.
+    fn anchored_value(
+        &mut self,
+        at: At,
+        cause: Cause,
+        anchor: crate::body::Anchor,
+        segs: &[Segment],
+        scope: ScopeId,
+    ) -> Result<Ty, Stop> {
+        let malformed = || -> Stop {
+            crate::error::CheckError::Malformed(crate::error::Malformed::List {
+                column: "segments",
+                start: 0,
+                len: segs.len() as u32,
+            })
+            .into()
+        };
+        let (assoc, seg) = match segs {
+            [seg] => (None, seg),
+            [assoc, seg] if anchor.trait_.is_some() => (Some(*assoc), seg),
+            _ => return Err(malformed()),
+        };
+        let self_ty = self.lower_body_ty(anchor.ty, at)?;
+        let Some(tpath) = anchor.trait_ else {
+            return self.assoc_value(at, cause, self_ty, *seg, scope);
+        };
+        let tbp = self.body.path(tpath)?;
+        let tsegs = self.body.segment_list(tbp.segments)?;
+        let mut names: Vec<Name, Alloc<'a>> = Vec::with_capacity_in(tsegs.len(), self.alloc);
+        for s in tsegs {
+            names.push(s.name);
+        }
+        let tlast = tsegs.last().copied();
+        let tr = match self.path_res(tbp, tpath, &names, at)? {
+            Ok(PathRes { def: Def::Trait(tr), consumed }) if consumed as usize == tsegs.len() => tr,
+            Ok(_) => {
+                self.diag(DiagCode::NotATrait, at, None, None, tlast.map(|s| s.name));
+                return Ok(self.common.err);
+            }
+            Err(why) => {
+                self.unresolved(why, at, tlast.map(|s| s.name));
+                return Ok(self.common.err);
+            }
+        };
+        let Some(def) = self.reads.trait_def(tr)? else {
+            self.diag(DiagCode::UnresolvedPath, at, None, None, tlast.map(|s| s.name));
+            return Ok(self.common.err);
+        };
+        let rest = self.explicit_args(at, tlast, tr, 1, def.generics.saturating_sub(1))?;
+        let self_list = self.mk_list(&[self_ty])?;
+        let trait_args = self.concat(self_list, rest)?;
+        if let Some(assoc) = assoc {
+            if !def.assoc_types.iter().any(|a| a.name == assoc.name) {
+                self.diag(DiagCode::NoAssocItem, at, None, Some(self_ty), Some(assoc.name));
+                return Ok(self.common.err);
+            }
+            self.register_trait(tr, trait_args, cause)?;
+            let projected = self.project(tr, trait_args, assoc.name, cause)?;
+            let projected = self.try_structurally_resolve(projected)?;
+            return self.assoc_value(at, cause, projected, *seg, scope);
+        }
+        let Some(item) = self.reads.assoc_item(tr, seg.name)? else {
+            self.diag(DiagCode::NoAssocItem, at, None, Some(self_ty), Some(seg.name));
+            return Ok(self.common.err);
+        };
+        self.register_trait(tr, trait_args, cause)?;
+        self.assoc_item_ty(at, cause, item.item, item.kind, trait_args, Some(*seg))
+    }
+
+    /// A fully resolved value definition, recorded at its node (`Checked::expr_defs`,
+    /// `pat_defs`) once it typed without an error.
     fn value_def(&mut self, at: At, cause: Cause, def: Def, segs: &[Segment]) -> Result<Ty, Stop> {
+        let t = self.value_def_ty(at, cause, def, segs)?;
+        if !self.is_err(t) {
+            self.defs.push((at, def));
+        }
+        Ok(t)
+    }
+
+    fn value_def_ty(&mut self, at: At, cause: Cause, def: Def, segs: &[Segment]) -> Result<Ty, Stop> {
         let last = segs.last().copied();
         let name = last.map(|s| s.name);
         match def {
@@ -168,8 +412,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     self.diag(DiagCode::UnresolvedPath, at, None, None, name);
                     return Ok(self.common.err);
                 };
-                let parent = self.fresh_args(sig.parent_count)?;
-                let own = self.explicit_args(at, last, sig.own_count)?;
+                let parent = self.fresh_generic_args(k, 0, sig.parent_count)?;
+                let own = self.explicit_fn_args(at, last, k, &sig)?;
                 let args = self.concat(parent, own)?;
                 self.register_predicates(k, args, cause)?;
                 self.mk(TyView::FnDef(k, args))
@@ -179,9 +423,9 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     self.diag(DiagCode::UnresolvedPath, at, None, None, name);
                     return Ok(self.common.err);
                 };
-                let args = self.fresh_args(sig.parent_count + sig.own_count)?;
+                let args = self.fresh_generic_args(k, 0, sig.parent_count + sig.own_count)?;
                 self.register_predicates(k, args, cause)?;
-                self.lower(sig.types, sig.output, Lower::Args(args))
+                self.lower(sig.types, sig.output, Lower::Args(args), cause)
             }
             Def::Ctor { adt, variant, kind } => {
                 let Some(info) = self.reads.adt(adt)? else {
@@ -191,7 +435,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 // The type's arguments may be written on any segment (`S::<T>`, `E::<T>::V`,
                 // `E::V::<T>`): the last segment that has them.
                 let written = segs.iter().rev().find(|s| s.has_args).copied();
-                let args = self.explicit_args(at, written, info.generics)?;
+                let args = self.explicit_args(at, written, adt, 0, info.generics)?;
                 match kind {
                     CtorKind::Unit => self.mk(TyView::Adt(adt, args)),
                     CtorKind::Tuple => {
@@ -207,7 +451,19 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     }
                 }
             }
-            Def::Adt(_) | Def::Trait(_) | Def::TyParam(_) => {
+            // A const parameter is a value of its declared type (the Reference, "Const
+            // generics": "const parameters may be used ... as a standalone expression").
+            Def::TyParam(i) => {
+                let owner = self.body.owner;
+                let own = self.reads.const_params(owner)?;
+                let Some(pt) = own.type_of(i) else {
+                    self.diag(DiagCode::NotAValue, at, None, None, name);
+                    return Ok(self.common.err);
+                };
+                let empty = self.mk_list(&[])?;
+                self.lower(own.types, pt, Lower::Args(empty), cause)
+            }
+            Def::Adt(_) | Def::Trait(_) | Def::Prim(_) => {
                 self.diag(DiagCode::NotAValue, at, None, None, name);
                 Ok(self.common.err)
             }
@@ -234,7 +490,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 return Ok(self.common.err);
             }
             if let Some((imp, item, kind)) = found {
-                let Some(impl_args) = self.impl_args(imp, self_ty)? else {
+                let Some(impl_args) = self.impl_args(imp, self_ty, at.cause())? else {
                     self.diag(DiagCode::NoMethod, at, None, Some(self_ty), Some(seg.name));
                     return Ok(self.common.err);
                 };
@@ -276,9 +532,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
     }
 
-    /// The traits of the body's where-clauses whose self type is parameter `i`.
+    /// The traits of the body's where-clauses whose self type is parameter `i`, elaborated
+    /// through their supertraits (rustc's `assemble_inherent_candidates_from_param` reads the
+    /// elaborated param env: `T: Sub` with `trait Sub: Base` gives `Base`'s methods too).
     pub(crate) fn param_bound_traits(&mut self, i: u32, out: &mut Vec<ItemKey, Alloc<'a>>) -> Result<(), Stop> {
         let owner = self.body.owner;
+        let start = out.len();
         let preds = self.reads.predicates(owner)?;
         for clause in preds.clauses {
             if let crate::world::PClause::Trait { trait_, args } = *clause {
@@ -286,6 +545,30 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 if let Some(&first) = list.first() {
                     if preds.types.node(first)? == crate::portable::PNode::Param(i) && !out.contains(&trait_) {
                         out.push(trait_);
+                    }
+                }
+            }
+        }
+        self.elaborate_bound_traits(out, start)
+    }
+
+    /// `out[start..]`'s traits, each followed by its supertraits not yet in `out`, transitively
+    /// (a parameter's bounds, an object's principal).
+    pub(crate) fn elaborate_bound_traits(&mut self, out: &mut Vec<ItemKey, Alloc<'a>>, start: usize) -> Result<(), Stop> {
+        // The worklist is `out` itself from `start`: each distinct trait is pushed once, so it
+        // ends after the world's traits at most.
+        let mut at = start;
+        while at < out.len() {
+            let t = out[at];
+            at += 1;
+            let Some(def) = self.reads.trait_def(t)? else { continue };
+            for clause in def.supertraits {
+                if let crate::world::PClause::Trait { trait_, args } = *clause {
+                    let list = def.types.list(args)?;
+                    if let Some(&first) = list.first() {
+                        if def.types.node(first)? == crate::portable::PNode::Param(0) && !out.contains(&trait_) {
+                            out.push(trait_);
+                        }
                     }
                 }
             }
@@ -299,17 +582,15 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             Some(sig) => sig.parent_count,
             None => 1,
         };
-        let mut v: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(parent.max(1) as usize, self.alloc);
-        v.push(self_ty);
-        for _ in 1..parent {
-            v.push(self.fresh()?);
-        }
-        self.mk_list(&v)
+        let rest = self.fresh_generic_args(item, 1, parent.saturating_sub(1))?;
+        let self_list = self.mk_list(&[self_ty])?;
+        self.concat(self_list, rest)
     }
 
     /// Whether `imp`'s self type can be `self_ty`, in a probe.
     pub(crate) fn impl_applies(&mut self, imp: ItemKey, self_ty: Ty) -> Result<bool, Stop> {
-        Ok(self.probe(|m| m.impl_args(imp, self_ty))?.is_some())
+        // A probe: rolled back, so its obligations' cause reaches no diagnostic.
+        Ok(self.probe(|m| m.impl_args(imp, self_ty, Cause::Body))?.is_some())
     }
 
     /// The value type of an associated item given its parent's arguments.
@@ -328,14 +609,16 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         };
         match kind {
             AssocKind::Fn { .. } => {
-                let own = self.explicit_args(at, seg, sig.own_count)?;
+                let own = self.explicit_fn_args(at, seg, item, &sig)?;
                 let args = self.concat(parent_args, own)?;
                 self.register_predicates(item, args, cause)?;
+                self.defs.push((at, Def::Fn(item)));
                 self.mk(TyView::FnDef(item, args))
             }
             AssocKind::Const => {
                 self.register_predicates(item, parent_args, cause)?;
-                self.lower(sig.types, sig.output, Lower::Args(parent_args))
+                self.defs.push((at, Def::Const(item)));
+                self.lower(sig.types, sig.output, Lower::Args(parent_args), cause)
             }
             AssocKind::Type => {
                 self.diag(DiagCode::NotAValue, at, None, None, seg.map(|s| s.name));

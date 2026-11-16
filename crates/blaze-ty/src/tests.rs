@@ -661,3 +661,246 @@ fn a_million_deep_chain_walks_without_stack_growth() {
     print(&cx.tys, plain.node(), &mut DefaultNames, &mut count);
     assert_eq!(count.0, DEPTH * "&'static ".len() + "bool".len());
 }
+
+// ---- what the solver needs (lib.rs, "What blaze-solve reads") ------------------------------
+
+/// Every node of an arena built from random terms comes back from its bits; bits past a
+/// class's rows do not; a node of one class is not a handle of another.
+#[test]
+fn node_at_round_trips_every_node_and_refuses_the_rest() {
+    blaze_sim::check(Config::cases(300), |tape| {
+        let mut m = Model::default();
+        let mut cx = TyCx::new_in(Alloc::global());
+        let vars: Vec<Ty> = (0..3).map(|_| cx.next_ty_var()).collect();
+        let n = 1 + tape.index(6, "terms");
+        for _ in 0..n {
+            let at = m.draw(tape, 3, vars.len(), 2);
+            build(&mut cx.tys, &m, at, &vars, None);
+        }
+        let _ = cx.tys.const_value(Ty::uint(UintTy::Usize), u128::from(tape.index(9, "len") as u32));
+        let classes = [
+            (crate::ids::TAG_TY, cx.tys.ty.len()),
+            (crate::ids::TAG_REGION, cx.tys.re.len()),
+            (crate::ids::TAG_CONST, cx.tys.ct.len()),
+            (crate::ids::TAG_LIST, cx.tys.list_start.len()),
+        ];
+        for (tag, rows) in classes {
+            for i in 0..rows {
+                let bits = (u32::try_from(i).unwrap_or(u32::MAX) << 2) | tag;
+                let got = cx.tys.node_at(bits);
+                oracle(got.map(Node::bits) == Some(bits), || format!("node_at({bits:#x}) of row {i} gave {got:?}"))?;
+                let Some(node) = got else { continue };
+                let one_class = [node.as_ty().is_some(), node.as_region().is_some(), node.as_const().is_some(), node.as_list().is_some()];
+                oracle(one_class.iter().filter(|x| **x).count() == 1, || format!("{node:?} is a handle of {one_class:?}"))?;
+                if let Some(t) = node.as_ty() {
+                    oracle(t.node() == node, || format!("{node:?} as a type is {t:?}"))?;
+                }
+                if let Some(l) = node.as_list() {
+                    oracle(l.node() == node, || format!("{node:?} as a list is {l:?}"))?;
+                }
+            }
+            let past = (u32::try_from(rows).unwrap_or(u32::MAX) << 2) | tag;
+            oracle(cx.tys.node_at(past).is_none(), || format!("node_at({past:#x}) past {rows} rows of class {tag}"))?;
+        }
+        oracle(Ty::BOOL.node().as_region().is_none() && Region::STATIC.node().as_ty().is_none(), || {
+            String::from("a node of one class read as another")
+        })
+    });
+}
+
+/// The variables a tape makes and binds: types, ints, floats and consts.
+struct Tape4 {
+    tys: Vec<Ty>,
+    consts: Vec<crate::Const>,
+}
+
+fn tape_vars(tape: &Tape, cx: &mut TyCx<'_>) -> Tape4 {
+    let n = 2 + tape.index(5, "vars");
+    let mut tys = Vec::new();
+    for _ in 0..n {
+        tys.push(match tape.index(3, "var kind") {
+            0 => cx.next_ty_var(),
+            1 => cx.next_int_var(),
+            _ => cx.next_float_var(),
+        });
+    }
+    let consts = (0..1 + tape.index(3, "const vars")).map(|_| cx.next_const_var()).collect();
+    Tape4 { tys, consts }
+}
+
+/// One random relation: types (variables, scalars, tuples of variables) or consts.
+fn tape_op(tape: &Tape, cx: &mut TyCx<'_>, v: &Tape4) {
+    if tape.one_in(4, "const op") {
+        let a = v.consts[tape.index(v.consts.len(), "const a")];
+        let b = if tape.coin("const b var") {
+            v.consts[tape.index(v.consts.len(), "const b")]
+        } else {
+            cx.tys.const_value(Ty::uint(UintTy::Usize), u128::from(tape.index(3, "value") as u32))
+        };
+        let _ = cx.eq(a.arg(), b.arg(), &mut AllInvariant);
+        return;
+    }
+    let a = v.tys[tape.index(v.tys.len(), "a")];
+    let b = match tape.index(5, "b kind") {
+        0 => v.tys[tape.index(v.tys.len(), "b var")],
+        1 => Ty::int(IntTy::I32),
+        2 => Ty::BOOL,
+        3 => {
+            let x = v.tys[tape.index(v.tys.len(), "tuple x")];
+            let y = v.tys[tape.index(v.tys.len(), "tuple y")];
+            cx.tys.tuple_of(&[x, y])
+        }
+        _ => cx.tys.slice(Ty::BOOL),
+    };
+    let _ = cx.eq(a.arg(), b.arg(), &mut AllInvariant);
+}
+
+/// Every variable of every table, by its row, with the kind the binding log names it by.
+fn every_var(cx: &TyCx<'_>) -> Vec<(crate::VarId, Node)> {
+    use crate::kind::{ct, ty};
+    let mut out = Vec::new();
+    for (kind, tag, k) in [
+        (VarKind::Ty, crate::ids::TAG_TY, ty::TY_VAR),
+        (VarKind::Int, crate::ids::TAG_TY, ty::INT_VAR),
+        (VarKind::Float, crate::ids::TAG_TY, ty::FLOAT_VAR),
+        (VarKind::Const, crate::ids::TAG_CONST, ct::VAR),
+    ] {
+        for i in 0..cx.vars.var_count(kind) {
+            let index = u32::try_from(i).unwrap_or(u32::MAX);
+            let row = cx.var_row(tag, k, index);
+            out.push((crate::VarId { kind, index }, Node((row << 2) | tag)));
+        }
+    }
+    out
+}
+
+/// What `probe` (or `probe_const`) gives for a variable's node.
+fn probe_node(cx: &TyCx<'_>, n: Node) -> Node {
+    match n.as_ty() {
+        Some(t) => cx.probe(t).node(),
+        None => cx.probe_const(n.konst()).node(),
+    }
+}
+
+/// The unbound roots, whose `probe` is themselves.
+fn unbound_roots(cx: &TyCx<'_>) -> Vec<crate::VarId> {
+    every_var(cx).into_iter().filter(|(_, n)| probe_node(cx, *n) == *n).map(|(v, _)| v).collect()
+}
+
+fn binding_log(tape: &Tape, plant: Plant) -> Result<(), Broke> {
+    let mut cx = TyCx::new_in(Alloc::global());
+    cx.vars.plant = plant;
+    let v = tape_vars(tape, &mut cx);
+    let ops = 1 + tape.index(8, "ops");
+    let mut snaps = Vec::new();
+    for step in 0..ops {
+        if tape.one_in(4, "open") {
+            snaps.push((cx.snapshot(), cx.vars.bindings().len()));
+        }
+        // (2): probe equals shallow_resolve and writes nothing.
+        let undo = cx.vars.undo_len();
+        let probed: Vec<(Node, Node)> = every_var(&cx).iter().map(|(_, n)| (*n, probe_node(&cx, *n))).collect();
+        oracle(cx.vars.undo_len() == undo, || format!("step {step}: probing wrote {} undo entries", cx.vars.undo_len() - undo))?;
+        for (n, p) in probed {
+            let s = match n.as_ty() {
+                Some(t) => cx.shallow_resolve(t).node(),
+                None => cx.shallow_resolve_const(n.konst()).node(),
+            };
+            oracle(p == s, || format!("step {step}: probe({n:?}) = {p:?}, shallow_resolve = {s:?}"))?;
+        }
+        // (3): the log grows by exactly the roots that stopped being unbound roots.
+        let roots = unbound_roots(&cx);
+        let before = cx.vars.bindings().len();
+        tape_op(tape, &mut cx, &v);
+        let after = unbound_roots(&cx);
+        let mut changed: Vec<crate::VarId> = roots.iter().filter(|r| !after.contains(r)).copied().collect();
+        let mut logged: Vec<crate::VarId> = cx.vars.bindings()[before..].to_vec();
+        changed.sort_unstable();
+        logged.sort_unstable();
+        logged.dedup();
+        oracle(changed == logged, || format!("step {step}: the log grew by {logged:?}, the roots that changed are {changed:?}"))?;
+        if tape.one_in(3, "close") {
+            if let Some((s, len)) = snaps.pop() {
+                if tape.coin("commit") {
+                    cx.commit(s);
+                } else {
+                    cx.rollback_to(s);
+                    oracle(cx.vars.bindings().len() == len, || {
+                        format!("step {step}: after a rollback the log has {} entries, at the snapshot {len}", cx.vars.bindings().len())
+                    })?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn probe_equals_shallow_resolve_and_the_log_names_each_change() {
+    blaze_sim::check(Config::cases(500), |tape| binding_log(tape, Plant::Clean));
+}
+
+/// The control: a log that misses the int table's bindings is caught.
+#[test]
+fn binding_log_control_catches_an_unlogged_int_binding() {
+    blaze_sim::control(Config::cases(500), Plant::Clean, Plant::ForgetIntBinding, "the log grew by", binding_log);
+}
+
+/// (4) The counts: one per variable made, rolled back with the snapshot that made them.
+#[test]
+fn var_counts_follow_creation_and_rollback() {
+    let mut cx = TyCx::new_in(Alloc::global());
+    let _ = (cx.next_ty_var(), cx.next_ty_var(), cx.next_int_var(), cx.next_const_var(), cx.next_region_var());
+    let counts = |cx: &TyCx<'_>| {
+        [VarKind::Ty, VarKind::Int, VarKind::Float, VarKind::Const, VarKind::Region].map(|k| cx.vars.var_count(k))
+    };
+    assert_eq!(counts(&cx), [2, 1, 0, 1, 1]);
+    let s = cx.snapshot();
+    let _ = (cx.next_float_var(), cx.next_ty_var(), cx.next_region_var());
+    assert_eq!(counts(&cx), [3, 1, 1, 1, 2]);
+    cx.rollback_to(s);
+    assert_eq!(counts(&cx), [2, 1, 0, 1, 1]);
+}
+
+/// Rolling back an outer snapshot undoes the inner one's writes too and closes it, so the
+/// outer can be opened again; a new snapshot after it nests from the outer's depth.
+#[test]
+fn rollback_to_an_outer_snapshot_closes_the_inner() {
+    use crate::fold::AllInvariant;
+    let mut cx = TyCx::new_in(Alloc::global());
+    let v = cx.next_ty_var();
+    let w = cx.next_ty_var();
+    let outer = cx.snapshot();
+    assert_eq!(cx.eq(v.arg(), Ty::BOOL.arg(), &mut AllInvariant), Ok(true));
+    let _inner = cx.snapshot();
+    assert_eq!(cx.eq(w.arg(), Ty::CHAR.arg(), &mut AllInvariant), Ok(true));
+    cx.rollback_to(outer);
+    assert!(!cx.vars.in_snapshot(), "the inner snapshot was closed with the outer");
+    assert_eq!(cx.shallow_resolve(v), v);
+    assert_eq!(cx.shallow_resolve(w), w);
+    let again = cx.snapshot();
+    assert_eq!(cx.eq(v.arg(), Ty::CHAR.arg(), &mut AllInvariant), Ok(true));
+    cx.commit(again);
+    assert_eq!(cx.shallow_resolve(v), Ty::CHAR);
+}
+
+#[test]
+fn var_node_names_each_variable_and_nothing_past_the_count() {
+    use crate::VarId;
+    let mut cx = TyCx::new_in(Alloc::global());
+    let made = [
+        (VarId { kind: VarKind::Ty, index: 0 }, cx.next_ty_var().node()),
+        (VarId { kind: VarKind::Ty, index: 1 }, cx.next_ty_var().node()),
+        (VarId { kind: VarKind::Int, index: 0 }, cx.next_int_var().node()),
+        (VarId { kind: VarKind::Float, index: 0 }, cx.next_float_var().node()),
+        (VarId { kind: VarKind::Const, index: 0 }, cx.next_const_var().node()),
+        (VarId { kind: VarKind::Region, index: 0 }, cx.next_region_var().node()),
+    ];
+    for (v, n) in made {
+        assert_eq!(cx.var_node(v), Some(n), "{v:?}");
+    }
+    for kind in [VarKind::Ty, VarKind::Int, VarKind::Float, VarKind::Const, VarKind::Region] {
+        let past = cx.vars.var_count(kind) as u32;
+        assert_eq!(cx.var_node(VarId { kind, index: past }), None, "{kind:?}");
+    }
+}

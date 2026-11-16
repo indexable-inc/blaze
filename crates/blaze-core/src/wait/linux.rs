@@ -1,7 +1,7 @@
 //! Linux's waits: `io_uring_enter` for the io_uring driver, and a sleep on the thread's wait
 //! ring (`wait/ring.rs`) or, on the direct driver, `clock_nanosleep` (`wait/direct.rs`).
 
-use std::{io, os::fd::RawFd, ptr};
+use std::{io, os::fd::RawFd, ptr, time::Duration};
 
 use super::{Clock, Deadline, Once, WaitError, Waited, until};
 
@@ -108,6 +108,41 @@ pub(crate) fn uring_enter(
             Some(libc::EBUSY | libc::EAGAIN) => Ok(Once::Ready(())),
             _ => Err(error),
         }
+    })
+}
+
+/// How long ago this process began: `starttime`, field 22 of `/proc/self/stat`, is clock ticks
+/// (`sysconf(_SC_CLK_TCK)`, 100 on every kernel blaze runs on, so 10 ms steps) since boot, on
+/// `CLOCK_BOOTTIME`, which is read beside it. Linux has no finer public record of an exec's
+/// instant; the drivers' `CLOCK_MONOTONIC` differs from `CLOCK_BOOTTIME` only by time
+/// suspended, none in the moment between a start and its first stamp.
+pub(crate) fn process_age() -> io::Result<Duration> {
+    // alloc: once per process, the stat line.
+    let line = std::fs::read_to_string("/proc/self/stat")
+        .map_err(|error| io::Error::new(error.kind(), format!("/proc/self/stat: {error}")))?;
+    // The command name, field 2, is in parentheses and may hold spaces: fields count after
+    // its last `)`, the state being field 3.
+    let after = line.rfind(')').map(|at| &line[at + 1..]);
+    let ticks = after.and_then(|rest| rest.split_ascii_whitespace().nth(22 - 3)).and_then(|it| it.parse::<u64>().ok());
+    let Some(ticks) = ticks else {
+        // alloc: an error.
+        return Err(io::Error::other(format!("/proc/self/stat: no starttime in {line:?}")));
+    };
+    // SAFETY: a query of a constant.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+    let hz = u64::try_from(hz).ok().filter(|it| *it > 0).ok_or_else(|| io::Error::other(format!("sysconf(_SC_CLK_TCK) is {hz}")))?;
+    let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: a timespec for the kernel to fill.
+    if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut now) } != 0 {
+        let error = io::Error::last_os_error();
+        // alloc: an error.
+        return Err(io::Error::new(error.kind(), format!("clock_gettime(CLOCK_BOOTTIME): {error}")));
+    }
+    let now = Duration::new(now.tv_sec as u64, now.tv_nsec as u32);
+    let began = Duration::from_nanos(ticks.saturating_mul(1_000_000_000) / hz);
+    now.checked_sub(began).ok_or_else(|| {
+        // alloc: an error.
+        io::Error::other(format!("/proc/self/stat: the process began at {began:?} after boot, after now ({now:?})"))
     })
 }
 

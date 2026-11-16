@@ -3,12 +3,13 @@
 //! statements kept), each list copied into the side column blaze-typeck reads it from.
 //!
 //! What blaze-typeck's form has no place for is refused by name ([`Refused::Form`]), never
-//! dropped: a lang-item path (every desugaring's), `let` in a condition, a break or continue
-//! with no target (an error already reported), `become`, `yield` and coroutines, raw borrows,
-//! `const` and `try` blocks, struct defaults (`..` alone), box, range and rest patterns, a
-//! slice pattern with `..`, `b'x'` and `c"..."` literals, format arguments, macro calls,
-//! inline assembly, `offset_of!`, `_` as an expression, path anchors (`<T as Tr>::x`) and
-//! lifetime arguments. What is dropped because it changes no type: the match and loop
+//! dropped: `let` in a condition, a break or continue
+//! with no target (an error already reported), `become`, `yield` and coroutines,
+//! `try` blocks, struct defaults (`..` alone), box patterns, `c"..."` literals, macro calls,
+//! inline assembly, `offset_of!`, const arguments other than literals, a path anchor (`<T as Tr>::x`) in a struct
+//! path or with more than one segment after it. Lifetime arguments are dropped (the checker
+//! erases regions). A desugaring's lang-item path goes over as one
+//! (`BodyPath::lang`), resolved by the world's `lang_path`. What is dropped because it changes no type: the match and loop
 //! sources (diagnostics only), the shadowing links and the hygiene of made names.
 //!
 //! Types are the caller's ([`Types`]): a written type becomes a portable one only by
@@ -18,7 +19,7 @@ use blaze_own::{AVec, Alloc, Vec};
 use blaze_typeck as tc;
 use blaze_typeck::{CheckError, ItemKey, Name, PTy, PTys, PortableTys};
 
-use crate::columns::{View, head};
+use crate::columns::{TextAt, View, head};
 use crate::form::*;
 
 /// Why a body has no blaze-typeck form.
@@ -28,6 +29,8 @@ pub enum Refused {
     Form { what: &'static str, range: blaze_surface::Range },
     /// A row that is no form of its column.
     Bad(BadRow),
+    /// A range that is no text of the record.
+    Text(TextAt),
     /// blaze-typeck's own table refused (a limit).
     Check(CheckError),
     /// The record is no body (a signature, or an item with none).
@@ -40,6 +43,15 @@ impl From<BadRow> for Refused {
     }
 }
 
+impl From<TextAt> for Refused {
+    fn from(t: TextAt) -> Refused {
+        match t {
+            TextAt::Row(b) => Refused::Bad(b),
+            t => Refused::Text(t),
+        }
+    }
+}
+
 impl From<CheckError> for Refused {
     fn from(e: CheckError) -> Refused {
         Refused::Check(e)
@@ -48,10 +60,27 @@ impl From<CheckError> for Refused {
 
 /// The caller's types: a written type to a portable one, an array length to its value.
 pub trait Types {
-    /// The portable type of the written type `t` of `view` (whose text is `text`).
-    fn ty(&mut self, view: &View<'_>, text: &str, t: TypeId, tys: &mut PortableTys<'_>) -> Result<PTy, Refused>;
+    /// The portable type of the written type `t` of `view` (its text read through
+    /// [`View::text_at`]).
+    fn ty(&mut self, view: &View<'_>, t: TypeId, tys: &mut PortableTys<'_>) -> Result<PTy, Refused>;
     /// The value of the repeat length `len` (an expression of `view`).
-    fn repeat_len(&mut self, view: &View<'_>, text: &str, len: ExprId) -> Result<u64, Refused>;
+    fn repeat_len(&mut self, view: &View<'_>, len: ExprId) -> Result<u64, Refused>;
+    /// The value of the const argument `c` of `view` that is no literal (the Reference,
+    /// "Generic parameters", "Const generics": a block or a path to a const item or a const
+    /// parameter): a const parameter's `ConstParam`; a constant's value as a `ConstValue`
+    /// (an enum's variant by [`PortableTys::variant_value`]); evaluated where the caller
+    /// evaluates an array length, its one home. Anything else is a typed refusal at `c`'s
+    /// range ([`no_const_arg`] for a caller with no constants).
+    fn const_arg(&mut self, view: &View<'_>, c: ConstIdx, tys: &mut PortableTys<'_>) -> Result<PTy, Refused>;
+}
+
+/// [`Types::const_arg`]'s refusal for a caller that evaluates no constant, at `c`'s range.
+pub fn no_const_arg(view: &View<'_>, c: ConstIdx) -> Refused {
+    let range = match view.const_range(c).map_err(Refused::from).and_then(|r| view.site(r).map_err(Refused::from)) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    Refused::Form { what: "a const argument that is no literal (this caller evaluates no constant)", range }
 }
 
 /// A body in blaze-typeck's form: the columns [`TypeckBody::view`] lends.
@@ -75,6 +104,8 @@ pub struct TypeckBody<'a> {
     pub segments: AVec<'a, tc::Segment>,
     pub type_lists: AVec<'a, PTy>,
     pub opt_types: AVec<'a, Option<PTy>>,
+    pub fmt_uses: AVec<'a, tc::FmtUse>,
+    pub coroutine: Option<tc::CoroutineKind>,
 }
 
 impl<'a> TypeckBody<'a> {
@@ -101,8 +132,99 @@ impl<'a> TypeckBody<'a> {
             types,
             type_lists: &self.type_lists,
             opt_types: &self.opt_types,
+            fmt_uses: &self.fmt_uses,
+            coroutine: self.coroutine,
         }
     }
+}
+
+/// An argument a format spec's width or precision names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Count<'s> {
+    /// `1$`.
+    Index(u32),
+    /// `w$`.
+    Name(&'s str),
+    /// `.*`.
+    Star,
+}
+
+/// What a format spec asks: its trait, and the arguments its width and precision name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Spec<'s> {
+    pub(crate) trait_: tc::FmtTrait,
+    pub(crate) width: Option<Count<'s>>,
+    pub(crate) precision: Option<Count<'s>>,
+}
+
+/// A count at the start of `s`: `n$` or `name$` (an argument), a plain `n` (a number, no
+/// argument), or nothing. Returns the count and the rest.
+fn count_at(s: &str) -> (Option<Count<'_>>, &str) {
+    if s.starts_with(|c: char| c.is_ascii_digit()) {
+        let end = s.find(|c: char| !c.is_ascii_digit()).unwrap_or(s.len());
+        let (digits, rest) = s.split_at(end);
+        return match (rest.strip_prefix('$'), digits.parse::<u32>()) {
+            (Some(rest), Ok(i)) => (Some(Count::Index(i)), rest),
+            // A plain number: a width or precision, no argument.
+            _ => (None, rest),
+        };
+    }
+    let end = s.find(|c: char| !(c.is_alphanumeric() || c == '_')).unwrap_or(s.len());
+    let (word, rest) = s.split_at(end);
+    match rest.strip_prefix('$') {
+        Some(rest) if !word.is_empty() => (Some(Count::Name(word)), rest),
+        // A word with no `$` is the type's (`x`, `e`).
+        _ => (None, s),
+    }
+}
+
+/// The format spec after `:` (the Reference's `std::fmt` grammar: `[[fill]align][sign]['#']
+/// ['0'][width]['.' precision][type]`); `None` when it is none.
+pub(crate) fn fmt_spec(spec: &str) -> Option<Spec<'_>> {
+    let mut s = spec;
+    let mut chars = s.char_indices();
+    let first = chars.next();
+    let second = chars.next();
+    let align = |c: char| matches!(c, '<' | '^' | '>');
+    match (first, second) {
+        (Some(_), Some((at, a))) if align(a) => s = &s[at + a.len_utf8()..],
+        (Some((_, a)), _) if align(a) => s = &s[1..],
+        _ => {}
+    }
+    s = s.strip_prefix(['+', '-']).unwrap_or(s);
+    s = s.strip_prefix('#').unwrap_or(s);
+    if s.starts_with('0') && !s.starts_with("0$") {
+        s = &s[1..];
+    }
+    let (width, rest) = count_at(s);
+    s = rest;
+    let mut precision = None;
+    if let Some(rest) = s.strip_prefix('.') {
+        if let Some(rest) = rest.strip_prefix('*') {
+            precision = Some(Count::Star);
+            s = rest;
+        } else {
+            let (p, rest) = count_at(rest);
+            if rest.len() == s.len() - 1 && p.is_none() {
+                return None;
+            }
+            precision = p;
+            s = rest;
+        }
+    }
+    let trait_ = match s {
+        "" => tc::FmtTrait::Display,
+        "?" | "x?" | "X?" => tc::FmtTrait::Debug,
+        "x" => tc::FmtTrait::LowerHex,
+        "X" => tc::FmtTrait::UpperHex,
+        "o" => tc::FmtTrait::Octal,
+        "b" => tc::FmtTrait::Binary,
+        "e" => tc::FmtTrait::LowerExp,
+        "E" => tc::FmtTrait::UpperExp,
+        "p" => tc::FmtTrait::Pointer,
+        _ => return None,
+    };
+    Some(Spec { trait_, width, precision })
 }
 
 const fn range(r: blaze_surface::Range) -> tc::Range {
@@ -118,21 +240,148 @@ const fn edition(e: blaze_surface::Edition) -> tc::Edition {
     }
 }
 
+/// A desugaring's lang item as blaze-typeck names it (the same items, one to one).
+const fn lang(l: LangItem) -> tc::LangItem {
+    match l {
+        LangItem::IntoIterIntoIter => tc::LangItem::IntoIterIntoIter,
+        LangItem::IteratorNext => tc::LangItem::IteratorNext,
+        LangItem::OptionSome => tc::LangItem::OptionSome,
+        LangItem::OptionNone => tc::LangItem::OptionNone,
+        LangItem::TryTraitBranch => tc::LangItem::TryTraitBranch,
+        LangItem::TryTraitFromResidual => tc::LangItem::TryTraitFromResidual,
+        LangItem::ControlFlowContinue => tc::LangItem::ControlFlowContinue,
+        LangItem::ControlFlowBreak => tc::LangItem::ControlFlowBreak,
+        LangItem::Range => tc::LangItem::Range,
+        LangItem::RangeFrom => tc::LangItem::RangeFrom,
+        LangItem::RangeTo => tc::LangItem::RangeTo,
+        LangItem::RangeFull => tc::LangItem::RangeFull,
+        LangItem::RangeInclusiveNew => tc::LangItem::RangeInclusiveNew,
+        LangItem::RangeToInclusive => tc::LangItem::RangeToInclusive,
+        LangItem::TryTraitFromOutput => tc::LangItem::TryTraitFromOutput,
+    }
+}
+
+/// The type a constant literal names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConstLitTy {
+    Bool,
+    Char,
+    /// An integer with its suffix, if written.
+    Int(Option<IntSuffix>),
+}
+
+/// A literal const argument's value: little-endian bits of its type's width.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ConstLit {
+    ty: ConstLitTy,
+    bits: u128,
+    negative: bool,
+}
+
+/// The checker's node of an integer suffix's type.
+fn int_suffix_node(s: Option<IntSuffix>) -> Option<tc::PNode> {
+    match s? {
+        IntSuffix::Int(i) => Some(tc::PNode::Int(i)),
+        IntSuffix::Uint(u) => Some(tc::PNode::Uint(u)),
+    }
+}
+
+/// The value of `text` as a literal constant (`true`, `'x'`, `4`, `0xffu8`, `-1i32`); `None`
+/// for anything else. A negative value is the two's complement at its suffix's width; a
+/// pointer-sized one (`isize`) has no width without the target and is `None`, as is a value
+/// that does not fit its suffix's type.
+fn const_literal(text: &str) -> Option<ConstLit> {
+    match text {
+        "true" => return Some(ConstLit { ty: ConstLitTy::Bool, bits: 1, negative: false }),
+        "false" => return Some(ConstLit { ty: ConstLitTy::Bool, bits: 0, negative: false }),
+        _ => {}
+    }
+    if let Some(inner) = text.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')) {
+        let mut cs = inner.chars();
+        let c = cs.next()?;
+        if c == '\\' || cs.next().is_some() {
+            return None;
+        }
+        return Some(ConstLit { ty: ConstLitTy::Char, bits: u128::from(u32::from(c)), negative: false });
+    }
+    let (negative, lit) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest.trim_start()),
+        None => (false, text),
+    };
+    let Some(Lit::Int(suffix)) = crate::lit::lit_of(parser::SyntaxKind::INT_NUMBER, lit) else { return None };
+    let (digits, radix) = match lit.get(..2) {
+        Some("0x" | "0X") => (&lit[2..], 16),
+        Some("0o" | "0O") => (&lit[2..], 8),
+        Some("0b" | "0B") => (&lit[2..], 2),
+        _ => (lit, 10),
+    };
+    let mut value: u128 = 0;
+    let mut any = false;
+    for ch in digits.chars() {
+        if ch == '_' {
+            continue;
+        }
+        let Some(d) = ch.to_digit(radix) else { break };
+        value = value.checked_mul(u128::from(radix))?.checked_add(u128::from(d))?;
+        any = true;
+    }
+    if !any {
+        return None;
+    }
+    let width = match suffix {
+        None => 128,
+        Some(IntSuffix::Int(IntTy::Isize) | IntSuffix::Uint(UintTy::Usize)) if negative => return None,
+        Some(IntSuffix::Int(IntTy::Isize) | IntSuffix::Uint(UintTy::Usize)) => 64,
+        Some(IntSuffix::Int(IntTy::I8) | IntSuffix::Uint(UintTy::U8)) => 8,
+        Some(IntSuffix::Int(IntTy::I16) | IntSuffix::Uint(UintTy::U16)) => 16,
+        Some(IntSuffix::Int(IntTy::I32) | IntSuffix::Uint(UintTy::U32)) => 32,
+        Some(IntSuffix::Int(IntTy::I64) | IntSuffix::Uint(UintTy::U64)) => 64,
+        Some(IntSuffix::Int(IntTy::I128) | IntSuffix::Uint(UintTy::U128)) => 128,
+    };
+    let signed = matches!(suffix, Some(IntSuffix::Int(_)));
+    if negative && !signed && suffix.is_some() {
+        return None;
+    }
+    let mask = if width == 128 { u128::MAX } else { (1u128 << width) - 1 };
+    let bits = if negative {
+        // `-x` fits a signed type of `width` bits when x <= 2^(width-1).
+        if suffix.is_some() && value > 1u128 << (width - 1) {
+            return None;
+        }
+        value.wrapping_neg() & mask
+    } else {
+        let max = if signed { (1u128 << (width - 1)) - 1 } else { mask };
+        if value > max {
+            return None;
+        }
+        value
+    };
+    Some(ConstLit { ty: ConstLitTy::Int(suffix), bits, negative })
+}
+
+/// [`const_literal`]'s bits, for the tests.
+#[cfg(test)]
+pub(crate) fn const_literal_bits(text: &str) -> Option<u128> {
+    const_literal(text).map(|c| c.bits)
+}
+
 fn len(n: usize) -> u32 {
     u32::try_from(n).expect("a body's column under 4G rows")
 }
 
 struct Conv<'v, 't, 'x, 'y, 'a> {
     v: &'v View<'v>,
-    text: &'v str,
     tys: &'x mut PortableTys<'y>,
     types: &'t mut dyn Types,
     out: TypeckBody<'a>,
+    /// Per pattern: it is a slice's `..` (or the `..` under its `x @ ..`), the one `..` that is
+    /// in a list and so has a type, the subslice's.
+    slice_rest: Vec<bool, Alloc<'a>>,
 }
 
 impl Conv<'_, '_, '_, '_, '_> {
-    fn refuse<T>(&self, what: &'static str, r: blaze_surface::Range) -> Result<T, Refused> {
-        Err(Refused::Form { what, range: r })
+    fn refuse<T>(&self, what: &'static str, r: BodyRange) -> Result<T, Refused> {
+        Err(Refused::Form { what, range: self.v.site(r)? })
     }
 
     fn name(&self, n: NameIdx) -> Result<Name, Refused> {
@@ -140,7 +389,7 @@ impl Conv<'_, '_, '_, '_, '_> {
     }
 
     fn ty(&mut self, t: TypeId) -> Result<PTy, Refused> {
-        self.types.ty(self.v, self.text, t, self.tys)
+        self.types.ty(self.v, t, self.tys)
     }
 
     fn opt_ty(&mut self, t: Option<TypeId>) -> Result<Option<PTy>, Refused> {
@@ -168,35 +417,134 @@ impl Conv<'_, '_, '_, '_, '_> {
         Ok(List { start, len: l.len })
     }
 
-    /// Generic arguments of a segment or a method call: types only.
-    fn type_args(&mut self, l: List, r: blaze_surface::Range) -> Result<List, Refused> {
+    /// Generic arguments of a segment or a method call, and whether any is not a lifetime.
+    ///
+    /// Lifetime arguments are dropped: the checker erases regions (rustc's typeck sees none),
+    /// and a list of lifetimes alone leaves the types to inference, as `Cow::<'a>::from`
+    /// does in Rust (lifetimes may be written without the types after them).
+    fn type_args(&mut self, l: List, r: BodyRange) -> Result<(List, bool), Refused> {
         let rows = self.v.rows(l)?;
         let mut at: AVec<'_, PTy> = Vec::new_in(*self.out.type_lists.allocator());
         for &n in rows {
             match GenericArg::decode(n)? {
                 GenericArg::Type(t) => at.push(self.ty(t)?),
-                GenericArg::Lifetime(_) => return self.refuse("a lifetime argument", r),
-                GenericArg::Const(_) => return self.refuse("a const argument", r),
+                GenericArg::Lifetime(_) => {}
+                GenericArg::Const(c) => at.push(self.const_arg(c)?),
                 _ => return self.refuse("an associated item constraint", r),
             }
         }
         let start = len(self.out.type_lists.len());
         self.out.type_lists.extend_from_slice(&at);
-        Ok(List { start, len: len(at.len()) })
+        Ok((List { start, len: len(at.len()) }, !at.is_empty()))
     }
 
-    fn path(&mut self, p: PathIdx) -> Result<PathIdx, Refused> {
-        let r = self.v.path_ranges.get(p.0 as usize).copied().unwrap_or_default();
+    /// A const argument written as a constant (the Reference, "Generic arguments": a literal,
+    /// a negated literal or a block; a path parses as a type argument and comes through
+    /// [`Types::ty`]): `true`/`false`, a plain `char` and an integer become a
+    /// `ConstValue`. An unsuffixed integer's type is a hole the checker fills from the
+    /// parameter's declared type. A block or a path is the caller's ([`Types::const_arg`]);
+    /// a negated literal without a suffix is refused by name.
+    fn const_arg(&mut self, c: ConstIdx) -> Result<PTy, Refused> {
+        let r = self.v.const_range(c)?;
+        let text = self.v.text_at(r)?.trim();
+        let Some(value) = const_literal(text) else {
+            return self.types.const_arg(self.v, c, self.tys);
+        };
+        let ty = match value.ty {
+            ConstLitTy::Bool => tc::PNode::Bool,
+            ConstLitTy::Char => tc::PNode::Char,
+            ConstLitTy::Int(s) => match int_suffix_node(s) {
+                Some(n) => n,
+                None if value.negative => return self.refuse("a negative const argument with no suffix", r),
+                None => tc::PNode::Infer,
+            },
+        };
+        let ty = self.tys.intern(ty).map_err(Refused::Check)?;
+        Ok(self.tys.intern(tc::PNode::ConstValue { ty, bits: value.bits }).map_err(Refused::Check)?)
+    }
+
+    /// A body path; `anchors` admits a qualified path (`<T as Tr>::x`, `<T>::x`), which names a
+    /// value only.
+    fn path(&mut self, p: PathIdx, anchors: bool) -> Result<PathIdx, Refused> {
+        let r = self.v.path_range(p)?;
         let path = self.v.path(p)?;
-        if path.lang.is_some() {
-            return self.refuse("a lang item's path (a desugaring's)", r);
-        }
-        if path.absolute {
-            return self.refuse("a path from the crate root (`::x`)", r);
+        if let Some(l) = path.lang {
+            let Some(scope) = path.scope else { return self.refuse("a path with no scope", r) };
+            let at = PathIdx(len(self.out.paths.len()));
+            self.out.paths.push(tc::BodyPath { scope, segments: List::EMPTY, lang: Some(lang(l)), anchor: None });
+            return Ok(at);
         }
         let Some(scope) = path.scope else { return self.refuse("a path with no scope", r) };
         let mut segs: AVec<'_, tc::Segment> = Vec::new_in(*self.out.segments.allocator());
-        for &n in self.v.segments(path)? {
+        // `::x` (the Reference, "Paths": a global path) starts at the root rustc names
+        // `{{root}}`: the crate root in edition 2015, the extern prelude from 2018. The world's
+        // resolution reads it as its first segment, as it reads `crate` and `super`.
+        if path.absolute {
+            segs.push(tc::Segment { name: Name::of("{{root}}"), generic_args: List::EMPTY, has_args: false });
+        }
+        let rows = self.v.segments(path)?;
+        let mut anchor = None;
+        let mut rest = rows;
+        let head = match rows.split_first() {
+            Some((&first, after)) => Some((Segment::decode(first)?, after)),
+            None => None,
+        };
+        if let Some((s, after)) = head
+            && s.kind == SegKind::Anchor
+        {
+            if !anchors {
+                return self.refuse("a qualified path (`<T as Tr>::x`) naming a struct", r);
+            }
+            // `<T as Tr>::x`, or `<T as Tr>::Assoc::x` through the trait's associated type.
+            let most = if s.trait_.is_some() { 2 } else { 1 };
+            if after.is_empty() || after.len() > most {
+                return self.refuse("a qualified path with more than one segment after `<T>`, or more than two after `<T as Tr>`", r);
+            }
+            let Some(t) = s.ty else { return self.refuse("a path anchor with no type", r) };
+            let ty = self.ty(t)?;
+            let trait_ = match s.trait_ {
+                None => None,
+                Some(tt) => match self.v.ty(tt)? {
+                    TypeRef::Path(tp) => Some(self.trait_path(tp, scope)?),
+                    _ => return self.refuse("a path anchor whose trait is not a path", r),
+                },
+            };
+            anchor = Some(tc::Anchor { ty, trait_ });
+            rest = after;
+        }
+        self.push_segments(rest, r, &mut segs)?;
+        let start = len(self.out.segments.len());
+        self.out.segments.extend_from_slice(&segs);
+        let at = PathIdx(len(self.out.paths.len()));
+        let segments = List { start, len: len(segs.len()) };
+        self.out.paths.push(tc::BodyPath { scope, segments, lang: None, anchor });
+        Ok(at)
+    }
+
+    /// The trait of a path anchor, `Tr` of `<T as Tr>::x`, as a path with no anchor of its own.
+    fn trait_path(&mut self, p: PathIdx, scope: ScopeId) -> Result<PathIdx, Refused> {
+        let r = self.v.path_range(p)?;
+        let path = self.v.path(p)?;
+        if path.lang.is_some() {
+            return self.refuse("a lang item's path as an anchor's trait", r);
+        }
+        let mut segs: AVec<'_, tc::Segment> = Vec::new_in(*self.out.segments.allocator());
+        if path.absolute {
+            segs.push(tc::Segment { name: Name::of("{{root}}"), generic_args: List::EMPTY, has_args: false });
+        }
+        let rows = self.v.segments(path)?;
+        self.push_segments(rows, r, &mut segs)?;
+        let start = len(self.out.segments.len());
+        self.out.segments.extend_from_slice(&segs);
+        let at = PathIdx(len(self.out.paths.len()));
+        let segments = List { start, len: len(segs.len()) };
+        self.out.paths.push(tc::BodyPath { scope: path.scope.unwrap_or(scope), segments, lang: None, anchor: None });
+        Ok(at)
+    }
+
+    /// Named segments (no anchor) onto `segs`.
+    fn push_segments(&mut self, rows: &[Node], r: BodyRange, segs: &mut AVec<'_, tc::Segment>) -> Result<(), Refused> {
+        for &n in rows {
             let s = Segment::decode(n)?;
             let name = match (s.kind, s.name) {
                 (SegKind::Ident, Some(n)) => self.name(n)?,
@@ -205,23 +553,23 @@ impl Conv<'_, '_, '_, '_, '_> {
                 (SegKind::Crate, _) => Name::of("crate"),
                 (SegKind::SelfTy, _) => Name::of("Self"),
                 (SegKind::DollarCrate, _) => Name::of("$crate"),
-                (SegKind::Anchor, _) => return self.refuse("a path anchor (`<T as Tr>::x`)", r),
+                (SegKind::Anchor, _) => return self.refuse("a path anchor after a path's first segment", r),
                 (SegKind::Ident, None) => return self.refuse("a segment with no name", r),
             };
             if s.parenthesized || s.return_notation {
                 return self.refuse("parenthesized arguments in a body path", r);
             }
-            let generic_args = if s.has_args { self.type_args(s.args, r)? } else { List::EMPTY };
-            segs.push(tc::Segment { name, generic_args, has_args: s.has_args });
+            let (generic_args, has_args) = if s.has_args { self.type_args(s.args, r)? } else { (List::EMPTY, false) };
+            segs.push(tc::Segment { name, generic_args, has_args });
         }
-        let start = len(self.out.segments.len());
-        self.out.segments.extend_from_slice(&segs);
-        let at = PathIdx(len(self.out.paths.len()));
-        self.out.paths.push(tc::BodyPath { scope, segments: List { start, len: len(segs.len()) } });
-        Ok(at)
+        Ok(())
     }
 
-    fn lit(&self, l: Lit, r: blaze_surface::Range) -> Result<tc::Lit, Refused> {
+    fn lit(&self, l: Lit, r: BodyRange) -> Result<tc::Lit, Refused> {
+        // The body's ranges are sites (rule 71): a literal an expansion made sits at its
+        // outermost call. Its value is never read at a range of the typeck body: its readers
+        // take it from the view (`View::text_at` of the node's own range), as consteval's
+        // `Lits` and the ladder's literal tables do.
         Ok(match l {
             Lit::Bool(b) => tc::Lit::Bool(b),
             Lit::Char => tc::Lit::Char,
@@ -229,26 +577,30 @@ impl Conv<'_, '_, '_, '_, '_> {
             Lit::ByteStr(n) => tc::Lit::ByteStr(n),
             Lit::Int(s) => tc::Lit::Int(s),
             Lit::Float(f) => tc::Lit::Float(f),
-            Lit::Byte => return self.refuse("a byte literal", r),
-            Lit::CStr => return self.refuse("a C string literal", r),
+            // `b'x'` is a `u8` literal (the reference, "Byte literals"): to the checker it is
+            // `97u8`. Its value is read from the text at the node's range, as every literal's.
+            Lit::Byte => tc::Lit::Int(Some(tc::IntSuffix::Uint(tc::UintTy::U8))),
+            Lit::CStr => tc::Lit::CStr,
         })
     }
 
     fn expr(&mut self, e: ExprId) -> Result<tc::Expr, Refused> {
-        let r = self.v.expr_range(e);
+        let r = self.v.expr_range(e)?;
         Ok(match self.v.expr(e)? {
             Expr::Missing => tc::Expr::Missing,
             Expr::Lit(l) => tc::Expr::Lit(self.lit(l, r)?),
             Expr::Local { pat, .. } => tc::Expr::Local(pat),
-            Expr::Path(p) => tc::Expr::Path(self.path(p)?),
+            Expr::Path(p) => tc::Expr::Path(self.path(p, true)?),
             Expr::Paren(i) => tc::Expr::Paren(i),
             Expr::Block { stmts, tail, scope, kind } => match kind {
-                BlockKind::Plain | BlockKind::Unsafe => tc::Expr::Block { stmts: self.stmts(stmts)?, tail, scope },
-                BlockKind::Const => return self.refuse("a const block", r),
-                BlockKind::Try => return self.refuse("a try block", r),
+                // A `try` block is a block its `?`s break to, its tail already `Try::from_output`.
+                BlockKind::Plain | BlockKind::Unsafe | BlockKind::Try => {
+                    tc::Expr::Block { stmts: self.stmts(stmts)?, tail, scope }
+                }
+                BlockKind::Const => tc::Expr::ConstBlock { stmts: self.stmts(stmts)?, tail, scope },
             },
             Expr::If { cond, then, else_ } => tc::Expr::If { cond, then, else_ },
-            Expr::Let { .. } => return self.refuse("`let` in a condition", r),
+            Expr::Let { pat, init } => tc::Expr::Let { pat, init },
             Expr::Match { scrutinee, arms, .. } => {
                 let start = len(self.out.arms.len());
                 for &n in self.v.rows(arms)? {
@@ -268,7 +620,7 @@ impl Conv<'_, '_, '_, '_, '_> {
             Expr::Call { callee, args } => tc::Expr::Call { callee, args: self.exprs(args)? },
             Expr::MethodCall { row, scope } => {
                 let m = MethodCall::decode(self.v.row(row)?)?;
-                let generic_args = if m.has_args { self.type_args(m.generic_args, r)? } else { List::EMPTY };
+                let generic_args = if m.has_args { self.type_args(m.generic_args, r)?.0 } else { List::EMPTY };
                 tc::Expr::MethodCall {
                     receiver: m.receiver,
                     name: self.name(m.name)?,
@@ -283,19 +635,22 @@ impl Conv<'_, '_, '_, '_, '_> {
             Expr::Binary { op, lhs, rhs } => tc::Expr::Binary { op, lhs, rhs },
             Expr::Assign { lhs, rhs } => tc::Expr::Assign { lhs, rhs },
             Expr::AssignOp { op, lhs, rhs } => tc::Expr::AssignOp { op, lhs, rhs },
-            Expr::Ref { raw: true, .. } => return self.refuse("a raw borrow", r),
+            Expr::Ref { mutbl, operand, raw: true } => tc::Expr::RawRef { mutbl, operand },
             Expr::Ref { mutbl, operand, raw: false } => tc::Expr::Ref { mutbl, operand },
             Expr::Cast { operand, ty } => tc::Expr::Cast { operand, ty: self.ty(ty)? },
             Expr::Tuple { elems } => tc::Expr::Tuple { elems: self.exprs(elems)? },
             Expr::Array { elems } => tc::Expr::Array { elems: self.exprs(elems)? },
-            Expr::Repeat { elem, len } => tc::Expr::Repeat { elem, len: self.types.repeat_len(self.v, self.text, len)? },
+            Expr::Repeat { elem, len } => {
+                let n = self.types.repeat_len(self.v, len)?;
+                tc::Expr::Repeat { elem, len: self.tys.usize_value(n)?, count: Some(len) }
+            }
             Expr::Struct { path, fields, base } => {
                 let base = match base {
                     StructBase::None => None,
                     StructBase::Expr(b) => Some(b),
                     StructBase::Defaults => return self.refuse("struct field defaults (`..`)", r),
                 };
-                let path = self.path(path)?;
+                let path = self.path(path, false)?;
                 let start = len(self.out.field_inits.len());
                 for &n in self.v.rows(fields)? {
                     let f = FieldInit::decode(n)?;
@@ -307,9 +662,17 @@ impl Conv<'_, '_, '_, '_, '_> {
             Expr::Index { base, index } => tc::Expr::Index { base, index },
             Expr::Closure { row } => {
                 let c = Closure::decode(self.v.row(row)?)?;
-                if c.kind != CoroutineKind::None {
-                    return self.refuse("a coroutine (async or gen)", r);
-                }
+                let is_async = match (c.kind, c.source) {
+                    (CoroutineKind::None, _) => false,
+                    (CoroutineKind::Async, CoroutineSource::Block) => {
+                        let capture = if c.capture_by_value { tc::Capture::Move } else { tc::Capture::Ref };
+                        return Ok(tc::Expr::AsyncBlock { body: c.body, capture });
+                    }
+                    (CoroutineKind::Async, CoroutineSource::Closure) => true,
+                    (CoroutineKind::Gen | CoroutineKind::AsyncGen, _) => {
+                        return self.refuse("a `gen` coroutine", r);
+                    }
+                };
                 let pstart = len(self.out.pat_lists.len());
                 let tstart = len(self.out.opt_types.len());
                 for &n in self.v.rows(c.params)? {
@@ -325,18 +688,89 @@ impl Conv<'_, '_, '_, '_, '_> {
                     param_tys: List { start: tstart, len: c.params.len },
                     ret,
                     body: c.body,
+                    is_async,
                 }
             }
-            Expr::FormatArgs { .. } => return self.refuse("format arguments", r),
+            Expr::FormatArgs { row } => self.format_args(row, r)?,
             Expr::MacroCall { .. } => return self.refuse("a macro call", r),
             Expr::Asm => return self.refuse("inline assembly", r),
-            Expr::OffsetOf { .. } => return self.refuse("`offset_of!`", r),
-            Expr::Underscore => return self.refuse("`_` as an expression", r),
+            Expr::OffsetOf { ty, fields } => {
+                let ty = self.ty(ty)?;
+                let start = len(self.out.segments.len());
+                for &n in self.v.ids(fields)? {
+                    // A tuple's field is named by its digits (`Name::of_index`).
+                    let name = self.name(NameIdx(n))?;
+                    self.out.segments.push(tc::Segment { name, generic_args: List::EMPTY, has_args: false });
+                }
+                tc::Expr::OffsetOf { ty, fields: List { start, len: fields.len } }
+            }
+            Expr::Underscore => tc::Expr::Underscore,
+            Expr::Await(e) => tc::Expr::Await(e),
         })
     }
 
+    /// `format_args!`: its arguments in order, and per placeholder what it asks of its
+    /// argument (the spec's trait) and of the arguments its width and precision name (`usize`).
+    fn format_args(&mut self, row: RowIdx, r: BodyRange) -> Result<tc::Expr, Refused> {
+        let f = self.v.format_args(self.v.row(row)?)?;
+        let arg_rows = self.v.rows(f.args)?;
+        let start = len(self.out.expr_lists.len());
+        for &n in arg_rows {
+            self.out.expr_lists.push(FmtArg::decode(n)?.expr);
+        }
+        let args = List { start, len: f.args.len };
+        let uses_start = len(self.out.fmt_uses.len());
+        for &n in self.v.rows(f.pieces)? {
+            let FmtPiece::Arg { arg, spec: spec_r } = self.v.fmt_piece(n)? else { continue };
+            let spec = self.v.text_at(spec_r)?;
+            let Some(parsed) = fmt_spec(spec) else { return self.refuse("this format spec", r) };
+            if arg >= f.args.len {
+                return self.refuse("a format placeholder past its arguments", r);
+            }
+            for count in [parsed.width, parsed.precision].into_iter().flatten() {
+                let index = match count {
+                    Count::Index(i) => Some(i),
+                    Count::Name(name) => self.fmt_arg_named(arg_rows, name)?,
+                    // `{:.*}`: the implicit positional before the value's. After a named or
+                    // numbered value (`{x:.*}`) it is the next implicit one, which the record
+                    // does not keep: refused by name, never guessed.
+                    Count::Star => {
+                        let template = self.v.text_at(f.template)?;
+                        let colon = spec_r.raw().start.saturating_sub(f.template.raw().start + 1) as usize;
+                        let open = template.get(..colon).and_then(|t| t.rfind('{'));
+                        let implicit = open.and_then(|o| template.get(o + 1..colon)).is_some_and(|a| a.trim().is_empty());
+                        if !implicit {
+                            return self.refuse("`.*` after a named or numbered argument", r);
+                        }
+                        arg.checked_sub(1)
+                    }
+                };
+                let Some(index) = index else { return self.refuse("a format count naming no argument", r) };
+                if index >= f.args.len {
+                    return self.refuse("a format count past its arguments", r);
+                }
+                self.out.fmt_uses.push(tc::FmtUse { arg: index, trait_: tc::FmtTrait::Count });
+            }
+            self.out.fmt_uses.push(tc::FmtUse { arg, trait_: parsed.trait_ });
+        }
+        let uses = List { start: uses_start, len: len(self.out.fmt_uses.len()) - uses_start };
+        Ok(tc::Expr::FormatArgs { args, uses })
+    }
+
+    /// The position of the argument named `name` among `rows`.
+    fn fmt_arg_named(&self, rows: &[Node], name: &str) -> Result<Option<u32>, Refused> {
+        for (i, &n) in rows.iter().enumerate() {
+            if let Some(nm) = FmtArg::decode(n)?.name
+                && self.v.name_text(nm)? == name
+            {
+                return Ok(Some(len(i)));
+            }
+        }
+        Ok(None)
+    }
+
     fn pat(&mut self, p: PatId) -> Result<tc::Pat, Refused> {
-        let r = self.v.pat_ranges.get(p.0 as usize).copied().unwrap_or_default();
+        let r = self.v.pat_range(p)?;
         Ok(match self.v.pat(p)? {
             Pat::Missing => tc::Pat::Missing,
             Pat::Wild => tc::Pat::Wild,
@@ -345,12 +779,12 @@ impl Conv<'_, '_, '_, '_, '_> {
             Pat::Ref { mutbl, inner } => tc::Pat::Ref { mutbl, inner },
             Pat::Lit(l) => tc::Pat::Lit(self.lit(l, r)?),
             Pat::NegLit(l) => tc::Pat::NegLit(self.lit(l, r)?),
-            Pat::Path(x) => tc::Pat::Path(self.path(x)?),
+            Pat::Path(x) => tc::Pat::Path(self.path(x, true)?),
             Pat::TupleStruct { path, elems, rest } => {
-                tc::Pat::TupleStruct { path: self.path(path)?, elems: self.pats(elems)?, rest }
+                tc::Pat::TupleStruct { path: self.path(path, true)?, elems: self.pats(elems)?, rest }
             }
             Pat::Struct { path, fields, rest } => {
-                let path = self.path(path)?;
+                let path = self.path(path, false)?;
                 let start = len(self.out.field_pats.len());
                 for &n in self.v.rows(fields)? {
                     let f = FieldPat::decode(n)?;
@@ -360,11 +794,15 @@ impl Conv<'_, '_, '_, '_, '_> {
                 tc::Pat::Struct { path, fields: List { start, len: fields.len }, rest }
             }
             Pat::Or { alts } => tc::Pat::Or { alts: self.pats(alts)? },
-            Pat::Slice { elems, rest: None } => tc::Pat::Slice { elems: self.pats(elems)? },
-            Pat::Slice { rest: Some(_), .. } => return self.refuse("a slice pattern with `..`", r),
+            Pat::Slice { elems, rest } => tc::Pat::Slice { elems: self.pats(elems)?, rest },
             Pat::Box(_) => return self.refuse("a box pattern", r),
-            Pat::Range { .. } => return self.refuse("a range pattern", r),
-            Pat::Rest => return self.refuse("a rest pattern", r),
+            Pat::Range { lo, hi, inclusive } => tc::Pat::Range { lo, hi, inclusive },
+            // A slice's `..` is in its list at the slice's `rest`, where the checker types it as
+            // the subslice. Any other `..` (a tuple's, tuple struct's or struct's) is its list's
+            // `rest` (an index or a flag) and its node is in no list: no value, a hole the
+            // checker never reaches ("Rest patterns": it matches elements, it is no place).
+            Pat::Rest if self.slice_rest.get(p.0 as usize).copied().unwrap_or(false) => tc::Pat::Wild,
+            Pat::Rest => tc::Pat::Missing,
             Pat::MacroCall { .. } => return self.refuse("a macro call", r),
         })
     }
@@ -378,11 +816,14 @@ impl Conv<'_, '_, '_, '_, '_> {
     }
 }
 
-/// Converts the body record `view` (of the item `text`, filed as `owner`) to blaze-typeck's
-/// form, its written types interned into `tys` by `types`; every column in `alloc`.
+/// Converts the body record `view` (filed as `owner`) to blaze-typeck's form, its written
+/// types interned into `tys` by `types`; every column in `alloc`.
+///
+/// Each expression's and pattern's range is item-relative (rule 71): a node an expansion made
+/// is at the macro call it came from ([`View::site`]), and a literal it made is refused, since
+/// a literal's value is read from the item's text at its range.
 pub fn to_typeck<'a>(
     view: &View<'_>,
-    text: &str,
     owner: ItemKey,
     tys: &mut PortableTys<'_>,
     types: &mut dyn Types,
@@ -398,15 +839,23 @@ pub fn to_typeck<'a>(
         2 => blaze_surface::Edition::E2021,
         _ => blaze_surface::Edition::E2024,
     };
+    let mut expr_ranges = Vec::with_capacity_in(view.exprs.len(), alloc);
+    for i in 0..view.exprs.len() {
+        expr_ranges.push(range(view.site(view.expr_range(ExprId(len(i)))?)?));
+    }
+    let mut pat_ranges = Vec::with_capacity_in(view.pats.len(), alloc);
+    for i in 0..view.pats.len() {
+        pat_ranges.push(range(view.site(view.pat_range(PatId(len(i)))?)?));
+    }
     let out = TypeckBody {
         owner,
         edition: edition(ed),
         params: Vec::new_in(alloc),
         root,
         exprs: Vec::with_capacity_in(view.exprs.len(), alloc),
-        expr_ranges: Vec::from_iter_in(view.expr_ranges.iter().map(|r| range(*r)), alloc),
+        expr_ranges,
         pats: Vec::with_capacity_in(view.pats.len(), alloc),
-        pat_ranges: Vec::from_iter_in(view.pat_ranges.iter().map(|r| range(*r)), alloc),
+        pat_ranges,
         stmts: Vec::with_capacity_in(view.stmts.len(), alloc),
         expr_lists: Vec::new_in(alloc),
         pat_lists: Vec::new_in(alloc),
@@ -418,8 +867,38 @@ pub fn to_typeck<'a>(
         segments: Vec::new_in(alloc),
         type_lists: Vec::new_in(alloc),
         opt_types: Vec::new_in(alloc),
+        fmt_uses: Vec::new_in(alloc),
+        coroutine: None,
     };
-    let mut c = Conv { v: view, text, tys, types, out };
+    let mut slice_rest: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(view.pats.len(), alloc);
+    slice_rest.resize(view.pats.len(), false);
+    for i in 0..view.pats.len() {
+        let Pat::Slice { elems, rest: Some(at) } = view.pat(PatId(len(i)))? else { continue };
+        let Some(&id) = view.ids(elems)?.get(at as usize) else {
+            return Err(Refused::Form { what: "a slice pattern's `..` past its list", range: view.site(view.pat_range(PatId(len(i)))?)? });
+        };
+        let under = match view.pat(PatId(id))? {
+            Pat::Bind { sub: Some(s), .. } => Some(s.0 as usize),
+            _ => None,
+        };
+        for k in [Some(id as usize), under].into_iter().flatten() {
+            if let Some(b) = slice_rest.get_mut(k) {
+                *b = true;
+            }
+        }
+    }
+    let mut c = Conv { v: view, tys, types, out, slice_rest };
+    // An async fn's body: checked against its written return type, `()` when none is written.
+    if view.head[head::FLAGS] & crate::machine::sig::ASYNC != 0 {
+        let output = match unopt(view.head[head::TY]) {
+            Some(t) => c.ty(TypeId(t))?,
+            None => {
+                let none = c.tys.intern_list(&[]).map_err(Refused::Check)?;
+                c.tys.intern(tc::PNode::Tuple(none)).map_err(Refused::Check)?
+            }
+        };
+        c.out.coroutine = Some(tc::CoroutineKind::Async { output });
+    }
     for &p in params {
         match unopt(p) {
             Some(p) => c.out.params.push(PatId(p)),
@@ -439,4 +918,259 @@ pub fn to_typeck<'a>(
         c.out.stmts.push(s);
     }
     Ok(c.out)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Pattern types: `core::pattern_type!(T is PAT)` (typeck.md, "Pattern types")
+
+/// One end of a range as written in a pattern type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PatEnd<'t> {
+    /// An integer literal, its sign apart (`-1` is `{ neg: true, magnitude: 1 }`).
+    Int { neg: bool, magnitude: u128 },
+    /// A `char` literal, by its scalar value.
+    Char(u32),
+    /// A path to a constant (`HALF_USIZE`, `u32::MAX`): the caller evaluates it.
+    Path(&'t str),
+}
+
+/// One range of a pattern type as written: `start..end`, `start..=end`, an end left open, or a
+/// single literal (`start ..= start`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PatRange<'t> {
+    pub start: Option<PatEnd<'t>>,
+    pub end: Option<PatEnd<'t>>,
+    pub inclusive: bool,
+}
+
+/// The input of `pattern_type!` read from its text: the base's text (the caller lowers it as a
+/// type) and the pattern, `!null` or an or of ranges (at most
+/// `blaze_typeck::MAX_PATTERN_RANGES`).
+#[derive(Clone, Copy, Debug)]
+pub struct PatternTypeText<'t> {
+    pub base: &'t str,
+    pub not_null: bool,
+    pub ranges: [Option<PatRange<'t>>; blaze_typeck::MAX_PATTERN_RANGES],
+}
+
+/// Reads `T is PAT`, the input of the pinned library's built-in `pattern_type!` (core/src/pat.rs;
+/// the forms core writes are in typeck.md, "Pattern types": integer and `char` ranges with
+/// literal or path ends, ors of them, and `!null`). A form outside these is
+/// `Refused::Form` naming it, at `range` (the macro call's).
+pub fn parse_pattern_type(input: &str, range: blaze_surface::Range) -> Result<PatternTypeText<'_>, Refused> {
+    let refuse = |what: &'static str| Refused::Form { what, range };
+    let at = word_at(input, "is").ok_or(refuse("a `pattern_type!` without `is`"))?;
+    let base = input[..at].trim();
+    let pat = input[at + 2..].trim();
+    if base.is_empty() {
+        return Err(refuse("a `pattern_type!` without a base type"));
+    }
+    let mut out = PatternTypeText { base, not_null: false, ranges: [None; blaze_typeck::MAX_PATTERN_RANGES] };
+    if let Some(rest) = pat.strip_prefix('!') {
+        if rest.trim() != "null" {
+            return Err(refuse("a negated pattern other than `!null` in a pattern type"));
+        }
+        out.not_null = true;
+        return Ok(out);
+    }
+    for (i, alt) in pat.split('|').enumerate() {
+        let slot = out.ranges.get_mut(i).ok_or(refuse("a pattern type with more than 16 ranges"))?;
+        let alt = alt.trim();
+        let (start, end, inclusive) = match alt.find("..") {
+            Some(dots) => {
+                let (inclusive, after) = match alt[dots + 2..].strip_prefix('=') {
+                    Some(after) => (true, after),
+                    None => (false, &alt[dots + 2..]),
+                };
+                let start = alt[..dots].trim();
+                let after = after.trim();
+                let start = if start.is_empty() { None } else { Some(pat_end(start).ok_or(refuse("a range end in a pattern type that is not a literal or a path"))?) };
+                let end = if after.is_empty() { None } else { Some(pat_end(after).ok_or(refuse("a range end in a pattern type that is not a literal or a path"))?) };
+                if end.is_none() && inclusive {
+                    return Err(refuse("an inclusive range with no end in a pattern type"));
+                }
+                (start, end, inclusive)
+            }
+            None => {
+                let one = pat_end(alt).ok_or(refuse("a pattern in a pattern type that is not a range, a literal or `!null`"))?;
+                (Some(one), Some(one), true)
+            }
+        };
+        *slot = Some(PatRange { start, end, inclusive });
+    }
+    Ok(out)
+}
+
+/// The byte offset of `word` standing alone (not inside an identifier) in `text`.
+fn word_at(text: &str, word: &str) -> Option<usize> {
+    let ident = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+    let bytes = text.as_bytes();
+    let mut from = 0;
+    while let Some(i) = text[from..].find(word) {
+        let at = from + i;
+        let before = at == 0 || !ident(bytes[at - 1]);
+        let after = bytes.get(at + word.len()).is_none_or(|&c| !ident(c));
+        if before && after {
+            return Some(at);
+        }
+        from = at + word.len();
+    }
+    None
+}
+
+/// One range end: an integer literal (any radix, `_`s, a type suffix), a `char` literal, or a
+/// path; `None` for anything else.
+fn pat_end(text: &str) -> Option<PatEnd<'_>> {
+    let text = text.trim();
+    if let Some(body) = text.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')) {
+        return char_value(body).map(PatEnd::Char);
+    }
+    let (neg, digits) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest.trim_start()),
+        None => (false, text),
+    };
+    if digits.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+        return int_value(digits).map(|magnitude| PatEnd::Int { neg, magnitude });
+    }
+    let path_char = |c: char| c.is_ascii_alphanumeric() || c == '_' || c == ':' || c == '$';
+    if !neg && !digits.is_empty() && digits.chars().all(path_char) {
+        return Some(PatEnd::Path(digits));
+    }
+    None
+}
+
+/// An integer literal's value: `0x`, `0o`, `0b` or decimal, `_`s ignored, an integer type suffix
+/// dropped.
+fn int_value(text: &str) -> Option<u128> {
+    let (radix, body) = match text.get(..2) {
+        Some("0x") => (16, &text[2..]),
+        Some("0o") => (8, &text[2..]),
+        Some("0b") => (2, &text[2..]),
+        _ => (10, text),
+    };
+    let mut value: u128 = 0;
+    let mut any = false;
+    for (i, c) in body.char_indices() {
+        if c == '_' {
+            continue;
+        }
+        match c.to_digit(radix) {
+            Some(d) => {
+                value = value.checked_mul(u128::from(radix))?.checked_add(u128::from(d))?;
+                any = true;
+            }
+            None if matches!(&body[i..], "u8" | "u16" | "u32" | "u64" | "u128" | "usize" | "i8" | "i16" | "i32" | "i64" | "i128" | "isize") => break,
+            None => return None,
+        }
+    }
+    any.then_some(value)
+}
+
+/// A `char` literal's body (between the quotes): one character, a `\u{..}` escape or a simple
+/// escape.
+fn char_value(body: &str) -> Option<u32> {
+    if let Some(hex) = body.strip_prefix("\\u{").and_then(|t| t.strip_suffix('}')) {
+        return u32::from_str_radix(&hex.replace('_', ""), 16).ok().filter(|v| char::from_u32(*v).is_some());
+    }
+    let simple = match body {
+        "\\n" => Some('\n'),
+        "\\r" => Some('\r'),
+        "\\t" => Some('\t'),
+        "\\0" => Some('\0'),
+        "\\\\" => Some('\\'),
+        "\\'" => Some('\''),
+        _ => None,
+    };
+    if let Some(c) = simple {
+        return Some(c as u32);
+    }
+    let mut chars = body.chars();
+    let c = chars.next()?;
+    (chars.next().is_none() && c != '\\').then_some(c as u32)
+}
+
+/// The pattern type `base is PAT` from what [`parse_pattern_type`] read, `base` already lowered
+/// by the caller (`Types::ty`), as `blaze_typeck`'s canonical node. `pointer_bits` is the
+/// target's pointer width (`usize`, `isize` and an address); `eval` gives the bits of a path end
+/// (a constant of the base's type, evaluated by the caller's constant evaluator). A base that is
+/// not an integer, `char`, raw pointer or (for `!null`) a generic parameter is `Refused::Form`.
+pub fn pattern_type(
+    tys: &mut PortableTys<'_>,
+    base: PTy,
+    text: &PatternTypeText<'_>,
+    pointer_bits: u32,
+    range: blaze_surface::Range,
+    eval: &mut dyn FnMut(&str) -> Result<u128, Refused>,
+) -> Result<PTy, Refused> {
+    use blaze_typeck::{IntTy, PNode, UintTy};
+    let refuse = |what: &'static str| Refused::Form { what, range };
+    let width = |i: Option<IntTy>, u: Option<UintTy>| match (i, u) {
+        (Some(IntTy::I8), _) | (_, Some(UintTy::U8)) => 8,
+        (Some(IntTy::I16), _) | (_, Some(UintTy::U16)) => 16,
+        (Some(IntTy::I32), _) | (_, Some(UintTy::U32)) => 32,
+        (Some(IntTy::I64), _) | (_, Some(UintTy::U64)) => 64,
+        (Some(IntTy::I128), _) | (_, Some(UintTy::U128)) => 128,
+        _ => pointer_bits,
+    };
+    if text.not_null {
+        // `!null` is every address but zero (pat.rs, non_null.rs `NonNull::pointer`).
+        match tys.view().node(base)? {
+            PNode::Ptr(..) | PNode::Param(_) => {}
+            _ => return Err(refuse("`!null` on a type that is not a raw pointer")),
+        }
+        let usize_ = tys.intern(PNode::Uint(UintTy::Usize))?;
+        let max = if pointer_bits >= 128 { u128::MAX } else { (1u128 << pointer_bits) - 1 };
+        return Ok(tys.pattern(base, usize_, pointer_bits, &[(1, max)])?);
+    }
+    // The base's width, signedness and value range (`char`'s is its scalar values).
+    let (bits, signed, min, max) = match tys.view().node(base)? {
+        PNode::Int(i) => {
+            let w = width(Some(i), None);
+            let sign = 1u128 << (w - 1);
+            (w, true, sign, sign - 1)
+        }
+        PNode::Uint(u) => {
+            let w = width(None, Some(u));
+            (w, false, 0, if w >= 128 { u128::MAX } else { (1u128 << w) - 1 })
+        }
+        PNode::Char => (32, false, 0, 0x10_FFFF),
+        _ => return Err(refuse("a range pattern type over a type that is not an integer or `char`")),
+    };
+    let mask = if bits >= 128 { u128::MAX } else { (1u128 << bits) - 1 };
+    // Numeric order of two values' bits: a signed value's sign bit flipped.
+    let key = |v: u128| if signed { v ^ (1u128 << (bits - 1)) } else { v };
+    let mut value = |end: PatEnd<'_>| -> Result<u128, Refused> {
+        Ok(match end {
+            PatEnd::Int { neg: false, magnitude } => magnitude,
+            PatEnd::Int { neg: true, magnitude } if signed => magnitude.wrapping_neg(),
+            PatEnd::Int { neg: true, .. } => return Err(refuse("a negative end in a pattern type over an unsigned base")),
+            PatEnd::Char(c) => u128::from(c),
+            PatEnd::Path(p) => eval(p)?,
+        } & mask)
+    };
+    let mut pairs = [(0u128, 0u128); blaze_typeck::MAX_PATTERN_RANGES];
+    let mut n = 0;
+    for r in text.ranges.iter().flatten() {
+        let start = match r.start {
+            Some(e) => value(e)?,
+            None => min,
+        };
+        let end = match (r.end, r.inclusive) {
+            (Some(e), true) => value(e)?,
+            (Some(e), false) => {
+                let e = value(e)?;
+                if key(e) <= key(start) {
+                    return Err(refuse("an empty range in a pattern type"));
+                }
+                e.wrapping_sub(1) & mask
+            }
+            (None, _) => max,
+        };
+        if key(start) > key(end) {
+            return Err(refuse("an empty range in a pattern type"));
+        }
+        pairs[n] = (start, end);
+        n += 1;
+    }
+    Ok(tys.pattern(base, base, bits, &pairs[..n])?)
 }

@@ -4,19 +4,35 @@
 
 use core::alloc::Allocator;
 
-use blaze_lir::builder::{MemAttrs, Param, Variadic};
-use blaze_lir::func::{BlockKind, Conv, Ext, RefKind, SlotId, SlotKind};
+use std::alloc::Global;
+
+use blaze_lir::builder::{DataReloc, Facts, MemAttrs, Param, Variadic};
+use blaze_lir::func::{BlockKind, Conv, Ext, ParamKind, RefId, RefKind, SlotId, SlotKind};
 use blaze_lir::{Block, Builder, Flags, Full, IntCond, Op, Ty, Value};
 use blaze_own::Alloc;
 use blaze_typeck::{
-    AdjustKind, AdtKind, BinOp, BodyView, Checked, Expr, ExprId, FnSig, IntTy, Lit, Name, PNode, PTy, PTys, Pat,
-    PatId, PortableTys, Stmt, StmtId, UintTy, UnOp,
+    AdjustKind, AdtKind, BinOp, BodyView, Checked, CtorKind, Def, Edition, Expr, ExprId, FnSig, IntTy, ItemKey, LangItem, List, Lit, Mutbl,
+    Name, PNode, PTy, PTys, Pat, PatId, PortableTys, Stmt, StmtId, UintTy, UnOp,
 };
 
-use crate::{Adts, BuildError, Built, Instance, Subst, ground};
+use crate::cabi::{self, CAbiError, Class};
+use crate::data::{DataRecord, DataTarget};
+use crate::intrinsics::{self, Arg, Call, GenericArg, IntrinsicCx, IntrinsicError, Out, Which};
+use crate::layout::{LayoutCx, LayoutError, LayoutId, Layouts, Prim, Refusal, Tail, Variants};
+use crate::vtable::ObjectRead;
+use crate::{Abi, Adts, BuildError, Built, Instance, Intrinsic, Subst, ground};
 
 /// The target's pointer width: the ladder runs on AArch64.
 const PTR_BITS: u32 = 64;
+
+/// The lang item an index past an array's end calls.
+const BOUNDS_FN: &str = "panic_bounds_check";
+
+/// The lang item fn a drop calls; its instance at `T` is built as `T`'s drop glue.
+const DROP_FN: &str = "drop_in_place";
+
+/// No parent expression, or no declaring block (a parameter), in the flag scan.
+const NO_EXPR: u32 = u32::MAX;
 
 /// A record type not grounded yet, in `Walk::grounded`.
 const UNGROUNDED: PTy = PTy(u32::MAX);
@@ -30,8 +46,8 @@ enum Repr {
     /// An `i8` of 0 or 1.
     Bool,
     Ptr,
-    /// A struct, by its row of `layouts`.
-    Struct(u32),
+    /// An aggregate of a non-zero size (a struct, a tuple, an array), by its row of `layouts`.
+    Agg(u32),
 }
 
 impl Repr {
@@ -41,10 +57,13 @@ impl Repr {
             Repr::Int { ty, .. } => Some(ty),
             Repr::Bool => Some(Ty::I8),
             Repr::Ptr => Some(Ty::PTR),
-            Repr::None | Repr::Struct(_) => None,
+            Repr::None | Repr::Agg(_) => None,
         }
     }
 }
+
+/// At most this many scalar leaves are copied unrolled; an array of more is copied in a loop.
+const UNROLL_LEAVES: u64 = 16;
 
 /// An evaluated expression.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -73,15 +92,106 @@ fn ground_err(error: BuildError) -> TyErr {
     }
 }
 
-/// A struct's layout at its arguments: its fields in `layout_fields[first..first + len]`.
+/// Layout's refusals as type errors (`Layouts` is the one layout: rule 30).
+fn layout_err(error: LayoutError) -> TyErr {
+    match error.why {
+        Refusal::Unsupported(what) => TyErr::Unsupported(what),
+        Refusal::Malformed(what) => TyErr::Malformed(what),
+        Refusal::Recursive => TyErr::Malformed("an aggregate that contains itself by value"),
+        Refusal::TooLarge => TyErr::Unsupported("a type larger than `isize::MAX` bytes"),
+        Refusal::NoAdt(adt) => TyErr::Other(BuildError::NoAdt { adt }),
+        Refusal::Ground(error) => ground_err(error),
+        Refusal::Missing(m) => TyErr::Other(BuildError::MissingRecord { item: m.item }),
+    }
+}
+
+/// The LIR type of a layout primitive (a pointer niche is a `ptr`).
+fn prim_ty(prim: Prim) -> Ty {
+    crate::intrinsics::lir(prim).0
+}
+
+/// An aggregate's walk row at its arguments: what `Layouts` says of it (size, alignment,
+/// offsets, stride), with how each part is held (`Repr`) and whether it needs drop.
 struct Layout {
-    /// The struct type, `Adt(key, args)` of the ground table.
+    /// The aggregate's type, of the ground table.
     ty: PTy,
     size: u32,
     /// log2 of the alignment.
     align: u8,
-    first: u32,
-    len: u32,
+    /// How many scalars a copy moves (saturating).
+    leaves: u64,
+    shape: Shape,
+    /// It needs drop: it has a `Drop` impl, or a part that needs drop.
+    needs_drop: bool,
+    /// Its `Drop` impl's fn, as the `Drop` trait's `drop` (a call at `[ty]` runs the impl's).
+    drop_fn: Option<ItemKey>,
+    /// A union: its `Fields` overlap at offset 0, and its glue drops none of them.
+    is_union: bool,
+}
+
+/// A binding whose type needs drop: its ground type, its drop flag if it has one, and its
+/// field flags if a `match` may move fields out of it (codegen.md, "A `match` by value on an
+/// enum that needs drop"): a 64-bit word, bit `field_bit` set while that field is held.
+#[derive(Clone, Copy)]
+struct Owned {
+    ty: PTy,
+    flag: Option<SlotId>,
+    rest: Option<SlotId>,
+}
+
+/// An entry of a drop scope: a binding, or what an arm of a `match` by value on a temporary
+/// left of it (`variant` the arm's, `moved` the `field_bit`s it moved out; `None`: nothing
+/// moved, the whole value), dropped at the arm's end, after the arm's bindings.
+#[derive(Clone, Copy)]
+enum Held {
+    Pat(PatId),
+    Rest { at: (Value, i32), l: u32, variant: Option<u32>, moved: u64 },
+}
+
+/// Who owns a `match`'s scrutinee while its arms move out of it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Owner {
+    /// Nothing to own: no drop, or matched through a reference.
+    None,
+    /// A local, matched in place: its moves clear its field flags.
+    Local(PatId),
+    /// A temporary: each arm holds its rest (`Held::Rest`).
+    Temp,
+}
+
+#[derive(Clone, Copy)]
+enum Shape {
+    /// A struct's or tuple's fields (a wide pointer's address and length), in
+    /// `layout_fields[first..first + len]`.
+    Fields { first: u32, len: u32 },
+    /// `len` elements of `elem`, `stride` bytes apart.
+    Array { elem: Repr, len: u32, stride: u32 },
+    /// An enum (lib.rs, "Enums"): its layout `id` in `ls` (the tag, its encoding, the
+    /// discriminants), its variants' fields in `layout_variants[first..first + len]`, each a
+    /// range of `layout_fields` at their offsets in the enum.
+    Enum { id: LayoutId, first: u32, len: u32 },
+}
+
+/// Where a binding lives: its own slot, or memory it was given (a caller's copy of an
+/// aggregate argument, the temporary an aggregate expression was built in).
+#[derive(Clone, Copy)]
+enum Home {
+    Slot(SlotId),
+    At(Value, i32),
+}
+
+/// One step of an aggregate copy (`Walk::copy`).
+#[derive(Clone, Copy)]
+enum CopyStep {
+    Copy { repr: Repr, from: (Value, i32), to: (Value, i32) },
+    /// The end of a loop's body over an array: the next element, or out.
+    Next { i: Value, header: Block, exit: Block },
+    /// Start building into a block (an enum variant's copy, or the copy's join).
+    Begin(Block),
+    /// The end of an enum variant's copy: on to the join.
+    Jump(Block),
+    /// Write variant `variant`'s tag of enum layout `id` at `to` (after its fields).
+    Tag { id: LayoutId, variant: u32, to: (Value, i32) },
 }
 
 /// What `break` and `continue` reach: a loop, or a block a `break` leaves.
@@ -92,6 +202,8 @@ struct Target {
     header: Option<Block>,
     exit: Block,
     repr: Repr,
+    /// The drop scopes open outside it: leaving it drops every scope from this depth on.
+    depth: u32,
 }
 
 /// A match being built: its arms' blocks are `arm_blocks[first..first + arms + 1]`, the last
@@ -99,14 +211,24 @@ struct Target {
 #[derive(Clone, Copy)]
 struct MatchState {
     expr: ExprId,
+    /// The value switched on: the scrutinee, or an enum scrutinee's tag.
     scrutinee: Value,
     width: u32,
+    /// An enum scrutinee: its place and its walk row, which its arms' variant patterns bind
+    /// from, and its layout in `ls`, whose discriminants the arms' variants are.
+    of_enum: Option<((Value, i32), u32, LayoutId)>,
     join: Block,
     repr: Repr,
     first: u32,
     arms: u32,
     /// Some arm has a guard: the arms are tested in turn rather than by one `switch`.
     guarded: bool,
+    /// The scrutinee was a reference the arms' patterns matched through (the reference's
+    /// "Binding modes": the default binding mode becomes `ref`): each binding takes its
+    /// part's address, nothing is moved or dropped.
+    by_ref: bool,
+    /// By value on an enum that needs drop: who holds what the arms do not move.
+    owner: Owner,
 }
 
 #[derive(Clone, Copy)]
@@ -115,13 +237,34 @@ enum Task {
     Eval(ExprId),
     /// Evaluate without the adjustments.
     Raw(ExprId),
-    Adjust(ExprId),
+    /// Apply `e`'s value adjustments from its `n`th on (a coercion: an unsizing, a reified
+    /// fn, `!` to any) to the value on top.
+    Adjust(ExprId, u32),
+    /// Step `n` of `e`'s adjustments, an overloaded dereference: the pointer on top (to the
+    /// `Self` of `Deref`) is replaced by what `Deref::deref` (or `deref_mut`) returns.
+    DerefCall(ExprId, u32),
+    /// Load the value of the type after `e`'s adjustment `n` from the place on top.
+    LoadAdjusted(ExprId, u32),
+    /// Keep `e`'s adjusted value on top in a temporary of its own, as a place.
+    SpillAdjusted(ExprId),
     /// Evaluate as a place.
     Place(ExprId),
+    /// Evaluate as a place, after `n` builtin dereferences of its value and no other
+    /// adjustment (the place an autoref borrows).
+    PlaceDerefs(ExprId, u32),
+    /// Build intrinsic call `e` in place, its arguments on top.
+    Intrinsic(ExprId, Intrinsic),
     Stmt(StmtId),
     Discard,
+    /// Discard the value on top, of expression `e`: dropped when its type needs drop (the end
+    /// of an expression statement, `let _ = <value>`).
+    DropValue(ExprId),
+    /// The end of block `e`'s drop scope: its bindings dropped under its value.
+    ScopeEnd(ExprId),
     PushNone,
-    Let(PatId),
+    /// Bind the value on top to the pattern; the expression it is of, for an aggregate built
+    /// in a temporary of its own, which becomes the binding's home.
+    Let(PatId, Option<ExprId>),
     BlockExit(ExprId),
     If { expr: ExprId, then: ExprId, else_: Option<ExprId> },
     IfThen { expr: ExprId, else_: Option<ExprId>, else_block: Block, join: Block },
@@ -143,12 +286,22 @@ enum Task {
     Assign(ExprId),
     AssignOp(ExprId, BinOp),
     Cast(ExprId),
-    /// Store the value on top into the struct place under it, at `layout_fields[at]`.
-    StructInit(u32),
+    /// Store the value on top into the aggregate place under it, `off` bytes in.
+    InitAt { off: u32, repr: Repr },
     Field(ExprId),
     FieldPlace(ExprId),
+    /// The place under the index on top: the element, after the bounds check.
+    IndexPlace(ExprId),
+    /// Load the value of expression `e` from the place on top.
+    LoadPlace(ExprId),
+    /// Load the pointer the place on top holds (one step of an autoderef).
+    LoadPtr,
     DerefPlace,
     Spill(ExprId),
+    /// Copy the aggregate argument on top into the caller's copy for the call.
+    ArgCopy(ExprId),
+    /// Fill the array literal `[x; N]` from the value on top.
+    Repeat(ExprId),
     Ref,
 }
 
@@ -169,10 +322,21 @@ struct Walk<'x, 'c, 't, A: Allocator + Clone> {
     alloc: A,
     b: Builder<A, Full>,
     refs: Vec<Instance, A>,
+    /// By `Static` reference place: the static item.
+    statics: Vec<ItemKey, A>,
+    /// By `Tls` reference place: the thread-local static item.
+    thread_locals: Vec<ItemKey, A>,
+    /// By `Vtable` reference place: the table.
+    vtables: Vec<crate::vtable::VtableRef, A>,
+    /// The one layout of every type (rule 30): the walk's rows read their sizes, alignments,
+    /// offsets, strides, tags and niches from it.
+    ls: Layouts<A>,
     layouts: Vec<Layout, A>,
     layout_fields: Vec<(Name, u32, Repr), A>,
-    /// Per pattern: the binding's slot and how its value is held.
-    slots: Vec<Option<(SlotId, Repr)>, A>,
+    /// Per enum variant laid out: its fields' range of `layout_fields` (first, len).
+    layout_variants: Vec<(u32, u32), A>,
+    /// Per pattern: the binding's home and how its value is held.
+    slots: Vec<Option<(Home, Repr)>, A>,
     /// Per block made: whether a reachable edge leads to it.
     reached: Vec<bool, A>,
     /// Whether the code being built is reachable.
@@ -185,6 +349,29 @@ struct Walk<'x, 'c, 't, A: Allocator + Clone> {
     matches: Vec<MatchState, A>,
     arm_blocks: Vec<Block, A>,
     ret: Repr,
+    /// How the result leaves: in registers, or through `sret`.
+    ret_pass: Pass,
+    /// The hidden result pointer of a fn returning an aggregate.
+    sret: Option<Value>,
+    /// Per pattern: the binding's state changes under a branch or loop of its scope, so it
+    /// gets a drop flag if its type needs drop (`scan_flags`).
+    needs_flag: Vec<bool, A>,
+    /// Per pattern: a `match` on the binding may move fields out of it, so it gets field
+    /// flags if its type needs drop (`scan_flags`).
+    partial: Vec<bool, A>,
+    /// Per expression: it is a temporary scope's whole (a statement's expression, a `let`'s
+    /// initializer, an arm's body, an edition-2024 block's tail), so a temporary made in it
+    /// drops right after it.
+    temp_scope_end: Vec<bool, A>,
+    /// Per pattern: the binding, if its type needs drop.
+    owned: Vec<Option<Owned>, A>,
+    /// Per pattern: whether a binding without a flag is initialized here.
+    init: Vec<bool, A>,
+    /// What needs drop, in declaration order, of every open drop scope.
+    scope_pats: Vec<Held, A>,
+    /// Per open drop scope (a fn's parameters first, then each block): where its bindings
+    /// start in `scope_pats`.
+    scope_marks: Vec<u32, A>,
 }
 
 fn unsupported(expr: ExprId, what: &'static str) -> BuildError {
@@ -236,9 +423,49 @@ fn abi_param(repr: Repr, ty: Ty) -> Param {
                 Ext::Zext
             }
         }
-        Repr::Int { .. } | Repr::Ptr | Repr::None | Repr::Struct(_) => Ext::None,
+        Repr::Int { .. } | Repr::Ptr | Repr::None | Repr::Agg(_) => Ext::None,
     };
     Param { ext, ..Param::of(ty) }
+}
+
+/// The integer types of 1, 2, 4 and 8 bytes, by log2 of the size.
+const WIDTHS: [Ty; 4] = [Ty::I8, Ty::I16, Ty::I32, Ty::I64];
+
+/// How one value crosses a call (lib.rs, "Rust ABI" and "The C ABI"). It is one plan for
+/// both sides: the caller's arguments and results and the callee's parameters and return.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Pass {
+    /// Nothing: a value-less type, or a C zero-sized one.
+    Ignore,
+    /// One register of `ty`, widened by `ext`. `agg`: the walk holds it as a one-scalar
+    /// aggregate (a C newtype), read and written at its offset 0.
+    Scalar { ty: Ty, ext: Ext, agg: bool },
+    /// Rust: an aggregate by the address of the caller's copy; a result by a hidden pointer
+    /// first.
+    Ref,
+    /// C: a composite past 16 bytes by the address of a copy (`byval`), a result through
+    /// `sret`.
+    Memory { size: u32, align: u8 },
+    /// C: a composite of `size` (1 to 16) bytes in `size.div_ceil(8)` `i64` registers, the
+    /// last read at a width inside the size.
+    Words { size: u32 },
+}
+
+/// What a call calls.
+#[derive(Clone, Copy)]
+enum Callee {
+    Direct(RefId),
+    /// A fn pointer's value.
+    Pointer(Value),
+}
+
+/// What a build makes of a fn.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kind {
+    /// Its written body.
+    Body,
+    /// The drop glue of its one type argument (`drop_in_place`'s instance).
+    DropGlue,
 }
 
 pub(crate) fn build<A: Allocator + Clone>(
@@ -247,8 +474,50 @@ pub(crate) fn build<A: Allocator + Clone>(
     sig: &FnSig<'_>,
     subst: &mut Subst<'_, '_>,
     adts: &dyn Adts,
+    kind: Kind,
     alloc: A,
 ) -> Result<Built<A>, BuildError> {
+    let mut w = Walk::new(body, checked, subst, adts, alloc);
+    if kind == Kind::Body {
+        w.scan_flags()?;
+    }
+    w.run(sig, kind)?;
+    let Walk { b, refs, statics, thread_locals, vtables, .. } = w;
+    let func = b.finish().map_err(|error| match error {
+        blaze_lir::BuildError::Verify(v) => BuildError::Verify(v),
+        other => BuildError::Lir(other),
+    })?;
+    blaze_lir::verify(func.view()).map_err(BuildError::Verify)?;
+    Ok(Built { func, refs, statics, thread_locals, vtables })
+}
+
+/// An unsizing adjustment's types: the pointer before and after, its pointee before and after.
+#[derive(Clone, Copy)]
+struct UnsizeEnds {
+    before: PTy,
+    after: PTy,
+    from: PTy,
+    to: PTy,
+}
+
+/// What the instance `subst` names of `body` reads of trait shapes, in expression order: the
+/// part of its record's key the world's trait facts give ([`crate::vtable::record_key`]). Walks
+/// the checked body's calls and unsizings without building code.
+pub(crate) fn object_reads<A: Allocator + Clone>(
+    body: &BodyView<'_>,
+    checked: &Checked<'_>,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    alloc: A,
+) -> Result<Vec<ObjectRead, A>, BuildError> {
+    let mut out = Vec::new_in(alloc.clone());
+    let mut w = Walk::new(body, checked, subst, adts, alloc);
+    w.object_reads(&mut out)?;
+    Ok(out)
+}
+
+impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
+    fn new(body: &'x BodyView<'x>, checked: &'x Checked<'c>, subst: &'x mut Subst<'_, 't>, adts: &'x dyn Adts, alloc: A) -> Self {
     let mut grounded = Vec::with_capacity_in(checked.types.len(), alloc.clone());
     grounded.resize(checked.types.len(), UNGROUNDED);
     let mut break_target = Vec::with_capacity_in(body.exprs.len(), alloc.clone());
@@ -262,7 +531,17 @@ pub(crate) fn build<A: Allocator + Clone>(
     }
     let mut slots = Vec::with_capacity_in(body.pats.len(), alloc.clone());
     slots.resize(body.pats.len(), None);
-    let mut w = Walk {
+    let mut needs_flag = Vec::with_capacity_in(body.pats.len(), alloc.clone());
+    needs_flag.resize(body.pats.len(), false);
+    let mut partial = Vec::with_capacity_in(body.pats.len(), alloc.clone());
+    partial.resize(body.pats.len(), false);
+    let mut temp_scope_end = Vec::with_capacity_in(body.exprs.len(), alloc.clone());
+    temp_scope_end.resize(body.exprs.len(), false);
+    let mut owned = Vec::with_capacity_in(body.pats.len(), alloc.clone());
+    owned.resize(body.pats.len(), None);
+    let mut init = Vec::with_capacity_in(body.pats.len(), alloc.clone());
+    init.resize(body.pats.len(), false);
+    Walk {
         body,
         checked,
         types: checked.types.view(),
@@ -274,8 +553,13 @@ pub(crate) fn build<A: Allocator + Clone>(
         alloc: alloc.clone(),
         b: Builder::new_in(PTR_BITS, alloc.clone()),
         refs: Vec::new_in(alloc.clone()),
+        statics: Vec::new_in(alloc.clone()),
+        thread_locals: Vec::new_in(alloc.clone()),
+        vtables: Vec::new_in(alloc.clone()),
+        ls: Layouts::new_in(alloc.clone()),
         layouts: Vec::new_in(alloc.clone()),
         layout_fields: Vec::new_in(alloc.clone()),
+        layout_variants: Vec::new_in(alloc.clone()),
         slots,
         reached: Vec::new_in(alloc.clone()),
         live: true,
@@ -286,15 +570,68 @@ pub(crate) fn build<A: Allocator + Clone>(
         matches: Vec::new_in(alloc.clone()),
         arm_blocks: Vec::new_in(alloc.clone()),
         ret: Repr::None,
-    };
-    w.run(sig)?;
-    let Walk { b, refs, .. } = w;
-    let func = b.finish().map_err(|error| match error {
-        blaze_lir::BuildError::Verify(v) => BuildError::Verify(v),
-        other => BuildError::Lir(other),
-    })?;
-    blaze_lir::verify(func.view()).map_err(BuildError::Verify)?;
-    Ok(Built { func, refs })
+        ret_pass: Pass::Ignore,
+        sret: None,
+        needs_flag,
+        partial,
+        temp_scope_end,
+        owned,
+        init,
+        scope_pats: Vec::new_in(alloc.clone()),
+        scope_marks: Vec::new_in(alloc.clone()),
+    }
+    }
+
+    /// Pushes onto `out` each [`ObjectRead`] of the body, in expression order: a dynamic call's
+    /// (principal, method, slot), then the expression's upcasts off the first supertrait chain
+    /// (or along it). The same facts `call` and `unsize` read, asked before the build.
+    fn object_reads(&mut self, out: &mut Vec<ObjectRead, A>) -> Result<(), BuildError> {
+        for i in 0..self.body.exprs.len() {
+            let e = ExprId(u32::try_from(i).map_err(|_| malformed("an expression index past u32"))?);
+            let instance = match self.expr(e)? {
+                Expr::Call { callee, .. } => {
+                    let t = self.adjusted_ty(callee)?;
+                    match self.node_at(callee, t)? {
+                        PNode::FnDef(item, args) => Some(Instance { item, args }),
+                        _ => None,
+                    }
+                }
+                Expr::MethodCall { .. } => Some(self.method_callee(e)?),
+                _ => None,
+            };
+            if let Some(instance) = instance
+                && let Some((principal, slot)) = self.dyn_slot(e, instance)?
+            {
+                out.push(ObjectRead::Call { principal, method: instance.item, slot });
+            }
+            let rows = self.adjust_rows(e);
+            for n in 0..rows.len() {
+                if !matches!(self.checked.adjusts.column::<1>()[rows.start + n], AdjustKind::Unsize) {
+                    continue;
+                }
+                let UnsizeEnds { from, to, .. } = self.unsize_ends(e, n)?;
+                let node = |w: &Self, t: PTy| w.ground_node(t).map_err(|error| Self::ty_err(e, error));
+                if !matches!((node(self, from)?, node(self, to)?), (PNode::Dynamic(_), PNode::Dynamic(_))) {
+                    continue;
+                }
+                let (Some((a, _)), Some((b, _))) = (self.principal(e, from)?, self.principal(e, to)?) else {
+                    continue;
+                };
+                if a == b {
+                    continue;
+                }
+                let shape = crate::vtable::Shape::of(a, |t| self.adts.object_trait(t), self.alloc.clone())
+                    .map_err(|error| BuildError::Vtable { at: Some(e), error })?;
+                let slot = match shape.upcast(b) {
+                    Some(crate::vtable::Upcast::Prefix) => None,
+                    Some(crate::vtable::Upcast::Load(slot)) => Some(slot),
+                    None => return Err(malformed("an upcast to a trait that is not a supertrait")),
+                };
+                out.push(ObjectRead::Upcast { from: a, to: b, slot });
+            }
+        }
+        Ok(())
+    }
 }
 
 impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
@@ -323,6 +660,11 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         self.ground.view().node(g).map_err(|_| TyErr::Malformed("a type past the ground table"))
     }
 
+    /// The value of ground array length `n` (a `ConstValue` once grounded).
+    fn ground_len(&self, n: PTy) -> Result<u64, TyErr> {
+        self.ground.view().value_u64(n).ok_or(TyErr::Malformed("an array length that is not a value"))
+    }
+
     /// The ground node of record type `t`, met at `e`.
     fn node_at(&mut self, e: ExprId, t: PTy) -> Result<PNode, BuildError> {
         let g = self.ground_ty(t).map_err(|error| Self::ty_err(e, error))?;
@@ -335,32 +677,48 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
 
     /// How ground type `g` is held.
     fn repr(&mut self, g: PTy) -> Result<Repr, TyErr> {
+        // A pattern type is held as its base (typeck.md, "Pattern types"): its valid range is
+        // the layout's, not the value's.
+        let g = match self.ground_node(g)? {
+            PNode::Pat(base, _) => base,
+            _ => g,
+        };
         Ok(match self.ground_node(g)? {
+            PNode::Pat(..) => return Err(TyErr::Unsupported("a pattern type over a pattern type")),
             PNode::Bool => Repr::Bool,
             PNode::Int(i) => Repr::Int { ty: int_ty(i)?, signed: true },
             PNode::Uint(u) => Repr::Int { ty: uint_ty(u)?, signed: false },
             PNode::Never | PNode::FnDef(..) => Repr::None,
             PNode::Tuple(l) if l.len == 0 => Repr::None,
-            PNode::Tuple(_) => return Err(TyErr::Unsupported("a tuple")),
-            PNode::Ref(_, inner) | PNode::Ptr(_, inner) => match self.ground_node(inner)? {
-                PNode::Str | PNode::Slice(_) => {
-                    return Err(TyErr::Unsupported("a pointer to an unsized type (a wide pointer)"));
+            PNode::Adt(..) | PNode::Tuple(_) | PNode::Array(..) => {
+                let l = self.layout(g)?;
+                if self.layouts[l as usize].size == 0 { Repr::None } else { Repr::Agg(l) }
+            }
+            // A wide pointer (lib.rs, "Wide pointers") when its pointee is unsized, by `ls`.
+            PNode::Ref(..) | PNode::Ptr(..) => {
+                if self.is_agg(g)? {
+                    Repr::Agg(self.layout(g)?)
+                } else {
+                    Repr::Ptr
                 }
-                PNode::Param(_) | PNode::Alias { .. } | PNode::Opaque(..) | PNode::Infer | PNode::Error => {
-                    return Err(TyErr::Malformed("a type the ground table does not hold"));
-                }
-                _ => Repr::Ptr,
-            },
-            PNode::Adt(..) => Repr::Struct(self.layout(g)?),
+            }
+            // A fn pointer is the code's address (lib.rs, "Fn pointers").
+            PNode::FnPtr(..) => Repr::Ptr,
             PNode::Char => return Err(TyErr::Unsupported("char")),
             PNode::Float(_) => return Err(TyErr::Unsupported("a float")),
             PNode::Str => return Err(TyErr::Unsupported("str")),
-            PNode::Array(..) => return Err(TyErr::Unsupported("an array by value")),
             PNode::Slice(_) => return Err(TyErr::Unsupported("a slice")),
-            PNode::FnPtr(_) => return Err(TyErr::Unsupported("a fn pointer")),
             PNode::Closure(..) => return Err(TyErr::Unsupported("a closure")),
+            PNode::Future(..) => return Err(TyErr::Unsupported("an async block's future")),
+            PNode::Dynamic(_) => return Err(TyErr::Unsupported("a trait object (`dyn`)")),
+            PNode::ExTrait(..) | PNode::ExProj { .. } | PNode::ExAuto(_) => {
+                return Err(TyErr::Malformed("a trait object's predicate row as a type"));
+            }
             PNode::Param(_) | PNode::Alias { .. } | PNode::Opaque(..) | PNode::Infer | PNode::Error => {
                 return Err(TyErr::Malformed("a type the ground table does not hold"));
+            }
+            PNode::ConstValue { .. } | PNode::ConstParam(_) => {
+                return Err(TyErr::Malformed("a const generic argument where a value's type is"));
             }
         })
     }
@@ -375,86 +733,295 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 let bytes = ty.bits(PTR_BITS) / 8;
                 (bytes, bytes.trailing_zeros() as u8)
             }
-            Repr::Struct(l) => {
+            Repr::Agg(l) => {
                 let l = &self.layouts[l as usize];
                 (l.size, l.align)
             }
         }
     }
 
-    /// The layout of ground struct type `g` at its arguments, its nested structs first, by a
-    /// work list. A field's type is grounded at the struct's own arguments.
+    /// How many scalars a copy of `repr` moves.
+    fn leaves(&self, repr: Repr) -> u64 {
+        match repr {
+            Repr::None => 0,
+            Repr::Agg(l) => self.layouts[l as usize].leaves,
+            Repr::Int { .. } | Repr::Bool | Repr::Ptr => 1,
+        }
+    }
+
+    /// Ground type `g`'s layout in `ls`, the one layout (rule 30).
+    fn ls_of(&mut self, g: PTy) -> Result<LayoutId, TyErr> {
+        let adts = self.adts;
+        let mut cx = LayoutCx { ground: &mut *self.ground, facts: adts.facts(), scratch: self.scratch };
+        self.ls.of(g, &mut cx).map_err(layout_err)
+    }
+
+    /// Whether ground type `g` is laid out as an aggregate: an ADT, an array, a non-empty
+    /// tuple, or a wide pointer (a pointer `ls` lays out as an address and a length).
+    fn is_agg(&mut self, g: PTy) -> Result<bool, TyErr> {
+        Ok(match self.ground_node(g)? {
+            PNode::Adt(..) | PNode::Array(..) => true,
+            PNode::Tuple(l) => l.len > 0,
+            PNode::Ref(..) | PNode::Ptr(..) => {
+                let id = self.ls_of(g)?;
+                self.ls.get(id).pair.is_some()
+            }
+            _ => false,
+        })
+    }
+
+    /// The layout of an enum variant `variant` of enum layout `l`: its fields' range of
+    /// `layout_fields`, and the enum's layout in `ls` (whose `tag_write` makes the variant). A
+    /// struct or tuple is its own variant 0, with no tag.
+    fn variant_rows(&self, l: u32, variant: u32) -> Result<(u32, u32, Option<LayoutId>), BuildError> {
+        match self.layouts[l as usize].shape {
+            Shape::Fields { first, len } if variant == 0 => Ok((first, len, None)),
+            Shape::Enum { id, first, len } if variant < len => {
+                let (f, n) = self.layout_variants[(first + variant) as usize];
+                Ok((f, n, Some(id)))
+            }
+            _ => Err(malformed("a variant past its type's variants")),
+        }
+    }
+
+    /// Makes variant `variant` of the enum of layout `id` at `at`: stores what `ls.tag_write`
+    /// says (nothing for a struct, an enum of one present variant, or a niche encoding's
+    /// untagged variant, whose own fields hold valid values there).
+    fn write_tag(&mut self, id: Option<LayoutId>, variant: u32, at: (Value, i32)) {
+        let Some(w) = id.and_then(|id| self.ls.tag_write(id, variant)) else { return };
+        let v = match w.scalar.prim {
+            // A pointer niche: null, or an address that is no allocation's.
+            Prim::Ptr if w.value == 0 => self.b.null(),
+            Prim::Ptr => {
+                let x = self.b.iconst(Ty::I64, w.value);
+                self.b.convert(Op::FromExposed, Flags::NONE, Ty::PTR, x)
+            }
+            p => self.b.iconst(prim_ty(p), w.value),
+        };
+        let attrs = MemAttrs::aligned(w.scalar.prim.align());
+        self.b.store(Flags::NONE, v, at.0, at.1 + w.offset as i32, attrs);
+    }
+
+    /// The discriminant of the enum of layout `id` at `at`, as an `i64` (the tag decoded by
+    /// the shared decoder, `intrinsics::read_discriminant`).
+    fn read_discriminant(&mut self, id: LayoutId, at: (Value, i32)) -> Result<Value, BuildError> {
+        crate::intrinsics::read_discriminant(&mut self.b, &self.ls, id, Some(at), Ty::I64)
+            .ok_or(malformed("an enum's tag past an `i32` offset"))
+    }
+
+    /// The value a `switch` on `read_discriminant` matches for variant `v` of enum layout `id`.
+    fn discriminant_case(&self, id: LayoutId, v: u32) -> Result<u128, BuildError> {
+        let d = self.ls.discriminant(id, v).ok_or(malformed("a variant past its enum's discriminants"))?;
+        Ok(mask(d as u128, 64))
+    }
+
+    /// The layout of ground aggregate type `g` (a struct, a tuple, an array, an enum, a wide
+    /// pointer) at its arguments, the aggregates it holds first, by a work list. Its size,
+    /// alignment, offsets and stride are `ls`'s; the row adds each part's `Repr` and whether
+    /// it needs drop.
     fn layout(&mut self, g: PTy) -> Result<u32, TyErr> {
         if let Some(found) = self.find_layout(g) {
             return Ok(found);
         }
+        let too_big = || TyErr::Unsupported("an aggregate of 2 GiB or more");
         let mut todo = Vec::new_in(self.alloc.clone());
         let mut args: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
-        let mut field_tys: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        // The parts: a struct's or tuple's fields, or an array's element.
+        let mut parts: Vec<(Name, PTy), A> = Vec::new_in(self.alloc.clone());
+        // An enum's variants: where each one's fields end in `parts`.
+        let mut variant_ends: Vec<u32, A> = Vec::new_in(self.alloc.clone());
         todo.push(g);
         while let Some(&t) = todo.last() {
             if self.find_layout(t).is_some() {
                 todo.pop();
                 continue;
             }
-            let PNode::Adt(k, l) = self.ground_node(t)? else {
-                return Err(TyErr::Malformed("a layout asked of other than a struct"));
-            };
-            args.clear();
-            args.extend_from_slice(self.ground.view().list(l).map_err(|_| TyErr::Malformed("a list past the ground table"))?);
-            let adts = self.adts;
-            let adt = adts.adt(k).ok_or(TyErr::Malformed("a struct the build's `Adts` does not know"))?;
-            match adt.kind {
-                AdtKind::Struct => {}
-                AdtKind::Enum => return Err(TyErr::Unsupported("an enum")),
-                AdtKind::Union => return Err(TyErr::Unsupported("a union")),
-            }
-            if adt.generics as usize != args.len() {
-                return Err(TyErr::Malformed("a struct type whose argument count is not its struct's generic count"));
-            }
-            let [variant] = adt.variants else {
-                return Err(TyErr::Malformed("a struct without exactly one variant"));
-            };
-            let fields =
-                adt.fields.get(variant.fields.range()).ok_or(TyErr::Malformed("a struct's fields past their column"))?;
-            field_tys.clear();
-            for f in fields {
-                let ft = ground(adt.types, f.ty, &args, self.ground, self.scratch).map_err(ground_err)?;
-                field_tys.push(ft);
+            parts.clear();
+            variant_ends.clear();
+            let mut is_enum = false;
+            let mut is_union = false;
+            let mut array_len = None;
+            let mut drop_fn = None;
+            // `ManuallyDrop<T>` (core's `#[lang = "manually_drop"]`): its field is never dropped.
+            let mut keeps_fields = false;
+            match self.ground_node(t)? {
+                PNode::Adt(k, l) => {
+                    args.clear();
+                    args.extend_from_slice(
+                        self.ground.view().list(l).map_err(|_| TyErr::Malformed("a list past the ground table"))?,
+                    );
+                    let adts = self.adts;
+                    // The walk's loads and stores are at each part's alignment: a packed
+                    // struct's parts may sit below theirs.
+                    if adts.facts().repr(k).packed.is_some() {
+                        return Err(TyErr::Unsupported("a `repr(packed)` type"));
+                    }
+                    drop_fn = adts.drop_impl(t, self.ground).map_err(TyErr::Other)?;
+                    keeps_fields = adts.lang_adt(LangItem::ManuallyDrop) == Some(k);
+                    let adt = adts.adt(k).ok_or(TyErr::Other(BuildError::NoAdt { adt: k }))?;
+                    match adt.kind {
+                        AdtKind::Struct => {
+                            if adt.variants.len() != 1 {
+                                return Err(TyErr::Malformed("a struct without exactly one variant"));
+                            }
+                        }
+                        AdtKind::Enum => is_enum = true,
+                        // Every field at offset 0 (`ls`'s); a copy copies each field's leaves,
+                        // so every byte some field holds; its fields are never dropped.
+                        AdtKind::Union => {
+                            if adt.variants.len() != 1 {
+                                return Err(TyErr::Malformed("a union without exactly one variant"));
+                            }
+                            is_union = true;
+                        }
+                    }
+                    if adt.generics as usize != args.len() {
+                        return Err(TyErr::Malformed("an ADT type whose argument count is not its ADT's generic count"));
+                    }
+                    for variant in adt.variants {
+                        let fields = adt
+                            .fields
+                            .get(variant.fields.range())
+                            .ok_or(TyErr::Malformed("an ADT's fields past their column"))?;
+                        for f in fields {
+                            let ft = ground(adt.types, f.ty, &args, self.ground, self.scratch).map_err(ground_err)?;
+                            parts.push((f.name, ft));
+                        }
+                        variant_ends.push(parts.len() as u32);
+                    }
+                }
+                // A wide pointer: its address and its length (lib.rs, "Wide pointers").
+                PNode::Ref(..) | PNode::Ptr(..) => {
+                    let byte = self.ground.intern(PNode::Uint(UintTy::U8)).map_err(|_| TyErr::Malformed("the ground table is full"))?;
+                    let ptr = self.ground.intern(PNode::Ptr(Mutbl::Not, byte)).map_err(|_| TyErr::Malformed("the ground table is full"))?;
+                    let len = self.ground.intern(PNode::Uint(UintTy::Usize)).map_err(|_| TyErr::Malformed("the ground table is full"))?;
+                    parts.push((Name(0), ptr));
+                    parts.push((Name(1), len));
+                }
+                PNode::Tuple(l) => {
+                    let elems = self.ground.view().list(l).map_err(|_| TyErr::Malformed("a list past the ground table"))?;
+                    for (i, &et) in elems.iter().enumerate() {
+                        parts.push((Name(i as u64), et));
+                    }
+                }
+                PNode::Array(et, n) => {
+                    parts.push((Name(0), et));
+                    array_len = Some(self.ground_len(n)?);
+                }
+                _ => return Err(TyErr::Malformed("a layout asked of other than an aggregate")),
             }
             let mut missing = None;
-            for &ft in field_tys.iter() {
-                if let PNode::Adt(..) = self.ground_node(ft)?
-                    && self.find_layout(ft).is_none()
-                {
-                    missing = Some(ft);
+            for &(_, pt) in parts.iter() {
+                if self.is_agg(pt)? && self.find_layout(pt).is_none() {
+                    missing = Some(pt);
                     break;
                 }
             }
             if let Some(inner) = missing {
                 if todo.contains(&inner) {
-                    return Err(TyErr::Malformed("a struct that contains itself by value"));
+                    return Err(TyErr::Malformed("an aggregate that contains itself by value"));
                 }
                 todo.push(inner);
                 continue;
             }
-            let first = self.layout_fields.len() as u32;
-            let (mut size, mut align) = (0u32, 0u8);
-            for (f, &ft) in fields.iter().zip(field_tys.iter()) {
-                let repr = self.repr(ft)?;
-                let (s, a) = self.size_align(repr);
-                let at = align_up(size, a).ok_or(TyErr::Unsupported("a struct of 4 GiB or more"))?;
-                self.layout_fields.push((f.name, at, repr));
-                size = at.checked_add(s).ok_or(TyErr::Unsupported("a struct of 4 GiB or more"))?;
-                align = align.max(a);
+            // Every aggregate part is laid out by now: whether one needs drop is known.
+            let mut needs_drop = drop_fn.is_some();
+            // A union's fields are never dropped (the reference, "Unions"): only its own
+            // `Drop` impl runs. Nor are `ManuallyDrop`'s.
+            for &(_, pt) in parts.iter().filter(|_| !is_union && !keeps_fields) {
+                if !self.is_agg(pt)? {
+                    continue;
+                }
+                let at = self.find_layout(pt).ok_or(TyErr::Malformed("a part whose layout was not made"))?;
+                let part = &self.layouts[at as usize];
+                if part.needs_drop && part.size == 0 {
+                    return Err(TyErr::Unsupported("a zero-sized part whose type needs drop"));
+                }
+                needs_drop |= part.needs_drop;
             }
-            let size = align_up(size, align)
-                .filter(|&s| s <= i32::MAX as u32)
-                .ok_or(TyErr::Unsupported("a struct of 2 GiB or more"))?;
-            self.layouts.push(Layout { ty: t, size, align, first, len: fields.len() as u32 });
+            // The size, alignment and every offset are `ls`'s (rule 30: one layout).
+            let id = self.ls_of(t)?;
+            let lt = *self.ls.get(id);
+            if lt.tail != Tail::Sized {
+                return Err(TyErr::Malformed("an unsized type held by value"));
+            }
+            let size = u32::try_from(lt.size).ok().filter(|&s| s <= i32::MAX as u32).ok_or_else(too_big)?;
+            let align = lt.align;
+            let offset = |at: Option<u64>| -> Result<u32, TyErr> {
+                u32::try_from(at.ok_or(TyErr::Malformed("a part `ls` gives no offset"))?).map_err(|_| too_big())
+            };
+            let layout = match array_len {
+                // An enum (lib.rs, "Enums"): each variant's fields at their offsets in the enum,
+                // as `ls` placed them (its tag, niche and field order are its own).
+                None if is_enum => {
+                    let n = variant_ends.len();
+                    let vfirst = self.layout_variants.len() as u32;
+                    if let Variants::Multiple { .. } = lt.variants {
+                        // The walk switches on the discriminant as an `i64`.
+                        for v in 0..n as u32 {
+                            let d = self.ls.discriminant(id, v).ok_or(TyErr::Malformed("an enum without its discriminants"))?;
+                            if i64::try_from(d).is_err() {
+                                return Err(TyErr::Unsupported("an enum discriminant past 64 bits"));
+                            }
+                        }
+                    }
+                    let mut most = 0u64;
+                    let mut from = 0usize;
+                    for vi in 0..n {
+                        let to = variant_ends[vi] as usize;
+                        let first = self.layout_fields.len() as u32;
+                        // No offset: a variant `ls` dropped (uninhabited, of zero-sized fields
+                        // only, which no value is ever of).
+                        let vid = self.ls.variant(id, vi as u32);
+                        let mut leaves = 0u64;
+                        for (j, &(name, pt)) in parts[from..to].iter().enumerate() {
+                            let repr = self.repr(pt)?;
+                            let at = match (vid.and_then(|v| self.ls.field_offset(v, j as u32)), repr) {
+                                (Some(o), _) => offset(Some(o))?,
+                                (None, Repr::None) => 0,
+                                (None, _) => return Err(TyErr::Malformed("a variant `ls` dropped with a part that has a value")),
+                            };
+                            self.layout_fields.push((name, at, repr));
+                            leaves = leaves.saturating_add(self.leaves(repr));
+                        }
+                        self.layout_variants.push((first, (to - from) as u32));
+                        most = most.max(leaves);
+                        from = to;
+                    }
+                    // Uninhabited: it never has a value to copy.
+                    let leaves = if lt.uninhabited { 0 } else { most.saturating_add(1) };
+                    let shape = Shape::Enum { id, first: vfirst, len: n as u32 };
+                    Layout { ty: t, size, align, leaves, shape, needs_drop, drop_fn, is_union }
+                }
+                Some(n) => {
+                    let elem = self.repr(parts[0].1)?;
+                    let crate::layout::Fields::Array { stride, .. } = lt.fields else {
+                        return Err(TyErr::Malformed("an array `ls` does not lay out as one"));
+                    };
+                    let stride = u32::try_from(stride).map_err(|_| too_big())?;
+                    let len = u32::try_from(n).map_err(|_| TyErr::Unsupported("an array of 2^32 elements or more"))?;
+                    let leaves = self.leaves(elem).saturating_mul(n);
+                    Layout { ty: t, size, align, leaves, shape: Shape::Array { elem, len, stride }, needs_drop, drop_fn, is_union }
+                }
+                // A struct's or tuple's fields at `ls`'s offsets (a `repr(Rust)` one reordered by
+                // decreasing alignment), by declaration index.
+                None => {
+                    let first = self.layout_fields.len() as u32;
+                    let mut leaves = 0u64;
+                    for (j, &(name, pt)) in parts.iter().enumerate() {
+                        let repr = self.repr(pt)?;
+                        let at = offset(self.ls.field_offset(id, j as u32))?;
+                        self.layout_fields.push((name, at, repr));
+                        leaves = leaves.saturating_add(self.leaves(repr));
+                    }
+                    let len = parts.len() as u32;
+                    Layout { ty: t, size, align, leaves, shape: Shape::Fields { first, len }, needs_drop, drop_fn, is_union }
+                }
+            };
+            self.layouts.push(layout);
             todo.pop();
         }
-        self.find_layout(g).ok_or(TyErr::Malformed("a struct whose layout was not made"))
+        self.find_layout(g).ok_or(TyErr::Malformed("an aggregate whose layout was not made"))
     }
 
     fn ty_err(e: ExprId, error: TyErr) -> BuildError {
@@ -478,6 +1045,27 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         self.body.pats.get(p.ix()).copied().ok_or(malformed("a pattern past `pats`"))
     }
 
+    /// What path or struct expression `e` resolved to, as the check recorded it.
+    fn expr_def(&self, e: ExprId) -> Option<Def> {
+        let col = self.checked.expr_defs.column::<0>();
+        col.binary_search(&e).ok().map(|at| self.checked.expr_defs.column::<1>()[at])
+    }
+
+    /// What path, tuple-struct or struct pattern `p` resolved to, as the check recorded it.
+    fn pat_def(&self, p: PatId) -> Option<Def> {
+        let col = self.checked.pat_defs.column::<0>();
+        col.binary_search(&p).ok().map(|at| self.checked.pat_defs.column::<1>()[at])
+    }
+
+    /// The variant a definition makes: a variant's index, a struct's 0.
+    fn def_variant(def: Option<Def>) -> Option<u32> {
+        match def? {
+            Def::Ctor { variant, .. } => Some(variant),
+            Def::Adt(_) => Some(0),
+            _ => None,
+        }
+    }
+
     fn expr_ty(&self, e: ExprId) -> Result<PTy, BuildError> {
         self.checked.expr_ty.get(e.ix()).copied().ok_or(malformed("an expression without a type in the record"))
     }
@@ -488,6 +1076,13 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let start = col.partition_point(|&x| x < e);
         let len = col[start..].iter().take_while(|&&x| x == e).count();
         start..start + len
+    }
+
+    /// Whether `e`'s last adjustment is an overloaded dereference: the operand of an overloaded
+    /// `*e`, where the check records the dereference on the operand.
+    fn deref_on_operand(&self, e: ExprId) -> bool {
+        let rows = self.adjust_rows(e);
+        matches!(self.checked.adjusts.column::<1>()[rows].last(), Some(AdjustKind::Deref { overloaded: Some(_) }))
     }
 
     /// `e`'s type after its adjustments.
@@ -584,11 +1179,11 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         self.b.ptr_add(Flags::NONE, p, by)
     }
 
-    /// What an edge passes for `v` of `repr`: nothing, the scalar, or the struct's address.
+    /// What an edge passes for `v` of `repr`: nothing, the scalar, or the aggregate's address.
     fn arg(&mut self, v: V, repr: Repr) -> Result<Option<Value>, BuildError> {
         Ok(match repr {
             Repr::None => None,
-            Repr::Struct(_) => {
+            Repr::Agg(_) => {
                 let at = self.place(v, repr)?;
                 Some(self.address(at))
             }
@@ -603,7 +1198,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     fn join_param(&mut self, repr: Repr) -> V {
         match repr {
             Repr::None => V::None,
-            Repr::Struct(_) => V::Place(self.b.param(Ty::PTR), 0),
+            Repr::Agg(_) => V::Place(self.b.param(Ty::PTR), 0),
             scalar => V::Scalar(self.b.param(scalar.scalar().unwrap_or(Ty::I8))),
         }
     }
@@ -615,7 +1210,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     fn load(&mut self, repr: Repr, (p, off): (Value, i32)) -> V {
         match repr {
             Repr::None => V::None,
-            Repr::Struct(_) => V::Place(p, off),
+            Repr::Agg(_) => V::Place(p, off),
             scalar => {
                 let ty = scalar.scalar().unwrap_or(Ty::I8);
                 let attrs = self.mem(scalar);
@@ -627,9 +1222,11 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     fn store(&mut self, v: V, repr: Repr, to: (Value, i32)) -> Result<(), BuildError> {
         match repr {
             Repr::None => Ok(()),
-            Repr::Struct(l) => {
+            Repr::Agg(_) => {
                 let from = self.place(v, repr)?;
-                self.copy(l, from, to);
+                if from != to {
+                    self.copy(repr, from, to)?;
+                }
                 Ok(())
             }
             scalar => {
@@ -642,27 +1239,149 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         }
     }
 
-    /// Copies struct `layout` field by field, nested structs by a work list.
-    fn copy(&mut self, layout: u32, from: (Value, i32), to: (Value, i32)) {
+    /// Copies a value of `repr` from one place to another, scalar leaf by scalar leaf (never
+    /// the padding), by a work list: a struct's or tuple's fields in turn, an array's elements
+    /// unrolled up to `UNROLL_LEAVES` leaves and in a loop beyond.
+    fn copy(&mut self, repr: Repr, from: (Value, i32), to: (Value, i32)) -> Result<(), BuildError> {
         let mut stack = Vec::new_in(self.alloc.clone());
-        stack.push((layout, 0i32));
-        while let Some((l, base)) = stack.pop() {
-            let (first, len) = (self.layouts[l as usize].first, self.layouts[l as usize].len);
-            for i in first..first + len {
-                let (_, off, repr) = self.layout_fields[i as usize];
-                let at = base + off as i32;
-                match repr {
-                    Repr::None => {}
-                    Repr::Struct(inner) => stack.push((inner, at)),
-                    scalar => {
-                        let ty = scalar.scalar().unwrap_or(Ty::I8);
-                        let attrs = self.mem(scalar);
-                        let x = self.b.load(ty, Flags::NONE, from.0, from.1 + at, attrs);
-                        self.b.store(Flags::NONE, x, to.0, to.1 + at, attrs);
+        stack.push(CopyStep::Copy { repr, from, to });
+        while let Some(step) = stack.pop() {
+            let (repr, from, to) = match step {
+                CopyStep::Copy { repr, from, to } => (repr, from, to),
+                CopyStep::Next { i, header, exit } => {
+                    let one = self.b.iconst(Ty::I64, 1);
+                    let next = self.b.binary(Op::Add, Flags::NONE, i, one);
+                    self.jump(header, &[next]);
+                    self.begin(exit);
+                    continue;
+                }
+                CopyStep::Begin(block) => {
+                    self.begin(block);
+                    continue;
+                }
+                CopyStep::Jump(block) => {
+                    self.jump(block, &[]);
+                    continue;
+                }
+                CopyStep::Tag { id, variant, to } => {
+                    self.write_tag(Some(id), variant, to);
+                    continue;
+                }
+            };
+            let l = match repr {
+                Repr::None => continue,
+                Repr::Agg(l) => l,
+                scalar => {
+                    let ty = scalar.scalar().unwrap_or(Ty::I8);
+                    let attrs = self.mem(scalar);
+                    let x = self.b.load(ty, Flags::NONE, from.0, from.1, attrs);
+                    self.b.store(Flags::NONE, x, to.0, to.1, attrs);
+                    continue;
+                }
+            };
+            match self.layouts[l as usize].shape {
+                Shape::Fields { first, len } => {
+                    for i in (first..first + len).rev() {
+                        let (_, off, repr) = self.layout_fields[i as usize];
+                        let off = off as i32;
+                        stack.push(CopyStep::Copy { repr, from: (from.0, from.1 + off), to: (to.0, to.1 + off) });
+                    }
+                }
+                Shape::Array { elem, len, stride } => {
+                    if self.layouts[l as usize].leaves <= UNROLL_LEAVES {
+                        for i in (0..len).rev() {
+                            let off = (i * stride) as i32;
+                            stack.push(CopyStep::Copy { repr: elem, from: (from.0, from.1 + off), to: (to.0, to.1 + off) });
+                        }
+                        continue;
+                    }
+                    let (i, fp, tp, header, exit) = self.array_loop(len, stride, from, to);
+                    stack.push(CopyStep::Next { i, header, exit });
+                    stack.push(CopyStep::Copy { repr: elem, from: (fp, 0), to: (tp, 0) });
+                }
+                // Switch on the variant, copy its fields alone, write its tag (lib.rs, "Enums"):
+                // a copy never reads a byte the value's variant leaves undefined.
+                Shape::Enum { id, first, len } => {
+                    if self.layouts[l as usize].leaves == 0 {
+                        continue;
+                    }
+                    let fields = |w: &Self, v: u32, stack: &mut Vec<CopyStep, A>| {
+                        let (f, n) = w.layout_variants[(first + v) as usize];
+                        for i in (f..f + n).rev() {
+                            let (_, off, repr) = w.layout_fields[i as usize];
+                            let off = off as i32;
+                            stack.push(CopyStep::Copy { repr, from: (from.0, from.1 + off), to: (to.0, to.1 + off) });
+                        }
+                    };
+                    match self.ls.get(id).variants {
+                        // One present variant and no tag: its fields.
+                        Variants::Single { index } if index < len => fields(self, index, &mut stack),
+                        Variants::Single { .. } => {}
+                        Variants::Multiple { .. } => {
+                            let d = self.read_discriminant(id, from)?;
+                            let join = self.create();
+                            let none = self.create();
+                            stack.push(CopyStep::Begin(join));
+                            let mut cases = Vec::new_in(self.alloc.clone());
+                            for v in (0..len).rev() {
+                                let case = self.discriminant_case(id, v)?;
+                                let block = self.create();
+                                cases.push((case, block));
+                                stack.push(CopyStep::Jump(join));
+                                stack.push(CopyStep::Tag { id, variant: v, to });
+                                fields(self, v, &mut stack);
+                                stack.push(CopyStep::Begin(block));
+                            }
+                            self.switch(d, none, &cases);
+                            // No variant has another discriminant: holding one is UB.
+                            self.begin(none);
+                            self.b.unreachable();
+                        }
                     }
                 }
             }
         }
+        Ok(())
+    }
+
+    /// Ends the block with a switch on `x`: to each case's block on its value, else `default`.
+    fn switch(&mut self, x: Value, default: Block, cases: &[(u128, Block)]) {
+        let mut tos = Vec::with_capacity_in(cases.len(), self.alloc.clone());
+        for &(v, block) in cases {
+            self.reach(block);
+            tos.push((v, (block, &[] as &[Value])));
+        }
+        self.reach(default);
+        self.b.switch(x, (default, &[]), &tos);
+    }
+
+    /// Opens a loop over the `len` elements of two arrays, `stride` apart: the index, the two
+    /// elements' addresses, the loop's head and its exit. The body is built next; it ends by
+    /// adding 1 to the index and jumping to the head, after which the exit is begun.
+    fn array_loop(
+        &mut self,
+        len: u32,
+        stride: u32,
+        from: (Value, i32),
+        to: (Value, i32),
+    ) -> (Value, Value, Value, Block, Block) {
+        let header = self.create();
+        let body = self.create();
+        let exit = self.create();
+        let zero = self.b.iconst(Ty::I64, 0);
+        let (from, to) = (self.address(from), self.address(to));
+        self.jump(header, &[zero]);
+        self.begin(header);
+        let i = self.b.param(Ty::I64);
+        let n = self.b.iconst(Ty::I64, u128::from(len));
+        let more = self.b.icmp(IntCond::Ult, i, n);
+        self.br(more, (body, &[]), (exit, &[]));
+        self.begin(body);
+        let s = self.b.iconst(Ty::I64, u128::from(stride));
+        let off = self.b.binary(Op::Mul, Flags::NONE, i, s);
+        let fp = self.b.ptr_add(Flags::NONE, from, off);
+        let tp = self.b.ptr_add(Flags::NONE, to, off);
+        (i, fp, tp, header, exit)
     }
 
     /// A fresh slot for `repr`.
@@ -681,46 +1400,880 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
 
     // Bindings.
 
-    /// The slot of binding pattern `p`, made on first use.
-    fn bind(&mut self, p: PatId) -> Result<(SlotId, Repr), BuildError> {
-        match self.pat(p)? {
-            Pat::Bind { ann, sub: None, .. } if ann.by_ref.is_none() => {}
-            Pat::Bind { .. } => {
-                return Err(BuildError::UnsupportedPat { pat: p, what: "a `ref` binding or a binding with a subpattern" });
-            }
-            _ => return Err(BuildError::UnsupportedPat { pat: p, what: "a pattern other than a binding or `_`" }),
+    /// The place a binding's home is.
+    fn home(&mut self, home: Home) -> (Value, i32) {
+        match home {
+            Home::Slot(slot) => (self.b.slot_addr(slot), 0),
+            Home::At(p, off) => (p, off),
         }
-        if let Some(found) = self.slots[p.ix()] {
-            return Ok(found);
-        }
+    }
+
+    /// How a binding's type is held.
+    fn local_repr(&mut self, p: PatId) -> Result<Repr, BuildError> {
         let t = *self.checked.local_ty.get(p.ix()).ok_or(malformed("a binding without a type in the record"))?;
-        let repr = self.ground_ty(t).and_then(|g| self.repr(g)).map_err(|error| match error {
+        self.ground_ty(t).and_then(|g| self.repr(g)).map_err(|error| Self::pat_ty_err(p, error))
+    }
+
+    fn pat_ty_err(p: PatId, error: TyErr) -> BuildError {
+        match error {
             TyErr::Unsupported(what) => BuildError::UnsupportedPat { pat: p, what },
             TyErr::Malformed(what) => malformed(what),
             TyErr::Other(error) => error,
-        })?;
-        let (size, align) = self.size_align(repr);
-        let slot = self.b.slot(size, align, SlotKind::Named);
-        self.slots[p.ix()] = Some((slot, repr));
-        Ok((slot, repr))
+        }
     }
 
-    /// Stores `v` into the binding `p` is, or drops it for `_`.
+    /// Checks `p` is a plain binding (no `ref`, no subpattern).
+    fn plain_binding(&self, p: PatId) -> Result<(), BuildError> {
+        match self.pat(p)? {
+            Pat::Bind { ann, sub: None, .. } if ann.by_ref.is_none() => Ok(()),
+            Pat::Bind { .. } => Err(BuildError::UnsupportedPat { pat: p, what: "a `ref` binding or a binding with a subpattern" }),
+            _ => Err(BuildError::UnsupportedPat { pat: p, what: "a pattern other than a binding or `_`" }),
+        }
+    }
+
+    /// Binding pattern `p` lives at `at`, memory it owns (a caller's copy, a temporary).
+    fn bind_at(&mut self, p: PatId, at: (Value, i32)) -> Result<(), BuildError> {
+        self.plain_binding(p)?;
+        if self.slots[p.ix()].is_some() {
+            return Err(malformed("a binding bound twice"));
+        }
+        let repr = self.local_repr(p)?;
+        self.slots[p.ix()] = Some((Home::At(at.0, at.1), repr));
+        Ok(())
+    }
+
+    /// The slot of binding pattern `p`, made on first use.
+    fn bind(&mut self, p: PatId) -> Result<(Home, Repr), BuildError> {
+        self.plain_binding(p)?;
+        if let Some(found) = self.slots[p.ix()] {
+            return Ok(found);
+        }
+        let repr = self.local_repr(p)?;
+        let (size, align) = self.size_align(repr);
+        let slot = self.b.slot(size, align, SlotKind::Named);
+        self.slots[p.ix()] = Some((Home::Slot(slot), repr));
+        Ok((Home::Slot(slot), repr))
+    }
+
+    /// Binds `v` to pattern `p`: a binding (the value stored into its slot), `_` (dropped), a
+    /// tuple pattern or an array pattern (`[a, _, b]`) taken apart from the aggregate's place,
+    /// by a work list.
     fn bind_value(&mut self, p: PatId, v: V) -> Result<(), BuildError> {
-        if let Pat::Wild = self.pat(p)? {
+        let mut todo = Vec::new_in(self.alloc.clone());
+        let mut parts = Vec::new_in(self.alloc.clone());
+        todo.push((p, v));
+        while let Some((p, v)) = todo.pop() {
+            let (elems, rest) = match self.pat(p)? {
+                Pat::Wild => {
+                    let t = *self.checked.pat_ty.get(p.ix()).ok_or(malformed("a pattern without a type in the record"))?;
+                    let g = self.ground_ty(t).map_err(|error| Self::pat_ty_err(p, error))?;
+                    if self.needs_drop(g).map_err(|error| Self::pat_ty_err(p, error))? {
+                        return Err(BuildError::UnsupportedPat { pat: p, what: "a `_` pattern over a value that needs drop" });
+                    }
+                    continue;
+                }
+                Pat::Bind { .. } => {
+                    let (home, repr) = self.bind(p)?;
+                    let at = self.home(home);
+                    self.store(v, repr, at)?;
+                    continue;
+                }
+                Pat::Tuple { elems, rest } => (elems, rest),
+                Pat::Slice { elems, rest: None } => (elems, None),
+                Pat::Slice { rest: Some(_), .. } => {
+                    return Err(BuildError::UnsupportedPat { pat: p, what: "an array pattern with `..`" });
+                }
+                _ => {
+                    return Err(BuildError::UnsupportedPat {
+                        pat: p,
+                        what: "a pattern other than a binding, `_`, a tuple or an array pattern",
+                    });
+                }
+            };
+            let subs = self.body.pat_lists.get(elems.range()).ok_or(malformed("a pattern's elements past `pat_lists`"))?;
+            let t = *self.checked.pat_ty.get(p.ix()).ok_or(malformed("a pattern without a type in the record"))?;
+            let g = self.ground_ty(t).map_err(|error| Self::pat_ty_err(p, error))?;
+            let node = self.ground_node(g).map_err(|error| Self::pat_ty_err(p, error))?;
+            let repr = self.repr(g).map_err(|error| Self::pat_ty_err(p, error))?;
+            let tuple = matches!(self.pat(p)?, Pat::Tuple { .. });
+            match (node, tuple) {
+                (PNode::Tuple(_), true) | (PNode::Array(..), false) => {}
+                (PNode::Slice(_), false) => {
+                    return Err(BuildError::UnsupportedPat { pat: p, what: "a slice pattern of a slice" });
+                }
+                _ => return Err(malformed("a tuple or array pattern of a type of another shape")),
+            }
+            // Each part's offset and representation, in element order.
+            parts.clear();
+            match repr {
+                // A zero-sized aggregate: no part has a value.
+                Repr::None => {
+                    let n = match node {
+                        PNode::Tuple(l) => l.len,
+                        PNode::Array(_, n) => {
+                            let n = self.ground_len(n).map_err(|error| Self::pat_ty_err(p, error))?;
+                            u32::try_from(n).map_err(|_| malformed("an array of 2^32 elements or more"))?
+                        }
+                        _ => 0,
+                    };
+                    parts.resize(n as usize, (0u32, Repr::None));
+                }
+                Repr::Agg(l) => match self.layouts[l as usize].shape {
+                    Shape::Fields { first, len } => {
+                        for i in first..first + len {
+                            let (_, off, r) = self.layout_fields[i as usize];
+                            parts.push((off, r));
+                        }
+                    }
+                    Shape::Array { elem, len, stride } => {
+                        for i in 0..len {
+                            parts.push((i * stride, elem));
+                        }
+                    }
+                    Shape::Enum { .. } => return Err(malformed("a tuple or array pattern of an enum")),
+                },
+                _ => return Err(malformed("a tuple or array pattern of a scalar")),
+            }
+            let n = parts.len();
+            let fits = match rest {
+                Some(_) => subs.len() <= n,
+                None => subs.len() == n,
+            };
+            if !fits {
+                return Err(match (tuple, rest) {
+                    (false, _) => BuildError::UnsupportedPat { pat: p, what: "an array pattern with `..` or of another length" },
+                    _ => malformed("a tuple pattern of another arity than its type"),
+                });
+            }
+            if let Some(r) = rest {
+                let skipped = r as usize..r as usize + (n - subs.len());
+                if parts[skipped].iter().any(|&(_, r)| self.repr_needs_drop(r)) {
+                    return Err(BuildError::UnsupportedPat { pat: p, what: "a `..` pattern over a part that needs drop" });
+                }
+            }
+            let at = match repr {
+                Repr::Agg(_) => Some(self.place(v, repr)?),
+                _ => None,
+            };
+            for (j, &sub) in subs.iter().enumerate().rev() {
+                let k = match rest {
+                    Some(r) if j >= r as usize => n - (subs.len() - j),
+                    _ => j,
+                };
+                let (off, r) = parts[k];
+                let part = match at {
+                    Some((base, at)) => {
+                        let at = (base, at + off as i32);
+                        self.load(r, at)
+                    }
+                    None => V::None,
+                };
+                todo.push((sub, part));
+            }
+        }
+        Ok(())
+    }
+
+    // Drops (lib.rs, "Drops").
+
+    /// Whether ground type `g` needs drop.
+    fn needs_drop(&mut self, g: PTy) -> Result<bool, TyErr> {
+        if !self.is_agg(g)? {
+            return Ok(false);
+        }
+        let l = self.layout(g)?;
+        Ok(self.layouts[l as usize].needs_drop)
+    }
+
+    /// Whether a value of `repr` needs drop.
+    fn repr_needs_drop(&self, repr: Repr) -> bool {
+        match repr {
+            Repr::Agg(l) => self.layouts[l as usize].needs_drop,
+            _ => false,
+        }
+    }
+
+    /// Calls the drop glue of ground type `g` on the value at `at`: `drop_in_place::<g>`.
+    fn drop_at(&mut self, g: PTy, at: (Value, i32)) -> Result<(), BuildError> {
+        let item = self.adts.lang_fn(DROP_FN).ok_or(BuildError::NoLangFn { expr: None, name: DROP_FN })?;
+        let args = self.ground.intern_list(&[g]).map_err(|_| malformed("the ground table is full"))?;
+        let p = self.address(at);
+        self.call_ptr(Instance { item, args }, p);
+        Ok(())
+    }
+
+    /// A call of `instance`, a fn of one pointer parameter and no result, with `p`.
+    fn call_ptr(&mut self, instance: Instance, p: Value) {
+        let place = self.ref_place(instance);
+        let reference = self.b.reference(RefKind::Func, place);
+        let sig = self.b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[]);
+        self.b.call(Flags::NONE, reference, sig, &[p]);
+    }
+
+    /// Binding `p`, just bound (`init`) or declared without a value, joins the innermost drop
+    /// scope if its type needs drop; a binding with a flag has it set here, at its `let`,
+    /// which every use of the binding comes after.
+    fn own(&mut self, p: PatId, init: bool) -> Result<(), BuildError> {
+        let t = *self.checked.local_ty.get(p.ix()).ok_or(malformed("a binding without a type in the record"))?;
+        let g = self.ground_ty(t).map_err(|error| Self::pat_ty_err(p, error))?;
+        if !self.needs_drop(g).map_err(|error| Self::pat_ty_err(p, error))? {
             return Ok(());
         }
-        let (slot, repr) = self.bind(p)?;
-        let at = self.b.slot_addr(slot);
-        self.store(v, repr, (at, 0))
+        let (_, repr) = self.slots[p.ix()].ok_or(malformed("a binding owned before it has a home"))?;
+        if repr == Repr::None {
+            return Err(BuildError::UnsupportedPat { pat: p, what: "a zero-sized binding whose type needs drop" });
+        }
+        if self.owned[p.ix()].is_some() {
+            return Err(malformed("a binding owned twice"));
+        }
+        let flag = if self.needs_flag[p.ix()] {
+            let slot = self.b.slot(1, 0, SlotKind::Named);
+            let at = self.b.slot_addr(slot);
+            let v = self.b.iconst(Ty::I8, u128::from(init));
+            self.b.store(Flags::NONE, v, at, 0, MemAttrs::aligned(0));
+            Some(slot)
+        } else {
+            None
+        };
+        let rest = if self.partial[p.ix()] {
+            let slot = self.b.slot(8, 3, SlotKind::Named);
+            Some(slot)
+        } else {
+            None
+        };
+        self.owned[p.ix()] = Some(Owned { ty: g, flag, rest });
+        self.hold_all(p);
+        self.init[p.ix()] = init;
+        self.scope_pats.push(Held::Pat(p));
+        Ok(())
+    }
+
+    /// Sets every field flag of binding `p`, if it has them: it holds all of its value again
+    /// (its `let`, an assignment over it).
+    fn hold_all(&mut self, p: PatId) {
+        if let Some(Owned { rest: Some(slot), .. }) = self.owned[p.ix()] {
+            let at = self.b.slot_addr(slot);
+            let all = self.b.iconst(Ty::I64, u128::from(u64::MAX));
+            self.b.store(Flags::NONE, all, at, 0, MemAttrs::aligned(3));
+        }
+    }
+
+    /// The bit of field `j` of variant `variant` of enum layout `l` in a field-flag word: the
+    /// fields of every variant before it, then `j`; `None` past 64 fields.
+    fn field_bit(&self, l: u32, variant: u32, j: u32) -> Result<Option<u32>, BuildError> {
+        let Shape::Enum { first, .. } = self.layouts[l as usize].shape else {
+            return Err(malformed("field flags of other than an enum"));
+        };
+        let before: u32 = (0..variant).map(|v| self.layout_variants[(first + v) as usize].1).sum();
+        Ok(Some(before + j).filter(|&b| b < 64))
+    }
+
+    /// Drops what the binding of ground type `g` at `at` holds: all of it, or with field flags
+    /// `rest`, each field of the live variant whose flag is set, in declaration order.
+    fn drop_owned(&mut self, g: PTy, at: (Value, i32), rest: Option<SlotId>) -> Result<(), BuildError> {
+        let Some(slot) = rest else { return self.drop_at(g, at) };
+        let l = self.layout(g).map_err(|_| malformed("a binding with field flags and no layout"))?;
+        let Shape::Enum { id, first, len } = self.layouts[l as usize].shape else {
+            return Err(malformed("field flags on other than an enum"));
+        };
+        let fa = self.b.slot_addr(slot);
+        let mask = self.b.load(Ty::I64, Flags::NONE, fa, 0, MemAttrs::aligned(3));
+        let exit = self.create();
+        let mut cases = Vec::with_capacity_in(len as usize, self.alloc.clone());
+        let mut bodies = Vec::with_capacity_in(len as usize, self.alloc.clone());
+        for v in 0..len {
+            let (ff, fl) = self.layout_variants[(first + v) as usize];
+            if !self.fields_need_drop(ff, fl) {
+                continue;
+            }
+            let block = self.create();
+            cases.push((self.discriminant_case(id, v)?, block));
+            bodies.push((block, v, ff, fl));
+        }
+        let d = self.read_discriminant(id, at)?;
+        self.switch(d, exit, &cases);
+        for &(block, v, ff, fl) in bodies.iter() {
+            self.begin(block);
+            for j in 0..fl {
+                let (_, off, repr) = self.layout_fields[(ff + j) as usize];
+                let Repr::Agg(fr) = repr else { continue };
+                if !self.layouts[fr as usize].needs_drop {
+                    continue;
+                }
+                let ft = self.layouts[fr as usize].ty;
+                // A field past 64 is never moved (`arm` refuses it), so always held.
+                let Some(bit) = self.field_bit(l, v, j)? else {
+                    self.drop_at(ft, (at.0, at.1 + off as i32))?;
+                    continue;
+                };
+                let one = self.b.iconst(Ty::I64, 1u128 << bit);
+                let held = self.b.binary(Op::And, Flags::NONE, mask, one);
+                let zero = self.b.iconst(Ty::I64, 0);
+                let set = self.b.icmp(IntCond::Ne, held, zero);
+                let yes = self.create();
+                let next = self.create();
+                self.br(set, (yes, &[]), (next, &[]));
+                self.begin(yes);
+                self.drop_at(ft, (at.0, at.1 + off as i32))?;
+                self.jump(next, &[]);
+                self.begin(next);
+            }
+            self.jump(exit, &[]);
+        }
+        self.begin(exit);
+        Ok(())
+    }
+
+    /// Drops what an arm left of a temporary scrutinee (`Held::Rest`): its variant is known,
+    /// so its fields not moved out are dropped with no flag; nothing moved, the whole value.
+    fn drop_rest(&mut self, at: (Value, i32), l: u32, variant: Option<u32>, moved: u64) -> Result<(), BuildError> {
+        let Some(v) = variant else {
+            let g = self.layouts[l as usize].ty;
+            return self.drop_at(g, at);
+        };
+        let (ff, fl, _) = self.variant_rows(l, v)?;
+        for j in 0..fl {
+            let (_, off, repr) = self.layout_fields[(ff + j) as usize];
+            let Repr::Agg(fr) = repr else { continue };
+            // A field past 64 is never moved (`arm` refuses it).
+            let gone = self.field_bit(l, v, j)?.is_some_and(|bit| moved & (1 << bit) != 0);
+            if self.layouts[fr as usize].needs_drop && !gone {
+                let ft = self.layouts[fr as usize].ty;
+                self.drop_at(ft, (at.0, at.1 + off as i32))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Drops drop-scope entry `h`: a binding (`drop_local`), or an arm's rest.
+    fn drop_held(&mut self, h: Held, kill: bool) -> Result<(), BuildError> {
+        match h {
+            Held::Pat(p) => self.drop_local(p, kill),
+            Held::Rest { at, l, variant, moved } => self.drop_rest(at, l, variant, moved),
+        }
+    }
+
+    /// Every binding of pattern `p`, just bound, joins the innermost drop scope, in order.
+    fn own_pat(&mut self, p: PatId) -> Result<(), BuildError> {
+        let mut todo = Vec::new_in(self.alloc.clone());
+        todo.push(p);
+        while let Some(p) = todo.pop() {
+            let subs = match self.pat(p)? {
+                Pat::Bind { .. } => {
+                    self.own(p, true)?;
+                    continue;
+                }
+                Pat::Tuple { elems, .. } | Pat::Slice { elems, .. } => elems,
+                _ => continue,
+            };
+            let subs = self.body.pat_lists.get(subs.range()).ok_or(malformed("a pattern's elements past `pat_lists`"))?;
+            todo.extend(subs.iter().rev().copied());
+        }
+        Ok(())
+    }
+
+    /// Stores `on` into binding `p`'s flag, if it has one.
+    fn set_flag(&mut self, p: PatId, on: bool) {
+        if let Some(Owned { flag: Some(slot), .. }) = self.owned[p.ix()] {
+            let at = self.b.slot_addr(slot);
+            let v = self.b.iconst(Ty::I8, u128::from(on));
+            self.b.store(Flags::NONE, v, at, 0, MemAttrs::aligned(0));
+        }
+    }
+
+    /// Drops binding `p` if it is initialized: statically, or by its flag (cleared on the way,
+    /// so a scope entered again starts clean). `kill`: its scope ends, it is not initialized
+    /// after (an early exit leaves the state of the code that follows it as it was).
+    fn drop_local(&mut self, p: PatId, kill: bool) -> Result<(), BuildError> {
+        let Some(o) = self.owned[p.ix()] else { return Ok(()) };
+        let (home, _) = self.slots[p.ix()].ok_or(malformed("an owned binding without a home"))?;
+        match o.flag {
+            None => {
+                if self.init[p.ix()] {
+                    let at = self.home(home);
+                    self.drop_owned(o.ty, at, o.rest)?;
+                }
+                if kill {
+                    self.init[p.ix()] = false;
+                }
+            }
+            Some(slot) => {
+                let fa = self.b.slot_addr(slot);
+                let f = self.b.load(Ty::I8, Flags::NONE, fa, 0, MemAttrs::aligned(0));
+                let zero = self.b.iconst(Ty::I8, 0);
+                let set = self.b.icmp(IntCond::Ne, f, zero);
+                let yes = self.create();
+                let join = self.create();
+                self.br(set, (yes, &[]), (join, &[]));
+                self.begin(yes);
+                let at = self.home(home);
+                self.drop_owned(o.ty, at, o.rest)?;
+                self.set_flag(p, false);
+                self.jump(join, &[]);
+                self.begin(join);
+            }
+        }
+        Ok(())
+    }
+
+    /// Where drop scope `depth` starts in `scope_pats` (its end when it is not open).
+    fn scope_start(&self, depth: u32) -> usize {
+        self.scope_marks.get(depth as usize).map_or(self.scope_pats.len(), |&m| m as usize)
+    }
+
+    /// Whether a binding from `start` of `scope_pats` on may be dropped here.
+    fn pending_from(&self, start: usize) -> bool {
+        self.scope_pats[start..].iter().any(|&h| match h {
+            Held::Rest { .. } => true,
+            Held::Pat(p) => match self.owned[p.ix()] {
+                Some(Owned { flag: Some(_), .. }) => true,
+                Some(Owned { flag: None, .. }) => self.init[p.ix()],
+                None => false,
+            },
+        })
+    }
+
+    /// Drops the entries from `start` of `scope_pats` on, last declared first, for an exit
+    /// that leaves their scopes (`break`, `continue`, `return`).
+    fn drop_from(&mut self, start: usize) -> Result<(), BuildError> {
+        for i in (start..self.scope_pats.len()).rev() {
+            let h = self.scope_pats[i];
+            self.drop_held(h, false)?;
+        }
+        Ok(())
+    }
+
+    /// A value about to outlive the drops of the bindings from `start` on: an aggregate place is
+    /// copied out first, as it may be one of theirs (a field of a binding the drop changes).
+    fn settle(&mut self, v: V, repr: Repr, start: usize) -> Result<V, BuildError> {
+        if !self.pending_from(start) {
+            return Ok(v);
+        }
+        match (v, repr) {
+            (V::Place(..), Repr::Agg(_)) => {
+                let at = self.temp(repr);
+                self.store(v, repr, at)?;
+                Ok(V::Place(at.0, at.1))
+            }
+            _ => Ok(v),
+        }
+    }
+
+    /// Binding `p` is used by value: a move, when its type needs drop.
+    fn moved(&mut self, e: ExprId, p: PatId) -> Result<(), BuildError> {
+        let Some(o) = self.owned[p.ix()] else { return Ok(()) };
+        if o.flag.is_some() {
+            self.set_flag(p, false);
+            return Ok(());
+        }
+        if !self.init[p.ix()] && self.live {
+            return Err(unsupported(e, "a use of a value already moved or never assigned (borrowck's E0382)"));
+        }
+        self.init[p.ix()] = false;
+        Ok(())
+    }
+
+    /// The binding place expression `e` names, through parentheses.
+    fn local_of(&self, e: ExprId) -> Result<Option<PatId>, BuildError> {
+        let mut e = e;
+        loop {
+            match self.expr(e)? {
+                Expr::Paren(inner) => e = inner,
+                Expr::Local(p) => return Ok(Some(p)),
+                _ => return Ok(None),
+            }
+        }
+    }
+
+    /// Whether `e` is a place expression (a local, a field, an index, a dereference), through
+    /// parentheses.
+    fn is_place_expr(&self, e: ExprId) -> Result<bool, BuildError> {
+        let mut e = e;
+        loop {
+            match self.expr(e)? {
+                Expr::Paren(inner) => e = inner,
+                Expr::Local(_) | Expr::Field { .. } | Expr::TupleField { .. } | Expr::Index { .. } => return Ok(true),
+                Expr::Unary { op: UnOp::Deref, .. } => return Ok(true),
+                Expr::Path(_) => return Ok(matches!(self.expr_def(e), Some(Def::Static(..)))),
+                _ => return Ok(false),
+            }
+        }
+    }
+
+    /// Which bindings get a drop flag: those with a state change (a use by value, an
+    /// assignment) under a branch or a loop between it and the block that declares the
+    /// binding. A use is by value unless its context is a place's (a borrow, a field's or an
+    /// index's base, a compound assignment's left side, an autoref'd receiver); a context not
+    /// known to be a place's counts, so the scan errs toward a flag, never away from one.
+    fn scan_flags(&mut self) -> Result<(), BuildError> {
+        let body = self.body;
+        let n = body.exprs.len();
+        // Per expression: its parent and whether the edge to it is conditional.
+        let mut parent: Vec<(u32, bool), A> = Vec::with_capacity_in(n, self.alloc.clone());
+        parent.resize(n, (NO_EXPR, false));
+        let mut decl: Vec<u32, A> = Vec::with_capacity_in(body.pats.len(), self.alloc.clone());
+        decl.resize(body.pats.len(), NO_EXPR);
+        let mut kids: Vec<(ExprId, bool), A> = Vec::new_in(self.alloc.clone());
+        let mut pats: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
+        let list = |l: List| body.expr_lists.get(l.range()).ok_or(malformed("a list past `expr_lists`"));
+        for (i, x) in body.exprs.iter().enumerate() {
+            kids.clear();
+            pats.clear();
+            match *x {
+                Expr::Missing | Expr::Lit(_) | Expr::Local(_) | Expr::Path(_) | Expr::Continue { .. } => {}
+                Expr::Paren(c) | Expr::Loop { body: c } => kids.push((c, matches!(x, Expr::Loop { .. }))),
+                Expr::Block { stmts, tail, .. } => {
+                    let ss = body.stmt_lists.get(stmts.range()).ok_or(malformed("a block's statements past `stmt_lists`"))?;
+                    for &s in ss {
+                        match body.stmts.get(s.ix()).copied().ok_or(malformed("a statement past `stmts`"))? {
+                            Stmt::Let { pat, init, else_, .. } => {
+                                kids.extend(init.map(|c| (c, false)));
+                                kids.extend(else_.map(|c| (c, true)));
+                                pats.push(pat);
+                                if let Some(c) = init {
+                                    *self.temp_scope_end.get_mut(c.ix()).ok_or(malformed("an initializer past `exprs`"))? = true;
+                                }
+                            }
+                            Stmt::Expr { expr, .. } => {
+                                kids.push((expr, false));
+                                *self.temp_scope_end.get_mut(expr.ix()).ok_or(malformed("a statement past `exprs`"))? = true;
+                            }
+                            Stmt::Item => {}
+                        }
+                    }
+                    kids.extend(tail.map(|c| (c, false)));
+                    // Edition 2024 drops a tail's temporaries before the block's locals, right
+                    // after the tail; edition 2021 keeps them past the block.
+                    if let Some(t) = tail
+                        && body.edition >= Edition::E2024
+                    {
+                        *self.temp_scope_end.get_mut(t.ix()).ok_or(malformed("a tail past `exprs`"))? = true;
+                    }
+                }
+                Expr::If { cond, then, else_ } => {
+                    kids.push((cond, false));
+                    kids.push((then, true));
+                    kids.extend(else_.map(|c| (c, true)));
+                }
+                // As a `let` statement: its initializer, then its pattern's bindings.
+                Expr::Let { pat, init } => {
+                    kids.push((init, false));
+                    pats.push(pat);
+                }
+                Expr::Match { scrutinee, arms } => {
+                    kids.push((scrutinee, false));
+                    // A local scrutinee: an arm binding all of it moves it (a flag); an arm
+                    // binding a variant's field by value moves that field (field flags).
+                    let mut s = scrutinee;
+                    while let Some(&Expr::Paren(inner)) = body.exprs.get(s.ix()) {
+                        s = inner;
+                    }
+                    let local = match body.exprs.get(s.ix()) {
+                        Some(&Expr::Local(p)) => Some(p),
+                        _ => None,
+                    };
+                    for arm in body.arms.get(arms.range()).ok_or(malformed("a match's arms past `arms`"))? {
+                        *self.temp_scope_end.get_mut(arm.body.ix()).ok_or(malformed("an arm's body past `exprs`"))? = true;
+                        if let Some(x) = local {
+                            let by_value = |p: PatId| matches!(body.pats.get(p.ix()), Some(Pat::Bind { ann, .. }) if ann.by_ref.is_none());
+                            let subs: &[PatId] = match body.pats.get(arm.pat.ix()) {
+                                Some(Pat::Bind { ann, .. }) if ann.by_ref.is_none() => {
+                                    self.needs_flag[x.ix()] = true;
+                                    &[]
+                                }
+                                Some(&Pat::TupleStruct { elems, .. }) => {
+                                    body.pat_lists.get(elems.range()).ok_or(malformed("a pattern's elements past `pat_lists`"))?
+                                }
+                                _ => &[],
+                            };
+                            let fields_by_value = match body.pats.get(arm.pat.ix()) {
+                                Some(&Pat::Struct { fields, .. }) => body
+                                    .field_pats
+                                    .get(fields.range())
+                                    .ok_or(malformed("a struct pattern's fields past `field_pats`"))?
+                                    .iter()
+                                    .any(|fp| by_value(fp.pat)),
+                                _ => false,
+                            };
+                            if fields_by_value || subs.iter().any(|&p| by_value(p)) {
+                                self.partial[x.ix()] = true;
+                            }
+                        }
+                        kids.extend(arm.guard.map(|g| (g, true)));
+                        kids.push((arm.body, true));
+                        // An arm's bindings are declared by its body (a use in its guard
+                        // crosses the arm's edge and counts as conditional: a flag, safely).
+                        self.mark_decl(arm.pat, arm.body.0, &mut decl)?;
+                    }
+                }
+                Expr::Break { value, .. } | Expr::Return { value } => kids.extend(value.map(|c| (c, false))),
+                Expr::Call { callee, args } => {
+                    kids.push((callee, false));
+                    kids.extend(list(args)?.iter().map(|&c| (c, false)));
+                }
+                Expr::MethodCall { receiver, args, .. } => {
+                    kids.push((receiver, false));
+                    kids.extend(list(args)?.iter().map(|&c| (c, false)));
+                }
+                Expr::Field { base: c, .. }
+                | Expr::TupleField { base: c, .. }
+                | Expr::Unary { operand: c, .. }
+                | Expr::Ref { operand: c, .. }
+                | Expr::Cast { operand: c, .. }
+                | Expr::Repeat { elem: c, .. } => kids.push((c, false)),
+                Expr::Binary { op, lhs, rhs } => {
+                    kids.push((lhs, false));
+                    kids.push((rhs, matches!(op, BinOp::And | BinOp::Or)));
+                }
+                Expr::Assign { lhs, rhs } | Expr::AssignOp { lhs, rhs, .. } | Expr::Index { base: lhs, index: rhs } => {
+                    kids.push((lhs, false));
+                    kids.push((rhs, false));
+                }
+                Expr::Tuple { elems } | Expr::Array { elems } => kids.extend(list(elems)?.iter().map(|&c| (c, false))),
+                Expr::Struct { fields, base, .. } => {
+                    let inits = body.field_inits.get(fields.range()).ok_or(malformed("a struct literal's fields past `field_inits`"))?;
+                    kids.extend(inits.iter().map(|f| (f.expr, false)));
+                    kids.extend(base.map(|c| (c, false)));
+                }
+                Expr::Closure { body: c, .. } => kids.push((c, true)),
+                Expr::FormatArgs { args, .. } => kids.extend(list(args)?.iter().map(|&c| (c, false))),
+                Expr::Await(c) => kids.push((c, false)),
+                Expr::AsyncBlock { body: c, .. } => kids.push((c, true)),
+                Expr::Underscore | Expr::OffsetOf { .. } => {}
+                Expr::RawRef { operand: c, .. } => kids.push((c, false)),
+                // An inline constant is its own body: its value, not its code, is this one's.
+                Expr::ConstBlock { .. } => {}
+            }
+            for &(c, cond) in kids.iter() {
+                *parent.get_mut(c.ix()).ok_or(malformed("an expression past `exprs`"))? = (i as u32, cond);
+            }
+            for &p in pats.iter() {
+                self.mark_decl(p, i as u32, &mut decl)?;
+            }
+        }
+        for (i, x) in body.exprs.iter().enumerate() {
+            let Expr::Local(p) = *x else { continue };
+            // The context: the parent of the outermost parenthesis around the use.
+            let mut c = i as u32;
+            while let (up, _) = parent[c as usize]
+                && up != NO_EXPR
+                && let Expr::Paren(_) = body.exprs[up as usize]
+            {
+                c = up;
+            }
+            let up = parent[c as usize].0;
+            // A first adjustment that borrows the local (an autoref, an overloaded
+            // dereference's `&self`) uses it in place, wherever it stands.
+            let rows = self.adjust_rows(ExprId(c));
+            let borrowed_first = matches!(
+                self.checked.adjusts.column::<1>().get(rows.start).filter(|_| !rows.is_empty()),
+                Some(AdjustKind::Borrow { .. } | AdjustKind::Deref { overloaded: Some(_) })
+            );
+            let in_place = borrowed_first
+                || up != NO_EXPR
+                && match body.exprs[up as usize] {
+                    Expr::Ref { operand, .. } => operand.0 == c,
+                    Expr::Field { base, .. } | Expr::TupleField { base, .. } | Expr::Index { base, .. } => base.0 == c,
+                    Expr::AssignOp { lhs, .. } => lhs.0 == c,
+                    // A place expression: matched in place, its arms' moves are marked below.
+                    Expr::Match { scrutinee, .. } => scrutinee.0 == c,
+                    _ => false,
+                };
+            if in_place {
+                continue;
+            }
+            let home = *decl.get(p.ix()).ok_or(malformed("a local past `pats`"))?;
+            let mut c = i as u32;
+            while c != home {
+                let (up, cond) = parent[c as usize];
+                if cond {
+                    self.needs_flag[p.ix()] = true;
+                    break;
+                }
+                if up == NO_EXPR {
+                    break;
+                }
+                c = up;
+            }
+        }
+        Ok(())
+    }
+
+    /// Every binding of pattern `p` is declared by expression `by`.
+    fn mark_decl(&self, p: PatId, by: u32, decl: &mut Vec<u32, A>) -> Result<(), BuildError> {
+        let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
+        todo.push(p);
+        while let Some(p) = todo.pop() {
+            *decl.get_mut(p.ix()).ok_or(malformed("a pattern past `pats`"))? = by;
+            let subs = match self.pat(p)? {
+                Pat::Bind { sub, .. } => {
+                    todo.extend(sub);
+                    continue;
+                }
+                Pat::Ref { inner, .. } => {
+                    todo.push(inner);
+                    continue;
+                }
+                Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Slice { elems, .. } | Pat::Or { alts: elems } => elems,
+                Pat::Struct { fields, .. } => {
+                    let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a struct pattern's fields past `field_pats`"))?;
+                    todo.extend(fps.iter().map(|f| f.pat));
+                    continue;
+                }
+                Pat::Missing | Pat::Wild | Pat::Lit(_) | Pat::NegLit(_) | Pat::Path(_) | Pat::Range { .. } => continue,
+            };
+            todo.extend_from_slice(self.body.pat_lists.get(subs.range()).ok_or(malformed("a pattern's elements past `pat_lists`"))?);
+        }
+        Ok(())
+    }
+
+    /// The body of `drop_in_place::<T>`, `T` the instance's argument, its parameter `p`: `T`'s
+    /// drop glue (lib.rs, "Drops").
+    fn glue(&mut self, p: Value) -> Result<(), BuildError> {
+        let g = *self.args.first().ok_or(malformed("`drop_in_place` without its type argument"))?;
+        let sig_err = |error: TyErr| match error {
+            TyErr::Unsupported(what) => BuildError::UnsupportedSig { what },
+            TyErr::Malformed(what) => malformed(what),
+            TyErr::Other(error) => error,
+        };
+        if !self.needs_drop(g).map_err(sig_err)? {
+            return Ok(());
+        }
+        let l = self.layout(g).map_err(sig_err)? as usize;
+        // A `Box<T>`'s contents go first, then its `Drop` impl (the library's, which frees).
+        if let PNode::Adt(k, list) = self.ground_node(g).map_err(sig_err)?
+            && self.adts.lang_adt(LangItem::OwnedBox) == Some(k)
+        {
+            self.drop_box_contents(list, p)?;
+        }
+        if let Some(item) = self.layouts[l].drop_fn {
+            let args = self.ground.intern_list(&[g]).map_err(|_| malformed("the ground table is full"))?;
+            self.call_ptr(Instance { item, args }, p);
+        }
+        match self.layouts[l].shape {
+            // A union's fields are never dropped.
+            Shape::Fields { .. } if self.layouts[l].is_union => {}
+            Shape::Fields { first, len } => self.drop_fields(p, first, len)?,
+            // The live variant's fields (the reference, "Destructors"): a `switch` on the
+            // discriminant, as a `match` reads it, to each variant with a field that needs
+            // drop; every other variant (and a niche's `None`) drops nothing.
+            Shape::Enum { id, first, len } => {
+                let exit = self.create();
+                let mut cases = Vec::with_capacity_in(len as usize, self.alloc.clone());
+                let mut bodies = Vec::with_capacity_in(len as usize, self.alloc.clone());
+                for v in 0..len {
+                    let (ff, fl) = self.layout_variants[(first + v) as usize];
+                    if !self.fields_need_drop(ff, fl) {
+                        continue;
+                    }
+                    let block = self.create();
+                    cases.push((self.discriminant_case(id, v)?, block));
+                    bodies.push((block, ff, fl));
+                }
+                let d = self.read_discriminant(id, (p, 0))?;
+                self.switch(d, exit, &cases);
+                for &(block, ff, fl) in bodies.iter() {
+                    self.begin(block);
+                    self.drop_fields(p, ff, fl)?;
+                    self.jump(exit, &[]);
+                }
+                self.begin(exit);
+            }
+            Shape::Array { elem: Repr::Agg(el), len, stride } if self.layouts[el as usize].needs_drop => {
+                let et = self.layouts[el as usize].ty;
+                let (i, ep, _, header, exit) = self.array_loop(len, stride, (p, 0), (p, 0));
+                self.drop_at(et, (ep, 0))?;
+                let one = self.b.iconst(Ty::I64, 1);
+                let next = self.b.binary(Op::Add, Flags::NONE, i, one);
+                self.jump(header, &[next]);
+                self.begin(exit);
+            }
+            Shape::Array { .. } => {}
+        }
+        Ok(())
+    }
+
+    /// The contents of the `Box<T>` at `p` (`list` its arguments), dropped by its glue before
+    /// the `Box`'s own `Drop` impl, which frees the allocation (std's `Box`: "the compiler drops
+    /// the contents, then calls `Drop::drop`", which deallocates by `Layout::for_value_raw`, so
+    /// a zero-sized `T`, never allocated, is never freed). The box's first word is the data
+    /// pointer (its pointer field, nested or not, is at offset 0); for `T = dyn Tr` the second
+    /// is the table, whose word 0 is `T`'s glue ([`Self::dyn_glue`]). A slice or `str` box's
+    /// elements are refused by name.
+    fn drop_box_contents(&mut self, list: List, p: Value) -> Result<(), BuildError> {
+        let sig_err = |error: TyErr| match error {
+            TyErr::Unsupported(what) => BuildError::UnsupportedSig { what },
+            TyErr::Malformed(what) => malformed(what),
+            TyErr::Other(error) => error,
+        };
+        let t = *self
+            .ground
+            .view()
+            .list(list)
+            .map_err(|_| malformed("a `Box`'s arguments past the ground table"))?
+            .first()
+            .ok_or(malformed("a `Box` without its type argument"))?;
+        match self.ground_node(t).map_err(sig_err)? {
+            PNode::Dynamic(_) => {
+                let data = self.b.load(Ty::PTR, Flags::NONE, p, 0, MemAttrs::aligned(3));
+                let vt = self.b.load(Ty::PTR, Flags::NONE, p, 8, MemAttrs::aligned(3));
+                self.dyn_glue(data, vt);
+            }
+            PNode::Slice(_) | PNode::Str => {
+                return Err(BuildError::UnsupportedSig { what: "the drop of a boxed slice's or `str`'s elements" });
+            }
+            _ => {
+                if self.needs_drop(t).map_err(sig_err)? {
+                    let data = self.b.load(Ty::PTR, Flags::NONE, p, 0, MemAttrs::aligned(3));
+                    self.drop_at(t, (data, 0))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The drop of the trait object at `data` whose table is `vt` (vtable.rs: word 0 is the
+    /// concrete type's `drop_in_place`, 0 when it needs none): a call of word 0 with `data`,
+    /// skipped when the word is 0.
+    fn dyn_glue(&mut self, data: Value, vt: Value) {
+        let word = self.b.load(Ty::I64, Flags::NONE, vt, 0, MemAttrs::aligned(3));
+        let zero = self.b.iconst(Ty::I64, 0);
+        let set = self.b.icmp(IntCond::Ne, word, zero);
+        let yes = self.create();
+        let next = self.create();
+        self.br(set, (yes, &[]), (next, &[]));
+        self.begin(yes);
+        let f = self.b.load(Ty::PTR, Flags::NONE, vt, 0, MemAttrs::aligned(3));
+        let sig = self.b.sig(Conv::C, Variadic::No, &[Param::of(Ty::PTR)], &[]);
+        self.b.call_indirect(Flags::NONE, f, sig, &[data]);
+        self.jump(next, &[]);
+        self.begin(next);
+    }
+
+    /// Whether any of `layout_fields[first..first + len]` needs drop.
+    fn fields_need_drop(&self, first: u32, len: u32) -> bool {
+        self.layout_fields[first as usize..(first + len) as usize].iter().any(|&(_, _, repr)| self.repr_needs_drop(repr))
+    }
+
+    /// Drops each of `layout_fields[first..first + len]` that needs drop, at its offset from
+    /// `p`, in declaration order.
+    fn drop_fields(&mut self, p: Value, first: u32, len: u32) -> Result<(), BuildError> {
+        for i in first..first + len {
+            let (_, off, repr) = self.layout_fields[i as usize];
+            if let Repr::Agg(fl) = repr
+                && self.layouts[fl as usize].needs_drop
+            {
+                let ft = self.layouts[fl as usize].ty;
+                self.drop_at(ft, (p, off as i32))?;
+            }
+        }
+        Ok(())
     }
 
     // The function.
 
-    fn run(&mut self, sig: &FnSig<'_>) -> Result<(), BuildError> {
-        if sig.self_param {
-            return Err(BuildError::UnsupportedSig { what: "a method" });
-        }
+    fn run(&mut self, sig: &FnSig<'_>, kind: Kind) -> Result<(), BuildError> {
+        // A method's `self` is its first input and its body's first parameter, like any other.
         if sig.inputs.len() != self.body.params.len() {
             return Err(malformed("a signature and a body with other numbers of parameters"));
         }
@@ -729,24 +2282,24 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             TyErr::Malformed(what) => malformed(what),
             TyErr::Other(error) => error,
         };
-        let mut params = Vec::with_capacity_in(sig.inputs.len(), self.alloc.clone());
+        // Drop glue is of the Rust ABI; a body is of its fn's.
+        let owner = self.body.owner;
+        let abi = match kind {
+            Kind::DropGlue => Abi::Rust,
+            Kind::Body => self.adts.abi(owner).ok_or(BuildError::NoAbi { item: owner })?,
+        };
         let mut reprs = Vec::with_capacity_in(sig.inputs.len(), self.alloc.clone());
+        let mut passes = Vec::with_capacity_in(sig.inputs.len(), self.alloc.clone());
         for &t in sig.inputs {
-            let repr = self.ground_in(sig.types, t).and_then(|g| self.repr(g)).map_err(sig_err)?;
-            match repr {
-                Repr::Struct(_) => return Err(BuildError::UnsupportedSig { what: "a struct passed by value" }),
-                Repr::None => {}
-                scalar => params.push(abi_param(scalar, scalar.scalar().unwrap_or(Ty::I8))),
-            }
+            let g = self.ground_in(sig.types, t).map_err(sig_err)?;
+            let repr = self.repr(g).map_err(sig_err)?;
             reprs.push(repr);
+            passes.push(self.pass(g, repr, abi, Some(owner))?);
         }
-        self.ret = self.ground_in(sig.types, sig.output).and_then(|g| self.repr(g)).map_err(sig_err)?;
-        let mut rets = Vec::with_capacity_in(1, self.alloc.clone());
-        match self.ret {
-            Repr::Struct(_) => return Err(BuildError::UnsupportedSig { what: "a struct returned by value" }),
-            Repr::None => {}
-            scalar => rets.push(abi_param(scalar, scalar.scalar().unwrap_or(Ty::I8))),
-        }
+        let g = self.ground_in(sig.types, sig.output).map_err(sig_err)?;
+        self.ret = self.repr(g).map_err(sig_err)?;
+        self.ret_pass = self.pass(g, self.ret, abi, Some(owner))?;
+        let (params, rets) = self.sig_of(&passes, self.ret_pass);
         let own = self.b.sig(Conv::C, Variadic::No, &params, &rets);
         self.b.set_signature(own);
         let entry = self.create();
@@ -756,13 +2309,47 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         for p in params.iter() {
             values.push(self.b.param(p.ty));
         }
-        let mut next = values.iter();
-        for (i, &repr) in reprs.iter().enumerate() {
-            let v = match repr {
-                Repr::None => V::None,
-                _ => V::Scalar(*next.next().ok_or(malformed("a parameter without its value"))?),
+        let mut next = values.iter().copied();
+        if let Pass::Ref | Pass::Memory { .. } = self.ret_pass {
+            self.sret = Some(next.next().ok_or(malformed("a result pointer without its value"))?);
+        }
+        if kind == Kind::DropGlue {
+            // `drop_in_place::<dyn Tr>`: its parameter is the wide pointer, passed by
+            // reference; the glue is the table's word 0 on the data word.
+            let g = *self.args.first().ok_or(malformed("`drop_in_place` without its type argument"))?;
+            if let (PNode::Dynamic(_), &[Repr::Agg(_)], Repr::None, &[q]) =
+                (self.ground_node(g).map_err(sig_err)?, reprs.as_slice(), self.ret, values.as_slice())
+            {
+                let data = self.b.load(Ty::PTR, Flags::NONE, q, 0, MemAttrs::aligned(3));
+                let vt = self.b.load(Ty::PTR, Flags::NONE, q, 8, MemAttrs::aligned(3));
+                self.dyn_glue(data, vt);
+                self.b.ret(&[]);
+                if let Some(error) = self.b.error() {
+                    return Err(BuildError::Lir(error.clone()));
+                }
+                return Ok(());
+            }
+            let (&[Repr::Ptr], Repr::None, &[p]) = (reprs.as_slice(), self.ret, values.as_slice()) else {
+                return Err(malformed("a `drop_in_place` whose signature is not `(*mut T)`"));
             };
-            self.bind_value(self.body.params[i], v)?;
+            self.glue(p)?;
+            self.b.ret(&[]);
+            if let Some(error) = self.b.error() {
+                return Err(BuildError::Lir(error.clone()));
+            }
+            return Ok(());
+        }
+        // The parameters' drop scope, the outermost.
+        self.scope_marks.push(0);
+        for (i, &repr) in reprs.iter().enumerate() {
+            let p = self.body.params[i];
+            // The caller's copy (or the one a C parameter's registers are written to) is the
+            // callee's to keep: a binding lives in it.
+            match self.take_passed(repr, passes[i], &mut next)? {
+                V::Place(at, off) if matches!(self.pat(p)?, Pat::Bind { .. }) => self.bind_at(p, (at, off))?,
+                v => self.bind_value(p, v)?,
+            }
+            self.own_pat(p)?;
         }
         self.work.push(Task::Eval(self.body.root));
         while let Some(task) = self.work.pop() {
@@ -773,11 +2360,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             return Err(malformed("values left on the stack at the end (a build bug)"));
         }
         if self.live {
-            let ret = self.ret;
-            match self.arg(v, ret)? {
-                Some(x) => self.b.ret(&[x]),
-                None => self.b.ret(&[]),
-            }
+            self.ret_value(v)?;
         } else {
             self.b.unreachable();
         }
@@ -787,25 +2370,383 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         Ok(())
     }
 
+    /// How a value of ground type `g`, held as `repr`, crosses a call of `abi` (lib.rs, "Rust
+    /// ABI" and "The C ABI"); `item` is the fn a C refusal names (`None` through a pointer).
+    fn pass(&mut self, g: PTy, repr: Repr, abi: Abi, item: Option<ItemKey>) -> Result<Pass, BuildError> {
+        let scalar = |repr: Repr| -> Result<Pass, BuildError> {
+            let ty = repr.scalar().ok_or(malformed("a scalar of no type"))?;
+            Ok(Pass::Scalar { ty, ext: abi_param(repr, ty).ext, agg: false })
+        };
+        if abi == Abi::Rust {
+            return match repr {
+                Repr::None => Ok(Pass::Ignore),
+                Repr::Agg(_) => Ok(Pass::Ref),
+                _ => scalar(repr),
+            };
+        }
+        let refuse = |why| BuildError::CAbi { item, why };
+        let adts = self.adts;
+        let class = {
+            let mut cx = LayoutCx { ground: &mut *self.ground, facts: adts.facts(), scratch: self.scratch };
+            cabi::class_of(&mut self.ls, g, &mut cx, self.alloc.clone())
+        };
+        let class = class.map_err(|error| match error {
+            CAbiError::Layout(error) => match layout_err(error) {
+                TyErr::Unsupported(why) | TyErr::Malformed(why) => refuse(why),
+                TyErr::Other(error) => error,
+            },
+            CAbiError::Refused { why, .. } => refuse(why),
+            CAbiError::TooLarge => refuse("more than 2 GiB of stacked arguments"),
+        })?;
+        Ok(match class {
+            Class::Ignore => Pass::Ignore,
+            Class::Int { size: 16, .. } => return Err(refuse("a 128-bit integer (a register pair)")),
+            // A scalar, or a one-scalar aggregate (a newtype) read and written at offset 0;
+            // Apple widens an integer under 32 bits (`cabi::Ext`).
+            Class::Int { size, signed } => {
+                let ext = match (size < 4, signed) {
+                    (true, true) => Ext::Sext,
+                    (true, false) => Ext::Zext,
+                    (false, _) => Ext::None,
+                };
+                match repr {
+                    Repr::Agg(_) => {
+                        let id = self.ls_of(g).map_err(|error| match error {
+                            TyErr::Unsupported(why) | TyErr::Malformed(why) => refuse(why),
+                            TyErr::Other(error) => error,
+                        })?;
+                        let s = self.ls.get(id).scalar.ok_or(malformed("a C integer class of a type with no scalar"))?;
+                        Pass::Scalar { ty: prim_ty(s.prim), ext, agg: true }
+                    }
+                    _ => {
+                        let ty = repr.scalar().ok_or(malformed("a scalar of no type"))?;
+                        Pass::Scalar { ty, ext, agg: false }
+                    }
+                }
+            }
+            Class::Float { .. } => return Err(refuse("a float (the SIMD registers are not built)")),
+            Class::Hfa { .. } => return Err(refuse("a homogeneous float aggregate (the SIMD registers are not built)")),
+            Class::Composite { size, align } if size > 16 => {
+                let size = u32::try_from(size).map_err(|_| refuse("a composite past 4 GiB"))?;
+                Pass::Memory { size, align }
+            }
+            // AAPCS64 C.8 starts it at an even register, which a run of `i64`s cannot say.
+            Class::Composite { align: 4.., .. } => return Err(refuse("a 16-byte-aligned composite (an even register pair)")),
+            Class::Composite { size, .. } => Pass::Words { size: size as u32 },
+        })
+    }
+
+    /// The lowered signature of passes `inputs` and `ret`: a result pointer first (Rust's plain
+    /// pointer, C's `sret`), then each input's registers.
+    fn sig_of(&self, inputs: &[Pass], ret: Pass) -> (Vec<Param, A>, Vec<Param, A>) {
+        let mut params = Vec::with_capacity_in(inputs.len() + 1, self.alloc.clone());
+        let mut rets = Vec::with_capacity_in(2, self.alloc.clone());
+        let memory = |kind, size, align| Param { kind, facts: Facts { size, align, ..Param::of(Ty::PTR).facts }, ..Param::of(Ty::PTR) };
+        match ret {
+            Pass::Ignore => {}
+            Pass::Ref => params.push(Param::of(Ty::PTR)),
+            Pass::Memory { size, align } => params.push(memory(ParamKind::Sret, size, align)),
+            Pass::Scalar { ty, ext, .. } => rets.push(Param { ext, ..Param::of(ty) }),
+            Pass::Words { size } => {
+                for _ in 0..size.div_ceil(8) {
+                    rets.push(Param::of(Ty::I64));
+                }
+            }
+        }
+        for &p in inputs {
+            match p {
+                Pass::Ignore => {}
+                Pass::Ref => params.push(Param::of(Ty::PTR)),
+                Pass::Memory { size, align } => params.push(memory(ParamKind::Byval, size, align)),
+                Pass::Scalar { ty, ext, .. } => params.push(Param { ext, ..Param::of(ty) }),
+                Pass::Words { size } => {
+                    for _ in 0..size.div_ceil(8) {
+                        params.push(Param::of(Ty::I64));
+                    }
+                }
+            }
+        }
+        (params, rets)
+    }
+
+    /// The `size` (1 to 8) bytes at `at`, `start` bytes into a value aligned to `align`, as a
+    /// zero-extended `i64`: loads of falling powers of two inside the size, so no byte past
+    /// the value is read (12 bytes are an `i64`, then an `i32`).
+    fn read_word(&mut self, at: (Value, i32), start: u32, size: u32, align: u8) -> Result<Value, BuildError> {
+        let mut word = None;
+        let mut off = 0u32;
+        while off < size {
+            let log = (31 - (size - off).leading_zeros()).min(3);
+            let ty = WIDTHS[log as usize];
+            let a = align.min(log as u8).min((start + off).trailing_zeros().min(7) as u8);
+            let x = self.b.load(ty, Flags::NONE, at.0, at.1 + (start + off) as i32, MemAttrs::aligned(a));
+            let mut x = self.resize(x, ty, Ty::I64, false);
+            if off > 0 {
+                let by = self.b.iconst(Ty::I64, u128::from(off * 8));
+                x = self.b.binary(Op::Shl, Flags::NONE, x, by);
+            }
+            word = Some(match word {
+                None => x,
+                Some(w) => self.b.binary(Op::Or, Flags::NONE, w, x),
+            });
+            off += 1 << log;
+        }
+        word.ok_or(malformed("a C register of no bytes"))
+    }
+
+    /// Writes the low `size` (1 to 8) bytes of `i64` `word` at `at`, `start` bytes into a value
+    /// aligned to `align`, in stores of falling powers of two inside the size.
+    fn write_word(&mut self, word: Value, at: (Value, i32), start: u32, size: u32, align: u8) {
+        let mut off = 0u32;
+        while off < size {
+            let log = (31 - (size - off).leading_zeros()).min(3);
+            let ty = WIDTHS[log as usize];
+            let a = align.min(log as u8).min((start + off).trailing_zeros().min(7) as u8);
+            let mut x = word;
+            if off > 0 {
+                let by = self.b.iconst(Ty::I64, u128::from(off * 8));
+                x = self.b.binary(Op::Lshr, Flags::NONE, x, by);
+            }
+            let x = self.resize(x, Ty::I64, ty, false);
+            self.b.store(Flags::NONE, x, at.0, at.1 + (start + off) as i32, MemAttrs::aligned(a));
+            off += 1 << log;
+        }
+    }
+
+    /// The argument values of `v`, held as `repr`, passed as `p`, into `out`.
+    fn pass_arg(&mut self, v: V, repr: Repr, p: Pass, out: &mut Vec<Value, A>) -> Result<(), BuildError> {
+        match p {
+            Pass::Ignore => {}
+            Pass::Scalar { ty, agg: false, .. } => out.push(self.scalar(v, ty)?),
+            Pass::Scalar { ty, agg: true, .. } => {
+                let at = self.place(v, repr)?;
+                let attrs = self.mem(repr);
+                out.push(self.b.load(ty, Flags::NONE, at.0, at.1, attrs));
+            }
+            // `ArgCopy` made the caller's copy; a `byval` one is copied again by the call.
+            Pass::Ref | Pass::Memory { .. } => {
+                let at = self.place(v, repr)?;
+                out.push(self.address(at));
+            }
+            Pass::Words { size } => {
+                let at = self.place(v, repr)?;
+                let align = self.size_align(repr).1;
+                for k in 0..size.div_ceil(8) {
+                    out.push(self.read_word(at, k * 8, (size - k * 8).min(8), align)?);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A value of `repr`, passed as `p`, from the values `next` yields: a parameter in the
+    /// callee, or a call's results in the caller.
+    fn take_passed(&mut self, repr: Repr, p: Pass, next: &mut dyn Iterator<Item = Value>) -> Result<V, BuildError> {
+        let mut one = || next.next().ok_or(malformed("a passed value without its register"));
+        Ok(match p {
+            Pass::Ignore => V::None,
+            Pass::Scalar { agg: false, .. } => V::Scalar(one()?),
+            Pass::Scalar { agg: true, .. } => {
+                let x = one()?;
+                let at = self.temp(repr);
+                let attrs = self.mem(repr);
+                self.b.store(Flags::NONE, x, at.0, at.1, attrs);
+                V::Place(at.0, at.1)
+            }
+            Pass::Ref | Pass::Memory { .. } => V::Place(one()?, 0),
+            Pass::Words { size } => {
+                let at = self.temp(repr);
+                let align = self.size_align(repr).1;
+                for k in 0..size.div_ceil(8) {
+                    let w = one()?;
+                    self.write_word(w, at, k * 8, (size - k * 8).min(8), align);
+                }
+                V::Place(at.0, at.1)
+            }
+        })
+    }
+
+    /// Calls `callee` (a fn reference, or a pointer value) with the values `n` on top of the
+    /// stack, of `reprs` passed as `passes`, for a result of `rrepr` passed as `rpass`; pushes
+    /// the result.
+    fn emit_call(&mut self, callee: Callee, reprs: &[Repr], passes: &[Pass], rrepr: Repr, rpass: Pass) -> Result<(), BuildError> {
+        let (params, rets) = self.sig_of(passes, rpass);
+        let mut values = Vec::with_capacity_in(params.len(), self.alloc.clone());
+        // The result's slot, the callee's to write.
+        let result = match rpass {
+            Pass::Ref | Pass::Memory { .. } => {
+                let at = self.temp(rrepr);
+                values.push(self.address(at));
+                Some(at)
+            }
+            _ => None,
+        };
+        let n = reprs.len();
+        let base = self.vals.len().checked_sub(n).ok_or(malformed("a call's arguments missing from the value stack (a build bug)"))?;
+        for i in 0..n {
+            let v = self.vals[base + i];
+            self.pass_arg(v, reprs[i], passes[i], &mut values)?;
+        }
+        self.vals.truncate(base);
+        let sig = self.b.sig(Conv::C, Variadic::No, &params, &rets);
+        let r = match callee {
+            Callee::Direct(reference) => self.b.call(Flags::NONE, reference, sig, &values),
+            Callee::Pointer(p) => self.b.call_indirect(Flags::NONE, p, sig, &values),
+        };
+        let v = match (result, rets.len()) {
+            (Some(at), _) => V::Place(at.0, at.1),
+            (None, 0) => V::None,
+            (None, 1) => self.take_passed(rrepr, rpass, &mut core::iter::once(r))?,
+            (None, k) => {
+                let mut parts = Vec::with_capacity_in(k, self.alloc.clone());
+                for i in 0..k as u32 {
+                    parts.push(self.b.project(r, i));
+                }
+                self.take_passed(rrepr, rpass, &mut parts.iter().copied())?
+            }
+        };
+        self.vals.push(v);
+        Ok(())
+    }
+
+    /// Returns `v` from the function: as the one result, through the result pointer, or as
+    /// nothing; the value is made first, then every open scope is dropped, parameters last.
+    fn ret_value(&mut self, v: V) -> Result<(), BuildError> {
+        let ret = self.ret;
+        let mut xs = Vec::with_capacity_in(2, self.alloc.clone());
+        match self.ret_pass {
+            Pass::Ref | Pass::Memory { .. } => {
+                let to = self.sret.ok_or(malformed("an aggregate result without its pointer"))?;
+                self.store(v, ret, (to, 0))?;
+            }
+            p => self.pass_arg(v, ret, p, &mut xs)?,
+        }
+        self.drop_from(0)?;
+        self.b.ret(&xs);
+        Ok(())
+    }
+
+    /// Whether building place `e` runs no code that could write memory: locals, fields,
+    /// dereferences and indexes by a local or a literal.
+    fn effect_free_place(&self, e: ExprId) -> Result<bool, BuildError> {
+        let mut todo = Vec::new_in(self.alloc.clone());
+        todo.push(e);
+        while let Some(e) = todo.pop() {
+            match self.expr(e)? {
+                Expr::Local(_) | Expr::Lit(_) => {}
+                Expr::Paren(x) | Expr::Field { base: x, .. } | Expr::TupleField { base: x, .. } => todo.push(x),
+                Expr::Unary { op: UnOp::Deref, operand } => todo.push(operand),
+                Expr::Index { base, index } => {
+                    todo.push(base);
+                    todo.push(index);
+                }
+                _ => return Ok(false),
+            }
+        }
+        Ok(true)
+    }
+
+    /// Whether `e` builds its aggregate value in a temporary of its own, which a binding or a
+    /// call may then take as is: a call, a literal.
+    fn is_fresh(&self, e: ExprId) -> Result<bool, BuildError> {
+        let mut e = e;
+        loop {
+            if !self.adjust_rows(e).is_empty() {
+                return Ok(false);
+            }
+            match self.expr(e)? {
+                Expr::Paren(inner) => e = inner,
+                Expr::Call { .. } | Expr::Tuple { .. } | Expr::Array { .. } | Expr::Repeat { .. } | Expr::Struct { .. } => {
+                    return Ok(true);
+                }
+                _ => return Ok(false),
+            }
+        }
+    }
+
     fn step(&mut self, task: Task) -> Result<(), BuildError> {
         match task {
             Task::Eval(e) => {
-                if !self.adjust_rows(e).is_empty() {
-                    self.work.push(Task::Adjust(e));
+                let rows = self.adjust_rows(e);
+                if rows.is_empty() {
+                    return self.raw(e);
                 }
-                self.raw(e)?;
+                self.eval_adjusted(e, rows)?;
             }
             Task::Raw(e) => self.raw(e)?,
-            Task::Adjust(e) => self.adjust(e)?,
+            Task::Adjust(e, from) => self.adjust(e, from as usize)?,
+            Task::DerefCall(e, n) => self.deref_call(e, n as usize)?,
+            Task::LoadAdjusted(e, n) => {
+                let v = self.pop()?;
+                let at = self.place_any(v)?;
+                let t = self.checked.adjusts.column::<2>()[self.adjust_rows(e).start + n as usize];
+                let repr = self.repr_at(e, t)?;
+                if self.repr_needs_drop(repr) {
+                    return Err(unsupported(e, "a move out of a dereference whose type needs drop"));
+                }
+                let v = self.load(repr, at);
+                self.vals.push(v);
+            }
+            Task::SpillAdjusted(e) => {
+                let v = self.pop()?;
+                let repr = self.adjusted_repr(e)?;
+                if self.repr_needs_drop(repr) {
+                    return Err(unsupported(e, "a borrowed temporary whose type needs drop"));
+                }
+                let at = match v {
+                    V::Place(p, off) => (p, off),
+                    _ => {
+                        let at = self.temp(repr);
+                        self.store(v, repr, at)?;
+                        at
+                    }
+                };
+                self.vals.push(V::Place(at.0, at.1));
+            }
             Task::Place(e) => self.place_of(e)?,
+            Task::PlaceDerefs(e, n) => self.place_derefs(e, n)?,
+            Task::Intrinsic(e, which) => self.intrinsic(e, which)?,
             Task::Stmt(s) => self.stmt(s)?,
             Task::Discard => {
                 self.pop()?;
             }
-            Task::PushNone => self.vals.push(V::None),
-            Task::Let(p) => {
+            Task::DropValue(e) => {
                 let v = self.pop()?;
-                self.bind_value(p, v)?;
+                let repr = self.adjusted_repr(e)?;
+                if self.live && self.repr_needs_drop(repr) {
+                    let Repr::Agg(l) = repr else { return Err(malformed("a value that needs drop not held as an aggregate")) };
+                    let at = self.place(v, repr)?;
+                    let g = self.layouts[l as usize].ty;
+                    self.drop_at(g, at)?;
+                }
+            }
+            Task::ScopeEnd(e) => {
+                let v = self.pop()?;
+                let mark = self.scope_marks.pop().ok_or(malformed("a block's drop scope out of order"))? as usize;
+                let repr = self.expr_repr(e)?;
+                let v = self.settle(v, repr, mark)?;
+                for i in (mark..self.scope_pats.len()).rev() {
+                    let h = self.scope_pats[i];
+                    self.drop_held(h, true)?;
+                    if let Held::Pat(p) = h {
+                        self.owned[p.ix()] = None;
+                    }
+                }
+                self.scope_pats.truncate(mark);
+                self.vals.push(v);
+            }
+            Task::PushNone => self.vals.push(V::None),
+            Task::Let(p, init) => {
+                let v = self.pop()?;
+                let fresh = match (init, v, self.pat(p)?) {
+                    (Some(e), V::Place(at, off), Pat::Bind { .. }) if self.live && self.is_fresh(e)? => Some((at, off)),
+                    _ => None,
+                };
+                match fresh {
+                    Some(at) => self.bind_at(p, at)?,
+                    None => self.bind_value(p, v)?,
+                }
+                self.own_pat(p)?;
             }
             Task::BlockExit(e) => {
                 let v = self.pop()?;
@@ -873,18 +2814,17 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     .rev()
                     .find(|t| t.expr == target)
                     .ok_or(malformed("a `break` whose target is not around it"))?;
+                let start = self.scope_start(t.depth);
+                let v = self.settle(v, t.repr, start)?;
                 let arg = self.arg(v, t.repr)?;
+                self.drop_from(start)?;
                 self.jump(t.exit, arg.as_slice());
                 self.dead_block();
                 self.vals.push(V::None);
             }
             Task::Return(has_value) => {
                 let v = if has_value { self.pop()? } else { V::None };
-                let ret = self.ret;
-                match self.arg(v, ret)? {
-                    Some(x) => self.b.ret(&[x]),
-                    None => self.b.ret(&[]),
-                }
+                self.ret_value(v)?;
                 self.dead_block();
                 self.vals.push(V::None);
             }
@@ -941,6 +2881,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 let v = self.pop()?;
                 let p = self.scalar(v, Ty::PTR)?;
                 let repr = self.expr_repr(e)?;
+                if self.repr_needs_drop(repr) {
+                    return Err(unsupported(e, "a move out of a dereference whose type needs drop"));
+                }
                 let v = self.load(repr, (p, 0));
                 self.vals.push(v);
             }
@@ -978,8 +2921,37 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 let v = self.pop()?;
                 let Expr::Assign { lhs, .. } = self.expr(e)? else { return Err(malformed("an assignment's task on another expression")) };
                 let repr = self.expr_repr(lhs)?;
-                let V::Place(p, off) = to else { return Err(malformed("an assignment to no place")) };
-                self.store(v, repr, (p, off))?;
+                let at = self.place(to, repr)?;
+                if self.live && self.repr_needs_drop(repr) {
+                    // The old value is dropped before the store, the new one held apart from
+                    // anything the drop could write.
+                    let v = match v {
+                        V::Place(..) => {
+                            let tmp = self.temp(repr);
+                            self.store(v, repr, tmp)?;
+                            V::Place(tmp.0, tmp.1)
+                        }
+                        other => other,
+                    };
+                    match self.local_of(lhs)? {
+                        Some(p) if self.owned[p.ix()].is_some() => {
+                            self.drop_local(p, false)?;
+                            self.store(v, repr, at)?;
+                            self.set_flag(p, true);
+                            self.hold_all(p);
+                            self.init[p.ix()] = true;
+                        }
+                        Some(_) => return Err(malformed("an assignment to a binding that needs drop and is not owned")),
+                        None => {
+                            let Repr::Agg(l) = repr else { return Err(malformed("a value that needs drop not held as an aggregate")) };
+                            let g = self.layouts[l as usize].ty;
+                            self.drop_at(g, at)?;
+                            self.store(v, repr, at)?;
+                        }
+                    }
+                } else {
+                    self.store(v, repr, at)?;
+                }
                 self.vals.push(V::None);
             }
             Task::AssignOp(e, op) => {
@@ -990,8 +2962,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 };
                 let lrepr = self.expr_repr(lhs)?;
                 let rrepr = self.adjusted_repr(rhs)?;
-                let V::Place(p, off) = to else { return Err(malformed("an assignment to no place")) };
                 let ty = lrepr.scalar().ok_or(unsupported(e, "a compound assignment to a non-scalar"))?;
+                let (p, off) = self.place(to, lrepr)?;
                 let l = self.load(lrepr, (p, off));
                 let l = self.scalar(l, ty)?;
                 let rty = rrepr.scalar().ok_or(unsupported(e, "a compound assignment of a non-scalar"))?;
@@ -1001,23 +2973,42 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.vals.push(V::None);
             }
             Task::Cast(e) => self.cast(e)?,
-            Task::StructInit(at) => {
+            Task::InitAt { off, repr } => {
                 let v = self.pop()?;
-                let V::Place(p, off) = *self.vals.last().ok_or(malformed("a struct literal without its place"))? else {
-                    return Err(malformed("a struct literal without its place"));
+                let V::Place(p, at) = *self.vals.last().ok_or(malformed("an aggregate literal without its place"))? else {
+                    return Err(malformed("an aggregate literal without its place"));
                 };
-                let (_, field_off, repr) = self.layout_fields[at as usize];
-                self.store(v, repr, (p, off + field_off as i32))?;
+                self.store(v, repr, (p, at + off as i32))?;
             }
             Task::Field(e) | Task::FieldPlace(e) => {
-                let v = self.pop()?;
-                let V::Place(p, off) = v else { return Err(malformed("a field of a value that is not a place")) };
                 let (field_off, repr) = self.field(e)?;
+                let v = self.pop()?;
+                let (p, off) = self.place_any(v)?;
                 let at = (p, off + field_off as i32);
                 let v = match task {
+                    Task::Field(_) if self.repr_needs_drop(repr) => {
+                        return Err(unsupported(e, "a move out of a field whose type needs drop (a partial move)"));
+                    }
                     Task::Field(_) => self.load(repr, at),
                     _ => V::Place(at.0, at.1),
                 };
+                self.vals.push(v);
+            }
+            Task::IndexPlace(e) => self.index_place(e)?,
+            Task::LoadPlace(e) => {
+                let v = self.pop()?;
+                let at = self.place_any(v)?;
+                let repr = self.expr_repr(e)?;
+                if self.repr_needs_drop(repr) {
+                    return Err(unsupported(e, "a move out of an indexed element whose type needs drop"));
+                }
+                let v = self.load(repr, at);
+                self.vals.push(v);
+            }
+            Task::LoadPtr => {
+                let v = self.pop()?;
+                let at = self.place_any(v)?;
+                let v = self.load(Repr::Ptr, at);
                 self.vals.push(v);
             }
             Task::DerefPlace => {
@@ -1027,6 +3018,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             }
             Task::Spill(e) => {
                 let v = self.pop()?;
+                let repr = self.expr_repr(e)?;
+                if self.repr_needs_drop(repr) {
+                    return Err(unsupported(e, "a borrowed temporary whose type needs drop"));
+                }
                 if let V::Place(..) = v {
                     self.vals.push(v);
                 } else {
@@ -1036,54 +3031,320 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     self.vals.push(V::Place(at.0, at.1));
                 }
             }
+            Task::ArgCopy(a) => {
+                let v = self.pop()?;
+                let repr = self.adjusted_repr(a)?;
+                let v = match v {
+                    V::Place(..) if self.is_fresh(a)? => v,
+                    _ => {
+                        let at = self.temp(repr);
+                        self.store(v, repr, at)?;
+                        V::Place(at.0, at.1)
+                    }
+                };
+                self.vals.push(v);
+            }
+            Task::Repeat(e) => self.repeat(e)?,
             Task::Ref => {
                 let v = self.pop()?;
-                let V::Place(p, off) = v else { return Err(malformed("a borrow of no place")) };
-                let a = self.address((p, off));
+                let at = self.place_any(v)?;
+                let a = self.address(at);
                 self.vals.push(V::Scalar(a));
             }
         }
         Ok(())
     }
 
-    /// Applies `e`'s adjustments to the value on top: those that change no bits, and
-    /// `NeverToAny` of an expression that diverged. Any other is refused, never skipped.
-    fn adjust(&mut self, e: ExprId) -> Result<(), BuildError> {
-        let rows = self.adjust_rows(e);
-        let kinds = &self.checked.adjusts.column::<1>()[rows.clone()];
-        let tys = &self.checked.adjusts.column::<2>()[rows.clone()];
-        match kinds {
-            [AdjustKind::NeverToAny] => {
-                let t = tys[0];
-                let repr = self.repr_at(e, t)?;
-                let v = self.pop()?;
-                let v = match repr {
-                    Repr::None => V::None,
-                    Repr::Struct(_) => {
-                        let (p, off) = self.place(v, repr)?;
-                        V::Place(p, off)
-                    }
-                    scalar => {
-                        let ty = scalar.scalar().unwrap_or(Ty::I8);
-                        V::Scalar(self.scalar(v, ty)?)
-                    }
-                };
-                self.vals.push(v);
-                Ok(())
+    /// Pushes the tasks that evaluate `e` and apply its adjustments `rows` (lib.rs,
+    /// "Adjustments"): the leading dereferences and the borrow as a pointer to the place they
+    /// reach (never a copy of the value), a dereference with no borrow as a load from that
+    /// place, then the coercions as value steps.
+    fn eval_adjusted(&mut self, e: ExprId, rows: core::ops::Range<usize>) -> Result<(), BuildError> {
+        let kinds = &self.checked.adjusts.column::<1>()[rows];
+        let lead = kinds.iter().take_while(|k| matches!(k, AdjustKind::Deref { .. })).count();
+        let borrow = matches!(kinds.get(lead), Some(AdjustKind::Borrow { .. }));
+        let from = lead + usize::from(borrow);
+        if kinds[from..].iter().any(|k| matches!(k, AdjustKind::Deref { .. } | AdjustKind::Borrow { .. })) {
+            return Err(unsupported(e, "a dereference or a borrow after a coercion in one adjustment list"));
+        }
+        if from < kinds.len() {
+            self.work.push(Task::Adjust(e, from as u32));
+        }
+        match (lead, borrow) {
+            (0, false) => self.raw(e)?,
+            // An autoref: the address of `e`'s own place.
+            (0, true) => {
+                self.work.push(Task::Ref);
+                self.work.push(Task::PlaceDerefs(e, 0));
             }
-            // A raw pointer's mutability: the same bits.
-            [AdjustKind::MutToConstPointer] => Ok(()),
-            // A reborrow (`&*r`, `&mut *r` to `*const`/`*mut`): the same pointer.
-            [AdjustKind::Deref { overloaded: None }, AdjustKind::Borrow { .. }] => {
-                let t = self.expr_ty(e)?;
-                match self.node_at(e, t)? {
-                    PNode::Ref(..) | PNode::Ptr(..) => Ok(()),
-                    _ => Err(unsupported(e, "a borrow of a dereference of a non-pointer")),
+            // A reborrow: the pointer to the place the dereferences reach is the borrow.
+            (_, true) => self.push_deref_chain(e, lead),
+            // A dereference with no borrow: a copy out of the place.
+            (_, false) => {
+                self.work.push(Task::LoadAdjusted(e, (lead - 1) as u32));
+                self.work.push(Task::DerefPlace);
+                self.push_deref_chain(e, lead);
+            }
+        }
+        Ok(())
+    }
+
+    /// Pushes the tasks that leave a pointer to the place `e`'s first `lead` adjustments (all
+    /// dereferences) reach: a builtin one loads the next pointer from the place, an overloaded
+    /// one calls `Deref::deref` with the pointer to its `Self` (`DerefCall`).
+    fn push_deref_chain(&mut self, e: ExprId, lead: usize) {
+        let rows = self.adjust_rows(e);
+        // The tasks run first to last, so they are pushed last to first.
+        for i in (1..lead).rev() {
+            match self.checked.adjusts.column::<1>()[rows.start + i] {
+                AdjustKind::Deref { overloaded: Some(_) } => self.work.push(Task::DerefCall(e, i as u32)),
+                _ => {
+                    self.work.push(Task::LoadPtr);
+                    self.work.push(Task::DerefPlace);
                 }
             }
-            [] => Ok(()),
-            _ => Err(unsupported(e, "this adjustment (an autoref, an overloaded deref, an unsizing or a fn pointer)")),
         }
+        match self.checked.adjusts.column::<1>()[rows.start] {
+            // `e`'s value is the first pointer.
+            AdjustKind::Deref { overloaded: None } => self.work.push(Task::Raw(e)),
+            // `e` is the `Self`: borrowed in place.
+            _ => {
+                self.work.push(Task::DerefCall(e, 0));
+                self.work.push(Task::Ref);
+                self.work.push(Task::PlaceDerefs(e, 0));
+            }
+        }
+    }
+
+    /// The type `e` has before its adjustment `n`: its own for the first, else the one the
+    /// adjustment before it made.
+    fn ty_before(&self, e: ExprId, n: usize) -> Result<PTy, BuildError> {
+        match n {
+            0 => self.expr_ty(e),
+            _ => Ok(self.checked.adjusts.column::<2>()[self.adjust_rows(e).start + n - 1]),
+        }
+    }
+
+    /// Adjustment `n` of `e`, an overloaded dereference: calls `Deref::deref` (or
+    /// `DerefMut::deref_mut`) at `[Self]` with the pointer on top, and leaves the reference it
+    /// returns. A reference to an unsized target (`String` to `str`) is a wide pointer, which
+    /// only a borrow right after may take as is: a place carries no length.
+    fn deref_call(&mut self, e: ExprId, n: usize) -> Result<(), BuildError> {
+        let rows = self.adjust_rows(e);
+        let kinds = &self.checked.adjusts.column::<1>()[rows.clone()];
+        let AdjustKind::Deref { overloaded: Some(m) } = kinds[n] else {
+            return Err(malformed("a deref call on an adjustment that is not an overloaded dereference"));
+        };
+        let borrowed_next = matches!(kinds.get(n + 1), Some(AdjustKind::Borrow { .. }));
+        // A place borrowed `&mut` through `Deref::deref` would be written through a shared
+        // reference: the check must record `DerefMut` there (rustc's
+        // `convert_place_derefs_to_mutable`), and the build never upgrades it on its own.
+        if m == Mutbl::Not && kinds[n + 1..].iter().any(|k| matches!(k, AdjustKind::Borrow { mutbl: Mutbl::Mut, .. })) {
+            return Err(unsupported(e, "a `&mut` borrow through an overloaded dereference the check recorded as `Deref::deref`, not `DerefMut::deref_mut`"));
+        }
+        let name = match m {
+            Mutbl::Not => "deref",
+            Mutbl::Mut => "deref_mut",
+        };
+        let item = self.adts.deref_fn(m).ok_or(BuildError::NoLangFn { expr: Some(e), name })?;
+        let self_t = self.ty_before(e, n)?;
+        let target_t = self.checked.adjusts.column::<2>()[rows.start + n];
+        let g_self = self.ground_ty(self_t).map_err(|error| Self::ty_err(e, error))?;
+        let g_target = self.ground_ty(target_t).map_err(|error| Self::ty_err(e, error))?;
+        let g_arg = self.ground.intern(PNode::Ref(m, g_self)).map_err(|_| malformed("the ground table is full"))?;
+        let g_ret = self.ground.intern(PNode::Ref(m, g_target)).map_err(|_| malformed("the ground table is full"))?;
+        let arepr = self.repr(g_arg).map_err(|error| Self::ty_err(e, error))?;
+        if arepr != Repr::Ptr {
+            return Err(unsupported(e, "an overloaded dereference of an unsized `Self`"));
+        }
+        let rrepr = self.repr(g_ret).map_err(|error| Self::ty_err(e, error))?;
+        if rrepr != Repr::Ptr && !borrowed_next {
+            return Err(unsupported(e, "a place behind an overloaded dereference to an unsized target (a place carries no length yet)"));
+        }
+        let abi = self.adts.abi(item).ok_or(BuildError::NoAbi { item })?;
+        let apass = self.pass(g_arg, arepr, abi, Some(item))?;
+        let rpass = self.pass(g_ret, rrepr, abi, Some(item))?;
+        let args = self.ground.intern_list(&[g_self]).map_err(|_| malformed("the ground table is full"))?;
+        let place = self.ref_place(Instance { item, args });
+        let reference = self.b.reference(RefKind::Func, place);
+        self.emit_call(Callee::Direct(reference), &[arepr], &[apass], rrepr, rpass)
+    }
+
+    /// Applies `e`'s adjustments from its `from`th on, all coercions, to the value on top, in
+    /// order. A step the build has no form for is refused by name, never skipped.
+    fn adjust(&mut self, e: ExprId, from: usize) -> Result<(), BuildError> {
+        let rows = self.adjust_rows(e);
+        for n in from..rows.len() {
+            let kind = self.checked.adjusts.column::<1>()[rows.start + n];
+            let t = self.checked.adjusts.column::<2>()[rows.start + n];
+            match kind {
+                AdjustKind::NeverToAny => {
+                    let repr = self.repr_at(e, t)?;
+                    let v = self.pop()?;
+                    let v = match repr {
+                        Repr::None => V::None,
+                        Repr::Agg(_) => {
+                            let (p, off) = self.place(v, repr)?;
+                            V::Place(p, off)
+                        }
+                        scalar => {
+                            let ty = scalar.scalar().unwrap_or(Ty::I8);
+                            V::Scalar(self.scalar(v, ty)?)
+                        }
+                    };
+                    self.vals.push(v);
+                }
+                // A raw pointer's mutability, a fn pointer's `unsafe`: the same bits.
+                AdjustKind::MutToConstPointer | AdjustKind::UnsafeFnPointer => {}
+                // A fn item to a pointer (lib.rs, "Fn pointers"): the address of its instance.
+                AdjustKind::ReifyFnPointer => {
+                    self.pop()?;
+                    let before = self.ty_before(e, n)?;
+                    let PNode::FnDef(item, args) = self.node_at(e, before)? else {
+                        return Err(malformed("a fn pointer made of other than a fn item"));
+                    };
+                    let p = self.fn_addr(Instance { item, args });
+                    self.vals.push(V::Scalar(p));
+                }
+                AdjustKind::Unsize => self.unsize(e, n)?,
+                // OWED: the closure's body as a fn of its own signature (no environment).
+                AdjustKind::ClosureFnPointer => {
+                    return Err(unsupported(e, "a closure that captures nothing as a fn pointer"));
+                }
+                AdjustKind::Deref { .. } | AdjustKind::Borrow { .. } => {
+                    return Err(malformed("a dereference or a borrow among the value adjustments"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Adjustment `n` of `e`, an unsizing of the pointer on top (lib.rs, "Wide pointers";
+    /// codegen.md, "Trait objects"). The Reference, "Coercion types": `&T`, `&mut T`, `*const T`,
+    /// `*mut T` and a `CoerceUnsized` struct (`Box<T>`) to the same with `U`, where `T: Unsize<U>`:
+    /// - `[T; N]` to `[T]`: the address and `N`;
+    /// - a concrete `T` to `dyn Tr`: the address and `(T, Tr)`'s vtable's;
+    /// - `dyn Sub` to `dyn Tr`, an upcast: the same table on the first supertrait chain, else
+    ///   the one word `Shape::upcast` names; an auto trait dropped: the same two words.
+    ///
+    /// A struct is unsized through its one pointer: refused by name unless it is 8 bytes before
+    /// and 16 after, so every other field is zero-sized and the pointer is at offset 0.
+    fn unsize(&mut self, e: ExprId, n: usize) -> Result<(), BuildError> {
+        let ends = self.unsize_ends(e, n)?;
+        self.unsize_from(e, ends)
+    }
+
+    /// Adjustment `n` of `e`, an unsizing: the pointer's type before and after it, and the
+    /// pointee before and after (a `CoerceUnsized` struct's one changed argument).
+    fn unsize_ends(&mut self, e: ExprId, n: usize) -> Result<UnsizeEnds, BuildError> {
+        let before = self.ty_before(e, n)?;
+        let after = self.checked.adjusts.column::<2>()[self.adjust_rows(e).start + n];
+        let (from, to) = match (self.node_at(e, before)?, self.node_at(e, after)?) {
+            (PNode::Ref(_, from) | PNode::Ptr(_, from), PNode::Ref(_, to) | PNode::Ptr(_, to)) => (from, to),
+            (PNode::Adt(k, a), PNode::Adt(k2, b)) if k == k2 => {
+                let view = self.ground.view();
+                let (a, b) = (view.list(a), view.list(b));
+                let (Ok(a), Ok(b)) = (a, b) else {
+                    return Err(malformed("a struct's arguments past the ground table"));
+                };
+                let mut differ = a.iter().zip(b.iter()).filter(|(x, y)| x != y);
+                let (Some((&from, &to)), None) = (differ.next(), differ.next()) else {
+                    return Err(unsupported(e, "a `CoerceUnsized` unsizing that changes other than one type argument"));
+                };
+                let (rb, ra) = (self.repr_at(e, before)?, self.repr_at(e, after)?);
+                if self.size_align(rb).0 != 8 || self.size_align(ra).0 != 16 {
+                    return Err(unsupported(e, "a `CoerceUnsized` struct with a field beside its pointer that is not zero-sized"));
+                }
+                (from, to)
+            }
+            _ => return Err(unsupported(e, "an unsizing of other than a pointer or a `CoerceUnsized` struct")),
+        };
+        Ok(UnsizeEnds { before, after, from, to })
+    }
+
+    /// [`Self::unsize`] once its ends are known.
+    fn unsize_from(&mut self, e: ExprId, ends: UnsizeEnds) -> Result<(), BuildError> {
+        let UnsizeEnds { before, from, to, .. } = ends;
+        let node = |w: &Self, t: PTy| w.ground_node(t).map_err(|error| Self::ty_err(e, error));
+        let (nf, nt) = (node(self, from)?, node(self, to)?);
+        let v = self.pop()?;
+        let rb = self.repr_at(e, before)?;
+        // The data address, and the pointer's second word when it is already wide (an upcast).
+        let (p, old) = match rb {
+            Repr::Ptr => (self.scalar(v, Ty::PTR)?, None),
+            Repr::Agg(_) => {
+                let at = self.place(v, rb)?;
+                let p = self.load(Repr::Ptr, at);
+                let p = self.scalar(p, Ty::PTR)?;
+                let second = match nf {
+                    PNode::Dynamic(_) => {
+                        let w = self.load(Repr::Ptr, (at.0, at.1 + 8));
+                        Some(self.scalar(w, Ty::PTR)?)
+                    }
+                    _ => None,
+                };
+                (p, second)
+            }
+            _ => return Err(malformed("an unsized pointer held as other than a pointer or an aggregate")),
+        };
+        let second = match (nf, nt, old) {
+            (PNode::Array(_, len), PNode::Slice(_), None) => {
+                let len = self.ground_len(len).map_err(|error| Self::ty_err(e, error))?;
+                self.b.iconst(Ty::I64, u128::from(len))
+            }
+            (PNode::Dynamic(_), PNode::Dynamic(_), Some(vt)) => {
+                let (pf, pt) = (self.principal(e, from)?, self.principal(e, to)?);
+                match (pf, pt) {
+                    (_, None) => return Err(unsupported(e, "an unsizing to a trait object of auto traits alone (no principal trait)")),
+                    (Some((a, _)), Some((b, _))) if a == b => vt,
+                    (Some((a, _)), Some((b, _))) => {
+                        let shape = crate::vtable::Shape::of(a, |t| self.adts.object_trait(t), self.alloc.clone())
+                            .map_err(|error| BuildError::Vtable { at: Some(e), error })?;
+                        match shape.upcast(b) {
+                            Some(crate::vtable::Upcast::Prefix) => vt,
+                            Some(crate::vtable::Upcast::Load(slot)) => {
+                                let off = 8 * (crate::vtable::HEADER_WORDS + slot);
+                                let off = i32::try_from(off).map_err(|_| malformed("a vtable slot past 2^31 bytes"))?;
+                                self.b.load(Ty::PTR, Flags::NONE, vt, off, MemAttrs::aligned(3))
+                            }
+                            None => return Err(malformed("an upcast to a trait that is not a supertrait")),
+                        }
+                    }
+                    (None, Some(_)) => return Err(malformed("an upcast from a trait object without a principal")),
+                }
+            }
+            (PNode::Dynamic(_), _, _) | (_, _, Some(_)) => return Err(malformed("an unsizing of a trait object to other than a trait object")),
+            (_, PNode::Dynamic(_), None) => {
+                let Some((principal, args)) = self.principal(e, to)? else {
+                    return Err(unsupported(e, "an unsizing to a trait object of auto traits alone (no principal trait)"));
+                };
+                self.vtable_addr(crate::vtable::VtableRef { concrete: from, principal, args })?
+            }
+            _ => return Err(unsupported(e, "an unsizing to other than a slice or a trait object")),
+        };
+        let repr = self.repr_at(e, ends.after)?;
+        let at = self.temp(repr);
+        self.b.store(Flags::NONE, p, at.0, at.1, MemAttrs::aligned(3));
+        self.b.store(Flags::NONE, second, at.0, at.1 + 8, MemAttrs::aligned(3));
+        self.vals.push(V::Place(at.0, at.1));
+        Ok(())
+    }
+
+    /// The principal trait of ground trait object `t` and its arguments after `Self` (its first
+    /// predicate when that is an `ExTrait`: the one form puts it first), `None` for `dyn Send`.
+    fn principal(&self, e: ExprId, t: PTy) -> Result<Option<(ItemKey, List)>, BuildError> {
+        let view = self.ground.view();
+        let PNode::Dynamic(l) = view.node(t).map_err(|_| malformed("a type past the ground table"))? else {
+            return Err(malformed("a trait object's principal asked of another type"));
+        };
+        let preds = view.list(l).map_err(|_| malformed("a trait object's predicates past the ground table"))?;
+        let Some(&first) = preds.first() else {
+            return Err(unsupported(e, "a trait object with no predicates"));
+        };
+        Ok(match view.node(first).map_err(|_| malformed("a type past the ground table"))? {
+            PNode::ExTrait(k, args) => Some((k, args)),
+            _ => None,
+        })
     }
 
     /// The offset and representation of field expression `e`'s field.
@@ -1096,38 +3357,565 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let row = col.binary_search(&e).map_err(|_| malformed("a field access without its record row"))?;
         let at = self.checked.fields.column::<2>()[row];
         let repr = self.adjusted_repr(base)?;
-        let Repr::Struct(l) = repr else { return Err(unsupported(e, "a field of a value that is not a struct")) };
-        let layout = &self.layouts[l as usize];
-        if at >= layout.len {
-            return Err(malformed("a field index past its struct's fields"));
+        let l = match repr {
+            Repr::Agg(l) => l,
+            // A field of a zero-sized aggregate is zero-sized.
+            Repr::None => return Ok((0, Repr::None)),
+            _ => return Err(unsupported(e, "a field of a value that is not a struct or a tuple")),
+        };
+        let Shape::Fields { first, len } = self.layouts[l as usize].shape else {
+            return Err(malformed("a field of an array"));
+        };
+        if at >= len {
+            return Err(malformed("a field index past its aggregate's fields"));
         }
-        let (_, off, repr) = self.layout_fields[(layout.first + at) as usize];
+        let (_, off, repr) = self.layout_fields[(first + at) as usize];
         Ok((off, repr))
+    }
+
+    /// The place `v` is; in unreachable code a value that diverged is any pointer.
+    fn place_any(&mut self, v: V) -> Result<(Value, i32), BuildError> {
+        match v {
+            V::Place(p, off) => Ok((p, off)),
+            V::None if !self.live => Ok((self.b.uninit(Ty::PTR), 0)),
+            V::None => Err(malformed("an expression with no value where a place was expected")),
+            V::Scalar(_) => Err(malformed("a scalar where a place was expected")),
+        }
+    }
+
+    /// The element place of index expression `e`, from the index on top and the array's place
+    /// under it: the index is compared with the length, and out of range the program's
+    /// `panic_bounds_check` is called with both (it never returns).
+    /// Pushes the tasks that leave the base of index expression `base[..]`: an array's place,
+    /// or for a slice reached through a reference (`w[i]` with `w: &[T]`, autoderef's last
+    /// step builtin) the wide pointer itself, whose address and length `index_place` reads
+    /// (lib.rs, "Wide pointers": a place carries no length, the pointer does).
+    fn push_index_base(&mut self, base: ExprId) -> Result<(), BuildError> {
+        let t = self.adjusted_ty(base)?;
+        if !matches!(self.node_at(base, t)?, PNode::Slice(_)) {
+            self.work.push(Task::Place(base));
+            return Ok(());
+        }
+        let rows = self.adjust_rows(base);
+        let kinds = &self.checked.adjusts.column::<1>()[rows];
+        let lead = kinds.iter().take_while(|k| matches!(k, AdjustKind::Deref { .. })).count();
+        if lead == 0 || lead != kinds.len() || !matches!(kinds[lead - 1], AdjustKind::Deref { overloaded: None }) {
+            return Err(unsupported(base, "indexing a slice not reached by a builtin dereference of a wide pointer"));
+        }
+        if lead == 1 {
+            self.raw(base)?;
+        } else {
+            self.work.push(Task::LoadAdjusted(base, (lead - 2) as u32));
+            self.work.push(Task::DerefPlace);
+            self.push_deref_chain(base, lead - 1);
+        }
+        Ok(())
+    }
+
+    fn index_place(&mut self, e: ExprId) -> Result<(), BuildError> {
+        let Expr::Index { base, .. } = self.expr(e)? else { return Err(malformed("an index task on another expression")) };
+        let i = self.pop()?;
+        let i = self.scalar(i, Ty::I64)?;
+        let v = self.pop()?;
+        let t = self.adjusted_ty(base)?;
+        let elem = self.expr_repr(e)?;
+        let (at, n) = match self.node_at(base, t)? {
+            PNode::Array(_, len) => {
+                let len = self.ground_len(len).map_err(|error| Self::ty_err(base, error))?;
+                (self.place_any(v)?, self.b.iconst(Ty::I64, u128::from(len)))
+            }
+            // `v` is the wide pointer (`push_index_base`): its address at 0, length at 8.
+            PNode::Slice(_) => {
+                let w = self.place_any(v)?;
+                let p = self.b.load(Ty::PTR, Flags::NONE, w.0, w.1, MemAttrs::aligned(3));
+                let len = self.b.load(Ty::I64, Flags::NONE, w.0, w.1 + 8, MemAttrs::aligned(3));
+                ((p, 0), len)
+            }
+            _ => return Err(unsupported(e, "an overloaded index (`Index::index`)")),
+        };
+        let bounds = self.adts.lang_fn(BOUNDS_FN).ok_or(BuildError::NoLangFn { expr: Some(e), name: BOUNDS_FN })?;
+        let ok = self.create();
+        let fail = self.create();
+        let inside = self.b.icmp(IntCond::Ult, i, n);
+        self.br(inside, (ok, &[]), (fail, &[]));
+        self.begin(fail);
+        let place = self.ref_place(Instance { item: bounds, args: List::EMPTY });
+        let reference = self.b.reference(RefKind::Func, place);
+        let usize_ = Param::of(Ty::I64);
+        let sig = self.b.sig(Conv::C, Variadic::No, &[usize_, usize_], &[]);
+        // In this block `i` and `n` are the values the branch compared.
+        self.b.call(Flags::NONE, reference, sig, &[i, n]);
+        self.b.unreachable();
+        self.begin(ok);
+        let (stride, _) = self.size_align(elem);
+        let v = if stride == 0 {
+            V::Place(at.0, at.1)
+        } else {
+            let s = self.b.iconst(Ty::I64, u128::from(stride));
+            let off = self.b.binary(Op::Mul, Flags::NONE, i, s);
+            let p = self.b.ptr_add(Flags::NONE, at.0, off);
+            V::Place(p, at.1)
+        };
+        self.vals.push(v);
+        Ok(())
+    }
+
+    /// Pushes the tasks of ctor call `e` of variant `variant` with arguments `args`: the tag,
+    /// then each field from its argument, in a temporary (lib.rs, "Enums").
+    fn construct(&mut self, e: ExprId, variant: u32, args: &[ExprId]) -> Result<(), BuildError> {
+        match self.expr_repr(e)? {
+            // Zero-sized: the arguments run for their effects.
+            Repr::None => {
+                self.work.push(Task::PushNone);
+                for &a in args.iter().rev() {
+                    self.work.push(Task::Discard);
+                    self.work.push(Task::Eval(a));
+                }
+            }
+            repr @ Repr::Agg(l) => {
+                let (first, len, tag) = self.variant_rows(l, variant)?;
+                if args.len() != len as usize {
+                    return Err(malformed("a ctor call whose arguments are not its variant's fields"));
+                }
+                let at = self.temp(repr);
+                self.write_tag(tag, variant, at);
+                self.vals.push(V::Place(at.0, at.1));
+                for (i, &a) in args.iter().enumerate().rev() {
+                    let (_, off, repr) = self.layout_fields[first as usize + i];
+                    self.work.push(Task::InitAt { off, repr });
+                    self.work.push(Task::Eval(a));
+                }
+            }
+            _ => return Err(malformed("a ctor call of a type held as a scalar")),
+        }
+        Ok(())
+    }
+
+    /// `const_eval_select::<ARG, F, G, RET>(arg, const_fn, rt_fn)` at run time: a call of
+    /// `G`'s fn item with the fields of the tuple `arg`, in order (`gl` the call's generic
+    /// arguments, its `n` arguments on top of the value stack).
+    fn const_eval_select(&mut self, e: ExprId, gl: List, n: usize) -> Result<(), BuildError> {
+        let gs = self.ground.view().list(gl).map_err(|_| malformed("a list past the ground table"))?;
+        let (&[g_arg, _, g_rt, g_ret], 3) = (gs, n) else {
+            return Err(malformed("a `const_eval_select` call not of four generic arguments and three arguments"));
+        };
+        let PNode::FnDef(item, args) = self.ground_node(g_rt).map_err(|error| Self::ty_err(e, error))? else {
+            return Err(unsupported(e, "`const_eval_select` of a run-time fn that is not a fn item"));
+        };
+        let PNode::Tuple(fl) = self.ground_node(g_arg).map_err(|error| Self::ty_err(e, error))? else {
+            return Err(malformed("`const_eval_select`'s argument is not a tuple"));
+        };
+        let base = self.vals.len().checked_sub(n).ok_or(malformed("an intrinsic's arguments missing from the value stack (a build bug)"))?;
+        let tuple = self.vals[base];
+        self.vals.truncate(base);
+        let trepr = self.repr(g_arg).map_err(|error| Self::ty_err(e, error))?;
+        let at = match trepr {
+            Repr::Agg(_) => Some(self.place(tuple, trepr)?),
+            _ => None,
+        };
+        let fields = self.ground.view().list(fl).map_err(|_| malformed("a list past the ground table"))?.len();
+        let abi = self.adts.abi(item).ok_or(BuildError::NoAbi { item })?;
+        let mut reprs = Vec::with_capacity_in(fields, self.alloc.clone());
+        let mut passes = Vec::with_capacity_in(fields, self.alloc.clone());
+        for i in 0..fields {
+            let ft = self.ground.view().list(fl).map_err(|_| malformed("a list past the ground table"))?[i];
+            let repr = self.repr(ft).map_err(|error| Self::ty_err(e, error))?;
+            let v = match (trepr, at) {
+                (Repr::Agg(l), Some(at)) => {
+                    let Shape::Fields { first, .. } = self.layouts[l as usize].shape else {
+                        return Err(malformed("a tuple not laid out as fields"));
+                    };
+                    let (_, off, frepr) = self.layout_fields[first as usize + i];
+                    self.load(frepr, (at.0, at.1 + off as i32))
+                }
+                _ => V::None,
+            };
+            self.vals.push(v);
+            passes.push(self.pass(ft, repr, abi, Some(item))?);
+            reprs.push(repr);
+        }
+        let rrepr = self.repr(g_ret).map_err(|error| Self::ty_err(e, error))?;
+        let rpass = self.pass(g_ret, rrepr, abi, Some(item))?;
+        let place = self.ref_place(Instance { item, args });
+        let reference = self.b.reference(RefKind::Func, place);
+        self.emit_call(Callee::Direct(reference), &reprs, &passes, rrepr, rpass)
+    }
+
+    /// Intrinsic call `e`, its arguments on top (lib.rs, "Intrinsics").
+    fn intrinsic(&mut self, e: ExprId, which: Intrinsic) -> Result<(), BuildError> {
+        let Expr::Call { callee, args } = self.expr(e)? else { return Err(malformed("an intrinsic's task on another expression")) };
+        let list = self.body.expr_lists.get(args.range()).ok_or(malformed("a call's arguments past `expr_lists`"))?;
+        let Intrinsic::Table(which) = which;
+        // No site is passed: a `#[track_caller]` location is not built.
+        if which == Which::CallerLocation {
+            return Err(BuildError::Intrinsic { expr: e, which, why: "`caller_location` (a `#[track_caller]` site)", unsupported: true });
+        }
+        // The generic arguments, grounded. The portable form has no const generic: every
+        // argument is a type (an intrinsic that needs a const one is refused by `build`).
+        let t = self.expr_ty(callee)?;
+        let PNode::FnDef(_, gl) = self.node_at(callee, t)? else { return Err(malformed("an intrinsic call whose callee is not a fn item")) };
+        if which == Which::ConstEvalSelect {
+            return self.const_eval_select(e, gl, list.len());
+        }
+        let mut generics = Vec::new_in(self.alloc.clone());
+        for &g in self.ground.view().list(gl).map_err(|_| malformed("a list past the ground table"))? {
+            generics.push(GenericArg::Ty(g));
+        }
+        // The arguments as `build` takes them: a value `ls` lays out as one scalar is that
+        // scalar (a newtype's too), any other aggregate its address.
+        let n = list.len();
+        let base = self.vals.len().checked_sub(n).ok_or(malformed("an intrinsic's arguments missing from the value stack (a build bug)"))?;
+        let mut cargs = Vec::with_capacity_in(n, self.alloc.clone());
+        for (i, &a) in list.iter().enumerate() {
+            let v = self.vals[base + i];
+            let at = self.adjusted_ty(a)?;
+            let g = self.ground_ty(at).map_err(|error| Self::ty_err(a, error))?;
+            let repr = self.repr_at(a, at)?;
+            cargs.push(match repr {
+                Repr::None => Arg::None,
+                Repr::Agg(_) => {
+                    let place = self.place(v, repr)?;
+                    let id = self.ls_of(g).map_err(|error| Self::ty_err(a, error))?;
+                    let l = *self.ls.get(id);
+                    match l.scalar {
+                        Some(s) => Arg::Scalar(self.b.load(prim_ty(s.prim), Flags::NONE, place.0, place.1, MemAttrs::aligned(l.align))),
+                        None => Arg::Place(self.address(place)),
+                    }
+                }
+                scalar => Arg::Scalar(self.scalar(v, scalar.scalar().ok_or(malformed("a scalar of no type"))?)?),
+            });
+        }
+        self.vals.truncate(base);
+        let rt = self.expr_ty(e)?;
+        let ret = self.ground_ty(rt).map_err(|error| Self::ty_err(e, error))?;
+        let rrepr = self.repr_at(e, rt)?;
+        // Only `needs_drop` asks: answered before the call, by the walk's drop rules.
+        let answer = match (which, generics.first()) {
+            (Which::NeedsDrop, Some(&GenericArg::Ty(t0))) => self.needs_drop(t0).map_err(|error| Self::ty_err(e, error))?,
+            _ => false,
+        };
+        let needs_drop = move |_: PTy| answer;
+        let call = Call { which, generics: &generics, args: &cargs, ret, site: None };
+        let adts = self.adts;
+        let built = {
+            let mut lcx = LayoutCx { ground: &mut *self.ground, facts: adts.facts(), scratch: self.scratch };
+            let mut icx = IntrinsicCx { layouts: &mut self.ls, cx: &mut lcx, needs_drop: &needs_drop };
+            intrinsics::build(&mut self.b, &call, &mut icx)
+        };
+        let out = built.map_err(|error| match error {
+            IntrinsicError::Shape { which, why } => BuildError::Intrinsic { expr: e, which, why, unsupported: false },
+            IntrinsicError::Unsupported { which, why } => BuildError::Intrinsic { expr: e, which, why, unsupported: true },
+            IntrinsicError::Layout(error) => Self::ty_err(e, layout_err(error)),
+        })?;
+        let v = match out {
+            Out::None => V::None,
+            Out::Diverges => {
+                self.dead_block();
+                V::None
+            }
+            Out::Scalar(x) => match rrepr {
+                Repr::None => V::None,
+                // A newtype of a scalar: the scalar at its offset 0.
+                Repr::Agg(_) => {
+                    let at = self.temp(rrepr);
+                    let attrs = self.mem(rrepr);
+                    self.b.store(Flags::NONE, x, at.0, at.1, attrs);
+                    V::Place(at.0, at.1)
+                }
+                _ => V::Scalar(x),
+            },
+            // A `(T, bool)`: written at the tuple's offsets.
+            Out::Pair(x, flag) => {
+                let Repr::Agg(l) = rrepr else { return Err(malformed("an intrinsic's pair result of a type not held as a tuple")) };
+                let Shape::Fields { first, len: 2 } = self.layouts[l as usize].shape else {
+                    return Err(malformed("an intrinsic's pair result of a type not of two fields"));
+                };
+                let at = self.temp(rrepr);
+                for (i, part) in [x, flag].into_iter().enumerate() {
+                    let (_, off, repr) = self.layout_fields[first as usize + i];
+                    self.store(V::Scalar(part), repr, (at.0, at.1 + off as i32))?;
+                }
+                V::Place(at.0, at.1)
+            }
+            // The value at an address (a transmuted argument's own memory): copied into a
+            // temporary of its own, which a binding may take as its home.
+            Out::At(addr) => match rrepr {
+                Repr::None => V::None,
+                Repr::Agg(_) => {
+                    let to = self.temp(rrepr);
+                    self.copy(rrepr, (addr, 0), to)?;
+                    V::Place(to.0, to.1)
+                }
+                scalar => self.load(scalar, (addr, 0)),
+            },
+        };
+        self.vals.push(v);
+        Ok(())
+    }
+
+    /// The function reference place of `instance`: one per instance.
+    /// The value of const `item`, named by path `e`, from its evaluated record (lib.rs,
+    /// "Consts"): a scalar is a constant of the root's bytes, little-endian at the type's
+    /// width; anything else is the place of the root's data row, its relocations to the
+    /// record's other allocations (each a data row of its own), to statics and to fns.
+    fn const_value(&mut self, e: ExprId, item: ItemKey) -> Result<V, BuildError> {
+        let adts = self.adts;
+        let record = adts.const_value(item, &[]).ok_or(BuildError::NoConstValue { expr: e, item })?;
+        let bad = |why| BuildError::Malformed { what: why };
+        record.check().map_err(|_| bad("a const's record that breaks the data form"))?;
+        let repr = self.expr_repr(e)?;
+        let root = record.allocs.first().ok_or(bad("a const's record with no allocation"))?;
+        match repr {
+            Repr::None => return Ok(V::None),
+            Repr::Agg(_) => {}
+            scalar => {
+                let ty = scalar.scalar().ok_or(malformed("a scalar of no type"))?;
+                if !root.relocs.is_empty() {
+                    // A pointer to data: the root's own row holds it, read as any place.
+                    let at = self.const_rows(e, record)?;
+                    return Ok(self.load(scalar, (at, 0)));
+                }
+                let width = (ty.bits(PTR_BITS) / 8) as usize;
+                let bytes = root.bytes.get(..width).ok_or(bad("a const's bytes shorter than its type"))?;
+                let mut value = 0u128;
+                for (i, &byte) in bytes.iter().enumerate() {
+                    value |= u128::from(byte) << (8 * i);
+                }
+                return Ok(V::Scalar(self.b.iconst(ty, value)));
+            }
+        }
+        let at = self.const_rows(e, record)?;
+        // A copy, as any use of a const is a fresh value: its row is never written.
+        let to = self.temp(repr);
+        self.copy(repr, (at, 0), to)?;
+        Ok(V::Place(to.0, to.1))
+    }
+
+    /// Each allocation of `record` as a data row of the function, its relocations resolved;
+    /// returns the root's address. Rows are made targets first, by an explicit stack; a cycle
+    /// among the allocations is refused.
+    fn const_rows(&mut self, e: ExprId, record: &DataRecord<Global>) -> Result<Value, BuildError> {
+        const TODO: u8 = 0;
+        const OPEN: u8 = 1;
+        let n = record.allocs.len();
+        let mut state = Vec::with_capacity_in(n, self.alloc.clone());
+        state.resize(n, TODO);
+        let mut rows: Vec<Option<RefId>, A> = Vec::with_capacity_in(n, self.alloc.clone());
+        rows.resize(n, None);
+        let mut stack = Vec::new_in(self.alloc.clone());
+        stack.push(0usize);
+        let mut relocs = Vec::new_in(self.alloc.clone());
+        while let Some(&k) = stack.last() {
+            if rows[k].is_some() {
+                stack.pop();
+                continue;
+            }
+            let a = &record.allocs[k];
+            if state[k] == TODO {
+                state[k] = OPEN;
+                for r in a.relocs.iter() {
+                    if let DataTarget::Local(t) = r.target {
+                        let t = t as usize;
+                        match (rows.get(t), state.get(t)) {
+                            (Some(Some(_)), _) => {}
+                            (Some(None), Some(&OPEN)) => {
+                                return Err(unsupported(e, "a const whose allocations point at each other in a cycle"));
+                            }
+                            (Some(None), _) => stack.push(t),
+                            (None, _) => return Err(malformed("a const's relocation to an allocation past its record")),
+                        }
+                    }
+                }
+                continue;
+            }
+            // Every local target is made: this allocation's row.
+            relocs.clear();
+            for r in a.relocs.iter() {
+                let off = r.offset as usize;
+                let word = a.bytes.get(off..off + 8).ok_or(malformed("a const's relocation past its bytes"))?;
+                let addend = i64::from_le_bytes(word.try_into().map_err(|_| malformed("a relocation word not of 8 bytes"))?);
+                let target = match r.target {
+                    DataTarget::Local(t) => rows[t as usize].ok_or(malformed("a const's row made before its target"))?,
+                    DataTarget::Static(s) => {
+                        let place = self.static_place(s, false)?;
+                        self.b.reference(RefKind::Static, place)
+                    }
+                    DataTarget::Fn(_) => return Err(unsupported(e, "a const holding a fn pointer (its instance is not a reference of this function)")),
+                    DataTarget::Vtable(_) => return Err(unsupported(e, "a const holding a `&dyn Trait` (its vtable is not a reference of this function)")),
+                };
+                relocs.push(DataReloc { offset: r.offset, target, addend });
+            }
+            let mut bytes = Vec::with_capacity_in(a.bytes.len(), self.alloc.clone());
+            bytes.extend_from_slice(&a.bytes);
+            // The word's addend is in the relocation: the row's bytes hold zero there.
+            for r in relocs.iter() {
+                bytes[r.offset as usize..r.offset as usize + 8].fill(0);
+            }
+            if a.mutable {
+                return Err(unsupported(e, "a const with a mutable allocation"));
+            }
+            rows[k] = Some(self.b.data(&bytes, u32::from(a.align), &relocs));
+            stack.pop();
+        }
+        let root = rows[0].ok_or(malformed("a const's root row not made"))?;
+        Ok(self.b.data_addr(root))
+    }
+
+    /// The address of the static path `e` names (lib.rs, "Statics"): `data_addr` of its
+    /// `Static` reference, or `tls_addr` of its `Tls` one for a `#[thread_local]`.
+    fn static_addr(&mut self, e: ExprId) -> Result<Value, BuildError> {
+        let Some(Def::Static(item, _)) = self.expr_def(e) else { return Err(malformed("a static's address of a path to other than a static")) };
+        let s = self.adts.static_item(item).ok_or(BuildError::NoStatic { expr: e, item })?;
+        let place = self.static_place(item, s.thread_local)?;
+        Ok(match s.thread_local {
+            true => {
+                let r = self.b.reference(RefKind::Tls, place);
+                self.b.tls_addr(r)
+            }
+            false => {
+                let r = self.b.reference(RefKind::Static, place);
+                self.b.data_addr(r)
+            }
+        })
+    }
+
+    /// Static `item`'s reference place: its index in `thread_locals` or `statics`.
+    fn static_place(&mut self, item: ItemKey, thread_local: bool) -> Result<u32, BuildError> {
+        let list = match thread_local {
+            true => &mut self.thread_locals,
+            false => &mut self.statics,
+        };
+        let place = match list.iter().position(|&k| k == item) {
+            Some(at) => at,
+            None => {
+                list.push(item);
+                list.len() - 1
+            }
+        };
+        u32::try_from(place).map_err(|_| malformed("more than 2^32 statics"))
+    }
+
+    /// The address of `instance`'s code: `func_addr` of its `Func` reference.
+    fn fn_addr(&mut self, instance: Instance) -> Value {
+        let place = self.ref_place(instance);
+        let r = self.b.reference(RefKind::Func, place);
+        self.b.func_addr(r)
+    }
+
+    /// The address of `table`: `data_addr` of its `Vtable` reference, one place per table. The
+    /// unsizing to `dyn` (codegen.md, "Trait objects") pairs it with the data pointer.
+    fn vtable_addr(&mut self, table: crate::vtable::VtableRef) -> Result<Value, BuildError> {
+        let place = match self.vtables.iter().position(|&t| t == table) {
+            Some(at) => at,
+            None => {
+                self.vtables.push(table);
+                self.vtables.len() - 1
+            }
+        };
+        let place = u32::try_from(place).map_err(|_| malformed("more than 2^32 vtables"))?;
+        let r = self.b.reference(RefKind::Vtable, place);
+        Ok(self.b.data_addr(r))
+    }
+
+    fn ref_place(&mut self, instance: Instance) -> u32 {
+        match self.refs.iter().position(|&k| k == instance) {
+            Some(at) => at as u32,
+            None => {
+                self.refs.push(instance);
+                (self.refs.len() - 1) as u32
+            }
+        }
+    }
+
+    /// `[x; N]`: the value on top stored `N` times into the array's temporary under it,
+    /// unrolled up to `UNROLL_LEAVES` leaves and in a loop beyond.
+    fn repeat(&mut self, e: ExprId) -> Result<(), BuildError> {
+        let v = self.pop()?;
+        let repr = self.expr_repr(e)?;
+        let Repr::Agg(l) = repr else {
+            // A zero-sized array: the element was evaluated, and has nowhere to go.
+            self.vals.push(V::None);
+            return Ok(());
+        };
+        let Shape::Array { elem, len, stride } = self.layouts[l as usize].shape else {
+            return Err(malformed("an array literal of a type that is not an array"));
+        };
+        let to = self.temp(repr);
+        if self.layouts[l as usize].leaves <= UNROLL_LEAVES {
+            for i in 0..len {
+                self.store(v, elem, (to.0, to.1 + (i * stride) as i32))?;
+            }
+        } else {
+            // The loop's source is the element itself: the same place at every index.
+            let (i, _, tp, header, exit) = self.array_loop(len, stride, to, to);
+            self.store(v, elem, (tp, 0))?;
+            let one = self.b.iconst(Ty::I64, 1);
+            let next = self.b.binary(Op::Add, Flags::NONE, i, one);
+            self.jump(header, &[next]);
+            self.begin(exit);
+        }
+        self.vals.push(V::Place(to.0, to.1));
+        Ok(())
     }
 
     /// Pushes the tasks that evaluate `e` as a place.
     fn place_of(&mut self, e: ExprId) -> Result<(), BuildError> {
         let rows = self.adjust_rows(e);
-        let kinds = &self.checked.adjusts.column::<1>()[rows];
-        match kinds {
-            [] => {}
-            [AdjustKind::Deref { overloaded: None }] => {
+        let kinds = &self.checked.adjusts.column::<1>()[rows.clone()];
+        // An autoderef of builtin steps only: `*`, once per step.
+        if kinds.iter().all(|k| *k == AdjustKind::Deref { overloaded: None }) {
+            let n = kinds.len() as u32;
+            return self.place_derefs(e, n);
+        }
+        // Dereferences, some overloaded: the place the pointer they leave points to.
+        if kinds.iter().all(|k| matches!(k, AdjustKind::Deref { .. })) {
+            self.work.push(Task::DerefPlace);
+            self.push_deref_chain(e, kinds.len());
+            return Ok(());
+        }
+        // A borrow or a coercion makes a new value: its place is a temporary of its own.
+        self.work.push(Task::SpillAdjusted(e));
+        self.eval_adjusted(e, rows)
+    }
+
+    /// Pushes the tasks that evaluate `e` as a place after `n` builtin dereferences of its
+    /// value; its own adjustments are the caller's.
+    fn place_derefs(&mut self, e: ExprId, n: u32) -> Result<(), BuildError> {
+        if n > 0 {
+            // The value is the first pointer; each step but the last loads the next one.
+            self.work.push(Task::DerefPlace);
+            for _ in 1..n {
+                self.work.push(Task::LoadPtr);
                 self.work.push(Task::DerefPlace);
-                self.work.push(Task::Raw(e));
-                return Ok(());
             }
-            _ => return Err(unsupported(e, "this adjustment of a place")),
+            self.work.push(Task::Raw(e));
+            return Ok(());
         }
         match self.expr(e)? {
             Expr::Local(p) => {
-                let (slot, _) = self.slots.get(p.ix()).copied().flatten().ok_or(malformed("a local used before its binding"))?;
-                let at = self.b.slot_addr(slot);
+                let (home, _) = self.slots.get(p.ix()).copied().flatten().ok_or(malformed("a local used before its binding"))?;
+                let at = self.home(home);
+                self.vals.push(V::Place(at.0, at.1));
+            }
+            Expr::Path(_) if matches!(self.expr_def(e), Some(Def::Static(..))) => {
+                let at = self.static_addr(e)?;
                 self.vals.push(V::Place(at, 0));
             }
             Expr::Paren(inner) => self.work.push(Task::Place(inner)),
             Expr::Field { base, .. } | Expr::TupleField { base, .. } => {
                 self.work.push(Task::FieldPlace(e));
                 self.work.push(Task::Place(base));
+            }
+            // The array's place, then the index: Rust's order.
+            Expr::Index { base, index } => {
+                self.work.push(Task::IndexPlace(e));
+                self.work.push(Task::Eval(index));
+                self.push_index_base(base)?;
+            }
+            // `*x` overloaded: the check put the dereference on `x` itself, so `x`'s adjusted
+            // place is the place.
+            Expr::Unary { op: UnOp::Deref, operand } if self.deref_on_operand(operand) => {
+                self.work.push(Task::Place(operand));
             }
             Expr::Unary { op: UnOp::Deref, operand } => {
                 self.work.push(Task::DerefPlace);
@@ -1145,17 +3933,30 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let stmt = self.body.stmts.get(s.ix()).copied().ok_or(malformed("a statement past `stmts`"))?;
         match stmt {
             Stmt::Let { else_: Some(e), .. } => return Err(unsupported(e, "`let`-`else`")),
+            // `let _ = <place>` reads nothing and moves nothing; `let _ = <value>` drops the
+            // value at once.
+            Stmt::Let { pat, init: Some(init), else_: None, .. } if matches!(self.pat(pat)?, Pat::Wild) => {
+                if self.adjust_rows(init).is_empty() && self.is_place_expr(init)? {
+                    self.work.push(Task::Discard);
+                    self.work.push(Task::Place(init));
+                } else {
+                    self.work.push(Task::DropValue(init));
+                    self.work.push(Task::Eval(init));
+                }
+            }
             Stmt::Let { pat, init: Some(init), else_: None, .. } => {
-                self.work.push(Task::Let(pat));
+                self.work.push(Task::Let(pat, Some(init)));
                 self.work.push(Task::Eval(init));
             }
             Stmt::Let { pat, init: None, else_: None, .. } => {
                 if !matches!(self.pat(pat)?, Pat::Wild) {
                     self.bind(pat)?;
+                    self.own(pat, false)?;
                 }
             }
+            // An expression statement's value is a temporary dropped at its end.
             Stmt::Expr { expr, .. } => {
-                self.work.push(Task::Discard);
+                self.work.push(Task::DropValue(expr));
                 self.work.push(Task::Eval(expr));
             }
             Stmt::Item => {}
@@ -1169,27 +3970,66 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             Expr::Missing => return Err(unsupported(e, "a missing expression")),
             Expr::Lit(lit) => self.lit(e, lit)?,
             Expr::Local(p) => {
-                let (slot, repr) = self.slots.get(p.ix()).copied().flatten().ok_or(malformed("a local used before its binding"))?;
-                let at = self.b.slot_addr(slot);
-                let v = self.load(repr, (at, 0));
+                let (home, repr) = self.slots.get(p.ix()).copied().flatten().ok_or(malformed("a local used before its binding"))?;
+                // A use by value: a move, when its type needs drop (its memory is read where
+                // the value lands, before anything else runs that could drop it).
+                self.moved(e, p)?;
+                let at = self.home(home);
+                let v = self.load(repr, at);
                 self.vals.push(v);
             }
             Expr::Path(_) => {
                 let t = self.expr_ty(e)?;
-                match self.node_at(e, t)? {
-                    PNode::FnDef(..) => self.vals.push(V::None),
-                    _ => return Err(unsupported(e, "a path to other than a fn item (a const, a static, a unit struct)")),
+                match (self.node_at(e, t)?, self.expr_def(e)) {
+                    (PNode::FnDef(..), _) => self.vals.push(V::None),
+                    (_, Some(Def::Const(item))) => {
+                        let v = self.const_value(e, item)?;
+                        self.vals.push(v);
+                    }
+                    // A static by value: a copy read from its memory.
+                    (_, Some(Def::Static(..))) => {
+                        let at = self.static_addr(e)?;
+                        let repr = self.expr_repr(e)?;
+                        let v = match repr {
+                            Repr::Agg(_) => {
+                                let to = self.temp(repr);
+                                self.copy(repr, (at, 0), to)?;
+                                V::Place(to.0, to.1)
+                            }
+                            _ => self.load(repr, (at, 0)),
+                        };
+                        self.vals.push(v);
+                    }
+                    // A unit struct or unit variant: its tag, if it has one, in a temporary.
+                    (PNode::Adt(..), Some(def @ (Def::Ctor { kind: CtorKind::Unit, .. } | Def::Adt(_)))) => {
+                        let variant = Self::def_variant(Some(def)).unwrap_or(0);
+                        match self.expr_repr(e)? {
+                            Repr::Agg(l) => {
+                                let (_, _, tag) = self.variant_rows(l, variant)?;
+                                let at = self.temp(Repr::Agg(l));
+                                self.write_tag(tag, variant, at);
+                                self.vals.push(V::Place(at.0, at.1));
+                            }
+                            Repr::None => self.vals.push(V::None),
+                            _ => return Err(malformed("a unit struct or variant held as a scalar")),
+                        }
+                    }
+                    _ => return Err(unsupported(e, "a path to other than a fn item, a unit struct or a unit variant (a const, a static)")),
                 }
             }
             Expr::Paren(inner) => self.work.push(Task::Eval(inner)),
             Expr::Block { stmts, tail, .. } => {
                 let list = self.body.stmt_lists.get(stmts.range()).ok_or(malformed("a block's statements past `stmt_lists`"))?;
+                let depth = self.scope_marks.len() as u32;
                 if self.break_target[e.ix()] {
                     let repr = self.expr_repr(e)?;
                     let exit = self.create();
-                    self.targets.push(Target { expr: e, header: None, exit, repr });
+                    self.targets.push(Target { expr: e, header: None, exit, repr, depth });
                     self.work.push(Task::BlockExit(e));
                 }
+                // The block's drop scope: its bindings are dropped after its value is made.
+                self.scope_marks.push(self.scope_pats.len() as u32);
+                self.work.push(Task::ScopeEnd(e));
                 match tail {
                     Some(t) => self.work.push(Task::Eval(t)),
                     None => self.work.push(Task::PushNone),
@@ -1202,9 +4042,32 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.work.push(Task::If { expr: e, then, else_ });
                 self.work.push(Task::Eval(cond));
             }
+            // The checker types it (blaze-typeck `expr_let`); building its test and bindings is
+            // this walk's to add.
+            Expr::Let { .. } => return Err(unsupported(e, "`let` in a condition")),
+            Expr::FormatArgs { .. } => return Err(unsupported(e, "`format_args!`")),
+            Expr::Await(_) => return Err(unsupported(e, "`.await`")),
+            Expr::AsyncBlock { .. } => return Err(unsupported(e, "an async block")),
+            Expr::Underscore => return Err(unsupported(e, "`_` (`_ = e` is not built yet)")),
+            Expr::RawRef { .. } => return Err(unsupported(e, "a raw borrow")),
+            Expr::ConstBlock { .. } => return Err(unsupported(e, "a const block")),
+            // Its value is the container's layout: a field's offset, which the code builder
+            // does not compute yet.
+            Expr::OffsetOf { .. } => return Err(unsupported(e, "`offset_of!` (a field's offset from the layout)")),
             Expr::Match { scrutinee, .. } => {
                 self.work.push(Task::Match(e));
-                self.work.push(Task::Eval(scrutinee));
+                // A local that needs drop is a place expression: matched in place, not moved
+                // (codegen.md, "A `match` by value on an enum that needs drop").
+                let mut s = scrutinee;
+                while let Expr::Paren(inner) = self.expr(s)? {
+                    s = inner;
+                }
+                match self.expr(s)? {
+                    Expr::Local(p) if self.owned[p.ix()].is_some() && self.adjust_rows(scrutinee).is_empty() => {
+                        self.work.push(Task::Place(s));
+                    }
+                    _ => self.work.push(Task::Eval(scrutinee)),
+                }
             }
             Expr::Loop { body } => {
                 let repr = self.expr_repr(e)?;
@@ -1212,7 +4075,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 let exit = self.create();
                 self.jump(header, &[]);
                 self.begin(header);
-                self.targets.push(Target { expr: e, header: Some(header), exit, repr });
+                let depth = self.scope_marks.len() as u32;
+                self.targets.push(Target { expr: e, header: Some(header), exit, repr, depth });
                 self.work.push(Task::LoopEnd(e));
                 self.work.push(Task::Discard);
                 self.work.push(Task::Eval(body));
@@ -1231,6 +4095,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     .find(|t| t.expr == target)
                     .ok_or(malformed("a `continue` whose loop is not around it"))?;
                 let header = t.header.ok_or(malformed("a `continue` of a block"))?;
+                let start = self.scope_start(t.depth);
+                self.drop_from(start)?;
                 self.jump(header, &[]);
                 self.dead_block();
                 self.vals.push(V::None);
@@ -1242,29 +4108,74 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 }
             }
             Expr::Call { callee, args } => {
-                let t = self.expr_ty(callee)?;
-                match self.node_at(callee, t)? {
-                    PNode::FnDef(..) => {}
-                    _ => return Err(unsupported(e, "a call of other than a fn item (a fn pointer, a closure)")),
-                }
                 let list = self.body.expr_lists.get(args.range()).ok_or(malformed("a call's arguments past `expr_lists`"))?;
+                let t = self.adjusted_ty(callee)?;
+                let item = match self.node_at(callee, t)? {
+                    PNode::FnDef(item, _) => item,
+                    // Through a fn pointer: its value first, then the arguments, then the call
+                    // (lib.rs, "Fn pointers").
+                    PNode::FnPtr(..) => {
+                        self.work.push(Task::Call(e));
+                        for &a in list.iter().rev() {
+                            if let Repr::Agg(_) = self.adjusted_repr(a)? {
+                                self.work.push(Task::ArgCopy(a));
+                            }
+                            self.work.push(Task::Eval(a));
+                        }
+                        self.work.push(Task::Eval(callee));
+                        return Ok(());
+                    }
+                    _ => return Err(unsupported(e, "a call of other than a fn item or a fn pointer (a closure)")),
+                };
+                // A tuple struct's or tuple variant's ctor: the value built in place.
+                if let Some(Def::Ctor { variant, kind: CtorKind::Tuple, .. }) = self.expr_def(callee) {
+                    return self.construct(e, variant, list);
+                }
+                if let Some(which) = self.adts.intrinsic(item) {
+                    self.work.push(Task::Intrinsic(e, which));
+                    for &a in list.iter().rev() {
+                        self.work.push(Task::Eval(a));
+                    }
+                    return Ok(());
+                }
                 self.work.push(Task::Call(e));
                 for &a in list.iter().rev() {
+                    // An aggregate argument gets its caller's copy at once, before the next
+                    // argument runs.
+                    if let Repr::Agg(_) = self.adjusted_repr(a)? {
+                        self.work.push(Task::ArgCopy(a));
+                    }
                     self.work.push(Task::Eval(a));
                 }
                 self.work.push(Task::Discard);
                 self.work.push(Task::Eval(callee));
             }
-            Expr::MethodCall { .. } => return Err(unsupported(e, "a method call")),
+            // A method call is a call of the method the check picked, the receiver (with its
+            // adjustments: the autoderef, the autoref) its first argument.
+            Expr::MethodCall { receiver, args, .. } => {
+                let list = self.body.expr_lists.get(args.range()).ok_or(malformed("a call's arguments past `expr_lists`"))?;
+                self.work.push(Task::Call(e));
+                for &a in list.iter().rev().chain([&receiver]) {
+                    if let Repr::Agg(_) = self.adjusted_repr(a)? {
+                        self.work.push(Task::ArgCopy(a));
+                    }
+                    self.work.push(Task::Eval(a));
+                }
+            }
             Expr::Field { base, .. } | Expr::TupleField { base, .. } => {
                 self.work.push(Task::Field(e));
                 self.work.push(Task::Place(base));
+            }
+            // `*x` overloaded: the dereference is `x`'s own last adjustment, so the value of `*x`
+            // is `x`'s adjusted value.
+            Expr::Unary { op: UnOp::Deref, operand } if self.deref_on_operand(operand) => {
+                self.work.push(Task::Eval(operand));
             }
             Expr::Unary { op: UnOp::Deref, operand } => {
                 let t = self.adjusted_ty(operand)?;
                 match self.node_at(operand, t)? {
                     PNode::Ptr(..) | PNode::Ref(..) => {}
-                    _ => return Err(unsupported(e, "an overloaded dereference")),
+                    _ => return Err(malformed("a dereference of other than a pointer with no overloaded dereference recorded")),
                 }
                 self.work.push(Task::Deref(e));
                 self.work.push(Task::Eval(operand));
@@ -1286,6 +4197,13 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             Expr::Assign { lhs, rhs } => {
                 self.work.push(Task::Assign(e));
                 self.work.push(Task::Place(lhs));
+                // An aggregate right side is a place read late, at the store: copied first when
+                // building the left side's place could write it (`a[f()] = b`).
+                if let Repr::Agg(_) = self.adjusted_repr(rhs)?
+                    && !self.effect_free_place(lhs)?
+                {
+                    self.work.push(Task::ArgCopy(rhs));
+                }
                 self.work.push(Task::Eval(rhs));
             }
             Expr::AssignOp { op, lhs, rhs } => {
@@ -1304,25 +4222,82 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             Expr::Struct { base: Some(_), .. } => return Err(unsupported(e, "a struct update (`..base`)")),
             Expr::Struct { fields, base: None, .. } => {
                 let repr = self.expr_repr(e)?;
-                let Repr::Struct(l) = repr else { return Err(unsupported(e, "a struct literal of other than a struct")) };
                 let inits = self.body.field_inits.get(fields.range()).ok_or(malformed("a struct literal's fields past `field_inits`"))?;
-                let (first, len) = (self.layouts[l as usize].first, self.layouts[l as usize].len);
-                if inits.len() != len as usize {
-                    return Err(malformed("a struct literal that does not name every field"));
-                }
-                let at = self.temp(repr);
-                self.vals.push(V::Place(at.0, at.1));
-                for init in inits.iter().rev() {
-                    let row = (first..first + len)
-                        .find(|&i| self.layout_fields[i as usize].0 == init.name)
-                        .ok_or(malformed("a struct literal naming a field its struct lacks"))?;
-                    self.work.push(Task::StructInit(row));
-                    self.work.push(Task::Eval(init.expr));
+                match repr {
+                    // A zero-sized struct: its fields are evaluated, in order, for their effects.
+                    Repr::None => {
+                        self.work.push(Task::PushNone);
+                        for init in inits.iter().rev() {
+                            self.work.push(Task::Discard);
+                            self.work.push(Task::Eval(init.expr));
+                        }
+                    }
+                    Repr::Agg(l) => {
+                        let variant = Self::def_variant(self.expr_def(e))
+                            .ok_or(malformed("a struct literal the check did not resolve to a struct or variant"))?;
+                        let (first, len, tag) = self.variant_rows(l, variant)?;
+                        // A union literal names exactly one field (the reference, "Unions").
+                        let named = if self.layouts[l as usize].is_union { 1 } else { len as usize };
+                        if inits.len() != named {
+                            return Err(malformed("a struct literal that does not name every field, or a union literal not one"));
+                        }
+                        let at = self.temp(repr);
+                        self.write_tag(tag, variant, at);
+                        self.vals.push(V::Place(at.0, at.1));
+                        for init in inits.iter().rev() {
+                            let row = (first..first + len)
+                                .find(|&i| self.layout_fields[i as usize].0 == init.name)
+                                .ok_or(malformed("a struct literal naming a field its struct lacks"))?;
+                            let (_, off, repr) = self.layout_fields[row as usize];
+                            self.work.push(Task::InitAt { off, repr });
+                            self.work.push(Task::Eval(init.expr));
+                        }
+                    }
+                    _ => return Err(unsupported(e, "a struct literal of other than a struct")),
                 }
             }
-            Expr::Tuple { .. } => return Err(unsupported(e, "a tuple")),
-            Expr::Array { .. } | Expr::Repeat { .. } => return Err(unsupported(e, "an array")),
-            Expr::Index { .. } => return Err(unsupported(e, "indexing")),
+            Expr::Tuple { elems } | Expr::Array { elems } => {
+                let list = self.body.expr_lists.get(elems.range()).ok_or(malformed("a literal's elements past `expr_lists`"))?;
+                let repr = self.expr_repr(e)?;
+                match repr {
+                    // `()` or a zero-sized aggregate: the elements are evaluated for their effects.
+                    Repr::None => {
+                        self.work.push(Task::PushNone);
+                        for &x in list.iter().rev() {
+                            self.work.push(Task::Discard);
+                            self.work.push(Task::Eval(x));
+                        }
+                    }
+                    Repr::Agg(l) => {
+                        let shape = self.layouts[l as usize].shape;
+                        let at = self.temp(repr);
+                        self.vals.push(V::Place(at.0, at.1));
+                        for (i, &x) in list.iter().enumerate().rev() {
+                            let (off, repr) = match shape {
+                                Shape::Fields { first, len } if (i as u32) < len => {
+                                    let (_, off, repr) = self.layout_fields[(first + i as u32) as usize];
+                                    (off, repr)
+                                }
+                                Shape::Array { elem, len, stride } if (i as u32) < len => (i as u32 * stride, elem),
+                                _ => return Err(malformed("a literal with more elements than its type")),
+                            };
+                            self.work.push(Task::InitAt { off, repr });
+                            self.work.push(Task::Eval(x));
+                        }
+                    }
+                    _ => return Err(malformed("a tuple or array literal of a scalar type")),
+                }
+            }
+            Expr::Repeat { elem, .. } => {
+                self.work.push(Task::Repeat(e));
+                self.work.push(Task::Eval(elem));
+            }
+            Expr::Index { base, index } => {
+                self.work.push(Task::LoadPlace(e));
+                self.work.push(Task::IndexPlace(e));
+                self.work.push(Task::Eval(index));
+                self.push_index_base(base)?;
+            }
             Expr::Closure { .. } => return Err(unsupported(e, "a closure")),
         }
         Ok(())
@@ -1349,7 +4324,23 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 let data = self.b.data(bytes, 0, &[]);
                 self.b.data_addr(data)
             }
-            Lit::Str => return Err(unsupported(e, "a string literal (a wide pointer)")),
+            // Its bytes as data, and the pair of their address and length (lib.rs, "Wide pointers").
+            Lit::Str => {
+                let text = self.adts.str_lit(self.body.owner, e).ok_or(BuildError::NoLiteralValue { expr: e })?;
+                let len = text.len() as u128;
+                let data = self.b.data(text.as_bytes(), 0, &[]);
+                let p = self.b.data_addr(data);
+                let repr = self.expr_repr(e)?;
+                let at = self.temp(repr);
+                self.b.store(Flags::NONE, p, at.0, at.1, MemAttrs::aligned(3));
+                let n = self.b.iconst(Ty::I64, len);
+                self.b.store(Flags::NONE, n, at.0, at.1 + 8, MemAttrs::aligned(3));
+                self.vals.push(V::Place(at.0, at.1));
+                return Ok(());
+            }
+            // Owed to the code builder's lane: a wide pointer over the bytes and their NUL, as
+            // blaze-consteval builds it (machine/code.rs, `Lit::CStr`).
+            Lit::CStr => return Err(unsupported(e, "a C string literal")),
             Lit::Char => return Err(unsupported(e, "a char literal")),
             Lit::Float(_) => return Err(unsupported(e, "a float literal")),
         };
@@ -1488,70 +4479,220 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     }
 
     fn call(&mut self, e: ExprId) -> Result<(), BuildError> {
-        let Expr::Call { callee, args } = self.expr(e)? else { return Err(malformed("a call task on another expression")) };
-        let list = self.body.expr_lists.get(args.range()).ok_or(malformed("a call's arguments past `expr_lists`"))?;
-        let n = list.len();
-        if self.vals.len() < n {
-            return Err(malformed("a call's arguments missing from the value stack (a build bug)"));
-        }
-        let t = self.expr_ty(callee)?;
-        // The callee instance: its item and its call's arguments, grounded at this instance's.
-        let PNode::FnDef(item, args) = self.node_at(callee, t)? else {
-            return Err(malformed("a call whose callee is not a fn item"));
-        };
-        let instance = Instance { item, args };
-        let mut params = Vec::with_capacity_in(n, self.alloc.clone());
-        let mut values = Vec::with_capacity_in(n, self.alloc.clone());
-        let base = self.vals.len() - n;
-        for (i, &a) in list.iter().enumerate() {
-            let repr = self.adjusted_repr(a)?;
-            let v = self.vals[base + i];
-            match repr {
-                Repr::None => {}
-                Repr::Struct(_) => return Err(unsupported(a, "a struct passed by value")),
-                scalar => {
-                    let ty = scalar.scalar().unwrap_or(Ty::I8);
-                    values.push(self.scalar(v, ty)?);
-                    params.push(abi_param(scalar, ty));
+        // The arguments in order (a method's receiver first) and the callee instance: its item
+        // and its call's arguments, grounded at this instance's.
+        let mut list = Vec::new_in(self.alloc.clone());
+        let instance = match self.expr(e)? {
+            Expr::Call { callee, args } => {
+                list.extend_from_slice(self.body.expr_lists.get(args.range()).ok_or(malformed("a call's arguments past `expr_lists`"))?);
+                let t = self.adjusted_ty(callee)?;
+                match self.node_at(callee, t)? {
+                    PNode::FnDef(item, args) => Instance { item, args },
+                    PNode::FnPtr(_, header) => return self.call_pointer(e, &list, header.abi),
+                    _ => return Err(malformed("a call whose callee is not a fn item or a fn pointer")),
                 }
             }
-        }
-        self.vals.truncate(base);
-        let rrepr = self.expr_repr(e)?;
-        let mut rets = Vec::with_capacity_in(1, self.alloc.clone());
-        match rrepr {
-            Repr::None => {}
-            Repr::Struct(_) => return Err(unsupported(e, "a struct returned by value")),
-            scalar => rets.push(abi_param(scalar, scalar.scalar().unwrap_or(Ty::I8))),
-        }
-        let place = match self.refs.iter().position(|&k| k == instance) {
-            Some(at) => at as u32,
-            None => {
-                self.refs.push(instance);
-                (self.refs.len() - 1) as u32
+            Expr::MethodCall { receiver, args, .. } => {
+                list.push(receiver);
+                list.extend_from_slice(self.body.expr_lists.get(args.range()).ok_or(malformed("a call's arguments past `expr_lists`"))?);
+                self.method_callee(e)?
             }
+            _ => return Err(malformed("a call task on another expression")),
         };
-        let reference = self.b.reference(RefKind::Func, place);
-        let sig = self.b.sig(Conv::C, Variadic::No, &params, &rets);
-        let r = self.b.call(Flags::NONE, reference, sig, &values);
+        if let Some((_, slot)) = self.dyn_slot(e, instance)? {
+            return self.dyn_call(e, instance, &list, slot);
+        }
+        let item = instance.item;
+        let abi = self.adts.abi(item).ok_or(BuildError::NoAbi { item })?;
+        let n = list.len();
+        let mut reprs = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut passes = Vec::with_capacity_in(n, self.alloc.clone());
+        for &a in list.iter() {
+            let t = self.adjusted_ty(a)?;
+            let g = self.ground_ty(t).map_err(|error| Self::ty_err(a, error))?;
+            let repr = self.repr_at(a, t)?;
+            reprs.push(repr);
+            passes.push(self.pass(g, repr, abi, Some(item))?);
+        }
         let ty = self.expr_ty(e)?;
+        let g = self.ground_ty(ty).map_err(|error| Self::ty_err(e, error))?;
+        let rrepr = self.repr_at(e, ty)?;
+        let rpass = self.pass(g, rrepr, abi, Some(item))?;
+        let place = self.ref_place(instance);
+        let reference = self.b.reference(RefKind::Func, place);
+        self.emit_call(Callee::Direct(reference), &reprs, &passes, rrepr, rpass)?;
         if let PNode::Never = self.node_at(e, ty)? {
+            self.vals.pop();
             self.b.unreachable();
             self.dead_block();
             self.vals.push(V::None);
-            return Ok(());
         }
-        self.vals.push(match rrepr {
-            Repr::None => V::None,
-            _ => V::Scalar(r),
-        });
         Ok(())
+    }
+
+    /// The slot of `instance` when it is a dynamic call: a method of the object's principal or
+    /// of a trait above it, with `Self` (its first argument) a trait object. The checker records
+    /// no other mark (codegen.md, "Trait objects"). A trait implemented for a `dyn` type by an
+    /// impl, or a generic fn at `T = dyn Tr`, has no slot there: an ordinary call.
+    fn dyn_slot(&mut self, e: ExprId, instance: Instance) -> Result<Option<(ItemKey, u32)>, BuildError> {
+        let view = self.ground.view();
+        let Some(&self_ty) = view.list(instance.args).map_err(|_| malformed("a callee's arguments past the ground table"))?.first() else {
+            return Ok(None);
+        };
+        if !matches!(self.ground_node(self_ty), Ok(PNode::Dynamic(_))) {
+            return Ok(None);
+        }
+        let Some((principal, _)) = self.principal(e, self_ty)? else {
+            return Ok(None);
+        };
+        let adts = self.adts;
+        let shape = crate::vtable::Shape::of(principal, |t| adts.object_trait(t), self.alloc.clone())
+            .map_err(|error| BuildError::Vtable { at: Some(e), error })?;
+        Ok(shape.slot(instance.item).map(|slot| (principal, slot)))
+    }
+
+    /// Dynamic call `e` of `instance` at vtable `slot` (codegen.md, "Trait objects"): the
+    /// receiver, a wide pointer, is the `list.len()`-th value from the top; `f = load [vtable +
+    /// 8 * (3 + slot)]`, then `f(data, args..)`. The callee is the impl's method at the concrete
+    /// type, so the receiver is passed in its thin form (`DispatchFromDyn`): `&self` and `&mut
+    /// self` as a pointer, `self: Box<Self>` as a `Box` of a sized type.
+    fn dyn_call(&mut self, e: ExprId, instance: Instance, list: &[ExprId], slot: u32) -> Result<(), BuildError> {
+        let item = instance.item;
+        let abi = self.adts.abi(item).ok_or(BuildError::NoAbi { item })?;
+        let n = list.len();
+        let mut reprs = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut passes = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut wide = Repr::None;
+        for (i, &a) in list.iter().enumerate() {
+            let t = self.adjusted_ty(a)?;
+            let mut g = self.ground_ty(t).map_err(|error| Self::ty_err(a, error))?;
+            if i == 0 {
+                wide = self.repr_at(a, t)?;
+                g = self.thin_receiver(a, g)?;
+            }
+            let repr = self.repr(g).map_err(|error| Self::ty_err(a, error))?;
+            reprs.push(repr);
+            passes.push(self.pass(g, repr, abi, Some(item))?);
+        }
+        let ty = self.expr_ty(e)?;
+        let g = self.ground_ty(ty).map_err(|error| Self::ty_err(e, error))?;
+        let rrepr = self.repr_at(e, ty)?;
+        let rpass = self.pass(g, rrepr, abi, Some(item))?;
+        let at = self.vals.len().checked_sub(n).ok_or(malformed("a dynamic call's receiver missing from the value stack (a build bug)"))?;
+        let v = core::mem::replace(&mut self.vals[at], V::None);
+        let place = self.place(v, wide)?;
+        let data = self.load(Repr::Ptr, place);
+        let data = self.scalar(data, Ty::PTR)?;
+        let vt = self.load(Repr::Ptr, (place.0, place.1 + 8));
+        let vt = self.scalar(vt, Ty::PTR)?;
+        self.vals[at] = match reprs[0] {
+            Repr::Ptr => V::Scalar(data),
+            Repr::Agg(_) => {
+                let to = self.temp(reprs[0]);
+                self.b.store(Flags::NONE, data, to.0, to.1, MemAttrs::aligned(3));
+                V::Place(to.0, to.1)
+            }
+            _ => return Err(malformed("a thin receiver held as other than a pointer or an aggregate")),
+        };
+        let off = 8 * (crate::vtable::HEADER_WORDS + slot);
+        let off = i32::try_from(off).map_err(|_| malformed("a vtable slot past 2^31 bytes"))?;
+        let f = self.b.load(Ty::PTR, Flags::NONE, vt, off, MemAttrs::aligned(3));
+        self.emit_call(Callee::Pointer(f), &reprs, &passes, rrepr, rpass)?;
+        if let PNode::Never = self.node_at(e, ty)? {
+            self.vals.pop();
+            self.b.unreachable();
+            self.dead_block();
+            self.vals.push(V::None);
+        }
+        Ok(())
+    }
+
+    /// The thin form of dynamic receiver type `g` (ground) of argument `a`: the trait object
+    /// replaced by `()` (any sized type has the same thin pointer). `self: Rc<Self>`,
+    /// `Arc<Self>` and `Pin<P>` are refused by name: their glue and layout are not read yet.
+    fn thin_receiver(&mut self, a: ExprId, g: PTy) -> Result<PTy, BuildError> {
+        let full = |_| malformed("the ground table is full");
+        let unit = self.ground.intern(PNode::Tuple(List::EMPTY)).map_err(full)?;
+        let node = match self.ground_node(g).map_err(|error| Self::ty_err(a, error))? {
+            PNode::Ref(m, _) => PNode::Ref(m, unit),
+            PNode::Ptr(m, _) => PNode::Ptr(m, unit),
+            PNode::Adt(k, l) if self.adts.lang_adt(LangItem::OwnedBox) == Some(k) => {
+                let view = self.ground.view();
+                let mut args = Vec::new_in(self.alloc.clone());
+                for &t in view.list(l).map_err(|_| malformed("a type's arguments past the ground table"))? {
+                    args.push(match view.node(t) {
+                        Ok(PNode::Dynamic(_)) => unit,
+                        _ => t,
+                    });
+                }
+                PNode::Adt(k, self.ground.intern_list(&args).map_err(full)?)
+            }
+            _ => return Err(unsupported(a, "a `self: Rc<Self>`, `Arc<Self>` or `Pin<P>` receiver called on a trait object")),
+        };
+        self.ground.intern(node).map_err(full)
+    }
+
+    /// Call `e` through a fn pointer of ABI `abi`: the pointer under the arguments `list` on
+    /// the stack; the signature lowered from the arguments' and the result's types, by the
+    /// pointer's ABI (lib.rs, "Fn pointers").
+    fn call_pointer(&mut self, e: ExprId, list: &[ExprId], abi: blaze_typeck::Abi) -> Result<(), BuildError> {
+        let abi = match abi {
+            blaze_typeck::Abi::Rust => Abi::Rust,
+            blaze_typeck::Abi::C => Abi::C,
+            // Its last parameter is a tuple spread at the ABI level: not built yet.
+            blaze_typeck::Abi::RustCall => {
+                return Err(unsupported(e, "a call through a fn pointer of the \"rust-call\" ABI (its tuple of arguments is not spread yet)"));
+            }
+            _ => return Err(unsupported(e, "a call through a fn pointer of an ABI other than \"Rust\" and \"C\"")),
+        };
+        let n = list.len();
+        let mut reprs = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut passes = Vec::with_capacity_in(n, self.alloc.clone());
+        for &a in list.iter() {
+            let t = self.adjusted_ty(a)?;
+            let g = self.ground_ty(t).map_err(|error| Self::ty_err(a, error))?;
+            let repr = self.repr_at(a, t)?;
+            reprs.push(repr);
+            passes.push(self.pass(g, repr, abi, None)?);
+        }
+        let ty = self.expr_ty(e)?;
+        let g = self.ground_ty(ty).map_err(|error| Self::ty_err(e, error))?;
+        let rrepr = self.repr_at(e, ty)?;
+        let rpass = self.pass(g, rrepr, abi, None)?;
+        // The pointer is under the arguments: taken out, so the arguments are the top `n`.
+        let at = self.vals.len().checked_sub(n + 1).ok_or(malformed("a call's pointer missing from the value stack (a build bug)"))?;
+        let p = self.vals.remove(at);
+        let p = self.scalar(p, Ty::PTR)?;
+        self.emit_call(Callee::Pointer(p), &reprs, &passes, rrepr, rpass)?;
+        if let PNode::Never = self.node_at(e, ty)? {
+            self.vals.pop();
+            self.b.unreachable();
+            self.dead_block();
+            self.vals.push(V::None);
+        }
+        Ok(())
+    }
+
+    /// The method that method call `e` calls, as the check resolved it, its arguments grounded at
+    /// this instance's.
+    fn method_callee(&mut self, e: ExprId) -> Result<Instance, BuildError> {
+        let at = self.checked.callees.column::<0>().iter().position(|&x| x == e).ok_or(malformed("a method call with no callee in the record"))?;
+        let item = self.checked.callees.column::<1>()[at];
+        let generic = self.checked.callees.column::<2>()[at];
+        let tys = self.types.list(generic).map_err(|_| malformed("a callee's arguments past the record's types"))?;
+        let mut grounded = Vec::with_capacity_in(tys.len(), self.alloc.clone());
+        for &t in tys {
+            grounded.push(self.ground_ty(t).map_err(|error| Self::ty_err(e, error))?);
+        }
+        let args = self.ground.intern_list(&grounded).map_err(|_| malformed("the ground table is full"))?;
+        Ok(Instance { item, args })
     }
 
     // Match.
 
-    /// The values pattern `p` matches, into `out`; `true` when it matches every value.
-    fn pat_values(&mut self, p: PatId, width: u32, out: &mut Vec<u128, A>) -> Result<bool, BuildError> {
+    /// The values pattern `p` matches, into `out`; `true` when it matches every value. Over an
+    /// enum of layout `of_enum`, a variant is its discriminant, as `read_discriminant` reads it.
+    fn pat_values(&mut self, p: PatId, width: u32, of_enum: Option<LayoutId>, out: &mut Vec<u128, A>) -> Result<bool, BuildError> {
         let refuse = |what| BuildError::UnsupportedPat { pat: p, what };
         let one = |w: &mut Self, alt: PatId, out: &mut Vec<u128, A>| -> Result<bool, BuildError> {
             match w.pat(alt)? {
@@ -1572,7 +4713,20 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     out.push(v);
                     Ok(false)
                 }
-                _ => Err(BuildError::UnsupportedPat { pat: alt, what: "a pattern other than a literal, a binding or `_`" }),
+                // A variant: its discriminant (lib.rs, "Enums").
+                Pat::TupleStruct { .. } | Pat::Path(_) | Pat::Struct { .. } => {
+                    let v = Self::def_variant(w.pat_def(alt)).ok_or(BuildError::UnsupportedPat {
+                        pat: alt,
+                        what: "a path pattern to other than a struct or a variant (a const)",
+                    })?;
+                    let id = of_enum.ok_or(BuildError::UnsupportedPat { pat: alt, what: "a variant pattern over other than an enum" })?;
+                    out.push(w.discriminant_case(id, v)?);
+                    Ok(false)
+                }
+                _ => Err(BuildError::UnsupportedPat {
+                    pat: alt,
+                    what: "a pattern other than a literal, a variant, a binding or `_`",
+                }),
             }
         };
         match self.pat(p)? {
@@ -1590,16 +4744,181 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         }
     }
 
+    /// Binds the fields of variant pattern `p` (`V(a, b)`, `V { x, .. }`) from the enum of layout
+    /// `l` at `at`, each by copy. Its subpatterns must be irrefutable (`bind_value` refuses the
+    /// rest by name). A field that needs drop is moved out by a binding (its `field_bit` in
+    /// the result) and left in place by `_`; nothing deeper is built.
+    fn bind_variant(&mut self, p: PatId, at: (Value, i32), l: u32, by_ref: bool) -> Result<u64, BuildError> {
+        let variant = Self::def_variant(self.pat_def(p)).ok_or(malformed("a variant pattern the check did not resolve"))?;
+        let (first, len, _) = self.variant_rows(l, variant)?;
+        let n = len as usize;
+        // (field row, subpattern) pairs.
+        let mut binds = Vec::new_in(self.alloc.clone());
+        let mut moved = 0u64;
+        match self.pat(p)? {
+            Pat::TupleStruct { elems, rest, .. } => {
+                let subs = self.body.pat_lists.get(elems.range()).ok_or(malformed("a pattern's elements past `pat_lists`"))?;
+                let fits = match rest {
+                    Some(_) => subs.len() <= n,
+                    None => subs.len() == n,
+                };
+                if !fits {
+                    return Err(malformed("a variant pattern of another arity than its variant"));
+                }
+                for (j, &sub) in subs.iter().enumerate() {
+                    let k = match rest {
+                        Some(r) if j >= r as usize => n - (subs.len() - j),
+                        _ => j,
+                    };
+                    binds.push((first as usize + k, sub));
+                }
+            }
+            Pat::Struct { fields, .. } => {
+                let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a struct pattern's fields past `field_pats`"))?;
+                for fp in fps {
+                    let row = (first..first + len)
+                        .find(|&i| self.layout_fields[i as usize].0 == fp.name)
+                        .ok_or(malformed("a struct pattern naming a field its variant lacks"))?;
+                    binds.push((row as usize, fp.pat));
+                }
+            }
+            _ => return Err(malformed("a variant's fields bound from a pattern of another kind")),
+        }
+        for &(row, sub) in binds.iter() {
+            let (_, off, repr) = self.layout_fields[row];
+            let part = (at.0, at.1 + off as i32);
+            if by_ref {
+                // Through a reference: a binding is `&field` (its address), `_` reads nothing.
+                match self.pat(sub)? {
+                    Pat::Wild => {}
+                    Pat::Bind { sub: None, .. } => {
+                        let a = self.address(part);
+                        self.bind_value(sub, V::Scalar(a))?;
+                    }
+                    _ => {
+                        return Err(BuildError::UnsupportedPat {
+                            pat: sub,
+                            what: "a pattern other than a binding or `_` inside a variant matched through a reference",
+                        });
+                    }
+                }
+                continue;
+            }
+            if self.repr_needs_drop(repr) {
+                match self.pat(sub)? {
+                    // Left in place: the scrutinee's owner drops it.
+                    Pat::Wild => continue,
+                    Pat::Bind { ann, sub: None, .. } if ann.by_ref.is_none() => {
+                        let bit = self.field_bit(l, variant, row as u32 - first)?.ok_or(BuildError::UnsupportedPat {
+                            pat: sub,
+                            what: "a move out of a field past an enum's 64th (its field flags are one word)",
+                        })?;
+                        moved |= 1 << bit;
+                    }
+                    _ => {
+                        return Err(BuildError::UnsupportedPat {
+                            pat: sub,
+                            what: "a pattern other than a binding or `_` over a field that needs drop, in a `match` by value (a move path deeper than one field)",
+                        });
+                    }
+                }
+            }
+            let v = self.load(repr, part);
+            self.bind_value(sub, v)?;
+            self.own_pat(sub)?;
+        }
+        Ok(moved)
+    }
+
     fn match_dispatch(&mut self, e: ExprId) -> Result<(), BuildError> {
         let Expr::Match { scrutinee, arms } = self.expr(e)? else { return Err(malformed("a match task on another expression")) };
-        let s = self.pop()?;
-        let srepr = self.adjusted_repr(scrutinee)?;
-        let (sty, width) = match srepr {
-            Repr::Int { ty, .. } => (ty, ty.bits(PTR_BITS)),
-            Repr::Bool => (Ty::I8, 8),
-            _ => return Err(unsupported(e, "a match on other than an integer or a bool")),
+        let mut s = self.pop()?;
+        let mut srepr = self.adjusted_repr(scrutinee)?;
+        // A reference to an enum, matched by variant patterns: the default binding mode (the
+        // reference, "Binding modes"): the references are followed to the enum's place.
+        let mut by_ref = false;
+        let mut owner = Owner::None;
+        if srepr == Repr::Ptr {
+            let t = self.adjusted_ty(scrutinee)?;
+            let mut g = self.ground_ty(t).map_err(|error| Self::ty_err(scrutinee, error))?;
+            let mut depth = 0u32;
+            while let PNode::Ref(_, inner) = self.ground_node(g).map_err(|error| Self::ty_err(scrutinee, error))? {
+                g = inner;
+                depth += 1;
+            }
+            let list = self.body.arms.get(arms.range()).ok_or(malformed("a match's arms past `arms`"))?;
+            let mut variant_pats = false;
+            for arm in list.iter() {
+                match self.pat(arm.pat)? {
+                    Pat::Ref { .. } => {
+                        return Err(BuildError::UnsupportedPat { pat: arm.pat, what: "a `&` pattern in a match on a reference" });
+                    }
+                    Pat::TupleStruct { .. } | Pat::Struct { .. } | Pat::Path(..) | Pat::Or { .. } => variant_pats = true,
+                    _ => {}
+                }
+            }
+            let is_enum = matches!(self.ground_node(g).map_err(|error| Self::ty_err(scrutinee, error))?, PNode::Adt(..))
+                && self.is_agg(g).map_err(|error| Self::ty_err(scrutinee, error))?;
+            if variant_pats && depth > 0 && is_enum {
+                let mut p = self.scalar(s, Ty::PTR)?;
+                for _ in 1..depth {
+                    p = self.b.load(Ty::PTR, Flags::NONE, p, 0, MemAttrs::aligned(3));
+                }
+                srepr = self.repr(g).map_err(|error| Self::ty_err(scrutinee, error))?;
+                s = V::Place(p, 0);
+                by_ref = true;
+            }
+        }
+        // An enum's walk row, a zero-sized one's too (no place, a constant discriminant).
+        let enum_row = match srepr {
+            Repr::Agg(l) => Some(l),
+            // (Through a reference, a zero-sized enum is never laid out as one: `is_agg` is false.)
+            Repr::None if !by_ref => {
+                let t = self.adjusted_ty(scrutinee)?;
+                let g = self.ground_ty(t).map_err(|error| Self::ty_err(scrutinee, error))?;
+                match self.ground_node(g).map_err(|error| Self::ty_err(scrutinee, error))? {
+                    PNode::Adt(..) => Some(self.layout(g).map_err(|error| Self::ty_err(scrutinee, error))?),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+        .filter(|&l| matches!(self.layouts[l as usize].shape, Shape::Enum { .. }));
+        let (x, width, of_enum) = match (srepr, enum_row) {
+            (Repr::Int { ty, .. }, _) => (self.scalar(s, ty)?, ty.bits(PTR_BITS), None),
+            (Repr::Bool, _) => (self.scalar(s, Ty::I8)?, 8, None),
+            // An enum: its discriminant, decoded once from the tag by `ls`'s encoding, as an
+            // `i64` (lib.rs, "Enums").
+            (_, Some(l)) => {
+                let Shape::Enum { id, .. } = self.layouts[l as usize].shape else {
+                    return Err(malformed("an enum's layout changed shape"));
+                };
+                // By value, what no arm moves is dropped at the scrutinee's end: a local's
+                // field flags, or a temporary's rest per arm (codegen.md, "A `match` by value
+                // on an enum that needs drop"); through a reference nothing moves.
+                if self.layouts[l as usize].needs_drop && !by_ref {
+                    owner = match self.local_of(scrutinee)? {
+                        // As `Expr::Match` evaluated it: in place.
+                        Some(p) if self.owned[p.ix()].is_some() && self.adjust_rows(scrutinee).is_empty() => Owner::Local(p),
+                        _ if self.temp_scope_end[e.ix()] => Owner::Temp,
+                        _ => {
+                            return Err(unsupported(
+                                e,
+                                "a `match` by value on a temporary that needs drop, inside a larger expression (its rest drops at the statement's end, after later operands)",
+                            ));
+                        }
+                    };
+                }
+                let at = match srepr {
+                    Repr::Agg(_) => self.place(s, srepr)?,
+                    // Zero-sized: nothing is read through the place.
+                    _ => (self.b.uninit(Ty::PTR), 0),
+                };
+                let d = self.read_discriminant(id, at)?;
+                (d, 64, Some((at, l, id)))
+            }
+            _ => return Err(unsupported(e, "a match on other than an integer, a bool or an enum")),
         };
-        let x = self.scalar(s, sty)?;
         let list = self.body.arms.get(arms.range()).ok_or(malformed("a match's arms past `arms`"))?;
         let repr = self.expr_repr(e)?;
         let guarded = list.iter().any(|a| a.guard.is_some());
@@ -1619,7 +4938,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             let mut default = self.arm_blocks[(first + n) as usize];
             for (i, arm) in list.iter().enumerate() {
                 values.clear();
-                let always = self.pat_values(arm.pat, width, &mut values)?;
+                let always = self.pat_values(arm.pat, width, of_enum.map(|o| o.2), &mut values)?;
                 let block = self.arm_blocks[first as usize + i];
                 for &v in values.iter() {
                     if !cases.iter().any(|&(c, _)| c == v) {
@@ -1631,15 +4950,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     break;
                 }
             }
-            let mut tos = Vec::with_capacity_in(cases.len(), self.alloc.clone());
-            for &(v, block) in cases.iter() {
-                self.reach(block);
-                tos.push((v, (block, &[] as &[Value])));
-            }
-            self.reach(default);
-            self.b.switch(x, (default, &[]), &tos);
+            self.switch(x, default, &cases);
         }
-        self.matches.push(MatchState { expr: e, scrutinee: x, width, join, repr, first, arms: n, guarded });
+        self.matches.push(MatchState { expr: e, scrutinee: x, width, of_enum, join, repr, first, arms: n, guarded, by_ref, owner });
         let m = (self.matches.len() - 1) as u32;
         self.work.push(Task::MatchEnd);
         for i in (0..n).rev() {
@@ -1657,7 +4970,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         self.begin(block);
         if st.guarded {
             let mut values = Vec::new_in(self.alloc.clone());
-            let always = self.pat_values(arm.pat, st.width, &mut values)?;
+            let always = self.pat_values(arm.pat, st.width, st.of_enum.map(|o| o.2), &mut values)?;
             if !always {
                 let ty = Ty::int(st.width).ok_or(malformed("a scrutinee of no integer width"))?;
                 let mut c = None;
@@ -1675,10 +4988,85 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.begin(pass);
             }
         }
-        if let Pat::Bind { .. } = self.pat(arm.pat)? {
-            self.bind_value(arm.pat, V::Scalar(st.scrutinee))?;
+        // The arm's drop scope: its bindings drop at its end, then a temporary scrutinee's
+        // rest, which is held ahead of them (codegen.md, "A `match` by value on an enum that
+        // needs drop").
+        self.scope_marks.push(self.scope_pats.len() as u32);
+        let rest_at = self.scope_pats.len();
+        if let (Owner::Temp, Some((at, l, _))) = (st.owner, st.of_enum) {
+            self.scope_pats.push(Held::Rest { at, l, variant: None, moved: 0 });
+        }
+        let mut moved = 0u64;
+        let mut whole = false;
+        match (self.pat(arm.pat)?, st.of_enum) {
+            (Pat::Bind { .. }, None) => self.bind_value(arm.pat, V::Scalar(st.scrutinee))?,
+            (Pat::Bind { .. }, Some((at, _, _))) => {
+                self.bind_value(arm.pat, V::Place(at.0, at.1))?;
+                if st.owner != Owner::None {
+                    self.own_pat(arm.pat)?;
+                    whole = true;
+                }
+            }
+            (Pat::TupleStruct { .. } | Pat::Struct { .. }, Some((at, l, _))) => {
+                moved = self.bind_variant(arm.pat, at, l, st.by_ref)?;
+                if moved != 0 {
+                    let variant = Self::def_variant(self.pat_def(arm.pat)).ok_or(malformed("a variant pattern the check did not resolve"))?;
+                    if self.layouts[l as usize].drop_fn.is_some() {
+                        return Err(BuildError::UnsupportedPat {
+                            pat: arm.pat,
+                            what: "a move out of an enum that implements `Drop` (E0509)",
+                        });
+                    }
+                    match st.owner {
+                        Owner::Local(x) => {
+                            let slot = self.owned[x.ix()]
+                                .and_then(|o| o.rest)
+                                .ok_or(malformed("a match moving fields out of a local without field flags"))?;
+                            let fa = self.b.slot_addr(slot);
+                            let mask = self.b.load(Ty::I64, Flags::NONE, fa, 0, MemAttrs::aligned(3));
+                            let keep = self.b.iconst(Ty::I64, u128::from(!moved));
+                            let left = self.b.binary(Op::And, Flags::NONE, mask, keep);
+                            self.b.store(Flags::NONE, left, fa, 0, MemAttrs::aligned(3));
+                        }
+                        Owner::Temp => self.scope_pats[rest_at] = Held::Rest { at, l, variant: Some(variant), moved },
+                        Owner::None => return Err(malformed("a field that needs drop moved out of a scrutinee no one owns")),
+                    }
+                }
+            }
+            (Pat::Or { alts }, Some(_)) => {
+                let list = self.body.pat_lists.get(alts.range()).ok_or(malformed("an or-pattern past `pat_lists`"))?;
+                for &alt in list {
+                    if let Pat::TupleStruct { elems, .. } = self.pat(alt)?
+                        && elems.len > 0
+                    {
+                        return Err(BuildError::UnsupportedPat { pat: alt, what: "an or-pattern of variants with fields" });
+                    }
+                    if let Pat::Struct { .. } = self.pat(alt)? {
+                        return Err(BuildError::UnsupportedPat { pat: alt, what: "an or-pattern of variants with fields" });
+                    }
+                }
+            }
+            _ => {}
+        }
+        if whole {
+            match st.owner {
+                Owner::Local(x) => self.moved(st.expr, x)?,
+                Owner::Temp => {
+                    self.scope_pats.remove(rest_at);
+                }
+                Owner::None => {}
+            }
+        }
+        if (moved != 0 || whole)
+            && arm.guard.is_some()
+        {
+            return Err(BuildError::UnsupportedPat {
+                pat: arm.pat,
+                what: "a guard on an arm that moves out of its scrutinee (Rust moves only after the guard passes)",
+            });
         }
         self.work.push(Task::ArmEnd { m });
+        self.work.push(Task::ScopeEnd(arm.body));
         self.work.push(Task::Eval(arm.body));
         if let Some(g) = arm.guard {
             self.work.push(Task::Guard { m, i });

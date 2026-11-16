@@ -82,6 +82,7 @@
 //! scope cancelled; a task still running then is a hang (rule 18), and the process stops,
 //! naming it, rather than free what it borrows.
 
+mod claim;
 mod deque;
 mod idle;
 #[expect(unsafe_code, reason = "per-worker slots handed to the worker that owns them: each `unsafe` states why")]
@@ -120,6 +121,7 @@ use crate::{
     rt::{catch_unwind, resume_unwind},
     unfinished::Unfinished,
 };
+use claim::Start;
 use threads::{Full, Pool, Queued, Ran, Tally};
 
 /// How a waiting task's frames are stored (std.md, "Layouts").
@@ -494,6 +496,7 @@ impl<'p> Scope<'p> {
         name: &'static str,
         index: u32,
         frame: Frame,
+        start: Start,
         task: impl FnOnce(&Cx) -> Result<T, E> + Send,
     ) -> (Queued<T>, threads::JobPtr) {
         let live = &self.live;
@@ -519,7 +522,7 @@ impl<'p> Scope<'p> {
         // SAFETY: the job's body borrows no longer than the scope, and the scope does not end
         // while the job is queued or running: its handle runs it, waits for it or drops it
         // unrun (`Pending`), and a task that will not end stops the process (`outlast`).
-        unsafe { threads::job(name, tally, body) }
+        unsafe { threads::job(name, tally, start, body) }
     }
 
     /// A pool task's outcome, as its handle gives it.
@@ -563,7 +566,7 @@ impl<'p> Scope<'p> {
         if let (Some(pool), Some(tally)) = (live.cx.pool(), &live.shared)
             && self.workers() > 1
         {
-            let (queued, job) = self.pool_job(tally, name, index, frame, task);
+            let (queued, job) = self.pool_job(tally, name, index, frame, Start::Open, task);
             let here = live.cx.here();
             if let Err(Full(job)) = pool.spawn(here, live.class.get(), job) {
                 pool.run_now(here, job);
@@ -634,14 +637,15 @@ impl<'p> Scope<'p> {
             Ok(prepared) => prepared,
             Err(failed) => return Ok(failed),
         };
-        let (queued, job) = self.pool_job(tally, name, index, frame, task);
+        // Reserved: only the worker it is handed to may start it, never its joiner, so it runs
+        // beside its spawner however soon the join comes (task/claim.rs).
+        let (queued, job) = self.pool_job(tally, name, index, frame, Start::Reserved, task);
         match pool.reserve(live.cx.here(), job) {
             Ok(_) => Ok(Scope::handle(name, Held::Queued(self.pending(pool, queued)))),
             Err(job) => {
                 // No worker idle: the task never runs. It was never queued, so this thread
-                // claims it and drops it unrun, then gives up both references.
-                let unrun = queued.drop_unstarted();
-                assert!(unrun, "bstd::task {name}: a task no worker took had started");
+                // withdraws it and drops it unrun, then gives up both references.
+                queued.withdraw();
                 job.release_unrun();
                 drop(queued);
                 Err(NoParallelism { have: 1, ..refused })
@@ -716,8 +720,8 @@ impl<'p> Scope<'p> {
                 why: TaskWhy::Unended { running, stopped },
             }),
             Settled::All => match (failed, cx.plant()) {
-                (Some(_), Plant::JoinDropsFailure) | (None, Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::UnsyncedRenameSyncs | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned | Plant::ParJoinsInRunOrder | Plant::FreezeLeaks | Plant::SwapFreesAtOnce | Plant::FlightComputesTwice | Plant::ChanPassesCapacity | Plant::PublishOnceOverwrites | Plant::OrderTokenTwice | Plant::TaskMigrates) => Ok(()),
-                (Some(failed), Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::UnsyncedRenameSyncs | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned | Plant::ParJoinsInRunOrder | Plant::FreezeLeaks | Plant::SwapFreesAtOnce | Plant::FlightComputesTwice | Plant::ChanPassesCapacity | Plant::PublishOnceOverwrites | Plant::OrderTokenTwice | Plant::TaskMigrates) => Err(failed),
+                (Some(_), Plant::JoinDropsFailure) | (None, Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::UnsyncedRenameSyncs | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned | Plant::ParJoinsInRunOrder | Plant::FreezeLeaks | Plant::SwapFreesAtOnce | Plant::FlightComputesTwice | Plant::ChanPassesCapacity | Plant::PublishOnceOverwrites | Plant::OrderTokenTwice | Plant::TaskMigrates | Plant::AncestorsUnbounded) => Ok(()),
+                (Some(failed), Plant::None | Plant::SubdirKeepsParent | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::UnsyncedRenameSyncs | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned | Plant::ParJoinsInRunOrder | Plant::FreezeLeaks | Plant::SwapFreesAtOnce | Plant::FlightComputesTwice | Plant::ChanPassesCapacity | Plant::PublishOnceOverwrites | Plant::OrderTokenTwice | Plant::TaskMigrates | Plant::AncestorsUnbounded) => Err(failed),
             },
         }
     }

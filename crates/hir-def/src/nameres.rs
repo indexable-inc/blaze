@@ -207,17 +207,12 @@ fn visibility_of(db: &Db, module: ModuleId, vis: blaze_surface::Visibility) -> V
 }
 
 /// What a binding's target names: the item, `None` for an ambiguity (two candidates of one
-/// layer, an error the scope's own check reports, as rustc's E0659). An undetermined target in
-/// a finished record is a scope solved short of its fixpoint: a typed stop naming the module.
-fn binding_target(db: &Db, module: ModuleId, binding: Binding) -> Option<ItemKey> {
+/// layer, an error the scope's own check reports, as rustc's E0659). A finished record never
+/// holds an undetermined binding: the type has no such state.
+fn binding_target(_db: &Db, _module: ModuleId, binding: Binding) -> Option<ItemKey> {
     match binding.state {
         BindingState::Determined => Some(binding.def.key),
         BindingState::Ambiguous(..) => None,
-        BindingState::Undetermined => {
-            let item = scope_key(db, module);
-            Err(SurfaceError::NotBuilt(NotBuilt { method: "an undetermined binding", item }))
-                .or_need()
-        }
     }
 }
 

@@ -8,12 +8,14 @@
 //! with `<text>` in what the compiler said, and its twin must compile, so a refusal that
 //! passes for another reason (a typo, a missing feature) shows as its twin failing.
 //!
-//! Where bstd is: this test's binary is in cargo's `deps/` directory, beside the
-//! `libbstd-<hash>.rlib` it was linked with and every crate bstd depends on. Each fixture gets
-//! `--extern bstd=<that rlib>` and `-L dependency=<deps/>`, from which the compiler finds bstd's
-//! own dependencies by their hashes. Two `libbstd-*.rlib` there (an older build of other
-//! features left in the same profile) are told apart by which was written last, the one this
-//! test's build made or kept, and the one chosen is named in every failure.
+//! Where bstd is: found from this test's binary ([`crate_dirs`]). In cargo's old layout the
+//! binary is in `deps/`, beside the `libbstd-<hash>.rlib` it was linked with and every crate
+//! bstd depends on; in the build directory's new layout each unit has its own
+//! `build/<package>/<hash>/out/`, and every one of them is searched. Each fixture gets
+//! `--extern bstd=<that rlib>` and `-L dependency=<dir>` for each, from which the compiler
+//! finds bstd's own dependencies by their hashes. Two `libbstd-*.rlib` (an older build of
+//! other features left in the same profile) are told apart by which was written last, the one
+//! this test's build made or kept, and the one chosen is named in every failure.
 //!
 //! Each compile is a lib crate emitted as an rlib, not checked only: a refusal made by a
 //! `const` assertion of an instance is a post-monomorphization error, which `--emit=metadata`
@@ -49,11 +51,12 @@ struct Fixture {
     says: String,
 }
 
-/// Where this test's bstd is: the rlib it was linked with, and the directory of its
+/// Where this test's bstd is: the rlib it was linked with, and the directories of its
 /// dependencies.
 struct Bstd {
+    /// The file with bstd's metadata: its `.rmeta` where cargo keeps it apart, else its rlib.
     rlib: PathBuf,
-    deps: PathBuf,
+    deps: Vec<PathBuf>,
 }
 
 fn fixtures() -> Vec<Fixture> {
@@ -83,22 +86,61 @@ fn fixtures() -> Vec<Fixture> {
     found
 }
 
+/// The directories that hold the build's crates, from where this test's binary is. cargo
+/// lays a profile out one of two ways: every crate in one `deps/` beside the test (the old
+/// layout), or each compiled unit in its own `build/<package>/<hash>/out/` (the build
+/// directory's new layout, which the test binary is in too). Any other place is a refusal
+/// naming it, never a guess.
+fn crate_dirs(exe: &Path) -> Vec<PathBuf> {
+    let out = exe.parent().expect("the test binary is in a directory");
+    if out.file_name().is_some_and(|it| it == "deps") {
+        return vec![out.to_path_buf()];
+    }
+    let build = out.parent().and_then(Path::parent).and_then(Path::parent);
+    let Some(build) = build.filter(|it| out.file_name().is_some_and(|name| name == "out") && it.file_name().is_some_and(|name| name == "build")) else {
+        panic!("{}: neither cargo's `deps/` nor its `build/<package>/<hash>/out/`", out.display());
+    };
+    let read = |dir: &Path| fs::read_dir(dir).unwrap_or_else(|error| panic!("{}: {error}", dir.display()));
+    let mut dirs = Vec::new();
+    for package in read(build) {
+        let package = package.unwrap_or_else(|error| panic!("{}: {error}", build.display())).path();
+        if !package.is_dir() {
+            continue;
+        }
+        for unit in read(&package) {
+            let unit = unit.unwrap_or_else(|error| panic!("{}: {error}", package.display())).path().join("out");
+            if unit.is_dir() {
+                dirs.push(unit);
+            }
+        }
+    }
+    dirs.sort();
+    dirs
+}
+
 fn bstd() -> Bstd {
     let exe = std::env::current_exe().expect("the test's own path");
-    let deps = exe.parent().expect("the test binary is in a directory").to_path_buf();
+    let deps = crate_dirs(&exe);
     let mut rlibs: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
-    for entry in fs::read_dir(&deps).unwrap_or_else(|error| panic!("{}: {error}", deps.display())) {
-        let path = entry.unwrap_or_else(|error| panic!("{}: {error}", deps.display())).path();
-        let file = path.file_name().and_then(|it| it.to_str()).unwrap_or("");
-        if file.starts_with("libbstd-") && file.ends_with(".rlib") {
-            let written = fs::metadata(&path).and_then(|it| it.modified()).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
-            rlibs.push((written, path));
+    for dir in &deps {
+        for entry in fs::read_dir(dir).unwrap_or_else(|error| panic!("{}: {error}", dir.display())) {
+            let path = entry.unwrap_or_else(|error| panic!("{}: {error}", dir.display())).path();
+            let file = path.file_name().and_then(|it| it.to_str()).unwrap_or("");
+            if file.starts_with("libbstd-") && file.ends_with(".rlib") {
+                let written = fs::metadata(&path).and_then(|it| it.modified()).unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+                rlibs.push((written, path));
+            }
         }
     }
     rlibs.sort();
     let Some((_, rlib)) = rlibs.pop() else {
-        panic!("{}: no libbstd-*.rlib beside this test's binary", deps.display());
+        panic!("{}: no libbstd-*.rlib in the build's {} crate directories", exe.display(), deps.len());
     };
+    // Where cargo keeps metadata out of the rlib (`-Zembed-metadata=no`), the rlib holds only a
+    // stub and its `.rmeta` beside it holds the metadata: a fixture, a lib crate whose rlib links
+    // nothing of bstd's, is compiled against that. In the old layout the rlib holds it whole.
+    let metadata = rlib.with_extension("rmeta");
+    let rlib = if metadata.exists() { metadata } else { rlib };
     Bstd { rlib, deps }
 }
 
@@ -117,17 +159,20 @@ fn start(bstd: &Bstd, file: &Path, crate_name: &str) -> Started {
     let stderr = fs::File::create(&said).unwrap_or_else(|error| panic!("{}: {error}", said.display()));
     let mut extern_bstd = std::ffi::OsString::from("bstd=");
     extern_bstd.push(&bstd.rlib);
-    let mut deps = std::ffi::OsString::from("dependency=");
-    deps.push(&bstd.deps);
     #[expect(clippy::disallowed_methods, reason = "a test of the compiler's answer runs the compiler; the directory is named below")]
     let mut command = Command::new(RUSTC);
     command
         .current_dir(&out)
         .args(["--edition=2024", "--crate-type=lib", "--emit=link", "-Cdebuginfo=0", "--crate-name", crate_name])
         .arg("--extern")
-        .arg(extern_bstd)
-        .arg("-L")
-        .arg(deps)
+        .arg(extern_bstd);
+    // The compiler finds each of bstd's dependencies by its hash among these.
+    for dir in &bstd.deps {
+        let mut deps = std::ffi::OsString::from("dependency=");
+        deps.push(dir);
+        command.arg("-L").arg(deps);
+    }
+    command
         .arg("--out-dir")
         .arg(&out)
         .arg(file)
@@ -196,5 +241,5 @@ fn each_refusal_refuses_and_its_twin_compiles() {
             }
         }
     }
-    assert!(failures.is_empty(), "against {} (deps {}), with {RUSTC}:\n{failures}", bstd.rlib.display(), bstd.deps.display());
+    assert!(failures.is_empty(), "against {} (deps in {} directories), with {RUSTC}:\n{failures}", bstd.rlib.display(), bstd.deps.len());
 }

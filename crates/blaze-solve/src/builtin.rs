@@ -36,15 +36,38 @@
 use blaze_own::{Alloc, Vec};
 
 use crate::assembly::{BuiltinSource, Cand, Cx, Rule as CandRule, Source, Step};
-use crate::error::{Limit, Malformed, SolveError, Stop};
+use crate::error::{Limit, Malformed, SolveError, Stop, Unsupported};
 use crate::facts::{AdtFlags, Facts, FnSigDef, Portable, TraitDef, TraitFlags};
 use crate::fold;
 use crate::term::{
-    AliasKind, Certainty, Children, Def, Flags, GoalSource, Lang, List, Mutbl, Polarity, Pred, Rigid, Ty, TyKind,
+    AliasKind, Certainty, Children, Def, Flags, GoalSource, Lang, List, Mutbl, Polarity, Pred, Rigid, Safety, Ty, TyKind,
     UintTy, Var, VarKind, children, CLOSURE_FN, CLOSURE_FN_MUT, CLOSURE_FN_ONCE,
 };
 use crate::trait_goals::TraitGoal;
 use crate::tys::{Relate, Tys};
+
+/// The trait-object rules' planted bugs (tests/plant.rs); outside tests none is ever on.
+#[cfg(test)]
+pub(crate) use crate::tests::plant::Plant as Planted;
+
+#[cfg(test)]
+pub(crate) fn planted(p: Planted) -> bool {
+    crate::tests::plant::on(p)
+}
+
+/// The trait-object rules' planted bugs: outside tests none is ever on.
+#[cfg(not(test))]
+#[derive(Clone, Copy)]
+pub(crate) enum Planted {
+    ObjectSized,
+    ObjectAnyAuto,
+    ObjectProjIgnoresBinding,
+}
+
+#[cfg(not(test))]
+pub(crate) fn planted(_: Planted) -> bool {
+    false
+}
 
 /// The most trait refs one supertrait elaboration visits (rule 18).
 const MAX_ELABORATED: usize = 4096;
@@ -109,9 +132,8 @@ impl ClosureKind {
 /// The answer for input no correct arena, world or engine can give a rule (the reference's
 /// `panic!("unexpected type")` and `unwrap`s, and a lang item the rule requires that the crates
 /// in scope do not define, `require_trait_lang_item`).
-pub(crate) fn malformed() -> Stop {
-    Stop::Error(SolveError::Malformed(Malformed::Pred))
-}
+#[track_caller]
+pub(crate) fn malformed() -> Stop { Stop::Error(SolveError::Malformed(crate::error::bad_pred())) }
 
 /// A builtin candidate of `rule` from `source`.
 pub(crate) fn cand(source: BuiltinSource, rule: CandRule) -> Cand {
@@ -316,8 +338,16 @@ pub fn assemble<T: Tys, F: Facts>(
         match def.lang {
             Some(Lang::Sized) => assemble_sizedness(cx, g, self_ty, false, out)?,
             Some(Lang::MetaSized) => assemble_sizedness(cx, g, self_ty, true, out)?,
-            // "`PointeeSized` is removed during lowering": it is never a goal.
-            Some(Lang::PointeeSized) => return Err(malformed()),
+            // `PointeeSized` is the bound every type meets (RFC 3729, the sized hierarchy: the
+            // absence of any sizedness bound). rustc strips it while lowering and calls the goal
+            // unreachable; here it holds wherever it reaches the solver, so no front end and no
+            // importer (an impl's where-clauses, a callee's predicates, an ADT's) must strip it:
+            // core writes `impl<T: PointeeSized> Clone for &T`.
+            Some(Lang::PointeeSized) => {
+                if positive {
+                    out.push(certain(Certainty::Yes));
+                }
+            }
             Some(Lang::Copy | Lang::Clone) => {
                 // `consider_builtin_copy_clone_candidate`.
                 if positive {
@@ -334,6 +364,13 @@ pub fn assemble<T: Tys, F: Facts>(
             Some(Lang::FnMut) => assemble_fn_trait(cx, g, self_ty, ClosureKind::FnMut, out)?,
             Some(Lang::FnOnce) => assemble_fn_trait(cx, g, self_ty, ClosureKind::FnOnce, out)?,
             Some(Lang::FnPtrTrait) => assemble_fn_ptr_trait(g, k, out),
+            // `consider_builtin_future_candidate`: an async coroutine implements `Future`
+            // (its `Output` by `normalize_future_output`).
+            Some(Lang::Future) => {
+                if positive && matches!(k, TyKind::Coroutine(..)) {
+                    out.push(certain(Certainty::Yes));
+                }
+            }
             Some(Lang::Tuple) => {
                 // `consider_builtin_tuple_candidate`.
                 if positive && matches!(k, TyKind::Tuple(_)) {
@@ -376,7 +413,7 @@ fn assemble_sizedness<T: Tys, F: Facts>(
 /// `consider_builtin_fn_ptr_trait_candidate` (trait_goals.rs): `impl FnPtr for fn(..)`, and
 /// `impl !FnPtr for T` where `T` is rigid and not a fn pointer (`is_known_rigid`).
 fn assemble_fn_ptr_trait(g: TraitGoal, k: TyKind, out: &mut Vec<Cand, Alloc<'_>>) {
-    let is_fn_ptr = matches!(k, TyKind::FnPtr(_));
+    let is_fn_ptr = matches!(k, TyKind::FnPtr(..));
     let holds = match g.polarity {
         Polarity::Positive => is_fn_ptr,
         Polarity::Negative => !is_fn_ptr && is_known_rigid(k),
@@ -400,12 +437,14 @@ fn is_known_rigid(k: TyKind) -> bool {
             | TyKind::Str
             | TyKind::Array(..)
             | TyKind::Slice(_)
+            | TyKind::Pat(..)
             | TyKind::RawPtr(..)
             | TyKind::Ref(..)
             | TyKind::FnDef(..)
-            | TyKind::FnPtr(_)
+            | TyKind::FnPtr(..)
             | TyKind::Dynamic(..)
             | TyKind::Closure(..)
+            | TyKind::Coroutine(..)
             | TyKind::Never
             | TyKind::Tuple(_)
     )
@@ -431,22 +470,27 @@ fn callable<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, self_ty: Ty, goal_kind:
         TyKind::FnDef(d, args) => {
             let sig: FnSigDef<'_> = cx.fn_sig(d)?;
             // `is_fn_trait_compatible` (a safe fn of the Rust ABI) and `has_target_features`.
-            if sig.flags & (FnSigDef::UNSAFE | FnSigDef::TARGET_FEATURE) != 0 {
+            if sig.flags & (FnSigDef::UNSAFE | FnSigDef::TARGET_FEATURE | FnSigDef::RUST_CALL) != 0 {
                 return Ok(Callable::No);
             }
             let io = cx.import_list(sig.portable, sig.inputs_output, args)?;
             split_sig(cx, io)
         }
-        // `FnPtr` carries no safety or ABI here: every fn pointer is `is_fn_trait_compatible`.
-        TyKind::FnPtr(io) => split_sig(cx, io),
+        // `FnSig::is_fn_trait_compatible`: "!self.c_variadic() && self.safety().is_safe() &&
+        // self.abi().is_fn_trait_compatible()"; `ExternAbi::is_fn_trait_compatible` is false
+        // for the internal "rust-call" (and uncallable ABIs, which have no `Abi` here).
+        TyKind::FnPtr(io, h) => match (h.safety, h.abi) {
+            (_, crate::term::Abi::RustCall) | (Safety::Unsafe, _) => Ok(Callable::No),
+            (Safety::Safe, _) => split_sig(cx, io),
+        },
         TyKind::Closure(_, args) => {
             if args.len < 3 {
                 return Err(malformed());
             }
             let kind = cx.arg(args, args.len - 3);
             match cx.kind(kind) {
-                TyKind::ConstValue(v) => {
-                    let Some(ck) = ClosureKind::from_value(v) else { return Err(malformed()) };
+                TyKind::ConstValue(_, v) => {
+                    let Some(ck) = u64::try_from(v).ok().and_then(ClosureKind::from_value) else { return Err(malformed()) };
                     if !ck.extends(goal_kind) {
                         return Ok(Callable::No);
                     }
@@ -459,7 +503,7 @@ fn callable<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, self_ty: Ty, goal_kind:
                 _ => return Err(malformed()),
             }
             let sig = cx.arg(args, args.len - 2);
-            let TyKind::FnPtr(io) = cx.kind(sig) else { return Err(malformed()) };
+            let TyKind::FnPtr(io, _) = cx.kind(sig) else { return Err(malformed()) };
             if io.len < 2 {
                 return Err(malformed());
             }
@@ -476,7 +520,7 @@ fn split_sig<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, io: List) -> Result<Ca
     if io.len == 0 {
         return Err(malformed());
     }
-    let inputs = cx.mk_list(&cx.list(List { start: io.start, len: io.len - 1 }))?;
+    let inputs = cx.mk_list(&cx.list_range(io, 0, io.len - 1))?;
     let tupled = cx.mk(TyKind::Tuple(inputs))?;
     Ok(Callable::Sig(tupled, cx.arg(io, io.len - 1)))
 }
@@ -549,7 +593,7 @@ fn assemble_unsize<T: Tys, F: Facts>(
                 elaborate_supertraits(cx, ad, args, &mut supers)?;
                 for &(d, l) in supers.iter().skip(1) {
                     // `ExistentialTraitRef::erase_self_ty`.
-                    let rest = cx.mk_list(&cx.list(List { start: l.start + 1, len: l.len.saturating_sub(1) }))?;
+                    let rest = cx.mk_list(&cx.list_range(l, 1, l.len))?;
                     let b = cx.mk(TyKind::Tuple(rest))?;
                     out.push(Cand { b, d, n: 1, ..row(Rule::UnsizeUpcast, BuiltinSource::TraitUpcasting) });
                 }
@@ -604,7 +648,7 @@ pub fn assemble_object<T: Tys, F: Facts>(
     let packed = pack_args(cx, g.args, self_ty)?;
     for i in 0..preds.len {
         if let TyKind::ExAuto(d) = cx.tys.kind(cx.arg(preds, i))
-            && d == g.trait_
+            && (d == g.trait_ || planted(Planted::ObjectAnyAuto))
         {
             let l = cx.mk_list(&[self_ty])?;
             let c = cx.mk(TyKind::Tuple(l))?;
@@ -652,6 +696,9 @@ pub fn step<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, rule: 
 /// `probe_and_evaluate_goal_for_constituent_tys`.
 fn step_sizedness<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand, meta: bool) -> Result<Step, Stop> {
     let k = cx.kind(cand.a);
+    if matches!(k, TyKind::Dynamic(..)) && planted(Planted::ObjectSized) {
+        return Ok(Step::Done(Certainty::Yes));
+    }
     let one = match k {
         // impl {Meta,}Sized for numbers, bool, char, fn items and pointers, raw pointers,
         // references, arrays, closures, `!` and errors.
@@ -661,13 +708,16 @@ fn step_sizedness<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand, meta
         | TyKind::Bool
         | TyKind::Float(_)
         | TyKind::FnDef(..)
-        | TyKind::FnPtr(_)
+        | TyKind::FnPtr(..)
         | TyKind::RawPtr(..)
         | TyKind::Char
         | TyKind::Ref(..)
         | TyKind::Array(..)
         | TyKind::Closure(..)
+        | TyKind::Coroutine(..)
         | TyKind::Never
+        // A pattern type's base is an integer, `char` or a thin pointer: always sized.
+        | TyKind::Pat(..)
         | TyKind::Error => None,
         // impl MetaSized for str, [T], dyn Trait.
         TyKind::Str | TyKind::Slice(_) | TyKind::Dynamic(..) => {
@@ -711,7 +761,7 @@ fn step_sizedness<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand, meta
 fn step_copy_clone<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Result<Step, Stop> {
     let mut tys: Vec<Ty, Alloc<'_>> = Vec::new_in(cx.alloc);
     match cx.kind(cand.a) {
-        TyKind::FnDef(..) | TyKind::FnPtr(_) | TyKind::Error => {}
+        TyKind::FnDef(..) | TyKind::FnPtr(..) | TyKind::Error => {}
         TyKind::Uint(_)
         | TyKind::Int(_)
         | TyKind::Infer(Var { kind: VarKind::Int | VarKind::Float, .. })
@@ -731,7 +781,12 @@ fn step_copy_clone<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> 
         | TyKind::Alias(..)
         | TyKind::Param(_)
         | TyKind::Placeholder(..) => return Ok(Step::No),
+        // An async coroutine is immovable: never `Copy` or `Clone`.
+        TyKind::Coroutine(..) => return Ok(Step::No),
         TyKind::Tuple(l) => tys.extend_from_slice(&cx.list(l)),
+        // A pattern type is `Copy`/`Clone` as its base (core's `niche_types` derives both over
+        // one; no impl in core).
+        TyKind::Pat(base, _) => tys.push(base),
         // impl Copy/Clone for Closure where its tupled upvars: Copy/Clone.
         TyKind::Closure(_, args) => {
             if args.len < 3 {
@@ -758,6 +813,77 @@ fn step_fn_trait<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) -> Re
     // `match_assumption`: the goal's trait ref equals `Self: Fn*<Inputs>` (the self types are
     // the same term).
     if !cx.eq(cx.arg(args, 1), inputs)? {
+        return Ok(Step::No);
+    }
+    let sized = require_lang(cx, Lang::Sized)?;
+    let p = trait_pred(cx, sized, &[output])?;
+    cx.add(GoalSource::ImplWhereBound, p);
+    Ok(Step::Done(Certainty::Yes))
+}
+
+/// `consider_builtin_future_candidate` (normalizes_to.rs): `<C as Future>::Output` of an async
+/// coroutine `C` is its output, `args[0]`; any other self type has no candidate.
+/// `<Self as DiscriminantKind>::Discriminant` (normalizes_to.rs
+/// `consider_builtin_discriminant_kind_candidate`, `Ty::discriminant_ty`). The trait has no impl
+/// in the library; the language gives it for every type. library/core/src/marker.rs, on
+/// `DiscriminantKind`: "Compiler-internal trait used to indicate the type of enum
+/// discriminants. This trait is automatically implemented for every type and does not add any
+/// guarantees to `mem::Discriminant`." An enum's is its discriminant type ([`Discr`]); a
+/// coroutine's is `u32` (its state index); every other type's is `u8`. `None`: a parameter,
+/// placeholder or alias, whose projection stays rigid.
+pub(crate) fn discriminant_ty<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, self_ty: Ty) -> Result<Option<Ty>, Stop> {
+    use crate::facts::Discr;
+    let k = match cx.kind(self_ty) {
+        TyKind::Param(_) | TyKind::Placeholder(..) | TyKind::Alias(..) | TyKind::Bound(..) => return Ok(None),
+        TyKind::Infer(_) => return Err(malformed()),
+        TyKind::Coroutine(..) => TyKind::Uint(UintTy::U32),
+        TyKind::Adt(d, _) => {
+            let adt = cx.adt(d)?;
+            if !adt.flags.has(AdtFlags::ENUM) {
+                TyKind::Uint(UintTy::U8)
+            } else {
+                match adt.discr {
+                    Discr::Int(i) => TyKind::Int(i),
+                    Discr::Uint(u) => TyKind::Uint(u),
+                    Discr::Unread => return Err(Stop::Error(SolveError::Unsupported(Unsupported::ReprNotRead(d)))),
+                }
+            }
+        }
+        _ => TyKind::Uint(UintTy::U8),
+    };
+    Ok(Some(cx.mk(k)?))
+}
+
+pub(crate) fn normalize_future_output<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, self_ty: Ty, term: Ty) -> Result<Step, Stop> {
+    let TyKind::Coroutine(_, args) = cx.kind(self_ty) else { return Ok(Step::No) };
+    if args.len != 2 {
+        return Err(malformed());
+    }
+    if cx.eq(term, cx.arg(args, 0))? { Ok(Step::Done(Certainty::Yes)) } else { Ok(Step::No) }
+}
+
+/// `consider_builtin_fn_trait_candidates` for a `NormalizesTo` goal of `FnOnce::Output`
+/// (normalizes_to.rs): the callable's tupled inputs and output (goal kind `FnOnce`, so a closure
+/// of unknown kind still has them), then `probe_and_consider_implied_clause` with the assumption
+/// `<Self as FnOnce<Inputs>>::Output == Output` (the self types are the same term: the goal's
+/// arguments after `Self` are equated with `Inputs`, its term with `Output`) and the requirement
+/// `Output: Sized` (`ImplWhereBound`). A type that is not callable has no candidate.
+pub(crate) fn normalize_fn_once_output<T: Tys, F: Facts>(
+    cx: &mut Cx<'_, '_, T, F>,
+    self_ty: Ty,
+    goal_args: List,
+    term: Ty,
+) -> Result<Step, Stop> {
+    let (inputs, output) = match callable(cx, self_ty, ClosureKind::FnOnce)? {
+        Callable::No => return Ok(Step::No),
+        // `forced_ambiguity(MaybeCause::Ambiguity)`.
+        Callable::Ambiguous => return Ok(Step::Done(Certainty::Ambiguous)),
+        Callable::Sig(i, o) => (i, o),
+    };
+    if goal_args.len != 2 {
+        return Err(malformed());
+    }
+    if !cx.eq(cx.arg(goal_args, 1), inputs)? || !cx.eq(term, output)? {
         return Ok(Step::No);
     }
     let sized = require_lang(cx, Lang::Sized)?;
@@ -918,7 +1044,7 @@ fn replace_projections<T: Tys, F: Facts>(
                 Ok(Some(projs[i].2))
             }
             // "could not replace": a projection bound of this item exists but none matches.
-            None if same_def => Err(SolveError::Malformed(Malformed::Pred)),
+            None if same_def => Err(SolveError::Malformed(crate::error::bad_pred())),
             None => Ok(None),
         }
     })?)

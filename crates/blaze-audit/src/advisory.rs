@@ -12,7 +12,7 @@
 //! informational = "unmaintained" | "unsound" | "notice"     withdrawn = "YYYY-MM-DD"
 //! [affected]  functions = { "foo::bar" = ["< 1.2.3"] }   arch = [..]   os = [..]
 //! [versions]  patched = [">= 1.2.3"]   unaffected = ["< 1.0.0"]
-//! ```
+//! ```text
 //! # Title
 //! Description.
 //! ```

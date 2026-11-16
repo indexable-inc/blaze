@@ -18,6 +18,14 @@ blaze-toml.workspace = true
 blaze-script.workspace = true
 # The workspace's one SHA-256, with no dependencies: `smoke` names the binary it ran by its hash.
 blaze-sha256.workspace = true
+# `proc_macro_modules`: a git source's files, read from the fetch store's verified pack.
+blaze-fetch.workspace = true
+blaze-git-fetch.workspace = true
+# A refused pack's reason as words (`Shown`).
+blaze-text.workspace = true
+# proc_macro_modules: the source corrections' allocator and the lexer's vector width (D58).
+blaze-own = { workspace = true, features = ["std"] }
+blaze-lex.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }
 
 [lints]

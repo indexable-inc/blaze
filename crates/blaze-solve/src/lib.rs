@@ -47,5 +47,5 @@ pub use assembly::{Clause, EnvId, Goal};
 pub use error::{SolveError, Stop};
 pub use eval::{Answer, Solver};
 pub use facts::{Facts, Read};
-pub use term::{Certainty, Def, Pred, Ty, TyKind, TypingMode};
+pub use term::{Abi, Certainty, Def, FnPtrHeader, Pred, Safety, Ty, TyKind, TypingMode};
 pub use tys::Tys;

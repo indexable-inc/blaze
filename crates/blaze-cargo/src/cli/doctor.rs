@@ -341,7 +341,7 @@ pub fn examine_all(state: &Path, now: u64) -> Report {
             Check::new("version", "pin", file, Verdict::Warn, format!("it cannot be read: {error}"))
         }
     });
-    match blaze_manifest::user_config::home() {
+    match blaze_manifest::user_config::home(|name| std::env::var_os(name), blaze_core::home::record) {
         Ok(home) => {
             let file = home.join("update").join("state.json");
             checks.push(update_check(ours, &file, read_optional(&file).as_deref()));

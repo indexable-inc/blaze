@@ -138,6 +138,7 @@ blaze-inproc-rt.opt-level = 3
 # blaze-codegen-code hashes the code generator's sources, which reruns on every edit of them:
 # optimized, as a build dependency is not by default.
 blake3.opt-level = 3
+blaze-blake3.opt-level = 3 # every key's digest: its tests hash every length to 4 KiB at 16 alignments
 blaze-codegen-code.opt-level = 3
 # The tier 0 scripts (`blaze run -p scripts --bin <name>`) are run, not developed: `docs check`
 # reads every tracked file, and unoptimized it took 26.5 s. The scripts and what they parse with
@@ -155,6 +156,18 @@ toml.opt-level = 3
 toml_parser.opt-level = 3
 toml_datetime.opt-level = 3
 winnow.opt-level = 3
+# The names pipeline (lex, outline, expand, resolve) runs inside every front-end test before its own work: a
+# test of the new front end resolves core, alloc, std and bstd first. Unoptimized that was about two minutes a
+# run, each run under the one build lock (2026-11-16); these crates are run by those tests, not developed by
+# them. `cargo check` does no codegen, so only a test build of an edited one of these pays for it.
+blaze-scope.opt-level = 3
+blaze-expand.opt-level = 3
+blaze-file-items.opt-level = 3
+blaze-surface.opt-level = 3
+blaze-toolchain.opt-level = 3
+blaze-lex.opt-level = 3
+parser.opt-level = 3
+rustc_lexer.opt-level = 3
 
 [profile.release]
 # Set this to 1 or 2 to get more useful backtraces in debugger.
@@ -296,6 +309,7 @@ blaze-tree = { path = "crates/blaze-tree" }
 blaze-resolve = { path = "crates/blaze-resolve" }
 blaze-source = { path = "crates/blaze-source" }
 blaze-units = { path = "crates/blaze-units" }
+blaze-unit-graph = { path = "crates/blaze-unit-graph" } # Features and cfgs per crate by cargo's rules, sans-IO: the unit graph of the new layer.
 blaze-shader = { path = "crates/blaze-shader" }
 blaze-doc = { path = "crates/blaze-doc" }
 blaze-fmt = { path = "crates/blaze-fmt" }
@@ -332,6 +346,7 @@ blaze-diagnostics = { path = "crates/blaze-diagnostics", version = "0.0.0" }
 # `blaze audit`: sources pinned by strong digests, advisories, yanked versions (sans-IO).
 blaze-audit = { path = "crates/blaze-audit" }
 blaze-fetch = { path = "crates/blaze-fetch" }
+blaze-toolchain = { path = "crates/blaze-toolchain" } # The toolchain as records: its manifest, the pinned id, the shelf reader (toolchain.md).
 blaze-format = { path = "crates/blaze-format" }
 # The record half of blaze-format on `core` alone, for the new item layer's `no_std` crates;
 # blaze-format re-exports it whole, with its `alloc` feature on.
@@ -344,6 +359,7 @@ blaze-format-tiers = { path = "crates/blaze-format-tiers" }
 # features, on here for the crates above, and the bottom crates name each other by path without
 # them. blaze's own BLAKE3, bit for bit official BLAKE3:
 blaze-blake3 = { path = "crates/blaze-blake3" }
+blaze-ed25519 = { path = "crates/blaze-ed25519" } # Ed25519 verification written here; the shared cache's head check
 # The SwissTable group probe and `Index`, re-exported as `blaze_mem::swiss`.
 blaze-swiss = { path = "crates/blaze-swiss" }
 blaze-hash = { path = "crates/blaze-hash", features = ["serde", "shared"] }
@@ -371,11 +387,16 @@ blaze-host = { path = "crates/blaze-host" }
 blaze-solo = { path = "crates/blaze-solo" }
 blaze-lir = { path = "crates/blaze-lir" }
 blaze-build = { path = "crates/blaze-build" } # A type-checked body to LIR (crates/blaze-cli/tests/ladder/README.md).
+blaze-consteval = { path = "crates/blaze-consteval" } # The constant evaluator (docs/v2/plan/design/consteval.md).
 blaze-emit = { path = "crates/blaze-emit" } # The baseline tier: LIR to AArch64 machine code.
 blaze-ladder = { path = "crates/blaze-ladder" } # The `blaze run` walking skeleton's straight line.
+blaze-world = { path = "crates/blaze-world" } # One world for run and check: the unit graph made into the names library's inputs.
 blaze-lint-defs = { path = "crates/blaze-lint-defs", version = "0.0.0" }
+blaze-lint = { path = "crates/blaze-lint" }
+blaze-real = { path = "crates/blaze-real" } # blaze's stages on a real checkout (tempo): the harness behind docs/v2/plan/design/tempo.md.
 blaze-radix = { path = "crates/blaze-radix" }
 blaze-record = { path = "crates/blaze-record" }
+blaze-proc-macro = { path = "crates/blaze-proc-macro", default-features = false }
 blaze-remote = { path = "crates/blaze-remote" }
 # The request certificate, its slot and the client's own check, with no compiler in it.
 blaze-certify = { path = "crates/blaze-certify" }
@@ -387,6 +408,7 @@ blaze-deflate = { path = "crates/blaze-deflate" }
 blaze-tar = { path = "crates/blaze-tar" }
 # blaze's own HTTP/1.1 client machine (no_std, sans-IO), and its driver over bstd's `Net` with a `Tls` seam.
 blaze-h1 = { path = "crates/blaze-h1" }
+blaze-url = { path = "crates/blaze-url" } # HostPort, Scheme, Origin, Url: checked addresses, the one home; bstd re-exports them.
 blaze-h1-net = { path = "crates/blaze-h1-net" }
 # A commit's files over git's smart HTTP protocol v2: pkt-lines, packs with deltas, SHA-1 object ids.
 blaze-git-fetch = { path = "crates/blaze-git-fetch" }
@@ -396,6 +418,8 @@ blaze-ty = { path = "crates/blaze-ty" }
 blaze-typeck = { path = "crates/blaze-typeck" }
 # blaze's own trait solver (docs/v2/plan/design/solve.md).
 blaze-solve = { path = "crates/blaze-solve" }
+# The flow form and its move and borrow checks (docs/v2/plan/design/flow.md, decision D61).
+blaze-flow = { path = "crates/blaze-flow" }
 # Typed SQL (docs/v2/plan/design/sql.md): the checker, and its drivers for C SQLite and Postgres.
 blaze-sql = { path = "crates/blaze-sql" }
 blaze-rel = { path = "crates/blaze-rel" }
@@ -429,12 +453,14 @@ blaze-memo = { path = "crates/blaze-memo" }
 blaze-memo-macros = { path = "crates/blaze-memo-macros" }
 blaze-reclaim = { path = "crates/blaze-reclaim" }
 blaze-mem = { path = "crates/blaze-mem" }
+blaze-malloc = { path = "crates/blaze-malloc" } # blaze's general-purpose allocator: a heap per thread, size-class spans, remote frees by queue (docs/v2/plan/design/malloc.md).
 blaze-own = { path = "crates/blaze-own" } # Vec, Box, Arc, Rc, ... with no default allocator, in place of `alloc`.
 blaze-int = { path = "crates/blaze-int" } # Integer conversions that say what they do (widen, narrow, truncate, saturate), in place of `as`.
 blaze-text = { path = "crates/blaze-text" } # Typed writers into a `Put` sink, `Show` and `Parse<'a>`, in place of `core::fmt` and `FromStr`.
 blaze-columns = { path = "crates/blaze-columns" }
 blaze-kit = { path = "crates/blaze-kit" } # Specialized collections: typed tables, inline vectors, union-find, sparse and chunked sets, heaps, a timer wheel, column codecs, static search.
 blaze-memchr = { path = "crates/blaze-memchr" } # Byte search (NEON, SSE2, SWAR), in place of memchr.
+blaze-sort = { path = "crates/blaze-sort" } # Sorting, searching and comparing, the algorithm chosen by the element type (radix keys, plain keys).
 blaze-cond = { path = "crates/blaze-cond" } # Presence conditions: hash-consed decision diagrams over a request's cfg variables.
 blaze-lex = { path = "crates/blaze-lex" } # The SIMD lexer: rustc_lexer's tokens, a body skipper, UTF-8 validation.
 blaze-bitflags = { path = "crates/blaze-bitflags" } # `bitflags!`, in place of bitflags.
@@ -444,6 +470,7 @@ blaze-base64 = { path = "crates/blaze-base64" }
 # The profile's columns, its Parquet files and its Arrow IPC frames, in place of arrow-* and
 # parquet (docs/v2/plan/third-party.md, "The profile's file").
 blaze-parquet = { path = "crates/blaze-parquet" }
+blaze-squeeze = { path = "crates/blaze-squeeze" }
 blaze-arrow-ipc = { path = "crates/blaze-arrow-ipc" }
 # `TextSize` and `TextRange`, in place of text-size.
 blaze-text-size = { path = "crates/blaze-text-size" }
@@ -591,7 +618,6 @@ cranelift-object = "=0.137.1"
 diff = "=0.1.13"
 dissimilar = "1.0.11"
 drop_bomb = "0.1.5"
-dunce = "1.0.5"
 filetime = "0.2.29"
 flate2 = { version = "1.1.10", default-features = false }
 # bstd::image's inflate (crates/blaze-std): the no-alloc core only (`inflate::core` into a buffer
@@ -628,7 +654,6 @@ rustc-demangle = "0.1.28"
 rustc-stable-hash = "0.1.2"
 rustc_hashes = { version = "0.179.0", package = "ra-ap-rustc_hashes" }
 rustc_index = { version = "0.179.0", package = "ra-ap-rustc_index", default-features = false }
-shell-escape = "=0.1.5"
 stacker = "0.1.25"
 syn = "2.0.117"
 synstructure = "0.13.2"

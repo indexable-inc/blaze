@@ -621,20 +621,20 @@ impl Endpoint {
             return Err(fail("this endpoint was made without a ClientConfig".to_owned()));
         };
         // alloc: an error's message, made only when it fails.
-        let parsed =
-            url::Url::parse(url).map_err(|why| fail(format!("`{url}` is not a URL: {why}")))?;
-        if parsed.scheme() != "https" {
+        let parsed = blaze_url::Url::parse(url).map_err(|why| fail(why.to_string()))?;
+        if parsed.scheme().as_str() != "https" {
             // alloc: an error's message, made only when it fails.
             return Err(fail(format!("`{url}` is not https, which WebTransport needs")));
         }
-        let name = match parsed.host() {
-            // alloc: the server's name, once a connection.
-            Some(url::Host::Ipv6(ip)) => ip.to_string(),
-            // alloc: as above.
-            Some(host) => host.to_string(),
+        let Some(at) = parsed.origin().map(|it| it.at()) else {
             // alloc: an error's message, made only when it fails.
-            None => return Err(fail(format!("`{url}` has no host"))),
+            return Err(fail(format!("`{url}` has no host")));
         };
+        // alloc: the server's name, once a connection: an IPv6 address without its brackets.
+        let name = at.host().strip_prefix('[').and_then(|it| it.strip_suffix(']')).unwrap_or(at.host()).to_owned();
+        // alloc: once a session, the CONNECT's `:authority`: the host, and the port when it is
+        // not https's.
+        let authority = if at.port() == 443 { at.host().to_owned() } else { at.to_string() };
         for (name, _) in headers {
             if name.starts_with(':')
                 || name.bytes().any(|it| it.is_ascii_uppercase())
@@ -647,14 +647,10 @@ impl Endpoint {
             }
         }
         // alloc: the CONNECT's fields, once a session.
-        let path = match parsed.query() {
-            Some(query) => format!("{}?{query}", parsed.path()),
-            None => parsed.path().to_owned(),
-        };
         let connect = Connect {
+            authority,
             // alloc: once a session.
-            authority: parsed.authority().to_owned(),
-            path,
+            path: parsed.target().to_owned(),
             // alloc: once a session.
             headers: headers.iter().map(|(n, v)| ((*n).to_owned(), (*v).to_owned())).collect(),
         };

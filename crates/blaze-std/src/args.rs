@@ -1,20 +1,65 @@
-//! The command line (docs/v2/plan/design/std.md, `Args`): the world's arguments, read once
-//! when it was made (handed in by the entry until `bstd::rt` reads the start block). There is
+//! The command line (docs/v2/plan/design/std.md, `Args`): the world's arguments. A native
+//! world's are views over the process's start block, where the kernel left them (std.md, "What
+//! a program pays for at start"); a run spec's or a simulated world's are owned text. There is
 //! no arguments function: a holder of `Args` reads them, no one else.
 
-use alloc::{string::String, sync::Arc};
+use alloc::{string::String, sync::Arc, vec::Vec};
+
+/// A world's command line, the program's own name first: what an [`Args`] reads.
+#[derive(Clone)] // clone: a refcount, or a `&'static`
+pub struct ArgList(Source);
+
+#[derive(Clone)]
+enum Source {
+    /// The process's own, checked UTF-8 at start ([`crate::rt::block`]).
+    Process(&'static [&'static str]),
+    Given(Arc<[String]>),
+}
+
+impl ArgList {
+    /// A command line of owned text: a run spec's, or a test's.
+    pub fn given(args: Vec<String>) -> ArgList {
+        // alloc: once per world, its command line.
+        ArgList(Source::Given(args.into()))
+    }
+
+    /// The process's own, borrowed from its start block.
+    pub(crate) fn process(block: &'static crate::rt::block::Block) -> ArgList {
+        ArgList(Source::Process(&block.args))
+    }
+
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    fn get(&self, at: usize) -> Option<&str> {
+        match &self.0 {
+            Source::Process(args) => args.get(at).copied(),
+            Source::Given(args) => args.get(at).map(String::as_str),
+        }
+    }
+
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    fn len(&self) -> usize {
+        match &self.0 {
+            Source::Process(args) => args.len(),
+            Source::Given(args) => args.len(),
+        }
+    }
+}
 
 /// The command line, the program's own name first.
 #[derive(Clone)] // clone: a refcount
 pub struct Args {
-    args: Arc<[String]>,
+    args: ArgList,
 }
 
 impl Args {
     #[blaze::nopanic]
     #[blaze::noalloc]
     #[blaze::nonblocking]
-    pub(crate) fn new(args: Arc<[String]>) -> Args {
+    pub(crate) fn new(args: ArgList) -> Args {
         Args { args }
     }
 
@@ -23,7 +68,7 @@ impl Args {
     #[blaze::noalloc]
     #[blaze::nonblocking]
     pub fn get(&self, at: usize) -> Option<&str> {
-        self.args.get(at).map(String::as_str)
+        self.args.get(at)
     }
 
     #[blaze::nopanic]
@@ -37,7 +82,7 @@ impl Args {
     #[blaze::noalloc]
     #[blaze::nonblocking]
     pub fn is_empty(&self) -> bool {
-        self.args.is_empty()
+        self.len() == 0
     }
 
     /// Each argument, in order.
@@ -45,7 +90,13 @@ impl Args {
     #[blaze::noalloc]
     #[blaze::nonblocking]
     pub fn each(&self) -> impl Iterator<Item = &str> {
-        self.args.iter().map(String::as_str)
+        (0..self.len()).filter_map(|at| self.get(at))
+    }
+}
+
+impl core::fmt::Debug for ArgList {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_list().entries((0..self.len()).filter_map(|at| self.get(at))).finish()
     }
 }
 

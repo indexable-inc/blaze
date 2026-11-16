@@ -52,6 +52,43 @@ mod scope_records;
 
 use scope_records::{Plant, bindings, write_scope};
 
+/// The tool namespaces and the `blaze::` table: sorted and unique (`classify` searches it), every
+/// name of the ledger known, and an unknown name answered with its nearest within distance 2.
+mod tool_attrs {
+    use crate::tool_attrs::{BLAZE, BlazeAttr, KNOWN, State, TOOLS, classify};
+
+    #[test]
+    fn tables_are_sorted_and_unique() {
+        assert!(TOOLS.windows(2).all(|w| w[0] < w[1]), "TOOLS sorted, no name twice");
+        assert!(TOOLS.contains(&BLAZE), "blaze is a registered tool");
+        assert!(KNOWN.windows(2).all(|w| w[0].name < w[1].name), "KNOWN sorted, no name twice");
+        assert!(KNOWN.iter().all(|k| k.state == State::Unchecked), "no stage checks a blaze attribute in this build yet");
+    }
+
+    #[test]
+    fn known_names_classify_as_known() {
+        for (i, k) in KNOWN.iter().enumerate() {
+            assert_eq!(classify(k.name), BlazeAttr::Known(i as u16), "{}", k.name);
+        }
+    }
+
+    #[test]
+    fn unknown_names_get_the_nearest_within_two() {
+        let name = |r: BlazeAttr| match r {
+            BlazeAttr::Unknown { nearest: Some(i) } => Some(KNOWN[usize::from(i)].name),
+            BlazeAttr::Unknown { nearest: None } => None,
+            BlazeAttr::Known(i) => panic!("`{}` is known", KNOWN[usize::from(i)].name),
+        };
+        assert_eq!(name(classify("noaloc")), Some("noalloc"), "one deletion");
+        assert_eq!(name(classify("nopanick")), Some("nopanic"), "one insertion");
+        assert_eq!(name(classify("lineer")), Some("linear"), "one substitution");
+        assert_eq!(name(classify("seald_")), Some("sealed"), "two edits");
+        assert_eq!(name(classify("whatever")), None, "nothing within two");
+        assert_eq!(name(classify("")), None, "the empty name is near no known name");
+        assert_eq!(name(classify("noalloc::x")), None, "a longer path is no known name");
+    }
+}
+
 /// The refinement: a key index page answers each key with its entry, in any order given.
 #[test]
 fn a_key_index_answers_each_key_in_one_probe() {
@@ -98,6 +135,7 @@ fn surface(rows: &[ScopeEntry<&str>]) -> MemSurface<'static> {
         file_attrs: crate::file_items::AttrSpan { start: 0, end: 0 },
         errors: &[],
         messages: &[],
+        file_flags: crate::file_items::ItemFlags::NONE,
     };
     surface.insert(Fact::FileItems, &items.write(Alloc::global()).expect("small")).expect("a written record");
     surface.insert_text(file(0), "fn a() {}");

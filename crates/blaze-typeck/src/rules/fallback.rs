@@ -54,6 +54,7 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
         self.check_casts()?;
         self.select()?;
         self.analyze_closures()?;
+        self.analyze_futures()?;
         self.select_all()
     }
 }

@@ -43,8 +43,12 @@ pub fn lazy_block_len<'t>(input: impl Into<Tokens<'t>>, start: usize) -> Option<
     }
     let mut depth = 0usize;
     let mut brackets = 0usize;
-    // The bracket depths at which the outer attributes being read started.
-    let mut attributes: Vec<usize> = Vec::new();
+    // The bracket depths at which the outer attributes being read started, bit `d` for depth
+    // `d`: a stack, as each starts deeper than the one open around it (each entry is below
+    // `brackets`, and a `]` lowers `brackets` by one, so it meets the top entry before any
+    // other), held in a word so a warm outline allocates nothing. An attribute opened 64 or
+    // more brackets deep makes the body one to parse in full (`None`).
+    let mut attributes: u64 = 0;
     let mut after_attribute = false;
     let mut at = start;
     loop {
@@ -70,12 +74,16 @@ pub fn lazy_block_len<'t>(input: impl Into<Tokens<'t>>, start: usize) -> Option<
             T!['['] => brackets += 1,
             T![']'] => {
                 brackets = brackets.saturating_sub(1);
-                if attributes.last() == Some(&brackets) {
-                    attributes.pop();
+                let top = if brackets < 64 { 1u64 << brackets } else { 0 };
+                if attributes & top != 0 {
+                    attributes &= !top;
                     after_attribute = true;
                 }
             }
-            T![#] if next == T!['['] => attributes.push(brackets),
+            T![#] if next == T!['['] => match brackets {
+                0..64 => attributes |= 1 << brackets,
+                _ => return None,
+            },
             T![#] | T![<] if matches!(next, T!['{'] | T!['}']) => return None,
             OUTER_DOC_COMMENT => after_attribute = true,
             IDENT if input.contextual_kind(at) == T![builtin] && next == T![#] => return None,
@@ -135,9 +143,27 @@ mod tests {
         }
     }
 
-    /// Skipping the tokens no arm watches changes nothing: random token sequences heavy in
-    /// braces, brackets, attributes, doc comments, `<`, `builtin #` and tokens of no interest,
-    /// from every start.
+    /// An attribute opened 64 brackets deep is past the word that holds the attribute stack:
+    /// the body is one to parse in full; one bracket shallower it is still left unparsed.
+    #[test]
+    fn an_attribute_past_the_stack_word_parses_the_body() {
+        for (deep, expect_lazy) in [(63, true), (64, false)] {
+            let mut input = Input::with_capacity(2 * deep + 8);
+            input.push(T!['{'], Edition::CURRENT);
+            (0..deep).for_each(|_| input.push(T!['['], Edition::CURRENT));
+            input.push(T![#], Edition::CURRENT);
+            input.push(T!['['], Edition::CURRENT);
+            input.push(T![']'], Edition::CURRENT);
+            (0..deep).for_each(|_| input.push(T![']'], Edition::CURRENT));
+            input.push(T!['}'], Edition::CURRENT);
+            assert_eq!(lazy_block_len(&input, 0).is_some(), expect_lazy, "{deep} deep");
+            assert!(reference(&input, 0).is_some(), "the reference keeps a stack of any depth");
+        }
+    }
+
+    /// Skipping the tokens no arm watches, and holding the attribute stack in a word, changes
+    /// nothing: random token sequences heavy in braces, brackets, attributes, doc comments, `<`,
+    /// `builtin #` and tokens of no interest, from every start.
     #[test]
     fn skipping_unwatched_tokens_keeps_every_answer() {
         let mut rng = SplitMix64::new(17);

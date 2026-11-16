@@ -8,7 +8,6 @@ use std::ffi::OsString;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use annotate_snippets::{Level, Renderer};
 use blaze_hash::{HashMap, HashSet};
 use blaze_ids::radix;
 use blaze_toml::{Document, Item, Kind, Limits};
@@ -277,6 +276,7 @@ pub struct Config<F: Files> {
     cwd: PathBuf,
     home: PathBuf,
     env: BTreeMap<String, String>,
+    user: UserRecord,
     cli: Vec<String>,
     /// The files are read at the first value asked for, and again at the next while they fail:
     /// a broken config file is an error only to what reads configuration, as in cargo.
@@ -376,14 +376,15 @@ impl CliUnstable {
 
 impl Config<Disk> {
     /// The configuration seen from `cwd` on the machine's disk with the variables of `env` and
-    /// the `--config` arguments `cli`, as `cargo` started there would. `--config` reads the
-    /// files at once.
+    /// the `--config` arguments `cli`, as `cargo` started there would: the driver's adapter
+    /// over [`Config::load_with`], which reads the disk and the system's record of the user.
+    /// `--config` reads the files at once.
     pub fn load(
         cwd: &Path,
         env: impl IntoIterator<Item = (String, String)>,
         cli: &[String],
     ) -> Result<Config<Disk>, ConfigError> {
-        let mut config = Config::load_with(cwd, env, Disk)?;
+        let mut config = Config::load_with(cwd, env, UserRecord::of_process(), Disk)?;
         config.merge_cli_args(cli)?;
         Ok(config)
     }
@@ -397,21 +398,25 @@ impl Config<Disk> {
 }
 
 impl<F: Files> Config<F> {
-    /// The configuration seen from `cwd` with the variables of `env`, every file of it
-    /// (`.cargo/config.toml` up from `cwd`, `$CARGO_HOME/config.toml`, `include`s, a `--config`
-    /// file) read through `files` when a value is first asked for.
+    /// The configuration seen from `cwd` with the variables of `env` and the user's home as the
+    /// system records it (`user`, asked only when `env` names neither `CARGO_HOME` nor a home),
+    /// every file of it (`.cargo/config.toml` up from `cwd`, `$CARGO_HOME/config.toml`,
+    /// `include`s, a `--config` file) read through `files` when a value is first asked for.
+    /// Nothing of the process is read: every input is passed, so all of them can enter a key.
     pub fn load_with(
         cwd: &Path,
         env: impl IntoIterator<Item = (String, String)>,
+        user: UserRecord,
         files: F,
     ) -> Result<Config<F>, ConfigError> {
         let env: BTreeMap<String, String> = env.into_iter().collect();
-        let home = cargo_home(cwd, &env)?;
+        let home = cargo_home(cwd, &env, &user)?;
         Ok(Config {
             files,
             cwd: cwd.to_path_buf(),
             home,
             env,
+            user,
             cli: Vec::new(),
             values: Default::default(),
             credentials: Default::default(),
@@ -487,7 +492,7 @@ impl<F: Files> Config<F> {
     where
         F: Clone,
     {
-        let mut copy = Config::load_with(&self.cwd, self.env.clone(), self.files.clone())?;
+        let mut copy = Config::load_with(&self.cwd, self.env.clone(), self.user.clone(), self.files.clone())?;
         copy.merge_cli_args(&self.cli)?;
         copy.unstable = self.unstable.clone();
         _ = copy.values();
@@ -506,6 +511,11 @@ impl<F: Files> Config<F> {
 
     pub fn env(&self, key: &str) -> Option<&str> {
         self.env.get(key).map(String::as_str)
+    }
+
+    /// The user's home as the system records it, as it was passed in.
+    pub fn user(&self) -> &UserRecord {
+        &self.user
     }
 
     fn load_values(&self) -> Result<HashMap<String, ConfigValue, Global>, ConfigError> {
@@ -1346,9 +1356,11 @@ impl<F: Files> Config<F> {
                     let help = format!(
                         "if you need to support cargo 1.38 or earlier, you can symlink `{name}` to `{name}.toml`"
                     );
-                    let report =
-                        Level::WARNING.secondary_title(title).element(Level::HELP.message(help));
-                    let rendered = Renderer::plain().render(&[report]);
+                    let rendered = crate::snippet::with_notes(
+                        crate::snippet::Level::Warning,
+                        &title,
+                        &[(crate::snippet::Level::Help, &help)],
+                    );
                     self.warn(rendered.strip_prefix("warning: ").unwrap_or(&rendered).to_owned());
                 }
             }
@@ -1385,15 +1397,28 @@ fn cli_dotted_keys(arg: &str) -> Result<Document<'_, Global>, ConfigError> {
     Ok(doc)
 }
 
+/// The home directory the operating system records for the user ([`blaze_core::home::record`]):
+/// the one input of a configuration that is no variable, read by the driver and passed in so
+/// it can enter a key. `Err` says why the system has none.
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: a path, copied when a configuration is read again
+pub struct UserRecord(pub Result<PathBuf, blaze_core::home::NoRecord>);
+
+impl UserRecord {
+    /// The record of the user this process runs as: for a driver, at its top.
+    pub fn of_process() -> UserRecord {
+        UserRecord(blaze_core::home::record())
+    }
+}
+
 /// `$CARGO_HOME` relative to `cwd`, or `.cargo` in the home directory, as the `home` crate
 /// cargo uses finds it.
-fn cargo_home(cwd: &Path, env: &BTreeMap<String, String>) -> Result<PathBuf, ConfigError> {
+fn cargo_home(cwd: &Path, env: &BTreeMap<String, String>, user: &UserRecord) -> Result<PathBuf, ConfigError> {
     match env.get("CARGO_HOME").filter(|h| !h.is_empty()) {
         Some(home) => Ok(cwd.join(home)),
         None => {
-            // The home of the user whose environment `env` is ([`blaze_core::home`], the one
-            // answer): its `HOME`, else the system's record of the user.
-            let dir = blaze_core::home::user_in(|name| env.get(name).map(std::ffi::OsString::from))
+            // The home of the user whose environment `env` is ([`blaze_core::home::decide`],
+            // the one answer): its `HOME`, else the system's record of the user as passed.
+            let dir = blaze_core::home::decide(|name| env.get(name).map(std::ffi::OsString::from), || user.0.clone())
                 .map_err(|why| ConfigError::new(ConfigWhat::NoCargoHome { why }))?;
             Ok(dir.join(".cargo"))
         }

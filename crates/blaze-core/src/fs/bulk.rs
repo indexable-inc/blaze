@@ -20,13 +20,14 @@
 
 use std::{io, path::Path};
 
-use crate::{FileName, Stamp};
+use crate::{DirName, FileName, Meta, Stamp};
 
 /// What is asked of every entry (`ATTR_CMN_RETURNED_ATTRS` and `ATTR_CMN_NAME` the call
 /// requires; `ATTR_CMN_ERROR` so one entry's failure is its own).
 const COMMON: u32 = libc::ATTR_CMN_RETURNED_ATTRS
     | libc::ATTR_CMN_NAME
     | ATTR_CMN_ERROR
+    | libc::ATTR_CMN_DEVID
     | libc::ATTR_CMN_OBJTYPE
     | libc::ATTR_CMN_MODTIME
     | libc::ATTR_CMN_CHGTIME
@@ -92,8 +93,9 @@ impl<'a> Fields<'a> {
     }
 }
 
-/// One entry as the call packed it: its name, and its stamp or the attribute it lacks.
-fn entry(entry: &[u8]) -> Option<(&[u8], Result<Stamp, &'static str>)> {
+/// One entry as the call packed it: its name, its stamp or the attribute it lacks, and its
+/// device (`ATTR_CMN_DEVID`, the `st_dev` a `stat` gives) where the call returned one.
+fn entry(entry: &[u8]) -> Option<(&[u8], Result<Stamp, &'static str>, Option<u64>)> {
     let mut fields = Fields { entry, at: 4 };
     // `attribute_set_t`: the common, volume, directory, file and fork groups returned.
     let common = fields.u32()?;
@@ -108,7 +110,9 @@ fn entry(entry: &[u8]) -> Option<(&[u8], Result<Stamp, &'static str>)> {
         return None;
     }
     let name = fields.name()?;
-    // The rest in the order of their bits, each there only when returned.
+    // The rest in the order of their bits, each there only when returned. `dev_t` is an
+    // `i32`, widened as std's `MetadataExt::dev` widens `st_dev`.
+    let dev = if has(libc::ATTR_CMN_DEVID) { Some(fields.u32()? as i32 as u64) } else { None };
     let vtype = if has(libc::ATTR_CMN_OBJTYPE) { Some(fields.u32()?) } else { None };
     let modified = if has(libc::ATTR_CMN_MODTIME) { Some(fields.time_ns()?) } else { None };
     let changed = if has(libc::ATTR_CMN_CHGTIME) { Some(fields.time_ns()?) } else { None };
@@ -123,7 +127,7 @@ fn entry(entry: &[u8]) -> Option<(&[u8], Result<Stamp, &'static str>)> {
             libc::ENOENT | libc::ENOTDIR => Stamp::GONE,
             _ => Stamp::UNKNOWN,
         };
-        return Some((name, Ok(stamp)));
+        return Some((name, Ok(stamp), dev));
     }
     let stamp: Result<Stamp, &'static str> = (|| {
         let vtype = vtype.ok_or("ATTR_CMN_OBJTYPE")?;
@@ -140,20 +144,54 @@ fn entry(entry: &[u8]) -> Option<(&[u8], Result<Stamp, &'static str>)> {
             mode: kind | (access.ok_or("ATTR_CMN_ACCESSMASK")? & 0o7777),
         })
     })();
-    Some((name, stamp))
+    Some((name, stamp, dev))
 }
 
 /// What is directly in `dir` (named `name` under the root), each with its stamp, sorted by
 /// name; symbolic links are stamped themselves. As the other Unixes' `entries`, in one
 /// `getattrlistbulk` per [`BUFFER`] of entries.
-pub(crate) fn entries(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, Stamp)>> {
+pub(crate) fn entries(dir: &Path, name: &DirName) -> io::Result<crate::Listing> {
+    use std::os::unix::ffi::OsStrExt as _;
+    // clone: the listing's directory, a refcount.
+    let mut found = crate::ListingBuilder::new(name.clone());
+    each(dir, |leaf, stamp, _| Ok(found.push(leaf.as_bytes(), stamp)?))?;
+    Ok(found.finish()?)
+}
+
+/// What is directly in `dir` (named `parent`), each with its [`Meta`] from the same
+/// `getattrlistbulk` that listed it (the device included), appended to `out` unsorted: the
+/// step of [`super::list`]'s walk. An entry gone between the listing and its attributes is
+/// left out; one the system would say nothing of fails the listing, naming it.
+pub(crate) fn listed(dir: &Path, parent: &DirName, out: &mut Vec<(FileName, Meta)>) -> io::Result<()> {
+    each(dir, |leaf, stamp, dev| {
+        if stamp.is_gone() {
+            return Ok(());
+        }
+        let refused = |why: &str| {
+            // alloc: an error path.
+            io::Error::other(format!("{}: getattrlistbulk: {why}", dir.join(leaf).display()))
+        };
+        if stamp.is_unknown() {
+            return Err(refused("the system would say nothing of it"));
+        }
+        let dev = dev.ok_or_else(|| refused("no ATTR_CMN_DEVID returned"))?;
+        // alloc: the name, the listing's payload.
+        out.push((super::name_under(parent, leaf, || dir.join(leaf))?, Meta::of(&stamp, dev)));
+        Ok(())
+    })
+}
+
+/// Each entry of `dir`, in the order the system packs them, handed to `put` with its stamp
+/// and device: one `getattrlistbulk` per [`BUFFER`] of entries.
+fn each(
+    dir: &Path,
+    mut put: impl FnMut(&std::ffi::OsStr, Stamp, Option<u64>) -> io::Result<()>,
+) -> io::Result<()> {
     use std::os::{fd::AsFd as _, unix::ffi::OsStrExt as _};
     // alloc: an error path.
     let failed =
         |why: &str| io::Error::other(format!("{}: getattrlistbulk: {why}", dir.display()));
     let fd = super::open_dir(dir)?;
-    // alloc: the listing's payload.
-    let mut found = Vec::new();
     // alloc: the listing's one buffer, freed with it.
     let mut buffer = vec![0_u8; BUFFER];
     loop {
@@ -175,7 +213,7 @@ pub(crate) fn entries(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, 
                 return Err(failed("an entry that is longer than what the call filled"));
             };
             rest = after;
-            let Some((leaf, stamp)) = entry(one) else {
+            let Some((leaf, stamp, dev)) = entry(one) else {
                 return Err(failed("an entry with no name, or cut short of its attributes"));
             };
             let leaf = std::ffi::OsStr::from_bytes(leaf);
@@ -187,13 +225,10 @@ pub(crate) fn entries(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, 
                     leaf.display()
                 ))
             })?;
-            // alloc: the name, the listing's payload.
-            let file = super::child_name(name, leaf, || dir.join(leaf))?;
-            found.push((file, stamp));
+            put(leaf, stamp, dev)?;
         }
     }
-    found.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    Ok(found)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -263,20 +298,102 @@ mod tests {
             std::fs::write(dir.join(long), b"").unwrap();
         }
         let name = FileName::new("listed").unwrap();
-        let bulk = entries(&dir, &name).unwrap();
+        let bulk = entries(&dir, &name.clone().into()).unwrap();
         let stat = by_stat(&dir, &name);
         assert_eq!(bulk.len(), stat.len(), "the listings name different numbers of entries");
-        for (bulk, stat) in bulk.iter().zip(&stat) {
-            assert_eq!(bulk, stat, "getattrlistbulk and lstat disagree on {}", stat.0);
+        for (at, stat) in stat.iter().enumerate() {
+            assert_eq!(
+                (bulk.file(at), bulk.stamp(at)),
+                stat.clone(),
+                "getattrlistbulk and lstat disagree on {}",
+                stat.0
+            );
         }
-        let of = |leaf: &str| {
-            let file = FileName::new(&format!("listed/{leaf}")).unwrap();
-            bulk.iter().find(|it| it.0 == file).unwrap().1
-        };
+        let of = |leaf: &str| bulk.stamp(bulk.find(leaf).unwrap());
         assert!(of("small.rs").is_file() && of("small.rs").size == 9);
         assert!(of("some").is_dir() && of("link").is_link() && of("dangling").is_link());
 
+        // The walk of `Effect::List`, a bulk call per directory, says of each name what an
+        // `lstat` says, the device the bulk call returns included, through the nested files.
+        let listed = super::super::list(&dir, &DirName::Named(name.clone())).unwrap();
+        let mut walked = stat.clone();
+        walked.extend(by_stat(&dir.join("some"), &FileName::new("listed/some").unwrap()));
+        walked.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(listed.len(), walked.len(), "the walk names different numbers of entries");
+        for ((file, meta), (want, stamp)) in listed.iter().zip(&walked) {
+            assert_eq!(file, want);
+            let lstat = std::fs::symlink_metadata(dir.join(&file.as_str()["listed/".len()..])).unwrap();
+            assert_eq!(*meta, Meta::of(stamp, lstat.dev()), "the walk and lstat disagree on {file}");
+            assert_ne!(meta.dev, 0, "no device for {file}");
+        }
+
         // A directory that is not there fails, as the listing by `readdir` did.
-        assert!(entries(&root.join("missing"), &name).is_err());
+        assert!(entries(&root.join("missing"), &name.into()).is_err());
+    }
+
+    /// The cost of one listing of 1,000 and of 10,000 entries: the floor (one `getattrlistbulk`
+    /// pass, nothing kept), the columns ([`entries`]), and the pairs it replaced (a `FileName`
+    /// made per entry and the pairs sorted), each the best of 20 rounds, and the allocations of
+    /// one. Run by hand, in release: `lanecheck.sh blaze-core test "--release --lib -- listing_cost --ignored --nocapture"`.
+    #[test]
+    #[ignore = "a measurement, run by hand"]
+    fn listing_cost() {
+        let pairs = |dir: &Path, name: &FileName| -> Vec<(FileName, Stamp)> {
+            let mut found = Vec::new();
+            each(dir, |leaf, stamp, _| {
+                found.push((super::super::child_name(name, leaf, || dir.join(leaf))?, stamp));
+                Ok(())
+            })
+            .unwrap();
+            found.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            found
+        };
+        let best = |f: &mut dyn FnMut()| {
+            (0..20)
+                .map(|_| {
+                    let start = std::time::Instant::now();
+                    f();
+                    start.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        let root = crate::temp::TempDir::for_test("blaze-fs-bulk-cost-");
+        for n in [1_000, 10_000] {
+            let dir = root.join(format!("d{n}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            // Created in an order that is not the sorted one.
+            for at in 0..n {
+                std::fs::write(dir.join(format!("{:05}-file.rs", (at * 7919) % n)), b"").unwrap();
+            }
+            let name = FileName::new(&format!("d{n}")).unwrap();
+            let listed: DirName = name.clone().into();
+            // Interleaved, so the three see one state of the caches and the clock.
+            let most = std::time::Duration::MAX;
+            let (mut floor, mut columns, mut old) = (most, most, most);
+            for _ in 0..5 {
+                floor = floor.min(best(&mut || each(&dir, |_, _, _| Ok(())).unwrap()));
+                columns = columns.min(best(&mut || drop(entries(&dir, &listed).unwrap())));
+                old = old.min(best(&mut || drop(pairs(&dir, &name))));
+            }
+            let ((), floor_used) = blaze_alloc_count::measure(|| each(&dir, |_, _, _| Ok(())).unwrap());
+            let (listing, columns_used) = blaze_alloc_count::measure(|| entries(&dir, &listed).unwrap());
+            let (old_pairs, old_used) = blaze_alloc_count::measure(|| pairs(&dir, &name));
+            assert_eq!(listing.len(), old_pairs.len());
+            for (at, (file, stamp)) in old_pairs.iter().enumerate() {
+                assert_eq!((&listing.file(at), listing.stamp(at)), (file, *stamp));
+            }
+            println!(
+                "listing of {n}: floor {floor:?} ({} allocations, {} bytes); columns {columns:?} ({} allocations, {} bytes, {} held); pairs {old:?} ({} allocations, {} bytes); counting allocator: {}",
+                floor_used.allocations,
+                floor_used.bytes,
+                columns_used.allocations,
+                columns_used.bytes,
+                listing.heap_bytes(),
+                old_used.allocations,
+                old_used.bytes,
+                blaze_alloc_count::installed(),
+            );
+        }
     }
 }

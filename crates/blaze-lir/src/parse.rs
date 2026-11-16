@@ -540,7 +540,7 @@ fn table(keyword: &str, line: &mut Line<'_, '_>, func: &mut Func<Global>) -> Res
             })?;
             let place = match kind {
                 RefKind::Data => line.id("d", "a data row")?,
-                RefKind::Func | RefKind::Static | RefKind::Tls => line.number("a place")?,
+                RefKind::Func | RefKind::Static | RefKind::Tls | RefKind::Vtable => line.number("a place")?,
             };
             func.refs.push(RefRec { place, kind: kind as u32 });
         }

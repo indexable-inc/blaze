@@ -1,6 +1,6 @@
 //! A tree of files as one object: its **listing**, the canonical encoding a git source's
-//! digest is over ([`crate::Source::Git`]) and a fetch graph's steps will hand on
-//! ([`crate::graph::Tree`]). Nix's NAR serialises a tree for its recursive hashes the same
+//! digest is over (blaze-audit's pins). The fetch's record ([`crate::pack`]) holds its paths to
+//! the same rules, through [`fold`]. Nix's NAR serialises a tree for its recursive hashes the same
 //! way in spirit (names sorted, the executable bit and symlinks kept, nothing else); this one
 //! is text, and lists each file by its BLAKE3 instead of inlining it, so each file is an object
 //! of its own in the store and two trees share the files they share.
@@ -13,7 +13,7 @@
 //! ```
 //!
 //! `length` is the file's length in decimal, with no leading zero: with it a lookup knows
-//! which files are kept as chunks ([`crate::store::CHUNK_LEN`]) without reading any file.
+//! how large each file is without reading any file.
 //!
 //! `kind` is `file`, `exec` (a file with any executable bit) or `link` (a symlink, its bytes
 //! where it points). A path is `/`-separated UTF-8 with no empty, `.`, `..` or `.git` part and
@@ -28,7 +28,7 @@ use std::fmt::{self, Write as _};
 use crate::digest::Blake3;
 
 /// The listing format's name and version, its first line. Every index record's key covers it
-/// ([`crate::Origin::key`]): a step's output under a new format is a new record, never a
+/// (a pin names the format it was made in): a step's output under a new format is a new record, never a
 /// second value under the old one's key.
 pub(crate) const HEADER: &str = "blaze tree 2\n";
 

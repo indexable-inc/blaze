@@ -250,17 +250,10 @@ unsafe fn symbol<F: Copy>(
     Ok(unsafe { std::mem::transmute_copy::<*mut c_void, F>(&found) })
 }
 
-// libdispatch, in libSystem.
-// SAFETY: these signatures match dispatch/queue.h and dispatch/object.h.
-unsafe extern "C" {
-    fn dispatch_queue_create(label: *const c_char, attributes: *const c_void) -> DispatchQueue;
-    fn dispatch_sync_f(
-        queue: DispatchQueue,
-        context: *mut c_void,
-        work: extern "C" fn(*mut c_void),
-    );
-    fn dispatch_release(object: *mut c_void);
-}
+// libdispatch, in libSystem: through blaze-sys's table of calls found at first use, so a
+// program that never watches binds none of them at load. The signatures (dispatch/queue.h and
+// dispatch/object.h) are the table's.
+use blaze_sys::macos::cold::{dispatch_queue_create, dispatch_release, dispatch_sync_f};
 
 /// Where a watch's completions go, from its queue's thread.
 pub(crate) trait Tell: Send + Sync + 'static {

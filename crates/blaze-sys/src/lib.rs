@@ -21,6 +21,8 @@
 
 #![cfg_attr(not(test), no_std)]
 #![feature(register_tool, custom_inner_attributes)]
+// `openat` and `ioctl` of macOS's table of calls found at first use are defined here (variadic).
+#![cfg_attr(target_os = "macos", feature(c_variadic))]
 #![register_tool(blaze)]
 #![blaze::trust(
     unsafe,
@@ -37,7 +39,7 @@ mod flags;
 mod types;
 
 pub use errno::Errno;
-pub use types::{Fd, Path, Timespec};
+pub use types::{Fd, Path, Timespec, WindowSize};
 
 #[cfg(all(target_os = "linux", any(target_arch = "aarch64", target_arch = "x86_64")))]
 pub mod linux;

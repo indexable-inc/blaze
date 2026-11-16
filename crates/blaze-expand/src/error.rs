@@ -20,8 +20,6 @@ pub enum Table {
     Contexts,
     Notes,
     Reads,
-    /// The position code a token is given on its way through mbe (twice its index).
-    Positions,
 }
 
 /// Which stream of a call an error is about.
@@ -98,8 +96,6 @@ pub enum ExpandError {
     Host(HostError),
     /// The call's kind is not one the macro can be called as (a derive called fn-like).
     WrongCallKind { def: CallShape, call: CallShape },
-    /// A span came back from mbe or a derive that this crate did not give it.
-    ForeignSpan { role: u32 },
     /// An origin names a token its stream does not have.
     ForeignOrigin { origin: TokenOrigin },
     /// A stream's delimiters do not pair up: its token `token` closes nothing or is left open.
@@ -112,6 +108,26 @@ pub enum ExpandError {
     EagerAnswers { wanted: u32, given: u32 },
     /// A proc macro gave a number of origins that is not its number of tokens.
     ProcMacroOutput { tokens: u32, origins: u32 },
+    /// A proc macro gave an origin (of a token or a diagnostic) naming a token it was not
+    /// given: past its input or its attribute's arguments, or the definition's (`Def`,
+    /// `Params`), which a proc macro has none of.
+    ProcMacroOrigin { origin: TokenOrigin },
+    /// A proc macro's diagnostic has a text that is not a whole `str` of the text it gave
+    /// (`len` bytes long).
+    ProcMacroText { text: crate::tokens::Text, len: u32 },
+    /// A `macro_rules!` definition (`call: None`, while it was compiled) or a call of it went
+    /// past the engine's bound on steps or nesting.
+    RulesBound { bound: RulesLimit, def: crate::def::MacroContent, call: Option<crate::key::CallKey> },
+}
+
+/// The bounds of the `macro_rules!` engine: each makes a runaway definition or call a refusal
+/// that names it, never a hang or an overflowed stack.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RulesLimit {
+    /// Steps of matching and transcription in one call.
+    Steps,
+    /// Nested groups and repetitions, of the definition or the matcher's or transcriber's stack.
+    Depth,
 }
 
 impl From<HostError> for ExpandError {
@@ -145,12 +161,6 @@ impl fmt::Display for ExpandError {
             ExpandError::WrongCallKind { def, call } => {
                 write!(f, "a {def:?} macro was called as a {call:?} macro")
             }
-            ExpandError::ForeignSpan { role } => {
-                write!(
-                    f,
-                    "a span of role {role} came back from mbe or a derive: no stream of the call has it"
-                )
-            }
             ExpandError::ForeignOrigin { origin } => {
                 write!(f, "the origin {origin:?} names no token of its stream")
             }
@@ -168,6 +178,29 @@ impl fmt::Display for ExpandError {
                 f,
                 "a proc macro gave {tokens} tokens and {origins} origins: one origin per token"
             ),
+            ExpandError::ProcMacroOrigin { origin } => {
+                write!(f, "a proc macro gave the origin {origin:?}, which names no token it was given")
+            }
+            ExpandError::ProcMacroText { text, len } => write!(
+                f,
+                "a proc macro's diagnostic has the text {}..{} of {len} bytes, not a whole `str` of them",
+                text.at,
+                u64::from(text.at) + u64::from(text.len)
+            ),
+            ExpandError::RulesBound { bound, def, call } => {
+                let what = match bound {
+                    RulesLimit::Steps => "its bound on steps",
+                    RulesLimit::Depth => "its bound on nesting",
+                };
+                match call {
+                    Some(call) => write!(
+                        f,
+                        "the call {:?} of the macro {:?} went past {what} (rule 18)",
+                        call.0, def.0
+                    ),
+                    None => write!(f, "the macro {:?} went past {what} while compiled (rule 18)", def.0),
+                }
+            }
         }
     }
 }

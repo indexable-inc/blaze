@@ -26,11 +26,18 @@ blaze-format.workspace = true
 blaze-hash.workspace = true
 # `map::ContentMap`: values stored once, by content.
 blaze-hashcons.workspace = true
-# The sans-IO cores only: its `tokio` feature (the drivers) stays off.
-blaze-http.workspace = true
-# A request's method, as blaze-http's h1 request writer takes it (`requests::Http::over`).
-http.workspace = true
+# The sans-IO cores only: its `tokio` feature (the drivers) stays off. Behind `net`.
+blaze-http = { workspace = true, optional = true }
+# HTTP/1.1's request writer and response parser (`requests::Http::over`). Behind `net`.
+blaze-h1 = { workspace = true, optional = true }
+# `url` and `net::HostPort`: checked addresses, their one home.
+blaze-url.workspace = true
 blaze-ids.workspace = true
+# The run spec (`spec`): a strict data model, and JSON with sorted keys.
+blaze-data.workspace = true
+blaze-json.workspace = true
+# The hosted wire's escape (`guest::codec`): deterministic CBOR, the tree's strict format.
+blaze-cbor.workspace = true
 # `sync`'s new primitives and `par`: Vec, VecDeque, Box, Arc with an allocator always named.
 blaze-own.workspace = true
 # `out::Held` is a `blaze_text::Put`: `Out::line_with` takes a chain of typed writers.
@@ -45,6 +52,11 @@ blaze-spin.workspace = true
 blaze-deflate = { workspace = true, optional = true }
 
 # bstd::video's VideoToolbox provider (src/video/videotoolbox.rs).
+# The runtime's own system calls (a stream's terminal facts; on macOS the topology and QoS,
+# through the table of calls found at first use).
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+blaze-sys.workspace = true
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-core-foundation = { workspace = true, optional = true }
 objc2-core-media = { workspace = true, optional = true }
@@ -58,6 +70,11 @@ objc2-video-toolbox = { workspace = true, optional = true }
 # names it in its own manifest.
 [features]
 default = []
+# `bstd::requests` (`Http`), `bstd::quic` and `bstd::http`: requests and QUIC on blaze-http,
+# which brings rustls, ring, quinn-proto and the rest. A program that makes requests turns it
+# on; one that only reads files and prints (blaze-cli) builds none of it. `net::Net` itself is
+# blaze-core's effects and needs no feature.
+net = ["dep:blaze-http", "blaze-http/h3", "dep:blaze-h1"]
 # `bstd::image`: PNG decode and encode, and its zlib.
 image = ["dep:blaze-deflate"]
 # `bstd::video`: the MP4 muxer, and the HEVC encoder on VideoToolbox on macOS, which links

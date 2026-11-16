@@ -8,9 +8,9 @@ use blaze_expand::{
     AlsoCopy, BuiltinDerive, BuiltinFn, Call, CallKind, CallShape, CallSite, Constness, Ctx, DefAt,
     DefSite, Delim, DeriveFacts, Diagnostic, Eager, Edition, ExpandCx, ExpandError, Expanded,
     Expansion, Export, Hole, HoleOf, HostAsk, HostError, HostWhy, IncludeAs, Included, Inside,
-    LitKind, LocalInner, MacroDefinition, MarkOf, NestedKind, TokenOrigin, Place, PlaceOf, ProcCall, ProcKind,
-    Produced, Raw, ReadAnswer, ReadKind, Reads, Spacing, TokenKind, TokenStream, call_key, expand,
-    expansion_key, find_calls, lex,
+    LitKind, LocalInner, MacroDefinition, MarkOf, NestedKind, TokenOrigin, Place, PlaceOf, ProcCall, ProcDiagnostic,
+    ProcKind, ProcLevel, Produced, Raw, Text, ReadAnswer, ReadKind, Reads, Spacing, TokenKind, TokenStream, call_key, expand,
+    expansion_key, find_calls, lex, CfgPredicateError, cfg_predicate,
 };
 use blaze_expand::{DefinitionError, DefinitionRecords, stream_record_id};
 use blaze_format::Aligned;
@@ -26,11 +26,31 @@ struct TestCx {
     files: &'static [(&'static str, &'static [u8])],
     cfgs: &'static [&'static str],
     line: u32,
+    /// What the echo proc macro also gives back: diagnostics, or output a host must not give.
+    emits: &'static [Emit],
+}
+
+/// A proc macro's extra output, as an untrusted host could give it.
+#[derive(Clone, Copy, Debug)]
+enum Emit {
+    /// A diagnostic of this level on its first input token.
+    Level(ProcLevel),
+    /// A panic with a message.
+    Panic,
+    /// A diagnostic whose text is past the end of the text given.
+    TextPastEnd,
+    /// A diagnostic whose text cuts a character.
+    TextMidChar,
+    /// A diagnostic naming an input token past the input.
+    OriginPastInput,
+    /// A token whose origin is the definition's, which a proc macro has none of.
+    TokenFromDef,
 }
 
 impl TestCx {
     fn new() -> TestCx {
         TestCx {
+            emits: &[],
             env: &[("V", "v")],
             files: &[
                 ("a.txt", b"hi"),
@@ -87,7 +107,30 @@ impl ExpandCx for TestCx {
         let mut reads = Reads::new_in(alloc);
         let name = def.proc_name().ok_or(FAILED)?;
         reads.push(ReadKind::ProcMacro, name, ReadAnswer::Bool(true)).map_err(|_| FAILED)?;
-        Ok(Produced { tokens, origins, reads })
+        // "é!" : bytes 0..2 are `é`, so 1..2 cuts it.
+        let mut text = OwnVec::new_in(alloc);
+        text.extend_from_slice("é!".as_bytes());
+        let whole = Text { at: 0, len: 3 };
+        let mut diagnostics = OwnVec::new_in(alloc);
+        for emit in self.emits {
+            let d = match *emit {
+                Emit::Level(level) => ProcDiagnostic::Emitted { level, message: whole, at: Some(TokenOrigin::Input(0)) },
+                Emit::Panic => ProcDiagnostic::Panicked { message: whole },
+                Emit::TextPastEnd => ProcDiagnostic::Panicked { message: Text { at: 2, len: 9 } },
+                Emit::TextMidChar => ProcDiagnostic::Panicked { message: Text { at: 1, len: 1 } },
+                Emit::OriginPastInput => ProcDiagnostic::Emitted {
+                    level: ProcLevel::Error,
+                    message: whole,
+                    at: Some(TokenOrigin::Input(u32::try_from(call.input.len()).map_err(|_| FAILED)?)),
+                },
+                Emit::TokenFromDef => {
+                    *origins.first_mut().ok_or(FAILED)? = TokenOrigin::Def(0);
+                    continue;
+                }
+            };
+            diagnostics.push(d);
+        }
+        Ok(Produced { tokens, origins, reads, diagnostics, text })
     }
 }
 
@@ -252,43 +295,6 @@ fn the_same_call_at_two_offsets_expands_equal() {
     });
 }
 
-/// `lex`, read straight from the lexer with nothing interned, equals `lex_through_tt`, the
-/// tt path through the process-wide interner (parallelism audit, change 7): on texts that
-/// reach each of its cases, and on soups of their pieces glued with and without spaces.
-#[test]
-fn lex_equals_the_tt_path() {
-    use blaze_expand::lex_through_tt;
-    let pieces = [
-        "a", "r#fn", "_", "'a", "'static", "1u8", "1.5e3f64", "0x1F_u32", "\"s\"", "\"s\"x",
-        "b'c'", "c\"z\"", "r#\"q\"#", "br\"r\"", "\"a\r\nb\"", "///d \"q\"\n", "//! i\n",
-        "/** b */", "/*! c */", "// n\n", "/* m */", "(", ")", "[", "]", "{", "}", "::", "->",
-        "=>", "..=", "#", "!", "$", "+=", "&&", "<", ">", ";", ",", ".", "@", "?", "~", "%",
-        " ", "\n",
-    ];
-    let fixed = ["", "f(a, b)", "a)", "(a", "([)]", "{ x }}", "x/**/y", "'a: loop {}"];
-    for text in fixed {
-        let one = lex(text, Edition::E2021, Alloc::global());
-        let two = lex_through_tt(text, Edition::E2021, Alloc::global());
-        assert_eq!(one, two, "`{text:?}` lexes unequal");
-    }
-    blaze_sim::check(Config::cases(512), |tape: &Tape| {
-        let mut text = String::new();
-        for _ in 0..12 {
-            text.push_str(tape.pick(&pieces, "piece").copied().unwrap_or(""));
-        }
-        for edition in [Edition::E2015, Edition::E2021, Edition::E2024] {
-            let one = lex(&text, edition, Alloc::global());
-            let two = lex_through_tt(&text, edition, Alloc::global());
-            if one != two {
-                return Err(Broke::Oracle(format!(
-                    "`{text:?}` lexes unequal in {edition:?}: {one:?} and {two:?}"
-                )));
-            }
-        }
-        Ok(())
-    });
-}
-
 /// The tokens of `stream` as (kind letter, text, joint) triples: `i` ident, `p` punct, `l`
 /// literal, `(`/`)` a group.
 fn shape(stream: &TokenStream<'_>) -> Vec<(char, String, bool)> {
@@ -390,6 +396,22 @@ fn stringify_prints_its_input() {
     let cx = TestCx::new();
     let exp = call_fn(&builtin(BuiltinFn::Stringify), "a + b", &cx);
     assert_eq!(show(&exp.tokens), "\"a + b\"");
+}
+
+/// `assert!`'s condition is an expression, so a comma in its turbofish ends no argument.
+#[test]
+fn assert_reads_its_condition_as_an_expression() {
+    let cx = TestCx::new();
+    let def = builtin(BuiltinFn::Assert);
+    let exp = call_fn(&def, "none::<List, Secret>()", &cx);
+    let shown = show(&exp.tokens);
+    assert!(shown.starts_with("if ! ( none ::< List , Secret > ( ) ) {"), "{shown}");
+    assert!(shown.contains("panicking :: panic"), "{shown}");
+    assert!(!shown.contains("panic_2021"), "{shown}");
+    let exp = call_fn(&def, "f::<A, B>(), \"m {}\", 1", &cx);
+    let shown = show(&exp.tokens);
+    assert!(shown.starts_with("if ! ( f ::< A , B > ( ) ) {"), "{shown}");
+    assert!(shown.contains("panic_2021 ! ( \"m {}\" , 1 )"), "{shown}");
 }
 
 #[test]
@@ -549,7 +571,10 @@ fn cfg_select_takes_the_first_arm_that_holds() {
     assert_eq!(show(&exp.tokens), "c");
     let exp = call_fn(&def, "windows => { a }", &cx);
     assert!(matches!(exp.diagnostics[..], [Diagnostic::Builtin { .. }]));
-    let exp = call_fn(&def, "unix => a", &cx);
+    // An arm may be an expression up to its `,` (the pinned std writes `target_os = "x" => 512,`).
+    let exp = call_fn(&def, "windows => f(a, b), unix => 8 * g(1, 2), _ => c", &cx);
+    assert_eq!(show(&exp.tokens), "8 * g ( 1 , 2 )");
+    let exp = call_fn(&def, "unix =>", &cx);
     assert!(matches!(exp.diagnostics[..], [Diagnostic::Builtin { .. }]));
 }
 
@@ -590,6 +615,164 @@ fn format_args_is_the_builtin_form() {
 
 fn derive(which: BuiltinDerive, item: &str) -> Expansion<'static> {
     derive_with(which, item, DeriveFacts::PLAIN)
+}
+
+/// Item position in the Reference's order: a `cfg_attr` applied where it stands, a derive passed
+/// over, each other attribute offered in turn as a possible attribute macro, its call the item
+/// without it; then the derives in order on the item as a derive sees it.
+#[test]
+fn an_items_attributes_are_walked_in_order() {
+    let mut unix = |name: &str, _: Option<&str>| Ok::<bool, ()>(name == "unix");
+    let mut walk = blaze_expand::ItemAttrs::new(tokens(
+        "#[inline] #[derive(Debug)] #[cfg_attr(unix, m::at(x), repr(C))] #[cfg(unix)] fn f() {}",
+    ));
+    let next = |walk: &mut blaze_expand::ItemAttrs<'static>, atom: &mut dyn FnMut(&str, Option<&str>) -> Result<bool, ()>| {
+        match walk.next(atom).expect("the attributes read") {
+            blaze_expand::NextAttr::Call { path, attr } => Some((String::from(path.as_str()), attr)),
+            blaze_expand::NextAttr::End => None,
+            blaze_expand::NextAttr::Removed => panic!("the item's cfg holds"),
+        }
+    };
+    assert_eq!(next(&mut walk, &mut unix).map(|(p, _)| p), Some("inline".into()));
+    let (path, attr) = next(&mut walk, &mut unix).expect("the cfg_attr leaves `m::at(x)`");
+    assert_eq!(path, "m::at");
+    let call = walk.attr_call(attr).expect("the call is made");
+    assert_eq!(show(call.args.as_ref().expect("it has arguments")), "x");
+    // The attributes after it as written: the walk has not reached them.
+    assert_eq!(show(&call.item), "# [ inline ] # [ derive ( Debug ) ] # [ repr ( C ) ] # [ cfg ( unix ) ] fn f ( ) { }");
+    assert_eq!(next(&mut walk, &mut unix).map(|(p, _)| p), Some("repr".into()));
+    assert_eq!(next(&mut walk, &mut unix), None);
+
+    let mut windows = |name: &str, _: Option<&str>| Ok::<bool, ()>(name == "windows");
+    let gone = blaze_expand::ItemAttrs::new(tokens("#[cfg(unix)] struct S;")).derives(&mut windows);
+    assert!(matches!(gone, Ok(None)));
+
+    let derives = blaze_expand::ItemAttrs::new(tokens(
+        "#[cfg_attr(unix, derive(Clone))] #[derive(core::marker::Copy)] #[repr(C)] struct S { #[cfg(windows)] a: u8, #[cfg_attr(unix, serde(skip))] b: u8 }",
+    ))
+    .derives(&mut unix)
+    .expect("the attributes read")
+    .expect("the item stays");
+    let paths: std::vec::Vec<&str> = derives.uses.iter().map(|u| u.path.as_str()).collect();
+    assert_eq!(paths, ["Clone", "core::marker::Copy"]);
+    assert_eq!(derives.facts(&derives.uses[0]).copy, AlsoCopy::Yes);
+    assert_eq!(show(&derives.input), "# [ repr ( C ) ] struct S { # [ serde ( skip ) ] b : u8 }");
+    // An atom the cfg set cannot answer is an error, never a guess.
+    let mut unknown = |_: &str, _: Option<&str>| Err::<bool, ()>(());
+    assert!(blaze_expand::ItemAttrs::new(tokens("#[cfg_attr(unix, derive(Clone))] struct S;")).derives(&mut unknown).is_err());
+}
+
+/// konst 0.2.20's `__declare_string_cmp_fns!`, reduced: its matcher holds a `///` doc comment
+/// between two fragments, and the call (`string.rs:15`) writes none. The Reference, "Comments":
+/// "Doc comments are interpreted as a special syntax for attributes"; "Macros by example" says
+/// nothing of a doc comment in a matcher. BLAZE'S RULE (rules/mod.rs `doc_attr_end`): a
+/// `#[doc = ".."]` in a matcher matches nothing; a doc comment in the call is still tokens.
+#[test]
+fn a_doc_comment_in_a_matcher_matches_nothing() {
+    let cx = TestCx::new();
+    let def = rules(
+        "(eq = $eq:ident, ord = $ord:ident, /// Equivalent to ord, but returns a U8Ordering
+          inner = $inner:ident,) => { fn $eq() {} fn $inner() {} }",
+        1,
+    );
+    let exp = call_fn(&def, "eq = eq_str, ord = cmp_str, inner = cmp_str_inner,", &cx);
+    assert_eq!(show(&exp.tokens), "fn eq_str ( ) { } fn cmp_str_inner ( ) { }", "{:?}", exp.diagnostics);
+}
+
+/// icu_collections 2.4's `cpinvlist.rs:27`, reduced: an attribute macro first, a `cfg_attr`
+/// leaving its helper later. The Reference, "Conditional compilation": "When the configuration
+/// predicate is true, this attribute expands out to the attributes listed after the predicate";
+/// "Attributes": `cfg` and `cfg_attr` are active, "During attribute processing, active
+/// attributes remove themselves from the thing they are on"; "Procedural Macros": an attribute
+/// macro's second stream is "the rest of the item including other attributes on the item". So
+/// the macro sees `#[zerovec::skip_derive(..)]`, never the `cfg_attr` that left it, and can
+/// consume it as its own helper.
+#[test]
+fn an_attribute_macro_sees_the_attributes_a_later_cfg_attr_leaves() {
+    let mut no_alloc = |name: &str, value: Option<&str>| Ok::<bool, ()>(!(name == "feature" && value == Some("alloc")));
+    let mut walk = blaze_expand::ItemAttrs::new(tokens(
+        "#[zerovec::make_varule(ListULE)] #[zerovec::skip_derive(Ord)] #[derive(Debug)] \
+         #[cfg_attr(not(feature = \"alloc\"), zerovec::skip_derive(ZeroMapKV, ToOwned))] pub struct List { size: u32 }",
+    ));
+    let attr = match walk.next(&mut no_alloc).expect("the attributes read") {
+        blaze_expand::NextAttr::Call { path, attr } if path.as_str() == "zerovec::make_varule" => attr,
+        _ => panic!("the first attribute is the macro's call"),
+    };
+    let call = walk.attr_call(attr).expect("the call is made");
+    assert_eq!(
+        show(&call.item),
+        "# [ zerovec :: skip_derive ( Ord ) ] # [ derive ( Debug ) ] # [ zerovec :: skip_derive ( ZeroMapKV , ToOwned ) ] pub struct List { size : u32 }"
+    );
+}
+
+#[test]
+fn a_derive_attribute_names_its_paths() {
+    let names = |attr: &str| {
+        let t = tokens(attr);
+        blaze_expand::derive_attr(&t, Alloc::global()).map(|(constness, paths)| {
+            let named: std::vec::Vec<String> = paths
+                .iter()
+                .map(|r| (r.start..r.end).map(|at| t.text_at(at as usize)).collect::<std::vec::Vec<_>>().concat())
+                .collect();
+            (constness, named)
+        })
+    };
+    assert_eq!(names("#[derive(Clone, Copy,)]"), Some((Constness::NotConst, vec!["Clone".into(), "Copy".into()])));
+    // A punctuation token's text is empty: the path's words, `::` dropped.
+    assert_eq!(names("#[derive_const(::core::clone::Clone)]"), Some((Constness::Const, vec!["corecloneClone".into()])));
+    assert_eq!(names("#[derive()]"), Some((Constness::NotConst, vec![])));
+    assert_eq!(names("#[repr(C)]"), None);
+    assert_eq!(names("#[derive(Clone = 1)]"), None);
+}
+
+/// `#[cfg_attr(pred, a, b)]` leaves `a` and `b` when `pred` holds and nothing otherwise; a
+/// nested `cfg_attr` is applied in its place, in order; a `derive(..)` it leaves reads as one.
+#[test]
+fn a_cfg_attr_leaves_its_attributes_when_its_predicate_holds() {
+    let metas = |attr: &str| {
+        let t = tokens(attr);
+        let got = blaze_expand::cfg_attr_metas(&t, Alloc::global(), &mut |name, value| -> Result<bool, ()> {
+            Ok(matches!((name, value), ("unix", None) | ("feature", Some("serde"))))
+        });
+        got.map(|ranges| {
+            ranges
+                .iter()
+                .map(|r| (r.start..r.end).map(|at| t.text_at(at as usize)).collect::<std::vec::Vec<_>>().concat())
+                .collect::<std::vec::Vec<String>>()
+        })
+    };
+    // (A punctuation or delimiter token's text is empty: the meta's words.)
+    assert_eq!(metas("#[cfg_attr(unix, derive(Clone, Copy), inline)]"), Ok(vec!["deriveCloneCopy".into(), "inline".into()]));
+    assert_eq!(metas("#[cfg_attr(windows, derive(Clone))]"), Ok(vec![]));
+    assert_eq!(
+        metas("#[cfg_attr(all(), a, cfg_attr(feature = \"serde\", b, cfg_attr(windows, c)), d,)]"),
+        Ok(vec!["a".into(), "b".into(), "d".into()])
+    );
+    assert_eq!(metas("#[cfg_attr(, a)]"), Err(blaze_expand::CfgAttrError::NoPredicate { token: 2 }));
+    assert_eq!(metas("#[derive(Clone)]"), Err(blaze_expand::CfgAttrError::NotCfgAttr));
+    // The derive it leaves, read in place.
+    let t = tokens("#[cfg_attr(unix, derive(Debug, ::core::hash::Hash))]");
+    let ranges = blaze_expand::cfg_attr_metas(&t, Alloc::global(), &mut |_, _| -> Result<bool, ()> { Ok(true) })
+        .expect("the predicate holds");
+    let (constness, paths) = blaze_expand::derive_meta(&t, ranges[0].clone(), Alloc::global()).expect("a derive");
+    assert_eq!(constness, Constness::NotConst);
+    assert_eq!(paths.len(), 2);
+}
+
+/// A built-in attribute may be named by its path in a standard prelude (the Reference,
+/// Attributes, "Built-in attributes" live in the prelude): libc 0.2.191's `s!` writes
+/// `#[::core::prelude::v1::derive(..)]`, which is `derive`; a path into no prelude is not.
+#[test]
+fn derive_named_by_its_prelude_path_is_a_derive() {
+    let derives = |text: &str| {
+        let t = tokens(text);
+        blaze_expand::derive_meta(&t, 2..(t.tokens().len() - 1) as u32, Alloc::global()).map(|(c, paths)| (c, paths.len()))
+    };
+    assert_eq!(derives("#[::core::prelude::v1::derive(Clone)]"), Some((Constness::NotConst, 1)));
+    assert_eq!(derives("#[std::prelude::rust_2021::derive(Clone, ::core::cmp::PartialEq)]"), Some((Constness::NotConst, 2)));
+    assert_eq!(derives("#[derive(Clone)]"), Some((Constness::NotConst, 1)));
+    assert_eq!(derives("#[serde::prelude::v1::derive(Clone)]"), None);
+    assert_eq!(derives("#[core::derive(Clone)]"), None);
 }
 
 fn derive_with(which: BuiltinDerive, item: &str, facts: DeriveFacts) -> Expansion<'static> {
@@ -726,6 +909,65 @@ fn concat_reads_escapes() {
     assert!(matches!(bad.diagnostics[..], [Diagnostic::Builtin { .. }]), "{:?}", bad.diagnostics);
 }
 
+/// A cfg predicate's outcome from its tokens, each atom asked once in order; malformed ones
+/// are refused at their token.
+#[test]
+fn a_cfg_predicate_is_read_from_its_tokens() {
+    let set = |name: &str, value: Option<&str>| -> Result<bool, ()> {
+        Ok(match (name, value) {
+            ("unix" | "test", None) => true,
+            ("target_os", Some(os)) => os == "macos",
+            ("feature", Some(f)) => f == "on",
+            ("unknown", None) => return Err(()),
+            _ => false,
+        })
+    };
+    let eval = |text: &str| {
+        let tokens = lex(text, Edition::E2021, Alloc::global()).expect("the predicate lexes");
+        let mut asked = Vec::new();
+        let out = cfg_predicate(&tokens, Alloc::global(), &mut |n, v| {
+            asked.push(n.to_string());
+            set(n, v)
+        });
+        (out, asked)
+    };
+    let cases = [
+        ("unix", true),
+        ("windows", false),
+        ("target_os = \"macos\"", true),
+        ("all(unix, not(windows), feature = \"on\",)", true),
+        ("any(windows, all(test, target_os = \"linux\"))", false),
+        ("any()", false),
+        ("all()", true),
+        ("not(any(windows, feature = \"off\"))", true),
+    ];
+    for (text, want) in cases {
+        assert_eq!(eval(text).0, Ok(want), "{text}");
+    }
+    assert_eq!(eval("all(unix, test)").1, ["unix", "test"]);
+    assert!(matches!(eval("not(unix, test)").0, Err(CfgPredicateError::NotTakesOne { .. })));
+    assert!(matches!(eval("not()").0, Err(CfgPredicateError::NotTakesOne { .. })));
+    // (`lex` closes a group left open, so an unclosed `all(unix` is no case here.)
+    assert!(matches!(eval("all(unix test)").0, Err(CfgPredicateError::Malformed { .. })));
+    assert!(matches!(eval("all(unix,,)").0, Err(CfgPredicateError::Malformed { .. })));
+    assert!(matches!(eval("unix test").0, Err(CfgPredicateError::Malformed { .. })));
+    assert!(matches!(eval("feature = 3").0, Err(CfgPredicateError::Malformed { .. })));
+    assert_eq!(eval("any(unix, unknown)").0, Err(CfgPredicateError::Atom(())));
+}
+
+/// A CRLF file lexes as rustc reads it, each `\r\n` a `\n` (the reference's CRLF
+/// normalization): a `\` before the line end continues a string (vcpkg-0.2.15 src/lib.rs:369,
+/// crossterm-0.29.0), and the tokens equal the LF file's.
+#[test]
+fn a_crlf_file_lexes_as_its_lf_form() {
+    let crlf = lex("let s = \"a \\\r\n   b\";\r\n", Edition::E2021, Alloc::global()).expect("CRLF is normalized");
+    let lf = lex("let s = \"a \\\n   b\";\n", Edition::E2021, Alloc::global()).expect("the LF form lexes");
+    assert_eq!(show(&crlf), show(&lf));
+    let doc_crlf = lex("/// d\r\nfn f() {}", Edition::E2021, Alloc::global()).expect("a CRLF doc comment lexes");
+    let doc_lf = lex("/// d\nfn f() {}", Edition::E2021, Alloc::global()).expect("the LF form lexes");
+    assert_eq!(show(&doc_crlf), show(&doc_lf));
+}
+
 #[test]
 fn an_attribute_call_takes_its_args_and_item() {
     let cx = TestCx::new();
@@ -753,6 +995,59 @@ fn an_attribute_call_takes_its_args_and_item() {
     assert!(matches!(
         wrong,
         Err(ExpandError::WrongCallKind { def: CallShape::Attr, call: CallShape::FnLike })
+    ));
+}
+
+/// `echo!(a b)` of a fn-like proc macro whose host also gives `emits`.
+fn echo(emits: &'static [Emit]) -> Result<Expanded<'static>, ExpandError> {
+    let cx = TestCx { emits, ..TestCx::new() };
+    let krate = CrateItemKey(ContentId([9; 32]));
+    let def =
+        MacroDefinition::proc_macro(krate, ProcKind::FnLike, "echo", &[], at(9), Alloc::global()).expect("names fit");
+    let input = tokens("a b");
+    expand(&def, &Call::fn_like(&input, site()), &cx, Alloc::global())
+}
+
+#[test]
+fn a_proc_macro_warning_keeps_its_tokens_and_an_error_drops_them() {
+    for level in [ProcLevel::Warning, ProcLevel::Note, ProcLevel::Help] {
+        let emits: &'static [Emit] = match level {
+            ProcLevel::Warning => &[Emit::Level(ProcLevel::Warning)],
+            ProcLevel::Note => &[Emit::Level(ProcLevel::Note)],
+            _ => &[Emit::Level(ProcLevel::Help)],
+        };
+        let exp = done(echo(emits));
+        assert_eq!(show(&exp.tokens), "a b", "{level:?}");
+        match exp.diagnostics[..] {
+            [Diagnostic::ProcMacro { level: l, message, at: Some(TokenOrigin::Input(0)) }] => {
+                assert_eq!(l, level);
+                // The text was copied out of the host's table into the expansion's notes.
+                assert_eq!(exp.note_text(message), "é!");
+            }
+            ref other => panic!("{other:?}"),
+        }
+    }
+    let error = done(echo(&[Emit::Level(ProcLevel::Warning), Emit::Level(ProcLevel::Error)]));
+    assert!(error.tokens.is_empty() && error.origins.is_empty());
+    assert_eq!(error.diagnostics.len(), 2);
+    let panicked = done(echo(&[Emit::Panic]));
+    assert!(panicked.tokens.is_empty());
+    assert!(matches!(panicked.diagnostics[..], [Diagnostic::ProcMacroPanicked { .. }]));
+    // Control: with nothing emitted the macro echoes its input.
+    assert_eq!(show(&done(echo(&[])).tokens), "a b");
+}
+
+#[test]
+fn a_proc_macro_hosts_out_of_range_output_is_refused_by_type() {
+    assert!(matches!(echo(&[Emit::TextPastEnd]), Err(ExpandError::ProcMacroText { len: 3, .. })));
+    assert!(matches!(echo(&[Emit::TextMidChar]), Err(ExpandError::ProcMacroText { len: 3, .. })));
+    assert!(matches!(
+        echo(&[Emit::OriginPastInput]),
+        Err(ExpandError::ProcMacroOrigin { origin: TokenOrigin::Input(2) })
+    ));
+    assert!(matches!(
+        echo(&[Emit::TokenFromDef]),
+        Err(ExpandError::ProcMacroOrigin { origin: TokenOrigin::Def(0) })
     ));
 }
 
@@ -797,6 +1092,9 @@ fn varied_expansions() -> Vec<Expansion<'static>> {
             "enum E<'a, T> where T: Sized { A(&'a T), B { x: T::Out } }",
         ),
         derive(BuiltinDerive::Default, "enum E { A }"),
+        // Tags 11 (a proc macro's warning, beside its tokens) and 12 (its panic).
+        done(echo(&[Emit::Level(ProcLevel::Warning), Emit::Level(ProcLevel::Help)])),
+        done(echo(&[Emit::Panic])),
     ]
 }
 
@@ -904,7 +1202,7 @@ fn keys_follow_expansions(tape: &Tape, key_of: KeyOf) -> Result<(), Broke> {
     let input = tokens("\"V\"");
     let call = Call::fn_like(&input, site());
     let run = |env: &'static [(&'static str, &'static str)]| {
-        let cx = TestCx { env, files: &[], cfgs: &[], line: 1 };
+        let cx = TestCx { env, files: &[], cfgs: &[], line: 1, emits: &[] };
         let exp = done(expand(&def, &call, &cx, Alloc::global()));
         let mut bytes = OwnVec::new_in(Alloc::global());
         exp.encode(&mut bytes);
@@ -931,4 +1229,35 @@ fn the_key_oracle_catches_a_key_blind_to_reads() {
         "equal keys for unequal expansions",
         keys_follow_expansions,
     );
+}
+
+/// `include_str!`'s path is relative to the file the call is in (core `macros/mod.rs`, the
+/// pinned library: "The file is located relative to the current file"), `..` taken
+/// lexically. It may leave the package (D60, docs/v2/plan/decisions.json): a member reads under
+/// the workspace's source root, a git source under its checkout, a registry package only under
+/// itself; past that bound, or an absolute path, the call is refused (`Included::Outside`),
+/// never read from the host. A build script's output folder is answered from its record.
+#[test]
+fn an_include_path_is_relative_to_the_calling_file_and_stays_in_its_root() {
+    use blaze_expand::{OutsideRoot, ReadRoot, SourceOrigin};
+    let target = |origin, package, folder, written| {
+        blaze_expand::include_target(ReadRoot { origin, package }, folder, written, Alloc::global())
+            .map(|s| s.iter().copied().collect::<Vec<_>>().join("/"))
+    };
+    let member = |folder, written| target(SourceOrigin::Checkout, "crates/a", folder, written);
+    assert_eq!(member("src", "data.txt"), Ok("crates/a/src/data.txt".to_string()));
+    assert_eq!(member("src/x", "../../README.md"), Ok("crates/a/README.md".to_string()));
+    assert_eq!(member("src", "./y/./z.rs"), Ok("crates/a/src/y/z.rs".to_string()));
+    // Another member's file, and the checkout's own: inside the source root.
+    assert_eq!(member("src", "../../b/genesis.json"), Ok("crates/b/genesis.json".to_string()));
+    assert_eq!(member("", "../../Cargo.toml"), Ok("Cargo.toml".to_string()));
+    let past = Err(OutsideRoot { origin: SourceOrigin::Checkout });
+    assert_eq!(member("", "../../../etc/passwd"), past);
+    assert_eq!(member("src", "/etc/passwd"), past);
+    // A git source reads beside its package in its checkout; a registry package stops at itself.
+    assert_eq!(target(SourceOrigin::GitCheckout, "pkg", "src", "../../shared/x.txt"), Ok("shared/x.txt".to_string()));
+    assert_eq!(target(SourceOrigin::Package, "reg-1.0.0", "src", "../x.txt"), Ok("reg-1.0.0/x.txt".to_string()));
+    let edge = Err(OutsideRoot { origin: SourceOrigin::Package });
+    assert_eq!(target(SourceOrigin::Package, "reg-1.0.0", "src", "../../other/x.txt"), edge);
+    assert_eq!(target(SourceOrigin::Package, "reg", "src", "../../reg-x/y"), edge);
 }

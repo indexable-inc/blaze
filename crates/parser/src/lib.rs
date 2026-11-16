@@ -32,6 +32,7 @@ mod frontmatter;
 mod grammar;
 mod input;
 mod lexed_str;
+pub mod line_break;
 mod outline;
 mod output;
 mod parser;

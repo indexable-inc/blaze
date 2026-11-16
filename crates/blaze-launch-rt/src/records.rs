@@ -283,13 +283,13 @@ fn own(name: &str) -> Option<u64> {
 
 impl Records for Loaded {
     fn record(&mut self, id: RecordId, bytes: &[u8]) -> Result<(), String> {
-        let hash = blake3::hash(bytes);
-        if *hash.as_bytes() != id.0 {
+        let hash = blaze_blake3::hash(bytes);
+        if hash != id.0 {
             // alloc: an error
             return Err(format!(
                 "the bytes given as record {} hash to {}",
                 short(&id.0),
-                short(hash.as_bytes())
+                short(&hash)
             ));
         }
         // alloc: the record's bytes, kept until the message that names it was carried out

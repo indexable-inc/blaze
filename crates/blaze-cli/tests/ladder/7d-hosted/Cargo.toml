@@ -1,0 +1,4 @@
+[package]
+name = "ladder-7d-hosted"
+version = "0.1.0"
+edition = "2024"

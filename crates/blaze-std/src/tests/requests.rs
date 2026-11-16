@@ -112,7 +112,7 @@ fn read_request(cx: &Cx, conn: &Conn) -> Result<(Method, String, Vec<u8>), Strin
             let head = std::str::from_utf8(&bytes[..head_end]).map_err(|e| format!("harness: a request's head: {e}"))?;
             let length = head
                 .lines()
-                .find_map(|line| line.strip_prefix("content-length: "))
+                .find_map(|line| line.split_once(':').filter(|(name, _)| name.eq_ignore_ascii_case("content-length")).map(|(_, value)| value.trim()))
                 .map_or(Ok(0), str::parse::<usize>)
                 .map_err(|e| format!("harness: a request's content-length: {e}"))?;
             let body = &bytes[head_end + 4..];

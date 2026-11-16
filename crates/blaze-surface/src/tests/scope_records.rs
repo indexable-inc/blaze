@@ -15,10 +15,9 @@ use super::{KRATE, NAMES, SPACES, file, key, name, small};
 use crate::{
     AmbiguityKind, AnonImport, Binding, BindingState, BuildError, CallShape, ChildModDecl,
     CrateRootBuilder, CrateRootHead, CrateRootView, DeclaredItem, DeclsBuilder, Def, DefKind, Dep,
-    Edition, ExternCrateDecl, ExternTarget, MacroCallDecl, MacroRulesDecl, ModuleDeclsView,
+    Edition, ExternCrateDecl, ExternTarget, MacroCallDecl, MacroRulesDecl, MacroShapes, ModuleDeclsView,
     ModuleInfo, Origin, Path, PathKind, Rename, ScopeBuilder, ScopeEntry, ScopeError, ScopeView,
-    Site, TextualDef, TextualMark, Unresolved, UseDecl, UseForm, UseSite, Visibility,
-    VisibilityClass, WrittenVis,
+    Site, TextualDef, TextualMark, Unresolved, UseDecl, UseForm, UseSite, Visibility, WrittenVis,
 };
 
 fn def(tape: &Tape) -> Def {
@@ -27,11 +26,16 @@ fn def(tape: &Tape) -> Def {
         0 => DefKind::Module,
         1 => DefKind::Enum,
         2 => DefKind::Trait,
-        3 => DefKind::Macro(CallShape::FnLike),
-        4 => DefKind::Macro(CallShape::Derive),
+        3 | 4 => DefKind::Macro(shapes(tape)),
         _ => DefKind::Other,
     };
     Def { key: key(n), kind }
+}
+
+/// A non-empty set of call shapes.
+fn shapes(tape: &Tape) -> MacroShapes {
+    let byte = u8::try_from(1 + tape.below(7, "shapes")).expect("below 8 fits a u8");
+    MacroShapes::from_byte(byte).expect("one to seven is a set")
 }
 
 fn vis(tape: &Tape) -> Visibility {
@@ -50,9 +54,8 @@ pub(super) fn bindings(tape: &Tape) -> StdVec<ScopeEntry<&'static str>, Alloc<'s
             if !tape.coin("bound") {
                 continue;
             }
-            let state = match tape.below(3, "state") {
+            let state = match tape.below(2, "state") {
                 0 => BindingState::Determined,
-                1 => BindingState::Undetermined,
                 _ => BindingState::Ambiguous(AmbiguityKind::GlobVsGlob),
             };
             let origin = [Origin::Declared, Origin::Import, Origin::Glob, Origin::ExternCrate]
@@ -76,11 +79,12 @@ pub(super) enum Plant {
     Unsorted,
 }
 
-/// The `ModuleScope` record of `key(200)` with `rows` and two fellows, given out of order.
+/// The `ModuleScope` record of `key(200)` with `rows` and two children's marks, given out of
+/// order.
 pub(super) fn write_scope(rows: &[ScopeEntry<&str>], plant: Plant) -> std::vec::Vec<u8, Alloc<'static>> {
     let mut out = ScopeBuilder::new_in(key(200), Alloc::global());
     out.bindings.extend_from_slice(rows);
-    out.fellows.extend_from_slice(&[key(202), key(201)]);
+    out.marks.extend_from_slice(&[TextualMark { child: key(202), len: 1 }, TextualMark { child: key(201), len: 0 }]);
     out.write_sorted(matches!(plant, Plant::None), Alloc::global()).expect("a drawn scope holds one binding per slot")
 }
 
@@ -101,8 +105,9 @@ fn scope_agrees(tape: &Tape, plant: Plant) -> Result<(), Broke> {
             return Err(Broke::Oracle(format!("the scope does not answer {row:?} by its name")));
         }
     }
-    if view.bindings().count() != rows.len() || !view.fellows().eq([key(201), key(202)]) {
-        return Err(Broke::Oracle("the scope lists other bindings or fellows than written".into()));
+    let marks = [TextualMark { child: key(201), len: 0 }, TextualMark { child: key(202), len: 1 }];
+    if view.bindings().count() != rows.len() || !view.marks().eq(marks) {
+        return Err(Broke::Oracle("the scope lists other bindings or marks than written".into()));
     }
     Ok(())
 }
@@ -164,7 +169,7 @@ fn full_scope(tape: &Tape) -> ScopeBuilder<'static, &'static str> {
         out.errors.push(error);
     }
     for n in 0..u8::try_from(tape.below(4, "textual")).expect("below 4") {
-        out.textual.push(TextualDef { name: name(tape), def: key(100 + n), expansion: 0 });
+        out.textual.push(TextualDef { name: name(tape), def: key(100 + n), expansion: 0, shapes: shapes(tape) });
     }
     for n in 0..u8::try_from(tape.below(3, "marks")).expect("below 3") {
         out.marks.push(TextualMark { child: key(120 + n), len: small(tape, 4, "mark") });
@@ -173,7 +178,7 @@ fn full_scope(tape: &Tape) -> ScopeBuilder<'static, &'static str> {
         out.traits.push(AnonImport { site: site(tape), def: def(tape), vis: vis(tape) });
     }
     if tape.coin("an expanded export") {
-        out.macro_exports.push(TextualDef { name: name(tape), def: key(130), expansion: 1 });
+        out.macro_exports.push(TextualDef { name: name(tape), def: key(130), expansion: 1, shapes: shapes(tape) });
     }
     out
 }
@@ -202,30 +207,17 @@ fn a_scope_round_trips_through_its_record() {
 }
 
 #[test]
-fn an_export_digest_moves_only_with_its_class() {
-    let binding = Binding {
-        def: Def { key: key(3), kind: DefKind::Other },
-        vis: Visibility::Public,
-        origin: Origin::Declared,
-        expansion: 0,
-        state: BindingState::Determined,
-    };
-    let public = ScopeEntry { ns: crate::Namespace::Values, name: "f", binding };
-    let private = ScopeEntry {
-        name: "g",
-        binding: Binding { def: Def { key: key(4), kind: DefKind::Other }, vis: Visibility::Restricted(key(200)), ..binding },
-        ..public
-    };
-    let read = |rows: &[ScopeEntry<&str>]| {
-        let buffer = Aligned::copy_from(&write_scope(rows, Plant::None));
-        let view = ScopeView::read(&buffer).expect("a written scope reads");
-        [VisibilityClass::Public, VisibilityClass::Crate, VisibilityClass::Restricted(key(200))]
-            .map(|class| view.exports(class))
-    };
-    let [pub_before, crate_before, within_before] = read(&[public]);
-    let [pub_after, crate_after, within_after] = read(&[public, private]);
-    assert_eq!((pub_before, crate_before), (pub_after, crate_after));
-    assert_ne!(within_before, within_after);
+fn a_globs_digest_moves_with_every_input_and_nothing_else() {
+    let edge = crate::GlobEdge { source: Def { key: key(3), kind: DefKind::Module }, vis: Visibility::Public, expansion: 0 };
+    let krate = CrateItemKey(ContentId([7; 32]));
+    let chain = [key(1), key(0)];
+    let digest = |edges: &[crate::GlobEdge], chain: &[ItemKey]| crate::globs_digest(edges, krate, chain, Alloc::global());
+    let base = digest(&[edge], &chain);
+    assert_eq!(base, digest(&[edge], &chain), "a digest is a function of its inputs");
+    assert_ne!(base, digest(&[crate::GlobEdge { vis: Visibility::Restricted(key(0)), ..edge }], &chain));
+    assert_ne!(base, digest(&[crate::GlobEdge { expansion: 1, ..edge }], &chain));
+    assert_ne!(base, digest(&[], &chain));
+    assert_ne!(base, digest(&[edge], &chain[..1]));
 }
 
 /// The round trip of a module's declarations: every list, every path kind and every written
@@ -272,7 +264,7 @@ fn module_decls_round_trip_in_source_order() {
             decls.extern_crates.push(ExternCrateDecl { target, rename: rename(tape), vis: written(tape) });
         }
         if tape.coin("a macro_rules") {
-            decls.macro_rules.push(MacroRulesDecl { name: name(tape), def: key(150), pos: 20, export: tape.coin("export") });
+            decls.macro_rules.push(MacroRulesDecl { name: name(tape), def: key(150), pos: 20, export: tape.coin("export"), shapes: shapes(tape) });
         }
         for n in 0..u8::try_from(tape.below(3, "calls")).expect("below 3") {
             let kind = [CallShape::FnLike, CallShape::Attr, CallShape::Derive][usize::from(n)];
@@ -304,6 +296,7 @@ fn a_crate_root_reads_back_sorted_and_refuses_two_crates_of_one_name() {
         edition: Edition::E2024,
         no_std: true,
         no_core: false,
+        arbitrary_ints: true,
         prelude: Some(key(201)),
     };
     let core = Dep { name: "core", krate: CrateItemKey(ContentId([7; 32])), root: key(7) };
@@ -317,7 +310,7 @@ fn a_crate_root_reads_back_sorted_and_refuses_two_crates_of_one_name() {
         out.extern_prelude.push(("me", key(200)));
         out.tools.extend_from_slice(&["blaze", "blaze"]);
         out.macro_use.push(key(7));
-        out.macro_exports.push(("m", key(30)));
+        out.macro_exports.push(("m", key(30), MacroShapes::ATTR.with(CallShape::FnLike)));
         out
     };
     let bytes = build([core, alloc]).write(Alloc::global()).expect("small");

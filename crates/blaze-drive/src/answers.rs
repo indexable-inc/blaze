@@ -12,9 +12,11 @@ use crate::key::{Key, Name};
 use crate::wire::{NAME_BYTES, Reader, WireError, WireWhy, Writer};
 
 /// 2: a row holds its split and its condition.
-const PAGE_MAGIC: &[u8; 4] = b"BDP2";
-const ROOT_MAGIC: &[u8; 4] = b"BDA1";
-const LAST_MAGIC: &[u8; 4] = b"BDL1";
+pub(crate) const PAGE_MAGIC: &[u8; 4] = b"BDP2";
+pub(crate) const ROOT_MAGIC: &[u8; 4] = b"BDA1";
+/// The `last` file's form: read at a fixed path, so its caller checks this before
+/// [`read_last`] and rebuilds a file of another form (crate::FORMATS).
+pub const LAST_MAGIC: &[u8; 4] = b"BDL1";
 
 /// The rows a page aims to hold; the root's bit count is the fewest that keep every page at or
 /// under it on average.
@@ -196,7 +198,8 @@ pub struct Last {
     pub tool: ContentId,
     /// The command's shape: what it wants (check, run, test) and its arguments.
     pub shape: ContentId,
-    /// The manifests' digest the units were made from.
+    /// The root units' source the answer was made from (the root manifest and the manifests'
+    /// paths): another one now reads the root units again.
     pub units: ContentId,
     pub cert: Key,
     pub root: Key,

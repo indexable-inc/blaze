@@ -933,10 +933,13 @@ impl Iocp {
             | Effect::Seal { .. }
             | Effect::Private { .. }
             | Effect::Map { .. }
+            | Effect::MapWrite { .. }
             | Effect::Stamp { .. }
             | Effect::Entries { .. }
             | Effect::MakeDir { .. }
-            | Effect::RemoveDir { .. }) => {
+            | Effect::RemoveDir { .. }
+            | Effect::Ancestors { .. }
+            | Effect::Above { .. }) => {
                 self.to_threads(Work::File(effect));
                 Ok(())
             }
@@ -946,6 +949,11 @@ impl Iocp {
             }
             Effect::Random { len, tag } => {
                 self.ready.push(Completion { tag, done: crate::host::random(len) });
+                Ok(())
+            }
+            // Refused by name: `crate::trust` reads no store of Windows.
+            Effect::Roots { cert_file, cert_dir, tag } => {
+                self.ready.push(Completion { tag, done: crate::host::roots(cert_file, cert_dir) });
                 Ok(())
             }
             // Not yet: a datagram socket or a standard stream waited on here needs its overlapped
@@ -2449,6 +2457,10 @@ impl Driver for Iocp {
     fn wall_ns(&self) -> u64 {
         crate::system_wall_ns()
     }
+
+    fn boot(&self) -> Result<crate::Boot, crate::NoBoot> {
+        crate::boot::system()
+    }
 }
 
 fn failed(tag: Tag, why: impl fmt::Display) -> Completion {
@@ -3627,18 +3639,21 @@ mod tests {
             &mut driver,
             vec![
                 Effect::Stamp { files: Arc::new(names.clone()), tag: Tag(1) },
-                Effect::Entries { dir: name("a"), tag: Tag(2) },
-                Effect::Entries { dir: name("a/missing"), tag: Tag(3) },
-                Effect::Entries { dir: name("a/f"), tag: Tag(4) },
+                Effect::Entries { dir: name("a").into(), tag: Tag(2) },
+                Effect::Entries { dir: name("a/missing").into(), tag: Tag(3) },
+                Effect::Entries { dir: name("a/f").into(), tag: Tag(4) },
             ],
         );
         assert_eq!(seen[&1], Done::Stamped(stamps.clone()));
         // The listing's stamps are the ones a handle of each gives.
-        let mut wanted = vec![(name("a/d"), dir_), (name("a/f"), file), (name("a/j"), junction)];
-        if symlink {
-            wanted.push((name("a/s"), link));
+        let mut wanted = crate::ListingBuilder::new(name("a"));
+        for (leaf, stamp) in [("d", dir_), ("f", file), ("j", junction)] {
+            wanted.push(leaf.as_bytes(), stamp).unwrap();
         }
-        assert_eq!(seen[&2], Done::Entries(wanted));
+        if symlink {
+            wanted.push(b"s", link).unwrap();
+        }
+        assert_eq!(seen[&2], Done::Entries(Box::new(wanted.finish().unwrap())));
         assert!(
             matches!(seen[&3], Done::Failed(_)) && matches!(seen[&4], Done::Failed(_)),
             "{seen:?}"

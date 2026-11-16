@@ -29,6 +29,7 @@ http = []
 explore = [
   "dep:blaze-base64",
   "dep:blaze-http",
+  "blaze-http/h3",
   "dep:blaze-sha256",
   "dep:rcgen",
 ]

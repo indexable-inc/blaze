@@ -1,0 +1,254 @@
+---
+status: plan
+summary: How blaze obtains the sources of a project's dependencies itself (crates/blaze-fetch). A Cargo.lock becomes a plan of units (a crates.io crate pinned by its SHA-256, a git commit pinned by its id); a sans-IO machine asks for each over HTTPS, checks it before a byte is unpacked, and asks the store to keep one content-addressed record of its files. Covers the plan, the machine, the trust steps, the record and its key, what the driver's Fetch task calls, the first numbers on tempo's lock, and what is not built.
+date: 2026-11-16
+---
+# Fetching dependency sources
+
+## Plan
+
+`blaze_fetch::plan::plan(&Lock)` reads the one lock reader (`blaze_manifest::lock`) and makes
+one unit per thing to fetch:
+
+- **Crate**: a crates.io package with a `checksum`: `name`, `version`, the SHA-256.
+- **Git**: one commit of one `https://` repository, however many packages it holds (tempo's
+  reth commit holds 110). The commit is the lock's `#fragment`, 40 hex digits; a branch or tag
+  alone is never fetched.
+
+A package that cannot be verified is named in `Skip`, never fetched and trusted: a registry
+package with no checksum, another registry's package, a git source that is not `https://`.
+Whatever becomes a URL is checked again here (name, version, repository characters, no `..`,
+`@` or `?`), whatever the lock reader allowed.
+
+## Machine
+
+`blaze_fetch::Machine` (sans-IO) takes units and gives effects: `Lookup { key }`,
+`Http { url, method, headers, body, most, deadline }`, `Put { key, record }`,
+`Reserve { key, room }`. Its completions are `looked`, `answered`, `reserved`, `stored`; the time
+comes with each call. `Machine::new` wants every unit (a whole lock); `Machine::wanting` wants
+none until `want(unit)` names one, so one machine a command serves every `Fetch` task that runs,
+under one budget, and a command whose tasks all stand asks nothing. A unit goes: lookup (held:
+`Present`, nothing asked) → request(s) → checks → unpack → put → `Fetched`. At most
+`in_flight_most` requests at once; a request past its deadline is failed by the machine and its
+late answer ignored. No connection, a broken one, no answer in time, a 429 or a 5xx is asked
+again after a doubling backoff, at most `tries_most` tries in all. Anything else fails the unit
+with a typed `Why` at once; a wrong digest is never asked again.
+
+A git commit takes two requests: the protocol v2 advertisement (`info/refs`), then `fetch` of the
+one commit at depth 1 (blaze-git-fetch's sans-IO pieces, carried by the same HTTPS client).
+
+## Trust steps, in order
+
+1. The pin is the lock's: the SHA-256 for a crate, the commit id for git.
+2. The answer's length is held to `most` by the driver, and again by the machine.
+3. A `.crate`'s SHA-256 is compared with the lock's before a byte is inflated. A mismatch names
+   the crate and both digests. A git pack's trailer SHA-1 and every object's id are computed
+   from their bytes, and the tree is walked from the pinned commit, so every file is bound to it.
+4. Inflate (blaze-deflate) is bounded in output and in ratio before it writes; the tar reader
+   (blaze-tar) checks checksums, refuses absolute paths, `..`, devices, links out and sizes past
+   its limits.
+5. Every entry lies under `name-version/` (stripped); a hard link is refused; a symbolic link is
+   kept only when its target stays inside the folder. A size a header declares is held to what is
+   left of the limit before anything is reserved for it.
+6. The record's paths follow the listing rules of `tree` (no `.git`, no two names one on a
+   case- and normalization-insensitive disk, no path under a file).
+7. Only then is a record made, and only a made record is put, whole or not at all.
+
+## Record and key
+
+Key: `blake3_derive("blaze-fetch: a registry crate's files, pack v3", name, version, sha256)` or
+`(... "a git commit's files, pack v3", commit)`, length-prefixed parts (`blaze_ids::Hasher`), from
+the lock's text alone, before any work: `SourceId::key()` (`Unit::key` is the same). A change to
+the form is a new domain.
+
+Record `BLZFPK03` (`pack.rs`, little-endian): a 96-byte header (magic, kind 1 crate / 2 git / 3
+a toolchain tree, counts, the source digest, the BLAKE3 of the files' `blaze tree 2` listing),
+then the data in archive order, then the paths, then 56-byte rows sorted by path (path range,
+mode, data range, the file's BLAKE3), and a BLAKE3 of all of it last. Data comes first so every
+file is written once, straight into the record (`Builder::append`, `Builder::slot`). Two builders
+of one key write equal bytes.
+
+Where it lives (decided by the coordinator, 2026-11-16 05:05; not built yet, drive.md's owed
+list): a source record is content-addressed and the same for every project, so it is in the
+user's shared store, `<home>/.blaze/v2/sources/<64 hex key>`, beside the toolchain shelf
+`<home>/.blaze/v2/toolchain/`, never under the project. A second checkout or worktree of the
+same project fetches nothing and writes only its own small records. The home is a passed value
+(rule 75), so tests give a temp folder. Two commands may fetch one unit at once: each writes a
+temporary name and renames whole bytes onto the key, so both write equal bytes under one name.
+A simulation that interleaves two fetchers and crashes one mid-write proves it, with its oracle
+(no reader maps a record that fails its digest; no record is lost) and a planted bug (rename
+before the bytes are complete) that it catches. A record is verified once a boot, by the
+store's boot rule, not on each read.
+
+## Reading a record in place
+
+`PackView::open_source(&SourceId, bytes)` checks the form, every row, the source (kind, SHA-256 or
+commit) and the BLAKE3 of every byte, once; `open_source_put` skips the BLAKE3 for a record this
+machine fetched and put (verified once per fetch). Then `files()` (sorted, each with `path`,
+`mode`, `bytes: &[u8]` borrowed from the mapping, `blake3`) and `find(path)`, with no check again.
+`examples/read.rs` measures it.
+
+## The driver's loop and the `Fetch` task
+
+`blaze_fetch::drive::step(machine, io, wait_most)` is the one loop body: it carries out every
+effect the machine has through a `FetchIo` (`lookup`, `put`, `send`, `wait`, `keep`, `reserve`)
+and waits once for an answer or the next deadline. `examples/fetch.rs` is a `FetchIo` (one file a
+record, `blaze_core::reserve` for records made in place, blaze-http's `Handle` with `gzip: false`,
+`https_only: true`, the effect's `most` and deadline, `Kind::TooBig { said }` mapped to
+`NetFailure::TooBig { said }`, a User-Agent of `blaze/<version>` and nothing else of the user's).
+blaze-cli's work.rs is the other, over its store.
+
+`blaze_drive::fetch_task`: one `Fetch` task a plan unit (rule 65: never one for the lock). Its
+name's subject and its source are the unit's key, so a repeat stands on its record. Its run wants
+its unit of the command's one machine and joins on the outcome; what a reader sees is the key, the
+same whether the record was present or fetched now. A failure is one finding naming the unit;
+`lasting` (the bytes' fault: a checksum, an archive, git's answer) or not (the network's or the
+store's: no record is kept, so the next command asks again). Without blaze-cli's `fetch` feature a
+missing record is the finding "this build cannot fetch".
+
+## TLS roots
+
+The client checks servers against roots it is given (rule 75), never a list built in.
+`blaze_http::roots::system(Places)` reads the operating system's store when a client first
+connects (`blaze_core::trust::system`), and `roots::with_der` takes a configured bundle's roots
+(`trust::pem::certificates`), which replace the system's.
+
+- **macOS:** Security.framework and CoreFoundation are opened with `dlopen` on that first read,
+  never linked at load. The roots are the system's anchors, minus those the admin or user trust
+  settings distrust for SSL, plus those they trust. Where the user and admin settings disagree,
+  the user's decision wins.
+- **Linux:** `SSL_CERT_FILE`, then `SSL_CERT_DIR`, else the distributions' bundles, then
+  `/etc/ssl/certs`. The PEM is decoded with blaze-base64.
+
+No root is `TrustError`, which names every place looked and what each gave. A root rustls refuses
+is `TlsSetup::BadRoot`. The old `native-roots` feature (rustls-native-certs, security-framework,
+core-foundation, bitflags, and Security linked at load) is gone from blaze-http. blaze-global still
+uses rustls-native-certs under its `net` feature.
+
+`trust/linux.rs` has not been compiled yet. The first build of it will be CI's
+`cargo check and test, linux arm64` job (`.github/workflows/blaze.yaml`, job `cargo`).
+`Effect::Roots` (the effect form, for bstd's `Io::roots` and the simulation's world) is the
+effect lane's to wire after Boot. The hunks are in that lane's hands.
+
+## Memory
+
+Unpacking streams: a `.crate` is inflated 16 KiB at a time into the tar reader and each file is
+appended to the record, sized once from the gzip trailer's ISIZE, which is only a hint held to
+min(the inflate limit, archive length x ratio limit) before the reserve; a trailer that disagrees
+with the inflated length is `Gzip(Why::Size)` and nothing is stored. A git pack is indexed in place
+(`blaze_git_fetch::Index`: offset, kind, size, id per object; each object's id checked against its
+bytes before use, also late in a delta chain), the tree listed, the record sized exactly, and each
+blob resolved straight into its slot through a base cache of at most 32 MiB.
+
+Bytes in flight (`Limits::bytes_most`, 512 MiB): every request's `most` and every record not yet
+stored. A first request asks 1 MiB (`.crate`) or 32 MiB (git pack); past it, it is asked once
+more sized to the stated length, or with the limit held to the budget when none is stated.
+
+## Proof
+
+`tests/sim.rs` (blaze-sim): random crates, some hostile (an entry beside the folder, a gzip bomb,
+a header claiming 4 GiB, a gzip trailer lying high or low), a store holding some, an origin whose
+every answer is on time, late, lost, refused, 503, 404, cut short, flipped, another crate's,
+tampered, past the request's `most` (with its length stated, unstated or a lie) or too big; a crash
+at any effect, then a calm run, then one that must ask nothing more than the hostile crates. Oracles:
+every stored record is its truth, no hostile crate is stored, no allocation passes 4 MiB, the bytes
+in flight stay within the budget's bound, every run ends. Planted bugs caught: a pack stored before
+its checksum, an entry outside its folder kept, a size from the wire (tar header or gzip trailer)
+reserved unchecked, a commit taken from the server's pack instead of the lock's id. A third of the
+units are git commits served as GitHub serves protocol v2 (advertisement, then a depth-1 answer
+with no length stated); hostile ones carry a tree entry `..` or an 8 MiB blob packed small, and
+the fates add another commit's answer and a blob changed under its tree's id. A git answer past
+what the budget lets it ask for must fail by name (`TooBig`, no length stated). blaze-git-fetch's
+own tests catch an object taken by the nearest id, an unchecked trailer and a corrupted object
+deep in a delta chain (their plants are that crate's own).
+
+## Numbers (tempo's lock, a Mac, 2026-11-16)
+
+1348 packages: 1169 crates and 4 git commits, 52 by path, none skipped; 187.5 MiB down, 59,190
+files, 1191.7 MiB unpacked. Measured with a counting allocator per phase and macOS's lifetime peak
+`phys_footprint` (`proc_pid_rusage`).
+
+| | heap high-water | peak | time |
+|---|---|---|---|
+| before (whole tar, builder copy, record; pack objects held) | 480.2 MiB | 1.97 GB RSS | 5.84 s |
+| streamed crate, indexed pack | 157.5 MiB | 551.2 MiB footprint | 8.49 s (network) |
+| plus blocks of 1 MiB and up mapped (example's allocator only) | 171.6 MiB | 184.6 MiB footprint | 5.82 s |
+| plus the budget | 181.7 MiB | 197.3 MiB footprint | 5.78 s |
+| records of 16 KiB and up made in place by the library (`Effect::Reserve`), the loop on `drive::step` | 87.7 MiB (in a put) | 84.8 MiB footprint | 15.49 s (network: 12.1 MiB/s down) |
+
+The same store again (store s15-drive-cold, 2026-11-16): 1,173 present, nothing asked, 0.10 s,
+footprint 9.6 MiB; from a fresh copy of the lock, 0.09 s, 9.5 MiB.
+
+What the peak is made of. These are three cold runs on 2026-11-16, each into its own store.
+`examples/fetch.rs` snapshots the following at the heap's high-water:
+- the answers the loop holds;
+- the requests open (sent and not yet taken by the loop, so queued answers count);
+- every live block of 1 MiB and up.
+
+| Run | Heap high-water | Peak footprint | At the high-water |
+|---|---|---|---|
+| Whole lock (s16) | 116.6 MiB | 101.4 MiB | Loop holds 6.7 MiB of answers; 13 requests open |
+| Git only (s17) | 60.4 MiB | 52.8 MiB | Loop holds 15.3 MiB (packs); 0 requests open |
+| Crates only (s18) | 101.1 MiB | 93.0 MiB | Loop holds 1.3 MiB; 15 requests open; 14 blocks of 1 MiB and up, 92.2 MiB in all: 16, 16, 14.5, 12, 8, 4, 4, 4, 3.1, 3, 3, 2 MiB |
+
+The same lock peaks between 85 and 117 MiB from run to run (the earlier row's 84.8 MiB is one such run).
+
+So the peak is answer bodies in blaze-http and the mailbox: the loop holds little of it. The
+powers of two show bodies grown by doubling in blaze-http's driver (`driver.rs`: `body.extend_from_slice`).
+Up to half of each such block is spare capacity.
+
+The floor is about 12 MiB: what is live with nothing in flight (7.6 MiB at the end), plus each open
+request's read-ahead window (`WINDOW`, 256 KiB, times 15 open requests). An answer is not needed
+whole in memory: it can go into its scratch file as it arrives, hashed as it goes, and be unpacked
+from that mapping once its digest matches. The ratio is 93.0 / 12, about 8x. The mechanism costing
+it is whole bodies in the heap; the end state is a body written straight to a scratch file
+(`Effect::Reserve` sized by Content-Length for a `.crate`). It is not built.
+
+The peak is one crate, windows 0.61.3: a 109 MiB record (floor: that record plus what is in
+flight). reth's pack: base cache 383 hits of 570 delta reads, at most 1.6 MiB held.
+
+Reading in place (store s08, warm): all 1,173 records opened by id and every `Cargo.toml` (1,344)
+read: 28.9 ms with `open_source_put`, 563 ms with `open_source` (the BLAKE3 of 1.2 GB), footprint
+5 MiB. windows' 721 files read whole at 22.6 GB/s.
+
+## For a successor
+
+- Work in /Volumes/Projects/blaze-fresh-1115; build only via
+  /Volumes/Projects/blaze-int-1112-notes/lanecheck.sh and examplerun.sh. tempo's checkout is
+  read-only input. Stores go in a new named folder each run; s08-v3-all is read by the unit graph.
+- Done:
+  - records made in place by the library (`Effect::Reserve`, from `reserve_from`);
+  - one loop (`drive::step`) and one machine a command (`Machine::wanting`);
+  - the `Fetch` task's pure half (`blaze_drive::fetch_task`);
+  - the git origin in the simulation;
+  - the system trust store (`blaze_core::trust`, `blaze_http::roots::system`/`with_der`), with
+    `native-roots` deleted.
+- The trust tests are green: `lanecheck.sh blaze-core test trust` gave "check ok (all targets)",
+  3 passed, 0 failed, on 2026-11-16. The driver lane has been told to swap its `NotReadYet` stub for
+  `blaze_http::roots::system(roots::Places { cert_file, cert_dir }) -> Result<Arc<ClientConfig>, TlsSetup>`.
+  A configured bundle goes through `trust::pem::certificates` and then
+  `roots::with_der(impl Iterator<Item = &[u8]>) -> Result<Arc<ClientConfig>, TlsSetup>`.
+- Open, in order:
+  1. **The cost to a command that never fetches.** Measure only after the driver's swap. Before it,
+     nothing reaches rustls and the optimizer drops the stack: on 2026-11-16 the `fetch` binary
+     (7,914,400 bytes, tree 6453171635) linked only libSystem and held no rustls string.
+     - Build both sides, two builds in all:
+       - `GREENMIX_KEEP_AS=blaze-fetch bash greenmix.sh blaze-cli --release`;
+       - `GREENMIX_FEATURES=--no-default-features GREENMIX_KEEP_AS=blaze-nofetch bash greenmix.sh blaze-cli --release`.
+     - Quote each run's tree id.
+     - Check with `strings` that the with-fetch binary really holds the TLS stack.
+     - Then compare: size, bare `blaze` (instructions, page faults), and a repeat `blaze check` on a
+       copy of hello world.
+     - Check with `otool -L` that Security is not a load-time library.
+  2. **Memory's end state.** Each body goes straight into its scratch file as it arrives (an
+     `Effect::Reserve` sized by Content-Length for a `.crate`), hashed on the way, and is unpacked
+     from the mapping once its digest matches.
+     - Target: the floor of about 12 MiB.
+     - Baseline: the three runs in Numbers (101.4, 52.8 and 93.0 MiB peak footprint).
+  3. **`trust/linux.rs`** has not been compiled. CI's `cargo` job (linux arm64,
+     `.github/workflows/blaze.yaml`) will be its first build.
+  4. **The first-use counter test.** A program-level test that the store is read on the first
+     connection and never at start: the count is 0 after start and 1 after the first fetch.
+     Today only `trust::macos::reads()` rising on an explicit call is tested.
+  5. **`Effect::Roots`**, which the effect lane wires after Boot.
+- Lane ids: read /Volumes/Projects/blaze-int-1112-notes/OWNERS.md, never a brief.

@@ -227,13 +227,11 @@ fn inherited(root: &Path, fd: RawFd, at: &crate::FileName) -> io::Result<Listene
         let mut len = size_of::<libc::c_int>() as libc::socklen_t;
         // SAFETY: `value` and `len` are valid for writes of the sizes `len` says.
         let got = unsafe {
-            libc::getsockopt(
-                copy.as_raw_fd(),
-                libc::SOL_SOCKET,
-                name,
-                (&raw mut value).cast(),
-                &raw mut len,
-            )
+            libc::getsockopt(copy.as_raw_fd(),
+            libc::SOL_SOCKET,
+            name,
+            (&raw mut value).cast(),
+            &raw mut len,)
         };
         if got < 0 {
             return Err(io::Error::last_os_error());

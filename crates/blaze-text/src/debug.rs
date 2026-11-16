@@ -17,16 +17,23 @@
 //! the pinned nightly's reflection gives it no size (seen on `Option<NonZero<u32>>`), so no
 //! vtable is found for it, and its own form could not be found either.
 //!
-//! What it cannot know. Reflection on the pinned nightly names no enum variant's
-//! discriminant, so the active variant is taken to be the one whose index equals the value's
-//! discriminant: right for every enum that sets no discriminant by hand. An enum that does
-//! (`Red = 1`) implements [`DebugForm`]; a discriminant past the last variant stops with a
-//! panic naming the type. A `#[repr(packed)]` struct also implements [`DebugForm`]: its fields
-//! are not aligned, and the walk reads a field in place.
+//! Enums. A value gives its discriminant (`discriminant_value`), not its variant's index, and
+//! reflection on the pinned nightly (and upstream, 5fb8a16f5f) names no variant's
+//! discriminant, so which variant a value is can be read only where index and discriminant
+//! are known to be equal. That is proved for `core::option::Option` and
+//! `core::result::Result` (their definitions in the pinned `core` set no discriminant, and the
+//! name `core::..` can be no other crate's), and nothing else ([`reads_variants`]). Every other
+//! enum stops the build with a message naming it and the line that gives it its own form:
+//! [`crate::debug_variants!`] for a fieldless enum (an exhaustive `match`, so it is right by
+//! construction), else an `impl DebugForm`. What the compiler fork needs to lift this: a
+//! compile-time intrinsic `type_id_variant_discriminant(TypeId, usize) -> u128` (the bits of
+//! `AdtDef::discriminant_for_variant`, beside `type_id_variant_name` in
+//! rustc_const_eval/src/const_eval/machine.rs), so the walk maps a discriminant to its index.
+//! A `#[repr(packed)]` struct implements [`DebugForm`]: its fields are not aligned, and the
+//! walk reads a field in place.
 //!
-//! Strings and characters are escaped as [`crate::escape::rust`] does: the same as `{:?}` on
-//! ASCII; other characters are copied as they are, where `{:?}` escapes the non-printable
-//! ones.
+//! Strings and characters are escaped exactly as `{:?}` escapes them, non-ASCII included
+//! (`char::escape_debug`: non-printable and grapheme-extending characters as `\u{..}`).
 //!
 //! Two traps of the pinned nightly, kept clear of. Reflection's `info()` panics the compiler
 //! on every tuple (crates/blaze-std/src/own/raw.rs says where), so a tuple is known by its
@@ -37,6 +44,7 @@ use core::alloc::Allocator;
 use core::any::TypeId;
 use core::marker::PhantomData;
 use core::mem::type_info::{self, TypeKind};
+use core::ops::{Range, RangeInclusive};
 use core::ptr::{self, DynMetadata, NonNull};
 
 use blaze_own::{Arc, BTreeMap, BTreeSet, Box, FixedString, Rc, SortedMap, SortedSet, String, Vec, VecDeque};
@@ -169,7 +177,7 @@ unsafe fn walk(form: Form, at: *const u8, variant: u128, out: &mut dyn Put) {
             Form::Signed(_) => _ = out.int(at.cast::<i128>().read()),
             Form::Float(4) => _ = out.float_debug(at.cast::<f32>().read()),
             Form::Float(_) => _ = out.float_debug(at.cast::<f64>().read()),
-            Form::Str => _ = out.escaped(&*at.cast::<*const str>().read()),
+            Form::Str => str_debug(&*at.cast::<*const str>().read(), out),
             Form::Slice { element, stride } => {
                 let slice = at.cast::<*const [u8]>().read();
                 elements(slice.cast::<u8>(), slice.len(), stride, element, out);
@@ -290,18 +298,46 @@ fn is_index(name: &str) -> bool {
     !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// A `char` as `{:?}` writes it: `'a'`, `'\''`, `'\n'`, `'\u{1b}'`.
+/// A `char` as `{:?}` writes it: `'a'`, `'\''`, `'"'`, `'\n'`, `'\u{1b}'`, `'\u{301}'`.
 fn char_debug(c: char, out: &mut dyn Put) {
     out.put_byte(b'\'');
     match c {
-        '\'' => out.put_str("\\'"),
+        // `{:?}` of a `char` leaves the double quote alone and escapes the single one.
         '"' => out.put_byte(b'"'),
-        _ => {
-            let mut bytes = [0u8; 4];
-            crate::escape::rust(c.encode_utf8(&mut bytes), out);
-        }
+        _ => escape_char(c, out),
     }
     out.put_byte(b'\'');
+}
+
+/// Text as `{:?}` writes it: in double quotes, `"` and `\` and control characters escaped, and
+/// every character `char::escape_debug` escapes (non-printable, grapheme-extending) as
+/// `\u{..}`; the single quote is left alone. Plain printable ASCII is copied in runs.
+pub(crate) fn str_debug(text: &str, out: &mut dyn Put) {
+    out.put_byte(b'"');
+    let mut start = 0;
+    for (i, c) in text.char_indices() {
+        let plain = match c {
+            '"' | '\\' => false,
+            ' '..='~' => true,
+            _ if c.is_ascii() => false,
+            _ => c.escape_debug().len() == 1,
+        };
+        if plain {
+            continue;
+        }
+        out.put_str(&text[start..i]);
+        escape_char(c, out);
+        start = i + c.len_utf8();
+    }
+    out.put_str(&text[start..]);
+    out.put_byte(b'"');
+}
+
+/// `c` as `char::escape_debug` gives it.
+fn escape_char(c: char, out: &mut dyn Put) {
+    for piece in c.escape_debug() {
+        out.char(piece);
+    }
 }
 
 // What runs at compile time: reading a type's form from its reflection.
@@ -351,12 +387,91 @@ fn form_of(id: TypeId, name: &'static str) -> Form {
             let fields = fields_of(id, 0, name);
             Form::Struct(Parts { name: short_name(name), fields, named: named(fields) })
         }
-        TypeKind::Enum => {
+        TypeKind::Enum if reads_variants(name) => {
             let count = id.variants();
             Form::Enum { type_name: name, variants: variants_of(id, count, name) }
         }
+        TypeKind::Enum => refuse_enum(id, name),
         _ => refuse(name, "is a union, a closure, a `dyn` or another type reflection gives no fields for"),
     }
+}
+
+/// Whether the enum named `name` is one whose variant indexes are proved equal to its
+/// discriminants: `core`'s `Option` and `Result`, whose definitions in the pinned `core` set
+/// no discriminant by hand. No other enum: reflection names no variant's discriminant, so for
+/// any other the index a value's discriminant names cannot be shown to be its variant's.
+#[rustc_comptime]
+pub(crate) fn reads_variants(name: &str) -> bool {
+    starts_with(name, "core::option::Option<") || starts_with(name, "core::result::Result<")
+}
+
+/// Whether `T` is an enum the walk reads, for the tests.
+#[cfg(test)]
+#[rustc_comptime]
+pub(crate) fn walks_enum<T>() -> bool {
+    reads_variants(core::intrinsics::reflection::type_name::<T>())
+}
+
+#[rustc_comptime]
+fn starts_with(name: &str, prefix: &str) -> bool {
+    let (name, prefix) = (name.as_bytes(), prefix.as_bytes());
+    if name.len() < prefix.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < prefix.len() {
+        if name[i] != prefix[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Stops the build at an enum whose variants the walk cannot read, naming it and the one line
+/// that gives it its own form.
+#[rustc_comptime]
+fn refuse_enum(id: TypeId, name: &'static str) -> ! {
+    let count = id.variants();
+    let mut fieldless = true;
+    let mut i = 0;
+    while i < count {
+        if id.fields(i) > 0 {
+            fieldless = false;
+        }
+        i += 1;
+    }
+    let why = "blaze-text: no debug form for the enum `";
+    let cannot = "`: reflection names no variant's discriminant, so which variant a value is cannot be read from it (blaze-text's debug module says why); give it its own form: ";
+    if !fieldless || count == 0 {
+        panic!("{}", join(&[why, name, cannot, "`impl blaze_text::DebugForm for ", short_name(name), " { .. }`"]));
+    }
+    // `blaze_text::debug_variants!(Name { A, B, C });`
+    let room = 2 * count + 6;
+    let pieces = allocate::<&str>(room);
+    let mut n = 0;
+    n = push(pieces, room, n, why);
+    n = push(pieces, room, n, name);
+    n = push(pieces, room, n, cannot);
+    n = push(pieces, room, n, "`blaze_text::debug_variants!(");
+    n = push(pieces, room, n, short_name(name));
+    let mut i = 0;
+    while i < count {
+        n = push(pieces, room, n, if i == 0 { " { " } else { ", " });
+        n = push(pieces, room, n, id.variant(i).name());
+        i += 1;
+    }
+    n = push(pieces, room, n, " });`");
+    panic!("{}", join(keep(pieces, n)))
+}
+
+/// `piece` at `pieces[n]`, of `room`; the next `n`.
+#[rustc_comptime]
+fn push(pieces: *mut &'static str, room: usize, n: usize, piece: &'static str) -> usize {
+    assert!(n < room, "blaze-text: the refusal's pieces outgrew their room");
+    // SAFETY: `n < room`, the room `pieces` was allocated with.
+    unsafe { pieces.add(n).write(piece) };
+    n + 1
 }
 
 /// The form of a reference to `pointee`.
@@ -525,13 +640,13 @@ fn map<'a, K: 'a, V: 'a>(entries: impl Iterator<Item = (&'a K, &'a V)>, out: &mu
 
 impl<A: Allocator> DebugForm for String<A> {
     fn debug_form(&self, out: &mut dyn Put) {
-        out.escaped(self.as_str());
+        str_debug(self.as_str(), out);
     }
 }
 
 impl<const N: usize> DebugForm for FixedString<N> {
     fn debug_form(&self, out: &mut dyn Put) {
-        out.escaped(self.as_str());
+        str_debug(self.as_str(), out);
     }
 }
 
@@ -593,6 +708,39 @@ impl<T, A: Allocator> DebugForm for BTreeSet<T, A> {
 impl<T: ?Sized> DebugForm for PhantomData<T> {
     fn debug_form(&self, out: &mut dyn Put) {
         out.str("PhantomData<").str(core::any::type_name::<T>()).put_byte(b'>');
+    }
+}
+
+/// A fieldless enum's debug form from its variant list, in one line:
+/// `blaze_text::debug_variants!(Color { Red, Green, Blue });`. It is an exhaustive `match`, so
+/// a variant left out or misnamed does not build, and set discriminants (`Red = 1`) cannot
+/// make it name the wrong one. The build's refusal of an enum prints this line for it.
+#[macro_export]
+macro_rules! debug_variants {
+    ($ty:ty { $($variant:ident),+ $(,)? }) => {
+        impl $crate::DebugForm for $ty {
+            fn debug_form(&self, out: &mut dyn $crate::Put) {
+                $crate::Put::put_str(out, match self {
+                    $(Self::$variant => ::core::stringify!($variant),)+
+                });
+            }
+        }
+    };
+}
+
+debug_variants!(core::cmp::Ordering { Less, Equal, Greater });
+
+/// `3..7`, as `{:?}` writes a range.
+impl<T> DebugForm for Range<T> {
+    fn debug_form(&self, out: &mut dyn Put) {
+        out.debug(&self.start).str("..").debug(&self.end);
+    }
+}
+
+/// `3..=7`.
+impl<T> DebugForm for RangeInclusive<T> {
+    fn debug_form(&self, out: &mut dyn Put) {
+        out.debug(self.start()).str("..=").debug(self.end());
     }
 }
 

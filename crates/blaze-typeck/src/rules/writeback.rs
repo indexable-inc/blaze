@@ -15,7 +15,7 @@
 
 use blaze_own::{Alloc, Soa, Vec};
 
-use crate::columns::{Adjusts, Callees, Captures, Checked, Fields};
+use crate::columns::{Adjusts, Callees, Captures, Checked, ExprDefs, Fields, PatDefs};
 use crate::diag::{At, Diag, DiagCode};
 use crate::error::{CheckError, Limit};
 use blaze_hash::HashMap;
@@ -63,12 +63,21 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
         };
         match v {
-            TyView::Tuple(l) | TyView::Adt(_, l) | TyView::FnDef(_, l) | TyView::FnPtr(l) | TyView::Opaque(_, l) => {
+            TyView::Tuple(l) | TyView::Adt(_, l) | TyView::FnDef(_, l) | TyView::FnPtr(l, _) | TyView::Opaque(_, l) => {
                 list(l, out)
             }
             TyView::Alias { args, .. } => list(args, out),
-            TyView::Ref(_, t) | TyView::Ptr(_, t) | TyView::Array(t, _) | TyView::Slice(t) | TyView::Closure(_, t) => {
+            TyView::Dynamic(l) | TyView::ExTrait(_, l) | TyView::ExProj { args_term: l, .. } => list(l, out),
+            TyView::Ref(_, t) | TyView::Ptr(_, t) | TyView::Slice(t) | TyView::Closure(_, t) | TyView::ConstValue { ty: t, .. } => {
                 out.push(t)
+            }
+            TyView::Future(_, o, i) | TyView::Array(o, i) => {
+                out.push(o);
+                out.push(i);
+            }
+            TyView::Pat(b, l) => {
+                out.push(b);
+                list(l, out)
             }
             TyView::Bool
             | TyView::Char
@@ -79,9 +88,29 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             | TyView::Never
             | TyView::Param(_)
             | TyView::Infer(_)
+            | TyView::ConstParam(_)
+            | TyView::ConstInfer(_)
+            | TyView::ExAuto(_)
             | TyView::Error => {}
         }
     }
+
+    /// An unmet goal of a finding, into the record's table: each argument exported, then the list.
+    fn export_goal(&mut self, ex: &mut Export<'a>, g: crate::diag::PendingGoal, at: At) -> Result<crate::diag::UnmetGoal, CheckError> { use crate::diag::{PendingGoal, UnmetGoal};
+    let (PendingGoal::Trait { args, .. } | PendingGoal::Projection { args, .. }) = g;
+    let n = self.ty.list_len(args);
+    let mut v: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(n as usize, self.alloc);
+    for i in 0..n {
+        let t = self.ty.list_get(args, i);
+        v.push(self.export(ex, t, at)?);
+    }
+    let list = ex.out.intern_list(&v)?;
+    Ok(match g {
+        PendingGoal::Trait { trait_, .. } => UnmetGoal::Trait { trait_, args: list },
+        PendingGoal::Projection { trait_, name, term, .. } => {
+            UnmetGoal::Projection { trait_, args: list, name, term: self.export(ex, term, at)? }
+        }
+    }) }
 
     fn export_list(&mut self, ex: &mut Export<'a>, l: TyList) -> Result<List, CheckError> {
         let n = self.ty.list_len(l);
@@ -130,7 +159,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
             kids.clear();
             self.ty_children(v, &mut kids);
-            let mut holds_var = matches!(v, TyView::Infer(_));
+            let mut holds_var = matches!(v, TyView::Infer(_) | TyView::ConstInfer(_));
             for &k in kids.iter() {
                 let k = self.ty.shallow_resolve(k);
                 holds_var |= ex.holds_var(k);
@@ -160,17 +189,36 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 TyView::Tuple(l) => PNode::Tuple(self.export_list(ex, l)?),
                 TyView::Ref(m, c) => PNode::Ref(m, one(ex, c, self.ty)?),
                 TyView::Ptr(m, c) => PNode::Ptr(m, one(ex, c, self.ty)?),
-                TyView::Array(c, n) => PNode::Array(one(ex, c, self.ty)?, n),
+                TyView::Array(c, n) => PNode::Array(one(ex, c, self.ty)?, one(ex, n, self.ty)?),
                 TyView::Slice(c) => PNode::Slice(one(ex, c, self.ty)?),
+                TyView::Pat(c, l) => PNode::Pat(one(ex, c, self.ty)?, self.export_list(ex, l)?),
                 TyView::Adt(k, l) => PNode::Adt(k, self.export_list(ex, l)?),
                 TyView::FnDef(k, l) => PNode::FnDef(k, self.export_list(ex, l)?),
-                TyView::FnPtr(l) => PNode::FnPtr(self.export_list(ex, l)?),
+                TyView::FnPtr(l, h) => PNode::FnPtr(self.export_list(ex, l)?, h),
                 TyView::Closure(e, sig) => PNode::Closure(e, one(ex, sig, self.ty)?),
+                TyView::Future(e, o, i) => PNode::Future(e, one(ex, o, self.ty)?, one(ex, i, self.ty)?),
                 TyView::Param(i) => PNode::Param(i),
                 TyView::Alias { trait_, name, args } => PNode::Alias { trait_, name, args: self.export_list(ex, args)? },
                 TyView::Opaque(k, l) => PNode::Opaque(k, self.export_list(ex, l)?),
+                TyView::ConstValue { ty, bits } => PNode::ConstValue { ty: one(ex, ty, self.ty)?, bits },
+                TyView::ConstParam(i) => PNode::ConstParam(i),
+                TyView::Dynamic(l) => PNode::Dynamic(self.export_list(ex, l)?),
+                TyView::ExTrait(k, l) => PNode::ExTrait(k, self.export_list(ex, l)?),
+                TyView::ExProj { trait_, name, args_term } => {
+                    let n = self.ty.list_len(args_term);
+                    let mut v: Vec<PTy, Alloc<'a>> = Vec::with_capacity_in(n as usize, self.alloc);
+                    for i in 0..n {
+                        let c = self.ty.list_get(args_term, i);
+                        v.push(one(ex, c, self.ty)?);
+                    }
+                    let Some((&term, args)) = v.split_last() else {
+                        return Err(CheckError::Malformed(crate::error::Malformed::ObjectPreds { node: x.0 }));
+                    };
+                    PNode::ExProj { trait_, name, args: ex.out.intern_list(args)?, term }
+                }
+                TyView::ExAuto(k) => PNode::ExAuto(k),
                 // A variable is `holds_var` above.
-                TyView::Infer(_) | TyView::Error => PNode::Error,
+                TyView::Infer(_) | TyView::ConstInfer(_) | TyView::Error => PNode::Error,
             };
             let p = ex.out.intern(node)?;
             ex.insert(x, p, false);
@@ -223,6 +271,17 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             callees.push((e, item, l));
         }
         callees.sort_by_key(|rows, i| rows.column::<0>()[i]);
+        let mut expr_defs: ExprDefs<'a> = Soa::new_in(alloc);
+        let mut pat_defs: PatDefs<'a> = Soa::new_in(alloc);
+        for &(at, d) in self.defs.iter() {
+            match at {
+                At::Expr(e) => expr_defs.push((e, d)),
+                At::Pat(p) => pat_defs.push((p, d)),
+                At::Body => {}
+            }
+        }
+        expr_defs.sort_by_key(|rows, i| rows.column::<0>()[i]);
+        pat_defs.sort_by_key(|rows, i| rows.column::<0>()[i]);
         let mut fields: Fields<'a> = Soa::with_capacity_in(self.fields.len(), alloc);
         for &(e, v, f) in self.fields.iter() {
             fields.push((e, v, f));
@@ -246,9 +305,53 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 Some(t) => Some(self.export(&mut ex, t, d.at)?),
                 None => None,
             };
-            diags.push(Diag { code: d.code, at: self.range_of(d.at), expected, found, name: d.name });
+            let at = self.range_of(d.at);
+            if at.end <= at.start && !d.code.covers_the_item() {
+                return Err(CheckError::DiagWithoutPlace { code: d.code, name: d.name }.into());
+            }
+            let because = match d.unmet {
+                Some((goal, leaf)) => {
+                    let goal = self.export_goal(&mut ex, goal, d.at)?;
+                    let leaf = match leaf {
+                        Some(l) => Some(self.export_goal(&mut ex, l, d.at)?),
+                        None => None,
+                    };
+                    Some(crate::diag::Because::Unmet { goal, leaf })
+                }
+                None => d.because,
+            };
+            diags.push(Diag { code: d.code, at, expected, found, name: d.name, because });
         }
         let (reads, needs) = self.reads.finish(alloc);
+        // Writeback runs only when the walk finished (`needs` here are prefetch hints for next
+        // time, not open questions): with no diagnostic, every recorded type must be named.
+        if diags.is_empty() {
+            // `local_ty` has a row per pattern; only a binding's row is a recorded type.
+            let mut binds: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(self.body.pats.len(), alloc);
+            for p in self.body.pats {
+                binds.push(matches!(p, crate::body::Pat::Bind { .. }));
+            }
+            let mut holes: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(self.body.exprs.len(), alloc);
+            for e in self.body.exprs {
+                holes.push(matches!(e, crate::body::Expr::Missing));
+            }
+            // A pattern hole (`Pat::Missing`: a tuple's or struct's `..`, in no list) has no
+            // value, as an expression hole has none.
+            let mut pat_holes: Vec<bool, Alloc<'a>> = Vec::with_capacity_in(self.body.pats.len(), alloc);
+            for p in self.body.pats {
+                pat_holes.push(matches!(p, crate::body::Pat::Missing));
+            }
+            let r = Recs { types: &ex.out, expr_ty: &expr_ty, pat_ty: &pat_ty, local_ty: &local_ty, binds: &binds, holes: &holes, pat_holes: &pat_holes, adjusts: &adjusts, callees: &callees };
+            if let Some(at) = first_unknown(r, alloc)? {
+                // A node the walk never reached is the lowering's, not an unknown type.
+                if let crate::error::Recorded::ExprTy(x) = at
+                    && !self.reached.get(x.ix()).copied().unwrap_or(true)
+                {
+                    return Err(CheckError::Malformed(crate::error::Malformed::Unreached(x)));
+                }
+                return Err(CheckError::UnknownInCleanBody { at });
+            }
+        }
         Ok(Checked {
             types: ex.out,
             expr_ty,
@@ -256,6 +359,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             local_ty,
             adjusts,
             callees,
+            expr_defs,
+            pat_defs,
             fields,
             captures,
             diags,
@@ -274,4 +379,78 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
         self.ty.mk_list(&v)
     }
+}
+
+/// The recorded facts of one body, as written back: what [`first_unknown`] scans.
+#[derive(Clone, Copy)]
+struct Recs<'r, 'a> {
+    types: &'r PortableTys<'a>,
+    expr_ty: &'r [PTy],
+    pat_ty: &'r [PTy],
+    local_ty: &'r [PTy],
+    /// Whether each pattern is a binding (whose `local_ty` row is recorded).
+    binds: &'r [bool],
+    /// Whether each expression is `Expr::Missing`: a hole carries no value, so its row records
+    /// nothing. The lowering writes one for every node a desugaring orphaned (a destructuring
+    /// assignment's assignee: Reference, "Assignee expressions": not a value expression).
+    holes: &'r [bool],
+    pat_holes: &'r [bool],
+    adjusts: &'r Adjusts<'a>,
+    callees: &'r Callees<'a>,
+}
+
+/// The first recorded fact of a clean body that holds the error type or a hole, in the order
+/// expression types, pattern types, binding types, adjustments, callees' arguments. A table's
+/// children come before their parent (`Malformed::TypeOrder`), so one pass in index order
+/// marks every node holding one: no recursion, linear in the table.
+fn first_unknown(r: Recs<'_, '_>, alloc: Alloc<'_>) -> Result<Option<crate::error::Recorded>, CheckError> {
+    use crate::error::Recorded;
+    let v = r.types.view();
+    let mut bad: Vec<bool, Alloc<'_>> = Vec::with_capacity_in(v.nodes.len(), alloc);
+    for &n in v.nodes {
+        let any = |l: List| -> Result<bool, CheckError> { Ok(v.list(l)?.iter().any(|c| bad.get(c.0 as usize).copied().unwrap_or(true))) };
+        let one = |c: PTy| bad.get(c.0 as usize).copied().unwrap_or(true);
+        let held = match n {
+            PNode::Error | PNode::Infer => true,
+            PNode::Bool
+            | PNode::Char
+            | PNode::Int(_)
+            | PNode::Uint(_)
+            | PNode::Float(_)
+            | PNode::Str
+            | PNode::Never
+            | PNode::Param(_)
+            | PNode::ConstParam(_)
+            | PNode::ExAuto(_) => false,
+            PNode::Ref(_, c) | PNode::Ptr(_, c) | PNode::Slice(c) | PNode::Closure(_, c) | PNode::ConstValue { ty: c, .. } => one(c),
+            PNode::Array(a, b) | PNode::Future(_, a, b) => one(a) || one(b),
+            PNode::Pat(c, l) => one(c) || any(l)?,
+            PNode::ExProj { args, term, .. } => one(term) || any(args)?,
+            PNode::Tuple(l)
+            | PNode::Adt(_, l)
+            | PNode::FnDef(_, l)
+            | PNode::FnPtr(l, _)
+            | PNode::Alias { args: l, .. }
+            | PNode::Opaque(_, l)
+            | PNode::Dynamic(l)
+            | PNode::ExTrait(_, l) => any(l)?,
+        };
+        bad.push(held);
+    }
+    let is_bad = |t: PTy| bad.get(t.0 as usize).copied().unwrap_or(true);
+    let firsts = [
+        r.expr_ty.iter().enumerate().position(|(i, &t)| !r.holes.get(i).copied().unwrap_or(false) && is_bad(t)).map(|i| Recorded::ExprTy(ExprId(i as u32))),
+        r.pat_ty.iter().enumerate().position(|(i, &t)| !r.pat_holes.get(i).copied().unwrap_or(false) && is_bad(t)).map(|i| Recorded::PatTy(PatId(i as u32))),
+        r.local_ty.iter().enumerate().position(|(i, &t)| r.binds.get(i).copied().unwrap_or(false) && is_bad(t)).map(|i| Recorded::LocalTy(PatId(i as u32))),
+        r.adjusts.column::<2>().iter().position(|&t| is_bad(t)).map(|i| Recorded::Adjust(r.adjusts.column::<0>()[i])),
+    ];
+    if let Some(at) = firsts.into_iter().flatten().next() {
+        return Ok(Some(at));
+    }
+    for i in 0..r.callees.len() {
+        if v.list(r.callees.column::<2>()[i])?.iter().any(|&t| is_bad(t)) {
+            return Ok(Some(Recorded::Callee(r.callees.column::<0>()[i])));
+        }
+    }
+    Ok(None)
 }

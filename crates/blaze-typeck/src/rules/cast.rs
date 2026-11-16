@@ -41,7 +41,7 @@ enum Kind {
 impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
     pub(crate) fn expr_cast(&mut self, mut f: Frame, e: ExprId, operand: ExprId, ty: PTy) -> Result<Flow, Stop> {
         if f.state == 0 {
-            let to = self.lower_body_ty(ty)?;
+            let to = self.lower_body_ty(ty, At::Expr(e))?;
             f.t = to;
             self.resume(f, 1)?;
             self.push_expr(operand, Expectation::Castable(to), Then::Nothing)?;
@@ -63,7 +63,7 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
             TyView::Bool => Kind::IntLike,
             TyView::Char => Kind::Char,
             TyView::Ptr(..) => Kind::Ptr,
-            TyView::FnPtr(_) | TyView::FnDef(..) => Kind::FnPtr,
+            TyView::FnPtr(..) | TyView::FnDef(..) => Kind::FnPtr,
             TyView::Ref(_, inner) => match self.view(inner) {
                 TyView::Array(..) => Kind::RefArray,
                 _ => Kind::Other,

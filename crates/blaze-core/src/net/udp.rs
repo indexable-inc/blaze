@@ -108,13 +108,7 @@ fn set(
 ) -> Result<(), (&'static str, io::Error)> {
     // SAFETY: an int option of an open socket, its value on the stack for the call.
     let done = unsafe {
-        libc::setsockopt(
-            fd,
-            level,
-            name,
-            (&raw const value).cast(),
-            size_of::<libc::c_int>() as libc::socklen_t,
-        )
+        libc::setsockopt(fd, level, name, (&raw const value).cast(), size_of::<libc::c_int>() as libc::socklen_t)
     };
     match done {
         0 => Ok(()),

@@ -55,6 +55,8 @@ pub enum Rule {
     ConstArgHasType,
     /// `compute_host_effect_goal`, as its trait goal (const traits are not ported).
     HostEffect,
+    /// `where const { COND }` (`Pred::ConstHolds`): see [`const_holds`].
+    ConstHolds,
     /// Two terms equal (an equation goal of the tests and of coherence).
     Eq,
 }
@@ -307,7 +309,10 @@ impl<'a> Solver<'a> {
             };
             pred_terms(tys, c.pred, &mut chk)?;
             if infer {
-                return Err(Stop::Error(SolveError::Malformed(Malformed::Pred)));
+                // A param env is the item's written clauses: an inference variable in one is the
+                // caller's bug. The refusal names that clause as its goal.
+                let goal = Some(bad_pred_of(&*tys, c.pred));
+                return Err(Stop::Error(SolveError::Malformed(crate::error::Malformed::Pred { at: core::panic::Location::caller(), goal, asked_by: None })));
             }
             if !all.contains(&c) {
                 all.push(c);
@@ -576,25 +581,50 @@ impl<'a> Solver<'a> {
     ) -> Result<Ans, Stop> {
         loop {
             let top = self.frames.len() - 1;
-            let phase = self.frames[top].phase;
-            match phase {
-                Phase::Start => self.start(tys, facts, top)?,
-                Phase::Assemble(k) => self.assemble(tys, facts, top, k)?,
-                Phase::NextCand => self.next_cand(tys, facts, probes, top)?,
-                Phase::Step(k) => self.step(tys, facts, probes, top, k)?,
-                Phase::Nested => {
-                    if self.nested(tys, facts, snaps, probes, top)? {
-                        continue;
-                    }
+            match self.drive_one(tys, facts, snaps, probes, top) {
+                Ok(Some(done)) => return Ok(done),
+                Ok(None) => {}
+                Err(Stop::Error(SolveError::Malformed(Malformed::Pred { at, goal: None, .. }))) => {
+                    // The goal being solved names the refusal (the frame may have finished and
+                    // been popped by `finish`: then no goal is known here), and the goal that
+                    // nested it names who asked.
+                    let goal = self.frames.get(top).map(|f| bad_pred_of(tys, f.goal.pred));
+                    let asked_by = top.checked_sub(1).and_then(|p| self.frames.get(p)).map(|f| bad_pred_of(tys, f.goal.pred));
+                    return Err(Stop::Error(SolveError::Malformed(Malformed::Pred { at, goal, asked_by })));
                 }
-                Phase::Merge => {
-                    let ans = self.merge(top)?;
-                    if let Some(done) = self.finish(tys, snaps, probes, top, ans)? {
-                        return Ok(done);
-                    }
+                Err(Stop::Error(SolveError::Malformed(Malformed::Sort { term, met, at, goal: None }))) => {
+                    let goal = self.frames.get(top).map(|f| bad_pred_of(tys, f.goal.pred));
+                    return Err(Stop::Error(SolveError::Malformed(Malformed::Sort { term, met, at, goal })));
                 }
+                Err(e) => return Err(e),
             }
         }
+    }
+
+    /// One phase of the top frame: the answer when the root finished.
+    fn drive_one<T: Tys, F: Facts>(
+        &mut self,
+        tys: &mut T,
+        facts: &F,
+        snaps: &mut Vec<T::Snapshot, Alloc<'a>>,
+        probes: &mut Vec<Option<T::Snapshot>, Alloc<'a>>,
+        top: usize,
+    ) -> Result<Option<Ans>, Stop> {
+        let phase = self.frames[top].phase;
+        match phase {
+            Phase::Start => self.start(tys, facts, top)?,
+            Phase::Assemble(k) => self.assemble(tys, facts, top, k)?,
+            Phase::NextCand => self.next_cand(tys, facts, probes, top)?,
+            Phase::Step(k) => self.step(tys, facts, probes, top, k)?,
+            Phase::Nested => {
+                self.nested(tys, facts, snaps, probes, top)?;
+            }
+            Phase::Merge => {
+                let ans = self.merge(top)?;
+                return self.finish(tys, snaps, probes, top, ans);
+            }
+        }
+        Ok(None)
     }
 
     fn cx<'c, T: Tys, F: Facts>(&'c mut self, tys: &'c mut T, facts: &'c F, top: usize) -> Cx<'c, 'a, T, F> {
@@ -691,7 +721,7 @@ impl<'a> Solver<'a> {
                 Kind::Trait => trait_goals::assemble(&mut cx, stage, &mut st, &mut out)?,
                 Kind::Alias => crate::alias::assemble(&mut cx, stage, &mut out)?,
                 Kind::WellFormed => {
-                    let Pred::WellFormed(t) = f.goal.pred else { return Err(Stop::Error(SolveError::Malformed(Malformed::Pred))) };
+                    let Pred::WellFormed(t) = f.goal.pred else { return Err(Stop::Error(SolveError::Malformed(crate::error::bad_pred()))) };
                     crate::structural::assemble_wf(&mut cx, t, &mut out)?;
                     AStep::Done
                 }
@@ -703,6 +733,7 @@ impl<'a> Solver<'a> {
                         Pred::DynCompatible(_) => Rule::DynCompatible,
                         Pred::ConstArgHasType { .. } => Rule::ConstArgHasType,
                         Pred::HostEffect { .. } => Rule::HostEffect,
+                        Pred::ConstHolds { .. } => Rule::ConstHolds,
                         _ => Rule::Eq,
                     };
                     out.push(Cand::new(Source::Builtin(crate::assembly::BuiltinSource::Misc), CandRule::Other(rule)));
@@ -1274,7 +1305,7 @@ fn pred_terms<T: Tys>(tys: &T, p: Pred, f: &mut impl FnMut(Ty) -> Result<(), Sol
         Ok(())
     };
     match p {
-        Pred::Trait { args, .. } | Pred::HostEffect { args, .. } => list(args, f),
+        Pred::Trait { args, .. } | Pred::HostEffect { args, .. } | Pred::ConstHolds { args, .. } => list(args, f),
         Pred::Projection { alias: a, term: b }
         | Pred::NormalizesTo { alias: a, term: b }
         | Pred::TypeOutlives { ty: a, region: b }
@@ -1314,19 +1345,20 @@ fn import_pred<T: Tys>(
     Ok(match pred {
         Pred::Trait { trait_, args: a, polarity } => Pred::Trait { trait_, args: list(tys, s, a)?, polarity },
         Pred::HostEffect { trait_, args: a, constness } => Pred::HostEffect { trait_, args: list(tys, s, a)?, constness },
+        Pred::ConstHolds { cond, args: a } => Pred::ConstHolds { cond, args: list(tys, s, a)? },
         Pred::Projection { alias, term } => Pred::Projection { alias: inst(tys, s, alias)?, term: inst(tys, s, term)? },
         Pred::TypeOutlives { ty, region } => Pred::TypeOutlives { ty: inst(tys, s, ty)?, region: inst(tys, s, region)? },
         Pred::RegionOutlives { a, b } => Pred::RegionOutlives { a: inst(tys, s, a)?, b: inst(tys, s, b)? },
         Pred::WellFormed(t) => Pred::WellFormed(inst(tys, s, t)?),
         Pred::ConstEvaluatable(t) => Pred::ConstEvaluatable(inst(tys, s, t)?),
         Pred::DynCompatible(d) => Pred::DynCompatible(d),
-        _ => return Err(SolveError::Malformed(Malformed::Pred)),
+        _ => return Err(SolveError::Malformed(crate::error::bad_pred())),
     })
 }
 
 /// The steps of [`Rule`].
 fn step_other<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, rule: Rule) -> Result<Step, Stop> {
-    let bad = || Stop::Error(SolveError::Malformed(Malformed::Pred));
+    let bad = || Stop::Error(SolveError::Malformed(crate::error::bad_pred()));
     let is_var = |k: TyKind| matches!(k, TyKind::Infer(v) if v.kind == VarKind::Ty);
     Ok(match rule {
         Rule::Outlives | Rule::ConstArgHasType => Step::Done(Certainty::Yes),
@@ -1360,6 +1392,10 @@ fn step_other<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, rule: Rule) -> Result
             let Pred::DynCompatible(d) = cx.goal.pred else { return Err(bad()) };
             if cx.trait_def(d)?.flags.has(TraitFlags::DYN_COMPATIBLE) { Step::Done(Certainty::Yes) } else { Step::No }
         }
+        Rule::ConstHolds => {
+            let Pred::ConstHolds { cond, args } = cx.goal.pred else { return Err(bad()) };
+            const_holds(cx, cond, args)?
+        }
         Rule::HostEffect => {
             let Pred::HostEffect { trait_, args, .. } = cx.goal.pred else { return Err(bad()) };
             cx.add(GoalSource::Misc, Pred::Trait { trait_, args, polarity: Polarity::Positive });
@@ -1368,5 +1404,120 @@ fn step_other<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, rule: Rule) -> Result
     })
 }
 
+/// `where const { COND }` at `args` (extensions.md, `where const`). The clause is a nested goal
+/// of its impl, so `false` fails that impl's goal; it never sends selection elsewhere.
+/// - Coherence: ambiguous, so a condition never proves two impls disjoint.
+/// - An argument still an inference variable (or a non-rigid alias): ambiguous, a stall.
+/// - An argument over a generic parameter, a placeholder or an opaque type: undecided for a
+///   generic type, so the clause fails (never true, never stalled forever).
+/// - Every argument ground: the world's answer; `Missing` is this goal's `Need`.
+fn const_holds<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cond: Def, args: crate::term::List) -> Result<Step, Stop> {
+    if cx.mode == TypingMode::Coherence {
+        return Ok(Step::Done(Certainty::Ambiguous));
+    }
+    let mut v = cx.list(args);
+    let mut flags = 0u16;
+    for t in v.iter_mut() {
+        *t = cx.resolve_deep(*t)?;
+        flags |= cx.tys.flags(*t).0;
+    }
+    let f = Flags(flags);
+    if f.has(Flags::HAS_INFER | Flags::HAS_NON_RIGID_ALIAS) {
+        return Ok(Step::Done(Certainty::Ambiguous));
+    }
+    // A type error is already a finding; the clause adds none of its own.
+    if f.has(Flags::HAS_ERROR) {
+        return Ok(Step::Done(Certainty::Yes));
+    }
+    if f.has(Flags::HAS_PARAM | Flags::HAS_PLACEHOLDER | Flags::HAS_BOUND | Flags::HAS_ALIAS | Flags::HAS_OPAQUE) {
+        // The item's own clause, assumed in its param env, meets the same condition at the
+        // same (hash-consed) arguments; nothing else decides it for a generic type.
+        let assumed = cx.env.iter().any(|c| match c.pred {
+            Pred::ConstHolds { cond: d, args: a } if d == cond && a.len == args.len => {
+                (0..a.len).all(|i| cx.tys.list_get(a, i) == v[i as usize])
+            }
+            _ => false,
+        });
+        return Ok(if assumed { Step::Done(Certainty::Yes) } else { Step::No });
+    }
+    let list = cx.mk_list(&v)?;
+    Ok(match cx.const_holds(cond, list, &v)? {
+        crate::facts::ConstHolds::True => Step::Done(Certainty::Yes),
+        crate::facts::ConstHolds::False | crate::facts::ConstHolds::Error => Step::No,
+    })
+}
+
 #[allow(dead_code)]
 fn unused(_: Flags) {}
+
+/// The sort and shape of one argument of a refused goal.
+fn arg_shape<T: Tys>(tys: &T, t: Ty) -> crate::error::ArgShape {
+    use crate::error::ArgShape;
+    let k = tys.kind(tys.shallow_resolve(t));
+    match k {
+        TyKind::ReStatic | TyKind::ReParam(_) | TyKind::ReErased => ArgShape::Region,
+        TyKind::Infer(v) if v.kind == VarKind::Region => ArgShape::Region,
+        TyKind::Infer(v) if v.kind == VarKind::Const => ArgShape::Const,
+        TyKind::ConstValue(..) | TyKind::ConstParam(_) => ArgShape::Const,
+        TyKind::Bound(..) | TyKind::Canonical(_) => ArgShape::Bound,
+        TyKind::Alias(_, _, d, _) => ArgShape::Alias(d),
+        _ => match crate::term::shape_of_kind(k) {
+            Some(s) => ArgShape::Ty(s),
+            None => ArgShape::Var,
+        },
+    }
+}
+
+/// A goal's predicate summarised for `Malformed::Pred`: kind, item, first argument shapes.
+fn bad_pred_of<T: Tys>(tys: &T, p: Pred) -> crate::error::BadPred {
+    use crate::error::{BadPred, PredKind};
+    let mut out = BadPred { kind: PredKind::Other, def: Def(0), args: [None; 4], n_args: 0 };
+    let mut two = |out: &mut BadPred, kind: PredKind, a: Ty, b: Ty| {
+        out.kind = kind;
+        out.args[0] = Some(arg_shape(tys, a));
+        out.args[1] = Some(arg_shape(tys, b));
+        out.n_args = 2;
+    };
+    match p {
+        Pred::Trait { trait_, args, .. } | Pred::HostEffect { trait_, args, .. } | Pred::ConstHolds { cond: trait_, args } => {
+            out.kind = match p {
+                Pred::Trait { .. } => PredKind::Trait,
+                Pred::HostEffect { .. } => PredKind::HostEffect,
+                _ => PredKind::ConstHolds,
+            };
+            out.def = trait_;
+            out.n_args = args.len;
+            for i in 0..args.len.min(4) {
+                out.args[i as usize] = Some(arg_shape(tys, tys.list_get(args, i)));
+            }
+        }
+        Pred::Projection { alias, term } => {
+            two(&mut out, PredKind::Projection, alias, term);
+            if let TyKind::Alias(_, _, d, _) = tys.kind(alias) {
+                out.def = d;
+            }
+        }
+        Pred::NormalizesTo { alias, term } => {
+            two(&mut out, PredKind::NormalizesTo, alias, term);
+            if let TyKind::Alias(_, _, d, _) = tys.kind(alias) {
+                out.def = d;
+            }
+        }
+        Pred::TypeOutlives { ty, region } => two(&mut out, PredKind::TypeOutlives, ty, region),
+        Pred::RegionOutlives { a, b } => two(&mut out, PredKind::RegionOutlives, a, b),
+        Pred::Subtype { a, b } => two(&mut out, PredKind::Subtype, a, b),
+        Pred::Coerce { a, b } => two(&mut out, PredKind::Coerce, a, b),
+        Pred::ConstArgHasType { ct, ty } => two(&mut out, PredKind::ConstArgHasType, ct, ty),
+        Pred::Eq { a, b } => two(&mut out, PredKind::Other, a, b),
+        Pred::WellFormed(t) | Pred::ConstEvaluatable(t) => {
+            out.kind = if matches!(p, Pred::WellFormed(_)) { PredKind::WellFormed } else { PredKind::ConstEvaluatable };
+            out.args[0] = Some(arg_shape(tys, t));
+            out.n_args = 1;
+        }
+        Pred::DynCompatible(d) => {
+            out.kind = PredKind::DynCompatible;
+            out.def = d;
+        }
+    }
+    out
+}

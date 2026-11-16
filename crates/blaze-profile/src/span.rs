@@ -920,7 +920,7 @@ span_kinds! {
         Crate = "crate" (Dict) fields "crate" | "krate",
             "the crate it was of: a kind's `krate`, or an ad hoc span's field `crate`; a front-end span's names one build of it, `serde v1.0.219 (lib)`, `(lib-test)` for its `cfg(test)` copy, `(lib, wasm)` for the proc macros' wasm copy";
         Function = "function" (Utf8) fields "function" | "subject",
-            "the function it was of: a `macro expand`'s macro path, what a `wait` awaits, what a `hold` holds, or an ad hoc span's field `function` or `subject`";
+            "the function it was of: a `macro expand`'s macro path, what a `wait` awaits, what a `hold` holds, or an ad hoc span's field `function` or `subject` (a macro file as its calls and source, `{macro call 3fa2.5 in macro call 77e1.3 in src/num/mod.rs}`, never a dump of its ids)";
         Unit = "unit" (Utf8) fields "unit" | "cgu",
             "the unit it was of: a unit phase's package, version and target (`serde v1.0.219 (build script)`), or an ad hoc span's field `unit` (a codegen unit)";
     }

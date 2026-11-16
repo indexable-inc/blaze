@@ -32,7 +32,7 @@
 //! shared by every reader; a read of the whole file costs a copy at memory bandwidth and the
 //! memory to hold it.
 
-use std::{fmt, fs::File, io, ops::Deref, path::Path, ptr::NonNull};
+use std::{fmt, fs::File, io, ops::Deref, path::Path, ptr::NonNull, slice};
 
 /// The file mapped read-only and shared, whole, as one [`Mapped`] that the last
 /// [`crate::Mapping`] of it unmaps.
@@ -286,6 +286,96 @@ impl Drop for Mapped {
             // once; the bytes lent by `bytes` borrow `self`, so none outlives it.
             unsafe { sys::unmap(self.base, self.slack + self.len) };
         }
+    }
+}
+
+/// A file mapped read-write and shared, for [`crate::Effect::MapWrite`]: `len` bytes that are
+/// the file's, written in place, unmapped when dropped. Durable only after a sync of the file
+/// asked once it is dropped (the effect's contract).
+pub struct MappedWrite {
+    base: NonNull<u8>,
+    len: usize,
+}
+
+// SAFETY: the mapping is this value's alone (not `Clone`, the file written by nothing else
+// while it lives, by the effect's contract), so moving it to another thread moves its only
+// writer; the bytes are plain memory.
+unsafe impl Send for MappedWrite {}
+
+impl MappedWrite {
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        if self.len == 0 {
+            return &[];
+        }
+        // SAFETY: `base` maps `len` readable bytes while `self` lives.
+        unsafe { slice::from_raw_parts(self.base.as_ptr(), self.len) }
+    }
+
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        if self.len == 0 {
+            return &mut [];
+        }
+        // SAFETY: `base` maps `len` writable bytes while `self` lives, and `&mut self` is the
+        // one borrow of them.
+        unsafe { slice::from_raw_parts_mut(self.base.as_ptr(), self.len) }
+    }
+}
+
+impl Drop for MappedWrite {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if self.len != 0 {
+            // SAFETY: mapped by `map_write` with this length, unmapped once; the bytes lent by
+            // `bytes_mut` borrow `self`, so none outlives it.
+            unsafe { sys::unmap(self.base, self.len) };
+        }
+    }
+}
+
+/// `path` made (or cut, or grown) to exactly `len` zero bytes and mapped read-write and shared,
+/// for [`crate::Effect::MapWrite`]. Unix only: elsewhere it fails, naming the effect.
+pub(crate) fn map_write(path: &Path, len: u64) -> io::Result<crate::MappingWrite> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        let file = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(path)?;
+        // Zero bytes of `len`: a hole, which takes no block until written.
+        file.set_len(len)?;
+        let len = usize::try_from(len)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "a writable mapping larger than memory"))?;
+        if len == 0 {
+            return Ok(crate::MappingWrite::file(MappedWrite { base: NonNull::dangling(), len: 0 }));
+        }
+        // SAFETY: a shared read-write mapping of `len` bytes of an open file whose length is
+        // `len`; nothing else writes, cuts or maps it while it lives (the effect's contract).
+        let at = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if at == libc::MAP_FAILED {
+            return Err(io::Error::last_os_error());
+        }
+        let base = NonNull::new(at.cast::<u8>()).expect("mmap mapped a file at address 0");
+        Ok(crate::MappingWrite::file(MappedWrite { base, len }))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, len);
+        Err(io::Error::new(io::ErrorKind::Unsupported, "Effect::MapWrite: a writable mapping is built on Unix only"))
     }
 }
 

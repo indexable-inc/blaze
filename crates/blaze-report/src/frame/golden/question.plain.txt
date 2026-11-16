@@ -1,0 +1,7 @@
+error  the `?` operator is not supported by this build of blaze yet
+  ╭─ src/main.rs:2:18
+1 │ fn main(cx: &Cx, io: Io) -> Result<(), Error> {
+2 │     io.need_out()?.line(cx, "Hello, world!")?;
+  │                  ^                          ^
+  │                  ╰─ this build of blaze cannot run this yet
+  ╰─ blaze explain not-supported-yet

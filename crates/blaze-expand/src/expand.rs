@@ -1,25 +1,24 @@
 //! [`expand`]: one macro call of one definition to its [`Expanded`].
 
 use blaze_own::Alloc;
-use mbe::DeclarativeMacro;
 
 use crate::{
     builtin,
     call::Call,
-    cx::{ExpandCx, ProcCall},
-    declarative,
+    cx::{ExpandCx, ProcCall, ProcDiagnostic},
     def::{LocalInner, MacroDefinition, MacroKind, ProcKind},
     derive,
     error::{ExpandError, Stream, Unbuilt},
     expansion::{Diagnostic, Expanded, Expansion, TokenOrigin, PathScope},
-    nested,
+    nested, rules,
     tokens::{Ctx, CtxNode, Delim, Spacing, Text, TokenKind, Transparency},
 };
 
-/// A definition made ready to expand calls: a declarative macro's rules parsed once.
+/// A definition made ready to expand calls: a declarative macro compiled once into its
+/// matching program ([`rules::Program`]).
 pub struct Prepared<'d> {
     def: &'d MacroDefinition<'d>,
-    rules: Option<DeclarativeMacro>,
+    program: Option<rules::Program<'d>>,
 }
 
 impl<'d> Prepared<'d> {
@@ -28,16 +27,18 @@ impl<'d> Prepared<'d> {
     }
 }
 
-/// Parses a declarative definition's rules; other kinds have nothing to prepare.
+/// Compiles a declarative definition's rules; other kinds have nothing to prepare. A definition
+/// whose streams cannot be read (unbalanced, or nested past the bound) is refused here; one whose
+/// rules are wrong compiles to a program that reports that on each call.
 pub fn prepare<'d>(def: &'d MacroDefinition<'_>) -> Result<Prepared<'d>, ExpandError> {
-    let rules = match def.kind() {
-        MacroKind::Rules | MacroKind::Macro2 => Some(declarative::parse(def)?),
+    let program = match def.kind() {
+        MacroKind::Rules | MacroKind::Macro2 => Some(rules::compile(def)?),
         MacroKind::BuiltinFn(_)
         | MacroKind::BuiltinAttr(_)
         | MacroKind::BuiltinDerive(_)
         | MacroKind::ProcMacro { .. } => None,
     };
-    Ok(Prepared { def, rules })
+    Ok(Prepared { def, program })
 }
 
 /// Expands `call` of `def`: the expansion, or the nested calls an eager macro needs first.
@@ -67,7 +68,7 @@ pub fn expand_prepared<'a>(
     {
         return Err(ExpandError::Unsealed { stream: Stream::Params });
     }
-    call.check()?;
+    let checked = call.check()?;
     if let Some(shape) = def.kind().shape()
         && shape != call.shape()
     {
@@ -76,8 +77,9 @@ pub fn expand_prepared<'a>(
     let mut out = Out { exp: Expansion::new_in(alloc), def, call, alloc };
     match def.kind() {
         MacroKind::Rules | MacroKind::Macro2 => {
-            let rules = prepared.rules.as_ref().expect("`prepare` parses a declarative definition");
-            declarative::expand(rules, &mut out)?;
+            let program =
+                prepared.program.as_ref().expect("`prepare` compiles a declarative definition");
+            rules::expand(program, &mut out, checked)?;
         }
         MacroKind::BuiltinFn(which) => {
             if let builtin::Step::Needs(calls) = builtin::expand(which, &mut out, cx)? {
@@ -111,11 +113,50 @@ fn proc_macro(
     if let Some(token) = produced.tokens.unbalanced() {
         return Err(ExpandError::Unbalanced { stream: Stream::Produced, token });
     }
+    // The host's output is untrusted (a wasm module's): every origin and text is checked
+    // before it is used, so none can index out of bounds.
+    for origin in produced.origins.iter() {
+        proc_origin(out.call, *origin)?;
+    }
     for (token, origin) in produced.tokens.tokens().iter().zip(produced.origins.iter()) {
         out.push(token.kind, produced.tokens.text_of(token), *origin)?;
     }
+    let len = crate::tokens::index(produced.text.len());
+    let rebase = |out: &mut Out<'_, '_>, text: Text| -> Result<Text, ExpandError> {
+        let s = text.get(&produced.text).ok_or(ExpandError::ProcMacroText { text, len })?;
+        out.note(s)
+    };
+    for diagnostic in produced.diagnostics.iter() {
+        let diagnostic = match *diagnostic {
+            ProcDiagnostic::Emitted { level, message, at } => {
+                if let Some(origin) = at {
+                    proc_origin(out.call, origin)?;
+                }
+                Diagnostic::ProcMacro { level, message: rebase(out, message)?, at }
+            }
+            ProcDiagnostic::Panicked { message } => {
+                Diagnostic::ProcMacroPanicked { message: rebase(out, message)? }
+            }
+        };
+        out.diagnose(diagnostic);
+    }
     out.exp.reads.extend(&produced.reads)?;
     Ok(())
+}
+
+/// Whether a proc macro may give `origin`: a token of its input or its attribute's arguments,
+/// or one made; never the definition's.
+fn proc_origin(call: &Call<'_>, origin: TokenOrigin) -> Result<(), ExpandError> {
+    let given = match origin {
+        TokenOrigin::Input(i) => (i as usize) < call.input().len(),
+        TokenOrigin::AttrArgs(i) => call.attr_args().is_some_and(|args| (i as usize) < args.len()),
+        TokenOrigin::Def(_) | TokenOrigin::Params(_) => false,
+        TokenOrigin::Made(_) => true,
+    };
+    match given {
+        true => Ok(()),
+        false => Err(ExpandError::ProcMacroOrigin { origin }),
+    }
 }
 
 /// An expansion being written: each token pushed with its origin, its context made from it.
@@ -142,7 +183,34 @@ impl<'a> Out<'_, 'a> {
         Ok(())
     }
 
-    fn ctx_for(&mut self, origin: TokenOrigin) -> Result<Ctx, ExpandError> {
+    /// [`Out::push`] with the context already made for `origin` ([`Out::ctx_for`]): a writer
+    /// that keeps the contexts it made for its sources pushes many tokens of one context so.
+    pub(crate) fn push_ctx(
+        &mut self,
+        kind: TokenKind,
+        text: &str,
+        origin: TokenOrigin,
+        ctx: Ctx,
+    ) -> Result<(), ExpandError> {
+        self.push_bytes_ctx(kind, text.as_bytes(), origin, ctx)
+    }
+
+    /// [`Out::push_ctx`] of a token's text read as bytes
+    /// ([`crate::tokens::TokenStream::bytes_at`]).
+    pub(crate) fn push_bytes_ctx(
+        &mut self,
+        kind: TokenKind,
+        text: &[u8],
+        origin: TokenOrigin,
+        ctx: Ctx,
+    ) -> Result<(), ExpandError> {
+        self.exp.tokens.push_bytes(kind, text, ctx)?;
+        self.exp.origins.push(origin);
+        Ok(())
+    }
+
+    /// The context of this expansion a token from `origin` gets.
+    pub(crate) fn ctx_for(&mut self, origin: TokenOrigin) -> Result<Ctx, ExpandError> {
         let (def, call) = (self.def, self.call);
         let foreign = ExpandError::ForeignOrigin { origin };
         let tokens = &mut self.exp.tokens;
@@ -218,10 +286,10 @@ impl<'a> Out<'_, 'a> {
         self.exp.diagnostics.push(diagnostic);
     }
 
-    /// The expansion: with a diagnostic, no tokens (the call's error is all it makes); else
+    /// The expansion: with an error ([`Diagnostic::is_error`]), no tokens (the call's error is all it makes); else
     /// its nested calls listed.
     fn finish(mut self) -> Result<Expanded<'a>, ExpandError> {
-        if !self.exp.diagnostics.is_empty() {
+        if self.exp.diagnostics.iter().any(Diagnostic::is_error) {
             self.exp.tokens.clear();
             self.exp.origins.clear();
             self.exp.holes.clear();

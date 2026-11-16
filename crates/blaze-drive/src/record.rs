@@ -21,8 +21,9 @@ use crate::key::{Key, Name};
 use crate::wire::{NAME_BYTES, Reader, WireError, WireWhy, Writer};
 
 /// 2: a whole record holds its split variable (drive.md, "One check covers every
-/// configuration"); a home of form 1 is refused by its magic, reported and rebuilt.
-const MAGIC: &[u8; 4] = b"BDR2";
+/// configuration"). 3: and the path of each `Locate::File` part ([`PathOf`]). A home of an older
+/// form is refused by its magic, reported and rebuilt.
+pub(crate) const MAGIC: &[u8; 4] = b"BDR3";
 const WHOLE: u8 = 1;
 const SHAPE: u8 = 2;
 
@@ -48,6 +49,18 @@ pub struct Part {
     pub place: u32,
 }
 
+/// Where a `Locate::File` part's file is: the record names the path, so a walk that reaches the
+/// part with no file for it (a first build, a record from another checkout) opens it there
+/// (`Effect::Open`): files are found forward from what was read (drive.md, "The system side").
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct PathOf<'a> {
+    pub name: Name,
+    /// Relative to the checkout, `/`-separated.
+    pub path: &'a [u8],
+    /// A `mod x;` slot: the path is `x.rs`, and `x/mod.rs` is probed beside it.
+    pub module: bool,
+}
+
 /// One finding: a lint or an error, no level, its range relative to its item's start (rule 81).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Finding<'a> {
@@ -61,6 +74,7 @@ pub struct Finding<'a> {
 const READ_BYTES: usize = NAME_BYTES + 32;
 const PART_BYTES: usize = NAME_BYTES + 1 + 32 + 4;
 const FINDING_LEAST: usize = 2 + 4 + 4 + 4;
+const PATH_LEAST: usize = NAME_BYTES + 1 + 4;
 
 /// A whole record's fields, to write.
 pub(crate) struct Whole<'a> {
@@ -69,6 +83,7 @@ pub(crate) struct Whole<'a> {
     pub(crate) out: ContentId,
     pub(crate) reads: &'a [(Name, ContentId)],
     pub(crate) parts: &'a [Part],
+    pub(crate) paths: &'a [PathOf<'a>],
     pub(crate) findings: &'a [Finding<'a>],
     pub(crate) payload: &'a [u8],
     /// A split: the task read this cfg variable unfixed, and its parts are its job re-entered
@@ -109,6 +124,12 @@ pub(crate) fn write_whole<'a>(whole: &Whole<'_>, alloc: Alloc<'a>) -> AVec<'a, u
             }
         }
         w.u32(part.place);
+    }
+    w.count(whole.paths.len());
+    for path in whole.paths {
+        w.name(path.name);
+        w.u8(u8::from(path.module));
+        w.bytes(path.path);
     }
     w.count(whole.findings.len());
     for finding in whole.findings {
@@ -155,6 +176,8 @@ pub struct WholeView<'a> {
     pub split: Option<Var>,
     reads: &'a [u8],
     parts: &'a [u8],
+    paths: &'a [u8],
+    npaths: usize,
     findings: &'a [u8],
     nfindings: usize,
     pub payload: &'a [u8],
@@ -191,6 +214,17 @@ pub fn open(bytes: &[u8]) -> Result<Stored<'_>, WireError> {
                 r.id()?;
                 r.u32().map(|_| ())
             })?;
+            let npaths = r.count(PATH_LEAST)?;
+            let start = r.position();
+            for _ in 0..npaths {
+                r.name()?;
+                let module = r.u8()?;
+                if module > 1 {
+                    return Err(r.error(WireWhy::Tag(module)));
+                }
+                r.bytes()?;
+            }
+            let paths = &bytes[start..r.position()];
             let nfindings = r.count(FINDING_LEAST)?;
             let start = r.position();
             for _ in 0..nfindings {
@@ -204,7 +238,7 @@ pub fn open(bytes: &[u8]) -> Result<Stored<'_>, WireError> {
             r.pad_to(PAYLOAD_ALIGN)?;
             let payload = r.take_bytes(len)?;
             r.done()?;
-            Ok(Stored::Whole(WholeView { name, source, out, split, reads, parts, findings, nfindings, payload }))
+            Ok(Stored::Whole(WholeView { name, source, out, split, reads, parts, paths, npaths, findings, nfindings, payload }))
         }
         SHAPE => {
             let name = r.name()?;
@@ -259,6 +293,16 @@ impl<'a> WholeView<'a> {
                 _ => Locate::Key(Key(id)),
             };
             Part { name, locate, place: r.u32().expect(CHECKED) }
+        })
+    }
+
+    /// The path of each `Locate::File` part, in the order the task gave them.
+    pub fn paths(&self) -> impl Iterator<Item = PathOf<'a>> + 'a {
+        let mut r = checked(self.paths);
+        (0..self.npaths).map(move |_| {
+            let name = r.name().expect(CHECKED);
+            let module = r.u8().expect(CHECKED) == 1;
+            PathOf { name, path: r.bytes().expect(CHECKED), module }
         })
     }
 

@@ -16,15 +16,21 @@
 #![register_tool(blaze)]
 #![forbid(unsafe_code)]
 
-#[cfg(any(test, feature = "toy"))]
+#[cfg(any(test, feature = "testing"))]
 extern crate std;
 
+mod asks;
 mod body;
 mod columns;
 mod diag;
+/// Dyn compatibility: the rule's one home (facts in, verdict out).
+pub mod dyn_compat;
 mod error;
 mod hash;
 mod ids;
+/// The real type context over blaze-ty and blaze-solve.
+pub mod infer;
+mod instance;
 mod intern;
 mod machine;
 mod portable;
@@ -34,28 +40,38 @@ mod world;
 
 #[cfg(test)]
 mod tests;
-/// The toy type context: a hash-consed type table, union-find variables and a small solver.
-/// Public under feature `toy` for the `blaze run` walking skeleton (crates/blaze-cli/tests/ladder/
-/// README.md) until crates/blaze-ty implements [`TypeCtx`]; never the real checker's context.
-#[cfg(any(test, feature = "toy"))]
-pub mod toy;
+#[cfg(test)]
+mod suite;
+/// A world and bodies written by hand, for the body suite and `examples/cost.rs`.
+#[cfg(any(test, feature = "testing"))]
+pub mod fixture;
+/// The tests' toy world (the type context is the real one, [`InferCtx`]).
+#[cfg(test)]
+mod toy;
 
 use blaze_own::Alloc;
 
-pub use body::{Arm, BinOp, BindAnn, BodyPath, BodyView, Expr, FieldInit, FieldPat, IntSuffix, Lit, Pat, Segment, Stmt, UnOp};
-pub use columns::{AdjustKind, Adjusts, Callees, CaptureKind, Captures, Checked, Fields};
-pub use diag::{Diag, DiagCode};
-pub use error::{CheckError, Limit, Malformed, Stop};
+pub use infer::{InferCtx, InferSnapshot};
+pub use instance::{ResolveError, Resolved, resolve_instance, select_impl};
+pub use asks::{Ask, AskLog, Clock, Order, R_THRESHOLD, Restarts, entries_histogram, restarts};
+pub use body::{
+    Anchor, Arm, BinOp, BindAnn, BodyPath, BodyView, Capture, CoroutineKind, Expr, FieldInit, FieldPat, FmtTrait, FmtUse,
+    IntSuffix, Lit, Pat, Segment, Stmt, UnOp,
+};
+pub use columns::{AdjustKind, Adjusts, Callees, CaptureKind, Captures, Checked, ExprDefs, Fields, PatDefs};
+pub use diag::{Because, Diag, DiagCode, UnmetGoal};
+pub use error::{CheckError, Limit, Malformed, Recorded, Stop};
 pub use hash::{ContentHash, StableHasher};
 pub use ids::{
-    Edition, ExprId, FloatTy, IntTy, ItemKey, LangItem, List, Mutbl, Name, PatId, PathIdx, Range, ScopeId, StmtId,
-    UintTy,
+    Abi, Edition, ExprId, FloatTy, FnPtrHeader, IntTy, ItemKey, LangItem, List, Mutbl, Name, PatId, PathIdx, Range,
+    Safety, ScopeId, StmtId, UintTy,
 };
-pub use portable::{PNode, PTy, PTys, PortableTys};
+pub use portable::{MAX_OBJECT_PREDS, MAX_PATTERN_RANGES, PNode, PTy, PTys, PortableTys, canonical_ranges, object_principal};
 pub use ty::{Cause, FulfillError, FulfillErrorKind, Goal, Obligation, Ty, TyList, TyView, TypeCtx, Var, VarKind};
 pub use world::{
-    Adt, AdtKind, AssocItem, AssocKind, CtorKind, Def, Fetch, Field, FnSig, Hidden, ImplHeader, Missing, Needs,
-    PClause, PathRes, Predicates, Question, ReadList, Reads, Seal, Shape, TypeAttrs, Variant, World,
+    Adt, AdtKind, ArgsAfterSelf, SplitSelf, AssocItem, AssocKind, AssocParent, AssocTyDef, ConstHolds, ConstParams, CtorKind, Def, Fetch, Field, FnSig,
+    Hidden, ImplHeader, ImplPolarity, Missing, Needs, PClause, PathRes, Predicates, Prim, Question, ReadList, Reads, RecordKind, Seal, Shape,
+    TraitDef, TraitFlags, TraitMembers, TypeAttrs, DiscrRepr, Variant, World, ground_args_digest,
 };
 
 use machine::{Machine, Plant};
@@ -92,12 +108,50 @@ pub(crate) fn check_with<'a, W: World, C: TypeCtx>(
     plant: Plant,
     alloc: Alloc<'a>,
 ) -> Result<Outcome<'a>, CheckError> {
-    let mut reads = Reads::new_in(world, alloc);
-    reads.prefetch(&hints.questions);
+    let reads = Reads::new_in(world, alloc);
+    run(body, reads, ty, hints, plant, alloc).map(|(o, _)| o)
+}
+
+/// `check` that also writes the ask log (asks.rs), reading `clock`: the measurement that
+/// decides whether re-entry from the top stays. The outcome equals `check`'s.
+pub fn check_logged<'a, 'w, W: World, C: TypeCtx>(
+    body: &BodyView<'_>,
+    world: &'w W,
+    ty: &mut C,
+    hints: &Needs<'_>,
+    clock: &'w dyn Clock,
+    alloc: Alloc<'a>,
+) -> Result<(Outcome<'a>, AskLog<'a>), CheckError> {
+    let reads = Reads::logged_in(world, clock, alloc);
+    let (o, log) = run(body, reads, ty, hints, Plant::None, alloc)?;
+    let log = log.ok_or(CheckError::Malformed(Malformed::HoleInAnswer))?;
+    Ok((o, log))
+}
+
+fn run<'a, 'w, W: World, C: TypeCtx>(
+    body: &BodyView<'_>,
+    mut reads: Reads<'w, 'a, W>,
+    ty: &mut C,
+    hints: &Needs<'_>,
+    plant: Plant,
+    alloc: Alloc<'a>,
+) -> Result<(Outcome<'a>, Option<AskLog<'a>>), CheckError> {
+    if hints.questions.is_empty() {
+        // A body with no record: one round of syntactic prefetches before the walk.
+        reads.prefetch_syntactic(body, alloc);
+    } else {
+        reads.prefetch(&hints.questions);
+    }
     let mut m = Machine::new_in(*body, reads, ty, plant, alloc)?;
     match walk(&mut m) {
-        Ok(()) => Ok(Outcome::Done(m.writeback()?)),
-        Err(Stop::Need(q)) => Ok(Outcome::Need(m.reads.finish_need(q, alloc))),
+        Ok(()) => {
+            let log = m.reads.take_log();
+            Ok((Outcome::Done(m.writeback()?), log))
+        }
+        Err(Stop::Need(q)) => {
+            let log = m.reads.take_log();
+            Ok((Outcome::Need(m.reads.finish_need(q, alloc)), log))
+        }
         Err(Stop::Error(e)) => Err(e),
     }
 }

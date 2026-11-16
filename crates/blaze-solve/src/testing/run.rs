@@ -16,6 +16,7 @@ use crate::coherence::{self, Orphan, Overlap};
 use crate::error::Stop;
 use crate::eval::{Answer, Solver};
 use crate::facts::{Ask, Read};
+use crate::fold::{self, Scratch};
 use crate::term::{Certainty, TypingMode};
 use crate::tys::Tys;
 
@@ -52,6 +53,19 @@ fn rule_key(rule: &str) -> String {
 
 /// Runs every case of `text` whose name `filter` accepts.
 pub fn run_text(file: &str, prelude: &FileA, text: &str, filter: &dyn Fn(&str) -> bool, report: &mut Report) -> Parsed<()> {
+    run_text_with(file, prelude, text, filter, &TestTys::new, report)
+}
+
+/// `run_text` over the term arena `new_tys` makes, one per case: the same cases through
+/// another `Tys` (blaze-typeck runs them over its `Terms`, blaze-ty's arena).
+pub fn run_text_with<T: Tys>(
+    file: &str,
+    prelude: &FileA,
+    text: &str,
+    filter: &dyn Fn(&str) -> bool,
+    new_tys: &dyn Fn() -> T,
+    report: &mut Report,
+) -> Parsed<()> {
     let f = parse_file(text)?;
     for case in &f.cases {
         if !filter(&case.name) {
@@ -63,7 +77,7 @@ pub fn run_text(file: &str, prelude: &FileA, text: &str, filter: &dyn Fn(&str) -
         decls.extend(prelude.decls.iter().map(|(l, d)| (*l, d)));
         decls.extend(f.decls.iter().map(|(l, d)| (*l, d)));
         decls.extend(case.decls.iter().map(|(l, d)| (*l, d)));
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_case(case, &decls)));
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| run_case(case, &decls, &mut new_tys())));
         match outcome {
             Ok(Ok(results)) => {
                 for (line, ok, want, got) in results {
@@ -95,34 +109,39 @@ pub fn run_text(file: &str, prelude: &FileA, text: &str, filter: &dyn Fn(&str) -
 
 /// Runs every case file.
 pub fn run_all(filter: &dyn Fn(&str) -> bool) -> Parsed<Report> {
+    run_all_with(filter, &TestTys::new)
+}
+
+/// `run_all` over the term arena `new_tys` makes (see `run_text_with`).
+pub fn run_all_with<T: Tys>(filter: &dyn Fn(&str) -> bool, new_tys: &dyn Fn() -> T) -> Parsed<Report> {
     let prelude = parse_file(PRELUDE)?;
     let mut report = Report::default();
     for (name, text) in FILES {
-        run_text(name, &prelude, text, filter, &mut report).map_err(|e| CaseError { line: e.line, what: format!("{name}: {}", e.what) })?;
+        run_text_with(name, &prelude, text, filter, new_tys, &mut report).map_err(|e| CaseError { line: e.line, what: format!("{name}: {}", e.what) })?;
     }
     Ok(report)
 }
 
 type GoalResult = (u32, bool, String, String);
 
-fn run_case(case: &CaseA, decls: &[(u32, &DeclA)]) -> Parsed<Vec<GoalResult>> {
+fn run_case<T: Tys>(case: &CaseA, decls: &[(u32, &DeclA)], tys: &mut T) -> Parsed<Vec<GoalResult>> {
     let world = World::build(decls)?;
     let alloc = Alloc::global();
-    let mut tys = TestTys::new();
+    let mut scratch = Scratch::new_in(alloc);
     let mut vars: HashMap<String, crate::term::Ty> = HashMap::new();
     let mut solver = Solver::new_in(alloc);
     let mut reads: blaze_own::Vec<Read, Alloc<'static>> = blaze_own::Vec::new_in(alloc);
     let sc = Scope { params: &case.params, bound: &[] };
     let mut clauses: Vec<Clause> = Vec::new();
     {
-        let mut a = Arena { tys: &mut tys, vars: &mut vars };
+        let mut a = Arena { tys: &mut *tys, vars: &mut vars };
         for p in &case.env {
             world.names.pred(&mut a, sc, case.line, p, &mut clauses)?;
         }
         world.names.case_sized(&mut a, case.line, case.params.len() as u32, &mut clauses)?;
     }
     let stop = |line: u32, s: Stop| CaseError { line, what: format!("the solver stopped: {s:?}") };
-    let env = solver.env(&mut tys, &world, &clauses, &mut reads).map_err(|s| stop(case.line, s))?;
+    let env = solver.env(tys, &world, &clauses, &mut reads).map_err(|s| stop(case.line, s))?;
     let mode = if case.coherence { TypingMode::Coherence } else { TypingMode::Analysis };
     let mut out = Vec::new();
     for g in &case.goals {
@@ -131,12 +150,12 @@ fn run_case(case: &CaseA, decls: &[(u32, &DeclA)]) -> Parsed<Vec<GoalResult>> {
             CheckA::Goal(p) => {
                 let mut cl = Vec::new();
                 {
-                    let mut a = Arena { tys: &mut tys, vars: &mut vars };
+                    let mut a = Arena { tys: &mut *tys, vars: &mut vars };
                     world.names.pred(&mut a, sc, line, p, &mut cl)?;
                 }
                 let [c]: [Clause; 1] = cl.try_into().map_err(|_| CaseError { line, what: "a goal is one predicate".to_string() })?;
                 let snap = tys.snapshot();
-                let r = solver.evaluate(&mut tys, &world, mode, Goal { env, pred: c.pred, bound: c.bound }, &mut reads);
+                let r = solver.evaluate(tys, &world, mode, Goal { env, pred: c.pred, bound: c.bound }, &mut reads);
                 let res = match r {
                     Err(s) => (line, false, format!("{:?}", g.expect), format!("stop {s:?}")),
                     Ok(a) => {
@@ -155,15 +174,15 @@ fn run_case(case: &CaseA, decls: &[(u32, &DeclA)]) -> Parsed<Vec<GoalResult>> {
                                         let Some(&v) = vars.get(name) else {
                                             return Err(CaseError { line, what: format!("?{name} is not in the goal") });
                                         };
-                                        let have = tys.resolve(v, 0).map_err(|e| CaseError { line, what: format!("{e}") })?;
+                                        let have = fold::resolve(tys, &mut scratch, v).map_err(|e| CaseError { line, what: format!("{e}") })?;
                                         let want_t = {
-                                            let mut a = Arena { tys: &mut tys, vars: &mut vars };
+                                            let mut a = Arena { tys: &mut *tys, vars: &mut vars };
                                             world.names.ty(&mut a, sc, line, want)?
                                         };
-                                        let want_t = tys.resolve(want_t, 0).map_err(|e| CaseError { line, what: format!("{e}") })?;
+                                        let want_t = fold::resolve(tys, &mut scratch, want_t).map_err(|e| CaseError { line, what: format!("{e}") })?;
                                         if have != want_t {
                                             ok = false;
-                                            detail.push_str(&format!(" ?{name} = {:?}", show(&tys, have)));
+                                            detail.push_str(&format!(" ?{name} = {:?}", show(tys, have)));
                                         }
                                     }
                                 }
@@ -182,7 +201,7 @@ fn run_case(case: &CaseA, decls: &[(u32, &DeclA)]) -> Parsed<Vec<GoalResult>> {
             CheckA::Overlap(a, b) => {
                 let da = *world.names.impls.get(a).ok_or_else(|| CaseError { line, what: format!("no impl @{a}") })?;
                 let db = *world.names.impls.get(b).ok_or_else(|| CaseError { line, what: format!("no impl @{b}") })?;
-                let r = coherence::overlap(&mut solver, &mut tys, &world, &mut reads, da, db);
+                let r = coherence::overlap(&mut solver, tys, &world, &mut reads, da, db);
                 let want = match g.expect {
                     Expect::Overlap => Overlap::Overlap,
                     Expect::Disjoint => Overlap::Disjoint,
@@ -196,7 +215,7 @@ fn run_case(case: &CaseA, decls: &[(u32, &DeclA)]) -> Parsed<Vec<GoalResult>> {
             }
             CheckA::Orphan(a) => {
                 let da = *world.names.impls.get(a).ok_or_else(|| CaseError { line, what: format!("no impl @{a}") })?;
-                let r = coherence::orphan_check(&mut tys, &Ask::new(&world), &mut reads, da);
+                let r = coherence::orphan_check(tys, &Ask::new(&world), &mut reads, da);
                 let want = match g.expect {
                     Expect::Ok => Orphan::Ok,
                     Expect::NotLocal => Orphan::NotLocal,
@@ -214,6 +233,6 @@ fn run_case(case: &CaseA, decls: &[(u32, &DeclA)]) -> Parsed<Vec<GoalResult>> {
 }
 
 /// A term's kind, one level, for a failure line.
-fn show(tys: &TestTys, t: crate::term::Ty) -> crate::term::TyKind {
+fn show<T: Tys>(tys: &T, t: crate::term::Ty) -> crate::term::TyKind {
     tys.kind(t)
 }

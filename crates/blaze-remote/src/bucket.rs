@@ -269,6 +269,7 @@ impl<P> Pending<P> {
         self.asked.is_empty()
     }
 
+    #[cfg(feature = "sign")]
     pub(crate) fn len(&self) -> usize {
         self.asked.len()
     }

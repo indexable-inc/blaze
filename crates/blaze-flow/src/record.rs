@@ -1,0 +1,64 @@
+//! One body's record (flow.md section 6): its findings, and the proof the code builder takes.
+#![blaze::sans_io]
+
+use alloc::vec::Vec;
+use core::alloc::Allocator;
+
+use crate::flow::{Bound, Flow};
+use crate::loans::{BorrowFinding, TierOne, facts, tier_one, tier_two};
+use crate::moves::{MoveFinding, check_moves_planted};
+
+/// A planted bug for the simulations' controls; `None` everywhere but in a control.
+#[doc(hidden)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Plant {
+    None,
+    /// The move dataflows join by intersection where they must unite.
+    MovesIntersect,
+    /// Tier two's second contains rule runs against the subset: loans flow from `O2` to `O1`.
+    TierTwoReversed,
+    /// Tier one does not close contained loans over the subset graph.
+    TierOneUnclosed,
+}
+
+/// The proof that a body passed the move and borrow checks: only [`check`] makes one, and the
+/// code builder takes it (rule 74).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Checked {
+    /// Which tier accepted: 1 or 2.
+    tier: u8,
+}
+
+impl Checked {
+    pub fn tier(self) -> u8 {
+        self.tier
+    }
+}
+
+/// One body's record: findings sorted by point, and the proof when there are none.
+pub struct Record<A: Allocator> {
+    pub moves: Vec<MoveFinding, A>,
+    pub borrows: Vec<BorrowFinding, A>,
+    pub proof: Option<Checked>,
+}
+
+/// The move check, then tier one, then tier two only if tier one cannot accept.
+pub fn check<A: Allocator + Clone>(flow: &Flow<A>, alloc: A) -> Result<Record<A>, Bound> {
+    check_planted(flow, Plant::None, alloc)
+}
+
+#[doc(hidden)]
+pub fn check_planted<A: Allocator + Clone>(
+    flow: &Flow<A>,
+    plant: Plant,
+    alloc: A,
+) -> Result<Record<A>, Bound> {
+    let moves = check_moves_planted(flow, plant, alloc.clone())?;
+    let facts = facts(flow, alloc.clone())?;
+    let (borrows, tier) = match tier_one(flow, &facts, plant, alloc.clone())? {
+        TierOne::Accepted => (Vec::new_in(alloc), 1),
+        TierOne::Refused => (tier_two(flow, &facts, plant, alloc)?, 2),
+    };
+    let proof = (moves.is_empty() && borrows.is_empty()).then_some(Checked { tier });
+    Ok(Record { moves, borrows, proof })
+}

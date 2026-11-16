@@ -14,8 +14,8 @@ use blaze_own::{Alloc, Vec};
 use crate::assembly::{EnvId, Goal, Via};
 use crate::error::{Limit, Malformed, SolveError};
 use crate::term::{
-    AliasKind, Certainty, Constness, Def, FloatTy, GoalSource, IntTy, List, Mutbl, Polarity, Pred, Rigid, Ty, TyKind,
-    TypingMode, UintTy, Var, VarKind,
+    AliasKind, Certainty, Constness, Def, FloatTy, FnPtrHeader, GoalSource, IntTy, List, Mutbl, Polarity, Pred, Rigid, Ty, TyKind,
+    TypingMode, UintTy, ValTy, Var, VarKind,
 };
 use crate::tys::{Relate, Tys};
 
@@ -56,6 +56,8 @@ const T_EX_PROJ: u32 = 30;
 const T_EX_AUTO: u32 = 31;
 /// A list of the `arity` terms before it (a predicate's argument list).
 const T_LIST: u32 = 32;
+const T_COROUTINE: u32 = 33;
+const T_PAT: u32 = 34;
 
 // Predicate tags.
 const P_TRAIT: u32 = 64;
@@ -71,6 +73,8 @@ const P_DYNC: u32 = 74;
 const P_HOST: u32 = 75;
 const P_CAHT: u32 = 76;
 const P_EQ: u32 = 77;
+/// `Pred::ConstHolds`: laid out as `P_TRAIT` (the list, the def, a flag word of 0).
+const P_HOLDS: u32 = 78;
 
 fn header(tag: u32, arity: u32) -> u32 {
     tag | (arity << 8)
@@ -248,6 +252,12 @@ impl<'a> Canon<'a> {
                     Constness::Maybe => 1,
                 });
             }
+            Pred::ConstHolds { cond, args } => {
+                self.list(tys, out, args)?;
+                out.push(header(P_HOLDS, 1));
+                push_def(out, cond);
+                out.push(0);
+            }
             Pred::Projection { alias, term } => two(self, out, alias, term, P_PROJ)?,
             Pred::NormalizesTo { alias, term } => two(self, out, alias, term, P_NORM)?,
             Pred::TypeOutlives { ty, region } => two(self, out, ty, region, P_TOUT)?,
@@ -307,6 +317,8 @@ fn emit<T: Tys>(tys: &T, out: &mut Vec<u32, Alloc<'_>>, k: TyKind) {
         }
         TyKind::Array(..) => out.push(header(T_ARRAY, 2)),
         TyKind::Slice(_) => out.push(header(T_SLICE, 1)),
+        // Children as `children` gives them: the ranges' bounds, then the base.
+        TyKind::Pat(_, l) => out.push(header(T_PAT, l.len + 1)),
         TyKind::Adt(d, l) => {
             out.push(header(T_ADT, l.len));
             push_def(out, d);
@@ -319,9 +331,16 @@ fn emit<T: Tys>(tys: &T, out: &mut Vec<u32, Alloc<'_>>, k: TyKind) {
             out.push(header(T_FNDEF, l.len));
             push_def(out, d);
         }
-        TyKind::FnPtr(l) => out.push(header(T_FNPTR, l.len)),
+        TyKind::FnPtr(l, h) => {
+            out.push(header(T_FNPTR, l.len));
+            out.push(u32::from(h.bits()));
+        }
         TyKind::Closure(d, l) => {
             out.push(header(T_CLOSURE, l.len));
+            push_def(out, d);
+        }
+        TyKind::Coroutine(d, l) => {
+            out.push(header(T_COROUTINE, l.len));
             push_def(out, d);
         }
         TyKind::Dynamic(l, _) => out.push(header(T_DYN, l.len + 1)),
@@ -357,10 +376,15 @@ fn emit<T: Tys>(tys: &T, out: &mut Vec<u32, Alloc<'_>>, k: TyKind) {
         TyKind::Error => out.push(header(T_ERROR, 0)),
         TyKind::ReStatic => out.push(header(T_RE_STATIC, 0)),
         TyKind::ReParam(_) | TyKind::ReErased => out.push(header(T_RE_ERASED, 0)),
-        TyKind::ConstValue(v) => {
+        TyKind::ConstValue(t, v) => {
             out.push(header(T_CONST, 0));
-            out.push(v as u32);
-            out.push((v >> 32) as u32);
+            out.push(t.code());
+            if let ValTy::Enum(d) = t {
+                push_def(out, d);
+            }
+            for i in 0..4 {
+                out.push((v >> (32 * i)) as u32);
+            }
         }
         TyKind::ConstParam(i) => {
             out.push(header(T_CONST_PARAM, 0));
@@ -499,7 +523,7 @@ impl<'a> Decode<'a> {
                     self.pop_kids(1, at)?;
                     TyKind::Slice(self.kids[0])
                 }
-                T_ADT | T_FNDEF | T_CLOSURE | T_EX_TRAIT => {
+                T_ADT | T_FNDEF | T_CLOSURE | T_COROUTINE | T_EX_TRAIT => {
                     need(4)?;
                     i += 4;
                     let d = read_def(w, at + 1);
@@ -509,6 +533,7 @@ impl<'a> Decode<'a> {
                         T_ADT => TyKind::Adt(d, l),
                         T_FNDEF => TyKind::FnDef(d, l),
                         T_CLOSURE => TyKind::Closure(d, l),
+                        T_COROUTINE => TyKind::Coroutine(d, l),
                         _ => TyKind::ExTrait(d, l),
                     }
                 }
@@ -519,8 +544,19 @@ impl<'a> Decode<'a> {
                     if tag == T_FOREIGN { TyKind::Foreign(d) } else { TyKind::ExAuto(d) }
                 }
                 T_FNPTR => {
+                    need(1)?;
+                    i += 1;
+                    let h = u8::try_from(w[at + 1]).ok().and_then(FnPtrHeader::from_bits).ok_or(bad(at))?;
                     self.pop_kids(n, at)?;
-                    TyKind::FnPtr(tys.mk_list(&self.kids)?)
+                    TyKind::FnPtr(tys.mk_list(&self.kids)?, h)
+                }
+                T_PAT => {
+                    if n == 0 {
+                        return Err(bad(at));
+                    }
+                    self.pop_kids(n, at)?;
+                    let base = self.kids[n as usize - 1];
+                    TyKind::Pat(base, tys.mk_list(&self.kids[..n as usize - 1])?)
                 }
                 T_DYN | T_EX_PROJ => {
                     if n == 0 {
@@ -574,9 +610,22 @@ impl<'a> Decode<'a> {
                 T_RE_STATIC => TyKind::ReStatic,
                 T_RE_ERASED => TyKind::ReErased,
                 T_CONST => {
-                    need(2)?;
-                    i += 2;
-                    TyKind::ConstValue(u64::from(w[at + 1]) | (u64::from(w[at + 2]) << 32))
+                    need(1)?;
+                    // An enum's definition: four words between the code and the bits.
+                    let (t, bits_at) = if w[at + 1] == ValTy::ENUM_CODE {
+                        need(9)?;
+                        (ValTy::Enum(read_def(w, at + 2)), at + 6)
+                    } else {
+                        need(5)?;
+                        let Some(t) = ValTy::from_code(w[at + 1]) else { return Err(bad(at)) };
+                        (t, at + 2)
+                    };
+                    i += bits_at + 4 - (at + 1);
+                    let mut v = 0u128;
+                    for k in 0..4 {
+                        v |= u128::from(w[bits_at + k]) << (32 * k);
+                    }
+                    TyKind::ConstValue(t, v)
                 }
                 T_CONST_PARAM => {
                     need(1)?;
@@ -608,7 +657,7 @@ impl<'a> Decode<'a> {
             Ok((s.kids[0], s.kids[1]))
         };
         Ok(match tag {
-            P_TRAIT | P_HOST => {
+            P_TRAIT | P_HOST | P_HOLDS => {
                 if at + 5 >= w.len() {
                     return Err(bad);
                 }
@@ -622,6 +671,8 @@ impl<'a> Decode<'a> {
                         args,
                         polarity: if flag == 0 { Polarity::Positive } else { Polarity::Negative },
                     }
+                } else if tag == P_HOLDS {
+                    Pred::ConstHolds { cond: d, args }
                 } else {
                     Pred::HostEffect {
                         trait_: d,

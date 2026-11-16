@@ -18,9 +18,10 @@
 //! one emits a `Projection` goal: `Cx::eq`), so there is no `alias_relate.rs` to port.
 //!
 //! Not ported, by reference function:
-//! - the `NormalizesTo` builtins (`consider_builtin_fn_trait_candidates`' `FnOnce::Output`,
-//!   `consider_builtin_pointee_candidate`, `consider_builtin_discriminant_kind_candidate`, the
-//!   coroutine family): the builtin helper's or a later lane's;
+//! - the `NormalizesTo` builtins other than `consider_builtin_fn_trait_candidates`'
+//!   `FnOnce::Output` (`consider_builtin_pointee_candidate`,
+//!   `consider_builtin_discriminant_kind_candidate`, the async-fn and coroutine families): the
+//!   builtin helper's or a later lane's;
 //! - `normalize_inherent_associated_term` and `normalize_free_alias`: `Facts` has no question
 //!   for an inherent impl's self type or a free alias's value; such a goal stops with an error;
 //! - `evaluate_const_and_instantiate_projection_term` for anonymous consts (no `Facts` question
@@ -42,8 +43,8 @@ use crate::error::{Limit, Malformed, SolveError, Stop, Unsupported};
 use crate::facts::{AssocKind, Facts, ImplPolarity, Portable};
 use crate::fold;
 use crate::term::{
-    AliasKind, Certainty, Def, Flags, GoalSource, List, Polarity, Pred, Rigid, Ty, TyKind, TypingMode, Var, VarKind,
-    shape_of_kind,
+    AliasKind, Certainty, Def, Flags, GoalSource, Lang, List, Polarity, Pred, Rigid, Ty, TyKind, TypingMode, Var,
+    VarKind, shape_of_kind,
 };
 use crate::trait_goals::TraitGoal;
 use crate::tys::Tys;
@@ -76,6 +77,15 @@ pub enum Rule {
     GatAmbiguous,
     /// The goal references an error (normalizes_to.rs `consider_error_guaranteed_candidate`).
     ErrorTerm,
+    /// `FnOnce::Output` of a callable self type (normalizes_to.rs
+    /// `consider_builtin_fn_trait_candidates`; builtin.rs `normalize_fn_once_output`).
+    FnOnceOutput,
+    /// `Future::Output` of an async coroutine (normalizes_to.rs
+    /// `consider_builtin_future_candidate`; builtin.rs `normalize_future_output`).
+    FutureOutput,
+    /// `DiscriminantKind::Discriminant` (normalizes_to.rs
+    /// `consider_builtin_discriminant_kind_candidate`; builtin.rs `normalize_discriminant`).
+    Discriminant,
     /// Not a candidate: the frame's normalized self type kept from assembly stage 0 to stage 1
     /// in `Cand::a`; removed before assembly is done.
     Stash,
@@ -86,9 +96,8 @@ fn unsupported(what: Unsupported) -> Stop {
     Stop::Error(SolveError::Unsupported(what))
 }
 
-fn malformed() -> Stop {
-    Stop::Error(SolveError::Malformed(Malformed::Pred))
-}
+#[track_caller]
+fn malformed() -> Stop { Stop::Error(SolveError::Malformed(crate::error::bad_pred())) }
 
 /// The parts of an alias term.
 fn alias_parts<T: Tys, F: Facts>(cx: &Cx<'_, '_, T, F>, t: Ty) -> Option<(Rigid, AliasKind, Def, List)> {
@@ -337,6 +346,17 @@ fn assemble_normalizes_to<T: Tys, F: Facts>(
             if cx.tys.flags(alias).has(Flags::HAS_ERROR) {
                 out.push(cand(Source::Builtin(BuiltinSource::Misc), Rule::ErrorTerm, self_ty));
             }
+            // The builtin `NormalizesTo` candidates (`assemble_builtin_impl_candidates`): of
+            // them `FnOnce::Output` and `Future::Output` are ported (the module doc).
+            if cx.is_lang(item, Lang::FnOnceOutput)? {
+                out.push(cand(Source::Builtin(BuiltinSource::Misc), Rule::FnOnceOutput, self_ty));
+            }
+            if cx.is_lang(item, Lang::FutureOutput)? {
+                out.push(cand(Source::Builtin(BuiltinSource::Misc), Rule::FutureOutput, self_ty));
+            }
+            if cx.is_lang(item, Lang::Discriminant)? {
+                out.push(cand(Source::Builtin(BuiltinSource::Misc), Rule::Discriminant, self_ty));
+            }
             match shape_of_kind(cx.kind(self_ty)) {
                 None => out.push(forced_ambiguity(Source::Builtin(BuiltinSource::Misc))),
                 Some(shape) => {
@@ -515,6 +535,26 @@ pub fn step<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, rule: 
             let (_, term) = nt_goal(cx)?;
             let e = cx.mk(TyKind::Error)?;
             if cx.eq(term, e)? { Ok(Step::Done(Certainty::Yes)) } else { Ok(Step::No) }
+        }
+        Rule::FnOnceOutput => {
+            let (alias, term) = nt_goal(cx)?;
+            let Some((_, _, _, args)) = alias_parts(cx, alias) else { return Err(malformed()) };
+            crate::builtin::normalize_fn_once_output(cx, cand.a, args, term)
+        }
+        Rule::FutureOutput => {
+            let (_, term) = nt_goal(cx)?;
+            crate::builtin::normalize_future_output(cx, cand.a, term)
+        }
+        Rule::Discriminant => {
+            let (alias, term) = nt_goal(cx)?;
+            match crate::builtin::discriminant_ty(cx, cand.a)? {
+                Some(d) => if cx.eq(term, d)? { Ok(Step::Done(Certainty::Yes)) } else { Ok(Step::No) },
+                // A parameter, placeholder or alias: the projection stays (rigid).
+                None => {
+                    let r = rigid(cx, alias)?;
+                    if cx.eq(term, r)? { Ok(Step::Done(Certainty::Yes)) } else { Ok(Step::No) }
+                }
+            }
         }
         Rule::Stash => Err(malformed()),
     }
@@ -700,7 +740,8 @@ fn step_object<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, i: 
             return Ok(Step::No);
         }
     }
-    if cx.eq(term, et)? { Ok(Step::Done(Certainty::Yes)) } else { Ok(Step::No) }
+    let ignore = crate::builtin::planted(crate::builtin::Planted::ObjectProjIgnoresBinding);
+    if ignore || cx.eq(term, et)? { Ok(Step::Done(Certainty::Yes)) } else { Ok(Step::No) }
 }
 
 /// normalizes_to.rs `consider_impl_candidate`. Stage 0: the impl's header against the goal's
@@ -718,7 +759,7 @@ fn step_impl<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, stage
         if h.polarity != ImplPolarity::Positive || h.trait_ != trait_ {
             return Ok(Step::No);
         }
-        let iargs = cx.fresh_args(h.generics)?;
+        let iargs = cx.fresh_impl_args(&h)?;
         let itr = cx.import_list(h.portable, h.args, iargs)?;
         let gargs = args_with_self(cx, args, cand.a)?;
         let gtr = prefix(cx, gargs, tgen)?;

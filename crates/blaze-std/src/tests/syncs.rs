@@ -10,11 +10,11 @@
 //! 2. A call told `Unsynced::Started` adds only what it begins and does not wait for: a
 //!    `WriteBack` of the file it changed, and a `SyncDir` of the directory whose names it
 //!    changed. It waits for the device no more than `No` does.
-//! 3. A `_synced` call hands over exactly its contract's syncs, in order. On the simulated
-//!    disk (whose rename syncs no names, so the name sync is its own effect): a publish
-//!    flushes the new file, renames it over the path, then syncs the path's directory; a
-//!    rename renames, flushes the file at its new name, then syncs that directory; a remove
-//!    removes, then syncs its directory.
+//! 3. A `_synced` call hands over exactly its contract's syncs, in order. A synced `Rename`
+//!    syncs the directories it changes, on every driver and in the simulation alike (the
+//!    strict name rule, 2026-11-16), so no `SyncDir` follows one: a publish flushes the new
+//!    file, then renames it over the path; a rename renames, then flushes the file at its new
+//!    name; a remove removes, then syncs its directory.
 //!
 //! Paths both directly in the directory under test and in one beneath it, so the name sync
 //! asked is of the right directory.
@@ -31,7 +31,7 @@ use blaze_sim::{Config, Tape};
 use super::{check, control, path, root};
 use crate::{
     Plant,
-    fs::{Content, Durable, FsError},
+    fs::{Content, Durable, FsError, FsKind},
     io::{Io, Limits, SimWorld},
 };
 
@@ -147,15 +147,14 @@ fn keeps_contract(call: Call, durable: Durable, asked: &[Effect], from: Option<&
         Durable::Yes => {
             // clone: the oracle's names, refcounts.
             let wanted = match (call, from) {
+                // The synced rename syncs its directories: no `SyncDir` after it.
                 (Call::Publish { .. }, Some(temp)) => vec![
                     Syncs::Sync(temp.clone()),
                     Syncs::Rename { from: temp.clone(), to: to.clone() },
-                    Syncs::SyncDir(dir_of(to)),
                 ],
                 (Call::Rename { .. }, Some(from)) => vec![
                     Syncs::Rename { from: from.clone(), to: to.clone() },
                     Syncs::Sync(to.clone()),
-                    Syncs::SyncDir(dir_of(to)),
                 ],
                 (Call::Remove { .. }, None) => vec![Syncs::SyncDir(dir_of(to))],
                 _ => return fail("harness: no rename's source"),
@@ -234,6 +233,80 @@ fn each_call_asks_the_device_for_exactly_what_its_durability_says() {
 #[test]
 fn the_oracle_catches_an_unsynced_rename_that_syncs() {
     control(Plant::UnsyncedRenameSyncs, plan, run);
+}
+
+/// `Dir::entries`: one level of a folder, sorted by the names' bytes, a folder among the files
+/// as a folder; a folder not there is `None`; a file is not a folder.
+#[test]
+fn entries_list_one_level_sorted_by_bytes() {
+    let io = Io::simulated(SimWorld::new(1, Limits::USUAL));
+    let cx = root(&io);
+    let top = io.need_fs().expect("Io::sim offers files").root();
+    for (at, it) in ["src/b.rs", "src/a.rs", "src/Z", "src/deep/x.rs"].iter().enumerate() {
+        top.publish(&cx, &path(it), Content::bytes(&b"bytes"[..at]), Durable::No).expect("a publish");
+    }
+    let entries = top.entries(&cx, &path("src")).expect("a listing").expect("the folder is there");
+    let seen: Vec<(&str, crate::fs::EntryKind)> = entries.iter().collect();
+    use crate::fs::EntryKind::{Dir, File};
+    assert_eq!(seen, [("Z", File), ("a.rs", File), ("b.rs", File), ("deep", Dir)]);
+    assert_eq!(entries.len_of(entries.find("a.rs").unwrap()), 1);
+    assert_eq!(entries.path(3).unwrap().as_str(), "src/deep");
+    assert_eq!(top.entries(&cx, &path("missing")).expect("no folder is no error"), None);
+    let refused = top.entries(&cx, &path("src/a.rs")).unwrap_err();
+    assert_eq!(refused.kind, FsKind::NotADirectory);
+
+    // A directory lists itself (`Dir::own_entries`): the root, and a named one, the same
+    // columns as the listing of it from above, with no folder and each path its own name.
+    let own = top.own_entries(&cx).expect("the root lists itself");
+    assert_eq!((own.folder(), own.iter().collect::<Vec<_>>()), (None, vec![("src", Dir)]));
+    assert_eq!(own.path(0).unwrap().as_str(), "src");
+    let src = top.subdir(&path("src")).own_entries(&cx).expect("a named directory lists itself");
+    assert_eq!(src.iter().collect::<Vec<_>>(), seen);
+    assert_eq!(src.path(3).unwrap().as_str(), "deep");
+    // The refusals: a directory not there, and a file in its place, each named.
+    for (it, kind) in [("missing", "no such directory"), ("src/a.rs", "no such directory")] {
+        let refused = top.subdir(&path(it)).own_entries(&cx).unwrap_err();
+        let said = refused.to_string();
+        assert!(said.contains(it) && said.contains(kind), "{said}");
+    }
+}
+
+/// The driver's root as a `Dir` (`Fs::root`): it lists every file at any depth by its path
+/// from the root, its name sync is the root's (`DirName::Root`), and a synced publish in it,
+/// whose name sync is the root's, is there after a crash, on every seed. (An unsynced
+/// rename's name is not kept by a later directory sync in blaze-core's disk model, which
+/// undoes it until the file's bytes sync: not asserted here.)
+#[test]
+fn the_root_lists_and_syncs_as_any_directory() {
+    for seed in 0..64 {
+        let mut world = SimWorld::new(seed, Limits::USUAL);
+        world.faults = Faults { max_latency: Duration::from_micros(seed * 7), ..Faults::default() };
+        let io = Io::simulated(world);
+        let cx = root(&io);
+        let fs = io.need_fs().expect("Io::sim offers files");
+        let top = fs.root();
+        assert_eq!(top.name(), &DirName::Root);
+        // An empty root lists as empty: it is there before anything is made in it.
+        let frame = blaze_mem::Frame::with_reserve(1 << 20, blaze_mem::Tag::Other).expect("a test frame");
+        assert!(top.list(&cx, &frame).expect("the empty root's listing").is_empty(), "seed {seed}");
+        top.publish(&cx, &path("kept"), Content::bytes(b"kept"), Durable::Yes).expect("a synced publish at the root");
+        top.publish(&cx, &path("d/deep"), Content::bytes(b"deep"), Durable::No).expect("a publish beneath the root");
+        top.publish(&cx, &path("a.new"), Content::bytes(b"a"), Durable::No).expect("the source");
+        top.rename_replacing(&cx, &path("a.new"), &path("a"), Durable::No).expect("an unsynced rename at the root");
+        let listed = top.list(&cx, &frame).expect("the root's listing");
+        let names: Vec<&str> = listed.iter().map(|(path, _)| path.as_str()).collect();
+        assert_eq!(names, ["a", "d/deep", "kept"], "seed {seed}");
+        io.record();
+        io.asked();
+        top.sync_names(&cx).expect("the root's names synced");
+        let asked = io.asked();
+        assert!(matches!(asked.as_slice(), [Effect::SyncDir { dir: DirName::Root, .. }]), "seed {seed}: {asked:?}");
+        assert!(io.crash(), "the world is simulated");
+        let after = top.list(&cx, &frame).expect("the root's listing after the crash");
+        let names: Vec<&str> = after.iter().map(|(path, _)| path.as_str()).collect();
+        assert!(names.contains(&"kept"), "seed {seed}: {names:?}");
+        assert!(names.iter().all(|it| ["a", "a.new", "kept"].contains(it) || it.starts_with("d/")), "seed {seed}: {names:?}");
+    }
 }
 
 #[test]

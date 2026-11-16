@@ -113,10 +113,13 @@ pub mod cow;
 pub mod deque;
 mod error;
 pub mod fixed;
+pub mod lists;
 pub mod make;
 pub mod packed;
+pub mod paths;
 pub mod raw;
 pub mod rc;
+pub mod segs;
 #[macro_use]
 pub mod soa;
 pub mod sorted;
@@ -124,6 +127,7 @@ pub mod spec;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 pub mod text;
+pub mod texts;
 pub mod vec;
 
 // A test-only switch that plants a known bug, for the oracles' controls (rule 53).
@@ -131,9 +135,13 @@ pub mod vec;
 mod plant;
 
 pub use alloc_ref::{
-    AArc, ABTreeMap, ABTreeSet, ABox, ADeque, ARc, ASoa, ASortedMap, ASortedSet, AString, AVec, Alloc, Erased,
-    Headed, Header, SharedAlloc,
+    AArc, ABTreeMap, ABTreeSet, ABox, ADeque, ALists, APaths, ARc, ASoa, ASortedMap, ASortedSet, AString, ATexts, AVec,
+    Alloc, Erased, Headed, Header, SharedAlloc,
 };
+pub use lists::Lists;
+pub use paths::{DirId, PathId, PathsView, Paths, SealedPaths};
+pub use segs::{Appender, Segs, SharedSegs};
+pub use texts::{SortedTexts, Texts};
 pub use arc::Arc;
 pub use boxed::{Box, CallOnce};
 pub use btree::{BTreeMap, BTreeSet};

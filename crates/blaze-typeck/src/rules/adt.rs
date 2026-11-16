@@ -23,6 +23,7 @@ use crate::diag::{At, DiagCode};
 use crate::error::Stop;
 use crate::ids::{ExprId, ItemKey, List, PathIdx};
 use crate::machine::{Expectation, Flow, Frame, Lower, Machine, Then};
+use crate::portable::PTy;
 use crate::ty::{Ty, TyList, TyView, TypeCtx};
 use crate::world::{AdtKind, Def, World};
 
@@ -78,7 +79,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         if f.state == 0 {
             if ids.is_empty() {
                 let v = self.fresh()?;
-                return Ok(Flow::Done(self.mk(TyView::Array(v, 0))?));
+                let n = self.len_value(0)?;
+                return Ok(Flow::Done(self.mk(TyView::Array(v, n))?));
             }
             f.t = match self.expected_elem(f.expect) {
                 Some(t) => t,
@@ -94,10 +96,15 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             return Ok(Flow::Wait);
         }
         let elem = self.coerce_many_complete(f.b);
-        Ok(Flow::Done(self.mk(TyView::Array(elem, ids.len() as u64))?))
+        let n = self.len_value(ids.len() as u64)?;
+        Ok(Flow::Done(self.mk(TyView::Array(elem, n))?))
     }
 
-    pub(crate) fn expr_repeat(&mut self, mut f: Frame, _e: ExprId, elem: ExprId, len: u64) -> Result<Flow, Stop> {
+    /// `[elem; len]` (the Reference, "Array expressions": `len` a constant expression of type
+    /// `usize`, here already a const term of the body's types).
+    /// `[elem; len]`: state 0 checks `elem`, state 1 the length's own expression `count` as a
+    /// `usize` (the Reference, "Array expressions"), state 2 makes `[T; len]`.
+    pub(crate) fn expr_repeat(&mut self, mut f: Frame, e: ExprId, elem: ExprId, len: PTy, count: Option<ExprId>) -> Result<Flow, Stop> {
         if f.state == 0 {
             match f.expect.only_has_type().and_then(|_| self.expected_elem(f.expect)) {
                 Some(t) => {
@@ -114,6 +121,15 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
             return Ok(Flow::Wait);
         }
+        if f.state == 1
+            && let Some(c) = count
+        {
+            let usize_ = self.common.usize_;
+            self.resume(f, 2)?;
+            self.push_has_type(c, usize_)?;
+            return Ok(Flow::Wait);
+        }
+        let len = self.lower_len(len, At::Expr(e))?;
         Ok(Flow::Done(self.mk(TyView::Array(f.t, len))?))
     }
 
@@ -127,22 +143,22 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             names.push(s.name);
         }
         let last = segs.last().map(|s| s.name);
-        let res = self.reads.resolve_path(bp.scope, path, &names)?;
-        let (k, variant) = match res {
-            Some(r) if r.consumed as usize == segs.len() => match r.def {
-                Def::Adt(k) => (k, None),
-                Def::Ctor { adt, variant, .. } => (adt, Some(variant)),
+        let res = self.path_res(bp, path, &names, at)?;
+        let (k, variant, def) = match res {
+            Ok(r) if r.consumed as usize == segs.len() => match r.def {
+                Def::Adt(k) => (k, None, r.def),
+                Def::Ctor { adt, variant, .. } => (adt, Some(variant), r.def),
                 _ => {
                     self.diag(DiagCode::NotAStruct, at, None, None, last);
                     return Ok(None);
                 }
             },
-            Some(_) => {
+            Ok(_) => {
                 self.diag(DiagCode::NotAStruct, at, None, None, last);
                 return Ok(None);
             }
-            None => {
-                self.diag(DiagCode::UnresolvedPath, at, None, None, last);
+            Err(why) => {
+                self.unresolved(why, at, last);
                 return Ok(None);
             }
         };
@@ -159,7 +175,8 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
         };
         let written = segs.iter().rev().find(|s| s.has_args).copied();
-        let args = self.explicit_args(at, written, adt.generics)?;
+        let args = self.explicit_args(at, written, k, 0, adt.generics)?;
+        self.defs.push((at, def));
         Ok(Some((k, variant, args)))
     }
 
@@ -192,7 +209,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         if f.state == 1 {
             if let Some(init) = inits.get(f.a as usize).copied() {
                 f.a += 1;
-                let to = if f.b == 1 { None } else { self.struct_field_ty(f.t, f.c, f.l, init.name)? };
+                let to = if f.b == 1 { None } else { self.struct_field_ty(f.t, f.c, f.l, init.name, crate::ty::Cause::Expr(init.expr))? };
                 self.resume(f, 1)?;
                 match to {
                     Some(t) => self.push_coercible(init.expr, t)?,
@@ -219,13 +236,20 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     }
 
     /// A field's declared type in variant `variant` of `adt_ty`, instantiated with `args`.
-    fn struct_field_ty(&mut self, adt_ty: Ty, variant: u32, args: TyList, name: crate::ids::Name) -> Result<Option<Ty>, Stop> {
+    fn struct_field_ty(
+        &mut self,
+        adt_ty: Ty,
+        variant: u32,
+        args: TyList,
+        name: crate::ids::Name,
+        cause: crate::ty::Cause,
+    ) -> Result<Option<Ty>, Stop> {
         let TyView::Adt(k, _) = self.view(adt_ty) else { return Ok(None) };
         let Some(adt) = self.reads.adt(k)? else { return Ok(None) };
         let Some(v) = adt.variants.get(variant as usize) else { return Ok(None) };
         let declared = adt.fields.get(v.fields.range()).unwrap_or(&[]);
         match declared.iter().find(|d| d.name == name) {
-            Some(d) => Ok(Some(self.lower(adt.types, d.ty, Lower::Args(args))?)),
+            Some(d) => Ok(Some(self.lower(adt.types, d.ty, Lower::Args(args), cause)?)),
             None => Ok(None),
         }
     }

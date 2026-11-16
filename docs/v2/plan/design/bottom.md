@@ -172,6 +172,395 @@ view that checks it once; two builders write equal bytes (rule 25; lists sorted 
 
 ## 6. Names
 
+**For a successor** (the names lead, 2026-11-16, handing step 5 on).
+
+Latest state (scope lead 18, 2026-11-16; runs `port27/scope-lead-18-*.txt`; steps 1 and 2 done):
+- `fellows` left the record (`ModuleScope` form 3). Reads between group members are ordinary
+  read-list entries: `finish.rs` `settle_reads` runs each member's final pass alone, its fellows
+  answered from the group's finished scopes; a different scope is `ResolveError::Unsettled`.
+  Textual digests have one home, `blaze_surface::textual_digest`.
+- Value-compared read lists cannot see circular justification (`c: pub fn x; p: pub use c::x;
+  q: pub use p::x`, edit `p` to `pub use q::x`: kept records keep `c::x`, a cold fill leaves both
+  unresolved). `again.rs` (`Again`, `Touched`) closes it: each wave is widened by the kept records
+  that read what the rerun may derive anew and that the rerun reads, transitively, solved again
+  from text with it. The test driver and `pipeline --edit` both use it.
+- Tests: 48 pass, among them `an_edit_under_any_schedule_gives_the_cold_records` (200 tapes, two
+  solvers), `an_edit_that_closes_an_import_cycle_gives_the_cold_records`,
+  `a_new_name_in_a_cycle_reruns_its_module_alone`, and the controls `fellow_reads_left_out_are_caught`
+  and the `Plant::KeepSuspects` half of the cycle test.
+- Edit rows (`scope-lead-18-ruleC-edit.txt`, 1 thread), before (`scope-lead-18-base-edit.txt`)
+  then after: (c) pub fn in a glob source 8 records, 42.7 ms, then 1 record, 12.3 ms; (d) pub use
+  inside the 192 group 192 records, 38.5 ms, not equal to cold, then 1 record (0 suspects),
+  2.6 ms, equal. All six rows equal a cold fill. Floor for (d): the one edited record (nobody
+  read the new name), ratio 1.0 in records.
+- Cold cost of settling: stage 4 1,572 ms, then 1,790 ms; allocated 999.5 MB, then 1,080 MB;
+  peak live 40.3 MB, then 43.0 MB; the same 12 unresolved, no `Unsettled`. Cold is about 1,800
+  times its floor (16k events, about 1 ms); step 3 (counters) is what targets it.
+
+**The cell core (2026-11-16; beside the old solver in `crates/blaze-scope/src/cells/`).**
+- A CELL is (module, namespace, name, layer), made the first time it is asked for, in an
+  ordered table. Layer `Full` is what a path reads; layer `Globs` is the same name through the
+  module's globs alone (what a named import of that very name reads, since an import never
+  justifies itself). Full's inputs: the module's explicit entry (an item, a child module), its
+  named imports that bind the name, then its Globs cell. Globs' inputs: one GLOB EDGE per
+  resolved glob (the source's Full cell, filtered by visibility from here, narrowed by the
+  glob's visibility) and the GROWTH: the module's globs not yet resolved (stage 2 adds the
+  unexpanded calls).
+- A cell is DECIDED ONCE AND FINALLY: an explicit entry is Found at once (it shadows globs,
+  R1); a named import of the name decides it when the import is decided; a Globs cell decides
+  only when its growth is zero and every source is decided: no candidate NotFound, one item
+  Found, two items Ambiguous (R2). Nothing is lowered or re-queued: there is no relax round.
+- An ITEM (a named import, a glob's path) is a task run from the top over FINAL reads; reading an
+  undecided cell leaves one waiter record and stops the item. A decided cell wakes its waiters
+  (items and cells). A lookup reads ONE cell; it never walks globs.
+- At a quiet point the graph of UNDECIDED nodes (cells, items) is condensed by an iterative
+  Tarjan pass (no recursion). A sink component of cells alone is a legal glob cycle (R3): its
+  cells are decided together as the least fixed point of their candidates. A sink component
+  with items is a true stall (R5): its items fail as not found, which ends the growth they held;
+  the loop goes on.
+- Order: the worklist is two ordered sets (cells by key, items by (module, index)); every table
+  iterated is ordered; so the outcome and every counter are the same for any push order.
+- Counters: cells made, decisions, waiter records, wakes, evaluations per item (mean, max),
+  cycle passes and their sizes, stalls.
+- Stage 1 (built): imports and globs, no macro calls. Stage 2: calls as growth, expansion through
+  the existing hook, the textual scope, the macro-namespace and lexical-outward read modes, the
+  seam, tempo, then deleting the old core.
+
+**Scope lead 20 (2026-11-16; runs in the scratchpad as `sl20-*.txt`).**
+- Step 1 done. Tests 55 pass, 0 fail. The one-level `TextualEntry` closed the refusals: no
+  `resolver refused` line anywhere (std set and hello set, 1 thread, `sl20-std1.txt`,
+  `sl20-hello1.txt`). Unresolved imports / macro paths: core 0/0 (1,938 ms), alloc 0/0, bstd 0/0,
+  std 22/0, libc 66/23, rustc_std_workspace_core 1/0. Classes: std 9 (`c_int`, `c_char`,
+  `dirent` in `libc::..`) cascade from libc; std 7 `is_*_feature_detected` in `std_detect` (its
+  macro-written `#[macro_export]` macros are not added to its root's answers: suspected, not
+  traced); std 1 `Frame` in a `libunwind` module of no crate in the graph; 5 not printed (the
+  example prints ten rows). libc 37 `core`, 4 `mem`, 4 `c_*`, 5 `sys`: libc's `extern crate
+  rustc_std_workspace_core as core` is written by a root `cfg_if!`, and the extern prelude is
+  fixed in the CrateRoot record from the syntactic graph (`root_plan`), so a macro-written root
+  `extern crate` never enters it (rustc adds it). libc 13 `cfg_if!`, 3 `Debug!`, 2
+  `s_no_extra_traits2!`, all in `unix/bsd/apple/mod.rs` (three levels of modules declared in
+  `cfg_if!` expansions; untraced). rustc_std_workspace_core 1: `use compiler_builtins` (left
+  out of the graph on purpose).
+- Step 2, the cold-fill oracle (`src/tests/oracle.rs`): generated crates of up to six modules
+  (mods and `mk!`-declared mods, items in two namespaces, every visibility incl. `pub(in ..)`,
+  named imports, renames, globs, chains and cycles, `macro_rules!` with export and
+  `#[macro_use]`) against a plain reference sharing no code with the solver; a disagreement
+  is printed as Rust (`replay_one_tape`) and settled by the written rule below (four were
+  first settled by running rustc on them: that was against rule 7, is withdrawn, and the
+  files are deleted).
+  Green on 600 cases; the control catches `Plant::GlobLeaksPrivate` (shrunk: 71 choices from
+  206, `BLAZE_SIM_TAPE='5 0*7 1 0*25 2 0 1 0*6 2 0*2 1 2 1 1 1 2 1'`, the reference `Crate`,
+  the solver `Public`).
+- Fixed: a glob waited on itself (`use crate::m::m::*` reaching `m` through `m`'s own
+  `use crate::*`): `Query::ignore` is now `lookup::Asking::{Import, Glob}` and `glob_lookup`
+  skips the asking glob (an import never justifies itself). The forced pass was changed to
+  force one call at a time; the rebuild below deletes it.
+- Three stall faults, `a_found_glob_binding_does_not_wait_on_a_pending_glob`,
+  `a_failed_sibling_glob_frees_the_other`, `a_failed_call_in_a_macro_use_child_keeps_the_grandchild`:
+  ruled (coordinator, rule 66) one defect, rebuilt as the stall rule below. Fault 3 traced: the
+  root and its `#[macro_use]` child are one group; the forced pass took the root's `mk!` first
+  and failed it, its textual walk passing the child's pending `mx!()`. Also: the Reference
+  (`items.use.glob.self-import`) refuses a glob of a module into itself; both sides accept the
+  root's `use crate::*`: a finding, not yet fixed.
+- **The stall rule** (replaces the forced pass and `fail_pending`). RFC 1560 resolves by a
+  work list run "until fixed point", where a name is used when it "has exactly one best
+  binding", a glob binding only once it is safe ("it may be shadowed"; "how a name resolves
+  should be consistent under any ordering"), and what is left at the fixed point is an error;
+  the Reference (`items.use.visibility.unambiguous`): redirections that "form a cycle or cannot
+  be resolved unambiguously" are an error; "items and named imports are allowed to shadow
+  names from glob imports" (`items.use.glob.shadowing`), and a glob never shadows: two globs
+  bringing different items under one name are an ambiguity, an error only where the name is
+  used. So undecided item i waits on undecided item j when deciding i reads name n (namespace
+  ns) in module M and either n has no binding in M and j is a pending glob into M, a pending
+  named import that can define n there, or an unexpanded call that can add to M (for a textual
+  read: a pending call before i's place in the chain); or n is bound in M only through globs
+  and j is a pending named import of n in M or such a call. Never a glob behind a glob once n
+  is bound: a later glob bringing a different item makes the binding ambiguous, and every
+  import that read it is solved again (its read list wakes it) to an ambiguity error. At a
+  quiet point the sink components of the graph's condensation fail as not found, each note
+  naming the other members it waited on; what waited on them is woken and solved normally;
+  repeat until nothing is undecided. The RFC reports the whole list left at the fixed point and
+  leaves open what the rest sees once some fail; sinks are a property of the graph, not of an
+  order, so the answer is the same in any order. Fixtures: faults 1 and 2 each have one
+  failing import (`self::m0::*`, `crate::m2::m0::*`); fault 3's `mx!` is a sink and `mk!`
+  resolves; `mod m1 {} mod m2 { use crate::m3::*; pub use crate::*; } mod m3 { pub use
+  crate::m2::m1::*; }` resolves with no error (the rule-4 guard); two globs with different
+  items under a name read by a third import give one ambiguity error, and none when unread.
+- Tempo before the rebuild (`blaze-world run names`, store s08-v3-all, 1022 crates;
+  `sl21-tempo-before-{18,1}.txt`): 18 threads, tree c4c848c1ca: whole graph 19245.6 ms, libc
+  0.2.190 6069.2 ms, core 1592.1 ms (2529 imports, 5352 macro paths, 0 unresolved); 1 thread,
+  tree 1956152ad1: whole graph 19902.4 ms, libc 0.2.190 5956.6 ms, core 1782.4 ms. The graph
+  barely gains from 18 threads: libc 0.2.190 alone is a third of the wall time.
+- The reference (src/tests/oracle.rs) now implements the stall rule plainly: every lookup
+  returns bound, absent, or the pending items it waits on (`Bk`); a decided import is tried
+  again each round and only ever moves to an ambiguity failure; when nothing moves, `v` is in a
+  sink when everything it reaches reaches it back, and the sinks fail (an import with what is
+  undecided read as absent, a call as not found). The stuck/spared/force hacks and
+  `HOLD_OUT_FAILING_CALLS` are gone, so generated calls may fail again; 2,000 cases per run,
+  20,000 by hand. Fixtures: faults 1, 2 and 3, the rule-4 guard, the two-glob pair.
+  `through` gained `Sources::OPEN`: an unreadable source is an open node, and the walk stops
+  only if nothing reaches the asked source.
+
+**Scope lead 19 (2026-11-16, the one-walk rebuild; runs in the scratchpad as `sl19-*.txt`).**
+- (a) verified: before, 51 pass and 4 fail, every one `GlobBug::NoFixpointRow` at seed 518.
+- Built: ONE walk. `lookup.rs` `member_node`: a member reached by `blaze_surface::through` is a
+  node by its CURRENT facts (own binding, else its resolved glob edges `glob_edges()`; a visible
+  pending import or glob, or an unexpanded call outside the macro namespace, stops the walk:
+  `Wait` if blocked, else `Undet`), every fact read is touched so a change wakes the reader.
+  Records and members are one least fixpoint. DELETED: `group_fixpoint`, `glob_closure`,
+  `fellow_res`, `Memo`/`MemoMap`/`MemoKey`, the sink's `memo`, `hits`, `computing`,
+  `fresh_memos`, `unsettled`, `settle_hits`, `Waiter::Memo`, `GlobBug::{FixpointBound,
+  NotAMember, NoFixpointRow}`, `FillStats::{fixpoints, fixpoint_evals}`.
+- Then seed 654 (masked by 518 before): a kept record that NAMES a removed module (root's glob
+  edge to a removed `m::m`) was walked by the edited `m`. The test driver's `gone` now dirties a
+  record naming a removed module by a glob edge or a binding; a read of a removed module is a
+  typed failure naming its readers. After: 55 pass, 0 fail (`sl19-t4.txt`), plants caught.
+- (b) verified in shape, not as written: std 118 and libc 20 refuse with `MemberUnfinished`
+  ("the final pass waited with every answer in"), the same at 02:19 (`s1-std-fill3.txt`), so not
+  the walk. Cause (being tested by removing it): `textual_entry` goes live only when the PARENT
+  is a fellow; with a finished parent and a member grandparent, the library's `entry` answers
+  `InProgress{grandparent}`, a wait on a member. Fix by construction: `TextualEntry{m}` means ONE
+  level (the parent's own `textual[..mark(m)]`, waits on the parent only), the resolver walks the
+  chain (live at the first fellow ancestor). Agreed with the names library and BUILT: `lookup.rs`
+  `textual_entry` loops up `chain`; one level in `task/answer.rs` `entry`, `finish.rs`
+  (`member_answer`, `owner_of`: the parent is the next module on a member's chain), the tests'
+  `entry`, `pipeline.rs` and `crates.rs` `FillCx::entry`; `read.rs` docs say so. Compiles
+  (`check ok`); its test run and the std re-run wait on crates.rs (library lane mid-edit, `Cfg`
+  not Sync). SHOWN after (`sl19-t7.txt`: mixcheck 55 pass, 0 fail; `sl19-std2.txt`, 1 thread,
+  std set): cause removed, effect gone: std 118 refused -> 0, libc 20 -> 0, core 0; unresolved
+  imports core 0, alloc 0, std 542 -> 22 (6 `libc::c_int`, 2 `c_char`, 2
+  `is_x86_feature_detected`, 1 libunwind `Frame`: names behind libc's own misses), libc 66
+  (37 `core::` first segment, 13 `cfg_if!`: libc's own, not this walk). Core 1,613.6 ms, total
+  2,524 ms, peak 440.5 MB (253.7 MB before, when 138 modules refused; the rise is unprofiled).
+- Left for the successor, in order: (1) run tests and `examplerun.sh blaze-scope crates --solver
+  worklist --loop fill --threads 1 std` (and bstd) and quote failed/unresolved per crate; (2)
+  the NEW cold-fill property (oracle 3): a plain reference solver in the test file (add every
+  binding any rule allows, whole crate, to a fixpoint), compared on generated crates with glob
+  cycles, re-export chains, shadowing, with a planted bug it must catch; (3) delete `Passes`
+  (item 8 below; keep `Solver`/`Worklist` until the library drops `S` from `solve`/`fill`, then
+  tell it); (4) the counters/quiet-point fill (item 7) with the floor stated first. Measured so
+  far, with the walk switched (`sl19-std1.txt`, 1 thread, std set, before the one-level entry):
+  core 440 modules, 2,529 imports 0 unresolved, 5,350 macro paths 0 unresolved, 1,758.9 ms,
+  0 failed; alloc 0 unresolved, 47.4 ms; std 542 unresolved imports (118 refused modules);
+  total 2,219 ms, peak 253.7 MB. Core's time is still about 1.8 s: the walk change did not move it.
+
+**For a successor (2026-11-16), the scope lead.** Tests at hand-off: blaze-scope 51 pass and 3 fail
+(the three edit-property tests, all at seed 518, item 1); blaze-surface 19 pass.
+
+1. **Glob fixpoint overrun: cause found (successor, 2026-11-16 02:40), fix held for rule 66.**
+   - The one `overrun` flag had five causes under one message; it is now `GlobBug`, and
+     `ResolveError::GlobLookup { module, why }` names which. Every refusal seen is
+     `GlobBug::NoFixpointRow`: the 154 core and 38 std modules (`crates --threads 1 std`, both
+     loops) and seed 518, no fixpoint ever changed past its bound.
+   - Cause (backtrace in the fixture): `read_name` walks a FINISHED non-member's record
+     (`Globs` edges) back into a member `f` that is no direct glob source of the walker;
+     `fellow_res` assumes a row `(f, me)` in `glob_closure(me)` and finds none. Globs as edges
+     let a module finish before its glob sources (its record needs no names of theirs), so a
+     glob cycle can pass through finished records. Fixture (red until fixed):
+     `a_walk_through_a_finished_record_back_into_its_group_is_answered`.
+   - Second fix to the `Live`/`fellow_res` walk (seed 385 was the first): stopped for an outside
+     verdict. Proposed end state: one least fixpoint, `blaze_surface::through`, for members and
+     records alike (a member is a node with its own value, its edges and its determinacy), and
+     `group_fixpoint`, `glob_closure` and the memo deleted.
+   - Was: what is seen: "a glob fixpoint changed past its bound" refuses 154 core and 38 std modules in
+     both loops (the names-library lane's runs). It is absent from the 01:46 `run12.txt`.
+   - Which change brought it is NOT known. Candidates, all uncommitted in the tree: the
+     `Undetermined` removal (lookup.rs, finish.rs, resolver.rs `fail_pending`), and other lanes'
+     edits.
+   - Note that both examples default to `Passes` (`WORKLIST` false unless `--solver worklist`),
+     so the core numbers are Passes numbers.
+   - The way in: the edit property reproduces it small.
+     - Worklist, seed 518: `BLAZE_SIM_TAPE='2 0*3 1 0*3 3 0 2 1 0 2 0 1 0 1 2'` in
+       `tests::edits::any_edit_sequence_gives_the_cold_records`.
+     - Passes only, seed 517: `fn x; use crate::x; use crate::m::x; mod n { pub mod m { use
+       crate::x; } } mod m { use crate::n::m::*; }`.
+   - The bound is `4 * fresh.len() + 4` in `lookup.rs` `group_fixpoint`. Find which `Res` value
+     oscillates: the lattice must be monotone.
+2. **Cycles named on finished modules: fixed at the protocol (02:55), one failure moved.**
+   `Answer::InProgress { module }` (the answerer names what it waits on), `Cached::InProgress(m)`,
+   `resolver::owner` deleted, `cycle_of` reads the stored module (agreed with the library lane).
+   std under the fill (`crates --threads 1 --loop fill std`): the "cycle names ..., held and no
+   member" refusals are gone; 118 std modules now fail with `MemberUnfinished` ("the final pass
+   waited with every answer in", `finish::settle_reads`), e.g. `std::sys::stdio`: next to find.
+   libc still 20 failed. Core under the fill: 440 scopes, 0 failed, digest aadc0a9b017d5603.
+   The lead it came from: which module a read
+   waits on has several homes that disagree for `TextualEntry`: `task::answer::entry` waits on
+   whichever ancestor is pending, `resolver::owner` names the parent only (also `again::owner`,
+   `finish::owner_of`, the tests' `answer`, crates.rs). The rounds-loop log shows `TextualEntry`
+   reads of made modules answered `InProgress` for an ancestor slot. Proposed: the answerer
+   names it, `Answer::InProgress { module }`, and `resolver::owner` goes (with the library lane).
+   Seen in the fill too: std 120 failed, "a cycle names ..., held and no member".
+   - `resolver.rs` `cycle_of` builds `Step::Cycle` from every `sink.waits`, unanswered reads
+     included. The contract (read.rs `Step`) is only modules answered `InProgress`.
+   - It shows in libc's 20 modules ("a cycle names ... held and no member") and std's root.
+   - Repro: build `runlocked.sh build --release -q -p blaze-scope --example crates`, then run
+     `CRATES_DEBUG_CYCLE=1 EXAMPLE_TIMEOUT=600 bash examplerun.sh blaze-scope crates --threads 1 std`
+     and grep `^cycle:` and `^inprogress:`.
+   - Also suspected: a stale `InProgress` across a group merge for macro-made modules.
+3. **Seed 385: fixed.** `read_name` dropped the ignored import, so a lookup coming back to its
+   module through a kept record's glob waited on the import being resolved. It now passes `ignore`
+   on. Fixture: `an_import_reaching_itself_through_a_kept_record_ignores_itself`.
+4. **The edit property** (`src/tests/edits.rs`).
+   - What it covers:
+     - a generated crate of up to 5 modules, private, pub and pub(crate) items in three
+       namespaces;
+     - named imports, renames, globs, re-exports and cycles;
+     - up to 4 edits, of 11 kinds;
+     - a drawn schedule;
+     - after every edit, records byte-equal to a cold fill.
+   - Size and speed: `CASES` = 2,000, about 0.4 to 1.7 s per test. Worklist only: Passes dropped
+     from its oracle (seed 517).
+   - What it found:
+     - Undetermined in a finished answer, now unrepresentable (seed 44, fixture
+       `an_import_found_only_around_its_glob_cycle_is_one_error`);
+     - Private versus NotFound decided by schedule (finish.rs takes it from the final state;
+       fixture `a_private_import_reached_around_a_cycle_is_private`);
+     - seed 385;
+     - seed 518 (item 1).
+   - Plants: `FellowReadsLeftOut` was caught. `KeepSuspects` was missed in 400 cases; at 2,000 it
+     is untested until item 1 is fixed. The hand fixture in props.rs catches it.
+5. **Row (c) and the floor table: not measured.** Only the earlier run exists:
+   `scope-lead-18-ruleC-edit.txt`, row (c) 1 record, 5,951 items, 2,318 events, 12.3 ms. Profile
+   it before any claim.
+6. **`pipeline-fill.diff`** (names-library lane, in the scratchpad): NOT applied. It waits for a
+   green property and item 1. Apply it with the Edit tool; `grouped` is not needed.
+7. **The cold-fill redesign (counters).**
+   - The idea, as far as it goes:
+     - each pending item (import, glob, call) holds a counter of its hard waits (unanswered
+       reads, unexpanded calls);
+     - an answer decrements, and the counter reaching 0 fires that item's evaluation once;
+     - a quiet point is an empty queue with counters still above 0;
+     - at a quiet point, one backward reachability pass from the stuck items over the wait edges
+       finds the set no outside answer can move, settled at once by the least fixpoint;
+     - this replaces the group re-solve at each of the ~1,257 waves.
+   - Report quiet points, events, wakes and items evaluated. The floor (one pass over core's 2,510
+     imports and 5,266 macro paths) is still to be stated and measured.
+   - It must fit tonight's decision: the fill is ordered by the syntactic import graph from the
+     declaration records before any scope task runs. First entries go in dependency order, and
+     each SCC is a group from the start (re-entry measured R = 0.58 by tasks on core, against
+     0.10).
+   - So the counters run inside a group's task. Re-entry is only for what text cannot decide
+     (paths through re-exports, macro-written imports).
+8. **`Passes`.** Still used by:
+   - `resolver.rs` `step` (its default);
+   - `group.rs` `step`;
+   - both examples' default (`step_by::<Passes>` and `fill.run::<Passes>`);
+   - the tests' `solve_with`, which compares both solvers, and the plants `PlanAll` and
+     `StaleNames`.
+
+   Deleting it (rule 30):
+   - make Worklist the default everywhere and drop `--solver`;
+   - delete `Passes`, `run`'s pass loop and the planned-pass machinery only it uses (`Plan`,
+     wake lists);
+   - drop the two plants with their controls;
+   - simplify `solve_with` to one solver.
+
+Earlier state (scope lead 17):
+- `work.rs` is the worklist solver, behind `Solver` (`Passes` | `Worklist`; `step_with::<S>`).
+  The tests run both and compare them. 39 pass, among them `any_event_order_gives_one_result`,
+  `waking_the_parked_gives_waking_everything` and the controls `a_dropped_wake_is_caught` and
+  `forgetting_glob_probes_is_caught`. Its core result matches the pass solver's (12 unresolved,
+  the same bindings by origin).
+  - Speed: not faster. 1,639 ms cold (passes 1,766 ms), allocated 2,375 MB (4,044), peak live
+    43 MB once the parked lists are compacted (709 MB before compaction).
+  - The cost is 1,257 relax rounds on the 192-module group: mode W blocks every item after
+    each move. Blocking only the dirty set was tried and was 2x slower (1.2M events, still
+    1,257 rounds), then reverted.
+  - The coordinator's design for the flags (counters, waits-on graph, one backward pass per
+    quiet point) is not built. Do not delete `Passes` until the worklist is faster.
+- `pipeline --edit` runs six edits incrementally from the first fill's records (rows in
+  `scope-lead-17-edit.txt`): body 0 ms, private fn 1.6 ms, pub fn in a glob source 43 ms,
+  pub use inside the 192 group 39 ms (all 192 re-solved).
+- Open correctness work:
+  - The `fellows` field depends on the driver's schedule (rule 25): row (d) differs from a
+    cold fill in `fellows` only.
+  - Reads between members are kept out of read lists, so any edit in a group re-solves all
+    of it.
+  - Fix both: the group becomes the SCC of the final read graph, and reads between members
+    go into the read lists.
+- Cold split (`scope-lead-17-split.txt`, timers in the example), 1 thread: expansion 259 ms,
+  solver steps 1,534 ms, 1,802 ms wall. The solver dominates.
+  - The same 192 modules re-solve in 39 ms when every expansion is already there.
+  - So the cold cost comes from re-solving the whole group at each expansion wave (1,472
+    passes, 1,257 relax rounds), not from the size of the work. The counters design is what
+    removes it.
+- Next: build the counters (or expand eagerly, so the waves come in fewer, larger batches);
+  fix `fellows` and the reads between members; then `--dump-bindings`.
+
+Where things are (all in /Volumes/Projects/blaze-fresh-1115, uncommitted on top of `dbae95611d`):
+- `crates/blaze-scope`: the resolver. It is a sans-IO machine (`Resolver`, and `Group` for one
+  strongly connected set) speaking the protocol in `read.rs`: `Read::{Name, Globs, TextualEntry,
+  TextualOut, DeriveHelpers}`, `Answer`, `Step::{Ask, Expand, Cycle, Done}`.
+  - `resolver.rs`: state, `apply`, `absorb`/`cached`, wake stamps.
+  - `lookup.rs`:
+    - `lookup_module` = `own_lookup` then `globs_res`/`glob_lookup`;
+    - `Live` is the `Sources` impl that reads fellows live and other modules by records;
+    - `read_name`, `fellow_res`/`group_fixpoint`;
+    - path, import, glob and call resolution; `plan()`.
+  - `finish.rs`: `finalize` writes own bindings plus `glob_edges()`; `undetermined_through`
+    gives the unresolved-glob error.
+  - `watch.rs`: wake lists. `scope.rs`: `ReadList`, `Resolved`, `Saw`.
+- `crates/blaze-surface/src/through.rs`: `Asker`, `SeenFrom` (`visible_from`, `narrower`,
+  `wider`), `through()`, the lookup through glob edges (a least fixpoint per name over the
+  reached sources, `merge` = same def widest vis, different defs `Ambiguous(GlobVsGlob)` under
+  the smaller def). It is the one home for the resolver and every reader.
+- `crates/blaze-surface/src/module_scope.rs`: `ModuleScope` form 2 (own bindings, `globs`
+  edges, errors, textual, marks, fellows, traits, macro exports); `GlobEdge`; `globs_digest`.
+- Tests: `crates/blaze-scope/src/tests/` (35: rules.rs one per rule, more.rs, props.rs edit and
+  order properties with tapes, records.rs). The driver is `solve`/`solve_with`;
+  `Solved::binding` reads through the edges; `Plant` holds the planted bugs.
+- `crates/blaze-scope/examples/pipeline.rs` runs the whole layer on a real crate. Command:
+  `EXAMPLE_TIMEOUT=600 bash /Volumes/Projects/blaze-int-1112-notes/examplerun.sh blaze-scope
+  pipeline [--threads 1,18] library/core`.
+  - Its "events:" line gives the floor counts; "work" gives passes, lookups and fixpoints.
+  - Checks go only through `bash /Volumes/Projects/blaze-int-1112-notes/lanecheck.sh <crate>
+    [test]`.
+- Runs: `/Volumes/Projects/blaze-int-1112-notes/port27/scope-lead-*.txt`.
+  - 12: copy form, 2,330 ms, 991 MB RSS.
+  - 13: 1 and 18 threads; the 192-module group alone is 1,536 ms.
+  - 14: event counts.
+  - 16: edge form, 1,646 ms, peak live 36 MB, RSS 127 MB, records 2.83 MB, the same 12
+    unresolved (`legacy_int_modules`, modules written by a macro, not walked).
+- hir-def's `ModuleScope` (`crates/hir-def/src/nameres.rs`) reads own bindings only and does
+  not follow glob edges. It is an old-layer crate that does not compile for other reasons (an
+  older `Visibility`; base-db broken under it); it is left as is.
+
+Owed before step 5 is done: the oracle that the edge form lost nothing.
+- Build `dbae95611d`'s blaze-scope and blaze-surface (copy form; its bindings equal run 12's)
+  in a worktree, and dump every (module, ns, name, def, vis, state) of `core`.
+- Check that `Solved`-style `through` over the new records gives the same binding for each of
+  the 86,671 glob-copied names, and that the 2 undetermined stay undetermined.
+- Keep a small-fixture version as a test.
+
+Step 5 needs:
+- A forward worklist in one arena per group: columns with `u32` ids, nothing allocated per
+  event.
+- It sits beside the pass solver behind one type parameter, and is held equal on the 35 tests
+  and on `core` (byte-equal records, the same 12 unresolved).
+- A planted bug in it must be caught by a test. Then switch over and delete the pass solver:
+  `watch.rs`, `group_fixpoint`, `plan`/passes.
+- Report against 1,646 ms and 127 MB, on 1 and 18 threads. The floor is about 16k events,
+  about 1 ms.
+
+Where Rust is not monotone, and how each is handled today (keep each, with its test):
+- **An explicit or expanded item shadows a glob's name.** `own_lookup` answers first. Its
+  determinacy follows rustc: a named import still pending gives `Wait` or `Undet`, and a call
+  not yet expanded makes a glob answer `Undet`/`Wait`. A glob name is final only at
+  quiescence. Tests: `rules::explicit_shadows_glob`; expanded-vs-outer ambiguity
+  (`MoreExpandedVsOuter`, `GlobVsExpanded`).
+- **Textual `macro_rules!` and `#[macro_use]` scope.** Its own ordered sequence
+  (`TextualEntry`/`TextualOut` reads, `marks`), not the lattice.
+- **"No namespace resolved" for an import.** Decided only at quiescence (`fail_pending` in the
+  final pass), as `Unresolved::NotFound`/`Undetermined`.
+- **One item through two glob routes** is one binding (`through::merge`, widest vis). Two items
+  are `Ambiguous(GlobVsGlob)`, an error only where used (`rules::two_globs_ambiguous_only_when_used`).
+- **The prelude and builtins** are the lowest layer (`layer_name`, `Layer::Prelude`, the
+  builtin types).
+- **An undetermined answer** at quiescence is an unresolved import of the glob that reached it
+  (`more::an_undetermined_answer_is_an_unresolved_import`, via `undetermined_through`).
+- **Blocking.** An item is blocked only if its wait chain reaches an outside answer or an
+  expansion (one reachability walk).
+
 Reviewed by an outsider on 2026-11-15. No per-name, demand-driven resolver of Rust is known to
 exist; rustc and rust-analyzer resolve a crate whole because expansion and imports interleave.
 Replaced: the first form of this section, an "import group" found before resolution, because what
@@ -195,9 +584,9 @@ from cold. The choice is the middle one:
 
 The rules it holds:
 
-- **Read per name.** A reader asks `(module, namespace, name)` or a module's `Exports` digest for
-  a visibility class (what a glob reads). A private fn added to a module moves no reader that did
-  not ask for that name, and no glob outside it.
+- **Read per name.** A reader asks `(module, namespace, name)` or a module's glob edges, per
+  name through them (below). A private fn added to a module moves no reader that did not ask
+  for that name, and no glob outside it.
 - **A binding has states.** Target key, visibility, origin (declared, explicit import, glob,
   expanded), and `undetermined` or `ambiguous` as values, not errors. Explicit bindings are a
   layer below globs, so the fixpoint is well defined; an import waits until its answer is final;
@@ -205,11 +594,62 @@ The rules it holds:
   with rustc's ambiguity kinds, which makes any evaluation order agree with rustc.
 - **Cycles are found at run time.** A glob read that reaches a module still being computed joins
   a strongly connected set, solved as a least fixpoint; each member is written as its own record
-  naming its fellows.
+  with its reads of its fellows in its read list, the same whatever the schedule.
 - **What an edit redoes** (estimates, to count per edit class): a body edit, one `FileItems` and
   no scope; a private fn added, about three records; a `pub use x::*` at the root, the root's set
   and the modules that glob it; an edited `macro_rules!`, its N expansions and the scopes whose
   names changed.
+
+**The floor of a fill, counted on `core`** (2026-11-15, `scope-lead-14.txt` in
+/Volumes/Projects/blaze-int-1112-notes/port27): 406 modules, 18 cycle groups (the largest 192
+modules); 13,568 declarations (expansions' included), 2,436 named imports with 4,629 path
+segments, 74 globs, 5,263 macro calls (3,962 expansions). Out: 102,688 bindings, of which 86,671
+came through a glob (2 not determined), 13,272 declared, 2,702 by a named import. A forward
+fill makes each binding once: about 103k events, plus 4.6k segment steps and at most 2.4k import
+wakes, so about 110k table operations. At 20 to 50 ns an operation on `u32`-id columns, the floor
+is 2 to 6 ms on one thread, plus cutting 11.3 MB of records (about 5 ms), with expansion measured
+apart; peak live is the tables, about 10 MB. Measured with the pass-based group solver: 2,330
+ms, 593 MB peak live, 991 MB RSS, about 300 times the floor. The aim (rule 67) is under 15 ms and
+20 MB for names on one thread, within 1.5 times the floor, and 1.1 times when the records are
+cut in place. Glob flows are 84% of the events: if a scope record held a glob edge rather than
+its 1,170 average copied names, the floor would drop by the same share, which is a question for
+the record format and not for the solver.
+
+**Globs are edges, not copies** (decided by the coordinator, 2026-11-15, from the counts above).
+A `ModuleScope` record holds what its module declares, what its named imports bind, and its glob
+edges (source module or enum, visibility, expansion depth), never a name copied through a glob.
+A name reached through a glob is found at lookup: the module's own binding first (an explicit
+binding shadows a glob), else the union over its edges of each source's value, each filtered by
+what the importer may name and narrowed by the edge's visibility, a glob cycle contributing only
+what some member binds (the least fixpoint, solved per name over the edges it reaches). One item
+by two routes is one binding, as visible as the widest; two items are ambiguous, an error only
+where used (Rust's own rule). The protocol reads it per name: `Name` answers a module's own
+binding, `Globs` its edges, and a lookup's read list holds each `(module, name)` and each `Globs`
+it probed, found or not, so a new shadowing or newly ambiguous name moves exactly the lookups it
+reaches, and a `pub` item added to a module others glob rewrites no importer's record.
+
+New floor on `core`: about 16k events (13,568 declarations and 2,436 named imports, against
+103k), so about 1 ms of table operations on one thread.
+
+Measured on `core` (2026-11-16, `ModuleScope` form 2 without the export-class column, still
+the pass solver; run `port27/scope-lead-16.txt` against `scope-lead-12.txt`): records 2.83 MB
+against 11.3 MB (16,017 own bindings and 74 edges, against 103k bindings); names 1,646 ms
+against 2,330 ms on one thread; allocated 2.02 GB against 4.82 GB; peak live 36 MB against
+593 MB; maximum RSS of the whole run 127 MB against 991 MB. Unchanged: the same 12 unresolved imports, the same failures,
+and stage 5 resolves the same 10,462 impl rows through the edges. The lookup through edges is
+`blaze_surface::through`, one home for the resolver and every reader of the records. The time
+left is the pass solver's (1.85M items planned, 1.99M lookups): what the group solve replaces.
+
+**The group solve** (replacing passes, 2026-11-15): one arena per strongly connected set by a
+forward worklist. An item that cannot advance parks on the exact keys it read: `(module, name)`,
+`(module, globs)` (its edges and whether a call there may still add one), `(module, textual)`;
+an event on a key wakes only its waiters. What is not monotone stays out of the worklist and is
+decided when the group is quiet: textual `macro_rules!` scope is ordered by position; whether an
+import binds no namespace, a glob's ambiguity, and a macro-expanded item shadowing a name already
+taken through a glob (rustc's `MoreExpandedVsOuter` and `GlobVsExpanded` errors, found from the
+reads recorded per site) are decided at quiescence; the prelude and builtins are the lowest
+layer. Quiescence with items still parked is the cycle case: an item is blocked only if its wait
+chain reaches an outside answer or an expansion, by one reachability walk, not rounds.
 
 **The gate for pull from cold.** Pull from cold (resolving only the modules a program reaches)
 saves work only for a crate never seen and not fetched, and is the one part no Rust compiler has
@@ -220,6 +660,899 @@ it, measure the size distribution of glob cycles on std, reth and tempo: if real
 large, per-module work collapses into a crate-wide task. Replaced: "The risk ... before the pull
 producer is trusted", because the producer is per module and the risk now gates only pull from
 cold.
+
+### Name resolution: the rules (2026-11-16)
+
+The rules the name solver and the reference solver (src/tests/oracle.rs) both hold. Each has
+fixtures in src/tests/name_rules.rs (`rNx_*`), solved in the calm order and 64 drawn completion
+orders; the answer must be the rule's in every order. Sources: the Rust Reference's
+expansion-time name resolution (`names.resolution.expansion.*`, saved in
+port27/world-1116/nr.txt), `items.use`, and RFC 1560; no compiler's behaviour is a source.
+
+1. **R1 shadowing.** In a module, an item or a named import shadows a glob import of the same
+   name in the same namespace ("items and named imports are allowed to shadow names from glob
+   imports", `items.use.glob.shadowing`). An expanded item shadows a glob binding no early
+   resolution used; one that was used is `GlobVsExpanded`. Fixtures r1a, r1b, r1c.
+2. **R2 glob vs glob.** Two globs bringing the same item (after following re-exports) under one
+   name are not ambiguous; different items are ambiguous, an error only where the name is used
+   ("The errors occur at time of use, not time of import", `...ambiguity.glob-vs-glob`).
+   A use at ANY segment counts (`self::m2::m0::*` uses `m2`: ambiguous, not NotFound at `m0`).
+   A name bound through one glob still waits on the module's pending globs (and on sources the
+   glob walk meets undecided): one may bring another item, and the answer must not hang on which
+   was decided first (2026-11-16, r2e: the reference took the root's `m2` before `crate::m0::*`
+   brought crate 3's; planted `R2BoundStopsWaiting`). Fixtures r2a-r2e; oracle.rs `two_globs_*`.
+3. **R3 glob cycles** are legal; the answer is the least fixed point (RFC 1560: resolution runs
+   "until fixed point"). A name in no member of a cycle is not found, and nothing hangs. r3a;
+   oracle.rs `a_glob_cycle_through_a_found_binding_resolves`.
+4. **R4 privacy.** A glob brings only the names visible at the importing module
+   (`items.use.glob`). r4a; oracle.rs `a_glob_that_brings_in_private_items_is_caught`.
+5. **R5 the stall rule** (Scope lead 20, above): at a quiet point, groups that wait only on
+   themselves (the sink components) fail as not found; repeat. Refinement (approved): a member
+   that waits on ONE macro call of the same group through a textual read is spared that round;
+   the order is program text alone. In a stalled member what is undecided is taken as absent,
+   so a plain first segment whose inner scope was undecided goes outward (R6) and the import may
+   RESOLVE: then only the members that resolved are decided that round, and the rest are tried
+   again with the facts ("nothing more comes" holds only for what fails); with none resolved,
+   all fail. A spared call still expands, so "nothing more comes" is false for whatever waits
+   on it: in a round with a spared call only the calls a spared call's textual read waits on
+   fail (they define nothing first), and the rest are tried again (2026-11-16 08:00: the
+   reference failed `use crate::m2::*` beside a spared `mk!` writing `mod m2`, contradicting
+   "names in the fully expanded AST must resolve to the same definition"; r5e, r5f). r5a-r5f;
+   oracle.rs faults 1-3; planted `R5NoStall`, `R5SparesAll`.
+6. **R6 lexical lookup** (D56). A path's first segment `n` that misses in the inner scope goes
+   outward: module, extern prelude, standard prelude, built-in types. If the inner scope can still
+   grow BY EXPANSION ONLY (unexpanded calls in that module; for the extern prelude, unexpanded
+   calls at the crate root), the lookup takes the outer binding; if an expansion not enclosing
+   the use later writes `n` into the inner scope, that is an ambiguity error at the new
+   definition, in every completion order; written by an enclosing expansion, the inner wins;
+   with no outer binding, the inner is used when it appears. The Reference gives the principle
+   only: a name "must resolve to the same definition regardless of the order in which macros are
+   expanded and imports are resolved". r6a-r6d.
+7. **R7 pending imports are waited for.** A pending glob or named import into the inner scope is
+   not growth by expansion: the lookup waits for it. A glob candidate beside an outer candidate
+   is an ambiguity ("Names in imports and macro invocations may not be resolved through glob
+   imports when there is another candidate available in an outer scope",
+   `...ambiguity.glob-vs-outer`); a named import shadows the outer one
+   (`...imports.shadowing`). The fast solver as read at 06:10 goes outward on an unblocked
+   pending glob (`globs_res` weak): r7a decides whether that changes the answer by order.
+   The ambiguity is at the first segment: the import fails there, as ambiguous, whatever the
+   later segments hold, and binds nothing (r7d, r7f). A glob candidate that IS the outer
+   candidate's definition is one candidate, no error (D57: "another candidate"; r7e).
+   r7a-r7g.
+8. **R8 the extern prelude.** A name from the unit's dependencies is final; a macro-written root
+   `extern crate X as n;` may add a name (`names.preludes.extern`), seen from every module, never
+   replace one (an error, whether or not a path reads it; D56). Until the root's calls expand, a
+   first segment with no candidate waits on them. r8a-r8d.
+9. **R9 built-in types.** A one-segment type path naming a built-in type whose lexical binding
+   is a module resolves to the built-in type (`use core::str; fn f(_: &str)`); as a path prefix
+   the module stands; a struct of the name shadows the built-in. r9a (both sides: the reference's
+   `type_path`, the solver's records through `names::path`); tests/entry.rs
+   `builtin_type_name_beside_a_module_of_its_name`.
+10. **Expansions' text (2026-11-16).** An import, item, `extern crate` or call an expansion writes
+   is the module's (its call stands there) from the moment the call expands; before that it is
+   the module's growth by expansion (R6). Imports are keyed by the fragment they are written in
+   (`UseSite { expansion }`). A call an expansion writes nests; its expansion is ENCLOSED by the
+   outer one, and R6's error is for a definition (an item, `mod`, `extern crate`, or an import
+   bringing the name) written by an expansion that does not enclose the use. r6f-r6k.
+11. **R5, later segments (2026-11-16).** In a stalled try every undecided lookup, a later path
+   segment's too, takes the undecided as absent (the reference failed it as not found: the cell
+   core lane's seed 1983). r5g.
+
+Owed (the reference): it still models one crate, `crate`/`self`/`super` paths and a macro that
+writes only `mod` items; R6-R8 are checked by fixtures against the rule, not yet by the
+2,000-case comparison. Widening it (dependencies, preludes, built-in types, lexical first
+segments, `mk!` writing items, uses, `extern crate` and calls, enclosure) is step 1 of the
+reference's brief, with one planted bug per rule.
+
+For a successor (name rules lane, 06:21). `mixcheck blaze-scope test name_rules`: "19 passed,
+0 failed" at tree 3a48978ca1 (18 fixtures, each calm plus 64 orders `Plant::Shuffle(seed)` with
+a drawn answer tape, plus `control_a_wrong_answer_is_caught`). The fast solver passed every
+fixture in every order, r7a (pending glob) included: no order-dependence shown yet, `KNOWN` is
+empty. Not done: steps 1 and 3 (widen oracle.rs: crates, preludes, built-in types, lexical
+first segments, `mk!` writing anything, enclosure; a planted bug per rule; the 2,000-case run
+classified); R6 through the standard prelude and macro paths (no fixture yet); r7a's glob is
+only one link deep: deepen it (a glob behind a pending macro call) to stress the early-outward
+path; message the solver-rebuild lane (OWNERS.md) once `KNOWN` has rows.
+
+For a successor (name rules lane, 07:00). Step 1 done: `r7_stress_pending_glob_sources` (11
+pending-glob sources: chains of 2 and 3 globs, a named import, a macro call, a dependency's glob;
+outer `n` in the extern and the standard prelude; with and without `n`: 22 cases, calm + 64
+orders): "20 passed, 0 failed": no order-dependence. Step 2 written in oracle.rs: `draw_in(tape,
+wide, calls)` (old distribution = `draw`, still 2,000 green); wide = a dependency (extern name
+`m1`), a standard prelude (`m1`, `m3`), plain first segments (`Ref::first_plain`, `outer`,
+`r6_findings`), `mk!` writing items; `Bug` (R1-R4, R6-R8) planted in the reference. The seam for
+the new core: `crate::tests::{reference_world, reference_imports, Imp, B}`. Two disagreements,
+both tests `#[ignore]`d with the reason: (a) no-calls seed 29: `use m1::m0::*` where `m1` comes
+by a glob and from the extern prelude: the old solver NotFound, the rule R7 glob-vs-outer: the
+SOLVER is wrong (write it as fixture r7d, put it in `KNOWN`); (b) wide seed 107: `y` in Types,
+reference None, solver a crate-1 binding: unclassified (replay it). Then un-ignore
+`every_planted_reference_bug_is_caught`. Not modelled yet: `extern crate` by `mk!`, `mk!` writing
+uses and calls, enclosure, built-in types (R9), R5's bug.
+
+For a successor (name rules lane, 07:00 runner, handing on at 06:58). Uncommitted in the tree.
+Verdicts: no-calls seed 29 = fixture r7d (glob-vs-outer at the first segment beats a later
+NotFound; the glob's `m1` is always crate 1's own module in that distribution, never the
+dependency: no import there binds a crate root); the same-definition case is D57 (one candidate,
+no error; r7e passes the old solver). Wide seed 107 = TWO findings: r7f (the old solver reports
+glob-vs-outer early but still resolves the import through the glob candidate and binds `y`: an
+error is reported, so not a silent accept) and a REFERENCE bug, fixed: a stalled plain first
+segment failed NotFound instead of going outward (R5 text above, r5c, r5d). No-calls seed 156 =
+r7g, a WRONG ACCEPT by the old solver (no error at all). Wide seed 39 = r6e. Wide seed 110/196:
+the reference's R6 finding now ignores its own order's outcome, and after an R6 error bindings
+are not compared. `KNOWN` = r6e, r7d, r7f, r7g; the comparisons skip exactly those classes
+(oracle.rs `known_import`, and r6e in the R6 check) and count them: "no calls: 2000 cases; cases
+with a KNOWN difference, by class: {"r7d": 23, "r7f": 7, "r7g": 1}" and the test passes. The
+comparison is now strict on Pending (a reference that leaves an import or call undecided fails).
+Open: the wide run fails at seed 225: `use m3::*` (glob) in module ...17: the solver NotFound,
+the reference Glob(crate 1): replay `ORACLE_DIST=wide ORACLE_TAPE='5 0*8 1 1 0 1 0*2 1 0*4 2 0*4
+1 0 3 0*4 3 0*40 1 0 1 3'` through `replay_one_tape` (it now prints plain paths and the preludes)
+and classify by hand. Then `every_planted_reference_bug_is_caught` (un-ignored, now with
+`R5NoStall` and `R5SparesAll`; it prints "planted .. caught: <first difference>") needs the clean
+wide run green. Not started: step 3 (mk! writing uses, extern crate, nested calls, enclosure,
+R9 and its planted bug) and the message to the new core's lane. The other lane's cells/mod.rs
+breaks the crate's build often: mixcheck's output file is shared, copy it at once after the run.
+
+For a successor (name rules lane, 08:00 runner; handing on). Uncommitted in the tree.
+`mixcheck test blaze-scope` (filter `tests::`): "exit 0; 129 passed, 0 failed", with both
+comparisons and `every_planted_reference_bug_is_caught` back on. Wide seed 225 is NOT a false
+NotFound: root `use m1::*` is an R6 error (`mk!` writes `mod m1` beside the extern `m1`), and
+m4's `crate::m3::*` follows the order through it. The comparison now skips every import's
+recovery after an R6 error ("R6 error, recovery not compared"). Wide seed 1402 = r3b (the old
+solver gives no answer). Seed 644 was a REFERENCE bug in R5: it failed members waiting on a
+spared call. Fixed, with the R5 text above and fixture r5e. That exposed r5f, an old-solver
+FALSE NotFound (seed 9; main told). The generator, at the coordinator's request (the new core's
+`core` bugs): module keys are XOR-mixed (`World::key_mix`, drawn last, so old tapes replay), and
+modules and imports draw `pub(super)` / `pub(in path)` (`any_vis`). Planted: R7's catch
+needed a new comparison arm: a solver's early ambiguity on a plain first segment that the
+reference resolved. Quotes, all "by the wide": R1 `q` in Macros; R2 `m2` amb; R3 `z` None vs
+Some; R4 `z` Some vs None; R6 `["m3","m4"]` NotFound vs Glob; R7 `["m1"]` Glob vs early
+ambiguity; R8 `["m2"]` Failed vs None; R5NoStall and R5SparesAll: Pending. Run the planted test's
+binary with CARGO_MANIFEST_DIR set, or the prints differ. Not started (step 3): `mk!` writing
+`use` (named and glob), root `extern crate dep as n;`, nested `mk!`, enclosure, and R9 with its
+planted bug. Plan: key imports by CONTAINER (a module's text or a Done call's expansion: `Bk::Imp(container, i)`,
+compare with `UseSite { expansion: Some(..) }`); make `own`/`globs`/`children`/`calls_of`/`live`
+walk Done calls recursively; R9 needs a type-position query on both sides (the solver's names
+library: tests/entry.rs `builtin_type_name_beside_a_module_of_its_name`). New core's lane
+(a3b5ce47fc4092767) has the step-4 message.
+
+For a successor (name rules lane, ~08:30 runner; handing on). Uncommitted in the tree. Done in
+oracle.rs: imports keyed by fragment (`frags`, `uses_of`, `written_in`, `encloses`, `mod_site`);
+`own`/`globs`/`calls_of`/`children`/`live`/`textual` walk expanded calls recursively;
+`extern_added`/`extern_replacing` (R8); `type_path` and `solver_type_path` (R9, over
+`names::path`); R6 findings with enclosure and import candidates; the R5 later-segment fix
+(`lookup_absent`). Generator: `draw_deep` (new distribution, `ORACLE_DIST=deep`; wide and
+no-calls tapes unchanged), `a_deep_cold_fill_equals_the_plain_reference`. Planted bugs added:
+`R5StallFailsMiddle`, `ExpansionImportsIgnored`, `NestedNotWalked`, `R6IgnoresEnclosure`,
+`R8MacroReplaces`, `R9ModuleIsTheType` (their catches not yet quoted: run
+`every_planted_reference_bug_is_caught -- --nocapture`). Fixtures r5g, r6f-r6k, r8c, r8d, r9a,
+r2c. New KNOWN: r5g, r8d, r2c (the old solver). `replay_one_tape` writes its report to
+`ORACLE_OUT` (the checker cuts test output). Runs: "135 passed, 4 failed" -> after r5g/r8d
+"141 passed, 1 failed" (deep only) -> deep's first two disagreements classified: a generator bug
+(two `pub type y`: wide's mk item not in `items`, fixed) and r2c. OPEN, in this order: (1) the
+names runner's run (port27/world-1116/r15-scope-test0.txt) says r2c's first fixture PASSES the
+old solver: rewritten to reach `k` through `a`'s own glob of the root, as the oracle program
+(deep-seed-amb.txt) does: re-run `test r2c`; if it still passes, find the program's real
+difference, never weaken. (2) A new deep disagreement: `use m2::m0::*` (plain, glob), the solver
+Ambiguous(GlobVsGlob), the reference Failed(NotFound); tape in r15-scope-test0.txt; replay with
+`ORACLE_OUT=<file> ORACLE_DIST=deep ORACLE_TAPE=..` via lanecheck (mixcheck does not pass the env)
+and resolve by hand. (3) Quote the planted catches, the three 2,000-case summaries, then message
+the new core's lane (ae1c3be3921c99701 per OWNERS.md 07:36): sent once at hand-off, see there.
+The crate failed to build at hand-off from resolve.rs (names library lane's).
+
+For a successor (name rules lane, ~09:30 runner; handing on). Uncommitted in the tree. Runs
+quoted from port27/world-1116/r16-*.txt (`ORACLE_OUT=<file>` now also keeps every KNOWN verdict,
+2,000-case summary and planted catch: oracle.rs `keep`; lanecheck only, mixcheck drops the env).
+State at start (r16-state.txt): "142 passed, 2 failed" (r2c "passes now: take it off `KNOWN`";
+deep `use m2::m0::*` solver GlobVsGlob, reference NotFound); ignored: `a_cold_fill_..._in_full`
+("long"), `the_planted_leak_shrunk` ("fails by design"). Done: (a) r2c is now the generator's
+program exactly; the old solver fails it: "KNOWN failure r2c: calm order: no ambiguity of `m2`:
+errors [Import { .. segments: ["m1", "m0"] }, segment: 1, why: NotFound }, ..]" (a FALSE NotFound
+upstream hides R2; the plain form is r2d and passes). (b) the deep `m2::m0` case: the REFERENCE was
+wrong (R2, and rule (f): a name bound through one glob stopped waiting on the module's pending
+globs, so it took the root's `m2` before `crate::m0::*` brought crate 3's): fixed in
+`lookup_parts` (not the macro namespace: there it made a sink of `mx!` and a glob, oldest seed
+364; open), and a stalled plain first segment now keeps the decided globs' value; fixture r2e,
+planted `R2BoundStopsWaiting`. The next deep tape (r16-deep2.txt, `self::m2::m0::*` in r2c's
+program) is class r2c (known_import: GlobVsGlob vs NotFound). Last run (r16-full.txt): "146
+passed, 1 failed"; "no calls: 2000 cases; cases with a KNOWN difference, by class: {"r7d": 25,
+"r7f": 7, "r7g": 3}"; "wide: 2000 cases; ..: {"R6 error, recovery not compared": 47, "r5f": 15,
+"r5g": 3, "r6e": 34, "r7d": 27, "r7f": 10, "r7g": 1}". OPEN, in order: (1) deep fails at
+`ORACLE_TAPE='1 0 0 0 0 0 1 1 0*7 2 1 0*6 1 1 3 0*27'`: "R6 says `m1` is ambiguous (outer, then
+written by an expansion), the solver reports nothing: []": replay, resolve by hand (a one-module
+crate: likely R8's `extern crate e3 as m1` beside a path read of `m1`: r8d's class or the
+reference's); until deep is green its planted catches are NOT proof: R2BoundStopsWaiting and
+R8MacroReplaces were "caught" by an R6 line like it. Catches by the wide/no-calls (clean, green):
+R1 `q` in Macros; R2 `m2` amb; R3 `z`; R4 `z`; R6 `["m3","m4"]` NotFound vs Glob; R7 `["m1"]`;
+R8 `["m2"]`; R5NoStall, R5SparesAll Pending; R5StallFailsMiddle `["m2"]`; by the deep:
+ExpansionImportsIgnored `m0`, NestedNotWalked `y`, R6IgnoresEnclosure `m3` R6, R9ModuleIsTheType
+`str` (r16-proof.txt). (2) step 4 checked against the code: r8c (root `mk!{extern crate other as
+k;}`, read from `mod b`), r6h/r6i/r6j (enclosure), r9a (type position both sides) exist and run
+64 orders; nothing was missing. (3) the macro namespace's R2 wait.
+
+### For a successor (name solver, runner after 06:10; read first)
+
+Steps 1-4 still open; nothing of this runner's is left in the code (one fix tried, taken out).
+- Suite: `mixcheck blaze-scope test` 92 passed, 0 failed at 06:05 (the `per_crate` failure seen
+  at 06:00 was the names library's test mid-edit; it passed at 06:01 with no solver change).
+- Baseline p7 (`port27/world-1116/run-libc.sh <tag> <roots> <sample-secs>` runs `names` at one
+  thread with `--crates` and samples it; `kids.py <sample> <fn-substring>` lists a function's
+  direct callees and self): "15 crates resolved in 4926.6 ms"; totals imports 7058, unresolved
+  23, macro paths 15388, unresolved 0. Rows of 3254 samples: `through` 965 (`Sources::node`
+  366, the rest the walk's own loops and its three vectors' growth), expand hook 872 (names
+  library's), `definition_of` 377. libc 0.2.190's plan counts vary run to run (12667, 12678)
+  while the totals do not: a nondeterminism to find.
+- Tried and taken out (rule g): a hash index in `through` (p8, a loaded machine, load 16.8):
+  `through` stayed 28.5% of samples (29.7% before) and the map itself cost 285+88 of its 1311.
+  The walk's loops are not the cost; the number of walks is: member nodes 359754 over ~13k plans
+  on libc 0.2.190, ~28 per walk, each walk from scratch. The floor needs a memo of a walk's
+  value per (start, ns, name) that one touch reads: entries as a second waiter kind in
+  `Lists` (`Waiter::Walk`), dropped and fired as `Key::Walk` when a key the walk touched fires,
+  kept only for walks with no blame, no `pend` and no stop. Replaying the walk's touches on a hit
+  would keep the parks (the `hash_one Key` row) and save only `node`.
+- Core's 3082 relax rounds are its 3567 steps: each step expands a call, nothing waits, so
+  `relax` lowers every flag and queues every pending item (~206). Re-queuing only items whose
+  last relaxed evaluation's reads fired is NOT sound as it stands: a lookup stops at the first
+  blocked candidate, so its read list can omit a flag its raised state depends on (S waits on A,
+  A on S, both raised; C, which S would read with A lowered, is lowered by a change, and nothing
+  wakes S; from the bottom S and A would be lowered). A sound incremental relax needs either
+  read lists that cover the lowered evaluation (evaluate with the dirty set lowered first and
+  park on what that reads) or DRed-style over-lowering by support, not by reads.
+- Step 2 (record the rule as D56, NOT D55: D55 is taken; take the file's next free id and cite
+  it in the stall rule's text). What the solver does today, read from lookup.rs (not yet
+  tested case by case): an inner module miss while the module has unexpanded calls, or an
+  unblocked pending glob, is `Res::Undet { weak: true }` (`globs_res`); `lexical_layers` goes
+  on and an early scan returns the FIRST outer hit at once (`layer`, `Scan::Final` excepted),
+  so the item is decided with the outer binding and, being decided and not via a glob, is never
+  evaluated again: whether the final pass then reports the later inner definition depends on
+  the final scan rerunning that lookup (`may_be_ambiguous` reads the outer layers only in
+  `Scan::Final`, for a hit from an expansion not enclosing the use): check that first, and that
+  the error lands at the new definition. The extern prelude: `extern_prelude_hit` (the unit's
+  dependencies) answers before the root's macro-written `extern crate` is read, so a macro can
+  add a name and never replace one (already the rule); an unknown name while the root has
+  unexpanded calls is weak (goes outward). A pending glob making the miss weak is wider than the
+  stated rule (expansion only): decide it in the same save set.
+
+Step 1 (speed) begun; steps 2-4 not started. Runs in
+/Volumes/Projects/blaze-int-1112-notes/port27/world-1116/ (`pN-libc.txt` with `pN-libc.sample.txt`,
+a macOS `sample` of the run; `w10-t18.txt`). Profile rows: `python3 -I incl.py <sample> 60`
+(inclusive samples per function; `incl.py` is kept beside the runs).
+- Counters: `FillStats` gained touches/parks, relax_queued, stalls (items, edges), plan_imports/
+  plan_globs; `FillReport.fill` sums them; blaze-world `names` prints "solver counters" for the
+  five slowest crates.
+- `--roots libc`, 1 thread: 13874.6 ms (p3) -> 13107.0 (p4: parks dedup by the list head, no
+  sort of the read list; the sort row, 1877 samples, gone) -> 8224.2 (p5: `calls_state` counts
+  up to two, so an expansion fires `CallsState` only when a `calls_but` answer can change; libc
+  0.2.190 plans 66827 -> 12667, wakes 62296 -> 8030) -> 5028.2 (p6: `Fragment.textual`/`open`,
+  `textual_back` passes over an expanded call whose fragment defines no textual name and waits on
+  nothing; textual row 1734 -> 90 samples). Totals unchanged: imports 7058, unresolved 23, macro
+  paths 15388, unresolved 0.
+- Rows left (p6, 3812 samples): worklist 2123 (eval 1115, nearly all glob walks `through` from
+  import evaluations: libc ~28 member nodes per plan); the expand hook 993 (`MacroDefinition::
+  hash`, `rules`, `with_names` per CALL: resolve.rs, the names library's: tell it, cache by def);
+  `definition_of` 445; outline 377. core: 3082 relax rounds, 636522 items queued (queue_all per
+  round: the work list keyed by what changed is still owed).
+- Whole graph, 18 threads (w10): "1022 crates resolved in 53461.9 ms; peak footprint so far
+  1841.5 MB"; "unresolved imports 419", macro paths 100333, unresolved 13 (was 83475.4 ms, 1549).
+  The slowest crate is 1978.7 ms, so the 53 s is not the solver per crate: profile the whole run
+  first (critical path, proc macros). One-thread whole run not done. Target 18.3 s, floor 0.47 s:
+  ratio 114.
+- `per_crate` tests (names library's, written 05:51) fail 2 of 91 under `mixcheck test
+  blaze-scope` (89 pass); not checked whether they fail without these changes.
+
+### For a successor (name solver, runner after 05:25)
+
+Saved, `lanecheck test blaze-scope: exit 0; 85 passed, 0 failed`. Runs in
+/Volumes/Projects/blaze-int-1112-notes/port27/world-1116/ (x1-cs, x2-std, x3-std-nofix; r1-cs,
+r2-cs are the same `--roots commonware-storage` command before the fix; nr.txt is the
+Reference's name-resolution chapter as text).
+- Step 1, ONE class, not two: a module other than the crate root, solved in a group without the
+  root, read the extern prelude only from the CrateRoot record (built before expansion), so a
+  root `extern crate` written by a macro (libc's `cfg_if!`, commonware's `stability_scope!`
+  `alloc`) was NotFound there. Fix: `NameAnswer::Found` carries the binding's `origin`
+  (read.rs; all constructors ported), and `extern_prelude_res` (lookup.rs) on a non-live root
+  does a `Read::Name { root, Types, name }`: `Origin::ExternCrate` is a hit, any other answer
+  a miss, no answer yet a Wait. Fixture `libc_shape_macro_written_extern_crate_and_modules`
+  green. Same `--roots commonware-storage` command: total unresolved imports 1246 -> 169;
+  commonware-storage 992 -> 0; std 108 -> 23 (31 before the regression). The glob-vs-glob
+  lead was wrong: `glob_lookup` already compares the final def after `through` (lookup.rs, "if
+  h0.def == hit.def"), and std's `libc::EBADF` rows went with this fix alone.
+  (`--roots std` printed total 0 with and without the fix: that set does not show std's
+  rows; do not use it as evidence.)
+- Why the oracle missed it: the generator (tests/oracle.rs `draw`) makes ONE crate, paths begin
+  only at `crate`/`self`/`super`, and `mk!` writes only `mod` items: no extern prelude, no
+  dependency, no macro-written `extern crate`; and the reference has no extern-prelude step at
+  all (the rule-(h) debt). OWED, first: a second generated crate, plain first segments, `mk!`
+  that may write `extern crate dep as n;` at the root; the reference's extern prelude = deps +
+  the root's final `extern crate` items; planted bug = this fix removed (`return Res::None` on
+  a non-live root: measured to fail the fixture).
+- The Reference today (nr.txt) states order stability ([names.resolution.expansion.
+  expansion-order-stability]: "names in the fully expanded AST must resolve to the same
+  definition regardless of the order in which macros are expanded and imports are resolved")
+  and speculative early resolution re-validated after expansion
+  ([..expansion.speculation]); glob-vs-glob allows "the same item (following reexports)";
+  [..macros.ambiguity.more-expanded-vs-outer] is a heading with no text. Step 3's rule is not
+  written there for imports or the extern prelude: it is blaze's rule (tell the coordinator).
+- Not started: steps 2 (time), 3 (outward-lookup rule), 4 (stall notes), 5.
+
+### For a successor (name solver, 05:25)
+
+Saved, `mixcheck test blaze-scope: exit 0; 82 passed, 0 failed` (tree 8ed9c75cfb):
+- Leak gone: `Resolver::edges`, kept current by `set_glob_source` (the one writer of a glob's
+  source); `member_node` borrows it. `queue_all(ms, decided)`: a relax round no longer
+  re-queues decided via-glob items (they wake by read list); only the planted flood passes true.
+  FillStats: `member_nodes`, `member_edge_bytes`, `agains`, `agains_spared` (pipeline example).
+- `$crate` of a crate not in deps -> `root_key(k)` (fixes tests/exports.rs).
+- `extern_prelude_res` (lookup.rs): a miss reads the live root's own `Origin::ExternCrate`
+  entry, else is a WEAK undet while the root (self or fellow) has unexpanded calls other than
+  the asker. A finished root is the names library's half. NOT in the oracle yet: owed (rule h).
+- `--roots libc`, 1 thread: before 17434.7 ms, peak 16532.4 MB (libc 0.2.190 8439.7 ms, core
+  1041.5 ms); after 13553.2 ms, peak 305.5 MB (libc 6578.2, core 843.2). With the relax
+  re-queue put back: 18523.4 ms, libc 8588.5: suspect 2 was real time. Tempo w9 (names lane):
+  peak 1905.0 MB (was 20178.3) but 83475.4 ms, and unresolved imports 1549 (was 1038).
+  Runs: `ns-libc-before.txt`, `ns-libc-after.txt`, `ns-libc-requeue.txt`, `ns-t2.txt` in
+  /Volumes/Projects/blaze-int-1112-notes/port27/world-1116/ (beside w7..w9).
+- OPEN: std unresolved 31 -> 108 (`use libc::EBADF` etc.) is NOT the re-queue change (put back,
+  still 108). Lead: libc 0.2.191's root has `pub use new::*;` beside `pub use unix::*`-style
+  globs; now that `new` resolves (derives find `core`), the two globs likely meet on one name:
+  check the glob-vs-glob ambiguity compares the final def (a re-export of the same item is not
+  ambiguous, RFC 1560). commonware-storage 17 -> 992 (`crate::merkle`) is probably the same.
+- Not started: steps 2-6 of the brief (spared-member rule text, stall notes in `names`,
+  DeriveHelpers, incremental rows).
+
+### For a successor (name solver, 04:50)
+
+**FIRST: a memory and time regression on tempo.** The whole graph at tree 79fe8a9b2c (18
+threads) took 60070.7 ms and peaked at 14219.9 MB. An hour earlier it took 18.3 s and 3.5 GB.
+libc 0.2.190 went from 6.4 s to 8.6 s. Other changes landed in that hour too, so the cause is
+not known. The names lane is splitting it by suspect.
+
+What I know of the rebuild's share:
+- **Blame records** (`resolver.rs` `Blame`): one per pending item a lookup meets.
+  - Each is a small enum: an `ItemKey` plus one or two `u32`s, so about 16–24 bytes. Its size
+    has not been measured.
+  - `Sink::blame` pushes ONLY when `scan == Scan::Stall`. Ordinary lookups record nothing.
+  - `lookup_module` and `lexical` truncate it when the result is decided.
+  - It is cleared per item inside `stall()`, and its vectors are freed when `stall()`
+    returns.
+- **`stall()`** runs once per quiet point, and only when nothing else moves. It evaluates
+  each pending item once. It does not run per wake.
+- **Suspect 1: `member_node` calls `f.glob_edges().leak()` on every call.** Since the rebuild,
+  a fellow's pending globs no longer stop the walk: they only set `Live::pend`, and an open
+  node no longer stops it either. So walks reach more members, and each reach leaks one edge
+  vector into the arena for the whole fill. This is the first thing to measure.
+- **Suspect 2: the via-glob re-solve.** A decided import or glob that read through globs is
+  evaluated again on every wake of a key it read. Each evaluation parks it again (list
+  nodes), and the walk is redone.
+- **The intended shape:**
+  - Blame is recorded only for a lookup that comes back undecided, as a fixed-size edge in a
+    per-group table, freed when the group is solved.
+  - The wait graph is built from those edges only at a stall.
+  - Walks must not leak per call: borrow the member's edges, or cache them per member and
+    drop them on a change.
+
+The stall rebuild, as of 2026-11-16 04:50, tree 7bc371e5a6. blaze-scope checks. Tests: "72
+passed, 6 failed".
+
+**The rule** is scope lead 20 above. It is implemented in two places, plainly in the reference
+(`src/tests/oracle.rs`, `Ref::lookup`, `try_import`, `textual`, `try_call`, `run`) and in the
+solver as follows. An undecided item i waits on an undecided item j when deciding i reads
+name n (in namespace ns) of module M, and one of these holds:
+- n has no binding in M, and j is one of: a pending glob into M; a pending named import that
+  can define n; a call of M not expanded yet. For a textual read, j is a pending call before
+  i's place.
+- n is bound in M only through globs, and j is a pending named import of n in M, or (outside
+  the macro namespace) a call of M not expanded yet.
+- Never a glob behind a glob once bound. A call never waits on itself.
+
+A later glob that brings a different item makes the binding ambiguous. A decided import that
+read it is solved again and fails as ambiguous. At a quiet point the sink SCCs of the wait
+graph fail as NotFound, and the loop goes on.
+
+**Where it lives in the solver.**
+- `resolver.rs`:
+  - `Blame` is an edge of the wait graph: `Import`, `Glob`, `Call`, or `Calls(m, except)`.
+  - `Scan::Stall` replaces `Force`.
+  - The sink keeps `blame` and `via_glob`; `Sink::blame` records only in a Stall scan.
+  - `Import::via_glob` and `Glob::via_glob`.
+  - Counters: `Resolver::blocked_calls` beside `unexpanded`. They are kept only through
+    `set_call_state` and `set_call_blocked`. Every write of a call's state or blocked flag goes
+    through these setters.
+  - `fail_stalled(item)` fails one member of a sink.
+- `lookup.rs`:
+  - `calls_state()` returns the two counts (a change to either is a `CallsState` event).
+    `calls_but(except)` is O(1). `asking_call` gives the call a lookup is made for.
+  - `Asking::Call(c)`: `resolve_call` passes it, so a call does not wait on itself.
+  - Blame is recorded in five places:
+    - `blame_named` blames pending named imports.
+    - `glob_lookup` blames a pending glob.
+    - `globs_res` blames `Calls`.
+    - `member_node` blames a fellow's pending globs and its calls.
+    - `textual_back` and `derive_helper` blame a pending call.
+  - `lookup_module` and `lexical` truncate blame when the result is decided.
+  - `globs_res`: a binding found through globs waits on no glob, only on the calls (outside
+    the macro namespace and unless restricted).
+  - `Live` is `OPEN`. A fellow's pending globs go to `Live::pend` and decide only when nothing
+    is found (`Live::settle`).
+  - The textual scope's `Tex::Undet` is non-weak.
+- `blaze-surface/src/through.rs`: `Sources::OPEN`.
+- `work.rs`:
+  - `stall()` re-evaluates every pending item in a Stall scan, maps blame to items, runs
+    `components` (Tarjan, explicit stack), fails the sinks' members, then fires their keys.
+  - `drain` evaluates a decided item again when it has `via_glob`. `ambiguous_again` moves it
+    only to an ambiguity failure.
+  - `run` is: drain, asks, waits/expansions/cycle, relax, `stall`, `finish`.
+- Deleted: the forced pass, `Work::fail_pending`, `Resolver::fail_pending`, `Scan::Force`, and
+  `Passes`/`Solver` (with watch.rs).
+- Not done: the stall note naming the other members of the SCC (`ScopeError` in
+  blaze-surface `module_scope.rs`).
+- Not done: `via_glob` is not set on outcomes applied in `relax`.
+
+**Update at 05:04: ALL GREEN.** "mixcheck test blaze-scope: exit 0; 80 passed, 0 failed"
+(tree 08551d6fee). That run includes the oracle at 2,000 cases, the planted private-glob
+control, all fixtures and the three property tests. The reference-side fix for case 1303
+below is in. The tempo-after measurements and the regression above are still owed.
+
+**Update at 05:00 (tree 923398e489): two tests fail, both the oracle.**
+
+Fixed since the list below:
+- The three property tests pass. Two fixes did it. `via_glob` is now sticky (set at every
+  evaluation that read through globs, so outcomes from relax and stall are covered).
+  `queue_all` also queues decided via-glob items. A third fix found what the property tests
+  showed: a record not given yet (`Stop::Answer`) is never an open node; `Sources::open(stop)`
+  replaces `OPEN`.
+- The test harness (`tests/mod.rs` `entry`) no longer panics for a module whose declaring
+  call failed.
+
+A rule refinement, applied to both the solver and the reference: in a sink SCC, a member that
+waits on ONE call of the same sink (a textual read past it, or a derive before it) is spared
+that round. The call fails first and defines nothing (the Reference, textual scope), and text
+order keeps a member to fail. This makes `a_failed_call_before_a_declaring_call_keeps_the_grandchild`
+right: without it, `mx!` and `mk!` form one SCC and both fail. The coordinator has not
+approved it yet.
+
+**The oracle's first failing case: seed 1302, case 1303 of 2000.** Tape:
+`2 0*11 2 0*5 1 2 0*8 1 0*4 2 0*2 1 0*5 2 0*5 2 0*3 1 2 1 0*6 1 1`. It prints with
+`ORACLE_TAPE=... mixcheck.sh blaze-scope test "replay_one_tape -- --nocapture"`.
+
+```rust
+macro_rules! mk { ($($t:tt)*) => { $($t)* } }
+mk! { mod m1 { type x = u8; #[macro_export] macro_rules! mx { () => {} } #[macro_export] macro_rules! my { () => {} } } }
+mk! { mod m2 { type x = u8; use crate::my; use crate::*; my! {} } }
+use crate::*; use crate::m2::*;
+```
+
+- The solver expands `my!`. The reference fails it as NotFound.
+- The reference has `use crate::my` and `my!` in one SCC. The import's Types lookup reaches
+  `m2` through the root's glob, and `m2` is open while `my!` is pending. The call waits on
+  the import.
+- The solver gives the import its Macros binding as soon as that namespace is found
+  (per-namespace determinacy), and `my!` resolves.
+- Judgment: the REFERENCE is wrong. An import's binding in one namespace is a fact once
+  found. The fix in progress is `Ref` keeping per-namespace partial results of pending
+  imports (`own` returns them), with `try_import` returning them beside its waits. An
+  ambiguous namespace fails the import at once, as the solver does.
+
+**The six failing tests at 04:50** (what each showed then):
+- `oracle::a_cold_fill_equals_the_plain_reference` (2,000 cases): disagreement at
+  oracle.rs:1216. The first case and its reduced program are still to be read.
+- `oracle::a_glob_that_brings_in_private_items_is_caught`, the planted-bug control
+  (oracle.rs:1235): the oracle does not catch the planted leak, so the control fails.
+- `oracle::a_failed_call_before_a_declaring_call_keeps_the_grandchild`: panics at
+  tests/mod.rs:366 ("a child's mod line is marked in its parent's scope"). The parent's scope
+  record lacks the mark for a grandchild declared by a call after a failed call.
+- `props::any_answer_order_and_batching_give_one_result` (props.rs:29),
+  `props::waking_the_parked_gives_waking_everything` (props.rs:191) and
+  `props::a_dropped_wake_is_caught` (props.rs:199) are the wake and order checks. Likely
+  suspects: the `via_glob` re-solve (a decided item woken), and `CallsState` now firing on
+  count changes.
+
+**Owed measurements:**
+- Tempo after the rebuild, with the same commands as the before numbers above: libc 0.2.190,
+  core and the whole graph, on 1 and 18 threads, into `sl21-tempo-after-*.txt`.
+- Then step 4: core's floor (2,529 imports, 5,350 macro paths), the profile, and the six
+  incremental rows, none slower.
+
+### For a successor (2026-11-16)
+
+The names library, as of the hand-off.
+
+**The seam.** It lives in `crates/blaze-scope/src/task/` and is in the tree; blaze-scope checks.
+
+- `answer.rs`: `answer(read, records: &impl Records<N>, here, alloc) -> Result<(Own, Option<Note>), Lack>`.
+  - `Records` has two methods: `held(key) -> Held::{Scope, Variants, Failed, Pending, Unknown}` and `parent(module)`.
+  - `helpers_digest` is defined here.
+- `solve.rs`: `solve::<S, N, F, R, X>(members, facts, records, expand: &impl Expand, here, alloc) -> Result<(Outcome::{Done(Vec<Resolved>), Need(Vec<Want::{Scope, Expansion}>)}, Tally), TaskError>`.
+  - Every entry restarts from the top.
+  - A read of a member is answered `InProgress`.
+  - A cycle that names a held module outside the members is the typed error `TaskError::CycleOutside`.
+- `fill.rs`: `Fill::new_in(alloc)`, then `.run::<S, _, _>(env: &impl FillEnv<N>, par: &impl Par, modules)`.
+  - It runs waves of ready tasks.
+  - A task that ends in `Need` waits on what it named, then re-enters.
+  - When nothing is ready, each sink SCC of the wait graph becomes one group task, widened to the whole SCC at once.
+  - `.report` holds R by both counts.
+- `FillEnv` provides `facts`, `here`, `parent`, `outer` (enums and other crates), `made` and `Expand`.
+- `examples/crates.rs` implements `FillEnv` as `FillCx`, with `Threads` as its `Par`.
+  - `--loop fill|rounds` selects the loop.
+  - Each crate prints `names digest <crate>: <hex>`, a digest of its scope records and read lists.
+
+**Proof.** Hello set at 18 threads, all 46 crates' digests equal between the two loops:
+
+| crate | digest | scopes |
+|---|---|---|
+| core | 555c4c382e1a0b56 | 257 |
+| alloc | 42a792ee1a7a4ceb | 93 |
+| std | cf34f87b8a06d449 | 144 |
+| bstd | 94d134fdf5881843 | 106 |
+
+Wall time is 1.85 s for the fill against 2.57 s for the rounds loop.
+
+**R today misses 0.10:**
+
+| crate | by entries | by steps |
+|---|---|---|
+| core | 0.580 | 0.168 |
+| alloc | 0.733 | 0.590 |
+| bstd | 0.581 | 0.378 |
+
+**Decision on R (coordinator, 2026-11-16): the syntactic prefetch.** Do not order by a previous fill's wait graph: that is a heuristic cache that depends on a past schedule (rule 25).
+
+- The wait graph comes from text, before the work. Once every module's declarations record and crate root exist (kind order), each module's `use` paths and globs name the modules whose scopes it will read: `crate::a::b`, `self`, `super`, an extern crate's root, a glob's source. Each is resolved along the module tree as far as the tree alone decides.
+- First entries are ordered by that graph: a module's scope task is entered when those scopes are done.
+- Each strongly connected component of the graph is one group task from the start.
+- What stays dynamic (a path through a re-export, imports a macro writes) may still re-enter.
+- Measure R again after this, by both counts. The threshold stays 0.10.
+
+**`resolve_crates`, built (names-library lane, 2026-11-16).**
+- **The entry:** `blaze_scope::resolve::resolve_crates(crates: &[CrateInput], sysroot, sources: &impl SourceTexts, par, alloc) -> Result<Names, NamesError>`.
+  - `Names` implements `names::World`, so `names::path` returns `Resolved{def, consumed}`, the longest prefix that names something.
+  - `Names` also gives `items`, `modules`, `place`, `outline_at` and `macro_src`.
+- **The example:** examples/crates.rs now calls it, and its rounds loop is deleted.
+  - 45 of 46 digests are equal.
+  - std differs because the library now finds the macro-written `libunwind.rs` that the old example missed.
+- **The ladder's hello world resolves.** "59 crates resolved in 8.859749209s" (Serial, Passes); `Cx`, `Io` and `Error` resolve to bstd's items, and `Result` and `Ok` to core's. Fixture: crates/blaze-ladder/tests/names.rs.
+- **Where the time goes.** A `sample` over 7 s of that run puts 4,386 of 5,027 samples in the group fixpoint.
+  - About 42% is `member_node` → `calls_state()`, which scans all of a module's calls on every glob member lookup.
+  - The fix is counters on the Resolver; I sent it to the solver lane.
+  - It runs on one thread, and the pack read takes 34 ms.
+
+**Cfg of a crate (unit-graph lane, 2026-11-16).** `Unit::cfg` holds the platform atoms,
+`feature="f"`, debug_assertions, test and proc_macro. It does not hold a build script's
+`cargo::rustc-cfg` lines. Those come from blaze-build-script's outputs record after the script
+runs. The cfg a crate resolves under is `unit.cfg` joined with that record, and the ModuleScope
+key takes the joined digest (`task::Cfg::from_atoms(..).digest()`). Until the join is built,
+units with `build_script: Some(_)` are counted apart: 106 of tempo's 1,263.
+
+**Prefetch, built (names-library successor, 2026-11-16).** `task/prefetch.rs` (`prefetch(modules,
+facts, alloc) -> Prefetch{components, reads, edges}`, the one Tarjan `sccs`); `Fill.first` is
+`First::Prefetch` (default) or `First::Alone`; the example takes `--first alone`. Same tree, hello
+set, 18 threads (scratchpad `s1-fill.txt` prefetch, `s2-alone.txt` alone):
+
+| crate | alone: R entries / steps, failed | prefetch: R entries / steps, failed |
+|---|---|---|
+| core | 0.580 / 0.168, 154 | 0.043 / 0.014, 0 |
+| alloc | 0.733 / 0.590, 0 | 0.000 / 0.000, 0 |
+| bstd | 0.591 / 0.390, 0 | 0.000 / 0.000, 0 |
+| std | 0.632 / 0.398, 38 | 0.392 / 0.314, 120 |
+
+After the solver's one-level TextualEntry change, re-run on one tree (scratchpad
+`r3-prefetch.txt`, `r3-alone.txt`). Every crate fails 0 in both modes, and the 46 `names digest`
+lines are equal, so the prefetch does not change results.
+
+| crate | alone: R entries / steps | prefetch: R entries / steps |
+|---|---|---|
+| core | 0.619 / 0.143 | 0.043 / 0.014 |
+| alloc | 0.733 / 0.588 | 0 / 0 |
+| bstd | 0.591 / 0.336 | 0 / 0 |
+| std | 0.710 / 0.621 | 0.453 / 0.566 |
+| libc | 0.630 / 0.700 | 0.614 / 0.699 |
+
+std and libc are still over 0.10. The prefetch finds 7 components and 7 edges in libc. Its waits
+look like items written by macros (`cfg_if!`), which a syntactic graph cannot see. That is not
+traced yet.
+
+- Wall 1.93 s and 233.9 MB alone; 3.88 s and 337.4 MB with the prefetch: core now solves its
+  192-module group instead of refusing 154 of it (`GlobBug::NoFixpointRow`), item 7 profiles it.
+- Digests differ between the two (core 440 scopes against 257); every crate reads core, so
+  equality under regrouping is unproven until core refuses nothing in both. Open.
+- What still waits: core 10 `Need`; std's 120 failed are item 2 above (cycles named on finished
+  modules), not the prefetch. TextualEntry adds an edge to every ancestor: the large SCCs.
+- Where the hello set's 3.88 s goes (per-crate column, outline to names, `s1-fill.txt` against
+  `s2-alone.txt`): core 2,190.1 ms (130.1 ms alone, when it refused 154 modules), libc 1,277.3
+  ms (804.8 alone; R by steps 0.931, its 20 failed modules redone), std 194.5, every other crate
+  under 50. So 3.47 s of 3.88 is core's one 192-module group and libc's refusals: both the
+  solver's group fixpoint (item 1 above, the rebuild on `through`), not lowering or the prefetch.
+  A span profile inside the group solve is owed once that rebuild lands.
+- `blaze_scope::names` (read side, compiles): `path`, `macro_path`, `traits_in_scope` over a
+  `World` of finished records; `Why::NotRead` is "dependency source not read". Wording rows
+  Cli 5 to 8 (unresolved, private, ambiguous import; `bstd` named `std`) are in blaze-report;
+  Cli 9 is the toolchain lane's (`toolchain-crate-named`, the manifest line).
+- Item 9's source of crates: not the example's library/ reading but the toolchain's shelf
+  (crates/blaze-toolchain: `shelf::open_manifest` then `ToolchainView::open`, `view.units(triple)`
+  gives each unit's features and deps by extern name, `shelf::open_pack` plus
+  `blaze_fetch::PackView::open_verified` its files). A shelf cut from this tree:
+  scratchpad `tc/shelf`, id 582bd43e...c63164. `plan_of`'s feature fixpoint goes when the
+  example reads that.
+
+**To do:**
+
+1. Move the lowering into the library as `task/lower.rs`: `walk`, `Lower`, `crate_root`, `make_modules` and the cfg, with no file reading. The example's run state (expansions, macro and call sources, enums, made modules) becomes records keyed from text.
+2. ~~Build the syntactic prefetch above.~~ Done, see above.
+3. Driver side, agreed with the driver lane:
+   - `crates/blaze-cli/src/names.rs`, with match arms `Kind::ModuleScope | Kind::Group | Kind::Expansion` in `work.rs::run`.
+   - No new `Kind`.
+   - Working memory in the per-task `scratch: &Frame`; copy only the record into `frame`.
+   - `blaze-drive/src/scope_task.rs` becomes a thin call into the library, or is deleted.
+4. Unresolved imports become finding records (rule 81): an item-relative range, the path, and the reason (not found, private, ambiguous).
+5. Tempo runs on a copy under `/Volumes/Projects/blaze-tempo-1116/` (never `/Volumes/Projects/ref-tempo/tempo`), with time, peak memory and R for each run:
+   - cold;
+   - a repeat, which must do no work;
+   - a function-body edit, after which names must not rerun;
+   - a `pub fn` added to a glob-imported module, counting the records that rerun against the floor.
+   Send the numbers to the tempo lane.
+6. The one-call entry for the ladder lane:
+   - `resolve_crates(crates: &[CrateInput], alloc) -> Result<Names, NamesError>`.
+   - `CrateInput { name, edition, root, files: &[(path, text)], deps: &[(extern name, crate index)], cfg: &dyn blaze-lower Cfg }`.
+   - `Names`:
+     - `path(module, ns, segments) -> Result<Def, PathError{module, path}>`
+     - `traits_in_scope(module)`
+     - `place(key) -> Place{krate, file, ItemIndex, module_path}`
+     - `key_at(krate, file, ItemIndex)`
+     - `module_of(key)`: the enclosing module, for an item in a body or written by a macro
+     - `ctor(key) -> Ctor{owner, index, kind}`
+     - `root(krate)`
+   - Preludes come from the `edition` crate.
+7. Profile the hello slowdown: plus 1.2 s since 2026-11-15, with a profile that names where the time goes.
+8. Delete `crates.rs`'s old rounds loop: `resolve`, `resolve_some`, `drive`, `sccs`, `DriveCx`, `Own`.
+9. Take unit-graph's `Unit` into `graph.rs`: add a `cfg` field to `GraphCrate`, and delete the example's feature fixpoint in `plan_of`.
+10. Follow up the `pipeline.rs` diff, which is with the solver lane. It is in the scratchpad as `pipeline-fill.diff`, and the solver lane applies it once its property test is green.
+
+Two copies of the loop exist until items 8 and 10 are done.
+
+**Failures in the tree, the solver lane's:**
+
+- The glob fixpoint bound is overrun on 154 core and 38 std modules, in both loops ("a glob fixpoint changed past its bound"). It is absent from the 01:46 run (`run12.txt`), so it is probably new since the removal of `Undetermined`.
+- libc's 20 modules: a `Step::Cycle` names finished modules (`cycle_of` counts unanswered reads).
+- `tests::edits::edit_sequence_catches_kept_suspects` fails at seed 385.
+
+**Evidence** is in `/private/tmp/claude-501/-Volumes-Projects-blaze/65dedbdf-09f9-429d-b209-308a28ee95a1/scratchpad/`:
+
+- `old.txt`: the rounds loop.
+- `new.txt`: the fill, with its `fill <crate>:` R lines.
+- `pipeline-fill.diff`.
+- `run10.txt` and `run12.txt`: the crate-graph lane's baselines.
+
+**For a successor (names library, 2026-11-16 ~04:00, the lead after the hand-off above).**
+Tests: "mixcheck test blaze-scope: exit 0; 64 passed, 0 failed" (blaze-core from its green
+snapshot; it was broken underneath). New tests: `src/tests/entry.rs` (others add to it too),
+`src/tests/items.rs`.
+- Done, on `resolve::Names`: `path` and `item_at(module, ns, Written<&str>, alloc) ->
+  Result<ItemAt{krate, def, macro_src}, PathError>` (segments of any lifetime: `Names` is
+  covariant), `members(owner) -> &[task::Member]` (traits and impls, cfg applied, declaration
+  order; keys equal the old assoc lang keys), `ctor(struct) -> Some(struct)` for tuple/unit
+  structs (`tables.ctors`), `variants(enum)`, `traits_in_scope`, `macro_definition(module,
+  shape, written, alloc) -> Result<MacroDefinition, MacroDefError>`; `definition_of` is the one
+  home of a MacroSrc -> MacroDefinition (body lexed in the defining crate's edition). Told to the
+  expansion lane, front2 (ladder) and its runner.
+- Item-position expansion: derives run (`CallSrc.input` = the item's text; `expand_decls` finds
+  the derive in `ItemAttrs::derives` by path; builtin derives via `builtin_derive`): test
+  `a_builtin_derive_writes_its_impl`. Attribute macros: `Attrs::attr_macro` (lowering) is the
+  outermost attribute that is not built in, not a tool's (`TOOLS`, `blaze` included) and not a
+  single name after a derive (a helper); the item is then not declared, a `CallShape::Attr`
+  call takes it, and `expand_decls` walks `ItemAttrs::next` to it and calls `Call::attr`.
+  Blocked: every macro_rules binding is `Macro(FnLike)`, so `#[dep::wrap]` is `WrongMacroKind`
+  (test `attribute_macros_take_their_item`, ignored). Agreed with the solver lane
+  (ab0bcfea227e16d44): a bit set `MacroShapes` (FnLike|Attr|Derive) in blaze-surface carried by
+  `DefKind::Macro`; THIS lane writes the surface + lowering half (shapes from the arms into
+  `MacroRulesDecl`, `TextualDef`, CrateRoot `macro_exports`), the solver lane the lookup half
+  (`kind_ok`, `textual_hit`, resolver.rs macro_exports) in one batch (rule 24). Not yet the
+  hello-set proof (bstd `Placement`/`Reach` Clone impls; `bstd_hosted_start`) nor the
+  example's derive/impl counts.
+- Not started: the macro-written root `extern crate` into the extern prelude (test
+  `libc_shape_macro_written_extern_crate_and_modules`, ignored; the solver lane says the fill
+  must add the name before any non-root module reads it, non-root lookups Undet until known);
+  proc-macro defs in `macro_definition` (needs `blaze_proc_macro::hook::crate_key`); call-site
+  edition per call; build-script outputs into `Host` (lane a9a7de3afe1016690 sends a diff:
+  `ScriptCx { inner: Host, out }` for `include!(concat!(env!("OUT_DIR"), ..))`).
+- Step 3 (worklist default, threads): the solver lane says do not switch yet; Passes is not
+  deleted, and the calls_state counters come after that. It will message.
+
+**For a successor (names library, 2026-11-16 ~04:20).** Tests: "mixcheck test blaze-scope:
+exit 0; 67 passed, 0 failed" (tree f2302b54e6); blaze-surface 22 passed.
+- Done: `blaze_surface::MacroShapes` (a non-empty bit set of `CallShape`, one checked record
+  byte; non-macros write `FN_LIKE`, agreed with the solver lane). `DefKind::Macro(MacroShapes)`;
+  `TextualDef`, `MacroRulesDecl` and CrateRoot `macro_exports` (now `(name, key, shapes)`,
+  `ExportRow`) carry it. The shapes are read from the arms by `task::rules_shapes(body,
+  edition, alloc)` (lexed only when the text holds `attr`/`derive`); `LowerCx` gained
+  `edition`. Tests in `src/tests/items.rs`: `attribute_macros_take_their_item` (un-ignored),
+  `a_function_like_macro_used_as_an_attribute_is_a_finding` (a `ScopeError::Macro` with
+  `WrongMacroKind` naming `dep::plain`, its call's shape `Attr`), `rule_shapes_are_read_from_the_arms`.
+  Open, the solver lane's: lookup.rs `textual: call.kind == FnLike` keeps `#[m]` of a
+  crate-local attr `macro_rules!` out of the textual scope; it will change that after Passes.
+- Hello proof (scratchpad package `hello-entry`: the owner's main with `#[std::main]`; the
+  owner's own main.rs has no attribute): `crates --threads 18 hello=<dir>` prints "hello `main`:
+  made by an expansion true; holds `bstd_hosted_start` true" (nested in the new main's body, not
+  a module item); "bstd `Placement`: 1 Clone impls", "bstd `Reach`: 1 Clone impls"; bstd derives
+  applied/used "Clone 250/250, Debug 200/200, Eq 192/192, PartialEq 192/192, Copy 120/120, Hash
+  28/28, Ord 18/18, PartialOrd 18/18, Default 11/11"; the whole set "Clone 1233/1234, Debug
+  1001/1004, Copy 827/828, ..., Deserialize 0/7, Serialize 0/7"; total time 2800 ms on 18
+  threads. The earlier use counts (Clone 523 ...) were not reproduced: they count something
+  other than the bstd crate's or the set's derive calls (not traced). Ladder runner told.
+- Build-script outputs (the coordinator's (C)): applied: `CrateInput.script:
+  Option<OutputsRef>`, `Base.script`, `ScriptCx` at the expand call, `script: None` at every
+  site (blaze-ladder, blaze-world, blaze-lower too). The cfg join was dropped: blaze-world
+  joins a script's cfgs into `CrateInput.cfg`. blaze-world filling `script` is main's area.
+- The solver lane is deleting Passes in resolve.rs, task/solve.rs, task/fill.rs,
+  examples/crates.rs and workspace.rs (it asked; yes). Stay off those lines until it sends its
+  mixcheck line.
+- Next, in the coordinator's order (tempo, whole18b.txt): (A) declare proc macros from a
+  proc-macro crate's outline (`#[proc_macro_derive(Name, attributes(..))]`,
+  `#[proc_macro_attribute]`, `#[proc_macro]`) with their shapes and helpers, expanded through
+  `ExpandCx::run_proc_macro` (lane a3c0fcccebe508508; `krate = hook::crate_key(module key)`);
+  (B) the "Tempo misses from blaze-world" reproductions in this file, then twenty samples; (D)
+  macro-written root `extern crate` into the extern prelude (libc 66, std 22). Also the
+  coordinator wants the 5.1 GB tempo peak explained from a measurement.
+- Tempo misses from blaze-world (adeffe8e234d87bf3, `resolve_crates` on 1,022 crates,
+  crates/blaze-world/examples/names.rs), largest first, each with a repro in its message:
+  (1) no proc macro is ever declared: the lowering never makes a macro def from a proc-macro
+  crate's `#[proc_macro]`, `#[proc_macro_attribute]`, `#[proc_macro_derive(N)]` fns (3,967
+  derives, 833 attributes, 55 bang calls, 73 re-export paths unresolved; items they hide unseen);
+  (2) `#[macro_export(local_inner_macros)]` not honoured (lazy_static's `__lazy_static_internal!`);
+  (3) `$crate::x!` in another crate's expansion gives NoCrate (fluent-bundle); (4) builtin
+  derives not found inside a macro's output, and `cfg_if!` out of scope, in toolchain libc
+  0.2.191 (0.2.190 resolves all), not reduced. Item 1 is the largest single miss on tempo.
+
+**For a successor (names library, runner four, 2026-11-16 ~04:50).** All of this is uncommitted
+in /Volumes/Projects/blaze-fresh-1115.
+- Done, item 1 above: proc macros are declared and run. The lowering (`ProcAttr`,
+  `Lower::proc_macro`) makes each proc fn a pub Macros def with its shape, named by the derive's
+  first argument for a derive. `MacroBody::Proc{kind, helpers}` builds `MacroDefinition::proc_macro`
+  from `CrateNames::proc_key`. The caller supplies the key and the runner through
+  `SourceTexts::proc_macro_key` and `run_proc_macro`, both defaulted. The tests are
+  src/tests/procs.rs ("3 passed"). blaze-world examples/names.rs takes `--procs <module store>
+  --procs-out <dir>` (`procs_of`, built on `ProcMacros::add_reached`) and prints the notes by kind.
+- Done: `#[macro_export]` macro_rules written by an expansion (tokio `select!`, alloy-primitives
+  `address!`/`b256!`, tempo-hardfork's `tempo_post_genesis_hardforks!`) join the root's bindings
+  and `crate_root.macro_exports` once the crate is done: `task/exports.rs`, test
+  src/tests/exports.rs ("1 passed").
+- Saved, NOT YET RUN: blaze-scope went red on the solver lane's in-flight lookup.rs/work.rs.
+  (a) `head` reads a path with spaces between tokens (as expansion text has them), and
+  `prelude_attr` maps `::core::prelude::v1::derive` (core/std/alloc, prelude, any module) to
+  `derive`. Before this, every libc `s!` struct was DROPPED ("401 Lower AttrMacroNotLowered
+  { attr: \"::\" }"), which explains libc `siginfo_t`/`timespec`/`sockaddr`. Test:
+  src/tests/attrs.rs. (b) `FillEnv::derive_helpers` with FillCx's side; the solver lane does
+  answer.rs.
+- Tempo whole graph, 18 threads, `--procs --scripts bs/exported4` (the `bs/exported` dir is
+  an old outputs layout and panics): "unresolved imports 1324, macro paths 91217, unresolved
+  macro paths 69", plus "not asked: inside macro crates: ... imports 6163 (3716 not found)".
+  Those 3,716 are not resolution failures: nothing asks for them, because the bootstrap tool
+  compiles macro crates today. A macro crate's internals will be resolved when blaze compiles
+  macro crates itself. Before step A: 10,306 and 5,115.
+- Next, in order: rerun tempo after (a). Then the REAL MISS rows. evm2 `Evm` sits under
+  `#[derive_where(Debug)]`, an attribute proc macro whose struct has field attributes
+  `#[derive_where(skip)]`: check that the expansion declares it. alloy-provider `Provider`
+  sits under `async_trait`/`auto_impl`. Also check commonware `spawn_cell`/`non_empty`.
+  Then the ladder's report: in graph.rs `externs`, `not_self` silently drops `std` for a
+  dependency of bstd (blaze_mem). Make that a typed note naming the crate, and ask the
+  unit-graph owner which std bstd's dependency cone gets.
+
+**For a successor (names library, runner five, 2026-11-16 ~05:10).** Uncommitted in
+/Volumes/Projects/blaze-fresh-1115. Whole-graph runs: `MIXCHECK_RUN_LOCKED=1 mixcheck.sh
+blaze-world run names /Volumes/Projects/blaze-tempo-1116/tempo $S/stores/s08-v3-all --threads 18
+--crates --procs $S/pm/store-c --procs-out $S/procs-out-wN --scripts
+/Volumes/Projects/blaze-int-1112-notes/port27/scripts-1116/exported5` ($S = this session's
+scratchpad; outputs w7.txt, w8.txt copied to /Volumes/Projects/blaze-int-1112-notes/port27/world-1116/).
+- Done: (a) libc `s!` structs lowered (runner four's attrs fix, now run); graph.rs `Externs::dropped`
+  + `NamesNote::ExternDropped{krate,name,why: ExternGone}` (79 on tempo: `proc_macro` of
+  proc-macro crates, NotInGraph); blaze_mem answer: Rust 2024, no no_std, `use std::ffi::OsStr`,
+  must get Rust std; the drop was blaze-ladder crates.rs `Sysroot{std: None}` (ladder fixed it).
+  task/exports.rs: `#[macro_export]` in a file of a macro-declared module reaches the root
+  (commonware `spawn_cell`). resolve.rs `render_with(stream, here, dollar)`: `$crate` inside a
+  written `macro_rules!`/`macro` definition kept as `__dollar_crate_<key>` also for the own
+  crate, and a `$crate` with no mark is `here` (tokio `doc!{try_join}`). Fixtures in
+  tests/exports.rs (3; the dollar one fails with the cause removed); graph.rs
+  `a_dropped_implicit_crate_is_named`. task/lower.rs: a `#[proc_macro*]` fn under another attribute
+  macro (alloy-sol-macro `#[proc_macro] #[proc_macro_error] fn sol`) is declared from its text and
+  the attr call is not made: NOT YET BUILT OR RUN; it should cut the 534+306 "not written as an
+  item" imports (sol! never expands); add a fixture in tests/procs.rs.
+- Runs: w7 (tree 79fe8a9b2c) "unresolved imports 1039 ... unresolved macro paths 248", "resolved in
+  60070.7 ms; peak footprint 14219.9 MB"; w8 (tree 2829a224ec, + blaze-expand's prelude-path derive)
+  "unresolved imports 1038, macro paths 92826, unresolved macro paths 621", "70600.2 ms; peak
+  20178.3 MB". The macro paths are libc 0.2.191's `::core::{clone::Clone,marker::Copy,fmt::Debug}`
+  derives: libc is `#![no_core]` under rustc-dep-of-std and gets `core` only from
+  `cfg_if!{ extern crate rustc_std_workspace_core as core; }`.
+- REGRESSION, coordinator's top item, NOT TRACED: 18.3 s / 3.5 GB -> 60-70 s / 14-20 GB. Asked: trace,
+  not fix; repro libc 0.2.190 alone (`--roots libc`, 6.4 s before, 8.6 s in w7); split by suspect
+  with counters: (a) solver's stall rebuild (resolver.rs `Sink::blame`, wait graph; no counter is
+  printed yet: add bytes/count of blame and wait edges to FillReport and print it in names.rs),
+  (b) libc structs and derives now existing, (c) --procs/--scripts inputs held, (d) std in more
+  graphs. Report the table to main; to the solver's lane once if (a) leads.
+- The solver lane (handed on) gave two lookup.rs pieces to this lane (its note in this section):
+  `PathKind::DollarCrate(k)` for a non-direct crate (needs a root lookup beside `deps`; fluent-bundle
+  7, x509-cert, p256), and macro-written root `extern crate` into `Resolver::extern_prelude` with a
+  `Key::ExternPrelude(root)` wake (libc: 54 imports, ~600 macro paths). Then step 3: sample thirty.
+
+**For a successor (names library, runner six, 2026-11-16 ~05:25).** Uncommitted in
+/Volumes/Projects/blaze-fresh-1115. Runs now in /Volumes/Projects/blaze-int-1112-notes/port27/world-1116/
+(w7, w8, w9); `--roots` runs r1-cs.txt, r2-cs.txt in this session's scratchpad. Same command as
+runner five, `--procs-out $S/procs-out-wN`.
+- Seam agreed with the solver (a5d2d83e5b75ed405, now handing on): a macro-written root `extern
+  crate X as N` is recorded as the root module's held Types entry with `Origin::ExternCrate`
+  (resolver.rs add_fragment, unchanged); lookup.rs reads it on an extern-prelude miss and waits on
+  the root's unexpanded calls. The solver saved it and the `$crate` fix (`start_module`:
+  `DollarCrate(k)` is `root_key(k)` for any crate). Fixtures: tests/exports.rs
+  `dollar_crate_of_a_crate_that_is_not_a_dependency_of_the_caller_is_the_defining_crate` (green);
+  tests/procs.rs `a_proc_macro_under_another_attribute_macro_is_declared_and_runs` (green; fails
+  with the lower.rs `proc_fn` filter removed: checked); tests/entry.rs
+  `libc_shape_macro_written_extern_crate_and_modules` UN-IGNORED and still RED: from the
+  macro-written `mod unix`, `use core::a::Kept` and `use ::core::a::Named` fail at segment 0
+  NotFound (root's `use core::a::open` passes): the non-root half of the extern-prelude lookup
+  is missing: solver's lookup.rs, for its successor. Test state: "82 passed, 1 failed" (that one).
+- w9 (tree 8833c230a6): "1022 crates resolved in 83475.4 ms; ... peak footprint so far 1905.0 MB";
+  "unresolved imports 1549, macro paths 100333, unresolved macro paths 13"; "not asked: inside
+  macro crates: ... imports 6163 (3716 not found), macro paths 1181 (82 not found)". sol! now
+  expands: "not written as an item" 534 -> 207 (dependency) and 306 -> 132 (this crate); libc
+  0.2.191 macro paths 562 -> 0.
+- REGRESSION, solver side, not mine: "commonware-storage 2026.10.0: ... unresolved 992" (w8: 17):
+  `crate::merkle::Location`, `crate::qmdb::..`, `alloc::string::String` from submodules all NotFound
+  at segment 0; its root items are written by `stability_scope!` (commonware-macros-impl
+  `#[proc_macro]`, output `#[cfg(not(any(..)))] pub mod merkle;` etc.). Proven not the sol
+  lowering change (r2: removed, still 992). Same shape as the red libc fixture: a submodule
+  reading a root binding that a macro wrote. And std 31 -> 108 (`use libc::EBADF`, 74 rows): the
+  solver's lead is the glob-vs-glob check now that libc's `pub use new::*` resolves.
+- Next: when the solver's successor fixes the above, ONE whole-graph run, then step 4 (sample
+  thirty unresolved imports across crates, classify before fixing). Ladder (a774482257e88a158)
+  reported the same libc `::core` impl paths (171) and 14 `ToTokens`/`Parse` in proc-macro crates
+  (host-side deps not held: the 3,716 "not asked" class).
+
+**Per-crate entry (2026-11-16, runner seven; uncommitted).** `blaze_scope::crate_scope::resolve_crate(input,
+deps: &[&[u8]], sysroot, sources, source, par, alloc) -> Result<CrateScope { names, record }, CrateScopeError>`.
+`input.deps` and `sysroot` index `deps` (`CrateId(deps.len())`: the crate itself); `source` is its index for
+`sources`. A dependent reads of a dependency only what resolve.rs's `Built` serves (now an enum `Dep`: a crate
+finished in this process, or a record): key, root, edition, proc key; each module's finished scope and chain;
+enum variants; macro sources. The `CrateScope` record (crate_scope.rs docs give the bytes): those, sorted by key,
+each module's scope as blaze-surface's `ModuleScope` record in a 16-aligned blob, plus `reaches`: every other
+crate its scopes name an item of, and what those reach. Transitive reads: the record names the target crate's
+key; a dependent given a record whose `reaches` it lacks answers `Need(keys)` before any work, the driver adds
+those records and enters again from the top (the library asks all at once). Parse step: the tables into hash
+maps and each module scope `ScopeView::read` in place then `ScopeBuilder::from` (one pass over the bytes).
+Private names are in the record with their visibility (a glob of a public module walks private modules); the
+reader checks visibility. Unresolved imports and macro paths stay in each module scope's errors. A dependency
+cycle cannot be given: the driver keys a dev-dependency's test unit apart. `resolve_by_records` drives a whole
+set this way (a measurement, not the driver). Proof: tests/per_crate.rs (equal answers to `resolve_crates` on a
+four-crate fixture with re-exports, globs, a macro crate and a script cfg; bytes equal across fill orders; the
+planted bug "every binding written pub" caught; `Need` names the reached crate); `crates --per-crate hello`:
+"47 crates ... crates differing from the whole set: 0; records 5270176 bytes", 1 vs 8 threads "records unequal
+... 0", 7702 ms against the whole set's 7469 ms (1 thread). Owed: libc and tempo runs, body-edit and `pub fn` cost.
+
+### Per crate, as built on tempo (2026-11-16)
+
+- Two records per crate (crate_scope.rs `Records { exports, inner }`). `exports` is what another crate can read:
+  `pub` names always; `pub(crate)` or restricted ones only where a 2.0 `macro`'s definition site sees them (a
+  `macro_rules!` through `$crate` resolves with the caller's privacy, so only `pub`); a hidden name kept when a
+  visible glob of its module may bring the same name (shadowing); only modules walkable from the root or a macro
+  2.0's site; enums and macros named by kept names or `#[macro_export]`. `inner` is the rest: errors, textual
+  scopes, private names, unwalked modules. A dependent reads and keys `exports` only, so a private edit changes no
+  dependent's key (tests/per_crate.rs: a body edit changes no record; an added `pub fn` only its crate's exports;
+  added private items only its inner). A path into another crate that stops at a name only `inner` holds reads as
+  not found; OWED: the reporter says "private" from that crate's inner record.
+- The key fix: an item's key once counted its outline position, so inserting any item re-keyed every later
+  sibling and every dependent's record. `Lower::key(owner, tag, name)` counts only earlier entries of the same
+  owner, kind and name.
+- The ready queue (`Ready { workers, rank, wait, hooks }`): a crate is ready when its dependencies' `exports`
+  exist and the sysroot crates before it in graph order are done (what makes records independent of order); N
+  workers pull; a wait has a deadline (`CrateScopeError::Stalled`); a `Need` on a crate not waited on is
+  `NeedNotWaitedOn`. Records are equal byte for byte across 1 and 18 workers and shuffled ranks.
+- Include rules: `include!("x.rs")` of a package file is read relative to the calling file's folder inside the
+  package, through `SourceTexts::read` (the sandbox rule: a crate sees its own package's files only);
+  `include!(concat!(env!("OUT_DIR"), ..))` reads the build script's outputs record, never the disk.
+- Member expansion: a macro call in an impl or trait body expands into members of that owner
+  (`Fragment::members_of`, `Member::written_by`), joined in (written_by, item) order.
+- `#[macro_export(local_inner_macros)]`: a single-name macro call in such a macro's body is rendered as
+  `$crate::name!` of the defining crate (`PathScope::DefCrate`), as the Reference says.
+- A proc-macro crate's exports come from its built module's list (`SourceTexts::proc_exports`: name, kind,
+  helpers, what the module declares to the host); its text's `#[proc_macro*]` attributes are read only when no
+  module is held (one finding per crate then). A derive declared through `synstructure::decl_derive!` is in the
+  list and in no text.
 
 ## 7. Expansion
 
@@ -465,9 +1798,11 @@ The exceptions, each dated 2026-11-15:
 |---|---|---|
 | The trait solver (`vendor/rustc_next_trait_solver`, `rustc_type_ir` and their small dependencies: arrayvec, bitflags, derive-where, ena, indexmap, ra-ap-rustc_index, rustc-hash, smallvec, thin-vec, tracing) | a fork of the Rust project's solver | becomes ours by stripping its dependencies and marking it `ours = true`; it is NOT rewritten from a blank page |
 | Wasmtime (`vendor/wasmtime`) | the proc-macro runner (rule 10) | stays vendored (Andrew, 2026-11-15 20:20: vendoring is fine for the hard ones); replaced only if a profile names it |
+| Proc-macro modules from a bootstrap builder (2026-11-16, D52; rule 1's named interim exception) | `scripts/src/bin/proc_macro_modules.rs` builds each proc-macro crate of a lock, unchanged, for `wasm32-wasip1` with the pinned nightly's rustc (`-Zwasm-proc-macros`), build scripts sandboxed, paths remapped, and writes module records; never the `blaze` binary, never spawned by it. Owner's word: allow proc macros so real projects compile unchanged | ends when blaze compiles syn to wasm; a module blaze builds is another key and supersedes by decision |
 | zstd (`vendor/zstd-sys`, C) | compression of stored records | stays vendored; first measure whether records should be compressed at all |
 | LLVM | the optimizing backend | the Rust bindings go (declared `extern "C"` from LLVM's headers); LLVM stays a C++ library until blaze's own backend is the top tier |
 | What third-party.md marks hard | TLS and signatures, zstd, the profile's file format, tree-sitter, Cargo's formats | the option third-party.md names for each |
+| `ring` for signing (2026-11-16) | blaze-remote's Ed25519 signer (builder and anchor seeds) and SigV4's SHA-256 and HMAC, linked only under its `sign` feature (and `bucket`); verification is blaze-ed25519 in every shape, and the `blaze` binary links no `ring` (remote-read.md, "Ed25519, written here") | signing stays on `ring`: code holding a secret needs constant time, and blaze writes no signer; SigV4 moves to `crates/blaze-sha2` |
 
 **No `std` and no `alloc` in blaze's own code** (Andrew: "can we not even depend on the std library
 for anything here? our own std library ... blaze-std"; "no alloc! we should have our own").
@@ -672,7 +2007,7 @@ the ratio shown.
 | A private fn added rewrites about three records | count records rewritten per edit class |
 | Glob cycles are small | the size distribution on std, reth, tempo |
 | A repeat touches a bounded number of pages | count pages touched by a repeat check after a restart |
-| Re-entry is cheap | serial `Need` rounds per body on std with an empty store |
+| Re-entry is cheap (reviewed 2026-11-16: restart stays, parking stays refused; made rare by kind order, a syntactic prefetch, and solver goals as their own tasks) | log every `Reads::ask` per body (kind, item or body fact, position, state bytes) on core, alloc, std, then reth and tempo; R = work repeated by restarts over total work, under pull order, kind order, and kind order with goal tasks. Keep re-entry if R is at most 0.10 and serial rounds add at most 10% to the 128-core cold time; above that, save state for those bodies only (explicit stacks, never fibers). Watch async code first: a `Send` obligation on a future needs its callee's body, down the chain |
 | Observed-value optimization pays | its speedup over the plain optimized tier on reth |
 | A prologue counter and a test-lane store are worth their cost | reth's suite against program-counter sampling (run.md 1 and 3) |
 | Zero third-party is affordable before hello-world | add up third-party.md's replacement lines; schedule after the first rung |

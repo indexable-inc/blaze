@@ -17,6 +17,7 @@ use blaze_own::Vec;
 
 use crate::{
     error::{Error, Why},
+    out::Out,
     plant::{self, Plant},
     request::{Range, is_token},
 };
@@ -86,6 +87,8 @@ pub struct Response<A: Allocator> {
     fields: Vec<Field, A>,
     line_start: usize,
     status: u16,
+    /// The `x` of the status line's `HTTP/1.x`.
+    minor: u8,
     length: Option<u64>,
     framing: Framing,
     body: u64,
@@ -103,6 +106,7 @@ impl<A: Allocator + Clone> Response<A> {
             fields: Vec::new_in(alloc),
             line_start: 0,
             status: 0,
+            minor: 0,
             length: None,
             framing: Framing::Head,
             body: 0,
@@ -114,13 +118,62 @@ impl<A: Allocator + Clone> Response<A> {
 
 impl<A: Allocator> Response<A> {
     /// Takes what it can of `input`, appending the body's bytes to `out`.
-    pub fn feed<B: Allocator>(&mut self, input: &[u8], out: &mut Vec<u8, B>) -> Result<Fed, Error> {
+    pub fn feed<O: Out + ?Sized>(&mut self, input: &[u8], out: &mut O) -> Result<Fed, Error> {
         let mut at = 0;
         let ran = self.run(input, &mut at, out);
         let error_at = self.taken + at as u64;
         self.taken += at as u64;
         ran.map_err(|why| Error { at: error_at, why })?;
         Ok(Fed { consumed: at, done: self.done })
+    }
+
+    /// Takes the head alone from `input`, interim heads read past, stopping where the body
+    /// starts: for a client that reads a body only as fast as its asker takes it. `consumed`
+    /// is all of `input` until the head is whole.
+    pub fn feed_head(&mut self, input: &[u8]) -> Result<Fed, Error> {
+        let mut at = 0;
+        let mut ran = Ok(());
+        while !self.done && self.framing == Framing::Head {
+            match self.head_line(input, &mut at) {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(why) => {
+                    ran = Err(why);
+                    break;
+                }
+            }
+        }
+        let error_at = self.taken + at as u64;
+        self.taken += at as u64;
+        ran.map_err(|why| Error { at: error_at, why })?;
+        Ok(Fed { consumed: at, done: self.done })
+    }
+
+    /// The `Content-Length` that frames the body, once the head is whole; none for a body
+    /// framed otherwise or for none (a HEAD request's, a 204's, a 304's).
+    pub fn content_length(&self) -> Option<u64> {
+        match self.framing {
+            Framing::Length { .. } => self.length,
+            _ => None,
+        }
+    }
+
+    /// Whether the connection can take another request once this response has ended: HTTP/1.1
+    /// with no `Connection: close`, or HTTP/1.0 with `Connection: keep-alive`, and a body not
+    /// ended by the close (RFC 9112 section 9.3).
+    pub fn reusable(&self) -> bool {
+        let (mut close, mut keep_alive) = (false, false);
+        for (name, value) in self.headers() {
+            if name.eq_ignore_ascii_case(b"connection") {
+                for token in value.split(|&b| b == b',') {
+                    let token = token.trim_ascii();
+                    close |= token.eq_ignore_ascii_case(b"close");
+                    keep_alive |= token.eq_ignore_ascii_case(b"keep-alive");
+                }
+            }
+        }
+        let keep = if self.minor == 1 { !close } else { keep_alive && !close };
+        keep && !matches!(self.framing, Framing::Head | Framing::Close)
     }
 
     /// The connection ended: the body ends with it when nothing else frames it, and is cut
@@ -194,23 +247,33 @@ impl<A: Allocator> Response<A> {
         Ok(got)
     }
 
-    fn run<B: Allocator>(&mut self, input: &[u8], at: &mut usize, out: &mut Vec<u8, B>) -> Result<(), Why> {
+    /// One line of the head from `input[*at..]`, the head parsed at its blank line: false when
+    /// the input ran out before the line's end.
+    fn head_line(&mut self, input: &[u8], at: &mut usize) -> Result<bool, Why> {
+        let rest = &input[*at..];
+        let Some(end) = rest.iter().position(|&b| b == b'\n') else {
+            self.head_bytes(rest)?;
+            *at += rest.len();
+            return Ok(false);
+        };
+        self.head_bytes(&rest[..=end])?;
+        *at += end + 1;
+        let line = &self.head[self.line_start..];
+        if line == b"\n" || line == b"\r\n" {
+            self.parse_head()?;
+        } else {
+            self.line_start = self.head.len();
+        }
+        Ok(true)
+    }
+
+    fn run<O: Out + ?Sized>(&mut self, input: &[u8], at: &mut usize, out: &mut O) -> Result<(), Why> {
         while !self.done {
             let rest = &input[*at..];
             match self.framing {
                 Framing::Head => {
-                    let Some(end) = rest.iter().position(|&b| b == b'\n') else {
-                        self.head_bytes(rest)?;
-                        *at += rest.len();
+                    if !self.head_line(input, at)? {
                         return Ok(());
-                    };
-                    self.head_bytes(&rest[..=end])?;
-                    *at += end + 1;
-                    let line = &self.head[self.line_start..];
-                    if line == b"\n" || line == b"\r\n" {
-                        self.parse_head()?;
-                    } else {
-                        self.line_start = self.head.len();
                     }
                 }
                 Framing::Empty => self.done = true,
@@ -248,17 +311,17 @@ impl<A: Allocator> Response<A> {
         self.head.try_extend_from_slice(bytes).map_err(Why::Alloc)
     }
 
-    fn emit<B: Allocator>(&mut self, bytes: &[u8], out: &mut Vec<u8, B>) -> Result<(), Why> {
+    fn emit<O: Out + ?Sized>(&mut self, bytes: &[u8], out: &mut O) -> Result<(), Why> {
         if self.body + bytes.len() as u64 > self.limits.most_body {
             return Err(Why::BodyOver { most: self.limits.most_body });
         }
-        out.try_extend_from_slice(bytes).map_err(Why::Alloc)?;
+        out.try_put(bytes).map_err(Why::Alloc)?;
         self.body += bytes.len() as u64;
         Ok(())
     }
 
     /// One step of a chunked body over `rest`; returns the bytes it took.
-    fn chunk<B: Allocator>(&mut self, chunk: Chunk, rest: &[u8], fresh: bool, out: &mut Vec<u8, B>) -> Result<usize, Why> {
+    fn chunk<O: Out + ?Sized>(&mut self, chunk: Chunk, rest: &[u8], fresh: bool, out: &mut O) -> Result<usize, Why> {
         if let Chunk::Data { left } = chunk {
             let n = left.min(rest.len() as u64) as usize;
             self.emit(&rest[..n], out)?;
@@ -330,7 +393,7 @@ impl<A: Allocator> Response<A> {
         self.fields.clear();
         let head = &self.head[..];
         let mut lines = head.split(|&b| b == b'\n').map(|l| l.strip_suffix(b"\r").unwrap_or(l));
-        let status = status_line(lines.next().unwrap_or(b""))?;
+        let (minor, status) = status_line(lines.next().unwrap_or(b""))?;
         let mut offset = head.iter().position(|&b| b == b'\n').map_or(head.len(), |i| i + 1);
         for line in lines {
             let start = offset;
@@ -362,6 +425,7 @@ impl<A: Allocator> Response<A> {
                 .map_err(|refused| Why::Alloc(refused.why))?;
         }
         self.status = status;
+        self.minor = minor;
         if status == 101 {
             return Err(Why::Switching);
         }
@@ -408,22 +472,22 @@ impl<A: Allocator> Response<A> {
             (None, None) => Framing::Close,
         };
         self.length = length;
-        if framing == (Framing::Length { left: 0 }) {
+        if framing == Framing::Empty || framing == (Framing::Length { left: 0 }) {
             self.done = true;
         }
         Ok(framing)
     }
 }
 
-/// `HTTP/1.x NNN reason`: the status.
-fn status_line(line: &[u8]) -> Result<u16, Why> {
+/// `HTTP/1.x NNN reason`: the `x`, and the status.
+fn status_line(line: &[u8]) -> Result<(u8, u16), Why> {
     let rest = line.strip_prefix(b"HTTP/1.").ok_or(Why::StatusLine)?;
     match rest {
-        [b'0' | b'1', b' ', a, b, c, tail @ ..] if [a, b, c].iter().all(|d| d.is_ascii_digit()) => {
+        [minor @ (b'0' | b'1'), b' ', a, b, c, tail @ ..] if [a, b, c].iter().all(|d| d.is_ascii_digit()) => {
             if !(tail.is_empty() || tail[0] == b' ') || tail.iter().any(|&b| b < b' ' && b != b'\t') {
                 return Err(Why::StatusLine);
             }
-            Ok(u16::from(a - b'0') * 100 + u16::from(b - b'0') * 10 + u16::from(c - b'0'))
+            Ok((minor - b'0', u16::from(a - b'0') * 100 + u16::from(b - b'0') * 10 + u16::from(c - b'0')))
         }
         _ => Err(Why::StatusLine),
     }

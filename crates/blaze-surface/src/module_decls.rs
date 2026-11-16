@@ -24,7 +24,8 @@ use crate::column::{
 };
 use crate::error::BuildError;
 use crate::kind::{
-    CallShape, Def, DefKind, DefKindTag, Namespace, WrittenVis, WrittenVisTag, byte_enum,
+    CallShape, Def, DefKind, DefKindTag, MacroShapes, Namespace, WrittenVis, WrittenVisTag,
+    byte_enum,
 };
 use crate::path::{
     ExternTarget, Path, PathRow, PathTable, PathView, Paths, Rename, RenameTag, UseForm,
@@ -82,6 +83,8 @@ pub struct MacroRulesDecl<N> {
     pub pos: u32,
     /// `#[macro_export]`.
     pub export: bool,
+    /// The call shapes its arms are written for.
+    pub shapes: MacroShapes,
 }
 
 /// An item-position macro call: a function-like call, an attribute macro on an item (the item
@@ -195,7 +198,7 @@ blaze_format::record! {
         pub(crate) key: ContentId,
         pub(crate) ns: Namespace,
         pub(crate) kind: DefKindTag,
-        pub(crate) shape: CallShape,
+        pub(crate) shapes: MacroShapes,
         pub(crate) vis: WrittenVisTag,
     }
 }
@@ -247,7 +250,7 @@ blaze_format::record! {
         pub(crate) pos: u32,
         pub(crate) def: ContentId,
         pub(crate) export: bool,
-        pub(crate) pad: u8,
+        pub(crate) shapes: MacroShapes,
         pub(crate) pad2: u16,
     }
 }
@@ -355,8 +358,8 @@ impl<N: AsRef<str>> DeclsBuilder<'_, N> {
         for it in self.items.iter() {
             let name = strings.push(it.name.as_ref(), TABLE)?;
             let (vis, vis_path) = vis_row(&it.vis, &mut paths, &mut strings, TABLE)?;
-            let (kind, shape) = it.def.kind.to_record();
-            items.push(ItemRow { name, vis_path, key: it.def.key.0, ns: it.ns, kind, shape, vis });
+            let (kind, shapes) = it.def.kind.to_record();
+            items.push(ItemRow { name, vis_path, key: it.def.key.0, ns: it.ns, kind, shapes, vis });
         }
         let mut mods = Vec::with_capacity_in(self.mods.len(), alloc);
         for m in self.mods.iter() {
@@ -391,7 +394,7 @@ impl<N: AsRef<str>> DeclsBuilder<'_, N> {
         let mut rules = Vec::with_capacity_in(self.macro_rules.len(), alloc);
         for mr in self.macro_rules.iter() {
             let name = strings.push(mr.name.as_ref(), TABLE)?;
-            rules.push(RulesRow { name, pos: mr.pos, def: mr.def.0, export: mr.export, pad: 0, pad2: 0 });
+            rules.push(RulesRow { name, pos: mr.pos, def: mr.def.0, export: mr.export, shapes: mr.shapes, pad2: 0 });
         }
         let mut calls = Vec::with_capacity_in(self.calls.len(), alloc);
         for c in self.calls.iter() {
@@ -553,7 +556,7 @@ impl<'a> ModuleDeclsView<'a> {
         self.items.iter().map(move |row| DeclaredItem {
             name: text_of(strings, row.name),
             ns: row.ns,
-            def: Def { key: ItemKey(row.key), kind: DefKind::from_record(row.kind, row.shape) },
+            def: Def { key: ItemKey(row.key), kind: DefKind::from_record(row.kind, row.shapes) },
             vis: vis_of(&paths, row.vis, row.vis_path),
         })
     }
@@ -608,6 +611,7 @@ impl<'a> ModuleDeclsView<'a> {
             def: ItemKey(row.def),
             pos: row.pos,
             export: row.export,
+            shapes: row.shapes,
         })
     }
 

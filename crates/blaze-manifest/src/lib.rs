@@ -5,29 +5,69 @@
 //! the same here; what it rejects is rejected with its message. `cargo metadata --no-deps` is
 //! the check: [`metadata`] prints the same JSON, held by the tests to the output cargo printed
 //! for each fixture, recorded once.
+//!
+//! [`layout`] is the sans-IO core the new `blaze` reads a workspace with, on blaze's own crates
+//! only (`default-features = false` leaves out the rest, the `cargo` feature):
+//!
+//! - It starts from a package's directory, anchor-relative: `Layout::new("crates/app", alloc)`.
+//! - `pass()` answers `Done(units)` or `Need(needs)`: manifest texts and directory listings by
+//!   anchor-relative path. The caller answers each with `manifest(path, text)` or
+//!   `listing(dir, entries)`, `None` for none there, and calls `pass()` again.
+//! - `units.members`, in cargo's order, each have their `dir`, `name`, `edition`
+//!   (`PackageEdition`: syntax, and `std_crate()`, `bstd` for a blaze edition), `lib` and
+//!   `bins` with their `root` files, `dependencies` and `features`.
+//! - Each dependency's `source` is `Member(index)`, `Path(dir)`, `Registry { req, registry }`
+//!   or `Git { url, reference }`.
+//! - Every package, target, dependency, feature and edition has a `span`: its manifest and the
+//!   byte range of its line, for a finding to be placed on.
 
 #![feature(allocator_api)]
 
+#[cfg(feature = "cargo")]
 pub mod config;
+#[cfg(feature = "cargo")]
 pub mod dependency;
+#[cfg(feature = "cargo")]
 pub mod diagnostic;
+#[cfg(feature = "cargo")]
 pub mod error;
+#[cfg(feature = "cargo")]
 pub mod features;
+#[cfg(feature = "cargo")]
 pub mod files;
+#[cfg(feature = "cargo")]
 pub mod home;
+pub mod layout;
+pub mod lock;
+#[cfg(feature = "cargo")]
 pub mod manifest;
+#[cfg(feature = "cargo")]
 pub mod metadata;
+#[cfg(feature = "cargo")]
 pub mod paths;
+#[cfg(feature = "cargo")]
 pub mod profiles;
+#[cfg(feature = "cargo")]
 pub mod schema;
+#[cfg(feature = "cargo")]
+mod snippet;
+#[cfg(feature = "cargo")]
 pub mod source;
+#[cfg(feature = "cargo")]
 pub mod targets;
+#[cfg(feature = "cargo")]
 pub mod user_config;
+#[cfg(feature = "cargo")]
 pub mod workspace;
 
+#[cfg(feature = "cargo")]
 use stdx::edit_distance::cargo as edit_distance;
 
-pub use config::Config;
+#[cfg(feature = "cargo")]
+pub use config::{Config, UserRecord};
+#[cfg(feature = "cargo")]
 pub use error::ManifestError;
+#[cfg(feature = "cargo")]
 pub use manifest::Context;
+#[cfg(feature = "cargo")]
 pub use workspace::Workspace;

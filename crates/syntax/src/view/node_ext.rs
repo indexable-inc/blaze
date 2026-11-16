@@ -310,6 +310,8 @@ impl<'t> ast::DocComment<'t> {
     }
 
     /// Returns the textual content of a doc comment node as a single string with prefix and suffix removed.
+    /// Raw: a block's CR LFs keep their CRs; its value, each break one LF, is
+    /// `parser::line_break::doc_comment_value`'s.
     pub fn text(self) -> &'t str {
         let shape = self.shape();
         let text = &self.text_with_markers()[Self::PREFIX_LEN.into()..];
@@ -317,7 +319,14 @@ impl<'t> ast::DocComment<'t> {
             // The `*/` may not exist because of recovery.
             text.strip_suffix("*/").unwrap_or(text)
         } else {
-            text
+            // The token ends before its LF, so a CR LF break leaves its CR in it
+            // (parser::line_break).
+            let followed_by_lf = self
+                .syntax
+                .first_token()
+                .and_then(|it| it.next_token())
+                .is_some_and(|it| it.text().starts_with('\n'));
+            parser::line_break::line_comment_text(text, followed_by_lf)
         }
     }
 }

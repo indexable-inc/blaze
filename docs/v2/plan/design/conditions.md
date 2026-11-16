@@ -55,13 +55,29 @@ that forked, plus the arena's node cap (`Limits::nodes`, a typed `CondError::Nod
 
 ## (iii) Stored under the condition it holds under; its support is its cfg read list
 
-A task's result holds under `C`, the conjunction of the alternatives it took (`P` implies
-`C`). It is stored with `C` in portable form, and its cfg read list is `support(C)`: exactly the
-variables whose value could change the result. A lookup by a task under `P'` takes a stored
-record when `implies(P', C)`; when `P' & C` is satisfiable but not `P'`, it takes the record for
-that part and computes `P' & !C`. An atom the space does not hold lowers to false and is
-reported by `cfg::lower` as an absent key: the record lists it in its read list as absent, and a
-request whose space holds it does not take the record.
+Decided 2026-11-15 (coordinator, for the drive's port):
+
+- **One record a key; the key is text only** (rule 65): `base`, no condition in it. A record is
+  variational: it holds `cover`, the condition it was computed under, its entries carry their
+  own conditions, and its read list carries the stable keys of `support` of what it read. A
+  record that read no cfg has cover true, the zero id, at no cost.
+- **A lookup under `P` is a hit** when the read list holds and `implies(P, cover)`; nothing is
+  searched among several records. When `P` is not inside `cover`, the part `P & !cover` is a
+  miss: the task runs under `cover | P` (first recompute; splicing the old entries for the
+  covered part comes after it is measured) and writes the record that supersedes the old one
+  under the same key, as a read-list miss replaces a record today. Coverage only grows, so two
+  requests with different spaces converge. `blaze check` asks under all of `valid`; a
+  single-configuration `blaze run` reads those records by restriction, and when first, writes a
+  narrower cover the next check widens.
+- **One arena a request, on the coordinator**: a `Cond` id means something only in it.
+  Workers build in arenas of their own and hand back the portable form, which the coordinator
+  re-interns (139 to 208 ns an import); there is no shared mutable arena.
+- **A certificate that stood imports nothing**: conditions are imported only for the records a
+  miss makes the machine read.
+
+An atom the space does not hold lowers to false and is reported by `cfg::lower` as an absent
+key: the record lists it in its read list as absent, and a request whose space holds it does
+not take the record.
 
 ## (iv) What changes in crates/blaze-drive (its lane edits; this doc does not)
 

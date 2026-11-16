@@ -264,6 +264,7 @@ dependencies = [
  "blaze-data",
  "blaze-fetch",
  "blaze-json",
+ "blaze-manifest",
  "blaze-own",
  "blaze-semver",
  "blaze-sim",
@@ -313,6 +314,9 @@ dependencies = [
 name = "blaze-build"
 version = "0.0.0"
 dependencies = [
+ "blaze-emit",
+ "blaze-ids",
+ "blaze-inproc",
  "blaze-lir",
  "blaze-own",
  "blaze-sim",
@@ -323,15 +327,14 @@ dependencies = [
 name = "blaze-build-script"
 version = "0.0.0"
 dependencies = [
- "blaze-alloc-count",
- "blaze-core",
- "blaze-hash",
+ "blaze-expand",
+ "blaze-fetch",
+ "blaze-git-fetch",
  "blaze-ids",
- "blaze-mem",
- "blaze-memchr",
- "blaze-serde",
- "serde",
- "serde_derive",
+ "blaze-manifest",
+ "blaze-own",
+ "blaze-sim",
+ "blaze-unit-graph",
 ]
 
 [[package]]
@@ -400,15 +403,29 @@ dependencies = [
 name = "blaze-cli"
 version = "0.0.0"
 dependencies = [
+ "blaze-core",
  "blaze-drive",
+ "blaze-fetch",
  "blaze-file-items",
+ "blaze-http",
+ "blaze-id",
  "blaze-ids",
  "blaze-ladder",
+ "blaze-manifest",
  "blaze-mem",
  "blaze-own",
+ "blaze-proc-macro",
+ "blaze-remote",
+ "blaze-report",
+ "blaze-scope",
  "blaze-sim",
  "blaze-std",
  "blaze-surface",
+ "blaze-text",
+ "blaze-toolchain",
+ "blaze-unit-graph",
+ "blaze-world",
+ "edition",
 ]
 
 [[package]]
@@ -445,14 +462,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-consteval"
+version = "0.0.0"
+dependencies = [
+ "blaze-build",
+ "blaze-consteval",
+ "blaze-expand",
+ "blaze-file-items",
+ "blaze-hash",
+ "blaze-id",
+ "blaze-ids",
+ "blaze-lower",
+ "blaze-mem",
+ "blaze-own",
+ "blaze-sim",
+ "blaze-surface",
+ "blaze-typeck",
+]
+
+[[package]]
 name = "blaze-core"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
+ "blaze-base64",
  "blaze-check",
  "blaze-hash",
  "blaze-ids",
  "blaze-mem",
+ "blaze-own",
  "blaze-queue",
  "blaze-radix",
  "blaze-rng",
@@ -494,14 +532,28 @@ dependencies = [
 name = "blaze-drive"
 version = "0.0.0"
 dependencies = [
+ "blaze-fetch",
  "blaze-format",
+ "blaze-git-fetch",
  "blaze-id",
  "blaze-ids",
+ "blaze-manifest",
  "blaze-own",
  "blaze-run",
  "blaze-scope",
  "blaze-sim",
  "blaze-surface",
+ "blaze-text",
+ "blaze-unit-graph",
+]
+
+[[package]]
+name = "blaze-ed25519"
+version = "0.0.0"
+dependencies = [
+ "blaze-int",
+ "blaze-sim",
+ "ring",
 ]
 
 [[package]]
@@ -524,49 +576,56 @@ dependencies = [
  "blaze-own",
  "blaze-sim",
  "blaze-surface",
- "intern",
- "mbe",
  "parser",
- "span",
- "syntax-bridge",
- "tt",
+ "rustc_lexer",
 ]
 
 [[package]]
 name = "blaze-fetch"
 version = "0.0.0"
 dependencies = [
- "blaze-cas",
  "blaze-core",
  "blaze-data",
+ "blaze-deflate",
+ "blaze-ed25519",
  "blaze-format",
- "blaze-hash",
+ "blaze-git-fetch",
+ "blaze-http",
  "blaze-ids",
  "blaze-json",
+ "blaze-lex",
+ "blaze-manifest",
+ "blaze-own",
+ "blaze-semver",
  "blaze-sha256",
  "blaze-sim",
  "blaze-tar",
- "blaze-trace",
+ "blaze-text",
  "blaze-unicode",
- "filetime",
- "sha2 0.11.1",
- "stdx",
- "tempfile",
 ]
 
 [[package]]
 name = "blaze-file-items"
 version = "0.0.0"
 dependencies = [
+ "blaze-blake3",
  "blaze-format",
  "blaze-hash",
  "blaze-ids",
  "blaze-lex",
+ "blaze-mem",
  "blaze-memchr",
  "blaze-own",
  "blaze-sim",
  "blaze-surface",
  "parser",
+]
+
+[[package]]
+name = "blaze-flow"
+version = "0.0.0"
+dependencies = [
+ "blaze-sim",
 ]
 
 [[package]]
@@ -671,10 +730,8 @@ name = "blaze-git-fetch"
 version = "0.0.0"
 dependencies = [
  "blaze-deflate",
- "blaze-h1-net",
  "blaze-own",
  "blaze-sim",
- "blaze-std",
 ]
 
 [[package]]
@@ -780,18 +837,15 @@ dependencies = [
  "blaze-base64",
  "blaze-core",
  "blaze-deflate",
+ "blaze-h1",
  "blaze-own",
  "blaze-sha256",
  "blaze-sim",
+ "blaze-url",
  "bytes",
- "http",
- "httparse",
- "percent-encoding",
  "quinn-proto",
  "rcgen",
  "rustls",
- "rustls-native-certs",
- "url",
 ]
 
 [[package]]
@@ -925,16 +979,26 @@ name = "blaze-ladder"
 version = "0.0.0"
 dependencies = [
  "blaze-build",
+ "blaze-consteval",
  "blaze-emit",
+ "blaze-expand",
+ "blaze-fetch",
  "blaze-file-items",
  "blaze-hash",
+ "blaze-id",
  "blaze-ids",
  "blaze-launch",
  "blaze-launch-rt",
+ "blaze-lower",
  "blaze-own",
+ "blaze-scope",
  "blaze-sim",
+ "blaze-std",
  "blaze-surface",
+ "blaze-toolchain",
  "blaze-typeck",
+ "blaze-unit-graph",
+ "edition",
  "libc",
  "parser",
 ]
@@ -951,7 +1015,7 @@ dependencies = [
 name = "blaze-launch-rt"
 version = "0.0.0"
 dependencies = [
- "blake3",
+ "blaze-blake3",
  "blaze-launch",
  "blaze-queue",
  "libc",
@@ -978,6 +1042,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-lint"
+version = "0.0.0"
+dependencies = [
+ "blaze-blake3",
+ "blaze-file-items",
+ "blaze-lex",
+ "blaze-memchr",
+ "blaze-own",
+ "blaze-sim",
+ "blaze-surface",
+ "blaze-text",
+]
+
+[[package]]
 name = "blaze-lint-defs"
 version = "0.0.0"
 dependencies = [
@@ -1000,27 +1078,44 @@ dependencies = [
 name = "blaze-lower"
 version = "0.0.0"
 dependencies = [
+ "blaze-build-script",
+ "blaze-expand",
  "blaze-file-items",
  "blaze-format-core",
  "blaze-hash",
+ "blaze-id",
  "blaze-ids",
  "blaze-own",
+ "blaze-scope",
  "blaze-sim",
  "blaze-surface",
  "blaze-typeck",
+ "blaze-unit-graph",
+ "edition",
  "parser",
+]
+
+[[package]]
+name = "blaze-malloc"
+version = "0.0.0"
+dependencies = [
+ "blaze-check",
+ "blaze-mem",
+ "blaze-rng",
+ "blaze-sim",
+ "blaze-spin",
 ]
 
 [[package]]
 name = "blaze-manifest"
 version = "0.0.0"
 dependencies = [
- "annotate-snippets",
  "blaze-core",
  "blaze-data",
  "blaze-glob",
  "blaze-hash",
  "blaze-ids",
+ "blaze-json",
  "blaze-own",
  "blaze-resolve",
  "blaze-semver",
@@ -1028,12 +1123,9 @@ dependencies = [
  "blaze-sim",
  "blaze-source",
  "blaze-toml",
- "dunce",
  "edition",
- "pathdiff",
  "serde",
  "serde_json",
- "shell-escape",
  "stdx",
  "url",
 ]
@@ -1106,6 +1198,7 @@ dependencies = [
 name = "blaze-own"
 version = "0.0.0"
 dependencies = [
+ "blaze-check",
  "blaze-memchr",
  "blaze-sim",
 ]
@@ -1146,6 +1239,32 @@ version = "0.0.0"
 dependencies = [
  "blaze-ids",
  "blaze-sim",
+]
+
+[[package]]
+name = "blaze-proc-macro"
+version = "0.0.0"
+dependencies = [
+ "blaze-build-script",
+ "blaze-expand",
+ "blaze-fetch",
+ "blaze-file-items",
+ "blaze-format",
+ "blaze-id",
+ "blaze-ids",
+ "blaze-lex",
+ "blaze-lower",
+ "blaze-manifest",
+ "blaze-own",
+ "blaze-record",
+ "blaze-sha256",
+ "blaze-sim",
+ "blaze-surface",
+ "blaze-typeck",
+ "blaze-unit-graph",
+ "blaze-wasi",
+ "tracing",
+ "wasmtime",
 ]
 
 [[package]]
@@ -1222,6 +1341,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-real"
+version = "0.0.0"
+dependencies = [
+ "blaze-build-script",
+ "blaze-expand",
+ "blaze-fetch",
+ "blaze-file-items",
+ "blaze-id",
+ "blaze-ladder",
+ "blaze-lex",
+ "blaze-lint",
+ "blaze-lower",
+ "blaze-manifest",
+ "blaze-own",
+ "blaze-proc-macro",
+ "blaze-scope",
+ "blaze-surface",
+ "blaze-toolchain",
+ "blaze-typeck",
+ "blaze-unit-graph",
+ "blaze-world",
+ "edition",
+]
+
+[[package]]
 name = "blaze-reclaim"
 version = "0.0.0"
 dependencies = [
@@ -1255,14 +1399,15 @@ version = "0.0.0"
 dependencies = [
  "blaze-cas",
  "blaze-data",
+ "blaze-ed25519",
  "blaze-format",
  "blaze-http",
  "blaze-ids",
  "blaze-json",
  "blaze-keyed",
+ "blaze-own",
  "blaze-sha256",
  "blaze-sim",
- "http",
  "ring",
 ]
 
@@ -1271,7 +1416,11 @@ name = "blaze-report"
 version = "0.0.0"
 dependencies = [
  "blaze-data",
+ "blaze-lex",
+ "blaze-own",
  "blaze-protocol",
+ "blaze-sim",
+ "blaze-text",
  "blaze-toml",
  "blaze-unicode",
  "serde",
@@ -1323,13 +1472,21 @@ dependencies = [
 name = "blaze-scope"
 version = "0.0.0"
 dependencies = [
+ "blaze-build-script",
  "blaze-expand",
+ "blaze-fetch",
  "blaze-file-items",
+ "blaze-format",
  "blaze-hash",
  "blaze-id",
+ "blaze-ids",
+ "blaze-manifest",
  "blaze-own",
  "blaze-sim",
  "blaze-surface",
+ "blaze-toolchain",
+ "blaze-unit-graph",
+ "edition",
 ]
 
 [[package]]
@@ -1425,6 +1582,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-sort"
+version = "0.0.0"
+dependencies = [
+ "blaze-hash",
+ "blaze-memchr",
+ "blaze-own",
+ "blaze-rng",
+ "blaze-sim",
+]
+
+[[package]]
 name = "blaze-source"
 version = "0.0.0"
 dependencies = [
@@ -1463,19 +1631,37 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-squeeze"
+version = "0.0.0"
+dependencies = [
+ "blaze-columns",
+ "blaze-file-items",
+ "blaze-ids",
+ "blaze-own",
+ "blaze-parquet",
+ "blaze-sim",
+ "blaze-surface",
+ "zstd",
+]
+
+[[package]]
 name = "blaze-std"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
  "blaze-bytes",
+ "blaze-cbor",
  "blaze-check",
  "blaze-core",
+ "blaze-data",
  "blaze-deflate",
  "blaze-format",
+ "blaze-h1",
  "blaze-hash",
  "blaze-hashcons",
  "blaze-http",
  "blaze-ids",
+ "blaze-json",
  "blaze-mem",
  "blaze-own",
  "blaze-phf",
@@ -1486,8 +1672,9 @@ dependencies = [
  "blaze-sha256",
  "blaze-sim",
  "blaze-spin",
+ "blaze-sys",
  "blaze-text",
- "http",
+ "blaze-url",
  "objc2-core-foundation",
  "objc2-core-media",
  "objc2-core-video",
@@ -1575,6 +1762,22 @@ dependencies = [
  "blaze-data",
  "blaze-own",
  "blaze-sim",
+ "blaze-text",
+]
+
+[[package]]
+name = "blaze-toolchain"
+version = "0.0.0"
+dependencies = [
+ "blaze-fetch",
+ "blaze-manifest",
+ "blaze-own",
+ "blaze-script",
+ "blaze-text",
+ "blaze-toml",
+ "blaze-unit-graph",
+ "edition",
+ "serde_json",
 ]
 
 [[package]]
@@ -1599,9 +1802,13 @@ name = "blaze-typeck"
 version = "0.0.0"
 dependencies = [
  "blaze-hash",
- "blaze-kit",
+ "blaze-id",
+ "blaze-ids",
  "blaze-own",
  "blaze-sim",
+ "blaze-solve",
+ "blaze-ty",
+ "blaze-typeck",
 ]
 
 [[package]]
@@ -1609,6 +1816,23 @@ name = "blaze-unicode"
 version = "0.0.0"
 dependencies = [
  "blaze-sim",
+]
+
+[[package]]
+name = "blaze-unit-graph"
+version = "0.0.0"
+dependencies = [
+ "blaze-cond",
+ "blaze-fetch",
+ "blaze-git-fetch",
+ "blaze-ids",
+ "blaze-manifest",
+ "blaze-own",
+ "blaze-semver",
+ "blaze-sim",
+ "blaze-text",
+ "blaze-toml",
+ "edition",
 ]
 
 [[package]]
@@ -1622,6 +1846,13 @@ dependencies = [
  "cfg",
  "intern",
  "syntax",
+]
+
+[[package]]
+name = "blaze-url"
+version = "0.0.0"
+dependencies = [
+ "blaze-sim",
 ]
 
 [[package]]
@@ -1674,21 +1905,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-world"
+version = "0.0.0"
+dependencies = [
+ "blaze-build-script",
+ "blaze-core",
+ "blaze-expand",
+ "blaze-fetch",
+ "blaze-id",
+ "blaze-lex",
+ "blaze-manifest",
+ "blaze-own",
+ "blaze-proc-macro",
+ "blaze-scope",
+ "blaze-surface",
+ "blaze-toolchain",
+ "blaze-unit-graph",
+ "blaze-world",
+ "edition",
+]
+
+[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
  "generic-array",
-]
-
-[[package]]
-name = "block-buffer"
-version = "0.12.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
-dependencies = [
- "hybrid-array",
 ]
 
 [[package]]
@@ -1781,32 +2024,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "const-oid"
-version = "0.10.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
-
-[[package]]
 name = "constant_time_eq"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3d52eff69cd5e647efe296129160853a42795992097e8af39800e1060caeea9b"
-
-[[package]]
-name = "core-foundation"
-version = "0.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2a6cd9ae233e7f62ba4e9353e81a88df7fc8a5987b8d445b4d90c879bd156f6"
-dependencies = [
- "core-foundation-sys",
- "libc",
-]
-
-[[package]]
-name = "core-foundation-sys"
-version = "0.8.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "corosensei"
@@ -1915,7 +2136,7 @@ dependencies = [
  "rustc-hash",
  "serde",
  "serde_derive",
- "sha2 0.10.9",
+ "sha2",
  "smallvec",
  "target-lexicon",
  "wasmtime-internal-core",
@@ -2043,15 +2264,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crypto-common"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce6e4c961d6cd6c9a86db418387425e8bdeaf05b3c8bc1411e6dca4c252f1453"
-dependencies = [
- "hybrid-array",
-]
-
-[[package]]
 name = "data-encoding"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2092,19 +2304,8 @@ version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
- "block-buffer 0.10.4",
- "crypto-common 0.1.7",
-]
-
-[[package]]
-name = "digest"
-version = "0.11.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
-dependencies = [
- "block-buffer 0.12.1",
- "const-oid",
- "crypto-common 0.2.2",
+ "block-buffer",
+ "crypto-common",
 ]
 
 [[package]]
@@ -2139,12 +2340,6 @@ name = "drop_bomb"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9bda8e21c04aca2ae33ffc2fd8c23134f3cac46db123ba97bd9d3f3b8a4a85e1"
-
-[[package]]
-name = "dunce"
-version = "1.0.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 
 [[package]]
 name = "edit-applier"
@@ -2493,31 +2688,6 @@ dependencies = [
  "syntax-bridge",
  "test-utils",
  "tt",
-]
-
-[[package]]
-name = "http"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "918d3568bebf352712bc2ef3d46a8bcf1a75b373be6539de198e9105cbbf9ce0"
-dependencies = [
- "bytes",
- "itoa",
-]
-
-[[package]]
-name = "httparse"
-version = "1.10.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
-
-[[package]]
-name = "hybrid-array"
-version = "0.4.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "27f864f10dfb56725ce5ce5472bc52252c8f93a4ab86327122cebf62c5f59a17"
-dependencies = [
- "typenum",
 ]
 
 [[package]]
@@ -3115,12 +3285,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
-name = "openssl-probe"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
-
-[[package]]
 name = "parking_lot"
 version = "0.12.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3632,18 +3796,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rustls-native-certs"
-version = "0.8.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4a073f5dc7469f984c52ad2752b63b0807745133b6de880b7b64c1ac4c48aec4"
-dependencies = [
- "openssl-probe",
- "rustls-pki-types",
- "schannel",
- "security-framework",
-]
-
-[[package]]
 name = "rustls-pki-types"
 version = "1.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3680,15 +3832,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "schannel"
-version = "0.1.30"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9cb23c424d8ee841bb4d813677ca237e2a610067d594fec130f87d6093495ab5"
-dependencies = [
- "windows-sys 0.61.2",
-]
-
-[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3699,33 +3842,15 @@ name = "scripts"
 version = "0.0.0"
 dependencies = [
  "blaze-data",
+ "blaze-fetch",
+ "blaze-git-fetch",
+ "blaze-lex",
+ "blaze-own",
  "blaze-script",
  "blaze-sha256",
+ "blaze-text",
  "blaze-toml",
  "serde_json",
-]
-
-[[package]]
-name = "security-framework"
-version = "3.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7f4bc775c73d9a02cde8bf7b2ec4c9d12743edf609006c7facc23998404cd1d"
-dependencies = [
- "bitflags",
- "core-foundation",
- "core-foundation-sys",
- "libc",
- "security-framework-sys",
-]
-
-[[package]]
-name = "security-framework-sys"
-version = "2.17.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ce2691df843ecc5d231c0b14ece2acc3efb62c0a398c7e1d875f3983ce020e3"
-dependencies = [
- "core-foundation-sys",
- "libc",
 ]
 
 [[package]]
@@ -3791,25 +3916,8 @@ checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
 dependencies = [
  "cfg-if",
  "cpufeatures 0.2.17",
- "digest 0.10.7",
+ "digest",
 ]
-
-[[package]]
-name = "sha2"
-version = "0.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "47d7069beb7d6ac7b9acd1039986e73443f24234f41074da099d6f994ac9ad19"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.3.1",
- "digest 0.11.3",
-]
-
-[[package]]
-name = "shell-escape"
-version = "0.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "45bb67a18fa91266cc7807181f62f9178a6873bfad7dc788c42e6430db40184f"
 
 [[package]]
 name = "shlex"

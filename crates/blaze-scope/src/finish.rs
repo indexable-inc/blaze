@@ -10,17 +10,19 @@ use blaze_hash::HashMap;
 use blaze_id::ItemKey;
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_surface::{
-    AnonImport, Binding, Def, DefKind, Namespace, Origin, Path, ScopeBuilder, ScopeEntry, ScopeError,
-    Site, TextualDef, TextualMark, Unresolved, Visibility,
+    AnonImport, Binding, BindingState, Def, DefKind, GlobEdge, Namespace, Origin, Path, ScopeBuilder,
+    ScopeEntry, ScopeError, Site, TextualDef, TextualMark, Unresolved, Visibility, globs_digest,
+    textual_digest,
 };
 
 use crate::error::ResolveError;
 use crate::facts::{Name, ScopeFacts};
-use crate::read::Read;
+use crate::read::{NameAnswer, Read};
 #[cfg(test)]
 use crate::resolver::Plant;
 use crate::resolver::{Cached, CallState, Env, NsRes, Query, Res, Resolver, Scan, Sink, Slot, Source};
-use crate::scope::{ReadList, Resolved, SeenFrom};
+use crate::scope::{ReadList, Resolved};
+use blaze_surface::SeenFrom;
 
 /// What a member's final pass came to.
 pub(crate) enum Finish<'a, N> {
@@ -51,12 +53,13 @@ impl<N: Name> Errors<'_, N> {
 }
 
 impl<'a, N: Name> Resolver<'a, N> {
-    /// The final pass of this member of a group of `fellows` (sorted, itself among them).
+    /// The final pass of this machine, the members of `env` read live. Its read list holds
+    /// what it read of modules outside `env`: alone, that is every read; a group's members
+    /// take theirs from [`settle`], which reads each fellow by its record.
     pub(crate) fn finalize<F: ScopeFacts<Name = N>>(
         &self,
         facts: &F,
         env: Env<'_, 'a, N>,
-        fellows: &[ItemKey],
         stats: &mut crate::resolver::FillStats,
     ) -> Result<Finish<'a, N>, ResolveError> {
         let a = self.alloc.clone();
@@ -64,22 +67,22 @@ impl<'a, N: Name> Resolver<'a, N> {
         #[cfg(test)]
         {
             sink.forget_negative = self.plant == Plant::ForgetNegativeReads;
+            sink.forget_probes = self.plant == Plant::ForgetGlobProbes;
         }
         let mut errors = Errors { list: Vec::new_in(a.clone()), seen: HashMap::new_in(a.clone()) };
         self.finish_frag(0, facts, env, &mut sink, &mut errors)?;
 
         let mut names = Vec::new_in(a.clone());
-        let mut seen = Vec::new_in(a.clone());
-        self.glob_names(env, &mut sink, &mut seen, &mut names);
+        self.own_names(&mut names);
         names.sort_unstable();
         names.dedup();
         let q = Query { asker: self.asker(), restricted: false, ignore: None };
         let mut bindings = Vec::with_capacity_in(names.len(), a.clone());
-        // The globs that left a name undetermined, by tree place: one error each.
-        let mut undetermined: AVec<'a, (crate::resolver::At, u32)> = Vec::new_in(a.clone());
         for &(ns, name) in names.iter() {
             sink.undet_glob = None;
             match self.lookup_module(ns, name, q, env, &mut sink) {
+                // A failed named import's name reached through a glob: the glob's, not the record's.
+                Res::Found(hit) if hit.origin == Origin::Glob => {}
                 Res::Found(hit) => bindings.push(ScopeEntry {
                     ns,
                     name,
@@ -94,9 +97,11 @@ impl<'a, N: Name> Resolver<'a, N> {
                 Res::None | Res::Wait => {}
                 Res::Undet { .. } => match sink.undet_glob {
                     // Nothing is pending and every answer is in, so a name stays undecided
-                    // only through a glob whose source answered `Undetermined`: that glob is
-                    // an unresolved import of the scope.
-                    Some((m, at, g)) if m == self.module => undetermined.push((at, g)),
+                    // only through this module's globs around a cycle of its group, where
+                    // nothing binds it: at the least fixpoint it is not there (the Reference,
+                    // "Use declarations": a glob imports the names its source has), so no
+                    // binding and no error. A finished scope never says "undetermined".
+                    Some((m, _, _)) if m == self.module => {}
                     other => {
                         return Err(ResolveError::Undecided {
                             module: self.module,
@@ -111,17 +116,6 @@ impl<'a, N: Name> Resolver<'a, N> {
         stats.add(&sink.stats);
         sink.stats = crate::resolver::FillStats::default();
         sink.check(self.module)?;
-        undetermined.sort_unstable_by(|x, y| self.tree_cmp(x.0, y.0).then(x.1.cmp(&y.1)));
-        undetermined.dedup_by(|x, y| x.1 == y.1);
-        for &(_, g) in undetermined.iter() {
-            let glob = &self.globs[g as usize];
-            errors.list.push(ScopeError::Import {
-                site: glob.site,
-                path: glob.path.copy_in(a.clone()),
-                segment: len32(glob.path.segments.len().saturating_sub(1)),
-                why: Unresolved::Undetermined,
-            });
-        }
 
         // `pub(in path)` through an alias: resolved as a path now, and written on the binding.
         for (fi, frag) in self.frags.iter().enumerate() {
@@ -164,25 +158,18 @@ impl<'a, N: Name> Resolver<'a, N> {
         }
 
         let mut entries = sink.used;
-        entries.retain(|e| match self.owner_of(&e.read) {
-            Some(m) => !fellows.contains(&m),
-            None => true,
-        });
         entries.sort_unstable_by(|x, y| x.read.cmp(&y.read));
         entries.dedup_by(|x, y| x.read == y.read);
         // The pass pushed one entry per use; the record keeps one per read.
         entries.shrink_to_fit();
-        let mut others = Vec::with_capacity_in(fellows.len(), a);
-        others.extend(fellows.iter().copied().filter(|&m| m != self.module));
-        others.sort_unstable();
         Ok(Finish::Done(Resolved {
             scope: ScopeBuilder {
                 module: self.module,
                 bindings,
+                globs: self.glob_edges(),
                 errors: errors.list,
                 textual,
                 marks,
-                fellows: others,
                 traits,
                 macro_exports,
             },
@@ -193,10 +180,13 @@ impl<'a, N: Name> Resolver<'a, N> {
     /// The module whose record answers `read`.
     fn owner_of(&self, read: &Read<N>) -> Option<ItemKey> {
         match *read {
-            Read::TextualEntry { module } if module == self.module => self.chain.get(1).copied(),
-            Read::TextualEntry { module }
-            | Read::Name { module, .. }
-            | Read::Exports { module, .. }
+            // One level: a module's entry is its parent's, and the parent is on this chain.
+            Read::TextualEntry { module } => {
+                let at = self.chain.iter().position(|&c| c == module)?;
+                self.chain.get(at + 1).copied()
+            }
+            Read::Name { module, .. }
+            | Read::Globs { module }
             | Read::TextualOut { module } => Some(module),
             Read::DeriveHelpers { .. } => None,
         }
@@ -253,13 +243,21 @@ impl<'a, N: Name> Resolver<'a, N> {
         // is a negative read, and the scope changes when that name appears).
         sink.amb = None;
         let again = self.resolve_import(i, env, sink);
+        // Whether the leaf is there but hidden from this module, by the final state: an early
+        // pass skips a pending import the asker cannot see, so it may have taken the leaf as
+        // absent before the fellow that binds it settled. Which error it is depends on what
+        // is there, never on when it was looked at.
+        let hidden_now = again.failed.is_none()
+            && again.ns.iter().any(|r| matches!(r, NsRes::Private(_)))
+            && !again.ns.iter().any(|r| matches!(r, NsRes::Found(_)));
         if let Some((segment, why)) = imp.failed {
             sink.amb = None;
+            let why = if why == Unresolved::NotFound && segment == last && hidden_now { Unresolved::Private } else { why };
             errors.list.push(fail(segment, why));
             return;
         }
         let mut found = false;
-        let mut private = false;
+        let mut private = hidden_now;
         for ns in Namespace::ALL {
             match imp.ns[ns.index()] {
                 NsRes::Found(_) => found = true,
@@ -461,20 +459,9 @@ impl<'a, N: Name> Resolver<'a, N> {
         }
     }
 
-    /// Every `(ns, name)` this module may bind: its declarations, its named imports, and what
-    /// each glob's source binds (a fellow's live, others' by their exports).
-    fn glob_names(
-        &self,
-        env: Env<'_, 'a, N>,
-        sink: &mut Sink<'a, N>,
-        seen: &mut AVec<'a, ItemKey>,
-        out: &mut AVec<'a, (Namespace, N)>,
-    ) {
-        // Each member once: the names are a union, so the order of the walk does not matter.
-        if seen.contains(&self.module) {
-            return;
-        }
-        seen.push(self.module);
+    /// Every `(ns, name)` this module binds of its own: its declarations and its named
+    /// imports. A name reached through a glob is not the record's (its glob is an edge).
+    fn own_names(&self, out: &mut AVec<'a, (Namespace, N)>) {
         out.extend(self.defs.keys().copied());
         for imp in self.imports.iter() {
             let Some(name) = imp.bound else { continue };
@@ -484,18 +471,29 @@ impl<'a, N: Name> Resolver<'a, N> {
                 }
             }
         }
+    }
+
+    /// The module's glob edges, by source: one per source, as visible as the widest glob of
+    /// it and as shallow as the shallowest; an enum's narrowed by the enum's own visibility.
+    pub(crate) fn glob_edges(&self) -> AVec<'a, GlobEdge> {
+        let importer = self.asker();
+        let mut out: AVec<'a, GlobEdge> = Vec::new_in(self.alloc.clone());
         for g in self.globs.iter() {
-            let Source::Resolved { def, classes, .. } = &g.source else { continue };
-            if let Some(f) = env.fellow(def.key) {
-                f.glob_names(env, sink, seen, out);
-                continue;
-            }
-            for &class in classes.iter() {
-                if let Some(Cached::Exports { entries, .. }) = self.cached(Read::Exports { module: def.key, class }, sink) {
-                    out.extend(entries.iter().map(|e| (e.ns, e.name)));
+            let Source::Resolved { def, clamp } = g.source else { continue };
+            let vis = match clamp {
+                Some(c) => Visibility::narrower(g.vis, c, importer),
+                None => g.vis,
+            };
+            match out.iter_mut().find(|e| e.source.key == def.key) {
+                Some(e) => {
+                    e.vis = Visibility::wider(e.vis, vis, importer);
+                    e.expansion = e.expansion.min(g.expansion);
                 }
+                None => out.push(GlobEdge { source: def, vis, expansion: g.expansion }),
             }
         }
+        out.sort_unstable_by_key(|e| e.source.key);
+        out
     }
 
     /// From fragment `frag` on, in tree order: the `use .. as _` imports of a trait, and the
@@ -545,7 +543,7 @@ impl<'a, N: Name> Resolver<'a, N> {
         let f = &self.frags[frag as usize];
         for slot in f.slots.iter() {
             match *slot {
-                Slot::Rules { name, def, .. } => out.push(TextualDef { name, def, expansion: f.expansion }),
+                Slot::Rules { name, def, shapes, .. } => out.push(TextualDef { name, def, expansion: f.expansion, shapes }),
                 Slot::Call(c) => {
                     if let CallState::Expanded { frag: inner, .. } = self.calls[c as usize].state {
                         self.flatten(inner, out, marks.as_deref_mut(), env, sink);
@@ -574,7 +572,211 @@ impl<'a, N: Name> Resolver<'a, N> {
         }
         match self.cached(Read::TextualOut { module: child }, sink) {
             Some(Cached::Textual { defs, .. }) => out.extend_from_slice(defs),
-            Some(Cached::Name(_) | Cached::Exports { .. } | Cached::Helpers { .. } | Cached::InProgress) | None => {}
+            Some(Cached::Name(_) | Cached::Globs { .. } | Cached::Helpers { .. } | Cached::InProgress(_)) | None => {}
         }
     }
+}
+
+/// What [`settle_reads`] came to.
+pub(crate) enum Settled<'a, N> {
+    /// Every member's result, in the order of the members.
+    Done(AVec<'a, Resolved<'a, N>>),
+    /// A member alone read what no member's record answers and no member was answered: to
+    /// ask for (`asks`), or in progress outside the group (`waits`, a larger cycle).
+    Need { asks: AVec<'a, Read<N>>, waits: AVec<'a, Read<N>> },
+}
+
+/// The read lists of a group's members, whose scopes `group` holds (in the order of `ms`):
+/// each member's final pass made again alone, every fellow read by the record the group wrote
+/// for it, as a driver answers it. So a member's read list holds what it reads of every other
+/// module, a fellow too, by the answers any reader of the records gets: one list whatever the
+/// group was (a schedule may solve a module with more or fewer others), and an edit inside a
+/// cycle reruns only the members whose reads it reaches. The scope of that pass is the
+/// group's, the group's result being a fixpoint of its own records; one that differs is
+/// refused.
+///
+/// A pass that reads a fellow's record it was not given is made again with that answer; the
+/// answers of a walk through a fellow's glob edges are given at once, so a pass is made about
+/// once per member.
+pub(crate) fn settle_reads<'a, N: Name, F: ScopeFacts<Name = N>>(
+    ms: &mut [Resolver<'a, N>],
+    group: AVec<'a, Resolved<'a, N>>,
+    facts: &F,
+    stats: &mut crate::resolver::FillStats,
+    alloc: Alloc<'a>,
+) -> Result<Settled<'a, N>, ResolveError> {
+    let mut out = Vec::with_capacity_in(ms.len(), alloc.clone());
+    let mut asks = Vec::new_in(alloc.clone());
+    let mut waits = Vec::new_in(alloc.clone());
+    for i in 0..ms.len() {
+        // Each round gives the member at least one answer it lacked, of finitely many: bounded.
+        loop {
+            
+            let lone = Env { members: core::slice::from_ref(&ms[i]) };
+            let (need, wait) = match ms[i].finalize(facts, lone, stats)? {
+                Finish::Done(r) => {
+                    if r.scope != group[i].scope {
+                        return Err(ResolveError::Unsettled { module: ms[i].module });
+                    }
+                    out.push(r);
+                    break;
+                }
+                Finish::Need { asks: need, waits: wait } => (need, wait),
+            };
+            let mut given: AVec<'a, (Read<N>, Cached<'a, N>)> = Vec::new_in(alloc.clone());
+            let mut outside = false;
+            for (&read, waited) in need.iter().map(|r| (r, false)).chain(wait.iter().map(|r| (r, true))) {
+                match member_answer(ms, &group, read, &mut given, alloc.clone())? {
+                    Given::Yes => {}
+                    Given::Ask(other) => {
+                        outside = true;
+                        if waited && other == read { waits.push(read) } else { asks.push(other) }
+                    }
+                }
+            }
+            let mut moved = false;
+            for (read, answer) in given {
+                let fresh = !matches!(ms[i].answers.get(&read), Some(c) if !matches!(c, Cached::InProgress(_)));
+                if fresh {
+                    ms[i].answers.insert(read, answer);
+                    moved = true;
+                }
+            }
+            if !moved {
+                if outside {
+                    break;
+                }
+                return Err(ResolveError::MemberUnfinished { module: ms[i].module });
+            }
+        }
+    }
+    if !asks.is_empty() || !waits.is_empty() {
+        asks.sort_unstable();
+        asks.dedup();
+        waits.sort_unstable();
+        waits.dedup();
+        return Ok(Settled::Need { asks, waits });
+    }
+    Ok(Settled::Done(out))
+}
+
+/// Whether [`member_answer`] gave the answer, or the read to ask the driver for instead.
+enum Given<N> {
+    Yes,
+    Ask(Read<N>),
+}
+
+/// The member at `module`, by its index in `ms` (sorted by module).
+fn member_at<N>(ms: &[Resolver<'_, N>], module: ItemKey) -> Option<usize> {
+    ms.binary_search_by(|r| r.module.cmp(&module)).ok()
+}
+
+/// A copy of an answer, in `alloc`.
+fn copy_cached<'a, N: Copy>(c: &Cached<'a, N>, alloc: Alloc<'a>) -> Cached<'a, N> {
+    fn copy<'a, T: Copy>(s: &[T], a: Alloc<'a>) -> AVec<'a, T> {
+        let mut v = Vec::with_capacity_in(s.len(), a);
+        v.extend_from_slice(s);
+        v
+    }
+    match c {
+        Cached::Name(a) => Cached::Name(*a),
+        Cached::Globs { edges, krate, chain, digest } => Cached::Globs {
+            edges: copy(edges, alloc.clone()),
+            krate: *krate,
+            chain: copy(chain, alloc),
+            digest: *digest,
+        },
+        Cached::Textual { defs, digest } => Cached::Textual { defs: copy(defs, alloc), digest: *digest },
+        Cached::Helpers { names, digest } => Cached::Helpers { names: copy(names, alloc), digest: *digest },
+        Cached::InProgress(m) => Cached::InProgress(*m),
+    }
+}
+
+/// An answer some member was given for `read`, if one was (a member keeps what it was
+/// answered before the group was made).
+fn answered<'r, 'a, N: Name>(ms: &'r [Resolver<'a, N>], read: Read<N>) -> Option<&'r Cached<'a, N>> {
+    ms.iter().find_map(|m| m.answers.get(&read).filter(|c| !matches!(c, Cached::InProgress(_))))
+}
+
+/// The answer to `read` that the records of the group's members give, pushed on `given`, with
+/// the answers a walk from it through the members' glob edges reads next; else what some
+/// member was answered; else the read to ask for.
+fn member_answer<'a, N: Name>(
+    ms: &[Resolver<'a, N>],
+    group: &[Resolved<'a, N>],
+    read: Read<N>,
+    given: &mut AVec<'a, (Read<N>, Cached<'a, N>)>,
+    alloc: Alloc<'a>,
+) -> Result<Given<N>, ResolveError> {
+    // The member whose finished record answers the read: a `TextualEntry` is its parent's (one
+    // level); the parent is found on the chain of any member that has `module` above it.
+    let first = match read {
+        Read::TextualEntry { module } => ms.iter().find_map(|r| {
+            let at = r.chain.iter().position(|&c| c == module)?;
+            r.chain.get(at + 1).copied()
+        }),
+        Read::Name { module, .. } | Read::Globs { module } | Read::TextualOut { module } => Some(module),
+        Read::DeriveHelpers { .. } => None,
+    };
+    let Some(at) = first.and_then(|m| member_at(ms, m)) else {
+        return Ok(match answered(ms, read) {
+            Some(c) => {
+                given.push((read, copy_cached(c, alloc)));
+                Given::Yes
+            }
+            None => Given::Ask(read),
+        });
+    };
+    match read {
+        Read::Name { ns, name, .. } => {
+            // The walk a lookup makes: a member's own binding, else its edges' sources.
+            let mut stack = Vec::new_in(alloc.clone());
+            let mut seen = Vec::new_in(alloc.clone());
+            stack.push(at);
+            while let Some(f) = stack.pop() {
+                if seen.contains(&f) {
+                    continue;
+                }
+                seen.push(f);
+                let scope = &group[f].scope;
+                let module = scope.module;
+                let found = scope.get(ns, name).copied();
+                given.push((Read::Name { module, ns, name }, Cached::Name(NameAnswer::from(found))));
+                if found.is_some() {
+                    continue;
+                }
+                given.push((Read::Globs { module }, globs_answer(ms, group, f, alloc.clone())));
+                stack.extend(scope.globs.iter().filter_map(|e| member_at(ms, e.source.key)));
+            }
+        }
+        Read::Globs { .. } => given.push((read, globs_answer(ms, group, at, alloc))),
+        Read::TextualOut { .. } => {
+            let defs = &group[at].scope.textual;
+            let mut v = Vec::with_capacity_in(defs.len(), alloc.clone());
+            v.extend_from_slice(defs);
+            given.push((read, Cached::Textual { digest: textual_digest(defs, alloc), defs: v }));
+        }
+        Read::TextualEntry { module } => {
+            // One level: the member parent's own definitions before the `mod module` line.
+            let scope = &group[at].scope;
+            let len = scope.mark(module).ok_or(ResolveError::NoMark { module: scope.module, child: module })? as usize;
+            let mut defs = Vec::new_in(alloc.clone());
+            defs.extend_from_slice(&scope.textual[..len.min(scope.textual.len())]);
+            given.push((read, Cached::Textual { digest: textual_digest(&defs, alloc), defs }));
+        }
+        // A macro's record, never a member's.
+        Read::DeriveHelpers { .. } => {}
+    }
+    Ok(Given::Yes)
+}
+
+/// The `Globs` answer of member `at`'s record: its edges, its crate, its chain.
+fn globs_answer<'a, N: Name>(ms: &[Resolver<'a, N>], group: &[Resolved<'a, N>], at: usize, alloc: Alloc<'a>) -> Cached<'a, N> {
+    let scope = &group[at].scope;
+    let mut edges = Vec::with_capacity_in(scope.globs.len(), alloc.clone());
+    edges.extend_from_slice(&scope.globs);
+    let mut chain = Vec::with_capacity_in(ms[at].chain.len(), alloc.clone());
+    chain.extend_from_slice(&ms[at].chain);
+    let digest = globs_digest(&edges, ms[at].krate, &chain, alloc);
+    Cached::Globs { edges, krate: ms[at].krate, chain, digest }
 }

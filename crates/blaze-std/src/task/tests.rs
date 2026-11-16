@@ -55,19 +55,22 @@ fn native() -> Io {
     let world = NativeWorld {
         root: &root,
         threads: 2,
-        env: Vec::new(),
-        args: Vec::new(),
+        env: crate::env::Vars::given(Vec::new()),
+        args: crate::args::ArgList::given(Vec::new()),
         host_name: Arc::from(""),
-        seed: 7,
+        seed: Some(7),
+        above: 0,
         limits: Limits::USUAL,
     };
     Io::native(world).expect("a native world")
 }
 
-/// Waits (bounded) until every worker of `pool` is parked: a `must_overlap` then finds one.
+/// Waits (bounded) until every worker of `pool` has its thread up and is parked: a
+/// `must_overlap` then finds one whose thread runs it at once. A worker whose thread has not
+/// started is counted parked too (task/idle.rs), hence the arrivals.
 fn all_parked(pool: &Pool) {
     let until = Instant::now() + Duration::from_secs(5);
-    while pool.parked() != pool.workers() {
+    while pool.arrived() != pool.workers() || pool.parked() != pool.workers() {
         assert!(Instant::now() < until, "the pool's workers did not all park within 5 s");
         std::thread::yield_now();
     }
@@ -404,11 +407,20 @@ fn a_second_entry_into_a_slot_on_one_worker_stops() {
     let cx = root_on(&io, running.pool());
     let slots = PerWorker::new_in(cx.workers(), Global, |_| 0u32);
     let scope = cx.scope();
+    let began = AtomicBool::new(false);
     let task = scope.may_overlap("reenters", TASK_FRAME, |cx| -> Result<(), String> {
+        began.store(true, Ordering::SeqCst);
         // The closure captures the task's `Cx` (a closure that can wait could reach another
         // task of this worker the same way): the inner `with` is the second entry.
         slots.with(cx, |_| slots.with(cx, |slot| *slot += 1)).map_err(|error| error.to_string())?.map_err(|error| error.to_string())
     });
+    // A join runs a task no worker has taken on the joining thread, which is no worker: wait
+    // (bounded) for a worker to take it, as the subject is a worker's second entry.
+    let until = Instant::now() + Duration::from_secs(5);
+    while !began.load(Ordering::SeqCst) {
+        assert!(Instant::now() < until, "no worker took the task within 5 s");
+        std::thread::yield_now();
+    }
     let ended = task.join(&cx);
     let _ = scope.join(&cx);
     match ended {
@@ -497,6 +509,137 @@ fn a_fold_never_sees_a_half_written_slot() {
 fn the_fold_control_reading_slots_directly_sees_one_torn() {
     let torn = torn_folds(FoldPlant::ReadsDirectly, 20_000);
     assert!(torn > 0, "the planted fold read every slot from its own thread and never saw a write half done");
+}
+
+/// How many times [`counted`] started a pool: only the lazy-start test's pools use it.
+static STARTS: AtomicU32 = AtomicU32::new(0);
+
+/// The driver's starter, counted.
+fn counted(pool: &Pool) {
+    STARTS.fetch_add(1, Ordering::SeqCst);
+    pool::starter(pool);
+}
+
+fn four() -> Topology {
+    Topology::flat(4)
+}
+
+/// The lazy start (task/threads.rs, `Pool::begin`): two threads make the first spawns on a
+/// pool nothing of which is made, released together by a barrier, in each of 200 rounds. The
+/// pool starts exactly once, and neither spawn is lost: each spawner waits (bounded) for a
+/// worker to run its task before it joins it, since a join runs an unstarted task itself and
+/// would hide a lost one. Then the stop waits for the last worker's leave.
+#[test]
+fn two_first_spawns_at_once_start_the_pool_once_and_neither_is_lost() {
+    let io = native();
+    for round in 0..200 {
+        let before = STARTS.load(Ordering::SeqCst);
+        let running = pool::lazy_on(four, counted, Plants::NONE);
+        let gate = std::sync::Barrier::new(2);
+        std::thread::scope(|threads| {
+            for side in 0..2 {
+                let (io, pool, gate) = (&io, running.pool(), &gate);
+                threads.spawn(move || {
+                    let cx = root_on(io, pool);
+                    let ran = AtomicBool::new(false);
+                    let ran = &ran;
+                    let scope = cx.scope();
+                    gate.wait();
+                    let task = scope.may_overlap(NAMES[side], TASK_FRAME, move |_cx| {
+                        ran.store(true, Ordering::SeqCst);
+                        Ok::<u64, String>(0)
+                    });
+                    let until = Instant::now() + Duration::from_secs(5);
+                    while !ran.load(Ordering::SeqCst) {
+                        assert!(Instant::now() < until, "round {round}: first spawn {side} was lost: no worker ran it within 5 s");
+                        std::thread::yield_now();
+                    }
+                    task.join(&cx).expect("the task");
+                    scope.join(&cx).expect("its scope");
+                });
+            }
+        });
+        assert_eq!(STARTS.load(Ordering::SeqCst) - before, 1, "round {round}: the pool started other than once");
+        stopped(running);
+    }
+}
+
+/// The threads of this process, as the platform counts them.
+#[cfg(target_os = "macos")]
+#[expect(unsafe_code, reason = "`proc_pidinfo`, the platform's count of a process's threads")]
+fn threads_now() -> u32 {
+    // Rule 45: libproc's `proc_pidinfo(pid, PROC_PIDTASKINFO = 4, 0, ...)` fills a
+    // `struct proc_taskinfo` (<sys/proc_info.h>): six `uint64_t`, then twelve `int32_t` of
+    // which the tenth is `pti_threadnum`, the task's thread count.
+    #[repr(C)]
+    struct TaskInfo {
+        sizes_and_times: [u64; 6],
+        counts: [i32; 12],
+    }
+    unsafe extern "C" {
+        fn proc_pidinfo(pid: i32, flavor: i32, arg: u64, buffer: *mut TaskInfo, size: i32) -> i32;
+    }
+    let mut info = TaskInfo { sizes_and_times: [0; 6], counts: [0; 12] };
+    let size = size_of::<TaskInfo>() as i32;
+    let pid = std::process::id() as i32;
+    // SAFETY: `info` is a `proc_taskinfo` the call writes at most `size` bytes of.
+    let wrote = unsafe { proc_pidinfo(pid, 4, 0, &raw mut info, size) };
+    assert_eq!(wrote, size, "proc_pidinfo(PROC_PIDTASKINFO) of this process");
+    info.counts[9] as u32
+}
+
+/// The threads of this process, as the platform counts them: the entries of `/proc/self/task`.
+#[cfg(target_os = "linux")]
+fn threads_now() -> u32 {
+    std::fs::read_dir("/proc/self/task").expect("/proc/self/task").count() as u32
+}
+
+/// Set in the child that [`a_program_that_spawns_nothing_starts_no_thread`] runs.
+const NO_THREAD_CHILD: &str = "BSTD_TEST_NO_THREAD_CHILD";
+
+/// A program of the blaze edition that spawns nothing starts no thread: its world is made
+/// (the native driver, which starts its file threads at the first file effect), its `main`
+/// makes and joins a scope (which reads the topology and makes the pool's tables), and the
+/// platform's count of threads is the same at the end of `main` as before the world. The
+/// entry exits the process, so the program runs in a child: this test binary again, running
+/// only this test on one test thread, its status saying the counts matched.
+#[test]
+fn a_program_that_spawns_nothing_starts_no_thread() {
+    if std::env::var_os(NO_THREAD_CHILD).is_some() {
+        let before = threads_now();
+        let root = std::env::temp_dir();
+        let world = crate::rt::open_native(crate::args::ArgList::given(Vec::new()), crate::env::Vars::given(Vec::new()), &root, 0);
+        crate::rt::run_io(world, |cx, _io| {
+            let scope = cx.scope();
+            scope.join(cx).expect("an empty scope");
+            let after = threads_now();
+            std::eprintln!("threads before the world {before}, at the end of main {after}");
+            if after == before { crate::entry::Status::OK } else { crate::entry::Status::FAILED }
+        });
+        unreachable!("the entry exits the process");
+    }
+    let name = "task::tests::a_program_that_spawns_nothing_starts_no_thread";
+    let mut child = std::process::Command::new(std::env::current_exe().expect("this test binary"))
+        .args([name, "--exact", "--test-threads=1", "--nocapture"])
+        .env(NO_THREAD_CHILD, "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("the child");
+    let until = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("the child's status") {
+            break status;
+        }
+        if Instant::now() >= until {
+            let _ = child.kill();
+            panic!("the child did not exit within 30 s");
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    let mut said = String::new();
+    std::io::Read::read_to_string(&mut child.stderr.take().expect("its standard error"), &mut said).expect("its words");
+    assert!(status.success(), "the program that spawns nothing started a thread: {said}");
 }
 
 /// The racy form's snapshot reads every slot from any thread, outside the pool too.

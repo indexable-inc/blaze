@@ -4,11 +4,15 @@
 //! of one type, so a function that takes `&Out` writes where its caller chose.
 //!
 //! **One way to say something.** [`Out::line`] writes a value and a line feed, [`Out::write`]
-//! a value alone; the value is anything that is `Display`, so text and formatted text are the
-//! same call and neither allocates:
+//! a value alone; the value is anything that is a [`Show`] (blaze-text's human form, written
+//! straight into the buffer), so text, numbers and formatted text are the same call and none
+//! allocates. Text goes into the buffer as it is, with no formatter between: a hello world
+//! runs no `core::fmt`. `format_args!` is a `Show` too (blaze-text's adapter, through
+//! `core::fmt`), for what is not ported to a chain ([`Out::line_with`]) yet:
 //!
 //! ```ignore
 //! out.line(cx, "Hello, world!")?;
+//! out.line_with(cx, |o| o.str("x = ").int(x))?;
 //! out.line(cx, format_args!("x = {x}, y = {y:?}"))?;
 //! ```
 //!
@@ -40,6 +44,8 @@
 
 use alloc::string::String;
 use core::fmt;
+
+use blaze_text::Show;
 
 use crate::{Stopped, cx::Cx, io::Io};
 
@@ -73,8 +79,6 @@ pub enum OutWhy {
     /// The host refused the write, saying this (a closed pipe, a full disk behind a
     /// redirection).
     Host(String),
-    /// The value's own `Display` returned an error: what it had written before is written.
-    Format,
 }
 
 /// A write that failed: the stream, and how.
@@ -90,7 +94,6 @@ impl fmt::Display for OutError {
         match &self.why {
             OutWhy::Stopped(stopped) => write!(f, "bstd::out write to {stream}: {stopped}"),
             OutWhy::Host(said) => write!(f, "bstd::out write to {stream}: the host refused: {said}"),
-            OutWhy::Format => write!(f, "bstd::out write to {stream}: the value's `Display` failed"),
         }
     }
 }
@@ -116,13 +119,18 @@ impl Out {
     }
 
     /// `what` and a line feed: one write when they are at most [`HELD`] bytes.
-    pub fn line(&self, cx: &Cx, what: impl fmt::Display) -> Result<(), OutError> {
-        self.say(cx, format_args!("{what}\n"))
+    pub fn line(&self, cx: &Cx, what: impl Show) -> Result<(), OutError> {
+        let mut held = Held::new(self, cx);
+        what.show(&mut held);
+        held.take(b"\n");
+        held.end()
     }
 
     /// `what`, with nothing after it: one write when it is at most [`HELD`] bytes.
-    pub fn write(&self, cx: &Cx, what: impl fmt::Display) -> Result<(), OutError> {
-        self.say(cx, format_args!("{what}"))
+    pub fn write(&self, cx: &Cx, what: impl Show) -> Result<(), OutError> {
+        let mut held = Held::new(self, cx);
+        what.show(&mut held);
+        held.end()
     }
 
     /// A chain of blaze-text writers and a line feed, written as [`Out::line`] writes: one
@@ -143,13 +151,9 @@ impl Out {
     }
 
     fn held(&self, cx: &Cx, fill: impl FnOnce(&mut Held<'_>)) -> Result<(), OutError> {
-        let mut held = Held { out: self, cx, bytes: [0; HELD], len: 0, failed: None };
+        let mut held = Held::new(self, cx);
         fill(&mut held);
-        held.flush();
-        match held.failed {
-            Some(error) => Err(error),
-            None => Ok(()),
-        }
+        held.end()
     }
 
     /// Every byte of `bytes`, in order, as one write, or an error.
@@ -164,22 +168,32 @@ impl Out {
         Writer { out: self, cx, failed: None }
     }
 
-    fn say(&self, cx: &Cx, args: fmt::Arguments<'_>) -> Result<(), OutError> {
-        let mut held = Held { out: self, cx, bytes: [0; HELD], len: 0, failed: None };
-        let formatted = fmt::Write::write_fmt(&mut held, args);
-        held.flush();
-        match (held.failed, formatted) {
-            (Some(error), _) => Err(error),
-            (None, Err(fmt::Error)) => Err(OutError { stream: self.stream, why: OutWhy::Format }),
-            (None, Ok(())) => Ok(()),
+    /// `parts`, in order, as one write, under `cx`'s span `bstd.out.write`. Written plainly
+    /// (no closure, no `?` over a conversion): it is on every hello's path.
+    fn parts(&self, cx: &Cx, parts: &[&[u8]]) -> Result<(), OutError> {
+        let cx = cx.span("bstd.out.write");
+        if let Err(stopped) = cx.stopped(&self.io) {
+            return Err(OutError { stream: self.stream, why: OutWhy::Stopped(stopped) });
+        }
+        match self.io.write_out(self.stream, parts) {
+            Ok(()) => Ok(()),
+            Err(said) => Err(OutError { stream: self.stream, why: OutWhy::Host(said) }),
         }
     }
 
-    fn parts(&self, cx: &Cx, parts: &[&[u8]]) -> Result<(), OutError> {
-        let error = |why| OutError { stream: self.stream, why };
-        let cx = cx.span("bstd.out.write");
-        cx.stopped_by(self.io.now()).map_err(|stopped| error(OutWhy::Stopped(stopped)))?;
-        self.io.write_out(self.stream, parts).map_err(|said| error(OutWhy::Host(said)))
+    /// Whether this stream is a terminal (`isatty` on its descriptor), read once, at the
+    /// first ask, and kept: whether colours and frames are drawn for someone.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self.io.tty(self.stream), crate::term::Tty::Terminal(_))
+    }
+
+    /// This stream's terminal size in cells (`TIOCGWINSZ`), read with [`Out::is_terminal`]:
+    /// `None` when it is not a terminal or the terminal says no size.
+    pub fn size(&self) -> Option<crate::term::Size> {
+        match self.io.tty(self.stream) {
+            crate::term::Tty::Terminal(size) => size,
+            crate::term::Tty::NotTerminal => None,
+        }
     }
 }
 
@@ -201,11 +215,32 @@ pub struct Held<'a> {
     failed: Option<OutError>,
 }
 
-impl Held<'_> {
+impl<'a> Held<'a> {
+    fn new(out: &'a Out, cx: &'a Cx) -> Held<'a> {
+        Held { out, cx, bytes: [0; HELD], len: 0, failed: None }
+    }
+
+    /// The call's end: what is held, written; the first failure, or `Ok`.
+    fn end(mut self) -> Result<(), OutError> {
+        self.flush();
+        match self.failed {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     /// What is held, written; after a failure nothing more is.
+    ///
+    /// Plain on purpose, as `take` is: matches and a byte loop, no `Option` or slice helpers,
+    /// because this is on the hosted hello's path and every helper is one more function the
+    /// new compiler must build (ladder README, "What the hosted hello executes").
     fn flush(&mut self) {
-        if self.failed.is_none() && self.len > 0 {
-            self.failed = self.out.parts(self.cx, &[&self.bytes[..self.len]]).err();
+        if let None = self.failed
+            && self.len > 0
+        {
+            if let Err(error) = self.out.parts(self.cx, &[&self.bytes[..self.len]]) {
+                self.failed = Some(error);
+            }
         }
         self.len = 0;
     }
@@ -215,21 +250,33 @@ impl Held<'_> {
     /// `bytes` after what is held, handed over each time `HELD` fill; `false` once a write
     /// failed.
     fn take(&mut self, bytes: &[u8]) -> bool {
-        let mut rest = bytes;
-        while !rest.is_empty() {
-            if self.failed.is_some() {
+        let mut from = 0;
+        while from < bytes.len() {
+            if let Some(_) = self.failed {
                 return false;
             }
             if self.len == HELD {
                 self.flush();
                 continue;
             }
-            let take = rest.len().min(HELD - self.len);
-            self.bytes[self.len..self.len + take].copy_from_slice(&rest[..take]);
+            let mut take = HELD - self.len;
+            if bytes.len() - from < take {
+                take = bytes.len() - from;
+            }
+            // A byte loop: built-in indexing calls no function, and an optimised build makes
+            // it one copy.
+            let mut at = 0;
+            while at < take {
+                self.bytes[self.len + at] = bytes[from + at];
+                at += 1;
+            }
             self.len += take;
-            rest = &rest[take..];
+            from += take;
         }
-        self.failed.is_none()
+        match self.failed {
+            Some(_) => false,
+            None => true,
+        }
     }
 }
 
@@ -240,6 +287,50 @@ impl fmt::Write for Held<'_> {
             false => Err(fmt::Error),
         }
     }
+}
+
+/// The invariant: a chain through `line_with` and `write_with` puts on the stream exactly what
+/// `line` and `write` put for the same values through `format_args!`, for lines shorter and
+/// longer than [`HELD`].
+#[cfg(test)]
+#[test]
+fn chains_say_what_format_says() {
+    use blaze_sim::{Broke, Config, Tape};
+    use blaze_text::Writes as _;
+
+    let written = |io: &Io| io.script(|host| host.out.clone()).expect("a simulated world");
+    blaze_sim::check(Config::cases(200), |tape: &Tape| {
+        let n = tape.next_u64("n");
+        let x = tape.f64("x");
+        let word = *tape.one_of(&["", "a", "naïve", "0123456789abcdef"], "word");
+        let times = tape.below(3 * HELD as u64 / 16, "times");
+        let long = word.repeat(usize::try_from(times).unwrap_or(0));
+        let (chain, format) = (Io::sim(1), Io::sim(1));
+        let (cx_chain, cx_format) = (chain.cx(core::time::Duration::from_secs(60), crate::mem::TASK_FRAME), format.cx(core::time::Duration::from_secs(60), crate::mem::TASK_FRAME));
+        let (Ok(cx_chain), Ok(cx_format)) = (cx_chain, cx_format) else {
+            return Err(Broke::Harness("no root frame".into()));
+        };
+        let (Some(out_chain), Some(out_format)) = (chain.out(), format.out()) else {
+            return Err(Broke::Harness("Io::sim offers out".into()));
+        };
+        let said = out_chain
+            .line_with(&cx_chain, |o| o.str("n = ").int(n).str(", x = ").float(x).str(" <").str(&long).byte(b'>'))
+            .and_then(|()| out_chain.write_with(&cx_chain, |o| o.int(n).byte(b'|')));
+        let formatted = out_format
+            .line(&cx_format, format_args!("n = {n}, x = {x} <{long}>"))
+            .and_then(|()| out_format.write(&cx_format, format_args!("{n}|")));
+        if let (Err(error), _) | (_, Err(error)) = (said, formatted) {
+            return Err(Broke::Harness(alloc::format!("a write failed: {error}")));
+        }
+        match written(&chain) == written(&format) {
+            true => Ok(()),
+            false => Err(Broke::Oracle(alloc::format!(
+                "line_with wrote {:?}; line wrote {:?}",
+                String::from_utf8_lossy(&written(&chain)),
+                String::from_utf8_lossy(&written(&format))
+            ))),
+        }
+    });
 }
 
 /// A failed write is kept in the `Held` and returned by the call that made it.

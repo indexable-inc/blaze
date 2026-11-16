@@ -1,0 +1,988 @@
+//! blaze-solve's `Facts` over typeck's `Reads`: the solver's questions answered from the
+//! body's own read seam, so a body's read list holds every fact its goals read.
+//!
+//! `Facts` answers from `&self` and may only say `Missing`; reading the world needs
+//! `&mut Reads`. So the adapter is a cache the context owns: the solver runs against it, a
+//! question it lacks stops the solve with `Need(question)`, and [`FactCache::fill`] reads that
+//! question through `Reads` (entering the read list, or stopping the body with typeck's own
+//! `Need`), converts the answer to the solver's portable form and keeps it; the goal is then
+//! evaluated again. Each such retry is counted ([`FactCache::retries`]): it is repeated work
+//! the cost example reports. Nothing here depends on being re-run: the cache is a function of
+//! the answers read, and a fresh run fills it the same way.
+//!
+//! Associated types: typeck names one by its trait and name; the solver by a def. The def is
+//! [`assoc_def`]`(trait, name)`, a 128-bit hash, used for every alias, every trait's associated
+//! type and every impl's binding alike, so they agree without asking for the item's key; the
+//! cache maps it back for `Facts::assoc` and for `TypeCtx::view`.
+
+use blaze_hash::HashMap;
+use blaze_own::{Alloc, Vec};
+use blaze_solve::facts::{
+    AdtDef, AdtFlags, AssocDef, AssocKind, AssocTy, ConstHolds, Facts, Fetch, FnSigDef, ImplAssoc, ImplFlags, ImplHeader,
+    ImplPolarity, ImplSet, Missing, OpaqueDef, Portable, Question as SQ, Seal, TraitDef, TraitFlags as STraitFlags,
+};
+use blaze_solve::prefilter::Columns;
+use blaze_solve::term::{
+    AliasKind as SAlias, Def as SDef, Lang, List as SList, Mutbl as SMutbl, Polarity, Pred, Rigid, Shape as SShape,
+    Ty as STy, TyKind as K,
+};
+
+use crate::error::{CheckError, Malformed, Stop};
+use crate::hash::{ContentHash, StableHasher};
+use crate::ids::{FloatTy, IntTy, ItemKey, LangItem, Mutbl, Name, UintTy};
+use crate::portable::{PNode, PTys};
+use crate::world::{AdtKind, PClause, Question, Reads, Shape, World};
+
+/// The solver's def of `<_ as trait_>::name`.
+pub fn assoc_def(trait_: ItemKey, name: Name) -> u128 {
+    let mut lo = StableHasher::new("blaze-typeck assoc def lo");
+    lo.u128(trait_.0);
+    lo.u64(name.0);
+    let mut hi = StableHasher::new("blaze-typeck assoc def hi");
+    hi.u128(trait_.0);
+    hi.u64(name.0);
+    u128::from(lo.finish()) | (u128::from(hi.finish()) << 64)
+}
+
+#[derive(Clone, Copy, Default)]
+struct Span {
+    start: u32,
+    len: u32,
+}
+
+impl Span {
+    fn of<T>(v: &[T], start: usize) -> Span {
+        Span { start: start as u32, len: (v.len() - start) as u32 }
+    }
+
+    fn get<T>(self, v: &[T]) -> &[T] {
+        &v[self.start as usize..(self.start + self.len) as usize]
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Por {
+    nodes: Span,
+    lists: Span,
+}
+
+#[derive(Clone, Copy)]
+struct TraitRow {
+    flags: STraitFlags,
+    generics: u32,
+    lang: Option<Lang>,
+    supers: Span,
+    assoc: Span,
+    por: Por,
+    digest: u64,
+}
+
+#[derive(Clone, Copy)]
+struct ImplRow {
+    generics: u32,
+    polarity: ImplPolarity,
+    trait_: SDef,
+    args: SList,
+    wheres: Span,
+    assoc: Span,
+    por: Por,
+    digest: u64,
+}
+
+#[derive(Clone, Copy)]
+struct AdtRow {
+    flags: AdtFlags,
+    generics: u32,
+    fields: Span,
+    variants: Span,
+    sized_tail: Option<STy>,
+    discr: blaze_solve::facts::Discr,
+    wheres: Span,
+    por: Por,
+    digest: u64,
+}
+
+#[derive(Clone, Copy)]
+struct SigRow {
+    generics: u32,
+    /// `FnSigDef`'s flags: `UNSAFE` and `RUST_CALL` from the fn's header.
+    flags: u16,
+    io: SList,
+    por: Por,
+    digest: u64,
+}
+
+#[derive(Clone, Copy)]
+struct OpaqueRow {
+    bounds: Span,
+    hidden: Option<STy>,
+    por: Por,
+    digest: u64,
+}
+
+/// The solver's facts, read through the body's `Reads` (see the module).
+pub struct FactCache<'a> {
+    alloc: Alloc<'a>,
+    nodes: Vec<K, Alloc<'a>>,
+    lists: Vec<STy, Alloc<'a>>,
+    preds: Vec<Pred, Alloc<'a>>,
+    assoc_tys: Vec<AssocTy, Alloc<'a>>,
+    impl_assoc: Vec<ImplAssoc, Alloc<'a>>,
+    fields: Vec<STy, Alloc<'a>>,
+    variants: Vec<(u32, u32), Alloc<'a>>,
+    impl_defs: Vec<SDef, Alloc<'a>>,
+    traits: HashMap<u128, TraitRow, Alloc<'a>>,
+    impls: HashMap<(u128, SShape), (Span, u64), Alloc<'a>>,
+    headers: HashMap<u128, ImplRow, Alloc<'a>>,
+    adts: HashMap<u128, AdtRow, Alloc<'a>>,
+    sigs: HashMap<u128, SigRow, Alloc<'a>>,
+    assoc: HashMap<u128, AssocDef, Alloc<'a>>,
+    opaques: HashMap<u128, OpaqueRow, Alloc<'a>>,
+    lang: HashMap<Lang, Option<SDef>, Alloc<'a>>,
+    /// `assoc_def(trait, name)` back to its trait and name.
+    pub names: HashMap<u128, (ItemKey, Name), Alloc<'a>>,
+    /// Questions filled after the solver stopped on them: each is one repeated evaluation.
+    pub retries: u64,
+    /// Every impl's `where const` conditions, in the order the impls were read:
+    /// `(condition, the impl's trait)`, for the reason of an unmet bound.
+    conditions: Vec<(u128, u128), Alloc<'a>>,
+    /// A `where const` condition's value at ground arguments: the arguments (hash-consed terms,
+    /// so equal arguments are equal terms) at `span` of `cond_args`, keyed by the condition and
+    /// a hash of the terms; a second set of arguments under one key is refused (rule 21).
+    holds: HashMap<(u128, u64), (Span, ConstHolds), Alloc<'a>>,
+    cond_args: Vec<STy, Alloc<'a>>,
+    /// A planted bug (`suite::control_first_impl_taken`): an impl bucket keeps only its first impl.
+    #[cfg(test)]
+    pub(crate) first_impl_only: bool,
+    /// A planted bug (`suite::control_where_const_dropped`): an impl's `where const` clauses
+    /// are passed over, so the impl holds for every type.
+    #[cfg(test)]
+    pub(crate) drop_const_clauses: bool,
+}
+
+/// The key of a `where const` condition's arguments in the cache: an FNV-1a hash of the terms.
+fn args_key(args: &[STy]) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for t in args {
+        for b in t.0.to_le_bytes() {
+            h = (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
+fn digest(domain: &str, v: &impl ContentHash) -> u64 {
+    let mut h = StableHasher::new(domain);
+    v.hash_into(&mut h);
+    h.finish()
+}
+
+/// A discriminant type as one number, for the ADT row's digest.
+fn discr_code(d: blaze_solve::facts::Discr) -> u8 {
+    match d {
+        blaze_solve::facts::Discr::Unread => 0,
+        blaze_solve::facts::Discr::Int(i) => 1 + i as u8,
+        blaze_solve::facts::Discr::Uint(u) => 7 + u as u8,
+    }
+}
+
+fn int(i: IntTy) -> blaze_solve::term::IntTy {
+    use blaze_solve::term::IntTy as S;
+    match i {
+        IntTy::Isize => S::Isize,
+        IntTy::I8 => S::I8,
+        IntTy::I16 => S::I16,
+        IntTy::I32 => S::I32,
+        IntTy::I64 => S::I64,
+        IntTy::I128 => S::I128,
+    }
+}
+
+fn uint(u: UintTy) -> blaze_solve::term::UintTy {
+    use blaze_solve::term::UintTy as S;
+    match u {
+        UintTy::Usize => S::Usize,
+        UintTy::U8 => S::U8,
+        UintTy::U16 => S::U16,
+        UintTy::U32 => S::U32,
+        UintTy::U64 => S::U64,
+        UintTy::U128 => S::U128,
+    }
+}
+
+fn float(f: FloatTy) -> blaze_solve::term::FloatTy {
+    use blaze_solve::term::FloatTy as S;
+    match f {
+        FloatTy::F16 => S::F16,
+        FloatTy::F32 => S::F32,
+        FloatTy::F64 => S::F64,
+        FloatTy::F128 => S::F128,
+    }
+}
+
+fn mutbl(m: Mutbl) -> SMutbl {
+    match m {
+        Mutbl::Not => SMutbl::Not,
+        Mutbl::Mut => SMutbl::Mut,
+    }
+}
+
+/// typeck's shape of the solver's (the world's buckets are typeck's).
+pub fn shape(s: SShape) -> Shape {
+    use blaze_solve::term::{FloatTy as SF, IntTy as SI, UintTy as SU};
+    let m = |m: SMutbl| match m {
+        SMutbl::Not => Mutbl::Not,
+        SMutbl::Mut => Mutbl::Mut,
+    };
+    match s {
+        SShape::Bool => Shape::Bool,
+        SShape::Char => Shape::Char,
+        SShape::Int(i) => Shape::Int(match i {
+            SI::Isize => IntTy::Isize,
+            SI::I8 => IntTy::I8,
+            SI::I16 => IntTy::I16,
+            SI::I32 => IntTy::I32,
+            SI::I64 => IntTy::I64,
+            SI::I128 => IntTy::I128,
+        }),
+        SShape::Uint(u) => Shape::Uint(match u {
+            SU::Usize => UintTy::Usize,
+            SU::U8 => UintTy::U8,
+            SU::U16 => UintTy::U16,
+            SU::U32 => UintTy::U32,
+            SU::U64 => UintTy::U64,
+            SU::U128 => UintTy::U128,
+        }),
+        SShape::Float(f) => Shape::Float(match f {
+            SF::F16 => FloatTy::F16,
+            SF::F32 => FloatTy::F32,
+            SF::F64 => FloatTy::F64,
+            SF::F128 => FloatTy::F128,
+        }),
+        SShape::Str => Shape::Str,
+        SShape::Never => Shape::Never,
+        SShape::Tuple(n) => Shape::Tuple(n),
+        SShape::Ref(x) => Shape::Ref(m(x)),
+        SShape::Ptr(x) => Shape::Ptr(m(x)),
+        SShape::Array => Shape::Array,
+        SShape::Slice => Shape::Slice,
+        SShape::Pat => Shape::Pat,
+        SShape::Adt(d) => Shape::Adt(ItemKey(d.0)),
+        SShape::Foreign(d) => Shape::Foreign(ItemKey(d.0)),
+        SShape::FnDef(d) => Shape::FnDef(ItemKey(d.0)),
+        SShape::FnPtr(n) => Shape::FnPtr(n),
+        SShape::Closure(_) | SShape::Coroutine(_) => Shape::Closure,
+        SShape::Dynamic(d) => Shape::Dynamic(if d.0 == 0 { None } else { Some(ItemKey(d.0)) }),
+        SShape::AnyInt => Shape::AnyInt,
+        SShape::AnyFloat => Shape::AnyFloat,
+        SShape::Blanket => Shape::Param,
+    }
+}
+
+/// typeck's lang item of the solver's.
+pub fn lang_item(l: Lang) -> LangItem {
+    match l {
+        Lang::Sized => LangItem::Sized,
+        Lang::MetaSized => LangItem::MetaSized,
+        Lang::PointeeSized => LangItem::PointeeSized,
+        Lang::Copy => LangItem::Copy,
+        Lang::Clone => LangItem::Clone,
+        Lang::Send => LangItem::Send,
+        Lang::Sync => LangItem::Sync,
+        Lang::Unpin => LangItem::Unpin,
+        Lang::Fn => LangItem::Fn,
+        Lang::FnMut => LangItem::FnMut,
+        Lang::FnOnce => LangItem::FnOnce,
+        Lang::FnOnceOutput => LangItem::FnOnceOutput,
+        Lang::FnPtrTrait => LangItem::FnPtrTrait,
+        Lang::Tuple => LangItem::Tuple,
+        Lang::Pointee => LangItem::Pointee,
+        Lang::Metadata => LangItem::Metadata,
+        Lang::DynMetadata => LangItem::DynMetadata,
+        Lang::DiscriminantKind => LangItem::DiscriminantKind,
+        Lang::Discriminant => LangItem::Discriminant,
+        Lang::Destruct => LangItem::Destruct,
+        Lang::Drop => LangItem::Drop,
+        Lang::Unsize => LangItem::Unsize,
+        Lang::CoerceUnsized => LangItem::CoerceUnsized,
+        Lang::DispatchFromDyn => LangItem::DispatchFromDyn,
+        Lang::PhantomData => LangItem::PhantomData,
+        Lang::OwnedBox => LangItem::OwnedBox,
+        Lang::ManuallyDrop => LangItem::ManuallyDrop,
+        Lang::Future => LangItem::Future,
+        Lang::FutureOutput => LangItem::FutureOutput,
+    }
+}
+
+/// The solver's lang item of typeck's, for the ones the solver knows.
+fn solver_lang(l: LangItem) -> Option<Lang> {
+    const ALL: [Lang; 29] = [
+        Lang::Sized,
+        Lang::MetaSized,
+        Lang::PointeeSized,
+        Lang::Copy,
+        Lang::Clone,
+        Lang::Send,
+        Lang::Sync,
+        Lang::Unpin,
+        Lang::Fn,
+        Lang::FnMut,
+        Lang::FnOnce,
+        Lang::FnOnceOutput,
+        Lang::FnPtrTrait,
+        Lang::Tuple,
+        Lang::Pointee,
+        Lang::Metadata,
+        Lang::DynMetadata,
+        Lang::DiscriminantKind,
+        Lang::Discriminant,
+        Lang::Destruct,
+        Lang::Drop,
+        Lang::Unsize,
+        Lang::CoerceUnsized,
+        Lang::DispatchFromDyn,
+        Lang::PhantomData,
+        Lang::OwnedBox,
+        Lang::ManuallyDrop,
+        Lang::Future,
+        Lang::FutureOutput,
+    ];
+    ALL.into_iter().find(|&s| lang_item(s) == l)
+}
+
+impl<'a> FactCache<'a> {
+    pub fn new_in(alloc: Alloc<'a>) -> FactCache<'a> {
+        FactCache {
+            alloc,
+            nodes: Vec::new_in(alloc),
+            lists: Vec::new_in(alloc),
+            preds: Vec::new_in(alloc),
+            assoc_tys: Vec::new_in(alloc),
+            impl_assoc: Vec::new_in(alloc),
+            fields: Vec::new_in(alloc),
+            variants: Vec::new_in(alloc),
+            impl_defs: Vec::new_in(alloc),
+            traits: HashMap::new_in(alloc),
+            impls: HashMap::new_in(alloc),
+            headers: HashMap::new_in(alloc),
+            adts: HashMap::new_in(alloc),
+            sigs: HashMap::new_in(alloc),
+            assoc: HashMap::new_in(alloc),
+            opaques: HashMap::new_in(alloc),
+            lang: HashMap::new_in(alloc),
+            names: HashMap::new_in(alloc),
+            retries: 0,
+            conditions: Vec::new_in(alloc),
+            holds: HashMap::new_in(alloc),
+            cond_args: Vec::new_in(alloc),
+            #[cfg(test)]
+            first_impl_only: false,
+            #[cfg(test)]
+            drop_const_clauses: false,
+        }
+    }
+
+    /// Whether the value of `cond` at `args` is kept.
+    pub fn const_holds_known(&self, cond: SDef, args: &[STy]) -> bool {
+        self.holds.contains_key(&(cond.0, args_key(args)))
+    }
+
+    /// Keeps the value of `cond` at `args`; other arguments with the same key are a refusal.
+    pub fn keep_const_holds(&mut self, cond: SDef, args: &[STy], v: ConstHolds) -> Result<(), Stop> {
+        let key = (cond.0, args_key(args));
+        if let Some(&(span, _)) = self.holds.get(&key) {
+            if span.get(&self.cond_args) != args {
+                return Err(CheckError::Malformed(Malformed::ConditionKey { cond: ItemKey(cond.0) }).into());
+            }
+            return Ok(());
+        }
+        let start = self.cond_args.len();
+        self.cond_args.extend_from_slice(args);
+        self.holds.insert(key, (Span::of(&self.cond_args, start), v));
+        Ok(())
+    }
+
+    /// The `i`th impl `where const` condition read, with its impl's trait.
+    pub fn const_condition(&self, i: usize) -> Option<(SDef, u128)> {
+        self.conditions.get(i).map(|&(c, t)| (SDef(c), t))
+    }
+
+    /// Why `cond` fails: a value kept as false or failed, else, when the bound is over a
+    /// generic parameter, that it is not decided.
+    pub fn reason(&self, cond: SDef, generic: bool) -> Option<crate::diag::Because> {
+        let k = ItemKey(cond.0);
+        // The solver never evaluates a condition over a parameter, so no kept answer is this
+        // bound's own.
+        if generic {
+            return Some(crate::diag::Because::Generic(k));
+        }
+        let mut kept = self.holds.iter().filter(|((c, _), _)| *c == cond.0).map(|(_, &(_, v))| v);
+        let worst = kept.try_fold(None, |acc: Option<ConstHolds>, v| match v {
+            ConstHolds::Error => Err(()),
+            ConstHolds::False => Ok(Some(ConstHolds::False)),
+            ConstHolds::True => Ok(acc),
+        });
+        match worst {
+            Err(()) => Some(crate::diag::Because::Error(k)),
+            Ok(Some(_)) => Some(crate::diag::Because::False(k)),
+            Ok(None) => None,
+        }
+    }
+
+    /// Whether the cache answers `q`.
+    pub fn has(&self, q: SQ) -> bool {
+        match q {
+            SQ::TraitDef(d) => self.traits.contains_key(&d.0),
+            SQ::Impls(d, s) => self.impls.contains_key(&(d.0, s)),
+            SQ::ImplHeader(d) => self.headers.contains_key(&d.0),
+            SQ::Adt(d) => self.adts.contains_key(&d.0),
+            SQ::FnSig(d) => self.sigs.contains_key(&d.0),
+            SQ::Assoc(d) => self.assoc.contains_key(&d.0),
+            SQ::Opaque(d) => self.opaques.contains_key(&d.0),
+            SQ::Lang(l) => self.lang.contains_key(&l),
+            SQ::IsLocal(_) => false,
+            // Its arguments are terms of the context: `InferCtx::fill` reads it.
+            SQ::ConstHolds(..) => false,
+        }
+    }
+
+    /// Reads `q` through `reads` and keeps its answer (see the module).
+    pub fn fill<W: World>(&mut self, q: SQ, reads: &mut Reads<'_, '_, W>) -> Result<(), Stop> {
+        if self.has(q) {
+            return Ok(());
+        }
+        match q {
+            SQ::TraitDef(d) => self.fill_trait(ItemKey(d.0), reads),
+            SQ::Impls(d, s) => {
+                let got = reads.impls_of(ItemKey(d.0), shape(s))?;
+                #[cfg(test)]
+                let got = if self.first_impl_only { &got[..got.len().min(1)] } else { got };
+                let start = self.impl_defs.len();
+                self.impl_defs.extend(got.iter().map(|k| SDef(k.0)));
+                let span = Span::of(&self.impl_defs, start);
+                let mut h = StableHasher::new("blaze-typeck impls");
+                for k in got {
+                    h.u128(k.0);
+                }
+                self.impls.insert((d.0, s), (span, h.finish()));
+                Ok(())
+            }
+            SQ::ImplHeader(d) => self.fill_impl(ItemKey(d.0), reads),
+            SQ::Adt(d) => self.fill_adt(ItemKey(d.0), reads),
+            SQ::FnSig(d) => self.fill_sig(ItemKey(d.0), reads),
+            SQ::Assoc(d) => self.fill_assoc(d.0, reads),
+            SQ::Opaque(d) => self.fill_opaque(ItemKey(d.0), reads),
+            SQ::Lang(l) => {
+                let item = lang_item(l);
+                let got = match item.assoc_type() {
+                    // An associated type: `assoc_def(trait, name)`, the one name the solver
+                    // gives it (`LangItem::assoc_type`), once the trait is seen to declare it.
+                    Some((trait_lang, name)) => match reads.lang_item(trait_lang)? {
+                        Some(t) => {
+                            let name = Name::of(name);
+                            match reads.assoc_item(t, name)? {
+                                Some(a) if a.kind == crate::world::AssocKind::Type => Some(ItemKey(assoc_def(t, name))),
+                                _ => {
+                                    return Err(CheckError::Malformed(Malformed::NoRecord(Question::AssocItem(t, name))).into());
+                                }
+                            }
+                        }
+                        None => None,
+                    },
+                    None => reads.lang_item(item)?,
+                };
+                self.lang.insert(l, got.map(|k| SDef(k.0)));
+                Ok(())
+            }
+            // Coherence's question; a body's check runs in analysis mode, which never asks it.
+            SQ::IsLocal(d) => Err(CheckError::Malformed(Malformed::NoRecord(Question::Attrs(ItemKey(d.0)))).into()),
+            // `InferCtx::fill` answers it: its arguments are terms of the context.
+            SQ::ConstHolds(cond, _) => Err(CheckError::Malformed(Malformed::NotGround { cond: ItemKey(cond.0) }).into()),
+        }
+    }
+
+    /// Converts `t` into the answer's portable table, which starts at `por`: an erased region
+    /// first, then `t`'s nodes one for one (an array's length is its own node). Returns the
+    /// answer-relative index of `t`'s node 0 and of its list 0.
+    fn table(&mut self, q: Question, t: PTys<'_>, por: Por) -> Result<(u32, u32), Stop> {
+        let base = por.nodes.start as usize;
+        let lbase = por.lists.start as usize;
+        let erased = (self.nodes.len() - base) as u32;
+        self.nodes.push(K::ReErased);
+        let off = (self.nodes.len() - base) as u32;
+        let loff = (self.lists.len() - lbase) as u32;
+        for p in t.lists {
+            self.lists.push(STy(off + p.0));
+        }
+        let list = |l: crate::ids::List| SList { start: loff + l.start, len: l.len };
+        let ty = |p: crate::portable::PTy| STy(off + p.0);
+        for n in t.nodes {
+            let k = match *n {
+                PNode::Bool => K::Bool,
+                PNode::Char => K::Char,
+                PNode::Int(i) => K::Int(int(i)),
+                PNode::Uint(u) => K::Uint(uint(u)),
+                PNode::Float(f) => K::Float(float(f)),
+                PNode::Str => K::Str,
+                PNode::Never => K::Never,
+                PNode::Tuple(l) => K::Tuple(list(l)),
+                PNode::Ref(m, p) => K::Ref(STy(erased), ty(p), mutbl(m)),
+                PNode::Ptr(m, p) => K::RawPtr(ty(p), mutbl(m)),
+                PNode::Array(e, n) => K::Array(ty(e), ty(n)),
+                PNode::Slice(e) => K::Slice(ty(e)),
+                PNode::Pat(b, l) => K::Pat(ty(b), list(l)),
+                PNode::Adt(k, l) => K::Adt(SDef(k.0), list(l)),
+                PNode::FnDef(k, l) => K::FnDef(SDef(k.0), list(l)),
+                PNode::FnPtr(l, h) => K::FnPtr(list(l), h),
+                PNode::Param(i) => K::Param(i),
+                PNode::ConstParam(i) => K::ConstParam(i),
+                PNode::ConstValue { ty: vt, bits } => {
+                    let vt = match t.node(vt).map_err(Stop::from)? {
+                        PNode::Bool => blaze_solve::term::ValTy::Bool,
+                        PNode::Char => blaze_solve::term::ValTy::Char,
+                        PNode::Int(i) => blaze_solve::term::ValTy::Int(int(i)),
+                        PNode::Uint(u) => blaze_solve::term::ValTy::Uint(uint(u)),
+                        // An enum's variant (`PortableTys::variant_value`).
+                        PNode::Adt(k, l) if l.len == 0 => blaze_solve::term::ValTy::Enum(SDef(k.0)),
+                        _ => return Err(CheckError::Malformed(Malformed::ConstValueType { node: vt.0 }).into()),
+                    };
+                    K::ConstValue(vt, bits)
+                }
+                PNode::Alias { trait_, name, args } => {
+                    let d = assoc_def(trait_, name);
+                    self.names.insert(d, (trait_, name));
+                    K::Alias(Rigid::No, SAlias::Projection, SDef(d), list(args))
+                }
+                PNode::Opaque(k, l) => K::Alias(Rigid::No, SAlias::Opaque, SDef(k.0), list(l)),
+                PNode::Error => K::Error,
+                PNode::Dynamic(l) => K::Dynamic(list(l), STy(erased)),
+                PNode::ExTrait(k, l) => K::ExTrait(SDef(k.0), list(l)),
+                PNode::ExProj { trait_, name, args, term } => {
+                    let d = assoc_def(trait_, name);
+                    self.names.insert(d, (trait_, name));
+                    K::ExProj(SDef(d), list(args), ty(term))
+                }
+                PNode::ExAuto(k) => K::ExAuto(SDef(k.0)),
+                PNode::Closure(..) | PNode::Future(..) | PNode::Infer => {
+                    return Err(CheckError::Malformed(Malformed::BodyTypeInRecord(q)).into());
+                }
+            };
+            self.nodes.push(k);
+        }
+        Ok((off, loff))
+    }
+
+    /// Converts clauses over a table converted at `(off, loff)` into `self.preds`.
+    fn clauses(&mut self, cs: &[PClause], off: u32, loff: u32, base: usize) {
+        for c in cs {
+            let p = match *c {
+                PClause::Trait { trait_, args } => Pred::Trait {
+                    trait_: SDef(trait_.0),
+                    args: SList { start: loff + args.start, len: args.len },
+                    polarity: Polarity::Positive,
+                },
+                PClause::Projection { trait_, args, name, term } => {
+                    let d = assoc_def(trait_, name);
+                    self.names.insert(d, (trait_, name));
+                    let alias = (self.nodes.len() - base) as u32;
+                    self.nodes.push(K::Alias(
+                        Rigid::No,
+                        SAlias::Projection,
+                        SDef(d),
+                        SList { start: loff + args.start, len: args.len },
+                    ));
+                    Pred::Projection { alias: STy(alias), term: STy(off + term.0) }
+                }
+                PClause::Const { cond, args } => {
+                    #[cfg(test)]
+                    if self.drop_const_clauses {
+                        continue;
+                    }
+                    Pred::ConstHolds { cond: SDef(cond.0), args: SList { start: loff + args.start, len: args.len } }
+                }
+            };
+            self.preds.push(p);
+        }
+    }
+
+    fn start(&self) -> Por {
+        Por {
+            nodes: Span { start: self.nodes.len() as u32, len: 0 },
+            lists: Span { start: self.lists.len() as u32, len: 0 },
+        }
+    }
+
+    fn end(&self, mut p: Por) -> Por {
+        p.nodes.len = self.nodes.len() as u32 - p.nodes.start;
+        p.lists.len = self.lists.len() as u32 - p.lists.start;
+        p
+    }
+
+    fn fill_trait<W: World>(&mut self, k: ItemKey, reads: &mut Reads<'_, '_, W>) -> Result<(), Stop> {
+        let q = Question::TraitDef(k);
+        let Some(t) = reads.trait_def(k)? else { return Err(CheckError::Malformed(Malformed::NoRecord(q)).into()) };
+        let por = self.start();
+        let (off, loff) = self.table(q, t.types, por)?;
+        let supers = self.preds.len();
+        self.clauses(t.supertraits, off, loff, por.nodes.start as usize);
+        let supers = Span::of(&self.preds, supers);
+        let assoc = self.assoc_tys.len();
+        for a in t.assoc_types {
+            let d = assoc_def(k, a.name);
+            self.names.insert(d, (k, a.name));
+            self.assoc_tys.push(AssocTy {
+                def: SDef(d),
+                own_generics: 0,
+                bounds_start: 0,
+                bounds_len: 0,
+                default: a.default.map(|p| STy(off + p.0)),
+            });
+        }
+        let assoc = Span::of(&self.assoc_tys, assoc);
+        let f = t.flags;
+        let mut flags = 0u16;
+        for (b, s) in [
+            (crate::world::TraitFlags::AUTO, STraitFlags::AUTO),
+            (crate::world::TraitFlags::MARKER, STraitFlags::MARKER),
+            (crate::world::TraitFlags::UNSAFE, STraitFlags::UNSAFE),
+            (crate::world::TraitFlags::FUNDAMENTAL, STraitFlags::FUNDAMENTAL),
+            (crate::world::TraitFlags::COINDUCTIVE, STraitFlags::COINDUCTIVE),
+            (crate::world::TraitFlags::CONST, STraitFlags::CONST),
+        ] {
+            if f.has(b) {
+                flags |= s;
+            }
+        }
+        // Set only on the rule's verdict (`crate::dyn_compat`): a refusal or a gap leaves it off.
+        if crate::dyn_compat::verdict(reads, k)? == crate::dyn_compat::Verdict::Compatible {
+            flags |= STraitFlags::DYN_COMPATIBLE;
+        }
+        let row = TraitRow {
+            flags: STraitFlags(flags),
+            generics: t.generics,
+            lang: t.lang.and_then(solver_lang),
+            supers,
+            assoc,
+            por: self.end(por),
+            digest: digest("blaze-typeck trait", &t),
+        };
+        self.traits.insert(k.0, row);
+        Ok(())
+    }
+
+    fn fill_impl<W: World>(&mut self, k: ItemKey, reads: &mut Reads<'_, '_, W>) -> Result<(), Stop> {
+        let q = Question::ImplHeader(k);
+        let Some(h) = reads.impl_header(k)? else { return Err(CheckError::Malformed(Malformed::NoRecord(q)).into()) };
+        let Some(trait_) = h.trait_ else { return Err(CheckError::Malformed(Malformed::NoRecord(q)).into()) };
+        let wc = reads.predicates(k)?;
+        let por = self.start();
+        let base = por.nodes.start as usize;
+        let (off, loff) = self.table(q, h.types, por)?;
+        // The trait's arguments, self first: a list of its own.
+        let args_at = (self.lists.len() - por.lists.start as usize) as u32;
+        self.lists.push(STy(off + h.self_ty.0));
+        for i in h.trait_args.list().range() {
+            let p = h.types.lists.get(i).ok_or(CheckError::Malformed(Malformed::NoRecord(q)))?;
+            self.lists.push(STy(off + p.0));
+        }
+        let args = SList { start: args_at, len: h.trait_args.list().len + 1 };
+        let assoc = self.impl_assoc.len();
+        for &(name, v) in h.assoc_types {
+            let d = assoc_def(trait_, name);
+            self.names.insert(d, (trait_, name));
+            self.impl_assoc.push(ImplAssoc { trait_item: SDef(d), value: STy(off + v.0), own_generics: 0, is_default: false });
+        }
+        let assoc = Span::of(&self.impl_assoc, assoc);
+        let (woff, wloff) = self.table(Question::Predicates(k), wc.types, por)?;
+        let wheres = self.preds.len();
+        self.clauses(wc.clauses, woff, wloff, base);
+        let wheres = Span::of(&self.preds, wheres);
+        for c in wc.clauses {
+            if let PClause::Const { cond, .. } = *c {
+                self.conditions.push((cond.0, trait_.0));
+            }
+        }
+        let row = ImplRow {
+            generics: h.generics,
+            polarity: h.polarity,
+            trait_: SDef(trait_.0),
+            args,
+            wheres,
+            assoc,
+            por: self.end(por),
+            digest: digest("blaze-typeck impl", &h) ^ digest("blaze-typeck impl where", &wc),
+        };
+        self.headers.insert(k.0, row);
+        Ok(())
+    }
+
+    fn fill_adt<W: World>(&mut self, k: ItemKey, reads: &mut Reads<'_, '_, W>) -> Result<(), Stop> {
+        let q = Question::Adt(k);
+        let Some(a) = reads.adt(k)? else { return Err(CheckError::Malformed(Malformed::NoRecord(q)).into()) };
+        let wc = reads.predicates(k)?;
+        let mut flags = match a.kind {
+            AdtKind::Struct => AdtFlags::STRUCT,
+            AdtKind::Enum => AdtFlags::ENUM,
+            AdtKind::Union => AdtFlags::UNION,
+        };
+        for (l, f) in [
+            (LangItem::OwnedBox, AdtFlags::BOX),
+            (LangItem::PhantomData, AdtFlags::PHANTOM_DATA),
+            (LangItem::ManuallyDrop, AdtFlags::MANUALLY_DROP),
+        ] {
+            if reads.lang_item(l)? == Some(k) {
+                flags |= f;
+            }
+        }
+        if let Some(drop) = reads.lang_item(LangItem::Drop)?
+            && !reads.impls_of(drop, Shape::Adt(k))?.is_empty()
+        {
+            flags |= AdtFlags::HAS_DROP;
+        }
+        let por = self.start();
+        let base = por.nodes.start as usize;
+        let (off, _) = self.table(q, a.types, por)?;
+        let fields = self.fields.len();
+        let variants = self.variants.len();
+        for v in a.variants {
+            let at = (self.fields.len() - fields) as u32;
+            for i in v.fields.range() {
+                let f = a.fields.get(i).ok_or(CheckError::Malformed(Malformed::NoRecord(q)))?;
+                self.fields.push(STy(off + f.ty.0));
+            }
+            self.variants.push((at, v.fields.len));
+        }
+        let sized_tail = match (a.kind, a.variants) {
+            (AdtKind::Struct, [v]) if v.fields.len > 0 => {
+                Some(self.fields[fields + v.fields.len as usize - 1])
+            }
+            _ => None,
+        };
+        // Only an enum's discriminant type is read (any other type's is `u8`).
+        let discr = match a.kind {
+            AdtKind::Enum => match reads.attrs(k)?.discr() {
+                crate::world::DiscrRepr::Unread => blaze_solve::facts::Discr::Unread,
+                crate::world::DiscrRepr::Int(i) => blaze_solve::facts::Discr::Int(int(i)),
+                crate::world::DiscrRepr::Uint(u) => blaze_solve::facts::Discr::Uint(uint(u)),
+            },
+            AdtKind::Struct | AdtKind::Union => blaze_solve::facts::Discr::Unread,
+        };
+        let fields = Span::of(&self.fields, fields);
+        let variants = Span::of(&self.variants, variants);
+        let (woff, wloff) = self.table(Question::Predicates(k), wc.types, por)?;
+        let wheres = self.preds.len();
+        self.clauses(wc.clauses, woff, wloff, base);
+        let wheres = Span::of(&self.preds, wheres);
+        let row = AdtRow {
+            flags: AdtFlags(flags),
+            generics: a.generics,
+            fields,
+            variants,
+            sized_tail,
+            discr,
+            wheres,
+            por: self.end(por),
+            digest: digest("blaze-typeck adt", &a) ^ digest("blaze-typeck adt where", &wc) ^ digest("blaze-typeck adt discr", &(discr_code(discr) as u32)),
+        };
+        self.adts.insert(k.0, row);
+        Ok(())
+    }
+
+    fn fill_sig<W: World>(&mut self, k: ItemKey, reads: &mut Reads<'_, '_, W>) -> Result<(), Stop> {
+        let q = Question::FnSig(k);
+        let Some(s) = reads.fn_sig(k)? else { return Err(CheckError::Malformed(Malformed::NoRecord(q)).into()) };
+        let por = self.start();
+        let (off, _) = self.table(q, s.types, por)?;
+        let at = (self.lists.len() - por.lists.start as usize) as u32;
+        for p in s.inputs {
+            self.lists.push(STy(off + p.0));
+        }
+        self.lists.push(STy(off + s.output.0));
+        let io = SList { start: at, len: s.inputs.len() as u32 + 1 };
+        // `FnSig::is_fn_trait_compatible` reads the safety and the ABI from the header.
+        let mut flags = 0;
+        if s.header.safety == crate::ids::Safety::Unsafe {
+            flags |= FnSigDef::UNSAFE;
+        }
+        if s.header.abi == crate::ids::Abi::RustCall {
+            flags |= FnSigDef::RUST_CALL;
+        }
+        let row = SigRow {
+            generics: s.parent_count + s.own_count,
+            flags,
+            io,
+            por: self.end(por),
+            digest: digest("blaze-typeck sig", &s),
+        };
+        self.sigs.insert(k.0, row);
+        Ok(())
+    }
+
+    fn fill_assoc<W: World>(&mut self, d: u128, reads: &mut Reads<'_, '_, W>) -> Result<(), Stop> {
+        // An associated type the cache named by `assoc_def`: its trait's generics.
+        if let Some(&(trait_, _)) = self.names.get(&d) {
+            self.fill_trait(trait_, reads)?;
+            let generics = self.traits.get(&trait_.0).map_or(0, |t| t.generics);
+            let digest = digest("blaze-typeck assoc", &ItemKey(d));
+            self.assoc.insert(
+                d,
+                AssocDef {
+                    container: SDef(trait_.0),
+                    trait_: Some(SDef(trait_.0)),
+                    kind: AssocKind::Type,
+                    parent_generics: generics,
+                    own_generics: 0,
+                    digest,
+                },
+            );
+            return Ok(());
+        }
+        let q = Question::AssocParent(ItemKey(d));
+        let Some(p) = reads.assoc_parent(ItemKey(d))? else {
+            return Err(CheckError::Malformed(Malformed::NoRecord(q)).into());
+        };
+        let (trait_, generics) = match reads.trait_def(p.container)? {
+            Some(t) => (Some(SDef(p.container.0)), t.generics),
+            None => match reads.impl_header(p.container)? {
+                Some(h) => (h.trait_.map(|t| SDef(t.0)), h.generics),
+                None => return Err(CheckError::Malformed(Malformed::NoRecord(q)).into()),
+            },
+        };
+        let kind = match p.kind {
+            crate::world::AssocKind::Fn { .. } => AssocKind::Fn,
+            crate::world::AssocKind::Const => AssocKind::Const,
+            crate::world::AssocKind::Type => AssocKind::Type,
+        };
+        let digest = digest("blaze-typeck assoc parent", &p);
+        self.assoc.insert(
+            d,
+            AssocDef { container: SDef(p.container.0), trait_, kind, parent_generics: generics, own_generics: 0, digest },
+        );
+        Ok(())
+    }
+
+    fn fill_opaque<W: World>(&mut self, k: ItemKey, reads: &mut Reads<'_, '_, W>) -> Result<(), Stop> {
+        let q = Question::Opaque(k);
+        let hidden = reads.opaque_hidden(k)?;
+        let bounds = reads.predicates(k)?;
+        let por = self.start();
+        let base = por.nodes.start as usize;
+        let hidden_ty = match hidden {
+            Some(h) => {
+                let (off, _) = self.table(q, h.types, por)?;
+                Some(STy(off + h.ty.0))
+            }
+            None => None,
+        };
+        let (boff, bloff) = self.table(Question::Predicates(k), bounds.types, por)?;
+        let start = self.preds.len();
+        self.clauses(bounds.clauses, boff, bloff, base);
+        let mut d = digest("blaze-typeck opaque bounds", &bounds);
+        if let Some(h) = hidden {
+            d ^= digest("blaze-typeck opaque hidden", &h);
+        }
+        let row = OpaqueRow { bounds: Span::of(&self.preds, start), hidden: hidden_ty, por: self.end(por), digest: d };
+        self.opaques.insert(k.0, row);
+        Ok(())
+    }
+
+    fn portable(&self, p: Por) -> Portable<'_> {
+        Portable { nodes: p.nodes.get(&self.nodes), lists: p.lists.get(&self.lists) }
+    }
+
+    /// The allocator the cache is in.
+    pub fn alloc(&self) -> Alloc<'a> {
+        self.alloc
+    }
+}
+
+impl Facts for FactCache<'_> {
+    fn trait_def(&self, _: Seal, t: SDef) -> Fetch<TraitDef<'_>> {
+        let r = self.traits.get(&t.0).ok_or(Missing)?;
+        Ok(TraitDef {
+            flags: r.flags,
+            generics: r.generics,
+            lang: r.lang,
+            supertraits: r.supers.get(&self.preds),
+            where_clauses: &[],
+            assoc: r.assoc.get(&self.assoc_tys),
+            item_bounds: &[],
+            portable: self.portable(r.por),
+            digest: r.digest,
+        })
+    }
+
+    fn impls(&self, _: Seal, t: SDef, shape: SShape) -> Fetch<ImplSet<'_>> {
+        let &(span, digest) = self.impls.get(&(t.0, shape)).ok_or(Missing)?;
+        // No fingerprint columns yet (`len` 0 is not the impl count): every impl is a
+        // candidate until the item layer's buckets carry blaze-impls' fingerprints.
+        Ok(ImplSet { impls: span.get(&self.impl_defs), columns: Columns::EMPTY, digest })
+    }
+
+    fn impl_header(&self, _: Seal, i: SDef) -> Fetch<ImplHeader<'_>> {
+        let r = self.headers.get(&i.0).ok_or(Missing)?;
+        Ok(ImplHeader {
+            generics: r.generics,
+            polarity: r.polarity,
+            flags: ImplFlags(0),
+            trait_: r.trait_,
+            args: r.args,
+            where_clauses: r.wheres.get(&self.preds),
+            assoc: r.assoc.get(&self.impl_assoc),
+            portable: self.portable(r.por),
+            digest: r.digest,
+        })
+    }
+
+    fn adt(&self, _: Seal, d: SDef) -> Fetch<AdtDef<'_>> {
+        let r = self.adts.get(&d.0).ok_or(Missing)?;
+        Ok(AdtDef {
+            flags: r.flags,
+            generics: r.generics,
+            fields: r.fields.get(&self.fields),
+            variants: r.variants.get(&self.variants),
+            sized_tail: r.sized_tail,
+            discr: r.discr,
+            where_clauses: r.wheres.get(&self.preds),
+            portable: self.portable(r.por),
+            digest: r.digest,
+        })
+    }
+
+    fn fn_sig(&self, _: Seal, d: SDef) -> Fetch<FnSigDef<'_>> {
+        let r = self.sigs.get(&d.0).ok_or(Missing)?;
+        Ok(FnSigDef { generics: r.generics, inputs_output: r.io, flags: r.flags, portable: self.portable(r.por), digest: r.digest })
+    }
+
+    fn assoc(&self, _: Seal, d: SDef) -> Fetch<AssocDef> {
+        self.assoc.get(&d.0).copied().ok_or(Missing)
+    }
+
+    fn opaque(&self, _: Seal, d: SDef) -> Fetch<OpaqueDef<'_>> {
+        let r = self.opaques.get(&d.0).ok_or(Missing)?;
+        // The world's opaque answer does not carry its generics yet: 0 until it does.
+        Ok(OpaqueDef {
+            generics: 0,
+            bounds: r.bounds.get(&self.preds),
+            hidden: r.hidden,
+            portable: self.portable(r.por),
+            digest: r.digest,
+        })
+    }
+
+    fn lang(&self, _: Seal, l: Lang) -> Fetch<Option<SDef>> {
+        self.lang.get(&l).copied().ok_or(Missing)
+    }
+
+    fn is_local(&self, _: Seal, _: SDef) -> Fetch<bool> {
+        Err(Missing)
+    }
+
+    fn const_holds(&self, _: Seal, cond: SDef, args: &[STy]) -> Fetch<ConstHolds> {
+        match self.holds.get(&(cond.0, args_key(args))) {
+            Some(&(span, v)) if span.get(&self.cond_args) == args => Ok(v),
+            // Absent, or other arguments under the key: the fill refuses the second.
+            _ => Err(Missing),
+        }
+    }
+}

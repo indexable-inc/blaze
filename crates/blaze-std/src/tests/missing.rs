@@ -79,6 +79,7 @@ fn asked(io: &Io, name: &str) -> Option<(bool, Result<(), Missing>)> {
         "serial" => (io.serial().is_some(), need(io.need_serial())),
         "clipboard" => (io.clipboard().is_some(), need(io.need_clipboard())),
         "notify" => (io.notify().is_some(), need(io.need_notify())),
+        #[cfg(feature = "net")]
         "http" => (io.http().is_some(), need(io.need_http())),
         "streams" => (io.streams().is_some(), need(io.need_streams())),
         "out" => (io.out().is_some(), need(io.need_out())),
@@ -110,6 +111,10 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
             (Some(outer), false) => outer,
             _ => name,
         };
+        // `Http` is behind bstd's `net` feature: without it the flag has no accessor.
+        if cfg!(not(feature = "net")) && name == "http" {
+            continue;
+        }
         let Some((handed, needed)) = asked(&io, name) else {
             return Err(format!("Offers has the flag {name}, and this test knows no accessor for it"));
         };

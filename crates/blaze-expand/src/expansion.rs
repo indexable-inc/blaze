@@ -270,6 +270,8 @@ pub enum IncludeFailure {
     NotUtf8,
     /// `include!` of a file that does not lex.
     DoesNotLex,
+    /// A path that leaves the unit's source root (decision D60: [`crate::include_target`]).
+    Outside,
 }
 
 impl IncludeFailure {
@@ -278,12 +280,14 @@ impl IncludeFailure {
             IncludeFailure::Missing => 0,
             IncludeFailure::NotUtf8 => 1,
             IncludeFailure::DoesNotLex => 2,
+            IncludeFailure::Outside => 3,
         }
     }
 }
 
 /// A macro call's own error, a value of its expansion: the record keeps it, and a reader
-/// reports it where it places the call. An expansion with one has no tokens.
+/// reports it where it places the call. An expansion with an error ([`Diagnostic::is_error`])
+/// has no tokens.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum Diagnostic {
     /// No rule of the `rules` rules matched. `token` is the token the rule that got furthest
@@ -310,6 +314,49 @@ pub enum Diagnostic {
     Derive { message: Text },
     /// A builtin macro's arguments are not what it takes.
     Builtin { message: Text, at: Option<TokenOrigin> },
+    /// A proc macro's own diagnostic, `proc_macro::Diagnostic::emit`: its level, its message,
+    /// and the token its first span names.
+    ProcMacro { level: ProcLevel, message: Text, at: Option<TokenOrigin> },
+    /// The proc macro panicked; its panic message.
+    ProcMacroPanicked { message: Text },
+}
+
+impl Diagnostic {
+    /// Whether the call failed: an expansion with an error has no tokens; a proc macro's
+    /// warning, note or help sits beside its tokens.
+    pub fn is_error(&self) -> bool {
+        !matches!(self, Diagnostic::ProcMacro { level: ProcLevel::Warning | ProcLevel::Note | ProcLevel::Help, .. })
+    }
+}
+
+/// A proc macro diagnostic's level, as `proc_macro::Level` has them.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ProcLevel {
+    Error,
+    Warning,
+    Note,
+    Help,
+}
+
+impl ProcLevel {
+    pub(crate) fn byte(self) -> u8 {
+        match self {
+            ProcLevel::Error => 0,
+            ProcLevel::Warning => 1,
+            ProcLevel::Note => 2,
+            ProcLevel::Help => 3,
+        }
+    }
+
+    pub(crate) fn from_byte(byte: u8) -> Option<ProcLevel> {
+        Some(match byte {
+            0 => ProcLevel::Error,
+            1 => ProcLevel::Warning,
+            2 => ProcLevel::Note,
+            3 => ProcLevel::Help,
+            _ => return None,
+        })
+    }
 }
 
 /// One macro call's expansion.
@@ -481,6 +528,15 @@ impl<'a> Expansion<'a> {
                 out.put(&[10]);
                 text(out, message);
                 origin(out, at);
+            }
+            Diagnostic::ProcMacro { level, message, at } => {
+                out.put(&[11, level.byte()]);
+                text(out, message);
+                origin(out, at);
+            }
+            Diagnostic::ProcMacroPanicked { message } => {
+                out.put(&[12]);
+                text(out, message);
             }
         }
     }

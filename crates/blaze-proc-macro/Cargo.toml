@@ -1,0 +1,69 @@
+[package]
+name = "blaze-proc-macro"
+description = "Proc macros as wasm32-wasip1 modules in Wasmtime: the module records, a fresh sandboxed instance per call, blaze's server of the pinned proc_macro bridge over blaze-expand's tokens, and expansion records keyed by the module's digest and the input, with the reads each run made"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[features]
+# Running a module: Wasmtime, the bridge server, the host, the hook and build scripts. Without
+# it: a module's identity and key, the module store's lookup and the expansion records' key and
+# lookup (what a command that expands nothing asks).
+runtime = ["dep:wasmtime", "dep:tracing","dep:blaze-build-script", "dep:blaze-unit-graph", "dep:blaze-format", "dep:blaze-id"]
+default = ["runtime"]
+
+[dependencies]
+# A build script's environment, outputs, key and compiler answers (`script.rs`).
+blaze-build-script = { workspace = true, optional = true }
+# `TokenStream`, `Produced`, `ProcDiagnostic`, `TokenOrigin`, `lex`: the hook's types.
+blaze-expand.workspace = true
+# `Alloc`, `AVec`: the output is made in the caller's allocator.
+blaze-own = { workspace = true, features = ["std"] }
+# `ContentId`, `Hasher`: the expansion's base key and the reads' digests.
+blaze-ids.workspace = true
+# `CrateItemKey`: the crate a proc macro's definition names (`hook.rs`).
+blaze-id = { workspace = true, optional = true }
+# The record with its reads: base key, read-lists, answers.
+blaze-record.workspace = true
+# The module record's key, as the bootstrap builder computes it.
+blaze-sha256.workspace = true
+# The bridge's byte cursor (`wire.rs`).
+blaze-format = { workspace = true, optional = true }
+# WASI preview 1's calls, over the sandbox's `System`.
+blaze-wasi.workspace = true
+wasmtime = { workspace = true, optional = true }
+# The span a worker waiting on another's load of a module opens (`host.rs`).
+tracing = { workspace = true, optional = true }
+# `script_unit.rs`: a unit graph's build-script units, run for the units they serve.
+blaze-unit-graph = { workspace = true, optional = true }
+# The source corrections (`blaze_fetch::correct`, D58): a corrected package's pin in a module's
+# closure names the row's digest, so the module key changes when the row does.
+blaze-fetch.workspace = true
+
+[dev-dependencies]
+# A test's table of source corrections, read with the lexer's scalar width.
+blaze-lex.workspace = true
+# The example's check that an expansion's output outlines as items.
+blaze-file-items.workspace = true
+# The simulation tests' tapes and planted-bug controls.
+blaze-sim.workspace = true
+# `tempo_scripts`: the graph of a workspace (blaze-unit-graph, a dependency, over the lock
+# and the manifests) and its packages' files from the fetch store's records.
+blaze-manifest = { workspace = true, default-features = false }
+# `tempo_pipeline`: the real expansion pipeline (`lower_file`, `ByName::with_procs`) over a
+# checkout, the hook behind it. By path, as blaze-real takes it.
+blaze-lower = { path = "../blaze-lower" }
+blaze-surface.workspace = true
+# `tempo_pipeline`: each body checked as blaze-real's stage h does (`to_typeck`'s table).
+blaze-typeck.workspace = true
+
+[lints]
+workspace = true

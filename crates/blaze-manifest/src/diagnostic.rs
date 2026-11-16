@@ -5,9 +5,8 @@ use std::fmt;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
-use annotate_snippets::{AnnotationKind, Group, Level, Renderer, Snippet};
-
 use crate::error::ManifestError;
+use crate::snippet;
 use crate::schema::SchemaError;
 
 /// What a diagnostic is about.
@@ -74,14 +73,10 @@ impl ManifestDiagnostic {
 
     /// The diagnostic as cargo prints it, the manifest's path relative to `cwd`.
     pub fn render(&self, cwd: &Path) -> String {
-        let path = pathdiff::diff_paths(&self.path, cwd).unwrap_or_else(|| self.path.clone());
+        let path = crate::paths::relative_to(&self.path, cwd).unwrap_or_else(|| self.path.clone());
         let message = self.what.to_string();
-        let group = Group::with_title(Level::ERROR.primary_title(&message)).element(
-            Snippet::source(&self.contents)
-                .path(path.display().to_string())
-                .annotation(AnnotationKind::Primary.span(self.span.clone())),
-        );
-        Renderer::plain().render(&[group])
+        let path = path.display().to_string();
+        snippet::with_span(snippet::Level::Error, &message, &path, &self.contents, self.span.clone())
     }
 }
 

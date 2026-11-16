@@ -198,6 +198,73 @@ impl BlazeEdition {
     }
 }
 
+/// What a package's `edition` means for the code under it: the Rust edition its files are
+/// parsed and resolved in, and for a blaze edition that its `std` is bstd. The one reading
+/// of a manifest's `edition` value ([`PackageEdition::of_manifest`]); every reader of a
+/// manifest (blaze-manifest's workspace reader, the driver) asks it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PackageEdition {
+    /// The Rust edition its syntax and name resolution are.
+    pub syntax: Edition,
+    /// The blaze edition it is, when it is one.
+    pub blaze: Option<BlazeEdition>,
+}
+
+/// A manifest `edition` value that is no Rust edition and no blaze edition: the value is the
+/// caller's text, so the error holds none of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoEdition {
+    /// `blaze-...` naming no blaze edition this blaze knows.
+    UnknownBlaze,
+    /// Anything else that is not `2015`, `2018`, `2021` or `2024`.
+    Unknown,
+}
+
+impl fmt::Display for NoEdition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            NoEdition::UnknownBlaze => f.write_str("no blaze edition this blaze knows"),
+            NoEdition::Unknown => f.write_str("none of `2015`, `2018`, `2021`, `2024` or a blaze edition"),
+        }
+    }
+}
+
+impl std::error::Error for NoEdition {}
+
+impl PackageEdition {
+    /// A package with no `edition`: 2015, as cargo reads it.
+    pub const DEFAULT: PackageEdition = PackageEdition { syntax: Edition::Edition2015, blaze: None };
+
+    /// The edition a manifest's `edition = "..."` names: a Rust edition's year, or a blaze
+    /// edition's spelling ([`BlazeEdition::manifest`], `blaze-2026.11`), whose syntax is its
+    /// [`BlazeEdition::rust`].
+    pub fn of_manifest(written: &str) -> Result<PackageEdition, NoEdition> {
+        let syntax = match written {
+            "2015" => Edition::Edition2015,
+            "2018" => Edition::Edition2018,
+            "2021" => Edition::Edition2021,
+            "2024" => Edition::Edition2024,
+            _ => {
+                return match BlazeEdition::from_manifest(written) {
+                    Ok(Some(blaze)) => Ok(PackageEdition { syntax: blaze.rust(), blaze: Some(blaze) }),
+                    Ok(None) => Err(NoEdition::Unknown),
+                    Err(_) => Err(NoEdition::UnknownBlaze),
+                };
+            }
+        };
+        Ok(PackageEdition { syntax, blaze: None })
+    }
+
+    /// The name its code calls `std` by: [`BlazeEdition::STD`] (`bstd`) for a blaze edition,
+    /// `std` for a Rust one.
+    pub const fn std_crate(self) -> &'static str {
+        match self.blaze {
+            Some(_) => BlazeEdition::STD,
+            None => "std",
+        }
+    }
+}
+
 impl fmt::Display for BlazeEdition {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.manifest())

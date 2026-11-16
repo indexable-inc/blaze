@@ -29,11 +29,25 @@ use alloc::{string::{String, ToString as _}, sync::Arc, vec::Vec};
 use core::{fmt::Write as _, time::Duration};
 
 use crate::{
+    args::ArgList,
     cx::Cx,
     entry::{Outcome, Status, run_on},
+    env::Vars,
     io::{Io, Limits, NativeWorld},
     task::threads::{Plants, Topology},
 };
+
+// The command line and environment where the kernel left them.
+#[expect(unsafe_code, reason = "the start block's pointers, read as the kernel left them, each with its SAFETY")]
+pub(crate) mod block;
+// The running image's linker id, read in place from its mapped header.
+#[expect(unsafe_code, reason = "the image's header and notes, read where the loader mapped them, each with its SAFETY")]
+pub(crate) mod image;
+// Whether a standard stream is a terminal, and its size.
+pub(crate) mod tty;
+// The launcher of `#[bstd::main]`: the run spec read from file descriptor 3 (crate::grant).
+mod launch;
+pub use launch::{SPEC_MARK, SPEC_MARK_VALUE, launch};
 
 /// The threads the native driver runs file calls on where it has a pool (kqueue, IOCP): a
 /// bound bstd picks for a program's entry, named (std.md, "The second rule").
@@ -66,32 +80,46 @@ impl std::process::Termination for Exit {
 /// - the host's name, empty: neither blaze-core nor Rust std asks the system for it yet.
 ///
 /// `main`'s context is the root of the process's `Threads` pool (task/threads.rs): one worker
-/// per core of the machine's [`topology`], started here and stopped when `main` returns, each
-/// given [`POOL_STOP`] to leave; a worker that does not is reported by name and the process
-/// fails.
+/// per core of the machine's [`topology`], read when a scope first asks about the workers,
+/// their threads started by the first spawn ([`pool::lazy`]). A program that spawns nothing
+/// starts no thread. When `main` returns, the effects it left in flight are drained (within
+/// [`POOL_STOP`], else the process fails naming them) and the process exits at once: the
+/// kernel frees the threads and tables, with no teardown.
 pub fn run<R: Outcome>(main: impl FnOnce(&Cx, Io) -> R) -> Exit {
+    run_io(native(), main)
+}
+
+/// [`run`] in the world `world` made, or saying why it could not be: the one home of the
+/// pool's start and stop for a program's `main` ([`run`], and `launch`'s spec-made world).
+pub(crate) fn run_io<R: Outcome>(world: Result<Io, String>, main: impl FnOnce(&Cx, Io) -> R) -> Exit {
     // alloc: once per process, what a failure says.
     let mut said = String::new();
-    let status = match native() {
-        Ok(io) => match topology().map_err(pool::StartError::from).and_then(|machine| pool::start(&machine, Plants::NONE)) {
-            Ok(running) => {
-                let status = run_on(io, running.pool().clone(), &mut said, main);
-                match running.stop(POOL_STOP) {
-                    Ok(()) => status,
-                    Err(hung) => {
-                        if !said.is_empty() {
-                            said.push_str("; ");
-                        }
-                        let _ = write!(said, "{hung}");
-                        Status::FAILED
+    let status = match world {
+        Ok(io) => {
+            let running = pool::lazy(Plants::NONE);
+            // clone: the world kept past `main`, to drain what it left in flight.
+            let kept = io.clone();
+            let status = run_on(io, running.pool().clone(), &mut said, main);
+            // A command answers and exits (rule 70): every scope of `main` has ended, so no
+            // task runs; what the driver still holds is drained, and then the process exits
+            // with no teardown of what the kernel frees (the pool's threads, their stacks, the
+            // driver's threads and tables, the frames' reservations).
+            let until = blaze_core::wait::Deadline::after(kept.now(), POOL_STOP);
+            let status = match kept.drain(until) {
+                Ok(()) => status,
+                Err(stopped) => {
+                    if !said.is_empty() {
+                        said.push_str("; ");
                     }
+                    let _ = write!(said, "{stopped}");
+                    Status::FAILED
                 }
+            };
+            if !said.is_empty() {
+                error_line(&said);
             }
-            Err(why) => {
-                let _ = write!(said, "{why}");
-                Status::FAILED
-            }
-        },
+            exit_now(status, running)
+        }
         Err(why) => {
             said.push_str(&why);
             Status::FAILED
@@ -101,6 +129,23 @@ pub fn run<R: Outcome>(main: impl FnOnce(&Cx, Io) -> R) -> Exit {
         error_line(&said);
     }
     Exit(status)
+}
+
+/// The process ends with `status` at once: standard output and error are written through as
+/// each line is (`write_out`, `error_line`), so nothing waits in a buffer, and nothing is torn
+/// down that the kernel frees: the pool `running` is not stopped or joined, and no destructor
+/// runs. `std::process::exit` is libc's `exit`: the C library's atexit handlers and stdio
+/// flush, nothing of Rust's.
+fn exit_now(status: Status, running: pool::Running) -> ! {
+    core::mem::forget(running);
+    std::process::exit(i32::from(status.0))
+}
+
+/// The process cannot go on (a worker's thread the system refused, from any thread): `said`
+/// on standard error, and the process exits failed at once, as at the end of `main`.
+pub(crate) fn fatal(said: &str) -> ! {
+    error_line(said);
+    std::process::exit(i32::from(Status::FAILED.0))
 }
 
 /// How long the pool's workers have to leave their loops at the end of `main`: they leave
@@ -152,27 +197,23 @@ pub(crate) mod pool {
     //! Starting and stopping the pool's threads: the driver of task/threads.rs.
 
     // `std` is this module's (bstd is `no_std`: rt.rs is where Rust std is named).
-    use super::std::{format, string::String, sync::mpsc, thread, vec::Vec as StdVec};
+    use super::std::{format, string::String, thread};
 
     use alloc::string::ToString as _;
     use core::time::Duration;
 
-    use blaze_core::wait::{Clock, Deadline, Monotonic, Parker};
+    use blaze_core::wait::{Clock, Deadline, Monotonic};
 
     use super::machine;
-    use crate::task::threads::{Hung, Plants, Pool, Topology};
+    use crate::task::threads::{Hung, Plants, Pool, Reader, Starter, Topology};
 
     /// Each worker's stack: tasks run on it to their end, and a waiting worker runs its own
     /// queued tasks on top of the wait, so it is deeper than a thread's usual 2 MiB.
     pub(crate) const WORKER_STACK: usize = 16 << 20;
 
-    /// How long the pool's threads have to start and report their pinning.
-    pub(crate) const START_WAIT: Duration = Duration::from_secs(5);
-
-    /// A running pool and its threads.
+    /// A pool and the stop of its threads, which start at its first spawn ([`starter`]).
     pub(crate) struct Running {
         pool: Pool,
-        threads: StdVec<Option<thread::JoinHandle<()>>>,
     }
 
     /// Why the pool did not start: the worker, and what refused.
@@ -194,60 +235,75 @@ pub(crate) mod pool {
         }
     }
 
-    /// The pool of `topology`, its threads started, each pinned or given its QoS first.
+    /// The machine's pool, nothing of it made: the topology is read when the pool is first
+    /// asked about its workers ([`read`]), its threads start at the first spawn ([`starter`]),
+    /// so a program that makes no scope reads no topology and one that spawns nothing makes
+    /// no thread.
+    pub(crate) fn lazy(plants: Plants) -> Running {
+        lazy_on(read, starter, plants)
+    }
+
+    /// [`lazy`] with its reader and starter given: a test's, to count starts or fix the
+    /// topology.
+    pub(crate) fn lazy_on(read: Reader, starter: Starter, plants: Plants) -> Running {
+        Running { pool: Pool::lazy(read, Monotonic::new(), plants, starter) }
+    }
+
+    /// The pool of `topology`, its threads started now: a test's pool, which begins as the
+    /// first spawn would begin it.
     pub(crate) fn start(topology: &Topology, plants: Plants) -> Result<Running, StartError> {
-        let pool = Pool::new(topology, Monotonic::new(), plants);
-        let (told, heard) = mpsc::channel::<(u32, Result<(), String>)>();
-        let mut threads = StdVec::new();
-        let mut at = 0u32;
-        for group in &topology.groups {
-            for &cpu in group.cpus.iter() {
-                let (mine, told, class, pin) = (pool.clone(), told.clone(), group.class, topology.pin);
-                let me = at;
-                let spawned = thread::Builder::new()
-                    .name(format!("bstd-worker-{me}"))
-                    .stack_size(WORKER_STACK)
-                    .spawn(move || {
-                        let placed = if pin { machine::place(cpu, class) } else { Ok(()) };
-                        let ok = placed.is_ok();
-                        let _ = told.send((me, placed));
-                        drop(told);
-                        if ok {
-                            mine.work(me);
-                        }
-                    });
-                match spawned {
-                    Ok(handle) => threads.push(Some(handle)),
-                    Err(error) => {
-                        let running = Running { pool, threads };
-                        let _ = running.stop(super::POOL_STOP);
-                        return Err(StartError { worker: me, why: error.to_string() });
-                    }
-                }
-                at += 1;
-            }
+        let running = Running { pool: Pool::new(topology, Monotonic::new(), plants, starter) };
+        running.pool.begin();
+        Ok(running)
+    }
+
+    /// The pool's [`Reader`](crate::task::threads::Reader): the machine's topology, or the
+    /// process stops naming why (a pool cannot be made without its cores).
+    fn read() -> Topology {
+        match super::topology() {
+            Ok(topology) => topology,
+            Err(why) => super::fatal(&why.to_string()),
         }
-        drop(told);
-        let mut failed = None;
-        for _ in 0..at {
-            match heard.recv_timeout(START_WAIT) {
-                Ok((_, Ok(()))) => {}
-                Ok((worker, Err(why))) => {
-                    failed.get_or_insert(StartError { worker, why });
-                }
-                Err(error) => {
-                    failed.get_or_insert(StartError { worker: at, why: format!("no word within {START_WAIT:?}: {error}") });
-                    break;
-                }
-            }
+    }
+
+    /// The pool's [`Starter`](crate::task::threads::Starter): the calling thread (the first
+    /// spawner) starts worker 0 and returns at once, without waiting for any worker; each
+    /// worker's thread starts its two children in the tree (`2n + 1`, `2n + 2`) before it
+    /// places itself and runs, so the threads come up in parallel, about log2 of the count
+    /// deep, each stack mapped by the thread that starts it rather than all by the spawner.
+    /// A task spawned meanwhile waits on a worker that is parked until its thread runs
+    /// (task/idle.rs). A thread the system refuses, or a placement it refuses, stops the
+    /// process naming the worker (rule no-fallback): a pool with a hole in it would hold the
+    /// tasks reserved to that worker forever.
+    pub(crate) fn starter(pool: &Pool) {
+        spawn_worker(pool, 0);
+    }
+
+    /// Starts worker `at`'s thread, if the pool has one so numbered.
+    fn spawn_worker(pool: &Pool, at: u32) {
+        if at >= pool.workers() {
+            return;
         }
-        let running = Running { pool, threads };
-        match failed {
-            None => Ok(running),
-            Some(failed) => {
-                let _ = running.stop(super::POOL_STOP);
-                Err(failed)
-            }
+        // clone: one handle on the pool per thread.
+        let mine = pool.clone();
+        let spawned = thread::Builder::new()
+            // alloc: once per thread, its name.
+            .name(format!("bstd-worker-{at}"))
+            .stack_size(WORKER_STACK)
+            .spawn(move || {
+                spawn_worker(&mine, 2 * at + 1);
+                spawn_worker(&mine, 2 * at + 2);
+                if let Some((cpu, class)) = mine.placement(at)
+                    && let Err(why) = machine::place(cpu, class)
+                {
+                    super::fatal(&StartError { worker: at, why }.to_string());
+                }
+                mine.work(at);
+            });
+        // The handle is dropped: the thread is detached, and a stop waits on the workers'
+        // own count of who left ([`Pool::wait_left`]), not on a join.
+        if let Err(error) = spawned {
+            super::fatal(&StartError { worker: at, why: error.to_string() }.to_string());
         }
     }
 
@@ -256,34 +312,16 @@ pub(crate) mod pool {
             &self.pool
         }
 
-        /// Stops every worker once it finds nothing to run, and joins each that left its loop
-        /// within `within`; the rest are named, with the task each still runs, and left
-        /// detached (the process is ending).
-        pub(crate) fn stop(mut self, within: Duration) -> Result<(), Hung> {
+        /// Stops every worker once it finds nothing to run, and waits until the last has left
+        /// its loop (it wakes this wait) or `within` passes; the rest are named, with the task
+        /// each still runs. A pool whose threads never began stops at once. A program's end
+        /// does not call this: it exits ([`super::exit_now`]).
+        pub(crate) fn stop(self, within: Duration) -> Result<(), Hung> {
             self.pool.stop();
-            let clock = Monotonic::new();
-            let until = Deadline::after(clock.now(), within);
-            let nap = Parker::new();
-            let count = u32::try_from(self.threads.len()).unwrap_or(u32::MAX);
-            while !(0..count).all(|at| self.pool.exited(at)) && !until.passed(clock.now()) {
-                // Nobody unparks it: a timed nap of the one kernel wait (rule 44).
-                let slice = Deadline::after(clock.now(), Duration::from_millis(1));
-                if nap.park("bstd.rt.pool.stop", Some(slice), &clock).is_err() {
-                    break;
-                }
-            }
-            for (at, slot) in self.threads.iter_mut().enumerate() {
-                let at = u32::try_from(at).unwrap_or(u32::MAX);
-                if self.pool.exited(at)
-                    && let Some(handle) = slot.take()
-                {
-                    // A worker's loop does not panic (its tasks' panics are caught): a join
-                    // error is the pool's own bug, reported as the worker's.
-                    if handle.join().is_err() {
-                        panic!("bstd::rt: the pool's worker {at} panicked outside a task");
-                    }
-                }
-            }
+            let until = Deadline::after(self.pool.clock().now(), within);
+            // A wait the kernel refused ends the wait early; what it waited for is then read
+            // as it is: every worker that has not left is named below, so nothing is lost.
+            let _left = self.pool.wait_left(until);
             match self.pool.hung() {
                 None => Ok(()),
                 Some(hung) => Err(hung),
@@ -407,29 +445,19 @@ mod machine {
 
     #[cfg(target_os = "macos")]
     pub(super) mod darwin {
-        use core::ffi::{c_char, c_int, c_void};
-
         /// `QOS_CLASS_USER_INITIATED` (`<sys/qos.h>`): what a foreground worker runs at.
         pub(crate) const QOS_USER_INITIATED: u32 = 0x19;
         /// `QOS_CLASS_UTILITY`: a background worker, which the scheduler keeps to efficiency
         /// cores when the performance cores are busy.
         pub(crate) const QOS_UTILITY: u32 = 0x11;
 
-        unsafe extern "C" {
-            /// `sysctlbyname(3)`.
-            pub(crate) fn sysctlbyname(
-                name: *const c_char,
-                oldp: *mut c_void,
-                oldlenp: *mut usize,
-                newp: *mut c_void,
-                newlen: usize,
-            ) -> c_int;
-            /// `pthread_set_qos_class_self_np` (`<pthread/qos.h>`): Darwin's own call, not
-            /// POSIX (rule 45): it is how a thread says what kind of work it does, which is
-            /// what places it on a performance or an efficiency core; there is no affinity
-            /// call on macOS. Its symbol is tested to exist (rt's tests).
-            pub(crate) fn pthread_set_qos_class_self_np(class: u32, relative: c_int) -> c_int;
-        }
+        /// `sysctlbyname(3)`, and `pthread_set_qos_class_self_np` (`<pthread/qos.h>`):
+        /// Darwin's own call, not POSIX (rule 45): it is how a thread says what kind of work
+        /// it does, which is what places it on a performance or an efficiency core; there is
+        /// no affinity call on macOS. Both are found at their first call through blaze-sys's
+        /// table (`blaze_sys::macos::cold`), not bound at load: a program that starts no
+        /// worker pays for neither. Their symbols are tested to exist there and in rt's tests.
+        pub(crate) use blaze_sys::macos::cold::{pthread_set_qos_class_self_np, sysctlbyname};
     }
 
     /// A sysctl's 32-bit value, by name.
@@ -537,45 +565,36 @@ mod machine {
 
 /// The process's world, or why it cannot be made.
 fn native() -> Result<Io, String> {
-    // alloc: once per process, its command line.
-    let mut args = Vec::new();
-    for (at, arg) in std::env::args_os().enumerate() {
-        match arg.into_string() {
-            Ok(arg) => args.push(arg),
-            Err(arg) => {
-                // alloc: an error's message.
-                let mut why = String::new();
-                let _ = write!(
-                    why,
-                    "bstd::entry: argument {at} of the command line is not UTF-8 ({}): `Args` holds text",
-                    arg.to_string_lossy()
-                );
-                return Err(why);
-            }
-        }
-    }
-    // alloc: once per process, its environment.
-    let env: Vec<(String, String)> = std::env::vars_os()
-        .filter_map(|(name, value)| Some((name.into_string().ok()?, value.into_string().ok()?)))
-        .collect();
-    let root = std::env::current_dir().map_err(|error| {
-        // alloc: an error's message.
-        let mut why = String::new();
-        let _ = write!(why, "bstd::entry: the directory the program was started in: {error}");
-        why
-    })?;
-    let seed = {
-        use std::hash::BuildHasher as _;
-        std::hash::RandomState::new().hash_one(0u8)
-    };
+    let block = process_start()?;
+    open_native(ArgList::process(block), Vars::process(block), start_dir(), u8::MAX)
+}
+
+/// The root of a world over the directory the process was started in: `.`, so the start reads
+/// no directory (std.md, "What a program pays for at start"); a call that needs an absolute
+/// path makes it from this when it is made.
+pub(crate) fn start_dir() -> &'static RootPath {
+    RootPath::new(".")
+}
+
+/// What the process was started with: its command line (each argument UTF-8, or a refusal
+/// naming it) and its environment, borrowed where the kernel left them (`block`).
+pub(crate) fn process_start() -> Result<&'static block::Block, String> {
+    block::read()
+}
+
+/// The native world over `root` with `args` and `env`: the process's, or a run spec's; it may
+/// read `above` folders above `root` (`u8::MAX`: up to the filesystem's root).
+pub(crate) fn open_native(args: ArgList, env: Vars, root: &RootPath, above: u8) -> Result<Io, String> {
     let world = NativeWorld {
-        root: &root,
+        root,
+        above,
         threads: FILE_THREADS,
         env,
         args,
         // alloc: once per process, the host's name (empty: see `run`).
         host_name: Arc::from(""),
-        seed,
+        // Drawn at the first `Io::rng`, not here: the start draws no randomness.
+        seed: None,
         limits: Limits::USUAL,
     };
     // alloc: an error's message.

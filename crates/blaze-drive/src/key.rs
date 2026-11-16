@@ -20,27 +20,43 @@ use crate::condition::{Condition, Space};
 pub enum Kind {
     /// The workspace's crates: their names, editions and roots, from the manifests' content.
     Units = 1,
+    /// The dependency graph the request reaches (unit_graph_task.rs): one a command, walked
+    /// level by level from the roots, each level's sources asked of `Fetch` as it is reached.
+    UnitGraph = 2,
     /// A crate with no text here: its record lists its records by key (a pack's manifest).
-    Fetch = 2,
-    FileItems = 3,
-    ModuleScope = 4,
+    Fetch = 3,
+    FileItems = 4,
+    ModuleScope = 5,
     /// A cycle of module scopes solved as one task; each member's record is its own.
-    Group = 5,
-    Expansion = 6,
-    Signature = 7,
-    ImplBucket = 8,
-    BodyCheck = 9,
-    Code = 10,
+    Group = 6,
+    Expansion = 7,
+    Signature = 8,
+    ImplBucket = 9,
+    BodyCheck = 10,
+    Code = 11,
     /// A test's result, whose read list is the code identities its run entered.
-    Test = 11,
+    Test = 12,
+    /// One crate's scope (drive.md, "SPEC, the NAMES step"): every public path to its item ids,
+    /// as blaze-world's names library makes it. Its source is the crate's identity
+    /// (blaze-world's `UnitInput::key`); it reads its files' `Surface`s, its dependencies'
+    /// `CrateScope`s and the `MacroModule`s of the proc-macro crates it calls.
+    CrateScope = 13,
+    /// One proc-macro crate compiled to wasm (rule 10), keyed by its whole text and the
+    /// toolchain; never compiled inside a `CrateScope` task.
+    MacroModule = 14,
+    /// One file's surface: its items' signatures, `pub` and `use` lines and macro calls, never a
+    /// body. Its source is that digest and its out is its source, so a body edit leaves it, and
+    /// every `CrateScope` reading it, standing.
+    Surface = 15,
 }
 
 /// How many kinds there are: the profile's table size.
-pub const KINDS: usize = 11;
+pub const KINDS: usize = 15;
 
 impl Kind {
     pub const ALL: [Kind; KINDS] = [
         Kind::Units,
+        Kind::UnitGraph,
         Kind::Fetch,
         Kind::FileItems,
         Kind::ModuleScope,
@@ -51,7 +67,27 @@ impl Kind {
         Kind::BodyCheck,
         Kind::Code,
         Kind::Test,
+        Kind::CrateScope,
+        Kind::MacroModule,
+        Kind::Surface,
     ];
+
+    /// The stage of the compiler this kind is, as a person reads it in a note: kinds of one
+    /// stage share the words.
+    pub fn stage(self) -> &'static str {
+        match self {
+            Kind::Units | Kind::UnitGraph => "read the manifests",
+            // Its sources in the store, checked against the lock; not their code read.
+            Kind::Fetch => "fetch the dependencies' sources",
+            Kind::FileItems | Kind::Surface => "parse",
+            Kind::ModuleScope | Kind::Group | Kind::CrateScope => "resolve names",
+            Kind::MacroModule => "compile procedural macros",
+            Kind::Expansion => "expand macros",
+            Kind::Signature | Kind::ImplBucket | Kind::BodyCheck => "check types",
+            Kind::Code => "generate code",
+            Kind::Test => "run tests",
+        }
+    }
 
     pub fn from_u8(byte: u8) -> Option<Kind> {
         Kind::ALL.get(usize::from(byte).checked_sub(1)?).copied()
@@ -65,6 +101,7 @@ impl Kind {
     pub fn name(self) -> &'static str {
         match self {
             Kind::Units => "Units",
+            Kind::UnitGraph => "UnitGraph",
             Kind::Fetch => "Fetch",
             Kind::FileItems => "FileItems",
             Kind::ModuleScope => "ModuleScope",
@@ -75,6 +112,9 @@ impl Kind {
             Kind::BodyCheck => "BodyCheck",
             Kind::Code => "Code",
             Kind::Test => "Test",
+            Kind::CrateScope => "CrateScope",
+            Kind::MacroModule => "MacroModule",
+            Kind::Surface => "Surface",
         }
     }
 }
@@ -91,9 +131,39 @@ impl Name {
         Name { kind, subject }
     }
 
-    /// The name of the workspace's units: there is one.
+    /// The workspace root's units: which manifests are its units (drive.md, "Units"). There is
+    /// one; its source is the root manifest and the checkout's manifest paths.
     pub fn units() -> Name {
         Name { kind: Kind::Units, subject: ContentId::of(UNITS_DOMAIN, b"units") }
+    }
+
+    /// The request's dependency graph: one a command, so its subject is a constant; its source
+    /// is `unit_graph_task::source` (the lock, the layout's reads, the target, the ask).
+    pub fn unit_graph() -> Name {
+        Name { kind: Kind::UnitGraph, subject: ContentId::of(UNITS_DOMAIN, b"unit graph") }
+    }
+
+    /// Whether the name's subject is its source too, known from the name alone: a `Fetch`
+    /// name's subject is its unit's record key (fetch_task.rs). A need of one is located by it.
+    pub fn located_by_subject(self) -> bool {
+        self.kind == Kind::Fetch
+    }
+
+    /// The units of the manifest at `path` (its package): a `Units` name whose subject is the
+    /// manifest file's, so its source is that file's content and its findings land on its lines.
+    pub fn manifest(path: &[u8]) -> Name {
+        Name { kind: Kind::Units, subject: Name::file(path).subject }
+    }
+
+    /// The file a name's text is: a `FileItems` name's own file, a manifest's units' manifest,
+    /// the root units' `Cargo.toml`; `None` for an item (its home's file is its file).
+    pub fn text_file(self) -> Option<Name> {
+        match self.kind {
+            Kind::FileItems => Some(self),
+            Kind::Units if self == Name::units() => Some(Name::file(b"Cargo.toml")),
+            Kind::Units => Some(Name { kind: Kind::FileItems, subject: self.subject }),
+            _ => None,
+        }
     }
 
     /// The `FileItems` name of the file at `path`, relative to the checkout.

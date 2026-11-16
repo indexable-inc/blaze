@@ -1604,15 +1604,20 @@ enum ToStamp {
 struct List {
     tag: Tag,
     root: Arc<Path>,
-    dir: FileName,
+    dir: crate::DirName,
     sender: crate::chan::Sender<Completion>,
     wake: Arc<Wake>,
 }
 
 impl List {
     fn run(self) {
-        let done = match crate::fs::entries(&self.root.join(self.dir.as_str()), &self.dir) {
-            Ok(entries) => Done::Entries(entries),
+        // alloc: the directory's path, once per listing.
+        let path = match self.dir.name() {
+            Some(name) => self.root.join(name.as_str()),
+            None => self.root.to_path_buf(),
+        };
+        let done = match crate::fs::entries(&path, &self.dir) {
+            Ok(entries) => Done::Entries(Box::new(entries)),
             // alloc: the error of a listing that failed.
             Err(error) => Done::Failed(IoError(error.to_string())),
         };
@@ -1814,6 +1819,8 @@ fn wake_ring(wake: &Wake) {
 
 pub struct Uring {
     start: Instant,
+    /// The machine's boot, read once as the driver is made ([`crate::Driver::boot`]).
+    boot: Result<crate::Boot, crate::NoBoot>,
     /// Shared with the work done off the ring, so handing it out is a count, not a copy.
     root: Arc<Path>,
     ring: Ring,
@@ -1956,6 +1963,7 @@ impl Uring {
         let spawn_dirs = root.join(".blaze-spawn"); // alloc: setup, once per driver.
         Ok(Uring {
             start: Instant::now(),
+            boot: crate::boot::system(),
             root,
             ring,
             table,
@@ -2339,7 +2347,7 @@ impl Uring {
     }
 
     /// Starts the listing of [`Effect::Entries`] `tag` of `dir` on a stamper.
-    fn list(&mut self, tag: Tag, dir: FileName) -> io::Result<()> {
+    fn list(&mut self, tag: Tag, dir: crate::DirName) -> io::Result<()> {
         self.make_stampers()?;
         let list = List {
             tag,
@@ -2826,6 +2834,8 @@ impl Driver for Uring {
                 // A directory's `fsync`, waited for on a thread of its own as a list is.
                 names @ Effect::SyncDir { .. } => self.off_ring(names).map(|()| None),
                 list @ Effect::List { .. } => self.off_ring(list).map(|()| None),
+                // The folders above the root: rare reads, on a thread of their own as a list.
+                above @ (Effect::Ancestors { .. } | Effect::Above { .. }) => self.off_ring(above).map(|()| None),
                 private @ Effect::Private { .. } => self.off_ring(private).map(|()| None),
                 Effect::WriteAt { file, at, bytes, .. } => {
                     self.write_at(tag, &file, at, bytes).map(|()| None)
@@ -2860,6 +2870,10 @@ impl Driver for Uring {
                 effect @ (Effect::MakeDir { .. } | Effect::RemoveDir { .. }) => {
                     crate::threads::run(&self.root, &self.descriptors, effect).map(Some)
                 }
+                // An open, a cut and an `mmap` here, as a directory is made: no ring op maps.
+                effect @ Effect::MapWrite { .. } => {
+                    crate::threads::run(&self.root, &self.descriptors, effect).map(Some)
+                }
                 // No io_uring op takes a lock, and `flock` without waiting is one call: here on
                 // the driver's thread, as a mode is set.
                 Effect::Lock { file, mode, .. } => {
@@ -2879,7 +2893,9 @@ impl Driver for Uring {
                 Effect::Stamp { files, .. } if files.is_empty() => {
                     Ok(Some(Done::Stamped(Vec::new())))
                 }
-                Effect::Stamp { files, .. } => self.sweep(tag, files).map(|()| None),
+                Effect::Stamp { files, .. } => {
+                    crate::journal::stamp_rows(&files).and_then(|()| self.sweep(tag, files)).map(|()| None)
+                }
                 Effect::Entries { dir, .. } => self.list(tag, dir).map(|()| None),
                 Effect::Flush { watch, .. } => self.flush(watch, tag).map(|()| None),
                 Effect::Unwatch { .. }
@@ -2893,7 +2909,8 @@ impl Driver for Uring {
                 | Effect::ReadStdin { .. }
                 | Effect::WriteOut { .. }
                 | Effect::Now { .. }
-                | Effect::Random { .. } => unreachable!("taken above"),
+                | Effect::Random { .. }
+                | Effect::Roots { .. } => unreachable!("taken above"),
                 // Of a file kept for appending, through its descriptor, after what was asked
                 // of it before; of any other, the file at its name now, opened for the read
                 // alone. Its buffer is the file's size, once it is open (a missing file's,
@@ -3113,6 +3130,10 @@ impl Driver for Uring {
 
     fn wall_ns(&self) -> u64 {
         crate::system_wall_ns()
+    }
+
+    fn boot(&self) -> Result<crate::Boot, crate::NoBoot> {
+        self.boot.clone()
     }
 
     fn waker(&self) -> Option<crate::Waker> {
@@ -4309,7 +4330,7 @@ mod tests {
         for round in 0..3 {
             let mut effects = Vec::with_capacity(1);
             effects.push(Effect::Entries {
-                dir: FileName::new("src/d0").unwrap(),
+                dir: FileName::new("src/d0").unwrap().into(),
                 tag: Tag(10 + round),
             });
             blaze_alloc_count::assert_at_most(1, "submitting a listing", || {
@@ -4338,7 +4359,7 @@ mod tests {
             assert!(reversed.push_str(names.get(at)));
         }
         let reference = crate::fs::stamps(&root, &names).unwrap();
-        let src = FileName::new("src").unwrap();
+        let src: crate::DirName = FileName::new("src").unwrap().into();
         let entries = crate::fs::entries(&root.join("src"), &src).unwrap();
         let mut driver = Uring::new(&root).unwrap();
         let mut effects = vec![
@@ -4352,7 +4373,7 @@ mod tests {
             Effect::Stamp { files: Arc::default(), tag: Tag(4) },
             Effect::Timer { after: Duration::from_millis(1), tag: Tag(5) },
             Effect::Entries { dir: src, tag: Tag(6) },
-            Effect::Entries { dir: FileName::new("src/missing").unwrap(), tag: Tag(7) },
+            Effect::Entries { dir: FileName::new("src/missing").unwrap().into(), tag: Tag(7) },
         ];
         driver.submit(&mut effects);
         assert_eq!(driver.in_flight(), 7);
@@ -4368,7 +4389,7 @@ mod tests {
         assert_eq!(seen[&2], Done::Appended);
         assert_eq!(seen[&4], Done::Stamped(Vec::new()));
         assert_eq!(seen[&5], Done::Fired);
-        assert_eq!(seen[&6], Done::Entries(entries));
+        assert_eq!(seen[&6], Done::Entries(Box::new(entries)));
         assert!(matches!(&seen[&7], Done::Failed(_)), "{:?}", seen[&7]);
         assert_eq!(driver.in_flight(), 0);
         drop(driver);

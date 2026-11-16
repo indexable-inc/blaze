@@ -21,10 +21,10 @@ use crate::Plant;
 use crate::answers::{read_last, read_page, read_root};
 use crate::condition::{Condition, Space, Var};
 use crate::key::{self, Key, Kind, Name, Tool};
-use crate::record::{Finding, Locate, Part};
+use crate::record::{Finding, Locate, Part, PathOf};
 use crate::request::{
     Answer, Ask, BatchId, Builder, Command, Config, DriveError, Effect, Event, FileEntry, Gate, Outcome, Output, Ran,
-    Request, Task, Ticket, Verdict, Want,
+    Request, Task, TaskFailure, Ticket, Verdict, Want, Why,
 };
 use crate::settled::Settled;
 use crate::worker::{self, InPlace};
@@ -43,21 +43,147 @@ struct Item {
     cfg: StdVec<Var>,
 }
 
+/// A workspace member: its manifest's text is its version; it lists the files it holds.
+#[derive(Clone, Debug)]
+struct Member {
+    version: u64,
+    files: StdVec<usize>,
+}
+
+fn member_path(member: usize) -> StdVec<u8> {
+    format!("m{member}/Cargo.toml").into_bytes()
+}
+
+/// The units' source, as the cli hands it: every manifest's path and content (what the layout
+/// read), so an edit of any manifest re-reads the root units.
+fn units_source(files: &[FileEntry<'_>]) -> ContentId {
+    let mut text = StdVec::new();
+    for file in files.iter().filter(|f| f.manifest) {
+        text.extend_from_slice(file.path);
+        text.extend_from_slice(&file.id.0);
+    }
+    key::digest("sim units source", &text)
+}
+
+fn member_id(member: &Member) -> ContentId {
+    key::digest("sim member manifest", &member.version.to_le_bytes())
+}
+
 #[derive(Clone, Debug)]
 struct World {
     files: StdVec<StdVec<Item>>,
     /// A crate with no text: a part of the units found only by this record key.
     dep: Option<Key>,
+    /// A workspace: the root manifest lists these members, each a manifest of its own that
+    /// lists its files and holds one finding on its own lines. Empty: the root is the package.
+    members: StdVec<Member>,
     /// Item and file names to their places, so the harness's own lookups are not a scan (the
     /// linearity test steps 100,000 jobs). Names do not depend on the text, so an edit keeps it.
     items: BTreeMap<Name, (usize, usize)>,
     file_subjects: BTreeMap<ContentId, usize>,
+    /// A lock, read this command: `Start` hands its `UnitGraph` job's source.
+    lock: Option<Lock>,
     /// The cfg space's value count per variable (empty: one configuration).
     values: StdVec<u16>,
     /// Every body is a finding whose message is its out digest: the conditions oracle compares
     /// every body's value, not only the quarter that are findings.
     find_all: bool,
     plant: Plant,
+    /// The names step's crates (empty: no `CrateScope` tasks), and the proc-macro crates they
+    /// call, each by its text.
+    crates: StdVec<SimCrate>,
+    macros: StdVec<u64>,
+    /// The module store holds none of the macro crates' modules: each `MacroModule` fails with
+    /// its one finding, as the cli's lookup does (macros.rs).
+    modules_absent: bool,
+    /// A file whose `FileItems` task fails (a planted panic, an oversize file): its surface,
+    /// and each crate reading it, fail `Waited`; the request goes on.
+    failing_file: Option<usize>,
+}
+
+/// A crate of the names step: its identity (what blaze-world's `UnitInput::key` hashes), the
+/// files it holds, its direct dependencies (earlier crates), which of them it glob re-exports
+/// (its scope then holds theirs), the proc-macro crates it calls, and whether the names library
+/// refuses it.
+#[derive(Clone, Debug)]
+struct SimCrate {
+    identity: u64,
+    files: StdVec<usize>,
+    deps: StdVec<usize>,
+    globs: StdVec<usize>,
+    macros: StdVec<usize>,
+    fails: bool,
+}
+
+fn crate_scope_name(c: usize) -> Name {
+    Name::new(Kind::CrateScope, key::digest("sim crate", format!("{c}").as_bytes()))
+}
+
+fn macro_name(m: usize) -> Name {
+    Name::new(Kind::MacroModule, key::digest("sim macro crate", format!("{m}").as_bytes()))
+}
+
+fn surface_name(f: usize) -> Name {
+    Name::new(Kind::Surface, file_name(f).subject)
+}
+
+/// A file's surface: its items' signatures and what they use, never a body.
+fn surface_source(items: &[Item]) -> ContentId {
+    let sigs: StdVec<ContentId> = items.iter().map(sig_source).collect();
+    key::digest("sim surface", format!("{sigs:?}").as_bytes())
+}
+
+/// A crate's identity, as the world's key: its text's identity and its dependencies' and
+/// macro crates' identities, never their surfaces.
+fn crate_source(world: &World, c: usize) -> ContentId {
+    let krate = &world.crates[c];
+    let deps: StdVec<u64> = krate.deps.iter().map(|d| world.crates[*d].identity).collect();
+    let macros: StdVec<u64> = krate.macros.iter().map(|m| world.macros[*m]).collect();
+    key::digest("sim crate identity", format!("{} {deps:?} {macros:?}", krate.identity).as_bytes())
+}
+
+/// Up to four crates over the world's files, each depending on earlier ones, some calling one
+/// of two proc-macro crates; `fails` none.
+fn draw_crates(tape: &Tape, world: &mut World) {
+    let n = 1 + tape.index(4, "crates");
+    world.macros = (0..1 + tape.index(2, "macro crates")).map(|m| 7_000 + m as u64).collect();
+    for c in 0..n {
+        let files = (0..world.files.len()).filter(|f| f % n == c).collect();
+        let deps: StdVec<usize> = (0..c).filter(|_| tape.one_in(2, "dep")).collect();
+        let globs = deps.iter().copied().filter(|_| tape.one_in(3, "glob")).collect();
+        let macros = (0..world.macros.len()).filter(|_| tape.one_in(2, "calls macro")).collect();
+        world.crates.push(SimCrate { identity: 5_000 + c as u64, files, deps, globs, macros, fails: false });
+    }
+}
+
+/// The `CrateScope` task: its files' surfaces, its dependencies' scopes and its macro crates'
+/// modules read; one of them failed this command fails it with `Waited`. Its out holds its own
+/// surface and the scopes it glob re-exports, so a dependent's out moves only through a glob.
+fn crate_scope(world: &World, task: &Task<'static>) -> Result<Answered, Broke> {
+    let name = task.name;
+    let c = (0..world.crates.len()).find(|c| crate_scope_name(*c) == name).ok_or(Broke::Harness(format!("no crate for {name}")))?;
+    if task.source != crate_source(world, c) {
+        return Err(Broke::Oracle(format!("{name} ran with a source that is not its crate's identity")));
+    }
+    let krate = &world.crates[c];
+    if krate.fails {
+        return Ok(Answered::Failed(TaskFailure { name, why: Why::Refused { what: "the names library refused the crate", rule: "sim" } }));
+    }
+    let mut wanted: StdVec<(Name, Name)> = krate.files.iter().map(|f| (surface_name(*f), file_name(*f))).collect();
+    wanted.extend(krate.deps.iter().map(|d| (crate_scope_name(*d), Name::units())));
+    wanted.extend(krate.macros.iter().map(|m| (macro_name(*m), Name::units())));
+    if let Some((on, _)) = wanted.iter().find(|(n, _)| task.failed.contains(n)) {
+        return Ok(Answered::Failed(TaskFailure { name, why: Why::Waited { on: *on } }));
+    }
+    match reads_of(task, &wanted) {
+        Err(lacking) => Ok(Answered::Need(lacking)),
+        Ok(reads) => {
+            let own: StdVec<ContentId> = krate.files.iter().filter_map(|f| input_out(task, surface_name(*f))).collect();
+            let globbed: StdVec<ContentId> = krate.globs.iter().filter_map(|d| input_out(task, crate_scope_name(*d))).collect();
+            let out = key::digest("sim crate scope out", format!("{c} {own:?} {globbed:?}").as_bytes());
+            Ok(Answered::Done(Made { name, out, reads, parts: StdVec::new(), findings: StdVec::new(), paths: StdVec::new() }))
+        }
+    }
 }
 
 fn path(file: usize) -> StdVec<u8> {
@@ -78,6 +204,63 @@ fn body_name(file: usize, item: usize) -> Name {
 
 fn dep_name() -> Name {
     Name::new(Kind::Fetch, key::digest("sim dep", b"dep"))
+}
+
+/// A toy `Cargo.lock` and what the members name of it: each entry lists the entries it depends
+/// on, which are known only once its own record (its manifest) is read, as a real one's are.
+#[derive(Clone, Debug)]
+struct Lock {
+    entries: StdVec<StdVec<usize>>,
+    /// The entries the workspace's members depend on: the graph's roots.
+    roots: StdVec<usize>,
+    /// Entries whose `Fetch` fails this command (the network's fault: no record kept).
+    failing: StdVec<usize>,
+}
+
+/// The `Fetch` name of lock entry `at`: its subject is its record key.
+fn entry_name(at: usize) -> Name {
+    Name::new(Kind::Fetch, key::digest("sim lock entry", format!("{at}").as_bytes()))
+}
+
+/// The `UnitGraph` job's source: the lock and the roots, as `unit_graph_task::source` digests
+/// the lock and the layout's reads.
+fn graph_source(lock: &Lock) -> ContentId {
+    key::digest("sim unit graph source", format!("{:?} {:?}", lock.entries, lock.roots).as_bytes())
+}
+
+/// The `UnitGraph` task: the reach from the roots, each entry's dependencies known once its
+/// `Fetch` record is an input; the entries reached and not yet handed are asked for, level by
+/// level, unless their `Fetch` failed this command (`Task::failed`), which leaves no graph.
+fn unit_graph(lock: &Lock, task: &Task<'static>) -> Answered {
+    let mut seen: BTreeSet<usize> = lock.roots.iter().copied().collect();
+    let mut frontier: StdVec<usize> = lock.roots.clone();
+    let mut reads = StdVec::new();
+    let mut wants = StdVec::new();
+    let mut failed = 0;
+    while let Some(at) = frontier.pop() {
+        let name = entry_name(at);
+        match input_out(task, name) {
+            Some(out) => {
+                reads.push((name, out));
+                for dep in &lock.entries[at] {
+                    if seen.insert(*dep) {
+                        frontier.push(*dep);
+                    }
+                }
+            }
+            None if task.failed.contains(&name) => failed += 1,
+            None => wants.push(Want { name, home: name }),
+        }
+    }
+    if !wants.is_empty() {
+        return Answered::Need(wants);
+    }
+    if failed > 0 {
+        return Answered::Failed(TaskFailure { name: task.name, why: Why::Refused { what: "sources not fetched", rule: "sim" } });
+    }
+    reads.sort();
+    let out = key::digest("sim unit graph out", format!("{reads:?}").as_bytes());
+    Answered::Done(Made { name: task.name, out, reads, parts: StdVec::new(), findings: StdVec::new(), paths: StdVec::new() })
 }
 
 fn sig_source(item: &Item) -> ContentId {
@@ -122,7 +305,26 @@ impl World {
                 items.insert(body_name(f, i), (f, i));
             }
         }
-        World { files, dep: None, items, file_subjects, values: StdVec::new(), find_all: false, plant: Plant::None }
+        World {
+            files,
+            dep: None,
+            members: StdVec::new(),
+            items,
+            file_subjects,
+            lock: None,
+            values: StdVec::new(),
+            find_all: false,
+            plant: Plant::None,
+            crates: StdVec::new(),
+            macros: StdVec::new(),
+            modules_absent: false,
+            failing_file: None,
+        }
+    }
+
+    /// The member whose manifest's units `name` is.
+    fn member_of(&self, name: Name) -> Option<usize> {
+        (0..self.members.len()).find(|k| Name::manifest(&member_path(*k)) == name)
     }
 
     fn bytes(&self, file: usize) -> StdVec<u8> {
@@ -173,12 +375,21 @@ struct Made {
     reads: StdVec<(Name, ContentId)>,
     parts: StdVec<Part>,
     findings: StdVec<(u16, u32, u32, StdVec<u8>)>,
+    /// Where each file part's file is (a units record's), for a request that opens them.
+    paths: StdVec<(Name, StdVec<u8>)>,
+}
+
+/// The paths of the file parts among `parts`: the sim's files are crate roots, never a `mod` slot.
+fn paths_of(world: &World, parts: &[Part]) -> StdVec<(Name, StdVec<u8>)> {
+    let files = parts.iter().filter(|part| part.name.kind == Kind::FileItems);
+    files.filter_map(|part| Some((part.name, path(world.file_of(&part.name.subject)?)))).collect()
 }
 
 enum Answered {
     Done(Made),
     Need(StdVec<Want>),
     Cfg(Var),
+    Failed(TaskFailure),
 }
 
 fn input_out(task: &Task<'static>, name: Name) -> Option<ContentId> {
@@ -219,30 +430,83 @@ fn finding(world: &World, kind: Kind, out: &ContentId) -> Option<StdVec<u8>> {
 
 fn execute(world: &World, task: &Task<'static>) -> Result<Answered, Broke> {
     let name = task.name;
-    let done = |out, reads, parts, findings| Ok(Answered::Done(Made { name, out, reads, parts, findings }));
+    let done = |out, reads, parts: StdVec<Part>, findings| {
+        let paths = paths_of(world, &parts);
+        Ok(Answered::Done(Made { name, out, reads, parts, findings, paths }))
+    };
     match name.kind {
+        Kind::Units if !world.members.is_empty() && name != Name::units() => {
+            // A member's manifest: its files, and one finding on its own lines.
+            let k = world.member_of(name).ok_or(Broke::Harness(format!("no member for {name}")))?;
+            let member = &world.members[k];
+            if task.source != key::file_source(member_id(member), 0) {
+                return Err(Broke::Oracle(format!("{name} ran with a source that is not its manifest's")));
+            }
+            let mut parts: StdVec<Part> =
+                member.files.iter().map(|f| Part { name: file_name(*f), locate: Locate::File { edition: EDITION }, place: file_place(*f) }).collect();
+            parts.sort_by_key(|part| part.name);
+            let out = key::digest("sim member out", format!("{k} {}", member.version).as_bytes());
+            let line = u32::try_from(k).unwrap_or(u32::MAX);
+            let findings = std::vec![(2, line, line + 1, format!("member {k} version {}", member.version).into_bytes())];
+            done(out, StdVec::new(), parts, findings)
+        }
         Kind::Units => {
             let mut parts = StdVec::new();
-            for f in 0..world.files.len() {
-                parts.push(Part { name: file_name(f), locate: Locate::File { edition: 0 }, place: 0 });
+            if world.members.is_empty() {
+                for f in 0..world.files.len() {
+                    parts.push(Part { name: file_name(f), locate: Locate::File { edition: EDITION }, place: file_place(f) });
+                }
+            } else {
+                // A workspace root: each member is its manifest's units.
+                for k in 0..world.members.len() {
+                    parts.push(Part { name: Name::manifest(&member_path(k)), locate: Locate::File { edition: 0 }, place: 0 });
+                }
             }
             if let Some(dep) = world.dep {
                 parts.push(Part { name: dep_name(), locate: Locate::Key(dep), place: 0 });
+            }
+            // The names step: one `CrateScope` per crate by its identity, one `MacroModule` per
+            // proc-macro crate by its text (the unit graph's, in the cli).
+            for c in 0..world.crates.len() {
+                parts.push(Part { name: crate_scope_name(c), locate: Locate::Source(crate_source(world, c)), place: 0 });
+            }
+            for (m, text) in world.macros.iter().enumerate() {
+                let source = key::digest("sim macro text", &text.to_le_bytes());
+                parts.push(Part { name: macro_name(m), locate: Locate::Source(source), place: 0 });
+            }
+            if !world.crates.is_empty() {
+                parts.sort_by_key(|part| part.name);
             }
             let out = key::digest("sim units out", format!("{}", world.files.len()).as_bytes());
             done(out, StdVec::new(), parts, StdVec::new())
         }
         Kind::FileItems => {
             let f = world.file_of(&task.base.subject).ok_or(Broke::Harness(format!("no file for {name}")))?;
+            // A file is read in the edition its home's part named, on every path to it (a
+            // repeat whose home stood finds it in the file's row).
+            if task.edition != EDITION || task.source != key::file_source(world.id(f), EDITION) {
+                return Err(Broke::Oracle(format!("{name} ran in edition {}, not its part's {EDITION}", task.edition)));
+            }
+            if world.failing_file == Some(f) {
+                return Ok(Answered::Failed(TaskFailure { name, why: Why::Panicked { used: 0, limit: 0 } }));
+            }
             let mut parts = StdVec::new();
             for (i, item) in world.files[f].iter().enumerate() {
                 let place = u32::try_from(i).unwrap_or(u32::MAX);
                 parts.push(Part { name: sig_name(f, i), locate: Locate::Source(sig_source(item)), place });
                 parts.push(Part { name: body_name(f, i), locate: Locate::Source(body_source(item)), place });
             }
+            if !world.crates.is_empty() {
+                parts.push(Part { name: surface_name(f), locate: Locate::Source(surface_source(&world.files[f])), place: 0 });
+            }
             parts.sort_by_key(|part| part.name);
             let out = key::digest("sim file out", format!("{:?}", parts).as_bytes());
-            done(out, StdVec::new(), parts, StdVec::new())
+            // A file of an even count of items has a finding on its own text, at 1..2.
+            let findings = match world.files[f].len() % 2 {
+                0 => std::vec![(1, 1, 2, format!("file {f}").into_bytes())],
+                _ => StdVec::new(),
+            };
+            done(out, StdVec::new(), parts, findings)
         }
         Kind::Signature | Kind::BodyCheck => {
             let (f, i) = world.item_of(task.base).ok_or(Broke::Harness(format!("no item for {name}")))?;
@@ -268,6 +532,9 @@ fn execute(world: &World, task: &Task<'static>) -> Result<Answered, Broke> {
             if source != task.source {
                 return Err(Broke::Oracle(format!("{name} ran with a source that is not its text's")));
             }
+            if let Some((on, _)) = wanted.iter().find(|(n, _)| task.failed.contains(n)) {
+                return Ok(Answered::Failed(TaskFailure { name, why: Why::Waited { on: *on } }));
+            }
             match reads_of(task, &wanted) {
                 Err(lacking) => Ok(Answered::Need(lacking)),
                 Ok(reads) => {
@@ -280,6 +547,38 @@ fn execute(world: &World, task: &Task<'static>) -> Result<Answered, Broke> {
                 }
             }
         }
+        Kind::UnitGraph => {
+            let lock = world.lock.as_ref().ok_or(Broke::Harness(format!("{name} ran with no lock")))?;
+            if task.source != graph_source(lock) {
+                return Err(Broke::Oracle(format!("{name} ran with a source that is not its lock's")));
+            }
+            Ok(unit_graph(lock, task))
+        }
+        Kind::Fetch if world.lock.is_some() => {
+            let lock = world.lock.as_ref().ok_or(Broke::Harness(format!("{name} ran with no lock")))?;
+            let at = (0..lock.entries.len()).find(|at| entry_name(*at) == name).ok_or(Broke::Oracle(format!("{name} is no lock entry")))?;
+            if task.source != name.subject {
+                return Err(Broke::Oracle(format!("{name} ran with a source that is not its subject")));
+            }
+            match lock.failing.contains(&at) {
+                true => Ok(Answered::Failed(TaskFailure { name, why: Why::Refused { what: "the network", rule: "sim" } })),
+                false => done(name.subject, StdVec::new(), StdVec::new(), StdVec::new()),
+            }
+        }
+        Kind::CrateScope => crate_scope(world, task),
+        // A file's surface and a compiled module: the out is the source (the module store's
+        // lookup, in the cli).
+        Kind::Surface => {
+            let f = world.file_of(&name.subject).ok_or(Broke::Harness(format!("no file for {name}")))?;
+            if task.source != surface_source(&world.files[f]) {
+                return Err(Broke::Oracle(format!("{name} ran with a source that is not its file's surface")));
+            }
+            done(task.source, StdVec::new(), StdVec::new(), StdVec::new())
+        }
+        Kind::MacroModule => match world.modules_absent {
+            true => Ok(Answered::Failed(TaskFailure { name, why: Why::Refused { what: "a proc-macro module the store lacks", rule: "sim" } })),
+            false => done(task.source, StdVec::new(), StdVec::new(), StdVec::new()),
+        },
         kind => Err(Broke::Harness(format!("the sim has no {} task", kind.name()))),
     }
 }
@@ -308,15 +607,22 @@ struct Setup {
     workers: u32,
     ask: Ask<'static>,
     plant: Plant,
+    /// The tool's identity (the binary's build id in blaze-cli).
+    tool: &'static [u8],
+    /// A first request hands only the manifests and opens each file where a units record says,
+    /// as blaze-cli's cold run does; otherwise every file is handed at `Start`.
+    opens: bool,
 }
+
+const SIM_TOOL: &[u8] = b"tool";
 
 /// Every finding is an error in the sim: `run` fails on lints too.
 fn every_rule(_: u16) -> bool {
     true
 }
 
-fn config(workers: u32) -> Config {
-    Config { tool: Tool(key::digest("sim tool", b"tool")), workers, most_entries: 32, most_jobs: 1 << 20, is_error: every_rule }
+fn config(workers: u32, tool: &[u8]) -> Config {
+    Config { tool: Tool(key::digest("sim tool", tool)), workers, most_entries: 32, most_jobs: 1 << 20, is_error: every_rule }
 }
 
 const ASK: Ask<'static> = Ask { command: Command::Check, args: b"", gate: Gate::Beside, space: Space::NONE };
@@ -327,7 +633,7 @@ fn workers(tape: &Tape) -> u32 {
 }
 
 fn setup(tape: &Tape, plant: Plant) -> Setup {
-    Setup { workers: workers(tape), ask: ASK, plant }
+    Setup { workers: workers(tape), ask: ASK, plant, tool: SIM_TOOL, opens: tape.one_in(2, "open the files") }
 }
 
 /// The most events one request takes in the sim (rule 18): a toy build is far below it.
@@ -388,7 +694,13 @@ fn request_with(
 ) -> Result<Ended, Broke> {
     let ids: StdVec<ContentId> = (0..world.files.len()).map(|f| world.id(f)).collect();
     let paths: StdVec<StdVec<u8>> = (0..world.files.len()).map(path).collect();
-    let mut files: StdVec<FileEntry<'_>> = (0..world.files.len())
+    // An opening first request knows no file: each is opened where a units record says. Later
+    // ones are handed every file, as the cli's leaf table holds every file the answer read.
+    let handed = match setup.opens && last.is_none() {
+        true => 0,
+        false => world.files.len(),
+    };
+    let mut files: StdVec<FileEntry<'_>> = (0..handed)
         .map(|f| FileEntry {
             path: &paths[f],
             id: ids[f],
@@ -397,10 +709,23 @@ fn request_with(
         })
         .collect();
     let manifest = b"Cargo.toml".to_vec();
-    files.push(FileEntry { path: &manifest, id: key::digest("sim manifest", b"[package]"), changed: false, manifest: true });
+    let root_text: &[u8] = if world.members.is_empty() { b"[package]" } else { b"[workspace]" };
+    files.push(FileEntry { path: &manifest, id: key::digest("sim manifest", root_text), changed: false, manifest: true });
+    let member_paths: StdVec<StdVec<u8>> = (0..world.members.len()).map(member_path).collect();
+    for (k, member) in world.members.iter().enumerate() {
+        let id = member_id(member);
+        let changed = before.is_none_or(|old| old.members.get(k).is_none_or(|was| member_id(was) != id));
+        files.push(FileEntry { path: &member_paths[k], id, changed, manifest: true });
+    }
     files.sort_by(|a, b| a.path.cmp(b.path));
+    // The lock and the members' dependency lines are the layout's reads too (blaze-cli reads
+    // the lock with it): a change to either moves the units' source, as an edit there does.
+    let units = match &world.lock {
+        None => units_source(&files),
+        Some(lock) => key::digest("sim units and lock", &[units_source(&files).0, graph_source(lock).0].concat()),
+    };
 
-    let mut req = Request::planted_in(config(setup.workers), setup.ask, setup.plant, Alloc::global());
+    let mut req = Request::planted_in(config(setup.workers, setup.tool), setup.ask, setup.plant, Alloc::global());
     let table: Settled<Global> = Settled::new_in(1 << 12, Global);
     let mut out: Vec<Effect<'static>, Alloc<'static>> = Vec::new_in(Alloc::global());
     let mut ended = Ended {
@@ -419,22 +744,36 @@ fn request_with(
     // Puts are written later, in an order the tape picks, as a store's writes complete; a
     // `Publish` completes every put before it first (the effect's contract).
     let mut puts: StdVec<(Key, StdVec<u8>)> = StdVec::new();
+    // Files the machine asked to open, answered in an order the tape picks.
+    let mut opens: StdVec<Name> = StdVec::new();
     // The program, once started: it wants a body now and then, and exits when the tape says.
     let mut running = false;
     let bodies: StdVec<Name> =
         (0..world.files.len()).flat_map(|f| (0..world.files[f].len()).map(move |i| body_name(f, i))).collect();
-    let mut first = Some(Event::Start { files: &files, gone: &[], last });
+    let graph = world.lock.as_ref().map(graph_source);
+    let mut first = Some(Event::Start { files: &files, gone: &[], last, units, cold: false, graph });
+    // The program's exit has been stepped: a stopped program's exit is an event too, not a
+    // flag the harness sets when it sees `Stop`.
+    let mut exited = false;
     for _ in 0..MOST_EVENTS {
         let stepped = match first.take() {
-            Some(event) => req.step(event, &mut out),
+            Some(event) => {
+                exited |= matches!(event, Event::Exited { .. });
+                req.step(event, &mut out)
+            }
             None => {
                 let program = usize::from(running) * 2;
-                let total = gets.len() + batches.len() + puts.len() + program;
+                let total = gets.len() + batches.len() + puts.len() + opens.len() + program;
                 if total == 0 {
                     return Err(Broke::Oracle(String::from("the request stalled: nothing out and no answer")));
                 }
                 let pick = tape.index(total, "which completes");
-                if pick < gets.len() {
+                let opened = gets.len() + puts.len() + batches.len();
+                if (opened..opened + opens.len()).contains(&pick) {
+                    let name: Name = opens.swap_remove(pick - opened);
+                    let f = world.file_of(&name.subject).ok_or(Broke::Oracle(format!("{name} was opened, and it is no file")))?;
+                    req.step(Event::Opened { name, id: Some(world.id(f)) }, &mut out)
+                } else if pick < gets.len() {
                     let key = gets.swap_remove(pick);
                     store.reads += 1;
                     // A get sees the store's writes in flight too: one process, one store.
@@ -448,7 +787,7 @@ fn request_with(
                     let (id, tasks) = batches.swap_remove(pick - gets.len() - puts.len());
                     let (answered, resolved) = work(world, store, &table, tasks)?;
                     ended.in_place += resolved;
-                    let mut held: StdVec<(StdVec<Finding<'_>>, &Made)> = StdVec::new();
+                    let mut held: StdVec<(StdVec<Finding<'_>>, StdVec<PathOf<'_>>, &Made)> = StdVec::new();
                     for (_, answer, _) in &answered {
                         if let Answered::Done(made) = answer {
                             let findings = made
@@ -456,16 +795,18 @@ fn request_with(
                                 .iter()
                                 .map(|(rule, start, end, message)| Finding { rule: *rule, start: *start, end: *end, message })
                                 .collect();
-                            held.push((findings, made));
+                            let paths = made.paths.iter().map(|(name, path)| PathOf { name: *name, path, module: false }).collect();
+                            held.push((findings, paths, made));
                         }
                     }
                     let outputs: StdVec<Output<'_>> = held
                         .iter()
-                        .map(|(findings, made)| Output {
+                        .map(|(findings, paths, made)| Output {
                             name: made.name,
                             out: made.out,
                             reads: &made.reads,
                             parts: &made.parts,
+                            paths,
                             findings,
                             payload: b"",
                         })
@@ -477,6 +818,7 @@ fn request_with(
                         let ran = match answer {
                             Answered::Need(wants) => Ran::Need(wants),
                             Answered::Cfg(var) => Ran::Cfg(*var),
+                            Answered::Failed(failure) => Ran::Failed(*failure),
                             Answered::Done(_) => {
                                 at += 1;
                                 Ran::Done(&outputs[at - 1..at])
@@ -487,6 +829,7 @@ fn request_with(
                     req.step(Event::Ran { batch: id, results: &results }, &mut out)
                 } else if tape.one_in(2, "the program exits") {
                     running = false;
+                    exited = true;
                     req.step(Event::Exited { ok: true }, &mut out)
                 } else {
                     let name = bodies[tape.index(bodies.len(), "the program wants")];
@@ -548,9 +891,19 @@ fn request_with(
                 }
                 Effect::WriteLast { bytes } => ended.last = Some(bytes.as_slice().to_vec()),
                 Effect::Done(answer) => ended.answer = Some(answer),
+                // Every file is handed at `Start` here, so nothing is opened.
+                Effect::Open { name, path: at, module } => {
+                    oracle(handed == 0, || format!("{name} was opened, and every file was handed"))?;
+                    let f = world.file_of(&name.subject).ok_or(Broke::Oracle(format!("{name} was opened, and it is no file")))?;
+                    oracle(at.as_slice() == path(f).as_slice() && !module, || format!("{name} was opened at another path"))?;
+                    opens.push(name);
+                }
             }
         }
         if let Some(answer) = ended.answer {
+            // The answer is the last thing the machine says: a program it started has exited
+            // first, or its exit would step an answered machine.
+            oracle(!ended.started || exited, || String::from("answered while the program it started is running"))?;
             // Under `Reached` the program's exit is the verdict: work still out is abandoned.
             let abandons = setup.ask.gate == Gate::Reached && setup.ask.command != Command::Check;
             let unfinished = !gets.is_empty() || !batches.is_empty() || (!answer.profile.certified && ended.last.is_none());
@@ -648,7 +1001,19 @@ fn same_as_fresh(tape: &Tape, world: &World, store: &Store, ended: &Ended) -> Re
             .collect();
         format!("the answer table differs from a fresh build at {differ:?}")
     })?;
-    oracle(ended.prints == fresh_ended.prints, || String::from("the findings printed differ from a fresh build"))
+    oracle(ended.prints == fresh_ended.prints, || String::from("the findings printed differ from a fresh build"))?;
+    // A file's findings are placed in its own text: from 0, never from its `mod` in its home.
+    let misplaced = ended.prints.iter().find(|print| print.0.kind == Kind::FileItems && print.6 != 0);
+    oracle(misplaced.is_none(), || format!("a file's finding is placed at {misplaced:?}, not in its own text"))
+}
+
+/// The edition every file is read in: not 0, so a row that loses it is seen.
+const EDITION: u8 = 3;
+
+/// Where file `f`'s part stands in its home: not 0 and not [`EDITION`], so a place taken for
+/// an edition, or an edition for a place, is seen.
+fn file_place(f: usize) -> u32 {
+    11 * (u32::try_from(f).unwrap_or(u32::MAX) + 1)
 }
 
 /// An edit of one item's signature or body, to a value no draw makes.
@@ -690,6 +1055,13 @@ fn control_a_skipped_changed_read_is_caught() {
     control(SimConfig::cases(2000), Plant::None, Plant::SkipChangedRead, "differs from a fresh build", edits);
 }
 
+/// The real binary's first edit of a module file (2026-11-16): its row had kept its `mod`'s place
+/// for an edition, and the file was read in no edition.
+#[test]
+fn control_an_edition_kept_as_a_place_is_caught() {
+    control(SimConfig::cases(2000), Plant::None, Plant::EditionAsPlace, "edition", edits);
+}
+
 fn flights(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     let world = World::draw(tape);
     let mut store = Store::default();
@@ -719,6 +1091,31 @@ fn a_repeat_runs_nothing_for_one_read() {
         oracle(store.reads == 1 && answer.profile.gets == 1, || format!("a repeat read the store {} times", store.reads))?;
         oracle(answer.profile.certified, || String::from("a repeat did not stand on its certificate"))?;
         oracle(again.prints == first.prints, || String::from("a repeat printed other findings"))
+    });
+}
+
+/// The tool's identity is in every key: a binary built from other code shares no record and no
+/// certificate with the one before it (it runs every task again), and the same identity does.
+#[test]
+fn another_tool_shares_no_record_and_no_certificate() {
+    check(SimConfig::cases(100), |tape| {
+        let world = World::draw(tape);
+        let mut store = Store::default();
+        let (_, first) = finished(request(tape, &world, None, &mut store, None, Plant::None)?)?;
+        let held: BTreeSet<Key> = store.records.keys().copied().collect();
+        let other = Setup { tool: b"another build", ..setup(tape, Plant::None) };
+        let mut alone = Store::default();
+        finished(request_with(tape, &world, None, &mut alone, None, Setup { tool: b"another build", ..setup(tape, Plant::None) })?)?;
+        let shared = alone.records.keys().filter(|key| held.contains(key)).count();
+        oracle(shared == 0, || format!("another tool's build wrote {shared} records under this tool's keys"))?;
+        let (answer, again) = finished(request_with(tape, &world, Some(&world), &mut store, first.last.as_deref(), other)?)?;
+        oracle(!answer.profile.certified, || String::from("another tool stood on this tool's certificate"))?;
+        // It made every record its own fresh build makes (each under its own keys, none of this
+        // tool's); a run's count may differ, `last`'s shapes saving a `Need` round.
+        let missing = alone.records.keys().filter(|key| !store.records.contains_key(key)).count();
+        oracle(missing == 0, || format!("another tool, given this tool's last answer, left {missing} of its records unmade ({:?})", again.runs))?;
+        let (same, repeat) = finished(request(tape, &world, Some(&world), &mut store, first.last.as_deref(), Plant::None)?)?;
+        oracle(same.profile.certified && repeat.runs.is_empty(), || format!("the same tool ran {:?}", repeat.runs))
     });
 }
 
@@ -772,6 +1169,146 @@ fn a_missing_record_of_a_textless_crate_is_the_typed_error() {
     });
 }
 
+/// Each member's finding is printed once, on its own manifest, saying its version.
+fn members_print_on_their_manifests(world: &World, ended: &Ended) -> Result<(), Broke> {
+    for (k, member) in world.members.iter().enumerate() {
+        let message = format!("member {k} version {}", member.version).into_bytes();
+        let on = ended.prints.iter().filter(|p| p.4 == message).collect::<StdVec<_>>();
+        oracle(on.len() == 1 && on[0].5.as_deref() == Some(member_path(k).as_slice()) && on[0].0 == Name::manifest(&member_path(k)), || {
+            format!("member {k}'s finding printed as {:?}", on.iter().map(|p| (p.0, p.5.clone())).collect::<StdVec<_>>())
+        })?;
+    }
+    Ok(())
+}
+
+#[test]
+fn a_member_manifest_edit_rereads_that_member_alone() {
+    check(SimConfig::cases(300), |tape| {
+        let mut world = World::draw(tape);
+        world.members = (0..3).map(|k| Member { version: 0, files: (0..world.files.len()).filter(|f| f % 3 == k).collect() }).collect();
+        let mut store = Store::default();
+        let (_, first) = finished(request(tape, &world, None, &mut store, None, Plant::None)?)?;
+        members_print_on_their_manifests(&world, &first)?;
+        let mut next = world.clone();
+        let k = tape.index(3, "edit member");
+        next.members[k].version += 1;
+        let (_, ended) = finished(request(tape, &next, Some(&world), &mut store, first.last.as_deref(), Plant::None)?)?;
+        // The root units (the layout read moved) and that member's: no file, no other member.
+        oracle(ended.runs.len() == 1 && ended.runs.get(&Kind::Units) == Some(&2), || {
+            format!("an edit of member {k}'s manifest ran {:?}", ended.runs)
+        })?;
+        members_print_on_their_manifests(&next, &ended)?;
+        same_as_fresh(tape, &next, &store, &ended)
+    });
+}
+
+// --- The unit graph and its fetches -----------------------------------------------------------
+
+/// A lock of up to eight entries, each depending only on later ones (as a real lock's graph is
+/// acyclic), with the roots the tape picks; none failing.
+fn draw_lock(tape: &Tape) -> Lock {
+    let n = 1 + tape.index(8, "lock entries");
+    let entries = (0..n).map(|at| (at + 1..n).filter(|_| tape.one_in(3, "depends")).collect()).collect();
+    let roots = (0..n).filter(|_| tape.one_in(4, "a root")).collect();
+    Lock { entries, roots, failing: StdVec::new() }
+}
+
+/// The entries the roots reach.
+fn reach(lock: &Lock) -> BTreeSet<usize> {
+    let mut seen: BTreeSet<usize> = lock.roots.iter().copied().collect();
+    let mut frontier = lock.roots.clone();
+    while let Some(at) = frontier.pop() {
+        for dep in &lock.entries[at] {
+            if seen.insert(*dep) {
+                frontier.push(*dep);
+            }
+        }
+    }
+    seen
+}
+
+fn runs(ended: &Ended, kind: Kind) -> u32 {
+    ended.runs.get(&kind).copied().unwrap_or(0)
+}
+
+/// A lock entry nothing reaches is never fetched: a lock with no roots (hello world's stale
+/// lock, whose 177 entries are bstd's, which the toolchain gives) fetches nothing at all.
+#[test]
+fn a_lock_fetches_only_what_the_roots_reach() {
+    check(SimConfig::cases(300), |tape| {
+        let mut world = World::draw(tape);
+        let lock = draw_lock(tape);
+        let reached = reach(&lock);
+        world.lock = Some(lock);
+        let mut store = Store::default();
+        let (answer, ended) = finished(request(tape, &world, None, &mut store, None, Plant::None)?)?;
+        oracle(answer.failed == 0, || format!("{} tasks failed", answer.failed))?;
+        oracle(runs(&ended, Kind::Fetch) as usize == reached.len(), || {
+            format!("{} Fetch runs for a reach of {} ({:?})", runs(&ended, Kind::Fetch), reached.len(), world.lock)
+        })?;
+        let mut none = world.clone();
+        if let Some(lock) = none.lock.as_mut() {
+            lock.roots.clear();
+        }
+        let (_, bare) = finished(request(tape, &none, None, &mut Store::default(), None, Plant::None)?)?;
+        oracle(runs(&bare, Kind::Fetch) == 0 && runs(&bare, Kind::UnitGraph) == 1, || format!("a lock no root reaches ran {:?}", bare.runs))
+    });
+}
+
+/// A member's manifest edit that makes one more entry reachable fetches exactly that one.
+#[test]
+fn an_edit_reaching_one_more_entry_fetches_one() {
+    check(SimConfig::cases(300), |tape| {
+        let mut world = World::draw(tape);
+        world.lock = Some(draw_lock(tape));
+        let mut store = Store::default();
+        let (_, first) = finished(request(tape, &world, None, &mut store, None, Plant::None)?)?;
+        let mut next = world.clone();
+        let Some(lock) = next.lock.as_mut() else { return Err(Broke::Harness(String::from("no lock"))) };
+        let unreached: StdVec<usize> = (0..lock.entries.len()).filter(|at| !reach(lock).contains(at)).collect();
+        // A root added: an unreached entry whose own dependencies are reached (or none), else a
+        // new entry with none.
+        let reached = reach(lock);
+        let pick = unreached.iter().copied().find(|at| lock.entries[*at].iter().all(|dep| reached.contains(dep)));
+        let added = match pick {
+            Some(at) => at,
+            None => {
+                lock.entries.push(StdVec::new());
+                lock.entries.len() - 1
+            }
+        };
+        lock.roots.push(added);
+        let (answer, ended) = finished(request(tape, &next, Some(&world), &mut store, first.last.as_deref(), Plant::None)?)?;
+        oracle(answer.failed == 0 && runs(&ended, Kind::Fetch) == 1, || format!("reaching entry {added} ran {:?}", ended.runs))
+    });
+}
+
+/// A `Fetch` that failed leaves no graph record: the graph task is told (`Task::failed`), asks
+/// no more for it, and fails; the next request asks for the graph and that entry again.
+#[test]
+fn a_failed_fetch_leaves_no_graph_and_the_next_request_asks_again() {
+    check(SimConfig::cases(300), |tape| {
+        let mut world = World::draw(tape);
+        let mut lock = draw_lock(tape);
+        lock.roots.push(0);
+        let reached: StdVec<usize> = reach(&lock).into_iter().collect();
+        let failing = reached[tape.index(reached.len(), "failing")];
+        lock.failing.push(failing);
+        world.lock = Some(lock);
+        let mut store = Store::default();
+        let (answer, first) = finished(request(tape, &world, None, &mut store, None, Plant::None)?)?;
+        oracle(answer.failed >= 2 && runs(&first, Kind::UnitGraph) >= 1, || format!("a failed fetch ended with {} failed, ran {:?}", answer.failed, first.runs))?;
+        let mut next = world.clone();
+        if let Some(lock) = next.lock.as_mut() {
+            lock.failing.clear();
+        }
+        let (again, ended) = finished(request(tape, &next, Some(&world), &mut store, first.last.as_deref(), Plant::None)?)?;
+        oracle(again.failed == 0 && runs(&ended, Kind::UnitGraph) >= 1 && runs(&ended, Kind::Fetch) >= 1, || {
+            format!("the request after a failed fetch ran {:?} with {} failed", ended.runs, again.failed)
+        })
+    });
+}
+
 // --- Many workers -----------------------------------------------------------------------------
 
 #[test]
@@ -779,9 +1316,10 @@ fn one_two_and_sixteen_workers_write_equal_bytes() {
     check(SimConfig::cases(200), |tape| {
         let world = World::draw(tape);
         let mut answers = StdVec::new();
+        let opens = tape.one_in(2, "open the files");
         for workers in [1, 2, 16] {
             let mut store = Store::default();
-            let setup = Setup { workers, ask: ASK, plant: Plant::None };
+            let setup = Setup { workers, ask: ASK, plant: Plant::None, tool: SIM_TOOL, opens };
             let (_, ended) = finished(request_with(tape, &world, None, &mut store, None, setup)?)?;
             answers.push((store.records, ended.prints));
         }
@@ -808,7 +1346,13 @@ fn gates(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     let world = World::draw(tape);
     let gate = [Gate::Beside, Gate::Before][tape.index(2, "gate")];
     let mut store = Store::default();
-    let setup = Setup { workers: workers(tape), ask: Ask { command: Command::Run, args: b"", gate, space: Space::NONE }, plant };
+    let setup = Setup {
+        workers: workers(tape),
+        ask: Ask { command: Command::Run, args: b"", gate, space: Space::NONE },
+        plant,
+        tool: SIM_TOOL,
+        opens: tape.one_in(2, "open the files"),
+    };
     let (answer, ended) = finished(request_with(tape, &world, None, &mut store, None, setup)?)?;
     let (_, checked) = fresh(tape, &world)?;
     let errors = checked.prints.len();
@@ -833,6 +1377,53 @@ fn no_success_is_reported_while_an_error_could_be_found() {
 #[test]
 fn control_a_success_before_the_gate_is_done_is_caught() {
     control(SimConfig::cases(2000), Plant::None, Plant::EarlySuccess, "could still find an error", gates);
+}
+
+/// Commands and edits in any order on one store, each walking forward from the one before, as
+/// a person types them: `check`, `run` and `test` (each its own certificate), a body or a
+/// signature edited between. Every request ends answered or with a typed error, never with a
+/// step after its answer (`blaze run` after `blaze check`, 2026-11-16: the walk stood on the
+/// check's error, stopped the program it had started and answered before its exit).
+///
+/// The one typed error allowed is `LateWant` (drive.md, "The gate"): after a forward walk or a
+/// certificate, a stood item is settled by the answer but not walked, and a want of it once
+/// the walk is done is refused. Owed: answer it from the answer's own rows; until then the
+/// real program wants nothing (`Code` is not built).
+fn commands(tape: &Tape, plant: Plant) -> Result<(), Broke> {
+    let mut world = World::draw(tape);
+    let mut before: Option<World> = None;
+    let mut store = Store::default();
+    let mut last: Option<StdVec<u8>> = None;
+    for serial in 0..2 + tape.below(5, "steps") {
+        if before.is_some() && tape.one_in(3, "an edit") {
+            world = edit(tape, &world, serial, tape.one_in(2, "body or signature"));
+            continue;
+        }
+        let command = [Command::Check, Command::Run, Command::Test][tape.index(3, "command")];
+        let setup = Setup { ask: Ask { command, args: b"", gate: Gate::Beside, space: Space::NONE }, ..setup(tape, plant) };
+        let ended = request_with(tape, &world, before.as_ref(), &mut store, last.as_deref(), setup)?;
+        match &ended.error {
+            Some(DriveError::LateWant { .. }) => return Ok(()),
+            Some(error) => return Err(Broke::Oracle(format!("`{command:?}` stopped with an error: {error}"))),
+            None => {}
+        }
+        let (_, ended) = finished(ended)?;
+        if ended.last.is_some() {
+            last = ended.last;
+        }
+        before = Some(world.clone());
+    }
+    Ok(())
+}
+
+#[test]
+fn any_sequence_of_commands_and_edits_answers() {
+    check(SimConfig::cases(300), |tape| commands(tape, Plant::None));
+}
+
+#[test]
+fn control_an_answer_while_the_program_runs_is_caught() {
+    control(SimConfig::cases(2000), Plant::None, Plant::AnswerWhileRunning, "answered while the program", commands);
 }
 
 // --- Linear bookkeeping (parallel.md change 3) ------------------------------------------------
@@ -883,13 +1474,14 @@ fn fifo(world: &World, ask: Ask<'_>) -> Result<Fifo, Broke> {
     let manifest = b"Cargo.toml".to_vec();
     files.push(FileEntry { path: &manifest, id: key::digest("sim manifest", b"[package]"), changed: false, manifest: true });
     files.sort_by(|a, b| a.path.cmp(b.path));
-    let mut req = Request::planted_in(config(16), ask, world.plant, Alloc::global());
+    let mut req = Request::planted_in(config(16, SIM_TOOL), ask, world.plant, Alloc::global());
     let mut store: BTreeMap<Key, StdVec<u8>> = BTreeMap::new();
     let mut todo: std::collections::VecDeque<Effect<'static>> = std::collections::VecDeque::new();
     let mut out: Vec<Effect<'static>, Alloc<'static>> = Vec::new_in(Alloc::global());
     let (mut jobs, mut edges) = (0u64, 0u64);
     let mut prints = StdVec::new();
-    req.step(Event::Start { files: &files, gone: &[], last: None }, &mut out).map_err(|e| Broke::Oracle(format!("{e}")))?;
+    let units = units_source(&files);
+    req.step(Event::Start { files: &files, gone: &[], last: None, units, cold: false, graph: None }, &mut out).map_err(|e| Broke::Oracle(format!("{e}")))?;
     loop {
         todo.extend(out.drain(..));
         let effect = todo.pop_front().ok_or(Broke::Oracle(String::from("the request stalled")))?;
@@ -911,7 +1503,7 @@ fn fifo(world: &World, ask: Ask<'_>) -> Result<Fifo, Broke> {
                     .iter()
                     .filter_map(|(_, a)| match a {
                         Answered::Done(made) => Some(made),
-                        Answered::Need(_) | Answered::Cfg(_) => None,
+                        Answered::Need(_) | Answered::Cfg(_) | Answered::Failed(_) => None,
                     })
                     .collect();
                 let held: StdVec<StdVec<Finding<'_>>> = made
@@ -921,7 +1513,7 @@ fn fifo(world: &World, ask: Ask<'_>) -> Result<Fifo, Broke> {
                 let outputs: StdVec<Output<'_>> = made
                     .iter()
                     .zip(held.iter())
-                    .map(|(m, findings)| Output { name: m.name, out: m.out, reads: &m.reads, parts: &m.parts, findings, payload: b"" })
+                    .map(|(m, findings)| Output { name: m.name, out: m.out, reads: &m.reads, parts: &m.parts, paths: &[], findings, payload: b"" })
                     .collect();
                 let mut at = 0;
                 let mut results = StdVec::new();
@@ -929,6 +1521,7 @@ fn fifo(world: &World, ask: Ask<'_>) -> Result<Fifo, Broke> {
                     let ran = match answer {
                         Answered::Need(wants) => Ran::Need(wants),
                         Answered::Cfg(var) => Ran::Cfg(*var),
+                        Answered::Failed(failure) => Ran::Failed(*failure),
                         Answered::Done(m) => {
                             jobs += 1;
                             edges += (m.parts.len() + m.reads.len()) as u64;
@@ -1029,6 +1622,10 @@ fn whole_space_equals_each(tape: &Tape, plant: Plant) -> Result<(), Broke> {
         }
         let mut each: StdVec<(Name, StdVec<u8>)> = StdVec::new();
         for f in 0..world.files.len() {
+            // A file's own finding holds under every configuration (`execute`'s FileItems).
+            if world.files[f].len() % 2 == 0 {
+                each.push((file_name(f), format!("file {f}").into_bytes()));
+            }
             for i in 0..world.files[f].len() {
                 if let Some(message) = finding(&world, Kind::BodyCheck, &eval_body(&world, f, i, config)) {
                     each.push((body_name(f, i), message));
@@ -1077,5 +1674,185 @@ fn an_item_past_the_cap_is_a_finding() {
         oracle(run.prints.iter().any(|(_, _, message)| message.windows(7).any(|w| w == b"past 64")), || {
             format!("no over-cap finding among {} printed", run.prints.len())
         })
+    });
+}
+
+// --- The names step: `CrateScope` and `MacroModule` (drive.md, "SPEC, the NAMES step") -------
+
+fn names_world(tape: &Tape) -> World {
+    let mut world = World::draw(tape);
+    draw_crates(tape, &mut world);
+    world
+}
+
+/// The crates whose `CrateScope` reruns when `changed`'s scope moves: each direct dependent of
+/// a moved scope reruns, and its own scope moves only where it glob re-exports a moved one.
+fn reruns_after(world: &World, changed: usize) -> BTreeSet<usize> {
+    let mut moved: BTreeSet<usize> = [changed].into_iter().collect();
+    let mut rerun = moved.clone();
+    for (c, krate) in world.crates.iter().enumerate().skip(changed + 1) {
+        if krate.deps.iter().any(|d| moved.contains(d)) {
+            rerun.insert(c);
+        }
+        if krate.globs.iter().any(|d| moved.contains(d)) {
+            moved.insert(c);
+        }
+    }
+    rerun
+}
+
+/// Every crate's scope is made once, after its dependencies' (a `Need` re-enters it), in any
+/// completion order with equal bytes; each proc-macro crate's module is made once for all its
+/// callers; a repeat runs nothing.
+#[test]
+fn crate_scopes_resolve_once_in_dependency_order_in_any_completion_order() {
+    check(SimConfig::cases(200), |tape| {
+        let world = names_world(tape);
+        let (one, first) = fresh(tape, &world)?;
+        let (two, _) = fresh(tape, &world)?;
+        oracle(one.records == two.records, || String::from("two completion orders of the names step wrote other bytes"))?;
+        // A run is an entry: a crate is entered once, or twice when it asks all its needs at
+        // once and is re-entered with them; never more.
+        let scopes = runs(&first, Kind::CrateScope) as usize;
+        oracle((world.crates.len()..=2 * world.crates.len()).contains(&scopes) && runs(&first, Kind::MacroModule) as usize == world.macros.len(), || {
+            format!("{} crates and {} macro crates ran {:?}", world.crates.len(), world.macros.len(), first.runs)
+        })?;
+        let mut store = one;
+        let (_, again) = finished(request(tape, &world, Some(&world), &mut store, first.last.as_deref(), Plant::None)?)?;
+        oracle(again.runs.is_empty(), || format!("a repeat ran {:?}", again.runs))
+    });
+}
+
+/// A body edit leaves every surface, so no `CrateScope` and no `MacroModule` runs.
+#[test]
+fn a_body_edit_runs_no_crate_scope() {
+    check(SimConfig::cases(200), |tape| {
+        let world = names_world(tape);
+        let mut store = Store::default();
+        let (_, first) = finished(request(tape, &world, None, &mut store, None, Plant::None)?)?;
+        let next = edit(tape, &world, 0, true);
+        let (_, ended) = finished(request(tape, &next, Some(&world), &mut store, first.last.as_deref(), Plant::None)?)?;
+        oracle(runs(&ended, Kind::CrateScope) == 0 && runs(&ended, Kind::Surface) == 0 && runs(&ended, Kind::MacroModule) == 0, || {
+            format!("a body edit ran {:?}", ended.runs)
+        })?;
+        same_as_fresh(tape, &next, &store, &ended)
+    });
+}
+
+/// An added `pub fn` in a crate reruns that crate's scope and its direct dependents' (their
+/// read of its scope fails), and past them only through a glob re-export: the unit of rerun is
+/// the whole dependent crate.
+#[test]
+fn an_added_pub_fn_reruns_its_crate_and_the_dependents_reading_it() {
+    check(SimConfig::cases(200), |tape| {
+        let world = names_world(tape);
+        let f = tape.index(world.files.len(), "edited file");
+        let c = f % world.crates.len();
+        let mut store = Store::default();
+        let (_, first) = finished(request(tape, &world, None, &mut store, None, Plant::None)?)?;
+        let mut files = world.files.clone();
+        files[f].push(Item { sig: 9_000, body: 0, uses: None, calls: StdVec::new(), cfg: StdVec::new() });
+        let mut next = World::new(files);
+        next.crates = world.crates.clone();
+        next.macros = world.macros.clone();
+        let (answer, ended) = finished(request(tape, &next, Some(&world), &mut store, first.last.as_deref(), Plant::None)?)?;
+        let expected = reruns_after(&world, c);
+        oracle(answer.failed == 0 && runs(&ended, Kind::CrateScope) as usize == expected.len() && runs(&ended, Kind::Surface) == 1, || {
+            format!("a pub fn in crate {c} (file {f}) ran {:?}, expected {} CrateScope ({expected:?}) of {:?}", ended.runs, expected.len(), world.crates)
+        })?;
+        same_as_fresh(tape, &next, &store, &ended)
+    });
+}
+
+/// A module store without the macro crates' modules: each `MacroModule` fails once (one
+/// finding a macro crate) and keeps no record, so the command after the store is filled looks
+/// each up exactly once, and a repeat after that looks none up.
+#[test]
+fn an_absent_module_is_asked_again_and_a_present_one_never() {
+    check(SimConfig::cases(200), |tape| {
+        let mut world = names_world(tape);
+        if world.macros.is_empty() {
+            return Ok(());
+        }
+        world.modules_absent = true;
+        let mut store = Store::default();
+        let (answer, first) = finished(request(tape, &world, None, &mut store, None, Plant::None)?)?;
+        let looked = runs(&first, Kind::MacroModule) as usize;
+        oracle(looked == world.macros.len() && answer.failed as usize >= world.macros.len(), || {
+            format!("with no modules, {} macro crates ran {looked} lookups and {} failed", world.macros.len(), answer.failed)
+        })?;
+        let mut filled = world.clone();
+        filled.modules_absent = false;
+        let (again, second) = finished(request(tape, &filled, Some(&world), &mut store, first.last.as_deref(), Plant::None)?)?;
+        oracle(again.failed == 0 && runs(&second, Kind::MacroModule) as usize == world.macros.len(), || {
+            format!("after the store was filled: {} failed, ran {:?}", again.failed, second.runs)
+        })?;
+        let (_, third) = finished(request(tape, &filled, Some(&filled), &mut store, second.last.as_deref(), Plant::None)?)?;
+        oracle(runs(&third, Kind::MacroModule) == 0, || format!("a repeat looked modules up: {:?}", third.runs))
+    });
+}
+
+/// A file whose own task fails (a planted panic) fails alone: its surface, which a crate's
+/// `CrateScope` wants, settles failed `Waited` on it, and so does each crate reading it; the
+/// request answers (no `NoPart`), and the next command, with the file fixed, matches a fresh
+/// build.
+#[test]
+fn a_failed_file_fails_its_surface_and_its_readers_not_the_request() {
+    check(SimConfig::cases(200), |tape| {
+        let mut world = names_world(tape);
+        if world.files.is_empty() {
+            return Ok(());
+        }
+        world.failing_file = Some(0);
+        // File 0 is crate 0's (`draw_crates`): it and each crate reaching it fail.
+        let mut reaching: BTreeSet<usize> = [0].into_iter().collect();
+        for (c, krate) in world.crates.iter().enumerate().skip(1) {
+            if krate.deps.iter().any(|d| reaching.contains(d)) {
+                reaching.insert(c);
+            }
+        }
+        let mut store = Store::default();
+        let (answer, first) = finished(request(tape, &world, None, &mut store, None, Plant::None)?)?;
+        // The file, its surface, and the crates; items using the file's signatures fail too.
+        let expected = 2 + reaching.len();
+        oracle(answer.failed as usize >= expected, || format!("{} failed, expected at least {expected} (crates {reaching:?})", answer.failed))?;
+        let mut fixed = world.clone();
+        fixed.failing_file = None;
+        let (again, ended) = finished(request(tape, &fixed, Some(&world), &mut store, first.last.as_deref(), Plant::None)?)?;
+        oracle(again.failed == 0, || format!("after the fix {} failed", again.failed))?;
+        same_as_fresh(tape, &fixed, &store, &ended)
+    });
+}
+
+/// A crate the names library refuses fails alone; each crate reaching it fails `Waited` and
+/// keeps no record, so the next command, with the crate fixed, makes all of them.
+#[test]
+fn a_failed_crate_leaves_its_dependents_without_a_record() {
+    check(SimConfig::cases(200), |tape| {
+        let mut world = names_world(tape);
+        if world.crates.len() < 2 {
+            return Ok(());
+        }
+        world.crates[1].deps = std::vec![0];
+        world.crates[0].fails = true;
+        let mut reaching: BTreeSet<usize> = [0].into_iter().collect();
+        for (c, krate) in world.crates.iter().enumerate().skip(1) {
+            if krate.deps.iter().any(|d| reaching.contains(d)) {
+                reaching.insert(c);
+            }
+        }
+        let mut store = Store::default();
+        let (answer, first) = finished(request(tape, &world, None, &mut store, None, Plant::None)?)?;
+        oracle(answer.failed as usize == reaching.len(), || format!("{} failed, expected {} ({reaching:?})", answer.failed, reaching.len()))?;
+        let mut fixed = world.clone();
+        fixed.crates[0].fails = false;
+        let (again, ended) = finished(request(tape, &fixed, Some(&world), &mut store, first.last.as_deref(), Plant::None)?)?;
+        let scopes = runs(&ended, Kind::CrateScope) as usize;
+        // The failed crates kept nothing, so each runs again (a crate the failed command never
+        // reached runs now too: at most two entries a crate in all).
+        oracle(again.failed == 0 && (reaching.len()..=2 * world.crates.len()).contains(&scopes), || {
+            format!("after the fix ran {:?}, expected {} to {} CrateScope entries", ended.runs, reaching.len(), 2 * world.crates.len())
+        })?;
+        same_as_fresh(tape, &fixed, &store, &ended)
     });
 }

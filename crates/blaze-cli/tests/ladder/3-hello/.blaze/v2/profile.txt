@@ -1,5 +1,0 @@
-store        gets 1 hits 1 puts 0 pages read 0 written 0; certificate stood; tests run 0 reused 0; segments sealed 0 checked 0
-schedule     tasks 0 batches 0 steps 3 in place 0 coordinator 0.015 ms idle 0.000 ms; entries 0|1|2|3|4|5-8|9-16|more [0, 0, 0, 0, 0, 0, 0, 0]
-gate         start 1.178 ms verdict 1.830 ms checked beside 0; items by conditions 1|2|3-4|5+ [0, 0, 0, 0]
-phases       before main 321583 · arguments 473667 · open checkout 37208 · leaf table 197125 · sweep 781292 · last answer read 59416 · machine and store open 19375 · request 773209 · store after answer 83 · in main 2348292 (ns; the profile's own write and exit are after this line)
-request      steps 15125 gets 106417 puts 0 runs 0 publish 0 prints 0 write last 0 (ns)

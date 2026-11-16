@@ -596,6 +596,7 @@ mod tests {
             let config = Config::load_with(
                 Path::new("/blaze-no-such-dir"),
                 env,
+                blaze_manifest::UserRecord(Err(blaze_core::home::NoRecord::NoEntry { uid: 0 })),
                 blaze_manifest::files::Disk,
             )
             .unwrap();

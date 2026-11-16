@@ -122,19 +122,46 @@ pub fn of_inner(
 }
 
 /// `span` named for the file `file` read as part of `krate`: the crate in `krate`, and in
-/// `function` the file's path (a macro file by its call, `{macro <id>}`), so the same file
-/// lowered for many crates reads as repeats of one key. The span declares `krate` and `function`.
+/// `function` the file's path, so the same file lowered for many crates reads as repeats of one
+/// key. A macro file is named by its call as a body's path names one ([`write_macro_call`]) and
+/// the source file the chain of calls ends in: `{macro call 3fa2.5 in macro call 77e1.3 in
+/// src/num/mod.rs}`, a few dozen bytes. It was the call id's `Debug` print, which spells out the
+/// call's whole location and every enclosing one (up to 64 KB, 21,560 distinct values and 53 MB
+/// of one session's `spans.function`, the profile's largest column); the short name says the
+/// same call, and the call's text is read from that file when it is wanted. The span declares
+/// `krate` and `function`.
 pub fn of_file(db: &Db, file: HirFileId, krate: Crate, span: blaze_trace::Span) -> blaze_trace::Span {
     if !span.is_disabled() {
         name(db, krate, &span, |text| match file {
-            HirFileId::FileId(it) => match db.path_for_file(it.file_id(db)) {
-                Some(path) => _ = write!(text, "{path}"),
-                None => _ = write!(text, "{{file {}}}", it.file_id(db).index()),
-            },
-            HirFileId::MacroFile(call) => _ = write!(text, "{{macro {call:?}}}"),
+            HirFileId::FileId(_) => write_file_path(db, file, text),
+            HirFileId::MacroFile(_) => {
+                text.push('{');
+                let calls = text.len();
+                write_macro_call(db, file, text);
+                // `write_macro_call` writes ` in ` before each call; the first is the name's start.
+                text.replace_range(calls..calls + " in ".len(), "");
+                let mut source = file;
+                while let HirFileId::MacroFile(call) = source {
+                    source = call.lookup(db).kind.file_id();
+                }
+                text.push_str(" in ");
+                write_file_path(db, source, text);
+                text.push('}');
+            }
         });
     }
     span
+}
+
+/// A source file's path as the checkout names it, `{file 12}` by its index when it has none; a
+/// macro file writes nothing (see [`of_file`]).
+fn write_file_path(db: &Db, file: HirFileId, text: &mut String) {
+    if let HirFileId::FileId(it) = file {
+        match db.path_for_file(it.file_id(db)) {
+            Some(path) => _ = write!(text, "{path}"),
+            None => _ = write!(text, "{{file {}}}", it.file_id(db).index()),
+        }
+    }
 }
 
 /// Writes `krate`'s label ([`write_crate_label`]) and the path `path` writes in `span`'s fields

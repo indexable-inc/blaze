@@ -120,7 +120,7 @@ impl<'a, S: Strategy> Fulfill<'a, S> {
             fold_vars(tys, work, t, vars)
         };
         match g.pred {
-            Pred::Trait { args, .. } | Pred::HostEffect { args, .. } => {
+            Pred::Trait { args, .. } | Pred::HostEffect { args, .. } | Pred::ConstHolds { args, .. } => {
                 for i in 0..args.len {
                     each(tys.list_get(args, i), &mut self.vars, &mut self.work)?;
                 }

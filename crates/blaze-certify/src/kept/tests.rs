@@ -68,13 +68,18 @@ impl Disk {
         let (tag, done) = match effect {
             Effect::Stat { file, tag } => {
                 let there = self.files.keys().any(|it| it.starts_with(&format!("{file}/")));
-                (tag, Done::Stat(there.then_some(Meta { len: 0, dir: true, modified_ns: 0 })))
+                let meta =
+                    Meta { len: 0, dir: true, modified_ns: 0, changed_ns: 0, ino: 0, dev: 1 };
+                (tag, Done::Stat(there.then_some(meta)))
             }
             Effect::List { dir, tag } => {
                 let listed = (self.files.iter())
                     .filter(|(name, _)| name.starts_with(&format!("{dir}/")))
-                    .map(|(name, (bytes, at))| {
-                        let meta = Meta { len: bytes.len() as u64, dir: false, modified_ns: *at };
+                    .enumerate()
+                    .map(|(ino, (name, (bytes, at)))| {
+                        let (len, ino) = (bytes.len() as u64, ino as u64 + 1);
+                        let meta =
+                            Meta { len, dir: false, modified_ns: *at, changed_ns: *at, ino, dev: 1 };
                         (FileName::new(name).unwrap(), meta)
                     })
                     .collect();

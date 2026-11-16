@@ -29,8 +29,18 @@ blaze-surface.workspace = true
 # `FormatError`: why a handed record is refused, named in `HeldError`. blaze-surface does not
 # re-export it. By path: the workspace entry turns on its `serde`.
 blaze-format = { path = "../blaze-format" }
+# The UnitGraph task (unit_graph_task.rs): the resolution, the sources reader and the record.
+blaze-unit-graph.workspace = true
+# `Lock`: the one lock reader, which the UnitGraph task reads the lock's bytes with.
+blaze-manifest = { workspace = true, default-features = false }
+# The Fetch task (fetch_task.rs): the plan's units, their outcomes and why one failed.
+blaze-fetch.workspace = true
+# A failed unit's finding, shown into the caller's allocator.
+blaze-text.workspace = true
 
 [dev-dependencies]
+# `Oid`: a git unit in the Fetch task's test.
+blaze-git-fetch.workspace = true
 # `check` and `control`: the request's simulation and its planted-bug controls.
 blaze-sim.workspace = true
 # `Alloc::global()`: the tests' handle.

@@ -193,7 +193,7 @@ fn orphan_walk_inner<T: Tys, F: Facts>(
             TyKind::ReStatic
             | TyKind::ReParam(_)
             | TyKind::ReErased
-            | TyKind::ConstValue(_)
+            | TyKind::ConstValue(..)
             | TyKind::ConstParam(_)
             | TyKind::Infer(Var { kind: VarKind::Region | VarKind::Const, .. })
             | TyKind::Alias(_, AliasKind::Const, ..) => {}
@@ -203,9 +203,10 @@ fn orphan_walk_inner<T: Tys, F: Facts>(
             | TyKind::Uint(_)
             | TyKind::Float(_)
             | TyKind::Str
-            | TyKind::FnPtr(_)
+            | TyKind::FnPtr(..)
             | TyKind::Array(..)
             | TyKind::Slice(_)
+            | TyKind::Pat(..)
             | TyKind::RawPtr(..)
             | TyKind::Never
             | TyKind::Tuple(_) => {}
@@ -261,8 +262,8 @@ fn orphan_walk_inner<T: Tys, F: Facts>(
             }
             // `unreachable!("unnameable type in coherence")` in the reference; existential
             // predicates are never a generic argument.
-            TyKind::FnDef(..) | TyKind::Closure(..) | TyKind::ExTrait(..) | TyKind::ExProj(..) | TyKind::ExAuto(_) => {
-                return Err(Stop::Error(SolveError::Malformed(Malformed::Pred)));
+            TyKind::FnDef(..) | TyKind::Closure(..) | TyKind::Coroutine(..) | TyKind::ExTrait(..) | TyKind::ExProj(..) | TyKind::ExAuto(_) => {
+                return Err(Stop::Error(SolveError::Malformed(crate::error::bad_pred())));
             }
         }
     }
@@ -339,10 +340,10 @@ pub fn step<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, rule: 
     match (rule, stage) {
         (Rule::Unknowable, 0) => {
             let Pred::Trait { args, .. } = cx.goal.pred else {
-                return Err(Stop::Error(SolveError::Malformed(Malformed::Pred)));
+                return Err(Stop::Error(SolveError::Malformed(crate::error::bad_pred())));
             };
             if args.len == 0 {
-                return Err(Stop::Error(SolveError::Malformed(Malformed::Pred)));
+                return Err(Stop::Error(SolveError::Malformed(crate::error::bad_pred())));
             }
             let mut items = cx.list(args);
             items[0] = cand.a;
@@ -371,14 +372,14 @@ pub fn step<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, rule: 
             }
             Ok(Step::Done(Certainty::Ambiguous))
         }
-        (Rule::Unknowable, _) => Err(Stop::Error(SolveError::Malformed(Malformed::Pred))),
+        (Rule::Unknowable, _) => Err(Stop::Error(SolveError::Malformed(crate::error::bad_pred()))),
     }
 }
 
 /// Fresh variables for an item's generics: a const variable where the portable table names
 /// `ConstParam(i)`, else a type variable (a region parameter is erased on import, so its
 /// variable is never used). `fresh_args_for_item`.
-fn fresh_for<'a, T: Tys>(tys: &mut T, p: Portable<'_>, generics: u32, alloc: Alloc<'a>) -> Result<Vec<Ty, Alloc<'a>>, SolveError> {
+pub(crate) fn fresh_for<'a, T: Tys>(tys: &mut T, p: Portable<'_>, generics: u32, alloc: Alloc<'a>) -> Result<Vec<Ty, Alloc<'a>>, SolveError> {
     let mut v = Vec::with_capacity_in(generics as usize, alloc);
     for i in 0..generics {
         let is_const = p.nodes.iter().any(|k| *k == TyKind::ConstParam(i));
@@ -410,6 +411,7 @@ fn import_pred<T: Tys>(tys: &mut T, s: &mut Scratch<'_>, p: Portable<'_>, pred: 
         Pred::HostEffect { trait_, args: a, constness } => {
             Pred::HostEffect { trait_, args: import_list(tys, s, p, a, args, alloc)?, constness }
         }
+        Pred::ConstHolds { cond, args: a } => Pred::ConstHolds { cond, args: import_list(tys, s, p, a, args, alloc)? },
         Pred::Projection { alias, term } => Pred::Projection { alias: t(tys, s, alias)?, term: t(tys, s, term)? },
         Pred::NormalizesTo { alias, term } => Pred::NormalizesTo { alias: t(tys, s, alias)?, term: t(tys, s, term)? },
         Pred::TypeOutlives { ty, region } => Pred::TypeOutlives { ty: t(tys, s, ty)?, region: t(tys, s, region)? },
@@ -420,7 +422,7 @@ fn import_pred<T: Tys>(tys: &mut T, s: &mut Scratch<'_>, p: Portable<'_>, pred: 
         Pred::Coerce { a, b } => Pred::Coerce { a: t(tys, s, a)?, b: t(tys, s, b)? },
         Pred::ConstArgHasType { ct, ty } => Pred::ConstArgHasType { ct: t(tys, s, ct)?, ty: t(tys, s, ty)? },
         Pred::DynCompatible(d) => Pred::DynCompatible(d),
-        Pred::Eq { .. } => return Err(SolveError::Malformed(Malformed::Pred)),
+        Pred::Eq { .. } => return Err(SolveError::Malformed(crate::error::bad_pred())),
     })
 }
 
@@ -466,7 +468,7 @@ fn orphan_check_inner<T: Tys, F: Facts>(
     let mut s = Scratch::new_in(alloc);
     let (vars, args) = fresh_header(tys, &mut s, h, alloc)?;
     if args.len == 0 {
-        return Err(Stop::Error(SolveError::Malformed(Malformed::Pred)));
+        return Err(Stop::Error(SolveError::Malformed(crate::error::bad_pred())));
     }
     let self_ty = tys.list_get(args, 0);
     let mut stack: Vec<Ty, Alloc<'_>> = Vec::new_in(alloc);
@@ -541,7 +543,7 @@ fn overlap_inner<'a, T: Tys, F: Facts>(
     let (va, la) = fresh_header(tys, &mut s, &ha, alloc)?;
     let (vb, lb) = fresh_header(tys, &mut s, &hb, alloc)?;
     if la.len != lb.len {
-        return Err(Stop::Error(SolveError::Malformed(Malformed::Pred)));
+        return Err(Stop::Error(SolveError::Malformed(crate::error::bad_pred())));
     }
     let mut goals: Vec<Pred, Alloc<'a>> = Vec::new_in(alloc);
     let mut deferred: Vec<(Ty, Ty), Alloc<'a>> = Vec::new_in(alloc);

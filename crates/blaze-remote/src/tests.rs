@@ -863,6 +863,7 @@ fn a_push_from_a_machine_that_is_not_a_trusted_writer_sends_nothing() {
 }
 
 #[test]
+#[cfg(feature = "bucket")]
 fn settings_never_show_a_secret() {
     let mut seed = [0u8; 32];
     Tape::seeded(15).fill(&mut seed, "seed");

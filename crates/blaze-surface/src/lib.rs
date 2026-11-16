@@ -70,6 +70,8 @@ mod names;
 mod path;
 mod proof;
 mod shape;
+mod through;
+pub mod tool_attrs;
 #[cfg(any(test, feature = "testing"))]
 pub mod testing;
 
@@ -84,7 +86,7 @@ pub use crate::crate_root::{CrateRootBuilder, CrateRootHead, CrateRootView, Dep}
 pub use crate::error::{BuildError, NotBuilt, SurfaceError};
 pub use crate::file_items::{
     Attr, AttrKind, AttrSpan, ChildItems, ErrorOrigin, FileItem, FileItems, FileItemsView, Item,
-    ItemDetail, SyntaxError,
+    ItemDetail, ItemFlags, SyntaxError, flagged_in_files, flags_of_files,
 };
 pub use crate::impl_index::{
     BUCKET_SCHEMA, Bucket, BucketHash, BucketKey, BucketView, CrateImpls, DIRECTORY_SCHEMA,
@@ -96,7 +98,7 @@ pub use crate::items::{Items, Source};
 pub use crate::key_index::{KeyEntry, KeyIndex, KeyIndexView};
 pub use crate::kind::{
     AmbiguityKind, Binding, BindingState, CallShape, Def, DefKind, Edition, ItemIndex, ItemKind,
-    Namespace, Origin, Place, Range, ScopeEntry, Visibility, VisibilityClass, WrittenVis,
+    MacroShapes, Namespace, Origin, Place, Range, ScopeEntry, Visibility, VisibilityClass, WrittenVis,
 };
 pub use crate::lang_items::{
     LANG_SCHEMA, LangItemsError, LangItemsView, LangName, LangNameError, MAX_LANG_NAME,
@@ -112,14 +114,17 @@ pub use crate::module_decls::{
     MacroRulesDecl, ModuleDeclsView, ModuleInfo, UseDecl,
 };
 pub use crate::module_scope::{
-    AnonImport, EXPORTS_DOMAIN, ExportEntry, ScopeBuilder, ScopeError, ScopeView, Site,
-    TextualDef, TextualMark, Unresolved, UseSite, exports_digest,
+    AnonImport, GlobEdge, ScopeBuilder, ScopeError, ScopeView, Site, TextualDef, TextualMark,
+    Unresolved, UseSite, globs_digest, textual_digest, GLOBS_DOMAIN, TEXTUAL_DOMAIN,
 };
 pub use crate::names::{ModuleFile, ModuleFileView, TextualEntry, TextualEntryView};
 pub use crate::path::{ExternTarget, Path, PathKind, PathView, Rename, UseForm};
 pub use crate::proof::HasText;
 pub use crate::shape::{
     FloatWidth, IntWidth, Mutability, SelfShape, Shape, ShapeError, UintWidth,
+};
+pub use crate::through::{
+    Asker, MAX_REACHED, Node, Passed, SeenFrom, Sources, Through, merge, through,
 };
 
 #[cfg(test)]

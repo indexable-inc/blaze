@@ -40,6 +40,11 @@ pub struct Model {
     pub clones: Clones,
     /// IO failures the explorer may inject in one execution.
     pub failures: u32,
+    /// Whether an injected failure is the device dying: every IO after it fails too, as on a
+    /// disk that is gone. Otherwise only the IO it was injected in fails. The store asks
+    /// failed IO again (`blaze_cas::FAILURES_MOST` times in a row before it stops), so only a
+    /// dying device stops it within a few injected failures.
+    pub dies: bool,
     /// Whether effects in flight complete in any order, or in the order asked.
     pub reorder_io: bool,
     pub wait: Wait,
@@ -477,6 +482,8 @@ pub struct Run<'a> {
     chooser: &'a mut Chooser,
     memo: &'a mut Memo,
     failures_left: u32,
+    /// The device died ([`Model::dies`]): every IO from here fails.
+    dead: bool,
     extra: Extra<'a>,
 }
 
@@ -508,6 +515,7 @@ impl<'a> Run<'a> {
             chooser,
             memo,
             failures_left: model.failures,
+            dead: false,
             extra,
         })
     }
@@ -549,9 +557,12 @@ impl<'a> Run<'a> {
             let flying = self.fs.in_flight();
             let open = if self.model.reorder_io { flying.len() } else { flying.len().min(1) };
             for (at, effect) in flying.iter().enumerate().take(open) {
-                options.push(format!("io: {effect}"));
-                actions.push(Action::Complete(at));
-                if self.failures_left > 0 {
+                // A dead device completes nothing: its IO only fails.
+                if !self.dead {
+                    options.push(format!("io: {effect}"));
+                    actions.push(Action::Complete(at));
+                }
+                if self.dead || self.failures_left > 0 {
                     options.push(format!("io: fail {effect}"));
                     actions.push(Action::Fail(at));
                 }
@@ -615,7 +626,10 @@ impl<'a> Run<'a> {
                     true
                 }
                 Action::Fail(at) => {
-                    self.failures_left -= 1;
+                    if !self.dead {
+                        self.failures_left -= 1;
+                        self.dead = self.model.dies;
+                    }
                     let completion = self.fs.fail(at);
                     if self.store.owns(completion.tag) {
                         self.store.complete(completion, &mut self.effects);
@@ -922,6 +936,8 @@ pub fn run_open(
     let mut store = Store::open(config(), &mut effects);
     fs.submit(&mut effects);
     let mut failures_left = model.failures;
+    // The device died ([`Model::dies`]): every IO from here fails.
+    let mut dead = false;
     loop {
         let states = fs
             .crash_states(bounds.crash_states)
@@ -964,9 +980,12 @@ pub fn run_open(
         let mut options: Vec<String> = Vec::new();
         let mut actions: Vec<Action> = Vec::new();
         for (at, effect) in flying.iter().enumerate().take(width) {
-            options.push(format!("io: {effect}"));
-            actions.push(Action::Complete(at));
-            if failures_left > 0 {
+            // A dead device completes nothing: its IO only fails.
+            if !dead {
+                options.push(format!("io: {effect}"));
+                actions.push(Action::Complete(at));
+            }
+            if dead || failures_left > 0 {
                 options.push(format!("io: fail {effect}"));
                 actions.push(Action::Fail(at));
             }
@@ -982,7 +1001,10 @@ pub fn run_open(
         }
         let completion = match actions.swap_remove(chooser.pick(&options)?) {
             Action::Fail(at) => {
-                failures_left -= 1;
+                if !dead {
+                    failures_left -= 1;
+                    dead = model.dies;
+                }
                 fs.fail(at)
             }
             Action::Complete(at) => fs.complete(at),

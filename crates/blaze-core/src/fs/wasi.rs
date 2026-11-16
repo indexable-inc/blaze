@@ -140,19 +140,18 @@ pub(crate) fn stamps(root: &Path, names: &Names) -> io::Result<Vec<Stamp>> {
 
 /// [`crate::Effect::Entries`]: what is directly in `dir` (named `name` under the root), each
 /// with its stamp, sorted by name; symbolic links are stamped themselves.
-pub(crate) fn entries(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, Stamp)>> {
-    // alloc: the listing's payload.
-    let mut found = Vec::new();
+pub(crate) fn entries(dir: &Path, name: &crate::DirName) -> io::Result<crate::Listing> {
+    // clone: the listing's directory, a refcount.
+    let mut found = crate::ListingBuilder::new(name.clone());
     // alloc: once per listing, std's handle of the directory.
     let read = std::fs::read_dir(dir)
         .map_err(|error| io::Error::new(error.kind(), format!("{}: {error}", dir.display())));
     for entry in read? {
         let entry = entry?;
-        // alloc: std's copy of the entry's name, and the name, the listing's payload.
-        let file = super::child_name(name, &entry.file_name(), || entry.path())?;
+        // alloc: std's copy of the entry's name.
+        let leaf = entry.file_name();
         // Of the entry itself, not followed through a symlink.
-        found.push((file, stamp_or_gone(entry.metadata())));
+        found.push(leaf.as_encoded_bytes(), stamp_or_gone(entry.metadata()))?;
     }
-    found.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-    Ok(found)
+    Ok(found.finish()?)
 }

@@ -20,14 +20,27 @@ blaze-typeck.workspace = true
 blaze-lir.workspace = true
 # `Alloc`: the allocator `Checked` is in.
 blaze-own.workspace = true
+# `ContentId` and `Hasher`: an instance's key. By path: the workspace entry turns on serde adapters.
+blaze-ids = { path = "../blaze-ids" }
+# `testing`: `read_back`, a value's record read through emitted code (blaze-consteval's
+# layout-drift test).
+blaze-emit = { workspace = true, optional = true }
+blaze-inproc = { workspace = true, optional = true }
+
+[features]
+testing = ["dep:blaze-emit", "dep:blaze-inproc"]
 
 [dev-dependencies]
-# `ToyCtx`: the bodies of the tests are checked before they are built.
-blaze-typeck = { workspace = true, features = ["toy"] }
+# `InferCtx`: the bodies of the tests are checked before they are built. `testing`: the
+# checker's fixture world (`fixture::{Fx, Bb}`), whose trait facts the trait-object tests use.
+blaze-typeck = { workspace = true, features = ["testing"] }
 # The evaluator a built function's result is compared with.
 blaze-lir = { workspace = true, features = ["eval"] }
 blaze-own = { workspace = true, features = ["std"] }
 blaze-sim.workspace = true
+# Thread-locals' two-thread test: the getter emitted and run for real.
+blaze-emit.workspace = true
+blaze-inproc.workspace = true
 
 [lints]
 workspace = true

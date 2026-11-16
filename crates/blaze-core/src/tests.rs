@@ -255,6 +255,306 @@ fn every_driver_writes_and_renames_without_a_sync_the_same() {
     assert_eq!(simulated.len(), 12);
 }
 
+/// The reads above the root, from the driver's answer of its ancestors: the depth it answered
+/// (cut to `most`), a stat, a read and a listing two folders up, and a file not there.
+fn above_script(driver: &mut impl Driver, most: u8) -> Vec<String> {
+    let mut seen = Vec::new();
+    let mut ancestors = None;
+    let mut effects = vec![Effect::Ancestors { most, tag: Tag(1) }];
+    run_until_idle(driver, &mut effects, |done, effects| {
+        let shown = match done.done {
+            Done::Ancestors(answered) => {
+                let shown = format!("depth {}", answered.depth());
+                ancestors = Some(answered);
+                shown
+            }
+            Done::Stat(Some(meta)) => format!("stat {} bytes dir {}", meta.len, meta.dir),
+            Done::Listed(names) => {
+                format!("{:?}", names.iter().map(|(name, meta)| (name.as_str().to_owned(), meta.dir)).collect::<Vec<_>>())
+            }
+            Done::Failed(_) => "failed".to_owned(),
+            other => format!("{other:?}"),
+        };
+        seen.push(shown);
+        let Some(ancestors) = &ancestors else { return };
+        let above = |up, rest: Option<&str>| ancestors.above(up, rest.map(name)).expect("a name above, granted");
+        let next = match done.tag.0 {
+            1 if ancestors.depth() >= 2 => Effect::Above { op: crate::AboveOp::Stat, name: above(2, Some("Cargo.toml")), tag: Tag(2) },
+            2 => Effect::Above { op: crate::AboveOp::Read, name: above(2, Some("Cargo.toml")), tag: Tag(3) },
+            3 => Effect::Above { op: crate::AboveOp::List, name: above(2, None), tag: Tag(4) },
+            4 => Effect::Above { op: crate::AboveOp::Read, name: above(1, Some("absent")), tag: Tag(5) },
+            _ => return,
+        };
+        effects.push(next);
+    })
+    .expect("the effects end");
+    seen
+}
+
+/// The folders above the root read the same on the simulation and on disk; past the granted
+/// top and back down into the root no name can be made.
+#[test]
+fn every_driver_reads_above_its_root_the_same() {
+    let top = dir("above");
+    let start = top.path().join("ws/crate");
+    std::fs::create_dir_all(&start).unwrap();
+    std::fs::write(top.path().join("Cargo.toml"), b"[workspace]").unwrap();
+    std::fs::create_dir(top.path().join("docs")).unwrap();
+    let mut sim = Sim::new(1, Faults::default());
+    sim.set_above(vec![
+        crate::sim::SimAbove { toward: "crate".into(), files: Vec::new() },
+        crate::sim::SimAbove {
+            toward: "ws".into(),
+            files: vec![(name("Cargo.toml"), b"[workspace]".to_vec()), (name("docs/a"), Vec::new())],
+        },
+    ]);
+    let simulated = above_script(&mut sim, 2);
+    let on_disk = above_script(&mut Threads::new(&start, 2), 2);
+    assert_eq!(simulated, on_disk);
+    assert_eq!(
+        simulated,
+        [
+            "depth 2",
+            "stat 11 bytes dir false",
+            "Read([91, 119, 111, 114, 107, 115, 112, 97, 99, 101, 93])",
+            r#"[("Cargo.toml", false), ("docs", true), ("ws", true)]"#,
+            "failed",
+        ]
+    );
+    #[cfg(target_os = "macos")]
+    assert_eq!(above_script(&mut crate::kqueue::Kqueue::new(&start, 2).unwrap(), 2), simulated);
+    // Granted one folder: the answer is cut there, and two up is past the top.
+    let one = above_script(&mut sim, 1);
+    assert_eq!(one, ["depth 1"]);
+    let mut effects = vec![Effect::Ancestors { most: 1, tag: Tag(1) }];
+    let mut answered = None;
+    run_until_idle(&mut sim, &mut effects, |done, _| {
+        if let Done::Ancestors(it) = done.done {
+            answered = Some(it);
+        }
+    })
+    .unwrap();
+    let answered = answered.unwrap();
+    assert_eq!(answered.above(2, None), Err(crate::AboveRefused::PastTop { up: 2, depth: 1 }));
+    assert_eq!(answered.above(0, None), Err(crate::AboveRefused::Root));
+    assert_eq!(
+        answered.above(1, Some(name("crate/src/lib.rs"))),
+        Err(crate::AboveRefused::IntoStart { up: 1, toward: "crate".into() })
+    );
+    assert!(answered.above(1, Some(name("crates2/x"))).is_ok(), "a sibling whose name only starts the same");
+}
+
+/// One level of a tree written through `driver`, listed: each entry's own name, kind and (for
+/// a file) length, the listing's order kept. Names that sort differently by bytes than by any
+/// other rule (case, punctuation, a multi-byte letter, a digit) and a directory among files.
+fn entries_script(driver: &mut impl Driver) -> Vec<String> {
+    // No two names differ by case alone: APFS, as macOS formats it, holds them as one.
+    let files = ["src/b.rs", "src/C.rs", "src/a-b", "src/a.b", "src/a/inner.rs", "src/é", "src/z", "src/_x", "src/0"];
+    let mut effects: Vec<Effect> = files
+        .iter()
+        .enumerate()
+        .map(|(at, it)| Effect::Write { file: name(it), bytes: vec![b'x'; at], tag: Tag(at as u64) })
+        .collect();
+    run_until_idle(&mut *driver, &mut effects, |_, _| {}).unwrap();
+    let mut seen = Vec::new();
+    let mut effects = vec![
+        // The root itself, which holds `src` alone.
+        Effect::Entries { dir: crate::DirName::Root, tag: Tag(99) },
+        Effect::Entries { dir: name("src").into(), tag: Tag(100) },
+        Effect::Entries { dir: name("src/missing").into(), tag: Tag(101) },
+        Effect::Entries { dir: name("src/z").into(), tag: Tag(102) },
+    ];
+    let mut done = BTreeMap::new();
+    run_until_idle(&mut *driver, &mut effects, |it, _| _ = done.insert(it.tag, it.done)).unwrap();
+    for (tag, done) in done {
+        match done {
+            Done::Entries(listing) => {
+                let want = match tag {
+                    Tag(99) => crate::DirName::Root,
+                    _ => name("src").into(),
+                };
+                assert_eq!(listing.dir(), &want);
+                if tag == Tag(99) {
+                    assert_eq!((listing.find_file("src"), listing.file(0)), (Some(0), name("src")));
+                }
+                for (at, (leaf, stamp)) in listing.iter().enumerate() {
+                    let kind = listing.kind(at);
+                    assert_eq!(listing.find(leaf.as_str()), Some(at), "found by name");
+                    let len = match kind {
+                        crate::Kind::File => stamp.size.to_string(),
+                        _ => "-".into(),
+                    };
+                    seen.push(format!("{leaf} {kind:?} {len}"));
+                }
+            }
+            Done::Failed(_) => seen.push("failed".into()),
+            other => panic!("{other:?}"),
+        }
+    }
+    seen
+}
+
+/// Every driver lists one level of a directory as the simulation does: the same names, in the
+/// order of their bytes, with the same kinds and lengths; a directory that is not there, or a
+/// file, fails.
+#[test]
+fn every_driver_lists_one_level_the_same() {
+    let simulated = entries_script(&mut Sim::new(1, Faults::default()));
+    assert_eq!(
+        simulated,
+        [
+            "src Dir -", "0 File 8", "C.rs File 1", "_x File 7", "a Dir -", "a-b File 2", "a.b File 3", "b.rs File 0",
+            "z File 6", "é File 5", "failed", "failed",
+        ]
+    );
+    let root = dir("entries-threads");
+    assert_eq!(entries_script(&mut Threads::new(root.path(), 2)), simulated);
+    #[cfg(target_os = "macos")]
+    {
+        let root = dir("entries-kqueue");
+        assert_eq!(entries_script(&mut crate::kqueue::Kqueue::new(root.path(), 2).unwrap()), simulated);
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    {
+        let root = dir("entries-native");
+        assert_eq!(entries_script(&mut crate::native(root.path(), 2).unwrap()), simulated);
+    }
+}
+
+/// What a driver tells of one column of names stamped as one [`Effect::Stamp`] (the batched
+/// stat: one submission, one completion): each row a kind and a file's length, or `gone` for a
+/// name not there or under a file; an empty column; and a column past [`crate::STAMP_MOST`],
+/// refused as a whole.
+fn stamps_script(driver: &mut impl Driver) -> Vec<String> {
+    let mut effects = vec![
+        Effect::Write { file: name("s/a.rs"), bytes: vec![b'x'; 3], tag: Tag(1) },
+        Effect::Write { file: name("s/sub/b.rs"), bytes: vec![b'y'; 5], tag: Tag(2) },
+    ];
+    run_until_idle(&mut *driver, &mut effects, |_, _| {}).unwrap();
+    let rows = ["s/a.rs", "s/sub/b.rs", "s/sub", "s/missing", "s/a.rs/under", "s/a.rs"];
+    let mut column = crate::Names::with_capacity(rows.len(), 64);
+    for it in rows {
+        column.push(&name(it));
+    }
+    let mut over = crate::Names::with_capacity(crate::STAMP_MOST + 1, 2 * (crate::STAMP_MOST + 1));
+    for _ in 0..=crate::STAMP_MOST {
+        over.push(&name("a"));
+    }
+    let mut effects = vec![
+        Effect::Stamp { files: std::sync::Arc::new(column), tag: Tag(10) },
+        Effect::Stamp { files: std::sync::Arc::new(crate::Names::default()), tag: Tag(11) },
+        Effect::Stamp { files: std::sync::Arc::new(over), tag: Tag(12) },
+    ];
+    let mut done = BTreeMap::new();
+    run_until_idle(&mut *driver, &mut effects, |it, _| _ = done.insert(it.tag, it.done)).unwrap();
+    let mut seen = Vec::new();
+    for (tag, done) in done {
+        match done {
+            Done::Stamped(stamps) => {
+                seen.push(format!("{tag:?}: {} rows", stamps.len()));
+                for stamp in stamps {
+                    seen.push(match stamp.mode & crate::S_IFMT {
+                        _ if stamp == crate::Stamp::GONE => "gone".into(),
+                        crate::S_IFDIR => "dir".into(),
+                        crate::S_IFREG => format!("file {}", stamp.size),
+                        other => format!("mode {other:o}"),
+                    });
+                }
+            }
+            Done::Failed(crate::IoError(why)) if why.contains("STAMP_MOST") => seen.push(format!("{tag:?}: refused")),
+            other => panic!("{tag:?}: {other:?}"),
+        }
+    }
+    seen
+}
+
+/// Every driver stamps a column as the simulation does, refuses one past the cap as a whole,
+/// and the same file twice in one column stamps the same.
+#[test]
+fn every_driver_stamps_a_column_the_same() {
+    let simulated = stamps_script(&mut Sim::new(1, Faults::default()));
+    assert_eq!(
+        simulated,
+        [
+            "Tag(10): 6 rows", "file 3", "file 5", "dir", "gone", "gone", "file 3", "Tag(11): 0 rows",
+            "Tag(12): refused",
+        ]
+    );
+    let root = dir("stamps-threads");
+    assert_eq!(stamps_script(&mut Threads::new(root.path(), 2)), simulated);
+    #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+    {
+        let root = dir("stamps-native");
+        assert_eq!(stamps_script(&mut crate::native(root.path(), 2).unwrap()), simulated);
+    }
+}
+
+/// One [`Effect::Roots`] on `driver`, as what it ended with: its roots' count, or the places
+/// looked and why each gave none.
+fn roots_asked(driver: &mut impl Driver) -> Result<usize, Vec<String>> {
+    let mut effects = vec![Effect::Roots { cert_file: None, cert_dir: None, tag: Tag(1) }];
+    let mut told = None;
+    run_until_idle(driver, &mut effects, |it, _| told = Some(it.done)).unwrap();
+    match told.expect("the roots' completion") {
+        Done::Roots(roots) => Ok(roots.len()),
+        Done::Untrusted(error) => Err(error.looked.iter().map(|it| format!("{:?}: {:?}", it.place, it.why)).collect()),
+        other => panic!("Effect::Roots ended {other:?}"),
+    }
+}
+
+/// The simulation's store answers what the test gave it, and counts each ask (so a client's
+/// "read once" is testable); a world never given roots answers by name that it has none. On
+/// macOS and Linux the native driver and the threads driver read the machine's store, on a
+/// thread of the host's, and find roots there.
+#[test]
+fn roots_are_the_worlds_and_each_ask_is_counted() {
+    let mut sim = Sim::new(1, Faults::default());
+    let none = roots_asked(&mut sim).unwrap_err();
+    assert!(none.len() == 1 && none[0].contains("Sim::roots never called"), "{none:?}");
+    let mut roots = crate::trust::Roots::new_in(std::alloc::Global);
+    roots.add(b"one root's DER").unwrap();
+    roots.add(b"another").unwrap();
+    sim.roots(roots);
+    assert_eq!(roots_asked(&mut sim), Ok(2));
+    assert_eq!(sim.roots_read(), 2);
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let root = dir("roots-native");
+        let native = roots_asked(&mut crate::native(root.path(), 2).unwrap()).unwrap();
+        let threads = roots_asked(&mut Threads::new(root.path(), 2)).unwrap();
+        assert!(native > 0 && native == threads, "the machine's roots: native {native}, threads {threads}");
+    }
+}
+
+/// On Linux, where a name may be any bytes: a directory holding one that is not UTF-8 fails its
+/// listing on every driver, naming the directory and the name escaped (the listing's rule).
+#[cfg(target_os = "linux")]
+#[test]
+fn a_name_that_is_not_utf8_fails_its_listing_naming_it() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let root = dir("entries-not-utf8");
+    std::fs::create_dir(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("src").join(std::ffi::OsStr::from_bytes(b"caf\xe9")), b"").unwrap();
+    let list = |driver: &mut dyn FnMut(&mut Vec<Effect>, &mut Vec<Done>)| {
+        let mut done = Vec::new();
+        driver(&mut vec![Effect::Entries { dir: name("src").into(), tag: Tag(1) }], &mut done);
+        done
+    };
+    for done in [
+        list(&mut |effects, done| {
+            run_until_idle(&mut Threads::new(root.path(), 2), effects, |it, _| done.push(it.done)).unwrap()
+        }),
+        list(&mut |effects, done| {
+            run_until_idle(&mut crate::native(root.path(), 2).unwrap(), effects, |it, _| done.push(it.done)).unwrap()
+        }),
+    ] {
+        assert!(
+            matches!(&done[..], [Done::Failed(crate::IoError(why))] if why.contains("src/caf\\xe9: a name that is not UTF-8")),
+            "{done:?}"
+        );
+    }
+}
+
 /// This target's [`crate::Native`] driver, as the build path makes it, ends the script as the
 /// threads driver does.
 #[cfg(any(target_os = "linux", target_os = "macos", windows))]

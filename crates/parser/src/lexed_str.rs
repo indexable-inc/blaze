@@ -18,6 +18,7 @@ use std::{borrow::Cow, ops};
 
 use blaze_mem::scratch::{self, Lent};
 
+use crate::line_break::has_bare_cr;
 use crate::unescape::{
     EscapeError, Mode, unescape_byte, unescape_byte_str, unescape_c_str, unescape_char,
     unescape_str,
@@ -375,6 +376,11 @@ impl<'a> Converter<'a> {
         }
     }
 
+    /// Whether the `len` bytes from the offset hold a bare CR (crate::line_break).
+    fn bare_cr(&self, len: usize) -> bool {
+        has_bare_cr(self.res.text.as_bytes(), self.offset..self.offset + len)
+    }
+
     fn comment_kind(doc_style: Option<rustc_lexer::DocStyle>) -> SyntaxKind {
         match doc_style {
             Some(rustc_lexer::DocStyle::Outer) => OUTER_DOC_COMMENT,
@@ -393,24 +399,26 @@ impl<'a> Converter<'a> {
         // being `u16` that come from `syntax_tree::SyntaxKind`.
         let syntax_kind = {
             match kind {
-                rustc_lexer::TokenKind::LineComment { doc_style } => Self::comment_kind(*doc_style),
+                rustc_lexer::TokenKind::LineComment { doc_style } => {
+                    if doc_style.is_some() && self.bare_cr(token_text.len()) {
+                        self.error("bare CR not allowed in doc-comment");
+                    }
+                    Self::comment_kind(*doc_style)
+                }
                 rustc_lexer::TokenKind::BlockComment { doc_style, terminated } => {
                     if !terminated {
                         self.error("Missing trailing `*/` symbols to terminate the block comment");
+                    } else if doc_style.is_some() && self.bare_cr(token_text.len()) {
+                        self.error("bare CR not allowed in block doc-comment");
                     }
                     Self::comment_kind(*doc_style)
                 }
 
-                rustc_lexer::TokenKind::Frontmatter {
-                    has_invalid_preceding_whitespace,
-                    invalid_infostring,
-                } => {
-                    if *has_invalid_preceding_whitespace {
-                        self.error("invalid preceding whitespace for frontmatter opening");
-                    } else if *invalid_infostring {
-                        self.error("invalid infostring for frontmatter");
-                    }
-                    FRONTMATTER
+                // The file's frontmatter is crate::frontmatter's, which reads a CR LF break as
+                // the language does; rustc_lexer's flags would call the CR an infostring
+                // (crate::line_break).
+                rustc_lexer::TokenKind::Frontmatter { .. } => {
+                    unreachable!("rustc_lexer lexes the parser's text with frontmatter not allowed")
                 }
 
                 rustc_lexer::TokenKind::Whitespace => WHITESPACE,
@@ -549,8 +557,17 @@ impl<'a> Converter<'a> {
         self.push(syntax_kind, token_text.len());
     }
 
+    /// A raw string's errors: an invalid opening, or a bare CR in it (its CR LFs are line
+    /// breaks, crate::line_break). The quotes and `#`s hold no CR, so the whole token is read.
+    fn raw_errors(&mut self, n_hashes: Option<u8>, len: usize) {
+        if n_hashes.is_none() {
+            self.error("Invalid raw string literal");
+        } else if self.bare_cr(len) {
+            self.error(err_to_msg(&EscapeError::BareCarriageReturnInRawString, Mode::RawStr));
+        }
+    }
+
     fn extend_literal(&mut self, len: usize, kind: &rustc_lexer::LiteralKind) {
-        const INVALID_RAW: &str = "Invalid raw string literal";
         let source: &'a str = self.res.text;
         let no_end_quote = |this: &mut Self, c: char, kind: &str| {
             // alloc: the error path (an unterminated literal).
@@ -637,21 +654,15 @@ impl<'a> Converter<'a> {
                 C_STRING
             }
             rustc_lexer::LiteralKind::RawStr { n_hashes } => {
-                if n_hashes.is_none() {
-                    self.error(INVALID_RAW);
-                }
+                self.raw_errors(n_hashes, len);
                 STRING
             }
             rustc_lexer::LiteralKind::RawByteStr { n_hashes } => {
-                if n_hashes.is_none() {
-                    self.error(INVALID_RAW);
-                }
+                self.raw_errors(n_hashes, len);
                 BYTE_STRING
             }
             rustc_lexer::LiteralKind::RawCStr { n_hashes } => {
-                if n_hashes.is_none() {
-                    self.error(INVALID_RAW);
-                }
+                self.raw_errors(n_hashes, len);
                 C_STRING
             }
         };
@@ -686,8 +697,12 @@ fn err_to_msg(error: &EscapeError, mode: Mode) -> &'static str {
             "unknown byte escape"
         }
         EscapeError::InvalidEscape => "unknown character escape",
-        EscapeError::BareCarriageReturn => "",
-        EscapeError::BareCarriageReturnInRawString => "",
+        // A CR not part of a CR LF (crate::line_break); a CR LF is a line break, no error.
+        EscapeError::BareCarriageReturn if mode == Mode::Char || mode == Mode::Byte => {
+            "character constant must be escaped: `\\r`"
+        }
+        EscapeError::BareCarriageReturn => "bare CR not allowed in string, use `\\r` instead",
+        EscapeError::BareCarriageReturnInRawString => "bare CR not allowed in raw string",
         EscapeError::EscapeOnlyChar if mode == Mode::Byte => "byte constant must be escaped",
         EscapeError::EscapeOnlyChar => "character constant must be escaped",
         EscapeError::TooShortHexEscape => "numeric character escape is too short",

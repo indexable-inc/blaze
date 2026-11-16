@@ -526,6 +526,46 @@ enum Shape {
     Many(u16, i64, char),
 }
 
+/// An enum's own form, as every enum but `Option` and `Result` needs one (the debug module
+/// says why); its fields go through the reflected walk.
+impl crate::DebugForm for Shape {
+    fn debug_form(&self, out: &mut dyn Put) {
+        match self {
+            Shape::Empty => _ = out.str("Empty"),
+            Shape::Dot(p) => _ = out.str("Dot(").debug(p).byte(b')'),
+            Shape::Line { from, to, label } => {
+                _ = out.str("Line { from: ").debug(from).str(", to: ").debug(to).str(", label: ").debug(label).str(" }");
+            }
+            Shape::Many(a, b, c) => _ = out.str("Many(").debug(a).str(", ").debug(b).str(", ").debug(c).byte(b')'),
+        }
+    }
+}
+
+/// Discriminants set by hand, in the other order: what the walk would name wrongly from the
+/// discriminant.
+#[derive(Debug, Clone, Copy)]
+enum Swapped {
+    A = 1,
+    B = 0,
+}
+
+debug_variants!(Swapped { A, B });
+
+#[test]
+fn an_enum_with_set_discriminants_is_named_right_or_not_built() {
+    // The walk reads no enum but `Option` and `Result`: any other would stop the build.
+    assert!(!const { crate::debug::walks_enum::<Swapped>() });
+    assert!(!const { crate::debug::walks_enum::<Shape>() });
+    assert!(const { crate::debug::walks_enum::<Option<Swapped>>() });    // Its own form from the one line names each variant right.
+    for x in [Swapped::A, Swapped::B, Swapped::B] {
+        debug_oracle(&x).unwrap_or_else(|broke| panic!("{broke:?}"));
+        debug_oracle(&Some(x)).unwrap_or_else(|broke| panic!("{broke:?}"));
+    }
+    for x in [core::cmp::Ordering::Less, core::cmp::Ordering::Equal, core::cmp::Ordering::Greater] {
+        debug_oracle(&x).unwrap_or_else(|broke| panic!("{broke:?}"));
+    }
+}
+
 #[derive(Debug)]
 struct Everything {
     shape: Shape,
@@ -560,8 +600,18 @@ match ours == core {
 
 fn everything(tape: &Tape) -> Everything {
     static SLICES: [&[i16]; 3] = [&[], &[-1], &[1, -32768, 32767]];
-    static TEXTS: [&str; 5] = ["", "plain", "quote \" and 'tick'", "tab\tnul\0bell\u{7}", "é ünïcode"];
-    static CHARS: [char; 6] = ['a', '\'', '"', '\n', '\u{1b}', 'é'];
+    static TEXTS: [&str; 9] = [
+        "",
+        "plain",
+        "quote \" and 'tick'",
+        "tab\tnul\0bell\u{7}del\u{7f}",
+        "é ünïcode",
+        "\u{301}accent first, then e\u{301}",
+        "zero\u{200b}width and \u{feff}bom",
+        "c1 \u{85} and \u{a0} nbsp",
+        "private \u{e000} and unassigned \u{378}",
+    ];
+    static CHARS: [char; 11] = ['a', '\'', '"', '\n', '\u{1b}', 'é', '\u{301}', '\u{200b}', '\u{85}', '\u{378}', '\u{1f600}'];
     let shape = match tape.below(4, "shape") {
         0 => Shape::Empty,
         1 => Shape::Dot(Point { x: tape.next_u32("x").cast_signed(), y: tape.f64("y") }),

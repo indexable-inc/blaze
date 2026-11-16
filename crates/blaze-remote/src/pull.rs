@@ -427,7 +427,7 @@ pub fn store_error(failure: &Failure) -> StoreError {
 /// phrase.
 fn refused(why: &Why) -> &'static str {
     match why {
-        Why::Signature => "an object of the bucket refused: its signature does not verify",
+        Why::Signature(_) => "an object of the bucket refused: its signature does not verify",
         Why::UnknownSigner => "an object of the bucket refused: its signer is not trusted for its namespace",
         Why::Revoked => "an object of the bucket refused: its signer is revoked",
         Why::NotValid { .. } => "an object of the bucket refused: its signer was not valid when it was issued",

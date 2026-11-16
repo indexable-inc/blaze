@@ -154,6 +154,10 @@ pub enum PredA {
     Wf(TyA),
     Sub(TyA, TyA),
     ForAll(Vec<String>, Box<PredA>),
+    /// `const NAME(T, ..)`: a `where const` condition at the arguments. The test world answers
+    /// it by the name, whatever the arguments: `yes` true, `no` false, `err` an evaluation
+    /// error; any other name is a fact the world lacks (`Missing`).
+    Const(String, Vec<TyA>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -929,6 +933,19 @@ impl P<'_> {
             let t = self.ty()?;
             self.expect(")")?;
             return Ok(PredA::Wf(t));
+        }
+        if self.eat_word("const") {
+            let name = self.ident()?;
+            self.expect("(")?;
+            let mut args = Vec::new();
+            while !self.eat(")") {
+                args.push(self.ty()?);
+                if !self.eat(",") {
+                    self.expect(")")?;
+                    break;
+                }
+            }
+            return Ok(PredA::Const(name, args));
         }
         if self.is_word("normalizes") && matches!(self.peek_at(1), Some(Tok::P("("))) {
             self.i += 2;

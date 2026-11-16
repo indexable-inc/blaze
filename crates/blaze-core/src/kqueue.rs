@@ -231,12 +231,12 @@ enum Owner {
 /// What each registration's `udata` names. Ids are handles' bits: one of a registration that
 /// has ended names nothing, even once its slot holds another's.
 struct Owners {
-    slab: Slab<Owner>,
+    slab: LazySlab<Owner>,
 }
 
 impl Owners {
     fn new() -> Result<Owners, MemError> {
-        Ok(Owners { slab: Slab::new(MOST, MemTag::Io)? })
+        Ok(Owners { slab: LazySlab::new() })
     }
 
     fn own(&mut self, owner: Owner) -> u64 {
@@ -323,8 +323,93 @@ fn no_slab(error: MemError) -> io::Error {
     io::Error::other(error)
 }
 
+/// A [`Slab`] whose region is reserved at its first insert, not with the driver: a program that
+/// never spawns, listens, connects or watches reserves nothing for them (std.md, "What a program
+/// pays for at start": macOS charges a reservation by its size, and these were seven of a
+/// start's map calls). Reads of one never inserted into find nothing.
+struct LazySlab<T> {
+    slab: Option<Slab<T>>,
+}
+
+impl<T> LazySlab<T> {
+    const fn new() -> LazySlab<T> {
+        LazySlab { slab: None }
+    }
+
+    /// The slab, reserved now if it was not.
+    fn made(&mut self) -> Result<&mut Slab<T>, MemError> {
+        if self.slab.is_none() {
+            self.slab = Some(Slab::new(MOST, MemTag::Io)?);
+        }
+        Ok(self.slab.as_mut().expect("made just above"))
+    }
+
+    fn try_insert(&mut self, value: T) -> Result<blaze_mem::Handle<T>, MemError> {
+        self.made()?.try_insert(value)
+    }
+
+    /// As [`Slab::insert`]: a refusal of its region or its room panics, naming the tag.
+    #[track_caller]
+    fn insert(&mut self, value: T) -> blaze_mem::Handle<T> {
+        match self.made() {
+            Ok(slab) => slab.insert(value),
+            Err(error) => panic!("the kqueue driver's slab of {}: {error}", core::any::type_name::<T>()),
+        }
+    }
+
+    fn get(&self, handle: blaze_mem::Handle<T>) -> Option<&T> {
+        self.slab.as_ref()?.get(handle)
+    }
+
+    fn get_mut(&mut self, handle: blaze_mem::Handle<T>) -> Option<&mut T> {
+        self.slab.as_mut()?.get_mut(handle)
+    }
+
+    fn remove(&mut self, handle: blaze_mem::Handle<T>) -> Option<T> {
+        self.slab.as_mut()?.remove(handle)
+    }
+
+    fn len(&self) -> usize {
+        self.slab.as_ref().map_or(0, Slab::len)
+    }
+
+    #[cfg(test)]
+    fn contains(&self, handle: blaze_mem::Handle<T>) -> bool {
+        self.slab.as_ref().is_some_and(|slab| slab.contains(handle))
+    }
+
+    /// Whether its region was reserved: a test's view.
+    #[cfg(test)]
+    fn reserved(&self) -> bool {
+        self.slab.is_some()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (blaze_mem::Handle<T>, &T)> {
+        self.slab.iter().flat_map(Slab::iter)
+    }
+
+    fn iter_mut(&mut self) -> impl Iterator<Item = (blaze_mem::Handle<T>, &mut T)> {
+        self.slab.iter_mut().flat_map(Slab::iter_mut)
+    }
+}
+
+/// `tags`, made at [`TAGS`] at its first use and grown past that only as a table grows.
+fn first_use<V>(tags: &mut HashMap<Tag, V, Global>) -> &mut HashMap<Tag, V, Global> {
+    if tags.capacity() == 0 {
+        // alloc: once per driver and table, at its first tag.
+        tags.reserve(TAGS);
+    }
+    tags
+}
+
 pub struct Kqueue {
     start: Instant,
+    /// The machine's boot, read once as the driver is made ([`crate::Driver::boot`]).
+    boot: Result<crate::Boot, crate::NoBoot>,
     root: Arc<Path>,
     notify: Arc<Notify>,
     files: Receiver<Completion>,
@@ -338,7 +423,13 @@ pub struct Kqueue {
     backlog: VecDeque<Effect>,
     /// File effects at the threads whose completions are not taken yet.
     at_threads: usize,
+    /// The file threads started so far: one more each time a file effect finds every one
+    /// busy, up to [`Kqueue::most_threads`].
     workers: Vec<JoinHandle<()>>,
+    /// The most file threads it starts.
+    most_threads: usize,
+    /// The file threads' end of the queue, cloned into each as it starts.
+    queue: Receiver<Effect>,
     // dyn: the platform's sandbox, given once at setup and asked once per spawn.
     confine: Option<Arc<dyn Confine>>,
     /// Where each sandboxed spawn's own directory is made: `root/.blaze-spawn` unless
@@ -352,20 +443,21 @@ pub struct Kqueue {
     /// Completions made on the polling thread, in the order they happened.
     ready: Vec<Completion>,
     owners: Owners,
-    /// By ticks since `start`; the wait ends at the next one due.
-    timers: Wheel<Tag>,
-    watches: Slab<fsevents::Watch<Watched>>,
+    /// By ticks since `start`; the wait ends at the next one due. Made with the first timer
+    /// (`LazySlab`'s reason).
+    timers: Option<Wheel<Tag>>,
+    watches: LazySlab<fsevents::Watch<Watched>>,
     watch_tags: HashMap<Tag, WatchId, Global>,
     /// Stopped, for the next watch.
     spare: Vec<fsevents::Watch<Watched>>,
     /// The flushes a stopping watch had not told.
     untold: Vec<Tag>,
-    spawns: Slab<Spawned>,
+    spawns: LazySlab<Spawned>,
     spawn_tags: HashMap<Tag, SpawnId, Global>,
-    listens: Slab<Listening>,
+    listens: LazySlab<Listening>,
     listen_tags: HashMap<Tag, ListenId, Global>,
-    connecting: Slab<Connecting>,
-    conns: Slab<Connection>,
+    connecting: LazySlab<Connecting>,
+    conns: LazySlab<Connection>,
     /// The file locks of [`Effect::Lock`], each taken as it is asked for.
     locks: crate::locks::Locks,
     /// The [`Effect::Pressure`] in flight and its registration's id: one a kqueue, since the
@@ -432,24 +524,21 @@ impl Kqueue {
         let host = crate::host::Host::new(Arc::new(sink)); // alloc: setup, once per driver.
         // alloc: setup, once per driver: the table the file threads share.
         let descriptors = Arc::new(Descriptors::new());
-        let workers = (0..threads.max(1))
-            .map(|n| {
-                // clone: setup, one count of each per worker thread.
-                let (root, queue, notify) = (Arc::clone(&root), queue.clone(), Arc::clone(&notify));
-                let kept = Arc::clone(&descriptors); // clone: as above.
-                std::thread::Builder::new()
-                    // alloc: setup, once per thread.
-                    .name(format!("blaze-kqueue-{n}"))
-                    .spawn(move || work_on(&root, &kept, &queue, &notify))
-            })
-            // alloc: setup, once per driver.
-            .collect::<io::Result<Vec<_>>>()?;
+        // No file thread yet: each is started when a file effect finds every one busy
+        // ([`Kqueue::to_threads`]), up to `threads`.
+        // alloc: setup, once per driver: the handles, at their most.
+        let workers = Vec::with_capacity(threads.max(1));
+        // Each table of tags, the backlog, the spares and the output buffer are empty until
+        // their first use, then made at their usual most at once (`LazySlab`'s reason: a
+        // program that never watches, spawns or listens dirties none of their pages; measured
+        // 2026-11-16, hello's footprint at exit).
         fn tags<V>() -> HashMap<Tag, V, Global> {
-            HashMap::with_capacity_in(TAGS, Global)
+            HashMap::new_in(Global)
         }
         let spawn_dirs = root.join(".blaze-spawn"); // alloc: setup, once per driver.
         Ok(Kqueue {
             start: Instant::now(),
+            boot: crate::boot::system(),
             root,
             notify,
             files,
@@ -457,28 +546,30 @@ impl Kqueue {
             hosted,
             host,
             work: Some(work),
-            backlog: VecDeque::with_capacity(FILES), // alloc: setup, once per driver.
+            backlog: VecDeque::new(),
             at_threads: 0,
             workers,
+            most_threads: threads.max(1),
+            queue,
             confine: None,
             spawn_dirs,
-            buffer: vec![0; 64 << 10], // alloc: setup, once per driver.
+            buffer: Vec::new(),
             // alloc: setup, once per driver: the lists of a wait at their usual most.
             changes: Vec::with_capacity(EVENTS),
             events: Vec::with_capacity(2 * EVENTS), // alloc: as above.
             ready: Vec::with_capacity(EVENTS),      // alloc: as above.
             owners: Owners::new().map_err(no_slab)?,
-            timers: Wheel::try_new(wheel::MAX_TIMERS).map_err(no_slab)?,
-            watches: Slab::new(MOST, MemTag::Io).map_err(no_slab)?,
+            timers: None,
+            watches: LazySlab::new(),
             watch_tags: tags(),
-            spare: Vec::with_capacity(SPARE_WATCHES), // alloc: setup, once per driver.
+            spare: Vec::new(),
             untold: Vec::with_capacity(16),           // alloc: setup, once per driver.
-            spawns: Slab::new(MOST, MemTag::Io).map_err(no_slab)?,
+            spawns: LazySlab::new(),
             spawn_tags: tags(),
-            listens: Slab::new(MOST, MemTag::Io).map_err(no_slab)?,
+            listens: LazySlab::new(),
             listen_tags: tags(),
-            connecting: Slab::new(MOST, MemTag::Io).map_err(no_slab)?,
-            conns: Slab::new(MOST, MemTag::Io).map_err(no_slab)?,
+            connecting: LazySlab::new(),
+            conns: LazySlab::new(),
             locks: crate::locks::Locks::new(),
             pressure: None,
             in_flight: 0,
@@ -569,14 +660,21 @@ impl Kqueue {
             | Effect::Remove { .. }
             | Effect::MakeDir { .. }
             | Effect::RemoveDir { .. }
+            | Effect::Ancestors { .. }
+            | Effect::Above { .. }
             | Effect::Stamp { .. }
             | Effect::Entries { .. }
-            | Effect::Map { .. }) => {
+            | Effect::Map { .. }
+            | Effect::MapWrite { .. }) => {
                 match self.at_threads < FILES && self.backlog.is_empty() {
                     true => self.to_threads(effect),
-                    false => self.backlog.push_back(effect),
+                    false => {
+                        // alloc: once per driver, at the first effect beyond the threads.
+                        self.backlog.reserve(FILES);
+                        self.backlog.push_back(effect);
+                        Ok(())
+                    }
                 }
-                Ok(())
             }
             // A lock never waits, so it is taken here rather than on the threads.
             Effect::Lock { file, mode, tag } => {
@@ -591,7 +689,10 @@ impl Kqueue {
             }
             Effect::Timer { after, tag } => {
                 let due = wheel::ticks(self.start.elapsed()).saturating_add(wheel::ticks(after));
-                self.timers.insert(due, tag);
+                if self.timers.is_none() {
+                    self.timers = Some(Wheel::try_new(wheel::MAX_TIMERS).map_err(no_slab)?);
+                }
+                self.timers.as_mut().expect("made just above").insert(due, tag);
                 Ok(())
             }
             Effect::Watch { dir, tag } => self.watch(dir, None, tag),
@@ -657,7 +758,8 @@ impl Kqueue {
             | Effect::ReadStdin { .. }
             | Effect::WriteOut { .. }
             | Effect::Now { .. }
-            | Effect::Random { .. }) => {
+            | Effect::Random { .. }
+            | Effect::Roots { .. }) => {
                 self.host.submit(effect);
                 Ok(())
             }
@@ -668,10 +770,27 @@ impl Kqueue {
     }
 
     /// A file effect onto the threads' queue, which has room: at most [`FILES`] are there.
-    fn to_threads(&mut self, effect: Effect) {
+    /// When every file thread started so far is busy with one, another is started first (up
+    /// to [`Kqueue::most_threads`]), so a driver that is asked no file call starts no thread
+    /// and one asked one at a time starts one. A thread the system refuses fails this
+    /// effect, naming it; the effect is not queued.
+    fn to_threads(&mut self, effect: Effect) -> io::Result<()> {
+        if self.workers.len() <= self.at_threads && self.workers.len() < self.most_threads {
+            let n = self.workers.len();
+            // clone: one count of each per file thread, at its start.
+            let (root, queue, notify) = (Arc::clone(&self.root), self.queue.clone(), Arc::clone(&self.notify));
+            let kept = Arc::clone(&self.descriptors); // clone: as above.
+            let started = std::thread::Builder::new()
+                // alloc: once per thread.
+                .name(format!("blaze-kqueue-{n}"))
+                .spawn(move || work_on(&root, &kept, &queue, &notify))
+                .map_err(|error| io::Error::new(error.kind(), format!("file thread {n} of the kqueue driver: {error}")))?;
+            self.workers.push(started);
+        }
         let work = self.work.as_ref().expect("the driver is running");
         work.try_send(effect).expect("room for a file effect at the threads, which are running");
         self.at_threads += 1;
+        Ok(())
     }
 
     fn connection(&mut self, conn: Conn) -> io::Result<&mut Connection> {
@@ -704,7 +823,7 @@ impl Kqueue {
                     let done = Done::Journaled(Box::new(first));
                     self.ready.push(Completion { tag, done });
                 }
-                self.watch_tags.insert(tag, id);
+                first_use(&mut self.watch_tags).insert(tag, id);
                 Ok(())
             }
             Err(error) => {
@@ -741,11 +860,19 @@ impl Kqueue {
     fn keep(&mut self, watch: fsevents::Watch<Watched>) {
         debug_assert!(!watch.is_running());
         if self.spare.len() < SPARE_WATCHES {
+            // alloc: once per driver, at the first watch stopped.
+            self.spare.reserve_exact(SPARE_WATCHES);
             self.spare.push(watch);
         }
     }
 
     fn spawn(&mut self, command: Box<Command>, tag: Tag) -> io::Result<()> {
+        // A sandbox's scratch folder is named in its profile, which takes absolute paths; a
+        // driver over `.` (a program's start folder, not read at start) makes it absolute here,
+        // at the first spawn that could need it, once.
+        if self.spawn_dirs.is_relative() {
+            self.spawn_dirs = std::path::absolute(&self.spawn_dirs)?; // alloc: once per driver.
+        }
         let process::Started { pid, stdin, stdout, stderr, finish } =
             process::start(&self.spawn_dirs, command, self.confine.as_ref())?;
         // Reaped only as this driver's loop polls its exit: a stall report names the tag.
@@ -767,7 +894,7 @@ impl Kqueue {
         match self.follow(spawn) {
             Ok(()) => {
                 // A spawn of `tag` already runs on, followed by its own handle.
-                self.spawn_tags.insert(tag, spawn);
+                first_use(&mut self.spawn_tags).insert(tag, spawn);
                 Ok(())
             }
             Err(error) => {
@@ -821,6 +948,10 @@ impl Kqueue {
             false => (&mut spawned.stdout, &mut spawned.out),
         };
         let Some(fd) = pipe.as_ref().map(|it| it.as_raw_fd()) else { return };
+        if self.buffer.is_empty() {
+            // alloc: once per driver, at the first output read.
+            self.buffer.resize(64 << 10, 0);
+        }
         loop {
             // SAFETY: an open descriptor and a buffer of the length given.
             let n = unsafe { libc::read(fd, self.buffer.as_mut_ptr().cast(), self.buffer.len()) };
@@ -919,7 +1050,7 @@ impl Kqueue {
         let id = self.register(Owner::Listen(listen), fd, libc::EVFILT_READ, libc::EV_ADD, 0);
         self.listens.get_mut(listen).expect("inserted above").id = id;
         // A listen of `tag` already ends, as the one it is replaced by begins.
-        if let Some(old) = self.listen_tags.insert(tag, listen)
+        if let Some(old) = first_use(&mut self.listen_tags).insert(tag, listen)
             && let Some(old) = self.listens.remove(old)
         {
             self.disown(old.id);
@@ -1119,16 +1250,18 @@ impl Kqueue {
     /// Makes the changes asked for and waits until `until` (forever for `None`), or until the
     /// next timer is due, for events, and acts on them; then fires the timers due.
     fn wait(&mut self, until: Option<Deadline>) {
-        let timer = self.timers.next_deadline().map(|due| Deadline::at(Duration::from_nanos(due)));
+        let timer = self.timers.as_mut().and_then(Wheel::next_deadline).map(|due| Deadline::at(Duration::from_nanos(due)));
         let until = match (until, timer) {
             (Some(until), Some(timer)) => Some(until.min(timer)),
             (until, timer) => until.or(timer),
         };
         self.wait_events(until);
         let ready = &mut self.ready;
-        self.timers.advance(wheel::ticks(self.start.elapsed()), |_, tag| {
-            ready.push(Completion { tag, done: Done::Fired });
-        });
+        if let Some(timers) = &mut self.timers {
+            timers.advance(wheel::ticks(self.start.elapsed()), |_, tag| {
+                ready.push(Completion { tag, done: Done::Fired });
+            });
+        }
     }
 
     fn wait_events(&mut self, until: Option<Deadline>) {
@@ -1302,7 +1435,11 @@ impl Kqueue {
         }
         while self.at_threads < FILES {
             let Some(effect) = self.backlog.pop_front() else { break };
-            self.to_threads(effect);
+            let tag = effect.tag();
+            if let Err(error) = self.to_threads(effect) {
+                // alloc: an error path.
+                out.push(Completion { tag, done: Done::Failed(IoError(error.to_string())) });
+            }
         }
         while let Ok(completion) = self.watched.try_recv() {
             out.push(completion);
@@ -1449,6 +1586,10 @@ impl Driver for Kqueue {
         crate::system_wall_ns()
     }
 
+    fn boot(&self) -> Result<crate::Boot, crate::NoBoot> {
+        self.boot.clone()
+    }
+
     fn waker(&self) -> Option<crate::Waker> {
         // Only the polling thread reads it, and only after this call on that same thread.
         self.waker_given.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -1525,13 +1666,11 @@ fn no_sigpipe(fd: RawFd) -> io::Result<()> {
     let on: libc::c_int = 1;
     // SAFETY: an open socket and an int of the size given.
     let set = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_NOSIGPIPE,
-            (&raw const on).cast(),
-            size_of::<libc::c_int>() as libc::socklen_t,
-        )
+        libc::setsockopt(fd,
+        libc::SOL_SOCKET,
+        libc::SO_NOSIGPIPE,
+        (&raw const on).cast(),
+        size_of::<libc::c_int>() as libc::socklen_t,)
     };
     if set != 0 {
         return Err(io::Error::last_os_error());
@@ -1571,6 +1710,30 @@ mod tests {
     /// long as a driver works in it.
     fn dir(what: &str) -> crate::temp::TempDir {
         crate::temp::TempDir::for_test(&format!("blaze-kq-{what}-"))
+    }
+
+    /// A new driver reserves no slab and no timer wheel (the start's map calls): each is made by
+    /// the first effect that needs it, and a timer made that way still fires.
+    #[test]
+    fn a_new_driver_reserves_nothing_until_asked() {
+        let root = dir("lazy");
+        let mut driver = Kqueue::new(&*root, 1).unwrap();
+        let slabs = |d: &Kqueue| {
+            [d.owners.slab.reserved(), d.watches.reserved(), d.spawns.reserved(), d.listens.reserved()]
+                .into_iter()
+                .chain([d.connecting.reserved(), d.conns.reserved(), d.timers.is_some()])
+                .filter(|reserved| *reserved)
+                .count()
+        };
+        assert_eq!(slabs(&driver), 0, "a new driver reserved a region");
+        driver.submit(&mut vec![Effect::Timer { after: Duration::from_millis(1), tag: Tag(3) }]);
+        assert_eq!(slabs(&driver), 1, "a timer makes the wheel and nothing else");
+        let mut done = Vec::new();
+        while done.is_empty() {
+            driver.poll(&mut done, Deadline::after(driver.now(), Duration::from_secs(5)));
+        }
+        assert_eq!(done[0].tag, Tag(3));
+        assert!(matches!(done[0].done, Done::Fired), "{:?}", done[0].done);
     }
 
     fn command(program: &str, args: &[&str], stdin: &[u8]) -> Box<Command> {
@@ -2399,8 +2562,8 @@ mod tests {
             &mut driver,
             vec![
                 Effect::Stamp { files: Arc::new(names.clone()), tag: Tag(3) },
-                Effect::Entries { dir: name("src"), tag: Tag(4) },
-                Effect::Entries { dir: name("missing"), tag: Tag(5) },
+                Effect::Entries { dir: name("src").into(), tag: Tag(4) },
+                Effect::Entries { dir: name("missing").into(), tag: Tag(5) },
             ],
         );
         let stamps = crate::fs::stamps(&root, &names).unwrap();
@@ -2408,10 +2571,10 @@ mod tests {
         assert!(stamps[0].is_file() && stamps[0].size == 9, "{stamps:?}");
         assert!(stamps[1].is_dir() && stamps[2].is_link(), "{stamps:?}");
         assert!(stamps[3].is_gone() && stamps[4].is_gone(), "{stamps:?}");
-        let entries = crate::fs::entries(&root.join("src"), &name("src")).unwrap();
-        assert_eq!(seen[&4], Done::Entries(entries.clone()));
+        let entries = crate::fs::entries(&root.join("src"), &name("src").into()).unwrap();
+        assert_eq!(seen[&4], Done::Entries(Box::new(entries.clone())));
         let named: Vec<_> = entries.iter().map(|(it, _)| it.as_str()).collect();
-        assert_eq!(named, ["src/deep", "src/lib.rs", "src/link"]);
+        assert_eq!(named, ["deep", "lib.rs", "link"]);
         assert!(matches!(seen[&5], Done::Failed(_)));
         drop(driver);
         std::fs::remove_dir_all(root).unwrap();

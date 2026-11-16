@@ -109,6 +109,10 @@ macOS was not measured.
   (`mmap` with `PROT_NONE`, then `mprotect`; `VirtualAlloc` with `MEM_RESERVE` then
   `MEM_COMMIT`). Growing never moves data, so addresses and `u32` offsets stay stable, and
   there is no realloc-and-copy. Huge pages back the hot regions ([hardware.md](data.md)).
+  Address space is not free on macOS: a `PROT_NONE` reservation costs in proportion to its
+  size (arm64, 2026-11-15: 4 GiB 7 us, 64 GiB 98 us, 256 GiB 290 us), so one 256 GiB chunk
+  space made a command's first allocation 0.3 ms. There a big range is reserved in 4 GiB
+  segments as it is used (`chunks::Segments`); Linux reserves in constant time, in one.
 - **Generational handles.** Objects that are freed and reused (tasks, I/O operations, watch
   slots, live-patch sites) are referred to by `(index: u32, generation: u32)`. A stale handle
   is detected, not dereferenced.

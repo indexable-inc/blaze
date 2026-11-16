@@ -1,0 +1,8 @@
+[0;1;33mwarning  [0ma bare [0;2m`[0;1mas[0;2m` [0mcast to an integer
+[0;1;31merror  [0;2m`[0;1mv.len() as u32[0;2m` [0mcan lose bits
+  [0;2m╭─ ]8;;file:///work/hello%20world/src/main.rs\[0msrc/pick.rs[0;2m:2:17]8;;\[0m
+[0;2m1 │ fn pick(v: Vec<u8>) -> u8 {[0m
+[0;2m2 │     [0mlet first [0;2m= [0;1;4:3;58;5;3mv[0] as u32[0m [0;2m+ [0;1;4:3;58;5;1mv.len() as u32[0;2m;[0m
+  [0;2m│                 │             ╰─ [0;31mtruncates past 4 GiB[0m
+  [0;2m│                 ╰─ [0;33muse `u32::from`[0m
+  [0;2m╰─ blaze explain lint:casts · blaze explain lint:truncate[0m

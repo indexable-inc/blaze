@@ -241,6 +241,8 @@ pub enum TyKind {
     Foreign(Def),
     Array(Ty, Const),
     Slice(Ty),
+    /// A pattern type: the base and its canonical ranges (`ty::PAT`).
+    Pat(Ty, List),
     RawPtr(Ty, Mutability),
     Ref(Region, Ty, Mutability),
     FnDef(Def, List),
@@ -628,6 +630,23 @@ impl<'a> Tys<'a> {
 
     // ---- reading -------------------------------------------------------------------------
 
+    /// The node whose bits are `bits` ([`Node::bits`]), if this arena has a row of that class
+    /// there: the only way back from bits to a handle, and checked against the class's row
+    /// count, so a handle it gives is in bounds for every read. A handle is meaningful only
+    /// for the arena that made it: bits from another arena (or another task) may name a row
+    /// here that is a different term.
+    #[inline(always)]
+    pub fn node_at(&self, bits: u32) -> Option<Node> {
+        let i = ix(bits >> 2);
+        let rows = match bits & 3 {
+            TAG_TY => self.ty.len(),
+            TAG_REGION => self.re.len(),
+            TAG_CONST => self.ct.len(),
+            _ => self.list_start.len(),
+        };
+        if i < rows { Some(Node(bits)) } else { None }
+    }
+
     /// A node's flags.
     #[inline(always)]
     pub fn node_flags(&self, n: Node) -> Flags {
@@ -692,6 +711,20 @@ impl<'a> Tys<'a> {
         let i = ix(l.0);
         let s = ix(self.list_start[i]);
         &self.pool[s..s + ix(self.list_len[i])]
+    }
+
+    /// Where a list's elements are in the pool: `(start, len)`. A slice of a list is a span of
+    /// the pool ([`Tys::pool_get`] reads it), which is how blaze-solve names lists and their
+    /// tails without interning them.
+    #[inline(always)]
+    pub fn list_span(&self, l: List) -> (u32, u32) {
+        (self.list_start[ix(l.0)], self.list_len[ix(l.0)])
+    }
+
+    /// The element at position `at` of the list pool; `None` past its end.
+    #[inline(always)]
+    pub fn pool_get(&self, at: u32) -> Option<Arg> {
+        self.pool.get(ix(at)).copied()
     }
 
     #[inline(always)]
@@ -764,6 +797,7 @@ impl<'a> Tys<'a> {
             ty::FOREIGN => TyKind::Foreign(Def(a)),
             ty::ARRAY => TyKind::Array(na.ty(), nb.konst()),
             ty::SLICE => TyKind::Slice(na.ty()),
+            ty::PAT => TyKind::Pat(na.ty(), nb.list()),
             ty::PTR => TyKind::RawPtr(na.ty(), Mutability::Not),
             ty::PTR_MUT => TyKind::RawPtr(na.ty(), Mutability::Mut),
             ty::REF => TyKind::Ref(nb.region(), na.ty(), Mutability::Not),
@@ -854,9 +888,11 @@ impl<'a> Tys<'a> {
         }
     }
 
-    /// The predicate a type-arena row is, if it is one.
+    /// The predicate a type-arena row is, if it is one: a goal's predicate or a `dyn`'s
+    /// existential one (`pred_kind` reads both).
     pub fn as_pred(&self, t: Ty) -> Option<Pred> {
-        if kind::is_pred(self.kind_of(t)) { Some(Pred(t.0)) } else { None }
+        let k = self.kind_of(t);
+        if kind::is_pred(k) || kind::is_existential(k) { Some(Pred(t.0)) } else { None }
     }
 
     // ---- types ---------------------------------------------------------------------------
@@ -910,6 +946,12 @@ impl<'a> Tys<'a> {
 
     /// `dyn ..`: `preds` are `EX_*` rows (`ex_trait`, `ex_projection`, `ex_auto`), principal
     /// first, in the order the front end sorts them.
+    /// A pattern type over `base` with `ranges`, already canonical (blaze-typeck's
+    /// `PortableTys::pattern` makes the form).
+    pub fn pat(&mut self, base: Ty, ranges: List) -> Ty {
+        self.intern_ty(ty::PAT, base.node().bits(), ranges.node().bits())
+    }
+
     pub fn dynamic(&mut self, preds: List, r: Region) -> Ty {
         self.intern_ty(ty::DYNAMIC, preds.node().bits(), r.node().bits())
     }

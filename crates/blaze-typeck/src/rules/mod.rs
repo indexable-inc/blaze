@@ -13,12 +13,14 @@ use crate::ty::{Ty, TyList, TyView, TypeCtx};
 use crate::world::World;
 
 pub(crate) mod adt;
+pub(crate) mod async_fmt;
 pub(crate) mod block;
 pub(crate) mod call;
 pub(crate) mod cast;
 pub(crate) mod closure;
 pub(crate) mod coerce;
 pub(crate) mod control;
+pub(crate) mod coroutine;
 pub(crate) mod fallback;
 pub(crate) mod field;
 pub(crate) mod lit_path;
@@ -32,12 +34,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     pub(crate) fn expr_rule(&mut self, f: Frame, e: ExprId, expr: Expr) -> Result<Flow, Stop> {
         match expr {
             Expr::Missing => Ok(Flow::Done(self.common.err)),
-            Expr::Lit(lit) => self.expr_lit(f, lit),
+            Expr::Lit(lit) => self.expr_lit(f, e, lit),
             Expr::Local(p) => Ok(Flow::Done(self.local_ty[p.ix()])),
             Expr::Path(path) => self.expr_path(e, path),
             Expr::Paren(inner) => self.expr_paren(f, inner),
             Expr::Block { stmts, tail, scope: _ } => self.expr_block(f, e, stmts, tail),
             Expr::If { cond, then, else_ } => self.expr_if(f, e, cond, then, else_),
+            Expr::Let { pat, init } => self.expr_let(f, pat, init),
             Expr::Match { scrutinee, arms } => self.expr_match(f, e, scrutinee, arms),
             Expr::Loop { body } => self.expr_loop(f, e, body),
             Expr::Break { value, target } => self.expr_break(f, e, value, target),
@@ -57,12 +60,19 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             Expr::Cast { operand, ty } => self.expr_cast(f, e, operand, ty),
             Expr::Tuple { elems } => self.expr_tuple(f, e, elems),
             Expr::Array { elems } => self.expr_array(f, e, elems),
-            Expr::Repeat { elem, len } => self.expr_repeat(f, e, elem, len),
+            Expr::Repeat { elem, len, count } => self.expr_repeat(f, e, elem, len, count),
             Expr::Struct { path, fields, base } => self.expr_struct(f, e, path, fields, base),
             Expr::Index { base, index } => self.expr_index(f, e, base, index),
-            Expr::Closure { params, param_tys, ret, body } => {
-                self.expr_closure(f, e, params, param_tys, ret, body)
+            Expr::Closure { params, param_tys, ret, body, is_async } => {
+                self.expr_closure(f, e, params, param_tys, ret, body, is_async)
             }
+            Expr::FormatArgs { args, uses } => self.expr_format_args(f, e, args, uses),
+            Expr::Await(operand) => self.expr_await(f, e, operand),
+            Expr::AsyncBlock { body, capture } => self.expr_async_block(f, e, body, capture),
+            Expr::Underscore => self.expr_underscore(e),
+            Expr::OffsetOf { ty, fields } => self.expr_offset_of(e, ty, fields),
+            Expr::RawRef { mutbl, operand } => self.expr_raw_ref(f, e, mutbl, operand),
+            Expr::ConstBlock { stmts, tail, scope: _ } => self.expr_block(f, e, stmts, tail),
         }
     }
 

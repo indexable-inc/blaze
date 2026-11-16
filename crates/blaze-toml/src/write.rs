@@ -11,6 +11,7 @@ use core::{alloc::Allocator, fmt};
 
 use blaze_data::{Map, Order, Step, Value, Visit, Walk, write_step};
 use blaze_own::{String, Vec};
+use blaze_text::{Dbg, DebugForm, Put, Show, Shown, Writes as _};
 
 /// How [`write_document`] lays a document out.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -40,23 +41,39 @@ pub struct WriteError<A: Allocator> {
     pub what: Unwritable,
 }
 
-impl<A: Allocator> fmt::Display for WriteError<A> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+/// `a.b[3]: null has no TOML form`.
+impl<A: Allocator> Show for WriteError<A> {
+    fn show<P: Put + ?Sized>(&self, out: &mut P) {
         let path = match self.path.is_empty() {
             true => "the value",
             false => self.path.as_str(),
         };
+        out.str(path).str(": ");
         match self.what {
-            Unwritable::Null => write!(f, "{path}: null has no TOML form"),
-            Unwritable::Bytes => write!(f, "{path}: bytes have no TOML form; encode them as text first"),
-            Unwritable::Integer(n) => write!(f, "{path}: {n} is past TOML's i64 integers"),
-        }
+            Unwritable::Null => out.str("null has no TOML form"),
+            Unwritable::Bytes => out.str("bytes have no TOML form; encode them as text first"),
+            Unwritable::Integer(n) => out.int(n).str(" is past TOML's i64 integers"),
+        };
+    }
+}
+
+/// `WriteError(a.b[3]: ...)`.
+impl<A: Allocator> DebugForm for WriteError<A> {
+    fn debug_form(&self, out: &mut dyn Put) {
+        out.str("WriteError(").show(self).byte(b')');
+    }
+}
+
+/// The bridges `core::error::Error` needs: the text is [`Show`]'s and [`DebugForm`]'s.
+impl<A: Allocator> fmt::Display for WriteError<A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&Shown(self), f)
     }
 }
 
 impl<A: Allocator> fmt::Debug for WriteError<A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "WriteError({self})")
+        fmt::Display::fmt(&Shown(Dbg(self)), f)
     }
 }
 

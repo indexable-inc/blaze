@@ -452,7 +452,7 @@ fn a_symlink_to_a_directory_found_by_a_relisting_is_read_as_a_link() {
         let out = run.watcher.complete(&mut run.vfs, journal, &mut run.effects);
         run.out.extend(out);
         assert!(
-            matches!(&run.effects[..], [Effect::Entries { dir, .. }] if *dir == ws(".claude")),
+            matches!(&run.effects[..], [Effect::Entries { dir, .. }] if *dir == ws(".claude").into()),
             "{what}: {:?}",
             run.effects
         );
@@ -638,7 +638,7 @@ fn an_unnamed_change_lists_its_directory_alone() {
     let out = run.watcher.complete(&mut run.vfs, journal, STEADY, &mut run.effects);
     run.out.extend(out);
     assert!(
-        matches!(&run.effects[..], [Effect::Entries { dir, .. }] if *dir == ws("src")),
+        matches!(&run.effects[..], [Effect::Entries { dir, .. }] if *dir == ws("src").into()),
         "{:?}",
         run.effects
     );

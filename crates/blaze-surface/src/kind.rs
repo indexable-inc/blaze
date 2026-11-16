@@ -173,19 +173,99 @@ byte_enum! {
     }
 }
 
+/// The call shapes a macro takes: never empty. A `macro_rules!` takes each shape one of its
+/// arms is written for (`attr(..)` arms: attribute, `derive(..)` arms: derive, plain arms:
+/// function-like, as the pinned nightly reads them); a builtin or procedural macro takes one.
+/// A lookup by shape asks [`MacroShapes::accepts`] (rustc's `sub_namespace_match` over a set).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+#[repr(transparent)]
+pub struct MacroShapes(u8);
+
+impl MacroShapes {
+    pub const FN_LIKE: MacroShapes = MacroShapes::of(CallShape::FnLike);
+    pub const ATTR: MacroShapes = MacroShapes::of(CallShape::Attr);
+    pub const DERIVE: MacroShapes = MacroShapes::of(CallShape::Derive);
+
+    /// The set of `shape` alone.
+    pub const fn of(shape: CallShape) -> MacroShapes {
+        MacroShapes(1 << shape.byte())
+    }
+
+    /// This set and `shape`.
+    pub const fn with(self, shape: CallShape) -> MacroShapes {
+        MacroShapes(self.0 | MacroShapes::of(shape).0)
+    }
+
+    /// Whether a call of `shape` may name this macro.
+    pub const fn accepts(self, shape: CallShape) -> bool {
+        self.0 & MacroShapes::of(shape).0 != 0
+    }
+
+    /// Its byte, as a record holds it: a bit per shape, `1 << CallShape::byte()`.
+    pub const fn byte(self) -> u8 {
+        self.0
+    }
+
+    /// The set whose byte is `byte`: one to seven (a non-empty set of the three shapes).
+    pub const fn from_byte(byte: u8) -> Option<MacroShapes> {
+        match byte {
+            1..=7 => Some(MacroShapes(byte)),
+            _ => None,
+        }
+    }
+
+    /// Its shapes, in [`CallShape`] order.
+    pub fn shapes(self) -> impl Iterator<Item = CallShape> {
+        CallShape::ALL.into_iter().filter(move |&s| self.accepts(s))
+    }
+}
+
+impl fmt::Display for MacroShapes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (n, shape) in self.shapes().enumerate() {
+            if n > 0 {
+                f.write_str(", ")?;
+            }
+            f.write_str(shape.name())?;
+        }
+        Ok(())
+    }
+}
+
+// SAFETY: one byte, the same on every host and in every snapshot; it names nothing interned.
+unsafe impl Portable for MacroShapes {}
+
+// SAFETY: `#[repr(transparent)]` over a `u8`: one byte, no padding, no reference. `check`
+// accepts exactly the bytes `from_byte` takes, so every byte it accepts is a valid value;
+// `PLAIN` and `SHALLOW_PLAIN` stay false, so no byte is read unchecked.
+unsafe impl blaze_format::Record for MacroShapes {
+    const SCHEMA: blaze_format::SchemaHash = blaze_format::schema_of(&[
+        blaze_format::Part::Str("MacroShapes"),
+        blaze_format::Part::U64(1),
+        blaze_format::Part::Str("bit per CallShape"),
+    ]);
+
+    fn check(bytes: &[u8], buffer: &[u8]) -> Result<(), FormatError> {
+        match bytes {
+            [byte] if MacroShapes::from_byte(*byte).is_some() => Ok(()),
+            _ => Err(FormatError::Invalid { at: at_of(bytes, buffer), what: "a byte that is no set of macro call shapes" }),
+        }
+    }
+}
+
 /// What a binding's target is, as far as resolving a path through it needs: a module or an
-/// enum can be descended into, a macro has a call shape, anything else ends a path.
+/// enum can be descended into, a macro has the call shapes it takes, anything else ends a path.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub enum DefKind {
     Module,
     Enum,
     Trait,
-    Macro(CallShape),
+    Macro(MacroShapes),
     Other,
 }
 
 byte_enum! {
-    /// [`DefKind`]'s byte in a record; a macro's [`CallShape`] is a field beside it.
+    /// [`DefKind`]'s byte in a record; a macro's [`MacroShapes`] is a field beside it.
     pub(crate) enum DefKindTag, refused as "a byte that is no definition kind" {
         Module = 0 => "module",
         Enum = 1 => "enum",
@@ -196,25 +276,26 @@ byte_enum! {
 }
 
 impl DefKind {
-    /// Its bytes as a record holds them: the shape is `FnLike` unless a macro, so two builders
-    /// write equal bytes.
-    pub(crate) fn to_record(self) -> (DefKindTag, CallShape) {
+    /// Its bytes as a record holds them: the shapes are `FN_LIKE` unless a macro, so two
+    /// builders write equal bytes (a zero byte for "no macro" would need every row's reader to
+    /// check the pair; the set type keeps the field one checked byte).
+    pub(crate) fn to_record(self) -> (DefKindTag, MacroShapes) {
         match self {
-            DefKind::Module => (DefKindTag::Module, CallShape::FnLike),
-            DefKind::Enum => (DefKindTag::Enum, CallShape::FnLike),
-            DefKind::Trait => (DefKindTag::Trait, CallShape::FnLike),
-            DefKind::Macro(shape) => (DefKindTag::Macro, shape),
-            DefKind::Other => (DefKindTag::Other, CallShape::FnLike),
+            DefKind::Module => (DefKindTag::Module, MacroShapes::FN_LIKE),
+            DefKind::Enum => (DefKindTag::Enum, MacroShapes::FN_LIKE),
+            DefKind::Trait => (DefKindTag::Trait, MacroShapes::FN_LIKE),
+            DefKind::Macro(shapes) => (DefKindTag::Macro, shapes),
+            DefKind::Other => (DefKindTag::Other, MacroShapes::FN_LIKE),
         }
     }
 
     /// What [`DefKind::to_record`] wrote.
-    pub(crate) fn from_record(tag: DefKindTag, shape: CallShape) -> DefKind {
+    pub(crate) fn from_record(tag: DefKindTag, shapes: MacroShapes) -> DefKind {
         match tag {
             DefKindTag::Module => DefKind::Module,
             DefKindTag::Enum => DefKind::Enum,
             DefKindTag::Trait => DefKind::Trait,
-            DefKindTag::Macro => DefKind::Macro(shape),
+            DefKindTag::Macro => DefKind::Macro(shapes),
             DefKindTag::Other => DefKind::Other,
         }
     }
@@ -476,14 +557,14 @@ byte_enum! {
     }
 }
 
-/// Whether a binding is final.
+/// What a settled binding is: final, or final and ambiguous. A binding not final yet is not
+/// a value of this type: the solver carries "undetermined" in its own working state, and a
+/// scope that would leave a name undetermined settles it to not found first, so no record
+/// and no reader of one can hold it.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub enum BindingState {
     /// Final.
     Determined,
-    /// Not final yet: something still pending may change it. Only a member of a group that is
-    /// still being solved answers with it; a finished scope holds none.
-    Undetermined,
     /// Final, and ambiguous: naming it is an error of this kind.
     Ambiguous(AmbiguityKind),
 }
@@ -492,7 +573,6 @@ byte_enum! {
     /// [`BindingState`]'s byte in a record; an ambiguity's kind is a field beside it.
     pub(crate) enum StateTag, refused as "a byte that is no binding state" {
         Determined = 0 => "determined",
-        Undetermined = 1 => "undetermined",
         Ambiguous = 2 => "ambiguous",
     }
 }
@@ -503,7 +583,6 @@ impl BindingState {
     pub(crate) fn to_record(self) -> (StateTag, AmbiguityKind) {
         match self {
             BindingState::Determined => (StateTag::Determined, AmbiguityKind::GlobVsGlob),
-            BindingState::Undetermined => (StateTag::Undetermined, AmbiguityKind::GlobVsGlob),
             BindingState::Ambiguous(kind) => (StateTag::Ambiguous, kind),
         }
     }
@@ -512,7 +591,6 @@ impl BindingState {
     pub(crate) fn from_record(tag: StateTag, kind: AmbiguityKind) -> BindingState {
         match tag {
             StateTag::Determined => BindingState::Determined,
-            StateTag::Undetermined => BindingState::Undetermined,
             StateTag::Ambiguous => BindingState::Ambiguous(kind),
         }
     }

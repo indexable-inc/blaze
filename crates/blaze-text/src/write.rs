@@ -88,6 +88,13 @@ pub trait Writes: Put {
         self.radix(x, 4, false, width)
     }
 
+    /// Uppercase hex, zero-padded to `width` digits, as `{:0width$X}` (`U+` and
+    /// `hex_upper_fixed(c, 4)`).
+    #[inline]
+    fn hex_upper_fixed<I: Integer>(&mut self, x: I, width: usize) -> &mut Self {
+        self.radix(x, 4, true, width)
+    }
+
     /// Every hex digit of the type's width: `hex_full(7u32)` is `00000007`.
     #[inline]
     fn hex_full<I: Integer>(&mut self, x: I) -> &mut Self {

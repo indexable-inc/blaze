@@ -114,6 +114,10 @@ pub mod ty {
     pub const INT_VAR: u8 = 36;
     pub const FLOAT_VAR: u8 = 37;
     pub const ERROR: u8 = 38;
+    /// A pattern type `a is ..` (typeck.md "Pattern types"): `a` the base; `b` its valid
+    /// values, a list of const values in pairs, `start ..= end` each, canonical (sorted,
+    /// merged, `start > end` wrapping).
+    pub const PAT: u8 = 39;
 
     /// `dyn` predicates. `a`: the trait; `b`: its arguments without `Self`.
     pub const EX_TRAIT: u8 = 40;
@@ -208,7 +212,7 @@ const fn ty_desc(kind: u8) -> Desc {
         ty::ARRAY | ty::REF | ty::REF_MUT => Desc::new(Child, Child, false, 0),
         ty::SLICE | ty::PTR | ty::PTR_MUT | ty::TUPLE => Desc::new(Child, None, false, 0),
         ty::FN_PTR => Desc::new(Child, Raw, true, 0),
-        ty::DYNAMIC => Desc::new(Child, Child, false, 0),
+        ty::DYNAMIC | ty::PAT => Desc::new(Child, Child, false, 0),
         ty::CLOSURE => Desc::new(Def, Child, false, 0),
         ty::CORO_CLOSURE | ty::COROUTINE | ty::CORO_WITNESS => Desc::new(Def, Child, false, Flags::CORO),
         ty::PROJECTION | ty::INHERENT | ty::FREE => {
@@ -296,7 +300,7 @@ table!(CT, ct_desc, ct::COUNT);
 pub(crate) fn valid(tag: u32, kind: u8) -> bool {
     match tag {
         crate::ids::TAG_TY => {
-            kind <= ty::ERROR
+            kind <= ty::PAT
                 || (kind >= ty::EX_TRAIT && kind <= ty::EX_AUTO)
                 || (kind >= ty::P_TRAIT && kind <= ty::P_AMBIGUOUS)
         }
@@ -323,6 +327,8 @@ pub(crate) const fn child_classes(tag: u32, kind: u8, b: bool) -> u8 {
     match (kind, b) {
         (ty::ARRAY, false) | (ty::SLICE | ty::PTR | ty::PTR_MUT | ty::REF | ty::REF_MUT, false) => T,
         (ty::ARRAY, true) => C,
+        (ty::PAT, false) => T,
+        (ty::PAT, true) => L,
         (ty::REF | ty::REF_MUT | ty::DYNAMIC, true) => R,
         (ty::FN_PTR | ty::DYNAMIC | ty::TUPLE, false) => L,
         (ty::P_PROJECTION | ty::P_ALIAS_EQ | ty::P_NORMALIZES_TO, _) => T | C,
@@ -347,6 +353,11 @@ pub const fn is_type(kind: u8) -> bool {
 /// Whether `kind` is a predicate kind.
 pub const fn is_pred(kind: u8) -> bool {
     kind >= ty::P_TRAIT && kind <= ty::P_AMBIGUOUS
+}
+
+/// Whether `kind` is an existential predicate of a `dyn` (`ExTrait`, `ExProjection`, `ExAuto`).
+pub const fn is_existential(kind: u8) -> bool {
+    kind >= ty::EX_TRAIT && kind <= ty::EX_AUTO
 }
 
 /// Whether `kind` is an alias not known to be rigid.

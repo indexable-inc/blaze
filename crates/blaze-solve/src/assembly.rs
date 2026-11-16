@@ -164,7 +164,7 @@ pub struct Langs {
     pub(crate) digests: [u64; LANGS],
 }
 
-pub(crate) const LANGS: usize = Lang::ManuallyDrop as usize + 1;
+pub(crate) const LANGS: usize = Lang::FutureOutput as usize + 1;
 
 impl Langs {
     pub fn new() -> Langs {
@@ -222,8 +222,15 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
 
     /// The terms of `l`, in a vector of the solver's allocator.
     pub fn list(&self, l: List) -> Vec<Ty, Alloc<'a>> {
-        let mut v = Vec::with_capacity_in(l.len as usize, self.alloc);
-        for i in 0..l.len {
+        self.list_range(l, 0, l.len)
+    }
+
+    /// Elements `from..to` of `l` (clamped to its length). A list is a handle the `Tys` made,
+    /// not a range to do arithmetic on: a sublist is read element by element and interned.
+    pub fn list_range(&self, l: List, from: u32, to: u32) -> Vec<Ty, Alloc<'a>> {
+        let to = to.min(l.len);
+        let mut v = Vec::with_capacity_in(to.saturating_sub(from) as usize, self.alloc);
+        for i in from..to {
             v.push(self.tys.list_get(l, i));
         }
         v
@@ -251,6 +258,14 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
         for _ in 0..n {
             v.push(self.tys.fresh(VarKind::Ty)?);
         }
+        self.mk_list(&v)
+    }
+
+    /// Fresh arguments for an impl being matched: a const variable for each const parameter
+    /// (one its portable table names as `ConstParam(i)`), a type variable for the rest, so a
+    /// const position can only ever unify with a const (`fresh_args_for_item`).
+    pub fn fresh_impl_args(&mut self, h: &ImplHeader<'_>) -> Result<List, Stop> {
+        let v = crate::coherence::fresh_for(self.tys, h.portable, h.generics, self.alloc)?;
         self.mk_list(&v)
     }
 
@@ -289,6 +304,7 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
             Pred::HostEffect { trait_, args, constness } => {
                 Pred::HostEffect { trait_, args: self.map_list(args, &mut f)?, constness }
             }
+            Pred::ConstHolds { cond, args } => Pred::ConstHolds { cond, args: self.map_list(args, &mut f)? },
             Pred::Projection { alias, term } => Pred::Projection { alias: f(self, alias)?, term: f(self, term)? },
             Pred::NormalizesTo { alias, term } => Pred::NormalizesTo { alias: f(self, alias)?, term: f(self, term)? },
             Pred::TypeOutlives { ty, region } => Pred::TypeOutlives { ty: f(self, ty)?, region: f(self, region)? },
@@ -347,7 +363,8 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
             Pred::HostEffect { trait_, args: a, constness } => {
                 Ok(Pred::HostEffect { trait_, args: self.import_list(p, a, args)?, constness })
             }
-            Pred::Eq { .. } => Err(Stop::Error(SolveError::Malformed(crate::error::Malformed::Pred))),
+            Pred::ConstHolds { cond, args: a } => Ok(Pred::ConstHolds { cond, args: self.import_list(p, a, args)? }),
+            Pred::Eq { .. } => Err(Stop::Error(SolveError::Malformed(crate::error::bad_pred()))),
             other => {
                 let v = self.list(args);
                 self.map_pred(other, |cx, t| Ok(fold::import(cx.tys, cx.scratch, p, t, Inst { args: &v, bound: &[] })?))
@@ -468,6 +485,11 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
 
     pub fn is_local(&mut self, d: Def) -> Result<bool, Stop> {
         self.ask.is_local(self.reads, d)
+    }
+
+    /// The `where const` condition `cond` at the ground `args`, whose terms `list` holds.
+    pub fn const_holds(&mut self, cond: Def, list: List, args: &[Ty]) -> Result<crate::facts::ConstHolds, Stop> {
+        self.ask.const_holds(self.reads, cond, list, args)
     }
 
     /// The lang item `l`'s def, if the crates in scope define it.

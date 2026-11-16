@@ -219,6 +219,139 @@ impl AttrSpan {
     }
 }
 
+/// What an entry's own tokens are that a program given capabilities by type must not hold
+/// (docs/v2/plan/design/run.md, "What a program is given"): each bit is read from the tokens,
+/// so the word in a string, a comment or an identifier (`unsafe_code`, `r#unsafe`) is none.
+/// An entry's own tokens are those of its range outside its child entries (a `fn` body's
+/// nested items are the `fn`'s, as they are no entries); [`FileItemsView::flags`] answers for
+/// a file, [`flags_of_files`] for a list of them.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
+pub struct ItemFlags(u8);
+
+// SAFETY: a value is its one byte, the same on every host and in every snapshot.
+unsafe impl Portable for ItemFlags {}
+
+// SAFETY: `#[repr(Rust)]` around one `u8`, a byte with no padding and no reference. `check`
+// accepts exactly the bytes with no bit but the declared ones, so every byte it accepts is a
+// value; `PLAIN` stays false, so no byte is read unchecked.
+unsafe impl blaze_format::Record for ItemFlags {
+    const SCHEMA: blaze_format::SchemaHash = blaze_format::schema_of(&[
+        blaze_format::Part::Str("ItemFlags"),
+        blaze_format::Part::U64(1),
+        blaze_format::Part::Str("UNSAFE"),
+        blaze_format::Part::U64(1),
+        blaze_format::Part::Str("FOREIGN"),
+        blaze_format::Part::U64(1 << 1),
+        blaze_format::Part::Str("ASM"),
+        blaze_format::Part::U64(1 << 2),
+        blaze_format::Part::Str("MACRO_CALL"),
+        blaze_format::Part::U64(1 << 3),
+    ]);
+
+    fn check(bytes: &[u8], buffer: &[u8]) -> Result<(), FormatError> {
+        match bytes {
+            [byte] if ItemFlags::from_bits(*byte).is_some() => Ok(()),
+            _ => Err(FormatError::Invalid { at: at_of(bytes, buffer), what: "a byte of entry flags no entry has" }),
+        }
+    }
+}
+
+impl ItemFlags {
+    pub const NONE: ItemFlags = ItemFlags(0);
+    /// The keyword `unsafe`: a block, `fn`, `impl`, `trait`, extern block or `unsafe(..)`
+    /// attribute.
+    pub const UNSAFE: ItemFlags = ItemFlags(1);
+    /// Code that is not Rust's: an extern block, an `extern fn` of another ABI than `"Rust"`
+    /// (no ABI is `"C"`), or `#[link]`, `#[no_mangle]`, `#[export_name]`, `#[link_section]`,
+    /// `#[linkage]` or `#[naked]`, alone, under `unsafe(..)` or under `cfg_attr`.
+    pub const FOREIGN: ItemFlags = ItemFlags(1 << 1);
+    /// `asm!`, `global_asm!` or `naked_asm!`, by the macro's last path segment.
+    pub const ASM: ItemFlags = ItemFlags(1 << 2);
+    /// A macro call whose expansion may add any of the others, unknown until it is expanded: a
+    /// bang call (but `asm!` and its kin, [`ItemFlags::ASM`]), a derive, or an attribute that
+    /// is no inert built-in one. A later stage that expands it clears this bit.
+    pub const MACRO_CALL: ItemFlags = ItemFlags(1 << 3);
+    /// Every flag, in bit order, with its name.
+    pub const NAMED: [(ItemFlags, &'static str); 4] = [
+        (ItemFlags::UNSAFE, "unsafe"),
+        (ItemFlags::FOREIGN, "foreign"),
+        (ItemFlags::ASM, "asm"),
+        (ItemFlags::MACRO_CALL, "macro call"),
+    ];
+
+    const ALL: u8 = (1 << 4) - 1;
+
+    pub const fn bits(self) -> u8 {
+        self.0
+    }
+
+    /// The flags of `bits`, if no bit is one no flag has.
+    pub const fn from_bits(bits: u8) -> Option<ItemFlags> {
+        match bits & !ItemFlags::ALL {
+            0 => Some(ItemFlags(bits)),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn union(self, other: ItemFlags) -> ItemFlags {
+        ItemFlags(self.0 | other.0)
+    }
+
+    /// These flags with `other`'s cleared: what a later stage that knows better leaves.
+    #[must_use]
+    pub const fn without(self, other: ItemFlags) -> ItemFlags {
+        ItemFlags(self.0 & !other.0)
+    }
+
+    pub const fn contains(self, other: ItemFlags) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl core::ops::BitOr for ItemFlags {
+    type Output = ItemFlags;
+
+    fn bitor(self, other: ItemFlags) -> ItemFlags {
+        self.union(other)
+    }
+}
+
+impl core::ops::BitOrAssign for ItemFlags {
+    fn bitor_assign(&mut self, other: ItemFlags) {
+        *self = self.union(other);
+    }
+}
+
+impl fmt::Debug for ItemFlags {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut set = f.debug_set();
+        for (flag, name) in ItemFlags::NAMED {
+            if self.contains(flag) {
+                set.entry(&format_args!("{name}"));
+            }
+        }
+        set.finish()
+    }
+}
+
+/// The flags of every file in `files` together: [`ItemFlags::is_empty`] answers "none set".
+pub fn flags_of_files<'a, 'f: 'a>(files: impl IntoIterator<Item = &'a FileItemsView<'f>>) -> ItemFlags {
+    files.into_iter().fold(ItemFlags::NONE, |flags, file| flags | file.flags())
+}
+
+/// Each entry of `files` with a flag set, by the file's position in `files`: which entries set
+/// which. A file with none is passed over in one read of its record's root.
+pub fn flagged_in_files<'a, 'f: 'a>(
+    files: impl IntoIterator<Item = &'a FileItemsView<'f>>,
+) -> impl Iterator<Item = (usize, ItemIndex, ItemFlags)> {
+    files.into_iter().enumerate().flat_map(|(at, file)| file.flagged().map(move |(index, flags)| (at, index, flags)))
+}
+
 /// One entry of a file: an item, a variant, a field, an item-position macro call or a stretch
 /// the parser could not read.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -256,6 +389,8 @@ pub struct Item {
     pub hash: ContentId,
     /// Its bytes before its body, in blaze-file-items' `ITEM_DOMAIN`.
     pub signature_hash: ContentId,
+    /// What its own tokens hold that capabilities by type refuse.
+    pub flags: ItemFlags,
 }
 
 impl Item {
@@ -354,7 +489,7 @@ pub struct SyntaxError {
 blaze_format::record! {
     /// One entry of a file: an [`Item`], its name's text beside it.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    pub(crate) struct ItemRow: 2 {
+    pub(crate) struct ItemRow: 3 {
         pub(crate) range: Range,
         pub(crate) name: Range,
         pub(crate) name_text: Text,
@@ -377,7 +512,9 @@ blaze_format::record! {
         pub(crate) has_first: bool,
         pub(crate) has_second: bool,
         pub(crate) flag: bool,
-        pub(crate) pad: [u8; 3],
+        /// In what was padding (version 2 had `pad: [u8; 3]`): no byte more a row.
+        pub(crate) flags: ItemFlags,
+        pub(crate) pad: [u8; 2],
     }
 }
 
@@ -407,7 +544,7 @@ blaze_format::record! {
 blaze_format::record! {
     /// The root of a [`FileItems`] buffer.
     #[derive(Clone, Copy, Debug)]
-    pub(crate) struct FileItemsRoot: 2 {
+    pub(crate) struct FileItemsRoot: 3 {
         pub(crate) file: ContentId,
         pub(crate) items: Slice<ItemRow>,
         pub(crate) attrs: Slice<AttrRow>,
@@ -417,6 +554,11 @@ blaze_format::record! {
         /// The errors' messages, as the outline holds them.
         pub(crate) messages: Slice<u8>,
         pub(crate) file_attrs: AttrSpan,
+        /// The flags of the file's own tokens, outside every entry (`#![..]`).
+        pub(crate) own_flags: ItemFlags,
+        /// `own_flags` and every entry's together: the file's answer without its rows.
+        pub(crate) flags: ItemFlags,
+        pub(crate) pad: [u8; 2],
     }
 }
 
@@ -446,7 +588,8 @@ fn row_of(item: &Item, name_text: Text) -> ItemRow {
         has_first: payload.first.is_some(),
         has_second: payload.second.is_some(),
         flag: payload.flag,
-        pad: [0; 3],
+        flags: item.flags,
+        pad: [0; 2],
     }
 }
 
@@ -470,6 +613,7 @@ fn item_of(row: &ItemRow) -> Item {
         disambiguator: row.disambiguator,
         hash: row.hash,
         signature_hash: row.signature_hash,
+        flags: row.flags,
     }
 }
 
@@ -602,6 +746,8 @@ pub struct FileItems<'p> {
     pub errors: &'p [SyntaxError],
     /// The errors' messages, one after another, each a whole `str`.
     pub messages: &'p [u8],
+    /// The flags of the file's own tokens, outside every entry.
+    pub file_flags: ItemFlags,
 }
 
 impl FileItems<'_> {
@@ -614,8 +760,10 @@ impl FileItems<'_> {
         count(self.errors.len(), "FileItems errors")?;
         let mut names = Strings::new_in(alloc);
         let mut rows = Vec::with_capacity_in(self.items.len(), alloc);
+        let mut flags = self.file_flags;
         for (at, item) in self.items.iter().enumerate() {
             let index = count(at, "FileItems items")?;
+            flags |= item.flags;
             let parent_end = item.parent.and_then(|parent| self.items.get(parent.at())).map(|parent| parent.end.0);
             if let Some(fault) = fault_of(index, item, parent_end, self.items.len(), self.attrs.len()) {
                 return Err(fault.error(index));
@@ -656,6 +804,7 @@ impl FileItems<'_> {
         let errors = Column::push(&mut out, &errors);
         let file = self.file;
         let file_attrs = self.file_attrs;
+        let own_flags = self.file_flags;
         Ok(finish_with(out, |at| FileItemsRoot {
             file,
             items: items.slice(at, offset_of!(FileItemsRoot, items)),
@@ -664,6 +813,9 @@ impl FileItems<'_> {
             names: names.slice(at, offset_of!(FileItemsRoot, names)),
             messages: messages.slice(at, offset_of!(FileItemsRoot, messages)),
             file_attrs,
+            own_flags,
+            flags,
+            pad: [0; 2],
         }))
     }
 }
@@ -696,6 +848,8 @@ pub struct FileItemsView<'a> {
     errors: &'a [ErrorRow],
     names: &'a str,
     messages: &'a str,
+    own_flags: ItemFlags,
+    flags: ItemFlags,
 }
 
 impl<'a> FileItemsView<'a> {
@@ -712,9 +866,16 @@ impl<'a> FileItemsView<'a> {
             errors: root.errors.follow(buffer)?,
             names: root.names.as_str(buffer)?,
             messages: root.messages.as_str(buffer)?,
+            own_flags: root.own_flags,
+            flags: root.flags,
         };
         let invalid = |row_at: u64, what: &'static str| FormatError::Invalid { at: row_at, what };
+        if root.pad != [0; 2] {
+            return Err(invalid(0, "a file's root whose padding is not zero"));
+        }
+        let mut flags = view.own_flags;
         for (at, row) in view.items.iter().enumerate() {
+            flags |= row.flags;
             let index = u32::try_from(at).expect("a slice's length is a u32");
             let row_at = at_of_record(row, buffer);
             check_text(view.names, row.name_text, row, buffer)?;
@@ -747,12 +908,35 @@ impl<'a> FileItemsView<'a> {
                 return Err(invalid(at_of_record(row, buffer), "a syntax error that is not its value's one sound encoding"));
             }
         }
+        if flags != view.flags {
+            return Err(invalid(0, "a file's flags that are not its own and its entries' together"));
+        }
         Ok(view)
     }
 
     /// The content of the file these are the entries of.
     pub fn file(&self) -> ContentId {
         self.file
+    }
+
+    /// Every flag the file's tokens set, its own and its entries': read from the root alone,
+    /// so "none set" costs no row.
+    pub fn flags(&self) -> ItemFlags {
+        self.flags
+    }
+
+    /// The flags of the file's own tokens, outside every entry (`#![..]`).
+    pub fn own_flags(&self) -> ItemFlags {
+        self.own_flags
+    }
+
+    /// Each entry with a flag set, in order, with its flags; nothing, without a row read, when
+    /// the file sets none.
+    pub fn flagged(&self) -> impl Iterator<Item = (ItemIndex, ItemFlags)> + use<'a> {
+        let rows: &'a [ItemRow] = if self.flags.is_empty() { &[] } else { self.items };
+        rows.iter().enumerate().filter(|(_, row)| !row.flags.is_empty()).map(|(at, row)| {
+            (ItemIndex(u32::try_from(at).expect("a record's entries are counted in u32")), row.flags)
+        })
     }
 
     /// How many entries the file has.

@@ -38,7 +38,8 @@ pub enum Relate {
 /// - `flags` sets `HAS_NON_RIGID_ALIAS` for a term holding an alias with `Rigid::No`.
 /// - Every binding of a variable (to a term or to another variable) appends the variable's
 ///   index to the binding log; `rollback_to` truncates the log with the bindings.
-/// - Snapshots nest in stack order: `rollback_to` or `commit` of the latest first.
+/// - Snapshots nest in stack order: `commit` of the latest first; `rollback_to` of the latest,
+///   or of an older one, which closes every snapshot opened after it (the unwind of a stop).
 pub trait Tys {
     /// A snapshot of the inference table and the binding log.
     type Snapshot: Copy;

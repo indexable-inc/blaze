@@ -5,6 +5,7 @@
 use core::mem::offset_of;
 
 use blaze_format_core::{FormatError, Own, Record, Slice, Writer, open_as};
+use blaze_ids::ContentId;
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_surface::Range;
 
@@ -19,7 +20,7 @@ pub type Head = [u32; HEAD_WORDS];
 
 /// The head's words.
 pub mod head {
-    /// [`crate::Mode`] as 0 (signature), 1 (body), 2 (anonymous constant).
+    /// [`crate::Mode`] as 0 (signature), 1 (body), 2 (anonymous constant), 3 (a lone type).
     pub const MODE: usize = 0;
     pub const EDITION: usize = 1;
     /// The item's parser kind, as its number; `u32::MAX` for an anonymous constant.
@@ -34,7 +35,7 @@ pub mod head {
     pub const ATTRS: usize = 8;
     /// Rows of `Param` (a signature); in a body, the parameters' patterns in `ids`.
     pub const PARAMS: usize = 10;
-    /// The return type, a type alias's or const's or static's type.
+    /// The return type, a type alias's or const's or static's type; a lone type's root.
     pub const TY: usize = 12;
     /// Rows of `Field` (struct, union) or `Variant` (enum).
     pub const FIELDS: usize = 13;
@@ -60,6 +61,9 @@ pub mod head {
     pub const REPR: usize = 28;
     /// 1 when the item's own `cfg` is false: nothing else is lowered.
     pub const CFG_OUT: usize = 29;
+    /// The length of the item's text the record was lowered from: a view is made only with
+    /// a text of this length ([`super::open`]).
+    pub const ITEM_LEN: usize = 30;
 }
 
 blaze_format_core::record! {
@@ -86,6 +90,16 @@ blaze_format_core::record! {
         pub unhandled: Slice<Node>,
         pub diags: Slice<Node>,
         pub cfg: Slice<Node>,
+        /// The text of the expansions lowered in place, after the item's own: a range from
+        /// the item's length on is of this, from there.
+        pub expanded: Slice<u8>,
+        /// The read list of the expansions: each body macro call's range ...
+        pub expansion_calls: Slice<Range>,
+        /// ... and the key of its expansion record (blaze-expand's call key) ...
+        pub expansion_keys: Slice<ContentId>,
+        /// ... and where its words start in `expanded`: expansions are appended whole, in
+        /// order, so the one holding an offset is the last starting at or before it.
+        pub expansion_starts: Slice<u32>,
         pub head: [u32; 32],
     }
 }
@@ -111,6 +125,10 @@ pub struct Columns<'a> {
     pub(crate) unhandled: AVec<'a, Node>,
     pub(crate) diags: AVec<'a, Node>,
     pub(crate) cfg: AVec<'a, Node>,
+    pub(crate) expanded: AVec<'a, u8>,
+    pub(crate) expansion_calls: AVec<'a, Range>,
+    pub(crate) expansion_keys: AVec<'a, ContentId>,
+    pub(crate) expansion_starts: AVec<'a, u32>,
     pub(crate) langs: u64,
     pub(crate) head: Head,
 }
@@ -137,13 +155,22 @@ impl<'a> Columns<'a> {
             unhandled: Vec::new_in(alloc),
             diags: Vec::new_in(alloc),
             cfg: Vec::new_in(alloc),
+            expanded: Vec::new_in(alloc),
+            expansion_calls: Vec::new_in(alloc),
+            expansion_keys: Vec::new_in(alloc),
+            expansion_starts: Vec::new_in(alloc),
             langs: 0,
             head: [NONE; HEAD_WORDS],
         }
     }
 
-    pub fn view(&self) -> View<'_> {
+    /// The view of these columns, lowered from `item`: only [`crate::Lowered::view`] makes
+    /// one, with the text it was lowered from.
+    pub(crate) fn view<'s>(&'s self, item: &'s str) -> View<'s> {
         View {
+            item,
+            lens: Lens::of(item.len(), self.expanded.len()),
+            expansion_starts: &self.expansion_starts,
             exprs: &self.exprs,
             expr_ranges: &self.expr_ranges,
             pats: &self.pats,
@@ -163,6 +190,9 @@ impl<'a> Columns<'a> {
             unhandled: &self.unhandled,
             diags: &self.diags,
             cfg: &self.cfg,
+            expanded: &self.expanded,
+            expansion_calls: &self.expansion_calls,
+            expansion_keys: &self.expansion_keys,
             langs: self.langs,
             head: self.head,
         }
@@ -189,6 +219,10 @@ impl<'a> Columns<'a> {
         let unhandled = Column::push(&mut out, &self.unhandled);
         let diags = Column::push(&mut out, &self.diags);
         let cfg = Column::push(&mut out, &self.cfg);
+        let expanded = Column::push(&mut out, &self.expanded);
+        let expansion_calls = Column::push(&mut out, &self.expansion_calls);
+        let expansion_keys = Column::push(&mut out, &self.expansion_keys);
+        let expansion_starts = Column::push(&mut out, &self.expansion_starts);
         let at = out.next::<LoweredRoot>();
         let root = LoweredRoot {
             langs: self.langs,
@@ -211,6 +245,10 @@ impl<'a> Columns<'a> {
             unhandled: unhandled.slice(at, offset_of!(LoweredRoot, unhandled)),
             diags: diags.slice(at, offset_of!(LoweredRoot, diags)),
             cfg: cfg.slice(at, offset_of!(LoweredRoot, cfg)),
+            expanded: expanded.slice(at, offset_of!(LoweredRoot, expanded)),
+            expansion_calls: expansion_calls.slice(at, offset_of!(LoweredRoot, expansion_calls)),
+            expansion_keys: expansion_keys.slice(at, offset_of!(LoweredRoot, expansion_keys)),
+            expansion_starts: expansion_starts.slice(at, offset_of!(LoweredRoot, expansion_starts)),
             head: self.head,
         };
         let written = out.push(&root);
@@ -242,10 +280,36 @@ impl Column {
     }
 }
 
-/// Opens a lowering's record: its root verified once, each column a slice of the buffer.
-pub fn open(buffer: &[u8]) -> Result<View<'_>, FormatError> {
+/// Why a record could not be opened.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Open {
+    /// The buffer is no lowering's record.
+    Format(FormatError),
+    /// The item text given is not the one the record was lowered from: its length is not the
+    /// recorded one. Refused here, once, so no read of the view can cut a wrong text.
+    ItemText { recorded: u32, given: usize },
+}
+
+impl From<FormatError> for Open {
+    fn from(e: FormatError) -> Open {
+        Open::Format(e)
+    }
+}
+
+/// Opens a lowering's record of the item whose text is `item`: its root verified once, each
+/// column a slice of the buffer. The view holds `item`, so every read of text through it is
+/// of the text the record was lowered from.
+pub fn open<'b>(buffer: &'b [u8], item: &'b str) -> Result<View<'b>, Open> {
     let root = open_as::<LoweredRoot>(buffer, <LoweredRoot as Record>::SCHEMA)?;
+    let recorded = root.head[head::ITEM_LEN];
+    if usize::try_from(recorded).ok() != Some(item.len()) {
+        return Err(Open::ItemText { recorded, given: item.len() });
+    }
+    let expanded: &[u8] = root.expanded.follow(buffer)?;
     Ok(View {
+        item,
+        lens: Lens::of(item.len(), expanded.len()),
+        expansion_starts: root.expansion_starts.follow(buffer)?,
         exprs: root.exprs.follow(buffer)?,
         expr_ranges: root.expr_ranges.follow(buffer)?,
         pats: root.pats.follow(buffer)?,
@@ -265,36 +329,319 @@ pub fn open(buffer: &[u8]) -> Result<View<'_>, FormatError> {
         unhandled: root.unhandled.follow(buffer)?,
         diags: root.diags.follow(buffer)?,
         cfg: root.cfg.follow(buffer)?,
+        expanded,
+        expansion_calls: root.expansion_calls.follow(buffer)?,
+        expansion_keys: root.expansion_keys.follow(buffer)?,
         langs: root.langs,
         head: root.head,
     })
 }
 
-/// A lowering read: of the columns in memory, or of a record in place. Rows decode when
-/// asked; a row that is no form of its column is a [`BadRow`].
+/// The two lengths that make a record's ranges its own: its item's text and its expansions'.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct Lens {
+    item_len: u32,
+    expanded_len: u32,
+}
+
+impl Lens {
+    /// While a lowering builds its columns: a range made then is only encoded (its bounds),
+    /// never read through a view.
+    pub(crate) const BUILDING: Lens = Lens { item_len: u32::MAX, expanded_len: u32::MAX };
+
+    fn of(item_len: usize, expanded_len: usize) -> Lens {
+        // An item's text and its expansions are each under 4 GiB: the lowering's ranges are
+        // `u32` pairs (asserted where it starts, `feed::run`).
+        Lens { item_len: idx(item_len), expanded_len: idx(expanded_len) }
+    }
+}
+
+fn idx(n: usize) -> u32 {
+    u32::try_from(n).expect("an item and its expansions are under 4 GiB")
+}
+
+/// A range of a lowering's record: of the item's own text, or past its length, of the text
+/// of the macro expansions lowered in place after it.
+///
+/// It has no way to cut text: no `of`, `get`, `Index`, bounds or conversion to a plain
+/// [`Range`]. The one door is [`View::text_at`], which reads the item's text or the
+/// expansions' as the range says. So a reader that slices the item's text with a range past
+/// its end (the bug class this type closes: a panic, or the wrong bytes) cannot be written;
+/// there is nothing to test, because the method does not exist. A position for a diagnostic
+/// is [`View::site`] (item-relative, rule 71) or [`View::item_relative`].
+///
+/// It carries the two lengths of the view that made it, so a view recognises a range of
+/// another record ([`TextAt::OtherView`]) rather than reading it as its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BodyRange {
+    start: u32,
+    end: u32,
+    lens: Lens,
+}
+
+impl BodyRange {
+    pub(crate) const fn new(r: Range, lens: Lens) -> BodyRange {
+        BodyRange { start: r.start, end: r.end, lens }
+    }
+
+    /// A range the lowering makes while it builds: encoded, never read.
+    pub(crate) const fn building(r: Range) -> BodyRange {
+        BodyRange::new(r, Lens::BUILDING)
+    }
+
+    /// Its bounds, for the lowering that builds the text (inside this crate only).
+    pub(crate) const fn raw(self) -> Range {
+        Range::new(self.start, self.end)
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.start >= self.end
+    }
+
+    /// Its length in bytes.
+    pub const fn len(self) -> u32 {
+        self.end.saturating_sub(self.start)
+    }
+
+    /// The range from the first's start to the later end of both; `None` for ranges of two
+    /// records, or of the item and of an expansion (no text spans both).
+    pub fn cover(self, other: BodyRange) -> Option<BodyRange> {
+        let item = self.lens.item_len;
+        let same_side = (self.end <= item) == (other.end <= item);
+        (self.lens == other.lens && same_side).then(|| BodyRange {
+            start: self.start.min(other.start),
+            end: self.end.max(other.end),
+            lens: self.lens,
+        })
+    }
+
+    /// Whether it is of the expansions' text, not the item's.
+    pub const fn in_expansion(self) -> bool {
+        self.end > self.lens.item_len
+    }
+}
+
+/// Why [`View::text_at`] gave no text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TextAt {
+    /// The range was made by another record's view.
+    OtherView(BodyRange),
+    /// The range is not a text of this record (past its end, across the item's end, or off a
+    /// character's boundary): a record whose bytes are wrong.
+    Malformed(BodyRange),
+    /// The row asked for is not in the record.
+    Row(BadRow),
+}
+
+impl From<BadRow> for TextAt {
+    fn from(b: BadRow) -> TextAt {
+        TextAt::Row(b)
+    }
+}
+
+/// A lowering read: of the columns in memory, or of a record in place, with the item's text
+/// it was lowered from. Rows decode when asked; a row that is no form of its column is a
+/// [`BadRow`]. Every range it gives is a [`BodyRange`], read through [`View::text_at`].
 #[derive(Clone, Copy)]
 pub struct View<'b> {
+    item: &'b str,
+    lens: Lens,
     pub exprs: &'b [Node],
-    pub expr_ranges: &'b [Range],
+    expr_ranges: &'b [Range],
     pub pats: &'b [Node],
-    pub pat_ranges: &'b [Range],
+    pat_ranges: &'b [Range],
     pub stmts: &'b [Node],
     pub types: &'b [Node],
-    pub type_ranges: &'b [Range],
+    type_ranges: &'b [Range],
     pub paths: &'b [Node],
-    pub path_ranges: &'b [Range],
+    path_ranges: &'b [Range],
     pub rows: &'b [Node],
-    pub row_ranges: &'b [Range],
+    row_ranges: &'b [Range],
     pub ids: &'b [u32],
     pub names: &'b [u64],
-    pub name_ranges: &'b [Range],
+    name_ranges: &'b [Range],
     pub scopes: &'b [Node],
-    pub consts: &'b [Range],
+    consts: &'b [Range],
     pub unhandled: &'b [Node],
     pub diags: &'b [Node],
     pub cfg: &'b [Node],
+    expanded: &'b [u8],
+    expansion_calls: &'b [Range],
+    pub expansion_keys: &'b [ContentId],
+    expansion_starts: &'b [u32],
     pub langs: u64,
     pub head: Head,
+}
+
+impl<'b> View<'b> {
+    /// The item's text the record was lowered from.
+    pub fn item(&self) -> &'b str {
+        self.item
+    }
+
+    pub(crate) fn lens(&self) -> Lens {
+        self.lens
+    }
+
+    fn range(&self, r: Range) -> BodyRange {
+        BodyRange::new(r, self.lens)
+    }
+
+    /// The text at `r`: the item's own, or of an expansion lowered in place. Total: a range
+    /// of another record, or one this record cannot hold, is refused, never a panic.
+    pub fn text_at(&self, r: BodyRange) -> Result<&'b str, TextAt> {
+        if r.lens != self.lens {
+            return Err(TextAt::OtherView(r));
+        }
+        let malformed = TextAt::Malformed(r);
+        let item = self.lens.item_len;
+        if r.start > r.end {
+            return Err(malformed);
+        }
+        if r.end <= item {
+            return self.item.get(r.start as usize..r.end as usize).ok_or(malformed);
+        }
+        let start = r.start.checked_sub(item).ok_or(malformed)? as usize;
+        let bytes = self.expanded.get(start..(r.end - item) as usize).ok_or(malformed)?;
+        core::str::from_utf8(bytes).map_err(|_| malformed)
+    }
+
+    /// `r` as a range of the item's text; `None` inside an expansion, which has no position
+    /// of its own in the item (rule 71: see [`View::site`]).
+    pub fn item_relative(&self, r: BodyRange) -> Option<Range> {
+        (r.lens == self.lens && !r.in_expansion()).then(|| r.raw())
+    }
+
+    /// Where `r` is in the item, for a diagnostic: `r` itself, or the range of the outermost
+    /// macro call whose expansion holds it. Item-relative (rule 71): a file position exists
+    /// only when printed.
+    pub fn site(&self, r: BodyRange) -> Result<Range, TextAt> {
+        if r.lens != self.lens {
+            return Err(TextAt::OtherView(r));
+        }
+        let item = self.lens.item_len;
+        let at = r.raw();
+        // A node of the item's text that ends with a macro call (`x.map_err(|e| format!(..))`)
+        // ends where the call's expansion ends: its site runs to the outermost call's end.
+        if at.start < item && at.end > item {
+            let tail = self.outermost(Range::new(at.end - 1, at.end), r)?;
+            return Ok(Range::new(at.start, tail.end.max(at.start)));
+        }
+        self.outermost(at, r)
+    }
+
+    /// `at`, or the range of the outermost macro call whose expansion holds it.
+    fn outermost(&self, mut at: Range, r: BodyRange) -> Result<Range, TextAt> {
+        let item = self.lens.item_len;
+        // Each step goes to a call of an earlier expansion (a call is in the text before the
+        // expansion it makes), so this ends within one step per expansion.
+        for _ in 0..=self.expansion_calls.len() {
+            if at.end <= item {
+                return Ok(at);
+            }
+            let offset = at.start.checked_sub(item).ok_or(TextAt::Malformed(r))?;
+            let held = self.expansion_starts.partition_point(|s| *s <= offset);
+            let call = held.checked_sub(1).and_then(|j| self.expansion_calls.get(j)).ok_or(TextAt::Malformed(r))?;
+            at = *call;
+        }
+        Err(TextAt::Malformed(r))
+    }
+
+    /// The text of the expansions lowered in place, after the item's own.
+    pub(crate) fn expanded(&self) -> &'b [u8] {
+        self.expanded
+    }
+
+    /// The read list of the expansions: each body macro call's range, beside
+    /// [`View::expansion_keys`].
+    pub fn expansion_calls(&self) -> impl Iterator<Item = BodyRange> + 'b {
+        let lens = self.lens;
+        self.expansion_calls.iter().map(move |r| BodyRange::new(*r, lens))
+    }
+
+    /// The anonymous constants' ranges, in order.
+    pub fn consts(&self) -> impl Iterator<Item = BodyRange> + 'b {
+        let lens = self.lens;
+        self.consts.iter().map(move |r| BodyRange::new(*r, lens))
+    }
+
+    pub(crate) fn raw_consts(&self) -> &'b [Range] {
+        self.consts
+    }
+
+    /// The ABI string's range of an `extern "abi"` item; `None` with no `extern` or `extern`
+    /// alone.
+    pub fn abi(&self) -> Option<BodyRange> {
+        match self.head[head::ABI] {
+            NONE => None,
+            start if start == NONE - 1 => None,
+            start => Some(self.range(Range::new(start, self.head[head::ABI + 1]))),
+        }
+    }
+
+    fn ranged(&self, column: &'static str, all: &[Range], i: u32) -> Result<BodyRange, BadRow> {
+        Ok(self.range(at(column, all, i)?))
+    }
+
+    pub fn expr_range(&self, e: ExprId) -> Result<BodyRange, BadRow> {
+        self.ranged("expr_ranges", self.expr_ranges, e.0)
+    }
+
+    pub fn pat_range(&self, p: PatId) -> Result<BodyRange, BadRow> {
+        self.ranged("pat_ranges", self.pat_ranges, p.0)
+    }
+
+    pub fn type_range(&self, t: TypeId) -> Result<BodyRange, BadRow> {
+        self.ranged("type_ranges", self.type_ranges, t.0)
+    }
+
+    pub fn path_range(&self, p: PathIdx) -> Result<BodyRange, BadRow> {
+        self.ranged("path_ranges", self.path_ranges, p.0)
+    }
+
+    /// The range of the row at `i` of the `rows` column (a list's `start + k`).
+    pub fn row_range(&self, i: u32) -> Result<BodyRange, BadRow> {
+        self.ranged("row_ranges", self.row_ranges, i)
+    }
+
+    pub fn name_range(&self, n: NameIdx) -> Result<BodyRange, BadRow> {
+        self.ranged("name_ranges", self.name_ranges, n.0)
+    }
+
+    /// A name as written (`r#` kept).
+    pub fn name_text(&self, n: NameIdx) -> Result<&'b str, TextAt> {
+        self.text_at(self.name_range(n)?)
+    }
+
+    /// The `expr_ranges` column, for blaze-typeck's form (one range per expression).
+    pub(crate) fn raw_expr_ranges(&self) -> &'b [Range] {
+        self.expr_ranges
+    }
+
+    /// The `pat_ranges` column, as [`View::raw_expr_ranges`].
+    pub(crate) fn raw_pat_ranges(&self) -> &'b [Range] {
+        self.pat_ranges
+    }
+
+    pub fn attr(&self, n: Node) -> Result<Attr, BadRow> {
+        Attr::decode(n, self.lens)
+    }
+
+    pub fn macro_call(&self, n: Node) -> Result<MacroCall, BadRow> {
+        MacroCall::decode(n, self.lens)
+    }
+
+    pub fn format_args(&self, n: Node) -> Result<FormatArgs, BadRow> {
+        FormatArgs::decode(n, self.lens)
+    }
+
+    pub fn fmt_piece(&self, n: Node) -> Result<FmtPiece, BadRow> {
+        FmtPiece::decode(n, self.lens)
+    }
+
+    pub fn local_item(&self, n: Node) -> Result<LocalItem, BadRow> {
+        LocalItem::decode(n, self.lens)
+    }
 }
 
 fn at<T: Copy>(column: &'static str, all: &[T], i: u32) -> Result<T, BadRow> {
@@ -311,10 +658,6 @@ impl<'b> View<'b> {
         Expr::decode(at("exprs", self.exprs, e.0)?)
     }
 
-    pub fn expr_range(&self, e: ExprId) -> Range {
-        self.expr_ranges.get(e.0 as usize).copied().unwrap_or_default()
-    }
-
     pub fn pat(&self, p: PatId) -> Result<Pat, BadRow> {
         Pat::decode(at("pats", self.pats, p.0)?)
     }
@@ -324,7 +667,7 @@ impl<'b> View<'b> {
     }
 
     pub fn ty(&self, t: TypeId) -> Result<TypeRef, BadRow> {
-        TypeRef::decode(at("types", self.types, t.0)?)
+        TypeRef::decode(at("types", self.types, t.0)?, self.lens)
     }
 
     pub fn path(&self, p: PathIdx) -> Result<PathRef, BadRow> {
@@ -352,13 +695,8 @@ impl<'b> View<'b> {
         at("names", self.names, n.0)
     }
 
-    /// A name as written in `text`, the item's text (`r#` kept).
-    pub fn name_text<'t>(&self, text: &'t str, n: NameIdx) -> &'t str {
-        self.name_ranges.get(n.0 as usize).and_then(|r| text.get(r.start as usize..r.end as usize)).unwrap_or("")
-    }
-
-    pub fn const_range(&self, c: ConstIdx) -> Result<Range, BadRow> {
-        at("consts", self.consts, c.0)
+    pub fn const_range(&self, c: ConstIdx) -> Result<BodyRange, BadRow> {
+        self.ranged("consts", self.consts, c.0)
     }
 
     pub fn scope(&self, s: ScopeId) -> Result<Scope, BadRow> {
@@ -366,11 +704,13 @@ impl<'b> View<'b> {
     }
 
     pub fn unhandled(&self) -> impl Iterator<Item = Unhandled> + 'b {
-        self.unhandled.iter().map(|n| Unhandled::decode(*n))
+        let lens = self.lens;
+        self.unhandled.iter().map(move |n| Unhandled::decode(*n, lens))
     }
 
     pub fn diags(&self) -> impl Iterator<Item = Result<Diag, BadRow>> + 'b {
-        self.diags.iter().map(|n| Diag::decode(*n))
+        let lens = self.lens;
+        self.diags.iter().map(move |n| Diag::decode(*n, lens))
     }
 
     pub fn cfg_reads(&self) -> impl Iterator<Item = CfgRead> + 'b {
@@ -396,6 +736,14 @@ impl<'b> View<'b> {
         let root = self.head_opt(head::ROOT)?;
         let params = self.ids(self.list(head::PARAMS)).unwrap_or(&[]);
         Some((ExprId(root), params))
+    }
+
+    /// A lone type's root ([`crate::lower_type_text`]); `None` for any other record.
+    pub fn type_root(&self) -> Option<TypeId> {
+        if self.head[head::MODE] != 3 {
+            return None;
+        }
+        self.head_opt(head::TY).map(TypeId)
     }
 
     /// Whether the item's own `cfg` turned it off.

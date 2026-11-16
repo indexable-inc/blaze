@@ -48,6 +48,7 @@ pub const USAGE: &str = "blaze cache status | blaze cache pull <toolchain> <targ
 pub type Connect<'c> = &'c mut dyn FnMut(&Settings) -> Result<Box<dyn Bucket>, Failure>;
 
 /// `blaze cache <words>` over HTTPS.
+#[cfg(feature = "bucket")]
 pub fn main(root: &Path, env: Env<'_>, words: &[&str], now_s: u64) -> Result<String, String> {
     run(root, env, words, now_s, &mut |settings| Ok(Box::new(crate::http::HttpBucket::new(settings)?) as Box<dyn Bucket>))
 }

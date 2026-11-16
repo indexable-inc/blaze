@@ -12,7 +12,8 @@ use blaze_sim::{Broke, Config, Tape};
 use super::{file, name, small};
 use crate::error::BuildError;
 use crate::file_items::{
-    Attr, AttrKind, AttrSpan, ErrorOrigin, FileItems, FileItemsView, Item, ItemDetail, SyntaxError,
+    Attr, AttrKind, AttrSpan, ErrorOrigin, FileItems, FileItemsView, Item, ItemDetail, ItemFlags,
+    SyntaxError,
 };
 use crate::kind::{ItemIndex, Range, WrittenVis};
 use crate::path::Rename;
@@ -84,6 +85,7 @@ struct Drawn {
     file_attrs: AttrSpan,
     errors: Vec<SyntaxError, Global>,
     messages: Vec<u8, Global>,
+    file_flags: ItemFlags,
 }
 
 fn drawn(tape: &Tape) -> Drawn {
@@ -126,6 +128,7 @@ fn drawn(tape: &Tape) -> Drawn {
             disambiguator: small(tape, 4, "disambiguator"),
             hash: id(tape, "hash"),
             signature_hash: id(tape, "signature hash"),
+            flags: flags(tape),
         });
         open.push(index);
     }
@@ -146,7 +149,8 @@ fn drawn(tape: &Tape) -> Drawn {
         };
         errors.push(SyntaxError { range: range_in(tape, text_len), origin, message });
     }
-    Drawn { text, items, attrs, file_attrs, errors, messages }
+    let file_flags = flags(tape);
+    Drawn { text, items, attrs, file_attrs, errors, messages, file_flags }
 }
 
 impl Drawn {
@@ -159,8 +163,14 @@ impl Drawn {
             file_attrs: self.file_attrs,
             errors: &self.errors,
             messages: &self.messages,
+            file_flags: self.file_flags,
         }
     }
+}
+
+fn flags(tape: &Tape) -> ItemFlags {
+    let bits = u8::try_from(tape.below(16, "flags")).expect("a draw below 16 fits a u8");
+    ItemFlags::from_bits(bits).expect("four bits are every flag")
 }
 
 fn oracle(what: &str) -> Broke {
@@ -193,6 +203,19 @@ fn file_items_read_back_every_value() {
         {
             return Err(oracle("the file's attributes or errors read back other than written"));
         }
+        // The roll-up: the file's flags are its own and every entry's, and the flagged entries
+        // are exactly those with a flag.
+        let all = drawn.items.iter().fold(drawn.file_flags, |flags, item| flags | item.flags);
+        let flagged = drawn.items.iter().enumerate().filter(|(_, item)| !item.flags.is_empty());
+        let flagged = flagged.map(|(at, item)| (ItemIndex(u32::try_from(at).expect("few")), item.flags));
+        if view.flags() != all
+            || view.own_flags() != drawn.file_flags
+            || !view.flagged().eq(flagged.clone())
+            || crate::flags_of_files([&view, &view]) != all
+            || !crate::flagged_in_files([&view]).map(|(_, index, flags)| (index, flags)).eq(flagged)
+        {
+            return Err(oracle("a file's flags roll up other than its entries'"));
+        }
         for error in &drawn.errors {
             if view.message(error).as_bytes() != &drawn.messages[error.message.to_usize()] {
                 return Err(oracle("an error's message read back other than written"));
@@ -224,6 +247,7 @@ pub(super) const F: Item = Item {
     disambiguator: 0,
     hash: ContentId([3; 32]),
     signature_hash: ContentId([4; 32]),
+    flags: ItemFlags::NONE,
 };
 
 fn write_one(item: Item) -> Result<(), BuildError> {
@@ -235,6 +259,7 @@ fn write_one(item: Item) -> Result<(), BuildError> {
         file_attrs: AttrSpan { start: 0, end: 0 },
         errors: &[],
         messages: &[],
+        file_flags: ItemFlags::NONE,
     };
     parts.write(Alloc::global()).map(|_| ())
 }

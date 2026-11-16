@@ -27,7 +27,7 @@ use crate::diagnostic::ManifestDiagnostic;
 use crate::edit_distance::closest_msg;
 use crate::features::{Edition, Feature, Features, ResolveBehavior};
 use crate::files::Files;
-use crate::paths::normalize_path;
+use crate::paths::{normalize_path, relative_to};
 use crate::profiles::validate_profiles;
 use crate::source::{self, CRATES_IO_INDEX, CRATES_IO_REGISTRY, GitReference, SourceId, into_url};
 use crate::targets::{self, Target};
@@ -294,7 +294,7 @@ pub(crate) fn resolve_relative_path(
     rel_path: &str,
 ) -> Result<String, ManifestError> {
     let joined_path = normalize_path(&old_root.join(rel_path));
-    match pathdiff::diff_paths(joined_path, new_root) {
+    match relative_to(&joined_path, new_root) {
         None => Err(InvalidManifest::Unrelatable {
             label: label.to_owned(),
             old_root: old_root.to_owned(),

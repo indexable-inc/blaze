@@ -38,6 +38,8 @@ pub struct Profile {
     pub pages_written: u32,
     /// Whether the certificate stood.
     pub certified: bool,
+    /// Files the walk opened as it reached them (`Effect::Open`): not in the leaf table.
+    pub opens: u32,
     /// Tests run again and tests whose stored result was reported.
     pub tests_run: u32,
     pub tests_reused: u32,

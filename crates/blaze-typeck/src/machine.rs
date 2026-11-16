@@ -13,17 +13,20 @@ use core::mem::DropGuard;
 
 use crate::body::BodyView;
 use crate::columns::{AdjustKind, CaptureKind};
-use crate::diag::{At, DiagCode, PendingDiag};
+use crate::diag::{At, DiagCode, PendingDiag, PendingGoal};
 use crate::error::{CheckError, Limit, Malformed, Stop};
 use crate::ids::{
     ExprId, FloatTy, IntTy, ItemKey, LangItem, Mutbl, Name, PatId, StmtId, UintTy,
 };
 use crate::portable::{PNode, PTy, PTys};
 use crate::ty::{Cause, Goal, Obligation, Ty, TyList, TyView, TypeCtx, Var, VarKind};
-use crate::world::{PClause, Reads, Shape, World};
+use crate::world::{Def, PClause, Reads, Shape, World};
 
 /// rustc's default `recursion_limit`: the autoderef bound (E0055 past it).
 pub(crate) const RECURSION_LIMIT: u32 = 128;
+
+/// How deep [`Machine::failed_leaf`] follows one impl's failing where-clause (rule 18).
+const MAX_LEAF_DEPTH: u32 = 16;
 
 /// A planted bug for the read-list property (`tests::read_list_property`): outside tests there is none.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,6 +35,24 @@ pub(crate) enum Plant {
     /// A field access reads its ADT through the unrecorded backdoor.
     #[cfg(test)]
     PeekFields,
+    /// Autoderef stops one step early (`suite::control_autoderef_short`).
+    #[cfg(test)]
+    AutoderefShort,
+    /// The owner's where-clauses never reach the param env (`suite::control_where_clause_ignored`).
+    #[cfg(test)]
+    IgnoreWhereClauses,
+    /// An async block's output is its first statement's type, not its tail's
+    /// (`suite::async_block::control_output_from_first`).
+    #[cfg(test)]
+    AsyncOutputFromFirst,
+    /// A method call registers none of its method's own where-clauses, so a `where Self: Sized`
+    /// method is callable on a trait object (`suite::dyn_objects::control_sized_method_callable`).
+    #[cfg(test)]
+    MethodClausesDropped,
+    /// An unsizing coercion takes any `Unsize`/`CoerceUnsized` target without asking the solver,
+    /// so it can invent an auto trait (`suite::dyn_objects::control_coercion_invents_auto`).
+    #[cfg(test)]
+    UnsizeUnasked,
 }
 
 /// What the context expects of an expression (rustc's `Expectation`).
@@ -61,6 +82,16 @@ impl Expectation {
             }
         }
     }
+}
+
+/// What one source of a coercion site ([`Machine::coerce_many_push`]) is, with its place.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Source {
+    /// A value: the tail, an arm, a `break`'s or `return`'s operand.
+    Expr(ExprId),
+    /// The forced `()` of the expression named: a block with no tail that does not diverge, or
+    /// a `break` or `return` with no value.
+    Unit(ExprId),
 }
 
 /// Where a finished expression's result goes, after it is written to its column.
@@ -141,14 +172,27 @@ pub(crate) struct PendingClosure {
     pub expr: ExprId,
 }
 
+/// An async block's (or async closure's) future whose interior is fixed after the walk
+/// (`Machine::analyze_futures`): its expression, the body walked for the interior, the interior
+/// variable, and how it captures.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PendingFuture {
+    pub expr: ExprId,
+    pub body: ExprId,
+    pub interior: Ty,
+    pub capture: crate::body::Capture,
+}
+
 /// What `Machine::snapshot` saved: the type context's snapshot and each column's length.
 pub(crate) struct MachineSnapshot<S> {
     ty: S,
     diags: usize,
+    dyn_seen: usize,
     errors: u32,
     adjust: usize,
     adj_scratch: usize,
     callees: usize,
+    defs: usize,
     fields: usize,
     captures: usize,
     casts: usize,
@@ -171,6 +215,10 @@ pub(crate) enum Lower {
     Args(TyList),
     /// A type written in the body: parameters are the owner's own; a hole is a fresh variable.
     Body,
+    /// The owner's where-clause, assumed in its param env: parameters are the owner's own, an
+    /// alias stays the alias (rustc keeps a param env's projections unnormalized: a clause
+    /// `U: Inject<S, <U as UnionFrom<S>>::Path>` is assumed as written), a hole is malformed.
+    Assumed,
 }
 
 /// The types every body uses.
@@ -206,15 +254,22 @@ pub(crate) struct Machine<'b, 'w, 'c, 'a, W: World, C: TypeCtx> {
     pub max_frames: usize,
     // Results, by node.
     pub expr_ty: Vec<Ty, Alloc<'a>>,
+    /// Whether the walk finished each expression: one no list or parent holds stays `false`,
+    /// and the writeback refuses it by name ([`crate::error::Malformed::Unreached`]).
+    pub reached: Vec<bool, Alloc<'a>>,
     pub pat_ty: Vec<Ty, Alloc<'a>>,
     pub local_ty: Vec<Ty, Alloc<'a>>,
     // Sparse results, rows read whole.
     /// Adjustments in the order made; scanned by expression (a receiver's autoref).
     pub adjust: Soa<(ExprId, AdjustKind, Ty), Alloc<'a>>,
     pub callees: Vec<(ExprId, ItemKey, TyList), Alloc<'a>>,
+    /// What each value or struct path resolved to, at its expression or pattern.
+    pub defs: Vec<(At, Def), Alloc<'a>>,
     pub fields: Vec<(ExprId, u32, u32), Alloc<'a>>,
     pub captures: Vec<(ExprId, PatId, CaptureKind), Alloc<'a>>,
     pub diags: Vec<PendingDiag, Alloc<'a>>,
+    /// The traits whose `dyn` was checked in this body ([`Machine::check_dyn`]: once per trait).
+    pub dyn_seen: Vec<ItemKey, Alloc<'a>>,
     /// The number of errors reported: the body is "tainted by errors" when it is not zero.
     pub errors: u32,
     // Queues, processed where rustc processes them.
@@ -222,10 +277,16 @@ pub(crate) struct Machine<'b, 'w, 'c, 'a, W: World, C: TypeCtx> {
     pub numeric: Vec<Ty, Alloc<'a>>,
     pub diverging: Vec<Ty, Alloc<'a>>,
     pub closures: Vec<PendingClosure, Alloc<'a>>,
+    pub futures: Vec<PendingFuture, Alloc<'a>>,
+    /// Each `.await` in an async context and the future it holds while suspended
+    /// (`<T as IntoFuture>::IntoFuture`): part of the enclosing future's interior.
+    pub awaited: Vec<(ExprId, Ty), Alloc<'a>>,
     pub coerce_many: Vec<CoerceMany, Alloc<'a>>,
     pub breaks: Vec<BreakCtx, Alloc<'a>>,
     /// The innermost body's return site (the fn's, or a closure's).
     pub ret_sites: Vec<u32, Alloc<'a>>,
+    /// One per open body, as `ret_sites`: whether it is async (where `.await` may be).
+    pub async_sites: Vec<bool, Alloc<'a>>,
     /// The adjustments of the coercion being tried, moved to `adjust` once it commits.
     pub adj_scratch: Vec<(AdjustKind, Ty), Alloc<'a>>,
 }
@@ -258,6 +319,8 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         let err = common.err;
         let mut expr_ty = Vec::with_capacity_in(body.exprs.len(), alloc);
         expr_ty.resize(body.exprs.len(), err);
+                let mut reached = Vec::with_capacity_in(body.exprs.len(), alloc);
+                reached.resize(body.exprs.len(), false);
         let mut pat_ty = Vec::with_capacity_in(body.pats.len(), alloc);
         pat_ty.resize(body.pats.len(), err);
         let mut local_ty = Vec::with_capacity_in(body.pats.len(), alloc);
@@ -273,21 +336,27 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             frames: Vec::new_in(alloc),
             max_frames: 4 * body.nodes() + 64,
             expr_ty,
+            reached,
             pat_ty,
             local_ty,
             adjust: Soa::new_in(alloc),
             callees: Vec::new_in(alloc),
+            defs: Vec::new_in(alloc),
             fields: Vec::new_in(alloc),
             captures: Vec::new_in(alloc),
             diags: Vec::new_in(alloc),
+            dyn_seen: Vec::new_in(alloc),
             errors: 0,
             casts: Vec::new_in(alloc),
             numeric: Vec::new_in(alloc),
             diverging: Vec::new_in(alloc),
             closures: Vec::new_in(alloc),
+            futures: Vec::new_in(alloc),
+            awaited: Vec::new_in(alloc),
             coerce_many: Vec::new_in(alloc),
             breaks: Vec::new_in(alloc),
             ret_sites: Vec::new_in(alloc),
+            async_sites: Vec::new_in(alloc),
             adj_scratch: Vec::new_in(alloc),
             alloc,
         })
@@ -304,6 +373,10 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             if steps > bound {
                 return Err(CheckError::Limit(Limit::Steps).into());
             }
+            if self.reads.logging() {
+                let bytes = self.state_bytes();
+                self.reads.at(steps as u32, bytes);
+            }
             match f.node {
                 Node::Expr(e) => self.step_expr(f, e)?,
                 Node::Pat(p) => self.step_pat(f, p)?,
@@ -311,6 +384,22 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             }
         }
         Ok(())
+    }
+
+    /// The checker's live state in bytes, for the ask log: what a saved state would hold (the
+    /// frames and the columns written so far; the type context's tables are not counted).
+    fn state_bytes(&self) -> u64 {
+        let b = core::mem::size_of::<Frame>() * self.frames.len()
+            + core::mem::size_of_val(&self.diags[..])
+            + core::mem::size_of::<(ExprId, AdjustKind, Ty)>() * self.adjust.len()
+            + core::mem::size_of_val(&self.callees[..])
+            + core::mem::size_of_val(&self.defs[..])
+            + core::mem::size_of_val(&self.fields[..])
+            + core::mem::size_of_val(&self.captures[..])
+            + core::mem::size_of_val(&self.casts[..])
+            + core::mem::size_of_val(&self.numeric[..])
+            + core::mem::size_of_val(&self.closures[..]);
+        b as u64
     }
 
     pub(crate) fn push(&mut self, f: Frame) -> Result<(), Stop> {
@@ -390,6 +479,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     /// Writes `e`'s type, folds divergence, and sends the result where `f.then` says.
     fn finish_expr(&mut self, f: Frame, e: ExprId, ty: Ty) -> Result<(), Stop> {
         self.expr_ty[e.ix()] = ty;
+                self.reached[e.ix()] = true;
         if self.is_never(ty) {
             self.diverges = true;
         }
@@ -407,7 +497,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 to
             }
             Then::CoerceMany(site) => {
-                self.coerce_many_push(site, Some(e), ty)?;
+                self.coerce_many_push(site, Source::Expr(e), ty)?;
                 ty
             }
         };
@@ -439,8 +529,14 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         Ok(at)
     }
 
-    /// `CoerceMany::coerce` (and `coerce_forced_unit` when `e` is `None`).
-    pub(crate) fn coerce_many_push(&mut self, site: u32, e: Option<ExprId>, ty: Ty) -> Result<(), Stop> {
+    /// `CoerceMany::coerce` (and `coerce_forced_unit` for [`Source::Unit`]). A mismatch is
+    /// reported at the source's own expression: the forced `()` names the block, `break` or
+    /// `return` it stands for, so no finding of a site has an empty place.
+    pub(crate) fn coerce_many_push(&mut self, site: u32, source: Source, ty: Ty) -> Result<(), Stop> {
+        let (e, at) = match source {
+            Source::Expr(e) => (Some(e), At::Expr(e)),
+            Source::Unit(of) => (None, At::Expr(of)),
+        };
         let cm = self.coerce_many[site as usize];
         let ty = self.try_structurally_resolve(ty)?;
         let merged = cm.final_ty.unwrap_or(cm.expected);
@@ -459,10 +555,6 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 if self.coerce(Some(e), ty, cm.expected, false)? { Some(cm.expected) } else { None }
             }
             Some(e) => self.coercion_lub(e, merged, ty)?,
-        };
-        let at = match e {
-            Some(e) => At::Expr(e),
-            None => At::Body,
         };
         match ok {
             Some(t) => {
@@ -529,10 +621,51 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     }
 
     /// `n` fresh type variables.
+    /// The `usize` value `n` (an array length) as a const term.
+    pub(crate) fn len_value(&mut self, n: u64) -> Result<Ty, Stop> {
+        let ty = self.common.usize_;
+        self.mk(TyView::ConstValue { ty, bits: u128::from(n) })
+    }
+
+    /// A length written in the body (`[x; N]`): an `Infer` hole (`_`) is a fresh const
+    /// variable, anything else the body's term lowered.
+    pub(crate) fn lower_len(&mut self, len: PTy, at: At) -> Result<Ty, Stop> {
+        if let PNode::Infer = self.body.types.node(len)? {
+            return self.ty.fresh(VarKind::Const).map_err(Stop::from);
+        }
+        self.lower_body_ty(len, at)
+    }
+
+    /// The value of const term `t` once resolved, when it is a value that fits a `u64`.
+    pub(crate) fn len_of(&mut self, t: Ty) -> Option<u64> {
+        match self.view(t) {
+            TyView::ConstValue { bits, .. } => u64::try_from(bits).ok(),
+            _ => None,
+        }
+    }
+
     pub(crate) fn fresh_args(&mut self, n: u32) -> Result<TyList, Stop> {
         let mut v: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(n as usize, self.alloc);
         for _ in 0..n {
             v.push(self.fresh()?);
+        }
+        self.mk_list(&v)
+    }
+
+    /// Fresh arguments for parameters `from..from + n` of `item`'s generics (the Reference,
+    /// "Generic parameters"): a const parameter's is a const variable, a type parameter's a
+    /// type variable.
+    pub(crate) fn fresh_generic_args(&mut self, item: ItemKey, from: u32, n: u32) -> Result<TyList, Stop> {
+        if n == 0 {
+            return self.mk_list(&[]);
+        }
+        let consts = self.reads.const_params(item)?;
+        let mut v: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(n as usize, self.alloc);
+        for i in from..from + n {
+            v.push(match consts.type_of(i) {
+                Some(_) => self.ty.fresh(VarKind::Const)?,
+                None => self.fresh()?,
+            });
         }
         self.mk_list(&v)
     }
@@ -589,7 +722,22 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         name: Option<Name>,
     ) {
         self.errors += 1;
-        self.diags.push(PendingDiag { code, at, expected, found, name });
+        let code = match (code, expected, found) {
+            (DiagCode::Mismatch, Some(e), Some(f)) if self.pattern_over(e, f) || self.pattern_over(f, e) => {
+                DiagCode::PatternNotBase
+            }
+            _ => code,
+        };
+        self.diags.push(PendingDiag { code, at, expected, found, name, because: None, unmet: None });
+    }
+
+    /// Whether `p` is a pattern type over `other` (typeck.md, "Pattern types"): its base is
+    /// `other`, or `other` is an integer or float variable (an unsuffixed literal). Such a
+    /// mismatch is `DiagCode::PatternNotBase`, which names both types.
+    fn pattern_over(&mut self, p: Ty, other: Ty) -> bool {
+        let TyView::Pat(base, _) = self.view(p) else { return false };
+        let (base, other) = (self.ty.shallow_resolve(base), self.ty.shallow_resolve(other));
+        base == other || matches!(self.ty.view(other), TyView::Infer(Var { kind: VarKind::Int | VarKind::Float, .. }))
     }
 
     // Selection.
@@ -597,37 +745,165 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     /// `select_obligations_where_possible`, reporting what failed (E0277).
     pub(crate) fn select(&mut self) -> Result<(), Stop> {
         self.ty.select_where_possible(&mut self.reads)?;
-        self.report_fulfill_errors(false);
-        Ok(())
+        self.report_fulfill_errors(false)
     }
 
     /// `select_all_obligations_or_error`: ambiguity is "type annotations needed", reported
     /// only when the body has no other error (rustc's `tainted_by_errors`).
     pub(crate) fn select_all(&mut self) -> Result<(), Stop> {
         self.ty.select_all(&mut self.reads)?;
-        self.report_fulfill_errors(true);
-        Ok(())
+        self.report_fulfill_errors(true)
     }
 
-    fn report_fulfill_errors(&mut self, ambiguity: bool) {
+    /// Ambiguity follows rustc's `maybe_report_ambiguity`: a trait goal other than `Sized` is
+    /// E0283 "cannot satisfy", anything else (a `Sized` goal, a projection, well-formedness)
+    /// E0282.
+    fn report_fulfill_errors(&mut self, ambiguity: bool) -> Result<(), Stop> {
         // Bounded by the context's error count; each `next_error` removes one.
         while let Some(err) = self.ty.next_error() {
-            let at = match err.obligation.cause {
-                Cause::Expr(e) => At::Expr(e),
-                Cause::Pat(p) => At::Pat(p),
-                Cause::Body => At::Body,
-            };
+            let at = At::of(err.obligation.cause);
             match err.kind {
                 crate::ty::FulfillErrorKind::Ambiguous => {
                     if ambiguity && self.errors == 0 {
-                        self.diag(DiagCode::AnnotationsNeeded, at, None, None, None);
+                        let code = match err.obligation.goal {
+                            crate::ty::Goal::Trait { trait_, .. } if self.lang(LangItem::Sized)? != Some(trait_) => {
+                                DiagCode::CannotSatisfy
+                            }
+                            _ => DiagCode::AnnotationsNeeded,
+                        };
+                        self.diag(code, at, None, None, None);
                     }
                 }
-                crate::ty::FulfillErrorKind::Unsatisfied | crate::ty::FulfillErrorKind::Mismatch => {
-                    self.diag(DiagCode::Unsatisfied, at, None, None, None);
-                }
+                crate::ty::FulfillErrorKind::Unsatisfied | crate::ty::FulfillErrorKind::Mismatch => match err.because {
+                    // An impl's `where const` condition is the reason: the finding names it,
+                    // with the bound's self type.
+                    Some(because) => {
+                        let found = match err.obligation.goal {
+                            crate::ty::Goal::Trait { args, .. } if self.ty.list_len(args) > 0 => {
+                                Some(self.ty.list_get(args, 0))
+                            }
+                            _ => None,
+                        };
+                        self.errors += 1;
+                        self.diags.push(PendingDiag {
+                            code: DiagCode::Unsatisfied,
+                            at,
+                            expected: None,
+                            found,
+                            name: None,
+                            because: Some(because),
+                            unmet: None,
+                        });
+                    }
+                    // The finding carries the goal entire (trait or projection, every
+                    // argument, the term) and the leaf where-clause that failed under it;
+                    // `found` is the goal's self type.
+                    None => {
+                        let goal = match err.obligation.goal {
+                            crate::ty::Goal::Trait { trait_, args } => Some(PendingGoal::Trait { trait_, args }),
+                            crate::ty::Goal::Projection { trait_, args, name, term } => {
+                                Some(PendingGoal::Projection { trait_, args, name, term })
+                            }
+                            _ => None,
+                        };
+                        match goal {
+                            Some(goal) => {
+                                let (PendingGoal::Trait { trait_, args } | PendingGoal::Projection { trait_, args, .. }) = goal;
+                                let found = if self.ty.list_len(args) > 0 { Some(self.ty.list_get(args, 0)) } else { None };
+                                let leaf = self.failed_leaf(trait_, args)?.map(|(trait_, args)| PendingGoal::Trait { trait_, args });
+                                self.errors += 1;
+                                self.diags.push(PendingDiag {
+                                    code: DiagCode::Unsatisfied,
+                                    at,
+                                    expected: None,
+                                    found,
+                                    name: None,
+                                    because: None,
+                                    unmet: Some((goal, leaf)),
+                                });
+                            }
+                            None => self.diag(DiagCode::Unsatisfied, at, None, None, None),
+                        }
+                    }
+                },
             }
         }
+        Ok(())
+    }
+
+    /// The leaf where-clause under an unmet `args[0]: trait_<args[1..]>`: while exactly one
+    /// impl's header matches the goal, the first of that impl's trait where-clauses that may
+    /// not hold becomes the goal; the last one so reached is the leaf (`None`: no impl, several,
+    /// or none of its clauses fails alone, so the goal itself is what to fix). A loop bounded by
+    /// [`MAX_LEAF_DEPTH`]; every probe is rolled back, and the leaf's arguments are resolved
+    /// first, so it names the impl's variables as the goal bound them.
+    fn failed_leaf(&mut self, trait_: ItemKey, args: TyList) -> Result<Option<(ItemKey, TyList)>, Stop> {
+        let (mut trait_, mut args) = (trait_, args);
+        let mut leaf = None;
+        for _ in 0..MAX_LEAF_DEPTH {
+            if self.ty.list_len(args) == 0 {
+                break;
+            }
+            let self_ty = self.ty.list_get(args, 0);
+            let self_ty = self.ty.resolve(self_ty)?;
+            let Some(shape) = self.shape(self_ty) else { break };
+            let impls = self.reads.impls_of(trait_, shape)?;
+            let mut matched = 0u32;
+            let mut next = None;
+            for &imp in impls {
+                let s = self.snapshot();
+                let found = self.leaf_clause_of(imp, trait_, args)?;
+                self.rollback_to(s);
+                if let Some(found) = found {
+                    matched += 1;
+                    next = found;
+                }
+            }
+            match (matched, next) {
+                (1, Some(n)) => {
+                    leaf = Some(n);
+                    (trait_, args) = n;
+                }
+                _ => break,
+            }
+        }
+        Ok(leaf)
+    }
+
+    /// Whether impl `imp`'s header matches `args[0]: trait_<args[1..]>` (`None`: it does not);
+    /// then its first trait where-clause that may not hold, with resolved arguments.
+    fn leaf_clause_of(&mut self, imp: ItemKey, trait_: ItemKey, args: TyList) -> Result<Option<Option<(ItemKey, TyList)>>, Stop> {
+        let Some(h) = self.reads.impl_header(imp)? else { return Ok(None) };
+        if h.trait_ != Some(trait_) || h.polarity != crate::world::ImplPolarity::Positive || h.trait_args.list().len + 1 != self.ty.list_len(args) {
+                    return Ok(None);
+                }
+        let iargs = self.fresh_generic_args(imp, 0, h.generics)?;
+        let impl_self = self.lower(h.types, h.self_ty, Lower::Args(iargs), Cause::Body)?;
+        if !self.ty.unify(impl_self, self.ty.list_get(args, 0))? {
+            return Ok(None);
+        }
+        let rest = h.types.list(h.trait_args.list())?;
+        for (i, &p) in rest.iter().enumerate() {
+            let t = self.lower(h.types, p, Lower::Args(iargs), Cause::Body)?;
+            if !self.ty.unify(t, self.ty.list_get(args, i as u32 + 1))? {
+                return Ok(None);
+            }
+        }
+        let wc = self.reads.predicates(imp)?;
+        for c in wc.clauses {
+            let PClause::Trait { trait_: ct, args: ca } = *c else { continue };
+            let parts = wc.types.list(ca)?;
+            let mut tys: blaze_own::Vec<Ty, Alloc<'static>> = blaze_own::Vec::with_capacity_in(parts.len(), Alloc::global());
+            for &p in parts {
+                let t = self.lower(wc.types, p, Lower::Args(iargs), Cause::Body)?;
+                tys.push(self.ty.resolve(t)?);
+            }
+            let ca = self.ty.mk_list(&tys)?;
+            if !self.ty.may_hold(Goal::Trait { trait_: ct, args: ca }, &mut self.reads)? {
+                return Ok(Some(Some((ct, ca))));
+            }
+        }
+        Ok(Some(None))
     }
 
     /// `try_structurally_resolve_type`: resolved at the top, selecting pending obligations
@@ -669,10 +945,12 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         MachineSnapshot {
             ty: self.ty.snapshot(),
             diags: self.diags.len(),
+            dyn_seen: self.dyn_seen.len(),
             errors: self.errors,
             adjust: self.adjust.len(),
             adj_scratch: self.adj_scratch.len(),
             callees: self.callees.len(),
+            defs: self.defs.len(),
             fields: self.fields.len(),
             captures: self.captures.len(),
             casts: self.casts.len(),
@@ -686,10 +964,12 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     pub(crate) fn rollback_to(&mut self, s: MachineSnapshot<C::Snapshot>) {
         self.ty.rollback_to(s.ty);
         self.diags.truncate(s.diags);
+        self.dyn_seen.truncate(s.dyn_seen);
         self.errors = s.errors;
         self.adjust.truncate(s.adjust);
         self.adj_scratch.truncate(s.adj_scratch);
         self.callees.truncate(s.callees);
+        self.defs.truncate(s.defs);
         self.fields.truncate(s.fields);
         self.captures.truncate(s.captures);
         self.casts.truncate(s.casts);
@@ -727,7 +1007,15 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     /// Lowers `root` of a portable table, children first, with an explicit stack. An alias is
     /// normalized by a fresh variable and a projection obligation, as rustc normalizes a
     /// signature when it instantiates it.
-    pub(crate) fn lower(&mut self, types: PTys<'_>, root: PTy, mode: Lower) -> Result<Ty, Stop> {
+    /// `cause` is the place the type is instantiated for (the call whose callee's signature it
+    /// is, the path naming the item): a projection in it that fails is reported there.
+    pub(crate) fn lower(&mut self, types: PTys<'_>, root: PTy, mode: Lower, cause: Cause) -> Result<Ty, Stop> {
+        self.lower_at(types, root, mode, cause, None)
+    }
+
+    /// [`Machine::lower`]; with `dyn_at`, each trait object's principal in the type is checked
+    /// for dyn compatibility and reported there ([`Machine::check_dyn`]).
+    fn lower_at(&mut self, types: PTys<'_>, root: PTy, mode: Lower, cause: Cause, dyn_at: Option<At>) -> Result<Ty, Stop> {
         let n = root.0 as usize + 1;
         if n > types.nodes.len() {
             return Err(CheckError::Malformed(Malformed::TypeOrder { node: root.0, child: root.0 }).into());
@@ -764,8 +1052,21 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 }
                 continue;
             }
-            let ty = self.lower_node(node, types, &memo, mode)?;
+            let ty = self.lower_node(node, types, &memo, mode, cause)?;
             memo[at as usize] = Some(ty);
+        }
+        // The lowered nodes are exactly the type's subtree.
+        if let Some(at) = dyn_at {
+            for (i, m) in memo.iter().enumerate() {
+                if m.is_none() {
+                    continue;
+                }
+                if let PNode::Dynamic(l) = types.node(PTy(i as u32))?
+                    && let Some(principal) = crate::portable::object_principal(types, l)
+                {
+                    self.check_dyn(principal, at)?;
+                }
+            }
         }
         match memo[root.0 as usize] {
             Some(t) => Ok(t),
@@ -789,7 +1090,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         self.mk_list(&v)
     }
 
-    fn lower_node(&mut self, node: PNode, types: PTys<'_>, memo: &[Option<Ty>], mode: Lower) -> Result<Ty, Stop> {
+    fn lower_node(&mut self, node: PNode, types: PTys<'_>, memo: &[Option<Ty>], mode: Lower, cause: Cause) -> Result<Ty, Stop> {
         let view = match node {
             PNode::Bool => TyView::Bool,
             PNode::Char => TyView::Char,
@@ -801,12 +1102,22 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             PNode::Tuple(l) => TyView::Tuple(self.lowered_list(memo, types, l)?),
             PNode::Ref(m, t) => TyView::Ref(m, Self::lowered(memo, t)?),
             PNode::Ptr(m, t) => TyView::Ptr(m, Self::lowered(memo, t)?),
-            PNode::Array(t, n) => TyView::Array(Self::lowered(memo, t)?, n),
+            // A hole for a length (`[u8; _]`) is a const variable, not the type variable the
+            // shared `Infer` node lowered to.
+            PNode::Array(t, n) => {
+                let len = match (types.node(n)?, mode) {
+                    (PNode::Infer, Lower::Body) => self.ty.fresh(VarKind::Const)?,
+                    _ => Self::lowered(memo, n)?,
+                };
+                TyView::Array(Self::lowered(memo, t)?, len)
+            }
             PNode::Slice(t) => TyView::Slice(Self::lowered(memo, t)?),
+            PNode::Pat(t, l) => TyView::Pat(Self::lowered(memo, t)?, self.lowered_list(memo, types, l)?),
             PNode::Adt(k, l) => TyView::Adt(k, self.lowered_list(memo, types, l)?),
             PNode::FnDef(k, l) => TyView::FnDef(k, self.lowered_list(memo, types, l)?),
-            PNode::FnPtr(l) => TyView::FnPtr(self.lowered_list(memo, types, l)?),
+            PNode::FnPtr(l, h) => TyView::FnPtr(self.lowered_list(memo, types, l)?, h),
             PNode::Closure(e, sig) => TyView::Closure(e, Self::lowered(memo, sig)?),
+            PNode::Future(e, o, i) => TyView::Future(e, Self::lowered(memo, o)?, Self::lowered(memo, i)?),
             PNode::Param(i) => match mode {
                 Lower::Args(args) => {
                     let len = self.ty.list_len(args);
@@ -815,21 +1126,47 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                     }
                     return Ok(self.ty.list_get(args, i));
                 }
-                Lower::Body => TyView::Param(i),
+                Lower::Body | Lower::Assumed => TyView::Param(i),
             },
+            PNode::ConstParam(i) => match mode {
+                Lower::Args(args) => {
+                    let len = self.ty.list_len(args);
+                    if i >= len {
+                        return Err(CheckError::Malformed(Malformed::Param { index: i, args: len }).into());
+                    }
+                    return Ok(self.ty.list_get(args, i));
+                }
+                Lower::Body | Lower::Assumed => TyView::ConstParam(i),
+            },
+            PNode::ConstValue { ty, bits } => TyView::ConstValue { ty: Self::lowered(memo, ty)?, bits },
+            PNode::Alias { trait_, name, args } if matches!(mode, Lower::Assumed) => {
+                TyView::Alias { trait_, name, args: self.lowered_list(memo, types, args)? }
+            }
             PNode::Alias { trait_, name, args } => {
                 let args = self.lowered_list(memo, types, args)?;
                 let term = self.fresh()?;
                 self.ty.register(Obligation {
                     goal: Goal::Projection { trait_, args, name, term },
-                    cause: Cause::Body,
+                    cause,
                 })?;
                 return Ok(term);
             }
             PNode::Opaque(k, l) => TyView::Opaque(k, self.lowered_list(memo, types, l)?),
+            // The rows are in `PortableTys::dynamic`'s order, which lowering keeps.
+            PNode::Dynamic(l) => TyView::Dynamic(self.lowered_list(memo, types, l)?),
+            PNode::ExTrait(k, l) => TyView::ExTrait(k, self.lowered_list(memo, types, l)?),
+            PNode::ExProj { trait_, name, args, term } => {
+                let mut v: Vec<Ty, Alloc<'a>> = Vec::new_in(self.alloc);
+                for &a in types.list(args)? {
+                    v.push(Self::lowered(memo, a)?);
+                }
+                v.push(Self::lowered(memo, term)?);
+                TyView::ExProj { trait_, name, args_term: self.mk_list(&v)? }
+            }
+            PNode::ExAuto(k) => TyView::ExAuto(k),
             PNode::Infer => match mode {
                 Lower::Body => return self.fresh(),
-                Lower::Args(_) => return Err(CheckError::Malformed(Malformed::HoleInAnswer).into()),
+                Lower::Args(_) | Lower::Assumed => return Err(CheckError::Malformed(Malformed::HoleInAnswer).into()),
             },
             PNode::Error => TyView::Error,
         };
@@ -837,17 +1174,45 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     }
 
     /// A written type of the body.
-    pub(crate) fn lower_body_ty(&mut self, t: PTy) -> Result<Ty, Stop> {
+    /// A written type of the body, at `at`: a `dyn` in it is checked for dyn compatibility.
+    pub(crate) fn lower_body_ty(&mut self, t: PTy, at: At) -> Result<Ty, Stop> {
         let types = self.body.types;
-        self.lower(types, t, Lower::Body)
+        self.lower_at(types, t, Lower::Body, at.cause(), Some(at))
+    }
+
+    /// The owner's signature type `t` of `types`, checked for `dyn` as written in the body.
+    pub(crate) fn lower_sig_ty(&mut self, types: PTys<'_>, t: PTy) -> Result<Ty, Stop> {
+        self.lower_at(types, t, Lower::Body, Cause::Body, Some(At::Body))
+    }
+
+    /// `principal` in a `dyn` written at `at` (the Reference, "Traits", "Dyn compatibility"):
+    /// E0038 naming the trait, the member and the rule when it is not dyn compatible, once per
+    /// trait per body; a trait the world cannot decide is the typed gap `DynUndecided`.
+    pub(crate) fn check_dyn(&mut self, principal: ItemKey, at: At) -> Result<(), Stop> {
+        if self.dyn_seen.contains(&principal) {
+            return Ok(());
+        }
+        match crate::dyn_compat::verdict(&mut self.reads, principal)? {
+            crate::dyn_compat::Verdict::Compatible => {}
+            crate::dyn_compat::Verdict::Not { trait_, by, member, rule } => {
+                self.errors += 1;
+                let because = Some(crate::diag::Because::Dyn { trait_, by, member, rule });
+                self.diags.push(PendingDiag { code: DiagCode::DynIncompatible, at, expected: None, found: None, name: member, because, unmet: None });
+            }
+            crate::dyn_compat::Verdict::Gap { trait_, by, why } => {
+                return Err(CheckError::DynUndecided { trait_, by, why }.into());
+            }
+        }
+        self.dyn_seen.push(principal);
+        Ok(())
     }
 
     /// A list of a world's answer, lowered with `args`.
-    pub(crate) fn lower_list(&mut self, types: PTys<'_>, l: crate::ids::List, args: TyList) -> Result<TyList, Stop> {
+    pub(crate) fn lower_list(&mut self, types: PTys<'_>, l: crate::ids::List, args: TyList, cause: Cause) -> Result<TyList, Stop> {
         let src = types.list(l)?;
         let mut v: Vec<Ty, Alloc<'a>> = Vec::with_capacity_in(src.len(), self.alloc);
         for &t in src {
-            v.push(self.lower(types, t, Lower::Args(args))?);
+            v.push(self.lower(types, t, Lower::Args(args), cause)?);
         }
         self.mk_list(&v)
     }
@@ -859,14 +1224,17 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         for clause in preds.clauses {
             let goal = match *clause {
                 PClause::Trait { trait_, args: l } => {
-                    Goal::Trait { trait_, args: self.lower_list(preds.types, l, args)? }
+                    Goal::Trait { trait_, args: self.lower_list(preds.types, l, args, cause)? }
                 }
                 PClause::Projection { trait_, args: l, name, term } => Goal::Projection {
                     trait_,
-                    args: self.lower_list(preds.types, l, args)?,
+                    args: self.lower_list(preds.types, l, args, cause)?,
                     name,
-                    term: self.lower(preds.types, term, Lower::Args(args))?,
+                    term: self.lower(preds.types, term, Lower::Args(args), cause)?,
                 },
+                PClause::Const { cond, args: l } => {
+                    Goal::ConstHolds { cond, args: self.lower_list(preds.types, l, args, cause)? }
+                }
             };
             self.ty.register(Obligation { goal, cause })?;
         }
@@ -890,7 +1258,40 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
         self.reads.lang_item(item)
     }
 
+    /// The lang item `item` that the form at `at` needs; when the world cannot answer it, the
+    /// one finding "the lang item `item` is not known to this world" (`missing_lang`).
+    pub(crate) fn need_lang(&mut self, item: LangItem, at: At) -> Result<Option<ItemKey>, Stop> {
+        let got = self.lang(item)?;
+        if got.is_none() {
+            self.missing_lang(item, at);
+        }
+        Ok(got)
+    }
+
+    /// Records `DiagCode::MissingLangItem` naming `item` at `at`. The body is tainted.
+    pub(crate) fn missing_lang(&mut self, item: LangItem, at: At) {
+        self.errors += 1;
+        let because = Some(crate::diag::Because::NoLangItem(item));
+        self.diags.push(PendingDiag { code: DiagCode::MissingLangItem, at, expected: None, found: None, name: None, because, unmet: None });
+    }
+
     /// The impl-lookup shape of `t`, or `None` for a variable or the error type.
+    /// A trait object's principal trait and its arguments after `Self`, from its rows `l`.
+    pub(crate) fn principal_args(&mut self, l: TyList) -> Option<(ItemKey, TyList)> {
+        if self.ty.list_len(l) == 0 {
+            return None;
+        }
+        let first = self.ty.list_get(l, 0);
+        match self.view(first) {
+            TyView::ExTrait(k, args) => Some((k, args)),
+            _ => None,
+        }
+    }
+
+    fn principal(&mut self, l: TyList) -> Option<ItemKey> {
+        self.principal_args(l).map(|(k, _)| k)
+    }
+
     pub(crate) fn shape(&mut self, t: Ty) -> Option<Shape> {
         Some(match self.view(t) {
             TyView::Bool => Shape::Bool,
@@ -905,13 +1306,20 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             TyView::Ptr(m, _) => Shape::Ptr(m),
             TyView::Array(..) => Shape::Array,
             TyView::Slice(_) => Shape::Slice,
+            TyView::Pat(..) => Shape::Pat,
             TyView::Adt(k, _) => Shape::Adt(k),
             TyView::FnDef(k, _) => Shape::FnDef(k),
-            TyView::FnPtr(l) => Shape::FnPtr(self.ty.list_len(l).saturating_sub(1)),
-            TyView::Closure(..) => Shape::Closure,
+            TyView::FnPtr(l, _) => Shape::FnPtr(self.ty.list_len(l).saturating_sub(1)),
+            // A future buckets with closures: neither can be named in an impl header, so only
+            // blanket impls apply to either.
+            TyView::Closure(..) | TyView::Future(..) => Shape::Closure,
             TyView::Param(_) => Shape::Param,
             TyView::Opaque(k, _) => Shape::Opaque(k),
+            TyView::Dynamic(l) => Shape::Dynamic(self.principal(l)),
             TyView::Alias { .. } | TyView::Infer(_) | TyView::Error => return None,
+            // A const term or an object's row is no self type.
+            TyView::ConstValue { .. } | TyView::ConstParam(_) | TyView::ConstInfer(_) => return None,
+            TyView::ExTrait(..) | TyView::ExProj { .. } | TyView::ExAuto(_) => return None,
         })
     }
 
@@ -919,6 +1327,16 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     /// overloaded deref, until a type that does not deref, a variable, or the recursion limit
     /// (the second value: E0055 when true).
     pub(crate) fn autoderef(&mut self, base: Ty, raw_ptrs: bool) -> Result<(Vec<Step, Alloc<'a>>, bool), Stop> {
+        #[cfg_attr(not(test), expect(unused_mut, reason = "only the planted bug changes the steps"))]
+        let mut out = self.autoderef_all(base, raw_ptrs)?;
+        #[cfg(test)]
+        if self.plant == Plant::AutoderefShort && out.0.len() > 1 {
+            out.0.pop();
+        }
+        Ok(out)
+    }
+
+    fn autoderef_all(&mut self, base: Ty, raw_ptrs: bool) -> Result<(Vec<Step, Alloc<'a>>, bool), Stop> {
         let mut steps: Vec<Step, Alloc<'a>> = Vec::new_in(self.alloc);
         let mut cur = self.try_structurally_resolve(base)?;
         steps.push(Step { ty: cur, overloaded: false });
@@ -971,18 +1389,32 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
 }
 
 /// The children of a node, in order.
-fn children(node: PNode, types: PTys<'_>, out: &mut Vec<PTy, Alloc<'_>>) -> Result<(), CheckError> {
+pub(crate) fn children(node: PNode, types: PTys<'_>, out: &mut Vec<PTy, Alloc<'_>>) -> Result<(), CheckError> {
     match node {
         PNode::Tuple(l)
         | PNode::Adt(_, l)
         | PNode::FnDef(_, l)
-        | PNode::FnPtr(l)
+        | PNode::FnPtr(l, _)
         | PNode::Opaque(_, l)
         | PNode::Alias { args: l, .. } => out.extend_from_slice(types.list(l)?),
-        PNode::Ref(_, t) | PNode::Ptr(_, t) | PNode::Array(t, _) | PNode::Slice(t) | PNode::Closure(_, t) => {
+        PNode::Ref(_, t) | PNode::Ptr(_, t) | PNode::Slice(t) | PNode::Closure(_, t) | PNode::ConstValue { ty: t, .. } => {
             out.push(t);
         }
-        PNode::Bool
+        PNode::Future(_, o, i) | PNode::Array(o, i) => {
+            out.push(o);
+            out.push(i);
+        }
+        PNode::Pat(b, l) => {
+            out.push(b);
+            out.extend_from_slice(types.list(l)?);
+        }
+        PNode::Dynamic(l) | PNode::ExTrait(_, l) => out.extend_from_slice(types.list(l)?),
+        PNode::ExProj { args, term, .. } => {
+            out.extend_from_slice(types.list(args)?);
+            out.push(term);
+        }
+        PNode::ExAuto(_)
+        | PNode::Bool
         | PNode::Char
         | PNode::Int(_)
         | PNode::Uint(_)
@@ -990,6 +1422,7 @@ fn children(node: PNode, types: PTys<'_>, out: &mut Vec<PTy, Alloc<'_>>) -> Resu
         | PNode::Str
         | PNode::Never
         | PNode::Param(_)
+        | PNode::ConstParam(_)
         | PNode::Infer
         | PNode::Error => {}
     }

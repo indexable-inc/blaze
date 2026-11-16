@@ -67,6 +67,32 @@ pub(crate) fn random(len: usize) -> Done {
     Done::Random(bytes)
 }
 
+/// [`Effect::Roots`](crate::Effect::Roots): the machine's trust anchors, read now; asked once,
+/// on a process's first connection. Where [`crate::trust`] reads no store, refused by name.
+pub(crate) fn roots(cert_file: Option<String>, cert_dir: Option<String>) -> Done {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        let places = crate::trust::Places {
+            cert_file: cert_file.as_deref().map(std::ffi::OsStr::new),
+            cert_dir: cert_dir.as_deref().map(std::ffi::OsStr::new),
+        };
+        match crate::trust::system(places, std::alloc::Global) {
+            // alloc: once per process, its roots.
+            Ok(roots) => Done::Roots(Box::new(roots)),
+            // alloc: an error path.
+            Err(error) => Done::Untrusted(Box::new(error)),
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (cert_file, cert_dir);
+        // alloc: an error path.
+        Done::Failed(IoError(String::from(
+            "Effect::Roots is refused on this target: crate::trust reads the stores of macOS and Linux only",
+        )))
+    }
+}
+
 /// `effect`, a socket's or a standard stream's, refused where the driver has none: the IOCP
 /// driver's and WASI's. Its buffer comes back as [`Effect::Send`]'s and [`Effect::Recv`]'s do.
 ///
@@ -280,6 +306,7 @@ mod unix {
                     | Effect::WriteOut { .. }
                     | Effect::Now { .. }
                     | Effect::Random { .. }
+                    | Effect::Roots { .. }
             )
         }
 
@@ -306,6 +333,20 @@ mod unix {
             match effect {
                 Effect::Now { tag } => self.tell(tag, super::wall()),
                 Effect::Random { len, tag } => self.tell(tag, super::random(len)),
+                // On a thread of its own, as a resolve: macOS's keychain calls go through
+                // securityd, and the driver's thread never waits on another process.
+                Effect::Roots { cert_file, cert_dir, tag } => {
+                    let started = self.shared().and_then(|shared| {
+                        spawn("blaze-host-roots", move || {
+                            let done = super::roots(cert_file, cert_dir);
+                            shared.sink.tell(Completion { tag, done });
+                        })
+                    });
+                    if let Err(error) = started {
+                        // alloc: an error path.
+                        self.tell(tag, Done::Failed(IoError(format!("Effect::Roots: starting its thread: {error}"))));
+                    }
+                }
                 Effect::Bind { at, options, tag } => {
                     let sock = Dgram(self.next);
                     let done = match bind(sock, at, options) {

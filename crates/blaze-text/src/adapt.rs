@@ -59,6 +59,15 @@ impl<T: Show> fmt::Display for Shown<T> {
     }
 }
 
+/// What it wraps, so a value handed out as `Shown` for `{}` users is still a [`Show`] to a
+/// chain.
+impl<T: Show> Show for Shown<T> {
+    #[inline]
+    fn show<P: Put + ?Sized>(&self, out: &mut P) {
+        self.0.show(out);
+    }
+}
+
 impl<T: Show> fmt::Debug for Shown<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         fmt::Display::fmt(self, f)
@@ -95,6 +104,26 @@ pub trait PutDisplay: Put {
 }
 
 impl<P: Put + ?Sized> PutDisplay for P {}
+
+/// `format_args!(..)` as a [`Show`]: what keeps a `format_args!` caller of a writer that takes
+/// a `Show` (bstd's `Out::line`) compiling until it is a chain. Through `core::fmt`, so it
+/// costs what `{}` costs; text with no arguments goes straight to the sink.
+///
+/// # Panics
+///
+/// When a `Display` inside returns an error on its own (the sink here cannot fail): the
+/// contract `alloc::string::ToString` also holds a `Display` to.
+impl Show for fmt::Arguments<'_> {
+    fn show<P: Put + ?Sized>(&self, out: &mut P) {
+        if let Some(text) = self.as_str() {
+            out.put_str(text);
+            return;
+        }
+        if fmt::write(&mut FromFormat(out), *self).is_err() {
+            panic!("blaze_text: a `Display` inside `format_args!` returned an error on its own");
+        }
+    }
+}
 
 impl fmt::Display for ParseError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

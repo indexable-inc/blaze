@@ -259,3 +259,7 @@ With live patching for redefinition, the tool and the code base are one language
 - **Handles need no mark at the use**; the off switch is an effect.
 - **Capabilities are plain parameters.** `with` is deferred.
 - **The syntax is otherwise Rust's.**
+- **bstd's extern name is `std`** (2026-11-16, [std](std.md#the-blaze-edition-opting-in),
+  [toolchain](toolchain.md)): blaze gives the crate bstd under that one name with no manifest
+  line; `bstd::..` is a finding whose fix rewrites it to `std::..`.
+- **No opt-in to Rust's `std`**: under the edition Rust's `std` has no name in the crate.

@@ -35,9 +35,15 @@ pub fn find_calls<'a>(
 
 /// `path ! group` at `at`: the call and the index after its group.
 fn call_at(stream: &TokenStream<'_>, at: usize) -> Option<(NestedCall, usize)> {
-    let end = path_at(stream, at)?;
+    // The shape first, by kinds alone, then the names: most identifiers are no call's.
+    let shape = path_shape_at(stream, at)?;
     let tokens = stream.tokens();
-    if !is_punct(stream, end, '!') || !matches!(tokens.get(end + 1)?.kind, TokenKind::Open(_)) {
+    if !is_punct(stream, shape, '!') || !matches!(tokens.get(shape + 1)?.kind, TokenKind::Open(_)) {
+        return None;
+    }
+    // `path_at` ends at the shape's end, or earlier, before a `::`, so at no call.
+    let end = path_at(stream, at)?;
+    if end != shape {
         return None;
     }
     let close = stream.close_of(end + 1)?;
@@ -58,7 +64,7 @@ fn definition_at(stream: &TokenStream<'_>, at: usize) -> Option<(NestedCall, usi
     let keyword = plain_ident(stream, at)?;
     let path = Range { start: index(at), end: index(at + 1) };
     match keyword {
-        "macro_rules" => {
+        b"macro_rules" => {
             if !is_punct(stream, at + 1, '!') || plain_or_raw_ident(stream, at + 2).is_none() {
                 return None;
             }
@@ -77,7 +83,7 @@ fn definition_at(stream: &TokenStream<'_>, at: usize) -> Option<(NestedCall, usi
             };
             Some((call, close + 1))
         }
-        "macro" => {
+        b"macro" => {
             plain_or_raw_ident(stream, at + 1)?;
             let mut open = at + 2;
             let mut params = None;
@@ -121,6 +127,25 @@ fn path_at(stream: &TokenStream<'_>, at: usize) -> Option<usize> {
     last_is_name.then_some(next)
 }
 
+/// The end of `::`? ident (`::` ident)* at `at`, by the tokens' kinds alone: where
+/// [`path_at`] can end at the furthest.
+fn path_shape_at(stream: &TokenStream<'_>, at: usize) -> Option<usize> {
+    let tokens = stream.tokens();
+    let ident = |at: usize| matches!(tokens.get(at).map(|it| it.kind), Some(TokenKind::Ident { .. }));
+    let mut next = at;
+    if is_path_sep(stream, next) {
+        next += 2;
+    }
+    if !ident(next) {
+        return None;
+    }
+    next += 1;
+    while is_path_sep(stream, next) && ident(next + 2) {
+        next += 3;
+    }
+    Some(next)
+}
+
 /// Whether the token at `at` can be a path segment, and if so whether it can be a macro's
 /// name (not a path keyword).
 fn segment(stream: &TokenStream<'_>, at: usize) -> Option<bool> {
@@ -148,9 +173,9 @@ fn is_punct(stream: &TokenStream<'_>, at: usize, want: char) -> bool {
 }
 
 /// The text of a plain (not raw) identifier at `at`.
-fn plain_ident<'s>(stream: &'s TokenStream<'_>, at: usize) -> Option<&'s str> {
+fn plain_ident<'s>(stream: &'s TokenStream<'_>, at: usize) -> Option<&'s [u8]> {
     let token = stream.tokens().get(at)?;
-    matches!(token.kind, TokenKind::Ident { raw: Raw::No, .. }).then(|| stream.text_of(token))
+    matches!(token.kind, TokenKind::Ident { raw: Raw::No, .. }).then(|| stream.bytes_at(at))
 }
 
 fn plain_or_raw_ident(stream: &TokenStream<'_>, at: usize) -> Option<()> {

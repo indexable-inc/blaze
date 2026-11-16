@@ -10,3 +10,6 @@ __pycache__/
 # directories included.
 !/library/**
 /library/target/
+
+# a checkout's own blaze home: build output, never source
+.blaze/

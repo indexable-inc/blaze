@@ -1,0 +1,921 @@
+//! The evaluator's suite: each case is Rust text lowered, checked and evaluated through the
+//! driver's own pipeline (`fixture`), and states the rule of the Reference it holds the
+//! evaluator to. Refused cases name their refusal. Then the property (the evaluator equals
+//! direct computation) and three planted-bug controls (rule 23).
+
+use std::string::String;
+use std::vec::Vec as StdVec;
+
+use blaze_own::Alloc;
+use blaze_sim::{Broke, Config, Tape, control};
+use blaze_typeck::{ItemKey, PNode, PortableTys};
+
+use crate::fixture::{World, int_of};
+use crate::machine::{Answer, Codes, Plant, discriminant_with_plant, int_binop, mask, sext, value_of_planted};
+use crate::record::DataTarget;
+use crate::{ConstError, Intrinsic, Layouts, Limits, Op, PanicPart, Refusal, eval_discriminant};
+
+/// A world with the intrinsics and the panic entry core's code reaches.
+fn world() -> World {
+    let mut w = World::new();
+    let fx = &mut w.fx;
+    let p0 = fx.param(0);
+    let p1 = fx.param(1);
+    let usize_ = fx.usize();
+    let b = fx.ty(PNode::Bool);
+    let pair = fx.tuple(&[p0, b]);
+    w.intrinsic("size_of", 1, &[], usize_, Intrinsic::SizeOf);
+    w.intrinsic("align_of", 1, &[], usize_, Intrinsic::AlignOf);
+    w.intrinsic("transmute", 2, &[p0], p1, Intrinsic::Transmute);
+    w.intrinsic("wrapping_add", 1, &[p0, p0], p0, Intrinsic::WrappingAdd);
+    w.intrinsic("wrapping_sub", 1, &[p0, p0], p0, Intrinsic::WrappingSub);
+    w.intrinsic("wrapping_mul", 1, &[p0, p0], p0, Intrinsic::WrappingMul);
+    w.intrinsic("add_with_overflow", 1, &[p0, p0], pair, Intrinsic::AddWithOverflow);
+    w.intrinsic("rotate_left", 1, &[p0, p0], p0, Intrinsic::RotateLeft);
+    w.intrinsic("ctpop", 1, &[p0], p0, Intrinsic::Ctpop);
+    w.intrinsic("bswap", 1, &[p0], p0, Intrinsic::Bswap);
+    w.intrinsic("saturating_sub", 1, &[p0, p0], p0, Intrinsic::SaturatingSub);
+    w.panic_fn("panic_display", "&str");
+    w
+}
+
+/// `const C: TY = BODY;` alone in the prelude world: its value as an integer, or the refusal.
+fn int(ty: &str, body: &str) -> Result<u128, String> {
+    let mut w = world();
+    w.konst("C", ty, body);
+    w.build();
+    eval_int(&mut w, "C")
+}
+
+fn eval_int(w: &mut World, name: &str) -> Result<u128, String> {
+    w.eval(name).map(int_of).map_err(|e| std::format!("{:?}", e.refusal))
+}
+
+fn refusal(w: &mut World, name: &str) -> String {
+    match w.eval(name) {
+        Ok(r) => panic!("`{name}` evaluated to {:?}, a refusal was expected", r),
+        Err(e) => std::format!("{:?}", e.refusal),
+    }
+}
+
+fn refused(ty: &str, body: &str) -> String {
+    match int(ty, body) {
+        Ok(v) => panic!("`{body}` evaluated to {v:#x}, a refusal was expected"),
+        Err(e) => e,
+    }
+}
+
+const INTS: [(&str, u32, bool); 12] = [
+    ("i8", 8, true),
+    ("i16", 16, true),
+    ("i32", 32, true),
+    ("i64", 64, true),
+    ("i128", 128, true),
+    ("isize", 64, true),
+    ("u8", 8, false),
+    ("u16", 16, false),
+    ("u32", 32, false),
+    ("u64", 64, false),
+    ("u128", 128, false),
+    ("usize", 64, false),
+];
+
+fn max_text(bits: u32, signed: bool) -> String {
+    if signed { std::format!("{}", (1u128 << (bits - 1)) - 1) } else { std::format!("{}", mask(u128::MAX, bits)) }
+}
+
+/// The Reference, "Arithmetic and Logical Binary Operators" and "Overflow": integer
+/// arithmetic at every width gives the mathematical result when it fits, and in a constant
+/// context overflow is an error (rustc's `arithmetic_overflow`, deny-by-default, is a hard
+/// error in const evaluation).
+#[test]
+fn arithmetic_at_every_width() {
+    for (ty, bits, signed) in INTS {
+        let max = max_text(bits, signed);
+        assert_eq!(int(ty, &std::format!("{max} - 1 + 1")), Ok(mask(u128::MAX, if signed { bits - 1 } else { bits })), "{ty}: MAX - 1 + 1");
+        assert_eq!(int(ty, "7 * 6 - 2 / 2 % 5"), Ok(41), "{ty}: precedence");
+        assert_eq!(refused(ty, &std::format!("{max} + 1")), std::format!("{:?}", Refusal::Overflow { op: Op::Add }), "{ty}: MAX + 1");
+        assert_eq!(refused(ty, &std::format!("{max} * 2")), std::format!("{:?}", Refusal::Overflow { op: Op::Mul }), "{ty}: MAX * 2");
+        if signed {
+            let min = std::format!("(-{max} - 1)");
+            let want = if bits == 128 { i128::MIN } else { -(1i128 << (bits - 1)) };
+            assert_eq!(int(ty, &min).map(|v| sext(v, bits)), Ok(want), "{ty}: MIN");
+            assert_eq!(refused(ty, &std::format!("{min} - 1")), std::format!("{:?}", Refusal::Overflow { op: Op::Sub }), "{ty}: MIN - 1");
+            assert_eq!(refused(ty, &std::format!("{min} / -1")), std::format!("{:?}", Refusal::Overflow { op: Op::Div }), "{ty}: MIN / -1");
+            assert_eq!(refused(ty, &std::format!("{min} % -1")), std::format!("{:?}", Refusal::Overflow { op: Op::Rem }), "{ty}: MIN % -1");
+            assert_eq!(int(ty, "-7 / 2").map(|v| sext(v, bits)), Ok(-3), "{ty}: division truncates toward zero");
+            assert_eq!(int(ty, "-7 % 2").map(|v| sext(v, bits)), Ok(-1), "{ty}: the remainder has the dividend's sign");
+        } else {
+            assert_eq!(refused(ty, "0 - 1"), std::format!("{:?}", Refusal::Overflow { op: Op::Sub }), "{ty}: 0 - 1");
+        }
+    }
+}
+
+/// The Reference, "Literal expressions": `-128i8` is the negation of a literal that does not
+/// fit `i8` by itself, accepted (the `overflowing_literals` lint looks through the minus);
+/// negating the minimum held in a constant overflows (`Overflow { op: Neg }`).
+#[test]
+fn negation() {
+    assert_eq!(int("i8", "-128").map(|v| sext(v, 8)), Ok(-128));
+    let mut w = world();
+    w.konst("M", "i8", "-128");
+    w.konst("C", "i8", "-M");
+    w.build();
+    assert_eq!(refusal(&mut w, "C"), std::format!("{:?}", Refusal::Overflow { op: Op::Neg }));
+}
+
+/// core's `wrapping_*`, `*_with_overflow`, `rotate_left`, `ctpop`, `bswap` and
+/// `saturating_sub` intrinsics: the wrapping operations are defined modulo 2^N, never an error.
+#[test]
+fn wrapping_and_bit_operations() {
+    assert_eq!(int("u8", "wrapping_add(250u8, 10u8)"), Ok(4));
+    assert_eq!(int("i8", "wrapping_sub(-128i8, 1i8)").map(|v| sext(v, 8)), Ok(127));
+    assert_eq!(int("u16", "wrapping_mul(300u16, 300u16)"), Ok((300u32 * 300 % 65536) as u128));
+    assert_eq!(int("u32", "rotate_left(0x8000_0001u32, 4u32)"), Ok(0x18));
+    assert_eq!(int("u64", "ctpop(0xF0F0u64)"), Ok(8));
+    assert_eq!(int("u32", "bswap(0x1122_3344u32)"), Ok(0x4433_2211));
+    assert_eq!(int("u8", "saturating_sub(3u8, 10u8)"), Ok(0));
+    assert_eq!(int("bool", "add_with_overflow(255u8, 1u8).1"), Ok(1));
+    assert_eq!(int("u8", "add_with_overflow(255u8, 2u8).0"), Ok(1));
+    assert_eq!(int("u32", "0xF0u32 & 0x3C | 0x01 ^ 0x03"), Ok(0x32));
+}
+
+/// The Reference, "Arithmetic and Logical Binary Operators": a shift by the width or more,
+/// or by a negative amount, overflows; division and remainder by zero are errors.
+#[test]
+fn shifts_and_division_by_zero() {
+    assert_eq!(int("u32", "1u32 << 31"), Ok(1 << 31));
+    assert_eq!(refused("u32", "1u32 << 32"), std::format!("{:?}", Refusal::ShiftTooFar { amount: 32, bits: 32 }));
+    assert_eq!(refused("i64", "1i64 >> -1i32"), std::format!("{:?}", Refusal::ShiftTooFar { amount: -1, bits: 64 }));
+    assert_eq!(int("i16", "-16i16 >> 2").map(|v| sext(v, 16)), Ok(-4), "`>>` of a signed integer is arithmetic");
+    assert_eq!(refused("u8", "1u8 / 0"), std::format!("{:?}", Refusal::DivByZero));
+    assert_eq!(refused("i32", "5i32 % 0"), std::format!("{:?}", Refusal::RemByZero));
+}
+
+/// The Reference, "Type cast expressions": integer to integer truncates or extends by the
+/// source's sign; float to integer rounds toward zero and saturates, NaN to 0; integer to
+/// float rounds to nearest; `u8` to `char`; `char` and `bool` to integers.
+#[test]
+fn casts() {
+    assert_eq!(int("u8", "-1i8 as u8"), Ok(255));
+    assert_eq!(int("u8", "300i32 as u8"), Ok(44));
+    assert_eq!(int("i64", "-1i32 as i64").map(|v| sext(v, 64)), Ok(-1));
+    assert_eq!(int("u64", "-1i32 as u32 as u64"), Ok(0xFFFF_FFFF));
+    assert_eq!(int("u8", "3.9f64 as u8"), Ok(3));
+    assert_eq!(int("u8", "-1.0f64 as u8"), Ok(0));
+    assert_eq!(int("i32", "1e10f64 as i32"), Ok(i32::MAX as u128));
+    assert_eq!(int("i32", "(0.0f64 / 0.0) as i32"), Ok(0));
+    assert_eq!(int("char", "97u8 as char"), Ok(97));
+    assert_eq!(int("u32", "'\\u{1F600}' as u32"), Ok(0x1F600));
+    assert_eq!(int("u8", "true as u8"), Ok(1));
+    assert_eq!(int("f32", "255u8 as f32"), Ok(u128::from(255f32.to_bits())));
+    assert_eq!(int("f64", "-1i32 as f64"), Ok(u128::from((-1f64).to_bits())));
+    assert_eq!(int("f32", "0.1f64 as f32"), Ok(u128::from(0.1f32.to_bits())));
+    assert_eq!(int("f64", "0.5 + 0.25 * 2.0"), Ok(u128::from(1.0f64.to_bits())));
+}
+
+/// The Reference, "Struct expressions", "Tuple expressions", "Array expressions", "Field
+/// access", "Array and slice indexing" and "Match expressions": aggregates are built and read
+/// by field, index and pattern; an index past the length is an error.
+#[test]
+fn aggregates_built_and_read() {
+    let mut w = world();
+    w.strukt("P", &[("x", "i32"), ("y", "i32")]);
+    w.enum_("Shape", None, &[("Circle", &["u32"], None), ("Rect", &["u32", "u32"], None), ("Empty", &[], None)]);
+    w.konst("S", "i32", "{ let p = P { x: 3, y: 4 }; p.x * 10 + p.y }");
+    w.konst("T", "u16", "(1u8, 300u16).1");
+    w.konst("A", "u8", "[1u8, 2, 3][2]");
+    w.konst("R", "u32", "[7u32; 5][4]");
+    w.konst(
+        "M",
+        "u32",
+        "match Shape::Rect(2, 3) { Shape::Circle(r) => r, Shape::Rect(a, b) => a * b, Shape::Empty => 0 }",
+    );
+    w.konst("E", "u32", "match Shape::Empty { Shape::Circle(r) => r, Shape::Rect(_, _) => 1, _ => 9 }");
+    w.konst("G", "u32", "match (3u32, 4u32) { (a, b) if a > b => a, (_, b) => b }");
+    w.konst("F", "u8", "{ let mut p = P { x: 1, y: 2 }; p.y = 40; let q = P { x: 2, ..p }; q.y as u8 + q.x as u8 }");
+    w.konst("O", "u8", "{ let a = [1u8, 2]; let i = 2usize; a[i] }");
+    w.konst("PS", "P", "P { x: -1, y: 2 }");
+    w.build();
+    assert_eq!(eval_int(&mut w, "S"), Ok(34));
+    assert_eq!(eval_int(&mut w, "T"), Ok(300));
+    assert_eq!(eval_int(&mut w, "A"), Ok(3));
+    assert_eq!(eval_int(&mut w, "R"), Ok(7));
+    assert_eq!(eval_int(&mut w, "M"), Ok(6));
+    assert_eq!(eval_int(&mut w, "E"), Ok(9));
+    assert_eq!(eval_int(&mut w, "G"), Ok(4));
+    assert_eq!(eval_int(&mut w, "F"), Ok(42));
+    assert_eq!(refusal(&mut w, "O"), std::format!("{:?}", Refusal::IndexOutOfBounds { index: 2, len: 2 }));
+    let ps = w.eval("PS").expect("PS");
+    assert_eq!(ps.data.allocs[0].bytes.as_slice(), &[0xFF, 0xFF, 0xFF, 0xFF, 2, 0, 0, 0], "a struct's record is its bytes in layout order");
+}
+
+/// The Reference, "Constant items": a constant's value is copied where it is used; a
+/// reference to a constant's value points into its record ("constant promotion"), and a read
+/// through it gives the value.
+#[test]
+fn references_into_constants() {
+    let mut w = world();
+    w.konst("A", "[u8; 3]", "[5, 6, 7]");
+    w.konst("R", "&[u8; 3]", "&A");
+    w.konst("C", "u8", "R[1]");
+    w.konst("S", "&u8", "&A[2]");
+    w.build();
+    assert_eq!(eval_int(&mut w, "C"), Ok(6));
+    let r = w.eval("R").expect("R");
+    assert_eq!(r.data.allocs.len(), 2, "the reference's target travels with it");
+    assert_eq!(r.data.allocs[0].relocs[0].target, DataTarget::Local(1));
+    assert_eq!(r.data.allocs[1].bytes.as_slice(), &[5, 6, 7]);
+    let s = w.eval("S").expect("S");
+    assert_eq!(s.data.allocs[0].bytes.as_slice(), &[2, 0, 0, 0, 0, 0, 0, 0], "the addend is the offset into the target");
+}
+
+/// The Reference, "Literal expressions", "C string literal expressions": a C string literal is
+/// a `&'static CStr` over its bytes "followed by a nul byte"; "Tokens", "C string and raw C
+/// string literals": `\xNN` is that byte (past ASCII too, unlike a `str`), a raw one keeps its
+/// `\`, and "it is an error for a C string literal to contain a NUL", which is refused naming
+/// the NUL's offset in the literal at the literal's range. Before the fix `lit::bytes` refused
+/// every C string (`LitError::CStr`).
+#[test]
+fn c_string_literals_end_in_one_nul() {
+    let mut w = world();
+    let cstr = w.strukt("CStr", &[("inner", "[i8]")]);
+    w.fx.lang(blaze_typeck::LangItem::CStr, cstr);
+    w.konst("C", "&CStr", "c\"hi\"");
+    w.konst("X", "&CStr", "c\"\\xff\"");
+    w.konst("R", "&CStr", "cr#\"a\\b\"#");
+    w.konst("N", "&CStr", "c\"a\\0b\"");
+    w.build();
+    for (name, want) in [("C", &b"hi\0"[..]), ("X", &b"\xff\0"[..]), ("R", &b"a\\b\0"[..])] {
+        let r = w.eval(name).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        assert_eq!(r.data.allocs.len(), 2, "{name}: the pointer and its bytes");
+        assert_eq!(r.data.allocs[1].bytes.as_slice(), want, "{name}");
+        let len = u64::from_le_bytes(r.data.allocs[0].bytes[8..16].try_into().expect("a wide pointer"));
+        assert_eq!(len, want.len() as u64, "{name}: the metadata counts the NUL");
+    }
+    let e = w.eval("N").expect_err("an interior NUL");
+    assert_eq!(e.refusal, Refusal::Literal(crate::LitError::InteriorNul { at: 3 }));
+    let at = e.at.expect("the literal's range");
+    assert_eq!(at.range.end - at.range.start, "c\"a\\0b\"".len() as u32, "{at:?}");
+}
+
+/// The Reference, "Constant evaluation": calls to `const fn`s are evaluated, recursion
+/// included, within the evaluator's bounds; past the call-depth bound the constant is refused
+/// naming the bound, never a stack overflow of blaze.
+#[test]
+fn const_fn_recursion_up_to_the_bound() {
+    let mut w = world();
+    w.const_fn("fact", &[("n", "u64")], "u64", "{ if n == 0 { 1 } else { n * fact(n - 1) } }");
+    w.const_fn("down", &[("n", "u32")], "u32", "{ if n == 0 { 0 } else { down(n - 1) } }");
+    w.const_fn("spin", &[], "u32", "{ loop {} }");
+    w.const_fn("fib", &[("n", "u32")], "u64", "{ let mut a = 0u64; let mut b = 1u64; let mut i = 0; while i < n { let t = a + b; a = b; b = t; i += 1; } return a; }");
+    w.konst("F20", "u64", "fact(20)");
+    w.konst("F21", "u64", "fact(21)");
+    w.konst("D500", "u32", "down(500)");
+    w.konst("D600", "u32", "down(600)");
+    w.konst("SPIN", "u32", "spin()");
+    w.konst("FIB", "u64", "fib(90)");
+    w.limits.steps = 200_000;
+    w.build();
+    assert_eq!(eval_int(&mut w, "F20"), Ok(2_432_902_008_176_640_000));
+    assert_eq!(eval_int(&mut w, "F21"), Err(std::format!("{:?}", Refusal::Overflow { op: Op::Mul })), "21! overflows u64");
+    assert_eq!(eval_int(&mut w, "D500"), Ok(0));
+    assert_eq!(eval_int(&mut w, "D600"), Err(std::format!("{:?}", Refusal::CallDepth { limit: 512 })));
+    assert_eq!(eval_int(&mut w, "SPIN"), Err(std::format!("{:?}", Refusal::StepLimit { limit: 200_000 })));
+    assert_eq!(eval_int(&mut w, "FIB"), Ok(2_880_067_194_370_816_120));
+    let e = w.eval("SPIN").expect_err("spin");
+    assert_eq!(e.constant, w.key("SPIN"), "the refusal names the constant");
+}
+
+/// Pointers in constants (the Reference, "Constant evaluation": comparison operators only on
+/// integers, floats, `bool` and `char`; `ptr_guaranteed_cmp`'s contract: 1 guaranteed equal,
+/// 0 guaranteed unequal, 2 unknown, never wrong). `==` is refused by name; the intrinsic
+/// answers exactly when every run of the program agrees, and core's `is_null` (written as core
+/// writes it) is false for a pointer made from a reference.
+#[test]
+fn pointers_compare_only_when_certain() {
+    let mut w = world();
+    let p = w.fx.ty(PNode::Param(0));
+    let ptr = w.fx.ty(PNode::Ptr(blaze_typeck::Mutbl::Not, p));
+    let u8_ = w.ty("u8");
+    w.intrinsic("ptr_guaranteed_cmp", 1, &[ptr, ptr], u8_, Intrinsic::PtrGuaranteedCmp);
+    w.panic_fn("panic_null_unknown", "&str");
+    w.const_fn(
+        "is_null",
+        &[("p", "*const u32")],
+        "bool",
+        "{ match ptr_guaranteed_cmp(p, 0 as *const u32) { 0 => false, 1 => true, _ => panic_null_unknown(\"nullness not known\") } }",
+    );
+    w.konst("K", "[u32; 2]", "[1, 2]");
+    w.stat("S", "[u32; 2]", "[3, 4]");
+    w.stat("T", "u32", "5");
+    let cases: [(&str, &str, u128); 9] = [
+        ("SAME", "ptr_guaranteed_cmp(&S[0] as *const u32, &S[0] as *const u32)", 1),
+        ("WITHIN", "ptr_guaranteed_cmp(&S[0] as *const u32, &S[1] as *const u32)", 0),
+        ("STATICS", "ptr_guaranteed_cmp(&S[1] as *const u32, &T as *const u32)", 0),
+        ("ONE_CONST", "{ let r = &K; ptr_guaranteed_cmp(&r[0] as *const u32, &r[1] as *const u32) }", 0),
+        // Two reads of a constant are two temporaries, which the program may merge.
+        ("TWO_TEMPS", "ptr_guaranteed_cmp(&K[0] as *const u32, &K[0] as *const u32)", 2),
+        ("LOCALS", "{ let a = 1u32; let b = 2u32; ptr_guaranteed_cmp(&a as *const u32, &b as *const u32) }", 0),
+        ("NOT_NULL", "ptr_guaranteed_cmp(&T as *const u32, 0 as *const u32)", 0),
+        ("NULLS", "ptr_guaranteed_cmp(0 as *const u32, 0 as *const u32)", 1),
+        ("IS_NULL", "is_null(&K[1] as *const u32) as u8", 0),
+    ];
+    for (name, body, _) in cases {
+        w.konst(name, "u8", body);
+    }
+    w.konst("EQ", "bool", "(&T as *const u32) == (&T as *const u32)");
+    w.build();
+    for (name, _, want) in cases {
+        assert_eq!(eval_int(&mut w, name), Ok(want), "{name}");
+    }
+    assert_eq!(refusal(&mut w, "EQ"), std::format!("{:?}", Refusal::PointerCompare));
+}
+
+/// Rule 18: each hostile constant stops by its own bound, under the default limits but the
+/// steps (lowered so the test is quick), and the refusal names the constant it was asked for.
+#[test]
+fn hostile_constants_stop_by_their_bound() {
+    let mut w = world();
+    w.const_fn("forever", &[("n", "u64")], "u64", "{ forever(n + 1) }");
+    w.konst("INF_REC", "u64", "forever(0)");
+    w.konst("INF_LOOP", "u32", "{ let mut i = 0u32; loop { i ^= 1; } }");
+    // 1 GiB: refused by the memory bound before a byte of it is allocated.
+    w.konst("HUGE", "[u8; 1073741824]", "[0u8; 1073741824]");
+    // Reads itself through a reference: a cycle, not a hang.
+    w.konst("SELF_REF", "&u32", "&(*SELF_REF + 1)");
+    w.limits.steps = 1_000_000;
+    w.build();
+    let cases = [
+        ("INF_REC", std::format!("{:?}", Refusal::CallDepth { limit: Limits::DEFAULT.depth })),
+        ("INF_LOOP", std::format!("{:?}", Refusal::StepLimit { limit: 1_000_000 })),
+        ("HUGE", std::format!("{:?}", Refusal::MemoryLimit { limit: Limits::DEFAULT.memory })),
+    ];
+    for (name, want) in cases {
+        let e = w.eval(name).expect_err(name);
+        assert_eq!(std::format!("{:?}", e.refusal), want, "{name}");
+        assert_eq!(e.constant, w.key(name), "{name}: the refusal names the constant");
+    }
+    let me = w.key("SELF_REF");
+    let e = w.eval("SELF_REF").expect_err("SELF_REF");
+    assert_eq!(std::format!("{:?}", e.refusal), std::format!("{:?}", Refusal::Cycle { chain: { let mut v = blaze_own::Vec::new_in(Alloc::global()); v.extend_from_slice(&[me, me]); v } }));
+    assert_eq!(e.constant, me);
+}
+
+/// A static's initialiser is a constant context (the Reference, "Static items"): a table
+/// built by a loop, as real libraries build CRC and lookup tables.
+#[test]
+fn static_table_built_by_a_loop() {
+    let mut w = world();
+    w.stat(
+        "CRC",
+        "[u32; 256]",
+        "{ let mut t = [0u32; 256]; let mut i = 0; while i < 256 { let mut c = i as u32; let mut k = 0; while k < 8 { c = if c & 1 == 1 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 }; k += 1; } t[i] = c; i += 1; } t }",
+    );
+    w.konst("AT", "u32", "CRC[255]");
+    w.build();
+    let rec = w.eval("CRC").expect("CRC");
+    let bytes = rec.data.allocs[0].bytes.as_slice();
+    let mut want = [0u32; 256];
+    for (i, slot) in want.iter_mut().enumerate() {
+        let mut c = i as u32;
+        for _ in 0..8 {
+            c = if c & 1 == 1 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+        }
+        *slot = c;
+    }
+    for (i, w4) in bytes.chunks(4).enumerate() {
+        assert_eq!(u32::from_le_bytes(w4.try_into().expect("4")), want[i], "entry {i}");
+    }
+    assert_eq!(eval_int(&mut w, "AT"), Ok(u128::from(want[255])), "a constant reads a static's record");
+}
+
+/// The Reference, "Enumerations", "Discriminants": an explicit discriminant is its constant's
+/// value; an implicit one is the previous variant's plus one, the first's 0; in the `repr`
+/// type, `isize` without one; past the type's range is an error. `as` reads it.
+#[test]
+fn discriminants() {
+    let mut w = world();
+    let e = w.enum_("E", Some("i8"), &[("A", &[], Some("-2")), ("B", &[], None), ("C", &[], Some("10")), ("D", &[], None)]);
+    let plain = w.enum_("Plain", None, &[("X", &[], None), ("Y", &[], None), ("Z", &[], None)]);
+    let over = w.enum_("Over", Some("u8"), &[("A", &[], Some("255")), ("B", &[], None)]);
+    w.konst("CB", "i32", "E::B as i32");
+    w.konst("CD", "u8", "E::D as u8");
+    w.konst("PZ", "i64", "Plain::Z as i64");
+    w.build();
+    // The explicit discriminants' records first: the seam returns `Need` until they exist.
+    let alloc = Alloc::global();
+    assert!(matches!(eval_discriminant(&w, e, 0, alloc), Ok(Answer::Need(_))), "an explicit discriminant not evaluated yet is a need");
+    w.eval("E_A_DISC").expect("A");
+    w.eval("E_C_DISC").expect("C");
+    w.eval("Over_A_DISC").expect("Over A");
+    let d = |w: &World, adt, v| match eval_discriminant(w, adt, v, alloc) {
+        Ok(Answer::Done(d)) => Ok(d),
+        Ok(Answer::Need(n)) => panic!("need {n:?}"),
+        Err(e) => Err(std::format!("{:?}", e.refusal)),
+    };
+    assert_eq!([d(&w, e, 0), d(&w, e, 1), d(&w, e, 2), d(&w, e, 3)], [Ok(-2), Ok(-1), Ok(10), Ok(11)]);
+    assert_eq!([d(&w, plain, 0), d(&w, plain, 1), d(&w, plain, 2)], [Ok(0), Ok(1), Ok(2)]);
+    assert_eq!(d(&w, over, 1), Err(std::format!("{:?}", Refusal::DiscriminantOverflow { variant: 1 })));
+    assert_eq!(eval_int(&mut w, "CB").map(|v| sext(v, 32)), Ok(-1));
+    assert_eq!(eval_int(&mut w, "CD"), Ok(11));
+    assert_eq!(eval_int(&mut w, "PZ"), Ok(2));
+}
+
+/// The Reference, "Slice types" and "Slice patterns": a reference to a constant array
+/// coerces to a slice (a pointer and a length); indexing it and matching it read the array.
+#[test]
+fn slice_of_a_constant_array() {
+    let mut w = world();
+    w.konst("A", "[u16; 4]", "[1, 2, 3, 4]");
+    w.konst("S", "&[u16]", "&A");
+    w.konst("C", "u16", "S[3]");
+    w.konst("M", "u16", "match S { [a, _, _, d] => *a + *d, _ => 0 }");
+    w.konst("STR", "&str", "\"h\\u{e9}llo\"");
+    w.build();
+    let s = w.eval("S").expect("S");
+    assert_eq!(&s.data.allocs[0].bytes[8..], &[4, 0, 0, 0, 0, 0, 0, 0], "the length after the pointer");
+    assert_eq!(s.data.allocs[1].bytes.as_slice(), &[1, 0, 2, 0, 3, 0, 4, 0]);
+    assert_eq!(eval_int(&mut w, "C"), Ok(4));
+    assert_eq!(eval_int(&mut w, "M"), Ok(5));
+    let st = w.eval("STR").expect("STR");
+    assert_eq!(st.data.allocs[1].bytes.as_slice(), "h\u{e9}llo".as_bytes(), "a string literal's bytes, escapes decoded");
+}
+
+/// The Reference, "Constant evaluation": a panic during evaluation is a compile error whose
+/// message is the panic's; here its parts.
+#[test]
+fn panic_in_a_constant() {
+    // The Reference ("Constant evaluation"): a panic where the value must be known at compile
+    // time is a compile error. The forms a constant reaches are core's const panic entries:
+    // `panic!("lit")`, `assert!`, `unreachable!` and kin (`panicking::panic(&str)`) and
+    // `panic!("{}", s)` of a `&str` (`panic_display`). The finding is the message, the constant
+    // asked for and the call's item-relative range (rule 71), in the record that refuses.
+    let body = "if 1 + 1 == 2 { panic_display(\"bad value\") } else { 1 }";
+    let mut w = world();
+    w.konst("C", "u8", body);
+    w.panic_fn("panic", "&str");
+    w.const_fn("checked", &[("n", "u8")], "u8", "{ if n > 9 { panic(\"n is more than 9\") } n }");
+    w.konst("D", "u8", "checked(10)");
+    w.build();
+    let e = w.eval("C").expect_err("panics");
+    let Refusal::Panic { parts } = &e.refusal else { panic!("{:?}", e.refusal) };
+    assert!(matches!(parts.as_slice(), [PanicPart::Str(s)] if s.as_slice() == b"bad value"), "{parts:?}");
+    assert_eq!(e.constant, w.key("C"));
+    let at = e.at.expect("the panic's place");
+    let text = std::format!("const C: u8 = {body};");
+    assert_eq!(&text[at.range.start as usize..at.range.end as usize], "panic_display(\"bad value\")", "item-relative");
+    // A panic in a const fn: the finding names the constant asked for, and the place is in
+    // the fn's own item.
+    let e = w.eval("D").expect_err("panics");
+    let Refusal::Panic { parts } = &e.refusal else { panic!("{:?}", e.refusal) };
+    assert!(matches!(parts.as_slice(), [PanicPart::Str(s)] if s.as_slice() == b"n is more than 9"), "{parts:?}");
+    assert_eq!(e.constant, w.key("D"));
+    assert_eq!(e.at.expect("the panic's place").body, w.key("checked"));
+}
+
+/// What the evaluator refuses, each by its name: what the language makes an error in a
+/// constant, and what is not built.
+#[test]
+fn refused_by_name() {
+    let mut w = world();
+    w.plain_fn("not_const", &[], "u8", "{ 1 }");
+    w.strukt("Pad", &[("a", "u8"), ("b", "u16")]);
+    w.const_fn("dangle", &[], "&u8", "{ let x = 5u8; &x }");
+    w.konst("NC", "u8", "not_const()");
+    w.stat_mut("SM", "u8", "1");
+    w.konst("RSM", "u8", "SM");
+    w.konst("A", "u8", "1");
+    w.konst("B", "u8", "2");
+    w.konst("PC", "bool", "&A as *const u8 == &B as *const u8");
+    w.konst("PI", "usize", "&A as *const u8 as usize");
+    w.konst("UN", "u32", "transmute::<Pad, u32>(Pad { a: 1, b: 2 })");
+    w.konst("DG", "u8", "*dangle()");
+    w.konst("IP", "u8", "*transmute::<usize, &u8>(8)");
+    w.konst("TS", "u16", "transmute::<u8, u16>(1)");
+    w.konst("IB", "bool", "transmute::<u8, bool>(2)");
+    w.konst("IC", "char", "transmute::<u32, char>(0xD800)");
+    w.konst("CY1", "u32", "CY2 + 1");
+    w.konst("CY2", "u32", "CY1 + 1");
+    w.konst("MEM", "[u64; 1000000]", "[0u64; 1000000]");
+    w.build();
+    let nc = w.key("not_const");
+    assert_eq!(refusal(&mut w, "NC"), std::format!("{:?}", Refusal::NotConstFn { item: nc }));
+    let sm = w.key("SM");
+    assert_eq!(refusal(&mut w, "RSM"), std::format!("{:?}", Refusal::MutableStatic { item: sm }));
+    assert_eq!(refusal(&mut w, "PC"), std::format!("{:?}", Refusal::PointerCompare));
+    assert_eq!(refusal(&mut w, "PI"), std::format!("{:?}", Refusal::PointerAsInt));
+    // repr(Rust) as blaze-build lays it out: `b: u16` at 0, `a: u8` at 2, padding at 3.
+    assert_eq!(refusal(&mut w, "UN"), std::format!("{:?}", Refusal::Uninit { offset: 3 }));
+    assert_eq!(refusal(&mut w, "DG"), std::format!("{:?}", Refusal::Dangling));
+    assert_eq!(refusal(&mut w, "IP"), std::format!("{:?}", Refusal::IntAsPointer));
+    assert_eq!(refusal(&mut w, "TS"), std::format!("{:?}", Refusal::TransmuteSize { from: 1, to: 2 }));
+    assert_eq!(refusal(&mut w, "IB"), std::format!("{:?}", Refusal::InvalidBool { value: 2 }));
+    assert_eq!(refusal(&mut w, "IC"), std::format!("{:?}", Refusal::InvalidChar { value: 0xD800 }));
+    let (c1, c2) = (w.key("CY1"), w.key("CY2"));
+    assert_eq!(refusal(&mut w, "CY1"), std::format!("{:?}", Refusal::Cycle { chain: { let mut v = blaze_own::Vec::new_in(Alloc::global()); v.extend_from_slice(&[c1, c2, c1]); v } }));
+    w.limits.memory = 1 << 20;
+    assert_eq!(refusal(&mut w, "MEM"), std::format!("{:?}", Refusal::MemoryLimit { limit: 1 << 20 }));
+}
+
+/// `size_of` and `align_of` answer from the layout; `transmute` of plain data reinterprets
+/// the bytes.
+#[test]
+fn size_align_and_transmute() {
+    let mut w = world();
+    w.strukt("Pad", &[("a", "u8"), ("b", "u16")]);
+    w.konst("SZ", "usize", "size_of::<Pad>() * 100 + align_of::<u64>()");
+    w.konst("BITS", "u32", "transmute::<f32, u32>(1.0)");
+    w.konst("ARR", "u32", "transmute::<[u8; 4], u32>([1, 2, 3, 4])");
+    w.build();
+    assert_eq!(eval_int(&mut w, "SZ"), Ok(408));
+    assert_eq!(eval_int(&mut w, "BITS"), Ok(u128::from(1f32.to_bits())));
+    assert_eq!(eval_int(&mut w, "ARR"), Ok(0x0403_0201));
+}
+
+/// The constants the hosted hello's 67 functions reach (the ladder's
+/// `port27/hosted-hello-functions.txt`, program side), each with its body as `bstd` and core
+/// write it. The fixture world has no methods, impl selection or generics, so a method is a
+/// free `const fn`, an associated constant a free one, and a generic call its instance; what
+/// each computes is the source's. Not here: `Duration::MAX` (`MAIN_UNBOUNDED`,
+/// `Limits::USUAL`) and `NonZero::<usize>::MIN`, whose types hold a pattern type that no
+/// checker type can name yet (consteval.md, "The hosted hello's constants").
+#[test]
+fn hosted_hello_constants() {
+    let mut w = world();
+    let fx = &mut w.fx;
+    let usize_ = fx.usize();
+    let unit = fx.tuple(&[]);
+    let bytes_ptr = w.ty("*const [u8]");
+    let thin = w.ty("*const ()");
+    let byte_ptr = w.ty("*const u8");
+    // core's `ptr::metadata` and `ptr::from_raw_parts`, at the instances `<[u8]>::len` and
+    // `ptr::null::<u8>` call.
+    w.intrinsic("ptr_metadata", 0, &[bytes_ptr], usize_, Intrinsic::PtrMetadata);
+    w.intrinsic("aggregate_raw_ptr", 0, &[thin, unit], byte_ptr, Intrinsic::AggregateRawPtr);
+    // bstd::io::Offers (five of its capabilities), `Offers::NONE`, bstd::guest::OFFERS.
+    w.strukt("Offers", &[("out", "bool"), ("err", "bool"), ("clock", "bool"), ("args", "bool"), ("rng", "bool"), ("fs", "bool")]);
+    w.konst("NONE", "Offers", "Offers { out: false, err: false, clock: false, args: false, rng: false, fs: false }");
+    w.konst(
+        "OFFERS",
+        "Offers",
+        "{ let mut offers = NONE; offers.out = true; offers.err = true; offers.clock = true; offers.args = true; offers.rng = true; offers }",
+    );
+    w.konst("OFFERS_FS", "bool", "OFFERS.fs");
+    w.konst("OFFERS_RNG", "bool", "OFFERS.rng");
+    // bstd::grant::Kind, `Kind::name`, `<Io as Grant>::KIND`.
+    w.enum_(
+        "Kind",
+        None,
+        &[
+            ("Args", &[], None),
+            ("Out", &[], None),
+            ("Clock", &[], None),
+            ("Mem", &[], None),
+            ("Spec", &[], None),
+            ("Dir", &["bool"], None),
+            ("Net", &[], None),
+            ("Env", &[], None),
+            ("Everything", &[], None),
+            ("Whole", &["&str"], None),
+        ],
+    );
+    w.const_fn(
+        "kind_name",
+        &[("k", "Kind")],
+        "&str",
+        "{ match k { Kind::Args => \"args\", Kind::Out => \"out\", Kind::Clock => \"clock\", Kind::Mem => \"mem\", Kind::Spec => \"spec\", Kind::Dir(_) => \"dir\", Kind::Net => \"net\", Kind::Env => \"env\", Kind::Everything => \"everything\", Kind::Whole(_) => \"whole\" } }",
+    );
+    w.konst("IO_KIND", "Kind", "Kind::Everything");
+    w.konst("IO_KIND_NAME", "&str", "kind_name(IO_KIND)");
+    // core's `str::as_bytes`, `<[u8]>::len`, `u8::is_ascii_digit`, `u8::is_ascii_alphanumeric`;
+    // bstd::spec::is_name, bstd::grant::same, `Param::new`, the `static MANIFEST` that
+    // `#[bstd::main]` makes for `main(cx, io: Io)`.
+    w.const_fn("as_bytes", &[("s", "&str")], "&[u8]", "{ transmute::<&str, &[u8]>(s) }");
+    w.const_fn("len", &[("s", "&[u8]")], "usize", "{ ptr_metadata(s as *const [u8]) }");
+    w.const_fn("is_ascii_digit", &[("b", "u8")], "bool", "{ match b { b'0'..=b'9' => true, _ => false } }");
+    w.const_fn(
+        "is_ascii_alphanumeric",
+        &[("b", "u8")],
+        "bool",
+        "{ (match b { b'0'..=b'9' => true, _ => false }) | (match b { b'A'..=b'Z' => true, _ => false }) | (match b { b'a'..=b'z' => true, _ => false }) }",
+    );
+    w.const_fn(
+        "is_name",
+        &[("raw", "&str")],
+        "bool",
+        "{ let bytes = as_bytes(raw); if len(bytes) == 0 || len(bytes) > 64 || is_ascii_digit(bytes[0]) { return false; } let mut at = 0; while at < len(bytes) { if !(is_ascii_alphanumeric(bytes[at]) || bytes[at] == b'_') { return false; } at += 1; } true }",
+    );
+    w.const_fn(
+        "same",
+        &[("a", "&str"), ("b", "&str")],
+        "bool",
+        "{ let (a, b) = (as_bytes(a), as_bytes(b)); if len(a) != len(b) { return false; } let mut at = 0; while at < len(a) { if a[at] != b[at] { return false; } at += 1; } true }",
+    );
+    w.strukt("Param", &[("name", "&str"), ("kind", "Kind")]);
+    w.const_fn(
+        "param_new",
+        &[("name", "&str"), ("kind", "Kind")],
+        "Param",
+        "{ if (match kind { Kind::Out => true, _ => false }) && !same(name, \"out\") && !same(name, \"err\") { panic_display(\"an `Out` parameter of `main` is named `out` (standard output) or `err` (standard error)\"); } if !is_name(name) { panic_display(\"a parameter of `main` is named by ASCII letters, digits and `_`, at most 64 bytes\"); } Param { name, kind } }",
+    );
+    w.strukt("Manifest", &[("params", "&[Param]")]);
+    w.stat("MANIFEST", "Manifest", "Manifest { params: &[param_new(\"io\", IO_KIND)] }");
+    w.konst("BAD_PARAM", "Param", "param_new(\"1o\", Kind::Everything)");
+    w.konst("BAD_OUT", "Param", "param_new(\"stdout\", Kind::Out)");
+    // bstd::wire::HostTable (`#[repr(C)]`): its six `extern "C" fn` entries stand here as
+    // `*const u8`, of the same size and alignment; `checked` compares against its size.
+    w.strukt(
+        "HostTable",
+        &[
+            ("version", "u32"),
+            ("size", "u32"),
+            ("host", "*const u8"),
+            ("exchange", "*const u8"),
+            ("exchange_len", "usize"),
+            ("write", "*const u8"),
+            ("clock", "*const u8"),
+            ("arg", "*const u8"),
+            ("grant", "*const u8"),
+            ("effect", "*const u8"),
+            ("exit", "*const u8"),
+        ],
+    );
+    w.konst("TABLE_SIZE", "usize", "size_of::<HostTable>()");
+    // bstd::out::HELD and the `Held` buffer's `[0; HELD]`.
+    w.konst("HELD", "usize", "1024");
+    // The fixture's converter takes literal lengths only (a length naming `HELD` is an
+    // anonymous constant, `eval_len`'s, in the driver).
+    w.konst("HELD_BYTES", "[u8; 1024]", "[0; 1024]");
+    w.konst("TAKE", "usize", "{ let len = 1000usize; if len == HELD { 0 } else { HELD - len } }");
+    // core's `ptr::null::<u8>()` (`from_raw_parts(without_provenance::<()>(0), ())`), and
+    // bstd::guest's `static CURRENT: Cell<*const Run> = Cell::new(ptr::null())`.
+    w.const_fn("without_provenance", &[("addr", "usize")], "*const ()", "{ transmute::<usize, *const ()>(addr) }");
+    w.const_fn("null", &[], "*const u8", "{ aggregate_raw_ptr(without_provenance(0), ()) }");
+    w.strukt("Cell", &[("value", "*const u8")]);
+    w.const_fn("cell_new", &[("value", "*const u8")], "Cell", "{ Cell { value } }");
+    w.stat("CURRENT", "Cell", "cell_new(null())");
+    w.build();
+
+    assert_eq!(eval_int(&mut w, "OFFERS_FS"), Ok(0));
+    assert_eq!(eval_int(&mut w, "OFFERS_RNG"), Ok(1));
+    let name = w.eval("IO_KIND_NAME").expect("IO_KIND_NAME");
+    assert_eq!(name.data.allocs[1].bytes.as_slice(), b"everything", "`<Io as Grant>::KIND.name()`");
+    let manifest = w.eval("MANIFEST").expect("MANIFEST");
+    assert_eq!(&manifest.data.allocs[0].bytes[8..], &[1, 0, 0, 0, 0, 0, 0, 0], "one parameter");
+    let message = |w: &mut World, name: &str| -> StdVec<u8> {
+        let e = w.eval(name).expect_err("panics");
+        let Refusal::Panic { parts } = &e.refusal else { panic!("{:?}", e.refusal) };
+        let [PanicPart::Str(s)] = parts.as_slice() else { panic!("{parts:?}") };
+        s.as_slice().to_vec()
+    };
+    assert!(message(&mut w, "BAD_PARAM").starts_with(b"a parameter of `main` is named by ASCII"), "a name starting with a digit: `Param::new`'s message");
+    assert!(message(&mut w, "BAD_OUT").starts_with(b"an `Out` parameter"), "an `Out` named other than `out` or `err`");
+    assert_eq!(eval_int(&mut w, "TABLE_SIZE"), Ok(80));
+    let held = w.eval("HELD_BYTES").expect("HELD_BYTES");
+    assert_eq!(held.data.allocs[0].bytes.len(), 1024);
+    assert_eq!(eval_int(&mut w, "TAKE"), Ok(24), "`Held::take`'s room left");
+    let current = w.eval("CURRENT").expect("CURRENT");
+    assert_eq!(current.data.allocs[0].bytes.as_slice(), &[0; 8], "`ptr::null()` is address 0");
+    assert!(current.data.allocs[0].relocs.is_empty(), "and points into nothing");
+}
+
+/// Layout cannot drift between compile time and run time: a constant's record, placed in
+/// memory, is read back by code the builder emits (blaze-build's `read_back`: one emitted
+/// function loading every scalar leaf through the builder's own offsets), and each leaf is the
+/// value the source wrote. Three shapes: a struct repr(Rust) may reorder, an array of a
+/// `repr(u8)` enum with explicit and implicit discriminants (the tag's raw bits), and a
+/// reference to a tuple holding a slice (two relocations).
+#[test]
+fn emitted_code_reads_constants_back() {
+    let mut w = world();
+    w.strukt("Mixed", &[("a", "u8"), ("b", "u64"), ("c", "u16"), ("s", "&str")]);
+    w.enum_("E", Some("u8"), &[("A", &[], Some("3")), ("B", &[], None), ("C", &[], Some("10"))]);
+    w.konst("M", "Mixed", "Mixed { a: 7, b: 0x1122_3344_5566_7788, c: 0xBEEF, s: \"hi\" }");
+    w.konst("ES", "[E; 4]", "[E::A, E::C, E::B, E::A]");
+    w.konst("R", "&(u16, &[u8])", "&(5, &[1, 2, 3])");
+    w.build();
+    let cases: [(&str, &str, StdVec<u64>); 3] = [
+        ("M", "Mixed", std::vec![7, 0x1122_3344_5566_7788, 0xBEEF, 2, u64::from(b'h'), u64::from(b'i')]),
+        ("ES", "[E; 4]", std::vec![3, 10, 4, 3]),
+        ("R", "&(u16, &[u8])", std::vec![5, 3, 1, 2, 3]),
+    ];
+    for (name, ty, want) in cases {
+        let t = w.ty(ty);
+        let got = w.read_back(name, t).unwrap_or_else(|e| panic!("{name}: {e:?}"));
+        assert_eq!(got, want, "{name}: the emitted code reads what the evaluator wrote");
+    }
+}
+
+/// Rule 25: two evaluations of one key write equal bytes, and the record's key and reads are
+/// a function of the text.
+#[test]
+fn records_are_deterministic() {
+    let build = || {
+        let mut w = world();
+        w.konst("A", "[u8; 3]", "[5, 6, 7]");
+        w.konst("R", "&[u8]", "&A");
+        w.build();
+        let r = w.eval("R").expect("R");
+        (r.key, std::format!("{r:?}"), r.reads.len())
+    };
+    let (a, b) = (build(), build());
+    assert_eq!(a, b);
+    assert_eq!(a.2, 2, "R's body and A's record (A's body is A's record's read, not R's): {a:?}");
+}
+
+// ---- The property and the controls ----
+
+/// One drawn integer case: a type, an operator and two operands as written.
+struct Case {
+    ty: &'static str,
+    bits: u32,
+    signed: bool,
+    op: &'static str,
+    a: u128,
+    b: u128,
+}
+
+const OPS: [&str; 10] = ["+", "-", "*", "/", "%", "<<", ">>", "&", "|", "^"];
+
+fn draw(tape: &Tape) -> Case {
+    let &(ty, bits, signed) = tape.pick(&INTS, "type").expect("types");
+    let op = *tape.pick(&OPS, "op").expect("ops");
+    let operand = |label| {
+        let v = match tape.below(4, label) {
+            0 => tape.below(8, label) as u128,
+            1 => mask(u128::MAX, bits) - tape.below(4, label) as u128,
+            2 => mask((1u128 << (bits - 1)).wrapping_add(tape.below(3, label) as u128).wrapping_sub(1), bits),
+            _ => mask(u128::from(tape.next_u64(label)) | u128::from(tape.next_u64(label)) << 64, bits),
+        };
+        if op == "<<" || op == ">>" { v % u128::from(bits + 2) } else { v }
+    };
+    Case { ty, bits, signed, op, a: operand("a"), b: operand("b") }
+}
+
+fn written(v: u128, bits: u32, signed: bool) -> String {
+    if signed && sext(v, bits) < 0 {
+        // The minimum has no positive literal of its type: written as `-MAX - 1`.
+        let m = sext(v, bits);
+        if m == if bits >= 128 { i128::MIN } else { -(1i128 << (bits - 1)) } { std::format!("({} - 1)", m + 1) } else { std::format!("({m})") }
+    } else {
+        std::format!("{v}")
+    }
+}
+
+/// The direct computation: the host's checked arithmetic on the type.
+fn direct(c: &Case) -> Option<u128> {
+    macro_rules! host {
+        ($t:ty) => {{
+            let (a, b) = (c.a as $t, c.b as $t);
+            let r: Option<$t> = match c.op {
+                "+" => a.checked_add(b),
+                "-" => a.checked_sub(b),
+                "*" => a.checked_mul(b),
+                "/" => a.checked_div(b),
+                "%" => a.checked_rem(b),
+                "<<" => a.checked_shl(c.b as u32).filter(|_| c.b < u128::from(c.bits)),
+                ">>" => a.checked_shr(c.b as u32).filter(|_| c.b < u128::from(c.bits)),
+                "&" => Some(a & b),
+                "|" => Some(a | b),
+                _ => Some(a ^ b),
+            };
+            r.map(|r| mask(r as u128, c.bits))
+        }};
+    }
+    match c.ty {
+        "i8" => host!(i8),
+        "i16" => host!(i16),
+        "i32" => host!(i32),
+        "i64" | "isize" => host!(i64),
+        "i128" => host!(i128),
+        "u8" => host!(u8),
+        "u16" => host!(u16),
+        "u32" => host!(u32),
+        "u64" | "usize" => host!(u64),
+        _ => host!(u128),
+    }
+}
+
+fn case_text(c: &Case) -> String {
+    let rhs_ty = if c.op == "<<" || c.op == ">>" { "u32" } else { c.ty };
+    let b = if rhs_ty == "u32" { std::format!("{}", c.b) } else { written(c.b, c.bits, c.signed) };
+    std::format!("{{ let a: {} = {}; let b: {rhs_ty} = {b}; a {} b }}", c.ty, written(c.a, c.bits, c.signed), c.op)
+}
+
+fn eval_case(c: &Case, plant: Plant) -> Result<u128, String> {
+    let mut w = world();
+    let k = w.konst("C", c.ty, &case_text(c));
+    w.build();
+    let alloc = Alloc::global();
+    let mut ground = PortableTys::new_in(alloc);
+    let mut layout = Layouts::new_in(alloc);
+    let mut codes = Codes::new_in(alloc);
+    match value_of_planted(&w, &mut layout, &mut codes, k, &mut ground, plant, alloc) {
+        Ok(Answer::Done(r)) => Ok(int_of(&r)),
+        Ok(Answer::Need(n)) => Err(std::format!("need {n:?}")),
+        Err(ConstError { refusal, .. }) => Err(std::format!("{refusal:?}")),
+    }
+}
+
+fn arithmetic_oracle(tape: &Tape, plant: Plant) -> Result<(), Broke> {
+    let c = draw(tape);
+    let got = eval_case(&c, plant);
+    let want = direct(&c);
+    tape.note(format_args!("{} = {got:?}, direct {want:?}", case_text(&c)));
+    match (got, want) {
+        (Ok(g), Some(w)) if g == w => Ok(()),
+        (Err(_), None) => Ok(()),
+        (Ok(g), None) => Err(Broke::Oracle(std::format!("an overflow answered {g:#x} where the language makes it an error: {}", case_text(&c)))),
+        (got, want) => Err(Broke::Oracle(std::format!("the evaluator differs from direct computation: {got:?} against {want:?}: {}", case_text(&c)))),
+    }
+}
+
+/// The property: every drawn integer expression evaluates to what the host's checked
+/// arithmetic computes, and is refused exactly where the host's is `None`.
+#[test]
+fn evaluator_equals_direct_computation() {
+    blaze_sim::check(Config::cases(300), |tape: &Tape| arithmetic_oracle(tape, Plant::None));
+}
+
+/// Control: arithmetic that wraps where it must error is caught by the property's oracle.
+#[test]
+fn control_overflow_that_wraps_is_caught() {
+    control(Config::cases(300), Plant::None, Plant::WrapOnOverflow, "where the language makes it an error", arithmetic_oracle);
+}
+
+/// Control: comparing pointers of two allocations by their offsets, instead of refusing, is
+/// caught (the Reference, "Constant evaluation": pointer comparison is not a constant
+/// operation; rustc refuses it).
+#[test]
+fn control_pointer_comparison_answered_is_caught() {
+    control(Config::cases(40), Plant::None, Plant::ComparePointers, "pointer comparison answered", |tape, plant| {
+        let mut w = world();
+        let n = tape.below(3, "statics") as usize + 2;
+        for i in 0..n {
+            w.konst(&std::format!("K{i}"), "u8", &std::format!("{i}"));
+        }
+        let (i, j) = (tape.below(n as u64, "i"), tape.below(n as u64, "j"));
+        let op = *tape.pick(&["==", "!=", "<"], "op").expect("op");
+        let k = w.konst("C", "bool", &std::format!("(&K{i} as *const u8) {op} (&K{j} as *const u8)"));
+        w.build();
+        let alloc = Alloc::global();
+        let mut ground = PortableTys::new_in(alloc);
+        let mut layout = Layouts::new_in(alloc);
+        let mut codes = Codes::new_in(alloc);
+        // The two constants' records first.
+        for i in 0..n {
+            w.eval(&std::format!("K{i}")).map_err(|e| Broke::Harness(std::format!("{e}")))?;
+        }
+        match value_of_planted(&w, &mut layout, &mut codes, k, &mut ground, plant, alloc) {
+            Err(ConstError { refusal: Refusal::PointerCompare, .. }) => Ok(()),
+            Ok(Answer::Done(r)) => Err(Broke::Oracle(std::format!("pointer comparison answered {}", int_of(&r)))),
+            other => Err(Broke::Harness(std::format!("{other:?}"))),
+        }
+    });
+}
+
+/// Control: a discriminant taken from the wrong variant is caught by comparing every
+/// variant's discriminant with the rule worked by hand.
+#[test]
+fn control_discriminant_of_the_wrong_variant_is_caught() {
+    control(Config::cases(60), Plant::None, Plant::DiscriminantOffByOne, "wrong discriminant", |tape, plant| {
+        let mut w = world();
+        let n = tape.below(5, "variants") as usize + 1;
+        let mut model = StdVec::new();
+        let mut texts: StdVec<(String, Option<String>)> = StdVec::new();
+        let mut next: i128 = 0;
+        for v in 0..n {
+            let explicit = tape.coin("explicit").then(|| tape.below(41, "value") as i128 - 20);
+            let d = explicit.unwrap_or(next);
+            model.push(d);
+            next = d + 1;
+            texts.push((std::format!("V{v}"), explicit.map(|e| std::format!("{e}"))));
+        }
+        let shaped: StdVec<(&str, &[&str], Option<&str>)> = texts.iter().map(|(n, d)| (n.as_str(), &[] as &[&str], d.as_deref())).collect();
+        let e = w.enum_("E", Some("i32"), &shaped);
+        w.build();
+        for (v, (_, d)) in texts.iter().enumerate() {
+            if d.is_some() {
+                w.eval(&std::format!("E_V{v}_DISC")).map_err(|e| Broke::Harness(std::format!("{e}")))?;
+            }
+        }
+        for (v, &want) in model.iter().enumerate() {
+            match discriminant_with_plant(&w, e, v as u32, plant, Alloc::global()) {
+                Ok(Answer::Done(got)) if got == want => {}
+                Ok(Answer::Done(got)) => return Err(Broke::Oracle(std::format!("wrong discriminant for variant {v}: {got}, the rule gives {want}"))),
+                other => return Err(Broke::Harness(std::format!("{other:?}"))),
+            }
+        }
+        Ok(())
+    });
+}
+
+/// `int_binop` itself refuses what the language refuses, without the pipeline: the oracle's
+/// own unit, for a failure that names the operator.
+#[test]
+fn int_binop_names_the_operator() {
+    let r = int_binop(blaze_typeck::BinOp::Add, 255, 1, 8, false, (8, false), Plant::None);
+    assert_eq!(r, Err(Refusal::Overflow { op: Op::Add }));
+    let _: ItemKey = ItemKey(0);
+}

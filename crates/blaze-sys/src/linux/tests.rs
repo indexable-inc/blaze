@@ -42,6 +42,16 @@ impl Drop for Scratch {
 
 const CREATE: OpenFlags = OpenFlags::READ_WRITE.with(OpenFlags::CREATE).with(OpenFlags::CLOSE_ON_EXEC);
 
+/// A pipe is not a terminal, and has no window size: `ENOTTY`, named.
+#[test]
+fn a_pipe_is_not_a_terminal() {
+    let (read_end, write_end) = pipe2(PipeFlags::CLOSE_ON_EXEC).unwrap();
+    for end in [&read_end, &write_end] {
+        assert!(!is_terminal(end.fd()));
+        assert_eq!(window_size(end.fd()), Err(Errno::NoTty));
+    }
+}
+
 /// libc's `errno`, as an [`Errno`].
 fn libc_errno() -> Errno {
     Errno::from_raw(u16::try_from(std::io::Error::last_os_error().raw_os_error().unwrap()).unwrap())

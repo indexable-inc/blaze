@@ -24,6 +24,28 @@ blaze-hash.workspace = true
 blaze-surface.workspace = true
 # `Vec`: every list of the machine, in the allocator it is made in.
 blaze-own.workspace = true
+# task/lower.rs: `Outline`, a file's items, which the source lowering reads.
+blaze-file-items.workspace = true
+# task/lower.rs: `Hasher`, the keys of the lowered items and the cfg's digest.
+blaze-ids.workspace = true
+# resolve.rs: the item macros a crate's names need, expanded as the fill names them.
+blaze-expand.workspace = true
+# resolve.rs: `OutputsRef`, a crate's build-script outputs read in place from their record, and
+# `cx::ScriptCx`, which lays them over the expansion host (`env!("OUT_DIR")`, `include!` of a
+# generated file). No cycle: blaze-build-script depends on blaze-own, blaze-ids,
+# blaze-unit-graph and blaze-expand only.
+blaze-build-script.workspace = true
+# resolve.rs: `FormatError`, why a record written does not read back.
+blaze-format.workspace = true
+# graph.rs: `Implicit`, what a unit is given without naming it (its `std`, its prelude), from
+# its one home.
+blaze-unit-graph.workspace = true
+# units.rs: `Lock`, each workspace unit's package as the lock writes it (its key).
+blaze-manifest = { workspace = true, default-features = false }
+# units.rs: `ToolchainView`, the installed toolchain's units the workspace's std, core and alloc are.
+blaze-toolchain.workspace = true
+# units.rs: `PackageEdition`, a unit's edition, for `implicit`.
+edition.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true
@@ -31,10 +53,17 @@ blaze-sim.workspace = true
 blaze-own = { workspace = true, features = ["std"] }
 # `testing::MemSurface`: the records the fixtures write, read back through `RecordFacts`.
 blaze-surface = { workspace = true, features = ["testing"] }
-# examples/pipeline.rs: `outline`, the FileItems of each file of a real crate.
-blaze-file-items.workspace = true
-# examples/pipeline.rs: the item macros the resolver asks to expand.
-blaze-expand.workspace = true
+# examples/crates.rs: the workspaces' manifests read through `layout::Layout` (sans-IO).
+blaze-manifest = { workspace = true, default-features = false }
+# examples/workspace.rs: `PackView`, a registry package's and a toolchain crate's files, read in place.
+blaze-fetch.workspace = true
+# examples/crates.rs: `PackageEdition`, `BlazeEdition::prelude`: what a blaze edition puts in scope.
+edition.workspace = true
+
+[features]
+# The cell core under construction (src/cells, bottom.md section 6): off by default, so a
+# half-built core never stops the crate's other lanes. Goes away when the crate switches to it.
+cells = []
 
 [lints]
 workspace = true

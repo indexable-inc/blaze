@@ -1,0 +1,725 @@
+//! The cell core's tests: one fixture per rule with its planted bug as the control, and the
+//! comparison with the solver on generated crates without macro calls, in shuffled push orders.
+
+use std::format;
+use std::string::String;
+use std::vec::Vec;
+
+use blaze_id::ItemKey;
+use blaze_own::Alloc;
+use blaze_sim::{Broke, Config, Tape};
+
+use super::{CellPlant, CellStats, Cells, Outcome, Value};
+use crate::tests::{B, Imp, N, V, World, reference_imports, reference_world};
+use crate::{Edition, Namespace, Unresolved};
+
+/// The core run on `w` with the tests' driver: expanding a call marks it expanded in the world,
+/// whose facts then hand its expansion back. Each solve starts with nothing expanded.
+fn solved(w: &World, root: ItemKey, plant: CellPlant, order: &[u32]) -> Result<Cells<'static, N>, String> {
+    w.expanded.borrow_mut().clear();
+    let mut c = Cells::load(w, root, Alloc::global()).map_err(|e| format!("{e}"))?;
+    c.plant = plant;
+    let expand = |call: ItemKey, _: crate::Def| {
+        w.expanded.borrow_mut().insert(call);
+    };
+    c.run(w, &expand, order).map_err(|e| format!("{e}"))?;
+    Ok(c)
+}
+
+fn cells_of(w: &World, root: ItemKey, plant: CellPlant) -> Cells<'static, N> {
+    solved(w, root, plant, &[]).expect("the core runs")
+}
+
+fn outcome(c: &Cells<'static, N>, m: ItemKey, index: u32) -> Outcome {
+    c.outcome(m, index).expect("every import is decided")
+}
+
+fn found(v: Option<Value>) -> Option<ItemKey> {
+    match v {
+        Some(Value::Found(d, _)) => Some(d.key),
+        _ => None,
+    }
+}
+
+/// R1. The Reference, `items.use.glob.shadowing`: "items and named imports are allowed to
+/// shadow names from glob imports in the same namespace." The glob and the item sit in `b`, not
+/// in the root its path starts from: in the root the planted bug (every read of the root's names
+/// waiting on its globs first) would make the glob wait on itself and fail, hiding the plant.
+#[test]
+fn an_item_shadows_a_glob() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let a = w.module(root, "a", V::Pub);
+    let ax = w.fun(a, "x", V::Pub);
+    let b = w.module(root, "b", V::Pub);
+    w.glob(b, "crate::a", V::Priv);
+    let x = w.fun(b, "x", V::Priv);
+    let mut ok = cells_of(&w, root, CellPlant::None);
+    assert_eq!(found(ok.ask(b, Namespace::Values, "x").expect("asks")), Some(x));
+    let mut bad = cells_of(&w, root, CellPlant::GlobsShadowExplicit);
+    assert_eq!(found(bad.ask(b, Namespace::Values, "x").expect("asks")), Some(ax), "the control");
+}
+
+/// R2. The Reference, `items.use.glob.ambiguity`: "it is an error to use a name that is
+/// imported by two glob imports where the names refer to different items" (when used).
+#[test]
+fn two_globs_with_different_items_are_ambiguous_where_used() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let a = w.module(root, "a", V::Pub);
+    w.fun(a, "x", V::Pub);
+    let b = w.module(root, "b", V::Pub);
+    w.fun(b, "x", V::Pub);
+    let c = w.module(root, "c", V::Pub);
+    w.glob(c, "crate::a", V::Pub);
+    w.glob(c, "crate::b", V::Pub);
+    w.use_(root, "crate::c::x", V::Priv);
+    let ok = cells_of(&w, root, CellPlant::None);
+    assert!(matches!(outcome(&ok, root, 0), Outcome::Failed(Unresolved::Ambiguous(_))));
+    let bad = cells_of(&w, root, CellPlant::FirstGlobWins);
+    assert!(matches!(outcome(&bad, root, 0), Outcome::Named(_)), "the control");
+}
+
+/// R3. RFC 1560, "Changes to the name resolution algorithm": imports are resolved by a work
+/// list "until fixed point"; globs that import each other are legal and bring what reaches the
+/// cycle from outside.
+#[test]
+fn a_glob_cycle_brings_what_reaches_it() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let a = w.module(root, "a", V::Pub);
+    let b = w.module(root, "b", V::Pub);
+    let d = w.module(root, "d", V::Pub);
+    w.glob(a, "crate::b", V::Pub);
+    w.glob(a, "crate::d", V::Pub);
+    w.glob(b, "crate::a", V::Pub);
+    let x = w.fun(d, "x", V::Pub);
+    w.use_(root, "crate::b::x", V::Priv);
+    let ok = cells_of(&w, root, CellPlant::None);
+    assert!(matches!(outcome(&ok, root, 0), Outcome::Named(bs) if bs[1].map(|b| b.0.key) == Some(x)));
+    assert!(ok.stats.cycle_passes >= 1, "decided as a cycle");
+    let bad = cells_of(&w, root, CellPlant::CycleNotFound);
+    assert!(matches!(outcome(&bad, root, 0), Outcome::Failed(_)), "the control");
+}
+
+/// R4. The Reference, `items.use.glob`: a glob imports "all importable entities" "that are
+/// visible" from the importing module; a private item stays behind.
+#[test]
+fn a_glob_leaves_private_items_behind() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let a = w.module(root, "a", V::Pub);
+    w.fun(a, "x", V::Priv);
+    let b = w.module(root, "b", V::Pub);
+    w.glob(b, "crate::a", V::Pub);
+    let mut ok = cells_of(&w, root, CellPlant::None);
+    assert_eq!(ok.ask(b, Namespace::Values, "x").expect("asks"), Some(Value::NotFound));
+    let mut bad = cells_of(&w, root, CellPlant::GlobLeaksPrivate);
+    assert!(found(bad.ask(b, Namespace::Values, "x").expect("asks")).is_some(), "the control");
+}
+
+/// R5, the stall rule (bottom.md section 6): at a quiet point only the sinks of the wait graph
+/// fail; what waited on them is then solved normally. RFC 1560: what is left unresolved at the
+/// fixed point is an error, and "how a name resolves should be consistent under any ordering".
+#[test]
+fn a_stall_fails_its_sink_alone() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let a = w.module(root, "a", V::Pub);
+    let b = w.module(root, "b", V::Pub);
+    let c = w.module(root, "c", V::Pub);
+    let d = w.module(root, "d", V::Pub);
+    w.use_(a, "crate::b::q", V::Pub);
+    w.use_(b, "crate::a::q", V::Pub);
+    w.glob(c, "crate::a", V::Pub);
+    w.glob(c, "crate::d", V::Pub);
+    let q = w.fun(d, "q", V::Pub);
+    w.use_(root, "crate::c::q", V::Priv);
+    let ok = cells_of(&w, root, CellPlant::None);
+    assert!(matches!(outcome(&ok, a, 0), Outcome::Failed(Unresolved::NotFound)));
+    assert!(matches!(outcome(&ok, b, 0), Outcome::Failed(Unresolved::NotFound)));
+    assert!(matches!(outcome(&ok, root, 0), Outcome::Named(bs) if bs[1].map(|b| b.0.key) == Some(q)));
+    assert_eq!(ok.stats.stalls, 1);
+    let bad = cells_of(&w, root, CellPlant::StallFailsAll);
+    assert!(matches!(outcome(&bad, root, 0), Outcome::Failed(_)), "the control");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The comparison on generated crates without macro calls.
+
+// ---------------------------------------------------------------------------------------------
+// Stage 2: macro calls. The control of each growth test is `CallsNoGrowth`: a cell decided
+// before its module's calls are in either answers wrong or trips the finality check.
+
+/// The control's verdict: the planted core either fails (the finality check names a cell
+/// decided not found too early) or answers otherwise than `right`.
+fn caught(w: &World, root: ItemKey, plant: CellPlant, m: ItemKey, index: u32, right: Outcome) -> bool {
+    match solved(w, root, plant, &[]) {
+        Err(_) => true,
+        Ok(c) => c.outcome(m, index) != Some(right),
+    }
+}
+
+fn named_def(o: Outcome, ns: Namespace) -> Option<ItemKey> {
+    match o {
+        Outcome::Named(b) => b[super::ns_at(ns)].map(|(d, _)| d.key),
+        _ => None,
+    }
+}
+
+/// A call writes an item another module imports: the import waits for the call's expansion,
+/// though a glob of the module already brings the name (an expanded item shadows a glob, R1).
+#[test]
+fn a_call_writes_an_item_another_module_imports() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    w.use_(root, "crate::a::x", V::Priv);
+    let a = w.module(root, "a", V::Pub);
+    let d = w.module(root, "d", V::Pub);
+    w.fun(d, "x", V::Pub);
+    // The call's macro comes by the same glob, so the glob is decided before the call resolves:
+    // the moment a core without growth decides `a::x` from the glob.
+    w.item(d, "mm", Namespace::Macros, crate::DefKind::Macro(crate::MacroShapes::FN_LIKE), V::Pub);
+    w.glob(a, "crate::d", V::Pub);
+    let call = w.call(a, "mm", crate::CallShape::FnLike);
+    let x = w.fun(call, "x", V::Pub);
+    let ok = cells_of(&w, root, CellPlant::None);
+    let got = outcome(&ok, root, 0);
+    assert_eq!(named_def(got, Namespace::Values), Some(x), "{got:?}");
+    assert!(caught(&w, root, CellPlant::CallsNoGrowth, root, 0, got), "the control");
+}
+
+/// A call writes a call (two levels): the inner call resolves in the textual scope through the
+/// outer expansion's place, and writes the item imported.
+#[test]
+fn a_call_writes_a_call() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    w.rules(root, "mk");
+    w.use_(root, "crate::a::y", V::Priv);
+    let a = w.module(root, "a", V::Pub);
+    let outer = w.call(a, "mk", crate::CallShape::FnLike);
+    let inner = w.call(outer, "mk", crate::CallShape::FnLike);
+    let y = w.fun(inner, "y", V::Pub);
+    let ok = cells_of(&w, root, CellPlant::None);
+    assert_eq!(ok.stats.expansions, 2);
+    let got = outcome(&ok, root, 0);
+    assert_eq!(named_def(got, Namespace::Values), Some(y), "{got:?}");
+    assert!(caught(&w, root, CellPlant::CallsNoGrowth, root, 0, got), "the control");
+}
+
+/// A call writes a module with its own imports: the module appears, and its import resolves.
+#[test]
+fn a_call_writes_a_module_with_imports() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    w.rules(root, "mk");
+    w.use_(root, "crate::a::m::z", V::Priv);
+    let a = w.module(root, "a", V::Pub);
+    let k = w.module(root, "k", V::Pub);
+    let z = w.fun(k, "z", V::Pub);
+    let call = w.call(a, "mk", crate::CallShape::FnLike);
+    let m = w.module(call, "m", V::Pub);
+    w.use_(m, "crate::k::z", V::Pub);
+    let ok = cells_of(&w, root, CellPlant::None);
+    assert_eq!(named_def(outcome(&ok, m, 0), Namespace::Values), Some(z));
+    let got = outcome(&ok, root, 0);
+    assert_eq!(named_def(got, Namespace::Values), Some(z), "{got:?}");
+    assert!(caught(&w, root, CellPlant::CallsNoGrowth, root, 0, got), "the control");
+}
+
+/// A call's path is imported through a glob (the path-based scope, macro namespace).
+#[test]
+fn a_call_named_through_a_glob() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    w.use_(root, "crate::a::x", V::Priv);
+    let defs = w.module(root, "defs", V::Pub);
+    let mm = w.item(defs, "mm", Namespace::Macros, crate::DefKind::Macro(crate::MacroShapes::FN_LIKE), V::Pub);
+    let a = w.module(root, "a", V::Pub);
+    w.glob(a, "crate::defs", V::Pub);
+    let call = w.call(a, "mm", crate::CallShape::FnLike);
+    let x = w.fun(call, "x", V::Pub);
+    let ok = cells_of(&w, root, CellPlant::None);
+    assert!(matches!(ok.call_outcome(call), Some(Outcome::Called(d)) if d.key == mm));
+    let got = outcome(&ok, root, 0);
+    assert_eq!(named_def(got, Namespace::Values), Some(x), "{got:?}");
+    assert!(caught(&w, root, CellPlant::CallsNoGrowth, root, 0, got), "the control");
+}
+
+/// The textual scope (Reference `macros.by-example.scope`): a definition is seen after it in
+/// text order and in child modules after it; `#[macro_use]` carries a child's definitions to
+/// the rest of the parent; a later definition shadows; a call before any definition sees none.
+#[test]
+fn the_textual_scope_of_macro_rules() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let early = w.call(root, "mx", crate::CallShape::FnLike);
+    let first = w.rules(root, "mx");
+    let between = w.call(root, "mx", crate::CallShape::FnLike);
+    let second = w.rules(root, "mx");
+    let child = w.module(root, "c", V::Pub);
+    let in_child = w.call(child, "mx", crate::CallShape::FnLike);
+    let u = w.module_with(root, "u", V::Pub, true, false);
+    let my = w.rules(u, "my");
+    let after_use = w.call(root, "my", crate::CallShape::FnLike);
+    let ok = cells_of(&w, root, CellPlant::None);
+    let called = |c: ItemKey| match ok.call_outcome(c) {
+        Some(Outcome::Called(d)) => Some(d.key),
+        _ => None,
+    };
+    assert_eq!(called(early), None, "before any definition");
+    assert_eq!(called(between), Some(first));
+    assert_eq!(called(in_child), Some(second), "the latest before the child's `mod` line");
+    assert_eq!(called(after_use), Some(my), "`#[macro_use]` carries `my` out");
+    let bad = cells_of(&w, root, CellPlant::NoTextualScope);
+    assert_eq!(bad.call_outcome(between).and_then(|o| if let Outcome::Called(d) = o { Some(d.key) } else { None }), None, "the control");
+}
+
+/// R5 over calls, the refinement: `B` reads the textual scope past the earlier call `A`, and
+/// `A`'s path-based read waits on `B` (its module's growth): a sink of two calls. `A` fails
+/// first; `B` is spared that round, then resolves through the glob. `A` is `self::mx!`: a plain
+/// `mx!` would go outward at once (R6: its inner scope grows by expansion alone) and leave
+/// the sink without a stall.
+#[test]
+fn a_stall_spares_the_later_call() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let defs = w.module(root, "defs", V::Pub);
+    let my = w.item(defs, "my", Namespace::Macros, crate::DefKind::Macro(crate::MacroShapes::FN_LIKE), V::Pub);
+    let m = w.module(root, "m", V::Pub);
+    w.glob(m, "crate::defs", V::Pub);
+    let a = w.call(m, "self::mx", crate::CallShape::FnLike);
+    let b = w.call(m, "my", crate::CallShape::FnLike);
+    let ok = cells_of(&w, root, CellPlant::None);
+    assert!(!matches!(ok.call_outcome(a), Some(Outcome::Called(_))), "{:?}", ok.call_outcome(a));
+    assert!(matches!(ok.call_outcome(b), Some(Outcome::Called(d)) if d.key == my), "{:?}", ok.call_outcome(b));
+    assert_eq!(ok.stats.spared, 1);
+    let bad = cells_of(&w, root, CellPlant::StallSparesNone);
+    assert!(!matches!(bad.call_outcome(b), Some(Outcome::Called(_))), "the control");
+}
+
+fn same_why(a: Unresolved, b: Unresolved) -> bool {
+    let plain = |u: Unresolved| match u {
+        Unresolved::Private => Unresolved::NotFound,
+        Unresolved::Ambiguous(_) => Unresolved::Ambiguous(crate::AmbiguityKind::GlobVsGlob),
+        u => u,
+    };
+    plain(a) == plain(b)
+}
+
+/// The core run with items first pushed in a drawn order.
+fn shuffled(w: &World, root: ItemKey, tape: &Tape) -> Result<Cells<'static, N>, String> {
+    let count = Cells::load(w, root, Alloc::global()).map_err(|e| format!("{e}"))?.items.len() as u32;
+    let mut order: Vec<u32> = (0..count).collect();
+    let mut drawn: Vec<u32> = Vec::new();
+    while !order.is_empty() {
+        drawn.push(order.remove(tape.below(order.len() as u64, "push order") as usize));
+    }
+    solved(w, root, CellPlant::None, &drawn)
+}
+
+/// Every import's outcome against the reference solver (src/tests/oracle.rs, the judge of the
+/// rules R1 to R9): the item each namespace binds and its visibility, a glob's source, or why
+/// it failed.
+fn compare(w: &World, root: ItemKey, c: &Cells<'static, N>) -> Result<[u64; 3], String> {
+    let reference = reference_imports(w, root);
+    // Imports compared: bound by name, globs, failed.
+    let mut seen = [0u64; 3];
+    for (&m, d) in w.decls.iter() {
+        for i in 0..d.uses.len() as u32 {
+            let want = reference.get(&(m, i)).copied();
+            let got = c.outcome(m, i);
+            let ok = match (got, want) {
+                (Some(Outcome::Named(a)), Some(Imp::Named(b))) => {
+                    a.iter().zip(b.iter()).all(|(x, y)| *x == y.map(|y: B| (y.def, y.vis)))
+                }
+                (Some(Outcome::Glob(a)), Some(Imp::Glob(b))) => a == b,
+                (Some(Outcome::Failed(a)), Some(Imp::Failed(b))) => same_why(a, b),
+                _ => false,
+            };
+            if !ok {
+                let u = &d.uses[i as usize];
+                let parent = w.modules[&m].parent;
+                return Err(format!(
+                    "the reference says {want:?}, the cells {got:?}: import {i} ({:?} {:?} {:?}) of {m:x} (parent {parent:?})",
+                    u.path.kind, u.path.segments, u.leaf
+                ));
+            }
+            seen[match got {
+                Some(Outcome::Named(_)) => 0,
+                Some(Outcome::Glob(_)) => 1,
+                _ => 2,
+            }] += 1;
+        }
+    }
+    Ok(seen)
+}
+
+fn case(tape: &Tape) -> Result<(CellStats, [u64; 3]), Broke> {
+    case_in(tape, false)
+}
+
+fn case_in(tape: &Tape, calls: bool) -> Result<(CellStats, [u64; 3]), Broke> {
+    // The reference's own drawing, narrow; `calls`: with `macro_rules!`, `#[macro_use]`,
+    // `#[macro_export]` and calls, some writing a module (stage 2).
+    let (w, root) = reference_world(tape, false, calls);
+    let first = solved(&w, root, CellPlant::None, &[]).map_err(Broke::Oracle)?;
+    let second = shuffled(&w, root, tape).map_err(Broke::Oracle)?;
+    // The determinism proof: the same outcomes and the same counters in another push order.
+    if first.stats != second.stats {
+        return Err(Broke::Oracle(format!("counters differ by push order: {:?} then {:?}", first.stats, second.stats)));
+    }
+    for (&m, d) in w.decls.iter() {
+        for i in 0..d.uses.len() as u32 {
+            if first.outcome(m, i) != second.outcome(m, i) {
+                return Err(Broke::Oracle(format!("import {i} of {m:x} differs by push order")));
+            }
+        }
+    }
+    let stats = first.stats;
+    let seen = compare(&w, root, &first).map_err(|e| Broke::Oracle(format!("differs from the reference: {e}")))?;
+    Ok((stats, seen))
+}
+
+const CASES: u32 = 2000;
+
+#[test]
+fn the_cells_equal_the_reference_without_macros() {
+    let mut seen = [0u64; 3];
+    blaze_sim::check(Config::cases(CASES), |tape| {
+        let (_, s) = case(tape)?;
+        for k in 0..3 {
+            seen[k] += s[k];
+        }
+        Ok::<(), Broke>(())
+    });
+    std::println!("cells vs reference: {CASES} cases, imports equal: {} named, {} globs, {} failed", seen[0], seen[1], seen[2]);
+    assert!(seen.iter().all(|&n| n > 0), "every kind of outcome was compared: {seen:?}");
+}
+
+#[test]
+fn the_cells_equal_the_reference_with_calls() {
+    let mut seen = [0u64; 3];
+    let mut expansions = 0;
+    blaze_sim::check(Config::cases(CASES), |tape| {
+        let (st, s) = case_in(tape, true)?;
+        expansions += st.expansions;
+        for k in 0..3 {
+            seen[k] += s[k];
+        }
+        Ok::<(), Broke>(())
+    });
+    std::println!(
+        "cells vs reference with calls: {CASES} cases, {expansions} expansions, imports equal: {} named, {} globs, {} failed",
+        seen[0],
+        seen[1],
+        seen[2]
+    );
+    assert!(seen.iter().all(|&n| n > 0) && expansions > 0, "every kind of outcome was compared: {seen:?}");
+}
+
+/// The counters on the largest drawn crate (by imports), printed for the report.
+#[test]
+fn the_counters_on_the_largest_case() {
+    let mut largest: Option<CellStats> = None;
+    blaze_sim::check(Config::cases(CASES), |tape| {
+        let (s, _) = case(tape)?;
+        if largest.is_none_or(|l| (s.items, s.cells) > (l.items, l.cells)) {
+            largest = Some(s);
+        }
+        Ok::<(), Broke>(())
+    });
+    let s = largest.expect("a case ran");
+    std::println!(
+        "cells largest case: modules {} names declared {} imports {} cells {} decisions {} waiters {} wakes {} evaluations {} (mean {:.2}, max {}) quiet points {} cycle passes {} cycle cells {} largest cycle {} stalls {} stalled items {}",
+        s.modules,
+        s.names_declared,
+        s.items,
+        s.cells,
+        s.decisions,
+        s.waiters,
+        s.wakes,
+        s.evaluations,
+        s.evaluations as f64 / s.items.max(1) as f64,
+        s.max_evaluations,
+        s.quiet_points,
+        s.cycle_passes,
+        s.cycle_cells,
+        s.largest_cycle,
+        s.stalls,
+        s.stalled_items
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// The outer scopes (R6-R8): a plain first segment the module misses goes outward.
+
+/// A crate whose standard prelude is its own module `prelude` (core's `#[prelude_import]`),
+/// holding `pub mod pm { pub struct y; }`; a child `c` with `use pm::y;` and, after it, a call
+/// of `mk!`. Returns (world, root, c, the call, the prelude's `y`).
+fn prelude_world() -> (World, ItemKey, ItemKey, ItemKey, ItemKey) {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let prelude = w.module(root, "prelude", V::Pub);
+    let pm = w.module(prelude, "pm", V::Pub);
+    let y = w.item(pm, "y", Namespace::Types, crate::DefKind::Other, V::Pub);
+    w.cr(root).head.prelude = Some(prelude);
+    w.rules(root, "mk");
+    let c = w.module(root, "c", V::Pub);
+    w.use_(c, "pm::y", V::Priv);
+    let call = w.call(c, "mk", crate::CallShape::FnLike);
+    (w, root, c, call, y)
+}
+
+/// R6: `use pm::y;` misses in `c`, which grows by expansion alone: it takes the prelude's `pm`
+/// at once and leaves a watch; the call then writes `mod pm` into `c` (an expansion that does
+/// not enclose the import): the R6 error, at that definition. Controls: a core whose growth
+/// holds the lookup answers through the new `pm` instead; one without the watch reports nothing.
+#[test]
+fn r6_a_miss_goes_outward_and_a_later_definition_is_the_error() {
+    let (mut w, root, c, call, y) = prelude_world();
+    // The definition comes from a call the first call's expansion writes: it is evaluated after
+    // the import (a call of `c`'s text expands before `c`'s imports are first tried, and the
+    // import then meets the definition inside: the error in the other order).
+    let nested = w.call(call, "mk", crate::CallShape::FnLike);
+    let inner = w.module(nested, "pm", V::Pub);
+    w.item(inner, "y", Namespace::Types, crate::DefKind::Other, V::Pub);
+    let ok = cells_of(&w, root, CellPlant::None);
+    let got = outcome(&ok, c, 0);
+    assert_eq!(named_def(got, Namespace::Types), Some(y), "{got:?}");
+    assert_eq!((ok.r6.len(), ok.stats.r6_errors), (1, 1), "the error at the expansion's `mod pm`");
+    let waits = cells_of(&w, root, CellPlant::OutwardWaits);
+    assert_ne!(named_def(outcome(&waits, c, 0), Namespace::Types), Some(y), "the control: growth held the lookup");
+    let blind = cells_of(&w, root, CellPlant::NoWatch);
+    assert_eq!(blind.stats.r6_errors, 0, "the control: no watch, no error");
+}
+
+/// R6, D56: the same program with the expansion writing nothing named `pm`: outward, no error.
+/// And D57: an expansion writing the outer definition itself (`pub use` is not drawn here: the
+/// prelude's own `pm` module key) is no other candidate.
+#[test]
+fn r6_no_definition_no_error() {
+    let (w, root, c, _, y) = prelude_world();
+    let ok = cells_of(&w, root, CellPlant::None);
+    assert_eq!(named_def(outcome(&ok, c, 0), Namespace::Types), Some(y));
+    assert_eq!(ok.stats.r6_errors, 0);
+    assert!(ok.stats.outward >= 1);
+}
+
+/// R7: a glob of `c` brings a DIFFERENT `pm` beside the prelude's: the import fails as
+/// ambiguous at its first segment. D57: a glob bringing the prelude's own `pm` is one candidate.
+/// Control: a core where the glob beats the outer candidate resolves through it.
+#[test]
+fn r7_a_glob_beside_a_different_outer_candidate_is_ambiguous() {
+    let (mut w, root, c, _, y) = prelude_world();
+    let g = w.module(root, "g", V::Pub);
+    let other = w.module(g, "pm", V::Pub);
+    w.item(other, "y", Namespace::Types, crate::DefKind::Other, V::Pub);
+    w.glob(c, "crate::g", V::Priv);
+    let ok = cells_of(&w, root, CellPlant::None);
+    assert!(matches!(outcome(&ok, c, 0), Outcome::Failed(Unresolved::Ambiguous(_))), "{:?}", outcome(&ok, c, 0));
+    let bad = cells_of(&w, root, CellPlant::GlobBeatsOuter);
+    assert!(!matches!(outcome(&bad, c, 0), Outcome::Failed(Unresolved::Ambiguous(_))), "the control");
+    // D57: the glob's source re-exports the prelude's own `pm`.
+    let (mut w, root, c, _, _) = prelude_world();
+    let g = w.module(root, "g", V::Pub);
+    w.use_(g, "crate::prelude::pm", V::Pub);
+    w.glob(c, "crate::g", V::Priv);
+    let ok = cells_of(&w, root, CellPlant::None);
+    assert_eq!(named_def(outcome(&ok, c, 0), Namespace::Types), Some(y), "{:?}", outcome(&ok, c, 0));
+}
+
+/// R8: a dependency's extern-prelude name is an outer candidate; a module of the crate of that
+/// name shadows it (the module is the inner scope). Through the dependency the next segment is
+/// in a crate this core does not see: the import is unknown (`Outside`), never not found; and an
+/// import of a name such an import brings is unknown too (the last runner's fix (2)). Control:
+/// a core taking the Outside binding as absent fails the second import as not found.
+#[test]
+fn r8_extern_prelude_and_an_outside_binding_is_unknown() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let dep = w.root(2, Edition::E2021);
+    w.item(dep, "x", Namespace::Types, crate::DefKind::Other, V::Pub);
+    w.dep(root, "e", dep);
+    w.use_(root, "e::x", V::Pub);
+    let b = w.module(root, "b", V::Pub);
+    w.use_(b, "crate::x", V::Priv);
+    w.use_(b, "e", V::Priv);
+    let ok = cells_of(&w, root, CellPlant::None);
+    assert_eq!(outcome(&ok, root, 0), Outcome::Outside);
+    assert_eq!(outcome(&ok, b, 0), Outcome::Outside, "a name an Outside import brings is unknown");
+    assert_eq!(named_def(outcome(&ok, b, 1), Namespace::Types), Some(dep), "`use e;` binds the dependency's root");
+    let bad = cells_of(&w, root, CellPlant::OutsideIsNotFound);
+    assert!(matches!(outcome(&bad, b, 0), Outcome::Failed(Unresolved::NotFound)), "the control: {:?}", outcome(&bad, b, 0));
+    // A module of the name shadows the extern prelude.
+    let e = w.module(root, "e", V::Pub);
+    w.item(e, "x", Namespace::Types, crate::DefKind::Other, V::Pub);
+    let ok = cells_of(&w, root, CellPlant::None);
+    assert!(matches!(outcome(&ok, root, 0), Outcome::Named(_)), "{:?}", outcome(&ok, root, 0));
+}
+
+/// The last runner's fix (1): a stalled call whose guess is `Outside` (the `#[macro_use]`
+/// prelude of another crate may hold its name) is decided Outside first, alone, never failed by
+/// the stall. The sink: call `mx!` in `m` waits on `m`'s glob `self::k::*`, whose `k` waits on
+/// `m`'s growth: the call. Control: a stall that fails it.
+#[test]
+fn a_stalled_outside_call_is_marked_before_the_stall() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let other = w.root(5, Edition::E2021);
+    w.cr(root).macro_use.push(other);
+    let m = w.module(root, "m", V::Pub);
+    w.glob(m, "self::k", V::Priv);
+    let call = w.call(m, "mx", crate::CallShape::FnLike);
+    let ok = cells_of(&w, root, CellPlant::None);
+    assert_eq!(ok.call_outcome(call), Some(Outcome::Outside));
+    let bad = cells_of(&w, root, CellPlant::StallFailsOutside);
+    assert_ne!(bad.call_outcome(call), Some(Outcome::Outside), "the control");
+}
+
+/// R5 (2026-11-16) for a call: in a stalled member the undecided inner scope is absent, so a
+/// one-segment call goes outward and resolves to the standard prelude's macro: core's
+/// `core_arch` `#[derive(Clone)]` in a module whose glob waits on that module's own calls. The
+/// sink: `Cl!` in `m` waits on `m`'s glob `self::k::*`, whose `k` waits on `m`'s growth: the
+/// call. Control: a stall that fails the call.
+#[test]
+fn a_stalled_call_an_outer_scope_provides_resolves() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let prelude = w.module(root, "prelude", V::Pub);
+    let cl = w.item(prelude, "Cl", Namespace::Macros, crate::DefKind::Macro(crate::MacroShapes::DERIVE), V::Pub);
+    w.cr(root).head.prelude = Some(prelude);
+    let m = w.module(root, "m", V::Pub);
+    w.glob(m, "self::k", V::Priv);
+    let call = w.call(m, "Cl", crate::CallShape::FnLike);
+    let ok = cells_of(&w, root, CellPlant::None);
+    assert!(matches!(ok.call_outcome(call), Some(Outcome::Called(d)) if d.key == cl), "{:?}", ok.call_outcome(call));
+    assert!(matches!(outcome(&ok, m, 0), Outcome::Failed(Unresolved::NotFound)), "{:?}", outcome(&ok, m, 0));
+    let bad = cells_of(&w, root, CellPlant::StallFailsOuterCall);
+    assert!(!matches!(bad.call_outcome(call), Some(Outcome::Called(_))), "the control: {:?}", bad.call_outcome(call));
+}
+
+/// A glob of an enum (core::cmp's `use self::Ordering::*;`) brings variants, which this core
+/// does not read: unknown in types and values, but never a macro, so the module's
+/// `#[derive(PartialEq)]` still goes outward to the prelude's. Control: a core taking the enum
+/// glob as unknown in every namespace leaves the call `Outside`.
+#[test]
+fn an_enum_glob_brings_no_macro() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let prelude = w.module(root, "prelude", V::Pub);
+    let cl = w.item(prelude, "Cl", Namespace::Macros, crate::DefKind::Macro(crate::MacroShapes::DERIVE), V::Pub);
+    w.cr(root).head.prelude = Some(prelude);
+    let m = w.module(root, "m", V::Pub);
+    w.item(m, "E", Namespace::Types, crate::DefKind::Enum, V::Pub);
+    w.glob(m, "self::E", V::Priv);
+    let call = w.call(m, "Cl", crate::CallShape::FnLike);
+    let ok = cells_of(&w, root, CellPlant::None);
+    assert_eq!(outcome(&ok, m, 0), Outcome::Outside, "the enum glob itself stays unknown");
+    assert!(matches!(ok.call_outcome(call), Some(Outcome::Called(d)) if d.key == cl), "{:?}", ok.call_outcome(call));
+    let bad = cells_of(&w, root, CellPlant::EnumHidesMacros);
+    assert_eq!(bad.call_outcome(call), Some(Outcome::Outside), "the control");
+}
+
+/// The language prelude after a local standard prelude: core's `core::primitive` has
+/// `pub use bool;`, a built-in type by its one-segment name (Reference, "Use declarations",
+/// "Preludes"). Control: a core that stops at the standard prelude fails it as not found.
+#[test]
+fn a_use_of_a_builtin_type_after_a_local_prelude() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let prelude = w.module(root, "prelude", V::Pub);
+    w.cr(root).head.prelude = Some(prelude);
+    let primitive = w.module(root, "primitive", V::Pub);
+    w.use_(primitive, "bool", V::Pub);
+    let want = crate::builtin_type("bool").map(|d| d.key);
+    let ok = cells_of(&w, root, CellPlant::None);
+    assert_eq!(named_def(outcome(&ok, primitive, 0), Namespace::Types), want, "{:?}", outcome(&ok, primitive, 0));
+    let bad = cells_of(&w, root, CellPlant::NoLanguagePrelude);
+    assert!(matches!(outcome(&bad, primitive, 0), Outcome::Failed(Unresolved::NotFound)), "the control: {:?}", outcome(&bad, primitive, 0));
+}
+
+/// Every import's outcome against the reference on the WIDE distribution (an extern prelude, a
+/// foreign standard prelude, plain first segments): `Outside` answers (a crate this core does
+/// not see) and imports with an R6 error (the program is an error; the reference keeps its own
+/// order's answer) are counted apart, the rest must be equal.
+fn compare_wide(w: &World, root: ItemKey, c: &Cells<'static, N>) -> Result<[u64; 3], String> {
+    let reference = reference_imports(w, root);
+    // equal, outside, R6 errors
+    let mut seen = [0u64; 3];
+    for (&m, d) in w.decls.iter() {
+        for i in 0..d.uses.len() as u32 {
+            let got = c.outcome(m, i);
+            if got == Some(Outcome::Outside) {
+                seen[1] += 1;
+                continue;
+            }
+            if c.import_has_r6(m, i) {
+                seen[2] += 1;
+                continue;
+            }
+            let want = reference.get(&(m, i)).copied();
+            let ok = match (got, want) {
+                (Some(Outcome::Named(a)), Some(Imp::Named(b))) => a.iter().zip(b.iter()).all(|(x, y)| *x == y.map(|y: B| (y.def, y.vis))),
+                (Some(Outcome::Glob(a)), Some(Imp::Glob(b))) => a == b,
+                (Some(Outcome::Failed(a)), Some(Imp::Failed(b))) => same_why(a, b),
+                _ => false,
+            };
+            if !ok {
+                let u = &d.uses[i as usize];
+                return Err(format!("the reference says {want:?}, the cells {got:?}: import {i} ({:?} {:?} {:?}) of {m:x}", u.path.kind, u.path.segments, u.leaf));
+            }
+            seen[0] += 1;
+        }
+    }
+    Ok(seen)
+}
+
+fn case_wide(tape: &Tape, calls: bool) -> Result<[u64; 3], Broke> {
+    let (w, root) = reference_world(tape, true, calls);
+    let first = solved(&w, root, CellPlant::None, &[]).map_err(Broke::Oracle)?;
+    let second = shuffled(&w, root, tape).map_err(Broke::Oracle)?;
+    if first.stats != second.stats {
+        return Err(Broke::Oracle(format!("counters differ by push order: {:?} then {:?}", first.stats, second.stats)));
+    }
+    compare_wide(&w, root, &first).map_err(|e| Broke::Oracle(format!("differs from the reference: {e}\nthe program:\n{}", program(&w))))
+}
+
+/// The drawn program, for a failing case: each module and expansion with its declarations.
+fn program(w: &World) -> String {
+    let mut out = String::new();
+    for (k, info) in w.modules.iter() {
+        out.push_str(&format!("module {k:x}: {info:?}\n"));
+    }
+    for (k, root) in w.roots.iter() {
+        out.push_str(&format!("crate {k:?}: {root:?}\n"));
+    }
+    for (k, d) in w.decls.iter() {
+        out.push_str(&format!("text of {k:x}: {d:?}\n"));
+    }
+    out
+}
+
+fn wide(calls: bool) {
+    let mut seen = [0u64; 3];
+    blaze_sim::check(Config::cases(CASES), |tape| {
+        let s = case_wide(tape, calls)?;
+        for k in 0..3 {
+            seen[k] += s[k];
+        }
+        Ok::<(), Broke>(())
+    });
+    std::println!("cells vs reference, wide, calls {calls}: {CASES} cases, imports equal {}, outside {}, R6 errors {}", seen[0], seen[1], seen[2]);
+    assert!(seen[0] > 0, "imports were compared: {seen:?}");
+}
+
+#[test]
+fn the_cells_equal_the_reference_wide() {
+    wide(false);
+}
+
+#[test]
+fn the_cells_equal_the_reference_wide_with_calls() {
+    wide(true);
+}

@@ -17,12 +17,62 @@
 //! | [`Show`] | a type's human form, in place of `Display` for blaze's own types; [`Fixed`], [`Hex`], [`Nanos`], [`Bytes`], [`Quoted`] make a writer's form a value, for columns |
 //! | [`Parse<'a>`] | a value and the rest of the text, the value free to borrow from it; combinators in [`parse`] |
 //! | [`adapt`] | the one module that names `core::fmt`: [`Shown`] makes a `Show` a `Display`; [`PutDisplay::put_display`] writes a foreign `Display` through `fmt`, named so its cost shows |
+//! | [`Writes::debug`], [`Dbg`], [`DebugForm`] | `{:?}` for any type, read by compile-time reflection, with no derive and no bound; a type supplies its own form by `DebugForm` |
+//! | [`show_with`] | a `Show` from a writing closure, for what was `format_args!` |
+//! | [`text_in`], [`text_exact_in`] | a string in an allocator from one chain; the exact form counts first and allocates once |
+//!
+//! # Format sites, translated
+//!
+//! | was | is |
+//! |---|---|
+//! | `format!("x = {x}")` | `text_in(alloc, \|out\| out.str("x = ").int(x))` |
+//! | `format_args!("x = {x}")` | `show_with(\|out\| _ = out.str("x = ").int(x))` |
+//! | `{x}` of a float | `.float(x)`: `{}`'s form (`1`, `0.1`, `1e300` in full) |
+//! | `{x:?}` | `.debug(&x)` (`.float_debug(x)` for a float alone: `1.0`, `1e16`) |
+//! | `println!(..)` | bstd's `out.line_with(cx, \|o\| o.str(..))?` |
+//!
+//! # An error type: `impl Show`, and `Shown` at the border
+//!
+//! An error's text is a [`Show`] impl: a chain into the caller's sink, no `fmt::Formatter`, no
+//! `write!`. A foreign API that wants `Display` (`core::error::Error`, `{}` in code not yet
+//! moved) gets one through [`Shown`], one line that writes nothing of its own. Its `Debug`
+//! (for `unwrap` and `assert_eq!`) is the derived one, or a [`DebugForm`] bridged the same
+//! way. blaze-toml's `Error`, before:
+//!
+//! ```text
+//! impl fmt::Display for Error {
+//!     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+//!         write!(f, "{} at byte {}", self.what, self.at)
+//!     }
+//! }
+//! ```
+//!
+//! and after:
+//!
+//! ```text
+//! impl Show for Error {
+//!     fn show<P: Put + ?Sized>(&self, out: &mut P) {
+//!         out.show(&self.what).str(" at byte ").int(self.at);
+//!     }
+//! }
+//!
+//! /// The bridge `core::error::Error` needs: the text is `Show`'s.
+//! impl fmt::Display for Error {
+//!     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+//!         fmt::Display::fmt(&Shown(self), f)
+//!     }
+//! }
+//! ```
+//!
+//! A message for a person that needs more than the error (`line L, column C: what`) is a
+//! method returning `Shown<impl Show>`: `{}` users and chains both take it.
 //!
 //! # Output is deterministic
 //!
 //! Every writer gives the same bytes for the same value on every machine (rule 25): no
-//! locale, no hash order, no platform float formatting. Integers, hex, binary, `{:?}`-form
-//! floats and fixed-place floats are byte-equal to `core::fmt`'s, which the tests hold.
+//! locale, no hash order, no platform float formatting. Integers, hex, binary, floats in both
+//! `{}` and `{:?}` form, fixed-place floats and the debug form of derived-`Debug` types are
+//! byte-equal to `core::fmt`'s, which the tests hold.
 //!
 //! # The floor
 //!
@@ -96,6 +146,8 @@ extern crate std;
 pub mod adapt;
 mod ascii;
 mod big;
+// `debug_variants!` in textual scope for the modules below (the tests use it).
+#[macro_use]
 mod debug;
 pub mod escape;
 pub mod float;

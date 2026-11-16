@@ -1,6 +1,6 @@
 [package]
 name = "blaze-git-fetch"
-description = "One commit of a git repository fetched over smart HTTP protocol v2 (ls-refs, fetch with deepen), its packfile read with offset and reference deltas under bounds, object ids by SHA-1 (git's names, never trust), and the commit's files handed out with every name checked"
+description = "One commit of a git repository over smart HTTP protocol v2 (its requests and answers as bytes), its packfile indexed in place and read one object at a time with offset and reference deltas under bounds and a byte-bounded base cache, object ids by SHA-1 (git's names, never trust), and the commit's files handed out with every name checked"
 publish = false
 
 version.workspace = true
@@ -14,14 +14,11 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
-# The pack's arena, the request bodies and the walk's stack, in the caller's allocator.
+# The index's rows and buffers, the request bodies and the walk's stack, in the caller's
+# allocator.
 blaze-own.workspace = true
 # Each pack entry is a zlib stream.
 blaze-deflate.workspace = true
-# The HTTP client the protocol rides on.
-blaze-h1-net.workspace = true
-# `Cx` and the checked `Url`.
-blaze-std.workspace = true
 
 [dev-dependencies]
 # Property tests and planted-bug controls.

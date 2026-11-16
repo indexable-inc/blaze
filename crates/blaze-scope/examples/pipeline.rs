@@ -37,18 +37,18 @@ use blaze_file_items::{Outline, outline, syntax_kind};
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_own::{AVec, Alloc};
 use blaze_scope::{
-    Answer, ExpandRequest, FillStats, Group, NameAnswer, Read, RecordFacts, Reply, ResolveError, Resolved,
-    Resolver, ScopeFacts, Step,
+    Answer, ExpandRequest, FillStats, Group, NameAnswer, Node, Passed, Read, RecordFacts, Reply, ResolveError,
+    Resolved, Resolver, ScopeFacts, Sources, Step, Touched, through,
 };
 use blaze_surface::testing::{Fact, MemSurface};
 use blaze_surface::{
     AttrKind, BindingState, BuiltinAttr, BuiltinDerive, BuiltinFn, CallShape, ChildModDecl,
-    CrateRootBuilder, CrateRootHead, DeclaredItem, DeclsBuilder, Def, DefKind, Edition,
-    ExportEntry, ExternCrateDecl, ExternTarget, FloatWidth, ImplFlags, ImplRow, IntWidth, Item,
-    ItemDetail, ItemIndex, LangName, MacroCallDecl, MacroRulesDecl, ModuleInfo, Mutability,
+    Binding, CrateRootBuilder, CrateRootHead, DeclaredItem, DeclsBuilder, Def, DefKind, Edition,
+    ExternCrateDecl, ExternTarget, FloatWidth, GlobEdge, ImplFlags, ImplRow, IntWidth, Item,
+    ItemDetail, ItemIndex, LangName, MacroCallDecl, MacroRulesDecl, MacroShapes, ModuleInfo, Mutability,
     Namespace, Path, PathKind, Rename, ScopeError, SelfShape, Shape, SurfaceError, TextualDef,
-    UintWidth, UseDecl, UseForm, Visibility, VisibilityClass, WrittenVis, build_impl_index,
-    build_lang_items, exports_digest,
+    UintWidth, UseDecl, UseForm, Visibility, WrittenVis, build_impl_index, build_lang_items,
+    globs_digest, textual_digest,
 };
 
 /// Every name is a slice of a text leaked for the run: a source file or an expansion.
@@ -122,7 +122,13 @@ fn main() {
             "--show" => {
                 let _ = SHOW.set(args.next().unwrap_or_default());
             }
+            "--edit" => EDIT.store(true, Ordering::Relaxed),
             "--examples" => EXAMPLES.store(args.next().and_then(|it| it.parse().ok()).unwrap_or(3), Ordering::Relaxed),
+            "--dump" => {
+                let dir = PathBuf::from(args.next().unwrap_or_default());
+                std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+                let _ = DUMP.set(dir);
+            }
             _ => dirs.push(PathBuf::from(arg)),
         }
     }
@@ -202,6 +208,19 @@ static REPEAT: AtomicUsize = AtomicUsize::new(1);
 static EXAMPLES: AtomicUsize = AtomicUsize::new(3);
 /// A name whose bindings in every scope are printed (`--show NAME`).
 static SHOW: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+/// A directory each record written is appended to (`--dump DIR`): `<kind>.recs`, each record a
+/// little-endian `u32` length and its bytes, for blaze-columns' `squeeze` measurement.
+static DUMP: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Appends `bytes` to `DIR/<kind>.recs` when `--dump DIR` was given.
+fn dump(kind: &str, bytes: &[u8]) {
+    use std::io::Write as _;
+    let Some(dir) = DUMP.get() else { return };
+    let path = dir.join(format!("{kind}.recs"));
+    let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    let len = u32::try_from(bytes.len()).expect("a record under 4 GiB");
+    file.write_all(&len.to_le_bytes()).and_then(|()| file.write_all(bytes)).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+}
 
 fn example_cap() -> usize { EXAMPLES.load(Ordering::Relaxed) }
 
@@ -670,6 +689,8 @@ impl Cfg {
                 }
             }
             _ => {
+                attrs.arbitrary_ints |=
+                    name.split_once("::").is_some_and(|(tool, rest)| tool.trim() == "blaze" && rest.trim() == "arbitrary_ints");
                 if !is_builtin_attr(name) {
                     attrs.others.push(name);
                 }
@@ -753,6 +774,8 @@ struct Attrs {
     no_implicit_prelude: bool,
     no_std: bool,
     no_core: bool,
+    /// `#![blaze::arbitrary_ints]`.
+    arbitrary_ints: bool,
     tools: Vec<&'static str>,
     /// Attribute names that are neither built in nor a tool's: attribute macros, not lowered.
     others: Vec<&'static str>,
@@ -775,6 +798,7 @@ impl Attrs {
             no_implicit_prelude: false,
             no_std: false,
             no_core: false,
+            arbitrary_ints: false,
             tools: Vec::new(),
             others: Vec::new(),
         }
@@ -1671,7 +1695,8 @@ impl<'a> Lower<'a> {
                 };
                 let pos = self.next_pos();
                 let export = exported || attrs.macro_export;
-                self.out.decls.macro_rules.push(MacroRulesDecl { name, def: key, pos, export });
+                let shapes = if attrs.builtin { MacroShapes::FN_LIKE } else { blaze_scope::task::rules_shapes(body, self.k.edition, g()) };
+                self.out.decls.macro_rules.push(MacroRulesDecl { name, def: key, pos, export, shapes });
                 let body = if attrs.builtin { MacroBody::BuiltinFn(attrs.builtin_name.unwrap_or(name)) } else { MacroBody::Rules(body) };
                 let src = MacroSrc { name, body, module: self.module, export, local_inner: attrs.local_inner };
                 self.out.macros.push((key, src));
@@ -1685,11 +1710,11 @@ impl<'a> Lower<'a> {
                 let (shape, body) = if attrs.builtin {
                     let which = attrs.builtin_name.unwrap_or(name);
                     if BuiltinDerive::ALL.into_iter().any(|it| it.name() == which) {
-                        (CallShape::Derive, MacroBody::BuiltinOther(CallShape::Derive))
+                        (MacroShapes::DERIVE, MacroBody::BuiltinOther(CallShape::Derive))
                     } else if BuiltinAttr::ALL.into_iter().any(|it| it.name() == which) {
-                        (CallShape::Attr, MacroBody::BuiltinOther(CallShape::Attr))
+                        (MacroShapes::ATTR, MacroBody::BuiltinOther(CallShape::Attr))
                     } else {
-                        (CallShape::FnLike, MacroBody::BuiltinFn(which))
+                        (MacroShapes::FN_LIKE, MacroBody::BuiltinFn(which))
                     }
                 } else {
                     let params = item.name.map(|r| {
@@ -1697,7 +1722,12 @@ impl<'a> Lower<'a> {
                         item.text(text, between).trim()
                     });
                     let params = params.filter(|it| it.starts_with('(')).map(inside);
-                    (CallShape::FnLike, MacroBody::Macro2 { params, body: inside(item.text(text, body_range)) })
+                    let body = inside(item.text(text, body_range));
+                    let shapes = match params {
+                        Some(_) => MacroShapes::FN_LIKE,
+                        None => blaze_scope::task::rules_shapes(body, self.k.edition, g()),
+                    };
+                    (shapes, MacroBody::Macro2 { params, body })
                 };
                 self.declare(name, Namespace::Macros, key, DefKind::Macro(shape), vis);
                 let src = MacroSrc { name, body, module: self.module, export: false, local_inner: false };
@@ -1792,7 +1822,7 @@ struct Lowering {
     impls: Vec<ImplSrc>,
     langs: Vec<LangSrc>,
     prelude: Option<(bool, Vec<N>, Loc)>,
-    macro_exports: Vec<(N, ItemKey, Loc)>,
+    macro_exports: Vec<(N, ItemKey, MacroShapes, Loc)>,
     entries: usize,
     items_in: usize,
     fails: Failures,
@@ -1828,7 +1858,7 @@ fn lower_modules(k: &Krate, tree: &Tree, threads: usize) -> Lowering {
         for rules in part.decls.macro_rules.iter() {
             if rules.export {
                 let loc = part.macros.iter().find(|(def, _)| *def == rules.def).map_or(Loc { file: 0, offset: 0 }, |_| Loc { file: tree.modules[i].file as u32, offset: 0 });
-                out.macro_exports.push((rules.name, rules.def, loc));
+                out.macro_exports.push((rules.name, rules.def, rules.shapes, loc));
             }
         }
         out.use_locs.insert(key, part.use_locs);
@@ -1860,7 +1890,8 @@ fn module_info(k: &Krate, tree: &Tree, m: &Module) -> ModuleInfo<N> {
 // ---------------------------------------------------------------------------------------------
 // Stage 3: the crate root.
 
-const TOOLS: &[&str] = &["clippy", "diagnostic", "miri", "rust_analyzer", "rustdoc", "rustfmt"];
+/// The tool namespaces, `blaze` among them: one table, blaze-surface's.
+const TOOLS: &[&str] = &blaze_surface::tool_attrs::TOOLS;
 
 fn crate_root(k: &Krate, tree: &Tree, low: &Lowering, fails: &mut Failures) -> CrateRootBuilder<'static, N> {
     let attrs = k.file_attrs(k.root);
@@ -1905,6 +1936,9 @@ fn crate_root(k: &Krate, tree: &Tree, low: &Lowering, fails: &mut Failures) -> C
         edition: k.edition,
         no_std: attrs.no_std,
         no_core: attrs.no_core,
+        // The example's attribute reader does not read `#![blaze::arbitrary_ints]`; no crate
+        // it is run on (tempo's graph) writes it.
+        arbitrary_ints: false,
         prelude,
     };
     let mut cr = CrateRootBuilder::new_in(head, g());
@@ -1920,11 +1954,11 @@ fn crate_root(k: &Krate, tree: &Tree, low: &Lowering, fails: &mut Failures) -> C
     externs.sort();
     externs.dedup_by_key(|it| it.0);
     cr.extern_prelude.extend_from_slice(&externs);
-    let mut exports: Vec<(N, ItemKey)> = Vec::new();
+    let mut exports: Vec<(N, ItemKey, MacroShapes)> = Vec::new();
     let mut seen: HashSet<N> = HashSet::new();
-    for (name, def, _) in &low.macro_exports {
+    for (name, def, shapes, _) in &low.macro_exports {
         if seen.insert(name) {
-            exports.push((name, *def));
+            exports.push((name, *def, *shapes));
         } else {
             fails.add("#[macro_export] name exported twice (first kept)", || name.to_string());
         }
@@ -1954,6 +1988,8 @@ struct Base<'k> {
     decls: OnGlobal<HashMap<ItemKey, (ModuleInfo<N>, DeclsBuilder<'static, N>)>>,
     root: OnGlobal<CrateRootBuilder<'static, N>>,
     parent: HashMap<ItemKey, Option<ItemKey>>,
+    /// Each module's chain of modules up to the crate's root, itself first.
+    chains: HashMap<ItemKey, Vec<ItemKey>>,
 }
 
 /// What one run of stage 4 adds: the expansions and what they declare.
@@ -2129,7 +2165,17 @@ fn shape_name(shape: CallShape) -> &'static str {
 }
 
 /// Expands one call the resolver asked for and files its declarations (empty when it cannot).
+/// Time spent expanding calls and in the solver's steps, summed over every thread and run.
+static EXPAND_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SOLVE_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn expand_call(base: &Base<'_>, run: &Run, request: ExpandRequest) {
+    let start = Instant::now();
+    expand_call_untimed(base, run, request);
+    EXPAND_NS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+}
+
+fn expand_call_untimed(base: &Base<'_>, run: &Run, request: ExpandRequest) {
     let decls = expand_decls(base, run, request).unwrap_or_else(|| DeclsBuilder::new_in(g()));
     run.expansions.lock().expect("the expansions' lock").insert(request.call, decls);
 }
@@ -2176,7 +2222,7 @@ fn expand_decls(base: &Base<'_>, run: &Run, request: ExpandRequest) -> Option<De
             };
             MacroDefinition::macro2(params, lexed(body, "macro body")?, def_at)
         }
-        MacroBody::BuiltinFn(name) => match BuiltinFn::ALL.into_iter().find(|it| it.name() == name) {
+        MacroBody::BuiltinFn(name) => match BuiltinFn::of_library(name) {
             Some(which) => MacroDefinition::builtin_fn(which, def_at, g()),
             None => {
                 run.fail(format!("builtin macro blaze-expand has no form of: {name}"), || at.clone());
@@ -2239,20 +2285,20 @@ fn expand_decls(base: &Base<'_>, run: &Run, request: ExpandRequest) -> Option<De
 /// An answer as the driver holds it.
 enum Own {
     Name(NameAnswer),
-    Exports(Vec<ExportEntry<N>>, ContentId),
+    Globs { edges: Vec<GlobEdge>, krate: CrateItemKey, chain: Vec<ItemKey>, digest: ContentId },
     Textual(Vec<TextualDef<N>>, ContentId),
     Helpers(ContentId),
-    InProgress,
+    InProgress(ItemKey),
 }
 
 impl Own {
     fn answer(&self) -> Answer<'_, N> {
         match self {
             Own::Name(a) => Answer::Name(*a),
-            Own::Exports(entries, digest) => Answer::Exports { entries, digest: *digest },
+            Own::Globs { edges, krate, chain, digest } => Answer::Globs { edges, krate: *krate, chain, digest: *digest },
             Own::Textual(defs, digest) => Answer::Textual { defs, digest: *digest },
             Own::Helpers(digest) => Answer::Helpers { names: &[], digest: *digest },
-            Own::InProgress => Answer::InProgress,
+            Own::InProgress(module) => Answer::InProgress { module: *module },
         }
     }
 }
@@ -2292,7 +2338,8 @@ impl DriveCx<'_> {
             return Ok(Vec::new());
         }
         let Some(p) = self.done.get(&parent) else { return Err(parent) };
-        let mut out = self.entry(parent)?;
+        // One level: the parent's own definitions before the `mod` line; the resolver walks up.
+        let mut out = Vec::new();
         let len = p.scope.mark(module).unwrap_or(0) as usize;
         out.extend_from_slice(&p.scope.textual[..len.min(p.scope.textual.len())]);
         Ok(out)
@@ -2306,57 +2353,39 @@ impl DriveCx<'_> {
         }
         if let Read::TextualEntry { module } = read {
             let defs = self.entry(module)?;
-            let digest = digest_of(3, &defs);
+            let digest = textual_digest(&defs, g());
             return Ok(Own::Textual(defs, digest));
         }
         if let Some(done) = self.done.get(&owner) {
             let scope = &done.scope;
             return Ok(match read {
                 Read::Name { ns, name, .. } => Own::Name(NameAnswer::from(scope.get(ns, name).copied())),
-                Read::Exports { class, .. } => {
-                    let entries: Vec<ExportEntry<N>> = scope.exports(class).collect();
-                    let digest = exports_digest(entries.iter().copied(), g());
-                    Own::Exports(entries, digest)
-                }
+                Read::Globs { module } => self.globs(module, scope.globs.to_vec()),
                 Read::TextualOut { .. } => {
                     let defs = scope.textual.to_vec();
-                    let digest = digest_of(2, &defs);
+                    let digest = textual_digest(&defs, g());
                     Own::Textual(defs, digest)
                 }
                 Read::TextualEntry { .. } | Read::DeriveHelpers { .. } => unreachable!("answered above"),
             });
         }
         if let Some(variants) = self.variants(owner) {
-            let entry = |v: &Variant, ns: Namespace| ExportEntry {
-                ns,
-                name: v.name,
-                def: Def { key: v.key, kind: DefKind::Other },
-                vis: Visibility::Public,
-                state: BindingState::Determined,
-            };
             return Ok(match read {
                 Read::Name { ns, name, .. } => {
                     let hit = variants.iter().find(|v| v.name == name && (ns == Namespace::Types || (ns == Namespace::Values && !v.record)));
                     Own::Name(match hit {
-                        Some(v) => NameAnswer::Found { def: Def { key: v.key, kind: DefKind::Other }, vis: Visibility::Public, state: BindingState::Determined },
+                        Some(v) => NameAnswer::Found {
+                            def: Def { key: v.key, kind: DefKind::Other },
+                            vis: Visibility::Public,
+                            state: BindingState::Determined,
+                            origin: blaze_surface::Origin::Declared,
+                        },
                         None => NameAnswer::Absent,
                     })
                 }
-                Read::Exports { class, .. } => {
-                    let mut entries = Vec::new();
-                    if class == VisibilityClass::Public {
-                        for v in &variants {
-                            entries.push(entry(v, Namespace::Types));
-                            if !v.record {
-                                entries.push(entry(v, Namespace::Values));
-                            }
-                        }
-                        entries.sort_by(|a, b| a.ns.cmp(&b.ns).then(a.name.cmp(b.name)));
-                    }
-                    let digest = exports_digest(entries.iter().copied(), g());
-                    Own::Exports(entries, digest)
-                }
-                _ => Own::Textual(Vec::new(), digest_of::<u8>(2, &[])),
+                // An enum has no glob edges: its variants are its own names.
+                Read::Globs { module } => self.globs(module, Vec::new()),
+                _ => Own::Textual(Vec::new(), textual_digest::<N>(&[], g())),
             });
         }
         if self.base.parent.contains_key(&owner) && !self.failed.contains(&owner) {
@@ -2366,9 +2395,17 @@ impl DriveCx<'_> {
         self.run.fail(why, || format!("{read:?}"));
         Ok(match read {
             Read::Name { .. } => Own::Name(NameAnswer::Absent),
-            Read::Exports { .. } => Own::Exports(Vec::new(), exports_digest(core::iter::empty::<ExportEntry<N>>(), g())),
-            _ => Own::Textual(Vec::new(), digest_of::<u8>(2, &[])),
+            Read::Globs { module } => self.globs(module, Vec::new()),
+            _ => Own::Textual(Vec::new(), textual_digest::<N>(&[], g())),
         })
+    }
+
+    /// A `Globs` answer of `module`: its edges, this crate, its chain of modules up to the root.
+    fn globs(&self, module: ItemKey, edges: Vec<GlobEdge>) -> Own {
+        let krate = self.base.k.key;
+        let chain = self.base.chains.get(&module).cloned().unwrap_or_else(|| vec![module]);
+        let digest = globs_digest(&edges, krate, &chain, g());
+        Own::Globs { edges, krate, chain, digest }
     }
 }
 
@@ -2479,7 +2516,7 @@ fn drive(slot: &mut Slot, me: usize, cx: &DriveCx<'_>) -> RoundOut {
         for read in asks {
             match cx.answer(read) {
                 Ok(own) => owned.push((read, own)),
-                Err(owner) if cx.module_slot.get(&owner) == Some(&me) => owned.push((read, Own::InProgress)),
+                Err(owner) if cx.module_slot.get(&owner) == Some(&me) => owned.push((read, Own::InProgress(owner))),
                 Err(_) => waiting.push(read),
             }
         }
@@ -2492,7 +2529,10 @@ fn drive(slot: &mut Slot, me: usize, cx: &DriveCx<'_>) -> RoundOut {
         let replies: Vec<Reply<'_, N>> = owned.iter().map(|(read, own)| Reply { read: *read, answer: own.answer() }).collect();
         let machine = slot.machine.as_mut().expect("a live slot holds its machine");
         out.steps += 1;
-        match step(machine, cx.facts, &replies) {
+        let start = Instant::now();
+        let stepped = step(machine, cx.facts, &replies);
+        SOLVE_NS.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        match stepped {
             Err(error) => {
                 for module in machine.modules() {
                     out.failed.push((module, error.to_string()));
@@ -2590,24 +2630,229 @@ struct Resolution {
     steps: usize,
     groups: usize,
     largest: Vec<ItemKey>,
+    /// Every module solved in a group of more than one (the run's, not the records').
+    grouped: HashSet<ItemKey>,
     fails: Failures,
     /// Per round: modules finished, import bindings in them, expansions made, wall ms.
     per_round: Vec<(usize, usize, usize, f64)>,
 }
 
-fn resolve(base: &Base<'_>, threads: usize) -> Resolution {
+/// The cell core on this crate (blaze-scope src/cells): its counters, its time with expansion
+/// apart, and every import's and macro path's answer against stage 4's (the old core), each
+/// difference by kind. An answer is a line: `F` failed import, `G` glob source, `N` named
+/// binding, `C` failed call.
+#[cfg(feature = "cells")]
+fn cells_against_stage4(base: &Base<'_>, res: &Resolution) {
+    use blaze_scope::CellOutcome;
+    use std::cell::Cell;
     let run = Run::default();
+    let facts = Facts { base, run: &run };
+    let expand_ns = Cell::new(0u64);
+    let expand = |call: ItemKey, def: Def| {
+        let t = Instant::now();
+        expand_call_untimed(base, &run, ExpandRequest { call, def });
+        expand_ns.set(expand_ns.get() + t.elapsed().as_nanos() as u64);
+    };
+    let plain = |why: blaze_surface::Unresolved| match why {
+        blaze_surface::Unresolved::Private => blaze_surface::Unresolved::NotFound,
+        w => w,
+    };
+    let path_text = |kind: PathKind, segs: &[N]| format!("{kind:?} {}", segs.join("::"));
+    let mut cells: BTreeMap<String, usize> = BTreeMap::new();
+    // What stage 1 does not follow (plain first segments, `::`, `$crate`, other crates): not
+    // compared; the old answers they cover are counted apart.
+    let mut outside_named: HashSet<(ItemKey, N)> = HashSet::new();
+    let mut outside_glob: HashSet<ItemKey> = HashSet::new();
+    let mut outside_paths: HashSet<(ItemKey, String)> = HashSet::new();
+    let mut outside_calls: HashSet<ItemKey> = HashSet::new();
+    let mut undecided = 0usize;
+    // A call's module and path, for the printed examples of a difference.
+    let mut call_text: HashMap<String, (ItemKey, String)> = HashMap::new();
+    let at = Instant::now();
+    let now = || at.elapsed().as_nanos() as u64;
+    let out = blaze_scope::cells_count(&facts, base.tree.modules[0].key, g(), &now, &expand, &mut |r| {
+        let m = r.module;
+        if let Some(c) = r.call {
+            call_text.insert(format!("{c:x}"), (m, path_text(r.kind, r.segments)));
+        }
+        match (r.call, r.outcome) {
+            (_, None) => undecided += 1,
+            (Some(c), Some(CellOutcome::Failed(why))) => *cells.entry(format!("C {c:x} {:?}", plain(why))).or_default() += 1,
+            (Some(c), Some(CellOutcome::Outside)) => {
+                outside_calls.insert(c);
+            }
+            (Some(_), Some(_)) => {}
+            (None, Some(CellOutcome::Outside)) => {
+                outside_paths.insert((m, path_text(r.kind, r.segments)));
+                if r.glob {
+                    outside_glob.insert(m);
+                } else if let Some(n) = r.binds {
+                    outside_named.insert((m, n));
+                }
+            }
+            (None, Some(CellOutcome::Failed(why))) => {
+                *cells.entry(format!("F {m:x} {} {:?}", path_text(r.kind, r.segments), plain(why))).or_default() += 1;
+            }
+            (None, Some(CellOutcome::Glob(src))) => {
+                cells.insert(format!("G {m:x} {src:x}"), 1);
+            }
+            (None, Some(CellOutcome::Named(per_ns))) => {
+                for (ns, b) in [Namespace::Types, Namespace::Values, Namespace::Macros].into_iter().zip(per_ns) {
+                    if let (Some((def, _)), Some(n)) = (b, r.binds) {
+                        *cells.entry(format!("N {m:x} {} {n} {:x}", ns.name(), def.key)).or_default() += 1;
+                    }
+                }
+            }
+            (None, Some(CellOutcome::Called(_))) => {}
+        }
+    });
+    let total_ms = at.elapsed().as_secs_f64() * 1e3;
+    let s = match out {
+        Ok(s) => s,
+        Err(error) => {
+            println!("  cells (with expansions): {error}");
+            return;
+        }
+    };
+    let expand_ms = expand_ns.get() as f64 / 1e6;
+    // `CELLS_REPEAT=n`: the solve again n times on the same facts, every expansion already made
+    // (the hook does nothing): the solve alone, best of n, and a long enough run to sample.
+    let repeat: usize = std::env::var("CELLS_REPEAT").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    let mut best_ns = u64::MAX;
+    for _ in 0..repeat {
+        let again = blaze_scope::cells_count(&facts, base.tree.modules[0].key, g(), &now, &|_, _| {}, &mut |_| {});
+        if let Ok(r) = again {
+            best_ns = best_ns.min(r.run_ns);
+        }
+    }
+    if repeat > 0 {
+        println!("  cells solve alone (expansions made, best of {repeat}): {:.2} ms", best_ns as f64 / 1e6);
+    }
+    println!(
+        "  cells (with expansions): load {:.2} ms, run {:.2} ms of which expansion {expand_ms:.2} ms, so solve {:.2} ms (whole call {total_ms:.2} ms); probe {:.2} ns; {:?}",
+        s.load_ns as f64 / 1e6,
+        s.run_ns as f64 / 1e6,
+        s.run_ns as f64 / 1e6 - expand_ms,
+        s.probe_centi_ns as f64 / 100.0,
+        s.stats
+    );
+    // A module with a glob stage 1 does not follow: its globs are not compared on either side.
+    let skipped: HashSet<String> = outside_glob.iter().map(|m| format!("G {m:x} ")).collect();
+    cells.retain(|k, _| !skipped.iter().any(|p| k.starts_with(p.as_str())));
+    let mut old: BTreeMap<String, usize> = BTreeMap::new();
+    let mut covered = 0usize;
+    for (&m, r) in res.done.iter() {
+        for e in r.scope.bindings.iter().filter(|e| e.binding.origin == blaze_surface::Origin::Import) {
+            if outside_named.contains(&(m, e.name)) {
+                covered += 1;
+                continue;
+            }
+            *old.entry(format!("N {m:x} {} {} {:x}", e.ns.name(), e.name, e.binding.def.key)).or_default() += 1;
+        }
+        for e in r.scope.globs.iter() {
+            if outside_glob.contains(&m) {
+                covered += 1;
+                continue;
+            }
+            old.insert(format!("G {m:x} {:x}", e.source.key), 1);
+        }
+        for error in r.scope.errors.iter() {
+            match error {
+                ScopeError::Import { path, why, .. } => {
+                    let p = path_text(path.kind, &path.segments);
+                    if outside_paths.contains(&(m, p.clone())) {
+                        covered += 1;
+                        continue;
+                    }
+                    *old.entry(format!("F {m:x} {p} {:?}", plain(*why))).or_default() += 1;
+                }
+                ScopeError::Macro { call, why, .. } => {
+                    if outside_calls.contains(call) {
+                        covered += 1;
+                        continue;
+                    }
+                    *old.entry(format!("C {call:x} {:?}", plain(*why))).or_default() += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut diff: BTreeMap<String, (usize, Vec<String>)> = BTreeMap::new();
+    let mut same = 0usize;
+    for (k, &n) in cells.iter() {
+        let o = old.get(k).copied().unwrap_or(0);
+        same += n.min(o);
+        if n > o {
+            let e = diff.entry(format!("cells only {}", &k[..1])).or_default();
+            e.0 += n - o;
+            if e.1.len() < 8 {
+                e.1.push(k.clone());
+            }
+        }
+    }
+    for (k, &o) in old.iter() {
+        let n = cells.get(k).copied().unwrap_or(0);
+        if o > n {
+            let e = diff.entry(format!("old only {}", &k[..1])).or_default();
+            e.0 += o - n;
+            if e.1.len() < 8 {
+                e.1.push(k.clone());
+            }
+        }
+    }
+    println!(
+        "  cells vs stage 4: {same} answers equal; undecided {undecided}; outside stage 1: {} imports, {} calls, {covered} old answers they cover",
+        outside_paths.len(),
+        outside_calls.len()
+    );
+    for (class, (n, examples)) in diff.iter() {
+        println!("    {class}: {n}");
+        for e in examples {
+            let k = e.split(' ').nth(1).unwrap_or("");
+            let (m, call) = match call_text.get(k) {
+                Some((m, p)) => (format!("{m:x}"), format!(" {p}!")),
+                None => (k.to_string(), String::new()),
+            };
+            let path = base.tree.modules.iter().find(|x| format!("{:x}", x.key) == m).map_or("?", |x| x.path.as_str());
+            println!("      {e}{call}   ({path})");
+        }
+    }
+    // What is left Outside, by path kind and first segment: another crate's, or a gap.
+    let mut classes: BTreeMap<String, usize> = BTreeMap::new();
+    for (_, p) in outside_paths.iter() {
+        let first = p.split("::").next().unwrap_or("");
+        *classes.entry(format!("import {first}")).or_default() += 1;
+    }
+    for c in outside_calls.iter() {
+        let p = call_text.get(&format!("{c:x}")).map_or("?", |x| x.1.as_str());
+        let first = p.split("::").next().unwrap_or("");
+        *classes.entry(format!("call {first}")).or_default() += 1;
+    }
+    let mut classes: Vec<(String, usize)> = classes.into_iter().collect();
+    classes.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    println!("    outside by first segment: {:?}", &classes[..classes.len().min(40)]);
+}
+
+fn resolve(base: &Base<'_>, threads: usize) -> Resolution {
+    let all: Vec<ItemKey> = base.tree.modules.iter().map(|m| m.key).collect();
+    resolve_some(base, threads, &all, OnGlobal(HashMap::new()), Run::default())
+}
+
+/// Resolves `modules` (in that order), every other module answered by its record in `done`;
+/// `run` holds the expansions made so far, kept (an expansion is a record by its call's key).
+fn resolve_some(base: &Base<'_>, threads: usize, modules: &[ItemKey], done: Done, run: Run) -> Resolution {
     let mut fails = Failures::default();
     let mut slots: Vec<Mutex<Slot>> = Vec::new();
     let mut module_slot: HashMap<ItemKey, usize> = HashMap::new();
-    for m in &base.tree.modules {
-        module_slot.insert(m.key, slots.len());
-        slots.push(Mutex::new(Slot { machine: None, asks: Vec::new(), state: State::Fresh(m.key) }));
+    for &m in modules {
+        module_slot.insert(m, slots.len());
+        slots.push(Mutex::new(Slot { machine: None, asks: Vec::new(), state: State::Fresh(m) }));
     }
-    let mut done: Done = OnGlobal(HashMap::new());
+    let mut done = done;
     let mut failed: HashSet<ItemKey> = HashSet::new();
     let (mut rounds, mut steps, mut groups) = (0usize, 0usize, 0usize);
     let mut largest: Vec<ItemKey> = Vec::new();
+    let mut in_groups: HashSet<ItemKey> = HashSet::new();
     let mut per_round = Vec::new();
     loop {
         let active: Vec<usize> = (0..slots.len())
@@ -2717,6 +2962,9 @@ fn resolve(base: &Base<'_>, threads: usize) -> Resolution {
                     for m in &modules {
                         module_slot.insert(*m, first);
                     }
+                    if modules.len() > 1 {
+                        in_groups.extend(modules.iter().copied());
+                    }
                     if modules.len() > largest.len() {
                         largest = modules;
                     }
@@ -2734,17 +2982,45 @@ fn resolve(base: &Base<'_>, threads: usize) -> Resolution {
             break;
         }
     }
-    Resolution { done, run, rounds, steps, groups, largest, fails, per_round }
+    Resolution { done, run, rounds, steps, groups, largest, grouped: in_groups, fails, per_round }
 }
 
 // ---------------------------------------------------------------------------------------------
 // Stage 5: impls and lang items.
 
+/// `name` in the type namespace of `m` as a reader of the finished scopes finds it: its own
+/// binding, else through its glob edges.
+fn scope_type(base: &Base<'_>, done: &Done, m: ItemKey, name: N) -> Option<Binding> {
+    struct Records<'r> {
+        krate: CrateItemKey,
+        chains: &'r HashMap<ItemKey, Vec<ItemKey>>,
+        done: &'r Done,
+        name: N,
+    }
+    impl<'r> Sources<'r> for Records<'r> {
+        type Stop = ();
+        fn node(&mut self, source: Def) -> Result<Node<'r>, ()> {
+            let Some(r) = self.done.get(&source.key) else { return Ok(Node::Value(None)) };
+            if let Some(b) = r.scope.get(Namespace::Types, self.name) {
+                return Ok(Node::Value(Some(Passed { def: b.def, vis: b.vis, state: b.state })));
+            }
+            let Some(chain) = self.chains.get(&source.key) else { return Err(()) };
+            Ok(Node::Edges { edges: &r.scope.globs, krate: self.krate, chain })
+        }
+    }
+    if let Some(b) = done.get(&m).and_then(|r| r.scope.get(Namespace::Types, name).copied()) {
+        return Some(b);
+    }
+    let mut sources = Records { krate: base.k.key, chains: &base.chains, done, name };
+    let p = through(&mut sources, Def::module(m), g()).ok()??;
+    Some(Binding { def: p.def, vis: p.vis, origin: blaze_surface::Origin::Glob, expansion: 0, state: p.state })
+}
+
 /// The definition `text` (a type path) names from `module`, read through the finished scopes.
 fn resolve_type(base: &Base<'_>, done: &Done, module: ItemKey, text: &'static str) -> Option<ItemKey> {
     let path = parse_path(text, base.k.key)?;
     let root = base.tree.modules[0].key;
-    let scope_get = |m: ItemKey, name: N| done.get(&m).and_then(|r| r.scope.get(Namespace::Types, name).copied());
+    let scope_get = |m: ItemKey, name: N| scope_type(base, done, m, name);
     let mut segments = path.segments.iter().copied();
     let mut cur = match path.kind {
         PathKind::Crate | PathKind::Abs | PathKind::DollarCrate(_) => root,
@@ -2949,6 +3225,9 @@ fn index(base: &Base<'_>, res: &Resolution) -> Indexed {
     let (row_count, buckets, mut bytes) = match build_impl_index(k.key, &rows, g()) {
         Ok(index) => {
             let bytes = index.directory.len() + index.no_impls_of.len() + index.buckets.iter().map(|b| b.bytes.len()).sum::<usize>();
+            for bucket in index.buckets.iter() {
+                dump("impl_bucket", &bucket.bytes);
+            }
             (rows.len(), index.buckets.len(), bytes)
         }
         Err(error) => {
@@ -3089,6 +3368,11 @@ fn run_crate(dir: &std::path::Path, counts: &[usize]) {
             Ok(bytes) => record_bytes += bytes,
             Err(error) => fails.add("FileItems record refused", || format!("{}: {error}", k.files[i].rel)),
         }
+        if DUMP.get().is_some()
+            && let Ok(record) = o.to_file_items(k.files[i].text, k.files[i].id, g())
+        {
+            dump("file_items", &record);
+        }
         for error in o.errors() {
             let message: String = o.message(error).chars().take(60).collect();
             fails.add(format!("syntax: {message}"), || k.at(Loc { file: i as u32, offset: error.range.start }));
@@ -3140,6 +3424,7 @@ fn run_crate(dir: &std::path::Path, counts: &[usize]) {
         match low.decls[i].write(m.key, &info, g()) {
             Ok(bytes) => {
                 decl_bytes += bytes.len();
+                dump("module_decls", &bytes);
                 records.push(bytes.to_vec());
             }
             Err(error) => low.fails.add("ModuleDecls record refused", || format!("{}: {error}", m.path)),
@@ -3227,7 +3512,17 @@ fn run_crate(dir: &std::path::Path, counts: &[usize]) {
         }
     };
     let load_ms = load.elapsed().as_secs_f64() * 1e3;
-    let base = Base { k: &k, tree: &tree, low: &low, decls: OnGlobal(decls), root: OnGlobal(root), parent };
+    let chains = parent
+        .keys()
+        .map(|&m| {
+            let mut chain = vec![m];
+            while let Some(&Some(p)) = parent.get(chain.last().expect("the chain starts with the module")) {
+                chain.push(p);
+            }
+            (m, chain)
+        })
+        .collect();
+    let base = Base { k: &k, tree: &tree, low: &low, decls: OnGlobal(decls), root: OnGlobal(root), parent, chains };
 
     // Stage 4.
     println!("\n  stage 4: names, first fill (Resolver over the MemSurface's records, in rounds)");
@@ -3238,7 +3533,15 @@ fn run_crate(dir: &std::path::Path, counts: &[usize]) {
     let meter = Meter::start();
     for &threads in counts {
         stage4 = None;
+        EXPAND_NS.store(0, Ordering::Relaxed);
+        SOLVE_NS.store(0, Ordering::Relaxed);
         let (ms, res) = best_of_3(|| resolve(&base, threads));
+        let runs = REPEAT.load(Ordering::Relaxed).max(1) as f64;
+        println!(
+            "    split at {threads} threads, per run, summed over threads: expansion {:.1} ms, solver steps {:.1} ms, of {ms:.1} ms wall",
+            EXPAND_NS.load(Ordering::Relaxed) as f64 / 1e6 / runs,
+            SOLVE_NS.load(Ordering::Relaxed) as f64 / 1e6 / runs
+        );
         times.push((threads, ms));
         shapes.push((res.rounds, res.groups, res.largest.len()));
         stage4 = Some(res);
@@ -3246,6 +3549,10 @@ fn run_crate(dir: &std::path::Path, counts: &[usize]) {
     print_times(&times);
     meter.print();
     let res = stage4.expect("one thread count at least");
+    // The cell core (blaze-scope src/cells, its lane's call): the same facts and the same
+    // expansion hook as stage 4, a fresh run; expansion timed apart; answers against stage 4's.
+    #[cfg(feature = "cells")]
+    cells_against_stage4(&base, &res);
     let same = shapes.windows(2).all(|it| it[0] == it[1]);
     let mut scope_bytes = 0usize;
     let mut bindings = 0usize;
@@ -3266,7 +3573,10 @@ fn run_crate(dir: &std::path::Path, counts: &[usize]) {
         bindings += r.scope.bindings.len();
         let mpath = tree.by_key.get(&r.scope.module).map_or_else(String::new, |&i| tree.modules[i].path.clone());
         match r.scope.write(g()) {
-            Ok(bytes) => scope_bytes += bytes.len(),
+            Ok(bytes) => {
+                scope_bytes += bytes.len();
+                dump("module_scope", &bytes);
+            }
             Err(error) => fails.add("ModuleScope record refused", || format!("{mpath}: {error}")),
         }
         for error in r.scope.errors.iter() {
@@ -3303,6 +3613,42 @@ fn run_crate(dir: &std::path::Path, counts: &[usize]) {
     let expansions: usize = expanded.values().sum();
     let expansion_count = res.run.expansions.lock().expect("the expansions' lock").len();
     {
+        // The event counts of the floor (bottom.md, section 6): what a forward fill does once.
+        let mut origin = BTreeMap::<String, usize>::new();
+        // A record holds glob edges, not names copied through them.
+        let (mut glob_names, mut glob_ambiguous) = (0usize, 0usize);
+        for r in res.done.values() {
+            glob_names += r.scope.globs.len();
+            for e in r.scope.bindings.iter() {
+                *origin.entry(format!("{:?}", e.binding.origin)).or_default() += 1;
+                if e.binding.state != BindingState::Determined {
+                    glob_ambiguous += 1;
+                }
+            }
+        }
+        let (mut imports, mut segments, mut globs, mut items, mut calls) = (0usize, 0usize, 0usize, 0usize, 0usize);
+        let mut count = |d: &DeclsBuilder<'_, N>| {
+            items += d.items.len() + d.mods.len() + d.extern_crates.len() + d.macro_rules.len();
+            calls += d.calls.len();
+            for u in d.uses.iter() {
+                segments += u.path.segments.len();
+                match u.leaf {
+                    UseForm::Glob => globs += 1,
+                    UseForm::Named { .. } => imports += 1,
+                }
+            }
+        };
+        for (_, d) in base.decls.values() {
+            count(d);
+        }
+        for d in res.run.expansions.lock().expect("the expansions' lock").values() {
+            count(d);
+        }
+        println!(
+            "    events: declarations {items} (with expansions'), named imports {imports}, globs {globs}, path segments {segments}, macro calls {calls}; bindings by origin {origin:?}; glob edges {glob_names}; own bindings not determined {glob_ambiguous}"
+        );
+    }
+    {
         let mut work = FILL_WORK.lock().expect("the fill work's lock");
         work.sort_by(|a, b| b.1.lookups.cmp(&a.1.lookups));
         let mut total = FillStats::default();
@@ -3311,8 +3657,8 @@ fn run_crate(dir: &std::path::Path, counts: &[usize]) {
         }
         let line = |s: &FillStats| {
             format!(
-                "passes {}, relax rounds {}, plans {}, lookups {}, fixpoints {} ({} edge evals), finals {}",
-                s.passes, s.relax_rounds, s.plans, s.lookups, s.fixpoints, s.fixpoint_evals, s.finals
+                "passes {}, relax rounds {}, items planned {}, lookups {}, finals {}, events {} (wakes {}), member steps {} ({} edge bytes), via-glob re-solves {} (spared {})",
+                s.passes, s.relax_rounds, s.plans, s.lookups, s.finals, s.events, s.wakes, s.member_nodes, s.member_edge_bytes, s.agains, s.agains_spared
             )
         };
         println!("    work (all machines, every run): {}", line(&total));
@@ -3409,4 +3755,323 @@ fn run_crate(dir: &std::path::Path, counts: &[usize]) {
     );
     indexed.fails.print();
     println!("    peak RSS so far {:.1} MB", peak_rss_mb());
+    if EDIT.load(Ordering::Relaxed) {
+        drop(indexed);
+        edits(&base, res, counts.last().copied().unwrap_or(1));
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// `--edit`: the edit loop over the first fill's records.
+
+/// After the first fill, six edits, each resolved again from the fill's records (`--edit`).
+static EDIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// What a read sees in an answer, as a read list holds it.
+fn own_saw(own: &Own) -> blaze_scope::Saw {
+    match own {
+        Own::Name(a) => blaze_scope::Saw::Name(*a),
+        Own::Globs { digest, .. } | Own::Textual(_, digest) | Own::Helpers(digest) => blaze_scope::Saw::Digest(*digest),
+        Own::InProgress(_) => blaze_scope::Saw::Name(NameAnswer::Absent),
+    }
+}
+
+type DeclMap = HashMap<ItemKey, (ModuleInfo<N>, DeclsBuilder<'static, N>)>;
+
+/// The first fill's inputs with one edit made to the records.
+fn edited_base<'k>(
+    base: &Base<'k>,
+    edit: impl FnOnce(&mut DeclMap, &mut HashMap<ItemKey, Option<ItemKey>>, &mut HashMap<ItemKey, Vec<ItemKey>>),
+) -> Base<'k> {
+    let mut decls: DeclMap = base.decls.iter().map(|(k, (info, d))| (*k, (*info, d.clone()))).collect();
+    let mut parent = base.parent.clone();
+    let mut chains = base.chains.clone();
+    edit(&mut decls, &mut parent, &mut chains);
+    Base { k: base.k, tree: base.tree, low: base.low, decls: OnGlobal(decls), root: OnGlobal((*base.root).clone()), parent, chains }
+}
+
+/// One edit's numbers.
+struct EditRow {
+    recomputed: usize,
+    /// Kept records solved again because a rerun's derivation may go around them.
+    widened: usize,
+    waves: usize,
+    plans: u64,
+    events: u64,
+    ms: f64,
+    changed: usize,
+    equal: bool,
+}
+
+/// Resolves again after an edit of `before`'s records into `base`'s, the records of `edited`
+/// changed: they first, widened by [`blaze_scope::Again::suspects`] to the kept records their
+/// derivation may go around (solved again with them, so a cycle the edit closes is solved
+/// from text), then every module whose read list no longer holds against today's answers,
+/// until every read list holds.
+fn incremental(before: &Base<'_>, base: &Base<'_>, threads: usize, orig: &Done, run: Run, edited: &[ItemKey]) -> (Done, Run, EditRow) {
+    let order = |set: &HashSet<ItemKey>| -> Vec<ItemKey> {
+        let mut v: Vec<ItemKey> = set.iter().copied().collect();
+        v.sort_by_key(|m| (base.tree.by_key.get(m).copied().unwrap_or(usize::MAX), m.0));
+        v
+    };
+    let work_before = FILL_WORK.lock().expect("the fill work's lock").len();
+    let start = Instant::now();
+    let parent = |m: ItemKey| base.parent.get(&m).copied().flatten();
+    let again = blaze_scope::Again::new_in(orig.iter().map(|(m, r)| (*m, &r.reads)), |m| before.parent.get(&m).copied().flatten(), g());
+    let touched_by_text = |m: ItemKey| match (before.decls.get(&m), base.decls.get(&m)) {
+        (Some((_, a)), Some((_, b))) => Touched::of_text(a, b, g()),
+        _ => Touched::wild(g()),
+    };
+    let mut touched: HashMap<ItemKey, Touched<'static, N>> = HashMap::new();
+    let mut done: Done = OnGlobal(orig.iter().map(|(k, v)| (*k, v.clone())).collect());
+    let mut run = run;
+    let mut first = HashSet::new();
+    for &m in edited {
+        first.insert(m);
+        touched.insert(m, touched_by_text(m));
+    }
+    let mut dirty = order(&first);
+    let mut recomputed: HashSet<ItemKey> = HashSet::new();
+    let mut waves = 0usize;
+    let mut widened = 0usize;
+    while !dirty.is_empty() {
+        // One wave: the dirty modules from their text, widened until no kept record they read
+        // reaches back to what they derive anew.
+        loop {
+            waves += 1;
+            for m in &dirty {
+                done.remove(m);
+                recomputed.insert(*m);
+            }
+            let r = resolve_some(base, threads, &dirty, done, run);
+            let Resolution { done: d, run: rn, .. } = r;
+            done = d;
+            run = rn;
+            for m in &dirty {
+                if let (Some(o), Some(n)) = (orig.get(m), done.get(m)) {
+                    touched.get_mut(m).expect("every dirty module is touched").add_changed(&o.scope, &n.scope);
+                }
+            }
+            let rerun: Vec<(ItemKey, &blaze_scope::ReadList<'static, N>, &Touched<'static, N>)> =
+                dirty.iter().filter_map(|m| Some((*m, &done.get(m)?.reads, touched.get(m)?))).collect();
+            let suspects = again.suspects(&rerun, |m| !recomputed.contains(&m) && done.contains_key(&m), parent);
+            if suspects.is_empty() {
+                break;
+            }
+            widened += suspects.len();
+            for &s in suspects.iter() {
+                touched.insert(s, Touched::wild(g()));
+            }
+            let mut wave: HashSet<ItemKey> = dirty.iter().copied().collect();
+            wave.extend(suspects.iter().copied());
+            dirty = order(&wave);
+        }
+        let mut next = HashSet::new();
+        {
+            let facts = Facts { base, run: &run };
+            let failed = HashSet::new();
+            let module_slot = HashMap::new();
+            let cx = DriveCx { base, run: &run, facts: &facts, done: &done, failed: &failed, module_slot: &module_slot };
+            for (m, rec) in done.iter() {
+                let holds = rec.reads.holds(|read| match cx.answer(*read) {
+                    Ok(own) => own_saw(&own),
+                    Err(_) => blaze_scope::Saw::Name(NameAnswer::Absent),
+                });
+                if !holds {
+                    next.insert(*m);
+                }
+            }
+        }
+        for &m in &next {
+            touched.insert(m, Touched::wild(g()));
+        }
+        dirty = order(&next);
+    }
+    let ms = start.elapsed().as_secs_f64() * 1e3;
+    let (plans, events) = FILL_WORK.lock().expect("the fill work's lock")[work_before..]
+        .iter()
+        .fold((0u64, 0u64), |(p, e), (_, s)| (p + s.plans, e + s.events));
+    let changed = done.iter().filter(|(m, r)| orig.get(m).is_none_or(|o| o.scope != r.scope)).count();
+    // Every module of the edited records, a new one too.
+    let all: HashSet<ItemKey> = base.decls.keys().copied().collect();
+    let cold = resolve_some(base, threads, &order(&all), OnGlobal(HashMap::new()), Run::default());
+    let equal = cold.done.len() == done.len()
+        && done.iter().all(|(m, r)| cold.done.get(m).is_some_and(|c| c.scope == r.scope && c.reads == r.reads));
+    if !equal {
+        println!("      cold {} records, incremental {}", cold.done.len(), done.len());
+        let mut shown = 0;
+        for (m, r) in done.iter() {
+            let Some(c) = cold.done.get(m) else {
+                println!("      {:x}: not in the cold fill", m.0);
+                continue;
+            };
+            if c.scope == r.scope && c.reads == r.reads {
+                continue;
+            }
+            shown += 1;
+            if shown > 2 {
+                break;
+            }
+            println!("      {:x}: scope equal {}, reads equal {}", m.0, c.scope == r.scope, c.reads == r.reads);
+            if c.scope != r.scope {
+                let (cs, rs) = (format!("{:?}", c.scope), format!("{:?}", r.scope));
+                let at = cs.bytes().zip(rs.bytes()).position(|(a, b)| a != b).unwrap_or(0);
+                println!("        cold: …{}", &cs[at.saturating_sub(120)..(at + 200).min(cs.len())]);
+                println!("        incr: …{}", &rs[at.saturating_sub(120)..(at + 200).min(rs.len())]);
+            } else {
+                let only_cold: Vec<_> = c.reads.entries.iter().filter(|e| !r.reads.entries.contains(e)).take(3).collect();
+                let only_incr: Vec<_> = r.reads.entries.iter().filter(|e| !c.reads.entries.contains(e)).take(3).collect();
+                println!("        reads only cold: {only_cold:?}\n        reads only incr: {only_incr:?}");
+            }
+        }
+    }
+    drop(cold);
+    (done, run, EditRow { recomputed: recomputed.len(), widened, waves, plans, events, ms, changed, equal })
+}
+
+/// The six edits of the edit loop, each the smallest of its kind on `core`'s real modules.
+fn edits(base: &Base<'_>, res: Resolution, threads: usize) {
+    println!("\n  edit loop: each edit resolved again from the first fill's records ({threads} threads)");
+    let Resolution { done: orig, run, largest, grouped, .. } = res;
+    let big: HashSet<ItemKey> = if largest.len() >= 16 { largest.iter().copied().collect() } else { HashSet::new() };
+    let path = |m: ItemKey| base.tree.by_key.get(&m).map_or_else(|| format!("{:x}", m.0), |&i| base.tree.modules[i].path.clone());
+    let in_order: Vec<ItemKey> = base.tree.modules.iter().map(|m| m.key).collect();
+    let krate = base.k.key;
+    let private_fn = |name: N, tag: &[u8]| DeclaredItem {
+        name,
+        ns: Namespace::Values,
+        def: Def { key: make_key(krate, &[b"blaze edit", tag]), kind: DefKind::Other },
+        vis: WrittenVis::Private,
+    };
+    let print = |label: &str, row: &EditRow| {
+        println!(
+            "    {label}\n      records recomputed {} ({} as suspects) in {} waves, items evaluated {}, events {}, {:.1} ms; records changed {}; equal to a cold fill of the edited records: {}",
+            row.recomputed, row.widened, row.waves, row.plans, row.events, row.ms, row.changed, if row.equal { "yes" } else { "NO" }
+        );
+    };
+    let mut run = run;
+    let alone = |m: &ItemKey| !grouped.contains(m);
+
+    // (a) A private fn added to a leaf module.
+    let leaf = in_order.iter().copied().find(|m| alone(m) && base.decls.get(m).is_some_and(|(_, d)| d.mods.is_empty()));
+    if let Some(leaf) = leaf {
+        let b = edited_base(base, |decls, _, _| {
+            decls.get_mut(&leaf).expect("the leaf's record").1.items.push(private_fn("blaze_edit_a", b"a"));
+        });
+        let (_, rn, row) = incremental(base, &b, threads, &orig, run, &[leaf]);
+        run = rn;
+        print(&format!("(a) private fn added to leaf {}", path(leaf)), &row);
+    }
+
+    // (b) A private fn's body changed: the outline is equal, so no record is edited at all.
+    {
+        let b = edited_base(base, |_, _, _| {});
+        let (_, rn, row) = incremental(base, &b, threads, &orig, run, &[]);
+        run = rn;
+        print("(b) a fn body changed (outline equal: no name record edited)", &row);
+    }
+
+    // (c) A `pub fn` added to the module most glob-imported (outside the big group if one is).
+    let mut importers: HashMap<ItemKey, Vec<ItemKey>> = HashMap::new();
+    for (m, r) in orig.iter() {
+        for e in r.scope.globs.iter() {
+            importers.entry(e.source.key).or_default().push(*m);
+        }
+    }
+    let source = importers
+        .iter()
+        .filter(|(s, _)| base.decls.contains_key(*s))
+        .max_by_key(|(s, i)| (!big.contains(*s), i.len(), s.0))
+        .map(|(s, i)| (*s, i.clone()));
+    if let Some((s, imps)) = source {
+        let b = edited_base(base, |decls, _, _| {
+            let mut item = private_fn("blaze_edit_c", b"c");
+            item.vis = WrittenVis::Pub;
+            decls.get_mut(&s).expect("the source's record").1.items.push(item);
+        });
+        let (_, rn, row) = incremental(base, &b, threads, &orig, run, &[s]);
+        run = rn;
+        let inside = imps.iter().filter(|m| big.contains(m)).count();
+        print(
+            &format!(
+                "(c) pub fn added to {} (glob-imported by {} modules, {inside} of them in the big group; it is {}in it)",
+                path(s),
+                imps.len(),
+                if big.contains(&s) { "" } else { "not " }
+            ),
+            &row,
+        );
+    }
+
+    // (d) A `pub use` added inside the big group: an existing named `pub use` again, renamed.
+    let member = in_order.iter().copied().find(|m| {
+        big.contains(m)
+            && base.decls.get(m).is_some_and(|(_, d)| {
+                d.uses.iter().any(|u| matches!(u.vis, WrittenVis::Pub) && matches!(u.leaf, UseForm::Named { .. }))
+            })
+    });
+    if let Some(member) = member {
+        let b = edited_base(base, |decls, _, _| {
+            let d = &mut decls.get_mut(&member).expect("the member's record").1;
+            let at = d.uses.iter().position(|u| matches!(u.vis, WrittenVis::Pub) && matches!(u.leaf, UseForm::Named { .. }));
+            let mut u = d.uses[at.expect("found above")].clone();
+            if let UseForm::Named { types_only, .. } = u.leaf {
+                u.leaf = UseForm::Named { rename: Rename::To("blaze_edit_d"), types_only };
+            }
+            u.pos = 1 << 30;
+            d.uses.push(u);
+        });
+        let (_, rn, row) = incremental(base, &b, threads, &orig, run, &[member]);
+        run = rn;
+        print(&format!("(d) pub use added in {} (a member of the {}-module group)", path(member), big.len()), &row);
+    }
+
+    // (e) A declared name removed that another module reads and found (outside the big group
+    // if one is).
+    let mut readers: HashMap<(ItemKey, N), usize> = HashMap::new();
+    for (m, r) in orig.iter() {
+        for e in r.reads.entries.iter() {
+            if let (Read::Name { module, name, .. }, blaze_scope::Saw::Name(NameAnswer::Found { .. })) = (e.read, e.saw) {
+                if module != *m {
+                    *readers.entry((module, name)).or_default() += 1;
+                }
+            }
+        }
+    }
+    let removed = readers
+        .iter()
+        .filter(|((m, name), _)| base.decls.get(m).is_some_and(|(_, d)| d.items.iter().any(|it| it.name == *name)))
+        .max_by_key(|((m, name), n)| (!big.contains(m), std::cmp::Reverse(**n), m.0, *name))
+        .map(|(k, n)| (*k, *n));
+    if let Some(((m, name), n)) = removed {
+        let b = edited_base(base, |decls, _, _| {
+            decls.get_mut(&m).expect("the module's record").1.items.retain(|it| it.name != name);
+        });
+        let (_, rn, row) = incremental(base, &b, threads, &orig, run, &[m]);
+        run = rn;
+        print(&format!("(e) `{name}` removed from {} (read and found by {n} other modules)", path(m)), &row);
+    }
+
+    // (f) A new `mod blaze_edit_f;` with one private fn, under the leaf of (a).
+    if let Some(leaf) = leaf {
+        let child = make_key(krate, &[b"blaze edit", b"f"]);
+        let b = edited_base(base, |decls, parent, chains| {
+            let (info, d) = decls.get_mut(&leaf).expect("the leaf's record");
+            let no_prelude = info.no_implicit_prelude;
+            d.mods.push(ChildModDecl { name: "blaze_edit_f", module: child, vis: WrittenVis::Private, macro_use: false, pos: 1 << 30 });
+            let mut own = DeclsBuilder::new_in(g());
+            own.items.push(private_fn("blaze_edit_f_fn", b"f fn"));
+            decls.insert(child, (ModuleInfo { krate, parent: Some(leaf), name: Some("blaze_edit_f"), no_implicit_prelude: no_prelude }, own));
+            parent.insert(child, Some(leaf));
+            let mut chain = vec![child];
+            chain.extend(chains.get(&leaf).cloned().unwrap_or_default());
+            chains.insert(child, chain);
+        });
+        let (_, rn, row) = incremental(base, &b, threads, &orig, run, &[leaf, child]);
+        run = rn;
+        print(&format!("(f) new mod blaze_edit_f (one private fn) under {}", path(leaf)), &row);
+    }
+    // The fill's records lend names from the run's texts: dropped first.
+    drop(orig);
+    drop(run);
 }

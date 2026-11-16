@@ -86,8 +86,17 @@ impl<'a> Uf<'a> {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct VarSnapshot {
     log: u32,
+    bound: u32,
     universe: Universe,
     depth: u32,
+}
+
+/// A variable of a table, as the binding log names it: its kind and its index in that kind's
+/// table (the `a` column of its `TY_VAR`, `INT_VAR`, `FLOAT_VAR` or const `VAR` row).
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct VarId {
+    pub kind: VarKind,
+    pub index: u32,
 }
 
 /// A bug the snapshot test plants: the int table's writes are not logged.
@@ -96,6 +105,8 @@ pub struct VarSnapshot {
 pub(crate) enum Plant {
     Clean,
     ForgetIntUndo,
+    /// The binding log misses the int table's bindings.
+    ForgetIntBinding,
 }
 
 /// The variable tables (see the module).
@@ -103,6 +114,8 @@ pub struct Vars<'a> {
     t: [Uf<'a>; 4],
     re_universe: Vec<u32, Alloc<'a>>,
     log: Vec<Undo, Alloc<'a>>,
+    /// The binding log (see [`Vars::bindings`]).
+    bound: Vec<VarId, Alloc<'a>>,
     open: u32,
     universe: Universe,
     #[cfg(test)]
@@ -115,6 +128,7 @@ impl<'a> Vars<'a> {
             t: [Uf::new_in(alloc), Uf::new_in(alloc), Uf::new_in(alloc), Uf::new_in(alloc)],
             re_universe: Vec::new_in(alloc),
             log: Vec::new_in(alloc),
+            bound: Vec::new_in(alloc),
             open: 0,
             universe: Universe::ROOT,
             #[cfg(test)]
@@ -181,6 +195,50 @@ impl<'a> Vars<'a> {
         self.re_universe.len()
     }
 
+    /// How many variables of `kind` exist (region variables included), made by the context or
+    /// by relating and folding (generalization, instantiation).
+    pub fn var_count(&self, kind: VarKind) -> usize {
+        match Table::of(kind) {
+            Some(t) => self.count(t),
+            None => self.re_universe.len(),
+        }
+    }
+
+    /// The binding log: every variable that stopped being the unbound root of its class, in
+    /// the order it happened. A bind logs the class's root; a union logs the root that went
+    /// under the other, and the new root too when the class took a value from the joined
+    /// one. A rollback truncates the log to its length at the snapshot; a commit keeps it.
+    /// The solver's fulfillment wakes the obligations stalled on a logged variable (a stalled
+    /// obligation waits on roots: what `probe` gives for an unbound variable).
+    ///
+    /// Without a snapshot open each variable is logged at most once (a class never becomes
+    /// unbound or a root again), so the log holds at most one entry per variable plus what
+    /// rolled-back snapshots made.
+    pub fn bindings(&self) -> &[VarId] {
+        &self.bound
+    }
+
+    #[inline(always)]
+    fn log_bound(&mut self, table: Table, v: u32) {
+        #[cfg(test)]
+        if self.plant == Plant::ForgetIntBinding && table == Table::Int {
+            return;
+        }
+        let kind = match table {
+            Table::Ty => VarKind::Ty,
+            Table::Int => VarKind::Int,
+            Table::Float => VarKind::Float,
+            Table::Const => VarKind::Const,
+        };
+        self.bound.push(VarId { kind, index: v });
+    }
+
+    /// How many undo entries are logged: what a write-free read must leave unchanged.
+    #[cfg(test)]
+    pub(crate) fn undo_len(&self) -> usize {
+        self.log.len()
+    }
+
     /// The root of `v`'s class, without writing (any snapshot state).
     #[inline]
     pub(crate) fn root(&self, table: Table, mut v: u32) -> u32 {
@@ -245,6 +303,11 @@ impl<'a> Vars<'a> {
         let (root, child) = if rank_a >= rank_b { (ra, rb) } else { (rb, ra) };
         self.t[ti].parent[ix(child)] = root;
         self.note(table, OP_PARENT, child, child);
+        // An unbound root going under another stops being one; a bound one resolves to the
+        // same value as before.
+        if self.t[ti].value[ix(child)] == NONE {
+            self.log_bound(table, child);
+        }
         if rank_a == rank_b {
             let was = self.t[ti].rank[ix(root)];
             self.t[ti].rank[ix(root)] = was.saturating_add(1);
@@ -259,6 +322,7 @@ impl<'a> Vars<'a> {
         if v_root == NONE && v_child != NONE {
             self.t[ti].value[ix(root)] = v_child;
             self.note(table, OP_VALUE, root, NONE);
+            self.log_bound(table, root);
         }
         root
     }
@@ -271,6 +335,7 @@ impl<'a> Vars<'a> {
         debug_assert!(was == NONE, "binding a bound variable");
         self.t[ti].value[ix(r)] = value;
         self.note(table, OP_VALUE, r, was);
+        self.log_bound(table, r);
     }
 
     /// Lowers the universe of `v`'s class to `u` if it is higher.
@@ -290,12 +355,14 @@ impl<'a> Vars<'a> {
     pub fn snapshot(&mut self) -> VarSnapshot {
         self.open += 1;
         let Some(log) = row(self.log.len()) else { panic!("blaze-ty: the undo log is full (rule 18)") };
-        VarSnapshot { log, universe: self.universe, depth: self.open }
+        let Some(bound) = row(self.bound.len()) else { panic!("blaze-ty: the binding log is full (rule 18)") };
+        VarSnapshot { log, bound, universe: self.universe, depth: self.open }
     }
 
-    /// Undoes every write since `s` and closes it (`rollback_to`).
+    /// Undoes every write since `s` and closes it (`rollback_to`), with every snapshot opened
+    /// inside it: a solver unwinding a stop rolls back to its root's snapshot in one step.
     pub fn rollback_to(&mut self, s: VarSnapshot) {
-        debug_assert!(s.depth == self.open, "snapshots close innermost first");
+        assert!(s.depth >= 1 && s.depth <= self.open, "blaze-ty: rollback to a snapshot already closed");
         while self.log.len() > ix(s.log) {
             let Some(u) = self.log.pop() else { break };
             if u.op == OP_NEW_REGION {
@@ -312,8 +379,9 @@ impl<'a> Vars<'a> {
                 _ => t.universe[at] = u.was,
             }
         }
+        self.bound.truncate(ix(s.bound));
         self.universe = s.universe;
-        self.open -= 1;
+        self.open = s.depth - 1;
     }
 
     /// Keeps every write since `s` and closes it.
@@ -331,7 +399,9 @@ impl<'a> Vars<'a> {
     }
 
     pub(crate) fn bytes(&self) -> usize {
-        self.t.iter().map(Uf::bytes).sum::<usize>() + self.re_universe.capacity() * 4 + self.log.capacity() * 12
+        self.t.iter().map(Uf::bytes).sum::<usize>() + self.re_universe.capacity() * 4
+            + self.log.capacity() * 12
+            + self.bound.capacity() * core::mem::size_of::<VarId>()
     }
 
     /// Which kinds of variable exist, for a check that every table was rolled back.

@@ -5,11 +5,10 @@
 
 #![blaze::sans_io]
 
-use core::alloc::Allocator;
-
-use blaze_own::Vec;
-
-use crate::error::{Error, Why};
+use crate::{
+    error::{Error, Why},
+    out::Out,
+};
 
 /// Bytes `first..=last` of a resource, or from `first` to its end.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -22,7 +21,9 @@ pub struct Range {
 #[derive(Clone, Copy, Debug)]
 pub struct Request<'a> {
     pub method: &'a str,
-    /// The path and query: `/index/se/rd/serde`.
+    /// The path and query: `/index/se/rd/serde`; or, to an HTTP proxy forwarding a plain
+    /// `http` request, the absolute form `http://host[:port]/path?query` (RFC 9112 section
+    /// 3.2.2).
     pub target: &'a str,
     /// The `Host` header: the host, and the port when it is not the scheme's own.
     pub host: &'a str,
@@ -38,14 +39,41 @@ pub struct Request<'a> {
 /// The headers the writer sets itself, which a caller's list may not hold.
 const OWN: [&str; 5] = ["host", "content-length", "transfer-encoding", "range", "connection"];
 
+/// Why a caller's header can't be written as given.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HeaderFault {
+    /// Its name is no token.
+    NotToken,
+    /// Its name is one the writer sets itself (`Host`, `Content-Length`, `Transfer-Encoding`,
+    /// `Range`, `Connection`): it frames the body, keeps the connection, or is typed.
+    Owned,
+    /// Its value has a CR, LF, NUL or other control byte, which would end the head early.
+    ControlByte,
+}
+
+/// Whether `name: value` can be one of a [`Request`]'s headers: the writer's own check, for a
+/// client that refuses a request before it is sent.
+pub fn check_header(name: &str, value: &str) -> Result<(), HeaderFault> {
+    if !is_token(name) {
+        return Err(HeaderFault::NotToken);
+    }
+    if OWN.iter().any(|own| own.eq_ignore_ascii_case(name)) {
+        return Err(HeaderFault::Owned);
+    }
+    if value.bytes().any(|b| (b < b' ' && b != b'\t') || b == 0x7f) {
+        return Err(HeaderFault::ControlByte);
+    }
+    Ok(())
+}
+
 /// `request`'s head, appended to `out`.
-pub fn write_request<B: Allocator>(request: &Request<'_>, out: &mut Vec<u8, B>) -> Result<(), Error> {
+pub fn write_request<O: Out + ?Sized>(request: &Request<'_>, out: &mut O) -> Result<(), Error> {
     let fail = |why| Error { at: 0, why };
     if !is_token(request.method) {
         return Err(fail(Why::Method));
     }
     let t = request.target.as_bytes();
-    if t.first() != Some(&b'/') || t.iter().any(|&b| b <= b' ' || b == 0x7f) {
+    if !(t.first() == Some(&b'/') || t.starts_with(b"http://")) || t.iter().any(|&b| b <= b' ' || b == 0x7f) {
         return Err(fail(Why::Target));
     }
     let h = request.host.as_bytes();
@@ -54,11 +82,10 @@ pub fn write_request<B: Allocator>(request: &Request<'_>, out: &mut Vec<u8, B>) 
     }
     for (i, &(name, value)) in request.headers.iter().enumerate() {
         let index = i.min(usize::from(u16::MAX)) as u16;
-        if !is_token(name) || OWN.iter().any(|own| own.eq_ignore_ascii_case(name)) {
-            return Err(fail(Why::HeaderName { index }));
-        }
-        if value.bytes().any(|b| (b < b' ' && b != b'\t') || b == 0x7f) {
-            return Err(fail(Why::HeaderValue { index }));
+        match check_header(name, value) {
+            Ok(()) => {}
+            Err(HeaderFault::NotToken | HeaderFault::Owned) => return Err(fail(Why::HeaderName { index })),
+            Err(HeaderFault::ControlByte) => return Err(fail(Why::HeaderValue { index })),
         }
     }
     if let Some(Range { first, last: Some(last) }) = request.range
@@ -70,8 +97,17 @@ pub fn write_request<B: Allocator>(request: &Request<'_>, out: &mut Vec<u8, B>) 
     for (name, value) in request.headers {
         len += name.len() + value.len() + 4;
     }
-    out.try_reserve(len).map_err(|e| fail(Why::Alloc(e)))?;
-    let mut put = |bytes: &[u8]| out.extend_from_slice(bytes);
+    out.try_reserve_more(len).map_err(|e| fail(Why::Alloc(e)))?;
+    // Within the room just reserved: a failure here is the allocator's after all, and the head
+    // is cut short; the caller sees the error of the first.
+    let mut failed = None;
+    let mut put = |bytes: &[u8]| {
+        if failed.is_none()
+            && let Err(e) = out.try_put(bytes)
+        {
+            failed = Some(e);
+        }
+    };
     put(request.method.as_bytes());
     put(b" ");
     put(t);
@@ -103,7 +139,10 @@ pub fn write_request<B: Allocator>(request: &Request<'_>, out: &mut Vec<u8, B>) 
         put(b"Connection: close\r\n");
     }
     put(b"\r\n");
-    Ok(())
+    match failed {
+        None => Ok(()),
+        Some(e) => Err(fail(Why::Alloc(e))),
+    }
 }
 
 /// A token (RFC 9110 section 5.6.2): one or more of the bytes a field name or method may hold.

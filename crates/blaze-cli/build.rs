@@ -14,5 +14,11 @@ fn main() {
     if os == "macos" {
         println!("cargo::rustc-link-arg-bins=-Wl,-dead_strip_dylibs");
     }
+    // The tool's identity is the linker's id of the binary (src/build_id.rs): ld64 writes
+    // LC_UUID by default; on Linux ask for a build-id note, a digest of the output (`sha1`), so
+    // equal inputs give one id. Tests read it too, so every target gets it.
+    if os == "linux" {
+        println!("cargo::rustc-link-arg=-Wl,--build-id=sha1");
+    }
     println!("cargo::rerun-if-changed=build.rs");
 }

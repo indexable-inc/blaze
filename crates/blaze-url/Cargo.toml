@@ -1,0 +1,21 @@
+[package]
+name = "blaze-url"
+description = "Addresses as checked types, the one home for them: a `HostPort` (a DNS name, IPv4, or IPv6 in brackets, and a port from 1), a `Scheme`, an `Origin` and a `Url` refusing a user before the host, a space, a control byte or a backslash; `const fn` checks so a literal is checked as its crate compiles; `no_std` with `alloc`, no dependency. bstd re-exports it; blaze-http's client parses with it"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dev-dependencies]
+# `check`: the property tests of the parse rules.
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

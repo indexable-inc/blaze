@@ -275,13 +275,13 @@ fn entry(bytes: &[u8]) -> Option<(&[u8], Stamp)> {
 
 /// What is directly in `dir` (named `name` under the root), each with its stamp, sorted by
 /// name; links and junctions are stamped themselves.
-pub(crate) fn entries(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, Stamp)>> {
+pub(crate) fn entries(dir: &Path, name: &crate::DirName) -> io::Result<crate::Listing> {
     thread_local! {
         // alloc: once per thread, the buffer every listing on it fills.
         static BUFFER: std::cell::RefCell<Box<[u64]>> = std::cell::RefCell::new(vec![0u64; LISTING / 8].into_boxed_slice());
     }
     let root;
-    let dir = match drive(name.as_str()) {
+    let dir = match name.name().and_then(|name| drive(name.as_str())) {
         Some((drive, "")) => {
             root = PathBuf::from(format!("{drive}\\"));
             &root
@@ -291,16 +291,17 @@ pub(crate) fn entries(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, 
     BUFFER.with_borrow_mut(|buffer| list(dir, name, buffer))
 }
 
-fn list(dir: &Path, name: &FileName, buffer: &mut [u64]) -> io::Result<Vec<(FileName, Stamp)>> {
+fn list(dir: &Path, name: &crate::DirName, buffer: &mut [u64]) -> io::Result<crate::Listing> {
     // alloc: an error path.
     let named =
         |error: io::Error| io::Error::new(error.kind(), format!("{}: {error}", dir.display()));
     let wide = sys::path(dir).map_err(named)?;
     let handle = open(&wide, FILE_LIST_DIRECTORY, FILE_FLAG_BACKUP_SEMANTICS).map_err(named)?;
     let mut class = FileIdBothDirectoryRestartInfo;
-    // alloc: the entries the listing answers with, once per listing.
-    let mut found = Vec::new();
-    let mut text = String::with_capacity(name.as_str().len() + 256);
+    // clone: the listing's directory, a refcount.
+    let mut found = crate::ListingBuilder::new(name.clone());
+    // alloc: once per listing, the name an entry's UTF-16 is decoded into.
+    let mut text = String::with_capacity(256);
     loop {
         // SAFETY: an open directory handle and a buffer of the length given, 8-aligned as the
         // class's entries are.
@@ -314,10 +315,7 @@ fn list(dir: &Path, name: &FileName, buffer: &mut [u64]) -> io::Result<Vec<(File
         };
         if ok == 0 {
             return match sys::last() {
-                ERROR_NO_MORE_FILES => {
-                    found.sort_unstable_by(|a: &(FileName, Stamp), b| a.0.cmp(&b.0));
-                    Ok(found)
-                }
+                ERROR_NO_MORE_FILES => Ok(found.finish()?),
                 _ => Err(named(io::Error::last_os_error())),
             };
         }
@@ -337,9 +335,6 @@ fn list(dir: &Path, name: &FileName, buffer: &mut [u64]) -> io::Result<Vec<(File
             let next = word::<4>(rest, 0).map(u32::from_le_bytes).ok_or_else(malformed)? as usize;
             let units = leaf.chunks_exact(2).map(|it| u16::from_le_bytes([it[0], it[1]]));
             text.clear();
-            text.push_str(name.as_str());
-            text.push('/');
-            let start = text.len();
             for unit in char::decode_utf16(units) {
                 let Ok(unit) = unit else {
                     return Err(named(io::Error::new(
@@ -349,13 +344,8 @@ fn list(dir: &Path, name: &FileName, buffer: &mut [u64]) -> io::Result<Vec<(File
                 };
                 text.push(unit);
             }
-            if !matches!(&text[start..], "." | "..") {
-                let file = FileName::new(&text).ok_or_else(|| {
-                    // alloc: an error path.
-                    named(io::Error::new(io::ErrorKind::InvalidData, format!("{text}: not a name")))
-                })?;
-                found.push((file, stamp));
-            }
+            // `.` and `..` are left out by the listing's own rule.
+            found.push(text.as_bytes(), stamp)?;
             if next == 0 {
                 break;
             }

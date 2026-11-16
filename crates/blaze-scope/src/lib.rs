@@ -43,26 +43,66 @@
 // `#![blaze::sans_io]` in each sans-IO module; inert under rustc.
 #![register_tool(blaze)]
 
-#[cfg(test)]
+// resolve.rs: the locks between the fill's threads (std::sync; see its module docs).
 extern crate std;
 
+mod again;
 mod builtin;
+// The cell core, stage 1 (bottom.md section 6): no caller until stage 2's seam.
+#[cfg(feature = "cells")]
+#[cfg_attr(not(test), expect(dead_code, reason = "the cell core under construction: the seam comes later"))]
+mod cells;
+pub mod crate_scope;
 mod error;
 mod facts;
 mod finish;
+pub mod graph;
 mod group;
 mod lookup;
+pub mod names;
+pub mod prepares;
 mod read;
+pub mod resolve;
 mod resolver;
 mod scope;
-mod watch;
+pub mod task;
+pub mod units;
+mod work;
 
 #[cfg(test)]
 mod tests;
 
-pub use builtin::{BUILTIN_TYPES, builtin_type, is_builtin_type};
-pub use error::ResolveError;
+pub use again::{Again, Touched};
+pub use builtin::{BUILTIN_TYPES, Builtin, builtin_of, builtin_type, builtin_type_in, is_builtin_type};
+pub use error::{GlobBug, ResolveError};
 pub use facts::{Name, RecordFacts, ScopeFacts};
+
+#[cfg(feature = "cells")]
+pub use cells::{ItemResult as CellResult, Outcome as CellOutcome};
+
+/// The cell core (bottom.md section 6) on one crate's module tree under `root`, for measuring
+/// it on real trees: `expand(call, def)` makes the call's expansion, which `facts.expansion`
+/// then hands back (the same hook and facts the old core's fill uses); `visit` is lent every
+/// import's and call's answer at the end.
+#[cfg(feature = "cells")]
+pub fn cells_count<'a, F: ScopeFacts>(
+    facts: &F,
+    root: blaze_id::ItemKey,
+    alloc: blaze_own::Alloc<'a>,
+    now: &dyn Fn() -> u64,
+    expand: &dyn Fn(blaze_id::ItemKey, Def),
+    visit: &mut dyn FnMut(CellResult<'_, F::Name>),
+) -> Result<cells::CellRun, cells::CellError> {
+    let t0 = now();
+    let mut c = cells::Cells::load(facts, root, alloc)?;
+    let t1 = now();
+    c.run(facts, expand, &[])?;
+    let t2 = now();
+    for r in c.results() {
+        visit(r);
+    }
+    Ok(cells::CellRun { stats: c.stats, load_ns: t1 - t0, run_ns: t2 - t1, probe_centi_ns: c.probe_cost(now) })
+}
 pub use group::Group;
 pub use read::{Answer, ExpandRequest, NameAnswer, Read, Reply, Step};
 pub use resolver::{FillStats, MAX_EXPANSIONS, MAX_MODULE_DEPTH, RECURSION_LIMIT, Resolver};
@@ -72,8 +112,8 @@ pub use scope::{ReadEntry, ReadList, Resolved, Saw};
 pub use blaze_surface::{
     AmbiguityKind, AnonImport, Binding, BindingState, CallShape, ChildModDecl, CrateRootBuilder,
     CrateRootHead, DeclaredItem, DeclsBuilder, Def, DefKind, Dep, Edition, ExpandedDecls,
-    ExportEntry, ExternCrateDecl, ExternTarget, MacroCallDecl, MacroRulesDecl, ModuleInfo,
+    ExternCrateDecl, ExternTarget, GlobEdge, MacroCallDecl, MacroRulesDecl, MacroShapes, ModuleInfo,
     Namespace, Origin, Path, PathKind, Rename, ScopeBuilder, ScopeEntry, ScopeError, Site,
     TextualDef, TextualMark, Unresolved, UseDecl, UseForm, UseSite, Visibility, VisibilityClass,
-    WrittenVis,
+    WrittenVis, globs_digest, Asker, Node, Passed, SeenFrom, Sources, Through, through,
 };

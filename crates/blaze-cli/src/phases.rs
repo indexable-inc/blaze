@@ -15,6 +15,10 @@ pub struct Phases {
     clock: Clock,
     began: Instant,
     last: Instant,
+    /// From the process's start (its exec) to the driver's: the loader, the runtime's
+    /// initialisers, Rust std's start, bstd's reading of the start; `None` where the system
+    /// would not say when the process began.
+    before_runtime: Option<u64>,
     /// From the driver's start to `main`'s first line.
     before_main: u64,
     rows: [(&'static str, u64); MOST],
@@ -26,6 +30,8 @@ pub struct Phases {
     first_chunk: Option<Syscalls>,
     /// The same, when `main` began.
     at_main: Syscalls,
+    /// The most each frame held over the request, once it answered.
+    pub frames: Option<crate::work::HighWater>,
 }
 
 type Syscalls = [(blaze_mem::syscalls::Kind, blaze_mem::syscalls::Calls); blaze_mem::syscalls::KINDS.len()];
@@ -54,9 +60,11 @@ pub struct Effects {
 impl Phases {
     pub fn new(clock: Clock) -> Phases {
         let now = clock.now();
+        let since_process = clock.since_process_start(now).ok();
         Phases {
             began: now,
             last: now,
+            before_runtime: since_process.map(|it| nanos(it.saturating_sub(now.since_start()))),
             before_main: nanos(now.since_start()),
             clock,
             rows: [("", 0); MOST],
@@ -64,6 +72,7 @@ impl Phases {
             request: Effects::default(),
             first_chunk: None,
             at_main: blaze_mem::syscalls::snapshot(),
+            frames: None,
         }
     }
 
@@ -76,6 +85,11 @@ impl Phases {
 
     pub fn now(&self) -> Instant {
         self.clock.now()
+    }
+
+    /// The clock `main` was handed: the sweep reads its wall time from it.
+    pub fn clock(&self) -> &Clock {
+        &self.clock
     }
 
     /// Nanoseconds since `from`.
@@ -110,7 +124,10 @@ fn nanos(d: core::time::Duration) -> u64 {
 
 impl fmt::Display for Phases {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "phases       before main {}", self.before_main)?;
+        match self.before_runtime {
+            Some(ns) => write!(f, "phases       process start to runtime start {ns} · runtime start to main {}", self.before_main)?,
+            None => write!(f, "phases       process start unknown · runtime start to main {}", self.before_main)?,
+        }
         for (name, ns) in &self.rows[..self.len] {
             write!(f, " · {name} {ns}")?;
         }
@@ -121,6 +138,13 @@ impl fmt::Display for Phases {
             "request      steps {} gets {} puts {} runs {} publish {} prints {} write last {} (ns)",
             r.steps, r.gets, r.puts, r.runs, r.publish, r.prints, r.write_last
         )?;
+        if let Some(h) = self.frames {
+            writeln!(
+                f,
+                "frames       most held (bytes): request {} · a task's scratch {} · a batch's records {} · a record read back {}",
+                h.request, h.scratch, h.batch, h.got
+            )?;
+        }
         memory_line(f, "by main", &self.at_main)?;
         if let Some(calls) = &self.first_chunk {
             memory_line(f, "by the first chunk", calls)?;

@@ -76,6 +76,8 @@ use crate::{
 mod handle;
 // The fast paths of `spec` against the generic ones.
 mod spec;
+// Lists, Texts and `get_or_insert_with` against their std forms.
+mod shapes;
 
 // ---------------------------------------------------------------------------------------------
 // The counting allocator.

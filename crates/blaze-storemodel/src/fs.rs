@@ -195,6 +195,9 @@ struct Unsynced {
     asked: u64,
 }
 
+/// The device every file of the model is on.
+const MODEL_DEV: u64 = 1;
+
 #[derive(Clone, Debug, Default)]
 struct Inode {
     live: Vec<u8>,
@@ -339,6 +342,7 @@ pub fn describe(effect: &Effect) -> String {
         Effect::Map { file, extent: blaze_core::Extent::Range { at, len }, .. } => {
             format!("map {len} bytes of {file} at {at}")
         }
+        Effect::MapWrite { file, len, .. } => format!("map {file} for writing, {len} bytes"),
         Effect::Stat { file, .. } => format!("stat {file}"),
         Effect::Lstat { file, .. } => format!("lstat {file}"),
         Effect::List { dir, .. } => format!("list {dir}"),
@@ -445,6 +449,13 @@ impl Files {
         self.dirs.get(dir).copied().unwrap_or(0)
     }
 
+    /// A directory's [`Meta`]: the model keeps no inode for a directory, so its `ino` is 0,
+    /// and its times are its count of changes.
+    fn dir_meta(&self, dir: &str) -> Meta {
+        let changes = self.dir_changes(dir);
+        Meta { len: 0, dir: true, modified_ns: changes, changed_ns: changes, ino: 0, dev: MODEL_DEV }
+    }
+
     /// A file's [`Stamp`], as [`Effect::Entries`] and [`Effect::Stamp`] report it: the inode is
     /// the model's index plus one (never 0, which with the rest 0 is a name with nothing
     /// there), the times its count of changes, since a disk with no clock has no other.
@@ -461,15 +472,8 @@ impl Files {
 
     fn stat(&self, file: &FileName) -> Option<Meta> {
         match self.ino(file) {
-            Some(ino) => {
-                let inode = &self.inodes[ino];
-                Some(Meta { len: inode.live.len() as u64, dir: false, modified_ns: inode.changes })
-            }
-            None if self.is_dir(file.as_str()) => Some(Meta {
-                len: 0,
-                dir: true,
-                modified_ns: self.dir_changes(file.as_str()),
-            }),
+            Some(ino) => Some(Meta::of(&self.file_stamp(ino), MODEL_DEV)),
+            None if self.is_dir(file.as_str()) => Some(self.dir_meta(file.as_str())),
             None => None,
         }
     }
@@ -485,13 +489,9 @@ impl Files {
         for (name, ino) in self.live.iter().filter(|(name, _)| name.starts_with(&under)) {
             for (at, _) in name[under.len()..].match_indices('/') {
                 let inner = &name[..under.len() + at];
-                let meta = Meta { len: 0, dir: true, modified_ns: self.dir_changes(inner) };
-                listed.insert(inner.to_owned(), meta);
+                listed.insert(inner.to_owned(), self.dir_meta(inner));
             }
-            let inode = &self.inodes[*ino];
-            let meta =
-                Meta { len: inode.live.len() as u64, dir: false, modified_ns: inode.changes };
-            listed.insert(name.clone(), meta);
+            listed.insert(name.clone(), Meta::of(&self.file_stamp(*ino), MODEL_DEV));
         }
         // The root is always there, empty or not.
         if listed.is_empty() && dir.name().is_some() {
@@ -506,11 +506,15 @@ impl Files {
     }
 
     /// What is directly in `dir`, each name with its stamp, sorted ([`Effect::Entries`]).
-    fn entries(&self, dir: &FileName) -> Done {
-        if self.live.contains_key(dir.as_str()) {
+    fn entries(&self, dir: &blaze_core::DirName) -> Done {
+        if dir.name().is_some_and(|name| self.live.contains_key(name.as_str())) {
             return Done::Failed(IoError(format!("{dir}: not a directory")));
         }
-        let under = format!("{dir}/");
+        // The root holds every name; a named directory, those that start with it and a `/`.
+        let under = match dir.name() {
+            Some(name) => format!("{name}/"),
+            None => String::new(),
+        };
         let mut found: BTreeMap<String, Stamp> = BTreeMap::new();
         for (name, ino) in self.live.iter().filter(|(name, _)| name.starts_with(&under)) {
             match name[under.len()..].split_once('/') {
@@ -531,15 +535,16 @@ impl Files {
                 }
             }
         }
-        if found.is_empty() {
+        // The root is always there, empty or not.
+        if found.is_empty() && dir.name().is_some() {
             return Done::Failed(IoError(format!("{dir}: no such directory")));
         }
-        Done::Entries(
-            found
-                .into_iter()
-                .map(|(name, stamp)| (FileName::new(&name).expect("a name of the disk"), stamp))
-                .collect(),
-        )
+        // clone: the listing's directory, a refcount.
+        let mut listing = blaze_core::ListingBuilder::new(dir.clone());
+        for (name, stamp) in found {
+            listing.push(name[under.len()..].as_bytes(), stamp).expect("a name of the disk");
+        }
+        Done::Entries(Box::new(listing.finish().expect("the disk's names, each once")))
     }
 
     /// Runs what `effect` does to the names and bytes the process sees, nothing of it durable
@@ -695,7 +700,14 @@ impl Files {
             | Effect::Lock { .. }
             | Effect::Unlock { .. }
             | Effect::MakeDir { .. }
-            | Effect::RemoveDir { .. } => panic!(
+            | Effect::RemoveDir { .. }
+            // Reads above the driver's root (2026-11-16): the store never names a folder
+            // above its own.
+            | Effect::Ancestors { .. }
+            | Effect::Above { .. }
+            // A file mapped for writing (2026-11-16): the store does not ask it yet; the fetch
+            // driver's packs do, proved in blaze-core's simulation.
+            | Effect::MapWrite { .. } => panic!(
                 "the crash model has no rule for {effect:?}: neither the store nor the kernel asked for it when the rules were written; add one to blaze-storemodel's fs.rs"
             ),
             // Not of a file system: watches, clocks, processes, sockets, the standard streams.
@@ -721,7 +733,8 @@ impl Files {
             | Effect::ReadStdin { .. }
             | Effect::WriteOut { .. }
             | Effect::Now { .. }
-            | Effect::Random { .. } => panic!(
+            | Effect::Random { .. }
+            | Effect::Roots { .. } => panic!(
                 "{effect:?} is no effect on files, and the crash model is a file system: a scenario that asks for it needs a driver for it beside blaze-storemodel's fs.rs"
             ),
         })

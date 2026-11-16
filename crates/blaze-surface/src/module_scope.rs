@@ -4,20 +4,23 @@
 //!
 //! It is found by its own `ModuleDecls` and is valid by its read list (read-addressed), never
 //! keyed by the scopes it imports from. A reader asks one `(namespace, name)` ([`ScopeView::get`])
-//! or the digest of one [`VisibilityClass`] a glob reads ([`ScopeView::exports`]), and its read
-//! list holds exactly that, so a private fn added to a module moves no reader that did not ask
-//! for its name and no glob outside it. The read list itself is the store's, not this record's.
+//! or the module's glob edges ([`ScopeView::globs`], read with [`globs_digest`]), and its read
+//! list holds exactly that, so an item added to a module moves no reader that did not ask for
+//! its name. The read list itself is the store's, not this record's.
 //!
 //! The record holds everything the working form does, so [`ScopeBuilder::from`] reads back an
-//! equal scope: the bindings with their origin, depth and state, the errors of user code, the
-//! module's `macro_rules!` sequence and its children's marks in it, the fellows of its group,
-//! the `use .. as _` traits and the macro-expanded `#[macro_export]`s.
+//! equal scope: the module's own bindings with their origin, depth and state, its glob edges
+//! (a name reached through a glob is found at lookup, never copied), the errors of user code, the
+//! module's `macro_rules!` sequence and its children's marks in it, the `use .. as _` traits
+//! and the macro-expanded `#[macro_export]`s. Nothing of how it was solved is in it (a cycle's
+//! members are solved together, and which modules that was depends on the schedule): two
+//! builders of one module write equal bytes whatever their order.
 
 use core::fmt;
 use core::mem::offset_of;
 
 use blaze_format::{FormatError, Record, Slice, Writer};
-use blaze_id::{ContentId, ItemKey, Portable};
+use blaze_id::{ContentId, CrateItemKey, ItemKey, Portable};
 use blaze_own::{AVec, Alloc, Vec};
 
 use crate::column::{
@@ -26,24 +29,11 @@ use crate::column::{
 };
 use crate::error::BuildError;
 use crate::kind::{
-    AmbiguityKind, Binding, BindingState, CallShape, Def, DefKind, DefKindTag, Namespace, Origin,
-    ScopeEntry, StateTag, Visibility, VisibilityClass, VisibilityTag, byte_enum,
+    AmbiguityKind, Binding, BindingState, Def, DefKind, DefKindTag, MacroShapes, Namespace, Origin,
+    ScopeEntry, StateTag, Visibility, VisibilityTag, byte_enum,
 };
 use crate::module_decls::NO_TEXT;
 use crate::path::{Path, PathRow, PathTable, PathView, Paths};
-
-/// The domain of an `Exports` digest.
-pub const EXPORTS_DOMAIN: &str = "blaze surface exports 2";
-
-/// One entry of an `Exports` read: a binding a glob can import, by namespace and name.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct ExportEntry<N> {
-    pub ns: Namespace,
-    pub name: N,
-    pub def: Def,
-    pub vis: Visibility,
-    pub state: BindingState,
-}
 
 /// One `macro_rules!` of a textual scope, in source order (later shadows earlier).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -52,6 +42,8 @@ pub struct TextualDef<N> {
     pub def: ItemKey,
     /// Expansion depth it was defined at (0 in source).
     pub expansion: u16,
+    /// The call shapes its arms are written for.
+    pub shapes: MacroShapes,
 }
 
 /// Where a child module's `mod` line falls in its parent's textual sequence: the child's
@@ -61,6 +53,17 @@ pub struct TextualDef<N> {
 pub struct TextualMark {
     pub child: ItemKey,
     pub len: u32,
+}
+
+/// A resolved `use path::*;` of a scope: the module or enum it imports from, the visibility of
+/// what it imports (the narrower of this and each name's own), and how deep in macro
+/// expansions it was written. A name reached through it is found at lookup, never copied
+/// (docs/v2/plan/design/bottom.md, "Globs are edges, not copies").
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct GlobEdge {
+    pub source: Def,
+    pub vis: Visibility,
+    pub expansion: u16,
 }
 
 /// A `use path as _;` that resolved: it binds no name, and brings its target (a trait) into
@@ -100,9 +103,6 @@ pub enum Unresolved {
     NoParent,
     /// `$crate` of a crate that is not a dependency.
     NoCrate,
-    /// Still undetermined when nothing could move any more: a cycle of imports that only
-    /// justify each other, or a macro whose path depends on its own expansion.
-    Undetermined,
     /// The binding is ambiguous.
     Ambiguous(AmbiguityKind),
     /// A macro of the wrong call shape (a function-like macro used as an attribute, ...).
@@ -117,7 +117,6 @@ byte_enum! {
         NotAModule = 2 => "not a module",
         NoParent = 3 => "no parent",
         NoCrate = 4 => "no crate",
-        Undetermined = 5 => "undetermined",
         Ambiguous = 6 => "ambiguous",
         WrongMacroKind = 7 => "wrong macro kind",
     }
@@ -132,7 +131,6 @@ impl Unresolved {
             Unresolved::NotAModule => (UnresolvedTag::NotAModule, none),
             Unresolved::NoParent => (UnresolvedTag::NoParent, none),
             Unresolved::NoCrate => (UnresolvedTag::NoCrate, none),
-            Unresolved::Undetermined => (UnresolvedTag::Undetermined, none),
             Unresolved::Ambiguous(kind) => (UnresolvedTag::Ambiguous, kind),
             Unresolved::WrongMacroKind => (UnresolvedTag::WrongMacroKind, none),
         }
@@ -145,7 +143,6 @@ impl Unresolved {
             UnresolvedTag::NotAModule => Unresolved::NotAModule,
             UnresolvedTag::NoParent => Unresolved::NoParent,
             UnresolvedTag::NoCrate => Unresolved::NoCrate,
-            UnresolvedTag::Undetermined => Unresolved::Undetermined,
             UnresolvedTag::Ambiguous => Unresolved::Ambiguous(kind),
             UnresolvedTag::WrongMacroKind => Unresolved::WrongMacroKind,
         }
@@ -199,13 +196,15 @@ impl<N, P> ScopeError<N, P> {
 /// A module's scope as a working form: what a resolver writes, and what a [`ModuleScope`]
 /// record holds (docs/v2/plan/design/bottom.md).
 ///
-/// `bindings` is sorted by namespace then name, one entry per pair; `marks` by child and
-/// `fellows` by key. `errors` is in the order the module's text and expansions are written in.
-/// A member of a cycle names its fellows.
+/// `bindings` is sorted by namespace then name, one entry per pair; `marks` by child. `errors`
+/// is in the order the module's text and expansions are written in.
 #[derive(Clone, Debug)]
 pub struct ScopeBuilder<'a, N> {
     pub module: ItemKey,
+    /// The module's own bindings: no name reached through a glob is here.
     pub bindings: AVec<'a, ScopeEntry<N>>,
+    /// The module's glob edges, sorted by source, one per source.
+    pub globs: AVec<'a, GlobEdge>,
     pub errors: AVec<'a, ScopeError<N, Path<'a, N>>>,
     /// The `macro_rules!` defined in this module and in its `#[macro_use]` children, in the
     /// order they are visible: what a `#[macro_use]` on this module carries out to the parent
@@ -213,7 +212,6 @@ pub struct ScopeBuilder<'a, N> {
     pub textual: AVec<'a, TextualDef<N>>,
     /// For each `mod` child (sorted by child key), where its `mod` line falls in `textual`.
     pub marks: AVec<'a, TextualMark>,
-    pub fellows: AVec<'a, ItemKey>,
     /// The `use .. as _` imports, in the module's tree order: the traits they bring into scope.
     /// (A glob does not carry them on yet.)
     pub traits: AVec<'a, AnonImport>,
@@ -233,7 +231,7 @@ impl<'a, N> ScopeBuilder<'a, N> {
             errors: AVec::new_in(alloc),
             textual: AVec::new_in(alloc),
             marks: AVec::new_in(alloc),
-            fellows: AVec::new_in(alloc),
+            globs: AVec::new_in(alloc),
             traits: AVec::new_in(alloc),
             macro_exports: AVec::new_in(alloc),
         }
@@ -249,10 +247,9 @@ impl<N: Ord + Copy> ScopeBuilder<'_, N> {
             .map(|at| &self.bindings[at].binding)
     }
 
-    /// The bindings of one visibility class, in scope order: what an `Exports` read of this
-    /// scope answers, and what the record hashes into the class's digest.
-    pub fn exports(&self, class: VisibilityClass) -> impl Iterator<Item = ExportEntry<N>> + '_ {
-        self.bindings.iter().filter(move |e| e.binding.vis.class() == class).map(|e| export_of(*e))
+    /// The glob edges, by source.
+    pub fn globs(&self) -> &[GlobEdge] {
+        &self.globs
     }
 
     /// The textual mark of `child`, if it is a child of this module.
@@ -261,21 +258,17 @@ impl<N: Ord + Copy> ScopeBuilder<'_, N> {
     }
 }
 
-fn export_of<N>(e: ScopeEntry<N>) -> ExportEntry<N> {
-    ExportEntry { ns: e.ns, name: e.name, def: e.binding.def, vis: e.binding.vis, state: e.binding.state }
-}
-
 impl<'b, N: PartialEq> PartialEq<ScopeBuilder<'b, N>> for ScopeBuilder<'_, N> {
     fn eq(&self, other: &ScopeBuilder<'b, N>) -> bool {
         self.module == other.module
             && self.bindings[..] == other.bindings[..]
+            && self.globs[..] == other.globs[..]
             && self.errors.len() == other.errors.len()
             && self.errors.iter().zip(other.errors.iter()).all(|(a, b)| {
                 a.clone_shape() == b.clone_shape() && a.path().zip(b.path()).is_none_or(|(p, q)| p == q)
             })
             && self.textual[..] == other.textual[..]
             && self.marks[..] == other.marks[..]
-            && self.fellows[..] == other.fellows[..]
             && self.traits[..] == other.traits[..]
             && self.macro_exports[..] == other.macro_exports[..]
     }
@@ -354,21 +347,11 @@ blaze_format::record! {
         pub(crate) ns: Namespace,
         pub(crate) origin: Origin,
         pub(crate) def_kind: DefKindTag,
-        pub(crate) shape: CallShape,
+        pub(crate) shape: MacroShapes,
         pub(crate) vis: VisibilityTag,
         pub(crate) state: StateTag,
         pub(crate) ambiguity: AmbiguityKind,
         pub(crate) pad2: u8,
-    }
-}
-
-blaze_format::record! {
-    /// One visibility class a binding of the scope is in, and the digest of its bindings.
-    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-    pub(crate) struct ExportRow: 1 {
-        pub(crate) module: ContentId,
-        pub(crate) digest: ContentId,
-        pub(crate) class: VisibilityTag,
     }
 }
 
@@ -389,9 +372,9 @@ blaze_format::record! {
         pub(crate) why: UnresolvedTag,
         pub(crate) ambiguity: AmbiguityKind,
         pub(crate) first_kind: DefKindTag,
-        pub(crate) first_shape: CallShape,
+        pub(crate) first_shape: MacroShapes,
         pub(crate) second_kind: DefKindTag,
-        pub(crate) second_shape: CallShape,
+        pub(crate) second_shape: MacroShapes,
         pub(crate) pad2: u8,
     }
 }
@@ -402,7 +385,8 @@ blaze_format::record! {
         pub(crate) name: Text,
         pub(crate) def: ContentId,
         pub(crate) expansion: u16,
-        pub(crate) pad: u16,
+        pub(crate) shapes: MacroShapes,
+        pub(crate) pad: u8,
     }
 }
 
@@ -422,22 +406,38 @@ blaze_format::record! {
         pub(crate) def: ContentId,
         pub(crate) vis_key: ContentId,
         pub(crate) def_kind: DefKindTag,
-        pub(crate) shape: CallShape,
+        pub(crate) shape: MacroShapes,
         pub(crate) vis: VisibilityTag,
         pub(crate) pad: u8,
     }
 }
 
 blaze_format::record! {
+    /// One glob edge: the module or enum a `use ..::*` of the scope imports from.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) struct GlobRow: 1 {
+        pub(crate) source: ContentId,
+        pub(crate) vis_key: ContentId,
+        pub(crate) expansion: u16,
+        pub(crate) def_kind: DefKindTag,
+        pub(crate) shape: MacroShapes,
+        pub(crate) vis: VisibilityTag,
+        pub(crate) pad: u8,
+    }
+}
+
+blaze_format::record! {
+    /// Form 3: the bindings are the module's own (declared, named imports, extern crates,
+    /// macro exports); a name reached through a glob is not copied, the glob is an edge. No
+    /// fellows (form 2 named them): a record says nothing of how it was solved.
     #[derive(Clone, Copy, Debug)]
-    pub(crate) struct ModuleScopeRoot: 1 {
+    pub(crate) struct ModuleScopeRoot: 3 {
         pub(crate) module: ContentId,
         pub(crate) bindings: Slice<BindingRow>,
-        pub(crate) exports: Slice<ExportRow>,
+        pub(crate) globs: Slice<GlobRow>,
         pub(crate) errors: Slice<ErrorRow>,
         pub(crate) textual: Slice<TextualRow>,
         pub(crate) marks: Slice<MarkRow>,
-        pub(crate) fellows: Slice<ContentId>,
         pub(crate) traits: Slice<TraitRow>,
         pub(crate) macro_exports: Slice<TextualRow>,
         pub(crate) paths: Slice<PathRow>,
@@ -450,17 +450,17 @@ const TABLE: &str = "ModuleScope";
 const ZERO: ContentId = ContentId([0; 32]);
 
 /// A def where a row has none: so two builders write equal bytes.
-fn def_parts(def: Option<Def>) -> (ContentId, DefKindTag, CallShape) {
+fn def_parts(def: Option<Def>) -> (ContentId, DefKindTag, MacroShapes) {
     match def {
         Some(def) => {
             let (kind, shape) = def.kind.to_record();
             (def.key.0, kind, shape)
         }
-        None => (ZERO, DefKindTag::Other, CallShape::FnLike),
+        None => (ZERO, DefKindTag::Other, MacroShapes::FN_LIKE),
     }
 }
 
-fn def_of(key: ContentId, kind: DefKindTag, shape: CallShape) -> Def {
+fn def_of(key: ContentId, kind: DefKindTag, shape: MacroShapes) -> Def {
     Def { key: ItemKey(key), kind: DefKind::from_record(kind, shape) }
 }
 
@@ -476,31 +476,53 @@ fn use_site_of(row: &ErrorRow) -> UseSite {
     UseSite { expansion: key_of_word(row.site_key), index: row.site_index }
 }
 
-/// The digest of one class's exports, in scope order: everything a glob of that class reads.
-pub fn exports_digest<N: AsRef<str>>(
-    entries: impl Iterator<Item = ExportEntry<N>>,
-    alloc: Alloc<'_>,
-) -> ContentId {
+/// The domain of a `Globs` digest.
+pub const GLOBS_DOMAIN: &str = "blaze surface globs 2";
+
+/// The digest of a module's glob edges (in order), its crate and its chain of modules from
+/// itself up to its crate's root: everything a lookup through its edges reads of it besides
+/// its names. A finished scope holds no undetermined binding, so there is none to digest.
+pub fn globs_digest(edges: &[GlobEdge], krate: CrateItemKey, chain: &[ItemKey], alloc: Alloc<'_>) -> ContentId {
     let mut bytes = AVec::new_in(alloc);
-    for e in entries {
-        let name = e.name.as_ref();
-        let (def, kind, shape) = def_parts(Some(e.def));
+    for e in edges {
+        let (kind, shape) = e.source.kind.to_record();
         let (vis, vis_key) = e.vis.to_record();
-        let (state, ambiguity) = e.state.to_record();
-        bytes.push(e.ns.byte());
+        bytes.extend_from_slice(&e.source.key.0.0);
+        bytes.extend_from_slice(&[kind.byte(), shape.byte(), vis.byte()]);
+        bytes.extend_from_slice(&vis_key.0);
+        bytes.extend_from_slice(&e.expansion.to_le_bytes());
+    }
+    bytes.push(0xff);
+    bytes.extend_from_slice(&krate.0.0);
+    for m in chain {
+        bytes.extend_from_slice(&m.0.0);
+    }
+    ContentId::of(GLOBS_DOMAIN, &bytes)
+}
+
+/// The domain of a `TextualEntry` or `TextualOut` digest.
+pub const TEXTUAL_DOMAIN: &str = "blaze surface textual 2";
+
+/// The digest of a textual scope (`macro_rules!` in the order they are visible): what a
+/// `TextualEntry` or `TextualOut` read saw. One function for every answerer, so a read list
+/// written by one driver holds against another's answers.
+pub fn textual_digest<N: AsRef<str>>(defs: &[TextualDef<N>], alloc: Alloc<'_>) -> ContentId {
+    let mut bytes = AVec::new_in(alloc);
+    for d in defs {
+        let name = d.name.as_ref();
         bytes.extend_from_slice(&u64::try_from(name.len()).expect("a name fits a u64").to_le_bytes());
         bytes.extend_from_slice(name.as_bytes());
-        bytes.extend_from_slice(&def.0);
-        bytes.extend_from_slice(&[kind.byte(), shape.byte(), vis.byte(), state.byte(), ambiguity.byte()]);
-        bytes.extend_from_slice(&vis_key.0);
+        bytes.extend_from_slice(&d.def.0.0);
+        bytes.extend_from_slice(&d.expansion.to_le_bytes());
+        bytes.push(d.shapes.byte());
     }
-    ContentId::of(EXPORTS_DOMAIN, &bytes)
+    ContentId::of(TEXTUAL_DOMAIN, &bytes)
 }
 
 impl<N: AsRef<str> + Copy> ScopeBuilder<'_, N> {
     /// The [`ModuleScope`] record of this scope, in `alloc`. The bindings are sorted by
-    /// namespace and name, the marks by child and the fellows by key, so the order they are
-    /// in moves no byte; two bindings of one slot are refused.
+    /// namespace and name and the marks by child, so the order they are in moves no byte; two
+    /// bindings of one slot are refused.
     pub fn write<'b>(&self, alloc: Alloc<'b>) -> Result<RecordBytes<'b>, BuildError> {
         self.write_sorted(true, alloc)
     }
@@ -542,18 +564,6 @@ impl<N: AsRef<str> + Copy> ScopeBuilder<'_, N> {
             });
         }
 
-        // Each class a binding is in, by its bytes, then its digest over the sorted bindings.
-        let mut classes = Vec::with_capacity_in(order.len(), alloc);
-        classes.extend(order.iter().map(|&at| bindings[at].binding.vis.class()));
-        classes.sort_unstable_by_key(|class| class.to_record());
-        classes.dedup();
-        let mut exports = Vec::with_capacity_in(classes.len(), alloc);
-        for &class in classes.iter() {
-            let entries = order.iter().map(|&at| bindings[at]).filter(|e| e.binding.vis.class() == class).map(export_of);
-            let (tag, module) = class.to_record();
-            exports.push(ExportRow { module, digest: exports_digest(entries, alloc), class: tag });
-        }
-
         let mut errors = Vec::with_capacity_in(self.errors.len(), alloc);
         for error in self.errors.iter() {
             errors.push(error_row(error, &mut paths, &mut strings)?);
@@ -561,13 +571,22 @@ impl<N: AsRef<str> + Copy> ScopeBuilder<'_, N> {
         let textual = textual_rows(&self.textual, &mut strings, alloc)?;
         let macro_exports = textual_rows(&self.macro_exports, &mut strings, alloc)?;
 
+        let mut globs = Vec::with_capacity_in(self.globs.len(), alloc);
+        for edge in self.globs.iter() {
+            let (source, def_kind, shape) = def_parts(Some(edge.source));
+            let (vis, vis_key) = edge.vis.to_record();
+            globs.push(GlobRow { source, vis_key, expansion: edge.expansion, def_kind, shape, vis, pad: 0 });
+        }
+        if sort {
+            globs.sort_unstable_by_key(|row| row.source);
+        }
+        if let Some(pair) = globs.windows(2).find(|pair| pair[0].source == pair[1].source) {
+            return Err(BuildError::Twice { table: "ModuleScope globs", key: pair[1].source });
+        }
         let mut marks = Vec::from_iter_in(self.marks.iter().map(|m| MarkRow { len: m.len, child: m.child.0 }), alloc);
-        let mut fellows = Vec::from_iter_in(self.fellows.iter().map(|key| key.0), alloc);
         if sort {
             marks.sort_unstable_by_key(|m| m.child);
-            fellows.sort_unstable();
         }
-        fellows.dedup();
         if let Some(pair) = marks.windows(2).find(|pair| pair[0].child == pair[1].child) {
             return Err(BuildError::Twice { table: "ModuleScope marks", key: pair[1].child });
         }
@@ -592,11 +611,10 @@ impl<N: AsRef<str> + Copy> ScopeBuilder<'_, N> {
         let mut out = Writer::new_in(<ModuleScopeRoot as Record>::SCHEMA, alloc);
         let text = Column::push(&mut out, strings.bytes());
         let bindings = Column::push(&mut out, &rows);
-        let exports = Column::push(&mut out, &exports);
+        let globs = Column::push(&mut out, &globs);
         let errors = Column::push(&mut out, &errors);
         let textual = Column::push(&mut out, &textual);
         let marks = Column::push(&mut out, &marks);
-        let fellows = Column::push(&mut out, &fellows);
         let traits = Column::push(&mut out, &traits);
         let macro_exports = Column::push(&mut out, &macro_exports);
         let path_rows = Column::push(&mut out, &paths.rows);
@@ -604,11 +622,10 @@ impl<N: AsRef<str> + Copy> ScopeBuilder<'_, N> {
         Ok(finish_with(out, |at| ModuleScopeRoot {
             module: self.module.0,
             bindings: bindings.slice(at, offset_of!(ModuleScopeRoot, bindings)),
-            exports: exports.slice(at, offset_of!(ModuleScopeRoot, exports)),
+            globs: globs.slice(at, offset_of!(ModuleScopeRoot, globs)),
             errors: errors.slice(at, offset_of!(ModuleScopeRoot, errors)),
             textual: textual.slice(at, offset_of!(ModuleScopeRoot, textual)),
             marks: marks.slice(at, offset_of!(ModuleScopeRoot, marks)),
-            fellows: fellows.slice(at, offset_of!(ModuleScopeRoot, fellows)),
             traits: traits.slice(at, offset_of!(ModuleScopeRoot, traits)),
             macro_exports: macro_exports.slice(at, offset_of!(ModuleScopeRoot, macro_exports)),
             paths: path_rows.slice(at, offset_of!(ModuleScopeRoot, paths)),
@@ -625,7 +642,7 @@ fn textual_rows<'b, N: AsRef<str>>(
 ) -> Result<AVec<'b, TextualRow>, BuildError> {
     let mut rows = AVec::with_capacity_in(defs.len(), alloc);
     for d in defs {
-        rows.push(TextualRow { name: strings.push(d.name.as_ref(), TABLE)?, def: d.def.0, expansion: d.expansion, pad: 0 });
+        rows.push(TextualRow { name: strings.push(d.name.as_ref(), TABLE)?, def: d.def.0, expansion: d.expansion, shapes: d.shapes, pad: 0 });
     }
     Ok(rows)
 }
@@ -697,10 +714,10 @@ impl<'a, 'b> ScopeBuilder<'b, &'a str> {
     pub fn from(view: &ScopeView<'a>, alloc: Alloc<'b>) -> ScopeBuilder<'b, &'a str> {
         let mut out = ScopeBuilder::new_in(view.module(), alloc);
         out.bindings.extend(view.bindings());
+        out.globs.extend(view.globs());
         out.errors.extend(view.errors().map(|e| e.map_path(|p| p.to_path_in(alloc))));
         out.textual.extend(view.textual());
         out.marks.extend(view.marks());
-        out.fellows.extend(view.fellows());
         out.traits.extend(view.traits());
         out.macro_exports.extend(view.macro_exports());
         out
@@ -712,11 +729,10 @@ impl<'a, 'b> ScopeBuilder<'b, &'a str> {
 pub struct ScopeView<'a> {
     module: ItemKey,
     rows: &'a [BindingRow],
-    exports: &'a [ExportRow],
+    globs: &'a [GlobRow],
     errors: &'a [ErrorRow],
     textual: &'a [TextualRow],
     marks: &'a [MarkRow],
-    fellows: &'a [ContentId],
     traits: &'a [TraitRow],
     macro_exports: &'a [TextualRow],
     paths: Paths<'a>,
@@ -726,7 +742,7 @@ pub struct ScopeView<'a> {
 impl<'a> ScopeView<'a> {
     /// The record in `buffer`, checked once: its layout, every name and path, and that its
     /// bindings are in strictly increasing order of namespace and name, which
-    /// [`ScopeView::get`] probes by (its classes, marks and fellows likewise by their keys).
+    /// [`ScopeView::get`] probes by (its glob edges and marks likewise by their keys).
     pub fn read(buffer: &'a [u8]) -> Result<ScopeView<'a>, FormatError> {
         let root = blaze_format::open::<ModuleScopeRoot>(buffer)?;
         let strings = root.strings.as_str(buffer)?;
@@ -734,11 +750,10 @@ impl<'a> ScopeView<'a> {
         let view = ScopeView {
             module: ItemKey(root.module),
             rows: root.bindings.follow(buffer)?,
-            exports: root.exports.follow(buffer)?,
+            globs: root.globs.follow(buffer)?,
             errors: root.errors.follow(buffer)?,
             textual: root.textual.follow(buffer)?,
             marks: root.marks.follow(buffer)?,
-            fellows: root.fellows.follow(buffer)?,
             traits: root.traits.follow(buffer)?,
             macro_exports: root.macro_exports.follow(buffer)?,
             paths,
@@ -750,12 +765,7 @@ impl<'a> ScopeView<'a> {
         check_increasing(view.rows, buffer, "bindings out of order or two of one slot", |row| {
             (row.ns, text_of(strings, row.name))
         })?;
-        check_increasing(view.exports, buffer, "visibility classes out of order or repeated", |row| (row.class, row.module))?;
-        for row in view.exports {
-            if row.class != VisibilityTag::Restricted && row.module != ZERO {
-                return Err(FormatError::Invalid { at: at_of_record(row, buffer), what: "a module on a class that has none" });
-            }
-        }
+        check_increasing(view.globs, buffer, "glob edges out of order or two of one source", |row| row.source)?;
         for row in view.errors {
             check_text(strings, row.name, row, buffer)?;
             let has_path = matches!(row.tag, ErrorTag::Import | ErrorTag::Macro | ErrorTag::RestrictedNotAncestor);
@@ -771,7 +781,6 @@ impl<'a> ScopeView<'a> {
             check_text(strings, row.name, row, buffer)?;
         }
         check_increasing(view.marks, buffer, "textual marks out of order or repeated", |row| row.child)?;
-        check_increasing(view.fellows, buffer, "fellow modules out of order or repeated", |key| *key)?;
         Ok(view)
     }
 
@@ -809,24 +818,15 @@ impl<'a> ScopeView<'a> {
         self.rows.iter().map(move |row| view.decode(row))
     }
 
-    /// The digest of the bindings a glob of `class` reads: of none when no binding is in it.
-    pub fn exports(&self, class: VisibilityClass) -> ContentId {
-        let (tag, module) = class.to_record();
-        match self.exports.binary_search_by(|row| (row.class, row.module).cmp(&(tag, module))) {
-            Ok(at) => self.exports[at].digest,
-            Err(_) => ContentId::of(EXPORTS_DOMAIN, &[]),
-        }
+    /// The glob edges, by source.
+    pub fn globs(&self) -> impl ExactSizeIterator<Item = GlobEdge> + use<'a> {
+        self.globs.iter().map(|row| GlobEdge {
+            source: def_of(row.source, row.def_kind, row.shape),
+            vis: Visibility::from_record(row.vis, row.vis_key),
+            expansion: row.expansion,
+        })
     }
 
-    /// The bindings of `class`, in scope order: what an `Exports` read answers.
-    pub fn exported(&self, class: VisibilityClass) -> impl Iterator<Item = ExportEntry<&'a str>> + use<'a> {
-        self.bindings().filter(move |e| e.binding.vis.class() == class).map(export_of)
-    }
-
-    /// The classes a binding of the scope is in, each with its digest, by class.
-    pub fn classes(&self) -> impl ExactSizeIterator<Item = (VisibilityClass, ContentId)> + use<'a> {
-        self.exports.iter().map(|row| (VisibilityClass::from_record(row.class, row.module), row.digest))
-    }
 
     /// The errors of user code, in the order the module's text and expansions are written in.
     pub fn errors(&self) -> impl ExactSizeIterator<Item = ScopeError<&'a str, PathView<'a>>> + use<'a> {
@@ -871,12 +871,6 @@ impl<'a> ScopeView<'a> {
         Some(self.marks[at].len)
     }
 
-    /// The other modules of the strongly connected set this scope was solved in; none for a
-    /// module alone.
-    pub fn fellows(&self) -> impl ExactSizeIterator<Item = ItemKey> + use<'a> {
-        self.fellows.iter().map(|key| ItemKey(*key))
-    }
-
     /// The `use .. as _` imports, in the module's tree order.
     pub fn traits(&self) -> impl ExactSizeIterator<Item = AnonImport> + use<'a> {
         self.traits.iter().map(|row| AnonImport {
@@ -893,5 +887,5 @@ impl<'a> ScopeView<'a> {
 }
 
 fn textual_of<'a>(strings: &'a str, rows: &'a [TextualRow]) -> impl ExactSizeIterator<Item = TextualDef<&'a str>> + use<'a> {
-    rows.iter().map(move |row| TextualDef { name: text_of(strings, row.name), def: ItemKey(row.def), expansion: row.expansion })
+    rows.iter().map(move |row| TextualDef { name: text_of(strings, row.name), def: ItemKey(row.def), expansion: row.expansion, shapes: row.shapes })
 }

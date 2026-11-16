@@ -424,6 +424,8 @@ impl Shared {
 
 pub struct Threads {
     start: Instant,
+    /// The machine's boot, read once as the driver is made ([`crate::Driver::boot`]).
+    boot: Result<crate::Boot, crate::NoBoot>,
     shared: Arc<Shared>,
     /// What the threads told, taken from their mailbox at once.
     inbox: VecDeque<Told>,
@@ -538,6 +540,7 @@ impl Threads {
         let host = crate::host::Host::new(Arc::new(HostSink(Arc::clone(&shared))));
         Threads {
             start: Instant::now(),
+            boot: crate::boot::system(),
             shared,
             // alloc: once per driver, swapped with the mailbox's queue.
             inbox: VecDeque::with_capacity(RESERVE),
@@ -1399,16 +1402,22 @@ fn run_kept(root: &Path, kept: &Descriptors, effect: Effect) -> io::Result<Done>
             Ok(Done::Stat(at(root, &file, |path| fs::stat(path, false))?))
         }
         #[cfg(any(unix, target_os = "wasi"))]
-        Effect::Stamp { files, .. } => Ok(Done::Stamped(fs::stamps(root, &files)?)),
+        Effect::Stamp { files, .. } => {
+            crate::journal::stamp_rows(&files)?;
+            Ok(Done::Stamped(fs::stamps(root, &files)?))
+        }
         #[cfg(any(unix, target_os = "wasi"))]
         Effect::Entries { dir, .. } => {
-            Ok(Done::Entries(at(root, &dir, |path| fs::entries(path, &dir))?))
+            Ok(Done::Entries(Box::new(at_dir(root, &dir, |path| fs::entries(path, &dir))?)))
         }
         #[cfg(windows)]
-        Effect::Stamp { files, .. } => Ok(Done::Stamped(crate::iocp::stamps(root, &files)?)),
+        Effect::Stamp { files, .. } => {
+            crate::journal::stamp_rows(&files)?;
+            Ok(Done::Stamped(crate::iocp::stamps(root, &files)?))
+        }
         #[cfg(windows)]
         Effect::Entries { dir, .. } => {
-            Ok(Done::Entries(at(root, &dir, |path| crate::iocp::entries(path, &dir))?))
+            Ok(Done::Entries(Box::new(at_dir(root, &dir, |path| crate::iocp::entries(path, &dir))?)))
         }
         Effect::List { dir, .. } => Ok(Done::Listed(at_dir(root, &dir, |path| fs::list(path, &dir))?)),
         Effect::Remove { file, .. } => at(root, &file, |path| {
@@ -1423,8 +1432,13 @@ fn run_kept(root: &Path, kept: &Descriptors, effect: Effect) -> io::Result<Done>
         Effect::RemoveDir { dir, .. } => at(root, &dir, |path| std::fs::remove_dir(path))
             .map(|()| Done::RemovedDir)
             .map_err(|error| named(&dir, &error)),
+        Effect::Ancestors { most, .. } => Ok(Done::Ancestors(fs::ancestors(root, most)?)),
+        Effect::Above { op, name, .. } => fs::above(root, op, &name),
         Effect::Map { file, extent, .. } => Ok(Done::Mapped(
             at(root, &file, |path| fs::map_extent(path, extent)).map_err(|error| named(&file, &error))?,
+        )),
+        Effect::MapWrite { file, len, .. } => Ok(Done::MappedWrite(
+            at(root, &file, |path| fs::map_write(path, len)).map_err(|error| named(&file, &error))?,
         )),
         Effect::Lock { .. } | Effect::Unlock { .. } => {
             unreachable!("file locks are kept by the driver, which takes each as it is asked for")
@@ -1451,7 +1465,8 @@ fn run_kept(root: &Path, kept: &Descriptors, effect: Effect) -> io::Result<Done>
         | Effect::ReadStdin { .. }
         | Effect::WriteOut { .. }
         | Effect::Now { .. }
-        | Effect::Random { .. } => {
+        | Effect::Random { .. }
+        | Effect::Roots { .. } => {
             unreachable!(
                 "timers, watches, processes, sockets, the standard streams, the clock and \
                  randomness are kept by the driver"
@@ -2350,6 +2365,9 @@ impl Driver for Threads {
                 Effect::Now { tag } => self.tell(tag, crate::host::wall()),
                 #[cfg(not(unix))]
                 Effect::Random { len, tag } => self.tell(tag, crate::host::random(len)),
+                // Refused by name where `crate::trust` reads no store (Windows, WASI).
+                #[cfg(not(unix))]
+                Effect::Roots { cert_file, cert_dir, tag } => self.tell(tag, crate::host::roots(cert_file, cert_dir)),
                 #[cfg(not(unix))]
                 effect @ (Effect::Bind { .. }
                 | Effect::SendTo { .. }
@@ -2433,5 +2451,9 @@ impl Driver for Threads {
 
     fn wall_ns(&self) -> u64 {
         crate::system_wall_ns()
+    }
+
+    fn boot(&self) -> Result<crate::Boot, crate::NoBoot> {
+        self.boot.clone()
     }
 }

@@ -1,0 +1,12 @@
+note  take a slice: `&[String]`
+warning  this `.clone()` copies a vector only read
+  ╭─ src/copy.rs:1:16
+1 │ fn copy(names: &Vec<String>) -> usize {
+  │                ^^^^^^^^^^^^
+  │                ╰─ take a slice: `&[String]`
++ │ fn copy(names: [-&Vec<String>-]{+&[String]+}) -> usize {
+2 │     let names = names.clone();
+  │                      ^^^^^^^^
+  │                      ╰─ not needed
++ │     let names = names[-.clone()-];
+  ╰─ blaze explain lint:slices · blaze explain lint:clones

@@ -11,6 +11,22 @@ pub(crate) mod barrier;
 
 use crate::FileName;
 
+/// The most names one [`crate::Effect::Stamp`] stamps: a million, whose stamps (40 bytes each)
+/// its completion carries. A column longer is refused as a whole before any name is stamped.
+pub const STAMP_MOST: usize = 1 << 20;
+
+/// `names` refused as a whole, before any is stamped, when there are more than [`STAMP_MOST`]:
+/// what every driver's [`crate::Effect::Stamp`] asks first.
+pub(crate) fn stamp_rows(names: &Names) -> std::io::Result<()> {
+    match names.len() <= STAMP_MOST {
+        true => Ok(()),
+        false => Err(std::io::Error::other(format!(
+            "a stamp of {} names: one stamp is at most STAMP_MOST, {STAMP_MOST}; split the column",
+            names.len()
+        ))),
+    }
+}
+
 /// Many names under the driver's root in one buffer, for an effect over thousands of them:
 /// each is a [`FileName`]'s text and a NUL, so a driver hands it to the system as it is, with
 /// no allocation per name.

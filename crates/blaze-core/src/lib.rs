@@ -36,6 +36,7 @@
 #![cfg_attr(target_os = "wasi", feature(wasi_ext))]
 
 pub mod atomic;
+pub mod boot;
 pub mod busy;
 pub mod chan;
 #[cfg(target_os = "linux")]
@@ -94,6 +95,7 @@ pub mod reaped;
     reason = "a file mapped shared as atomic words; its waits are blaze_core::wait::wait_shared's"
 )]
 pub mod shared;
+pub mod reserve;
 pub mod signal;
 pub mod sim;
 pub mod site;
@@ -106,6 +108,7 @@ mod sync;
 mod tags;
 pub mod temp;
 pub mod threads;
+pub mod trust;
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code, reason = "the io_uring driver: its mapped rings, buffers and system calls")]
 pub mod uring;
@@ -116,15 +119,19 @@ mod watch;
 pub mod wait;
 pub mod wheel;
 pub mod world;
+pub mod listing;
 
 use std::{fmt, time::Duration};
 
+pub use crate::listing::{Kind, Leaf, Listing, ListingBuilder, ListingError};
+
 pub use crate::journal::{
-    Cursor, Journaled, Lost, Names, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, Stamp,
+    Cursor, Journaled, Lost, Names, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, STAMP_MOST, Stamp,
 };
 pub use crate::descriptors::Opens;
 pub use crate::spans::{DIRECT_ALIGN, Memory, Registered, Span, SpanRegion, Spans};
 pub use crate::tags::Tags;
+pub use crate::boot::{Boot, NoBoot};
 
 /// Makes the sandbox of a process: given to a driver by whoever owns the platform's sandbox
 /// (`blaze-usercode`), so the driver starts what it says in place of the program. A driver
@@ -777,14 +784,20 @@ pub enum Effect {
     /// followed; a name that is not there is [`Stamp::GONE`]. Completes with
     /// [`Done::Stamped`]; it fails only as a whole, never for one name. `files` is shared, so
     /// an asker that compares the stamps against the names keeps them without a copy.
+    ///
+    /// One submission and one completion for the whole column: the batched stat. Every name
+    /// is a [`FileName`]'s text by [`Names`]' construction, so none is checked again here; more
+    /// than [`STAMP_MOST`] names are refused as a whole before any is stamped. The native
+    /// drivers stamp by `fstatat` (io_uring: `statx`) relative to the root's descriptor.
     Stamp {
         files: std::sync::Arc<Names>,
         tag: Tag,
     },
-    /// What is directly in `dir`, each name with its [`Stamp`], sorted by name; completes with
+    /// What is directly in `dir`, the driver's root ([`DirName::Root`]) or a directory named
+    /// under it, each name with its [`Stamp`], sorted by name; completes with
     /// [`Done::Entries`]. A `dir` that is not there, or not a directory, fails.
     Entries {
-        dir: FileName,
+        dir: DirName,
         tag: Tag,
     },
     /// Completes with [`Done::Flushed`] once every change the system had queued for the watch
@@ -819,6 +832,22 @@ pub enum Effect {
     Map {
         file: FileName,
         extent: Extent,
+        tag: Tag,
+    },
+    /// `file` made (or cut, or grown) to exactly `len` zero bytes and mapped read-write and
+    /// shared: completes with [`Done::MappedWrite`], whose [`MappingWrite::bytes_mut`] are the
+    /// file's bytes. How a task writes a large record once, straight into the file that will
+    /// hold it (docs/v2/plan/design/fetch.md, "Writing a record in place"; [`reserve`] is the
+    /// protocol over it).
+    ///
+    /// What is written through it is the file's, but durable only once a [`Effect::Sync`] of
+    /// the file asked after the mapping is dropped completes; at a crash before that, any of
+    /// its blocks may or may not be in the file. The asker's contract: nothing else writes,
+    /// cuts or maps the file while the mapping lives, and no other effect on the file is asked
+    /// until it is dropped.
+    MapWrite {
+        file: FileName,
+        len: u64,
         tag: Tag,
     },
     /// A process started as `command` says, in its sandbox; completes with [`Done::Exited`]
@@ -972,6 +1001,18 @@ pub enum Effect {
         len: usize,
         tag: Tag,
     },
+    /// The machine's TLS trust anchors, read now ([`trust`]): completes with [`Done::Roots`],
+    /// or [`Done::Untrusted`] naming every place looked and what each gave. `cert_file` and
+    /// `cert_dir` are the asker's `SSL_CERT_FILE` and `SSL_CERT_DIR` (rule 75: passed in, never
+    /// read here; Linux reads them, macOS reads its keychains). Text, not `OsString`, so
+    /// `#![no_std]` askers (bstd) can name it; an environment's values are text there already.
+    /// Asked on a client's first connection, never at start. Windows and WASI refuse it by
+    /// name. The simulation answers with the roots its world was given.
+    Roots {
+        cert_file: Option<String>,
+        cert_dir: Option<String>,
+        tag: Tag,
+    },
     /// `dir` made, empty: completes with [`Done::MadeDir`]. Its parent must be there (the
     /// root always is); a `dir` that is there already, as a file or a directory, fails, naming
     /// it.
@@ -986,6 +1027,153 @@ pub enum Effect {
         dir: FileName,
         tag: Tag,
     },
+    /// The folders above the driver's root, at most `most` of them, nearest first: completes
+    /// with [`Done::Ancestors`], the one way an [`Above`] can be made. Read from the system
+    /// (the root's own path) when asked, never at start.
+    Ancestors {
+        most: u8,
+        tag: Tag,
+    },
+    /// A read of a folder above the driver's root, or of a file beneath one: `op` on `name`.
+    /// Only reads: no other effect takes an [`Above`], so nothing writes, renames or removes
+    /// above the root. Completes as its [`AboveOp`] says.
+    Above {
+        op: AboveOp,
+        name: Above,
+        tag: Tag,
+    },
+}
+
+/// What an [`Effect::Above`] reads.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum AboveOp {
+    /// Its [`Meta`], not following a link at the last name: [`Done::Stat`], `None` when not
+    /// there.
+    Stat,
+    /// The file's bytes: [`Done::Read`]; a file not there fails, naming it.
+    Read,
+    /// The names directly in the folder, sorted, each with its [`Meta`], relative to it:
+    /// [`Done::Listed`]; a folder not there fails, naming it.
+    List,
+}
+
+/// A folder `up` steps above the driver's root, or the file `rest` beneath it. Made only by
+/// [`Ancestors::above`], from a driver's answer, so `up` is never past the folders it was
+/// granted and `rest` never walks back down into the root (one file has one name); taken only
+/// by [`Effect::Above`], which reads. Nothing of an absolute path is in it.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)] // clone: a refcount at most
+pub struct Above {
+    up: core::num::NonZeroU8,
+    rest: Option<FileName>,
+}
+
+impl Above {
+    /// How many folders above the root.
+    pub fn up(&self) -> core::num::NonZeroU8 {
+        self.up
+    }
+
+    /// The file beneath that folder, or `None` for the folder itself.
+    pub fn rest(&self) -> Option<&FileName> {
+        self.rest.as_ref()
+    }
+
+    /// As a path relative to the root: `..` steps, then `rest`.
+    pub fn relative(&self) -> std::path::PathBuf {
+        let mut path = std::path::PathBuf::new();
+        for _ in 0..self.up.get() {
+            path.push("..");
+        }
+        if let Some(rest) = &self.rest {
+            path.push(rest.as_str());
+        }
+        path
+    }
+}
+
+impl fmt::Display for Above {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for at in 0..self.up.get() {
+            f.write_str(if at == 0 { ".." } else { "/.." })?;
+        }
+        match &self.rest {
+            Some(rest) => write!(f, "/{rest}"),
+            None => Ok(()),
+        }
+    }
+}
+
+/// The folders above a driver's root that it answered for ([`Effect::Ancestors`]), nearest
+/// first: for each, the name in it of the folder on the way down to the root. Its length is
+/// the granted depth. Made only by a driver.
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: a refcount
+pub struct Ancestors {
+    toward: std::sync::Arc<[std::sync::Arc<str>]>,
+}
+
+/// Why [`Ancestors::above`] made no name.
+#[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
+pub enum AboveRefused {
+    /// `up` is 0: the root itself is no folder above it.
+    Root,
+    /// `up` is past the granted top, which is `depth` folders above the root.
+    PastTop { up: u8, depth: u8 },
+    /// `rest` walks back down toward the root through `toward`, a folder that has a shorter
+    /// name already.
+    IntoStart { up: u8, toward: std::sync::Arc<str> },
+}
+
+impl fmt::Display for AboveRefused {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AboveRefused::Root => f.write_str("0 folders up is the root itself, not a folder above it"),
+            AboveRefused::PastTop { up, depth } => {
+                write!(f, "{up} folders up is past the granted top, {depth} above the start folder")
+            }
+            AboveRefused::IntoStart { up, toward } => write!(
+                f,
+                "a name {up} folders up that goes down into {toward:?} walks back toward the start folder, \
+                 which names it with fewer steps"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for AboveRefused {}
+
+impl Ancestors {
+    /// What a driver answers: `toward` nearest first, cut to `most`.
+    pub(crate) fn answered(mut toward: Vec<std::sync::Arc<str>>, most: u8) -> Ancestors {
+        toward.truncate(usize::from(most));
+        Ancestors { toward: toward.into() }
+    }
+
+    /// How many folders above the root were granted.
+    pub fn depth(&self) -> u8 {
+        u8::try_from(self.toward.len()).expect("cut to a u8 when answered")
+    }
+
+    /// The name, in the folder `up` above the root, of the folder on the way down to it.
+    pub fn toward(&self, up: core::num::NonZeroU8) -> Option<&str> {
+        self.toward.get(usize::from(up.get()) - 1).map(|it| &**it)
+    }
+
+    /// The folder `up` above the root, or the file `rest` beneath it: refused past the granted
+    /// top, and where `rest` starts with the folder on the way down (that file's name is
+    /// shorter: fewer steps up).
+    pub fn above(&self, up: u8, rest: Option<FileName>) -> Result<Above, AboveRefused> {
+        let Some(up) = core::num::NonZeroU8::new(up) else { return Err(AboveRefused::Root) };
+        let Some(toward) = self.toward.get(usize::from(up.get()) - 1) else {
+            return Err(AboveRefused::PastTop { up: up.get(), depth: self.depth() });
+        };
+        if let Some(rest) = &rest
+            && rest.as_str().split('/').next() == Some(&**toward)
+        {
+            // clone: an error's name, a refcount.
+            return Err(AboveRefused::IntoStart { up: up.get(), toward: toward.clone() });
+        }
+        Ok(Above { up, rest })
+    }
 }
 
 /// The most bytes one datagram of [`Effect::SendTo`] carries: UDP's most over IPv4 (65,535
@@ -1065,6 +1253,7 @@ impl Effect {
             | Effect::Flush { tag, .. }
             | Effect::Timer { tag, .. }
             | Effect::Map { tag, .. }
+            | Effect::MapWrite { tag, .. }
             | Effect::Spawn { tag, .. }
             | Effect::Kill { tag }
             | Effect::Listen { tag, .. }
@@ -1083,8 +1272,11 @@ impl Effect {
             | Effect::WriteOut { tag, .. }
             | Effect::Now { tag }
             | Effect::Random { tag, .. }
+            | Effect::Roots { tag, .. }
             | Effect::MakeDir { tag, .. }
-            | Effect::RemoveDir { tag, .. } => *tag,
+            | Effect::RemoveDir { tag, .. }
+            | Effect::Ancestors { tag, .. }
+            | Effect::Above { tag, .. } => *tag,
         }
     }
 }
@@ -1337,6 +1529,84 @@ impl Mapping {
     }
 }
 
+/// A file mapped read-write by [`Effect::MapWrite`]: its bytes, written in place, the file's
+/// once the mapping is dropped. Not `Clone`: one writer. Dropping it unmaps (a driver) or hands
+/// the bytes back (the simulation, which folds them into the file as unsynced writes at its
+/// next effect, so a crash before a sync tears them as any other write).
+pub struct MappingWrite(Writable);
+
+enum Writable {
+    File(fs::MappedWrite),
+    /// The simulation's: the bytes, put into the slot the simulator holds when dropped.
+    Sim { bytes: Vec<u8>, back: sim::Drawn },
+}
+
+impl Drop for Writable {
+    fn drop(&mut self) {
+        if let Writable::Sim { bytes, back } = self {
+            *back.lock() = Some(std::mem::take(bytes));
+        }
+    }
+}
+
+impl MappingWrite {
+    pub(crate) fn file(mapped: fs::MappedWrite) -> MappingWrite {
+        MappingWrite(Writable::File(mapped))
+    }
+
+    pub(crate) fn sim(bytes: Vec<u8>, back: sim::Drawn) -> MappingWrite {
+        MappingWrite(Writable::Sim { bytes, back })
+    }
+
+    /// The file's bytes, exactly the length asked.
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        match &mut self.0 {
+            Writable::File(mapped) => mapped.bytes_mut(),
+            Writable::Sim { bytes, .. } => bytes,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match &self.0 {
+            Writable::File(mapped) => mapped.len(),
+            Writable::Sim { bytes, .. } => bytes.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl fmt::Debug for MappingWrite {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "MappingWrite({} bytes)", self.len())
+    }
+}
+
+impl PartialEq for MappingWrite {
+    /// Two writable mappings are never one: each is its file's only writer.
+    fn eq(&self, _other: &MappingWrite) -> bool {
+        false
+    }
+}
+
+impl Eq for MappingWrite {}
+
+/// Tests keep the completions they saw ([`Done`] is `Clone` under test): a copy of the bytes
+/// as they are, in a buffer no file holds.
+#[cfg(test)]
+impl Clone for MappingWrite {
+    fn clone(&self) -> MappingWrite {
+        let bytes = match &self.0 {
+            Writable::File(mapped) => mapped.bytes().to_vec(),
+            Writable::Sim { bytes, .. } => bytes.clone(),
+        };
+        // A slot no simulator drains.
+        MappingWrite::sim(bytes, std::sync::Arc::new(lock::Lock::new("test.drawn", None)))
+    }
+}
+
 impl PartialEq for Mapping {
     fn eq(&self, other: &Mapping) -> bool {
         self.bytes() == other.bytes()
@@ -1351,7 +1621,10 @@ impl fmt::Debug for Mapping {
     }
 }
 
-/// What [`Effect::Stat`] or [`Effect::Lstat`] found.
+/// What [`Effect::Stat`], [`Effect::Lstat`] or [`Effect::List`] found of one name: its length
+/// and kind, and what identifies this version of it (the inode, the device, both times), from
+/// the same call that found it (macOS's `getattrlistbulk` for a listing, a `stat` for a stat).
+/// Unlike [`Stamp`], which the sweep keeps in its image, it says the device too.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Meta {
     pub len: u64,
@@ -1360,6 +1633,28 @@ pub struct Meta {
     /// simulation has no clock of the world: there it is the simulated disk's count of changes,
     /// or the time an [`Effect::Times`] gave the file.
     pub modified_ns: u64,
+    /// The inode's change time as `modified_ns` counts (a chmod, a rename, a link move it too);
+    /// 0 where the system keeps none.
+    pub changed_ns: u64,
+    /// The inode (NTFS: the file reference number; 0 where the system gives none): a file
+    /// replaced by a rename has another.
+    pub ino: u64,
+    /// The device the inode is on (`st_dev`; 0 where the system gives none).
+    pub dev: u64,
+}
+
+impl Meta {
+    /// Of a [`Stamp`] of a file that is there, on the device `dev`.
+    pub fn of(stamp: &Stamp, dev: u64) -> Meta {
+        Meta {
+            len: stamp.size,
+            dir: stamp.is_dir(),
+            modified_ns: stamp.mtime_ns,
+            changed_ns: stamp.ctime_ns,
+            ino: stamp.ino,
+            dev,
+        }
+    }
 }
 
 /// Who may change a file besides the user the process runs as, as [`Effect::Private`] finds.
@@ -1473,8 +1768,9 @@ pub enum Done {
     Journaled(Box<Journaled>),
     /// Of an [`Effect::Stamp`]: one per name, in its order.
     Stamped(Vec<Stamp>),
-    /// Of an [`Effect::Entries`]: each name under the root, sorted.
-    Entries(Vec<(FileName, Stamp)>),
+    /// Of an [`Effect::Entries`]: what is directly in the directory, as columns sorted by the
+    /// names' bytes ([`Listing`]). Boxed: a completion stays the size of a [`Done::Broken`].
+    Entries(Box<Listing>),
     Unwatched,
     /// Of an [`Effect::Pressure`]: the system said memory is short, `critical` when it said so
     /// at its highest level (macOS's critical; PSI has one level, said as not critical). One
@@ -1486,6 +1782,8 @@ pub enum Done {
     Flushed,
     Fired,
     Mapped(Mapping),
+    /// Of an [`Effect::MapWrite`]: the file's bytes, to write.
+    MappedWrite(MappingWrite),
     Exited(Box<Exit>),
     Accepted {
         conn: Conn,
@@ -1532,8 +1830,15 @@ pub enum Done {
     Wall(Duration),
     /// Of an [`Effect::Random`]: its bytes.
     Random(Vec<u8>),
+    /// Of an [`Effect::Roots`]: at least one root. Boxed, as the next, so a completion stays
+    /// the size it was.
+    Roots(Box<trust::Roots<std::alloc::Global>>),
+    /// Of an [`Effect::Roots`]: no root, or a store that would not read: every place looked.
+    Untrusted(Box<trust::TrustError>),
     MadeDir,
     RemovedDir,
+    /// Of an [`Effect::Ancestors`]: the folders above the root it may read.
+    Ancestors(Ancestors),
     /// It did not happen. For an append, none of its bytes are durable unless a later sync
     /// says so; for a sync, nothing appended since the last successful one is known durable;
     /// for a write, the file is as it was.
@@ -1612,6 +1917,11 @@ pub trait Driver {
     /// ([`sim::Sim::wall_start`]), the clock its disk stamps mtimes from, so a stamp taken
     /// just after a write is racy there as on a real disk.
     fn wall_ns(&self) -> u64;
+    /// Which boot of the machine this is ([`Boot`]): a native driver read it once as it was
+    /// made (macOS `kern.bootsessionuuid`, Linux `/proc/sys/kernel/random/boot_id`); the
+    /// simulation draws a new one at every power cut. A fact passed in, never read ambiently
+    /// and never put in a key; a host with none says so ([`NoBoot`]).
+    fn boot(&self) -> Result<Boot, NoBoot>;
     /// A handle another thread ends this driver's wait with ([`Waker`]), where the driver has
     /// one: what a thread that finished work the loop reads from a queue of its own (a plane
     /// task's end) calls after it queued it, so the loop turns then and not at its next

@@ -140,9 +140,21 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     }
                 }
             }
-            if let TyView::Param(p) = self.view(step.ty) {
+            // A parameter's bound traits, and an object's principal with its supertraits, are
+            // found at their step whether or not in scope (typeck.md "Trait objects" (c)).
+            let view = self.view(step.ty);
+            if let TyView::Param(_) | TyView::Dynamic(_) = view {
                 bounds.clear();
-                self.param_bound_traits(p, &mut bounds)?;
+                match view {
+                    TyView::Param(p) => self.param_bound_traits(p, &mut bounds)?,
+                    TyView::Dynamic(l) => {
+                        if let Some((k, _)) = self.principal_args(l) {
+                            bounds.push(k);
+                            self.elaborate_bound_traits(&mut bounds, 0)?;
+                        }
+                    }
+                    _ => {}
+                }
                 for &tr in bounds.iter() {
                     if let Some(it) = self.reads.assoc_item(tr, name)? {
                         if let AssocKind::Fn { self_param } = it.kind {
@@ -204,10 +216,10 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     }
 
     /// The impl's arguments with its self type unified with `self_ty`, or `None`.
-    pub(crate) fn impl_args(&mut self, imp: ItemKey, self_ty: Ty) -> Result<Option<TyList>, Stop> {
+    pub(crate) fn impl_args(&mut self, imp: ItemKey, self_ty: Ty, cause: Cause) -> Result<Option<TyList>, Stop> {
         let Some(header) = self.reads.impl_header(imp)? else { return Ok(None) };
-        let args = self.fresh_args(header.generics)?;
-        let impl_self = self.lower(header.types, header.self_ty, Lower::Args(args))?;
+        let args = self.fresh_generic_args(imp, 0, header.generics)?;
+        let impl_self = self.lower(header.types, header.self_ty, Lower::Args(args), cause)?;
         Ok(if self.unify(impl_self, self_ty)? { Some(args) } else { None })
     }
 
@@ -224,8 +236,10 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         seg: Option<(At, Segment)>,
     ) -> Result<Option<(TyList, TyList)>, Stop> {
         let self_ty = self.fresh()?;
+        // Confirmation reports at the call; the probe makes no diagnostic and is rolled back.
+        let cause = seg.map_or(Cause::Body, |(at, _)| at.cause());
         let parent = match c.trait_ {
-            None => match self.impl_args(c.container, self_ty)? {
+            None => match self.impl_args(c.container, self_ty, cause)? {
                 Some(a) => a,
                 None => return Ok(None),
             },
@@ -233,12 +247,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         };
         let Some(sig) = self.reads.fn_sig(c.item)? else { return Ok(None) };
         let own = match seg {
-            Some((at, s)) => self.explicit_args(at, Some(s), sig.own_count)?,
-            None => self.fresh_args(sig.own_count)?,
+            Some((at, s)) => self.explicit_fn_args(at, Some(s), c.item, &sig)?,
+            None => self.fresh_generic_args(c.item, sig.parent_count, sig.own_count)?,
         };
         let args = self.concat(parent, own)?;
         let Some(&first) = sig.inputs.first() else { return Ok(None) };
-        let self_in = self.lower(sig.types, first, Lower::Args(args))?;
+        let self_in = self.lower(sig.types, first, Lower::Args(args), cause)?;
         if !self.unify(self_in, adjusted)? {
             return Ok(None);
         }
@@ -283,11 +297,17 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
         }
         self.callees.push((e, pick.cand.item, args));
-        self.register_predicates(pick.cand.item, args, Cause::Expr(e))?;
+        #[cfg(test)]
+        let drop_clauses = self.plant == crate::machine::Plant::MethodClausesDropped;
+        #[cfg(not(test))]
+        let drop_clauses = false;
+        if !drop_clauses {
+            self.register_predicates(pick.cand.item, args, Cause::Expr(e))?;
+        }
         if let Some(tr) = pick.cand.trait_ {
             self.register_trait(tr, parent, Cause::Expr(e))?;
         }
-        let Some((all, output)) = self.fn_def_sig(pick.cand.item, args)? else { return Ok(None) };
+        let Some((all, output)) = self.fn_def_sig(pick.cand.item, args, Cause::Expr(e))? else { return Ok(None) };
         let all = self.list(all);
         let rest = self.mk_list(all.get(1..).unwrap_or(&[]))?;
         Ok(Some((rest, output)))

@@ -1,69 +1,86 @@
-//! blaze-fetch: give me the bytes with this hash, and download them only if the store doesn't
-//! already have them.
+//! blaze-fetch: the sources of a project's dependencies, obtained by blaze itself
+//! (docs/v2/plan/design/fetch.md).
 //!
 //! ```text
-//! get(Source) -> Object        Source::Url { url, digest } | Source::Git { repo, rev, digest }
+//! Cargo.lock --plan--> units --Machine--> effects (lookup, HTTPS, put) --> one record a unit
 //! ```
 //!
-//! - A pin is a [`Digest`], written `<algo>:<hex>`: sha256, sha512 or blake3. md5 and sha1 are
-//!   refused by name, as is any algorithm not listed. A git commit id selects a commit and
-//!   verifies nothing; a git source's pin is over its tree's canonical listing ([`tree`]).
-//! - Bytes live in blaze's store ([`blaze_cas`]) filed by plain BLAKE3, with a side index from
-//!   each pin (and, for the fetch graph, each pure step over its inputs) to the object
-//!   ([`store`]). The index is store values, so it is persisted, verified on read, and made
-//!   durable by the store's own commit.
-//! - A download streams into a temporary file, up to a byte limit; the store's side reads it
-//!   back a chunk at a time, hashes it in the pin's algorithm and BLAKE3 together, and puts it,
-//!   chunk by chunk, only on a match. A mismatch names the URL, the algorithm and both digests
-//!   and keeps nothing ([`FetchError::Mismatch`]). Every read of an object is checked against
-//!   its BLAKE3.
-//! - One download per pin and store at a time ([`flight`]), its followers waiting in a span that names the
-//!   pin, with a deadline; tries are bounded by a sans-IO policy ([`decisions`]).
+//! - [`plan`]: from a lock ([`blaze_manifest::lock`], the one reader) to the units to fetch:
+//!   each registry crate with the SHA-256 the lock states, each git commit once however many
+//!   packages it holds. A package the lock cannot verify (no checksum, an unpinned or non-HTTPS
+//!   git source, another registry) is named in [`plan::Skip`], never fetched and trusted.
+//! - [`fetch`]: the machine (sans-IO, rule 14). It asks the store whether each unit's record is
+//!   held, asks for the rest over HTTPS with a byte limit and a deadline, tries a transient
+//!   failure again a bounded number of times, checks every answer before a byte of it is
+//!   unpacked, and asks the store to keep one record a unit.
+//! - [`unpack`]: a `.crate` (gzip, then tar) or a git pack, read under limits, every path held
+//!   inside the unit's folder, into [`pack`]: the record's form, its files sorted, its tree's
+//!   listing digest and its own BLAKE3 in it.
+//! - [`digest`] and [`tree`] (kept from the old crate): the pins blaze-audit writes
+//!   (`<algo>:<hex>`) and the canonical listing a tree's pin is over, whose path rules the
+//!   record uses.
 //!
-//! Prior art, and what is taken from it:
-//!
-//! - Nix's fixed-output derivations: pin the output, not the source, so any mirror or method
-//!   that makes the same bytes is the same; print `specified:` and `got:` on a mismatch; hash a
-//!   tree as a canonical serialization that keeps the executable bit and symlinks, in sorted
-//!   order (NAR's recursive mode, here the simpler [`tree`] listing). Unlike Nix, the steps after
-//!   the download are proved pure by the compiler ([`graph::Transform`]) instead of trusted to a
-//!   sandbox.
-//! - Bazel's repository cache: a download is keyed by its hash in a content-addressed directory,
-//!   checked before it is moved into place, and skipped when present. Unlike Bazel, which files
-//!   by sha256 alone, objects are filed once by BLAKE3 and every algorithm's pin is an index
-//!   record onto them.
-//! - cargo's `.crate` checksums: the registry's sha256 is the pin, now checked here once.
+//! The trust steps, in order: the lock's checksum is the pin; the answer's length is held to
+//! its limit by the driver and again here; its SHA-256 is compared before it is inflated; the
+//! inflate and the tar reader are bounded before they write; every path is checked (inside the
+//! crate's folder, no link out, no two names one on a caseless disk); only then is a record
+//! made, and only a made record is put.
 
 #![feature(allocator_api, register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 
 mod casefold;
-pub mod decisions;
+pub mod correct;
 pub mod digest;
-pub mod downloads;
-pub mod error;
-pub mod fetcher;
-pub mod flight;
-pub mod graph;
-pub mod progress;
-pub mod request;
-pub mod store;
+pub mod drive;
+pub mod fetch;
+pub mod pack;
+pub mod plan;
 pub mod tree;
 pub mod unpack;
-pub mod verified;
 
 #[cfg(test)]
 mod tests;
 
 pub use crate::{
-    decisions::{Failure, Policy},
     digest::{Algo, Blake3, Digest, DigestRefused, Hashed, Hashing},
-    error::{FetchError, Producer, redact, scrub},
-    fetcher::{
-        DEFAULT_MOST_BYTES, Fetcher, Git, Net, Source, StoreOf, Verified, is_commit, verify,
-    },
-    flight::Flights,
-    graph::{StepError, Transform, Tree, TreeFile},
-    request::Asked,
-    store::{CHUNK_LEN, Form, Made, Object, Objects, Origin, Produced, ensure},
+    drive::{FetchIo, Reserved, Woke},
+    fetch::{Effect, Failed, Limits, Machine, Method, NetFailure, Outcome, Reply, StoreFailure, Why},
+    pack::{File, Mode, PackRefused, PackView},
+    plan::{Plan, PlanRefused, Skip, SourceId, Unit},
+    unpack::UnpackError,
 };
+
+/// A bug planted by a test, to show its oracle catches it: only ever in this crate's tests.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Plant {
+    None,
+    /// A `.crate` is unpacked and stored without its SHA-256 compared to the lock's.
+    StoreBeforeChecksum,
+    /// A tar entry outside the crate's folder is kept under its own path.
+    EntryOutside,
+    /// A tar entry's size, as its header says it, is reserved before it is held to a limit
+    /// (and the tar reader is given no limit of its own).
+    SizeFromWire,
+    /// A git answer's commit is the first commit object of its pack, not the one whose id the
+    /// lock pins: the server's word taken.
+    CommitFromServer,
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(crate) static PLANT: std::cell::Cell<Plant> = const { std::cell::Cell::new(Plant::None) };
+}
+
+/// Whether `plant` is planted: only ever in this crate's tests.
+#[cfg(test)]
+pub(crate) fn planted(plant: Plant) -> bool {
+    PLANT.get() == plant
+}
+
+/// Whether `plant` is planted: never, outside tests.
+#[cfg(not(test))]
+#[inline(always)]
+pub(crate) fn planted(_plant: Plant) -> bool {
+    false
+}

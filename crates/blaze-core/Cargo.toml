@@ -16,18 +16,25 @@ doctest = false
 [dependencies]
 blaze-hash.workspace = true
 blaze-mem.workspace = true
+# `SortedTexts`: a listing's names as one buffer and its ends (`listing`). Already under
+# blaze-mem, so no new crate in the graph.
+blaze-own.workspace = true
 # The channel's queues (`chan`), and the queues the drivers hand work through.
 blaze-queue.workspace = true
 blaze-radix.workspace = true
 blaze-rng.workspace = true
 blaze-spin.workspace = true
+# `trust::pem`: the PEM bundles of the machine's TLS roots (portable; only reading the system's
+# store is per-OS).
+blaze-base64.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
 # The one home of system calls (docs/v2/plan/design/sys.md): the drivers move onto it call by
-# call, and `libc` above goes when the last has.
-[target.'cfg(target_os = "linux")'.dependencies]
+# call, and `libc` above goes when the last has. On macOS its table of calls resolved at first
+# use (`blaze_sys::macos::cold`).
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 blaze-sys.workspace = true
 
 [target.'cfg(windows)'.dependencies]

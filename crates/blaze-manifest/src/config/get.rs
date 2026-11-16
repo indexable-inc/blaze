@@ -1,8 +1,7 @@
 //! `cargo config get` as cargo 1.99 prints it (`src/ops/cargo_config.rs`): the oracle the
 //! harness reads the configuration through.
 
-use std::borrow::Cow;
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::path::Path;
 use std::str::FromStr;
 
@@ -12,6 +11,32 @@ use super::error::{ConfigError, ConfigWhat};
 use super::key::{push_toml_key, push_toml_string};
 use super::{Config, ConfigKey, ConfigValue as CV, Definition};
 use crate::files::Disk;
+
+/// A value as one POSIX shell word, as cargo 1.99 prints environment variables (shell-escape
+/// 0.1.5's `unix::escape`): bare when every character is in `[A-Za-z0-9-_=/,.+]` and there is
+/// one, else in single quotes with `'` and `!` written `'\'` `'` and `'\!'`.
+struct ShellWord<'v>(&'v str);
+
+impl fmt::Display for ShellWord<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let bare = |ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '=' | '/' | ',' | '.' | '+');
+        if !self.0.is_empty() && self.0.chars().all(bare) {
+            return f.write_str(self.0);
+        }
+        f.write_char('\'')?;
+        for ch in self.0.chars() {
+            match ch {
+                '\'' | '!' => {
+                    f.write_str("'\\")?;
+                    f.write_char(ch)?;
+                    f.write_char('\'')?;
+                }
+                _ => f.write_char(ch)?,
+            }
+        }
+        f.write_char('\'')
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub enum ConfigFormat {
@@ -215,7 +240,7 @@ pub fn get(config: &Config<Disk>, opts: &GetOptions<'_>) -> Result<Output, Confi
                         let _ = writeln!(
                             out.stdout,
                             "# {k}={}",
-                            shell_escape::escape(Cow::Borrowed(v))
+                            ShellWord(v)
                         );
                     }
                 }
@@ -225,7 +250,7 @@ pub fn get(config: &Config<Disk>, opts: &GetOptions<'_>) -> Result<Output, Confi
                     );
                     for (k, v) in env {
                         let _ =
-                            writeln!(out.stderr, "{k}={}", shell_escape::escape(Cow::Borrowed(v)));
+                            writeln!(out.stderr, "{k}={}", ShellWord(v));
                     }
                 }
             }
@@ -426,7 +451,7 @@ fn print_toml_unmerged(
     if !env.is_empty() {
         out.push_str("# Environment variables\n");
         for (k, v) in env {
-            let _ = writeln!(out, "# {k}={}", shell_escape::escape(Cow::Borrowed(v)));
+            let _ = writeln!(out, "# {k}={}", ShellWord(v));
         }
         out.push('\n');
     }
@@ -437,4 +462,25 @@ fn print_toml_unmerged(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ShellWord;
+
+    /// shell-escape 0.1.5's own cases for `unix::escape`.
+    #[test]
+    fn shell_words() {
+        let cases = [
+            ("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_=/,.+", "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_=/,.+"),
+            ("--aaa=bbb-ccc", "--aaa=bbb-ccc"),
+            ("linker=gcc -L/foo -Wl,bar", "'linker=gcc -L/foo -Wl,bar'"),
+            (r#"--features="default""#, r#"'--features="default"'"#),
+            (r#"'!\$`\\\n "#, r#"''\'''\!'\$`\\\n '"#),
+            ("", "''"),
+        ];
+        for (raw, word) in cases {
+            assert_eq!(ShellWord(raw).to_string(), word, "{raw:?}");
+        }
+    }
 }

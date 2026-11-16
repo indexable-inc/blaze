@@ -10,6 +10,12 @@ pub enum Plant {
     CoinductiveAsInductive,
     /// The prefilter treats an impl's wildcard byte as a mismatch.
     PrefilterDropsWildcard,
+    /// A trait object is `Sized` (builtin.rs `step_sizedness`).
+    ObjectSized,
+    /// A trait object that lists any auto trait has every one (builtin.rs object candidates).
+    ObjectAnyAuto,
+    /// An object's projection is its binding's whatever the binding's term (alias.rs `step_object`).
+    ObjectProjIgnoresBinding,
 }
 
 std::thread_local! {

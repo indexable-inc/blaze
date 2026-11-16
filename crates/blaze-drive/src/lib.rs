@@ -13,6 +13,7 @@
 //! | [`profile`] | counts per task kind, on every command |
 //! | [`scope_task`] | the `ModuleScope` task over blaze-scope's machine |
 //! | [`items`] | the production `Items` and `Source` over the records a task holds |
+//! | [`fetch_task`] | the `Fetch` task: one lock entry's sources, its name, record and finding |
 //! | [`run`] | blaze-run's compiles and records as drive names |
 //!
 //! # Collections
@@ -32,6 +33,7 @@ extern crate std;
 
 pub mod answers;
 pub mod condition;
+pub mod fetch_task;
 pub mod items;
 pub mod key;
 pub mod lines;
@@ -42,6 +44,7 @@ pub mod run;
 pub mod scope_task;
 pub mod settled;
 pub mod table;
+pub mod unit_graph_task;
 pub mod worker;
 mod wire;
 
@@ -50,13 +53,24 @@ mod sim;
 
 pub use crate::condition::{Condition, ConditionError, Space, Var};
 pub use crate::key::{Key, Kind, Name, Tool};
-pub use crate::record::{Finding, Locate, Part};
+pub use crate::record::{Finding, Locate, Part, PathOf};
 pub use crate::request::{
     Answer, Ask, Batch, BatchId, Builder, Class, Command, Config, DriveError, Effect, Event, FileEntry, Gate, Input,
-    Outcome, Output, Print, Ran, Request, Task, TaskFailure, Ticket, Verdict, Want,
+    Outcome, Output, Print, Ran, Request, Task, TaskFailure, Ticket, Verdict, Want, Why,
 };
 pub use crate::settled::{Settled, TableFull};
 pub use crate::wire::{WireError, WireWhy};
+
+/// Every byte form the drive writes, by name: what a tool's key holds (a bump changes every key,
+/// so a record of another form is never fetched, only made again) and what drive.md's formats
+/// table lists. A file at a fixed path (`last`) is checked by its magic instead.
+pub const FORMATS: [(&str, &[u8; 4]); 5] = [
+    ("record", record::MAGIC),
+    ("answer page", answers::PAGE_MAGIC),
+    ("answer root", answers::ROOT_MAGIC),
+    ("last answer", answers::LAST_MAGIC),
+    ("certificate", request::CERT_MAGIC),
+];
 
 /// A bug the simulation plants to show its oracle catches it (`blaze_sim::control`). Always
 /// `None` outside the tests; public so a caller's simulation can plant it too.
@@ -78,4 +92,10 @@ pub enum Plant {
     /// A record is stored under the condition its job began at, not the one it read: an asker
     /// that does not imply what it read is served it.
     RanUnderCondition,
+    /// A file's row keeps its part's place in its home, not its edition: a repeat whose home
+    /// stood reads the file in the edition its place spells.
+    EditionAsPlace,
+    /// A run's answer is given while the program it started is still running (stopped or
+    /// not): the caller then steps the answered machine with the program's exit.
+    AnswerWhileRunning,
 }

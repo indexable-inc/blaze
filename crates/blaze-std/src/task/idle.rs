@@ -14,6 +14,13 @@
 //! Reserved -W-> Busy                     it took its mailbox
 //! ```
 //!
+//! **A worker whose thread has not started is parked** ([`Idle::unstarted`]): the pool starts
+//! its threads at the first spawn, not at its own making, and every worker's mark begins at
+//! `Parked`, counted. A spawn's wake moves one to `Searching`, a `must_overlap` to `Reserved`,
+//! with an unpark token kept for it; the thread's first act is [`Idle::back`], the step after
+//! a park. So a task published before the worker's thread exists is found as one published
+//! while it slept: no wake is lost and the protocol has no fifth state.
+//!
 //! Every move out of `Searching` or `Parked` is a compare-and-swap, since another thread may
 //! move it to `Reserved` at the same moment; a move out of `Busy` or `Reserved` is the worker's
 //! alone, a store.
@@ -75,6 +82,11 @@ impl Mark {
         Mark { state: AtomicU32::new(BUSY) }
     }
 
+    /// The mark of a worker whose thread has not started: parked (the module's doc).
+    pub(crate) const fn unstarted() -> Mark {
+        Mark { state: AtomicU32::new(PARKED) }
+    }
+
     /// Whether `must_overlap` handed it a task. `Acquire`: the mailbox was written before the
     /// reservation's compare-and-swap.
     pub(crate) fn reserved(&self) -> bool {
@@ -103,6 +115,14 @@ impl Idle {
             most_searching: workers.div_ceil(2).max(1),
             plant,
         }
+    }
+
+    /// The protocol of `workers` whose threads have not started: each counted parked, its
+    /// mark [`Mark::unstarted`] (the module's doc).
+    pub(crate) fn unstarted(workers: u32, plant: IdlePlant) -> Idle {
+        let idle = Idle::new(workers, plant);
+        idle.parked.0.store(workers, Ordering::Relaxed);
+        idle
     }
 
     /// The worker of `mark`, busy, asks to search: granted while fewer than half the workers
@@ -222,7 +242,9 @@ impl Idle {
 /// Under the model checker (`RUSTFLAGS="--cfg blaze_check" cargo test -p blaze-std --release
 /// model_idle`): a worker that finds nothing goes to sleep while a spawner publishes a task and
 /// wakes; the worker never sleeps through the task (the model reports a deadlock if it does).
-/// The control drops the spawner's fence.
+/// The control drops the spawner's fence. And the lazy start (`model_lazy_start`): two first
+/// spawns at once on a worker whose thread does not exist yet start it once and lose neither
+/// task; the control begins without the compare-and-swap.
 #[cfg(all(test, blaze_check))]
 mod model {
     use std::{
@@ -231,7 +253,10 @@ mod model {
     };
 
     use blaze_check::{
-        sync::atomic::{AtomicBool, Ordering},
+        sync::{
+            Mutex,
+            atomic::{AtomicBool, AtomicU32, Ordering},
+        },
         thread,
     };
 
@@ -273,6 +298,156 @@ mod model {
             worker.thread().unpark();
         }
         worker.join().expect("the worker ends");
+    }
+
+    /// The control of the lazy start: how the pool is begun.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum Begin {
+        /// A compare-and-swap of `begun`, as `Pool::begin` (task/threads.rs).
+        Once,
+        /// A load, then a store: two first spawns can both start the thread.
+        Racy,
+    }
+
+    /// One worker of a pool whose thread does not exist yet, and two spawners.
+    struct Lazy {
+        idle: Idle,
+        mark: Mark,
+        begin: Begin,
+        tasks: AtomicU32,
+        begun: AtomicBool,
+        starts: AtomicU32,
+        /// The worker's parker: a token kept for a wake before its park, or before its thread.
+        token: AtomicBool,
+        thread: Mutex<Option<thread::Thread>>,
+        handle: Mutex<Option<thread::JoinHandle<()>>>,
+    }
+
+    fn unpark(world: &Lazy) {
+        world.token.store(true, Ordering::SeqCst);
+        if let Some(thread) = &*world.thread.lock().expect("the thread's slot") {
+            thread.unpark();
+        }
+    }
+
+    fn park(world: &Lazy) {
+        while !world.token.swap(false, Ordering::SeqCst) {
+            thread::park();
+        }
+    }
+
+    /// The worker's thread, as `Pool::work`: first `back`, as from a park, then the loop until
+    /// it has run both tasks.
+    fn work(world: &Lazy) {
+        *world.thread.lock().expect("the thread's slot") = Some(thread::current());
+        let mut taken = 0;
+        let mut searching = match world.idle.back(&world.mark) {
+            Woke::Searching => true,
+            Woke::Itself => false,
+            Woke::Reserved => unreachable!("nothing reserves in this model"),
+        };
+        loop {
+            let published = world.tasks.load(Ordering::SeqCst);
+            if published > taken {
+                taken = published;
+                if searching {
+                    let _ = world.idle.found(&world.mark);
+                    searching = false;
+                }
+                if taken == 2 {
+                    return;
+                }
+                continue;
+            }
+            assert!(world.idle.to_park(&world.mark, searching), "nothing reserves in this model");
+            // The re-check after the fence: published before it, or a spawner sees this parked.
+            if world.tasks.load(Ordering::SeqCst) > taken {
+                searching = world.idle.back(&world.mark) == Woke::Searching;
+                continue;
+            }
+            park(world);
+            searching = world.idle.back(&world.mark) == Woke::Searching;
+        }
+    }
+
+    /// The worker's thread started, once: a second start is refused here, where it happens,
+    /// before a second thread exists, so the finding is always this message (never a second
+    /// worker's own failure on the shared mark, or a thread left unjoined), and the one
+    /// worker that exists is the one `first_spawns` joins.
+    fn start(world: &Arc<Lazy>) {
+        let before = world.starts.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(before, 0, "the pool's thread was started other than once");
+        let mine = Arc::clone(world);
+        let handle = thread::spawn(move || work(&mine));
+        *world.handle.lock().expect("the handle's slot") = Some(handle);
+    }
+
+    /// A spawn, as `Pool::spawn`: begin, publish, wake.
+    fn spawn(world: &Arc<Lazy>) {
+        match world.begin {
+            Begin::Once => {
+                if !world.begun.load(Ordering::Acquire)
+                    && world.begun.compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_ok()
+                {
+                    start(world);
+                }
+            }
+            Begin::Racy => {
+                if !world.begun.load(Ordering::Acquire) {
+                    world.begun.store(true, Ordering::Release);
+                    start(world);
+                }
+            }
+        }
+        world.tasks.fetch_add(1, Ordering::SeqCst);
+        if world.idle.wake_one([(0, &world.mark)].into_iter()).is_some() {
+            unpark(world);
+        }
+    }
+
+    /// Two first spawns at once on a pool whose one worker has no thread: the thread is started
+    /// once, and it runs both tasks (a lost spawn leaves it parked, a deadlock to the model).
+    fn first_spawns(begin: Begin) {
+        let world = Arc::new(Lazy {
+            idle: Idle::unstarted(1, IdlePlant::None),
+            mark: Mark::unstarted(),
+            begin,
+            tasks: AtomicU32::new(0),
+            begun: AtomicBool::new(false),
+            starts: AtomicU32::new(0),
+            token: AtomicBool::new(false),
+            thread: Mutex::new(None),
+            handle: Mutex::new(None),
+        });
+        let spawners: [_; 2] = core::array::from_fn(|_| {
+            let world = Arc::clone(&world);
+            thread::spawn(move || spawn(&world))
+        });
+        for spawner in spawners {
+            spawner.join().expect("a spawner ends");
+        }
+        assert_eq!(world.starts.load(Ordering::SeqCst), 1, "the pool's thread was started other than once");
+        let handle = world.handle.lock().expect("the handle's slot").take().expect("a started thread");
+        handle.join().expect("the worker ends");
+    }
+
+    #[test]
+    fn model_lazy_start_begins_once_and_loses_no_spawn() {
+        blaze_check::model(|| first_spawns(Begin::Once));
+    }
+
+    /// The interleaving that starts it twice: both spawners load `begun` as false before
+    /// either stores true, so both call `start`, and the second's count is 1.
+    #[test]
+    fn model_lazy_start_catches_a_begin_without_its_compare_and_swap() {
+        let found = catch_unwind(AssertUnwindSafe(|| blaze_check::model(|| first_spawns(Begin::Racy))));
+        let report = found.err().expect("the model must find the thread started twice");
+        let text = report
+            .downcast_ref::<std::string::String>()
+            .map(std::string::String::as_str)
+            .or_else(|| report.downcast_ref::<&'static str>().copied())
+            .expect("the model's report is text");
+        assert!(text.contains("started other than once"), "the model found something else: {text}");
     }
 
     #[test]

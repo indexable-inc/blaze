@@ -107,6 +107,22 @@ pub use self::windows::{signaled, sleep_until};
 #[cfg(test)]
 mod tests;
 
+/// How long ago this process began, on the clock a driver's `now()` reads, so that a stamp on
+/// it can say time since the process started: macOS asks `proc_pid_rusage` (`wait/macos.rs`,
+/// exact), Linux `/proc/self/stat` (`wait/linux.rs`, in 10 ms steps). Another system says
+/// it cannot.
+pub fn process_age() -> std::io::Result<Duration> {
+    #[cfg(target_os = "macos")]
+    return macos::process_age();
+    #[cfg(target_os = "linux")]
+    return linux::process_age();
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "blaze_core::wait::process_age: this system's process start is not asked yet",
+    ))
+}
+
 /// The system's monotonic clock, counted from an origin: for code that has no driver to ask
 /// for `now()`. A driver's own clock is one of these on the instant it began
 /// ([`Monotonic::since`]), so its waits and its `now()` agree.

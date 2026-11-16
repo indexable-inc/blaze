@@ -83,13 +83,16 @@ fn head(k: TyKind, impl_side: bool) -> Option<u64> {
         TyKind::RawPtr(_, m) => (10, m as u64, 0),
         TyKind::Array(..) => (11, 0, 0),
         TyKind::Slice(_) => (12, 0, 0),
+        TyKind::Pat(_, l) => (34, u64::from(l.len), 0),
         TyKind::Adt(d, _) => (13, d.0 as u64, (d.0 >> 64) as u64),
         TyKind::Foreign(d) => (14, d.0 as u64, (d.0 >> 64) as u64),
         TyKind::FnDef(d, _) => (15, d.0 as u64, (d.0 >> 64) as u64),
-        TyKind::FnPtr(l) => (16, u64::from(l.len), 0),
+        TyKind::FnPtr(l, h) => (16, u64::from(l.len), u64::from(h.bits())),
         TyKind::Closure(d, _) => (17, d.0 as u64, (d.0 >> 64) as u64),
+        TyKind::Coroutine(d, _) => (23, d.0 as u64, (d.0 >> 64) as u64),
         TyKind::Dynamic(..) => (18, 0, 0),
-        TyKind::ConstValue(v) => (19, v, 0),
+        // Bits and type folded: a collision only lets a candidate through to unification.
+        TyKind::ConstValue(t, v) => (19, v as u64, (v >> 64) as u64 ^ u64::from(t.code())),
         // A rigid alias is rigid on the goal side; in an impl header every alias may normalize.
         TyKind::Alias(Rigid::Yes, _, d, _) if !impl_side => (20, d.0 as u64, (d.0 >> 64) as u64),
         TyKind::Param(i) | TyKind::ConstParam(i) if !impl_side => (21, u64::from(i), 0),

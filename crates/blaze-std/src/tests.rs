@@ -63,6 +63,8 @@
 //!   order, through the ring (plant: the ring's back index forgets its front).
 //! - [`atomics`]: the named atomics mean what their docs say (their orderings are untested).
 //! - [`ranks`]: one lock-order token a task, back when dropped.
+//! - [`ancestors`]: the folders above the start are exactly the granted ones and only read;
+//!   a step past the top and a name back into the start are typed refusals.
 //!
 //! The compile-time half, that dropping a `Scope`, `Task`, `Pending` or `File<ReadWrite>`
 //! unfinished is an error, is in crates/hir-ty-linear's fixtures (`bstd_*`): that harness
@@ -78,6 +80,7 @@
 //! Replay: a failure prints its plan, the simulation's seed in it; a control prints the seed of
 //! the plan that caught its plant.
 
+mod ancestors;
 mod arena;
 mod atomics;
 mod budget;
@@ -91,6 +94,11 @@ mod deadlines;
 mod durable;
 mod effects;
 mod entry;
+mod grants;
+mod guest;
+mod hold;
+mod home;
+mod layers;
 mod env;
 mod eval;
 mod explicit;
@@ -115,6 +123,8 @@ mod par;
 mod paths;
 mod placement;
 mod ranks;
+mod reach;
+#[cfg(feature = "net")]
 mod requests;
 mod scopes;
 mod simtest;

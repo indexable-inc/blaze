@@ -22,12 +22,12 @@
 //! nothing.
 
 use blaze_hash::HashMap;
-use blaze_own::{AVec, Alloc, Vec};
+use blaze_own::{AString, AVec, Alloc, Vec};
 use blaze_surface::{Edition, Range};
 use blaze_typeck::Name;
 use parser::SyntaxKind::{self, *};
 
-use crate::columns::{Columns, head};
+use crate::columns::{Columns, Lens, head};
 use crate::form::*;
 use crate::{Cfg, CfgAnswer, Lowered, Need, lit};
 
@@ -41,6 +41,9 @@ pub enum Mode {
     Body,
     /// An anonymous constant's expression.
     AnonConst,
+    /// One type alone, from its text ([`crate::lower_type_text`]): lowered as a signature's
+    /// types are (paths with no body scope), its root at [`head::TY`].
+    Type,
 }
 
 /// A signature's flags, in the head's `FLAGS` word.
@@ -209,7 +212,9 @@ pub struct Machine<'t, 'c, 'a> {
     text: &'t str,
     pub(crate) mode: Mode,
     pub(crate) edition: Edition,
-    cfg: &'c mut dyn Cfg,
+    /// The cfg set; `None` only while it is lent to the expander for one call
+    /// ([`Machine::lend_cfg`]), when no step runs.
+    cfg: Option<&'c mut dyn Cfg>,
     pub(crate) out: Columns<'a>,
     frames: AVec<'a, Frame>,
     pub(crate) vals: AVec<'a, Val>,
@@ -228,12 +233,59 @@ pub struct Machine<'t, 'c, 'a> {
     pub(crate) entries: AVec<'a, Entry>,
     /// (entry, break or continue expression) waiting for the entry's node to close.
     jumps: AVec<'a, (u32, u32)>,
-    /// The coroutines open: each one's resume pattern, made at its first `.await`.
+    /// The bodies open that `.await` and `yield` see: each a coroutine's kind (its `F_ASYNC`
+    /// and `F_GEN` flags), or [`NOT_CORO`] for a plain closure, which hides the coroutine
+    /// around it.
     pub(crate) coros: AVec<'a, u32>,
     scopes: AVec<'a, u32>,
     needs: AVec<'a, Range>,
     /// The expression a closing frame's entry targets, set by its handler.
     pub(crate) loop_target: u32,
+    alloc: Alloc<'a>,
+    /// The item's text and, past its end, each expansion lowered in place, one after another:
+    /// made at the first expansion; until then the item's text is read where it is.
+    grown: Option<AString<'a>>,
+    /// The words of the expansions in `grown`, in order: where each starts, its local
+    /// hygiene ([`blaze_expand::local_hygiene`]), and which expansion and token it is.
+    words: AVec<'a, ExpWord>,
+    /// A body's macro call the feed is to expand, set when the call's node closes.
+    request: Option<Request>,
+    /// The `macro_rules!` the body has defined so far, in textual order, each with the depth
+    /// of `scopes` it was written at: the Reference's textual scope ("Macros By Example",
+    /// Scoping): visible after its statement, in nested blocks too, until its block ends.
+    local_macros: AVec<'a, LocalMacroAt>,
+    /// Whether the feed has an expander: without one a call stays a macro call node.
+    pub(crate) expanding: bool,
+}
+
+/// One word of an expansion lowered in place.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ExpWord {
+    pub(crate) start: u32,
+    pub(crate) hygiene: u64,
+    pub(crate) expansion: u32,
+    pub(crate) token: u32,
+}
+
+/// A `macro_rules!` a body defines: its name's range and the item's, and the depth of the
+/// machine's `scopes` (the blocks open) where it is written.
+#[derive(Clone, Copy, Debug)]
+struct LocalMacroAt {
+    name: Range,
+    item: Range,
+    depth: u32,
+}
+
+/// A body's macro call waiting for its expansion: the call's range, its path's and its
+/// input's (delimiters included), and the fragment its position takes.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Request {
+    pub(crate) range: Range,
+    pub(crate) path: PathIdx,
+    pub(crate) path_range: Range,
+    pub(crate) input: Range,
+    pub(crate) place: MacroPlace,
+    pub(crate) fragment: blaze_expand::Fragment,
 }
 
 pub(crate) fn idx(len: usize) -> u32 {
@@ -334,10 +386,12 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             Mode::Signature => 0,
             Mode::Body => 1,
             Mode::AnonConst => 2,
+            Mode::Type => 3,
         };
         out.head[head::EDITION] = crate::edition_byte(edition) as u32;
         out.head[head::FLAGS] = 0;
         out.head[head::CFG_OUT] = 0;
+        out.head[head::ITEM_LEN] = idx(text.len());
         for word in [head::GENERICS, head::WHERE, head::ATTRS, head::PARAMS, head::FIELDS, head::BOUNDS, head::ITEMS] {
             out.head[word] = 0;
             out.head[word + 1] = 0;
@@ -346,7 +400,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             text,
             mode,
             edition,
-            cfg,
+            cfg: Some(cfg),
             out,
             frames: Vec::new_in(alloc),
             vals: Vec::new_in(alloc),
@@ -365,8 +419,14 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             scopes: Vec::new_in(alloc),
             needs: Vec::new_in(alloc),
             loop_target: NONE,
+            alloc,
+            grown: None,
+            words: Vec::new_in(alloc),
+            request: None,
+            local_macros: Vec::new_in(alloc),
+            expanding: false,
         };
-        if mode != Mode::Signature {
+        if matches!(mode, Mode::Body | Mode::AnonConst) {
             // The body's outermost scope: its parameters' and its module's.
             m.out.scopes.push(Scope { parent: None, items: List { start: 0, len: 0 } }.encode());
             m.scopes.push(0);
@@ -374,20 +434,159 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         m
     }
 
-    pub(crate) fn text(&self) -> &'t str {
-        self.text
+    /// The text every range is of: the item's, then the expansions lowered in place.
+    pub(crate) fn text(&self) -> &str {
+        match &self.grown {
+            Some(grown) => grown.as_str(),
+            None => self.text,
+        }
     }
 
-    pub(crate) fn finish(mut self) -> Result<Lowered<'a>, Need<'a>> {
+    pub(crate) fn allocator(&self) -> Alloc<'a> {
+        self.alloc
+    }
+
+    /// The local hygiene of the token at `start`: 0 in the item's own text.
+    fn hygiene_at(&self, start: u32) -> u64 {
+        if (start as usize) < self.text.len() || self.words.is_empty() {
+            return 0;
+        }
+        match self.words.binary_search_by_key(&start, |w| w.start) {
+            Ok(at) => self.words[at].hygiene,
+            Err(_) => 0,
+        }
+    }
+
+    /// The key a local or a label of name `name` is bound and looked up by: its name's hash,
+    /// and its local hygiene when an expansion's own tokens wrote it (blaze-expand's `body`
+    /// module states the rule).
+    pub(crate) fn local_key(&self, name: NameIdx) -> u64 {
+        let hash = self.out.names[name.0 as usize];
+        match self.hygiene_at(self.out.name_ranges[name.0 as usize].start) {
+            0 => hash,
+            hygiene => hash ^ hygiene.rotate_left(17),
+        }
+    }
+
+    /// The cfg set, lent to the expander for one call: a `cfg!` in the body is answered by the
+    /// set its `#[cfg]`s are, never by a host's own answer. Given back by [`Machine::return_cfg`]
+    /// before the next step.
+    pub(crate) fn lend_cfg(&mut self) -> &'c mut dyn Cfg {
+        let Some(cfg) = self.cfg.take() else { unreachable!("the cfg set is lent once at a time") };
+        cfg
+    }
+
+    pub(crate) fn return_cfg(&mut self, cfg: &'c mut dyn Cfg) {
+        self.cfg = Some(cfg);
+    }
+
+    /// The call the feed is to expand, once.
+    pub(crate) fn take_request(&mut self) -> Option<Request> {
+        self.request.take()
+    }
+
+    /// The `macro_rules!` in textual scope here, in the order written: each one's name and
+    /// its rules (the text inside the definition's delimiters).
+    pub(crate) fn local_macros(&self) -> impl Iterator<Item = crate::driver::LocalMacro<'_>> + '_ {
+        let text = self.text();
+        self.local_macros.iter().filter_map(move |l| {
+            let name = l.name.of(text);
+            let after = text.get(l.name.end as usize..l.item.end as usize)?.trim();
+            let tree = after.strip_suffix(';').map_or(after, str::trim_end);
+            let rules = tree.get(1..tree.len().checked_sub(1)?)?;
+            Some(crate::driver::LocalMacro { name, rules })
+        })
+    }
+
+    /// Where `request`'s input is: the item's text, or tokens of an expansion lowered here.
+    pub(crate) fn call_input(&self, request: &Request) -> crate::driver::CallInput<'_> {
+        let r = request.input;
+        if (r.end as usize) <= self.text.len() {
+            return crate::driver::CallInput::Text(r.of(self.text));
+        }
+        let first = self.words.partition_point(|w| w.start < r.start);
+        let last = self.words.partition_point(|w| w.start < r.end).saturating_sub(1);
+        match (self.words.get(first), self.words.get(last)) {
+            (Some(a), Some(b)) if a.expansion == b.expansion => crate::driver::CallInput::Expanded {
+                expansion: a.expansion,
+                start: a.token,
+                end: b.token + 1,
+            },
+            _ => crate::driver::CallInput::Text(r.of(self.text())),
+        }
+    }
+
+    /// Appends an expansion's words to the text: each word's text, its first token and its
+    /// local hygiene; records the call's read (its range and the expansion's key). Gives each
+    /// word's range, for the feed.
+    pub(crate) fn append_expansion(&mut self, request: &Request, out: &crate::driver::BodyOut<'_>) -> AVec<'a, Range> {
+        let grown = self.grown.get_or_insert_with(|| {
+            let mut s = AString::new_in(self.alloc);
+            s.push_str(self.text);
+            s
+        });
+        let expansion = idx(self.out.expansion_calls.len());
+        self.out.expansion_calls.push(request.range);
+        self.out.expansion_keys.push(out.key);
+        self.out.expansion_starts.push(idx(grown.len() - self.text.len()));
+        let mut ranges = Vec::with_capacity_in(out.words.words.len(), self.alloc);
+        for w in out.words.words.iter() {
+            // A space before each word that may take one: two words lex again as they were
+            // (`a b` stays two, `::` stays one), as `format_args!` reads its input's text.
+            if w.space_before {
+                grown.push(' ');
+            }
+            let start = idx(grown.len());
+            grown.push_str(&out.words.text[w.text.0 as usize..w.text.1 as usize]);
+            let end = idx(grown.len());
+            ranges.push(Range::new(start, end));
+            self.words.push(ExpWord { start, hygiene: w.hygiene, expansion, token: w.token });
+        }
+        ranges
+    }
+
+    /// A call not expanded: kept as a macro call node, counted as unhandled with `why`.
+    pub(crate) fn unexpanded(&mut self, request: Request, why: Why) {
+        let r = request.range;
+        self.unhandled(MACRO_CALL, r, why);
+        let row = self.put_row(MacroCall { path: request.path, input: BodyRange::building(request.input), place: request.place }.encode(), r);
+        match request.place {
+            MacroPlace::Pat => {
+                let p = self.put_pat(Pat::MacroCall { row }, r);
+                self.push(V::Pat, p.0, r);
+            }
+            MacroPlace::Type => {
+                let t = self.put_type(TypeRef::Macro(row), r);
+                self.push(V::Type, t.0, r);
+            }
+            MacroPlace::Expr | MacroPlace::Stmt => {
+                let e = self.put_expr(Expr::MacroCall { row }, r);
+                self.push(V::Expr, e.0, r);
+            }
+            MacroPlace::Item => {}
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> Result<Lowered<'a, 't>, Need<'a>> {
         if !self.needs.is_empty() {
             return Err(Need { atoms: self.needs });
+        }
+        if let Some(grown) = &self.grown {
+            self.out.expanded.extend_from_slice(&grown.as_bytes()[self.text.len()..]);
         }
         if self.mode == Mode::AnonConst
             && let Some(v) = self.vals.iter().rev().find(|v| v.v == V::Expr)
         {
             self.out.head[head::ROOT] = v.id;
         }
-        Ok(Lowered { columns: self.out })
+        // A lone type's root: the last type made, as an anonymous constant's is its last
+        // expression (each inner type's value is taken by its parent).
+        if self.mode == Mode::Type
+            && let Some(v) = self.vals.iter().rev().find(|v| v.v == V::Type)
+        {
+            self.out.head[head::TY] = v.id;
+        }
+        Ok(Lowered { columns: self.out, item: self.text })
     }
 
     // -----------------------------------------------------------------------------------------
@@ -460,6 +659,10 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 node.a = self.skip_name.start;
                 node.b = self.skip_name.end;
                 self.vals.push(Val { v: V::Skipped(top.kind), id: NONE, node, range });
+                if top.kind == MACRO_RULES && self.skip_name.start != NONE {
+                    let depth = idx(self.scopes.len());
+                    self.local_macros.push(LocalMacroAt { name: self.skip_name, item: range, depth });
+                }
                 self.after_child();
                 return;
             }
@@ -503,7 +706,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             return;
         }
         let at = self.last_end;
-        self.out.diags.push(Diag { kind: DiagKind::Syntax, range: Range::new(at, at) }.encode());
+        self.out.diags.push(Diag { kind: DiagKind::Syntax, range: BodyRange::building(Range::new(at, at)) }.encode());
     }
 
     fn range_of(&self, f: &Frame) -> Range {
@@ -527,6 +730,10 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         }
         if f.flags & F_SCOPE != 0 {
             self.scopes.pop();
+            // The block's own `macro_rules!` go out of scope with it.
+            while self.local_macros.last().is_some_and(|l| l.depth as usize > self.scopes.len()) {
+                self.local_macros.pop();
+            }
         }
         if is_binder(f.kind) {
             self.pending.truncate(f.pending as usize);
@@ -569,7 +776,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 self.activate(p.pending);
                 let label = match p.aux {
                     NONE => 0,
-                    name => self.out.names[name as usize],
+                    name => self.local_key(NameIdx(name)),
                 };
                 self.push_entry(Jk::Loop, label);
                 self.top_mut().flags |= F_FOR | F_LOOP;
@@ -586,7 +793,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             }
             BLOCK_EXPR if kind == STMT_LIST => {
                 if p.flags & (F_ASYNC | F_GEN) != 0 {
-                    self.coros.push(NONE);
+                    self.coros.push(p.flags & (F_ASYNC | F_GEN));
                     self.push_entry(Jk::Barrier, 0);
                     self.top_mut().flags |= F_CORO | F_LOOP;
                 } else if p.flags & F_CONST != 0 {
@@ -606,7 +813,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 && kind == BLOCK_EXPR
                 && p.flags & F_ASYNC != 0 =>
             {
-                self.coros.push(NONE);
+                self.coros.push(F_ASYNC);
                 self.top_mut().flags |= F_CORO;
             }
             _ => {}
@@ -668,7 +875,9 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         if p.flags & F_EQ != 0 && matches!(p.kind, VARIANT | RECORD_FIELD | KEY_VALUE_META) {
             return true;
         }
-        if p.kind == STMT_LIST && is_item(kind) || p.kind == ASSOC_ITEM_LIST && (is_item(kind) || kind == MACRO_CALL) {
+        if matches!(p.kind, STMT_LIST | MACRO_STMTS) && is_item(kind)
+            || p.kind == ASSOC_ITEM_LIST && (is_item(kind) || kind == MACRO_CALL)
+        {
             return true;
         }
         let depth = self.frames.len();
@@ -676,9 +885,15 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         match self.mode {
             Mode::Signature => {
                 parent_is_root && (kind == BLOCK_EXPR || p.flags & F_EQ != 0 && matches!(p.kind, CONST | STATIC))
+                    // A `where const { .. }` condition is an anonymous constant, lowered on its own.
+                    || p.kind == WHERE_PRED && kind == BLOCK_EXPR
             }
             Mode::Body => {
                 if parent_is_root {
+                    // An async fn's body is checked against its written return type: kept.
+                    if kind == RET_TYPE && p.kind == FN && p.flags & F_ASYNC != 0 {
+                        return false;
+                    }
                     return matches!(kind, GENERIC_PARAM_LIST | WHERE_CLAUSE | RET_TYPE | VISIBILITY | ABI)
                         || matches!(p.kind, CONST | STATIC) && is_type(kind);
                 }
@@ -687,7 +902,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                     && is_type(kind)
                     && self.frames.get(self.root_depth).is_some_and(|r| r.kind == FN)
             }
-            Mode::AnonConst => false,
+            Mode::AnonConst | Mode::Type => false,
         }
     }
 
@@ -800,6 +1015,11 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         self.coros.last().is_some_and(|c| *c != NOT_CORO)
     }
 
+    /// Inside an `async` body (an `async gen` one too), with no plain closure between.
+    pub(crate) fn in_async(&self) -> bool {
+        self.coros.last().is_some_and(|c| *c != NOT_CORO && c & F_ASYNC != 0)
+    }
+
     pub(crate) fn add_jump(&mut self, entry: usize, expr: ExprId) {
         self.jumps.push((idx(entry), expr.0));
     }
@@ -892,7 +1112,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
     }
 
     pub(crate) fn name(&mut self, r: Range) -> NameIdx {
-        let text = r.of(self.text);
+        let text = r.of(self.text());
         let text = text.strip_prefix("r#").unwrap_or(text);
         let id = idx(self.out.names.len());
         self.out.names.push(Name::of(text).0);
@@ -908,11 +1128,11 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
     }
 
     pub(crate) fn unhandled(&mut self, kind: SyntaxKind, r: Range, why: Why) {
-        self.out.unhandled.push(Unhandled { syntax: kind as u16, range: r, why }.encode());
+        self.out.unhandled.push(Unhandled { syntax: kind as u16, range: BodyRange::building(r), why }.encode());
     }
 
     pub(crate) fn diag(&mut self, kind: DiagKind, r: Range) {
-        self.out.diags.push(Diag { kind, range: r }.encode());
+        self.out.diags.push(Diag { kind, range: BodyRange::building(r) }.encode());
     }
 
     fn push(&mut self, v: V, id: u32, r: Range) {
@@ -1121,7 +1341,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 let t = TypeRef::FnPtr {
                     params,
                     ret,
-                    abi: abi.and_then(|a| (a.node.a == 1).then_some(a.range)),
+                    abi: abi.and_then(|a| (a.node.a == 1).then_some(BodyRange::building(a.range))),
                     unsafety,
                     extern_: abi.is_some(),
                     variadic,
@@ -1147,10 +1367,27 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 let t = self.put_type(if f.kind == NEVER_TYPE { TypeRef::Never } else { TypeRef::Infer }, r);
                 self.push(V::Type, t.0, r);
             }
-            MACRO_TYPE | MACRO_EXPR | MACRO_PAT => {
-                // The macro call left the value of the place it is in.
+            MACRO_TYPE | MACRO_EXPR | MACRO_PAT | MACRO_STMTS => {
+                // The macro call left the value of the place it is in: unexpanded, its node;
+                // expanded, its expansion's, lowered in place (statements stay in their
+                // block's values, each one of its statements).
             }
-            PATTERN_TYPE | UNSAFE_BINDER_TYPE | UNION_TYPE | RECORD_TYPE => {
+            // `builtin # pattern_type(base is pat)`: core's `pattern_type!` expanded.
+            PATTERN_TYPE => {
+                let base = self.first(f, V::Type).map(|v| TypeId(v.id));
+                let pat = if self.has_tok(f, NOT_NULL) { Some(TyPat::NotNull) } else { self.first(f, V::Pat).map(|v| TyPat::Of(PatId(v.id))) };
+                self.done(f);
+                let t = match (base, pat) {
+                    (Some(base), Some(pat)) => TypeRef::Pat { base, pat },
+                    _ => {
+                        self.unhandled(f.kind, r, Why::Kind);
+                        TypeRef::Error
+                    }
+                };
+                let t = self.put_type(t, r);
+                self.push(V::Type, t.0, r);
+            }
+            UNSAFE_BINDER_TYPE | UNION_TYPE | RECORD_TYPE => {
                 self.done(f);
                 self.unhandled(f.kind, r, Why::Kind);
                 let t = self.put_type(TypeRef::Error, r);
@@ -1241,13 +1478,25 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 let ty = self.first(f, V::Type);
                 let lifetime = self.first(f, V::Lifetime);
                 let bounds = self.list_of(f, L::Bounds).map_or(List { start: 0, len: 0 }, |l| l.0);
+                let cond = self.first(f, V::Skipped(BLOCK_EXPR));
                 self.done(f);
                 let p = match (ty, lifetime) {
                     (Some(t), _) => WherePred::Type { binder, ty: TypeId(t.id), bounds },
                     (None, Some(l)) => WherePred::Lifetime { name: NameIdx(l.id), bounds },
-                    (None, None) => return,
+                    (None, None) => match cond {
+                        Some(c) => WherePred::Const { cond: self.put_const(c.range) },
+                        None => return,
+                    },
                 };
                 self.push_node(V::Row(ROW_WHERE), p.encode(), r);
+            }
+            // `name = expr` or `expr`, an argument of `builtin # format_args(..)`.
+            FORMAT_ARGS_ARG => {
+                let name = self.first(f, V::Name).map(|v| NameIdx(v.id));
+                let expr = self.first(f, V::Expr);
+                self.done(f);
+                let expr = expr.map_or_else(|| self.put_expr(Expr::Missing, r), |v| ExprId(v.id));
+                self.push_node(V::Row(ROW_FMT_ARG), FmtArg { name, expr, captured: false }.encode(), r);
             }
             // Parameters.
             PARAM_LIST => self.param_list(f, r),
@@ -1274,7 +1523,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 };
                 let path = path.map_or(Range::new(r.start, r.start), |p| p.range);
                 let args = args.map_or(Range::new(r.end, r.end), |a| a.range);
-                let a = Attr { path, args, meta, inner: false };
+                let a = Attr { path: BodyRange::building(path), args: BodyRange::building(args), meta, inner: false };
                 self.push_node(V::Row(ROW_ATTR), a.encode(), r);
             }
             UNSAFE_META => {
@@ -1334,7 +1583,9 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 let vis = self.vis_of(f);
                 let name = self.first(f, V::Name).map(|v| NameIdx(v.id));
                 let ty = self.first(f, V::Type);
-                let default = self.kid(f, 0, |v| matches!(v, V::Skipped(_)));
+                // The default is the node after `=`, skipped; a doc comment is skipped too and is
+                // no anonymous constant.
+                let default = self.kid(f, 0, |v| matches!(v, V::Skipped(k) if k != DOC_COMMENT));
                 self.done(f);
                 let ty = ty.map_or_else(|| self.put_type(TypeRef::Error, r), |v| TypeId(v.id));
                 let default = default.map(|d| self.put_const(d.range));
@@ -1352,7 +1603,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 let fields = self
                     .kid(f, 0, |v| matches!(v, V::List(L::Fields(_))))
                     .map(|v| (List { start: v.id, len: v.node.a }, v.v));
-                let disc = self.kid(f, 0, |v| matches!(v, V::Skipped(_)));
+                let disc = self.kid(f, 0, |v| matches!(v, V::Skipped(k) if k != DOC_COMMENT));
                 self.done(f);
                 let (fields, shape) = match fields {
                     Some((l, V::List(L::Fields(shape)))) => (l, shape),
@@ -1380,7 +1631,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                     let name = (n.a != NONE).then(|| self.name(Range::new(n.a, n.b)));
                     // Its range only in the side column: an edit of its body leaves the
                     // trait's or impl's rows equal.
-                    let item = LocalItem { syntax: n.tag, name, range: Range::new(0, 0), scope: None };
+                    let item = LocalItem { syntax: n.tag, name, range: BodyRange::building(Range::new(0, 0)), scope: None };
                     rows.push((item.encode(ROW_ASSOC), *range));
                 }
                 let l = self.put_rows_of(&rows);
@@ -1407,7 +1658,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 let l = self.first(f, V::Lifetime);
                 self.done(f);
                 if let Some(l) = l {
-                    let hash = self.out.names[l.id as usize];
+                    let hash = self.local_key(NameIdx(l.id));
                     match self.parent_kind() {
                         Some(LOOP_EXPR | WHILE_EXPR) => {
                             if let Some(e) = self.entries.last_mut() {
@@ -1439,6 +1690,22 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 self.done(f);
                 if let Some(e) = e {
                     self.push(V::Else, e.id, r);
+                }
+            }
+            EXPR_STMT
+                if self.vals[f.base as usize..]
+                    .iter()
+                    .any(|v| v.v == V::Stmt || matches!(v.v, V::Skipped(k) if is_item(k))) =>
+            {
+                // A macro call's statements, lowered in place: they stay the block's, and a
+                // last expression is a statement of its own when a `;` follows the call.
+                let semi = self.has_tok(f, SEMICOLON);
+                let last = self.vals[f.base as usize..].iter().rposition(|v| v.v == V::Expr);
+                if semi && let Some(at) = last {
+                    let at = f.base as usize + at;
+                    let v = self.vals[at];
+                    let s = self.put_stmt(Stmt::Expr { expr: ExprId(v.id), semi: true });
+                    self.vals[at] = Val { v: V::Stmt, id: s.0, ..v };
                 }
             }
             EXPR_STMT => {
@@ -1536,7 +1803,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 self.done(f);
                 match (base, name) {
                     (Some(b), Some(n)) if n.v == V::NameRef(INT_NUMBER) => {
-                        let text = self.out.name_ranges[n.id as usize].of(self.text);
+                        let text = self.out.name_ranges[n.id as usize].of(self.text());
                         match text.parse::<u32>() {
                             Ok(index) => Expr::TupleField { base: ExprId(b.id), index },
                             Err(_) => Expr::Missing,
@@ -1730,7 +1997,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 return;
             }
             BREAK_EXPR | CONTINUE_EXPR => {
-                let label = self.first(f, V::Lifetime).map_or(0, |l| self.out.names[l.id as usize]);
+                let label = self.first(f, V::Lifetime).map_or(0, |l| self.local_key(NameIdx(l.id)));
                 let value = self.first(f, V::Expr).map(|v| ExprId(v.id));
                 self.done(f);
                 let want_loop = f.kind == CONTINUE_EXPR;
@@ -1782,6 +2049,34 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 return;
             }
             CLOSURE_EXPR => self.closure(f, r),
+            // `builtin # format_args("..", args)`, the expander's `format_args!` once its
+            // template is expanded: its arguments lowered here as any expression (from the
+            // expansion's own words, `$crate` paths and hygiene kept), the template read.
+            FORMAT_ARGS_EXPR => {
+                let template = self.first(f, V::Expr).map(|v| (ExprId(v.id), v.range));
+                let mut args: AVec<'_, (Node, Range)> = Vec::new_in(self.vals.allocator().clone());
+                for v in &self.vals[f.base as usize..] {
+                    if v.v == V::Row(ROW_FMT_ARG) {
+                        args.push((v.node, v.range));
+                    }
+                }
+                self.done(f);
+                let e = match self.builtin_format_args(template, &args, r) {
+                    Ok(e) => e,
+                    Err(why) => {
+                        self.unhandled(f.kind, r, why);
+                        self.put_expr(Expr::Missing, r)
+                    }
+                };
+                // Only the template's text is read (fmt.rs `builtin_format_args`): its lowered
+                // literal is held by no node, so its slot becomes a hole the checker and the
+                // writeback skip, never an expression left untyped.
+                if let Some((t, _)) = template {
+                    self.out.exprs[t.0 as usize] = Expr::Missing.encode();
+                }
+                self.push(V::Expr, e.0, r);
+                return;
+            }
             UNDERSCORE_EXPR => {
                 self.done(f);
                 Expr::Underscore
@@ -1791,7 +2086,39 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 self.unhandled(f.kind, r, Why::Kind);
                 Expr::Asm
             }
-            OFFSET_OF_EXPR | FORMAT_ARGS_EXPR | INCLUDE_BYTES_EXPR | YEET_EXPR | UNSAFE_BINDER_CAST_EXPR => {
+            OFFSET_OF_EXPR => {
+                // `builtin # offset_of(Ty, a.b.0)`: the type, then the field path's names; the
+                // lexer makes `0.1` one float, split here at its dot.
+                let ty = self.first(f, V::Type).map(|v| TypeId(v.id));
+                let start = idx(self.out.ids.len());
+                for i in f.base as usize..self.vals.len() {
+                    let v = self.vals[i];
+                    match v.v {
+                        V::NameRef(FLOAT_NUMBER) => {
+                            let nr = self.out.name_ranges[v.id as usize];
+                            let dot = nr.of(self.text()).find('.');
+                            match dot {
+                                Some(dot) => {
+                                    let dot = idx(dot);
+                                    let a = self.name(Range::new(nr.start, nr.start + dot));
+                                    let b = self.name(Range::new(nr.start + dot + 1, nr.end));
+                                    self.out.ids.extend_from_slice(&[a.0, b.0]);
+                                }
+                                None => self.out.ids.push(v.id),
+                            }
+                        }
+                        V::NameRef(_) => self.out.ids.push(v.id),
+                        _ => {}
+                    }
+                }
+                self.done(f);
+                let fields = List { start, len: idx(self.out.ids.len()) - start };
+                match ty {
+                    Some(ty) if fields.len > 0 => Expr::OffsetOf { ty, fields },
+                    _ => Expr::Missing,
+                }
+            }
+            INCLUDE_BYTES_EXPR | YEET_EXPR | UNSAFE_BINDER_CAST_EXPR => {
                 self.done(f);
                 self.unhandled(f.kind, r, Why::Kind);
                 Expr::Missing
@@ -1827,7 +2154,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 let candidate = !by_ref && !mutable && sub.is_none();
                 let name = NameIdx(name.id);
                 let p = self.put_pat(Pat::Bind { ann, name, sub, shadows: None, candidate }, r);
-                let hash = self.out.names[name.0 as usize];
+                let hash = self.local_key(name);
                 self.push_pending(hash, p);
                 self.push(V::Pat, p.0, r);
                 return;
@@ -1977,7 +2304,14 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 self.done(f);
                 Pat::Range { lo, hi, inclusive }
             }
-            CONST_BLOCK_PAT | DEREF_PAT | GUARD_PAT | NOT_NULL | CFG_PRED_PAT => {
+            // `!null`, only a pattern type's pattern: its `null` is no binding; the parent
+            // `PATTERN_TYPE` reads this token value.
+            NOT_NULL => {
+                self.done(f);
+                self.push(V::Tok(NOT_NULL), 0, r);
+                return;
+            }
+            CONST_BLOCK_PAT | DEREF_PAT | GUARD_PAT | CFG_PRED_PAT => {
                 self.done(f);
                 self.unhandled(f.kind, r, Why::Kind);
                 Pat::Missing
@@ -2068,7 +2402,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         let t = self.kid(f, 0, |v| matches!(v, V::Tok(_)));
         self.done(f);
         let lit = t.and_then(|t| match t.v {
-            V::Tok(kind) => lit::lit_of(kind, t.range.of(self.text)),
+            V::Tok(kind) => lit::lit_of(kind, t.range.of(self.text())),
             _ => None,
         });
         let in_pat = self.parent_kind() == Some(LITERAL_PAT);
@@ -2148,7 +2482,8 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         }
         let segments = List { start, len: idx(self.out.rows.len()) - start };
         self.done(f);
-        let scope = (self.mode != Mode::Signature).then(|| self.scope());
+        // A signature's paths and a lone type's have no body scope.
+        let scope = matches!(self.mode, Mode::Body | Mode::AnonConst).then(|| self.scope());
         let p = self.put_path(PathRef { segments, absolute, scope, lang: None }, r);
         self.push(V::Path, p.0, r);
     }
@@ -2186,7 +2521,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             && matches!(seg.kind, SegKind::Ident | SegKind::SelfMod)
             && !seg.has_args
             && let Some(name) = seg.name
-            && let Some(pat) = self.lookup(self.out.names[name.0 as usize])
+            && let Some(pat) = self.lookup(self.local_key(name))
         {
             return Expr::Local { pat, path: p };
         }
@@ -2270,8 +2605,8 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 self.activate(f.pending);
                 // A plain closure is no coroutine: `.await` and `yield` in it are refused, as
                 // rustc does, though it sits in one.
-                let coro = parent.is_some_and(|p| p.flags & (F_ASYNC | F_GEN) != 0);
-                self.coros.push(if coro { NONE } else { NOT_CORO });
+                let kind = parent.map_or(0, |p| p.flags & (F_ASYNC | F_GEN));
+                self.coros.push(if kind != 0 { kind } else { NOT_CORO });
                 self.top_mut().flags |= F_CORO;
             }
             // The root fn's own parameters (the root's frame is still open above this list).
@@ -2302,7 +2637,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         };
         let ann = BindAnn { by_ref: None, mutable: mutable && !amp };
         let pat = self.put_pat(Pat::Bind { ann, name, sub: None, shadows: None, candidate: false }, r);
-        let hash = self.out.names[name.0 as usize];
+        let hash = self.local_key(name);
         self.push_pending(hash, pat);
         let p = Param { pat: Some(pat), ty, self_kind, lifetime, variadic: false, attrs: List { start: 0, len: 0 } };
         self.push_node(V::Row(ROW_PARAM), p.encode(), r);
@@ -2339,12 +2674,21 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             Some(V::Tok(FALSE_KW)) => CfgAnswer::No,
             Some(V::Tok(_)) => {
                 let name_range = first.map_or(r, |t| t.range);
-                let name = name_range.of(self.text);
-                let value_text = value.map(|v| {
-                    let t = v.range.of(self.text);
-                    t.strip_prefix('"').and_then(|t| t.strip_suffix('"')).unwrap_or(t)
+                // Copied out of the text, which an expansion lowered here may have grown.
+                let mut name = AString::new_in(self.alloc);
+                name.push_str(name_range.of(self.text()));
+                let value_owned = value.map(|v| {
+                    let t = v.range.of(self.text());
+                    let mut s = AString::new_in(self.alloc);
+                    s.push_str(t.strip_prefix('"').and_then(|t| t.strip_suffix('"')).unwrap_or(t));
+                    s
                 });
-                let answer = self.cfg.atom(name, value_text);
+                let name = name.as_str();
+                let value_text = value_owned.as_deref();
+                let Some(cfg) = self.cfg.as_deref_mut() else {
+                    unreachable!("the cfg set is lent only while a call expands, and no step runs then")
+                };
+                let answer = cfg.atom(name, value_text);
                 let read = CfgRead {
                     name: Name::of(name).0,
                     value: value_text.map_or(0, |v| Name::of(v).0),
@@ -2362,7 +2706,9 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
     }
 
     fn cfg_composite(&mut self, f: &Frame, r: Range) {
-        let op = self.kid(f, 0, |v| matches!(v, V::Tok(IDENT))).map(|t| t.range.of(self.text));
+        let op: Option<&'static str> = self.kid(f, 0, |v| matches!(v, V::Tok(IDENT))).map(|t| {
+            ["all", "any", "not"].into_iter().find(|it| *it == t.range.of(self.text())).unwrap_or("")
+        });
         let mut all = CfgAnswer::Yes;
         let mut any = CfgAnswer::No;
         let mut count = 0;
@@ -2401,7 +2747,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         self.push(V::Pred(answer), NONE, r);
     }
 
-    fn binary(&mut self, f: &Frame, r: Range) -> Expr {
+    fn binary(&mut self, f: &Frame, _r: Range) -> Expr {
         let lhs = self.kid(f, 0, |v| v == V::Expr);
         let rhs = self.kid(f, 1, |v| v == V::Expr);
         let op = self.vals[f.base as usize..].iter().find_map(|v| match v.v {
@@ -2412,10 +2758,23 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         let (Some(lhs), Some(rhs), Some(op)) = (lhs, rhs, op) else { return Expr::Missing };
         let (lhs, rhs) = (ExprId(lhs.id), ExprId(rhs.id));
         if op == EQ {
-            let place = Expr::decode(self.out.exprs[lhs.0 as usize]);
-            if matches!(place, Ok(Expr::Tuple { .. } | Expr::Array { .. } | Expr::Struct { .. } | Expr::Call { .. })) {
-                self.unhandled(BIN_EXPR, r, Why::DestructuringAssignment);
-                return Expr::Missing;
+            // An assignee that is a tuple, a slice, a tuple struct or a struct (in parentheses
+            // or not) destructures; `..` alone and `_` alone stay one assignment.
+            let mut place = lhs;
+            for _ in 0..=self.out.exprs.len() {
+                match Expr::decode(self.out.exprs[place.0 as usize]) {
+                    Ok(Expr::Paren(inner)) => place = inner,
+                    Ok(Expr::Tuple { .. } | Expr::Array { .. } | Expr::Call { .. }) => return self.destructuring_assign(lhs, rhs),
+                    Ok(Expr::Struct { path, fields, .. }) => {
+                        let range_full = PathRef::decode(self.out.paths[path.0 as usize])
+                            .is_ok_and(|p| p.lang == Some(LangItem::RangeFull));
+                        if range_full && fields.len == 0 {
+                            break;
+                        }
+                        return self.destructuring_assign(lhs, rhs);
+                    }
+                    _ => break,
+                }
             }
             return Expr::Assign { lhs, rhs };
         }
@@ -2438,17 +2797,10 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             (false, true) => CoroutineKind::Gen,
             (false, false) => CoroutineKind::None,
         };
-        // An async closure's coroutine was opened by its parameter list (F_CORO on this
-        // frame), so its resume pattern is the innermost coroutine's until cleanup.
-        let resume = match kind {
-            CoroutineKind::None => None,
-            _ => self.coros.last().copied().filter(|p| *p != NOT_CORO).and_then(unopt).map(PatId),
-        };
         let c = Closure {
             params,
             ret,
             body,
-            resume,
             kind,
             source: CoroutineSource::Closure,
             capture_by_value: f.flags & F_MOVE != 0,
@@ -2476,7 +2828,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         let mut rows: AVec<'_, (Node, Range)> = Vec::new_in(self.vals.allocator().clone());
         for (n, range) in items.iter() {
             let name = (n.a != NONE).then(|| self.name(Range::new(n.a, n.b)));
-            let item = LocalItem { syntax: n.tag, name, range: *range, scope: Some(scope) };
+            let item = LocalItem { syntax: n.tag, name, range: BodyRange::building(*range), scope: Some(scope) };
             rows.push((item.encode(ROW_LOCAL_ITEM), *range));
         }
         let item_rows = self.put_rows_of(&rows);
@@ -2531,7 +2883,6 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         let scope = ScopeId(list.node.d);
         if f.flags & (F_ASYNC | F_GEN) != 0 {
             let body = self.put_expr(Expr::Block { stmts, tail, scope, kind: BlockKind::Plain }, r);
-            let resume = self.coros.last().copied().and_then(unopt).map(PatId);
             let kind = match (f.flags & F_ASYNC != 0, f.flags & F_GEN != 0) {
                 (true, true) => CoroutineKind::AsyncGen,
                 (true, false) => CoroutineKind::Async,
@@ -2541,7 +2892,6 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 params: List { start: 0, len: 0 },
                 ret: None,
                 body,
-                resume,
                 kind,
                 source: CoroutineSource::Block,
                 capture_by_value: f.flags & F_MOVE != 0,
@@ -2562,6 +2912,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         } else {
             BlockKind::Plain
         };
+        let tail = if kind == BlockKind::Try { Some(self.try_block_tail(tail, r)) } else { tail };
         let e = self.put_expr(Expr::Block { stmts, tail, scope, kind }, r);
         if f.flags & F_LOOP != 0 {
             self.loop_target = e.0;
@@ -2583,9 +2934,15 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             _ => MacroPlace::Item,
         };
         let mut why = Why::Kind;
-        if matches!(place, MacroPlace::Expr | MacroPlace::Stmt)
-            && let Some(name) = self.single_name(path)
-            && matches!(name, "format_args" | "format_args_nl" | "const_format_args")
+        // `format_args!` and its kin stay one node, their template parsed here (`fmt`): by
+        // name, written plainly or through `$crate`, `core` or `std` as the library's own
+        // macros write it. While expanding, the expander's `format_args!` gives
+        // `builtin # format_args(..)` (its template expanded first), whose arguments are then
+        // lowered from the expansion's words like any expression: an argument written in an
+        // expansion (`$crate::format_args!(..)`) is never read again from text.
+        if !self.expanding
+            && matches!(place, MacroPlace::Expr | MacroPlace::Stmt)
+            && let Some(name) = self.format_args_name(path)
         {
             match self.format_args(name == "format_args_nl", input, r) {
                 Ok(e) => {
@@ -2595,30 +2952,76 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 Err(w) => why = w,
             }
         }
-        self.unhandled(MACRO_CALL, r, why);
-        let row = self.put_row(MacroCall { path, input, place }.encode(), r);
-        match place {
-            MacroPlace::Pat => {
-                let p = self.put_pat(Pat::MacroCall { row }, r);
-                self.push(V::Pat, p.0, r);
-            }
-            MacroPlace::Type => {
-                let t = self.put_type(TypeRef::Macro(row), r);
-                self.push(V::Type, t.0, r);
-            }
-            MacroPlace::Expr | MacroPlace::Stmt => {
-                let e = self.put_expr(Expr::MacroCall { row }, r);
-                self.push(V::Expr, e.0, r);
-            }
-            MacroPlace::Item => {}
+        // Inline assembly has no lowering yet: refused by name, never expanded.
+        if self.library_macro(path, &["asm", "global_asm", "naked_asm"]).is_some() {
+            why = Why::Asm;
         }
+        // A statement of a block, `m!(..);` among them, expands to statements (Rust's rule
+        // for a call in statement position); every other place to its own fragment.
+        let in_stmt = place == MacroPlace::Stmt
+            || place == MacroPlace::Expr
+                && self.frames.len() >= 2
+                && self.frames[self.frames.len() - 2].kind == EXPR_STMT;
+        let fragment = match place {
+            MacroPlace::Pat => blaze_expand::Fragment::Pat,
+            MacroPlace::Type => blaze_expand::Fragment::Type,
+            _ if in_stmt => blaze_expand::Fragment::Stmts,
+            _ => blaze_expand::Fragment::Expr,
+        };
+        let path_range = self.path_range(path, r);
+        let request = Request { range: r, path, path_range, input, place, fragment };
+        if !self.expanding || place == MacroPlace::Item || why != Why::Kind {
+            self.request = None;
+            self.unexpanded(request, why);
+            return;
+        }
+        self.request = Some(request);
+    }
+
+    /// The range of a path's text: from the call's start to its last segment's name.
+    fn path_range(&self, p: PathIdx, call: Range) -> Range {
+        let end = self
+            .segment_name(p, usize::MAX)
+            .map_or(call.start, |name| self.out.name_ranges[name.0 as usize].end);
+        Range::new(call.start, end.max(call.start))
+    }
+
+    /// The name of segment `i` of a path (`usize::MAX` for the last).
+    fn segment_name(&self, p: PathIdx, i: usize) -> Option<NameIdx> {
+        let path = PathRef::decode(self.out.paths[p.0 as usize]).ok()?;
+        let len = path.segments.len as usize;
+        let i = if i == usize::MAX { len.checked_sub(1)? } else { i };
+        if i >= len {
+            return None;
+        }
+        Segment::decode(self.out.rows[path.segments.start as usize + i]).ok()?.name
+    }
+
+    /// `format_args`, `format_args_nl` or `const_format_args` when the path names one of
+    /// them.
+    fn format_args_name(&self, p: PathIdx) -> Option<&'static str> {
+        self.library_macro(p, &["format_args", "format_args_nl", "const_format_args"])
+    }
+
+    /// The one of `names` the path names as the library's macro: one plain segment, or a path
+    /// from `$crate`, `core` or `std` (`core::arch::asm`).
+    fn library_macro(&self, p: PathIdx, names: &[&'static str]) -> Option<&'static str> {
+        let path = PathRef::decode(self.out.paths[p.0 as usize]).ok()?;
+        let text = |name: NameIdx| self.out.name_ranges[name.0 as usize].of(self.text());
+        match path.segments.len {
+            1 => {}
+            2 | 3 if matches!(text(self.segment_name(p, 0)?), "$crate" | "core" | "std") => {}
+            _ => return None,
+        }
+        let name = text(self.segment_name(p, usize::MAX)?);
+        names.iter().copied().find(|it| *it == name)
     }
 
     /// The text of a path of one plain segment.
-    pub(crate) fn single_name(&self, p: PathIdx) -> Option<&'t str> {
+    pub(crate) fn single_name(&self, p: PathIdx) -> Option<&str> {
         let seg = self.single_segment(p)?;
         let name = seg.name?;
-        Some(self.out.name_ranges[name.0 as usize].of(self.text))
+        Some(self.out.name_ranges[name.0 as usize].of(self.text()))
     }
 
     fn signature_root(&mut self, f: &Frame) {
@@ -2715,8 +3118,8 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         }
         // `#[repr(..)]`: the row of the attribute, read by layout.
         for i in attrs.start..attrs.start + attrs.len {
-            if let Ok(a) = Attr::decode(self.out.rows[i as usize])
-                && a.path.of(self.text) == "repr"
+            if let Ok(a) = Attr::decode(self.out.rows[i as usize], Lens::BUILDING)
+                && a.path.raw().of(self.text()) == "repr"
             {
                 self.out.head[head::REPR] = i;
             }
@@ -2729,7 +3132,12 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             FN => {
                 let params = self.list_of(f, L::Params).map(|l| l.0);
                 let body = self.first(f, V::Expr);
+                let ret = self.first(f, V::Ret).map_or(NONE, |v| v.id);
                 self.done(f);
+                if f.flags & F_ASYNC != 0 {
+                    self.out.head[head::FLAGS] = sig::ASYNC;
+                    self.out.head[head::TY] = ret;
+                }
                 let Some(body) = body else { return };
                 let params = params.unwrap_or(List { start: 0, len: 0 });
                 let mut pats: AVec<'_, u32> = Vec::new_in(self.vals.allocator().clone());

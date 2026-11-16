@@ -1,11 +1,12 @@
 //! rustc's desugarings, made as the machine closes the node that needs one: the same shapes
 //! `rustc_ast_lowering` builds (its `lower_expr_for`, `lower_expr_while_in_loop_scope`,
-//! `lower_expr_try`, `lower_expr_range`, `make_lowered_await` and
-//! `lower_coroutine_body_with_moved_arguments`), in this crate's columns. A path a desugaring
-//! names is a lang item's ([`PathRef::lang`]); the body's set of them is its read list's.
+//! `lower_expr_try`, `lower_expr_range` and `lower_coroutine_body_with_moved_arguments`), in
+//! this crate's columns. A path a desugaring names is a lang item's ([`PathRef::lang`]); the
+//! body's set of them is its read list's. `.await` is not desugared: it stays one node
+//! ([`Expr::Await`]), since its poll loop is a state machine's, made where code is.
 //!
 //! Every node made here is written after its children (post-order holds), and every name made
-//! here (`iter`, `val`, `residual`, `__awaitee`, `result`, `_task_context`, `__argN`) is
+//! here (`iter`, `val`, `residual`, `__argN`) is
 //! hygienic: no path of the source finds it, because no binding made here enters the scope
 //! map; the desugared expressions name their bindings by pattern directly.
 //!
@@ -29,22 +30,14 @@
 //!          ControlFlow::Continue(val) => val,
 //!      }
 //!      (inside `try { }`: `break 'try FromResidual::from_residual(residual)`)
+//! try { STMTS TAIL }
+//!   => 'try: { STMTS Try::from_output(TAIL) }   (no tail: `Try::from_output(())`)
 //! a..b => Range { start: a, end: b }      a.. => RangeFrom { start: a }
 //! ..b  => RangeTo { end: b }              ..  => RangeFull {}
 //! a..=b => RangeInclusive::new(a, b)      ..=b => RangeToInclusive { end: b }
-//! EXPR.await
-//!   => match IntoFuture::into_future(EXPR) {
-//!          mut __awaitee => loop {
-//!              match unsafe { Future::poll(Pin::new_unchecked(&mut __awaitee),
-//!                                          get_context(_task_context)) } {
-//!                  Poll::Ready(result) => break result,
-//!                  Poll::Pending => {}
-//!              }
-//!              _task_context = yield ();
-//!          },
-//!      }
 //! async fn f(PAT: T) BODY
-//!   => fn f(__arg0: T) { async move { let PAT = __arg0; BODY } }
+//!   => fn f(__arg0: T) { let PAT = __arg0; BODY }, the body's head marked async
+//!      (the parameters move into the future; their drop order is the `let`s')
 //! ```
 
 use blaze_surface::Range;
@@ -163,6 +156,15 @@ impl Machine<'_, '_, '_> {
         lp
     }
 
+    /// A `try` block's tail: `Try::from_output(TAIL)`, `Try::from_output(())` with none.
+    pub(crate) fn try_block_tail(&mut self, tail: Option<ExprId>, r: Range) -> ExprId {
+        let value = match tail {
+            Some(t) => t,
+            None => self.put_expr(Expr::Tuple { elems: List { start: 0, len: 0 } }, r),
+        };
+        self.lang_call(LangItem::TryTraitFromOutput, &[value], r)
+    }
+
     /// `EXPR?`.
     pub(crate) fn try_op(&mut self, e: ExprId, r: Range) -> ExprId {
         let branch = self.lang_call(LangItem::TryTraitBranch, &[e], r);
@@ -223,60 +225,18 @@ impl Machine<'_, '_, '_> {
         self.put_expr(Expr::Struct { path, fields: List { start, len: idx(n) }, base: StructBase::None }, r)
     }
 
-    /// The innermost coroutine's resume argument, `_task_context`, made at its first use.
-    fn task_context(&mut self, r: Range) -> Option<PatId> {
-        let at = self.coros.len().checked_sub(1)?;
-        match self.coros[at] {
-            NOT_CORO => None,
-            NONE => {
-                let p = self.hygienic_bind("_task_context", true, r);
-                self.coros[at] = p.0;
-                Some(p)
-            }
-            p => Some(PatId(p)),
-        }
-    }
-
     /// `EXPR.await`.
+    ///
+    /// One node: what it means (`IntoFuture::into_future`, then polling at a suspension point)
+    /// is the checker's to type and the code builder's to make into a state machine; spelling
+    /// rustc's poll loop here would make every later stage read it back out.
     pub(crate) fn await_op(&mut self, e: ExprId, r: Range) -> ExprId {
-        let Some(task) = self.task_context(r) else {
-            // E0728: no desugaring outside a coroutine.
+        if !self.in_async() {
+            // E0728.
             self.diag(DiagKind::AwaitOutsideAsync, r);
             return e;
-        };
-        let into_future = self.lang_call(LangItem::IntoFutureIntoFuture, &[e], r);
-        let awaitee = self.hygienic_bind("__awaitee", true, r);
-        // `unsafe { Future::poll(Pin::new_unchecked(&mut __awaitee), get_context(_task_context)) }`
-        let awaitee_ref = self.hygienic_local(awaitee, r);
-        let borrow = self.put_expr(Expr::Ref { mutbl: Mutbl::Mut, raw: false, operand: awaitee_ref }, r);
-        let pinned = self.lang_call(LangItem::PinNewUnchecked, &[borrow], r);
-        let task_ref = self.hygienic_local(task, r);
-        let cx = self.lang_call(LangItem::GetContext, &[task_ref], r);
-        let poll = self.lang_call(LangItem::FuturePoll, &[pinned, cx], r);
-        let unsafe_poll = self.block_of(&[], Some(poll), BlockKind::Unsafe, r);
-        // `Poll::Ready(result) => break result`
-        let result = self.hygienic_bind("result", false, r);
-        let ready = self.lang_variant_pat(LangItem::PollReady, &[result], r);
-        let result_ref = self.hygienic_local(result, r);
-        let break_ = self.put_expr(Expr::Break { value: Some(result_ref), target: None }, r);
-        // `Poll::Pending => {}`
-        let pending = self.lang_variant_pat(LangItem::PollPending, &[], r);
-        let empty = self.block_of(&[], None, BlockKind::Plain, r);
-        let arms =
-            self.arms(&[Arm { pat: ready, guard: None, body: break_ }, Arm { pat: pending, guard: None, body: empty }], r);
-        let poll_match = self.put_expr(Expr::Match { scrutinee: unsafe_poll, arms, source: MatchSource::Await }, r);
-        let poll_stmt = self.put_stmt(Stmt::Expr { expr: poll_match, semi: false });
-        // `_task_context = yield ();`
-        let unit = self.put_expr(Expr::Tuple { elems: List { start: 0, len: 0 } }, r);
-        let yield_ = self.put_expr(Expr::Yield { value: Some(unit) }, r);
-        let task_place = self.hygienic_local(task, r);
-        let assign = self.put_expr(Expr::Assign { lhs: task_place, rhs: yield_ }, r);
-        let yield_stmt = self.put_stmt(Stmt::Expr { expr: assign, semi: false });
-        let body = self.block_of(&[poll_stmt, yield_stmt], None, BlockKind::Plain, r);
-        let lp = self.put_expr(Expr::Loop { body, source: LoopSource::Loop }, r);
-        self.out.exprs[break_.0 as usize] = Expr::Break { value: Some(result_ref), target: Some(lp) }.encode();
-        let arms = self.arms(&[Arm { pat: awaitee, guard: None, body: lp }], r);
-        self.put_expr(Expr::Match { scrutinee: into_future, arms, source: MatchSource::Await }, r)
+        }
+        self.put_expr(Expr::Await(e), r)
     }
 
     /// An `async fn`'s body: its parameters (`pats`, the written patterns) become the coroutine's
@@ -317,24 +277,227 @@ impl Machine<'_, '_, '_> {
                 }
             }
         }
-        let block = self.block_of(&stmts, Some(body), BlockKind::Plain, r);
-        let resume = self.coros.last().copied().filter(|c| *c != NOT_CORO).and_then(unopt).map(PatId);
-        let c = Closure {
-            params: List { start: 0, len: 0 },
-            ret: None,
-            body: block,
-            resume,
-            kind: CoroutineKind::Async,
-            source: CoroutineSource::Fn,
-            capture_by_value: true,
-            konst: false,
-            immovable: false,
-        };
-        let row = self.put_row(c.encode(), r);
-        let root = self.put_expr(Expr::Closure { row }, r);
+        // The root is the block itself: the body's head says it is an async fn's (`sig::ASYNC`,
+        // its written return type at `head::TY`), and the coroutine is made from that by whoever
+        // builds code, not spelled here as a closure.
+        let root = self.block_of(&stmts, Some(body), BlockKind::Plain, r);
         let params = self.put_ids_of(&params);
         (root, params)
     }
+
+    /// `ASSIGNEE = rhs` where the assignee is a tuple, a slice, a tuple struct or a struct:
+    /// `{ let PAT = rhs; place_1 = __lhs; .. }` (the Reference, "Destructuring assignments"),
+    /// each place of the assignee replaced in `PAT` by a fresh binding, `_` by `_` and `..` by
+    /// `..`, the assignments in the order the places are written. The left side's nodes are
+    /// walked breadth first (a node's children consecutive), the patterns made from the last
+    /// node back, so every pattern is written after its children.
+    pub(crate) fn destructuring_assign(&mut self, lhs: ExprId, rhs: ExprId) -> Expr {
+        let alloc = *self.vals.allocator();
+        let mut nodes: blaze_own::AVec<'_, Assignee> = blaze_own::Vec::new_in(alloc);
+        nodes.push(self.assignee(lhs, Within::Other));
+        let mut i = 0;
+        while i < nodes.len() {
+            let n = nodes[i];
+            let within = match n.shape {
+                Shape::Tuple | Shape::Slice | Shape::TupleStruct(_) => Within::Seq,
+                _ => Within::Other,
+            };
+            let first = idx(nodes.len());
+            for k in 0..n.src.len {
+                let at = (n.src.start + k) as usize;
+                let kid = match n.shape {
+                    Shape::Struct { .. } => match FieldInit::decode(self.out.rows[at]) {
+                        Ok(init) => init.expr,
+                        Err(_) => continue,
+                    },
+                    _ => ExprId(self.out.ids[at]),
+                };
+                let mut a = self.assignee(kid, within);
+                a.index = k;
+                nodes.push(a);
+            }
+            nodes[i].first = first;
+            nodes[i].kids = idx(nodes.len()) - first;
+            i += 1;
+        }
+        let mut pats: blaze_own::AVec<'_, PatId> = blaze_own::Vec::new_in(alloc);
+        pats.resize(nodes.len(), PatId(0));
+        let mut kids: blaze_own::AVec<'_, u32> = blaze_own::Vec::new_in(alloc);
+        for i in (0..nodes.len()).rev() {
+            let n = nodes[i];
+            let er = self.out.expr_ranges[n.expr.0 as usize];
+            let below = &nodes[n.first as usize..(n.first + n.kids) as usize];
+            let below_pats = &pats[n.first as usize..(n.first + n.kids) as usize];
+            kids.clear();
+            let mut rest = None;
+            for (k, p) in below.iter().zip(below_pats) {
+                match (n.shape, k.shape) {
+                    (Shape::Tuple | Shape::TupleStruct(_), Shape::Rest) => {
+                        rest = rest.or(Some(idx(kids.len())));
+                    }
+                    (Shape::Slice, Shape::Rest) => {
+                        rest = rest.or(Some(idx(kids.len())));
+                        kids.push(p.0);
+                    }
+                    _ => kids.push(p.0),
+                }
+            }
+            let pat = match n.shape {
+                Shape::Place => self.hygienic_bind("lhs", false, er),
+                Shape::Wild => self.put_pat(Pat::Wild, er),
+                Shape::Rest => self.put_pat(Pat::Rest, er),
+                Shape::Tuple => {
+                    let elems = self.put_ids_of(&kids);
+                    self.put_pat(Pat::Tuple { elems, rest }, er)
+                }
+                Shape::Slice => {
+                    let elems = self.put_ids_of(&kids);
+                    self.put_pat(Pat::Slice { elems, rest }, er)
+                }
+                Shape::TupleStruct(path) => {
+                    let elems = self.put_ids_of(&kids);
+                    self.put_pat(Pat::TupleStruct { path, elems, rest }, er)
+                }
+                Shape::Struct { path, rest } => {
+                    let start = idx(self.out.rows.len());
+                    for (k, p) in below.iter().zip(below_pats) {
+                        let Ok(init) = FieldInit::decode(self.out.rows[(n.src.start + k.index) as usize]) else {
+                            continue;
+                        };
+                        let kr = self.out.expr_ranges[k.expr.0 as usize];
+                        self.out.rows.push(FieldPat { name: init.name, pat: *p, shorthand: false }.encode());
+                        self.out.row_ranges.push(kr);
+                    }
+                    let fields = List { start, len: idx(self.out.rows.len()) - start };
+                    self.put_pat(Pat::Struct { path, fields, rest }, er)
+                }
+            };
+            pats[i] = pat;
+        }
+        // The `let`, then each place's assignment, in the order written: a preorder walk.
+        let mut stmts: blaze_own::AVec<'_, u32> = blaze_own::Vec::new_in(alloc);
+        stmts.push(self.put_stmt(Stmt::Let { pat: pats[0], ty: None, init: Some(rhs), else_: None }).0);
+        let mut stack: blaze_own::AVec<'_, u32> = blaze_own::Vec::new_in(alloc);
+        stack.push(0);
+        while let Some(i) = stack.pop() {
+            let n = nodes[i as usize];
+            if let Shape::Place = n.shape {
+                let er = self.out.expr_ranges[n.expr.0 as usize];
+                let value = self.hygienic_local(pats[i as usize], er);
+                let assign = self.put_expr(Expr::Assign { lhs: n.expr, rhs: value }, er);
+                stmts.push(self.put_stmt(Stmt::Expr { expr: assign, semi: true }).0);
+            }
+            stack.extend((n.first..n.first + n.kids).rev());
+        }
+        // The assignee is not a value (the Reference, "Assignee expressions"): its own nodes (the
+        // tuple, the struct, a tuple struct's callee path, `_`, `..`, every parenthesis around a
+        // node) are now the pattern's and no root reaches them. Each becomes `Missing` so the
+        // passes that read every node in order (the conversion to the checker's body, the code
+        // builder's scans) see no value there; a place is kept, read by its assignment alone.
+        for n in nodes.iter() {
+            let mut cur = n.outer;
+            for _ in 0..=self.out.exprs.len() {
+                if cur == n.expr {
+                    break;
+                }
+                let Ok(Expr::Paren(inner)) = Expr::decode(self.out.exprs[cur.0 as usize]) else { break };
+                self.out.exprs[cur.0 as usize] = Expr::Missing.encode();
+                cur = inner;
+            }
+            if matches!(n.shape, Shape::Place) {
+                continue;
+            }
+            if let Ok(Expr::Call { callee, .. }) = Expr::decode(self.out.exprs[n.expr.0 as usize]) {
+                self.out.exprs[callee.0 as usize] = Expr::Missing.encode();
+            }
+            self.out.exprs[n.expr.0 as usize] = Expr::Missing.encode();
+        }
+        let stmts = self.put_ids_of(&stmts);
+        Expr::Block { stmts, tail: None, scope: self.scope(), kind: BlockKind::Plain }
+    }
+
+    /// What one node of an assignee is (parentheses looked through).
+    fn assignee(&mut self, e: ExprId, within: Within) -> Assignee {
+        let mut cur = e;
+        let mut shape = Shape::Place;
+        let mut src = List { start: 0, len: 0 };
+        for _ in 0..=self.out.exprs.len() {
+            match Expr::decode(self.out.exprs[cur.0 as usize]) {
+                Ok(Expr::Paren(inner)) => {
+                    cur = inner;
+                    continue;
+                }
+                Ok(Expr::Tuple { elems }) => (shape, src) = (Shape::Tuple, elems),
+                Ok(Expr::Array { elems }) => (shape, src) = (Shape::Slice, elems),
+                Ok(Expr::Call { callee, args }) => {
+                    if let Ok(Expr::Path(path)) = Expr::decode(self.out.exprs[callee.0 as usize]) {
+                        (shape, src) = (Shape::TupleStruct(path), args);
+                    }
+                }
+                Ok(Expr::Underscore) => shape = Shape::Wild,
+                Ok(Expr::Struct { path, fields, base }) => {
+                    let range_full = PathRef::decode(self.out.paths[path.0 as usize])
+                        .is_ok_and(|p| p.lang == Some(LangItem::RangeFull));
+                    if range_full && fields.len == 0 {
+                        // `..`: a rest only among a tuple's, a slice's or a tuple struct's.
+                        if within == Within::Seq {
+                            shape = Shape::Rest;
+                        }
+                    } else {
+                        let rest = match base {
+                            StructBase::None => false,
+                            StructBase::Defaults => true,
+                            StructBase::Expr(b) => {
+                                // rustc: "functional record updates are not allowed in
+                                // destructuring assignments".
+                                let br = self.out.expr_ranges[b.0 as usize];
+                                self.diag(DiagKind::FruInDestructuringAssignment, br);
+                                true
+                            }
+                        };
+                        (shape, src) = (Shape::Struct { path, rest }, fields);
+                    }
+                }
+                _ => {}
+            }
+            break;
+        }
+        Assignee { outer: e, expr: cur, shape, src, first: 0, kids: 0, index: 0 }
+    }
+}
+
+/// Where an assignee node stands: `..` is a rest only in a sequence.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Within {
+    Seq,
+    Other,
+}
+
+/// One node of a destructuring assignment's left side; its children are `kids` nodes from
+/// `first`, made from `src` (ids, or for a struct rows of [`FieldInit`]).
+#[derive(Clone, Copy)]
+struct Assignee {
+    /// The node as written, parentheses and all; `expr` is the node inside them.
+    outer: ExprId,
+    expr: ExprId,
+    shape: Shape,
+    src: List,
+    first: u32,
+    kids: u32,
+    /// Its position in its parent's `src`.
+    index: u32,
+}
+
+#[derive(Clone, Copy)]
+enum Shape {
+    /// A place expression: a fresh binding in the pattern, then `place = binding`.
+    Place,
+    Wild,
+    Rest,
+    Tuple,
+    Slice,
+    TupleStruct(PathIdx),
+    Struct { path: PathIdx, rest: bool },
 }
 
 #[cfg(test)]

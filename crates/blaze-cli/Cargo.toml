@@ -24,6 +24,8 @@ blaze-std.workspace = true
 blaze-file-items.workspace = true
 # `Edition`, `ItemDetail`, `ItemKind`: the outline's value types.
 blaze-surface.workspace = true
+# `BlazeEdition`: the one home of the blaze editions' spellings (std.md, "The blaze edition").
+edition.workspace = true
 # `ContentId`: file and item digests. By path: the workspace entry turns on serde adapters.
 blaze-ids = { path = "../blaze-ids" }
 # Vec, SortedMap, VecDeque in the command's frame.
@@ -34,6 +36,48 @@ blaze-mem.workspace = true
 # `blaze run`'s program after its check: the walking skeleton's straight line, lower to call
 # (tests/ladder/README.md).
 blaze-ladder.workspace = true
+# The shared cache's read path (remote-read.md): a named origin folder read by range, checked
+# against a signed head. Without `bucket`: no HTTP client, no TLS, in this binary's graph.
+blaze-remote = { workspace = true, default-features = false }
+# The findings' frames, their wording table and the closing line (blaze_report::frame).
+blaze-report.workspace = true
+# The workspace's layout (`layout::Layout`), sans-IO: members, targets, dependencies, each on its
+# line. Without `cargo`: no serde, on blaze's own crates only.
+blaze-manifest = { workspace = true, default-features = false }
+# What each crate is given with nothing in its manifest (`implicit`), the one rule.
+blaze-unit-graph.workspace = true
+# The `MacroModule` task (macros.rs): a module's identity, its key and the module store's lookup;
+# the runtime only with `sandbox`.
+blaze-proc-macro.workspace = true
+# `procs`: a macro crate's module identity from the lock and the graph (one home, procs.rs).
+blaze-world = { workspace = true, features = ["procs"] }
+# The toolchain this binary opens (`PINNED`), its manifest and packs read from the shelf.
+blaze-toolchain.workspace = true
+# The names step's per-crate entry (names.rs).
+blaze-scope.workspace = true
+blaze-id.workspace = true
+# The lock's units (`plan`) and the machine that fetches them (fetch.rs). The plan is needed
+# without `fetch` too: a unit the store lacks is then a finding naming it. blaze-drive's
+# `fetch_task` already brings this crate into the graph either way.
+blaze-fetch.workspace = true
+# HTTPS for the fetch machine (`fetch`): HTTP/1.1 over rustls on ring; no h3, and no
+# `native-roots` (the trust anchors come from the effect the fetch lane is adding).
+blaze-http = { workspace = true, optional = true }
+# The fetched source records mapped read-only for the dependency graph (`Mapping::map_file`,
+# graph.rs); with `fetch`, a git commit's record written in place (`reserve::Reserve`), on a
+# driver of its own over the records' folder.
+blaze-core.workspace = true
+# A unit's and a refusal's words (`Show`), as blaze-fetch writes them.
+blaze-text.workspace = true
+
+[features]
+default = ["fetch", "sandbox"]
+# The network: the `Fetch` task asks for each lock entry's sources over HTTPS. Without it the
+# binary opens no socket, and a lock entry whose sources the store lacks is a finding.
+fetch = ["dep:blaze-http"]
+# The proc-macro sandbox (Wasmtime), linked into `blaze`: no helper process, one code path. A
+# command that expands nothing does not run it; without it the binary still looks modules up.
+sandbox = ["blaze-proc-macro/runtime"]
 
 [dev-dependencies]
 # `check` and `control`: the sweep's simulation and its planted-bug control.

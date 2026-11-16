@@ -12,6 +12,7 @@ use core::{alloc::Allocator, fmt};
 
 use blaze_data::Value;
 use blaze_own::{String, Vec};
+use blaze_text::{Dbg, DebugForm, Put, Show, Shown, Writes as _};
 
 use crate::{
     doc::{Document, Item, Kind, NONE, Origin, low, widen},
@@ -42,25 +43,40 @@ pub struct EditError<B: Allocator> {
     pub what: EditWhat<B>,
 }
 
+/// `the edit at byte N: why`.
+impl<B: Allocator> Show for EditError<B> {
+    fn show<P: Put + ?Sized>(&self, out: &mut P) {
+        out.str("the edit at byte ").int(self.at).str(": ");
+        match &self.what {
+            EditWhat::OtherDocument => out.str("the item is from another document"),
+            EditWhat::NotATable { kind } => out.str(kind.name()).str(" is not a table"),
+            EditWhat::NotAnArray { kind } => out.str(kind.name()).str(" is not an array"),
+            EditWhat::IsATable => out.str("the key holds a table; set the keys inside it"),
+            EditWhat::NotEditable { origin } => out.str("a table or array of origin ").debug(origin).str(" has no one place to edit"),
+            EditWhat::Index { index, len } => out.str("index ").int(*index).str(" is past the array's ").int(*len).str(" elements"),
+            EditWhat::Overlap { at } => out.str("it overlaps another edit at byte ").int(*at),
+            EditWhat::Value(error) => out.show(error),
+        };
+    }
+}
+
+/// `EditError(the edit at byte N: why)`.
+impl<B: Allocator> DebugForm for EditError<B> {
+    fn debug_form(&self, out: &mut dyn Put) {
+        out.str("EditError(").show(self).byte(b')');
+    }
+}
+
+/// The bridges `core::error::Error` needs: the text is [`Show`]'s and [`DebugForm`]'s.
 impl<B: Allocator> fmt::Display for EditError<B> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "the edit at byte {}: ", self.at)?;
-        match &self.what {
-            EditWhat::OtherDocument => f.write_str("the item is from another document"),
-            EditWhat::NotATable { kind } => write!(f, "{} is not a table", kind.name()),
-            EditWhat::NotAnArray { kind } => write!(f, "{} is not an array", kind.name()),
-            EditWhat::IsATable => f.write_str("the key holds a table; set the keys inside it"),
-            EditWhat::NotEditable { origin } => write!(f, "a table or array of origin {origin:?} has no one place to edit"),
-            EditWhat::Index { index, len } => write!(f, "index {index} is past the array's {len} elements"),
-            EditWhat::Overlap { at } => write!(f, "it overlaps another edit at byte {at}"),
-            EditWhat::Value(error) => write!(f, "{error}"),
-        }
+        fmt::Display::fmt(&Shown(self), f)
     }
 }
 
 impl<B: Allocator> fmt::Debug for EditError<B> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "EditError({self})")
+        fmt::Display::fmt(&Shown(Dbg(self)), f)
     }
 }
 

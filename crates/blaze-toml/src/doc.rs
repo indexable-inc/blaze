@@ -10,6 +10,7 @@
 use core::{alloc::Allocator, fmt, ops::Range};
 
 use blaze_own::{String, Vec};
+use blaze_text::{Dbg, DebugForm, Put, Show, Shown, Writes as _};
 
 /// No node: the end of a chain.
 pub(crate) const NONE: u32 = u32::MAX;
@@ -59,6 +60,8 @@ pub enum Origin {
     /// A value, or an array written `[ ]`: closed once written.
     Value,
 }
+
+blaze_text::debug_variants!(Origin { Implicit, Header, Dotted, Inline, Value });
 
 /// Text that is either a range of the source or of the arena.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -152,16 +155,16 @@ pub struct Datetime {
 }
 
 /// RFC 3339's form: `1979-05-27T07:32:00.5-07:00`, the fraction without trailing zeros.
-impl fmt::Display for Datetime {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+impl Show for Datetime {
+    fn show<P: Put + ?Sized>(&self, out: &mut P) {
         if let Some(Date { year, month, day }) = self.date {
-            write!(f, "{year:04}-{month:02}-{day:02}")?;
+            out.int_zeros(year, 4).byte(b'-').int_zeros(month, 2).byte(b'-').int_zeros(day, 2);
             if self.time.is_some() {
-                f.write_str("T")?;
+                out.byte(b'T');
             }
         }
         if let Some(Time { hour, minute, second, nanosecond }) = self.time {
-            write!(f, "{hour:02}:{minute:02}:{second:02}")?;
+            out.int_zeros(hour, 2).byte(b':').int_zeros(minute, 2).byte(b':').int_zeros(second, 2);
             if nanosecond > 0 {
                 let mut digits = 9;
                 let mut n = nanosecond;
@@ -169,18 +172,25 @@ impl fmt::Display for Datetime {
                     n /= 10;
                     digits -= 1;
                 }
-                write!(f, ".{n:0digits$}")?;
+                out.byte(b'.').int_zeros(n, digits);
             }
         }
         match self.offset {
-            None => Ok(()),
-            Some(Offset::Z) => f.write_str("Z"),
+            None => {}
+            Some(Offset::Z) => _ = out.byte(b'Z'),
             Some(Offset::Minutes(m)) => {
-                let sign = if m < 0 { '-' } else { '+' };
+                let sign = if m < 0 { b'-' } else { b'+' };
                 let m = m.unsigned_abs();
-                write!(f, "{sign}{:02}:{:02}", m / 60, m % 60)
+                out.byte(sign).int_zeros(m / 60, 2).byte(b':').int_zeros(m % 60, 2);
             }
         }
+    }
+}
+
+/// The bridge for `{}` users: the text is [`Show`]'s.
+impl fmt::Display for Datetime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&Shown(self), f)
     }
 }
 
@@ -359,9 +369,18 @@ impl<'d, 't, A: Allocator> Item<'d, 't, A> {
     }
 }
 
+/// `Item(table "key" at 3..9)`: its own debug form, in place of reflection's reading of the
+/// document it points into.
+impl<A: Allocator> DebugForm for Item<'_, '_, A> {
+    fn debug_form(&self, out: &mut dyn Put) {
+        out.str("Item(").str(self.kind().name()).byte(b' ').debug(self.key()).str(" at ").debug(&self.span()).byte(b')');
+    }
+}
+
+/// The bridge for `{:?}` users (`assert_eq!`, `unwrap`): the debug form above.
 impl<A: Allocator> fmt::Debug for Item<'_, '_, A> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Item({} {:?} at {:?})", self.kind().name(), self.key(), self.span())
+        fmt::Display::fmt(&Shown(Dbg(self)), f)
     }
 }
 

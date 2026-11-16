@@ -334,7 +334,7 @@ impl<T, A: Allocator + Clone, S> PerWorker<T, A, S> {
             };
             // SAFETY: the visit borrows `self` and `visit`, and this call waits for every
             // visit to end (`outlast` below) before it returns.
-            let (queued, job) = unsafe { threads::job("bstd.per_worker.fold", &tally, body) };
+            let (queued, job) = unsafe { threads::job("bstd.per_worker.fold", &tally, super::claim::Start::Open, body) };
             if let Err(Full(job)) = pool.spawn_on(at, job) {
                 pool.run_now(cx.here(), job);
             }

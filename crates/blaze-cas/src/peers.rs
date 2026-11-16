@@ -194,7 +194,7 @@ impl Store {
             let tag = self.tags.ask(Op::Peers { root });
             let peers = self.peers.as_ref().expect("a look is of a shared store");
             // clone: once per root a look, the effect owns the name
-            effects.push(Effect::Entries { dir: peers.roots[root].clone(), tag });
+            effects.push(Effect::Entries { dir: peers.roots[root].clone().into(), tag });
         }
         let peers = self.peers.as_mut().expect("a look is of a shared store");
         peers.asked += 1;
@@ -301,16 +301,23 @@ impl Store {
                     self.peers.as_ref().expect("a listing is of a shared store").roots[root_at].clone();
                 if self.retry(&root, &done) {
                     let tag = self.tags.ask(Op::Peers { root: root_at });
-                    effects.push(Effect::Entries { dir: root, tag });
+                    effects.push(Effect::Entries { dir: root.into(), tag });
                 }
                 return;
             }
         };
         self.failures = 0;
-        for (dir, stamp) in entries {
+        for entry in 0..entries.len() {
             let peers = self.peers.as_mut().expect("a listing is of a shared store");
-            let name = dir.as_str().rsplit('/').next().unwrap_or_default();
-            if !stamp.is_dir() || !name.starts_with(WRITER_PREFIX) || dir == peers.own {
+            // The kind column first: a file or a link is passed over with no name read.
+            if entries.kind(entry) != blaze_core::Kind::Dir
+                || !entries.leaf(entry).as_str().starts_with(WRITER_PREFIX)
+            {
+                continue;
+            }
+            // alloc: once per writer's directory, the name its tier and its reads keep.
+            let dir = entries.file(entry);
+            if dir == peers.own {
                 continue;
             }
             let at = match peers.tier_of.get(&dir) {

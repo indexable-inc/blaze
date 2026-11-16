@@ -49,7 +49,8 @@ fn explicit_shadows_glob() {
     assert_eq!(s.def(k.root, VAL, "foo"), Some(k.b_foo));
     assert_eq!(s.scope(k.root).get(VAL, "foo").map(|b| b.origin), Some(Origin::Import));
     assert_eq!(s.def(k.root, VAL, "bar"), Some(k.a_bar));
-    assert_eq!(s.scope(k.root).get(VAL, "bar").map(|b| b.origin), Some(Origin::Glob));
+    // Reached through the glob's edge, not copied into the record.
+    assert_eq!(s.scope(k.root).get(VAL, "bar"), None);
     assert!(s.errors(k.root).is_empty(), "{:?}", s.errors(k.root));
 }
 
@@ -59,7 +60,7 @@ fn explicit_shadows_glob() {
 fn two_globs_ambiguous_only_when_used() {
     let (w, k) = fixtures::two_globs();
     let s = solved(&w);
-    let x = s.scope(k.root).get(VAL, "x").copied();
+    let x = s.binding(k.root, VAL, "x");
     assert_eq!(x.map(|b| b.state), Some(BindingState::Ambiguous(AmbiguityKind::GlobVsGlob)));
     assert!(s.errors(k.root).is_empty(), "{:?}", s.errors(k.root));
     assert_eq!(
@@ -80,28 +81,21 @@ fn pub_use_chain_across_three_modules() {
 }
 
 /// Rule: globs that import each other (`use super::*` in a child whose parent has `pub use
-/// child::*`) reach the least fixpoint: each binds what the other declares, nothing more, and
-/// the two are written as one group naming each other.
+/// child::*`) reach the least fixpoint: each binds what the other declares, nothing more.
 #[test]
 fn super_glob_cycle_is_solved() {
     let (w, k) = fixtures::super_glob();
     let s = solved(&w);
     assert_eq!(s.def(k.root, VAL, "c"), Some(k.c));
     assert_eq!(s.def(k.child, VAL, "r"), Some(k.r));
-    assert_eq!(s.scope(k.root).fellows.as_slice(), &[k.child]);
-    assert_eq!(s.scope(k.child).fellows.as_slice(), &[k.root]);
     for m in [k.root, k.child] {
         assert!(s.errors(m).is_empty(), "{:?}", s.errors(m));
-        assert!(
-            s.by[&m].reads.entries.iter().all(|e| e.read.module() != k.root && e.read.module() != k.child),
-            "a fellow's read is in the read list"
-        );
     }
 }
 
 /// Rule: a glob brings only what the importer may name: a private item is invisible through
-/// a glob from outside its module and visible from inside it; an outside glob does not even
-/// read the private class.
+/// a glob from outside its module and visible from inside it. The importer's record holds the
+/// edge, not the names: its read list asks `a` for its edges, never for its names.
 #[test]
 fn private_item_invisible_through_glob_from_outside() {
     let (w, k) = fixtures::private();
@@ -110,8 +104,9 @@ fn private_item_invisible_through_glob_from_outside() {
     assert_eq!(s.def(k.root, VAL, "hidden"), None);
     assert_eq!(s.def(k.inner, VAL, "hidden"), Some(k.hidden));
     let reads = &s.by[&k.root].reads;
-    assert!(reads.contains(&Read::Exports { module: k.a, class: crate::VisibilityClass::Public }));
-    assert!(!reads.contains(&Read::Exports { module: k.a, class: crate::VisibilityClass::Restricted(k.a) }));
+    assert!(s.scope(k.root).globs.iter().any(|e| e.source.key == k.a), "the glob of `a` is an edge of the record");
+    assert!(s.scope(k.root).get(VAL, "shown").is_none(), "a name through a glob is not copied into the record");
+    assert!(!reads.contains(&Read::Name { module: k.a, ns: VAL, name: "hidden" }));
 }
 
 /// Rule: `pub(crate)` is the crate, `pub(super)` and `pub(in path)` the named ancestor; an
@@ -210,6 +205,34 @@ fn expansion_adds_item_a_pending_import_waits_for() {
     assert_eq!(s.def(k.user, VAL, "made"), Some(k.made));
     assert!(s.errors(k.root).is_empty(), "{:?}", s.errors(k.root));
     assert!(s.errors(k.user).is_empty(), "{:?}", s.errors(k.user));
+}
+
+/// Rule: a module a macro writes is a module like a walked one, and so are the modules inside
+/// it: std's and hashbrown's `cfg_if! { if #[cfg(unix)] { mod unix; pub use self::unix::*; } }`
+/// shape, where `gen!()` expands to `mod imp { mod unix { pub fn f; } pub use self::unix::f; }`
+/// and the root re-exports `imp::f`, which a sibling module imports by `crate::f`.
+#[test]
+fn module_written_by_a_macro_resolves_like_a_walked_one() {
+    use super::V;
+    use crate::CallShape;
+    let mut w = World::new();
+    let root = w.root(1, crate::Edition::E2021);
+    w.rules(root, "gen");
+    let call = w.call(root, "gen", CallShape::FnLike);
+    let imp = w.module(call, "imp", V::Priv);
+    let unix = w.module(imp, "unix", V::Priv);
+    let f = w.fun(unix, "f", V::Pub);
+    w.use_(imp, "self::unix::f", V::Pub);
+    w.use_(root, "imp::f", V::Pub);
+    let user = w.module(root, "user", V::Priv);
+    w.use_(user, "crate::f", V::Priv);
+    let s = solved(&w);
+    assert_eq!(s.def(imp, VAL, "f"), Some(f));
+    assert_eq!(s.def(root, VAL, "f"), Some(f));
+    assert_eq!(s.def(user, VAL, "f"), Some(f));
+    for m in [root, imp, unix, user] {
+        assert!(s.errors(m).is_empty(), "{:?}", s.errors(m));
+    }
 }
 
 /// Rule: a name a macro expansion adds may not shadow a glob binding an early resolution of

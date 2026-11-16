@@ -27,23 +27,23 @@ impl Cfg for Unix {
     }
 }
 
-fn body(text: &str) -> Lowered<'static> {
+fn body(text: &str) -> Lowered<'static, '_> {
     match lower_body(text, Edition::E2024, &mut Unix, Alloc::global()) {
         Ok(l) => l,
         Err(need) => panic!("{text}: needs {:?}", need.atoms),
     }
 }
 
-fn signature(text: &str) -> Lowered<'static> {
+fn signature(text: &str) -> Lowered<'static, '_> {
     match lower_signature(text, Edition::E2024, &mut Unix, Alloc::global()) {
         Ok(l) => l,
         Err(need) => panic!("{text}: needs {:?}", need.atoms),
     }
 }
 
-fn dump_of(text: &str, l: &Lowered<'_>) -> String {
+fn dump_of(l: &Lowered<'_, '_>) -> String {
     let mut out = String::new();
-    crate::dump::dump(text, &l.view(), Alloc::global(), &mut out).expect("a String takes every write");
+    crate::dump::dump(&l.view(), Alloc::global(), &mut out).expect("a String takes every write");
     out
 }
 
@@ -62,7 +62,7 @@ fn in_order(dump: &str, fragments: &[&str]) -> Result<(), String> {
 #[track_caller]
 fn assert_body(text: &str, fragments: &[&str]) {
     let l = body(text);
-    let dump = dump_of(text, &l);
+    let dump = dump_of(&l);
     if let Err(why) = in_order(&dump, fragments) {
         panic!("{text}:\n{why}");
     }
@@ -127,7 +127,7 @@ fn every_pattern_form_dumps() {
     ];
     for (text, fragments) in cases {
         let l = body(text);
-        let dump = dump_of(text, &l);
+        let dump = dump_of(&l);
         if let Err(why) = in_order(&dump, fragments) {
             panic!("{text}:\n{why}");
         }
@@ -151,7 +151,7 @@ fn every_signature_form_dumps() {
     ];
     for (text, fragments) in cases {
         let l = signature(text);
-        let dump = dump_of(text, &l);
+        let dump = dump_of(&l);
         if let Err(why) = in_order(&dump, fragments) {
             panic!("{text}:\n{why}");
         }
@@ -186,6 +186,38 @@ fn for_is_rustcs() {
 #[test]
 fn while_is_rustcs() {
     assert_body("fn f(c: bool) { while c { g(); } }", &["(loop/while e", "(tail (if c@p0 (block", "(stmt (break ->e"]);
+}
+
+/// The Reference, "Destructuring assignments": "the assignee expression is first evaluated
+/// ... desugared to a `let` binding of fresh variables by the corresponding pattern, followed
+/// by the assignment of those variables to the places, in order"; so the right side (`p()`,
+/// `q()`) runs before any place's index (`n()`, `m()`), and the places are assigned in the
+/// order written. `_` is a wildcard, `..` a rest, nested assignees nest, and a struct's `..`
+/// is its pattern's rest. Before the fix every one was "unhandled BIN_EXPR".
+#[test]
+fn destructuring_assignment_is_a_let_then_assignments() {
+    assert_body(
+        "fn f(v: V, w: W) { (v[n()], w[m()]) = (p(), q()); }",
+        &[
+            "(let (tuple $made@p",
+            "(call (path p)",
+            "(call (path q)",
+            "(semi (assign (index v@p0 (call (path n)",
+            "(semi (assign (index w@p1 (call (path m)",
+        ],
+    );
+    assert_body("fn f(a: A, b: B) { (a, b) = (b, a); }", &["(let (tuple $made@p", "(assign a@p0 $made@p", "(assign b@p1 $made@p"]);
+    assert_body("fn f(a: A, t: T) { (a, _) = t; }", &["(let (tuple $made@p", "_", "(assign a@p0 $made@p"]);
+    assert_body("fn f(x: X, y: Y, arr: R) { [x, .., y] = arr; }", &["(let (slice $made@p", "..", "(assign x@p0", "(assign y@p1"]);
+    assert_body("fn f(g: G, s: S) { S { f: g, .. } = s; }", &["(let (struct (path S) (field f $made@p", "..", "(assign g@p0"]);
+    assert_body(
+        "fn f(a: A, b: B, c: C) { ((a, Pair(b, ..)), [c]) = z(); }",
+        &["(let (tuple (tuple $made@p", "(tuple-struct (path Pair) $made@p", "(slice $made@p", "(assign a@p0", "(assign b@p1", "(assign c@p2"],
+    );
+    // `..base` has no place in an assignee.
+    let l = body("fn f(g: G, s: S) { S { f: g, ..s } = s; }");
+    let dump = dump_of(&l);
+    assert!(dump.contains("diag FruInDestructuringAssignment"), "{dump}");
 }
 
 /// rustc: `if let` and `while let` chains stay `let` expressions in a condition.
@@ -238,32 +270,58 @@ fn ranges_are_rustcs() {
     );
 }
 
-/// rustc's `make_lowered_await`.
+/// `.await` is one node, in an async body only; an async fn's body is its block, its head
+/// marked async with the written return type; an async block is a coroutine closure.
 #[test]
-fn await_is_rustcs() {
-    assert_body(
-        "async fn f() -> u8 { g().await }",
-        &[
-            "(async-fn move resume=p",
-            "(match/await (call #into_future (call (path g)))",
-            "(arm mut $__awaitee@p",
-            "(loop e",
-            "(match/await (unsafe e",
-            "(call #poll (call #new_unchecked (ref-mut $__awaitee@p",
-            "(call #get_context $_task_context@p",
-            "(arm (tuple-struct #Ready $result@p",
-            "(break ->e",
-            "(arm #Pending (block e",
-            "(assign $_task_context@p",
-            "(yield (tuple))",
-        ],
-    );
-    // E0728: no desugaring outside a coroutine.
-    let l = body("fn f() { g().await; }");
-    assert!(l.view().diags().any(|d| d.is_ok_and(|d| d.kind == DiagKind::AwaitOutsideAsync)));
-    // A plain closure in an async body is no coroutine.
-    let l = body("async fn f() { let c = || g().await; }");
-    assert!(l.view().diags().any(|d| d.is_ok_and(|d| d.kind == DiagKind::AwaitOutsideAsync)));
+fn await_is_one_node() {
+    assert_body("async fn f() -> u8 { g().await }", &["(body (block e", "(await (call (path g)))"]);
+    let l = body("async fn f() -> u8 { g().await }");
+    assert!(!dump_of(&l).contains("yield"), "{}", dump_of(&l));
+    assert_body("fn f() { async move { g().await }; }", &["(async-block move", "(await (call (path g)))"]);
+    // E0728: outside an async body, and in a plain closure inside one, and in a `gen` block.
+    for text in ["fn f() { g().await; }", "async fn f() { let c = || g().await; }", "fn f() { gen { g().await }; }"] {
+        let l = body(text);
+        assert!(l.view().diags().any(|d| d.is_ok_and(|d| d.kind == DiagKind::AwaitOutsideAsync)), "{text}");
+        assert!(!dump_of(&l).contains("(await"), "{text}");
+    }
+}
+
+/// An async fn's body converts with its coroutine output: the written return type, `()` when
+/// none is written; `.await` and an async block convert to their nodes.
+#[test]
+fn an_async_body_converts_with_its_output() {
+    use crate::typeck::{Refused, Types, to_typeck};
+    use blaze_typeck::{PNode, PTy, PortableTys};
+    /// Every written type is `u8`.
+    struct U8;
+    impl Types for U8 {
+        fn ty(&mut self, _: &View<'_>, _: TypeId, tys: &mut PortableTys<'_>) -> Result<PTy, Refused> {
+            tys.intern(PNode::Uint(blaze_typeck::UintTy::U8)).map_err(Refused::Check)
+        }
+        fn const_arg(&mut self, view: &View<'_>, c: ConstIdx, _: &mut blaze_typeck::PortableTys<'_>) -> Result<blaze_typeck::PTy, Refused> {
+            Err(crate::typeck::no_const_arg(view, c))
+        }
+        fn repeat_len(&mut self, _: &View<'_>, _: ExprId) -> Result<u64, Refused> {
+            Ok(0)
+        }
+    }
+    let mut tys = PortableTys::new_in(Alloc::global());
+    let u8_ = tys.intern(PNode::Uint(blaze_typeck::UintTy::U8)).expect("u8");
+    let none = tys.intern_list(&[]).expect("()");
+    let unit = tys.intern(PNode::Tuple(none)).expect("()");
+    let cases = [
+        ("async fn f() -> u8 { g().await }", Some(u8_)),
+        ("async fn f() { g().await; }", Some(unit)),
+        ("fn f() { let _ = async { 1 }; }", None),
+    ];
+    for (text, output) in cases {
+        let l = body(text);
+        let b = to_typeck(&l.view(), blaze_typeck::ItemKey(0), &mut tys, &mut U8, Alloc::global()).expect(text);
+        assert_eq!(b.coroutine, output.map(|output| blaze_typeck::CoroutineKind::Async { output }), "{text}");
+        let awaits = b.exprs.iter().filter(|e| matches!(e, blaze_typeck::Expr::Await(_))).count();
+        let blocks = b.exprs.iter().filter(|e| matches!(e, blaze_typeck::Expr::AsyncBlock { .. })).count();
+        assert_eq!((awaits, blocks), (usize::from(output.is_some()), usize::from(output.is_none())), "{text}");
+    }
 }
 
 /// rustc's `lower_coroutine_body_with_moved_arguments`: a plain binding is moved by a `let`
@@ -272,17 +330,17 @@ fn await_is_rustcs() {
 fn async_fn_moves_its_arguments() {
     assert_body(
         "async fn f(a: u8, (b, c): (u8, u8)) {}",
-        &["(body a@p", "$made@p", "(async-fn move", "(let a@p", "(let mut $made@p", "(let (tuple b@p"],
+        &["(body a@p", "$made@p", "(let a@p", "(let mut $made@p", "(let (tuple b@p"],
     );
 }
 
 // ---------------------------------------------------------------------------------------------
 // Scopes
 
-fn binds(v: &View<'_>, text: &str, name: &str) -> StdVec<PatId> {
+fn binds(v: &View<'_>, name: &str) -> StdVec<PatId> {
     (0..v.pats.len() as u32)
         .map(PatId)
-        .filter(|p| matches!(v.pat(*p), Ok(Pat::Bind { name: n, .. }) if v.name_text(text, n) == name))
+        .filter(|p| matches!(v.pat(*p), Ok(Pat::Bind { name: n, .. }) if v.name_text(n) == Ok(name)))
         .collect()
 }
 
@@ -305,7 +363,7 @@ fn shadowing_finds_the_innermost() {
     let text = "fn f() -> u8 { let x = 1; let x = x; x }";
     let l = body(text);
     let v = l.view();
-    let xs = binds(&v, text, "x");
+    let xs = binds(&v, "x");
     assert_eq!(xs.len(), 2);
     assert_eq!(locals(&v), vec![xs[0], xs[1]], "the second let's init sees the first, the tail the second");
     assert!(matches!(v.pat(xs[1]), Ok(Pat::Bind { shadows: Some(s), .. }) if s == xs[0]));
@@ -313,7 +371,7 @@ fn shadowing_finds_the_innermost() {
     let text = "fn f(x: u8) -> u8 { { let x = 2; } x }";
     let l = body(text);
     let v = l.view();
-    let xs = binds(&v, text, "x");
+    let xs = binds(&v, "x");
     assert_eq!(locals(&v), vec![xs[0]]);
 }
 
@@ -344,8 +402,8 @@ fn closures_see_out_and_shadow_in() {
     let text = "fn f(x: u8, y: u8) { let g = |x: u8| x + y; x; }";
     let l = body(text);
     let v = l.view();
-    let xs = binds(&v, text, "x");
-    let ys = binds(&v, text, "y");
+    let xs = binds(&v, "x");
+    let ys = binds(&v, "y");
     assert_eq!(xs.len(), 2, "the fn's x and the closure's");
     assert_eq!(locals(&v), vec![xs[1], ys[0], xs[0]]);
 }
@@ -371,12 +429,39 @@ impl Sink for Collect {
             Outcome::Need(need) => panic!("needs {:?}", need.atoms),
         }
     }
+
+    fn refused(&mut self, item: &ItemRef<'_>, refusal: crate::Refusal<'_>) {
+        panic!("{}: {} refused, {}", item.item_text(), refusal.path, refusal.bound);
+    }
 }
 
 struct NoMacros;
 
 impl Expand for NoMacros {
-    fn expand(&mut self, _: &str, _: &str, _: Edition, _: &mut blaze_own::AString<'_>) -> Expansion {
+    fn expand(&mut self, _: &str, _: &str, _: Edition, _: &mut dyn crate::Cfg, _: &mut crate::BodyOut<'_>) -> Expansion {
+        Expansion::Unsupported
+    }
+    fn expand_body(&mut self, _: crate::BodyCall<'_>, _: &mut dyn crate::Cfg, _: &mut crate::BodyOut<'_>) -> Expansion {
+        Expansion::Unsupported
+    }
+    fn derive(
+        &mut self,
+        _: &str,
+        _: &blaze_expand::TokenStream<'_>,
+        _: blaze_expand::DeriveFacts,
+        _: Edition,
+        _: &mut crate::BodyOut<'_>,
+    ) -> Expansion {
+        Expansion::Unsupported
+    }
+    fn attr(
+        &mut self,
+        _: &str,
+        _: Option<&blaze_expand::TokenStream<'_>>,
+        _: &blaze_expand::TokenStream<'_>,
+        _: Edition,
+        _: &mut crate::BodyOut<'_>,
+    ) -> Expansion {
         Expansion::Unsupported
     }
 }
@@ -467,7 +552,7 @@ fn deep(text: &str) -> usize {
                 crate::feed::feed_steps(&mut m, &lexed, steps.into_iter(), 0);
                 let l = m.finish().unwrap_or_else(|_| panic!("no cfg in it"));
                 let mut out = String::new();
-                crate::dump::dump(text, &l.view(), Alloc::global(), &mut out).expect("a String takes every write");
+                crate::dump::dump(&l.view(), Alloc::global(), &mut out).expect("a String takes every write");
                 assert!(l.view().unhandled.is_empty());
                 l.view().exprs.len()
             })
@@ -562,4 +647,137 @@ fn the_oracle_catches_a_for_that_drops_the_break_on_none() {
             for_leaves_on_none(&l.view()).map_err(|why| Broke::Oracle(format!("{text}: {why}")))
         })
     });
+}
+
+/// `where const { COND }` is its own predicate, its condition an anonymous constant; never
+/// dropped (an item would hold without its condition).
+#[test]
+fn a_where_const_condition_is_a_predicate() {
+    let text = "impl<T> Tr for T where const { false } {}";
+    let l = signature(text);
+    let v = l.view();
+    let rows = v.rows(v.list(crate::columns::head::WHERE)).expect("where rows");
+    assert_eq!(rows.len(), 1, "{}", dump_of(&l));
+    let Ok(WherePred::Const { cond }) = WherePred::decode(rows[0]) else { panic!("{}", dump_of(&l)) };
+    let r = v.const_range(cond).expect("its range");
+    assert_eq!(v.text_at(r).expect("its text"), "const { false }");
+    assert!(dump_of(&l).contains("(const-pred const { false })"), "{}", dump_of(&l));
+}
+
+/// A format spec's trait and the arguments its width and precision name.
+#[test]
+fn format_specs_name_their_trait_and_counts() {
+    use crate::typeck::{Count, fmt_spec};
+    use blaze_typeck::FmtTrait as T;
+    let cases: [(&str, T, Option<Count<'_>>, Option<Count<'_>>); 12] = [
+        ("", T::Display, None, None),
+        ("?", T::Debug, None, None),
+        ("#x?", T::Debug, None, None),
+        ("08x", T::LowerHex, None, None),
+        (">8", T::Display, None, None),
+        ("x>8X", T::UpperHex, None, None),
+        ("+.3e", T::LowerExp, None, None),
+        ("w$", T::Display, Some(Count::Name("w")), None),
+        ("1$.prec$b", T::Binary, Some(Count::Index(1)), Some(Count::Name("prec"))),
+        ("0$", T::Display, Some(Count::Index(0)), None),
+        (".*", T::Display, None, Some(Count::Star)),
+        ("-^#010.2p", T::Pointer, None, None),
+    ];
+    for (spec, t, width, precision) in cases {
+        let s = fmt_spec(spec).unwrap_or_else(|| panic!("{spec:?} is a spec"));
+        assert_eq!((s.trait_, s.width, s.precision), (t, width, precision), "{spec:?}");
+    }
+    for bad in ["y", ".x", "?x"] {
+        assert!(fmt_spec(bad).is_none(), "{bad:?}");
+    }
+}
+
+/// `format_args!` converts to one node: its arguments, and per placeholder its trait and the
+/// `usize` counts its spec names.
+#[test]
+fn format_args_converts_with_its_uses() {
+    use crate::typeck::{Refused, Types, to_typeck};
+    use blaze_typeck::{FmtTrait as T, FmtUse};
+    struct Infer;
+    impl Types for Infer {
+        fn ty(&mut self, _: &View<'_>, _: TypeId, tys: &mut blaze_typeck::PortableTys<'_>) -> Result<blaze_typeck::PTy, Refused> {
+            tys.intern(blaze_typeck::PNode::Infer).map_err(Refused::Check)
+        }
+        fn const_arg(&mut self, view: &View<'_>, c: ConstIdx, _: &mut blaze_typeck::PortableTys<'_>) -> Result<blaze_typeck::PTy, Refused> {
+            Err(crate::typeck::no_const_arg(view, c))
+        }
+        fn repeat_len(&mut self, _: &View<'_>, _: ExprId) -> Result<u64, Refused> {
+            Ok(0)
+        }
+    }
+    let l = body("fn f(x: u8, w: usize) { format_args!(\"{x:>w$} {:?} {:.*} {0:#x}\", 1, 2, 3); }");
+    let mut tys = blaze_typeck::PortableTys::new_in(Alloc::global());
+    let b = to_typeck(&l.view(), blaze_typeck::ItemKey(0), &mut tys, &mut Infer, Alloc::global()).expect("it converts");
+    // Arguments: 1, 2, 3 written, then w and x captured in the order the template reads them
+    // (`w$` before the placeholder's own `x`): w is 3, x is 4.
+    let uses: StdVec<FmtUse> = b.fmt_uses.iter().copied().collect();
+    let want = [
+        FmtUse { arg: 3, trait_: T::Count },
+        FmtUse { arg: 4, trait_: T::Display },
+        FmtUse { arg: 0, trait_: T::Debug },
+        FmtUse { arg: 1, trait_: T::Count },
+        FmtUse { arg: 2, trait_: T::Display },
+        FmtUse { arg: 0, trait_: T::LowerHex },
+    ];
+    assert_eq!(uses, want);
+    let l = body("fn f(x: u8) { format_args!(\"{x:.*}\", 1, 2); }");
+    let mut tys = blaze_typeck::PortableTys::new_in(Alloc::global());
+    let refused = to_typeck(&l.view(), blaze_typeck::ItemKey(0), &mut tys, &mut Infer, Alloc::global()).map(|_| ());
+    assert!(matches!(refused, Err(Refused::Form { what: "`.*` after a named or numbered argument", .. })), "{refused:?}");
+}
+
+/// A doc comment on a field or variant is an attribute, never an anonymous constant (the
+/// consteval census found 1118 of them read as one); a real default or discriminant still is.
+#[test]
+fn a_doc_comment_is_no_anonymous_constant() {
+    for text in ["struct S { /// Frames a second.\n rate: u32 }", "enum E { /// doc\n A }"] {
+        let l = signature(text);
+        assert_eq!(l.view().consts().count(), 0, "{text}");
+    }
+    for text in ["struct S { /// doc\n rate: u32 = 3 }", "enum E { /// doc\n A = 1 }"] {
+        let l = signature(text);
+        let v = l.view();
+        let consts: StdVec<&str> = v.consts().map(|c| v.text_at(c).expect("the const's text")).collect();
+        assert_eq!(consts.len(), 1, "{text}: {consts:?}");
+        assert!(!consts[0].contains("doc"), "{text}: {consts:?}");
+    }
+}
+
+/// `..` in a tuple, tuple-struct or struct pattern is its list's rest, so the conversion takes
+/// it (tempo's census: 89 bodies stopped at "a rest pattern" on `S { a, .. }`); a slice's
+/// `..` is still refused, by the slice.
+#[test]
+fn a_rest_in_a_tuple_or_struct_pattern_converts() {
+    use crate::typeck::{Refused, Types, to_typeck};
+    struct NoTypes;
+    impl Types for NoTypes {
+        fn ty(&mut self, _: &View<'_>, _: TypeId, _: &mut blaze_typeck::PortableTys<'_>) -> Result<blaze_typeck::PTy, Refused> {
+            Err(Refused::Form { what: "a written type", range: Default::default() })
+        }
+        fn const_arg(&mut self, view: &View<'_>, c: ConstIdx, _: &mut blaze_typeck::PortableTys<'_>) -> Result<blaze_typeck::PTy, Refused> {
+            Err(crate::typeck::no_const_arg(view, c))
+        }
+        fn repeat_len(&mut self, _: &View<'_>, _: ExprId) -> Result<u64, Refused> {
+            Err(Refused::Form { what: "a repeat length", range: Default::default() })
+        }
+    }
+    let convert = |text: &str| {
+        let l = body(text);
+        let mut tys = blaze_typeck::PortableTys::new_in(Alloc::global());
+        to_typeck(&l.view(), blaze_typeck::ItemKey(0), &mut tys, &mut NoTypes, Alloc::global()).map(|_| ())
+    };
+    // A slice's `..` converts too, at its list's `rest` (typeck_tests' `slice_patterns_with_rest`).
+    for text in [
+        "fn f() { let (a, ..) = g(); }",
+        "fn f() { let S(a, ..) = g(); }",
+        "fn f() { let S { a, .. } = g(); }",
+        "fn f() { let [a, ..] = g(); }",
+    ] {
+        assert_eq!(convert(text), Ok(()), "{text}");
+    }
 }

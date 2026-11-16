@@ -1,0 +1,603 @@
+//! The lock's units and the `Fetch` tasks' work (blaze_drive::fetch_task; fetch.md).
+//!
+//! - **The plan.** The layout reads `Cargo.lock` as one of its reads (units.rs), so a lock
+//!   edit moves the units' source and with it the certificate. [`Lockfile::read`] plans it once
+//!   a command, and only when the layout was read. Each unit's key is a `Fetch` subject, asked
+//!   for by the `UnitGraph` task only once the graph reaches it (graph.rs).
+//! - **The records.** One file a unit, `.blaze/v2/sources/<64 hex key>`, outside the packs:
+//!   tempo's are hundreds of MiB, and a pack is merged and read whole.
+//!   - A small record (a crate) is published unsynced.
+//!   - A large one (a git commit) is written in place through `blaze_core::reserve`, synced:
+//!     the fetch is the cold path, its wait the network's.
+//! - **What a record proves.** Nothing until it is checked. `lookup` reads the record whole
+//!   and checks its BLAKE3 (`PackView::open_source`). One that fails is removed, and the unit
+//!   is fetched again. `lookup` runs only when the `Fetch` task runs, which is when its own
+//!   record is missing: a cold home, or a lock edit.
+//! - **The machine** is one a command, made at the graph's first ask. It wants each level's
+//!   units at once ([`Lockfile::want_ahead`]), so their fetches overlap up to its in-flight
+//!   limit, and never a unit the graph does not reach. Each task then steps it until its own
+//!   unit's outcome is known.
+//! - **Without `fetch`** no socket is opened. A unit whose record the store holds stands; one it
+//!   lacks is the [`CANNOT_FETCH`] finding, kept as a record: another build has another tool id
+//!   and so other keys.
+
+use blaze_drive::fetch_task::{self, Index};
+use blaze_drive::{Name, TaskFailure, Why};
+use blaze_fetch::pack::PackView;
+use blaze_fetch::plan::{self, Unit};
+use blaze_ids::ContentId;
+use blaze_manifest::lock::Lock;
+use blaze_own::Alloc;
+use bstd::cx::Cx;
+use bstd::fs::{Dir, FsKind, ReadWrite};
+use bstd::mem::{Bytes, Frame};
+use bstd::path::Path;
+
+use crate::CliError;
+use crate::work::{Did, Made, held_str};
+
+/// The finding number of a `Cargo.lock` the lock reader or the fetch plan refuses. Its one
+/// argument is the refusal.
+pub const LOCK_UNREAD: u16 = 11;
+/// The finding number of a unit whose bytes are not what the lock pins: the same key meets the
+/// same bytes again, so it is kept as a record. Its one argument is the unit and why.
+pub const SOURCE_REFUSED: u16 = 12;
+/// The finding number of a unit the store lacks in a build without `fetch`. Its one argument
+/// names the unit.
+pub const CANNOT_FETCH: u16 = 13;
+
+/// Where the units' records are, under the checkout.
+pub const SOURCES: &str = ".blaze/v2/sources";
+
+const REFUSED_DOMAIN: &str = "blaze-cli fetch refused 1";
+
+/// The lock's units, planned once a command.
+pub struct Lockfile<'f> {
+    /// The lock's text, as read: the `UnitGraph` task's source reads it (graph.rs).
+    pub text: &'f [u8],
+    /// The lock, read once a command; the `UnitGraph` task resolves over it.
+    pub lock: &'f Lock<'static>,
+    units: &'f [Unit<'f, 'static>],
+    index: Index<'static>,
+    #[cfg(feature = "fetch")]
+    net: Option<net::Net<'f>>,
+}
+
+impl<'f> Lockfile<'f> {
+    /// The lock's text planned. A refusal is `Err` with its words, which the caller makes a
+    /// [`LOCK_UNREAD`] finding.
+    ///
+    /// The lock and the plan are kept in the command's frame for the command: the machine
+    /// borrows the units, and both live as long as the request does. Their owners are on the
+    /// global heap (the machine's allocator must be the units'), so they go with the process.
+    pub fn read(text: &'f [u8], frame: &'f Frame) -> Result<Lockfile<'f>, bstd::mem::String<&'f Frame>> {
+        let lock = match Lock::read(text, Alloc::global()) {
+            Ok(lock) => lock,
+            Err(refused) => return Err(bstd::mem::format_in!(frame, "{refused}")),
+        };
+        let lock: &'f Lock<'static> = std::boxed::Box::leak(std::boxed::Box::new_in(lock, frame));
+        let planned = match plan::plan(lock, Alloc::global()) {
+            Ok(planned) => planned,
+            Err(refused) => {
+                let mut words = blaze_own::String::new_in(Alloc::global());
+                blaze_text::Writes::show(&mut words, &refused);
+                return Err(bstd::mem::String::from_str_in(words.as_str(), frame));
+            }
+        };
+        let planned: &'f plan::Plan<'f, 'static> = std::boxed::Box::leak(std::boxed::Box::new_in(planned, frame));
+        let units: &'f [Unit<'f, 'static>] = &planned.units;
+        Ok(Lockfile {
+            text,
+            lock,
+            units,
+            index: fetch_task::index(units, Alloc::global()),
+            #[cfg(feature = "fetch")]
+            net: None,
+        })
+    }
+
+    /// The units of the `Fetch` subjects a level of the graph asked for, wanted of the
+    /// command's machine at once, before their tasks run one after another: each task then
+    /// steps the machine, so the level's fetches overlap up to its in-flight limit. Nothing is
+    /// looked up or sent here. A subject no unit has is left to its task, which names it.
+    pub(crate) fn want_ahead(&mut self, subjects: &[ContentId], env: &FetchEnv<'_>) {
+        #[cfg(feature = "fetch")]
+        {
+            let units = self.units;
+            let net = match &mut self.net {
+                Some(net) => net,
+                none => none.insert(net::Net::new(units, env)),
+            };
+            for subject in subjects {
+                if let Some(at) = fetch_task::unit_of(&self.index, Name::new(blaze_drive::Kind::Fetch, *subject)) {
+                    net.want(at);
+                }
+            }
+        }
+        #[cfg(not(feature = "fetch"))]
+        let _ = (subjects, env);
+    }
+}
+
+/// What the fetch needs of the command beyond the plan: its clock, for the machine's
+/// deadlines, and where the checkout is, for the records' driver.
+pub struct FetchEnv<'f> {
+    pub clock: bstd::clock::Clock,
+    /// The checkout, relative to where blaze was started ("" for there).
+    pub checkout: &'f str,
+    /// `SSL_CERT_FILE` and `SSL_CERT_DIR`, read at the edge (rule 75): where the HTTPS
+    /// client's roots are looked for, besides the machine's store.
+    pub cert_file: Option<&'f str>,
+    pub cert_dir: Option<&'f str>,
+    /// The user's home, read at the edge (rule 75): the shared store is under it (the module
+    /// store, macros.rs). `None` when `HOME` is not set.
+    pub home: Option<&'f str>,
+    /// The folder blaze was started in (`PWD`), read at the edge: the toolchain's shelf under
+    /// the home is reached from it (toolchain.rs). `None` when `PWD` is not set.
+    pub start: Option<&'f str>,
+    /// The toolchain this command opens, given by `main` (`blaze_toolchain::PINNED`) and never
+    /// read deeper (rule 75): the target's cfg, the units' output and the names world take it.
+    pub toolchain: blaze_toolchain::ToolchainId,
+    /// The command's files: the toolchain's shelf and the names step read through them.
+    pub fs: bstd::fs::Fs,
+}
+
+/// One `Fetch` task: its unit's record held, or the finding of why not.
+pub(crate) fn run<'b>(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    lockfile: &mut Lockfile<'_>,
+    env: &FetchEnv<'_>,
+    name: Name,
+    held: &'b Frame,
+) -> Result<Did<'b>, CliError> {
+    let cx = cx.span("fetch: one lock entry's sources");
+    let Some(at) = fetch_task::unit_of(&lockfile.index, name) else {
+        return Ok(Did::Failed(TaskFailure { name, why: Why::Refused { what: "a `Fetch` name no unit of the lock has", rule: "fetch_task::unit_of" } }));
+    };
+    let unit = &lockfile.units[at as usize];
+    #[cfg(feature = "fetch")]
+    let made = {
+        let units = lockfile.units;
+        let net = match &mut lockfile.net {
+            Some(net) => net,
+            none => none.insert(net::Net::new(units, env)),
+        };
+        match net.outcome(&cx, root, units, &lockfile.index, at)? {
+            Ok(outcome) => fetch_task::made(unit, &outcome, Alloc::global()).ok_or(CliError::Text { what: "the fetch machine stopped with a unit pending" })?,
+            Err(untrusted) => {
+                let mut words = blaze_own::String::new_in(Alloc::global());
+                blaze_text::Writes::show(&mut words, unit);
+                let words = bstd::mem::format_in!(held, "{}: {untrusted}", words.as_str());
+                return Ok(Did::FailedSaying(TaskFailure { name, why: Why::Refused { what: "its sources were not fetched now; the next command asks again", rule: "fetch_task::made" } }, held_str(words.as_str(), held)));
+            }
+        }
+    };
+    #[cfg(not(feature = "fetch"))]
+    let made = {
+        let _ = env;
+        match held_record(&cx, root, unit)? {
+            true => fetch_task::Made::Held { out: fetch_task::source(unit), down: 0 },
+            false => fetch_task::cannot_fetch(unit, Alloc::global()),
+        }
+    };
+    let mut record = Made::new_in(name, held);
+    match made {
+        fetch_task::Made::Held { out, .. } => record.out = out,
+        fetch_task::Made::Failed { message, lasting } => {
+            let rule = match cfg!(feature = "fetch") {
+                true => SOURCE_REFUSED,
+                false => CANNOT_FETCH,
+            };
+            // Not lasting, with the network: the network's or the store's fault, which the
+            // next command may not meet. No record; the job fails with the words, and the
+            // answer is not written, so the next command asks again.
+            if !lasting && cfg!(feature = "fetch") {
+                return Ok(Did::FailedSaying(TaskFailure { name, why: Why::Refused { what: "its sources were not fetched now (the network's or the store's fault); the next command asks again", rule: "fetch_task::made" } }, held_str(message.as_str(), held)));
+            }
+            record.find(rule, (0, 0), &[message.as_str()]);
+            record.out = ContentId::of(REFUSED_DOMAIN, &name.subject.0);
+        }
+    }
+    Ok(Did::Done(record))
+}
+
+/// The record file's name at `key`: its 64 hex digits.
+pub(crate) fn key_hex(key: &ContentId) -> [u8; 64] {
+    let mut hex = [0u8; 64];
+    for (i, byte) in key.0.iter().enumerate() {
+        hex[2 * i] = b"0123456789abcdef"[usize::from(byte >> 4)];
+        hex[2 * i + 1] = b"0123456789abcdef"[usize::from(byte & 15)];
+    }
+    hex
+}
+
+/// The path of the record at `key`.
+fn record_path(key: &ContentId) -> Result<Path, CliError> {
+    let hex = key_hex(key);
+    let hex = core::str::from_utf8(&hex).map_err(|_| CliError::Text { what: "a key's hex is not UTF-8" })?;
+    let mut path = std::string::String::with_capacity(SOURCES.len() + 65);
+    path.push_str(SOURCES);
+    path.push('/');
+    path.push_str(hex);
+    Ok(Path::new(&path)?)
+}
+
+/// Whether the store holds `unit`'s record whole: read and checked against its BLAKE3. One that
+/// fails the check is removed (it is made again).
+fn held_record(cx: &Cx, root: &Dir<ReadWrite>, unit: &Unit<'_, '_>) -> Result<bool, CliError> {
+    let path = record_path(&unit.key())?;
+    let Some(meta) = root.stat(cx, &path)?.filter(|meta| !meta.dir) else {
+        return Ok(false);
+    };
+    let reserve = usize::try_from(meta.len).map_err(|_| CliError::Text { what: "a source record past the address space" })?;
+    let scratch = Frame::with_reserve(reserve.max(1 << 16).saturating_add(1 << 16), bstd::mem::Tag::Other)
+        .map_err(|_| CliError::Text { what: "the frame a source record is checked in could not be reserved" })?;
+    let mut bytes = Bytes::new_in(&scratch, "a source record, checked");
+    match root.read_all(cx, &path, &mut bytes) {
+        Ok(_) => {}
+        Err(error) if error.kind == FsKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    }
+    if PackView::open_source(&unit.source(), bytes.as_slice()).is_ok() {
+        return Ok(true);
+    }
+    match root.remove(cx, &path, bstd::fs::Durable::No) {
+        Ok(()) => Ok(false),
+        Err(error) if error.kind == FsKind::NotFound => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(feature = "fetch")]
+mod net {
+    //! The machine and its IO: blaze-http's driver thread for HTTPS, the records' files, the
+    //! command's clock.
+
+    use std::collections::HashMap;
+    use std::time::Duration;
+
+    use blaze_core::reserve::{Next, Reserve, Step as Reserving};
+    use blaze_core::{Done, FileName, Tag};
+    use blaze_drive::fetch_task;
+    use blaze_drive::{Kind as TaskKind, Name};
+    use blaze_fetch::fetch::{Ask, Outcome};
+    use blaze_fetch::plan::Unit;
+    use blaze_fetch::{FetchIo, Limits, Machine, Method, NetFailure, Reply, Reserved, StoreFailure, Woke};
+    use blaze_http::driver::{Fetched, Handle};
+    use blaze_http::{Kind, Request, Step, mailbox};
+    use blaze_ids::ContentId;
+    use blaze_own::Alloc;
+    use bstd::cx::Cx;
+    use bstd::fs::{Content, Dir, Durable, FsKind, ReadWrite};
+
+    use super::{FetchEnv, held_record, record_path, SOURCES};
+    use crate::CliError;
+
+    const USER_AGENT: &str = concat!("blaze/", env!("CARGO_PKG_VERSION"));
+    /// How long one step waits when no deadline is due: the machine's own bound.
+    const STEP_MOST_NS: u64 = 1_000_000_000;
+    /// Steps past which a unit that has not settled is a hang (rule 18): the machine's requests
+    /// each end by their deadline (`Limits::REAL.ask_ns`, tried `tries_most` times), so a unit
+    /// settles within that many seconds' steps.
+    const STEPS_MOST: u64 = 4 * 120 * 4;
+
+    /// Why HTTPS is not set up: each names what.
+    #[derive(Clone, Debug)] // clone: an error's words, once a unit that needed them
+    pub(super) enum Untrusted {
+        /// The machine's trust anchors could not be read or made into rustls's roots
+        /// (`blaze_http::roots::system`): its words name every place looked. Not lasting: the
+        /// machine's store or the environment may change before the next command.
+        Tls(std::string::String),
+        /// blaze-http's driver thread did not start.
+        Driver(std::string::String),
+    }
+
+    impl core::fmt::Display for Untrusted {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match self {
+                Untrusted::Tls(why) => write!(f, "HTTPS could not be set up: {why}"),
+                Untrusted::Driver(why) => write!(f, "blaze-http's driver thread did not start: {why}"),
+            }
+        }
+    }
+
+    /// The machine and its IO, made at the command's first `Fetch` task.
+    pub(super) struct Net<'f> {
+        machine: Machine<'f, 'f, 'static>,
+        io: Io,
+        steps: u64,
+    }
+
+    impl<'f> Net<'f> {
+        /// The machine over the lock's plan, wanting nothing yet: a unit is wanted when the
+        /// graph reaches it ([`Lockfile::want_ahead`]) or its task asks ([`Net::outcome`]), so
+        /// a lock entry nothing reaches is never looked up or fetched.
+        pub(super) fn new(units: &'f [Unit<'f, 'static>], env: &FetchEnv<'_>) -> Net<'f> {
+            let machine = Machine::wanting(units, Limits::REAL, Alloc::global());
+            let (to, answers) = mailbox::channel::<(u64, Fetched)>(None);
+            let mut sources = std::string::String::with_capacity(env.checkout.len() + SOURCES.len() + 1);
+            if !env.checkout.is_empty() {
+                sources.push_str(env.checkout);
+                sources.push('/');
+            }
+            sources.push_str(SOURCES);
+            Net {
+                machine,
+                io: Io {
+                    clock: env.clock.clone(),
+                    client: None,
+                    to,
+                    answers,
+                    last: None,
+                    kept: HashMap::new(),
+                    disk: None,
+                    sources,
+                    cert_file: env.cert_file.map(std::ffi::OsString::from),
+                    cert_dir: env.cert_dir.map(std::ffi::OsString::from),
+                },
+                steps: 0,
+            }
+        }
+
+        /// Wants unit `at` (nothing done when it is wanted already).
+        pub(super) fn want(&mut self, at: u32) {
+            self.machine.want(at);
+        }
+
+        /// Steps the machine until unit `at` has its outcome; `Err` with the words when HTTPS
+        /// could not be set up and the unit needs a request (every such unit after the first).
+        pub(super) fn outcome(
+            &mut self,
+            cx: &Cx,
+            root: &Dir<ReadWrite>,
+            units: &'f [Unit<'f, 'static>],
+            index: &[(ContentId, u32)],
+            at: u32,
+        ) -> Result<Result<Outcome, Untrusted>, CliError> {
+            self.machine.want(at);
+            let mut scope = Scope { io: &mut self.io, cx, root, units, index, failed: None };
+            loop {
+                if !matches!(self.machine.outcome(at), Outcome::Pending) {
+                    return Ok(Ok(self.machine.outcome(at).clone()));
+                }
+                if let Some(Err(untrusted)) = &scope.io.client {
+                    return Ok(Err(untrusted.clone()));
+                }
+                if self.steps >= STEPS_MOST {
+                    return Err(CliError::Text { what: "the fetch machine did not settle a unit within its steps (rule 18)" });
+                }
+                self.steps += 1;
+                blaze_fetch::drive::step(&mut self.machine, &mut scope, STEP_MOST_NS);
+                if let Some(error) = scope.failed.take() {
+                    return Err(error);
+                }
+            }
+        }
+    }
+
+    /// The parts of the IO that outlive a task.
+    struct Io {
+        clock: bstd::clock::Clock,
+        /// Made at the first request, never when every unit's record stands.
+        client: Option<Result<Handle, Untrusted>>,
+        to: mailbox::Tx<(u64, Fetched)>,
+        answers: mailbox::Rx<(u64, Fetched)>,
+        /// The answer the last wait gave: its unit and body.
+        last: Option<(u32, std::vec::Vec<u8>)>,
+        /// Answers kept for a reservation, by unit, until it is made.
+        kept: HashMap<u32, std::vec::Vec<u8>>,
+        /// The records' driver for reservations, made at the first.
+        disk: Option<blaze_core::Native>,
+        /// The records' folder, relative to where blaze was started.
+        sources: std::string::String,
+        /// `SSL_CERT_FILE` and `SSL_CERT_DIR` as the command was given them (rule 75).
+        cert_file: Option<std::ffi::OsString>,
+        cert_dir: Option<std::ffi::OsString>,
+    }
+
+    /// The IO for one task's steps: what the machine's effects need of this task's context.
+    struct Scope<'s, 'f> {
+        io: &'s mut Io,
+        cx: &'s Cx,
+        root: &'s Dir<ReadWrite>,
+        units: &'f [Unit<'f, 'static>],
+        index: &'s [(ContentId, u32)],
+        /// The first error the store gave that is the tool's, not the unit's.
+        failed: Option<CliError>,
+    }
+
+    impl Scope<'_, '_> {
+        /// By the plan's sorted index: a scan would hash every unit's key at each lookup.
+        fn unit_of_key(&self, key: &ContentId) -> Option<&Unit<'_, 'static>> {
+            let at = fetch_task::unit_of(self.index, Name::new(TaskKind::Fetch, *key))?;
+            self.units.get(at as usize)
+        }
+    }
+
+    impl FetchIo for Scope<'_, '_> {
+        fn now(&self) -> u64 {
+            self.io.clock.now().since_start().as_nanos() as u64
+        }
+
+        fn lookup(&mut self, key: &ContentId) -> bool {
+            let Some(unit) = self.unit_of_key(key) else { return false };
+            match held_record(self.cx, self.root, unit) {
+                Ok(held) => held,
+                Err(error) => {
+                    self.failed.get_or_insert(error);
+                    false
+                }
+            }
+        }
+
+        fn put(&mut self, key: &ContentId, record: &[u8]) -> Result<(), StoreFailure> {
+            let path = record_path(key).map_err(|_| StoreFailure::Io)?;
+            match self.root.publish(self.cx, &path, Content::bytes(record), Durable::No) {
+                Ok(_) => Ok(()),
+                Err(error) if matches!(error.kind, FsKind::OverQuota(_)) => Err(StoreFailure::Full),
+                Err(_) => Err(StoreFailure::Io),
+            }
+        }
+
+        fn send(&mut self, ask: Ask, method: Method, url: &str, headers: &[(&str, &str)], body: &[u8], most: u64, deadline_ns: u64) {
+            let within = Duration::from_nanos(deadline_ns.saturating_sub(self.now()));
+            let (cert_file, cert_dir) = (self.io.cert_file.as_deref(), self.io.cert_dir.as_deref());
+            let client = self.io.client.get_or_insert_with(|| client(cert_file, cert_dir));
+            // No client: nothing is sent, and `Net::outcome` answers every unit still pending
+            // with why (not lasting: no record, so the next command asks again).
+            let Ok(handle) = client else { return };
+            let request = Request {
+                method: match method {
+                    Method::Get => blaze_http::Method::Get,
+                    Method::Post => blaze_http::Method::Post,
+                },
+                url: url.to_owned(),
+                headers: headers.iter().map(|(n, v)| ((*n).to_owned(), (*v).to_owned())).collect(),
+                body: body.to_vec(),
+                gzip: false,
+                most,
+                https_only: true,
+                range: None,
+            };
+            handle.fetch(request, within, key_of(ask), &self.io.to);
+        }
+
+        fn wait(&mut self, until_ns: Option<u64>) -> Woke<'_> {
+            self.io.last = None;
+            if matches!(self.io.client, Some(Err(_))) {
+                return Woke::Other;
+            }
+            let wait = Some(Duration::from_nanos(until_ns.map_or(STEP_MOST_NS, |at| at.saturating_sub(self.now()))));
+            match mailbox::block_on("a dependency's HTTPS answer", wait, self.io.answers.recv()) {
+                Ok(Some((key, fetched))) => {
+                    let ask = Ask { unit: (key >> 32) as u32, seq: key as u32 };
+                    let at = self.now();
+                    let reply = match fetched {
+                        Fetched::Answered { status, body, .. } => {
+                            let (_, body) = self.io.last.insert((ask.unit, body));
+                            Reply::Body { status, bytes: body.as_slice() }
+                        }
+                        Fetched::Failed(error) => Reply::Failed(failure(&error.kind)),
+                        Fetched::TimedOut => Reply::Failed(NetFailure::Timeout),
+                    };
+                    Woke::Answer { ask, at, reply }
+                }
+                // The channel's sender is held here, so it never closes while this waits.
+                Ok(None) => Woke::Other,
+                Err(_due) => Woke::Due,
+            }
+        }
+
+        fn keep(&mut self, unit: u32) {
+            if let Some((of, body)) = self.io.last.take()
+                && of == unit
+            {
+                self.io.kept.insert(unit, body);
+            }
+        }
+
+        fn reserve(
+            &mut self,
+            unit: u32,
+            key: &ContentId,
+            room: u64,
+            write: &mut dyn FnMut(&[u8], Result<&mut [u8], StoreFailure>) -> Option<u64>,
+        ) -> Reserved {
+            let body = self.io.kept.remove(&unit).unwrap_or_default();
+            let made = match &mut self.io.disk {
+                Some(disk) => Ok(disk),
+                none => {
+                    let folder = std::path::Path::new(self.io.sources.as_str());
+                    match std::fs::create_dir_all(folder).and_then(|()| blaze_core::native(folder, 2)) {
+                        Ok(disk) => Ok(none.insert(disk)),
+                        Err(_) => Err(()),
+                    }
+                }
+            };
+            let Ok(disk) = made else {
+                _ = write(&body, Err(StoreFailure::Io));
+                return Reserved::Abandoned;
+            };
+            let Some(name) = FileName::new(&hex(key)) else {
+                _ = write(&body, Err(StoreFailure::Io));
+                return Reserved::Abandoned;
+            };
+            let (mut reserve, first) = Reserve::new(name, room, Tag(u64::from(unit)));
+            let mut done = ask_disk(disk, first);
+            loop {
+                let Some(answer) = done else {
+                    return Reserved::Unkept(StoreFailure::Io);
+                };
+                match reserve.answer(answer) {
+                    Ok(Next::Write(mut mapping)) => match write(&body, Ok(mapping.bytes_mut())) {
+                        Some(len) => match reserve.finish(mapping, len) {
+                            Ok(effect) => done = ask_disk(disk, effect),
+                            Err(_) => return Reserved::Unkept(StoreFailure::Io),
+                        },
+                        None => {
+                            if let Some(effect) = reserve.abandon(Some(mapping)) {
+                                _ = ask_disk(disk, effect);
+                            }
+                            return Reserved::Abandoned;
+                        }
+                    },
+                    Ok(Next::Ask(effect)) => done = ask_disk(disk, effect),
+                    Ok(Next::Stored) => return Reserved::Kept,
+                    Ok(Next::Abandoned) => return Reserved::Abandoned,
+                    Err(_) => {
+                        let mapped = reserve.step() != Reserving::Mapping;
+                        if let Some(effect) = reserve.abandon(None) {
+                            _ = ask_disk(disk, effect);
+                        }
+                        return match mapped {
+                            false => {
+                                _ = write(&body, Err(StoreFailure::Io));
+                                Reserved::Abandoned
+                            }
+                            true => Reserved::Unkept(StoreFailure::Io),
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    /// The HTTPS client, made at the first request (never at start, and never when every
+    /// unit's record stands): the machine's roots read now, from where the environment points.
+    fn client(cert_file: Option<&std::ffi::OsStr>, cert_dir: Option<&std::ffi::OsStr>) -> Result<Handle, Untrusted> {
+        let tls = blaze_http::roots::system(blaze_http::roots::Places { cert_file, cert_dir }).map_err(|setup| Untrusted::Tls(setup.to_string()))?;
+        let client = blaze_http::Client::new(blaze_http::Config::new(tls, USER_AGENT, Duration::from_secs(60)));
+        Handle::spawn(client, Limits::REAL.in_flight_most as usize).map_err(|error| Untrusted::Driver(error.to_string()))
+    }
+
+    fn key_of(ask: Ask) -> u64 {
+        u64::from(ask.unit) << 32 | u64::from(ask.seq)
+    }
+
+    /// What a blaze-http error is to the machine: only no connection, a broken one and no
+    /// answer in time are transient.
+    fn failure(kind: &Kind) -> NetFailure {
+        match kind {
+            Kind::Io { step: Step::Connect | Step::Proxy, .. } => NetFailure::Connect,
+            Kind::Io { step: Step::Tls, .. } => NetFailure::Refused,
+            Kind::Io { .. } => NetFailure::Reset,
+            Kind::NoAnswer { .. } | Kind::Stalled { .. } => NetFailure::Timeout,
+            Kind::TooBig { said, .. } => NetFailure::TooBig { said: *said },
+            _ => NetFailure::Refused,
+        }
+    }
+
+    /// One effect of a reservation run to its completion on the records' driver; `None` when
+    /// the driver stalled or gave none.
+    fn ask_disk(disk: &mut blaze_core::Native, effect: blaze_core::Effect) -> Option<Done> {
+        let mut effects = vec![effect];
+        let mut got = None;
+        blaze_core::run_until_idle(disk, &mut effects, |completion, _| got = Some(completion.done)).ok()?;
+        got
+    }
+
+    fn hex(key: &ContentId) -> std::string::String {
+        super::key_hex(key).iter().map(|digit| char::from(*digit)).collect()
+    }
+}

@@ -549,7 +549,7 @@ fn the_oracle_catches_a_non_idempotent_request_sent_early() {
     world.new_client();
     let conn = world.client.connect_requests(SERVER, NAME).unwrap();
     let post = Request {
-        method: http::Method::POST,
+        method: crate::Method::Post,
         authority: AUTHORITY.to_owned(),
         path: "/o/0".to_owned(),
         range: None,

@@ -51,28 +51,18 @@ const KERN_ABORTED: libc::c_int = 14;
 // each wait and each wake, and the wake took that lock; this is one call each on the word
 // the park's core already keeps, with nothing else shared.
 //
-// There is no other park on macOS (rule no-fallback). A blaze started on a macOS before 14.4
-// does not start: dyld stops it, naming the symbol it could not bind
-// (`_os_sync_wait_on_address_with_deadline`). The test below resolves each at run time, so a
-// system that drops one fails CI naming it.
-//
-// SAFETY: the signatures are the header's: `os_sync_wait_on_address_flags_t`,
+// There is no other park on macOS (rule no-fallback). They are reached through blaze-sys's
+// table of calls found at first use (`blaze_sys::macos::cold`), not bound at load: a program
+// that never parks never pays for them. A blaze on a macOS before 14.4 stops at its first park,
+// naming the symbol it could not find. The test below and blaze-sys's
+// `every_cold_symbol_exists` resolve each at run time, so a system that drops one fails CI
+// naming it. The signatures are the header's, in the table: `os_sync_wait_on_address_flags_t`,
 // `os_sync_wake_by_address_flags_t` and `os_clockid_t` are `uint32_t` options and `size` is a
 // `size_t`; each returns an `int`, -1 with `errno` set on an error.
-unsafe extern "C" {
-    fn os_sync_wait_on_address(addr: *mut c_void, value: u64, size: usize, flags: u32)
-    -> libc::c_int;
-    fn os_sync_wait_on_address_with_deadline(
-        addr: *mut c_void,
-        value: u64,
-        size: usize,
-        flags: u32,
-        clockid: u32,
-        deadline: u64,
-    ) -> libc::c_int;
-    fn os_sync_wake_by_address_any(addr: *mut c_void, size: usize, flags: u32) -> libc::c_int;
-    fn os_sync_wake_by_address_all(addr: *mut c_void, size: usize, flags: u32) -> libc::c_int;
-}
+use blaze_sys::macos::cold::{
+    os_sync_wait_on_address, os_sync_wait_on_address_with_deadline, os_sync_wake_by_address_all,
+    os_sync_wake_by_address_any,
+};
 
 /// `OS_CLOCK_MACH_ABSOLUTE_TIME` (<os/clock.h>): the one clock a deadline may be on.
 const OS_CLOCK_MACH_ABSOLUTE_TIME: u32 = 32;
@@ -104,6 +94,39 @@ fn timebase() -> io::Result<(u32, u32)> {
     }
     TIMEBASE.store((u64::from(base.numer) << 32) | u64::from(base.denom), Ordering::Relaxed);
     Ok((base.numer, base.denom))
+}
+
+/// How long ago this process began, on `mach_absolute_time`'s clock, the one `Instant` and so
+/// every driver's `now()` reads (it stops while the machine sleeps, as they do).
+///
+/// `proc_pid_rusage(RUSAGE_INFO_V4)` (<libproc.h>, public) gives `ri_proc_start_abstime`, the
+/// exec's instant on that same clock, so the age is one subtraction with no clock between.
+/// It beats `proc_pidinfo(PROC_PIDTBSDINFO)` and the `kern.proc.pid` sysctl, the other two
+/// ways: they give the start as wall-clock microseconds, which a wall-clock step moves and
+/// which would have to be set against a second clock read at another instant.
+pub(crate) fn process_age() -> io::Result<Duration> {
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v4>::zeroed();
+    // SAFETY: the flavour says the buffer is a `rusage_info_v4`, which `info` is, for the
+    // kernel to fill; this process's own id needs no right.
+    let got = unsafe {
+        libc::proc_pid_rusage(libc::getpid(), libc::RUSAGE_INFO_V4, info.as_mut_ptr().cast())
+    };
+    if got != 0 {
+        let error = io::Error::last_os_error();
+        // alloc: an error.
+        return Err(io::Error::new(error.kind(), format!("proc_pid_rusage(RUSAGE_INFO_V4): {error}")));
+    }
+    // SAFETY: filled by the call that returned 0.
+    let began = unsafe { info.assume_init() }.ri_proc_start_abstime;
+    let (numer, denom) = timebase()?;
+    // SAFETY: a read of Mach's clock.
+    let now = unsafe { mach_absolute_time() };
+    let ticks = now.checked_sub(began).ok_or_else(|| {
+        // alloc: an error.
+        io::Error::other(format!("proc_pid_rusage: the process began at {began}, after now ({now})"))
+    })?;
+    let ns = u128::from(ticks) * u128::from(numer) / u128::from(denom);
+    Ok(Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX)))
 }
 
 /// The time on `mach_absolute_time`'s clock `left` from now, rounded up to a unit; the
@@ -388,6 +411,16 @@ mod tests {
                 "{name:?} is gone from this macOS: wait::sleep_until needs it"
             );
         }
+    }
+
+    /// The process began before now, and not long before: the test binary started it within
+    /// this run, and a second look is no younger than the first.
+    #[test]
+    fn the_process_began_a_moment_ago() {
+        let first = super::process_age().expect("the process's start");
+        let second = super::process_age().expect("the process's start");
+        assert!(first > Duration::ZERO && first < Duration::from_secs(3600), "{first:?}");
+        assert!(second >= first, "{second:?} then {first:?}");
     }
 
     /// The calls a park is built on resolve at run time (rule macos-private-apis): a macOS

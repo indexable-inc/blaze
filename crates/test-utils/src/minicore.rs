@@ -1341,31 +1341,29 @@ pub mod ops {
             }
         }
 
+        // Each flag's impl whole, so the file itself parses (syntax's `self_hosting_parsing`).
         // region:!try_bodies
         impl<#[blaze::linear] T> FromResidual for Option<T> {
-            // endregion:!try_bodies
-            // region:try_bodies
-            // As core writes it (library/core/src/option.rs, rust-lang/rust#99940): the
-            // residual by name, not by the trait's default.
-        impl<#[blaze::linear] T> FromResidual<Option<Infallible>> for Option<T> {
-            // endregion:try_bodies
-            // region:!try_bodies
             fn from_residual(x: Option<Infallible>) -> Self {
                 match x {
                     None => None,
                     Some(_) => loop {},
                 }
             }
-            // endregion:!try_bodies
-            // region:try_bodies
+        }
+        // endregion:!try_bodies
+        // region:try_bodies
+        // As core writes it (library/core/src/option.rs, rust-lang/rust#99940): the
+        // residual by name, not by the trait's default.
+        impl<#[blaze::linear] T> FromResidual<Option<Infallible>> for Option<T> {
             // core's own body (library/core/src/option.rs): `Option<!>` has no `Some`.
             fn from_residual(residual: Option<Infallible>) -> Self {
                 match residual {
                     None => None,
                 }
             }
-            // endregion:try_bodies
         }
+        // endregion:try_bodies
 
         impl<T> const Residual<T> for Option<Infallible> {
             type TryType = Option<T>;

@@ -7,9 +7,10 @@
 //! it spawned, and watching the process's own signals needs an effect it does not have.
 
 use alloc::sync::Arc;
-use core::num::NonZero;
+use core::{num::NonZero, time::Duration};
 
 use crate::{
+    clock::Born,
     io::{Io, Missing, Offers},
     procs::Procs,
 };
@@ -26,7 +27,66 @@ pub struct HostFacts {
     /// The cores the process may use.
     pub cores: NonZero<usize>,
     pub name: Arc<str>,
+    /// When the process began against the driver's clock.
+    pub born: Born,
+    /// The running image's linker id; `None` when it was linked without one.
+    pub build_id: Option<BuildId>,
 }
+
+/// This program's identity: the id its linker wrote into the running image from the image's
+/// content, Mach-O's `LC_UUID` on macOS (16 bytes) and the GNU build-id note on Linux (20 with
+/// `--build-id=sha1`). Keys that start from it make a rebuilt program share nothing with the one
+/// before it, with nothing bumped by hand (rules 21, 52). A native world reads it in place from
+/// the image's mapped header (`rt::image`, no file opened); a simulated one holds what its test
+/// set ([`HostFacts::simulated`]'s is fixed).
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct BuildId {
+    bytes: [u8; 32],
+    len: u8,
+}
+
+impl BuildId {
+    /// `bytes` as an id: `None` when empty or longer than 32 bytes.
+    #[blaze::nonblocking]
+    pub fn of(bytes: &[u8]) -> Option<BuildId> {
+        let mut out = [0; 32];
+        if bytes.is_empty() {
+            return None;
+        }
+        out.get_mut(..bytes.len())?.copy_from_slice(bytes);
+        Some(BuildId { bytes: out, len: u8::try_from(bytes.len()).ok()? })
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..usize::from(self.len)]
+    }
+}
+
+impl core::fmt::Debug for BuildId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("BuildId(")?;
+        for byte in self.as_bytes() {
+            write!(f, "{byte:02x}")?;
+        }
+        f.write_str(")")
+    }
+}
+
+/// The running image carries no linker id: it was linked without one. Nothing is put in its
+/// place (rule 3).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NoBuildId;
+
+impl core::fmt::Display for NoBuildId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(
+            "bstd::host: this program's image carries no linker build id (Mach-O LC_UUID on macOS; on Linux the GNU \
+             build-id note, written when linked with --build-id)",
+        )
+    }
+}
+
+impl core::error::Error for NoBuildId {}
 
 impl HostFacts {
     /// The simulation's machine unless a test says otherwise: process 1 on a four-core host
@@ -39,6 +99,8 @@ impl HostFacts {
             cores: NonZero::<usize>::MIN.saturating_add(3),
             // alloc: once per simulated world, its host's name.
             name: Arc::from("sim"),
+            born: Born::Before(Duration::ZERO),
+            build_id: BuildId::of(b"bstd simulated!!"),
         }
     }
 }
@@ -74,6 +136,12 @@ impl Host {
 
     pub fn name(&self) -> Arc<str> {
         self.io.host_facts(|facts| Arc::clone(&facts.name))
+    }
+
+    /// This program's identity: the id its linker wrote into the running image ([`BuildId`]).
+    /// A program that keys what it keeps on its own code starts every key from it.
+    pub fn build_id(&self) -> Result<BuildId, NoBuildId> {
+        self.io.host_facts(|facts| facts.build_id).ok_or(NoBuildId)
     }
 
     /// Other processes, if the host offers them (the simulation does): its own entry of

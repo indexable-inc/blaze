@@ -438,10 +438,14 @@ pub enum RefKind {
     /// The function's own data (a constant, a `file!()` text, a panic location): `place` is
     /// its row of `datas`.
     Data,
+    /// A vtable (docs/v2/plan/design/codegen.md, "Trait objects"), by place: the builder's
+    /// `Built::vtables` names the (concrete type, principal trait) record at each place. Its
+    /// address is a relocation, like a static's.
+    Vtable,
 }
 
 impl RefKind {
-    pub const ALL: [RefKind; 4] = [RefKind::Func, RefKind::Static, RefKind::Tls, RefKind::Data];
+    pub const ALL: [RefKind; 5] = [RefKind::Func, RefKind::Static, RefKind::Tls, RefKind::Data, RefKind::Vtable];
 
     pub const fn from_word(word: u32) -> Option<RefKind> {
         match (word as usize) < RefKind::ALL.len() {
@@ -456,6 +460,7 @@ impl RefKind {
             RefKind::Static => "static",
             RefKind::Tls => "tls",
             RefKind::Data => "data",
+            RefKind::Vtable => "vtable",
         }
     }
 

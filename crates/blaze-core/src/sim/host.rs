@@ -87,6 +87,9 @@ pub(super) enum Plant {
     /// A sync that completes makes durable one change fewer than it covered, when it covers
     /// at least one.
     SyncCoversLess,
+    /// The loose rule: a file's sync makes its name durable too, as if its directory were
+    /// synced.
+    FileSyncKeepsName,
 }
 
 /// A UDP socket bound, and the datagrams it got and no receive took yet.
@@ -155,6 +158,11 @@ pub(super) struct Host {
     wall: Duration,
     /// Directories made empty and not removed, sorted.
     made: Vec<FileName>,
+    /// The trust anchors [`Effect::Roots`] answers ([`Sim::roots`]); none, a store with no
+    /// root.
+    roots: Option<crate::trust::Roots<std::alloc::Global>>,
+    /// How many times [`Effect::Roots`] was asked ([`Sim::roots_read`]).
+    roots_read: u32,
     plant: Option<Plant>,
 }
 
@@ -188,6 +196,8 @@ impl Host {
             wall: Duration::from_secs(1_700_000_000 + seed % 1_000_000_000),
             // alloc: none until a directory is made.
             made: Vec::new(),
+            roots: None,
+            roots_read: 0,
             plant: None,
         }
     }
@@ -247,6 +257,18 @@ impl Sim {
         let mut kept = Vec::with_capacity_in(addresses.len(), std::alloc::Global);
         kept.extend_from_slice(addresses);
         self.host.names.push((name.to_owned(), kept));
+    }
+
+    /// From now on [`Effect::Roots`] answers `roots`; until a test calls this, the world's
+    /// store has none, and the effect is told [`Done::Untrusted`].
+    pub fn roots(&mut self, roots: crate::trust::Roots<std::alloc::Global>) {
+        self.host.roots = Some(roots);
+    }
+
+    /// How many times [`Effect::Roots`] has been asked: a client reads the roots on its first
+    /// connection only.
+    pub fn roots_read(&self) -> u32 {
+        self.host.roots_read
     }
 
     /// `bytes` come next on the standard input, after what the test gave before.
@@ -352,6 +374,21 @@ impl Sim {
             }
             Effect::Random { len, tag } => {
                 let done = self.random(len);
+                self.tell(tag, done, Of::Op);
+            }
+            Effect::Roots { tag, .. } => {
+                self.host.roots_read += 1;
+                let done = match &self.host.roots {
+                    // clone: the world's roots, once per ask; alloc: the completion's box.
+                    Some(roots) => Done::Roots(Box::new(roots.clone())),
+                    // alloc: an error path.
+                    None => Done::Untrusted(Box::new(crate::trust::TrustError {
+                        looked: vec![crate::trust::Looked {
+                            place: crate::trust::Place::System("the simulation's world (Sim::roots never called)"),
+                            why: crate::trust::Why::NoCertificate,
+                        }],
+                    })),
+                };
                 self.tell(tag, done, Of::Op);
             }
             _ => unreachable!("only the host's effects are handed here"),

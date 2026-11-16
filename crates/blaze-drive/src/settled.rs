@@ -156,6 +156,26 @@ impl<A: Allocator> Settled<A> {
         Ok(())
     }
 
+    /// The writer's, between batches (no reader holds the table): a table of twice the slots
+    /// holding every slot of this one. What the writer does on [`TableFull`] before it publishes
+    /// again, so a run the first size did not foresee grows the table and never stops (a cold run
+    /// opens files the start did not list).
+    pub fn grown_in(&self, alloc: A) -> Result<Settled<A>, TableFull> {
+        let grown = Settled::new_in(self.slots() * 2, alloc);
+        for slot in 0..self.slots() {
+            let fp = self.word(slot, FP).load(Ordering::Acquire);
+            if fp == 0 {
+                continue;
+            }
+            let full = TableFull { slots: u32::try_from(grown.slots()).unwrap_or(u32::MAX), name: Name::units() };
+            let to = grown.find(fp).ok_or(full)?;
+            for at in 0..WORDS {
+                grown.word(to, at).store(self.word(slot, at).load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+        }
+        Ok(grown)
+    }
+
     /// Any thread's: what `name` is settled at, if it is and the slot was read whole within
     /// [`MOST_RETRIES`]. `None` sends the need to the coordinator.
     pub fn get(&self, name: Name) -> Option<Input> {
@@ -184,5 +204,34 @@ impl<A: Allocator> Settled<A> {
             return (live == 1).then(|| Input { name, at: Key(id_of(at)), out: id_of(out) });
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::alloc::Global;
+
+    use super::*;
+
+    /// A table filled past its size grows on [`TableFull`] and keeps every name it held: the
+    /// writer's growth, never a stop.
+    #[test]
+    fn a_full_table_grows_and_keeps_what_it_held() {
+        let mut table = Settled::new_in(64, Global);
+        let input = |i: u32| {
+            let name = Name::file(&i.to_le_bytes());
+            Input { name, at: Key(ContentId::of("a test's key", &i.to_le_bytes())), out: ContentId::of("a test's out", &i.to_le_bytes()) }
+        };
+        let mut grew = 0;
+        for i in 0..1000u32 {
+            while table.publish(input(i)).is_err() {
+                table = table.grown_in(Global).expect("twice the slots hold what half did");
+                grew += 1;
+            }
+        }
+        assert!(grew > 0 && table.slots() >= 1024, "grew {grew} times to {} slots", table.slots());
+        for i in 0..1000u32 {
+            assert_eq!(table.get(input(i).name), Some(input(i)), "name {i} kept through the growth");
+        }
     }
 }

@@ -18,7 +18,7 @@ use crate::column::{
     key_word, text_of,
 };
 use crate::error::BuildError;
-use crate::kind::Edition;
+use crate::kind::{Edition, MacroShapes};
 
 /// What a crate's root record says of the crate itself.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -33,6 +33,8 @@ pub struct CrateRootHead {
     pub no_std: bool,
     /// `#![no_core]`.
     pub no_core: bool,
+    /// `#![blaze::arbitrary_ints]`: `u1`..`u127` and `i1`..`i127` are builtin types in it.
+    pub arbitrary_ints: bool,
     /// The standard prelude module the crate's modules import (`std::prelude::rust_2021`, or
     /// core's under `no_std`), `None` under `#![no_core]`.
     pub prelude: Option<ItemKey>,
@@ -64,8 +66,8 @@ pub struct CrateRootBuilder<'a, N> {
     /// injected one included), whose exported macros are the `#[macro_use]` prelude, in order.
     pub macro_use: AVec<'a, ItemKey>,
     /// The crate's `#[macro_export]` `macro_rules!` written in source (not macro-expanded),
-    /// sorted by name: they are bindings of the root's scope.
-    pub macro_exports: AVec<'a, (N, ItemKey)>,
+    /// sorted by name: they are bindings of the root's scope, each with its call shapes.
+    pub macro_exports: AVec<'a, (N, ItemKey, MacroShapes)>,
     /// The tool names (`rustfmt`, `clippy`, `register_tool`'s), sorted: an attribute path
     /// beginning with one is inert.
     pub tools: AVec<'a, N>,
@@ -111,6 +113,18 @@ blaze_format::record! {
 }
 
 blaze_format::record! {
+    /// One `#[macro_export]` macro: its name, its key and the call shapes its arms take.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(crate) struct ExportRow: 1 {
+        pub(crate) name: Text,
+        pub(crate) key: ContentId,
+        pub(crate) shapes: MacroShapes,
+        pub(crate) pad: u8,
+        pub(crate) pad2: u16,
+    }
+}
+
+blaze_format::record! {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub(crate) struct DepRow: 1 {
         pub(crate) name: Text,
@@ -121,7 +135,7 @@ blaze_format::record! {
 
 blaze_format::record! {
     #[derive(Clone, Copy, Debug)]
-    pub(crate) struct CrateRootRoot: 2 {
+    pub(crate) struct CrateRootRoot: 3 {
         pub(crate) krate: ContentId,
         pub(crate) root_module: ContentId,
         pub(crate) root_file: ContentId,
@@ -129,14 +143,14 @@ blaze_format::record! {
         pub(crate) externs: Slice<NamedKeyRow>,
         pub(crate) deps: Slice<DepRow>,
         pub(crate) macro_use: Slice<ContentId>,
-        pub(crate) macro_exports: Slice<NamedKeyRow>,
+        pub(crate) macro_exports: Slice<ExportRow>,
         pub(crate) tools: Slice<Text>,
         pub(crate) builtin_attrs: Slice<Text>,
         pub(crate) strings: Slice<u8>,
         pub(crate) edition: Edition,
         pub(crate) no_std: bool,
         pub(crate) no_core: bool,
-        pub(crate) pad: u8,
+        pub(crate) arbitrary_ints: bool,
     }
 }
 
@@ -183,7 +197,13 @@ impl<N: AsRef<str>> CrateRootBuilder<'_, N> {
             let d = &self.deps[at];
             deps.push(DepRow { name: strings.push(d.name.as_ref(), TABLE)?, krate: d.krate.0, root: d.root.0 });
         }
-        let macro_exports = named(&self.macro_exports, None, &mut strings)?;
+        let order = sorted_order(&self.macro_exports, |(name, key, _)| (name.as_ref(), key.0), None, alloc)?;
+        let mut macro_exports = Vec::with_capacity_in(order.len(), alloc);
+        for &at in order.iter() {
+            let (name, key, shapes) = &self.macro_exports[at];
+            let name = strings.push(name.as_ref(), TABLE)?;
+            macro_exports.push(ExportRow { name, key: key.0, shapes: *shapes, pad: 0, pad2: 0 });
+        }
         let names = |rows: &[N], strings: &mut Strings<'b>| -> Result<AVec<'b, Text>, BuildError> {
             let order = sorted_order(rows, |name| (name.as_ref(), zero), None, alloc)?;
             let mut out = Vec::with_capacity_in(order.len(), alloc);
@@ -220,7 +240,7 @@ impl<N: AsRef<str>> CrateRootBuilder<'_, N> {
             edition: head.edition,
             no_std: head.no_std,
             no_core: head.no_core,
-            pad: 0,
+            arbitrary_ints: head.arbitrary_ints,
         }))
     }
 }
@@ -247,7 +267,7 @@ pub struct CrateRootView<'a> {
     externs: &'a [NamedKeyRow],
     deps: &'a [DepRow],
     macro_use: &'a [ContentId],
-    macro_exports: &'a [NamedKeyRow],
+    macro_exports: &'a [ExportRow],
     tools: &'a [Text],
     builtin_attrs: &'a [Text],
     strings: &'a str,
@@ -264,7 +284,10 @@ impl<'a> CrateRootView<'a> {
         let macro_exports = root.macro_exports.follow(buffer)?;
         let tools = root.tools.follow(buffer)?;
         let builtin_attrs = root.builtin_attrs.follow(buffer)?;
-        for row in externs.iter().chain(macro_exports) {
+        for row in externs {
+            check_text(strings, row.name, row, buffer)?;
+        }
+        for row in macro_exports {
             check_text(strings, row.name, row, buffer)?;
         }
         for row in deps {
@@ -289,6 +312,7 @@ impl<'a> CrateRootView<'a> {
                 edition: root.edition,
                 no_std: root.no_std,
                 no_core: root.no_core,
+                arbitrary_ints: root.arbitrary_ints,
                 prelude: key_of_word(root.prelude),
             },
             externs,
@@ -340,8 +364,9 @@ impl<'a> CrateRootView<'a> {
     }
 
     /// The `#[macro_export]` macros written in source, by name.
-    pub fn macro_exports(&self) -> impl ExactSizeIterator<Item = (&'a str, ItemKey)> + use<'a> {
-        named_of(self.strings, self.macro_exports)
+    pub fn macro_exports(&self) -> impl ExactSizeIterator<Item = (&'a str, ItemKey, MacroShapes)> + use<'a> {
+        let strings = self.strings;
+        self.macro_exports.iter().map(move |row| (text_of(strings, row.name), ItemKey(row.key), row.shapes))
     }
 
     /// The tool names, sorted.

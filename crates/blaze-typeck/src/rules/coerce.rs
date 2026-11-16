@@ -9,16 +9,17 @@
 //! unsizing is tried first": never, then `coerce_unsized`, then the reference arms, then fn
 //! items) and types/src/typeck/coerce_unsized.rs (`coerce_unsized`).
 //!
-//! First cut, said where it differs: unsizing is the builtin `[T; N]` to `[T]` behind a
-//! reference or pointer (the general form is `CoerceUnsized` obligations through the solver,
-//! which blaze-ty's adapter will give); two unresolved variables unify instead of registering a
-//! `Coerce` predicate; a closure does not coerce to a fn pointer yet.
+//! Unsizing (`coerce_unsized`): `[T; N]` to `[T]` behind a reference or pointer by unification;
+//! to a `dyn` pointee by the solver's `Unsize`; one ADT's two instances (`Box`) by
+//! `CoerceUnsized`; each goal asked in a probe, then registered. Said where it differs: two
+//! unresolved variables unify instead of registering a `Coerce` predicate. A closure that
+//! captures nothing coerces to a fn pointer (`ClosureFnPointer`).
 
 use crate::columns::AdjustKind;
 use crate::error::Stop;
-use crate::ids::{ExprId, Mutbl};
+use crate::ids::{ExprId, FnPtrHeader, ItemKey, LangItem, Mutbl, Safety};
 use crate::machine::Machine;
-use crate::ty::{Ty, TyView, TypeCtx};
+use crate::ty::{Cause, Goal, Ty, TyList, TyView, TypeCtx};
 use crate::world::World;
 
 impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
@@ -43,7 +44,8 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
         if self.is_ty_var(a) {
             return self.unify(a, b);
         }
-        let got = self.commit_if(|m| m.try_coerce(a, b, two_phase))?;
+        let cause = e.map_or(Cause::Body, Cause::Expr);
+        let got = self.commit_if(|m| m.try_coerce(a, b, two_phase, cause))?;
         if got.is_none() {
             return Ok(false);
         }
@@ -60,9 +62,9 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
         Ok(if self.unify(a, b)? { Some(()) } else { None })
     }
 
-    fn try_coerce(&mut self, a: Ty, b: Ty, two_phase: bool) -> Result<Option<()>, Stop> {
+    fn try_coerce(&mut self, a: Ty, b: Ty, two_phase: bool, cause: Cause) -> Result<Option<()>, Stop> {
         self.adj_scratch.clear();
-        if self.commit_if(|m| m.coerce_unsized(a, b))?.is_some() {
+        if self.commit_if(|m| m.coerce_unsized(a, b, cause))?.is_some() {
             return Ok(Some(()));
         }
         self.adj_scratch.clear();
@@ -72,47 +74,145 @@ impl<W: World, C: TypeCtx> Machine<'_, '_, '_, '_, W, C> {
             _ => {}
         }
         match (self.view(a), self.view(b)) {
-            (TyView::FnDef(k, args), TyView::FnPtr(_)) => {
-                let Some((inputs, output)) = self.fn_def_sig(k, args)? else {
+            // `coerce_from_fn_item`: the fn's own header (`extern "C" fn` reifies to
+            // `extern "C" fn(..)`), then, to an `unsafe` target, `UnsafeFnPointer` after it.
+            (TyView::FnDef(k, args), TyView::FnPtr(_, hb)) => {
+                let Some(sig) = self.reads.fn_sig(k)? else { return Ok(None) };
+                let ha = sig.header;
+                let Some((inputs, output)) = self.fn_def_sig(k, args, cause)? else {
                     return Ok(None);
                 };
                 let mut all = self.list(inputs);
                 all.push(output);
                 let list = self.mk_list(&all)?;
-                let ptr = self.mk(TyView::FnPtr(list))?;
-                if !self.unify(ptr, b)? {
+                let reified = self.mk(TyView::FnPtr(list, ha))?;
+                if ha.safety == Safety::Safe && hb.safety == Safety::Unsafe {
+                    let unsafe_ = self.mk(TyView::FnPtr(list, FnPtrHeader { safety: Safety::Unsafe, ..ha }))?;
+                    if !self.unify(unsafe_, b)? {
+                        return Ok(None);
+                    }
+                    self.adj_scratch.push((AdjustKind::ReifyFnPointer, reified));
+                    self.adj_scratch.push((AdjustKind::UnsafeFnPointer, b));
+                    return Ok(Some(()));
+                }
+                if !self.unify(reified, b)? {
                     return Ok(None);
                 }
                 self.adj_scratch.push((AdjustKind::ReifyFnPointer, b));
+                Ok(Some(()))
+            }
+            // `coerce_closure_to_fn`: the Reference, "Type coercions", "Coercion types": "Non
+            // capturing closures to `fn` pointers". The pointer is the closure's signature with
+            // the Rust ABI and the target's safety (rustc's `ClosureFnPointer(safety)`).
+            (TyView::Closure(c, sig), TyView::FnPtr(_, hb)) => {
+                let TyView::FnPtr(l, _) = self.view(sig) else { return Ok(None) };
+                if !self.captures_nothing(c)? {
+                    return Ok(None);
+                }
+                let ptr = self.mk(TyView::FnPtr(l, FnPtrHeader { safety: hb.safety, ..FnPtrHeader::RUST }))?;
+                if !self.unify(ptr, b)? {
+                    return Ok(None);
+                }
+                self.adj_scratch.push((AdjustKind::ClosureFnPointer, b));
+                Ok(Some(()))
+            }
+            // `coerce_from_safe_fn`: a safe fn pointer to the `unsafe` one of the same ABI.
+            (TyView::FnPtr(l, ha), TyView::FnPtr(_, hb)) if ha.safety == Safety::Safe && hb.safety == Safety::Unsafe => {
+                let unsafe_ = self.mk(TyView::FnPtr(l, FnPtrHeader { safety: Safety::Unsafe, ..ha }))?;
+                if !self.unify(unsafe_, b)? {
+                    return Ok(None);
+                }
+                self.adj_scratch.push((AdjustKind::UnsafeFnPointer, b));
                 Ok(Some(()))
             }
             _ => self.unify_some(a, b),
         }
     }
 
-    /// `&[T; N]` (or `&mut`, or a raw pointer) to `&[T]`: deref, borrow, unsize.
-    fn coerce_unsized(&mut self, a: Ty, b: Ty) -> Result<Option<()>, Stop> {
+    /// `coerce_unsized` (the Reference, "Coercion types": "TyCtor(`T`) to TyCtor(`U`), where
+    /// TyCtor(`T`) is one of `&T`, `&mut T`, `*const T`, `*mut T`, `Box<T>`, and where `U` can be
+    /// obtained from `T` by unsized coercion"). A reference or raw pointer: `&[T; N]` to `&[T]`
+    /// by unification, and to a `dyn` pointee by the solver's `Pointee: Unsize<dyn ..>` (to an
+    /// object, between objects; an auto trait dropped, never added); then deref, borrow, unsize.
+    /// Another pointer of one ADT whose target holds a `dyn` or slice argument (`Box<T>` to
+    /// `Box<dyn Tr>`): `Source: CoerceUnsized<Target>` (core's and alloc's impls). Each goal is
+    /// asked in a probe, then registered; never on a variable source pointee.
+    fn coerce_unsized(&mut self, a: Ty, b: Ty, cause: Cause) -> Result<Option<()>, Stop> {
         let (ma, pointee_a, mb, pointee_b, raw) = match (self.view(a), self.view(b)) {
             (TyView::Ref(ma, x), TyView::Ref(mb, y)) => (ma, x, mb, y, false),
             (TyView::Ref(ma, x), TyView::Ptr(mb, y)) | (TyView::Ptr(ma, x), TyView::Ptr(mb, y)) => {
                 (ma, x, mb, y, true)
             }
+            (TyView::Adt(ka, _), TyView::Adt(kb, lb)) if ka == kb => return self.coerce_unsized_adt(a, b, lb, cause),
             _ => return Ok(None),
         };
         if ma == Mutbl::Not && mb == Mutbl::Mut {
             return Ok(None);
         }
-        let (TyView::Array(elem_a, _), TyView::Slice(elem_b)) = (self.view(pointee_a), self.view(pointee_b)) else {
-            return Ok(None);
-        };
-        if !self.unify(elem_a, elem_b)? {
-            return Ok(None);
+        match (self.view(pointee_a), self.view(pointee_b)) {
+            (TyView::Array(elem_a, _), TyView::Slice(elem_b)) => {
+                if !self.unify(elem_a, elem_b)? {
+                    return Ok(None);
+                }
+            }
+            (TyView::Infer(_), _) | (_, TyView::Infer(_)) => return Ok(None),
+            (_, TyView::Dynamic(_)) => {
+                // Equal pointees are no unsizing: the reborrow arms take them.
+                if self.probe(|m| m.unify_some(pointee_a, pointee_b))?.is_some() {
+                    return Ok(None);
+                }
+                // No `Unsize` in the world: the coercion is undecidable, so the finding naming
+                // it, and the coercion taken (no second error as a mismatch).
+                if let Some(unsize) = self.need_lang(LangItem::Unsize, crate::diag::At::of(cause))? {
+                    let args = self.mk_list(&[pointee_a, pointee_b])?;
+                    if !self.unsize_goal(unsize, args, cause)? {
+                        return Ok(None);
+                    }
+                }
+            }
+            _ => return Ok(None),
         }
         let borrowed = if raw { self.mk(TyView::Ptr(mb, pointee_a))? } else { self.mk(TyView::Ref(mb, pointee_a))? };
         self.adj_scratch.push((AdjustKind::Deref { overloaded: None }, pointee_a));
         self.adj_scratch.push((AdjustKind::Borrow { mutbl: mb, two_phase: false, raw }, borrowed));
         self.adj_scratch.push((AdjustKind::Unsize, b));
         Ok(Some(()))
+    }
+
+    /// `coerce_unsized` for one ADT's two instances (`Box<T>` to `Box<dyn Tr>`): only when an
+    /// argument of the target `lb` is a `dyn` or a slice and the two do not unify as they are;
+    /// then `a: CoerceUnsized<b>`, asked, registered, and one `Unsize` adjustment.
+    fn coerce_unsized_adt(&mut self, a: Ty, b: Ty, lb: TyList, cause: Cause) -> Result<Option<()>, Stop> {
+        let mut unsized_arg = false;
+        for t in self.list(lb) {
+            unsized_arg |= matches!(self.view(t), TyView::Dynamic(_) | TyView::Slice(_));
+        }
+        if !unsized_arg || self.probe(|m| m.unify_some(a, b))?.is_some() {
+            return Ok(None);
+        }
+        // As `Unsize` above: no `CoerceUnsized` is the finding naming it, the coercion taken.
+        if let Some(coerce) = self.need_lang(LangItem::CoerceUnsized, crate::diag::At::of(cause))? {
+            let args = self.mk_list(&[a, b])?;
+            if !self.unsize_goal(coerce, args, cause)? {
+                return Ok(None);
+            }
+        }
+        self.adj_scratch.push((AdjustKind::Unsize, b));
+        Ok(Some(()))
+    }
+
+    /// `args[0]: tr<args[1]>` (`Unsize`, `CoerceUnsized`): `false` if it cannot hold (asked in
+    /// a probe); else registered with `cause`.
+    fn unsize_goal(&mut self, tr: ItemKey, args: TyList, cause: Cause) -> Result<bool, Stop> {
+        #[cfg(test)]
+        if self.plant == crate::machine::Plant::UnsizeUnasked {
+            return Ok(true);
+        }
+        if !self.ty.may_hold(Goal::Trait { trait_: tr, args }, &mut self.reads)? {
+            return Ok(false);
+        }
+        self.register_trait(tr, args, cause)?;
+        Ok(true)
     }
 
     /// `coerce_borrowed_pointer`: autoderef the source, skipping its first step, until `&mb U`

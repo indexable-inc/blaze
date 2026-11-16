@@ -8,6 +8,9 @@
 //! from the algorithm's definition on an independent HMAC-SHA256 (blaze-sha256, held to RFC
 //! 4231), under a secret derived from a constant label. That R2 accepts it is not measured until
 //! the owner's bucket exists.
+//!
+//! Its SHA-256 and HMAC move off `ring` onto crates/blaze-sha2 (the fetch lane's), then `sign`'s
+//! `ring` is Ed25519 signing alone.
 
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]

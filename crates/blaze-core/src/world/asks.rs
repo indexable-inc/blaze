@@ -24,7 +24,7 @@
 
 use std::alloc::Global;
 
-use crate::world::disk::{Barrier, Change, Disk, File, Kept, Made, Undo, sectors, starts_with};
+use crate::world::disk::{Barrier, Change, Crash, Disk, File, Made, Named, sectors, starts_with};
 
 /// An effect on the disk, as it was asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -268,17 +268,24 @@ fn copy_file(file: &File) -> File {
         barriers.push(Barrier { covers: file.barriers[i].covers, epoch: file.barriers[i].epoch });
         i += 1;
     }
-    let undo = match &file.undo {
-        Some(undo) => {
-            let was = match &undo.was {
-                Some(bytes) => Some(copy_bytes(bytes)),
-                None => None,
-            };
-            Some(Undo { was, from: undo.from })
-        }
+    File { name: file.name, durable: copy_bytes(&file.durable), changes, barriers }
+}
+
+/// A copy of what a name held, where it held a file.
+fn copy_was(was: &Option<Vec<u8>>) -> Option<Vec<u8>> {
+    match was {
+        Some(bytes) => Some(copy_bytes(bytes)),
         None => None,
-    };
-    File { name: file.name, durable: copy_bytes(&file.durable), changes, barriers, undo }
+    }
+}
+
+/// A copy of `named`.
+fn copy_named(named: &Named) -> Named {
+    match named {
+        Named::Put { file, was } => Named::Put { file: *file, was: copy_was(was) },
+        Named::Gone { file, was } => Named::Gone { file: *file, was: copy_bytes(was) },
+        Named::Moved { from, to, was } => Named::Moved { from: *from, to: *to, was: copy_was(was) },
+    }
 }
 
 /// A copy of `disk`.
@@ -289,7 +296,13 @@ fn copy_disk(disk: &Disk) -> Disk {
         files.push(copy_file(&disk.files[i]));
         i += 1;
     }
-    Disk { files, epoch: disk.epoch }
+    let mut names = Vec::new_in(Global);
+    i = 0;
+    while i < disk.names.len() {
+        names.push(copy_named(&disk.names[i]));
+        i += 1;
+    }
+    Disk { files, names, epoch: disk.epoch }
 }
 
 impl World {
@@ -452,9 +465,11 @@ impl World {
                     self.disk.barrier(file, *covers);
                 }
             }
+            // The world's names are all in one directory: its sync makes every change of a
+            // name durable, and flushes the drive.
             Ask::SyncDir => {
                 if done(told) {
-                    self.disk.flush();
+                    self.disk.sync_names();
                 }
             }
             Ask::Write { file, bytes } => {
@@ -554,7 +569,7 @@ impl World {
 
     /// Whether a crash may land `landings`, sectors of the writes from memory in flight in
     /// the order they land, and then keep `cut` of the disk they leave ([`Disk::allows`]).
-    pub fn allows_crash(&self, landings: &[Landing], cut: &[Kept]) -> bool {
+    pub fn allows_crash(&self, landings: &[Landing], cut: &Crash) -> bool {
         match self.landed(landings) {
             Some(disk) => disk.allows(cut),
             None => false,
@@ -564,7 +579,7 @@ impl World {
     /// A crash the world allows ([`World::allows_crash`]): the sectors `landings` names land
     /// in its order, the disk keeps `cut` ([`Disk::crash`]), and nothing is in flight, none
     /// of it answered. Where the world does not allow it, nothing changes.
-    pub fn crash(&mut self, landings: &[Landing], cut: &[Kept]) {
+    pub fn crash(&mut self, landings: &[Landing], cut: &Crash) {
         let Some(mut disk) = self.landed(landings) else { return };
         if !disk.allows(cut) {
             return;
@@ -641,7 +656,7 @@ fn synced_append(
     between: &[Between],
     covers: Option<usize>,
     landings: &[Landing],
-    cut: &[Kept],
+    cut: &Crash,
 ) -> Option<bool> {
     if !disk.wf() || !disk.small() {
         return None;
@@ -656,7 +671,7 @@ fn synced_append(
         return None;
     }
     let Some(at) = world.disk.find(file) else { return None };
-    if !world.disk.files[at].only_appended() || world.disk.files[at].undo.is_some() {
+    if !world.disk.files[at].only_appended() || world.disk.named(file) {
         return None;
     }
     let before = world.disk.files[at].contents();
@@ -728,7 +743,7 @@ pub fn a_synced_append_survives_a_crash(
     between: Vec<Between>,
     covers: usize,
     landings: Vec<Landing>,
-    cut: Vec<Kept>,
+    cut: Crash,
 ) -> bool {
     match synced_append(disk, file, bytes, &between, Some(covers), &landings, &cut) {
         Some(survived) => survived,
@@ -741,7 +756,7 @@ mod tests {
     use blaze_sim::{Broke, Config, Tape, check};
 
     use super::*;
-    use crate::world::disk::{Torn, tests as disks};
+    use crate::world::disk::{Kept, Torn, tests as disks};
 
     /// What is asked and answered while the sync is in flight, drawn: appends that end done
     /// or part way, and syncs told a count near what the file has not synced.
@@ -815,7 +830,9 @@ mod tests {
                     }
                     let lost = world.disk.find(file).is_some_and(|at| {
                         let file = &world.disk.files[at];
-                        !file.changes.is_empty() && cut[at].whole < file.changes.len() && cut[at].torn == Torn::Nothing
+                        !file.changes.is_empty()
+                            && cut.kept[at].whole < file.changes.len()
+                            && cut.kept[at].torn == Torn::Nothing
                     });
                     if reached && lost {
                         tape.reached("a crash that loses a later append");
@@ -840,10 +857,14 @@ mod tests {
         let run = |covers| {
             let mut bytes = Vec::new_in(Global);
             bytes.extend_from_slice(b"abc");
-            let mut cut = Vec::new_in(Global);
-            cut.push(Kept { whole: 0, torn: Torn::Nothing, undone: false });
+            let mut cut = Crash { kept: Vec::new_in(Global), undone: Vec::new_in(Global) };
+            cut.kept.push(Kept { whole: 0, torn: Torn::Nothing });
             let landings: Vec<Landing> = Vec::new_in(Global);
-            synced_append(Disk::new(), 7, bytes, &[], covers, &landings, &cut)
+            // The file is there with its name synced: a file the append made would be a
+            // change of a name a crash may undo, which the theorem leaves out.
+            let mut disk = Disk::new();
+            disk.write(7, Vec::new_in(Global));
+            synced_append(disk, 7, bytes, &[], covers, &landings, &cut)
         };
         // Not told: the crash keeps nothing of the append, and the file is empty.
         assert_eq!(run(None), Some(false));

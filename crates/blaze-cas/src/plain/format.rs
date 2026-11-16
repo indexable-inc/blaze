@@ -949,7 +949,9 @@ pub(crate) fn find_by<'a>(n: usize, key: &ContentId, key_of: impl FnMut(usize) -
 /// sorted as the run is, and each is sought from where the one before it ended, never before:
 /// the run's pages are touched in ascending order, a page the keys share probed once for all of
 /// them, where one lookup a key starts each from the whole run (store-next.md, "Batches").
-pub(crate) fn find_many<'a>(n: usize, keys: &[ContentId], mut key_of: impl FnMut(usize) -> &'a [u8]) -> Vec<Option<usize>, Global> {
+/// Public for the shared cache's reader (blaze-remote's `read`), which seeks a fetched index
+/// page of another stride with it (remote-read.md): one interpolation, one home.
+pub fn find_many<'a>(n: usize, keys: &[ContentId], mut key_of: impl FnMut(usize) -> &'a [u8]) -> Vec<Option<usize>, Global> {
     // alloc: once per batch, the order its keys are sought in and its answers
     let mut order: Vec<usize, Global> = Vec::with_capacity_in(keys.len(), Global);
     order.extend(0..keys.len());

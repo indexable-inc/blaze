@@ -20,12 +20,23 @@ use crate::{
     Answer, CallShape, ChildModDecl, CrateRootBuilder, CrateRootHead, DeclaredItem, DeclsBuilder,
     Def, DefKind, Dep, Edition, ExternCrateDecl, ExternTarget, Group, MacroCallDecl,
     MacroRulesDecl, ModuleInfo, NameAnswer, Namespace, Path, PathKind, Read, Rename, Reply,
-    Resolved, Resolver, Saw, ScopeBuilder, ScopeError, ScopeFacts, Step, TextualDef, UseDecl,
-    UseForm, WrittenVis,
+    Resolved, Resolver, Saw, ScopeBuilder, ScopeError, ScopeFacts, Step,
+    TextualDef, UseDecl, UseForm, WrittenVis,
 };
 
+mod edits;
+mod attrs;
+mod entry;
+mod exports;
 mod fixtures;
+mod items;
 mod more;
+mod name_rules;
+mod oracle;
+/// The reference solver's seam a solver core is compared through (oracle.rs).
+pub(crate) use oracle::{B, Imp, reference_imports, reference_world};
+mod per_crate;
+mod procs;
 mod props;
 mod records;
 mod rules;
@@ -100,6 +111,11 @@ pub(crate) struct World {
     /// Each derive macro's helper attributes.
     pub(crate) helpers: BTreeMap<ItemKey, Vec<N>>,
     next: u16,
+    /// XORed into each fresh key's counter (a bijection): nonzero, a key's order is unrelated
+    /// to the order the test made it in, so a child module's key sorts before its parent's as
+    /// often as after (the oracle's generator draws it; the real `core` crate's keys showed a
+    /// solver that read ancestors in key order).
+    pub(crate) key_mix: u16,
 }
 
 pub(crate) fn crate_key(k: u8) -> CrateItemKey {
@@ -117,6 +133,7 @@ impl World {
             expanded: RefCell::new(BTreeSet::new()),
             helpers: BTreeMap::new(),
             next: 0,
+            key_mix: 0,
         }
     }
 
@@ -125,7 +142,7 @@ impl World {
         self.next += 1;
         let mut bytes = [0u8; 32];
         bytes[..8].fill(k);
-        bytes[9..11].copy_from_slice(&self.next.to_be_bytes());
+        bytes[9..11].copy_from_slice(&(self.next ^ self.key_mix).to_be_bytes());
         ItemKey(ContentId(bytes))
     }
 
@@ -160,6 +177,7 @@ impl World {
             edition,
             no_std: false,
             no_core: false,
+            arbitrary_ints: false,
             prelude: None,
         };
         let mut cr = CrateRootBuilder::new_in(head, Alloc::global());
@@ -246,7 +264,7 @@ impl World {
     pub(crate) fn rules_with(&mut self, at: ItemKey, name: N, export: bool) -> ItemKey {
         let def = self.key(World::krate_byte(at));
         let pos = self.next_pos(at);
-        self.d(at).macro_rules.push(MacroRulesDecl { name, def, pos, export });
+        self.d(at).macro_rules.push(MacroRulesDecl { name, def, pos, export, shapes: crate::MacroShapes::FN_LIKE });
         def
     }
 
@@ -262,7 +280,7 @@ impl World {
 
     /// A derive macro `name` with `helpers`, at the root of crate `root`.
     pub(crate) fn derive_macro(&mut self, root: ItemKey, name: N, helpers: &[N]) -> ItemKey {
-        let def = self.item(root, name, Namespace::Macros, DefKind::Macro(CallShape::Derive), V::Pub);
+        let def = self.item(root, name, Namespace::Macros, DefKind::Macro(crate::MacroShapes::DERIVE), V::Pub);
         self.helpers.insert(def, helpers.to_vec());
         def
     }
@@ -322,28 +340,29 @@ fn digest<T: Hash>(tag: u8, items: &[T]) -> ContentId {
 /// An answer as the driver holds it.
 pub(crate) enum Own {
     Name(NameAnswer),
-    Exports(Vec<crate::ExportEntry<N>>, ContentId),
+    Globs { edges: Vec<crate::GlobEdge>, krate: CrateItemKey, chain: Vec<ItemKey>, digest: ContentId },
     Textual(Vec<TextualDef<N>>, ContentId),
     Helpers(Vec<N>, ContentId),
-    InProgress,
+    /// In progress, waiting on the module named.
+    InProgress(ItemKey),
 }
 
 impl Own {
     pub(crate) fn answer(&self) -> Answer<'_, N> {
         match self {
             Own::Name(a) => Answer::Name(*a),
-            Own::Exports(entries, digest) => Answer::Exports { entries, digest: *digest },
+            Own::Globs { edges, krate, chain, digest } => Answer::Globs { edges, krate: *krate, chain, digest: *digest },
             Own::Textual(defs, digest) => Answer::Textual { defs, digest: *digest },
             Own::Helpers(names, digest) => Answer::Helpers { names, digest: *digest },
-            Own::InProgress => Answer::InProgress,
+            Own::InProgress(module) => Answer::InProgress { module: *module },
         }
     }
 
     pub(crate) fn saw(&self) -> Option<Saw> {
         match self {
             Own::Name(a) => Some(Saw::Name(*a)),
-            Own::Exports(_, d) | Own::Textual(_, d) | Own::Helpers(_, d) => Some(Saw::Digest(*d)),
-            Own::InProgress => None,
+            Own::Globs { digest: d, .. } | Own::Textual(_, d) | Own::Helpers(_, d) => Some(Saw::Digest(*d)),
+            Own::InProgress(_) => None,
         }
     }
 }
@@ -353,8 +372,11 @@ impl Own {
 fn entry(w: &World, done: &BTreeMap<ItemKey, Resolved<'static, N>>, module: ItemKey) -> Result<Vec<TextualDef<N>>, ItemKey> {
     let Some(parent) = w.modules[&module].parent else { return Ok(Vec::new()) };
     let Some(p) = done.get(&parent) else { return Err(parent) };
-    let mut out = entry(w, done, parent)?;
-    let len = p.scope.mark(module).expect("a child's mod line is marked in its parent's scope");
+    // One level: the parent's own definitions before the `mod` line; the resolver walks up.
+    let mut out = Vec::new();
+    // A module whose declaring call failed is not in its parent's scope: it does not exist,
+    // the driver solves it anyway, and the comparison (live modules only) says if that is wrong.
+    let Some(len) = p.scope.mark(module) else { return Ok(Vec::new()) };
     out.extend_from_slice(&p.scope.textual[..len as usize]);
     Ok(out)
 }
@@ -374,19 +396,25 @@ pub(crate) fn answer(
     let scope = move |m: ItemKey| of(done, m);
     Ok(match read {
         Read::Name { module, ns, name } => Own::Name(NameAnswer::from(scope(module)?.get(ns, name).copied())),
-        Read::Exports { module, class } => {
-            let v: Vec<_> = scope(module)?.exports(class).collect();
-            let d = digest(1, &v);
-            Own::Exports(v, d)
+        Read::Globs { module } => {
+            let s = scope(module)?;
+            let edges = s.globs.to_vec();
+            let krate = w.modules[&module].krate;
+            let mut chain = vec![module];
+            while let Some(p) = w.modules[chain.last().expect("the chain starts with the module")].parent {
+                chain.push(p);
+            }
+            let digest = blaze_surface::globs_digest(&edges, krate, &chain, Alloc::global());
+            Own::Globs { edges, krate, chain, digest }
         }
         Read::TextualOut { module } => {
             let v = scope(module)?.textual.to_vec();
-            let d = digest(2, &v);
+            let d = blaze_surface::textual_digest(&v, Alloc::global());
             Own::Textual(v, d)
         }
         Read::TextualEntry { module } => {
             let v = entry(w, done, module)?;
-            let d = digest(3, &v);
+            let d = blaze_surface::textual_digest(&v, Alloc::global());
             Own::Textual(v, d)
         }
         Read::DeriveHelpers { derive } => {
@@ -444,6 +472,9 @@ fn step<F: ScopeFacts<Name = N>>(m: &mut Machine, w: &F, replies: &[Reply<'_, N>
 /// Every module of a world, finished.
 pub(crate) struct Solved {
     pub(crate) by: BTreeMap<ItemKey, Resolved<'static, N>>,
+    /// Each module's crate and chain of modules up to its root (itself first).
+    pub(crate) krate: BTreeMap<ItemKey, CrateItemKey>,
+    pub(crate) chain: BTreeMap<ItemKey, Vec<ItemKey>>,
 }
 
 impl Solved {
@@ -451,8 +482,28 @@ impl Solved {
         &self.by[&m].scope
     }
 
+    /// What `name` in `ns` names in `m`: its own binding, else through its glob edges.
     pub(crate) fn def(&self, m: ItemKey, ns: Namespace, name: N) -> Option<ItemKey> {
-        self.scope(m).get(ns, name).map(|b| b.def.key)
+        self.binding(m, ns, name).map(|p| p.def.key)
+    }
+
+    /// `name` in `ns` of `m` as a reader of the records finds it (own, then through edges).
+    pub(crate) fn binding(&self, m: ItemKey, ns: Namespace, name: N) -> Option<crate::Passed> {
+        struct Records<'s>(&'s Solved, Namespace, N);
+        impl<'s> crate::Sources<'s> for Records<'s> {
+            type Stop = ItemKey;
+            fn node(&mut self, source: Def) -> Result<crate::Node<'s>, ItemKey> {
+                let Records(s, ns, name) = *self;
+                let Some(r) = s.by.get(&source.key) else {
+                    return if source.kind == DefKind::Enum { Ok(crate::Node::Value(None)) } else { Err(source.key) };
+                };
+                if let Some(b) = r.scope.get(ns, name) {
+                    return Ok(crate::Node::Value(Some(crate::Passed { def: b.def, vis: b.vis, state: b.state })));
+                }
+                Ok(crate::Node::Edges { edges: &r.scope.globs, krate: s.krate[&source.key], chain: &s.chain[&source.key] })
+            }
+        }
+        crate::through(&mut Records(self, ns, name), Def::module(m), Alloc::global()).expect("every module is solved")
     }
 
     pub(crate) fn errors(&self, m: ItemKey) -> &[Error] {
@@ -473,6 +524,73 @@ pub(crate) fn solve(w: &World, tape: Option<&Tape>, plant: Plant) -> Result<Solv
     solve_with(w, w, tape, plant)
 }
 
+/// Whether two runs gave one result: the same scopes (as record bytes) and read lists, or the
+/// same error.
+pub(crate) fn same(a: &Result<Solved, String>, b: &Result<Solved, String>) -> Result<(), String> {
+    match (a, b) {
+        (Ok(a), Ok(b)) => {
+            let keys_a: Vec<ItemKey> = a.by.keys().copied().collect();
+            let keys_b: Vec<ItemKey> = b.by.keys().copied().collect();
+            if keys_a != keys_b {
+                return Err(format!("the solvers finished other modules: {keys_a:x?} and {keys_b:x?}"));
+            }
+            for (m, ra) in a.by.iter() {
+                let rb = &b.by[m];
+                let bytes = |r: &Resolved<'static, N>| r.scope.write(Alloc::global()).map(|b| b.to_vec());
+                let (wa, wb) = (bytes(ra), bytes(rb));
+                if wa.is_err() != wb.is_err() || wa.as_ref().ok() != wb.as_ref().ok() || ra.scope != rb.scope {
+                    return Err(format!("the runs differ on the scope of {m:x}: {}", scope_diff(&ra.scope, &rb.scope)));
+                }
+                if ra.reads != rb.reads {
+                    let only = |x: &Resolved<'static, N>, y: &Resolved<'static, N>| -> Vec<String> {
+                        x.reads.entries.iter().filter(|e| !y.reads.entries.contains(e)).take(3).map(|e| format!("{e:?}")).collect()
+                    };
+                    return Err(format!(
+                        "the runs differ on the reads of {m:x}:\n only first: {:?}\n only second: {:?}",
+                        only(ra, rb),
+                        only(rb, ra)
+                    ));
+                }
+            }
+            Ok(())
+        }
+        (Err(x), Err(y)) if x == y => Ok(()),
+        (x, y) => Err(format!(
+            "the solvers differ: passes {}, worklist {}",
+            x.as_ref().map_or_else(|e| e.clone(), |_| String::from("done")),
+            y.as_ref().map_or_else(|e| e.clone(), |_| String::from("done"))
+        )),
+    }
+}
+
+/// The first parts of two scopes that differ, each on its own line.
+fn scope_diff(a: &ScopeBuilder<'static, N>, b: &ScopeBuilder<'static, N>) -> String {
+    let mut out = String::new();
+    let only = |x: &ScopeBuilder<'static, N>, y: &ScopeBuilder<'static, N>| -> Vec<String> {
+        let mut v: Vec<String> =
+            x.bindings.iter().filter(|e| !y.bindings.contains(e)).map(|e| format!("{} {:?}: {:?}", e.name, e.ns, e.binding)).collect();
+        v.extend(x.errors.iter().filter(|e| !y.errors.contains(e)).map(|e| format!("error {e:?}")));
+        if x.globs[..] != y.globs[..] {
+            v.push(format!("globs {:?}", x.globs));
+        }
+        if x.textual[..] != y.textual[..] || x.marks[..] != y.marks[..] {
+            v.push(format!("textual {:?} marks {:?}", x.textual, x.marks));
+        }
+        v
+    };
+    for (label, x, y) in [("first", a, b), ("second", b, a)] {
+        out.push_str(&format!("\n only {label}:"));
+        for line in only(x, y).iter().take(4) {
+            out.push_str("\n   ");
+            out.push_str(line);
+        }
+    }
+    if out.matches("\n   ").count() == 0 {
+        out.push_str(&format!("\n (in order or another field) first: {a:?}"));
+    }
+    out
+}
+
 /// [`solve`], the machines reading their facts from `facts` (the world's records, say) and
 /// the driver answering reads from `w`'s finished scopes as before.
 pub(crate) fn solve_with<F: ScopeFacts<Name = N>>(
@@ -482,11 +600,155 @@ pub(crate) fn solve_with<F: ScopeFacts<Name = N>>(
     plant: Plant,
 ) -> Result<Solved, String> {
     w.expanded.borrow_mut().clear();
-    let mut order: Vec<ItemKey> = w.modules.keys().copied().collect();
+    let order: Vec<ItemKey> = w.modules.keys().copied().collect();
+    let done = drive_by::<F>(w, facts, tape, plant, BTreeMap::new(), order)?;
+    Ok(w.solved(done))
+}
+
+impl World {
+    /// `done`, with each module's crate and chain.
+    fn solved(&self, done: BTreeMap<ItemKey, Resolved<'static, N>>) -> Solved {
+        let krate = self.modules.iter().map(|(&m, i)| (m, i.krate)).collect();
+        let chain = self
+            .modules
+            .keys()
+            .map(|&m| {
+                let mut c = vec![m];
+                while let Some(p) = self.modules[c.last().expect("the chain starts with the module")].parent {
+                    c.push(p);
+                }
+                (m, c)
+            })
+            .collect();
+        Solved { by: done, krate, chain }
+    }
+}
+
+/// Resolves again after an edit of `before` into `w`, as an incremental driver does: the
+/// `edited` modules from their text, every other module answered by its record in `old`;
+/// widened by [`crate::Again::suspects`] to the kept records a rerun's derivation may go
+/// around; then each module whose read list no longer holds, again, until every one holds.
+/// With a tape, every round draws its own order and batches, so two calls are two schedules.
+/// With `plant` [`Plant::KeepSuspects`], the widening is left out.
+pub(crate) fn resolve_again(
+    before: &World,
+    w: &World,
+    old: &Solved,
+    edited: &[ItemKey],
+    tape: Option<&Tape>,
+    plant: Plant,
+) -> Result<Again, String> {
+    let g = Alloc::global();
+    let mut done: BTreeMap<ItemKey, Resolved<'static, N>> =
+        old.by.iter().filter(|(m, _)| w.modules.contains_key(*m)).map(|(m, r)| (*m, r.clone())).collect();
+    let parent_before = |m: ItemKey| before.modules.get(&m).and_then(|i| i.parent);
+    let parent = |m: ItemKey| w.modules.get(&m).and_then(|i| i.parent);
+    let again = crate::Again::new_in(old.by.iter().map(|(m, r)| (*m, &r.reads)), parent_before, g);
+    let mut touched: BTreeMap<ItemKey, crate::Touched<'static, N>> = BTreeMap::new();
+    // A module new in the edit has no record yet; one that read a module the edit removed has
+    // nothing to answer that read; one that NAMES a removed module (a glob edge to it, a
+    // binding of it) is no longer true, and a walk through it would read the removed module
+    // (seed 654: a kept root's glob edge to a removed `m::m`, walked by the edited `m`).
+    let removed = |d: Def| d.kind == DefKind::Module && !w.modules.contains_key(&d.key);
+    let gone = |r: &Resolved<'static, N>| {
+        r.reads.entries.iter().any(|e| match e.read {
+            Read::TextualEntry { .. } | Read::DeriveHelpers { .. } => false,
+            Read::Name { module, .. } | Read::Globs { module } | Read::TextualOut { module } => !w.modules.contains_key(&module),
+        }) || r.scope.globs.iter().any(|e| removed(e.source))
+            || r.scope.bindings.iter().any(|b| removed(b.binding.def))
+    };
+    let mut dirty: Vec<ItemKey> = w
+        .modules
+        .keys()
+        .copied()
+        .filter(|m| edited.contains(m) || done.get(m).is_none_or(|r| gone(r)))
+        .collect();
+    for &m in dirty.iter() {
+        let t = match (before.decls.get(&m), w.decls.get(&m)) {
+            (Some(a), Some(b)) => crate::Touched::of_text(a, b, g),
+            _ => crate::Touched::wild(g),
+        };
+        touched.insert(m, t);
+    }
+    let mut fresh: BTreeSet<ItemKey> = BTreeSet::new();
+    let mut widened: BTreeSet<ItemKey> = BTreeSet::new();
+    let mut rounds = 0u32;
+    while !dirty.is_empty() {
+        rounds += 1;
+        if rounds > 1_000 {
+            return Err(String::from("resolving again took 1000 rounds"));
+        }
+        // One wave: the dirty modules from their text, widened until no kept record they read
+        // reaches back to what they derive anew.
+        loop {
+            rounds += 1;
+            if rounds > 1_000 {
+                return Err(String::from("resolving again took 1000 rounds"));
+            }
+            for m in dirty.iter() {
+                done.remove(m);
+            }
+            done = drive_by::<World>(w, w, tape, plant, done, dirty.clone())?;
+            fresh.extend(dirty.iter().copied());
+            for m in dirty.iter() {
+                if let (Some(o), Some(n)) = (old.by.get(m), done.get(m)) {
+                    touched.get_mut(m).expect("every dirty module is touched").add_changed(&o.scope, &n.scope);
+                }
+            }
+            if plant == Plant::KeepSuspects {
+                break;
+            }
+            let rerun: Vec<(ItemKey, &crate::ReadList<'static, N>, &crate::Touched<'static, N>)> =
+                dirty.iter().map(|m| (*m, &done[m].reads, &touched[m])).collect();
+            let suspects = again.suspects(&rerun, |m| !fresh.contains(&m) && done.contains_key(&m), parent);
+            if suspects.is_empty() {
+                break;
+            }
+            for &s in suspects.iter() {
+                widened.insert(s);
+                touched.insert(s, crate::Touched::wild(g));
+                dirty.push(s);
+            }
+        }
+        dirty = done
+            .iter()
+            .filter(|(_, r)| {
+                !r.reads.holds(|read| match answer(w, &done, *read) {
+                    Ok(own) => own.saw().unwrap_or(Saw::Name(NameAnswer::Absent)),
+                    Err(_) => Saw::Name(NameAnswer::Absent),
+                })
+            })
+            .map(|(m, _)| *m)
+            .collect();
+        for &m in dirty.iter() {
+            touched.insert(m, crate::Touched::wild(g));
+        }
+    }
+    Ok(Again { solved: w.solved(done), widened })
+}
+
+/// What [`resolve_again`] gives: every record, and the modules it solved again.
+pub(crate) struct Again {
+    pub(crate) solved: Solved,
+    /// The kept records solved again because a rerun's derivation may go around them.
+    pub(crate) widened: BTreeSet<ItemKey>,
+}
+
+/// Drives the machines of `order`'s modules (a drawn order with a tape) to done, every module
+/// in `done` answered by its record there; `done` with them.
+fn drive_by<F: ScopeFacts<Name = N>>(
+    w: &World,
+    facts: &F,
+    tape: Option<&Tape>,
+    plant: Plant,
+    done: BTreeMap<ItemKey, Resolved<'static, N>>,
+    order: Vec<ItemKey>,
+) -> Result<BTreeMap<ItemKey, Resolved<'static, N>>, String> {
+    let mut order = order;
     if let Some(t) = tape {
         t.shuffle(&mut order, "module order");
     }
-    let mut done: BTreeMap<ItemKey, Resolved<'static, N>> = BTreeMap::new();
+    let mut done = done;
     let mut stack: Vec<Frame> = Vec::new();
     let mut next = 0usize;
     let mut steps = 0u32;
@@ -513,7 +775,7 @@ pub(crate) fn solve_with<F: ScopeFacts<Name = N>>(
                 Ok(own) => owned.push((read, own)),
                 Err(owner) => {
                     if stack.iter().any(|f| f.m.holds(owner)) {
-                        owned.push((read, Own::InProgress));
+                        owned.push((read, Own::InProgress(owner)));
                     } else if first_needed.is_none() {
                         first_needed = Some(owner);
                     }
@@ -529,6 +791,18 @@ pub(crate) fn solve_with<F: ScopeFacts<Name = N>>(
         }
         if owned.is_empty() {
             if let Some(owner) = first_needed {
+                if !w.modules.contains_key(&owner) {
+                    let who: Vec<String> = stack
+                        .iter()
+                        .map(|f| match &f.m {
+                            Machine::One(r) => format!("{:x}", r.module),
+                            Machine::Many(g) => format!("{:x?}", g.modules().collect::<Vec<_>>()),
+                        })
+                        .collect();
+                    // A kept record that names a removed module is dirty (`gone`), so no walk
+                    // reaches one: a read of it is the driver's bug, named with its reader.
+                    return Err(format!("a read of the removed module {owner:x}: {asks:x?}, by the machines {who:?}"));
+                }
                 stack[top].asks = asks;
                 stack.push(new_frame(facts, owner, plant)?);
                 continue;
@@ -536,7 +810,7 @@ pub(crate) fn solve_with<F: ScopeFacts<Name = N>>(
         }
         let replies: Vec<Reply<'_, N>> =
             owned.iter().map(|(read, own)| Reply { read: *read, answer: own.answer() }).collect();
-        match step(&mut stack[top].m, facts, &replies)? {
+        match step::<F>(&mut stack[top].m, facts, &replies)? {
             Out::Ask(reads) => stack[top].asks = reads,
             Out::Expand(calls) => {
                 let mut expanded = w.expanded.borrow_mut();
@@ -572,5 +846,5 @@ pub(crate) fn solve_with<F: ScopeFacts<Name = N>>(
             }
         }
     }
-    Ok(Solved { by: done })
+    Ok(done)
 }
