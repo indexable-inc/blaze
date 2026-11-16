@@ -1443,6 +1443,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-id"
+version = "0.0.0"
+dependencies = [
+ "blaze-hash",
+ "blaze-ids",
+ "blaze-sim",
+ "serde",
+]
+
+[[package]]
 name = "blaze-ids"
 version = "0.0.0"
 dependencies = [

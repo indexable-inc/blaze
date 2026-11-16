@@ -583,6 +583,8 @@ blaze-hash = { path = "crates/blaze-hash" }
 # blaze's sans-IO HTTP/1.1 and HTTP/3 cores and their drivers on blaze-core's effects.
 blaze-http = { path = "crates/blaze-http", default-features = false }
 blaze-ids = { path = "crates/blaze-ids" }
+# An item's portable identity: its key, the `Portable` bound and the tables that outlive a snapshot (docs/v2/plan/design/identity.md).
+blaze-id = { path = "crates/blaze-id" }
 # The fresh core's vocabulary: record kinds, keys, the store, memo, executor and driver interfaces.
 blaze-keyed = { path = "crates/blaze-keyed" }
 # Lint findings as records, their three-class scheduler, wait modes and the adoption ladder.
