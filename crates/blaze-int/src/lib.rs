@@ -5,17 +5,26 @@
 //!
 //! | method | what happens | exists for |
 //! |---|---|---|
-//! | [`widen`](Int::widen) | the same value in a wider type | only pairs where no value of the source is lost on any supported target: a compile error otherwise, because the impl does not exist |
+//! | [`widen_to`](Int::widen_to) | the same value in a wider type | only pairs where no value of the source is lost on any supported target: a compile error otherwise, because the impl does not exist |
 //! | [`narrow`](Int::narrow) | the same value, or a [`Narrowed`] naming the value and both types | every other pair |
 //! | [`narrow_or_stop`](Int::narrow_or_stop) | the same value, or a panic naming it and both types, at the caller (`#[track_caller]`) | the pairs of `narrow`, where a value that does not fit is a bug: say the invariant in a comment beside it |
-//! | [`truncate`](Int::truncate) | the low bits, kept on purpose (hash mixing, codecs) | pairs whose target has no more bits than the source on every supported target |
+//! | [`truncate_to`](Int::truncate_to) | the low bits, kept on purpose (hash mixing, codecs) | pairs whose target has no more bits than the source on every supported target |
 //! | [`saturate`](Int::saturate) | the value, clamped to the target's range | the pairs of `narrow` |
-//! | [`to_signed`](ToSigned::to_signed), [`to_unsigned`](ToUnsigned::to_unsigned) | the same bits read with the other sign | pairs of equal width |
+//! | `core`'s `cast_signed`, `cast_unsigned` (stable, `const`) | the same bits read with the other sign | pairs of equal width |
 //!
-//! `use blaze_int::prelude::*` brings the methods; `x.widen::<u64>()` names the target where
+//! `use blaze_int::Int` brings the methods; `x.widen_to::<u64>()` names the target where
 //! inference does not. A conversion that `as` does in one step and that is two things, such as
 //! `i32 as u64` (sign-extend, then reinterpret), is written as its two steps here:
-//! `x.widen::<i64>().to_unsigned()`, or `x.to_unsigned().widen::<u64>()` to zero-extend.
+//! `x.widen_to::<i64>().cast_unsigned()`, or `x.cast_unsigned().widen_to::<u64>()` to
+//! zero-extend.
+//!
+//! Why `widen_to` and `truncate_to`, not `widen` and `truncate`: the pinned nightly's `core` has
+//! unstable inherent `widen` and `truncate` (`integer_widen_truncate`, rust-lang/rust#154330)
+//! for same-sign pairs only and with `usize` taken as possibly 16 bits (no `u32 -> usize`, no
+//! `usize -> u64`, the two the tree needs most). A trait method of the same name draws
+//! `unstable_name_collisions` at every call today, and once they are stable the inherent method
+//! wins and every pair it lacks stops compiling. `core`'s `cast_signed`/`cast_unsigned` are
+//! stable and are this crate's reinterpretations: one home, so none is written here.
 //!
 //! Every conversion is also a `const fn` of [`Cast`], the one home of the code:
 //! `Cast::<u64, u32>::narrow(x)`, `Cast::<u32, usize>::widen(x)`; the traits call it. Trait
@@ -95,35 +104,35 @@ impl core::error::Error for Narrowed {}
 
 /// `Self` to `T` with no value lost. Implemented only for such pairs.
 pub trait Widen<T>: Copy {
-    fn widen_to(self) -> T;
+    fn widened(self) -> T;
 }
 
 /// `Self` to `T`, checked. Implemented for every pair that is not a [`Widen`] (and not `T`
 /// to itself).
 pub trait Narrow<T>: Copy {
-    fn narrow_to(self) -> Result<T, Narrowed>;
+    fn narrowed(self) -> Result<T, Narrowed>;
 }
 
 /// `Self`'s low bits as a `T`. Implemented where `T` has no more bits than `Self`.
 pub trait Truncate<T>: Copy {
-    fn truncate_to(self) -> T;
+    fn truncated(self) -> T;
 }
 
 /// `Self` clamped to `T`'s range. Implemented for the pairs of [`Narrow`].
 pub trait Saturate<T>: Copy {
-    fn saturate_to(self) -> T;
+    fn saturated(self) -> T;
 }
 
-/// The conversions as methods with the target as a type parameter: `x.widen::<u64>()`,
+/// The conversions as methods with the target as a type parameter: `x.widen_to::<u64>()`,
 /// `x.narrow::<u32>()?`. Implemented for every primitive integer.
 pub trait Int: Copy {
     /// The same value in a wider type; the pair must lose nothing.
     #[inline(always)]
-    fn widen<T>(self) -> T
+    fn widen_to<T>(self) -> T
     where
         Self: Widen<T>,
     {
-        self.widen_to()
+        self.widened()
     }
 
     /// The same value, or a [`Narrowed`] naming it and both types.
@@ -132,7 +141,7 @@ pub trait Int: Copy {
     where
         Self: Narrow<T>,
     {
-        self.narrow_to()
+        self.narrowed()
     }
 
     /// The same value; one that does not fit is a bug, and panics at the caller naming the
@@ -143,7 +152,7 @@ pub trait Int: Copy {
     where
         Self: Narrow<T>,
     {
-        match self.narrow_to() {
+        match self.narrowed() {
             Ok(it) => it,
             Err(e) => e.stop(),
         }
@@ -151,11 +160,11 @@ pub trait Int: Copy {
 
     /// The low bits, on purpose.
     #[inline(always)]
-    fn truncate<T>(self) -> T
+    fn truncate_to<T>(self) -> T
     where
         Self: Truncate<T>,
     {
-        self.truncate_to()
+        self.truncated()
     }
 
     /// The value clamped to `T`'s range.
@@ -164,25 +173,8 @@ pub trait Int: Copy {
     where
         Self: Saturate<T>,
     {
-        self.saturate_to()
+        self.saturated()
     }
-}
-
-/// An unsigned integer's bits read as the signed integer of its width.
-pub trait ToSigned: Copy {
-    type Signed;
-    fn to_signed(self) -> Self::Signed;
-}
-
-/// A signed integer's bits read as the unsigned integer of its width.
-pub trait ToUnsigned: Copy {
-    type Unsigned;
-    fn to_unsigned(self) -> Self::Unsigned;
-}
-
-/// The methods: `use blaze_int::prelude::*`.
-pub mod prelude {
-    pub use crate::{Int, ToSigned, ToUnsigned};
 }
 
 /// An id as an index: `u32` to `usize`, which loses nothing where `usize` has 32 bits or more.
@@ -239,13 +231,6 @@ macro_rules! table {
     };
 }
 
-/// The equal-width pairs, unsigned first, for `to_signed` and `to_unsigned`.
-macro_rules! signs {
-    ($then:ident) => {
-        $then! { (u8, i8) (u16, i16) (u32, i32) (u64, i64) (u128, i128) (usize, isize) }
-    };
-}
-
 macro_rules! impls {
     ($(
         $s:ident $sign:ident: widen [$($w:ident),*] widen_ptr [$($p:ident),*]
@@ -276,7 +261,7 @@ macro_rules! widen {
 
         impl Widen<$t> for $s {
             #[inline(always)]
-            fn widen_to(self) -> $t {
+            fn widened(self) -> $t {
                 Cast::<$s, $t>::widen(self)
             }
         }
@@ -363,14 +348,14 @@ macro_rules! narrow {
 
         impl Narrow<$t> for $s {
             #[inline(always)]
-            fn narrow_to(self) -> Result<$t, Narrowed> {
+            fn narrowed(self) -> Result<$t, Narrowed> {
                 Cast::<$s, $t>::narrow(self)
             }
         }
 
         impl Saturate<$t> for $s {
             #[inline(always)]
-            fn saturate_to(self) -> $t {
+            fn saturated(self) -> $t {
                 Cast::<$s, $t>::saturate(self)
             }
         }
@@ -389,53 +374,14 @@ macro_rules! truncate {
 
         impl Truncate<$t> for $s {
             #[inline(always)]
-            fn truncate_to(self) -> $t {
+            fn truncated(self) -> $t {
                 Cast::<$s, $t>::truncate(self)
             }
         }
     };
 }
 
-macro_rules! reinterpret {
-    ($(($u:ident, $i:ident))*) => {
-        $(
-            impl Cast<$u, $i> {
-                /// The same bits, read as signed.
-                #[inline(always)]
-                pub const fn reinterpret(x: $u) -> $i {
-                    x as $i
-                }
-            }
-
-            impl Cast<$i, $u> {
-                /// The same bits, read as unsigned.
-                #[inline(always)]
-                pub const fn reinterpret(x: $i) -> $u {
-                    x as $u
-                }
-            }
-
-            impl ToSigned for $u {
-                type Signed = $i;
-                #[inline(always)]
-                fn to_signed(self) -> $i {
-                    Cast::<$u, $i>::reinterpret(self)
-                }
-            }
-
-            impl ToUnsigned for $i {
-                type Unsigned = $u;
-                #[inline(always)]
-                fn to_unsigned(self) -> $u {
-                    Cast::<$i, $u>::reinterpret(self)
-                }
-            }
-        )*
-    };
-}
-
 table!(impls);
-signs!(reinterpret);
 
 #[cfg(test)]
 mod tests;

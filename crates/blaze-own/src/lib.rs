@@ -25,7 +25,7 @@
 //!
 //! The cargo feature `std` (off by default; blaze-mem turns it on) adds what only this crate
 //! may write by the orphan rule and only std has: `AsRef<OsStr>` and `AsRef<Path>` for
-//! [`String`]. Nothing else of std is used. The feature `testing` adds [`testing`]: a leak-
+//! [`String`]. Nothing else of std is used. The feature `testing` adds the module `testing`: a leak-
 //! and misuse-counting allocator, one that refuses the n-th allocation, and `every_failure`,
 //! which runs a closure once per allocation with that one refused (after Zig's
 //! `std.testing.allocator` and `checkAllAllocationFailures`).

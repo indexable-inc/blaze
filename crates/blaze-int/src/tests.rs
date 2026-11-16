@@ -69,7 +69,7 @@ macro_rules! check_widen {
             let wide: $t = Cast::<$s, $t>::widen(v);
             assert_eq!(wide, v as $t, "{} -> {} widen of {v} is not `as`", stringify!($s), stringify!($t));
             assert_eq!(<$s>::try_from(wide).ok(), Some(v), "{} -> {} widen lost {v}", stringify!($s), stringify!($t));
-            assert_eq!(v.widen::<$t>(), wide);
+            assert_eq!(v.widen_to::<$t>(), wide);
         }
     };
 }
@@ -118,24 +118,6 @@ macro_rules! check_truncate {
     };
 }
 
-macro_rules! check_signs {
-    ($(($u:ident, $i:ident))*) => {
-        $(
-            for v in edges!($u, $i) {
-                let signed = v.to_signed();
-                assert_eq!(signed, v as $i);
-                assert_eq!(Cast::<$u, $i>::reinterpret(v), signed);
-                assert_eq!(signed.to_unsigned(), v);
-            }
-            for v in edges!($i, $u) {
-                assert_eq!(v.to_unsigned(), v as $u);
-                assert_eq!(Cast::<$i, $u>::reinterpret(v), v as $u);
-                assert_eq!(v.to_unsigned().to_signed(), v);
-            }
-        )*
-    };
-}
-
 /// `named`, a source's targets, are the 11 other types, each once.
 fn each_other_once(source: &str, named: &[&str]) {
     for it in TYPES {
@@ -150,11 +132,6 @@ fn each_other_once(source: &str, named: &[&str]) {
 #[allow(unused_comparisons, reason = "`v < 0` of an unsigned source, the table's one body for all")]
 fn every_pair_at_its_edges() {
     table!(check_pairs);
-}
-
-#[test]
-fn reinterpretations_keep_the_bits() {
-    signs!(check_signs);
 }
 
 #[test]

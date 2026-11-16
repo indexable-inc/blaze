@@ -30,7 +30,6 @@ use super::{AttrFlags, Tree, attr_value, attrs_source, collect_attrs_in, for_eac
 use crate::{
     AdtId, AssocItemId, AttrDefId, BlockIdLt, FieldId, HasModule, ItemContainerId, ModuleDefId,
     ModuleId, ModuleIdLt, VariantId,
-    deps::facts::{Ctx, In, Out, Value as FactValue},
     nameres::assoc::{ImplItems, TraitItems},
     unstable_features::UnstableFeatures,
 };
@@ -401,16 +400,13 @@ fn own(db: &Db, def: StabilityDef) -> Option<&Own> {
     (own != NONE).then_some(own)
 }
 
-/// What `def`'s own attributes say: its attribute fact `stability ..` ([`Context::what`]), so
-/// of a crate given by its address it is read from the entry its store kept, with no text of
-/// its files. Floor and cost: `deps::facts`'s, one entry a definition with one of the
-/// attributes (its flags say which: [`own`] asks nothing of the others).
+/// What `def`'s own attributes say, off its text ([`super::from_text`]: of a crate without
+/// text a typed stop until an `Attrs` record holds them). Asked only of a definition with one
+/// of the attributes (its flags say which: [`own`] asks nothing of the others).
 #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
 fn own_of_def(db: &Db, def: AttrDefId) -> Own {
     let context = Context::of(db, def.krate(db));
-    let mut what = [0; WHAT_LEN];
-    let what = context.what("stability", &mut what);
-    from_text(db, what, def, || own_of_def_made(db, def, &context))
+    super::from_text(db, "stability", def, || own_of_def_made(db, def, &context))
 }
 
 /// [`own_of_def`] off `def`'s syntax, and whether it read nothing but its attributes' text
@@ -435,19 +431,9 @@ fn own_of_def_made(db: &Db, def: AttrDefId, context: &Context) -> (Own, bool) {
 /// are (`AttrFlags::query_field`).
 #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
 fn own_of_fields(db: &Db, variant: VariantId) -> Box<[Own]> {
-    use crate::deps::facts::{Part, at, fact};
-
+    crate::nameres::demand_text(db, variant.krate(db), "the stability of a crate's fields");
     let context = Context::of(db, variant.krate(db));
-    let mut what = [0; WHAT_LEN];
-    let what = context.what("field stability", &mut what);
-    let (kind, place) = match variant {
-        VariantId::StructId(it) => (1, at(db, it)),
-        VariantId::UnionId(it) => (2, at(db, it)),
-        VariantId::EnumVariantId(it) => (5, at(db, it)),
-    };
-    fact(db, "field stability", what, kind, Some(place), Part::Header, || {
-        own_of_fields_made(db, variant, &context)
-    })
+    own_of_fields_made(db, variant, &context).0
 }
 
 /// [`own_of_fields`] off `variant`'s syntax, and whether it read nothing but its text.
@@ -489,10 +475,6 @@ fn written_by_macro(mut expr: ast::Expr<'_>) -> bool {
     matches!(expr, ast::Expr::MacroExpr(_))
 }
 
-/// The room [`Context::what`] writes a fact's name in: `field stability 1 65535.65535.65535`
-/// is 36 bytes.
-const WHAT_LEN: usize = 48;
-
 /// What the parse of a crate's attributes depends on.
 struct Context {
     /// `#![feature(staged_api)]`.
@@ -507,171 +489,21 @@ impl Context {
             current: RustcVersion::current(db, krate),
         }
     }
-
-    /// The name of a fact of `family` parsed in this context, written into `room`: the parse
-    /// reads `staged_api` and the rustc version beside the attributes' text, so both are in
-    /// the key (rule 21), and an entry kept for another version is a miss, never served.
-    fn what<'r>(&self, family: &str, room: &'r mut [u8; WHAT_LEN]) -> &'r str {
-        use std::io::Write as _;
-
-        let staged = u8::from(self.staged);
-        let len = {
-            let mut rest = &mut room[..];
-            let written = match self.current {
-                Some(RustcVersion { major, minor, patch }) => {
-                    write!(rest, "{family} {staged} {major}.{minor}.{patch}")
-                }
-                None => write!(rest, "{family} {staged} none"),
-            };
-            written.unwrap_or_else(|_| panic!("a `{family}` fact's name past {WHAT_LEN} bytes"));
-            WHAT_LEN - rest.len()
-        };
-        std::str::from_utf8(&room[..len]).expect("a fact's name is written as text")
-    }
 }
 
-// The values of [`Own`] as a fact's entry holds them (`deps::facts::Value`): every symbol as
-// its text, a version as three numbers, each enum by a tag.
 
-type R<T> = Result<T, String>;
 
-fn tag_error(what: &str, tag: u8) -> String {
-    // alloc: error path
-    format!("{what} of tag {tag}")
-}
 
-fn put_version(out: &mut Out, it: RustcVersion) {
-    for part in [it.major, it.minor, it.patch] {
-        out.u32(u32::from(part));
-    }
-}
 
-fn take_version(input: &mut In<'_>) -> R<RustcVersion> {
-    let mut part = || {
-        let it = input.u32()?;
-        // alloc: error path
-        u16::try_from(it).map_err(|_| format!("a version part of {it}"))
-    };
-    Ok(RustcVersion { major: part()?, minor: part()?, patch: part()? })
-}
 
-impl FactValue for Deprecation {
-    fn put(&self, ctx: Ctx, out: &mut Out) -> bool {
-        match &self.since {
-            DeprecatedSince::RustcVersion(it) => {
-                out.u8(0);
-                put_version(out, *it);
-            }
-            DeprecatedSince::Future => out.u8(1),
-            DeprecatedSince::NonStandard(it) => {
-                out.u8(2);
-                out.str(it.as_str());
-            }
-            DeprecatedSince::Unspecified => out.u8(3),
-            DeprecatedSince::Err => out.u8(4),
-        }
-        self.note.put(ctx, out) && self.suggestion.put(ctx, out)
-    }
 
-    fn take(ctx: Ctx, input: &mut In<'_>) -> R<Deprecation> {
-        let since = match input.u8()? {
-            0 => DeprecatedSince::RustcVersion(take_version(input)?),
-            1 => DeprecatedSince::Future,
-            2 => DeprecatedSince::NonStandard(input.symbol()?),
-            3 => DeprecatedSince::Unspecified,
-            4 => DeprecatedSince::Err,
-            tag => return Err(tag_error("a deprecation's since", tag)),
-        };
-        Ok(Deprecation {
-            since,
-            note: FactValue::take(ctx, input)?,
-            suggestion: FactValue::take(ctx, input)?,
-        })
-    }
-}
 
-impl FactValue for Stability {
-    fn put(&self, ctx: Ctx, out: &mut Out) -> bool {
-        match &self.level {
-            StabilityLevel::Unstable { reason, issue, is_soft, implied_by, old_name } => {
-                out.u8(0);
-                match reason {
-                    UnstableReason::None => out.u8(0),
-                    UnstableReason::Default => out.u8(1),
-                    UnstableReason::Some(it) => {
-                        out.u8(2);
-                        out.str(it.as_str());
-                    }
-                }
-                // `issue = "none"` is 0, which no issue is.
-                out.u32(issue.map_or(0, NonZero::get));
-                if !(is_soft.put(ctx, out) && implied_by.put(ctx, out) && old_name.put(ctx, out)) {
-                    return false;
-                }
-            }
-            StabilityLevel::Stable { since, allowed_through_unstable_modules } => {
-                out.u8(1);
-                match since {
-                    StableSince::Version(it) => {
-                        out.u8(0);
-                        put_version(out, *it);
-                    }
-                    StableSince::Current => out.u8(1),
-                    StableSince::Err => out.u8(2),
-                }
-                if !allowed_through_unstable_modules.put(ctx, out) {
-                    return false;
-                }
-            }
-        }
-        out.str(self.feature.as_str());
-        true
-    }
 
-    fn take(ctx: Ctx, input: &mut In<'_>) -> R<Stability> {
-        let level = match input.u8()? {
-            0 => {
-                let reason = match input.u8()? {
-                    0 => UnstableReason::None,
-                    1 => UnstableReason::Default,
-                    2 => UnstableReason::Some(input.symbol()?),
-                    tag => return Err(tag_error("an unstable reason", tag)),
-                };
-                StabilityLevel::Unstable {
-                    reason,
-                    issue: NonZero::new(input.u32()?),
-                    is_soft: FactValue::take(ctx, input)?,
-                    implied_by: FactValue::take(ctx, input)?,
-                    old_name: FactValue::take(ctx, input)?,
-                }
-            }
-            1 => {
-                let since = match input.u8()? {
-                    0 => StableSince::Version(take_version(input)?),
-                    1 => StableSince::Current,
-                    2 => StableSince::Err,
-                    tag => return Err(tag_error("a stable since", tag)),
-                };
-                StabilityLevel::Stable {
-                    since,
-                    allowed_through_unstable_modules: FactValue::take(ctx, input)?,
-                }
-            }
-            tag => return Err(tag_error("a stability level", tag)),
-        };
-        Ok(Stability { level, feature: input.symbol()? })
-    }
-}
 
-impl FactValue for Own {
-    fn put(&self, ctx: Ctx, out: &mut Out) -> bool {
-        self.deprecation.put(ctx, out) && self.stability.put(ctx, out)
-    }
 
-    fn take(ctx: Ctx, input: &mut In<'_>) -> R<Own> {
-        Ok(Own { deprecation: FactValue::take(ctx, input)?, stability: FactValue::take(ctx, input)? })
-    }
-}
+
+
+
 
 /// Reads one definition's attributes in order.
 #[derive(Default)]

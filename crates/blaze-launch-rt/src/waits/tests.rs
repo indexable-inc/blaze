@@ -136,8 +136,8 @@ fn interleave(checked: bool, reads: usize, stop_at_first: bool) -> usize {
     let waits = table(&mut region);
     let stop = AtomicBool::new(false);
     let deadline = Instant::now() + Duration::from_secs(20);
+    let mut slot = waits.claim(Thread(1)).expect("a free row");
     thread::scope(|scope| {
-        let mut slot = waits.claim(Thread(1)).expect("a free row");
         let writer = scope.spawn(|| {
             let mut k = 1u64;
             while !stop.load(Ordering::Relaxed) {

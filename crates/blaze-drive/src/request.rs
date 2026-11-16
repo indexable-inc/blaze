@@ -644,7 +644,14 @@ impl<A: Allocator + Clone> Request<A> {
                         None => None,
                     };
                     if self.root.is_none() {
+                        // No old table to walk forward from: walk the whole build from the
+                        // units, as a first build does (the seeds find no row and go).
                         self.last = None;
+                        if self.forward {
+                            self.forward = false;
+                            let units = Name::units();
+                            self.add_job(units, units, Some(Locate::Source(self.units_source)), false, Class::Foreground)?;
+                        }
                     }
                     let waiters = core::mem::replace(&mut self.root_waiters, Vec::new_in(self.alloc.clone()));
                     for name in waiters.iter() {

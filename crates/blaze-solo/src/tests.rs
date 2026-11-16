@@ -739,3 +739,15 @@ fn the_newest_whole_slot_is_opened() {
     assert_eq!(root::newest(&file), Some(slot(1, 1)), "a slot at the other's offset is none");
     assert_eq!(root::newest(&[]), None);
 }
+
+/// A sweep spreads over the driver's file threads: a tree of 1,000 files on four is four
+/// batches (one thread before), a big one is capped at 4096 names a batch, a tiny one is one.
+#[test]
+fn a_sweep_asks_a_stamp_batch_per_file_thread() {
+    use crate::run::{STAMP_BATCH, STAMP_LEAST, stamp_batch};
+    assert_eq!(stamp_batch(1_000, 4), 250);
+    assert_eq!(1_000usize.div_ceil(stamp_batch(1_000, 4)), 4);
+    assert_eq!(stamp_batch(40, 4), STAMP_LEAST);
+    assert_eq!(stamp_batch(1_000_000, 4), STAMP_BATCH);
+    assert_eq!(stamp_batch(1_000, 0), 1_000, "no lanes named is one");
+}

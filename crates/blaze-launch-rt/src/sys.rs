@@ -60,6 +60,9 @@
 use core::ptr::{self, NonNull};
 use core::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(test)]
+mod tests;
+
 /// A call of the OS that failed: which, its `errno`, and the bytes of the mapping it was about.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct SysError {
@@ -615,26 +618,55 @@ impl Code {
         if unsafe { libc::ftruncate(fd.as_raw_fd(), length) } != 0 {
             return Err(failed("ftruncate", 0, len));
         }
-        let map = |protection: libc::c_int, call: &'static str| {
-            // SAFETY: a shared mapping of the memfd at no fixed address; the result is checked.
-            let at = unsafe {
-                libc::mmap(ptr::null_mut(), len, protection, libc::MAP_SHARED, fd.as_raw_fd(), 0)
-            };
-            if at == libc::MAP_FAILED {
+        let reservation = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE;
+        let protection = libc::PROT_READ | libc::PROT_WRITE;
+        // SAFETY: an anonymous mapping at no fixed address: nothing of this process is
+        // replaced; the result is checked.
+        let base = unsafe { libc::mmap(ptr::null_mut(), whole, protection, reservation, -1, 0) };
+        if base == libc::MAP_FAILED {
+            return Err(failed("mmap(code and data)", 0, whole));
+        }
+        let views = || -> Result<(NonNull<u8>, NonNull<u8>), SysError> {
+            let call = "mmap(memfd, read and execute)";
+            let flags = libc::MAP_SHARED | libc::MAP_FIXED;
+            let protection = libc::PROT_READ | libc::PROT_EXEC;
+            // SAFETY: a shared mapping of the memfd over the reservation's code part, made
+            // above and named by nothing, so `MAP_FIXED` replaces nothing live.
+            let exec = unsafe { libc::mmap(base, len, protection, flags, fd.as_raw_fd(), 0) };
+            if exec != base {
                 return Err(failed(call, 0, len));
             }
-            NonNull::new(at.cast::<u8>()).ok_or(SysError { call, errno: 0, at: 0, len })
+            let call = "mmap(memfd, read and write)";
+            let protection = libc::PROT_READ | libc::PROT_WRITE;
+            // SAFETY: a shared mapping of the memfd at no fixed address; the result is checked.
+            let write = unsafe {
+                libc::mmap(ptr::null_mut(), len, protection, libc::MAP_SHARED, fd.as_raw_fd(), 0)
+            };
+            if write == libc::MAP_FAILED {
+                return Err(failed(call, 0, len));
+            }
+            // SAFETY: the write view just made; changes only what a fork gives the child.
+            if unsafe { libc::madvise(write, len, libc::MADV_DONTFORK) } != 0 {
+                let why = failed("madvise(MADV_DONTFORK)", 0, len);
+                // SAFETY: the write view just made, which nothing has written or named.
+                unsafe { libc::munmap(write, len) };
+                return Err(why);
+            }
+            match (NonNull::new(base.cast::<u8>()), NonNull::new(write.cast::<u8>())) {
+                (Some(exec), Some(write)) => Ok((exec, write)),
+                _ => Err(SysError { call, errno: libc::EFAULT, at: 0, len }),
+            }
         };
-        let exec = map(libc::PROT_READ | libc::PROT_EXEC, "mmap(memfd, read and execute)")?;
-        let write = match map(libc::PROT_READ | libc::PROT_WRITE, "mmap(memfd, read and write)") {
-            Ok(write) => write,
+        let (exec, write) = match views() {
+            Ok(views) => views,
             Err(why) => {
-                // SAFETY: the mapping made two lines up, which nothing has run or named.
-                unsafe { libc::munmap(exec.as_ptr().cast(), len) };
+                // SAFETY: the reservation made above, which nothing has run or named (the run
+                // view, if made, is inside it).
+                unsafe { libc::munmap(base, whole) };
                 return Err(why);
             }
         };
-        let code = Code { exec, write, fd, len };
+        let code = Code { exec, write, fd, len, data };
         // A process registers once before it may ask for the barrier; again is harmless.
         #[cfg(target_arch = "aarch64")]
         if !linux::membarrier(linux::REGISTER_PRIVATE_EXPEDITED_SYNC_CORE) {
@@ -643,23 +675,10 @@ impl Code {
         Ok(code)
     }
 
-    /// Runs `with` on the base of the writable mapping.
-    fn writable(&mut self, with: impl FnOnce(*mut u8)) {
-        with(self.write.as_ptr());
-    }
-
     /// Copies `bytes` to `at` and makes them runnable. The bytes are ones no thread can be
     /// running (the module's invariant).
     pub fn write(&mut self, at: usize, bytes: &[u8]) -> Result<(), SysError> {
-        self.within("write", at, bytes.len())?;
-        self.writable(|to| {
-            // SAFETY: `to + at .. + bytes.len()` is in the writable mapping (`within`);
-            // `bytes` is a live slice that cannot overlap it (the mapping is not borrowed as
-            // a slice anywhere); no thread reads these bytes (the module's invariant).
-            unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), to.add(at), bytes.len()) };
-        });
-        #[cfg(target_arch = "aarch64")]
-        linux::icache(self.base() + at, bytes.len());
+        self.copy(at, bytes)?;
         self.settle()
     }
 
@@ -669,11 +688,7 @@ impl Code {
     /// [`Code::settle`] once after the last, before any word names what was written. (One
     /// `membarrier` a function made a launcher's start of 210 functions 210 system calls.)
     pub fn copy(&mut self, at: usize, bytes: &[u8]) -> Result<(), SysError> {
-        self.within("write", at, bytes.len())?;
-        self.writable(|to| {
-            // SAFETY: as `write`'s copy.
-            unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), to.add(at), bytes.len()) };
-        });
+        self.put(at, bytes)?;
         #[cfg(target_arch = "aarch64")]
         linux::icache(self.base() + at, bytes.len());
         Ok(())

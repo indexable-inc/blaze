@@ -172,7 +172,8 @@ impl<T, const N: usize> FixedVec<T, N> {
         if index >= self.len {
             out_of_bounds("FixedVec::swap_remove", index, self.len);
         }
-        self.as_mut_slice().swap(index, self.len - 1);
+        let last = self.len - 1;
+        self.as_mut_slice().swap(index, last);
         let Some(value) = self.pop() else { unreachable!("`index < len`, so it held a value") };
         value
     }

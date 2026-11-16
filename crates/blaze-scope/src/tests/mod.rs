@@ -529,13 +529,13 @@ pub(crate) fn solve_with<F: ScopeFacts<Name = N>>(
         if owned.is_empty() {
             if let Some(owner) = first_needed {
                 stack[top].asks = asks;
-                stack.push(new_frame(w, owner, plant)?);
+                stack.push(new_frame(facts, owner, plant)?);
                 continue;
             }
         }
         let replies: Vec<Reply<'_, N>> =
             owned.iter().map(|(read, own)| Reply { read: *read, answer: own.answer() }).collect();
-        match step(&mut stack[top].m, w, &replies)? {
+        match step(&mut stack[top].m, facts, &replies)? {
             Out::Ask(reads) => stack[top].asks = reads,
             Out::Expand(calls) => {
                 let mut expanded = w.expanded.borrow_mut();
