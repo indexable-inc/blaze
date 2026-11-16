@@ -20,7 +20,7 @@ use core::{
     str::{self, Utf8Error},
 };
 
-use crate::{Box, Vec};
+use crate::{AllocFailure, Box, Vec};
 
 /// A growable UTF-8 string in `A`: std's `String` with an allocator.
 pub struct String<A: Allocator> {
@@ -59,15 +59,48 @@ impl<A: Allocator> String<A> {
         }
     }
 
+    /// An empty string in `alloc` with room for `capacity` bytes, or why there is none.
+    #[inline]
+    pub fn try_with_capacity_in(capacity: usize, alloc: A) -> Result<String<A>, AllocFailure> {
+        Ok(String { bytes: Vec::try_with_capacity_in(capacity, alloc)? })
+    }
+
+    /// A copy of `text` in `alloc`, or why there is no room for it.
+    #[inline]
+    pub fn try_from_str_in(text: &str, alloc: A) -> Result<String<A>, AllocFailure> {
+        let mut out = String::try_with_capacity_in(text.len(), alloc)?;
+        out.try_push_str(text)?;
+        Ok(out)
+    }
+
     #[inline]
     pub fn push(&mut self, ch: char) {
         let mut buffer = [0; 4];
         self.bytes.extend_from_slice(ch.encode_utf8(&mut buffer).as_bytes());
     }
 
+    /// [`String::push`], or why there is no room; the string is as it was.
+    #[inline]
+    pub fn try_push(&mut self, ch: char) -> Result<(), AllocFailure> {
+        let mut buffer = [0; 4];
+        self.try_push_str(ch.encode_utf8(&mut buffer))
+    }
+
     #[inline]
     pub fn push_str(&mut self, text: &str) {
         self.bytes.extend_from_slice(text.as_bytes());
+    }
+
+    /// [`String::push_str`], or why there is no room; the string is as it was.
+    #[inline]
+    pub fn try_push_str(&mut self, text: &str) -> Result<(), AllocFailure> {
+        self.bytes.try_extend_from_slice(text.as_bytes())
+    }
+
+    /// [`String::reserve`], or why there is no room; the string is as it was.
+    #[inline]
+    pub fn try_reserve(&mut self, additional: usize) -> Result<(), AllocFailure> {
+        self.bytes.try_reserve(additional)
     }
 
     #[inline]

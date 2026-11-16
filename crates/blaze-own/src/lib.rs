@@ -20,19 +20,26 @@
 //! | [`Cow`] | borrowed or owned, copied into the allocator the caller names when it must own |
 //! | [`Soa`], [`soa!`] | a struct-of-arrays vector: one packed column per field in one allocation; the macro names its rows and columns |
 //! | [`String`], [`format_in!`], [`format_into!`] | UTF-8 text over [`Vec<u8, A>`](Vec); `blaze_mem` re-exports it, keeping only `OsString` and `PathBuf` |
+//! | [`FixedVec`] | up to `N` values inline, no allocator; a push past `N` is refused with [`Full`], the value handed back |
+//! | [`Inline`] | an allocator over a buffer inside itself (`&Inline<BYTES>`), so any of these lives on the stack; refuses when full, never falls back |
 //!
-//! The one cargo feature, `std` (off by default; blaze-mem turns it on), adds what only this
-//! crate may write by the orphan rule and only std has: `AsRef<OsStr>` and `AsRef<Path>` for
-//! [`String`]. Nothing else of std is used.
+//! The cargo feature `std` (off by default; blaze-mem turns it on) adds what only this crate
+//! may write by the orphan rule and only std has: `AsRef<OsStr>` and `AsRef<Path>` for
+//! [`String`]. Nothing else of std is used. The feature `testing` adds [`testing`]: a leak-
+//! and misuse-counting allocator, one that refuses the n-th allocation, and `every_failure`,
+//! which runs a closure once per allocation with that one refused (after Zig's
+//! `std.testing.allocator` and `checkAllAllocationFailures`).
 //!
 //! # Allocation failure
 //!
-//! The convention is `blaze_mem`'s: an infallible call (`push`, `reserve`, `new_in`) that
-//! cannot get memory panics with an [`AllocFailure`] naming the type and the layout
-//! (`fail`), which fails its own job (rule 20), never an abort; each has a `try_` form that
-//! returns the [`AllocFailure`] instead and leaves the value as it was. A count that would
-//! overflow (a reference count past `isize::MAX`) aborts, as std's does: by then the count is
-//! wrong for every owner, which no one job's failure can contain.
+//! An infallible call (`push`, `reserve`, `new_in`) that cannot get memory panics with an
+//! [`AllocFailure`] naming the type and the layout (`fail`), which fails its own job (rule
+//! 20), never an abort; each has a `try_` form that returns the [`AllocFailure`] (or a
+//! [`Refused`] with the value handed back) and leaves the value as it was, which the tests
+//! hold under `testing::every_failure`. The rule that follows: library code calls the `try_`
+//! forms and returns the failure; only a binary's top decides that a refusal stops it. A count
+//! that would overflow (a reference count past `isize::MAX`) aborts, as std's does: by then
+//! the count is wrong for every owner, which no one job's failure can contain.
 //!
 //! # Nightly features
 //!
@@ -56,7 +63,7 @@
 //! Every `unsafe` block states the invariant it relies on in a `// SAFETY:` comment. Buffers
 //! are allocated, grown and freed only in [`RawBuf`] and in the struct-of-arrays core
 //! ([`Soa`], whose [`soa!`] wrappers are safe code); [`Box`], [`Arc`] and [`Rc`] allocate their one block each in their own
-//! module. Panic-safety guards are `core::mem::DropGuard`s; a hand-written guard says why.
+//! module; [`FixedVec`] keeps its slots inline and [`Inline`] hands out ranges of its own buffer. Panic-safety guards are `core::mem::DropGuard`s; a hand-written guard says why.
 //!
 //! # Send and Sync
 //!
@@ -92,11 +99,14 @@ pub mod boxed;
 pub mod cow;
 pub mod deque;
 mod error;
+pub mod fixed;
 pub mod raw;
 pub mod rc;
 #[macro_use]
 pub mod soa;
 pub mod sorted;
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
 pub mod text;
 pub mod vec;
 
@@ -109,6 +119,7 @@ pub use boxed::{Box, CallOnce};
 pub use cow::{Cow, ToOwnedIn};
 pub use deque::VecDeque;
 pub use error::AllocFailure;
+pub use fixed::{FixedVec, Full, Inline};
 pub use raw::RawBuf;
 pub use rc::Rc;
 pub use soa::Soa;

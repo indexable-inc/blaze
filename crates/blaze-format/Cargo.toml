@@ -14,9 +14,10 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+# The records, views and writer; this crate re-exports them at their old paths. `alloc` for
+# `Writer`'s default and `Persist`, `serde` for the serde forms its users persist.
+blaze-format-core = { workspace = true, features = ["alloc", "serde"] }
 blaze-ids.workspace = true
-blaze-serde.workspace = true
-serde = { workspace = true, features = ["derive"] }
 zstd.workspace = true
 
 [dev-dependencies]

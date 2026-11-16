@@ -8,7 +8,7 @@ use core::fmt;
 use blaze_own::Vec;
 
 use crate::{
-    def::{MacroDef, ProcKind},
+    def::{MacroDefinition, ProcKind},
     expansion::{TokenOrigin, Reads},
     tokens::TokenStream,
 };
@@ -33,7 +33,7 @@ pub trait ExpandCx {
     /// (`SemiOpaque`) or `def_site` (`Opaque`).
     fn run_proc_macro<A: Allocator + Clone>(
         &self,
-        def: &MacroDef<A>,
+        def: &MacroDefinition<A>,
         call: ProcCall<'_, A>,
         alloc: A,
     ) -> Result<Produced<A>, HostError>;

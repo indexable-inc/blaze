@@ -12,6 +12,7 @@
 //! and the path columns are laid out in the record's own order as it is written.
 
 use core::alloc::Allocator;
+use core::fmt;
 use core::mem::offset_of;
 
 use blaze_format::{FormatError, Record, Slice, Writer};
@@ -19,8 +20,8 @@ use blaze_id::{ContentId, CrateItemKey, ItemKey, Portable};
 use blaze_own::Vec;
 
 use crate::column::{
-    Column, NONE, RecordBytes, Strings, Text, at_of_record, check_text, finish_with, key_of_word,
-    key_word, text_of,
+    Column, NONE, RecordBytes, Strings, Text, at_of, at_of_record, check_text, finish_with,
+    key_of_word, key_word, text_of,
 };
 use crate::error::BuildError;
 use crate::kind::{
@@ -87,7 +88,7 @@ pub struct MacroRulesDecl<N> {
 /// An item-position macro call: a function-like call, an attribute macro on an item (the item
 /// is not a declared name until the call expands), or a derive.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub struct MacroCallDecl<N, P> {
+pub struct MacroCallDecl<P> {
     /// The call's identity: the key its expansion's items are keyed under.
     pub call: ItemKey,
     pub path: P,
@@ -96,10 +97,6 @@ pub struct MacroCallDecl<N, P> {
     /// The item an attribute or a derive is on, an index unique in the fragment: a derive's
     /// helper attributes are in scope for the attributes written after it on the same item.
     pub item: Option<u32>,
-    /// `N` names no field of a call; it is here so every declaration takes the same two
-    /// parameters.
-    #[doc(hidden)]
-    pub _name: core::marker::PhantomData<fn() -> N>,
 }
 
 /// A module's place in its crate, read from its parent's `mod` line and its own attributes.
@@ -128,7 +125,7 @@ pub struct DeclsBuilder<N, A: Allocator> {
     pub uses: Vec<UseDecl<N, Path<N, A>>, A>,
     pub extern_crates: Vec<ExternCrateDecl<N, Path<N, A>>, A>,
     pub macro_rules: Vec<MacroRulesDecl<N>, A>,
-    pub calls: Vec<MacroCallDecl<N, Path<N, A>>, A>,
+    pub calls: Vec<MacroCallDecl<Path<N, A>>, A>,
 }
 
 /// What a macro call's expansion adds to its module: the same shape as the module's own text.
@@ -466,7 +463,6 @@ impl<'a, A: Allocator + Clone> DeclsBuilder<&'a str, A> {
             kind: c.kind,
             pos: c.pos,
             item: c.item,
-            _name: core::marker::PhantomData,
         }));
         out
     }
@@ -617,7 +613,7 @@ impl<'a> ModuleDeclsView<'a> {
     }
 
     /// The item-position macro calls, in source order.
-    pub fn calls(&self) -> impl ExactSizeIterator<Item = MacroCallDecl<&'a str, PathView<'a>>> + use<'a> {
+    pub fn calls(&self) -> impl ExactSizeIterator<Item = MacroCallDecl<PathView<'a>>> + use<'a> {
         let paths = self.paths;
         self.calls.iter().map(move |row| MacroCallDecl {
             call: ItemKey(row.call),
@@ -625,7 +621,6 @@ impl<'a> ModuleDeclsView<'a> {
             kind: row.kind,
             pos: row.pos,
             item: (row.item != NONE).then_some(row.item),
-            _name: core::marker::PhantomData,
         })
     }
 }

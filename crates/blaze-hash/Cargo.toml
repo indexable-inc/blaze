@@ -14,18 +14,18 @@ repository.workspace = true
 doctest = false
 
 # Adapters to crates from outside the workspace, which the crates above turn on (the root
-# manifest's `blaze-hash` entry): with none on, this crate's one dependency is hashbrown, with
-# no dependency of its own (docs/v2/plan/design/bottom.md, "Also decided on 2026-11-15").
+# manifest's `blaze-hash` entry): with none on, this crate's dependencies are blaze-own and
+# blaze-swiss, workspace crates with no dependency from outside it (docs/v2/plan/design/bottom.md,
+# "Also decided on 2026-11-15").
 [features]
-# serde's forms of `Map` and `Set`.
-serde = ["dep:serde", "hashbrown/serde"]
+# serde's forms of `Map` and `Set`, written by hand in `hash_map` and `hash_set`.
+serde = ["dep:serde"]
 # `SharedMap`, `SharedSet` and `SharedByHash`: papaya's lock-free tables on these hashers.
 shared = ["dep:papaya"]
 
 [dependencies]
-# Named here, not `.workspace`: the workspace entry would turn on its `serde` feature for every
-# crate, which this crate's own graph must not hold. The same version and features otherwise.
-hashbrown = { version = "0.17.1", default-features = false, features = ["inline-more", "nightly"] }
+blaze-own.workspace = true
+blaze-swiss.workspace = true
 papaya = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
 

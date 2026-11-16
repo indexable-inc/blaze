@@ -42,17 +42,13 @@ impl UnstableFeatures {
     }
 }
 
-#[blaze_memo::tracked]
 impl UnstableFeatures {
     /// Query unstable features for a crate.
     ///
-    /// This is also available as `DefMap::features()`. Use that if you have a DefMap available.
-    /// Otherwise, use this, to not draw a dependency to the def map. While the crate's own def
-    /// map is being built (a proc macro it calls), use [`UnstableFeatures::of_root`].
-    #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
-    pub fn query(db: &Db, krate: Crate) -> UnstableFeatures {
-        // clone: once per def-map change of the crate; the copy lets its readers backdate
-        crate::crate_def_map(db, krate).features().clone()
+    /// The same as `DefMap::features(db)`: the crate's attributes' features
+    /// ([`crate::nameres::crate_attrs::crate_attrs`]), a typed stop for a crate without text.
+    pub fn query(db: &Db, krate: Crate) -> &UnstableFeatures {
+        &crate::nameres::crate_attrs::crate_attrs(db, krate).unstable_features
     }
 }
 

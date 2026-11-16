@@ -2001,4 +2001,159 @@ mod tests {
             "two instances' writable objects are two"
         );
     }
+
+    /// How the renaming property's run instantiates: with each instance's own references, or
+    /// with two places swapped (the planted bug a merged memo would have if it bound places
+    /// to the wrong targets).
+    #[derive(Clone, Copy, Debug)]
+    enum Binding {
+        Own,
+        Swapped,
+    }
+
+    /// The shape of a generated function: its code length, and per relocation its offset,
+    /// kind, place and addend; per data pointer the place it points at.
+    struct Drawn {
+        len: u32,
+        rows: Vec<(u32, RelocKind, usize, i64)>,
+        data: Option<usize>,
+        refs: usize,
+    }
+
+    fn drawn(tape: &blaze_sim::Tape) -> Drawn {
+        let refs = tape.int_in(1usize..=5, "references");
+        let fields = tape.int_in(1u32..=6, "fields");
+        let rows = (0..fields)
+            .map(|at| {
+                let kind = *tape.one_of(&[RelocKind::Abs64, RelocKind::PcRel32], "kind");
+                let place = tape.int_in(0..=refs - 1, "place");
+                let addend = tape.int_in(-64i64..=64, "addend");
+                (8 * at, kind, place, addend)
+            })
+            .collect();
+        let data = tape.option("data", |tape| tape.int_in(0..=refs - 1, "data's place"));
+        // Eight bytes per field, eight for the data's, and a `ret`.
+        Drawn { len: 8 * fields + 8 + 1, rows, data, refs }
+    }
+
+    /// Instance `n` of `drawn`: its references distinct, of kinds drawn by place, its code
+    /// and relocations the drawn ones over them.
+    fn instance(drawn: &Drawn, kinds: &[u8], n: u8) -> (CompiledFunction, Vec<Target>) {
+        let refs: Vec<Target> = (0..drawn.refs)
+            .map(|at| {
+                let id = ContentId([n.wrapping_mul(31).wrapping_add(at as u8 + 1); 32]);
+                match kinds[at] % 3 {
+                    0 => Target::Function(InstanceKey(id)),
+                    1 => Target::Static { item: ItemKey(id), instance: ContentId([n; 32]) },
+                    _ => Target::Extern(format!("symbol_{n}_{at}")),
+                }
+            })
+            .collect();
+        let mut relocs: Vec<Relocation> = drawn
+            .rows
+            .iter()
+            .map(|&(at, kind, place, addend)| Relocation {
+                at,
+                kind,
+                target: refs[place].clone(),
+                addend,
+            })
+            .collect();
+        let data: Vec<Data> = drawn
+            .data
+            .map(|place| {
+                let to = Relocation {
+                    at: 0,
+                    kind: RelocKind::Abs64,
+                    target: refs[place].clone(),
+                    addend: 0,
+                };
+                Data::new(8, vec![0; 8], vec![to].into())
+            })
+            .into_iter()
+            .collect();
+        if let Some(it) = data.first() {
+            // In the eight bytes past the drawn fields, which `drawn` keeps for it.
+            relocs.push(Relocation {
+                at: drawn.len - 9,
+                kind: RelocKind::PcRel32,
+                target: Target::Data(it.id),
+                addend: -4,
+            });
+        }
+        let mut code = vec![0x90; drawn.len as usize];
+        for row in &relocs {
+            let len = if row.kind == RelocKind::Abs64 { 8 } else { 4 };
+            code[row.at as usize..row.at as usize + len].fill(0);
+        }
+        let function = CompiledFunction {
+            key: InstanceKey(ContentId([200u8.wrapping_add(n); 32])),
+            arch: Arch::X86_64,
+            align: 16,
+            code,
+            relocs: relocs.into(),
+            data,
+            inlined: Vec::new(),
+            side: None,
+            unwind: None,
+            lines: Vec::new(),
+            coverage: None,
+            profile: None,
+        };
+        (function, refs)
+    }
+
+    /// Instances equal up to which targets fill their places share one template, and each
+    /// instantiated from it is itself: merging by shape changes no instance.
+    fn merged_behave_as_unmerged(
+        tape: &blaze_sim::Tape,
+        binding: Binding,
+    ) -> Result<(), blaze_sim::Broke> {
+        let drawn = drawn(tape);
+        let kinds: Vec<u8> = (0..drawn.refs).map(|_| tape.int_in(0u8..=2, "kind")).collect();
+        let count = tape.int_in(2u8..=4, "instances");
+        let instances: Vec<_> = (0..count).map(|n| instance(&drawn, &kinds, n)).collect();
+        let harness = |why: TemplateError| blaze_sim::Broke::Harness(format!("{why}"));
+        let (first, first_refs) = &instances[0];
+        let merged = Template::of(first, first_refs, &[]).map_err(harness)?;
+        for (function, refs) in &instances {
+            let own = Template::of(function, refs, &[]).map_err(harness)?;
+            if own != merged {
+                return Err(blaze_sim::Broke::Oracle(format!(
+                    "two instances equal up to renaming made two templates: {own:?} and {merged:?}"
+                )));
+            }
+            let mut given = refs.clone();
+            if let Binding::Swapped = binding
+                && given.len() > 1
+            {
+                given.swap(0, 1);
+            }
+            let back = merged.instantiate(function.key, &given).map_err(harness)?;
+            if back != *function {
+                return Err(blaze_sim::Broke::Oracle(format!(
+                    "an instance from the merged template differs from its own compile: {back:?} against {function:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn merged_instances_behave_as_unmerged() {
+        blaze_sim::check(blaze_sim::Config::cases(256), |tape| {
+            merged_behave_as_unmerged(tape, Binding::Own)
+        });
+    }
+
+    #[test]
+    fn the_oracle_catches_places_bound_to_the_wrong_targets() {
+        blaze_sim::control(
+            blaze_sim::Config::cases(256),
+            Binding::Own,
+            Binding::Swapped,
+            "differs from its own compile",
+            merged_behave_as_unmerged,
+        );
+    }
 }

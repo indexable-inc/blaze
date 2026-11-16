@@ -512,15 +512,31 @@ impl<T, A: Allocator> Vec<T, A> {
 
     /// Drops each value that `same` says belongs with the last one kept before it: `same(value,
     /// kept)`. Panic safety as [`Vec::retain_mut`].
-    pub fn dedup_by(&mut self, mut same: impl FnMut(&mut T, &mut T) -> bool) {
-        let len = self.len;
-        if len <= 1 {
+    pub fn dedup_by(&mut self, same: impl FnMut(&mut T, &mut T) -> bool) {
+        self.dedup_range_by(.., same);
+    }
+
+    /// [`Vec::dedup_by`] inside `range` only: the values after it move down to close the gaps.
+    /// With a sort of the same range through the slice it is a sorted set in a vector's tail:
+    /// `v[from..].sort_unstable(); v.dedup_range(from..)`.
+    ///
+    /// # Panics
+    ///
+    /// When `range` is backwards or ends past the length.
+    #[track_caller]
+    pub fn dedup_range_by<R: RangeBounds<usize>>(&mut self, range: R, mut same: impl FnMut(&mut T, &mut T) -> bool) {
+        let Range { start, end } = range_of(&range, self.len, "Vec::dedup_range_by");
+        if end - start <= 1 {
             return;
         }
+        let len = self.len;
         let base = self.buf.ptr();
         self.len = 0;
-        let mut at = DropGuard::new(Compact { vec: self, read: 1, write: 1, len }, Compact::finish);
-        while at.read < len {
+        // The first value of the range is kept; values before it are kept untouched, and the
+        // guard moves the values from `read` on (the rest of the range, then the tail) down.
+        let first = start + 1;
+        let mut at = DropGuard::new(Compact { vec: self, read: first, write: first, len }, Compact::finish);
+        while at.read < end {
             // SAFETY: slot `read < len` holds a value not yet seen, and slot `write - 1 < read`
             // the last one kept: two distinct values.
             let (value, kept) = unsafe { (&mut *base.add(at.read), &mut *base.add(at.write - 1)) };
@@ -550,6 +566,15 @@ impl<T, A: Allocator> Vec<T, A> {
         T: PartialEq,
     {
         self.dedup_by(|value, kept| *value == *kept);
+    }
+
+    /// Drops consecutive equal values but the first, inside `range` only.
+    #[track_caller]
+    pub fn dedup_range<R: RangeBounds<usize>>(&mut self, range: R)
+    where
+        T: PartialEq,
+    {
+        self.dedup_range_by(range, |value, kept| *value == *kept);
     }
 
     /// The values as a `Box<[T], A>`, its room shrunk to its length.

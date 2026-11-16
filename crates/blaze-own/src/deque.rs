@@ -20,7 +20,11 @@ use core::{
 
 #[cfg(test)]
 use crate::plant::{self, Plant};
-use crate::{error::AllocFailure, raw::RawBuf, vec::out_of_bounds};
+use crate::{
+    error::AllocFailure,
+    raw::RawBuf,
+    vec::{Refused, out_of_bounds},
+};
 
 /// A ring of `T` in `A`.
 ///
@@ -140,6 +144,30 @@ impl<T, A: Allocator> VecDeque<T, A> {
         // SAFETY: `len < capacity`, so the slot after the back is in the buffer and empty.
         unsafe { ptr::write(self.at(slot), value) };
         self.len += 1;
+    }
+
+    /// [`VecDeque::push_back`], or the value back with why there was no room; the deque is as
+    /// it was.
+    pub fn try_push_back(&mut self, value: T) -> Result<(), Refused<T>> {
+        if self.len == self.buf.capacity()
+            && let Err(why) = self.try_reserve(1)
+        {
+            return Err(Refused { value, why });
+        }
+        self.push_back(value);
+        Ok(())
+    }
+
+    /// [`VecDeque::push_front`], or the value back with why there was no room; the deque is as
+    /// it was.
+    pub fn try_push_front(&mut self, value: T) -> Result<(), Refused<T>> {
+        if self.len == self.buf.capacity()
+            && let Err(why) = self.try_reserve(1)
+        {
+            return Err(Refused { value, why });
+        }
+        self.push_front(value);
+        Ok(())
     }
 
     pub fn push_front(&mut self, value: T) {

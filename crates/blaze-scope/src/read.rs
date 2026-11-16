@@ -3,7 +3,9 @@
 
 use blaze_id::{ContentId, ItemKey};
 
-use crate::scope::{BindingState, Def, ExportEntry, Namespace, TextualDef, Visibility, VisibilityClass};
+use blaze_surface::{
+    Binding, BindingState, Def, ExportEntry, Namespace, TextualDef, Visibility, VisibilityClass,
+};
 
 /// A read of another module's records.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -41,6 +43,17 @@ pub enum NameAnswer {
     /// No binding of the name: a negative read, kept in the read list like any other.
     Absent,
     Found { def: Def, vis: Visibility, state: BindingState },
+}
+
+impl From<Option<Binding>> for NameAnswer {
+    /// What a scope's binding of the name answers: `NameAnswer::from(view.get(ns, name))` over
+    /// a `ModuleScope` record, or over a working form's `get(..).copied()`.
+    fn from(binding: Option<Binding>) -> NameAnswer {
+        match binding {
+            Some(b) => NameAnswer::Found { def: b.def, vis: b.vis, state: b.state },
+            None => NameAnswer::Absent,
+        }
+    }
 }
 
 /// The answer to one read.

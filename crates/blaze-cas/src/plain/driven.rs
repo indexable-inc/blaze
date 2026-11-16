@@ -192,7 +192,9 @@ impl Driven<Native> {
             boot: boot().unwrap_or(nonce),
             nonce,
             durable: settings.durable,
-            page: blaze_mem::page_size() as u32,
+            // The store's own root, in the spelling it was opened by; the caller adds the
+            // checkout's and the home's ([`Driven::machine`]).
+            machine: vec![root.as_os_str().as_encoded_bytes().to_vec()],
             writes: settings.writes(),
             reads: settings.reads(),
         };
@@ -387,6 +389,27 @@ impl<D: Driver> Driven<D> {
             }
         }
         Ok(out)
+    }
+
+    /// The exit tail sealed ([`Plain::seal`]): a command calls it after it answered, before or
+    /// beside [`Driven::compact`], on a lowered thread. One barrier per segment this boot wrote
+    /// and none sealed, then one flip; the next boot's open proves them with no byte read.
+    /// Whether anything was sealed.
+    pub fn seal(&mut self) -> Result<bool, StoreError> {
+        lower_this_thread()?;
+        if !self.core.seal(&mut self.effects) {
+            return Ok(false);
+        }
+        self.run("sealing the exit tail")?;
+        Ok(true)
+    }
+
+    /// Adds `paths` (the checkout's, the home's, in each spelling the caller knows) to what a
+    /// put into a shared namespace is scanned for ([`super::PlainConfig::machine`]).
+    pub fn machine(&mut self, paths: &[&Path]) {
+        for path in paths {
+            self.core.machine(path.as_os_str().as_encoded_bytes().to_vec());
+        }
     }
 
     /// Fetches what `source` holds of `keys` in `namespace` (one of the namespaces the store

@@ -894,12 +894,18 @@ macro_rules! soa {
     (
         $(#[$meta:meta])*
         $vis:vis struct $Row:ident, $Vec:ident, $Ref:ident {
-            $( $fvis:vis $field:ident : $ty:ty => $cols:ident / $cols_mut:ident ),+ $(,)?
+            $(
+                $(#[$fmeta:meta])*
+                $fvis:vis $field:ident : $ty:ty => $cols:ident / $cols_mut:ident
+            ),+ $(,)?
         }
     ) => {
+        // The row's attributes (docs, derives) and each field's go on the row struct only: the
+        // reference row and the vector are the macro's, and an attribute such as a derive's
+        // helper need not mean anything on them.
         $(#[$meta])*
         $vis struct $Row {
-            $( $fvis $field: $ty, )+
+            $( $(#[$fmeta])* $fvis $field: $ty, )+
         }
 
         #[doc = concat!("One row of a `", stringify!($Vec), "`, by reference.")]

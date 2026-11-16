@@ -340,6 +340,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f2032f911046de80f0a198e0901378627c33f59ea0ac00e363d481118bd70a53"
 
 [[package]]
+name = "base-db"
+version = "0.0.0"
+dependencies = [
+ "blaze-core",
+ "blaze-format",
+ "blaze-hash",
+ "blaze-id",
+ "blaze-ids",
+ "blaze-mem",
+ "blaze-memo",
+ "blaze-surface",
+ "cfg",
+ "indexmap",
+ "intern",
+ "semver",
+ "span",
+ "syntax",
+ "triomphe",
+]
+
+[[package]]
 name = "base64"
 version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -393,6 +414,14 @@ dependencies = [
  "serde",
  "serde_json",
  "toml",
+]
+
+[[package]]
+name = "blaze-base64"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -483,7 +512,6 @@ name = "blaze-check"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
- "blaze-hash",
  "blaze-rng",
  "libc",
  "parking_lot",
@@ -533,6 +561,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-deflate"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+ "blaze-sim",
+ "miniz_oxide",
+]
+
+[[package]]
+name = "blaze-drive"
+version = "0.0.0"
+dependencies = [
+ "blaze-format",
+ "blaze-id",
+ "blaze-ids",
+ "blaze-own",
+ "blaze-run",
+ "blaze-scope",
+ "blaze-sim",
+ "blaze-surface",
+]
+
+[[package]]
 name = "blaze-expand"
 version = "0.0.0"
 dependencies = [
@@ -540,7 +591,9 @@ dependencies = [
  "blaze-id",
  "blaze-ids",
  "blaze-mem",
+ "blaze-own",
  "blaze-sim",
+ "blaze-surface",
  "intern",
  "mbe",
  "span",
@@ -575,9 +628,12 @@ dependencies = [
 name = "blaze-file-items"
 version = "0.0.0"
 dependencies = [
+ "blaze-format",
  "blaze-hash",
  "blaze-ids",
+ "blaze-own",
  "blaze-sim",
+ "blaze-surface",
  "parser",
 ]
 
@@ -614,12 +670,20 @@ name = "blaze-format"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
+ "blaze-format-core",
  "blaze-ids",
- "blaze-serde",
  "blaze-sim",
  "blaze-v2-proof",
- "serde",
  "zstd",
+]
+
+[[package]]
+name = "blaze-format-core"
+version = "0.0.0"
+dependencies = [
+ "blaze-ids",
+ "blaze-own",
+ "serde",
 ]
 
 [[package]]
@@ -698,9 +762,10 @@ name = "blaze-hash"
 version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
+ "blaze-own",
  "blaze-sim",
+ "blaze-swiss",
  "foldhash",
- "hashbrown 0.17.1",
  "indexmap",
  "papaya",
  "serde",
@@ -804,6 +869,7 @@ dependencies = [
  "blaze-format",
  "blaze-id",
  "blaze-sim",
+ "blaze-surface",
 ]
 
 [[package]]
@@ -831,6 +897,10 @@ dependencies = [
  "parking_lot",
  "windows-sys 0.61.2",
 ]
+
+[[package]]
+name = "blaze-int"
+version = "0.0.0"
 
 [[package]]
 name = "blaze-kernel"
@@ -942,6 +1012,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
  "blaze-check",
+ "blaze-own",
  "blaze-reclaim",
  "blaze-rng",
  "blaze-sim",
@@ -1173,6 +1244,9 @@ dependencies = [
 name = "blaze-run"
 version = "0.0.0"
 dependencies = [
+ "blaze-format",
+ "blaze-hash",
+ "blaze-own",
  "blaze-sim",
 ]
 
@@ -1182,7 +1256,9 @@ version = "0.0.0"
 dependencies = [
  "blaze-hash",
  "blaze-id",
+ "blaze-own",
  "blaze-sim",
+ "blaze-surface",
 ]
 
 [[package]]
@@ -1206,6 +1282,14 @@ dependencies = [
  "regex",
  "serde_json",
  "toml",
+]
+
+[[package]]
+name = "blaze-semver"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -1308,6 +1392,7 @@ dependencies = [
  "blaze-http",
  "blaze-ids",
  "blaze-mem",
+ "blaze-own",
  "blaze-phf",
  "blaze-radix",
  "blaze-reclaim",
@@ -1354,6 +1439,7 @@ dependencies = [
  "blaze-format",
  "blaze-hash",
  "blaze-id",
+ "blaze-own",
  "blaze-sim",
 ]
 
@@ -1363,6 +1449,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-alloc-count",
  "blaze-check",
+ "blaze-own",
  "blaze-rng",
  "blaze-sim",
 ]
@@ -1372,6 +1459,14 @@ name = "blaze-sys"
 version = "0.0.0"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "blaze-typeck"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -1425,6 +1520,14 @@ name = "blaze-wasi"
 version = "0.0.0"
 dependencies = [
  "wasmtime",
+]
+
+[[package]]
+name = "blaze-watch"
+version = "0.0.0"
+dependencies = [
+ "blaze-own",
+ "blaze-sim",
 ]
 
 [[package]]

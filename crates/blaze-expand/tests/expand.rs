@@ -10,11 +10,15 @@ use blaze_expand::{
     AlsoCopy, BuiltinDerive, BuiltinFn, Call, CallKind, CallShape, CallSite, Constness, Ctx, DefAt,
     DefSite, Delim, DeriveFacts, Diagnostic, Eager, Edition, ExpandCx, ExpandError, Expanded,
     Expansion, Export, Hole, HoleOf, HostAsk, HostError, HostWhy, IncludeAs, Included, Inside,
-    LitKind, LocalInner, MacroDef, MarkOf, NestedKind, TokenOrigin, Place, PlaceOf, ProcCall, ProcKind,
+    LitKind, LocalInner, MacroDefinition, MarkOf, NestedKind, TokenOrigin, Place, PlaceOf, ProcCall, ProcKind,
     Produced, Raw, ReadAnswer, ReadKind, Reads, Spacing, TokenKind, TokenStream, call_key, expand,
     expansion_key, find_calls, lex,
 };
-use blaze_id::{ContentId, CrateItemKey};
+use blaze_expand::{DefinitionError, DefinitionRecords, stream_record_id};
+use blaze_format::Aligned;
+use blaze_id::{ContentId, CrateItemKey, ItemKey};
+use blaze_own::Vec as OwnVec;
+use blaze_surface::{BuildError, MacroDefView};
 use blaze_sim::{Broke, Config, Tape};
 
 /// The outside of the tests' expansions: fixed env vars, files, enabled cfg names and a
@@ -72,12 +76,12 @@ impl ExpandCx for TestCx {
 
     fn run_proc_macro<A: Allocator + Clone>(
         &self,
-        def: &MacroDef<A>,
+        def: &MacroDefinition<A>,
         call: ProcCall<'_, A>,
         alloc: A,
     ) -> Result<Produced<A>, HostError> {
         let mut tokens = TokenStream::new_in(alloc.clone());
-        let mut origins = Vec::new_in(alloc.clone());
+        let mut origins = OwnVec::new_in(alloc.clone());
         for at in 0..call.input.len() {
             tokens.push_from(call.input, at).map_err(|_| FAILED)?;
             origins.push(TokenOrigin::Input(u32::try_from(at).map_err(|_| FAILED)?));
@@ -111,12 +115,12 @@ fn tokens(text: &str) -> TokenStream<Global> {
     lex(text, Edition::E2021, Global).expect("the test's text lexes")
 }
 
-fn rules(body: &str, krate: u8) -> MacroDef<Global> {
-    MacroDef::rules(tokens(body), at(krate))
+fn rules(body: &str, krate: u8) -> MacroDefinition<Global> {
+    MacroDefinition::rules(tokens(body), at(krate))
 }
 
-fn builtin(which: BuiltinFn) -> MacroDef<Global> {
-    MacroDef::builtin_fn(which, at(1), Global)
+fn builtin(which: BuiltinFn) -> MacroDefinition<Global> {
+    MacroDefinition::builtin_fn(which, at(1), Global)
 }
 
 fn done(expanded: Result<Expanded<Global>, ExpandError>) -> Expansion<Global> {
@@ -129,7 +133,7 @@ fn done(expanded: Result<Expanded<Global>, ExpandError>) -> Expansion<Global> {
 }
 
 /// Expands `m!(args)` of `def` where it is written.
-fn call_fn(def: &MacroDef<Global>, args: &str, cx: &TestCx) -> Expansion<Global> {
+fn call_fn(def: &MacroDefinition<Global>, args: &str, cx: &TestCx) -> Expansion<Global> {
     let input = tokens(args);
     done(expand(def, &Call::fn_like(&input, site()), cx, Global))
 }
@@ -210,17 +214,17 @@ fn dollar_crate_carries_the_defining_crate() {
 
 /// `m!(args)` in `source` at whatever offset, its args cut out as the reader would.
 fn expand_in_source(
-    def: &MacroDef<Global>,
+    def: &MacroDefinition<Global>,
     source: &str,
     cx: &TestCx,
-) -> (Expansion<Global>, Vec<u8, Global>, blaze_expand::ExpansionKey) {
+) -> (Expansion<Global>, OwnVec<u8, Global>, blaze_expand::ExpansionKey) {
     let file = tokens(source);
     let calls = find_calls(&file, Global).expect("the file's calls are found");
     let call = calls.iter().find(|it| it.kind == NestedKind::FnLike).expect("one call");
     let input = file.copy_in(call.inner().to_usize(), Global).expect("the args copy");
     let call = Call::fn_like(&input, site());
     let exp = done(expand(def, &call, cx, Global));
-    let mut bytes = Vec::new_in(Global);
+    let mut bytes = OwnVec::new_in(Global);
     exp.encode(&mut bytes);
     let key = expansion_key(def, &call, &exp.reads);
     (exp, bytes, key)
@@ -471,7 +475,7 @@ fn derive(which: BuiltinDerive, item: &str) -> Expansion<Global> {
 
 fn derive_with(which: BuiltinDerive, item: &str, facts: DeriveFacts) -> Expansion<Global> {
     let cx = TestCx::new();
-    let def = MacroDef::builtin_derive(which, at(1), Global);
+    let def = MacroDefinition::builtin_derive(which, at(1), Global);
     let item = tokens(item);
     let call =
         Call { kind: CallKind::Derive { item: &item, facts }, site: site(), eager: Eager::plain() };
@@ -493,7 +497,7 @@ fn clone_of_a_copy_type_without_type_parameters_is_star_self() {
     assert!(text.contains("$crate :: clone :: Clone :: clone ( a_self )"), "{text}");
     // The facts are in the key.
     let item = tokens("struct S { a: u8 }");
-    let def = MacroDef::builtin_derive(BuiltinDerive::Clone, at(1), Global);
+    let def = MacroDefinition::builtin_derive(BuiltinDerive::Clone, at(1), Global);
     let call = |facts| Call {
         kind: CallKind::Derive { item: &item, facts },
         site: site(),
@@ -593,7 +597,7 @@ fn an_attribute_call_takes_its_args_and_item() {
     let cx = TestCx::new();
     let krate = CrateItemKey(ContentId([9; 32]));
     let def =
-        MacroDef::proc_macro(krate, ProcKind::Attr, "echo", &[], at(9), Global).expect("names fit");
+        MacroDefinition::proc_macro(krate, ProcKind::Attr, "echo", &[], at(9), Global).expect("names fit");
     let args = tokens("x");
     let item = tokens("fn f() {}");
     let call = Call {
@@ -675,6 +679,54 @@ fn an_expansion_record_reads_back_equal_and_rewrites_equal_bytes() {
     }
 }
 
+/// A definition's records, read back: the `MacroDef` and its streams, each aligned.
+fn read_back(
+    def: &MacroDefinition<Global>,
+    records: &DefinitionRecords<Global>,
+) -> Result<MacroDefinition<Global>, DefinitionError> {
+    let head = Aligned::copy_from(&records.def);
+    let view = MacroDefView::read(&head).expect("a written record");
+    let body = records.body.as_ref().map(|(_, bytes)| Aligned::copy_from(bytes));
+    let params = records.params.as_ref().map(|(_, bytes)| Aligned::copy_from(bytes));
+    assert_eq!(view.head().content, def.content().0);
+    MacroDefinition::from(&view, body.as_deref(), params.as_deref(), Global)
+}
+
+#[test]
+fn a_macro_definition_reads_back_from_its_records() {
+    let krate = CrateItemKey(ContentId([9; 32]));
+    let derive =
+        MacroDefinition::proc_macro(krate, ProcKind::Derive, "Serialize", &["serde", "allow"], at(9), Global)
+            .expect("names fit");
+    let defs = [
+        rules("($x:expr) => { $x + 1 }", 1),
+        MacroDefinition::macro2(Some(tokens("$x:expr")), tokens("$x * 2"), at(2)),
+        builtin(BuiltinFn::Concat),
+        MacroDefinition::builtin_derive(BuiltinDerive::Clone, at(1), Global),
+        derive,
+    ];
+    let item = ItemKey(ContentId([5; 32]));
+    for def in &defs {
+        let name = def.proc_name().unwrap_or("m");
+        let records = def.write(item, name, None, Global).expect("a small definition");
+        let read = read_back(def, &records).expect("the records are one definition");
+        assert_eq!(read.content(), def.content());
+        assert_eq!((read.kind(), read.at(), read.transparency()), (def.kind(), def.at(), def.transparency()));
+        assert!(read.helpers().eq(def.helpers()) && read.proc_name() == def.proc_name());
+        // Written again, the records are the same bytes (rule 25).
+        let again = read.write(item, name, None, Global).expect("a small definition");
+        assert_eq!(again.def[..], records.def[..]);
+    }
+    // Control: a body record of another stream is refused by its digest, never read as the body.
+    let mut records = defs[0].write(item, "m", None, Global).expect("a small definition");
+    let other = tokens("() => {}").write_record(Global);
+    records.body = Some((stream_record_id(&other), other));
+    assert!(matches!(read_back(&defs[0], &records), Err(DefinitionError::Mismatch { .. })));
+    // A proc macro written under a name that is not its export name is refused.
+    let renamed = defs[4].write(item, "Deserialize", None, Global);
+    assert!(matches!(renamed.err(), Some(BuildError::Disagrees { .. })));
+}
+
 #[test]
 fn an_expansion_record_refuses_a_token_entry_it_does_not_write() {
     let exp = call_fn(&builtin(BuiltinFn::Stringify), "a", &TestCx::new());
@@ -720,7 +772,7 @@ fn keys_follow_expansions(tape: &Tape, key_of: KeyOf) -> Result<(), Broke> {
     let run = |env: &'static [(&'static str, &'static str)]| {
         let cx = TestCx { env, files: &[], cfgs: &[], line: 1 };
         let exp = done(expand(&def, &call, &cx, Global));
-        let mut bytes = Vec::new_in(Global);
+        let mut bytes = OwnVec::new_in(Global);
         exp.encode(&mut bytes);
         let key = match key_of {
             KeyOf::Record => expansion_key(&def, &call, &exp.reads).0,

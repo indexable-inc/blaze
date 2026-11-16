@@ -22,10 +22,11 @@ use blaze_keyed::{
 
 /// The format of a plain store's own files: its head slots and its manifests. Formats 1 and 2
 /// shared their number with the segments'; format 3 gives each retired row a mark, "lost, not
-/// yet reported" ([`LostMark`]), in the u32 that format 2 kept zero. A head or a manifest of
-/// another format is refused naming both; there is no migration: the store is rebuilt from
-/// what made it.
-pub const FORMAT: u32 = 3;
+/// yet reported" ([`LostMark`]), in the u32 that format 2 kept zero; format 4 adds a segment
+/// row's flag 4, sealed ([`Segment::sealed`]), which format 3 refused as a row no commit
+/// writes. A head or a manifest of another format is refused naming both; there is no
+/// migration: the store is rebuilt from what made it.
+pub const FORMAT: u32 = 4;
 
 /// The format of a plain segment, which outlives any one store (a published segment is shared
 /// through a bucket): its own number, so a change to the store's own files never changes a
@@ -552,6 +553,12 @@ pub struct Segment {
     /// It is in a shared bucket (pulled, or pushed): compaction never rewrites it, it only
     /// lets go of this machine's copy.
     pub published: bool,
+    /// Its bytes are on the media, in order before the flip that set this (store-next.md, the
+    /// exit tail): a barrier covered its file and completed before that flip was asked, or an
+    /// open of a later boot read it whole from the disk. An open of a new boot proves it by
+    /// this row with no byte read ([`super::verified::Verified::sealed`]); one not sealed, the
+    /// tail of the boot before, is checked whole as before.
+    pub sealed: bool,
 }
 
 impl Segment {
@@ -569,6 +576,7 @@ impl Segment {
             boot: 0,
             local: true,
             published: false,
+            sealed: false,
         }
     }
 
@@ -734,7 +742,7 @@ pub(crate) struct Manifest {
 impl Manifest {
     /// Bytes 0..4 magic `BLPM`, 4..8 format, 8..16 generation, 16..20 segments `s`, 20..24
     /// retired `r`, 24..28 roots `t`, 28..32 zero; then `s` x 80 (digest 32, length u64, index
-    /// offset u64, entries u32, flags u32 (1 here, 2 published), namespace u64, generation
+    /// offset u64, entries u32, flags u32 (1 here, 2 published, 4 sealed), namespace u64, generation
     /// u64, boot u64), `r` x 24 (id u64, 1 for a log u32, the mark u32 ([`LostMark::encode`]:
     /// zero for none, never set on a log), since ns u64), and `t` roots, each 32 key, 8
     /// generation, 2 name length, the name's UTF-8, zeros to a multiple of 8. Little-endian.
@@ -752,7 +760,7 @@ impl Manifest {
             out.extend_from_slice(&it.len.to_le_bytes());
             out.extend_from_slice(&it.index_at.to_le_bytes());
             out.extend_from_slice(&it.count.to_le_bytes());
-            out.extend_from_slice(&(u32::from(it.local) | u32::from(it.published) << 1).to_le_bytes());
+            out.extend_from_slice(&(u32::from(it.local) | u32::from(it.published) << 1 | u32::from(it.sealed) << 2).to_le_bytes());
             out.extend_from_slice(&it.namespace.0.to_le_bytes());
             out.extend_from_slice(&it.generation.to_le_bytes());
             out.extend_from_slice(&it.boot.to_le_bytes());
@@ -809,13 +817,14 @@ impl Manifest {
                 count: u32_at(bytes, at + 48),
                 local: flags & 1 != 0,
                 published: flags & 2 != 0,
+                sealed: flags & 4 != 0,
                 namespace: Namespace(u64_at(bytes, at + 56)),
                 generation: u64_at(bytes, at + 64),
                 boot: u64_at(bytes, at + 72),
             };
             let end = it.index_at.checked_add(u64::from(it.count) * ENTRY as u64 + FOOTER as u64);
-            if !it.index_at.is_multiple_of(ALIGN) || it.len > SEGMENT_MOST || end != Some(it.len) || it.generation > generation || flags > 3 {
-                return Err(bad("a segment row is not one a commit writes (its index unaligned, its length past 4 GiB or not its index's end, its generation newer than the manifest's, or flags past 3)", at));
+            if !it.index_at.is_multiple_of(ALIGN) || it.len > SEGMENT_MOST || end != Some(it.len) || it.generation > generation || flags > 7 {
+                return Err(bad("a segment row is not one a commit writes (its index unaligned, its length past 4 GiB or not its index's end, its generation newer than the manifest's, or flags past 7)", at));
             }
             segments.push(it);
         }
@@ -916,36 +925,44 @@ pub(crate) fn key_at(run: &[u8], i: usize) -> ContentId {
     id_at(run, i * ENTRY)
 }
 
-fn prefix_at(run: &[u8], i: usize) -> u64 {
-    u64::from_be_bytes(run[i * ENTRY..i * ENTRY + 8].try_into().expect("8 bytes"))
-}
-
 /// The position of `key` in `run`, entries sorted by key. Keys are hashes, spread evenly, so
 /// the first steps interpolate on their first eight bytes (about one probe of a page for a
 /// run of millions, where bisection takes some twenty); bisection finishes, so a run whose
 /// keys are not even still costs at most `3 + log2(n)` probes.
+///
+/// No entry is read but the probes (store-next.md): the bounds the guesses interpolate between
+/// start as the whole key space (`0`, `u64::MAX`) and become each probe's prefix as it narrows
+/// the range, so a lookup in a cold run reads the pages its probes land on and not the run's
+/// first and last (two pages a segment, before). Every entry in `lo..hi` has a prefix in
+/// `lo_p..=hi_p`, and `want` is in it too, so each guess is in `lo..hi`.
 pub(crate) fn find(run: &[u8], key: &ContentId) -> Option<usize> {
+    find_by(run.len() / ENTRY, key, |i| &run[i * ENTRY..i * ENTRY + 32])
+}
+
+/// [`find`] over `n` entries whose `i`th key `key_of` reads: the entries a lookup touches are
+/// the `i` it asks for, which a test counts as pages.
+pub(crate) fn find_by<'a>(n: usize, key: &ContentId, mut key_of: impl FnMut(usize) -> &'a [u8]) -> Option<usize> {
     let want = u64::from_be_bytes(key.0[0..8].try_into().expect("8 bytes"));
-    let (mut lo, mut hi) = (0usize, run.len() / ENTRY);
+    let prefix = |k: &[u8]| u64::from_be_bytes(k[0..8].try_into().expect("8 bytes"));
+    let (mut lo, mut hi) = (0usize, n);
+    let (mut lo_p, mut hi_p) = (0u64, u64::MAX);
     let mut guesses = 0;
     while lo < hi {
         let mid = if guesses < 3 && hi - lo > 8 {
             guesses += 1;
-            let (first, last) = (prefix_at(run, lo), prefix_at(run, hi - 1));
-            if want < first || want > last {
-                return None;
-            }
-            match last - first {
-                0 => lo + (hi - lo) / 2,
-                span => lo + ((u128::from(want - first) * (hi - 1 - lo) as u128) / u128::from(span)) as usize,
-            }
+            // want - lo_p <= hi_p - lo_p < span: the guess is below hi.
+            let span = u128::from(hi_p - lo_p) + 1;
+            lo + ((u128::from(want - lo_p) * (hi - lo) as u128) / span) as usize
         } else {
             lo + (hi - lo) / 2
         };
-        match run[mid * ENTRY..mid * ENTRY + 32].cmp(&key.0[..]) {
+        let probed = key_of(mid);
+        match probed.cmp(&key.0[..]) {
             Ordering::Equal => return Some(mid),
-            Ordering::Less => lo = mid + 1,
-            Ordering::Greater => hi = mid,
+            // Its key is below the one wanted: its prefix is at most want's.
+            Ordering::Less => (lo, lo_p) = (mid + 1, prefix(probed)),
+            // Above: its prefix is at least want's.
+            Ordering::Greater => (hi, hi_p) = (mid, prefix(probed)),
         }
     }
     None

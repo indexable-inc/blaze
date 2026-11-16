@@ -38,12 +38,8 @@ use crate::column::{
     index_of, index_word, text_of, wide,
 };
 use crate::error::BuildError;
-use crate::kind::{ItemIndex, ItemKind, Range, WrittenVis, WrittenVisTag, byte_enum};
-
 // `byte_enum!` names `fmt`, `Portable`, `FormatError` and `at_of` where it is called.
-const _: fn(&[u8], &[u8]) -> u64 = at_of;
-const _: Option<&dyn Portable> = None;
-const _: Option<fmt::Error> = None;
+use crate::kind::{ItemIndex, ItemKind, Range, WrittenVis, WrittenVisTag, byte_enum};
 
 /// What an entry is, and what each kind has that the others have not. Every range is relative
 /// to the entry's start. Its kind alone, the byte records and keys hold, is [`ItemDetail::kind`].
@@ -804,7 +800,8 @@ impl<'a> FileItemsView<'a> {
     }
 
     fn span(&self, span: AttrSpan) -> impl ExactSizeIterator<Item = Attr> + use<'a> {
-        self.attrs[span.to_usize()].iter().map(attr_of)
+        let attrs: &'a [AttrRow] = self.attrs;
+        attrs[span.to_usize()].iter().map(attr_of)
     }
 
     /// The attributes and doc comments of `item`, an entry of this file. Panics when its span
@@ -830,7 +827,8 @@ impl<'a> FileItemsView<'a> {
 
     /// The syntax errors: the parser's, in the order it found them, then the lexer's.
     pub fn errors(&self) -> impl ExactSizeIterator<Item = SyntaxError> + use<'a> {
-        self.errors.iter().map(error_of)
+        let errors: &'a [ErrorRow] = self.errors;
+        errors.iter().map(error_of)
     }
 
     /// What `error`, one of [`FileItemsView::errors`], says. Panics for an error of another

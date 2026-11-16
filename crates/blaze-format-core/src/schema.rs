@@ -320,6 +320,8 @@ const fn derive_key(context: &str, material: Input<'_>) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
+    use std::vec::Vec;
+
     use super::*;
 
     fn runtime(material: &[u8]) -> [u8; 32] {

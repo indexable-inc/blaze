@@ -14,21 +14,19 @@
 #![register_tool(blaze)]
 #![deny(unsafe_code)]
 
-use std::{fmt, hash, marker::PhantomData};
+use std::{alloc::Global, fmt, hash, marker::PhantomData};
 
-use blaze_swiss::Index;
-
-#[allow(
-    clippy::disallowed_types,
-    reason = "`Lock` is named only by `Shard::lock`, which allows it"
-)]
-use crate::{
-    b3::ContextKey,
+// The once-cell, the spin lock and the atomics are blaze-swiss's: `core`'s atomics, or the
+// model checker's in a model build (docs/v2/plan/design/model-checker.md, "The switch").
+use blaze_swiss::{
+    Index,
     sync::{
-        Lock, OnceLock,
+        Once, Spin,
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
 };
+
+use crate::b3::ContextKey;
 
 pub mod b3;
 pub mod bits;
@@ -41,7 +39,6 @@ pub mod names;
 pub use blaze_radix as radix;
 pub use blaze_rng as rng;
 mod std_hash;
-mod sync;
 // serde's forms of the IDs, for the crates above that persist them with serde: behind the
 // `serde` feature, which they turn on (the root manifest's entry), so this crate depends on no
 // crate from outside the workspace (docs/v2/plan/design/bottom.md, "Also decided on 2026-11-15").
@@ -148,12 +145,12 @@ pub fn index_key<'a>(
 /// millions of times is declared as (`pub static KEY: Domain = Domain::new("blaze v2 key 1")`).
 pub struct Domain {
     name: &'static str,
-    key: OnceLock<ContextKey>,
+    key: Once<ContextKey>,
 }
 
 impl Domain {
     pub const fn new(name: &'static str) -> Domain {
-        Domain { name, key: OnceLock::new() }
+        Domain { name, key: Once::new() }
     }
 
     pub fn name(&self) -> &'static str {
@@ -171,9 +168,9 @@ const DOMAIN_SLOTS: usize = 2048;
 
 /// The context key of each domain name hashed so far, open-addressed by the name's address:
 /// a slot once set never changes, so a lookup is acquire loads and compares.
-static DOMAIN_KEYS: DomainKeys = [const { OnceLock::new() }; DOMAIN_SLOTS];
+static DOMAIN_KEYS: DomainKeys = [const { Once::new() }; DOMAIN_SLOTS];
 
-type DomainKeys = [OnceLock<(&'static str, ContextKey)>; DOMAIN_SLOTS];
+type DomainKeys = [Once<(&'static str, ContextKey)>; DOMAIN_SLOTS];
 
 /// A domain's first slot, from its address and length, so a lookup reads none of its text: a
 /// domain hashed millions of times is one literal, found by a pointer compare. Hashing the text
@@ -367,7 +364,7 @@ pub const BLOCK: u32 = 64;
 /// writers rarely meet on one shard and each shard's table, copied under its lock to grow,
 /// stays small.
 pub fn shard_count() -> usize {
-    static COUNT: OnceLock<usize> = OnceLock::new();
+    static COUNT: Once<usize> = Once::new();
     *COUNT.get_or_init(|| {
         let cores = std::thread::available_parallelism().map_or(1, |it| it.get());
         (cores * 4).next_power_of_two().max(4)
@@ -379,7 +376,7 @@ pub fn shard_count() -> usize {
 const FIRST: usize = 64;
 const CHUNKS: usize = 27;
 
-type Chunks<T> = [OnceLock<Box<[OnceLock<(ContentId, T)>]>>; CHUNKS];
+type Chunks<T> = [Once<Box<[Once<(ContentId, T)>]>>; CHUNKS];
 
 /// The indices `next..end` a shard has claimed and not yet handed out.
 struct Claimed {
@@ -389,18 +386,18 @@ struct Claimed {
 
 /// One cache line pair per shard, so writers to neighbouring shards don't share a line.
 #[repr(align(128))]
-#[allow(
-    clippy::disallowed_types,
-    reason = "the one lock of `Sharded`: held only to probe again, insert and claim a block, never across a call (docs/v2/plan/design/concurrency.md); a find never takes it"
-)]
 struct Shard {
-    /// Held only to look again and insert.
-    lock: Lock<Claimed>,
+    /// The one lock of `Sharded`, held only to probe again, insert into the index and claim a
+    /// block of indices: a few hundred instructions, never across a call
+    /// (docs/v2/plan/design/concurrency.md), and a find never takes it. A spin lock, as
+    /// nothing below this crate parks a thread.
+    lock: Spin<Claimed>,
     /// How many values the shard has, written under `lock`.
     len: AtomicU32,
     /// The shard's values by [`probe_hash`]: a find is one control word and one slot, then
-    /// the slot's ID compared only on a tag match.
-    index: Index,
+    /// the slot's ID compared only on a tag match. On the global heap, as the interner's
+    /// chunks are.
+    index: Index<Global>,
 }
 
 /// Bits 64..128 of the ID: its probe's start (the low bits) and tag (the top seven). The shard
@@ -418,17 +415,16 @@ fn chunk_of(raw: u32) -> (usize, usize) {
 }
 
 impl<T: Send + Sync> Sharded<T> {
-    #[allow(clippy::disallowed_types, reason = "makes `Shard::lock`, which allows it")]
     pub fn new() -> Sharded<T> {
         let count = shard_count();
         Sharded {
-            slots: std::array::from_fn(|_| OnceLock::new()),
+            slots: std::array::from_fn(|_| Once::new()),
             next: AtomicU64::new(0),
             shards: (0..count)
                 .map(|_| Shard {
-                    lock: Lock::new("ids.sharded.claim", Claimed { next: 0, end: 0 }),
+                    lock: Spin::new("ids.sharded.claim", Claimed { next: 0, end: 0 }),
                     len: AtomicU32::new(0),
-                    index: Index::new(),
+                    index: Index::new_in(Global),
                 })
                 // alloc: once per interner made, its shards
                 .collect(),
@@ -488,7 +484,7 @@ impl<T: Send + Sync> Interner<T> for Sharded<T> {
         let (chunk, at) = chunk_of(raw);
         let slots = self.slots[chunk]
             // alloc: once per chunk of slots, each twice the last: amortized, never per intern
-            .get_or_init(|| (0..FIRST << chunk).map(|_| OnceLock::new()).collect());
+            .get_or_init(|| (0..FIRST << chunk).map(|_| Once::new()).collect());
         if slots[at].set((id, value)).is_err() {
             unreachable!("index {raw} handed out twice");
         }
@@ -828,7 +824,6 @@ mod tests {
 /// returned before it, an index reads back its value and ID and is below `end`, and every value
 /// made is dropped once. And a [`Domain`]'s key derived by two threads at once.
 #[cfg(all(test, blaze_check))]
-#[allow(clippy::disallowed_types, reason = "a test's own bookkeeping, off every hot path")]
 mod model {
     use std::sync::{
         Arc,
@@ -896,7 +891,7 @@ mod model {
     struct Model {
         interner: Sharded<Counted>,
         ids: Vec<ContentId>,
-        made: Lock<Vec<Arc<AtomicBool>>>,
+        made: Spin<Vec<Arc<AtomicBool>>>,
         history: History<Set>,
     }
 
@@ -908,7 +903,7 @@ mod model {
             Arc::new(Model {
                 interner: Sharded::new(),
                 ids,
-                made: Lock::new("ids.test.made", Vec::new()),
+                made: Spin::new("ids.test.made", Vec::new()),
                 history: History::new(),
             })
         }
@@ -1094,7 +1089,7 @@ mod model {
             .find(|name| home(name) == first_home)
             .expect("a name of the same home slot");
         blaze_check::model(move || {
-            let slots: Arc<DomainKeys> = Arc::new([const { OnceLock::new() }; DOMAIN_SLOTS]);
+            let slots: Arc<DomainKeys> = Arc::new([const { Once::new() }; DOMAIN_SLOTS]);
             let other = {
                 let slots = slots.clone();
                 thread::spawn(move || *context_key_in(&slots, second))

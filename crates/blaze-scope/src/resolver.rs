@@ -25,21 +25,20 @@
 use core::alloc::Allocator;
 use core::cmp::Ordering;
 
-use alloc::vec::Vec;
 use blaze_hash::HashMap;
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
-
-use crate::error::{Record, ResolveError};
-use crate::facts::{
-    Dep, Edition, ExternTarget, ModuleDecls, Name, Path, PathKind, Rename, ScopeFacts, UseLeaf,
-    VisDecl,
+use blaze_own::Vec;
+use blaze_surface::{
+    AmbiguityKind, BindingState, CallShape, DeclsBuilder, Def, DefKind, Dep, Edition, ExportEntry,
+    ExternTarget, Namespace, Origin, Path, PathKind, Rename, TextualDef, Unresolved, UseForm,
+    UseSite, Visibility, VisibilityClass, WrittenVis,
 };
+
+use crate::error::ResolveError;
+use crate::facts::{Name, ScopeFacts};
 use crate::finish::Finish;
 use crate::read::{Answer, ExpandRequest, NameAnswer, Read, Reply, Step};
-use crate::scope::{
-    AmbiguityKind, Asker, BindingState, Def, DefKind, ExportEntry, MacroKind, Namespace, Origin,
-    ReadEntry, Resolved, Saw, TextualDef, Unresolved, UseSite, Visibility, VisibilityClass,
-};
+use crate::scope::{Asker, ReadEntry, Resolved, Saw};
 
 /// The most parents a module may have (rule 18); no real crate comes near it.
 pub const MAX_MODULE_DEPTH: usize = 128;
@@ -250,7 +249,7 @@ impl CallState {
 pub(crate) struct Call<N, A: Allocator> {
     pub(crate) key: ItemKey,
     pub(crate) path: Path<N, A>,
-    pub(crate) kind: MacroKind,
+    pub(crate) kind: CallShape,
     pub(crate) at: At,
     /// The item it is on, in its fragment (an attribute or a derive).
     pub(crate) item: Option<u32>,
@@ -478,9 +477,8 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         facts: &F,
         alloc: A,
     ) -> Result<Resolver<N, A>, ResolveError> {
-        let info = facts
-            .module(module)
-            .ok_or(ResolveError::Missing { record: Record::ModuleInfo, module })?;
+        let surface = |error| ResolveError::Surface { module, error };
+        let info = facts.module(module).map_err(surface)?;
         let mut chain = Vec::new_in(alloc.clone());
         let mut chain_names = Vec::new_in(alloc.clone());
         chain.push(module);
@@ -491,9 +489,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
             if chain.len() >= MAX_MODULE_DEPTH {
                 return Err(ResolveError::ModuleTooDeep { module });
             }
-            let up = facts
-                .module(p)
-                .ok_or(ResolveError::Missing { record: Record::ModuleInfo, module: p })?;
+            let up = facts.module(p).map_err(surface)?;
             chain.push(p);
             chain_names.push(up.name);
             implicit_prelude &= !up.no_implicit_prelude;
@@ -501,31 +497,28 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         }
         let root = chain[chain.len() - 1];
         let krate = info.krate;
-        let cr = facts.crate_root(krate).ok_or(ResolveError::NoCrateRoot { module, krate })?;
-        let mut extern_prelude = Vec::with_capacity_in(cr.extern_prelude.len(), alloc.clone());
-        extern_prelude.extend_from_slice(&cr.extern_prelude);
-        extern_prelude.sort_by(|a, b| a.0.cmp(&b.0));
-        let mut deps = Vec::with_capacity_in(cr.deps.len(), alloc.clone());
-        deps.extend_from_slice(&cr.deps);
-        let mut macro_use = Vec::with_capacity_in(cr.macro_use.len(), alloc.clone());
-        macro_use.extend_from_slice(&cr.macro_use);
-        let mut tools = Vec::with_capacity_in(cr.tools.len(), alloc.clone());
-        tools.extend_from_slice(&cr.tools);
-        let mut builtin_attrs = Vec::with_capacity_in(cr.builtin_attrs.len(), alloc.clone());
-        builtin_attrs.extend_from_slice(&cr.builtin_attrs);
-        builtin_attrs.sort();
+        let cr = facts.crate_root(krate).map_err(surface)?;
+        let mut extern_prelude = Vec::from_slice_in(&cr.extern_prelude, alloc.clone());
+        // By name, then key: a total order, so a working form made by hand (which may hold a
+        // name twice, where a record cannot) still gives one result.
+        extern_prelude.sort_unstable();
+        let deps = Vec::from_slice_in(&cr.deps, alloc.clone());
+        let macro_use = Vec::from_slice_in(&cr.macro_use, alloc.clone());
+        let tools = Vec::from_slice_in(&cr.tools, alloc.clone());
+        let mut builtin_attrs = Vec::from_slice_in(&cr.builtin_attrs, alloc.clone());
+        builtin_attrs.sort_unstable();
         let mut r = Resolver {
             module,
             krate,
             root,
-            edition: cr.edition,
+            edition: cr.head.edition,
             chain,
             chain_names,
             implicit_prelude,
             extern_prelude,
             deps,
             macro_use,
-            prelude: cr.prelude,
+            prelude: cr.head.prelude,
             tools,
             builtin_attrs,
             frags: Vec::new_in(alloc.clone()),
@@ -543,15 +536,13 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
             #[cfg(test)]
             plant: Plant::None,
         };
-        let decls = facts
-            .decls(module)
-            .ok_or(ResolveError::Missing { record: Record::ModuleDecls, module })?;
-        r.add_fragment(decls, None, 0, None)?;
+        let decls = facts.decls(module).map_err(surface)?;
+        r.add_fragment(&decls, None, 0, None)?;
         if module == root {
             // `#[macro_export]` macros are bindings of the crate root (rustc's `MacroExport`).
             for &(name, def) in cr.macro_exports.iter() {
                 let entry = DefEntry {
-                    def: Def { key: def, kind: DefKind::Macro(MacroKind::Bang) },
+                    def: Def { key: def, kind: DefKind::Macro(CallShape::FnLike) },
                     vis: Visibility::Public,
                     origin: Origin::MacroExport,
                     expansion: 0,
@@ -579,17 +570,22 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
     }
 
     /// A written visibility resolved against the module's own chain; a `pub(in path)` naming
-    /// no ancestor goes to `bad` and is private.
+    /// no ancestor, and a `pub(path)` written without `in` (which rustc refuses, E0704), go to
+    /// `bad` and are private. `pub(self)` is private.
     fn resolve_vis<B: Allocator>(
         &self,
-        vis: &VisDecl<N, B>,
+        vis: &WrittenVis<Path<N, B>>,
         bad: &mut Vec<Path<N, A>, A>,
     ) -> Visibility {
         match vis {
-            VisDecl::Private => self.restricted(self.module),
-            VisDecl::Public => Visibility::Public,
-            VisDecl::Crate => Visibility::Crate(self.krate),
-            VisDecl::Super => match self.chain.get(1) {
+            WrittenVis::Private | WrittenVis::SelfOnly => self.restricted(self.module),
+            WrittenVis::WithoutIn(path) => {
+                bad.push(path.copy_in(self.alloc.clone()));
+                self.restricted(self.module)
+            }
+            WrittenVis::Pub => Visibility::Public,
+            WrittenVis::Crate => Visibility::Crate(self.krate),
+            WrittenVis::Super => match self.chain.get(1) {
                 Some(&parent) => self.restricted(parent),
                 None => {
                     bad.push(Path {
@@ -599,7 +595,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
                     self.restricted(self.module)
                 }
             },
-            VisDecl::In(path) => {
+            WrittenVis::In(path) => {
                 let top = self.chain.len() - 1;
                 let start = match path.kind {
                     PathKind::Crate => Some(top),
@@ -634,7 +630,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
     /// the final pass (private until then) rather than refused.
     fn resolve_decl_vis<B: Allocator>(
         &self,
-        vis: &VisDecl<N, B>,
+        vis: &WrittenVis<Path<N, B>>,
         ns: Namespace,
         name: N,
         def: Def,
@@ -643,7 +639,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
     ) -> Visibility {
         let before = bad.len();
         let resolved = self.resolve_vis(vis, bad);
-        if let VisDecl::In(path) = vis {
+        if let WrittenVis::In(path) = vis {
             let as_path = match path.kind {
                 PathKind::Crate | PathKind::SelfMod | PathKind::Super(_) => true,
                 PathKind::Plain => self.edition == Edition::E2015,
@@ -661,7 +657,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
     /// Adds one fragment (the module's text or a call's expansion), returning its index.
     pub(crate) fn add_fragment<B: Allocator>(
         &mut self,
-        decls: &ModuleDecls<N, B>,
+        decls: &DeclsBuilder<N, B>,
         call: Option<ItemKey>,
         expansion: u16,
         parent: Option<At>,
@@ -724,7 +720,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
             let path = u.path.copy_in(a.clone());
             let placeholder = At { frag: fid, slot: 0 };
             match u.leaf {
-                UseLeaf::Glob => {
+                UseForm::Glob => {
                     let g = count(self.globs.len(), module)?;
                     self.globs.push(Glob {
                         site,
@@ -738,7 +734,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
                     });
                     ordered.push((u.pos, Slot::Glob(g)));
                 }
-                UseLeaf::Named { rename, types_only } => {
+                UseForm::Named { rename, types_only } => {
                     let bound = match rename {
                         Rename::Same => path.segments.last().copied(),
                         Rename::To(name) => Some(name),
@@ -791,7 +787,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
             });
             ordered.push((c.pos, Slot::Call(i)));
         }
-        ordered.sort_by_key(|&(pos, _)| pos);
+        ordered.sort_unstable_by_key(|&(pos, _)| pos);
         let mut slots = Vec::with_capacity_in(ordered.len(), a);
         for (s, &(_, slot)) in ordered.iter().enumerate() {
             let at = At { frag: fid, slot: count(s, module)? };
@@ -873,7 +869,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
                 (Read::Exports { .. }, Answer::Exports { entries, digest }) => {
                     let mut v = Vec::with_capacity_in(entries.len(), self.alloc.clone());
                     v.extend_from_slice(entries);
-                    v.sort_by(|x, y| (x.ns, x.name).cmp(&(y.ns, y.name)));
+                    v.sort_unstable_by(|x, y| (x.ns, x.name).cmp(&(y.ns, y.name)));
                     Cached::Exports { entries: v, digest }
                 }
                 (
@@ -887,7 +883,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
                 (Read::DeriveHelpers { .. }, Answer::Helpers { names, digest }) => {
                     let mut v = Vec::with_capacity_in(names.len(), self.alloc.clone());
                     v.extend_from_slice(names);
-                    v.sort();
+                    v.sort_unstable();
                     Cached::Helpers { names: v, digest }
                 }
                 (
@@ -986,14 +982,17 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         for c in 0..self.calls.len() {
             let CallState::Resolved(def) = self.calls[c].state else { continue };
             let key = self.calls[c].key;
-            let Some(expanded) = facts.expansion(key) else { continue };
+            let expanded = facts
+                .expansion(key)
+                .map_err(|error| ResolveError::Surface { module: self.module, error })?;
+            let Some(expanded) = expanded else { continue };
             self.expansions += 1;
             if self.expansions > MAX_EXPANSIONS {
                 return Err(ResolveError::TooManyExpansions { module: self.module });
             }
             let at = self.calls[c].at;
             let depth = self.frags[at.frag as usize].expansion + 1;
-            let frag = self.add_fragment(expanded, Some(key), depth, Some(at))?;
+            let frag = self.add_fragment(&expanded, Some(key), depth, Some(at))?;
             self.calls[c].state = CallState::Expanded { frag, def };
             self.unexpanded -= 1;
             moved = true;
@@ -1256,7 +1255,7 @@ fn cycle_of<N: Name, A: Allocator + Clone>(
             }
         }
     }
-    out.cycle.sort();
+    out.cycle.sort_unstable();
     out.cycle.dedup();
     !out.cycle.is_empty()
 }
@@ -1273,7 +1272,7 @@ pub(crate) fn run<N: Name, A: Allocator + Clone, F: ScopeFacts<Name = N>>(
         let sink = settle(ms, facts, alloc)?;
         out.asks.clear();
         out.asks.extend_from_slice(&sink.need);
-        out.asks.sort();
+        out.asks.sort_unstable();
         out.asks.dedup();
         if !out.asks.is_empty() {
             return Ok(Ran::Ask);
@@ -1286,7 +1285,7 @@ pub(crate) fn run<N: Name, A: Allocator + Clone, F: ScopeFacts<Name = N>>(
                 }
             }
         }
-        out.expand.sort();
+        out.expand.sort_unstable();
         out.expand.dedup();
         if !out.expand.is_empty() {
             return Ok(Ran::Expand);
@@ -1332,7 +1331,7 @@ pub(crate) fn run<N: Name, A: Allocator + Clone, F: ScopeFacts<Name = N>>(
         if !asks.is_empty() {
             out.asks.clear();
             out.asks.extend_from_slice(&asks);
-            out.asks.sort();
+            out.asks.sort_unstable();
             out.asks.dedup();
             return Ok(Ran::Ask);
         }

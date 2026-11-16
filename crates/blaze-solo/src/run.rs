@@ -58,8 +58,19 @@ use crate::{
 
 /// The bytes one read of a file asks for.
 pub const CHUNK: usize = 64 << 10;
-/// The names one stamp effect carries.
+/// The most names one stamp effect carries.
 pub const STAMP_BATCH: usize = 4096;
+/// The fewest names one stamp effect carries, unless the sweep has fewer: below it a batch's
+/// own cost (one effect, one wake of a file thread) is near its stats'.
+pub const STAMP_LEAST: usize = 64;
+
+/// The names one stamp effect of a sweep of `rows` carries, so the sweep spreads over the
+/// driver's `lanes` file threads (store-next.md, item e): `ceil(rows / lanes)` within
+/// [`STAMP_LEAST`]..=[`STAMP_BATCH`]. Before, every batch held 4096, so a tree under 4096
+/// files was swept by one thread whatever the machine.
+pub fn stamp_batch(rows: usize, lanes: u32) -> usize {
+    rows.div_ceil(lanes.max(1) as usize).clamp(STAMP_LEAST, STAMP_BATCH)
+}
 /// Files read at once.
 pub const READS_AT_ONCE: usize = 64;
 /// The tags a command asks with: `tags..tags + TAG_SPAN`.
@@ -106,6 +117,9 @@ pub struct Config {
     pub codes: Codes,
     /// The command's tags are `tags..tags + TAG_SPAN`.
     pub tags: u64,
+    /// The file threads the driver runs effects on (the number it was made with): the sweep
+    /// asks at least this many stamp batches when it has the rows ([`stamp_batch`]).
+    pub lanes: u32,
 }
 
 /// Nanoseconds of each phase, by the injected clock.
@@ -677,13 +691,14 @@ impl Command {
         let names: Vec<FileName> = sweep.names().map(|path| self.full(path)).collect();
         // alloc: the stamps of one sweep, once a command
         self.stamps = vec![Stamp::GONE; names.len()];
-        for (n, batch) in names.chunks(STAMP_BATCH).enumerate() {
+        let per = stamp_batch(names.len(), self.config.lanes);
+        for (n, batch) in names.chunks(per).enumerate() {
             let bytes = batch.iter().map(|name| name.as_str().len() + 1).sum();
             let mut list = Names::with_capacity(batch.len(), bytes);
             for name in batch {
                 list.push(name);
             }
-            let tag = self.ask(Pending::Stamps { from: n * STAMP_BATCH, len: batch.len() });
+            let tag = self.ask(Pending::Stamps { from: n * per, len: batch.len() });
             effects.push(Effect::Stamp { files: Arc::new(list), tag });
             self.stamps_left += 1;
         }

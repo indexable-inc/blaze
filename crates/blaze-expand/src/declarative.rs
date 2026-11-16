@@ -12,7 +12,7 @@ use span::SyntaxContext;
 use crate::{
     bridge::{self, Role},
     call::CallKind,
-    def::{MacroDef, MacroKind},
+    def::{MacroDefinition, MacroKind},
     error::{ExpandError, Stream},
     expand::Out,
     expansion::Diagnostic,
@@ -20,7 +20,7 @@ use crate::{
 };
 
 /// The definition's rules, parsed.
-pub(crate) fn parse<A: Allocator>(def: &MacroDef<A>) -> Result<DeclarativeMacro, ExpandError> {
+pub(crate) fn parse<A: Allocator>(def: &MacroDefinition<A>) -> Result<DeclarativeMacro, ExpandError> {
     let edition = |ctx: SyntaxContext| ctx.edition();
     let body = bridge::to_tt(def.body(), Role::Def, Stream::Def, def.edition())?;
     Ok(match def.kind() {

@@ -16,7 +16,8 @@
 //!   encoder and decoder goes through. [`NoItem`] is a key that names no item of a crate.
 //! - [`Carried`], a table that outlives a snapshot: it can only be keyed by a `Portable` key.
 //!
-//! It is `no_std` on `core` and `alloc`. It is not on bstd (docs/v2/plan/design/std.md) yet:
+//! It is `no_std` on `core` alone, without `alloc`: its one table is blaze-hash's, in the
+//! allocator its maker names. It is not on bstd (docs/v2/plan/design/std.md) yet:
 //! bstd uses syntax only blaze accepts, and while cargo with the pinned nightly builds and
 //! tests blaze in the dev loop (AGENTS.md, `blaze-builds-blaze`; decision D25) a crate that
 //! must be verified now cannot depend on it. It moves to bstd when that rule returns to

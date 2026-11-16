@@ -20,7 +20,7 @@ use intern::Symbol;
 use span::{Edition, FileId};
 use triomphe::Arc;
 
-use crate::{CrateWorkspaceData, Db};
+use crate::{CrateWorkspaceData, Db, EditionedFileId};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CrateName(Symbol);
@@ -537,9 +537,26 @@ pub struct Crate {
     /// read them from the crate root's surface).
     #[returns(copy)]
     pub extensions: span::Extensions,
+    /// The blaze edition the crate is of (`#![blaze::edition = "2026.11"]`, or the manifest's
+    /// `edition = "blaze-2026.11"`), as the driver read it with the extensions; `None` for a
+    /// Rust crate, and for one whose attribute the driver refused (it is never quietly of an
+    /// edition it did not name).
+    #[returns(copy)]
+    pub blaze_edition: Option<span::BlazeEdition>,
 }
 
 impl Crate {
+    /// The crate's root file, read in the crate's edition and under its syntax extensions.
+    pub fn root_file_id(self, db: &Db) -> EditionedFileId {
+        let edition = self.data(db).edition;
+        EditionedFileId::new_with_extensions(
+            db,
+            self.data(db).root_file_id,
+            edition,
+            self.extensions(db),
+        )
+    }
+
     /// What tells the crate from every other one: its key, which covers its cfg, edition and
     /// dependencies (docs/v2/plan/design/identity.md).
     pub fn content<D: ?Sized + blaze_memo::Database>(self, db: &D) -> ContentId {

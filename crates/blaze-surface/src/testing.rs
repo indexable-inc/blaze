@@ -16,7 +16,8 @@ use crate::items::{Items, Source};
 use crate::key_index::{KeyEntry, KeyIndexView};
 use crate::module_decls::ModuleDeclsView;
 use crate::module_scope::ScopeView;
-use crate::names::{CrateRootView, MacroDefView, ModuleFileView, TextualEntryView};
+use crate::macro_def::MacroDefView;
+use crate::names::{CrateRootView, ModuleFileView, TextualEntryView};
 use crate::proof::HasText;
 
 /// Which record a buffer given to [`MemSurface::insert`] is.

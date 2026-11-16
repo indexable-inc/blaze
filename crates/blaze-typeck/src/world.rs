@@ -9,7 +9,7 @@
 
 #![blaze::sans_io]
 
-use blaze_own::Vec;
+use blaze_own::{Soa, Vec};
 use core::alloc::Allocator;
 
 use crate::columns::columns_eq;
@@ -255,22 +255,39 @@ pub trait World {
     }
 }
 
-/// The read list: each question asked and the content hash of its answer, sorted and
-/// deduplicated at the end of the run. Two columns.
+/// The read list: each question asked and the content hash of its answer, sorted by question
+/// and deduplicated at the end of the run. A lookup scans the question column only.
 #[derive(Clone)]
 pub struct ReadList<A: Allocator + Clone> {
-    pub questions: Vec<Question, A>,
-    pub hashes: Vec<u64, A>,
+    pub rows: Soa<(Question, u64), A>,
 }
 
-columns_eq!(ReadList { questions, hashes });
 columns_eq!(Needs { questions });
 
+impl<A: Allocator + Clone> PartialEq for ReadList<A> {
+    fn eq(&self, other: &ReadList<A>) -> bool {
+        self.rows.column::<0>() == other.rows.column::<0>() && self.rows.column::<1>() == other.rows.column::<1>()
+    }
+}
+
+impl<A: Allocator + Clone> Eq for ReadList<A> {}
+
+impl<A: Allocator + Clone> core::fmt::Debug for ReadList<A> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("ReadList").field("rows", &self.rows).finish()
+    }
+}
+
 impl<A: Allocator + Clone> ReadList<A> {
+    /// The questions read, sorted.
+    pub fn questions(&self) -> &[Question] {
+        self.rows.column::<0>()
+    }
+
     /// The hash recorded for `q`, if it was read.
     pub fn hash_of(&self, q: &Question) -> Option<u64> {
-        match self.questions.binary_search(q) {
-            Ok(i) => Some(self.hashes[i]),
+        match self.rows.column::<0>().binary_search(q) {
+            Ok(i) => Some(self.rows.column::<1>()[i]),
             Err(_) => None,
         }
     }
@@ -412,17 +429,28 @@ impl<'w, W: World, A: Allocator + Clone> Reads<'w, W, A> {
     pub(crate) fn finish(mut self, alloc: A) -> (ReadList<A>, Needs<A>) {
         self.entries.sort_unstable();
         self.entries.dedup();
-        let mut questions = Vec::with_capacity_in(self.entries.len(), alloc.clone());
-        let mut hashes = Vec::with_capacity_in(self.entries.len(), alloc.clone());
+        let mut rows = Soa::with_capacity_in(self.entries.len(), alloc.clone());
         let mut needs = Vec::with_capacity_in(self.entries.len(), alloc);
         for &(q, h) in self.entries.iter() {
-            questions.push(q);
-            hashes.push(h);
+            rows.push((q, h));
             if needs.last() != Some(&q) {
                 needs.push(q);
             }
         }
-        (ReadList { questions, hashes }, Needs { questions: needs })
+        (ReadList { rows }, Needs { questions: needs })
+    }
+
+    /// The needs of a run stopped by the missing answer to `missing`: every question asked
+    /// before it and `missing` itself, sorted, so the next run fetches them in one batch.
+    pub(crate) fn finish_need(self, missing: Question, alloc: A) -> Needs<A> {
+        let mut questions = Vec::with_capacity_in(self.entries.len() + 1, alloc);
+        for &(q, _) in self.entries.iter() {
+            questions.push(q);
+        }
+        questions.push(missing);
+        questions.sort_unstable();
+        questions.dedup();
+        Needs { questions }
     }
 }
 

@@ -3,10 +3,12 @@
 //! call's tokens to an [`Expansion`], a value that is written as a record and read in any
 //! process.
 //!
-//! - [`MacroDef`]: what a macro is. Its kind (`macro_rules!`, `macro`, a builtin by name, a
-//!   proc macro by its crate's key and export name), its tokens, edition, `#[macro_export]` and
-//!   `local_inner_macros` flags, a derive's helper attributes and its transparency, and the
-//!   hash of all of that, its [`MacroContent`]: never its item key (rule 21).
+//! - [`MacroDefinition`]: what a macro is. Its kind (`macro_rules!`, `macro`, a builtin by
+//!   name, a proc macro by its crate's key and export name), its tokens, edition,
+//!   `#[macro_export]` and `local_inner_macros` flags, a derive's helper attributes and its
+//!   transparency, and the hash of all of that, its [`MacroContent`]: never its item key (rule
+//!   21). Stored as blaze-surface's `MacroDef` record and its token streams' records
+//!   ([`MacroDefinition::write`], [`MacroDefinition::from`]).
 //! - [`Call`]: one call: its tokens and kind (fn-like, attribute with the item, derive with the
 //!   item and its [`DeriveFacts`]), its call-site hygiene ([`CallSite`]) and, for an eager macro re-entered, the
 //!   expansions of the calls in its input ([`Eager`]).
@@ -49,8 +51,6 @@
 #![no_std]
 #![feature(allocator_api)]
 
-extern crate alloc;
-
 mod adt;
 mod bridge;
 mod builtin;
@@ -76,19 +76,21 @@ pub use crate::{
         Produced,
     },
     def::{
-        BuiltinAttr, BuiltinDerive, BuiltinFn, DefAt, Export, LocalInner, MacroContent, MacroDef,
-        MacroKind, ProcKind,
+        BuiltinAttr, BuiltinDerive, BuiltinFn, DefAt, DefinitionError, DefinitionRecords, Export,
+        LocalInner, MacroContent, MacroDefinition, MacroKind, ProcKind,
     },
     error::{ExpandError, LexError, Stream, StreamError, Table, Unbuilt},
     expand::{Prepared, expand, expand_prepared, prepare},
     expansion::{
         Diagnostic, Expanded, Expansion, Hole, HoleOf, IncludeFailure, NestedCall, NestedKind,
-        TokenOrigin, PathScope, Range, Read, ReadAnswer, ReadKind, Reads,
+        PathScope, Range, Read, ReadAnswer, ReadKind, Reads, TokenOrigin,
     },
     key::{CallKey, ExpansionKey, call_key, expansion_key},
     limit::{Depth, LimitReached, RecursionLimit},
     nested::find_calls,
-    record::{EXPANSION_SCHEMA, RecordColumn, RecordError},
+    record::{
+        EXPANSION_SCHEMA, RecordBytes, RecordColumn, RecordError, STREAM_SCHEMA, stream_record_id,
+    },
     tokens::{
         Ctx, CtxNode, DefSite, Delim, Edition, LitKind, Mark, MarkOf, Raw, Sink, Spacing, Text,
         Token, TokenHygiene, TokenKind, TokenStream, Transparency, lex,

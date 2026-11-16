@@ -4,9 +4,12 @@
 
 use std::{
     alloc::{AllocError, Allocator, Global, Layout},
+    borrow::ToOwned,
     cell::Cell,
     hash::BuildHasher,
     ptr::NonNull,
+    string::{String, ToString},
+    vec::Vec,
 };
 
 use blaze_sim::{Config, Tape};

@@ -1,0 +1,36 @@
+[package]
+name = "blaze-format-core"
+description = "the part of blaze v2's zero-copy format that defines and reads records: the traits, the in-place views, the column and row helpers, the writer and `record!`, on `core` alone; blaze-format adds the tiers, the cursor and the codecs on top and re-exports all of this"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# With none on, this crate is `#![no_std]` with no `extern crate alloc` and no crate from outside
+# the workspace (docs/v2/plan/design/bottom.md, "No `std` and no `alloc` in blaze's own code").
+[features]
+# `alloc`'s `Vec<u8, A>` as a writer's buffer, and what is defined over it: `Writer`'s default
+# (`Writer<Global>`), `Persist`, `to_bytes`, `read_verified`, `Aligned`. blaze-format turns it on,
+# for the crates that still hold their buffers in `alloc` (D25, 2026-11-11).
+alloc = []
+# serde's forms of `SchemaHash`, `SpanRef` and `RelSpan`, for the crates that persist them with
+# serde: the derives must sit beside the types (the orphan rule), so they are a feature here that
+# only blaze-format turns on.
+serde = ["dep:serde", "blaze-ids/serde"]
+
+[dependencies]
+# By path, not `.workspace`: the workspace entry turns on blaze-ids' adapter features (serde,
+# smallvec, thin-vec), which a member's entry cannot turn off.
+blaze-ids = { path = "../blaze-ids" }
+blaze-own = { path = "../blaze-own" }
+serde = { workspace = true, optional = true, features = ["derive"] }
+
+[lints]
+workspace = true

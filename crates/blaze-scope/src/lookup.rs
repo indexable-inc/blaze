@@ -8,20 +8,21 @@
 use core::alloc::Allocator;
 use core::cmp::Ordering;
 
-use alloc::vec::Vec;
 use blaze_id::ItemKey;
+use blaze_own::Vec;
+use blaze_surface::{
+    AmbiguityKind, BindingState, CallShape, Def, DefKind, Edition, Namespace, Origin, Path,
+    PathKind, TextualDef, Unresolved, Visibility, VisibilityClass,
+};
 
-use crate::error::{Record, ResolveError};
-use crate::facts::{Edition, Name, Path, PathKind, ScopeFacts};
+use crate::error::ResolveError;
+use crate::facts::{Name, ScopeFacts};
 use crate::read::{NameAnswer, Read};
 use crate::resolver::{
     Amb, At, CallState, Cached, Env, Hit, ImportOutcome, Item, Layer, NsRes, Plan, Query, Res,
     Resolver, Scan, Sink, Slot, Source, MAX_MODULE_DEPTH,
 };
-use crate::scope::{
-    AmbiguityKind, BindingState, Def, DefKind, MacroKind, Namespace, Origin, TextualDef,
-    Unresolved, Visibility, VisibilityClass,
-};
+use crate::scope::SeenFrom;
 
 /// What a path is resolved for: a 2015 `use` path begins at the crate root.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -37,7 +38,7 @@ pub(crate) struct LexQuery<N> {
     pub(crate) name: N,
     pub(crate) at: At,
     /// The macro sub-namespace a macro path needs (rustc's `sub_namespace_match`).
-    pub(crate) want: Option<MacroKind>,
+    pub(crate) want: Option<CallShape>,
     /// Whether the `macro_rules!` textual scope is searched (a one-segment bang path).
     pub(crate) textual: bool,
     pub(crate) ignore: Option<(ItemKey, u32)>,
@@ -116,7 +117,7 @@ fn group_fixpoint<N: Name, A: Allocator + Clone>(
             }
         }
     }
-    edges.sort();
+    edges.sort_unstable();
     edges.dedup();
     let mut table = Vec::with_capacity_in(edges.len(), alloc.clone());
     table.extend(edges.iter().map(|&(f, i)| (f, i, Res::None)));
@@ -589,7 +590,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         }
     }
 
-    fn kind_ok(&self, hit: &Hit, want: Option<MacroKind>) -> bool {
+    fn kind_ok(&self, hit: &Hit, want: Option<CallShape>) -> bool {
         match want {
             None => true,
             Some(k) => hit.def.kind == DefKind::Macro(k),
@@ -700,7 +701,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
             match f.slots[s] {
                 Slot::Rules { name: n, def } if n == name => {
                     return Tex::Hit(Hit {
-                        def: Def { key: def, kind: DefKind::Macro(MacroKind::Bang) },
+                        def: Def { key: def, kind: DefKind::Macro(CallShape::FnLike) },
                         vis: self.restricted(self.module),
                         origin: Origin::Declared,
                         expansion: f.expansion,
@@ -736,7 +737,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
 
     fn textual_hit(&self, d: &TextualDef<N>) -> Hit {
         Hit {
-            def: Def { key: d.def, kind: DefKind::Macro(MacroKind::Bang) },
+            def: Def { key: d.def, kind: DefKind::Macro(CallShape::FnLike) },
             vis: self.restricted(self.module),
             origin: Origin::Declared,
             expansion: d.expansion,
@@ -987,10 +988,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
             if steps > MAX_MODULE_DEPTH {
                 return Err(ResolveError::ModuleTooDeep { module: target });
             }
-            cur = facts
-                .module(m)
-                .ok_or(ResolveError::Missing { record: Record::ModuleInfo, module: m })?
-                .parent;
+            cur = facts.module(m).map_err(|error| ResolveError::Surface { module: self.module, error })?.parent;
         }
         Ok(classes)
     }
@@ -1043,7 +1041,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         let fail = |s: u32, why: Unresolved| CallOutcome { state: Some(CallState::Failed(s, why)), first: None, wait: false };
         let stay = CallOutcome { state: None, first: None, wait: false };
         let wait = CallOutcome { state: None, first: None, wait: true };
-        if call.kind == MacroKind::Attr
+        if call.kind == CallShape::Attr
             && call.path.kind == PathKind::Plain
             && n >= 2
             && self.implicit_prelude
@@ -1055,7 +1053,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
             return fail(0, Unresolved::NotFound);
         }
         let inert = CallOutcome { state: Some(CallState::Inert), first: None, wait: false };
-        let one_attr = call.kind == MacroKind::Attr && n == 1;
+        let one_attr = call.kind == CallShape::Attr && n == 1;
         if one_attr {
             // rustc's innermost scope for an attribute: the helpers of the derives before it
             // on its item.
@@ -1076,7 +1074,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
                 name: segs[0],
                 at: call.at,
                 want: Some(call.kind),
-                textual: call.kind == MacroKind::Bang,
+                textual: call.kind == CallShape::FnLike,
                 ignore: None,
             };
             (self.lexical(lq, env, sink), None)
@@ -1141,7 +1139,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         let mut wait = false;
         let mut undet = false;
         for d in self.calls.iter() {
-            if d.kind != MacroKind::Derive
+            if d.kind != CallShape::Derive
                 || d.item != Some(item)
                 || d.at.frag != call.at.frag
                 || d.at.slot >= call.at.slot
@@ -1249,7 +1247,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
                 plan.calls.push((seg(c), state, o.first));
             }
         }
-        plan.waiting.sort();
+        plan.waiting.sort_unstable();
         Ok(plan)
     }
 }

@@ -9,7 +9,7 @@
 
 use core::alloc::Allocator;
 
-use alloc::vec::Vec;
+use blaze_own::Vec;
 use blaze_id::ItemKey;
 
 use crate::error::ResolveError;
@@ -34,7 +34,7 @@ impl<N: Name, A: Allocator + Clone> Group<N, A> {
         if members.is_empty() {
             return Err(ResolveError::BadGroup { module: None });
         }
-        members.sort_by_key(|m| m.module);
+        members.sort_unstable_by_key(|m| m.module);
         for pair in members.windows(2) {
             if pair[0].module == pair[1].module {
                 return Err(ResolveError::BadGroup { module: Some(pair[0].module) });

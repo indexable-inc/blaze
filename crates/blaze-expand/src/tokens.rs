@@ -312,16 +312,6 @@ impl Ctx {
     }
 }
 
-/// Where a macro is defined: what `$crate` and a def-site path resolve against.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct DefSite {
-    /// The crate of the definition, what `$crate` names.
-    pub krate: CrateItemKey,
-    /// The module of the definition, for a macro whose names resolve there (`macro`, and an
-    /// opaque mark); `None` for `macro_rules!`, whose def-site names are its crate's.
-    pub module: Option<ItemKey>,
-}
-
 /// Which expansion a mark is of.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum MarkOf {
@@ -776,8 +766,6 @@ fn joined_to<A: Allocator + Clone>(
 }
 
 // SAFETY: a closed enum; it names nothing interned.
-unsafe impl Portable for Transparency {}
-// SAFETY: a closed enum; it names nothing interned.
 unsafe impl Portable for Delim {}
 // SAFETY: a closed enum; it names nothing interned.
 unsafe impl Portable for Spacing {}
@@ -792,8 +780,6 @@ unsafe impl Portable for TokenKind {}
 // SAFETY: a root by edition, or an index of the stream's own context table, which travels
 // with it: never an interned `SyntaxContext`.
 unsafe impl Portable for Ctx {}
-// SAFETY: a crate key and a module's item key.
-unsafe impl Portable for DefSite {}
 // SAFETY: this expansion, or an earlier one by its record's content key.
 unsafe impl Portable for MarkOf {}
 // SAFETY: every field is `Portable`.

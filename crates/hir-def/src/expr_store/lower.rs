@@ -64,7 +64,10 @@ use crate::{
     item_scope::BuiltinShadowMode,
     item_tree::FieldsShape,
     lang_item::{LangItemTarget, LangItems},
-    nameres::{DefMap, Hygienic, LocalDefMap, MacroSubNs, block_def_map},
+    nameres::{
+        DefMap, MacroSubNs, block_def_map,
+        def_site::{Hygienic, hygienic_origin},
+    },
     per_ns::Namespace,
     signatures::{ImplSignature, StructSignature, TypeAliasSignature},
     type_ref::{
@@ -652,7 +655,6 @@ pub struct ExprCollector<'db> {
     cfg_options: &'db CfgOptions,
     expander: Expander<'db>,
     def_map: &'db DefMap,
-    local_def_map: &'db LocalDefMap,
     module: ModuleId,
     lowering_mode: LoweringMode,
     #[expect(
@@ -1000,7 +1002,7 @@ impl<'db> ExprCollector<'db> {
         lowering_mode: LoweringMode,
         maps: Option<(&'db RealSpanMap, &'db AstIdMap)>,
     ) -> ExprCollector<'db> {
-        let (def_map, local_def_map) = module.local_def_map(db);
+        let def_map = module.def_map(db);
         let expander = match maps {
             Some((span_map, ast_id_map)) => {
                 Expander::within(db, current_file_id, def_map, span_map, ast_id_map)
@@ -1014,7 +1016,6 @@ impl<'db> ExprCollector<'db> {
             module,
             lowering_mode,
             def_map,
-            local_def_map,
             lang_items: std::cell::OnceCell::new(),
             store: ExpressionStoreBuilder::new(),
             expander,
@@ -2642,18 +2643,11 @@ impl<'db> ExprCollector<'db> {
         if path.is_Self() {
             return true;
         }
-        // `self.def_map` is the innermost block's when the body's blocks have items, so the path
-        // is resolved in the def maps around it too, as rustc's lexical walk does: a constructor
-        // declared outside a block with items (`struct S(u8); fn f() { struct L; S(a) = s; }`)
-        // is still one.
-        let (resolution, unresolved_idx, _) = self.def_map.resolve_path_around(
-            self.def_map.ctx_table(),
-            self.local_def_map,
-            self.db,
-            self.module,
-            path,
-            BuiltinShadowMode::Other,
-        );
+        // `self.module` is the innermost block's when the body's blocks have items: the path is
+        // looked up there first, as rustc's lexical walk does, and a block's scope stops the
+        // task (its items are in no record yet).
+        let (resolution, unresolved_idx, _) =
+            self.def_map.resolve_path(self.db, self.module, path, BuiltinShadowMode::Other, None);
         match unresolved_idx {
             Some(_) => {
                 // If `Some(_)`, path could be resolved to unit struct/variant/const with type information, i.e. an assoc type or const.
@@ -3298,45 +3292,37 @@ impl<'db> ExprCollector<'db> {
     {
         let macro_call_ptr = self.expander.in_file(syntax_ptr);
 
-        let block_call = self.def_map.module(self.db, self.module).scope(self.db).macro_invoc(
-            self.expander.in_file(self.expander.ast_id_map().ast_id_for_ptr(syntax_ptr)),
-        );
+        // A macro call in a block with items is one of the block's own: its expansion is in an
+        // `Expansion` record, as the block's scope is, neither built (a typed stop here).
+        let _ = crate::nameres::scope_key(self.db, self.module);
+        let block_call: Option<MacroCallId> = None;
         let res = match block_call {
-            // fast path, macro call is in a block module
             Some(call) => Ok(self.expander.enter_expand_id(self.db, call)),
             None => {
                 let resolver = |path: &ModPath, ctx: SyntaxContext| {
-                    // Where a `macro`'s def-site hygiene says the path is looked up.
-                    let origin = self.def_map.hygienic_origin(
-                        self.db,
-                        self.module,
-                        path,
-                        Some(Namespace::Macros),
-                        ctx,
-                    );
-                    // The latest `macro_rules!` of that name before the call, which is not
-                    // the last one of the block when a later statement defines it again.
-                    let shadowing =
-                        path.as_ident().filter(|_| origin == Hygienic::Here).and_then(|name| {
-                            let seen = *self.current_block_legacy_macro_defs_count.get(name)?;
-                            let defs = self
-                                .def_map
-                                .module(self.db, self.def_map.root)
-                                .legacy_macro_in_scope(self.db, name)?;
-                            defs.get(seen.checked_sub(1)?).copied()
-                        });
-                    if shadowing.is_some() {
-                        return shadowing;
+                    // Where a `macro`'s def-site hygiene says the path is looked up: here, or
+                    // a typed stop.
+                    let Hygienic::Here = hygienic_origin(self.db, self.module, HygieneId::new(ctx));
+                    // A one-segment path is looked up in the `macro_rules!` textual scope at
+                    // the call (the body's own definitions before it, then the module's
+                    // `TextualEntry`, its earlier definitions and the `#[macro_use]` prelude),
+                    // which no record holds at a position yet: a typed stop.
+                    if path.as_ident().is_some() {
+                        let item = crate::nameres::scope_key(self.db, self.module);
+                        return base_db::OrNeed::or_need(Err(base_db::SurfaceError::NotBuilt(
+                            blaze_surface::NotBuilt {
+                                method: "the textual macro scope of a body's macro call",
+                                item,
+                            },
+                        )));
                     }
                     self.def_map
-                        .resolve_path_from(
-                            self.local_def_map,
+                        .resolve_path(
                             self.db,
                             self.module,
                             path,
                             crate::item_scope::BuiltinShadowMode::Other,
                             Some(MacroSubNs::Bang),
-                            origin,
                         )
                         .0
                         .take_macros()
@@ -3510,12 +3496,12 @@ impl<'db> ExprCollector<'db> {
                     self.store.push_list_statement(Statement::Item(Item::Other));
                     return;
                 };
-                let name = self.macro_binding_name(name);
-                let macro_id = self
-                    .def_map
-                    .module(self.db, self.def_map.root)
-                    .name_in_scope(self.db, &name)
-                    .take_macros();
+                let _ = self.macro_binding_name(name);
+                let macro_id: Option<MacroId> = crate::nameres::block_scope_stop(
+                    self.db,
+                    self.module,
+                    "a `macro` defined in a block",
+                );
                 self.collect_macro_def(macro_id);
             }
             ast::Stmt::Item(ast::Item::MacroRules(macro_)) => {
@@ -3529,13 +3515,12 @@ impl<'db> ExprCollector<'db> {
                 let name = self.macro_binding_name(name);
                 let macro_defs_count =
                     self.current_block_legacy_macro_defs_count.entry(name).or_insert(0);
-                let macro_id = self
-                    .def_map
-                    .module(self.db, self.def_map.root)
-                    .legacy_macro_in_scope(self.db, &name)
-                    .and_then(|it| it.get(*macro_defs_count))
-                    .copied();
                 *macro_defs_count += 1;
+                let macro_id: Option<MacroId> = crate::nameres::block_scope_stop(
+                    self.db,
+                    self.module,
+                    "a `macro_rules!` defined in a block",
+                );
                 self.collect_macro_def(macro_id);
             }
             ast::Stmt::Item(_item) => self.store.push_list_statement(Statement::Item(Item::Other)),
@@ -3546,7 +3531,7 @@ impl<'db> ExprCollector<'db> {
     /// written with, as the block's def map binds it (`def_site::def_binding_name`).
     fn macro_binding_name(&self, name: ast::Name<'_>) -> Name {
         let file = self.expander.current_file_id();
-        match crate::nameres::binding_key_at(self.db, file, name.syntax().text_range()) {
+        match crate::nameres::def_site::binding_key_at(self.db, file, name.syntax().text_range()) {
             Some(key) => name.as_name().keyed(key),
             None => name.as_name(),
         }
@@ -3739,8 +3724,7 @@ impl<'db> ExprCollector<'db> {
                 let is_path = is_simple_ident_pat && {
                     // This could also be a single-segment path pattern. To
                     // decide that, we need to try resolving the name.
-                    let (resolved, _) = self.def_map.resolve_path(
-                        self.local_def_map,
+                    let (resolved, _, _) = self.def_map.resolve_path(
                         self.db,
                         self.module,
                         &name.into(),
@@ -4473,7 +4457,7 @@ impl<'db> ExprCollector<'db> {
         }
         // blaze: `5u3` under `#![blaze::arbitrary_ints]`; every other crate reads the suffix
         // as rustc does (docs/v2/plan/design/arbitrary-ints.md).
-        if self.def_map.arbitrary_ints()
+        if self.features().blaze_arbitrary_ints
             && let ast::LiteralKind::IntNumber(int) = kind
             && let Some(suffix) = int.suffix()
         {
@@ -4511,7 +4495,7 @@ impl<'db> ExprCollector<'db> {
     }
 
     fn features(&self) -> &'db UnstableFeatures {
-        self.def_map.features()
+        self.def_map.features(self.db)
     }
 
     /// An anonymous const's root (a const argument, an array type's length): a body of its own,
@@ -4823,7 +4807,6 @@ impl<'db> ExprCollector<'db> {
     ) -> Option<impl Iterator<Item = LifetimeRefId> + use<'a, 'db>> {
         let lifetime_args = lifetime_args?;
         let r_path = self.def_map.resolve_path(
-            self.local_def_map,
             self.db,
             self.module,
             mod_path,

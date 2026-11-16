@@ -33,7 +33,7 @@ use smallvec::SmallVec;
 #[cfg(feature = "thin-vec")]
 use thin_vec::ThinVec;
 
-use crate::sync::atomic::{AtomicU64, Ordering};
+use blaze_swiss::sync::atomic::{AtomicU64, Ordering};
 
 #[cfg(test)]
 mod tests;

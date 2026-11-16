@@ -35,6 +35,7 @@ pub mod dedupe;
 pub mod driver;
 pub mod exec;
 pub mod flight;
+pub mod fields;
 pub mod fold;
 pub mod imports;
 pub mod kernel;

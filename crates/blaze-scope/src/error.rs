@@ -1,26 +1,17 @@
-//! The machine's own failures: a missing record, a bound exceeded, a protocol broken by its
+//! The machine's own failures: a record it cannot read, a bound exceeded, a protocol broken by its
 //! caller. User code's errors are not these; they are [`crate::ScopeError`] values in a scope.
 
 use core::fmt;
 
-use blaze_id::{CrateItemKey, ItemKey};
-
-/// Which record was missing.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Record {
-    ModuleInfo,
-    ModuleDecls,
-    CrateRoot,
-}
+use blaze_id::ItemKey;
+use blaze_surface::SurfaceError;
 
 /// Why a machine stopped.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum ResolveError {
-    /// The facts have no such record for `key` (a module's, or a crate's key's first 8 bytes'
-    /// owner for `CrateRoot`).
-    Missing { record: Record, module: ItemKey },
-    /// The facts have no crate-root record of `krate`.
-    NoCrateRoot { module: ItemKey, krate: CrateItemKey },
+    /// A record the resolution of `module` reads could not be read: missing, not built yet,
+    /// or of other bytes than its schema (the error names which record, and of what).
+    Surface { module: ItemKey, error: SurfaceError },
     /// A module's chain of parents is longer than [`crate::MAX_MODULE_DEPTH`] (a cycle in the
     /// module facts, or a tree no real crate has).
     ModuleTooDeep { module: ItemKey },
@@ -41,13 +32,9 @@ pub enum ResolveError {
 impl fmt::Display for ResolveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            ResolveError::Missing { record, module } => {
-                write!(f, "name resolution of module {module:x}: no {record:?} record")
+            ResolveError::Surface { module, error } => {
+                write!(f, "name resolution of module {module:x}: {error}")
             }
-            ResolveError::NoCrateRoot { module, krate } => write!(
-                f,
-                "name resolution of module {module:x}: no crate-root record of crate {krate:x}"
-            ),
             ResolveError::ModuleTooDeep { module } => write!(
                 f,
                 "name resolution of module {module:x}: more than {} parents",

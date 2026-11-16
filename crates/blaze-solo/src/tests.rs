@@ -174,7 +174,7 @@ impl Harness {
     }
 
     fn start(&mut self, ask: Ask) -> Live {
-        let config = Config { checkout: name(CO), state: name(ST), reading: reading(), ask, codes: codes(), tags: self.tags };
+        let config = Config { checkout: name(CO), state: name(ST), reading: reading(), ask, codes: codes(), tags: self.tags, lanes: 4 };
         self.tags += TAG_SPAN;
         let mut effects = Vec::new();
         let command = Command::start(config, self.sim.wall_ns(), self.sim.now(), &mut effects).expect("a command starts");

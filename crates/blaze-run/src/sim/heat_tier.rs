@@ -1,7 +1,8 @@
 //! [`Heat`] and [`Tier`] together, and the optimized record on a later run's load.
 //!
-//! The oracle of the first: a function is optimized exactly once when its heat, decayed as a
-//! naive model decays it, reaches the bound, and never otherwise; a job begun before a newer
+//! The oracle of the first: a function is optimized exactly once when its count stub reaches
+//! zero (however often it fires, and however late the events come), and never otherwise; a job
+//! begun before a newer
 //! snapshot is never filed or published. Of the second: an optimized record whose inlined
 //! callee changed is never published, and the fast record is; one whose callees hold is.
 
@@ -15,7 +16,7 @@ use super::{harness, key, oracle};
 use crate::heat::{Config as HeatConfig, Heat};
 use crate::parent::{Config as ParentConfig, Effect as ParentEffect, Found, FoundOptimized, Function, Parent};
 use crate::tier::{self, Callee, Inlined, Job, Optimized, Optimizer};
-use crate::{CodeId, CodeRef, Hooks, InstanceKey, Made, Nanos, Plant, RecordKey, SlotId, Snapshot, Tier, Version, Why};
+use crate::{CodeId, CodeRef, InstanceKey, Made, Nanos, Plant, RecordKey, SlotId, Snapshot, Tier, Why};
 
 const SLOTS: u32 = 4;
 
@@ -23,15 +24,27 @@ fn instance(slot: SlotId) -> InstanceKey {
     InstanceKey(key(u64::from(slot.0)))
 }
 
+/// Gives each slot made hot to the tier; a second start of one is the oracle's finding.
+fn give(hot: &mut Own<SlotId, Global>, tier: &mut tier::Tier<Global>, effects: &mut Own<tier::Effect, Global>) -> Result<(), Broke> {
+    for slot in hot.drain(..) {
+        match tier.hot(slot, instance(slot), effects) {
+            Ok(()) => {}
+            Err(tier::Error::Twice { slot }) => {
+                return Err(Broke::Oracle(format!("slot {} was tiered twice", slot.0)));
+            }
+            Err(error) => return Err(harness(error)),
+        }
+    }
+    Ok(())
+}
+
 fn heated(tape: &Tape, plant: Plant) -> Result<(), Broke> {
-    let config = HeatConfig { bound: 40, period: Nanos(100), shift: 1 };
-    let mut heat = Heat::new(SLOTS, config, Nanos(0), Global).map_err(harness)?;
+    let mut heat = Heat::new(SLOTS, HeatConfig { bound: 40 }, Global).map_err(harness)?;
     heat.plant = plant;
     let mut tier = tier::Tier::new(SLOTS, 2, Snapshot(0), Global).map_err(harness)?;
-    let mut model = [0u64; SLOTS as usize];
+    // Each count stub's counter, as the stub counts it down, while its stub is in.
+    let mut counters: [Option<u32>; SLOTS as usize] = [Some(heat.bound()); SLOTS as usize];
     let mut crossed = BTreeSet::new();
-    let mut since = 0u64;
-    let mut now = 0u64;
     let mut hot = Own::new_in(Global);
     let mut effects = Own::new_in(Global);
     let mut running: Vec<Job> = Vec::new();
@@ -50,20 +63,22 @@ fn heated(tape: &Tape, plant: Plant) -> Result<(), Broke> {
             0 | 1 => {
                 let slot = SlotId(tape.below(u64::from(SLOTS), "slot") as u32);
                 let by = tape.below(30, "calls") as u32;
-                model[slot.index()] += u64::from(by);
-                if model[slot.index()] >= 40 {
-                    crossed.insert(slot);
+                let Some(left) = counters[slot.index()] else { continue };
+                if by < left {
+                    counters[slot.index()] = Some(left - by);
+                    continue;
                 }
-                heat.charge(slot, by, &mut hot).map_err(harness)?;
-                for slot in hot.drain(..) {
-                    match tier.hot(slot, instance(slot), &mut effects) {
-                        Ok(()) => {}
-                        Err(tier::Error::Twice { slot }) => {
-                            return Err(Broke::Oracle(format!("slot {} was tiered twice", slot.0)));
-                        }
-                        Err(error) => return Err(harness(error)),
-                    }
+                // The stub reached zero; another thread's call may fire it again before the
+                // control thread turns it off.
+                crossed.insert(slot);
+                heat.reached(slot, &mut hot).map_err(harness)?;
+                if tape.coin("fired again") {
+                    heat.reached(slot, &mut hot).map_err(harness)?;
                 }
+                if !heat.counted(slot) {
+                    counters[slot.index()] = None;
+                }
+                give(&mut hot, &mut tier, &mut effects)?;
             }
             2 if !running.is_empty() => {
                 let job = running.remove(tape.index(running.len(), "ended"));
@@ -87,14 +102,11 @@ fn heated(tape: &Tape, plant: Plant) -> Result<(), Broke> {
                     }
                 }
             }
-            3 => {
-                now += tape.below(150, "time");
-                let periods = (now - since) / 100;
-                since += periods * 100;
-                for count in &mut model {
-                    *count = if periods >= 64 { 0 } else { *count >> periods };
-                }
-                heat.tick(Nanos(now)).map_err(harness)?;
+            // An event queued before the stub was off, handed over late.
+            3 if !crossed.is_empty() => {
+                let late: Vec<SlotId> = crossed.iter().copied().collect();
+                heat.reached(late[tape.index(late.len(), "late")], &mut hot).map_err(harness)?;
+                give(&mut hot, &mut tier, &mut effects)?;
             }
             4 if tape.one_in(8, "a newer snapshot") => {
                 snapshot = Snapshot(snapshot.0 + 1);
@@ -217,7 +229,7 @@ fn reloaded(tape: &Tape, plant: Plant) -> Result<(), Broke> {
         callees: &[],
         optimized: Some(FoundOptimized { code: record.code, inlined: &record.inlined }),
     };
-    parent.looked(Version { slot: f, hooks: Hooks::NONE }, Some(found), &mut out).map_err(harness)?;
+    parent.looked(f, Some(found), &mut out).map_err(harness)?;
     let published = out.iter().find_map(|effect| match effect {
         ParentEffect::Publish { slot, tier, code, .. } if *slot == f => Some((*tier, *code)),
         _ => None,

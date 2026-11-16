@@ -4,11 +4,14 @@
 //! exists to avoid: a mapped buffer is read where it sits.
 //!
 //! Every view checks before it casts: size and alignment here, the value by [`Record::check`],
-//! whose contract (`unsafe trait Record`) makes what it accepts a valid value.
+//! whose contract (`unsafe trait Record`) makes what it accepts a valid value. Each one first
+//! names [`Record::VERIFIED`], so a record declared in safe code ([`crate::declared`]) is
+//! never viewed until the compiler has checked its declaration against the type itself.
 
-use std::mem::{align_of, size_of, size_of_val};
+use core::mem::{align_of, size_of, size_of_val};
 
-use crate::{ALIGN, Block, FormatError, Record, Rel, Slice};
+use crate::declared::{ByteEnum, FromByte, Layout};
+use crate::{FormatError, Record, Rel, Slice};
 
 /// A type every bit pattern of whose size is a value, viewed in place without a check of its
 /// own: a [`Rel`] or a [`Slice`] (an `i32`, a `u32` and a zero-sized marker), whose targets
@@ -41,9 +44,11 @@ fn fits<T>(bytes: &[u8], len: usize, buffer: &[u8]) -> Result<(), FormatError> {
 
 /// The bytes of `values`.
 pub(crate) fn bytes_of<T: Record>(values: &[T]) -> &[u8] {
+    const { T::VERIFIED };
     // SAFETY: `values` is `size_of_val(values)` bytes, all initialised since `Record`'s
-    // contract rules out padding; `u8` needs no alignment, and the bytes borrow `values`.
-    unsafe { std::slice::from_raw_parts(values.as_ptr().cast::<u8>(), size_of_val(values)) }
+    // contract rules out padding (for a declared record, `VERIFIED` above refuses to compile
+    // one whose fields don't fill it); `u8` needs no alignment, and the bytes borrow `values`.
+    unsafe { core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), size_of_val(values)) }
 }
 
 /// `bytes`, a part of `buffer`, as a `T`, once [`Record::check`] accepts them when `DEEP`
@@ -53,6 +58,7 @@ pub(crate) fn view<'a, T: Record, const DEEP: bool>(
     bytes: &'a [u8],
     buffer: &[u8],
 ) -> Result<&'a T, FormatError> {
+    const { T::VERIFIED };
     fits::<T>(bytes, 1, buffer)?;
     match DEEP {
         true => T::check(bytes, buffer)?,
@@ -73,6 +79,7 @@ pub(crate) fn view_slice<'a, T: Record, const DEEP: bool>(
     len: usize,
     buffer: &[u8],
 ) -> Result<&'a [T], FormatError> {
+    const { T::VERIFIED };
     fits::<T>(bytes, len, buffer)?;
     let size = size_of::<T>();
     match DEEP {
@@ -88,7 +95,7 @@ pub(crate) fn view_slice<'a, T: Record, const DEEP: bool>(
     // each (a size is a multiple of its alignment), and each is a valid `T`: checked above, or
     // `T::PLAIN`, or `T::SHALLOW_PLAIN` (any bits, references unfollowed) when not `DEEP`. The
     // slice borrows `bytes`.
-    Ok(unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<T>(), len) })
+    Ok(unsafe { core::slice::from_raw_parts(bytes.as_ptr().cast::<T>(), len) })
 }
 
 /// `bytes`, a part of `buffer`, as an `H`, which any bytes of its size are.
@@ -101,18 +108,42 @@ pub(crate) fn in_place<'a, H: AnyBits>(
     Ok(unsafe { &*bytes.as_ptr().cast::<H>() })
 }
 
+/// The one byte of `value`, a fieldless enum one byte long: its discriminant. What a
+/// [`ByteEnum`] record's check compares a byte with, so it accepts only the bytes of values.
+pub(crate) fn enum_byte<S: FromByte>(value: &S) -> u8 {
+    const { <ByteEnum as Layout<S>>::VERDICT.assert() };
+    // SAFETY: the verdict above refuses to compile unless `S` is an enum one byte long whose
+    // variants hold no fields, so its one byte is its discriminant, always initialised; `u8`
+    // needs no alignment, and `value` is a valid `S` borrowed for the read.
+    unsafe { *(value as *const S).cast::<u8>() }
+}
+
 /// The first `len` bytes of `blocks`.
-pub(crate) fn blocks_bytes(blocks: &[Block], len: usize) -> &[u8] {
-    assert!(len <= blocks.len() * ALIGN, "{len} bytes of {} blocks", blocks.len());
+#[cfg(feature = "alloc")]
+pub(crate) fn blocks_bytes(blocks: &[crate::writer::Block], len: usize) -> &[u8] {
+    assert!(len <= blocks.len() * crate::ALIGN, "{len} bytes of {} blocks", blocks.len());
     // SAFETY: a `Block` is `ALIGN` initialised bytes with no padding, so `blocks` holds at
     // least `len` of them (asserted above) in a row; the bytes borrow `blocks`.
-    unsafe { std::slice::from_raw_parts(blocks.as_ptr().cast::<u8>(), len) }
+    unsafe { core::slice::from_raw_parts(blocks.as_ptr().cast::<u8>(), len) }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::vec::Vec;
+
     use super::*;
-    use crate::Aligned;
+
+    /// 64 bytes at an address aligned to 16, as a buffer is.
+    #[repr(C, align(16))]
+    struct Buffer([u8; 64]);
+
+    impl Buffer {
+        fn of(bytes: &[u8]) -> Buffer {
+            let mut buffer = Buffer([0; 64]);
+            buffer.0[..bytes.len()].copy_from_slice(bytes);
+            buffer
+        }
+    }
 
     /// The safe reference for each view: the values decoded a byte at a time.
     fn words(bytes: &[u8]) -> Vec<u32> {
@@ -121,28 +152,29 @@ mod tests {
 
     #[test]
     fn views_read_what_a_byte_at_a_time_decode_reads() {
-        let values: Vec<u32> = (0..100u32).map(|n| n.wrapping_mul(2_654_435_761)).collect();
+        let values: Vec<u32> = (0..16u32).map(|n| n.wrapping_mul(2_654_435_761)).collect();
         let bytes = bytes_of(&values);
         let le: Vec<u8> = values.iter().flat_map(|it| it.to_le_bytes()).collect();
         assert_eq!(bytes, &le[..]);
-        let buffer = Aligned::copy_from(bytes);
-        for len in [0, 1, 7, 100] {
+        let buffer = Buffer::of(bytes);
+        let buffer = &buffer.0[..];
+        for len in [0, 1, 7, 16] {
             assert_eq!(
-                view_slice::<u32, true>(&buffer[..4 * len], len, &buffer).unwrap(),
+                view_slice::<u32, true>(&buffer[..4 * len], len, buffer).unwrap(),
                 &words(&buffer[..4 * len])[..]
             );
             assert_eq!(
-                view_slice::<u32, false>(&buffer[..4 * len], len, &buffer).unwrap(),
+                view_slice::<u32, false>(&buffer[..4 * len], len, buffer).unwrap(),
                 &words(&buffer[..4 * len])[..]
             );
         }
-        assert_eq!(*view::<u32, true>(&buffer[8..12], &buffer).unwrap(), words(&buffer[8..12])[0]);
-        assert_eq!(*view::<u32, false>(&buffer[8..12], &buffer).unwrap(), words(&buffer[8..12])[0]);
+        assert_eq!(*view::<u32, true>(&buffer[8..12], buffer).unwrap(), words(&buffer[8..12])[0]);
+        assert_eq!(*view::<u32, false>(&buffer[8..12], buffer).unwrap(), words(&buffer[8..12])[0]);
         assert_eq!(
-            *view::<u64, true>(&buffer[8..16], &buffer).unwrap(),
+            *view::<u64, true>(&buffer[8..16], buffer).unwrap(),
             u64::from_le_bytes(buffer[8..16].try_into().unwrap())
         );
-        let slice = in_place::<Slice<u32>>(&buffer[16..24], &buffer).unwrap();
+        let slice = in_place::<Slice<u32>>(&buffer[16..24], buffer).unwrap();
         assert_eq!(
             (slice.offset, slice.len),
             (words(&buffer[16..20])[0] as i32, words(&buffer[20..24])[0])
@@ -151,29 +183,32 @@ mod tests {
 
     #[test]
     fn a_view_of_the_wrong_size_or_alignment_is_refused() {
-        let buffer = Aligned::copy_from(&[0; 64]);
-        assert!(view::<u32, true>(&buffer[1..5], &buffer).is_err());
-        assert!(view::<u32, false>(&buffer[1..5], &buffer).is_err());
-        assert!(view::<u32, true>(&buffer[0..3], &buffer).is_err());
-        assert!(view::<u64, false>(&buffer[4..12], &buffer).is_err());
-        assert!(view_slice::<u32, true>(&buffer[0..8], 3, &buffer).is_err());
-        assert!(view_slice::<u32, false>(&buffer[2..10], 2, &buffer).is_err());
-        assert!(view_slice::<u32, false>(&buffer[0..8], usize::MAX, &buffer).is_err());
+        let buffer = Buffer::of(&[]);
+        let buffer = &buffer.0[..];
+        assert!(view::<u32, true>(&buffer[1..5], buffer).is_err());
+        assert!(view::<u32, false>(&buffer[1..5], buffer).is_err());
+        assert!(view::<u32, true>(&buffer[0..3], buffer).is_err());
+        assert!(view::<u64, false>(&buffer[4..12], buffer).is_err());
+        assert!(view_slice::<u32, true>(&buffer[0..8], 3, buffer).is_err());
+        assert!(view_slice::<u32, false>(&buffer[2..10], 2, buffer).is_err());
+        assert!(view_slice::<u32, false>(&buffer[0..8], usize::MAX, buffer).is_err());
         assert!(
-            view_slice::<Slice<u32>, false>(&buffer[2..10], 1, &buffer).is_err(),
+            view_slice::<Slice<u32>, false>(&buffer[2..10], 1, buffer).is_err(),
             "a Slice off its alignment"
         );
-        assert!(in_place::<Rel<u32>>(&buffer[2..6], &buffer).is_err());
-        let two = Aligned::copy_from(&[2]);
-        assert!(view::<bool, true>(&two, &two).is_err(), "a bool of 2");
-        assert!(view::<bool, false>(&two, &two).is_err(), "a bool of 2, shallow");
+        assert!(in_place::<Rel<u32>>(&buffer[2..6], buffer).is_err());
+        let two = Buffer::of(&[2]);
+        let two = &two.0[..1];
+        assert!(view::<bool, true>(two, two).is_err(), "a bool of 2");
+        assert!(view::<bool, false>(two, two).is_err(), "a bool of 2, shallow");
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn blocks_give_their_first_bytes() {
         let bytes: Vec<u8> = (0..=255).collect();
         for len in [0, 1, 15, 16, 17, 255] {
-            assert_eq!(&*Aligned::copy_from(&bytes[..len]), &bytes[..len]);
+            assert_eq!(&*crate::Aligned::copy_from(&bytes[..len]), &bytes[..len]);
         }
     }
 }

@@ -18,6 +18,12 @@ doctest = false
 blaze-id.workspace = true
 # `HashMap`: the machine's single-owner indexes, in the allocator it is made in.
 blaze-hash.workspace = true
+# The words of the item layer (`Namespace`, `Def`, `Binding`, `Visibility`, ...), the working
+# forms of the records the machine reads and writes (`DeclsBuilder`, `CrateRootBuilder`,
+# `ScopeBuilder`) and `Items`, which `RecordFacts` reads them through: one home for each.
+blaze-surface.workspace = true
+# `Vec`: every list of the machine, in the allocator it is made in.
+blaze-own.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true

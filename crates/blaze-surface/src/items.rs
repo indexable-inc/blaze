@@ -11,11 +11,12 @@ use crate::lang_items::LangItemsView;
 use crate::error::{NotBuilt, SurfaceError};
 use crate::file_items::{FileItem, FileItemsView};
 use crate::key_index::KeyEntry;
-use crate::kind::{ByteRange, ItemKind, Namespace, Place, Target};
+use crate::kind::{Binding, ItemKind, Range, Namespace, Place};
 use crate::locals::{AnyItem, Local, LocalTable};
 use crate::module_decls::ModuleDeclsView;
 use crate::module_scope::ScopeView;
-use crate::names::{CrateRootView, MacroDefView, ModuleFileView, TextualEntryView};
+use crate::macro_def::MacroDefView;
+use crate::names::{CrateRootView, ModuleFileView, TextualEntryView};
 use crate::proof::HasText;
 
 /// What may be asked of any crate's items: every method reads records, and none can reach
@@ -97,7 +98,7 @@ pub trait Items {
     /// What the item is.
     fn kind(&self, item: ItemKey) -> Result<ItemKind, SurfaceError> {
         match self.place(item)? {
-            Place::File { .. } => Ok(self.file_item(item)?.1.kind),
+            Place::File { .. } => Ok(self.file_item(item)?.1.kind()),
             Place::Expansion { .. } => Err(NotBuilt { method: "kind", item }.into()),
         }
     }
@@ -108,8 +109,8 @@ pub trait Items {
         module: ItemKey,
         ns: Namespace,
         name: &str,
-    ) -> Result<Option<Target<ItemKey>>, SurfaceError> {
-        Ok(self.scope(module)?.get(ns, name).map(|binding| binding.target))
+    ) -> Result<Option<Binding>, SurfaceError> {
+        Ok(self.scope(module)?.get(ns, name))
     }
 
     /// [`Items::place`] of a task's local.
@@ -151,16 +152,17 @@ pub trait Items {
         self.scope(locals.key(module)?)
     }
 
-    /// [`Items::lookup`] in a task's local module, what it finds numbered in the task's table.
+    /// [`Items::lookup`] in a task's local module: the binding, and its target numbered in the
+    /// task's table.
     fn local_lookup<A: Allocator + Clone>(
         &self,
         locals: &mut LocalTable<AnyItem, A>,
         module: Local<AnyItem>,
         ns: Namespace,
         name: &str,
-    ) -> Result<Option<Target<Local<AnyItem>>>, SurfaceError> {
+    ) -> Result<Option<(Local<AnyItem>, Binding)>, SurfaceError> {
         match self.lookup(locals.key(module)?, ns, name)? {
-            Some(target) => Ok(Some(target.try_map(|key| locals.intern(key))?)),
+            Some(binding) => Ok(Some((locals.intern(binding.def.key)?, binding))),
             None => Ok(None),
         }
     }
@@ -186,17 +188,24 @@ pub trait Source: Items {
 
     /// The text of the item's signature.
     fn signature_text(&self, proof: HasText, item: ItemKey) -> Result<&str, SurfaceError> {
-        range_text(self, proof, item, |row| row.signature, "the signature's bytes in its file")
+        range_text(self, proof, item, |_, row| row.signature, "the signature's bytes in its file")
     }
 
     /// The text of the item's body; empty when it has none.
     fn body_text(&self, proof: HasText, item: ItemKey) -> Result<&str, SurfaceError> {
-        range_text(self, proof, item, |row| row.body, "the body's bytes in its file")
+        let empty = Range::new(0, 0);
+        range_text(self, proof, item, |_, row| row.body.unwrap_or(empty), "the body's bytes in its file")
     }
 
     /// The text of the item's outer attributes and doc comments.
     fn attrs_text(&self, proof: HasText, item: ItemKey) -> Result<&str, SurfaceError> {
-        range_text(self, proof, item, |row| row.attrs, "the attributes' bytes in its file")
+        range_text(
+            self,
+            proof,
+            item,
+            |view, row| view.outer_attrs(row),
+            "the attributes' bytes in its file",
+        )
     }
 
     /// [`Source::signature_text`] of a task's local.
@@ -220,18 +229,23 @@ pub trait Source: Items {
     }
 }
 
-/// The bytes `pick` gives of the item's row, in its file's text. A range outside the text, or
-/// one cutting a character, is a `FileItems` record of other bytes than the text: refused as
-/// no record of `fact`.
+/// The bytes `pick` gives of the item's row (a range relative to the item), in its file's
+/// text. A range outside the text, or one cutting a character, is a `FileItems` record of other
+/// bytes than the text: refused as no record of `fact`. An item an expansion made is
+/// [`NotBuilt`], as for [`Items::file_item`].
 fn range_text<'s, S: Source + ?Sized>(
     source: &'s S,
     proof: HasText,
     item: ItemKey,
-    pick: impl FnOnce(&FileItem<'_>) -> ByteRange,
+    pick: impl FnOnce(&FileItemsView<'_>, &FileItem<'_>) -> Range,
     fact: &'static str,
 ) -> Result<&'s str, SurfaceError> {
     source.check(proof)?;
-    let (file, row) = source.file_item(item)?;
-    let range = pick(&row).in_file(row.at).ok_or(SurfaceError::NoRecord { fact, item })?;
-    source.text(proof, file)?.get(range).ok_or(SurfaceError::NoRecord { fact, item })
+    let Place::File { file, index } = source.place(item)? else {
+        return Err(NotBuilt { method: "file_item", item }.into());
+    };
+    let view = source.file_items(file)?;
+    let row = view.item(index).ok_or(SurfaceError::NoRecord { fact: "the item's row of its FileItems", item })?;
+    let range = row.checked_in_file(pick(&view, &row)).ok_or(SurfaceError::NoRecord { fact, item })?;
+    source.text(proof, file)?.get(range.to_usize()).ok_or(SurfaceError::NoRecord { fact, item })
 }

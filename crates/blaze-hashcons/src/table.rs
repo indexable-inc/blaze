@@ -14,6 +14,7 @@
 //!   the shard: an index to a node is arithmetic and two acquire loads.
 
 use std::{
+    alloc::Global,
     any::type_name,
     fmt, hash,
     ops::Deref,
@@ -72,7 +73,7 @@ struct Shard<T> {
     len: AtomicU32,
     /// The shard's nodes by their fingerprint's bits 64..128: a find is one control word and
     /// one slot, then the node's fingerprint compared only on a tag match.
-    index: Index,
+    index: Index<Global>,
     nodes: [OnceLock<Chunk<T>>; CHUNKS],
 }
 
@@ -103,7 +104,7 @@ impl<T> Shard<T> {
         Shard {
             lock: ShardLock::new(),
             len: AtomicU32::new(0),
-            index: Index::new(),
+            index: Index::new_in(Global),
             nodes: std::array::from_fn(|_| OnceLock::new()),
         }
     }

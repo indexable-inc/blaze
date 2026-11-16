@@ -1,6 +1,6 @@
 [package]
 name = "blaze-blake3"
-description = "BLAKE3, written here: every mode blaze uses and the extended output, bit for bit official BLAKE3's, whole chunks side by side in SIMD lanes; no dependencies"
+description = "BLAKE3, written here: every mode blaze uses and the extended output, bit for bit official BLAKE3's, whole chunks side by side in SIMD lanes, and the CPU feature detection the bottom of the tree dispatches on; `no_std`, no allocation, no dependencies"
 publish = false
 
 version.workspace = true

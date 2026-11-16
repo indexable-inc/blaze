@@ -11,7 +11,7 @@
 #[derive(Default, Clone, Copy)]
 pub struct KeyHasher(u64);
 
-impl std::hash::Hasher for KeyHasher {
+impl core::hash::Hasher for KeyHasher {
     #[inline]
     fn finish(&self) -> u64 {
         self.0
@@ -33,8 +33,8 @@ impl std::hash::Hasher for KeyHasher {
     fn write_usize(&mut self, _: usize) {}
 }
 
-/// The `BuildHasher` of [`KeyHasher`], for a table built elsewhere (`hashbrown`, `with_hasher`).
-pub type BuildKeyHasher = std::hash::BuildHasherDefault<KeyHasher>;
+/// The `BuildHasher` of [`KeyHasher`], for a table built elsewhere (papaya's, `with_hasher`).
+pub type BuildKeyHasher = core::hash::BuildHasherDefault<KeyHasher>;
 
 /// A map on hashes, indexed by the hash itself, in the allocator `A`, which every use names
 /// (`ByHash::new_in(frame)`).

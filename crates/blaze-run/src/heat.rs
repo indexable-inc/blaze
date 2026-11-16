@@ -1,47 +1,39 @@
-//! [`Heat`]: how hot each function is, and the one moment it becomes hot.
+//! [`Heat`]: the one moment each function becomes hot.
 //!
-//! Fast code charges its slot's counter in its prologue (a plain add to a `u32` in the table's
-//! mapping beside the words; a lost increment between two threads only cools a function a
-//! little). The control thread samples the counters on its clock and charges the differences
-//! here. A function whose heat reaches [`Config::bound`] is hot: it is given to the optimizing
-//! tier once, and never again in the run, however hot it stays. Heat decays: every
-//! [`Config::period`] of the clock, each count is shifted right by [`Config::shift`], so a
-//! function that ran hot once at the start and never again does not stay hot by age alone.
+//! Nothing counts in a function's code. While a function is in the fast tier its slot word is a
+//! count stub ([`crate::Watch::HEAT`]): the stub counts down a per-function counter in a data
+//! table beside the words, set to [`Config::bound`] when the stub goes in (a plain decrement: a
+//! lost one between two threads only delays the function a call), and at zero calls into the
+//! runtime, which queues the slot for the control thread and stores nothing. The control thread
+//! hands each such event to [`Heat::reached`]: the first for a slot makes it hot, once for the
+//! run, however often the stub fires before its word is gone; the driver then turns the count
+//! stub off (`Slots::plain`), so a hot function stops paying for being counted, and gives the
+//! slot to the optimizing tier. Relax measured about 5% of cycles in count stubs before removing
+//! them at its last tier; here a function pays them for at most `bound` calls.
+//!
+//! The count is of calls since the stub went in, not decayed by time: a function called `bound`
+//! times is worth one background compile whenever the calls came, and that compile never takes
+//! the worker kept for a thread's own function.
 
 #![blaze::sans_io]
 
 use core::alloc::Allocator;
 
-use blaze_own::{Vec, soa};
+use blaze_own::Vec;
 
-use crate::{Nanos, Plant, SlotId};
-
-soa! {
-    /// One slot's heat: its count this period, and whether it was given to the tier (once, for
-    /// the run). The decay scans `counts` alone.
-    struct Row, Rows, RowRef {
-        count: u32 => counts / counts_mut,
-        queued: bool => queued / queued_mut,
-    }
-}
+use crate::{Plant, SlotId};
 
 /// The heat's parameters.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Config {
-    /// The count at which a function is hot.
+    /// The calls at which a function is hot: what each count stub's counter starts at.
     pub bound: u32,
-    /// The decay's period on the driver's clock.
-    pub period: Nanos,
-    /// How far each count is shifted right each period: 1 halves it.
-    pub shift: u8,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Error {
     Config { what: &'static str, value: u64 },
     NoSlot { slot: SlotId, slots: u32 },
-    /// A time before the last one given.
-    Backwards { now: Nanos, last: Nanos },
 }
 
 impl core::fmt::Display for Error {
@@ -49,10 +41,7 @@ impl core::fmt::Display for Error {
         match *self {
             Error::Config { what, value } => write!(f, "the heat's config: {what} ({value})"),
             Error::NoSlot { slot, slots } => {
-                write!(f, "heat charged to slot {}, past the table's {slots}", slot.0)
-            }
-            Error::Backwards { now, last } => {
-                write!(f, "the heat's clock went from {} ns back to {} ns", last.0, now.0)
+                write!(f, "a count stub of slot {} fired, past the table's {slots}", slot.0)
             }
         }
     }
@@ -60,71 +49,45 @@ impl core::fmt::Display for Error {
 
 impl core::error::Error for Error {}
 
-/// The counts of one program's slots. See the module's documentation.
+/// Which of one program's slots are hot. See the module's documentation.
 pub struct Heat<A: Allocator> {
     config: Config,
-    slots: Rows<A>,
-    /// The start of the period the counts are in.
-    since: Nanos,
+    /// A flag a slot: given to the tier (once, for the run). One column, scanned by nothing.
+    hot: Vec<bool, A>,
     pub(crate) plant: Plant,
 }
 
 impl<A: Allocator> Heat<A> {
-    pub fn new(slots: u32, config: Config, start: Nanos, alloc: A) -> Result<Heat<A>, Error> {
+    pub fn new(slots: u32, config: Config, alloc: A) -> Result<Heat<A>, Error> {
         if config.bound == 0 {
             return Err(Error::Config { what: "a bound of 0 makes every function hot", value: 0 });
         }
-        if config.period.0 == 0 {
-            return Err(Error::Config { what: "a decay period of 0 ns", value: 0 });
-        }
-        if config.shift == 0 || config.shift > 31 {
-            return Err(Error::Config {
-                what: "a decay shift outside 1 to 31",
-                value: u64::from(config.shift),
-            });
-        }
-        let mut rows = Rows::with_capacity_in(slots as usize, alloc);
-        for _ in 0..slots {
-            rows.push(Row { count: 0, queued: false });
-        }
-        Ok(Heat { config, slots: rows, since: start, plant: Plant::None })
+        Ok(Heat { config, hot: Vec::from_elem_in(false, slots as usize, alloc), plant: Plant::None })
     }
 
-    /// The decay up to `now`: one shift for each whole period since the last.
-    pub fn tick(&mut self, now: Nanos) -> Result<(), Error> {
-        if now < self.since {
-            return Err(Error::Backwards { now, last: self.since });
-        }
-        let periods = (now.0 - self.since.0) / self.config.period.0;
-        if periods == 0 {
-            return Ok(());
-        }
-        self.since = Nanos(self.since.0 + periods * self.config.period.0);
-        let shift = periods.saturating_mul(u64::from(self.config.shift));
-        for count in self.slots.counts_mut() {
-            *count = if shift >= 32 { 0 } else { *count >> shift };
-        }
-        Ok(())
+    /// What a count stub's counter starts at.
+    pub fn bound(&self) -> u32 {
+        self.config.bound
     }
 
-    /// `by` more calls of `slot` in this period. Pushes `slot` to `hot` the one time it becomes
-    /// hot.
-    pub fn charge<B: Allocator>(&mut self, slot: SlotId, by: u32, hot: &mut Vec<SlotId, B>) -> Result<(), Error> {
-        let slots = self.slots.len() as u32;
-        let Some(count) = self.slots.counts_mut().get_mut(slot.index()) else {
+    /// Whether `slot` is to be counted: a count stub goes in front of its fast code until it is
+    /// hot, never after.
+    pub fn counted(&self, slot: SlotId) -> bool {
+        self.hot.get(slot.index()).is_some_and(|hot| !*hot)
+    }
+
+    /// `slot`'s count stub reached zero. Pushes `slot` to `hot` the one time it becomes hot;
+    /// a later event of the same slot (a stub that fired again before its word was gone) is
+    /// nothing.
+    pub fn reached<B: Allocator>(&mut self, slot: SlotId, hot: &mut Vec<SlotId, B>) -> Result<(), Error> {
+        let slots = self.hot.len() as u32;
+        let Some(was) = self.hot.get_mut(slot.index()) else {
             return Err(Error::NoSlot { slot, slots });
         };
-        *count = count.saturating_add(by);
-        let hot_now = *count >= self.config.bound;
-        let queued = &mut self.slots.queued_mut()[slot.index()];
-        if hot_now && (!*queued || self.plant == Plant::HotTwice) {
-            *queued = true;
+        if !*was || self.plant == Plant::HotTwice {
+            *was = true;
             hot.push(slot);
         }
         Ok(())
-    }
-
-    pub fn count(&self, slot: SlotId) -> Option<u32> {
-        self.slots.counts().get(slot.index()).copied()
     }
 }

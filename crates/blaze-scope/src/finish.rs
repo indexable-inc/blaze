@@ -8,9 +8,13 @@
 
 use core::alloc::Allocator;
 
-use alloc::vec::Vec;
 use blaze_hash::HashMap;
 use blaze_id::ItemKey;
+use blaze_own::Vec;
+use blaze_surface::{
+    AnonImport, Binding, Def, DefKind, Namespace, Origin, Path, ScopeBuilder, ScopeEntry, ScopeError,
+    Site, TextualDef, TextualMark, Unresolved, Visibility,
+};
 
 use crate::error::ResolveError;
 use crate::facts::{Name, ScopeFacts};
@@ -18,10 +22,7 @@ use crate::read::Read;
 #[cfg(test)]
 use crate::resolver::Plant;
 use crate::resolver::{Cached, CallState, Env, NsRes, Query, Res, Resolver, Scan, Sink, Slot, Source};
-use crate::scope::{
-    AnonImport, Binding, Def, DefKind, ModuleScope, Namespace, ReadList, Resolved, ScopeEntry,
-    ScopeError, Site, TextualDef, TextualMark, Unresolved, Visibility,
-};
+use crate::scope::{ReadList, Resolved, SeenFrom};
 
 /// What a member's final pass came to.
 pub(crate) enum Finish<N, A: Allocator> {
@@ -37,7 +38,7 @@ fn len32(n: usize) -> u32 {
 /// The errors of the final pass, in the module's tree order, and the non-glob bindings seen so
 /// far for `Duplicate`.
 struct Errors<N, A: Allocator> {
-    list: Vec<ScopeError<N, A>, A>,
+    list: Vec<ScopeError<N, Path<N, A>>, A>,
     seen: HashMap<(Namespace, N), Def, A>,
 }
 
@@ -71,7 +72,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         let mut names = Vec::new_in(a.clone());
         let mut seen = Vec::new_in(a.clone());
         self.glob_names(env, &mut sink, &mut seen, &mut names);
-        names.sort();
+        names.sort_unstable();
         names.dedup();
         let q = Query { asker: self.asker(), restricted: false, ignore: None };
         let mut bindings = Vec::with_capacity_in(names.len(), a.clone());
@@ -104,7 +105,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
             }
         }
         sink.check(self.module)?;
-        undetermined.sort_by(|x, y| self.tree_cmp(x.0, y.0));
+        undetermined.sort_unstable_by(|x, y| self.tree_cmp(x.0, y.0).then(x.1.cmp(&y.1)));
         undetermined.dedup_by(|x, y| x.1 == y.1);
         for &(_, g) in undetermined.iter() {
             let glob = &self.globs[g as usize];
@@ -134,7 +135,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
                     Some(vis) => {
                         if let Ok(k) = bindings.binary_search_by(|e| (e.ns, e.name).cmp(&(*ns, *name))) {
                             let b = &mut bindings[k].binding;
-                            if b.def == *def && b.origin == crate::scope::Origin::Declared {
+                            if b.def == *def && b.origin == Origin::Declared {
                                 b.vis = vis;
                             }
                         }
@@ -147,7 +148,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         let mut textual = Vec::new_in(a.clone());
         let mut marks = Vec::new_in(a.clone());
         self.flatten(0, &mut textual, Some(&mut marks), env, &mut sink);
-        marks.sort_by_key(|m: &TextualMark| m.child);
+        marks.sort_unstable_by_key(|m: &TextualMark| m.child);
         let mut traits = Vec::new_in(a.clone());
         let mut macro_exports = Vec::new_in(a.clone());
         self.anon_and_exports(0, &mut traits, &mut macro_exports);
@@ -161,13 +162,13 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
             Some(m) => !fellows.contains(&m),
             None => true,
         });
-        entries.sort_by(|x, y| x.read.cmp(&y.read));
+        entries.sort_unstable_by(|x, y| x.read.cmp(&y.read));
         entries.dedup_by(|x, y| x.read == y.read);
         let mut others = Vec::with_capacity_in(fellows.len(), a);
         others.extend(fellows.iter().copied().filter(|&m| m != self.module));
-        others.sort();
+        others.sort_unstable();
         Ok(Finish::Done(Resolved {
-            scope: ModuleScope {
+            scope: ScopeBuilder {
                 module: self.module,
                 bindings,
                 errors: errors.list,

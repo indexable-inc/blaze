@@ -7,7 +7,8 @@
 
 use std::{alloc::Global, path::PathBuf, time::Instant};
 
-use blaze_file_items::{Edition, ItemKind, outline};
+use blaze_file_items::outline;
+use blaze_surface::{Edition, ItemDetail};
 
 fn main() {
     let mut files: Vec<PathBuf, Global> = Vec::new_in(Global);
@@ -44,10 +45,10 @@ fn main() {
         let (mut items, mut errors, mut unhandled) = (0usize, 0usize, 0usize);
         let start = Instant::now();
         for text in &texts {
-            let made = outline(text, Edition::Edition2024, Global);
+            let made = outline(text, Edition::E2024, Global);
             items += made.items().len();
             errors += made.errors().len();
-            unhandled += made.items().iter().filter(|it| matches!(it.kind, ItemKind::Unhandled { .. })).count();
+            unhandled += made.items().iter().filter(|it| matches!(it.detail, ItemDetail::Unhandled { .. })).count();
         }
         let took = start.elapsed();
         println!(

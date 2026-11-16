@@ -13,11 +13,14 @@
 //! 8 at the target's baseline elsewhere (two NEON registers a word on AArch64). Parent nodes,
 //! the last chunk and inputs of one chunk are compressed one block at a time. Which path runs is
 //! dispatch on the CPU, not a fallback: every path computes the same bytes, held to the official
-//! test vectors and to the `blake3` crate (`tests/`).
+//! test vectors and to the `blake3` crate (`tests/`). The CPU's features are [`cpu`]'s, found on
+//! `core` alone: the crate is `no_std` and allocates nothing.
 
+#![no_std]
 #![feature(portable_simd)]
 #![deny(unsafe_code)]
 
+pub mod cpu;
 pub mod lanes;
 
 /// Bytes of a hash, and of a key.
@@ -100,7 +103,7 @@ fn one_shot(key: &[u32; 8], flags: u32, input: &[u8]) -> [u8; OUT_LEN] {
 
 /// `bytes`' eight little-endian words.
 fn words_of(bytes: &[u8; OUT_LEN]) -> [u32; 8] {
-    std::array::from_fn(|word| {
+    core::array::from_fn(|word| {
         u32::from_le_bytes([
             bytes[4 * word],
             bytes[4 * word + 1],
@@ -111,11 +114,11 @@ fn words_of(bytes: &[u8; OUT_LEN]) -> [u32; 8] {
 }
 
 fn first_32(block: &[u8; BLOCK_LEN]) -> [u8; OUT_LEN] {
-    std::array::from_fn(|byte| block[byte])
+    core::array::from_fn(|byte| block[byte])
 }
 
 fn first_8(words: &[u32; 16]) -> [u32; 8] {
-    std::array::from_fn(|word| words[word])
+    core::array::from_fn(|word| words[word])
 }
 
 #[inline(always)]
@@ -422,7 +425,7 @@ impl OutputReader {
             let block = self.root.root_block(self.position / BLOCK_LEN as u64);
             let offset = (self.position % BLOCK_LEN as u64) as usize;
             let take = (BLOCK_LEN - offset).min(out.len());
-            let (head, rest) = std::mem::take(&mut out).split_at_mut(take);
+            let (head, rest) = core::mem::take(&mut out).split_at_mut(take);
             head.copy_from_slice(&block[offset..offset + take]);
             out = rest;
             self.position += take as u64;
@@ -444,7 +447,7 @@ impl OutputReader {
 fn lanes_for_this_cpu() -> usize {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx512f") {
+        if cpu::has(cpu::Feature::Avx512f) {
             return 16;
         }
     }
@@ -459,7 +462,7 @@ fn hash_chunks(key: &[u32; 8], input: &[u8], counter: u64, flags: u32, out: &mut
         if out.len() == 16 {
             return x86::chunks_avx512(key, input, counter, flags, out);
         }
-        if std::arch::is_x86_feature_detected!("avx2") {
+        if cpu::has(cpu::Feature::Avx2) {
             return x86::chunks_avx2(key, input, counter, flags, out);
         }
     }
@@ -479,12 +482,12 @@ fn chunks_of<const N: usize>(
     assert_eq!(out.len(), N, "a batch of {N} chunks");
     assert_eq!(input.len(), N * CHUNK_LEN, "a batch of {N} whole chunks");
     let mut cv: [[u32; N]; 8] = key.map(|word| [word; N]);
-    let counter_low: [u32; N] = std::array::from_fn(|lane| (counter + lane as u64) as u32);
+    let counter_low: [u32; N] = core::array::from_fn(|lane| (counter + lane as u64) as u32);
     let counter_high: [u32; N] =
-        std::array::from_fn(|lane| ((counter + lane as u64) >> 32) as u32);
+        core::array::from_fn(|lane| ((counter + lane as u64) >> 32) as u32);
     let blocks = CHUNK_LEN / BLOCK_LEN;
     for block in 0..blocks {
-        let rows: [[u32; 16]; N] = std::array::from_fn(|lane| {
+        let rows: [[u32; 16]; N] = core::array::from_fn(|lane| {
             let at = lane * CHUNK_LEN + block * BLOCK_LEN;
             lanes::block_words(input[at..at + BLOCK_LEN].try_into().expect("a whole block"))
         });
@@ -505,7 +508,7 @@ fn chunks_of<const N: usize>(
         );
     }
     for (lane, slot) in out.iter_mut().enumerate() {
-        *slot = std::array::from_fn(|word| cv[word][lane]);
+        *slot = core::array::from_fn(|word| cv[word][lane]);
     }
 }
 
@@ -523,10 +526,7 @@ mod x86 {
         flags: u32,
         out: &mut [[u32; 8]],
     ) {
-        assert!(
-            std::arch::is_x86_feature_detected!("avx512f"),
-            "AVX-512F lanes on a CPU without it"
-        );
+        assert!(super::cpu::has(super::cpu::Feature::Avx512f), "AVX-512F lanes on a CPU without it");
         // SAFETY: a `target_feature` function may run only on a CPU with the feature, and this
         // one has AVX-512F, asserted just above.
         unsafe { chunks_wide(key, input, counter, flags, out) }
@@ -539,7 +539,7 @@ mod x86 {
         flags: u32,
         out: &mut [[u32; 8]],
     ) {
-        assert!(std::arch::is_x86_feature_detected!("avx2"), "AVX2 lanes on a CPU without it");
+        assert!(super::cpu::has(super::cpu::Feature::Avx2), "AVX2 lanes on a CPU without it");
         // SAFETY: a `target_feature` function may run only on a CPU with the feature, and this
         // one has AVX2, asserted just above.
         unsafe { chunks_narrow(key, input, counter, flags, out) }

@@ -9,6 +9,8 @@
 
 use std::cell::RefCell;
 
+#[cfg(target_arch = "x86_64")]
+use blaze_blake3::cpu::{self, Feature};
 use blaze_blake3::{
     CHUNK_END, CHUNK_START, DERIVE_KEY_MATERIAL, ROOT,
     lanes::{block_words, columns, rows_of},
@@ -149,10 +151,10 @@ fn last_blocks(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx512f") {
+        if cpu::has(Feature::Avx512f) {
             return x86::last_blocks_avx512(inputs, members, start, group, out);
         }
-        if std::arch::is_x86_feature_detected!("avx2") {
+        if cpu::has(Feature::Avx2) {
             return x86::last_blocks_avx2(inputs, members, start, group, out);
         }
     }
@@ -266,10 +268,10 @@ pub(crate) fn leading_lanes(
 ) {
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("avx512f") {
+        if cpu::has(Feature::Avx512f) {
             return x86::leading_lanes_avx512(key, inputs, members, blocks, cvs);
         }
-        if std::arch::is_x86_feature_detected!("avx2") {
+        if cpu::has(Feature::Avx2) {
             return x86::leading_lanes_avx2(key, inputs, members, blocks, cvs);
         }
     }
@@ -310,6 +312,8 @@ fn leading_lanes_of<const N: usize>(
 #[cfg(target_arch = "x86_64")]
 #[allow(unsafe_code)]
 mod x86 {
+    use blaze_blake3::cpu::{self, Feature};
+
     use super::Start;
     use crate::ContentId;
 
@@ -321,7 +325,7 @@ mod x86 {
         cvs: &mut Vec<[u32; 8]>,
     ) {
         assert!(
-            std::arch::is_x86_feature_detected!("avx512f"),
+            cpu::has(Feature::Avx512f),
             "AVX-512F lanes on a CPU without it"
         );
         // SAFETY: the CPU has AVX-512F, asserted just above.
@@ -335,7 +339,7 @@ mod x86 {
         blocks: usize,
         cvs: &mut Vec<[u32; 8]>,
     ) {
-        assert!(std::arch::is_x86_feature_detected!("avx2"), "AVX2 lanes on a CPU without it");
+        assert!(cpu::has(Feature::Avx2), "AVX2 lanes on a CPU without it");
         // SAFETY: the CPU has AVX2, asserted just above.
         unsafe { leading_narrow(key, inputs, members, blocks, cvs) }
     }
@@ -348,7 +352,7 @@ mod x86 {
         out: &mut [ContentId],
     ) {
         assert!(
-            std::arch::is_x86_feature_detected!("avx512f"),
+            cpu::has(Feature::Avx512f),
             "AVX-512F lanes on a CPU without it"
         );
         // SAFETY: the CPU has AVX-512F, asserted just above.
@@ -362,7 +366,7 @@ mod x86 {
         group: usize,
         out: &mut [ContentId],
     ) {
-        assert!(std::arch::is_x86_feature_detected!("avx2"), "AVX2 lanes on a CPU without it");
+        assert!(cpu::has(Feature::Avx2), "AVX2 lanes on a CPU without it");
         // SAFETY: the CPU has AVX2, asserted just above.
         unsafe { last_narrow(inputs, members, start, group, out) }
     }

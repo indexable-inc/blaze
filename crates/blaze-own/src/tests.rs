@@ -964,6 +964,11 @@ fn raw_pointers_round_trip() -> Result<(), Broke> {
     alloc.check()
 }
 
+/// `f`, its closure kind fixed to `FnMut` by the bound.
+fn fn_mut<F: FnMut()>(f: F) -> F {
+    f
+}
+
 #[test]
 fn boxed_closures_are_called_once_and_freed() -> Result<(), Broke> {
     tokens::fresh();
@@ -996,7 +1001,9 @@ fn boxed_closures_are_called_once_and_freed() -> Result<(), Broke> {
         tokens::check(0)?;
         // A sized closure in a box is called by every closure trait.
         let mut count = 0;
-        let mut counter = Box::new_in(|| count += 1, &alloc);
+        // A call on a box whose closure's kind is not yet inferred tries `Fn` first and fixes
+        // the closure to it (as with std's `Box`); `fn_mut` gives the closure its kind first.
+        let mut counter = Box::new_in(fn_mut(|| count += 1), &alloc);
         counter();
         counter();
         drop(counter);
@@ -1402,6 +1409,61 @@ fn sorted_map_and_set_match_std() {
 }
 
 #[test]
+fn sorted_map_entry_and_index() -> Result<(), Broke> {
+    tokens::fresh();
+    let alloc = Counting::new();
+    {
+        let mut counts: SortedMap<u64, u64, &Counting> = SortedMap::new_in(&alloc);
+        for key in [5, 1, 5, 3, 1, 5] {
+            counts.entry(key).and_modify(|n| *n += 1).or_insert(1);
+        }
+        same("counts by entry", counts.iter().map(|(k, v)| (*k, *v)), [(1, 2), (3, 1), (5, 3)].into_iter())?;
+        let missing = panics(|| {
+            let _missing = counts[&4];
+        });
+        if counts[&5] != 3 || missing.is_err() {
+            return Err(Broke::Oracle(String::from("Index gave the wrong value, or none for a missing key")));
+        }
+        let mut tokens_by_key: SortedMap<u64, Token, &Counting> = SortedMap::new_in(&alloc);
+        let made = tokens_by_key.entry(7).or_insert_with_key(|k| Token::new(*k)).value;
+        // An occupied entry makes nothing.
+        let again = tokens_by_key.entry(7).or_insert_with(|| Token::new(99)).value;
+        tokens::check(1)?;
+        let crate::sorted::Entry::Occupied(entry) = tokens_by_key.entry(7) else {
+            return Err(Broke::Oracle(String::from("a held key's entry is vacant")));
+        };
+        if (made, again, entry.remove().value) != (7, 7, 7) || !tokens_by_key.is_empty() {
+            return Err(Broke::Oracle(String::from("entry made, kept or removed the wrong value")));
+        }
+    }
+    tokens::check(0)?;
+    alloc.check()
+}
+
+#[test]
+fn vec_sorts_and_dedups_a_tail() -> Result<(), Broke> {
+    tokens::fresh();
+    let alloc = Counting::new();
+    {
+        let mut v = vec_in![&alloc; 9, 9, 4, 2, 4, 1, 2, 2];
+        // The run crate's `sort_tail`: a sorted set in the vector from index 2 on.
+        v[2..].sort_unstable();
+        v.dedup_range(2..);
+        same("a sorted, deduplicated tail", v.iter().copied(), [9, 9, 1, 2, 4].into_iter())?;
+        // A range in the middle keeps the values after it, which move down.
+        let mut held: Vec<Token, &Counting> = Vec::new_in(&alloc);
+        for value in [1, 1, 2, 2, 2, 3, 3] {
+            held.push(Token::new(value));
+        }
+        held.dedup_range_by(1..5, |a, b| a.value == b.value);
+        same("a range deduplicated", held.iter().map(|t| t.value), [1, 1, 2, 3, 3].into_iter())?;
+        tokens::check(5)?;
+    }
+    tokens::check(0)?;
+    alloc.check()
+}
+
+#[test]
 fn from_sorted_refuses_what_is_not() -> Result<(), Broke> {
     let alloc = Counting::new();
     {
@@ -1569,8 +1631,12 @@ fn soa_matches_a_vec_of_rows() {
 }
 
 soa! {
+    /// Attributes on the row and on its fields go on the row struct.
+    #[derive(Clone, Copy, Debug, PartialEq)]
     struct Pair, Pairs, PairRef {
+        /// A doc comment on a field.
         big: u64 => bigs / bigs_mut,
+        #[allow(unused)]
         small: u32 => smalls / smalls_mut,
     }
 }
@@ -1726,7 +1792,8 @@ fn soa_debug_and_insert_remove() -> Result<(), Broke> {
         }
         let gone = pairs.remove(0);
         same("after remove", pairs.bigs().iter().copied(), [2, 3, 4].into_iter())?;
-        same("the removed row", [(gone.big, gone.small)].into_iter(), [(1, 10)].into_iter())?;
+        // The row derives what its attributes say.
+        same("the removed row", [gone].into_iter(), [Pair { big: 1, small: 10 }].into_iter())?;
         pairs.retain(|p| *p.big != 3);
         same("after retain", pairs.smalls().iter().copied(), [20, 40].into_iter())?;
     }
@@ -1791,4 +1858,374 @@ fn string_stays_utf8_and_frees() -> Result<(), Broke> {
         }
     }
     alloc.check()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Every allocation failure (`testing::every_failure`): each `try_` method, run once per
+// allocation or growth with that one refused, returns its typed error, leaves its value as it
+// was and frees everything. The values held are boxes, so a refused value dropped twice or not
+// at all is seen by the counting allocator.
+
+use crate::{
+    AllocFailure, FixedVec, Full, Inline, Refused, Soa,
+    testing::{self, EveryFailure, FailAt, every_failure},
+};
+
+/// The allocator every run builds with.
+type Failing = FailAt<testing::Counting<&'static System>>;
+
+/// What a run came back with: a refusal (what is wanted), or a value a refused call changed.
+#[derive(Debug)]
+enum Why {
+    Refused(AllocFailure),
+    Changed(String),
+}
+
+impl From<AllocFailure> for Why {
+    fn from(failure: AllocFailure) -> Why {
+        Why::Refused(failure)
+    }
+}
+
+impl<T> From<Refused<T>> for Why {
+    fn from(refused: Refused<T>) -> Why {
+        Why::Refused(refused.why)
+    }
+}
+
+/// One `try_` call on `value`: on a refusal, `look` must read the same before and after.
+fn step<V, S: PartialEq + core::fmt::Debug, R, E: Into<Why>>(
+    value: &mut V,
+    look: impl Fn(&V) -> S,
+    call: impl FnOnce(&mut V) -> Result<R, E>,
+) -> Result<R, Why> {
+    let before = look(value);
+    match call(value) {
+        Ok(done) => Ok(done),
+        Err(refused) => {
+            let after = look(value);
+            if after != before {
+                return Err(Why::Changed(format!("{before:?} became {after:?}")));
+            }
+            Err(refused.into())
+        }
+    }
+}
+
+/// `run` under [`every_failure`] over `System`; the number of allocations and growths it makes.
+fn under_every_failure(what: &str, mut run: impl FnMut(&Failing) -> Result<(), Why>) -> Result<usize, Broke> {
+    let mut changed = None;
+    let found = every_failure(&System, |alloc| match run(alloc) {
+        Ok(()) => Ok(()),
+        Err(Why::Refused(failure)) => Err(failure),
+        Err(Why::Changed(how)) => {
+            if changed.is_none() {
+                changed = Some(how);
+            }
+            Ok(())
+        }
+    });
+    if let Some(how) = changed {
+        return Err(Broke::Oracle(format!("{what}: a refused call changed its value: {how}")));
+    }
+    let events = found.map_err(|e| Broke::Oracle(format!("{what}: {e}")))?;
+    if events == 0 {
+        return Err(Broke::Harness(format!("{what}: the run allocated nothing, so nothing was refused")));
+    }
+    Ok(events)
+}
+
+fn boxed_values<A: Allocator, B: Allocator>(v: &Vec<Box<u64, A>, B>) -> StdVec<u64> {
+    v.iter().map(|b| **b).collect()
+}
+
+fn words<A: Allocator>(v: &Vec<u64, A>) -> StdVec<u64> {
+    v.iter().copied().collect()
+}
+
+#[test]
+fn vec_try_forms_fail_cleanly_at_every_allocation() -> Result<(), Broke> {
+    under_every_failure("Vec", |alloc| {
+        let mut v = Vec::try_with_capacity_in(2, alloc)?;
+        for n in 0..9 {
+            let value = Box::try_new_in(n, alloc)?;
+            step(&mut v, boxed_values, |v| {
+                v.try_push(value).map_err(|refused| {
+                    if *refused.value == n { Why::from(refused) } else { Why::Changed(String::from("another value came back")) }
+                })
+            })?;
+        }
+        step(&mut v, boxed_values, |v| v.try_reserve(40))?;
+        step(&mut v, boxed_values, |v| v.try_reserve_exact(100))?;
+        step(&mut v, boxed_values, |v| v.try_shrink_to_fit())?;
+        let mut w = Vec::try_with_capacity_in(1, alloc)?;
+        step(&mut w, words, |w| w.try_extend_from_slice(&[1, 2, 3, 4, 5]))?;
+        step(&mut w, words, |w| w.try_extend_from_slice(&[6; 20]))?;
+        if boxed_values(&v) != (0..9).collect::<StdVec<u64>>() || w.len() != 25 {
+            return Err(Why::Changed(format!("the pushes gave {:?} and {:?}", boxed_values(&v), words(&w))));
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn deque_values<A: Allocator, B: Allocator>(d: &VecDeque<Box<u64, A>, B>) -> StdVec<u64> {
+    d.iter().map(|b| **b).collect()
+}
+
+#[test]
+fn deque_try_forms_fail_cleanly_at_every_allocation() -> Result<(), Broke> {
+    under_every_failure("VecDeque", |alloc| {
+        let mut d = VecDeque::try_with_capacity_in(3, alloc)?;
+        for n in 0..14 {
+            let value = Box::try_new_in(n, alloc)?;
+            // Pushes at both ends and pops at the front, so growth meets every wrap.
+            if n % 3 == 0 {
+                step(&mut d, deque_values, |d| d.try_push_front(value))?;
+            } else {
+                step(&mut d, deque_values, |d| d.try_push_back(value))?;
+            }
+            if n % 4 == 3 {
+                let _front = d.pop_front();
+            }
+        }
+        step(&mut d, deque_values, |d| d.try_reserve(50))?;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn soa_rows<A: Allocator, B: Allocator>(s: &Soa<(u32, Box<u64, A>), B>) -> StdVec<(u32, u64)> {
+    s.iter().map(|(a, b)| (*a, **b)).collect()
+}
+
+#[test]
+fn soa_try_forms_fail_cleanly_at_every_allocation() -> Result<(), Broke> {
+    under_every_failure("Soa", |alloc| {
+        let mut s = Soa::try_with_capacity_in(1, alloc)?;
+        for n in 0..10u32 {
+            let row = (n, Box::try_new_in(u64::from(n) * 3, alloc)?);
+            step(&mut s, soa_rows, |s| s.try_push(row))?;
+        }
+        step(&mut s, soa_rows, |s| s.try_reserve(30))?;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn map_entries<A: Allocator, B: Allocator>(m: &SortedMap<u64, Box<u64, A>, B>) -> StdVec<(u64, u64)> {
+    m.iter().map(|(k, v)| (*k, **v)).collect()
+}
+
+#[test]
+fn sorted_map_try_insert_fails_cleanly_at_every_allocation() -> Result<(), Broke> {
+    under_every_failure("SortedMap", |alloc| {
+        let mut m = SortedMap::new_in(alloc);
+        for n in [5, 1, 9, 3, 7, 2, 8, 0, 6, 4] {
+            let value = Box::try_new_in(n * 10, alloc)?;
+            step(&mut m, map_entries, |m| {
+                m.try_insert(n, value).map_err(|refused| {
+                    if refused.value.0 == n && *refused.value.1 == n * 10 {
+                        Why::from(refused)
+                    } else {
+                        Why::Changed(String::from("another entry came back"))
+                    }
+                })
+            })?;
+        }
+        // A key already there is replaced in place, with no allocation to refuse.
+        let value = Box::try_new_in(55, alloc)?;
+        step(&mut m, map_entries, |m| m.try_insert(5, value))?;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn text_of<A: Allocator>(s: &crate::String<A>) -> String {
+    String::from(s.as_str())
+}
+
+#[test]
+fn string_try_forms_fail_cleanly_at_every_allocation() -> Result<(), Broke> {
+    under_every_failure("String", |alloc| {
+        let mut s = crate::String::try_from_str_in("ab", alloc)?;
+        for ch in ['c', 'é', '日', '🦀', 'd', 'e', 'f'] {
+            step(&mut s, text_of, |s| s.try_push(ch))?;
+        }
+        step(&mut s, text_of, |s| s.try_push_str("-0123456789"))?;
+        step(&mut s, text_of, |s| s.try_reserve(100))?;
+        let mut t = crate::String::try_with_capacity_in(0, alloc)?;
+        step(&mut t, text_of, |t| t.try_push_str(s.as_str()))?;
+        if t != "abcé日🦀def-0123456789" {
+            return Err(Why::Changed(format!("the pushes gave {t:?}")));
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+#[test]
+fn box_arc_rc_try_forms_fail_cleanly_at_every_allocation() -> Result<(), Broke> {
+    under_every_failure("Box, Arc and Rc", |alloc| {
+        // Each refusal must hand back the value, here a box of its own, whole.
+        let back = |refused: Refused<Box<u64, &Failing>>, n: u64| {
+            if *refused.value == n { Why::from(refused) } else { Why::Changed(String::from("another value came back")) }
+        };
+        let b = Box::try_new_in(Box::try_new_in(1, alloc)?, alloc).map_err(|r| back(r, 1))?;
+        let a = Arc::try_new_in(Box::try_new_in(2, alloc)?, alloc).map_err(|r| back(r, 2))?;
+        let r = Rc::try_new_in(Box::try_new_in(3, alloc)?, alloc).map_err(|r| back(r, 3))?;
+        let a_slice = Arc::try_from_slice_in(&[4, 5, 6], alloc)?;
+        let r_slice = Rc::try_from_slice_in(&[7, 8], alloc)?;
+        if **b != 1 || **a != 2 || **r != 3 || *a_slice != [4, 5, 6] || *r_slice != [7, 8] {
+            return Err(Why::Changed(String::from("a counted or boxed value reads wrong")));
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+#[test]
+fn every_failure_catches_a_swallowed_refusal_and_a_leak() -> Result<(), Broke> {
+    // Controls (rule 53): a run that ignores a refusal, and one that forgets a block.
+    let swallowed = every_failure(&System, |alloc| {
+        let mut v = Vec::new_in(alloc);
+        let _ignored = v.try_push(1u8);
+        Ok::<(), AllocFailure>(())
+    });
+    if !matches!(swallowed, Err(EveryFailure::Swallowed { at: 0 })) {
+        return Err(Broke::Oracle(format!("a swallowed refusal gave {swallowed:?}")));
+    }
+    let leaked = every_failure(&System, |alloc| {
+        let v = Vec::<u8, _>::try_with_capacity_in(4, alloc)?;
+        core::mem::forget(v);
+        Ok::<(), AllocFailure>(())
+    });
+    match leaked {
+        Err(EveryFailure::Leaked { at: None, leaked }) if leaked.live == 1 && leaked.first[0].map(|b| b.seq) == Some(0) => {
+            Ok(())
+        }
+        other => Err(Broke::Oracle(format!("a forgotten block gave {other:?}"))),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Fixed capacity.
+
+#[test]
+fn fixed_vec_refuses_past_its_capacity_and_drops_once() -> Result<(), Broke> {
+    tokens::fresh();
+    {
+        let mut v = FixedVec::<Token, 4>::new();
+        for n in 0..4 {
+            if v.push(Token::new(n)).is_err() {
+                return Err(Broke::Oracle(format!("push {n} of 4 was refused")));
+            }
+        }
+        match v.push(Token::new(9)) {
+            Err(Full { value, cap: 4 }) if value.value == 9 => {}
+            other => return Err(Broke::Oracle(format!("a push past 4 gave {other:?}"))),
+        }
+        if v.insert(0, Token::new(8)).map_err(|full| full.value.value) != Err(8) {
+            return Err(Broke::Oracle(String::from("an insert into a full vector was taken")));
+        }
+        let removed = v.remove(1);
+        let swapped = v.swap_remove(0);
+        if removed.value != 1 || swapped.value != 0 || v.iter().map(|t| t.value).collect::<StdVec<_>>() != [3, 2] {
+            return Err(Broke::Oracle(String::from("remove and swap_remove moved the wrong values")));
+        }
+        drop((removed, swapped));
+        if v.insert(1, Token::new(7)).is_err() || v.insert(3, Token::new(6)).is_err() {
+            return Err(Broke::Oracle(String::from("an insert with room was refused")));
+        }
+        v.retain(|t| t.value % 2 == 0);
+        let copy = v.clone();
+        let kept: StdVec<u64> = copy.into_iter().map(|t| t.value).collect();
+        if kept != [2, 6] {
+            return Err(Broke::Oracle(format!("retain kept {kept:?}")));
+        }
+        tokens::check(2)?;
+        // A drop that panics mid-retain: the values not yet seen stay, after the ones kept.
+        let mut w = FixedVec::<Token, 6>::new();
+        for n in 0..6 {
+            let _ = w.push(Token::new(n));
+        }
+        tokens::panic_on_drop(1);
+        panics(|| w.retain(|t| t.value != 1))?;
+        if w.iter().map(|t| t.value).collect::<StdVec<_>>() != [0, 2, 3, 4, 5] {
+            return Err(Broke::Oracle(String::from("a panic in retain lost or kept the wrong values")));
+        }
+        let mut iter = w.into_iter();
+        let _front = iter.next();
+        let _back = iter.next_back();
+    }
+    tokens::check(0)
+}
+
+#[test]
+fn inline_holds_collections_on_the_stack_and_refuses_when_full() -> Result<(), Broke> {
+    let inline = Inline::<256>::new();
+    {
+        let mut v = Vec::new_in(&inline);
+        let mut pushed = 0u64;
+        // The newest block grows in place (4, 8, 16, 32 values), so the vector fills all 256
+        // bytes; growing to 64 is refused.
+        let refused = loop {
+            match v.try_push(pushed) {
+                Ok(()) => pushed += 1,
+                Err(refused) => break refused,
+            }
+        };
+        if refused.value != pushed || pushed != 32 {
+            return Err(Broke::Oracle(format!("{pushed} pushes then {refused:?}")));
+        }
+        if words(&v) != (0..pushed).collect::<StdVec<_>>() {
+            return Err(Broke::Oracle(String::from("growth in place lost values")));
+        }
+    }
+    if inline.used() != 0 {
+        return Err(Broke::Oracle(format!("{} bytes still used after the vector was freed", inline.used())));
+    }
+    // Every collection over it, freed newest first. The text is 16 bytes, so the next block
+    // needs no padding and the frees bring the top back to 0 (a free rewinds to the block's
+    // start, not over padding before it).
+    {
+        let text = crate::String::try_from_str_in("sixteen bytes!!!", &inline).map_err(|e| Broke::Oracle(format!("{e}")))?;
+        let shared = Rc::try_new_in(7u32, &inline).map_err(|e| Broke::Oracle(format!("{}", e.why)))?;
+        let mut rows = Soa::<(u8, u32), _>::new_in(&inline);
+        rows.try_push((1, 2)).map_err(|e| Broke::Oracle(format!("{}", e.why)))?;
+        if &*text != "sixteen bytes!!!" || *shared != 7 || rows.len() != 1 {
+            return Err(Broke::Oracle(String::from("values over the inline buffer read wrong")));
+        }
+        drop((rows, shared, text));
+    }
+    if inline.used() != 0 {
+        return Err(Broke::Oracle(format!("{} bytes still used after newest-first frees", inline.used())));
+    }
+    // Nothing is taken from anywhere else: a request past the buffer is refused at once.
+    if Vec::<u8, _>::try_with_capacity_in(257, &inline).is_ok() {
+        return Err(Broke::Oracle(String::from("a 257-byte block came from a 256-byte buffer")));
+    }
+    Ok(())
+}
+
+#[test]
+fn inline_under_every_failure() -> Result<(), Broke> {
+    // The fixed buffer as the base under the failing allocator: refusals stay typed, and with
+    // newest-first frees the buffer comes back whole each run.
+    let inline = Inline::<512>::new();
+    let events = every_failure(&&inline, |alloc| {
+        let mut s = crate::String::try_with_capacity_in(2, alloc)?;
+        // 16 bytes, so the vector after it needs no padding (see the test above).
+        s.try_push_str("fixed buffers!!!")?;
+        let mut v = Vec::try_with_capacity_in(1, alloc)?;
+        v.try_extend_from_slice(&[1u32, 2, 3, 4, 5, 6])?;
+        drop(v);
+        drop(s);
+        Ok::<(), AllocFailure>(())
+    })
+    .map_err(|e| Broke::Oracle(format!("{e}")))?;
+    if events < 4 || inline.used() != 0 {
+        return Err(Broke::Oracle(format!("{events} events; {} bytes left used", inline.used())));
+    }
+    Ok(())
 }

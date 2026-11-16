@@ -410,7 +410,7 @@ fn own_of_def(db: &Db, def: AttrDefId) -> Own {
     let context = Context::of(db, def.krate(db));
     let mut what = [0; WHAT_LEN];
     let what = context.what("stability", &mut what);
-    crate::deps::facts::of_attrs(db, what, def, || own_of_def_made(db, def, &context))
+    from_text(db, what, def, || own_of_def_made(db, def, &context))
 }
 
 /// [`own_of_def`] off `def`'s syntax, and whether it read nothing but its attributes' text

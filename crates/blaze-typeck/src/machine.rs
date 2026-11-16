@@ -8,7 +8,7 @@
 
 #![blaze::sans_io]
 
-use blaze_own::Vec;
+use blaze_own::{Soa, Vec};
 use core::alloc::Allocator;
 use core::mem::DropGuard;
 
@@ -96,6 +96,7 @@ pub(crate) struct Frame {
     pub then: Then,
     pub a: u32,
     pub b: u32,
+    pub c: u32,
     pub t: Ty,
     pub u: Ty,
     pub l: TyList,
@@ -193,7 +194,8 @@ pub(crate) struct Machine<'b, 'w, 'c, W: World, C: TypeCtx, A: Allocator + Clone
     pub pat_ty: Vec<Ty, A>,
     pub local_ty: Vec<Ty, A>,
     // Sparse results, rows read whole.
-    pub adjust: Vec<(ExprId, AdjustKind, Ty), A>,
+    /// Adjustments in the order made; scanned by expression (a receiver's autoref).
+    pub adjust: Soa<(ExprId, AdjustKind, Ty), A>,
     pub callees: Vec<(ExprId, ItemKey, TyList), A>,
     pub fields: Vec<(ExprId, u32, u32), A>,
     pub captures: Vec<(ExprId, PatId, CaptureKind), A>,
@@ -258,7 +260,7 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx, A: Allocator + Clone> Machine<'b, 'w, 'c,
             expr_ty,
             pat_ty,
             local_ty,
-            adjust: Vec::new_in(alloc.clone()),
+            adjust: Soa::new_in(alloc.clone()),
             callees: Vec::new_in(alloc.clone()),
             fields: Vec::new_in(alloc.clone()),
             captures: Vec::new_in(alloc.clone()),
@@ -314,6 +316,7 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx, A: Allocator + Clone> Machine<'b, 'w, 'c,
             then,
             a: 0,
             b: 0,
+            c: 0,
             t: err,
             u: err,
             l: self.common.empty,

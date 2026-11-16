@@ -1,6 +1,6 @@
 [package]
 name = "blaze-swiss"
-description = "The SwissTable group probe every interner's table shares, and `Index`, the lock-free-read table of `u32`s on it; no dependencies, so the bottom of the tree reaches it (moved from blaze-mem's `swiss`)"
+description = "The SwissTable group probe every interner's table shares, `Index`, the lock-free-read table of `u32`s on it, and the bottom of the tree's once-cell and spin lock; `no_std`, its one dependency blaze-own, so the bottom of the tree reaches it (moved from blaze-mem's `swiss`)"
 publish = false
 
 version.workspace = true
@@ -13,7 +13,9 @@ repository.workspace = true
 [lib]
 doctest = false
 
+# `core` and blaze-own (its `Box` and `Vec`, in place of `alloc`), which depends on nothing.
 [dependencies]
+blaze-own.workspace = true
 
 [target.'cfg(blaze_check)'.dependencies]
 blaze-check.workspace = true

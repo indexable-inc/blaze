@@ -10,13 +10,14 @@ use blaze_sim::{Broke, Config, Tape};
 
 use crate::testing::{Fact, MemSurface};
 use crate::{
-    AnyItem, Binding, ByteRange, CrateRoot, CrateRootHead, CrateRootView, DeclaredName, Edition,
-    ExportClass, FileItem, FileItems, FileItemsView, HasText, ItemIndex, ItemKind, Items, KeyEntry,
-    KeyIndex, KeyIndexView, LocalTable, MacroCall, MacroDef, MacroDefHead, MacroDefView, MacroKind,
-    ModDecl, ModuleDecls, ModuleDeclsView, ModuleFile, ModuleFileView, ModuleScope, Namespace,
+    AnyItem, Binding, CrateRoot, CrateRootHead, CrateRootView, DeclaredName, Edition,
+    ExportClass, FileItems, HasText, ItemIndex, ItemKind, Items, KeyEntry,
+    KeyIndex, KeyIndexView, LocalTable, MacroDef, MacroDefHead, MacroDefView, MacroKind,
+    ModuleDecls, ModuleDeclsView, ModuleFile, ModuleFileView, ModuleScope, Namespace,
     NotBuilt, Origin, Place, ScopeView, Source, SurfaceError, Target, TextualEntry,
-    TextualEntryView, UseLeaf, Visibility,
+    TextualEntryView, Visibility,
 };
+use crate::{BuiltinDerive, DefSite, ProcKind, Transparency};
 
 /// The crate every test's items are of.
 const KRATE: CrateItemKey = CrateItemKey(ContentId([1; 32]));
@@ -35,8 +36,6 @@ fn file(n: u8) -> ContentId {
 
 /// Few names, so draws repeat them.
 const NAMES: [&str; 8] = ["a", "b", "main", "Vec", "é", "r#fn", "_", "zz"];
-const KINDS: [ItemKind; 6] =
-    [ItemKind::Function, ItemKind::Struct, ItemKind::Module, ItemKind::Impl, ItemKind::Use, ItemKind::Field];
 const SPACES: [Namespace; 3] = [Namespace::Types, Namespace::Values, Namespace::Macros];
 
 fn name(tape: &Tape) -> &'static str {
@@ -47,133 +46,8 @@ fn small(tape: &Tape, below: u32, label: &'static str) -> u32 {
     u32::try_from(tape.below(u64::from(below), label)).expect("a draw below a u32 fits one")
 }
 
-/// A range inside an item `len` bytes long.
-fn range(tape: &Tape, len: u32) -> ByteRange {
-    let start = small(tape, len + 1, "range start");
-    ByteRange { start, len: small(tape, len - start + 1, "range len") }
-}
-
-/// The rows of one file, drawn: items in order, each parent before it, and `mod`, `use` and
-/// macro-call rows of them.
-struct DrawnFile {
-    items: Vec<FileItem<'static>, Global>,
-    mods: Vec<ModDecl<'static>, Global>,
-    uses: Vec<UseLeaf<'static>, Global>,
-    calls: Vec<MacroCall<'static>, Global>,
-}
-
-fn drawn_file(tape: &Tape) -> DrawnFile {
-    let mut at = 0;
-    let mut items = Vec::new_in(Global);
-    for index in 0..small(tape, 12, "items") {
-        let len = small(tape, 200, "len");
-        let parent = match index > 0 && tape.coin("has a parent") {
-            true => Some(ItemIndex(small(tape, index, "parent"))),
-            false => None,
-        };
-        items.push(FileItem {
-            kind: *tape.pick(&KINDS, "kind").expect("KINDS is not empty"),
-            name: name(tape),
-            at,
-            len,
-            signature: range(tape, len),
-            body: range(tape, len),
-            attrs: range(tape, len),
-            parent,
-        });
-        at += len;
-    }
-    let (mut mods, mut uses, mut calls) = (Vec::new_in(Global), Vec::new_in(Global), Vec::new_in(Global));
-    let count = u32::try_from(items.len()).expect("at most 12 items");
-    if count > 0 {
-        for _ in 0..small(tape, 4, "rows") {
-            let item = ItemIndex(small(tape, count, "of item"));
-            match tape.below(3, "row") {
-                0 => mods.push(ModDecl { name: name(tape), item, inline: tape.coin("inline") }),
-                1 => uses.push(UseLeaf {
-                    path: name(tape),
-                    alias: tape.coin("aliased").then(|| name(tape)),
-                    glob: tape.coin("glob"),
-                    item,
-                }),
-                _ => calls.push(MacroCall {
-                    path: name(tape),
-                    at: small(tape, 1000, "call at"),
-                    len: small(tape, 100, "call len"),
-                    parent: tape.coin("inside").then_some(item),
-                }),
-            }
-        }
-    }
-    DrawnFile { items, mods, uses, calls }
-}
-
-fn write_file(drawn: &DrawnFile, mods_first: bool) -> Vec<u8, Global> {
-    let mut out = FileItems::new_in(file(0), Global);
-    for item in &drawn.items {
-        out.item(*item).expect("a drawn item is valid");
-    }
-    let leaves = |out: &mut FileItems<Global>| {
-        for leaf in &drawn.uses {
-            out.use_leaf(*leaf).expect("a drawn leaf is valid");
-        }
-        for call in &drawn.calls {
-            out.macro_call(*call).expect("a drawn call is valid");
-        }
-    };
-    if !mods_first {
-        leaves(&mut out);
-    }
-    for module in &drawn.mods {
-        out.module(*module).expect("a drawn mod is valid");
-    }
-    if mods_first {
-        leaves(&mut out);
-    }
-    out.finish().expect("a drawn file is small")
-}
-
-/// The refinement: a file's items read back as written, row for row, and the order the kinds
-/// of row are given in moves no byte.
-#[test]
-fn file_items_read_back_as_written() {
-    blaze_sim::check(Config::cases(300), |tape| {
-        let drawn = drawn_file(tape);
-        let bytes = write_file(&drawn, true);
-        if bytes != write_file(&drawn, false) {
-            return Err(Broke::Oracle("two orders of one file's rows wrote different bytes".into()));
-        }
-        let buffer = Aligned::copy_from(&bytes);
-        let view = FileItemsView::read(&buffer).map_err(|error| Broke::Oracle(error.to_string()))?;
-        let same = view.file() == file(0)
-            && view.items().eq(drawn.items.iter().copied())
-            && view.mods().eq(drawn.mods.iter().copied())
-            && view.uses().eq(drawn.uses.iter().copied())
-            && view.calls().eq(drawn.calls.iter().copied());
-        match same {
-            true => Ok(()),
-            false => Err(Broke::Oracle("a file's items read back other than written".into())),
-        }
-    });
-}
-
-#[test]
-fn a_parent_after_its_child_and_a_range_past_the_item_are_refused() {
-    let mut out = FileItems::new_in(file(0), Global);
-    let item = FileItem {
-        kind: ItemKind::Function,
-        name: "f",
-        at: 0,
-        len: 10,
-        signature: ByteRange { start: 0, len: 4 },
-        body: ByteRange { start: 4, len: 7 },
-        attrs: ByteRange::EMPTY,
-        parent: None,
-    };
-    assert_eq!(out.item(item), Err(crate::BuildError::PastItem { index: 0 }));
-    let item = FileItem { body: ByteRange { start: 4, len: 6 }, parent: Some(ItemIndex(0)), ..item };
-    assert!(matches!(out.item(item), Err(crate::BuildError::BadIndex { index: 0, .. })));
-}
+/// `FileItems`' promises: in the module below, beside the record's own types.
+mod file_items;
 
 /// A drawn scope: at most one binding per (namespace, name), in a drawn order.
 fn bindings(tape: &Tape) -> Vec<Binding<'static>, Global> {
@@ -327,20 +201,16 @@ fn a_key_index_answers_each_key_in_one_probe() {
 /// One module, `key(200)`, of one file, `file(0)`: `fn a() {}` and a struct a macro made.
 fn surface(rows: &[Binding<'_>]) -> MemSurface {
     let mut surface = MemSurface::new(KRATE);
-    let mut items = FileItems::new_in(file(0), Global);
-    items
-        .item(FileItem {
-            kind: ItemKind::Function,
-            name: "a",
-            at: 0,
-            len: 9,
-            signature: ByteRange { start: 0, len: 6 },
-            body: ByteRange { start: 7, len: 2 },
-            attrs: ByteRange::EMPTY,
-            parent: None,
-        })
-        .expect("a valid item");
-    surface.insert(Fact::FileItems, &items.finish().expect("small")).expect("a written record");
+    let items = FileItems {
+        file: file(0),
+        text: "fn a() {}",
+        items: &[file_items::F],
+        attrs: &[],
+        file_attrs: crate::file_items::AttrSpan { start: 0, end: 0 },
+        errors: &[],
+        messages: &[],
+    };
+    surface.insert(Fact::FileItems, &items.write(Global).expect("small")).expect("a written record");
     surface.insert_text(file(0), "fn a() {}");
     let mut page = KeyIndex::new_in(key(200), Global);
     page.entry(KeyEntry {
@@ -529,14 +399,21 @@ fn a_crate_root_reads_back_sorted_and_refuses_two_crates_of_one_name() {
 
 #[test]
 fn a_macro_def_reads_back_with_its_helpers_in_order() {
+    let krate = CrateItemKey(ContentId([7; 32]));
     let head = MacroDefHead {
         item: key(5),
         name: "Serialize",
-        body: ContentId([6; 32]),
+        content: ContentId([6; 32]),
         place: Some(Place::File { file: file(2), index: ItemIndex(3) }),
-        kind: MacroKind::ProcDerive,
+        kind: MacroKind::ProcMacro { krate, kind: ProcKind::Derive },
+        site: DefSite { krate, module: None },
+        edition: Edition::E2021,
         exported: false,
         local_inner: false,
+        written_transparency: None,
+        transparency: Transparency::Opaque,
+        body: None,
+        params: None,
     };
     let mut out = MacroDef::new_in(head, Global);
     out.helper("serde").expect("small");
@@ -545,7 +422,11 @@ fn a_macro_def_reads_back_with_its_helpers_in_order() {
     let view = MacroDefView::read(&buffer).expect("a written record");
     assert_eq!(view.head(), head);
     assert!(view.helpers().eq(["serde", "allow"]));
-    let builtin = MacroDefHead { place: None, kind: MacroKind::Builtin, ..head };
+    let builtin = MacroDefHead {
+        place: None,
+        kind: MacroKind::BuiltinDerive(BuiltinDerive::Clone),
+        ..head
+    };
     let buffer = Aligned::copy_from(&MacroDef::new_in(builtin, Global).finish().expect("small"));
     assert_eq!(MacroDefView::read(&buffer).expect("a written record").head(), builtin);
 }

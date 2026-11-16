@@ -5,7 +5,7 @@ use blaze_v2_proof::{Rng, columns};
 use super::{
     BufferColumns, COLD_HEADER, CORRUPT, Codec, ColdDictionary, HotColumn, HotRef, Packed,
     WarmColumn, WarmRef, Width, cold_codec, columns_of, compress, decode_cold, decode_cold_bytes,
-    decode_raw, encode_cold, encode_cold_bytes, encode_raw, raw_cold,
+    decode_raw, encode_cold, encode_cold_bytes, encode_raw, push_hot, push_warm, raw_cold,
 };
 use crate::{
     Aligned, FormatError, Record, Rel, Slice, Str, WordTable, Writer, leb, open, record, row_words,
@@ -29,7 +29,7 @@ record! {
 
 fn hot_buffer(values: &[u32]) -> Aligned {
     let mut out = Writer::new(HotRoot::SCHEMA);
-    let placed = out.push_hot(values);
+    let placed = push_hot(&mut out, values);
     let at = out.next::<HotRoot>();
     let root = HotRoot { column: HotColumn::new(at + offset_of!(HotRoot, column) as u64, placed) };
     assert_eq!(out.push(&root), at);
@@ -38,7 +38,7 @@ fn hot_buffer(values: &[u32]) -> Aligned {
 
 fn warm_buffer(values: &[u32]) -> Aligned {
     let mut out = Writer::new(WarmRoot::SCHEMA);
-    let placed = out.push_warm(values);
+    let placed = push_warm(&mut out, values);
     let at = out.next::<WarmRoot>();
     let root =
         WarmRoot { column: WarmColumn::new(at + offset_of!(WarmRoot, column) as u64, placed) };
@@ -102,8 +102,8 @@ fn a_hot_column_is_at_its_narrowest_width() {
 #[test]
 fn a_hot_column_of_two_widths_is_refused() {
     let mut out = Writer::new(HotRoot::SCHEMA);
-    let u8s = out.push_hot(&[1, 2, 3]);
-    let u16s = out.push_hot(&[1000, 2000]);
+    let u8s = push_hot(&mut out, &[1, 2, 3]);
+    let u16s = push_hot(&mut out, &[1000, 2000]);
     let at = out.next::<HotRoot>();
     let field = at + offset_of!(HotRoot, column) as u64;
     let mut column = HotColumn::new(field, u8s);
@@ -195,7 +195,7 @@ fn a_warm_column_takes_the_bits_of_its_range() {
 fn a_warm_column_that_does_not_fit_its_words_is_refused() {
     let corrupt = |edit: fn(&mut WarmColumn)| {
         let mut out = Writer::new(WarmRoot::SCHEMA);
-        let placed = out.push_warm(&[5, 6, 7, 1000]);
+        let placed = push_warm(&mut out, &[5, 6, 7, 1000]);
         let at = out.next::<WarmRoot>();
         let mut column = WarmColumn::new(at + offset_of!(WarmRoot, column) as u64, placed);
         edit(&mut column);

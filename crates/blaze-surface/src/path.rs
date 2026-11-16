@@ -10,7 +10,7 @@ use blaze_format::FormatError;
 use blaze_id::{ContentId, CrateItemKey, Portable};
 use blaze_own::Vec;
 
-use crate::column::{NONE, Strings, Text, at_of_record, check_text, count, text_of, wide};
+use crate::column::{NONE, Strings, Text, at_of, at_of_record, check_text, count, text_of, wide};
 use crate::error::BuildError;
 use crate::kind::{Range, byte_enum};
 
@@ -115,6 +115,14 @@ byte_enum! {
 }
 
 impl<N> Rename<N> {
+    pub fn as_ref(&self) -> Rename<&N> {
+        match self {
+            Rename::Same => Rename::Same,
+            Rename::To(name) => Rename::To(name),
+            Rename::Underscore => Rename::Underscore,
+        }
+    }
+
     pub fn map<M>(self, f: impl FnOnce(N) -> M) -> Rename<M> {
         match self {
             Rename::Same => Rename::Same,
@@ -320,6 +328,16 @@ impl<'a> PathView<'a> {
         Path { kind: self.kind, segments }
     }
 }
+
+impl PartialEq for PathView<'_> {
+    /// Two paths read from records are equal when they begin alike and have the same segments'
+    /// text, whatever record they are in.
+    fn eq(&self, other: &Self) -> bool {
+        self.kind == other.kind && self.segments().eq(other.segments())
+    }
+}
+
+impl Eq for PathView<'_> {}
 
 impl fmt::Debug for PathView<'_> {
     /// `Crate::a::b`: its start, then each segment.

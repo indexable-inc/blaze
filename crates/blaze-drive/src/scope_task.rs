@@ -1,0 +1,123 @@
+//! The `ModuleScope` task (drive.md, "Tasks and Need"): blaze-scope's machine for one module,
+//! driven until it is done or asks for something the task was not handed. Its reads of other
+//! modules are answered from the scope records it holds; one it lacks is a `Need` of that
+//! module's `ModuleScope`, a macro call it must see expanded is a `Need` of the call's
+//! `Expansion`, and the task is entered again from the top with them (bottom.md 9: Need by
+//! unwinding). A cycle is the request machine's: the members wait on each other, the machine
+//! finds them quiet and runs them as one `Group`.
+
+use core::alloc::Allocator;
+use core::fmt;
+
+use blaze_id::ItemKey;
+use blaze_own::Vec;
+use blaze_scope::{Answer, Read, Reply, ResolveError, Resolved, Resolver, ScopeFacts, Step};
+use blaze_surface::SurfaceError;
+
+use crate::key::{Kind, Name};
+
+/// The most steps one entry takes: each step moves the machine forward or asks, and every ask
+/// is answered at once from what the task holds, so a module's steps are bounded by its reads
+/// (rule 18). Past it, [`ScopeTaskError::Steps`].
+pub const MOST_STEPS: u32 = 1 << 16;
+
+/// Answers a read of another module's scope from the records the task was handed.
+pub trait ScopeReads<N> {
+    /// The answer, or `None` when the task does not hold that module's scope record: the task
+    /// then needs it.
+    fn answer(&self, read: &Read<N>) -> Result<Option<Answer<'_, N>>, SurfaceError>;
+}
+
+/// How an entry of the task ended.
+pub enum ScopeOutcome<N, A: Allocator + Clone> {
+    Done(Resolved<N, A>),
+    /// Names to be handed on the next entry, sorted and without repeats.
+    Need(Vec<Name, A>),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ScopeTaskError {
+    /// The machine refused: the module's records are not what it reads, or a bound was hit.
+    Resolve { module: ItemKey, error: ResolveError },
+    /// A record the module's own facts are read from is missing: the task's inputs miss a fact
+    /// its home should have held (the request machine hands the home; this is a bug there).
+    Fact { module: ItemKey, error: SurfaceError },
+    /// The machine reported a cycle while every read was answered by a record, not in
+    /// progress: a record that says "in progress" was stored, which no task writes.
+    Cycle { module: ItemKey },
+    Steps { module: ItemKey },
+}
+
+impl fmt::Display for ScopeTaskError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ScopeTaskError::Resolve { module, error } => write!(f, "the scope of module {module:x}: {error}"),
+            ScopeTaskError::Fact { module, error } => {
+                write!(f, "the scope of module {module:x}: its own facts: {error} (drive.md: a task is handed its home)")
+            }
+            ScopeTaskError::Cycle { module } => write!(f, "the scope of module {module:x}: a cycle among stored records"),
+            ScopeTaskError::Steps { module } => write!(f, "the scope of module {module:x}: more than {MOST_STEPS} steps (rule 18)"),
+        }
+    }
+}
+
+impl core::error::Error for ScopeTaskError {}
+
+/// One entry of the `ModuleScope` task of `module`.
+pub fn module_scope<N: blaze_scope::Name, F: ScopeFacts<Name = N>, R: ScopeReads<N>, A: Allocator + Clone>(
+    module: ItemKey,
+    facts: &F,
+    reads: &R,
+    alloc: A,
+) -> Result<ScopeOutcome<N, A>, ScopeTaskError> {
+    let refused = |error: ResolveError| match error {
+        ResolveError::Surface { module, error } => ScopeTaskError::Fact { module, error },
+        error => ScopeTaskError::Resolve { module, error },
+    };
+    let mut machine = Resolver::new_in(module, facts, alloc.clone()).map_err(refused)?;
+    let mut needs: Vec<Name, A> = Vec::new_in(alloc.clone());
+    let mut replies: Vec<Reply<'_, N>, A> = Vec::new_in(alloc.clone());
+    for _ in 0..MOST_STEPS {
+        let step = machine.step(facts, &replies).map_err(refused)?;
+        replies.clear();
+        match step {
+            Step::Done(resolved) => {
+                return Ok(match needs.is_empty() {
+                    true => ScopeOutcome::Done(resolved),
+                    false => ScopeOutcome::Need(needs),
+                });
+            }
+            Step::Ask(asks) => {
+                let mut lacking = false;
+                for read in asks {
+                    match reads.answer(read).map_err(|error| ScopeTaskError::Fact { module, error })? {
+                        Some(answer) => replies.push(Reply { read: *read, answer }),
+                        None => {
+                            lacking = true;
+                            add(&mut needs, Name::new(Kind::ModuleScope, read.module().0));
+                        }
+                    }
+                }
+                if lacking {
+                    // Every lack of this entry is gathered at once: the next entry is handed
+                    // them all, so a chain of needs costs one entry per depth, not per read.
+                    return Ok(ScopeOutcome::Need(needs));
+                }
+            }
+            Step::Expand(calls) => {
+                for call in calls {
+                    add(&mut needs, Name::new(Kind::Expansion, call.call.0));
+                }
+                return Ok(ScopeOutcome::Need(needs));
+            }
+            Step::Cycle(_) => return Err(ScopeTaskError::Cycle { module }),
+        }
+    }
+    Err(ScopeTaskError::Steps { module })
+}
+
+fn add<A: Allocator>(needs: &mut Vec<Name, A>, name: Name) {
+    if let Err(at) = needs.binary_search(&name) {
+        needs.insert(at, name);
+    }
+}

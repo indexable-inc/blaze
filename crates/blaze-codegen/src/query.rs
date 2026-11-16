@@ -13,6 +13,7 @@
 //! | a thunk | [`keys::thunk`] | the group's key and what the member's code is kept under (instance key, what it builds in, its references' kinds), which holds its constants |
 //! | a static's template | [`keys::static_value`] | the value's content (with its layout and imports), its mutability, thread-locality and section, how many references it has and each one's kind (`driver::definition`), and the settings |
 //! | a side table | [`keys::side`] | its bytes |
+//! | a template by shape | [`keys::shape`] | the shape ([`crate::backend::Shape`]: the prepared IR with each reference by its place, the settings and architecture, and whether it is relative or names itself at a place) and the toolchain that compiles it; the binding is the instance's reference list, which each build's describe gives (docs/v2/plan/design/backend-next.md, (b)) |
 
 use blaze_query::QueryKind;
 
@@ -71,6 +72,15 @@ pub mod keys {
         key("blaze v2 store side 1", &[id])
     }
 
+    /// The template every instance of `shape` instantiates, compiled by the codegen of
+    /// `toolchain` (`Spec::toolchain.id`): what a command probes after preparing an instance
+    /// the store has no template of, before compiling it, so a shape an earlier command
+    /// compiled is not compiled again for a new instance (the memo lives one command, rule
+    /// 70). Written next to the instance's own record, which stays the one read of a hit.
+    pub fn shape(shape: &crate::backend::Shape, toolchain: &ContentId) -> Key {
+        key("blaze v2 store shape 1", &[&shape.key(), toolchain])
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -88,6 +98,7 @@ pub mod keys {
                 thunk(&instance, &instance),
                 static_value(&id, &Settings(id)),
                 side(&id),
+                shape(&crate::backend::Shape::of_id(id), &id),
             ];
             let unique: std::collections::BTreeSet<_> = keys.iter().collect();
             assert_eq!(unique.len(), keys.len());

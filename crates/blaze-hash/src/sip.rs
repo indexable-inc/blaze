@@ -25,10 +25,15 @@
 //! Cost: one round of four adds, rotates and xors for every 8 bytes, then 4 rounds: about
 //! 15 ns for a 16-byte name, where foldhash's fixed hasher takes 3.
 
-use std::{
-    hash::{BuildHasher, Hash, Hasher},
-    sync::OnceLock,
-};
+use core::hash::{BuildHasher, Hash, Hasher};
+
+use blaze_swiss::sync::Once;
+
+// libc's door to the operating system's randomness (POSIX 2024; macOS 10.12, glibc 2.25, musl,
+// wasi-libc): fills `len` bytes, at most 256, and returns 0, or -1 with `errno` set.
+unsafe extern "C" {
+    fn getentropy(buf: *mut u8, len: usize) -> i32;
+}
 
 /// A SipHash key: what [`SipKey::hash`] is keyed by.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -43,16 +48,19 @@ impl SipKey {
     }
 
     /// A key from the operating system's randomness, unknown outside this process: for a
-    /// table nothing persists the layout of. Two outputs of std's `RandomState`, whose keys
-    /// std draws from the OS (`getrandom`, `arc4random`, WASI's `random_get`) once per thread
-    /// and steps for each state, so no two calls give related keys.
+    /// table nothing persists the layout of. Sixteen bytes of libc's `getentropy` (the
+    /// kernel's `getrandom` on Linux, `getentropy` on macOS, `random_get` on WASI), drawn
+    /// afresh for each key, so no two calls give related keys. A refusal is a panic naming it
+    /// (rule no-fallback): there is no weaker source to fall back to.
     pub fn random() -> SipKey {
-        #[allow(
-            clippy::disallowed_types,
-            reason = "std's one door to the OS's randomness: used only to draw a SipHash key, never as a map's hasher"
-        )]
-        let state = std::hash::RandomState::new();
-        SipKey::new(state.hash_one(0x5349_5030_u64), state.hash_one(0x5349_5031_u64))
+        let mut bytes = [0_u8; 16];
+        // SAFETY: `bytes` is 16 writable bytes, within `getentropy`'s limit of 256, and it
+        // writes no more than `len`.
+        let refused = unsafe { getentropy(bytes.as_mut_ptr(), bytes.len()) };
+        assert!(refused == 0, "getentropy refused 16 bytes for a SipHash key ({refused})");
+        let [low, high] = [&bytes[..8], &bytes[8..]]
+            .map(|half| u64::from_le_bytes(half.try_into().expect("eight bytes")));
+        SipKey::new(low, high)
     }
 
     /// The key's two words, for a format that stores it.
@@ -95,11 +103,11 @@ impl BuildHasher for SipKey {
 /// same for the table's life: what a table that lives in a `static`, made by a `const fn`
 /// before any code runs, is keyed by. Asking is one acquire load once the key is drawn.
 #[derive(Default)]
-pub struct LazyKey(OnceLock<SipKey>);
+pub struct LazyKey(Once<SipKey>);
 
 impl LazyKey {
     pub const fn new() -> LazyKey {
-        LazyKey(OnceLock::new())
+        LazyKey(Once::new())
     }
 
     /// The key, drawn now if this is the first ask.

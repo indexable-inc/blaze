@@ -28,14 +28,16 @@
 //! insert appends; iteration is a walk of a vector. [`OrderMap::with_capacity_in`] makes two
 //! allocations (the entries, the table) and none after while the map stays within it.
 
-use std::{
+use core::{
     alloc::Allocator,
     fmt,
     hash::{BuildHasher, Hash},
     ops::Index,
 };
 
-use hashbrown::{Equivalent, HashTable};
+use blaze_own::Vec;
+
+use crate::{Equivalent, raw::RawTable};
 
 /// One entry: the key's hash, kept so that the table is rebuilt and searched without the key.
 struct Slot<K, V> {
@@ -55,7 +57,7 @@ impl<K: Clone, V: Clone> Clone for Slot<K, V> {
 pub struct OrderMap<K, V, S, A: Allocator + Clone> {
     entries: Vec<Slot<K, V>, A>,
     /// The index in `entries` of each entry, found by the entry's hash.
-    table: HashTable<u32, A>,
+    table: RawTable<u32, A>,
     hasher: S,
 }
 
@@ -100,7 +102,7 @@ impl<K, V, S, A: Allocator + Clone> OrderMap<K, V, S, A> {
     #[inline]
     pub fn with_hasher_in(hasher: S, alloc: A) -> Self {
         // clone: the allocator's handle, once per map: the entries and the table each hold one.
-        OrderMap { entries: Vec::new_in(alloc.clone()), table: HashTable::new_in(alloc), hasher }
+        OrderMap { entries: Vec::new_in(alloc.clone()), table: RawTable::new_in(alloc), hasher }
     }
 
     /// [`OrderMap::with_capacity_in`] with `hasher`.
@@ -109,7 +111,7 @@ impl<K, V, S, A: Allocator + Clone> OrderMap<K, V, S, A> {
         OrderMap {
             // clone: the allocator's handle, once per map.
             entries: Vec::with_capacity_in(capacity, alloc.clone()),
-            table: HashTable::with_capacity_in(capacity, alloc),
+            table: RawTable::with_capacity_in(capacity, alloc),
             hasher,
         }
     }
@@ -216,8 +218,8 @@ impl<K, V, S, A: Allocator + Clone> OrderMap<K, V, S, A> {
         // The entry that was last is at `index` now, unless the removed one was the last.
         if let Some(moved) = self.entries.get(index) {
             let was = held(self.entries.len());
-            match self.table.find_mut(moved.hash, |&at| at == was) {
-                Some(at) => *at = held(index),
+            match self.table.find(moved.hash, |&at| at == was) {
+                Some(slot) => *self.table.get_mut(slot) = held(index),
                 None => unreachable!("every entry's index is in the table"),
             }
         }
@@ -252,11 +254,11 @@ impl<K, V, S, A: Allocator + Clone> OrderMap<K, V, S, A> {
 
     /// Takes the index `at` of an entry with `hash` out of the table.
     fn unlink(&mut self, hash: u64, at: u32) {
-        match self.table.find_entry(hash, |&it| it == at) {
-            Ok(entry) => {
-                entry.remove();
+        match self.table.find(hash, |&it| it == at) {
+            Some(slot) => {
+                self.table.remove(slot);
             }
-            Err(_) => unreachable!("every entry's index is in the table"),
+            None => unreachable!("every entry's index is in the table"),
         }
     }
 
@@ -276,8 +278,8 @@ impl<K: Eq + Hash, V, S: BuildHasher, A: Allocator + Clone> OrderMap<K, V, S, A>
     fn find<Q: Hash + Equivalent<K> + ?Sized>(&self, key: &Q) -> (u64, Option<usize>) {
         let hash = self.hasher.hash_one(key);
         let entries = &self.entries;
-        let at = self.table.find(hash, |&at| key.equivalent(&entries[at as usize].key));
-        (hash, at.map(|&at| at as usize))
+        let slot = self.table.find(hash, |&at| key.equivalent(&entries[at as usize].key));
+        (hash, slot.map(|slot| *self.table.get(slot) as usize))
     }
 
     /// `value` under `key`, at the end when the key is new; a key already held keeps its
@@ -291,7 +293,7 @@ impl<K: Eq + Hash, V, S: BuildHasher, A: Allocator + Clone> OrderMap<K, V, S, A>
     pub fn insert_full(&mut self, key: K, value: V) -> (usize, Option<V>) {
         let (hash, at) = self.find(&key);
         match at {
-            Some(at) => (at, Some(std::mem::replace(&mut self.entries[at].value, value))),
+            Some(at) => (at, Some(core::mem::replace(&mut self.entries[at].value, value))),
             None => (self.push(hash, key, value), None),
         }
     }
@@ -363,13 +365,15 @@ impl<K: Eq + Hash, V, S: BuildHasher, A: Allocator + Clone> OrderMap<K, V, S, A>
     where
         K: Ord,
     {
-        self.entries.sort_by(|a, b| a.key.cmp(&b.key));
+        // Unstable is exact here: the keys are distinct, so there are no ties to keep in order
+        // (and core has no stable sort, which needs a buffer).
+        self.entries.sort_unstable_by(|a, b| a.key.cmp(&b.key));
         self.relink();
     }
 }
 
 /// The entries of an [`OrderMap`] in insertion order.
-pub struct Iter<'a, K, V>(std::slice::Iter<'a, Slot<K, V>>);
+pub struct Iter<'a, K, V>(core::slice::Iter<'a, Slot<K, V>>);
 
 impl<K, V> Clone for Iter<'_, K, V> {
     fn clone(&self) -> Self {
@@ -401,7 +405,7 @@ impl<K, V> DoubleEndedIterator for Iter<'_, K, V> {
 impl<K, V> ExactSizeIterator for Iter<'_, K, V> {}
 
 /// The entries of an [`OrderMap`] in insertion order, their values to change.
-pub struct IterMut<'a, K, V>(std::slice::IterMut<'a, Slot<K, V>>);
+pub struct IterMut<'a, K, V>(core::slice::IterMut<'a, Slot<K, V>>);
 
 impl<'a, K, V> Iterator for IterMut<'a, K, V> {
     type Item = (&'a K, &'a mut V);
@@ -427,7 +431,7 @@ impl<K, V> DoubleEndedIterator for IterMut<'_, K, V> {
 impl<K, V> ExactSizeIterator for IterMut<'_, K, V> {}
 
 /// The entries of an [`OrderMap`] taken by value, in insertion order.
-pub struct IntoIter<K, V, A: Allocator>(std::vec::IntoIter<Slot<K, V>, A>);
+pub struct IntoIter<K, V, A: Allocator>(blaze_own::vec::IntoIter<Slot<K, V>, A>);
 
 impl<K, V, A: Allocator> Iterator for IntoIter<K, V, A> {
     type Item = (K, V);

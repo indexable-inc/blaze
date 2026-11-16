@@ -10,7 +10,7 @@ use blaze_id::ItemKey;
 use super::{N, Solved, V, World, solve};
 use crate::resolver::Plant;
 use crate::{
-    AmbiguityKind, BindingState, DefKind, Edition, ExportEntry, MacroKind, Namespace, Read, Reply,
+    AmbiguityKind, BindingState, DefKind, Edition, ExportEntry, CallShape, Namespace, Read, Reply,
     Resolver, ScopeError, Step, Unresolved, Visibility,
 };
 
@@ -117,11 +117,11 @@ fn derive_helpers_scope_the_attributes_after_them() {
     let root = w.root(1, Edition::E2021);
     w.dep(root, "dep", dep_root);
     w.use_(root, "dep::Ser", V::Priv);
-    w.call_on(root, "Ser", MacroKind::Derive, Some(1));
-    let after = w.call_on(root, "serde", MacroKind::Attr, Some(1));
-    let other_item = w.call_on(root, "serde", MacroKind::Attr, Some(2));
-    let before = w.call_on(root, "serde", MacroKind::Attr, Some(3));
-    w.call_on(root, "Ser", MacroKind::Derive, Some(3));
+    w.call_on(root, "Ser", CallShape::Derive, Some(1));
+    let after = w.call_on(root, "serde", CallShape::Attr, Some(1));
+    let other_item = w.call_on(root, "serde", CallShape::Attr, Some(2));
+    let before = w.call_on(root, "serde", CallShape::Attr, Some(3));
+    w.call_on(root, "Ser", CallShape::Derive, Some(3));
     let s = solved(&w);
     assert_eq!(macro_error(&s, root, after), None, "{:?}", s.errors(root));
     assert_eq!(macro_error(&s, root, other_item), Some(Unresolved::NotFound));
@@ -135,10 +135,10 @@ fn derive_helpers_scope_the_attributes_after_them() {
 fn builtin_attributes_are_inert_and_shadowing_them_is_ambiguous() {
     let mut w = World::new();
     let root = w.root(1, Edition::E2021);
-    let inline = w.call_on(root, "inline", MacroKind::Attr, Some(1));
+    let inline = w.call_on(root, "inline", CallShape::Attr, Some(1));
     let m = w.module(root, "m", V::Priv);
-    w.item(root, "test", Namespace::Macros, DefKind::Macro(MacroKind::Attr), V::Priv);
-    let test = w.call_on(m, "test", MacroKind::Attr, Some(1));
+    w.item(root, "test", Namespace::Macros, DefKind::Macro(CallShape::Attr), V::Priv);
+    let test = w.call_on(m, "test", CallShape::Attr, Some(1));
     w.use_(m, "super::test", V::Priv);
     let s = solved(&w);
     assert_eq!(macro_error(&s, root, inline), None, "{:?}", s.errors(root));
@@ -169,7 +169,7 @@ fn a_macro_expanded_macro_export_is_listed() {
     let root = w.root(1, Edition::E2021);
     let m = w.module(root, "m", V::Priv);
     w.rules(m, "gen");
-    let call = w.call(m, "gen", MacroKind::Bang);
+    let call = w.call(m, "gen", CallShape::FnLike);
     let exp = w.rules_with(call, "exp", true);
     let s = solved(&w);
     let exports = &s.scope(m).macro_exports;

@@ -1,189 +1,29 @@
-//! What a macro is: [`MacroDef`], and the hash of its content, [`MacroContent`], which is
-//! what an expansion's key names it by (never its item key: two definitions with equal content
-//! expand alike, and a renamed or moved one keeps its expansions; rule 21).
+//! What a macro is: [`MacroDefinition`], the working form expansion reads, and the hash of its
+//! content, [`MacroContent`], which is what an expansion's key names it by (never its item key:
+//! two definitions with equal content expand alike, and a renamed or moved one keeps its
+//! expansions; rule 21).
+//!
+//! Its stored form is blaze-surface's `MacroDef` record, with each token stream a
+//! [`TokenStream::write_record`] record named by its digest: [`MacroDefinition::write`] gives
+//! the three, [`MacroDefinition::from`] reads them back and checks they are one definition.
 
 use core::alloc::Allocator;
+use core::fmt;
 
-use blaze_own::Vec;
-
-use blaze_id::{ContentId, CrateItemKey, Portable};
+use blaze_id::{ContentId, CrateItemKey, ItemKey, Portable};
 use blaze_ids::Hasher;
+use blaze_own::{CollectIn, Vec};
+use blaze_surface::{BuildError, MacroDef, MacroDefHead, MacroDefView};
 
 use crate::{
-    call::CallShape,
     error::{StreamError, Table},
+    record::{RecordBytes, RecordError, stream_record_id},
     tokens::{DefSite, Edition, Mark, MarkOf, Sink, Text, TokenStream, Transparency, push_text},
 };
 
-/// The builtin fn-like macros, by name.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum BuiltinFn {
-    FormatArgs,
-    FormatArgsNl,
-    ConstFormatArgs,
-    Concat,
-    Stringify,
-    /// `core::panic!` and `std::panic!`: `$crate` tells them apart.
-    Panic,
-    Unreachable,
-    Cfg,
-    Env,
-    OptionEnv,
-    IncludeStr,
-    IncludeBytes,
-    Line,
-    Column,
-    File,
-    ModulePath,
-    CompileError,
-    Include,
-    Assert,
-    ConcatBytes,
-    /// Not built yet ([`crate::ExpandError::NotBuilt`]).
-    Asm,
-    /// Not built yet.
-    GlobalAsm,
-    /// Not built yet.
-    NakedAsm,
-    CfgSelect,
-    /// Not built yet.
-    TraceMacros,
-    /// Not built yet.
-    LogSyntax,
-}
-
-impl BuiltinFn {
-    pub fn name(self) -> &'static str {
-        match self {
-            BuiltinFn::FormatArgs => "format_args",
-            BuiltinFn::FormatArgsNl => "format_args_nl",
-            BuiltinFn::ConstFormatArgs => "const_format_args",
-            BuiltinFn::Concat => "concat",
-            BuiltinFn::Stringify => "stringify",
-            BuiltinFn::Panic => "panic",
-            BuiltinFn::Unreachable => "unreachable",
-            BuiltinFn::Cfg => "cfg",
-            BuiltinFn::Env => "env",
-            BuiltinFn::OptionEnv => "option_env",
-            BuiltinFn::IncludeStr => "include_str",
-            BuiltinFn::IncludeBytes => "include_bytes",
-            BuiltinFn::Line => "line",
-            BuiltinFn::Column => "column",
-            BuiltinFn::File => "file",
-            BuiltinFn::ModulePath => "module_path",
-            BuiltinFn::CompileError => "compile_error",
-            BuiltinFn::Include => "include",
-            BuiltinFn::Assert => "assert",
-            BuiltinFn::ConcatBytes => "concat_bytes",
-            BuiltinFn::Asm => "asm",
-            BuiltinFn::GlobalAsm => "global_asm",
-            BuiltinFn::NakedAsm => "naked_asm",
-            BuiltinFn::CfgSelect => "cfg_select",
-            BuiltinFn::TraceMacros => "trace_macros",
-            BuiltinFn::LogSyntax => "log_syntax",
-        }
-    }
-}
-
-/// The builtin attribute macros, by name. None is built yet: each is a
-/// [`crate::ExpandError::NotBuilt`].
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum BuiltinAttr {
-    Test,
-    Bench,
-    TestCase,
-    GlobalAllocator,
-    CfgEval,
-    Derive,
-    DeriveConst,
-    AllocErrorHandler,
-}
-
-impl BuiltinAttr {
-    pub fn name(self) -> &'static str {
-        match self {
-            BuiltinAttr::Test => "test",
-            BuiltinAttr::Bench => "bench",
-            BuiltinAttr::TestCase => "test_case",
-            BuiltinAttr::GlobalAllocator => "global_allocator",
-            BuiltinAttr::CfgEval => "cfg_eval",
-            BuiltinAttr::Derive => "derive",
-            BuiltinAttr::DeriveConst => "derive_const",
-            BuiltinAttr::AllocErrorHandler => "alloc_error_handler",
-        }
-    }
-}
-
-/// The builtin derives built here, each written by `crate::derive`.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum BuiltinDerive {
-    Copy,
-    Clone,
-    Default,
-    Debug,
-    Hash,
-    Ord,
-    PartialOrd,
-    Eq,
-    PartialEq,
-}
-
-impl BuiltinDerive {
-    pub fn name(self) -> &'static str {
-        match self {
-            BuiltinDerive::Copy => "Copy",
-            BuiltinDerive::Clone => "Clone",
-            BuiltinDerive::Default => "Default",
-            BuiltinDerive::Debug => "Debug",
-            BuiltinDerive::Hash => "Hash",
-            BuiltinDerive::Ord => "Ord",
-            BuiltinDerive::PartialOrd => "PartialOrd",
-            BuiltinDerive::Eq => "Eq",
-            BuiltinDerive::PartialEq => "PartialEq",
-        }
-    }
-}
-
-/// How a proc macro is called.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum ProcKind {
-    FnLike,
-    Attr,
-    Derive,
-}
-
-/// What kind of macro a definition is.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum MacroKind {
-    /// `macro_rules! m { rules }`: its body is the rules.
-    Rules,
-    /// `macro m { rules }`, or `macro m(params) { body }` with [`MacroDef::params`].
-    Macro2,
-    BuiltinFn(BuiltinFn),
-    BuiltinAttr(BuiltinAttr),
-    BuiltinDerive(BuiltinDerive),
-    /// A proc macro: its crate's key and its export name ([`MacroDef::proc_name`]).
-    ProcMacro {
-        krate: CrateItemKey,
-        kind: ProcKind,
-        name: Text,
-    },
-}
-
-impl MacroKind {
-    /// The kinds of call the macro takes; `None` for a declarative macro, whose rules say.
-    pub(crate) fn shape(self) -> Option<CallShape> {
-        match self {
-            MacroKind::Rules | MacroKind::Macro2 => None,
-            MacroKind::BuiltinFn(_) => Some(CallShape::FnLike),
-            MacroKind::BuiltinAttr(_) => Some(CallShape::Attr),
-            MacroKind::BuiltinDerive(_) => Some(CallShape::Derive),
-            MacroKind::ProcMacro { kind: ProcKind::FnLike, .. } => Some(CallShape::FnLike),
-            MacroKind::ProcMacro { kind: ProcKind::Attr, .. } => Some(CallShape::Attr),
-            MacroKind::ProcMacro { kind: ProcKind::Derive, .. } => Some(CallShape::Derive),
-        }
-    }
-}
+/// The macro words, defined once in the schema: the builtin names, how a proc macro is called,
+/// and what kind of macro a definition is.
+pub use blaze_surface::{BuiltinAttr, BuiltinDerive, BuiltinFn, MacroKind, ProcKind};
 
 /// `#[macro_export]`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -218,16 +58,6 @@ pub struct MacroContent(pub ContentId);
 
 // SAFETY: a content hash.
 unsafe impl Portable for MacroContent {}
-// SAFETY: a closed enum of names.
-unsafe impl Portable for BuiltinFn {}
-// SAFETY: a closed enum of names.
-unsafe impl Portable for BuiltinAttr {}
-// SAFETY: a closed enum of names.
-unsafe impl Portable for BuiltinDerive {}
-// SAFETY: a closed enum.
-unsafe impl Portable for ProcKind {}
-// SAFETY: closed enums, a crate key and a range of the definition's own name table.
-unsafe impl Portable for MacroKind {}
 // SAFETY: a closed enum.
 unsafe impl Portable for Export {}
 // SAFETY: a closed enum.
@@ -236,48 +66,86 @@ unsafe impl Portable for LocalInner {}
 unsafe impl Portable for DefAt {}
 // SAFETY: every field is `Portable` (streams, UTF-8 bytes, ranges of them, keys, closed
 // enums); the allocator is where the bytes are.
-unsafe impl<A: Allocator> Portable for MacroDef<A> {}
+unsafe impl<A: Allocator> Portable for MacroDefinition<A> {}
 
-/// A macro's definition.
+/// A macro's definition, as expansion reads it.
 #[derive(Clone, Debug)]
-pub struct MacroDef<A: Allocator> {
+pub struct MacroDefinition<A: Allocator> {
     kind: MacroKind,
     body: TokenStream<A>,
     params: Option<TokenStream<A>>,
     /// The text of a proc macro's name and of the helper attributes.
     names: Vec<u8, A>,
+    /// A proc macro's export name, in `names`.
+    proc_name: Option<Text>,
     helpers: Vec<Text, A>,
     at: DefAt,
     transparency: Transparency,
     content: MacroContent,
 }
 
-impl<A: Allocator + Clone> MacroDef<A> {
+/// A definition as records: the `MacroDef` record, and each token stream's record with the
+/// digest the `MacroDef` names it by. Each is stored by itself.
+pub struct DefinitionRecords<B: Allocator> {
+    pub def: RecordBytes<B>,
+    /// The body's tokens; `None` for a body of no tokens and no contexts.
+    pub body: Option<(ContentId, RecordBytes<B>)>,
+    pub params: Option<(ContentId, RecordBytes<B>)>,
+}
+
+/// Why records are not one definition.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum DefinitionError {
+    /// A token stream's record does not read.
+    Stream(RecordError),
+    /// The records disagree: `what` says how (a stream given that the head does not name, or
+    /// one whose digest is not the head's, a content hash that is not of what was read).
+    Mismatch { item: ItemKey, what: &'static str },
+}
+
+impl fmt::Display for DefinitionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DefinitionError::Stream(error) => write!(f, "a macro's token stream record: {error}"),
+            DefinitionError::Mismatch { item, what } => {
+                write!(f, "the records of macro {:x} are not one definition: {what}", item.0)
+            }
+        }
+    }
+}
+
+impl core::error::Error for DefinitionError {}
+
+impl<A: Allocator + Clone> MacroDefinition<A> {
     /// `macro_rules! m { body }`: `body` the tokens inside the braces.
-    pub fn rules(body: TokenStream<A>, at: DefAt) -> MacroDef<A> {
+    pub fn rules(body: TokenStream<A>, at: DefAt) -> MacroDefinition<A> {
         let alloc = body.allocator().clone();
-        MacroDef::make(MacroKind::Rules, body, None, at, alloc)
+        MacroDefinition::make(MacroKind::Rules, body, None, at, alloc)
     }
 
     /// `macro m { body }` (`params` `None`), or `macro m(params) { body }`.
-    pub fn macro2(params: Option<TokenStream<A>>, body: TokenStream<A>, at: DefAt) -> MacroDef<A> {
+    pub fn macro2(
+        params: Option<TokenStream<A>>,
+        body: TokenStream<A>,
+        at: DefAt,
+    ) -> MacroDefinition<A> {
         let alloc = body.allocator().clone();
-        MacroDef::make(MacroKind::Macro2, body, params, at, alloc)
+        MacroDefinition::make(MacroKind::Macro2, body, params, at, alloc)
     }
 
-    pub fn builtin_fn(which: BuiltinFn, at: DefAt, alloc: A) -> MacroDef<A> {
+    pub fn builtin_fn(which: BuiltinFn, at: DefAt, alloc: A) -> MacroDefinition<A> {
         let body = TokenStream::new_in(alloc.clone());
-        MacroDef::make(MacroKind::BuiltinFn(which), body, None, at, alloc)
+        MacroDefinition::make(MacroKind::BuiltinFn(which), body, None, at, alloc)
     }
 
-    pub fn builtin_attr(which: BuiltinAttr, at: DefAt, alloc: A) -> MacroDef<A> {
+    pub fn builtin_attr(which: BuiltinAttr, at: DefAt, alloc: A) -> MacroDefinition<A> {
         let body = TokenStream::new_in(alloc.clone());
-        MacroDef::make(MacroKind::BuiltinAttr(which), body, None, at, alloc)
+        MacroDefinition::make(MacroKind::BuiltinAttr(which), body, None, at, alloc)
     }
 
-    pub fn builtin_derive(which: BuiltinDerive, at: DefAt, alloc: A) -> MacroDef<A> {
+    pub fn builtin_derive(which: BuiltinDerive, at: DefAt, alloc: A) -> MacroDefinition<A> {
         let body = TokenStream::new_in(alloc.clone());
-        MacroDef::make(MacroKind::BuiltinDerive(which), body, None, at, alloc)
+        MacroDefinition::make(MacroKind::BuiltinDerive(which), body, None, at, alloc)
     }
 
     /// The proc macro `name` of the proc-macro crate `krate`; a derive's `helpers` are the
@@ -289,26 +157,16 @@ impl<A: Allocator + Clone> MacroDef<A> {
         helpers: &[&str],
         at: DefAt,
         alloc: A,
-    ) -> Result<MacroDef<A>, StreamError> {
-        let mut names = Vec::new_in(alloc.clone());
-        let name = push_text(&mut names, name, Table::Text)?;
-        let mut helper_texts = Vec::with_capacity_in(helpers.len(), alloc.clone());
-        for helper in helpers {
-            helper_texts.push(push_text(&mut names, helper, Table::Text)?);
-        }
-        let transparency = at.transparency.unwrap_or(Transparency::Opaque);
-        let mut def = MacroDef {
-            kind: MacroKind::ProcMacro { krate, kind, name },
-            body: TokenStream::new_in(alloc),
-            params: None,
-            names,
-            helpers: helper_texts,
+    ) -> Result<MacroDefinition<A>, StreamError> {
+        MacroDefinition::with_names(
+            MacroKind::ProcMacro { krate, kind },
+            TokenStream::new_in(alloc.clone()),
+            None,
+            Some(name),
+            helpers.iter().copied(),
             at,
-            transparency,
-            content: MacroContent(ContentId([0; 32])),
-        };
-        def.content = def.hash();
-        Ok(def)
+            alloc,
+        )
     }
 
     fn make(
@@ -317,31 +175,102 @@ impl<A: Allocator + Clone> MacroDef<A> {
         params: Option<TokenStream<A>>,
         at: DefAt,
         alloc: A,
-    ) -> MacroDef<A> {
-        let own = match kind {
-            MacroKind::Rules | MacroKind::BuiltinFn(_) | MacroKind::BuiltinAttr(_) => {
-                Transparency::SemiOpaque
-            }
-            MacroKind::Macro2 | MacroKind::BuiltinDerive(_) | MacroKind::ProcMacro { .. } => {
-                Transparency::Opaque
-            }
+    ) -> MacroDefinition<A> {
+        MacroDefinition::with_names(kind, body, params, None, core::iter::empty(), at, alloc)
+            .expect("a definition with no names fits the name table")
+    }
+
+    /// The one constructor: every other is this one.
+    fn with_names<'h>(
+        kind: MacroKind,
+        body: TokenStream<A>,
+        params: Option<TokenStream<A>>,
+        proc_name: Option<&str>,
+        helpers: impl ExactSizeIterator<Item = &'h str>,
+        at: DefAt,
+        alloc: A,
+    ) -> Result<MacroDefinition<A>, StreamError> {
+        let mut names = Vec::new_in(alloc.clone());
+        let proc_name = match proc_name {
+            Some(name) => Some(push_text(&mut names, name, Table::Text)?),
+            None => None,
         };
-        let mut def = MacroDef {
+        let mut helper_texts = Vec::with_capacity_in(helpers.len(), alloc);
+        for helper in helpers {
+            helper_texts.push(push_text(&mut names, helper, Table::Text)?);
+        }
+        let mut def = MacroDefinition {
             kind,
             body,
             params,
-            names: Vec::new_in(alloc.clone()),
-            helpers: Vec::new_in(alloc),
+            names,
+            proc_name,
+            helpers: helper_texts,
             at,
-            transparency: at.transparency.unwrap_or(own),
+            transparency: at.transparency.unwrap_or(kind.own_transparency()),
             content: MacroContent(ContentId([0; 32])),
         };
         def.content = def.hash();
-        def
+        Ok(def)
+    }
+
+    /// The definition `view` and its token stream records hold, in `alloc`: `body` and
+    /// `params` the records the head names ([`MacroDefHead::body`], [`MacroDefHead::params`]),
+    /// each checked against its digest, and the whole checked against the head's content hash,
+    /// so what is read is the definition that was written.
+    pub fn from(
+        view: &MacroDefView<'_>,
+        body: Option<&[u8]>,
+        params: Option<&[u8]>,
+        alloc: A,
+    ) -> Result<MacroDefinition<A>, DefinitionError> {
+        let head = view.head();
+        let mismatch = |what| DefinitionError::Mismatch { item: head.item, what };
+        let stream = |id: Option<ContentId>, bytes: Option<&[u8]>| match (id, bytes) {
+            (None, None) => Ok(None),
+            (Some(id), Some(bytes)) if stream_record_id(bytes) == id => {
+                TokenStream::read_record(bytes, alloc.clone())
+                    .map(Some)
+                    .map_err(DefinitionError::Stream)
+            }
+            (Some(_), Some(_)) => Err(mismatch("a token stream whose digest is not the head's")),
+            (Some(_), None) => Err(mismatch("a token stream the head names, not given")),
+            (None, Some(_)) => Err(mismatch("a token stream given that the head does not name")),
+        };
+        let body = stream(head.body, body)?.unwrap_or_else(|| TokenStream::new_in(alloc.clone()));
+        let params = stream(head.params, params)?;
+        let at = DefAt {
+            site: head.site,
+            edition: head.edition,
+            export: if head.exported { Export::Exported } else { Export::Local },
+            local_inner: if head.local_inner { LocalInner::Yes } else { LocalInner::No },
+            transparency: head.written_transparency,
+        };
+        let proc_name = match head.kind {
+            MacroKind::ProcMacro { .. } => Some(head.name),
+            _ => None,
+        };
+        let def = MacroDefinition::with_names(
+            head.kind,
+            body,
+            params,
+            proc_name,
+            view.helpers().collect_in(alloc.clone()).into_iter(),
+            at,
+            alloc,
+        )
+        .map_err(|_| mismatch("names past the name table's u32::MAX bytes"))?;
+        if def.transparency != head.transparency {
+            return Err(mismatch("a transparency that is not the written one or the kind's"));
+        }
+        if def.content.0 != head.content {
+            return Err(mismatch("a content hash that is not of what the records hold"));
+        }
+        Ok(def)
     }
 }
 
-impl<A: Allocator> MacroDef<A> {
+impl<A: Allocator> MacroDefinition<A> {
     pub fn kind(&self) -> MacroKind {
         self.kind
     }
@@ -377,15 +306,59 @@ impl<A: Allocator> MacroDef<A> {
 
     /// A proc macro's export name.
     pub fn proc_name(&self) -> Option<&str> {
-        match self.kind {
-            MacroKind::ProcMacro { name, .. } => Some(name.of(&self.names)),
-            _ => None,
-        }
+        self.proc_name.map(|name| name.of(&self.names))
     }
 
     /// A derive's helper attributes, in the order declared.
     pub fn helpers(&self) -> impl Iterator<Item = &str> + '_ {
         self.helpers.iter().map(|text| text.of(&self.names))
+    }
+
+    /// The definition as records, in `alloc`: the `MacroDef` of the macro `item` named `name`
+    /// and written at `place` (`None` for a builtin), and its token streams. A proc macro's
+    /// `name` is its export name, refused when it differs.
+    pub fn write<B: Allocator + Clone>(
+        &self,
+        item: ItemKey,
+        name: &str,
+        place: Option<blaze_surface::Place>,
+        alloc: B,
+    ) -> Result<DefinitionRecords<B>, BuildError> {
+        if self.proc_name().is_some_and(|proc_name| proc_name != name) {
+            return Err(BuildError::Disagrees {
+                table: "MacroDef",
+                what: "a proc macro's export name and the name of its item",
+            });
+        }
+        let stream = |tokens: &TokenStream<A>| {
+            let bytes = tokens.write_record(alloc.clone());
+            (stream_record_id(&bytes), bytes)
+        };
+        let body = match self.body.is_empty() && self.body.contexts().is_empty() {
+            true => None,
+            false => Some(stream(&self.body)),
+        };
+        let params = self.params.as_ref().map(stream);
+        let head = MacroDefHead {
+            item,
+            name,
+            content: self.content.0,
+            place,
+            kind: self.kind,
+            site: self.at.site,
+            edition: self.at.edition,
+            exported: self.at.export == Export::Exported,
+            local_inner: self.at.local_inner == LocalInner::Yes,
+            written_transparency: self.at.transparency,
+            transparency: self.transparency,
+            body: body.as_ref().map(|(id, _)| *id),
+            params: params.as_ref().map(|(id, _)| *id),
+        };
+        let mut def = MacroDef::new_in(head, alloc);
+        for helper in self.helpers() {
+            def.helper(helper)?;
+        }
+        Ok(DefinitionRecords { def: def.finish()?, body, params })
     }
 
     /// The mark this definition's expansion puts on a token, at `transparency`.
@@ -410,10 +383,11 @@ impl<A: Allocator> MacroDef<A> {
                 hasher.put(&[4]);
                 hasher.part(which.name().as_bytes());
             }
-            MacroKind::ProcMacro { krate, kind, name } => {
-                hasher.put(&[5, kind as u8]);
+            MacroKind::ProcMacro { krate, kind } => {
+                hasher.put(&[5, kind.byte()]);
                 hasher.id(&krate.0);
-                hasher.part(name.of(&self.names).as_bytes());
+                let name = self.proc_name().expect("every constructor of a proc macro names it");
+                hasher.part(name.as_bytes());
             }
         }
         self.body.encode(&mut hasher);

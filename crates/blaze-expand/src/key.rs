@@ -6,7 +6,7 @@ use core::alloc::Allocator;
 use blaze_id::{ContentId, Portable};
 use blaze_ids::Hasher;
 
-use crate::{call::Call, def::MacroDef, expansion::Reads, tokens::Sink};
+use crate::{call::Call, def::MacroDefinition, expansion::Reads, tokens::Sink};
 
 /// A call's key: the definition's content and site, and the call's tokens, kind, call-site
 /// hygiene and eager answers. Two calls with equal keys expand alike given equal reads.
@@ -23,7 +23,7 @@ unsafe impl Portable for CallKey {}
 unsafe impl Portable for ExpansionKey {}
 
 /// The key of `call` of `def`, computed before the work.
-pub fn call_key<A: Allocator, B: Allocator>(def: &MacroDef<A>, call: &Call<'_, B>) -> CallKey {
+pub fn call_key<A: Allocator, B: Allocator>(def: &MacroDefinition<A>, call: &Call<'_, B>) -> CallKey {
     let mut hasher = Hasher::new("blaze v2 expand call 1");
     hasher.id(&def.content().0);
     let site = def.site();
@@ -41,7 +41,7 @@ pub fn call_key<A: Allocator, B: Allocator>(def: &MacroDef<A>, call: &Call<'_, B
 
 /// The key of the record of `call` of `def` that made `reads`.
 pub fn expansion_key<A: Allocator, B: Allocator, C: Allocator>(
-    def: &MacroDef<A>,
+    def: &MacroDefinition<A>,
     call: &Call<'_, B>,
     reads: &Reads<C>,
 ) -> ExpansionKey {

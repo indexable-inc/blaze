@@ -72,34 +72,25 @@ pub struct PlacedHot {
     len: usize,
 }
 
-impl Writer {
-    /// Writes `values` at their narrowest width, straight into the buffer.
-    pub fn push_hot(&mut self, values: &[u32]) -> PlacedHot {
-        let width = Width::of(values);
-        let at = self.pad(width.bytes());
-        self.bytes.reserve(values.len() * width.bytes());
-        match width {
-            Width::U8 => self.bytes.extend(values.iter().map(|&it| it as u8)),
-            Width::U16 => {
-                self.bytes.extend(values.iter().flat_map(|&it| (it as u16).to_le_bytes()))
-            }
-            Width::U32 => self.bytes.extend(values.iter().flat_map(|&it| it.to_le_bytes())),
-        }
-        PlacedHot { width, at, len: values.len() }
+/// Writes `values` to `out` at their narrowest width, straight into the buffer. A function, not
+/// a method of [`Writer`]: the writer is blaze-format-core's, and the tiers are this crate's.
+pub fn push_hot(out: &mut Writer, values: &[u32]) -> PlacedHot {
+    let width = Width::of(values);
+    let at = out.pad(width.bytes());
+    out.bytes.reserve(values.len() * width.bytes());
+    match width {
+        Width::U8 => out.bytes.extend(values.iter().map(|&it| it as u8)),
+        Width::U16 => out.bytes.extend(values.iter().flat_map(|&it| (it as u16).to_le_bytes())),
+        Width::U32 => out.bytes.extend(values.iter().flat_map(|&it| it.to_le_bytes())),
     }
+    PlacedHot { width, at, len: values.len() }
+}
 
-    /// Writes `values` bit-packed.
-    pub fn push_warm(&mut self, values: &[u32]) -> PlacedWarm {
-        let packed = Packed::pack(values);
-        let at = self.push_slice(&packed.words);
-        PlacedWarm {
-            min: packed.min,
-            bits: packed.bits,
-            len: packed.len,
-            at,
-            words: packed.words.len(),
-        }
-    }
+/// Writes `values` to `out` bit-packed.
+pub fn push_warm(out: &mut Writer, values: &[u32]) -> PlacedWarm {
+    let packed = Packed::pack(values);
+    let at = out.push_slice(&packed.words);
+    PlacedWarm { min: packed.min, bits: packed.bits, len: packed.len, at, words: packed.words.len() }
 }
 
 impl HotColumn {

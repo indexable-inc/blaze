@@ -1,0 +1,570 @@
+//! The single-owner set, [`Set`], and its iterator types: a [`Map`] of its elements to nothing,
+//! on this crate's own SwissTable, in the allocator the type names. [`HashSet`](crate::HashSet),
+//! [`ByHashSet`](crate::ByHashSet) and [`KeyedSet`](crate::KeyedSet) are this on this crate's
+//! hashers. The methods are the ones the tree uses of the hashbrown set this replaces.
+
+use core::{
+    alloc::Allocator,
+    fmt,
+    hash::{BuildHasher, Hash},
+    iter::FusedIterator,
+    ops::{BitAnd, BitOr, BitXor, Sub},
+};
+
+use blaze_own::AllocFailure;
+
+use crate::{
+    Equivalent,
+    hash_map::{self, Entry, Map},
+};
+
+/// A set on the hasher `S`, in the allocator `A`.
+pub struct Set<T, S, A: Allocator>(Map<T, (), S, A>);
+
+impl<T, S: Default, A: Allocator> Set<T, S, A> {
+    /// An empty set in `alloc`; it allocates nothing until the first insert.
+    #[inline]
+    pub fn new_in(alloc: A) -> Self {
+        Set(Map::new_in(alloc))
+    }
+
+    /// An empty set in `alloc` with room for `capacity` elements.
+    #[inline]
+    pub fn with_capacity_in(capacity: usize, alloc: A) -> Self {
+        Set(Map::with_capacity_in(capacity, alloc))
+    }
+}
+
+impl<T, S, A: Allocator> Set<T, S, A> {
+    /// An empty set on `hasher` in `alloc`, in a `const` too.
+    #[inline]
+    pub const fn with_hasher_in(hasher: S, alloc: A) -> Self {
+        Set(Map::with_hasher_in(hasher, alloc))
+    }
+
+    /// An empty set on `hasher` in `alloc` with room for `capacity` elements.
+    #[inline]
+    pub fn with_capacity_and_hasher_in(capacity: usize, hasher: S, alloc: A) -> Self {
+        Set(Map::with_capacity_and_hasher_in(capacity, hasher, alloc))
+    }
+
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[inline]
+    pub fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
+
+    #[inline]
+    pub fn hasher(&self) -> &S {
+        self.0.hasher()
+    }
+
+    #[inline]
+    pub fn allocator(&self) -> &A {
+        self.0.allocator()
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// The elements, in the table's order.
+    #[inline]
+    pub fn iter(&self) -> Iter<'_, T> {
+        Iter(self.0.keys())
+    }
+
+    /// Every element taken out; the memory is kept.
+    #[inline]
+    pub fn drain(&mut self) -> Drain<'_, T, A> {
+        Drain(self.0.drain())
+    }
+
+    /// Keeps the elements `keep` says to.
+    #[inline]
+    pub fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
+        self.0.retain(|it, ()| keep(it));
+    }
+}
+
+impl<T: Eq + Hash, S: BuildHasher + Default, A: Allocator> Set<T, S, A> {
+    /// The set of `iter`'s elements in `alloc`: what `collect()` makes, with the allocator
+    /// named.
+    #[inline]
+    pub fn from_iter_in<I: IntoIterator<Item = T>>(iter: I, alloc: A) -> Self {
+        let iter = iter.into_iter();
+        let mut set = Set::with_capacity_in(iter.size_hint().0, alloc);
+        set.extend(iter);
+        set
+    }
+}
+
+impl<T: Eq + Hash, S: BuildHasher, A: Allocator> Set<T, S, A> {
+    #[inline]
+    pub fn reserve(&mut self, additional: usize) {
+        self.0.reserve(additional);
+    }
+
+    #[inline]
+    pub fn try_reserve(&mut self, additional: usize) -> Result<(), AllocFailure> {
+        self.0.try_reserve(additional)
+    }
+
+    #[inline]
+    pub fn shrink_to_fit(&mut self) {
+        self.0.shrink_to_fit();
+    }
+
+    #[inline]
+    pub fn shrink_to(&mut self, min: usize) {
+        self.0.shrink_to(min);
+    }
+
+    /// Adds `value`: whether it was not held (a held equal element is kept).
+    #[inline]
+    pub fn insert(&mut self, value: T) -> bool {
+        match self.0.entry(value) {
+            Entry::Occupied(_) => false,
+            Entry::Vacant(entry) => {
+                entry.insert(());
+                true
+            }
+        }
+    }
+
+    /// Adds `value`, putting it in place of an equal element held, which it returns.
+    #[inline]
+    pub fn replace(&mut self, value: T) -> Option<T> {
+        let old = self.0.remove_entry(&value).map(|(it, ())| it);
+        self.0.insert(value, ());
+        old
+    }
+
+    /// The held element equal to `value`, which is added if none is.
+    #[inline]
+    pub fn get_or_insert(&mut self, value: T) -> &T {
+        self.0.entry(value).insert(()).into_key_ref()
+    }
+
+    #[inline]
+    pub fn contains<Q: ?Sized + Hash + Equivalent<T>>(&self, value: &Q) -> bool {
+        self.0.contains_key(value)
+    }
+
+    /// The held element equal to `value`.
+    #[inline]
+    pub fn get<Q: ?Sized + Hash + Equivalent<T>>(&self, value: &Q) -> Option<&T> {
+        self.0.get_key_value(value).map(|(it, ())| it)
+    }
+
+    /// Removes `value`: whether it was held.
+    #[inline]
+    pub fn remove<Q: ?Sized + Hash + Equivalent<T>>(&mut self, value: &Q) -> bool {
+        self.0.remove(value).is_some()
+    }
+
+    /// Removes and returns the held element equal to `value`.
+    #[inline]
+    pub fn take<Q: ?Sized + Hash + Equivalent<T>>(&mut self, value: &Q) -> Option<T> {
+        self.0.remove_entry(value).map(|(it, ())| it)
+    }
+
+    /// The elements of either.
+    #[inline]
+    pub fn union<'a>(&'a self, other: &'a Self) -> Union<'a, T, S, A> {
+        // The larger first, so the rest walked against it is the smaller.
+        let (larger, smaller) = if self.len() >= other.len() { (self, other) } else { (other, self) };
+        Union { first: larger.iter(), rest: smaller.difference(larger) }
+    }
+
+    /// The elements of both, walking the smaller.
+    #[inline]
+    pub fn intersection<'a>(&'a self, other: &'a Self) -> Intersection<'a, T, S, A> {
+        let (smaller, larger) = if self.len() <= other.len() { (self, other) } else { (other, self) };
+        Intersection { walk: smaller.iter(), other: larger }
+    }
+
+    /// The elements of this one not in `other`.
+    #[inline]
+    pub fn difference<'a>(&'a self, other: &'a Self) -> Difference<'a, T, S, A> {
+        Difference { walk: self.iter(), other }
+    }
+
+    /// The elements of exactly one.
+    #[inline]
+    pub fn symmetric_difference<'a>(&'a self, other: &'a Self) -> SymmetricDifference<'a, T, S, A> {
+        SymmetricDifference { first: self.difference(other), second: other.difference(self) }
+    }
+
+    #[inline]
+    pub fn is_disjoint(&self, other: &Self) -> bool {
+        self.intersection(other).next().is_none()
+    }
+
+    #[inline]
+    pub fn is_subset(&self, other: &Self) -> bool {
+        self.len() <= other.len() && self.iter().all(|it| other.contains(it))
+    }
+
+    #[inline]
+    pub fn is_superset(&self, other: &Self) -> bool {
+        other.is_subset(self)
+    }
+}
+
+/// A set's elements by reference.
+pub struct Iter<'a, T>(hash_map::Keys<'a, T, ()>);
+
+impl<T> Clone for Iter<'_, T> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Iter(self.0.clone())
+    }
+}
+
+impl<'a, T> Iterator for Iter<'a, T> {
+    type Item = &'a T;
+
+    #[inline]
+    fn next(&mut self) -> Option<&'a T> {
+        self.0.next()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
+impl<T> ExactSizeIterator for Iter<'_, T> {}
+impl<T> FusedIterator for Iter<'_, T> {}
+
+impl<T: fmt::Debug> fmt::Debug for Iter<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.clone()).finish()
+    }
+}
+
+/// A set's elements by value.
+pub struct IntoIter<T, A: Allocator>(hash_map::IntoKeys<T, (), A>);
+
+impl<T, A: Allocator> Iterator for IntoIter<T, A> {
+    type Item = T;
+
+    #[inline]
+    fn next(&mut self) -> Option<T> {
+        self.0.next()
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
+impl<T, A: Allocator> ExactSizeIterator for IntoIter<T, A> {}
+impl<T, A: Allocator> FusedIterator for IntoIter<T, A> {}
+
+/// A set's elements taken out by [`Set::drain`].
+pub struct Drain<'a, T, A: Allocator>(hash_map::Drain<'a, T, (), A>);
+
+impl<T, A: Allocator> Iterator for Drain<'_, T, A> {
+    type Item = T;
+
+    #[inline]
+    fn next(&mut self) -> Option<T> {
+        self.0.next().map(|(it, ())| it)
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
+impl<T, A: Allocator> ExactSizeIterator for Drain<'_, T, A> {}
+impl<T, A: Allocator> FusedIterator for Drain<'_, T, A> {}
+
+/// The elements of one set not in another: [`Set::difference`].
+pub struct Difference<'a, T, S, A: Allocator> {
+    walk: Iter<'a, T>,
+    other: &'a Set<T, S, A>,
+}
+
+impl<T, S, A: Allocator> Clone for Difference<'_, T, S, A> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Difference { walk: self.walk.clone(), other: self.other }
+    }
+}
+
+impl<'a, T: Eq + Hash, S: BuildHasher, A: Allocator> Iterator for Difference<'a, T, S, A> {
+    type Item = &'a T;
+
+    #[inline]
+    fn next(&mut self) -> Option<&'a T> {
+        let other = self.other;
+        self.walk.find(|it| !other.contains(*it))
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, self.walk.size_hint().1)
+    }
+}
+
+impl<T: Eq + Hash, S: BuildHasher, A: Allocator> FusedIterator for Difference<'_, T, S, A> {}
+
+/// The elements of both sets: [`Set::intersection`].
+pub struct Intersection<'a, T, S, A: Allocator> {
+    walk: Iter<'a, T>,
+    other: &'a Set<T, S, A>,
+}
+
+impl<T, S, A: Allocator> Clone for Intersection<'_, T, S, A> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Intersection { walk: self.walk.clone(), other: self.other }
+    }
+}
+
+impl<'a, T: Eq + Hash, S: BuildHasher, A: Allocator> Iterator for Intersection<'a, T, S, A> {
+    type Item = &'a T;
+
+    #[inline]
+    fn next(&mut self) -> Option<&'a T> {
+        let other = self.other;
+        self.walk.find(|it| other.contains(*it))
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, self.walk.size_hint().1)
+    }
+}
+
+impl<T: Eq + Hash, S: BuildHasher, A: Allocator> FusedIterator for Intersection<'_, T, S, A> {}
+
+/// The elements of either set, each once: [`Set::union`].
+pub struct Union<'a, T, S, A: Allocator> {
+    first: Iter<'a, T>,
+    rest: Difference<'a, T, S, A>,
+}
+
+impl<T, S, A: Allocator> Clone for Union<'_, T, S, A> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Union { first: self.first.clone(), rest: self.rest.clone() }
+    }
+}
+
+impl<'a, T: Eq + Hash, S: BuildHasher, A: Allocator> Iterator for Union<'a, T, S, A> {
+    type Item = &'a T;
+
+    #[inline]
+    fn next(&mut self) -> Option<&'a T> {
+        self.first.next().or_else(|| self.rest.next())
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let (first, _) = self.first.size_hint();
+        (first, first.checked_add(self.rest.size_hint().1.unwrap_or(0)))
+    }
+}
+
+impl<T: Eq + Hash, S: BuildHasher, A: Allocator> FusedIterator for Union<'_, T, S, A> {}
+
+/// The elements of exactly one of two sets: [`Set::symmetric_difference`].
+pub struct SymmetricDifference<'a, T, S, A: Allocator> {
+    first: Difference<'a, T, S, A>,
+    second: Difference<'a, T, S, A>,
+}
+
+impl<T, S, A: Allocator> Clone for SymmetricDifference<'_, T, S, A> {
+    #[inline]
+    fn clone(&self) -> Self {
+        SymmetricDifference { first: self.first.clone(), second: self.second.clone() }
+    }
+}
+
+impl<'a, T: Eq + Hash, S: BuildHasher, A: Allocator> Iterator
+    for SymmetricDifference<'a, T, S, A>
+{
+    type Item = &'a T;
+
+    #[inline]
+    fn next(&mut self) -> Option<&'a T> {
+        self.first.next().or_else(|| self.second.next())
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (0, self.first.size_hint().1.zip(self.second.size_hint().1).map(|(a, b)| a + b))
+    }
+}
+
+impl<T: Eq + Hash, S: BuildHasher, A: Allocator> FusedIterator
+    for SymmetricDifference<'_, T, S, A>
+{
+}
+
+/// A set in an allocator that is `Default` (`Global`). The ratchet's: kept for the existing
+/// callers on the global heap; new code names its allocator with [`Set::new_in`].
+impl<T, S: Default, A: Allocator + Default> Default for Set<T, S, A> {
+    #[inline]
+    fn default() -> Self {
+        Set::new_in(A::default())
+    }
+}
+
+impl<T: Clone, S: Clone, A: Allocator + Clone> Clone for Set<T, S, A> {
+    #[inline]
+    fn clone(&self) -> Self {
+        Set(self.0.clone())
+    }
+}
+
+impl<T: fmt::Debug, S, A: Allocator> fmt::Debug for Set<T, S, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_set().entries(self.iter()).finish()
+    }
+}
+
+/// The same elements, whatever the order.
+impl<T: Eq + Hash, S: BuildHasher, A: Allocator> PartialEq for Set<T, S, A> {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl<T: Eq + Hash, S: BuildHasher, A: Allocator> Eq for Set<T, S, A> {}
+
+impl<T, S, A: Allocator> IntoIterator for Set<T, S, A> {
+    type Item = T;
+    type IntoIter = IntoIter<T, A>;
+
+    #[inline]
+    fn into_iter(self) -> IntoIter<T, A> {
+        IntoIter(self.0.into_keys())
+    }
+}
+
+impl<'a, T, S, A: Allocator> IntoIterator for &'a Set<T, S, A> {
+    type Item = &'a T;
+    type IntoIter = Iter<'a, T>;
+
+    #[inline]
+    fn into_iter(self) -> Iter<'a, T> {
+        self.iter()
+    }
+}
+
+/// `collect()` into a set in an allocator that is `Default` (`Global`); one in a frame is
+/// made with [`Set::from_iter_in`]. The ratchet's, as [`Default`].
+impl<T: Eq + Hash, S: BuildHasher + Default, A: Allocator + Default> FromIterator<T>
+    for Set<T, S, A>
+{
+    #[inline]
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        Set::from_iter_in(iter, A::default())
+    }
+}
+
+impl<T: Eq + Hash, S: BuildHasher, A: Allocator> Extend<T> for Set<T, S, A> {
+    #[inline]
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        self.0.extend(iter.into_iter().map(|it| (it, ())));
+    }
+}
+
+impl<'a, T: 'a + Eq + Hash + Copy, S: BuildHasher, A: Allocator> Extend<&'a T> for Set<T, S, A> {
+    #[inline]
+    fn extend<I: IntoIterator<Item = &'a T>>(&mut self, iter: I) {
+        self.extend(iter.into_iter().copied());
+    }
+}
+
+/// The set operators make a new set in `A::default()`, so only for an allocator that has one.
+macro_rules! set_operator {
+    ($($trait:ident $method:ident $walk:ident),*) => {$(
+        impl<T, S, A> $trait<&Set<T, S, A>> for &Set<T, S, A>
+        where
+            T: Eq + Hash + Clone,
+            S: BuildHasher + Default,
+            A: Allocator + Default,
+        {
+            type Output = Set<T, S, A>;
+
+            #[inline]
+            fn $method(self, rhs: &Set<T, S, A>) -> Set<T, S, A> {
+                self.$walk(rhs).cloned().collect()
+            }
+        }
+    )*};
+}
+
+set_operator!(
+    BitOr bitor union,
+    BitAnd bitand intersection,
+    BitXor bitxor symmetric_difference,
+    Sub sub difference
+);
+
+// serde's forms, a sequence of the elements: behind the `serde` feature.
+#[cfg(feature = "serde")]
+impl<T: serde::Serialize, S, A: Allocator> serde::Serialize for Set<T, S, A> {
+    fn serialize<Z: serde::Serializer>(&self, serializer: Z) -> Result<Z::Ok, Z::Error> {
+        serializer.collect_seq(self.iter())
+    }
+}
+
+#[cfg(feature = "serde")]
+impl<'de, T, S, A> serde::Deserialize<'de> for Set<T, S, A>
+where
+    T: serde::Deserialize<'de> + Eq + Hash,
+    S: BuildHasher + Default,
+    A: Allocator + Default,
+{
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use core::marker::PhantomData;
+
+        struct Elements<T, S, A>(PhantomData<fn() -> (T, S, A)>);
+
+        impl<'de, T, S, A> serde::de::Visitor<'de> for Elements<T, S, A>
+        where
+            T: serde::Deserialize<'de> + Eq + Hash,
+            S: BuildHasher + Default,
+            A: Allocator + Default,
+        {
+            type Value = Set<T, S, A>;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a sequence")
+            }
+
+            fn visit_seq<Q: serde::de::SeqAccess<'de>>(self, mut elements: Q) -> Result<Self::Value, Q::Error> {
+                // At most a page's worth up front: the hint is the input's, not to be trusted.
+                let hint = elements.size_hint().unwrap_or(0).min(4096);
+                let mut set = Set::with_capacity_in(hint, A::default());
+                while let Some(value) = elements.next_element()? {
+                    set.insert(value);
+                }
+                Ok(set)
+            }
+        }
+
+        deserializer.deserialize_seq(Elements(PhantomData))
+    }
+}

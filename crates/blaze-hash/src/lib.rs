@@ -1,13 +1,13 @@
 //! What blaze hashes in memory with: one choice per kind of key, so no crate picks its own.
 //!
-//! - Ordinary keys (ids, names, tuples, paths): [`HashMap`] and [`HashSet`], hashbrown's map
-//!   and set on [`FixedState`], foldhash's fast hasher with its one fixed seed, in the
-//!   allocator the type names (`HashMap<K, V, &Frame>` for a task's, `HashMap<K, V, Global>`
-//!   with `// alloc: <why>` for the global heap's; see [`table`]). It costs about what
-//!   FxHash does per key, and it spreads sequential integers and aligned pointers over the whole
-//!   word, which FxHash's single multiply does not: hashbrown places a key by the low bits of its
-//!   hash and tells keys of a group apart by the top seven. The seed is fixed so that a run is
-//!   reproducible; no output may depend on a map's order all the same.
+//! - Ordinary keys (ids, names, tuples, paths): [`HashMap`] and [`HashSet`], this crate's own
+//!   SwissTable ([`hash_map`], [`hash_set`], on `blaze_swiss`'s group probe) on [`FixedState`],
+//!   foldhash's fast hasher with its one fixed seed, in the allocator the type names
+//!   (`HashMap<K, V, &Frame>` for a task's, `HashMap<K, V, Global>` for the global heap's). It
+//!   costs about what FxHash does per key, and it spreads sequential integers and aligned
+//!   pointers over the whole word, which FxHash's single multiply does not: the table places a
+//!   key by the low bits of its hash and tells keys of a group apart by the top seven. The seed
+//!   is fixed so that a run is reproducible; no output may depend on a map's order all the same.
 //! - Keys that are hashes already (a content ID, a store key, a fingerprint): [`ByHash`] and
 //!   [`ByHashSet`], on [`KeyHasher`], which takes the key's first word and hashes nothing, in
 //!   a named allocator as above.
@@ -40,9 +40,19 @@
 //!   only [`Map::with_hasher_in`] with the key, so it cannot be made without one.
 //! - Hashes that are persisted or compared across runs are BLAKE3, never these: a content ID
 //!   is `blaze_ids::Hasher`, and a value's `Hash` is fed to it through [`Blake3Hasher`]. This
-//!   crate depends on nothing of blaze's, so every crate can use it.
+//!   crate depends only on blaze-own and blaze-swiss, which depend on no crate from outside the
+//!   workspace, so every crate can use it; it is `no_std` and uses no `alloc`: memory comes from
+//!   the allocator a table names.
 
+#![no_std]
 #![feature(allocator_ext)]
+// blaze's lints (`blaze::trust`) name their tool; inert under rustc.
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![blaze::trust(
+    unsafe,
+    reason = "the table's own memory (`raw`: control words, slots initialized exactly where tagged live, one allocation in the table's allocator) and libc's `getentropy` for `SipKey::random`; each block names the invariant it relies on"
+)]
 #![cfg_attr(test, feature(hashmap_internals))]
 #![cfg_attr(
     test,
@@ -52,17 +62,27 @@
     )
 )]
 
-use std::hash::{BuildHasher, Hasher};
+// Tests compare against std's tables and hashers and use its processes and clocks; the crate
+// itself sees `core` only.
+#[cfg(test)]
+#[macro_use]
+extern crate std;
+
+use core::hash::{BuildHasher, Hasher};
 
 pub mod adaptive;
 mod blake3;
 mod fold;
+pub mod hash_map;
+pub mod hash_set;
 mod key;
 pub mod order;
 #[cfg(test)]
 mod order_tests;
+mod raw;
+#[cfg(test)]
+mod raw_tests;
 mod sip;
-pub mod table;
 #[cfg(test)]
 mod tests;
 
@@ -70,13 +90,27 @@ pub use blake3::{Blake3, Blake3Hasher};
 pub use key::{BuildKeyHasher, ByHash, ByHashSet, KeyHasher};
 pub use sip::{LazyKey, SipHasher, SipKey};
 pub use order::{OrderMap, OrderSet};
-pub use table::{Map, Set};
+pub use hash_map::Map;
+pub use hash_set::Set;
+/// Why a `try_reserve` was refused: blaze-own's, the one allocation failure of the tree.
+pub use blaze_own::AllocFailure;
 
-/// The entry and iterator types of [`HashMap`] and [`ByHash`]: hashbrown's
-/// (`hash_map::Entry::Vacant(..)`), not std's.
-pub use hashbrown::hash_map;
-/// The iterator types of [`HashSet`] and [`ByHashSet`]: hashbrown's.
-pub use hashbrown::hash_set;
+/// A borrowed form of a key that a table is asked with (`map.get(&("a", 1))` for a key of
+/// `(String, u32)`, through a type that compares to it); every `Q: Eq` that a key `Borrow`s is
+/// one. Under the `shared` feature it is papaya's trait of the same shape, so one impl serves
+/// the shared tables and these.
+#[cfg(not(feature = "shared"))]
+pub trait Equivalent<K: ?Sized> {
+    fn equivalent(&self, key: &K) -> bool;
+}
+
+#[cfg(not(feature = "shared"))]
+impl<Q: ?Sized + Eq, K: ?Sized + core::borrow::Borrow<Q>> Equivalent<K> for Q {
+    #[inline]
+    fn equivalent(&self, key: &K) -> bool {
+        PartialEq::eq(self, key.borrow())
+    }
+}
 
 /// A map of ordinary keys in the allocator `A`, which every use names: `HashMap::new_in(frame)`,
 /// `HashMap::with_capacity_in(n, frame)`, `HashMap::from_iter_in(iter, frame)`.
@@ -118,13 +152,13 @@ pub type SharedSet<K> = papaya::HashSet<K, FixedState>;
 #[cfg(feature = "shared")]
 pub type SharedByHash<K, V> = papaya::HashMap<K, V, BuildKeyHasher>;
 
-/// What the shared tables are asked with: a borrowed form of a key ([`Equivalent`]), and what
-/// a compare-and-swap of an entry does ([`Operation`], for `map.pin().compute(..)`).
+/// What every table is asked with under `shared`: a borrowed form of a key ([`Equivalent`]),
+/// and what a compare-and-swap of an entry does ([`Operation`], for `map.pin().compute(..)`).
 #[cfg(feature = "shared")]
 pub use papaya::{Equivalent, Operation};
 
 /// The `BuildHasher` of [`HashMap`] and [`HashSet`], and of any other table of ordinary keys
-/// (`hashbrown`, `indexmap`, `papaya`): every hasher it builds is [`FixedHasher::default`].
+/// (`OrderMap`, `papaya`'s): every hasher it builds is [`FixedHasher::default`].
 /// Zero-sized and `Copy`, so a table holds nothing for it, and the type is its own value
 /// (`FixedState.hash_one(key)`, `HashMap::with_hasher(FixedState)`).
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]

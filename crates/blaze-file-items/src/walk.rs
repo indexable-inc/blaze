@@ -7,19 +7,21 @@
 //! is taken when it closes, from its range or from the tokens recorded while it was open (a
 //! visibility, a rename, an attribute). No node is kept past its exit.
 
-use std::alloc::Allocator;
+use core::alloc::Allocator;
 
 use blaze_hash::ByHash;
 use blaze_ids::{ContentId, Hasher};
+use blaze_own::Vec;
+use blaze_surface::{
+    Attr, AttrKind, AttrSpan, ErrorOrigin, Item, ItemDetail, ItemIndex, Range, Rename, SyntaxError,
+    WrittenVis,
+};
 use parser::{
     Edition, LexedStr, OutlineStep, Step,
     SyntaxKind::{self, *},
 };
 
-use crate::{
-    Attr, AttrKind, AttrSpan, ErrorOrigin, ITEM_DOMAIN, Item, ItemIndex, ItemKind, Outline, Range,
-    Rename, SIGNATURE_DOMAIN, SyntaxError, Visibility, usize_of,
-};
+use crate::{ITEM_DOMAIN, Outline, SIGNATURE_DOMAIN};
 
 /// The domain of an unnamed entry's head: its signature tokens outside its attributes, which
 /// stand for its name among its siblings.
@@ -30,12 +32,12 @@ const SIBLING_DOMAIN: &str = "blaze v2 file item siblings 1";
 
 /// What an entry is before the walk closes it.
 const PLACEHOLDER: Item = Item {
-    kind: ItemKind::Error,
+    detail: ItemDetail::Error,
     parent: None,
     end: ItemIndex(0),
     range: Range::new(0, 0),
     name: None,
-    visibility: Visibility::Private,
+    visibility: WrittenVis::Private,
     signature: Range::new(0, 0),
     body: None,
     attrs: AttrSpan { start: 0, end: 0 },
@@ -145,7 +147,7 @@ struct Open {
     after_colon: bool,
     after_eq: bool,
     name: Option<Range>,
-    visibility: Visibility,
+    visibility: WrittenVis<Range>,
     rename: Option<Rename>,
     tree: Option<Range>,
     path: Option<Range>,
@@ -378,7 +380,7 @@ impl<'t, 'l, A: Allocator + Clone> Walk<'t, 'l, A> {
             after_colon: false,
             after_eq: false,
             name: None,
-            visibility: Visibility::Private,
+            visibility: WrittenVis::Private,
             rename: None,
             tree: None,
             path: None,
@@ -546,46 +548,46 @@ impl<'t, 'l, A: Allocator + Clone> Walk<'t, 'l, A> {
         .or(open.before_semi)
         .unwrap_or(end)
         .max(start);
-        let attrs = &self.out.attrs[usize_of(open.attrs.start)..usize_of(open.attrs.end)];
+        let attrs = &self.out.attrs[open.attrs.to_usize()];
         let kind = match open.syntax {
-            FN => ItemKind::Fn { body_holds_items: open.holds_items },
-            STRUCT => ItemKind::Struct,
-            ENUM => ItemKind::Enum,
-            UNION => ItemKind::Union,
-            TRAIT if open.before_eq.is_some() => ItemKind::TraitAlias,
-            TRAIT => ItemKind::Trait,
-            IMPL => ItemKind::Impl,
-            CONST => ItemKind::Const { body_holds_items: open.holds_items },
-            STATIC => ItemKind::Static { body_holds_items: open.holds_items },
-            TYPE_ALIAS => ItemKind::TypeAlias,
-            MODULE => ItemKind::Mod {
+            FN => ItemDetail::Fn { body_holds_items: open.holds_items },
+            STRUCT => ItemDetail::Struct,
+            ENUM => ItemDetail::Enum,
+            UNION => ItemDetail::Union,
+            TRAIT if open.before_eq.is_some() => ItemDetail::TraitAlias,
+            TRAIT => ItemDetail::Trait,
+            IMPL => ItemDetail::Impl,
+            CONST => ItemDetail::Const { body_holds_items: open.holds_items },
+            STATIC => ItemDetail::Static { body_holds_items: open.holds_items },
+            TYPE_ALIAS => ItemDetail::TypeAlias,
+            MODULE => ItemDetail::Mod {
                 inline: open.body.is_some(),
                 path: attrs.iter().find_map(|attr| match attr.kind {
                     AttrKind::Path { literal } if !attr.inner => Some(literal),
                     _ => None,
                 }),
             },
-            USE => ItemKind::Use { tree: open.tree.map(rel) },
-            EXTERN_CRATE => ItemKind::ExternCrate {
+            USE => ItemDetail::Use { tree: open.tree.map(rel) },
+            EXTERN_CRATE => ItemDetail::ExternCrate {
                 rename: open.rename.map(|rename| match rename {
                     Rename::Name(name) => Rename::Name(rel(name)),
                     Rename::Underscore => Rename::Underscore,
                 }),
             },
-            EXTERN_BLOCK => ItemKind::ExternBlock { abi: open.abi.map(rel) },
-            MACRO_RULES => ItemKind::MacroRules {
+            EXTERN_BLOCK => ItemDetail::ExternBlock { abi: open.abi.map(rel) },
+            MACRO_RULES => ItemDetail::MacroRules {
                 exported: attrs.iter().any(|attr| !attr.inner && attr.kind == AttrKind::MacroExport),
             },
-            MACRO_DEF => ItemKind::MacroDef,
+            MACRO_DEF => ItemDetail::MacroDef,
             MACRO_CALL => {
-                ItemKind::MacroCall { path: open.path.map(rel), input: open.input.map(rel) }
+                ItemDetail::MacroCall { path: open.path.map(rel), input: open.input.map(rel) }
             }
-            VARIANT => ItemKind::Variant { discriminant: open.value.map(rel) },
+            VARIANT => ItemDetail::Variant { discriminant: open.value.map(rel) },
             RECORD_FIELD | TUPLE_FIELD => {
-                ItemKind::Field { ty: open.ty.map(rel), default: open.value.map(rel) }
+                ItemDetail::Field { ty: open.ty.map(rel), default: open.value.map(rel) }
             }
-            ERROR | ATTR | DOC_COMMENT => ItemKind::Error,
-            syntax => ItemKind::Unhandled { syntax },
+            ERROR | ATTR | DOC_COMMENT => ItemDetail::Error,
+            syntax => ItemDetail::Unhandled { syntax: u16::from(syntax) },
         };
         let mut sibling = Hasher::new(SIBLING_DOMAIN);
         sibling
@@ -609,16 +611,12 @@ impl<'t, 'l, A: Allocator + Clone> Walk<'t, 'l, A> {
         *count += 1;
         let after = u32::try_from(self.out.items.len()).expect("an outline's entries are counted in u32");
         self.out.items[open.index.at()] = Item {
-            kind,
+            detail: kind,
             parent: open.parent,
             end: ItemIndex(after),
             range: Range::new(start, end),
             name: open.name.map(rel),
-            visibility: match open.visibility {
-                Visibility::In { path } => Visibility::In { path: rel(path) },
-                Visibility::WithoutIn { path } => Visibility::WithoutIn { path: rel(path) },
-                other => other,
-            },
+            visibility: open.visibility.map(rel),
             signature: Range::new(0, signature_end - start),
             body: open.body.map(rel),
             attrs: open.attrs,
@@ -737,36 +735,36 @@ fn is_list(kind: SyntaxKind) -> bool {
 }
 
 /// The kind of an entry as one byte of its sibling key: its variant, not its payload.
-fn tag_of(kind: ItemKind) -> u8 {
+fn tag_of(kind: ItemDetail) -> u8 {
     match kind {
-        ItemKind::Fn { .. } => 0,
-        ItemKind::Struct => 1,
-        ItemKind::Enum => 2,
-        ItemKind::Union => 3,
-        ItemKind::Trait => 4,
-        ItemKind::TraitAlias => 5,
-        ItemKind::Impl => 6,
-        ItemKind::Const { .. } => 7,
-        ItemKind::Static { .. } => 8,
-        ItemKind::TypeAlias => 9,
-        ItemKind::Mod { .. } => 10,
-        ItemKind::Use { .. } => 11,
-        ItemKind::ExternCrate { .. } => 12,
-        ItemKind::ExternBlock { .. } => 13,
-        ItemKind::MacroRules { .. } => 14,
-        ItemKind::MacroDef => 15,
-        ItemKind::MacroCall { .. } => 16,
-        ItemKind::Variant { .. } => 17,
-        ItemKind::Field { .. } => 18,
-        ItemKind::Error => 19,
-        ItemKind::Unhandled { .. } => 20,
+        ItemDetail::Fn { .. } => 0,
+        ItemDetail::Struct => 1,
+        ItemDetail::Enum => 2,
+        ItemDetail::Union => 3,
+        ItemDetail::Trait => 4,
+        ItemDetail::TraitAlias => 5,
+        ItemDetail::Impl => 6,
+        ItemDetail::Const { .. } => 7,
+        ItemDetail::Static { .. } => 8,
+        ItemDetail::TypeAlias => 9,
+        ItemDetail::Mod { .. } => 10,
+        ItemDetail::Use { .. } => 11,
+        ItemDetail::ExternCrate { .. } => 12,
+        ItemDetail::ExternBlock { .. } => 13,
+        ItemDetail::MacroRules { .. } => 14,
+        ItemDetail::MacroDef => 15,
+        ItemDetail::MacroCall { .. } => 16,
+        ItemDetail::Variant { .. } => 17,
+        ItemDetail::Field { .. } => 18,
+        ItemDetail::Error => 19,
+        ItemDetail::Unhandled { .. } => 20,
     }
 }
 
 /// A visibility from its tokens: `pub`, then `( .. )` or nothing. Ranges are the file's.
-fn visibility_of(tokens: &[Tok]) -> Visibility {
+fn visibility_of(tokens: &[Tok]) -> WrittenVis<Range> {
     let Some(paren) = tokens.get(1).filter(|token| token.kind == L_PAREN) else {
-        return Visibility::Pub;
+        return WrittenVis::Pub;
     };
     let inside = match tokens {
         [_, _, inside @ .., close] if close.kind == R_PAREN => inside,
@@ -778,11 +776,11 @@ fn visibility_of(tokens: &[Tok]) -> Visibility {
         _ => Range::new(paren.range.end, paren.range.end),
     };
     match inside {
-        [only] if only.kind == CRATE_KW => Visibility::Crate,
-        [only] if only.kind == SUPER_KW => Visibility::Super,
-        [only] if only.kind == SELF_KW => Visibility::SelfOnly,
-        [first, path @ ..] if first.kind == IN_KW => Visibility::In { path: span(path) },
-        path => Visibility::WithoutIn { path: span(path) },
+        [only] if only.kind == CRATE_KW => WrittenVis::Crate,
+        [only] if only.kind == SUPER_KW => WrittenVis::Super,
+        [only] if only.kind == SELF_KW => WrittenVis::SelfOnly,
+        [first, path @ ..] if first.kind == IN_KW => WrittenVis::In(span(path)),
+        path => WrittenVis::WithoutIn(span(path)),
     }
 }
 

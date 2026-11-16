@@ -48,7 +48,7 @@ pub use crate::key::{Key, Kind, Name, Tool};
 pub use crate::record::{Finding, Locate, Part};
 pub use crate::request::{
     Answer, Ask, Builder, Class, Command, Config, DriveError, Effect, Event, FileEntry, Input,
-    Output, Ran, Request, Task, TaskFailure, Ticket, Want,
+    Output, Print, Ran, Request, Task, TaskFailure, Ticket, Want,
 };
 pub use crate::wire::{WireError, WireWhy};
 

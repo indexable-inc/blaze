@@ -19,7 +19,9 @@ use super::{
     Bytes, CORRUPT, ColdDictionary, MOST_RAW, compress, decode_raw, decompress, put_packed,
     raw_cold,
 };
-use crate::{ALIGN, Aligned, FormatError, Record, SchemaHash, WordTable, bytes_of, leb, open_as};
+use crate::{
+    ALIGN, Aligned, FormatError, Record, SchemaHash, WordTable, bytes_of_slice, leb, open_as,
+};
 
 const FORM_VERSION: u8 = 2;
 const WARM: u8 = 0;
@@ -47,7 +49,7 @@ pub fn columns_of<R: Record>(
     let root = open_as::<R>(buffer, schema)?;
     // alloc: the columns of a buffer moved to a tier, once a buffer
     let mut found = Vec::new();
-    R::columns(bytes_of(root), buffer, &mut found);
+    R::columns(bytes_of_slice(core::slice::from_ref(root)), buffer, &mut found);
     Ok(merged(found))
 }
 

@@ -198,14 +198,26 @@ impl<T, A: Allocator> Rc<[T], A> {
     where
         T: Clone,
     {
+        match Rc::try_from_slice_in(values, alloc) {
+            Ok(rc) => rc,
+            Err(failure) => fail(failure),
+        }
+    }
+
+    /// [`Rc::from_slice_in`], or why there is no block; nothing is left allocated.
+    pub fn try_from_slice_in(values: &[T], alloc: A) -> Result<Rc<[T], A>, AllocFailure>
+    where
+        T: Clone,
+    {
         let len = values.len();
         let Some(layout) = slice_layout::<T>(len) else {
-            fail(AllocFailure::CapacityOverflow { what: type_name::<T>(), len: 0, additional: len });
+            let what = type_name::<T>();
+            return Err(AllocFailure::CapacityOverflow { what, len: 0, additional: len });
         };
-        let Ok(block) = alloc.allocate(layout) else {
-            fail(AllocFailure::Refused { what: type_name::<[T]>(), layout });
-        };
-        let block = block.cast::<u8>();
+        let block = alloc
+            .allocate(layout)
+            .map_err(|_| AllocFailure::Refused { what: type_name::<[T]>(), layout })?
+            .cast::<u8>();
         let inner = ptr::slice_from_raw_parts_mut(block.as_ptr().cast::<T>(), len) as *mut Inner<[T]>;
         // SAFETY: the fresh block laid out as `Inner<[T]>` of `len` (`slice_layout`).
         let first = unsafe {
@@ -230,7 +242,7 @@ impl<T, A: Allocator> Rc<[T], A> {
         DropGuard::dismiss(made);
         // SAFETY: from a non-null block.
         let ptr = unsafe { NonNull::new_unchecked(inner) };
-        Rc { ptr, alloc, _owns: PhantomData }
+        Ok(Rc { ptr, alloc, _owns: PhantomData })
     }
 }
 

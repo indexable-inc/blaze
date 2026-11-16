@@ -442,6 +442,12 @@ impl Shape {
         self.0
     }
 
+    /// A shape of a given ID, for tests of what is keyed by one.
+    #[cfg(test)]
+    pub fn of_id(id: ContentId) -> Shape {
+        Shape(id)
+    }
+
     /// This shape as compiled to a template relative to its function's own anchors
     /// ([`Described::anchors`]) when `relative`, else itself. A relative and an absolute
     /// template of one IR are two memo entries: a template's places at its own code hold

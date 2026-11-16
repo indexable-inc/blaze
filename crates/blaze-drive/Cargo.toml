@@ -26,6 +26,9 @@ blaze-scope.workspace = true
 blaze-run.workspace = true
 # The record views the production `Items`/`Source` reads (items.rs).
 blaze-surface.workspace = true
+# `FormatError`: why a handed record is refused, named in `HeldError`. blaze-surface does not
+# re-export it.
+blaze-format.workspace = true
 
 [dev-dependencies]
 # `check` and `control`: the request's simulation and its planted-bug controls.

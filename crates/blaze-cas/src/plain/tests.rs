@@ -83,7 +83,7 @@ fn space(n: u32) -> Namespace {
 }
 
 fn cfg(n: u64, boot: u64, durable: bool) -> PlainConfig {
-    PlainConfig { dir: dir(), tags: n * TAGS, cap_bytes: u64::MAX, boot, nonce: 100 + n, durable, page: 16 << 10, writes: writes(), reads: reads() }
+    PlainConfig { dir: dir(), tags: n * TAGS, cap_bytes: u64::MAX, boot, nonce: 100 + n, durable, machine: vec![MACHINE.to_vec()], writes: writes(), reads: reads() }
 }
 
 fn key(n: u32) -> Key {
@@ -1602,7 +1602,7 @@ fn a_previous_layout_is_refused_by_name() {
     };
     let old = refused(b"BLZHEAD\x03 a content-addressed store's head".to_vec());
     assert_eq!(old, StoreError::Head { what: format::HEAD_FOREIGN, at: format::SLOT_AT[0] });
-    for (format, at) in [(2u32, 0usize), (2, 1), (1, 0), (1, 1), (0, 0)] {
+    for (format, at) in [(3u32, 0usize), (3, 1), (2, 0), (2, 1), (1, 0), (1, 1), (0, 0)] {
         let slot = Slot { generation: 2 + at as u64, log: 7, manifest_at: 0, manifest_len: 64, manifest_crc: 0 }.encode_as(format);
         let mut head = vec![0u8; format::HEAD_LEN];
         let start = format::SLOT_AT[at] as usize;
@@ -1610,10 +1610,13 @@ fn a_previous_layout_is_refused_by_name() {
         assert_eq!(refused(head), StoreError::Format { what: format::HEAD_SLOT, found: format, wanted: FORMAT }, "slot {at} of format {format}");
     }
 
-    // A manifest of format 2: this format's bytes with only the format word changed.
-    let mut manifest = format::Manifest::default().encode();
-    manifest[4..8].copy_from_slice(&2u32.to_le_bytes());
-    assert_eq!(format::Manifest::decode(&manifest), Err(StoreError::Format { what: "a plain store's manifest", found: 2, wanted: FORMAT }));
+    // Manifests of formats 2 and 3 (3: before the sealed flag): this format's bytes with only
+    // the format word changed.
+    for old in [2u32, 3] {
+        let mut manifest = format::Manifest::default().encode();
+        manifest[4..8].copy_from_slice(&old.to_le_bytes());
+        assert_eq!(format::Manifest::decode(&manifest), Err(StoreError::Format { what: "a plain store's manifest", found: old, wanted: FORMAT }));
+    }
     // This format's retired rows, marked and not, decode to what was encoded.
     let marked = format::Manifest {
         generation: 4,
@@ -1987,4 +1990,327 @@ fn a_fetched_segment_is_verified_before_it_is_used() {
     assert_eq!(why, StoreError::Namespace { found: Namespace::PUBLIC, wanted: Namespace::LOCAL });
     assert_eq!(other.get(&key(0)).map(|it| it.bytes.len()), None, "nothing of the lie was used");
     let _ = std::fs::remove_dir_all(&at);
+}
+
+// ---- The exit tail, the endpoint-free lookup and sealed sharing (store-next.md) ----
+
+/// This machine's path as the tests' stores know it ([`PlainConfig::machine`]).
+const MACHINE: &[u8] = b"/Users/someone/checkout";
+
+/// One history of the exit tail. Writer 0 commits and, in the rounds between, seals (the tail
+/// of a command that answered) or runs a compaction slice; writer 1 commits every round; a
+/// reader of boot 1 opens after the first round and holds what it mapped. The power cut after
+/// `cut_after` completions when given, else a last process of boot 1 seals what is left (an
+/// orderly exit, with the sealer's `plant`). Then always a power cut and a new boot, whose
+/// reader is held to the oracle and to two more promises: a segment proved by its sealed row
+/// is whole on the disk, and when the boot's last seal survived, the new boot's open checks no
+/// segment in full (it reads no segment's bytes to prove it).
+fn sealing(seed: u64, rounds: u32, per: u32, cut_after: Option<u32>, fail_one_in: u32, plant: Plant) -> Result<(), String> {
+    let mut sim = Sim::new(seed, Faults { fail_one_in, ..Faults::default() });
+    let mut actors = vec![Actor::new(cfg(0, 1, false), plant), Actor::new(cfg(1, 1, false), Plant::None)];
+    let mut budget = cut_after;
+    let mut ledger = Ledger { never: vec![500_000, 1_500_000], ..Ledger::default() };
+    let mut next = [0u32, 1_000_000];
+    let mut pending: [Option<Vec<u32>>; 2] = [None, None];
+    let mut early: Option<(Actor, Vec<u32>)> = None;
+    let mut cut = false;
+    for round in 0..=rounds {
+        for (i, actor) in actors.iter_mut().enumerate() {
+            if round == rounds || !actor.store.ready() || pending[i].is_some() {
+                continue;
+            }
+            if i == 0 && round % 2 == 1 {
+                let _asked = if round % 3 == 0 { actor.store.compact(&mut actor.effects) } else { actor.store.seal(&mut actor.effects) };
+                continue;
+            }
+            let keys: Vec<u32> = (0..per).map(|k| next[i] + k).collect();
+            next[i] += per;
+            for &n in &keys {
+                actor.store.put(key(n), space(n), TAG, &value(n)).map_err(|it| it.to_string())?;
+                ledger.maybe.insert(n, space(n));
+            }
+            actor.store.commit(Vec::new_in(Global), sim.wall_ns(), &mut actor.effects).map_err(|it| it.to_string())?;
+            pending[i] = Some(keys);
+        }
+        let settled = run(&mut sim, &mut actors, &mut budget);
+        for (i, actor) in actors.iter_mut().enumerate() {
+            let _slice = actor.store.take_sliced();
+            if let Some(Ok(committed)) = actor.store.take_committed() {
+                let keys = pending[i].take().expect("a commit was pending");
+                ledger.land(&keys, &committed)?;
+            }
+        }
+        if !settled {
+            cut = true;
+            break;
+        }
+        if let Some(why) = actors.iter().find_map(|it| it.store.broken())
+            && !injected(why)
+        {
+            return Err(format!("a writer broke on its own: {why}"));
+        }
+        if round == 0 && early.is_none() {
+            let held: Vec<u32> = ledger.committed.keys().copied().collect();
+            early = Some((reader_with(&mut sim, 5, 1, Plant::None), held));
+        }
+    }
+    drop(actors);
+    // The generation the boot's last seal wrote, when it ran and completed.
+    let mut sealed_at = None;
+    if !cut {
+        let mut last = reader_with(&mut sim, 6, 1, plant);
+        if last.store.seal(&mut last.effects) {
+            settle(&mut sim, std::slice::from_mut(&mut last));
+        }
+        if last.store.broken().is_none() {
+            sealed_at = Some(last.store.generation());
+        }
+    }
+    // A reader of boot 1 keeps reading what it mapped, through seals and compaction.
+    if let Some((r, held)) = &early {
+        for &n in held {
+            if r.store.get(&key(n)).map(|it| it.bytes.to_vec()) != Some(value(n)) {
+                return Err(format!("record {n}, held by a reader of boot 1, no longer reads back under it"));
+            }
+        }
+    }
+    drop(early);
+    sim.crash();
+    let r = reader_with(&mut sim, 2, 2, Plant::None);
+    oracle(&r.store, &ledger, true, false)?;
+    for id in r.store.proved_by_seal() {
+        let bytes = sim.contents(&FileName::new(&format!("plain/seg-{id:016x}")).expect("a name"));
+        if let Err(why) = check_segment(&bytes) {
+            return Err(format!("segment {id:016x} was proved by its sealed row and is not whole on the disk: {why}"));
+        }
+    }
+    if let Some(at) = sealed_at
+        && r.store.report().whole.is_some_and(|whole| whole >= at)
+        && !r.store.fully_checked().is_empty()
+    {
+        return Err(format!("the boot's last seal (generation {at}) survived, and the next boot checked {:x?} in full", r.store.fully_checked()));
+    }
+    Ok(())
+}
+
+/// The invariant of the exit tail: interleaved writers, seals and compaction slices, effects
+/// failing, a power cut anywhere (the seal's barriers and flip among them): every committed
+/// record reads back or is reported lost by name, nothing sealed is torn, and an orderly exit
+/// leaves the next boot nothing to check.
+#[test]
+fn a_sealed_tail_survives_any_power_cut_and_is_never_read_to_prove() {
+    blaze_sim::check(SimConfig::DEFAULT, |tape| {
+        let seed = tape.next_u64("sim seed");
+        let rounds = tape.int_in(1..=7u32, "rounds");
+        let per = tape.int_in(1..=12u32, "records per round");
+        let cut = tape.int_in(0..=1u32, "power cut") == 1;
+        let after = tape.int_in(0..=300u32, "cut after");
+        let fail = if tape.int_in(0..=3u32, "failing effects") == 0 { 40 } else { 0 };
+        let outcome = sealing(seed, rounds, per, cut.then_some(after), fail, Plant::None);
+        assert!(outcome.is_ok(), "seed {seed}, {rounds} rounds of {per}, cut {cut} after {after}, fail 1 in {fail}: {outcome:?}");
+    });
+}
+
+/// The control: a seal that flips before its barriers names segments sealed whose bytes the
+/// power cut may still tear; the oracle catches it for some seed of an orderly exit.
+#[test]
+fn the_oracle_catches_a_seal_before_its_barrier() {
+    let mut caught = None;
+    for seed in 0..64 {
+        let honest = sealing(seed, 4, 6, None, 0, Plant::None);
+        assert!(honest.is_ok(), "seed {seed} without the plant: {honest:?}");
+        if caught.is_none() {
+            caught = sealing(seed, 4, 6, None, 0, Plant::SealBeforeBarrier).err();
+        }
+    }
+    assert!(caught.is_some(), "no seed of 64 caught a seal flipped before its barriers");
+}
+
+/// A run of `n` test keys, sorted.
+fn run_of(n: u32) -> Vec<u8> {
+    let mut entries = Vec::new_in(Global);
+    for k in 0..n {
+        entries.push(Entry { key: key(k).0, tag: TAG, at: HEADER as u64, len: 0, crc: 0 });
+    }
+    format::sorted_run(entries).unwrap()
+}
+
+/// The lookup before 2026-11-15, kept as the control of the test below: each guess read the
+/// range's first and last entries.
+fn endpoint_find<'a>(n: usize, key: &ContentId, mut key_of: impl FnMut(usize) -> &'a [u8]) -> Option<usize> {
+    let prefix = |k: &[u8]| u64::from_be_bytes(k[0..8].try_into().unwrap());
+    let want = prefix(&key.0);
+    let (mut lo, mut hi, mut guesses) = (0usize, n, 0);
+    while lo < hi {
+        let mid = if guesses < 3 && hi - lo > 8 {
+            guesses += 1;
+            let (first, last) = (prefix(key_of(lo)), prefix(key_of(hi - 1)));
+            if want < first || want > last {
+                return None;
+            }
+            match last - first {
+                0 => lo + (hi - lo) / 2,
+                span => lo + ((u128::from(want - first) * (hi - 1 - lo) as u128) / u128::from(span)) as usize,
+            }
+        } else {
+            lo + (hi - lo) / 2
+        };
+        match key_of(mid).cmp(&key.0[..]) {
+            std::cmp::Ordering::Equal => return Some(mid),
+            std::cmp::Ordering::Less => lo = mid + 1,
+            std::cmp::Ordering::Greater => hi = mid,
+        }
+    }
+    None
+}
+
+/// The pages of 16 KiB a lookup of each probed key touches, at most and in all, and how many
+/// lookups touched the run's first or last page with their key on neither.
+fn pages_touched(run: &[u8], n: u32, endpoints: bool) -> (usize, usize, usize) {
+    const PAGE: usize = 16 << 10;
+    let count = run.len() / ENTRY;
+    let last_page = (run.len() - 1) / PAGE;
+    let (mut most, mut total, mut at_ends) = (0, 0, 0);
+    for k in (0..n).step_by(101).chain([n + 1, n + 7_000]) {
+        let mut pages = BTreeSet::new();
+        let key_of = |i: usize| {
+            pages.insert(i * ENTRY / PAGE);
+            &run[i * ENTRY..i * ENTRY + 32]
+        };
+        let found = if endpoints { endpoint_find(count, &key(k).0, key_of) } else { format::find_by(count, &key(k).0, key_of) };
+        assert_eq!(found.map(|i| run[i * ENTRY..i * ENTRY + 32] == key(k).0), (k < n).then_some(true), "key {k}");
+        let home = found.map(|i| i * ENTRY / PAGE);
+        if (pages.contains(&0) && home != Some(0)) || (pages.contains(&last_page) && home != Some(last_page)) {
+            at_ends += 1;
+        }
+        most = most.max(pages.len());
+        total += pages.len();
+    }
+    (most, total, at_ends)
+}
+
+/// The lookup reads the pages its probes land on and never the run's ends for a key elsewhere
+/// (two cold pages a segment probed, before): the cause removed, the control (the old lookup
+/// over the same run) shows the effect it had.
+#[test]
+fn a_lookup_reads_only_the_pages_its_probes_land_on() {
+    let n = 200_000;
+    let run = run_of(n);
+    let (most, total, at_ends) = pages_touched(&run, n, false);
+    assert_eq!(at_ends, 0, "lookups read the run's first or last page for keys on neither");
+    assert!(most <= 6, "a lookup touched {most} pages of a {n}-entry run");
+    let (_, old_total, old_at_ends) = pages_touched(&run, n, true);
+    assert!(old_at_ends > 0, "the control: the old lookup read the run's ends");
+    assert!(total < old_total, "the endpoint-free lookup touched {total} pages in all, the old {old_total}");
+}
+
+/// The lookup finds every key of a run whose keys are not spread evenly (clusters of prefixes,
+/// runs of one prefix), and no key it does not hold.
+#[test]
+fn a_lookup_finds_every_key_of_an_uneven_run() {
+    blaze_sim::check(SimConfig::DEFAULT, |tape| {
+        let clusters = tape.int_in(1..=4u32, "clusters");
+        let mut keys = BTreeSet::new();
+        for c in 0..clusters {
+            let base = tape.next_u64("cluster base");
+            let size = tape.int_in(1..=200u32, "cluster size");
+            let width = [0u64, 1, 1 << 20, u64::MAX >> 8][tape.index(4, "cluster width")];
+            for i in 0..size {
+                let mut k = ContentId::of("uneven run", &[c.to_le_bytes(), i.to_le_bytes()].concat()).0;
+                let offset = if width == 0 { 0 } else { u64::from_be_bytes(k[0..8].try_into().unwrap()) % width };
+                k[0..8].copy_from_slice(&base.wrapping_add(offset).to_be_bytes());
+                keys.insert(k);
+            }
+        }
+        let mut entries = Vec::new_in(Global);
+        entries.extend(keys.iter().map(|k| Entry { key: ContentId(*k), tag: TAG, at: HEADER as u64, len: 0, crc: 0 }));
+        let run = format::sorted_run(entries).unwrap();
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(format::find(&run, &ContentId(*k)), Some(i), "key {i} of {}", keys.len());
+            let mut absent = *k;
+            absent[31] ^= 1;
+            if !keys.contains(&absent) {
+                assert_eq!(format::find(&run, &ContentId(absent)), None, "a key not held, next to key {i}");
+            }
+        }
+    });
+}
+
+/// Sealed sharing (rule 25): a record holding this machine's path is refused for a shared
+/// namespace, by a put (naming the key and the offset) and in a worker's batch at the commit,
+/// and kept under the local one. The control: the same puts with no path listed go through.
+#[test]
+fn a_record_naming_the_machine_never_reaches_a_shared_namespace() {
+    let mut sim = Sim::new(3, Faults::default());
+    let mut w = [Actor::new(cfg(0, 1, false), Plant::None)];
+    settle(&mut sim, &mut w);
+    let mut leaky = b"a record built at ".to_vec();
+    leaky.extend_from_slice(MACHINE);
+    leaky.extend_from_slice(b"/src/lib.rs");
+    for space in [Namespace::PUBLIC, org()] {
+        let refused = w[0].store.put(key(1), space, TAG, &leaky);
+        assert!(matches!(refused, Err(super::core::PutError::Machine { at: 18, needle: 0, namespace, .. }) if namespace == space), "{refused:?}");
+    }
+    assert!(w[0].store.put(key(1), Namespace::LOCAL, TAG, &leaky).is_ok(), "the local namespace keeps it");
+    let mut batch = super::core::Batch::new(org());
+    batch.put(key(2), TAG, &leaky).unwrap();
+    let refused = w[0].store.commit(vec![batch], sim.wall_ns(), &mut w[0].effects);
+    assert!(matches!(refused, Err(StoreError::Other { .. })), "{refused:?}");
+    // The control: a store that lists no path of the machine takes both.
+    let mut open = cfg(1, 1, false);
+    open.machine.clear();
+    let mut c = [Actor::new(open, Plant::None)];
+    settle(&mut sim, &mut c);
+    assert!(c[0].store.put(key(3), Namespace::PUBLIC, TAG, &leaky).is_ok());
+    let mut batch = super::core::Batch::new(org());
+    batch.put(key(4), TAG, &leaky).unwrap();
+    assert!(c[0].store.commit(vec![batch], sim.wall_ns(), &mut c[0].effects).is_ok());
+    settle(&mut sim, &mut c);
+}
+
+/// A startup image round-trips byte for byte, refuses another program's or format's bytes by
+/// name, and orders its reads by segment and offset from what a real store places: the image's
+/// records committed over two commits (two segments), read back in one ascending pass each.
+#[test]
+fn a_startup_image_round_trips_and_reads_in_place_order() {
+    use super::image::{ImageError, Placement, StartupImage};
+    let manifest = ContentId::of("a program's manifest", b"hello");
+    let mut sim = Sim::new(5, Faults::default());
+    let mut w = [Actor::new(cfg(0, 1, false), Plant::None)];
+    settle(&mut sim, &mut w);
+    // Placed before main in this order: 7, 3, 9, 1, 5 (slots 0..5); committed in two batches.
+    let order = [7u32, 3, 9, 1, 5];
+    for half in [&[7u32, 9, 5][..], &[3u32, 1][..]] {
+        for &n in half {
+            w[0].store.put(key(n), Namespace::LOCAL, TAG, &value(n)).unwrap();
+        }
+        w[0].store.commit(Vec::new_in(Global), sim.wall_ns(), &mut w[0].effects).unwrap();
+        settle(&mut sim, &mut w);
+        assert!(matches!(w[0].store.take_committed(), Some(Ok(_))));
+    }
+    let mut placed = Vec::new_in(Global);
+    placed.extend(order.iter().enumerate().map(|(slot, n)| Placement { slot: slot as u32, code: key(*n).0 }));
+    placed.push(Placement { slot: 5, code: key(400_000).0 });
+    let image = StartupImage { manifest, placed };
+    let mut bytes = Vec::new_in(Global);
+    image.encode_into(&mut bytes);
+    let mut again = Vec::new_in(Global);
+    StartupImage::decode_in(&bytes, &manifest, Global).unwrap().encode_into(&mut again);
+    assert_eq!(bytes, again, "decode then encode is the same bytes");
+    assert_eq!(StartupImage::decode_in(&bytes, &manifest, Global).unwrap(), image);
+    let other = ContentId::of("a program's manifest", b"another");
+    assert_eq!(StartupImage::decode_in(&bytes, &other, Global), Err(ImageError::Manifest { found: manifest, wanted: other }));
+    let mut old = bytes.clone();
+    old[4..8].copy_from_slice(&2u32.to_le_bytes());
+    assert_eq!(StartupImage::decode_in(&old, &manifest, Global), Err(ImageError::Format { found: 2, wanted: 1 }));
+    assert!(matches!(StartupImage::decode_in(&bytes[..bytes.len() - 1], &manifest, Global), Err(ImageError::Short { .. })));
+    let mut reads = Vec::new_in(Global);
+    image.read_order(|k| w[0].store.locate(k), &mut reads);
+    assert_eq!(reads.len(), 5, "the key the store does not hold is left out");
+    for pair in reads.windows(2) {
+        let (a, b) = (&pair[0].1, &pair[1].1);
+        assert!(a.segment.0 < b.segment.0 || (a.segment == b.segment && a.at < b.at), "reads out of place order: {a:?} then {b:?}");
+    }
+    let segments: BTreeSet<[u8; 32]> = reads.iter().map(|it| it.1.segment.0).collect();
+    assert_eq!(segments.len(), 2, "two commits, two segments");
 }

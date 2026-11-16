@@ -10,10 +10,9 @@
 //! answers a row of it). The queries live in their own modules; this is their one public path
 //! for a reader by kind. Read a query's answer through its module's own API, not this one.
 //!
-//! Not here, and why: name resolution has no row per name any more. A module's scope is part
-//! of the value of the query that collected its def map (`nameres::crate_resolution`, a block's
-//! `block_def_map`), which reads its crate's files whole, so no query of it stands for one
-//! name; the classifier's `NAME_QUERIES` went with the rows. Nor are the queries that read a
+//! Name resolution is read per module from its `ModuleScope` record (`item_scope`), and the
+//! def maps are small handles (`crate_def_map`, `block_def_map`); a crate's attributes are
+//! `crate_attrs`. Not here: the queries that read a
 //! file's syntax whole (`expr_store::body`'s `file_body_syntax`): a body reads its own syntax
 //! through [`item_body_syntax`] or [`placed_body_syntax`], keyed by the body.
 
@@ -25,9 +24,11 @@ pub use crate::{
     diagnostic_item::diagnostic_items,
     expr_store::body::{item_body_syntax, placed_body_syntax},
     lang_item::{crate_lang_items, lang_items},
+    item_scope::item_scope,
     nameres::{
         assoc::{ImplItems_of, TraitItems_query_with_diagnostics},
-        assoc_item_key, crate_recursion_limit, module_impls,
+        block_def_map, crate_attrs::crate_attrs, crate_def_map, crate_extern_prelude,
+        module_impls,
     },
     signatures::{
         ConstSignature_lowered, ConstSignature_relative, ConstSignature_served,
@@ -41,6 +42,5 @@ pub use crate::{
         TypeAliasSignature_with_source_map, UnionSignature_lowered, UnionSignature_served,
         VariantFields_lowered, VariantFields_served,
     },
-    unstable_features::UnstableFeatures_query,
     visibility::{AssocItemId_assoc_visibility, VariantFields_field_visibilities},
 };

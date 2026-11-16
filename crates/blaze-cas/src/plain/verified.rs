@@ -2,7 +2,7 @@
 //! type (decision 18 of 2026-11-13, "verify once, by construction"): every read of a segment
 //! goes through a [`Verified`], and nothing that holds one checks a byte again.
 //!
-//! A mapped segment enters as an [`Unverified`], whose bytes cannot be read. Two functions
+//! A mapped segment enters as an [`Unverified`], whose bytes cannot be read. Three functions
 //! turn it into a [`Verified`], and they are the only ones (the fields are private to this
 //! module):
 //!
@@ -11,7 +11,10 @@
 //!   crash loses none of it), or an open of this boot checked it in full and recorded the
 //!   boot by a flip, or a fetch of this boot checked its statement and digest before writing
 //!   it and adopted it with this boot. No byte is read for it.
-//! - [`Verified::check`]: a segment of an earlier boot, checked in full once (its length, its
+//! - [`Verified::sealed`]: a segment of an earlier boot its row names sealed: a barrier
+//!   covered its file before the flip that said so (the exit tail, store-next.md), so the
+//!   generation that names it is proof its bytes reached the media first. No byte is read.
+//! - [`Verified::check`]: a segment of an earlier boot not sealed, checked in full once (its length, its
 //!   layout, the BLAKE3 digest of every byte, the digest, namespace and count its row names),
 //!   consuming the [`Unverified`]. The open's next flip records the boot, so no later process
 //!   of this boot checks it again.
@@ -114,6 +117,18 @@ impl Verified {
     /// [`Verified::check`]ed or dropped.
     pub(crate) fn recorded(it: Unverified, boot: Boot) -> Result<Verified, Unverified> {
         if it.seg.boot != boot.0 || it.len() != it.seg.file_len() {
+            return Err(it);
+        }
+        Ok(Verified { seg: it.seg, file: it.file, map: it.map, boot })
+    }
+
+    /// A segment of an earlier boot whose row says it is sealed ([`Segment::sealed`]): a
+    /// barrier ordered its bytes before the flip that set the flag, so a generation that names
+    /// it sealed was written after them, and a disk that kept the generation kept them (or an
+    /// open of a later boot read them whole from the disk and recorded so). No byte is read;
+    /// its length is still compared with the row. `Err` hands it back, to be checked.
+    pub(crate) fn sealed(it: Unverified, boot: Boot) -> Result<Verified, Unverified> {
+        if !it.seg.sealed || !it.seg.local || it.len() != it.seg.file_len() {
             return Err(it);
         }
         Ok(Verified { seg: it.seg, file: it.file, map: it.map, boot })

@@ -47,12 +47,12 @@ pub fn crc32c(bytes: &[u8]) -> u32 {
 /// The CRC-32C of `a` followed by `bytes`, given `crc == crc32c(a)`.
 pub fn extend(crc: u32, bytes: &[u8]) -> u32 {
     #[cfg(target_arch = "x86_64")]
-    if std::arch::is_x86_feature_detected!("sse4.2") {
+    if blaze_blake3::cpu::has(blaze_blake3::cpu::Feature::Sse42) {
         // SAFETY: the CPU has SSE4.2, checked just above.
         return !unsafe { x86::raw(!crc, bytes) };
     }
     #[cfg(target_arch = "aarch64")]
-    if std::arch::is_aarch64_feature_detected!("crc") {
+    if blaze_blake3::cpu::has(blaze_blake3::cpu::Feature::Crc) {
         // SAFETY: the CPU has the CRC instructions, checked just above.
         return !unsafe { arm::raw(!crc, bytes) };
     }
@@ -183,7 +183,7 @@ fn combine(table: &Shift, a: u32, b: u32, c: u32) -> u32 {
 
 #[cfg(target_arch = "x86_64")]
 mod x86 {
-    use std::arch::x86_64::{_mm_crc32_u8, _mm_crc32_u64};
+    use core::arch::x86_64::{_mm_crc32_u8, _mm_crc32_u64};
 
     use super::{ROUNDS, combine, word};
 
@@ -220,7 +220,7 @@ mod x86 {
 
 #[cfg(target_arch = "aarch64")]
 mod arm {
-    use std::arch::aarch64::{__crc32cb, __crc32cd};
+    use core::arch::aarch64::{__crc32cb, __crc32cd};
 
     use super::{ROUNDS, combine, word};
 

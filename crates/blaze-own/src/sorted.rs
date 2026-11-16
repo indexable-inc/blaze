@@ -13,11 +13,11 @@ use core::{
     cmp::Ordering,
     fmt,
     hash::{Hash, Hasher},
-    ops::{Bound, RangeBounds},
+    ops::{Bound, Index, RangeBounds},
     slice,
 };
 
-use crate::{error::AllocFailure, vec::Vec};
+use crate::vec::{Refused, Vec};
 
 /// A map ordered by key, one sorted vector of `(key, value)`.
 ///
@@ -123,13 +123,24 @@ impl<K: Ord, V, A: Allocator> SortedMap<K, V, A> {
         }
     }
 
-    /// [`SortedMap::insert`], with the [`AllocFailure`] when it must grow and cannot; the map is
-    /// as it was.
-    pub fn try_insert(&mut self, key: K, value: V) -> Result<Option<V>, AllocFailure> {
+    /// The place of `key`, found once: [`Entry::or_insert_with`], [`Entry::and_modify`] and the
+    /// rest then act on it with no second search.
+    pub fn entry(&mut self, key: K) -> Entry<'_, K, V, A> {
+        match self.find(&key) {
+            Ok(at) => Entry::Occupied(OccupiedEntry { map: self, at }),
+            Err(at) => Entry::Vacant(VacantEntry { map: self, at, key }),
+        }
+    }
+
+    /// [`SortedMap::insert`], or the key and value handed back with the [`AllocFailure`](crate::AllocFailure) when it
+    /// must grow and cannot (as [`Vec::try_push`] hands its value back); the map is as it was.
+    pub fn try_insert(&mut self, key: K, value: V) -> Result<Option<V>, Refused<(K, V)>> {
         match self.find(&key) {
             Ok(at) => Ok(Some(core::mem::replace(&mut self.entries[at].1, value))),
             Err(at) => {
-                self.entries.try_reserve(1)?;
+                if let Err(why) = self.entries.try_reserve(1) {
+                    return Err(Refused { value: (key, value), why });
+                }
                 self.entries.insert(at, (key, value));
                 Ok(None)
             }
@@ -223,6 +234,129 @@ impl<K: Ord, V, A: Allocator> SortedMap<K, V, A> {
     /// The entries as the sorted vector.
     pub fn into_vec(self) -> Vec<(K, V), A> {
         self.entries
+    }
+}
+
+/// A key's place in a [`SortedMap`], from [`SortedMap::entry`].
+pub enum Entry<'a, K, V, A: Allocator> {
+    Occupied(OccupiedEntry<'a, K, V, A>),
+    Vacant(VacantEntry<'a, K, V, A>),
+}
+
+/// A key the map holds, at index `at`.
+pub struct OccupiedEntry<'a, K, V, A: Allocator> {
+    map: &'a mut SortedMap<K, V, A>,
+    at: usize,
+}
+
+/// A key the map does not hold, and the index `at` that keeps the keys increasing.
+pub struct VacantEntry<'a, K, V, A: Allocator> {
+    map: &'a mut SortedMap<K, V, A>,
+    at: usize,
+    key: K,
+}
+
+impl<'a, K, V, A: Allocator> Entry<'a, K, V, A> {
+    pub fn key(&self) -> &K {
+        match self {
+            Entry::Occupied(entry) => entry.key(),
+            Entry::Vacant(entry) => entry.key(),
+        }
+    }
+
+    pub fn or_insert(self, value: V) -> &'a mut V {
+        self.or_insert_with(|| value)
+    }
+
+    pub fn or_insert_with(self, make: impl FnOnce() -> V) -> &'a mut V {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(make()),
+        }
+    }
+
+    /// As [`Entry::or_insert_with`], with the key to make the value from.
+    pub fn or_insert_with_key(self, make: impl FnOnce(&K) -> V) -> &'a mut V {
+        match self {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let value = make(&entry.key);
+                entry.insert(value)
+            }
+        }
+    }
+
+    /// Changes the value when the key is there; then any `or_` method inserts when it is not.
+    pub fn and_modify(self, change: impl FnOnce(&mut V)) -> Entry<'a, K, V, A> {
+        match self {
+            Entry::Occupied(mut entry) => {
+                change(entry.get_mut());
+                Entry::Occupied(entry)
+            }
+            vacant @ Entry::Vacant(_) => vacant,
+        }
+    }
+}
+
+impl<'a, K, V, A: Allocator> OccupiedEntry<'a, K, V, A> {
+    pub fn key(&self) -> &K {
+        &self.map.entries[self.at].0
+    }
+
+    pub fn get(&self) -> &V {
+        &self.map.entries[self.at].1
+    }
+
+    pub fn get_mut(&mut self) -> &mut V {
+        &mut self.map.entries[self.at].1
+    }
+
+    pub fn into_mut(self) -> &'a mut V {
+        &mut self.map.entries[self.at].1
+    }
+
+    pub fn insert(&mut self, value: V) -> V {
+        core::mem::replace(self.get_mut(), value)
+    }
+
+    pub fn remove_entry(self) -> (K, V) {
+        self.map.entries.remove(self.at)
+    }
+
+    pub fn remove(self) -> V {
+        self.remove_entry().1
+    }
+}
+
+impl<'a, K, V, A: Allocator> VacantEntry<'a, K, V, A> {
+    pub fn key(&self) -> &K {
+        &self.key
+    }
+
+    pub fn into_key(self) -> K {
+        self.key
+    }
+
+    /// Puts `value` under the key, `O(n)` moves; panics as `Vec::insert` when it cannot grow.
+    pub fn insert(self, value: V) -> &'a mut V {
+        let VacantEntry { map, at, key } = self;
+        map.entries.insert(at, (key, value));
+        &mut map.entries[at].1
+    }
+}
+
+impl<K: Ord + Borrow<Q>, Q: Ord + ?Sized, V, A: Allocator> Index<&Q> for SortedMap<K, V, A> {
+    type Output = V;
+
+    /// # Panics
+    ///
+    /// When the key is not in the map.
+    #[track_caller]
+    fn index(&self, key: &Q) -> &V {
+        match self.get(key) {
+            Some(value) => value,
+            None => panic!("blaze_own::SortedMap::index: the key is not in the map of {} entries", self.len()),
+        }
     }
 }
 

@@ -2,7 +2,7 @@
 //! property runs all of them.
 
 use super::{V, World};
-use crate::{DefKind, Edition, ExternTarget, MacroKind, Namespace, Rename};
+use crate::{DefKind, Edition, ExternTarget, CallShape, Namespace, Rename};
 use blaze_id::ItemKey;
 use std::vec::Vec;
 
@@ -184,7 +184,7 @@ pub(crate) fn prelude() -> (World, Prelude) {
     let p = w.module(std_root, "prelude", V::Pub);
     w.use_(p, "crate::vec", V::Pub);
     let root = w.root(1, Edition::E2021);
-    w.cr(root).prelude = Some(p);
+    w.cr(root).head.prelude = Some(p);
     let a = w.module(root, "a", V::Priv);
     w.use_(a, "vec::Vec", V::Priv);
     let b = w.module_with(root, "b", V::Priv, false, true);
@@ -202,9 +202,9 @@ pub(crate) struct Textual {
 pub(crate) fn textual() -> (World, Textual) {
     let mut w = World::new();
     let root = w.root(1, Edition::E2021);
-    let before_call = w.call(root, "m", MacroKind::Bang);
+    let before_call = w.call(root, "m", CallShape::FnLike);
     w.rules(root, "m");
-    let after_call = w.call(root, "m", MacroKind::Bang);
+    let after_call = w.call(root, "m", CallShape::FnLike);
     (w, Textual { root, before_call, after_call })
 }
 
@@ -220,12 +220,12 @@ pub(crate) fn macro_use() -> (World, MacroUse) {
     let mut w = World::new();
     let root = w.root(1, Edition::E2021);
     let before = w.module(root, "before", V::Priv);
-    w.call(before, "m", MacroKind::Bang);
+    w.call(before, "m", CallShape::FnLike);
     let a = w.module_with(root, "a", V::Priv, true, false);
     let m = w.rules(a, "m");
-    w.call(root, "m", MacroKind::Bang);
+    w.call(root, "m", CallShape::FnLike);
     let after = w.module(root, "after", V::Priv);
-    w.call(after, "m", MacroKind::Bang);
+    w.call(after, "m", CallShape::FnLike);
     (w, MacroUse { root, before, after, m })
 }
 
@@ -245,7 +245,7 @@ pub(crate) fn macro_export() -> (World, Export) {
     w.cr(dep_root).macro_exports.push(("exp", exp));
     let root = w.root(1, Edition::E2021);
     w.dep(root, "dep", dep_root);
-    w.call(root, "dep::exp", MacroKind::Bang);
+    w.call(root, "dep::exp", CallShape::FnLike);
     (w, Export { root, dep_root, exp })
 }
 
@@ -261,7 +261,7 @@ pub(crate) fn expanded() -> (World, Expanded) {
     let mut w = World::new();
     let root = w.root(1, Edition::E2021);
     w.rules(root, "gen");
-    let call = w.call(root, "gen", MacroKind::Bang);
+    let call = w.call(root, "gen", CallShape::FnLike);
     let made = w.fun(call, "made", V::Pub);
     w.use_as(root, "self::made", "alias", V::Priv);
     let user = w.module(root, "user", V::Priv);
@@ -284,7 +284,7 @@ pub(crate) fn glob_vs_expanded() -> (World, GlobExpanded) {
     w.fun(tools, "t", V::Pub);
     w.glob(root, "a", V::Priv);
     w.rules(root, "gen");
-    let call = w.call(root, "gen", MacroKind::Bang);
+    let call = w.call(root, "gen", CallShape::FnLike);
     let tools_expanded = w.module(call, "tools", V::Priv);
     w.fun(tools_expanded, "t", V::Pub);
     w.use_(root, "tools::t", V::Priv);
@@ -304,11 +304,11 @@ pub(crate) fn negative() -> (World, Negative) {
     let dep_root = w.root(2, Edition::E2021);
     let std_root = w.root(3, Edition::E2021);
     let prelude = w.module(std_root, "prelude", V::Pub);
-    w.item(prelude, "pm", Namespace::Macros, DefKind::Macro(MacroKind::Bang), V::Pub);
+    w.item(prelude, "pm", Namespace::Macros, DefKind::Macro(CallShape::FnLike), V::Pub);
     let root = w.root(1, Edition::E2021);
     w.cr(root).macro_use.push(dep_root);
-    w.cr(root).prelude = Some(prelude);
-    w.call(root, "pm", MacroKind::Bang);
+    w.cr(root).head.prelude = Some(prelude);
+    w.call(root, "pm", CallShape::FnLike);
     (w, Negative { root, dep_root, prelude })
 }
 

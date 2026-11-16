@@ -1,6 +1,7 @@
 use std::{
     alloc::Global,
     hash::{BuildHasher, Hash, Hasher},
+    vec::Vec,
 };
 
 use blaze_sim::Config;

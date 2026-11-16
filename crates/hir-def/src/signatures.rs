@@ -92,14 +92,11 @@ type Maps<'a> = Option<(&'a RealSpanMap, &'a AstIdMap)>;
 /// Served-else-lowered: what every per-item
 /// query of the front end reads its value through, the one shape of it.
 ///
-/// - **Served.** The item's crate has an image ([`crate::deps::image_of`]): the value is read
-///   from it in place, and the read lists the item's fact (its stable id and the digest of its
-///   record), not the image's. A dependency the driver maps is served; so is the crate being
-///   built when the driver says its surface key hit, from its own image, written by the build
-///   before (spec F): a query of it is answered from its per-item records after its arena was
-///   dropped, and only what an edit reached is lowered again.
-/// - **Lowered.** Otherwise: the value is lowered from syntax by a query of its own, in the
-///   crate's arena, and held there for the snapshot.
+/// - **Served.** The item is of a crate whose text the task does not hold: the value is its
+///   `Signature` record, read in place ([`signature_record`]; not built yet, so a typed stop).
+/// - **Lowered.** The item is of the crate whose text the task holds: the value is lowered from
+///   the item's text by a query of its own, in the crate's arena, and held there for the
+///   snapshot.
 ///
 /// The rule a caller keeps: `lowered` is asked only where `served` has nothing, so a crate read
 /// from its image never lowers from syntax. Memory is bounded by arena drop, not by eviction: a
@@ -183,8 +180,40 @@ impl<'db, T: PartialEq + std::fmt::Debug + Send + Sync + 'static> Serve<'db, T> 
     }
 }
 
+/// The signature of `item` of `krate` as a record: `None` for the crate whose text the task
+/// holds (its signatures are lowered from the item's text range). Another crate's is a
+/// `Signature` record, which blaze-surface does not have yet (reconnect.md, "What the
+/// new-layer crates lack"): a typed stop naming the item, never a parse.
+fn signature_record<'db, T>(db: &'db Db, krate: Crate, item: base_db::ItemKey) -> Option<&'db T> {
+    if db.source_of(krate.key(db)).is_some() {
+        return None;
+    }
+    base_db::OrNeed::or_need(Err(base_db::SurfaceError::NotBuilt(blaze_surface::NotBuilt {
+        method: "the Signature record of an item of a crate the task has no text of",
+        item,
+    })))
+}
+
+/// A fact of `id` made by `make` from its text, for the crate whose text the task holds;
+/// another crate's is a record not built yet (`what`, a typed stop naming the item).
+fn from_text<Id: crate::HasModule + crate::key::FromKey, T>(
+    db: &Db,
+    id: Id,
+    what: &'static str,
+    make: impl FnOnce() -> T,
+) -> T {
+    let krate = id.krate(db);
+    if db.source_of(krate.key(db)).is_none() {
+        let item = id.key(db);
+        return base_db::OrNeed::or_need(Err(base_db::SurfaceError::NotBuilt(
+            blaze_surface::NotBuilt { method: what, item },
+        )));
+    }
+    make()
+}
+
 /// The queries of the signature `$Sig` of an `$Id`, which `$Sig::lower` lowers and
-/// `deps::signatures::$served` reads from its crate's image: `of` reads the signature, lowered
+/// [`signature_record`] reads for another crate: `of` reads the signature, lowered
 /// without its source map; `relative` and `with_source_map` lower it again with the map.
 macro_rules! signature_queries {
     ($Sig:ident, $Id:ident, $served:ident) => {
@@ -196,7 +225,7 @@ macro_rules! signature_queries {
             // (`hir_ty::kinds`, `blaze_items::goals`).
             #[blaze_memo::tracked(returns(copy), mem_tag = Nameres)]
             pub fn served<'db>(db: &'db Db, id: $Id) -> Option<&'db $Sig> {
-                crate::deps::signatures::$served(db, id)
+                signature_record(db, crate::HasModule::krate(&id, db), crate::key::FromKey::key(id, db))
             }
 
             /// The signature lowered alone, for a crate no image serves. `pub` as
@@ -961,25 +990,14 @@ pub(crate) fn written_visibility<N: AstIdNode>(
     id: AstId<N>,
     module: ModuleId,
 ) -> RawVisibility {
-    // A visibility kept as an entry of its item, keyed by its header; one written by a macro,
-    // or with a context not its file's root, is made each time (`deps::facts`).
-    let at =
-        crate::deps::facts::At { file: id.file_id, ast: id.value.erase(), krate: module.krate(db) };
-    let header = crate::deps::facts::Part::Header;
-    crate::deps::facts::fact(db, "visibility", "", 0, Some(at), header, || {
-        (written_visibility_made(db, id, module), true)
-    })
-}
-
-/// [`written_visibility`] off the item's syntax.
-fn written_visibility_made<N: AstIdNode>(
-    db: &Db,
-    id: AstId<N>,
-    module: ModuleId,
-) -> RawVisibility {
-    // Of a crate given by its address whose file has no text here: refused, typed, naming the
-    // crate and the file, before any parse.
-    crate::nameres::frozen::pages::demand_text(db, module.krate(db), id.file_id);
+    // Of a crate whose text the task does not hold: refused, typed, naming the module, before
+    // any parse.
+    if db.source_of(module.krate(db).key(db)).is_none() {
+        let item = crate::nameres::scope_key(db, module);
+        return base_db::OrNeed::or_need(Err(base_db::SurfaceError::NotBuilt(
+            blaze_surface::NotBuilt { method: "a written visibility of a dependency", item },
+        )));
+    }
     if let HirFileId::FileId(file) = id.file_id {
         let outline = file_outline(db, file);
         if let Some(ptr) = outline.ast_id_map.try_get_erased(id.value.erase()) {
@@ -1410,10 +1428,8 @@ fn has_unsafe_field(fields: Option<ast::FieldList<'_>>, cfg_options: &CfgOptions
 /// its own: a variant edit runs it again, and the signature only when the answer changes.
 #[blaze_memo::tracked(returns(copy), mem_tag = Nameres)]
 pub(crate) fn enum_has_unsafe_fields(db: &Db, id: EnumId) -> bool {
-    let at = crate::deps::facts::at(db, id);
-    let header = crate::deps::facts::Part::Header;
-    crate::deps::facts::fact(db, "unsafe fields", "", 3, Some(at), header, || {
-        (enum_has_unsafe_fields_made(db, id), true)
+    from_text(db, id, "the unsafe-fields fact of an enum of a crate the task has no text of", || {
+        enum_has_unsafe_fields_made(db, id)
     })
 }
 
@@ -1808,10 +1824,8 @@ pub fn written_self_view(db: &Db, func: FunctionId) -> Option<WrittenSelfView> {
     if !FunctionSignature::of(db, func).has_self_view() {
         return None;
     }
-    let at = crate::deps::facts::at(db, func);
-    let header = crate::deps::facts::Part::Header;
-    crate::deps::facts::fact(db, "self view", "", 4, Some(at), header, || {
-        (written_self_view_made(db, func), true)
+    from_text(db, func, "the self view of a function of a crate the task has no text of", || {
+        written_self_view_made(db, func)
     })
 }
 
@@ -2085,7 +2099,12 @@ impl VariantFields {
     /// place, as a signature's ([`Serve`]).
     #[blaze_memo::tracked(returns(copy), mem_tag = Nameres)]
     pub fn served<'db>(db: &'db Db, id: VariantId) -> Option<&'db VariantFields> {
-        crate::deps::signatures::served_variant_fields(db, id)
+        let key = match id {
+            VariantId::EnumVariantId(it) => crate::key::FromKey::key(it, db),
+            VariantId::StructId(it) => crate::key::FromKey::key(it, db),
+            VariantId::UnionId(it) => crate::key::FromKey::key(it, db),
+        };
+        signature_record(db, crate::HasModule::krate(&id, db), key)
     }
 
     /// The fields lowered alone, for a crate no image serves.
@@ -2471,10 +2490,9 @@ impl Eq for EnumVariants {}
 impl EnumVariants {
     #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
     pub fn of(db: &Db, e: EnumId) -> (EnumVariants, ThinVec<InactiveEnumVariantCode>) {
-        if let Some(it) = crate::deps::signatures::served_enum_variants(db, e) {
-            return it;
-        }
-        Self::lower(db, e)
+        from_text(db, e, "the variants of an enum of a crate the task has no text of", || {
+            Self::lower(db, e)
+        })
     }
 }
 
@@ -2672,17 +2690,21 @@ impl EnumVariants {
 
 #[blaze_memo::tracked(returns(copy), mem_tag = Nameres)]
 pub(crate) fn extern_block_abi(db: &Db, extern_block: ExternBlockId) -> ExternAbi {
-    let at = crate::deps::facts::at(db, extern_block);
-    let header = crate::deps::facts::Part::Header;
-    crate::deps::facts::fact(db, "extern abi", "", 14, Some(at), header, || {
-        let source = extern_block.lookup(db).source_view(db);
-        let abi = source
-            .value
-            .abi()
-            .and_then(|abi| abi.abi_string()?.text_without_quotes().parse().ok())
-            .unwrap_or(ExternAbi::FALLBACK);
-        (abi, true)
-    })
+    // An extern block is no item of the records: its ABI is read from text, which only the
+    // crate the task holds the text of has.
+    let module = extern_block.lookup(db).container;
+    if db.source_of(module.krate(db).key(db)).is_none() {
+        let item = crate::nameres::scope_key(db, module);
+        return base_db::OrNeed::or_need(Err(base_db::SurfaceError::NotBuilt(
+            blaze_surface::NotBuilt { method: "the ABI of an extern block of a dependency", item },
+        )));
+    }
+    let source = extern_block.lookup(db).source_view(db);
+    source
+        .value
+        .abi()
+        .and_then(|abi| abi.abi_string()?.text_without_quotes().parse().ok())
+        .unwrap_or(ExternAbi::FALLBACK)
 }
 
 #[cfg(test)]

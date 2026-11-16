@@ -11,8 +11,12 @@
 //! Every read of a record the task lacks stops it with a [`base_db::Need`] naming its key.
 
 pub mod assoc;
+pub mod crate_attrs;
 pub mod def_site;
 pub mod diagnostics;
+pub mod origin;
+
+pub use origin::{ModuleOrigin, ModuleSourceView};
 
 pub use def_site::{
     assoc_item_is, assoc_item_key, impl_item_name, param_name, path_param_name, trait_item_name,
@@ -27,8 +31,10 @@ use hir_expand::{
     mod_path::{ModPath, PathKind},
     name::Name,
 };
+use intern::Symbol;
 use span::Edition;
 
+use crate::unstable_features::UnstableFeatures;
 use crate::{
     AdtId, BlockId, FunctionId, Lookup, MacroExpander, MacroId, ModuleDefId, ModuleId,
     ProcMacroId, UseId,
@@ -88,11 +94,16 @@ pub fn crate_def_map(db: &Db, krate: Crate) -> DefMap {
     DefMap { krate, block: None, root: key::crate_root_module(db, krate) }
 }
 
-/// A block's handle: its scope is the block's own items, then its module's.
+/// A block's handle. Its root is the block's own module (keyed by no item, its parent the
+/// module the block is in, as the old block map's root was), whose scope the records do not
+/// hold yet: a question of it stops ([`scope_key`]).
 #[blaze_memo::tracked(returns(ref), mem_tag = Nameres)]
 pub fn block_def_map(db: &Db, block: BlockId) -> DefMap {
-    let module = block.module(db).to_static();
-    DefMap { krate: module.krate(db), block: Some(block), root: module }
+    let around = block.module(db);
+    let krate = around.krate(db);
+    let empty = Name::new_symbol_root(intern::sym::__empty);
+    let root = crate::ModuleIdLt::new(db, krate, Some(block.to_db(db)), None, empty, None);
+    DefMap { krate, block: Some(block), root: root.to_static() }
 }
 
 /// One module, as the old map's entry for it was asked.
@@ -130,6 +141,12 @@ pub(crate) fn scope_key(db: &Db, module: ModuleId) -> ItemKey {
     if let Some(key) = module.key(db) {
         return key;
     }
+    block_scope_stop(db, module, "the ModuleScope of a block")
+}
+
+/// A question of the items of the block whose module (or a module inside it) is `module`:
+/// in no record yet, a typed stop naming the first module with a key around it.
+pub(crate) fn block_scope_stop<T>(db: &Db, module: ModuleId, method: &'static str) -> T {
     // A block is in an item's body, and every item is in a module with a key.
     let mut around = module.to_db(db);
     let item = loop {
@@ -141,7 +158,7 @@ pub(crate) fn scope_key(db: &Db, module: ModuleId) -> ItemKey {
             break key;
         }
     };
-    Err(SurfaceError::NotBuilt(NotBuilt { method: "the ModuleScope of a block", item })).or_need()
+    Err(SurfaceError::NotBuilt(NotBuilt { method, item })).or_need()
 }
 
 /// The text a name is looked up by in a record. A name a `macro` keyed by its def-site
@@ -189,6 +206,23 @@ fn binding_target(db: &Db, module: ModuleId, binding: Binding<'_>) -> Option<Ite
             Err(SurfaceError::NotBuilt(NotBuilt { method: "an undetermined binding", item }))
                 .or_need()
         }
+    }
+}
+
+/// The visibility of the module-level item `key`, as its module's scope record binds its name
+/// in `ns` there: a declared item's binding is its own (an import of its name beside it is
+/// an error of that scope). An item its module binds no name to (`_`, a shadowed glob) is
+/// not in the record by its key: a typed stop.
+pub(crate) fn declared_visibility(db: &Db, key: ItemKey, ns: SurfaceNs) -> Visibility {
+    let module = key::module_of_key(db, key::module_around(db, key));
+    let name = key::item_name(db, key);
+    let view = db.items().scope(scope_key(db, module)).or_need();
+    match view.get(ns, name.as_str()) {
+        Some(binding) if matches!(binding.target, Target::Item(it) if it == key) => {
+            visibility_of(db, module, binding.vis)
+        }
+        _ => Err(SurfaceError::NotBuilt(NotBuilt { method: "the visibility of an unbound item", item: key }))
+            .or_need(),
     }
 }
 
@@ -321,21 +355,78 @@ impl DefMap {
         crate_prelude(db, self.krate).map(|module| (module, None))
     }
 
-    /// The crate's `#![recursion_limit]`. Not built: the `CrateRoot` record has no field for
-    /// it yet (design, "What the new-layer crates lack").
-    pub fn recursion_limit(&self, db: &Db) -> u32 {
-        let item = scope_key(db, crate_def_map(db, self.krate).root);
-        Err(SurfaceError::NotBuilt(NotBuilt { method: "DefMap::recursion_limit", item })).or_need()
+    /// The crate's inner attributes ([`crate_attrs::crate_attrs`]): read from its root's text,
+    /// a typed stop for a crate the task has no text of.
+    pub fn attrs<'db>(&self, db: &'db Db) -> &'db crate_attrs::CrateAttrs {
+        crate_attrs::crate_attrs(db, self.krate)
     }
 
-    /// A builtin integer of any width (`u7`), under `#![blaze::arbitrary_ints]`. Not built:
-    /// the crate root record has no field for the extension's attribute yet.
+    /// The crate's `#![recursion_limit]`, rustc's 128 when it says none.
+    pub fn recursion_limit(&self, db: &Db) -> u32 {
+        self.attrs(db).recursion_limit.unwrap_or(128)
+    }
+
+    pub fn features<'db>(&self, db: &'db Db) -> &'db UnstableFeatures {
+        &self.attrs(db).unstable_features
+    }
+
+    pub fn registered_tools<'db>(&self, db: &'db Db) -> &'db [Symbol] {
+        &self.attrs(db).registered_tools
+    }
+
+    pub fn is_rustc_coherence_is_core(&self, db: &Db) -> bool {
+        self.attrs(db).rustc_coherence_is_core
+    }
+
+    pub fn is_proc_macro(&self, db: &Db) -> bool {
+        self.attrs(db).proc_macro
+    }
+
+    /// `#![blaze::arbitrary_ints]`: `u3` and `i24` name integers in this crate.
+    pub fn arbitrary_ints(&self, db: &Db) -> bool {
+        self.attrs(db).arbitrary_ints
+    }
+
+    /// `#![blaze::handles]`: a move of a handle used again later is a copy.
+    pub fn handles(&self, db: &Db) -> bool {
+        self.attrs(db).handles
+    }
+
+    /// `#![blaze::views]`: a receiver may name the fields it borrows.
+    pub fn views(&self, db: &Db) -> bool {
+        self.attrs(db).views
+    }
+
+    /// `#![blaze::pattern_types]`: `T is PAT` types in this crate.
+    pub fn pattern_types(&self, db: &Db) -> bool {
+        self.attrs(db).pattern_types
+    }
+
+    /// `#![blaze::early_drop]`: a local whose destructor only frees memory drops after its
+    /// last use.
+    pub fn early_drop(&self, db: &Db) -> bool {
+        self.attrs(db).early_drop
+    }
+
+    /// `#![no_std]` or `#![no_core]`, from the crate root record.
+    pub fn is_no_std(&self, db: &Db) -> bool {
+        let head = db.items().crate_root(self.krate.key(db)).or_need().head();
+        head.no_std || head.no_core
+    }
+
+    /// `#![no_core]`, from the crate root record.
+    pub fn is_no_core(&self, db: &Db) -> bool {
+        db.items().crate_root(self.krate.key(db)).or_need().head().no_core
+    }
+
+    /// A builtin integer of any width (`u7`), under `#![blaze::arbitrary_ints]`.
     pub(crate) fn arbitrary_int(&self, db: &Db, name: &Name) -> PerNs {
-        if BuiltinType::arbitrary_by_name(name).is_none() {
-            return PerNs::none();
+        match BuiltinType::arbitrary_by_name(name) {
+            Some(ty) if self.arbitrary_ints(db) => {
+                PerNs::types(ModuleDefId::BuiltinType(ty), Visibility::Public, None)
+            }
+            _ => PerNs::none(),
         }
-        let item = scope_key(db, crate_def_map(db, self.krate).root);
-        Err(SurfaceError::NotBuilt(NotBuilt { method: "DefMap::arbitrary_int", item })).or_need()
     }
 
     /// The function a proc macro is: the same item, so the same key.
@@ -357,6 +448,56 @@ impl DefMap {
         expected_macro: Option<MacroSubNs>,
     ) -> (PerNs, Option<usize>, ResolvePathResultPrefixInfo) {
         resolve_path(db, module, path, shadow, expected_macro)
+    }
+
+    /// The visibility `visibility` gives an item of `original_module` (rustc's
+    /// `try_resolve_visibility`): a `pub(in path)` resolves its path to a module that must be
+    /// `original_module` or above it. A path a `macro` wrote resolves by def-site hygiene,
+    /// which stops ([`def_site::hygienic_origin`]).
+    pub(crate) fn resolve_visibility(
+        &self,
+        db: &Db,
+        original_module: ModuleId,
+        visibility: &crate::visibility::RawVisibility,
+        within_impl: bool,
+    ) -> Result<Visibility, crate::visibility::VisibilityError> {
+        use crate::visibility::{RawVisibility, VisibilityError, visibility_path};
+        let vis = match visibility {
+            RawVisibility::Module(path, explicitness, ctxt) => {
+                let path = visibility_path(path, self.krate.data(db).edition)?;
+                let hygiene = crate::expr_store::HygieneId::new(*ctxt);
+                let def_site::Hygienic::Here = def_site::hygienic_origin(db, original_module, hygiene);
+                let (result, remaining, _) =
+                    resolve_path(db, original_module, &path, BuiltinShadowMode::Module, None);
+                if remaining.is_some() {
+                    return Err(VisibilityError::Unresolved);
+                }
+                let m = match result.take_types().ok_or(VisibilityError::Unresolved)? {
+                    ModuleDefId::ModuleId(m) => m,
+                    found => return Err(VisibilityError::NotAModule { found }),
+                };
+                if !Visibility::Module(m, *explicitness).is_visible_from_def_map(
+                    db,
+                    self,
+                    original_module,
+                ) {
+                    return Err(VisibilityError::NotAncestor { module: m });
+                }
+                // In a block, `self` is the module around it; a visibility names a module of
+                // the map it is written in, so it is restricted to the block's (except for an
+                // associated item of an impl).
+                match self.block != m.block(db) && !within_impl {
+                    true => Visibility::Module(self.root, *explicitness),
+                    false => Visibility::Module(m, *explicitness),
+                }
+            }
+            RawVisibility::PubSelf(explicitness) => {
+                Visibility::Module(original_module, *explicitness)
+            }
+            RawVisibility::Public => Visibility::Public,
+            RawVisibility::PubCrate => Visibility::PubCrate(self.krate),
+        };
+        Ok(vis)
     }
 }
 
@@ -393,6 +534,51 @@ pub(crate) fn for_each_extern_prelude(db: &Db, krate: Crate, mut each: impl FnMu
 /// The extern prelude of `krate`, in the order its crates are listed: each name with the root
 /// of the crate it names. Which `extern crate` added a name is not in the crate-graph record,
 /// so the second of each pair is `None` (reconnect.md, "What the new-layer crates lack").
+/// The guard every read of a crate's syntax goes through first: nothing for the crate whose
+/// text the task holds (`Db::source_of`); for any other, a typed stop naming its root module,
+/// never a read of text the snapshot does not have. `what` is the question that needed it.
+pub(crate) fn demand_text(db: &Db, krate: Crate, what: &'static str) {
+    if db.source_of(krate.key(db)).is_some() {
+        return;
+    }
+    let item = db.items().crate_root(krate.key(db)).or_need().head().root_module;
+    Err::<(), _>(SurfaceError::NotBuilt(NotBuilt { method: what, item })).or_need()
+}
+
+/// The impls one module declares, in declaration order, split as hir-ty's `TraitImpls` and
+/// `InherentImpls` split them.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ModuleImpls {
+    pub trait_impls: Box<[crate::ImplId], Global>,
+    pub inherent_impls: Box<[crate::ImplId], Global>,
+    pub builtin_derive_impls: Box<[crate::BuiltinDeriveImplId], Global>,
+}
+
+/// [`ModuleImpls`] of `module`: its scope's impls ([`item_scope`]), each told apart by its
+/// lowered header (`ImplSignature::target_trait`: from the text of a crate the task holds, a
+/// `Signature` record or a typed stop otherwise). The builtin derives' impls need the derive
+/// attributes of the module's items resolved, in no record yet: a typed stop
+/// ([`ItemScope::builtin_derive_impls`]).
+#[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
+pub fn module_impls(db: &Db, module: ModuleId) -> ModuleImpls {
+    let scope = item_scope(db, module);
+    let mut trait_impls = Vec::new_in(Global);
+    let mut inherent_impls = Vec::new_in(Global);
+    for id in scope.impls() {
+        match crate::signatures::ImplSignature::of(db, id).target_trait {
+            Some(_) => trait_impls.push(id),
+            None => inherent_impls.push(id),
+        }
+    }
+    let mut builtin_derive_impls = Vec::new_in(Global);
+    builtin_derive_impls.extend(scope.builtin_derive_impls(db));
+    ModuleImpls {
+        trait_impls: trait_impls.into_boxed_slice(),
+        inherent_impls: inherent_impls.into_boxed_slice(),
+        builtin_derive_impls: builtin_derive_impls.into_boxed_slice(),
+    }
+}
+
 #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
 pub fn crate_extern_prelude(
     db: &Db,
@@ -408,7 +594,7 @@ fn module_per_ns(module: ModuleId) -> PerNs {
 }
 
 /// The builtin type `name` names, in the type namespace.
-fn builtin(name: &Name) -> PerNs {
+pub(crate) fn builtin(name: &Name) -> PerNs {
     match BuiltinType::by_name(name) {
         Some(ty) => PerNs::types(ModuleDefId::BuiltinType(ty), Visibility::Public, None),
         None => PerNs::none(),
@@ -421,7 +607,8 @@ fn builtin(name: &Name) -> PerNs {
 /// type, not `core::str`); with `Module`, a module is.
 fn resolve_first(db: &Db, module: ModuleId, name: &Name, shadow: BuiltinShadowMode) -> PerNs {
     let mut found = ModuleScope { module }.get_per_ns(db, name);
-    let builtin = builtin(name);
+    // `u7` under `#![blaze::arbitrary_ints]`: read only for a name of that shape.
+    let builtin = builtin(name).or(crate_def_map(db, module.krate(db)).arbitrary_int(db, name));
     if let (Some(types), Some(_)) = (found.types, builtin.types)
         && matches!(types.def, ModuleDefId::ModuleId(_))
         && shadow == BuiltinShadowMode::Other

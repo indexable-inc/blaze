@@ -1,22 +1,55 @@
 //! What the launcher asks of the OS: memory that code runs from and that one thread writes, a
 //! thread's stack bounds and its frame pointer.
 //!
-//! [`Code`] is one mapping: a launcher has one, which holds its slot words, its lazy stubs
-//! and its code area (`drive` says why they are one).
+//! [`Code`] is one reservation: a launcher has one, which holds its slot words, its lazy stubs
+//! and its code area (`drive` says why they are one), then, in the same reservation, read and
+//! write data that code reaches PC-relatively ([`Code::data_base`]).
 //!
-//! - **macOS** (AArch64): `mmap(MAP_JIT)`, readable, writable and executable in name; which of
-//!   write and execute a thread has is the thread's own switch, `pthread_jit_write_protect_np`.
-//!   [`Code::write`] turns the calling thread's to write for the length of one copy and back,
-//!   so every other thread keeps running the area and never sees it writable. Then
-//!   `sys_icache_invalidate`. All three are public (`<sys/mman.h>`, `<pthread.h>`,
-//!   `<libkern/OSCacheControl.h>`); they are declared here rather than taken from the `libc`
+//! On both systems the code is **two views of the same pages**: read and execute at the code
+//! address, where every thread runs and loads, and read and write at an address only [`Code`]
+//! holds, which only [`Code`]'s owner writes through. No page is ever writable and executable
+//! at one address, no thread's state decides which it is, and nothing is `mprotect`ed after
+//! the views are made. (The JITs of V8, JavaScriptCore and LuaJIT document the same layout.)
+//!
+//! - **Linux**: a `memfd` mapped twice, `MAP_SHARED`. On AArch64 a write is followed by the
+//!   cache maintenance (`dc cvau`, `ic ivau`) and by `membarrier(PRIVATE_EXPEDITED_SYNC_CORE)`,
+//!   so no core runs stale instructions once [`Code::write`] returns.
+//! - **macOS**: anonymous memory (`mach_vm_allocate`) is the write view, and `mach_vm_remap`
+//!   with `copy = FALSE` aliases its pages read and execute at the code address. Each view's
+//!   *maximum* protection is lowered (`mach_vm_protect` with `set_maximum`), so no `mprotect`
+//!   of the process can make the run view writable or the write view executable. After a
+//!   write, `sys_icache_invalidate` on the run view's range. Not `MAP_JIT` with
+//!   `pthread_jit_write_protect_np`: that switch is per thread and covers every `MAP_JIT` page
+//!   of the process, so a program that itself embeds a JIT and calls it would flip the
+//!   launcher's pages for its own thread too. Why `mach_vm_remap` and not a Mach memory entry
+//!   (`mach_make_memory_entry_64`, as `blaze-inproc`'s memory object is) mapped twice: see
+//!   [`Code::map_with_data`]. The calls are declared here rather than taken from the `libc`
 //!   crate so that [`SYMBOLS`] lists exactly what this file calls, and a test resolves each at
 //!   run time (rule `macos-private-apis`).
-//! - **Linux**: a `memfd` mapped twice, read and execute where code runs and read and write at
-//!   an address only [`Code`] knows. No page is ever writable and executable at one address,
-//!   and nothing is `mprotect`ed. On AArch64 a write is followed by the cache maintenance
-//!   (`dc cvau`, `ic ivau`) and by `membarrier(PRIVATE_EXPEDITED_SYNC_CORE)`, so no core runs
-//!   stale instructions once [`Code::write`] returns.
+//!
+//! **Code signing (macOS)**: the pages carry no code signature, so they run only in a process
+//! that does not enforce code signing on its map (`CS_ENFORCEMENT` clear). Measured on macOS
+//! 27.0.1, Apple silicon, 2026-11-15, with a C probe of this exact sequence: a binary signed
+//! ad hoc by the linker runs it; the same binary with the hardened runtime is killed
+//! (`SIGKILL`) at the first instruction fetch, with `com.apple.security.cs.allow-jit` too
+//! (that entitlement admits only `MAP_JIT` memory); with
+//! `com.apple.security.cs.allow-unsigned-executable-memory` it runs. [`Code::map_with_data`]
+//! asks `csops` first and refuses with that reason rather than be killed.
+//!
+//! **Fork**: what a child forked from the program holds of a [`Code`]:
+//!
+//! | | the run view | the write view | the data |
+//! |---|---|---|---|
+//! | macOS | `VM_INHERIT_COPY`: a copy-on-write snapshot of the code as it was at the fork; nothing the parent writes or decommits later reaches it | `VM_INHERIT_NONE`: absent | a private copy |
+//! | Linux | `MAP_SHARED`: the same pages as the parent's, so the parent's later writes and decommits reach it | `MADV_DONTFORK`: absent | a private copy |
+//!
+//! So on both a child keeps a run view at the same address and needs no step after the fork
+//! (no thread switch to set, nothing to map again), and no child can write the parent's code.
+//! The child has no control thread, so it never writes code; `table` stops a child that
+//! reaches a function the parent had not placed. What Linux does not give: a child running a
+//! body the parent decommits after the fork reads zeros there. A snapshot on Linux needs the
+//! written ranges copied into a new memfd before the fork (a `pthread_atfork` prepare handler,
+//! as makepad/relax's `fork_prepare` does); not done here.
 //!
 //! The invariant every `unsafe` block here rests on, kept by [`Code`]'s owner (the `Driver`,
 //! which the control thread owns): **one thread writes a mapping, and it writes only bytes no
@@ -39,7 +72,9 @@ pub struct SysError {
 impl core::fmt::Display for SysError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         let SysError { call, errno, at, len } = *self;
-        write!(f, "{call} failed with errno {errno} (offset {at}, {len} bytes)")
+        // A Mach call (macOS) answers a `kern_return_t`, which `errno` then holds.
+        let code = if call.starts_with("mach_") { "kern_return" } else { "errno" };
+        write!(f, "{call} failed with {code} {errno} (offset {at}, {len} bytes)")
     }
 }
 
@@ -63,7 +98,13 @@ pub fn page() -> Result<usize, SysError> {
     })
 }
 
-/// One mapping that code runs from. See the module's documentation for who may write it.
+/// One reservation that code runs from, code then data. See the module's documentation for
+/// who may write it.
+///
+/// ```text
+/// | code: the run view (read, execute); its pages also at `write` (read, write) | data (read, write) |
+/// base                                                                           base + len            base + len + data
+/// ```
 ///
 /// **A mapping is never unmapped**: there is no `Drop`. A launcher's code lives as long as
 /// its process, and a thread may be in it, or hold an address of it, at any time; so an
@@ -71,30 +112,63 @@ pub fn page() -> Result<usize, SysError> {
 /// that made it, and nothing has to prove that every thread left before a value is dropped.
 /// What a `Code` gives back is memory ([`Code::decommit`]), never addresses.
 pub struct Code {
-    /// Where code runs.
+    /// Where code runs: the reservation's first byte.
     exec: NonNull<u8>,
-    /// Where the same pages are writable.
-    #[cfg(target_os = "linux")]
+    /// Where the same pages are writable: an address only this `Code` holds.
     write: NonNull<u8>,
     /// The memfd, open for the life of the process, as its mappings are.
     #[cfg(target_os = "linux")]
     fd: std::os::fd::OwnedFd,
+    /// The code's bytes, a whole number of pages.
     len: usize,
+    /// The data's bytes, from `exec + len`.
+    data: usize,
 }
 
 // SAFETY: a `Code` is the sole owner of its mappings (and its descriptor); nothing in it is
-// tied to the thread that made it. On macOS the write switch is taken and given back inside
-// each `write` and `store`, on whichever thread calls them.
+// tied to the thread that made it: which view is writable is the view's, not a thread's.
 unsafe impl Send for Code {}
 
 impl Code {
+    /// Maps `len` bytes (a whole number of pages) that code can run from, and no data.
+    /// Nothing is committed until written.
+    pub fn map(len: usize) -> Result<Code, SysError> {
+        Code::map_with_data(len, 0)
+    }
+
     /// Where code runs: the address of offset 0.
     pub fn base(&self) -> usize {
         self.exec.as_ptr() as usize
     }
 
+    /// The code's bytes: what [`Code::write`], [`Code::store`] and [`Code::decommit`] take
+    /// offsets in.
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    /// The address of the data's first byte: right after the code's last page, in the same
+    /// reservation, so code reaches it PC-relatively (`adrp`, `[rip + disp32]`) whatever the
+    /// system placed the reservation at. Readable and writable by every thread, never
+    /// executable, zero until written; its owner writes it as [`Data`]'s owner writes that.
+    pub fn data_base(&self) -> usize {
+        self.base() + self.len
+    }
+
+    /// The data's bytes.
+    pub fn data_len(&self) -> usize {
+        self.data
+    }
+
+    /// `len` and `data` are whole pages, and the reservation's length is a `usize`: the views
+    /// must cover exactly the code's pages, or the run view would reach over the data.
+    fn layout(len: usize, data: usize) -> Result<usize, SysError> {
+        let page = page()?;
+        let whole = len.checked_add(data);
+        match whole {
+            Some(whole) if len != 0 && len % page == 0 && data % page == 0 => Ok(whole),
+            _ => Err(SysError { call: "mapping code", errno: libc::EINVAL, at: 0, len }),
+        }
     }
 
     /// `at..at + len` must be in the mapping.
@@ -113,14 +187,25 @@ impl Code {
         if at % 8 != 0 {
             return Err(SysError { call: "store", errno: libc::EINVAL, at, len: 8 });
         }
-        self.writable(|to| {
-            // SAFETY: `to + at` is in the mapping (`within`), aligned for a `u64` (the mapping
-            // is page aligned and `at` a multiple of 8), writable on this thread (`writable`),
-            // and lives as long as `self`. Other threads only load it, as machine code does:
-            // one aligned 8-byte load, which an atomic store is sound against.
-            let cell = unsafe { AtomicU64::from_ptr(to.add(at).cast::<u64>()) };
-            cell.store(word, Ordering::SeqCst);
-        });
+        // SAFETY: `write + at` is in the write view (`within`), aligned for a `u64` (the view
+        // is page aligned and `at` a multiple of 8), writable, and lives as long as `self`
+        // (never unmapped). Other threads only load the word, through the run view, as
+        // machine code does: one aligned 8-byte load of the same physical bytes, which an
+        // atomic store is sound against.
+        let cell = unsafe { AtomicU64::from_ptr(self.write.as_ptr().add(at).cast::<u64>()) };
+        cell.store(word, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Copies `bytes` to `at` through the write view, without telling the instruction
+    /// caches.
+    fn put(&mut self, at: usize, bytes: &[u8]) -> Result<(), SysError> {
+        self.within("write", at, bytes.len())?;
+        // SAFETY: `write + at .. + bytes.len()` is in the write view (`within`); `bytes` is a
+        // live slice that cannot overlap it (the view is not borrowed as a slice anywhere, and
+        // only this `Code` knows its address); no thread reads these bytes (the module's
+        // invariant).
+        unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), self.write.as_ptr().add(at), bytes.len()) };
         Ok(())
     }
 }
@@ -129,38 +214,178 @@ impl Code {
 mod macos {
     use core::ffi::{c_int, c_void};
 
-    /// `MAP_JIT` (`<sys/mman.h>`): the mapping's write and execute are switched a thread.
-    pub(super) const MAP_JIT: c_int = 0x0800;
-    /// `MADV_FREE_REUSABLE` (`<sys/mman.h>`): the pages' memory goes back to the system now
-    /// and stops counting in the process's footprint, where `MADV_FREE` only marks it.
-    pub(super) const MADV_FREE_REUSABLE: c_int = 7;
+    use super::SysError;
+
+    /// A Mach port name (`mach_port_t`).
+    pub(super) type Port = u32;
+    pub(super) const KERN_SUCCESS: c_int = 0;
+    pub(super) const MACH_PORT_NULL: Port = 0;
+    /// `vm_prot_t` bits (`<mach/vm_prot.h>`).
+    pub(super) const VM_PROT_NONE: c_int = 0;
+    pub(super) const VM_PROT_READ: c_int = 1;
+    pub(super) const VM_PROT_WRITE: c_int = 2;
+    pub(super) const VM_PROT_EXECUTE: c_int = 4;
+    /// `<mach/vm_statistics.h>`.
+    pub(super) const VM_FLAGS_FIXED: c_int = 0;
+    pub(super) const VM_FLAGS_ANYWHERE: c_int = 1;
+    pub(super) const VM_FLAGS_OVERWRITE: c_int = 0x4000;
+    /// `vm_inherit_t` (`<mach/vm_inherit.h>`).
+    pub(super) const VM_INHERIT_COPY: u32 = 1;
+    pub(super) const VM_INHERIT_NONE: u32 = 2;
+    /// `csops` (`<sys/codesign.h>`): the status operation and its enforcement flag.
+    pub(super) const CS_OPS_STATUS: u32 = 0;
+    pub(super) const CS_ENFORCEMENT: u32 = 0x1000;
 
     unsafe extern "C" {
-        /// `<pthread.h>`, macOS 11: whether this thread's `MAP_JIT` pages are executable (1)
-        /// or writable (0).
-        pub(super) fn pthread_jit_write_protect_np(enabled: c_int);
-        /// `<pthread.h>`, macOS 11: whether the switch exists on this machine.
-        pub(super) fn pthread_jit_write_protect_supported_np() -> c_int;
-        /// `<libkern/OSCacheControl.h>`: the instruction cache sees what was written.
+        /// `<mach/mach_init.h>`: this task's own port; a send right the task always holds.
+        pub(super) fn mach_task_self() -> Port;
+        /// `<mach/mach_vm.h>`: zero-filled anonymous memory.
+        pub(super) fn mach_vm_allocate(task: Port, address: *mut u64, size: u64, flags: c_int) -> c_int;
+        /// `<mach/mach_vm.h>`: unmaps a range.
+        pub(super) fn mach_vm_deallocate(task: Port, address: u64, size: u64) -> c_int;
+        /// `<mach/mach_vm.h>`: maps the pages of `source_address..` again at `address`;
+        /// `copy` = 0 shares them, and the new mapping's current and maximum protection are
+        /// the source's, given back through the two pointers.
+        pub(super) fn mach_vm_remap(
+            target: Port,
+            address: *mut u64,
+            size: u64,
+            mask: u64,
+            flags: c_int,
+            source: Port,
+            source_address: u64,
+            copy: c_int,
+            current: *mut c_int,
+            maximum: *mut c_int,
+            inheritance: u32,
+        ) -> c_int;
+        /// `<mach/mach_vm.h>`: sets a range's current protection, or with `set_maximum` its
+        /// maximum (which also lowers the current to it).
+        pub(super) fn mach_vm_protect(
+            task: Port,
+            address: u64,
+            size: u64,
+            set_maximum: c_int,
+            protection: c_int,
+        ) -> c_int;
+        /// `<mach/mach_vm.h>`: what a child forked from this task gets of a range.
+        pub(super) fn mach_vm_inherit(task: Port, address: u64, size: u64, inheritance: u32) -> c_int;
+        /// `<mach/mach_vm.h>`: maps a memory object, or with `MACH_PORT_NULL` fresh anonymous
+        /// memory, here with `VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE` over what is at `address`.
+        pub(super) fn mach_vm_map(
+            target: Port,
+            address: *mut u64,
+            size: u64,
+            mask: u64,
+            flags: c_int,
+            object: Port,
+            offset: u64,
+            copy: c_int,
+            current: c_int,
+            maximum: c_int,
+            inheritance: u32,
+        ) -> c_int;
+        /// libsystem_kernel's code-signing status call (`<sys/codesign.h>`, not in the public
+        /// SDK's documentation, stable since 10.5; what `codesign` and the kernel's own tests
+        /// ask): whether this process enforces code signing on its map.
+        pub(super) fn csops(pid: c_int, ops: u32, out: *mut c_void, size: usize) -> c_int;
+        /// `<libkern/OSCacheControl.h>`: the instruction cache sees what was written
+        /// (`dc cvau`, `dsb ish`, `ic ivau`, `dsb ish`, `isb`; nothing on x86-64).
         pub(super) fn sys_icache_invalidate(start: *mut c_void, len: usize);
         /// `<pthread.h>`: the high end of a thread's stack.
         pub(super) fn pthread_get_stackaddr_np(thread: libc::pthread_t) -> *mut c_void;
         /// `<pthread.h>`: the length of a thread's stack.
         pub(super) fn pthread_get_stacksize_np(thread: libc::pthread_t) -> usize;
     }
+
+    pub(super) fn task() -> Port {
+        // SAFETY: no preconditions; names this task's own port.
+        unsafe { mach_task_self() }
+    }
+
+    /// The `kern_return_t` `code` of `call` about `at..at + len`, as a result.
+    pub(super) fn kern(call: &'static str, code: c_int, at: usize, len: usize) -> Result<(), SysError> {
+        if code == KERN_SUCCESS { Ok(()) } else { Err(SysError { call, errno: code, at, len }) }
+    }
+
+    /// Replaces `len` bytes at `address` with fresh anonymous memory no access reaches
+    /// (`VM_PROT_NONE`, not inherited): the pages that were there go back to the system, and
+    /// the addresses stay taken, so the system places nothing else there.
+    pub(super) fn cover(call: &'static str, address: u64, at: usize, len: usize) -> Result<(), SysError> {
+        let mut placed = address;
+        // SAFETY: a fixed mapping over `address..address + len`, which the caller owns and in
+        // which nothing is live (`Code::decommit`'s contract); `placed` is a live in-out
+        // pointer; anonymous memory (`MACH_PORT_NULL`) replaces only those pages.
+        let code = unsafe {
+            mach_vm_map(
+                task(),
+                &raw mut placed,
+                len as u64,
+                0,
+                VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+                MACH_PORT_NULL,
+                0,
+                0,
+                VM_PROT_NONE,
+                VM_PROT_NONE,
+                VM_INHERIT_NONE,
+            )
+        };
+        kern(call, code, at, len)?;
+        if placed != address {
+            return Err(SysError { call, errno: libc::EFAULT, at, len });
+        }
+        Ok(())
+    }
+
+    /// This process does not enforce code signing on its map, so pages with no signature run
+    /// in it (the module's documentation says what was measured). Refused with the reason,
+    /// rather than the kernel killing the process at the first instruction it fetches.
+    pub(super) fn unsigned_code_runs(len: usize) -> Result<(), SysError> {
+        let mut flags: u32 = 0;
+        // SAFETY: no preconditions.
+        let pid = unsafe { libc::getpid() };
+        // SAFETY: `CS_OPS_STATUS` writes this process's 4-byte status to `flags`, which is a
+        // live local of that size.
+        let asked = unsafe { csops(pid, CS_OPS_STATUS, (&raw mut flags).cast(), size_of::<u32>()) };
+        if asked != 0 {
+            return Err(super::failed("csops(CS_OPS_STATUS)", 0, len));
+        }
+        if flags & CS_ENFORCEMENT != 0 {
+            return Err(SysError {
+                call: "csops: this process enforces code signing (the hardened runtime), so the kernel \
+                       would kill it at the code area's first unsigned page; sign the launcher ad hoc \
+                       without the hardened runtime, or with \
+                       com.apple.security.cs.allow-unsigned-executable-memory (allow-jit admits only \
+                       MAP_JIT memory)",
+                errno: libc::EPERM,
+                at: 0,
+                len,
+            });
+        }
+        Ok(())
+    }
 }
 
-/// The symbols this file calls on macOS beyond POSIX, each with why. None is private; each is
+/// The symbols this file calls on macOS beyond POSIX, each with why. All are public Mach or
+/// libSystem calls but `csops`, which the public SDK declares without documenting; each is
 /// specific to macOS or to a version of it, so `tests::every_macos_symbol_resolves` looks
 /// each up at run time and fails naming the one that is gone.
 #[cfg(target_os = "macos")]
-pub const SYMBOLS: [(&core::ffi::CStr, &str); 5] = [
+pub const SYMBOLS: [(&core::ffi::CStr, &str); 11] = [
+    (c"mach_task_self", "the task whose map the code's views are made in"),
+    (c"mach_vm_allocate", "the reservation (code, then data) and the code's write view"),
+    (c"mach_vm_deallocate", "takes back views made when a later step of making them fails"),
     (
-        c"pthread_jit_write_protect_np",
-        "the control thread's switch between writing and running MAP_JIT pages; other threads \
-         keep running them, where mprotect would stop every thread",
+        c"mach_vm_remap",
+        "aliases the write view's pages read and execute at the code address: two views of \
+         one memory, where MAP_JIT's per-thread switch would also be flipped by a JIT the \
+         program itself runs",
     ),
-    (c"pthread_jit_write_protect_supported_np", "whether that switch exists on this machine"),
+    (c"mach_vm_protect", "lowers each view's maximum protection, so neither can gain the other's"),
+    (c"mach_vm_inherit", "a forked child gets no write view"),
+    (c"mach_vm_map", "decommit: fresh inaccessible memory over both views of freed pages"),
+    (c"csops", "whether this process may run unsigned pages, asked before mapping them"),
     (c"sys_icache_invalidate", "the instruction cache sees new code before a word names it"),
     (c"pthread_get_stackaddr_np", "the bounds a safepoint's walk of its own stack stays in"),
     (c"pthread_get_stacksize_np", "as pthread_get_stackaddr_np"),
@@ -168,67 +393,122 @@ pub const SYMBOLS: [(&core::ffi::CStr, &str); 5] = [
 
 #[cfg(target_os = "macos")]
 impl Code {
-    /// Maps `len` bytes (a whole number of pages) that code can run from. Nothing is committed
-    /// until written.
-    pub fn map(len: usize) -> Result<Code, SysError> {
-        // SAFETY: asks whether the per-thread switch exists; no arguments.
-        if unsafe { macos::pthread_jit_write_protect_supported_np() } == 0 {
-            return Err(SysError {
-                call: "pthread_jit_write_protect_supported_np",
-                errno: libc::ENOTSUP,
-                at: 0,
-                len,
-            });
-        }
-        let protection = libc::PROT_READ | libc::PROT_WRITE | libc::PROT_EXEC;
-        let flags = libc::MAP_PRIVATE | libc::MAP_ANON | macos::MAP_JIT;
-        // SAFETY: an anonymous mapping at no fixed address; the result is checked.
-        let at = unsafe { libc::mmap(ptr::null_mut(), len, protection, flags, -1, 0) };
-        if at == libc::MAP_FAILED {
-            return Err(failed("mmap(MAP_JIT)", 0, len));
-        }
-        match NonNull::new(at.cast::<u8>()) {
-            Some(exec) => Ok(Code { exec, len }),
-            None => Err(SysError { call: "mmap(MAP_JIT)", errno: 0, at: 0, len }),
-        }
-    }
+    /// Reserves `len` bytes of code then `data` bytes of data (each a whole number of pages),
+    /// and makes the code's two views. Nothing is committed until written.
+    ///
+    /// 1. `mach_vm_allocate` reserves code and data together, anywhere: anonymous, readable
+    ///    and writable, inherited by a fork as a copy. The data stays as it is.
+    /// 2. `mach_vm_allocate` makes the write view, anywhere.
+    /// 3. `mach_vm_remap` (`copy` = 0, `VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE`) maps the write
+    ///    view's pages again over the reservation's code part: the run view, inherited by a
+    ///    fork as a copy (the child's snapshot, see the module's table).
+    /// 4. `mach_vm_protect` sets the run view's maximum, then current, protection to read and
+    ///    execute, and the write view's maximum to read and write; `mach_vm_inherit` keeps the
+    ///    write view from a child.
+    ///
+    /// Why `mach_vm_remap` of anonymous memory and not a Mach memory entry
+    /// (`mach_make_memory_entry_64` with `MAP_MEM_NAMED_CREATE`) mapped twice with
+    /// `mach_vm_map`: both run and rewrite code correctly, but the entry's object keeps every
+    /// page it was given until the whole object goes. Measured on macOS 27.0.1, Apple silicon,
+    /// 2026-11-15 (a C probe of both, 2 GiB written, 1 GiB then replaced in both views): the
+    /// entry gave back nothing (`mach_memory_entry_get_page_counts` still counted every page),
+    /// the remapped anonymous memory gave back the 1 GiB. A code area freed a page at a time
+    /// ([`Code::decommit`]) needs the second. (`blaze-inproc`'s memory object is an entry
+    /// because it is handed to another process as a port; this memory never leaves the
+    /// process.) Adapted from makepad/relax (MIT), libs/relax/compiler/src/os/mem.rs, whose
+    /// macOS code memory is the same alias; here the fork keeps the run view as a copy where
+    /// relax maps it again in a `pthread_atfork` child handler.
+    pub fn map_with_data(len: usize, data: usize) -> Result<Code, SysError> {
+        use macos::{VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE, kern, task};
 
-    /// Runs `with` on the mapping's base while this thread may write `MAP_JIT` pages. `with`
-    /// must not panic and must not run code of any `MAP_JIT` mapping: for its length this
-    /// thread cannot execute them.
-    fn writable(&mut self, with: impl FnOnce(*mut u8)) {
-        // SAFETY: this thread's `MAP_JIT` pages become writable and stop being executable for
-        // it; it runs none until the switch back below (`with` is a copy or a store).
-        unsafe {
-            macos::pthread_jit_write_protect_np(0)
+        let whole = Code::layout(len, data)?;
+        macos::unsigned_code_runs(len)?;
+        let mut base = 0u64;
+        // SAFETY: anonymous memory anywhere: nothing of this process is replaced; `base` is a
+        // live out-pointer, read only on success.
+        let code = unsafe { macos::mach_vm_allocate(task(), &raw mut base, whole as u64, macos::VM_FLAGS_ANYWHERE) };
+        kern("mach_vm_allocate(code and data)", code, 0, whole)?;
+        let mut write = 0u64;
+        // SAFETY: as above, for the write view.
+        let code = unsafe { macos::mach_vm_allocate(task(), &raw mut write, len as u64, macos::VM_FLAGS_ANYWHERE) };
+        if let Err(why) = kern("mach_vm_allocate(the write view)", code, 0, len) {
+            // SAFETY: the reservation made above, which nothing has used or named.
+            unsafe { macos::mach_vm_deallocate(task(), base, whole as u64) };
+            return Err(why);
+        }
+        let views = || -> Result<(), SysError> {
+            let (mut run, mut current, mut maximum) = (base, 0, 0);
+            // SAFETY: `base..base + len` is the reservation's code part, made above and named
+            // by nothing, so overwriting it replaces nothing live; `write..write + len` is the
+            // write view made above; the out-pointers are live locals.
+            let code = unsafe {
+                macos::mach_vm_remap(
+                    task(),
+                    &raw mut run,
+                    len as u64,
+                    0,
+                    macos::VM_FLAGS_FIXED | macos::VM_FLAGS_OVERWRITE,
+                    task(),
+                    write,
+                    0,
+                    &raw mut current,
+                    &raw mut maximum,
+                    macos::VM_INHERIT_COPY,
+                )
+            };
+            kern("mach_vm_remap(the run view)", code, 0, len)?;
+            if run != base {
+                return Err(SysError { call: "mach_vm_remap(the run view)", errno: libc::EFAULT, at: 0, len });
+            }
+            let protect = |address: u64, ceiling: bool, protection: core::ffi::c_int, call: &'static str| {
+                // SAFETY: a view made above, of `len` bytes, that nothing runs or names yet;
+                // changing its protection touches no other mapping.
+                let code = unsafe {
+                    macos::mach_vm_protect(task(), address, len as u64, ceiling.into(), protection)
+                };
+                kern(call, code, 0, len)
+            };
+            // The maximum first: it is the run view's own, and the source's (read, write and
+            // execute) was given to it by the remap.
+            protect(base, true, VM_PROT_READ | VM_PROT_EXECUTE, "mach_vm_protect(the run view's maximum)")?;
+            protect(base, false, VM_PROT_READ | VM_PROT_EXECUTE, "mach_vm_protect(the run view)")?;
+            protect(write, true, VM_PROT_READ | VM_PROT_WRITE, "mach_vm_protect(the write view's maximum)")?;
+            // SAFETY: the write view made above; changes only what a fork gives the child.
+            let code = unsafe { macos::mach_vm_inherit(task(), write, len as u64, macos::VM_INHERIT_NONE) };
+            kern("mach_vm_inherit(the write view)", code, 0, len)
         };
-        with(self.exec.as_ptr());
-        // SAFETY: back to executable, the state every thread starts in.
-        unsafe {
-            macos::pthread_jit_write_protect_np(1)
-        };
+        let made = views().and_then(|()| {
+            match (NonNull::new(base as *mut u8), NonNull::new(write as *mut u8)) {
+                (Some(exec), Some(write)) => Ok(Code { exec, write, len, data }),
+                _ => Err(SysError { call: "mach_vm_allocate", errno: libc::EFAULT, at: 0, len }),
+            }
+        });
+        if made.is_err() {
+            // SAFETY: the reservation made above, which nothing has run, written or named.
+            unsafe { macos::mach_vm_deallocate(task(), base, whole as u64) };
+            // SAFETY: as above, the write view.
+            unsafe { macos::mach_vm_deallocate(task(), write, len as u64) };
+        }
+        made
     }
 
     /// Copies `bytes` to `at` and makes them runnable. The bytes are ones no thread can be
     /// running (the module's invariant).
     pub fn write(&mut self, at: usize, bytes: &[u8]) -> Result<(), SysError> {
-        self.within("write", at, bytes.len())?;
-        self.writable(|to| {
-            // SAFETY: `to + at .. + bytes.len()` is in the mapping (`within`) and writable on
-            // this thread (`writable`); `bytes` is a live slice that cannot overlap it (the
-            // mapping is not borrowed as a slice anywhere); no thread reads these bytes (the
-            // module's invariant).
-            unsafe { ptr::copy_nonoverlapping(bytes.as_ptr(), to.add(at), bytes.len()) };
-        });
-        // SAFETY: the range just written, in the mapping.
-        unsafe {
-            macos::sys_icache_invalidate(self.exec.as_ptr().add(at).cast(), bytes.len())
-        };
+        self.put(at, bytes)?;
+        // SAFETY: the range just written, in the run view (`put` checked it); the maintenance
+        // changes no byte. It is done by the run view's addresses; the data cache line it
+        // cleans is the write view's line too, Apple silicon's caches being physically
+        // indexed and tagged (what `blaze_inproc_rt::sys::check_icache` rests on as well).
+        unsafe { macos::sys_icache_invalidate(self.exec.as_ptr().add(at).cast(), bytes.len()) };
         Ok(())
     }
 
-    /// As [`Code::write`]: on macOS `sys_icache_invalidate` is all a write needs, so there
-    /// is nothing to put off.
+    /// As [`Code::write`]: on macOS `sys_icache_invalidate` is all a write needs (there is no
+    /// `membarrier`; the bytes were never code before, so no core holds stale instructions of
+    /// them), so there is nothing to put off. To confirm on a real machine under load: that no
+    /// core runs a stale fetch of a range rewritten in place (a gate's entry), which Linux
+    /// guards with `membarrier(PRIVATE_EXPEDITED_SYNC_CORE)`.
     pub fn copy(&mut self, at: usize, bytes: &[u8]) -> Result<(), SysError> {
         self.write(at, bytes)
     }
@@ -238,27 +518,27 @@ impl Code {
         Ok(())
     }
 
-    /// Gives the memory of whole pages back to the system. Their addresses stay reserved and
-    /// are never used again (the core hands an offset out once).
+    /// Gives the memory of whole pages back to the system: both views of `at..at + len` are
+    /// replaced with fresh memory no access reaches. Their addresses stay taken and are never
+    /// used again (the core hands an offset out once); a fetch there faults.
+    ///
+    /// Not `madvise`: with the pages mapped twice, `MADV_FREE_REUSABLE`, `MADV_FREE` and
+    /// `MADV_DONTNEED` on the write view all left the footprint as it was (measured with the
+    /// probe `map_with_data` names: 64 MiB written, 64 MiB still counted after each), as XNU
+    /// takes back only pages of an object mapped once.
     pub fn decommit(&mut self, at: usize, len: usize) -> Result<(), SysError> {
-        self.within("madvise(MADV_FREE_REUSABLE)", at, len)?;
-        // The kernel answers EAGAIN while it cannot take the pages' lock; a few tries, then
-        // the refusal (rule bounded-progress).
-        for _ in 0..16 {
-            // SAFETY: whole pages of the mapping (`within`; the caller gives page multiples)
-            // in which nothing is live: no thread is in them, and no one will read them.
-            let done = unsafe {
-                libc::madvise(self.exec.as_ptr().add(at).cast(), len, macos::MADV_FREE_REUSABLE)
-            };
-            if done == 0 {
-                return Ok(());
-            }
-            let why = failed("madvise(MADV_FREE_REUSABLE)", at, len);
-            if why.errno != libc::EAGAIN {
-                return Err(why);
-            }
+        self.within("decommit", at, len)?;
+        let page = page()?;
+        if at % page != 0 || len % page != 0 {
+            return Err(SysError { call: "decommit", errno: libc::EINVAL, at, len });
         }
-        Err(SysError { call: "madvise(MADV_FREE_REUSABLE)", errno: libc::EAGAIN, at, len })
+        if len == 0 {
+            return Ok(());
+        }
+        // The run view first: once it is covered, no thread could run the pages even were the
+        // core wrong about them.
+        macos::cover("mach_vm_map(over the run view)", (self.base() + at) as u64, at, len)?;
+        macos::cover("mach_vm_map(over the write view)", self.write.as_ptr() as u64 + at as u64, at, len)
     }
 }
 
@@ -308,11 +588,19 @@ mod linux {
 
 #[cfg(target_os = "linux")]
 impl Code {
-    /// Maps `len` bytes (a whole number of pages) that code can run from. Nothing is committed
-    /// until written.
-    pub fn map(len: usize) -> Result<Code, SysError> {
+    /// Reserves `len` bytes of code then `data` bytes of data (each a whole number of pages),
+    /// and makes the code's two views. Nothing is committed until written.
+    ///
+    /// 1. A memfd of `len` bytes, sparse.
+    /// 2. An anonymous private mapping of code and data together, anywhere (`MAP_NORESERVE`):
+    ///    the reservation, and the data as it stays.
+    /// 3. The memfd read and execute over the reservation's code part (`MAP_FIXED`), the run
+    ///    view; the memfd read and write anywhere, the write view, which a fork does not give
+    ///    the child (`MADV_DONTFORK`).
+    pub fn map_with_data(len: usize, data: usize) -> Result<Code, SysError> {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
+        let whole = Code::layout(len, data)?;
         // SAFETY: a name that is a C string; the result is checked.
         let fd = unsafe { libc::memfd_create(c"blaze-launch".as_ptr(), libc::MFD_CLOEXEC) };
         if fd < 0 {

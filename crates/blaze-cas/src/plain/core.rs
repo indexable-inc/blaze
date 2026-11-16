@@ -19,7 +19,7 @@ use blaze_core::{Completion, Done, Effect, Extent, FileName, LockMode, Tag as Ef
 use blaze_ids::{ContentId, crc32c};
 use blaze_keyed::{
     kind::{Namespace, Tag},
-    store::{ALIGN, ENTRY, FOOTER, HEADER, Put, StoreError, StoreFile},
+    store::{ALIGN, ENTRY, FOOTER, HEADER, Put, SegmentId, StoreError, StoreFile},
 };
 
 use super::format::{
@@ -100,9 +100,11 @@ pub struct PlainConfig {
     /// store is a cache rebuilt from what made it; a caller that needs a commit to survive a
     /// power cut (none today) turns it on.
     pub durable: bool,
-    /// The machine's page size: the stride a segment's index is touched at once mapped, so a
-    /// probe takes no fault. Nothing in the layout depends on it.
-    pub page: u32,
+    /// What names this machine, as bytes a record could hold (the checkout's, the home's and
+    /// the store's paths, in each spelling the caller gives): a put into any namespace but
+    /// [`Namespace::LOCAL`] whose bytes hold one is refused, naming the key and the offset
+    /// (rule 25, sealed sharing: nothing of the machine leaves it). Empty: nothing is scanned.
+    pub machine: Vec<Vec<u8>>,
     /// The namespaces a put may name, [`Namespace::LOCAL`] always among them (the store's roots
     /// live there): only `LOCAL` on a machine that is not a trusted writer (every developer's);
     /// a trusted builder (CI) adds [`Namespace::PUBLIC`] and its organisation's. A commit writes
@@ -147,6 +149,26 @@ pub enum PutError {
     /// A put names a namespace this store does not write ([`PlainConfig::writes`]): a machine
     /// that is not a trusted writer writes only [`Namespace::LOCAL`].
     NotWritable { namespace: Namespace },
+    /// A record for a shared namespace holds a path of this machine
+    /// ([`PlainConfig::machine`]): its bytes at `at` begin needle `needle` of the list.
+    Machine { key: Key, namespace: Namespace, at: u64, needle: u32 },
+}
+
+/// Where the first of `needles` occurs in `bytes`, and which one: the scan of a record before
+/// it may go to a shared namespace (rule 25). Each needle is looked for from each place its
+/// first byte occurs; none empty is ever found.
+pub(crate) fn machine_in(needles: &[Vec<u8>], bytes: &[u8]) -> Option<(u64, u32)> {
+    let mut first: Option<(u64, u32)> = None;
+    for (i, needle) in needles.iter().enumerate() {
+        let Some(&lead) = needle.first() else { continue };
+        let found = bytes.iter().enumerate().filter(|(_, b)| **b == lead).map(|(at, _)| at).find(|&at| bytes[at..].starts_with(needle));
+        if let Some(at) = found
+            && first.is_none_or(|(was, _)| (at as u64) < was)
+        {
+            first = Some((at as u64, i as u32));
+        }
+    }
+    first
 }
 
 impl PutError {
@@ -157,6 +179,9 @@ impl PutError {
             PutError::Mismatch(it) => StoreError::TwoValues { tag, key: it.key.0 },
             PutError::TooLong { key, len } => StoreError::TooLong { tag, key: key.0, len },
             PutError::NotWritable { namespace } => StoreError::NotWritable { namespace },
+            // blaze-keyed's vocabulary has no row for it yet (store-next.md lists it): the
+            // put's own error names the key and offset; the store's says the rule.
+            PutError::Machine { .. } => StoreError::Other { what: "a record for a shared namespace holds a path of this machine (rule 25): it stays local" },
         }
     }
 }
@@ -167,6 +192,11 @@ impl std::fmt::Display for PutError {
             PutError::NotWritable { namespace } => write!(f, "a put names namespace {:x}, which this store does not write: a machine that is not a trusted writer writes only the local namespace", namespace.0),
             PutError::Mismatch(it) => write!(f, "{:x} holds other bytes ({:x}) than the put's ({:x}): a key covers every input its value depends on", it.key.0, it.kept, it.given),
             PutError::TooLong { key, len } => write!(f, "the value of {:x} is {len} bytes: a plain store's record is shorter than 4 GiB and a segment shorter than 16 TiB", key.0),
+            PutError::Machine { key, namespace, at, needle } => write!(
+                f,
+                "the value of {:x}, put under namespace {:x}, holds this machine's path {needle} of the store's list at byte {at}: a record that names the machine stays local (rule 25)",
+                key.0, namespace.0
+            ),
         }
     }
 }
@@ -189,6 +219,9 @@ pub struct Report {
     pub lost: Vec<Lost>,
     /// Segments of another boot checked whole.
     pub checked: u32,
+    /// Segments of another boot proved by their sealed rows, with no byte read
+    /// ([`Plain::proved_by_seal`]).
+    pub sealed: u32,
     /// The generation whose manifest the open read whole: everything committed at or before
     /// it reads back or is in `lost` by name. None when no generation survived. What was
     /// committed after it, with no sync, a power cut may have taken with no trace to name
@@ -249,6 +282,9 @@ pub(crate) enum Plant {
     /// The flip that retires a loss clears its "lost, not yet reported" mark at once: a
     /// report that dies with its process is never made again.
     ClearMarkAtOnce,
+    /// [`Plain::seal`] flips without its barriers: a generation names a segment sealed whose
+    /// bytes a power cut may still tear.
+    SealBeforeBarrier,
 }
 
 /// Puts one worker holds for one namespace, laid out as they will lie in a segment: each
@@ -334,6 +370,7 @@ const UNLOCK: u8 = 16;
 const REMOVE: u8 = 17;
 const LATE_SYNC: u8 = 18;
 const HEAD_MAKE: u8 = 19;
+const BARRIER: u8 = 20;
 
 enum RootEdit {
     Set { name: String, key: Key },
@@ -383,6 +420,11 @@ enum Change {
     Adopt { segs: Vec<Segment> },
     /// Segments pushed to a shared bucket.
     Publish { ids: Vec<u64> },
+    /// The exit tail sealed (store-next.md): each `(id, generation added)` had a barrier
+    /// complete on its file before this flip was asked. A row is sealed only while it is still
+    /// that one (named here, with that generation): a file removed and written again since
+    /// is another's bytes, and stays for the next seal.
+    Seal { ids: Vec<(u64, u64)> },
 }
 
 /// The generation a flip builds on, read under the lock.
@@ -435,6 +477,8 @@ enum Phase {
     SyncingSegment(Box<Writing>, Box<Why>),
     Flipping(Box<Flip>),
     Removing { left: u32, then: Then },
+    /// [`Plain::seal`]'s barriers, `left` of them in flight; the flip follows the last.
+    Sealing { left: u32, ids: Vec<(u64, u64)> },
     Broken,
 }
 
@@ -469,6 +513,8 @@ pub struct Plain {
     /// Each segment this process checked in full, in order: for the oracle, which fails on a
     /// segment checked twice in one boot.
     checked_ids: Vec<u64>,
+    /// Each segment of another boot this process proved by its sealed row, in order.
+    sealed_ids: Vec<u64>,
     by_id: BTreeMap<u64, usize>,
     /// What [`Plain::get`] searches: this generation's mapped segments, newest first.
     view: Vec<usize>,
@@ -615,6 +661,7 @@ impl Plain {
             boot: Boot(cfg.boot),
             checks: std::cell::Cell::new(Checks::default()),
             checked_ids: Vec::new_in(Global),
+            sealed_ids: Vec::new_in(Global),
             held,
             sealed: Vec::new_in(Global),
             committing: Vec::new_in(Global),
@@ -821,6 +868,19 @@ impl Plain {
         &self.checked_ids
     }
 
+    /// The ids of the segments of another boot this process proved by their sealed rows: no
+    /// byte of them read at the open.
+    pub fn proved_by_seal(&self) -> &[u64] {
+        &self.sealed_ids
+    }
+
+    /// The ids of the segments the generation this process holds names sealed.
+    pub fn sealed_segments(&self) -> Vec<u64> {
+        let mut out = Vec::new_in(Global);
+        out.extend(self.manifest.segments.iter().filter(|it| it.sealed).map(|it| it.id));
+        out
+    }
+
     /// The caller's explicit ask (a `scrub` command), never a read's: every record of every
     /// segment mapped here checked against its CRC-32C as its bytes lie now. A byte that changed
     /// on the disk after its segment was proved is found here, or by the consumer that fails on
@@ -912,6 +972,11 @@ impl Plain {
         let Some(at) = self.cfg.writes.iter().position(|it| *it == namespace) else {
             return Err(PutError::NotWritable { namespace });
         };
+        if namespace != Namespace::LOCAL
+            && let Some((at, needle)) = self.machine_at(value)
+        {
+            return Err(PutError::Machine { key, namespace, at, needle });
+        }
         let crc = record_crc(&key.0, tag, value);
         let same = |entry: &Entry| entry.tag == tag && entry.len as usize == value.len() && entry.crc == crc;
         if let Some((held, entry)) = self.held_in(namespace, &key) {
@@ -969,6 +1034,15 @@ impl Plain {
         }
         if let Some(batch) = batches.iter().find(|it| !self.cfg.writes.contains(&it.namespace)) {
             return Err(StoreError::NotWritable { namespace: batch.namespace });
+        }
+        // A worker's batch for a shared namespace is scanned as a put is (rule 25), before
+        // anything of the commit is laid out.
+        for batch in batches.iter().filter(|it| it.namespace != Namespace::LOCAL) {
+            for entry in &batch.entries {
+                if let Some((at, needle)) = self.machine_at(batch.payload(entry)) {
+                    return Err(PutError::Machine { key: Key(entry.key), namespace: batch.namespace, at, needle }.into_store(entry.tag));
+                }
+            }
         }
         // The held batches stay readable while they are written: sealed until the commit ends.
         let mut fresh = Vec::with_capacity_in(self.cfg.writes.len(), Global);
@@ -1079,6 +1153,7 @@ impl Plain {
             Phase::Listing => "compacting",
             Phase::Writing(..) | Phase::SyncingSegment(..) => "writing a segment",
             Phase::Flipping(_) => "flipping its head",
+            Phase::Sealing { .. } => "sealing the exit tail",
             Phase::Broken => "broken",
         }
     }
@@ -1340,6 +1415,9 @@ impl Plain {
         for seg in m.segments.iter_mut() {
             if self.checked.contains(&seg.id) && self.plant() != Plant::ForgetCheck {
                 seg.boot = self.cfg.boot;
+                // Read whole from the media in a boot after the one that wrote it (a new
+                // boot's page cache holds none of it): on the disk, so sealed with no barrier.
+                seg.sealed = seg.local;
             }
         }
         for id in &self.dropped {
@@ -1370,8 +1448,16 @@ impl Plain {
                         m.retired.retain(|it| !(it.id == seg.id && !it.log));
                         seg.generation = generation;
                         match m.segments.iter_mut().find(|it| it.id == seg.id) {
-                            // The same bytes, named already: here again if they were not.
-                            Some(named) => named.local = true,
+                            // The same bytes, named already: here again if they were not. A
+                            // file written again is unsealed and named anew, so a seal asked for
+                            // the old file (by its generation) never seals the new one.
+                            Some(named) => {
+                                if !named.local {
+                                    named.sealed = false;
+                                    named.generation = generation;
+                                }
+                                named.local = true;
+                            }
                             None => m.segments.push(*seg),
                         }
                     }
@@ -1396,7 +1482,14 @@ impl Plain {
                     seg.local = true;
                     seg.published = true;
                     match m.segments.iter_mut().find(|it| it.id == seg.id) {
-                        Some(named) => *named = Segment { generation: named.generation, ..seg },
+                        // A file fetched again where none was is unsealed and named anew (see
+                        // the commit's); one that was here keeps its row's seal.
+                        Some(named) => {
+                            *named = match named.local {
+                                true => Segment { generation: named.generation, sealed: named.sealed, ..seg },
+                                false => seg,
+                            }
+                        }
                         None => m.segments.push(seg),
                     }
                 }
@@ -1404,6 +1497,11 @@ impl Plain {
             Change::Publish { ids } => {
                 for seg in m.segments.iter_mut().filter(|it| ids.contains(&it.id)) {
                     seg.published = true;
+                }
+            }
+            Change::Seal { ids } => {
+                for seg in m.segments.iter_mut().filter(|it| it.local && ids.contains(&(it.id, it.generation))) {
+                    seg.sealed = true;
                 }
             }
             Change::Compact { seg, candidates, orphans, .. } => {
@@ -1414,6 +1512,7 @@ impl Plain {
                     // A published candidate stays named, as not here: a source has it.
                     for it in m.segments.iter_mut().filter(|it| it.published && candidates.contains(&it.id)) {
                         it.local = false;
+                        it.sealed = false;
                     }
                     m.segments.retain(|it| it.published || !candidates.contains(&it.id));
                     if let Some((seg, _)) = seg {
@@ -1581,7 +1680,7 @@ impl Plain {
                 self.committing.extend(segs.iter().map(|(it, _)| it.id));
                 Then::Commit
             }
-            Change::Stamp | Change::Adopt { .. } | Change::Publish { .. } => Then::Stamp,
+            Change::Stamp | Change::Adopt { .. } | Change::Publish { .. } | Change::Seal { .. } => Then::Stamp,
             Change::Compact { mut stats, .. } => {
                 stats.removed = flip.removals.len() as u32;
                 Then::Compact(stats)
@@ -1645,7 +1744,7 @@ impl Plain {
     }
 
     /// One segment's map came back: checked (its length always; its CRC once, when it is of
-    /// another boot) and its index touched a page at a time.
+    /// another boot and not sealed); no page of it is touched.
     fn on_map(&mut self, index: u32, done: Done) -> Result<(), StoreError> {
         let seg = self.manifest.segments[index as usize];
         let file = self.segment_file(seg.id);
@@ -1665,15 +1764,30 @@ impl Plain {
                 return Err(why);
             }
         };
-        // The proof: this boot's row needs no byte read; an earlier boot's segment is checked
-        // in full once, here, and the open's next flip records the boot so no process of this
-        // boot checks it again.
+        // The proof: this boot's row needs no byte read; nor does a sealed row of an earlier
+        // boot (its bytes reached the media before the generation that says so); an earlier
+        // boot's unsealed segment, the tail, is checked in full once, here, and the open's next
+        // flip records the boot (and seals it) so no process checks it again.
         let unverified = Unverified::new(seg, file, map);
+        let mut sealed = false;
         let proved = match Verified::recorded(unverified, self.boot) {
             Ok(proved) => Ok(proved),
             Err(unverified) if !earlier_boot => {
                 return Err(StoreError::Changed { segment: seg.id, generation, len: unverified.len(), named: unverified.seg().file_len() });
             }
+            Err(unverified) if seg.sealed => match Verified::sealed(unverified, self.boot) {
+                Ok(proved) => {
+                    sealed = true;
+                    Ok(proved)
+                }
+                // Sealed and of another length than its row: something outside blaze changed
+                // the file; it is lost, by name, as a torn one is.
+                Err(unverified) => Err((seg, self.segment_file(seg.id), StoreError::Layout {
+                    segment: SegmentId(seg.digest),
+                    what: "it is sealed, and its file's length is not the one its generation names",
+                    at: unverified.len(),
+                })),
+            },
             Err(unverified) if self.plant() == Plant::TrustBoot => Ok(self.trust_for_a_plant(unverified)),
             Err(unverified) => {
                 let mut checks = self.checks.get();
@@ -1691,17 +1805,17 @@ impl Plain {
                 return Ok(());
             }
         };
-        if earlier_boot {
+        if earlier_boot && !sealed {
             self.checked.insert(seg.id);
             self.report.checked += 1;
         }
-        // Touch the index a page at a time, so no probe faults (the payloads are not touched).
-        let run = proved.run();
-        let mut touched = 0u8;
-        for at in (0..run.len()).step_by(self.cfg.page.max(1) as usize) {
-            touched ^= run[at];
+        if sealed {
+            self.sealed_ids.push(seg.id);
+            self.report.sealed += 1;
         }
-        std::hint::black_box(touched);
+        // No page of it is touched here (store-next.md): a repeat with nothing changed reads
+        // the index pages its lookups probe and no other, and a segment no lookup reaches is
+        // never read from the disk.
         self.by_id.insert(seg.id, self.maps.len());
         self.maps.push(proved);
         Ok(())
@@ -1758,6 +1872,52 @@ impl Plain {
             return false;
         }
         self.start_flip(Change::Stamp, effects);
+        true
+    }
+
+    /// Adds `needle` to what names this machine ([`PlainConfig::machine`]); an empty one is
+    /// not added (it would be found everywhere).
+    pub fn machine(&mut self, needle: Vec<u8>) {
+        if !needle.is_empty() && !self.cfg.machine.contains(&needle) {
+            self.cfg.machine.push(needle);
+        }
+    }
+
+    /// Where this machine's first path occurs in `bytes`, when it does ([`machine_in`]).
+    fn machine_at(&self, bytes: &[u8]) -> Option<(u64, u32)> {
+        machine_in(&self.cfg.machine, bytes)
+    }
+
+    /// The exit tail sealed (store-next.md), asked by a command after it answered, as
+    /// [`Plain::compact`] is: one barrier ([`Effect::Barrier`]: `F_BARRIERFSYNC` on macOS,
+    /// `fdatasync` on Linux) on each segment this boot wrote or fetched and no generation
+    /// names sealed, then a flip that seals the ones still named so. No wait is on the edit
+    /// path: the commit before it took no sync, and a power cut before this flip lands leaves
+    /// them unsealed, checked whole at the next boot's open as before. `false`: nothing to
+    /// seal, or the store is busy.
+    pub fn seal(&mut self, effects: &mut Vec<Effect>) -> bool {
+        if !self.ready() {
+            return false;
+        }
+        let mut ids = Vec::new_in(Global);
+        ids.extend(self.manifest.segments.iter().filter(|it| it.local && !it.sealed && it.boot == self.cfg.boot).map(|it| (it.id, it.generation)));
+        if ids.is_empty() {
+            return false;
+        }
+        if self.plant() == Plant::SealBeforeBarrier {
+            self.start_flip(Change::Seal { ids }, effects);
+            return true;
+        }
+        for (i, (id, _)) in ids.iter().enumerate() {
+            let (file, tag) = (self.segment_file(*id), self.tag(BARRIER, i as u32));
+            // A fetched segment is written whole with no sync (`Effect::WriteUnsynced`, by
+            // `Driven::fetch_missing`), which a power cut may undo until a sync covers it: a
+            // barrier orders writes, not a name's replacement, so a published row (fetched or
+            // pushed: few, and off the edit path) is synced.
+            let published = self.manifest.segments.iter().any(|it| it.id == *id && it.published);
+            effects.push(if published { Effect::Sync { file, tag } } else { Effect::Barrier { file, tag } });
+        }
+        self.phase = Phase::Sealing { left: ids.len() as u32, ids };
         true
     }
 
@@ -2025,6 +2185,22 @@ impl Plain {
                     self.lose(seg, file, LostKind::Gone, why);
                 }
                 self.mapped(then, effects);
+                Ok(())
+            }
+            (BARRIER, Phase::Sealing { left, ids }) => {
+                let id = ids.get(index as usize).map(|it| it.0).ok_or_else(|| unexpected("sealing"))?;
+                *left -= 1;
+                let left = *left;
+                if let Some(why) = fail("ordering a segment before the flip that seals it", &self.segment_file(id), &done) {
+                    return Err(why);
+                }
+                if !matches!(done, Done::Ordered | Done::Synced) {
+                    return Err(unexpected("sealing"));
+                }
+                if left == 0 {
+                    let Phase::Sealing { ids, .. } = std::mem::replace(&mut self.phase, Phase::Broken) else { unreachable!("sealing") };
+                    self.start_flip(Change::Seal { ids }, effects);
+                }
                 Ok(())
             }
             (REMOVE, Phase::Removing { left, then }) => {

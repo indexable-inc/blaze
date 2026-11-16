@@ -9,14 +9,16 @@
 use std::alloc::Global;
 use std::fmt::Write as _;
 
-use blaze_file_items::{
-    AttrKind, ContentId, Edition, Item, ItemIndex, ItemKind, Outline, Range, Rename, Visibility,
-    outline,
+use blaze_file_items::{Outline, outline};
+use blaze_format::Aligned;
+use blaze_surface::{
+    AttrKind, ContentId, Edition, FileItemsView, Item, ItemDetail, ItemIndex, Range, Rename,
+    WrittenVis,
 };
 use blaze_sim::{Broke, Config, Tape};
 
 fn parse(text: &str) -> Outline<Global> {
-    outline(text, Edition::Edition2024, Global)
+    outline(text, Edition::E2024, Global)
 }
 
 /// The first entry in source order whose name is `name`.
@@ -36,34 +38,34 @@ fn text_of<'t>(text: &'t str, item: &Item, range: Option<Range>) -> &'t str {
 }
 
 /// The kind's name, for a sequence compared at once.
-fn kind_name(kind: ItemKind) -> &'static str {
+fn kind_name(kind: ItemDetail) -> &'static str {
     match kind {
-        ItemKind::Fn { .. } => "fn",
-        ItemKind::Struct => "struct",
-        ItemKind::Enum => "enum",
-        ItemKind::Union => "union",
-        ItemKind::Trait => "trait",
-        ItemKind::TraitAlias => "trait alias",
-        ItemKind::Impl => "impl",
-        ItemKind::Const { .. } => "const",
-        ItemKind::Static { .. } => "static",
-        ItemKind::TypeAlias => "type",
-        ItemKind::Mod { .. } => "mod",
-        ItemKind::Use { .. } => "use",
-        ItemKind::ExternCrate { .. } => "extern crate",
-        ItemKind::ExternBlock { .. } => "extern block",
-        ItemKind::MacroRules { .. } => "macro_rules",
-        ItemKind::MacroDef => "macro",
-        ItemKind::MacroCall { .. } => "macro call",
-        ItemKind::Variant { .. } => "variant",
-        ItemKind::Field { .. } => "field",
-        ItemKind::Error => "error",
-        ItemKind::Unhandled { .. } => "unhandled",
+        ItemDetail::Fn { .. } => "fn",
+        ItemDetail::Struct => "struct",
+        ItemDetail::Enum => "enum",
+        ItemDetail::Union => "union",
+        ItemDetail::Trait => "trait",
+        ItemDetail::TraitAlias => "trait alias",
+        ItemDetail::Impl => "impl",
+        ItemDetail::Const { .. } => "const",
+        ItemDetail::Static { .. } => "static",
+        ItemDetail::TypeAlias => "type",
+        ItemDetail::Mod { .. } => "mod",
+        ItemDetail::Use { .. } => "use",
+        ItemDetail::ExternCrate { .. } => "extern crate",
+        ItemDetail::ExternBlock { .. } => "extern block",
+        ItemDetail::MacroRules { .. } => "macro_rules",
+        ItemDetail::MacroDef => "macro",
+        ItemDetail::MacroCall { .. } => "macro call",
+        ItemDetail::Variant { .. } => "variant",
+        ItemDetail::Field { .. } => "field",
+        ItemDetail::Error => "error",
+        ItemDetail::Unhandled { .. } => "unhandled",
     }
 }
 
 fn kinds(outline: &Outline<Global>, parent: Option<ItemIndex>) -> Vec<&'static str> {
-    outline.children(parent).map(|(_, item)| kind_name(item.kind)).collect()
+    outline.children(parent).map(|(_, item)| kind_name(item.detail)).collect()
 }
 
 const FORMS: &str = r#"//! A crate's root.
@@ -176,26 +178,26 @@ fn each_item_form_has_its_kind_name_and_ranges() {
     assert_eq!(file_attrs, [(true, AttrKind::Doc), (true, AttrKind::Other)]);
 
     let (_, heap) = named(&outline, text, "alloc");
-    let ItemKind::ExternCrate { rename: Some(Rename::Name(rename)) } = heap.kind else {
-        panic!("`extern crate alloc as heap` renames: {:?}", heap.kind)
+    let ItemDetail::ExternCrate { rename: Some(Rename::Name(rename)) } = heap.detail else {
+        panic!("`extern crate alloc as heap` renames: {:?}", heap.detail)
     };
     assert_eq!(heap.text(text, rename), "heap");
-    assert_eq!(named(&outline, text, "core").1.kind, ItemKind::ExternCrate { rename: None });
+    assert_eq!(named(&outline, text, "core").1.detail, ItemDetail::ExternCrate { rename: None });
 
     let uses: Vec<_> = outline
         .children(None)
-        .filter(|(_, item)| matches!(item.kind, ItemKind::Use { .. }))
+        .filter(|(_, item)| matches!(item.detail, ItemDetail::Use { .. }))
         .map(|(_, item)| item)
         .collect();
-    let ItemKind::Use { tree } = uses[0].kind else { unreachable!("filtered to uses") };
+    let ItemDetail::Use { tree } = uses[0].detail else { unreachable!("filtered to uses") };
     assert_eq!(text_of(text, uses[0], tree), "std::collections::{HashMap, BTreeMap}");
     assert_eq!(uses[0].text(text, uses[0].signature), "use std::collections::{HashMap, BTreeMap}");
     assert_eq!(uses[0].name, None);
-    assert_eq!(uses[1].visibility, Visibility::Crate);
+    assert_eq!(uses[1].visibility, WrittenVis::Crate);
 
     let (_, add) = named(&outline, text, "add");
-    assert_eq!(add.kind, ItemKind::Fn { body_holds_items: false });
-    assert_eq!(add.visibility, Visibility::Pub);
+    assert_eq!(add.detail, ItemDetail::Fn { body_holds_items: false });
+    assert_eq!(add.visibility, WrittenVis::Pub);
     assert_eq!(
         add.text(text, add.signature),
         "/// Adds two numbers.\n#[inline]\n#[cfg(feature = \"fast\")]\npub fn add<T: core::ops::Add<Output = T>>(a: T, b: T) -> T where T: Copy"
@@ -209,25 +211,25 @@ fn each_item_form_has_its_kind_name_and_ranges() {
     assert_eq!(add.text(text, outline.attrs(add)[2].range), "#[cfg(feature = \"fast\")]");
 
     let (_, declares) = named(&outline, text, "declares");
-    assert_eq!(declares.kind, ItemKind::Fn { body_holds_items: true });
-    assert_eq!(declares.visibility, Visibility::Super);
+    assert_eq!(declares.detail, ItemDetail::Fn { body_holds_items: true });
+    assert_eq!(declares.visibility, WrittenVis::Super);
     assert!(outline.items().iter().all(|item| item.name.is_none_or(|name| item.text(text, name) != "Local")));
 
     let (_, plain) = named(&outline, text, "plain");
-    assert_eq!(plain.kind, ItemKind::Fn { body_holds_items: false });
-    assert_eq!(plain.visibility, Visibility::Private);
+    assert_eq!(plain.detail, ItemDetail::Fn { body_holds_items: false });
+    assert_eq!(plain.visibility, WrittenVis::Private);
     assert_eq!(plain.range.of(text), "fn plain() -> u8 { 1 }");
 
     let (point_at, point) = named(&outline, text, "Point");
-    assert_eq!(point.kind, ItemKind::Struct);
+    assert_eq!(point.detail, ItemDetail::Struct);
     assert_eq!(point.text(text, point.signature), "pub struct Point<T> where T: Clone");
     let fields: Vec<_> = outline.children(Some(point_at)).map(|(_, field)| field).collect();
     let names: Vec<_> = fields.iter().map(|field| text_of(text, field, field.name)).collect();
     assert_eq!(names, ["x", "y", "z"]);
-    assert_eq!(fields[0].visibility, Visibility::Pub);
-    let ItemKind::Field { ty, default: None } = fields[0].kind else { panic!("{:?}", fields[0].kind) };
+    assert_eq!(fields[0].visibility, WrittenVis::Pub);
+    let ItemDetail::Field { ty, default: None } = fields[0].detail else { panic!("{:?}", fields[0].detail) };
     assert_eq!(text_of(text, fields[0], ty), "T");
-    let Visibility::In { path } = fields[1].visibility else { panic!("{:?}", fields[1].visibility) };
+    let WrittenVis::In(path) = fields[1].visibility else { panic!("{:?}", fields[1].visibility) };
     assert_eq!(fields[1].text(text, path), "crate::shapes");
     assert_eq!(outline.attrs(fields[2]).iter().map(|attr| attr.kind).collect::<Vec<_>>(), [AttrKind::CfgAttr]);
     assert!(fields.iter().all(|field| field.parent == Some(point_at)));
@@ -237,36 +239,36 @@ fn each_item_form_has_its_kind_name_and_ranges() {
     let shapes: Vec<_> = fields
         .iter()
         .map(|field| {
-            let ItemKind::Field { ty, .. } = field.kind else { panic!("{:?}", field.kind) };
+            let ItemDetail::Field { ty, .. } = field.detail else { panic!("{:?}", field.detail) };
             (field.name, text_of(text, field, ty), field.visibility, field.disambiguator)
         })
         .collect();
-    assert_eq!(shapes, [(None, "u8", Visibility::Pub, 0), (None, "u16", Visibility::Private, 1)]);
+    assert_eq!(shapes, [(None, "u8", WrittenVis::Pub, 0), (None, "u16", WrittenVis::Private, 1)]);
 
     let (shape_at, shape) = named(&outline, text, "Shape");
-    assert_eq!(shape.kind, ItemKind::Enum);
+    assert_eq!(shape.detail, ItemDetail::Enum);
     assert_eq!(kinds(&outline, Some(shape_at)), ["variant", "variant", "variant"]);
     let (circle_at, _) = named(&outline, text, "Circle");
     assert_eq!(kinds(&outline, Some(circle_at)), ["field"]);
     let (square_at, _) = named(&outline, text, "Square");
     assert_eq!(kinds(&outline, Some(square_at)), ["field"]);
     let (_, empty) = named(&outline, text, "Empty");
-    let ItemKind::Variant { discriminant } = empty.kind else { panic!("{:?}", empty.kind) };
+    let ItemDetail::Variant { discriminant } = empty.detail else { panic!("{:?}", empty.detail) };
     assert_eq!(text_of(text, empty, discriminant), "3");
 
     let (bits_at, bits) = named(&outline, text, "Bits");
-    assert_eq!(bits.kind, ItemKind::Union);
+    assert_eq!(bits.detail, ItemDetail::Union);
     assert_eq!(kinds(&outline, Some(bits_at)), ["field", "field"]);
 
     let (area_at, area) = named(&outline, text, "Area");
-    assert_eq!(area.kind, ItemKind::Trait);
+    assert_eq!(area.detail, ItemDetail::Trait);
     assert_eq!(kinds(&outline, Some(area_at)), ["fn", "const", "type"]);
     let (_, area_fn) = outline.children(Some(area_at)).next().expect("the trait has items");
     assert_eq!(area_fn.body, None);
     assert_eq!(area_fn.text(text, area_fn.signature), "fn area(&self) -> f64");
-    assert_eq!(named(&outline, text, "Both").1.kind, ItemKind::TraitAlias);
+    assert_eq!(named(&outline, text, "Both").1.detail, ItemDetail::TraitAlias);
 
-    let impls: Vec<_> = outline.children(None).filter(|(_, item)| item.kind == ItemKind::Impl).collect();
+    let impls: Vec<_> = outline.children(None).filter(|(_, item)| item.detail == ItemDetail::Impl).collect();
     let (impl_at, area_impl) = impls[0];
     assert_eq!(area_impl.name, None);
     assert_eq!(area_impl.text(text, area_impl.signature), "impl<T: Clone> Area for Point<T> where T: Copy");
@@ -276,29 +278,29 @@ fn each_item_form_has_its_kind_name_and_ranges() {
     assert_eq!((impls[0].1.disambiguator, impls[1].1.disambiguator), (0, 0));
 
     let (_, limit) = named(&outline, text, "LIMIT");
-    assert_eq!(limit.kind, ItemKind::Const { body_holds_items: false });
+    assert_eq!(limit.detail, ItemDetail::Const { body_holds_items: false });
     assert_eq!(limit.text(text, limit.signature), "const LIMIT: usize");
     assert_eq!(text_of(text, limit, limit.body), "10");
     let (_, count) = named(&outline, text, "COUNT");
-    assert_eq!(count.kind, ItemKind::Static { body_holds_items: false });
+    assert_eq!(count.detail, ItemDetail::Static { body_holds_items: false });
     assert_eq!(count.text(text, count.signature), "static mut COUNT: u32");
     let (_, map) = named(&outline, text, "Map");
-    assert_eq!(map.kind, ItemKind::TypeAlias);
+    assert_eq!(map.detail, ItemDetail::TypeAlias);
     assert_eq!(map.text(text, map.signature), "type Map<K> = HashMap<K, u32>");
     assert_eq!(map.body, None);
 
     let (_, place) = named(&outline, text, "place");
-    let ItemKind::Mod { inline: false, path: Some(path) } = place.kind else { panic!("{:?}", place.kind) };
+    let ItemDetail::Mod { inline: false, path: Some(path) } = place.detail else { panic!("{:?}", place.detail) };
     assert_eq!(place.text(text, path), "\"other/place.rs\"");
-    assert_eq!(place.visibility, Visibility::Pub);
+    assert_eq!(place.visibility, WrittenVis::Pub);
 
     let (inner_at, inner) = named(&outline, text, "inner");
-    assert_eq!(inner.kind, ItemKind::Mod { inline: true, path: None });
+    assert_eq!(inner.detail, ItemDetail::Mod { inline: true, path: None });
     let inner_attrs: Vec<_> = outline.attrs(inner).iter().map(|attr| (attr.inner, attr.kind)).collect();
     assert_eq!(inner_attrs, [(true, AttrKind::Other)]);
     assert_eq!(kinds(&outline, Some(inner_at)), ["struct", "mod"]);
     let (deeper_at, deeper) = named(&outline, text, "deeper");
-    assert_eq!(deeper.visibility, Visibility::SelfOnly);
+    assert_eq!(deeper.visibility, WrittenVis::SelfOnly);
     assert_eq!(deeper.parent, Some(inner_at));
     let (leaf_at, leaf) = named(&outline, text, "leaf");
     assert_eq!(leaf.parent, Some(deeper_at));
@@ -307,21 +309,21 @@ fn each_item_form_has_its_kind_name_and_ranges() {
 
     let (block_at, block) = outline
         .children(None)
-        .find(|(_, item)| matches!(item.kind, ItemKind::ExternBlock { .. }))
+        .find(|(_, item)| matches!(item.detail, ItemDetail::ExternBlock { .. }))
         .expect("the fixture has an extern block");
-    let ItemKind::ExternBlock { abi } = block.kind else { unreachable!("found as an extern block") };
+    let ItemDetail::ExternBlock { abi } = block.detail else { unreachable!("found as an extern block") };
     assert_eq!(text_of(text, block, abi), "extern \"C\"");
     assert_eq!(kinds(&outline, Some(block_at)), ["fn", "static"]);
     assert_eq!(named(&outline, text, "abs").1.body, None);
 
-    assert_eq!(named(&outline, text, "square").1.kind, ItemKind::MacroRules { exported: true });
+    assert_eq!(named(&outline, text, "square").1.detail, ItemDetail::MacroRules { exported: true });
     let (_, twice) = named(&outline, text, "twice");
-    assert_eq!(twice.kind, ItemKind::MacroDef);
+    assert_eq!(twice.detail, ItemDetail::MacroDef);
     assert_eq!(twice.text(text, twice.signature), "pub macro twice($e:expr)");
     assert_eq!(text_of(text, twice, twice.body), "{ $e + $e }");
 
     let (_, call) = outline.children(None).last().expect("the fixture has items");
-    let ItemKind::MacroCall { path, input } = call.kind else { panic!("{:?}", call.kind) };
+    let ItemDetail::MacroCall { path, input } = call.detail else { panic!("{:?}", call.detail) };
     assert_eq!(text_of(text, call, path), "thread_local");
     assert_eq!(text_of(text, call, input), "{ static DEPTH: u32 = 0; }");
     assert_eq!(call.text(text, call.signature), "thread_local!");
@@ -338,7 +340,7 @@ fn a_second_equal_impl_gets_disambiguator_one() {
     let impls = |outline: &Outline<Global>| -> Vec<(u32, ContentId)> {
         outline
             .children(None)
-            .filter(|(_, item)| item.kind == ItemKind::Impl)
+            .filter(|(_, item)| item.detail == ItemDetail::Impl)
             .map(|(_, item)| (item.disambiguator, item.hash))
             .collect()
     };
@@ -349,11 +351,14 @@ fn a_second_equal_impl_gets_disambiguator_one() {
     assert_eq!(after[0].1, after[2].1, "equal impls apart from whitespace hash alike");
 }
 
+/// A file with syntax errors around items that parse.
+const BROKEN: &str = "fn before() {}\nfn broken() { let x = ; }\nstruct Missing { a: u8 b: u16 }\nfn after() {};\nfn last<T>(t: T) -> T { t }\n";
+
 /// A file with syntax errors still lists the items around them, the stray `;` as an error
 /// entry, and each error at a range of the file.
 #[test]
 fn a_syntax_error_in_one_item_leaves_the_others() {
-    let text = "fn before() {}\nfn broken() { let x = ; }\nstruct Missing { a: u8 b: u16 }\nfn after() {};\nfn last<T>(t: T) -> T { t }\n";
+    let text = BROKEN;
     let outline = parse(text);
     assert!(!outline.errors().is_empty(), "the fixture has syntax errors");
     for error in outline.errors() {
@@ -361,14 +366,14 @@ fn a_syntax_error_in_one_item_leaves_the_others() {
         assert!(!outline.message(error).is_empty());
     }
     for name in ["before", "broken", "after", "last"] {
-        assert!(matches!(named(&outline, text, name).1.kind, ItemKind::Fn { .. }), "`{name}` is listed");
+        assert!(matches!(named(&outline, text, name).1.detail, ItemDetail::Fn { .. }), "`{name}` is listed");
     }
     let (missing_at, missing) = named(&outline, text, "Missing");
-    assert_eq!(missing.kind, ItemKind::Struct);
+    assert_eq!(missing.detail, ItemDetail::Struct);
     let fields: Vec<_> =
         outline.children(Some(missing_at)).map(|(_, field)| text_of(text, field, field.name)).collect();
     assert_eq!(fields, ["a", "b"]);
-    assert!(outline.items().iter().any(|item| item.kind == ItemKind::Error), "the stray `;` is an entry");
+    assert!(outline.items().iter().any(|item| item.detail == ItemDetail::Error), "the stray `;` is an entry");
 }
 
 /// One item of a drawn file: a kind and one of three names, so names repeat.
@@ -459,6 +464,43 @@ fn an_outline_is_a_function_of_the_text() {
             false => Err(Broke::Oracle(format!("two outlines of one text differ:\n{text}"))),
         }
     });
+}
+
+/// Whether the `FileItems` record of `text`'s outline answers what the outline answers: every
+/// entry, its name's text, its attributes and children, the file's attributes, the errors and
+/// their messages.
+fn record_answers_as_outline(text: &str) -> Result<(), Broke> {
+    let made = parse(text);
+    let broke = |what: &str| Broke::Oracle(format!("{what}:\n{text}"));
+    let bytes = made.to_file_items(text, ContentId([7; 32]), Global).map_err(|error| broke(&error.to_string()))?;
+    let buffer = Aligned::copy_from(&bytes);
+    let view = FileItemsView::read(&buffer).map_err(|error| broke(&error.to_string()))?;
+    let entries = view.file() == ContentId([7; 32])
+        && view.items().map(|entry| entry.item).eq(made.items().iter().copied())
+        && view.items().all(|entry| entry.name == text_of(text, &entry, entry.item.name))
+        && view.items().all(|entry| view.attrs(&entry).eq(made.attrs(&entry).iter().copied()));
+    let parents = (0..made.items().len()).map(|at| Some(ItemIndex(u32::try_from(at).expect("a small file"))));
+    let children = core::iter::once(None).chain(parents).all(|parent| {
+        let (ours, theirs) = (view.children(parent), made.children(parent));
+        ours.map(|(at, entry)| (at, entry.item)).eq(theirs.map(|(at, item)| (at, *item)))
+    });
+    let rest = view.file_attrs().eq(made.file_attrs().iter().copied())
+        && view.errors().eq(made.errors().iter().copied())
+        && made.errors().iter().all(|error| view.message(error) == made.message(error));
+    match entries && children && rest {
+        true => Ok(()),
+        false => Err(broke("the record answers other than the outline")),
+    }
+}
+
+/// The refinement: an outline's record answers what the outline answers, on the fixture of
+/// every form, the file with syntax errors, and drawn files.
+#[test]
+fn the_record_answers_what_the_outline_answers() {
+    for text in [FORMS, BROKEN] {
+        record_answers_as_outline(text).expect("the record of a fixture answers as its outline");
+    }
+    blaze_sim::check(Config::cases(200), |tape| record_answers_as_outline(&text(&file(tape), "", false).0));
 }
 
 /// The invariant: editing one function's body changes that entry's whole hash and no other

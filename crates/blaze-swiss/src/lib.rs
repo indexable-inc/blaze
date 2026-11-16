@@ -19,20 +19,26 @@
 //! one table built on them here: `u32`s naming a column the caller keeps, which every
 //! interner keyed by an index (`blaze_ids::Sharded`, the hash-conser, base-db's tables) uses.
 
+#![no_std]
+#![feature(allocator_ext)]
 #![deny(unsafe_code)]
 
-// The atomics are `std`'s, or under `cfg(blaze_check)` the model checker's
-// (docs/v2/plan/design/model-checker.md "The switch").
-#[cfg(blaze_check)]
-use blaze_check::sync::{
-    OnceLock,
+// The tests' threads, collections and global allocator: `core` has none.
+#[cfg(test)]
+extern crate std;
+
+use core::alloc::Allocator;
+
+use blaze_own::{Box, Vec};
+
+// The atomics are `core`'s, or under `cfg(blaze_check)` the model checker's
+// (docs/v2/plan/design/model-checker.md "The switch"), as is the once-cell.
+use crate::sync::{
+    Once,
     atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
-#[cfg(not(blaze_check))]
-use std::sync::{
-    OnceLock,
-    atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
-};
+
+pub mod sync;
 
 /// Counts allocations so the probe's tests hold it to none.
 #[cfg(test)]
@@ -241,14 +247,15 @@ struct Group {
 #[cfg(not(blaze_check))]
 const _: () = assert!(size_of::<Group>() == 32 && align_of::<Group>() == 32);
 
-fn new_table(len: usize) -> Box<[Group]> {
-    (0..len)
-        .map(|_| Group {
-            ctrl: AtomicU64::new(0),
-            values: std::array::from_fn(|_| AtomicU32::new(0)),
-        })
-        // alloc: growth, one table per doubling of the values, over the inserts that filled the last
-        .collect()
+/// A table of `len` empty groups in `alloc`: growth, one table per doubling of the values,
+/// over the inserts that filled the last.
+fn new_table<A: Allocator>(len: usize, alloc: A) -> Box<[Group], A> {
+    let mut groups = Vec::with_capacity_in(len, alloc);
+    groups.resize_with(len, || Group {
+        ctrl: AtomicU64::new(0),
+        values: core::array::from_fn(|_| AtomicU32::new(0)),
+    });
+    groups.into_boxed_slice()
 }
 
 /// A SwissTable of `u32`s, each naming a value in a column the caller keeps, found by a hash
@@ -263,22 +270,34 @@ fn new_table(len: usize) -> Box<[Group]> {
 /// [`Index::release_outgrown`] frees them with `&mut`. A value costs 7.1 to 14.2 bytes of
 /// table, and nothing is stored of its hash: growing asks the caller for it.
 ///
-/// An index with no value has no table: [`Index::new`] allocates nothing.
-pub struct Index {
+/// Its tables are in the allocator `A`, which the maker names ([`Index::new_in`]); an index
+/// with no value has no table and allocates nothing.
+pub struct Index<A: Allocator + Clone> {
     /// How many levels are published; the last is in use.
     level: AtomicUsize,
-    tables: [OnceLock<Box<[Group]>>; LEVELS],
+    tables: [Once<Box<[Group], A>>; LEVELS],
+    alloc: A,
 }
 
-impl Default for Index {
-    fn default() -> Index {
-        Index::new()
+/// The ratchet's (tools/ratchets): an index in a default allocator, for the callers that made
+/// one by `Index::new()` before it named its allocator. New code calls [`Index::new_in`].
+impl<A: Allocator + Clone + Default> Default for Index<A> {
+    fn default() -> Index<A> {
+        Index::new_in(A::default())
     }
 }
 
-impl Index {
-    pub fn new() -> Index {
-        Index { level: AtomicUsize::new(0), tables: std::array::from_fn(|_| OnceLock::new()) }
+impl<A: Allocator + Clone + Default> Index<A> {
+    /// The ratchet's, as [`Default`]: [`Index::new_in`] of `A::default()`.
+    pub fn new() -> Index<A> {
+        Index::new_in(A::default())
+    }
+}
+
+impl<A: Allocator + Clone> Index<A> {
+    /// An empty index whose tables go in `alloc`: no allocation until the first insert.
+    pub fn new_in(alloc: A) -> Index<A> {
+        Index { level: AtomicUsize::new(0), tables: core::array::from_fn(|_| Once::new()), alloc }
     }
 
     fn at_level(&self, level: usize) -> Option<&[Group]> {
@@ -319,7 +338,8 @@ impl Index {
             return groups;
         }
         assert!(level < LEVELS, "an index of more than 2^32 values");
-        let grown = new_table(1 << level);
+        // clone: the allocator's handle, once per level.
+        let grown = new_table(1 << level, self.alloc.clone());
         if let Some(old) = current {
             // Relaxed: every write to the table was the writer's, and so ours.
             for group in old {
@@ -348,7 +368,7 @@ impl Index {
     pub fn release_outgrown(&mut self) {
         let level = self.level.load(Ordering::Relaxed);
         for table in &mut self.tables[..level.saturating_sub(1)] {
-            *table = OnceLock::new();
+            *table = Once::new();
         }
     }
 }
@@ -365,6 +385,8 @@ fn put(groups: &[Group], hash: u64, value: u32, publish: Ordering) {
 
 #[cfg(test)]
 mod tests {
+    use std::{alloc::Global, boxed::Box, vec, vec::Vec};
+
     use blaze_sim::{Config, Tape};
 
     use super::*;
@@ -593,7 +615,7 @@ mod tests {
     #[test]
     fn index_agrees_with_a_map() {
         for seed in 0..4u64 {
-            let mut index = Index::new();
+            let mut index = Index::new_in(Global);
             assert_eq!(index.capacity(), 0);
             let mut keys: Vec<u64> = Vec::new();
             let mut model: std::collections::BTreeMap<u64, u32> = std::collections::BTreeMap::new();
@@ -634,7 +656,7 @@ mod tests {
         use std::sync::{Mutex, atomic::AtomicU64 as Key};
 
         const KEYS: usize = 20_000;
-        let index = Index::new();
+        let index = Index::new_in(Global);
         let column: Box<[Key]> = (0..KEYS).map(|_| Key::new(u64::MAX)).collect();
         let len = Mutex::new(0usize);
         let intern = |key: u64| -> u32 {
@@ -680,14 +702,14 @@ mod tests {
     #[cfg(not(blaze_check))]
     #[test]
     fn index_groups_never_straddle_a_line() {
-        let index = Index::new();
+        let index = Index::new_in(Global);
         let keys: Vec<u64> = (0..5_000).collect();
         for (len, &key) in keys.iter().enumerate() {
             index.insert(len, hash_of(key), len as u32, |value| hash_of(keys[value as usize]));
         }
         let levels = index.level.load(Ordering::Relaxed);
         assert!(levels > 5);
-        for table in index.tables[..levels].iter().filter_map(OnceLock::get) {
+        for table in index.tables[..levels].iter().filter_map(Once::get) {
             for group in table.iter() {
                 let at = std::ptr::from_ref(group).addr();
                 assert_eq!(at / 64, (at + size_of::<Group>() - 1) / 64, "a group in one line");
@@ -698,7 +720,7 @@ mod tests {
     #[cfg(not(blaze_check))]
     #[test]
     fn an_index_allocates_only_to_grow() {
-        let index = blaze_alloc_count::assert_at_most(0, "a new index", Index::new);
+        let index = blaze_alloc_count::assert_at_most(0, "a new index", || Index::new_in(Global));
         let keys: Vec<u64> = (0..1_000).collect();
         for (len, &key) in keys.iter().enumerate() {
             index.insert(len, hash_of(key), len as u32, |value| hash_of(keys[value as usize]));
@@ -732,7 +754,7 @@ mod tests {
 /// finds a value from before the growth and one inserted during it.
 #[cfg(all(test, blaze_check))]
 mod model {
-    use std::sync::Arc;
+    use std::{alloc::Global, sync::Arc};
 
     use blaze_check::thread;
 
@@ -746,7 +768,7 @@ mod model {
     #[test]
     fn model_swiss_reader_races_growth() {
         blaze_check::model(|| {
-            let index = Arc::new(Index::new());
+            let index = Arc::new(Index::new_in(Global));
             for value in 0..4u32 {
                 index.insert(value as usize, HASH, value, |_| HASH);
             }

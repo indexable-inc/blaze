@@ -8,7 +8,7 @@
 //! What uses it: [`crate::Hasher`]'s whole chunks side by side, and `blaze_ids`' many short
 //! inputs (`ContentId::of_many`), whose last blocks have a length each.
 
-use std::simd::Simd;
+use core::simd::Simd;
 
 use crate::{BLOCK_LEN, IV, SCHEDULE};
 
@@ -91,7 +91,7 @@ pub fn compress<const N: usize>(
 /// A block's sixteen little-endian words.
 #[inline(always)]
 pub fn block_words(block: &[u8; BLOCK_LEN]) -> [u32; 16] {
-    std::array::from_fn(|word| {
+    core::array::from_fn(|word| {
         u32::from_le_bytes([
             block[4 * word],
             block[4 * word + 1],
@@ -109,8 +109,8 @@ pub fn columns<const S: usize>(rows: &[[u32; 16]; S]) -> [[u32; S]; 16] {
     const { assert!(S.is_power_of_two() && S <= 16) };
     let mut out = [[0; S]; 16];
     for from in (0..16).step_by(S) {
-        let square = transpose(std::array::from_fn(|lane| {
-            Simd::from_array(std::array::from_fn(|word| rows[lane][from + word]))
+        let square = transpose(core::array::from_fn(|lane| {
+            Simd::from_array(core::array::from_fn(|word| rows[lane][from + word]))
         }));
         for (word, column) in square.iter().enumerate() {
             out[from + word] = column.to_array();
@@ -126,7 +126,7 @@ pub fn rows_of<const S: usize>(columns: &[[u32; S]; 8]) -> [[u32; 8]; S] {
     const { assert!(S.is_power_of_two() && S <= 16) };
     let mut out = [[0; 8]; S];
     for from in (0..8).step_by(S) {
-        let square = transpose(std::array::from_fn(|row| {
+        let square = transpose(core::array::from_fn(|row| {
             Simd::from_array(columns.get(from + row).copied().unwrap_or([0; S]))
         }));
         for (lane, row) in square.iter().enumerate() {

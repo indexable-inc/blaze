@@ -302,6 +302,9 @@ blaze-diagnostics = { path = "crates/blaze-diagnostics", version = "0.0.0" }
 blaze-audit = { path = "crates/blaze-audit" }
 blaze-fetch = { path = "crates/blaze-fetch" }
 blaze-format = { path = "crates/blaze-format" }
+# The record half of blaze-format on `core` alone, for the new item layer's `no_std` crates;
+# blaze-format re-exports it whole, with its `alloc` and `serde` features on.
+blaze-format-core = { path = "crates/blaze-format-core" }
 # The bottom of the tree depends on no crate from outside the workspace
 # (docs/v2/plan/design/bottom.md, "Also decided on 2026-11-15"): its adapters to such crates are
 # features, on here for the crates above, and the bottom crates name each other by path without
@@ -323,6 +326,7 @@ blaze-surface = { path = "crates/blaze-surface" }
 # The fresh core's vocabulary: record kinds, keys, the store, memo, executor and driver interfaces.
 blaze-keyed = { path = "crates/blaze-keyed" }
 blaze-run = { path = "crates/blaze-run" } # `blaze run`/`blaze test` as sans-IO machines (docs/v2/plan/design/run.md).
+blaze-watch = { path = "crates/blaze-watch" } # The monitor's rings, transport, viewer core and recorder (docs/v2/plan/design/watch.md).
 # The host of the keyed driver (docs/v2/plan/design/host.md): a unit's keys from its own text,
 # and the process that performs the driver's effects.
 blaze-unitkey = { path = "crates/blaze-unitkey" }
@@ -373,6 +377,13 @@ blaze-memo-macros = { path = "crates/blaze-memo-macros" }
 blaze-reclaim = { path = "crates/blaze-reclaim" }
 blaze-mem = { path = "crates/blaze-mem" }
 blaze-own = { path = "crates/blaze-own" } # Vec, Box, Arc, Rc, ... with no default allocator, in place of `alloc`.
+blaze-int = { path = "crates/blaze-int" } # Integer conversions that say what they do (widen, narrow, truncate, saturate), in place of `as`.
+# blaze's own data formats, on blaze-own and core only, in place of base64, serde_json,
+# toml/toml_edit and semver (docs/v2/plan/third-party.md).
+blaze-base64 = { path = "crates/blaze-base64" }
+blaze-json = { path = "crates/blaze-json" }
+blaze-semver = { path = "crates/blaze-semver" }
+blaze-toml = { path = "crates/blaze-toml" }
 blaze-usercode = { path = "crates/blaze-usercode" }
 blaze-v2-proof = { path = "crates/blaze-v2-proof" }
 blaze-vfs = { path = "crates/blaze-vfs" }

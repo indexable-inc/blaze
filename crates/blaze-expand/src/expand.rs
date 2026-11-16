@@ -9,7 +9,7 @@ use crate::{
     call::Call,
     cx::{ExpandCx, ProcCall},
     declarative,
-    def::{LocalInner, MacroDef, MacroKind, ProcKind},
+    def::{LocalInner, MacroDefinition, MacroKind, ProcKind},
     derive,
     error::{ExpandError, Stream, Unbuilt},
     expansion::{Diagnostic, Expanded, Expansion, TokenOrigin, PathScope},
@@ -19,18 +19,18 @@ use crate::{
 
 /// A definition made ready to expand calls: a declarative macro's rules parsed once.
 pub struct Prepared<'d, A: Allocator> {
-    def: &'d MacroDef<A>,
+    def: &'d MacroDefinition<A>,
     rules: Option<DeclarativeMacro>,
 }
 
 impl<'d, A: Allocator> Prepared<'d, A> {
-    pub fn def(&self) -> &'d MacroDef<A> {
+    pub fn def(&self) -> &'d MacroDefinition<A> {
         self.def
     }
 }
 
 /// Parses a declarative definition's rules; other kinds have nothing to prepare.
-pub fn prepare<A: Allocator>(def: &MacroDef<A>) -> Result<Prepared<'_, A>, ExpandError> {
+pub fn prepare<A: Allocator>(def: &MacroDefinition<A>) -> Result<Prepared<'_, A>, ExpandError> {
     let rules = match def.kind() {
         MacroKind::Rules | MacroKind::Macro2 => Some(declarative::parse(def)?),
         MacroKind::BuiltinFn(_)
@@ -44,7 +44,7 @@ pub fn prepare<A: Allocator>(def: &MacroDef<A>) -> Result<Prepared<'_, A>, Expan
 /// Expands `call` of `def`: the expansion, or the nested calls an eager macro needs first.
 /// Everything outside the tokens is asked of `cx` and recorded in the expansion.
 pub fn expand<A: Allocator + Clone>(
-    def: &MacroDef<A>,
+    def: &MacroDefinition<A>,
     call: &Call<'_, A>,
     cx: &impl ExpandCx,
     alloc: A,
@@ -122,7 +122,7 @@ fn proc_macro<A: Allocator + Clone>(
 /// An expansion being written: each token pushed with its origin, its context made from it.
 pub(crate) struct Out<'c, A: Allocator + Clone> {
     pub(crate) exp: Expansion<A>,
-    pub(crate) def: &'c MacroDef<A>,
+    pub(crate) def: &'c MacroDefinition<A>,
     pub(crate) call: &'c Call<'c, A>,
     pub(crate) alloc: A,
 }

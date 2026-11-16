@@ -12,22 +12,29 @@ use std::vec::Vec;
 use std::{format, vec};
 
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
+use blaze_own::Vec as OwnVec;
 use blaze_sim::Tape;
+use blaze_surface::SurfaceError;
 
 use crate::resolver::Plant;
 use crate::{
-    Answer, CrateRoot, DeclaredItem, Def, DefKind, Dep, Edition, ExternCrateDecl, ExternTarget,
-    Group, MacroCallDecl, MacroKind, MacroRulesDecl, ModDecl, ModuleDecls, ModuleInfo, ModuleScope,
-    NameAnswer, Namespace, Path, PathKind, Read, Rename, Reply, Resolved, Resolver, Saw, ScopeError,
-    ScopeFacts, Step, TextualDef, UseDecl, UseLeaf, VisDecl,
+    Answer, CallShape, ChildModDecl, CrateRootBuilder, CrateRootHead, DeclaredItem, DeclsBuilder,
+    Def, DefKind, Dep, Edition, ExternCrateDecl, ExternTarget, Group, MacroCallDecl,
+    MacroRulesDecl, ModuleInfo, NameAnswer, Namespace, Path, PathKind, Read, Rename, Reply,
+    Resolved, Resolver, Saw, ScopeBuilder, ScopeError, ScopeFacts, Step, TextualDef, UseDecl,
+    UseForm, WrittenVis,
 };
 
 mod fixtures;
 mod more;
 mod props;
+mod records;
 mod rules;
 
 pub(crate) type N = &'static str;
+
+/// A scope error as the machine makes it in the tests.
+pub(crate) type Error = ScopeError<N, Path<N, Global>>;
 
 /// A visibility as a test writes it.
 #[derive(Clone, Copy, Debug)]
@@ -40,13 +47,13 @@ pub(crate) enum V {
 }
 
 impl V {
-    fn decl(self) -> VisDecl<N, Global> {
+    fn decl(self) -> WrittenVis<Path<N, Global>> {
         match self {
-            V::Priv => VisDecl::Private,
-            V::Pub => VisDecl::Public,
-            V::Crate => VisDecl::Crate,
-            V::Super => VisDecl::Super,
-            V::In(p) => VisDecl::In(path(p)),
+            V::Priv => WrittenVis::Private,
+            V::Pub => WrittenVis::Pub,
+            V::Crate => WrittenVis::Crate,
+            V::Super => WrittenVis::Super,
+            V::In(p) => WrittenVis::In(path(p)),
         }
     }
 }
@@ -57,7 +64,7 @@ pub(crate) fn path(text: &'static str) -> Path<N, Global> {
         Some(rest) => (true, rest),
         None => (false, text),
     };
-    let mut segments: Vec<N> = rest.split("::").filter(|s| !s.is_empty()).collect();
+    let mut segments = OwnVec::from_iter_in(rest.split("::").filter(|s| !s.is_empty()), Global);
     if abs {
         return Path { kind: PathKind::Abs, segments };
     }
@@ -84,8 +91,8 @@ pub(crate) fn path(text: &'static str) -> Path<N, Global> {
 pub(crate) struct World {
     pub(crate) modules: BTreeMap<ItemKey, ModuleInfo<N>>,
     /// The module text of each module, and the expansion of each call.
-    pub(crate) decls: BTreeMap<ItemKey, ModuleDecls<N, Global>>,
-    pub(crate) roots: BTreeMap<CrateItemKey, CrateRoot<N, Global>>,
+    pub(crate) decls: BTreeMap<ItemKey, DeclsBuilder<N, Global>>,
+    pub(crate) roots: BTreeMap<CrateItemKey, CrateRootBuilder<N, Global>>,
     /// Each call's module.
     pub(crate) owner: BTreeMap<ItemKey, ItemKey>,
     pub(crate) pos: BTreeMap<ItemKey, u32>,
@@ -131,7 +138,7 @@ impl World {
         at.crate_prefix()[0]
     }
 
-    fn d(&mut self, at: ItemKey) -> &mut ModuleDecls<N, Global> {
+    fn d(&mut self, at: ItemKey) -> &mut DeclsBuilder<N, Global> {
         self.decls.get_mut(&at).expect("a test writes into a module or a call it made")
     }
 
@@ -146,29 +153,24 @@ impl World {
         let root = self.key(k);
         let krate = crate_key(k);
         self.modules.insert(root, ModuleInfo { krate, parent: None, name: None, no_implicit_prelude: false });
-        self.decls.insert(root, ModuleDecls::new_in(Global));
-        self.roots.insert(
+        self.decls.insert(root, DeclsBuilder::new_in(Global));
+        let head = CrateRootHead {
             krate,
-            CrateRoot {
-                krate,
-                root,
-                edition,
-                no_std: false,
-                no_core: false,
-                extern_prelude: Vec::new(),
-                deps: Vec::new(),
-                macro_use: Vec::new(),
-                prelude: None,
-                macro_exports: Vec::new(),
-                tools: Vec::new(),
-                builtin_attrs: std::vec!["derive", "inline", "test"],
-            },
-        );
+            root_module: root,
+            root_file: ContentId([k; 32]),
+            edition,
+            no_std: false,
+            no_core: false,
+            prelude: None,
+        };
+        let mut cr = CrateRootBuilder::new_in(head, Global);
+        cr.builtin_attrs.extend_from_slice(&["derive", "inline", "test"]);
+        self.roots.insert(krate, cr);
         root
     }
 
     /// The crate-root record of the crate `root` is the root of.
-    pub(crate) fn cr(&mut self, root: ItemKey) -> &mut CrateRoot<N, Global> {
+    pub(crate) fn cr(&mut self, root: ItemKey) -> &mut CrateRootBuilder<N, Global> {
         let krate = self.modules[&root].krate;
         self.roots.get_mut(&krate).expect("a crate made by `root`")
     }
@@ -198,9 +200,9 @@ impl World {
         let krate = self.modules[&parent].krate;
         let module = self.key(World::krate_byte(at));
         self.modules.insert(module, ModuleInfo { krate, parent: Some(parent), name: Some(name), no_implicit_prelude });
-        self.decls.insert(module, ModuleDecls::new_in(Global));
+        self.decls.insert(module, DeclsBuilder::new_in(Global));
         let pos = self.next_pos(at);
-        self.d(at).mods.push(ModDecl { name, module, vis: vis.decl(), macro_use, pos });
+        self.d(at).mods.push(ChildModDecl { name, module, vis: vis.decl(), macro_use, pos });
         module
     }
 
@@ -216,18 +218,18 @@ impl World {
     }
 
     pub(crate) fn use_(&mut self, at: ItemKey, p: &'static str, vis: V) {
-        self.use_leaf(at, p, UseLeaf::Named { rename: Rename::Same, types_only: false }, vis);
+        self.use_leaf(at, p, UseForm::Named { rename: Rename::Same, types_only: false }, vis);
     }
 
     pub(crate) fn use_as(&mut self, at: ItemKey, p: &'static str, to: N, vis: V) {
-        self.use_leaf(at, p, UseLeaf::Named { rename: Rename::To(to), types_only: false }, vis);
+        self.use_leaf(at, p, UseForm::Named { rename: Rename::To(to), types_only: false }, vis);
     }
 
     pub(crate) fn glob(&mut self, at: ItemKey, p: &'static str, vis: V) {
-        self.use_leaf(at, p, UseLeaf::Glob, vis);
+        self.use_leaf(at, p, UseForm::Glob, vis);
     }
 
-    fn use_leaf(&mut self, at: ItemKey, p: &'static str, leaf: UseLeaf<N>, vis: V) {
+    fn use_leaf(&mut self, at: ItemKey, p: &'static str, leaf: UseForm<N>, vis: V) {
         let pos = self.next_pos(at);
         self.d(at).uses.push(UseDecl { path: path(p), leaf, vis: vis.decl(), pos });
     }
@@ -251,29 +253,29 @@ impl World {
 
     /// `use p as _;`.
     pub(crate) fn use_anon(&mut self, at: ItemKey, p: &'static str) {
-        self.use_leaf(at, p, UseLeaf::Named { rename: Rename::Underscore, types_only: false }, V::Priv);
+        self.use_leaf(at, p, UseForm::Named { rename: Rename::Underscore, types_only: false }, V::Priv);
     }
 
     /// A macro call; its expansion is empty until the test writes into it (at its key).
-    pub(crate) fn call(&mut self, at: ItemKey, p: &'static str, kind: MacroKind) -> ItemKey {
+    pub(crate) fn call(&mut self, at: ItemKey, p: &'static str, kind: CallShape) -> ItemKey {
         self.call_on(at, p, kind, None)
     }
 
     /// A derive macro `name` with `helpers`, at the root of crate `root`.
     pub(crate) fn derive_macro(&mut self, root: ItemKey, name: N, helpers: &[N]) -> ItemKey {
-        let def = self.item(root, name, Namespace::Macros, DefKind::Macro(MacroKind::Derive), V::Pub);
+        let def = self.item(root, name, Namespace::Macros, DefKind::Macro(CallShape::Derive), V::Pub);
         self.helpers.insert(def, helpers.to_vec());
         def
     }
 
     /// An attribute or a derive on item `item` of its fragment.
-    pub(crate) fn call_on(&mut self, at: ItemKey, p: &'static str, kind: MacroKind, item: Option<u32>) -> ItemKey {
+    pub(crate) fn call_on(&mut self, at: ItemKey, p: &'static str, kind: CallShape, item: Option<u32>) -> ItemKey {
         let call = self.key(World::krate_byte(at));
         let pos = self.next_pos(at);
         self.d(at).calls.push(MacroCallDecl { call, path: path(p), kind, pos, item });
         let module = self.module_of(at);
         self.owner.insert(call, module);
-        self.decls.insert(call, ModuleDecls::new_in(Global));
+        self.decls.insert(call, DeclsBuilder::new_in(Global));
         call
     }
 }
@@ -282,26 +284,30 @@ impl ScopeFacts for World {
     type Name = N;
     type Alloc = Global;
 
-    fn module(&self, module: ItemKey) -> Option<ModuleInfo<N>> {
-        self.modules.get(&module).copied()
+    fn module(&self, module: ItemKey) -> Result<ModuleInfo<N>, SurfaceError> {
+        self.modules.get(&module).copied().ok_or(SurfaceError::NoRecord { fact: "ModuleDecls", item: module })
     }
 
-    fn decls(&self, module: ItemKey) -> Option<&ModuleDecls<N, Global>> {
+    fn decls(&self, module: ItemKey) -> Result<DeclsBuilder<N, Global>, SurfaceError> {
+        let missing = SurfaceError::NoRecord { fact: "ModuleDecls", item: module };
         if self.owner.contains_key(&module) {
-            return None;
+            return Err(missing);
         }
-        self.decls.get(&module)
+        self.decls.get(&module).cloned().ok_or(missing)
     }
 
-    fn crate_root(&self, krate: CrateItemKey) -> Option<&CrateRoot<N, Global>> {
-        self.roots.get(&krate)
+    fn crate_root(&self, krate: CrateItemKey) -> Result<CrateRootBuilder<N, Global>, SurfaceError> {
+        self.roots.get(&krate).cloned().ok_or(SurfaceError::NoCrateRecord { fact: "CrateRoot", krate })
     }
 
-    fn expansion(&self, call: ItemKey) -> Option<&ModuleDecls<N, Global>> {
+    fn expansion(&self, call: ItemKey) -> Result<Option<DeclsBuilder<N, Global>>, SurfaceError> {
         if !self.expanded.borrow().contains(&call) {
-            return None;
+            return Ok(None);
         }
-        self.decls.get(&call)
+        match self.decls.get(&call) {
+            Some(d) => Ok(Some(d.clone())),
+            None => Err(SurfaceError::NoRecord { fact: "Expansion", item: call }),
+        }
     }
 }
 
@@ -361,12 +367,12 @@ pub(crate) fn answer(
     done: &BTreeMap<ItemKey, Resolved<N, Global>>,
     read: Read<N>,
 ) -> Result<Own, ItemKey> {
-    fn of(done: &BTreeMap<ItemKey, Resolved<N, Global>>, m: ItemKey) -> Result<&ModuleScope<N, Global>, ItemKey> {
+    fn of(done: &BTreeMap<ItemKey, Resolved<N, Global>>, m: ItemKey) -> Result<&ScopeBuilder<N, Global>, ItemKey> {
         done.get(&m).map(|r| &r.scope).ok_or(m)
     }
     let scope = move |m: ItemKey| of(done, m);
     Ok(match read {
-        Read::Name { module, ns, name } => Own::Name(scope(module)?.answer(ns, name)),
+        Read::Name { module, ns, name } => Own::Name(NameAnswer::from(scope(module)?.get(ns, name).copied())),
         Read::Exports { module, class } => {
             let v: Vec<_> = scope(module)?.exports(class).collect();
             let d = digest(1, &v);
@@ -416,7 +422,7 @@ enum Out {
     Done(Vec<Resolved<N, Global>>),
 }
 
-fn step(m: &mut Machine, w: &World, replies: &[Reply<'_, N>]) -> Result<Out, String> {
+fn step<F: ScopeFacts<Name = N>>(m: &mut Machine, w: &F, replies: &[Reply<'_, N>]) -> Result<Out, String> {
     let shown = |e: crate::ResolveError| format!("{e}");
     Ok(match m {
         Machine::One(r) => match r.step(w, replies).map_err(shown)? {
@@ -440,7 +446,7 @@ pub(crate) struct Solved {
 }
 
 impl Solved {
-    pub(crate) fn scope(&self, m: ItemKey) -> &ModuleScope<N, Global> {
+    pub(crate) fn scope(&self, m: ItemKey) -> &ScopeBuilder<N, Global> {
         &self.by[&m].scope
     }
 
@@ -448,12 +454,12 @@ impl Solved {
         self.scope(m).get(ns, name).map(|b| b.def.key)
     }
 
-    pub(crate) fn errors(&self, m: ItemKey) -> &[ScopeError<N, Global>] {
+    pub(crate) fn errors(&self, m: ItemKey) -> &[Error] {
         &self.scope(m).errors
     }
 }
 
-fn new_frame(w: &World, module: ItemKey, plant: Plant) -> Result<Frame, String> {
+fn new_frame<F: ScopeFacts<Name = N>>(w: &F, module: ItemKey, plant: Plant) -> Result<Frame, String> {
     let mut r = Resolver::new_in(module, w, Global).map_err(|e| format!("{e}"))?;
     r.set_plant(plant);
     Ok(Frame { m: Machine::One(r), asks: Vec::new() })
@@ -463,6 +469,17 @@ fn new_frame(w: &World, module: ItemKey, plant: Plant) -> Result<Frame, String> 
 /// on a stack, `InProgress` for one on it, a group of the frames of a cycle. With a tape, the
 /// modules start in a drawn order and each step gets a drawn, shuffled part of its answers.
 pub(crate) fn solve(w: &World, tape: Option<&Tape>, plant: Plant) -> Result<Solved, String> {
+    solve_with(w, w, tape, plant)
+}
+
+/// [`solve`], the machines reading their facts from `facts` (the world's records, say) and
+/// the driver answering reads from `w`'s finished scopes as before.
+pub(crate) fn solve_with<F: ScopeFacts<Name = N>>(
+    w: &World,
+    facts: &F,
+    tape: Option<&Tape>,
+    plant: Plant,
+) -> Result<Solved, String> {
     w.expanded.borrow_mut().clear();
     let mut order: Vec<ItemKey> = w.modules.keys().copied().collect();
     if let Some(t) = tape {
@@ -480,7 +497,7 @@ pub(crate) fn solve(w: &World, tape: Option<&Tape>, plant: Plant) -> Result<Solv
             if next == order.len() {
                 break;
             }
-            stack.push(new_frame(w, order[next], plant)?);
+            stack.push(new_frame(facts, order[next], plant)?);
         }
         steps += 1;
         if steps > 100_000 {
@@ -542,7 +559,8 @@ pub(crate) fn solve(w: &World, tape: Option<&Tape>, plant: Plant) -> Result<Solv
                         Machine::Many(g) => members.extend(g.into_members()),
                     }
                 }
-                let g = Group::new_in(members, Global).map_err(|e| format!("{e}"))?;
+                let g = Group::new_in(OwnVec::from_iter_in(members, Global), Global)
+                    .map_err(|e| format!("{e}"))?;
                 stack.push(Frame { m: Machine::Many(g), asks: Vec::new() });
             }
             Out::Done(all) => {

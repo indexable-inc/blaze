@@ -45,6 +45,9 @@ impl Failed {
 }
 
 const TAGS: u64 = 1 << 40;
+/// The native driver's file threads (kqueue's; io_uring runs a stamper a core whatever this
+/// says), and so the stamp batches a sweep spreads over ([`blaze_solo::run::stamp_batch`]).
+const FILE_THREADS: u32 = 4;
 const LOCK_TAG: Tag = Tag(1);
 
 fn main() -> ExitCode {
@@ -90,7 +93,7 @@ fn run() -> Result<String, Failed> {
     let mine = state.join("solo").join(&id[..16]);
     std::fs::create_dir_all(&mine).map_err(|e| Failed::new(mine.display(), "the checkout's state directory can be made", e))?;
 
-    let mut driver = blaze_core::native(Path::new("/"), 4)
+    let mut driver = blaze_core::native(Path::new("/"), FILE_THREADS as usize)
         .map_err(|e| Failed::new("the native driver", "the platform's driver starts", e))?;
     // One writer a store (blaze-cas): held for the whole command, never waited for.
     let lock = name(&state.join("store.lock"))?;
@@ -115,6 +118,7 @@ fn run() -> Result<String, Failed> {
         ask: Ask::Changed,
         codes: codes(),
         tags: TAGS,
+        lanes: FILE_THREADS,
     };
     let mut effects = Vec::new();
     let mut command = Command::start(config, driver.wall_ns(), driver.now(), &mut effects)

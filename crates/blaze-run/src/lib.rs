@@ -10,8 +10,8 @@
 //! | module | machine | lives in |
 //! |---|---|---|
 //! | [`parent`] | [`parent::Parent`]: the start, a program's needs, single flight, speculation | the `blaze run` process, alive exactly as long as the program |
-//! | [`slots`] | [`slots::Slots`]: one word a function (stub, fast, optimized), publish, retirement by per-thread epochs | the program's control thread |
-//! | [`heat`] | [`heat::Heat`]: a counter a slot, charged by fast code; past a bound a function is hot, once | the program's control thread |
+//! | [`slots`] | [`slots::Slots`]: two words a function (the slot word callers jump through, the body word stubs jump through), publish, observe and plain, retirement by per-thread epochs | the program's control thread |
+//! | [`heat`] | [`heat::Heat`]: a count stub's "bound reached" for a slot; a function is hot once | the program's control thread |
 //! | [`tier`] | [`tier::Tier`]: hot functions optimized across functions; the record valid while every inlined callee is | the parent |
 //! | [`registry`] | [`registry::Registry`]: the directory of live runs; [`registry::RunEvent`], the stream a viewer reads | the parent |
 //! | [`events`] | a flush of [`registry::RunEvent`]s as one blaze-format batch in columns | the parent's driver |
@@ -112,35 +112,36 @@ impl Nanos {
     }
 }
 
-/// The tier a function's code is at.
+/// The tier a function's code is at. Neither holds any instrumentation: what is observed is a
+/// stub in front of the code ([`Watch`]), so a function's code bytes are the same whatever is.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Tier {
-    /// The first code: one body, calls through slot words, a heat counter in its prologue.
+    /// The first code: one body, calls through slot words. Counted by a count stub until hot.
     Fast,
-    /// Optimized across functions: callees inlined, no counter.
+    /// Optimized across functions: callees inlined.
     Optimized,
 }
 
-/// The hooks compiled into one version of a function (bottom.md, "Decide at run time"): each
-/// bit a hook, none the plain version. A version with hooks is its own code record, made once
-/// and shared; the plain version tests no flag, so a hook that is off costs nothing.
+/// The hooks a viewer turns on (bottom.md, "Decide at run time"). Each is a hook stub in front
+/// of the function's code, never code compiled into it: the stub runs the hook at the call, then
+/// jumps through the body word. What a stub cannot see (each block entered, extra checks inside
+/// the body) changes the code and so is not a hook: it is another program, keyed as such.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Hooks(pub u16);
 
 impl Hooks {
     pub const NONE: Hooks = Hooks(0);
-    /// Each call and return, with its arguments, to the run's event stream.
+    /// Each call and return, with its argument registers, to the run's event stream (the
+    /// return through a trampoline the stub puts in the return address).
     pub const TRACE: Hooks = Hooks(1 << 0);
-    /// Each effect the function makes (a write, a syscall), logged for one task or crate.
-    pub const EFFECTS: Hooks = Hooks(1 << 1);
-    /// Exact call counts and times, not heat's sampled ones.
-    pub const COUNTS: Hooks = Hooks(1 << 2);
+    /// Exact call counts and times.
+    pub const COUNTS: Hooks = Hooks(1 << 1);
     /// A breakpoint: the calling thread parks with its stack for the viewer.
-    pub const BREAK: Hooks = Hooks(1 << 3);
-    /// Coverage: each block entered, marked.
-    pub const COVERAGE: Hooks = Hooks(1 << 4);
-    /// Extra checks: overflow, bounds, contracts, on the function one suspects.
-    pub const CHECKS: Hooks = Hooks(1 << 5);
+    pub const BREAK: Hooks = Hooks(1 << 2);
+    /// One call in N recorded with its stack.
+    pub const SAMPLE: Hooks = Hooks(1 << 3);
+    /// Every hook there is: a viewer's request naming another bit is refused.
+    pub const ALL: Hooks = Hooks(0b1111);
 
     pub const fn is_none(self) -> bool {
         self.0 == 0
@@ -155,21 +156,43 @@ impl Hooks {
     }
 }
 
-/// One version of one slot's function: what a slot's word can hold. The plain version has no
-/// hooks; its tier is whichever is made best (fast, then optimized).
+/// What a slot's stub does before it jumps through the body word: the viewer's [`Hooks`] in the
+/// low bits, and the run's own two observers. None is the plain state, where the slot word names
+/// the body itself and a call pays nothing.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct Version {
-    pub slot: SlotId,
-    pub hooks: Hooks,
+pub struct Watch(pub u16);
+
+impl Watch {
+    pub const NONE: Watch = Watch(0);
+    /// The count stub: a per-function counter in a data table, counted down from heat's bound;
+    /// at zero its runtime call queues the slot ([`heat::Heat::reached`]).
+    pub const HEAT: Watch = Watch(1 << 14);
+    /// The mark stub: one byte a slot in the calling thread's bitmap, while a test runs.
+    pub const MARK: Watch = Watch(1 << 15);
+
+    pub const fn hooks(hooks: Hooks) -> Watch {
+        Watch(hooks.0)
+    }
+
+    pub const fn is_none(self) -> bool {
+        self.0 == 0
+    }
+
+    /// This watch with `other` turned on or off.
+    pub const fn with(self, other: Watch, on: bool) -> Watch {
+        match on {
+            true => Watch(self.0 | other.0),
+            false => Watch(self.0 & !other.0),
+        }
+    }
 }
 
-/// A code record's key: the function, its tier and the hooks in it. Becomes the key of
-/// blaze-keyed's `CodeRecord` with the hooks in its template.
+/// A code record's key: the function and its tier, nothing about what is observed. Becomes the
+/// key of blaze-keyed's `CodeRecord`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct VersionKey {
+pub struct CodeKey {
     pub function: InstanceKey,
     pub tier: Tier,
-    pub hooks: Hooks,
 }
 
 /// A record some compile lacks, by its key (a callee's signature, a plan, a layout). Becomes
@@ -259,8 +282,8 @@ pub(crate) enum Plant {
     StalePostings,
     /// [`parent::Parent`] enters a compile again once the first of the records it lacked is made.
     ReenterEarly,
-    /// [`parent::Parent`] leaves the hooked version in a slot whose hooks were all turned off.
+    /// [`parent::Parent`] leaves a slot's hooks on when the viewer turned them all off.
     OffKeepsHooks,
-    /// [`parent::Parent`] keys hooked versions by their hooks alone, forgetting the function.
-    VersionsByHooks,
+    /// [`slots::Slots`] stores the new body in the slot word whatever it held, over a stub.
+    PublishOverStub,
 }

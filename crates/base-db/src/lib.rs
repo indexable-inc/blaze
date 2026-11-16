@@ -174,3 +174,20 @@ pub fn env_var<'db>(db: &'db Db, krate: Crate, name: &str) -> Option<&'db str> {
 pub fn macro_env(db: &Db, krate: Crate) -> &Env {
     krate.env(db)
 }
+
+/// The files of `krate`'s command-line crate attributes (rustc's `-Z crate-attr`) that rustc
+/// applies after the root's own inner attributes. The task's file table has no file per
+/// attribute: empty for a crate without any, and for one with some a typed stop naming its
+/// root module, never a crate read as if it had none (the blaze edition and the extensions are
+/// inputs of their own, [`Crate::blaze_edition`] and [`Crate::extensions`]).
+pub fn applied_crate_attr_files(db: &Db, krate: Crate) -> &'static [EditionedFileId] {
+    if krate.data(db).crate_attrs.is_empty() {
+        return &[];
+    }
+    let item = blaze_surface::Items::crate_root(db.items(), krate.key(db)).or_need().head().root_module;
+    Err(SurfaceError::NotBuilt(blaze_surface::NotBuilt {
+        method: "the files of a crate's command-line crate attributes",
+        item,
+    }))
+    .or_need()
+}

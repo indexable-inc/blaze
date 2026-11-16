@@ -21,7 +21,7 @@ const T: Namespace = Namespace::Types;
 const VAL: Namespace = Namespace::Values;
 const MAC: Namespace = Namespace::Macros;
 
-fn import_error(errors: &[ScopeError<N, std::alloc::Global>]) -> Option<(u32, Unresolved)> {
+fn import_error(errors: &[super::Error]) -> Option<(u32, Unresolved)> {
     errors.iter().find_map(|e| match e {
         ScopeError::Import { segment, why, .. } => Some((*segment, *why)),
         _ => None,

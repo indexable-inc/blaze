@@ -449,40 +449,36 @@ fn trait_item_visibility(db: &Db, container: ItemContainerId) -> Option<Visibili
     }
 }
 
-/// The visibility written on `item`, an item of the impl `container`, resolved for
-/// `has_resolver` (the item), where its crate's image holds it
-/// (`deps::signatures::served_impl_visibilities`): no file of the crate is read. `None` for
-/// an item of a trait, or of a crate read from no image's pages.
-///
-/// # Panics
-///
-/// Where the image holds the impl's visibilities and `item` is not among the impl's items: the
-/// two are one record ([`crate::deps::signatures::AssocRecord`]), so that is a corrupt image.
+/// The visibility of `item`, an item of the impl `container`, where its text is not the
+/// task's: no record holds an impl item's visibility yet (reconnect.md, "What the new-layer
+/// crates lack": a Signature record), so that is a typed stop. `None` for an item of a trait,
+/// or of the crate whose text the task holds (its written visibility is read).
 fn served_impl_item_visibility(
     db: &Db,
-    has_resolver: impl HasResolver + HasModule,
+    _has_resolver: impl HasResolver + HasModule,
     container: ItemContainerId,
     item: AssocItemId,
 ) -> Option<Visibility> {
     let ItemContainerId::ImplId(impl_) = container else { return None };
-    let visibilities = crate::deps::signatures::served_impl_visibilities(db, impl_).as_ref()?;
-    let items = &crate::nameres::assoc::ImplItems::of(db, impl_).0.items;
-    let Some(at) = items.iter().position(|&(_, it)| it == item) else {
-        panic!(
-            "the image of crate {} is corrupt: {item:?} is not among the items its record holds \
-             of {impl_:?}, which hold its visibility",
-            impl_.lookup(db).container.krate(db).named(db)
-        )
+    let krate = impl_.lookup(db).container.krate(db);
+    if db.source_of(krate.key(db)).is_some() {
+        return None;
+    }
+    use crate::key::FromKey;
+    let key = match item {
+        AssocItemId::FunctionId(it) => it.key(db),
+        AssocItemId::ConstId(it) => it.key(db),
+        AssocItemId::TypeAliasId(it) => it.key(db),
     };
-    Some(resolve_raw(db, has_resolver, &visibilities[at]))
+    base_db::OrNeed::or_need(Err(base_db::SurfaceError::NotBuilt(blaze_surface::NotBuilt {
+        method: "the visibility of an impl item of a crate the task has no text of",
+        item: key,
+    })))
 }
 
+/// A trait's visibility: its binding's in its module's scope record, for every crate.
 fn trait_visibility(db: &Db, def: TraitId) -> Visibility {
-    // Of a crate read from an image's pages, the visibility its record holds.
-    if let Some(raw) = crate::deps::signatures::served_trait_visibility(db, def) {
-        return resolve_raw(db, def, raw);
-    }
-    written_visibility(db, def, def.lookup(db).id)
+    crate::nameres::declared_visibility(db, def.key(db), blaze_surface::Namespace::Types)
 }
 
 #[cfg(test)]

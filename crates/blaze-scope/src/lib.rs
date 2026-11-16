@@ -1,7 +1,8 @@
 //! Name resolution of the item layer, one module at a time (docs/v2/plan/design/bottom.md,
 //! "Name resolution without resolving a crate").
 //!
-//! A [`Resolver`] computes one module's [`ModuleScope`] from its own records, read through
+//! A [`Resolver`] computes one module's scope (a [`ScopeBuilder`], blaze-surface's working form
+//! of the `ModuleScope` record, which [`ScopeBuilder::write`] writes) from its own records, read through
 //! [`ScopeFacts`] (its declarations, its place, its crate's root record, the expansions of its
 //! macro calls), and from reads of other modules' scopes, which it never computes: it asks
 //! for them and takes their answers. The result is the scope and the [`ReadList`] of exactly
@@ -28,6 +29,10 @@
 //! `macro_rules!` textual order with `#[macro_use]` modules, the extern, `#[macro_use]` and
 //! standard preludes as the outer layers, and the final pass's ambiguity kinds.
 //!
+//! [`RecordFacts`] reads the facts from the records an `Items` holds; the words the machine
+//! speaks (namespaces, definitions, bindings, visibilities, paths) and the working forms are
+//! blaze-surface's, re-exported here, and none is defined twice.
+//!
 //! The machine is sans-IO and allocates only in the allocator it is given. Every loop is
 //! bounded ([`MAX_MODULE_DEPTH`], [`MAX_EXPANSIONS`], [`RECURSION_LIMIT`], and a pass bound
 //! from the module's own work); a user-code error is a [`ScopeError`] in the scope, and the
@@ -38,7 +43,6 @@
 // `#![blaze::sans_io]` in each sans-IO module; inert under rustc.
 #![register_tool(blaze)]
 
-extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
@@ -54,17 +58,19 @@ mod scope;
 #[cfg(test)]
 mod tests;
 
-pub use error::{Record, ResolveError};
-pub use facts::{
-    CrateRoot, DeclaredItem, Dep, Edition, ExpandedDecls, ExternCrateDecl, ExternTarget,
-    MacroCallDecl, MacroRulesDecl, ModDecl, ModuleDecls, ModuleInfo, Name, Path, PathKind,
-    Rename, ScopeFacts, UseDecl, UseLeaf, VisDecl,
-};
+pub use error::ResolveError;
+pub use facts::{Name, RecordFacts, ScopeFacts};
 pub use group::Group;
 pub use read::{Answer, ExpandRequest, NameAnswer, Read, Reply, Step};
 pub use resolver::{MAX_EXPANSIONS, MAX_MODULE_DEPTH, RECURSION_LIMIT, Resolver};
-pub use scope::{
-    AmbiguityKind, AnonImport, Binding, BindingState, Def, DefKind, ExportEntry, MacroKind, ModuleScope,
-    Namespace, Origin, ReadEntry, ReadList, Resolved, Saw, ScopeEntry, ScopeError, Site,
-    TextualDef, TextualMark, Unresolved, UseSite, Visibility, VisibilityClass,
+pub use scope::{ReadEntry, ReadList, Resolved, Saw};
+
+// The item layer's words and working forms, from their one home.
+pub use blaze_surface::{
+    AmbiguityKind, AnonImport, Binding, BindingState, CallShape, ChildModDecl, CrateRootBuilder,
+    CrateRootHead, DeclaredItem, DeclsBuilder, Def, DefKind, Dep, Edition, ExpandedDecls,
+    ExportEntry, ExternCrateDecl, ExternTarget, MacroCallDecl, MacroRulesDecl, ModuleInfo,
+    Namespace, Origin, Path, PathKind, Rename, ScopeBuilder, ScopeEntry, ScopeError, Site,
+    TextualDef, TextualMark, Unresolved, UseDecl, UseForm, UseSite, Visibility, VisibilityClass,
+    WrittenVis,
 };

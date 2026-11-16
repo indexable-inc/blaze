@@ -23,7 +23,7 @@
 //!   4 MiB (the old one retired). A manifest: 0..4 `BLPM`, 4..8 format, 8..16 generation,
 //!   16..20 segments `s`, 20..24 retired `r`, 24..28 roots `t`, 28..32 zero; `s` rows of 80
 //!   (32 digest, 8 file length, 8 index offset, 4 entries, 4 flags: bit 0 held here, bit 1
-//!   published; 8 namespace, 8 generation added, 8 boot written or checked); `r` rows of 24
+//!   published, bit 2 sealed; 8 namespace, 8 generation added, 8 boot written or checked); `r` rows of 24
 //!   (8 id, 4 one for a log, 4 zero, 8 retired at, wall ns); `t` roots (32 key, 8 generation,
 //!   2 name length, name, zeros to 8). A segment's id is the first 8 bytes of its digest.
 //! - `seg-<id:016x>`, written once, never changed, and the wire format of the shared cache as
@@ -71,7 +71,9 @@
 //! slot's generation; and every segment records the boot it was written in. Bytes are verified
 //! once, and the type carries the fact (`verified::Verified`, decision 18): a segment of this
 //! boot is proved by its row (written, checked or fetched in this boot: the page cache holds
-//! it, a process crash loses none of it); a segment of an earlier boot is checked in full
+//! it, a process crash loses none of it); a segment of an earlier boot whose row is sealed is
+//! proved by the row too ([`Driven::seal`], the exit tail: a barrier ordered its bytes before
+//! the flip that sealed it); an unsealed segment of an earlier boot is checked in full
 //! (length, layout, digest) once, at the first open of the new boot, and the check is recorded
 //! by a flip, so no process of that boot repeats it; a fetched segment's statement and digest
 //! are checked once, at the fetch. A segment that fails is dropped and reported by name with
@@ -84,16 +86,17 @@
 //!
 //! # Reads
 //!
-//! Each segment is mapped once per process, never unmapped during a run, and its index
-//! touched a page at a time once mapped. A lookup names the namespaces it asks, in order
+//! Each segment is mapped once per process and never unmapped during a run; no page of it is
+//! touched at the open (store-next.md: a repeat reads the pages its lookups probe). A lookup names the namespaces it asks, in order
 //! (this machine's, the organisation's, the public one: [`Settings::reads`]), and searches no
 //! other; within each it probes the index of each segment, newest first, with no lock and no
 //! write to anything shared ([`PlainStore`], blaze-keyed's `Store`): up to three
-//! interpolation steps on the key's first 8 bytes, then bisection. [`Driven::get`] returns
-//! the payload in place (the mapping); [`Driven::get_into`] reads it with one `pread` into
-//! the caller's buffer. Per lookup: 0 syscalls and 0 faults for the index (touched), plus
-//! for `get_into` one `pread`, for `get` the payload's pages faulted on first touch; no
-//! checksum of any kind.
+//! interpolation steps on the key's first 8 bytes between bounds the probes narrow (no read
+//! of the run's ends), then bisection. [`Driven::get`] returns the payload in place (the
+//! mapping); [`Driven::get_into`] reads it with one `pread` into the caller's buffer. Per
+//! lookup: 0 syscalls; a fault for each index page a probe lands on first (one or two a
+//! segment, from the page cache when warm), plus for `get_into` one `pread`, for `get` the
+//! payload's pages faulted on first touch; no checksum of any kind.
 //!
 //! # Compaction ([`Driven::compact`])
 //!
@@ -125,6 +128,7 @@ mod core;
 mod driven;
 mod format;
 mod handle;
+mod image;
 mod verified;
 
 #[cfg(test)]
@@ -137,6 +141,7 @@ pub use self::core::{
 pub use self::driven::{Driven, LocalDir, Opened, lower_this_thread};
 pub use self::format::{Described, Entry, FORMAT, SEGMENT_FORMAT, Segment, check_segment, describe, record_crc, seal_segment};
 pub use self::handle::PlainStore;
+pub use self::image::{IMAGE_TAG, ImageError, Placement, StartupImage};
 pub use self::settings::{Form, Settings};
 pub use self::verified::{Checks, Proof};
 // The vocabulary is blaze-keyed's (rule 30): re-exported where the remote lane looks for it.
