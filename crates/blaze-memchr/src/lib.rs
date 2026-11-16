@@ -6,11 +6,24 @@
 //! |---|---|---|---|
 //! | [`Portable`]: `core::simd`'s `Simd<u8, N>`, `simd_eq`, `to_bitmask` | 16 or 32 | 1 | the search, on every target |
 //! | [`Word`]: a `u64` (SWAR), the exact zero-byte test | 8 | 8 | the scalar twin the tests hold the vector to |
-//! | `neon::Neon`: aarch64 intrinsics, the mask by `shrn` | 16 | 4 | the reference `examples/cost.rs` measures against, until it is deleted |
 //!
 //! The portable vector is the language's own (docs/v2/plan/design/std.md, "SIMD"): one source,
 //! from which the compiler makes NEON on aarch64, SSE2 on x86-64 (where `to_bitmask` is
-//! `movemask`) and scalar code on a target with no vectors. Two and three needles are the OR of
+//! `movemask`) and scalar code on a target with no vectors; no `core::arch` path is left.
+//!
+//! What it costs (`examples/cost.rs`, release; 2026-11-15, one run, this machine: the
+//! integration Mac, aarch64): bytes per nanosecond, the needle at the last byte.
+//!
+//! | search | 16 B | 256 B | 64 KiB |
+//! |---|---|---|---|
+//! | portable, 16 lanes (the search) | 12.05 | 57.30 | 79.60 |
+//! | portable, 32 lanes | 3.24 | 49.56 | 89.49 |
+//! | NEON intrinsics (the path this replaced, deleted) | 13.83 | 60.48 | 79.53 |
+//! | word (SWAR) | 8.72 | 20.19 | 23.26 |
+//! | naive loop | 3.17 | 3.68 | 4.24 |
+//!
+//! The portable 16 lanes equal the intrinsics at 64 KiB and are within 5% at 256 B and 13% at
+//! 16 B, so the intrinsics went (one implementation). Two and three needles are the OR of
 //! the comparisons; the first hit is the mask's trailing zeros, the last its leading zeros. A
 //! search goes four vectors a step while it can, then one, then one load that ends at the
 //! haystack's end and overlaps the bytes already searched (which held no hit, so the first hit
@@ -26,12 +39,8 @@
 //! search by property.
 
 #![no_std]
-#![feature(portable_simd, register_tool, custom_inner_attributes)]
-#![register_tool(blaze)]
-#![blaze::trust(
-    unsafe,
-    reason = "the NEON reference's intrinsics: each load reads exactly one vector from a `&[u8; 16]`, and every other intrinsic is a `#[target_feature]` function of NEON, in the baseline of every aarch64 target"
-)]
+#![feature(portable_simd)]
+#![forbid(unsafe_code)]
 
 #[cfg(test)]
 extern crate std;
@@ -147,80 +156,12 @@ impl Lanes for Word {
     }
 }
 
-#[cfg(target_arch = "aarch64")]
-mod neon {
-    use core::arch::aarch64::{
-        uint8x16_t, vandq_u8, vceqq_u8, vdupq_n_u8, vget_lane_u64, vld1q_u8, vorrq_u8,
-        vreinterpret_u64_u8, vreinterpretq_u16_u8, vshrn_n_u16,
-    };
-
-    use crate::Lanes;
-
-    /// The intrinsics path the portable one replaced, kept only as the reference
-    /// `examples/cost.rs` measures against (std.md, "SIMD", rule 2).
-    #[derive(Clone, Copy)]
-    pub(crate) struct Neon(uint8x16_t);
-
-    // Every block below calls a `#[target_feature(enable = "neon")]` intrinsic, which is unsafe
-    // only for the feature: NEON is in the baseline of every aarch64 target.
-    impl Lanes for Neon {
-        type Hit = Neon;
-        const WIDTH: usize = 16;
-        const BITS: u32 = 4;
-
-        #[inline(always)]
-        fn splat(byte: u8) -> Neon {
-            // SAFETY: NEON is in every aarch64 target's baseline.
-            Neon(unsafe { vdupq_n_u8(byte) })
-        }
-
-        #[inline(always)]
-        fn load(bytes: &[u8]) -> Neon {
-            let chunk = bytes.first_chunk::<16>().expect("a load of a vector past the haystack's end");
-            // SAFETY: `chunk` is 16 readable bytes, and `vld1q_u8` reads 16 with no alignment.
-            Neon(unsafe { vld1q_u8(chunk.as_ptr()) })
-        }
-
-        #[inline(always)]
-        fn eq(self, other: Neon) -> Neon {
-            // SAFETY: NEON is in every aarch64 target's baseline.
-            Neon(unsafe { vceqq_u8(self.0, other.0) })
-        }
-
-        #[inline(always)]
-        fn or(a: Neon, b: Neon) -> Neon {
-            // SAFETY: NEON is in every aarch64 target's baseline.
-            Neon(unsafe { vorrq_u8(a.0, b.0) })
-        }
-
-        #[inline(always)]
-        fn and(a: Neon, b: Neon) -> Neon {
-            // SAFETY: NEON is in every aarch64 target's baseline.
-            Neon(unsafe { vandq_u8(a.0, b.0) })
-        }
-
-        /// Each 16-bit pair of lanes shifted right by 4 and narrowed to a byte: lane `i` (0x00
-        /// or 0xff) becomes the nibble at bits `4 * i ..`.
-        #[inline(always)]
-        fn mask(hit: Neon) -> u64 {
-            // SAFETY: NEON is in every aarch64 target's baseline.
-            let pairs = unsafe { vreinterpretq_u16_u8(hit.0) };
-            // SAFETY: NEON is in every aarch64 target's baseline.
-            let nibbles = unsafe { vshrn_n_u16::<4>(pairs) };
-            // SAFETY: NEON is in every aarch64 target's baseline.
-            let word = unsafe { vreinterpret_u64_u8(nibbles) };
-            // SAFETY: NEON is in every aarch64 target's baseline.
-            unsafe { vget_lane_u64::<0>(word) }
-        }
-    }
-}
-
-/// The search's vector: 16 lanes, one NEON or SSE2 register, until `examples/cost.rs` shows 32
-/// (two registers a step) is faster on the machines blaze is judged on.
+/// The search's vector: 16 lanes, one NEON or SSE2 register. 32 lanes measured 3.7 times slower
+/// at 16 bytes and 12% faster only at 64 KiB (the crate's table).
 type Native = Portable<16>;
 
 /// Each vector's one-needle search as a function of its own, for `examples/cost.rs` (and only
-/// it): the portable vector at both widths, the word, and the NEON reference.
+/// it): the portable vector at both widths, and the word.
 #[doc(hidden)]
 pub mod paths {
     use crate::{Portable, Word, find};
@@ -238,12 +179,6 @@ pub mod paths {
     #[inline(never)]
     pub fn word(needle: u8, haystack: &[u8]) -> Option<usize> {
         find::<Word, 1>([needle], haystack)
-    }
-
-    #[cfg(target_arch = "aarch64")]
-    #[inline(never)]
-    pub fn neon(needle: u8, haystack: &[u8]) -> Option<usize> {
-        find::<crate::neon::Neon, 1>([needle], haystack)
     }
 }
 

@@ -59,6 +59,9 @@ impl core::fmt::Display for TableFull {
 
 impl core::error::Error for TableFull {}
 
+/// Kept generic over its allocator (std.md, "One handle, not a type parameter", the kept
+/// case): the one value read by every worker thread at once, so it names a `Sync` allocator
+/// concretely; `blaze_own::Alloc` is neither `Send` nor `Sync`.
 pub struct Settled<A: Allocator> {
     words: Vec<AtomicU64, A>,
     mask: usize,

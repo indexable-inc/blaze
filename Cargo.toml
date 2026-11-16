@@ -234,11 +234,6 @@ crossbeam-queue = "0.3.14"
 parking_lot = "0.12.5"
 aho-corasick = "1.1.5"
 arrayvec = "0.7.8"
-arrow-array = { version = "60.1.0", default-features = false }
-arrow-buffer = { version = "60.1.0", default-features = false }
-arrow-ipc = { version = "60.1.0", default-features = false, features = ["zstd"] }
-arrow-schema = { version = "60.1.0", default-features = false }
-parquet = { version = "60.1.0", default-features = false, features = ["arrow", "zstd", "simdutf8"] }
 either = "1.19.0"
 expect-test = "1.5.1"
 indexmap = { version = "2.14.2", features = ["serde"] }
@@ -374,6 +369,9 @@ blaze-host = { path = "crates/blaze-host" }
 # The no-daemon leaf table and its sweep.
 blaze-solo = { path = "crates/blaze-solo" }
 blaze-lir = { path = "crates/blaze-lir" }
+blaze-build = { path = "crates/blaze-build" } # A type-checked body to LIR (crates/blaze-cli/tests/ladder/README.md).
+blaze-emit = { path = "crates/blaze-emit" } # The baseline tier: LIR to AArch64 machine code.
+blaze-ladder = { path = "crates/blaze-ladder" } # The `blaze run` walking skeleton's straight line.
 blaze-lint-defs = { path = "crates/blaze-lint-defs", version = "0.0.0" }
 blaze-radix = { path = "crates/blaze-radix" }
 blaze-record = { path = "crates/blaze-record" }
@@ -393,6 +391,7 @@ blaze-h1-net = { path = "crates/blaze-h1-net" }
 blaze-git-fetch = { path = "crates/blaze-git-fetch" }
 # blaze's own test engine and simulation kit (docs/v2/plan/design/sim.md).
 blaze-sim = { path = "crates/blaze-sim" }
+blaze-ty = { path = "crates/blaze-ty" }
 blaze-typeck = { path = "crates/blaze-typeck" }
 # blaze's own trait solver (docs/v2/plan/design/solve.md).
 blaze-solve = { path = "crates/blaze-solve" }
@@ -435,6 +434,7 @@ blaze-text = { path = "crates/blaze-text" } # Typed writers into a `Put` sink, `
 blaze-columns = { path = "crates/blaze-columns" }
 blaze-kit = { path = "crates/blaze-kit" } # Specialized collections: typed tables, inline vectors, union-find, sparse and chunked sets, heaps, a timer wheel, column codecs, static search.
 blaze-memchr = { path = "crates/blaze-memchr" } # Byte search (NEON, SSE2, SWAR), in place of memchr.
+blaze-lex = { path = "crates/blaze-lex" } # The SIMD lexer: rustc_lexer's tokens, a body skipper, UTF-8 validation.
 blaze-bitflags = { path = "crates/blaze-bitflags" } # `bitflags!`, in place of bitflags.
 # blaze's own data formats, on blaze-own and core only, in place of base64, serde_json,
 # toml/toml_edit and semver (docs/v2/plan/third-party.md).

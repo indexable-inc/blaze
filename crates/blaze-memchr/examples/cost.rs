@@ -1,7 +1,7 @@
 //! The cost of a one-needle search (std.md, "SIMD", rule 5): bytes per nanosecond at haystacks
 //! of 16, 256 and 65,536 bytes, the needle absent until the last byte (a whole scan), for the
-//! portable vector at 16 and 32 lanes, the NEON intrinsics it replaced (aarch64), the word
-//! (SWAR) and a naive loop. Each is timed over about 256 MiB of haystack, best of five rounds.
+//! portable vector at 16 and 32 lanes, the word (SWAR) and a naive loop (the NEON intrinsics it
+//! was measured against are deleted; their numbers are in the crate's doc). Each is timed over about 256 MiB of haystack, best of five rounds.
 //!
 //! A measurement tool, not a test: `cargo run --release -p blaze-memchr --example cost`.
 
@@ -40,8 +40,6 @@ fn main() {
     let mut searches: Vec<(&str, fn(u8, &[u8]) -> Option<usize>), Global> = Vec::new_in(Global);
     searches.push(("portable 16", paths::portable_16));
     searches.push(("portable 32", paths::portable_32));
-    #[cfg(target_arch = "aarch64")]
-    searches.push(("neon intrinsics", paths::neon));
     searches.push(("word (swar)", paths::word));
     searches.push(("naive loop", naive));
     println!("{:<16} {:>12} {:>12} {:>12}   (bytes per ns, needle at the last byte)", "search", "16 B", "256 B", "64 KiB");

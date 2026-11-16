@@ -31,7 +31,8 @@ impl Flags {
     pub const OPAQUE: u16 = 1 << 7;
     /// The error type, region or const.
     pub const ERROR: u16 = 1 << 8;
-    /// A region that is not bound, erased or an error.
+    /// A region that is not bound (erased and error regions too: canonicalizing an input
+    /// replaces them, as rustc's `HAS_FREE_REGIONS | HAS_RE_ERASED` says).
     pub const FREE_REGIONS: u16 = 1 << 9;
     /// A canonical variable (`kind::CANONICAL`).
     pub const CANONICAL: u16 = 1 << 10;

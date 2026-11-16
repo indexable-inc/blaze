@@ -5,16 +5,16 @@
 
 use std::{
     alloc::Global,
-    cell::RefCell,
     collections::{BTreeMap, VecDeque},
     net::{IpAddr, Ipv4Addr, SocketAddr},
-    rc::Rc,
     sync::Arc,
     time::Duration,
 };
 
 use blaze_core::{
     Address, Completion as Finished, Conn, Done, Driver, Effect, Tag, Waker,
+    // The server is locked: a simulated process's step is `Send` (`Sim::other_process`).
+    lock::Lock,
     sim::{Faults, Sim},
     wait::Deadline,
 };
@@ -519,12 +519,12 @@ fn served_run(tape: &Tape, fault: Fault) -> Result<(), Broke> {
     let Some(waker) = sim.waker() else {
         return Err(Broke::Harness("Sim::give_wakers gave no waker".to_owned()));
     };
-    let server = Rc::new_in(RefCell::new(Server::default()), Global);
+    let server = Arc::new_in(Lock::new("test.server", Server::default()), Global);
     // clone: the server, for the process that runs it
-    let running = Rc::clone(&server);
-    sim.other_process(SERVER..u64::MAX, move |_, completion, effects| running.borrow_mut().complete(completion, effects));
+    let running = Arc::clone(&server);
+    sim.other_process(SERVER..u64::MAX, move |_, completion, effects| running.lock().complete(completion, effects));
     let mut effects = Vec::new_in(Global);
-    server.borrow_mut().listen(&mut effects);
+    server.lock().listen(&mut effects);
     sim.submit(&mut effects);
     let inbox: Arc<Inbox, Global> = Arc::new_in(Inbox::new(waker), Global);
     let (to, from) = mailbox::channel::<(u64, Fetched)>(None);
@@ -581,7 +581,7 @@ fn served_run(tape: &Tape, fault: Fault) -> Result<(), Broke> {
     if sim.wakes_landed().parked > 0 {
         tape.reached("a wake landed while the loop was parked");
     }
-    let server = server.borrow();
+    let server = server.lock();
     for (i, (at, what, url)) in posted.iter().enumerate() {
         let Some((when, fetched)) = ended.get(&(i as u64)) else {
             return Err(Broke::Oracle(format!("{url}, posted at {at:?}, never ended: {LATE}")));

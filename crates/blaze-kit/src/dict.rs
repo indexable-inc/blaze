@@ -14,6 +14,12 @@
 //! falls). A push hashes once and reads one slot line, plus the value compared on a hash match
 //! (a second line); a probe past one slot is rare at that load. Growth rehashes from the kept
 //! hashes, reading no value.
+//!
+//! # Measured
+//!
+//! `examples/codec.rs` compares a push against `blaze_hash::HashMap` (the same FixedState hash,
+//! hashbrown's layout) and std's SipHash map, each building the codes and values too. Against
+//! blaze-hash's map: not yet measured.
 
 use core::{
     alloc::Allocator,

@@ -11,6 +11,11 @@
 //!
 //! `size_of::<T>()` bytes per element, nothing else. A push touches `log4 n` lines, a pop
 //! `log4 n` lines plus the root's; a binary heap touches `log2 n` for a pop, twice as many.
+//!
+//! # Measured (`examples/heaps.rs`, release, one Mac run, 2026-11-15)
+//!
+//! ns per push and pop against `std::collections::BinaryHeap`: 16.1 against 19.2 at 1e5
+//! values, 73.2 against 111.0 at 1e7.
 
 use core::{alloc::Allocator, mem::ManuallyDrop, ptr};
 

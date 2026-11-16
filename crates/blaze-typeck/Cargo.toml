@@ -22,6 +22,11 @@ blaze-own.workspace = true
 # turns on the `serde` and `shared` adapters and with them crates from outside the workspace.
 blaze-hash = { path = "../blaze-hash" }
 
+[features]
+# `blaze_typeck::toy`: the tests' type context, for the `blaze run` walking skeleton until
+# crates/blaze-ty implements `TypeCtx` (crates/blaze-cli/tests/ladder/README.md). Takes `std`.
+toy = []
+
 [dev-dependencies]
 # `check`, `control`: the properties of typeck.md, "Proof".
 blaze-sim.workspace = true

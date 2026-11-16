@@ -29,6 +29,11 @@
 //! Timers placed in the wheel fire in deadline order (a level-0 slot is one tick, so ties fire
 //! in the order they reached it). Timers inserted with a deadline at or before `elapsed` fire
 //! first, in insertion order.
+//!
+//! # Measured (`examples/heaps.rs`, release, one Mac run, 2026-11-15)
+//!
+//! ns per timer inserted and fired, at the example's three sizes: 15.2, 18.6, 62.6 against a
+//! `BinaryHeap` with a set of cancelled timers beside it: 45.8, 106.4, 126.6.
 
 use core::{alloc::Allocator, any::type_name};
 

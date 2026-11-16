@@ -390,3 +390,36 @@ impl<T, const CAP: usize> fmt::Debug for SegQueue<T, CAP> {
         f.debug_struct("SegQueue").field("len", &self.len()).finish()
     }
 }
+
+/// The values of a [`SegQueue`] taken by value, in order: what is left of it when it ends.
+pub struct IntoIter<T, const CAP: usize = 31>(SegQueue<T, CAP>);
+
+impl<T, const CAP: usize> IntoIterator for SegQueue<T, CAP> {
+    type Item = T;
+    type IntoIter = IntoIter<T, CAP>;
+
+    fn into_iter(self) -> IntoIter<T, CAP> {
+        IntoIter(self)
+    }
+}
+
+impl<T, const CAP: usize> Iterator for IntoIter<T, CAP> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        self.0.pop()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.0.len();
+        (len, Some(len))
+    }
+}
+
+impl<T, const CAP: usize> ExactSizeIterator for IntoIter<T, CAP> {}
+
+impl<T, const CAP: usize> fmt::Debug for IntoIter<T, CAP> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("IntoIter").field(&self.0).finish()
+    }
+}

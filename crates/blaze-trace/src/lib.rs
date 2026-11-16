@@ -459,27 +459,12 @@ impl<'a> Event<'a> {
         sink.event(&Event { meta, values, parent });
     }
 
-    /// Records an event of `site` in what records it: what each event macro does once the
-    /// site's state said something may.
+    /// Records an event of `site` as [`Site::how`] decided: what each event macro does.
     #[inline]
-    pub fn emit(site: &'static Site, parent: Parent, values: Values<'_>) {
-        let state = site.state();
-        // As for a span ([`Span::open`]): the thread's own sink, the rings, the entry's sink.
-        if record::by_sink(state)
-            && let Some(sink) = record::THREAD.sink.get()
-        {
-            if sink.enabled(site.metadata()) {
-                Event::dispatch(sink, site.metadata(), parent, values);
-            }
-        } else if record::by_ring(state)
-            && let Some(config) = record::config()
-        {
-            record::event(config, record::id_of(state), parent, values);
-        } else if record::by_sink(state)
-            && let Some(sink) = current()
-            && sink.enabled(site.metadata())
-        {
-            Event::dispatch(sink, site.metadata(), parent, values);
+    pub fn emit(site: &'static Site, how: record::How, parent: Parent, values: Values<'_>) {
+        match how {
+            record::How::Ring(config, id) => record::event(config, id, parent, values),
+            record::How::Sink(sink) => Event::dispatch(sink, site.metadata(), parent, values),
         }
     }
 
@@ -697,39 +682,21 @@ impl Span {
         Span { inner: Inner::None }
     }
 
-    /// Begins a span of `site` in what records it: what the span macros do once the site's
-    /// state said something may. A span with no field and no named parent writes nothing yet:
-    /// its first entry is its enter.
+    /// Begins a span of `site` as [`Site::how`] decided: what the span macros do. A ring span
+    /// with no field and no named parent writes nothing yet: its first entry is its enter.
     #[inline]
-    pub fn open(site: &'static Site, parent: Parent, values: Values<'_>) -> Span {
-        let state = site.state();
-        // A thread's own sink comes first (a test's, a simulation's), then the rings, then the
-        // entry's sink.
-        if record::by_sink(state)
-            && let Some(sink) = record::THREAD.sink.get()
-        {
-            return match sink.enabled(site.metadata()) {
-                true => Span::new(sink, site.metadata(), parent, values),
-                false => Span::none(),
-            };
+    pub fn open(site: &'static Site, how: record::How, parent: Parent, values: Values<'_>) -> Span {
+        match how {
+            record::How::Ring(config, id) => {
+                let span = if parent == Parent::Current && values.iter().all(Option::is_none) {
+                    0
+                } else {
+                    record::open(config, id, parent, values)
+                };
+                Span { inner: Inner::Ring { site, span: AtomicU64::new(span) } }
+            }
+            record::How::Sink(sink) => Span::new(sink, site.metadata(), parent, values),
         }
-        if record::by_ring(state)
-            && let Some(config) = record::config()
-        {
-            let span = if parent == Parent::Current && values.iter().all(Option::is_none) {
-                0
-            } else {
-                record::open(config, record::id_of(state), parent, values)
-            };
-            return Span { inner: Inner::Ring { site, span: AtomicU64::new(span) } };
-        }
-        if record::by_sink(state)
-            && let Some(sink) = current()
-            && sink.enabled(site.metadata())
-        {
-            return Span::new(sink, site.metadata(), parent, values);
-        }
-        Span::none()
     }
 
     /// Begins a span of `meta` in `sink`.

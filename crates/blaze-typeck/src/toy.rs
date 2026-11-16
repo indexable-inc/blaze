@@ -6,6 +6,11 @@
 //! where-clauses (an impl applies when its header unifies), coherence, auto traits, regions,
 //! occurs checks (the generated bodies cannot build a cyclic type).
 
+#![cfg_attr(
+    not(test),
+    allow(dead_code, reason = "the toy world is the tests'; outside them only `ToyCtx` is used (feature `toy`)")
+)]
+
 use blaze_hash::HashMap;
 use blaze_own::{Alloc, Vec};
 use std::alloc::Global;
@@ -45,13 +50,13 @@ enum Undo {
     Rank(u32, u8),
 }
 
-pub(crate) struct Snap {
+pub struct Snap {
     undo: usize,
     pending: Vec<Obligation, Global>,
     errors: usize,
 }
 
-pub(crate) struct ToyCtx {
+pub struct ToyCtx {
     nodes: Vec<TyView, Global>,
     node_index: HashMap<TyView, u32, Global>,
     lists: Vec<Vec<Ty, Global>, Global>,
@@ -70,7 +75,7 @@ pub(crate) struct ToyCtx {
 }
 
 impl ToyCtx {
-    pub(crate) fn new() -> ToyCtx {
+    pub fn new() -> ToyCtx {
         ToyCtx {
             nodes: Vec::new_in(Global),
             node_index: HashMap::new_in(Global),

@@ -31,19 +31,18 @@ use std::{
     time::{Duration, Instant},
 };
 
+// std's atomics as the locks' (`lock::raw`): a channel is a real handoff in blaze-core's tests,
+// never the scheduled atomics; under `--cfg blaze_check`, the model checker's.
 #[cfg(not(blaze_check))]
-use std::sync::atomic::fence;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering, fence};
 
 #[cfg(blaze_check)]
-use blaze_check::sync::atomic::fence;
+use blaze_check::sync::atomic::{AtomicU32, AtomicUsize, Ordering, fence};
 use blaze_queue::{ArrayQueue, SegQueue};
 
-use crate::{
-    lock::{
-        raw::{self, Word},
-        signal_span,
-    },
-    sync::atomic::{AtomicU32, AtomicUsize, Ordering},
+use crate::lock::{
+    raw::{self, Word},
+    signal_span,
 };
 
 #[cfg(test)]

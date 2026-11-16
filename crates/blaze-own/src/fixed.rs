@@ -4,7 +4,10 @@
 //! - [`FixedVec<T, N>`]: up to `N` values stored inline, no allocator at all. A push past `N`
 //!   is refused with [`Full`], which hands the value back and names the capacity; nothing grows.
 //! - [`FixedString<N>`]: up to `N` bytes of UTF-8 inline, refused past `N` alike; a
-//!   `fmt::Write` sink that fails rather than allocates.
+//!   `fmt::Write` sink that fails rather than allocates. Its refusal is sticky (every later
+//!   write is refused too) and it counts the bytes all writes wanted ([`Overflow`]), so a chain
+//!   of writes never reads as a whole text when it was cut. [`FixedVec`]'s is not: a push
+//!   hands its value back and the caller holds it, so nothing is lost unseen.
 //! - [`Inline<BYTES>`]: an allocator over a buffer of `BYTES` inside itself, so any collection
 //!   here can live on the stack: `Vec::new_in(&inline)`. It bumps a top and refuses when the
 //!   buffer is full; it never asks another allocator. A free of the newest block, and a growth
@@ -388,17 +391,61 @@ impl<T, const N: usize> Drop for IntoIter<T, N> {
     }
 }
 
+/// What a [`FixedString`] that refused a write says: its room, and the bytes all its writes
+/// wanted (the refused ones too), to size the next buffer exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Overflow {
+    pub capacity: usize,
+    pub needed: usize,
+}
+
+impl fmt::Display for Overflow {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "a fixed string of {} bytes was asked for {}", self.capacity, self.needed)
+    }
+}
+
+impl core::error::Error for Overflow {}
+
 /// Up to `N` bytes of UTF-8, inline (see the module).
+///
+/// A refusal is sticky: once a write does not fit, every later write is refused too, until
+/// [`FixedString::clear`], so a chain of writes never leaves a cut text that reads as whole;
+/// [`FixedString::text`] says which it is, and how many bytes the writes wanted.
 #[derive(Clone, Copy)]
 pub struct FixedString<const N: usize> {
     /// Bytes `..len` are UTF-8, cut only at a character's boundary; the rest are zero.
     len: usize,
     bytes: [u8; N],
+    /// The bytes every write since the last clear asked for, the refused ones too.
+    needed: usize,
+    /// A write was refused since the last clear.
+    refused: bool,
 }
 
 impl<const N: usize> FixedString<N> {
     pub const fn new() -> FixedString<N> {
-        FixedString { len: 0, bytes: [0; N] }
+        FixedString { len: 0, bytes: [0; N], needed: 0, refused: false }
+    }
+
+    /// The text, or the [`Overflow`] when any write since the last clear was refused.
+    pub fn text(&self) -> Result<&str, Overflow> {
+        if self.refused {
+            return Err(Overflow { capacity: N, needed: self.needed });
+        }
+        Ok(self.as_str())
+    }
+
+    /// Whether a write since the last clear was refused (and so every later one).
+    #[inline]
+    pub const fn is_refused(&self) -> bool {
+        self.refused
+    }
+
+    /// The bytes every write since the last clear asked for, the refused ones too.
+    #[inline]
+    pub const fn needed(&self) -> usize {
+        self.needed
     }
 
     #[inline]
@@ -424,10 +471,13 @@ impl<const N: usize> FixedString<N> {
         N
     }
 
-    /// `text` at the end, or handed back whole (nothing written) when it does not fit.
+    /// `text` at the end, or handed back whole (nothing written) when it does not fit or an
+    /// earlier write was refused (the refusal is sticky).
     pub fn try_push_str<'t>(&mut self, text: &'t str) -> Result<(), Full<&'t str>> {
+        self.needed = self.needed.saturating_add(text.len());
         let end = self.len + text.len();
-        if end > N {
+        if self.refused || end > N {
+            self.refused = true;
             return Err(Full { value: text, cap: N });
         }
         self.bytes[self.len..end].copy_from_slice(text.as_bytes());
@@ -441,8 +491,11 @@ impl<const N: usize> FixedString<N> {
         self.try_push_str(char.encode_utf8(&mut buf)).map_err(|_| Full { value: char, cap: N })
     }
 
+    /// Empties it, the refusal and the count too.
     pub fn clear(&mut self) {
         self.len = 0;
+        self.needed = 0;
+        self.refused = false;
     }
 }
 

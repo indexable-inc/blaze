@@ -14,6 +14,7 @@
 #![forbid(unsafe_code)]
 
 mod print;
+mod program;
 mod store;
 mod sweep;
 mod work;
@@ -24,12 +25,13 @@ use blaze_drive::{
     Answer, Ask, Command, Config, DriveError, Effect, Event, FileEntry, Gate, Request, Settled, Space, TableFull, Tool,
     WireError,
 };
-use blaze_own::{Vec, VecDeque};
+use blaze_own::{Alloc, Vec, VecDeque};
 use bstd::fs::{Dir, FsError, ReadWrite};
 use bstd::io::Missing;
 use bstd::mem::{Bytes, Frame};
 use bstd::out::{Out, OutError};
 use bstd::path::{Path, PathError};
+use bstd::entry::Status;
 use bstd::{Cx, Io, entry::Error};
 
 use crate::store::{FileStore, Store};
@@ -56,6 +58,8 @@ pub enum CliError {
     Findings(u32),
     /// The workers' settled table was sized below the run.
     Table(TableFull),
+    /// `blaze run`'s program did not run: the stage and the function it stopped at.
+    Program(blaze_ladder::run::RunError),
 }
 
 impl fmt::Display for CliError {
@@ -73,6 +77,7 @@ impl fmt::Display for CliError {
             CliError::Text { what } => write!(f, "{what}"),
             CliError::Findings(n) => write!(f, "{n} findings"),
             CliError::Table(full) => write!(f, "{full}"),
+            CliError::Program(error) => write!(f, "blaze run: {error}"),
         }
     }
 }
@@ -105,12 +110,13 @@ fn env_version() -> &'static str {
     concat!(env!("CARGO_PKG_NAME"), " ", env!("CARGO_PKG_VERSION"), " drive 1")
 }
 
+/// The status: 0 for a check that passed; `blaze run`'s, the status its program's `main` ended with.
 #[bstd::main]
-fn main(cx: &Cx, io: Io) -> Result<(), Error> {
+fn main(cx: &Cx, io: Io) -> Result<Status, Error> {
     let out = io.need_out()?;
     let err = io.need_err()?;
     match command(cx, &io, &out, &err) {
-        Ok(()) => Ok(()),
+        Ok(status) => Ok(status),
         Err(error) => {
             err.line(cx, &error)?;
             Err(Error::from(error))
@@ -118,7 +124,7 @@ fn main(cx: &Cx, io: Io) -> Result<(), Error> {
     }
 }
 
-fn command(cx: &Cx, io: &Io, out: &Out, err: &Out) -> Result<(), CliError> {
+fn command(cx: &Cx, io: &Io, out: &Out, err: &Out) -> Result<Status, CliError> {
     let args = io.need_args()?;
     let command = match args.get(1) {
         Some("check") => Command::Check,
@@ -150,10 +156,10 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out) -> Result<(), CliError> {
         return Err(CliError::Findings(answer.findings));
     }
     match command {
-        Command::Check => Ok(()),
-        // The units' record is the entry's home: blaze-run's Parent takes it from here, and its
-        // `Code` names answer NotBuilt today (drive.md, "Run").
-        Command::Run => Err(CliError::NotBuilt { command: "run" }),
+        Command::Check => Ok(Status::OK),
+        // The walking skeleton's straight line, in this process (tests/ladder/README.md); the
+        // design's route is blaze-run's Parent taking the units' record (drive.md, "Run").
+        Command::Run => Ok(Status(program::run(cx, &root, frame)?)),
         Command::Test => Err(CliError::NotBuilt { command: "test" }),
     }
 }
@@ -189,13 +195,17 @@ fn request(cx: &Cx, root: &Dir<ReadWrite>, command: Command, workers: u32, frame
         None => None,
     };
     let config = Config { tool: tool(), workers, most_entries: 64, most_jobs: 1 << 24, is_error: every_rule };
-    let mut req = Request::new_in(config, Ask { command, args: b"", gate: Gate::Beside, space: Space::NONE }, frame);
+    // The machine allocates through a one-word handle; the frame carries no header of its own,
+    // so it is erased into one here, on this stack, for this request.
+    let erased = blaze_own::Erased::new(frame);
+    let alloc = erased.handle();
+    let mut req = Request::new_in(config, Ask { command, args: b"", gate: Gate::Beside, space: Space::NONE }, alloc);
     let mut store = FileStore::open(root)?;
     // The workers' read side: two slots a name at most a half full; about 128 names a file
     // (items, bodies, scopes) is the sizing until the profile says otherwise.
     let table = Settled::new_in(files.len().saturating_mul(128), frame);
-    let mut effects: Vec<Effect<&Frame>, &Frame> = Vec::new_in(frame);
-    let mut todo: VecDeque<Effect<&Frame>, &Frame> = VecDeque::new_in(frame);
+    let mut effects: Vec<Effect<'_>, Alloc<'_>> = Vec::new_in(alloc);
+    let mut todo: VecDeque<Effect<'_>, Alloc<'_>> = VecDeque::new_in(alloc);
     req.step(Event::Start { files: &files, gone: &gone, last }, &mut effects)?;
     loop {
         for effect in effects.drain(..) {

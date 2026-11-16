@@ -167,7 +167,12 @@ fn main() {
     }
     let float_texts: std::vec::Vec<std::string::String> = floats.iter().map(|x| format!("{x:?}")).collect();
     bench.pair(
-        "f64 parse (shortest forms)",
+        "f64 parse_all (the text is the token)",
+        |i| _ = black_box(blaze_text::parse_all::<f64>(black_box(float_texts[i].as_str())).ok()),
+        |i| _ = black_box(black_box(float_texts[i].as_str()).parse::<f64>().ok()),
+    );
+    bench.pair(
+        "f64 parse, a prefix (shortest forms)",
         |i| _ = black_box(<f64 as Parse>::parse(black_box(float_texts[i].as_str())).ok()),
         |i| _ = black_box(black_box(float_texts[i].as_str()).parse::<f64>().ok()),
     );

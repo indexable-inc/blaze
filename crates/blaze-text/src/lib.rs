@@ -31,6 +31,37 @@
 //! sink: about 1 ns per pair on a 2026 core, so 2 to 8 ns for a whole call into a `String` with
 //! room, against `core::fmt`'s 15 to 30 ns (an estimate, not a measurement; `examples/cost.rs`
 //! measures it). Floats are Ryu (Adams 2018) with tables computed at compile time: 20 to 40 ns.
+//!
+//! # Measured
+//!
+//! `examples/cost.rs`, release, 2026-11-15, one run, this machine (an Apple-silicon Mac); ns
+//! per operation with the loop's own cost subtracted, before the fixes listed under it:
+//!
+//! | operation | blaze-text | core | ratio |
+//! |---|---|---|---|
+//! | u64 decimal, 1 digit | 3.3 | 5.6 | 1.71x |
+//! | u64 decimal, 5 digits | 5.3 | 6.9 | 1.30x |
+//! | u64 decimal, 10 digits | 6.3 | 6.9 | 1.10x |
+//! | u64 decimal, 20 digits | 10.7 | 9.3 | 0.87x |
+//! | u64 decimal, every length | 7.6 | 10.0 | 1.32x |
+//! | u64 hex | 7.4 | 9.8 | 1.32x |
+//! | f64 shortest | 33.9 | 51.3 | 1.51x |
+//! | f64 fixed, 3 places | 16.5 | 18.0 | 1.09x |
+//! | `"{}: {} of {} ({:.1}%)"` | 19.0 | 47.2 | 2.49x |
+//! | u64 parse, 1 digit | 2.8 | 1.0 | 0.35x |
+//! | u64 parse, 5 digits | 4.6 | 2.3 | 0.49x |
+//! | u64 parse, 10 digits | 3.9 | 3.6 | 0.92x |
+//! | u64 parse, 20 digits | 6.5 | 13.0 | 1.99x |
+//! | u64 parse, every length | 5.9 | 5.6 | 0.95x |
+//! | f64 parse | 21.0 | 12.5 | 0.59x |
+//! | vector digit run against its scalar twin, 1 to 15 digits | | | 1.1x to 1.7x |
+//! | the same, 20 digits | | | 0.86x |
+//! | next escape byte after 4 / 16 / 64 / 256 plain bytes, vector against scalar | | | 0.75x / 6.2x / 11.1x / 13.5x |
+//!
+//! Fixed since, not yet measured: short integer parses read one word and convert under eight
+//! digits without the vector; `parse_all` of a float hands a plain decimal to `core` without
+//! scanning it first; `u64` writes take eight digits at a time in 32-bit halves; the escape
+//! search takes the byte loop under 16 bytes; `String`'s `put_byte` pushes the byte directly.
 
 #![no_std]
 // blaze's lints (`blaze::trust`, `blaze::sans_io`) name their tool; inert under rustc.

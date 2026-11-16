@@ -35,9 +35,10 @@
 //! # Threads
 //!
 //! `Alloc` is neither `Send` nor `Sync`: it may stand for an allocator one thread owns (a task's
-//! frame, an [`Inline`](crate::Inline) buffer), and the one type cannot say which it is. A value
-//! that crosses threads names a `Sync` allocator concretely (`Vec<T, Global>`), or takes a fresh
-//! handle on the other side.
+//! frame, an [`Inline`](crate::Inline) buffer). [`SharedAlloc`] is the same word made only from a
+//! `Sync` allocator (`Erased::shared`, `SharedAlloc::global()`), and is `Send + Sync` (invariant
+//! 4); a value that crosses threads holds its collections over it, and passes
+//! `shared.local()` to the functions it calls.
 
 use core::{
     alloc::{AllocError, Allocator, AllocatorClone, Layout},
@@ -213,17 +214,26 @@ impl<'a> Alloc<'a> {
 mod global {
     use std::alloc::Global;
 
-    use super::{Alloc, Erased};
+    use super::{Alloc, Erased, SharedAlloc};
 
     /// The global allocator, erased once for the whole program.
     static GLOBAL: Erased<Global> = Erased::new(Global);
 
     impl Alloc<'static> {
         /// The global allocator's handle: named in tests and at a program's top only, which
-        /// hands it (or a frame's) down (the `std` feature).
+        /// hands it (or a frame's) down (the `std` feature). The kind every function takes; a
+        /// value that crosses threads is made over [`SharedAlloc::global`] instead.
         #[inline]
         pub fn global() -> Alloc<'static> {
             GLOBAL.handle()
+        }
+    }
+
+    impl SharedAlloc<'static> {
+        /// The global allocator's handle that may cross threads (the `std` feature).
+        #[inline]
+        pub fn global() -> SharedAlloc<'static> {
+            GLOBAL.shared()
         }
     }
 }
@@ -279,6 +289,93 @@ unsafe impl Allocator for Alloc<'_> {
 // a handle touches nothing of it.
 unsafe impl AllocatorClone for Alloc<'_> {}
 
+/// An [`Alloc`] that may cross threads: made only from an allocator that is `Sync` (the global
+/// heap, an `Erased<A>` with `A: Sync`), never from a task's frame or an `Inline` buffer. A
+/// collection over it is `Send` when its elements are. A function still takes `Alloc<'_>`:
+/// [`SharedAlloc::local`] (or `.into()`) is the same handle, one word, for passing down.
+///
+/// Invariant 4: the allocator a `SharedAlloc` stands for is `Sync`, so its methods may be called
+/// through a shared reference from any thread at once, and its header is never written after
+/// it is made; that is all sending or sharing the handle does with it.
+#[derive(Clone, Copy)]
+pub struct SharedAlloc<'a> {
+    alloc: Alloc<'a>,
+}
+
+// SAFETY: invariant 4: sending the handle sends a `&T` of a `T: Sync` (`of`'s bound, the only
+// constructor), which is `Send`.
+unsafe impl Send for SharedAlloc<'_> {}
+// SAFETY: invariant 4: a `&SharedAlloc` lets other threads call the allocator through a shared
+// reference, which `T: Sync` allows.
+unsafe impl Sync for SharedAlloc<'_> {}
+
+impl<'a> SharedAlloc<'a> {
+    /// The handle of a `Sync` allocator that carries its own header.
+    #[inline]
+    pub fn of<T: Headed + Sync>(allocator: &'a T) -> SharedAlloc<'a> {
+        SharedAlloc { alloc: Alloc::of(allocator) }
+    }
+
+    /// The same handle as the kind every function takes.
+    #[inline]
+    pub fn local(self) -> Alloc<'a> {
+        self.alloc
+    }
+}
+
+impl<'a> From<SharedAlloc<'a>> for Alloc<'a> {
+    #[inline]
+    fn from(shared: SharedAlloc<'a>) -> Alloc<'a> {
+        shared.alloc
+    }
+}
+
+impl fmt::Debug for SharedAlloc<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("SharedAlloc").field(&self.alloc.header).finish()
+    }
+}
+
+// SAFETY: every method is the inner handle's, whose contract it keeps.
+unsafe impl Allocator for SharedAlloc<'_> {
+    #[inline]
+    fn allocate(&self, layout: Layout) -> Grant {
+        self.alloc.allocate(layout)
+    }
+
+    #[inline]
+    fn allocate_zeroed(&self, layout: Layout) -> Grant {
+        self.alloc.allocate_zeroed(layout)
+    }
+
+    #[inline]
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        // SAFETY: the caller's contract, passed on.
+        unsafe { self.alloc.deallocate(ptr, layout) }
+    }
+
+    #[inline]
+    unsafe fn grow(&self, ptr: NonNull<u8>, old: Layout, new: Layout) -> Grant {
+        // SAFETY: the caller's contract, passed on.
+        unsafe { self.alloc.grow(ptr, old, new) }
+    }
+
+    #[inline]
+    unsafe fn grow_zeroed(&self, ptr: NonNull<u8>, old: Layout, new: Layout) -> Grant {
+        // SAFETY: the caller's contract, passed on.
+        unsafe { self.alloc.grow_zeroed(ptr, old, new) }
+    }
+
+    #[inline]
+    unsafe fn shrink(&self, ptr: NonNull<u8>, old: Layout, new: Layout) -> Grant {
+        // SAFETY: the caller's contract, passed on.
+        unsafe { self.alloc.shrink(ptr, old, new) }
+    }
+}
+
+// SAFETY: as `Alloc`'s: a copy is the same allocator.
+unsafe impl AllocatorClone for SharedAlloc<'_> {}
+
 /// Any allocator with a [`Header`] before it, so it hands out [`Alloc`] handles:
 /// `Erased::new(&frame).handle()`, `Erased::new(&counting).handle()`.
 #[repr(C)]
@@ -297,6 +394,47 @@ impl<A: Allocator> Erased<A> {
     #[inline]
     pub fn handle(&self) -> Alloc<'_> {
         Alloc::of(self)
+    }
+
+    /// The handle that may cross threads, borrowing `self`: only of a `Sync` allocator.
+    ///
+    /// A collection over it crosses a thread:
+    ///
+    /// ```
+    /// #![feature(allocator_ext)]
+    /// let erased = blaze_own::Erased::new(std::alloc::Global);
+    /// let mut v = blaze_own::Vec::new_in(erased.shared());
+    /// v.push(1u32);
+    /// std::thread::scope(|s| {
+    ///     s.spawn(move || assert_eq!(v.as_slice(), [1]));
+    /// });
+    /// ```
+    ///
+    /// One over a thread's own allocator (an `Inline` buffer, a task's frame) cannot be shared:
+    ///
+    /// ```compile_fail,E0277
+    /// let inline = blaze_own::Inline::<256>::new();
+    /// let erased = blaze_own::Erased::new(&inline);
+    /// let _ = erased.shared();
+    /// ```
+    ///
+    /// and over its plain handle it cannot cross a thread:
+    ///
+    /// ```compile_fail,E0277
+    /// let inline = blaze_own::Inline::<256>::new();
+    /// let erased = blaze_own::Erased::new(&inline);
+    /// let mut v = blaze_own::Vec::new_in(erased.handle());
+    /// v.push(1u32);
+    /// std::thread::scope(|s| {
+    ///     s.spawn(move || drop(v));
+    /// });
+    /// ```
+    #[inline]
+    pub fn shared(&self) -> SharedAlloc<'_>
+    where
+        A: Sync,
+    {
+        SharedAlloc::of(self)
     }
 
     pub fn inner(&self) -> &A {

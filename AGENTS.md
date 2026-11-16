@@ -146,7 +146,7 @@ tools/agents/rules.ts, then run `bun tools/agents/rules.ts --write`.
 - **8. own-nightly**: Each project builds with `harness/toolchain`; toolchain files, rustup and `RUSTC` are ignored.
 - **22. measure-the-exact-tree**: A measurement, bisect or checkpoint names and keeps the tree and binary it ran on.
 - **34. work-in-ix-vms**: Build, test and smoke on the Mac, or on `blaze-vm` when it answers; no AWS, no x86 VM.
-- **35. fan-out-write-only**: Lanes only write and never wait on a compile; the main agent compiles the tree in batches.
+- **35. fan-out-write-only**: Lanes write and check their own crate through the one build lock; the main agent admits the tree.
 - **36. worktree-per-lane**: One directory, each lane in its own files; a worktree is the exception; never `git stash`.
 - **39. clean-up-lane**: When a lane is done, delete what it made: VM state, worktrees, branches, processes left running.
 - **46. ledger-decides**: Work comes from the objectives ledger and is done when its row's check passes on a named commit.

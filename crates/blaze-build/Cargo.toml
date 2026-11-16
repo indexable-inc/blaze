@@ -1,0 +1,33 @@
+[package]
+name = "blaze-build"
+description = "A type-checked body to LIR: blaze-typeck's body form and its record (`Checked`) to one LIR function, with explicit stacks and no recursion on the input; every local in a stack slot, control flow as blocks, calls by function reference (crates/blaze-cli/tests/ladder/README.md)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The input: the body form (`BodyView`), the check's record (`Checked`), portable types.
+blaze-typeck.workspace = true
+# The output: one function's columns, made with `Builder` and checked with `verify`.
+blaze-lir.workspace = true
+# `Alloc`: the allocator `Checked` is in.
+blaze-own.workspace = true
+
+[dev-dependencies]
+# `ToyCtx`: the bodies of the tests are checked before they are built.
+blaze-typeck = { workspace = true, features = ["toy"] }
+# The evaluator a built function's result is compared with.
+blaze-lir = { workspace = true, features = ["eval"] }
+blaze-own = { workspace = true, features = ["std"] }
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

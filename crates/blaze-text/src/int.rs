@@ -44,16 +44,34 @@ pub trait Integer: Copy + sealed::Sealed {
 /// `n`'s decimal digits before the first of `out`, two at a time.
 #[inline]
 pub(crate) fn u64_into<const N: usize>(mut n: u64, out: &mut Ascii<N>) {
-    while n >= 100 {
-        let r = n % 100;
-        n /= 100;
-        out.front_pair(r.truncate_to::<usize>());
+    // Past eight digits, the low eight at a time: one 64-bit division, then 32-bit arithmetic
+    // on two independent halves of four, which the core overlaps.
+    while n >= 100_000_000 {
+        let low = (n % 100_000_000).truncate_to::<u32>();
+        n /= 100_000_000;
+        eight_into(low, out);
     }
-    if n >= 10 {
-        out.front_pair(n.truncate_to::<usize>());
+    let mut m = n.truncate_to::<u32>();
+    while m >= 100 {
+        let r = m % 100;
+        m /= 100;
+        out.front_pair(idx(r));
+    }
+    if m >= 10 {
+        out.front_pair(idx(m));
     } else {
-        out.front_digit(&LOWER, n.truncate_to::<usize>());
+        out.front_digit(&LOWER, idx(m));
     }
+}
+
+/// Exactly eight digits of `n` (below 10^8), zeros kept.
+#[inline(always)]
+fn eight_into<const N: usize>(n: u32, out: &mut Ascii<N>) {
+    let (high, low) = (n / 10_000, n % 10_000);
+    out.front_pair(idx(low % 100));
+    out.front_pair(idx(low / 100));
+    out.front_pair(idx(high % 100));
+    out.front_pair(idx(high / 100));
 }
 
 const TEN_19: u64 = 10_000_000_000_000_000_000;

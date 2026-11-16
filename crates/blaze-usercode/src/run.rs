@@ -1231,12 +1231,14 @@ pub fn restore(dir: &Path, files: &[OutFile]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use std::{
-        cell::RefCell,
         collections::BTreeMap,
         ffi::{OsStr, OsString},
-        rc::Rc,
+        sync::Arc,
         time::Duration,
     };
+
+    // A simulated program is `Send` (blaze_core::sim::Program): its shared fixtures are locked.
+    use blaze_core::lock::Lock;
 
     use blaze_cas::Config;
     use blaze_core::{
@@ -1340,15 +1342,15 @@ mod tests {
     /// A script that reads `/ws/data` and `CC` and prints what `printed` holds then.
     fn script(
         sim: &mut Sim,
-        data: Rc<RefCell<[u8; 32]>>,
-        printed: Rc<RefCell<Vec<u8>>>,
-        runs: Rc<RefCell<u32>>,
+        data: Arc<Lock<[u8; 32]>>,
+        printed: Arc<Lock<Vec<u8>>>,
+        runs: Arc<Lock<u32>>,
     ) {
         sim.program("/script", move |command, _| {
-            *runs.borrow_mut() += 1;
+            *runs.lock() += 1;
             let Sandbox::On { trace: true, .. } = command.sandbox else { panic!("a run traces") };
             let traced = Traced {
-                files: vec![("/ws/data".into(), Some(*data.borrow()))],
+                files: vec![("/ws/data".into(), Some(*data.lock()))],
                 dirs: vec![("/ws".into(), listing([OsStr::new("data")]))],
                 env: vec![("CC".into(), Some("cc".into()))],
                 untraceable: Vec::new(),
@@ -1356,7 +1358,7 @@ mod tests {
             let exit = Exit {
                 code: Some(0),
                 signal: None,
-                stdout: printed.borrow().clone(),
+                stdout: printed.lock().clone(),
                 stderr: Vec::new(),
                 traced: Some(traced),
                 peak_memory: 0,
@@ -1383,9 +1385,9 @@ mod tests {
 
     /// A script that reads `data` in the directory it runs in and `CC`, and prints what
     /// `printed` holds then.
-    fn script_in_dir(sim: &mut Sim, printed: Rc<RefCell<Vec<u8>>>, runs: Rc<RefCell<u32>>) {
+    fn script_in_dir(sim: &mut Sim, printed: Arc<Lock<Vec<u8>>>, runs: Arc<Lock<u32>>) {
         sim.program("/script", move |command, _| {
-            *runs.borrow_mut() += 1;
+            *runs.lock() += 1;
             let Sandbox::On { trace: true, .. } = command.sandbox else { panic!("a run traces") };
             let traced = Traced {
                 files: vec![(command.dir.join("data"), Some([1; 32]))],
@@ -1396,7 +1398,7 @@ mod tests {
             let exit = Exit {
                 code: Some(0),
                 signal: None,
-                stdout: printed.borrow().clone(),
+                stdout: printed.lock().clone(),
                 stderr: Vec::new(),
                 traced: Some(traced),
                 peak_memory: 0,
@@ -1470,9 +1472,9 @@ mod tests {
         for moved in [true, false] {
             let mut sim = Sim::new(7, Faults::default());
             let mut store = opened(&mut sim);
-            let data = Rc::new(RefCell::new([1; 32]));
-            let printed = Rc::new(RefCell::new(b"cargo:rustc-cfg=one\n".to_vec()));
-            let runs = Rc::new(RefCell::new(0));
+            let data = Arc::new(Lock::new("test.fixture",[1; 32]));
+            let printed = Arc::new(Lock::new("test.fixture",b"cargo:rustc-cfg=one\n".to_vec()));
+            let runs = Arc::new(Lock::new("test.fixture",0));
             script(&mut sim, data.clone(), printed.clone(), runs.clone());
             let mut inputs = Fixed {
                 files: [("/ws/data".into(), [1; 32])].into(),
@@ -1492,7 +1494,7 @@ mod tests {
             assert_eq!(again.1, moved, "a run kept under no key runs again; moved: {moved}");
             // Kept by the run just made in either case: one result, and a verify of a rerun
             // that gives otherwise under a moved read says no difference.
-            *printed.borrow_mut() = b"cargo:rustc-cfg=other\n".to_vec();
+            *printed.lock() = b"cargo:rustc-cfg=other\n".to_vec();
             let verified = go_moved(&mut sim, &mut store, &mut inputs, spec(Mode::Verify), moved);
             match moved {
                 true => assert_eq!(verified.unwrap().2, Some(NotKept::Moved(data_moved()))),
@@ -1505,9 +1507,9 @@ mod tests {
     fn a_run_is_reused_until_what_it_read_changes_and_verified_on_request() {
         let mut sim = Sim::new(3, Faults::default());
         let mut store = opened(&mut sim);
-        let data = Rc::new(RefCell::new([1; 32]));
-        let printed = Rc::new(RefCell::new(b"cargo:rustc-cfg=one\n".to_vec()));
-        let runs = Rc::new(RefCell::new(0));
+        let data = Arc::new(Lock::new("test.fixture",[1; 32]));
+        let printed = Arc::new(Lock::new("test.fixture",b"cargo:rustc-cfg=one\n".to_vec()));
+        let runs = Arc::new(Lock::new("test.fixture",0));
         script(&mut sim, data.clone(), printed.clone(), runs.clone());
         let mut inputs = Fixed {
             files: [("/ws/data".into(), [1; 32])].into(),
@@ -1549,8 +1551,8 @@ mod tests {
         assert!(!go(&mut sim, &mut store, &mut inputs, Mode::Normal).unwrap().1);
 
         inputs.files.insert("/ws/data".into(), [2; 32]);
-        *data.borrow_mut() = [2; 32];
-        *printed.borrow_mut() = b"cargo:rustc-cfg=two\n".to_vec();
+        *data.lock() = [2; 32];
+        *printed.lock() = b"cargo:rustc-cfg=two\n".to_vec();
         let (second, ran) = go(&mut sim, &mut store, &mut inputs, Mode::Normal).unwrap();
         assert!(ran && second.stdout == b"cargo:rustc-cfg=two\n");
         // Both kept: going back reuses the first.
@@ -1559,12 +1561,12 @@ mod tests {
             go(&mut sim, &mut store, &mut inputs, Mode::Normal).unwrap(),
             (first.clone(), false)
         );
-        assert_eq!(*runs.borrow(), 2);
+        assert_eq!(*runs.lock(), 2);
 
-        *data.borrow_mut() = [1; 32];
-        *printed.borrow_mut() = b"cargo:rustc-cfg=one\n".to_vec();
+        *data.lock() = [1; 32];
+        *printed.lock() = b"cargo:rustc-cfg=one\n".to_vec();
         assert_eq!(go(&mut sim, &mut store, &mut inputs, Mode::Verify).unwrap(), (first, true));
-        *printed.borrow_mut() = b"cargo:rustc-cfg=other\n".to_vec();
+        *printed.lock() = b"cargo:rustc-cfg=other\n".to_vec();
         let differs = go(&mut sim, &mut store, &mut inputs, Mode::Verify).unwrap_err();
         assert!(matches!(differs, RunError::Differs { .. }), "{differs:?}");
     }
@@ -1576,8 +1578,8 @@ mod tests {
     fn a_verified_run_that_reruns_otherwise_is_retracted_for_every_checkout() {
         let mut sim = Sim::new(5, Faults::default());
         let mut store = opened(&mut sim);
-        let printed = Rc::new(RefCell::new(b"cargo:rustc-cfg=one\n".to_vec()));
-        let runs = Rc::new(RefCell::new(0));
+        let printed = Arc::new(Lock::new("test.fixture",b"cargo:rustc-cfg=one\n".to_vec()));
+        let runs = Arc::new(Lock::new("test.fixture",0));
         script_in_dir(&mut sim, printed.clone(), runs.clone());
         let files =
             ["a", "b", "c", "d"].map(|it| (PathBuf::from(format!("/ckout/{it}/data")), [1; 32]));
@@ -1592,16 +1594,16 @@ mod tests {
         // A third is given it without a run.
         let (given, ran) = go_in(&mut sim, &mut store, Mode::Normal, "/ckout/c").unwrap();
         assert!(!ran && given.stdout == b"cargo:rustc-cfg=one\n");
-        assert_eq!(*runs.borrow(), 2);
+        assert_eq!(*runs.lock(), 2);
 
         // The third reruns it on request and gets otherwise: retracted, the record's ticket
         // given for the caller to make durable.
-        *printed.borrow_mut() = b"cargo:rustc-cfg=other\n".to_vec();
+        *printed.lock() = b"cargo:rustc-cfg=other\n".to_vec();
         match go_in(&mut sim, &mut store, Mode::Verify, "/ckout/c") {
             Err(RunError::Differs { retracted: Some(_), .. }) => {}
             other => panic!("a verified value that reruns otherwise is retracted, not {other:?}"),
         }
-        assert_eq!(*runs.borrow(), 3);
+        assert_eq!(*runs.lock(), 3);
 
         // A fourth checkout is no longer given it: it runs.
         let (fourth, ran) = go_in(&mut sim, &mut store, Mode::Normal, "/ckout/d").unwrap();
@@ -1612,7 +1614,7 @@ mod tests {
         // The first still finds its own, kept here before it was shared.
         let (first, ran) = go_in(&mut sim, &mut store, Mode::Normal, "/ckout/a").unwrap();
         assert!(!ran && first.stdout == b"cargo:rustc-cfg=one\n");
-        assert_eq!(*runs.borrow(), 4);
+        assert_eq!(*runs.lock(), 4);
     }
 
     /// C2 (round 7): a pure build script's run is kept under its sandboxed key and its pure
@@ -1624,8 +1626,8 @@ mod tests {
     fn one_check_run_that_differs_retracts_both_its_keys() {
         let mut sim = Sim::new(6, Faults::default());
         let mut store = opened(&mut sim);
-        let printed = Rc::new(RefCell::new(b"cargo:rustc-cfg=one\n".to_vec()));
-        let runs = Rc::new(RefCell::new(0));
+        let printed = Arc::new(Lock::new("test.fixture",b"cargo:rustc-cfg=one\n".to_vec()));
+        let runs = Arc::new(Lock::new("test.fixture",0));
         script_in_dir(&mut sim, printed.clone(), runs.clone());
         let files =
             ["a", "b", "c", "d"].map(|it| (PathBuf::from(format!("/ckout/{it}/data")), [1; 32]));
@@ -1672,7 +1674,7 @@ mod tests {
 
         // The third reruns it on request and gets otherwise: the sandboxed key is retracted,
         // and the error carries what it ran, which differs from the pure key's hit too.
-        *printed.borrow_mut() = b"cargo:rustc-cfg=other\n".to_vec();
+        *printed.lock() = b"cargo:rustc-cfg=other\n".to_vec();
         let ran =
             match go_with(&mut sim, &mut store, &mut inputs, spec_in(Mode::Verify, "/ckout/c")) {
                 Err(RunError::Differs { retracted: Some(_), ran, .. }) => ran,

@@ -8,12 +8,11 @@
 //! ([`crate::record::PAYLOAD_ALIGN`]) in store buffers aligned the same: blaze-format's views
 //! read them where they are.
 
-use core::alloc::Allocator;
 use core::fmt;
 
 use blaze_format::FormatError;
 use blaze_id::{ContentId, CrateItemKey, ItemKey, NoItem};
-use blaze_own::SortedMap;
+use blaze_own::{ASortedMap, Alloc, SortedMap};
 use blaze_surface::{
     CrateGraphView, CrateRootView, FileItemsView, HasText, Items, KeyEntry, KeyIndexView,
     LangItemsView, MacroDefView, ModuleDeclsView, ModuleFileView, NoImplsOfView, ScopeView,
@@ -73,17 +72,17 @@ impl fmt::Display for HeldError {
 impl core::error::Error for HeldError {}
 
 /// The records and texts one task holds, borrowed for `'a` from the buffers its driver read.
-pub struct TaskItems<'a, A: Allocator + Clone> {
+pub struct TaskItems<'a, 'b> {
     krate: CrateItemKey,
-    records: SortedMap<(Fact, ContentId), &'a [u8], A>,
+    records: ASortedMap<'b, (Fact, ContentId), &'a [u8]>,
     /// The crate's `KeyIndex` records, by module: scanned for [`Items::entry`].
-    texts: SortedMap<ContentId, &'a str, A>,
+    texts: ASortedMap<'b, ContentId, &'a str>,
 }
 
-impl<'a, A: Allocator + Clone> TaskItems<'a, A> {
+impl<'a, 'b> TaskItems<'a, 'b> {
     /// The records of a task compiling `krate` (or reading it, when it holds no text).
-    pub fn new_in(krate: CrateItemKey, alloc: A) -> TaskItems<'a, A> {
-        TaskItems { krate, records: SortedMap::new_in(alloc.clone()), texts: SortedMap::new_in(alloc) }
+    pub fn new_in(krate: CrateItemKey, alloc: Alloc<'b>) -> TaskItems<'a, 'b> {
+        TaskItems { krate, records: SortedMap::new_in(alloc), texts: SortedMap::new_in(alloc) }
     }
 
     /// Hold `bytes` as a `fact` record, checked whole now; a second record of one key replaces
@@ -141,7 +140,7 @@ fn reopened<T>(view: Result<T, FormatError>) -> T {
     }
 }
 
-impl<'a, A: Allocator + Clone> Items for TaskItems<'a, A> {
+impl<'a> Items for TaskItems<'a, '_> {
     fn entry(&self, item: ItemKey) -> Result<KeyEntry, SurfaceError> {
         let missing = NoItem { krate: self.krate, key: item };
         if !item.is_of(self.krate) {
@@ -199,7 +198,7 @@ impl<'a, A: Allocator + Clone> Items for TaskItems<'a, A> {
     }
 }
 
-impl<'a, A: Allocator + Clone> Source for TaskItems<'a, A> {
+impl<'a> Source for TaskItems<'a, '_> {
     fn krate(&self) -> CrateItemKey {
         self.krate
     }

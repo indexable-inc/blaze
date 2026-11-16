@@ -85,22 +85,146 @@ fn bare_key(key: &str) -> bool {
     !key.is_empty() && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
-/// `key` as a TOML key: bare when it can be, else a basic string.
-pub fn write_key<B: Allocator>(key: &str, out: &mut String<B>) {
-    match bare_key(key) {
-        true => out.push_str(key),
-        false => basic(key, out),
+// Strings and keys are spelled as cargo prints them: `toml_edit`'s default representation
+// (`toml_writer`'s `TomlStringBuilder::as_default` and `TomlKeyBuilder::as_default`), so a
+// manifest, config value or lockfile blaze writes is cargo's bytes.
+
+/// What a string holds that decides its spelling.
+struct Metrics {
+    most_single_quotes: usize,
+    most_double_quotes: usize,
+    /// A control character other than tab and newline, which only an escape can say.
+    escape_codes: bool,
+    /// A backslash.
+    escape: bool,
+    newline: bool,
+}
+
+impl Metrics {
+    fn of(text: &str) -> Metrics {
+        let mut m =
+            Metrics { most_single_quotes: 0, most_double_quotes: 0, escape_codes: false, escape: false, newline: false };
+        let (mut single, mut double) = (0usize, 0usize);
+        for &b in text.as_bytes() {
+            single = if b == b'\'' { single + 1 } else { 0 };
+            double = if b == b'"' { double + 1 } else { 0 };
+            m.most_single_quotes = m.most_single_quotes.max(single);
+            m.most_double_quotes = m.most_double_quotes.max(double);
+            match b {
+                b'\\' => m.escape = true,
+                b'\t' => {}
+                b'\n' => m.newline = true,
+                c if c <= 0x1f || c == 0x7f => m.escape_codes = true,
+                _ => {}
+            }
+        }
+        m
     }
 }
 
-/// `text` as a basic string.
-fn basic<B: Allocator>(text: &str, out: &mut String<B>) {
-    out.push('"');
+/// A TOML string's four spellings.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StringForm {
+    /// `"..."`, with escapes where needed.
+    Basic,
+    /// `'...'`: no escapes, so no `'`, newline or control character.
+    Literal,
+    /// `"""..."""`, a newline as itself.
+    MultiLineBasic,
+    /// `'''...'''`: no escapes, at most two `'` in a row.
+    MultiLineLiteral,
+}
+
+impl StringForm {
+    /// The form cargo writes `text` in: basic when it needs no escape, else literal, else a
+    /// multi-line form, else an escaped basic string.
+    pub fn of(text: &str) -> StringForm {
+        let m = Metrics::of(text);
+        if !m.escape_codes && !m.escape && m.most_double_quotes == 0 && !m.newline {
+            StringForm::Basic
+        } else if !m.escape_codes && m.most_single_quotes == 0 && !m.newline {
+            StringForm::Literal
+        } else if !m.escape_codes && !m.escape && m.most_double_quotes <= 2 {
+            StringForm::MultiLineBasic
+        } else if !m.escape_codes && m.most_single_quotes <= 2 {
+            StringForm::MultiLineLiteral
+        } else if m.newline {
+            StringForm::MultiLineBasic
+        } else {
+            StringForm::Basic
+        }
+    }
+
+    /// Whether `text` can be spelled this way and read back as itself.
+    pub fn holds(self, text: &str) -> bool {
+        let m = Metrics::of(text);
+        match self {
+            StringForm::Basic | StringForm::MultiLineBasic => true,
+            StringForm::Literal => !m.escape_codes && m.most_single_quotes == 0 && !m.newline,
+            StringForm::MultiLineLiteral => !m.escape_codes && m.most_single_quotes <= 2,
+        }
+    }
+}
+
+/// `text` as a TOML string value, in the form cargo writes it ([`StringForm::of`]).
+pub fn write_string<B: Allocator>(text: &str, out: &mut String<B>) {
+    write_string_as(text, StringForm::of(text), out);
+}
+
+/// `text` as a TOML string in `form`; refused, with nothing written, when the form cannot
+/// hold it ([`StringForm::holds`]).
+pub fn write_string_in_form<B: Allocator>(text: &str, form: StringForm, out: &mut String<B>) -> Result<(), StringForm> {
+    match form.holds(text) {
+        true => {
+            write_string_as(text, form, out);
+            Ok(())
+        }
+        false => Err(form),
+    }
+}
+
+fn write_string_as<B: Allocator>(text: &str, form: StringForm, out: &mut String<B>) {
+    let delimiter = match form {
+        StringForm::Literal => "'",
+        StringForm::Basic => "\"",
+        StringForm::MultiLineLiteral => "'''",
+        StringForm::MultiLineBasic => "\"\"\"",
+    };
+    let multi_line = matches!(form, StringForm::MultiLineLiteral | StringForm::MultiLineBasic);
+    out.push_str(delimiter);
+    // A newline just after the opening delimiter is trimmed when read, so a text that has
+    // newlines starts on the next line, as cargo writes it.
+    if multi_line && text.contains('\n') {
+        out.push('\n');
+    }
+    match form {
+        StringForm::Literal | StringForm::MultiLineLiteral => out.push_str(text),
+        StringForm::Basic | StringForm::MultiLineBasic => escape(text, multi_line, out),
+    }
+    out.push_str(delimiter);
+}
+
+/// `text` in a basic string: `"` escaped past the run a multi-line string allows, the short
+/// escapes, `\uXXXX` for the other control characters, a newline as itself in a multi-line one.
+fn escape<B: Allocator>(text: &str, multi_line: bool, out: &mut String<B>) {
+    let most_quotes = if multi_line { 2 } else { 0 };
+    let mut quotes = 0;
     let mut run = 0;
     for (i, &b) in text.as_bytes().iter().enumerate() {
+        if b == b'"' {
+            quotes += 1;
+            if quotes <= most_quotes {
+                continue;
+            }
+            // An escaped quote ends the run, as toml_writer counts it.
+            quotes = 0;
+        } else {
+            quotes = 0;
+        }
         let short = match b {
             b'"' => "\\\"",
             b'\\' => "\\\\",
+            b'\n' if multi_line => continue,
             b'\n' => "\\n",
             b'\r' => "\\r",
             b'\t' => "\\t",
@@ -117,7 +241,42 @@ fn basic<B: Allocator>(text: &str, out: &mut String<B>) {
         run = i + 1;
     }
     out.push_str(&text[run..]);
-    out.push('"');
+}
+
+/// `key` as a TOML key, as cargo writes it: bare when it can be, else a basic string when it
+/// needs no escape, else a literal one, else a basic string with escapes.
+pub fn write_key<B: Allocator>(key: &str, out: &mut String<B>) {
+    if bare_key(key) {
+        out.push_str(key);
+        return;
+    }
+    let (mut single, mut double, mut backslash, mut codes) = (false, false, false, false);
+    for &b in key.as_bytes() {
+        match b {
+            b'\'' => single = true,
+            b'"' => double = true,
+            b'\\' => backslash = true,
+            b'\t' => {}
+            c if c <= 0x1f || c == 0x7f => codes = true,
+            _ => {}
+        }
+    }
+    let form = match (codes, backslash, double, single) {
+        (false, false, false, _) => StringForm::Basic,
+        (false, _, _, false) => StringForm::Literal,
+        _ => StringForm::Basic,
+    };
+    write_string_as(key, form, out);
+}
+
+/// A dotted key, `a.b."c d"`: each part as [`write_key`] writes it, joined by `.`.
+pub fn write_dotted_key<B: Allocator, K: AsRef<str>>(parts: &[K], out: &mut String<B>) {
+    for (i, part) in parts.iter().enumerate() {
+        if i > 0 {
+            out.push('.');
+        }
+        write_key(part.as_ref(), out);
+    }
 }
 
 /// `value` as an inline TOML value (`1`, `"x"`, `[1, 2]`, `{ a = 1 }`) appended to `out`,
@@ -176,7 +335,7 @@ fn scalar<A: Allocator, B: Allocator>(value: &Value<A>, out: &mut String<B>) -> 
             }
         },
         Value::Float(x) => float(*x, out),
-        Value::Text(text) => basic(text.as_str(), out),
+        Value::Text(text) => write_string(text.as_str(), out),
         Value::List(_) | Value::Map(_) => unreachable!("a walk visits containers as starts"),
     }
     Ok(())

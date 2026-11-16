@@ -105,6 +105,13 @@ pub enum AliasKind {
     Const,
 }
 
+/// Whether an alias is rigid (`rustc_type_ir::IsRigid`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Rigid {
+    No,
+    Yes,
+}
+
 /// A closure's kind as the term in its args (`ConstValue(0)` is `Fn`, 1 `FnMut`, 2 `FnOnce`),
 /// or an inference variable while it is not known.
 pub const CLOSURE_FN: u64 = 0;
@@ -138,7 +145,10 @@ pub enum TyKind {
     /// Existential predicates (`ExTrait` principal first, then `ExProj`s, then `ExAuto`s,
     /// each sorted), then the region bound.
     Dynamic(List, Ty),
-    Alias(AliasKind, Def, List),
+    /// `Alias(IsRigid, AliasTy)` of the reference: a rigid alias (one the solver failed to
+    /// normalize further, marked by normalization) relates by structure like a type
+    /// constructor; relating a non-rigid one emits a `Projection` goal.
+    Alias(Rigid, AliasKind, Def, List),
     /// A generic parameter of the item in scope, by index (`Self` is 0 in a trait).
     Param(u32),
     /// A universally bound term: universe, index.
@@ -185,6 +195,9 @@ impl Flags {
     /// A region other than `'static` (a parameter, an erased one, a variable).
     pub const HAS_FREE_REGION: u16 = 1 << 8;
     pub const HAS_CANONICAL: u16 = 1 << 9;
+    /// An alias with `Rigid::No` (`HAS_TY_NON_RIGID_ALIAS` and friends in rustc_type_ir
+    /// flags.rs): relating the term may emit a `Projection` goal.
+    pub const HAS_NON_RIGID_ALIAS: u16 = 1 << 10;
 
     pub const fn has(self, bits: u16) -> bool {
         self.0 & bits != 0
@@ -255,13 +268,6 @@ pub enum Polarity {
     Negative,
 }
 
-/// An `AliasRelate`'s direction.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Dir {
-    Equate,
-    Subtype,
-}
-
 /// A host-effect goal's constness (`~const` is `Maybe`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Constness {
@@ -275,12 +281,13 @@ pub enum Constness {
 pub enum Pred {
     /// `args[0]: trait_<args[1..]>`.
     Trait { trait_: Def, args: List, polarity: Polarity },
-    /// `alias == term`, `alias` an `Alias` term (project_goals/mod.rs).
+    /// `alias == term`, `alias` an `Alias` term (`ClauseKind::Projection`, solved by
+    /// project_goals/mod.rs): also the goal relating a non-rigid alias emits, with a fresh
+    /// variable as `term` (rustc_type_ir relate/solver_relating.rs, the `IsRigid::No` arms).
     Projection { alias: Ty, term: Ty },
-    /// The alias's value is `term`, which is unconstrained when asked (normalizes_to.rs).
+    /// The alias's value is `term`, which is unconstrained when asked
+    /// (`PredicateKind::NormalizesTo`, normalizes_to.rs).
     NormalizesTo { alias: Ty, term: Ty },
-    /// `a == b` (or `a <: b`) where a side may be an alias (alias_relate).
-    AliasRelate { a: Ty, b: Ty, dir: Dir },
     /// `ty: 'region`: recorded for the borrow checker.
     TypeOutlives { ty: Ty, region: Ty },
     /// `'a: 'b`: recorded for the borrow checker.
@@ -511,7 +518,7 @@ pub fn children(k: TyKind) -> Children {
         | TyKind::FnDef(_, l)
         | TyKind::FnPtr(l)
         | TyKind::Closure(_, l)
-        | TyKind::Alias(_, _, l)
+        | TyKind::Alias(_, _, _, l)
         | TyKind::ExTrait(_, l) => Children::List(l),
         TyKind::Ref(r, t, _) => Children::Two(r, t),
         TyKind::Array(t, n) => Children::Two(t, n),

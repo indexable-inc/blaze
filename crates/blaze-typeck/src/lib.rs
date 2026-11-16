@@ -16,7 +16,7 @@
 #![register_tool(blaze)]
 #![forbid(unsafe_code)]
 
-#[cfg(test)]
+#[cfg(any(test, feature = "toy"))]
 extern crate std;
 
 mod body;
@@ -34,8 +34,11 @@ mod world;
 
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-mod toy;
+/// The toy type context: a hash-consed type table, union-find variables and a small solver.
+/// Public under feature `toy` for the `blaze run` walking skeleton (crates/blaze-cli/tests/ladder/
+/// README.md) until crates/blaze-ty implements [`TypeCtx`]; never the real checker's context.
+#[cfg(any(test, feature = "toy"))]
+pub mod toy;
 
 use blaze_own::Alloc;
 

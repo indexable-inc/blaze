@@ -10,7 +10,7 @@
 //! [`crate::ToValue`]. `field = field::Empty` declares a field a later `span.record(..)` gives.
 //! A site's target is its module's path unless it names one. Each site is one `static`
 //! [`crate::Metadata`] and one [`crate::Site`]; nothing is evaluated past the site's state's
-//! branch ([`crate::Site::on`]) unless something records the site.
+//! branch ([`crate::Site::how`]) unless something records the site.
 
 /// Reads a site's fields and message, then gives them to `$done` (`__span` or `__event`):
 /// `[names] [values] [message]`.
@@ -61,8 +61,10 @@ macro_rules! __span {
             $crate::Kind::SPAN,
         );
         static SITE: $crate::Site = $crate::Site::new(&META);
-        if $crate::Level::compiled($level) && SITE.on() {
-            $crate::Span::open(&SITE, $parent, &[$($v),*])
+        if $crate::Level::compiled($level)
+            && let ::core::option::Option::Some(how) = SITE.how()
+        {
+            $crate::Span::open(&SITE, how, $parent, &[$($v),*])
         } else {
             $crate::Span::none()
         }
@@ -87,8 +89,10 @@ macro_rules! __event {
             $crate::Kind::EVENT,
         );
         static SITE: $crate::Site = $crate::Site::new(&META);
-        if $crate::Level::compiled($level) && SITE.on() {
-            $crate::Event::emit(&SITE, $parent, &[$($v),*]);
+        if $crate::Level::compiled($level)
+            && let ::core::option::Option::Some(how) = SITE.how()
+        {
+            $crate::Event::emit(&SITE, how, $parent, &[$($v),*]);
         }
     }};
     (@site ($target:expr, $parent:expr, $level:expr) [$($n:expr),*] [$($v:expr),*] [$($message:tt)+]) => {{
@@ -103,9 +107,12 @@ macro_rules! __event {
             $crate::Kind::EVENT,
         );
         static SITE: $crate::Site = $crate::Site::new(&META);
-        if $crate::Level::compiled($level) && SITE.on() {
+        if $crate::Level::compiled($level)
+            && let ::core::option::Option::Some(how) = SITE.how()
+        {
             $crate::Event::emit(
                 &SITE,
+                how,
                 $parent,
                 &[$($v,)* ::core::option::Option::Some($crate::Value::Display(&format_args!($($message)+)))],
             );

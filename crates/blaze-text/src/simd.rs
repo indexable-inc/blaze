@@ -50,6 +50,10 @@ pub(crate) const fn is_special(b: u8) -> bool {
 /// then byte by byte for the tail.
 #[inline]
 pub(crate) fn next_special(bytes: &[u8], mut from: usize) -> usize {
+    // Under one vector, the byte loop: a short string costs no setup (0.75x measured at 4).
+    if bytes.len() - from < 16 {
+        return next_special_scalar(bytes, from);
+    }
     while from + 16 <= bytes.len() {
         let mask = special16(&bytes[from..]);
         if mask != 0 {

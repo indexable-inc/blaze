@@ -15,7 +15,7 @@ use blaze_kit::StaticSearch;
 
 fn main() {
     println!("ns per lower bound of a random probe");
-    for size in [10_000usize, 4_000_000, 64_000_000] {
+    for size in [1_000usize, 10_000, 30_000, 100_000, 300_000, 1_000_000, 4_000_000, 64_000_000] {
         let mut mix = bench::Mix(13);
         let mut keys: Vec<u32> = (0..size).map(|_| mix.next().truncate_to::<u32>()).collect();
         keys.sort_unstable();

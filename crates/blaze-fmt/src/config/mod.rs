@@ -276,7 +276,7 @@ pub enum ConfigError {
 }
 
 impl ConfigError {
-    fn io(what: &'static str, path: &Path) -> impl FnOnce(io::Error) -> ConfigError + '_ {
+    fn io<'p>(what: &'static str, path: &'p Path) -> impl FnOnce(io::Error) -> ConfigError + 'p {
         move |error| ConfigError::Io {
             what,
             path: path.to_owned(),

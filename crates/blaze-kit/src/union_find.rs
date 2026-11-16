@@ -21,6 +21,11 @@
 //! included) or [`UnionFind::commit`] (keep it; the outermost commit drops the log). A
 //! [`Snapshot`] is not `Copy` and is used up by either, and one closed out of order is a bug
 //! and panics naming both depths.
+//!
+//! # Measured (`examples/union_find.rs`, release, one Mac run, 2026-11-15)
+//!
+//! ns per unify and find against a naive union-find (no rank, no halving): 20.1 against 66.8; 31.0
+//! inside a snapshot that is rolled back.
 
 use core::{alloc::Allocator, any::type_name, marker::PhantomData};
 

@@ -4,10 +4,8 @@
 //! the reverse one (its readers) at once; nothing of the table is held in memory but the pages a
 //! run touches.
 
-use core::alloc::Allocator;
-
 use blaze_id::ContentId;
-use blaze_own::{SortedMap, Vec};
+use blaze_own::{ASortedMap, AVec, Alloc, SortedMap, Vec};
 
 use crate::condition::{Condition, Var};
 use crate::key::{Key, Name};
@@ -26,7 +24,7 @@ pub const MOST_BITS: u8 = 16;
 
 /// One name's answer.
 #[derive(Clone, Debug)]
-pub struct Row<A: Allocator + Clone> {
+pub struct Row<'a> {
     /// Its task key: what its record is.
     pub key: Key,
     /// Where its whole record is: the key itself, or the value key of a read-addressed record.
@@ -40,11 +38,11 @@ pub struct Row<A: Allocator + Clone> {
     /// Its start in its home's file; for a `FileItems` row, the edition it is read in.
     pub place: u32,
     /// Its read list, sorted by name: also the hints of its next run.
-    pub reads: Vec<(Name, ContentId), A>,
+    pub reads: AVec<'a, (Name, ContentId)>,
     /// The names its record lists.
-    pub parts: Vec<Name, A>,
+    pub parts: AVec<'a, Name>,
     /// The names whose read lists hold it, sorted: the reverse index.
-    pub readers: Vec<Name, A>,
+    pub readers: AVec<'a, Name>,
     /// Its record's split variable: its parts are then its forks, one per allowed value.
     pub split: Option<Var>,
     /// The name it is a fork of and the condition it runs under; `None` under
@@ -54,7 +52,7 @@ pub struct Row<A: Allocator + Clone> {
 }
 
 /// The rows of one page, by name.
-pub type Page<A> = SortedMap<Name, Row<A>, A>;
+pub type Page<'a> = ASortedMap<'a, Name, Row<'a>>;
 
 /// Which page of a root of `bits` holds `name`: its subject's leading bits.
 pub fn page_of(name: Name, bits: u8) -> u32 {
@@ -74,10 +72,10 @@ pub fn bits_for(rows: u64) -> u8 {
     bits
 }
 
-pub(crate) fn write_page<'r, A: Allocator + Clone + 'r, B: Allocator>(
-    rows: impl ExactSizeIterator<Item = (&'r Name, &'r Row<A>)>,
-    alloc: B,
-) -> Vec<u8, B> {
+pub(crate) fn write_page<'r, 'x: 'r, 'b>(
+    rows: impl ExactSizeIterator<Item = (&'r Name, &'r Row<'x>)>,
+    alloc: Alloc<'b>,
+) -> AVec<'b, u8> {
     let mut w = Writer::new_in(PAGE_MAGIC, alloc);
     w.count(rows.len());
     for (name, row) in rows {
@@ -114,9 +112,11 @@ pub(crate) fn write_page<'r, A: Allocator + Clone + 'r, B: Allocator>(
     w.finish()
 }
 
-pub(crate) fn read_page<A: Allocator + Clone>(bytes: &[u8], alloc: A) -> Result<Page<A>, WireError> {
+pub(crate) fn read_page<'a>(bytes: &[u8], alloc: Alloc<'a>) -> Result<Page<'a>, WireError> {
     let mut r = Reader::new(bytes, PAGE_MAGIC, "answer page")?;
-    let n = r.count(NAME_BYTES * 3 + 32 * 4 + 4 + 4 + 1 + 12)?;
+    // The least row: its name and home, key, at, source and out, place, split, the condition
+    // tag and three counts.
+    let n = r.count(NAME_BYTES * 2 + 32 * 4 + 4 + 4 + 1 + 12)?;
     let mut rows = Vec::with_capacity_in(n, alloc.clone());
     for _ in 0..n {
         let name = r.name()?;
@@ -155,14 +155,14 @@ pub(crate) fn read_page<A: Allocator + Clone>(bytes: &[u8], alloc: A) -> Result<
 
 /// The table's root: how it is paged and each page's key.
 #[derive(Clone, Debug)]
-pub struct Root<A: Allocator> {
+pub struct Root<'a> {
     pub bits: u8,
     pub rows: u64,
     /// One per page; [`Key::default`] for a page with no row.
-    pub pages: Vec<Key, A>,
+    pub pages: AVec<'a, Key>,
 }
 
-pub(crate) fn write_root<A: Allocator, B: Allocator>(root: &Root<A>, alloc: B) -> Vec<u8, B> {
+pub(crate) fn write_root<'b>(root: &Root<'_>, alloc: Alloc<'b>) -> AVec<'b, u8> {
     let mut w = Writer::new_in(ROOT_MAGIC, alloc);
     w.u8(root.bits);
     w.u32(u32::try_from(root.rows).unwrap_or(u32::MAX));
@@ -173,7 +173,7 @@ pub(crate) fn write_root<A: Allocator, B: Allocator>(root: &Root<A>, alloc: B) -
     w.finish()
 }
 
-pub(crate) fn read_root<A: Allocator>(bytes: &[u8], alloc: A) -> Result<Root<A>, WireError> {
+pub(crate) fn read_root<'a>(bytes: &[u8], alloc: Alloc<'a>) -> Result<Root<'a>, WireError> {
     let mut r = Reader::new(bytes, ROOT_MAGIC, "answer root")?;
     let bits = r.u8()?;
     let rows = u64::from(r.u32()?);
@@ -202,7 +202,7 @@ pub struct Last {
     pub root: Key,
 }
 
-pub(crate) fn write_last<A: Allocator>(last: &Last, alloc: A) -> Vec<u8, A> {
+pub(crate) fn write_last<'a>(last: &Last, alloc: Alloc<'a>) -> AVec<'a, u8> {
     let mut w = Writer::new_in(LAST_MAGIC, alloc);
     w.id(&last.tool);
     w.id(&last.shape);

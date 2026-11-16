@@ -104,8 +104,9 @@ pub struct Ran {
 
 /// A simulated program: given the command it was spawned with and the simulation's random
 /// numbers, what its run is.
-// dyn: a test's program, given once per path and called once per spawn of it.
-pub type Program = Box<dyn FnMut(&Command, &mut Rng) -> Ran>;
+// dyn: a test's program, given once per path and called once per spawn of it. `Send`: a
+// simulated world is an `Io` like a native one, and an `Io` crosses to bstd's pool workers.
+pub type Program = Box<dyn FnMut(&Command, &mut Rng) -> Ran + Send>;
 
 /// The signal a kill or a passed memory limit ends a process with.
 pub const KILLED: i32 = 9;
@@ -732,7 +733,7 @@ impl Sim {
     pub fn program(
         &mut self,
         path: impl Into<PathBuf>,
-        program: impl FnMut(&Command, &mut Rng) -> Ran + 'static,
+        program: impl FnMut(&Command, &mut Rng) -> Ran + Send + 'static,
     ) {
         // alloc: once per program the test gives.
         self.programs.insert(path.into(), Box::new(program));

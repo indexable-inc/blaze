@@ -1,0 +1,29 @@
+[package]
+name = "blaze-emit"
+description = "The baseline tier: one LIR function to AArch64 machine code in one pass, no optimization, every value in a stack slot, the platform's C convention, calls through slot words; the first backend that runs `blaze run` (crates/blaze-cli/tests/ladder/README.md)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The input: one function's columns (`View`), its ops, types and signatures.
+blaze-lir.workspace = true
+
+[dev-dependencies]
+# The reference evaluator every emitted function is compared with.
+blaze-lir = { workspace = true, features = ["eval"] }
+# `check`: random LIR functions run as machine code and in the evaluator.
+blaze-sim.workspace = true
+# `Executable`: emitted code made executable in the test process and called.
+blaze-inproc.workspace = true
+
+[lints]
+workspace = true

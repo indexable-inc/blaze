@@ -13,7 +13,7 @@ use super::{
     vec_case_in, words,
 };
 use crate::{
-    AVec, Alloc, Arc, Box, Cow, Erased, Inline, Packed, Rc, Vec,
+    AVec, Alloc, Arc, Box, Cow, Erased, Inline, Packed, Rc, SharedAlloc, Vec,
     plant::{self, Plant},
     testing::every_failure,
 };
@@ -174,6 +174,34 @@ fn a_handle_of_an_inline_buffer_grows_in_place_and_refuses_when_full() -> Result
         return Err(Broke::Oracle(format!("{events} events through the handle")));
     }
     Ok(())
+}
+
+#[test]
+fn a_vector_over_a_shared_handle_crosses_threads() -> Result<(), Broke> {
+    let counted = Counting::new();
+    let erased = Erased::new(&counted);
+    let shared = erased.shared();
+    let mut v: Vec<u64, SharedAlloc<'_>> = Vec::new_in(shared);
+    v.extend(0..10);
+    // Grown, then freed, on another thread, into the same allocator.
+    let sum = std::thread::scope(|s| {
+        s.spawn(move || {
+            v.extend(10..1000);
+            v.iter().sum::<u64>()
+        })
+        .join()
+    })
+    .map_err(|_| Broke::Harness(String::from("the other thread panicked")))?;
+    let global: Vec<u32, SharedAlloc<'static>> = Vec::from_slice_in(&[1, 2, 3], SharedAlloc::global());
+    let global_sum = std::thread::spawn(move || global.iter().sum::<u32>())
+        .join()
+        .map_err(|_| Broke::Harness(String::from("the other thread panicked")))?;
+    // The same handle as the kind functions take.
+    let local: Alloc<'_> = shared.local();
+    if sum != 499_500 || global_sum != 6 || !local.same(erased.handle()) {
+        return Err(Broke::Oracle(format!("sums {sum} and {global_sum}, or `local` is another allocator")));
+    }
+    counted.check()
 }
 
 #[test]

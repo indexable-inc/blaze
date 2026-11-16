@@ -34,7 +34,10 @@ fn sparse_case(tape: &Tape) -> Result<(), Broke> {
                 }
                 3..=4 => {
                     let at = model.iter().position(|&m| m == raw);
-                    ensure(set.remove(pt(raw)) == at.is_some(), || format!("remove of {raw} differs from the model"))?;
+                    // A stale position may point past `dense` and panic: that, too, is the set
+                    // differing from the model.
+                    let removed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| set.remove(pt(raw))));
+                    ensure(matches!(removed, Ok(r) if r == at.is_some()), || format!("remove of {raw} differs from the model"))?;
                     if let Some(at) = at {
                         model.remove(at);
                     }
@@ -50,6 +53,20 @@ fn sparse_case(tape: &Tape) -> Result<(), Broke> {
                     if tape.one_in(6, "clear") {
                         set.clear();
                         model.clear();
+                    } else if tape.coin("burst") {
+                        // A run of inserts, then three in four of it removed: enough tombstones
+                        // that the next insert compacts.
+                        let end = domain.min(raw + 100);
+                        for x in raw..end {
+                            if !model.contains(&x) {
+                                set.insert(pt(x));
+                                model.push(x);
+                            }
+                        }
+                        for x in (raw..end).filter(|x| x % 4 != 0) {
+                            set.remove(pt(x));
+                            model.retain(|&m| m != x);
+                        }
                     }
                 }
             }
@@ -57,6 +74,12 @@ fn sparse_case(tape: &Tape) -> Result<(), Broke> {
             ensure(set.iter().map(Id::to_u32).eq(model.iter().copied()), || format!("the order differs from the model"))?;
             let probe = small(tape, domain, "probe");
             ensure(set.contains(pt(probe)) == model.contains(&probe), || format!("contains {probe} differs from the model"))?;
+        }
+        // Remove every member one at a time, newest first, so every position is read.
+        while let Some(raw) = model.pop() {
+            let removed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| set.remove(pt(raw))));
+            ensure(matches!(removed, Ok(true)), || format!("remove of {raw} at the end differs from the model"))?;
+            ensure(set.iter().map(Id::to_u32).eq(model.iter().copied()), || format!("the order at the end differs from the model"))?;
         }
     }
     no_leaks(&alloc)

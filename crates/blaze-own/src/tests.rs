@@ -2241,12 +2241,22 @@ fn fixed_string_refuses_a_piece_whole_and_cuts_at_no_boundary() -> Result<(), Br
     if s.try_push_str("c€").is_ok() || s.as_str() != "ab" {
         return Err(Broke::Oracle(format!("a refused piece was cut in: {s:?}")));
     }
-    if s.try_push('€').is_err() || s.as_str() != "ab€" || s.try_push('x').is_ok() {
-        return Err(Broke::Oracle(format!("the char pushes gave {s:?}")));
+    // The refusal is sticky: a piece that would fit is refused too, and the count goes on.
+    let overflow = crate::Overflow { capacity: 5, needed: 2 + 4 + 3 };
+    if s.try_push('€').is_ok() || s.as_str() != "ab" || s.text() != Err(overflow) {
+        return Err(Broke::Oracle(format!("a write after a refusal gave {s:?}, {:?}", s.text())));
     }
     s.clear();
-    if write!(s, "{}", 12345).is_err() || write!(s, "{}", 6).is_ok() || &*s != "12345" {
+    if s.try_push('€').is_err() || s.as_str() != "€" || s.try_push_str("xyz").is_ok() || s.needed() != 6 {
+        return Err(Broke::Oracle(format!("after a clear the pushes gave {s:?}, {} bytes needed", s.needed())));
+    }
+    s.clear();
+    if write!(s, "{}", 12345).is_err() || s.text() != Ok("12345") || write!(s, "{}", 6).is_ok() || &*s != "12345" {
         return Err(Broke::Oracle(format!("the writes gave {s:?}")));
+    }
+    // The exact size of the next buffer: what all the writes wanted.
+    if !s.is_refused() || s.text() != Err(crate::Overflow { capacity: 5, needed: 6 }) {
+        return Err(Broke::Oracle(format!("the overflow read {:?}", s.text())));
     }
     Ok(())
 }

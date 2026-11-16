@@ -130,7 +130,7 @@ pub struct Session<'s, 'p, A: Allocator> {
 /// Runs one query over `tables`, with no views or parameters and the profile's bounds.
 pub fn run<'s, B: Allocator, A: Allocator + Copy>(
     sql: &'s str,
-    tables: &Catalog<'_, B, A>,
+    tables: &Catalog<'s, B, A>,
     alloc: A,
 ) -> Result<Rows<A>, QueryError<'s, A>> {
     let prelude = Prelude::empty(alloc);
@@ -142,7 +142,7 @@ pub fn run<'s, B: Allocator, A: Allocator + Copy>(
 pub fn run_with<'s, B: Allocator, A: Allocator + Copy>(
     sql: &'s str,
     session: &Session<'s, '_, A>,
-    tables: &Catalog<'_, B, A>,
+    tables: &Catalog<'s, B, A>,
     alloc: A,
 ) -> Result<Rows<A>, QueryError<'s, A>> {
     let statement_name = first_line(sql);

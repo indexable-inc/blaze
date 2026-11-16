@@ -17,7 +17,7 @@ use blaze_drive::{
 };
 use blaze_drive::record::Finding;
 use blaze_ids::ContentId;
-use blaze_own::Vec;
+use blaze_own::{AVec, Vec};
 use blaze_surface::{Edition, ItemDetail};
 use bstd::cx::Cx;
 use bstd::fs::{Dir, ReadWrite};
@@ -48,14 +48,14 @@ enum Did<'f> {
 }
 
 /// Run every task of `batch`, then answer the machine once.
-pub fn run_batch<'f>(
+pub fn run_batch<'f, 'r>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
     files: &[FileEntry<'_>],
-    req: &mut Request<&'f Frame>,
-    batch: Batch<&'f Frame>,
+    req: &mut Request<'r>,
+    batch: Batch<'r>,
     frame: &'f Frame,
-    effects: &mut Vec<Effect<&'f Frame>, &'f Frame>,
+    effects: &mut AVec<'_, Effect<'r>>,
 ) -> Result<(), CliError> {
     let cx = cx.span("batch");
     let mut did = Vec::with_capacity_in(batch.tasks.len(), frame);
@@ -106,8 +106,8 @@ fn run<'f>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
     files: &[FileEntry<'_>],
-    req: &Request<&'f Frame>,
-    task: &Task<&'f Frame>,
+    req: &Request<'_>,
+    task: &Task<'_>,
     frame: &'f Frame,
 ) -> Result<Did<'f>, CliError> {
     let cx = cx.span("task");
@@ -146,7 +146,10 @@ fn run<'f>(
                 return Err(CliError::Text { what: "a source file past 4 GiB" });
             }
             let edition = Edition::from_byte(task.edition).ok_or(CliError::Text { what: "a part's edition byte is no edition" })?;
-            let outline = blaze_file_items::outline(text, edition, frame);
+            // blaze-file-items allocates through a one-word handle; the frame carries no header of
+            // its own, so it is erased into one here, on this stack, for this task.
+            let erased = blaze_own::Erased::new(frame);
+            let outline = blaze_file_items::outline(text, edition, erased.handle());
             let mut parts = Vec::new_in(frame);
             for item in outline.items() {
                 let ItemDetail::Mod { inline: false, path: attr } = item.detail else { continue };
@@ -168,7 +171,7 @@ fn run<'f>(
                 findings.push((SYNTAX, error.range.start, error.range.end, at, messages.len()));
             }
             let record = outline
-                .to_file_items(text, ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes()), frame)
+                .to_file_items(text, ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes()), erased.handle())
                 .map_err(|_| CliError::Text { what: "the outline is not one of its file" })?;
             let payload = Vec::from_slice_in(&record, frame);
             let out = parts_out(&parts);
@@ -201,10 +204,10 @@ fn parts_out(parts: &[Part]) -> ContentId {
 /// directory named for it; each enclosing inline `mod` adds its name. `None` when an enclosing
 /// entry is not a module. A `name/mod.rs` file is not looked for: the drive stops with `NoFile`
 /// naming `name.rs` (a gap: choosing between the two reads the file list, a read the key lacks).
-fn module_file<'f, 't, A: core::alloc::Allocator>(
+fn module_file<'f, 't>(
     path: &str,
     text: &'t str,
-    outline: &blaze_file_items::Outline<A>,
+    outline: &blaze_file_items::Outline<'_>,
     item: &blaze_surface::Item,
     name: &str,
     frame: &'f Frame,
@@ -237,7 +240,7 @@ fn module_file<'f, 't, A: core::alloc::Allocator>(
     Ok(Some(out))
 }
 
-fn push_segment<A: core::alloc::Allocator>(out: &mut Vec<u8, A>, segment: &str) {
+fn push_segment(out: &mut Vec<u8, &Frame>, segment: &str) {
     if !out.is_empty() {
         out.push(b'/');
     }

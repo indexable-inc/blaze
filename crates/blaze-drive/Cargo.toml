@@ -33,6 +33,8 @@ blaze-format = { path = "../blaze-format" }
 [dev-dependencies]
 # `check` and `control`: the request's simulation and its planted-bug controls.
 blaze-sim.workspace = true
+# `Alloc::global()`: the tests' handle.
+blaze-own = { workspace = true, features = ["std"] }
 
 [lints]
 workspace = true

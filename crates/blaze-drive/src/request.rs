@@ -6,12 +6,11 @@
 //! names is their rows, read from the answer pages a job touches, and the readers posted this
 //! run.
 
-use core::alloc::Allocator;
 use core::fmt;
 
 use blaze_id::ContentId;
 use blaze_ids::Hasher;
-use blaze_own::{CollectIn, SortedMap, SortedSet, Vec, VecDeque, soa};
+use blaze_own::{AVec, Alloc, CollectIn, SortedMap, SortedSet, Vec, VecDeque, soa};
 
 use crate::Plant;
 use crate::answers::{self, Last, Page, Root, Row};
@@ -127,9 +126,9 @@ pub struct BatchId(pub u64);
 /// Tasks of one kind and one home, about [`TARGET_BATCH_NS`] of work together (drive.md,
 /// "Scheduling on many cores"): the coordinator's cost per task drops by the batch's size.
 #[derive(Debug)]
-pub struct Batch<A: Allocator> {
+pub struct Batch<'a> {
     pub id: BatchId,
-    pub tasks: Vec<(Ticket, Task<A>), A>,
+    pub tasks: Vec<(Ticket, Task<'a>), Alloc<'a>>,
 }
 
 /// A batch is sized to about this much work, from this run's mean time of its kind.
@@ -239,7 +238,7 @@ pub struct Input {
 
 /// A task to run.
 #[derive(Debug)]
-pub struct Task<A: Allocator> {
+pub struct Task<'a> {
     /// The job's name: what its [`Output`] is of. Under a condition it is a fork's name
     /// (`key::at_condition`), and the item is [`Task::base`].
     pub name: Name,
@@ -260,14 +259,14 @@ pub struct Task<A: Allocator> {
     pub file: Option<u32>,
     pub edition: u8,
     /// Its inputs: last time's read list first, then what it needed since.
-    pub inputs: Vec<Input, A>,
+    pub inputs: Vec<Input, Alloc<'a>>,
     /// A `Group`'s members.
-    pub members: Vec<Name, A>,
+    pub members: Vec<Name, Alloc<'a>>,
 }
 
 /// A finding to print: the caller places it with the file's line table.
 #[derive(Debug)]
-pub struct Print<A: Allocator> {
+pub struct Print<'a> {
     /// The item (a base name, never a fork's).
     pub name: Name,
     /// The configurations it holds in: every one that implies this (bottom.md 11: a finding
@@ -280,16 +279,16 @@ pub struct Print<A: Allocator> {
     pub rule: u16,
     pub start: u32,
     pub end: u32,
-    pub message: Vec<u8, A>,
+    pub message: Vec<u8, Alloc<'a>>,
 }
 
 /// What the machine asks of its caller.
 #[derive(Debug)]
-pub enum Effect<A: Allocator> {
+pub enum Effect<'a> {
     Get { key: Key },
     /// Write `bytes` at `key` once; bytes already there under the key stand.
-    Put { key: Key, bytes: Vec<u8, A> },
-    Run { batch: Batch<A> },
+    Put { key: Key, bytes: Vec<u8, Alloc<'a>> },
+    Run { batch: Batch<'a> },
     /// Write the name's row of the settled table (`Settled::publish`), after every `Put` before
     /// it has completed: a worker that reads the row reads the record at once.
     Publish(Input),
@@ -300,9 +299,9 @@ pub enum Effect<A: Allocator> {
     StartProgram { units: Key },
     /// Stop the running program: the gate found `errors` error-level findings.
     Stop { errors: u32 },
-    Print(Print<A>),
+    Print(Print<'a>),
     /// Replace the checkout's `last` file with `bytes`, after every `Put` before it.
-    WriteLast { bytes: Vec<u8, A> },
+    WriteLast { bytes: Vec<u8, Alloc<'a>> },
     Done(Answer),
 }
 
@@ -452,7 +451,7 @@ enum State {
     Settled,
 }
 
-struct Job<A: Allocator> {
+struct Job<'a> {
     state: State,
     home: Name,
     place: u32,
@@ -475,12 +474,12 @@ struct Job<A: Allocator> {
     /// first of its waits to settle, then waits again on the next.
     parked: bool,
     /// The names its next run is handed, sorted.
-    needs: Vec<Name, A>,
+    needs: Vec<Name, Alloc<'a>>,
     /// The read names its value key is made of.
-    shape: Vec<Name, A>,
+    shape: Vec<Name, Alloc<'a>>,
     /// Jobs waiting on this one.
-    waiters: Vec<Name, A>,
-    members: Vec<Name, A>,
+    waiters: Vec<Name, Alloc<'a>>,
+    members: Vec<Name, Alloc<'a>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -493,9 +492,9 @@ enum Purpose {
     Value(Name),
 }
 
-enum PageState<A: Allocator + Clone> {
+enum PageState<'a> {
     Loading,
-    Loaded(Page<A>),
+    Loaded(Page<'a>),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -510,21 +509,21 @@ enum Phase {
 }
 
 /// A name's findings as printed: its file, its start, its findings.
-struct Held<A: Allocator> {
+struct Held<'a> {
     file: Name,
     place: u32,
     /// The item and the condition its record was found under: a fork's findings print as its
     /// base's, under its condition.
     base: Name,
     condition: Condition,
-    findings: Vec<HeldFinding<A>, A>,
+    findings: Vec<HeldFinding<'a>, Alloc<'a>>,
 }
 
-struct HeldFinding<A: Allocator> {
+struct HeldFinding<'a> {
     rule: u16,
     start: u32,
     end: u32,
-    message: Vec<u8, A>,
+    message: Vec<u8, Alloc<'a>>,
 }
 
 /// Where a name's settled record is and what a read of it sees.
@@ -540,8 +539,8 @@ enum Digest {
 }
 
 /// One command's request.
-pub struct Request<A: Allocator + Clone> {
-    alloc: A,
+pub struct Request<'a> {
+    alloc: Alloc<'a>,
     config: Config,
     command: Command,
     shape_digest: ContentId,
@@ -550,56 +549,56 @@ pub struct Request<A: Allocator + Clone> {
     phase: Phase,
     profile: Profile,
 
-    files: FileRows<A>,
-    paths: Vec<u8, A>,
-    gone: Vec<ContentId, A>,
+    files: FileRows<Alloc<'a>>,
+    paths: Vec<u8, Alloc<'a>>,
+    gone: Vec<ContentId, Alloc<'a>>,
     cert: Key,
     last: Option<Last>,
     forward: bool,
 
-    root: Option<Root<A>>,
+    root: Option<Root<'a>>,
     root_loading: bool,
-    root_waiters: Vec<Name, A>,
-    pages: Table<u32, PageState<A>, A>,
-    page_waiters: Table<u32, Vec<Name, A>, A>,
+    root_waiters: Vec<Name, Alloc<'a>>,
+    pages: Table<u32, PageState<'a>, Alloc<'a>>,
+    page_waiters: Table<u32, Vec<Name, Alloc<'a>>, Alloc<'a>>,
     /// Rows this run changed or made.
-    new: Table<Name, Row<A>, A>,
+    new: Table<Name, Row<'a>, Alloc<'a>>,
     /// What each settled name is now.
-    now: Table<Name, Now, A>,
+    now: Table<Name, Now, Alloc<'a>>,
     /// Names a re-made home no longer lists.
-    dropped: Set<Name, A>,
+    dropped: Set<Name, Alloc<'a>>,
     /// The locates of the parts of homes loaded or made this run.
-    part_locs: Table<Name, (Locate, u32, Name), A>,
+    part_locs: Table<Name, (Locate, u32, Name), Alloc<'a>>,
     /// Readers posted this run: read name to the names that read it (a name settled twice
     /// posts twice; `dirty_readers` dedups).
-    posted: Table<Name, Vec<Name, A>, A>,
+    posted: Table<Name, Vec<Name, Alloc<'a>>, Alloc<'a>>,
 
-    jobs: Table<Name, Job<A>, A>,
+    jobs: Table<Name, Job<'a>, Alloc<'a>>,
     /// Jobs settled: `jobs.len() - settled` is how many are not (no scan).
     settled: usize,
-    wake: VecDeque<Name, A>,
-    gets: Table<Key, Vec<Purpose, A>, A>,
-    tickets: Table<Ticket, (Name, BatchId), A>,
+    wake: VecDeque<Name, Alloc<'a>>,
+    gets: Table<Key, Vec<Purpose, Alloc<'a>>, Alloc<'a>>,
+    tickets: Table<Ticket, (Name, BatchId), Alloc<'a>>,
     next_ticket: u64,
     /// Queued jobs, one FIFO ring per (class, kind) in run order: the person's first, then by
     /// kind (files, scopes, signatures, bodies, code). An entry is (name, the job's queue
     /// generation); one whose generation is not the job's is stale and skipped, so a job leaves
     /// the queue in O(1) (`unqueue`).
-    ready: Vec<VecDeque<(Name, u32), A>, A>,
+    ready: Vec<VecDeque<(Name, u32), Alloc<'a>>, Alloc<'a>>,
     /// Live entries per ring and in all.
     ready_live: [u32; RINGS],
     queued: usize,
     /// Stale entries skipped: bounded by queue operations, counted for the linearity test.
     ready_ops: u64,
     /// Batches out: at most one per worker, so a sorted set of at most `workers`.
-    batches: SortedSet<BatchId, A>,
+    batches: SortedSet<BatchId, Alloc<'a>>,
     next_batch: u64,
     /// The settled table's writes this step, last write per name: flushed as `Publish` and
     /// `Unpublish` at the step's end, after every `Put` of the step.
-    publish: Table<Name, Option<Input>, A>,
+    publish: Table<Name, Option<Input>, Alloc<'a>>,
 
-    findings: Table<Name, Held<A>, A>,
-    old_findings: SortedMap<Name, Held<A>, A>,
+    findings: Table<Name, Held<'a>, Alloc<'a>>,
+    old_findings: SortedMap<Name, Held<'a>, Alloc<'a>>,
     old_findings_loading: bool,
     units_at: Option<Key>,
 
@@ -613,15 +612,15 @@ pub struct Request<A: Allocator + Clone> {
     errors: u32,
 
     /// The request's space, owned (the caller's borrow ends with the constructor).
-    space_values: Vec<u16, A>,
-    space_implications: Vec<(Var, Var), A>,
+    space_values: Vec<u16, Alloc<'a>>,
+    space_implications: Vec<(Var, Var), Alloc<'a>>,
     space_closed: bool,
     /// What a split record's read of `space_name` (`key::space_name`) sees.
     space_digest: ContentId,
     space_name: Name,
     /// Each fork made or walked this run: its base and its condition (a fork with no entry
     /// here is found by its row's `cond`).
-    conditioned: Table<Name, (Name, Condition), A>,
+    conditioned: Table<Name, (Name, Condition), Alloc<'a>>,
 }
 
 /// Where a need of a job under a condition leads (drive.md, "One check covers every
@@ -652,13 +651,13 @@ const GROUP_DOMAIN: &str = "blaze-drive group 1";
 /// 2: each finding's item carries its base and condition.
 const CERT_MAGIC: &[u8; 4] = b"BDC2";
 
-impl<A: Allocator + Clone> Request<A> {
-    pub fn new_in(config: Config, ask: Ask<'_>, alloc: A) -> Request<A> {
+impl<'a> Request<'a> {
+    pub fn new_in(config: Config, ask: Ask<'_>, alloc: Alloc<'a>) -> Request<'a> {
         Request::planted_in(config, ask, Plant::None, alloc)
     }
 
     /// A request with `plant` planted: for a simulation's control only.
-    pub fn planted_in(config: Config, ask: Ask<'_>, plant: Plant, alloc: A) -> Request<A> {
+    pub fn planted_in(config: Config, ask: Ask<'_>, plant: Plant, alloc: Alloc<'a>) -> Request<'a> {
         // The space is part of the request's shape: a certificate answers for the space it
         // was checked under, and no other.
         let space_digest = key::space_digest(&ask.space);
@@ -739,7 +738,7 @@ impl<A: Allocator + Clone> Request<A> {
 
     /// The units are known: under `Beside` and `Reached` the program starts now, unless an
     /// error is already found.
-    fn units_known<B: Allocator>(&mut self, at: Key, out: &mut Vec<Effect<A>, B>) {
+    fn units_known(&mut self, at: Key, out: &mut AVec<'_, Effect<'a>>) {
         if self.runs_program() && self.gate != Gate::Before && self.program == Program::Unstarted && self.errors == 0 {
             self.program = Program::Running;
             out.push(Effect::StartProgram { units: at });
@@ -748,7 +747,7 @@ impl<A: Allocator + Clone> Request<A> {
 
     /// A settled record held `errors` error-level findings: under `Beside`, the first stops the
     /// running program.
-    fn found_errors<B: Allocator>(&mut self, errors: u32, out: &mut Vec<Effect<A>, B>) {
+    fn found_errors(&mut self, errors: u32, out: &mut AVec<'_, Effect<'a>>) {
         if errors == 0 {
             return;
         }
@@ -760,7 +759,7 @@ impl<A: Allocator + Clone> Request<A> {
     }
 
     /// The program ended.
-    fn exited<B: Allocator>(&mut self, ok: bool, out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
+    fn exited(&mut self, ok: bool, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
         match self.program {
             Program::Running | Program::Stopped => {}
             Program::Unstarted | Program::Ended { .. } => return Err(DriveError::NoProgram),
@@ -788,7 +787,7 @@ impl<A: Allocator + Clone> Request<A> {
 
     /// The answer, once both the check and the program (if any) are done: a success is never
     /// reported while an error is found or could still be.
-    fn conclude<B: Allocator>(&mut self, out: &mut Vec<Effect<A>, B>) {
+    fn conclude(&mut self, out: &mut AVec<'_, Effect<'a>>) {
         let Some(mut answer) = self.held else { return };
         let started = self.program != Program::Unstarted;
         let verdict = match (self.runs_program(), self.program) {
@@ -851,7 +850,7 @@ impl<A: Allocator + Clone> Request<A> {
     }
 
     /// One event in; its effects pushed onto `out`.
-    pub fn step<B: Allocator>(&mut self, event: Event<'_>, out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
+    pub fn step(&mut self, event: Event<'_>, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
         if self.phase == Phase::Answered {
             return Err(DriveError::Finished);
         }
@@ -875,7 +874,7 @@ impl<A: Allocator + Clone> Request<A> {
     }
 
     /// The table's writes of this step, after its `Put`s.
-    fn flush_publish<B: Allocator>(&mut self, out: &mut Vec<Effect<A>, B>) {
+    fn flush_publish(&mut self, out: &mut AVec<'_, Effect<'a>>) {
         if self.publish.is_empty() {
             return;
         }
@@ -887,7 +886,7 @@ impl<A: Allocator + Clone> Request<A> {
         }
     }
 
-    fn ran_batch<B: Allocator>(&mut self, batch: BatchId, results: &[Outcome<'_>], out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
+    fn ran_batch(&mut self, batch: BatchId, results: &[Outcome<'_>], out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
         if !self.batches.remove(&batch) {
             return Err(DriveError::UnknownBatch(batch));
         }
@@ -925,12 +924,12 @@ impl<A: Allocator + Clone> Request<A> {
 
     // --- Start and the certificate ------------------------------------------------------------
 
-    fn start<B: Allocator>(
+    fn start(
         &mut self,
         files: &[FileEntry<'_>],
         gone: &[&[u8]],
         last: Option<&[u8]>,
-        out: &mut Vec<Effect<A>, B>,
+        out: &mut AVec<'_, Effect<'a>>,
     ) -> Result<(), DriveError> {
         if files.windows(2).any(|w| w[0].path >= w[1].path) {
             return Err(DriveError::Unsorted { what: "the sweep's files" });
@@ -939,7 +938,7 @@ impl<A: Allocator + Clone> Request<A> {
             return Err(DriveError::SpaceNotClosed);
         }
         let mut units = Hasher::new(UNITS_SOURCE_DOMAIN);
-        let mut rows = Vec::with_capacity_in(files.len(), self.alloc.clone());
+        let mut rows = Vec::with_capacity_in(files.len(), self.alloc);
         for file in files {
             if file.manifest {
                 units.part(file.path).id(&file.id);
@@ -972,7 +971,7 @@ impl<A: Allocator + Clone> Request<A> {
     }
 
     /// The certificate missed: start the walk.
-    fn begin<B: Allocator>(&mut self, out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
+    fn begin(&mut self, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
         self.phase = Phase::Working;
         let last = self.last.filter(|last| last.tool == self.config.tool.0);
         self.last = last;
@@ -984,7 +983,7 @@ impl<A: Allocator + Clone> Request<A> {
             self.forward = last.shape == self.shape_digest && last.units == self.units_source;
         }
         if self.forward {
-            let mut seeds = Vec::new_in(self.alloc.clone());
+            let mut seeds = Vec::new_in(self.alloc);
             for (subject, changed) in self.files.subjects().iter().zip(self.files.changeds()) {
                 if *changed {
                     seeds.push(*subject);
@@ -1002,8 +1001,8 @@ impl<A: Allocator + Clone> Request<A> {
         Ok(())
     }
 
-    fn certified<B: Allocator>(&mut self, bytes: &[u8], out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
-        let (units, held) = read_cert(bytes, self.alloc.clone()).map_err(|error| DriveError::Wire { key: self.cert, error })?;
+    fn certified(&mut self, bytes: &[u8], out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
+        let (units, held) = read_cert(bytes, self.alloc).map_err(|error| DriveError::Wire { key: self.cert, error })?;
         self.profile.certified = true;
         let count = self.print(&held, out);
         let is_error = self.config.is_error;
@@ -1029,11 +1028,11 @@ impl<A: Allocator + Clone> Request<A> {
 
     // --- Events -------------------------------------------------------------------------------
 
-    fn get<B: Allocator>(&mut self, key: Key, purpose: Purpose, out: &mut Vec<Effect<A>, B>) {
+    fn get(&mut self, key: Key, purpose: Purpose, out: &mut AVec<'_, Effect<'a>>) {
         match self.gets.get_mut(&key) {
             Some(purposes) => purposes.push(purpose),
             None => {
-                let mut purposes = Vec::new_in(self.alloc.clone());
+                let mut purposes = Vec::new_in(self.alloc);
                 purposes.push(purpose);
                 self.gets.insert(key, purposes);
                 self.profile.gets += 1;
@@ -1042,12 +1041,12 @@ impl<A: Allocator + Clone> Request<A> {
         }
     }
 
-    fn put<B: Allocator>(&mut self, key: Key, bytes: Vec<u8, A>, out: &mut Vec<Effect<A>, B>) {
+    fn put(&mut self, key: Key, bytes: Vec<u8, Alloc<'a>>, out: &mut AVec<'_, Effect<'a>>) {
         self.profile.puts += 1;
         out.push(Effect::Put { key, bytes });
     }
 
-    fn got<B: Allocator>(&mut self, key: Key, bytes: Option<&[u8]>, out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
+    fn got(&mut self, key: Key, bytes: Option<&[u8]>, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
         let purposes = self.gets.remove(&key).ok_or(DriveError::UnaskedGet(key))?;
         if bytes.is_some() {
             self.profile.hits += 1;
@@ -1061,14 +1060,14 @@ impl<A: Allocator + Clone> Request<A> {
                 Purpose::OldCert => {
                     self.old_findings_loading = false;
                     if let Some(bytes) = bytes {
-                        self.old_findings = read_cert(bytes, self.alloc.clone()).map_err(|error| DriveError::Wire { key, error })?.1;
+                        self.old_findings = read_cert(bytes, self.alloc).map_err(|error| DriveError::Wire { key, error })?.1;
                     }
                 }
                 Purpose::Root => {
                     self.root_loading = false;
                     // A root the store lost is an empty table: every job is made or found again.
                     self.root = match bytes {
-                        Some(bytes) => Some(answers::read_root(bytes, self.alloc.clone()).map_err(|error| DriveError::Wire { key, error })?),
+                        Some(bytes) => Some(answers::read_root(bytes, self.alloc).map_err(|error| DriveError::Wire { key, error })?),
                         None => None,
                     };
                     if self.root.is_none() {
@@ -1081,7 +1080,7 @@ impl<A: Allocator + Clone> Request<A> {
                             self.add_job(units, units, Some(Locate::Source(self.units_source)), false, Class::Foreground)?;
                         }
                     }
-                    let waiters = core::mem::replace(&mut self.root_waiters, Vec::new_in(self.alloc.clone()));
+                    let waiters = core::mem::replace(&mut self.root_waiters, Vec::new_in(self.alloc));
                     for name in waiters.iter() {
                         self.wake.push_back(*name);
                     }
@@ -1089,8 +1088,8 @@ impl<A: Allocator + Clone> Request<A> {
                 Purpose::Page(index) => {
                     self.profile.pages += 1;
                     let page = match bytes {
-                        Some(bytes) => answers::read_page(bytes, self.alloc.clone()).map_err(|error| DriveError::Wire { key, error })?,
-                        None => SortedMap::new_in(self.alloc.clone()),
+                        Some(bytes) => answers::read_page(bytes, self.alloc).map_err(|error| DriveError::Wire { key, error })?,
+                        None => SortedMap::new_in(self.alloc),
                     };
                     self.pages.insert(index, PageState::Loaded(page));
                     if let Some(waiters) = self.page_waiters.remove(&index) {
@@ -1106,7 +1105,7 @@ impl<A: Allocator + Clone> Request<A> {
         Ok(())
     }
 
-    fn ran<B: Allocator>(&mut self, ticket: Ticket, ran: &Ran<'_>, out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
+    fn ran(&mut self, ticket: Ticket, ran: &Ran<'_>, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
         let (name, _) = self.tickets.remove(&ticket).ok_or(DriveError::UnknownTicket(ticket))?;
         if let Some(job) = self.jobs.get(&name)
             && job.entries > self.config.most_entries
@@ -1162,7 +1161,7 @@ impl<A: Allocator + Clone> Request<A> {
                     } else if self.plant == Plant::DoubleFlight
                         && self.jobs.get(&want.name).is_some_and(|job| job.state == State::Running)
                     {
-                        let mut tasks = Vec::new_in(self.alloc.clone());
+                        let mut tasks = Vec::new_in(self.alloc);
                         tasks.push(self.emit(want.name));
                         self.send(tasks, out);
                     }
@@ -1188,7 +1187,7 @@ impl<A: Allocator + Clone> Request<A> {
         if self.jobs.len() as u64 >= u64::from(self.config.most_jobs) {
             return Err(DriveError::TooManyJobs { most: self.config.most_jobs, name });
         }
-        let a = self.alloc.clone();
+        let a = self.alloc;
         self.jobs.insert(
             name,
             Job {
@@ -1252,12 +1251,12 @@ impl<A: Allocator + Clone> Request<A> {
 
     /// The forks of `name`, which split on `var`: one per value the space allows under its
     /// condition, sorted by name, each registered with its base and condition.
-    fn forks(&mut self, name: Name, var: Var) -> Result<Vec<(Name, Condition), A>, DriveError> {
+    fn forks(&mut self, name: Name, var: Var) -> Result<Vec<(Name, Condition), Alloc<'a>>, DriveError> {
         let (base, under) = self.cond_of(name);
         if under.get(var).is_some() {
             return Err(DriveError::SplitOnFixed { name, var });
         }
-        let mut forks = Vec::new_in(self.alloc.clone());
+        let mut forks = Vec::new_in(self.alloc);
         for fork in self.space().fork(&under, var).map_err(|error| DriveError::Condition { name: base, error })? {
             forks.push((key::at_condition(base, &fork), fork));
         }
@@ -1283,12 +1282,12 @@ impl<A: Allocator + Clone> Request<A> {
     /// A lookup by implication: from `need` down the splits on the way to the record whose
     /// condition `under` implies. A split's forks are its parts, so each is a job once the split
     /// settles; at most [`MOST_ATOMS`] splits lie on one way (each fixes one more variable).
-    fn resolve<B: Allocator>(
+    fn resolve(
         &mut self,
         need: Name,
         waiter: Name,
         under: &Condition,
-        out: &mut Vec<Effect<A>, B>,
+        out: &mut AVec<'_, Effect<'a>>,
     ) -> Result<Resolved, DriveError> {
         let mut at = need;
         for _ in 0..=MOST_ATOMS {
@@ -1338,7 +1337,7 @@ impl<A: Allocator + Clone> Request<A> {
     /// are what the space allows), whose parts are the job once per allowed value. Past the cap
     /// its record is instead the typed finding ([`ConditionError::OverCap`]), and the forks are
     /// not made.
-    fn split<B: Allocator>(&mut self, name: Name, var: Var, out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
+    fn split(&mut self, name: Name, var: Var, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
         let (_, under) = self.cond_of(name);
         let span = self.space().span(&under, var);
         let space_read = [(self.space_name, self.space_digest)];
@@ -1360,7 +1359,7 @@ impl<A: Allocator + Clone> Request<A> {
         let locate = job.locate.expect("a job runs once located");
         let place = job.place;
         let forks = self.forks(name, var)?;
-        let mut parts = Vec::with_capacity_in(forks.len(), self.alloc.clone());
+        let mut parts = Vec::with_capacity_in(forks.len(), self.alloc);
         let mut h = Hasher::new("blaze-drive split out 1");
         h.update(&var.to_le_bytes());
         for (fork, _) in forks.iter() {
@@ -1395,7 +1394,7 @@ impl<A: Allocator + Clone> Request<A> {
 
     fn wake_waiters(&mut self, name: Name) {
         let Some(job) = self.jobs.get_mut(&name) else { return };
-        let waiters = core::mem::replace(&mut job.waiters, Vec::new_in(self.alloc.clone()));
+        let waiters = core::mem::replace(&mut job.waiters, Vec::new_in(self.alloc));
         for waiter in waiters.iter() {
             self.wake.push_back(*waiter);
         }
@@ -1421,7 +1420,7 @@ impl<A: Allocator + Clone> Request<A> {
 
     /// Whether the old table is known for `name`: `Some(row or none)` when it is, `None` when
     /// `waiter` now waits for the root or the page.
-    fn old_ready<B: Allocator>(&mut self, name: Name, waiter: Name, out: &mut Vec<Effect<A>, B>) -> bool {
+    fn old_ready(&mut self, name: Name, waiter: Name, out: &mut AVec<'_, Effect<'a>>) -> bool {
         if self.last.is_none() {
             return true;
         }
@@ -1445,7 +1444,7 @@ impl<A: Allocator + Clone> Request<A> {
                 self.page_wait(index, waiter);
                 match key == Key::default() {
                     true => {
-                        self.pages.insert(index, PageState::Loaded(SortedMap::new_in(self.alloc.clone())));
+                        self.pages.insert(index, PageState::Loaded(SortedMap::new_in(self.alloc)));
                         self.wake.push_back(waiter);
                     }
                     false => self.get(key, Purpose::Page(index), out),
@@ -1462,7 +1461,7 @@ impl<A: Allocator + Clone> Request<A> {
         match self.page_waiters.get_mut(&index) {
             Some(list) => list.push(waiter),
             None => {
-                let mut list = Vec::new_in(self.alloc.clone());
+                let mut list = Vec::new_in(self.alloc);
                 list.push(waiter);
                 self.page_waiters.insert(index, list);
             }
@@ -1470,7 +1469,7 @@ impl<A: Allocator + Clone> Request<A> {
     }
 
     /// The old row of `name`, its page loaded.
-    fn old(&self, name: Name) -> Option<&Row<A>> {
+    fn old(&self, name: Name) -> Option<&Row<'a>> {
         let root = self.root.as_ref()?;
         match self.pages.get(&answers::page_of(name, root.bits))? {
             PageState::Loaded(page) => page.get(&name),
@@ -1479,12 +1478,12 @@ impl<A: Allocator + Clone> Request<A> {
     }
 
     /// The row this run knows for `name`: made this run, else the old one.
-    fn current(&self, name: Name) -> Option<&Row<A>> {
+    fn current(&self, name: Name) -> Option<&Row<'a>> {
         self.new.get(&name).or_else(|| self.old(name))
     }
 
     /// What a read of `read` sees now, or that `waiter` waits for it.
-    fn digest<B: Allocator>(&mut self, read: Name, waiter: Name, out: &mut Vec<Effect<A>, B>) -> Digest {
+    fn digest(&mut self, read: Name, waiter: Name, out: &mut AVec<'_, Effect<'a>>) -> Digest {
         if read == self.space_name {
             return Digest::Ready(Some(Now { at: Key::default(), out: self.space_digest }));
         }
@@ -1511,7 +1510,7 @@ impl<A: Allocator + Clone> Request<A> {
         self.files.subjects().binary_search(subject).ok()
     }
 
-    fn pump<B: Allocator>(&mut self, out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
+    fn pump(&mut self, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
         loop {
             while let Some(name) = self.wake.pop_front() {
                 self.ready_ops += 1;
@@ -1598,7 +1597,7 @@ impl<A: Allocator + Clone> Request<A> {
     /// many as make [`TARGET_BATCH_NS`] at this run's mean time of the kind, and no more than
     /// an even share of that kind's queue over the free workers, so no worker idles while
     /// another holds a long batch.
-    fn emit_ready<B: Allocator>(&mut self, out: &mut Vec<Effect<A>, B>) {
+    fn emit_ready(&mut self, out: &mut AVec<'_, Effect<'a>>) {
         let workers = self.config.workers.max(1) as usize;
         while self.batches.len() < workers {
             // The first ring with a live entry: at most `RINGS` (33) looks, a constant.
@@ -1608,7 +1607,7 @@ impl<A: Allocator + Clone> Request<A> {
             let of_kind = self.ready_live[r] as usize;
             let by_time = usize::try_from(TARGET_BATCH_NS / self.task_ns(kind)).unwrap_or(MOST_BATCH);
             let size = by_time.clamp(1, MOST_BATCH).min(of_kind.div_ceil(free)).max(1);
-            let mut tasks = Vec::with_capacity_in(size, self.alloc.clone());
+            let mut tasks = Vec::with_capacity_in(size, self.alloc);
             while tasks.len() < size {
                 let Some(name) = self.pop_ready(r) else { break };
                 tasks.push(self.emit(name));
@@ -1622,7 +1621,7 @@ impl<A: Allocator + Clone> Request<A> {
         }
     }
 
-    fn send<B: Allocator>(&mut self, tasks: Vec<(Ticket, Task<A>), A>, out: &mut Vec<Effect<A>, B>) {
+    fn send(&mut self, tasks: Vec<(Ticket, Task<'a>), Alloc<'a>>, out: &mut AVec<'_, Effect<'a>>) {
         let id = BatchId(self.next_batch);
         self.next_batch += 1;
         for (ticket, _) in tasks.iter() {
@@ -1634,10 +1633,10 @@ impl<A: Allocator + Clone> Request<A> {
         out.push(Effect::Run { batch: Batch { id, tasks } });
     }
 
-    fn emit(&mut self, name: Name) -> (Ticket, Task<A>) {
+    fn emit(&mut self, name: Name) -> (Ticket, Task<'a>) {
         let ticket = Ticket(self.next_ticket);
         self.next_ticket += 1;
-        let a = self.alloc.clone();
+        let a = self.alloc;
         let mut inputs = Vec::new_in(a.clone());
         let mut members = Vec::new_in(a.clone());
         let (base, condition) = self.cond_of(name);
@@ -1685,7 +1684,7 @@ impl<A: Allocator + Clone> Request<A> {
         (ticket, task)
     }
 
-    fn advance<B: Allocator>(&mut self, name: Name, out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
+    fn advance(&mut self, name: Name, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
         let Some(job) = self.jobs.get_mut(&name) else { return Ok(()) };
         job.parked = false;
         let state = job.state;
@@ -1699,7 +1698,7 @@ impl<A: Allocator + Clone> Request<A> {
     }
 
     /// Start: find the job's source and key.
-    fn locate<B: Allocator>(&mut self, name: Name, out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
+    fn locate(&mut self, name: Name, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
         if self.dropped.contains(&name) {
             self.gone_job(name);
             return Ok(());
@@ -1787,7 +1786,7 @@ impl<A: Allocator + Clone> Request<A> {
         self.decide(name, out)
     }
 
-    fn decide<B: Allocator>(&mut self, name: Name, out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
+    fn decide(&mut self, name: Name, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
         let job = self.jobs.get(&name).expect("a job");
         let (key, recheck) = (job.key, job.recheck);
         if name.kind == Kind::Group {
@@ -1804,7 +1803,7 @@ impl<A: Allocator + Clone> Request<A> {
                 .reads
                 .binary_search_by_key(&space_name, |(n, _)| *n)
                 .is_ok_and(|at| row.reads[at].1 != space_digest);
-            (row.key, other_space, row.reads.iter().map(|(n, _)| *n).collect_in(self.alloc.clone()))
+            (row.key, other_space, row.reads.iter().map(|(n, _)| *n).collect_in(self.alloc))
         });
         match row {
             Some((held, false, _)) if held == key && !recheck => self.stand(name, out),
@@ -1824,9 +1823,9 @@ impl<A: Allocator + Clone> Request<A> {
 
     /// Compute the value key from today's digests of the shape's reads, waiting for any not
     /// settled, then look it up.
-    fn value<B: Allocator>(&mut self, name: Name, out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
-        let shape = core::mem::replace(&mut self.jobs.get_mut(&name).expect("a job").shape, Vec::new_in(self.alloc.clone()));
-        let mut reads = Vec::with_capacity_in(shape.len(), self.alloc.clone());
+    fn value(&mut self, name: Name, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
+        let shape = core::mem::replace(&mut self.jobs.get_mut(&name).expect("a job").shape, Vec::new_in(self.alloc));
+        let mut reads = Vec::with_capacity_in(shape.len(), self.alloc);
         let mut waiting = false;
         for read in shape.iter() {
             match self.digest(*read, name, out) {
@@ -1846,7 +1845,7 @@ impl<A: Allocator + Clone> Request<A> {
         Ok(())
     }
 
-    fn looked<B: Allocator>(&mut self, name: Name, key: Key, bytes: Option<&[u8]>, out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
+    fn looked(&mut self, name: Name, key: Key, bytes: Option<&[u8]>, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
         if self.state(name) != Some(State::Looking) {
             return Ok(());
         }
@@ -1857,7 +1856,7 @@ impl<A: Allocator + Clone> Request<A> {
                 if shape.name != name {
                     return Err(DriveError::WrongRecord { key, asked: name, held: shape.name });
                 }
-                let mut names = Vec::with_capacity_in(shape.names().len(), self.alloc.clone());
+                let mut names = Vec::with_capacity_in(shape.names().len(), self.alloc);
                 names.extend(shape.names());
                 let job = self.jobs.get_mut(&name).expect("a job");
                 job.shape = names;
@@ -1867,7 +1866,7 @@ impl<A: Allocator + Clone> Request<A> {
         }
     }
 
-    fn valued<B: Allocator>(&mut self, name: Name, key: Key, bytes: Option<&[u8]>, out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
+    fn valued(&mut self, name: Name, key: Key, bytes: Option<&[u8]>, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
         if self.state(name) != Some(State::Valuing) {
             return Ok(());
         }
@@ -1879,7 +1878,7 @@ impl<A: Allocator + Clone> Request<A> {
     }
 
     /// The record at `at` was found: it is the job's answer.
-    fn found<B: Allocator>(&mut self, name: Name, at: Key, view: WholeView<'_>, out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
+    fn found(&mut self, name: Name, at: Key, view: WholeView<'_>, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
         if view.name != name {
             return Err(DriveError::WrongRecord { key: at, asked: name, held: view.name });
         }
@@ -1892,12 +1891,12 @@ impl<A: Allocator + Clone> Request<A> {
     }
 
     /// No record: hand the task its hints and run it.
-    fn to_run<B: Allocator>(&mut self, name: Name, out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
+    fn to_run(&mut self, name: Name, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
         let job = self.jobs.get(&name).expect("a job");
         if let Some(Locate::Key(key)) = job.locate {
             return Err(DriveError::Missing { name, key, builder: Builder::Pack { krate: job.home } });
         }
-        let hints = self.current(name).map(|row| row.reads.iter().map(|(n, _)| *n).collect_in(self.alloc.clone()));
+        let hints = self.current(name).map(|row| row.reads.iter().map(|(n, _)| *n).collect_in(self.alloc));
         if let Some(hints) = hints {
             let job = self.jobs.get_mut(&name).expect("a job");
             job.needs.extend_from_slice(&hints);
@@ -1909,8 +1908,8 @@ impl<A: Allocator + Clone> Request<A> {
     }
 
     /// Wait for every need to settle, then queue the run.
-    fn gather<B: Allocator>(&mut self, name: Name, out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
-        let needs = core::mem::replace(&mut self.jobs.get_mut(&name).expect("a job").needs, Vec::new_in(self.alloc.clone()));
+    fn gather(&mut self, name: Name, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
+        let needs = core::mem::replace(&mut self.jobs.get_mut(&name).expect("a job").needs, Vec::new_in(self.alloc));
         let (_, under) = self.cond_of(name);
         let mut waiting = false;
         let mut fork = None;
@@ -1948,25 +1947,25 @@ impl<A: Allocator + Clone> Request<A> {
         Ok(())
     }
 
-    fn stand<B: Allocator>(&mut self, name: Name, out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
+    fn stand(&mut self, name: Name, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
         self.profile.of(name.kind).standing += 1;
         self.settle(name, None, false, out)
     }
 
     /// A task made `output`: store it and settle its job.
-    fn made<B: Allocator>(&mut self, output: &Output<'_>, out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
+    fn made(&mut self, output: &Output<'_>, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
         self.made_split(output, None, out)
     }
 
     /// [`Request::made`], for a split's record too (`split` its variable).
-    fn made_split<B: Allocator>(&mut self, output: &Output<'_>, split: Option<Var>, out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
+    fn made_split(&mut self, output: &Output<'_>, split: Option<Var>, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
         let job = self.jobs.get(&output.name).expect("checked by the caller");
         let (key, source) = (job.key, job.source);
         // A worker names its reads by base name; the record holds the names its condition
         // implies (stored under the condition it read), so a fork's change dirties exactly the
         // readers of that fork.
         let (_, under) = self.cond_of(output.name);
-        let mut reads = Vec::with_capacity_in(output.reads.len(), self.alloc.clone());
+        let mut reads = Vec::with_capacity_in(output.reads.len(), self.alloc);
         for (read, saw) in output.reads {
             reads.push((self.resolve_settled(*read, &under), *saw));
         }
@@ -1992,11 +1991,11 @@ impl<A: Allocator + Clone> Request<A> {
             payload: output.payload,
             split,
         };
-        let bytes = record::write_whole(&whole, self.alloc.clone());
+        let bytes = record::write_whole(&whole, self.alloc);
         let at = match reads.is_empty() {
             true => key,
             false => {
-                let shape = record::write_shape(output.name, &reads, self.alloc.clone());
+                let shape = record::write_shape(output.name, &reads, self.alloc);
                 self.put(key, shape, out);
                 key::value_key(key, &reads)
             }
@@ -2013,14 +2012,14 @@ impl<A: Allocator + Clone> Request<A> {
     }
 
     /// The job's answer is in: its row, its findings, its parts, its readers.
-    fn settle<B: Allocator>(
+    fn settle(
         &mut self,
         name: Name,
         record: Option<(Key, WholeView<'_>)>,
         stale: bool,
-        out: &mut Vec<Effect<A>, B>,
+        out: &mut AVec<'_, Effect<'a>>,
     ) -> Result<(), DriveError> {
-        let a = self.alloc.clone();
+        let a = self.alloc;
         let before = self.now.get(&name).copied().or_else(|| self.old(name).map(|row| Now { at: row.at, out: row.out }));
         let job = self.jobs.get(&name).expect("a job");
         let (key, source, home, place, settles) = (job.key, job.source, job.home, job.place, job.settles);
@@ -2142,7 +2141,7 @@ impl<A: Allocator + Clone> Request<A> {
     /// A re-made home no longer lists `name`: its row goes, with the rows it listed whose pages
     /// this run holds, and its readers are checked again (a read of it is now `ABSENT`).
     fn drop_name(&mut self, name: Name) -> Result<(), DriveError> {
-        let mut work = Vec::new_in(self.alloc.clone());
+        let mut work = Vec::new_in(self.alloc);
         work.push(name);
         while let Some(gone) = work.pop() {
             if !self.dropped.insert(gone) {
@@ -2178,7 +2177,7 @@ impl<A: Allocator + Clone> Request<A> {
         if self.plant == Plant::SkipChangedRead {
             return Ok(());
         }
-        let mut readers = Vec::new_in(self.alloc.clone());
+        let mut readers = Vec::new_in(self.alloc);
         if let Some(row) = self.old(name) {
             readers.extend_from_slice(&row.readers);
         }
@@ -2225,7 +2224,7 @@ impl<A: Allocator + Clone> Request<A> {
     /// Nothing is out and jobs are unsettled: they wait on each other. A cycle of module scopes
     /// becomes one `Group` task; any other is an error naming it.
     fn break_cycle(&mut self) -> Result<(), DriveError> {
-        let mut cycle = Vec::new_in(self.alloc.clone());
+        let mut cycle = Vec::new_in(self.alloc);
         for (name, job) in self.jobs.iter() {
             if job.state != State::Settled {
                 cycle.push(*name);
@@ -2263,11 +2262,11 @@ impl<A: Allocator + Clone> Request<A> {
 
     /// Every job is settled: write the reverse index, the touched pages, the root, the
     /// certificate and `last`, then print.
-    fn finish<B: Allocator>(&mut self, out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
-        let a = self.alloc.clone();
+    fn finish(&mut self, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
+        let a = self.alloc;
         // Items by how many conditions they were answered under: each settled record that is
         // not a split is one condition of its base.
-        let mut per_item: Table<Name, u32, A> = Table::new_in(a.clone());
+        let mut per_item: Table<Name, u32, Alloc<'a>> = Table::new_in(a.clone());
         for (name, job) in self.jobs.iter() {
             if job.state == State::Settled && name.kind != Kind::Group && self.current(*name).is_some_and(|row| row.split.is_none()) {
                 let base = self.cond_of(*name).0;
@@ -2280,7 +2279,7 @@ impl<A: Allocator + Clone> Request<A> {
         }
         // The reverse index: each made row's reads against its old row's (both sorted by name,
         // so one binary search a read).
-        let mut updates: Vec<(Name, Name, bool), A> = Vec::new_in(a.clone());
+        let mut updates: Vec<(Name, Name, bool), Alloc<'a>> = Vec::new_in(a.clone());
         let has = |reads: &[(Name, ContentId)], read: &Name| reads.binary_search_by_key(read, |(r, _)| *r).is_ok();
         for (name, row) in self.new.iter() {
             let old = self.old(*name);
@@ -2423,8 +2422,8 @@ impl<A: Allocator + Clone> Request<A> {
             }
         };
         // Every row of a touched page, bucketed by page once: O(rows), not pages x rows.
-        let mut buckets: Table<u32, Vec<(Name, Row<A>), A>, A> = Table::new_in(a.clone());
-        let bucket = |buckets: &mut Table<u32, Vec<(Name, Row<A>), A>, A>, name: Name, row: &Row<A>| {
+        let mut buckets: Table<u32, Vec<(Name, Row<'a>), Alloc<'a>>, Alloc<'a>> = Table::new_in(a.clone());
+        let bucket = |buckets: &mut Table<u32, Vec<(Name, Row<'a>), Alloc<'a>>, Alloc<'a>>, name: Name, row: &Row<'a>| {
             let index = answers::page_of(name, bits);
             if touched.binary_search(&index).is_err() {
                 return;
@@ -2456,7 +2455,7 @@ impl<A: Allocator + Clone> Request<A> {
             let mut rows = buckets.remove(index).unwrap_or_else(|| Vec::new_in(a.clone()));
             rows.sort_unstable_by_key(|(name, _)| *name);
             rows.dedup_by_key(|(name, _)| *name);
-            let page: Page<A> = SortedMap::from_sorted(rows).expect("sorted and deduplicated above");
+            let page: Page<'a> = SortedMap::from_sorted(rows).expect("sorted and deduplicated above");
             let key = match page.is_empty() {
                 true => Key::default(),
                 false => {
@@ -2541,8 +2540,8 @@ impl<A: Allocator + Clone> Request<A> {
     }
 
     /// `Print` effects for `held`, sorted by path and position; how many.
-    fn print<B: Allocator>(&self, held: &SortedMap<Name, Held<A>, A>, out: &mut Vec<Effect<A>, B>) -> u32 {
-        let mut order = Vec::with_capacity_in(held.len(), self.alloc.clone());
+    fn print(&self, held: &SortedMap<Name, Held<'a>, Alloc<'a>>, out: &mut AVec<'_, Effect<'a>>) -> u32 {
+        let mut order = Vec::with_capacity_in(held.len(), self.alloc);
         for (name, entry) in held.iter() {
             let file = match entry.file.kind {
                 Kind::FileItems => self.file_index(&entry.file.subject).map(|i| i as u32),
@@ -2556,7 +2555,7 @@ impl<A: Allocator + Clone> Request<A> {
         for (_, place, name, file) in order.iter() {
             let entry = held.get(name).expect("listed above");
             for finding in entry.findings.iter() {
-                let mut message = Vec::with_capacity_in(finding.message.len(), self.alloc.clone());
+                let mut message = Vec::with_capacity_in(finding.message.len(), self.alloc);
                 message.extend_from_slice(&finding.message);
                 out.push(Effect::Print(Print {
                     name: entry.base,
@@ -2609,7 +2608,7 @@ fn file_of(name: Name, home: Name) -> Name {
     }
 }
 
-fn hold<A: Allocator + Clone>(view: &WholeView<'_>, alloc: A) -> Vec<HeldFinding<A>, A> {
+fn hold<'a>(view: &WholeView<'_>, alloc: Alloc<'a>) -> Vec<HeldFinding<'a>, Alloc<'a>> {
     let mut held = Vec::with_capacity_in(view.finding_count(), alloc.clone());
     for finding in view.findings() {
         let mut message = Vec::with_capacity_in(finding.message.len(), alloc.clone());
@@ -2621,7 +2620,7 @@ fn hold<A: Allocator + Clone>(view: &WholeView<'_>, alloc: A) -> Vec<HeldFinding
 
 /// The certificate: the units' record (so a repeat `run` starts at one read), then every
 /// finding of the answer.
-fn write_cert<A: Allocator + Clone>(held: &SortedMap<Name, Held<A>, A>, units: Option<Key>, alloc: A) -> Vec<u8, A> {
+fn write_cert<'a>(held: &SortedMap<Name, Held<'a>, Alloc<'a>>, units: Option<Key>, alloc: Alloc<'a>) -> Vec<u8, Alloc<'a>> {
     let mut w = Writer::new_in(CERT_MAGIC, alloc);
     w.u32(u32::from(units.is_some()));
     w.raw(&units.unwrap_or_default().0.0);
@@ -2643,9 +2642,9 @@ fn write_cert<A: Allocator + Clone>(held: &SortedMap<Name, Held<A>, A>, units: O
     w.finish()
 }
 
-type Cert<A> = (Option<Key>, SortedMap<Name, Held<A>, A>);
+type Cert<'a> = (Option<Key>, SortedMap<Name, Held<'a>, Alloc<'a>>);
 
-fn read_cert<A: Allocator + Clone>(bytes: &[u8], alloc: A) -> Result<Cert<A>, WireError> {
+fn read_cert<'a>(bytes: &[u8], alloc: Alloc<'a>) -> Result<Cert<'a>, WireError> {
     let mut r = Reader::new(bytes, CERT_MAGIC, "certificate")?;
     let has_units = r.u32()? == 1;
     let mut units = [0u8; 32];

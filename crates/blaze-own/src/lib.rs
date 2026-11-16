@@ -132,7 +132,7 @@ mod plant;
 
 pub use alloc_ref::{
     AArc, ABTreeMap, ABTreeSet, ABox, ADeque, ARc, ASoa, ASortedMap, ASortedSet, AString, AVec, Alloc, Erased,
-    Headed, Header,
+    Headed, Header, SharedAlloc,
 };
 pub use arc::Arc;
 pub use boxed::{Box, CallOnce};
@@ -140,7 +140,7 @@ pub use btree::{BTreeMap, BTreeSet};
 pub use cow::{Cow, ToOwnedIn};
 pub use deque::VecDeque;
 pub use error::AllocFailure;
-pub use fixed::{FixedString, FixedVec, Full, Inline};
+pub use fixed::{FixedString, FixedVec, Full, Inline, Overflow};
 pub use make::{CloneIn, DefaultIn, FromIn, FromStrIn, IntoIn, ParseIn, Share};
 pub use packed::{Pack, Packed};
 pub use raw::RawBuf;

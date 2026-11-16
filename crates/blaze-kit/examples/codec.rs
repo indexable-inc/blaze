@@ -1,6 +1,6 @@
 //! At three sizes: the delta column (encode and decode) against plain 8-byte little-endian
-//! values, with the bytes each takes; and `Dict` against a `std::collections::HashMap` from
-//! value to code.
+//! values, with the bytes each takes; and `Dict` against `blaze_hash::HashMap` (FixedState)
+//! and `std::collections::HashMap` (SipHash) from value to code.
 //!
 //!     cargo run --release -p blaze-kit --example codec
 
@@ -68,7 +68,21 @@ fn main() {
             }
             u64::try_from(values.len()).unwrap_or(0)
         });
+        let fixed = bench::ns_per_op(ops, || {
+            let mut map: blaze_hash::HashMap<u64, u32, System> = blaze_hash::HashMap::new_in(System);
+            let mut codes: Vec<u32> = Vec::with_capacity(0);
+            let mut values: Vec<u64> = Vec::new();
+            for &v in &rows {
+                let next = u32::try_from(values.len()).unwrap_or(u32::MAX);
+                let code = *map.entry(v).or_insert_with(|| {
+                    values.push(v);
+                    next
+                });
+                codes.push(code);
+            }
+            u64::try_from(values.len()).unwrap_or(0)
+        });
         println!("{size} rows of {distinct} values: ns per row coded");
-        bench::row(size, &[("Dict", dict), ("HashMap (SipHash)", std)]);
+        bench::row(size, &[("Dict", dict), ("blaze_hash::HashMap", fixed), ("std HashMap (SipHash)", std)]);
     }
 }

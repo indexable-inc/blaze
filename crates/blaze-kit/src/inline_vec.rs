@@ -18,6 +18,18 @@
 //! copy back and forth.
 //!
 //! Zero-sized `T` is refused at compile time: a list of them is a count.
+//!
+//! # Measured (`examples/inline_vec.rs`, release, one Mac run, 2026-11-15)
+//!
+//! Before: `InlineVec<u32, 4>` against `Vec<u32>`, ns per vector made, filled, summed and
+//! dropped: 3 values 12.3 against 10.0, 8 values 31.6 against 36.4, 64 values 309 against 169.
+//! Cause read from the code (not profiled): each push branched on the state three times
+//! (`len`, `capacity`, `parts_mut`) with the growth path inlined into the loop, so the spilled
+//! loop was not `Vec`'s; `drop` was an out-of-line call even inline with nothing to drop.
+//! Fix: `try_push` reads the state once and keeps growth cold and out of line,
+//! `try_extend_from_slice` reads it once per slice, `drop` returns at once inline for a `T`
+//! with no drop. After (2026-11-15, one run, this machine): 3 values 2.51 against `Vec`'s
+//! 10.88, 8 values 15.92 against 32.82, 64 values 105.76 against 145.42: ahead at every size.
 
 use core::{
     alloc::{Allocator, Layout},
@@ -302,15 +314,41 @@ impl<T, const N: usize, A: Allocator> InlineVec<T, N, A> {
     }
 
     /// Appends `value`, or gives it back with the refusal and nothing changed.
+    ///
+    /// The state is read once: inline with room, one compare and a store; spilled with room,
+    /// `Vec::push`'s code (a compare of length and capacity, a store). Growth, the spill
+    /// included, is out of line and cold, so the loop a push sits in carries no growth code.
     #[inline]
     pub fn try_push(&mut self, value: T) -> Result<(), Refused<T>> {
-        if self.len() == self.capacity()
-            && let Err(why) = self.try_grow_for(1)
-        {
+        if self.capacity < N {
+            // SAFETY: inline (`capacity < N`), so `inline` is the field in use and slot
+            // `capacity`, below `N`, is free.
+            unsafe { (*self.data.inline).as_mut_ptr().cast::<T>().add(self.capacity).write(value) };
+            self.capacity += 1;
+            return Ok(());
+        }
+        if self.capacity > N {
+            // SAFETY: spilled, so `heap` is the field in use.
+            let heap = unsafe { &mut self.data.heap };
+            if heap.1 < self.capacity {
+                // SAFETY: slot `heap.1` is inside the block (below its capacity) and free.
+                unsafe { heap.0.as_ptr().add(heap.1).write(value) };
+                heap.1 += 1;
+                return Ok(());
+            }
+        }
+        self.push_grown(value)
+    }
+
+    /// A push that grows first: the spill, or a full block.
+    #[cold]
+    #[inline(never)]
+    fn push_grown(&mut self, value: T) -> Result<(), Refused<T>> {
+        if let Err(why) = self.try_grow_for(1) {
             return Err(Refused { value, why });
         }
         let (first, len) = self.parts_mut();
-        // SAFETY: there is room, so slot `len` is inside the storage and holds no value.
+        // SAFETY: there is room now, so slot `len` is inside the storage and holds no value.
         unsafe { first.add(*len).write(value) };
         *len += 1;
         Ok(())
@@ -477,8 +515,9 @@ impl<T, const N: usize, A: Allocator> InlineVec<T, N, A> {
         T: Clone,
     {
         self.try_grow_for(values.len())?;
+        // The state is read once for the whole slice.
+        let (first, count) = self.parts_mut();
         for value in values {
-            let (first, count) = self.parts_mut();
             // SAFETY: room for all of `values` was made, so slot `count` is free.
             unsafe { first.add(*count).write(value.clone()) };
             *count += 1;
@@ -497,7 +536,12 @@ impl<T, const N: usize, A: Allocator> InlineVec<T, N, A> {
 }
 
 impl<T, const N: usize, A: Allocator> Drop for InlineVec<T, N, A> {
+    #[inline]
     fn drop(&mut self) {
+        // Inline values that need no drop: nothing to do, no call made.
+        if !self.spilled() && !core::mem::needs_drop::<T>() {
+            return;
+        }
         let len = self.len();
         let first = self.as_mut_ptr();
         let _free = if self.spilled() {

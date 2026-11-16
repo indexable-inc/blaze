@@ -16,6 +16,7 @@ doctest = false
 [dependencies]
 blaze-core.workspace = true
 blaze-hash.workspace = true
+blaze-kit.workspace = true
 blaze-mem.workspace = true
 blaze-radix.workspace = true
 blaze-protocol.workspace = true

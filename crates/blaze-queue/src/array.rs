@@ -231,3 +231,36 @@ impl<T> fmt::Debug for ArrayQueue<T> {
         f.debug_struct("ArrayQueue").field("len", &self.len()).field("cap", &self.cap).finish()
     }
 }
+
+/// The values of an [`ArrayQueue`] taken by value, in order.
+pub struct IntoIter<T>(ArrayQueue<T>);
+
+impl<T> IntoIterator for ArrayQueue<T> {
+    type Item = T;
+    type IntoIter = IntoIter<T>;
+
+    fn into_iter(self) -> IntoIter<T> {
+        IntoIter(self)
+    }
+}
+
+impl<T> Iterator for IntoIter<T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        self.0.pop()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let len = self.0.len();
+        (len, Some(len))
+    }
+}
+
+impl<T> ExactSizeIterator for IntoIter<T> {}
+
+impl<T> fmt::Debug for IntoIter<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_tuple("IntoIter").field(&self.0).finish()
+    }
+}

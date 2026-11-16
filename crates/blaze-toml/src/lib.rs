@@ -4,8 +4,11 @@
 //!   byte range (manifests need them: errors on the right line, and edits that keep the rest);
 //!   [`Item`] reads it, and [`Document::to_value_in`] lowers it to a
 //!   [`blaze_data::Value`] (a datetime as its RFC 3339 text).
-//! - [`write_document`] / [`write_inline`]: a `Value` to TOML text, keys in insertion order.
-//! - [`Edit`]: set a key, or put a value into an array, keeping every other byte of the text.
+//! - [`write_document`] / [`write_inline`]: a `Value` to TOML text, keys in insertion order;
+//!   [`write_string`], [`write_key`] and [`write_dotted_key`] spell strings and keys as cargo
+//!   does (basic, literal or multi-line by what the text holds, [`StringForm`]).
+//! - [`Edit`]: set a key, put a value into an array, or remove a key or a table, keeping every
+//!   other byte of the text.
 //!
 //! The reader is the whole of TOML 1.0: tables, arrays of tables and inline tables, dotted
 //! keys, the four string forms, integers in every radix, floats with `inf` and `nan`, booleans,
@@ -49,7 +52,10 @@ mod plant {
 
 pub use doc::{Children, Date, Datetime, Document, Item, Kind, Offset, Origin, Time};
 pub use edit::{Edit, EditError, EditWhat};
-pub use write::{DocumentOptions, Unwritable, WriteError, write_document, write_inline, write_key};
+pub use write::{
+    DocumentOptions, StringForm, Unwritable, WriteError, write_document, write_dotted_key, write_inline, write_key,
+    write_string, write_string_in_form,
+};
 
 /// The bounds a read holds untrusted text to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

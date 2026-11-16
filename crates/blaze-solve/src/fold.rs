@@ -68,7 +68,7 @@ pub fn rebuild<T: Tys>(tys: &mut T, k: TyKind, kids: &[Ty]) -> Result<Ty, SolveE
         TyKind::FnDef(d, _) => TyKind::FnDef(d, tys.mk_list(kids)?),
         TyKind::FnPtr(_) => TyKind::FnPtr(tys.mk_list(kids)?),
         TyKind::Closure(d, _) => TyKind::Closure(d, tys.mk_list(kids)?),
-        TyKind::Alias(a, d, _) => TyKind::Alias(a, d, tys.mk_list(kids)?),
+        TyKind::Alias(r, a, d, _) => TyKind::Alias(r, a, d, tys.mk_list(kids)?),
         TyKind::ExTrait(d, _) => TyKind::ExTrait(d, tys.mk_list(kids)?),
         TyKind::Ref(_, _, m) => TyKind::Ref(kids[0], kids[1], m),
         TyKind::Array(..) => TyKind::Array(kids[0], kids[1]),

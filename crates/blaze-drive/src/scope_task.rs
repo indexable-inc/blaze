@@ -6,11 +6,10 @@
 //! unwinding). A cycle is the request machine's: the members wait on each other, the machine
 //! finds them quiet and runs them as one `Group`.
 
-use core::alloc::Allocator;
 use core::fmt;
 
 use blaze_id::ItemKey;
-use blaze_own::{Alloc, Vec};
+use blaze_own::{AVec, Alloc, Vec};
 use blaze_scope::{Answer, Read, Reply, ResolveError, Resolved, Resolver, ScopeFacts, Step};
 use blaze_surface::SurfaceError;
 
@@ -168,19 +167,18 @@ impl<F: ScopeFacts> ScopeFacts for SharedRoot<'_, F> {
 /// One round of a crate's first fill: an entry of every module in `modules` over one decoded
 /// root, each outcome pushed in order. A module's error is its own (rule 20): it is pushed as
 /// that module's outcome, and the round goes on.
-pub fn fill_round<'a, N, F, R, B>(
+pub fn fill_round<'a, N, F, R>(
     facts: &F,
     krate: blaze_id::CrateItemKey,
     modules: &[ItemKey],
     reads: &R,
     alloc: Alloc<'a>,
-    out: &mut Vec<Result<ScopeOutcome<'a, N>, ScopeTaskError>, B>,
+    out: &mut AVec<'_, Result<ScopeOutcome<'a, N>, ScopeTaskError>>,
 ) -> Result<(), SurfaceError>
 where
     N: blaze_scope::Name,
     F: ScopeFacts<Name = N>,
     R: ScopeReads<N>,
-    B: Allocator,
 {
     let shared = SharedRoot::new(facts, krate)?;
     for module in modules {
@@ -189,7 +187,7 @@ where
     Ok(())
 }
 
-fn add<A: Allocator>(needs: &mut Vec<Name, A>, name: Name) {
+fn add(needs: &mut AVec<'_, Name>, name: Name) {
     if let Err(at) = needs.binary_search(&name) {
         needs.insert(at, name);
     }

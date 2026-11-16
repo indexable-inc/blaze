@@ -310,6 +310,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-build"
+version = "0.0.0"
+dependencies = [
+ "blaze-lir",
+ "blaze-own",
+ "blaze-sim",
+ "blaze-typeck",
+]
+
+[[package]]
 name = "blaze-build-script"
 version = "0.0.0"
 dependencies = [
@@ -394,6 +404,7 @@ dependencies = [
  "blaze-drive",
  "blaze-file-items",
  "blaze-ids",
+ "blaze-ladder",
  "blaze-own",
  "blaze-std",
  "blaze-surface",
@@ -476,6 +487,15 @@ dependencies = [
  "blaze-scope",
  "blaze-sim",
  "blaze-surface",
+]
+
+[[package]]
+name = "blaze-emit"
+version = "0.0.0"
+dependencies = [
+ "blaze-inproc",
+ "blaze-lir",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -655,6 +675,7 @@ dependencies = [
  "blaze-core",
  "blaze-hash",
  "blaze-ids",
+ "blaze-kit",
  "blaze-mem",
  "blaze-protocol",
  "blaze-queue",
@@ -828,6 +849,7 @@ dependencies = [
  "blaze-radix",
  "blaze-spin",
  "libc",
+ "parking_lot",
  "windows-sys 0.61.2",
 ]
 
@@ -880,6 +902,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-ladder"
+version = "0.0.0"
+dependencies = [
+ "blaze-build",
+ "blaze-emit",
+ "blaze-file-items",
+ "blaze-hash",
+ "blaze-ids",
+ "blaze-launch",
+ "blaze-launch-rt",
+ "blaze-own",
+ "blaze-sim",
+ "blaze-surface",
+ "blaze-typeck",
+ "libc",
+ "parser",
+]
+
+[[package]]
 name = "blaze-launch"
 version = "0.0.0"
 dependencies = [
@@ -904,6 +945,17 @@ dependencies = [
  "blaze-launch",
  "blaze-launch-rt",
  "libc",
+]
+
+[[package]]
+name = "blaze-lex"
+version = "0.0.0"
+dependencies = [
+ "blaze-int",
+ "blaze-memchr",
+ "blaze-sim",
+ "blaze-unicode",
+ "rustc_lexer",
 ]
 
 [[package]]
@@ -1171,6 +1223,7 @@ dependencies = [
  "blaze-data",
  "blaze-hash",
  "blaze-own",
+ "blaze-profile",
  "blaze-sim",
  "blaze-sql",
 ]
@@ -1249,6 +1302,8 @@ dependencies = [
 name = "blaze-scope"
 version = "0.0.0"
 dependencies = [
+ "blaze-expand",
+ "blaze-file-items",
  "blaze-hash",
  "blaze-id",
  "blaze-own",
@@ -2731,6 +2786,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
+name = "lock_api"
+version = "0.4.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "224399e74b87b5f3557511d98dff8b14089b3dadafcab6bb93eab67d3aace965"
+dependencies = [
+ "scopeguard",
+]
+
+[[package]]
 name = "log"
 version = "0.4.31"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3039,6 +3103,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7c87def4c32ab89d880effc9e097653c8da5d6ef28e6b539d313baaacfbafcbe"
 
 [[package]]
+name = "parking_lot"
+version = "0.12.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "93857453250e3077bd71ff98b6a65ea6621a19bb0f559a85248955ac12c45a1a"
+dependencies = [
+ "lock_api",
+ "parking_lot_core",
+]
+
+[[package]]
+name = "parking_lot_core"
+version = "0.9.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2621685985a2ebf1c516881c026032ac7deafcda1a2c9b7850dc81e3dfcb64c1"
+dependencies = [
+ "cfg-if",
+ "libc",
+ "redox_syscall",
+ "smallvec",
+ "windows-link",
+]
+
+[[package]]
 name = "parser"
 version = "0.0.0"
 dependencies = [
@@ -3306,6 +3393,15 @@ dependencies = [
  "time",
  "x509-parser",
  "yasna",
+]
+
+[[package]]
+name = "redox_syscall"
+version = "0.5.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
+dependencies = [
+ "bitflags",
 ]
 
 [[package]]

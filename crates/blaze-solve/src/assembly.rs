@@ -287,7 +287,6 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
             }
             Pred::Projection { alias, term } => Pred::Projection { alias: f(self, alias)?, term: f(self, term)? },
             Pred::NormalizesTo { alias, term } => Pred::NormalizesTo { alias: f(self, alias)?, term: f(self, term)? },
-            Pred::AliasRelate { a, b, dir } => Pred::AliasRelate { a: f(self, a)?, b: f(self, b)?, dir },
             Pred::TypeOutlives { ty, region } => Pred::TypeOutlives { ty: f(self, ty)?, region: f(self, region)? },
             Pred::RegionOutlives { a, b } => Pred::RegionOutlives { a: f(self, a)?, b: f(self, b)? },
             Pred::WellFormed(t) => Pred::WellFormed(f(self, t)?),
@@ -354,24 +353,47 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
 
     // Relating and adding goals.
 
-    /// Relates `a` and `b`; an alias met on one side becomes a nested `AliasRelate` goal
-    /// (`TypeRelating`). `false`: they do not unify (nothing stays bound).
+    /// Relates `a` and `b` (the reference's `EvalCtxt::eq`, through rustc_type_ir
+    /// relate/solver_relating.rs): a non-rigid alias met on one side becomes a nested
+    /// `Projection { alias, term: fresh }` goal (`TypeRelating`) and `fresh` is related with the
+    /// other side. `false`: they do not unify (nothing stays bound).
     pub fn eq(&mut self, a: Ty, b: Ty) -> Result<bool, Stop> {
         let base = self.deferred.len();
-        if !self.tys.unify(a, b, self.deferred)? {
+        if !self.tys.unify(a, b, crate::tys::Relate::Lazy, self.deferred)? {
             self.deferred.truncate(base);
             return Ok(false);
         }
+        // Each deferred pair relates a fresh variable with the other side, which may defer
+        // more pairs; every round removes one alias from the pair it relates, so the loop ends
+        // within the size of the two terms.
         while self.deferred.len() > base {
-            let Some((x, y)) = self.deferred.pop() else { break };
+            let Some((alias, other)) = self.deferred.pop() else { break };
+            let kind = match self.tys.kind(alias) {
+                TyKind::Alias(_, crate::term::AliasKind::Const, ..) => VarKind::Const,
+                _ => VarKind::Ty,
+            };
+            let fresh = self.tys.fresh(kind)?;
             self.added.push(Added {
                 source: GoalSource::TypeRelating,
-                pred: Pred::AliasRelate { a: x, b: y, dir: crate::term::Dir::Equate },
+                pred: Pred::Projection { alias, term: fresh },
                 bound: 0,
                 via_only: false,
             });
+            if !self.tys.unify(fresh, other, crate::tys::Relate::Lazy, self.deferred)? {
+                self.deferred.truncate(base);
+                return Ok(false);
+            }
         }
         Ok(true)
+    }
+
+    /// Relates `a` and `b` by structure, aliases included, deferring nothing (the relation the
+    /// reference applies responses with: canonical/mod.rs `ResponseRelating`).
+    pub fn eq_structurally(&mut self, a: Ty, b: Ty) -> Result<bool, Stop> {
+        let base = self.deferred.len();
+        let ok = self.tys.unify(a, b, crate::tys::Relate::Structural, self.deferred)?;
+        self.deferred.truncate(base);
+        Ok(ok)
     }
 
     /// Relates every pair of `a` and `b` (equal lengths).

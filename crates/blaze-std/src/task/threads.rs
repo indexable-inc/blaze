@@ -381,7 +381,7 @@ where
     T: Send,
 {
     let job = Job {
-        head: JobHead {
+        head: JobHead::<T> {
             header: Header {
                 state: AtomicU8::new(QUEUED),
                 run: run::<F, T>,

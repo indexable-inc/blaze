@@ -33,6 +33,11 @@
 //!
 //! So every `Ix<'b, _>` is below the length of the one slice its `Branded<'b>` reads, and the
 //! read is in bounds.
+//!
+//! # Measured (`examples/table.rs`, release, one Mac run, 2026-11-15)
+//!
+//! ns per branded read at three sizes: 0.24, 0.57, 3.34, against a checked slice index's 0.39,
+//! 0.65, 3.61 and `Table::at`'s 0.47, 0.70, 4.31.
 
 use core::{
     alloc::Allocator,

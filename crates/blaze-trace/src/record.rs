@@ -72,10 +72,35 @@ impl Site {
         Site { meta, state: AtomicU32::new(UNSEEN) }
     }
 
-    /// Whether anything may record it: the one load and branch every macro pays.
+    /// Who records this call, decided before any field is evaluated: `None` costs one load and
+    /// a branch. The calling thread's own sink comes first (a test's, a simulation's), then the
+    /// rings, then the entry's sink; a sink is asked [`Sink::enabled`] only on the sink paths.
     #[inline(always)]
-    pub fn on(&self) -> bool {
-        self.state.load(Ordering::Relaxed) & WHO != 0
+    pub fn how(&'static self) -> Option<How> {
+        let mut state = self.state.load(Ordering::Relaxed);
+        if state & WHO == 0 {
+            return None;
+        }
+        if state == UNSEEN {
+            state = register(self);
+        }
+        if state & SINK != 0
+            && let Some(sink) = THREAD.sink.get()
+        {
+            return sink.enabled(self.meta).then_some(How::Sink(sink));
+        }
+        if state & RING != 0
+            && let Some(config) = RINGS.get()
+        {
+            return Some(How::Ring(config, state >> ID_SHIFT));
+        }
+        if state & SINK != 0
+            && let Some(sink) = crate::entry()
+            && sink.enabled(self.meta)
+        {
+            return Some(How::Sink(sink));
+        }
+        None
     }
 
     pub const fn metadata(&self) -> &'static Metadata<'static> {
@@ -87,11 +112,14 @@ impl Site {
         self.state.load(Ordering::Relaxed) >> ID_SHIFT
     }
 
-    #[inline(always)]
-    pub(crate) fn state(&'static self) -> u32 {
-        let state = self.state.load(Ordering::Relaxed);
-        if state == UNSEEN { register(self) } else { state }
-    }
+}
+
+/// Who records a site's call ([`Site::how`]).
+#[derive(Clone, Copy)]
+pub enum How {
+    /// The rings, under the site's id.
+    Ring(&'static RingConfig, u32),
+    Sink(&'static dyn Sink),
 }
 
 static SITES: [AtomicPtr<Site>; MOST_SITES] = [const { AtomicPtr::new(ptr::null_mut()) }; MOST_SITES];
@@ -358,8 +386,9 @@ pub fn unrecorded() -> u64 {
 /// The bit a span id's lane starts at: lanes are under 2^12, entries under 2^51.
 const LANE_SHIFT: u32 = 51;
 
-/// The span id of entry `n` of `lane`: never 0.
-const fn span_id(lane: u32, n: u64) -> u64 {
+/// The span id of entry `n` of `lane`: never 0. An enter entry naming span 0 opened its span:
+/// the span's id is that entry's.
+pub const fn span_id(lane: u32, n: u64) -> u64 {
     (lane as u64 + 1) << LANE_SHIFT | n
 }
 
@@ -639,22 +668,6 @@ fn field(config: &RingConfig, index: u16, value: &Value<'_>) {
 #[inline(always)]
 pub(crate) fn config() -> Option<&'static RingConfig> {
     RINGS.get()
-}
-
-/// Whether `state` says the rings record its site.
-#[inline(always)]
-pub(crate) const fn by_ring(state: u32) -> bool {
-    state & RING != 0
-}
-
-#[inline(always)]
-pub(crate) const fn by_sink(state: u32) -> bool {
-    state & SINK != 0
-}
-
-#[inline(always)]
-pub(crate) const fn id_of(state: u32) -> u32 {
-    state >> ID_SHIFT
 }
 
 /// A span begins with fields or a named parent: its open entry and fields; its id.

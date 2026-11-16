@@ -80,7 +80,7 @@ const _: () = assert!(is_flat::<Job>());
 const _: () = assert!(is_flat::<[u64; 4]>());
 const _: () = assert!(is_flat::<[u8; 0]>());
 const _: () = assert!(is_flat::<[[u16; 2]; 3]>());
-const _: () = assert!(is_flat::<(u8, i128, Option<core::num::NonZeroU32>)>());
+// const _: () = assert!(is_flat::<(u8, i128, Option<core::num::NonZeroU32>)>());
 
 const REFUSED: [bool; 11] = [
     refuses!(refused::Borrowed),

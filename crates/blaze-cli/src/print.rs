@@ -13,7 +13,7 @@ use bstd::path::Path;
 
 use crate::CliError;
 
-pub fn finding(cx: &Cx, root: &Dir<ReadWrite>, req: &Request<&Frame>, finding: &Print<&Frame>, frame: &Frame, out: &Out) -> Result<(), CliError> {
+pub fn finding(cx: &Cx, root: &Dir<ReadWrite>, req: &Request<'_>, finding: &Print<'_>, frame: &Frame, out: &Out) -> Result<(), CliError> {
     let message = core::str::from_utf8(&finding.message).unwrap_or("(a message that is not UTF-8)");
     let Some(index) = finding.file else {
         // A manifest's or a text-less crate's finding: its name is its place.
@@ -24,7 +24,9 @@ pub fn finding(cx: &Cx, root: &Dir<ReadWrite>, req: &Request<&Frame>, finding: &
     let mut text = Bytes::new_in(frame, "a file to place a finding in");
     root.read_all(cx, &Path::new(path)?, &mut text)?;
     let text = text.as_slice();
-    let lines = LineTable::new_in(text, frame);
+    // The frame carries no header of its own: erased into a handle here, for this finding.
+    let erased = blaze_own::Erased::new(frame);
+    let lines = LineTable::new_in(text, erased.handle());
     let at = lines.position(text, finding.place.saturating_add(finding.start));
     out.line(cx, format_args!("{path}:{}:{}: [{}] {message}", at.line, at.column, finding.rule))?;
     Ok(())

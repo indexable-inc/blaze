@@ -1,8 +1,22 @@
-//! Trait goals (trait_goals.rs of the reference): assembly from the param env and from impls
-//! (through the fingerprint prefilter), the builtin and alias-bound hooks, and
-//! `merge_trait_candidates`. (Being written: this stub fixes the names other modules use.)
+//! Trait goals (rustc_next_trait_solver solve/trait_goals.rs and the trait half of
+//! solve/assembly/mod.rs): assembly in the reference's order (normalize the self type, forced
+//! ambiguity on a variable, coherence's unknowable candidate, alias bounds, the param env,
+//! builtins, then impls and objects), the param-env and impl candidates' rules, and
+//! `merge_trait_candidates`. Builtin and object candidates are `builtin.rs`'s, alias bounds
+//! `alias.rs`'s, the unknowable candidate `coherence.rs`'s.
+//!
+//! Impl candidates come from the trait's impls bucketed by the self type's shape, through the
+//! fingerprint prefilter (`prefilter.rs`, the reference's `DeepRejectCtxt::args_may_unify` in
+//! `assemble_impl_candidates`).
 
-use crate::term::{Def, List, Polarity, Ty};
+use blaze_own::{Alloc, Vec};
+
+use crate::assembly::{AStep, BuiltinSource, Cand, Cx, Done, MergeInfo, Merger, Source, Step, Via};
+use crate::canon::RespId;
+use crate::error::{Malformed, SolveError, Stop};
+use crate::facts::{Facts, ImplPolarity, TraitFlags};
+use crate::term::{Certainty, Def, Flags, GoalSource, Lang, List, Polarity, Pred, Ty, TyKind, TypingMode, VarKind};
+use crate::tys::Tys;
 
 /// A trait goal with its self type resolved and, where it was an alias, normalized
 /// (`structurally_normalize_ty` in `assemble_and_evaluate_candidates`).
@@ -23,4 +37,281 @@ pub enum Rule {
     Env(u32),
     /// The impl in `Cand::d` (`consider_impl_candidate`).
     Impl,
+}
+
+/// What a trait goal's frame keeps between its assembly stages and for its merge.
+#[derive(Clone, Copy, Debug)]
+pub struct State {
+    /// The self type, or the variable it is normalized into.
+    pub self_ty: Ty,
+    /// The trait is `#[marker]`.
+    pub marker: bool,
+    /// `CandidatePreferenceMode::Marker`: a sizedness or auto trait.
+    pub prefer_alias_bounds: bool,
+    /// Assembly returned early (forced ambiguity, unknowable): no impls after.
+    pub early: bool,
+}
+
+impl State {
+    pub const NEW: State = State { self_ty: Ty::NONE, marker: false, prefer_alias_bounds: false, early: false };
+}
+
+fn malformed() -> Stop {
+    Stop::Error(SolveError::Malformed(Malformed::Pred))
+}
+
+fn parts(p: Pred) -> Result<(Def, List, Polarity), Stop> {
+    match p {
+        Pred::Trait { trait_, args, polarity } => Ok((trait_, args, polarity)),
+        _ => Err(malformed()),
+    }
+}
+
+/// The goal as a [`TraitGoal`] with the frame's self type.
+pub fn goal_of<T: Tys, F: Facts>(cx: &Cx<'_, '_, T, F>, st: &State) -> Result<TraitGoal, Stop> {
+    let (trait_, args, polarity) = parts(cx.goal.pred)?;
+    Ok(TraitGoal { trait_, args, polarity, self_ty: cx.resolve(st.self_ty) })
+}
+
+/// The first assembly stages (`assemble_and_evaluate_candidates` up to the builtin
+/// candidates). Stage 0 normalizes a non-rigid alias self type through a `Projection` goal
+/// (`structurally_normalize_ty`, solve/mod.rs); stage 1 assembles.
+pub fn assemble<T: Tys, F: Facts>(
+    cx: &mut Cx<'_, '_, T, F>,
+    stage: u8,
+    st: &mut State,
+    out: &mut Vec<Cand, Alloc<'_>>,
+) -> Result<AStep, Stop> {
+    let (trait_, args, _) = parts(cx.goal.pred)?;
+    if args.len == 0 {
+        return Err(malformed());
+    }
+    if stage == 0 {
+        let self_ty = cx.resolve(cx.arg(args, 0));
+        st.self_ty = self_ty;
+        if crate::alias::needs_normalizing(cx, self_ty)? {
+            let v = cx.fresh_ty()?;
+            cx.add(GoalSource::NormalizeGoal, Pred::Projection { alias: self_ty, term: v });
+            st.self_ty = v;
+            return Ok(AStep::Then(1));
+        }
+    }
+    let def = cx.trait_def(trait_)?;
+    st.marker = def.flags.has(TraitFlags::MARKER);
+    st.prefer_alias_bounds = def.flags.has(TraitFlags::AUTO)
+        || matches!(def.lang, Some(Lang::Sized | Lang::MetaSized | Lang::PointeeSized));
+    let g = goal_of(cx, st)?;
+    // A self type that is still a type variable: forced ambiguity
+    // (`try_assemble_bounds_via_registered_opaques`; no opaques are registered here).
+    if matches!(cx.kind(g.self_ty), TyKind::Infer(v) if v.kind == VarKind::Ty) {
+        out.push(Cand::new(Source::Builtin(BuiltinSource::Misc), crate::assembly::Rule::Certain(Certainty::Ambiguous)));
+        st.early = true;
+        return Ok(AStep::Done);
+    }
+    if crate::coherence::unknowable(cx, g, out)? {
+        st.early = true;
+        return Ok(AStep::Done);
+    }
+    crate::alias::assemble_alias_bounds(cx, g, out)?;
+    assemble_env(cx, g, out)?;
+    crate::builtin::assemble(cx, g, def, out)?;
+    Ok(AStep::Done)
+}
+
+/// `assemble_param_env_candidates`: every clause of the env the goal may match
+/// (`fast_reject_assumption`: the same trait and polarity, or a `MetaSized` goal against a
+/// `Sized` clause).
+fn assemble_env<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, g: TraitGoal, out: &mut Vec<Cand, Alloc<'_>>) -> Result<(), Stop> {
+    let meta = cx.lang(Lang::MetaSized)? == Some(g.trait_);
+    let sized = if meta { cx.lang(Lang::Sized)? } else { None };
+    for (i, c) in cx.env.iter().enumerate() {
+        let Pred::Trait { trait_, args, polarity } = c.pred else { continue };
+        let same = trait_ == g.trait_ && polarity == g.polarity;
+        let sizedness = meta && Some(trait_) == sized && g.polarity == Polarity::Positive;
+        if !same && !sizedness {
+            continue;
+        }
+        let mut f = Flags(0);
+        for k in 0..args.len {
+            f = f.union(cx.tys.flags(cx.arg(args, k)));
+        }
+        let global = !f.has(Flags::HAS_PARAM | Flags::HAS_INFER | Flags::HAS_RE_INFER | Flags::HAS_PLACEHOLDER | Flags::HAS_FREE_REGION);
+        out.push(Cand::new(Source::ParamEnv { global }, crate::assembly::Rule::Trait(Rule::Env(i as u32))));
+    }
+    Ok(())
+}
+
+/// Whether the impls and objects are assembled after the first candidates were evaluated:
+/// always in coherence, else unless a non-global where-bound or an alias bound holds with no
+/// constraints (`assemble_and_evaluate_candidates`).
+pub fn wants_impls(mode: TypingMode, st: &State, resps: &crate::canon::Responses<'_>, done: &[Done]) -> bool {
+    if st.early {
+        return false;
+    }
+    if mode == TypingMode::Coherence {
+        return true;
+    }
+    !done.iter().any(|d| {
+        matches!(d.cand.source, Source::ParamEnv { global: false } | Source::AliasBound { .. })
+            && resps.is_identity(d.resp)
+            && resps.certainty(d.resp) == Certainty::Yes
+    })
+}
+
+/// `assemble_impl_candidates` and `assemble_object_bound_candidates`: the impls of the trait
+/// for the self type's shape that survive the prefilter, then the object candidates.
+pub fn assemble_impls<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, st: &State, out: &mut Vec<Cand, Alloc<'_>>) -> Result<(), Stop> {
+    let g = goal_of(cx, st)?;
+    let Some(shape) = crate::term::shape_of_kind(cx.kind(g.self_ty)) else {
+        // An unresolved self type never gets here (forced ambiguity above).
+        return Err(malformed());
+    };
+    let set = cx.impls(g.trait_, shape)?;
+    let fp = crate::prefilter::fingerprint_goal(&*cx.tys, g.args);
+    let mut keep: Vec<u32, Alloc<'_>> = Vec::new_in(cx.alloc);
+    if set.columns.len as usize == set.impls.len() {
+        crate::prefilter::filter(&fp, set.columns, &mut keep);
+    } else {
+        // The world gave no columns: every impl is a candidate.
+        for i in 0..set.impls.len() {
+            keep.push(i as u32);
+        }
+    }
+    for &i in keep.iter() {
+        let Some(&d) = set.impls.get(i as usize) else { return Err(malformed()) };
+        let mut c = Cand::new(Source::Impl(d), crate::assembly::Rule::Trait(Rule::Impl));
+        c.d = d;
+        out.push(c);
+    }
+    let def = cx.trait_def(g.trait_)?;
+    crate::builtin::assemble_object(cx, g, def, out)
+}
+
+/// A candidate's stage.
+pub fn step<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, rule: Rule, stage: u8) -> Result<Step, Stop> {
+    if stage != 0 {
+        return Err(malformed());
+    }
+    match rule {
+        Rule::Env(i) => step_env(cx, i),
+        Rule::Impl => step_impl(cx, cand.d),
+    }
+}
+
+/// `probe_and_match_goal_against_assumption` with `match_assumption` (trait_goals.rs): the
+/// clause's binder instantiated with fresh variables, its trait ref related with the goal's
+/// (only the self types for a `MetaSized` goal against a `Sized` clause).
+fn step_env<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, i: u32) -> Result<Step, Stop> {
+    let Some(&clause) = cx.env.get(i as usize) else { return Err(malformed()) };
+    let (_, gargs, _) = parts(cx.goal.pred)?;
+    let Pred::Trait { trait_, args, .. } = clause.pred else { return Err(malformed()) };
+    let args = if clause.bound > 0 {
+        let with = cx.fresh_args(clause.bound)?;
+        let mut f = |cx: &mut Cx<'_, '_, T, F>, t: Ty| cx.instantiate_bound(t, with);
+        cx.map_list(args, &mut f)?
+    } else {
+        args
+    };
+    let (gt, _, _) = parts(cx.goal.pred)?;
+    let ok = if trait_ == gt {
+        cx.eq_lists(gargs, args)?
+    } else {
+        let (a, b) = (cx.arg(gargs, 0), cx.arg(args, 0));
+        cx.eq(a, b)?
+    };
+    Ok(if ok { Step::Done(Certainty::Yes) } else { Step::No })
+}
+
+/// `consider_impl_candidate` (trait_goals.rs): polarity, the impl's header related with the
+/// goal's trait ref, its where-clauses as `ImplWhereBound` goals.
+fn step_impl<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, impl_: Def) -> Result<Step, Stop> {
+    let (_, gargs, polarity) = parts(cx.goal.pred)?;
+    let h = cx.impl_header(impl_)?;
+    let max = match (h.polarity, polarity) {
+        (ImplPolarity::Reservation, _) => match cx.mode {
+            TypingMode::Coherence => Certainty::Ambiguous,
+            TypingMode::Analysis => return Ok(Step::No),
+        },
+        (ImplPolarity::Positive, Polarity::Positive) | (ImplPolarity::Negative, Polarity::Negative) => Certainty::Yes,
+        _ => return Ok(Step::No),
+    };
+    let args = cx.fresh_args(h.generics)?;
+    let header = cx.import_list(h.portable, h.args, args)?;
+    if !cx.eq_lists(gargs, header)? {
+        return Ok(Step::No);
+    }
+    for &w in h.where_clauses {
+        let p = cx.import_pred(h.portable, w, args)?;
+        cx.add(GoalSource::ImplWhereBound, p);
+    }
+    Ok(Step::Done(max))
+}
+
+/// `try_merge_impl_candidates`.
+fn try_merge_impl(m: &mut Merger<'_, '_>, marker: bool, cands: &[Done]) -> Option<RespId> {
+    let all_builtin = cands.iter().all(|c| matches!(c.cand.source, Source::Builtin(_)));
+    if marker || all_builtin {
+        m.try_merge(cands).map(|(r, _)| r)
+    } else if cands.len() > 1 {
+        None
+    } else {
+        cands.first().map(|c| c.resp)
+    }
+}
+
+fn merge_or_bail(m: &mut Merger<'_, '_>, cands: &[Done], via: Via) -> Result<(RespId, Via), SolveError> {
+    match m.try_merge(cands) {
+        Some((r, _)) => Ok((r, via)),
+        None => Ok((m.bail_with_ambiguity(cands)?, Via::None)),
+    }
+}
+
+fn merge_impls_or_bail(m: &mut Merger<'_, '_>, marker: bool, cands: &[Done]) -> Result<(RespId, Via), SolveError> {
+    match try_merge_impl(m, marker, cands) {
+        Some(r) => Ok((r, Via::Misc)),
+        None => Ok((m.bail_with_ambiguity(cands)?, Via::None)),
+    }
+}
+
+/// `merge_trait_candidates` (trait_goals.rs). `None`: no solution. Specialization is not
+/// ported (`filter_specialized_impls`: solve.md, "Not ported").
+pub fn merge(
+    m: &mut Merger<'_, '_>,
+    mode: TypingMode,
+    st: &State,
+    cands: &mut Vec<Done, Alloc<'_>>,
+) -> Result<Option<(RespId, Via)>, SolveError> {
+    if cands.is_empty() {
+        return Ok(None);
+    }
+    if mode == TypingMode::Coherence {
+        return Ok(Some(merge_impls_or_bail(m, st.marker, cands)?));
+    }
+    if let Some(c) = cands.iter().find(|c| c.cand.source == Source::Builtin(BuiltinSource::Trivial)) {
+        return Ok(Some((c.resp, Via::Misc)));
+    }
+    if st.prefer_alias_bounds && cands.iter().any(|c| c.cand.source == Source::AliasBound { self_bounds: true }) {
+        cands.retain(|c| matches!(c.cand.source, Source::AliasBound { .. }));
+        return Ok(Some(merge_or_bail(m, cands, Via::AliasBound)?));
+    }
+    if cands.iter().any(|c| c.cand.source == Source::ParamEnv { global: false }) {
+        cands.retain(|c| matches!(c.cand.source, Source::ParamEnv { .. }));
+        return Ok(Some(match m.try_merge(cands) {
+            Some((r, MergeInfo::AlwaysApplicable(_) | MergeInfo::EqualResponse)) => (r, Via::ParamEnv),
+            None => (m.bail_with_ambiguity(cands)?, Via::None),
+        }));
+    }
+    if cands.iter().any(|c| matches!(c.cand.source, Source::AliasBound { .. })) {
+        cands.retain(|c| matches!(c.cand.source, Source::AliasBound { .. }));
+        return Ok(Some(merge_or_bail(m, cands, Via::AliasBound)?));
+    }
+    // `unsound_prefer_builtin_dyn_impl`.
+    if cands.iter().find(|c| c.cand.source == Source::Builtin(BuiltinSource::Object)).is_some_and(|c| m.no_constraints(c.resp)) {
+        cands.retain(|c| !matches!(c.cand.source, Source::Impl(_)));
+    }
+    if cands.iter().all(|c| c.cand.source == Source::ParamEnv { global: true }) {
+        return Ok(Some(merge_or_bail(m, cands, Via::ParamEnv)?));
+    }
+    cands.retain(|c| c.cand.source != Source::ParamEnv { global: true });
+    Ok(Some(merge_impls_or_bail(m, st.marker, cands)?))
 }

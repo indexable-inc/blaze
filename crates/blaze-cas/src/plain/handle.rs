@@ -221,7 +221,8 @@ impl<D: Driver> PlainStore<D> {
         }
         let mut open = Vec::with_capacity_in(self.writes.len(), Global);
         open.extend(self.writes.iter().map(|it| Held::new(*it)));
-        let replaced = self.lanes.pin().insert(id, Lock::new("store.plain.lane", Lane { open, flushing: None }));
+        let lanes = self.lanes.pin();
+        let replaced = lanes.insert(id, Lock::new("store.plain.lane", Lane { open, flushing: None }));
         assert!(replaced.is_none(), "lane {id} is made once");
         Ok(LaneId(id))
     }

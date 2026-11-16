@@ -11,7 +11,7 @@
 
 use core::alloc::Allocator;
 
-use blaze_own::Vec;
+use blaze_own::AVec;
 
 use crate::request::{Task, Want};
 use crate::settled::Settled;
@@ -27,12 +27,12 @@ pub enum InPlace {
 
 /// Answer `wants` from `table` into `task`'s inputs; the rest into `left`. `most_entries` is
 /// the request's bound: a task at it goes to the coordinator, which names the loop.
-pub fn answer_in_place<A: Allocator, B: Allocator, C: Allocator>(
+pub fn answer_in_place<B: Allocator>(
     table: &Settled<B>,
-    task: &mut Task<A>,
+    task: &mut Task<'_>,
     wants: &[Want],
     most_entries: u32,
-    left: &mut Vec<Want, C>,
+    left: &mut AVec<'_, Want>,
 ) -> InPlace {
     for want in wants {
         if task.inputs.iter().any(|input| input.name == want.name) {

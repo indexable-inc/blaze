@@ -29,6 +29,9 @@ blaze-surface.workspace = true
 blaze-ids = { path = "../blaze-ids" }
 # Vec, SortedMap, VecDeque in the command's frame.
 blaze-own.workspace = true
+# `blaze run`'s program after its check: the walking skeleton's straight line, lower to call
+# (tests/ladder/README.md).
+blaze-ladder.workspace = true
 
 [lints]
 workspace = true

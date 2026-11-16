@@ -113,12 +113,6 @@ fn every_search_on_the_portable_vector_is_the_naive_search() {
     blaze_sim::check(Config::cases(500), case::<Portable<32>>);
 }
 
-#[cfg(target_arch = "aarch64")]
-#[test]
-fn every_search_on_the_neon_reference_is_the_naive_search() {
-    blaze_sim::check(Config::cases(500), case::<crate::neon::Neon>);
-}
-
 /// The vector and its scalar twin give one answer at every start of one drawn buffer, across
 /// more than two of the widest vector's four-vector steps, for every search.
 fn alignments<L: Lanes>(tape: &Tape) -> Result<(), Broke> {

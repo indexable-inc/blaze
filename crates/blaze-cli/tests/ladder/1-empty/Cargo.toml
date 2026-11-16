@@ -1,0 +1,4 @@
+[package]
+name = "ladder-1-empty"
+version = "0.1.0"
+edition = "2024"

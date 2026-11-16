@@ -484,6 +484,7 @@ impl<'p> Scope<'p> {
     }
 
     /// A job for `task` on the pool, its context grown from a seed on the thread that runs it.
+    #[expect(unsafe_code, reason = "erasing the task's borrows to the scope's lifetime, as std::thread::scope does: the SAFETY below")]
     fn pool_job<T: Send, E: fmt::Display>(
         &self,
         tally: &Arc<Tally, Global>,

@@ -64,6 +64,9 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     let mut reader = Reader { lane: 0, drain: None, next: vec![0; lanes] };
     let reader_weight = tape.range(1..8, "reader's share of steps");
     let mut finishing = false;
+    // Whether the last pass began at lane 0: a drain running when the pushes ended finishes
+    // first, then the pass starts over from lane 0.
+    let mut full_pass = false;
     let mut steps = 0u32;
     loop {
         steps += 1;
@@ -77,6 +80,7 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
             finishing = true;
             if reader.drain.is_none() {
                 reader.lane = 0;
+                full_pass = true;
             }
         }
         let read = finishing || tape.below(8, "who steps") < reader_weight;
@@ -144,7 +148,10 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
                 cells.store(ring.reader(), next, Ordering::Release);
                 reader.drain = None;
                 reader.lane += 1;
-                if reader.lane == lanes {
+                if finishing && !full_pass {
+                    reader.lane = 0;
+                    full_pass = true;
+                } else if reader.lane == lanes {
                     reader.lane = 0;
                     if finishing {
                         break;

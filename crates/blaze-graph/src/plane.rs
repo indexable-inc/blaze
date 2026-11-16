@@ -63,6 +63,7 @@ use std::{
 };
 
 use blaze_hash::{ByHash, HashMap};
+use blaze_kit::Heap4;
 use blaze_mem::{Handle, RegionVec, Slab, Tag as MemTag};
 use blaze_protocol::events::{Event, Level, NodeKind, NodeState, Record};
 use blaze_radix as radix;
@@ -828,7 +829,6 @@ impl Request {
 
 /// What [`Plane::check`] found of a batch of nodes, for [`Plane::add`]; its buffers are kept
 /// for the next batch.
-#[derive(Default)]
 struct Batch {
     /// Each node's deps, by its place in the batch: a slot, or [`NEW`] and the place of a node
     /// of the batch.
@@ -845,10 +845,24 @@ struct Batch {
     then: radix::Csr<u32>,
     /// `then`'s rebuild cursors, kept.
     cursors: Vec<u32>,
-    can: BinaryHeap<Reverse<u32>>,
+    /// A 4-ary min-heap: the places are distinct, so the order is the places' own.
+    can: Heap4<u32, Global>,
 }
 
 impl Batch {
+    fn new() -> Batch {
+        Batch {
+            deps: Vec::new(),
+            deps_at: Vec::new(),
+            order: Vec::new(),
+            slots: Vec::new(),
+            waiting: Vec::new(),
+            then: radix::Csr::default(),
+            cursors: Vec::new(),
+            can: Heap4::new_in(Global),
+        }
+    }
+
     /// Kahn's order over a batch with a dep on a later node of it, into `order`, the first
     /// given first among those that can go; or the ids of the nodes in a cycle, sorted.
     fn sort(&mut self, nodes: &(impl Given + ?Sized)) -> Result<(), Vec<NodeId>> {
@@ -863,16 +877,18 @@ impl Batch {
         let pairs = (0..len).flat_map(|at| of(at).map(move |&dep| (dep & !NEW, at as u32)));
         self.then.rebuild(len, pairs, &mut self.cursors);
         self.can.clear();
-        self.can.extend((0..len as u32).filter(|&at| self.waiting[at as usize] == 0).map(Reverse));
+        for at in (0..len as u32).filter(|&at| self.waiting[at as usize] == 0) {
+            self.can.push(at);
+        }
         self.order.clear();
-        while let Some(Reverse(at)) = self.can.pop() {
+        while let Some(at) = self.can.pop() {
             self.order.push(at);
             let at = at as usize;
             for &next in self.then.row(at) {
                 let next = next as usize;
                 self.waiting[next] -= 1;
                 if self.waiting[next] == 0 {
-                    self.can.push(Reverse(next as u32));
+                    self.can.push(next as u32);
                 }
             }
         }
@@ -1005,7 +1021,7 @@ impl<M: Memo> Plane<M> {
             deferred: Vec::new(),             // alloc: kept scratch
             last_ns: 0,
             counts: Counts::default(),
-            batch: Batch::default(),
+            batch: Batch::new(),
             touched: Vec::new(),  // alloc: kept scratch
             added: Vec::new(),    // alloc: kept scratch
             rising: Vec::new(),   // alloc: kept scratch
@@ -1486,7 +1502,8 @@ impl<M: Memo> Plane<M> {
         if len == 0 {
             return;
         }
-        let mut batch = std::mem::take(&mut self.batch);
+        // `Batch::new` allocates nothing: the kept buffers come back below.
+        let mut batch = std::mem::replace(&mut self.batch, Batch::new());
         batch.slots.clear();
         batch.slots.resize(len, NONE);
         let mut added = std::mem::take(&mut self.added);

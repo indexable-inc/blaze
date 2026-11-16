@@ -61,6 +61,12 @@ impl<A: Allocator> Put for String<A> {
     }
 
     #[inline]
+    fn put_byte(&mut self, byte: u8) {
+        assert!(byte.is_ascii(), "blaze_text::Put::put_byte: 0x{byte:02x} is not ASCII");
+        self.push(char::from(byte));
+    }
+
+    #[inline]
     fn reserve(&mut self, additional: usize) {
         String::reserve(self, additional);
     }
@@ -76,6 +82,10 @@ pub struct Overflow {
 /// Up to `N` bytes of text on the stack. A write that does not fit is refused whole and the
 /// buffer is marked full: every later write is refused too, so the text is never a silently
 /// cut one. [`Buf::text`] gives the text, or the [`Overflow`] with the bytes it needed.
+///
+/// It duplicates blaze-own's `FixedString` (rule 30) for those two behaviours, the sticky
+/// refusal and the bytes-needed count, which `FixedString` lacks: `Buf` goes, and `Put` is
+/// implemented for `FixedString`, once it has both.
 #[derive(Clone, Copy)]
 pub struct Buf<const N: usize> {
     /// Bytes `..len` are UTF-8, written only from whole `str`s.

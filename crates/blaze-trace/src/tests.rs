@@ -293,7 +293,13 @@ fn the_rings_hold_each_edge_and_field_as_written() {
         let mut entries = Vec::new();
         rings
             .drain::<{ record::WORDS }>(crate::ring::Lane(lane), from, |got| match got {
-                crate::ring::Got::Entry { words, .. } => entries.push(record::decode(words)),
+                // An enter naming span 0 opened its span: the span's id is the entry's own.
+                crate::ring::Got::Entry { n, words } => entries.push(match record::decode(words) {
+                    record::Entry::Enter { site, depth, tick, span: 0 } => {
+                        record::Entry::Enter { site, depth, tick, span: record::span_id(lane, n) }
+                    }
+                    other => other,
+                }),
                 crate::ring::Got::Lost { from, count } => panic!("entries {from}..+{count} lost in a ring of 256"),
             })
             .unwrap();

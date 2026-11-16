@@ -329,7 +329,7 @@ fn an_unknown_op_is_named_with_the_layers_that_have_ops() {
 
 #[test]
 fn an_answer_carries_rows_and_elapsed_and_one_aligned_ipc_stream() {
-    let answer = Answer { table: Table::of(vec![numbers(5), numbers(2)]), ..Answer::new("count") };
+    let answer = Answer { table: Table::of(blaze_own::Vec::from_array_in([numbers(5), numbers(2)], Global)), ..Answer::new("count") };
     let bytes = frame::answer_bytes(Ok(answer), 1234);
     let len = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
     assert_eq!((4 + len) % frame::ALIGN, 0, "the IPC starts 8-aligned");

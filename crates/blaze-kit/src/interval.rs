@@ -18,6 +18,12 @@
 //! When the members do not come in runs: past one range per 64 ids a bit set is smaller, and it
 //! unions and intersects a word at a time where this merges ranges. A borrow-check region over
 //! a long body with scattered points is a [`ChunkedBitSet`](crate::ChunkedBitSet).
+//!
+//! # Measured (`examples/sets.rs`, release, one Mac run, 2026-11-15)
+//!
+//! Against a `BTreeSet` of the ids: insert 58.7 to 68.9 ns against 2,128 to 2,156; a probe
+//! 10.1 to 12.8 against 51.1 to 53.2. A second run (2026-11-15, one run, this machine):
+//! insert 43 to 48 ns against 1,647 to 1,806.
 
 use core::{alloc::Allocator, marker::PhantomData, ops::Range};
 

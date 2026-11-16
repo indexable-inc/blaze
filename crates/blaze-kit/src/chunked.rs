@@ -26,6 +26,12 @@
 //! When the domain is small (one chunk or a few: a bit set has no chunk word and no count), or
 //! when the set is not copied and its bits are scattered so that every chunk is mixed: then
 //! this is a bit set plus a word and a count per 2,048 bits.
+//!
+//! # Measured (`examples/sets.rs`, release, one Mac run, 2026-11-15)
+//!
+//! A copy and a union, ns, against a plain bit set: 376 against 2,023 at 262,144 ids, 5,621
+//! against 21,955 at 4,194,304. A second run (2026-11-15, one run, this machine): 275 against
+//! 682, and 4,233 against 17,908.
 
 use core::{
     alloc::{AllocatorClone, Layout},

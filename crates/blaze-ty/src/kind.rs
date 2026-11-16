@@ -252,8 +252,8 @@ const fn re_desc(kind: u8) -> Desc {
         re::STATIC => Desc::new(None, None, false, Flags::FREE_REGIONS),
         re::VAR => Desc::new(Raw, None, false, Flags::RE_INFER | Flags::FREE_REGIONS),
         re::PLACEHOLDER => Desc::new(Raw, Raw, false, Flags::PLACEHOLDER | Flags::FREE_REGIONS),
-        re::ERASED => Desc::new(None, None, false, 0),
-        re::ERROR => Desc::new(None, None, false, Flags::ERROR),
+        re::ERASED => Desc::new(None, None, false, Flags::FREE_REGIONS),
+        re::ERROR => Desc::new(None, None, false, Flags::ERROR | Flags::FREE_REGIONS),
         re::CANONICAL => Desc::new(Raw, None, false, Flags::CANONICAL),
         _ => Desc::BAD,
     }
@@ -291,6 +291,53 @@ macro_rules! table {
 table!(TY, ty_desc, ty::COUNT);
 table!(RE, re_desc, re::COUNT);
 table!(CT, ct_desc, ct::COUNT);
+
+/// Whether `kind` is a kind of class `tag` (a list has none).
+pub(crate) fn valid(tag: u32, kind: u8) -> bool {
+    match tag {
+        crate::ids::TAG_TY => {
+            kind <= ty::ERROR
+                || (kind >= ty::EX_TRAIT && kind <= ty::EX_AUTO)
+                || (kind >= ty::P_TRAIT && kind <= ty::P_AMBIGUOUS)
+        }
+        crate::ids::TAG_REGION => ix8(kind) < re::COUNT,
+        crate::ids::TAG_CONST => ix8(kind) < ct::COUNT,
+        _ => false,
+    }
+}
+
+/// The classes a child column of a kind may hold, as a mask of `1 << tag`.
+pub(crate) const fn child_classes(tag: u32, kind: u8, b: bool) -> u8 {
+    use crate::ids::{TAG_CONST, TAG_LIST, TAG_REGION, TAG_TY};
+    const T: u8 = 1 << TAG_TY;
+    const R: u8 = 1 << TAG_REGION;
+    const C: u8 = 1 << TAG_CONST;
+    const L: u8 = 1 << TAG_LIST;
+    const ARG: u8 = T | R | C;
+    if tag == TAG_CONST {
+        return if b { L } else { T };
+    }
+    if tag != TAG_TY {
+        return 0;
+    }
+    match (kind, b) {
+        (ty::ARRAY, false) | (ty::SLICE | ty::PTR | ty::PTR_MUT | ty::REF | ty::REF_MUT, false) => T,
+        (ty::ARRAY, true) => C,
+        (ty::REF | ty::REF_MUT | ty::DYNAMIC, true) => R,
+        (ty::FN_PTR | ty::DYNAMIC | ty::TUPLE, false) => L,
+        (ty::P_PROJECTION | ty::P_ALIAS_EQ | ty::P_NORMALIZES_TO, _) => T | C,
+        (ty::P_WELL_FORMED, false) => ARG,
+        (ty::P_REGION_OUTLIVES, _) => R,
+        (ty::P_TYPE_OUTLIVES, false) | (ty::P_SUBTYPE | ty::P_COERCE | ty::P_ALIAS_SUB, _) => T,
+        (ty::P_TYPE_OUTLIVES, true) => R,
+        (ty::P_CONST_HAS_TYPE, false) | (ty::P_CONST_EVALUATABLE, false) | (ty::P_CONST_EQUATE, _) => C,
+        (ty::P_CONST_HAS_TYPE, true) => T,
+        // Items' argument lists: ADTs, fn items, closures, coroutines, aliases, `dyn` and
+        // trait predicates.
+        (_, true) => L,
+        _ => 0,
+    }
+}
 
 /// Whether `kind` is a type kind (not a predicate or an existential predicate).
 pub const fn is_type(kind: u8) -> bool {

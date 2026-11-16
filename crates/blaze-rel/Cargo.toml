@@ -29,6 +29,8 @@ blaze-hash.workspace = true
 # Properties: the hash join and hash aggregate against nested-loop and sort-based models, with
 # a planted-bug control.
 blaze-sim.workspace = true
+# The acceptance test: the profile's schema, views.sql and examples.sql.
+blaze-profile.workspace = true
 
 [lints]
 workspace = true

@@ -50,6 +50,9 @@ windows-sys.workspace = true
 blaze-ids.workspace = true
 blaze-radix.workspace = true
 blaze-spin.workspace = true
+# `library/blaze_inproc_rt/src/fence/tests.rs` (the standard library's workspace, which this
+# lane may not edit) takes `parking_lot::Mutex`; it goes once that test moves to std's lock.
+parking_lot.workspace = true
 
 [lints]
 workspace = true

@@ -41,7 +41,14 @@ use std::{
 #[cfg(not(blaze_check))]
 use blaze_spin::SpinWait;
 
-use crate::sync::atomic::{AtomicU32, Ordering};
+// std's atomics, never `crate::atomic`'s: in blaze-core's tests those are the scheduled ones,
+// and a lock is a real lock there (the scheduler's own baton is one: scheduling its word would
+// recurse). Under `--cfg blaze_check`, the model checker's.
+#[cfg(not(blaze_check))]
+use std::sync::atomic::{AtomicU32, Ordering};
+
+#[cfg(blaze_check)]
+use blaze_check::sync::atomic::{AtomicU32, Ordering};
 
 #[cfg(test)]
 mod tests;
@@ -65,6 +72,23 @@ pub(crate) enum Plant {
 }
 
 // --- Word ---------------------------------------------------------------------------------------
+
+/// A word as the kernel's wait takes it: `crate::atomic`'s type, which is std's outside
+/// blaze-core's tests.
+#[cfg(all(not(blaze_check), not(test), any(target_os = "linux", target_os = "macos")))]
+fn kernel_word(word: &AtomicU32) -> &crate::atomic::AtomicU32 {
+    word
+}
+
+/// In blaze-core's tests `crate::atomic`'s type is the scheduled one, `repr(transparent)` over
+/// std's: the same word, which the kernel compares and wakes by address alone; no operation of
+/// the scheduled type is made on it.
+#[cfg(all(not(blaze_check), test, any(target_os = "linux", target_os = "macos")))]
+fn kernel_word(word: &AtomicU32) -> &crate::atomic::AtomicU32 {
+    // SAFETY: `scheduled::AtomicU32` is `#[repr(transparent)]` over `std`'s `AtomicU32`, so the
+    // reference is to the same bytes with the same layout, for the same lifetime.
+    unsafe { &*std::ptr::from_ref(word).cast::<crate::atomic::AtomicU32>() }
+}
 
 /// A word threads sleep on while it holds a value, and the wake of one of them or of all.
 pub(crate) struct Word {
@@ -96,7 +120,7 @@ impl Word {
         use crate::wait::{Clock as _, Deadline, Monotonic, Waited};
         let clock = Monotonic::new();
         let deadline = within.map(|it| Deadline::after(clock.now(), it));
-        match crate::wait::word_wait(WHAT, &self.value, expected, deadline, &clock) {
+        match crate::wait::word_wait(WHAT, kernel_word(&self.value), expected, deadline, &clock) {
             Ok(Waited::Ready(())) => false,
             Ok(Waited::Deadline) => true,
             Err(error) => panic!("{error} (rule no-fallback: a lock's wait has no other way)"),
@@ -105,7 +129,7 @@ impl Word {
 
     #[cfg(all(not(blaze_check), any(target_os = "linux", target_os = "macos")))]
     pub(crate) fn wake(&self, all: bool) {
-        crate::wait::word_wake(&self.value, all);
+        crate::wait::word_wake(kernel_word(&self.value), all);
     }
 
     /// Windows and the rest are out of scope (AGENTS.md, "Not now"): there a wait is a yield,

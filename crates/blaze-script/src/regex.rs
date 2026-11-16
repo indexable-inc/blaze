@@ -480,7 +480,8 @@ impl<'p> Parser<'p> {
                             negate = true;
                             continue;
                         }
-                        Some(':') if any => {
+                        // `(?:a)` is a plain non-capturing group; `(?-:a)` names no flag.
+                        Some(':') if any || !negate => {
                             let inner = self.alternation(new, depth + 1)?;
                             if !self.eat(")") {
                                 return Err(self.error(start, ErrorKind::UnclosedGroup));

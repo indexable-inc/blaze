@@ -11,7 +11,8 @@ rust-version.workspace = true
 repository.workspace = true
 
 [lib]
-doctest = false
+# Doc tests run here, as in blaze-id: that a collection over a thread's own allocator cannot
+# cross a thread is a `compile_fail` doc test (`Erased::shared`), beside its control.
 
 # A dependency here is a dependency of every crate's collections: only crates on `core` alone.
 [dependencies]

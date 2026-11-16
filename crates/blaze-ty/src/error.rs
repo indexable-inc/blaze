@@ -36,6 +36,32 @@ pub enum FoldError {
     CanonicalOutOfRange { node: Node, values: u32 },
 }
 
+/// Why a canonical response could not be applied.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ResponseError {
+    /// The response's value is not a list of variable values.
+    NotAList { node: Node },
+    /// The response has `response` values for `orig` original values.
+    Arity { response: u32, orig: usize },
+    Fold(FoldError),
+    Relate(TypeError),
+}
+
+impl fmt::Display for ResponseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ResponseError::NotAList { node } => write!(f, "response {:#x} is not a list of values", node.bits()),
+            ResponseError::Arity { response, orig } => {
+                write!(f, "a response of {response} values for {orig} original values")
+            }
+            ResponseError::Fold(e) => write!(f, "instantiating the response: {e}"),
+            ResponseError::Relate(e) => write!(f, "applying the response: {e}"),
+        }
+    }
+}
+
+impl core::error::Error for ResponseError {}
+
 impl fmt::Display for TypeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {

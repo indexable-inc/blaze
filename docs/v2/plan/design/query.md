@@ -27,7 +27,7 @@ SQL text ──blaze_sql::parse::parse_query──▶ query::Statement (blaze-sq
   (`parse::parse_query`, `parse::parse_script`): the same lexer and expression parser, plus
   comments, `::`, `@name`, `WITH [RECURSIVE]`, set operations, derived tables, the join forms,
   `FILTER`, `OVER`, `QUALIFY`, `GROUP BY ALL` and subqueries. Its tree is `blaze_sql::query`;
-  its expressions are `ast::Expr` with one more variant, `ExprKind::Query`, which the portable
+  its expressions are `ast::Expr` with one more variant, `ExprKind::Analytic`, which the portable
   subset's checker refuses by name (`TypeErrorKind::NotInSubset`). `Grammar::Subset` is
   unchanged: the typed surface (sql.md) still refuses comments and every construct outside it.
 - **Binding is planning.** blaze-sql's `infer` types the portable subset against SQLite and
@@ -45,7 +45,7 @@ SQL text ──blaze_sql::parse::parse_query──▶ query::Statement (blaze-sq
 
 | Node | What |
 |---|---|
-| `Scan` | a base table by index; the columns read (pruned to those the query names); conjuncts `col op literal` checked against each chunk's min/max/null-count statistics to skip the chunk, then the whole pushed filter row by row before any column is copied |
+| `Scan` | a base table by index; conjuncts `col op number` checked against each chunk's min/max statistics to skip the chunk, then the whole pushed filter row by row; every column is read (pruning to the columns the query names is not built yet) |
 | `Filter` | rows where a predicate is true (null and false drop) |
 | `Project` | scalar expressions over the input's columns |
 | `Join` | inner, left, full, semi, anti, cross; equality keys (each null-safe or not: `IS NOT DISTINCT FROM` is a key that matches nulls) and a residual predicate |
@@ -99,10 +99,12 @@ are refused by name (the acceptance list says which views).
 
 ## The seam
 
-`blaze_rel::run(sql, &catalog, &params, bounds, alloc) -> Result<Rows<A>, QueryError>` runs one
-statement over a `Catalog`: the base tables (each a `dyn Table`) and the views of a prelude
-(`Catalog::prelude(views_sql)`, which reads `CREATE OR REPLACE VIEW` statements; a view that is
-`SELECT * FROM read_parquet(@t, ..)` is the base table `t` itself, so filters reach its scan).
+`blaze_rel::run(sql, &catalog, alloc) -> Result<Rows<A>, QueryError>` runs one statement over a
+`Catalog` of base tables (each a `dyn Table`, added with `Catalog::add(name, &table)`);
+`run_with(sql, &session, &catalog, alloc)` adds a `Session`: the views of a `Prelude`
+(`Prelude::parse(views_sql)`, which reads `CREATE [OR REPLACE] VIEW` statements; a view that is
+`SELECT * FROM read_parquet(@t, ..)` is the base table `t` itself, so filters reach its scan),
+the `$name` parameters, and the `Bounds` (`Bounds::PROFILE` by default).
 `Rows::write_table` and `Rows::write_json` print what `blaze debug sql` prints today (the header,
 a rule of dashes, two spaces between columns, trailing spaces trimmed, `N rows`; one JSON object
 a line). A `QueryError` names the statement (its first line, or the view's name), the byte
@@ -151,10 +153,10 @@ Functions: `max` 91, `round` 84, `sum` 68, `coalesce` 67, `count` 34 (`count(*)`
 3, `median` 3, `avg` 3, `ends_with` 2, `arg_min` 2, `lag` 2, `abs`, `floor`, `split_part`,
 `rank`, `replace`, `unnest`, `range` 1 each; and `error`, `concat` from the argument defaults
 (views.rs). blaze-sql's function table (`funcs.rs`) stays the subset's; the engine's functions
-are its own (`blaze_rel::func`), each with its NULL rule.
+are its own (`blaze_rel::plan::Func` and `AggFunc`), each with its NULL rule.
 
 blaze-sql gains (this change): the `Grammar::Query` lexer mode and parser, `query::{Statement,
-Query, SetExpr, Core, FromItem, Join, Order, Window, Frame, TypeName}`, `ExprKind::Query`, and
+Query, SetExpr, Core, FromItem, Join, Order, Window, Frame, TypeName}`, `ExprKind::Analytic`, and
 `TypeErrorKind::NotInSubset`. Nothing the subset accepted changes meaning.
 
 ## Memory
@@ -168,8 +170,8 @@ error naming the operator, never a swap storm; an allocation the frame refuses i
 already skips chunks by statistics, and the next step is streaming filters and aggregates chunk
 by chunk so only the hash tables and the joined rows are held.
 
-The floor (rule 67): reading each referenced column once. A scan copies the pruned columns of
-the rows its filter keeps, so a selective query is near the floor; an expression is interpreted
+The floor (rule 67): reading each referenced column once. A scan copies the columns of the rows
+its filter keeps (every column until column pruning is built), so a selective query is near the floor; an expression is interpreted
 row by row (about 10-30 ns a node a row, measured on nothing yet: the first real-run profile
 names the ratio). DuckDB's floor includes spawning a process and writing Arrow (~100 ms).
 

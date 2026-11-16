@@ -51,6 +51,11 @@ mod tests;
 
 pub use self::{array::ArrayQueue, seg::SegQueue};
 
+/// The owning iterators, as crossbeam's queues have them.
+pub mod iter {
+    pub use crate::{array::IntoIter as ArrayIntoIter, seg::IntoIter as SegIntoIter};
+}
+
 /// A value padded to 128 bytes, the pair of lines arm64 and x86 prefetch together: the head
 /// and the tail are written by different threads and must not share a line.
 #[repr(align(128))]

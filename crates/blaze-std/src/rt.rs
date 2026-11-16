@@ -151,7 +151,8 @@ impl core::fmt::Display for TopologyError {
 pub(crate) mod pool {
     //! Starting and stopping the pool's threads: the driver of task/threads.rs.
 
-    use std::{format, string::String, sync::mpsc, thread, vec::Vec as StdVec};
+    // `std` is this module's (bstd is `no_std`: rt.rs is where Rust std is named).
+    use super::std::{format, string::String, sync::mpsc, thread, vec::Vec as StdVec};
 
     use alloc::string::ToString as _;
     use core::time::Duration;
@@ -201,7 +202,7 @@ pub(crate) mod pool {
         let mut at = 0u32;
         for group in &topology.groups {
             for &cpu in group.cpus.iter() {
-                let (pool, told, class, pin) = (pool.clone(), told.clone(), group.class, topology.pin);
+                let (mine, told, class, pin) = (pool.clone(), told.clone(), group.class, topology.pin);
                 let me = at;
                 let spawned = thread::Builder::new()
                     .name(format!("bstd-worker-{me}"))
@@ -212,7 +213,7 @@ pub(crate) mod pool {
                         let _ = told.send((me, placed));
                         drop(told);
                         if ok {
-                            pool.work(me);
+                            mine.work(me);
                         }
                     });
                 match spawned {
@@ -295,7 +296,8 @@ pub(crate) mod pool {
 mod machine {
     //! The machine's cores, and placing a worker on one (rule 45 for macOS's).
 
-    use std::{format, fs, string::String, vec::Vec as StdVec};
+    // `std` is this module's (bstd is `no_std`: rt.rs is where Rust std is named).
+    use super::std::{self, format, fs, string::String, vec::Vec as StdVec};
 
     use alloc::{alloc::Global, string::ToString as _};
 
@@ -511,7 +513,7 @@ mod machine {
 
     #[cfg(test)]
     mod tests {
-        use super::cpu_list;
+        use super::{cpu_list, std};
 
         #[test]
         fn a_cpu_list_reads_ranges_and_singles() {

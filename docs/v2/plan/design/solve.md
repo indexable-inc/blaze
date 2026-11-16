@@ -17,8 +17,11 @@ ports. Only the representation and the engineering are new.
 
 - **Types** (`blaze_solve::Tys`, src/tys.rs): what blaze-ty implements: one level of a term
   (`kind`), its `flags` and `markers` columns, interning (`mk`, `mk_list`), fresh variables,
-  `shallow_resolve`, `unify` (structural; an alias met on one side is handed back as a deferred
-  pair, which becomes an `AliasRelate` goal: the reference's lazy normalization), snapshots
+  `shallow_resolve`, `unify` (with `Relate::Lazy` a non-rigid alias met on one side is handed
+  back as a deferred pair: the solver emits `Projection { alias, term: fresh }` and relates
+  `fresh` with the other side, as rustc_type_ir relate/solver_relating.rs does for
+  `Alias(IsRigid::No, ..)`; a rigid alias relates by structure; with `Relate::Structural`
+  everything does, as canonical/mod.rs `ResponseRelating` applies responses), snapshots
   with an undo log, and the binding log the wake lists read. Terms are one arena: types,
   regions and consts are `Ty(u32)` handles of one `TyKind` (src/term.rs), so generic argument
   lists are plain `List`s of handles. Until blaze-ty lands, `Ty`, `List`, `TyKind`, `Flags` and
@@ -37,13 +40,16 @@ ports. Only the representation and the engineering are new.
 
 ## Goals (`Pred`, src/term.rs)
 
+The kinds of the pinned nightly's `PredicateKind` and `ClauseKind` (rustc_type_ir
+predicate_kind.rs). It has no `AliasRelate`: an alias carries `IsRigid`, and relating a
+non-rigid one emits a `Projection` goal, so this solver has none either (2026-11-15).
+
 | kind | meaning | reference |
 |---|---|---|
 | `Trait { trait_, args, polarity }` | `args[0]: trait_<args[1..]>`, positive or negative | trait_goals.rs |
-| `Projection { alias, term }` | `<..>::A == term`, through `NormalizesTo` | project_goals/mod.rs |
-| `NormalizesTo { alias, term }` | the solver-internal step: the alias's value, term unconstrained | normalizes_to.rs |
-| `AliasRelate { a, b, dir }` | equate or subtype where a side is an alias | alias_relate.rs (inside normalizes_to.rs in this nightly) |
-| `TypeOutlives`, `RegionOutlives` | recorded as region constraints in the response, for the borrow checker; never solved here | solve/mod.rs `compute_type_outlives_goal` |
+| `Projection { alias, term }` | `<..>::A == term` (`ClauseKind::Projection`); also what relating a non-rigid alias emits, with a fresh `term` | project_goals/mod.rs; rustc_type_ir relate/solver_relating.rs |
+| `NormalizesTo { alias, term }` | the solver-internal step: the alias's value, term unconstrained (`PredicateKind::NormalizesTo`) | normalizes_to.rs |
+| `TypeOutlives`, `RegionOutlives` | hold here; regions are erased, so the borrow checker takes outlives obligations from the fulfillment loop, not from responses (see Not ported) | solve/mod.rs `compute_type_outlives_goal` |
 | `WellFormed(term)` | the term's WF obligations (helper 2 / later) | solve/mod.rs `compute_well_formed_goal` |
 | `ConstEvaluatable(ct)` | stalls while the const has variables, else holds | solve/mod.rs |
 | `Subtype`, `Coerce` | stall while either side is an unresolved variable, else relate | solve/mod.rs `compute_subtype_goal` |
@@ -57,9 +63,10 @@ A goal's answer is canonical: `certainty` (one byte: yes; maybe because of ambig
 because of overflow, with or without the hint to raise the limit; `Certainty::and` and `or`
 port `MaybeCause::and/or`), the **variable values** (for each canonical variable of the input,
 its value as canonical words over the input's variables and new existential ones; one flag
-when the response is the identity), the **region constraints** (outlives pairs over canonical
-regions, in order, for the borrow checker), and the **opaque-type uses** (opaque, args, hidden
-type) a defining body records. No solution is its own result, not a certainty. Applying a
+when the response is the identity), **how a trait goal was proven** (`TraitGoalProvenVia`, which
+normalization reads), and the **nested normalization goals** a `NormalizesTo` answer hands back
+to its caller (eval_ctxt/mod.rs `evaluate_added_goals_and_make_canonical_response`). Region
+constraints and opaque-type uses are not in it (see Not ported). No solution is its own result, not a certainty. Applying a
 response in the caller instantiates the existential variables fresh and unifies each input
 variable's original term with its value (eval_ctxt/mod.rs `instantiate_and_apply_query_response`).
 
@@ -99,7 +106,7 @@ future-compat lint (`maybe_evaluate_root_goal_for_proof_tree_with_higher_recursi
 A candidate is a row: its source, a range of equations (pairs of terms to unify), a range of
 nested goals (each with its `GoalSource`), a certainty floor, and after its probe a response id.
 Assembly writes rows; the engine probes each in a snapshot: unify the equations (deferred alias
-pairs become `AliasRelate` nested goals), then evaluate the nested goals to a fixpoint of rounds
+pairs become `Projection` nested goals with a fresh term), then evaluate the nested goals to a fixpoint of rounds
 as `try_evaluate_added_goals` does, then canonicalize the response, roll back.
 
 Order, as `assemble_and_evaluate_candidates`: a self type that is an unresolved type variable
@@ -121,7 +128,7 @@ structural auto traits (src/builtin.rs, src/structural.rs: Sized and MetaSized, 
 built-in shapes, the Fn family for closures, fn items and pointers, Tuple, Pointee,
 DiscriminantKind, Destruct, auto traits with coinduction and `disqualify_auto_trait_candidate_due_to_possible_impl`,
 `dyn Trait` with its elaborated supertraits, unsizing); helper 2 writes aliases (src/alias.rs:
-normalizes-to, alias-relate, projection candidates from impls, param env and alias bounds, opaque
+normalizes-to and projection goals (rigid and non-rigid aliases as the reference's `IsRigid`), candidates from impls, param env and alias bounds, opaque
 types, associated consts); helper 3 writes coherence (src/coherence.rs: overlap of two impl
 headers with the intercrate mode and the orphan check).
 
@@ -224,7 +231,10 @@ property test against the scalar and naive matchers.
 
 - blaze-ty implements `Tys` (it owns `Ty`, `List`, `TyKind`, `Flags`, `Markers`; the
   canonical word format is this crate's, `canon.rs`, because it is the record key), keeps a
-  binding log beside its undo log, and hands back alias pairs from `unify` instead of failing.
+  binding log beside its undo log, hands back non-rigid alias pairs from `unify` (`Relate::Lazy`)
+  instead of failing, relates aliases by structure under `Relate::Structural`, and keeps the
+  reference's `IsRigid` bit on every alias (`TyKind::Alias(Rigid, ..)`) with the
+  `HAS_NON_RIGID_ALIAS` flag.
 - blaze-ty's `TypeCtx` forwards `assume`, `register`, `select_*`, `next_error`, `may_hold`,
   `normalize` and `closure_hint` to `Solver`, and implements `Facts` over typeck's `Reads`,
   so a body's read list holds what its goals read.

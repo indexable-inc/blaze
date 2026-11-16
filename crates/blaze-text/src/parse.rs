@@ -45,6 +45,17 @@ impl ParseError {
 pub trait Parse<'a>: Sized {
     /// The value and the rest of `text`.
     fn parse(text: &'a str) -> Result<(Self, &'a str), ParseError>;
+
+    /// The whole of `text`, nothing after it ([`parse_all`]). A type overrides it when
+    /// knowing the token's end saves work (floats skip their own scan).
+    #[inline]
+    fn parse_whole(text: &'a str) -> Result<Self, ParseError> {
+        let (value, rest) = Self::parse(text)?;
+        match rest.is_empty() {
+            true => Ok(value),
+            false => Err(ParseError { at: consumed(text, rest), expected: "the end of the text" }),
+        }
+    }
 }
 
 /// The bytes of `whole` before `rest`, which is a suffix of it.
@@ -54,12 +65,9 @@ fn consumed(whole: &str, rest: &str) -> usize {
 }
 
 /// The whole of `text` as a `T`: nothing may follow it.
+#[inline]
 pub fn parse_all<'a, T: Parse<'a>>(text: &'a str) -> Result<T, ParseError> {
-    let (value, rest) = T::parse(text)?;
-    match rest.is_empty() {
-        true => Ok(value),
-        false => Err(ParseError { at: consumed(text, rest), expected: "the end of the text" }),
-    }
+    T::parse_whole(text)
 }
 
 /// How an integer is written.
@@ -157,6 +165,27 @@ const POW10_U64: [u64; 9] = [1, 10, 100, 1_000, 10_000, 100_000, 1_000_000, 10_0
 /// otherwise [`decimal_u64_scalar`].
 #[inline]
 pub(crate) fn decimal_u64(bytes: &[u8]) -> Decimal64 {
+    // Most numbers are short: one word says how many of the first eight bytes are digits
+    // (the lowest byte that is not), and under eight converts at once, no vector and no loop.
+    // A text under eight bytes is padded with zero bytes, which are not digits.
+    {
+        let mut word = [0u8; 8];
+        let have = bytes.len().min(8);
+        word[..have].copy_from_slice(&bytes[..have]);
+        let w = u64::from_le_bytes(word);
+        let not_digit =
+            (w.wrapping_sub(0x3030_3030_3030_3030) | w.wrapping_add(0x4646_4646_4646_4646)) & 0x8080_8080_8080_8080;
+        if not_digit != 0 {
+            // A borrow or carry only moves up, past the first non-digit: the bytes below it
+            // are judged exactly.
+            let n = not_digit.trailing_zeros() / 8;
+            return match n {
+                0 => Decimal64::NoDigit,
+                _ => Decimal64::Value(first_digits(&word, n), blaze_int::idx(n)),
+            };
+        }
+    }
+    // Eight digits at least: one vector compare gives the run's length.
     if bytes.len() >= 16 {
         let n = crate::simd::digit_run(bytes);
         match n {
@@ -211,6 +240,7 @@ pub(crate) fn decimal_u64_scalar(bytes: &[u8]) -> Decimal64 {
 macro_rules! parse_ints {
     ($($t:ident $u:ident $signed:tt $width:tt;)*) => {$(
         impl ParseInt for $t {
+            #[inline]
             fn parse_with(text: &str, syntax: IntSyntax) -> Result<($t, &str), ParseError> {
                 assert!(
                     (2..=36).contains(&syntax.radix),
@@ -423,10 +453,48 @@ fn scan_float<F: Float>(text: &str) -> Result<Scanned<'_, F>, ParseError> {
     Ok(Scanned::Number(Number { negative, int, frac, exp }, i))
 }
 
+/// Whether `text` is a plain decimal in this crate's float grammar as far as `core` could
+/// read it differently: a digit first (after one `-`), a digit last, and a digit after every
+/// `.` (`core` also reads `+1`, `.5`, `5.`, `1.e5`, `infinity` and any case of `nan`).
+#[inline]
+fn plain_float(bytes: &[u8]) -> bool {
+    let first = usize::from(bytes.first() == Some(&b'-'));
+    let digit_at = |i: usize| bytes.get(i).is_some_and(u8::is_ascii_digit);
+    digit_at(first)
+        && bytes.last().is_some_and(u8::is_ascii_digit)
+        && match bytes.iter().position(|&b| b == b'.') {
+            Some(point) => digit_at(point + 1),
+            None => true,
+        }
+}
+
+/// The whole text as a float: a plain decimal goes to `core` straight, with no scan of ours;
+/// anything else (a special, an error, a value past the range) is the scanner's to judge,
+/// so the error is this crate's. Both give the correctly rounded value, so the answer does
+/// not depend on which ran.
+#[inline]
+fn parse_whole_float<F: Float>(text: &str) -> Result<F, ParseError> {
+    if plain_float(text.as_bytes())
+        && let Some(x) = F::core_parse(text)
+    {
+        return Ok(x);
+    }
+    let (x, rest) = parse_float::<F>(text)?;
+    match rest.is_empty() {
+        true => Ok(x),
+        false => Err(ParseError { at: consumed(text, rest), expected: "the end of the text" }),
+    }
+}
+
 impl<'a> Parse<'a> for f64 {
     #[inline]
     fn parse(text: &'a str) -> Result<(f64, &'a str), ParseError> {
         parse_float::<f64>(text)
+    }
+
+    #[inline]
+    fn parse_whole(text: &'a str) -> Result<f64, ParseError> {
+        parse_whole_float::<f64>(text)
     }
 }
 
@@ -434,6 +502,11 @@ impl<'a> Parse<'a> for f32 {
     #[inline]
     fn parse(text: &'a str) -> Result<(f32, &'a str), ParseError> {
         parse_float::<f32>(text)
+    }
+
+    #[inline]
+    fn parse_whole(text: &'a str) -> Result<f32, ParseError> {
+        parse_whole_float::<f32>(text)
     }
 }
 

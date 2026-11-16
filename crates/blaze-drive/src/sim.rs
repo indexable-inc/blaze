@@ -14,7 +14,7 @@ use std::string::String;
 use std::vec::Vec as StdVec;
 
 use blaze_id::ContentId;
-use blaze_own::Vec;
+use blaze_own::{Alloc, Vec};
 use blaze_sim::{Broke, Config as SimConfig, Tape, check, control};
 
 use crate::Plant;
@@ -181,11 +181,11 @@ enum Answered {
     Cfg(Var),
 }
 
-fn input_out(task: &Task<Global>, name: Name) -> Option<ContentId> {
+fn input_out(task: &Task<'static>, name: Name) -> Option<ContentId> {
     task.inputs.iter().find(|input| input.name == name).map(|input| input.out)
 }
 
-fn reads_of(task: &Task<Global>, wanted: &[(Name, Name)]) -> Result<StdVec<(Name, ContentId)>, StdVec<Want>> {
+fn reads_of(task: &Task<'static>, wanted: &[(Name, Name)]) -> Result<StdVec<(Name, ContentId)>, StdVec<Want>> {
     let mut reads = StdVec::new();
     let mut lacking = StdVec::new();
     for (name, home) in wanted {
@@ -217,7 +217,7 @@ fn finding(world: &World, kind: Kind, out: &ContentId) -> Option<StdVec<u8>> {
     }
 }
 
-fn execute(world: &World, task: &Task<Global>) -> Result<Answered, Broke> {
+fn execute(world: &World, task: &Task<'static>) -> Result<Answered, Broke> {
     let name = task.name;
     let done = |out, reads, parts, findings| Ok(Answered::Done(Made { name, out, reads, parts, findings }));
     match name.kind {
@@ -346,7 +346,7 @@ fn request(
 
 /// A batch as the sim's worker runs it: each task to `Done`, `Failed` or a `Need` no row of
 /// the settled table answers, re-entered in place otherwise (`worker::answer_in_place`).
-fn work(world: &World, store: &Store, table: &Settled<Global>, tasks: StdVec<(Ticket, Task<Global>)>) -> Result<(StdVec<(Ticket, Answered, u32)>, u32), Broke> {
+fn work(world: &World, store: &Store, table: &Settled<Global>, tasks: StdVec<(Ticket, Task<'static>)>) -> Result<(StdVec<(Ticket, Answered, u32)>, u32), Broke> {
     let mut answered = StdVec::new();
     let mut resolved = 0;
     for (ticket, mut task) in tasks {
@@ -354,7 +354,7 @@ fn work(world: &World, store: &Store, table: &Settled<Global>, tasks: StdVec<(Ti
         loop {
             match execute(world, &task)? {
                 Answered::Need(wants) => {
-                    let mut left: Vec<Want, Global> = Vec::new_in(Global);
+                    let mut left: Vec<Want, Alloc<'static>> = Vec::new_in(Alloc::global());
                     let before = task.inputs.len();
                     let again = worker::answer_in_place(table, &mut task, &wants, 32, &mut left);
                     for input in &task.inputs[before..] {
@@ -400,9 +400,9 @@ fn request_with(
     files.push(FileEntry { path: &manifest, id: key::digest("sim manifest", b"[package]"), changed: false, manifest: true });
     files.sort_by(|a, b| a.path.cmp(b.path));
 
-    let mut req = Request::planted_in(config(setup.workers), setup.ask, setup.plant, Global);
+    let mut req = Request::planted_in(config(setup.workers), setup.ask, setup.plant, Alloc::global());
     let table: Settled<Global> = Settled::new_in(1 << 12, Global);
-    let mut out: Vec<Effect<Global>, Global> = Vec::new_in(Global);
+    let mut out: Vec<Effect<'static>, Alloc<'static>> = Vec::new_in(Alloc::global());
     let mut ended = Ended {
         answer: None,
         error: None,
@@ -415,7 +415,7 @@ fn request_with(
         stopped: false,
     };
     let mut gets: StdVec<Key> = StdVec::new();
-    let mut batches: StdVec<(BatchId, StdVec<(Ticket, Task<Global>)>)> = StdVec::new();
+    let mut batches: StdVec<(BatchId, StdVec<(Ticket, Task<'static>)>)> = StdVec::new();
     // Puts are written later, in an order the tape picks, as a store's writes complete; a
     // `Publish` completes every put before it first (the effect's contract).
     let mut puts: StdVec<(Key, StdVec<u8>)> = StdVec::new();
@@ -526,7 +526,7 @@ fn request_with(
                     let mut tasks = StdVec::new();
                     for (ticket, task) in batch.tasks.into_iter() {
                         let out_now = batches.iter().flat_map(|(_, b)| b.iter()).chain(tasks.iter());
-                        if out_now.clone().any(|(_, running): &(Ticket, Task<Global>)| running.key == task.key) {
+                        if out_now.clone().any(|(_, running): &(Ticket, Task<'static>)| running.key == task.key) {
                             return Err(Broke::Oracle(format!("single flight: {} ran twice at once", task.name)));
                         }
                         *ended.runs.entry(task.name.kind).or_insert(0) += 1;
@@ -589,14 +589,14 @@ fn table(store: &Store, last: &[u8]) -> Result<Table, Broke> {
     let wire = |error| Broke::Oracle(format!("a stored answer is not one: {error}"));
     let last = read_last(last).map_err(wire)?;
     let root_bytes = store.records.get(&last.root).ok_or(Broke::Oracle(String::from("the root is not stored")))?;
-    let root = read_root(root_bytes, Global).map_err(wire)?;
+    let root = read_root(root_bytes, Alloc::global()).map_err(wire)?;
     let mut table = Table::new();
     for page_key in root.pages.iter() {
         if *page_key == Key::default() {
             continue;
         }
         let bytes = store.records.get(page_key).ok_or(Broke::Oracle(String::from("a page is not stored")))?;
-        for (name, row) in read_page(bytes, Global).map_err(wire)?.iter() {
+        for (name, row) in read_page(bytes, Alloc::global()).map_err(wire)?.iter() {
             table.insert(
                 *name,
                 (
@@ -883,10 +883,10 @@ fn fifo(world: &World, ask: Ask<'_>) -> Result<Fifo, Broke> {
     let manifest = b"Cargo.toml".to_vec();
     files.push(FileEntry { path: &manifest, id: key::digest("sim manifest", b"[package]"), changed: false, manifest: true });
     files.sort_by(|a, b| a.path.cmp(b.path));
-    let mut req = Request::planted_in(config(16), ask, world.plant, Global);
+    let mut req = Request::planted_in(config(16), ask, world.plant, Alloc::global());
     let mut store: BTreeMap<Key, StdVec<u8>> = BTreeMap::new();
-    let mut todo: std::collections::VecDeque<Effect<Global>> = std::collections::VecDeque::new();
-    let mut out: Vec<Effect<Global>, Global> = Vec::new_in(Global);
+    let mut todo: std::collections::VecDeque<Effect<'static>> = std::collections::VecDeque::new();
+    let mut out: Vec<Effect<'static>, Alloc<'static>> = Vec::new_in(Alloc::global());
     let (mut jobs, mut edges) = (0u64, 0u64);
     let mut prints = StdVec::new();
     req.step(Event::Start { files: &files, gone: &[], last: None }, &mut out).map_err(|e| Broke::Oracle(format!("{e}")))?;
@@ -955,8 +955,9 @@ fn fifo(world: &World, ask: Ask<'_>) -> Result<Fifo, Broke> {
 /// costs in proportion to the jobs (parallel.md change 3). A count, not a time.
 #[test]
 fn bookkeeping_is_linear_in_jobs_and_edges() {
-    check(SimConfig::cases(1), |_| {
-        let (small_jobs, small_edges, small) = counted(&wide(100, 10))?;
+    check(SimConfig::cases(1), |tape| {
+        let small_files = 100 + tape.index(20, "small world's files");
+        let (small_jobs, small_edges, small) = counted(&wide(small_files, 10))?;
         let (large_jobs, large_edges, large) = counted(&wide(1_000, 50))?;
         oracle(large_jobs >= 100_000, || format!("the large world made {large_jobs} jobs, not 100,000"))?;
         let per_small = small as f64 / (small_jobs + small_edges) as f64;
@@ -1063,13 +1064,13 @@ fn control_an_asker_served_a_fork_it_does_not_imply_is_caught() {
     control(SimConfig::cases(2000), Plant::None, Plant::RanUnderCondition, "they differ", whole_space_equals_each);
 }
 
-/// An item reading three variables of five values spans 125 configurations, past the cap of 64:
-/// its answer is the typed finding, not a sample.
+/// An item reading three variables of five or six values spans 125 to 216 configurations, past
+/// the cap of 64: its answer is the typed finding, not a sample.
 #[test]
 fn an_item_past_the_cap_is_a_finding() {
-    check(SimConfig::cases(1), |_| {
+    check(SimConfig::cases(20), |tape| {
         let mut world = wide(1, 1);
-        world.values = std::vec![5, 5, 5];
+        world.values = (0..3).map(|_| 5 + tape.index(2, "values past the cap") as u16).collect();
         world.files[0][0].cfg = std::vec![0, 1, 2];
         let space = Space { values: &world.values, implications: &[] };
         let run = fifo(&world, Ask { command: Command::Check, args: b"", gate: Gate::Beside, space })?;

@@ -224,7 +224,11 @@ fn three(dict: bool) -> Batch<Global> {
         stack,
         pcs,
     ];
-    Batch::try_new(Vec::from_iter_in(fields(), Global), Vec::from_iter_in(columns, Global)).unwrap()
+    let mut fields = fields();
+    if !dict {
+        fields[8] = Field::new("kind", Type::One(Scalar::Text), false);
+    }
+    Batch::try_new(Vec::from_iter_in(fields, Global), Vec::from_iter_in(columns, Global)).unwrap()
 }
 
 #[test]

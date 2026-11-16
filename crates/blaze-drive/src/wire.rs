@@ -2,11 +2,10 @@
 //! lists, written once and read in place. Deterministic: no field holds the machine, a time or a
 //! map's order (rule 25); every list is sorted by its writer.
 
-use core::alloc::Allocator;
 use core::fmt;
 
 use blaze_id::ContentId;
-use blaze_own::Vec;
+use blaze_own::{AVec, Alloc, Vec};
 
 use crate::condition::{Condition, Var};
 use crate::key::{Key, Kind, Name};
@@ -52,12 +51,12 @@ impl fmt::Display for WireError {
 impl core::error::Error for WireError {}
 
 /// A record being written, in the caller's allocator.
-pub(crate) struct Writer<A: Allocator> {
-    bytes: Vec<u8, A>,
+pub(crate) struct Writer<'a> {
+    bytes: AVec<'a, u8>,
 }
 
-impl<A: Allocator> Writer<A> {
-    pub(crate) fn new_in(magic: &[u8; 4], alloc: A) -> Writer<A> {
+impl<'a> Writer<'a> {
+    pub(crate) fn new_in(magic: &[u8; 4], alloc: Alloc<'a>) -> Writer<'a> {
         let mut bytes = Vec::new_in(alloc);
         bytes.extend_from_slice(magic);
         Writer { bytes }
@@ -111,7 +110,7 @@ impl<A: Allocator> Writer<A> {
         }
     }
 
-    pub(crate) fn finish(self) -> Vec<u8, A> {
+    pub(crate) fn finish(self) -> AVec<'a, u8> {
         self.bytes
     }
 

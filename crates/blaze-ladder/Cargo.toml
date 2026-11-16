@@ -1,0 +1,40 @@
+[package]
+name = "blaze-ladder"
+description = "The `blaze run` walking skeleton (crates/blaze-cli/tests/ladder/README.md): a program's source files to running code in this process, through the new layer's pieces in a straight line; its own lowering and world stand in for blaze-lower and the item layer until they answer, each named in the README's shortcut list"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `outline`: each file's items, and the parser's events for bodies and signatures.
+blaze-file-items.workspace = true
+blaze-surface.workspace = true
+parser.workspace = true
+# The body form, the checker, and its toy type context (until blaze-ty implements `TypeCtx`).
+blaze-typeck = { workspace = true, features = ["toy"] }
+blaze-own = { workspace = true, features = ["std"] }
+blaze-hash = { path = "../blaze-hash" }
+# A checked body to LIR, and LIR to AArch64 code (the baseline tier).
+blaze-build.workspace = true
+blaze-emit.workspace = true
+# The slot table and code area the program's bodies are placed in, and its wire types.
+blaze-launch.workspace = true
+blaze-launch-rt.workspace = true
+# `ContentId`: a placed body's record id, by its bytes.
+blaze-ids = { path = "../blaze-ids" }
+# `dlsym`: an outside symbol's address in this process.
+libc.workspace = true
+
+[dev-dependencies]
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

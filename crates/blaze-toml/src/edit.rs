@@ -14,7 +14,7 @@ use blaze_data::Value;
 use blaze_own::{String, Vec};
 
 use crate::{
-    doc::{Document, Item, Kind, Origin},
+    doc::{Document, Item, Kind, NONE, Origin, low, widen},
     write::{WriteError, write_inline, write_key},
 };
 
@@ -256,6 +256,118 @@ impl<'d, 't, A: Allocator, B: Allocator + Clone> Edit<'d, 't, A, B> {
         Ok(())
     }
 
+    /// `item` and everything under it gone, every other byte kept:
+    /// - a key/value in a table with a header (or the root): its whole line, with a comment
+    ///   after the value;
+    /// - a key/value in an inline table: the entry and one comma beside it (`{}` when it was
+    ///   the only one);
+    /// - a table with a header, an array of tables or an element of one, or a table named only
+    ///   on the way to headers (`a` of `[a.b]`): the section of every header at or under it,
+    ///   from the header's line to the end of its last entry's line.
+    ///
+    /// Refused: the root, an array's element, and a key whose table was made by dotted keys
+    /// (`b` of `a.b = 1`), which has no line of its own.
+    pub fn remove(&mut self, item: Item<'_, '_, A>) -> Result<(), EditError<B>> {
+        self.mine(&item)?;
+        let at = item.span().start;
+        let Some(parent) = item.parent() else {
+            return Err(EditError { at, what: EditWhat::NotEditable { origin: item.origin() } });
+        };
+        match item.origin() {
+            Origin::Header | Origin::Implicit => {
+                self.remove_sections(item);
+                Ok(())
+            }
+            Origin::Dotted => Err(EditError { at, what: EditWhat::NotEditable { origin: Origin::Dotted } }),
+            Origin::Value | Origin::Inline => match (parent.kind(), parent.origin()) {
+                (Kind::Table, Origin::Inline) => {
+                    self.remove_inline_entry(item, parent);
+                    Ok(())
+                }
+                (Kind::Table, Origin::Header) => {
+                    self.remove_line(item);
+                    Ok(())
+                }
+                (_, origin) => Err(EditError { at, what: EditWhat::NotEditable { origin } }),
+            },
+        }
+    }
+
+    /// The line of a key/value in a header's section, through its newline.
+    fn remove_line(&mut self, item: Item<'_, '_, A>) {
+        let bytes = self.doc.text().as_bytes();
+        // A key/value starts its line (TOML puts each on its own), after blanks.
+        let start = line_start(bytes, item.key_span().start);
+        let end = line_end(bytes, item.span().end);
+        self.splice(start, end, String::new_in(self.alloc.clone()));
+    }
+
+    /// An inline table's entry and a comma beside it.
+    fn remove_inline_entry(&mut self, item: Item<'_, '_, A>, table: Item<'_, '_, A>) {
+        let nodes = &self.doc.nodes;
+        let bytes = self.doc.text().as_bytes();
+        let start = item.key_span().start;
+        let next = nodes.next_siblings()[widen(item.id)];
+        let empty = String::new_in(self.alloc.clone());
+        if next != NONE {
+            // Up to the next entry's first key: the comma and the blanks after it.
+            let until = nodes.key_spans()[widen(next)].range().start;
+            self.splice(start, until, empty);
+        } else if nodes.first_children()[widen(table.id)] != item.id {
+            // The last of several: from the comma before it.
+            let mut comma = start;
+            while comma > 0 && blank(bytes[comma - 1]) {
+                comma -= 1;
+            }
+            self.splice(comma - 1, item.span().end, empty);
+        } else {
+            let mut text = empty;
+            text.push_str("{}");
+            let span = table.span();
+            self.splice(span.start, span.end, text);
+        }
+    }
+
+    /// The section of every header table at or under `item`, walked by the node columns.
+    fn remove_sections(&mut self, item: Item<'_, '_, A>) {
+        let nodes = &self.doc.nodes;
+        let bytes = self.doc.text().as_bytes();
+        let top = item.id;
+        let mut at = top;
+        let mut sections = Vec::new_in(self.alloc.clone());
+        loop {
+            let i = widen(at);
+            let (kind, origin) = (nodes.kinds()[i], nodes.origins()[i]);
+            if kind == Kind::Table && origin == Origin::Header {
+                let start = line_start(bytes, nodes.spans()[i].range().start);
+                let end = widen(low(nodes.payloads()[i]));
+                sections.push((start, end));
+            }
+            // Headers sit under tables and arrays of tables made by headers or keys, never
+            // under a value or an inline table.
+            let into = matches!(kind, Kind::Table | Kind::Array) && !matches!(origin, Origin::Value | Origin::Inline);
+            let first = nodes.first_children()[i];
+            if into && first != NONE {
+                at = first;
+                continue;
+            }
+            loop {
+                if at == top {
+                    for (start, end) in sections.iter() {
+                        self.splice(*start, *end, String::new_in(self.alloc.clone()));
+                    }
+                    return;
+                }
+                let next = nodes.next_siblings()[widen(at)];
+                if next != NONE {
+                    at = next;
+                    break;
+                }
+                at = nodes.parents()[widen(at)];
+            }
+        }
+    }
+
     /// The text with every edit applied, in the edits' allocator.
     pub fn finish(mut self) -> Result<String<B>, EditError<B>> {
         self.splices.sort_unstable_by_key(|s| (s.at, s.seq));
@@ -274,6 +386,31 @@ impl<'d, 't, A: Allocator, B: Allocator + Clone> Edit<'d, 't, A, B> {
         out.push_str(&source[done..]);
         Ok(out)
     }
+}
+
+/// The start of the line `at` is on.
+fn line_start(bytes: &[u8], at: usize) -> usize {
+    bytes[..at].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1)
+}
+
+/// Past the rest of the line from `from`: blanks, a comment, and the newline.
+fn line_end(bytes: &[u8], from: usize) -> usize {
+    let mut i = from;
+    while i < bytes.len() && blank(bytes[i]) {
+        i += 1;
+    }
+    if i < bytes.len() && bytes[i] == b'#' {
+        while i < bytes.len() && bytes[i] != b'\n' {
+            i += 1;
+        }
+    }
+    if i < bytes.len() && bytes[i] == b'\r' {
+        i += 1;
+    }
+    if i < bytes.len() && bytes[i] == b'\n' {
+        i += 1;
+    }
+    i
 }
 
 /// Where the comma after an array's last element is, if it has one: past blanks, comments and

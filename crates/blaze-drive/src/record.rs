@@ -13,10 +13,8 @@
 //! A view checks its buffer once when opened; its iterators then decode without checking again
 //! (rule 74).
 
-use core::alloc::Allocator;
-
 use blaze_id::ContentId;
-use blaze_own::Vec;
+use blaze_own::{AVec, Alloc};
 
 use crate::condition::Var;
 use crate::key::{Key, Name};
@@ -79,7 +77,7 @@ pub(crate) struct Whole<'a> {
     pub(crate) split: Option<Var>,
 }
 
-pub(crate) fn write_whole<A: Allocator>(whole: &Whole<'_>, alloc: A) -> Vec<u8, A> {
+pub(crate) fn write_whole<'a>(whole: &Whole<'_>, alloc: Alloc<'a>) -> AVec<'a, u8> {
     let mut w = Writer::new_in(MAGIC, alloc);
     w.u8(WHOLE);
     w.name(whole.name);
@@ -130,7 +128,7 @@ pub(crate) fn write_whole<A: Allocator>(whole: &Whole<'_>, alloc: A) -> Vec<u8, 
 /// The store hands every record in such a buffer (drive.md, "The system side").
 pub const PAYLOAD_ALIGN: usize = 16;
 
-pub(crate) fn write_shape<A: Allocator>(name: Name, reads: &[(Name, ContentId)], alloc: A) -> Vec<u8, A> {
+pub(crate) fn write_shape<'a>(name: Name, reads: &[(Name, ContentId)], alloc: Alloc<'a>) -> AVec<'a, u8> {
     let mut w = Writer::new_in(MAGIC, alloc);
     w.u8(SHAPE);
     w.name(name);
