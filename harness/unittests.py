@@ -227,12 +227,13 @@ class Watch:
         print(self.line(), flush=True)
 
 
-def run(command, cwd, env, seen, failed, watch_dirs, log):
-    """Runs one `blaze test`, adding its tests to seen and failed and its output to `log`;
-    returns its exit status, whether any of its tests failed and its `Watch`."""
+def run(command, cwd, env, seen, failed, watch_dirs, log, mode="w"):
+    """Runs one test command, adding its tests to seen and failed and its output to `log`
+    (`mode` "a" adds to it); returns its exit status, whether any of its tests failed and its
+    `Watch`."""
     print(" ".join(command), flush=True)
     proc = subprocess.Popen(command, cwd=cwd, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors="replace")
-    with Watch(proc, watch_dirs) as watch, open(log, "w", encoding="utf-8") as kept:
+    with Watch(proc, watch_dirs) as watch, open(log, mode, encoding="utf-8") as kept:
         return *read(proc, seen, failed, kept), watch
 
 
@@ -273,6 +274,14 @@ class Config:
     # The fewest tests the run has to have run: a run of fewer is a failure, never a pass.
     at_least: int = 1
 
+
+# Packages whose tests a cargo run runs one at a time, and why: `blaze test` runs each test in a
+# process of its own, and these tests share what a process holds when they run as threads of
+# one (blaze-cargo's serve tests: 103 failed at 32 threads on 2026-11-15, 32 at one).
+SERIAL = {
+    "blaze-cargo": "its serve tests share process-wide state (the machine's layer directory, each store's "
+    "reservation of 4096 windows of 1 GiB of address space) and expect a process to themselves",
+}
 
 # The package rustc cannot compile: blaze's own standard library, written in blaze's syntax
 # (decision D25). A cargo run leaves it and every package of the workspace built on it out.
@@ -359,7 +368,10 @@ def main():
             left_out = blaze_only(toolchain)
             print(f"left out of the cargo run, as rustc cannot compile them: {', '.join(left_out)}", flush=True)
             excluded = [arg for name in left_out for arg in ("--exclude", name)]
-            command = ["cargo", f"+{toolchain}", "test", "--release", "--locked", "--no-fail-fast", "--workspace", *excluded, *args]
+            command = ["cargo", f"+{toolchain}", "test", "--release", "--locked", "--no-fail-fast", "--workspace", *excluded, *[arg for name in SERIAL for arg in ("--exclude", name)], *args]
+            for name, why in SERIAL.items():
+                print(f"{name}'s tests run one at a time: {why}", flush=True)
+            serial = ["cargo", f"+{toolchain}", "test", "--release", "--locked", "--no-fail-fast", *[arg for name in SERIAL for arg in ("-p", name)], *args, *([] if "--" in args else ["--"]), "--test-threads", "1"]
     else:
         command = ["blaze", *verb, "--release", "--locked", "--workspace", *args]
     # Under CI rust-analyzer's slow tests run, and mark that they did in the target directory.
@@ -389,6 +401,11 @@ def main():
             print(f"::error::{' '.join(bins)} failed (exit status {built}): the tests run these programs")
             sys.exit(1)
     status, _, watch = run(command, ROOT, env, seen, failed, watch_dirs, log)
+    if cfg.builder == "cargo" and not cfg.build:
+        more, _, after = run(serial, ROOT, env, seen, failed, watch_dirs, log, "a")
+        status = status or more
+        if after.peak > watch.peak:
+            watch.peak, watch.at_peak = after.peak, after.at_peak
     sys.stdout.flush()
     took = (time.monotonic() - watch.began) / 60
     peak = f"{watch.peak / 1024:.1f} GB of memory and swap in use on the machine at most" if watch.at_peak else "no memory reading on this platform"
