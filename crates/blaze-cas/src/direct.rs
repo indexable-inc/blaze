@@ -2043,7 +2043,7 @@ impl Direct {
             }
         };
         let form = found.place.form();
-        if self.chunk_round && !matches!(form, Form::Raw | Form::Lz4 | Form::Zstd) {
+        if self.chunk_round && !matches!(form, Form::Raw | Form::Zstd) {
             let at = match found.place {
                 Place::Pack(loc) => loc.offset,
                 Place::Segment(seg) => seg.offset,
@@ -2648,8 +2648,8 @@ fn finish<A: Allocator>(
 }
 
 /// Why a record named by a chunked value's list is refused when it is no chunk.
-const NOT_A_CHUNK: &str = "a chunked value's list names it as a chunk, and a chunk is kept raw, \
-                           lz4 or zstd (`segment.rs`, a put of an output)";
+const NOT_A_CHUNK: &str = "a chunked value's list names it as a chunk, and a chunk is kept raw \
+                           or zstd (`segment.rs`, a put of an output)";
 
 /// A chunked value's list of chunks checked against its header: whole entries, each no longer
 /// than a chunk, their lengths summing to the value's.
@@ -2776,7 +2776,6 @@ fn checked_header(record: &[u8], key: &Key, loc: Loc, check: bool) -> Result<(Re
 fn decode<'p>(view: &View, tier: usize, header: &RecordHeader, payload: &'p [u8]) -> Result<Cow<'p, [u8]>, String> {
     Ok(match header.form {
         Form::Raw => Cow::Borrowed(payload),
-        Form::Lz4 => Cow::Owned(cold::unlz4(payload, header.raw)?),
         Form::Zstd if header.dictionary == NO_DICTIONARY => Cow::Owned(cold::decompress_long(payload, header.raw)?),
         Form::Zstd => {
             let dictionary = view
@@ -2817,7 +2816,6 @@ fn form_name(form: Form) -> &'static str {
         Form::Chunked => "chunked",
         Form::External => "as a file of its own",
         Form::Dictionary => "as a dictionary",
-        Form::Lz4 => "lz4",
         Form::Warm => "in warm columns",
         Form::ColdColumns => "in cold columns",
     }

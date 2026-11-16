@@ -56,8 +56,14 @@ mod macros;
 mod map;
 mod path;
 mod traits;
+#[cfg(feature = "std")]
+mod std_types;
 mod value;
 mod walk;
+
+// The `std` feature's impls name std's types; tests have std already.
+#[cfg(all(feature = "std", not(test)))]
+extern crate std;
 
 #[cfg(test)]
 mod plant;

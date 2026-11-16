@@ -15,12 +15,12 @@ doctest = false
 
 [dependencies]
 blaze-arrow-ipc.workspace = true
-blaze-base64.workspace = true
 blaze-columns.workspace = true
 blaze-core.workspace = true
 blaze-graph.workspace = true
 blaze-hash.workspace = true
 blaze-ids.workspace = true
+blaze-kit.workspace = true
 blaze-mem.workspace = true
 blaze-own.workspace = true
 blaze-parquet.workspace = true

@@ -93,6 +93,6 @@ pub use crate::{
     },
     tokens::{
         Ctx, CtxNode, DefSite, Delim, Edition, LitKind, Mark, MarkOf, Raw, Sink, Spacing, Text,
-        Token, TokenHygiene, TokenKind, TokenStream, Transparency, lex,
+        Token, TokenHygiene, TokenKind, TokenStream, Transparency, lex, lex_through_tt,
     },
 };

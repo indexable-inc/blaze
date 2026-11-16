@@ -322,6 +322,7 @@ impl<T, const CAP: usize> SegQueue<T, CAP> {
 
     /// The values in it at one moment: a tail read twice the same around a head.
     pub fn len(&self) -> usize {
+        let mut spin = SpinWait::new();
         loop {
             let mut tail = self.tail.index.load(Ordering::SeqCst);
             let mut head = self.head.index.load(Ordering::SeqCst);
@@ -344,6 +345,8 @@ impl<T, const CAP: usize> SegQueue<T, CAP> {
                 // Each lap's last step holds nothing.
                 return tail - head - tail / Self::LAP;
             }
+            // The tail moved between the two looks: back off before the next.
+            spin.relax();
         }
     }
 }

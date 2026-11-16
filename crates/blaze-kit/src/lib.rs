@@ -37,6 +37,15 @@
 //! chunk blocks), [`Heap4`] (the hole in a sift) and [`table::Branded`] (one unchecked read,
 //! proven in range by the brand) hold the crate's `unsafe`; each block names the invariant it
 //! relies on. Everything else is safe code over blaze-own's vectors.
+//!
+//! # Callers
+//!
+//! Moved (2026-11-15): blaze-graph's batch order and blaze-protocol's node order (Kahn's ready
+//! set) and blaze-profile's replay events to [`Heap4`]; blaze-parquet's thrift zigzag and
+//! varint to [`codec`]; blaze-typeck's toy variable table to [`UnionFind`]. Left for when their
+//! crates come back from the parked list (the root manifest's `exclude`): blaze-codegen's
+//! `BinaryHeap` (src/driver/support.rs) to [`Heap4`], and blaze-link's `SmallVec`s
+//! (symbols.rs, macho.rs, native.rs, target.rs, lib.rs) to [`InlineVec`].
 
 #![no_std]
 #![feature(allocator_ext)]

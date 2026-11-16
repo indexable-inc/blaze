@@ -32,11 +32,23 @@ pub enum Malformed {
     Pred,
 }
 
+/// A part of the semantics not ported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unsupported {
+    InherentAlias,
+    FreeAlias,
+    AnonConst,
+    ConstEval,
+}
+
 /// The solver's own failure: a bound passed or malformed input. Never a user's error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SolveError {
     Limit(Limit),
     Malformed(Malformed),
+    /// A goal needs a part of Rust's semantics the solver does not port (solve.md,
+    /// "Not ported"): stopped, never answered wrongly (rule 3).
+    Unsupported(Unsupported),
 }
 
 impl core::fmt::Display for SolveError {
@@ -44,6 +56,7 @@ impl core::fmt::Display for SolveError {
         match self {
             SolveError::Limit(l) => write!(f, "blaze-solve: bound reached: {l:?} (rule 18)"),
             SolveError::Malformed(m) => write!(f, "blaze-solve: malformed input: {m:?}"),
+            SolveError::Unsupported(u) => write!(f, "blaze-solve: not ported: {u:?} (solve.md, \"Not ported\")"),
         }
     }
 }

@@ -552,13 +552,21 @@ mod tests {
     #[test]
     fn the_hook_is_installed_once_and_bounds_a_wait() {
         static YIELDS: AtomicUsize = AtomicUsize::new(0);
-        static NOW: AtomicUsize = AtomicUsize::new(0);
+        // The hook is process-wide and the other tests' waits run beside this one, so the fake
+        // clock is per thread: this test's jump past the budget hangs only its own wait.
+        std::thread_local! {
+            static NOW: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+        }
         fn yield_now() {
             YIELDS.fetch_add(1, Relaxed);
             std::thread::yield_now();
         }
         fn now() -> u64 {
-            NOW.fetch_add(1, Relaxed) as u64
+            NOW.with(|now| {
+                let at = now.get();
+                now.set(at + 1);
+                at
+            })
         }
         static WAITING: Waiting =
             Waiting { yield_now, clock: Some(Clock { now, budget: 1_000_000, unit: "calls" }) };
@@ -569,7 +577,7 @@ mod tests {
             backoff.snooze();
         }
         assert!(YIELDS.load(Relaxed) >= 3, "the yields past the spin rounds");
-        NOW.store(10_000_000, Relaxed);
+        NOW.with(|now| now.set(10_000_000));
         let hang = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| backoff.snooze()));
         let message = hang.expect_err("past the budget: a hang");
         let message = message.downcast_ref::<std::string::String>().expect("a message");

@@ -268,10 +268,7 @@ impl RawMutex {
         // Taken from here on as contended: some other thread may still sleep on the word, and
         // only a 2 makes this thread's release wake it.
         #[cfg(test)]
-        let take = match plant {
-            Plant::TakeAsUncontended => HELD,
-            Plant::None | Plant::ReadersUnwoken | Plant::SequenceUnmoved => CONTENDED,
-        };
+        let mut take = CONTENDED;
         #[cfg(not(test))]
         let take = {
             _ = plant;
@@ -288,6 +285,13 @@ impl RawMutex {
             }
             // wakes: `unlock`, which wakes one sleeper whenever the word said 2
             self.word.wait(CONTENDED, rest);
+            // The plant: woken, this waiter forgets the others asleep behind it. (Taken as 1
+            // before any sleep, a waiter could not sleep at all: its wait for a 2 would return
+            // at once, a spin and not the lost wakeup the plant is for.)
+            #[cfg(test)]
+            if plant == Plant::TakeAsUncontended {
+                take = HELD;
+            }
             state = spin_while(&self.word.value, |it| it == HELD);
         }
     }

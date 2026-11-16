@@ -30,6 +30,17 @@
 //!   run by `trailing_ones` and a store: about 12 cycles a token, 3 cycles a byte (about 1 GB/s).
 //!
 //! `examples/cost.rs` prints each piece's MB/s and ns per line over `library/`.
+//!
+//! Measured 2026-11-15, one run of `examples/cost.rs` (release) on the owner's Mac (aarch64,
+//! 18 threads), over library/: 3,130 files, 1,525,930 lines, 57.0 MB.
+//! - `rustc_lexer::tokenize` 531.6 MB/s on 1 thread, 6,819.5 MB/s on 18. [`tokenize`] with
+//!   vectors 642.2 MB/s (1.21x) and 7,926.6 MB/s (1.16x): 0.64 of the 1 GB/s floor. The scalar
+//!   twin then ran 254.4 MB/s, half rustc_lexer's, because its runs built all three run masks of
+//!   each 64-byte block a byte at a time; it now tests each byte of a run once.
+//! - Tokenizing and counting braces over every fn body (21.7 MB) with rustc_lexer 439.7 MB/s;
+//!   [`skip_body`] 3,391.6 MB/s on 1 thread (7.7x; 0.97 of the floor) and 31,401.9 MB/s on 18;
+//!   scalar 1,014.9 MB/s.
+//! - `core::str::from_utf8` 47,110 MB/s; [`validate`] 59,872 MB/s (1.27x); scalar 4,131 MB/s.
 
 #![no_std]
 #![feature(portable_simd, register_tool, custom_inner_attributes)]

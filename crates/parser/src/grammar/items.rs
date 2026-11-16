@@ -166,6 +166,18 @@ pub(super) fn opt_item(
         has_mods = true;
     }
 
+    // A const closure (`const move |x| ..`, `const || ..`) is an expression, not an item.
+    if at_const_closure(p) {
+        return Err(m);
+    }
+
+    // `final fn` in a trait: a method no impl overrides (`#![feature(final_associated_functions)]`).
+    if p.at(T![final]) && matches!(p.nth(1), T![fn] | T![const] | T![unsafe] | T![async] | T![extern])
+    {
+        p.bump(T![final]);
+        has_mods = true;
+    }
+
     // modifiers
     if p.at(T![const]) && p.nth(1) != T!['{'] && !at_comptime_block(p) {
         p.eat(T![const]);
@@ -303,6 +315,11 @@ pub(super) fn opt_item(
 /// (`#![feature(blaze_comptime)]`): an expression, never an item's `const`.
 fn at_comptime_block(p: &Parser<'_>) -> bool {
     p.at(T![const]) && p.nth(1) == T![static] && p.nth(2) == T!['{']
+}
+
+/// At `const` starting a closure, `const |x| ..`, `const || ..` or `const move ..`.
+fn at_const_closure(p: &Parser<'_>) -> bool {
+    p.at(T![const]) && matches!(p.nth(1), T![move] | T![|] | T![||])
 }
 
 fn opt_item_without_modifiers(p: &mut Parser<'_>, m: Marker) -> Result<(), Marker> {

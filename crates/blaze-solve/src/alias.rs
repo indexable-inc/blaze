@@ -38,7 +38,7 @@ use blaze_own::{Alloc, Vec};
 
 use crate::assembly::{AStep, BuiltinSource, Cand, Cx, Done, Merger, Rule as CandRule, Source, Step, Via};
 use crate::canon::RespId;
-use crate::error::{Limit, Malformed, SolveError, Stop};
+use crate::error::{Limit, Malformed, SolveError, Stop, Unsupported};
 use crate::facts::{AssocKind, Facts, ImplPolarity, Portable};
 use crate::fold;
 use crate::term::{
@@ -82,9 +82,8 @@ pub enum Rule {
 }
 
 /// The error for an alias this port has no rule or no facts for (see the module doc).
-// The lead: a `SolveError::Unsupported(what)` would name it better than `Malformed::Pred`.
-fn unsupported() -> Stop {
-    Stop::Error(SolveError::Malformed(Malformed::Pred))
+fn unsupported(what: Unsupported) -> Stop {
+    Stop::Error(SolveError::Unsupported(what))
 }
 
 fn malformed() -> Stop {
@@ -281,6 +280,11 @@ fn assemble_normalizes_to<T: Tys, F: Facts>(
     }
     let self_ty = cx.resolve(self_ty);
     let via = cx.via();
+    // The trait goal has no solution: neither has this one (the `?` after
+    // `probe(compute_trait_goal)`).
+    if via == Via::Failed {
+        return Ok(AStep::No);
+    }
     // `proven_via` is `None`: `forced_ambiguity(MaybeInfo::AMBIGUOUS)`.
     if via == Via::None {
         out.push(forced_ambiguity(Source::Builtin(BuiltinSource::Misc)));
@@ -329,7 +333,7 @@ fn assemble_normalizes_to<T: Tys, F: Facts>(
                 out.push(cand(Source::Builtin(BuiltinSource::Misc), Rule::GatAmbiguous, self_ty));
             }
         }
-        Via::Misc | Via::None => {
+        Via::Misc | Via::None | Via::Failed => {
             if cx.tys.flags(alias).has(Flags::HAS_ERROR) {
                 out.push(cand(Source::Builtin(BuiltinSource::Misc), Rule::ErrorTerm, self_ty));
             }
@@ -526,12 +530,15 @@ fn step_project<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, st
             let a = cx.assoc(def)?;
             if a.kind == AssocKind::Const && a.trait_.is_some() {
                 normalize_associated_term(cx, cand, alias, term, kind, stage)
+            } else if a.trait_.is_none() && a.kind == AssocKind::Const {
+                Err(unsupported(Unsupported::InherentAlias))
             } else {
-                Err(unsupported())
+                Err(unsupported(Unsupported::AnonConst))
             }
         }
         AliasKind::Opaque => normalize_opaque_type(cx, alias, term, def, args),
-        AliasKind::Inherent | AliasKind::Free => Err(unsupported()),
+        AliasKind::Inherent => Err(unsupported(Unsupported::InherentAlias)),
+        AliasKind::Free => Err(unsupported(Unsupported::FreeAlias)),
     }
 }
 

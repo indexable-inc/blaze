@@ -20,6 +20,8 @@ blaze-columns.workspace = true
 blaze-own.workspace = true
 # Integer conversions that say what they do, in place of `as`.
 blaze-int.workspace = true
+# Zigzag and LEB128 (`codec`).
+blaze-kit.workspace = true
 
 [lints]
 workspace = true

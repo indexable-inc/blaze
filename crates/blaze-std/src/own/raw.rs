@@ -37,12 +37,15 @@ pub const fn same(a: TypeId, b: TypeId) -> bool {
 #[blaze::noalloc]
 #[blaze::nonblocking]
 pub fn shape(id: TypeId) -> Shape {
-    // An array or slice is asked by its element first, never through `info`: the pinned
-    // nightly's `type_id_type_of` writes a payload into `TypeKind::Array`, which its core
-    // declares without fields, and the compiler panics (index 0 of no fields, in
-    // `write_type_info`). `element_ty` is its own intrinsic and answers both shapes.
-    if id.element_ty().is_some() {
-        return Shape::Elements;
+    // A tuple is never asked of `info`: the pinned nightly (16d1ffac17ad) panics there on every
+    // tuple, a rustc bug. Its `write_type_info` (rustc_const_eval, const_eval/type_info.rs)
+    // writes a `Tuple` payload into `TypeKind::Tuple`, which the same commit's core declares
+    // with no field, so it indexes field 0 of none (rustc_abi/src/lib.rs:1763). So a tuple is
+    // known by intrinsics that answer for every type: `()` by its id, and any other by its
+    // first field, named `0`. A tuple struct and an enum whose first variant is tuple-like
+    // match too, and are `Parts` either way; a union's fields are always named.
+    if is_tuple_like(id) {
+        return Shape::Parts;
     }
     match id.info().kind {
         TypeKind::Bool
@@ -59,6 +62,26 @@ pub fn shape(id: TypeId) -> Shape {
         // A union, a closure, a foreign type, `!`, and whatever reflection adds later.
         _ => Shape::Unseen,
     }
+}
+
+/// Whether the type is `()`, or its first variant's first field is named `0` (a tuple, a tuple
+/// struct, an enum whose first variant is tuple-like). Asked only of `type_id_fields` and the
+/// field's name, which answer for every type (`fields` is 0 for one with none), never of
+/// `info` ([`shape`] says why).
+#[rustc_comptime]
+#[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
+fn is_tuple_like(id: TypeId) -> bool {
+    if same(id, self::id::<()>()) {
+        return true;
+    }
+    // An enum with no variants has no variant 0 to ask of.
+    if variants(id) == 0 || fields(id, 0) == 0 {
+        return false;
+    }
+    let name = field_name(id, 0, 0).as_bytes();
+    name.len() == 1 && name[0] == b'0'
 }
 
 /// How many variants: an enum's, one for anything else.
@@ -146,7 +169,15 @@ pub fn arg(id: TypeId, at: usize) -> Option<TypeId> {
 #[blaze::noalloc]
 #[blaze::nonblocking]
 pub fn implements(id: TypeId, marker: TypeId) -> bool {
-    core::intrinsics::reflection::type_id_vtable(id, marker).is_some()
+    if core::intrinsics::reflection::type_id_vtable(id, marker).is_some() {
+        return true;
+    }
+    // A function pointer is asked as `fn()`: under the pinned nightly the intrinsic found no
+    // impl of `bstd::flat::Address` for `fn(u32) -> u32` through its blanket
+    // `impl<F: FnPtr> Address for F` (`tests::flat` saw the walk clear it), so a trait that
+    // holds of every function pointer states it for `fn()` too, and is found there. Right for a
+    // trait held of all function pointers or of none, which is the only kind the walk asks.
+    id.function_ptr().is_some() && core::intrinsics::reflection::type_id_vtable(self::id::<fn()>(), marker).is_some()
 }
 
 /// The type as a diagnostic names it (`Shared<Parent>`).

@@ -21,6 +21,8 @@ blaze-own.workspace = true
 # `HashMap` and `ByHash`: the one hash table (rule 30). By path, not the workspace entry, which
 # turns on the `serde` and `shared` adapters and with them crates from outside the workspace.
 blaze-hash = { path = "../blaze-hash" }
+# `UnionFind`: the toy context's variable table, with snapshots.
+blaze-kit = { path = "../blaze-kit" }
 
 [features]
 # `blaze_typeck::toy`: the tests' type context, for the `blaze run` walking skeleton until

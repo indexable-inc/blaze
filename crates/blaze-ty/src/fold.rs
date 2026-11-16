@@ -136,6 +136,12 @@ pub(crate) enum Step {
 
 pub(crate) trait Hook {
     type Error;
+    /// Whether a node of these flags at `depth` is kept as it is: tested before the memo and
+    /// before `pre`, so an untouched subtree costs one load of its flags.
+    #[inline(always)]
+    fn skip(&self, _flags: Flags, _depth: u32) -> bool {
+        false
+    }
     fn pre(&mut self, tys: &mut Tys<'_>, vars: &mut Vars<'_>, n: Node, depth: u32, ctx: u8) -> Result<Step, Self::Error>;
 }
 
@@ -220,6 +226,10 @@ fn run_on<H: Hook>(
     while let Some(f) = st.stack.pop() {
         match f.op {
             ENTER => {
+                if h.skip(tys.node_flags(f.node), f.depth) {
+                    st.out.push(f.node);
+                    continue;
+                }
                 let key = if f.rule == RULE_SAME { memo_key(f.node, f.depth, f.ctx) } else { None };
                 if let Some(k) = key
                     && let Some(r) = st.memo.get(k)
@@ -387,6 +397,11 @@ fn bound_at(tys: &Tys<'_>, n: Node, depth: u32) -> At {
 impl Hook for Shift {
     type Error = FoldError;
 
+    #[inline(always)]
+    fn skip(&self, f: Flags, depth: u32) -> bool {
+        !f.escapes(depth)
+    }
+
     #[inline]
     fn pre(&mut self, tys: &mut Tys<'_>, _: &mut Vars<'_>, n: Node, depth: u32, _: u8) -> Result<Step, FoldError> {
         match bound_at(tys, n, depth) {
@@ -412,6 +427,11 @@ pub(crate) struct ShiftIn(pub(crate) u32);
 
 impl Hook for ShiftIn {
     type Error = Infallible;
+
+    #[inline(always)]
+    fn skip(&self, f: Flags, depth: u32) -> bool {
+        !f.escapes(depth)
+    }
 
     #[inline]
     fn pre(&mut self, tys: &mut Tys<'_>, _: &mut Vars<'_>, n: Node, depth: u32, _: u8) -> Result<Step, Infallible> {
@@ -446,6 +466,11 @@ pub(crate) struct Subst {
 
 impl Hook for Subst {
     type Error = FoldError;
+
+    #[inline(always)]
+    fn skip(&self, f: Flags, _: u32) -> bool {
+        !f.has(Flags::PARAM)
+    }
 
     #[inline]
     fn pre(&mut self, tys: &mut Tys<'_>, _: &mut Vars<'_>, n: Node, depth: u32, _: u8) -> Result<Step, FoldError> {
@@ -495,6 +520,11 @@ pub(crate) struct ReplaceBound<'m, 'a> {
 
 impl Hook for ReplaceBound<'_, '_> {
     type Error = FoldError;
+
+    #[inline(always)]
+    fn skip(&self, f: Flags, depth: u32) -> bool {
+        !f.escapes(depth)
+    }
 
     fn pre(&mut self, tys: &mut Tys<'_>, vars: &mut Vars<'_>, n: Node, depth: u32, _: u8) -> Result<Step, FoldError> {
         if !tys.node_flags(n).escapes(depth) {
@@ -564,6 +594,11 @@ pub(crate) struct Resolve;
 
 impl Hook for Resolve {
     type Error = Infallible;
+
+    #[inline(always)]
+    fn skip(&self, f: Flags, _: u32) -> bool {
+        !f.has(Flags::TY_INFER | Flags::CT_INFER)
+    }
 
     #[inline]
     fn pre(&mut self, tys: &mut Tys<'_>, vars: &mut Vars<'_>, n: Node, _: u32, _: u8) -> Result<Step, Infallible> {

@@ -239,9 +239,10 @@ impl<'a> Inputs<'a> {
         ans: Ans,
         required_depth: u32,
         nested: &[u32],
+        big: bool,
         reads: &[Read],
     ) -> Result<Entry, SolveError> {
-        let nested_range = if nested.len() > MAX_NESTED {
+        let nested_range = if big || nested.len() > MAX_NESTED {
             (0, u32::MAX)
         } else {
             let s = crate::error::row(self.nested_pool.len())?;

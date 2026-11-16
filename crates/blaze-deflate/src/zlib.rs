@@ -11,7 +11,7 @@ use crate::{
     checksum::Adler32,
     deflate::{Deflate, DeflateError, Level},
     error::{Error, Format, Why},
-    inflate::{Fed, Inflate, Limits},
+    inflate::{Fed, Inflate, InflateInto, Limits},
 };
 
 const HEADER: u64 = 2;
@@ -53,9 +53,8 @@ impl<const N: usize> Trailer<N> {
     }
 }
 
-/// A streaming zlib reader.
-pub struct ZlibDecoder<A: Allocator> {
-    inflate: Inflate<A>,
+/// The zlib frame around either inflater: the header, the running Adler-32 and the trailer.
+struct Frame {
     header: [u8; 2],
     header_have: usize,
     adler: Adler32,
@@ -65,17 +64,66 @@ pub struct ZlibDecoder<A: Allocator> {
     taken: u64,
 }
 
+impl Frame {
+    const NEW: Frame =
+        Frame { header: [0; 2], header_have: 0, adler: Adler32::new(), trailer: Trailer::EMPTY, done: false, taken: 0 };
+
+    /// The header's bytes taken from `input`; whether it is whole and good.
+    fn head(&mut self, input: &[u8], at: &mut usize) -> Result<bool, Error> {
+        while self.header_have < 2 && *at < input.len() {
+            self.header[self.header_have] = input[*at];
+            self.header_have += 1;
+            *at += 1;
+            if self.header_have == 2 {
+                check_header(self.header[0], self.header[1]).map_err(|why| Error::new(Format::Zlib, 0, why))?;
+            }
+        }
+        Ok(self.header_have == 2)
+    }
+
+    /// After the stream ended (`inflated` its input bytes): the trailer's bytes taken and
+    /// checked once whole.
+    fn tail(&mut self, input: &[u8], at: &mut usize, inflated: u64) -> Result<(), Error> {
+        if self.done {
+            return Ok(());
+        }
+        *at += self.trailer.take(&input[*at..]);
+        if self.trailer.is_whole() {
+            let stored = u32::from_be_bytes(self.trailer.bytes);
+            let computed = self.adler.finish();
+            if stored != computed {
+                return Err(Error::new(Format::Zlib, HEADER + inflated, Why::Adler32 { stored, computed }));
+            }
+            self.done = true;
+        }
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<(), Error> {
+        match self.done {
+            true => Ok(()),
+            false => Err(Error::new(Format::Zlib, self.taken, Why::Truncated)),
+        }
+    }
+
+    fn over(&self) -> &[u8] {
+        &self.trailer.over[..self.trailer.over_len]
+    }
+
+    fn stream_len(&self) -> u64 {
+        self.taken - self.trailer.over_len as u64
+    }
+}
+
+/// A streaming zlib reader appending to the caller's vector.
+pub struct ZlibDecoder<A: Allocator> {
+    inflate: Inflate<A>,
+    frame: Frame,
+}
+
 impl<A: Allocator + Clone> ZlibDecoder<A> {
     pub fn new_in(limits: Limits, alloc: A) -> ZlibDecoder<A> {
-        ZlibDecoder {
-            inflate: Inflate::new_in(limits, alloc),
-            header: [0; 2],
-            header_have: 0,
-            adler: Adler32::new(),
-            trailer: Trailer::EMPTY,
-            done: false,
-            taken: 0,
-        }
+        ZlibDecoder { inflate: Inflate::new_in(limits, alloc), frame: Frame::NEW }
     }
 }
 
@@ -83,62 +131,91 @@ impl<A: Allocator> ZlibDecoder<A> {
     /// Takes what it can of `input`, appending the output to `out`; see [`Inflate::feed`].
     pub fn feed<B: Allocator>(&mut self, input: &[u8], out: &mut Vec<u8, B>) -> Result<Fed, Error> {
         let mut at = 0;
-        while self.header_have < 2 && at < input.len() {
-            self.header[self.header_have] = input[at];
-            self.header_have += 1;
-            at += 1;
-            if self.header_have == 2 {
-                check_header(self.header[0], self.header[1]).map_err(|why| Error::new(Format::Zlib, 0, why))?;
-            }
-        }
-        if self.header_have < 2 {
-            self.taken += at as u64;
-            return Ok(Fed { consumed: at, done: false });
-        }
-        if !self.inflate.is_done() {
-            let before = out.len();
-            let fed = self.inflate.feed(&input[at..], out).map_err(|e| e.framed(Format::Zlib, HEADER))?;
-            self.adler.update(&out[before..]);
-            at += fed.consumed;
-            if fed.done {
-                self.trailer.from_tail(self.inflate.tail());
-            }
-        }
-        if self.inflate.is_done() && !self.done {
-            at += self.trailer.take(&input[at..]);
-            if self.trailer.is_whole() {
-                let stored = u32::from_be_bytes(self.trailer.bytes);
-                let computed = self.adler.finish();
-                if stored != computed {
-                    let at = HEADER + self.inflate.taken();
-                    return Err(Error::new(Format::Zlib, at, Why::Adler32 { stored, computed }));
+        if self.frame.head(input, &mut at)? {
+            if !self.inflate.is_done() {
+                let before = out.len();
+                let fed = self.inflate.feed(&input[at..], out).map_err(|e| e.framed(Format::Zlib, HEADER))?;
+                self.frame.adler.update(&out[before..]);
+                at += fed.consumed;
+                if fed.done {
+                    self.frame.trailer.from_tail(self.inflate.tail());
                 }
-                self.done = true;
+            }
+            if self.inflate.is_done() {
+                self.frame.tail(input, &mut at, self.inflate.taken())?;
             }
         }
-        self.taken += at as u64;
-        Ok(Fed { consumed: at, done: self.done })
+        self.frame.taken += at as u64;
+        Ok(Fed { consumed: at, done: self.frame.done })
     }
 
     /// The input ended: an error unless the stream did.
     pub fn finish(&self) -> Result<(), Error> {
-        match self.done {
-            true => Ok(()),
-            false => Err(Error::new(Format::Zlib, self.taken, Why::Truncated)),
-        }
+        self.frame.finish()
     }
 
     /// Bytes taken that lie past the stream's end (the bit buffer's read-ahead): the next
     /// thing's first bytes.
     pub fn over(&self) -> &[u8] {
-        &self.trailer.over[..self.trailer.over_len]
+        self.frame.over()
     }
 
     /// Bytes of the input the stream itself took: what was taken less [`ZlibDecoder::over`].
     pub fn stream_len(&self) -> u64 {
-        self.taken - self.trailer.over_len as u64
+        self.frame.stream_len()
     }
 
+    pub fn written(&self) -> u64 {
+        self.inflate.written()
+    }
+}
+
+/// A streaming zlib reader writing into one slice the caller sized (see [`InflateInto`]).
+pub struct ZlibInto {
+    inflate: InflateInto,
+    frame: Frame,
+}
+
+impl ZlibInto {
+    pub const fn new(limits: Limits) -> ZlibInto {
+        ZlibInto { inflate: InflateInto::new(limits), frame: Frame::NEW }
+    }
+
+    /// Takes what it can of `input`, writing the output into `out` after the
+    /// [`ZlibInto::written`] bytes already there; see [`InflateInto::feed`].
+    pub fn feed(&mut self, input: &[u8], out: &mut [u8]) -> Result<Fed, Error> {
+        let mut at = 0;
+        if self.frame.head(input, &mut at)? {
+            if !self.inflate.is_done() {
+                let before = self.inflate.written() as usize;
+                let fed = self.inflate.feed(&input[at..], out).map_err(|e| e.framed(Format::Zlib, HEADER))?;
+                self.frame.adler.update(&out[before..self.inflate.written() as usize]);
+                at += fed.consumed;
+                if fed.done {
+                    self.frame.trailer.from_tail(self.inflate.tail());
+                }
+            }
+            if self.inflate.is_done() {
+                self.frame.tail(input, &mut at, self.inflate.taken())?;
+            }
+        }
+        self.frame.taken += at as u64;
+        Ok(Fed { consumed: at, done: self.frame.done })
+    }
+
+    pub fn finish(&self) -> Result<(), Error> {
+        self.frame.finish()
+    }
+
+    pub fn over(&self) -> &[u8] {
+        self.frame.over()
+    }
+
+    pub fn stream_len(&self) -> u64 {
+        self.frame.stream_len()
+    }
+
+    /// Bytes written into the slice.
     pub fn written(&self) -> u64 {
         self.inflate.written()
     }

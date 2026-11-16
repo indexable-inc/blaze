@@ -151,8 +151,6 @@ pub struct Pack<A: Allocator> {
     by_oid: Vec<u32, A>,
 }
 
-/// The most output inflate may make per input byte: DEFLATE's own ceiling is about 1032.
-const RATIO: u64 = 1100;
 
 impl<A: Allocator + Clone> Pack<A> {
     /// The pack that is all of `pack`, read under `limits`.
@@ -210,7 +208,7 @@ impl<A: Allocator + Clone> Pack<A> {
                 return Err(refuse(PackWhy::TotalOver { most: limits.most_total }));
             }
             let start = raw.len();
-            let bound = blaze_deflate::Limits { most_out: size, most_ratio: RATIO, most_header: 0 };
+            let bound = blaze_deflate::Limits { most_out: size, most_ratio: blaze_deflate::MAX_RATIO, most_header: 0 };
             let used = blaze_deflate::unzlib_prefix(&pack[pos..end], bound, alloc.clone(), &mut raw)
                 .map_err(|e| refuse(PackWhy::Inflate(e)))?;
             let got = (raw.len() - start) as u64;

@@ -40,9 +40,12 @@
 //!
 //! [`typeck::to_typeck`] converts a body into blaze-typeck's `BodyView`, and refuses by name
 //! what that form has no place for: `let` in a condition, a break with no target, lang-item
-//! paths (every desugaring's), match and loop sources, coroutines and `yield`, `become`, raw
-//! borrows, block kinds (`unsafe`, `const`, `try`), struct defaults `..`, box, range and rest
-//! patterns, `b'x'` and `c"..."` literals, format arguments, macro calls, the shadowing links.
+//! paths (every desugaring's), coroutines and `yield`, `become`, raw borrows, `const` and
+//! `try` blocks, struct defaults `..`, box, range and rest patterns, a slice pattern's `..`,
+//! `b'x'` and `c"..."` literals, format arguments, macro calls, path anchors and lifetime
+//! arguments. Dropped in the conversion, because no type depends on them: match and loop
+//! sources and `unsafe` on a block (diagnostics and the unsafety check only), the shadowing
+//! links and the hygiene of names made by desugarings.
 
 #![no_std]
 #![feature(allocator_api)]
@@ -73,7 +76,7 @@ use blaze_own::{AVec, Alloc};
 pub use blaze_surface::{Edition, Range};
 
 pub use crate::columns::{Columns, Head, LoweredRoot, View, open};
-pub use crate::driver::{Expand, Expansion, FileStats, Sink, lower_file};
+pub use crate::driver::{EXPANSION_DEPTH, Expand, Expansion, FileStats, ItemRef, Outcome, Sink, Source, What, lower_file};
 pub use crate::form::*;
 pub use crate::machine::Mode;
 

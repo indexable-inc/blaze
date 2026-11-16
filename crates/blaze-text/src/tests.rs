@@ -11,11 +11,11 @@ use std::{
     vec::Vec as StdVec,
 };
 
-use blaze_own::{ParseIn, String, Vec};
+use blaze_own::{FixedString, Overflow, ParseIn, String, Vec};
 use blaze_sim::{Broke, Config, Tape};
 
 use crate::{
-    Buf, Count, Fixed, Float, IntSyntax, Integer, Overflow, Parse, ParseError, Put, Show, Shown, Unquoted, Writes,
+    Count, Fixed, Float, IntSyntax, Integer, Parse, ParseError, Put, Show, Shown, Unquoted, Writes,
     parse::{opt, sep_by, tag, take_while},
     parse_all, parse_int, parse_quoted_in,
     plant::{self, Plant},
@@ -277,15 +277,17 @@ fn vector_routines_equal_their_scalar_twins() {
         let digits = bytes_from(tape, b"0123456789012345678901234567890123456789x-", 40);
         let mixed = bytes_from(tape, b"abc \"\\\n\x01\x7f\xc3\xa9xyz0123", 40);
         for at in 0..32 {
+            // The integer reader against core on every window of a digit-heavy buffer.
             let window = &digits[at..];
-            let scalar = crate::parse::decimal_u64_scalar(window);
-            let vector = crate::parse::decimal_u64(window);
-            if scalar != vector {
-                return Err(Broke::Oracle(format!("decimal_u64 at {at} of {window:?}: vector {vector:?}, scalar {scalar:?}")));
-            }
-            let (v, s) = (crate::simd::digit_run(window), crate::simd::digit_run_scalar(window));
-            if v != s {
-                return Err(Broke::Oracle(format!("digit_run at {at}: vector {v}, scalar {s}")));
+            let run = window.iter().take_while(|b| b.is_ascii_digit()).count();
+            let want = core::str::from_utf8(&window[..run]).ok().and_then(|t| t.parse::<u64>().ok());
+            let got = match crate::parse::decimal_u64(window) {
+                crate::parse::Decimal64::Value(v, n) if n == run => Some(v),
+                crate::parse::Decimal64::Value(..) => return Err(Broke::Oracle(format!("decimal_u64 at {at}: wrong length"))),
+                _ => None,
+            };
+            if got != want {
+                return Err(Broke::Oracle(format!("decimal_u64 at {at} of {window:?}: read {got:?}, core {want:?}")));
             }
             let window = &mixed[at..];
             for from in [0, 1, 7, 17] {
@@ -318,7 +320,12 @@ fn integer_parse_matches_core_on_random_text() {
                 (u32::parse(&text).ok().map(|(v, _)| i128::from(v)), token.parse::<u32>().ok().map(i128::from)),
                 (i8::parse(&text).ok().map(|(v, _)| i128::from(v)), token.parse::<i8>().ok().map(i128::from)),
             ];
-            for (got, want) in pairs {
+            let whole = [
+                (parse_all::<u64>(token).ok().map(i128::from), token.parse::<u64>().ok().map(i128::from)),
+                (parse_all::<i64>(token).ok().map(i128::from), token.parse::<i64>().ok().map(i128::from)),
+                (parse_all::<u8>(token).ok().map(i128::from), token.parse::<u8>().ok().map(i128::from)),
+            ];
+            for (got, want) in pairs.into_iter().chain(whole) {
                 if got != want {
                     return Err(Broke::Oracle(format!("{text:?}: blaze-text read {got:?}, core {want:?}")));
                 }
@@ -409,8 +416,8 @@ fn combinators_compose() {
 // Sinks.
 
 #[test]
-fn buf_refuses_at_its_bound_and_stays_refused() {
-    let mut buf = Buf::<4>::new();
+fn fixed_string_refuses_at_its_bound_and_stays_refused() {
+    let mut buf = FixedString::<4>::new();
     buf.str("abc");
     assert_eq!(buf.text(), Ok("abc"));
     buf.str("de");

@@ -37,6 +37,21 @@ struct Col<'n> {
     name: &'n str,
     /// Kept from unqualified names and `*`: the right side's column of `using`.
     hidden: bool,
+    /// A later column of one relation under a name it already has (`select t.*, u.job as job`
+    /// where `t` has a `job`): DuckDB renames it `job_1`, so `job` names the first.
+    shadowed: bool,
+}
+
+/// Marks each column of one relation whose name an earlier column of it has.
+fn shadow(scope: &mut [Col<'_>]) {
+    for at in 1..scope.len() {
+        let name = scope.get(at).map_or("", |it| it.name);
+        if scope.get(..at).is_some_and(|earlier| earlier.iter().any(|it| eq(it.name, name)))
+            && let Some(col) = scope.get_mut(at)
+        {
+            col.shadowed = true;
+        }
+    }
 }
 
 type Scope<'n, A> = Vec<Col<'n>, A>;
@@ -58,6 +73,9 @@ struct Named<'n, A: Allocator> {
 /// The grouping of a level: its keys and the aggregates found so far.
 struct Grouping<A: Allocator> {
     keys: Vec<Expr<A>, A>,
+    /// Where each key's expression is written: a select item a key names by alias or position
+    /// is that key, though a subquery in it binds anew each time.
+    spans: Vec<Span, A>,
     aggs: Vec<Agg<A>, A>,
 }
 
@@ -718,8 +736,9 @@ impl<'q, 's: 'n, 'n, 'c, 't: 'n, B: Allocator, A: Allocator + Copy> Binder<'q, '
     fn named_scope(&self, names: &[&'n str], qual: &'n str) -> Scope<'n, A> {
         let mut scope = Vec::with_capacity_in(names.len(), self.alloc);
         for name in names {
-            scope.push(Col { qual: Some(qual), name, hidden: false });
+            scope.push(Col { qual: Some(qual), name, hidden: false, shadowed: false });
         }
+        shadow(&mut scope);
         scope
     }
 
@@ -748,8 +767,9 @@ impl<'q, 's: 'n, 'n, 'c, 't: 'n, B: Allocator, A: Allocator + Copy> Binder<'q, '
                 let (plan, names) = self.query(query)?;
                 let mut scope = Vec::with_capacity_in(names.len(), self.alloc);
                 for name in names.iter() {
-                    scope.push(Col { qual: alias.as_ref().map(|it| it.text), name, hidden: false });
+                    scope.push(Col { qual: alias.as_ref().map(|it| it.text), name, hidden: false, shadowed: false });
                 }
+                shadow(&mut scope);
                 Ok((plan, scope))
             }
             FromItem::Join(join) => self.join(join),
@@ -1049,7 +1069,8 @@ impl<'q, 's: 'n, 'n, 'c, 't: 'n, B: Allocator, A: Allocator + Copy> Binder<'q, '
             || core.having.as_ref().is_some_and(|it| has_aggregate(it))
             || core.qualify.as_ref().is_some_and(|it| has_aggregate(it))
             || order_by.iter().any(|o| has_aggregate(&o.expr));
-        let mut grouping = Grouping { keys: Vec::new_in(self.alloc), aggs: Vec::new_in(self.alloc) };
+        let mut grouping =
+            Grouping { keys: Vec::new_in(self.alloc), spans: Vec::new_in(self.alloc), aggs: Vec::new_in(self.alloc) };
         if grouped {
             match &core.group_by {
                 GroupBy::None => {}
@@ -1058,6 +1079,7 @@ impl<'q, 's: 'n, 'n, 'c, 't: 'n, B: Allocator, A: Allocator + Copy> Binder<'q, '
                         let target = self.group_target(e, core, &scope);
                         let key = self.bind(target, &mut Level::plain(&scope))?;
                         grouping.keys.push(key);
+                        grouping.spans.push(target.span);
                     }
                 }
                 GroupBy::All(_) => {
@@ -1068,6 +1090,7 @@ impl<'q, 's: 'n, 'n, 'c, 't: 'n, B: Allocator, A: Allocator + Copy> Binder<'q, '
                         {
                             let key = self.bind(expr, &mut Level::plain(&scope))?;
                             grouping.keys.push(key);
+                            grouping.spans.push(expr.span);
                         }
                     }
                 }
@@ -1260,6 +1283,9 @@ impl<'q, 's: 'n, 'n, 'c, 't: 'n, B: Allocator, A: Allocator + Copy> Binder<'q, '
     fn column(&self, scope: &[Col<'n>], table: Option<&ast::Name<'s>>, name: &ast::Name<'s>) -> Run<'s, u32, A> {
         let mut found = None;
         for (at, col) in scope.iter().enumerate() {
+            if col.shadowed {
+                continue;
+            }
             let hit = match table {
                 Some(t) => col.qual.is_some_and(|q| eq(q, t.text)) && eq(col.name, name.text),
                 None => !col.hidden && eq(col.name, name.text),
@@ -1273,7 +1299,7 @@ impl<'q, 's: 'n, 'n, 'c, 't: 'n, B: Allocator, A: Allocator + Copy> Binder<'q, '
         }
         // A hidden `using` column is still found by its name alone if nothing else is.
         if found.is_none() && table.is_none() {
-            found = scope.iter().position(|col| eq(col.name, name.text));
+            found = scope.iter().position(|col| !col.shadowed && eq(col.name, name.text));
         }
         match found {
             Some(at) => Ok(u32::try_from(at).unwrap_or(u32::MAX)),
@@ -1315,6 +1341,11 @@ impl<'q, 's: 'n, 'n, 'c, 't: 'n, B: Allocator, A: Allocator + Copy> Binder<'q, '
         let at = self.loc(e.span);
         if level.group.is_some() && !has_aggregate(e) && !has_window(e) && !matches!(e.kind, K::Null | K::Boolean(_) | K::Integer(_) | K::Real(_) | K::Text(_) | K::Param(_)) {
             let scope = level.scope;
+            if let Some(group) = level.group.as_deref()
+                && let Some(k) = group.spans.iter().position(|span| *span == e.span)
+            {
+                return Ok(Expr { kind: ExprKind::Col(u32::try_from(k).unwrap_or(u32::MAX)), at });
+            }
             if let Ok(plain) = self.bind(e, &mut Level::plain(scope))
                 && let Some(group) = level.group.as_deref()
                 && let Some(k) = group.keys.iter().position(|key| same_expr(key, &plain))

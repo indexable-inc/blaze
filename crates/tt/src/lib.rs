@@ -551,6 +551,22 @@ impl Literal {
 }
 
 pub fn token_to_literal(text: &str, span: Span) -> Literal {
+    let parts = literal_parts(text);
+    Literal::new(parts.text, span, parts.kind, parts.suffix)
+}
+
+/// A literal token's parts, as [`Literal`] keeps them: its kind, the text inside its quotes (a
+/// number's digits), and the suffix kept (none for `_`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct LiteralParts<'t> {
+    pub kind: LitKind,
+    pub text: &'t str,
+    pub suffix: &'t str,
+}
+
+/// The parts of the literal token `text`, read without interning anything: what
+/// [`token_to_literal`] interns, for a caller that keeps text in its own table.
+pub fn literal_parts(text: &str) -> LiteralParts<'_> {
     use rustc_lexer::LiteralKind;
 
     let token =
@@ -560,7 +576,7 @@ pub fn token_to_literal(text: &str, span: Span) -> Literal {
         ..
     },)) = token
     else {
-        return Literal::new_no_suffix(text, span, LitKind::Err(()));
+        return LiteralParts { kind: LitKind::Err(()), text, suffix: "" };
     };
 
     let (kind, start_offset, end_offset) = match kind {
@@ -591,19 +607,11 @@ pub fn token_to_literal(text: &str, span: Span) -> Literal {
     let (lit, suffix) = text.split_at(suffix_start as usize);
     let lit = &lit[start_offset..lit.len() - end_offset];
     match suffix {
-        "" | "_" => Literal::new_no_suffix(lit, span, kind),
+        "" | "_" => LiteralParts { kind, text: lit, suffix: "" },
         // A quoted literal keeps its kind and suffix, as rustc's lexer does: a suffix where
-        // none is allowed is an error of the literal's use (`LitKind::from_token_lit`).
-        suffix if !matches!(kind, LitKind::Integer | LitKind::Float) => {
-            Literal::new(lit, span, kind, suffix)
-        }
-        // A number has no quotes, so its text and suffix are the token's text.
-        suffix => Literal {
-            text_and_suffix: Symbol::intern(text),
-            span,
-            kind,
-            suffix_len: text_len(suffix),
-        },
+        // none is allowed is an error of the literal's use (`LitKind::from_token_lit`). A
+        // number has no quotes, so its digits and suffix are the token's text.
+        suffix => LiteralParts { kind, text: lit, suffix },
     }
 }
 

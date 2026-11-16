@@ -531,7 +531,8 @@ fn punct_char(text: &str, offset: usize) -> Option<char> {
     text.get(offset..)?.chars().next()
 }
 
-fn is_single_token_op(kind: SyntaxKind) -> bool {
+/// Whether a punctuation character followed by a token of `kind` is joint with it.
+pub fn is_single_token_op(kind: SyntaxKind) -> bool {
     matches!(
         kind,
         EQ | L_ANGLE

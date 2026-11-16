@@ -1,17 +1,23 @@
 //! Streaming inflate (RFC 1951): a sans-IO state machine fed the input in any pieces, every block
-//! type (stored, fixed and dynamic Huffman), its output appended to the caller's vector as it
-//! comes.
+//! type (stored, fixed and dynamic Huffman).
+//!
+//! **Where the output goes** is the one seam ([`Out`], rule 78), with two strategies:
+//!
+//! - [`Inflate`] appends to the caller's growing vector, keeping the last 32 KiB in a window of
+//!   its own (the caller may drain its vector between feeds);
+//! - [`InflateInto`] writes into one slice the caller sized in advance (PNG's rows, an object of
+//!   known size), which is both the output and the window: nothing is allocated and nothing
+//!   copied twice, and a stream that would write past the slice is [`Why::OutputOver`].
 //!
 //! **Bounds.** A hostile stream is bounded before a byte past its bound is written: the output
 //! may not pass [`Limits::most_out`], nor the input read so far times [`Limits::most_ratio`] (plus
 //! [`RATIO_SLACK`] for a stream's first symbols). Either is a typed refusal ([`Why::OutputOver`],
-//! [`Why::RatioOver`]), never a partial answer said whole. DEFLATE's own largest ratio is about
-//! 1032 to 1 (a one-bit literal/length code for 258 and a one-bit distance), so a `most_ratio` of
-//! 1032 or more refuses no valid stream for its ratio, and less refuses the most repetitive ones.
+//! [`Why::RatioOver`]), never a partial answer said whole. [`MAX_RATIO`] is DEFLATE's own
+//! largest ratio: a `most_ratio` at or above it refuses no valid stream for its ratio.
 //!
-//! **Memory.** One block of the caller's allocator holds the 32 KiB window and the three decode
-//! tables; nothing grows with the input. Output goes to the caller's vector, grown with
-//! `try_reserve`, so memory running out is [`Why::Alloc`].
+//! **Memory.** The decode tables (about 15 KiB) live in the inflater; [`Inflate`] keeps them and
+//! its 32 KiB window in one block of the caller's allocator each, [`InflateInto`] inline (box it
+//! if the stack is short). Nothing grows with the input.
 //!
 //! **Decoding.** A code is looked up in a 10-bit table, and one longer than 10 bits (rare in
 //! practice) is read bit by bit against the code's counts (the canonical walk of Mark Adler's
@@ -48,6 +54,18 @@ const FAST_SIZE: usize = 1 << FAST_BITS;
 /// symbols say more than any steady ratio does.
 pub const RATIO_SLACK: u64 = 1 << 12;
 
+/// DEFLATE's largest expansion: output bytes per input byte, in the limit of a long stream.
+///
+/// The most output per bit is a match of the longest length, 258 (literal/length symbol 285, no
+/// extra bits), at a distance whose code has no extra bits (codes 0 to 3), each code one bit
+/// long: a dynamic block may give the literal/length code just two symbols (285 and the
+/// end-of-block, 256), one bit each, and RFC 1951 lets a distance code hold a single one-bit
+/// code. So every 2 bits make 258 bytes: 258 * 8 / 2 = 1032 bytes per input byte. Headers,
+/// the first literal a match copies and the end only lower it. A caller sizing a bomb limit
+/// sets [`Limits::most_ratio`] at or above this to refuse nothing valid, below it to refuse the
+/// most repetitive streams too.
+pub const MAX_RATIO: u64 = 1032;
+
 /// How much a stream may say: every field is the caller's choice, so there is no default.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Limits {
@@ -60,7 +78,7 @@ pub struct Limits {
     pub most_header: u32,
 }
 
-/// What one [`Inflate::feed`] did.
+/// What one feed did.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Fed {
     /// Bytes of this call's input taken (into the output or the bit buffer).
@@ -172,7 +190,7 @@ impl Huffman {
     }
 }
 
-/// The tables of a block, kept in the caller's allocator.
+/// The tables of a block.
 struct Tables {
     lit: Huffman,
     dist: Huffman,
@@ -182,6 +200,17 @@ struct Tables {
     lens: [u8; 286 + 32],
     /// Whether `lit` and `dist` hold the fixed code now (so a fixed block builds nothing).
     fixed: bool,
+}
+
+impl Tables {
+    const EMPTY: Tables = Tables {
+        lit: Huffman::EMPTY,
+        dist: Huffman::EMPTY,
+        pre: Huffman::EMPTY,
+        pre_lens: [0; 19],
+        lens: [0; 286 + 32],
+        fixed: false,
+    };
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -196,14 +225,146 @@ enum State {
     Done,
 }
 
-/// A streaming inflater: see the module.
-pub struct Inflate<A: Allocator> {
-    tables: Box<Tables, A>,
-    window: Vec<u8, A>,
+/// Where decoded bytes go, and where a match's earlier bytes are read from: the seam between
+/// the two strategies. `at` is always the stream's output so far.
+pub(crate) trait Out {
+    /// Bytes that may be written from `at` before [`Out::make_room`] must run again; 0 means
+    /// none can be, ever: the output is full.
+    fn free(&self, at: u64) -> usize;
+    /// Makes room for at least one match, if the strategy can.
+    fn make_room(&mut self, at: u64) -> Result<(), Why>;
+    fn put_byte(&mut self, at: u64, byte: u8) -> Result<(), Why>;
+    fn put_bytes(&mut self, at: u64, bytes: &[u8]) -> Result<(), Why>;
+    /// `length` bytes copied from `distance` back (`distance <= at`, checked by the caller).
+    fn put_match(&mut self, at: u64, distance: usize, length: usize) -> Result<(), Why>;
+}
+
+/// [`Inflate`]'s strategy: a 32 KiB ring, flushed to the caller's vector.
+struct Ring<'a, B: Allocator> {
+    window: &'a mut [u8],
+    flushed: &'a mut u64,
+    out: &'a mut Vec<u8, B>,
+}
+
+impl<B: Allocator> Ring<'_, B> {
+    /// The window's bytes not yet in `out`, appended.
+    fn flush(&mut self, at: u64) -> Result<(), Why> {
+        let pending = (at - *self.flushed) as usize;
+        if pending == 0 {
+            return Ok(());
+        }
+        let start = (*self.flushed as usize) & WMASK;
+        self.out.try_reserve(pending).map_err(Why::Alloc)?;
+        if start + pending <= WINDOW {
+            self.out.extend_from_slice(&self.window[start..start + pending]);
+        } else {
+            self.out.extend_from_slice(&self.window[start..]);
+            self.out.extend_from_slice(&self.window[..start + pending - WINDOW]);
+        }
+        *self.flushed = at;
+        Ok(())
+    }
+}
+
+impl<B: Allocator> Out for Ring<'_, B> {
+    fn free(&self, at: u64) -> usize {
+        WINDOW - (at - *self.flushed) as usize
+    }
+
+    fn make_room(&mut self, at: u64) -> Result<(), Why> {
+        if (at - *self.flushed) as usize > WINDOW - MAX_MATCH {
+            self.flush(at)?;
+        }
+        Ok(())
+    }
+
+    fn put_byte(&mut self, at: u64, byte: u8) -> Result<(), Why> {
+        self.window[(at as usize) & WMASK] = byte;
+        Ok(())
+    }
+
+    fn put_bytes(&mut self, at: u64, bytes: &[u8]) -> Result<(), Why> {
+        let dst = (at as usize) & WMASK;
+        let first = bytes.len().min(WINDOW - dst);
+        self.window[dst..dst + first].copy_from_slice(&bytes[..first]);
+        self.window[..bytes.len() - first].copy_from_slice(&bytes[first..]);
+        Ok(())
+    }
+
+    fn put_match(&mut self, at: u64, distance: usize, length: usize) -> Result<(), Why> {
+        let dst = (at as usize) & WMASK;
+        let src = dst.wrapping_sub(distance) & WMASK;
+        if distance >= length && src + length <= WINDOW && dst + length <= WINDOW {
+            self.window.copy_within(src..src + length, dst);
+        } else {
+            for i in 0..length {
+                self.window[(dst + i) & WMASK] = self.window[(src + i) & WMASK];
+            }
+        }
+        Ok(())
+    }
+}
+
+/// [`InflateInto`]'s strategy: the caller's slice, output and window at once.
+struct Flat<'a> {
+    out: &'a mut [u8],
+}
+
+impl Flat<'_> {
+    fn full(&self) -> Why {
+        Why::OutputOver { most: self.out.len() as u64 }
+    }
+}
+
+impl Out for Flat<'_> {
+    fn free(&self, at: u64) -> usize {
+        self.out.len().saturating_sub(at as usize)
+    }
+
+    fn make_room(&mut self, _at: u64) -> Result<(), Why> {
+        Ok(())
+    }
+
+    fn put_byte(&mut self, at: u64, byte: u8) -> Result<(), Why> {
+        let full = self.full();
+        *self.out.get_mut(at as usize).ok_or(full)? = byte;
+        Ok(())
+    }
+
+    fn put_bytes(&mut self, at: u64, bytes: &[u8]) -> Result<(), Why> {
+        let full = self.full();
+        let at = at as usize;
+        self.out.get_mut(at..at + bytes.len()).ok_or(full)?.copy_from_slice(bytes);
+        Ok(())
+    }
+
+    fn put_match(&mut self, at: u64, distance: usize, length: usize) -> Result<(), Why> {
+        let dst = at as usize;
+        if dst + length > self.out.len() {
+            return Err(self.full());
+        }
+        let src = dst - distance;
+        if distance >= length {
+            self.out.copy_within(src..src + length, dst);
+        } else {
+            // An overlapping copy repeats the last `distance` bytes: copy them a period at a
+            // time, each copy twice as long as the last.
+            let mut done = 0;
+            while done < length {
+                let n = (length - done).min(distance + done);
+                self.out.copy_within(src..src + n, dst + done);
+                done += n;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The decoder's state, whatever the output: see the module.
+struct Core {
+    tables: Tables,
     /// Bytes written: the output's length so far.
     written: u64,
-    /// Bytes of the window already appended to the caller's output.
-    flushed: u64,
     bits: u64,
     nbits: u32,
     state: State,
@@ -219,22 +380,11 @@ pub struct Inflate<A: Allocator> {
     tail_len: u8,
 }
 
-impl<A: Allocator + Clone> Inflate<A> {
-    /// An inflater held to `limits`, its window and tables in `alloc`.
-    pub fn new_in(limits: Limits, alloc: A) -> Inflate<A> {
-        let tables = Tables {
-            lit: Huffman::EMPTY,
-            dist: Huffman::EMPTY,
-            pre: Huffman::EMPTY,
-            pre_lens: [0; 19],
-            lens: [0; 286 + 32],
-            fixed: false,
-        };
-        Inflate {
-            tables: Box::new_in(tables, alloc.clone()),
-            window: Vec::from_elem_in(0u8, WINDOW, alloc),
+impl Core {
+    const fn new(limits: Limits) -> Core {
+        Core {
+            tables: Tables::EMPTY,
             written: 0,
-            flushed: 0,
             bits: 0,
             nbits: 0,
             state: State::Header,
@@ -248,46 +398,16 @@ impl<A: Allocator + Clone> Inflate<A> {
             tail_len: 0,
         }
     }
-}
 
-impl<A: Allocator> Inflate<A> {
-    /// Takes what it can of `input`, appending the output it makes to `out`. Once the stream has
-    /// ended nothing more is taken. On an error the stream is refused for good: `out` holds what
-    /// was made before it, which the caller must not take as the stream's output.
-    pub fn feed<B: Allocator>(&mut self, input: &[u8], out: &mut Vec<u8, B>) -> Result<Fed, Error> {
-        let mut at = 0usize;
-        let ran = self.run(input, &mut at, out);
-        let flushed = self.flush(out);
-        ran.and(flushed).map_err(|why| Error::new(Format::Deflate, self.taken, why))?;
-        Ok(Fed { consumed: at, done: self.state == State::Done })
-    }
-
-    /// Whether the final block has ended.
-    pub fn is_done(&self) -> bool {
-        self.state == State::Done
-    }
-
-    /// The input ended: an error unless the stream did.
-    pub fn finish(&self) -> Result<(), Error> {
+    fn finish(&self) -> Result<(), Error> {
         match self.state {
             State::Done => Ok(()),
             _ => Err(Error::new(Format::Deflate, self.taken, Why::Truncated)),
         }
     }
 
-    /// The whole bytes read past the final block: the next thing's (see the module).
-    pub fn tail(&self) -> &[u8] {
+    fn tail(&self) -> &[u8] {
         &self.tail[..usize::from(self.tail_len)]
-    }
-
-    /// Bytes of output so far.
-    pub fn written(&self) -> u64 {
-        self.written
-    }
-
-    /// Bytes of input taken so far, the bit buffer's included.
-    pub fn taken(&self) -> u64 {
-        self.taken
     }
 
     fn refill(&mut self, input: &[u8], at: &mut usize) {
@@ -337,51 +457,7 @@ impl<A: Allocator> Inflate<A> {
         Ok(())
     }
 
-    /// The window's bytes not yet in `out`, appended.
-    fn flush<B: Allocator>(&mut self, out: &mut Vec<u8, B>) -> Result<(), Why> {
-        let pending = (self.written - self.flushed) as usize;
-        if pending == 0 {
-            return Ok(());
-        }
-        let start = (self.flushed as usize) & WMASK;
-        out.try_reserve(pending).map_err(Why::Alloc)?;
-        if start + pending <= WINDOW {
-            out.extend_from_slice(&self.window[start..start + pending]);
-        } else {
-            out.extend_from_slice(&self.window[start..]);
-            out.extend_from_slice(&self.window[..start + pending - WINDOW]);
-        }
-        self.flushed = self.written;
-        Ok(())
-    }
-
-    /// Flushes when fewer than one match's bytes of the window are free.
-    fn make_room<B: Allocator>(&mut self, out: &mut Vec<u8, B>) -> Result<(), Why> {
-        if (self.written - self.flushed) as usize > WINDOW - MAX_MATCH {
-            self.flush(out)?;
-        }
-        Ok(())
-    }
-
-    fn put_byte(&mut self, byte: u8) {
-        self.window[(self.written as usize) & WMASK] = byte;
-        self.written += 1;
-    }
-
-    fn put_match(&mut self, distance: usize, length: usize) {
-        let dst = (self.written as usize) & WMASK;
-        let src = dst.wrapping_sub(distance) & WMASK;
-        if distance >= length && src + length <= WINDOW && dst + length <= WINDOW {
-            self.window.copy_within(src..src + length, dst);
-        } else {
-            for i in 0..length {
-                self.window[(dst + i) & WMASK] = self.window[(src + i) & WMASK];
-            }
-        }
-        self.written += length as u64;
-    }
-
-    fn run<B: Allocator>(&mut self, input: &[u8], at: &mut usize, out: &mut Vec<u8, B>) -> Result<(), Why> {
+    fn run<O: Out>(&mut self, input: &[u8], at: &mut usize, out: &mut O) -> Result<(), Why> {
         loop {
             match self.state {
                 State::Done => return Ok(()),
@@ -395,7 +471,7 @@ impl<A: Allocator> Inflate<A> {
                     self.state = match header >> 1 {
                         0 => State::StoredHeader,
                         1 => {
-                            let t = &mut *self.tables;
+                            let t = &mut self.tables;
                             if !t.fixed {
                                 t.lit.build(&FIXED_LIT_LENS, Tree::Literals)?;
                                 t.dist.build(&FIXED_DIST_LENS, Tree::Distances)?;
@@ -426,15 +502,21 @@ impl<A: Allocator> Inflate<A> {
                         self.end_block();
                         continue;
                     }
-                    self.make_room(out)?;
-                    let free = WINDOW - (self.written - self.flushed) as usize;
+                    out.make_room(self.written)?;
                     if self.nbits >= 8 {
                         // The bytes the bit buffer read ahead come first, one by one.
                         self.room(1)?;
                         let byte = self.take(8) as u8;
-                        self.put_byte(byte);
+                        out.put_byte(self.written, byte)?;
+                        self.written += 1;
                         self.state = State::Stored { left: left - 1 };
                         continue;
+                    }
+                    let free = out.free(self.written);
+                    if free == 0 {
+                        // Room is made above whenever it can be: this output is full.
+                        self.room(1)?;
+                        return Err(Why::OutputOver { most: self.written });
                     }
                     let n = (left as usize).min(input.len() - *at).min(free);
                     if n == 0 {
@@ -442,10 +524,7 @@ impl<A: Allocator> Inflate<A> {
                     }
                     self.taken += n as u64;
                     self.room(n as u64)?;
-                    let dst = (self.written as usize) & WMASK;
-                    let first = n.min(WINDOW - dst);
-                    self.window[dst..dst + first].copy_from_slice(&input[*at..*at + first]);
-                    self.window[..n - first].copy_from_slice(&input[*at + first..*at + n]);
+                    out.put_bytes(self.written, &input[*at..*at + n])?;
                     self.written += n as u64;
                     *at += n;
                     self.state = State::Stored { left: left - n as u32 };
@@ -474,7 +553,7 @@ impl<A: Allocator> Inflate<A> {
                         self.tables.pre_lens[PRECODE_ORDER[usize::from(have)]] = self.take(3) as u8;
                         have += 1;
                     }
-                    let t = &mut *self.tables;
+                    let t = &mut self.tables;
                     t.pre.build(&t.pre_lens, Tree::Precode)?;
                     self.state = State::Lengths { have: 0 };
                 }
@@ -522,7 +601,7 @@ impl<A: Allocator> Inflate<A> {
                         have += count;
                     }
                     let (hlit, hdist) = (usize::from(self.hlit), usize::from(self.hdist));
-                    let t = &mut *self.tables;
+                    let t = &mut self.tables;
                     if t.lens[256] == 0 {
                         return Err(Why::NoEndOfBlock);
                     }
@@ -541,10 +620,10 @@ impl<A: Allocator> Inflate<A> {
     }
 
     /// The symbols of a Huffman block, to its end (`true`) or the input's (`false`).
-    fn codes<B: Allocator>(&mut self, input: &[u8], at: &mut usize, out: &mut Vec<u8, B>) -> Result<bool, Why> {
+    fn codes<O: Out>(&mut self, input: &[u8], at: &mut usize, out: &mut O) -> Result<bool, Why> {
         loop {
             self.refill(input, at);
-            self.make_room(out)?;
+            out.make_room(self.written)?;
             let (symbol, len) = match self.tables.lit.decode(self.bits, self.nbits) {
                 Decoded::Symbol(symbol, len) => (symbol, len),
                 Decoded::More => return Ok(false),
@@ -553,7 +632,8 @@ impl<A: Allocator> Inflate<A> {
             if symbol < 256 {
                 self.room(1)?;
                 self.take(len);
-                self.put_byte(symbol as u8);
+                out.put_byte(self.written, symbol as u8)?;
+                self.written += 1;
                 continue;
             }
             if symbol == 256 {
@@ -591,7 +671,111 @@ impl<A: Allocator> Inflate<A> {
             }
             self.room(length as u64)?;
             self.take(head + dlen + dist_extra);
-            self.put_match(distance, length);
+            out.put_match(self.written, distance, length)?;
+            self.written += length as u64;
         }
+    }
+}
+
+/// A streaming inflater appending to the caller's vector: see the module.
+pub struct Inflate<A: Allocator> {
+    core: Box<Core, A>,
+    window: Vec<u8, A>,
+    /// Bytes of the window already appended to the caller's output.
+    flushed: u64,
+}
+
+impl<A: Allocator + Clone> Inflate<A> {
+    /// An inflater held to `limits`, its window and tables in `alloc`.
+    pub fn new_in(limits: Limits, alloc: A) -> Inflate<A> {
+        Inflate {
+            core: Box::new_in(Core::new(limits), alloc.clone()),
+            window: Vec::from_elem_in(0u8, WINDOW, alloc),
+            flushed: 0,
+        }
+    }
+}
+
+impl<A: Allocator> Inflate<A> {
+    /// Takes what it can of `input`, appending the output it makes to `out`. Once the stream has
+    /// ended nothing more is taken. On an error the stream is refused for good: `out` holds what
+    /// was made before it, which the caller must not take as the stream's output.
+    pub fn feed<B: Allocator>(&mut self, input: &[u8], out: &mut Vec<u8, B>) -> Result<Fed, Error> {
+        let mut at = 0usize;
+        let core = &mut *self.core;
+        let mut ring = Ring { window: &mut self.window, flushed: &mut self.flushed, out };
+        let ran = core.run(input, &mut at, &mut ring);
+        let flushed = ring.flush(core.written);
+        ran.and(flushed).map_err(|why| Error::new(Format::Deflate, core.taken, why))?;
+        Ok(Fed { consumed: at, done: core.state == State::Done })
+    }
+
+    /// Whether the final block has ended.
+    pub fn is_done(&self) -> bool {
+        self.core.state == State::Done
+    }
+
+    /// The input ended: an error unless the stream did.
+    pub fn finish(&self) -> Result<(), Error> {
+        self.core.finish()
+    }
+
+    /// The whole bytes read past the final block: the next thing's (see the module).
+    pub fn tail(&self) -> &[u8] {
+        self.core.tail()
+    }
+
+    /// Bytes of output so far.
+    pub fn written(&self) -> u64 {
+        self.core.written
+    }
+
+    /// Bytes of input taken so far, the bit buffer's included.
+    pub fn taken(&self) -> u64 {
+        self.core.taken
+    }
+}
+
+/// A streaming inflater writing into one slice the caller sized: see the module.
+pub struct InflateInto {
+    core: Core,
+}
+
+impl InflateInto {
+    /// An inflater held to `limits` (and to the slice it is fed: the lesser bound wins).
+    pub const fn new(limits: Limits) -> InflateInto {
+        InflateInto { core: Core::new(limits) }
+    }
+
+    /// Takes what it can of `input`, writing the output into `out` after the
+    /// [`InflateInto::written`] bytes already there. `out` must be the same buffer on every
+    /// feed, its written bytes untouched: a match reads them back. A stream that would write
+    /// past `out`'s end is [`Why::OutputOver`].
+    pub fn feed(&mut self, input: &[u8], out: &mut [u8]) -> Result<Fed, Error> {
+        let mut at = 0usize;
+        let ran = self.core.run(input, &mut at, &mut Flat { out });
+        ran.map_err(|why| Error::new(Format::Deflate, self.core.taken, why))?;
+        Ok(Fed { consumed: at, done: self.core.state == State::Done })
+    }
+
+    pub fn is_done(&self) -> bool {
+        self.core.state == State::Done
+    }
+
+    pub fn finish(&self) -> Result<(), Error> {
+        self.core.finish()
+    }
+
+    pub fn tail(&self) -> &[u8] {
+        self.core.tail()
+    }
+
+    /// Bytes written into the slice: the output is its first this many.
+    pub fn written(&self) -> u64 {
+        self.core.written
+    }
+
+    pub fn taken(&self) -> u64 {
+        self.core.taken
     }
 }

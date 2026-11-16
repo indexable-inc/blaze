@@ -544,7 +544,7 @@ impl<A: Allocator, const W: usize> Producer<'_, A, W> {
         let line = &cells.lines[slot / LINE].0;
         let at = slot % LINE;
         line[at].store(stamp(n) | BUSY, Ordering::Relaxed);
-        fence(Ordering::Release);
+        store_store();
         for (w, value) in payload.iter().enumerate() {
             line[at + 1 + w].store(*value, Ordering::Relaxed);
         }
@@ -553,6 +553,25 @@ impl<A: Allocator, const W: usize> Producer<'_, A, W> {
         self.next = n + 1;
         n
     }
+}
+
+/// Step 2's fence, as the hardware needs it: between the busy stamp and the payload the producer
+/// only stores, so all the `Release` fence has to give is that the busy stamp is visible before
+/// any payload word (a reader that read a new payload word and then fenced sees the stamp
+/// busy). On arm64 that is `dmb ishst` (a store-store barrier), where `fence(Release)` is a full
+/// `dmb ish` that also waits for every earlier load; Rust has no store-store fence, so it is
+/// written out. The asm has no `nomem`, so the compiler moves no memory access across it either.
+/// The simulation keeps `Op::Fence(Release)`, the stronger form. On x86-64 (TSO: stores are seen
+/// in order) the fence is the compiler's only, as `fence(Release)` is there.
+#[inline(always)]
+fn store_store() {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: a barrier: reads and writes no register or memory of the program's.
+    unsafe {
+        core::arch::asm!("dmb ishst", options(nostack, preserves_flags));
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    fence(Ordering::Release);
 }
 
 impl<A: Allocator, const W: usize> Drop for Producer<'_, A, W> {

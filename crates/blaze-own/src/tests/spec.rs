@@ -197,7 +197,7 @@ fn specialized_case_in(tape: &Tape, alloc: &Counting) -> Result<(), Broke> {
 
 #[test]
 fn specialized_paths_match_the_generic_ones() {
-    blaze_sim::check(Config::cases(300), specialized_case);
+    blaze_sim::check(cases(300), specialized_case);
 }
 
 /// A `TrustedLen` iterator of tokens that panics at its `k`-th value.

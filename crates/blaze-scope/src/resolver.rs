@@ -1340,7 +1340,8 @@ pub(crate) fn run<'a, N: Name, F: ScopeFacts<Name = N>>(
         if done.len() != ms.len() {
             // A final pass waited on a member: a member's records are read live, never
             // waited on, so this is the machine's own bug, stopped on rather than hidden.
-            return Err(ResolveError::NoProgressBound { module: ms[0].module, passes: forced });
+            let module = ms.iter().map(|m| m.module).find(|m| !done.iter().any(|d| d.scope.module == *m));
+            return Err(ResolveError::MemberUnfinished { module: module.unwrap_or(ms[0].module) });
         }
         for m in ms.iter_mut() {
             m.finished = true;

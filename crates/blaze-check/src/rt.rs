@@ -105,6 +105,11 @@ pub(crate) struct Thread {
     /// Its own clock at its last yield.
     pub(crate) last_yield: Option<u32>,
     yields: u32,
+    /// The threads that could run at its last yield and have not run since, a bit each: it
+    /// stays `Yield` while any of them can run (CHESS's fair schedule, Musuvathi and Qadeer,
+    /// PLDI 2008), so two spinners cannot hand the run to each other forever past the thread
+    /// both wait for.
+    behind: u32,
     /// An unpark not yet consumed by a park, and what the unparkers knew.
     token: bool,
     unparked: Clock,
@@ -132,6 +137,7 @@ impl Thread {
             dpor: Clock::ZERO,
             last_yield: None,
             yields: 0,
+            behind: 0,
             token: false,
             unparked: Clock::ZERO,
             // alloc: none until the thread's first `thread_local!` (`Vec::new` is free)
@@ -146,6 +152,18 @@ impl Thread {
     fn runnable(&self) -> bool {
         self.state == State::Runnable
     }
+
+    /// It can run, now or once the threads it yielded to have.
+    fn can_run(&self) -> bool {
+        matches!(self.state, State::Runnable | State::Yield)
+    }
+}
+
+const _: () = assert!(MAX_THREADS <= u32::BITS as usize, "`Thread::behind` holds a bit a thread");
+
+/// The threads in `threads` that can run, now or after their yield, a bit each.
+fn can_run(threads: &[Thread]) -> u32 {
+    threads.iter().enumerate().filter(|(_, it)| it.can_run()).fold(0, |all, (at, _)| all | 1 << at)
 }
 
 pub(crate) enum Object {
@@ -377,8 +395,10 @@ impl Runtime {
                 entry.last_store = Some(access);
             }
         }
+        let live = can_run(&self.threads);
         for (thread, th) in self.threads.iter_mut().enumerate() {
-            if th.state == State::Yield && thread != next {
+            th.behind &= !(1 << next);
+            if th.state == State::Yield && thread != next && th.behind & live == 0 {
                 th.state = State::Runnable;
             }
         }
@@ -544,8 +564,10 @@ pub(crate) fn yield_now(at: At) -> Option<()> {
     reschedule(|rt| {
         rt.note(at, "yield");
         let thread = rt.current();
+        let behind = can_run(&rt.threads) & !(1 << thread);
         let th = &mut rt.threads[thread];
         th.state = State::Yield;
+        th.behind = behind;
         th.last_yield = Some(th.clock.get(thread));
         th.yields += 1;
     });

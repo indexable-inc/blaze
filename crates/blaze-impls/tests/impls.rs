@@ -24,7 +24,8 @@ use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_impls::{
     BucketKey, BucketView, CrateFlags, CrateGraphView, CrateImpls, CrateIndex, CrateInput,
     DepInput, DirectoryView, EdgeFlags, Edition, ImplFlags, ImplRead, ImplRecords, ImplRow,
-    Incoherent, IntWidth, LangError, LangItem, LangItemsError, LangName, LangRead, LangRecords,
+    Incoherent, IntWidth, LangError, LangItem, LangItemsError, LangItemsView, LangName,
+    LangNameError, LangRead, LangRecords, MAX_LANG_NAME,
     Mutability, NoImplsOfView, RecordKind, SelfShape, Shape, build_crate_graph, build_impl_index,
     build_lang_items, candidates, inherent_candidates, lang_item,
 };
@@ -264,7 +265,8 @@ struct Store {
     crates: BTreeMap<CrateItemKey, Records>,
     accessed: RefCell<Vec<(CrateItemKey, RecordKind)>>,
     noted: RefCell<Vec<ImplRead>>,
-    lang_noted: RefCell<Vec<LangRead>>,
+    /// Each lang read noted: the crate read, the name asked and the answer.
+    lang_noted: RefCell<Vec<(CrateItemKey, String, Option<ItemKey>)>>,
     lang_accessed: RefCell<Vec<CrateItemKey>>,
 }
 
@@ -319,8 +321,8 @@ impl LangRecords for Store {
         self.records(krate)?.lang_items.as_deref().ok_or(Missing("LangItems record"))
     }
 
-    fn note(&self, read: LangRead) {
-        self.lang_noted.borrow_mut().push(read);
+    fn note(&self, read: LangRead<'_>) {
+        self.lang_noted.borrow_mut().push((read.krate, read.name.as_str().to_owned(), read.found));
     }
 }
 
@@ -703,9 +705,41 @@ fn a_lang_item_is_found_across_three_crates() {
     let accessed = sysroot.store.lang_accessed.borrow().clone();
     assert!(!accessed.contains(&sysroot.keys[3]), "a crate without lang items was read");
     let noted = sysroot.store.lang_noted.borrow().clone();
-    let termination: Vec<LangRead> = noted.into_iter().filter(|read| read.name == lang("termination")).collect();
+    let termination: Vec<_> = noted.into_iter().filter(|read| read.1 == "termination").collect();
     assert_eq!(termination.len(), 3, "each of the three crates is read once: {termination:?}");
-    assert!(termination.iter().filter(|read| read.found.is_some()).count() == 1);
+    assert!(termination.iter().filter(|read| read.2.is_some()).count() == 1);
+}
+
+/// A lang item name is stored out of line: `core`'s `panic_misaligned_pointer_dereference`
+/// (36 bytes) was refused by version 1's fixed 32-byte field. Names of 1 to 256 bytes go in
+/// and are found again by a binary search over the record; 257 bytes and an empty name are
+/// refused by name.
+#[test]
+fn a_long_lang_item_name_round_trips() {
+    let krate = crate_key(7);
+    let long = "x".repeat(blaze_surface::MAX_LANG_NAME);
+    let names = ["panic_misaligned_pointer_dereference", "sized", "a", long.as_str()];
+    let items: Vec<(LangName<'_>, ItemKey)> =
+        names.iter().enumerate().map(|(n, name)| (lang(name), item(krate, KIND_LANG, n))).collect();
+    let bytes = match build_lang_items(krate, &items, Alloc::global()) {
+        Ok(bytes) => Aligned::copy_from(&bytes),
+        Err(error) => panic!("the long names are refused: {error}"),
+    };
+    let view = match LangItemsView::read(&bytes) {
+        Ok(view) => view,
+        Err(error) => panic!("the record does not read back: {error}"),
+    };
+    for (n, name) in names.iter().enumerate() {
+        assert_eq!(view.get(lang(name)), Some(item(krate, KIND_LANG, n)), "{name}");
+    }
+    assert_eq!(view.get(lang("panic_misaligned_pointer_dereferenc")), None);
+    let listed: Vec<&str> = view.iter().map(|(name, _)| name.as_str()).collect();
+    let mut sorted = names.to_vec();
+    sorted.sort_unstable();
+    assert_eq!(listed, sorted);
+    let too_long = "x".repeat(blaze_surface::MAX_LANG_NAME + 1);
+    assert_eq!(LangName::new(&too_long), Err(LangNameError::TooLong { len: too_long.len() }));
+    assert_eq!(LangName::new(""), Err(LangNameError::Empty));
 }
 
 #[test]

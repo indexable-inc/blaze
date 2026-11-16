@@ -179,15 +179,111 @@ fn run(case: Case, threads: usize) -> f64 {
     all.iter().sum::<f64>() / all.len() as f64
 }
 
+/// ns per iteration of `body`, run `SPANS` times on this thread.
+#[inline(always)]
+fn per(mut body: impl FnMut(u64)) -> f64 {
+    let start = Instant::now();
+    for i in 0..SPANS {
+        body(black_box(i));
+    }
+    start.elapsed().as_nanos() as f64 / SPANS as f64
+}
+
+/// The disabled path's intended cost: a static word, loaded relaxed, and a branch.
+static FLAG: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+static LADDER_META: blaze_trace::Metadata<'static> = blaze_trace::Metadata::new(
+    "ladder_site",
+    "cost",
+    blaze_trace::Level::INFO,
+    Some(file!()),
+    Some(line!()),
+    Some(module_path!()),
+    blaze_trace::field::FieldSet::new(&[]),
+    blaze_trace::Kind::SPAN,
+);
+static LADDER_SITE: blaze_trace::Site = blaze_trace::Site::new(&LADDER_META);
+
+/// The ladder: each line one step more than the last, on one thread, with its difference from
+/// the line before. Its first part runs before the rings are installed (nothing records).
+fn ladder_off(lines: &mut Vec<(&'static str, f64)>) {
+    use core::sync::atomic::Ordering::Relaxed;
+    lines.push(("(a) empty loop", per(|i| _ = black_box(i))));
+    lines.push((
+        "(b) static AtomicU32 load + branch",
+        per(|i| {
+            if black_box(&FLAG).load(Relaxed) & 3 != 0 {
+                black_box(i);
+            }
+        }),
+    ));
+    lines.push(("(b2) Site::how alone, nothing records", per(|_| _ = black_box(LADDER_SITE.how().is_some()))));
+    lines.push((
+        "(c) the disabled macro, entered",
+        per(|i| {
+            let _span = blaze_trace::info_span!("ladder_off").entered();
+            black_box(i);
+        }),
+    ));
+    lines.push(("(d) one counter read", per(|_| _ = black_box(record::counter()))));
+    lines.push((
+        "(e) two counter reads",
+        per(|_| {
+            black_box(record::counter());
+            black_box(record::counter());
+        }),
+    ));
+    lines.push(("(f) the thread-state pointer (thread-local)", per(|_| _ = black_box(record::thread_state()))));
+}
+
+/// The ladder's second part, once the rings are installed.
+fn ladder_on(lines: &mut Vec<(&'static str, f64)>) {
+    lines.push(("(g) one slot write, barrier, no counter", per(|i| _ = black_box(record::emit([0x80, i, i])))));
+    lines.push((
+        "(h) two slot writes",
+        per(|i| {
+            black_box(record::emit([0x80, i, i]));
+            black_box(record::emit([0x81, i, i]));
+        }),
+    ));
+    lines.push((
+        "(h2) two slot writes, two counter reads",
+        per(|i| {
+            black_box(record::emit([0x80, record::counter(), i]));
+            black_box(record::emit([0x81, record::counter(), i]));
+        }),
+    ));
+    lines.push((
+        "(i) the full span, rings",
+        per(|i| {
+            let _span = blaze_trace::info_span!("ladder_ring").entered();
+            black_box(i);
+        }),
+    ));
+}
+
 fn main() {
+    let mut ladder = Vec::new();
+    ladder_off(&mut ladder);
     println!("{:<40} {:>10} {:>10}", "case", "1 thread", "8 threads");
+    // The loop alone, to subtract from every line.
+    let empty = {
+        let start = Instant::now();
+        for i in 0..SPANS {
+            black_box(i);
+        }
+        start.elapsed().as_nanos() as f64 / SPANS as f64
+    };
+    println!("{:<40} {:>10.2}", "empty loop", empty);
     // Nothing records until the rings are installed, once a process: the nothing-records case
     // runs first.
     for case in [Case::OursOff, Case::TheirsNone, Case::TheirsNothing] {
         println!("{:<40} {:>10.2} {:>10.2}", case.name(), run(case, 1), run(case, 8));
     }
     let rings: &'static Rings = Box::leak(Box::new(Rings::new_in(64, 1 << 12, Global).expect("the rings")));
-    blaze_trace::install_rings(blaze_trace::RingConfig { rings, wants: |_| true, clock: None }).expect("rings installed once");
+    blaze_trace::install_rings(blaze_trace::RingConfig { rings, wants: |_| true, clock: record::Clock::Counter })
+        .expect("rings installed once");
+    ladder_on(&mut ladder);
     for case in [Case::OursRing, Case::TheirsRing] {
         println!("{:<40} {:>10.2} {:>10.2}", case.name(), run(case, 1), run(case, 8));
     }
@@ -201,4 +297,11 @@ fn main() {
     };
     println!("{:<40} {:>10.2}", "floor: two ticks, two slot writes", floor);
     println!("counter: {:?} Hz; entries not recorded: {}", record::counter_hz(), record::unrecorded());
+    println!();
+    println!("{:<44} {:>8} {:>8}", "ladder (1 thread)", "ns", "step");
+    let mut before = 0.0;
+    for (name, ns) in &ladder {
+        println!("{:<44} {:>8.2} {:>+8.2}", name, ns, ns - before);
+        before = *ns;
+    }
 }

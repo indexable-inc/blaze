@@ -38,6 +38,28 @@
 //! evaluated. Recorded by the rings: per edge, a counter read and one 32-byte slot written.
 //! `trace!` and `trace_span!` compile out of builds without debug assertions
 //! ([`Level::COMPILED`]). Evidence: [`tests::no_sink_evaluates_no_field`], `examples/cost.rs`.
+//!
+//! Measured 2026-11-15, one run, this machine (an arm64 Mac), `examples/cost.rs` in release,
+//! ns per span (open, enter, exit, close), 2M spans a thread, before the fixes below:
+//!
+//! | case                                       | 1 thread | 8 threads |
+//! |--------------------------------------------|---------:|----------:|
+//! | blaze_trace, nothing recording             |     2.52 |      2.96 |
+//! | tracing, no subscriber                     |     1.83 |      1.89 |
+//! | tracing, a subscriber keeping nothing      |     6.23 |     54.61 |
+//! | blaze_trace, rings                         |    10.34 |     11.60 |
+//! | tracing, a subscriber writing the rings    |    13.72 |     97.96 |
+//! | floor: two counter reads, two slot writes  |     5.94 |           |
+//!
+//! Recording: 1.33x faster than `tracing` on one thread, 8.4x on eight (no shared state);
+//! 1.74x the floor (rule 67 wants 1.1x). Disabled: 1.38x `tracing`'s. Fixed since, to be
+//! measured again: a span finds its thread's state once, at its enter, and its guard keeps it
+//! for the exit (it was four thread-local accesses a span, each a call on macOS); the rings'
+//! config is taken once, at open (it was an acquire load an edge); the tick is the counter with
+//! no branch (the simulation clock is the `sim-clock` feature); `Span`'s drop is inlined (it was
+//! an out-of-line call at every site, recorded or not); the push's step-2 fence is `dmb ishst`,
+//! not a full `dmb ish` ([`ring`]), which lowers the floor too. The table gains an empty-loop line
+//! to subtract.
 
 #![no_std]
 #![feature(thread_local, allocator_api)]
@@ -46,7 +68,6 @@ extern crate alloc;
 
 use core::{
     fmt,
-    marker::PhantomData,
     sync::atomic::{AtomicU64, Ordering},
 };
 
@@ -665,8 +686,9 @@ struct Open {
 /// Who records a span.
 enum Inner {
     None,
-    /// The rings: its site's id and its span id, 0 until its first entry.
-    Ring { site: &'static Site, span: AtomicU64 },
+    /// The rings: its site, the rings' config (taken once, at open) and its span id, 0 until
+    /// its first entry.
+    Ring { site: &'static Site, config: &'static record::RingConfig, span: AtomicU64 },
     Sink(Open),
 }
 
@@ -693,7 +715,7 @@ impl Span {
                 } else {
                     record::open(config, id, parent, values)
                 };
-                Span { inner: Inner::Ring { site, span: AtomicU64::new(span) } }
+                Span { inner: Inner::Ring { site, config, span: AtomicU64::new(span) } }
             }
             record::How::Sink(sink) => Span::new(sink, site.metadata(), parent, values),
         }
@@ -705,29 +727,34 @@ impl Span {
         Span { inner: Inner::Sink(Open { sink, id, meta }) }
     }
 
+    /// Enters it on the calling thread: for a ring span, the thread's state its exit takes
+    /// (null otherwise), so the span finds its thread once.
     #[inline(always)]
-    fn edge_in(&self) {
+    fn edge_in(&self) -> *const record::Thread {
         match &self.inner {
-            Inner::None => {}
-            Inner::Ring { site, span } => {
-                if let Some(config) = record::config() {
-                    let given = record::enter(config, site.id(), span.load(Ordering::Relaxed));
-                    span.store(given, Ordering::Relaxed);
-                }
+            Inner::None => core::ptr::null(),
+            Inner::Ring { site, config, span } => {
+                let (given, here) = record::enter(config, site.id(), span.load(Ordering::Relaxed));
+                span.store(given, Ordering::Relaxed);
+                here
             }
-            Inner::Sink(open) => open.sink.enter(&open.id),
+            Inner::Sink(open) => {
+                open.sink.enter(&open.id);
+                core::ptr::null()
+            }
         }
     }
 
+    /// Leaves it on the calling thread; `here` is what its [`Span::edge_in`] returned.
     #[inline(always)]
-    fn edge_out(&self) {
+    fn edge_out(&self, here: *const record::Thread) {
         match &self.inner {
             Inner::None => {}
-            Inner::Ring { site, span } => {
-                if let Some(config) = record::config() {
-                    record::exit(config, site.id(), span.load(Ordering::Relaxed));
-                }
-            }
+            // SAFETY: a ring span's `edge_in` returned `here` on this thread: the guards that
+            // hold it are not `Send`.
+            Inner::Ring { site, config, span } => unsafe {
+                record::exit(config, here, site.id(), span.load(Ordering::Relaxed));
+            },
             Inner::Sink(open) => open.sink.exit(&open.id),
         }
     }
@@ -735,15 +762,15 @@ impl Span {
     /// Enters it on this thread until the guard drops.
     #[inline]
     pub fn entered(self) -> EnteredSpan {
-        self.edge_in();
-        EnteredSpan { span: self, _here: PhantomData }
+        let here = self.edge_in();
+        EnteredSpan { span: self, here }
     }
 
     /// Enters it on this thread until the guard drops, keeping the handle.
     #[inline]
     pub fn enter(&self) -> Entered<'_> {
-        self.edge_in();
-        Entered { span: self, _here: PhantomData }
+        let here = self.edge_in();
+        Entered { span: self, here }
     }
 
     /// Runs `f` inside it.
@@ -769,10 +796,9 @@ impl Span {
     pub fn record<V: ToValue>(&self, field: &str, value: V) -> &Span {
         match &self.inner {
             Inner::None => {}
-            Inner::Ring { site, span } => {
+            Inner::Ring { site, config, span } => {
                 if let Some(field) = site.metadata().fields().field(field)
                     && let Some(value) = value.to_value()
-                    && let Some(config) = record::config()
                 {
                     let id = Span::ring_id(*site, span);
                     record::record(config, site.id(), id, field.index() as u16, &value);
@@ -793,7 +819,7 @@ impl Span {
     pub fn id(&self) -> Option<Id> {
         match &self.inner {
             Inner::None => None,
-            Inner::Ring { site, span } => match Span::ring_id(*site, span) {
+            Inner::Ring { site, span, .. } => match Span::ring_id(*site, span) {
                 0 => None,
                 id => Some(Id(id)),
             },
@@ -823,7 +849,9 @@ impl Clone for Span {
         Span {
             inner: match &self.inner {
                 Inner::None => Inner::None,
-                Inner::Ring { site, span } => Inner::Ring { site: *site, span: AtomicU64::new(span.load(Ordering::Relaxed)) },
+                Inner::Ring { site, config, span } => {
+                    Inner::Ring { site: *site, config: *config, span: AtomicU64::new(span.load(Ordering::Relaxed)) }
+                }
                 Inner::Sink(open) => Inner::Sink(Open { id: open.sink.clone_span(&open.id), ..*open }),
             },
         }
@@ -831,9 +859,16 @@ impl Clone for Span {
 }
 
 impl Drop for Span {
+    /// Nothing for a ring span or none (inlined into every site); a sink's close is out of line.
+    #[inline(always)]
     fn drop(&mut self) {
-        if let Inner::Sink(open) = &self.inner {
+        #[cold]
+        #[inline(never)]
+        fn close(open: &Open) {
             open.sink.try_close(open.id);
+        }
+        if let Inner::Sink(open) = &self.inner {
+            close(open);
         }
     }
 }
@@ -848,7 +883,7 @@ impl fmt::Debug for Span {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.inner {
             Inner::None => f.write_str("Span(none)"),
-            Inner::Ring { site, span } => f
+            Inner::Ring { site, span, .. } => f
                 .debug_struct("Span")
                 .field("name", &site.metadata().name())
                 .field("id", &span.load(Ordering::Relaxed))
@@ -862,14 +897,16 @@ impl fmt::Debug for Span {
 /// thread, where it was never entered.
 pub struct EnteredSpan {
     span: Span,
-    _here: PhantomData<*mut ()>,
+    /// The entering thread's state ([`Span::edge_in`]); a raw pointer, so the guard is not
+    /// `Send`.
+    here: *const record::Thread,
 }
 
 impl EnteredSpan {
     /// Leaves it, keeping it open.
     pub fn exit(mut self) -> Span {
         let span = core::mem::replace(&mut self.span, Span::none());
-        span.edge_out();
+        span.edge_out(self.here);
         span
     }
 
@@ -887,9 +924,9 @@ impl core::ops::Deref for EnteredSpan {
 }
 
 impl Drop for EnteredSpan {
-    #[inline]
+    #[inline(always)]
     fn drop(&mut self) {
-        self.span.edge_out();
+        self.span.edge_out(self.here);
     }
 }
 
@@ -902,12 +939,13 @@ impl fmt::Debug for EnteredSpan {
 /// A span entered on this thread through a borrow ([`Span::enter`]): left when it drops.
 pub struct Entered<'a> {
     span: &'a Span,
-    _here: PhantomData<*mut ()>,
+    /// As an `EnteredSpan`'s: the entering thread's state.
+    here: *const record::Thread,
 }
 
 impl Drop for Entered<'_> {
-    #[inline]
+    #[inline(always)]
     fn drop(&mut self) {
-        self.span.edge_out();
+        self.span.edge_out(self.here);
     }
 }

@@ -140,79 +140,32 @@ pub(crate) enum Decimal64 {
     Value(u64, usize),
 }
 
-/// The first `n` (1 to 8) digits of the eight bytes at `chunk` as their value: the bytes past
-/// `n` are shifted out and `'0'`s shifted in above, so one [`eight_digits`] converts them.
-#[inline(always)]
-fn first_digits(chunk: &[u8], n: u32) -> u64 {
-    let mut word = [0u8; 8];
-    word.copy_from_slice(&chunk[..8]);
-    let w = u64::from_le_bytes(word);
-    let w = match n {
-        8 => w,
-        _ => (w << (8 * (8 - n))) | (0x3030_3030_3030_3030u64 >> (8 * n)),
-    };
-    match eight_digits(&w.to_le_bytes()) {
-        Some(v) => v,
-        None => unreachable!("the first {n} bytes are digits and the rest '0'"),
-    }
-}
-
-const POW10_U64: [u64; 9] = [1, 10, 100, 1_000, 10_000, 100_000, 1_000_000, 10_000_000, 100_000_000];
-
-/// The decimal digits at the front of `bytes` as a `u64`. With 16 bytes to look at, one
-/// vector compare gives the run's length ([`crate::simd::digit_run`]) and a run under 16
-/// digits (every `u64` but the longest) converts in one or two [`first_digits`], no loop;
-/// otherwise [`decimal_u64_scalar`].
+/// The decimal digits at the front of `bytes` as a `u64`.
+///
+/// Most numbers are short, so the first eight digits are a plain byte loop (measured: a
+/// padded word load and mask, or a vector compare, cost more than it below eight digits,
+/// and the vector run lost at 10 and 20 digits too, so integers use none). Past eight, the
+/// SWAR word converts eight more at a time, then the byte loop ends the run. Overflow is
+/// decided once at the end: none below 20 significant digits; at exactly 20, by comparing
+/// them with `u64::MAX`'s.
 #[inline]
 pub(crate) fn decimal_u64(bytes: &[u8]) -> Decimal64 {
-    // Most numbers are short: one word says how many of the first eight bytes are digits
-    // (the lowest byte that is not), and under eight converts at once, no vector and no loop.
-    // A text under eight bytes is padded with zero bytes, which are not digits.
-    {
-        let mut word = [0u8; 8];
-        let have = bytes.len().min(8);
-        word[..have].copy_from_slice(&bytes[..have]);
-        let w = u64::from_le_bytes(word);
-        let not_digit =
-            (w.wrapping_sub(0x3030_3030_3030_3030) | w.wrapping_add(0x4646_4646_4646_4646)) & 0x8080_8080_8080_8080;
-        if not_digit != 0 {
-            // A borrow or carry only moves up, past the first non-digit: the bytes below it
-            // are judged exactly.
-            let n = not_digit.trailing_zeros() / 8;
-            return match n {
-                0 => Decimal64::NoDigit,
-                _ => Decimal64::Value(first_digits(&word, n), blaze_int::idx(n)),
-            };
-        }
-    }
-    // Eight digits at least: one vector compare gives the run's length.
-    if bytes.len() >= 16 {
-        let n = crate::simd::digit_run(bytes);
-        match n {
-            0 => return Decimal64::NoDigit,
-            1..=8 => return Decimal64::Value(first_digits(bytes, n), blaze_int::idx(n)),
-            9..=15 => {
-                let high = first_digits(bytes, 8);
-                let low = first_digits(&bytes[8..], n - 8);
-                return Decimal64::Value(high * POW10_U64[blaze_int::idx(n - 8)] + low, blaze_int::idx(n));
-            }
-            _ => {}
-        }
-    }
-    decimal_u64_scalar(bytes)
-}
-
-/// The scalar twin of [`decimal_u64`], and its path for short inputs and long runs: eight
-/// digits at a time by SWAR, overflow decided once at the end (none below 20 significant
-/// digits; for exactly 20, by comparing them with `u64::MAX`'s).
-#[inline]
-pub(crate) fn decimal_u64_scalar(bytes: &[u8]) -> Decimal64 {
-    let mut i = 0;
-    while bytes.get(i) == Some(&b'0') {
-        i += 1;
-    }
-    let significant = i;
     let mut acc = 0u64;
+    let mut i = 0;
+    while i < 8 {
+        match bytes.get(i) {
+            Some(&b) if b.is_ascii_digit() => {
+                acc = acc * 10 + u64::from(b - b'0');
+                i += 1;
+            }
+            _ => {
+                return match i {
+                    0 => Decimal64::NoDigit,
+                    _ => Decimal64::Value(acc, i),
+                };
+            }
+        }
+    }
     while let Some(chunk) = bytes.get(i..i + 8) {
         match eight_digits(chunk) {
             Some(v) => acc = acc.wrapping_mul(100_000_000).wrapping_add(v),
@@ -227,9 +180,11 @@ pub(crate) fn decimal_u64_scalar(bytes: &[u8]) -> Decimal64 {
         acc = acc.wrapping_mul(10).wrapping_add(u64::from(b - b'0'));
         i += 1;
     }
-    if i == 0 {
-        return Decimal64::NoDigit;
+    if i < 20 {
+        return Decimal64::Value(acc, i);
     }
+    // Twenty digits or more: leading zeros do not count.
+    let significant = bytes[..i].iter().take_while(|&&b| b == b'0').count();
     match i - significant {
         0..20 => Decimal64::Value(acc, i),
         20 if bytes[significant..i] <= b"18446744073709551615"[..] => Decimal64::Value(acc, i),
@@ -270,6 +225,23 @@ macro_rules! parse_ints {
             #[inline]
             fn parse(text: &'a str) -> Result<($t, &'a str), ParseError> {
                 <$t as ParseInt>::parse_with(text, IntSyntax::DECIMAL)
+            }
+
+            /// The text is the token: `core`'s parse reads it straight (the grammars agree
+            /// but for a leading `+`, which `core` reads and this one refuses); a text `core`
+            /// refuses is this crate's parser's to name the error of.
+            #[inline]
+            fn parse_whole(text: &'a str) -> Result<$t, ParseError> {
+                if text.as_bytes().first() != Some(&b'+')
+                    && let Ok(value) = text.parse::<$t>()
+                {
+                    return Ok(value);
+                }
+                let (value, rest) = <$t as ParseInt>::parse_with(text, IntSyntax::DECIMAL)?;
+                match rest.is_empty() {
+                    true => Ok(value),
+                    false => Err(ParseError { at: consumed(text, rest), expected: "the end of the text" }),
+                }
             }
         }
     )*};
@@ -369,6 +341,17 @@ impl<'a> Parse<'a> for char {
 /// crate's own exact conversion ([`crate::float::parse`]) is kept as the tests' oracle until
 /// an Eisel-Lemire path of its own is written: alone it is 50 times slower.
 fn parse_float<F: Float>(text: &str) -> Result<(F, &str), ParseError> {
+    // One pass to the first byte that cannot continue a number; a plain decimal there is
+    // `core`'s at once. Anything else (a special, `1-2`, `1.5e`, an error, a value past the
+    // range) is the scanner's, which finds the exact token and names the error.
+    let bytes = text.as_bytes();
+    let end = bytes.iter().position(|&b| !NUMBER_BYTE[usize::from(b)]).unwrap_or(bytes.len());
+    let token = &text[..end];
+    if plain_float(token.as_bytes())
+        && let Some(x) = F::core_parse(token)
+    {
+        return Ok((x, &text[end..]));
+    }
     match scan_float::<F>(text)? {
         Scanned::Special(x, rest) => Ok((x, rest)),
         Scanned::Number(_, end) => match F::core_parse(&text[..end]) {
@@ -452,6 +435,25 @@ fn scan_float<F: Float>(text: &str) -> Result<Scanned<'_, F>, ParseError> {
     }
     Ok(Scanned::Number(Number { negative, int, frac, exp }, i))
 }
+
+/// The bytes a float token can hold: digits, `.`, `e`, `E`, `+`, `-`.
+static NUMBER_BYTE: [bool; 256] = {
+    const fn at(b: u8) -> usize {
+        blaze_int::Cast::<u8, usize>::widen(b)
+    }
+    let mut table = [false; 256];
+    let mut b = b'0';
+    while b <= b'9' {
+        table[at(b)] = true;
+        b += 1;
+    }
+    table[at(b'.')] = true;
+    table[at(b'e')] = true;
+    table[at(b'E')] = true;
+    table[at(b'+')] = true;
+    table[at(b'-')] = true;
+    table
+};
 
 /// Whether `text` is a plain decimal in this crate's float grammar as far as `core` could
 /// read it differently: a digit first (after one `-`), a digit last, and a digit after every

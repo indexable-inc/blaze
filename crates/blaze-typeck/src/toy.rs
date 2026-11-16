@@ -12,8 +12,9 @@
 )]
 
 use blaze_hash::HashMap;
+use blaze_kit::{UnionFind, union_find::Snapshot};
 use blaze_own::{Alloc, Vec};
-use std::alloc::Global;
+use std::{alloc::Global, convert::Infallible};
 
 use crate::error::{CheckError, Limit, Malformed, Stop};
 use crate::hash::StableHasher;
@@ -39,19 +40,11 @@ const SOLVER_ROUNDS: u32 = 64;
 /// The deepest a type is walked by unify or resolve.
 const DEPTH: u32 = 256;
 
-/// A snapshot: the undo log's length and the pending obligations. Variables made inside a
-/// snapshot stay as unbound handles after a rollback; none is reachable from a type made before.
-/// One undoable write to the variable table.
-#[derive(Clone, Copy)]
-enum Undo {
-    /// The variable was unbound before.
-    Bound(u32),
-    /// The variable's rank was this before.
-    Rank(u32, u8),
-}
-
+/// A snapshot: the variable table's and the pending obligations. A rollback removes the
+/// variables made inside it (blaze-kit's `UnionFind` undoes new keys); none is reachable from a
+/// type made before.
 pub struct Snap {
-    undo: usize,
+    vars: Snapshot,
     pending: Vec<Obligation, Global>,
     errors: usize,
 }
@@ -61,13 +54,10 @@ pub struct ToyCtx {
     node_index: HashMap<TyView, u32, Global>,
     lists: Vec<Vec<Ty, Global>, Global>,
     list_index: ListIndex<'static>,
-    /// Each variable's value, by index.
-    vals: Vec<Option<Ty>, Global>,
-    /// Each variable's own handle.
-    var_ty: Vec<Ty, Global>,
-    /// Each variable's union rank: an upper bound on the depth of the chain ending at it.
-    rank: Vec<u8, Global>,
-    undo: Vec<Undo, Global>,
+    /// The variables, keyed by index: each set's value is the type it is bound to, or while
+    /// unbound the handle of its most specific variable (an integer or float variable over a
+    /// type variable). Union by rank and path halving keep a resolve near-constant.
+    vars: UnionFind<u32, Ty, Global>,
     env: Vec<Goal, Global>,
     pending: Vec<Obligation, Global>,
     errors: Vec<FulfillError, Global>,
@@ -81,10 +71,7 @@ impl ToyCtx {
             node_index: HashMap::new_in(Global),
             lists: Vec::new_in(Global),
             list_index: ListIndex::new_in(Alloc::global()),
-            vals: Vec::new_in(Global),
-            var_ty: Vec::new_in(Global),
-            rank: Vec::new_in(Global),
-            undo: Vec::new_in(Global),
+            vars: UnionFind::new_in(Global),
             env: Vec::new_in(Global),
             pending: Vec::new_in(Global),
             errors: Vec::new_in(Global),
@@ -97,37 +84,16 @@ impl ToyCtx {
         self.pending.len()
     }
 
-    /// Undoes the variable table's writes made since `mark` (an undo log length), newest
-    /// first: each binding made since is cleared and each rank raised since is restored.
-    fn undo_to(&mut self, mark: usize) {
-        while self.undo.len() > mark {
-            match self.undo.pop() {
-                Some(Undo::Bound(i)) => self.vals[i as usize] = None,
-                Some(Undo::Rank(i, r)) => self.rank[i as usize] = r,
-                None => {}
-            }
-        }
-    }
-
+    /// Binds unbound variable `v`'s set to `t`, a type that is not a variable.
     fn bind(&mut self, v: Var, t: Ty) {
-        self.vals[v.index as usize] = Some(t);
-        self.undo.push(Undo::Bound(v.index));
+        self.vars.set_value(v.index, t);
     }
 
-    /// Joins two unbound variables of one kind by rank, so a chain of `n` joins is at most
-    /// `log2 n` deep and `shallow_resolve` stays logarithmic (a join of the newest to the
-    /// oldest every time, as a nested operator chain makes, was a chain of length `n`).
-    fn join(&mut self, x: Var, a: Ty, y: Var, b: Ty) {
-        let (rx, ry) = (self.rank[x.index as usize], self.rank[y.index as usize]);
-        if rx < ry {
-            self.bind(x, b);
-        } else {
-            self.bind(y, a);
-            if rx == ry {
-                self.undo.push(Undo::Rank(x.index, rx));
-                self.rank[x.index as usize] = rx.saturating_add(1);
-            }
-        }
+    /// Joins the sets of two unbound variables; the joined set's handle is `keep`, the more
+    /// specific of their handles `a` and `b`.
+    fn join(&mut self, x: Var, y: Var, keep: Ty) {
+        let joined: Result<u32, Infallible> = self.vars.unify(x.index, y.index, |_, _| Ok(keep));
+        let Ok(_) = joined;
     }
 
     fn unify_at(&mut self, a: Ty, b: Ty, depth: u32) -> Result<bool, CheckError> {
@@ -144,15 +110,15 @@ impl ToyCtx {
             (TyView::Error, _) | (_, TyView::Error) => true,
             (TyView::Infer(x), TyView::Infer(y)) => match (x.kind, y.kind) {
                 (k, l) if k == l => {
-                    self.join(x, a, y, b);
+                    self.join(x, y, a);
                     true
                 }
                 (VarKind::Ty, _) => {
-                    self.bind(x, b);
+                    self.join(x, y, b);
                     true
                 }
                 (_, VarKind::Ty) => {
-                    self.bind(y, a);
+                    self.join(x, y, a);
                     true
                 }
                 _ => false,
@@ -491,26 +457,20 @@ impl TypeCtx for ToyCtx {
     }
 
     fn fresh(&mut self, kind: VarKind) -> Result<Ty, CheckError> {
-        let index = u32::try_from(self.vals.len()).map_err(|_| CheckError::Limit(Limit::Interner))?;
+        let index = u32::try_from(self.vars.len()).map_err(|_| CheckError::Limit(Limit::Interner))?;
         let t = self.mk(TyView::Infer(Var { kind, index }))?;
-        self.vals.push(None);
-        self.var_ty.push(t);
-        self.rank.push(0);
+        let key = self.vars.new_key(t);
+        debug_assert_eq!(key, index);
         Ok(t)
     }
 
-    fn shallow_resolve(&mut self, mut t: Ty) -> Ty {
-        // A chain of bound variables is at most as long as the variables.
-        for _ in 0..=self.vals.len() {
-            match self.nodes[t.0 as usize] {
-                TyView::Infer(v) => match self.vals[v.index as usize] {
-                    Some(next) => t = next,
-                    None => return t,
-                },
-                _ => return t,
-            }
+    /// A variable's set's value: its bound type, or the set's handle. One find: a bound value
+    /// is never a variable (`bind` takes a resolved non-variable).
+    fn shallow_resolve(&mut self, t: Ty) -> Ty {
+        match self.nodes[t.0 as usize] {
+            TyView::Infer(v) => *self.vars.value(v.index),
+            _ => t,
         }
-        t
     }
 
     fn resolve(&mut self, t: Ty) -> Result<Ty, CheckError> {
@@ -520,29 +480,28 @@ impl TypeCtx for ToyCtx {
     fn unify(&mut self, a: Ty, b: Ty) -> Result<bool, CheckError> {
         // Unification writes only the variable table, so a failed one undoes that log alone;
         // a full snapshot here copied the pending queue on every unify, quadratic in the body.
-        let mark = self.undo.len();
-        let ok = self.unify_at(a, b, 0)?;
-        if !ok {
-            self.undo_to(mark);
-        }
-        Ok(ok)
+        let mark = self.vars.snapshot();
+        let ok = self.unify_at(a, b, 0);
+        // An error stops the check, so what it wrote is kept as it was before (no undo).
+        if matches!(ok, Ok(false)) { self.vars.rollback_to(mark) } else { self.vars.commit(mark) }
+        ok
     }
 
     fn snapshot(&mut self) -> Snap {
         let mut pending = Vec::with_capacity_in(self.pending.len(), Global);
         pending.extend_from_slice(&self.pending);
-        Snap { undo: self.undo.len(), pending, errors: self.errors.len() }
+        Snap { vars: self.vars.snapshot(), pending, errors: self.errors.len() }
     }
 
     fn rollback_to(&mut self, s: Snap) {
-        self.undo_to(s.undo);
+        self.vars.rollback_to(s.vars);
         self.pending = s.pending;
         self.errors.truncate(s.errors);
         self.errors_taken = self.errors_taken.min(s.errors);
     }
 
     fn commit(&mut self, s: Snap) {
-        let _ = s;
+        self.vars.commit(s.vars);
     }
 
     fn assume(&mut self, clause: Goal) -> Result<(), CheckError> {

@@ -241,10 +241,7 @@ impl<A: Allocator> Deflate<A> {
                 break;
             }
             if data[c + best] == data[pos + best] && data[c] == data[pos] && data[c + 1] == data[pos + 1] {
-                let mut l = 2;
-                while l < most && data[c + l] == data[pos + l] {
-                    l += 1;
-                }
+                let l = crate::simd::match_len(data, c, pos, 2, most);
                 if l > best {
                     best = l;
                     best_dist = pos - c;

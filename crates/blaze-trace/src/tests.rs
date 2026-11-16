@@ -280,7 +280,7 @@ fn the_rings_hold_each_edge_and_field_as_written() {
     use alloc::boxed::Box;
 
     let rings: &'static record::Rings = Box::leak(Box::new(record::Rings::new_in(8, 256, Global).unwrap()));
-    crate::install_rings(crate::RingConfig { rings, wants: |meta| meta.target() == RING_TARGET, clock: Some(ring_clock) })
+    crate::install_rings(crate::RingConfig { rings, wants: |meta| meta.target() == RING_TARGET, clock: record::Clock::Sim(ring_clock) })
         .unwrap();
     std::thread::spawn(move || {
         let outer = crate::info_span!(target: RING_TARGET, "outer").entered();

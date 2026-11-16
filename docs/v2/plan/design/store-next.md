@@ -138,6 +138,20 @@ as a control.
     entries.
   - Machine needles: the handle copies them at open and refuses at the put. The commit scans
     again with the writer's list, which `Driven::machine` may have grown.
+- **(h) What is compressed, by kind (2026-11-15).** The rule: a record read on the edit loop is
+  kept raw and read in place (rule 51); compression is for what no build reads. The plain store
+  compresses nothing. The pack store (format 10):
+  - **Output chunks:** raw. LZ4 is gone (and the crate dependency): a hit decoded each LZ4
+    chunk, then copied it into the whole. Fixture (600 KiB text + 600 KiB noise): 5 copies
+    before, 1 after; 643,274 bytes stored before, 1,229,694 (the bytes) after.
+  - **Runs:** raw, now hot: a build reaching a run's dependents reads them, every process again.
+  - **Debug info:** zstd with a per-kind dictionary from its put: read only on a panic or in a
+    debugger, large and alike.
+  - **Any other kind:** raw; a settle compresses one unread for two periods (zstd, or cold
+    columns through blaze-format-tiers), and the end of the first period that reads it writes it
+    back raw (was two periods running), so a read decodes until then, never on every read.
+    Warm columns are read in place, so they keep the two periods.
+  - A store of format 9 may hold LZ4 chunks: it is refused by name and rebuilt (rule 26).
 
 ## Left, and why
 

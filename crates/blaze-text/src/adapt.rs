@@ -7,7 +7,7 @@
 use core::fmt;
 
 use crate::parse::ParseError;
-use crate::put::{Count, Overflow, Put};
+use crate::put::{Count, Put};
 use crate::show::Show;
 
 /// A [`Show`] as a `Display`: `format!("{}", Shown(&x))`.
@@ -103,11 +103,3 @@ impl fmt::Display for ParseError {
 }
 
 impl core::error::Error for ParseError {}
-
-impl fmt::Display for Overflow {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&Shown(self), f)
-    }
-}
-
-impl core::error::Error for Overflow {}

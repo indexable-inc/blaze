@@ -126,43 +126,51 @@ impl<'a> TyCx<'a> {
         self.tys.const_var(v)
     }
 
-    /// One `find`: a bound variable's value, an unbound variable's root, any other type
-    /// itself (`shallow_resolve`).
+    /// A bound variable's value, an unbound variable's root, any other type itself
+    /// (`shallow_resolve`). A value may itself be a variable (a type variable bound to an
+    /// integer variable, or to another type variable by generalization): it is followed until
+    /// it is not a bound variable, as rustc's `shallow_resolve` does.
     #[inline]
-    pub fn shallow_resolve(&mut self, t: Ty) -> Ty {
-        let i = crate::ids::ix(t.0);
-        let k = self.tys.ty.kind[i];
-        let table = match k {
-            ty::TY_VAR => Table::Ty,
-            ty::INT_VAR => Table::Int,
-            ty::FLOAT_VAR => Table::Float,
-            _ => return t,
-        };
-        let v = self.tys.ty.a[i];
-        let r = self.vars.find(table, v);
-        match self.vars.value(table, r) {
-            Some(x) => Ty(x),
-            None if r == v => t,
-            None => match table {
-                Table::Ty => self.tys.ty_var(r),
-                Table::Int => self.tys.int_var(r),
-                _ => self.tys.float_var(r),
-            },
+    pub fn shallow_resolve(&mut self, mut t: Ty) -> Ty {
+        loop {
+            let i = crate::ids::ix(t.0);
+            let k = self.tys.ty.kind(i);
+            let table = match k {
+                ty::TY_VAR => Table::Ty,
+                ty::INT_VAR => Table::Int,
+                ty::FLOAT_VAR => Table::Float,
+                _ => return t,
+            };
+            let v = self.tys.ty.a(i);
+            let r = self.vars.find(table, v);
+            match self.vars.value(table, r) {
+                Some(x) => t = Ty(x),
+                None if r == v => return t,
+                None => {
+                    return match table {
+                        Table::Ty => self.tys.ty_var(r),
+                        Table::Int => self.tys.int_var(r),
+                        _ => self.tys.float_var(r),
+                    };
+                }
+            }
         }
     }
 
     /// [`TyCx::shallow_resolve`] of a const.
     #[inline]
-    pub fn shallow_resolve_const(&mut self, c: Const) -> Const {
-        if self.tys.ct_kind_of(c) != ct::VAR {
-            return c;
-        }
-        let v = self.tys.ct.a[crate::ids::ix(c.0)];
-        let r = self.vars.find(Table::Const, v);
-        match self.vars.value(Table::Const, r) {
-            Some(x) => Const(x),
-            None if r == v => c,
-            None => self.tys.const_var(r),
+    pub fn shallow_resolve_const(&mut self, mut c: Const) -> Const {
+        loop {
+            if self.tys.ct_kind_of(c) != ct::VAR {
+                return c;
+            }
+            let v = self.tys.ct.a(crate::ids::ix(c.0));
+            let r = self.vars.find(Table::Const, v);
+            match self.vars.value(Table::Const, r) {
+                Some(x) => c = Const(x),
+                None if r == v => return c,
+                None => return self.tys.const_var(r),
+            }
         }
     }
 

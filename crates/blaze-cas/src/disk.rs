@@ -101,15 +101,13 @@ pub(crate) enum Form {
     /// long value ([`crate::cold::LONG_FROM`]), with no dictionary ([`NO_DICTIONARY`]) and
     /// long-distance matching.
     Zstd,
-    /// A list of chunks ([`CHUNK_REF`] bytes each), each a value of its own, raw or LZ4.
+    /// A list of chunks ([`CHUNK_REF`] bytes each), each a value of its own, raw (or zstd once
+    /// a settle moved it cold).
     Chunked,
     /// The value is a file of its own, [`external_file`] of its content: placed by cloning it.
     External,
     /// A compression dictionary, listed in the head; not a value.
     Dictionary,
-    /// LZ4 (a block, no frame): for chunks, which are copied out anyway when their value is
-    /// assembled, so decompressing them costs little more than the copy.
-    Lz4,
     /// The value's columns bit-packed ([`crate::Columns::warm`]), read in place: the payload is
     /// the schema of the value ([`SCHEMA_PREFIX`] bytes), then the warm bytes.
     Warm,
@@ -134,9 +132,9 @@ impl Form {
             Form::Chunked => 2,
             Form::External => 3,
             Form::Dictionary => 4,
-            Form::Lz4 => 5,
-            Form::Warm => 6,
-            Form::ColdColumns => 7,
+            // Format 10: 5 was LZ4, and these were 6 and 7; an older store is refused whole.
+            Form::Warm => 5,
+            Form::ColdColumns => 6,
         }
     }
 
@@ -147,9 +145,8 @@ impl Form {
             2 => Some(Form::Chunked),
             3 => Some(Form::External),
             4 => Some(Form::Dictionary),
-            5 => Some(Form::Lz4),
-            6 => Some(Form::Warm),
-            7 => Some(Form::ColdColumns),
+            5 => Some(Form::Warm),
+            6 => Some(Form::ColdColumns),
             _ => None,
         }
     }

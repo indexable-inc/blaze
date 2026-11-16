@@ -16,6 +16,8 @@ doctest = false
 [dependencies]
 # `String<A>` for an identifier past the inline size, and `Vec` for a requirement's comparators.
 blaze-own.workspace = true
+# Versions and requirements as values (their text), read strictly (`data`).
+blaze-data.workspace = true
 
 [dev-dependencies]
 # Properties: precedence is a total order consistent with equality, display parses back, and

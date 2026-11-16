@@ -21,6 +21,12 @@ pub enum ResolveError {
     NoProgressBound { module: ItemKey, passes: u32 },
     /// A group's glob fixpoint of one name kept changing past its bound: a bug.
     GlobFixpointBound { module: ItemKey },
+    /// The final pass found a name of `module` still undetermined with every answer in:
+    /// `glob_of` names the module whose glob left it so (none: no glob did), `unexpanded`
+    /// the calls of `module` that may still add names. A bug.
+    Undecided { module: ItemKey, glob_of: Option<ItemKey>, unexpanded: u32 },
+    /// A member's final pass waited on something with every answer in: a bug.
+    MemberUnfinished { module: ItemKey },
     /// An answer of the wrong kind for its read.
     WrongAnswer { module: ItemKey, read_of: ItemKey },
     /// A step after the machine finished.
@@ -53,6 +59,17 @@ impl fmt::Display for ResolveError {
                 f,
                 "name resolution of the group of module {module:x}: a glob fixpoint changed past its bound"
             ),
+            ResolveError::Undecided { module, glob_of, unexpanded } => {
+                write!(f, "name resolution of module {module:x}: a name undetermined in the final pass (")?;
+                match glob_of {
+                    Some(m) => write!(f, "by a glob of {m:x}")?,
+                    None => write!(f, "by no glob")?,
+                }
+                write!(f, ", {unexpanded} calls unexpanded)")
+            }
+            ResolveError::MemberUnfinished { module } => {
+                write!(f, "name resolution of module {module:x}: the final pass waited with every answer in")
+            }
             ResolveError::WrongAnswer { module, read_of } => write!(
                 f,
                 "name resolution of module {module:x}: a read of {read_of:x} was answered with the wrong kind of answer"

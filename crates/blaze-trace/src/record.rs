@@ -258,16 +258,26 @@ pub struct RingConfig {
     pub rings: &'static Rings,
     /// Which sites the rings record, decided once a site.
     pub wants: fn(&'static Metadata<'static>) -> bool,
-    /// The clock, when a simulation passes one; `None` is the CPU's counter.
-    pub clock: Option<fn() -> u64>,
+    pub clock: Clock,
+}
+
+/// Where an entry's tick comes from. Without the `sim-clock` feature (or a test of this crate)
+/// only the CPU's counter: one `mrs`/`rdtsc` a read, no branch and no call.
+#[derive(Clone, Copy)]
+pub enum Clock {
+    Counter,
+    /// A simulation's clock, a call a read.
+    #[cfg(any(test, feature = "sim-clock"))]
+    Sim(fn() -> u64),
 }
 
 impl RingConfig {
     #[inline(always)]
     fn tick(&self) -> u64 {
         match self.clock {
-            None => counter(),
-            Some(clock) => clock(),
+            Clock::Counter => counter(),
+            #[cfg(any(test, feature = "sim-clock"))]
+            Clock::Sim(clock) => clock(),
         }
     }
 }
@@ -297,7 +307,7 @@ impl fmt::Display for RingsRefused {
 /// Makes `config` the process's rings, once: from then on every site it wants is recorded
 /// there, and a sink installed beside it gets only the sites the rings do not.
 pub fn install_rings(config: RingConfig) -> Result<(), RingsRefused> {
-    if config.clock.is_none() && !HAS_COUNTER {
+    if matches!(config.clock, Clock::Counter) && !HAS_COUNTER {
         return Err(RingsRefused::NoCounter);
     }
     RINGS.set(config).map_err(|Installed| RingsRefused::Installed)?;
@@ -400,16 +410,32 @@ pub const fn span_parts(span: u64) -> Option<(u32, u64)> {
     }
 }
 
-/// Pushes `payload` into the calling thread's ring: its span id, `None` when nothing was
-/// recorded.
+/// The calling thread's state, found once a span edge and passed down: on macOS every access
+/// to a thread-local is a call through its descriptor, so a span takes one, at its enter, and
+/// its guard keeps the pointer for the exit.
 #[inline(always)]
-fn push(config: &RingConfig, payload: &[u64; WORDS]) -> Option<u64> {
-    // SAFETY: THREAD is this thread's own; its producer is borrowed only here and in
+pub(crate) fn here() -> *const Thread {
+    &raw const THREAD
+}
+
+/// The calling thread's state's address, for `examples/cost.rs`'s ladder alone: what one
+/// thread-local access costs.
+#[doc(hidden)]
+#[inline(always)]
+pub fn thread_state() -> *const u8 {
+    here().cast()
+}
+
+/// Pushes `payload` into `thread`'s ring (the calling thread's): its span id, `None` when
+/// nothing was recorded.
+#[inline(always)]
+fn push(config: &RingConfig, thread: &Thread, payload: &[u64; WORDS]) -> Option<u64> {
+    // SAFETY: `thread` is the calling thread's own; its producer is borrowed only here and in
     // `claim_and_push` and `ended`, none of which calls back into any of them.
-    let producer = unsafe { &mut *THREAD.producer.get() };
+    let producer = unsafe { &mut *thread.producer.get() };
     match producer {
         Some(producer) => Some(span_id(producer.lane().0, producer.push(payload))),
-        None => claim_and_push(config, producer, payload),
+        None => claim_and_push(config, thread, producer, payload),
     }
 }
 
@@ -417,10 +443,11 @@ fn push(config: &RingConfig, payload: &[u64; WORDS]) -> Option<u64> {
 #[inline(never)]
 fn claim_and_push(
     config: &RingConfig,
+    thread: &Thread,
     slot: &mut Option<Producer<'static, Global, SLOT>>,
     payload: &[u64; WORDS],
 ) -> Option<u64> {
-    if THREAD.refused.get() {
+    if thread.refused.get() {
         UNRECORDED.fetch_add(1, Ordering::Relaxed);
         return None;
     }
@@ -431,7 +458,7 @@ fn claim_and_push(
             Some(span_id(producer.lane().0, producer.push(payload)))
         }
         Err(_) => {
-            THREAD.refused.set(true);
+            thread.refused.set(true);
             UNRECORDED.fetch_add(1, Ordering::Relaxed);
             None
         }
@@ -608,7 +635,7 @@ impl Text<'_> {
         }
         let low = u64::from_le_bytes(self.chunk[..8].try_into().unwrap_or([0; 8]));
         let high = u64::from_le_bytes(self.chunk[8..].try_into().unwrap_or([0; 8]));
-        push(self.config, &[head(kind::TEXT, self.len as u8, 0, 0), low, high]);
+        push(self.config, &THREAD, &[head(kind::TEXT, self.len as u8, 0, 0), low, high]);
         self.chunk = [0; 16];
         self.len = 0;
     }
@@ -661,7 +688,7 @@ fn field(config: &RingConfig, index: u16, value: &Value<'_>) {
             (tag::TEXT, text.kept, text.cut)
         }
     };
-    push(config, &[head(kind::FIELD, tag, index, 0), low, high]);
+    push(config, &THREAD, &[head(kind::FIELD, tag, index, 0), low, high]);
 }
 
 /// The rings' config, when installed.
@@ -672,44 +699,56 @@ pub(crate) fn config() -> Option<&'static RingConfig> {
 
 /// A span begins with fields or a named parent: its open entry and fields; its id.
 pub(crate) fn open(config: &RingConfig, site: u32, parent: Parent, values: Values<'_>) -> u64 {
-    let id = push(config, &[head(kind::OPEN, 0, 0, site), config.tick(), parent_word(parent)]);
+    let id = push(config, &THREAD, &[head(kind::OPEN, 0, 0, site), config.tick(), parent_word(parent)]);
     fields(config, values);
     id.unwrap_or(0)
 }
 
 /// An event: its entry and fields.
 pub(crate) fn event(config: &RingConfig, site: u32, parent: Parent, values: Values<'_>) {
-    push(config, &[head(kind::EVENT, 0, THREAD.depth.get(), site), config.tick(), parent_word(parent)]);
+    let thread = &THREAD;
+    push(config, thread, &[head(kind::EVENT, 0, thread.depth.get(), site), config.tick(), parent_word(parent)]);
     fields(config, values);
 }
 
 /// `span` was given field `index` its site names.
 pub(crate) fn record(config: &RingConfig, site: u32, span: u64, index: u16, value: &Value<'_>) {
-    push(config, &[head(kind::RECORD, 0, 0, site), 0, span]);
+    push(config, &THREAD, &[head(kind::RECORD, 0, 0, site), 0, span]);
     field(config, index, value);
 }
 
-/// The thread enters `span` (0: a span with no entry yet, whose id this entry's becomes).
+/// The calling thread enters `span` (0: a span with no entry yet, whose id this entry's
+/// becomes): the span's id, and the thread's state for its exit ([`exit`]).
 #[inline(always)]
-pub(crate) fn enter(config: &RingConfig, site: u32, span: u64) -> u64 {
-    let depth = THREAD.depth.get();
-    THREAD.depth.set(depth.wrapping_add(1));
-    let id = push(config, &[head(kind::ENTER, 0, depth, site), config.tick(), span]);
-    if span == 0 { id.unwrap_or(0) } else { span }
+pub(crate) fn enter(config: &RingConfig, site: u32, span: u64) -> (u64, *const Thread) {
+    let here = here();
+    // SAFETY: the calling thread's own state, live while the thread is.
+    let thread = unsafe { &*here };
+    let depth = thread.depth.get();
+    thread.depth.set(depth.wrapping_add(1));
+    let id = push(config, thread, &[head(kind::ENTER, 0, depth, site), config.tick(), span]);
+    (if span == 0 { id.unwrap_or(0) } else { span }, here)
 }
 
+/// The thread whose state `here` is leaves `span`.
+///
+/// # Safety
+///
+/// `here` is what [`enter`] returned on the calling thread.
 #[inline(always)]
-pub(crate) fn exit(config: &RingConfig, site: u32, span: u64) {
-    let depth = THREAD.depth.get().wrapping_sub(1);
-    THREAD.depth.set(depth);
-    push(config, &[head(kind::EXIT, 0, depth, site), config.tick(), span]);
+pub(crate) unsafe fn exit(config: &RingConfig, here: *const Thread, site: u32, span: u64) {
+    // SAFETY: the caller's promise: the calling thread's own state, live while it is.
+    let thread = unsafe { &*here };
+    let depth = thread.depth.get().wrapping_sub(1);
+    thread.depth.set(depth);
+    push(config, thread, &[head(kind::EXIT, 0, depth, site), config.tick(), span]);
 }
 
 /// A task's boundary on the calling thread, with the thread's CPU time as the driver read it:
 /// the reader shares the CPU between two boundaries among the spans between them by wall time.
 pub fn task_boundary(cpu_ns: u64) {
     if let Some(config) = RINGS.get() {
-        push(config, &[head(kind::CPU, 0, 0, 0), config.tick(), cpu_ns]);
+        push(config, &THREAD, &[head(kind::CPU, 0, 0, 0), config.tick(), cpu_ns]);
     }
 }
 
@@ -719,5 +758,5 @@ pub fn task_boundary(cpu_ns: u64) {
 #[inline(always)]
 pub fn emit(words: [u64; WORDS]) -> Option<u64> {
     let config = RINGS.get()?;
-    push(config, &words)
+    push(config, &THREAD, &words)
 }

@@ -27,7 +27,7 @@
 #[cfg(test)]
 extern crate std;
 
-use core::alloc::Allocator;
+use core::{alloc::Allocator, fmt};
 
 use blaze_int::Int;
 use blaze_own::{Box, Vec};
@@ -354,6 +354,25 @@ pub struct Vacancy<'a, A: Allocator + Clone> {
 pub struct Full<'a, A: Allocator + Clone> {
     pub level: usize,
     pub grow: Option<Grow<'a, A>>,
+}
+
+impl<A: Allocator + Clone> fmt::Debug for Vacancy<'_, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Vacancy")
+            .field("level", &self.level)
+            .field("log", &self.log)
+            .field("grows", &self.grow.is_some())
+            .finish()
+    }
+}
+
+impl<A: Allocator + Clone> fmt::Debug for Full<'_, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Full")
+            .field("level", &self.level)
+            .field("grow", &self.grow.as_ref().map(|grow| grow.level))
+            .finish()
+    }
 }
 
 /// The right and duty to build the next level of an [`Index`], outside the writer's lock.

@@ -330,6 +330,19 @@ impl<'a> Cursor<'a> {
     /// `trailing_ones` of each from the cursor's lane.
     #[inline(always)]
     fn run(&mut self, class: usize) {
+        // The scalar twin tests each byte once, as rustc_lexer does: its masks would be three
+        // predicates on each of 64 bytes per block, for a run of a few.
+        if self.cpu.path == crate::cpu::Path::Scalar {
+            let holds = |byte: u8| match class {
+                RUN_IDENT => byte.is_ascii_alphanumeric() || byte == b'_',
+                RUN_SPACE => matches!(byte, b'\t' | b'\n' | 0x0B | 0x0C | b'\r' | b' '),
+                _ => byte.is_ascii_digit() || byte == b'_',
+            };
+            while self.bytes.get(self.pos).is_some_and(|&byte| holds(byte)) {
+                self.pos += 1;
+            }
+            return;
+        }
         loop {
             if self.pos >= self.bytes.len() {
                 return;

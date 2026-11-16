@@ -430,6 +430,20 @@ impl<'a, N: Name> Resolver<'a, N> {
         self.read_name(def.key, ns, name, Layer::Path, sink)
     }
 
+    /// The binding of `name` in `ns` of `module` as a lexical layer (the standard prelude, a
+    /// `#[macro_use]` crate root) sees it: this module's or a fellow's live, another's by a
+    /// `Name` read. A prelude may be a module of the asker's own cycle (`core`'s is), and a
+    /// member is never asked for: its answer would be `InProgress` for good.
+    fn layer_name(&self, module: ItemKey, ns: Namespace, name: N, layer: Layer, env: Env<'_, 'a, N>, sink: &mut Sink<'a, N>) -> Res {
+        let live = if module == self.module { Some(self) } else { env.fellow(module) };
+        let Some(f) = live else { return self.read_name(module, ns, name, layer, sink) };
+        let q = Query { asker: self.asker(), restricted: false, ignore: None };
+        match f.lookup_module(ns, name, q, env, sink) {
+            Res::Found(hit) => Res::Found(Hit { origin: Origin::Prelude, expansion: 0, frag: None, layer, ..hit }),
+            other => other,
+        }
+    }
+
     /// A `Name` read of another module.
     fn read_name(&self, module: ItemKey, ns: Namespace, name: N, layer: Layer, sink: &mut Sink<'a, N>) -> Res {
         match self.cached(Read::Name { module, ns, name }, sink) {
@@ -563,7 +577,7 @@ impl<'a, N: Name> Resolver<'a, N> {
             if lq.ns == Namespace::Macros {
                 let mut r = Res::None;
                 for &root in self.macro_use.iter() {
-                    match self.read_name(root, Namespace::Macros, lq.name, Layer::MacroUsePrelude, sink) {
+                    match self.layer_name(root, Namespace::Macros, lq.name, Layer::MacroUsePrelude, env, sink) {
                         Res::None => {}
                         other => {
                             r = other;
@@ -576,7 +590,7 @@ impl<'a, N: Name> Resolver<'a, N> {
                 }
             }
             if let Some(prelude) = self.prelude {
-                let r = self.read_name(prelude, lq.ns, lq.name, Layer::StdPrelude, sink);
+                let r = self.layer_name(prelude, lq.ns, lq.name, Layer::StdPrelude, env, sink);
                 if let Some(stop) = self.layer(r, &lq, &mut inner, &mut undet, sink) {
                     return stop;
                 }
@@ -864,7 +878,10 @@ impl<'a, N: Name> Resolver<'a, N> {
                 Res::Found(hit) => {
                     match hit.state {
                         BindingState::Ambiguous(k) => return Prefix::Fail(s, Unresolved::Ambiguous(k)),
-                        BindingState::Undetermined => return Prefix::Undet,
+                        BindingState::Undetermined => {
+                            // Forced, nothing more will decide it: the path fails here.
+                            return if force { Prefix::Fail(s, Unresolved::Undetermined) } else { Prefix::Undet };
+                        }
                         BindingState::Determined => {}
                     }
                     if !hit.vis.visible_from(self.asker()) {

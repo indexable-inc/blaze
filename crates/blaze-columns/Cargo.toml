@@ -18,6 +18,18 @@ doctest = false
 blaze-own.workspace = true
 # Integer conversions that say what they do, in place of `as`.
 blaze-int.workspace = true
+# `enc`: the dictionary builder (distinct values in first-use order) its dictionaries are made by.
+blaze-kit.workspace = true
+
+[dev-dependencies]
+# `enc`'s properties and planted-bug controls.
+blaze-sim.workspace = true
+# `Alloc::global()` for the tests and the cost example.
+blaze-own = { workspace = true, features = ["std"] }
+# The cost example's token-kind column: the pinned nightly's lexer.
+rustc_lexer.workspace = true
+# The cost example's reference ratio for general compression: blaze's own DEFLATE, in the tree.
+blaze-deflate.workspace = true
 
 [lints]
 workspace = true

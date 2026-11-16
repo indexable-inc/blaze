@@ -16,6 +16,10 @@ doctest = false
 [lints]
 workspace = true
 
+[features]
+# A simulation's clock for the rings (`record::Clock::Sim`); without it a tick is the counter.
+sim-clock = []
+
 # Only for examples/cost.rs, the comparison with the crate this one replaces; removed once its
 # numbers are in docs/profiling.md.
 [dev-dependencies]

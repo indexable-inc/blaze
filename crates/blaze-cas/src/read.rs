@@ -21,6 +21,13 @@
 
 use std::{borrow::Cow, ptr, sync::Arc};
 
+#[cfg(test)]
+thread_local! {
+    /// The values [`Look::value`] made a copy of on this thread instead of handing its bytes
+    /// in place (a decode, or a chunked value made whole): a test's count of a hit's copies.
+    pub(crate) static COPIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 use crate::sync::{
     OnceLock,
     atomic::{AtomicBool, AtomicPtr, AtomicU64, Ordering},
@@ -1224,7 +1231,6 @@ impl<'a> Look<'a> {
             Form::Zstd if header.dictionary == NO_DICTIONARY => {
                 Cow::Owned(cold::decompress_long(payload, header.raw).map_err(corrupt)?)
             }
-            Form::Lz4 => Cow::Owned(cold::unlz4(payload, header.raw).map_err(corrupt)?),
             Form::Zstd => {
                 let dictionary = self.dictionary(found, header.dictionary).ok_or_else(|| {
                     // alloc: the error's message
@@ -1273,7 +1279,7 @@ impl<'a> Look<'a> {
                         .ok_or_else(|| {
                             corrupt(format!("its chunk {} is not in the store", chunk.0))
                         })??;
-                    if !matches!(piece.place.form(), Form::Raw | Form::Lz4 | Form::Zstd) {
+                    if !matches!(piece.place.form(), Form::Raw | Form::Zstd) {
                         // alloc: the error's message
                         return Err(corrupt(format!(
                             "its chunk {} is not kept as a chunk",
@@ -1349,6 +1355,10 @@ impl<'a> Look<'a> {
         if matches!(why, Use::Read) {
             self.was_read(found);
         }
+        #[cfg(test)]
+        if let Cow::Owned(_) = bytes {
+            COPIES.with(|it| it.set(it.get() + 1));
+        }
         Ok((header, bytes))
     }
 
@@ -1386,7 +1396,7 @@ impl<'a> Look<'a> {
         let owned = self.shared.owned(self.held);
         if matches!(
             found.place.form(),
-            Form::Zstd | Form::Chunked | Form::Lz4 | Form::Warm | Form::ColdColumns
+            Form::Zstd | Form::Chunked | Form::Warm | Form::ColdColumns
         ) && let Some((content, bytes)) = owned.get(self.held, id)
         {
             self.was_read(found);

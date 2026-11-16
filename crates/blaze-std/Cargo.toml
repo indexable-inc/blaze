@@ -39,8 +39,8 @@ blaze-reclaim.workspace = true
 blaze-report.workspace = true
 blaze-sha256.workspace = true
 blaze-spin.workspace = true
-# bstd::image's inflate: miniz_oxide's no-alloc core, into the buffer decode sized and limited.
-miniz_oxide.workspace = true
+# bstd::image's zlib: inflated straight into the buffer decode sized and limited, and deflated.
+blaze-deflate.workspace = true
 
 # bstd::video's VideoToolbox provider (src/video/videotoolbox.rs).
 [target.'cfg(target_os = "macos")'.dependencies]

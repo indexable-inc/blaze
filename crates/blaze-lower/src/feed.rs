@@ -45,9 +45,19 @@ impl Cursor<'_, '_> {
 
 /// Feeds `output`, the parse of `lexed`, to `m`.
 pub(crate) fn feed(m: &mut Machine<'_, '_, '_>, lexed: &LexedStr<'_>, output: &Output, base: u32) {
+    feed_steps(m, lexed, output.steps(), base);
+}
+
+/// Feeds `steps`, a parse's steps of `lexed`, to `m`.
+pub(crate) fn feed_steps<'s>(
+    m: &mut Machine<'_, '_, '_>,
+    lexed: &LexedStr<'_>,
+    steps: impl Iterator<Item = OutlineStep<'s>>,
+    base: u32,
+) {
     assert!(u32::try_from(lexed.as_str().len()).is_ok(), "an item of over 4 GiB: ranges are u32 pairs");
     let mut at = Cursor { lexed, pos: 0, offset: 0, base };
-    for step in output.steps() {
+    for step in steps {
         match step {
             OutlineStep::Step(Step::Token { kind, n_input_tokens }) => {
                 let range = at.take(u32::from(n_input_tokens));

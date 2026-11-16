@@ -32,20 +32,15 @@ pub(crate) const STRUCT: u8 = 12;
 /// How deep structs and lists may nest in what is read: Parquet's footer nests five deep.
 pub(crate) const DEPTH: u32 = 32;
 
-pub(crate) fn varint<A: Allocator>(out: &mut Vec<u8, A>, mut value: u64) {
-    while value >= 0x80 {
-        out.push(value.truncate_to::<u8>() | 0x80);
-        value >>= 7;
+/// Zigzag and LEB128 are blaze-kit's `codec`; an `i32` zigzags as the `i64` it widens to.
+pub(crate) use blaze_kit::codec::zigzag;
+
+/// `value` as LEB128 (blaze-kit's `codec`), panicking on a refused allocation as `Vec::push`
+/// does.
+pub(crate) fn varint<A: Allocator>(out: &mut Vec<u8, A>, value: u64) {
+    if let Err(failure) = blaze_kit::codec::write_uleb128(value, out) {
+        panic!("blaze_parquet: a thrift varint: {failure}");
     }
-    out.push(value.truncate_to::<u8>());
-}
-
-pub(crate) const fn zigzag32(value: i32) -> u32 {
-    (value << 1 ^ value >> 31).cast_unsigned()
-}
-
-pub(crate) const fn zigzag64(value: i64) -> u64 {
-    (value << 1 ^ value >> 63).cast_unsigned()
 }
 
 /// A struct being written: its fields' headers say each id's delta from the last.
@@ -66,7 +61,7 @@ impl<'a, A: Allocator> Struct<'a, A> {
             self.out.push(delta.cast_unsigned().truncate_to::<u8>() << 4 | ty);
         } else {
             self.out.push(ty);
-            varint(self.out, zigzag32(i32::from(id)).widen_to::<u64>());
+            varint(self.out, zigzag(i64::from(id)));
         }
         self.last = id;
     }
@@ -82,17 +77,17 @@ impl<'a, A: Allocator> Struct<'a, A> {
 
     pub(crate) fn i16(&mut self, id: i16, value: i16) {
         self.header(id, I16);
-        varint(self.out, zigzag32(i32::from(value)).widen_to::<u64>());
+        varint(self.out, zigzag(i64::from(value)));
     }
 
     pub(crate) fn i32(&mut self, id: i16, value: i32) {
         self.header(id, I32);
-        varint(self.out, zigzag32(value).widen_to::<u64>());
+        varint(self.out, zigzag(i64::from(value)));
     }
 
     pub(crate) fn i64(&mut self, id: i16, value: i64) {
         self.header(id, I64);
-        varint(self.out, zigzag64(value));
+        varint(self.out, zigzag(value));
     }
 
     pub(crate) fn binary(&mut self, id: i16, value: &[u8]) {
@@ -142,7 +137,7 @@ impl<'a, A: Allocator> Struct<'a, A> {
     pub(crate) fn i32s(&mut self, id: i16, items: impl ExactSizeIterator<Item = i32>) {
         self.list_head(id, I32, items.len());
         for item in items {
-            varint(self.out, zigzag32(item).widen_to::<u64>());
+            varint(self.out, zigzag(i64::from(item)));
         }
     }
 
@@ -202,25 +197,16 @@ impl<'a> In<'a> {
         Ok(byte)
     }
 
+    /// A LEB128 value (blaze-kit's `codec`); an overlong one is named at its first byte.
     pub(crate) fn varint(&mut self) -> Result<u64, ParquetError> {
-        let mut value = 0u64;
-        for shift in (0..64).step_by(7) {
-            let byte = self.byte()?;
-            let bits = u64::from(byte & 0x7F);
-            if shift == 63 && bits > 1 {
-                return Err(self.bad("a varint past 64 bits"));
-            }
-            value |= bits << shift;
-            if byte & 0x80 == 0 {
-                return Ok(value);
-            }
-        }
-        Err(self.bad("a varint past ten bytes"))
+        blaze_kit::codec::read_uleb128(self.bytes, &mut self.at, 0).map_err(|error| match error {
+            blaze_kit::codec::CodecError::Truncated { .. } => ParquetError::Truncated { what: "thrift", at: self.bytes.len() },
+            _ => self.bad("a varint past 64 bits"),
+        })
     }
 
     pub(crate) fn i64(&mut self) -> Result<i64, ParquetError> {
-        let raw = self.varint()?;
-        Ok((raw >> 1).cast_signed() ^ (raw & 1).cast_signed().wrapping_neg())
+        Ok(blaze_kit::codec::unzigzag(self.varint()?))
     }
 
     pub(crate) fn i32(&mut self) -> Result<i32, ParquetError> {

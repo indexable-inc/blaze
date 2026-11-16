@@ -4,6 +4,9 @@
 //!   back as [`Str`]s borrowed from the text, decoded only when asked.
 //! - [`read_in`]: bytes to a [`Value`](blaze_data::Value), over the reader.
 //! - [`write_into`] / [`to_string_in`]: a `Value` to text; [`Writer`]: events to text.
+//! - [`from_slice`] / [`to_string`] (and their `_in` forms): bytes straight to a
+//!   [`FromValue`](blaze_data::FromValue) type, a [`ToValue`](blaze_data::ToValue) type
+//!   straight to text, strict by the type's rules too ([`FromJsonError`]).
 //!
 //! Strict, as RFC 8259 is: no trailing commas, comments, single quotes, `NaN`, leading `+` or
 //! leading zeros; text must be UTF-8 (checked once, up front); a string's lone surrogate escape
@@ -27,6 +30,7 @@ use core::fmt;
 mod read;
 mod stack;
 mod tree;
+mod typed;
 mod write;
 
 #[cfg(test)]
@@ -45,6 +49,7 @@ mod plant {
 
 pub use read::{Event, Item, Reader, Str};
 pub use tree::read_in;
+pub use typed::{FromJsonError, from_slice, from_slice_in, to_string, to_string_of_in, to_string_pretty};
 pub use write::{
     BytesAs, KeyOrder, Style, StreamError, StreamWhat, Unwritable, WriteError, WriteOptions, Writer, to_string_in,
     write_into,

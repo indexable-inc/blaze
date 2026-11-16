@@ -20,6 +20,37 @@
 //! - The function's own data (`data_addr` of a `RefKind::Data` reference) is copied after the
 //!   literal words and reached PC-relatively (`adr`): no fixup.
 //!
+//! - The code is followed by its literal words (8-aligned) and its data rows (each at least
+//!   8-aligned, at most 16): placement puts the code's first byte at a 16-aligned address.
+//!
+//! # Values
+//!
+//! One invariant holds for every cell, kept on every write: **a cell's 8 low bytes hold the
+//! value zero-extended to 64 bits** (an `i1` is 0 or 1, an `i8` 0..=255; a pointer is its 64
+//! bits). An operation computes in whole 64-bit registers: one that only needs the low bits
+//! right (`add`, `sub`, `mul`, `neg`, `not`, `shl`, `trunc`) zero-extends its result back to the
+//! width; one that reads the sign (`sdiv`, `srem`, `ashr`, a signed `icmp`, `sext`) sign-extends
+//! its operands first. A parameter or a call's return arrives with its bits above the width
+//! unspecified and is zero-extended at once.
+//!
+//! # Traps
+//!
+//! A LIR `trap` is `brk #code` (codes below 0xff00); division by zero is `brk #0xff00`,
+//! `sdiv` of `MIN` by -1 `brk #0xff01`, `unreachable` `brk #0xff02`.
+//!
+//! # The subset
+//!
+//! Types `i1`, `i8`, `i16`, `i32`, `i64` and `ptr` (64-bit targets). Operations `param`,
+//! `iconst`, `iconst_wide`, `null`, `add`, `sub`, `mul`, `neg`, `udiv`, `sdiv`, `urem`,
+//! `srem`, `and`, `or`, `xor`, `not`, `shl`, `lshr`, `ashr`, `icmp`, `select`, `zext`,
+//! `sext`, `trunc`, `freeze`, `slot_addr`, `slot_live`, `slot_dead`, `ptr_add`, `ptr_addr`,
+//! `load`, `store`, `data_addr` (own data without relocations), `func_addr` (of a
+//! [`Via::Address`] function), `call` (C convention, at most 8 integer arguments and one
+//! integer return, no `sret` or `byval`, not variadic), `jump`, `br`, `switch`, `return`,
+//! `trap`, `unreachable`. Promise and hint flags are dropped (they only allow UB or say
+//! nothing); `volatile` on a load or store is honoured (each is one access of its width);
+//! every other meaning flag is refused.
+//!
 //! Anything outside the subset is [`EmitError::Unsupported`], naming the instruction: never a
 //! guess.
 
@@ -29,6 +60,12 @@ use core::alloc::Allocator;
 use core::fmt;
 
 use blaze_lir::{Op, View};
+
+mod enc;
+mod pass;
+
+#[cfg(test)]
+mod tests;
 
 /// How a call of one function reference is made.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -70,6 +107,8 @@ pub enum EmitError {
     NoVia { place: u32 },
     /// The frame or the code passed a bound of the encoding.
     TooLarge { what: &'static str },
+    /// The function's own signature, or its target, is outside the subset.
+    Signature { why: &'static str },
 }
 
 impl fmt::Display for EmitError {
@@ -80,6 +119,7 @@ impl fmt::Display for EmitError {
             }
             EmitError::NoVia { place } => write!(f, "function reference {place} has no call kind (`Via`) given"),
             EmitError::TooLarge { what } => write!(f, "{what} is past what the baseline tier encodes"),
+            EmitError::Signature { why } => write!(f, "the function's signature: the baseline tier does not emit {why}"),
         }
     }
 }
@@ -89,8 +129,7 @@ impl core::error::Error for EmitError {}
 /// Emits `func` (verified by `blaze_lir::verify`) into `out`, which is cleared first. `via` has
 /// one entry per function reference place the function names.
 pub fn emit<A: Allocator>(func: View<'_>, via: &[Via], out: &mut Code<A>) -> Result<(), EmitError> {
-    let _ = (func, via);
     out.bytes.clear();
     out.fixups.clear();
-    Err(EmitError::TooLarge { what: "every function (the emitter is being written)" })
+    pass::run(func, via, &mut out.bytes, &mut out.fixups)
 }

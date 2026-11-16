@@ -148,7 +148,7 @@ fn is_punct(stream: &TokenStream<'_>, at: usize, want: char) -> bool {
 }
 
 /// The text of a plain (not raw) identifier at `at`.
-fn plain_ident(stream: &TokenStream<'_>, at: usize) -> Option<&str> {
+fn plain_ident<'s>(stream: &'s TokenStream<'_>, at: usize) -> Option<&'s str> {
     let token = stream.tokens().get(at)?;
     matches!(token.kind, TokenKind::Ident { raw: Raw::No, .. }).then(|| stream.text_of(token))
 }

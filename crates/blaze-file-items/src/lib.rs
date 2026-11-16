@@ -67,6 +67,7 @@
 #![no_std]
 #![feature(allocator_api)]
 
+mod header;
 mod walk;
 
 use core::fmt;
@@ -77,6 +78,8 @@ use blaze_surface::{
 };
 
 pub use blaze_ids::ContentId;
+pub use header::{HeaderError, ImplHeader, impl_header};
+pub use walk::Bodies;
 pub use parser::SyntaxKind;
 
 /// The domain of [`Item::hash`]: an item's tokens, whole.
@@ -97,8 +100,18 @@ pub const SIGNATURE_DOMAIN: &str = "blaze v2 file item signature 1";
 ///
 /// When `text` is longer than `u32::MAX` bytes: every range is a `u32` pair, as the lexer's
 /// offsets are.
+///
+/// A `fn` body is not parsed ([`Bodies::Skipped`]): its tokens are hashed, and it is parsed
+/// only when they may hold an item or a macro call. The syntax errors are those outside such
+/// bodies, and every lexer error.
 pub fn outline<'a>(text: &str, edition: Edition, alloc: Alloc<'a>) -> Outline<'a> {
-    walk::outline(text, parser_edition(edition), alloc)
+    outline_with(text, edition, Bodies::Skipped, alloc)
+}
+
+/// As [`outline`], with `fn` bodies read as `bodies` says: [`Bodies::Parsed`] is the reference
+/// [`outline`] is tested equal to.
+pub fn outline_with<'a>(text: &str, edition: Edition, bodies: Bodies, alloc: Alloc<'a>) -> Outline<'a> {
+    walk::outline(text, parser_edition(edition), bodies, alloc)
 }
 
 /// The schema's edition as the parser's.

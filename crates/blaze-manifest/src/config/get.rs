@@ -9,7 +9,7 @@ use std::str::FromStr;
 use serde_json::json;
 
 use super::error::{ConfigError, ConfigWhat};
-use super::toml_text;
+use super::key::{push_toml_key, push_toml_string};
 use super::{Config, ConfigKey, ConfigValue as CV, Definition};
 use crate::files::Disk;
 
@@ -259,7 +259,7 @@ fn maybe_env<'a>(
 /// `{}`, a table's keys in order.
 fn write_toml(cv: &CV, out: &mut String) {
     match cv {
-        CV::String(s, _) => toml_text::write_string(s, out),
+        CV::String(s, _) => push_toml_string(s, out),
         CV::Integer(i, _) => {
             let _ = write!(out, "{i}");
         }
@@ -288,7 +288,7 @@ fn write_toml(cv: &CV, out: &mut String) {
                 if i != 0 {
                     out.push_str(", ");
                 }
-                toml_text::write_key(k, out);
+                push_toml_key(k, out);
                 out.push_str(" = ");
                 write_toml(v, out);
             }

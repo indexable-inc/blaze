@@ -74,13 +74,17 @@ macro_rules! refuses {
     };
 }
 
-// Arrays are the shape that made the compiler panic when the walk asked `info` of one (batch
-// 11): each array here, of any length, is decided by its element.
+// Tuples are the shape that made the compiler panic when the walk asked `info` of one (rustc
+// bug at 16d1ffac17ad, own/raw.rs `shape` says which): each tuple here, `()` and nested ones
+// included, is decided without asking it.
 const _: () = assert!(is_flat::<Job>());
+const _: () = assert!(is_flat::<(u16, u16)>());
+const _: () = assert!(is_flat::<()>());
+const _: () = assert!(is_flat::<((u8, ()), [(char, bool); 2])>());
 const _: () = assert!(is_flat::<[u64; 4]>());
 const _: () = assert!(is_flat::<[u8; 0]>());
 const _: () = assert!(is_flat::<[[u16; 2]; 3]>());
-// const _: () = assert!(is_flat::<(u8, i128, Option<core::num::NonZeroU32>)>());
+const _: () = assert!(is_flat::<(u8, i128, Option<core::num::NonZeroU32>)>());
 
 const REFUSED: [bool; 11] = [
     refuses!(refused::Borrowed),

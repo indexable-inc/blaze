@@ -206,26 +206,31 @@ and no lock per goal.
 
 ## Test language (src/testing/)
 
-Cases are text in `src/tests/cases/*.solve`, each named for the rule it tests:
+Cases are text in `src/tests/cases/*.solve` (builtin, auto, alias, coherence; `prelude.solve`
+is read under every file), each naming the reference rule it tests:
 
 ```
-case impl_where_clause  # trait_goals.rs consider_impl_candidate
-trait Clone {}
-impl<T: Clone> Clone for Vec<T> {}
-impl Clone for u32 {}
+case vec_clone = trait_goals.rs::consider_impl_candidate
 goal Vec<u32>: Clone => yes
-goal Vec<String>: Clone => no
 goal Vec<?0>: Clone => maybe
+case tuple_sized_tail = structural_traits.rs::instantiate_constituent_tys_for_sized_trait
+goal (u8, [u8]): Sized => no
 ```
 
-`src/testing/parse.rs` reads items (traits with supertraits, generics and associated types;
-`auto trait`; `#[lang = ..]`; `#[marker]`; structs and enums by field types; impls with
-where-clauses and associated types; fns), goals (`goal for<T: Clone> T: Clone => yes`, with
-`?N` variables and expected bindings `=> yes ?0 = u32`), into an in-memory `Facts`
-(src/testing/world.rs) and the arena (src/testing/tys.rs). A shared prelude defines the lang
-items. Planted-bug controls (testing skill): a coinductive cycle treated as inductive must fail
-the auto-trait cycle cases; a prefilter that drops an impl's wildcard must fail the prefilter's
-property test against the scalar and naive matchers.
+One line per item: `[extern lang(x) auto marker coinductive fundamental unsafe const]` on
+`trait`, `struct`, `enum`, `impl[@label]`, `fn`, `opaque Name: Bounds [= hidden]` and
+`foreign`; params get an implicit `Sized` unless `?Sized`. Case lines: `params`, `env`,
+`mode coherence`, `goal Pred => yes [?N = Ty, ..] | no | maybe | overflow`, `overlap @a @b =>
+overlap | disjoint | may_overlap`, `orphan @a => ok | not_local | uncovered(i)`. Types include
+`closure#N<kind, sig, upvars>`, `fn#name<..>`, `opaque#Name<..>`, `dyn ..`, `<T as Tr>::A`,
+`rigid <..>` (an alias marked rigid), `?N`/`?iN`/`?fN`, `!N`, `{3}` and `_`.
+`src/testing/parse.rs` parses, `world.rs` lowers each case's items into one portable table and
+answers `Facts` (impl buckets per shape with their fingerprint columns), `tys.rs` is the arena,
+`run.rs` checks each goal from one starting state. Controls (testing skill, `blaze_sim::control`):
+a coinductive cycle taken as inductive must fail the cycle cases; a prefilter that drops a
+wildcard must fail the prefilter's property against the truth, at every alignment. Wake lists
+and rescan are tested equal on the staggered load (`testing/stagger.rs`), which
+`examples/cost.rs` also times.
 
 ## What blaze-ty and blaze-typeck change
 

@@ -34,8 +34,10 @@ mbe.workspace = true
 tt.workspace = true
 span.workspace = true
 intern.workspace = true
-# `parse_to_token_tree`: text to tokens, for `lex`.
+# `parse_to_token_tree`: text to tokens, for `lex_through_tt`; `is_single_token_op`.
 syntax-bridge.workspace = true
+# `LexedStr`: the lexer's kinds and lengths, which `lex` reads straight into a stream.
+parser.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true

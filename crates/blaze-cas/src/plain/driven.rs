@@ -171,9 +171,21 @@ pub struct Driven<D: Driver = Native> {
     own: Vec<Completion>,
     /// Each mapped segment opened once more for `pread` ([`Driven::get_into`]), native only.
     files: BTreeMap<FileName, std::fs::File>,
-    /// The test's power cut: completions left before every run stops ([`Driven::cut_after`]).
+    /// The test's power cut ([`Driven::cut`]).
     #[cfg(test)]
-    cut: Option<u32>,
+    cut: Option<Cut>,
+}
+
+/// Where a test's power cut falls ([`Driven::cut`]): every run from then on stops, as if the
+/// process and the machine went down there.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Cut {
+    /// After this many more completions.
+    After(u32),
+    /// At the first completion after a run's flip landed: between the flip and what its
+    /// commit asks after it (a late sync), a window a drawn count almost never hits.
+    AtFlip,
 }
 
 impl Driven<Native> {
@@ -258,11 +270,10 @@ impl<D: Driver> Driven<D> {
         it.opened()
     }
 
-    /// A power cut after `left` more completions (`None`: none): every run from then on
-    /// stops, as if the process and the machine went down there.
+    /// A power cut where `at` says (`None`: none).
     #[cfg(test)]
-    pub(crate) fn cut_after(&mut self, left: Option<u32>) {
-        self.cut = left;
+    pub(crate) fn cut(&mut self, at: Option<Cut>) {
+        self.cut = at;
     }
 
     fn bare(driver: D, root: &Path, core: Plain) -> Driven<D> {
@@ -319,6 +330,8 @@ impl<D: Driver> Driven<D> {
     fn run(&mut self, what: &'static str) -> Result<(), StoreError> {
         let _span = blaze_trace::info_span!("plain.wait", what).entered();
         let mut since = self.driver.now();
+        #[cfg(test)]
+        let flipped_from = self.core.generation();
         loop {
             self.driver.submit(&mut self.effects);
             if self.driver.in_flight() == 0 {
@@ -334,12 +347,21 @@ impl<D: Driver> Driven<D> {
             let wall = self.driver.wall_ns();
             for completion in self.done.drain(..) {
                 #[cfg(test)]
-                if let Some(left) = &mut self.cut {
-                    if *left == 0 {
-                        // The power cut: this completion and the rest reach nothing.
+                {
+                    let now = match &mut self.cut {
+                        Some(Cut::After(0)) => true,
+                        Some(Cut::After(left)) => {
+                            *left -= 1;
+                            false
+                        }
+                        Some(Cut::AtFlip) => self.core.generation() != flipped_from,
+                        None => false,
+                    };
+                    if now {
+                        // The power cut: this completion and the rest, of every run, reach nothing.
+                        self.cut = Some(Cut::After(0));
                         return Err(StoreError::Unfinished { what: "a run the test's power cut stopped" });
                     }
-                    *left -= 1;
                 }
                 if self.core.owns(completion.tag) {
                     self.core.complete(completion, wall, &mut self.effects);

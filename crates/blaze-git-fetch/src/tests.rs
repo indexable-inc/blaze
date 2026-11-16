@@ -388,8 +388,12 @@ fn names_that_leave_the_checkout_are_refused() {
     assert_eq!(walk(b"odd", 0o100600), Err(TreeWhy::Mode { mode: 0o100600 }));
 }
 
-fn parent_refused(_: &Tape) -> Result<(), Broke> {
-    match walk(b"..", 0o100644) {
+fn parent_refused(tape: &Tape) -> Result<(), Broke> {
+    let mode = match tape.coin("executable") {
+        true => 0o100755,
+        false => 0o100644,
+    };
+    match walk(b"..", mode) {
         Err(TreeWhy::Name) => Ok(()),
         _ => Err(Broke::Oracle(String::from("a tree entry `..` was not refused"))),
     }

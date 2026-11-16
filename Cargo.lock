@@ -367,7 +367,6 @@ dependencies = [
  "blaze-trace",
  "blaze-v2-proof",
  "libc",
- "lz4_flex",
  "zstd",
 ]
 
@@ -425,8 +424,12 @@ dependencies = [
 name = "blaze-columns"
 version = "0.0.0"
 dependencies = [
+ "blaze-deflate",
  "blaze-int",
+ "blaze-kit",
  "blaze-own",
+ "blaze-sim",
+ "rustc_lexer",
 ]
 
 [[package]]
@@ -511,6 +514,7 @@ dependencies = [
  "blaze-surface",
  "intern",
  "mbe",
+ "parser",
  "span",
  "syntax-bridge",
  "tt",
@@ -982,7 +986,6 @@ name = "blaze-lower"
 version = "0.0.0"
 dependencies = [
  "blaze-file-items",
- "blaze-format",
  "blaze-format-core",
  "blaze-hash",
  "blaze-ids",
@@ -1106,6 +1109,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-columns",
  "blaze-int",
+ "blaze-kit",
  "blaze-own",
 ]
 
@@ -1133,12 +1137,12 @@ name = "blaze-profile"
 version = "0.0.0"
 dependencies = [
  "blaze-arrow-ipc",
- "blaze-base64",
  "blaze-columns",
  "blaze-core",
  "blaze-graph",
  "blaze-hash",
  "blaze-ids",
+ "blaze-kit",
  "blaze-mem",
  "blaze-own",
  "blaze-parquet",
@@ -1177,6 +1181,7 @@ dependencies = [
  "blaze-fuzz",
  "blaze-hash",
  "blaze-ids",
+ "blaze-kit",
  "blaze-serde",
  "blaze-sim",
  "serde",
@@ -1340,6 +1345,7 @@ dependencies = [
 name = "blaze-semver"
 version = "0.0.0"
 dependencies = [
+ "blaze-data",
  "blaze-own",
  "blaze-sim",
 ]
@@ -1448,6 +1454,7 @@ dependencies = [
  "blaze-bytes",
  "blaze-check",
  "blaze-core",
+ "blaze-deflate",
  "blaze-format",
  "blaze-hash",
  "blaze-hashcons",
@@ -1464,7 +1471,6 @@ dependencies = [
  "blaze-sim",
  "blaze-spin",
  "http",
- "miniz_oxide",
  "objc2-core-foundation",
  "objc2-core-media",
  "objc2-core-video",
@@ -1576,6 +1582,7 @@ name = "blaze-typeck"
 version = "0.0.0"
 dependencies = [
  "blaze-hash",
+ "blaze-kit",
  "blaze-own",
  "blaze-sim",
 ]
@@ -2805,12 +2812,6 @@ name = "lru-slab"
 version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4050469837a6ff301cd14c1f8f24f88549e6d548f24f64e2148eb0f72cebc51f"
-
-[[package]]
-name = "lz4_flex"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ecbdfe44b1bd960b68170b417450a628c43f7cf56bb3c5317e61cb230ee7f226"
 
 [[package]]
 name = "mach2"

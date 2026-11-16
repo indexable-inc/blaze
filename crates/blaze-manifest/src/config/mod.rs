@@ -28,7 +28,6 @@ mod profile;
 pub mod schema;
 mod source;
 pub mod target;
-mod toml_text;
 mod value;
 
 use error::Context as _;

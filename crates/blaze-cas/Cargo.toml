@@ -27,7 +27,6 @@ blaze-reclaim.workspace = true
 blaze-spin.workspace = true
 blaze-queue.workspace = true
 libc.workspace = true
-lz4_flex.workspace = true
 # `store.json`, read as JSON into its typed value.
 blaze-data.workspace = true
 blaze-json.workspace = true

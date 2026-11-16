@@ -77,6 +77,9 @@ pub enum Via {
     Misc = 1,
     ParamEnv = 2,
     AliasBound = 3,
+    /// The trait goal has no solution (the reference's `compute_trait_goal(..)?` failing a
+    /// `NormalizesTo` goal), as opposed to `None`: proven ambiguously.
+    Failed = 4,
 }
 
 impl Via {
@@ -85,6 +88,7 @@ impl Via {
             1 => Via::Misc,
             2 => Via::ParamEnv,
             3 => Via::AliasBound,
+            4 => Via::Failed,
             _ => Via::None,
         }
     }

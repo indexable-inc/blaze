@@ -2012,132 +2012,30 @@ fn a_head_of_another_format_is_refused_by_name() {
     assert!(broken.what.contains("format 99"), "{broken}");
 }
 
-/// Format 4 added the packs' block checks. A store of format 3 has none: it is refused, naming
-/// both formats, and never migrated or read as this one.
+/// A store of an older format is refused, naming both formats, and never migrated or read as
+/// this one (rule 26): format 3 had no block checks, and format 9 (or 8) may hold LZ4 chunks.
 #[test]
-fn a_store_of_the_format_before_block_checks_is_refused_naming_both() {
-    let mut sim = Sim::new(6, quiet());
-    let mut store = open(&mut sim, "store");
-    store.put(key(1), Kind::Code, &[1]).unwrap();
-    flush(&mut sim, &mut store);
-    drop(store);
-    assert_eq!((FORMAT_READ, FORMAT), (4, 9));
-    let head = name("store/head");
-    let mut bytes = sim.contents(&head);
-    assert_eq!(bytes[8..12], FORMAT.to_le_bytes());
-    bytes[8..12].copy_from_slice(&3u32.to_le_bytes());
-    sim.change(&head, &bytes);
-    let mut effects = Vec::new();
-    let mut store = Store::open(config("store"), &mut effects);
-    drive(&mut sim, &mut store, &mut effects);
-    assert!(!store.ready());
-    let broken = store.broken().unwrap();
-    assert_eq!(broken.file, head);
-    assert!(broken.what.contains("store format 3, not 9"), "{broken}");
-}
-
-/// The invariant: a store a blaze of format 8 left (records whose CRC covers their header
-/// only, head and index stamped 8) opens, reads every value right (each hashed, as format 8
-/// read them), takes format-9 records beside them, and goes on as format 9 across a reopen,
-/// with nothing the scrub finds. Rule 26: read forward, never refused.
-#[test]
-fn a_store_of_format_8_records_is_read_forward() {
-    let mut sim = Sim::new(31, quiet());
-    let mut store = open(&mut sim, "store");
-    let count = INDEX_AFTER as u64 + 4;
-    disk::WRITE_FORMAT_8.set(true);
-    for n in 0..count {
-        store.put(key(n), Kind::Code, &text(n, 300)).unwrap();
+fn a_store_of_an_older_format_is_refused_naming_both() {
+    assert_eq!((FORMAT_READ, FORMAT), (10, 10));
+    for old in [3u32, 8, 9] {
+        let mut sim = Sim::new(6, quiet());
+        let mut store = open(&mut sim, "store");
+        store.put(key(1), Kind::Code, &[1]).unwrap();
+        flush(&mut sim, &mut store);
+        drop(store);
+        let head = name("store/head");
+        let mut bytes = sim.contents(&head);
+        assert_eq!(bytes[8..12], FORMAT.to_le_bytes());
+        bytes[8..12].copy_from_slice(&old.to_le_bytes());
+        sim.change(&head, &bytes);
+        let mut effects = Vec::new();
+        let mut store = Store::open(config("store"), &mut effects);
+        drive(&mut sim, &mut store, &mut effects);
+        assert!(!store.ready());
+        let broken = store.broken().unwrap();
+        assert_eq!(broken.file, head);
+        assert!(broken.what.contains(&format!("store format {old}, not 10")), "{broken}");
     }
-    flush(&mut sim, &mut store);
-    disk::WRITE_FORMAT_8.set(false);
-    let slot = store.tiers[0].head.index.expect("past `INDEX_AFTER` records an index is written").slot;
-    drop(store);
-    let (head, index) = (name("store/head"), name(&format!("store/index-{slot}")));
-    let mut table = sim.contents(&index);
-    table[8..12].copy_from_slice(&8u32.to_le_bytes());
-    sim.change(&index, &table);
-    let mut written = Head::decode(&sim.contents(&head)).unwrap();
-    written.index.as_mut().unwrap().check = crc::crc32c(&table);
-    sim.change(&head, &written.encode_as(8));
-    let mut store = open(&mut sim, "store");
-    let look = store.look();
-    let old = look.find(&key(0)).unwrap().unwrap();
-    assert_eq!(look.record_sealed(old, &key(0)).unwrap().2, disk::Sealed::Header, "a format-8 record");
-    for n in 0..count {
-        assert_eq!(bytes_of(&store, &key(n)).unwrap(), text(n, 300), "{n} of format 8");
-    }
-    store.put(key(count), Kind::Code, &text(count, 300)).unwrap();
-    flush(&mut sim, &mut store);
-    let look = store.look();
-    let new = look.find(&key(count)).unwrap().unwrap();
-    assert_eq!(look.record_sealed(new, &key(count)).unwrap().2, disk::Sealed::Whole, "a format-9 record beside them");
-    assert_eq!(sim.contents(&head)[8..12], 9u32.to_le_bytes(), "the next head is of format 9");
-    drop(store);
-    let store = open(&mut sim, "store");
-    for n in 0..=count {
-        assert_eq!(bytes_of(&store, &key(n)).unwrap(), text(n, 300), "{n} after a reopen");
-    }
-    assert_eq!(store.verify(None), Vec::new());
-}
-
-/// Format 5 added a head's whole files to remove, format 6 each pack's time of use. A store
-/// of format 4 or 5 (its head and its index table) is read as it is, its packs' times of use
-/// not known until the store's clock is told, and the next head written over it is of this
-/// format.
-#[test]
-fn a_store_of_format_4_or_5_is_read_and_goes_on_as_this_format() {
-    for format in [4u32, 5] {
-        a_store_of_an_older_format_is_read_and_goes_on(format);
-    }
-}
-
-fn a_store_of_an_older_format_is_read_and_goes_on(format: u32) {
-    let mut sim = Sim::new(8, quiet());
-    let mut store = open(&mut sim, "store");
-    let count = INDEX_AFTER as u64 + 4;
-    for n in 0..count {
-        store.put(key(n), Kind::Code, &text(n, 300)).unwrap();
-    }
-    flush(&mut sim, &mut store);
-    let slot = store.tiers[0].head.index.expect("past `INDEX_AFTER` records an index is written").slot;
-    drop(store);
-    // The store as a blaze of format 4 left it: the index's stamp, its check in the head, and
-    // the head's stamp and check.
-    let (head, index) = (name("store/head"), name(&format!("store/index-{slot}")));
-    let mut table = sim.contents(&index);
-    assert_eq!(table[8..12], FORMAT.to_le_bytes());
-    table[8..12].copy_from_slice(&format.to_le_bytes());
-    sim.change(&index, &table);
-    let mut written = Head::decode(&sim.contents(&head)).unwrap();
-    written.index.as_mut().unwrap().check = crc::crc32c(&table);
-    // As that blaze wrote it: no time of use a pack.
-    let bytes = written.encode_as(format);
-    assert_eq!(bytes[8..12], format.to_le_bytes());
-    assert!(bytes.len() < written.encode().len(), "a head of format {format} is shorter");
-    sim.change(&head, &bytes);
-    let mut store = open(&mut sim, "store");
-    assert!(
-        store.collect_candidates().iter().all(|it| it.used == 0),
-        "a head of format {format} says of no pack when it was used"
-    );
-    store.clock(1_000);
-    assert!(
-        store.collect_candidates().iter().all(|it| it.used == 1_000),
-        "the store's clock stamps the packs whose use is not known"
-    );
-    for n in 0..count {
-        assert_eq!(bytes_of(&store, &key(n)).unwrap(), text(n, 300), "{n}");
-    }
-    store.put(key(count), Kind::Code, &text(count, 300)).unwrap();
-    flush(&mut sim, &mut store);
-    assert_eq!(sim.contents(&head)[8..12], FORMAT.to_le_bytes(), "the next head is of this format");
-    drop(store);
-    let store = open(&mut sim, "store");
-    for n in 0..=count {
-        assert_eq!(bytes_of(&store, &key(n)).unwrap(), text(n, 300), "{n} after a reopen");
-    }
-    assert_eq!(store.verify(None), Vec::new());
 }
 
 /// A hot value long enough for a file of its own, unread for two periods, goes cold as a
@@ -2234,10 +2132,10 @@ fn a_cold_kind_trains_its_dictionary_and_compresses_what_follows() {
     let mut store = open(&mut sim, "store");
     let count = cold::TRAIN_VALUES as u64 + 40;
     for n in 0..count {
-        store.put(key(n), Kind::Run, &run_output(n)).unwrap();
+        store.put(key(n), Kind::Debug, &run_output(n)).unwrap();
     }
     assert_eq!(store.problems(), &[] as &[String]);
-    assert_eq!(store.tiers[0].dictionaries.len(), 1, "one dictionary for runs");
+    assert_eq!(store.tiers[0].dictionaries.len(), 1, "one dictionary for debug info");
     let (form, stored, raw) = store.sizes_of(&key(count - 1));
     assert_eq!(form, Form::Zstd);
     assert!(stored * 3 < raw, "{stored} stored of {raw}");
@@ -3750,32 +3648,43 @@ fn a_long_cold_value_is_compressed_without_a_dictionary_over_a_long_window() {
     assert_eq!(store.verify(None), Vec::new());
 }
 
+/// Rule 51 on the edit loop: a hit read of a chunked output, after a reopen, copies its bytes
+/// once (into the value made whole) and decodes no chunk; on disk its chunks hold its bytes as
+/// they are. The fixture: 600 KiB of build-script text, then 600 KiB of noise. Format 9 kept
+/// four of its twelve chunks in LZ4: 643,274 bytes stored, 652,096 written, and five copies on
+/// a hit (each LZ4 chunk decoded, then the whole); format 10 stores 1,229,694 (the bytes),
+/// writes 1,238,516 and copies once.
 #[test]
-fn chunks_that_shrink_are_kept_in_lz4_and_the_rest_raw() {
+fn a_hit_read_of_a_chunked_output_copies_once_and_decodes_nothing() {
     let mut sim = Sim::new(22, quiet());
     let mut store = open(&mut sim, "store");
-    let mut text = Vec::new();
+    let mut both = Vec::new();
     let mut n = 0;
-    while text.len() < 600 << 10 {
-        text.extend(run_output(n));
+    while both.len() < 600 << 10 {
+        both.extend(run_output(n));
         n += 1;
     }
-    let mut both = text.clone();
     both.extend(noise(600 << 10, 220));
     store.put(key(1), Kind::Output, &both).unwrap();
-    let forms: Vec<Form> = store.tiers[0]
+    flush(&mut sim, &mut store);
+    let chunks: Vec<(Form, u64, u64)> = store.tiers[0]
         .delta
         .iter(Held::writer(&store))
         .filter(|(_, it)| it.key != key(1))
-        .map(|(_, it)| it.place.form())
+        .map(|(_, it)| store.sizes_of(&it.key))
         .collect();
-    assert!(forms.contains(&Form::Lz4), "{forms:?}");
-    assert!(forms.contains(&Form::Raw), "{forms:?}");
-    assert_eq!(bytes_of(&store, &key(1)).unwrap(), both);
-    flush(&mut sim, &mut store);
+    let stored: u64 = chunks.iter().map(|it| it.1).sum();
+    let written = sim.bytes_written();
     drop(store);
     let store = open(&mut sim, "store");
+    crate::read::COPIES.with(|it| it.set(0));
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), both);
+    let copies = crate::read::COPIES.with(|it| it.get());
+    let measured = format!("{stored} bytes stored of {}; {written} written", both.len());
+    assert_eq!(copies, 1, "one copy, the value made whole; {measured}");
+    assert!(chunks.iter().all(|it| it.0 == Form::Raw && it.1 == it.2), "{chunks:?}");
+    assert_eq!(stored, both.len() as u64, "{measured}");
+    assert_eq!(written, 1_238_516, "{measured}");
     assert_eq!(store.verify(None), Vec::new());
 }
 
@@ -4009,7 +3918,7 @@ fn a_batch_trains_its_kind_s_dictionary_where_it_is_compressed() {
 }
 
 #[test]
-fn a_cold_value_read_in_two_periods_running_comes_back_hot() {
+fn a_cold_value_read_in_a_period_comes_back_hot_and_raw_at_its_end() {
     let mut sim = Sim::new(31, quiet());
     let mut store = open(&mut sim, "store");
     store.put(key(1), Kind::Code, &text(1, 16 << 10)).unwrap();
@@ -4018,14 +3927,13 @@ fn a_cold_value_read_in_two_periods_running_comes_back_hot() {
     settle(&mut sim, &mut store);
     settle(&mut sim, &mut store);
     assert_eq!(settle(&mut sim, &mut store).demoted, 2);
-    for round in 0..2 {
-        assert_eq!(bytes_of(&store, &key(1)).unwrap(), text(1, 16 << 10));
-        assert_eq!(bytes_of(&store, &key(2)).unwrap(), text(2, 16 << 10));
-        let settled = settle(&mut sim, &mut store);
-        assert_eq!(settled.promoted, round * 2, "{settled:?}");
-    }
+    assert_eq!(settle(&mut sim, &mut store).promoted, 0, "unread, it stays cold");
+    assert_eq!(bytes_of(&store, &key(1)).unwrap(), text(1, 16 << 10));
+    assert_eq!(bytes_of(&store, &key(2)).unwrap(), text(2, 16 << 10));
+    let settled = settle(&mut sim, &mut store);
+    assert_eq!(settled.promoted, 2, "one period's read brings it back: {settled:?}");
     assert_eq!(form_of(&store, &key(1)), Form::Raw);
-    assert_eq!(form_of(&store, &key(2)), Form::Lz4, "an output comes back as LZ4");
+    assert_eq!(form_of(&store, &key(2)), Form::Raw, "an output comes back raw, read in place");
     drop(store);
     let store = open(&mut sim, "store");
     assert_eq!(bytes_of(&store, &key(2)).unwrap(), text(2, 16 << 10));
@@ -4229,15 +4137,10 @@ fn a_value_of_columns_goes_warm_then_cold_then_comes_back_hot() {
     assert_eq!(settle(&mut sim, &mut store).demoted, 0, "a warm record made last period stays");
     assert_eq!(settle(&mut sim, &mut store).demoted, 1);
     assert_eq!(form_of(&store, &key(1)), Form::ColdColumns);
-    for round in 0..2 {
-        assert_eq!(bytes_of(&store, &key(1)).unwrap(), hot);
-        let (heat, entry) = store.get_in_place(&key(1)).unwrap().unwrap();
-        assert_eq!(
-            (heat, entry.bytes, entry.content),
-            (Heat::Hot, hot.as_slice(), content_of(&hot))
-        );
-        assert_eq!(settle(&mut sim, &mut store).promoted, round);
-    }
+    assert_eq!(bytes_of(&store, &key(1)).unwrap(), hot);
+    let (heat, entry) = store.get_in_place(&key(1)).unwrap().unwrap();
+    assert_eq!((heat, entry.bytes, entry.content), (Heat::Hot, hot.as_slice(), content_of(&hot)));
+    assert_eq!(settle(&mut sim, &mut store).promoted, 1);
     assert_eq!(form_of(&store, &key(1)), Form::Raw);
     drop(store);
     let store = with_columns(&mut sim, false);
@@ -4300,7 +4203,7 @@ fn a_cold_kind_of_columns_is_put_in_cold_columns() {
     let mut sim = Sim::new(43, quiet());
     let mut store = with_columns(&mut sim, false);
     let hot = one_column(false).hot(&column_values(9));
-    store.put(key(1), Kind::Run, &hot).unwrap();
+    store.put(key(1), Kind::Debug, &hot).unwrap();
     assert_eq!(form_of(&store, &key(1)), Form::ColdColumns);
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), hot);
     flush(&mut sim, &mut store);
@@ -4362,7 +4265,7 @@ fn a_cold_kind_of_buffer_is_put_in_its_cold_columns() {
     let mut sim = Sim::new(45, quiet());
     let mut store = with_spans(&mut sim);
     let hot = spans_buffer();
-    store.put(key(1), Kind::Run, &hot).unwrap();
+    store.put(key(1), Kind::Debug, &hot).unwrap();
     assert_eq!(form_of(&store, &key(1)), Form::ColdColumns);
     assert_eq!(bytes_of(&store, &key(1)).unwrap(), hot);
 }

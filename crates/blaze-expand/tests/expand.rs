@@ -252,6 +252,112 @@ fn the_same_call_at_two_offsets_expands_equal() {
     });
 }
 
+/// `lex`, read straight from the lexer with nothing interned, equals `lex_through_tt`, the
+/// tt path through the process-wide interner (parallelism audit, change 7): on texts that
+/// reach each of its cases, and on soups of their pieces glued with and without spaces.
+#[test]
+fn lex_equals_the_tt_path() {
+    use blaze_expand::lex_through_tt;
+    let pieces = [
+        "a", "r#fn", "_", "'a", "'static", "1u8", "1.5e3f64", "0x1F_u32", "\"s\"", "\"s\"x",
+        "b'c'", "c\"z\"", "r#\"q\"#", "br\"r\"", "\"a\r\nb\"", "///d \"q\"\n", "//! i\n",
+        "/** b */", "/*! c */", "// n\n", "/* m */", "(", ")", "[", "]", "{", "}", "::", "->",
+        "=>", "..=", "#", "!", "$", "+=", "&&", "<", ">", ";", ",", ".", "@", "?", "~", "%",
+        " ", "\n",
+    ];
+    let fixed = ["", "f(a, b)", "a)", "(a", "([)]", "{ x }}", "x/**/y", "'a: loop {}"];
+    for text in fixed {
+        let one = lex(text, Edition::E2021, Alloc::global());
+        let two = lex_through_tt(text, Edition::E2021, Alloc::global());
+        assert_eq!(one, two, "`{text:?}` lexes unequal");
+    }
+    blaze_sim::check(Config::cases(512), |tape: &Tape| {
+        let mut text = String::new();
+        for _ in 0..12 {
+            text.push_str(tape.pick(&pieces, "piece").copied().unwrap_or(""));
+        }
+        for edition in [Edition::E2015, Edition::E2021, Edition::E2024] {
+            let one = lex(&text, edition, Alloc::global());
+            let two = lex_through_tt(&text, edition, Alloc::global());
+            if one != two {
+                return Err(Broke::Oracle(format!(
+                    "`{text:?}` lexes unequal in {edition:?}: {one:?} and {two:?}"
+                )));
+            }
+        }
+        Ok(())
+    });
+}
+
+/// The tokens of `stream` as (kind letter, text, joint) triples: `i` ident, `p` punct, `l`
+/// literal, `(`/`)` a group.
+fn shape(stream: &TokenStream<'_>) -> Vec<(char, String, bool)> {
+    stream
+        .tokens()
+        .iter()
+        .filter_map(|token| {
+            let text = stream.text_of(token).to_owned();
+            Some(match token.kind {
+                TokenKind::Ident { spacing, .. } => ('i', text, spacing != Spacing::Alone),
+                TokenKind::Punct { char, spacing } => ('p', char.to_string(), spacing == Spacing::Joint),
+                TokenKind::Literal { .. } => ('l', text, false),
+                TokenKind::Open(Delim::Invisible) | TokenKind::Close(Delim::Invisible) => return None,
+                TokenKind::Open(_) => ('(', text, false),
+                TokenKind::Close(_) => (')', text, false),
+            })
+        })
+        .collect()
+}
+
+/// `core`'s `impl_int_cast!` (core/src/convert/num.rs:766), called as `impl_all_int_casts!`
+/// calls it: a `ty` fragment, then `as`, then a bracketed list; `no rule matched` on `core`.
+#[test]
+fn a_ty_fragment_followed_by_as_matches() {
+    let cx = TestCx::new();
+    let def = rules("($Src:ty as [$($Dst:ty),*]) => { $(const impl C<$Src> for $Dst {})* }", 1);
+    let exp = call_fn(&def, "u8 as [u8, u16]", &cx);
+    assert!(exp.diagnostics.is_empty(), "{:?}", exp.diagnostics);
+    assert_eq!(show(&exp.tokens), "const impl C < u8 > for u8 { } const impl C < u8 > for u16 { }");
+    // As the inner call of a macro whose own `$Src:ty` it passes on.
+    let outer = rules("([$($Src:ty),*]) => { $(m!($Src as [u8, i8]);)* }", 1);
+    let exp = call_fn(&outer, "[u8, usize]", &cx);
+    let calls = find_calls(&exp.tokens, Alloc::global()).expect("the expansion's calls are found");
+    assert_eq!(calls.len(), 2);
+    for call in calls.iter() {
+        let mut input = exp.tokens.copy_in(call.inner().to_usize(), Alloc::global()).expect("the args copy");
+        input.seal(ContentId([7; 32]));
+        let inner = call_fn_tokens(&def, &input, &cx);
+        assert!(inner.diagnostics.is_empty(), "{:?}: {:?}", show(&input), inner.diagnostics);
+    }
+}
+
+fn call_fn_tokens(def: &MacroDefinition<'static>, input: &TokenStream<'_>, cx: &TestCx) -> Expansion<'static> {
+    done(expand(def, &Call::fn_like(input, site()), cx, Alloc::global()))
+}
+
+/// `core`'s `fmt_refs!` and `bitop_impls!` (an anonymous lifetime `'_` in the transcribed
+/// text) and `impl_number!` (`<<$number as SimdElement>::Mask`): each expansion's lifetime is
+/// a joint `'` and an identifier, and `<<` two `<`.
+#[test]
+fn lifetimes_and_double_angles_are_transcribed_as_written() {
+    let cx = TestCx::new();
+    let def = rules("($($tr:ident),*) => { $(impl<T: $tr> $tr for &T { fn fmt(&self, f: &mut F<'_>) {} })* }", 1);
+    let exp = call_fn(&def, "Debug, Display", &cx);
+    let tokens = shape(&exp.tokens);
+    let quotes: Vec<usize> = tokens.iter().enumerate().filter(|(_, t)| t.1 == "'").map(|(at, _)| at).collect();
+    assert_eq!(quotes.len(), 2, "{tokens:?}");
+    for at in quotes {
+        assert_eq!(tokens[at], ('p', "'".to_owned(), true), "{tokens:?}");
+        assert_eq!(tokens[at + 1].0, 'i', "{tokens:?}");
+        assert_eq!(tokens[at + 1].1, "_", "{tokens:?}");
+    }
+    let def = rules("{ $($number:ty),* } => { $(type M = Mask<<$number as E>::Mask, N>;)* }", 1);
+    let exp = call_fn(&def, "f16, u8", &cx);
+    let tokens = shape(&exp.tokens);
+    let angles = tokens.windows(2).filter(|w| w[0].1 == "<" && w[1].1 == "<").count();
+    assert_eq!(angles, 2, "{tokens:?}");
+}
+
 #[test]
 fn an_edit_changes_the_key_and_a_comment_does_not() {
     let input = tokens("1");

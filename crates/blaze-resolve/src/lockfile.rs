@@ -687,53 +687,20 @@ fn encodable_source_id(id: SourceId, version: ResolveVersion) -> Option<TomlLock
     Some(TomlLockfileSourceId::new(url).expect("source ID should have valid URLs"))
 }
 
-/// A TOML control character, which no string but a basic one with escapes may hold.
-fn control(c: char) -> bool {
-    matches!(c, '\0'..='\x1f' | '\x7f')
-}
-
-/// `text` quoted as toml 1.1.2 quotes it (toml_writer 1.0.6): `"text"` when nothing in it
-/// needs an escape (a value may hold a tab there, a key may not), else `'text'` when it can
-/// be literal, else a basic string with escapes. toml writes a text with a newline (or with
-/// both quotes and a backslash) as a multi-line string instead; here it gets the escaped
-/// form, which reads back the same but is not cargo's bytes. No name, version, source or
-/// checksum holds such a text; a hand-written `[metadata]` value could.
-fn push_quoted(text: &str, value: bool, out: &mut String) {
-    let escape = |c: char| (control(c) && !(value && c == '\t')) || c == '"' || c == '\\';
-    if !text.chars().any(escape) {
-        out.push('"');
-        out.push_str(text);
-        out.push('"');
-    } else if !text.chars().any(|c| control(c) || c == '\'') {
-        out.push('\'');
-        out.push_str(text);
-        out.push('\'');
-    } else {
-        // A text with a quote, backslash or control character is never a bare key, so
-        // `write_key` writes it as a basic string with escapes.
-        let mut escaped = blaze_own::String::new_in(Global);
-        blaze_toml::write_key(text, &mut escaped);
-        out.push_str(escaped.as_str());
-    }
-}
-
+/// `text` as a TOML string value, spelled as cargo spells it (blaze-toml's writer).
 fn push_value(text: &str, out: &mut String) {
-    push_quoted(text, true, out);
+    let mut spelled = blaze_own::String::new_in(Global);
+    blaze_toml::write_string(text, &mut spelled);
+    out.push_str(spelled.as_str());
 }
 
-fn push_key(key: &str, out: &mut String) {
-    match !key.is_empty() && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-    {
-        true => out.push_str(key),
-        false => push_quoted(key, false, out),
-    }
-}
-
-/// `key = "value"` and a newline.
+/// `key = "value"` and a newline, both spelled as cargo spells them (blaze-toml's writer).
 fn push_line(key: &str, value: &str, out: &mut String) {
-    push_key(key, out);
-    out.push_str(" = ");
-    push_value(value, out);
+    let mut spelled = blaze_own::String::new_in(Global);
+    blaze_toml::write_key(key, &mut spelled);
+    spelled.push_str(" = ");
+    blaze_toml::write_string(value, &mut spelled);
+    out.push_str(spelled.as_str());
     out.push('\n');
 }
 

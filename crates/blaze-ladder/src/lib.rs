@@ -14,4 +14,8 @@
 
 pub mod lower;
 pub mod place;
+pub mod run;
 pub mod world;
+
+#[cfg(test)]
+mod tests;

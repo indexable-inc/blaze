@@ -201,7 +201,19 @@ fn a_forgotten_drain_leaves_the_map_empty() {
     }
     let mut drain = map.drain();
     drop(drain.next());
-    std::mem::forget(drain);
+    // The forget, kept findable: the drain goes to a leaked box rather than `mem::forget`, so
+    // under Miri its box is a root and the table and values it leaks by design are reachable,
+    // not reported, while a leak anywhere else still fails the run.
+    let forgotten = std::boxed::Box::into_raw(std::boxed::Box::new(drain));
+    #[cfg(miri)]
+    {
+        unsafe extern "Rust" {
+            /// Miri's shim: the allocation at `ptr`, and all it reaches, is not a leak.
+            safe fn miri_static_root(ptr: *const u8);
+        }
+        miri_static_root(forgotten.cast::<u8>());
+    }
+    let _ = forgotten;
     assert_eq!(dropped.get(), 1, "only the value taken is dropped");
     assert_eq!(map.len(), 0);
     assert!(map.get(&3).is_none());

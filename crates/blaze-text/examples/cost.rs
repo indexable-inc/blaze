@@ -155,13 +155,20 @@ fn main() {
 
     for digits in [1u32, 5, 10, 20, 0] {
         let texts: std::vec::Vec<std::string::String> = ints(digits).iter().map(|x| format!("{x}")).collect();
-        let name = match digits {
-            0 => std::string::String::from("u64 parse, every length"),
-            d => format!("u64 parse, {d} digits"),
+        let length = match digits {
+            0 => std::string::String::from("every length"),
+            d => format!("{d} digits"),
         };
         bench.pair(
-            &name,
-            |i| _ = black_box(<u64 as Parse>::parse(black_box(texts[i].as_str())).ok()),
+            &format!("u64 parse_all, {length}"),
+            |i| _ = black_box(blaze_text::parse_all::<u64>(black_box(texts[i].as_str())).ok()),
+            |i| _ = black_box(black_box(texts[i].as_str()).parse::<u64>().ok()),
+        );
+        // A prefix: the number with text after it, against core on the number alone.
+        let lines: std::vec::Vec<std::string::String> = ints(digits).iter().map(|x| format!("{x}, next")).collect();
+        bench.pair(
+            &format!("u64 parse, a prefix, {length}"),
+            |i| _ = black_box(<u64 as Parse>::parse(black_box(lines[i].as_str())).ok()),
             |i| _ = black_box(black_box(texts[i].as_str()).parse::<u64>().ok()),
         );
     }
@@ -181,15 +188,6 @@ fn main() {
     // The vector routines against their scalar twins ("core" column = the scalar twin), in a
     // longer text, as a parser meets them: where each crosses over.
     println!("vector (ours) against its scalar twin (core column):");
-    for digits in [1u32, 5, 10, 15, 20] {
-        let texts: std::vec::Vec<std::string::String> =
-            ints(digits).iter().map(|x| format!("{x}, and the rest of the line")).collect();
-        bench.pair(
-            &format!("  digit run + convert, {digits} digits"),
-            |i| _ = black_box(twins::decimal_u64(black_box(texts[i].as_bytes()))),
-            |i| _ = black_box(twins::decimal_u64_scalar(black_box(texts[i].as_bytes()))),
-        );
-    }
     for len in [4usize, 16, 64, 256] {
         let text: std::vec::Vec<u8> = (0..len).map(|i| b'a' + u8::try_from(i % 26).unwrap_or(0)).chain(*b"\"").collect();
         bench.pair(

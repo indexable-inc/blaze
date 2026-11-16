@@ -53,6 +53,15 @@ impl<A: Allocator> VersionReq<A> {
         VersionReq { comparators: Vec::new_in(alloc) }
     }
 
+    /// `text` as a requirement under [`Limits::CARGO`], in `A`'s default allocator
+    /// (`VersionReq::<Global>::parse("^1.2")`).
+    pub fn parse(text: &str) -> Result<VersionReq<A>, Error>
+    where
+        A: Clone + Default,
+    {
+        VersionReq::parse_in(text, Limits::CARGO, A::default())
+    }
+
     /// `text` as a requirement: comparators separated by `,`, blanks allowed around each.
     /// A pre-release past [`INLINE`](crate::INLINE) bytes goes in `alloc`.
     pub fn parse_in(text: &str, limits: Limits, alloc: A) -> Result<VersionReq<A>, Error>

@@ -45,6 +45,15 @@ impl<A: Allocator> Version<A> {
         }
     }
 
+    /// `text` as a version under [`Limits::CARGO`], a long identifier in `A`'s default
+    /// allocator (`Version::<Global>::parse("1.2.3")`).
+    pub fn parse(text: &str) -> Result<Version<A>, Error>
+    where
+        A: Clone + Default,
+    {
+        Version::parse_in(text, Limits::CARGO, A::default())
+    }
+
     /// The order of SemVer 2.0.0's section 11: by the numbers, then a pre-release before the
     /// release; build metadata does not count.
     pub fn cmp_precedence(&self, other: &Version<A>) -> Ordering {

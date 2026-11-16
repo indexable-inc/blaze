@@ -38,59 +38,79 @@ fn full(column: &'static str) -> ! {
     )
 }
 
+/// One row: what a hit compares and what a walk reads first (flags, then the columns), in
+/// one 12-byte record, so either touches one cache line. Columns per field would make a hit
+/// read three lines at its row, which the cost example measured as the hit's main cost on a
+/// table past the cache.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(C)]
+pub(crate) struct Row {
+    pub(crate) a: u32,
+    pub(crate) b: u32,
+    pub(crate) kind: u8,
+    pub(crate) flags: Flags,
+}
+
 /// One class's rows.
 pub(crate) struct Rows<'a> {
-    pub(crate) kind: Vec<u8, Alloc<'a>>,
-    pub(crate) a: Vec<u32, Alloc<'a>>,
-    pub(crate) b: Vec<u32, Alloc<'a>>,
-    pub(crate) flags: Vec<Flags, Alloc<'a>>,
-    index: Index<'a>,
+    rows: Vec<Row, Alloc<'a>>,
+    pub(crate) index: Index<'a>,
     name: &'static str,
 }
 
 impl<'a> Rows<'a> {
     fn with_capacity_in(rows: usize, name: &'static str, alloc: Alloc<'a>) -> Rows<'a> {
-        Rows {
-            kind: Vec::with_capacity_in(rows, alloc),
-            a: Vec::with_capacity_in(rows, alloc),
-            b: Vec::with_capacity_in(rows, alloc),
-            flags: Vec::with_capacity_in(rows, alloc),
-            index: Index::with_capacity_in(rows, alloc),
-            name,
-        }
+        Rows { rows: Vec::with_capacity_in(rows, alloc), index: Index::with_capacity_in(rows, alloc), name }
     }
 
     #[inline(always)]
-    fn find(&self, kind: u8, a: u32, b: u32) -> Probe {
+    pub(crate) fn find(&self, kind: u8, a: u32, b: u32) -> Probe {
         let h = hash::row(kind, a, b);
-        self.index.probe(h, |id| {
-            let i = ix(id);
-            self.a[i] == a && self.b[i] == b && self.kind[i] == kind
+        let rows = &self.rows[..];
+        self.index.probe(h, |id| match rows.get(ix(id)) {
+            Some(r) => r.a == a && r.b == b && r.kind == kind,
+            None => false,
         })
     }
 
     #[inline]
     fn push(&mut self, v: crate::index::Vacant, kind: u8, a: u32, b: u32, flags: Flags) -> u32 {
-        let Some(id) = row(self.kind.len()) else { full(self.name) };
-        self.kind.push(kind);
-        self.a.push(a);
-        self.b.push(b);
-        self.flags.push(flags);
-        let (k, ca, cb) = (&self.kind, &self.a, &self.b);
+        let Some(id) = row(self.rows.len()) else { full(self.name) };
+        self.rows.push(Row { a, b, kind, flags });
+        let rows = &self.rows;
         self.index.fill(v, id, |r| {
-            let i = ix(r);
-            hash::row(k[i], ca[i], cb[i])
+            let r = rows[ix(r)];
+            hash::row(r.kind, r.a, r.b)
         });
         id
     }
 
+    #[inline(always)]
+    pub(crate) fn at(&self, i: usize) -> Row {
+        self.rows[i]
+    }
+
+    #[inline(always)]
+    pub(crate) fn kind(&self, i: usize) -> u8 {
+        self.rows[i].kind
+    }
+
+    #[inline(always)]
+    pub(crate) fn a(&self, i: usize) -> u32 {
+        self.rows[i].a
+    }
+
+    #[inline(always)]
+    pub(crate) fn flags(&self, i: usize) -> Flags {
+        self.rows[i].flags
+    }
+
     pub(crate) fn len(&self) -> usize {
-        self.kind.len()
+        self.rows.len()
     }
 
     fn bytes(&self) -> usize {
-        self.kind.capacity() + self.a.capacity() * 4 + self.b.capacity() * 4 + self.flags.capacity() * 2
-            + self.index.bytes()
+        self.rows.capacity() * core::mem::size_of::<Row>() + self.index.bytes()
     }
 }
 
@@ -544,44 +564,45 @@ impl<'a> Tys<'a> {
     pub fn node_flags(&self, n: Node) -> Flags {
         let i = ix(n.index());
         match n.tag() {
-            TAG_TY => self.ty.flags[i],
-            TAG_REGION => self.re.flags[i],
-            TAG_CONST => self.ct.flags[i],
+            TAG_TY => self.ty.flags(i),
+            TAG_REGION => self.re.flags(i),
+            TAG_CONST => self.ct.flags(i),
             _ => self.list_flags[i],
         }
     }
 
     #[inline(always)]
     pub fn flags(&self, t: Ty) -> Flags {
-        self.ty.flags[ix(t.0)]
+        self.ty.flags(ix(t.0))
     }
 
     /// A row of a node's class: `(kind, a, b)`; a list's is `(0, start, len)`.
     #[inline(always)]
     pub fn raw(&self, n: Node) -> (u8, u32, u32) {
         let i = ix(n.index());
-        match n.tag() {
-            TAG_TY => (self.ty.kind[i], self.ty.a[i], self.ty.b[i]),
-            TAG_REGION => (self.re.kind[i], self.re.a[i], self.re.b[i]),
-            TAG_CONST => (self.ct.kind[i], self.ct.a[i], self.ct.b[i]),
-            _ => (0, self.list_start[i], self.list_len[i]),
-        }
+        let r = match n.tag() {
+            TAG_TY => self.ty.at(i),
+            TAG_REGION => self.re.at(i),
+            TAG_CONST => self.ct.at(i),
+            _ => return (0, self.list_start[i], self.list_len[i]),
+        };
+        (r.kind, r.a, r.b)
     }
 
     /// The kind code of a type-arena row.
     #[inline(always)]
     pub fn kind_of(&self, t: Ty) -> u8 {
-        self.ty.kind[ix(t.0)]
+        self.ty.kind(ix(t.0))
     }
 
     #[inline(always)]
     pub(crate) fn re_kind_of(&self, r: Region) -> u8 {
-        self.re.kind[ix(r.0)]
+        self.re.kind(ix(r.0))
     }
 
     #[inline(always)]
     pub(crate) fn ct_kind_of(&self, c: Const) -> u8 {
-        self.ct.kind[ix(c.0)]
+        self.ct.kind(ix(c.0))
     }
 
     /// The descriptor of a node's kind (a list's: no columns).
@@ -589,9 +610,9 @@ impl<'a> Tys<'a> {
     pub(crate) fn desc(&self, n: Node) -> Desc {
         let i = ix(n.index());
         match n.tag() {
-            TAG_TY => kind::ty_d(self.ty.kind[i]),
-            TAG_REGION => kind::re_d(self.re.kind[i]),
-            TAG_CONST => kind::ct_d(self.ct.kind[i]),
+            TAG_TY => kind::ty_d(self.ty.kind(i)),
+            TAG_REGION => kind::re_d(self.re.kind(i)),
+            TAG_CONST => kind::ct_d(self.ct.kind(i)),
             _ => kind::ct_d(u8::MAX),
         }
     }
@@ -650,7 +671,7 @@ impl<'a> Tys<'a> {
     /// A type, read back.
     pub fn ty_kind(&self, t: Ty) -> TyKind {
         let i = ix(t.0);
-        let (k, a, b) = (self.ty.kind[i], self.ty.a[i], self.ty.b[i]);
+        let Row { kind: k, a, b, .. } = self.ty.at(i);
         let na = Node(a);
         let nb = Node(b);
         match k {
@@ -704,7 +725,7 @@ impl<'a> Tys<'a> {
     /// A region, read back.
     pub fn region_kind(&self, r: Region) -> RegionKind {
         let i = ix(r.0);
-        let (k, a, b) = (self.re.kind[i], self.re.a[i], self.re.b[i]);
+        let Row { kind: k, a, b, .. } = self.re.at(i);
         match k {
             re::EARLY_PARAM => RegionKind::EarlyParam(a),
             re::BOUND => RegionKind::Bound(a, b),
@@ -721,7 +742,7 @@ impl<'a> Tys<'a> {
     /// A const, read back.
     pub fn const_kind(&self, c: Const) -> ConstKind {
         let i = ix(c.0);
-        let (k, a, b) = (self.ct.kind[i], self.ct.a[i], self.ct.b[i]);
+        let Row { kind: k, a, b, .. } = self.ct.at(i);
         match k {
             ct::PARAM => ConstKind::Param(a),
             ct::VAR => ConstKind::Var(a),
@@ -737,7 +758,7 @@ impl<'a> Tys<'a> {
     /// A predicate, read back.
     pub fn pred_kind(&self, p: Pred) -> PredKind {
         let i = ix(p.0);
-        let (k, a, b) = (self.ty.kind[i], self.ty.a[i], self.ty.b[i]);
+        let Row { kind: k, a, b, .. } = self.ty.at(i);
         let (na, nb) = (Node(a), Node(b));
         let (aa, ab) = (Arg(a), Arg(b));
         match k {

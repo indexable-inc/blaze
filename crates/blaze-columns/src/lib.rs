@@ -13,7 +13,7 @@
 //! string); only its validity says it is null.
 
 #![cfg_attr(not(test), no_std)]
-#![feature(allocator_api, register_tool, custom_inner_attributes)]
+#![feature(allocator_api, register_tool, custom_inner_attributes, portable_simd)]
 #![register_tool(blaze)]
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
@@ -24,6 +24,8 @@ use core::{alloc::Allocator, fmt, ops::Range};
 use blaze_int::Int;
 use blaze_own::{String, Vec};
 
+/// Lightweight encodings read in place (docs/v2/plan/design/columns.md).
+pub mod enc;
 #[cfg(test)]
 mod tests;
 

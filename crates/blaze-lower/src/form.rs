@@ -1491,9 +1491,12 @@ impl Param {
 /// its arguments (rows of [`FmtArg`]: the written ones, then the ones the template captures).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FormatArgs {
+    /// The string literal's contents (no quotes).
     pub template: Range,
     pub pieces: List,
     pub args: List,
+    /// `format_args_nl!`: a `\n` follows the last piece.
+    pub newline: bool,
 }
 
 impl FormatArgs {
@@ -1505,13 +1508,18 @@ impl FormatArgs {
             d: self.pieces.len,
             e: self.args.start,
             f: self.args.len,
-            ..Node::of(ROW_FORMAT)
+            ..Node::of(ROW_FORMAT).with(self.newline as u16)
         }
     }
 
     pub(crate) fn decode(n: Node) -> Result<FormatArgs, BadRow> {
         check_tag!(n, ROW_FORMAT, "format args");
-        Ok(FormatArgs { template: Range::new(n.a, n.b), pieces: list(n.c, n.d), args: list(n.e, n.f) })
+        Ok(FormatArgs {
+            template: Range::new(n.a, n.b),
+            pieces: list(n.c, n.d),
+            args: list(n.e, n.f),
+            newline: n.flags & 1 != 0,
+        })
     }
 }
 
@@ -1618,6 +1626,8 @@ pub struct LocalItem {
     /// The parser's kind of the item node, as its number.
     pub syntax: u16,
     pub name: Option<NameIdx>,
+    /// Where it is, item-relative; empty for an associated item's entry, whose range is only
+    /// in the `row_ranges` side column (an edit of its body leaves the signature's rows equal).
     pub range: Range,
     /// The block it is declared in; `None` in a trait or impl.
     pub scope: Option<ScopeId>,

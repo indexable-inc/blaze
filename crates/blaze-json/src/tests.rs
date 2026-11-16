@@ -15,6 +15,36 @@ use crate::{
     read_in, to_string_in,
 };
 
+/// A plain struct for the typed shortcuts.
+struct Run<A: core::alloc::Allocator> {
+    suite: String<A>,
+    timeout: u32,
+    ids: Option<blaze_own::Vec<u64, A>>,
+}
+blaze_data::fields!(for<A> Run<A> { suite, timeout; ids });
+
+#[test]
+fn typed_shortcuts_read_strictly_and_write() {
+    use crate::{FromJsonError, from_slice, from_slice_in, to_string, to_string_pretty};
+
+    let run: Run<Global> = from_slice::<Run<Global>, Global>(br#"{"suite": "unit", "timeout": 30}"#).unwrap();
+    assert_eq!((run.suite.as_str(), run.timeout, run.ids.is_none()), ("unit", 30, true));
+    assert_eq!(to_string::<Run<Global>, Global>(&run).unwrap().as_str(), r#"{"suite":"unit","timeout":30}"#);
+    assert_eq!(
+        to_string_pretty::<Run<Global>, Global>(&run).unwrap().as_str(),
+        "{\n  \"suite\": \"unit\",\n  \"timeout\": 30\n}"
+    );
+
+    let unknown = from_slice::<Run<Global>, Global>(br#"{"suite": "u", "timeout": 1, "timout": 2}"#);
+    let Err(FromJsonError::Shape(error)) = unknown else { panic!("an unknown field is refused") };
+    assert!(error.to_string().contains("unknown field \"timout\""), "{error}");
+    let syntax = from_slice_in::<Run<Global>, Global>(b"{\"suite\": ", Limits::DEFAULT, Global);
+    assert!(matches!(syntax, Err(FromJsonError::Syntax(Error { at: 10, .. }))));
+    let kind = from_slice::<Run<Global>, Global>(br#"{"suite": "u", "timeout": "30"}"#);
+    let Err(FromJsonError::Shape(error)) = kind else { panic!("text is no integer") };
+    assert_eq!(error.to_string(), "timeout: expected integer, found text");
+}
+
 fn read(text: &str) -> Value<Global> {
     match read_in(text.as_bytes(), Limits::DEFAULT, Global) {
         Ok(value) => value,

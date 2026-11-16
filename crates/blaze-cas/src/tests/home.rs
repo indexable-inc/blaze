@@ -152,12 +152,11 @@ fn a_home_goes_by_its_records_forget_and_never_alone() {
     assert_eq!(store.problems(), &[] as &[String]);
 }
 
-/// The invariant (rule 26): a head of format 7, which lists no home, reads as it was written,
-/// every file it lists a `file-<content>` one; a head of format 8 lists homes and homes
-/// removed apart from the others, and round-trips them; a format-7 length that collides with
-/// the home bit is refused by name.
+/// The invariant: a head lists homes and homes removed apart from the other files, and
+/// round-trips them; a head of an older format (7, which had no homes) is refused by name
+/// (rule 26), never read as this one.
 #[test]
-fn a_head_of_format_7_reads_with_no_homes_and_one_of_format_8_round_trips_them() {
+fn a_head_round_trips_its_homes_and_one_of_format_7_is_refused() {
     let (a, b, c) = (content_of(b"a"), content_of(b"b"), content_of(b"c"));
     let mut head = Head {
         generation: 3,
@@ -173,14 +172,9 @@ fn a_head_of_format_7_reads_with_no_homes_and_one_of_format_8_round_trips_them()
     };
     let old = head.encode_as(7);
     assert_eq!(old[8..12], 7u32.to_le_bytes());
-    assert_eq!(Head::decode(&old).unwrap(), head, "a head of format 7 lists no home");
+    let why = Head::decode(&old).unwrap_err();
+    assert!(why.contains(&format!("store format 7, not {FORMAT}")), "{why}");
     head.externals.push(ExternalRef { content: c, len: 40 << 10, placed: true });
     head.externals.push(ExternalRef { content: content_of(b"d"), len: disk::EXTERNAL_REMOVED, placed: true });
-    assert_eq!(FORMAT, 8);
     assert_eq!(Head::decode(&head.encode()).unwrap(), head);
-    let mut collides = head.clone();
-    collides.externals.truncate(1);
-    collides.externals[0].len |= disk::EXTERNAL_PLACED;
-    let why = Head::decode(&collides.encode_as(7)).unwrap_err();
-    assert!(why.contains(&format!("{a:x}")), "{why}");
 }

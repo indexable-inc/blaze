@@ -111,6 +111,9 @@ impl<T: ?Sized> Address for &T {}
 impl<T: ?Sized> Address for &mut T {}
 /// A function's address: where this process loaded it.
 impl<F: FnPtr> Address for F {}
+// The one function pointer the walk asks for every function pointer (`own::raw::implements`
+// says why the blanket impl above is not enough under rustc).
+impl Address for fn() {}
 /// The target's width: a value written on one host is read on another.
 impl Address for usize {}
 /// The target's width, as `usize`.

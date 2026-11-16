@@ -676,7 +676,7 @@ impl PeriodScan {
             // file is its home ([`crate::home`]): that file is what its places clone, so a
             // copy in a pack would hold its bytes twice again. A pin stays as it is: every
             // scan reads it; so does a listing of an item set a scan follows ([`Kind::Set`]).
-            Form::Raw | Form::Lz4 | Form::Warm | Form::External
+            Form::Raw | Form::Warm | Form::External
                 if (loc.form != Form::External || !matches!(loc.kind, Kind::Machine | Kind::Output))
                     && !matches!(loc.kind, Kind::Pin | Kind::Set)
                     && self.periods >= 2
@@ -688,9 +688,13 @@ impl PeriodScan {
             {
                 self.demote.push((key, loc, found.at.row()));
             }
-            Form::Zstd | Form::Warm | Form::ColdColumns
-                if read && before && (!short || !loc.kind.cold()) =>
-            {
+            // A form a read decodes, read once in the period, comes back hot at its end: an
+            // edit-loop read pays a decode until then, not on every read while a second period
+            // proves it warm. Warm columns are read in place, so they wait for that second.
+            Form::Zstd | Form::ColdColumns if read && (!short || !loc.kind.cold()) => {
+                self.promote.push((key, loc, found.at.row()));
+            }
+            Form::Warm if read && before && (!short || !loc.kind.cold()) => {
                 self.promote.push((key, loc, found.at.row()));
             }
             _ => {}

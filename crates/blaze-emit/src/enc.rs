@@ -76,6 +76,7 @@ pub(crate) const fn movn(rd: Reg, imm16: u32, hw: u32) -> u32 {
 }
 
 /// `movz wd, #imm16`: the 32-bit form, which tests use as `mov w0, #n`.
+#[cfg_attr(not(test), expect(dead_code, reason = "a form pinned by the encoding tests, which the pass does not use yet"))]
 pub(crate) const fn movz_w(rd: Reg, imm16: u32) -> u32 {
     0x5280_0000 | (imm16 << 5) | rd
 }
@@ -118,6 +119,7 @@ pub(crate) const fn mvn(rd: Reg, rm: Reg) -> u32 {
 }
 
 /// `orr xd, xzr, xm`.
+#[cfg_attr(not(test), expect(dead_code, reason = "a form pinned by the encoding tests, which the pass does not use yet"))]
 pub(crate) const fn mov(rd: Reg, rm: Reg) -> u32 {
     orr(rd, ZR, rm)
 }
@@ -177,6 +179,7 @@ pub(crate) const fn asrv(rd: Reg, rn: Reg, rm: Reg) -> u32 {
     0x9ac0_2800 | (rm << 16) | (rn << 5) | rd
 }
 
+#[cfg_attr(not(test), expect(dead_code, reason = "a form pinned by the encoding tests, which the pass does not use yet"))]
 pub(crate) const fn rorv(rd: Reg, rn: Reg, rm: Reg) -> u32 {
     0x9ac0_2c00 | (rm << 16) | (rn << 5) | rd
 }
@@ -202,22 +205,28 @@ pub(crate) const fn zext(rd: Reg, rn: Reg, bits: u32) -> u32 {
     ubfm(rd, rn, 0, bits - 1)
 }
 
+/// The named extensions: the pass reaches them through [`sext`] and [`zext`] by width.
+#[cfg(test)]
 pub(crate) const fn sxtb(rd: Reg, rn: Reg) -> u32 {
     sext(rd, rn, 8)
 }
 
+#[cfg(test)]
 pub(crate) const fn sxth(rd: Reg, rn: Reg) -> u32 {
     sext(rd, rn, 16)
 }
 
+#[cfg(test)]
 pub(crate) const fn sxtw(rd: Reg, rn: Reg) -> u32 {
     sext(rd, rn, 32)
 }
 
+#[cfg(test)]
 pub(crate) const fn uxtb(rd: Reg, rn: Reg) -> u32 {
     zext(rd, rn, 8)
 }
 
+#[cfg(test)]
 pub(crate) const fn uxth(rd: Reg, rn: Reg) -> u32 {
     zext(rd, rn, 16)
 }
@@ -312,6 +321,7 @@ pub(crate) const fn cbnz(rt: Reg, words: i32) -> u32 {
     0xb500_0000 | (((words as u32) & 0x7_ffff) << 5) | rt
 }
 
+#[cfg_attr(not(test), expect(dead_code, reason = "a form pinned by the encoding tests, which the pass does not use yet"))]
 pub(crate) const fn br(rn: Reg) -> u32 {
     0xd61f_0000 | (rn << 5)
 }

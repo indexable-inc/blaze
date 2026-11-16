@@ -1,8 +1,10 @@
 //! Compression. Cold values: zstd with a dictionary per kind. Values of one kind (the debug
 //! info of compiled functions, the outputs of build-script runs) share most of their structure,
 //! which a dictionary trained on them takes out of each. Long cold values instead get zstd's
-//! long-distance matching over a wide window, on several threads. Chunks of hot outputs: LZ4,
-//! which decompresses at memory speed.
+//! long-distance matching over a wide window, on several threads. Nothing read on the edit
+//! loop is compressed: it is read in place (rule 51). What is: debug info from its put (read
+//! only on a panic or in a debugger), and any other value a settle found unread for two
+//! periods running, which goes back raw at the end of the first period that reads it.
 //!
 //! A value put or read is compressed or decompressed in its thread's zstd contexts, made once:
 //! a new context allocates and clears its tables at its first frame, which costs more than a
@@ -268,36 +270,6 @@ fn whole(bytes: Vec<u8>, raw: usize) -> Result<Vec<u8>, String> {
     Ok(bytes)
 }
 
-/// A chunk in LZ4, if that saves at least an eighth of it.
-pub(crate) fn lz4(raw: &[u8]) -> Option<Vec<u8>> {
-    let stored = lz4_flex::block::compress(raw);
-    (stored.len() + raw.len() / 8 <= raw.len()).then_some(stored)
-}
-
-/// [`lz4`] into `out`, a buffer the caller reuses: the same bytes, in `out` when it says so.
-pub(crate) fn lz4_into(raw: &[u8], out: &mut Vec<u8>) -> bool {
-    out.clear();
-    out.resize(lz4_flex::block::get_maximum_output_size(raw.len()), 0);
-    let len =
-        lz4_flex::block::compress_into(raw, out).expect("the most LZ4 can grow a block by fits");
-    out.truncate(len);
-    len + raw.len() / 8 <= raw.len()
-}
-
-pub(crate) fn unlz4(stored: &[u8], raw: u64) -> Result<Vec<u8>, String> {
-    // A block's densest byte, a match length's 255, is what an LZ4 block can grow by per byte;
-    // `raw` is unverified, and it is allocated before a byte is decoded.
-    if raw > (stored.len() as u64).saturating_mul(255).saturating_add(16) {
-        // alloc: the error's message
-        return Err(format!("{} bytes of LZ4 cannot decode to the {raw} recorded", stored.len()));
-    }
-    // alloc: the error's message
-    let raw = usize::try_from(raw).map_err(|_| "its length does not fit in memory".to_owned())?;
-    let bytes = lz4_flex::block::decompress(stored, raw)
-        // alloc: the error's message
-        .map_err(|error| format!("it does not decompress: {error}"))?;
-    whole(bytes, raw)
-}
 
 #[cfg(test)]
 mod tests {
@@ -385,10 +357,6 @@ mod tests {
             assert!(decompress(&dictionary, &stored, huge).is_err());
             assert!(decompress_long(&stored, huge).is_err());
         }
-        let stored = lz4(&sample(1).repeat(64)).unwrap();
-        let why = unlz4(&stored, huge).unwrap_err();
-        assert!(why.contains("cannot decode"), "{why}");
-        assert!(unlz4(&[0; 16], u64::MAX).is_err());
     }
 
     /// A long value whose repeats are further apart than zstd's default window reaches.
@@ -509,32 +477,6 @@ mod tests {
                 });
             }
         });
-    }
-
-    #[test]
-    fn lz4_keeps_only_what_it_shrinks_and_round_trips() {
-        let text = sample(1).repeat(64);
-        let stored = lz4(&text).unwrap();
-        assert_eq!(unlz4(&stored, text.len() as u64).unwrap(), text);
-        assert!(unlz4(&stored, text.len() as u64 + 1).is_err());
-        let mut rng = blaze_ids::rng::SplitMix64::new(6);
-        let noise: Vec<u8> = (0..64 << 10).map(|_| rng.next_u64() as u8).collect();
-        assert_eq!(lz4(&noise), None);
-    }
-
-    /// The on-disk bytes do not change with the buffer: into a reused one, each value is what
-    /// `lz4` makes, kept exactly when `lz4` keeps it.
-    #[test]
-    fn lz4_into_a_reused_buffer_makes_the_same_bytes() {
-        let mut rng = blaze_ids::rng::SplitMix64::new(7);
-        let noise: Vec<u8> = (0..64 << 10).map(|_| rng.next_u64() as u8).collect();
-        let mut out = vec![0xAA; 3];
-        for value in
-            [sample(1).repeat(64), noise, sample(2).repeat(3), Vec::new(), sample(3).repeat(500)]
-        {
-            let kept = lz4_into(&value, &mut out);
-            assert_eq!(lz4(&value), kept.then(|| out.clone()), "{} bytes", value.len());
-        }
     }
 
     /// What C zstd 1.5.7 (zstd-sys 2.1.2+zstd.1.5.7, the zstd every target used until wasm got

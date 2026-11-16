@@ -20,14 +20,14 @@ pub trait LangRecords {
 
     fn lang_items(&self, krate: CrateItemKey) -> Result<&[u8], Self::Error>;
 
-    fn note(&self, read: LangRead);
+    fn note(&self, read: LangRead<'_>);
 }
 
 /// A read of a lang item lookup: `krate` was asked for `name`, and answered `found`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct LangRead {
+pub struct LangRead<'t> {
     pub krate: CrateItemKey,
-    pub name: LangName,
+    pub name: LangName<'t>,
     pub found: Option<ItemKey>,
 }
 
@@ -40,16 +40,16 @@ pub struct LangItem {
 
 /// Why a lang item lookup stopped.
 #[derive(Clone, PartialEq, Eq, Debug)]
-pub enum LangError<E> {
+pub enum LangError<'t, E> {
     /// Two crates `from` loads define `name` (E0152): the first by index order, and the other.
-    Duplicate { name: LangName, first: LangItem, second: LangItem },
+    Duplicate { name: LangName<'t>, first: LangItem, second: LangItem },
     Records { krate: CrateItemKey, error: E },
     Format { krate: CrateItemKey, error: FormatError },
     /// The record read for `krate` is of `found`.
     WrongCrate { krate: CrateItemKey, found: CrateItemKey },
 }
 
-impl<E: fmt::Display> fmt::Display for LangError<E> {
+impl<E: fmt::Display> fmt::Display for LangError<'_, E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             LangError::Duplicate { name, first, second } => write!(
@@ -70,16 +70,16 @@ impl<E: fmt::Display> fmt::Display for LangError<E> {
     }
 }
 
-impl<E: fmt::Display + fmt::Debug> core::error::Error for LangError<E> {}
+impl<E: fmt::Display + fmt::Debug> core::error::Error for LangError<'_, E> {}
 
 /// The lang item `name` as `from` sees it: its one definition among the crates `from` loads,
 /// none when no crate defines it, [`LangError::Duplicate`] when two do.
-pub fn lang_item<C: LangRecords>(
+pub fn lang_item<'t, C: LangRecords>(
     graph: &CrateGraphView<'_>,
     from: CrateIndex,
-    name: LangName,
+    name: LangName<'t>,
     cx: &C,
-) -> Result<Option<LangItem>, LangError<C::Error>> {
+) -> Result<Option<LangItem>, LangError<'t, C::Error>> {
     let mut found: Option<LangItem> = None;
     for at in graph.closure(from) {
         if !graph.flags(at).contains(CrateFlags::LANG_ITEMS) {

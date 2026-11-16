@@ -99,15 +99,33 @@ impl<T> std::ops::DerefMut for OnGlobal<T> {
 }
 
 fn main() {
-    let dirs: Vec<PathBuf> = std::env::args_os().skip(1).map(PathBuf::from).collect();
-    if dirs.is_empty() {
-        eprintln!("usage: pipeline <crate dir>...  (each directory one crate)");
-        std::process::exit(2);
-    }
+    let usage = "usage: pipeline [--threads 1,8,18|all] [--repeat N] [--examples N] <crate dir>...  (each directory one crate; default: one thread, one run)";
     let most = std::thread::available_parallelism().map_or(1, |it| it.get());
-    let mut counts: Vec<usize> = [1usize, 2, 4, 8].into_iter().filter(|it| *it <= most).collect();
-    if !counts.contains(&most) {
-        counts.push(most);
+    let mut counts: Vec<usize> = vec![1];
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--threads" => {
+                let list = args.next().unwrap_or_default();
+                counts = if list == "all" {
+                    let mut c: Vec<usize> = [1usize, 2, 4, 8].into_iter().filter(|it| *it <= most).collect();
+                    if !c.contains(&most) {
+                        c.push(most);
+                    }
+                    c
+                } else {
+                    list.split(',').filter_map(|it| it.parse().ok()).collect()
+                };
+            }
+            "--repeat" => REPEAT.store(args.next().and_then(|it| it.parse().ok()).unwrap_or(1), Ordering::Relaxed),
+            "--examples" => EXAMPLES.store(args.next().and_then(|it| it.parse().ok()).unwrap_or(3), Ordering::Relaxed),
+            _ => dirs.push(PathBuf::from(arg)),
+        }
+    }
+    if dirs.is_empty() || counts.is_empty() {
+        eprintln!("{usage}");
+        std::process::exit(2);
     }
     for dir in &dirs {
         run_crate(dir, &counts);
@@ -128,7 +146,7 @@ impl Failures {
     fn add(&mut self, kind: impl Into<String>, example: impl FnOnce() -> String) {
         let entry = self.by.entry(kind.into()).or_default();
         entry.0 += 1;
-        if entry.1.len() < 3 {
+        if entry.1.len() < example_cap() {
             entry.1.push(example());
         }
     }
@@ -138,7 +156,7 @@ impl Failures {
             let entry = self.by.entry(kind).or_default();
             entry.0 += count;
             for example in examples {
-                if entry.1.len() < 3 {
+                if entry.1.len() < example_cap() {
                     entry.1.push(example);
                 }
             }
@@ -174,17 +192,114 @@ struct Loc {
     offset: u32,
 }
 
-/// Runs `f` three times; the best wall time in milliseconds and the last result.
+/// How many times each stage runs at each thread count (`--repeat`, default 1); the best
+/// wall time is printed.
+static REPEAT: AtomicUsize = AtomicUsize::new(1);
+/// Examples kept per failure kind (`--examples N`).
+static EXAMPLES: AtomicUsize = AtomicUsize::new(3);
+
+fn example_cap() -> usize { EXAMPLES.load(Ordering::Relaxed) }
+
+/// Runs `f` `REPEAT` times; the best wall time in milliseconds and the last result.
 fn best_of_3<T>(mut f: impl FnMut() -> T) -> (f64, T) {
     let mut best = f64::MAX;
     let mut last = None;
-    for _ in 0..3 {
+    for _ in 0..REPEAT.load(Ordering::Relaxed).max(1) {
+        // The last result is dropped before the next run starts, so a repeat's peak is its own.
+        drop(last.take());
         let start = Instant::now();
         let value = f();
         best = best.min(start.elapsed().as_secs_f64() * 1e3);
         last = Some(value);
     }
-    (best, last.expect("three runs"))
+    (best, last.expect("one run at least"))
+}
+
+// The counting allocator: the system heap with three counters, so a stage's bytes are its
+// own and not the process's (`getrusage`'s peak RSS counts every stage before it too).
+
+/// Bytes allocated and not yet freed.
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+/// The most `LIVE` has been since the last `Meter::start`.
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+/// Bytes ever allocated (a realloc counts its new size).
+static TOTAL: AtomicUsize = AtomicUsize::new(0);
+
+struct Counting;
+
+impl Counting {
+    fn up(size: usize) {
+        TOTAL.fetch_add(size, Ordering::Relaxed);
+        let live = LIVE.fetch_add(size, Ordering::Relaxed) + size;
+        PEAK.fetch_max(live, Ordering::Relaxed);
+    }
+}
+
+// SAFETY: every call is forwarded to `System` unchanged; the counters are only atomics.
+unsafe impl std::alloc::GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        // SAFETY: the caller's contract for `alloc`, passed on.
+        let p = unsafe { std::alloc::System.alloc(layout) };
+        if !p.is_null() {
+            Counting::up(layout.size());
+        }
+        p
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: std::alloc::Layout) -> *mut u8 {
+        // SAFETY: the caller's contract for `alloc_zeroed`, passed on.
+        let p = unsafe { std::alloc::System.alloc_zeroed(layout) };
+        if !p.is_null() {
+            Counting::up(layout.size());
+        }
+        p
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: std::alloc::Layout) {
+        LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+        // SAFETY: the caller's contract for `dealloc`, passed on.
+        unsafe { std::alloc::System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: std::alloc::Layout, new: usize) -> *mut u8 {
+        // SAFETY: the caller's contract for `realloc`, passed on.
+        let p = unsafe { std::alloc::System.realloc(ptr, layout, new) };
+        if !p.is_null() {
+            LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+            Counting::up(new);
+        }
+        p
+    }
+}
+
+#[global_allocator]
+static HEAP: Counting = Counting;
+
+/// One stage's memory: what it allocated, the most it held at once above what was live when
+/// it started, and what it left live.
+struct Meter {
+    total0: usize,
+    live0: usize,
+}
+
+impl Meter {
+    fn start() -> Meter {
+        let live0 = LIVE.load(Ordering::Relaxed);
+        PEAK.store(live0, Ordering::Relaxed);
+        Meter { total0: TOTAL.load(Ordering::Relaxed), live0 }
+    }
+
+    fn print(&self) {
+        let mb = |b: usize| b as f64 / 1e6;
+        let live = LIVE.load(Ordering::Relaxed);
+        println!(
+            "    memory: allocated {:.1} MB, peak live {:.1} MB above the {:.1} MB live at the start, left live {:+.1} MB",
+            mb(TOTAL.load(Ordering::Relaxed) - self.total0),
+            mb(PEAK.load(Ordering::Relaxed).saturating_sub(self.live0)),
+            mb(self.live0),
+            (live as f64 - self.live0 as f64) / 1e6
+        );
+    }
 }
 
 /// `f` over `0..n` on `threads` threads, each taking the next index from one counter; the
@@ -224,7 +339,8 @@ fn print_times(times: &[(usize, f64)]) {
     let one = times.first().map_or(1.0, |it| it.1);
     for &(threads, ms) in times {
         println!(
-            "    threads {threads:>3}: {ms:>9.1} ms best of 3   {:.2}x of one thread",
+            "    threads {threads:>3}: {ms:>9.1} ms best of {}   {:.2}x of the first count",
+            REPEAT.load(Ordering::Relaxed).max(1),
             one / ms
         );
     }
@@ -1844,6 +1960,23 @@ struct Run {
     fails: Mutex<Failures>,
     expanded: Mutex<BTreeMap<String, usize>>,
     expansion_bytes: AtomicUsize,
+    /// The rendered text of every expansion, kept once and freed with the run.
+    texts: Mutex<Vec<Box<str>>>,
+}
+
+impl Run {
+    /// Keeps `text` for the run and lends it as `&'static str`, the example's one name type.
+    fn keep(&self, text: String) -> &'static str {
+        let boxed = text.into_boxed_str();
+        // SAFETY: the box's heap bytes do not move when the box is moved into `texts`, and
+        // `texts` frees them only when the `Run` drops. Every name lent from them lives in
+        // the run's own tables or in the `Resolution` that owns the run, whose `done` field
+        // is declared (and dropped) before `run`; nothing reads a name after the
+        // `Resolution` is dropped.
+        let lent: &'static str = unsafe { &*std::ptr::from_ref::<str>(&boxed) };
+        self.texts.lock().expect("the texts' lock").push(boxed);
+        lent
+    }
 }
 
 impl Run {
@@ -2070,7 +2203,7 @@ fn expand_decls(base: &Base<'_>, run: &Run, request: ExpandRequest) -> Option<De
         run.fail(format!("macro diagnostic: {what}"), || format!("{at}: {}!", mac.name));
     }
     *run.expanded.lock().expect("the expanded counts' lock").entry(mac.name.to_string()).or_default() += 1;
-    let text = leak(render(&expansion.tokens));
+    let text = run.keep(render(&expansion.tokens));
     run.expansion_bytes.fetch_add(text.len(), Ordering::Relaxed);
     let made = outline(text, edition, g());
     if !made.errors().is_empty() {
@@ -2437,6 +2570,8 @@ struct Resolution {
     groups: usize,
     largest: Vec<ItemKey>,
     fails: Failures,
+    /// Per round: modules finished, import bindings in them, expansions made, wall ms.
+    per_round: Vec<(usize, usize, usize, f64)>,
 }
 
 fn resolve(base: &Base<'_>, threads: usize) -> Resolution {
@@ -2452,6 +2587,7 @@ fn resolve(base: &Base<'_>, threads: usize) -> Resolution {
     let mut failed: HashSet<ItemKey> = HashSet::new();
     let (mut rounds, mut steps, mut groups) = (0usize, 0usize, 0usize);
     let mut largest: Vec<ItemKey> = Vec::new();
+    let mut per_round = Vec::new();
     loop {
         let active: Vec<usize> = (0..slots.len())
             .filter(|&i| {
@@ -2465,6 +2601,8 @@ fn resolve(base: &Base<'_>, threads: usize) -> Resolution {
         }
         rounds += 1;
         let before = done.len() + failed.len();
+        let expansions_before = run.expansions.lock().expect("the expansions' lock").len();
+        let round_start = Instant::now();
         let results = {
             let facts = Facts { base, run: &run };
             let cx = DriveCx { base, run: &run, facts: &facts, done: &done, failed: &failed, module_slot: &module_slot };
@@ -2475,9 +2613,12 @@ fn resolve(base: &Base<'_>, threads: usize) -> Resolution {
                 drive(&mut slot, i, &cx)
             })
         };
+        let (mut finished, mut imported) = (0usize, 0usize);
         for r in results {
             steps += r.steps;
             for resolved in r.done {
+                finished += 1;
+                imported += resolved.scope.bindings.iter().filter(|b| b.binding.origin == blaze_surface::Origin::Import).count();
                 done.insert(resolved.scope.module, resolved);
             }
             for (module, why) in r.failed {
@@ -2487,6 +2628,8 @@ fn resolve(base: &Base<'_>, threads: usize) -> Resolution {
                 fails.add(format!("resolver refused: {kind}"), || format!("{path}: {why}"));
             }
         }
+        let expansions_now = run.expansions.lock().expect("the expansions' lock").len();
+        per_round.push((finished, imported, expansions_now - expansions_before, round_start.elapsed().as_secs_f64() * 1e3));
         if done.len() + failed.len() > before {
             continue;
         }
@@ -2570,7 +2713,7 @@ fn resolve(base: &Base<'_>, threads: usize) -> Resolution {
             break;
         }
     }
-    Resolution { done, run, rounds, steps, groups, largest, fails }
+    Resolution { done, run, rounds, steps, groups, largest, fails, per_round }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2954,8 +3097,10 @@ fn run_crate(dir: &std::path::Path, counts: &[usize]) {
     println!("\n  stage 1: outline every file to its FileItems record");
     let mut times = Vec::new();
     let mut stage1 = None;
+    let meter = Meter::start();
     for &threads in counts {
         let k = &k;
+        stage1 = None;
         let (ms, made) = best_of_3(|| {
             par_map(threads, k.files.len(), |i| {
                 let file = &k.files[i];
@@ -2968,6 +3113,7 @@ fn run_crate(dir: &std::path::Path, counts: &[usize]) {
         stage1 = Some(made);
     }
     print_times(&times);
+    meter.print();
     let mut fails = Failures::default();
     let (mut items, mut record_bytes) = (0usize, 0usize);
     let made = stage1.expect("one thread count at least");
@@ -3007,8 +3153,10 @@ fn run_crate(dir: &std::path::Path, counts: &[usize]) {
     println!("    forms handled: inline `mod x {{}}`, `x.rs`, `x/mod.rs`, `#[path]` on a file or an inline module (a true cfg_attr's too); a module written by a macro, `include!` of items and a missing file are counted, not walked");
     let mut times = Vec::new();
     let mut stage2 = None;
+    let meter = Meter::start();
     for &threads in counts {
         let k = &k;
+        stage2 = None;
         let (ms, made) = best_of_3(|| {
             let tree = walk(k);
             let low = lower_modules(k, &tree, threads);
@@ -3018,6 +3166,7 @@ fn run_crate(dir: &std::path::Path, counts: &[usize]) {
         stage2 = Some(made);
     }
     print_times(&times);
+    meter.print();
     let (mut tree, mut low) = stage2.expect("one thread count at least");
     let mut decl_bytes = 0usize;
     let mut records: Vec<std::vec::Vec<u8>> = Vec::with_capacity(tree.modules.len());
@@ -3121,13 +3270,16 @@ fn run_crate(dir: &std::path::Path, counts: &[usize]) {
     let mut times = Vec::new();
     let mut stage4 = None;
     let mut shapes = Vec::new();
+    let meter = Meter::start();
     for &threads in counts {
+        stage4 = None;
         let (ms, res) = best_of_3(|| resolve(&base, threads));
         times.push((threads, ms));
         shapes.push((res.rounds, res.groups, res.largest.len()));
         stage4 = Some(res);
     }
     print_times(&times);
+    meter.print();
     let res = stage4.expect("one thread count at least");
     let same = shapes.windows(2).all(|it| it[0] == it[1]);
     let mut scope_bytes = 0usize;
@@ -3161,7 +3313,7 @@ fn run_crate(dir: &std::path::Path, counts: &[usize]) {
                     let entry = unresolved.entry(format!("{why:?}")).or_default();
                     entry.0 += 1;
                     *entry.1.entry(seg.to_string()).or_default() += 1;
-                    if entry.2.len() < 3 {
+                    if entry.2.len() < example_cap() {
                         entry.2.push(format!("{at}: use {} (segment `{seg}`)", show_path(path)));
                     }
                 }
@@ -3210,6 +3362,10 @@ fn run_crate(dir: &std::path::Path, counts: &[usize]) {
         res.run.expansion_bytes.load(Ordering::Relaxed) as f64 / 1e6,
         scope_bytes as f64 / 1e6
     );
+    println!("    per round (last run): modules finished / import bindings in them / expansions made / ms");
+    for (i, (finished, imported, expanded, ms)) in res.per_round.iter().enumerate() {
+        println!("      round {:>3}: {finished:>5} / {imported:>6} / {expanded:>5} / {ms:>8.1}", i + 1);
+    }
     let mut top: Vec<(&String, &usize)> = expanded.iter().collect();
     top.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
     let top: Vec<String> = top.iter().take(10).map(|(name, n)| format!("{name}! {n}")).collect();

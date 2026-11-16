@@ -26,7 +26,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use blaze_data::Value;
 use blaze_manifest::error::ManifestError;
 use blaze_manifest::schema::PackageName;
-use blaze_toml::{Document, EditError, Item, Limits, Origin};
+use blaze_toml::{Document, EditError, Item, Limits, Origin, write_string};
 
 /// The edition `cargo new` writes when none is asked.
 const LATEST_STABLE: &str = "2024";
@@ -1126,13 +1126,6 @@ impl<'a> NewManifest<'a> {
 
 fn text_value(text: &str) -> Value<Global> {
     Value::Text(blaze_own::String::from_str_in(text, Global))
-}
-
-/// `text` as a TOML basic string.
-fn write_string(text: &str, out: &mut blaze_own::String<Global>) {
-    if blaze_toml::write_inline(&text_value(text), out).is_err() {
-        unreachable!("every string has a TOML form");
-    }
 }
 
 /// The text of `item` as `doc` writes it, for a message.

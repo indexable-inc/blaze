@@ -387,7 +387,7 @@ impl Runtime {
         let thread = self.tick();
         let clock = self.threads[thread].clock;
         // alloc: called only to report a race
-        self.cell_mut(obj).write(thread, &clock, at, &|| "an `UnsafeCell`".to_owned())
+        self.cell_mut(obj).write(thread, &clock, at, Bytes::Write, &|| "an `UnsafeCell`".to_owned())
     }
 
     /// A non-atomic access of the bytes `addr..addr + len` (`cell::read`, `write`, `free`),
@@ -433,7 +433,7 @@ impl Runtime {
             }
             match kind {
                 Bytes::Read => span.shadow.read(thread, &clock, at, &what)?,
-                Bytes::Write | Bytes::Free => span.shadow.write(thread, &clock, at, &what)?,
+                Bytes::Write | Bytes::Free => span.shadow.write(thread, &clock, at, kind, &what)?,
             }
         }
         match kind {
@@ -483,13 +483,17 @@ impl Cell {
         thread: Tid,
         clock: &Clock,
         at: At,
+        kind: Bytes,
         what: &impl Fn() -> String,
     ) -> Result<(), String> {
+        // A free is checked as a write, and named as what it is: one racing a read is a use
+        // after reclaim.
+        let access = if kind == Bytes::Free { "free" } else { "write" };
         if !self.write.before(clock) {
             // alloc: a finding's or an error's text, made once, when the model stops
             return Err(format!(
-                "data race on {}: a write at {at} by thread {thread} races with the write at {} by \
-                 thread {}",
+                "data race on {}: a {access} at {at} by thread {thread} races with the write at \
+                 {} by thread {}",
                 what(),
                 place(self.write_at),
                 self.write.thread
@@ -500,8 +504,8 @@ impl Cell {
                 clock.behind(&self.reads).expect("a read not before the clock has a thread");
             // alloc: a finding's or an error's text, made once, when the model stops
             return Err(format!(
-                "data race on {}: a write at {at} by thread {thread} races with the read at {} by \
-                 thread {other}",
+                "data race on {}: a {access} at {at} by thread {thread} races with the read at {} \
+                 by thread {other}",
                 what(),
                 place(self.reads_at[other])
             ));

@@ -8,7 +8,7 @@
 
 use std::fmt::Write as _;
 
-use blaze_file_items::{Outline, outline};
+use blaze_file_items::{Bodies, Outline, outline, outline_with};
 use blaze_own::Alloc;
 use blaze_format::Aligned;
 use blaze_surface::{
@@ -501,6 +501,70 @@ fn the_record_answers_what_the_outline_answers() {
         record_answers_as_outline(text).expect("the record of a fixture answers as its outline");
     }
     blaze_sim::check(Config::cases(200), |tape| record_answers_as_outline(&text(&file(tape), "", false).0));
+}
+
+/// Whether the outline that skips bodies equals the one that parses them, apart from the
+/// syntax errors the parse of a skipped body finds, which are not the skipping outline's.
+fn skipping_equals_parsing(what: &str, text: &str) -> Result<(), String> {
+    let skipped = outline_with(text, Edition::E2024, Bodies::Skipped, Alloc::global());
+    let parsed = outline_with(text, Edition::E2024, Bodies::Parsed, Alloc::global());
+    let first = |ours: &[Item], theirs: &[Item]| ours.iter().zip(theirs).position(|(a, b)| a != b);
+    if skipped.items() != parsed.items() {
+        let at = first(skipped.items(), parsed.items());
+        return Err(format!(
+            "{what}: skipping bodies gives other entries than parsing them: {} against {}, first at {at:?}: {:?} against {:?}",
+            skipped.items().len(),
+            parsed.items().len(),
+            at.and_then(|at| skipped.items().get(at)),
+            at.and_then(|at| parsed.items().get(at)),
+        ));
+    }
+    let attrs = |o: &Outline<'_>| o.items().iter().map(|item| o.attrs(item).to_vec()).collect::<Vec<_>>();
+    if attrs(&skipped) != attrs(&parsed) || skipped.file_attrs() != parsed.file_attrs() {
+        return Err(format!("{what}: skipping bodies gives other attributes than parsing them"));
+    }
+    if parsed.errors().is_empty() && skipped != parsed {
+        return Err(format!("{what}: with no syntax errors, the outlines still differ: {skipped:?} against {parsed:?}"));
+    }
+    // An error by where it is, whose and what it says: its message's place in the messages
+    // moves when an earlier error is not the skipping outline's.
+    let said = |o: &Outline<'_>| {
+        o.errors().iter().map(|error| (error.range, error.origin, o.message(error).to_owned())).collect::<Vec<_>>()
+    };
+    let theirs = said(&parsed);
+    if !said(&skipped).iter().all(|error| theirs.contains(error)) {
+        return Err(format!("{what}: skipping bodies finds an error parsing them does not: {:?}", skipped.errors()));
+    }
+    Ok(())
+}
+
+/// The refinement: skipping `fn` bodies changes no entry, attribute or hash, on the fixtures,
+/// drawn files, and every file of library/core.
+#[test]
+fn skipping_bodies_outlines_as_parsing_them() {
+    for (what, text) in [("FORMS", FORMS), ("BROKEN", BROKEN)] {
+        skipping_equals_parsing(what, text).unwrap_or_else(|why| panic!("{why}"));
+    }
+    blaze_sim::check(Config::cases(200), |tape| {
+        let (text, _) = text(&file(tape), "", false);
+        skipping_equals_parsing("a drawn file", &text).map_err(Broke::Oracle)
+    });
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../library/core");
+    let mut stack = vec![root.clone()];
+    let mut files = 0usize;
+    while let Some(dir) = stack.pop() {
+        for entry in std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())).flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.extension().is_some_and(|it| it == "rs") {
+                let Ok(text) = std::fs::read_to_string(&path) else { continue };
+                skipping_equals_parsing(&path.display().to_string(), &text).unwrap_or_else(|why| panic!("{why}"));
+                files += 1;
+            }
+        }
+    }
+    assert!(files > 250,"library/core under {} holds only {files} .rs files", root.display());
 }
 
 /// The invariant: editing one function's body changes that entry's whole hash and no other

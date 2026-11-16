@@ -114,6 +114,13 @@ impl<T> ArrayQueue<T> {
                 if head.wrapping_add(self.one_lap) == tail {
                     return Err(value);
                 }
+                // A pop has taken the head and not yet freed the slot: wait for a change
+                // before looking again, as a retry at once would spin with no back-off.
+                SpinWait::until("a slot of an ArrayQueue a pop is freeing", || {
+                    slot.stamp.load(Ordering::Acquire) != stamp
+                        || self.tail.load(Ordering::Relaxed) != tail
+                        || self.head.load(Ordering::Relaxed) != head
+                });
                 tail = self.tail.load(Ordering::Relaxed);
             } else {
                 // Another push or pop is mid-way through the slot.
@@ -162,6 +169,13 @@ impl<T> ArrayQueue<T> {
                 if tail == head {
                     return None;
                 }
+                // A push has taken the tail and not yet filled the slot: wait for a change
+                // before looking again, as a retry at once would spin with no back-off.
+                SpinWait::until("a slot of an ArrayQueue a push is filling", || {
+                    slot.stamp.load(Ordering::Acquire) != stamp
+                        || self.head.load(Ordering::Relaxed) != head
+                        || self.tail.load(Ordering::Relaxed) != tail
+                });
                 head = self.head.load(Ordering::Relaxed);
             } else {
                 SpinWait::until("a slot of an ArrayQueue another thread is writing", || {
@@ -191,6 +205,7 @@ impl<T> ArrayQueue<T> {
 
     /// The values in the ring at one moment: a tail read twice the same around a head.
     pub fn len(&self) -> usize {
+        let mut spin = SpinWait::new();
         loop {
             let tail = self.tail.load(Ordering::SeqCst);
             let head = self.head.load(Ordering::SeqCst);
@@ -207,6 +222,8 @@ impl<T> ArrayQueue<T> {
                     self.cap
                 };
             }
+            // The tail moved between the two looks: back off before the next.
+            spin.relax();
         }
     }
 }

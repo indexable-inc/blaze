@@ -17,6 +17,42 @@ use crate::{
     plant::{self, Plant},
 };
 
+#[cfg(feature = "std")]
+#[test]
+fn std_types_are_read_and_written_strictly() {
+    use std::{ffi::OsStr, os::unix::ffi::OsStrExt, path::PathBuf};
+
+    let read = |value: &Value<Global>| Cursor::root(value, Global).get::<StdVec<StdString>>();
+    let names: StdVec<StdString> = StdVec::from(["a".to_string(), "b".to_string()]);
+    let value = names.to_value(Global);
+    assert_eq!(value, value!(in Global; ["a", "b"]));
+    assert_eq!(read(&value).unwrap(), names);
+    let error = read(&value!(in Global; ["a", 1])).unwrap_err();
+    assert_eq!(error.to_string(), "[1]: expected text, found integer");
+
+    let path = PathBuf::from("/tmp/x y");
+    let value = path.to_value(Global);
+    assert_eq!(value.as_str(), Some("/tmp/x y"));
+    assert_eq!(Cursor::root(&value, Global).get::<PathBuf>().unwrap(), path);
+    let raw = PathBuf::from(OsStr::from_bytes(b"/tmp/\xff"));
+    let value = raw.to_value(Global);
+    assert_eq!(value.as_bytes(), Some(&b"/tmp/\xff"[..]));
+    assert_eq!(Cursor::root(&value, Global).get::<PathBuf>().unwrap(), raw);
+    assert!(matches!(
+        Cursor::root(&value!(in Global; 1), Global).get::<PathBuf>().unwrap_err().shape,
+        Shape::Expected { expected: Kind::Text, found: Kind::Int }
+    ));
+}
+
+#[test]
+fn invalid_names_the_type_and_the_reason() {
+    let value = value!(in Global; {"v": "x"});
+    let root = Cursor::root(&value, Global);
+    let error = root.field("v").unwrap().invalid("version", &"no digits at byte 0");
+    assert_eq!(error.shape, Shape::Invalid { ty: "version" });
+    assert_eq!(error.to_string(), "v: not a version: no digits at byte 0");
+}
+
 fn text(s: &str) -> String<Global> {
     String::from_str_in(s, Global)
 }

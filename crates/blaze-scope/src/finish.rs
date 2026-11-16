@@ -96,8 +96,12 @@ impl<'a, N: Name> Resolver<'a, N> {
                     // only through a glob whose source answered `Undetermined`: that glob is
                     // an unresolved import of the scope.
                     Some((m, at, g)) if m == self.module => undetermined.push((at, g)),
-                    Some(_) | None => {
-                        return Err(ResolveError::NoProgressBound { module: self.module, passes: 0 });
+                    other => {
+                        return Err(ResolveError::Undecided {
+                            module: self.module,
+                            glob_of: other.map(|(m, _, _)| m),
+                            unexpanded: self.unexpanded,
+                        });
                     }
                 },
             }

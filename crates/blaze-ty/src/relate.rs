@@ -305,7 +305,7 @@ impl<'a> TyCx<'a> {
         let (ka, kb) = (self.tys.ct_kind_of(a), self.tys.ct_kind_of(b));
         match (ka, kb) {
             (ct::VAR, ct::VAR) => {
-                let (va, vb) = (self.tys.ct.a[ix(a.0)], self.tys.ct.a[ix(b.0)]);
+                let (va, vb) = (self.tys.ct.a(ix(a.0)), self.tys.ct.a(ix(b.0)));
                 self.vars.union(Table::Const, va, vb);
                 self.bound = true;
                 return Ok(());
@@ -321,7 +321,7 @@ impl<'a> TyCx<'a> {
                 return Ok(());
             }
             (ct::VAR, _) => {
-                let va = self.tys.ct.a[ix(a.0)];
+                let va = self.tys.ct.a(ix(a.0));
                 let g = self.generalize(Table::Const, va, b.node(), Variance::Invariant, aliases, vo)?;
                 self.vars.bind(Table::Const, va, g.index());
                 self.bound = true;
@@ -329,7 +329,7 @@ impl<'a> TyCx<'a> {
                 return Ok(());
             }
             (_, ct::VAR) => {
-                let vb = self.tys.ct.a[ix(b.0)];
+                let vb = self.tys.ct.a(ix(b.0));
                 let g = self.generalize(Table::Const, vb, a.node(), Variance::Invariant, aliases, vo)?;
                 self.vars.bind(Table::Const, vb, g.index());
                 self.bound = true;
@@ -350,7 +350,7 @@ impl<'a> TyCx<'a> {
 
     #[inline]
     fn var_of(&self, t: Ty) -> u32 {
-        self.tys.ty.a[ix(t.0)]
+        self.tys.ty.a(ix(t.0))
     }
 
     /// The generalization of `term` for the variable `var` of `table` related to it with
@@ -418,6 +418,11 @@ impl Generalize {
 
 impl Hook for Generalize {
     type Error = TypeError;
+
+    #[inline(always)]
+    fn skip(&self, f: Flags, _: u32) -> bool {
+        !f.has(Flags::INFER | Flags::PLACEHOLDER | Flags::FREE_REGIONS | Flags::NEEDS_NORMALIZE)
+    }
 
     fn pre(&mut self, tys: &mut Tys<'_>, vars: &mut Vars<'_>, n: Node, _depth: u32, ctx: u8) -> Result<Step, TypeError> {
         let f = tys.node_flags(n);

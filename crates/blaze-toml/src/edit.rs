@@ -257,49 +257,47 @@ impl<'d, 't, A: Allocator, B: Allocator + Clone> Edit<'d, 't, A, B> {
     }
 
     /// `item` and everything under it gone, every other byte kept:
-    /// - a key/value in a table with a header (or the root): its whole line, with a comment
-    ///   after the value;
+    /// - a key/value outside inline tables: its whole line, with a comment after the value;
     /// - a key/value in an inline table: the entry and one comma beside it (`{}` when it was
     ///   the only one);
-    /// - a table with a header, an array of tables or an element of one, or a table named only
-    ///   on the way to headers (`a` of `[a.b]`): the section of every header at or under it,
-    ///   from the header's line to the end of its last entry's line.
+    /// - a table made by headers or by dotted keys, an array of tables or an element of one:
+    ///   the section of every header at or under it (from the header's line through its last
+    ///   entry's line) and the line of every key/value under it outside those sections.
     ///
-    /// Refused: the root, an array's element, and a key whose table was made by dotted keys
-    /// (`b` of `a.b = 1`), which has no line of its own.
+    /// A table made by dotted keys has no text but its keys: removing `b` of `a.b = 1`, the
+    /// only key under `a`, removes `a` too. A table with a header stays, empty.
+    ///
+    /// Refused: the root, an array's element, and a table made by dotted keys inside an inline
+    /// table, or a key under one (`x.y` of `{ x.y = 1 }`), whose entries need not be together.
     pub fn remove(&mut self, item: Item<'_, '_, A>) -> Result<(), EditError<B>> {
         self.mine(&item)?;
         let at = item.span().start;
         let Some(parent) = item.parent() else {
             return Err(EditError { at, what: EditWhat::NotEditable { origin: item.origin() } });
         };
-        match item.origin() {
-            Origin::Header | Origin::Implicit => {
-                self.remove_sections(item);
-                Ok(())
+        let mut enclosing = parent;
+        while enclosing.kind() == Kind::Table && enclosing.origin() == Origin::Dotted {
+            match enclosing.parent() {
+                Some(up) => enclosing = up,
+                None => break,
             }
-            Origin::Dotted => Err(EditError { at, what: EditWhat::NotEditable { origin: Origin::Dotted } }),
-            Origin::Value | Origin::Inline => match (parent.kind(), parent.origin()) {
-                (Kind::Table, Origin::Inline) => {
+        }
+        match (parent.kind(), enclosing.origin()) {
+            // An array's element: arrays written `[ ]` are closed, and an element of an array
+            // of tables is a table with a header (`Origin::Header` on the array).
+            (Kind::Array, Origin::Value) => Err(EditError { at, what: EditWhat::NotEditable { origin: Origin::Value } }),
+            (_, Origin::Inline) => match parent.origin() == Origin::Inline && item.origin() != Origin::Dotted {
+                true => {
                     self.remove_inline_entry(item, parent);
                     Ok(())
                 }
-                (Kind::Table, Origin::Header) => {
-                    self.remove_line(item);
-                    Ok(())
-                }
-                (_, origin) => Err(EditError { at, what: EditWhat::NotEditable { origin } }),
+                false => Err(EditError { at, what: EditWhat::NotEditable { origin: Origin::Dotted } }),
             },
+            _ => {
+                self.remove_lines(item);
+                Ok(())
+            }
         }
-    }
-
-    /// The line of a key/value in a header's section, through its newline.
-    fn remove_line(&mut self, item: Item<'_, '_, A>) {
-        let bytes = self.doc.text().as_bytes();
-        // A key/value starts its line (TOML puts each on its own), after blanks.
-        let start = line_start(bytes, item.key_span().start);
-        let end = line_end(bytes, item.span().end);
-        self.splice(start, end, String::new_in(self.alloc.clone()));
     }
 
     /// An inline table's entry and a comma beside it.
@@ -328,23 +326,32 @@ impl<'d, 't, A: Allocator, B: Allocator + Clone> Edit<'d, 't, A, B> {
         }
     }
 
-    /// The section of every header table at or under `item`, walked by the node columns.
-    fn remove_sections(&mut self, item: Item<'_, '_, A>) {
+    /// The section of every header table at or under `item` and the line of every key/value
+    /// at or under it, walked by the node columns without recursion; a line inside a removed
+    /// section goes with the section.
+    fn remove_lines(&mut self, item: Item<'_, '_, A>) {
         let nodes = &self.doc.nodes;
         let bytes = self.doc.text().as_bytes();
         let top = item.id;
         let mut at = top;
-        let mut sections = Vec::new_in(self.alloc.clone());
+        let mut ranges = Vec::new_in(self.alloc.clone());
         loop {
             let i = widen(at);
             let (kind, origin) = (nodes.kinds()[i], nodes.origins()[i]);
-            if kind == Kind::Table && origin == Origin::Header {
-                let start = line_start(bytes, nodes.spans()[i].range().start);
-                let end = widen(low(nodes.payloads()[i]));
-                sections.push((start, end));
+            let span = nodes.spans()[i].range();
+            match origin {
+                Origin::Header if kind == Kind::Table => {
+                    ranges.push((line_start(bytes, span.start), widen(low(nodes.payloads()[i]))));
+                }
+                // A key/value starts its line (TOML puts each on its own line), after blanks;
+                // its key's first part is where the line's text starts.
+                Origin::Value | Origin::Inline => {
+                    ranges.push((line_start(bytes, nodes.key_spans()[i].range().start), line_end(bytes, span.end)));
+                }
+                Origin::Header | Origin::Implicit | Origin::Dotted => {}
             }
-            // Headers sit under tables and arrays of tables made by headers or keys, never
-            // under a value or an inline table.
+            // Headers and key/values sit under tables and arrays of tables made by headers or
+            // keys, never under a value or an inline table.
             let into = matches!(kind, Kind::Table | Kind::Array) && !matches!(origin, Origin::Value | Origin::Inline);
             let first = nodes.first_children()[i];
             if into && first != NONE {
@@ -353,8 +360,15 @@ impl<'d, 't, A: Allocator, B: Allocator + Clone> Edit<'d, 't, A, B> {
             }
             loop {
                 if at == top {
-                    for (start, end) in sections.iter() {
+                    ranges.sort_unstable();
+                    let mut done = 0;
+                    for (start, end) in ranges.iter() {
+                        if *start < done {
+                            // Inside a section already removed.
+                            continue;
+                        }
                         self.splice(*start, *end, String::new_in(self.alloc.clone()));
+                        done = *end;
                     }
                     return;
                 }

@@ -12,9 +12,9 @@ use blaze_sim::{Broke, Config, Tape};
 
 use crate::{
     Datetime, Document, DocumentOptions, Edit, EditWhat, Error, Expected, Kind, Limits, MOST_KEY_PARTS, Origin,
-    Unwritable, What,
+    StringForm, Unwritable, What,
     plant::{self, Plant},
-    write_document, write_inline,
+    write_document, write_dotted_key, write_inline, write_string, write_string_in_form,
 };
 
 fn parse(text: &str) -> Document<'_, Global> {
@@ -373,6 +373,100 @@ fn set_keeps_every_other_byte() {
 }
 
 #[test]
+fn strings_and_keys_are_spelled_as_cargo_spells_them() {
+    let spelled = |text: &str| {
+        let mut out = String::new_in(Global);
+        write_string(text, &mut out);
+        let line = format!("k = {}", out.as_str());
+        assert_eq!(lower(&line), value!(in Global; {"k": text}), "{line:?}");
+        out.as_str().to_string()
+    };
+    assert_eq!(spelled("plain"), "\"plain\"");
+    assert_eq!(spelled("a\"b"), "'a\"b'");
+    assert_eq!(spelled("C:\\x"), "'C:\\x'");
+    assert_eq!(spelled("it's \"x\""), "\"\"\"it's \"x\"\"\"\"");
+    assert_eq!(spelled("one\ntwo"), "\"\"\"\none\ntwo\"\"\"");
+    assert_eq!(spelled("a\\b\nc"), "'''\na\\b\nc'''");
+    assert_eq!(spelled("a\u{1}\t"), "\"a\\u0001\\t\"");
+    assert_eq!(spelled("'''\"\"\"\n"), "\"\"\"\n'''\"\"\\\"\n\"\"\"");
+    assert_eq!(spelled("\"\"\"'''\\"), "\"\\\"\\\"\\\"'''\\\\\"");
+    assert_eq!(StringForm::of("a'b"), StringForm::Basic);
+    let mut out = String::new_in(Global);
+    assert_eq!(write_string_in_form("a'b", StringForm::Literal, &mut out), Err(StringForm::Literal));
+    assert!(out.is_empty());
+    write_string_in_form("a\nb", StringForm::MultiLineLiteral, &mut out).unwrap();
+    assert_eq!(out.as_str(), "'''\na\nb'''");
+
+    let key = |parts: &[&str]| {
+        let mut out = String::new_in(Global);
+        write_dotted_key(parts, &mut out);
+        let line = format!("{} = 1", out.as_str());
+        let mut v = lower(&line);
+        for part in parts {
+            v = v.as_map().unwrap().get(part).unwrap().clone();
+        }
+        assert_eq!(v, value!(in Global; 1), "{line:?}");
+        out.as_str().to_string()
+    };
+    assert_eq!(key(&["a-b_1"]), "a-b_1");
+    assert_eq!(key(&["a b"]), "\"a b\"");
+    assert_eq!(key(&["a\"b"]), "'a\"b'");
+    assert_eq!(key(&["a\"'b"]), "\"a\\\"'b\"");
+    assert_eq!(key(&["a\tb"]), "\"a\\tb\"");
+    assert_eq!(key(&["target", "cfg(unix)", "x.y"]), "target.\"cfg(unix)\".\"x.y\"");
+}
+
+#[test]
+fn remove_takes_its_own_bytes_and_keeps_every_other() {
+    let removed = |text: &str, path: &[&str]| {
+        edited(text, |doc, e| {
+            let mut item = doc.root();
+            for step in path {
+                item = match step.parse::<usize>() {
+                    Ok(index) => item.at(index).unwrap(),
+                    Err(_) => item.get(step).unwrap(),
+                };
+            }
+            e.remove(item).unwrap();
+        })
+    };
+    let text = "# top\nname = \"x\" # the name\nedition = \"2024\"\n\n# deps\n[dependencies]\nserde = { version = \"1\", features = [\"derive\"] }\nlibc = \"0.2\"\n\n[dependencies.tokio]\nversion = \"1\"\n\n[dev-dependencies]\nx = 1\n";
+    assert_eq!(
+        removed(text, &["name"]),
+        "# top\nedition = \"2024\"\n\n# deps\n[dependencies]\nserde = { version = \"1\", features = [\"derive\"] }\nlibc = \"0.2\"\n\n[dependencies.tokio]\nversion = \"1\"\n\n[dev-dependencies]\nx = 1\n"
+    );
+    assert_eq!(
+        removed(text, &["dependencies"]),
+        "# top\nname = \"x\" # the name\nedition = \"2024\"\n\n# deps\n\n\n[dev-dependencies]\nx = 1\n"
+    );
+    assert_eq!(
+        removed(text, &["dependencies", "tokio"]),
+        "# top\nname = \"x\" # the name\nedition = \"2024\"\n\n# deps\n[dependencies]\nserde = { version = \"1\", features = [\"derive\"] }\nlibc = \"0.2\"\n\n\n[dev-dependencies]\nx = 1\n"
+    );
+    let inline = "a = { x = 1, y = 2, z = 3 }\n";
+    assert_eq!(removed(inline, &["a", "x"]), "a = { y = 2, z = 3 }\n");
+    assert_eq!(removed(inline, &["a", "y"]), "a = { x = 1, z = 3 }\n");
+    assert_eq!(removed(inline, &["a", "z"]), "a = { x = 1, y = 2 }\n");
+    assert_eq!(removed("a = { x = 1 }\n", &["a", "x"]), "a = {}\n");
+    assert_eq!(removed("a.b = 1\na.c = 2\nd = 3\n", &["a", "b"]), "a.c = 2\nd = 3\n");
+    assert_eq!(removed("a.b = 1\nd = 3\na.c = 2\n", &["a"]), "d = 3\n");
+    assert_eq!(removed("[a.b]\nx = 1\n[c]\n[a.d]\ny = 2\n", &["a"]), "[c]\n");
+    let bins = "[[bin]]\nname = \"a\"\n[[bin]]\nname = \"b\"\n[lib]\n";
+    assert_eq!(removed(bins, &["bin", "1"]), "[[bin]]\nname = \"a\"\n[lib]\n");
+    assert_eq!(removed(bins, &["bin"]), "[lib]\n");
+
+    let doc = parse("x = [1, 2]\ny = { a.b = 1 }\n");
+    let mut e = Edit::new_in(&doc, Global);
+    let what = |r: Result<(), crate::EditError<Global>>| r.unwrap_err().what;
+    let root = doc.root();
+    assert!(matches!(what(e.remove(root)), EditWhat::NotEditable { origin: Origin::Header }));
+    assert!(matches!(what(e.remove(root.get("x").unwrap().at(0).unwrap())), EditWhat::NotEditable { origin: Origin::Value }));
+    let a = root.get("y").unwrap().get("a").unwrap();
+    assert!(matches!(what(e.remove(a)), EditWhat::NotEditable { origin: Origin::Dotted }));
+    assert!(matches!(what(e.remove(a.get("b").unwrap())), EditWhat::NotEditable { origin: Origin::Dotted }));
+}
+
+#[test]
 fn edits_with_no_one_place_are_refused() {
     let text = "a.b = 1\n[c.d]\n[[e]]\nf = [1]\n";
     let doc = parse(text);
@@ -480,6 +574,24 @@ fn round_trip(tape: &Tape) -> Result<(), Broke> {
     let back = doc.to_value_in(Global);
     if back != v {
         return Err(Broke::Oracle(format!("the round trip of {v:?} through {text:?} gave {back:?}")));
+    }
+    // Removing a root key takes its bytes alone and reads back as the map without it.
+    if !map.is_empty() {
+        let (gone, _) = map.entry_at(tape.int_in(0usize..=map.len() - 1, "removed")).unwrap();
+        let mut edit = Edit::new_in(&doc, Global);
+        edit.remove(doc.root().get(gone).unwrap()).map_err(harness)?;
+        let out = edit.finish().map_err(harness)?;
+        let out = out.as_str();
+        let mut expected = map.clone();
+        expected.remove(gone);
+        match Document::parse_in(out, Limits::CARGO, Global) {
+            Ok(doc) if doc.to_value_in(Global) == Value::Map(expected) => {}
+            Ok(doc) => {
+                let got = doc.to_value_in(Global);
+                return Err(Broke::Oracle(format!("removing {gone:?} from {text:?} gave {out:?}, read as {got:?}")));
+            }
+            Err(e) => return Err(Broke::Oracle(format!("removing {gone:?} from {text:?} gave {out:?}: {}", e.display(out)))),
+        }
     }
     let key = format!("new{}", tape.text_from("xy", 0..=2, "new key"));
     if map.contains_key(&key) {

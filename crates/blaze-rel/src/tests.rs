@@ -125,9 +125,10 @@ fn project_nulls_and_division() {
 
 #[test]
 fn aggregates_skip_nulls() {
-    let (t, _) = fixture();
+    let (t, u) = fixture();
     let mut c = Catalog::new_in(Global);
     c.add("t", &t);
+    c.add("u", &u);
     expect(
         &c,
         "select count(*) as n, count(a) as m, sum(a) as s, min(a) as lo, max(a) as hi, avg(a) as mean from t",
@@ -143,6 +144,18 @@ fn aggregates_skip_nulls() {
         "select g, count(*) as n, sum(a) as s from t group by g order by g",
         &[r#"{"g":"p","n":2,"s":1}"#, r#"{"g":null,"n":1,"s":3}"#],
     );
+    // A key named by its alias is that select item, a scalar subquery in it and all.
+    expect(
+        &c,
+        "select coalesce(a, (select max(k) from u)) as m, count(*) as n from t group by m order by m",
+        &[r#"{"m":1,"n":1}"#, r#"{"m":3,"n":1}"#, r#"{"m":5,"n":1}"#],
+    );
+    // A relation's repeated name is its first column, as DuckDB renames the later `job_1`.
+    expect(&c, "select job from (select a as job, g as job from t) order by job", &[
+        r#"{"job":1}"#,
+        r#"{"job":3}"#,
+        r#"{"job":null}"#,
+    ]);
     expect(&c, "select g, count(*) as n from t group by all having count(a) > 0 order by n desc", &[
         r#"{"g":"p","n":2}"#,
         r#"{"g":null,"n":1}"#,

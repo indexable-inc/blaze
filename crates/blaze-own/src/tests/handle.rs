@@ -6,10 +6,10 @@
 
 use std::{format, string::String, vec::Vec as StdVec};
 
-use blaze_sim::{Broke, Config, Tape};
+use blaze_sim::{Broke, Tape};
 
 use super::{
-    Counting, Why, boxed_values, btree_case_in, deque_case_in, soa_case_in, sorted_case_in, step, under_every_failure,
+    Counting, Why, boxed_values, btree_case_in, cases, deque_case_in, soa_case_in, sorted_case_in, step, under_every_failure,
     vec_case_in, words,
 };
 use crate::{
@@ -29,33 +29,34 @@ fn through(case: impl FnOnce(&Counting, Alloc<'_>) -> Result<(), Broke>) -> Resu
 
 #[test]
 fn vec_matches_std_through_a_handle() {
-    blaze_sim::check(Config::cases(300), |tape: &Tape| through(|_, alloc| vec_case_in(tape, alloc)));
+    blaze_sim::check(cases(300), |tape: &Tape| through(|_, alloc| vec_case_in(tape, alloc)));
 }
 
 #[test]
 fn deque_matches_std_through_a_handle() {
-    blaze_sim::check(Config::cases(300), |tape: &Tape| through(|_, alloc| deque_case_in(tape, alloc)));
+    blaze_sim::check(cases(300), |tape: &Tape| through(|_, alloc| deque_case_in(tape, alloc)));
 }
 
 #[test]
 fn sorted_map_and_set_match_std_through_a_handle() {
-    blaze_sim::check(Config::cases(300), |tape: &Tape| through(|_, alloc| sorted_case_in(tape, alloc)));
+    blaze_sim::check(cases(300), |tape: &Tape| through(|_, alloc| sorted_case_in(tape, alloc)));
 }
 
 #[test]
 fn soa_matches_a_vec_of_rows_through_a_handle() {
-    blaze_sim::check(Config::cases(300), |tape: &Tape| through(|counted, alloc| soa_case_in(tape, counted, alloc)));
+    blaze_sim::check(cases(300), |tape: &Tape| through(|counted, alloc| soa_case_in(tape, counted, alloc)));
 }
 
 #[test]
 fn btree_matches_std_through_a_handle() {
-    blaze_sim::check(Config::cases(300), |tape: &Tape| through(|_, alloc| btree_case_in(tape, alloc)));
+    blaze_sim::check(cases(300), |tape: &Tape| through(|_, alloc| btree_case_in(tape, alloc)));
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "a planted bug: tests the oracle, not unsafe code, and leaks on purpose; its clean half is `vec_matches_std_through_a_handle`")]
 fn the_oracle_catches_a_handle_whose_grow_allocates() {
     let run = |tape: &Tape, p: Plant| plant::with(p, || through(|_, alloc| vec_case_in(tape, alloc)));
-    blaze_sim::control(Config::cases(300), Plant::Clean, Plant::HandleGrowAllocates, "differs from the model", run);
+    blaze_sim::control(cases(300), Plant::Clean, Plant::HandleGrowAllocates, "differs from the model", run);
 }
 
 #[test]

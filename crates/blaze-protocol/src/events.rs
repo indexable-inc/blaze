@@ -5,11 +5,11 @@
 //!
 //! Times are nanoseconds since the build began and counts are integers: no floats.
 
-use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::alloc::Global;
 use std::fmt::{self, Write as _};
 use std::path::PathBuf;
 
+use blaze_kit::Heap4;
 use serde::{Deserialize, Serialize};
 
 /// One thing a build said, `at_ns` after it began.
@@ -148,14 +148,28 @@ impl std::error::Error for Malformed {}
 
 /// What reads [`Event::Nodes`] records keeps from one to the next: the order of the last one
 /// read ([`Order::places`]) and the buffers that found it.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Order {
     places: Vec<u32>,
     waiting: Vec<u32>,
     first_dependent: Vec<u32>,
     /// Each edge's dependent and the next edge of the same dep.
     dependents: Vec<(u32, u32)>,
-    ready: BinaryHeap<Reverse<u32>>,
+    /// The places that can go, least first (a 4-ary min-heap; places are distinct).
+    ready: Heap4<u32, Global>,
+}
+
+impl Default for Order {
+    /// Empty buffers: allocates nothing.
+    fn default() -> Order {
+        Order {
+            places: Vec::new(),
+            waiting: Vec::new(),
+            first_dependent: Vec::new(),
+            dependents: Vec::new(),
+            ready: Heap4::new_in(Global),
+        }
+    }
 }
 
 const NO_EDGE: u32 = u32::MAX;
@@ -284,15 +298,17 @@ impl<'a> NodeBatch<'a> {
                 }
             }
         }
-        ready.extend((0..len as u32).filter(|&at| waiting[at as usize] == 0).map(Reverse));
-        while let Some(Reverse(at)) = ready.pop() {
+        for at in (0..len as u32).filter(|&at| waiting[at as usize] == 0) {
+            ready.push(at);
+        }
+        while let Some(at) = ready.pop() {
             places.push(at);
             let mut edge = first_dependent[at as usize];
             while edge != NO_EDGE {
                 let (dependent, next) = dependents[edge as usize];
                 waiting[dependent as usize] -= 1;
                 if waiting[dependent as usize] == 0 {
-                    ready.push(Reverse(dependent));
+                    ready.push(dependent);
                 }
                 edge = next;
             }

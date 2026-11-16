@@ -39,6 +39,7 @@ pub use blaze_surface::{
     CrateImpls, CrateIndex, CrateInput, DIRECTORY_SCHEMA, DepEdge, DepInput, DirHit, DirectoryView,
     EdgeFlags, Edition, FloatWidth, GRAPH_SCHEMA, GraphError, ImplFlags, ImplIndexError, ImplRow,
     IntWidth, LANG_SCHEMA, LangItemsError, LangItemsView, LangName, LangNameError, MAX_CRATES,
+    MAX_LANG_NAME,
     MAX_EXTERN_NAME, MAX_ROWS, Members, Mutability, NO_IMPLS_SCHEMA, NoImplsOfView, SelfShape,
     Shape, ShapeError, UintWidth, UnknownFlags, build_crate_graph, build_impl_index,
     build_lang_items, trait_mark,

@@ -106,6 +106,9 @@ pub enum Shape {
     OutOfRange { ty: &'static str },
     /// An index past a list of `len`.
     NoIndex { len: usize },
+    /// Text (or bytes) of the right kind that does not read as `ty` (`"1.x.3"` for a version);
+    /// the error's `note` says why, in the type's own words.
+    Invalid { ty: &'static str },
 }
 
 /// A value that does not fit: the path to it, why, and for an unknown name the names (empty
@@ -133,6 +136,7 @@ impl<A: Allocator> fmt::Display for ShapeError<A> {
             Shape::UnknownFields { .. } | Shape::UnknownVariant => write!(f, "{path}: {}", self.note.as_str()),
             Shape::OutOfRange { ty } => write!(f, "{path}: out of range for {ty}"),
             Shape::NoIndex { len } => write!(f, "{path}: past the end of a list of {len}"),
+            Shape::Invalid { ty } => write!(f, "{path}: not a {ty}: {}", self.note.as_str()),
         }
     }
 }
@@ -173,6 +177,15 @@ impl<'v, 'p, A: Allocator + Clone> Cursor<'v, 'p, A> {
     /// An error about this value.
     pub fn error(&self, shape: Shape) -> ShapeError<A> {
         ShapeError { path: self.at.render_in(self.alloc.clone()), shape, note: String::new_in(self.alloc.clone()) }
+    }
+
+    /// An error saying this value does not read as `ty`, for `why` (a parser's own error).
+    pub fn invalid(&self, ty: &'static str, why: &dyn fmt::Display) -> ShapeError<A> {
+        let mut error = self.error(Shape::Invalid { ty });
+        if fmt::write(&mut error.note, format_args!("{why}")).is_err() {
+            unreachable!("writing into a `String` does not fail");
+        }
+        error
     }
 
     /// This map read as a struct, strictly: `read` takes each field from the [`Fields`], and

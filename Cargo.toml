@@ -229,6 +229,7 @@ ra-ap-rustc_pattern_analysis = { path = "vendor/ra-ap-rustc_pattern_analysis" }
 rustls = { path = "vendor/rustls" }
 
 [workspace.dependencies]
+arrow-array = { version = "60.1.0", default-features = false }
 crossbeam-channel = "0.5.17"
 crossbeam-queue = "0.3.14"
 parking_lot = "0.12.5"
@@ -531,7 +532,6 @@ zstd = { version = "0.14.3", default-features = false, features = ["zdict_builde
 # `tt`'s proc-macro wire views its columns as bytes with no unsafe code of its own.
 zerocopy = { version = "0.8.63", default-features = false, features = ["derive"] }
 # `safe-decode`: a rotted pack decodes to an error, never to an out-of-bounds read.
-lz4_flex = { version = "0.14", default-features = false, features = ["std", "safe-decode"] }
 # rustc renders its diagnostics with exactly this version; another lays some snippets out differently.
 annotate-snippets = "=0.12.16"
 # No `wasm`: it pulls a second wasmparser, and nothing here reads Wasm through `object`.

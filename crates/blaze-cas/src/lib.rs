@@ -153,10 +153,14 @@ use crate::table::{Held, Table};
 /// BLAKE3 of its value: a record of format 8 (magic `BLZR`) is read forward, its header's CRC
 /// checked and its value hashed as before, and a store mixes the two until a settle or the
 /// collector rewrites its packs. A blaze of format 8 refuses a store of format 9 by name.
-pub(crate) const FORMAT: u32 = 9;
+/// Format 10 keeps every record read on the edit loop raw, read in place: no output chunk is
+/// LZ4 any more, and a value moved back hot is raw. A store of format 9 may hold LZ4 chunks,
+/// which this blaze cannot decode, so it is refused by name and rebuilt (rule 26), as every
+/// older one is.
+pub(crate) const FORMAT: u32 = 10;
 
 /// The oldest format read ([`FORMAT`]).
-pub(crate) const FORMAT_READ: u32 = 4;
+pub(crate) const FORMAT_READ: u32 = 10;
 
 /// A pack is closed for appends once it is this long; a record longer than that has a pack of
 /// its own.
@@ -359,10 +363,12 @@ impl Kind {
         }
     }
 
-    /// Read rarely (debug info on a panic or in a debugger; a run's outputs once per hit), so
-    /// kept compressed. The rest are read in place on every warm path.
+    /// Read rarely by its nature (debug info, on a panic or in a debugger), so kept compressed
+    /// from its put. The rest are read in place on the edit loop: a run's outputs too, which
+    /// every build that reaches the run's dependents reads again, a command being a process
+    /// that holds nothing between builds (rule 70).
     const fn cold(self) -> bool {
-        matches!(self, Kind::Debug | Kind::Run)
+        matches!(self, Kind::Debug)
     }
 }
 
@@ -3083,8 +3089,10 @@ impl Store {
     /// Each call ends a period of reading. A record unread for two periods running moves a tier
     /// colder: a value of a schema it was given encodings for ([`Store::encode_columns`]) goes
     /// from hot to warm columns (or straight to cold where warm saves too little) and from warm
-    /// to cold columns; any other goes from raw or LZ4 to zstd. A record read in two periods
-    /// running moves hot. It moves a bounded number of bytes a call ([`SETTLE_MOST`]), which
+    /// to cold columns; any other goes from raw to zstd. A record a read decodes (zstd, cold
+    /// columns) read in a period moves back hot, raw, at its end: a read decodes it only until
+    /// then, never on every read after; warm columns, read in place, after two periods
+    /// running. It moves a bounded number of bytes a call ([`SETTLE_MOST`]), which
     /// is still far more than a caller with someone waiting can afford: the daemon's loop ends
     /// its periods with [`Store::end_period`] and moves in [`Store::settle_step`]s.
     pub fn settle(&mut self, effects: &mut Vec<Effect>) -> Settled {
@@ -3241,10 +3249,7 @@ impl Store {
             moves.promoted += 1;
             let Some((content, bytes)) = self.movable(key, loc) else { continue };
             *spent += loc.raw;
-            match (loc.kind == Kind::Output).then(|| cold::lz4(&bytes)).flatten() {
-                Some(stored) => self.replace(key, loc, Form::Lz4, 0, content, &stored, false),
-                None => self.replace(key, loc, Form::Raw, 0, content, &bytes, false),
-            }
+            self.replace(key, loc, Form::Raw, 0, content, &bytes, false);
             settled.promoted += 1;
         }
         for at in self.retirable() {

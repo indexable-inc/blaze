@@ -24,7 +24,7 @@ blaze-hash = { path = "../blaze-hash" }
 [features]
 # The test language, its arena and its in-memory world (src/testing/), on `std`: for this crate's
 # tests (always on under `cfg(test)`) and `examples/cost.rs`.
-testing = []
+testing = ["blaze-own/std"]
 
 [dev-dependencies]
 # `Alloc::global()`, which the tests and the cost example hand down.

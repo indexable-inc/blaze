@@ -162,6 +162,16 @@ unsafe impl<T: ?Sized> Owns<Inline> for ManuallyDrop<T> {}
 // `Inline` says; uninitialized, it owns less.
 unsafe impl<T> Owns<Inline> for MaybeUninit<T> {}
 
+// SAFETY: a `NonZero<T>` is the integer `T` in its own bytes, a value range excluding zero. The
+// walk cannot see into it itself: its one field is a pattern type (`u32 is 1..`), which
+// reflection does not show. Named per integer, so no unstable `ZeroablePrimitive` bound is.
+macro_rules! nonzero_inline {
+    ($($int:ty),*) => {
+        $(unsafe impl Owns<Inline> for core::num::NonZero<$int> {})*
+    };
+}
+nonzero_inline!(u8, u16, u32, u64, u128, usize, i8, i16, i32, i64, i128, isize);
+
 // SAFETY: a `Box` is the one owner of its allocation: a unique pointer to the `T`, freed
 // with the box.
 unsafe impl<T: ?Sized, A: Allocator> Owns<Solely> for Box<T, A> {}

@@ -1,7 +1,10 @@
 //! The vector routines, in `core::simd` (docs/v2/plan/design/std.md, "SIMD"), each with its
 //! scalar twin; the tests hold the two equal on random input at every alignment.
 //!
-//! - [`digit_run`]: how many ASCII digits start a 16-byte window (one compare, one bitmask).
+//! Digit runs are not here: measured on integers of 1 to 20 digits, a vector compare for the
+//! run lost to the byte loop below eight digits and to SWAR at 10 and 20 (0.90x, 0.75x), and
+//! numbers are short.
+//!
 //! - [`next_special`]: the next byte an escape rewrites (`"`, `\`, below 0x20, DEL).
 //! - [`hex16`]: sixteen bytes as 32 hex digits by a table lookup (`swizzle_dyn`).
 
@@ -13,21 +16,6 @@ type V16 = Simd<u8, 16>;
 #[inline(always)]
 fn load16(bytes: &[u8]) -> V16 {
     V16::from_slice(&bytes[..16])
-}
-
-/// How many of the first 16 bytes of `bytes` (at least 16 of them) are ASCII digits, in a run
-/// from the first.
-#[inline(always)]
-pub(crate) fn digit_run(bytes: &[u8]) -> u32 {
-    let digits = (load16(bytes) - V16::splat(b'0')).simd_lt(V16::splat(10));
-    digits.to_bitmask().trailing_ones()
-}
-
-/// The scalar twin of [`digit_run`].
-#[cfg(test)]
-pub(crate) fn digit_run_scalar(bytes: &[u8]) -> u32 {
-    let run = bytes[..16].iter().take_while(|b| b.is_ascii_digit()).count();
-    blaze_int::Int::narrow_or_stop::<u32>(run)
 }
 
 /// The 16-byte window's escape bits: bit `i` set when byte `i` is `"`, `\`, below 0x20 or DEL.

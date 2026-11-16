@@ -11,7 +11,7 @@ use blaze_build::{Adts, BuildError};
 use blaze_emit::{Code, EmitError, Via};
 use blaze_own::Alloc;
 use blaze_typeck::toy::ToyCtx;
-use blaze_typeck::{Adt, CheckError, DiagCode, ItemKey, Needs, Outcome, PNode};
+use blaze_typeck::{Adt, CheckError, DiagCode, ExprId, ItemKey, Needs, Outcome, PNode, PatId};
 
 use crate::lower::{self, Abi, LowerError, Program, SourceFile};
 use crate::place::{self, Body, Entry, PlaceError, Target};
@@ -67,6 +67,24 @@ struct ProgramAdts<'p>(&'p Program);
 impl Adts for ProgramAdts<'_> {
     fn adt(&self, key: ItemKey) -> Option<Adt<'_>> {
         self.0.adt(key)
+    }
+
+    fn int_lit(&self, owner: ItemKey, expr: ExprId) -> Option<u128> {
+        self.body(owner)?.int_value(expr)
+    }
+
+    fn int_pat(&self, owner: ItemKey, pat: PatId) -> Option<u128> {
+        self.body(owner)?.pat_int_value(pat)
+    }
+
+    fn byte_str(&self, owner: ItemKey, expr: ExprId) -> Option<&[u8]> {
+        self.body(owner)?.byte_str(expr)
+    }
+}
+
+impl ProgramAdts<'_> {
+    fn body(&self, owner: ItemKey) -> Option<&lower::Body> {
+        self.0.fns.get(self.0.index_of(owner)?)?.body.as_ref()
     }
 }
 

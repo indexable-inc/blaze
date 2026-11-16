@@ -17,6 +17,11 @@ doctest = false
 # `String`, `Vec`: every owner takes the caller's allocator.
 blaze-own.workspace = true
 
+[features]
+# `ToValue`/`FromValue` for std's `String`, `Vec` and (unix) `PathBuf`, for callers that still
+# hold std types.
+std = []
+
 [dev-dependencies]
 # Properties: a map agrees with a model map under any inserts and removes; with a planted-bug
 # control.

@@ -31,10 +31,7 @@ impl Adler32 {
     pub fn update(&mut self, bytes: &[u8]) {
         let (mut a, mut b) = (self.a, self.b);
         for run in bytes.chunks(ADLER_RUN) {
-            for &byte in run {
-                a += u32::from(byte);
-                b += a;
-            }
+            (a, b) = crate::simd::adler_run(a, b, run);
             a %= ADLER_MOD;
             b %= ADLER_MOD;
         }

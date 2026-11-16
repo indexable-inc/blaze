@@ -12,6 +12,34 @@
 //! The tests named for one hard spot (`make_mut` with only a `Weak`, `get_mut` against another
 //! thread's reads, growth from every wrap, the columns' places) are small and wait on nothing
 //! timed, so they mean the same under Miri, whose race detector checks the orderings.
+//!
+//! # Under Miri
+//!
+//! `cargo miri test -p blaze-own` runs the whole suite at Miri sizes: every property test
+//! [`MIRI_CASES`] cases (`cases`), and the sizes inside them small (`sized`), each still
+//! reaching its code: the B-tree tests insert at least [`MIRI_TALL`] keys where they need
+//! height two, which `miri_sizes_reach_every_shape` holds in the normal suite. The planted-bug
+//! controls are ignored under Miri (each says why): they test the oracle, not the crate's
+//! unsafe code, and their plants leak or read stale slots on purpose; each one's clean half is
+//! a test of its own. The one test that leaks on purpose (the `every_failure` control) names
+//! its one block to Miri (`miri_leaks_on_purpose`). Which tests reach which unsafe code:
+//!
+//! | unsafe code | reached by |
+//! |---|---|
+//! | `RawBuf`: allocate, grow, shrink, free; values sized 0; alignment over 16 | `vec_matches_std`, `values_sized_zero_never_allocate`, `over_aligned_values_are_aligned`, `vec_try_forms_*` |
+//! | `Vec`: the initialized prefix, `drain`, `retain`, `truncate`, `extend`, `clone`, and their unwinding | `vec_matches_std`, `vec_frees_everything_when_*`, `vec_sorts_and_dedups_a_tail`, `vec_in_makes_what_it_says` |
+//! | the block copies and the `TrustedLen` extend (`spec`), `insert_many` | `specialized_paths_match_the_generic_ones`, `trusted_extend_frees_everything_when_the_iterator_panics`, `insert_many_frees_everything_when_a_clone_panics`, `collect_in_from_an_exact_iterator_allocates_once` |
+//! | `VecDeque`: the wrapped slots, growth from a wrap, `append` in runs, drain and retain unwinding | `deque_matches_std`, `deque_grows_from_every_wrap`, `deque_grown_while_wrapped_matches_std`, `deque_frees_everything_when_a_drop_panics_across_the_wrap`, `deque_drain_and_retain_keep_order_when_a_drop_panics` |
+//! | `Box`: unsizing, `dyn` drop, `CallOnce` | `box_unsizes_and_drops_once`, `boxed_closures_are_called_once_and_freed` |
+//! | `Arc`, `Rc`, their `Weak`s: counts, `make_mut`, `get_mut`, `new_cyclic`, raw round trips, slices | `arc_under_threads_drops_once_and_frees`, `arc_unique_paths`, `arc_make_mut_with_only_a_weak`, `arc_get_mut_waits_for_the_others_reads`, `new_cyclic_refers_to_itself_and_frees`, `raw_pointers_round_trip`, `arc_slice_frees_everything_when_clone_panics`, `arc_clones_count`, `rc_counts_and_frees` |
+//! | `Soa`: one block of columns, growth, the column copies, permute, compaction | `soa_matches_a_vec_of_rows`, `soa_grows_every_column`, `soa_columns_sit_where_the_layout_says`, `soa_frees_everything_when_a_drop_panics`, `soa_retain_keeps_the_unseen_when_a_drop_panics`, `soa_of_fields_sized_zero_never_allocates`, `soa_debug_and_insert_remove` |
+//! | `SortedMap`, `SortedSet` | `sorted_map_and_set_match_std`, `sorted_map_entry_and_index`, `from_sorted_refuses_what_is_not` |
+//! | `BTreeMap`, `BTreeSet`: nodes, split, merge, borrow from either side, delete from an internal node, the dying iterators, `#[may_dangle]` drop, unwinding from user code | `btree_matches_std`, `btree_shrinks_to_empty_like_std`, `btree_structural_cases`, `btree_stays_whole_when_user_code_panics`, `btree_try_forms_fail_cleanly_at_every_allocation` |
+//! | `Packed` | `packed_matches_a_vector_and_seeks`, `packed_try_push_fails_cleanly_at_every_allocation`, `packed_stops_on_a_pack_that_reads_another_length` |
+//! | `FixedVec`, `FixedString`, `Inline` | `fixed_vec_refuses_past_its_capacity_and_drops_once`, `fixed_string_refuses_a_piece_whole_and_cuts_at_no_boundary`, `inline_holds_collections_on_the_stack_and_refuses_when_full`, `inline_under_every_failure` |
+//! | `String`, `Cow`, `make` (`CloneIn`, `Share`) | `string_stays_utf8_and_frees`, `cow_owns_only_when_it_must`, `make_try_forms_fail_cleanly_at_every_allocation`, `share_adds_a_handle_and_allocates_nothing`, `clone_in_leaves_the_first_allocator_alone` |
+//! | `Alloc`, `SharedAlloc`, `Erased` (the handle) | `handle`'s tests: `*_through_a_handle`, `a_handle_is_one_word_and_copies_are_the_same_allocator`, `a_handle_of_an_inline_buffer_grows_in_place_and_refuses_when_full`, `a_vector_over_a_shared_handle_crosses_threads`, `the_global_handle_allocates` |
+//! | the testing allocators (`testing`) | every `*_fail_cleanly_at_every_allocation`, `every_failure_catches_a_swallowed_refusal_and_a_leak` |
 
 use core::{
     alloc::{AllocError, Allocator, Layout},
@@ -280,6 +308,35 @@ fn same<T: PartialEq + core::fmt::Debug>(
     }
 }
 
+/// Cases a property test runs under Miri, whose interpreter is some thousand times slower.
+const MIRI_CASES: u32 = 16;
+
+/// A property test's cases: `n`, or [`MIRI_CASES`] under Miri.
+fn cases(n: u32) -> Config {
+    Config::cases(if cfg!(miri) { n.min(MIRI_CASES) } else { n })
+}
+
+/// `normal`, or `miri` under Miri: a size the interpreter runs quickly that still reaches the
+/// same code; each use says what it must reach, and `miri_sizes_reach_every_shape` holds the
+/// B-tree's ones in the normal suite.
+fn sized<T>(normal: T, miri: T) -> T {
+    if cfg!(miri) { miri } else { normal }
+}
+
+/// Keys that make a B-tree of height two (a root over internal nodes over leaves) when inserted
+/// in order: the least that reaches merges and borrows of internal nodes and deletes from them.
+const MIRI_TALL: u64 = 200;
+
+/// Tells Miri's leak check that the block starting at `block` is leaked on purpose
+/// (`miri_static_root`): one block, named by the test that leaks it.
+#[cfg(miri)]
+fn miri_leaks_on_purpose(block: *const u8) {
+    unsafe extern "Rust" {
+        safe fn miri_static_root(ptr: *const u8);
+    }
+    miri_static_root(block);
+}
+
 fn bounds(tape: &Tape, len: usize) -> (usize, usize) {
     let a = tape.index(len + 1, "from");
     let b = tape.index(len + 1, "to");
@@ -431,19 +488,21 @@ fn vec_case_in<A: Allocator + Copy>(tape: &Tape, alloc: A) -> Result<(), Broke> 
 
 #[test]
 fn vec_matches_std() {
-    blaze_sim::check(Config::cases(300), vec_case);
+    blaze_sim::check(cases(300), vec_case);
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "a planted bug: tests the oracle, not unsafe code; its clean half is `vec_matches_std`")]
 fn the_oracle_catches_truncate_forgetting_drops() {
     let run = |tape: &Tape, p: Plant| plant::with(p, || vec_case(tape));
-    blaze_sim::control(Config::cases(300), Plant::Clean, Plant::TruncateForgetsDrop, "never dropped", run);
+    blaze_sim::control(cases(300), Plant::Clean, Plant::TruncateForgetsDrop, "never dropped", run);
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "a planted bug: tests the oracle, not unsafe code; its clean half is `vec_matches_std`")]
 fn the_oracle_catches_retain_forgetting_drops() {
     let run = |tape: &Tape, p: Plant| plant::with(p, || vec_case(tape));
-    blaze_sim::control(Config::cases(300), Plant::Clean, Plant::RetainForgetsDrop, "never dropped", run);
+    blaze_sim::control(cases(300), Plant::Clean, Plant::RetainForgetsDrop, "never dropped", run);
 }
 
 fn ten(alloc: &Counting) -> Vec<Token, &Counting> {
@@ -711,10 +770,10 @@ fn arc_under_threads_drops_once_and_frees() -> Result<(), Broke> {
     {
         let shared = Arc::new_in(Counted(&drops), &alloc);
         std::thread::scope(|s| {
-            for _ in 0..8 {
+            for _ in 0..sized(8, 4) {
                 let mine = shared.clone();
                 s.spawn(move || {
-                    for _ in 0..500 {
+                    for _ in 0..sized(500, 25) {
                         let another = mine.clone();
                         let weak = Arc::downgrade(&another);
                         assert!(weak.upgrade().is_some(), "an upgrade failed while owners live");
@@ -1112,10 +1171,17 @@ fn arc_clone_case(tape: &Tape) -> Result<(), Broke> {
     alloc.check()
 }
 
+/// The control's clean half on its own.
 #[test]
+fn arc_clones_count() {
+    blaze_sim::check(cases(64), arc_clone_case);
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "a planted bug: tests the oracle, not unsafe code, and forgets the shared block on purpose; its clean half is `arc_clones_count`")]
 fn the_oracle_catches_a_clone_that_skips_the_count() {
     let run = |tape: &Tape, p: Plant| plant::with(p, || arc_clone_case(tape));
-    blaze_sim::control(Config::cases(64), Plant::Clean, Plant::ArcCloneSkipsCount, "missed a clone", run);
+    blaze_sim::control(cases(64), Plant::Clean, Plant::ArcCloneSkipsCount, "missed a clone", run);
 }
 
 #[test]
@@ -1262,7 +1328,7 @@ fn deque_case_in<A: Allocator + Copy>(tape: &Tape, alloc: A) -> Result<(), Broke
 
 #[test]
 fn deque_matches_std() {
-    blaze_sim::check(Config::cases(300), deque_case);
+    blaze_sim::check(cases(300), deque_case);
 }
 
 /// Wraps the ring around its end before it grows, with `u64`s (a planted bug reads poisoned
@@ -1285,10 +1351,17 @@ fn deque_wrap_case(tape: &Tape) -> Result<(), Broke> {
     alloc.check()
 }
 
+/// The control's clean half on its own, so Miri runs the growth from every wrap.
 #[test]
+fn deque_grown_while_wrapped_matches_std() {
+    blaze_sim::check(cases(64), deque_wrap_case);
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "a planted bug: tests the oracle, not unsafe code, and reads stale slots on purpose; its clean half is `deque_grown_while_wrapped_matches_std`")]
 fn the_oracle_catches_growth_that_keeps_the_wrap() {
     let run = |tape: &Tape, p: Plant| plant::with(p, || deque_wrap_case(tape));
-    blaze_sim::control(Config::cases(64), Plant::Clean, Plant::DequeGrowKeepsWrap, "differs from the model", run);
+    blaze_sim::control(cases(64), Plant::Clean, Plant::DequeGrowKeepsWrap, "differs from the model", run);
 }
 
 #[test]
@@ -1470,7 +1543,7 @@ fn sorted_case_in<A: Allocator + Copy>(tape: &Tape, alloc: A) -> Result<(), Brok
 
 #[test]
 fn sorted_map_and_set_match_std() {
-    blaze_sim::check(Config::cases(300), sorted_case);
+    blaze_sim::check(cases(300), sorted_case);
 }
 
 #[test]
@@ -1698,7 +1771,7 @@ fn soa_case_in<A: Allocator + Copy>(tape: &Tape, counted: &Counting, alloc: A) -
 
 #[test]
 fn soa_matches_a_vec_of_rows() {
-    blaze_sim::check(Config::cases(300), soa_case);
+    blaze_sim::check(cases(300), soa_case);
 }
 
 soa! {
@@ -1727,10 +1800,17 @@ fn soa_grow_case(tape: &Tape) -> Result<(), Broke> {
     alloc.check()
 }
 
+/// The control's clean half on its own, so Miri runs the growth of every column.
 #[test]
+fn soa_grows_every_column() {
+    blaze_sim::check(cases(64), soa_grow_case);
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "a planted bug: tests the oracle, not unsafe code, and reads a column never written on purpose; its clean half is `soa_grows_every_column`")]
 fn the_oracle_catches_growth_that_skips_a_column() {
     let run = |tape: &Tape, p: Plant| plant::with(p, || soa_grow_case(tape));
-    blaze_sim::control(Config::cases(64), Plant::Clean, Plant::SoaGrowSkipsColumn, "differs from the model", run);
+    blaze_sim::control(cases(64), Plant::Clean, Plant::SoaGrowSkipsColumn, "differs from the model", run);
 }
 
 #[test]
@@ -2168,6 +2248,10 @@ fn every_failure_catches_a_swallowed_refusal_and_a_leak() -> Result<(), Broke> {
     }
     let leaked = every_failure(&System, |alloc| {
         let v = Vec::<u8, _>::try_with_capacity_in(4, alloc)?;
+        // The one block leaked on purpose: Miri's leak check is told of exactly it (the failing
+        // allocator hands out `System`'s block as it is, so the buffer is the block's start).
+        #[cfg(miri)]
+        miri_leaks_on_purpose(v.as_ptr());
         core::mem::forget(v);
         Ok::<(), AllocFailure>(())
     });
@@ -2435,7 +2519,7 @@ fn packed_case(tape: &Tape) -> Result<(), Broke> {
 
 #[test]
 fn packed_matches_a_vector_and_seeks() {
-    blaze_sim::check(Config::cases(300), packed_case);
+    blaze_sim::check(cases(300), packed_case);
 }
 
 #[test]
@@ -2535,7 +2619,8 @@ fn btree_case_in<A: core::alloc::AllocatorClone + Copy>(tape: &Tape, alloc: A) -
         let mut model: BTreeMap<u64, u64> = BTreeMap::new();
         let mut set: OwnSet<u64, A> = OwnSet::new_in(alloc);
         let mut model_set: BTreeSet<u64> = BTreeSet::new();
-        for _ in 0..tape.index(200, "steps") {
+        // Under Miri fewer steps; a run of keys (op 13) still makes height two in most cases.
+        for _ in 0..tape.index(sized(200, 60), "steps") {
             let k = tape.below(span, "key");
             let v = tape.below(1000, "value");
             match tape.below(16, "op") {
@@ -2726,7 +2811,7 @@ fn btree_case_in<A: core::alloc::AllocatorClone + Copy>(tape: &Tape, alloc: A) -
 
 #[test]
 fn btree_matches_std() {
-    blaze_sim::check(Config::cases(300), btree_case);
+    blaze_sim::check(cases(300), btree_case);
 }
 
 /// A tree of height two or more, emptied one tape-chosen key at a time: every merge, of leaves
@@ -2734,7 +2819,7 @@ fn btree_matches_std() {
 fn btree_shrink_case(tape: &Tape) -> Result<(), Broke> {
     let alloc = Counting::new();
     {
-        let n = 300 + tape.below(300, "size");
+        let n = sized(300 + tape.below(300, "size"), MIRI_TALL + tape.below(40, "size"));
         let mut ours: OwnMap<u64, u64, &Counting> = OwnMap::new_in(&alloc);
         let mut model = BTreeMap::new();
         for k in 0..n {
@@ -2755,15 +2840,31 @@ fn btree_shrink_case(tape: &Tape) -> Result<(), Broke> {
     alloc.check()
 }
 
+/// The Miri sizes of the B-tree tests still reach every shape: the fewest keys they insert in
+/// order make a tree of height two, so its internal nodes split, merge, borrow from each side
+/// and lose keys. Runs in the normal suite, where the Miri sizes are otherwise unused.
 #[test]
-fn btree_shrinks_to_empty_like_std() {
-    blaze_sim::check(Config::cases(60), btree_shrink_case);
+fn miri_sizes_reach_every_shape() -> Result<(), Broke> {
+    let alloc = Counting::new();
+    {
+        let map = spaced(MIRI_TALL, &alloc);
+        if map.height() < 2 {
+            return Err(Broke::Harness(format!("{MIRI_TALL} keys in order made height {}, not two", map.height())));
+        }
+    }
+    alloc.check()
 }
 
 #[test]
+fn btree_shrinks_to_empty_like_std() {
+    blaze_sim::check(cases(60), btree_shrink_case);
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "a planted bug: tests the oracle, not unsafe code, and leaks a node on purpose; its clean half is `btree_shrinks_to_empty_like_std`")]
 fn the_oracle_catches_a_merge_that_forgets_a_child() {
     let run = |tape: &Tape, p: Plant| plant::with(p, || btree_shrink_case(tape));
-    blaze_sim::control(Config::cases(60), Plant::Clean, Plant::BTreeMergeForgetsChild, "differs from the model", run);
+    blaze_sim::control(cases(60), Plant::Clean, Plant::BTreeMergeForgetsChild, "differs from the model", run);
 }
 
 /// Keys `0, 10, .., 10 (n - 1)`, each with its index.
@@ -2849,14 +2950,17 @@ fn btree_structural_cases() -> Result<(), Broke> {
         shape("deleted from the root", &map, &alloc, 1, 3, (0..16).filter(|&k| k != 7).map(|k| k * 10))?;
         drop(map);
 
-        // Deep: 2000 keys, removed in a scattered order down to nothing.
-        let mut map = spaced(2000, &alloc);
+        // Deep: 2000 keys (under Miri the fewest that make height two), removed in a scattered
+        // order down to nothing.
+        let deep = sized(2000, MIRI_TALL);
+        let mut map = spaced(deep, &alloc);
         if map.height() < 2 {
-            return Err(Broke::Oracle(format!("2000 keys made a tree of height {}", map.height())));
+            return Err(Broke::Oracle(format!("{deep} keys made a tree of height {}", map.height())));
         }
-        let mut model: BTreeMap<u64, u64> = (0..2000).map(|k| (k * 10, k)).collect();
-        for i in 0..2000u64 {
-            let k = (i * 7919 % 2000) * 10;
+        let mut model: BTreeMap<u64, u64> = (0..deep).map(|k| (k * 10, k)).collect();
+        for i in 0..deep {
+            // 7919 is prime, so coprime to both sizes: every key once.
+            let k = (i * 7919 % deep) * 10;
             same("deep remove", map.remove(&k).into_iter(), model.remove(&k).into_iter())?;
             oracle(map.invariants())?;
         }
@@ -2907,7 +3011,7 @@ fn btree_panic_case(tape: &Tape) -> Result<(), Broke> {
     let alloc = Counting::new();
     {
         let mut map: OwnMap<Touchy, Token, &Counting> = OwnMap::new_in(&alloc);
-        for n in 0..tape.below(400, "size") {
+        for n in 0..tape.below(sized(400, MIRI_TALL), "size") {
             map.insert(Touchy(n * 2), Token::new(n));
         }
         for _ in 0..tape.index(12, "steps") {
@@ -2966,7 +3070,7 @@ fn btree_panic_case(tape: &Tape) -> Result<(), Broke> {
 
 #[test]
 fn btree_stays_whole_when_user_code_panics() {
-    blaze_sim::check(Config::cases(200), btree_panic_case);
+    blaze_sim::check(cases(200), btree_panic_case);
 }
 
 fn tree_values<A: Allocator, B: Allocator>(m: &OwnMap<u64, Box<u64, A>, B>) -> StdVec<(u64, u64)> {

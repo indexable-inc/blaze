@@ -1,23 +1,29 @@
 //! A walk's memo: `u64` key to `u32` value, cleared in O(1) by a generation stamp, so a pass
 //! over a large shared type visits each distinct (node, depth) once and a pass over a small
-//! one pays nothing to clear. Linear probing, at most half full.
+//! one pays nothing to clear. Linear probing, at most half full; an entry is one 16-byte slot
+//! (key, value, generation), so a probe touches one cache line.
 
 use blaze_int::Int;
 use blaze_own::{Alloc, Vec};
 
 use crate::hash;
 
+#[derive(Clone, Copy, Default)]
+struct Slot {
+    key: u64,
+    val: u32,
+    generation: u32,
+}
+
 pub(crate) struct Memo<'a> {
-    keys: Vec<u64, Alloc<'a>>,
-    vals: Vec<u32, Alloc<'a>>,
-    gens: Vec<u32, Alloc<'a>>,
+    slots: Vec<Slot, Alloc<'a>>,
     gen_now: u32,
     len: usize,
 }
 
 impl<'a> Memo<'a> {
     pub(crate) fn new_in(alloc: Alloc<'a>) -> Memo<'a> {
-        Memo { keys: Vec::new_in(alloc), vals: Vec::new_in(alloc), gens: Vec::new_in(alloc), gen_now: 1, len: 0 }
+        Memo { slots: Vec::new_in(alloc), gen_now: 1, len: 0 }
     }
 
     /// Forgets every entry.
@@ -29,8 +35,8 @@ impl<'a> Memo<'a> {
         self.len = 0;
         self.gen_now = self.gen_now.wrapping_add(1);
         if self.gen_now == 0 {
-            for g in self.gens.iter_mut() {
-                *g = 0;
+            for s in self.slots.iter_mut() {
+                s.generation = 0;
             }
             self.gen_now = 1;
         }
@@ -41,14 +47,15 @@ impl<'a> Memo<'a> {
         if self.len == 0 {
             return None;
         }
-        let mask = self.keys.len() - 1;
+        let mask = self.slots.len() - 1;
         let mut at = hash::key(key).truncate_to::<usize>() & mask;
         loop {
-            if self.gens[at] != self.gen_now {
+            let s = self.slots[at];
+            if s.generation != self.gen_now {
                 return None;
             }
-            if self.keys[at] == key {
-                return Some(self.vals[at]);
+            if s.key == key {
+                return Some(s.val);
             }
             at = (at + 1) & mask;
         }
@@ -57,21 +64,20 @@ impl<'a> Memo<'a> {
     /// Sets `key` to `val` (replacing what it had).
     #[inline]
     pub(crate) fn insert(&mut self, key: u64, val: u32) {
-        if (self.len + 1) * 2 > self.keys.len() {
+        if (self.len + 1) * 2 > self.slots.len() {
             self.grow();
         }
-        let mask = self.keys.len() - 1;
+        let mask = self.slots.len() - 1;
         let mut at = hash::key(key).truncate_to::<usize>() & mask;
         loop {
-            if self.gens[at] != self.gen_now {
-                self.gens[at] = self.gen_now;
-                self.keys[at] = key;
-                self.vals[at] = val;
+            let s = &mut self.slots[at];
+            if s.generation != self.gen_now {
+                *s = Slot { key, val, generation: self.gen_now };
                 self.len += 1;
                 return;
             }
-            if self.keys[at] == key {
-                self.vals[at] = val;
+            if s.key == key {
+                s.val = val;
                 return;
             }
             at = (at + 1) & mask;
@@ -80,32 +86,24 @@ impl<'a> Memo<'a> {
 
     #[cold]
     fn grow(&mut self) {
-        let cap = (self.keys.len() * 2).max(64);
-        let alloc = *self.keys.allocator();
-        let mut keys = Vec::new_in(alloc);
-        keys.resize(cap, 0);
-        let mut vals = Vec::new_in(alloc);
-        vals.resize(cap, 0);
-        let mut gens = Vec::new_in(alloc);
-        gens.resize(cap, 0);
-        let old_keys = core::mem::replace(&mut self.keys, keys);
-        let old_vals = core::mem::replace(&mut self.vals, vals);
-        let old_gens = core::mem::replace(&mut self.gens, gens);
+        let cap = (self.slots.len() * 2).max(64);
+        let alloc = *self.slots.allocator();
+        let mut slots = Vec::new_in(alloc);
+        slots.resize(cap, Slot::default());
+        let old = core::mem::replace(&mut self.slots, slots);
         let was = self.gen_now;
         self.gen_now = 1;
         self.len = 0;
         let mask = cap - 1;
-        for i in 0..old_keys.len() {
-            if old_gens[i] != was {
+        for s in old.iter() {
+            if s.generation != was {
                 continue;
             }
-            let mut at = hash::key(old_keys[i]).truncate_to::<usize>() & mask;
-            while self.gens[at] == self.gen_now {
+            let mut at = hash::key(s.key).truncate_to::<usize>() & mask;
+            while self.slots[at].generation == self.gen_now {
                 at = (at + 1) & mask;
             }
-            self.gens[at] = self.gen_now;
-            self.keys[at] = old_keys[i];
-            self.vals[at] = old_vals[i];
+            self.slots[at] = Slot { key: s.key, val: s.val, generation: self.gen_now };
             self.len += 1;
         }
     }

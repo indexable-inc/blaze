@@ -507,6 +507,40 @@ fn a_spin_loop_with_a_hint_ends() {
     });
 }
 
+/// Two threads spin, yielding, on a flag a third sets after a step of its own: a yielder waits
+/// for every thread that could run when it yielded, so the two cannot hand the run to each
+/// other past the setter until the bound on branches.
+#[test]
+fn two_spinners_let_the_thread_they_wait_for_run() {
+    let mut builder = builder();
+    builder.max_branches = 400;
+    builder.check(|| {
+        let flag = Arc::new(AtomicBool::new(false));
+        let step = Arc::new(AtomicU32::new(0));
+        let setter = {
+            let (flag, step) = (flag.clone(), step.clone());
+            thread::spawn(move || {
+                step.store(1, Relaxed);
+                flag.store(true, Release);
+            })
+        };
+        let spinner = {
+            let flag = flag.clone();
+            thread::spawn(move || {
+                while !flag.load(Acquire) {
+                    thread::yield_now();
+                }
+            })
+        };
+        while !flag.load(Acquire) {
+            thread::yield_now();
+        }
+        assert_eq!(step.load(Relaxed), 1);
+        setter.join().unwrap();
+        spinner.join().unwrap();
+    });
+}
+
 #[test]
 fn a_spin_loop_without_a_yield_is_a_finding() {
     let mut builder = builder();

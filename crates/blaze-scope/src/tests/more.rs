@@ -177,6 +177,28 @@ fn a_macro_expanded_macro_export_is_listed() {
     assert_eq!((exports[0].name, exports[0].def, exports[0].expansion), ("exp", exp, 1));
 }
 
+/// Rule: a crate's prelude may be its own module (`core`: `#![no_core]` and `#[prelude_import]
+/// use prelude::rust_2024::*`), in one cycle with the modules that read it. The lexical
+/// prelude layer then reads a member of the group: it is read live, never asked for. `mod p {
+/// pub use crate::A; pub use crate::m::B; } mod m { pub struct B; } pub struct A; use B as
+/// C;` with `p` the prelude: `C` is `m::B` (core's 192-module group stalled on this read).
+#[test]
+fn a_prelude_in_the_crate_s_own_cycle_is_read_live() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let p = w.module(root, "p", V::Pub);
+    let m = w.module(root, "m", V::Pub);
+    let b = w.item(m, "B", Namespace::Types, DefKind::Other, V::Pub);
+    w.item(root, "A", Namespace::Types, DefKind::Other, V::Pub);
+    w.use_(p, "crate::A", V::Pub);
+    w.use_(p, "crate::m::B", V::Pub);
+    w.cr(root).head.prelude = Some(p);
+    w.use_as(root, "B", "C", V::Pub);
+    let s = solved(&w);
+    assert!(s.errors(root).is_empty(), "{:?}", s.errors(root));
+    assert_eq!(s.def(root, Namespace::Types, "C"), Some(b));
+}
+
 /// Rule: `pub(in path)` names a module by path, an alias of an ancestor included; a path to a
 /// module that is no ancestor is an error.
 #[test]

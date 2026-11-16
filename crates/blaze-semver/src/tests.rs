@@ -77,6 +77,36 @@ fn the_specs_order() {
 }
 
 #[test]
+fn versions_and_requirements_are_their_text_as_values() {
+    use blaze_data::{Cursor, FromValue, Shape, ToValue, Value};
+
+    let read = |value: &Value<Global>| Version::<Global>::from_value(&Cursor::root(value, Global));
+    let read_req = |value: &Value<Global>| VersionReq::<Global>::from_value(&Cursor::root(value, Global));
+    for text in ["1.2.3", "1.0.0-rc.1+x.7"] {
+        let value = v(text).to_value(Global);
+        assert_eq!(value.as_str(), Some(text));
+        assert_eq!(read(&value).unwrap(), v(text));
+    }
+    let value = req(">=1.2, <2").to_value(Global);
+    assert_eq!(value.as_str(), Some(">=1.2, <2"));
+    assert_eq!(read_req(&value).unwrap(), req(">=1.2, <2"));
+
+    // Strict: only text, and only text that parses.
+    let number = Value::Int(blaze_data::Int::from_i64(1));
+    assert!(matches!(read(&number).unwrap_err().shape, Shape::Expected { .. }));
+    let bad = "1.x.3".to_value(Global);
+    let error = read(&bad).unwrap_err();
+    assert_eq!(error.shape, Shape::Invalid { ty: "version" });
+    assert_eq!(error.to_string(), format!("the value: not a version: {}", version_err("1.x.3")));
+    let error = read_req(&"*, ^1".to_value(Global)).unwrap_err();
+    assert_eq!(error.shape, Shape::Invalid { ty: "version requirement" });
+
+    assert_eq!(Version::<Global>::parse("1.2.3").unwrap(), v("1.2.3"));
+    assert_eq!(VersionReq::<Global>::parse("~1.2").unwrap(), req("~1.2"));
+    assert_eq!(Version::<Global>::parse("v1.2.3").unwrap_err(), version_err("v1.2.3"));
+}
+
+#[test]
 fn versions_print_as_parsed() {
     for text in ["0.0.0", "1.2.3", "1.2.3-alpha.1", "1.2.3+build.5", "1.0.0-rc.1+x.7.z.92"] {
         assert_eq!(v(text).to_string(), text);

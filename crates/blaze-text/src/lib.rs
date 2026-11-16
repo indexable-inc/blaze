@@ -12,7 +12,7 @@
 //!
 //! | piece | what |
 //! |---|---|
-//! | [`Put`] | a sink of UTF-8: [`String<A>`](blaze_own::String), [`Buf<N>`] (fixed, refuses when full, never truncates), [`Count`] (only measures, for count-then-fill) |
+//! | [`Put`] | a sink of UTF-8: [`String<A>`](blaze_own::String), blaze-own's [`FixedString<N>`](blaze_own::FixedString) (fixed, refuses when full, never truncates), [`Count`] (only measures, for count-then-fill) |
 //! | [`Writes`] | the chainable writers, on every `Put`: integers, hex, binary, floats, durations, byte counts, escapes, columns |
 //! | [`Show`] | a type's human form, in place of `Display` for blaze's own types; [`Fixed`], [`Hex`], [`Nanos`], [`Bytes`], [`Quoted`] make a writer's form a value, for columns |
 //! | [`Parse<'a>`] | a value and the rest of the text, the value free to borrow from it; combinators in [`parse`] |
@@ -35,33 +35,33 @@
 //! # Measured
 //!
 //! `examples/cost.rs`, release, 2026-11-15, one run, this machine (an Apple-silicon Mac); ns
-//! per operation with the loop's own cost subtracted, before the fixes listed under it:
+//! per operation with the loop's own cost subtracted (the second run of the day):
 //!
 //! | operation | blaze-text | core | ratio |
 //! |---|---|---|---|
-//! | u64 decimal, 1 digit | 3.3 | 5.6 | 1.71x |
-//! | u64 decimal, 5 digits | 5.3 | 6.9 | 1.30x |
-//! | u64 decimal, 10 digits | 6.3 | 6.9 | 1.10x |
-//! | u64 decimal, 20 digits | 10.7 | 9.3 | 0.87x |
-//! | u64 decimal, every length | 7.6 | 10.0 | 1.32x |
-//! | u64 hex | 7.4 | 9.8 | 1.32x |
-//! | f64 shortest | 33.9 | 51.3 | 1.51x |
-//! | f64 fixed, 3 places | 16.5 | 18.0 | 1.09x |
-//! | `"{}: {} of {} ({:.1}%)"` | 19.0 | 47.2 | 2.49x |
-//! | u64 parse, 1 digit | 2.8 | 1.0 | 0.35x |
-//! | u64 parse, 5 digits | 4.6 | 2.3 | 0.49x |
-//! | u64 parse, 10 digits | 3.9 | 3.6 | 0.92x |
-//! | u64 parse, 20 digits | 6.5 | 13.0 | 1.99x |
+//! | u64 decimal, 1 digit | 3.3 | 5.9 | 1.79x |
+//! | u64 decimal, 5 digits | 5.2 | 6.9 | 1.33x |
+//! | u64 decimal, 10 digits | 6.4 | 7.0 | 1.09x |
+//! | u64 decimal, 20 digits | 11.0 | 10.1 | 0.92x (within noise) |
+//! | u64 decimal, every length | 7.3 | 9.9 | 1.35x |
+//! | u64 hex | 7.3 | 9.8 | 1.34x |
+//! | f64 shortest | 34.5 | 51.3 | 1.49x |
+//! | f64 fixed, 3 places | 6.3 | 20.2 | 3.2x |
+//! | `"{}: {} of {} ({:.1}%)"` | 17.8 | 47.7 | 2.68x |
+//! | u64 parse, 1 digit | 2.8 | 0.8 | 0.27x |
+//! | u64 parse, 5 digits | 3.6 | 2.0 | 0.54x |
+//! | u64 parse, 10 digits | 4.7 | 3.7 | 0.78x |
+//! | u64 parse, 20 digits | 7.3 | 13.0 | 1.79x |
 //! | u64 parse, every length | 5.9 | 5.6 | 0.95x |
-//! | f64 parse | 21.0 | 12.5 | 0.59x |
-//! | vector digit run against its scalar twin, 1 to 15 digits | | | 1.1x to 1.7x |
-//! | the same, 20 digits | | | 0.86x |
-//! | next escape byte after 4 / 16 / 64 / 256 plain bytes, vector against scalar | | | 0.75x / 6.2x / 11.1x / 13.5x |
+//! | f64 `parse_all` | 14.0 | 12.8 | 0.91x |
+//! | f64 parse, a prefix | 21.1 | 12.5 | 0.59x |
+//! | next escape byte after 4 / 16 / 64 / 256 plain bytes, vector against scalar | | | 0.81x / 5.07x / 10.05x / 13.74x |
 //!
-//! Fixed since, not yet measured: short integer parses read one word and convert under eight
-//! digits without the vector; `parse_all` of a float hands a plain decimal to `core` without
-//! scanning it first; `u64` writes take eight digits at a time in 32-bit halves; the escape
-//! search takes the byte loop under 16 bytes; `String`'s `put_byte` pushes the byte directly.
+//! The writers stand. The parses were changed after this run, not yet measured: `parse_all`
+//! of an integer is `core`'s parse straight; a prefix parse reads its first eight digits by a
+//! plain byte loop and only longer ones eight at a time by SWAR (the vector digit run lost at
+//! every length and is gone); a float prefix finds its token's end in one pass over a
+//! 256-entry table and hands a plain decimal to `core` with no scan of ours.
 
 #![no_std]
 // blaze's lints (`blaze::trust`, `blaze::sans_io`) name their tool; inert under rustc.
@@ -98,21 +98,6 @@ mod write;
 /// the crossover; not an interface.
 #[doc(hidden)]
 pub mod twins {
-    /// A decimal `u64` at the front of `bytes`: `(value, digits)`, or `None`.
-    pub fn decimal_u64(bytes: &[u8]) -> Option<(u64, usize)> {
-        match crate::parse::decimal_u64(bytes) {
-            crate::parse::Decimal64::Value(v, n) => Some((v, n)),
-            _ => None,
-        }
-    }
-
-    pub fn decimal_u64_scalar(bytes: &[u8]) -> Option<(u64, usize)> {
-        match crate::parse::decimal_u64_scalar(bytes) {
-            crate::parse::Decimal64::Value(v, n) => Some((v, n)),
-            _ => None,
-        }
-    }
-
     pub fn next_special(bytes: &[u8]) -> usize {
         crate::simd::next_special(bytes, 0)
     }
@@ -131,6 +116,6 @@ pub use adapt::{PutDisplay, Shown};
 pub use float::Float;
 pub use int::Integer;
 pub use parse::{IntSyntax, Parse, ParseError, Unquoted, parse_all, parse_int, parse_quoted_in};
-pub use put::{Buf, Count, Overflow, Put};
+pub use put::{Count, Put};
 pub use show::{Bytes, Fixed, Hex, Nanos, Quoted, Show};
 pub use write::Writes;

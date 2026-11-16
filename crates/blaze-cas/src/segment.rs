@@ -507,52 +507,48 @@ impl Own {
             content,
         };
         let won = if kind == Kind::Output && bytes.len() >= CHUNK_FROM {
-            // The list of chunks and each chunk's LZ4 are made in the thread's reused buffers.
+            // The list of chunks is made in the thread's reused buffer. Each chunk is kept raw:
+            // an output is read on the edit loop, and a chunk read in place is copied once, into
+            // the value made whole (rule 51), where a compressed one is decoded first.
             scratch::with_bytes(|payload| {
-                scratch::with_bytes(|packed| {
-                    for range in chunk::cuts(bytes) {
-                        let piece = &bytes[range];
-                        let chunk = Key(ContentId::of(CHUNK_DOMAIN, piece));
-                        let kept = look.kept(&chunk);
-                        let copy = kept.is_some_and(|(_, there)| self.waits_on(look, there));
-                        #[cfg(test)]
-                        if kept.is_none()
-                            && let Some(pause) = &self.pause
-                        {
-                            pause(PutAt::ChunkMissed);
-                        }
-                        if kept.is_none() || copy {
-                            let (form, stored) = match cold::lz4_into(piece, packed) {
-                                true => (Form::Lz4, &packed[..]),
-                                false => (Form::Raw, piece),
-                            };
-                            let header = RecordHeader {
-                                kind: Kind::Output,
-                                form,
-                                dictionary: 0,
-                                stored: stored.len() as u64,
-                                raw: piece.len() as u64,
-                                key: chunk,
-                                content: content_of(piece),
-                            };
-                            // A chunk another put claimed between the look and this claim is the
-                            // same bytes (its key is their hash), but its record may be that
-                            // put's, not yet published: then this put keeps a copy, as it does
-                            // for one found kept at the look, or its ticket could turn durable
-                            // with the chunk only in the other writer's memory.
-                            let lost = match copy {
-                                true => true,
-                                false => self
-                                    .claim(look, Unit::SHARED, header, stored, ticket)
-                                    .is_err_and(|(_, there)| self.waits_on(look, there)),
-                            };
-                            if lost {
-                                self.write_copy(Unit::SHARED, &header, stored);
-                            }
-                        }
-                        disk::encode_chunk(payload, chunk, piece.len() as u64);
+                for range in chunk::cuts(bytes) {
+                    let piece = &bytes[range];
+                    let chunk = Key(ContentId::of(CHUNK_DOMAIN, piece));
+                    let kept = look.kept(&chunk);
+                    let copy = kept.is_some_and(|(_, there)| self.waits_on(look, there));
+                    #[cfg(test)]
+                    if kept.is_none()
+                        && let Some(pause) = &self.pause
+                    {
+                        pause(PutAt::ChunkMissed);
                     }
-                });
+                    if kept.is_none() || copy {
+                        let header = RecordHeader {
+                            kind: Kind::Output,
+                            form: Form::Raw,
+                            dictionary: 0,
+                            stored: piece.len() as u64,
+                            raw: piece.len() as u64,
+                            key: chunk,
+                            content: content_of(piece),
+                        };
+                        // A chunk another put claimed between the look and this claim is the
+                        // same bytes (its key is their hash), but its record may be that put's,
+                        // not yet published: then this put keeps a copy, as it does for one
+                        // found kept at the look, or its ticket could turn durable with the
+                        // chunk only in the other writer's memory.
+                        let lost = match copy {
+                            true => true,
+                            false => self
+                                .claim(look, Unit::SHARED, header, piece, ticket)
+                                .is_err_and(|(_, there)| self.waits_on(look, there)),
+                        };
+                        if lost {
+                            self.write_copy(Unit::SHARED, &header, piece);
+                        }
+                    }
+                    disk::encode_chunk(payload, chunk, piece.len() as u64);
+                }
                 let payload = &payload[..];
                 self.claim(look, unit, record(Form::Chunked, 0, payload), payload, ticket)
             })

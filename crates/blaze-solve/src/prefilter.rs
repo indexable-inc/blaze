@@ -21,7 +21,7 @@
 //! survivors read off the bitmask.
 
 use core::simd::cmp::SimdPartialEq;
-use core::simd::{LaneCount, Simd, SupportedLaneCount};
+use core::simd::Simd;
 
 use blaze_own::{Alloc, Vec};
 
@@ -213,10 +213,7 @@ pub fn filter_scalar(g: &Fingerprint, cols: Columns<'_>, out: &mut Vec<u32, Allo
     }
 }
 
-fn filter_n<const N: usize>(g: &Fingerprint, cols: Columns<'_>, out: &mut Vec<u32, Alloc<'_>>)
-where
-    LaneCount<N>: SupportedLaneCount,
-{
+fn filter_n<const N: usize>(g: &Fingerprint, cols: Columns<'_>, out: &mut Vec<u32, Alloc<'_>>) {
     let drop_wild = drops_wildcard();
     let stride = cols.stride as usize;
     let zero = Simd::<u8, N>::splat(0);

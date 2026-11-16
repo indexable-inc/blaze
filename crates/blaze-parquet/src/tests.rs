@@ -8,7 +8,7 @@ use blaze_own::Vec;
 
 use crate::{
     Concat, File, Input, Options, ParquetError, levels,
-    thrift::{In, Struct, zigzag32, zigzag64},
+    thrift::{In, Struct, zigzag},
     write,
 };
 
@@ -22,8 +22,8 @@ fn bytes(f: impl FnOnce(&mut Struct<'_, Global>)) -> std::vec::Vec<u8> {
 
 #[test]
 fn zigzag_is_the_specs() {
-    assert_eq!([zigzag32(0), zigzag32(-1), zigzag32(1), zigzag32(-2), zigzag32(i32::MAX)], [0, 1, 2, 3, u32::MAX - 1]);
-    assert_eq!(zigzag64(i64::MIN), u64::MAX);
+    assert_eq!([zigzag(0), zigzag(-1), zigzag(1), zigzag(-2), zigzag(i64::from(i32::MAX))], [0, 1, 2, 3, u64::from(u32::MAX) - 1]);
+    assert_eq!(zigzag(i64::MIN), u64::MAX);
 }
 
 #[test]

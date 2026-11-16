@@ -12,8 +12,8 @@ use blaze_own::Vec;
 use blaze_sim::{Broke, Config, Tape, check, control};
 
 use crate::{
-    Adler32, Crc32, Deflate, Error, GzipDecoder, Inflate, Level, Limits, Tree, Why,
-    ZlibDecoder, adler32, crc32, gunzip, gzip, inflate, unzlib, unzlib_prefix, zlib,
+    Adler32, Crc32, Deflate, Error, GzipDecoder, Inflate, InflateInto, Level, Limits, Tree, Why,
+    ZlibDecoder, ZlibInto, adler32, crc32, gunzip, gzip, inflate, unzlib, unzlib_prefix, zlib,
     plant::{self, Plant},
 };
 
@@ -57,6 +57,19 @@ fn decompress(stream: &[u8], limits: Limits, splits: &[usize]) -> Result<Vec<u8,
     }
     i.finish()?;
     Ok(out)
+}
+
+/// `stream` inflated into `out` with [`InflateInto`], fed in pieces; the bytes written.
+fn decompress_into(stream: &[u8], out: &mut [u8], splits: &[usize]) -> Result<usize, Error> {
+    let mut i = InflateInto::new(LOOSE);
+    let mut at = 0usize;
+    let mut sizes = splits.iter().copied().chain(core::iter::repeat(usize::MAX));
+    while at < stream.len() && !i.is_done() {
+        let end = at.saturating_add(sizes.next().unwrap_or(usize::MAX).max(1)).min(stream.len());
+        at += i.feed(&stream[at..end], out)?.consumed;
+    }
+    i.finish()?;
+    Ok(i.written() as usize)
 }
 
 /// Input of a shape that tests one edge of the matcher.
@@ -125,6 +138,19 @@ fn round_trip(tape: &Tape) -> Result<(), Broke> {
         .map_err(|e| oracle(format!("round trip refused: {e}")))?;
     if back[..] != data[..] {
         return Err(oracle(format!("round trip differs: {} bytes in, {} back", data.len(), back.len())));
+    }
+    let mut flat = std::vec![0u8; data.len()];
+    let n = decompress_into(&whole, &mut flat, &splits(tape, "slice splits"))
+        .map_err(|e| oracle(format!("the slice inflater refused: {e}")))?;
+    if n != data.len() || flat != data {
+        return Err(oracle(format!("the slice inflater differs: {} bytes in, {n} back", data.len())));
+    }
+    if !data.is_empty() {
+        let mut short = std::vec![0u8; data.len() - 1];
+        match decompress_into(&whole, &mut short, &[]) {
+            Err(e) if matches!(e.why, Why::OutputOver { .. }) => {}
+            other => return Err(oracle(format!("a slice one byte short gave {other:?}, not OutputOver"))),
+        }
     }
     let theirs = miniz_oxide::inflate::decompress_to_vec(&whole)
         .map_err(|e| oracle(format!("the reference refuses our stream: {e:?}")))?;
@@ -285,6 +311,17 @@ fn zlib_round_trip_and_prefix() {
         if piecewise[..] != data[..] {
             return Err(oracle(String::from("zlib fed bytewise differs")));
         }
+        // Into a slice, a byte at a time, the same; the bytes after it stay its next thing's.
+        let mut z = ZlibInto::new(LOOSE);
+        let mut flat = std::vec![0u8; data.len()];
+        let mut at = 0;
+        while !z.finish().is_ok() && at < both.len() {
+            at += z.feed(&both[at..at + 1], &mut flat).map_err(|e| oracle(format!("{e}")))?.consumed;
+        }
+        z.finish().map_err(|e| oracle(format!("{e}")))?;
+        if flat != data || z.written() as usize != data.len() || z.stream_len() as usize != first.len() {
+            return Err(oracle(String::from("zlib into a slice differs")));
+        }
         Ok(())
     });
 }
@@ -390,4 +427,40 @@ fn deflate_is_deterministic_across_runs() {
         let b = compress(&data, level, &[1, 2, 3, 65_536, 100_000]);
         assert!(a[..] == b[..], "{level:?}: bytes differ by split");
     }
+}
+
+/// Each vector routine equals its scalar twin on random input at every alignment.
+#[test]
+fn vector_routines_equal_their_scalar_twins() {
+    use crate::simd::{adler_run, adler_run_scalar, match_len, match_len_scalar};
+    check(Config::cases(400), |tape| {
+        // Two copies of a piece with a few bytes changed: long agreements that end anywhere.
+        let piece = tape.bytes(0..=600, "piece");
+        let skew = tape.int_in(0usize..=31, "skew");
+        let mut data = tape.bytes(skew..=skew, "lead");
+        let a = data.len();
+        data.extend_from_slice(&piece);
+        let b = data.len() + tape.int_in(0usize..=17, "gap");
+        data.resize(b, 0);
+        data.extend_from_slice(&piece);
+        for _ in 0..tape.int_in(0usize..=3, "changes") {
+            if !piece.is_empty() {
+                let at = b + tape.index(piece.len(), "changed at");
+                data[at] = data[at].wrapping_add(1 + tape.int_in(0u8..=254, "by"));
+            }
+        }
+        let most = piece.len();
+        let from = tape.int_in(0usize..=most.min(3), "from");
+        let (v, s) = (match_len(&data, a, b, from, most), match_len_scalar(&data, a, b, from, most));
+        if v != s {
+            return Err(oracle(format!("match_len {v}, its twin {s} (a {a}, b {b}, from {from}, most {most})")));
+        }
+        let run = &data[skew..data.len().min(skew + 5_552)];
+        let start = (tape.int_in(1u32..=65_520, "a"), tape.int_in(0u32..=65_520, "b"));
+        let (v, s) = (adler_run(start.0, start.1, run), adler_run_scalar(start.0, start.1, run));
+        if v != s {
+            return Err(oracle(format!("adler_run {v:?}, its twin {s:?} over {} bytes", run.len())));
+        }
+        Ok(())
+    });
 }

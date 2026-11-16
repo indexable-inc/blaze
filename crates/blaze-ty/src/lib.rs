@@ -30,6 +30,8 @@ mod index;
 mod infer;
 mod kind;
 mod memo;
+#[doc(hidden)]
+pub mod pieces;
 mod portable;
 mod print;
 mod relate;

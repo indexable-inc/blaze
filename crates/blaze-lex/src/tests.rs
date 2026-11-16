@@ -499,7 +499,7 @@ fn utf8_is_core_on_every_boundary_form_at_every_alignment() {
         for cpu in cpus() {
             same_utf8("a mix of sequences", &bytes, cpu)?;
         }
-        Ok(())
+        Ok::<(), Broke>(())
     });
 }
 
@@ -567,8 +567,7 @@ fn every_class_of_every_byte_on_every_path_is_its_predicate() {
         }
     }
     blaze_sim::check(Config::cases(500), |tape: &Tape| {
-        let mut block = [0u8; 64];
-        tape.fill(&mut block, "block");
+        let block: [u8; 64] = tape.array("block", |tape| tape.below(256, "byte").truncate_to::<u8>());
         for cpu in cpus() {
             let (got, want) = (classify(cpu, &block), oracle_masks(&block));
             if got != want {

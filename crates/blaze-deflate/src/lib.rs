@@ -4,7 +4,9 @@
 //! | type | what |
 //! |---|---|
 //! | [`Inflate`] | raw DEFLATE read, fed in pieces, bounded by [`Limits`] |
+//! | [`InflateInto`], [`ZlibInto`] | the same into one slice the caller sized: no window, no copy |
 //! | [`ZlibDecoder`], [`GzipDecoder`] | the same in a frame, its checksum checked |
+//! | [`MAX_RATIO`] | DEFLATE's largest expansion (1032), for sizing a bomb limit |
 //! | [`Deflate`] | raw DEFLATE written at a [`Level`], deterministic |
 //! | [`ZlibEncoder`], [`GzipEncoder`] | the same in a frame |
 //! | [`Adler32`], [`Crc32`] | the frames' checksums |
@@ -21,13 +23,14 @@
 #![no_std]
 #![cfg_attr(test, feature(allocator_api))]
 // `#![blaze::sans_io]` in the modules names blaze's tool; inert under rustc.
-#![feature(register_tool, custom_inner_attributes)]
+#![feature(register_tool, custom_inner_attributes, portable_simd)]
 #![register_tool(blaze)]
 
 #[cfg(test)]
 extern crate std;
 
 mod checksum;
+pub mod simd;
 mod deflate;
 mod error;
 mod gzip;
@@ -47,8 +50,8 @@ pub use checksum::{Adler32, Crc32, adler32, crc32};
 pub use deflate::{Deflate, DeflateError, Level};
 pub use error::{Error, Format, Tree, Why};
 pub use gzip::{GzipDecoder, GzipEncoder};
-pub use inflate::{Fed, Inflate, Limits, RATIO_SLACK};
-pub use zlib::{ZlibDecoder, ZlibEncoder};
+pub use inflate::{Fed, Inflate, InflateInto, Limits, MAX_RATIO, RATIO_SLACK};
+pub use zlib::{ZlibDecoder, ZlibEncoder, ZlibInto};
 
 /// `input` deflated at `level`, appended to `out`; the deflater's buffers in `alloc`.
 pub fn deflate<A: Allocator + Clone, B: Allocator>(

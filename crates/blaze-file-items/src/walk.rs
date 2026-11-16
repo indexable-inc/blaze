@@ -15,7 +15,7 @@ use blaze_surface::{
     WrittenVis,
 };
 use parser::{
-    Edition, LexedStr, OutlineStep, Step,
+    Edition, Input, LexedStr, OutlineStep, Reparser, Step,
     SyntaxKind::{self, *},
 };
 
@@ -44,7 +44,7 @@ const PLACEHOLDER: Item = Item {
     signature_hash: ContentId([0; 32]),
 };
 
-pub(crate) fn outline<'a>(text: &str, edition: Edition, alloc: Alloc<'a>) -> Outline<'a> {
+pub(crate) fn outline<'a>(text: &str, edition: Edition, bodies: Bodies, alloc: Alloc<'a>) -> Outline<'a> {
     assert!(
         u32::try_from(text.len()).is_ok(),
         "a source file of {} bytes: an outline's ranges are u32 pairs",
@@ -52,33 +52,67 @@ pub(crate) fn outline<'a>(text: &str, edition: Edition, alloc: Alloc<'a>) -> Out
     );
     let lexed = LexedStr::new(edition, text);
     let input = lexed.to_input(edition);
-    let output = parser::TopEntryPoint::SourceFile.parse(input.tokens());
+    let output = match bodies {
+        Bodies::Parsed => parser::TopEntryPoint::SourceFile.parse(input.tokens()),
+        Bodies::Skipped => parser::TopEntryPoint::SourceFile.parse_outline(input.tokens()),
+    };
     let mut walk = Walk::new(text, &lexed, edition, alloc);
     for step in output.steps() {
         match step {
-            OutlineStep::Step(Step::Token { n_input_tokens, .. }) => {
-                for _ in 0..n_input_tokens {
-                    walk.token();
-                }
-            }
-            // `x.0.1`: one float token, then the node it ends and, past a second field, the
-            // one the parser left open for it (`Output`'s depth accounting).
-            OutlineStep::Step(Step::FloatSplit { ends_in_dot }) => {
-                walk.token();
-                walk.exit();
-                if !ends_in_dot {
-                    walk.exit();
-                }
-            }
-            OutlineStep::Step(Step::Enter { kind }) => walk.enter(kind),
-            OutlineStep::Step(Step::Exit) => walk.exit(),
-            OutlineStep::Step(Step::Error { msg }) => walk.parser_error(msg),
-            OutlineStep::Lazy { kind, .. } => {
-                unreachable!("a full parse's output holds a lazy {kind:?}")
+            OutlineStep::Step(step) => walk.step(step),
+            OutlineStep::Lazy { kind, n_input_tokens } => {
+                assert_eq!(kind, BLOCK_EXPR, "an outline leaves only a `fn` body unparsed");
+                walk.lazy_body(&input, n_input_tokens);
             }
         }
     }
     walk.finish()
+}
+
+/// Whether the parser has a `{ .. }` body that holds an item or a macro call at any depth
+/// (an `is_item` node) among input tokens `from..from + len`, when the tokens may say so: false
+/// only when none of them can start one. Every item but a macro call starts with its keyword
+/// (`fn`, `struct`, `enum`, `trait`, `impl`, `const`, `static`, `type`, `mod`, `use`,
+/// `extern`, `macro`, or the contextual `union`); `macro_rules!` and every macro call have a
+/// `!` right after a path, whose last token is an identifier, a path keyword or a generic
+/// argument list's `>`. The grammar takes a `!` there as a call's (`path_expr`, `type_path`,
+/// `path_or_macro_pat`) unless it is a joint `!=` in an expression or type; only a pattern
+/// right before a joint `!=` (`let a != b`), which nothing valid has, is a call this misses.
+/// A `const` right after `*` is a pointer type's, never an item's.
+fn may_hold_items(input: &Input, from: usize, len: usize) -> bool {
+    let mut prev = EOF;
+    for at in from..from + len {
+        let (kind, contextual, _, joint, _) = input.token(at);
+        let item = match kind {
+            FN_KW | STRUCT_KW | ENUM_KW | TRAIT_KW | IMPL_KW | STATIC_KW | TYPE_KW | MOD_KW
+            | USE_KW | EXTERN_KW | MACRO_KW => true,
+            CONST_KW => prev != STAR,
+            IDENT => contextual == UNION_KW,
+            BANG => {
+                matches!(prev, IDENT | SELF_KW | SUPER_KW | CRATE_KW | SELF_TYPE_KW | R_ANGLE)
+                    && !(joint && input.token(at + 1).0 == EQ)
+            }
+            _ => false,
+        };
+        if item {
+            return true;
+        }
+        prev = kind;
+    }
+    false
+}
+
+/// How an outline reads a `fn` body: parsed with the rest, or left unparsed, as the parser's
+/// outline mode leaves it (`TopEntryPoint::parse_outline`, `lazy_block_len`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bodies {
+    /// Every body parsed: the reference the skipping walk is tested equal to.
+    Parsed,
+    /// A body the parser may leave unparsed is not parsed, unless its tokens may hold an item or
+    /// a macro call ([`may_hold_items`]), which only a parse can tell apart from a body that does
+    /// not; its tokens are hashed as they are either way. A body's own syntax errors are not the
+    /// outline's then: they are found when the body is parsed for its own record.
+    Skipped,
 }
 
 /// Whose a list or an attribute is: the file's, or an entry's.
@@ -179,6 +213,11 @@ struct Walk<'t, 'l, 'a> {
     /// generic over its allocator; here it is the handle's.
     siblings: ByHash<ContentId, u32, Alloc<'a>>,
     file_children: u32,
+    /// The input tokens (trivia not counted) the parser has taken.
+    taken: usize,
+    /// A body is being walked from its own parse ([`Walk::lazy_body`]): its errors are not the
+    /// outline's.
+    body_errors_muted: bool,
     out: Outline<'a>,
 }
 
@@ -197,6 +236,8 @@ impl<'t, 'l, 'a> Walk<'t, 'l, 'a> {
             tokens: Vec::new_in(alloc),
             siblings: ByHash::new_in(alloc),
             file_children: 0,
+            taken: 0,
+            body_errors_muted: false,
             out: Outline {
                 items: Vec::new_in(alloc),
                 attrs: Vec::new_in(alloc),
@@ -243,8 +284,72 @@ impl<'t, 'l, 'a> Walk<'t, 'l, 'a> {
         }
     }
 
+    fn step(&mut self, step: Step<'_>) {
+        match step {
+            Step::Token { n_input_tokens, .. } => {
+                for _ in 0..n_input_tokens {
+                    self.token();
+                }
+            }
+            // `x.0.1`: one float token, then the node it ends and, past a second field, the
+            // one the parser left open for it (`Output`'s depth accounting).
+            Step::FloatSplit { ends_in_dot } => {
+                self.token();
+                self.exit();
+                if !ends_in_dot {
+                    self.exit();
+                }
+            }
+            Step::Enter { kind } => self.enter(kind),
+            Step::Exit => self.exit(),
+            Step::Error { msg } if !self.body_errors_muted => self.parser_error(msg),
+            Step::Error { .. } => {}
+        }
+    }
+
+    /// A `fn` body the parser left unparsed, its next `len` input tokens: walked as the block it
+    /// is, its tokens hashed, and parsed only when it may hold an item or a macro call.
+    fn lazy_body(&mut self, input: &Input, len: u32) {
+        let len = usize::try_from(len).expect("a body's tokens are counted in usize");
+        let from = self.taken;
+        if !may_hold_items(input, from, len) {
+            self.enter(BLOCK_EXPR);
+            for _ in 0..len {
+                self.token();
+            }
+            self.exit();
+            return;
+        }
+        // The body's tokens alone, as the file's input holds them: a block's parse alone is the
+        // subtree a full parse makes there (crates/parser/src/outline.rs).
+        let mut body = Input::with_capacity(len);
+        for at in from..from + len {
+            let (kind, contextual, edition, joint, _) = input.token(at);
+            match kind {
+                IDENT => body.push_ident(contextual, edition),
+                _ => body.push(kind, edition),
+            }
+            if joint {
+                body.was_joint();
+            }
+        }
+        let parsed = Reparser::for_node(BLOCK_EXPR, None, None)
+            .expect("a block expression has a reparser")
+            .parse(body.tokens());
+        self.body_errors_muted = true;
+        for step in parsed.steps() {
+            match step {
+                OutlineStep::Step(step) => self.step(step),
+                OutlineStep::Lazy { kind, .. } => unreachable!("a full parse's output holds a lazy {kind:?}"),
+            }
+        }
+        self.body_errors_muted = false;
+        assert_eq!(self.taken, from + len, "a body's parse takes every token of the body");
+    }
+
     /// The parser took one raw token.
     fn token(&mut self) {
+        self.taken += 1;
         self.skip_trivia();
         assert!(self.pos < self.lexed.len(), "the parser took a token past the lexer's last");
         let kind = self.lexed.kind(self.pos);

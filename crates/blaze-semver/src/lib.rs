@@ -29,6 +29,7 @@
 
 use core::fmt;
 
+mod data;
 mod ident;
 mod req;
 mod version;

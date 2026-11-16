@@ -89,6 +89,9 @@ const F_POPPED: u32 = 1 << 18;
 
 const NO_RANGE: Range = Range::new(NONE, NONE);
 
+/// On the coroutine stack: a plain closure, which hides the coroutine around it.
+pub(crate) const NOT_CORO: u32 = NONE - 1;
+
 /// An open node.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Frame {
@@ -494,6 +497,11 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
     }
 
     pub(crate) fn parse_error(&mut self) {
+        if self.skip > 0 {
+            // Inside a node skipped wholesale: its own lowering reports it (and a signature's
+            // record stays a function of its key's text, which a body is not part of).
+            return;
+        }
         let at = self.last_end;
         self.out.diags.push(Diag { kind: DiagKind::Syntax, range: Range::new(at, at) }.encode());
     }
@@ -593,7 +601,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                     self.top_mut().flags |= F_LOOP;
                 }
             }
-            FN if depth == self.root_depth + 1
+            FN if depth == self.root_depth.wrapping_add(1)
                 && self.mode == Mode::Body
                 && kind == BLOCK_EXPR
                 && p.flags & F_ASYNC != 0 =>
@@ -634,19 +642,19 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
     fn on_token(&mut self, kind: SyntaxKind) {
         let depth = self.frames.len();
         let mode = self.mode;
-        let root = self.root_depth;
+        let root = self.root_depth.wrapping_add(1);
         let Some(top) = self.frames.last_mut() else { return };
         match (top.kind, kind) {
             (VARIANT | RECORD_FIELD | KEY_VALUE_META, EQ) => top.flags |= F_EQ,
-            (CONST | STATIC, EQ) if depth == root + 1 && mode == Mode::Signature => top.flags |= F_EQ,
+            (CONST | STATIC, EQ) if depth == root && mode == Mode::Signature => top.flags |= F_EQ,
             (BLOCK_EXPR | CLOSURE_EXPR, ASYNC_KW) => top.flags |= F_ASYNC,
             (BLOCK_EXPR | CLOSURE_EXPR, GEN_KW) => top.flags |= F_GEN,
             (BLOCK_EXPR | CLOSURE_EXPR, CONST_KW) => top.flags |= F_CONST,
             (BLOCK_EXPR, UNSAFE_KW) => top.flags |= F_UNSAFE,
             (BLOCK_EXPR | CLOSURE_EXPR, MOVE_KW) => top.flags |= F_MOVE,
             (CLOSURE_EXPR, STATIC_KW) => top.flags |= F_STATIC,
-            (FN, ASYNC_KW) if depth == root + 1 => top.flags |= F_ASYNC,
-            (FN, GEN_KW) if depth == root + 1 => top.flags |= F_GEN,
+            (FN, ASYNC_KW) if depth == root => top.flags |= F_ASYNC,
+            (FN, GEN_KW) if depth == root => top.flags |= F_GEN,
             (ARRAY_EXPR, SEMICOLON) => top.flags |= F_SEMI,
             _ => {}
         }
@@ -664,7 +672,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             return true;
         }
         let depth = self.frames.len();
-        let parent_is_root = depth == self.root_depth + 1;
+        let parent_is_root = depth == self.root_depth.wrapping_add(1);
         match self.mode {
             Mode::Signature => {
                 parent_is_root && (kind == BLOCK_EXPR || p.flags & F_EQ != 0 && matches!(p.kind, CONST | STATIC))
@@ -785,6 +793,11 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             }
         }
         None
+    }
+
+    /// Inside an `async` or `gen` body, with no plain closure between.
+    pub(crate) fn in_coroutine(&self) -> bool {
+        self.coros.last().is_some_and(|c| *c != NOT_CORO)
     }
 
     pub(crate) fn add_jump(&mut self, entry: usize, expr: ExprId) {
@@ -1070,12 +1083,12 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 self.push(V::Type, t.0, r);
             }
             PAREN_TYPE => {
+                // `(T)` is `T`.
                 let inner = self.first(f, V::Type);
                 self.done(f);
-                self.type_of(inner, r, |_| TypeRef::Error);
-                if let (Some(inner), Some(last)) = (inner, self.vals.last_mut()) {
-                    // `(T)` is `T`: the paren row stays unread, the value is the inner type.
-                    last.id = inner.id;
+                match inner {
+                    Some(inner) => self.push(V::Type, inner.id, r),
+                    None => self.type_of(None, r, |_| TypeRef::Error),
                 }
             }
             ARRAY_TYPE => {
@@ -1169,9 +1182,8 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 self.done(f);
                 self.push_list(L::Names, l, r);
             }
-            FOR_BINDER | VISIBILITY_INNER | MATCH_ARM_LIST | PARAM_LIST | ARG_LIST
-                if false => {}
-            FOR_BINDER | VISIBILITY_INNER | CFG_PRED_EXPR => {}
+            // Read through: their children's values are their parent's.
+            FOR_BINDER | VISIBILITY_INNER => {}
             GENERIC_PARAM_LIST => {
                 let l = self.put_rows(f, ROW_GENERIC_PARAM);
                 self.done(f);
@@ -1291,18 +1303,19 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             CFG_ATOM => self.cfg_atom(f, r),
             CFG_COMPOSITE => self.cfg_composite(f, r),
             VISIBILITY => {
-                let code = if self.has_tok(f, IN_KW) {
-                    5
-                } else if self.has_tok(f, CRATE_KW) {
-                    2
-                } else if self.has_tok(f, SELF_KW) {
-                    3
-                } else if self.has_tok(f, SUPER_KW) {
-                    4
-                } else {
-                    1
-                };
+                // `pub(crate)`, `pub(self)`, `pub(super)` are one-segment paths; `pub(in p)`
+                // any path.
                 let path = self.first(f, V::Path).map_or(NONE, |p| p.id);
+                let code = match (self.has_tok(f, IN_KW), unopt(path)) {
+                    (_, None) => 1,
+                    (true, Some(_)) => 5,
+                    (false, Some(p)) => match self.single_segment(PathIdx(p)).map(|s| s.kind) {
+                        Some(SegKind::Crate) => 2,
+                        Some(SegKind::SelfMod) => 3,
+                        Some(SegKind::Super) => 4,
+                        _ => 5,
+                    },
+                };
                 self.done(f);
                 let mut node = Node::of(0);
                 node.flags = code;
@@ -1365,7 +1378,9 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 let mut rows: AVec<'_, (Node, Range)> = Vec::new_in(self.vals.allocator().clone());
                 for (n, range) in nodes.iter() {
                     let name = (n.a != NONE).then(|| self.name(Range::new(n.a, n.b)));
-                    let item = LocalItem { syntax: n.tag, name, range: *range, scope: None };
+                    // Its range only in the side column: an edit of its body leaves the
+                    // trait's or impl's rows equal.
+                    let item = LocalItem { syntax: n.tag, name, range: Range::new(0, 0), scope: None };
                     rows.push((item.encode(ROW_ASSOC), *range));
                 }
                 let l = self.put_rows_of(&rows);
@@ -1377,7 +1392,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 if self.is_root_frame() =>
             {
                 match self.mode {
-                    Mode::Signature => self.signature_root(f, r),
+                    Mode::Signature => self.signature_root(f),
                     _ => self.body_root(f, r),
                 }
             }
@@ -1569,7 +1584,22 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 }
             }
             RANGE_EXPR => {
-                let e = self.range_expr(f, r);
+                let base = f.base as usize;
+                let op = self.vals[base..].iter().position(|v| matches!(v.v, V::Tok(DOT2 | DOT2EQ | DOT3)));
+                let inclusive = self.has_tok(f, DOT2EQ) || self.has_tok(f, DOT3);
+                let mut lo = None;
+                let mut hi = None;
+                for (i, v) in self.vals[base..].iter().enumerate() {
+                    if v.v == V::Expr {
+                        if op.is_some_and(|op| i < op) {
+                            lo = Some(ExprId(v.id));
+                        } else {
+                            hi = Some(ExprId(v.id));
+                        }
+                    }
+                }
+                self.done(f);
+                let e = self.range_expr(lo, hi, inclusive, r);
                 self.push(V::Expr, e.0, r);
                 return;
             }
@@ -1674,14 +1704,29 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 return;
             }
             WHILE_EXPR => {
-                let e = self.while_loop(f, r);
+                let cond = self.kid(f, 0, |v| v == V::Expr).map(|v| ExprId(v.id));
+                let body = self.kid(f, 1, |v| v == V::Expr).map(|v| ExprId(v.id));
+                self.done(f);
+                let cond = cond.unwrap_or_else(|| self.put_expr(Expr::Missing, r));
+                let body = body.unwrap_or_else(|| self.put_expr(Expr::Missing, r));
+                let e = self.while_loop(cond, body, r);
                 self.loop_target = e.0;
                 self.push(V::Expr, e.0, r);
                 return;
             }
             FOR_EXPR => {
-                let e = self.for_loop(f, r);
-                self.push(V::Expr, e.0, r);
+                let pat = self.first(f, V::Pat).map(|v| PatId(v.id));
+                let head = self.kid(f, 0, |v| v == V::Expr).map(|v| ExprId(v.id));
+                let body = self.kid(f, 1, |v| v == V::Expr).map(|v| ExprId(v.id));
+                self.done(f);
+                let pat = pat.unwrap_or_else(|| self.put_pat(Pat::Missing, r));
+                let head = head.unwrap_or_else(|| self.put_expr(Expr::Missing, r));
+                let body = body.unwrap_or_else(|| self.put_expr(Expr::Missing, r));
+                let e = self.for_loop(pat, head, body, r);
+                if f.flags & F_LOOP != 0 {
+                    self.loop_target = e.inner_loop.0;
+                }
+                self.push(V::Expr, e.outer.0, r);
                 return;
             }
             BREAK_EXPR | CONTINUE_EXPR => {
@@ -1715,7 +1760,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             YIELD_EXPR => {
                 let v = self.first(f, V::Expr).map(|v| ExprId(v.id));
                 self.done(f);
-                if self.coros.is_empty() {
+                if !self.in_coroutine() {
                     self.diag(DiagKind::YieldOutsideCoroutine, r);
                 }
                 Expr::Yield { value: v }
@@ -1869,6 +1914,11 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 let p = self.first(f, V::Pat);
                 self.done(f);
                 let Some(p) = p else { return };
+                if name.is_none() && Pat::decode(self.out.pats[p.id as usize]) == Ok(Pat::Rest) {
+                    // `S { a, .. }`: the rest, for the field list.
+                    self.push(V::Pat, p.id, r);
+                    return;
+                }
                 let (name, shorthand) = match name {
                     Some(n) => (NameIdx(n.id), false),
                     None => match self.bound_name(PatId(p.id)) {
@@ -2103,14 +2153,37 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         self.push(V::Path, p.0, r);
     }
 
+    /// Opens a frame no parser node made, to hold the values of what is fed inside it (a
+    /// format argument's expression): its parent sees none of them. Returns its values' base.
+    pub(crate) fn open_container(&mut self) -> usize {
+        let base = self.vals.len();
+        self.frames.push(Frame {
+            kind: TOKEN_TREE,
+            start: NONE,
+            base: idx(base),
+            locals: idx(self.locals.len()),
+            pending: idx(self.pending.len()),
+            saved_barrier: self.barrier,
+            // Where the source was: what is fed inside is earlier text, re-read.
+            aux: self.last_end,
+            flags: 0,
+        });
+        base
+    }
+
+    /// Closes the frame [`Machine::open_container`] opened, dropping its values.
+    pub(crate) fn close_container(&mut self, base: usize) {
+        let f = self.frames.pop().expect("a container closes what it opened");
+        debug_assert_eq!(f.base as usize, base, "a container closes its own frame");
+        self.vals.truncate(base);
+        self.pending.truncate(f.pending as usize);
+        self.last_end = f.aux;
+    }
+
     /// A path in expression position: a local when it is one name in scope.
-    fn path_expr(&mut self, p: PathIdx) -> Expr {
-        let path = PathRef::decode(self.out.paths[p.0 as usize]);
-        if let Ok(path) = path
-            && path.segments.len == 1
-            && !path.absolute
-            && let Ok(seg) = Segment::decode(self.out.rows[path.segments.start as usize])
-            && seg.kind == SegKind::Ident
+    pub(crate) fn path_expr(&mut self, p: PathIdx) -> Expr {
+        if let Some(seg) = self.single_segment(p)
+            && matches!(seg.kind, SegKind::Ident | SegKind::SelfMod)
             && !seg.has_args
             && let Some(name) = seg.name
             && let Some(pat) = self.lookup(self.out.names[name.0 as usize])
@@ -2118,6 +2191,15 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             return Expr::Local { pat, path: p };
         }
         Expr::Path(p)
+    }
+
+    /// The segment of a relative path of one segment.
+    fn single_segment(&self, p: PathIdx) -> Option<Segment> {
+        let path = PathRef::decode(self.out.paths[p.0 as usize]).ok()?;
+        if path.segments.len != 1 || path.absolute {
+            return None;
+        }
+        Segment::decode(self.out.rows[path.segments.start as usize]).ok()
     }
 
     fn generic_args(&mut self, f: &Frame, r: Range) {
@@ -2186,10 +2268,11 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         match parent.map(|p| p.kind) {
             Some(CLOSURE_EXPR) => {
                 self.activate(f.pending);
-                if parent.is_some_and(|p| p.flags & (F_ASYNC | F_GEN) != 0) {
-                    self.coros.push(NONE);
-                    self.top_mut().flags |= F_CORO;
-                }
+                // A plain closure is no coroutine: `.await` and `yield` in it are refused, as
+                // rustc does, though it sits in one.
+                let coro = parent.is_some_and(|p| p.flags & (F_ASYNC | F_GEN) != 0);
+                self.coros.push(if coro { NONE } else { NOT_CORO });
+                self.top_mut().flags |= F_CORO;
             }
             Some(FN) if self.mode == Mode::Body && self.is_root_frame() => self.activate(f.pending),
             // A fn pointer's names, a signature's patterns: bound nowhere.
@@ -2223,7 +2306,6 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
     }
 
     fn attr(&mut self, f: &Frame, r: Range) {
-        let _ = r;
         if self.count(f, |v| v == V::CfgFalse) > 0 {
             self.done(f);
             self.push(V::CfgFalse, NONE, r);
@@ -2355,7 +2437,10 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         };
         // An async closure's coroutine was opened by its parameter list (F_CORO on this
         // frame), so its resume pattern is the innermost coroutine's until cleanup.
-        let resume = if f.flags & F_CORO != 0 { self.coros.last().copied().and_then(unopt).map(PatId) } else { None };
+        let resume = match kind {
+            CoroutineKind::None => None,
+            _ => self.coros.last().copied().filter(|p| *p != NOT_CORO).and_then(unopt).map(PatId),
+        };
         let c = Closure {
             params,
             ret,
@@ -2494,15 +2579,20 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
             Some(MACRO_EXPR) => MacroPlace::Expr,
             _ => MacroPlace::Item,
         };
+        let mut why = Why::Kind;
         if matches!(place, MacroPlace::Expr | MacroPlace::Stmt)
             && let Some(name) = self.single_name(path)
             && matches!(name, "format_args" | "format_args_nl" | "const_format_args")
-            && let Some(e) = self.format_args(name == "format_args_nl", input, r)
         {
-            self.push(V::Expr, e.0, r);
-            return;
+            match self.format_args(name == "format_args_nl", input, r) {
+                Ok(e) => {
+                    self.push(V::Expr, e.0, r);
+                    return;
+                }
+                Err(w) => why = w,
+            }
         }
-        self.unhandled(MACRO_CALL, r, Why::Kind);
+        self.unhandled(MACRO_CALL, r, why);
         let row = self.put_row(MacroCall { path, input, place }.encode(), r);
         match place {
             MacroPlace::Pat => {
@@ -2523,17 +2613,12 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
 
     /// The text of a path of one plain segment.
     pub(crate) fn single_name(&self, p: PathIdx) -> Option<&'t str> {
-        let path = PathRef::decode(self.out.paths[p.0 as usize]).ok()?;
-        if path.segments.len != 1 {
-            return None;
-        }
-        let seg = Segment::decode(self.out.rows[path.segments.start as usize]).ok()?;
+        let seg = self.single_segment(p)?;
         let name = seg.name?;
         Some(self.out.name_ranges[name.0 as usize].of(self.text))
     }
 
-    fn signature_root(&mut self, f: &Frame, r: Range) {
-        let _ = r;
+    fn signature_root(&mut self, f: &Frame) {
         let attrs = self.put_rows(f, ROW_ATTR);
         let vis = self.vis_of(f);
         let name = self.first(f, V::Name).map_or(NONE, |v| v.id);
@@ -2549,8 +2634,9 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         let items = self.list_of(f, L::Items).map(|l| l.0);
         let t0 = self.kid(f, 0, |v| v == V::Type).map(|v| v.id);
         let t1 = self.kid(f, 1, |v| v == V::Type).map(|v| v.id);
-        let body = self.kid(f, 0, |v| matches!(v, V::Skipped(BLOCK_EXPR) | V::Skipped(_)) && f.kind != STRUCT).is_some()
-            || f.flags & F_EQ != 0;
+        // A fn's body is a lazy node of the outline, or a block skipped; a const's or
+        // static's value follows its `=`.
+        let body = self.first(f, V::Skipped(BLOCK_EXPR)).is_some() || f.flags & F_EQ != 0;
         let mut flags = 0;
         for (tok, flag) in [
             (CONST_KW, sig::CONST),
@@ -2585,7 +2671,7 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         let h = &mut self.out.head;
         h[head::SYNTAX] = f.kind as u32;
         h[head::FLAGS] = flags;
-        let mut set_list = |h: &mut crate::columns::Head, word: usize, l: Option<List>| {
+        let set_list = |h: &mut crate::columns::Head, word: usize, l: Option<List>| {
             if let Some(l) = l {
                 h[word] = l.start;
                 h[word + 1] = l.len;

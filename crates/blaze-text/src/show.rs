@@ -10,7 +10,9 @@ use blaze_own::{Arc, BTreeMap, BTreeSet, Box, Rc, SortedMap, SortedSet, String, 
 use crate::float::Float;
 use crate::int::Integer;
 use crate::parse::ParseError;
-use crate::put::{Overflow, Put};
+use blaze_own::Overflow;
+
+use crate::put::Put;
 use crate::write::Writes;
 
 /// A value's human form.
@@ -194,7 +196,8 @@ impl Show for ParseError {
 /// `text needs N bytes; the buffer holds M`.
 impl Show for Overflow {
     fn show<P: Put + ?Sized>(&self, out: &mut P) {
-        out.str("text needs ").int(self.needed).str(" bytes; the buffer holds ").int(self.capacity);
+        // As blaze-own's `Display` for it says.
+        out.str("a fixed string of ").int(self.capacity).str(" bytes was asked for ").int(self.needed);
     }
 }
 

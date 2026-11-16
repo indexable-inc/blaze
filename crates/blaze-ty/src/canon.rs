@@ -148,6 +148,11 @@ impl Canonicalize<'_, '_, '_> {
 impl Hook for Canonicalize<'_, '_, '_> {
     type Error = FoldError;
 
+    #[inline(always)]
+    fn skip(&self, f: Flags, _: u32) -> bool {
+        !f.has(Flags::INFER | Flags::PLACEHOLDER | Flags::PARAM | Flags::FREE_REGIONS)
+    }
+
     fn pre(&mut self, tys: &mut Tys<'_>, vars: &mut Vars<'_>, n: Node, _: u32, _: u8) -> Result<Step, FoldError> {
         let need = Flags::INFER | Flags::PLACEHOLDER | Flags::PARAM | Flags::FREE_REGIONS;
         if !tys.node_flags(n).has(need) {
@@ -275,6 +280,11 @@ struct Values {
 
 impl Hook for Values {
     type Error = FoldError;
+
+    #[inline(always)]
+    fn skip(&self, f: Flags, _: u32) -> bool {
+        !f.has(Flags::CANONICAL)
+    }
 
     fn pre(&mut self, tys: &mut Tys<'_>, _: &mut Vars<'_>, n: Node, depth: u32, _: u8) -> Result<Step, FoldError> {
         if !tys.node_flags(n).has(Flags::CANONICAL) {

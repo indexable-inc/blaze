@@ -18,10 +18,9 @@ use std::alloc::Global;
 use blaze_mem::{Frame, Tag};
 use blaze_sim::{Config, Tape};
 
-use crate::image::{
-    Color, Depth, Image, ImageError, Limits, decode, decode_bytes, encode,
-    zlib::{Crc, Inflate, compress},
-};
+use blaze_deflate::{Crc32 as Crc, Level, MAX_RATIO, ZlibInto};
+
+use crate::image::{Color, Depth, Image, ImageError, Limits, decode, decode_bytes, encode};
 
 /// What a frame may round its first allocation up by: the decode limit is checked against the
 /// frame's peak with this much room.
@@ -76,13 +75,15 @@ fn deflate_round_trips_through_inflate() {
         let len = tape.int_in(0..=100_000u64, "len") as usize;
         let mode = tape.int_in(0..=2u64, "content mode");
         let data = content(tape, len, mode);
-        let z = compress(&data, Global).unwrap_or_else(|e| panic!("compress {len} bytes: {e}"));
-        let mut out = vec![0u8; len + 1];
-        let mut inflate = Inflate::new();
-        inflate.feed(&z, false, &mut out).unwrap_or_else(|e| panic!("inflate {len} bytes: {e}"));
-        assert!(inflate.done(), "the stream of {len} bytes did not end");
-        assert_eq!(inflate.written(), len, "the stream of {len} bytes inflated to {}", inflate.written());
-        assert!(out[..len] == data[..], "the stream of {len} bytes inflated to other bytes");
+        let mut z = blaze_own::Vec::new_in(Global);
+        blaze_deflate::zlib(&data, Level::Fast, Global, &mut z).unwrap_or_else(|e| panic!("compress {len} bytes: {e}"));
+        let mut out = vec![0u8; len];
+        let limits = blaze_deflate::Limits { most_out: len as u64, most_ratio: MAX_RATIO, most_header: 0 };
+        let mut inflate = ZlibInto::new(limits);
+        inflate.feed(&z, &mut out).unwrap_or_else(|e| panic!("inflate {len} bytes: {e}"));
+        inflate.finish().unwrap_or_else(|e| panic!("the stream of {len} bytes did not end: {e}"));
+        assert_eq!(inflate.written(), len as u64, "the stream of {len} bytes inflated to {}", inflate.written());
+        assert!(out[..] == data[..], "the stream of {len} bytes inflated to other bytes");
     });
 }
 

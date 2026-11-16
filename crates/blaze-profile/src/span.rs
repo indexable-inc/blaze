@@ -1193,9 +1193,11 @@ mod tests {
             Process { pid: 1, name: "span kinds test", commit: None },
         )
         .unwrap();
-        let at = batch.schema().index_of("waits_on").unwrap();
-        let mut older = batch.clone();
-        older.remove_column(at);
+        let at = batch.index_of("waits_on").unwrap();
+        let (mut fields, mut columns) = batch.into_parts();
+        fields.remove(at);
+        columns.remove(at);
+        let older = Batch::try_new(fields, columns).unwrap();
         assert_eq!(
             read_batch::<Wait>(&older),
             Err(KindError::Column { kind: "wait", column: "waits_on", why: "is not in the batch" })
@@ -1311,7 +1313,7 @@ mod tests {
                 .unwrap();
         let at = rows.iter().position(|it| std::ptr::eq(it, said)).unwrap();
         let fields = batch.column_by_name("fields").expect("`fields` is a column of `spans`");
-        assert_eq!(text_at(fields.as_ref(), at), Some("what=the image runs=3 why=memory is short"));
+        assert_eq!(fields.text(at), Some("what=the image runs=3 why=memory is short"));
     }
 
     /// [`ad_hoc_fields`], the list `blaze::span_field_unrecorded` holds a span's fields to, is

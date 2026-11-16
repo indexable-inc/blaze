@@ -47,7 +47,7 @@ use blaze_sim::{Config as SimConfig, Tape};
 
 use super::{
     core::{Committed, Plain, PlainConfig, Plant, TAGS},
-    driven::{Driven, LocalDir},
+    driven::{Cut, Driven, LocalDir},
     format::{self, Entry, FORMAT, SEGMENT_FORMAT, Slot, check_segment, seal_segment},
     handle::{LaneId, PlainStore},
 };
@@ -2292,15 +2292,15 @@ fn handle(sim: Sim, n: u64, boot: u64, plant: Plant) -> PlainStore<Sim> {
 /// One history of the lanes (store-next.md, "Puts on every worker"): `workers` lanes put into
 /// one handle, each round its own keys and one key all of them put with equal bytes, in an
 /// order the seed turns; a reader's lane that puts nothing looks before and after each
-/// commit; the power is cut once after `cut_after` completions, and the machine comes back
+/// commit; the power is cut once where `cut_at` says, and the machine comes back
 /// at a new boot. The oracle: a record whose commit's flip landed (the commit returned, or
 /// the generation it flipped to is this process's) reads back after every cut; no record is
 /// seen by another lane before its commit's flip; each worker sees its own puts at once; the
 /// key every worker put is one record of equal bytes.
-fn lanes(seed: u64, workers: u32, rounds: u32, cut_after: Option<u32>, plant: Plant) -> Result<(), String> {
+fn lanes(seed: u64, workers: u32, rounds: u32, cut_at: Option<Cut>, plant: Plant) -> Result<(), String> {
     let mut boot = 1;
     let mut store = handle(Sim::new(seed, Faults::default()), 1, boot, plant);
-    store.writer().cut_after(cut_after);
+    store.writer().cut(cut_at);
     let mut promised: BTreeSet<u32> = BTreeSet::new();
     let mut ids: Vec<LaneId> = (0..workers).map(|_| store.lane().expect("under the cap")).collect();
     let mut reader = store.lane().expect("under the cap");
@@ -2338,7 +2338,7 @@ fn lanes(seed: u64, workers: u32, rounds: u32, cut_after: Option<u32>, plant: Pl
                     }
                 }
             }
-            Err(why) if !cut && cut_after.is_some() => {
+            Err(why) if !cut && cut_at.is_some() => {
                 if store.writer().core().generation() > before {
                     // The flip landed before the cut: what it names is promised.
                     promised.extend(put.iter().copied());
@@ -2393,10 +2393,13 @@ fn lanes_put_with_no_shared_lock_and_keep_every_flip_s_promise() {
         let seed = tape.next_u64("sim seed");
         let workers = tape.int_in(1..=8u32, "workers");
         let rounds = tape.int_in(1..=5u32, "rounds");
-        let cut = tape.int_in(0..=1u32, "power cut") == 1;
-        let after = tape.int_in(0..=200u32, "cut after");
-        let outcome = lanes(seed, workers, rounds, cut.then_some(after), Plant::None);
-        assert!(outcome.is_ok(), "seed {seed}, {workers} workers, {rounds} rounds, cut {cut} after {after}: {outcome:?}");
+        let cut = match tape.int_in(0..=2u32, "power cut") {
+            0 => None,
+            1 => Some(Cut::AtFlip),
+            _ => Some(Cut::After(tape.int_in(0..=200u32, "cut after"))),
+        };
+        let outcome = lanes(seed, workers, rounds, cut, Plant::None);
+        assert!(outcome.is_ok(), "seed {seed}, {workers} workers, {rounds} rounds, cut {cut:?}: {outcome:?}");
     });
 }
 
@@ -2405,19 +2408,14 @@ fn lanes_put_with_no_shared_lock_and_keep_every_flip_s_promise() {
 #[test]
 fn the_oracle_catches_a_lane_commit_flipped_before_its_bytes_are_durable() {
     let mut caught = None;
-    for seed in 0..64u64 {
-        for after in [10u32, 20, 30, 40, 50, 60] {
-            let honest = lanes(seed, 4, 3, Some(after), Plant::None);
-            assert!(honest.is_ok(), "seed {seed}, cut after {after}, without the plant: {honest:?}");
-            if caught.is_none() {
-                caught = lanes(seed, 4, 3, Some(after), Plant::FlipBeforeSync).err();
-            }
-        }
-        if caught.is_some() {
-            break;
+    for seed in 0..16u64 {
+        let honest = lanes(seed, 4, 3, Some(Cut::AtFlip), Plant::None);
+        assert!(honest.is_ok(), "seed {seed}, cut at the flip, without the plant: {honest:?}");
+        if caught.is_none() {
+            caught = lanes(seed, 4, 3, Some(Cut::AtFlip), Plant::FlipBeforeSync).err();
         }
     }
-    assert!(caught.is_some(), "no seed caught a flip before its segment's sync");
+    assert!(caught.is_some(), "no seed of 16 caught a flip before its segment's sync");
 }
 
 /// Rule 25 across workers: the same records, split over other lanes and put in another order,

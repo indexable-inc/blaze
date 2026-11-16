@@ -102,6 +102,14 @@ impl<T: Ord, A: Allocator> Heap4<T, A> {
         Ok(Heap4 { data: Vec::try_with_capacity_in(capacity, alloc)? })
     }
 
+    /// [`Heap4::try_with_capacity_in`], panicking with the refusal.
+    pub fn with_capacity_in(capacity: usize, alloc: A) -> Heap4<T, A> {
+        match Heap4::try_with_capacity_in(capacity, alloc) {
+            Ok(heap) => heap,
+            Err(failure) => crate::error::fail(failure),
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.data.len()
     }

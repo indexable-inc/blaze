@@ -5,7 +5,7 @@
 //! ports), on a data-oriented engine: goals, candidates and nested goals as fixed-size rows, one
 //! explicit stack of frames (no recursion on a goal's depth), the reference's search graph for
 //! cycles (`search`), canonical inputs and responses as words (`canon`), stalled obligations on
-//! wake lists (`fulfill`), the ground fast path (`markers`) and a SIMD fingerprint prefilter
+//! wake lists (`fulfill`), the ground fast path (`eval`, a term's markers byte) and a SIMD fingerprint prefilter
 //! over impl buckets (`prefilter`).
 //!
 //! The solver learns about the program only through [`facts::Facts`], whose methods only the
@@ -25,7 +25,6 @@ pub mod eval;
 pub mod facts;
 pub mod fold;
 pub mod fulfill;
-pub mod markers;
 pub mod prefilter;
 pub mod search;
 pub mod term;

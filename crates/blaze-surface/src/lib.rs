@@ -99,7 +99,8 @@ pub use crate::kind::{
     Namespace, Origin, Place, Range, ScopeEntry, Visibility, VisibilityClass, WrittenVis,
 };
 pub use crate::lang_items::{
-    LANG_SCHEMA, LangItemsError, LangItemsView, LangName, LangNameError, build_lang_items,
+    LANG_SCHEMA, LangItemsError, LangItemsView, LangName, LangNameError, MAX_LANG_NAME,
+    build_lang_items,
 };
 pub use crate::locals::{AnyItem, Local, LocalTable};
 pub use crate::macro_def::{
