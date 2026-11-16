@@ -39,42 +39,44 @@ See [docs/contributing.md#credit](../../../docs/contributing.md#credit).
 
 ## proof-before-merge (rule 68)
 
-SUSPENDED IN PART since 2026-11-15, by the owner: the old item layer, the daemon and the lints were
-deleted from main that day to rebuild the item layer from scratch (docs/v2/plan/design/bottom.md),
-so no blaze exists that can run the hello-world smoke, and `land.py`, which demands its quote,
-cannot be used. Until `blaze run` of hello-world passes on the new layer, the proof of a merge is:
-on the exact tree that will be main (the head of a branch that contains main), `cargo check
---workspace --exclude blaze-std --all-targets` passes and the tests of every crate the change
-touches pass, both quoted in the pull request with the tree hash and the host; the allocator and
-untyped-error ratchets pass; then an admin merge pinned to that head. The first change that makes
-`blaze run` of hello-world pass restores this rule as written below, with the smoke rewritten for
-`run`, `test` and `check`. The rule as it was and will be again: Nothing merges to main (through
-`land.py`, an admin merge, or a cut of the integration tree) until a release blaze built from the
-exact tree that will be main has run the smoke (on the Mac or on blaze-vm; the quote names its host)
-and its quote is in the pull request's body. That tree is the head of a branch that contains the
-main it joins (`git merge origin/main` first, then build and smoke that commit): a `--no-ff` merge
-of it has the head's tree. When main moves past the head, the merge's tree changes, and the quote is
-made again. The smoke is `scripts/src/bin/smoke.rs`: `blaze run -q -p scripts --bin smoke --
-'{"blaze": "<release blaze>", "work": "<empty dir>"}' > smoke.txt`. It runs hello-world in a fresh
-home, each step one child under a deadline that kills its process group (cold 180 s, the rest 60 s:
-ceilings for something being wrong, not performance bars): a cold `blaze run`, a no-op `blaze run`,
-a body edit then `blaze run`, a comment edit then `blaze run` (each counted only with exit status 0
-and the program's own line, the new line after the body edit), then `blaze check` and `blaze stop`.
-Its standard output is the quote, a block whose first line is `blaze-smoke 1`: the tree (`git
-rev-parse HEAD^{tree}`, with `+dirty <sha256>` when the checkout had changes), the binary's sha256,
-the host, each step's outcome and wall time, and `verdict ok` or `verdict FAILED <the first
-failure>` (`measure-the-exact-tree`). It exits 0 only for `verdict ok`; a failed step's output tail,
-`serve.log`'s tail and the slowest spans of the last build go to standard error, so the finding
-needs no rerun (`every-command-has-a-timeout`). `land.py` puts the quote in the body and will not
-open, resume or merge a pull request unless `smoke '{"verify": ...}'` holds the quote to the head's
-tree, clean, with verdict ok; it asks again just before it merges, against the head GitHub has, and
-refuses when main has moved past that head. No flag skips this, and an admin merge needs it as much.
-A change to build scripts, proc macros, C dependencies or the sandbox also runs
-`harness/v2/real_smoke.py` (how-to `real-smoke`). A step that fails or times out blocks the merge:
-fix it, never run it again hoping it passes (`no-fallback`). The merge gate's compile and unit tests
-do not stand in for this, and neither does a smoke of the branch before the merge or of another
-commit. A change that builds no binary (only docs or these rules) is smoked too: an exemption a pull
-request declares for itself is the kind of stand-in this rule removes.
+A change that touches no Rust or Cargo file (rules, docs, scripts in other languages) needs only its
+own checks (the rules check, the docs check), not a build. SUSPENDED IN PART since 2026-11-15, by
+the owner: the old item layer, the daemon and the lints were deleted from main that day to rebuild
+the item layer from scratch (docs/v2/plan/design/bottom.md), so no blaze exists that can run the
+hello-world smoke, and `land.py`, which demands its quote, cannot be used. Until `blaze run` of
+hello-world passes on the new layer, the proof of a merge is: on the exact tree that will be main
+(the head of a branch that contains main), `cargo check --workspace --exclude blaze-std
+--all-targets` passes and the tests of every crate the change touches pass, both quoted in the pull
+request with the tree hash and the host; the allocator and untyped-error ratchets pass; then an
+admin merge pinned to that head. The first change that makes `blaze run` of hello-world pass
+restores this rule as written below, with the smoke rewritten for `run`, `test` and `check`. The
+rule as it was and will be again: Nothing merges to main (through `land.py`, an admin merge, or a
+cut of the integration tree) until a release blaze built from the exact tree that will be main has
+run the smoke (on the Mac or on blaze-vm; the quote names its host) and its quote is in the pull
+request's body. That tree is the head of a branch that contains the main it joins (`git merge
+origin/main` first, then build and smoke that commit): a `--no-ff` merge of it has the head's tree.
+When main moves past the head, the merge's tree changes, and the quote is made again. The smoke is
+`scripts/src/bin/smoke.rs`: `blaze run -q -p scripts --bin smoke -- '{"blaze": "<release blaze>",
+"work": "<empty dir>"}' > smoke.txt`. It runs hello-world in a fresh home, each step one child under
+a deadline that kills its process group (cold 180 s, the rest 60 s: ceilings for something being
+wrong, not performance bars): a cold `blaze run`, a no-op `blaze run`, a body edit then `blaze run`,
+a comment edit then `blaze run` (each counted only with exit status 0 and the program's own line,
+the new line after the body edit), then `blaze check` and `blaze stop`. Its standard output is the
+quote, a block whose first line is `blaze-smoke 1`: the tree (`git rev-parse HEAD^{tree}`, with
+`+dirty <sha256>` when the checkout had changes), the binary's sha256, the host, each step's outcome
+and wall time, and `verdict ok` or `verdict FAILED <the first failure>` (`measure-the-exact-tree`).
+It exits 0 only for `verdict ok`; a failed step's output tail, `serve.log`'s tail and the slowest
+spans of the last build go to standard error, so the finding needs no rerun
+(`every-command-has-a-timeout`). `land.py` puts the quote in the body and will not open, resume or
+merge a pull request unless `smoke '{"verify": ...}'` holds the quote to the head's tree, clean,
+with verdict ok; it asks again just before it merges, against the head GitHub has, and refuses when
+main has moved past that head. No flag skips this, and an admin merge needs it as much. A change to
+build scripts, proc macros, C dependencies or the sandbox also runs `harness/v2/real_smoke.py`
+(how-to `real-smoke`). A step that fails or times out blocks the merge: fix it, never run it again
+hoping it passes (`no-fallback`). The merge gate's compile and unit tests do not stand in for this,
+and neither does a smoke of the branch before the merge or of another commit. A change that builds
+no binary (only docs or these rules) is smoked too: an exemption a pull request declares for itself
+is the kind of stand-in this rule removes.
 
 See [docs/contributing.md#landing-a-change](../../../docs/contributing.md#landing-a-change).
 

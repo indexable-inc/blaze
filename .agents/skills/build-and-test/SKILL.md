@@ -35,9 +35,9 @@ See [docs/contributing.md](../../../docs/contributing.md).
 ## verify-on-real-projects (rule 7)
 
 A verdict on blaze comes from real projects built by blaze: blaze itself, then large open-source
-workspaces (ripgrep, nushell, bevy, wasmtime, tokio, ...), each built with `blaze build` and its own
-tests run with `blaze test`. A project whose tests pass under blaze is correct for what they cover;
-a failing test is a blaze bug to fix. Never build a project with rustc or cargo to diff against: no
+workspaces (ripgrep, nushell, bevy, wasmtime, tokio, ...), each run with `blaze run` and its own
+tests with `blaze test`. A project whose tests pass under blaze is correct for what they cover; a
+failing test is a blaze bug to fix. Never build a project with rustc or cargo to diff against: no
 reference build, no output comparison with rustc's, no harness that runs cargo for an oracle. A
 test's expectation states what is right, not what rustc printed.
 
@@ -91,7 +91,13 @@ See [docs/contributing.md#working-in-parallel](../../../docs/contributing.md#wor
 
 ## fan-out-write-only (rule 35)
 
-The head is always green. There is one head that has check-compiled whole (`cargo check --workspace
+Bias, by the owner on 2026-11-15 ("cant we just do thign in parlalel? like we odntn eed to wait for
+compile"): writing does not wait for compiling. When pieces are independent, start them all now; a
+lane writes its next piece without waiting for the last to compile; the main agent compiles the
+combined tree when a batch has landed, sometimes, and sends each error to the lane whose file it
+names. A tree that does not compile for a while is normal while lanes are mid-piece and stops no
+one. Do not ask whether to start work that follows from what was decided: start it and say so. The
+head is always green. There is one head that has check-compiled whole (`cargo check --workspace
 --all-targets`, until blaze builds blaze fast) and a lane's piece joins it alone: its files are
 applied onto that head in one scratch checkout with a warm target, the workspace is check-compiled,
 and it is committed only if that passes; if not, the errors go back to that lane and the head does
@@ -153,9 +159,9 @@ variant tree, a long-lived rewrite that cannot keep the tree building; the brief
 ## clean-up-lane (rule 39)
 
 When a lane is done, delete what it made: its directory under `/root/wt/<lane>/` and its homes on
-`blaze-vm`, any blaze process it left running there (a daemon or a build's helper, by pid), any
-worktree and merged branch, and any exception machine its brief allowed (`ix rm`). The build VM
-itself is never removed by a lane.
+`blaze-vm`, any blaze process it left running there (a build's helper, by pid), any worktree and
+merged branch, and any exception machine its brief allowed (`ix rm`). The build VM itself is never
+removed by a lane.
 
 ## ledger-decides (rule 46)
 
@@ -214,13 +220,14 @@ time plus half. Set it where the command runs: the Bash tool's `timeout`, `timeo
 <seconds> <command>` in a shell (coreutils, on the Mac and the VM), `subprocess.run(...,
 timeout=...)` in Python, the `timeout` of `harness/v2/ran.py`'s `Command` in a harness, and a
 deadline on each step of a VM job, not one for the whole job. On expiry, before the kill, take the
-status: `blaze debug inspect` for a blaze still running, `blaze slow` in its directory, and the
-flight recording the watchdog names (`bounded-progress`); the report quotes that line. A timeout is
-a finding: a hang in blaze is a bug to report with that line and file (an annoyance row at least),
-and the fix is in blaze. Never wait a hang out, never rerun with a longer limit hoping it passes
-(`no-fallback`), and never let a script sleep and poll with no bound. A wait of more than a minute
-(a build, a job on the VM, a pull request's checks) runs in the background with a notification when
-it ends; the main agent never sits in a foreground wait while lanes and jobs need it.
+status: a stack sample of the process still running (`sample <pid>` on macOS, `gdb -p <pid> -batch
+-ex 'thread apply all bt'` on Linux) and the flight recording the watchdog names
+(`bounded-progress`); the report quotes that line. A timeout is a finding: a hang in blaze is a bug
+to report with that line and file (an annoyance row at least), and the fix is in blaze. Never wait a
+hang out, never rerun with a longer limit hoping it passes (`no-fallback`), and never let a script
+sleep and poll with no bound. A wait of more than a minute (a build, a job on the VM, a pull
+request's checks) runs in the background with a notification when it ends; the main agent never sits
+in a foreground wait while lanes and jobs need it.
 
 ## act-on-snapshots (rule 80)
 
@@ -236,21 +243,21 @@ never mixing two states.
 
 ## real-run-first (rule 82)
 
-A new command, path or mode (a check with no daemon, a new backend, a new store) is run end to end
-on a real project, hello-world first, on the day its first piece compiles and before more is built
-on it: by the main agent, with a release blaze of the exact tree (`measure-the-exact-tree`), and
-again after every round of lanes. It writes the profile from that first run (`slow-is-p0-traced`),
-and the run is read through it: what `blaze explain` cannot say about the run's time or memory is
-the run's first bug, fixed before the next piece. What that run prints is the state of the work: its
-first failure is the next task, and its timing line says where the time goes before anyone
-optimises. Unit tests on fixtures and a passing simulation say the pieces agree with their models,
-not that the command works: nothing is reported as working, and no second piece is designed on top,
-until the real run has been made and its output read. A lane's brief names the real run that judges
-its piece. Where the real run cannot be made yet because a piece is not written, say which piece,
-and make the nearest real run that can be made (the real std keyed by the new key rule, the real
-project gathered) instead of a fixture. When finding each failure of the real run would cost one
-release build, first write the test that finds every such case in one run (key every crate of std,
-check every item), then fix what it lists.
+A new command, path or mode (a check on the new item layer, a new backend, a new store) is run end
+to end on a real project, hello-world first, on the day its first piece compiles and before more is
+built on it: by the main agent, with a release blaze of the exact tree (`measure-the-exact-tree`),
+and again after every round of lanes. It writes the profile from that first run
+(`slow-is-p0-traced`), and the run is read through it: what `blaze explain` cannot say about the
+run's time or memory is the run's first bug, fixed before the next piece. What that run prints is
+the state of the work: its first failure is the next task, and its timing line says where the time
+goes before anyone optimises. Unit tests on fixtures and a passing simulation say the pieces agree
+with their models, not that the command works: nothing is reported as working, and no second piece
+is designed on top, until the real run has been made and its output read. A lane's brief names the
+real run that judges its piece. Where the real run cannot be made yet because a piece is not
+written, say which piece, and make the nearest real run that can be made (the real std keyed by the
+new key rule, the real project gathered) instead of a fixture. When finding each failure of the real
+run would cost one release build, first write the test that finds every such case in one run (key
+every crate of std, check every item), then fix what it lists.
 
 <!-- End of the generated rules. Hand-written notes follow. -->
 

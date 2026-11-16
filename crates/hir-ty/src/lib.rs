@@ -133,12 +133,8 @@ pub use lower::{
     GenericDefaultsRef, GenericPredicates, LifetimeElisionKind, LifetimeLoweringMode, Lowered,
     LoweringMode, PredicateSource, SelfAndAssocBounds, TyDefId, TyLoweringContext,
     TyLoweringResult, ValueTyDefId,
-    batch::{
-        Batch, CrateFieldTypes, CrateImplPredicates, CrateImplSelfTys, CrateImplTraits, SideTable,
-    },
     diagnostics::*,
     elided_groups, elided_lifetimes, hir_mutability, hybrid_param_env, lower_mutability,
-    persist::{BatchKind, ColdBatch, ColdBatchRef, PredicatesRec},
     predicate_sources,
     written_implied_predicates,
     record::{

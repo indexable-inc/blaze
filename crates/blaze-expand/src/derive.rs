@@ -5,14 +5,15 @@
 //! [`Origin::Input`], so it keeps the item's hygiene and edition; what the derive writes is
 //! made def-site ([`Transparency::Opaque`]), as rustc's derives write at `def_site`.
 //!
-//! Not done yet: the `*self` body of `Clone` for a type that also derives `Copy` (the call does
-//! not say what else the item derives; the impl written instead is equivalent), and
-//! `derive_const`.
+//! The call's [`DeriveFacts`] say the rest: an item that also derives `Copy` and has no type
+//! parameter gets rustc's `*self` `Clone`, and a `#[derive_const]` impl is `impl const`, its
+//! trait bounds `[const]`.
 
 use core::{alloc::Allocator, fmt, ops::Range};
 
 use crate::{
     adt::{self, Adt, AdtKind, FieldsKind, ParamKind, Variant},
+    call::{AlsoCopy, CallKind, Constness, DeriveFacts},
     def::BuiltinDerive,
     error::ExpandError,
     expand::Out,

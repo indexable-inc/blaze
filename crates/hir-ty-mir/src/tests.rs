@@ -10,7 +10,6 @@ mod derived_impls;
 mod diagnostics;
 mod display_source_code;
 mod dyn_compatibility;
-mod frozen;
 mod incremental;
 mod layout;
 mod macros;

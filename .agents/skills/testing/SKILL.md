@@ -1,6 +1,6 @@
 ---
 name: testing
-description: "How blaze tests its own code, the one home for it: few tests, each for hard-to-verify logic behind a stable interface; property tests and deterministic simulation tests (DST) on blaze's own engine, `blaze-sim` (a case is a function of one tape of choices, shrunk and replayed), which replaces Hegel; `blaze_core::sim::Sim` (virtual clock, shuffled completions, failure injection, crashes that tear unsynced writes) for blaze-core's effects and `blaze-check` for interleaved atomics; an invariant oracle with planted-bug controls and tape replay; sans-IO cores as the precondition; round-trip tests for persisted state; testing a causal claim by removing the cause. What a persisted type is and where memory lives are the `memory-and-data` skill. Proof for concurrent, durable, crash-recovering, billing and data-deletion code is a DST, never a code review. Load before writing or changing a test, before changing anything concurrent, persisted, crash-recovering, billing or data-deleting (the store, the daemon image, the profile history, a lock-free structure, a ring), and before claiming such code is correct."
+description: "How blaze tests its own code, the one home for it: few tests, each for hard-to-verify logic behind a stable interface; property tests and deterministic simulation tests (DST) on blaze's own engine, `blaze-sim` (a case is a function of one tape of choices, shrunk and replayed), which replaces Hegel; `blaze_core::sim::Sim` (virtual clock, shuffled completions, failure injection, crashes that tear unsynced writes) for blaze-core's effects and `blaze-check` for interleaved atomics; an invariant oracle with planted-bug controls and tape replay; sans-IO cores as the precondition; round-trip tests for persisted state; testing a causal claim by removing the cause. What a persisted type is and where memory lives are the `memory-and-data` skill. Proof for concurrent, durable, crash-recovering, billing and data-deletion code is a DST, never a code review. Load before writing or changing a test, before changing anything concurrent, persisted, crash-recovering, billing or data-deleting (the store, the certificate, the profile history, a lock-free structure, a ring), and before claiming such code is correct."
 ---
 
 # Testing blaze
@@ -18,17 +18,16 @@ gone; say so, and rest the claim on the tests of the mechanism alone.
 
 ## persisted-state-round-trips (rule 26)
 
-Anything blaze persists (the store's records, the certificate, the profile history, and the daemon
-image while it exists; what a persisted value is, is `outputs-are-records`) has a test that restores
-it and checks the result equals a fresh build byte for byte, and a budget for a fresh process to
-first answer. A file that another version of blaze can find (in the state directory, in a home, in
-`/tmp`) also has a test that a file of its previous layout is handled: an old home after an upgrade
-is detected, reported by name and rebuilt, and nothing is migrated (scope decision D36); a file
-outside a home is refused by name with what to do, or left alone under a name that carries its
-layout; docs/cargo.md, "Files that outlive a version", lists each with its test. A restore that
-silently starts empty is a failure blaze reports, naming why. A format that is written while blaze
-runs and read after a crash also gets a DST (`dst-not-review`) that crashes it at every point and
-checks the restore.
+Anything blaze persists (the store's records, the certificate, the profile history; what a persisted
+value is, is `outputs-are-records`) has a test that restores it and checks the result equals a fresh
+build byte for byte, and a budget for a fresh process to first answer. A file that another version
+of blaze can find (in the state directory, in a home, in `/tmp`) also has a test that a file of its
+previous layout is handled: an old home after an upgrade is detected, reported by name and rebuilt,
+and nothing is migrated (scope decision D36); a file outside a home is refused by name with what to
+do, or left alone under a name that carries its layout; docs/cargo.md, "Files that outlive a
+version", lists each with its test. A restore that silently starts empty is a failure blaze reports,
+naming why. A format that is written while blaze runs and read after a crash also gets a DST
+(`dst-not-review`) that crashes it at every point and checks the restore.
 
 ## dst-not-review (rule 43)
 

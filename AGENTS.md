@@ -20,7 +20,7 @@ Mac (8 to 16 cores, 16 to 64 GB), with one code path sized by the machine.
 
 ## The design ([in full](docs/v2/plan/design/bottom.md))
 
-- Everything kept is a record: keyed from text before the work, written once, read in place.
+- Everything kept is a record: keyed from text, written once, read in place, in columns.
 - A command is a process that answers and exits; no daemon holds state between builds.
 - A record is valid by its key, or else by its read list checked against today's facts.
 - No dependency graph in memory: candidates are found forward from what changed.
@@ -29,7 +29,7 @@ Mac (8 to 16 cores, 16 to 64 GB), with one code path sized by the machine.
 - A dependency is only its records and an item only its key; text for the crate compiled alone.
 - A check happens once and leaves a proof later code takes; a coarse proof covers all under it.
 - Records are shared by content: CI fills a cache anyone can read, so std arrives precompiled.
-- Remote execution is the same driver with another executor.
+- Decide at run time: a hook, check or optimization is a version swapped into a slot.
 - A lint finding is a record too: errors before the answer, advice after, analyses in the
   background.
 
@@ -45,7 +45,7 @@ In scope:
 - The shared cache is read without a login. Only CI, and later the remote workers, write to it.
 - Private builds can always stay local: nothing leaves the machine unless an organisation opts in.
 - An old home after an upgrade is detected, reported and rebuilt; nothing is migrated.
-- Code that stays for the long term is sans-IO. New crates move to bstd once blaze builds blaze.
+- blaze's own code is on bstd and our collections: no `std`, `alloc` or third-party crate.
 - A plain Rust project adopts blaze's checks by steps: `rust`, `suggest`, `edition`, `strict`.
 
 Not now:
@@ -54,7 +54,7 @@ Not now:
 
 ## How work is done
 
-- Lanes write; the main agent compiles each piece within minutes and admits it alone (35, 36, 48).
+- Work in parallel: lanes write in one directory and never wait on a compile or on a yes (35, 48).
 - Until `blaze run` exists again, a merge's proof is the whole build and its tests, quoted (68).
 - Every command has a timeout; a hang is a bug to report, never one to wait out (69, 18).
 - Facts come from tool output in this session (61); verdicts from real projects, run first (7, 82).
@@ -78,7 +78,7 @@ tools/agents/rules.ts, then run `bun tools/agents/rules.ts --write`.
 - **1. no-rustc**: blaze never runs rustc, rustdoc or a cargo that runs them; each place that still does is a bug.
 - **4. superset-of-rust**: Every program nightly accepts builds and runs correctly; only rustc soundness holes are refused.
 - **5. useful-not-parity**: rustc and cargo are references, not specs: design each output and interface as if from scratch.
-- **6. blaze-uses-its-extensions**: blaze's crates use them, enforced; while cargo also builds blaze, only in forms rustc ignores.
+- **6. blaze-uses-its-extensions**: Use them in blaze's crates: while rustc builds too, in forms it reads or under `cfg(blaze)`.
 - **9. sandbox-everything**: Build scripts and proc macros always run sandboxed; where no sandbox can be made, blaze stops.
 - **10. proc-macros-on-wasm**: Proc macros compile to `wasm32-wasip1` and run in Wasmtime; Cranelift never makes native code.
 - **21. keys-cover-every-input**: Two values under one key is a typed refusal, and the fix is the key, never the check.
@@ -122,7 +122,7 @@ tools/agents/rules.ts, then run `bun tools/agents/rules.ts --write`.
 - **61. claims-from-evidence**: State as fact only what a tool call here showed; a pass counts only with proof the check ran.
 
 ### Design and changing code (skill `changing-code`)
-- **13. fix-through-blaze-lints**: Change many sites with astlog rules (`blaze check --rules`) or a ban and `--fix`: never by text.
+- **13. fix-through-blaze-lints**: Change many sites with an astlog rules file or a `.clippy.toml` ban: never by text.
 - **24. whole-ports**: A shared signature changes with all its callers in one batch; the tree compiles at every save.
 - **28. best-long-term-design**: Pick the best long-term design, not the least work; be proud of the first iteration, then prove it.
 - **29. spec-then-build**: A change that needs a design gets a short spec, then the same lane builds it at once.
@@ -134,7 +134,7 @@ tools/agents/rules.ts, then run `bun tools/agents/rules.ts --write`.
 - **63. agents-json**: Read every how-to in `agents/`, search its annoyances for your area, add a row as things happen.
 - **66. end-state-not-hill-climb**: A second fix to one mechanism stops it until an outsider says rebuild or delete.
 - **67. within-ten-percent-of-the-floor**: Aim every design at the floor from the start; state it and report the ratio.
-- **72. edit-rust-by-syntax**: Only the edit tools, astlog rules, `blaze check --fix` or `ast-grep`; never a heredoc or `sed`.
+- **72. edit-rust-by-syntax**: Only the edit tools, astlog rules or `ast-grep`; never a heredoc, `sed` or a script.
 - **73. type-then-lint-then-rule**: Prevent a mistake by a type, then a lint with a fix; a rule here comes last.
 - **76. correct-by-construction**: A value with an obligation or meaning is a type saying so: linear, proof, typed id, checked length.
 - **78. strategy-is-a-type-parameter**: A choice between strategies is a type parameter at one seam, each instantiation tested equal.
@@ -146,12 +146,12 @@ tools/agents/rules.ts, then run `bun tools/agents/rules.ts --write`.
 - **8. own-nightly**: Each project builds with `harness/toolchain`; toolchain files, rustup and `RUSTC` are ignored.
 - **22. measure-the-exact-tree**: A measurement, bisect or checkpoint names and keeps the tree and binary it ran on.
 - **34. work-in-ix-vms**: Build, test and smoke on the Mac, or on `blaze-vm` when it answers; no AWS, no x86 VM.
-- **35. fan-out-write-only**: Lanes only write; the main agent compiles each piece within minutes, then admits it alone.
+- **35. fan-out-write-only**: Lanes only write and never wait on a compile; the main agent compiles the tree in batches.
 - **36. worktree-per-lane**: One directory, each lane in its own files; a worktree is the exception; never `git stash`.
 - **39. clean-up-lane**: When a lane is done, delete what it made: VM state, worktrees, branches, processes left running.
 - **46. ledger-decides**: Work comes from the objectives ledger and is done when its row's check passes on a named commit.
 - **47. every-agent-has-a-task**: Every agent starts on one task with its outcome and check; people follow tasks, not agents.
-- **48. agents-are-a-cost**: Start each independent large piece now in its own lane; four at most share files; nothing small.
+- **48. agents-are-a-cost**: Start every independent piece now, in parallel, without asking; disjoint files; nothing small.
 - **69. every-command-has-a-timeout**: Size a timeout to each command; an expiry is a finding, never waited out or retried.
 - **80. act-on-snapshots**: Work starts when asked, on a snapshot; nothing builds, checks or publishes on save or mid-edit.
 - **82. real-run-first**: A new path runs its real command, profile on, on a real project the day it compiles.

@@ -1,6 +1,6 @@
 ---
 name: memory-and-data
-description: "How blaze holds memory and keeps what it computes: no allocation where none is needed, and a named allocator where one is (a task's frame, reset per item in a long task; `Global` named in code); footprint as the one measure reported and the kernel's limit as the one ceiling, with nothing admitting or throttling by memory; outputs as blaze-format records written once to the store, small ones read with pread into the task's frame and large plain arrays mapped read-only, the kernel's page cache the only cache; no state between requests that is not a record; persistence from one generic impl over `for const`; bytes verified once per boot or fetch, never on each read; and caches keyed by code identity. Load before allocating, adding a query result or anything persisted or kept between requests, touching blaze-mem, blaze-format, the store, admission, the allocator or the memory ceiling, or caching a function's results. Finding where a build's memory went is the `debugging` skill."
+description: "How blaze holds memory and keeps what it computes: no allocation where none is needed, and a named allocator where one is (a task's frame, reset per item in a long task; `Global` named in code); footprint as the one measure reported and the kernel's limit as the one ceiling, with nothing admitting or throttling by memory; outputs as blaze-format records written once to the store, small ones read with pread into the task's frame and large plain arrays mapped read-only, the kernel's page cache the only cache; no state between requests that is not a record; persistence from one generic impl over `for const`; bytes verified once per boot or fetch, never on each read; and caches keyed by code identity. Load before allocating, adding a query result or anything persisted or kept between requests, touching blaze-mem, blaze-format, the store, the allocator or the memory ceiling, or caching a function's results. Finding where a build's memory went is the `debugging` skill."
 ---
 
 # Memory and durable data
@@ -55,12 +55,12 @@ task's scratch is its frame, what outlives a task is a record on disk (`outputs-
 nothing is held between requests (`no-state-between-requests`), and the pool is bounded by cores. So
 nothing admits a task by a forecast of its memory, wounds or preempts one, throttles commits through
 a gate, gives memory back on a ladder, or releases the front end at a threshold. The machinery that
-does this today (admission and its giveback, the machine ledger, wound-wait, blaze-mem's gate and
-budget, the mimalloc heap per tag in `heaps.rs` and the C malloc override in `malloc.rs`) is to be
-deleted: never extend it, and a change that seems to need it is a sign the structure it compensates
-for should go (`end-state-not-hill-climb`). Live bytes per tag say who holds memory; the gap between
-footprint and live is memory freed but kept and is a bug to find an owner for, never a number to
-tune a threshold around.
+did this (admission and its giveback, the machine ledger, wound-wait, blaze-mem's gate and budget,
+the engine's heap per tag and its malloc override) was deleted with the daemon on 2026-11-15, but
+for blaze-graph's `admission`, which is to go: never bring it back, and a change that seems to need
+it is a sign the structure it compensates for should go (`end-state-not-hill-climb`). Live bytes per
+tag say who holds memory; the gap between footprint and live is memory freed but kept and is a bug
+to find an owner for, never a number to tune a threshold around.
 
 See [docs/memory-footprint.md](../../../docs/memory-footprint.md).
 
@@ -98,7 +98,7 @@ See [docs/v2/plan/design/comptime.md](../../../docs/v2/plan/design/comptime.md).
 
 ## no-state-between-requests (rule 70)
 
-A command (`blaze build`, `run`, `check`, `test`) is one process: it checks the certificate, does
+A command (`blaze run`, `test`, `check`, `export`) is one process: it checks the certificate, does
 the work on a pool bounded by cores, writes records and exits. Nothing is kept between requests that
 is not a record (`outputs-are-records`). There is no `blaze watch` and nothing builds on save: an
 edit is often one of several that belong together (a transaction, as an agent makes them) and the
@@ -106,14 +106,14 @@ states between are invalid, so a build happens only when asked. A build may leav
 behind when that makes the next build faster: it has an expiry, never builds on its own, and holds
 only what a fresh process could rebuild from records (mapped pages, the edited crates' tables,
 interners and dense ids), so killing it loses nothing. Live patching that keeps a running program's
-state is wanted later, not now: an edit patches the program's file and the program runs again.
-Interners and dense ids live for the process, a task's scratch for the task (`bump-allocate`).
-Today's daemon breaks this: its query graph kept across requests, its warm tables, process statics
-and images are to be deleted by the target design. Do not add state to it or anything like it: a
-cache, a warm table, a memo kept for the next request, or a decision that depends on what an earlier
-request left in memory is written as a record instead, or kept in the helper as a copy a fresh
-process rebuilds. The test: kill the process between any two requests, and the next answer equals
-the uninterrupted one byte for byte (`persisted-state-round-trips`).
+state is wanted later, not now: an edit makes new code records and the program runs again. Interners
+and dense ids live for the process, a task's scratch for the task (`bump-allocate`). The daemon that
+broke this (its query graph kept across requests, its warm tables, process statics and images) was
+deleted on 2026-11-15. Do not bring back anything like it: a cache, a warm table, a memo kept for
+the next request, or a decision that depends on what an earlier request left in memory is written as
+a record instead, or kept in the helper as a copy a fresh process rebuilds. The test: kill the
+process between any two requests, and the next answer equals the uninterrupted one byte for byte
+(`persisted-state-round-trips`).
 
 ## verify-once (rule 74)
 

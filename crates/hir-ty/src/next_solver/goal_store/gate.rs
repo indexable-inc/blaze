@@ -184,7 +184,7 @@ impl Answer {
     }
 }
 
-/// The key of a root goal whose answer the table may give, and the goal as the solver sees
+/// The key of a root goal whose answer the store may give, and the goal as the solver sees
 /// it: resolved through the unification table as `evaluate_goal_raw` resolves it first, so a
 /// goal whose variables were all unified with global types (a method probe's where clauses,
 /// once its receiver is known) is the global goal it stands for. The evaluation's goal is
@@ -202,33 +202,8 @@ fn root_key<'db>(
     infcx.inner.borrow_mut().opaque_types().is_empty().then_some((key, goal))
 }
 
-/// Whether the table already holds that a goal being registered holds. Such a goal is not
-/// kept: its first evaluation would answer `Yes` with no change and drop it. With an
-/// obligation inspector attached it is kept, so the inspector sees its evaluation.
-#[inline]
-pub(crate) fn holds_at_registration<'db>(
-    delegate: &SolverContext<'db>,
-    goal: Goal<'db, Predicate<'db>>,
-) -> bool {
-    let infcx = &delegate.0;
-    if infcx.has_obligation_inspector() {
-        return false;
-    }
-    let Some((key, _)) = root_key(infcx, goal) else { return false };
-    let interner = infcx.interner;
-    // Only a goal that holds is dropped, so only its reads are replayed.
-    interner.with_global_goals(|table| match table.table.get(key) {
-        Some((Answer::Holds, reads)) => {
-            // SAFETY: `reads` points into a box `kept` holds while `table` lives (`KeptReads`).
-            replay(interner.db, unsafe { &*reads.0 });
-            true
-        }
-        Some((Answer::Fails, _)) | None => false,
-    })
-}
-
-/// [`SolverDelegateEvalExt::evaluate_root_goal`], answered from the table, then the store, when the
-/// goal is global.
+/// [`SolverDelegateEvalExt::evaluate_root_goal`], answered from the store when the goal is
+/// global.
 pub(crate) fn evaluate_root_goal<'db>(
     delegate: &SolverContext<'db>,
     goal: Goal<'db, Predicate<'db>>,
@@ -244,13 +219,7 @@ pub(crate) fn evaluate_root_goal<'db>(
         return delegate.evaluate_root_goal(goal, span, stalled_on);
     };
     let interner = infcx.interner;
-    if let Some(answer) = interner.with_global_goals(|table| table.get(interner.db, key)) {
-        return answer.evaluation(resolved);
-    }
     if let Some(found) = goal_store::lookup(interner, key) {
-        if let Some(reads) = &found.reads {
-            interner.with_global_goals(|table| table.insert(key, found.answer, reads));
-        }
         return found.answer.evaluation(resolved);
     }
     let Some(before) = Mark::of(infcx) else {
