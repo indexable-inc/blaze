@@ -13,20 +13,12 @@ use core::{
 use blaze_own::AllocFailure;
 
 use crate::{
-    Equivalent, KeyHash, Plain,
+    Equivalent, KeyHash,
     hash_map::{self, Entry, Map},
 };
 
-/// A set on the hasher `S`, in the allocator `A`: a `BuildHasher` or [`Plain`], as [`Map`]'s.
+/// A set on the hasher `S`, in the allocator `A`, hashed through [`KeyHash`] as [`Map`] is.
 pub struct Set<T, S, A: Allocator>(Map<T, (), S, A>);
-
-impl<T, A: Allocator> Set<T, Plain, A> {
-    /// An empty set in `alloc` hashed by [`hash_plain`](crate::hash_plain).
-    #[inline]
-    pub const fn plain_in(alloc: A) -> Self {
-        Set(Map::plain_in(alloc))
-    }
-}
 
 impl<T, S: Default, A: Allocator> Set<T, S, A> {
     /// An empty set in `alloc`; it allocates nothing until the first insert.

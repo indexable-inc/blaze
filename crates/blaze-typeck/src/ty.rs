@@ -2,8 +2,6 @@
 //! are the minimal traits until `crates/blaze-ty` exists; each item names what it becomes there.
 //! The tests implement them over a toy type language (`crate::toy`).
 
-use core::alloc::Allocator;
-
 use crate::error::{CheckError, Stop};
 use crate::ids::{ExprId, FloatTy, IntTy, ItemKey, Mutbl, Name, PatId, UintTy};
 use crate::world::{Reads, World};
@@ -152,31 +150,31 @@ pub trait TypeCtx {
     /// Registers an obligation to be proved.
     fn register(&mut self, ob: Obligation) -> Result<(), CheckError>;
     /// Proves what can be proved now; failures go to `next_error`, ambiguous ones stay.
-    fn select_where_possible<W: World, A: Allocator + Clone>(
+    fn select_where_possible<W: World>(
         &mut self,
-        reads: &mut Reads<'_, W, A>,
+        reads: &mut Reads<'_, '_, W>,
     ) -> Result<(), Stop>;
     /// As `select_where_possible`, then every obligation left is an `Ambiguous` error.
-    fn select_all<W: World, A: Allocator + Clone>(
+    fn select_all<W: World>(
         &mut self,
-        reads: &mut Reads<'_, W, A>,
+        reads: &mut Reads<'_, '_, W>,
     ) -> Result<(), Stop>;
     /// The next failed obligation, in the order they failed.
     fn next_error(&mut self) -> Option<FulfillError>;
     /// Whether `goal` may hold, evaluated in a probe (`predicate_may_hold`): nothing is bound.
-    fn may_hold<W: World, A: Allocator + Clone>(
+    fn may_hold<W: World>(
         &mut self,
         goal: Goal,
-        reads: &mut Reads<'_, W, A>,
+        reads: &mut Reads<'_, '_, W>,
     ) -> Result<bool, Stop>;
     /// `<args[0] as trait_<args[1..]>>::name` normalized now, if one impl or bound selects it;
     /// `None` when ambiguous or unsatisfied. Binds what the selection binds.
-    fn normalize<W: World, A: Allocator + Clone>(
+    fn normalize<W: World>(
         &mut self,
         trait_: ItemKey,
         args: TyList,
         name: Name,
-        reads: &mut Reads<'_, W, A>,
+        reads: &mut Reads<'_, '_, W>,
     ) -> Result<Option<Ty>, Stop>;
 
     /// The closure-signature hint of `var` from pending obligations

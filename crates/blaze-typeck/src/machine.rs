@@ -8,8 +8,7 @@
 
 #![blaze::sans_io]
 
-use blaze_own::{Soa, Vec};
-use core::alloc::Allocator;
+use blaze_own::{Alloc, Soa, Vec};
 use core::mem::DropGuard;
 
 use crate::body::BodyView;
@@ -192,11 +191,11 @@ pub(crate) struct Common {
 }
 
 /// The machine of one run.
-pub(crate) struct Machine<'b, 'w, 'c, W: World, C: TypeCtx, A: Allocator + Clone> {
+pub(crate) struct Machine<'b, 'w, 'c, 'a, W: World, C: TypeCtx> {
     pub body: BodyView<'b>,
-    pub reads: Reads<'w, W, A>,
+    pub reads: Reads<'w, 'a, W>,
     pub ty: &'c mut C,
-    pub alloc: A,
+    pub alloc: Alloc<'a>,
     pub plant: Plant,
     pub common: Common,
     /// The type a finished child left for its parent.
@@ -231,14 +230,14 @@ pub(crate) struct Machine<'b, 'w, 'c, W: World, C: TypeCtx, A: Allocator + Clone
     pub adj_scratch: Vec<(AdjustKind, Ty), A>,
 }
 
-impl<'b, 'w, 'c, W: World, C: TypeCtx, A: Allocator + Clone> Machine<'b, 'w, 'c, W, C, A> {
+impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
     pub(crate) fn new_in(
         body: BodyView<'b>,
-        reads: Reads<'w, W, A>,
+        reads: Reads<'w, 'a, W>,
         ty: &'c mut C,
         plant: Plant,
-        alloc: A,
-    ) -> Result<Machine<'b, 'w, 'c, W, C, A>, CheckError> {
+        alloc: Alloc<'a>,
+    ) -> Result<Machine<'b, 'w, 'c, 'a, W, C>, CheckError> {
         let empty = ty.mk_list(&[])?;
         let unit = ty.mk(TyView::Tuple(empty))?;
         let str_ = ty.mk(TyView::Str)?;
@@ -972,7 +971,7 @@ impl<'b, 'w, 'c, W: World, C: TypeCtx, A: Allocator + Clone> Machine<'b, 'w, 'c,
 }
 
 /// The children of a node, in order.
-fn children<A: Allocator>(node: PNode, types: PTys<'_>, out: &mut Vec<PTy, A>) -> Result<(), CheckError> {
+fn children(node: PNode, types: PTys<'_>, out: &mut Vec<PTy, Alloc<'_>>) -> Result<(), CheckError> {
     match node {
         PNode::Tuple(l)
         | PNode::Adt(_, l)

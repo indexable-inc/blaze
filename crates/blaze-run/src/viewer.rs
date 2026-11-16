@@ -8,10 +8,9 @@
 //! value; a decoder refuses any other form by name, and bounds the slots by its caller's cap
 //! before it takes one (network CBOR decoded with limits).
 
-
 use core::fmt;
 
-use blaze_own::Vec;
+use blaze_own::AVec;
 
 use crate::{Hooks, SlotId};
 
@@ -78,7 +77,7 @@ impl fmt::Display for Bad {
 
 impl core::error::Error for Bad {}
 
-fn head<A: Allocator>(major: u8, value: u64, out: &mut Vec<u8, A>) {
+fn head(major: u8, value: u64, out: &mut AVec<'_, u8>) {
     let major = major << 5;
     match value {
         0..=23 => out.push(major | value as u8),
@@ -99,7 +98,7 @@ fn head<A: Allocator>(major: u8, value: u64, out: &mut Vec<u8, A>) {
 }
 
 /// Pushes the toggle of `hooks` to `on` for `slots` onto `out`.
-pub fn toggle<A: Allocator>(slots: &[SlotId], hooks: Hooks, on: bool, out: &mut Vec<u8, A>) {
+pub fn toggle(slots: &[SlotId], hooks: Hooks, on: bool, out: &mut AVec<'_, u8>) {
     head(ARRAY, 5, out);
     head(UINT, VERSION, out);
     head(UINT, TOGGLE, out);
@@ -159,7 +158,7 @@ impl Reader<'_> {
 
 /// The request in `bytes`, its slots pushed to `slots`: at most `most_slots` of them, refused
 /// before any is taken.
-pub fn read<A: Allocator>(bytes: &[u8], most_slots: usize, slots: &mut Vec<SlotId, A>) -> Result<Request, Bad> {
+pub fn read(bytes: &[u8], most_slots: usize, slots: &mut AVec<'_, SlotId>) -> Result<Request, Bad> {
     let mut reader = Reader { bytes, at: 0 };
     reader.array(5, "request of five fields")?;
     let found = reader.head(UINT, "schema version")?;

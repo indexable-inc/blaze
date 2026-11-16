@@ -24,14 +24,13 @@
 //! writers of one outline write equal bytes and a record holds no bytes its values do not say
 //! (rule 25).
 
-use core::alloc::Allocator;
 use core::fmt;
 use core::mem::offset_of;
 use core::ops::Deref;
 
 use blaze_format::{FormatError, Slice, Writer};
 use blaze_id::{ContentId, Portable};
-use blaze_own::Vec;
+use blaze_own::{Alloc, Vec};
 
 use crate::column::{
     Column, RecordBytes, Strings, Text, at_of, at_of_record, check_text, count, finish_with,
@@ -609,12 +608,12 @@ impl FileItems<'_> {
     /// The record's buffer, in `alloc`. Refused when an entry's parent or descendants are not
     /// where they are said to be, a range runs backwards or past its entry, a name is not in
     /// the text, or a message is not one.
-    pub fn write<A: Allocator + Clone>(&self, alloc: A) -> Result<RecordBytes<A>, BuildError> {
+    pub fn write<'a>(&self, alloc: Alloc<'a>) -> Result<RecordBytes<'a>, BuildError> {
         count(self.items.len(), "FileItems items")?;
         count(self.attrs.len(), "FileItems attrs")?;
         count(self.errors.len(), "FileItems errors")?;
-        let mut names = Strings::new_in(alloc.clone());
-        let mut rows = Vec::with_capacity_in(self.items.len(), alloc.clone());
+        let mut names = Strings::new_in(alloc);
+        let mut rows = Vec::with_capacity_in(self.items.len(), alloc);
         for (at, item) in self.items.iter().enumerate() {
             let index = count(at, "FileItems items")?;
             let parent_end = item.parent.and_then(|parent| self.items.get(parent.at())).map(|parent| parent.end.0);
@@ -630,7 +629,7 @@ impl FileItems<'_> {
             };
             rows.push(row_of(item, names.push(name, "FileItems names")?));
         }
-        let mut attrs = Vec::with_capacity_in(self.attrs.len(), alloc.clone());
+        let mut attrs = Vec::with_capacity_in(self.attrs.len(), alloc);
         for (at, attr) in self.attrs.iter().enumerate() {
             if !attr_is_sound(attr) {
                 return Err(BuildError::BadIndex { table: "FileItems attrs", index: count(at, "FileItems attrs")? });
@@ -642,7 +641,7 @@ impl FileItems<'_> {
         }
         let messages = core::str::from_utf8(self.messages)
             .map_err(|_| BuildError::BadIndex { table: "FileItems messages", index: 0 })?;
-        let mut errors = Vec::with_capacity_in(self.errors.len(), alloc.clone());
+        let mut errors = Vec::with_capacity_in(self.errors.len(), alloc);
         for (at, error) in self.errors.iter().enumerate() {
             if !forwards(error.range) || error.message.get(messages).is_none() {
                 return Err(BuildError::BadIndex { table: "FileItems errors", index: count(at, "FileItems errors")? });

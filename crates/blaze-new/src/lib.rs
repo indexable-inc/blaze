@@ -236,7 +236,7 @@ pub enum NewError {
     /// An entry of the root manifest's `members`, or of its `exclude` when `exclude`, that is
     /// not a string, as written.
     NotAString { exclude: bool, written: String },
-    Pattern { pattern: String, error: glob::PatternError },
+    Pattern { pattern: String, error: blaze_glob::PatternError },
     /// The root manifest's `members` could not be edited.
     Edit { path: PathBuf, error: EditError<Global> },
     NoParent { path: PathBuf },

@@ -328,11 +328,11 @@ impl ToyCtx {
 
     /// Selects `trait_<args>`: `Some(Some(impl args))` for one impl, `Some(None)` for a bound
     /// of the env, `None` when nothing or more than one applies (the second value says which).
-    fn select_trait<W: World, A: core::alloc::Allocator + Clone>(
+    fn select_trait<W: World>(
         &mut self,
         trait_: ItemKey,
         args: TyList,
-        reads: &mut Reads<'_, W, A>,
+        reads: &mut Reads<'_, '_, W>,
     ) -> Result<Selection, Stop> {
         let self_ty = self.list_get(args, 0);
         let Some(shape) = self.shape(self_ty) else {
@@ -385,12 +385,12 @@ impl ToyCtx {
 
     /// The associated type `name` of the selected impl: the header instantiated afresh and
     /// unified with `args`, then the type lowered with the same arguments.
-    fn assoc_of<W: World, A: core::alloc::Allocator + Clone>(
+    fn assoc_of<W: World>(
         &mut self,
         imp: ItemKey,
         args: TyList,
         name: Name,
-        reads: &mut Reads<'_, W, A>,
+        reads: &mut Reads<'_, '_, W>,
     ) -> Result<Option<Ty>, Stop> {
         let Some(h) = reads.impl_header(imp)? else { return Ok(None) };
         let fresh = self.fresh_list(h.generics)?;
@@ -411,10 +411,10 @@ impl ToyCtx {
     }
 
     /// One attempt at an obligation: `Some(true)` held, `Some(false)` failed, `None` not yet.
-    fn attempt<W: World, A: core::alloc::Allocator + Clone>(
+    fn attempt<W: World>(
         &mut self,
         ob: Obligation,
-        reads: &mut Reads<'_, W, A>,
+        reads: &mut Reads<'_, '_, W>,
     ) -> Result<Option<FulfillErrorKind>, Stop> {
         Ok(match ob.goal {
             Goal::WellFormed(_) => None,
@@ -550,9 +550,9 @@ impl TypeCtx for ToyCtx {
         Ok(())
     }
 
-    fn select_where_possible<W: World, A: core::alloc::Allocator + Clone>(
+    fn select_where_possible<W: World>(
         &mut self,
-        reads: &mut Reads<'_, W, A>,
+        reads: &mut Reads<'_, '_, W>,
     ) -> Result<(), Stop> {
         for _ in 0..SOLVER_ROUNDS {
             // One pass compacts the kept obligations to the front: `Vec::remove` per settled
@@ -581,7 +581,7 @@ impl TypeCtx for ToyCtx {
         Err(CheckError::Limit(Limit::Solver).into())
     }
 
-    fn select_all<W: World, A: core::alloc::Allocator + Clone>(&mut self, reads: &mut Reads<'_, W, A>) -> Result<(), Stop> {
+    fn select_all<W: World>(&mut self, reads: &mut Reads<'_, '_, W>) -> Result<(), Stop> {
         self.select_where_possible(reads)?;
         for ob in core::mem::replace(&mut self.pending, Vec::new_in(Global)).iter() {
             self.errors.push(FulfillError { obligation: *ob, kind: FulfillErrorKind::Ambiguous });
@@ -597,19 +597,19 @@ impl TypeCtx for ToyCtx {
         e
     }
 
-    fn may_hold<W: World, A: core::alloc::Allocator + Clone>(&mut self, goal: Goal, reads: &mut Reads<'_, W, A>) -> Result<bool, Stop> {
+    fn may_hold<W: World>(&mut self, goal: Goal, reads: &mut Reads<'_, '_, W>) -> Result<bool, Stop> {
         let s = self.snapshot();
         let got = self.attempt(Obligation { goal, cause: crate::ty::Cause::Body }, reads);
         self.rollback_to(s);
         Ok(matches!(got?, None | Some(FulfillErrorKind::Ambiguous)))
     }
 
-    fn normalize<W: World, A: core::alloc::Allocator + Clone>(
+    fn normalize<W: World>(
         &mut self,
         trait_: ItemKey,
         args: TyList,
         name: Name,
-        reads: &mut Reads<'_, W, A>,
+        reads: &mut Reads<'_, '_, W>,
     ) -> Result<Option<Ty>, Stop> {
         for i in 0..self.env.len() {
             if let Goal::Projection { trait_: t, args: a, name: n, term } = self.env[i] {

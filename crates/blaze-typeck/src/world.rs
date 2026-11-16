@@ -441,7 +441,7 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
 
     /// The needs of a run stopped by the missing answer to `missing`: every question asked
     /// before it and `missing` itself, sorted, so the next run fetches them in one batch.
-    pub(crate) fn finish_need(self, missing: Question, alloc: A) -> Needs<A> {
+    pub(crate) fn finish_need(self, missing: Question, alloc: Alloc<'a>) -> Needs<'a> {
         let mut questions = Vec::with_capacity_in(self.entries.len() + 1, alloc);
         for &(q, _) in self.entries.iter() {
             questions.push(q);

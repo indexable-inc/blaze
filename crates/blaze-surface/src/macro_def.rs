@@ -9,13 +9,12 @@
 //! macro's kind, name and flags never reads its tokens, and two definitions with one body share
 //! its record.
 
-use core::alloc::Allocator;
 use core::fmt;
 use core::mem::offset_of;
 
 use blaze_format::{FormatError, Writer};
 use blaze_id::{ContentId, CrateItemKey, ItemKey, Portable};
-use blaze_own::Vec;
+use blaze_own::{AVec, Alloc};
 
 use crate::column::{
     Column, NONE, RecordBytes, Strings, Text, at_of, at_of_record, check_text, field_at,
@@ -280,21 +279,16 @@ pub struct MacroDefHead<'a> {
 /// The writer of one macro's [`MacroDef`] record: its head and, for a derive, its helper
 /// attributes in the order `attributes(..)` lists them (the source's order, which fixes the
 /// bytes).
-pub struct MacroDef<'a, A: Allocator + Clone> {
+pub struct MacroDef<'a, 'b> {
     head: MacroDefHead<'a>,
-    helpers: Vec<Text, A>,
-    staging: Strings<A>,
-    alloc: A,
+    helpers: AVec<'b, Text>,
+    staging: Strings<'b>,
+    alloc: Alloc<'b>,
 }
 
-impl<'a, A: Allocator + Clone> MacroDef<'a, A> {
-    pub fn new_in(head: MacroDefHead<'a>, alloc: A) -> MacroDef<'a, A> {
-        MacroDef {
-            head,
-            helpers: Vec::new_in(alloc.clone()),
-            staging: Strings::new_in(alloc.clone()),
-            alloc,
-        }
+impl<'a, 'b> MacroDef<'a, 'b> {
+    pub fn new_in(head: MacroDefHead<'a>, alloc: Alloc<'b>) -> MacroDef<'a, 'b> {
+        MacroDef { head, helpers: AVec::new_in(alloc), staging: Strings::new_in(alloc), alloc }
     }
 
     /// A derive's helper attribute.
@@ -304,14 +298,14 @@ impl<'a, A: Allocator + Clone> MacroDef<'a, A> {
         Ok(())
     }
 
-    pub fn finish(mut self) -> Result<RecordBytes<A>, BuildError> {
-        let mut strings = Strings::new_in(self.alloc.clone());
+    pub fn finish(mut self) -> Result<RecordBytes<'b>, BuildError> {
+        let mut strings = Strings::new_in(self.alloc);
         let name = strings.push(self.head.name, "MacroDef strings")?;
         for text in &mut self.helpers {
             *text = strings.moved(&self.staging, *text, "MacroDef strings")?;
         }
         let mut out =
-            Writer::new_in(<MacroDefRoot as blaze_format::Record>::SCHEMA, self.alloc.clone());
+            Writer::new_in(<MacroDefRoot as blaze_format::Record>::SCHEMA, self.alloc);
         let text = Column::push(&mut out, strings.bytes());
         let helpers = Column::push(&mut out, &self.helpers);
         let head = self.head;

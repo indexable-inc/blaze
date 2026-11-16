@@ -10,7 +10,8 @@
 //! - A [`Fingerprint`] is the 128 bits of a result kept for early cutoff (docs/v2/plan/design/item-hash.md
 //!   section 6.2).
 
-#![feature(allocator_api, allocator_ext, portable_simd, register_tool)]
+// `min_specialization`: implementing `blaze_hash::PlainKey`, a specialization trait, needs it.
+#![feature(allocator_api, allocator_ext, min_specialization, portable_simd, register_tool)]
 #![register_tool(blaze)]
 #![deny(unsafe_code)]
 

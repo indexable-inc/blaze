@@ -13,11 +13,10 @@
 
 #![blaze::sans_io]
 
-
 use core::mem;
 
 use blaze_hash::HashMap;
-use blaze_own::{SortedSet, Soa, Vec};
+use blaze_own::{AVec, ASoa, ASortedSet, Alloc, SortedSet, Soa, Vec};
 
 use crate::{CodeId, Plant, SlotId, TestId};
 
@@ -25,11 +24,11 @@ use crate::{CodeId, Plant, SlotId, TestId};
 /// the test's threads (in any order, a slot as often as threads marked it), `ids[slot]` is the
 /// slot's body's identity, and `inlined(slot)` lists the identities the optimizer inlined into
 /// the slot's optimized body (empty for fast code). Pushed to `out` sorted, each once.
-pub fn entered<'a, A: Allocator>(
+pub fn entered<'a>(
     marked: &[SlotId],
     ids: &[CodeId],
     inlined: impl Fn(SlotId) -> &'a [CodeId],
-    out: &mut Vec<CodeId, A>,
+    out: &mut AVec<'_, CodeId>,
 ) {
     let first = out.len();
     for slot in marked {
@@ -42,7 +41,7 @@ pub fn entered<'a, A: Allocator>(
 }
 
 /// Sorts what `out` holds from `first` on, and keeps each value once.
-fn sort_tail<T: Ord + Copy, A: Allocator>(out: &mut Vec<T, A>, first: usize) {
+fn sort_tail<T: Ord + Copy>(out: &mut AVec<'_, T>, first: usize) {
     out[first..].sort_unstable();
     let mut kept = first;
     for at in first..out.len() {
@@ -67,23 +66,23 @@ const VERDICT: usize = 1;
 const ENTERED: usize = 2;
 
 /// One suite's index. See the module's documentation.
-pub struct Tests<A: Allocator + Clone> {
-    alloc: A,
+pub struct Tests<'a> {
+    alloc: Alloc<'a>,
     /// Every test the suite has, sorted by its id, a row each: its id, its last verdict (none
     /// before it ran) and the identities it entered then. Columns, since `affected` scans the
     /// verdicts alone and a lookup halves the ids alone.
-    tests: Soa<(TestId, Option<Verdict>, Vec<CodeId, A>), A>,
+    tests: ASoa<'a, (TestId, Option<Verdict>, AVec<'a, CodeId>)>,
     /// From each identity to the tests that entered it. Hashed: every record adds a posting for
     /// each body it entered, thousands in no order, which a sorted vector would shift for.
-    postings: HashMap<CodeId, SortedSet<TestId, A>, A>,
+    postings: HashMap<CodeId, ASortedSet<'a, TestId>, Alloc<'a>>,
     pub(crate) plant: Plant,
 }
 
-impl<A: Allocator + Clone> Tests<A> {
-    pub fn new(alloc: A) -> Tests<A> {
+impl<'a> Tests<'a> {
+    pub fn new(alloc: Alloc<'a>) -> Tests<'a> {
         Tests {
-            tests: Soa::new_in(alloc.clone()),
-            postings: HashMap::new_in(alloc.clone()),
+            tests: Soa::new_in(alloc),
+            postings: HashMap::new_in(alloc),
             alloc,
             plant: Plant::None,
         }

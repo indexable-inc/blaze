@@ -269,7 +269,7 @@ fn expect(holds: bool, what: &str) {
 /// The selftest's file. Line by line:
 /// - 1, `.unwrap()`: unwrap; 2, `.expect("x")`: expect; 3, `.unwrap_or(0)`, `.expect_err`: none;
 /// - 4, `panic!`, `unreachable!`, `todo!`, `unimplemented!`: one each;
-/// - 5, `panic != x`, `x.panic!`... no: `std::panic::catch_unwind`: none;
+/// - 5, `std::panic::catch_unwind` and `panic != x`: none;
 /// - 6, `v[i]`: index; `v[0]`, `v[1..]`, `v[..]`, `v[..=2]`: literal, none;
 /// - 7, `m["k"]`: index; `f()[j]`: index; `a[i][0]`: one;
 /// - 8, `#[derive(Debug)]`, `let [a, b] = x;`, `&'a [u8]`, `[0u8; 4]`, `vec![1]`: none;

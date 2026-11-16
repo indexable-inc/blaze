@@ -425,6 +425,7 @@ blaze-reclaim = { path = "crates/blaze-reclaim" }
 blaze-mem = { path = "crates/blaze-mem" }
 blaze-own = { path = "crates/blaze-own" } # Vec, Box, Arc, Rc, ... with no default allocator, in place of `alloc`.
 blaze-int = { path = "crates/blaze-int" } # Integer conversions that say what they do (widen, narrow, truncate, saturate), in place of `as`.
+blaze-text = { path = "crates/blaze-text" } # Typed writers into a `Put` sink, `Show` and `Parse<'a>`, in place of `core::fmt` and `FromStr`.
 blaze-columns = { path = "crates/blaze-columns" }
 blaze-kit = { path = "crates/blaze-kit" } # Specialized collections: typed tables, inline vectors, union-find, sparse and chunked sets, heaps, a timer wheel, column codecs, static search.
 blaze-memchr = { path = "crates/blaze-memchr" } # Byte search (NEON, SSE2, SWAR), in place of memchr.

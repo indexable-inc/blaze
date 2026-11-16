@@ -262,6 +262,11 @@ impl<A: Allocator + Clone, S: Allocator> Build<A, S> {
         self.value(value);
     }
 
+    /// Whether the top value is whole.
+    pub fn is_whole(&self) -> bool {
+        self.open.is_empty() && self.done.is_some()
+    }
+
     /// The value, once whole.
     pub fn finish(self) -> Option<Value<A>> {
         match self.open.is_empty() {

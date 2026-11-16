@@ -15,6 +15,7 @@ use blaze_own::{CollectIn, SortedMap, SortedSet, Vec, VecDeque, soa};
 
 use crate::Plant;
 use crate::answers::{self, Last, Page, Root, Row};
+use crate::condition::{Condition, ConditionError, MOST_ATOMS, MOST_CONDITIONS, OVER_CAP_RULE, Space, Var};
 use crate::key::{self, ABSENT, Key, Kind, Name, Tool};
 use crate::profile::Profile;
 use crate::record::{self, Finding, Locate, Part, Stored, Whole, WholeView};
@@ -93,6 +94,9 @@ pub struct Ask<'a> {
     pub args: &'a [u8],
     /// For `run` and `test`; `check` ignores it.
     pub gate: Gate,
+    /// Every configuration the request answers for at once (drive.md, "One check covers every
+    /// configuration"): [`Space::NONE`] for one. Its implications are closed by the caller.
+    pub space: Space<'a>,
 }
 
 /// One file of the checkout, as the sweep found it.
@@ -167,6 +171,9 @@ pub enum Ran<'a> {
     Done(&'a [Output<'a>]),
     /// What it lacks; it is entered again from the top with them as inputs.
     Need(&'a [Want]),
+    /// It read a cfg variable its [`Task::condition`] does not fix (`Need(Cfg(variable))`): the
+    /// job is entered again once per value the request's space allows, each a job of its own.
+    Cfg(Var),
     Failed(TaskFailure),
 }
 
@@ -233,7 +240,15 @@ pub struct Input {
 /// A task to run.
 #[derive(Debug)]
 pub struct Task<A: Allocator> {
+    /// The job's name: what its [`Output`] is of. Under a condition it is a fork's name
+    /// (`key::at_condition`), and the item is [`Task::base`].
     pub name: Name,
+    /// The item the task is about: `name` under [`Condition::ANY`]. Workers find the item, and
+    /// name what they read and want, by base names; the machine maps them to the records the
+    /// task's condition implies.
+    pub base: Name,
+    /// The cfg values the task may read; reading any other variable is [`Ran::Cfg`].
+    pub condition: Condition,
     pub key: Key,
     pub source: ContentId,
     pub class: Class,
@@ -253,7 +268,11 @@ pub struct Task<A: Allocator> {
 /// A finding to print: the caller places it with the file's line table.
 #[derive(Debug)]
 pub struct Print<A: Allocator> {
+    /// The item (a base name, never a fork's).
     pub name: Name,
+    /// The configurations it holds in: every one that implies this (bottom.md 11: a finding
+    /// carries the reduced condition it was found under).
+    pub condition: Condition,
     /// The file it is in, an index for [`Request::path`]; `None` for a manifest's or a crate's.
     pub file: Option<u32>,
     /// Its item's start in the file.
@@ -344,6 +363,13 @@ pub enum DriveError {
     /// The program wanted a name nothing settled after the check was done: code the check's
     /// walk does not reach is not built yet (drive.md, "The gate").
     LateWant { name: Name },
+    /// A condition of `name` could not be formed (too many atoms, a variable the space lacks).
+    Condition { name: Name, error: ConditionError },
+    /// A split record forks on a variable its own condition fixes: no task reads a fixed
+    /// variable as unfixed.
+    SplitOnFixed { name: Name, var: Var },
+    /// The request's space has implications that are not closed (`Space::closed`).
+    SpaceNotClosed,
 }
 
 impl fmt::Display for DriveError {
@@ -383,6 +409,13 @@ impl fmt::Display for DriveError {
             DriveError::Finished => write!(f, "a step after the request answered"),
             DriveError::NoProgram => write!(f, "a program's exit, with no program running"),
             DriveError::LateWant { name } => write!(f, "the program wanted {name} after the check was done; a late want is not built (drive.md, \"The gate\")"),
+            DriveError::Condition { name, error } => write!(f, "the conditions of {name}: {error}"),
+            DriveError::SplitOnFixed { name, var } => {
+                write!(f, "the record of {name} forks on cfg variable {var}, which its condition fixes (rule 21)")
+            }
+            DriveError::SpaceNotClosed => {
+                write!(f, "the request's feature implications are not transitively closed (drive.md, \"One check covers every configuration\")")
+            }
         }
     }
 }
@@ -480,6 +513,10 @@ enum Phase {
 struct Held<A: Allocator> {
     file: Name,
     place: u32,
+    /// The item and the condition its record was found under: a fork's findings print as its
+    /// base's, under its condition.
+    base: Name,
+    condition: Condition,
     findings: Vec<HeldFinding<A>, A>,
 }
 
