@@ -231,6 +231,10 @@ thread_local! {
         const { RefCell::new(BTreeMap::new()) };
     /// Each unit's record as a build ended it, made or stood, in the order they ended.
     static STAND_ENDED: RefCell<Vec<(usize, ContentId)>> = const { RefCell::new(Vec::new()) };
+    /// The unit whose compile says its crate's identity moved after its record's lookup
+    /// ([`Compiled::moved`]), as a build script's run or a proc macro's expanders applied to
+    /// a crate it depends on move it.
+    static STAND_MOVED: Cell<Option<usize>> = const { Cell::new(None) };
     /// Each unit stood in its one task ([`Front::stand`]), in order.
     static STOOD: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
     /// Set while a standing unit's task runs its store, which replays the record it found.
@@ -1709,6 +1713,7 @@ impl Front<Fake> for FakeFront {
             why: None,
             puts,
             put_of: Vec::new(),
+            moved: STAND_MOVED.get() == Some(unit),
             record: None,
             body_sessions,
             share,
@@ -2927,6 +2932,44 @@ fn a_sealed_unit_the_last_build_kept_stands_in_one_task_and_its_record_gone_fail
     assert_eq!(each, Phase::BUILD, "dep's library posts its phases again: {ran:?}");
     let records = ended_records();
     assert_eq!(records, fresh_records(3103, 3, "1"), "the build after the failure");
+    standing_off();
+}
+
+/// The invariant: a unit whose crate's identity moved after its record's lookup in the last
+/// build (its record filed under the key it was looked up under, which the kept front end no
+/// longer asks) does not stand in the next: it posts its phases, the build ends well, and its
+/// records are a fresh daemon's. Once it compiled with its identity unmoved, it stands again.
+#[test]
+fn a_unit_whose_identity_moved_after_its_lookup_does_not_stand_in_the_next_build() {
+    standing_model(&[0]);
+    let mut sim = Sim::new(3111, Faults::default());
+    checkout(&mut sim, "[package]\n");
+    let steps = Arc::new(Fake::default());
+    let mut daemon = start(sim, &steps, 3111);
+    let mut client = dial(&mut daemon);
+    STAND_MOVED.set(Some(0));
+    let got = standing_build(&mut daemon, &mut client, "1");
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+    STAND_MOVED.set(None);
+    let _ = (ended_records(), PHASES.with(|it| it.take()), STOOD.take());
+
+    standing_edit(&mut daemon, 3, 1);
+    let got = standing_build(&mut daemon, &mut client, "1");
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+    let (ran, stood) = (PHASES.with(|it| it.take()), STOOD.take());
+    assert!(stood.is_empty(), "dep's library moved last build, so nothing stands: {stood:?}");
+    let mut each = phases_of(&ran, 0);
+    each.sort_unstable_by_key(|it| *it as u8);
+    assert_eq!(each, Phase::BUILD, "dep's library posts its phases: {ran:?}");
+    let records = ended_records();
+    assert_eq!(records, fresh_records(3112, 1, "1"), "the build after the move");
+
+    standing_edit(&mut daemon, 3, 2);
+    let got = standing_build(&mut daemon, &mut client, "1");
+    assert_eq!(got.last(), Some(&Response::Done { ok: true }), "{got:#?}");
+    let (ran, stood) = (PHASES.with(|it| it.take()), STOOD.take());
+    assert_eq!(stood, [0], "compiled unmoved, dep's library stands again: {ran:?}");
+    let _ = ended_records();
     standing_off();
 }
 

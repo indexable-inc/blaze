@@ -1994,6 +1994,21 @@ impl Lowered {
         std::mem::take(&mut self.library_made)
     }
 
+    /// Unit `unit`'s crate identity as the front end makes it now: the one worked out since
+    /// the last write, else worked out again over the database as it is. It differs from the
+    /// identity a record was looked up under ([`Lowered::identity`]) when a write since the
+    /// lookup moved it: a build script's run applied, or a proc macro's expanders given, to
+    /// the crate or one it depends on. None for a unit with no crate in the front end.
+    pub fn identity_now(&self, unit: usize) -> Option<ContentId> {
+        let krate = self.crates.krate(unit)?;
+        if let Some(known) = self.identities.get(&krate) {
+            return Some(*known);
+        }
+        // clone: the identities known since the last write, once per unit stored after one
+        let mut identities = self.identities.clone();
+        Some(identity_of(&self.db, krate, &self.spellings, &mut identities))
+    }
+
     /// What unit `unit`'s identity ([`Lowered::identity`]) is made of, one part each, for
     /// `blaze why` to name the one that changed (docs/v2/plan/design/why.md): its crate's own
     /// settings, each file it is made from (its root file alone for a crate that reads no
