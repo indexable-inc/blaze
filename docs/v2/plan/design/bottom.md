@@ -308,6 +308,22 @@ Andrew: "we should have 0 third party and all the things you said worth adding".
   keep, it can run on another machine. Fibers are bstd's convenience for sequential code of
   an ordinary program (no `async`, one kind of function), until blaze generates the state
   machine from straight-line code; they are not how the compiler's own tasks wait.
+- **A body's needs are remembered.** The record of a checked body lists what its check
+  needed; the driver has those before it enters the task the next time, so the usual check is
+  one pass with no re-entry. Written new, the checker would walk a body with a work stack of
+  its own over the flat expression arrays (its state is data: it cannot overflow the stack and
+  can stop anywhere) and keep questions it cannot answer yet in a queue, in rustc's order of
+  inference, which is the specification; the refit keeps the recursive walk and re-enters.
+- **Fibers and `Send`** (Andrew: "wont we not have proper protection against using things
+  like ... Rc"). Rust checks `Send` across an `.await` and not across a fiber's wait: a fiber
+  that holds an `Rc`, a lock guard or a thread-local borrow, parks and wakes on another thread
+  is a data race rustc accepts. So: the compiler's own tasks use no fibers (above); built by
+  rustc, a fiber of bstd never changes its thread after it starts (new tasks are spread, a
+  started one stays), which is sound unchecked; built by blaze, "a value that is not `Send` is
+  live across a call that can wait" is a compile error and a fiber may move. That check
+  (rule 27; its lints went with the old lints on 2026-11-15) is the first rebuilt on the new
+  layer. bstd has no thread-local storage; its one-thread types check in debug builds that
+  they end on the thread that made them.
 - **Many machines on one page** (Andrew: "a monitor of what might be happening even on
   multiple machines"). The viewer's events (a command began or ended, what it runs, compiles
   or tests, on which machine and checkout, time and memory) are one stream. When an
