@@ -262,10 +262,11 @@ impl<'c, 'a, T: Tys, F: Facts> Cx<'c, 'a, T, F> {
     }
 
     /// Fresh arguments for an impl being matched: a const variable for each const parameter
-    /// (one its portable table names as `ConstParam(i)`), a type variable for the rest, so a
-    /// const position can only ever unify with a const (`fresh_args_for_item`).
+    /// (one the impl's own terms name as `ConstParam(i)`: `coherence::fresh_for`), a type
+    /// variable for the rest, so a const position can only ever unify with a const
+    /// (`fresh_args_for_item`).
     pub fn fresh_impl_args(&mut self, h: &ImplHeader<'_>) -> Result<List, Stop> {
-        let v = crate::coherence::fresh_for(self.tys, h.portable, h.generics, self.alloc)?;
+        let v = crate::coherence::fresh_for(self.tys, h, self.alloc)?;
         self.mk_list(&v)
     }
 

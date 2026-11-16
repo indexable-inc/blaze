@@ -1912,6 +1912,7 @@ dependencies = [
  "blaze-core",
  "blaze-expand",
  "blaze-fetch",
+ "blaze-file-items",
  "blaze-id",
  "blaze-lex",
  "blaze-manifest",

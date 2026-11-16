@@ -801,6 +801,46 @@ once; the plant `RanUnderCondition` (an asker served a fork it does not imply) i
       the 25 ms `pub fn` question; note the names step now READS std's packs whole instead of
       mapping them: re-measure body and `pub fn` edits, the world should not be rebuilt for one
       crate. The shared store (step 4) moved to the "Shared cache" lane.
+    - RUNNER 4 2026-11-16 (uncommitted; handing on). blaze-report: "check ok (all targets)",
+      its tests "39 passed, 1 failed" (the tree-wide backticks ratchet, other crates' rows).
+      blaze-cli test (mixcheck, 10:2x) compiled with all below: the panic and oversize tests
+      now ANSWER (no `NoPart`); their fixed runs printed "FileItems ... made 1", "CrateScope
+      ... made 1 ... entries 4 needs 3": numbers set to 6 with the reason; the signature edit
+      printed "CrateScope ... entries 2 needs 1": the 4th run is the crate's second entry,
+      number set to 4 with the reason (re-run owed for the pass line). Still red:
+      `creating_a_missing_module_file_clears_its_error`: "Drive(NoFile { file: FileItems,
+      home: FileItems })": a missing `mod x;` file fails the WHOLE request in the drive
+      (request.rs `advance`, `Locate::File` arm, `State::Settled` home -> `NoFile`): make it a
+      finding of the home's (no request error), then the absence read is testable;
+      `a_clean_run_says_nothing_of_its_own`: "blaze: machine store: 6 records found ..." is
+      printed by store.rs (the Shared cache lane's; tell them). blaze-drive's own test run was
+      not reached (build lock). Written:
+      (1a) request.rs `advance`: a part whose home is Settled and in `failures` settles failed
+      `Why::Waited { on: home }` (no `NoPart`); sim.rs `World::failing_file` + test
+      `a_failed_file_fails_its_surface_and_its_readers_not_the_request` (first run without the
+      sim's Signature `task.failed` check looped: "Signature(..) was entered 32 times"; it now
+      answers `Waited` like `crate_scope`). The without-the-fix failing line is still owed.
+      names.rs `run`: ANY `task.failed` need fails the crate `Waited` (was only `CrateScope`).
+      main.rs `draw`: `Waited` failures print as one note "N task(s) not run: each needs one
+      that failed above"; test helper `Checked.failed` holds only causes, `profile` and `errors`
+      added; the three red tests print `profile` on a wrong count (the `runs` counts ENTRIES:
+      the 4th of a signature edit is likely the `CrateScope`'s second entry after its `Need`
+      of surfaces; confirm from the printed profile, then fix the doc and number). The panic
+      and oversize tests may now count 3 (the crate's names, never made): check the profile.
+      (1c) names.rs `Recording.absent`: a probe under `/0/` that found nothing is a read of
+      its `Surface` with `key::ABSENT`; test `creating_a_missing_module_file_clears_its_error`.
+      (3a) blaze-report `Closing.coverage: Option<Coverage { ran, not }>`: never `ok` while a
+      stage is missing ("incomplete · no errors in: … · NOT checked: …"); main.rs
+      `CHECK_STAGES` (the one list), `check_coverage`, `INCOMPLETE = Status(3)`, `blaze
+      explain [status]` (`STATUSES`). mixcheck builds blaze-cli against blaze-report's LAST
+      GREEN snapshot: blaze-report must pass `mixcheck blaze-report test` first.
+      Left: compile and run all of the above; (2) the planted `held` run; (3b) body syntax:
+      plan = a `BodyCheck` part per fn body in `outline_file` (source = body text digest),
+      run as `parser::Reparser::top_level_item().parse` (blaze-lower lib.rs `lower_body`'s
+      entry) emitting `SYNTAX` findings item-relative; `builds(BodyCheck)` then true, so
+      `left_out_note` must stop deriving "check types" from it; (3c) unresolved own paths as
+      errors, "N paths wait on: <cause> (k)", and "names resolved for N crates" always;
+      "pass on": scripts/src/bin/smoke.rs may expect `check` exit 0.
 - Owed, not now: `run` after `check` writes its own certificate, because the command is in
   the key. That costs 3.5 ms against the second run's 1.0 ms on hello-world. A coarse proof
   covers all under it: `check`'s certificate should stand for `run`'s check part.

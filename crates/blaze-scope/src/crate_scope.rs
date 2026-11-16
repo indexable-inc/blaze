@@ -687,6 +687,34 @@ pub trait ReadyHooks {
     }
 }
 
+/// The domain of an exports record's digest: what a dependent's read list holds of each
+/// dependency it was handed ([`Kept`]).
+pub const EXPORTS_DOMAIN: &str = "blaze-scope exports record v1";
+
+/// Earlier solves kept between calls (the driver's records; blaze-world's `names --records`):
+/// asked before a crate is solved, told once it was. A crate is found, not solved, when what it
+/// read then is read the same now: the exports record of each crate it was handed (its
+/// dependencies, the sysroot crates before it, each crate a `Need` named), by digest, and its
+/// files (the store's own check: [`SourceTexts`] is where it sees them read).
+pub trait Kept: Sync {
+    /// `krate`'s exports and inner records if every record it read is unchanged: `exports(g)`
+    /// is crate `g`'s exports digest in this call (`None`: not written yet, so not found).
+    fn find(&self, krate: usize, exports: &dyn Fn(usize) -> Option<ContentId>) -> Option<(&[u8], &[u8])>;
+
+    /// `krate` was solved: its two records and, sorted by crate index, each crate whose exports
+    /// record it was handed with that record's digest.
+    fn made(&self, krate: usize, record: &[u8], inner: &[u8], read: &[(usize, ContentId)]);
+}
+
+/// One crate's answer from [`resolve_kept`].
+#[derive(Debug)]
+pub enum Solved<'a> {
+    /// Solved in this call.
+    Solved(CrateScope<'a>),
+    /// Found from an earlier solve ([`Kept::find`]): its two records, nothing solved.
+    Found { record: &'a [u8], inner: &'a [u8] },
+}
+
 /// No hooks.
 pub struct NoHooks;
 
@@ -718,12 +746,30 @@ pub fn resolve_by_records<'a, S: SourceTexts<'a>, P: Par>(
     resolve_by_records_with(crates, sysroot, sources, par, ready, false, alloc)
 }
 
+/// [`resolve_by_records`] with earlier solves: each crate is first looked up in `kept` and
+/// solved only when not found; each solve is told to `kept` with its read list. A found crate's
+/// records are exactly those it was solved to (the key is its read list, checked against this
+/// call's records), so what dependents are handed is the same either way.
+pub fn resolve_kept<'a, S: SourceTexts<'a>, P: Par>(
+    crates: &[CrateInput<'a>],
+    sysroot: Sysroot,
+    sources: &S,
+    par: &P,
+    ready: &Ready<'_>,
+    kept: &dyn Kept,
+    alloc: Alloc<'a>,
+) -> Result<(AVec<'a, Solved<'a>>, usize), (usize, CrateScopeError<'a>)> {
+    resolve_queue(crates, sysroot, sources, par, ready, false, Some(kept), alloc)
+}
+
 /// The ready queue's state, under one lock: held to take a crate, to read records, and to
 /// publish one; never across a resolution.
 struct Queue<'a> {
     /// By crate index: its exports record once written, decoded once for the whole call.
     records: AVec<'a, Option<&'a DepScope<'a>>>,
-    out: AVec<'a, Option<CrateScope<'a>>>,
+    /// By crate index: its exports record's digest ([`EXPORTS_DOMAIN`]) once written.
+    digests: AVec<'a, Option<ContentId>>,
+    out: AVec<'a, Option<Solved<'a>>>,
     /// By crate index: how many of the crates it waits on are not done.
     blocked: AVec<'a, u32>,
     ready: AVec<'a, usize>,
@@ -746,7 +792,6 @@ fn locked<'q, 'a>(queue: &'q Mutex<Queue<'a>>) -> MutexGuard<'q, Queue<'a>> {
     queue.lock().unwrap_or_else(|poisoned| panic!("the names ready queue's lock was poisoned by a panic while held: {poisoned}"))
 }
 
-#[allow(clippy::too_many_lines, reason = "one worker's loop: take, resolve with its Needs, publish")]
 pub(crate) fn resolve_by_records_with<'a, S: SourceTexts<'a>, P: Par>(
     crates: &[CrateInput<'a>],
     sysroot: Sysroot,
@@ -756,6 +801,30 @@ pub(crate) fn resolve_by_records_with<'a, S: SourceTexts<'a>, P: Par>(
     leak_private: bool,
     alloc: Alloc<'a>,
 ) -> Result<(AVec<'a, CrateScope<'a>>, usize), (usize, CrateScopeError<'a>)> {
+    let (solved, needs) = resolve_queue(crates, sysroot, sources, par, ready, leak_private, None, alloc)?;
+    let mut all = AVec::with_capacity_in(solved.len(), alloc);
+    for (at, s) in solved.into_iter().enumerate() {
+        match s {
+            Solved::Solved(scope) => all.push(scope),
+            // No `Kept` was given, so nothing is found.
+            Solved::Found { .. } => return Err((at, CrateScopeError::Names(NamesError::NotResolved { krate: crates[at].name }))),
+        }
+    }
+    Ok((all, needs))
+}
+
+#[allow(clippy::too_many_lines, reason = "one worker's loop: take, find or resolve with its Needs, publish")]
+#[allow(clippy::too_many_arguments, reason = "the entry's arguments, the planted bug's switch and the kept solves")]
+fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
+    crates: &[CrateInput<'a>],
+    sysroot: Sysroot,
+    sources: &S,
+    par: &P,
+    ready: &Ready<'_>,
+    leak_private: bool,
+    kept: Option<&dyn Kept>,
+    alloc: Alloc<'a>,
+) -> Result<(AVec<'a, Solved<'a>>, usize), (usize, CrateScopeError<'a>)> {
     let graph = crate::resolve::graph_of(crates, sysroot, alloc).map_err(|e| (0, CrateScopeError::Names(e)))?;
     let n = crates.len();
     let mut pos: AVec<'a, usize> = AVec::from_iter_in(crates.iter().map(|_| usize::MAX), alloc);
@@ -790,6 +859,7 @@ pub(crate) fn resolve_by_records_with<'a, S: SourceTexts<'a>, P: Par>(
     let ready_now: AVec<'a, usize> = AVec::from_iter_in((0..n).filter(|&at| blocked[at] == 0), alloc);
     let queue = Mutex::new(Queue {
         records: AVec::from_iter_in(crates.iter().map(|_| None), alloc),
+        digests: AVec::from_iter_in(crates.iter().map(|_| None), alloc),
         out: AVec::from_iter_in(crates.iter().map(|_| None), alloc),
         blocked,
         ready: ready_now,
@@ -850,8 +920,14 @@ pub(crate) fn resolve_by_records_with<'a, S: SourceTexts<'a>, P: Par>(
             for (slot, s) in mapped.iter_mut().zip(sysroot.all()) {
                 *slot = s.filter(|s| s.index() != at && pos[s.index()] < pos[at]).map(|s| place(s.index(), &mut local));
             }
+            // An earlier solve whose read list holds today: its records, copied out of the store.
+            let digest_of = |g: usize| locked(&queue).digests[g];
+            let found = kept.and_then(|k| k.find(at, &digest_of)).map(|(record, inner)| {
+                let (r, i) = (crate::resolve::aligned(record, alloc), crate::resolve::aligned(inner, alloc));
+                Solved::Found { record: &r[..record.len()], inner: &i[..inner.len()] }
+            });
             let mut tries = 0;
-            let result = loop {
+            let result = if let Some(found) = found { Ok(found) } else { loop {
                 tries += 1;
                 let me = local.len();
                 let ids = mapped.map(|p| p.map(|p| CrateId(p as u32)));
@@ -909,23 +985,42 @@ pub(crate) fn resolve_by_records_with<'a, S: SourceTexts<'a>, P: Par>(
                     }
                     Err(e) => break Err(e),
                 }
-            };
+            }
+            .map(|done| {
+                // Its read list: each crate whose exports record it was handed (all written).
+                if let Some(k) = kept {
+                    let mut read = AVec::with_capacity_in(local.len(), alloc);
+                    {
+                        let q = locked(&queue);
+                        read.extend(local.iter().filter_map(|&g| q.digests[g].map(|d| (g, d))));
+                    }
+                    read.sort_unstable_by_key(|(g, _)| *g);
+                    k.made(at, &done.record, &done.inner, &read);
+                }
+                Solved::Solved(done)
+            }) };
             // The crate's exports record, decoded once here, outside the lock, and shared by
             // every crate that reads it in this call: never once per reader.
             let result = result.and_then(|done| {
+                let own: &[u8] = match &done {
+                    Solved::Solved(scope) => &scope.record,
+                    Solved::Found { record, .. } => record,
+                };
+                let digest = ContentId::of(EXPORTS_DOMAIN, own);
                 ready.hooks.decoding(at);
-                let bytes = crate::resolve::aligned(&done.record, alloc);
+                let bytes = crate::resolve::aligned(own, alloc);
                 let decoded = read_record(bytes, alloc).map_err(|error| CrateScopeError::OwnRecord { krate: input.name, error })?;
                 ready.hooks.decoded(at, bytes.len());
                 let decoded: &'a DepScope<'a> = Box::leak(Box::new_in(decoded, alloc));
-                Ok((done, decoded))
+                Ok((done, decoded, digest))
             });
             {
                 let mut q = locked(&queue);
                 q.in_flight -= 1;
                 match result {
-                    Ok((done, record)) => {
+                    Ok((done, record, digest)) => {
                         q.records[at] = Some(record);
+                        q.digests[at] = Some(digest);
                         q.out[at] = Some(done);
                         q.left -= 1;
                         for &d in dependents[at].iter() {

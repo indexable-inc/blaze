@@ -38,6 +38,92 @@ pub struct Body {
     pub statics: Vec<ItemKey, Global>,
     /// By `Tls` reference place: the thread-local's offset in a thread's block.
     pub tls: Vec<u32, Global>,
+    /// By `Vtable` reference place: the program's table ([`Vtables`]) the word is the address of.
+    pub vtables: Vec<u32, Global>,
+}
+
+/// What one word of a vtable becomes: a slot's entry thunk (a method, the drop glue) or another
+/// table's address (a supertrait's off the first chain).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VtableWord {
+    Slot(u32),
+    Table(u32),
+}
+
+/// One vtable of the program: its bytes as the code builder laid them out
+/// (`blaze_build::vtable::Vtable::build`: drop glue, size, align, then the methods in the object
+/// trait's order) and, by byte offset, what each address word is filled with.
+pub struct VtableImage {
+    pub bytes: Vec<u8, Global>,
+    pub words: Vec<(u32, VtableWord), Global>,
+}
+
+/// The program's vtables written into memory of their own (never freed: they live as long as
+/// the placed code does). Words naming another table are filled when written; words naming a
+/// slot once the slots are declared, on the first code that takes a table's address.
+struct Vtables<'b> {
+    images: &'b [VtableImage],
+    at: Vec<u64, Global>,
+    slots_filled: bool,
+}
+
+impl Vtables<'_> {
+    fn write(images: &[VtableImage]) -> Result<Vtables<'_>, PlaceError> {
+        use core::alloc::{Allocator, Layout};
+        let mut at = Vec::with_capacity_in(images.len(), Global);
+        for image in images {
+            let bytes = image.bytes.len().max(8);
+            let layout = Layout::from_size_align(bytes, 8).map_err(|_| PlaceError::NoMemory { bytes })?;
+            let memory = Global.allocate_zeroed(layout).map_err(|_| PlaceError::NoMemory { bytes })?;
+            let base = memory.as_ptr().cast::<u8>();
+            // SAFETY: `memory` is a fresh allocation of at least `image.bytes.len()` bytes, owned
+            // here and never freed; nothing else refers to it yet.
+            unsafe { core::ptr::copy_nonoverlapping(image.bytes.as_ptr(), base, image.bytes.len()) };
+            at.push(base as u64);
+        }
+        for (n, image) in images.iter().enumerate() {
+            for &(offset, word) in image.words.iter() {
+                if let VtableWord::Table(t) = word {
+                    let Some(&target) = at.get(t as usize) else {
+                        return Err(PlaceError::NoVtable { table: t });
+                    };
+                    Self::store(&at, images, n, offset, target)?;
+                }
+            }
+        }
+        Ok(Vtables { images, at, slots_filled: false })
+    }
+
+    /// Writes `value` into table `n`'s word at byte `offset`.
+    fn store(at: &[u64], images: &[VtableImage], n: usize, offset: u32, value: u64) -> Result<(), PlaceError> {
+        let len = images[n].bytes.len();
+        if offset as usize % 8 != 0 || offset as usize + 8 > len {
+            return Err(PlaceError::VtableWord { table: n as u32, offset });
+        }
+        // SAFETY: table `n` was allocated by `write` with `len` bytes, 8-aligned, and is never
+        // freed; `offset` is an 8-aligned word inside it (checked above). The tables are written
+        // only here, before any placed code runs.
+        unsafe { ((at[n] + u64::from(offset)) as *mut u64).write(value) };
+        Ok(())
+    }
+
+    /// Table `t`'s address, its slot words filled first (all tables at once, the first time).
+    fn address(&mut self, t: u32, place: Place) -> Result<u64, String> {
+        if !self.slots_filled {
+            for (n, image) in self.images.iter().enumerate() {
+                for &(offset, word) in image.words.iter() {
+                    if let VtableWord::Slot(s) = word {
+                        let Some(thunk) = place.thunk(Slot(s)) else {
+                            return Err(format!("vtable {n}: the word at {offset} names slot {s}, which is not declared"));
+                        };
+                        Self::store(&self.at, self.images, n, offset, thunk).map_err(|e| e.to_string())?;
+                    }
+                }
+            }
+            self.slots_filled = true;
+        }
+        self.at.get(t as usize).copied().ok_or_else(|| format!("vtable {t} is not one of the program's {}", self.at.len()))
+    }
 }
 
 /// What every body's thread-local words name: the program's one descriptor static and the
@@ -70,6 +156,10 @@ pub enum PlaceError {
     TlsKey { errno: i32 },
     /// The program has thread-locals and its static image holds no descriptor for them.
     NoDescriptor,
+    /// A vtable's word names a table the program does not have.
+    NoVtable { table: u32 },
+    /// A vtable's address word is not an aligned word inside it.
+    VtableWord { table: u32, offset: u32 },
 }
 
 impl core::fmt::Display for PlaceError {
@@ -91,6 +181,8 @@ impl core::fmt::Display for PlaceError {
             PlaceError::NoMemory { bytes } => write!(f, "no memory for the {bytes}-byte static image"),
             PlaceError::TlsKey { errno } => write!(f, "`pthread_key_create` for the thread-locals' key failed: errno {errno}"),
             PlaceError::NoDescriptor => write!(f, "the program has thread-locals and its static image holds no descriptor"),
+            PlaceError::NoVtable { table } => write!(f, "a vtable's word names table {table}, which the program does not have"),
+            PlaceError::VtableWord { table, offset } => write!(f, "vtable {table}: the address word at byte {offset} is not an aligned word inside it"),
         }
     }
 }
@@ -109,6 +201,7 @@ struct Table<'b> {
     /// The program's statics and the address they were written at.
     image: Option<(&'b StaticImage<Global>, u64)>,
     tls: Option<Tls>,
+    vtables: Vtables<'b>,
     /// The first outside symbol that was not found, said after the edit fails.
     missing: Option<Box<str, Global>>,
 }
@@ -203,9 +296,12 @@ impl Records for Table<'_> {
                         None => return Err(format!("slot {slot}: static reference {p} is in no placed static image")),
                     }
                 }
-                // The code builder's `Built::vtables` names the (type, principal) record at each
-                // place; the ladder writes no vtable records yet (codegen.md, "Trait objects").
-                RelocTo::Vtable(p) => return Err(format!("slot {slot}: vtable reference {p}: the ladder places no vtables yet")),
+                // The code builder's `Built::vtables` names the (type, principal) table at each
+                // place; run.rs made each program table once (`Body::vtables`).
+                RelocTo::Vtable(p) => match body.vtables.get(p as usize) {
+                    Some(&t) => self.vtables.address(t, place)?,
+                    None => return Err(format!("slot {slot}: vtable reference {p} is not in the body's table")),
+                },
                 RelocTo::TlsOffset(p) => match body.tls.get(p as usize) {
                     Some(&offset) => u64::from(offset),
                     None => return Err(format!("slot {slot}: thread-local reference {p} is not in the body's table")),
@@ -277,7 +373,8 @@ pub fn create_tls_key(desc: u64) -> Result<(), PlaceError> {
 
 /// Places `bodies`, body `n` in slot `n`, in one edit. `image` is the program's statics as
 /// written at an address ([`load_statics`]); `tls` is what thread-local words name.
-pub fn place(bodies: &[Body], image: Option<(&StaticImage<Global>, u64)>, tls: Option<Tls>) -> Result<Placed, PlaceError> {
+pub fn place(bodies: &[Body], vtables: &[VtableImage], image: Option<(&StaticImage<Global>, u64)>, tls: Option<Tls>) -> Result<Placed, PlaceError> {
+    let vtables = Vtables::write(vtables)?;
     let page = blaze_launch_rt::sys::page().map_err(|e| PlaceError::Launcher(e.into()))? as u64;
     let code_len: u64 = bodies.iter().map(|b| (b.code.bytes.len() as u64).next_multiple_of(16)).sum();
     let area = (code_len + page).next_multiple_of(page).max(16 * page);
@@ -299,7 +396,7 @@ pub fn place(bodies: &[Body], image: Option<(&StaticImage<Global>, u64)>, tls: O
             refs: List::of(&[]),
         });
     }
-    let mut table = Table { bodies, image, tls, missing: None };
+    let mut table = Table { bodies, image, tls, vtables, missing: None };
     // Not `together`: nothing runs before the commit, so no gate is needed.
     if let Err(error) = driver.edit(Txn(1), &binds, false, &mut table) {
         return Err(match table.missing {

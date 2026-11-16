@@ -22,10 +22,13 @@ use blaze_own::{ABTreeMap, ABTreeSet, AVec, Alloc};
 use blaze_surface::{DeclsBuilder, SurfaceError};
 
 use crate::facts::ScopeFacts;
-use crate::{AmbiguityKind, Def, DefKind, Namespace, Path, PathKind, Rename, Unresolved, UseForm, Visibility, WrittenVis};
+use crate::{AmbiguityKind, Def, DefKind, Edition, Namespace, Path, PathKind, Rename, Unresolved, UseForm, Visibility, WrittenVis};
 
+mod deps;
 #[cfg(test)]
 mod tests;
+
+pub(crate) use deps::{BuiltDeps, DepAnswer, DepNames};
 
 pub(crate) const NAMESPACES: [Namespace; 3] = [Namespace::Types, Namespace::Values, Namespace::Macros];
 
@@ -191,6 +194,10 @@ pub struct CellStats {
     /// R6 errors: an expansion not enclosing a use wrote, into the module, the name the use
     /// took from an outer scope (or the use met it there beside a different outer binding).
     pub r6_errors: u64,
+    /// Cells of dependencies' modules, each decided from the record when made.
+    pub dep_reads: u64,
+    /// Paths into another crate whose module no dependency read here holds: left unknown.
+    pub dep_absent: u64,
 }
 
 /// A bug planted on purpose, one per rule, for the tests' controls.
@@ -221,6 +228,12 @@ pub(crate) enum CellPlant {
     GlobBeatsOuter,
     /// A stalled item whose guess is `Outside` is failed by the stall, not marked first.
     StallFailsOutside,
+    /// A path into a dependency's module is unknown (`Outside`), its record unread.
+    DepIsOutside,
+    /// A glob of a dependency's module brings nothing.
+    DepGlobEmpty,
+    /// `$crate` of a dependency's macro is taken as this crate's root.
+    DollarCrateIsRoot,
     /// A name brought by an `Outside` import is taken as not found.
     OutsideIsNotFound,
     /// A name a local standard prelude lacks stops there: the language prelude is not read.
@@ -229,6 +242,12 @@ pub(crate) enum CellPlant {
     StallFailsOuterCall,
     /// An import through an enum is unknown in the macro namespace too.
     EnumHidesMacros,
+    /// R5 broken for imports: a stalled group decides every member from its guess at once,
+    /// the failed ones beside the resolved ones.
+    StallDecidesAll,
+    /// R6 broken by order: a definition an earlier expansion wrote beside a different outer
+    /// binding wins over it (the answer then depends on which came first).
+    InnerAfterWrite,
 }
 
 type ModId = u32;
@@ -296,6 +315,9 @@ struct Module<'a, N> {
     mod_line: Option<(FragId, u32)>,
     /// Its imports read so far: the next one's index.
     uses: u32,
+    /// A module of a dependency: each of its cells is decided when made, from the dependency's
+    /// record ([`DepNames`]); it has no text, items or growth here.
+    foreign: bool,
 }
 
 struct Cell<'a, N> {
@@ -400,6 +422,12 @@ pub(crate) struct Cells<'a, N> {
     pub(crate) r6: ABTreeSet<'a, ItemId>,
     pub(crate) stats: CellStats,
     pub(crate) plant: CellPlant,
+    /// The dependencies' decided names; `None`: every path into another crate is unknown.
+    deps: Option<&'a dyn DepNames<N>>,
+    /// The crate's edition: what `::name` starts from.
+    edition: Edition,
+    /// The `#[macro_use]` prelude's crates' root modules, in order (their exported macros).
+    macro_use: AVec<'a, ItemKey>,
 }
 
 /// A read of a cell by an item: decided, or the item now waits on it.
@@ -430,6 +458,17 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     /// Reads the crate's module tree under `root` from `facts`: modules, explicit entries and
     /// imports. Modules are numbered in key order, so nothing depends on the order they are met.
     pub(crate) fn load<F: ScopeFacts<Name = N>>(facts: &F, root: ItemKey, alloc: Alloc<'a>) -> Result<Cells<'a, N>, CellError> {
+        Cells::load_with(facts, root, None, alloc)
+    }
+
+    /// [`Cells::load`] with the dependencies' decided names: a path into one of their modules
+    /// reads it (R8's extern prelude, `$crate`, `::name`, the `#[macro_use]` prelude, globs).
+    pub(crate) fn load_with<F: ScopeFacts<Name = N>>(
+        facts: &F,
+        root: ItemKey,
+        deps: Option<&'a dyn DepNames<N>>,
+        alloc: Alloc<'a>,
+    ) -> Result<Cells<'a, N>, CellError> {
         let info = facts.module(root).map_err(|error| CellError::Facts { module: root, error })?;
         let mut cells = Cells {
             alloc,
@@ -451,6 +490,9 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             r6: ABTreeSet::new_in(alloc),
             stats: CellStats::default(),
             plant: CellPlant::None,
+            deps,
+            edition: Edition::E2021,
+            macro_use: AVec::new_in(alloc),
         };
         let made = cells.make_modules(facts, &[root])?;
         cells.root = cells.by_key[&root];
@@ -496,6 +538,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 text: FragId::MAX,
                 mod_line: None,
                 uses: 0,
+                foreign: false,
             });
             made.push(id);
         }
@@ -535,9 +578,16 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             // The outer scopes (R6, R8): sorted already by the record's rule.
             self.outer.externs.extend_from_slice(&r.extern_prelude);
             self.outer.macro_use = !r.macro_use.is_empty();
+            self.macro_use.extend_from_slice(&r.macro_use);
+            self.edition = r.head.edition;
             if let Some(p) = r.head.prelude {
-                match self.by_key.get(&p) {
-                    Some(&local) => self.outer.local = Some(local),
+                // A standard prelude of a dependency is read like any module of it.
+                let prelude = match self.by_key.get(&p) {
+                    Some(&local) => Some(local),
+                    None => self.foreign(p),
+                };
+                match prelude {
+                    Some(m) => self.outer.local = Some(m),
                     None => {
                         let pd = facts.decls(p).map_err(|error| CellError::Facts { module: p, error })?;
                         for it in pd.items.iter() {
@@ -815,12 +865,71 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     // -----------------------------------------------------------------------------------------
     // Cells.
 
+    /// The module `key` of this crate, or of a dependency (made here once, its cells decided from
+    /// the record); `None` when no dependency read here holds it (its record absent): unknown.
+    fn module_at(&mut self, key: ItemKey) -> Option<ModId> {
+        if let Some(&m) = self.by_key.get(&key) {
+            return Some(m);
+        }
+        let found = self.foreign(key);
+        if found.is_none() {
+            self.stats.dep_absent += 1;
+        }
+        found
+    }
+
+    fn foreign(&mut self, key: ItemKey) -> Option<ModId> {
+        if let Some(&m) = self.by_key.get(&key) {
+            return Some(m);
+        }
+        let deps = self.deps?;
+        if self.plant == CellPlant::DepIsOutside || !deps.has_module(key) {
+            return None;
+        }
+        let id = self.modules.len() as ModId;
+        let alloc = self.alloc;
+        self.by_key.insert(key, id);
+        let mut chain = AVec::new_in(alloc);
+        chain.push(key);
+        self.modules.push(Module {
+            key,
+            name: None,
+            parent: None,
+            chain,
+            explicit: ABTreeMap::new_in(alloc),
+            named: ABTreeMap::new_in(alloc),
+            globs_pending: 0,
+            glob_items: AVec::new_in(alloc),
+            edges: ABTreeMap::new_in(alloc),
+            glob_cells: AVec::new_in(alloc),
+            calls: AVec::new_in(alloc),
+            growth: 0,
+            text: FragId::MAX,
+            mod_line: None,
+            uses: 0,
+            foreign: true,
+        });
+        Some(id)
+    }
+
     fn cell(&mut self, m: ModId, ns: Namespace, name: N, layer: Layer) -> CellId {
         let key = (m, cell_slot(ns, layer), name);
         if let Some(&c) = self.cell_ids.get(&key) {
             return c;
         }
         let id = self.cells.len() as CellId;
+        if self.modules[m as usize].foreign
+            && let Some(deps) = self.deps
+        {
+            // Decided already, in the dependency: read, never waited on.
+            let value = deps.name_in(self.modules[m as usize].key, ns, name).value();
+            self.cells.push(Cell { module: m, ns, name, layer, value: Some(value), waiters: AVec::new_in(self.alloc), waiting_on: None });
+            self.cell_ids.insert(key, id);
+            self.stats.cells += 1;
+            self.stats.decisions += 1;
+            self.stats.dep_reads += 1;
+            return id;
+        }
         self.cells.push(Cell { module: m, ns, name, layer, value: None, waiters: AVec::new_in(self.alloc), waiting_on: None });
         self.cell_ids.insert(key, id);
         if layer == Layer::Globs {
@@ -1123,6 +1232,8 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 }
             }
         }
+        // The first segment the walk reads (`::dep` reads its crate from the extern prelude).
+        let mut first = 0;
         let mut cur = match kind {
             PathKind::Crate => self.root,
             PathKind::SelfMod => m,
@@ -1131,11 +1242,40 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 None => return Step::Done(Outcome::Failed(Unresolved::NoParent)),
             },
             PathKind::Plain => m,
-            PathKind::Abs | PathKind::DollarCrate(_) => return Step::Done(Outcome::Outside),
+            // `$crate` names the crate the macro was defined in (Reference `macro.decl.hygiene`).
+            PathKind::DollarCrate(k) if k == self.krate || self.plant == CellPlant::DollarCrateIsRoot => self.root,
+            PathKind::DollarCrate(k) => match self.deps.and_then(|d| d.crate_root(k)) {
+                Some(r) => match self.module_at(r) {
+                    Some(r) => r,
+                    None => return Step::Done(Outcome::Outside),
+                },
+                None => {
+                    self.stats.dep_absent += 1;
+                    return Step::Done(Outcome::Outside);
+                }
+            },
+            // `::name` from 2018 on: `name` is a crate of the extern prelude (Reference
+            // `paths.qualifiers.global-root`); in 2015 the crate root.
+            PathKind::Abs if self.edition == Edition::E2015 => self.root,
+            PathKind::Abs => {
+                let len = self.items[i as usize].segments.len();
+                if len < 2 && !glob {
+                    return Step::Done(Outcome::Outside);
+                }
+                let s = self.items[i as usize].segments[0];
+                let Ok(k) = self.outer.externs.binary_search_by(|e| e.0.cmp(&s)) else {
+                    return Step::Done(Outcome::Failed(Unresolved::NotFound));
+                };
+                first = 1;
+                match self.module_at(self.outer.externs[k].1) {
+                    Some(r) => r,
+                    None => return Step::Done(Outcome::Outside),
+                }
+            }
         };
         let len = self.items[i as usize].segments.len();
         let steps = if glob { len } else { len.saturating_sub(1) };
-        for k in 0..steps {
+        for k in first..steps {
             let s = self.items[i as usize].segments[k];
             let v = if kind == PathKind::Plain && k == 0 {
                 match self.first_segment(m, Namespace::Types, s, i, guess) {
@@ -1171,8 +1311,8 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                         Outcome::Failed(Unresolved::NotAModule)
                     });
                 }
-                Value::Found(def, _) => match self.by_key.get(&def.key) {
-                    Some(&next) => cur = next,
+                Value::Found(def, _) => match self.module_at(def.key) {
+                    Some(next) => cur = next,
                     None => return Step::Done(Outcome::Outside),
                 },
             }
@@ -1345,7 +1485,24 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             return Step::Done(Some(Value::Found(Def::module(self.outer.externs[k].1), Visibility::Public)));
         }
         if ns == Namespace::Macros && self.outer.macro_use {
-            return Step::Done(Some(Value::Outside));
+            // The `#[macro_use]` prelude: the macros each such crate's root exports, the first
+            // crate's that has the name (Reference `names.preludes.macro_use`).
+            let mut unknown = false;
+            for k in 0..self.macro_use.len() {
+                let Some(r) = self.module_at(self.macro_use[k]) else {
+                    unknown = true;
+                    continue;
+                };
+                match self.read(r, ns, name, Layer::Full, guess) {
+                    Read::Ready(v @ (Value::Found(_, Visibility::Public) | Value::Ambiguous(_, Visibility::Public))) => return Step::Done(Some(v)),
+                    Read::Ready(Value::Outside) => unknown = true,
+                    Read::Ready(_) => {}
+                    Read::Wait(c) => return Step::Wait(Node::Cell(c)),
+                }
+            }
+            if unknown {
+                return Step::Done(Some(Value::Outside));
+            }
         }
         if let Some(p) = self.outer.local {
             // A name the standard prelude lacks goes on to the language prelude.
@@ -1407,13 +1564,20 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     return Step::Done(Value::Ambiguous(d, v));
                 }
                 if let From::Wrote(f) = from
-                    && guess.is_none()
+                    && let Some(o) = outer
                     && outer_def.is_some_and(|od| od != d)
                     && !self.encloses(f, self.items[me as usize].at)
                 {
                     // R6 in the other order: the inner definition came first, from an expansion
-                    // that does not enclose the use, beside a different outer binding.
-                    self.r6_error(me);
+                    // that does not enclose the use, beside a different outer binding. The
+                    // answer is the one every order gives: the outer binding, with the error at
+                    // the expansion's definition (wide seed 8 with calls: the reference's).
+                    if guess.is_none() {
+                        self.r6_error(me);
+                    }
+                    if self.plant != CellPlant::InnerAfterWrite {
+                        return Step::Done(o);
+                    }
                 }
                 if from == From::Glob
                     && let Some(j) = self.growing(m, me, guess)
@@ -1573,6 +1737,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             module.globs_pending -= 1;
             if let Outcome::Glob(src) = o
                 && let Some(&s) = self.by_key.get(&src)
+                && !(self.modules[s as usize].foreign && self.plant == CellPlant::DepGlobEmpty)
             {
                 let vis = self.items[i as usize].vis;
                 self.modules[m as usize].edges.insert(index, (s, vis));
@@ -2005,6 +2170,29 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         let has_call = members.iter().any(|&n| matches!(n, Node::Item(i) if self.items[i as usize].call.is_some()));
         if has_call {
             return self.stall_with_calls(members, &guess);
+        }
+        // R5: in a stalled group what is undecided is taken as absent, and an import may RESOLVE
+        // so; then only the members that resolved are decided this round, and the rest (cells
+        // too: their guess read the failed members as absent) are tried again with the facts,
+        // woken by what the decided imports bring. Each such round decides one import at least,
+        // so the rounds are bounded by the group's imports.
+        if self.plant != CellPlant::StallDecidesAll {
+            let alloc = self.alloc;
+            let mut picked: AVec<'a, (ItemId, Outcome)> = AVec::new_in(alloc);
+            let mut failed = false;
+            for (&i, &o) in guess.items.iter() {
+                match o {
+                    Some(o @ (Outcome::Named(_) | Outcome::Glob(_) | Outcome::Outside)) => picked.push((i, o)),
+                    _ => failed = true,
+                }
+            }
+            if failed && !picked.is_empty() {
+                self.stats.stalls += 1;
+                for &(i, o) in picked.iter() {
+                    self.settle(i, o);
+                }
+                return Ok(());
+            }
         }
         // Decided: a group holding an import is a stall (R5), one of cells alone a glob cycle.
         if guess.items.is_empty() {

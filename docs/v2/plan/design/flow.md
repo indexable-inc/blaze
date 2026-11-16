@@ -75,8 +75,10 @@ No compiler's source or output is a source; every test expectation below is stat
 - **Statements**: `Assign(dest, value)` where a value is `Use(Copy p | Move p | Const)`,
   `Borrow { kind: Shared | Mut | TwoPhase | Shallow, place, loan }` (a reborrow is a borrow of a
   place through a `Deref`), `Aggregate(operands)`; `Call { args, dest }`; `StorageLive(l)`,
-  `StorageDead(l)`; `Drop(p)`; `Activate(loan)` (a two-phase loan's first use); `Subset(o1, o2)`
-  (a `subset_base` fact, given directly in this leg; generated from types in the next).
+  `StorageDead(l)`; `Drop(p)`; `Activate(loan)` (a two-phase loan's first use). The
+  `subset_base` facts are a table of `(statement, from, into)`, each at the Mid of the statement
+  that makes it (a call relates its arguments to its destination at its own Mid), given directly
+  in this leg and generated from types in the next.
 - **No unwind edges.** The rebuilt path aborts on panic, so a call or a drop cannot leave the body
   sideways: both are plain statements, not terminators, and there are no cleanup blocks. That
   removes the unwind half of every graph and every "drop on unwind" path; when unwinding is added,
@@ -100,13 +102,16 @@ No compiler's source or output is a source; every test expectation below is stat
   uninitialized. `Move p`, `Drop p` and `StorageDead l` / `StorageLive l` make the place and its
   descendants uninitialized (and not initialized); `Assign` and a call's `dest` make them
   initialized.
-- **Findings** (exactly three): (1) **use of a moved value**: a read, move, borrow or drop of `p`
-  where `p`, a prefix of `p`, or a descendant of `p` may be uninitialized (the Reference's
+- **Findings** (exactly three): (1) **use of a moved value**: a read, move or borrow of `p` (not
+  a `Drop`: a scope's end after a move is what drop elaboration resolves) where `p`, a prefix of `p`, or a descendant of `p` may be uninitialized (the Reference's
   "cannot be read from again until it is reinitialized"; a descendant covers a partial move);
   (2) **move out of a borrow, an index or a `Drop` type's field**: `Move p` where `p`'s chain holds
   `Deref` or `Index`, or a `Field` of a type that implements `Drop` (the Reference's list of what
   may be moved out of); (3) **assign to a moved-from part**: `Assign` to `p.f..` where a proper
-  prefix of the destination reached without a `Deref` may be uninitialized.
+  prefix of the destination reached without a `Deref` may be uninitialized (a prefix reached
+  through one is a use of the moved pointer, finding 1). Every prefix is tested, none stopping
+  the walk: each finding means "on some path", and the simulation found that stopping at the
+  nearest prefix hides a use on another path.
 - **Drop elaboration** reads the same result at a `Drop p`: initialized and not uninitialized is a
   static drop; not initialized is no drop; both is a drop behind a flag; a descendant uninitialized
   is an open drop of the initialized fields (the Reference: "only its initialized fields are
@@ -125,7 +130,9 @@ No compiler's source or output is a source; every test expectation below is stat
   argument to its parameter and the return to `dest`, and adds the callee's outlives bounds as
   subsets.
 - **Liveness**: a local is live where its value may be used later (backward dataflow); an origin is
-  live at a point when a local live there mentions it, or it is a placeholder. A `Drop` makes only
+  live at a point when a local live there mentions it, or it is a placeholder. At Start(s) the
+  locals are live-in of s; at Mid(s), during s, live-in or live-out, so a call's argument origins
+  are live where the call relates them to its destination. A `Drop` makes only
   its drop-live origins live: all but the `may_dangle` ones (RFC 2094); this leg treats every
   origin of a dropped local as drop-live, which refuses more and never less.
 
@@ -199,7 +206,27 @@ No compiler's source or output is a source; every test expectation below is stat
 - Async bodies are checked before the coroutine transform, as plain bodies with `yield` as a
   `Call`; loans live across a yield are a finding of the coroutine layer.
 
+## What is built (crates/blaze-flow)
+
+- `flow`: the forms above as flat tables, `FlowBuilder`, and `Flow::print`'s stable text.
+- `moves`: the two dataflows, the three findings, `drop_kind`. Proven equal to a path oracle
+  (every path, each block entered at most three times, one concrete flag per place) on random
+  flows; the control plants a join that intersects (`Plant::MovesIntersect`) and the oracle
+  answers "move check missed".
+- `loans`: accesses and conflicts, liveness, activation, `tier_one`, `tier_two` (each Polonius rule
+  a marked step). The simulation checks section 5's obligation on random flows; the controls plant
+  a tier two whose second contains rule runs backwards (`TierTwoReversed`) and a tier one that does
+  not close over the subset graph (`TierOneUnclosed`), each answered "tier one accepted what tier
+  two refuses".
+- Fixtures: the Reference's moves (moved local, reinitialized, fields, `Box`, a borrow, a `Drop`
+  type's field, assignment into a moved part, drop kinds); RFC 2094's problem cases #1 and #2
+  (tier one accepts), #3 and #4 (tier one cannot accept, tier two accepts: #3 by location, #4 by
+  `loan_killed_at`), and a live mutable loan read through a shared borrow (both refuse; one finding).
+- Not yet: may_dangle, union fields, the per-place `Copy` and `Drop` facts from the type checker;
+  tier two is dense (bits per point); a sparse form for large bodies when one is measured.
+
 ## For a successor
 
 Next: the lowering from the typed body (needs the questions in section 7) and constraint
-generation from types with variance; then real bodies from the census.
+generation from types with variance; then real bodies from the census, measuring how many bodies
+tier one accepts (the claim "almost every body" is not yet measured).

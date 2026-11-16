@@ -695,7 +695,7 @@ fn outline_file<A: Allocator + Copy>(cx: &Cx, root: &Dir<ReadWrite>, job: &Job<'
             }
             // The file's surface, its own part: what name resolution reads of it, never a body
             // (drive.md, "SPEC, the NAMES step"). A body edit leaves its source, so it stands.
-            let surface = surface_source(&outline, scratch);
+            let surface = outline.surface();
             parts.push(Part { name: Name::new(Kind::Surface, job.name.subject), locate: Locate::Source(surface), place: 0 });
             parts.sort_unstable_by_key(|part| part.name);
             let mut findings = Vec::new_in(held);
@@ -715,33 +715,6 @@ fn outline_file<A: Allocator + Copy>(cx: &Cx, root: &Dir<ReadWrite>, job: &Job<'
     }
 }
 
-/// The domain of a file's surface digest ([`surface_source`]).
-const SURFACE_DOMAIN: &str = "blaze-cli surface v1";
-
-/// A file's surface: for each entry outside a function's body, its kind, its parent's place
-/// and its signature's digest (attributes, visibility, name, generics, `use` paths), and for a
-/// macro definition or an item-position macro call its whole digest, since its tokens make
-/// names. Never a body: a body edit leaves this source equal, and the planted "bodies in the
-/// surface" bug of the simulation is this function hashing `item.hash` for every entry.
-fn surface_source(outline: &blaze_file_items::Outline<'_>, scratch: &Frame) -> ContentId {
-    let items = outline.items();
-    // Whether each entry is inside a function's body: its parent comes before it.
-    let mut in_body: Vec<bool, &Frame> = Vec::with_capacity_in(items.len(), scratch);
-    let mut hasher = blaze_ids::Hasher::new(SURFACE_DOMAIN);
-    for item in items {
-        let hidden = item.parent.is_some_and(|p| in_body[p.at()] || items[p.at()].kind() == ItemKind::Function);
-        in_body.push(hidden);
-        if hidden {
-            continue;
-        }
-        let parent = item.parent.map_or(u32::MAX, |p| p.0);
-        hasher.part(&[item.kind() as u8]).part(&parent.to_le_bytes()).id(&item.signature_hash);
-        if matches!(item.kind(), ItemKind::MacroRules | ItemKind::Macro2 | ItemKind::MacroCall) {
-            hasher.id(&item.hash);
-        }
-    }
-    hasher.finish()
-}
 
 /// Why an outline did not come: a file it could not take as text (its task fails), or a path
 /// or read error, which stops the command (`CliError::Path`, `CliError::Fs`). `Send`, unlike

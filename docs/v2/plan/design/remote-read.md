@@ -225,8 +225,8 @@ link the same pack store or an `Origin`, and stops at the first that holds the k
    what this machine computed.
 
 The home is a value the command's start passes in (rule 75); the machine store is opened
-through the effect layer only when the home is beneath the start folder (bstd gives no
-writable home above it yet: `User` is simulation-only); otherwise one line says it is off.
+through the effect layer as a second tree over it (`Fs::home`), wherever it is; a home that
+cannot be opened turns the machine store off with one line naming it.
 
 The floor for a second project's cold build: no toolchain task runs; each machine pack costs
 one listing, one footer and index read (plus one whole read once per boot), and each record
@@ -260,16 +260,41 @@ toolchain shelf, two hello-world copies differing in package name, load 11.1):
   whole (Boot is `Unknown` until bstd has a boot fact, so every command reads the machine pack
   whole: that is the gap to the floor, not measured apart yet).
 
+**Built, second runner (2026-11-16):**
+1. *The home wherever it is.* bstd `Fs::home(cx, home, folder) -> Result<Dir<ReadWrite>,
+   HomeError>`: natively a second driver over the absolute `home` (`Io::beside`: one file
+   thread, no environment, nothing above it); in the simulation a folder beneath its one root.
+   `HomeError { home, why: NotAbsolute | Dotted | Open | Fs | NoSecondTree }` names the home.
+   `Machine::of(cx, fs, home)` opens `<home>/.blaze` through it (the machine store is
+   `v2/shared` in it); a refusal is `Machine::Off(MachineOff::Home(..))` and the one stderr
+   line. Tests: bstd `tests::home` "2 passed" (a native home outside the start folder in a
+   temp folder; the simulation's); blaze-cli `store::tests` "14 passed, 0 failed", the chain's
+   crash simulation now with the project at `work/project` and the home at `/home/sim`, and
+   `a_home_that_cannot_be_made_turns_the_machine_store_off_by_name`.
+2. *Once per boot.* The boot record (`boot` beside the packs, naming the boot and the packs
+   known whole in it) and its simulations already existed (`a_pack_is_read_whole_once_a_boot`,
+   the planted `VerifySkipped` and `SelfVouching`, a reboot drawing a new boot at each power
+   cut); what was missing was the fact: main.rs passed `Boot::Unknown`. It now passes
+   `Io::boot()` (macOS `kern.bootsessionuuid`), and a `NoBoot` says one line and verifies.
+3. *Registry crates public.* `Names::public` holds the toolchain's crates and every crate whose
+   lock package is a registry source with a `checksum`; the store's rule is unchanged (a record
+   is public only when its name and every name it reads are public), so a registry crate that
+   reads a member, a path or git package (a `[patch]`) stays the project's. Not yet in the
+   chain oracle: the simulation's `EvenLengths` stands for the rule, not the names.
+
 **Next, in order:**
-1. A writable home in bstd (the effect layer's): today the machine store is on only when the
-   home is beneath the start folder; otherwise one line says it is off.
-2. A boot fact in bstd, so the machine pack is read whole once per boot, not per command.
-3. Registry crates known by checksum as public too (`Origin::Unit` whose lock source is a
-   registry with a checksum).
-4. HTTP origin: an `Origin` over blaze-h1 ranged GETs through `Net`, a length bound before the
-   body and `Content-Range` checked against the ask; a lying 127.0.0.1 server in the test.
-5. Batched gets: main.rs drains `Effect::Get`s one at a time; collect the Gets of one drain into
-   one `fetch` batch (needs a `Store::get_many`; main.rs is the driver lane's).
+1. HTTP origin: an `Origin` over blaze-h1 ranged GETs through bstd `Net` (`Net::connect`,
+   `Conn::recv`; blaze-h1 `write_request` with `Range`, `Response::new_in(Limits, ..)` bounds the
+   head and body before reading, `Response::ranged(asked)` checks `Content-Range`; a 3xx is
+   refused). blaze-fetch's own path is blaze-http's driver thread, not bstd effects: do not
+   reuse it. Test: a lying 127.0.0.1 server (wrong payload bytes) caught by the digest chain.
+2. Batched gets (the driver's, main.rs's drain at `Effect::Get`): take every `Effect::Get` the
+   machine has queued in `effects` at once, then
+   `Store::get_many(&mut self, cx: &Cx, keys: &[Key], into: &Frame, got: &mut dyn FnMut(Key,
+   Option<&[u8]>) -> Result<(), CliError>) -> Result<(), CliError>`: local then machine store
+   per key, the misses as ONE `fetch(reader, origin, clock, &missed, alloc)`, then `got` for
+   each key in the order asked, which steps `Event::Got`. Floor 5 origin reads where
+   one-at-a-time gets make 19.
 
 ## Not built
 

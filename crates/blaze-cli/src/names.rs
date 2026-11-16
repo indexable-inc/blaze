@@ -179,6 +179,10 @@ pub struct Names<'f> {
     /// (key, crate index), sorted.
     by_key: std::vec::Vec<(CrateItemKey, usize), Global>,
     made: std::vec::Vec<(ContentId, Resolved), Global>,
+    /// The subjects of the crates whose records may hold nothing of a project (target.md,
+    /// "Namespaces"): the toolchain's, and a registry archive's known by its lock checksum.
+    /// Whether a record is public also needs every name it reads public: the store's check.
+    public: std::vec::Vec<ContentId, Global>,
     /// The command's one set of prepared macro definitions, shared by every crate it resolves.
     prepares: &'f Prepares<'f>,
     /// Crates whose names were resolved this command, and the unresolved paths among them.
@@ -235,15 +239,33 @@ pub(crate) fn world<'f>(cx: &Cx, root: &Dir<ReadWrite>, graph_record: &[u8], loc
     }
     by_subject.sort_unstable();
     by_key.sort_unstable();
-    Ok(Names { world, by_subject, by_key, made: std::vec::Vec::new(), prepares: Prepares::new_in(alloc), resolved: 0, unresolved: 0 })
+    // A registry package with a checksum in the lock: its archive is known by content, so its
+    // crate's records are keyed by nothing of this project. A path or git package, a member,
+    // or a registry package with no checksum stays the project's.
+    let from_archive = |unit: blaze_unit_graph::UnitId| {
+        let package = lock.package(graph.units[unit.0 as usize].package);
+        matches!(package.source, LockSource::Registry { .. }) && matches!(package.checksum, blaze_manifest::lock::Checksum::Sha256(_))
+    };
+    let mut public = std::vec::Vec::new_in(Global);
+    public.extend(
+        world
+            .crates
+            .iter()
+            .filter(|krate| match krate.origin {
+                blaze_world::Origin::Toolchain(_) => true,
+                blaze_world::Origin::Unit(unit) => from_archive(unit),
+            })
+            .map(|krate| name_of(krate.input.key).subject),
+    );
+    Ok(Names { world, by_subject, by_key, made: std::vec::Vec::new(), public, prepares: Prepares::new_in(alloc), resolved: 0, unresolved: 0 })
 }
 
-/// Tells `store` the world's toolchain crates, whose records hold nothing of a project: they go
-/// to the machine store (remote-read.md, "One chain of stores"). Called wherever a world is made.
+/// Tells `store` the world's public crates (the toolchain's and checksummed registry
+/// archives'), whose records hold nothing of a project when every name they read is public
+/// too: they go to the machine store (remote-read.md, "One chain of stores"). Called wherever
+/// a world is made.
 pub(crate) fn tell_public(store: &mut dyn Store, names: &Names<'_>) {
-    let mut public = std::vec::Vec::new_in(Global);
-    public.extend(names.world.crates.iter().filter(|krate| matches!(krate.origin, blaze_world::Origin::Toolchain(_))).map(|krate| name_of(krate.input.key).subject));
-    store.public_crates(&public);
+    store.public_crates(&names.public);
 }
 
 /// The `CrateScope` parts the graph's record names: one per crate of the world, by subject,

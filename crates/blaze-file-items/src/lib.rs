@@ -175,8 +175,8 @@ use core::fmt;
 
 use blaze_own::{AVec, Alloc};
 use blaze_surface::{
-    Attr, AttrSpan, BuildError, Edition, FileItems, Item, ItemFlags, ItemIndex, RecordBytes,
-    SyntaxError,
+    Attr, AttrSpan, BuildError, Edition, FileItems, Item, ItemFlags, ItemIndex, ItemKind,
+    RecordBytes, SyntaxError,
 };
 
 pub use blaze_ids::ContentId;
@@ -191,6 +191,10 @@ pub const ITEM_DOMAIN: &str = "blaze v2 file item merkle 2";
 /// The domain of [`Item::signature_hash`]: the edition, an item's own bytes before its body
 /// and the digests of its children there (crate docs, "Identity").
 pub const SIGNATURE_DOMAIN: &str = "blaze v2 file item signature 1";
+
+/// The domain of [`Outline::surface`] (the drive's `Surface` part: its value is unchanged
+/// since the digest lived in blaze-cli, so no record keyed by it moves).
+pub const SURFACE_DOMAIN: &str = "blaze-cli surface v1";
 
 /// The outline of `text`, a source file of `edition`, in `alloc`: every item it declares at any
 /// module-level nesting, in source order, and the syntax errors of the parse. It always
@@ -329,6 +333,28 @@ impl Outline<'_> {
     /// Every entry, in source order: an entry comes before the entries written inside it.
     pub fn items(&self) -> &[Item] {
         &self.items
+    }
+
+    /// The file's surface: what name resolution reads of it, never a body. For each entry
+    /// outside a function's body, its kind, its parent's place and its signature's digest
+    /// (attributes, visibility, name, generics, `use` paths), and for a macro definition or an
+    /// item-position macro call its whole digest, since its tokens make names. A body edit
+    /// leaves it equal (the drive's `Surface` part; blaze-world's `names --records`).
+    pub fn surface(&self) -> ContentId {
+        let items = &self.items;
+        let mut hasher = blaze_ids::Hasher::new(SURFACE_DOMAIN);
+        let mut at = 0;
+        while at < items.len() {
+            let item = &items[at];
+            let parent = item.parent.map_or(u32::MAX, |p| p.0);
+            hasher.part(&[item.kind() as u8]).part(&parent.to_le_bytes()).id(&item.signature_hash);
+            if matches!(item.kind(), ItemKind::MacroRules | ItemKind::Macro2 | ItemKind::MacroCall) {
+                hasher.id(&item.hash);
+            }
+            // Everything written inside a function's body is hidden: skip past its last entry.
+            at = if item.kind() == ItemKind::Function { item.end.at().max(at + 1) } else { at + 1 };
+        }
+        hasher.finish()
     }
 
     /// The entry at `at`.

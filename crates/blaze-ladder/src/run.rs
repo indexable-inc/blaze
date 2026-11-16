@@ -11,14 +11,15 @@ use std::alloc::Global;
 
 use blaze_build::data::{DataAlloc, DataError, DataRecord, StaticImage};
 use blaze_build::tls::{self, TlsError, TlsLayout};
-use blaze_build::layout::{LayoutFacts, Layouts, Missing, ReprAttrs, ValidRange};
+use blaze_build::layout::{LayoutCx, LayoutFacts, Layouts, Missing, ReprAttrs, ValidRange};
+use blaze_build::vtable::{Shape, Vtable, VtableRef, VtableTarget, Word};
 use blaze_consteval::{
     Answer, Codes, ConstError, ConstRecord, ConstWorld, FnKind as ConstFnKind, Limits, Lits, Need, NeedKind, RecordKey, Settle,
     Typed, value_of,
 };
 use blaze_ids::ContentId;
 use blaze_typeck::{Checked, ConstHolds, Fetch, PTys};
-use blaze_build::{Abi, Adts, BuildError, Instance, Intrinsic, StaticItem, Subst, instance_key};
+use blaze_build::{Abi, Adts, BuildError, Instance, InstanceKey, Intrinsic, StaticItem, Subst, instance_key};
 use blaze_emit::{Code, EmitError, Isa, Os, Via};
 use blaze_own::Alloc;
 use blaze_typeck::{
@@ -32,7 +33,7 @@ use crate::front2::program::{Front2Program, Front2Refusal};
 use crate::seam::FrontEnd;
 use edition::PackageEdition;
 use crate::refusal::{NOT_YET, Refusal, RefusalRule, SourceFile};
-use crate::place::{self, Body, Entry, PlaceError, Target};
+use crate::place::{self, Body, Entry, PlaceError, Target, VtableImage, VtableWord};
 
 /// A function a stage refused: its path, for the words, and where its item is, for the finding.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,6 +74,8 @@ pub enum RunError {
     Callee { function: Named, callee: ItemKey },
     /// A call of a trait's fn found no impl to run.
     Resolve { function: Named, callee: ItemKey, error: ResolveError },
+    /// A vtable the function takes the address of could not be made.
+    Vtable { function: Named, principal: ItemKey, why: VtableFail },
     Place(PlaceError),
     /// The program has no `main` at its crate root.
     NoMain,
@@ -125,6 +128,15 @@ impl core::fmt::Display for RunError {
             }
             RunError::Resolve { function, callee, error } => {
                 write!(f, "`{function}` calls trait fn {:#x}: {error}", callee.0)
+            }
+            RunError::Vtable { function, principal, why } => {
+                write!(f, "`{function}` takes a vtable of trait {:#x}: ", principal.0)?;
+                match why {
+                    VtableFail::Shape(error) => write!(f, "{error}"),
+                    VtableFail::Layout(error) => write!(f, "the concrete type's layout: {error}"),
+                    VtableFail::Build(error) => write!(f, "{error}"),
+                    VtableFail::NoDropGlue => write!(f, "the program has no `drop_in_place` lang item for the drop word"),
+                }
             }
             RunError::Place(error) => write!(f, "{error}"),
             RunError::NoMain => write!(f, "the crate root has no `main`"),
@@ -219,6 +231,7 @@ impl RunError {
             | RunError::Emit { ref function, .. }
             | RunError::Callee { ref function, .. }
             | RunError::Resolve { ref function, .. }
+            | RunError::Vtable { ref function, .. }
             | RunError::MainShape { main: ref function, .. }
             | RunError::NoHost { start: ref function }
             | RunError::Const { constant: ref function, .. } => Some(function.at),
@@ -673,6 +686,8 @@ pub enum Start {
 /// A program built and ready to place: each reached instance's code, the entry's first.
 pub struct Built {
     bodies: Vec<Body, Global>,
+    /// Every vtable a body names, once each (`Body::vtables` index it).
+    vtables: Vec<VtableImage, Global>,
     start: Start,
     start_fn: Named,
     /// Every static's first bytes, the thread-locals' template and descriptor among them.
@@ -785,7 +800,7 @@ pub fn run_with(files: &[SourceFile<'_>], root: &str, host: Option<NonNull<c_voi
         }
         _ => None,
     };
-    let placed = place::place(&built.bodies, image, tls).map_err(RunError::Place)?;
+    let placed = place::place(&built.bodies, &built.vtables, image, tls).map_err(RunError::Place)?;
     // The entry's instance was the first reached.
     placed.call(0, entry).map_err(RunError::Place)
 }
@@ -905,10 +920,53 @@ fn filed(survey: &mut Option<&mut Vec<(Box<str>, Box<str>), Global>>, e: RunErro
         RunError::Emit { function, error } => (function, format!("emit: {}", class_of(&format!("{error:?}"))).into_boxed_str()),
         RunError::Callee { function, .. } => (function, Box::from("callee: neither a tabled body nor an outside symbol")),
         RunError::Resolve { function, error, .. } => (function, format!("callee: resolve {}", class_of(&format!("{error:?}"))).into_boxed_str()),
+        RunError::Vtable { function, why, .. } => (function, format!("vtable: {}", class_of(&format!("{why:?}"))).into_boxed_str()),
         _ => return Err(e),
     };
     out.push((format!("{function}").into_boxed_str(), class));
     Ok(())
+}
+
+/// Why a vtable was not made, named.
+#[derive(Debug)]
+pub enum VtableFail {
+    /// The object trait's shape: no facts for a trait on its supertrait tree, or too large.
+    Shape(blaze_build::vtable::VtableError),
+    /// The concrete type's size and alignment.
+    Layout(blaze_build::layout::LayoutError),
+    Build(BuildError),
+    /// The drop word needs `drop_in_place::<T>` and the program has none.
+    NoDropGlue,
+}
+
+/// The program's vtables, each made once: `refs[n]` is what `images[n]` is the table of.
+struct Tables {
+    refs: Vec<VtableRef, Global>,
+    images: Vec<VtableImage, Global>,
+}
+
+/// The reached instances: slot `n` is `instances[n]`, of fn `tabled[n]`, told apart by `keys[n]`.
+struct Reached {
+    instances: Vec<Instance, Global>,
+    tabled: Vec<usize, Global>,
+    keys: Vec<InstanceKey, Global>,
+}
+
+impl Reached {
+    /// `callee`'s slot (of fn `c`, key `key`): the one reached before under that key, else a new
+    /// one at the end, built in its turn.
+    fn slot(&mut self, callee: Instance, c: usize, key: InstanceKey) -> Result<u32, RunError> {
+        let slot = match self.keys.iter().position(|&known| known == key) {
+            Some(slot) => slot,
+            None => {
+                self.instances.push(callee);
+                self.tabled.push(c);
+                self.keys.push(key);
+                self.instances.len() - 1
+            }
+        };
+        u32::try_from(slot).map_err(|_| RunError::TooManyInstances)
+    }
 }
 
 /// A refusal's typed name: its `Debug` form up to its first field.
@@ -952,13 +1010,17 @@ fn build_from<P: FrontEnd>(program: &mut P, surveyed: Option<(&mut Vec<(Box<str>
             .map_err(|error| RunError::Build { function: program.function(c).named(), error, range: None })
     };
     // Slot `n` is the `n`th instance reached; `keys[n]` its key, by which instances are told apart.
-    let mut instances = Vec::with_capacity_in(program.fn_count(), Global);
-    let mut keys = Vec::with_capacity_in(program.fn_count(), Global);
-    let mut tabled: Vec<usize, Global> = Vec::with_capacity_in(program.fn_count(), Global);
+    let mut reached = Reached {
+        instances: Vec::with_capacity_in(program.fn_count(), Global),
+        tabled: Vec::with_capacity_in(program.fn_count(), Global),
+        keys: Vec::with_capacity_in(program.fn_count(), Global),
+    };
+    let mut tables = Tables { refs: Vec::new_in(Global), images: Vec::new_in(Global) };
+    let mut layouts = Layouts::new_in(Alloc::global());
     if let Some(main) = entry {
-        instances.push(Instance { item: program.function(main).key, args: List::EMPTY });
-        tabled.push(main);
-        keys.push(key_of(main, List::EMPTY, &ground)?);
+        reached.instances.push(Instance { item: program.function(main).key, args: List::EMPTY });
+        reached.tabled.push(main);
+        reached.keys.push(key_of(main, List::EMPTY, &ground)?);
     }
     // A survey seeds every non-generic fn with a checked body, by key (the program's order,
     // never the asking's); a generic one is met at the instances built bodies call it at.
@@ -975,18 +1037,18 @@ fn build_from<P: FrontEnd>(program: &mut P, surveyed: Option<(&mut Vec<(Box<str>
         }
         seeds.sort_unstable_by_key(|s| s.0);
         for (item, c) in seeds {
-            instances.push(Instance { item, args: List::EMPTY });
-            tabled.push(c);
-            keys.push(key_of(c, List::EMPTY, &ground)?);
+            reached.instances.push(Instance { item, args: List::EMPTY });
+            reached.tabled.push(c);
+            reached.keys.push(key_of(c, List::EMPTY, &ground)?);
         }
     }
     let mut bodies = Vec::with_capacity_in(program.fn_count(), Global);
     let mut args = Vec::new_in(Global);
     let mut at = 0;
-    while let Some(&instance) = instances.get(at) {
+    while let Some(&instance) = reached.instances.get(at) {
         at += 1;
         // Each instance is pushed with its fn's index (`tabled`), so none is looked up again.
-        let i = tabled[at - 1];
+        let i = reached.tabled[at - 1];
         let function = program.function(i);
         let name = || function.named();
         let (Some((body, _)), Some(done)) = (function.body, checked[i].as_ref()) else {
@@ -1046,23 +1108,92 @@ fn build_from<P: FrontEnd>(program: &mut P, surveyed: Option<(&mut Vec<(Box<str>
             let target = program.function(c);
             if target.body.is_some() {
                 let key = key_of(c, callee.args, &ground)?;
-                let slot = match keys.iter().position(|&known| known == key) {
-                    Some(slot) => slot,
-                    None => {
-                        instances.push(callee);
-                        tabled.push(c);
-                        keys.push(key);
-                        instances.len() - 1
-                    }
-                };
                 via.push(Via::Slot);
-                targets.push(Target::Slot(u32::try_from(slot).map_err(|_| RunError::TooManyInstances)?));
+                targets.push(Target::Slot(reached.slot(callee, c, key)?));
             } else if target.kind == FnKind::Foreign {
                 via.push(Via::Address);
                 targets.push(Target::Symbol(target.symbol.into()));
             } else {
                 filed(&mut survey, RunError::Callee { function: name(), callee: callee.item })?;
                 broken = true;
+            }
+        }
+        if broken {
+            continue;
+        }
+        // Each vtable the body names, made once for the program (`Shape::of`, `Vtable::build`):
+        // the tables of its supertraits off the first chain first, by a stack; each method word
+        // the impl's fn, resolved and reached as a call is; the drop word `drop_in_place::<T>`.
+        let mut table_of = Vec::with_capacity_in(built.vtables.len(), Global);
+        for &want in built.vtables.iter() {
+            let made = (|| -> Result<u32, RunError> {
+                let fail = |why| RunError::Vtable { function: name(), principal: want.principal, why };
+                let full = || fail(VtableFail::Build(BuildError::Malformed { what: "the ground table is full" }));
+                let mut stack = Vec::new_in(Global);
+                stack.push(want);
+                while let Some(&t) = stack.last() {
+                    if tables.refs.contains(&t) {
+                        stack.pop();
+                        continue;
+                    }
+                    let shape = Shape::of(t.principal, |k| program.object_trait(k), Global).map_err(|e| fail(VtableFail::Shape(e)))?;
+                    let above = |s: ItemKey| VtableRef { concrete: t.concrete, principal: s, args: List::EMPTY };
+                    let missing = shape.words.iter().find_map(|w| match *w {
+                        Word::Super(s) => (!tables.refs.contains(&above(s))).then(|| above(s)),
+                        Word::Method { .. } => None,
+                    });
+                    if let Some(r) = missing {
+                        stack.push(r);
+                        continue;
+                    }
+                    let mut cx = LayoutCx { ground: &mut ground, facts: &adts, scratch: Alloc::global() };
+                    let id = layouts.of(t.concrete, &mut cx).map_err(|e| fail(VtableFail::Layout(e)))?;
+                    let (size, align) = (layouts.get(id).size, layouts.get(id).align_bytes());
+                    let glue_item = program.fn_lang(FnLang::DropInPlace).ok_or_else(|| fail(VtableFail::NoDropGlue))?;
+                    let glue = Instance { item: glue_item, args: ground.intern_list(&[t.concrete]).map_err(|_| full())? };
+                    let mut targs = Vec::new_in(Global);
+                    targs.extend_from_slice(ground.view().list(t.args).map_err(|_| full())?);
+                    let table = Vtable::build(&shape, t.concrete, &targs, size, align, Some(glue), &mut ground, Global)
+                        .map_err(|e| fail(VtableFail::Build(e)))?;
+                    let mut words = Vec::with_capacity_in(table.relocs.len(), Global);
+                    for &(offset, to) in table.relocs.iter() {
+                        let word = match to {
+                            VtableTarget::Fn(f) => {
+                                // A trait method runs as the selected impl's; the glue is itself.
+                                let (item, args) = match f.item == glue_item {
+                                    true => (f.item, f.args),
+                                    false => program
+                                        .resolve(i, f.item, f.args, &mut ground)
+                                        .map_err(|error| RunError::Resolve { function: name(), callee: f.item, error })?,
+                                };
+                                let c = program.fn_index(item).filter(|&c| program.function(c).body.is_some());
+                                let Some(c) = c else {
+                                    return Err(RunError::Callee { function: name(), callee: item });
+                                };
+                                VtableWord::Slot(reached.slot(Instance { item, args }, c, key_of(c, args, &ground)?)?)
+                            }
+                            VtableTarget::Super(s) => match tables.refs.iter().position(|r| *r == above(s)) {
+                                Some(n) => VtableWord::Table(u32::try_from(n).map_err(|_| RunError::TooManyInstances)?),
+                                None => return Err(fail(VtableFail::Shape(blaze_build::vtable::VtableError::NoTrait(s)))),
+                            },
+                        };
+                        words.push((offset, word));
+                    }
+                    tables.refs.push(t);
+                    tables.images.push(VtableImage { bytes: table.bytes, words });
+                    stack.pop();
+                }
+                match tables.refs.iter().position(|r| *r == want) {
+                    Some(n) => u32::try_from(n).map_err(|_| RunError::TooManyInstances),
+                    None => Err(fail(VtableFail::Shape(blaze_build::vtable::VtableError::NoTrait(want.principal)))),
+                }
+            })();
+            match made {
+                Ok(n) => table_of.push(n),
+                Err(e) => {
+                    filed(&mut survey, e)?;
+                    broken = true;
+                }
             }
         }
         if broken {
@@ -1084,13 +1215,13 @@ fn build_from<P: FrontEnd>(program: &mut P, surveyed: Option<(&mut Vec<(Box<str>
             };
             tls_at.push(offset);
         }
-        bodies.push(Body { code, targets, statics: built.statics, tls: tls_at });
+        bodies.push(Body { code, targets, statics: built.statics, tls: tls_at, vtables: table_of });
     }
     if let Some(counts) = counts.as_deref_mut() {
         counts.built = bodies.len();
-        counts.tried = instances.len();
+        counts.tried = reached.instances.len();
         let mut met: blaze_hash::HashMap<ItemKey, (), Global> = blaze_hash::HashMap::new_in(Global);
-        met.extend(instances.iter().map(|i| (i.item, ())));
+        met.extend(reached.instances.iter().map(|i| (i.item, ())));
         for c in 0..program.fn_count() {
             let f = program.function(c);
             if f.body.is_some() && checked[c].is_some() && generic(c) && !met.contains_key(&f.key) {
@@ -1117,9 +1248,9 @@ fn build_from<P: FrontEnd>(program: &mut P, surveyed: Option<(&mut Vec<(Box<str>
             }
             let mut code = Code::new_in(Global);
             blaze_emit::emit(func.view(), &via, isa(), &mut code).map_err(|error| RunError::Emit { function: named(), error })?;
-            bodies.push(Body { code, targets, statics: Vec::new_in(Global), tls: Vec::new_in(Global) });
+            bodies.push(Body { code, targets, statics: Vec::new_in(Global), tls: Vec::new_in(Global), vtables: Vec::new_in(Global) });
             Some(u32::try_from(bodies.len() - 1).map_err(|_| RunError::TooManyInstances)?)
         }
     };
-    Ok(Some(Built { bodies, start, start_fn: program.function(main).named(), image, getter }))
+    Ok(Some(Built { bodies, vtables: tables.images, start, start_fn: program.function(main).named(), image, getter }))
 }

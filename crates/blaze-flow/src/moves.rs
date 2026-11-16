@@ -113,7 +113,7 @@ pub fn transfer<A: Allocator>(flow: &Flow<A>, s: Stmt, init: &mut [u64], uninit:
             initialize(flow, dest, init, uninit);
         }
         StmtKind::StorageLive(l) | StmtKind::StorageDead(l) => {
-            deinit(flow, Place(l.0), init, uninit);
+            deinit(flow, flow.local_place(l), init, uninit);
         }
         StmtKind::Drop(p) => deinit(flow, p, init, uninit),
         _ => {}

@@ -1441,11 +1441,14 @@ started, its result line not captured. The rust-call test: passed (not in the fa
   forced `()` stands for. `At::Body` is gone from that path (suite:
   `a_forced_unit_mismatch_carries_the_blocks_range`; without it: "DiagWithoutPlace { code:
   Mismatch, name: None }").
-- In a user crate, `panic!()` and `assert!` give E0425-like `UnresolvedPath` at the macro
-  call. The `panic!` arms' mismatch comes from the `panic_fmt(..);` statement not diverging, and
-  a path that does not resolve would explain both: `$crate::panicking::..` from a user crate.
-  The test prints each diagnostic's name hash beside `Name::of` of the expansion's words, to
-  say which segment fails.
+- After both fixes: "clean: [\"e\", \"core::panicking::panic_bounds_check\", \"<impl
+  core::fmt::Display for W>::fmt\", \"<impl core::fmt::Display for V>::fmt\"]". OPEN, and not
+  the checker's: in a USER crate, `$crate::panicking::panic_fmt` (name hash 8263167416644613366
+  = `Name::of("panic_fmt")`, printed by the test) and `panic` (`panic!()`, hash
+  12722707682089970518) answer `UnresolvedPath` at the macro call. The `panic!` arms' E0308
+  (now at the call's own range, 38..89) follows from it: the unresolved call is not `!`. Next:
+  find where front2 or the names library resolves a `$crate` path out of a user crate's
+  expansion. Bodies a, a2, b, c, d of front2_panics.rs fail on it.
 - Negative impls: the solver already had `ImplPolarity` (trait_goals.rs `step_impl`,
   structural.rs's disqualification by any impl of the shape). The world's `ImplHeader` now has
   `polarity: ImplPolarity` (the solver's type, re-exported). infer/facts.rs passes it through

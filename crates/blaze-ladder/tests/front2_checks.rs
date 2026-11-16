@@ -68,6 +68,12 @@ fn from_self() { need_from::<E, E>(E) }
 fn need_try<T: core::ops::Try>(_: T) {}
 fn result_tries(r: Result<(), E>) { need_try(r) }
 fn arc_star(a: Arc<u8>) -> u8 { *a }
+fn arc_star_wrong(a: Arc<u8>) -> bool { *a }
+fn guard_star_wrong(g: Guard<'_>) -> bool { *g }
+struct Inner { x: u8 }
+struct W(Inner);
+impl Deref for W { type Target = Inner; fn deref(&self) -> &Inner { &self.0 } }
+fn w_field(w: W) -> u8 { w.x }
 fn deref_bound<T: Deref<Target = [u8]>>(_: &T) {}
 fn vec_deref_bound(v: Vec<u8>) { deref_bound(&v) }
 fn need_deref<T: Deref>(_: &T) {}
@@ -77,7 +83,10 @@ fn result_output(r: Result<(), E>) { try_output(r) }
 ";
 
 /// The bodies that must check clean, each with what it proves.
-const CLEAN: [(&str, &str); 26] = [
+const CLEAN: &[(&str, &str)] = &[
+    ("vec_iter", "FIRST"),
+    ("try_same", "FIRST"),
+    ("w_field", "a field through a local `Deref` impl"),
     ("arc_star", "`*a` on `Arc<u8>`"),
     ("vec_deref_bound", "`Vec<u8>: Deref<Target = [u8]>` as a bound"),
     ("vec_derefs", "`Vec<u8>: Deref` as a bound"),
@@ -172,10 +181,20 @@ fn deref_and_try_through_front2() {
                 }
                 for k in found {
                     let Some(h) = store.impls.get(k) else { println!("probe {lang}: {k:?} no head"); continue };
-                    let preds = store.preds.get(k).map(|p| format!("{:?}", p.clauses)).unwrap_or_default();
                     let tys = store.tys.view();
-                    probes += &format!("\nprobe {lang}: g={} self={:?} args={:?} assoc={:?} preds={}", h.generics, tys.node(h.self_ty), h.trait_args, h.assoc.iter().map(|(_, t)| tys.node(*t)).collect::<Vec<_>>(), &preds[..preds.len().min(200)]);
-                    let _ = &mut probes;
+                    let named = |t: blaze_typeck::ItemKey| -> String {
+                        for l in ["sized", "meta_sized", "pointee_sized", "Try", "deref"] {
+                            if front.index.lang(l).map(blaze_ladder::front2::keys::checker_of) == Some(t) {
+                                return l.to_string();
+                            }
+                        }
+                        format!("{:x}", t.0 >> 96)
+                    };
+                    let preds: Vec<String> = store.preds.get(k).map(|p| p.clauses.iter().map(|c| match c {
+                        blaze_typeck::PClause::Trait { trait_, args } => format!("{}{:?}", named(*trait_), tys.list(*args).map(|l| l.iter().map(|t| tys.node(*t)).collect::<Vec<_>>())),
+                        other => format!("{other:?}"),
+                    }).collect()).unwrap_or_default();
+                    probes += &format!("\nprobe {lang}: g={} self={:?} assoc={:?} preds={preds:?}", h.generics, tys.node(h.self_ty), h.assoc.iter().map(|(_, t)| tys.node(*t)).collect::<Vec<_>>());
                 }
             }
         }
@@ -185,7 +204,6 @@ fn deref_and_try_through_front2() {
     for line in &report {
         println!("{line}");
     }
-    let _ = probes;
     let why: Vec<String> = report.iter().filter(|l| !l.ends_with(": clean")).map(|l| l.chars().take(260).collect()).collect();
-    assert!(failed.is_empty(), "bodies that must check clean did not: {failed:?}\n{}", why.join("\n"));
+    assert!(failed.is_empty(), "bodies that must check clean did not: {failed:?}\n{}{probes}", why.join("\n"));
 }

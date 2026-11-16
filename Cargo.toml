@@ -420,6 +420,8 @@ blaze-typeck = { path = "crates/blaze-typeck" }
 blaze-solve = { path = "crates/blaze-solve" }
 # The flow form and its move and borrow checks (docs/v2/plan/design/flow.md, decision D61).
 blaze-flow = { path = "crates/blaze-flow" }
+# The lowering from a type-checked body to its flow (flow.md, "The lowering").
+blaze-flow-lower = { path = "crates/blaze-flow-lower" }
 # Typed SQL (docs/v2/plan/design/sql.md): the checker, and its drivers for C SQLite and Postgres.
 blaze-sql = { path = "crates/blaze-sql" }
 blaze-rel = { path = "crates/blaze-rel" }

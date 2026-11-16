@@ -286,6 +286,9 @@ pub struct ImplHead {
     /// Its associated constants (the Reference, "Associated constants"), each with a row in
     /// `Store::fns` as the checker reads one: no inputs, its type the output, no body.
     pub consts: Vec<(Name, ItemKey), Global>,
+    /// `impl !Trait for T` is negative (the Reference does not list negative impls: rustc's
+    /// `negative_impls`, which core and alloc use); `#[rustc_reservation_impl]` reserves.
+    pub polarity: tc::ImplPolarity,
 }
 
 /// What [`Store::ensure`] is asked to make.
@@ -901,8 +904,11 @@ impl<'n> Store<'n> {
 
     fn impl_(&mut self, names: &'n Names<'n>, keys: &mut Keys, key: LibKey, module: LibKey, v: &View<'_>) -> Result<(), Why> {
         let whole = Range::new(0, 0);
-        if v.head[head::FLAGS] & sig::NEGATIVE != 0 {
-            return Err(Why::Unsupported("a negative impl", whole));
+        let mut polarity = if v.head[head::FLAGS] & sig::NEGATIVE != 0 { tc::ImplPolarity::Negative } else { tc::ImplPolarity::Positive };
+        for &n in v.rows(v.list(head::ATTRS))? {
+            if v.text_at(v.attr(n)?.path)?.trim() == "rustc_reservation_impl" {
+                polarity = tc::ImplPolarity::Reservation;
+            }
         }
         let ck = checker_of(key);
         let mut ps = Vec::new_in(Global);
@@ -986,7 +992,7 @@ impl<'n> Store<'n> {
             self.member_fn_head(names, key, mk, Some(ck), &env, generics, &preds.clauses, &low.view(), text)?;
         }
         self.preds.insert(ck, preds);
-        self.impls.insert(ck, ImplHead { generics, self_ty, trait_, trait_args, assoc, fns, consts });
+        self.impls.insert(ck, ImplHead { generics, self_ty, trait_, trait_args, assoc, fns, consts, polarity });
         self.maps.const_params.insert(key, cs);
         Ok(())
     }

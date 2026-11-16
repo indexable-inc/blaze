@@ -818,7 +818,7 @@ impl<'r, 'a> Built<'r, 'a> {
     }
 
     /// See [`Names::lookup`].
-    fn lookup(&self, module: ItemKey, ns: Namespace, name: &'a str, alloc: Alloc<'_>) -> Option<Binding> {
+    pub(crate) fn lookup(&self, module: ItemKey, ns: Namespace, name: &'a str, alloc: Alloc<'_>) -> Option<Binding> {
         struct Records<'q, 'r, 'a> {
             built: &'q Built<'r, 'a>,
             ns: Namespace,

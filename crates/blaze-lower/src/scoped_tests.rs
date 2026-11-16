@@ -30,6 +30,12 @@ macro_rules! seven_of { () => { $crate::inner::SEVEN } }
 #[macro_export]
 macro_rules! via { () => { $crate::m!(3) } }
 pub mod inner { pub const SEVEN: u32 = 7; }
+// A nested pair, the shape of core's `panic!` -> `panic_2021!` -> `$crate::panicking::panic_fmt`.
+#[macro_export]
+macro_rules! outer { () => { $crate::inner_m!() } }
+#[macro_export]
+macro_rules! inner_m { () => { $crate::deep::f() } }
+pub mod deep { pub fn f() -> u32 { 1 } }
 pub mod again { pub use crate::m as re; }
 pub mod globbed { pub use crate::seven_of; }
 
@@ -115,6 +121,7 @@ macro_rules! fail { () => { dep::panic!(\"{}\") } }
 const USER: &str = "#![no_core]
 use dep::seven_of;
 mod g { pub use dep::globbed::*; }
+mod deep { pub fn f() -> u32 { 2 } }
 pub fn main() {}
 ";
 
@@ -219,6 +226,51 @@ fn dollar_crate_in_an_expansion_names_the_defining_crate() {
 fn dollar_crate_in_a_macro_written_by_a_macro_names_the_defining_crate() {
     assert_clean("fn h() -> u32 { dep::address!(\"0x01\") }", "SEVEN");
     assert_clean("fn z() -> u32 { dep::address!() }", "SEVEN");
+}
+
+/// The Reference, "Macros By Example", Hygiene: "`$crate` ... refers to the crate defining the
+/// macro". A value path a SECOND-level expansion writes in a body (`dep::outer!` writes
+/// `$crate::inner_m!()`, which writes `$crate::deep::f()`: the pinned core's `panic!` ->
+/// `$crate::panic::panic_2021!` -> `$crate::panicking::panic_fmt(..)`) resolves to `dep`'s
+/// `deep::f` from `user`'s body, as the ladder's resolver asks it (`to_path` at the body's crate,
+/// then the names library at the body's module), never to `user`'s own `deep::f`.
+#[test]
+fn a_value_path_a_nested_expansion_writes_names_the_defining_crate() {
+    use crate::resolve::{Answer, Ns, resolve};
+    use blaze_scope::names::{self, Written};
+    use blaze_scope::task::to_path;
+    use blaze_scope::{Namespace, PathKind};
+    struct Ask(&'static Names<'static>, CrateItemKey);
+    impl crate::resolve::Names for Ask {
+        fn lookup(&mut self, ns: Ns, absolute: bool, segments: &[&str]) -> Answer {
+            let ns = match ns {
+                Ns::Type => Namespace::Types,
+                Ns::Value => Namespace::Values,
+                Ns::Macro => Namespace::Macros,
+            };
+            let p = to_path(absolute, segments, self.1, Alloc::global());
+            match names::path(self.0, self.0.root(0), ns, Written { kind: p.kind, segments: &p.segments }, Alloc::global()) {
+                Ok(r) if r.consumed == p.segments.len() => Answer::Found(r.def.key),
+                _ => Answer::Absent,
+            }
+        }
+        fn lang(&mut self, _: crate::form::LangItem) -> Answer {
+            Answer::Absent
+        }
+    }
+    let names = names();
+    let scoped = Scoped { names, module: names.root(0), prepared: Some(Prepares::new_in(Alloc::global())) };
+    let mut expander = ByName::with_names(&scoped, Host, Alloc::global());
+    let text = "fn k() -> u32 { dep::outer!() }";
+    let l = lower_body_expanding(text, names.edition(0), &mut Unix, &mut expander, Alloc::global()).unwrap_or_else(|need| panic!("{text}: needs {:?}", need.atoms));
+    let dep_f = names::path(names, names.root(1), Namespace::Values, Written { kind: PathKind::Crate, segments: &["deep", "f"] }, Alloc::global())
+        .unwrap_or_else(|e| panic!("dep's `deep::f`: {e:?}"))
+        .def
+        .key;
+    let user = CrateItemKey(ContentId::of("blaze-lower scoped test crate", b"user"));
+    let got = resolve(&l.view(), &mut Ask(names, user), Alloc::global()).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+    let found: StdVec<_> = got.paths.iter().map(|r| r.target).collect();
+    assert!(found.contains(&crate::resolve::Target::Item(dep_f)), "{text}: {found:?} (dep's `deep::f` is {dep_f:?})\n{}", dump_of(&l));
 }
 
 /// The same rule for a macro handed through an `item` fragment of another macro (tokio's

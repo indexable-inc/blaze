@@ -894,18 +894,11 @@ impl<S: Sharing> Store for Layered<'_, S> {
         self.local.after_answer(cx, profile)?;
         if let Some(machine) = &mut self.machine {
             machine.after_answer(cx, profile)?;
-            if self.machine_found + self.machine_put > 0 {
-                self.err.line(
-                    cx,
-                    format_args!(
-                        "blaze: machine store: {} records found, {} written; {} packs, {} read whole this command",
-                        self.machine_found,
-                        self.machine_put,
-                        machine.packs.len(),
-                        machine.verified
-                    ),
-                )?;
-            }
+            // Facts of the run, not news: the profile's rows (and `--stats`), never plain stderr.
+            profile.machine_found = self.machine_found;
+            profile.machine_put = self.machine_put;
+            profile.machine_packs = u32::try_from(machine.packs.len()).unwrap_or(u32::MAX);
+            profile.machine_read_whole = machine.verified;
         }
         if let Some(remote) = &self.remote {
             let r = remote.reader.report();
@@ -1144,6 +1137,9 @@ mod tests {
         let root = fs.root().subdir(&Path::new(PROJECT)?);
         let home = match Machine::of(cx, &fs, Some(HOME))? {
             Machine::Home(home) => home,
+            // A failure the simulation injected into the home's open ends this start as any
+            // failed effect does (a real command goes on with the store off and says so).
+            Machine::Off(MachineOff::Home(bstd::fs::HomeError { why: bstd::fs::HomeWhy::Fs(error), .. })) => return Err(error.into()),
             Machine::Off(why) => panic!("the simulation's home was refused: {why}"),
         };
         let err = io.need_err().map_err(CliError::Missing)?;

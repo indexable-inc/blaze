@@ -308,9 +308,7 @@ impl World for BodyWorld<'_, '_> {
                 trait_args: i.trait_args,
                 assoc_types: &i.assoc,
                 types: self.types(),
-                // The heads refuse `impl !Trait` by name today (heads.rs): every head here is
-                // positive until the heads lane fills this from the impl's `!`.
-                polarity: blaze_typeck::ImplPolarity::Positive,
+                polarity: i.polarity,
             }));
         }
         match self.detail(item) {

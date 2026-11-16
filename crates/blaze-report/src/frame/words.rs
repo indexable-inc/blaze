@@ -140,6 +140,22 @@ pub const WORDINGS: &[Wording] = &[
         args: 1,
     },
     Wording {
+        area: Area::Drive,
+        number: 0xC0F7,
+        name: "module-file-missing",
+        headline: "this module's file is at neither of its places: {code:0} or {code:1}",
+        label: "create one of the two files, or delete this line",
+        args: 2,
+    },
+    Wording {
+        area: Area::Drive,
+        number: 0xC0F8,
+        name: "path-file-missing",
+        headline: "this module's `#[path]` names {code:0}, which is not in the checkout",
+        label: "create the file, or change the path",
+        args: 1,
+    },
+    Wording {
         area: Area::Ladder,
         number: 1,
         name: "not-supported-yet",

@@ -1185,6 +1185,10 @@ Twenty-second port lane (2026-11-16 ~10:30; handing on).
   (both fronts); run.rs `BackLangs` asks ManuallyDrop and OwnedBox once before the build
   (`RunError::Lang`); front2 looks up Drop/Deref/DerefMut once at `make`
   (`Front2Refusal::Lang`), so `drop_trait`/`lang_trait_fn` read a checked table. No panic left.
+- THE TABLE IS NOT MEASURED: list-AA never ran. lanecheck stopped on another lane's
+  examples/check_speed.rs:638 (E0277 `RawBuf<&str, Alloc>` not Sync), and mixcheck twice
+  printed "the build lock stayed busy for 540s" (exit 75). First job: rerun
+  `FRONT2_WORK_LIST=.../list-AA.txt` through mixcheck and send REACHABLE/BUILDS/classes to main.
 - NOT DONE: step 3 (the entry's proof with the append off), the rungs and `--test ladder` were
   NOT rerun after these changes (owed first thing: `"--test ladder_front2"`, `"--test ladder"`).
 
@@ -1319,6 +1323,32 @@ Twenty-second port lane (2026-11-16 ~10:30; handing on).
   expression) is body.rs's. (5) E0425 at env.rs:74 and eval.rs:125; trait consts; "gap
   TypeAlias"; "NotAHead"; `size_of::<Self>()` needs the evaluator to run generic calls.
 - Tests: crates/blaze-ladder/tests/front2_items.rs (`check_fns` over a small crate).
+
+##### Second runner (2026-11-16, ~10:15; handing on)
+
+- PROVEN: the index fix. "4 passed, 0 failed"; with `i += 1` taken out of `predicates`'
+  const arm: "a_const_parameter_first_keeps_the_type_parameters_indexes ... FAILED .. BadPred
+  { kind: Trait, .. args: [Some(Const),". census-gen-2 (bstd): "clean 1054 (45.6%)"; Sort
+  still 662: NOT this bug. `sort_probe` reduces it (order-dependent: `a? << 4` after a
+  `chunks_exact(2).enumerate()` loop on one store). It FAILS today and is the third checker
+  lane's fixture: leave it.
+- types.rs `path_ty` (the types lane's file, three lines): a const param in a type position
+  (`T: Tr<N>`) is `Why::Unsupported` by name, not `Param(i)`. Fixture
+  `a_const_parameter_as_a_bound_argument_is_refused_by_name` passes.
+- Statics: `Store::statics` (mutability from `sig::MUT`); `step` builds a static's head as a
+  const's; world_paths answers `Def::Static(k, m)`; `Gap::Static` is deleted (front2_main.rs
+  ported). Fixture `statics_are_items_with_their_type` passes.
+- SAVED, NOT YET COMPILED (the lock was contended for 40 minutes):
+  (1) check.rs `lower_heads`: every refused impl header (except `NeedConst`, which `make`
+  evaluates) goes to `Buckets::fail`. world_items `failed_impl` turns it into
+  `Gap::RefusedImpl { impl_, place, why }` (`item_place` = file:line), or `UnreadImpl` when
+  it was unread. The census class is "gap RefusedImpl: ..". Fixture
+  `a_refused_impl_is_a_named_gap`.
+  (2) Negative impls: `ImplHead::polarity` (Negative from `!`, Reservation from
+  `#[rustc_reservation_impl]`), answered in `impl_header`. Fixture `a_negative_impl_is_a_head`.
+- Next: compile, then run front2_items (expect every test but `sort_probe` to pass), his main
+  (list-Y.txt), census-gen-3, then step 3 (`explicit_discriminants` passed in the 7-test run)
+  and step 4.
 - From the checker lane (aecc6d5b7f9cee13b, after I handed on): body.rs's new `const_arg`
   resolves an enum variant path (`{ AtomicOrdering::SeqCst }`) as
   `PortableTys::variant_value` before calling `const_term`. Move that branch into

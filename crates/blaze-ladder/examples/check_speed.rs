@@ -437,7 +437,7 @@ fn main() {
                 entries.push(Entry { order: (f, o, s, key_low(*k)), target: Target::Free(*k), path: format!("{module}::{}", it.name.unwrap_or("?")), bytes: it.text.len() });
             }
             ItemDetail::Impl | ItemDetail::Trait => {
-                let head = it.impl_header.map(|h| h.chars().take(60).collect::<String>()).unwrap_or_else(|| format!("trait {}", it.name.unwrap_or("?")));
+                let head = it.impl_header.map(|h| h.chars().take(60).map(|c| if c == '\n' { ' ' } else { c }).collect::<String>()).unwrap_or_else(|| format!("trait {}", it.name.unwrap_or("?")));
                 for m in names.members(*k).unwrap_or(&[]) {
                     let (ItemDetail::Fn { .. }, Some(name)) = (m.detail, m.name) else { continue };
                     let (f, o, s) = pos(*k, m.text);

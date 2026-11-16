@@ -40,35 +40,35 @@ fn check_runs(text: &str, runs: &[&[&str]]) -> Vec<Vec<(String, String)>> {
     let sources = [SourceFile { path: "src/main.rs", text }];
     let mut out = Vec::new();
     for fns in runs {
-    let mut front = Front2::new(&names, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
-    let prepared = Prepares::new_in(Alloc::global());
-    let mut store = Store::new(front.index.lang("sized"));
-    let (mut buckets, mut consts) = (None, Consts::default());
-    let mut got = Vec::new();
-    for &n in *fns {
-        let found = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &[n] }, Alloc::global())
-            .unwrap_or_else(|e| panic!("`{n}`: {e}"));
-        let k = found.whole(1).unwrap_or_else(|| panic!("`{n}` not named")).key;
-        let outcome = match lower_fn(&names, prepared, &mut front.keys, &mut store, k) {
-            Err(e) => format!("not lowered: {e}"),
-            Ok(body) => {
-                let view = body.lowered.view();
-                let spell = Spelling::of(&view).unwrap_or_else(|e| panic!("spelling `{n}`: {e:?}"));
-                let scope = body.scope(&spell);
-                let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: Some((&mut consts, prepared)) };
-                match check_body(&mut records, &body, &scope) {
-                    Ok(done) if done.diags.is_empty() => "clean".to_string(),
-                    Ok(done) => {
-                        let d: Vec<String> = done.diags.iter().map(|d| format!("{} at {:?}", d.code.code(), d.at)).collect();
-                        format!("diags {d:?}")
+        let mut front = Front2::new(&names, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+        let prepared = Prepares::new_in(Alloc::global());
+        let mut store = Store::new(front.index.lang("sized"));
+        let (mut buckets, mut consts) = (None, Consts::default());
+        let mut got = Vec::new();
+        for &n in *fns {
+            let found = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &[n] }, Alloc::global())
+                .unwrap_or_else(|e| panic!("`{n}`: {e}"));
+            let k = found.whole(1).unwrap_or_else(|| panic!("`{n}` not named")).key;
+            let outcome = match lower_fn(&names, prepared, &mut front.keys, &mut store, k) {
+                Err(e) => format!("not lowered: {e}"),
+                Ok(body) => {
+                    let view = body.lowered.view();
+                    let spell = Spelling::of(&view).unwrap_or_else(|e| panic!("spelling `{n}`: {e:?}"));
+                    let scope = body.scope(&spell);
+                    let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: Some((&mut consts, prepared)) };
+                    match check_body(&mut records, &body, &scope) {
+                        Ok(done) if done.diags.is_empty() => "clean".to_string(),
+                        Ok(done) => {
+                            let d: Vec<String> = done.diags.iter().map(|d| format!("{} at {:?}", d.code.code(), d.at)).collect();
+                            format!("diags {d:?}")
+                        }
+                        Err(e) => format!("not checked: {e}"),
                     }
-                    Err(e) => format!("not checked: {e}"),
                 }
-            }
-        };
-        got.push((n.to_string(), outcome));
-    }
-    out.push(got);
+            };
+            got.push((n.to_string(), outcome));
+        }
+        out.push(got);
     }
     out
 }
@@ -86,7 +86,11 @@ fn shift_of_question_after_enumerate() {
     let (alone, after, before) = (&got[0], &got[1], &got[2]);
     let shown = format!(
         "ORDER question alone: {:?}\nORDER chunks then question: {:?} / {:?}\nORDER question then chunks: {:?} / {:?}",
-        alone[0].1, after[0].1, after[1].1, before[0].1, before[1].1
+        short(&alone[0].1),
+        short(&after[0].1),
+        short(&after[1].1),
+        short(&before[0].1),
+        short(&before[1].1)
     );
     println!("{shown}");
     assert!(alone[0].1 == after[1].1 && after[0].1 == before[1].1, "a body's outcome depends on what was checked before it:\n{shown}");
@@ -110,6 +114,13 @@ fn total(v: &[u32]) -> u32 { v.iter().map(|x| x * 2).sum() }
 fn main() {}
 ";
 
+/// An outcome without the parts every line repeats (the body's key, the source file's path), so
+/// that a line of the report shows the refusal itself.
+fn short(o: &str) -> String {
+    let o = o.find("Malformed(").map_or(o, |at| &o[at..]);
+    o.replace("Location { file: \"crates/", "").replace("Some(BadPred { kind: ", "(").chars().take(220).collect()
+}
+
 const BODIES: [&str; 12] = ["question", "chunks", "shl", "map_add", "slice_len", "arr", "arr_call", "pick", "q1", "index_mut", "digit", "total"];
 
 #[test]
@@ -127,7 +138,7 @@ fn outcome_does_not_depend_on_order() {
         for (n, got) in order {
             let want = &alone.iter().find(|(m, _)| *m == n).expect("each body checked alone").1;
             if &got != want {
-                differ.push(format!("{label}: `{n}`: alone {want:?}, here {got:?}"));
+                differ.push(format!("{label}: `{n}`: alone {:?}, here {:?}", short(want), short(&got)));
             }
         }
     }

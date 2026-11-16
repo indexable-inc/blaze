@@ -56,7 +56,7 @@ pub fn for_each_access<A: Allocator>(flow: &Flow<A>, s: Stmt, mut f: impl FnMut(
             }
             f(access(dest, true, false));
         }
-        StmtKind::StorageDead(l) => f(access(Place(l.0), true, false)),
+        StmtKind::StorageDead(l) => f(access(flow.local_place(l), true, false)),
         StmtKind::Drop(p) => f(access(p, true, true)),
         StmtKind::Activate(l) => {
             f(Access { place: flow.loan(l).place, write: true, deep: true, except: Some(l) })

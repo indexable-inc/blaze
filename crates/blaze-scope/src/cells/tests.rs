@@ -489,10 +489,32 @@ fn r6_a_miss_goes_outward_and_a_later_definition_is_the_error() {
     let got = outcome(&ok, c, 0);
     assert_eq!(named_def(got, Namespace::Types), Some(y), "{got:?}");
     assert_eq!((ok.r6.len(), ok.stats.r6_errors), (1, 1), "the error at the expansion's `mod pm`");
+    // The control: growth held the lookup, so it met the written `pm` first. Since R6 gives
+    // that order the same answer (the fixture below), the control is seen in the order alone:
+    // the lookup did not go outward on its first try.
     let waits = cells_of(&w, root, CellPlant::OutwardWaits);
-    assert_ne!(named_def(outcome(&waits, c, 0), Namespace::Types), Some(y), "the control: growth held the lookup");
+    assert_eq!(named_def(outcome(&waits, c, 0), Namespace::Types), Some(y), "the answer does not depend on the order");
+    assert!(waits.stats.outward < ok.stats.outward, "the control: {} outward, {} without the plant", waits.stats.outward, ok.stats.outward);
     let blind = cells_of(&w, root, CellPlant::NoWatch);
     assert_eq!(blind.stats.r6_errors, 0, "the control: no watch, no error");
+}
+
+/// R6 in the other order (wide seed 8 with calls): the call of `c`'s own text writes `mod pm`
+/// and expands before the import is first tried, so the import meets the definition inside.
+/// The answer is the one the first order gives: the prelude's `pm`, with the error at the
+/// expansion's definition. Control: a core where the earlier-written definition wins answers
+/// through the new `pm` (an answer that depends on the order).
+#[test]
+fn r6_a_definition_written_first_still_loses_to_the_outer_binding() {
+    let (mut w, root, c, call, y) = prelude_world();
+    let inner = w.module(call, "pm", V::Pub);
+    let other = w.item(inner, "y", Namespace::Types, crate::DefKind::Other, V::Pub);
+    let ok = cells_of(&w, root, CellPlant::None);
+    let got = outcome(&ok, c, 0);
+    assert_eq!(named_def(got, Namespace::Types), Some(y), "{got:?}");
+    assert_eq!(ok.stats.r6_errors, 1, "the error at the expansion's `mod pm`");
+    let bad = cells_of(&w, root, CellPlant::InnerAfterWrite);
+    assert_eq!(named_def(outcome(&bad, c, 0), Namespace::Types), Some(other), "the control");
 }
 
 /// R6, D56: the same program with the expansion writing nothing named `pm`: outward, no error.
@@ -683,7 +705,14 @@ fn case_wide(tape: &Tape, calls: bool) -> Result<[u64; 3], Broke> {
     if first.stats != second.stats {
         return Err(Broke::Oracle(format!("counters differ by push order: {:?} then {:?}", first.stats, second.stats)));
     }
-    compare_wide(&w, root, &first).map_err(|e| Broke::Oracle(format!("differs from the reference: {e}\nthe program:\n{}", program(&w))))
+    compare_wide(&w, root, &first).map_err(|e| {
+        let text = format!("differs from the reference: {e}\nthe program:\n{}", program(&w));
+        // A failing case in full, for a runner whose test driver cuts long lines.
+        if let Some(path) = std::env::var_os("CELLS_DUMP") {
+            std::fs::write(path, &text).expect("the dump file is writable");
+        }
+        Broke::Oracle(text)
+    })
 }
 
 /// The drawn program, for a failing case: each module and expansion with its declarations.
@@ -722,4 +751,151 @@ fn the_cells_equal_the_reference_wide() {
 #[test]
 fn the_cells_equal_the_reference_wide_with_calls() {
     wide(true);
+}
+
+/// R5 for imports, reduced from wide seed 1274: `m4` holds `use m1::*; use self::m2::*;` and
+/// `m1` is the dependency's root through the extern prelude (the crate's own `m1` is not in
+/// `m4`'s scope). The two globs are one group: the first's lookup of `m1` reads `m4`'s globs.
+/// At the stall the first resolves (the undecided glob taken as absent) and is decided ALONE;
+/// the second is tried again with it and finds the dependency's `m2`. Control: a stall that
+/// decides every member from the guess at once fails the second as not found.
+#[test]
+fn a_stalled_group_decides_only_what_resolves() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let dep = w.root(2, Edition::E2021);
+    w.item(dep, "x", Namespace::Types, crate::DefKind::Other, V::Pub);
+    let dm2 = w.module(dep, "m2", V::Pub);
+    w.item(dm2, "y", Namespace::Types, crate::DefKind::Other, V::Pub);
+    w.dep(root, "m1", dep);
+    // The standard prelude, another crate's module, as the wide distribution draws it (an
+    // unknown standard prelude would make every outward miss unknown).
+    let std = w.root(9, Edition::E2021);
+    let prelude = w.module(std, "prelude", V::Pub);
+    w.module(prelude, "m1", V::Pub);
+    w.cr(root).head.prelude = Some(prelude);
+    let m1 = w.module(root, "m1", V::Priv);
+    w.item(m1, "x", Namespace::Types, crate::DefKind::Other, V::Priv);
+    w.module(root, "m2", V::Priv);
+    let m4 = w.module(root, "m4", V::Priv);
+    w.glob(m4, "m1", V::Priv);
+    w.glob(m4, "self::m2", V::Priv);
+    // The rules' answer is (Glob(dep), Glob(dm2)); this core reads no other crate's modules, so
+    // its answer is unknown for both (`Outside`), never not found.
+    let _ = dm2;
+    let ok = cells_of(&w, root, CellPlant::None);
+    assert_eq!((outcome(&ok, m4, 0), outcome(&ok, m4, 1)), (Outcome::Outside, Outcome::Outside));
+    let bad = cells_of(&w, root, CellPlant::StallDecidesAll);
+    assert_eq!(outcome(&bad, m4, 1), Outcome::Failed(Unresolved::NotFound), "the control");
+}
+
+/// A dependency solved first by this core, read through [`super::DepNames`] (the ready queue's
+/// order: a dependency is decided before its dependents).
+struct SolvedDep {
+    cells: core::cell::RefCell<Cells<'static, N>>,
+    krate: blaze_id::CrateItemKey,
+    root: ItemKey,
+}
+
+impl super::DepNames<N> for SolvedDep {
+    fn has_module(&self, module: ItemKey) -> bool {
+        self.cells.borrow().by_key.get(&module).is_some_and(|&m| !self.cells.borrow().modules[m as usize].foreign)
+    }
+
+    fn name_in(&self, module: ItemKey, ns: Namespace, name: N) -> super::DepAnswer {
+        match self.cells.borrow_mut().ask(module, ns, name) {
+            Ok(Some(Value::Found(d, v))) => super::DepAnswer::Found(d, v),
+            Ok(Some(Value::Ambiguous(d, v))) => super::DepAnswer::Ambiguous(d, v),
+            Ok(Some(Value::NotFound)) => super::DepAnswer::NotFound,
+            Ok(Some(Value::Outside) | None) | Err(_) => super::DepAnswer::Unknown,
+        }
+    }
+
+    fn crate_root(&self, krate: blaze_id::CrateItemKey) -> Option<ItemKey> {
+        (krate == self.krate).then_some(self.root)
+    }
+}
+
+/// `root`'s crate solved with `dep`'s (crate 2) read as decided.
+fn with_dep(w: &World, root: ItemKey, dep: ItemKey, plant: CellPlant) -> Cells<'static, N> {
+    let d = cells_of(w, dep, CellPlant::None);
+    let reader: &'static SolvedDep = Box::leak(Box::new(SolvedDep { cells: core::cell::RefCell::new(d), krate: crate::tests::crate_key(2), root: dep }));
+    w.expanded.borrow_mut().clear();
+    let mut c = Cells::load_with(w, root, Some(reader), Alloc::global()).expect("the core loads");
+    c.plant = plant;
+    let expand = |call: ItemKey, _: crate::Def| {
+        w.expanded.borrow_mut().insert(call);
+    };
+    c.run(w, &expand, &[]).expect("the core runs");
+    c
+}
+
+/// Step 1 of runner 9: a path into a dependency is an answer. Dependency `e` (crate 2): `pub mod
+/// m { pub struct S; struct P; pub use crate::inner::*; }`, `mod inner { pub struct T; }`, and
+/// `#[macro_export] macro_rules! mac`. The crate: `use e::m::S;` (S), `use e::m::P;` (private),
+/// `use e::m::T;` (through the dependency's glob), `use e::m::Q;` (not found: never unknown),
+/// `use ::e::m::S as S2;` (`::` reads the extern prelude), in `b`: `use e::m::*;` then
+/// `use self::T as T2;` (the glob of a dependency's module brings its exported names), and
+/// `use $crate::m::S as S3;` written as by a macro of `e`. Controls: `DepIsOutside` leaves S
+/// unknown, `DepGlobEmpty` fails `T2`, `DollarCrateIsRoot` fails `S3`.
+#[test]
+fn a_path_into_a_dependency_reads_its_decided_names() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let dep = w.root(2, Edition::E2021);
+    let m = w.module(dep, "m", V::Pub);
+    let s = w.item(m, "S", Namespace::Types, crate::DefKind::Other, V::Pub);
+    w.item(m, "P", Namespace::Types, crate::DefKind::Other, V::Priv);
+    let inner = w.module(dep, "inner", V::Priv);
+    let t = w.item(inner, "T", Namespace::Types, crate::DefKind::Other, V::Pub);
+    w.glob(m, "crate::inner::*", V::Pub);
+    w.dep(root, "e", dep);
+    w.use_(root, "e::m::S", V::Pub);
+    w.use_(root, "e::m::P", V::Pub);
+    w.use_(root, "e::m::T", V::Pub);
+    w.use_(root, "e::m::Q", V::Pub);
+    w.use_as(root, "::e::m::S", "S2", V::Pub);
+    let b = w.module(root, "b", V::Pub);
+    w.glob(b, "e::m::*", V::Pub);
+    w.use_as(b, "self::T", "T2", V::Pub);
+    w.use_as(b, "x::m::S", "S3", V::Pub);
+    let u = w.decls.get_mut(&b).and_then(|d| d.uses.last_mut()).expect("the use just written");
+    u.path.kind = crate::PathKind::DollarCrate(crate::tests::crate_key(2));
+    u.path.segments.remove(0);
+    let ok = with_dep(&w, root, dep, CellPlant::None);
+    assert_eq!(named_def(outcome(&ok, root, 0), Namespace::Types), Some(s));
+    assert_eq!(outcome(&ok, root, 1), Outcome::Failed(Unresolved::Private));
+    assert_eq!(named_def(outcome(&ok, root, 2), Namespace::Types), Some(t), "through the dependency's own glob");
+    assert!(matches!(outcome(&ok, root, 3), Outcome::Failed(Unresolved::NotFound)), "{:?}", outcome(&ok, root, 3));
+    assert_eq!(named_def(outcome(&ok, root, 4), Namespace::Types), Some(s), "`::e` is the extern prelude's");
+    assert_eq!(named_def(outcome(&ok, b, 1), Namespace::Types), Some(t), "the dependency's glob layer");
+    assert_eq!(named_def(outcome(&ok, b, 2), Namespace::Types), Some(s), "`$crate` of the dependency");
+    assert!(ok.stats.dep_reads > 0 && ok.stats.dep_absent == 0, "{:?}", ok.stats);
+    let bad = with_dep(&w, root, dep, CellPlant::DepIsOutside);
+    assert_eq!(outcome(&bad, root, 0), Outcome::Outside, "the control DepIsOutside");
+    let bad = with_dep(&w, root, dep, CellPlant::DepGlobEmpty);
+    assert!(matches!(outcome(&bad, b, 1), Outcome::Failed(Unresolved::NotFound)), "the control DepGlobEmpty: {:?}", outcome(&bad, b, 1));
+    let bad = with_dep(&w, root, dep, CellPlant::DollarCrateIsRoot);
+    assert!(matches!(outcome(&bad, b, 2), Outcome::Failed(_)), "the control DollarCrateIsRoot: {:?}", outcome(&bad, b, 2));
+}
+
+/// The `#[macro_use]` prelude read from the dependency's root: a call `mac!()` of the crate
+/// resolves to `e`'s exported `mac`; a call `nope!()` is not found (no longer unknown). Control:
+/// `DepIsOutside` leaves `mac!` unknown.
+#[test]
+fn the_macro_use_prelude_reads_the_dependencys_exports() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let dep = w.root(2, Edition::E2021);
+    let mac = w.rules_with(dep, "mac", true);
+    w.cr(dep).macro_exports.push(("mac", mac, crate::MacroShapes::FN_LIKE));
+    w.dep(root, "e", dep);
+    w.cr(root).macro_use.push(dep);
+    let call = w.call(root, "mac", crate::CallShape::FnLike);
+    let nope = w.call(root, "nope", crate::CallShape::FnLike);
+    let ok = with_dep(&w, root, dep, CellPlant::None);
+    assert!(matches!(ok.call_outcome(call), Some(Outcome::Called(d)) if d.key == mac), "{:?}", ok.call_outcome(call));
+    assert!(matches!(ok.call_outcome(nope), Some(Outcome::Failed(Unresolved::NotFound))), "{:?}", ok.call_outcome(nope));
+    let bad = with_dep(&w, root, dep, CellPlant::DepIsOutside);
+    assert_eq!(bad.call_outcome(call), Some(Outcome::Outside), "the control DepIsOutside");
 }

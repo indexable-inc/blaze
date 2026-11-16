@@ -376,14 +376,55 @@ pub fn step<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, rule: 
     }
 }
 
-/// Fresh variables for an item's generics: a const variable where the portable table names
-/// `ConstParam(i)`, else a type variable (a region parameter is erased on import, so its
-/// variable is never used). `fresh_args_for_item`.
-pub(crate) fn fresh_for<'a, T: Tys>(tys: &mut T, p: Portable<'_>, generics: u32, alloc: Alloc<'a>) -> Result<Vec<Ty, Alloc<'a>>, SolveError> {
-    let mut v = Vec::with_capacity_in(generics as usize, alloc);
-    for i in 0..generics {
-        let is_const = p.nodes.iter().any(|k| *k == TyKind::ConstParam(i));
-        v.push(tys.fresh(if is_const { VarKind::Const } else { VarKind::Ty })?);
+/// Fresh variables for an impl's generics: a const variable where the impl's OWN terms (its
+/// trait arguments, where clauses and associated type values) name `ConstParam(i)`, else a type
+/// variable (a region parameter is erased on import, so its variable is never used; a parameter
+/// none of them names is never read). `fresh_args_for_item`.
+///
+/// It takes the header, never a bare table: a record's table is shared (the world answers each
+/// record in one table that holds every item built so far), so a scan of the whole table read
+/// another item's `ConstParam(i)` as this impl's, and made the impl's type parameter `i` a
+/// const as soon as such an item had been built: the result of checking a body depended on
+/// what was checked before it (tests/front2_order.rs in blaze-ladder).
+pub(crate) fn fresh_for<'a, T: Tys>(tys: &mut T, h: &ImplHeader<'_>, alloc: Alloc<'a>) -> Result<Vec<Ty, Alloc<'a>>, SolveError> {
+    let p = h.portable;
+    let mut roots: Vec<Ty, Alloc<'_>> = Vec::new_in(alloc);
+    let mut list = |l: List, roots: &mut Vec<Ty, Alloc<'_>>| -> Result<(), SolveError> {
+        for i in 0..l.len {
+            let at = l.start + i;
+            let Some(&x) = p.lists.get(at as usize) else {
+                return Err(SolveError::Malformed(Malformed::PortableIndex { node: at, len: p.lists.len() as u32 }));
+            };
+            roots.push(x);
+        }
+        Ok(())
+    };
+    list(h.args, &mut roots)?;
+    for c in h.where_clauses {
+        match *c {
+            Pred::Trait { args, .. } | Pred::HostEffect { args, .. } | Pred::ConstHolds { args, .. } => list(args, &mut roots)?,
+            Pred::Projection { alias: a, term: b }
+            | Pred::NormalizesTo { alias: a, term: b }
+            | Pred::TypeOutlives { ty: a, region: b }
+            | Pred::RegionOutlives { a, b }
+            | Pred::Subtype { a, b }
+            | Pred::Coerce { a, b }
+            | Pred::ConstArgHasType { ct: a, ty: b } => roots.extend([a, b]),
+            Pred::WellFormed(a) | Pred::ConstEvaluatable(a) => roots.push(a),
+            Pred::DynCompatible(_) => {}
+            Pred::Eq { .. } => return Err(SolveError::Malformed(crate::error::bad_pred())),
+        }
+    }
+    roots.extend(h.assoc.iter().map(|a| a.value));
+    let mut is_const: Vec<bool, Alloc<'_>> = Vec::from_elem_in(false, h.generics as usize, alloc);
+    let konst = |k: TyKind| match k {
+        TyKind::ConstParam(x) => Some(x),
+        _ => None,
+    };
+    crate::builtin::params_reached(p, &roots, konst, &mut is_const, alloc)?;
+    let mut v = Vec::with_capacity_in(h.generics as usize, alloc);
+    for c in is_const {
+        v.push(tys.fresh(if c { VarKind::Const } else { VarKind::Ty })?);
     }
     Ok(v)
 }
@@ -434,7 +475,7 @@ fn fresh_header<'a, T: Tys>(
     h: &ImplHeader<'_>,
     alloc: Alloc<'a>,
 ) -> Result<(Vec<Ty, Alloc<'a>>, List), SolveError> {
-    let vars = fresh_for(tys, h.portable, h.generics, alloc)?;
+    let vars = fresh_for(tys, h, alloc)?;
     let args = import_list(tys, s, h.portable, h.args, &vars, alloc)?;
     Ok((vars, args))
 }

@@ -2070,6 +2070,12 @@ impl<'a> Request<'a> {
                 // still lists it; a home re-made without it drops it first.
                 None => {
                     let home = self.jobs.get(&name).map_or(home, |job| job.home);
+                    // A part its settled home lists, opened and found at neither place: a
+                    // finding at its `mod` item; the rest of the crate goes on.
+                    let file = Name::new(Kind::FileItems, self.cond_of(name).0.subject);
+                    if home != name && self.state(home) == Some(State::Settled) && self.absent_files.contains(&file) {
+                        return self.absent_module(name, file, edition, place, out);
+                    }
                     return match self.state(home) {
                         Some(State::Settled) => Err(DriveError::NoFile { file: name, home }),
                         Some(_) => {
@@ -2093,6 +2099,40 @@ impl<'a> Request<'a> {
         job.key = key;
         job.state = State::Decide;
         self.decide(name, out)
+    }
+
+    /// A module file its settled home lists, opened and found at neither of its places: by the
+    /// Reference ("Modules", "Module source filenames") a `mod x;` is read from `x.rs` or else
+    /// `x/mod.rs` (a `#[path]` from its one path). Its record is one finding, placed at the `mod`
+    /// item in the home's file, naming the places looked at; no request error, so the rest of
+    /// the crate is still checked. Keyed by those paths: creating the file gives the part a
+    /// file's key, and a reader that looked for it read it absent (`key::ABSENT`), so reruns.
+    fn absent_module(&mut self, name: Name, file: Name, edition: u8, place: u32, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
+        let home = self.jobs.get(&name).expect("a job").home;
+        let Some(&(at, len, module)) = self.part_paths.get(&file) else {
+            return Err(DriveError::NoFile { file: name, home });
+        };
+        let path = &self.paths[at as usize..(at + len) as usize];
+        let mut message = Vec::with_capacity_in(2 * path.len() + 8, self.alloc);
+        message.extend_from_slice(path);
+        let rule = match module {
+            true => {
+                message.push(0x1f);
+                message.extend_from_slice(path.strip_suffix(b".rs").unwrap_or(path));
+                message.extend_from_slice(b"/mod.rs");
+                MODULE_FILE_MISSING_RULE
+            }
+            false => PATH_FILE_MISSING_RULE,
+        };
+        let source = key::digest("blaze-drive absent module file 1", &message);
+        let job = self.jobs.get_mut(&name).expect("a job");
+        job.locate = Some(Locate::File { edition });
+        job.place = place;
+        job.source = source;
+        job.key = key::task_key(self.config.tool, name, &source);
+        let findings = [Finding { rule, start: 0, end: 0, message: &message }];
+        let output = Output { name, out: source, reads: &[], parts: &[], paths: &[], findings: &findings, payload: &[] };
+        self.made(&output, out)
     }
 
     fn decide(&mut self, name: Name, out: &mut AVec<'_, Effect<'a>>) -> Result<(), DriveError> {
@@ -2336,7 +2376,11 @@ impl<'a> Request<'a> {
         // A file's row keeps the edition it is read in (a repeat that does not run its home finds
         // it there, [`Request::locate`]); its findings are placed in its own text, from 0. Any
         // other name's row and findings keep its start in its home's file.
+        // A module file at neither place ([`Request::absent_module`]): its finding is placed at
+        // its `mod` item in its home's file.
+        let absent = name.kind == Kind::FileItems && self.absent_files.contains(&Name::new(Kind::FileItems, self.cond_of(name).0.subject));
         let (place, held_place) = match (name.kind, job.locate) {
+            (Kind::FileItems, Some(Locate::File { edition })) if absent => (u32::from(edition), job.place),
             (Kind::FileItems, Some(Locate::File { .. })) if self.plant == Plant::EditionAsPlace => (job.place, job.place),
             (Kind::FileItems, Some(Locate::File { edition })) => (u32::from(edition), 0),
             (Kind::FileItems, _) => return Err(DriveError::Unlocated { name }),
@@ -2405,7 +2449,7 @@ impl<'a> Request<'a> {
                         }
                     }
                 }
-                let held = Held { file: file_of(base, home), place: held_place, base, condition, findings: hold(view, a.clone()) };
+                let held = Held { file: if absent { home } else { file_of(base, home) }, place: held_place, base, condition, findings: hold(view, a.clone()) };
                 let is_error = self.config.is_error;
                 let errors = held.findings.iter().filter(|f| is_error(f.rule)).count();
                 self.findings.insert(name, held);
@@ -2925,6 +2969,12 @@ impl<'a> Request<'a> {
 /// The longest message a finding the machine makes holds (it is written in place, no
 /// allocation); a longer one is cut at an ASCII boundary.
 const MESSAGE_BYTES: usize = 192;
+
+/// The rule of a `mod x;` whose file is at neither `x.rs` nor `x/mod.rs` (arguments: the two
+/// paths, `\x1f` between); an error under every command.
+pub const MODULE_FILE_MISSING_RULE: u16 = 0xC0F7;
+/// The rule of a `#[path]` module whose file is not in the checkout (argument: the path).
+pub const PATH_FILE_MISSING_RULE: u16 = 0xC0F8;
 
 /// The over-cap finding's text: [`ConditionError::OverCap`] with the variables the item reads,
 /// `var` included.

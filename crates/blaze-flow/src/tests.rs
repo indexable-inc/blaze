@@ -304,10 +304,10 @@ fn tiers_control_tier_two_reversed() {
     control(Config::cases(5000), Plant::None, Plant::TierTwoReversed, "tier one accepted", tiers_case);
 }
 
-/// Planted in tier one: the subset graph closed one step only.
+/// Planted in tier one: contained loans not closed over the subset graph.
 #[test]
-fn tiers_control_tier_one_one_step() {
-    control(Config::cases(5000),Plant::None, Plant::TierOneOneStep, "tier one accepted", tiers_case);
+fn tiers_control_tier_one_unclosed() {
+    control(Config::cases(5000), Plant::None, Plant::TierOneUnclosed, "tier one accepted", tiers_case);
 }
 
 // ---------------------------------------------------------------- fixtures: the Reference's moves

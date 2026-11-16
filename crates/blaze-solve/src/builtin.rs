@@ -1208,39 +1208,55 @@ fn step_struct_unsize<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &Cand) 
 /// parents in a portable table, so one backward pass from `root` over a reachability mark
 /// visits each node once (no recursion).
 fn portable_params(p: Portable<'_>, root: Ty, out: &mut Vec<bool, Alloc<'_>>, alloc: Alloc<'_>) -> Result<(), Stop> {
+    let any = |k: TyKind| match k {
+        TyKind::Param(x) | TyKind::ConstParam(x) => Some(x),
+        _ => None,
+    };
+    params_reached(p, &[root], any, out, alloc).map_err(Stop::Error)
+}
+
+/// Marks in `out` every parameter `which` picks among the nodes of `p` the `roots` reach, and
+/// no other node of `p`: a record's table may hold other items' terms, over other parameters
+/// (fold.rs `import`). One backward pass over a reachability mark (no recursion).
+pub(crate) fn params_reached(
+    p: Portable<'_>,
+    roots: &[Ty],
+    which: fn(TyKind) -> Option<u32>,
+    out: &mut [bool],
+    alloc: Alloc<'_>,
+) -> Result<(), SolveError> {
     let len = p.nodes.len();
-    let r = root.0 as usize;
-    if r >= len {
-        return Err(Stop::Error(SolveError::Malformed(Malformed::PortableIndex { node: root.0, len: len as u32 })));
+    let Some(top) = roots.iter().map(|t| t.0 as usize).max() else { return Ok(()) };
+    if top >= len {
+        return Err(SolveError::Malformed(Malformed::PortableIndex { node: top as u32, len: len as u32 }));
     }
-    let mut reach: Vec<bool, Alloc<'_>> = Vec::from_elem_in(false, r + 1, alloc);
-    reach[r] = true;
-    for i in (0..=r).rev() {
+    let mut reach: Vec<bool, Alloc<'_>> = Vec::from_elem_in(false, top + 1, alloc);
+    for t in roots {
+        reach[t.0 as usize] = true;
+    }
+    for i in (0..=top).rev() {
         if !reach[i] {
             continue;
         }
         let k = p.nodes[i];
-        if let TyKind::Param(x) | TyKind::ConstParam(x) = k
+        if let Some(x) = which(k)
             && let Some(slot) = out.get_mut(x as usize)
         {
             *slot = true;
         }
-        let mut mark = |c: Ty| -> Result<(), Stop> {
+        let mut mark = |c: Ty| -> Result<(), SolveError> {
             let ci = c.0 as usize;
             if ci >= i {
-                return Err(Stop::Error(SolveError::Malformed(Malformed::PortableIndex { node: c.0, len: i as u32 })));
+                return Err(SolveError::Malformed(Malformed::PortableIndex { node: c.0, len: i as u32 }));
             }
             reach[ci] = true;
             Ok(())
         };
-        let list = |l: List, mark: &mut dyn FnMut(Ty) -> Result<(), Stop>| -> Result<(), Stop> {
+        let list = |l: List, mark: &mut dyn FnMut(Ty) -> Result<(), SolveError>| -> Result<(), SolveError> {
             for j in 0..l.len {
                 let at = (l.start + j) as usize;
                 let Some(&c) = p.lists.get(at) else {
-                    return Err(Stop::Error(SolveError::Malformed(Malformed::PortableIndex {
-                        node: at as u32,
-                        len: p.lists.len() as u32,
-                    })));
+                    return Err(SolveError::Malformed(Malformed::PortableIndex { node: at as u32, len: p.lists.len() as u32 }));
                 };
                 mark(c)?;
             }

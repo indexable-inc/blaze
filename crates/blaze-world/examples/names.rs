@@ -462,12 +462,167 @@ struct Timed<'w> {
     lines: AtomicU64,
     bytes: AtomicU64,
     files: AtomicU64,
+    /// `--records`: by crate, each checkout file (tree 0) its solve read, in order of reading.
+    /// A fetched or toolchain file is under the crate's key, so it is not listed.
+    read: Vec<std::sync::Mutex<Vec<&'static str>>>,
+}
+
+/// `--records <folder>`: each crate's two records kept between runs, one file a crate
+/// (`<hex of its key>`), with its read list: each checkout file its solve read and that file's
+/// surface (`blaze_file_items::Outline::surface`; an absent file: zeros), then each crate whose
+/// exports record it was handed, by key, with that record's digest. A crate is found when every
+/// surface and every digest is the same today: a body edit moves no surface, a private item
+/// moves its own crate's surface only, and its dependents see its exports digest unchanged.
+struct KeptDir<'w> {
+    dir: PathBuf,
+    /// The same texts the ready queue's workers read at once (`Texts` holds a `dyn Tree` that is
+    /// not marked `Sync`; it is read from every worker already): [`OnGlobal`].
+    texts: OnGlobal<&'w Timed<'w>>,
+    inputs: &'w [CrateInput<'static>],
+    by_key: std::collections::HashMap<blaze_id::CrateItemKey, usize>,
+    found: AtomicUsize,
+    /// Time inside `find`, summed over workers, and the checkout files it outlined there.
+    find_ns: AtomicU64,
+    outlined: AtomicU64,
+    /// By crate: why it was not found (`None`: found, or not asked).
+    missed: Vec<std::sync::Mutex<Option<String>>>,
+}
+
+const KEPT_MAGIC: &[u8; 8] = b"BZKEPT1\0";
+
+impl KeptDir<'_> {
+    fn path(&self, krate: usize) -> PathBuf {
+        let key = self.inputs[krate].key.0.0;
+        self.dir.join(key.iter().map(|b| format!("{b:02x}")).collect::<String>())
+    }
+
+    /// A checkout file's surface today: zeros when absent.
+    fn surface(&self, krate: usize, path: &str) -> [u8; 32] {
+        self.outlined.fetch_add(1, Ordering::Relaxed);
+        match self.texts.inner.read(krate, path) {
+            Some(text) => blaze_file_items::outline(text, self.inputs[krate].edition, g()).surface().0,
+            None => [0; 32],
+        }
+    }
+
+    fn miss(&self, krate: usize, why: String) -> Option<(&[u8], &[u8])> {
+        *self.missed[krate].lock().unwrap_or_else(|p| panic!("crate {krate}'s miss lock was poisoned: {p}")) = Some(why);
+        None
+    }
+}
+
+/// A cursor over a kept file: each read names the file and the field it was after.
+struct KeptRead<'b> {
+    bytes: &'b [u8],
+    at: usize,
+    file: &'b FsPath,
+}
+
+impl<'b> KeptRead<'b> {
+    fn take(&mut self, n: usize, what: &str) -> &'b [u8] {
+        let Some(part) = self.bytes.get(self.at..self.at + n) else {
+            panic!("kept record {}: cut short at byte {} reading {what} ({n} bytes)", self.file.display(), self.at);
+        };
+        self.at += n;
+        part
+    }
+
+    fn u32(&mut self, what: &str) -> usize {
+        u32::from_le_bytes(self.take(4, what).try_into().expect("four bytes")) as usize
+    }
+
+    fn u64(&mut self, what: &str) -> usize {
+        u64::from_le_bytes(self.take(8, what).try_into().expect("eight bytes")) as usize
+    }
+
+    fn id(&mut self, what: &str) -> [u8; 32] {
+        self.take(32, what).try_into().expect("32 bytes")
+    }
+}
+
+impl blaze_scope::crate_scope::Kept for KeptDir<'_> {
+    fn find(&self, krate: usize, exports: &dyn Fn(usize) -> Option<blaze_id::ContentId>) -> Option<(&[u8], &[u8])> {
+        let start = Instant::now();
+        let file = self.path(krate);
+        let bytes: &'static [u8] = match std::fs::read(&file) {
+            Ok(bytes) => Vec::leak(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return self.miss(krate, "no kept record".into()),
+            Err(e) => panic!("kept record {}: {e}", file.display()),
+        };
+        let file: &'static FsPath = Box::leak(file.into_boxed_path());
+        let mut r = KeptRead { bytes, at: 0, file };
+        assert!(r.take(8, "the magic") == KEPT_MAGIC, "kept record {}: not a kept record (its magic)", file.display());
+        let mut why = None;
+        for _ in 0..r.u32("the file count") {
+            let len = r.u32("a path's length");
+            let path = std::str::from_utf8(r.take(len, "a path")).unwrap_or_else(|e| panic!("kept record {}: a path not UTF-8: {e}", file.display()));
+            let was = r.id("a surface");
+            if why.is_none() && self.surface(krate, path) != was {
+                why = Some(format!("the surface of {path} moved"));
+            }
+        }
+        for _ in 0..r.u32("the read count") {
+            let key = blaze_id::CrateItemKey(blaze_id::ContentId(r.id("a crate key")));
+            let was = r.id("an exports digest");
+            if why.is_none() {
+                match self.by_key.get(&key) {
+                    None => why = Some("a crate it read is not in the graph".into()),
+                    Some(&g) => match exports(g) {
+                        None => why = Some(format!("`{}`'s exports not written yet", self.inputs[g].name)),
+                        Some(now) if now.0 != was => why = Some(format!("`{}`'s exports changed", self.inputs[g].name)),
+                        Some(_) => {}
+                    },
+                }
+            }
+        }
+        let len = r.u64("the exports length");
+        let record = r.take(len, "the exports record");
+        let len = r.u64("the inner length");
+        let inner = r.take(len, "the inner record");
+        self.find_ns.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        if let Some(why) = why {
+            return self.miss(krate, why);
+        }
+        self.found.fetch_add(1, Ordering::Relaxed);
+        Some((record, inner))
+    }
+
+    fn made(&self, krate: usize, record: &[u8], inner: &[u8], read: &[(usize, blaze_id::ContentId)]) {
+        let files: Vec<&'static str> = self.texts.read[krate].lock().unwrap_or_else(|p| panic!("crate {krate}'s read list lock was poisoned: {p}")).clone();
+        let mut out = Vec::with_capacity(64 + record.len() + inner.len());
+        out.extend_from_slice(KEPT_MAGIC);
+        out.extend_from_slice(&(files.len() as u32).to_le_bytes());
+        for path in &files {
+            out.extend_from_slice(&(path.len() as u32).to_le_bytes());
+            out.extend_from_slice(path.as_bytes());
+            out.extend_from_slice(&self.surface(krate, path));
+        }
+        out.extend_from_slice(&(read.len() as u32).to_le_bytes());
+        for &(g, digest) in read {
+            out.extend_from_slice(&self.inputs[g].key.0.0);
+            out.extend_from_slice(&digest.0);
+        }
+        out.extend_from_slice(&(record.len() as u64).to_le_bytes());
+        out.extend_from_slice(record);
+        out.extend_from_slice(&(inner.len() as u64).to_le_bytes());
+        out.extend_from_slice(inner);
+        let path = self.path(krate);
+        let part = path.with_extension("part");
+        std::fs::write(&part, &out).unwrap_or_else(|e| panic!("kept record {}: {e}", part.display()));
+        std::fs::rename(&part, &path).unwrap_or_else(|e| panic!("kept record {}: {e}", path.display()));
+    }
 }
 
 impl SourceTexts<'static> for Timed<'_> {
     fn read(&self, krate: usize, path: &str) -> Option<&'static str> {
         let ns = self.start.elapsed().as_nanos() as u64 + 1;
         let _ = self.first[krate].compare_exchange(0, ns, Ordering::Relaxed, Ordering::Relaxed);
+        if path.starts_with("/0/") {
+            let mut read = self.read[krate].lock().unwrap_or_else(|p| panic!("crate {krate}'s read list lock was poisoned: {p}"));
+            if !read.iter().any(|p| *p == path) {
+                read.push(Box::leak(path.to_owned().into_boxed_str()));
+            }
+        }
         let before = owners::set(owners::SOURCE);
         let text = self.inner.read(krate, path);
         owners::set(before);
@@ -1065,6 +1220,10 @@ fn main() {
     }
 
     let shuffle = args.iter().any(|a| a == "--shuffle");
+    let kept_dir: Option<PathBuf> = flag("--records").map(PathBuf::from);
+    if let Some(dir) = &kept_dir {
+        std::fs::create_dir_all(dir).unwrap_or_else(|e| panic!("--records {}: {e}", dir.display()));
+    }
     let mut first_records: Option<Vec<(Vec<u8>, Vec<u8>)>> = None;
     for (run, &t) in threads.iter().enumerate() {
         let texts = Timed {
@@ -1075,6 +1234,7 @@ fn main() {
             lines: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
             files: AtomicU64::new(0),
+            read: (0..world.crates.len()).map(|_| std::sync::Mutex::new(Vec::new())).collect(),
         };
         let texts: &'static Timed<'static> = Box::leak(Box::new(texts));
         let inputs: &'static [CrateInput<'static>] = world.inputs(g()).leak();
@@ -1106,6 +1266,57 @@ fn main() {
             }
             r
         });
+        // `--records <folder>`: found or solved, crate by crate; the counts below need every
+        // crate's tables, so this run prints what was found and solved and the times only.
+        if let Some(dir) = kept_dir.as_ref() {
+            let kept = KeptDir {
+                dir: dir.clone(),
+                texts: OnGlobal(texts),
+                inputs,
+                by_key: inputs.iter().enumerate().map(|(i, c)| (c.key, i)).collect(),
+                found: AtomicUsize::new(0),
+                find_ns: AtomicU64::new(0),
+                outlined: AtomicU64::new(0),
+                missed: (0..inputs.len()).map(|_| std::sync::Mutex::new(None)).collect(),
+            };
+            let ready = blaze_scope::crate_scope::Ready { workers: t, rank: rank.as_deref(), wait: Duration::from_secs(1200), hooks: &clock };
+            let all = blaze_scope::crate_scope::resolve_kept(inputs, world.sysroot, texts, &Threads(t), &ready, &kept, g());
+            let elapsed = start.elapsed();
+            let (all, needs) = match all {
+                Ok(all) => all,
+                Err((at, e)) => {
+                    println!("threads {t}: no names after {:.1} ms: crate `{}`: {e:?}", ms(elapsed), inputs[at].name);
+                    continue;
+                }
+            };
+            let solved: Vec<usize> = (0..all.len()).filter(|&i| matches!(all[i], blaze_scope::crate_scope::Solved::Solved(_))).collect();
+            let work: u64 = clock.spans.iter().map(|(b, e)| e.load(Ordering::Relaxed).saturating_sub(b.load(Ordering::Relaxed))).sum();
+            let solve_work: u64 = solved.iter().map(|&i| clock.spans[i].1.load(Ordering::Relaxed).saturating_sub(clock.spans[i].0.load(Ordering::Relaxed))).sum();
+            println!(
+                "\nthreads {t}: records {}: {} crates in {:.1} ms: found {}, solved {}; work {:.1} ms (solving {:.1} ms; finding {:.1} ms, {} checkout files outlined); files read by solves {}; Need re-entries {needs}; peak footprint so far {:.1} MB",
+                dir.display(),
+                all.len(),
+                ms(elapsed),
+                kept.found.load(Ordering::Relaxed),
+                solved.len(),
+                work as f64 / 1e6,
+                solve_work as f64 / 1e6,
+                kept.find_ns.load(Ordering::Relaxed) as f64 / 1e6,
+                kept.outlined.load(Ordering::Relaxed),
+                texts.files.load(Ordering::Relaxed),
+                max_footprint() as f64 / 1e6
+            );
+            let mut whys: BTreeMap<String, Vec<&str>> = BTreeMap::new();
+            for &i in &solved {
+                let why = kept.missed[i].lock().unwrap_or_else(|p| panic!("miss lock poisoned: {p}")).clone().unwrap_or_else(|| "not asked".into());
+                let kind = why.split('`').next().unwrap_or("").trim().to_string();
+                whys.entry(if kind.is_empty() { why } else { kind }).or_default().push(inputs[i].name);
+            }
+            for (why, crates) in &whys {
+                println!("  solved because {why}: {} (e.g. {})", crates.len(), crates.iter().take(12).copied().collect::<Vec<_>>().join(", "));
+            }
+            continue;
+        }
         let names = if per_crate {
             let ready = blaze_scope::crate_scope::Ready { workers: t, rank: rank.as_deref(), wait: Duration::from_secs(1200), hooks: &clock };
             match blaze_scope::crate_scope::resolve_by_records(inputs, world.sysroot, texts, &Threads(t), &ready, g()) {

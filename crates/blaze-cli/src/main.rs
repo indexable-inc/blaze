@@ -1214,7 +1214,8 @@ mod tests {
         write(&io, "src/big.rs", &functions(10));
         let fixed = check(&io, SMALL);
         assert!(fixed.failed.is_empty(), "{:?}", fixed.failed);
-        assert_eq!(fixed.runs, 2, "only the failed file's task runs again, and its new surface:\n{}", fixed.profile);
+        // As in `a_planted_panic_fails_one_task`: outline, surface, the crate's names (4 entries).
+        assert_eq!(fixed.runs, 6, "only the failed file's task runs again, its new surface and its crate's names:\n{}", fixed.profile);
         let again = check(&io, SMALL);
         assert!(again.certified && again.runs == 0);
     }
@@ -1233,7 +1234,10 @@ mod tests {
         assert_eq!(body.runs, 1, "a body edit runs its file's outline alone");
         write(&io, "src/m3.rs", &functions(100).replace("fn f00003() {}", "fn f00003(_x: u8) { let _x = 1; }"));
         let signature = check(&io, SMALL);
-        assert_eq!(signature.runs, 2, "a signature edit runs its file's outline and its surface:\n{}", signature.profile);
+        // Entries, not tasks: the outline, the surface, and the crate's `CrateScope` twice (its
+        // first entry answers `Need` of the moved surface, the second resolves; profile of
+        // 2026-11-16: "CrateScope ... entries 2 needs 1").
+        assert_eq!(signature.runs, 4, "a signature edit runs its file's outline, its surface and its crate's names (two entries):\n{}", signature.profile);
     }
 
     /// The project's own BINARY reruns its names after a signature edit (the stale answer of
@@ -1268,6 +1272,8 @@ mod tests {
         assert!(matches!(failure.why, Why::Panicked { .. }), "{failure:?}");
         let fixed = check(&io, SMALL);
         assert!(fixed.failed.is_empty());
-        assert_eq!(fixed.runs, 2, "only the panicked file's task runs again, and its surface, never made:\n{}", fixed.profile);
+        // The file's outline, its surface, and the crate's names, failed `Waited` last time:
+        // made fresh in 4 entries (`Need` of the graph, then of its files' surfaces).
+        assert_eq!(fixed.runs, 6, "only the panicked file's task runs again, its surface and its crate's names, never made:\n{}", fixed.profile);
     }
 }

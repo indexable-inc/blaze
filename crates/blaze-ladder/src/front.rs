@@ -2782,7 +2782,7 @@ impl World for FrontWorld<'_, '_> {
                     trait_args: i.trait_args,
                     assoc_types: &i.assoc,
                     types: self.front.tys.view(),
-                    polarity: i.polarity,
+                    polarity: blaze_typeck::ImplPolarity::Positive,
                 }))
     }
 

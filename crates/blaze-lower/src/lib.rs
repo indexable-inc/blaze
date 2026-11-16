@@ -1,5 +1,32 @@
 //! # For a successor
 //!
+//! State (2026-11-16, ~13:00, relay runner after the one below; budget spent, handing on).
+//! FIRST (coordinator, ahead of everything): a `panic!`/`assert!` in any crate OTHER than core
+//! leaves `$crate::panicking::panic_fmt` unresolved (front2_panics.rs, user crate on
+//! blaze-2026.11: `UnresolvedPath`, hash 8263167416644613366 = `Name::of("panic_fmt")`; bstd
+//! env.rs:74 E0425, hash 9982642335519403907: print it). NOT STARTED. Suspects: the `$crate`
+//! mark of a path written by the second-level expansion (`panic!` -> `panic_2021!`); a body's
+//! by-name `$crate` lookup starting in the user crate; a visibility test on `core::panicking`.
+//! Fixture of two crates, then `lanecheck.sh blaze-ladder test "--test front2_panics"`.
+//! STEP 1 (pattern types) WRITTEN, COMPILES, NOT YET TESTED: `TypeRef::Pat { base, pat: TyPat }`
+//! (form.rs, tag 14, flag bit 8 = `TyPat::NotNull`, else `TyPat::Of(PatId)`); machine.rs lowers
+//! `PATTERN_TYPE` to it and `NOT_NULL` to a `V::Tok(NOT_NULL)` value; blaze-surface
+//! `BuiltinFn::PatternType = 26`; blaze-expand builtin.rs `pattern_type` writes
+//! `builtin # pattern_type(input)`; `lower_type_text_expanding` (type_text.rs); dump.rs arm.
+//! front2: pattern_ty.rs rewritten (`macro_ty` expands a SIGNATURE's type macro from its own
+//! text with `Scoped { prepared: None }` + body.rs's `NoHost` (made `pub(super)`), refuses a
+//! leftover macro; `pat_ty` reads `TypeRef::Pat`, the pattern's text through
+//! `parse_pattern_type`); types.rs dispatch + `children` arms; front.rs refuses `Pat`.
+//! `lanecheck.sh blaze-ladder` compiled everything but front2_checks.rs:86 (E0308, array size
+//! 30 vs 29: the second checker lane's test file, not this change). Owed: run blaze-lower's
+//! suite (new fixture `a_pattern_type_expands_to_its_one_form` in expand_tests.rs; run it once
+//! with the `PATTERN_TYPE` arm removed and quote the failure), front2_items/main/bounds, the
+//! census (failed-by-macro-4.txt), and ONE message to the ITEMS lane (pattern_ty.rs ported).
+//! Step 2 survey: the edition_panic flag needs `DefAt.edition_panic` (built in blaze-scope
+//! resolve.rs:1995 from `MacroSrc`, whose record in crate_scope.rs:246/593 must carry it), and
+//! `Mark` (blaze-expand tokens.rs:265) a `panic_edition` set from the call's when the def has
+//! the flag; by_name.rs:449 then reads `mark.panic_edition`. Steps 3-5 not started.
+//!
 //! State (2026-11-16, ~11:30, relay runner after the one below). DONE: (1) D60 includes: blaze-
 //! expand `ReadRoot { origin: SourceOrigin, package }` given per unit by the host;
 //! `include_target(root, folder, written)` gives root-relative segments, bound = whole root for

@@ -211,11 +211,19 @@ pub struct Flow<A: Allocator> {
     pub local_origins: Vec<(Local, Origin), A>,
     /// Known `from: into` between placeholders (the signature's bounds).
     pub known: Vec<(Origin, Origin), A>,
+    /// Each local's own place: `Place(l)` for the locals the builder was made with, a later row
+    /// for a local added while lowering ([`FlowBuilder::add_local`]).
+    pub local_places: Vec<Place, A>,
 }
 
 impl<A: Allocator> Flow<A> {
     pub fn place(&self, p: Place) -> PlaceRow {
         self.places[p.index()]
+    }
+
+    /// The place that is local `l` itself.
+    pub fn local_place(&self, l: Local) -> Place {
+        self.local_places[l.index()]
     }
 
     pub fn stmt(&self, s: Stmt) -> StmtRow {
@@ -398,7 +406,9 @@ impl<A: Allocator + Clone> FlowBuilder<A> {
     /// A body of `locals` locals, of which `1..=args` are arguments (`Local(0)` returns).
     pub fn new_in(locals: u32, args: u32, alloc: A) -> FlowBuilder<A> {
         let mut places = Vec::new_in(alloc.clone());
+        let mut local_places = Vec::new_in(alloc.clone());
         for l in 0..locals {
+            local_places.push(Place(l));
             places.push(PlaceRow {
                 local: Local(l),
                 parent: None,
@@ -423,6 +433,7 @@ impl<A: Allocator + Clone> FlowBuilder<A> {
                 placeholder: Vec::new_in(alloc.clone()),
                 local_origins: Vec::new_in(alloc.clone()),
                 known: Vec::new_in(alloc.clone()),
+                local_places,
             },
             filled: Vec::new_in(alloc),
             open: None,
@@ -431,7 +442,16 @@ impl<A: Allocator + Clone> FlowBuilder<A> {
     }
 
     pub fn local(&self, l: u32) -> Place {
-        Place(l)
+        self.flow.local_places[l as usize]
+    }
+
+    /// A new local (a temporary or a binding found while lowering): its place is a new row.
+    pub fn add_local(&mut self) -> Local {
+        let l = Local(self.flow.locals);
+        self.flow.locals += 1;
+        self.flow.places.push(PlaceRow { local: l, parent: None, proj: None, depth: 0, of_drop_type: false });
+        self.flow.local_places.push(Place(self.flow.places.len() as u32 - 1));
+        l
     }
 
     /// The place `parent` projected by `proj`, interned: one id per distinct place.

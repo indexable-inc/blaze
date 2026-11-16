@@ -65,7 +65,10 @@ pub fn framed(
     frame: &Frame,
     out: &Out,
 ) -> Result<(), CliError> {
-    let area = if finding.rule == OVER_CAP_RULE { Area::Drive } else { Area::Cli };
+    let area = match finding.rule {
+        OVER_CAP_RULE | MODULE_FILE_MISSING_RULE | PATH_FILE_MISSING_RULE => Area::Drive,
+        _ => Area::Cli,
+    };
     let message = core::str::from_utf8(&finding.message).map_err(|_| CliError::Text { what: "a finding's message is not UTF-8" })?;
     let Some(path) = path else {
         // A text-less crate's finding: no source to draw, its name is its place.

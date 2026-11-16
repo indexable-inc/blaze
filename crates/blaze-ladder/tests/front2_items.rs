@@ -232,6 +232,25 @@ fn main() {}
     assert!(got[2].1.contains("a candidate of this question, has a refused header") && got[2].1.contains("src/main.rs:4"), "{got:?}");
 }
 
+/// A negative impl is a head with its polarity (rustc's `negative_impls`, which core uses for
+/// `impl<T: ?Sized> !Send for *const T`): `S: Send` with `impl !Send for S` does not hold
+/// (E0277), `u8: Send` does. Before the fix the head was refused "a negative impl".
+#[test]
+fn a_negative_impl_is_a_head() {
+    const TEXT: &str = "#![feature(negative_impls)]
+struct S;
+impl !Send for S {}
+fn need<T: Send>(_t: T) {}
+fn holds() { need(1u8) }
+fn not_send() { need(S) }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["holds", "not_send"]);
+    println!("negative: {got:?}");
+    assert_eq!(got[0].1, "clean", "{got:?}");
+    assert!(got[1].1.starts_with("diags") && got[1].1.contains("E0277"), "{got:?}");
+}
+
 /// Reduction probe for the census's `Malformed/Sort` (bstd::blobs `from_key`).
 #[test]
 fn sort_probe() {
