@@ -18,7 +18,7 @@ const PASSING: &[&str] = &["1-empty", "2-exit", "3-hello", "4-modules", "5-gener
 
 /// front2's own programs (ladder/front2/*/): each one seam of the run path no rung covers.
 /// The old ladder's `&dyn` rung (no_core) runs here too: front2's vtables, placed.
-const OWN: &[&str] = &["7b-dyn", "front2/f1-defaults", "front2/f2-generic-self", "front2/f3-dyn"];
+const OWN: &[&str] = &["7b-dyn", "front2/f1-defaults", "front2/f2-generic-self", "front2/f3-dyn", "front2/f4-assoc", "front2/f5-closures", "front2/f6-literals"];
 
 fn capture(f: impl FnOnce() -> u8) -> (u8, Vec<u8>) {
     let mut fds = [0; 2];

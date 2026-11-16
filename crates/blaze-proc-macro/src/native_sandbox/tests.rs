@@ -1,0 +1,167 @@
+//! Confinement is proven by a hostile script, never by reading (D65, rule 9): this test binary
+//! runs itself inside the sandbox as the script (`hostile_child`), which tries one thing out of
+//! its grant; each attempt must fail confined and succeed with the confinement planted off.
+
+use std::{path::PathBuf, time::Duration};
+
+use blaze_build_script::native::Grant;
+use blaze_own::Alloc;
+
+use super::{NativeRefusal, NativeRun, Plant, run_planted};
+
+const ATTEMPT: &str = "BLAZE_D65_ATTEMPT";
+
+/// The hostile script: does what `BLAZE_D65_ATTEMPT` says and prints what happened. Run
+/// directly (no variable) it does nothing.
+#[test]
+fn hostile_child() {
+    let Ok(attempt) = std::env::var(ATTEMPT) else { return };
+    let (verb, arg) = attempt.split_once(' ').expect("verb and argument");
+    let result: Result<(), std::string::String> = match verb {
+        "read" => std::fs::read(arg).map(drop).map_err(|e| e.to_string()),
+        "write" => std::fs::write(arg, b"escaped").map_err(|e| e.to_string()),
+        "connect" => std::net::TcpStream::connect(arg).map(drop).map_err(|e| e.to_string()),
+        "exec" => std::process::Command::new(arg).output().map(drop).map_err(|e| e.to_string()),
+        "sleep" => {
+            std::thread::sleep(Duration::from_millis(arg.parse().expect("milliseconds")));
+            Ok(())
+        }
+        other => panic!("unknown attempt {other}"),
+    };
+    match result {
+        Ok(()) => println!("ATTEMPT {verb} ok"),
+        Err(e) => println!("ATTEMPT {verb} denied: {e}"),
+    }
+}
+
+struct Place {
+    root: PathBuf,
+    package: std::string::String,
+    out: std::string::String,
+    outside: std::string::String,
+}
+
+fn place(name: &str) -> Place {
+    let root = std::env::temp_dir().join(format!("blaze-d65-{}-{name}", std::process::id()));
+    _ = std::fs::remove_dir_all(&root);
+    for dir in ["package", "out", "outside"] {
+        std::fs::create_dir_all(root.join(dir)).expect("a test folder");
+    }
+    let root = root.canonicalize().expect("the folder's real path");
+    std::fs::write(root.join("outside/canary.txt"), b"canary").expect("the canary");
+    std::fs::write(root.join("package/build.rs"), b"fn main() {}").expect("a package file");
+    let text = |dir: &str| root.join(dir).to_str().expect("a UTF-8 temp path").to_owned();
+    Place { package: text("package"), out: text("out"), outside: text("outside"), root }
+}
+
+/// The hostile script's line for `attempt`, run with `plant`.
+fn attempt(place: &Place, attempt: &str, deadline: Duration, plant: Plant) -> Result<std::string::String, NativeRefusal> {
+    let exe = std::env::current_exe().expect("the test binary").canonicalize().expect("its real path");
+    let exe = exe.to_str().expect("a UTF-8 path");
+    let reads = [place.package.as_str()];
+    let writes = [place.out.as_str()];
+    let run = NativeRun {
+        grant: Grant { program: exe, exec: &[], read: &reads, write: &writes },
+        args: &["--exact", "native_sandbox::tests::hostile_child", "--nocapture", "--test-threads=1"],
+        env: &[(ATTEMPT, attempt)],
+        dir: &place.package,
+        deadline,
+    };
+    let ran = run_planted(&run, plant, Alloc::global())?;
+    let stdout = std::string::String::from_utf8_lossy(&ran.stdout);
+    // libtest prints its own `test .. ` before the line on the same row.
+    let line = stdout.lines().find_map(|l| l.find("ATTEMPT ").map(|at| l[at..].to_owned()));
+    Ok(line.unwrap_or_else(|| format!("no line: code {:?}: {stdout} {}", ran.code, std::string::String::from_utf8_lossy(&ran.stderr))))
+}
+
+const LONG: Duration = Duration::from_secs(20);
+
+/// Each attempt confined and planted off; `confined` must say denied, `off` ok.
+fn hostile(name: &str, make: impl Fn(&Place) -> std::string::String) {
+    let place = place(name);
+    let what = make(&place);
+    let confined = attempt(&place, &what, LONG, Plant::None).expect("the confined run");
+    let off = attempt(&place, &what, LONG, Plant::NoConfinement).expect("the planted run");
+    println!("{name}: confined: {confined}");
+    println!("{name}: planted off: {off}");
+    assert!(confined.contains(" denied: "), "{name}: confined: {confined}");
+    assert!(off.ends_with(" ok"), "{name}: planted off: {off}");
+    _ = std::fs::remove_dir_all(&place.root);
+    quote(&format!("{name}: confined: {confined} | planted off: {off}"));
+}
+
+/// With `BLAZE_D65_QUOTE` set, a passing test fails with its lines, so a run that shows only
+/// failures shows them (evidence for the lane's report); unset, nothing.
+fn quote(lines: &str) {
+    if std::env::var_os("BLAZE_D65_QUOTE").is_some() {
+        panic!("QUOTE {lines}");
+    }
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "the Linux sandbox's tests run on the VM: remove this on Linux")]
+fn a_native_script_cannot_read_outside_its_inputs() {
+    hostile("read", |p| format!("read {}/canary.txt", p.outside));
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "the Linux sandbox's tests run on the VM: remove this on Linux")]
+fn a_native_script_cannot_write_outside_out_dir() {
+    hostile("write", |p| format!("write {}/escaped.txt", p.outside));
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "the Linux sandbox's tests run on the VM: remove this on Linux")]
+fn a_native_script_cannot_open_a_socket() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback listener");
+    let address = listener.local_addr().expect("its address");
+    hostile("connect", |_| format!("connect {address}"));
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "the Linux sandbox's tests run on the VM: remove this on Linux")]
+fn a_native_script_cannot_start_a_program_it_was_not_granted() {
+    hostile("exec", |_| "exec /bin/echo".to_owned());
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "the Linux sandbox's tests run on the VM: remove this on Linux")]
+fn a_native_script_inside_its_grant_reads_its_package_and_writes_out_dir() {
+    let place = place("inside");
+    let read = attempt(&place, &format!("read {}/build.rs", place.package), LONG, Plant::None).expect("a run");
+    let write = attempt(&place, &format!("write {}/made.rs", place.out), LONG, Plant::None).expect("a run");
+    println!("inside: {read}; {write}");
+    assert_eq!((read.as_str(), write.as_str()), ("ATTEMPT read ok", "ATTEMPT write ok"));
+    _ = std::fs::remove_dir_all(&place.root);
+}
+
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "the Linux sandbox's tests run on the VM: remove this on Linux")]
+fn a_native_script_does_not_outlive_its_deadline() {
+    let place = place("deadline");
+    let short = Duration::from_millis(1500);
+    let confined = attempt(&place, "sleep 6000", short, Plant::None);
+    let off = attempt(&place, "sleep 6000", short, Plant::NoDeadline);
+    println!("deadline: confined: {confined:?}");
+    println!("deadline: planted off: {off:?}");
+    assert!(matches!(confined, Err(NativeRefusal::Deadline { .. })), "{confined:?}");
+    assert!(matches!(off.as_deref(), Ok("ATTEMPT sleep ok")), "{off:?}");
+    _ = std::fs::remove_dir_all(&place.root);
+    quote(&format!("deadline: confined: {} | planted off: {off:?}", confined.map_err(|e| e.to_string()).err().unwrap_or_default()));
+}
+
+#[test]
+fn a_grant_that_cannot_be_said_runs_nothing() {
+    let place = place("unsayable");
+    let reads = ["/tmp/../etc"];
+    let run = NativeRun {
+        grant: Grant { program: "/bin/echo", exec: &[], read: &reads, write: &[] },
+        args: &[],
+        env: &[],
+        dir: &place.package,
+        deadline: LONG,
+    };
+    let refused = run_planted(&run, Plant::None, Alloc::global());
+    assert!(matches!(&refused, Err(NativeRefusal::Grant { why }) if why.contains("/tmp/../etc")), "{refused:?}");
+    _ = std::fs::remove_dir_all(&place.root);
+}

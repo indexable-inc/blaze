@@ -45,6 +45,11 @@ fn world() -> (Fx, Items) {
     let mut fx = Fx::new();
     let sized = fx.tr("Sized", 1, Vec::new(), &[]);
     fx.lang(LangItem::Sized, sized);
+    // `Copy` and core's `impl Copy for u8`: a capture used by value is a copy, not a move.
+    let copy = fx.tr("Copy", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Copy, copy);
+    let u8_c = fx.ty(PNode::Uint(UintTy::U8));
+    fx.imp("impl Copy for u8", 0, u8_c, Some((copy, &[])), &[], Vec::new());
     let (p0, p1, p2) = (fx.param(0), fx.param(1), fx.param(2));
     let rust_call = FnPtrHeader { abi: Abi::RustCall, safety: Safety::Safe };
 
@@ -190,10 +195,10 @@ fn a_closure_decides_the_callees_output_parameter() {
         &c,
         &Want {
             exprs: &[
-                (ExprId(0), "fn then<u16, closure#3fn() -> u16>"),
+                (ExprId(0), "fn then<u16, closure#0 of main_u16<>>"),
                 (ExprId(1), "fn k"),
                 (ExprId(2), "u16"),
-                (ExprId(3), "closure#3fn() -> u16"),
+                (ExprId(3), "closure#0 of main_u16<>"),
                 (ExprId(4), "u16"),
                 (ExprId(5), "u16"),
             ],
@@ -229,12 +234,12 @@ fn a_closures_parameter_comes_from_the_bound_and_its_output_decides_a_parameter(
         &c,
         &Want {
             exprs: &[
-                (ExprId(0), "fn map_err<u8, u16, closure#5fn(u8) -> u16>"),
+                (ExprId(0), "fn map_err<u8, u16, closure#0 of main_x<>>"),
                 (ExprId(1), "u8"),
                 (ExprId(2), "fn widen"),
                 (ExprId(3), "u8"),
                 (ExprId(4), "u16"),
-                (ExprId(5), "closure#5fn(u8) -> u16"),
+                (ExprId(5), "closure#0 of main_x<>"),
                 (ExprId(6), "u16"),
                 (ExprId(7), "u16"),
             ],

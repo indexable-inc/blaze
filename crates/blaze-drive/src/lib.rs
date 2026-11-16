@@ -83,6 +83,9 @@ pub enum Plant {
     /// A name with no record (never made, or dropped) keeps no watch row: the readers that read
     /// it absent are forgotten, so its appearing reruns none of them.
     ForgetAbsentReaders,
+    /// A read that found nothing is handed to the task's next run as a hint: the name, still
+    /// not there, fails, and its reader fails `Waited` on it every run.
+    HintAbsentReads,
     /// A want of a name whose task is running starts a second run of the same key.
     DoubleFlight,
     /// A batch's records are applied a second time, past the ticket check.

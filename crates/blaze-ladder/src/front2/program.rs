@@ -149,6 +149,23 @@ struct Literals {
     ints: Vec<(ExprId, u128), Global>,
     int_pats: Vec<(PatId, u128), Global>,
     strings: Vec<(ExprId, Box<[u8], Global>), Global>,
+    /// Each float literal: its text rounded to the nearest `f64` and `f32` ([`float_bits`]).
+    floats: Vec<(ExprId, (u64, u32)), Global>,
+}
+
+/// A float literal's text (`1.5`, `2e-3_f32`, `1_000.0`) rounded once to the nearest `f64`
+/// and once to the nearest `f32` (the Reference, "Floating-point literal expressions"): the
+/// underscores and a suffix dropped, then core's correctly rounded parse; `None` for a text
+/// the parse refuses.
+fn float_bits(text: &str) -> Option<(u64, u32)> {
+    let t = text.strip_suffix("f32").or_else(|| text.strip_suffix("f64")).unwrap_or(text);
+    let mut digits = blaze_own::String::new_in(Alloc::global());
+    for ch in t.chars().filter(|&ch| ch != '_') {
+        digits.push(ch);
+    }
+    let wide: f64 = digits.parse().ok()?;
+    let narrow: f32 = digits.parse().ok()?;
+    Some((wide.to_bits(), narrow.to_bits()))
 }
 
 /// The program as front2 made it for the back half: `main` at index 0, then every fn the walk
@@ -167,13 +184,13 @@ pub struct Front2Program<'n> {
     /// it, as a trait object sees it ([`object_tables`]): what the seam's `object_trait` lends.
     objects: HashMap<ItemKey, ObjectTable, Global>,
     /// [`SEAM_LANGS`]' answers.
-    langs: [(LangItem, Option<ItemKey>); 3],
+    langs: [(LangItem, Option<ItemKey>); SEAM_LANGS.len()],
 }
 
 /// The lang traits the seam's own `Option` answers name (`drop_trait`, `lang_trait_fn`):
 /// each looked up once in [`Front2Program::make`], a refusal stopping the program by the item's
 /// name there, so those answers never meet a lookup that fails.
-const SEAM_LANGS: [LangItem; 3] = [LangItem::Drop, LangItem::Deref, LangItem::DerefMut];
+const SEAM_LANGS: [LangItem; 6] = [LangItem::Drop, LangItem::Deref, LangItem::DerefMut, LangItem::Fn, LangItem::FnMut, LangItem::FnOnce];
 
 fn lang_of(front: &Front2<'_>, item: LangItem) -> Result<Option<ItemKey>, crate::seam::LangRefusal> {
     match super::langs::find(&front.index, front.resolver, item) {
@@ -604,7 +621,7 @@ impl<'n> Front2Program<'n> {
             let none = Box::<str>::from("");
             fns.push(Tabled { key, body: None, checked: None, kind: FnKind::Ctor, path, at, abi: Abi::Rust, symbol: none, export: None, lits: Literals::default(), intrinsic: None });
         }
-        let mut langs = [(LangItem::Drop, None); 3];
+        let mut langs = [(LangItem::Drop, None); SEAM_LANGS.len()];
         for (slot, item) in langs.iter_mut().zip(SEAM_LANGS) {
             *slot = (item, lang_of(&front, item).map_err(|l| Front2Refusal::Lang { item: l.item, why: l.why })?);
         }
@@ -757,8 +774,14 @@ fn literals(body: &Body<'_>, path: &str) -> Result<Literals, Front2Refusal> {
                 let bytes = string_bytes(text).ok_or_else(|| refuse("this escape in a string literal"))?;
                 out.strings.push((id, bytes.into_boxed_slice()));
             }
+            // `c".."` / `cr".."`: the bytes without the nul the builder adds (its `byte_str`).
+            tc::Lit::CStr => {
+                let bytes = text.strip_prefix('c').and_then(string_bytes).ok_or_else(|| refuse("this escape in a C string literal"))?;
+                out.strings.push((id, bytes.into_boxed_slice()));
+            }
             tc::Lit::Int(_) | tc::Lit::Char => out.ints.push((id, int_value(text).ok_or_else(|| refuse("this integer or char literal"))?)),
-            _ => {}
+            tc::Lit::Float(_) => out.floats.push((id, float_bits(text).ok_or_else(|| refuse("this float literal"))?)),
+            tc::Lit::Bool(_) => {}
         }
     }
     for (p, x) in t.pats.iter().enumerate() {
@@ -907,6 +930,20 @@ impl FrontEnd for Front2Program<'_> {
     fn string(&self, owner: ItemKey, e: ExprId) -> Option<&[u8]> {
         let s = &self.fns[self.fn_index(owner)?].lits.strings;
         s.binary_search_by_key(&e.0, |(x, _)| x.0).ok().map(|i| &*s[i].1)
+    }
+
+    fn float_lit(&self, owner: ItemKey, e: ExprId) -> Option<(u64, u32)> {
+        let s = &self.fns[self.fn_index(owner)?].lits.floats;
+        s.binary_search_by_key(&e.0, |(x, _)| x.0).ok().map(|i| s[i].1)
+    }
+
+    /// In the first tabled body's world: selection and the projection step read the impls and
+    /// the traits, never a body's own scope, so any body's world answers alike.
+    fn normalize(&self, trait_: ItemKey, name: tc::Name, args: &[PTy], ground: &mut PortableTys<'_>) -> Result<Option<PTy>, ResolveError> {
+        let Some(i) = self.fns.iter().position(|f| f.body.is_some()) else {
+            return Ok(None);
+        };
+        self.in_world(i, |w| blaze_typeck::normalize_projection(w, trait_, name, args, ground, Alloc::global()))
     }
 
     fn repr(&self, key: ItemKey) -> ReprAttrs {

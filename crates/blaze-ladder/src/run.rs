@@ -250,7 +250,88 @@ impl RunError {
 
 /// The build's questions answered from the front end: ADTs, literals, lang fns, `Drop` impls,
 /// ABIs and intrinsics; and each `const` item's evaluated value, by item.
-struct FrontAdts<'a, P>(&'a P, usize, &'a [(ItemKey, DataRecord<Global>)], &'a BackLangs);
+struct FrontAdts<'a, P>(&'a P, usize, &'a [(ItemKey, DataRecord<Global>)], &'a BackLangs, &'a Bodies<'a>);
+
+/// What the build reads of the checked bodies beyond each one's own: every record (a float
+/// literal's type) and every closure's facts.
+struct Bodies<'a> {
+    checked: &'a [Option<Checked<'static>>],
+    closures: ClosureTable,
+}
+
+/// Every closure's facts ([`LayoutFacts::closure`]), made once before the build from its
+/// owner's check record by `blaze_build::layout::closure_facts`, sorted by (owner, ordinal).
+/// A closure whose owner did not check has no row: the builder refuses it, naming it.
+struct ClosureTable {
+    tys: PortableTys<'static>,
+    rows: Vec<(ItemKey, u32, Result<(blaze_build::FnTrait, PTy, PTy), BuildError>), Global>,
+}
+
+impl ClosureTable {
+    fn of<P: FrontEnd>(program: &P, checked: &[Option<Checked<'static>>]) -> ClosureTable {
+        let mut tys = PortableTys::new_in(Alloc::global());
+        let mut rows = Vec::new_in(Global);
+        for (i, done) in checked.iter().enumerate() {
+            let Some(done) = done else { continue };
+            let sig = program.sig(i);
+            let generics = sig.parent_count + sig.own_count;
+            let owner = program.function(i).key;
+            for ordinal in 0..done.closures.len() as u32 {
+                let facts = blaze_build::layout::closure_facts(done, ordinal, generics, &mut tys, Alloc::global());
+                rows.push((owner, ordinal, facts));
+            }
+        }
+        rows.sort_unstable_by_key(|r| (r.0, r.1));
+        ClosureTable { tys, rows }
+    }
+
+    fn get(&self, owner: ItemKey, ordinal: u32) -> Option<blaze_build::layout::ClosureFacts<'_>> {
+        let at = self.rows.binary_search_by_key(&(owner, ordinal), |r| (r.0, r.1)).ok()?;
+        let (kind, sig, env) = *self.rows[at].2.as_ref().ok()?;
+        Some(blaze_build::layout::ClosureFacts { types: self.tys.view(), kind, sig, env })
+    }
+}
+
+/// The front end's normalization as the builder asks it: an answer not given is the builder's
+/// own refusal naming the projection.
+fn normalized<P: FrontEnd>(program: &P, trait_: ItemKey, name: blaze_typeck::Name, args: &[PTy], ground: &mut PortableTys<'_>) -> Result<PTy, BuildError> {
+    match program.normalize(trait_, name, args, ground) {
+        Ok(Some(t)) => Ok(t),
+        Ok(None) | Err(_) => Err(BuildError::Projection { trait_, name }),
+    }
+}
+
+/// `called` as a closure's `Fn*` method instance (`[closure, (A..)]` with the item one of
+/// [`Adts::fn_trait_method`]'s): its owner's index, which tables it; `None` for any other call.
+fn closure_owner<P: FrontEnd>(program: &P, adts: &dyn Adts, called: Instance, ground: &PortableTys<'_>) -> Option<usize> {
+    let first = *ground.view().list(called.args).ok()?.first()?;
+    let of = blaze_build::closure_of(ground.view(), first)?;
+    let methods = [blaze_build::FnTrait::Fn, blaze_build::FnTrait::FnMut, blaze_build::FnTrait::FnOnce];
+    if !methods.into_iter().any(|w| adts.fn_trait_method(w) == Some(called.item)) {
+        return None;
+    }
+    program.fn_index(of.owner)
+}
+
+/// The list a closure's `Fn*` method instance is keyed by: its owner's arguments first (so the
+/// owner's projections normalize at them), then the method as a `FnDef`, then the instance's
+/// own arguments (the closure and its argument tuple). Never equal to an owner's own list: it
+/// is longer, and the count is hashed.
+fn closure_key_args(instance: Instance, ground: &mut PortableTys<'_>) -> Result<List, BuildError> {
+    let malformed = |_| BuildError::Malformed { what: "a closure instance's arguments past the ground table" };
+    let full = |_| BuildError::Malformed { what: "the ground table is full" };
+    let own: Vec<PTy, Global> = {
+        let mut v = Vec::new_in(Global);
+        v.extend_from_slice(ground.view().list(instance.args).map_err(malformed)?);
+        v
+    };
+    let of = own.first().and_then(|&t| blaze_build::closure_of(ground.view(), t)).ok_or(BuildError::Malformed { what: "a closure method instance whose self is not a closure" })?;
+    let mut all: Vec<PTy, Global> = Vec::new_in(Global);
+    all.extend_from_slice(ground.view().list(of.owner_args).map_err(malformed)?);
+    all.push(ground.intern(PNode::FnDef(instance.item, List::EMPTY)).map_err(full)?);
+    all.extend_from_slice(&own);
+    ground.intern_list(&all).map_err(full)
+}
 
 /// The lang ADTs the builder asks for ([`blaze_build::Adts::lang_adt`]), asked of the front end
 /// once before the build: a lookup the front end refuses stops the build by the item's name
@@ -296,6 +377,10 @@ impl<P: FrontEnd> LayoutFacts for FrontConsts<'_, P> {
 
     fn valid_range(&self, _: ItemKey) -> ValidRange {
         ValidRange::default()
+    }
+
+    fn normalize(&self, trait_: ItemKey, name: blaze_typeck::Name, args: &[PTy], ground: &mut PortableTys<'_>) -> Result<PTy, BuildError> {
+        normalized(self.program, trait_, name, args, ground)
     }
 }
 
@@ -547,6 +632,14 @@ impl<P: FrontEnd> LayoutFacts for FrontAdts<'_, P> {
     fn valid_range(&self, _: ItemKey) -> ValidRange {
         ValidRange::default()
     }
+
+    fn normalize(&self, trait_: ItemKey, name: blaze_typeck::Name, args: &[PTy], ground: &mut PortableTys<'_>) -> Result<PTy, BuildError> {
+        normalized(self.0, trait_, name, args, ground)
+    }
+
+    fn closure(&self, owner: ItemKey, ordinal: u32) -> Option<blaze_build::layout::ClosureFacts<'_>> {
+        self.4.closures.get(owner, ordinal)
+    }
 }
 
 impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
@@ -572,6 +665,28 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
 
     fn str_lit(&self, owner: ItemKey, expr: ExprId) -> Option<&str> {
         core::str::from_utf8(self.0.string(owner, expr)?).ok()
+    }
+
+    /// The literal's bits at the type its body's check gave it: `f32`'s in the low 32, else
+    /// `f64`'s (each rounded once from the text by the front end).
+    fn float_lit(&self, owner: ItemKey, expr: ExprId) -> Option<u128> {
+        let (wide, narrow) = self.0.float_lit(owner, expr)?;
+        let done = self.4.checked.get(self.0.fn_index(owner)?)?.as_ref()?;
+        let ty = *done.expr_ty.get(expr.0 as usize)?;
+        match done.types.view().node(ty).ok()? {
+            PNode::Float(blaze_typeck::FloatTy::F32) => Some(u128::from(narrow)),
+            PNode::Float(blaze_typeck::FloatTy::F64) => Some(u128::from(wide)),
+            _ => None,
+        }
+    }
+
+    /// The `Fn*` lang traits' methods, as looked up when the program was made.
+    fn fn_trait_method(&self, which: blaze_build::FnTrait) -> Option<ItemKey> {
+        match which {
+            blaze_build::FnTrait::Fn => self.0.lang_trait_fn(LangItem::Fn, "call"),
+            blaze_build::FnTrait::FnMut => self.0.lang_trait_fn(LangItem::FnMut, "call_mut"),
+            blaze_build::FnTrait::FnOnce => self.0.lang_trait_fn(LangItem::FnOnce, "call_once"),
+        }
     }
 
     fn lang_fn(&self, name: &str) -> Option<ItemKey> {
@@ -1006,10 +1121,18 @@ fn build_from<P: FrontEnd>(program: &mut P, surveyed: Option<(&mut Vec<(Box<str>
     let mut ground = PortableTys::new_in(Alloc::global());
     // An item's code identity, until the item layer's records give one (shortcuts 2 and 12): its
     // key and its item's text. Never stale; coarse only in that a signature edit changes it too.
-    let key_of = |c: usize, args: List, ground: &PortableTys<'_>| {
-        instance_key(program.code_of(c), args, ground.view(), Alloc::global())
-            .map_err(|error| RunError::Build { function: program.function(c).named(), error, range: None })
+    // The key covers what each projection of the fn's checked types normalizes to at the
+    // instance (`instance_key_normalized`): two instances that differ only there never share
+    // one. A closure's `Fn*` method instance keys its owner's code at the owner's arguments,
+    // then the method and the instance's own arguments ([`closure_key_args`]).
+    let checked_bodies = Bodies { checked: &checked, closures: ClosureTable::of(program, &checked) };
+    let key_of = |c: usize, instance: Instance, ground: &mut PortableTys<'_>, facts: &dyn LayoutFacts| {
+        let fail = |error| RunError::Build { function: program.function(c).named(), error, range: None };
+        let from = checked.get(c).and_then(Option::as_ref).map_or(PTys::EMPTY, |d| d.types.view());
+        let args = if instance.item == program.function(c).key { instance.args } else { closure_key_args(instance, ground).map_err(fail)? };
+        blaze_build::instance_key_normalized(program.code_of(c), args, from, ground, facts, Alloc::global()).map_err(fail)
     };
+    let keyer = FrontAdts(program, entry.unwrap_or(0), &consts, &langs, &checked_bodies);
     // Slot `n` is the `n`th instance reached; `keys[n]` its key, by which instances are told apart.
     let mut reached = Reached {
         instances: Vec::with_capacity_in(program.fn_count(), Global),
@@ -1021,7 +1144,8 @@ fn build_from<P: FrontEnd>(program: &mut P, surveyed: Option<(&mut Vec<(Box<str>
     if let Some(main) = entry {
         reached.instances.push(Instance { item: program.function(main).key, args: List::EMPTY });
         reached.tabled.push(main);
-        reached.keys.push(key_of(main, List::EMPTY, &ground)?);
+        let key = key_of(main, Instance { item: program.function(main).key, args: List::EMPTY }, &mut ground, &keyer)?;
+        reached.keys.push(key);
     }
     // A survey seeds every non-generic fn with a checked body, by key (the program's order,
     // never the asking's); a generic one is met at the instances built bodies call it at.
@@ -1038,9 +1162,17 @@ fn build_from<P: FrontEnd>(program: &mut P, surveyed: Option<(&mut Vec<(Box<str>
         }
         seeds.sort_unstable_by_key(|s| s.0);
         for (item, c) in seeds {
-            reached.instances.push(Instance { item, args: List::EMPTY });
+            let instance = Instance { item, args: List::EMPTY };
+            let key = match key_of(c, instance, &mut ground, &keyer) {
+                Ok(k) => k,
+                Err(e) => {
+                    filed(&mut survey, e)?;
+                    continue;
+                }
+            };
+            reached.instances.push(instance);
             reached.tabled.push(c);
-            reached.keys.push(key_of(c, List::EMPTY, &ground)?);
+            reached.keys.push(key);
         }
     }
     let mut bodies = Vec::with_capacity_in(program.fn_count(), Global);
@@ -1057,12 +1189,30 @@ fn build_from<P: FrontEnd>(program: &mut P, surveyed: Option<(&mut Vec<(Box<str>
         };
         args.clear();
         let malformed = |_| RunError::Build { function: name(), error: BuildError::Malformed { what: "an instance's arguments past the ground table" }, range: None };
-        args.extend_from_slice(ground.view().list(instance.args).map_err(malformed)?);
+        // A closure's `Fn*` method instance (`[closure, (A..)]`, tabled as its owner): built
+        // from the owner's body at the owner's arguments the closure's type holds.
+        let closure = if instance.item == function.key {
+            None
+        } else {
+            let first = ground.view().list(instance.args).map_err(malformed)?.first().copied();
+            let of = first.and_then(|t| blaze_build::closure_of(ground.view(), t));
+            let which = [blaze_build::FnTrait::Fn, blaze_build::FnTrait::FnMut, blaze_build::FnTrait::FnOnce]
+                .into_iter()
+                .find(|&w| FrontAdts(program, i, &consts, &langs, &checked_bodies).fn_trait_method(w) == Some(instance.item));
+            match (of, which) {
+                (Some(of), Some(which)) => Some((of, which)),
+                _ => return Err(RunError::Callee { function: name(), callee: instance.item }),
+            }
+        };
+        let owner_args = closure.map_or(instance.args, |(of, _)| of.owner_args);
+        args.extend_from_slice(ground.view().list(owner_args).map_err(malformed)?);
         let view = body.view(types);
-        let adts = FrontAdts(program, i, &consts, &langs);
+        let adts = FrontAdts(program, i, &consts, &langs, &checked_bodies);
         let mut subst = Subst { args: &args, ground: &mut ground, scratch: Alloc::global() };
         // `drop_in_place::<T>` is built as `T`'s drop glue, never from its written body.
-        let built = if Some(function.key) == program.fn_lang(FnLang::DropInPlace) {
+        let built = if let Some((of, which)) = closure {
+            blaze_build::build_closure(&view, done, of.ordinal, which, &program.sig(i), &mut subst, &adts, Global)
+        } else if Some(function.key) == program.fn_lang(FnLang::DropInPlace) {
             blaze_build::build_drop_glue(&view, done, &program.sig(i), &mut subst, &adts, Global)
         } else {
             blaze_build::build(&view, done, &program.sig(i), &mut subst, &adts, Global)
@@ -1091,6 +1241,21 @@ fn build_from<P: FrontEnd>(program: &mut P, surveyed: Option<(&mut Vec<(Box<str>
         // In a survey, a callee refused leaves this instance unemitted (its targets short).
         let mut broken = false;
         for &called in built.refs.iter() {
+            // A closure's `Fn*` method: no impl to select; the instance is the closure's own,
+            // tabled as its owner (the loop above builds it from the owner's body).
+            if let Some(c) = closure_owner(program, &adts, called, &ground) {
+                match key_of(c, called, &mut ground, &adts) {
+                    Ok(key) => {
+                        via.push(Via::Slot);
+                        targets.push(Target::Slot(reached.slot(called, c, key)?));
+                    }
+                    Err(e) => {
+                        filed(&mut survey, e)?;
+                        broken = true;
+                    }
+                }
+                continue;
+            }
             // A trait's fn runs as the selected impl's.
             let (item, resolved) = match program.resolve(i, called.item, called.args, &mut ground) {
                 Ok(r) => r,
@@ -1108,7 +1273,15 @@ fn build_from<P: FrontEnd>(program: &mut P, surveyed: Option<(&mut Vec<(Box<str>
             };
             let target = program.function(c);
             if target.body.is_some() {
-                let key = key_of(c, callee.args, &ground)?;
+                // A key the callee cannot have (a projection not normalized) refuses this caller.
+                let key = match key_of(c, callee, &mut ground, &adts) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        filed(&mut survey, e)?;
+                        broken = true;
+                        continue;
+                    }
+                };
                 via.push(Via::Slot);
                 targets.push(Target::Slot(reached.slot(callee, c, key)?));
             } else if target.kind == FnKind::Foreign {
@@ -1180,7 +1353,8 @@ fn build_from<P: FrontEnd>(program: &mut P, surveyed: Option<(&mut Vec<(Box<str>
                                 let Some(c) = c else {
                                     return Err(RunError::Callee { function: name(), callee: item });
                                 };
-                                VtableWord::Slot(reached.slot(Instance { item, args }, c, key_of(c, args, &ground)?)?)
+                                let key = key_of(c, Instance { item, args }, &mut ground, &adts)?;
+                                VtableWord::Slot(reached.slot(Instance { item, args }, c, key)?)
                             }
                             VtableTarget::Super(s) => match tables.refs.iter().position(|r| *r == above(s)) {
                                 Some(n) => VtableWord::Table(u32::try_from(n).map_err(|_| RunError::TooManyInstances)?),

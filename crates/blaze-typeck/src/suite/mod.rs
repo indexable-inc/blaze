@@ -49,6 +49,7 @@ mod lower_forms;
 mod opaque;
 mod pattern_types;
 mod self_paths;
+mod suggest;
 mod where_const;
 mod where_projection;
 
@@ -881,9 +882,9 @@ fn closure_passed_to_a_generic_bound() {
         &c,
         &Want {
             exprs: &[
-                (ExprId(0), "fn apply<closure#2fn(u8) -> u16>"),
+                (ExprId(0), "fn apply<closure#0 of c_closure<>>"),
                 (ExprId(1), "u16"),
-                (ExprId(2), "closure#2fn(u8) -> u16"),
+                (ExprId(2), "closure#0 of c_closure<>"),
                 (ExprId(3), "u16"),
                 (ExprId(4), "u16"),
             ],

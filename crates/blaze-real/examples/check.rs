@@ -93,7 +93,9 @@ fn kind_of(q: &Question) -> usize {
         Question::TraitDef(_) => 14,
         Question::AssocParent(_) => 15,
         Question::ConstHolds(..) => 16,
-        Question::ConstParams(_) => 17,    }
+        Question::ConstParams(_) => 17,
+        Question::Closure(..) => 19,
+    }
 }
 
 const KIND_NAMES: [&str; KINDS] = [

@@ -52,7 +52,7 @@ mod toy;
 use blaze_own::Alloc;
 
 pub use infer::{InferCtx, InferSnapshot};
-pub use instance::{ResolveError, Resolved, resolve_instance, select_impl};
+pub use instance::{ResolveError, Resolved, normalize_projection, resolve_instance, select_impl};
 pub use asks::{Ask, AskLog, Clock, Order, QUESTION_KINDS, R_THRESHOLD, Restarts, Solve, Tally, entries_histogram, question_kind, restarts};
 pub use body::{
     Anchor, Arm, BinOp, BindAnn, BodyPath, BodyView, Capture, CoroutineKind, Expr, FieldInit, FieldPat, FmtTrait, FmtUse,
@@ -60,6 +60,8 @@ pub use body::{
 };
 pub use columns::{AdjustKind, Adjusts, Callees, CaptureKind, Captures, Checked, Closures, ExprDefs, Fields, PatDefs};
 pub use diag::{Because, Diag, DiagCode, UnmetGoal};
+/// The fix offered for a name that does not resolve: `Checked::suggests` and `suggest::pick`.
+pub use rules::suggest;
 pub use error::{CheckError, Limit, Malformed, Recorded, Stop};
 pub use hash::{ContentHash, StableHasher};
 pub use ids::{

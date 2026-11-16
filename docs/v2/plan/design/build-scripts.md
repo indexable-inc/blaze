@@ -429,7 +429,100 @@ The coordinator's decision, recorded as D54 in decisions.json; it refines D53's 
   7-digit prefix; neither is checked (the record keeps the package's files, not the whole
   repository's objects).
 
+## Native scripts (D65)
+
+Owner, 2026-11-16: scripts that need a C toolchain run native, in the OS sandbox, with blaze's
+own pinned clang. This replaces "no native run, ever" above for that class only.
+
+**Which (from text, in the key).** `blaze_build_script::native::runner(graph, script)` walks the
+script unit's dependency closure (iteratively); a unit of a package in `native::TOOLCHAIN_CLASS`
+(`cc`, `cmake`, `bindgen`, `clang-sys`, `pkg-config`) makes it `Runner::Native { because }`,
+else `Runner::Wasm`. The runner is in the run key (`key::RunnerKey`: a native key adds the
+parts `native`, the compiler's shelf digest and the host target; a wasm key adds nothing, so
+the 100 wasm records stand); a wasm failure is never retried native (rule 3). `autocfg` is NOT in the class: it spawns `rustc`, which the wasm
+probe shim answers (eyre, memoffset, num-traits stay wasm and give outputs today). signal-hook
+names `cc` in its source but has no `cc` in its closure under tempo's features: wasm. clang-sys's
+and bindgen's own scripts depend on no class crate: wasm. The census row `native` lists the 20
+expected (alloca, antithesis-instrumentation, aws-lc-sys, blake3, blst, c-kzg, hidapi-rusb,
+libfuzzer-sys, libproc, librocksdb-sys, libusb1-sys, lz4-sys, reth-mdbx-sys, ring,
+secp256k1-sys 0.10/0.11/0.14, sha3-asm, tikv-jemalloc-sys, zstd-sys) with the units behind each;
+the run's count is in "Runner 9" below. Native is not enough for five of them: sha3-asm spawns
+`perl` and `patch`, tikv-jemalloc-sys `sh` and `make`, aws-lc-sys and zstd-sys may take `cmake`,
+libusb1-sys and hidapi-rusb `pkg-config`: each such spawn is refused by name (only the pinned
+compiler may be started), so they need their own answers later (pkg-config from a table, as D53
+answers git).
+
+**The compiler.** blaze's LLVM fork (`crates/hir-ty-codegen/llvm.json`: 23.1.4, indexable-inc/llvm
+`ix/23.x` e152d9fa2bc2, archives at blaze-releases.ix.dev/native) builds with
+`-DLLVM_ENABLE_PROJECTS=` (`.github/scripts/llvm.py`): no clang, no libclang; the fetched
+aarch64-apple-darwin archive (`~/.blaze/native/sha256-e95fc3b4..`) holds only `llvm-config`,
+`llvm-dwarfdump`, `llvm-pdbutil`. So until llvm.py adds `clang` (the end state of toolchain-c.md),
+the source is the LLVM project's release for the same LLVM the nightly reports (`probe::LLVM`,
+23.1.4): `https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.4/LLVM-23.1.4-{macOS,Linux}-ARM64.tar.xz`
+(1,570,051,292 and 1,829,686,400 bytes; sha256 `5d3179db..39ef` and `9b27cf26..3a91`, read from
+the GitHub release's asset `digest` and its `.jsonl` attestation, recorded in a pin table beside
+llvm.json, fetched to `~/.blaze/v2/toolchain/clang/<sha256>/`). Nothing is fetched yet. Still
+missing beside it: C library headers. A macOS clang without an SDK cannot compile `<stdlib.h>`
+(toolchain-c.md: the SDK only on the user's explicit acceptance, keyed by `SDKSettings.json`'s
+digest); Linux needs a pinned glibc sysroot. Both are owner questions.
+
+**The sandbox.** The tree's confinement (blaze-cargo `sandbox/macos.rs`, `linux.rs`, blaze-usercode
+`confine.rs`) gives reads of the WHOLE machine (`(allow default)` with writes denied): the
+machine's clang is reachable, so it is not sound for D65 and is not moved. Its raw layers
+(`sandbox/macos/raw.rs`, `linux/raw.rs`) are sound but serve a single-threaded launcher, which the
+rebuilt path has not. New, in blaze-build-script `native.rs` (sans-IO: the policy) and
+blaze-proc-macro `native_sandbox.rs` (the run): macOS Seatbelt `(deny default)`, reads only of
+the grant (package folder, dependencies' outputs, the toolchain folder, `OUT_DIR`) plus the OS's
+own loader set (`/`, `/usr/lib`, `/System/Library`, `/System/Volumes/Preboot/Cryptexes/OS`: no
+compiler there; `/System/Volumes/Data`, `/usr/bin`, `/Library`, `/Applications` are NOT read),
+writes only `OUT_DIR`, `process-exec` only of the script and the granted compiler binaries, no
+network (denied by default); Linux Landlock (reads, writes, execute by path) plus a new user and
+network namespace, set in `pre_exec`. A deadline kills the process group. Refusals: a program or
+path the grant cannot say is refused before the run, by name; inside the run the kernel refuses
+(EPERM/EACCES); naming each refused path needs a witness (the old interposer's role), not built.
+
+**The script binary.** Built today only for `wasm32-wasip1`, by the interim builder
+(`scripts/src/bin/proc_macro_modules.rs`, D52: cargo from the pinned nightly in Seatbelt or bwrap,
+paths remapped, `--target wasm32-wasip1`). A native script is the same build with `--target` the
+host and no process shim (it must really spawn the pinned clang); its module key adds the target.
+Not built in this leg.
+
+**The record.** The same outputs record (`bzbsout3`); the run key adds the runner word, the
+compiler shelf digest and the host target. Read list: coarse and correct: the digests of every
+granted input folder (a coarse proof covers all under it); per-file reads need the witness, or
+`-MD` depfiles (which miss bindgen: libclang runs in the script's own process). Determinism
+(rule 25): `CFLAGS`/`CXXFLAGS` carry `-ffile-prefix-map=<OUT_DIR>=/out`,
+`-ffile-prefix-map=<package>=/workspace/<package>` and `-fdebug-compilation-dir=.`;
+`SOURCE_DATE_EPOCH=0` fixes `__DATE__`/`__TIME__`; `AR` is the shelf's `llvm-ar`, deterministic
+by default; bindgen's text holds no paths. Proven by a two-run byte compare once a clang exists.
+
 ## For a successor
+
+- **Runner 9: native scripts (D65), 2026-11-16.** Built: `blaze_build_script::native`
+  (`runner`, `TOOLCHAIN_CLASS`, `Grant`, `seatbelt`, `GrantError`), `key::RunnerKey`, census row
+  `runners`; blaze-proc-macro `native_sandbox` (`run`, `NativeRefusal`, Linux Landlock + user and
+  net namespace + seccomp `socket` refusal, compiled and tested only on macOS so far: the Linux
+  tests are `ignore`d off macOS; the coordinator runs them on the VM with the `ignore` removed).
+  - tempo, read-only (`mixcheck.sh blaze-build-script run census <tempo> <fetch store>`):
+    "runners 20 native, 86 wasm (D65)"; units behind each: aws-lc-sys 189, blst 177, c-kzg
+    164, zstd-sys 174, secp256k1-sys 0.11 200, sha3-asm 200, ring 114, reth-mdbx-sys 69,
+    librocksdb-sys 62, libproc 22 (the rest in the run's output). Of the six without outputs
+    today, five are native (libproc, librocksdb-sys, reth-mdbx-sys, sha3-asm, libusb1-sys);
+    rusb is wasm and waits on libusb1-sys's `links`.
+  - Hostile tests (macOS 27, arm64; with `BLAZE_D65_QUOTE=1` each passing test prints): "read:
+    confined: ATTEMPT read denied: Operation not permitted (os error 1) | planted off: ATTEMPT
+    read ok"; the same for write, connect (a loopback listener the test made: no outside network)
+    and exec (`/bin/echo`); "deadline: confined: ..: the native build script outlived its
+    deadline of 1.5s and was killed (rule 18) | planted off: Ok(\"ATTEMPT sleep ok\")". Inside
+    the grant, the package read and the `OUT_DIR` write pass. blaze-proc-macro "59 passed".
+  - NOT wired into the runner: 15 of the 20 give outputs today as wasm in check mode (C requests
+    deferred); routing them native before a clang is on the shelf would stop them. Owner
+    question: check mode keeps wasm-deferred and `build` goes native (a keyed choice by mode,
+    not a fallback), or both go native.
+  - Next, in order: the fetch of the clang (the pin above) and a C library source (macOS SDK by
+    acceptance; a Linux sysroot); the host build of a script in the interim builder; the witness
+    that names each refused path and gives per-file reads; the two-run byte compare of a fixture
+    compiling one C file.
 
 - **Done 2026-11-16 (relay runner 3):**
   - mime_guess's empty file is right: the target side has features `[]` (reqwest takes it

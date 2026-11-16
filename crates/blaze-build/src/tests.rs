@@ -268,6 +268,8 @@ struct TestWorld {
     /// The fixture solver of `LayoutFacts::normalize`: `<self_ as Deref>::Target = target`,
     /// both types of this world's table (tests/projections.rs).
     projs: Vec<(PTy, PTy), Global>,
+    /// A fn's where-clauses (`T: Deref`), their types of this world's table.
+    where_clauses: Vec<(ItemKey, Vec<PClause, Global>), Global>,
 }
 
 const DEREF: ItemKey = ItemKey(90);
@@ -295,6 +297,7 @@ impl TestWorld {
             deref_fn: None,
             manually_drop: None,
             projs: Vec::new_in(Global),
+            where_clauses: Vec::new_in(Global),
         }
     }
 
@@ -428,8 +431,11 @@ impl World for TestWorld {
         Ok(None)
     }
 
-    fn predicates(&self, _: Seal, _: ItemKey) -> Fetch<Predicates<'_>> {
-        Ok(Predicates { clauses: &[] as &[PClause], types: PTys::EMPTY })
+    fn predicates(&self, _: Seal, item: ItemKey) -> Fetch<Predicates<'_>> {
+        match self.where_clauses.iter().find(|(k, _)| *k == item) {
+            Some((_, clauses)) => Ok(Predicates { clauses: clauses.as_slice(), types: self.types.view() }),
+            None => Ok(Predicates { clauses: &[] as &[PClause], types: PTys::EMPTY }),
+        }
     }
 
     fn adt(&self, _: Seal, item: ItemKey) -> Fetch<Option<Adt<'_>>> {
@@ -3260,3 +3266,5 @@ mod closures;
 
 mod forms;
 mod projections;
+mod places;
+mod casts;

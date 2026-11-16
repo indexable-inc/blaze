@@ -181,6 +181,8 @@ pub trait TypeCtx {
     fn shallow_resolve(&mut self, t: Ty) -> Ty;
     /// `t` with every bound variable inside it replaced by its value. Unbound ones stay.
     fn resolve(&mut self, t: Ty) -> Result<Ty, CheckError>;
+    /// Whether a type of `l`, resolved, still holds an inference variable.
+    fn list_has_infer(&mut self, l: TyList) -> bool;
     /// Makes `a` and `b` equal, binding variables. `Ok(false)`: they cannot be, and nothing was
     /// bound (the context rolls back its own partial work).
     fn unify(&mut self, a: Ty, b: Ty) -> Result<bool, CheckError>;

@@ -486,6 +486,49 @@ fn select_in<W: World>(
     }
 }
 
+/// The projection `<args[0] as trait_<args[1..]>>::name` at the ground `args` (self first, in
+/// `ground`, no parameter inside), normalized by the solver's own projection step (blaze-solve
+/// alias.rs `step_impl`: the selected impl's item, or the trait's default), the answer exported
+/// into `ground`. `Ok(None)`: the solver did not normalize it (no impl holds, or the answer
+/// still holds a variable). The code builder's question at an instance (blaze-build
+/// `LayoutFacts::normalize`): the same selection a body's check makes, in one home.
+pub fn normalize_projection<W: World>(
+    world: &W,
+    trait_: ItemKey,
+    name: crate::ids::Name,
+    args: &[PTy],
+    ground: &mut PortableTys<'_>,
+    alloc: Alloc<'_>,
+) -> Result<Option<PTy>, ResolveError> {
+    if args.is_empty() {
+        return Err(ResolveError::NotGround { item: trait_ });
+    }
+    let mut reads = Reads::new_in(world, alloc);
+    let mut cx = InferCtx::new_in(alloc);
+    let mut tys: Vec<Ty, Alloc<'_>> = Vec::with_capacity_in(args.len(), alloc);
+    for &p in args {
+        let mut src = Asked { reads: &mut reads, need: None };
+        match import(&mut cx, &mut src, ground.view(), p, &[], 0) {
+            Ok(t) => tys.push(t),
+            Err(e) => {
+                return Err(match src.need {
+                    Some(q) => ResolveError::Missing(q),
+                    None => ResolveError::Check(e),
+                });
+            }
+        }
+    }
+    let goal_args = cx.mk_list(&tys)?;
+    let term = cx.fresh(crate::ty::VarKind::Ty)?;
+    cx.register(Obligation { goal: Goal::Projection { trait_, args: goal_args, name, term }, cause: Cause::Body })?;
+    cx.select_all(&mut reads)?;
+    if cx.next_error().is_some() {
+        return Ok(None);
+    }
+    let t = cx.resolve(term)?;
+    Ok(export(&mut cx, t, ground, 0)?)
+}
+
 /// The body a call of `item` at the ground `args` runs: for a trait's method, the selected
 /// impl's method with the impl's arguments then the method's own, or the trait's provided
 /// method (its arguments unchanged) when the impl does not define it; any other item, itself.

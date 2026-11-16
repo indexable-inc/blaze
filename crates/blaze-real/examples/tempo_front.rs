@@ -213,6 +213,7 @@ fn body_class(e: &BodyError) -> String {
         BodyError::NoHead(_) => "lower NoHead".into(),
         BodyError::NoBody(_) => "lower NoBody".into(),
         BodyError::Const { error, .. } => format!("lower Const: {}", cls(&format!("{error:?}"))),
+        BodyError::PatternName { error, .. } => format!("lower PatternName: {}", cls(&format!("{error:?}"))),
     }
 }
 

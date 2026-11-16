@@ -28,6 +28,7 @@ pub(crate) mod method;
 pub(crate) mod op;
 pub(crate) mod opaque_def;
 pub(crate) mod pat;
+pub mod suggest;
 pub(crate) mod writeback;
 
 impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
@@ -37,7 +38,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             Expr::Missing => Ok(Flow::Done(self.common.err)),
             Expr::Lit(lit) => self.expr_lit(f, e, lit),
             Expr::Local(p) => Ok(Flow::Done(self.local_ty[p.ix()])),
-            Expr::Path(path) => self.expr_path(e, path),
+            Expr::Path(path) => self.expr_path(f.expect, e, path),
             Expr::Paren(inner) => self.expr_paren(f, inner),
             Expr::Block { stmts, tail, scope: _ } => self.expr_block(f, e, stmts, tail),
             Expr::If { cond, then, else_ } => self.expr_if(f, e, cond, then, else_),

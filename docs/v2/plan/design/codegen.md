@@ -404,6 +404,14 @@ fixed words 0 to 2. The cost of the finer form is one pass over the checked body
 
 ## Closures and the Fn traits (2026-11-16)
 
+State after runner 3 (supersedes the survey below where they disagree; details in the ladder
+README "Code builder: closures"): values, environments, direct calls, bodies by kind, the thin
+`call_mut`/`call_once` entries, calls through a bound's trait (the checker's callee row wins over
+the closure's kind: `closure.rs through_fn_trait`), by-move captures with drop glue, and
+`ClosureFnPointer` (the closure's `call_once`, zero-sized `self`) are built and run natively.
+Open: SHIM instances of `Fn*` methods at a fn item or fn pointer `self`, and a closure called in
+a body other than its owner's.
+
 What exists in blaze-build (walk.rs, by search; the strings are the refusals each form hits):
 - A closure VALUE: not built. `repr` refuses its type (`TyErr::Unsupported("a closure")`) and the walk
   its expression (`Expr::Closure` -> "a closure"). No environment struct, no closure body fn.
@@ -458,6 +466,12 @@ The design (2026-11-16, built in blaze-build src/closure.rs, a child module of w
 - ENTRIES: the weaker kinds' methods are thin instances of their own key over the body: `call_mut` on an
   `Fn` closure passes its pointer on; `call_once` on an `Fn`/`FnMut` closure takes the environment by
   value, calls the body with its address and drops it after.
+- IDENTITY (11:40, supersedes GROUND FORM and KIND above): the ground type is the checker's
+  `Closure { owner, ordinal, args }`; kind, signature and environment are FACTS asked through
+  `LayoutFacts::closure(owner, ordinal)`, made from the owner's record by
+  `layout::closure_facts`, grounded at `args` as an ADT's fields are. No expression id leaves
+  one body's walk. Entries built (`closure.rs run_entry`); state in the ladder README, "Code
+  builder: closures".
 - STATE (11:15): environment, ground form, value, direct call and body built; native tests in
   blaze-build src/tests/closures.rs (3, 42, 1313). Not built yet: the entries, the generic `apply<F>` test,
   the fn item / fn pointer shims, `ClosureFnPointer` (ladder README "Code builder: closures").

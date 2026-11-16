@@ -86,6 +86,10 @@ pub struct Checked<'a> {
     /// What the check read, and what to fetch next time.
     pub reads: ReadList<'a>,
     pub needs: Needs<'a>,
+    /// For each E0425 at a one-segment value name: the names in scope that could replace it
+    /// (rules/suggest.rs; `suggest::pick` chooses the one fix with the item's text). Empty, and
+    /// no work done, for a body where every name resolved.
+    pub suggests: crate::rules::suggest::Suggests<'a>,
 }
 
 /// Two two-column tables are equal column by column.
@@ -139,6 +143,7 @@ impl<'a> Checked<'a> {
             && soa3_eq(&self.captures, &other.captures)
             && soa3_eq(&self.closures, &other.closures)
             && self.diags == other.diags
+            && self.suggests == other.suggests
     }
 }
 
@@ -163,6 +168,7 @@ impl<'a> core::fmt::Debug for Checked<'a> {
             .field("captures", &self.captures)
             .field("closures", &self.closures)
             .field("diags", &self.diags)
+            .field("suggests", &self.suggests)
             .field("reads", &self.reads)
             .field("needs", &self.needs)
             .finish()

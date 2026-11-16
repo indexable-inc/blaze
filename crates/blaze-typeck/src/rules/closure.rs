@@ -440,8 +440,10 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         if exprs.iter().zip(kinds).any(|(&e, k)| e == x && matches!(k, crate::columns::AdjustKind::Borrow { .. })) {
             return Ok(false);
         }
-        let Some(copy) = self.lang(LangItem::Copy)? else { return Ok(false) };
-        let Some(&t) = self.expr_ty.get(x.ix()) else { return Ok(false) };
+        // Without `Copy` nothing can be told copied: the finding names the lang item (the body
+        // is tainted), and the use counts as a move, the Reference's case for a non-`Copy` place.
+        let Some(copy) = self.need_lang(LangItem::Copy, At::Expr(x))? else { return Ok(true) };
+        let t = self.expr_ty[x.ix()];
         let t = self.ty.resolve(t)?;
         let args = self.mk_list(&[t])?;
         Ok(!self.ty.may_hold(crate::ty::Goal::Trait { trait_: copy, args }, &mut self.reads)?)

@@ -128,9 +128,7 @@ impl Reader {
         }
         let at = Path::new(path).ok()?;
         let mut bytes = Bytes::new_in(self.frame, "the names step's files");
-        let r = self.root.read_all(self.cx, &at, &mut bytes);
-        eprintln!("DEBUG read {path}: {:?}", r.as_ref().err());
-        r.ok()?;
+        self.root.read_all(self.cx, &at, &mut bytes).ok()?;
         // Held to the end of the command, in the names frame.
         let held: &'static Bytes<'static> = std::boxed::Box::leak(std::boxed::Box::new(bytes));
         Some(held.as_slice())
@@ -451,6 +449,21 @@ fn exports(payload: &[u8]) -> Option<&[u8]> {
 }
 
 /// The surface name of a checkout file.
+/// The slot a module file is named by: `a/x.rs` for `a/x/mod.rs`, else the path itself. Debt:
+/// a `#[path]` naming a `mod.rs` file is a path part named by its own path, which this maps
+/// to a slot that lists nothing.
+fn slot_of(path: String) -> String {
+    match path.strip_suffix("/mod.rs") {
+        Some(stem) => {
+            let mut slot = String::with_capacity(stem.len() + 3);
+            slot.push_str(stem);
+            slot.push_str(".rs");
+            slot
+        }
+        None => path,
+    }
+}
+
 fn surface(path: &str) -> Name {
     Name::new(Kind::Surface, Name::file(path.as_bytes()).subject)
 }
@@ -594,10 +607,15 @@ pub(crate) fn run<'f, 'b>(
         payload.extend_from_slice(&done.record);
         payload.resize(payload.len().next_multiple_of(16), 0);
         payload.extend_from_slice(&done.inner);
+        // The drive names a module file by its slot (`x.rs` for `x/mod.rs` too, sweep.rs): a
+        // read of either place is a read of the slot's `Surface`.
         let mut files = texts.read.into_inner();
+        let mut absent = texts.absent.into_inner();
+        for path in files.iter_mut().chain(absent.iter_mut()) {
+            *path = slot_of(core::mem::take(path));
+        }
         files.sort_unstable();
         files.dedup();
-        let mut absent = texts.absent.into_inner();
         absent.sort_unstable();
         absent.dedup();
         absent.retain(|path| files.binary_search(path).is_err());
@@ -609,7 +627,6 @@ pub(crate) fn run<'f, 'b>(
     }
     let i = names.made.binary_search_by_key(&name.subject, |(subject, _)| *subject).expect("made above");
     let resolved = &names.made[i].1;
-    eprintln!("DEBUG crate scope: files {:?} absent {:?} findings {} inputs {}", resolved.files, resolved.absent, resolved.findings.len(), task.inputs.len());
     // Each checkout file it read is read as its `Surface`: ask for those not given yet, with
     // the dependencies' records again, so the entry after holds them all.
     let unread: std::vec::Vec<&String, Global> = resolved.files.iter().filter(|path| !task.inputs.iter().any(|input| input.name == surface(path))).collect();

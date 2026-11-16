@@ -106,8 +106,18 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
     }
 
-    pub(crate) fn expr_path(&mut self, e: ExprId, path: PathIdx) -> Result<Flow, Stop> {
+    pub(crate) fn expr_path(&mut self, expect: Expectation, e: ExprId, path: PathIdx) -> Result<Flow, Stop> {
+        let before = self.diags.len();
         let ty = self.value_path(At::Expr(e), Cause::Expr(e), path)?;
+        // An E0425 at a one-segment name: a hole `rules::suggest` ranks a fix for. Only on this
+        // error path: a clean body pays one length compare per path.
+        if self.diags.len() > before {
+            let bp = self.body.path(path)?;
+            let named = self.diags[before..].iter().any(|d| d.code == DiagCode::UnresolvedPath && d.at == At::Expr(e));
+            if named && bp.anchor.is_none() && bp.lang.is_none() && bp.segments.len == 1 {
+                self.named_holes.push((e, expect));
+            }
+        }
         Ok(Flow::Done(ty))
     }
 

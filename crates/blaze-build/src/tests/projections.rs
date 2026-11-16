@@ -22,6 +22,17 @@ fn target_of(w: &mut TestWorld, of: PNode) -> PNode {
     PNode::Alias { trait_: DEREF, name: Name::of("Target"), args }
 }
 
+/// `fn <item><T>(..) where <each of `deref`>: Deref`.
+fn deref_bounds(w: &mut TestWorld, item: ItemKey, deref: &[PNode]) {
+    let mut clauses = Vec::new_in(Global);
+    for &of in deref {
+        let t = w.ty(of);
+        let args = w.types.intern_list(&[t]).expect("a list interns");
+        clauses.push(PClause::Trait { trait_: DEREF, args });
+    }
+    w.where_clauses.push((item, clauses));
+}
+
 /// `struct Wrap { n: u8 }`, `impl Deref for Wrap { type Target = <target>; }` (its `deref` fn
 /// declared, never called), and the fixture solver's row for it.
 fn wrap_world(target: PNode) -> TestWorld {
@@ -38,9 +49,9 @@ fn wrap_world(target: PNode) -> TestWorld {
 }
 
 /// ```text
-/// struct Holder<T> { v: <T as Deref>::Target, k: u8 }
-/// fn first<T>(w: T, x: <T as Deref>::Target) -> <T as Deref>::Target {
-///     let h = Holder { v: x, k: 1 };
+/// struct Holder<T: Deref> { v: <T as Deref>::Target, k: T }
+/// fn first<T: Deref>(w: T, x: <T as Deref>::Target) -> <T as Deref>::Target {
+///     let h = Holder { v: x, k: w };   // `k` fixes Holder's `T`: a projection is not injective
 ///     h.v
 /// }
 /// fn main() -> u16 { first(Wrap { n: 1 }, 700u16) }
@@ -53,14 +64,16 @@ fn a_projection_in_a_signature_a_local_and_a_field_is_normalized() {
     let mut w = wrap_world(U16);
     let proj = target_of(&mut w, T);
     w.generic_func(3, "first", 1, &[T, proj], proj);
-    w.generic_strukt(20, "Holder", 1, &[("v", proj), ("k", U8)]);
+    deref_bounds(&mut w, FIRST, &[T]);
+    w.generic_strukt(20, "Holder", 1, &[("v", proj), ("k", T)]);
+    deref_bounds(&mut w, HOLDER, &[T]);
     w.func(1, "main", &[], U16);
 
     let mut b = BodyBuf::new();
     let (wp, x, h) = (b.bind("w"), b.bind("x"), b.bind("h"));
     b.params.extend_from_slice(&[wp, x]);
     let x_e = b.local(x);
-    let one_ = b.int(1, Some(IntSuffix::Uint(UintTy::U8)));
+    let one_ = b.local(wp);
     let path = b.path("Holder");
     let start = b.field_inits.len() as u32;
     b.field_inits.push(FieldInit { name: Name::of("v"), expr: x_e });
@@ -91,7 +104,7 @@ fn a_projection_in_a_signature_a_local_and_a_field_is_normalized() {
     let at = g.intern_list(&[wrap_g]).expect("a list interns");
     assert_eq!(main.refs.as_slice(), &[Instance { item: FIRST, args: at }]);
     #[cfg(target_arch = "aarch64")]
-    assert_eq!(run_native_with(&[], &[(MAIN, None, &main), (FIRST, Some(at), &first)]), 700);
+    assert_eq!(run_native_with(&[], &[(FIRST, Some(at), &first), (MAIN, None, &main)]), 700);
 }
 
 /// `fn nested<T>(x: <<T as Deref>::Target as Deref>::Target) -> <<T as Deref>::Target as
@@ -106,6 +119,7 @@ fn a_nested_projection_is_normalized_inside_out() {
     let inner = target_of(&mut w, T);
     let outer = target_of(&mut w, inner);
     w.generic_func(3, "nested", 1, &[outer], outer);
+    deref_bounds(&mut w, FIRST, &[T, inner]);
     let mut b = BodyBuf::new();
     let x = b.bind("x");
     b.params.push(x);
@@ -126,6 +140,7 @@ fn a_projection_the_solver_does_not_answer_is_refused_by_name() {
     let mut w = wrap_world(U8);
     let proj = target_of(&mut w, T);
     w.generic_func(3, "nested", 1, &[proj], proj);
+    deref_bounds(&mut w, FIRST, &[T]);
     let mut b = BodyBuf::new();
     let x = b.bind("x");
     b.params.push(x);

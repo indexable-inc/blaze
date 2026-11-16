@@ -64,6 +64,20 @@ fn method_name(which: FnTrait) -> &'static str {
 }
 
 impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+    /// Whether the checker resolved call `e` through a `Fn*` trait (its callee row names
+    /// `call`, `call_mut` or `call_once`): a callee of a type parameter `F: Fn*(..)`, which an
+    /// instance may ground to a closure. The Reference, "Call expressions": "for closures and
+    /// other types implementing the `Fn*` traits, the call is resolved to the trait's method":
+    /// the trait the bound names, not the closure's kind, so an `Fn` closure called through `F:
+    /// FnOnce` takes its `call_once` entry (its environment consumed and dropped by the call).
+    pub(super) fn through_fn_trait(&self, e: ExprId) -> bool {
+        let Some(at) = self.checked.callees.column::<0>().iter().position(|&x| x == e) else {
+            return false;
+        };
+        let item = self.checked.callees.column::<1>()[at];
+        [FnTrait::Fn, FnTrait::FnMut, FnTrait::FnOnce].into_iter().any(|w| self.adts.fn_trait_method(w) == Some(item))
+    }
+
     /// Ground closure type `g` read: its identity (owner, ordinal, the owner's arguments) from
     /// the type, its kind, signature and environment from the seam ([`LayoutFacts::closure`],
     /// the owner's check record) grounded at those arguments, as an ADT's fields are.
@@ -208,6 +222,23 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
 
     /// The call `push_closure_call` set up: the environment (its address for `Fn`/`FnMut`) and
     /// the arguments on the stack, each crossing as a Rust parameter of its own.
+    /// The fn pointer a closure that captures nothing coerces to (`AdjustKind::ClosureFnPointer`;
+    /// the Reference, "Type coercions": "Non capturing closures to `fn` pointers"): the address
+    /// of its `call_once` at `[C, (A..)]`, `before` its type. Its environment is zero-sized (the
+    /// checker coerces only a closure with no capture), so `self` crosses as nothing and that
+    /// function's parameters are the pointer's own: one function per closure, the same one an
+    /// `FnOnce` call of it reaches (its body when the kind is `FnOnce`, else its entry).
+    pub(super) fn closure_fn_addr(&mut self, e: ExprId, before: PTy) -> Result<Value, BuildError> {
+        let g = self.ground_ty(before).map_err(|error| Self::ty_err(e, error))?;
+        let parts = self.parts_at(e, g)?;
+        let lc = self.layout(g).map_err(|error| Self::ty_err(e, error))?;
+        if self.layouts[lc as usize].size != 0 {
+            return Err(BuildError::UnsupportedType { expr: e, what: "a closure with captures coerced to a fn pointer" });
+        }
+        let instance = self.body_instance(e, g, Parts { kind: FnTrait::FnOnce, ..parts })?;
+        Ok(self.fn_addr(instance))
+    }
+
     pub(super) fn closure_call(&mut self, e: ExprId, callee: ExprId, written: &[ExprId]) -> Result<(), BuildError> {
         let t = self.adjusted_ty(callee)?;
         let g = self.ground_ty(t).map_err(|error| Self::ty_err(callee, error))?;
@@ -320,6 +351,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             V::Scalar(p) => Some((p, 0)),
             V::Place(p, off) => Some((p, off)),
             V::None => None,
+            V::Unsized(..) => return Err(malformed("a closure's environment as an unsized place")),
         };
         let mut caps = Vec::new_in(self.alloc.clone());
         self.captures_of(closure, &mut caps);
@@ -407,6 +439,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         // The environment: its pointer passed on, or the value taken (the caller's copy is the
         // entry's own) and its address passed.
         let owned = match (which, self.take_passed(reprs[0], passes[0], &mut next)?) {
+            (_, V::Unsized(..)) => return Err(malformed("a closure's environment as an unsized place")),
             (FnTrait::FnOnce, V::Place(p, off)) => Some((p, off)),
             (FnTrait::FnOnce, v) => {
                 let at = self.temp(env_repr);

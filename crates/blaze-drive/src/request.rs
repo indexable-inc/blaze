@@ -2059,6 +2059,16 @@ impl<'a> Request<'a> {
                         self.wait_on(units, name);
                         return Ok(());
                     }
+                    // Its home settled today and lists no such part (a module file at both its
+                    // places has no `Surface`, though a resolver read one of them): the want fails
+                    // alone, by name (rule 20); its waiters see it in `Task::failed`.
+                    None if home != name && self.state(home) == Some(State::Settled) => {
+                        self.failures.push(TaskFailure { name, why: Why::Refused { what: "a part its file's record does not list", rule: "keys-cover-every-input" } });
+                        self.now.remove(&name);
+                        self.set_state(name, State::Settled);
+                        self.wake_waiters(name);
+                        return Ok(());
+                    }
                     None => return Err(DriveError::NoPart { name, home }),
                 },
             }
@@ -2258,7 +2268,9 @@ impl<'a> Request<'a> {
         if let Some(Locate::Key(key)) = job.locate {
             return Err(DriveError::Missing { name, key, builder: Builder::Pack { krate: job.home } });
         }
-        let hints = self.current(name).map(|row| row.reads.iter().map(|(n, _)| *n).collect_in(self.alloc));
+        // A read that found nothing is no hint: the task asks for it again if it still looks,
+        // and a name that is not there would fail the run that was handed it.
+        let hints = self.current(name).map(|row| row.reads.iter().filter(|(_, saw)| *saw != ABSENT || self.plant == Plant::HintAbsentReads).map(|(n, _)| *n).collect_in(self.alloc));
         if let Some(hints) = hints {
             let job = self.jobs.get_mut(&name).expect("a job");
             job.needs.extend_from_slice(&hints);

@@ -26,6 +26,7 @@ use crate::{Abi, Adts, BuildError, Built, Instance, Intrinsic, Subst, ground};
 mod closure;
 pub(crate) use closure::closures_in;
 
+mod casts;
 mod numbers;
 mod strs;
 
@@ -82,6 +83,11 @@ enum V {
     Scalar(Value),
     /// A place: a pointer and a byte offset from it.
     Place(Value, i32),
+    /// The place of an unsized value (`*s` of `s: &[T]`, `&str`, `*const dyn Tr`), held as the
+    /// memory of the wide pointer that reaches it, a pointer and a byte offset: the Reference,
+    /// "Dynamically Sized Types": a pointer to one carries its metadata, and a place of one is
+    /// only borrowed (`&*s` is the pointer again) or indexed, never copied.
+    Unsized(Value, i32),
 }
 
 /// A type outside the subset, or a type the record should not hold, before it is placed.
@@ -303,8 +309,6 @@ enum Task {
     IndexPlace(ExprId),
     /// Load the value of expression `e` from the place on top.
     LoadPlace(ExprId),
-    /// Load the pointer the place on top holds (one step of an autoderef).
-    LoadPtr,
     DerefPlace,
     Spill(ExprId),
     /// Copy the aggregate argument on top into the caller's copy for the call.
@@ -342,6 +346,9 @@ struct Walk<'x, 'c, 't, A: Allocator + Clone> {
     ls: Layouts<A>,
     layouts: Vec<Layout, A>,
     layout_fields: Vec<(Name, u32, Repr), A>,
+    /// Row for row with `layout_fields`: each field's ground type at the aggregate's arguments
+    /// (walk/matches.rs follows a pattern into a field by it).
+    layout_field_tys: Vec<PTy, A>,
     /// Per enum variant laid out: its fields' range of `layout_fields` (first, len).
     layout_variants: Vec<(u32, u32), A>,
     /// Per pattern: the binding's home and how its value is held.
@@ -579,6 +586,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         ls: Layouts::new_in(alloc.clone()),
         layouts: Vec::new_in(alloc.clone()),
         layout_fields: Vec::new_in(alloc.clone()),
+        layout_field_tys: Vec::new_in(alloc.clone()),
         layout_variants: Vec::new_in(alloc.clone()),
         slots,
         reached: Vec::new_in(alloc.clone()),
@@ -1018,6 +1026,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                                 (None, _) => return Err(TyErr::Malformed("a variant `ls` dropped with a part that has a value")),
                             };
                             self.layout_fields.push((name, at, repr));
+                            self.layout_field_tys.push(pt);
                             leaves = leaves.saturating_add(self.leaves(repr));
                         }
                         self.layout_variants.push((first, (to - from) as u32));
@@ -1048,6 +1057,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                         let repr = self.repr(pt)?;
                         let at = offset(self.ls.field_offset(id, j as u32))?;
                         self.layout_fields.push((name, at, repr));
+                        self.layout_field_tys.push(pt);
                         leaves = leaves.saturating_add(self.leaves(repr));
                     }
                     let len = parts.len() as u32;
@@ -1190,6 +1200,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             V::None if !self.live => Ok(self.b.uninit(ty)),
             V::None => Err(malformed("an expression with no value where its type has one")),
             V::Place(..) => Err(malformed("a place where a scalar was expected")),
+            V::Unsized(..) => Err(malformed("an unsized place where a scalar was expected")),
         }
     }
 
@@ -1204,6 +1215,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             }
             V::None => Err(malformed("an expression with no value where its type has one")),
             V::Scalar(_) => Err(malformed("a scalar where a place was expected")),
+            V::Unsized(..) => Err(malformed("an unsized place where a sized one was expected")),
         }
     }
 
@@ -3141,16 +3153,14 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 let v = self.load(repr, at);
                 self.vals.push(v);
             }
-            Task::LoadPtr => {
-                let v = self.pop()?;
-                let at = self.place_any(v)?;
-                let v = self.load(Repr::Ptr, at);
-                self.vals.push(v);
-            }
             Task::DerefPlace => {
-                let v = self.pop()?;
-                let p = self.scalar(v, Ty::PTR)?;
-                self.vals.push(V::Place(p, 0));
+                // A thin pointer is a scalar (`repr`); a wide one is an aggregate whose
+                // dereference is an unsized place, kept as the pointer's own memory.
+                let v = match self.pop()? {
+                    V::Place(p, off) => V::Unsized(p, off),
+                    v => V::Place(self.scalar(v, Ty::PTR)?, 0),
+                };
+                self.vals.push(v);
             }
             Task::Spill(e) => {
                 let v = self.pop()?;
@@ -3182,10 +3192,15 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             }
             Task::Repeat(e) => self.repeat(e)?,
             Task::Ref => {
-                let v = self.pop()?;
-                let at = self.place_any(v)?;
-                let a = self.address(at);
-                self.vals.push(V::Scalar(a));
+                let v = match self.pop()? {
+                    // A borrow of an unsized place is the wide pointer that reached it.
+                    V::Unsized(p, off) => V::Place(p, off),
+                    v => {
+                        let at = self.place_any(v)?;
+                        V::Scalar(self.address(at))
+                    }
+                };
+                self.vals.push(v);
             }
         }
         Ok(())
@@ -3234,8 +3249,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         for i in (1..lead).rev() {
             match self.checked.adjusts.column::<1>()[rows.start + i] {
                 AdjustKind::Deref { overloaded: Some(_) } => self.work.push(Task::DerefCall(e, i as u32)),
+                // The pointer step `i` dereferences is the place step `i - 1` reached, loaded
+                // at its own type: a wide pointer whole (rule 76: never as a thin one).
                 _ => {
-                    self.work.push(Task::LoadPtr);
+                    self.work.push(Task::LoadAdjusted(e, (i - 1) as u32));
                     self.work.push(Task::DerefPlace);
                 }
             }
@@ -3343,9 +3360,13 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     self.vals.push(V::Scalar(p));
                 }
                 AdjustKind::Unsize => self.unsize(e, n)?,
-                // OWED: the closure's body as a fn of its own signature (no environment).
+                // A closure that captures nothing to a pointer: its `call_once` (closure.rs
+                // `closure_fn_addr`).
                 AdjustKind::ClosureFnPointer => {
-                    return Err(unsupported(e, "a closure that captures nothing as a fn pointer"));
+                    self.pop()?;
+                    let before = self.ty_before(e, n)?;
+                    let p = self.closure_fn_addr(e, before)?;
+                    self.vals.push(V::Scalar(p));
                 }
                 AdjustKind::Deref { .. } | AdjustKind::Borrow { .. } => {
                     return Err(malformed("a dereference or a borrow among the value adjustments"));
@@ -3516,6 +3537,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             V::None if !self.live => Ok((self.b.uninit(Ty::PTR), 0)),
             V::None => Err(malformed("an expression with no value where a place was expected")),
             V::Scalar(_) => Err(malformed("a scalar where a place was expected")),
+            V::Unsized(..) => Err(malformed("an unsized place where a sized one was expected")),
         }
     }
 
@@ -3560,9 +3582,13 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 let len = self.ground_len(len).map_err(|error| Self::ty_err(base, error))?;
                 (self.place_any(v)?, self.b.iconst(Ty::I64, u128::from(len)))
             }
-            // `v` is the wide pointer (`push_index_base`): its address at 0, length at 8.
+            // `v` is the wide pointer (`push_index_base`), or the slice's place, which is held
+            // as its wide pointer (`V::Unsized`): its address at 0, length at 8.
             PNode::Slice(_) => {
-                let w = self.place_any(v)?;
+                let w = match v {
+                    V::Unsized(p, off) => (p, off),
+                    v => self.place_any(v)?,
+                };
                 let p = self.b.load(Ty::PTR, Flags::NONE, w.0, w.1, MemAttrs::aligned(3));
                 let len = self.b.load(Ty::I64, Flags::NONE, w.0, w.1 + 8, MemAttrs::aligned(3));
                 ((p, 0), len)
@@ -4018,10 +4044,12 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// value; its own adjustments are the caller's.
     fn place_derefs(&mut self, e: ExprId, n: u32) -> Result<(), BuildError> {
         if n > 0 {
-            // The value is the first pointer; each step but the last loads the next one.
+            // The value is the first pointer; each step but the last loads the next one, at the
+            // type adjustment row `row` left (a wide pointer whole). Pushed last to first: the
+            // first load (row 0) runs first.
             self.work.push(Task::DerefPlace);
-            for _ in 1..n {
-                self.work.push(Task::LoadPtr);
+            for row in (0..n - 1).rev() {
+                self.work.push(Task::LoadAdjusted(e, row));
                 self.work.push(Task::DerefPlace);
             }
             self.work.push(Task::Raw(e));
@@ -4266,7 +4294,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     }
                     // A closure called directly: a call of its body, the instance of its kind's
                     // `Fn*` method, with its environment as `self` (closure.rs).
-                    PNode::Closure { .. } => return self.push_closure_call(e, callee, list),
+                    PNode::Closure { .. } if !self.through_fn_trait(e) => return self.push_closure_call(e, callee, list),
                     // An overloaded call through `Fn*` (the checker's callee row): the callee is
                     // `self`, evaluated with its adjustments (the borrow of `call`/`call_mut`),
                     // then the arguments, each a field of the method's tuple (lib.rs
@@ -4628,7 +4656,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 V::Scalar(self.b.convert(Op::FromExposed, Flags::NONE, Ty::PTR, addr))
             }
             (Repr::Float(_), _) | (_, Repr::Float(_)) => self.float_cast(e, v, from, to)?,
-            _ => return Err(unsupported(e, "this cast (a fn item to a pointer)")),
+            // A wide pointer, an enum, a fn item (walk/casts.rs).
+            _ => self.cast_other(e, operand, v, from, to)?,
         };
         self.vals.push(out);
         Ok(())
@@ -4669,7 +4698,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                         return self.call_pointer(e, &list, header.abi);
                     }
                     // A closure called directly (closure.rs `push_closure_call`).
-                    PNode::Closure { .. } => return self.closure_call(e, callee, written),
+                    PNode::Closure { .. } if !self.through_fn_trait(e) => return self.closure_call(e, callee, written),
                     // The checker's `Fn*::call*` at `[callee's type, tuple of the arguments]`,
                     // the callee (adjusted: borrowed for `call` and `call_mut`) its `self`.
                     _ => {

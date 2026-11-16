@@ -687,6 +687,43 @@ fn main() {
         graph.unavailable.len()
     );
 
+    // D65: where each script runs, decided from its dependency closure, and the units that
+    // wait on it (every unit whose closure reaches the unit it serves, the served one too).
+    let mut users: Vec<Vec<usize>> = vec![Vec::new(); units.len()];
+    for (at, unit) in units.iter().enumerate() {
+        for dep in unit.deps.iter() {
+            users[dep.unit.0 as usize].push(at);
+        }
+        if let Some(script) = unit.build_script {
+            users[script.0 as usize].push(at);
+        }
+    }
+    let mut native_rows = Vec::new();
+    for at in &scripts {
+        let runner = blaze_build_script::native::runner(&graph, blaze_unit_graph::UnitId(*at as u32), alloc);
+        let blaze_build_script::native::Runner::Native { because } = runner else { continue };
+        let mut seen = vec![false; units.len()];
+        let mut stack = vec![*at];
+        let mut behind = 0usize;
+        while let Some(u) = stack.pop() {
+            for &user in &users[u] {
+                if !seen[user] {
+                    seen[user] = true;
+                    behind += 1;
+                    stack.push(user);
+                }
+            }
+        }
+        let unit = &units[*at];
+        let by = &units[because.0 as usize];
+        native_rows.push(format!("native {} {} (by {} {}): {behind} units behind", unit.name, unit.version, by.name, by.version));
+    }
+    native_rows.sort();
+    println!("runners        {} native, {} wasm (D65)", native_rows.len(), scripts.len() - native_rows.len());
+    for row in &native_rows {
+        println!("  {row}");
+    }
+
     // One scan per package: host and target units of a package run one script.
     let mut rows: BTreeMap<String, (Seen, Vec<String>, Option<String>)> = BTreeMap::new();
     for at in &scripts {

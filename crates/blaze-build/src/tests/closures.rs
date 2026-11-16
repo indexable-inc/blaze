@@ -30,6 +30,31 @@ struct World {
     methods: [ItemKey; 3],
     /// `Fn`, `FnMut`, `FnOnce`.
     traits: [ItemKey; 3],
+    /// `struct D { x: u64 }`'s item, its host `Drop` fn (counts in [`DROPS`]), `fn mk_d() -> D`
+    /// (host: `D { x: 5 }`) and the `drop_in_place` lang fn.
+    d: ItemKey,
+    drop_d: ItemKey,
+    mk_d: ItemKey,
+    dip: ItemKey,
+}
+
+std::thread_local! {
+    /// How many `D`s the host's `Drop` saw.
+    static DROPS: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+}
+
+/// `D`'s `Drop::drop(&mut self)` on the host: counts one drop.
+extern "C" fn host_drop_d(p: *const u64) {
+    // SAFETY: the glue passes the D's address, a live u64 (its `x`).
+    assert_eq!(unsafe { p.read() }, 5, "a drop of a value that is not a live D");
+    DROPS.with(|d| d.set(d.get() + 1));
+}
+
+/// `mk_d()`: a one-field struct is an aggregate, returned through the result pointer (lib.rs,
+/// "Rust ABI").
+extern "C" fn host_mk_d(out: *mut u64) {
+    // SAFETY: `out` is the caller's result slot of one D.
+    unsafe { out.write(5) };
 }
 
 fn world() -> World {
@@ -43,6 +68,10 @@ fn open_world() -> World {
     let mut fx = Fx::new();
     let sized = fx.tr("Sized", 1, Vec::new(), &[]);
     fx.lang(LangItem::Sized, sized);
+    // `#[lang = "copy"] trait Copy {}`: "Capture modes" captures a value moved out by value
+    // only when it is not `Copy`, which the checker asks of this trait.
+    let copy = fx.tr("Copy", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Copy, copy);
     let (p0, p1) = (fx.param(0), fx.param(1));
     let rust_call = FnPtrHeader { abi: TAbi::RustCall, safety: Safety::Safe };
     let fn_once = fx.tr("FnOnce", 2, Vec::new(), &["Output"]);
@@ -64,7 +93,17 @@ fn open_world() -> World {
     fx.set_header(call, rust_call);
     let u64_ = fx.ty(PNode::Uint(UintTy::U64));
     let main = fx.func("main", 0, &[], u64_, Vec::new());
-    World { fx, main, methods: [call, call_mut, call_once], traits: [fn_, fn_mut, fn_once] }
+    fx.imp("copy_u64", 0, u64_, Some((copy, &[])), &[], Vec::new());
+    let d = fx.strukt("D", 0, &[("x", u64_)]);
+    let dt = fx.adt(d, &[]);
+    let md = fx.r(Mutbl::Mut, dt);
+    let unit = fx.unit();
+    let drop_d = fx.func("drop_d", 0, &[md], unit, Vec::new());
+    let mk_d = fx.func("mk_d", 0, &[], dt, Vec::new());
+    let raw = fx.ty(PNode::Ptr(Mutbl::Mut, p0));
+    let dip = fx.func("drop_in_place", 1, &[raw], unit, Vec::new());
+    fx.unsized_fn_param(dip, 0);
+    World { fx, main, methods: [call, call_mut, call_once], traits: [fn_, fn_mut, fn_once], d, drop_d, mk_d, dip }
 }
 
 /// One fn item's body: its item, its builder, its root and its literals.
@@ -128,8 +167,15 @@ impl Adts for FxAdts<'_> {
         self.w.fx.sig_of(item).map(|_| Abi::Rust)
     }
 
-    fn drop_impl(&self, _: PTy, _: &mut PortableTys<'_>) -> Result<Option<ItemKey>, crate::BuildError> {
-        Ok(None)
+    fn drop_impl(&self, ty: PTy, ground: &mut PortableTys<'_>) -> Result<Option<ItemKey>, crate::BuildError> {
+        Ok(match ground.view().node(ty) {
+            Ok(PNode::Adt(k, _)) if k == self.w.d => Some(self.w.drop_d),
+            _ => None,
+        })
+    }
+
+    fn lang_fn(&self, name: &str) -> Option<ItemKey> {
+        (name == "drop_in_place").then_some(self.w.dip)
     }
 
     fn fn_trait_method(&self, which: FnTrait) -> Option<ItemKey> {
@@ -220,6 +266,16 @@ fn run_progs(w: &World, progs: &[Prog<'_>]) -> (u64, usize) {
     super::emits(&main, &[]);
     let mut bodies: StdVec<(ItemKey, List, Built<Global>)> = StdVec::new();
     let mut closures = 0;
+    // `drop_in_place`'s written body (never built: each instance is its argument's glue).
+    let mut gb = Bb::new();
+    gb.param("p");
+    let groot = gb.block(&[], None);
+    let gview = gb.view(w.dip, groot);
+    let mut gty = InferCtx::new_in(Alloc::global());
+    let gchecked = match blaze_typeck::check(&gview, &w.fx, &mut gty, &Needs::new_in(Alloc::global()), Alloc::global()) {
+        Ok(Outcome::Done(c)) => c,
+        other => panic!("the check of `drop_in_place` did not finish: {:?}", other.err()),
+    };
     let mut todo: StdVec<(ItemKey, List)> = main.refs.iter().map(|r| (r.item, r.args)).collect();
     while let Some((item, args)) = todo.pop() {
         if bodies.iter().any(|(i, a, _)| *i == item && *a == args) {
@@ -233,9 +289,13 @@ fn run_progs(w: &World, progs: &[Prog<'_>]) -> (u64, usize) {
             let oargs = ground.view().list(c.owner_args).expect("the owner's arguments").to_vec();
             let sig = w.fx.sig_of(c.owner).expect("the owner's signature");
             let mut subst = Subst { args: &oargs, ground: &mut ground, scratch: Alloc::global() };
-            closures += 1;
-            crate::build_closure(&views[at], &checked[at], c.ordinal, which, &sig, &mut subst, &adts, Global)
+            closures += 1;            crate::build_closure(&views[at], &checked[at], c.ordinal, which, &sig, &mut subst, &adts, Global)
                 .unwrap_or_else(|e| panic!("the closure's {which:?} method failed: {e}"))
+        } else if item == w.dip {
+            let gargs = ground.view().list(args).expect("the glue's argument").to_vec();
+            let sig = w.fx.sig_of(w.dip).expect("`drop_in_place`'s signature");
+            let mut subst = Subst { args: &gargs, ground: &mut ground, scratch: Alloc::global() };
+            crate::build_drop_glue(&gview, &gchecked, &sig, &mut subst, &adts, Global).unwrap_or_else(|e| panic!("the glue at {gargs:?} failed: {e}"))
         } else if let Some(at) = progs.iter().position(|p| p.item == item) {
             let gargs = ground.view().list(args).expect("the instance's arguments").to_vec();
             let sig = w.fx.sig_of(item).expect("the fn's signature");
@@ -248,10 +308,26 @@ fn run_progs(w: &World, progs: &[Prog<'_>]) -> (u64, usize) {
         todo.extend(built.refs.iter().map(|r| (r.item, r.args)));
         bodies.push((item, args, built));
     }
-    // Callees before callers: each body was found by a caller built before it.
-    let mut fns: StdVec<(ItemKey, Option<List>, &Built<Global>)> = bodies.iter().rev().map(|(i, a, b)| (*i, Some(*a), b)).collect();
+    // Callees before callers (the run places each fn after every fn it names): a pass places
+    // each body whose built callees are all placed; a body reached twice (a glue named by two
+    // callers) is placed once, before both.
+    let mut fns: StdVec<(ItemKey, Option<List>, &Built<Global>)> = StdVec::new();
+    let mut placed = std::vec![false; bodies.len()];
+    for _ in 0..=bodies.len() {
+        for (j, (i, a, b)) in bodies.iter().enumerate() {
+            let ready = b.refs.iter().all(|r| {
+                (r.item == *i && r.args == *a) || bodies.iter().zip(&placed).all(|((ci, ca, _), &p)| p || *ci != r.item || *ca != r.args)
+            });
+            if !placed[j] && ready {
+                placed[j] = true;
+                fns.push((*i, Some(*a), b));
+            }
+        }
+    }
+    assert!(placed.iter().all(|&p| p), "a cycle among the built bodies");
     fns.push((w.main, None, &main));
-    (run_native_with(&[], &fns), closures)
+    let host = [(w.drop_d, host_drop_d as usize as u64), (w.mk_d, host_mk_d as usize as u64)];
+    (run_native_with(&host, &fns), closures)
 }
 
 /// The Reference, "Closure types": "A closure expression produces a closure value with a
@@ -324,12 +400,17 @@ fn main_applying(writes: bool) -> (Bb, ExprId, StdVec<(ExprId, u128)>) {
         let sum = bin(&mut b, BinOp::Add, xe, ye);
         b.block(&[sv], Some(sum))
     };
+    // Bound first, so no expected bound reaches the closure expression and its kind is its
+    // captures' alone (an argument written in place takes the bound's kind, as rustc does).
     let clo = b.closure(&[x], body);
+    let f = b.bind("f");
+    let sf = b.let_(f, None, clo);
+    let fe = b.local(f);
     let a = lit(&mut b, &mut lits, if writes { 5 } else { 2 });
     let callee = b.path(&["apply"]);
-    let call = b.call(callee, &[clo, a]);
+    let call = b.call(callee, &[fe, a]);
     if !writes {
-        let root = b.block(&[s0], Some(call));
+        let root = b.block(&[s0, sf], Some(call));
         return (b, root, lits);
     }
     let r = b.bind("r");
@@ -340,7 +421,7 @@ fn main_applying(writes: bool) -> (Bb, ExprId, StdVec<(ExprId, u128)>) {
     let scaled = bin(&mut b, BinOp::Mul, re, hundred);
     let ne = b.local(y);
     let out = bin(&mut b, BinOp::Add, scaled, ne);
-    let root = b.block(&[s0, s1], Some(out));
+    let root = b.block(&[s0, sf, s1], Some(out));
     (b, root, lits)
 }
 
@@ -482,4 +563,270 @@ fn a_closure_writes_a_capture_by_mutable_reference_and_the_second_call_sees_it()
     let out = bin(&mut b, BinOp::Add, scaled, nl);
     let root = b.block(&[s0, s1, s2, s3, s4], Some(out));
     assert_eq!(run(&w, &b, root, &lits), (1313, 1));
+}
+
+/// core's function.rs: `Args` is a tuple and "rust-call" spreads it, so a closure of NO
+/// parameters takes `()`: its body is `(env)` alone. `let y: u64 = 40; let f = || y + 2; f()`
+/// is 42.
+#[test]
+fn a_closure_of_no_parameters_takes_the_empty_tuple() {
+    let w = world();
+    let mut b = Bb::new();
+    let mut lits = StdVec::new();
+    let (s0, y) = let_u64(&mut b, &mut lits, "y", 40);
+    let ye = b.local(y);
+    let two = lit(&mut b, &mut lits, 2);
+    let sum = bin(&mut b, BinOp::Add, ye, two);
+    let clo = b.closure(&[], sum);
+    let f = b.bind("f");
+    let s1 = b.let_(f, None, clo);
+    let fe = b.local(f);
+    let call = b.call(fe, &[]);
+    let root = b.block(&[s0, s1], Some(call));
+    assert_eq!(run(&w, &b, root, &lits), (42, 1));
+}
+
+/// The same with THREE parameters, each a field of `Args` crossing as its own parameter in
+/// order: `let f = |a, b, c| a * 100 + b * 10 + c; f(1, 2, 3)` is 123 (an order slip gives 321
+/// or another permutation).
+#[test]
+fn a_closure_of_three_parameters_takes_them_in_order() {
+    let w = world();
+    let mut b = Bb::new();
+    let mut lits = StdVec::new();
+    let ps = [b.bind("a"), b.bind("b"), b.bind("c")];
+    let mut stmts = StdVec::new();
+    let mut uses = StdVec::new();
+    for &p in &ps {
+        let (s, e) = param_u64(&mut b, p);
+        stmts.push(s);
+        uses.push(e);
+    }
+    let h = lit(&mut b, &mut lits, 100);
+    let t = lit(&mut b, &mut lits, 10);
+    let a100 = bin(&mut b, BinOp::Mul, uses[0], h);
+    let b10 = bin(&mut b, BinOp::Mul, uses[1], t);
+    let ab = bin(&mut b, BinOp::Add, a100, b10);
+    let abc = bin(&mut b, BinOp::Add, ab, uses[2]);
+    let body = b.block(&stmts, Some(abc));
+    let clo = b.closure(&ps, body);
+    let f = b.bind("f");
+    let s0 = b.let_(f, None, clo);
+    let mut args = StdVec::new();
+    let mut lets = std::vec![s0];
+    for (name, v) in [("p", 1), ("q", 2), ("r", 3)] {
+        let (s, p) = let_u64(&mut b, &mut lits, name, v);
+        lets.push(s);
+        args.push(b.local(p));
+    }
+    let fe = b.local(f);
+    let call = b.call(fe, &args);
+    let root = b.block(&lets, Some(call));
+    assert_eq!(run(&w, &b, root, &lits), (123, 1));
+}
+
+/// "Closure types": a closure's value is a value like any other, so a closure may return one.
+/// `let add = |x| { let v: u64 = x; move |y| { let w: u64 = y; v + w } }; let g = add(40); let
+/// a: u64 = 2; g(a)` is 42: the outer body builds the inner closure's environment (its `v` by
+/// value, "Capture modes": `move`) and returns it; two closure methods built, one per ordinal.
+#[test]
+fn a_closure_returns_a_closure_that_owns_its_capture() {
+    let w = world();
+    let mut b = Bb::new();
+    let mut lits = StdVec::new();
+    let y = b.bind("y");
+    let (sw, we) = param_u64(&mut b, y);
+    let x = b.bind("x");
+    let vb = b.bind("v");
+    let xe = b.local(x);
+    let t = b.ty(PNode::Uint(UintTy::U64));
+    let sv = b.let_(vb, Some(t), xe);
+    let ve = b.local(vb);
+    let sum = bin(&mut b, BinOp::Add, ve, we);
+    let ibody = b.block(&[sw], Some(sum));
+    let inner = b.move_closure(&[y], ibody);
+    let obody = b.block(&[sv], Some(inner));
+    let outer = b.closure(&[x], obody);
+    let add = b.bind("add");
+    let s0 = b.let_(add, None, outer);
+    let (s1, n) = let_u64(&mut b, &mut lits, "n", 40);
+    let (adde, ne) = (b.local(add), b.local(n));
+    let made = b.call(adde, &[ne]);
+    let g = b.bind("g");
+    let s2 = b.let_(g, None, made);
+    let (s3, a) = let_u64(&mut b, &mut lits, "a", 2);
+    let (ge, ae) = (b.local(g), b.local(a));
+    let call = b.call(ge, &[ae]);
+    let root = b.block(&[s0, s1, s2, s3], Some(call));
+    assert_eq!(run(&w, &b, root, &lits), (42, 2));
+}
+
+/// core's function.rs: `impl<A: Tuple, F: ?Sized> Fn<A> for &F where F: Fn<A>`. In a world
+/// WITHOUT that impl, `fn apply<F: Fn(u64) -> u64>(f: &F, x: u64) -> u64 { f(x) }` called as
+/// `apply(&|x| x + y, 2)` (`y = 40`) is 42: "Call expressions" autoderefs the callee to `F`, so
+/// the call is `Fn::call` at `[C, (u64,)]`, the closure's own body.
+#[test]
+fn a_closure_by_reference_to_a_generic_fn_is_called_through_its_referent() {
+    let mut w = open_world();
+    let u64_ = w.fx.ty(PNode::Uint(UintTy::U64));
+    let p0 = w.fx.param(0);
+    let rf = w.fx.r(Mutbl::Not, p0);
+    let targs = w.fx.tuple(&[u64_]);
+    let bound = w.fx.bound(w.traits[0], &[p0, targs]);
+    let out = w.fx.proj(w.traits[2], &[p0, targs], "Output", u64_);
+    let item = w.fx.func("apply", 1, &[rf, u64_], u64_, std::vec![bound, out]);
+    w.fx.finish();
+    let mut ab = Bb::new();
+    let (f, x) = (ab.param("f"), ab.param("x"));
+    let (fe, xe) = (ab.local(f), ab.local(x));
+    let c = ab.call(fe, &[xe]);
+    let aroot = ab.block(&[], Some(c));
+    let mut b = Bb::new();
+    let mut lits = StdVec::new();
+    let (s0, y) = let_u64(&mut b, &mut lits, "y", 40);
+    let xb = b.bind("x");
+    let (sv, xv) = param_u64(&mut b, xb);
+    let ye = b.local(y);
+    let sum = bin(&mut b, BinOp::Add, xv, ye);
+    let body = b.block(&[sv], Some(sum));
+    let clo = b.closure(&[xb], body);
+    let fb = b.bind("f");
+    let s1 = b.let_(fb, None, clo);
+    let fl = b.local(fb);
+    let rfe = b.borrow(Mutbl::Not, fl);
+    let a = lit(&mut b, &mut lits, 2);
+    let callee = b.path(&["apply"]);
+    let call = b.call(callee, &[rfe, a]);
+    let root = b.block(&[s0, s1], Some(call));
+    let progs = [Prog { item: w.main, b: &b, root, lits: &lits }, Prog { item, b: &ab, root: aroot, lits: &[] }];
+    assert_eq!(run_progs(&w, &progs), (42, 1));
+}
+
+/// The Reference, "Type coercions": "Non capturing closures to `fn` pointers". `fn via(x: u64,
+/// f: fn(u64) -> u64) -> u64 { f(x) }` called as `via(41, |x| x + 1)` is 42: the pointer is
+/// the closure's `call_once` (its zero-sized `self` crosses as nothing), here the entry over
+/// its `Fn` body: two closure methods.
+#[test]
+fn a_closure_that_captures_nothing_coerces_to_a_fn_pointer() {
+    let mut w = open_world();
+    let u64_ = w.fx.ty(PNode::Uint(UintTy::U64));
+    let io = w.fx.list(&[u64_, u64_]);
+    let fp = w.fx.ty(PNode::FnPtr(io, FnPtrHeader::RUST));
+    let item = w.fx.func("via", 0, &[u64_, fp], u64_, Vec::new());
+    w.fx.finish();
+    let mut vb = Bb::new();
+    let (x, f) = (vb.param("x"), vb.param("f"));
+    let (fe, xe) = (vb.local(f), vb.local(x));
+    let c = vb.call(fe, &[xe]);
+    let vroot = vb.block(&[], Some(c));
+    let mut b = Bb::new();
+    let mut lits = StdVec::new();
+    let xb = b.bind("x");
+    let (sv, xv) = param_u64(&mut b, xb);
+    let one = lit(&mut b, &mut lits, 1);
+    let sum = bin(&mut b, BinOp::Add, xv, one);
+    let body = b.block(&[sv], Some(sum));
+    let clo = b.closure(&[xb], body);
+    let a = lit(&mut b, &mut lits, 41);
+    let callee = b.path(&["via"]);
+    let call = b.call(callee, &[a, clo]);
+    let root = b.block(&[], Some(call));
+    let progs = [Prog { item: w.main, b: &b, root, lits: &lits }, Prog { item, b: &vb, root: vroot, lits: &[] }];
+    assert_eq!(run_progs(&w, &progs), (42, 2));
+}
+
+/// `let d = mk_d();` in `b`.
+fn let_d(b: &mut Bb) -> (StmtId, PatId) {
+    let d = b.bind("d");
+    let callee = b.path(&["mk_d"]);
+    let e = b.call(callee, &[]);
+    (b.let_(d, None, e), d)
+}
+
+/// Runs `main` (one body) and returns its value, the closure methods built and the drops of
+/// `D` the host counted.
+fn run_counting(w: &World, b: &Bb, root: ExprId, lits: &[(ExprId, u128)]) -> (u64, usize, u64) {
+    DROPS.with(|d| d.set(0));
+    let (v, n) = run(w, b, root, lits);
+    (v, n, DROPS.with(core::cell::Cell::get))
+}
+
+/// "Capture modes": "`move` ... captures by value"; "Drop order": a closure's captures are
+/// dropped when the closure is. `let d = mk_d(); let f = move || { let r = &d; 7 }; 9` is 9
+/// with ONE drop of `D`: the environment owns it, `d` itself was moved and is not dropped, and
+/// the closure is dropped uncalled at the end of `main`.
+#[test]
+fn a_move_closure_owns_its_capture_and_drops_it_once_when_never_called() {
+    let w = world();
+    let mut b = Bb::new();
+    let mut lits = StdVec::new();
+    let (s0, d) = let_d(&mut b);
+    let de = b.local(d);
+    let rd = b.borrow(Mutbl::Not, de);
+    let r = b.bind("r");
+    let sr = b.let_(r, None, rd);
+    let seven = lit(&mut b, &mut lits, 7);
+    let body = b.block(&[sr], Some(seven));
+    let clo = b.move_closure(&[], body);
+    let f = b.bind("f");
+    let s1 = b.let_(f, None, clo);
+    let nine = lit(&mut b, &mut lits, 9);
+    let root = b.block(&[s0, s1], Some(nine));
+    assert_eq!(run_counting(&w, &b, root, &lits), (9, 0, 1));
+}
+
+/// "Closure types": a closure that moves a capture out is `FnOnce` only, its call consumes
+/// it. `let d = mk_d(); let f = || { let e = d; 7 }; f()` is 7 with ONE drop: `d` is captured
+/// by value (moved out, "Capture modes"), the body owns its environment and drops `e` at its
+/// end; nothing is dropped again after the call.
+#[test]
+fn an_fn_once_closure_consumes_its_capture_when_called() {
+    let w = world();
+    let mut b = Bb::new();
+    let mut lits = StdVec::new();
+    let (s0, d) = let_d(&mut b);
+    let de = b.local(d);
+    let e = b.bind("e");
+    let se = b.let_(e, None, de);
+    let seven = lit(&mut b, &mut lits, 7);
+    let body = b.block(&[se], Some(seven));
+    let clo = b.closure(&[], body);
+    let f = b.bind("f");
+    let s1 = b.let_(f, None, clo);
+    let fe = b.local(f);
+    let call = b.call(fe, &[]);
+    let root = b.block(&[s0, s1], Some(call));
+    assert_eq!(run_counting(&w, &b, root, &lits), (7, 1, 1));
+}
+
+/// "Capture modes": a `move` closure over a `Copy` value takes a COPY. `let n: u64 = 40; let f
+/// = move |x| x + n; n = 1; f(2) * 100 + n` is 4201: the closure's `n` stays 40 after the
+/// variable is assigned (by reference it would read 1: 301).
+#[test]
+fn a_move_closure_over_a_copy_value_copies_it() {
+    let w = world();
+    let mut b = Bb::new();
+    let mut lits = StdVec::new();
+    let (s0, n) = let_u64(&mut b, &mut lits, "n", 40);
+    let x = b.bind("x");
+    let (sv, xe) = param_u64(&mut b, x);
+    let ne = b.local(n);
+    let sum = bin(&mut b, BinOp::Add, xe, ne);
+    let body = b.block(&[sv], Some(sum));
+    let clo = b.move_closure(&[x], body);
+    let f = b.bind("f");
+    let s1 = b.let_(f, None, clo);
+    let nl = b.local(n);
+    let one = lit(&mut b, &mut lits, 1);
+    let set = assign(&mut b, nl, one);
+    let s2 = b.semi(set);
+    let (s3, a) = let_u64(&mut b, &mut lits, "a", 2);
+    let (fe, ae) = (b.local(f), b.local(a));
+    let call = b.call(fe, &[ae]);
+    let hundred = lit(&mut b, &mut lits, 100);
+    let scaled = bin(&mut b, BinOp::Mul, call, hundred);
+    let nr = b.local(n);
+    let out = bin(&mut b, BinOp::Add, scaled, nr);
+    let root = b.block(&[s0, s1, s2, s3], Some(out));
+    assert_eq!(run(&w, &b, root, &lits), (4201, 1));
 }

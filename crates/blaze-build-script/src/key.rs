@@ -62,6 +62,17 @@ pub struct KeyInputs<'k> {
     pub answers: ContentId,
     pub c_mode: CMode,
     pub limits: RunLimits,
+    pub runner: RunnerKey<'k>,
+}
+
+/// Where the run happens, as the key sees it (D65, [`crate::native::runner`]): decided from the
+/// dependency closure before the run.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RunnerKey<'k> {
+    /// Wasm: adds nothing, so the keys of wasm records made before D65 stand.
+    Wasm,
+    /// Native: the pinned C toolchain's shelf digest and the host target the binary is for.
+    Native { compiler: [u8; 32], target: &'k str },
 }
 
 /// The domain of the base key; a change to what it covers takes the next number.
@@ -87,5 +98,8 @@ pub fn base(inputs: &KeyInputs<'_>, scratch: &mut blaze_own::AVec<'_, u8>) -> Co
         .update(&l.out_dir_files.to_le_bytes())
         .update(&l.output.to_le_bytes())
         .update(&l.line.to_le_bytes());
+    if let RunnerKey::Native { compiler, target } = inputs.runner {
+        hasher.part(b"native").part(&compiler).part(target.as_bytes());
+    }
     hasher.finish()
 }

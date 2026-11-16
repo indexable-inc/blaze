@@ -9,7 +9,34 @@ use blaze_unit_graph::CfgAtom;
 
 use crate::env::{DepMetadata, Given, PackageFacts, env};
 use crate::instr::{Instr, Line, LinkTo, Malformed, OutputError, OutputLimits, SearchKind, Syntax, flags, lines, parse};
-use crate::key::{CMode, KeyInputs, RunLimits, base};
+use crate::key::{CMode, KeyInputs, RunLimits, RunnerKey, base};
+use crate::native::{self, Grant, GrantError};
+
+#[test]
+fn a_native_grant_says_only_what_it_names_and_refuses_what_it_cannot_say() {
+    let alloc = Alloc::global();
+    let grant = Grant {
+        program: "/w/script",
+        exec: &["/t/bin/clang"],
+        read: &["/w/pkg", "/t"],
+        write: &["/w/out"],
+    };
+    let profile = native::seatbelt(&grant, alloc).expect("a sayable grant");
+    let text = profile.as_str();
+    assert!(text.contains("(deny default)") && !text.contains("(allow default)"), "{text}");
+    assert!(text.contains("(allow process-exec (literal \"/w/script\") (literal \"/t/bin/clang\"))"), "{text}");
+    assert!(text.contains("(allow file-write* (subpath \"/w/out\") (literal \"/dev/null\"))"), "{text}");
+    assert!(!text.contains("network") && !text.contains("mach-lookup"), "no network, no service: {text}");
+    for (bad, want) in [
+        ("w/pkg", GrantError::NotCanonical { path: "w/pkg" }),
+        ("/w/../etc", GrantError::NotCanonical { path: "/w/../etc" }),
+        ("/w//x", GrantError::NotCanonical { path: "/w//x" }),
+        ("/w/\")(allow default", GrantError::Unsayable { path: "/w/\")(allow default" }),
+    ] {
+        let reads = [bad];
+        assert_eq!(native::seatbelt(&Grant { read: &reads, ..grant }, alloc).err(), Some(want), "{bad}");
+    }
+}
 use crate::outputs::{FileError, FileLimits, NoteKind, Outputs, OutputsRef, RecordError};
 use crate::probe::{self, Request, Table};
 
@@ -372,17 +399,27 @@ fn missed(key: impl Fn(&KeyInputs<'_>) -> ContentId) -> Option<&'static str> {
     let cfg = [CfgAtom::flag("unix", alloc)];
     let env_a = env(&given_env(&features, &cfg, &[]), alloc);
     let env_b = env(&given_env(&[], &cfg, &[]), alloc);
-    let at = KeyInputs { module: [1; 32], env: &env_a, answers: Table::EMPTY.id(), c_mode: CMode::Deferred, limits: LIMITS };
-    let first = key(&at);
+    let at = KeyInputs {
+        module: [1; 32],
+        env: &env_a,
+        answers: Table::EMPTY.id(),
+        c_mode: CMode::Deferred,
+        limits: LIMITS,
+        runner: RunnerKey::Wasm,
+    };
+    let native = KeyInputs { runner: RunnerKey::Native { compiler: [4; 32], target: "aarch64-apple-darwin" }, ..at };
     let row = [probe::Row { key: ContentId([7; 32]), accepted: true }];
-    let changed: [(&str, KeyInputs<'_>); 5] = [
-        ("module", KeyInputs { module: [2; 32], ..at }),
-        ("env", KeyInputs { env: &env_b, ..at }),
-        ("answers", KeyInputs { answers: Table { rows: &row }.id(), ..at }),
-        ("c_mode", KeyInputs { c_mode: CMode::Built, ..at }),
-        ("limits", KeyInputs { limits: RunLimits { fuel: 1, ..LIMITS }, ..at }),
+    let changed: [(&str, KeyInputs<'_>, KeyInputs<'_>); 8] = [
+        ("module", at, KeyInputs { module: [2; 32], ..at }),
+        ("env", at, KeyInputs { env: &env_b, ..at }),
+        ("answers", at, KeyInputs { answers: Table { rows: &row }.id(), ..at }),
+        ("c_mode", at, KeyInputs { c_mode: CMode::Built, ..at }),
+        ("limits", at, KeyInputs { limits: RunLimits { fuel: 1, ..LIMITS }, ..at }),
+        ("runner", at, native),
+        ("compiler", native, KeyInputs { runner: RunnerKey::Native { compiler: [5; 32], target: "aarch64-apple-darwin" }, ..at }),
+        ("target", native, KeyInputs { runner: RunnerKey::Native { compiler: [4; 32], target: "aarch64-unknown-linux-gnu" }, ..at }),
     ];
-    changed.iter().find(|(_, inputs)| key(inputs) == first).map(|(name, _)| *name)
+    changed.iter().find(|(_, from, to)| key(from) == key(to)).map(|(name, _, _)| *name)
 }
 
 #[test]
@@ -400,7 +437,14 @@ fn the_key_covers_every_input() {
     scratch.extend_from_slice(b"junk");
     let features = [String::from_str_in("std", alloc)];
     let e = env(&given_env(&features, &[], &[]), alloc);
-    let inputs = KeyInputs { module: [3; 32], env: &e, answers: Table::EMPTY.id(), c_mode: CMode::Deferred, limits: LIMITS };
+    let inputs = KeyInputs {
+        module: [3; 32],
+        env: &e,
+        answers: Table::EMPTY.id(),
+        c_mode: CMode::Deferred,
+        limits: LIMITS,
+        runner: RunnerKey::Wasm,
+    };
     assert_eq!(base(&inputs, &mut scratch), base(&inputs, &mut Vec::new_in(alloc)));
 }
 

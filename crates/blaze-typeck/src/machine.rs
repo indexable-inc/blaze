@@ -272,6 +272,9 @@ pub(crate) struct Machine<'b, 'w, 'c, 'a, W: World, C: TypeCtx> {
     pub fields: Vec<(ExprId, u32, u32), Alloc<'a>>,
     pub captures: Vec<(ExprId, PatId, CaptureKind), Alloc<'a>>,
     pub diags: Vec<PendingDiag, Alloc<'a>>,
+    /// Each one-segment value path that did not resolve, and its context's expectation: the
+    /// holes `rules::suggest` ranks fixes for at writeback (empty in a body with none).
+    pub named_holes: Vec<(ExprId, Expectation), Alloc<'a>>,
     /// The traits whose `dyn` was checked in this body ([`Machine::check_dyn`]: once per trait).
     pub dyn_seen: Vec<ItemKey, Alloc<'a>>,
     /// The number of errors reported: the body is "tainted by errors" when it is not zero.
@@ -360,6 +363,7 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
             fields: Vec::new_in(alloc),
             captures: Vec::new_in(alloc),
             diags: Vec::new_in(alloc),
+            named_holes: Vec::new_in(alloc),
             dyn_seen: Vec::new_in(alloc),
             errors: 0,
             casts: Vec::new_in(alloc),
@@ -940,6 +944,11 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                 tys.push(self.ty.resolve(t)?);
             }
             let ca = self.ty.mk_list(&tys)?;
+            // A clause still naming one of this probe's variables cannot outlive the caller's
+            // rollback (its variables are deleted): the goal itself is the leaf then.
+            if self.ty.list_has_infer(ca) {
+                return Ok(Some(None));
+            }
             if !self.ty.may_hold(Goal::Trait { trait_: ct, args: ca }, &mut self.reads)? {
                 return Ok(Some(Some((ct, ca))));
             }

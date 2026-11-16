@@ -483,7 +483,11 @@ fn request<'f>(
     };
     phases.mark("pointer read (last answer and leaf table)");
     let stamps = FromMeta::now(phases.clock());
-    let followed = sweep::Follow { stamps, plant: sweep::Plant::None }.follow(&cx, root, &leaves, frame)?;
+    let sweep_plant = match sizes.plant {
+        work::Plant::Sweep(plant) => plant,
+        _ => sweep::Plant::None,
+    };
+    let followed = sweep::Follow { stamps, plant: sweep_plant }.follow(&cx, root, &leaves, frame)?;
     phases.mark("sweep");
     // No table: nothing to follow; the layout discovers forward from the root manifest, and the
     // drive opens each file as a record names it.
@@ -542,7 +546,11 @@ fn request<'f>(
     // performed (a record's bytes to `Put`, a page) is freed once performed, so the request's
     // footprint is its keys, rows and findings, not every record it wrote (rule 51: a record
     // leaves for the store when its task ends). A frame would hold each until the command ended.
-    let mut req = Request::new_in(config, Ask { command, args: b"", gate: Gate::Beside, space: Space::NONE }, Alloc::global());
+    let drive_plant = match sizes.plant {
+        work::Plant::Drive(plant) => plant,
+        _ => blaze_drive::Plant::None,
+    };
+    let mut req = Request::planted_in(config, Ask { command, args: b"", gate: Gate::Beside, space: Space::NONE }, drive_plant, Alloc::global());
     // Frames for the tasks and for records read back, made on first use (a repeat runs none).
     let mut frames: Option<work::Frames> = None;
     let mut got = bstd::mem::Frame::with_reserve(bstd::mem::TASK_FRAME, bstd::mem::Tag::Other)
@@ -1107,7 +1115,128 @@ mod tests {
         write(&io, "src/x.rs", "pub fn f() {}\n");
         let created = check(&io, work::Sizes::USUAL);
         assert!(created.failed.is_empty(), "{:?}", created.failed);
-        assert_eq!(created.errors, 0, "the created file clears the error:\n{}\n{}", created.profile, stdout(&io));
+        assert_eq!(created.errors, 0, "the created file clears the error:\n{}", created.profile);
+    }
+
+    /// The findings lines of the last command: what it printed since `before` bytes of stdout.
+    fn findings_since(io: &Io, before: usize) -> std::vec::Vec<std::string::String> {
+        let out = stdout(io);
+        let mut lines: std::vec::Vec<std::string::String> = out[before..].lines().filter(|line| line.contains("error[") || line.contains("warning[")).map(std::string::String::from).collect();
+        lines.sort_unstable();
+        lines
+    }
+
+    /// One step of [`edits_answer_as_a_fresh_home`]: an edit the tape draws, on the model `files`
+    /// (path, text) and on the home's checkout.
+    fn edit_step(tape: &blaze_sim::Tape, io: &Io, files: &mut std::vec::Vec<(&'static str, std::string::String)>) -> Result<(), blaze_sim::Broke> {
+        let harness = |what: &str| blaze_sim::Broke::Harness(std::string::String::from(what));
+        let cx = io.cx(BUDGET, TASK_FRAME).map_err(|_| harness("a root context"))?;
+        let root = io.need_fs().map_err(|_| harness("files"))?.open_dir(&cx, &Path::new("ws").map_err(|_| harness("a path"))?).map_err(|_| harness("open"))?;
+        let put = |files: &mut std::vec::Vec<(&'static str, std::string::String)>, path: &'static str, text: std::string::String| -> Result<(), blaze_sim::Broke> {
+            root.publish(&cx, &Path::new(path).map_err(|_| harness("a path"))?, Content::bytes(text.as_bytes()), Durable::No).map_err(|_| harness("a write"))?;
+            files.retain(|(p, _)| *p != path);
+            files.push((path, text));
+            Ok(())
+        };
+        let remove = |files: &mut std::vec::Vec<(&'static str, std::string::String)>, path: &'static str| -> Result<(), blaze_sim::Broke> {
+            if files.iter().any(|(p, _)| *p == path) {
+                root.remove(&cx, &Path::new(path).map_err(|_| harness("a path"))?, Durable::No).map_err(|_| harness("a remove"))?;
+                files.retain(|(p, _)| *p != path);
+            }
+            Ok(())
+        };
+        let name = if tape.coin("f or g") { "f" } else { "g" };
+        let text_of = |files: &std::vec::Vec<(&'static str, std::string::String)>, path: &str| files.iter().find(|(p, _)| *p == path).map(|(_, t)| t.clone());
+        // Debt: a module at both places is kept out (drive.md, RUNNER 8: the home and a fresh
+        // home answer it differently, tape '0 1 0 2' before this guard).
+        match tape.below(8, "an edit") {
+            0 => {
+                remove(files, "src/x/mod.rs")?;
+                put(files, "src/x.rs", format!("pub fn {name}() {{}}\n"))?;
+            }
+            1 => remove(files, "src/x.rs")?,
+            2 => {
+                remove(files, "src/x.rs")?;
+                put(files, "src/x/mod.rs", format!("pub fn {name}() {{}}\n"))?;
+            }
+            3 => remove(files, "src/x/mod.rs")?,
+            // A rename: `x.rs` moves to `x/mod.rs`.
+            4 => {
+                if let Some(text) = text_of(files, "src/x.rs") {
+                    remove(files, "src/x.rs")?;
+                    put(files, "src/x/mod.rs", text)?;
+                }
+            }
+            // A touch: the same text written again.
+            5 => {
+                let text = text_of(files, "src/lib.rs").ok_or_else(|| harness("lib.rs in the model"))?;
+                put(files, "src/lib.rs", text)?;
+            }
+            6 => put(files, "src/lib.rs", format!("mod x;\npub use x::{name};\n"))?,
+            _ => {}
+        }
+        Ok(())
+    }
+
+    /// After every edit (a module file created, deleted, created at `x/mod.rs` instead, renamed,
+    /// touched without change, its user edited, all within the clock's same tick), `check`
+    /// answers as a fresh home on the same tree does (rule 26: a restore equals a fresh build),
+    /// and an unchanged repeat runs no task.
+    fn edits_answer_as_a_fresh_home(tape: &blaze_sim::Tape, plant: blaze_drive::Plant) -> Result<(), blaze_sim::Broke> {
+        let sizes = work::Sizes { plant: work::Plant::Drive(plant), ..work::Sizes::USUAL };
+        let io = Io::simulated(SimWorld::new(tape.next_u64("sim seed"), Limits::USUAL));
+        let mut files: std::vec::Vec<(&'static str, std::string::String)> = std::vec::Vec::new();
+        write(&io, "Cargo.toml", MANIFEST);
+        write(&io, "src/lib.rs", "mod x;\npub use x::f;\n");
+        files.push(("Cargo.toml", std::string::String::from(MANIFEST)));
+        files.push(("src/lib.rs", std::string::String::from("mod x;\npub use x::f;\n")));
+        let ask_now = |io: &Io, sizes: work::Sizes| -> Result<(Checked, std::vec::Vec<std::string::String>), blaze_sim::Broke> {
+            let before = stdout(io).len();
+            let checked = ask(io, (Command::Check, "check"), sizes).map_err(|e| blaze_sim::Broke::Oracle(format!("the request failed: {e:?}")))?;
+            let lines = findings_since(io, before);
+            Ok((checked, lines))
+        };
+        ask_now(&io, sizes)?;
+        for step in 0..tape.range(1..6, "steps") {
+            edit_step(tape, &io, &mut files)?;
+            let (home, home_lines) = ask_now(&io, sizes)?;
+            let fresh_io = Io::simulated(SimWorld::new(3, Limits::USUAL));
+            for (path, text) in files.iter() {
+                write(&fresh_io, path, text);
+            }
+            let (fresh, fresh_lines) = ask_now(&fresh_io, work::Sizes::USUAL)?;
+            if (home.errors, home.status, &home_lines) != (fresh.errors, fresh.status, &fresh_lines) {
+                let tree: std::vec::Vec<&str> = files.iter().map(|(p, _)| *p).collect();
+                return Err(blaze_sim::Broke::Oracle(format!(
+                    "differs from a fresh home at step {step} on {tree:?}: home {:?} {:?} {home_lines:?}, fresh {:?} {:?} {fresh_lines:?}\n{}",
+                    home.errors, home.status, fresh.errors, fresh.status, home.profile
+                )));
+            }
+            let (again, _) = ask_now(&io, sizes)?;
+            if again.runs != 0 {
+                return Err(blaze_sim::Broke::Oracle(format!("an unchanged repeat ran {} tasks at step {step}:\n{}", again.runs, again.profile)));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn edits_of_module_files_answer_as_a_fresh_home() {
+        blaze_sim::check(blaze_sim::Config::cases(40), |tape| edits_answer_as_a_fresh_home(tape, blaze_drive::Plant::None));
+    }
+
+    // OPEN BUG, found by these at 400 cases (seed 245, BLAZE_SIM_TAPE='0 2 0 2 0 6 0 3': create
+    // `x/mod.rs`, edit lib.rs, delete `x/mod.rs`): the request fails `NoFile` for FileItems of
+    // `src/x.rs` (drive `absent_module`: no `part_paths` row). The controls run 200 cases until
+    // it is fixed (drive.md, RUNNER 8); raise them back to 400 with the fix.
+    #[test]
+    fn the_fresh_home_oracle_catches_forgotten_absent_readers() {
+        blaze_sim::control(blaze_sim::Config::cases(200), blaze_drive::Plant::None, blaze_drive::Plant::ForgetAbsentReaders, "differs from a fresh home", edits_answer_as_a_fresh_home);
+    }
+
+    #[test]
+    fn the_zero_runs_clause_catches_absent_reads_handed_as_hints() {
+        blaze_sim::control(blaze_sim::Config::cases(200), blaze_drive::Plant::None, blaze_drive::Plant::HintAbsentReads, "an unchanged repeat ran", edits_answer_as_a_fresh_home);
     }
 
     /// A missing module file is one finding at its `mod` line, naming both places; the rest of

@@ -32,6 +32,7 @@ mod exports;
 mod fixtures;
 mod items;
 mod more;
+mod names_record;
 mod name_rules;
 mod oracle;
 /// The reference solver's seam a solver core is compared through (oracle.rs).

@@ -1433,6 +1433,53 @@ FIRST JOB: `lanecheck.sh blaze-ladder test "--test front2_project"`, fix my file
   returned expression against the bounds: both told to the checker lane. Auto-trait leakage
   needs the defining body's record.
 
+#### Heads lane: types and bounds (2026-11-16, fifth runner; opaque types end to end)
+
+- MEASURED: lanecheck `"--test front2_dyn --test front2_bounds --test front2_heads"`: "3 passed,
+  0 failed" (front2_dyn's edit holds). heads-4 (core): "heads 48635, built 46877 (96.4%)" against
+  heads-3 "built 46859 (96.3%)": +18, the 16 return-position `impl Trait` and 2 `async fn` rows
+  are gone. Body census (WITH the defining-body rule below): census-opq-1 "HEAD crate bstd:
+  bodies 2309, clean 2222 (96.2%)" against 2136 (92.5%) (other lanes' work is in the delta too).
+  ONE opaque body is wrong, OURS, NEXT: `bstd::fs::<impl Entries>::iter` (fs.rs:211) E0277
+  "`Opaque(..): Iterator`" at `self.listing.iter().zip(..)`: blaze_core's `Listing::iter` returns
+  `impl ExactSizeIterator<..>` and an opaque's bounds are not elaborated to supertraits (rustc's
+  `item_bounds` = elaborated `explicit_item_bounds`). Fix in the head (preds.rs `impl_bounds`,
+  each bound's supertrait clauses substituted, as `item_bounds`) or in blaze-solve alias.rs
+  `bound_pred` (Type checker lane's) through builtin.rs `elaborate_supertraits`.
+  heads-5 / census-opq-2 were NOT run: no head changed after heads-4, and census-opq-1 already
+  ran with every change of this runner.
+- OPEN, FIRST for the next runner: the must-pass run (`front2_bounds ladder_front2 front2_main
+  front2_dyn front2_order front2_items front2_checks`, use_opt_next back in CLEAN): "19 passed, 2
+  failed": front2_main `his_main_through_the_checker` and `the_entry_programs_as_far_as_each_gets`
+  panic at blaze-ty infer.rs:247 "index out of bounds: the len is 31 but the index is 31" (a
+  variable past its table). NOT yet known whether it is ours (the `defining` variables made in
+  `start_body`) or the closure/speed lanes' uncommitted infer/mod.rs: test the cause by making
+  `lower_defining_output` call `lower_sig_ty` (the plant's path) and rerunning front2_main.
+  front2_bounds passed in that run (use_opt_next clean through the front end); cargo stops at the
+  first failing binary, so front2_order and ladder_front2 did NOT run.
+- ASYNC FN BODIES were never a wrong-error risk: blaze-lower typeck.rs (~892) sets
+  `CoroutineKind::Async { output }` from `sig::ASYNC`, and blaze-typeck control.rs `start_body`
+  checks the body against the written `T` with an async site (`.await` allowed). So the lowering
+  keeps the block (the coroutine is the code builder's, as desugar.rs:280 says); it was not
+  rewritten into an `async move` block. front2_bounds: `af`, `g` (`af(1).await`) clean, `h`
+  (`"a"` for `u8`) Mismatch. Owed: the fn's own future's interior (`analyze_futures` covers async
+  BLOCKS only), so `Send` of an async fn's future is not computed.
+- DEFINING BODIES (NEW blaze-typeck rules/opaque_def.rs; call site control.rs `start_body`;
+  machine.rs `defining`/`opening` and one arm in `lower_at`): a non-async fn's output is lowered
+  with each opaque as one hidden-type variable; the opaque's bounds are registered on it before
+  the walk. Before this the returned value met the RIGID opaque and the body failed with
+  `DiagWithoutPlace { code: Unsatisfied }` (the control `control_opaque_not_opened`, a plant).
+  suite/opaque.rs "10 passed, 0 failed": two returns of one type clean, of two types Mismatch at
+  the second, `"a"` for `impl Tr2` Unsatisfied, a generic opaque at two instances, the two old
+  fixtures (they lacked the `Sized` bound the heads file).
+- `Send` (any ambiguous goal) on an opaque is now the typed gap `Unported("an auto trait of an
+  opaque type: its hidden type is not recorded yet")` (machine.rs `report_fulfill_errors`), was
+  E0283. Fixture `send_of_an_opaque_is_a_gap_until_its_hidden_type_is_recorded`.
+- NEXT: write each `defining` hidden type into `Checked` (writeback, per opaque key) and answer
+  world_items `opaque_hidden` from the defining body's record; then auto traits leak.
+- `use_opt_next`: the checker alone checks it clean (`a_method_on_an_opaque_bound_by_a_pattern`);
+  put back in CLEAN to be measured through the front end.
+
 #### Heads lane: items (2026-11-16, first runner; handing on)
 
 - Const generics are built in every head. `heads::own_generics` gives each const param its
@@ -2027,7 +2074,65 @@ ours): use mixcheck.
   NoLangFn, Select, NoAbi, NoStatic, NoConstValue, MissingRecord, NoAdt, Intrinsic, CAbi, Vtable, Lir,
   Verify. The RUN lane's build survey, when relayed, replaces this order.
 
-### Code builder: closures (2026-11-16 ~11:15; handing on)
+### Code builder: closures (2026-11-16, runner 3; handing on)
+
+Whole suite: "test blaze-build: exit 0; 121 passed, 0 failed" (uncommitted, this tree).
+- FIXED the red `call_once` test: the cause was the BUILDER, not the checker (it records `Fn`
+  for `|x| x + y`). walk.rs's two closure dispatch arms (`Expr::Call` push and `call`) took the
+  direct path whenever the callee grounds to a closure, so `f(x)` with `F: FnOnce` called the
+  `Fn` body, never `call_once`. Now `closure.rs through_fn_trait(e)` (the checker's callee row
+  names a `Fn*` method) sends it through the trait method. Key line removed in `call`: "left:
+  (42, 1) right: (42, 2)".
+- NEW tests, all pass natively: no parameters (42), three in order (123), a closure returning a
+  `move` closure (42, two methods), `apply(f: &F)` through autoderef (42), by-move capture
+  dropped once uncalled (9, drops 1), `FnOnce` closure consuming its capture (7, drops 1), `move`
+  over Copy copies (4201), `ClosureFnPointer` (42: `closure_fn_addr`, the closure's
+  `call_once` at `[C, (A..)]`, refused unless the closure is zero-sized). The fixture world now
+  has `drop_in_place`, `struct D` with a counting host `Drop`, `Copy` + `impl Copy for u64`, and
+  places bodies in dependency order.
+- FOUND (told the checker lane): rules/closure.rs `moved_out` returns `false` when the world has
+  no `copy` lang item, so a moved-out non-Copy capture became ByRef and D dropped twice ("left:
+  (7, 1, 2)"). A silent fallback (rule 3). FIXED by the checker lane: a missing `copy` lang item
+  is now a MissingLangItem finding and the use counts as a move ("test blaze-typeck: exit 0; 135
+  passed, 0 failed", its report).
+- `&F` with core's blanket `impl Fn for &F`: the checker would pick it (first autoderef step), so
+  the builder reaches `Fn::call` at `[&C, ..]`: an ordinary impl method the seam resolves; its
+  body `(**self).call(args)` needs the RustCall tuple param (walk.rs ~2336) and spread (~4708),
+  both present. Not run with the impl in a fixture.
+- NOT DONE: fn ITEM / fn POINTER as `F`: with `F: FnOnce` the call grounds to FnDef/FnPtr and is
+  called directly (no shim needed, untested); with `F: Fn`/`FnMut` the callee is borrowed and
+  goes to `Fn::call` at `[FnDef|FnPtr, ..]`, which needs a SHIM instance (none exists:
+  `build_closure` takes a closure ordinal only). Step 5 (a closure across two bodies, key per
+  owner arguments) not started. Removed-line run for `ClosureFnPointer` not done.
+
+Runner 2's state (supersedes the 11:15 notes below where they disagree):
+- IDENTITY: the checker's `PNode::Closure { owner, ordinal, args }` is the one ground form; the
+  builder's self-describing form and its grounding rounds (`ground_closures`, `NOT_READY`, the
+  walk's `closures` fields) are deleted. Kind, signature and ENVIRONMENT are facts asked through
+  a new seam method `layout::LayoutFacts::closure(owner, ordinal) -> ClosureFacts { types, kind,
+  sig, env }` (default `None` = a refusal naming it), answered from the owner's check record by
+  `layout::closure_facts(checked, ordinal, generics, out, scratch)` (kind and sig from
+  `Checked::closures`, env from `Checked::captures`). Layout grounds the env like an ADT's
+  fields; the walk's `closure_parts(g)` (closure.rs) the same. `closures_in(body)` (closure.rs)
+  is the one place an ordinal is derived from a body. Instance key: tag 20, owner + ordinal,
+  children the owner's args. NOT DONE: blaze-ladder's seam does not answer
+  `LayoutFacts::closure` yet (its owner, the integration lane, must: call `closure_facts` on the
+  owner's `Checked`).
+- ENTRIES built: `build_closure(body, checked, ordinal, which: FnTrait, ..)` builds the body
+  when `which` is the kind, the thin entry (`closure.rs run_entry`: `call_mut` passes the
+  pointer on; `call_once` takes the env by value, calls the body on its address, drops it if
+  it needs drop) when weaker, and refuses a stronger one.
+- Tests (src/tests/closures.rs; `run_progs` builds several bodies, generic fns at ground args):
+  identity by ordinal (1112; with the ordinal key line removed: "left: (1111, 1) right: (1112,
+  2)"); the three first forms (removed-line run: no-capture "the value stack ran out", by-ref
+  and by-mut-ref "a local used before its binding"); `apply<F: Fn>` 42 and `apply<F: FnMut>`
+  1111 PASS; the call_mut and call_once entries 42 PASS (two methods built each; main binds the
+  closure first so no expected bound sets its kind). Whole suite after the checker's
+  kind-from-use fix: "lanecheck blaze-build test: exit 0; 112 passed, 0 failed".
+- NOT STARTED: zero/three params, closure returning closure, `&F` blanket impl test, by-move
+  fixture with drop count (step 3; the checker now records ByValue and `move`, and the kind
+  from each capture's use), fn item / fn pointer shims, `ClosureFnPointer` (step 4), a closure
+  returned from a generic fn (step 5).
 
 Uncommitted, in /Volumes/Projects/blaze-fresh-1115. Read codegen.md "Closures and the Fn traits", "The
 design" list first. blaze-emit was red under lanecheck at 11:14 (`enc::sxtw`, not ours): use mixcheck.
@@ -2089,4 +2194,68 @@ A later `mixcheck ... test forms` was red only in the closures lane's mid-edit t
   (3) char/u128/i128 signature refusals should now pass: re-run the survey to confirm; (4) casts of
   fn items to pointers; (5) `match` on references, tuples, ranges, slices; then slice patterns and
   overloaded `Index`.
+
+### Code builder: strings, slices and numbers, runner 2 (2026-11-16 ~11:35; handing on)
+
+Uncommitted, in /Volumes/Projects/blaze-fresh-1115. Suite: "mixcheck test blaze-build: exit 101; 111
+passed, 1 failed" (tree 4364cd6cbc): the one failure is the closures lane's
+`an_fn_closure_used_as_fn_once_goes_through_its_call_once_entry` ("left: (42, 1) right: (42, 2)").
+- DONE, class (1) of the survey (302 "an associated type in an instance" + 61 "a value of an
+  associated type"): ONE `instance::ground(from, ty, args, ground, scratch, facts: &dyn LayoutFacts)`
+  (`ground_with` and its `closures` parameter deleted, agreed with the closures lane; `NOT_READY`
+  stays until that lane deletes its grounding rounds) substitutes, keeps `PNode::Alias` with its
+  args mapped, then src/normalize.rs `normalize_ground` replaces every projection: rounds over the
+  ground table (a work list, no recursion, at most `ROUNDS` = 64), the solver asked only with
+  projection-free args (a projection over a fresh answer waits a round). The seam: a defaulted
+  `LayoutFacts::normalize(trait_, name, args: &[PTy], ground) -> Result<PTy, BuildError>`, default
+  `Err(BuildError::Projection { trait_, name })` (on LayoutFacts, not Adts, because layout grounds
+  fields too; the walk reaches it by `Adts::facts()`). Callers ported: walk.rs `ground_in` and the
+  field grounding, layout.rs (two), closure.rs (two), blaze-consteval fixture.rs:701.
+- KEY: `instance_key_normalized(code, args, from, ground, facts, scratch)` = `instance_key` over
+  args followed by each `Alias` of `from` normalized; equal to `instance_key` with no projection.
+- TESTS (src/tests/projections.rs; fixture solver `TestWorld::projs`, where-clauses
+  `TestWorld::where_clauses`): native `first::<Wrap>` with a projection in its signature, a local
+  and a `Holder` field, called from `main`: 700; a nested projection: 201; an unanswered one
+  refused naming trait 0x5a; two programs differing only in `Target` share `instance_key` and
+  differ in `instance_key_normalized`. "mixcheck test blaze-build: exit 0; 4 passed, 0 failed".
+  Removed-line run (`projections = true;` gone): all 4 fail, "the build failed: a malformed body
+  or record: a type the ground table does not hold".
+- OWED BY THE RUN LANE (its next runner): fill `normalize` in run.rs FrontAdts and FrontConsts
+  LayoutFacts impls; switch run.rs ~1010 to `instance_key_normalized`; `Adts::float_lit`;
+  `tc::Lit::CStr` in program.rs ~736. Then rerun the survey: the 302 + 61 should move.
+- NEXT: steps (2) and (3) of the brief untouched (35 "a place where a scalar was expected", 6 the
+  reverse; casts; matches; ...), in the order of the section above.
+
+### Code builder: forms, runner 3 (2026-11-16; handing on at the call budget)
+
+Uncommitted, in /Volumes/Projects/blaze-fresh-1115. Suite: "lanecheck test blaze-build: exit 0; 122
+passed, 0 failed" (the closures lane's earlier red test passes now too).
+- DONE, (1) place/scalar mix-ups: the root was UNSIZED PLACES. `Task::DerefPlace` took the pointer
+  as a scalar, so `*s` of a wide pointer (`&*s`, a reborrow, `(*s)[i]`) failed "a place where a
+  scalar was expected" (reproduced, quoted from the run); `Task::LoadPtr` loaded every inner
+  pointer as a thin one, so `&&[T]` deref chains made a scalar of a wide pointer ("a scalar where a
+  place was expected", the reverse class). Fix at its one home: a new `V::Unsized(p, off)` (walk.rs
+  `enum V`: an unsized place held as its wide pointer's memory); `DerefPlace` of an aggregate
+  pointer makes one; `Task::Ref` of one is the wide pointer again; `index_place`'s slice arm takes
+  one; `scalar`/`place`/`place_any` refuse it by name. `LoadPtr` DELETED: each deref step loads
+  with `LoadAdjusted(e, row)` at the adjustment row's own type (`place_derefs`,
+  `push_deref_chain`). closure.rs: two refusal arms (agreed with the closures lane). Test
+  tests/places.rs `a_wide_pointer_reborrows_and_reads_back_whole` (native 32307, including a
+  `&&[u8]` to `&[u8]` deref coercion); removed-line run (`V::Place(p, off) => V::Unsized(p, off)`
+  gone): "the build failed: a malformed body or record: a place where a scalar was expected".
+  NOT VERIFIED that the survey's 35 + 6 are all this class: the survey prints no expression id.
+- DONE, (2) casts: walk/casts.rs `cast_other` (walk.rs `cast` dispatches its last arm there): fn
+  item to fn pointer / raw pointer / integer (`fn_addr`), wide pointer to thin (address) and to
+  wide (both words), enum to integer (`read_discriminant`, resized; a zero-sized enum's lone
+  variant). Test tests/casts.rs (native 2507); removed-line run: "expression 7: REMOVED-LINE RUN
+  is not built to LIR yet". Still refused by name: a wide pointer to an integer, a struct to an
+  integer. Not tested natively: fn item to integer, explicit enum discriminants, a negative one.
+- RULE BROKEN ONCE: tests/places.rs's expected value and doc line were edited with `sed`; the
+  file is a test and compiled, but say so to the next reviewer.
+- NEXT, untouched: (3) matches on references (default binding modes), tuples, `char`, ranges,
+  slice patterns, nested or-patterns (walk/matches.rs); (4) NoConstValue, borrowed temporaries
+  that need drop, `let` chains and `let`-`else`, `format_args!`; (5) overloaded `Index`, float `%`,
+  i128 div/rem (`__udivti3` and friends: compiler_builtins on the toolchain shelf; not looked up),
+  i128 <-> float. The run lane should rerun the survey: expect the 35 "a place where a scalar was
+  expected", the 6 reverse, and the cast rows (22 + 18 + 10 + 6) to move.
 

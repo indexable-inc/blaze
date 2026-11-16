@@ -23,7 +23,7 @@ use std::{
 use blaze_build_script::{
     Env, Outputs, OutputsRef,
     instr::{OutputError, OutputLimits},
-    key::{self, KeyInputs},
+    key::{self, KeyInputs, RunnerKey},
     outputs::{FileError, FileLimits},
     probe::Table,
 };
@@ -383,7 +383,15 @@ impl ScriptRuntime {
 
     /// The record's base key of `script` run by `loaded` with `env`.
     pub fn base(&self, loaded: &LoadedScript, script: &Script, env: &Env<'_>) -> ContentId {
-        let inputs = KeyInputs { module: loaded.sha256, env, answers: Table { rows: &script.table }.id(), c_mode: script.c_mode, limits: script.limits };
+        // This runner is the wasm one: a native script never reaches it (D65).
+        let inputs = KeyInputs {
+            module: loaded.sha256,
+            env,
+            answers: Table { rows: &script.table }.id(),
+            c_mode: script.c_mode,
+            limits: script.limits,
+            runner: RunnerKey::Wasm,
+        };
         let mut scratch = blaze_own::Vec::new_in(Alloc::global());
         key::base(&inputs, &mut scratch)
     }

@@ -28,6 +28,8 @@ pub mod hook;
 #[cfg(feature = "runtime")]
 pub mod host;
 #[cfg(feature = "runtime")]
+pub mod native_sandbox;
+#[cfg(feature = "runtime")]
 pub mod protocol;
 #[cfg(feature = "runtime")]
 pub mod script;

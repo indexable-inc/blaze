@@ -112,6 +112,20 @@ pub trait FrontEnd {
     fn int_lit(&self, owner: ItemKey, e: ExprId) -> Option<u128>;
     fn int_pat(&self, owner: ItemKey, p: PatId) -> Option<u128>;
     fn string(&self, owner: ItemKey, e: ExprId) -> Option<&[u8]>;
+    /// Float literal `e` of `owner`'s body, its text rounded to the nearest `f64` and to the
+    /// nearest `f32` (each rounded once, from the text): the back half picks by the type the
+    /// check gave it. `None`: the front end did not read it (the builder refuses it).
+    fn float_lit(&self, owner: ItemKey, e: ExprId) -> Option<(u64, u32)> {
+        let _ = (owner, e);
+        None
+    }
+    /// The projection `<args[0] as trait_<args[1..]>>::name` at ground `args` (in `ground`),
+    /// normalized by the front end's solver (`blaze_typeck::normalize_projection`): `Ok(None)`
+    /// when it is not normalized. The default: not answered (the builder refuses it by name).
+    fn normalize(&self, trait_: ItemKey, name: blaze_typeck::Name, args: &[PTy], ground: &mut PortableTys<'_>) -> Result<Option<PTy>, ResolveError> {
+        let _ = (trait_, name, args, ground);
+        Ok(None)
+    }
     fn repr(&self, key: ItemKey) -> ReprAttrs;
     fn intrinsic(&self, item: ItemKey) -> Option<Intrinsic>;
     fn static_item(&self, key: ItemKey) -> Option<StaticItem>;

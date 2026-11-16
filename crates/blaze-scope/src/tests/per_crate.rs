@@ -184,9 +184,15 @@ fn crate_by_crate_through_records_answers_as_the_whole_set_and_writes_equal_byte
 fn records_equal_across_workers_and_orders() {
     let crates = crates();
     let g = Alloc::global();
-    // The read list is a record too: its bytes are the same whatever order the fill asked in.
+    // The read list is a record too: its bytes are the same whatever order the fill asked in;
+    // and so is the full-names record ([`crate::names_record`]).
     let bytes = |all: &[CrateScope<'static>]| {
-        all.iter().map(|c| (c.record.to_vec(), c.inner.to_vec(), crate::asked::encode(c.names.key, &[], &c.asked, g).to_vec())).collect::<Vec<_>>()
+        all.iter()
+            .map(|c| {
+                let names = crate::names_record::encode(c.names, g).unwrap_or_else(|e| panic!("names record of `{}`: {e:?}", c.names.name));
+                (c.record.to_vec(), c.inner.to_vec(), crate::asked::encode(c.names.key, &[], &c.asked, g).to_vec(), names.to_vec())
+            })
+            .collect::<Vec<_>>()
     };
     for sysroot in [Sysroot::default(), Sysroot { core: Some(CrateId(2)), ..Sysroot::default() }] {
         let (one, _) = resolve_by_records(&crates, sysroot, &TEXTS, &Serial, &Ready::serial(WAIT), g).unwrap_or_else(|e| panic!("one worker: {e:?}"));
@@ -201,6 +207,7 @@ fn records_equal_across_workers_and_orders() {
                 assert!(a.0 == b.0, "crate `{}`: exports differ, 1 worker vs 4 with ranks {rank:?} (core {:?})", crates[i].name, sysroot.core);
                 assert!(a.1 == b.1, "crate `{}`: inner differs, 1 worker vs 4 with ranks {rank:?} (core {:?})", crates[i].name, sysroot.core);
                 assert!(!a.2.is_empty() && a.2 == b.2, "crate `{}`: read list differs, 1 worker vs 4 with ranks {rank:?} (core {:?})", crates[i].name, sysroot.core);
+                assert!(!a.3.is_empty() && a.3 == b.3, "crate `{}`: names record differs, 1 worker vs 4 with ranks {rank:?} (core {:?})", crates[i].name, sysroot.core);
             }
         }
     }

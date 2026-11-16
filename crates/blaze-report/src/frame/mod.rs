@@ -600,6 +600,77 @@ pub fn note(out: &mut AString<'_>, words: &str, caps: Caps) {
     pen.end();
 }
 
+/// Why [`help`] drew nothing: the caller's fix does not fit its text.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HelpError {
+    /// The edit's range is not in the text, or is not on one line.
+    NotOneLine { start: u32, end: u32, len: usize },
+    /// The line is not UTF-8.
+    NotText { line: u32 },
+}
+
+/// Advice attached to an error (the error stands either way): `help: words`, then, for a fix,
+/// the line before it (`N - ..`) and after it (`N + ..`), whole. `text` is the file, `fix` one
+/// edit on one line (file-relative: the printer adds the item's place to a record's range).
+///
+/// ```text
+/// help: `b` is in scope, is a `u32`, and is never used
+/// 1 - fn add(a: u32, b: u32) -> u32 { a + c }
+/// 1 + fn add(a: u32, b: u32) -> u32 { a + b }
+/// ```
+pub fn help(out: &mut AString<'_>, words: &str, text: &[u8], fix: Option<Edit<'_>>, caps: Caps) -> Result<(), HelpError> {
+    let caps = if caps.form == Form::Lines { Caps::LINES } else { caps };
+    // The lines first, so nothing is drawn for a fix that does not fit.
+    let mut lines = None;
+    if let Some(e) = fix {
+        let bad = HelpError::NotOneLine { start: e.start, end: e.end, len: text.len() };
+        let (s, x) = (e.start as usize, e.end as usize);
+        if s > x || x > text.len() || text[s..x].contains(&b'\n') {
+            return Err(bad);
+        }
+        let first = text[..s].iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+        let last = text[x..].iter().position(|&b| b == b'\n').map_or(text.len(), |i| x + i);
+        let number = text[..s].iter().filter(|&&b| b == b'\n').count() as u32 + 1;
+        let line = core::str::from_utf8(&text[first..last]).map_err(|_| HelpError::NotText { line: number })?;
+        let (before, after) = (s - first, x - first);
+        if !line.is_char_boundary(before) || !line.is_char_boundary(after) {
+            return Err(HelpError::NotText { line: number });
+        }
+        lines = Some((number, line, before, after, e.insert));
+    }
+    let mut pen = Pen::new(out, caps);
+    pen.put(Style { bold: true, ..Style { fg: Ink::Note.colour(), ..Style::PLAIN } }, "help", 4);
+    pen.put(Style::PLAIN, ": ", 2);
+    pen.put(Style::PLAIN, words, words.chars().count() as u32);
+    pen.end();
+    if let Some((number, line, before, after, insert)) = lines {
+        let mut digits = [0u8; 10];
+        let mut n = number;
+        let mut at = digits.len();
+        loop {
+            at -= 1;
+            digits[at] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        let number = core::str::from_utf8(&digits[at..]).unwrap_or("?");
+        let width = |s: &str| s.chars().count() as u32;
+        for (sign, ink, middle) in [("-", Ink::Error, &line[before..after]), ("+", Ink::Note, insert)] {
+            pen.put(Style::DIM, number, width(number));
+            pen.put(Style { fg: ink.colour(), ..Style::PLAIN }, " ", 1);
+            pen.put(Style { fg: ink.colour(), ..Style::PLAIN }, sign, 1);
+            pen.put(Style::PLAIN, " ", 1);
+            pen.put(Style::PLAIN, &line[..before], width(&line[..before]));
+            pen.put(Style { fg: ink.colour(), ..Style::PLAIN }, middle, width(middle));
+            pen.put(Style::PLAIN, &line[after..], width(&line[after..]));
+            pen.end();
+        }
+    }
+    Ok(())
+}
+
 /// `0.5 ms`, `1.1 ms`, `312 ms`, `2.4 s`, `95 s`: two or three figures.
 fn duration(buf: &mut [u8; 24], nanos: u64) -> &str {
     let (tenths, unit) = match nanos {

@@ -35,7 +35,7 @@ struct Use {
 }
 
 #[derive(Clone, Debug)]
-struct Spec {
+pub(super) struct Spec {
     g: [bool; 3],
     h: [bool; 3],
     g_globs_h: bool,
@@ -46,7 +46,7 @@ fn names(tape: &Tape, label: &'static str) -> [bool; 3] {
     [tape.bool(label), tape.bool(label), tape.bool(label)]
 }
 
-fn draw(tape: &Tape) -> Vec<Spec> {
+pub(super) fn draw(tape: &Tape) -> Vec<Spec> {
     let n = 2 + tape.index(3, "crates");
     let mut specs = Vec::new();
     for i in 0..n {
@@ -131,7 +131,7 @@ fn text(spec: &Spec) -> &'static str {
     leak(t)
 }
 
-fn world(specs: &[Spec]) -> (&'static Texts, Vec<CrateInput<'static>>) {
+pub(super) fn world(specs: &[Spec]) -> (&'static Texts, Vec<CrateInput<'static>>) {
     let mut files = Vec::new();
     let mut inputs = Vec::new();
     for (i, s) in specs.iter().enumerate() {

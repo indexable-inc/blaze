@@ -528,6 +528,9 @@ struct KeptDir<'w> {
     find_ns: AtomicU64,
     /// Bytes of the read lists written this run (blaze-scope's question-grain record).
     read_bytes: AtomicU64,
+    /// Bytes of the full-names records written this run ([`blaze_scope::names_record`]).
+    names_bytes: AtomicU64,
+    keeps_names: bool,
     outlined: AtomicU64,
     /// By crate: why it was not found (`None`: found, or not asked).
     missed: Vec<std::sync::Mutex<Option<String>>>,
@@ -678,6 +681,20 @@ impl blaze_scope::crate_scope::Kept for KeptDir<'_> {
         let part = path.with_extension("part");
         std::fs::write(&part, &out).unwrap_or_else(|e| panic!("kept record {}: {e}", part.display()));
         std::fs::rename(&part, &path).unwrap_or_else(|e| panic!("kept record {}: {e}", path.display()));
+    }
+
+    /// `--no-names`: no full-names record written (to measure what writing them costs).
+    fn keeps_names(&self) -> bool {
+        self.keeps_names
+    }
+
+    /// `<hex>.names`, beside the crate's kept file: found when the crate is.
+    fn names(&self, krate: usize, names: &[u8]) {
+        let path = self.path(krate).with_extension("names");
+        let part = self.path(krate).with_extension("names-part");
+        std::fs::write(&part, names).unwrap_or_else(|e| panic!("names record {}: {e}", part.display()));
+        std::fs::rename(&part, &path).unwrap_or_else(|e| panic!("names record {}: {e}", path.display()));
+        self.names_bytes.fetch_add(names.len() as u64, Ordering::Relaxed);
     }
 }
 
@@ -1352,6 +1369,8 @@ fn main() {
                 found: AtomicUsize::new(0),
                 find_ns: AtomicU64::new(0),
                 read_bytes: AtomicU64::new(0),
+                names_bytes: AtomicU64::new(0),
+                keeps_names: !args.iter().any(|a| a == "--no-names"),
                 outlined: AtomicU64::new(0),
                 missed: (0..inputs.len()).map(|_| std::sync::Mutex::new(None)).collect(),
             };
@@ -1383,6 +1402,50 @@ fn main() {
                 max_footprint() as f64 / 1e6
             );
             println!("threads {t}: read lists written this run: {} bytes", kept.read_bytes.load(Ordering::Relaxed));
+            println!("threads {t}: names records written this run: {} bytes", kept.names_bytes.load(Ordering::Relaxed));
+            // `--question`: ten crates, evenly spaced by index; each solved this run prints its
+            // solve's span; then one path in each is resolved through its names record alone,
+            // opened (mapped) on that first ask: the time and the bytes decoded per crate.
+            if args.iter().any(|a| a == "--question") {
+                let ten: Vec<usize> = (0..10).map(|i| i * inputs.len() / 10).collect();
+                for &i in &ten {
+                    if matches!(all[i], blaze_scope::crate_scope::Solved::Solved(_)) {
+                        let span = clock.spans[i].1.load(Ordering::Relaxed).saturating_sub(clock.spans[i].0.load(Ordering::Relaxed));
+                        println!("question: `{}` solved from scratch in {:.3} ms", inputs[i].name, span as f64 / 1e6);
+                    }
+                }
+                struct Mapped<'k>(&'k KeptDir<'k>);
+                impl blaze_scope::names_record::LoadNames<'static> for Mapped<'_> {
+                    fn load(&self, krate: usize) -> Option<&'static [u8]> {
+                        let path = self.0.path(krate).with_extension("names");
+                        Some(map(&path).unwrap_or_else(|e| panic!("names record {}: {e}", path.display())))
+                    }
+                }
+                let keys: Vec<blaze_id::CrateItemKey> = inputs.iter().map(|c| c.key).collect();
+                let world = blaze_scope::names_record::RecordNames::new(&keys, Mapped(&kept), g());
+                for &i in &ten {
+                    let before = world.decoded();
+                    let start = Instant::now();
+                    let record = world.record(i).unwrap_or_else(|| panic!("no names record of `{}`", inputs[i].name));
+                    let root = record.root_module();
+                    let scope = record.scope(root).unwrap_or_else(|e| panic!("`{}`: {e:?}", inputs[i].name));
+                    let name: &str = scope.and_then(|s| s.bindings.first()).map_or("main", |b| b.name);
+                    let segments = [name];
+                    let written = blaze_scope::names::Written { kind: blaze_surface::PathKind::Plain, segments: &segments };
+                    let answer = blaze_scope::names::path(&world, root, blaze_surface::Namespace::Types, written, g());
+                    let took = start.elapsed();
+                    let after = world.decoded();
+                    println!(
+                        "question: `{}` `{name}` -> {:?} in {:.3} ms: record {} bytes opened, {} scopes decoded ({} bytes)",
+                        inputs[i].name,
+                        answer.map(|r| r.consumed),
+                        ms(took),
+                        after.bytes - before.bytes,
+                        after.scopes - before.scopes,
+                        after.scope_bytes - before.scope_bytes
+                    );
+                }
+            }
             let mut whys: BTreeMap<String, Vec<&str>> = BTreeMap::new();
             for &i in &solved {
                 let why = kept.missed[i].lock().unwrap_or_else(|p| panic!("miss lock poisoned: {p}")).clone().unwrap_or_else(|| "not asked".into());

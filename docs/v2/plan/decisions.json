@@ -546,6 +546,38 @@
    "why": "The std-out lane found shared.rs holding `std::sync::Mutex` and could not replace it: blaze-core depends on blaze-hash (its stall table uses the plain map), so the map cannot name `blaze_core::lock`; and a blocking lock cannot move below blaze-core, because its wait is a kernel wait that must go through `blaze_core::wait` with a deadline (rules 44, 15, 18). A data structure below with its policy passed in from above is the shape the allocator already has (rule 75) and is rule 78's strategy as a type parameter at one seam. Moving the map up into blaze-core would put a collection in the effect layer; a spin lock would be an unbounded wait under preemption.",
    "recommended": "The std-out lane builds it: the trait and the parameter in blaze-hash, the instantiation and alias in blaze-core, callers moved by name in one batch, both planted bugs of the interleaving test still caught, blaze-hash's ratchet row lowered.",
    "state": "decided by the coordinator; assigned"
+  },
+  {
+   "id": "D65",
+   "date": "2026-11-16",
+   "decision": "Build scripts that need a C toolchain run NATIVE inside the operating system's sandbox, with blaze's own pinned clang. A build script whose dependency closure holds a crate that starts a compiler or loads libclang (`cc`, `cmake`, `bindgen` / `clang-sys`, and the rest of that class in build-scripts.md's table) cannot run as wasm: WASI has no process to start and no library to load. Such a script is built for the host and run confined (no network, writes only under its `OUT_DIR`, reads only its inputs and the pinned toolchain), and the only compiler it can see is a clang and libclang that blaze fetches by digest to its own shelf. The choice is made from the script's dependencies before it runs and is part of its key: never a second try after a wasm failure. Every other build script, and every procedural macro, stays wasm in Wasmtime.",
+   "why": "The owner, 2026-11-16, asked whether to allow a pinned native clang inside the OS sandbox: \"ok sure use our pinned native clang maybe inside sandbox since we fork llvm idk  in teh sandbox\". 126 units of tempo wait on build scripts that run bindgen (librocksdb-sys, reth-mdbx-sys, libproc), and the same class compiles C and C++ with `cc`: tempo cannot fully build without it. Rule 9 asks for a sandbox, not for wasm; rule 10's wasm is for procedural macros. The machine's own clang is never used: it is not a keyed input.",
+   "recommended": "The build-scripts lane: the design in build-scripts.md first (which scripts are native and how that is decided from text; where the pinned clang comes from and its digest; the confinement on macOS and Linux, reusing the tree's existing sandbox code if it is sound; what the record's key and read list hold), then one real script end to end. End state unchanged: the outputs of such scripts are shared records that CI fills, so most users never run one.",
+   "state": "decided by the owner; assigned"
+  },
+  {
+   "id": "D66",
+   "date": "2026-11-16",
+   "decision": "The old front end path is deleted. What goes: the ladder's first front end (crates/blaze-ladder/src/front.rs and the tests and rungs only it serves), and the old-path crates the rebuilt path does not depend on (the old type checker, MIR, borrow checker and code generator, and the crates already excluded from the workspace). What is moved first, not lost: anything the rebuilt path still needs that lives in an old-path crate (the operating-system confinement code that D65 reuses). Not touched: crates/harness, blaze-sql, blaze-pg, blaze-sqlite, the gpu crates, vendor/.",
+   "why": "The owner, 2026-11-16, asked whether to delete the old front end path (the coordinator had recommended waiting until hello world prints through the new one): \"6 YES delete\". Every cross-crate change has had to port the old path too (the pattern lane ported front.rs; the std-out lane edited five excluded crates it could not compile), and the installed old binary already fails on the hello world.",
+   "recommended": "One lane, holding the batch token, when the front end crate is calm: an inventory first (each crate: who depends on it), then the deletion in one batch with every crate checked, then the docs that named the deleted crates.",
+   "state": "decided by the owner; scheduled after the front-end integration"
+  },
+  {
+   "id": "D67",
+   "date": "2026-11-16",
+   "decision": "Three answers of the owner's on how the work is run. (1) Lanes stay in ONE directory: no worktree per lane (\"meh i like if u can see conflcit rightaway to resol\"); one cross-crate batch at a time is the guard. (2) Complicated lanes may run on Fable at medium or high effort; exact tasks stay on Opus 5.5 medium (\"sure fable medium or high for it (and jchagne instructions comlpicated thigns can use fable)\"). (3) No second build VM (\"5 nah\").",
+   "why": "Asked on 2026-11-16 after overlapping cross-crate changes left the tree red for half an hour and about a third of that day's lane runs ended mid-task.",
+   "recommended": "OWNERS.md's section on batches; the brief template names the token; Fable for the type checker, the front end's records and design work.",
+   "state": "decided by the owner"
+  },
+  {
+   "id": "D68",
+   "date": "2026-11-16",
+   "decision": "The shared cache goes to R2. The owner said yes to providing a bucket with a public read address, a write credential held only by CI, and an Ed25519 signing key.",
+   "why": "The owner, 2026-11-16: \"3 yes\". Reading the cache over HTTP from a local server passes byte-equality tests; nothing has been uploaded anywhere.",
+   "recommended": "Still needed FROM the owner before any upload: the bucket's name and public address, where the write credential lives (a CI secret, never on this machine), and who generates and holds the signing key. Until then every server is local.",
+   "state": "approved by the owner; waiting on the bucket, the credential and the key"
   }
  ]
 }

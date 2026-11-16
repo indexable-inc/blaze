@@ -209,6 +209,10 @@ pub enum Plant {
     None,
     /// The `FileItems` task of the file at this path panics.
     PanicIn(&'static str),
+    /// The drive's own planted bug (`blaze_drive::Plant`), for the command-level properties.
+    Drive(blaze_drive::Plant),
+    /// The sweep's own planted bug (`sweep::Plant`), for the command-level properties.
+    Sweep(crate::sweep::Plant),
 }
 
 impl Sizes {

@@ -1272,6 +1272,7 @@ dependencies = [
  "blaze-typeck",
  "blaze-unit-graph",
  "blaze-wasi",
+ "libc",
  "tracing",
  "wasmtime",
 ]

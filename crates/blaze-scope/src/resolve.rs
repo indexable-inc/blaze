@@ -471,7 +471,7 @@ impl<'a> CrateNames<'a> {
     }
 
     /// A module's place, walked or made.
-    fn info(&self, module: ItemKey) -> Option<ModuleInfo<&'a str>> {
+    pub(crate) fn info(&self, module: ItemKey) -> Option<ModuleInfo<&'a str>> {
         self.decls.get(&module).map(|it| it.0).or_else(|| self.made.get(&module).map(|m| m.info))
     }
 }

@@ -1581,7 +1581,16 @@ E0599, 151 E0277):
   value is a GAT projection (`Token<'a>`; facts.rs `own_generics: 0`); c7/c8/c9 tell which.
 - Suites: blaze-typeck "115 passed, 5 failed" before the fixture (3 closures: the closure batch's
   open work; 2 suite/opaque.rs: owed from (12), plain paths only, untouched by this change);
-  blaze-solve "8 passed, 0 failed".
+  blaze-solve "8 passed, 0 failed". suite/opaque.rs is now the opaque lane's (addae433814bf7ee9:
+  its two fixtures pass with the heads' `Sized` bound).
+- OPEN, a panic (the integrator, a14c41bba58ed36a1, 11:40: ladder_front2 and front2_main):
+  "crates/blaze-ty/src/infer.rs:247:23: index out of bounds: the len is 31 but the index is 31"
+  from machine.rs `failed_leaf` -> `leaf_clause_of` -> unify. `leaf_clause_of` returns a
+  where-clause whose args come from `resolve` over the impl's fresh arguments made INSIDE
+  `failed_leaf`'s snapshot; `rollback_to` deletes those variables, and the next round unifies
+  against them. Fix: return `Some(None)` when a resolved argument still holds an inference
+  variable (needs a small "has inference variables" query on `TypeCtx`), with a fixture whose
+  failed goal's impl leaves a parameter unfixed by its header.
 
 ## Closures against `Fn` bounds (2026-11-16, closures lane)
 
@@ -1673,6 +1682,29 @@ rules/call.rs (a direct call of a foreign closure), body.rs (`is_move`), fixture
 closure.rs, walk.rs, layout.rs, tests.rs (only what must compile); blaze-ladder front2 types.rs,
 check.rs, buckets.rs, world_items.rs (`closure`: a `Gap::BodyRecord`), front.rs, run.rs; blaze-real
 examples/check.rs; blaze-flow-lower lib.rs.
+
+The kind and the capture modes are two facts ("Call traits and coercions": "`move` closures may
+still implement `Fn` or `FnMut`"). A capture's MODE is `ByValue` for every capture of a `move`
+closure and for a non-`Copy` value used by value, else `ByMutRef` for a mutable use, else `ByRef`;
+the closure's KIND is the strongest USE (moved out: `FnOnce`; mutable: `FnMut`; else `Fn`),
+recorded in `Checked::closures` beside the exported signature. Tests: suite/closure_identity.rs
+(two bodies through `F: Fn(u8) -> u8` and a direct call; the adaptor `Map<F>` with `(self.f)(x)`;
+`gen::<u8>` and `gen::<u16>` as two types; the five kinds and captures incl. `move || x` with `x:
+Copy` = `ByValue` + `Fn`). Without the owner's facts the caller stops with
+`Malformed(BodyTypeInRecord(Closure(..)))` (run 2026-11-16).
+
+Not in yet:
+- A solver-rebuilt term of a foreign closure is viewed by matching its def and its owner's
+  arguments after a SHALLOW probe (`foreign_resolved`); a variable nested in an argument
+  (`gen::<Vec<?T>>`), or a term the solver made by substitution alone, panics ("a closure this
+  context did not make").
+- Upvars are `()` for a foreign closure: the solver sees no capture types, so `Copy`/`Clone`/auto
+  traits of another body's closure are not decided by its captures. `ClosureFacts` would need the
+  capture types.
+- A closure in a const or static owner gets 0 arguments (`own_params` comes from a fn sig only),
+  wrong for a const inside a generic impl.
+- Moving out through a field or an index (`consume(s.f)`) is not told apart: the base's use is 0,
+  so such a capture is `ByRef`/`Fn`.
 
 ## Overloaded deref and `?` on the real world (2026-11-16, second checker lane)
 
@@ -1785,6 +1817,49 @@ front2_locals"` (or mixcheck), fix what is mine, quote the line.
 - NOT DONE: steps 3's local structs and impls (gap, not built: `adt` reads variants and ctors
   from the names library), the census and walk numbers, `front2_order` fixtures, front2_panics.
 
+## Impls inside blocks (2026-11-16)
+
+The Reference, "Statements", "Item declarations": "An item declaration statement has a syntactic
+form identical to an item declaration within a module. Declaring an item within a statement block
+restricts its scope to the block containing the statement." An implementation is not a name: it
+holds for its type in the whole program (coherence is per crate), and only its header and members
+are READ in the block's scope.
+
+**The cause, proven** (crates/blaze-ladder/tests/front2_nested.rs, before any change): "NESTED
+impls in the index: 0"; `in_const: diagnostics [(NoMethod, Range { start: 26, end: 31 }, "found
+Some(\"X\") ..), (NoAssocItem, Range { start: 34, end: 46 }, ..)]`; serde's shape
+`block_extern_crate: [(Unsatisfied, .. "`Xd: ArbitraryInt` because `Xd: Default`")]`: a wrong NO
+on eight correct bodies (the census's E0599, E0576 and E0277).
+
+**The design (written before the code).**
+1. The scan is syntax's: `blaze_file_items::nested::scan(text, alloc)` (new file nested.rs) reads
+   ONE body-like text (a fn, const or static item's whole text) by tokens, with a stack of open
+   brackets and no recursion, and returns its blocks (each with its parent) and the item
+   statements in them (kind word, range relative to the text, attributes included), plus the macro
+   calls in statement position (which may write items: not expanded here). An `impl` inside a
+   string, a comment or a macro call's arguments is one token or inside a non-block bracket: never
+   counted. It is a pure function of the item's text: an edit to one body rescans that body.
+2. Its home in the pipeline is the NAMES LIBRARY, not front2 (where the tree's shape forces a
+   difference from the coordinator's sketch): every consumer of an impl (front2's `Index`,
+   `Buckets::file`, `Store::step`, `names.members`, the census's body list) reads the library's
+   tables by key, so a nested impl that is in `tables.impls`, `texts` and `members` needs no second
+   path in any of them. blaze-scope resolve.rs `make_blocks` runs the scan on each lowered item and
+   member whose outline flag says `body_holds_items` and whose text holds the word `impl`.
+3. THE BLOCK IS A SCOPE RECORD: for a body with an impl, each block on the way to an impl becomes
+   an unnamed child module of the item's module (a "made" module, as a macro-written `mod` is):
+   its declarations are the block's own item statements (lowered from their own text by the one
+   lowering) and one glob import of the scope outside it. So `use x as y;`, `extern crate s as
+   _s;`, a local struct, the blocks around and then the module are found by the ONE name solver
+   (explicit declarations shadow the glob: innermost first), and a head resolves in a block
+   exactly as in a module: no second lookup rule. The enclosing fn's generics and locals are not
+   items, so they are not in scope (the Reference: no capture).
+4. Identity: the block fragment's key is `key_of(crate, enclosing item, "blocks", "", 0)` with
+   `INNER`; a block module's is that plus its ordinal among the body's blocks in text order; an
+   impl's is its ordinal among the impls of its block (the lowering's `key`); members under it as
+   at module level. Nothing depends on which body was read first.
+5. Member bodies are bodies (their module is the block's); a body inside one that holds impls
+   again is scanned the same way: a work list, bounded by a depth cap.
+
 ## Speed on real code (2026-11-16)
 
 Stage one of D62, the checker's side. Measured with `crates/blaze-ladder/examples/check_speed.rs`
@@ -1867,6 +1942,52 @@ log's `Order::Pull` model (stop at the first miss) is now an upper bound on roun
 control loses as many rounds' fetches as the bound allows.
 Counters added for the solver's profile (asks.rs `Solve`, printed by check_speed as "solver:"
 and "checker phases:"), and `late_holes`: the holes second and later runs meet, by kind.
+
+Measured (port27/speed-1116/bstd-4.txt, tree 6db6fbf05e, load 16.9 before, 14.7 after; the
+tree moved under other lanes since bstd-3: 2308 bodies, not 2300):
+
+| | bstd-3 (stop at first miss) | bstd-4 (holes) |
+|---|---|---|
+| A rounds | 6294 checks; 1:1298 2:353 3:163 4:140 5:93 6+:253 | 3917 checks; 1:1292 2:646 3:259 4:69 5:19 6+:23 |
+| A check | 932 bodies/s (ratio 77.0x to 71,747/s) | 912 bodies/s (78.6x) |
+| B check (warm) | 2871 bodies/s (25.0x) | 2578 bodies/s (27.8x) |
+| first-pass extra | 1667.5 ms (67.6%) | 1634.5 ms (64.6%) |
+
+Checks fell 38% and bodies of six rounds or more from 253 to 23, but pass A did not get
+faster: its extra cost is the records made, not the repeated checks. Outcomes: "A outcomes:
+clean 2223; check refused .. 85; lowering refused 1" equals B's line, and B never meets a hole
+(every record present: "B rounds: 2308 checks for 2308 bodies"), so on the same tree the holed
+first pass decides exactly what a hole-free run decides ("outcomes changed A->B: 0"); the
+counts differ from bstd-3's "clean 2204 .. 96" because the lowering moved ("lowering refused"
+9 to 1), not because of holes. Speculative needs dropped: 7.
+
+Why bodies still take three rounds: "holes met by second and later runs: ImplsOf 1400; Inherent
+84; Adt 79; TraitDef 43; AssocItem 39; Path 19": a trait goal's impls name, through their
+where-clauses, the next trait whose impls are needed (a record naming a record); and a fact
+fill that reads a hole's `None` ends the walk (`Malformed` in facts.rs `fill_impl`/
+`fill_trait`/`fill_adt`/`fill_sig`): the first is a chain, the second is left to fix (make the
+fill answer the solver "ambiguous" on a hole: infer/mod.rs's three solver loops, the checker's).
+
+The solver's profile, warm (B): "solver: 107678 calls in 514.9 ms (4.8 us each), 79210
+repeated after a fact fill; frames 170616 (1.6 per call); cache hits 307836; impl candidates
+933736 (5.47 per frame)"; "walk and rules .. 144.6 ms"; world answers 106.2 ms, hashing 52.5
+ms, fact fills 71.3 ms, of 889.5 ms. Top three: (1) the solver, 514.9 ms (58%), and 74% of its
+calls are a goal started again from the top after one fact was filled: inside each check the
+solver repeats the round pattern this section removed from the driver; (2) world answers and
+hashing, 158.7 ms; (3) the walk, 144.6 ms. Not fixed here: the cause of (1) is plain (re-entry
+per fact), and its fix belongs to blaze-solve (the checker lane): a solver that asks all the
+facts a goal's candidates need at once, or facts.rs filling an impl set's headers with the set.
+
+**What remains, by cost, and whose (after bstd-4).**
+1. Records made in the first pass, 1634.5 ms of A's 2529.8 (the front end's: heads and
+   buckets, items and types lanes).
+2. The solver re-entering a goal per fact, 79210 of 107678 calls, 514.9 ms warm (blaze-solve,
+   the checker lane; or facts.rs prefill, this lane).
+3. Rounds from fact fills that meet a hole and end the walk (infer/mod.rs, the checker lane),
+   and from impl where-clause chains (ImplsOf 1400 late holes).
+4. Owed: a test that a hole met inside a method probe (`instantiate_method` passes over a
+   candidate whose header is `None`) gives `Outcome::Need` and no diagnostic (the checker lane
+   asked for it; note (12)).
 
 ## Not decided here
 

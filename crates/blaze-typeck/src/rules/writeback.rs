@@ -363,7 +363,6 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             };
             diags.push(Diag { code: d.code, at, expected, found, name: d.name, because });
         }
-        let (reads, needs) = self.reads.finish(alloc);
         // Writeback runs only when the walk finished (`needs` here are prefetch hints for next
         // time, not open questions): with no diagnostic, every recorded type must be named.
         if diags.is_empty() {
@@ -393,7 +392,42 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 return Err(CheckError::UnknownInCleanBody { at });
             }
         }
+        // The fixes' facts (rules/suggest.rs): only where a one-segment name did not resolve.
+        let mut expects: Vec<(ExprId, Option<PTy>), Alloc<'a>> = Vec::with_capacity_in(self.named_holes.len(), alloc);
+        for i in 0..self.named_holes.len() {
+            let (e, expect) = self.named_holes[i];
+            let expected = match expect.only_has_type() {
+                Some(t) => {
+                    let t = self.ty.resolve(t)?;
+                    if self.is_ty_var(t) {
+                        None
+                    } else {
+                        // Exporting may report an unknown type once (E0282): a fix's facts add
+                        // no finding, so that one is taken back and the hole has no expectation.
+                        let n = self.diags.len();
+                        let p = self.export(&mut ex, t, At::Expr(e))?;
+                        if self.diags.len() == n { Some(p) } else {
+                            self.diags.truncate(n);
+                            None
+                        }
+                    }
+                }
+                None => None,
+            };
+            expects.push((e, expected));
+        }
+        let suggests = crate::rules::suggest::collect(&crate::rules::suggest::Facts {
+            body: &self.body,
+            types: ex.out.view(),
+            expr_ty: &expr_ty,
+            local_ty: &local_ty,
+            diags: &diags,
+            holes: &expects,
+            alloc,
+        })?;
+        let (reads, needs) = self.reads.finish(alloc);
         Ok(Checked {
+            suggests,
             types: ex.out,
             expr_ty,
             pat_ty,

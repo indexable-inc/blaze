@@ -995,6 +995,36 @@ once; the plant `RanUnderCondition` (an asker served a fork it does not imply) i
       names.rs; its test publishes under `u/me/` (the simulation's home). Suite: "mixcheck test
       blaze-cli: exit 101; 50 passed, 2 failed (against green: blaze-typeck blaze-lower
       blaze-ladder)": the two above.
+    - RUNNER 8 2026-11-16 (uncommitted; handing on). BUG ONE cause: the CrateScope record DID
+      list `(Surface src/x.rs, ABSENT)`, but the answers table kept a reader only on a name
+      with a row (request.rs finish: `let Some(old) = self.old(target) else { continue }`), so
+      the absent name's readers were dropped. Fix: a WATCH ROW (answers.rs `Row::watching`, zero
+      key, readers only) for a name read absent or dropped; `old`/`current` hide it,
+      `dirty_readers` and the new row's readers use it (`old_or_watch`); emptied, it goes.
+      Then: a read of ABSENT is no hint for the next run (`to_run`), else the absent name's
+      job fails and its reader fails `Waited` every run. names.rs `slot_of`: a read of
+      `x/mod.rs` is the slot `x.rs`'s Surface (the drive names module files by slot; before,
+      a crate with `x/mod.rs` failed `NoPart`). A want of a part its settled home does not
+      list fails alone (`Refused`), not the request. BUG TWO cause, from the rows (hint
+      plant on): the repeat's m3 leaf "stamp Some(..) .. was (0, [127, 7, 74, 128]); changed
+      true" (the stamp settled; the table still held the COLD id) and the scope "failed
+      [Surface 0225.., ..]": the hinted absent `mN/mod.rs` Surfaces failed, the scope failed
+      `Waited`, no leaf table or certificate was written, so every repeat walked. Not the
+      racy stamp. Racy rule (unchanged, sweep.rs `look_at`): an unsettled stamp is stored as
+      none, the file is read again next sweep and its stamp kept once settled: at most one
+      extra read per file changed within the granularity before a sweep (sweep's own
+      property `the_oracle_catches_a_racy_stamp_trusted`). Property: main.rs
+      `edits_answer_as_a_fresh_home` (findings, errors, status equal to a fresh home after
+      each edit; an unchanged repeat runs 0 tasks); plants `ForgetAbsentReaders`,
+      `HintAbsentReads` caught. OPEN (found by it): (a) module at BOTH places: home says an
+      extra "no `x` in this scope" vs fresh (tape '0 1 0 2'; edits now keep the two places
+      exclusive); (b) create x/mod.rs, edit lib.rs, delete it: `NoFile` (seed 245, tape '0 2 0
+      2 0 6 0 3'; controls at 200 cases until fixed); (c) tests/run_output.rs
+      `a_clean_run_prints_only_its_program` fails "3-hello: a clean run says nothing", left
+      "note: names resolved for 15 crates; 2 paths unresolved..": check whether it predates
+      this (git stash is banned: check out the commit in a scratch worktree). Not done:
+      `#[path]` absence (resolver probes go through `Recording` so they are recorded; untested),
+      target roots, include!, build.rs, members; step 4.
 - Owed, not now: `run` after `check` writes its own certificate, because the command is in
   the key. That costs 3.5 ms against the second run's 1.0 ms on hello-world. A coarse proof
   covers all under it: `check`'s certificate should stand for `run`'s check part.

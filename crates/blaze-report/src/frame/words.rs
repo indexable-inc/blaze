@@ -197,6 +197,61 @@ pub const WORDINGS: &[Wording] = &[
     },
 ];
 
+/// What a help line says about a name that did not resolve, by what the fix leaves wrong
+/// (blaze-typeck `suggest::Pick`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HelpKind {
+    /// The one candidate of the right type that nothing uses: `{0}` its name, `{1}` its type.
+    NeverUsed,
+    /// The one candidate spelled almost the same: `{0}` its name.
+    SpelledAlike,
+    /// Two candidates equal on every count, no fix: `{0}` and `{1}` their names.
+    Tied,
+}
+
+/// One help's words.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct HelpWording {
+    pub kind: HelpKind,
+    pub name: &'static str,
+    pub template: &'static str,
+    pub args: u8,
+}
+
+/// Every help's words.
+pub const HELPS: &[HelpWording] = &[
+    HelpWording {
+        kind: HelpKind::NeverUsed,
+        name: "help-never-used",
+        template: "{code:0} is in scope, is a {code:1}, and is never used",
+        args: 2,
+    },
+    HelpWording {
+        kind: HelpKind::SpelledAlike,
+        name: "help-spelled-alike",
+        template: "{code:0} is in scope and is spelled almost the same",
+        args: 1,
+    },
+    HelpWording {
+        kind: HelpKind::Tied,
+        name: "help-tied",
+        template: "{code:0} and {code:1} are both in scope and fit equally well: no fix is offered",
+        args: 2,
+    },
+];
+
+/// The words of help `kind` filled from `args` into `out`.
+pub fn help_words(out: &mut AString<'_>, kind: HelpKind, args: &[&str]) -> Result<(), WordsError> {
+    let Some(w) = HELPS.iter().find(|w| w.kind == kind) else {
+        return Err(WordsError::Arguments { name: "help", given: args.len(), takes: 0 });
+    };
+    if args.len() != usize::from(w.args) {
+        return Err(WordsError::Arguments { name: w.name, given: args.len(), takes: w.args });
+    }
+    fill(out, w.template, args);
+    Ok(())
+}
+
 /// The words of `area`'s rule `number`.
 pub fn wording(area: Area, number: u16) -> Option<&'static Wording> {
     WORDINGS.iter().find(|it| it.area == area && it.number == number)

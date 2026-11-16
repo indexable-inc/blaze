@@ -15,7 +15,7 @@ use std::vec::Vec;
 use super::{Want, adjusts, check_body, expect};
 use crate::diag::DiagCode;
 use crate::fixture::{Bb, Fx};
-use crate::ids::{Abi, ExprId, FnPtrHeader, ItemKey, PatId, Safety, UintTy};
+use crate::ids::{Abi, ExprId, FnPtrHeader, ItemKey, LangItem, PatId, Safety, UintTy};
 use crate::infer::InferPlant;
 use crate::machine::Plant;
 use crate::portable::{PNode, PTy};
@@ -29,6 +29,10 @@ fn world() -> (Fx, ItemKey) {
     let mut world = Fx::new();
     let fx = &mut world;
     let u8_ = fx.ty(PNode::Uint(UintTy::U8));
+    // `Copy` and core's `impl Copy for u8`: a capture used by value is a copy, not a move.
+    let copy = fx.tr("Copy", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Copy, copy);
+    fx.imp("impl Copy for u8", 0, u8_, Some((copy, &[])), &[], Vec::new());
     let unit = fx.unit();
     let io = fx.list(&[u8_, u8_]);
     let fn_ptr = fx.ty(PNode::FnPtr(io, FnPtrHeader::RUST));

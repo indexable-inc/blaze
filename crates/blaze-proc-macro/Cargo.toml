@@ -49,6 +49,9 @@ blaze-unit-graph = { workspace = true, optional = true }
 # The source corrections (`blaze_fetch::correct`, D58): a corrected package's pin in a module's
 # closure names the row's digest, so the module key changes when the row does.
 blaze-fetch.workspace = true
+# `native_sandbox.rs` (D65): killing a native script's process group; on Linux Landlock,
+# seccomp and the namespaces, by system call.
+libc.workspace = true
 
 [dev-dependencies]
 # A test's table of source corrections, read with the lexer's scalar width.

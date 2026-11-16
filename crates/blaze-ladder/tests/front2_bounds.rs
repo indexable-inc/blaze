@@ -125,7 +125,7 @@ fn use_wrap2() { let a = wrap(1u8); let b = wrap(true); let _c = need_clone(&a);
 ";
 
 /// The bodies that must check clean, each with what it proves.
-const CLEAN: [(&str, &str); 43] = [
+const CLEAN: [(&str, &str); 44] = [
     ("call_bound", "`F: Fn(u8) -> u16` on the parameter: `Fn<(u8,)>` and `Output = u16`"),
     ("call_where", "`where F: FnMut(u8)`: the output is `()`"),
     ("call_apit", "`impl FnOnce(u8, bool) -> u16` in argument position"),
@@ -178,6 +178,7 @@ const CLEAN: [(&str, &str); 43] = [
     ("g", "\"Await expressions\": `af(1).await` is `<impl Future<Output = u16> as IntoFuture>::Output`"),
     ("two_same", "two return points of one type: one hidden type `u8`"),
     ("use_wrap2", "a generic fn's opaque at two instances (`u8`, `bool`): two different types, each `Clone`"),
+    ("use_opt_next", "`Some(mut i) => i.next()`: a method through the bound of an opaque bound by a pattern inside `Option`"),
 ];
 
 /// The defining bodies that must be refused, each with the diagnostic it must give.
@@ -186,11 +187,9 @@ const REFUSED: [(&str, &str, &str); 3] = [
     ("two_types", "Mismatch", "two return points of two types (`u8`, `&str`): \"one type\": E0308"),
     ("lacks", "Unsatisfied", "the hidden type `u8` is not `Iterator`: E0277 naming the bound"),
 ];
-// `use_opt_next` (`match opt_iter() { Some(mut i) => i.next(), .. }`) is not in CLEAN: its head
-// is the one `use_opt` checks clean with, but `i.next()` on the opaque reached through `Option`'s
-// argument ends in the checker's `DiagWithoutPlace { code: Unsatisfied }` (2026-11-16 11:10),
-// while `let mut i = evens(); i.next()` checks clean: the checker's lane (its opaque facts are
-// loaded for a fn's output, not yet for one nested in it: a lead, not proved).
+// `use_opt_next` was out of CLEAN at 11:10 with the checker's `DiagWithoutPlace { code:
+// Unsatisfied }`; reduced in blaze-typeck suite/opaque.rs (`a_method_on_an_opaque_bound_by_a_pattern`
+// passes in the checker alone), it is back in CLEAN to be measured through the front end.
 // `display` (`write!(f, \"{t}\")` with `T: Display`) is not in CLEAN: past the lang item it meets
 // the checker's internal `UnknownInCleanBody` at the format arguments (the checker's lane). The
 // lang item itself is proved below: every `LangItem` has an answer.

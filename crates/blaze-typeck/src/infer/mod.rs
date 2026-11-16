@@ -772,6 +772,18 @@ impl<'a> TypeCtx for InferCtx<'a> {
         Ok(Ty(self.terms.cx.resolve(n).bits()))
     }
 
+    fn list_has_infer(&mut self, args: TyList) -> bool {
+        let l = self.slist(args);
+        let mut scratch = blaze_solve::fold::Scratch::new_in(self.alloc);
+        (0..l.len).any(|i| {
+            let t = self.terms.list_get(l, i);
+            match blaze_solve::fold::resolve(&mut self.terms, &mut scratch, t) {
+                Ok(t) => self.terms.flags(t).has(blaze_solve::term::Flags::HAS_INFER),
+                Err(_) => true,
+            }
+        })
+    }
+
     fn unify(&mut self, a: Ty, b: Ty) -> Result<bool, CheckError> {
         #[cfg(test)]
         let (a, b) = {

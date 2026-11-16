@@ -64,6 +64,7 @@ pub mod graph;
 mod group;
 mod lookup;
 pub mod names;
+pub mod names_record;
 pub mod prepares;
 mod read;
 pub mod resolve;

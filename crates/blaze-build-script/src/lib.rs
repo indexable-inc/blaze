@@ -26,6 +26,7 @@ pub mod git;
 mod git_objects;
 pub mod instr;
 pub mod key;
+pub mod native;
 pub mod outputs;
 pub mod pinned;
 pub mod probe;
