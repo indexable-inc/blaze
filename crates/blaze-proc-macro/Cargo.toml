@@ -62,6 +62,8 @@ blaze-lex.workspace = true
 blaze-file-items.workspace = true
 # The simulation tests' tapes and planted-bug controls.
 blaze-sim.workspace = true
+# `native_unit`'s test builds a unit graph by hand: a unit's edition.
+edition.workspace = true
 # `tempo_scripts`: the graph of a workspace (blaze-unit-graph, a dependency, over the lock
 # and the manifests) and its packages' files from the fetch store's records.
 blaze-manifest = { workspace = true, default-features = false }

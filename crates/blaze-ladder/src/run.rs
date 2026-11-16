@@ -66,6 +66,11 @@ pub enum RunError {
     /// The build refused the function; `range` is where in its item, when the error names an
     /// expression or a pattern of its body.
     Build { function: Named, error: BuildError, range: Option<blaze_typeck::Range> },
+    /// The build refused the function at item `item` it reads (a static `Adts` does not
+    /// describe, a const whose value it does not hold, in an expression or a pattern, a record
+    /// not made yet): `path` is the item's name where the front end gives it, so the survey's
+    /// class names the item, not its key.
+    ItemRefused { function: Named, error: BuildError, item: ItemKey, path: Option<Box<str>> },
     /// The build met a type naming ADT `adt`, which the seam's `Adts` has no row for; `path`
     /// is its name where the front end can give it.
     NoAdt { function: Named, adt: ItemKey, path: Option<Box<str>> },
@@ -126,6 +131,10 @@ impl core::fmt::Display for RunError {
                 write!(f, "`{function}`: {count} type errors, the first {first:?}")
             }
             RunError::Build { function, error, .. } => write!(f, "`{function}`: {error}"),
+            RunError::ItemRefused { function, error, path, .. } => match path {
+                Some(path) => write!(f, "`{function}`: `{path}`: {error}"),
+                None => write!(f, "`{function}`: {error}"),
+            },
             RunError::NoAdt { function, adt, path } => match path {
                 Some(path) => write!(f, "`{function}`: a type names the ADT `{path}` ({:#x}), which the build's `Adts` has no row for", adt.0),
                 None => write!(f, "`{function}`: a type names ADT {:#x}, which the build's `Adts` has no row for", adt.0),
@@ -240,6 +249,7 @@ impl RunError {
             | RunError::Need { ref function }
             | RunError::Types { ref function, .. }
             | RunError::Build { ref function, .. }
+            | RunError::ItemRefused { ref function, .. }
             | RunError::NoAdt { ref function, .. }
             | RunError::Emit { ref function, .. }
             | RunError::Callee { ref function, .. }
@@ -682,6 +692,19 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
         core::str::from_utf8(self.0.string(owner, expr)?).ok()
     }
 
+    /// The front end's (front2: front2/fmt_template.rs, from the lowering's `FormatArgs` row).
+    fn format_template(&self, owner: ItemKey, expr: ExprId) -> Option<&[blaze_build::FmtPiece<'_>]> {
+        self.0.format_template(owner, expr)
+    }
+
+    fn fmt_argument_new(&self, trait_: blaze_typeck::FmtTrait) -> Option<ItemKey> {
+        self.0.fmt_argument_new(trait_)
+    }
+
+    fn fmt_argument_adt(&self) -> Option<ItemKey> {
+        self.0.fmt_argument_adt()
+    }
+
     /// The literal's bits at the type its body's check gave it: `f32`'s in the low 32, else
     /// `f64`'s (each rounded once from the text by the front end).
     fn float_lit(&self, owner: ItemKey, expr: ExprId) -> Option<u128> {
@@ -693,6 +716,23 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
             PNode::Float(blaze_typeck::FloatTy::F64) => Some(u128::from(wide)),
             _ => None,
         }
+    }
+
+    /// A float literal pattern's magnitude at the type its body's check gave the pattern, as
+    /// [`Adts::float_lit`] an expression's.
+    fn float_pat(&self, owner: ItemKey, pat: PatId) -> Option<u128> {
+        let (wide, narrow) = self.0.float_pat(owner, pat)?;
+        let done = self.4.checked.get(self.0.fn_index(owner)?)?.as_ref()?;
+        let ty = *done.pat_ty.get(pat.0 as usize)?;
+        match done.types.view().node(ty).ok()? {
+            PNode::Float(blaze_typeck::FloatTy::F32) => Some(u128::from(narrow)),
+            PNode::Float(blaze_typeck::FloatTy::F64) => Some(u128::from(wide)),
+            _ => None,
+        }
+    }
+
+    fn str_pat(&self, owner: ItemKey, pat: PatId) -> Option<&str> {
+        self.0.str_pat(owner, pat)
     }
 
     /// The `Fn*` lang traits' methods, as looked up when the program was made.
@@ -856,7 +896,9 @@ fn static_image<P: FrontEnd>(
     values: &[(ItemKey, DataRecord<Global>)],
 ) -> Result<(Option<StaticImage<Global>>, Option<TlsLayout<Global>>), RunError> {
     let mut tls = Vec::new_in(Global);
-    for (key, record) in values.iter() {
+    // `eval_consts`'s records (the old front's tabled statics) and the front end's own
+    // (front2's, `static_records`): never both for one front.
+    for (key, record) in values.iter().chain(program.static_records()) {
         if program.static_item(*key).is_some_and(|s| s.thread_local) {
             tls.push((*key, record));
         }
@@ -864,7 +906,7 @@ fn static_image<P: FrontEnd>(
     let template = tls::template(&tls, Global).map_err(|error| RunError::Tls { error })?;
     let desc = template.as_ref().map(|(_, layout)| tls::descriptor(TLS_TEMPLATE, layout, Global));
     let mut plain = Vec::new_in(Global);
-    for (key, record) in values.iter() {
+    for (key, record) in values.iter().chain(program.static_records()) {
         if program.static_item(*key).is_some_and(|s| !s.thread_local) {
             plain.push((*key, record));
         }
@@ -1050,6 +1092,11 @@ fn filed(survey: &mut Option<&mut Vec<(Box<str>, Box<str>), Global>>, e: RunErro
             let said = format!("{}: {error}", class_of(&format!("{error:?}")));
             (function, Box::from(said.char_indices().nth(200).map_or(&*said, |(i, _)| &said[..i])))
         }
+        // By the variant and the item's name, so each refused item is one class.
+        RunError::ItemRefused { function, error, item, path } => {
+            let shown = path.as_deref().map_or_else(|| format!("{:#x}", item.0), |p| format!("`{p}`"));
+            (function, format!("{}: {shown}", class_of(&format!("{error:?}"))).into_boxed_str())
+        }
         RunError::NoAdt { function, adt, path } => {
             let shown = path.as_deref().map_or_else(|| format!("{:#x}", adt.0), |p| format!("`{p}`"));
             (function, format!("NoAdt: no row for the ADT {shown}").into_boxed_str())
@@ -1174,7 +1221,13 @@ fn build_from<P: FrontEnd>(program: &mut P, surveyed: Option<(&mut Vec<(Box<str>
             error => RunError::Build { function: program.function(c).named(), error, range: None },
         };
         let from = checked.get(c).and_then(Option::as_ref).map_or(PTys::EMPTY, |d| d.types.view());
-        let args = if instance.item == program.function(c).key { instance.args } else { closure_key_args(instance, ground).map_err(fail)? };
+        let args = if instance.item == program.function(c).key {
+            instance.args
+        } else if crate::fn_shim::self_is_fn(instance, ground) {
+            crate::fn_shim::fn_shim_key_args(instance, ground).map_err(fail)?
+        } else {
+            closure_key_args(instance, ground).map_err(fail)?
+        };
         blaze_build::instance_key_normalized(program.code_of(c), args, from, ground, facts, Alloc::global()).map_err(fail)
     };
     let keyer = FrontAdts(program, entry.unwrap_or(0), &consts, &langs, &checked_bodies);
@@ -1236,7 +1289,9 @@ fn build_from<P: FrontEnd>(program: &mut P, surveyed: Option<(&mut Vec<(Box<str>
         let malformed = |_| RunError::Build { function: name(), error: BuildError::Malformed { what: "an instance's arguments past the ground table" }, range: None };
         // A closure's `Fn*` method instance (`[closure, (A..)]`, tabled as its owner): built
         // from the owner's body at the owner's arguments the closure's type holds.
-        let closure = if instance.item == function.key {
+        // A fn item's or fn pointer's `Fn*` method instance: a shim (fn_shim.rs).
+        let shim = if instance.item == function.key { None } else { crate::fn_shim::fn_shim_of(&FrontAdts(program, i, &consts, &langs, &checked_bodies), instance, &ground) };
+        let closure = if instance.item == function.key || shim.is_some() {
             None
         } else {
             let first = ground.view().list(instance.args).map_err(malformed)?.first().copied();
@@ -1249,13 +1304,21 @@ fn build_from<P: FrontEnd>(program: &mut P, surveyed: Option<(&mut Vec<(Box<str>
                 _ => return Err(RunError::Callee { function: name(), callee: instance.item }),
             }
         };
-        let owner_args = closure.map_or(instance.args, |(of, _)| of.owner_args);
+        let owner_args = match shim {
+            Some(s) => s.item.map_or(List::EMPTY, |(_, fn_args)| fn_args),
+            None => closure.map_or(instance.args, |(of, _)| of.owner_args),
+        };
         args.extend_from_slice(ground.view().list(owner_args).map_err(malformed)?);
         let view = body.view(types);
         let adts = FrontAdts(program, i, &consts, &langs, &checked_bodies);
         let mut subst = Subst { args: &args, ground: &mut ground, scratch: Alloc::global() };
         // `drop_in_place::<T>` is built as `T`'s drop glue, never from its written body.
-        let built = if let Some((of, which)) = closure {
+        let built = if let Some(s) = shim {
+            match s.item {
+                Some(_) => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, Some(&program.sig(i)), &mut subst, &adts, Global),
+                None => blaze_build::build_fn_shim(s.callee, s.tuple, s.which, None, &mut subst, &adts, Global),
+            }
+        } else if let Some((of, which)) = closure {
             blaze_build::build_closure(&view, done, of.ordinal, which, &program.sig(i), &mut subst, &adts, Global)
         } else if Some(function.key) == program.fn_lang(FnLang::DropInPlace) {
             blaze_build::build_drop_glue(&view, done, &program.sig(i), &mut subst, &adts, Global)
@@ -1269,10 +1332,22 @@ fn build_from<P: FrontEnd>(program: &mut P, surveyed: Option<(&mut Vec<(Box<str>
                     ranges(&body.expr_ranges, expr.0)
                 }
                 BuildError::UnsupportedPat { pat, .. } => ranges(&body.pat_ranges, pat.0),
-                BuildError::NoAdt { adt } | BuildError::NoAbi { item: adt } | BuildError::NoConstValue { item: adt, .. } if let Some(why) = program.left_out(adt) => {
+                BuildError::NoAdt { adt }
+                | BuildError::NoAbi { item: adt }
+                | BuildError::NoConstValue { item: adt, .. }
+                | BuildError::NoPatConstValue { item: adt, .. }
+                    if let Some(why) = program.left_out(adt) =>
+                {
                     return RunError::LeftOut { function: name(), item: adt, path: program.item_named(adt), why: Box::from(why) };
                 }
                 BuildError::NoAdt { adt } => return RunError::NoAdt { function: name(), adt, path: program.item_named(adt) },
+                // An item the body reads, refused: the survey's class names it.
+                BuildError::NoStatic { item, .. }
+                | BuildError::NoConstValue { item, .. }
+                | BuildError::NoPatConstValue { item, .. }
+                | BuildError::MissingRecord { item } => {
+                    return RunError::ItemRefused { function: name(), error, item, path: program.item_named(item) };
+                }
                 BuildError::Projection { .. } if let Some(why) = program.last_projection() => {
                     return RunError::Projection { function: name(), why };
                 }
@@ -1294,7 +1369,8 @@ fn build_from<P: FrontEnd>(program: &mut P, surveyed: Option<(&mut Vec<(Box<str>
         for &called in built.refs.iter() {
             // A closure's `Fn*` method: no impl to select; the instance is the closure's own,
             // tabled as its owner (the loop above builds it from the owner's body).
-            if let Some(c) = closure_owner(program, &adts, called, &ground) {
+            // A fn item's or fn pointer's: the shim, tabled as fn_shim.rs says.
+            if let Some(c) = closure_owner(program, &adts, called, &ground).or_else(|| crate::fn_shim::fn_shim_owner(program, &adts, called, &ground, i)) {
                 match key_of(c, called, &mut ground, &adts) {
                     Ok(key) => {
                         via.push(Via::Slot);

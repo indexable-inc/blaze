@@ -594,6 +594,22 @@
    "why": "The owner, 2026-11-16, looking at the error card on the website: \"all errors hsould maybe have an llm viedw like [the card] this should have an llm view and have an id and u can blaze check --fix {id}* as  well or someting idk\", then \"or just use what makes smot sense\". A finding is already a record with an item-relative range (rule 81) and, since today, a fix stored as data (ranges, no strings): the id, the views and `--fix` are three readers of that record. Most commands today are run by agents; a view made for them costs a few lines and saves them reading art meant for eyes.",
    "recommended": "The driver lane: ids on every finding the command prints today (syntax, unresolved imports) and on the checker's fixes; the three views with golden tests; `--fix` with its refusals proven in the simulation; the website's error card shows both views.",
    "state": "decided by the coordinator on the owner's request; assigned"
+  },
+  {
+   "id": "D71",
+   "date": "2026-11-16",
+   "decision": "A native build script that needs a tool other than the C toolchain (sha3-asm starts `perl` to generate assembly) gets it ONLY as a named host tool: a short list in the pin table (today: perl), each granted read-and-execute to the sandbox by its resolved path, with the digest of the tool's binary in the script's run key and the record marked `host-tool`. A record so marked stays on this machine: the shared-cache origin refuses to seal it. A tool not on the list is refused by name as today. End state: such scripts' outputs arrive as shared records filled by CI from a pinned tool, so users never run them.",
+   "why": "The first native runs (2026-11-16): zstd-sys and libproc ran confined and byte-equal with the pinned clang; sha3-asm stopped with \"could not execute perl\"; 200 units of tempo wait on it. A machine tool is not a keyed input (D65), so it may only enter with its digest in the key and never into a shared record. Pinning a relocatable perl for two hosts is a larger job than tempo's path can wait for.",
+   "recommended": "The build-scripts lane: the list and the grant, the key and the mark, the origin's refusal with a test, then sha3-asm.",
+   "state": "decided by the coordinator under the owner's \"just do what u recomcmend\" for D69's questions; assigned"
+  },
+  {
+   "id": "D72",
+   "date": "2026-11-16",
+   "decision": "Test code is held to bstd too. (1) The ratchet counts test code as its own columns in its own file (tools/ratchets/std-alloc-tests.txt): lines naming `std`, `alloc` and their collections, AND the ambient effects that make a test's result depend on the machine or the moment: the real file system, the real clock, operating-system threads, the environment, randomness not drawn from the test's tape. Counts only go down. (2) A test's world is passed in like any other code's: the simulated effects (`blaze_core::sim::Sim`: virtual clock, simulated files, crashes) and the test engine's tape (`blaze_sim::check`) are the defaults; collections are blaze-own's and blaze-hash's with a fixed seed. (3) Named exceptions, each listed in the ratchet file with its reason: tests whose subject IS the machine (running built machine code natively, the operating-system sandbox's hostile tests, the real-project censuses).",
+   "why": "The owner, 2026-11-16: \"is most eveyrhing including our tests using bstd? that would eb ideal cause detmerinisti etc\". Measured that minute by text search over the 198 crates: 68 are `no_std` at the root; of 1,674 files holding tests, 310 use the tree's own test engine and 29 the simulated effects, while 197 touch the real file system, 103 read the real clock, 120 start OS threads, 111 read the environment and 186 name std collections; the existing ratchet does not count test code at all (scripts/src/bin/ambient.rs: \"A site in test code is not counted\").",
+   "recommended": "First the measure (the tool and the new file), then one writer per crate of the rebuilt path, largest count first; old-path crates are not moved: they go with D66.",
+   "state": "decided by the coordinator on the owner's question; the measure assigned"
   }
  ]
 }

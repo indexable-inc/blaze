@@ -638,3 +638,76 @@ fn the_oracle_catches_a_lifetime_taken_as_a_char_literal_start() {
     };
     blaze_sim::control(Config::cases(300), Planted::Clean, Planted::Planted, "rustc_lexer", run);
 }
+
+// ---- The first-byte table against the `char` match it replaced.
+
+/// Forty inputs where a first byte alone could mislead: prefixes against identifiers, a
+/// lifetime against a character, numbers against ranges and fields, doc comments against plain
+/// ones, and every non-ASCII class the Reference names ("Whitespace": U+0085, U+200E, U+200F,
+/// U+2028, U+2029; "Identifiers": XID_Start beyond ASCII) beside one it does not (U+FEFF, an
+/// unknown token; an emoji, an invalid identifier).
+const FIRST_BYTE_TRICKS: [&str; 40] = [
+    "r#\"", "r#\"a\"#", "r#a", "r#é", "r#", "k#fn", "k#é", "k#", "b'", "b'a'", "b\"", "br#\"x\"#", "c\"", "cr\"x\"",
+    "c'a'", "'a", "'a'", "'é", "'é'", "'r#a", "0x", "0xé", "1..2", "1.e3", "1.é", "/**/", "/***/", "//!", "///",
+    "////", "/*!*/", "#\"", "##", "\u{FEFF}", "\u{2028}x", "\u{85}\u{200E}\u{200F}\u{2029}", "éa_ü", "🦀x", "a🦀",
+    "---\n---\n",
+];
+
+/// Operator prefixes, non-ASCII identifiers and whitespace, unterminated forms and raw strings,
+/// drawn between the corpus's pieces.
+const FIRST_BYTE_PARTS: &[&str] = &[
+    "!", "!=", "%=", "&&", "&=", "*=", "+=", "-=", "->", "-", "--", "---", "..=", "...", "::", "<<=", ">>=", "<-", "=>",
+    "==", "^=", "|=", "||", "@", "~", "?", "$", ";", ",", "`", "\\", "\0", "\x7f", "é", "ñame", "日本", "a\u{300}",
+    "\u{2028}", "\u{200E}", "\u{85}", "\u{a0}", "\u{FEFF}", "🦀", "\u{200d}", "\"abc", "\"a\\\"", "/* open", "/* /* */",
+    "'a", "'ab", "b'x", "c\"x", "r#\"x\"", "r##\"x\"#", "br\"", "cr#", "0b", "0o7", "0x_", "1e+", "1.0f32", "_",
+];
+
+fn first_byte_soup(tape: &Tape) -> String {
+    let parts = tape.vec(0..=32, "parts", |tape| {
+        let part = if tape.index(3, "from the corpus") == 0 {
+            *tape.one_of(PIECES, "piece")
+        } else {
+            *tape.one_of(FIRST_BYTE_PARTS, "part")
+        };
+        let gap = *tape.one_of(&["", " ", "\n", "a", "é", "1", "'", "\"", "#", "/"], "gap");
+        part.to_owned() + gap
+    });
+    parts.concat()
+}
+
+/// The table's tokens and the old `char` match's are the same, or the first difference.
+fn same_as_the_char_match(what: &str, text: &str) -> Result<(), Broke> {
+    for cpu in cpus() {
+        for frontmatter in [FrontmatterAllowed::Yes, FrontmatterAllowed::No] {
+            let want: Vec<Token> = crate::lexer::first::tokenize_reference(text, frontmatter, cpu).collect();
+            let got: Vec<Token> = tokenize(text, frontmatter, cpu).collect();
+            if got != want {
+                let at = got.iter().zip(&want).position(|(ours, theirs)| ours != theirs).unwrap_or(got.len().min(want.len()));
+                return Err(Broke::Oracle(format!(
+                    "{what} ({frontmatter:?}, {}): token {at} differs: the table's {:?}, the char match's {:?}; the text: {text:?}",
+                    cpu.name(),
+                    got.get(at),
+                    want.get(at)
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `advance_token` by first byte gives the old `char` match's tokens, kind and length, on the
+/// forty tricky inputs (alone, after an identifier and after a space) and on 2,000 drawn soups.
+/// A wrong arm in the table (say `#` before `"` taken as `Pound`, or `b'` as an identifier)
+/// fails here with the text and the token index. Prints `test
+/// tests::advance_token_by_first_byte_is_the_char_match ... ok`.
+#[test]
+fn advance_token_by_first_byte_is_the_char_match() {
+    for trick in FIRST_BYTE_TRICKS {
+        for text in [trick.to_owned(), format!("x{trick}"), format!(" {trick}"), format!("{trick}é")] {
+            if let Err(e) = same_as_the_char_match("a tricky input", &text) {
+                panic!("{}", broke(e));
+            }
+        }
+    }
+    blaze_sim::check(Config::cases(2000), |tape: &Tape| same_as_the_char_match("a first-byte soup", &first_byte_soup(tape)));
+}

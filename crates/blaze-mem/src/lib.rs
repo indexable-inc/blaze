@@ -64,6 +64,7 @@ pub mod column;
 mod error;
 pub mod frame;
 pub mod handle;
+pub mod host;
 pub mod huge;
 mod os;
 pub mod pool;
@@ -94,6 +95,7 @@ pub use blocks::Kept;
 pub use column::{Block, Column};
 pub use error::MemError;
 pub use frame::{Frame, Marker};
+pub use host::HostMemory;
 pub use handle::{Handle, Slab};
 pub use pool::{Cache, Pool, Pooled, Shared};
 #[cfg(target_pointer_width = "64")]

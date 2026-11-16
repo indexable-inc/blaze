@@ -140,8 +140,13 @@ In: the same walk blaze-flow-lower does (one mid-level form per body, D61), with
 `Expr::Await` becomes the Reference's loop (a local for the future, `Poll`, a switch, `Suspend`),
 each `Suspend` gets a cancel path made by the routine that makes a `return`'s exit, and a binding
 whose initialisation depends on the path gets a flag local (blaze-flow moves.rs `drop_kind` says
-which). The upvars come from the checker's captures (`Checked::captures`, or the fn's parameters
-for an `async fn`). Best is to make it a second output of blaze-flow-lower itself, so there is one
+which). The upvars come from the checker's captures (`Checked::captures`). An `async fn` is not a
+second case: as reported by the opaque-types lane on 2026-11-16 (blaze-lower desugar.rs `async_fn`,
+not compiled when this was written), its root is the node a written `async move { .. }` lowers to
+(`Expr::AsyncBlock { body, capture: Capture::Move }`, the parameter `let`s first in `body`), its
+type `TyView::Future(root, T, interior)` is the fn's hidden type in `Checked::hidden`, and its
+parameters are that block's by-move captures. So `root` is always an `Expr::AsyncBlock`, and the
+fn itself is an ordinary body that makes the state and returns it. Best is to make it a second output of blaze-flow-lower itself, so there is one
 walk from the typed body to statements, not two.
 
 Back: the builder does NOT walk the machine's blocks. blaze-build walks the expression tree with

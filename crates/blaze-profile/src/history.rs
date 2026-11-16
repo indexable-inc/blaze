@@ -138,6 +138,7 @@ mod drive;
 mod files;
 pub mod manifest;
 pub(crate) mod merge;
+mod order;
 mod pin;
 pub(crate) mod retire;
 
@@ -1681,6 +1682,10 @@ impl History {
                 of
             });
         }
+        // The rows in one total order, not the rings' drain order: equal rows write equal bytes.
+        order::spans(&mut self.read.spans);
+        order::spans(&mut self.others);
+        order::counters(&mut self.read.counters);
         let of_build = Process { commit, ..self.process };
         let client_rows =
             |parts: &[Batch]| parts.iter().map(Batch::num_rows).sum::<usize>();

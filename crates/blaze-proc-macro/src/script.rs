@@ -463,8 +463,15 @@ impl ScriptRuntime {
     }
 
     pub(crate) fn keep(&self, base: ContentId, reads: &[Read], outputs: &Outputs<'_>) -> Result<(), RecordError> {
+        self.keep_as(base, reads, outputs, blaze_build_script::host_tools::RUN_KIND)
+    }
+
+    /// [`Self::keep`] with the read list filed under `kind`: a native run granted a host tool
+    /// passes [`blaze_build_script::host_tools::RUN_KIND_HOST_TOOL`], the `host-tool` mark the
+    /// shared-cache origin refuses to seal (D71).
+    pub(crate) fn keep_as(&self, base: ContentId, reads: &[Read], outputs: &Outputs<'_>, kind: &[u8]) -> Result<(), RecordError> {
         let mut list = Vec::new();
-        write_list(&mut list, &base, b"build-script run", reads.iter().map(|read| read.subject.as_bytes()));
+        write_list(&mut list, &base, kind, reads.iter().map(|read| read.subject.as_bytes()));
         let mut key = AnswerKey::new(&list);
         for read in reads {
             key.value(read.digest.map_or(Digest::Nothing, Digest::Is));

@@ -273,11 +273,23 @@ struct TestWorld {
     projs: Vec<(PTy, PTy), Global>,
     /// A fn's where-clauses (`T: Deref`), their types of this world's table.
     where_clauses: Vec<(ItemKey, Vec<PClause, Global>), Global>,
+    /// `#[lang = "index"] trait Index<Idx> { type Output; }` (`INDEX`) and its one impl
+    /// (`INDEX_IMPL`): `impl Index<idx> for <self> { type Output = <out>; }`: the self type and
+    /// the trait's arguments after `Self` (`[idx]`), of this world's table (tests/index.rs).
+    index: Option<(PTy, blaze_typeck::ArgsAfterSelf)>,
+    /// The trait's associated type, and the impl's `Output`.
+    index_defs: Vec<blaze_typeck::AssocTyDef, Global>,
+    index_assoc: Vec<(Name, PTy), Global>,
+    /// What `Adts::index_fn(Not)` answers: the fn a call at `[Self, Idx]` runs.
+    index_fn: Option<ItemKey>,
 }
 
 const DEREF: ItemKey = ItemKey(90);
 const DEREF_TARGET: ItemKey = ItemKey(91);
 const DEREF_IMPL: ItemKey = ItemKey(92);
+const INDEX: ItemKey = ItemKey(93);
+const INDEX_OUTPUT: ItemKey = ItemKey(94);
+const INDEX_IMPL: ItemKey = ItemKey(95);
 
 impl TestWorld {
     fn new() -> TestWorld {
@@ -301,6 +313,10 @@ impl TestWorld {
             manually_drop: None,
             projs: Vec::new_in(Global),
             where_clauses: Vec::new_in(Global),
+            index: None,
+            index_defs: Vec::new_in(Global),
+            index_assoc: Vec::new_in(Global),
+            index_fn: None,
         }
     }
 
@@ -335,6 +351,19 @@ impl TestWorld {
         self.deref_defs.push(blaze_typeck::AssocTyDef { name: Name::of("Target"), item: DEREF_TARGET, default: None });
         self.deref_assoc.push((Name::of("Target"), t));
         self.deref_fn = Some(deref_fn);
+    }
+
+    /// `impl Index<idx> for <self_> { type Output = <out>; }`, whose `index` is fn `index_fn`.
+    fn index_impl(&mut self, self_: PNode, idx: PNode, out: PNode, index_fn: ItemKey) {
+        let s = self.ty(self_);
+        let i = self.ty(idx);
+        let o = self.ty(out);
+        let with_self = self.types.intern_list(&[s, i]).expect("a list interns");
+        let after = blaze_typeck::ArgsAfterSelf::split(self.types.view(), with_self, s).expect("`Self` first");
+        self.index = Some((s, after));
+        self.index_defs.push(blaze_typeck::AssocTyDef { name: Name::of("Output"), item: INDEX_OUTPUT, default: None });
+        self.index_assoc.push((Name::of("Output"), o));
+        self.index_fn = Some(index_fn);
     }
 
     /// `#[lang = "panic_bounds_check"] fn panic_bounds_check(index: usize, len: usize) -> !`.
@@ -446,17 +475,23 @@ impl World for TestWorld {
     }
 
     fn impls_of(&self, _: Seal, trait_: ItemKey, shape: Shape) -> Fetch<&[ItemKey]> {
-        let Some((s, _)) = self.deref else { return Ok(&[]) };
-        let ours = match self.types.view().node(s) {
-            Ok(PNode::Adt(k, _)) => shape == Shape::Adt(k),
+        // Whether the impl's self type `s` is an ADT of `shape`.
+        let ours = |s: Option<PTy>| match s.map(|s| self.types.view().node(s)) {
+            Some(Ok(PNode::Adt(k, _))) => shape == Shape::Adt(k),
             _ => false,
         };
-        Ok(if trait_ == DEREF && ours { &[DEREF_IMPL] } else { &[] })
+        Ok(if trait_ == DEREF && ours(self.deref.map(|(s, _)| s)) {
+            &[DEREF_IMPL]
+        } else if trait_ == INDEX && ours(self.index.map(|(s, _)| s)) {
+            &[INDEX_IMPL]
+        } else {
+            &[]
+        })
     }
 
     fn impl_header(&self, _: Seal, item: ItemKey) -> Fetch<Option<ImplHeader<'_>>> {
-        Ok(match (item, self.deref) {
-            (DEREF_IMPL, Some((s, _))) => Some(ImplHeader {
+        Ok(match (item, self.deref, self.index) {
+            (DEREF_IMPL, Some((s, _)), _) => Some(ImplHeader {
                             generics: 0,
                             self_ty: s,
                             trait_: Some(DEREF),
@@ -465,6 +500,15 @@ impl World for TestWorld {
                             types: self.types.view(),
                             polarity: blaze_typeck::ImplPolarity::Positive,
                         }),
+            (INDEX_IMPL, _, Some((s, after))) => Some(ImplHeader {
+                generics: 0,
+                self_ty: s,
+                trait_: Some(INDEX),
+                trait_args: after,
+                assoc_types: &self.index_assoc,
+                types: self.types.view(),
+                polarity: blaze_typeck::ImplPolarity::Positive,
+            }),
             _ => None,
         })
     }
@@ -508,6 +552,7 @@ impl World for TestWorld {
     fn lang_item(&self, _: Seal, item: LangItem) -> Fetch<Option<ItemKey>> {
         Ok(match item {
             LangItem::Deref => self.deref.is_some().then_some(DEREF),
+            LangItem::Index => self.index.is_some().then_some(INDEX),
             // forms.rs: `c"..."`'s referent, when the test declares it.
             LangItem::CStr => self.structs.iter().any(|s| s.key == forms::CSTR).then_some(forms::CSTR),
             _ => None,
@@ -530,6 +575,18 @@ impl World for TestWorld {
     }
 
     fn trait_def(&self, _: Seal, item: ItemKey) -> Fetch<Option<blaze_typeck::TraitDef<'_>>> {
+        if item == INDEX && self.index.is_some() {
+            // `trait Index<Idx>`: `Self` and `Idx`.
+            return Ok(Some(blaze_typeck::TraitDef {
+                generics: 2,
+                flags: blaze_typeck::TraitFlags(0),
+                lang: Some(LangItem::Index),
+                supertraits: &[],
+                members: blaze_typeck::TraitMembers::NotKnown,
+                assoc_types: &self.index_defs,
+                types: self.types.view(),
+            }));
+        }
         Ok((item == DEREF && self.deref.is_some()).then(|| blaze_typeck::TraitDef {
             generics: 1,
             flags: blaze_typeck::TraitFlags(0),
@@ -641,6 +698,13 @@ impl Adts for TestAdts<'_> {
     fn deref_fn(&self, mutbl: Mutbl) -> Option<ItemKey> {
         match mutbl {
             Mutbl::Not => self.world.deref_fn,
+            Mutbl::Mut => None,
+        }
+    }
+
+    fn index_fn(&self, mutbl: Mutbl) -> Option<ItemKey> {
+        match mutbl {
+            Mutbl::Not => self.world.index_fn,
             Mutbl::Mut => None,
         }
     }
@@ -2344,6 +2408,7 @@ fn run_native_vt(host: &[(ItemKey, u64)], fns: &[(ItemKey, Option<List>, &Built<
                     RelocTo::Code(off) => base + u64::from(off),
                     RelocTo::Func(p) => callee(p),
                     RelocTo::Vtable(p) => table_at.iter().find(|&&(q, _)| q == p).expect("the table placed above").1,
+                    RelocTo::Routine(routine) => wide::routine_at(routine),
                     other => panic!("the native run places no {other:?}"),
                 };
                 let at = r.at as usize;
@@ -3240,9 +3305,19 @@ fn a_match_by_value_refuses_drop_impl_enums_and_wide_enums() {
 /// _)`), a guard on a moving arm, and a temporary scrutinee inside a larger expression.
 #[test]
 fn a_match_by_value_refuses_what_it_does_not_build() {
-    let deep = match_drops(Scrut::W, Arms::Deep, false).expect_err("a deeper move is refused");
-    // (A nested variant pattern goes to the match by tests, walk/matches.rs, which moves nothing.)
-    assert!(deep.contains("a binding by value of a part that needs drop, in a match by tests (a move out)"), "{deep}");
+    // CHANGED ON PURPOSE (walk/moves.rs): `W(P(s), _)` was refused ("a binding by value of a
+    // part that needs drop, in a match by tests (a move out)") and is now built. A nested
+    // variant pattern goes to the match by tests, which moves `G{5}` into `s` (dropped at the
+    // arm's end) and leaves `G{6}`: a local's rest drops at its scope's end, after `k`
+    // (declared later); a temporary's at its statement's end, before `k`.
+    let deep = match_drops(Scrut::W, Arms::Deep, false).unwrap_or_else(|e| panic!("{e}"));
+    let deep_temp = match_drops(Scrut::W, Arms::Deep, true).unwrap_or_else(|e| panic!("{e}"));
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert_eq!(deep.as_slice(), &[5, 9, 6]);
+        assert_eq!(deep_temp.as_slice(), &[5, 6, 9]);
+    }
+    let _ = (deep, deep_temp);
     let guard = match_drops(Scrut::A, Arms::Guard, false).expect_err("a guard on a moving arm is refused");
     assert!(guard.contains("a guard on an arm that moves out of its scrutinee"), "{guard}");
 
@@ -3285,3 +3360,6 @@ mod matches;
 #[cfg(target_arch = "aarch64")]
 mod temps;
 mod lets;
+mod wide;
+mod index;
+mod fmt;

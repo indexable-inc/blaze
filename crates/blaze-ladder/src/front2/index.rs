@@ -76,6 +76,23 @@ impl<'n> Index<'n> {
         self.langs.get(name).copied()
     }
 
+    /// The fn the back half calls on its own account as `l`, under any of the names a library
+    /// declares it by ([`crate::front::FnLang::declared_as`], the pinned core's first). Two
+    /// different items under two of its names is no answer: [`Index::fn_lang_clash`] names it.
+    pub fn fn_lang(&self, l: crate::front::FnLang) -> Option<LibKey> {
+        if self.fn_lang_clash(l).is_some() {
+            return None;
+        }
+        l.declared_as().iter().find_map(|n| self.lang(n))
+    }
+
+    /// Two different items declaring fn lang `l` under two of its names: the two.
+    pub fn fn_lang_clash(&self, l: crate::front::FnLang) -> Option<(LibKey, LibKey)> {
+        let mut found = l.declared_as().iter().filter_map(|n| self.lang(n));
+        let first = found.next()?;
+        found.find(|k| *k != first).map(|second| (first, second))
+    }
+
     /// The `#[lang]` name `key` is declared under, if any (a scan of the few lang items).
     pub fn lang_name_of(&self, key: LibKey) -> Option<&'n str> {
         self.langs.iter().find(|(_, k)| **k == key).map(|(n, _)| *n)

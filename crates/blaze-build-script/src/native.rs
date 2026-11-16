@@ -137,6 +137,15 @@ fn quoted(out: &mut AString<'_>, filter: &str, path: &str) {
 /// program and [`MACOS_LOADER_READS`], no program started but `program` and `exec`. A forked
 /// child keeps the profile.
 pub fn seatbelt<'a, 'g>(grant: &Grant<'g>, alloc: Alloc<'a>) -> Result<AString<'a>, GrantError<'g>> {
+    seatbelt_with(grant, &[], alloc)
+}
+
+/// [`seatbelt`] of `grant`, and also any program under the folders `exec_under` started (and
+/// read): the one home of the deny-by-default profile, which the interim builder of a native
+/// script takes too (cargo starts rustc, the linking clang, `ld64.lld`, and the build scripts
+/// and proc macros of the script's build-dependencies it has just written under its target
+/// folder: `exec_under` names the toolchain's and the shelf's `bin` and that folder).
+pub fn seatbelt_with<'a, 'g>(grant: &Grant<'g>, exec_under: &[&'g str], alloc: Alloc<'a>) -> Result<AString<'a>, GrantError<'g>> {
     let mut out: AString<'a> = String::new_in(alloc);
     out.push_str("(version 1)\n(deny default)\n(allow process-fork)\n(allow sysctl-read)\n");
     out.push_str("(allow signal (target same-sandbox))\n(allow process-exec");
@@ -144,7 +153,13 @@ pub fn seatbelt<'a, 'g>(grant: &Grant<'g>, alloc: Alloc<'a>) -> Result<AString<'
     for program in grant.exec {
         quoted(&mut out, "literal", checked(program)?);
     }
+    for folder in exec_under {
+        quoted(&mut out, "subpath", checked(folder)?);
+    }
     out.push_str(")\n(allow file-read*");
+    for folder in exec_under {
+        quoted(&mut out, "subpath", folder);
+    }
     quoted(&mut out, "literal", "/");
     quoted(&mut out, "literal", grant.program);
     for program in grant.exec {
@@ -162,7 +177,12 @@ pub fn seatbelt<'a, 'g>(grant: &Grant<'g>, alloc: Alloc<'a>) -> Result<AString<'
     // resource headers, `lib/clang/<v>/include`, beside its real path so; without this it
     // finds none, D69).
     out.push_str(")\n(allow file-read-metadata");
-    let named = [grant.program].into_iter().chain(grant.exec.iter().copied()).chain(grant.read.iter().copied()).chain(grant.write.iter().copied());
+    let named = [grant.program]
+        .into_iter()
+        .chain(grant.exec.iter().copied())
+        .chain(grant.read.iter().copied())
+        .chain(grant.write.iter().copied())
+        .chain(exec_under.iter().copied());
     for path in named {
         for (at, _) in path.match_indices('/').filter(|(at, _)| *at > 0) {
             quoted(&mut out, "literal", &path[..at]);

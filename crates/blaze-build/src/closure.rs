@@ -482,4 +482,201 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         }
         Ok(())
     }
+
+    /// The SHIM of a fn item or fn pointer `callee` as `Fn*` method `which` at `[callee,
+    /// tuple]` (lib.rs `build_fn_shim`): `self` taken as `which` takes it (a pointer for `call`
+    /// and `call_mut`, the value for `call_once`), then the tuple's fields, each a Rust parameter
+    /// of its own (lib.rs `Abi::RustCall`). A fn item's `self` is zero-sized and ignored, and
+    /// the item is called directly; a fn pointer's is loaded (through `self` for `call` and
+    /// `call_mut`) and called INDIRECTLY. The fields cross to the callee as its own ABI passes
+    /// its parameters, so an `extern "C"` fn item or pointer is called as C.
+    fn run_fn_shim(&mut self, callee: PTy, tuple: PTy, which: FnTrait, sig: Option<&FnSig<'_>>) -> Result<(), BuildError> {
+        let sig_err = |error: TyErr| match error {
+            TyErr::Unsupported(what) => BuildError::UnsupportedSig { what },
+            TyErr::Malformed(what) => malformed(what),
+            TyErr::Other(error) => error,
+        };
+        let past = |_| malformed("a list past the ground table");
+        let PNode::Tuple(l) = self.ground_node(tuple).map_err(sig_err)? else {
+            return Err(malformed("a fn shim's arguments not a tuple"));
+        };
+        let mut inputs: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        inputs.extend_from_slice(self.ground.view().list(l).map_err(past)?);
+        // The direct callee (a fn item's instance) or none (a pointer), the callee's ABI, the
+        // item a C refusal names, and the output.
+        let (target, abi, item, output) = match self.ground_node(callee).map_err(sig_err)? {
+            PNode::FnDef(item, args) => {
+                let sig = sig.ok_or(malformed("a fn item's shim built without the item's signature"))?;
+                if self.ground.view().list(args).map_err(past)? != self.args {
+                    return Err(malformed("a fn item's shim whose instance arguments are not the item's"));
+                }
+                if sig.inputs.len() != inputs.len() {
+                    return Err(malformed("a fn item's shim whose tuple and signature differ in number"));
+                }
+                let output = self.ground_in(sig.types, sig.output).map_err(sig_err)?;
+                let abi = self.adts.abi(item).ok_or(BuildError::NoAbi { item })?;
+                (Some(Instance { item, args }), abi, Some(item), output)
+            }
+            PNode::FnPtr(fl, header) => {
+                let all = self.ground.view().list(fl).map_err(past)?;
+                let (&output, ins) = all.split_last().ok_or(malformed("a fn pointer type without its output"))?;
+                if ins.len() != inputs.len() {
+                    return Err(malformed("a fn pointer's shim whose tuple and signature differ in number"));
+                }
+                let abi = match header.abi {
+                    blaze_typeck::Abi::Rust => Abi::Rust,
+                    blaze_typeck::Abi::C => Abi::C,
+                    _ => return Err(BuildError::UnsupportedSig { what: "a fn pointer of an ABI other than \"Rust\" and \"C\" used as an `Fn*` value" }),
+                };
+                (None, abi, None, output)
+            }
+            _ => return Err(malformed("a fn shim asked of a type that is neither a fn item nor a fn pointer")),
+        };
+        // core's function.rs: "rust-call" is not `Fn*`-compatible; the checker never makes this.
+        if abi == Abi::RustCall {
+            return Err(BuildError::UnsupportedSig { what: "a \"rust-call\" fn item used as an `Fn*` value" });
+        }
+        let self_repr = match which {
+            FnTrait::Fn | FnTrait::FnMut => Repr::Ptr,
+            FnTrait::FnOnce => self.repr(callee).map_err(sig_err)?,
+        };
+        let n = inputs.len() + 1;
+        let mut reprs = Vec::with_capacity_in(n, self.alloc.clone());
+        let mut passes = Vec::with_capacity_in(n, self.alloc.clone());
+        reprs.push(self_repr);
+        passes.push(Self::rust_pass(self_repr)?);
+        for &gi in inputs.iter() {
+            let repr = self.repr(gi).map_err(sig_err)?;
+            reprs.push(repr);
+            passes.push(Self::rust_pass(repr)?);
+        }
+        self.ret = self.repr(output).map_err(sig_err)?;
+        self.ret_pass = Self::rust_pass(self.ret)?;
+        let (params, rets) = self.sig_of(&passes, self.ret_pass);
+        let own = self.b.sig(Conv::C, Variadic::No, &params, &rets);
+        self.b.set_signature(own);
+        let entry = self.create();
+        self.reached[entry.index()] = true;
+        self.begin(entry);
+        let mut values = Vec::with_capacity_in(params.len(), self.alloc.clone());
+        for p in params.iter() {
+            values.push(self.b.param(p.ty));
+        }
+        let mut next = values.iter().copied();
+        if let Pass::Ref | Pass::Memory { .. } = self.ret_pass {
+            self.sret = Some(next.next().ok_or(malformed("a result pointer without its value"))?);
+        }
+        self.scope_marks.push(0);
+        // `self`: nothing to read for a fn item; the pointer's value for a fn pointer.
+        let me = self.take_passed(reprs[0], passes[0], &mut next)?;
+        let callee_ref = match target {
+            Some(instance) => {
+                let place = self.ref_place(instance);
+                Callee::Direct(self.b.reference(RefKind::Func, place))
+            }
+            None => {
+                let p = match (which, me) {
+                    (FnTrait::Fn | FnTrait::FnMut, V::Scalar(at)) => match self.load(Repr::Ptr, (at, 0)) {
+                        V::Scalar(p) => p,
+                        _ => return Err(malformed("a fn pointer loaded as other than a scalar")),
+                    },
+                    (FnTrait::FnOnce, V::Scalar(p)) => p,
+                    _ => return Err(malformed("a fn pointer's `self` not passed as a pointer")),
+                };
+                Callee::Pointer(p)
+            }
+        };
+        let mut treprs = Vec::with_capacity_in(n - 1, self.alloc.clone());
+        let mut tpasses = Vec::with_capacity_in(n - 1, self.alloc.clone());
+        for i in 1..n {
+            let v = self.take_passed(reprs[i], passes[i], &mut next)?;
+            self.vals.push(v);
+            treprs.push(reprs[i]);
+            tpasses.push(self.pass(inputs[i - 1], reprs[i], abi, item)?);
+        }
+        let rrepr = self.ret;
+        let rpass = self.pass(output, rrepr, abi, item)?;
+        self.emit_call(callee_ref, &treprs, &tpasses, rrepr, rpass)?;
+        let v = self.pop()?;
+        if let PNode::Never = self.ground_node(output).map_err(sig_err)? {
+            self.b.unreachable();
+        } else {
+            self.ret_value(v)?;
+        }
+        if let Some(error) = self.b.error() {
+            return Err(BuildError::Lir(error.clone()));
+        }
+        Ok(())
+    }
+}
+
+/// An empty check record: a shim has no body of its own, and its walk reads none.
+fn empty_record(a: Alloc<'_>) -> Checked<'_> {
+    Checked {
+        types: PortableTys::new_in(a),
+        expr_ty: blaze_own::Vec::new_in(a),
+        pat_ty: blaze_own::Vec::new_in(a),
+        local_ty: blaze_own::Vec::new_in(a),
+        adjusts: blaze_own::Soa::new_in(a),
+        callees: blaze_own::Soa::new_in(a),
+        expr_defs: blaze_own::Soa::new_in(a),
+        pat_defs: blaze_own::Soa::new_in(a),
+        fields: blaze_own::Soa::new_in(a),
+        captures: blaze_own::Soa::new_in(a),
+        closures: blaze_own::Soa::new_in(a),
+        diags: blaze_own::Vec::new_in(a),
+        reads: blaze_typeck::ReadList { rows: blaze_own::Soa::new_in(a) },
+        needs: blaze_typeck::Needs::new_in(a),
+        suggests: blaze_typeck::suggest::Suggests::new_in(a),
+        hidden: blaze_own::Vec::new_in(a),
+    }
+}
+
+/// Builds the shim of fn item or fn pointer `callee` as `Fn*` method `which` at `[callee,
+/// tuple]` (lib.rs `build_fn_shim`, `Walk::run_fn_shim`). Its walk is given an empty body,
+/// named by the trait method, and an empty check record: neither is read.
+pub(crate) fn build_fn_shim<A: Allocator + Clone>(
+    callee: PTy,
+    tuple: PTy,
+    which: FnTrait,
+    sig: Option<&FnSig<'_>>,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    alloc: A,
+) -> Result<Built<A>, BuildError> {
+    let owner = adts.fn_trait_method(which).ok_or(BuildError::NoLangFn { expr: None, name: method_name(which) })?;
+    let checked = empty_record(subst.scratch);
+    let body = BodyView {
+        owner,
+        edition: Edition::E2024,
+        params: &[],
+        root: ExprId(0),
+        exprs: &[],
+        expr_ranges: &[],
+        pats: &[],
+        pat_ranges: &[],
+        stmts: &[],
+        expr_lists: &[],
+        pat_lists: &[],
+        stmt_lists: &[],
+        arms: &[],
+        field_inits: &[],
+        field_pats: &[],
+        paths: &[],
+        segments: &[],
+        types: checked.types.view(),
+        type_lists: &[],
+        opt_types: &[],
+        fmt_uses: &[],
+        coroutine: None,
+    };
+    let mut w = Walk::new(&body, &checked, subst, adts, alloc);
+    w.run_fn_shim(callee, tuple, which, sig)?;
+    let Walk { b, refs, statics, thread_locals, vtables, .. } = w;
+    let func = b.finish().map_err(|error| match error {
+        blaze_lir::BuildError::Verify(v) => BuildError::Verify(v),
+        other => BuildError::Lir(other),
+    })?;
+    blaze_lir::verify(func.view()).map_err(BuildError::Verify)?;
+    Ok(Built { func, refs, statics, thread_locals, vtables })
 }

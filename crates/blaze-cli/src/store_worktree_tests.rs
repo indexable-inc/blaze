@@ -138,6 +138,61 @@ fn made(profile: &str, kind: &str) -> u32 {
     words.iter().position(|word| *word == "made").and_then(|at| words.get(at + 1)).and_then(|n| n.parse().ok()).unwrap_or(0)
 }
 
+/// Every whole drive record in the user's own store under [`HOME`]: (key, name, reads).
+fn own_records(io: &Io) -> std::vec::Vec<(blaze_drive::Key, blaze_drive::Name, std::vec::Vec<(blaze_drive::Name, blaze_ids::ContentId)>)> {
+    let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+    let fs = io.need_fs().expect("files");
+    let home = match super::Machine::of(&cx, &fs, Some(HOME)).expect("no harness error") {
+        super::Machine::Home(home) => home,
+        super::Machine::Off(why) => panic!("the simulation's home: {why}"),
+    };
+    let own = super::PackStore::open_in(&cx, &home, super::OWN, super::Boot::Unknown, super::PACKS_MOST, super::StorePlant::None).expect("the own store");
+    let scratch = bstd::mem::Frame::with_reserve(TASK_FRAME, bstd::mem::Tag::Other).expect("a frame");
+    let mut all = std::vec::Vec::new();
+    own.each_record(&cx, &scratch, &mut |key, bytes| {
+        if let Ok(blaze_drive::record::Stored::Whole(view)) = blaze_drive::record::open(bytes) {
+            all.push((key, view.name, view.reads().collect()));
+        }
+        Ok(())
+    })
+    .expect("the own store's packs read");
+    all
+}
+
+fn short(id: &blaze_ids::ContentId) -> std::string::String {
+    id.0[..4].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// For each whole record the second worktree wrote to the own store: the reads in which it
+/// differs from the first worktree's record of the same name (what moved its value key).
+fn moved_reads(before: &[(blaze_drive::Key, blaze_drive::Name, std::vec::Vec<(blaze_drive::Name, blaze_ids::ContentId)>)], after: &[(blaze_drive::Key, blaze_drive::Name, std::vec::Vec<(blaze_drive::Name, blaze_ids::ContentId)>)]) -> std::string::String {
+    let mut said = std::string::String::new();
+    for (key, name, reads) in after.iter().filter(|(key, _, _)| !before.iter().any(|(k, _, _)| k == key)) {
+        let Some((_, _, old)) = before.iter().find(|(_, n, _)| n == name) else {
+            writeln!(said, "new {name} at {key}: no record of that name from worktree one").expect("text");
+            continue;
+        };
+        let mut diffs = std::vec::Vec::new();
+        for (read, saw) in reads.iter() {
+            match old.iter().find(|(r, _)| r == read) {
+                Some((_, was)) if was == saw => {}
+                Some((_, was)) => diffs.push(format!("{read} saw {} (one: {})", short(saw), short(was))),
+                None => diffs.push(format!("{read} read only in two")),
+            }
+        }
+        for (read, _) in old.iter().filter(|(r, _)| !reads.iter().any(|(n, _)| n == r)) {
+            diffs.push(format!("{read} read only in one"));
+        }
+        writeln!(said, "new {name}: {} reads; differs: {}", reads.len(), if diffs.is_empty() { std::string::String::from("none (same reads: task key moved)") } else { diffs.join("; ") }).expect("text");
+    }
+    said
+}
+
+/// The profile rows whose kind made something.
+fn made_rows(profile: &str) -> std::string::String {
+    profile.lines().filter(|line| line.contains(" made ") && !line.split_whitespace().skip_while(|w| *w != "made").nth(1).is_some_and(|n| n == "0")).map(|line| format!("{line}\n")).collect()
+}
+
 /// (i) The first worktree's cold check, then the second's: the second runs no task, finds
 /// what it needs in the machine's stores and writes nothing there; its answer equals a fresh
 /// home's. `Err` says which clause failed (the planted test expects one).
@@ -149,8 +204,15 @@ fn second_worktree_runs_nothing(keys: Keys) -> Result<(), std::string::String> {
     if one.runs == 0 || one.machine_put == 0 {
         return Err(format!("the first worktree's cold check made nothing in the machine's stores: {} runs, {} written\n{}", one.runs, one.machine_put, one.profile));
     }
+    let before = own_records(&io);
     let two = check_in(&io, TWO, keys);
+    let after = own_records(&io);
     let mut said = std::string::String::new();
+    if two.runs != 0 {
+        // First, within the eight lines the scripts show: what moved, and which kinds made.
+        said.push_str(&moved_reads(&before, &after));
+        write!(said, "made in two:\n{}made in one:\n{}", made_rows(&two.profile), made_rows(&one.profile)).expect("text");
+    }
     if two.runs != 0 {
         writeln!(said, "the second worktree ran {} tasks the first had run", two.runs).expect("a string takes text");
     }
@@ -169,7 +231,11 @@ fn second_worktree_runs_nothing(keys: Keys) -> Result<(), std::string::String> {
     }
     match said.is_empty() {
         true => Ok(()),
-        false => Err(format!("{said}{}", two.profile)),
+        false => {
+            let err = io.script(|host| host.err.clone()).expect("a simulated host");
+            let err = std::string::String::from_utf8_lossy(&err).into_owned();
+            Err(format!("{said}--- the second worktree's profile:\n{}--- the first's:\n{}--- stderr:\n{err}", two.profile, one.profile))
+        }
     }
 }
 
@@ -186,7 +252,7 @@ fn a_second_worktree_finds_every_record_and_answers_as_a_fresh_home() {
 fn the_worktree_oracle_catches_a_path_in_the_keys() {
     match second_worktree_runs_nothing(Keys::PlantedPath) {
         Ok(()) => panic!("a path in the keys was not caught: the second worktree ran nothing"),
-        Err(said) => assert!(said.contains("the second worktree ran"), "caught otherwise: {said}"),
+        Err(said) => assert!(said.contains("the second worktree ran") && said.contains("new "), "caught otherwise: {said}"),
     }
 }
 

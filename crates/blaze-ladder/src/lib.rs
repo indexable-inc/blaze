@@ -13,6 +13,7 @@
 #![feature(allocator_api)]
 
 pub mod crates;
+mod fn_shim;
 pub mod front;
 pub mod front2;
 pub mod place;

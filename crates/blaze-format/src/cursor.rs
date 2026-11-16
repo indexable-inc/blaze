@@ -19,7 +19,7 @@
 
 #![forbid(unsafe_code)]
 
-use core::{alloc::Allocator, fmt, mem::size_of};
+use core::{fmt, mem::size_of};
 
 use crate::leb::{self, LebError};
 
@@ -585,5 +585,6 @@ impl Put for Vec<u8> {
     }
 }
 
+mod own;
 #[cfg(test)]
 mod tests;

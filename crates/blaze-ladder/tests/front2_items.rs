@@ -619,17 +619,21 @@ fn main() {}
 /// pinned core's library/core/src/mem/alignment.rs:377 has "#[repr(usize)]" / "enum
 /// AlignmentEnum {" / "    _Align1Shl0 = 1 << 0," / "    _Align1Shl1 = 1 << 1," .. (the walk's
 /// "14 x NoAdt" on `AlignmentEnum`). The row holds each value: 1, 2, 4, and `(1 << 3) | 1` = 9.
-/// IGNORED until the constant evaluator can be asked an ANONYMOUS constant: today heads.rs
-/// `discriminants` refuses `1 << 0` as `Why::ConstPath` (expected line today: "discriminant
-/// expressions: AlignmentEnum: refused: Item(.., ConstPath(\"1 << 0\", ..))"). What is missing,
-/// in order: a key for (enum, variant)'s discriminant (keys.rs `MemberKind`), a head in
-/// `Store::fns` for it (no inputs, output the enum's `discr_ty`, text the expression) so
-/// body.rs `lower_member` lowers the expression as a body, consts.rs
-/// `ConstsWorld::explicit_discriminant` answering that key (it answers `None`), and a
-/// `Why::NeedConst`-like need carrying a checker key (`NeedConst` and `check::eval_len` take a
-/// library key, which an anonymous constant has not).
+/// Each such expression is an ANONYMOUS constant (front2/anon.rs): the item `const _: usize =
+/// 1 << 0;` of the enum's module, keyed by (module, type, text) with `MemberKind::Anon`, its
+/// head in `Store::fns`, needed as `Why::NeedConst` under its need key and evaluated by
+/// `check::eval_len` through the same machine as a constant item's body; all of one enum's are
+/// asked in one pass and evaluated in one round (`adt_rows` allows four). `Signed`: the
+/// Reference, "Negation operators" and "Arithmetic and Logical Binary Operators": `-(1 << 3)`
+/// at `i8` is -8 (bits 0xf8, sign-extended by the head), `5 - 2` is 3, and the implicit `C` is
+/// the previous plus one, 4. `Top`: the pinned core's `u8::MAX` (library/core/src/num/
+/// uint_macros.rs, in `impl u8`: "pub const MAX: Self = !0;") is an associated constant of an
+/// inherent impl, read through the anonymous constant `const _: u8 = u8::MAX;`: `!0` at `u8` is
+/// 255 (tempo's census class "ConstPath \"u8 :: MAX\""). Before the fix each printed "refused:
+/// Item(.., ConstPath(\"1 << 0\", ..))". Expected lines: "discriminant expressions:
+/// AlignmentEnum: fields [] discrs [1, 2, 4, 9]", "discriminant expressions: Signed: fields []
+/// discrs [-8, 3, 4]", "discriminant expressions: Top: fields [] discrs [255, 0]".
 #[test]
-#[ignore = "an anonymous constant (a discriminant expression) cannot be asked of the evaluator yet"]
 fn a_discriminant_is_a_constant_expression() {
     const TEXT: &str = "#[repr(usize)]
 enum AlignmentEnum {
@@ -640,14 +644,17 @@ enum AlignmentEnum {
 }
 #[repr(i8)]
 enum Signed { A = -(1 << 3), B = 5 - 2, C }
+#[repr(u8)]
+enum Top { A = u8::MAX, B = 0 }
 fn main() {}
 ";
-    let got = adt_rows(TEXT, &["AlignmentEnum", "Signed"]);
+    let got = adt_rows(TEXT, &["AlignmentEnum", "Signed", "Top"]);
     for (n, o) in &got {
         println!("discriminant expressions: {n}: {o}");
     }
     assert_eq!(got[0].1, "fields [] discrs [1, 2, 4, 9]", "{got:?}");
     assert_eq!(got[1].1, "fields [] discrs [-8, 3, 4]", "{got:?}");
+    assert_eq!(got[2].1, "fields [] discrs [255, 0]", "{got:?}");
 }
 
 #[test]

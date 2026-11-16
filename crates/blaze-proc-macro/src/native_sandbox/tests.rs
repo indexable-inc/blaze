@@ -22,6 +22,12 @@ fn hostile_child() {
         "write" => std::fs::write(arg, b"escaped").map_err(|e| e.to_string()),
         "connect" => std::net::TcpStream::connect(arg).map(drop).map_err(|e| e.to_string()),
         "exec" => std::process::Command::new(arg).output().map(drop).map_err(|e| e.to_string()),
+        // D71: `perl` found by the `PATH` search, as sha3-asm starts it, running real code
+        // (its own modules from the granted folders: `use strict`) and answering.
+        "perl" => std::process::Command::new("perl").args(["-e", arg]).output().map_err(|e| e.to_string()).and_then(|out| {
+            let said = std::string::String::from_utf8_lossy(&out.stdout).into_owned();
+            if out.status.success() && said == "2" { Ok(()) } else { Err(format!("exit {:?}, said {said:?}, {}", out.status.code(), std::string::String::from_utf8_lossy(&out.stderr))) }
+        }),
         "sleep" => {
             std::thread::sleep(Duration::from_millis(arg.parse().expect("milliseconds")));
             Ok(())
@@ -96,6 +102,59 @@ fn quote(lines: &str) {
     if std::env::var_os("BLAZE_D65_QUOTE").is_some() {
         panic!("QUOTE {lines}");
     }
+}
+
+/// The hostile script's line for `attempt`, confined, granted the pin table's host tools for
+/// `package` (D71) exactly as `native_script::run_script` grants them: each tool's real path
+/// executed, its `reads` read-only, `PATH` the tools' folders.
+fn attempt_with_tools(place: &Place, attempt: &str, package: &str) -> std::string::String {
+    use blaze_build_script::{host_tools, toolchain::PIN};
+    let alloc = Alloc::global();
+    let table = host_tools::host_tools(PIN, "aarch64-apple-darwin", alloc).expect("the macOS host-tool row");
+    let tools = host_tools::granted(&table, package, alloc);
+    let exe = std::env::current_exe().expect("the test binary").canonicalize().expect("its real path");
+    let exe = exe.to_str().expect("a UTF-8 path");
+    let exec: std::vec::Vec<&str> = tools.iter().map(|t| t.path).collect();
+    let mut reads: std::vec::Vec<&str> = vec![place.package.as_str()];
+    reads.extend(tools.iter().flat_map(|t| t.read_folders()));
+    let mut folders: std::vec::Vec<&str> = tools.iter().map(|t| t.path.rsplit_once('/').map_or("/", |(d, _)| d)).collect();
+    folders.sort_unstable();
+    folders.dedup();
+    let path = folders.join(":");
+    let writes = [place.out.as_str()];
+    let run = NativeRun {
+        grant: Grant { program: exe, exec: &exec, read: &reads, write: &writes },
+        args: &["--exact", "native_sandbox::tests::hostile_child", "--nocapture", "--test-threads=1"],
+        env: &[(ATTEMPT, attempt), ("PATH", path.as_str())],
+        dir: &place.package,
+        deadline: LONG,
+    };
+    let ran = run_planted(&run, Plant::None, alloc).expect("the confined run");
+    let stdout = std::string::String::from_utf8_lossy(&ran.stdout);
+    let line = stdout.lines().find_map(|l| l.find("ATTEMPT ").map(|at| l[at..].to_owned()));
+    line.unwrap_or_else(|| format!("no line: code {:?}: {stdout} {}", ran.code, std::string::String::from_utf8_lossy(&ran.stderr)))
+}
+
+/// D71: sha3-asm's script, confined and granted the table's perl, starts `perl` by name and
+/// perl runs (its `strict` module read from /System/Library/Perl); the same confinement without
+/// the grant (a package the table does not list) cannot start it; a program not on the list
+/// (`/usr/bin/python3`) is denied even with perl granted. Prints
+/// "host tool: granted: ATTEMPT perl ok | not granted: ATTEMPT perl denied: .. | python3:
+/// ATTEMPT exec denied: ..".
+#[test]
+#[cfg(target_os = "macos")]
+fn a_granted_host_tool_runs_and_an_unlisted_one_is_denied() {
+    let place = place("host-tool");
+    let code = "use strict; print 1+1";
+    let granted = attempt_with_tools(&place, &format!("perl {code}"), "sha3-asm");
+    let not_granted = attempt_with_tools(&place, &format!("perl {code}"), "zstd-sys");
+    let python = attempt_with_tools(&place, "exec /usr/bin/python3", "sha3-asm");
+    println!("host tool: granted: {granted} | not granted: {not_granted} | python3: {python}");
+    assert_eq!(granted, "ATTEMPT perl ok", "granted: {granted}");
+    assert!(not_granted.contains(" denied: "), "not granted: {not_granted}");
+    assert!(python.contains(" denied: "), "python3: {python}");
+    _ = std::fs::remove_dir_all(&place.root);
+    quote(&format!("host tool: granted: {granted} | not granted: {not_granted} | python3: {python}"));
 }
 
 #[test]

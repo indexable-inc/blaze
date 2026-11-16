@@ -81,8 +81,11 @@ pub fn instance_key(code: ContentId, args: List, ground: PTys<'_>, scratch: Allo
                 h.update(&ordinal.to_le_bytes());
                 (20, owner.0)
             }
-            PNode::FnPtr(..)
-            | PNode::Future(..)
+            // A fn pointer (`Fn::call` at `[fn(u64) -> u64, (u64,)]`, lib.rs `build_fn_shim`;
+            // a generic fn at `T = fn(..)`): its header (ABI and safety, one byte) is part of
+            // the type; its children the inputs, then the output.
+            PNode::FnPtr(_, header) => (21, u128::from(header.bits())),
+            PNode::Future(..)
             | PNode::Alias { .. }
             | PNode::Opaque(..)
             | PNode::Param(_)

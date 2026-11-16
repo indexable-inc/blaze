@@ -114,6 +114,8 @@ impl Persist for Spans {
 }
 
 #[cfg(test)]
+mod own_tests;
+#[cfg(test)]
 mod placed_tests;
 #[cfg(test)]
 mod tests;

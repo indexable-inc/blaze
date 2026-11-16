@@ -32,7 +32,7 @@ pub mod sig;
 #[cfg(test)]
 mod tests;
 
-pub use sig::{Region, SigBuf, SigLife, SigRefusal, read_signature};
+pub use sig::{CallableRefusal, Region, SigBuf, SigLife, SigRefusal, read_callable_param, read_signature};
 
 /// What the lowering needs to know about an ADT (flow.md section 7, question (e)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,6 +71,14 @@ pub trait Facts {
     fn sig(&self, _item: ItemKey) -> Option<SigLife<'_>> {
         None
     }
+    /// The text of the body's own fn, from its attributes or `fn` keyword on (what
+    /// [`read_signature`] is given for it). A call through one of the body's parameters (a fn
+    /// pointer, a `dyn Fn`, an `F: Fn(..)`) reads that parameter's written type from it
+    /// ([`read_callable_param`]: question T3's stand-in). `None`: not known, and such a call
+    /// whose arguments or result carry a lifetime is refused ([`Form::CalleeValueUnknown`]).
+    fn own_text(&self) -> Option<&str> {
+        None
+    }
     /// The index of field `name` of `variant`.
     fn field(&self, adt: ItemKey, variant: u32, name: Name) -> Option<u32>;
     /// The number of fields of `variant`.
@@ -101,6 +109,13 @@ pub enum Form {
     GuardMovesBinding,
     /// The callee's signature writes lifetimes (needs the heads' lifetime part).
     CallWritesLifetimes,
+    /// The callee's signature is not known (no head, or a lifetime part that does not line
+    /// up) and an argument or the result carries a lifetime: one origin for all cannot say
+    /// "this argument must be `'static`", so the body is not checked rather than accepted.
+    CalleeUnknown,
+    /// A call through a value (a fn pointer, a closure, a `dyn Fn`, an `F: Fn(..)`) whose own
+    /// signature's lifetimes are not known, with an argument or result that carries one.
+    CalleeValueUnknown,
     /// The signature's lifetime part does not have one region per origin position of the
     /// body's parameters and return type.
     SigUnaligned,
@@ -165,6 +180,11 @@ pub enum Plant {
     TupleUnified,
     /// The signature's implied and declared bounds are not given to the flow as known.
     NoKnown,
+    /// A callee's `'static` is instantiated afresh at each call like any other region: a fn
+    /// pointer's `fn(&'static T)` then takes a local's reference.
+    StaticIgnored,
+    /// A closure's captures are not lowered: the closure value holds no loan and moves nothing.
+    NoCaptures,
 }
 
 /// Lowers one checked body.
@@ -1119,6 +1139,12 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 (Local(0), TyD::of(self.adjusted_ty(root)?), sig.regions.len())
             };
             let n = self.npos_d(t, root)? as usize;
+            if i == nparams as usize && n == 0 {
+                // The body's value has no origin position (it diverges, or the output has
+                // none): nothing borrowed can reach the return place.
+                self.set_local(l, t, self.origs.len() as u32, 0);
+                break;
+            }
             if hi < lo || hi > sig.regions.len() || hi - lo != n {
                 return self.refuse(Form::SigUnaligned, root);
             }
@@ -1158,7 +1184,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
     /// The origin a callee's region takes at one call: `'static` is the body's; every other is
     /// fresh for the call.
     fn instance(&mut self, inst: &mut Vec<(Region, Origin), A>, r: Region) -> Origin {
-        if r == Region::Static {
+        if r == Region::Static && self.plant != Plant::StaticIgnored {
             return self.universal(r);
         }
         if let Some(&(_, o)) = inst.iter().find(|(x, _)| *x == r) {
@@ -2092,8 +2118,19 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             Some(a) => a,
             None => return self.refuse(Form::Malformed, e),
         };
+        // A callee value whose type is a fn item's is a call of that item: its head answers.
+        let mut by_type: Option<(ItemKey, List)> = None;
+        if value_callee {
+            let c = self.vals[at];
+            if c.ty.wrap.is_none()
+                && let PNode::FnDef(k, l) = self.node(c.ty.ty, e)?
+            {
+                by_type = Some((k, l));
+            }
+        }
+        let value_callee = value_callee && by_type.is_none();
         let mut vs: Vec<Val, A> = Vec::new_in(self.alloc.clone());
-        vs.extend_from_slice(&self.vals[at..]);
+        vs.extend_from_slice(&self.vals[at + usize::from(by_type.is_some())..]);
         self.vals.truncate(at);
         let mut ops: Vec<Operand, A> = Vec::new_in(self.alloc.clone());
         let mut ins: Vec<Place, A> = Vec::new_in(self.alloc.clone());
@@ -2114,7 +2151,15 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         self.two_phase.truncate((mark as usize).min(pending));
         self.b.call(&ops, tp, self.span(e));
         let out = self.info(tp);
-        let callee = if value_callee { None } else { self.callee_of(e) };
+        if value_callee {
+            self.call_through_value(e, &vs, tp, ty)?;
+            self.push_place(tp, ty);
+            return Ok(());
+        }
+        let callee = match by_type {
+            Some(c) => Some(c),
+            None => self.callee_of(e),
+        };
         let sig = callee.and_then(|(item, _)| self.facts.callee(item));
         let generic_origins = match callee {
             Some((_, g)) => {
@@ -2187,11 +2232,83 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 self.stats.calls_elided += 1;
             }
             _ => {
+                // No head for the callee: one origin for all cannot say "this argument must be
+                // `'static`" (`spawn(&local)`), so where anything carries a lifetime the body
+                // is refused by name, not accepted. A known head that writes no lifetime, called
+                // with generic arguments that carry origins, keeps the one origin.
+                if sig.is_none() {
+                    let mut any = out.len > 0;
+                    for v in vs.iter() {
+                        any |= self.npos_d(v.ty, e)? > 0;
+                    }
+                    if any {
+                        return self.refuse(Form::CalleeUnknown, e);
+                    }
+                }
                 self.unify_call(&vs, tp, e)?;
                 self.stats.calls_unified += 1;
             }
         }
         self.push_place(tp, ty);
+        Ok(())
+    }
+
+    /// A call through a value, `vs[0]`: a fn pointer, a `dyn Fn`, a generic `F: Fn(..)`. Its
+    /// lifetimes are its own type's (the Reference, "Higher-ranked trait bounds": such "bounds
+    /// specify a bound that is true for all lifetimes", and "Lifetime elision" holds in fn
+    /// pointer and closure trait signatures: `fn(&u8)` is `for<'a> fn(&'a u8)`): every region
+    /// but `'static` is instantiated afresh at each call, and `'static` is the body's, so
+    /// `f(&local)` with `f: fn(&'static u8)` puts the loan where it is live for ever. The
+    /// erased types do not hold them: they are read from the written type of the body's
+    /// parameter the value is ([`read_callable_param`], question T3's stand-in). Any other
+    /// value, or a type not read, is refused by name unless nothing in the call carries a
+    /// lifetime (then no signature could relate or demand anything).
+    fn call_through_value(&mut self, e: ExprId, vs: &[Val], dest: Place, dest_ty: TyD) -> Result<(), Refusal> {
+        let Some(args) = vs.get(1..) else { return self.refuse(Form::Malformed, e) };
+        let mut any = self.info(dest).len > 0;
+        for v in args {
+            any |= self.npos_d(v.ty, e)? > 0;
+        }
+        if !any {
+            self.stats.calls_unified += 1;
+            return Ok(());
+        }
+        let mut c = match self.expr(e)? {
+            Expr::Call { callee, .. } => callee,
+            _ => return self.refuse(Form::Malformed, e),
+        };
+        let mut steps = 0usize;
+        while let Expr::Paren(i) = self.expr(c)? {
+            steps += 1;
+            if steps > self.body.exprs.len() {
+                return self.refuse(Form::Bound, e);
+            }
+            c = i;
+        }
+        let param = match self.expr(c)? {
+            Expr::Local(p) => self.body.params.iter().position(|x| *x == p),
+            _ => None,
+        };
+        let facts: &'b F = self.facts;
+        let (Some(param), Some(text)) = (param, facts.own_text()) else {
+            return self.refuse(Form::CalleeValueUnknown, e);
+        };
+        if dest_ty.wrap.is_some() || args.iter().any(|v| v.ty.wrap.is_some()) {
+            return self.refuse(Form::CalleeValueUnknown, e);
+        }
+        let mut inputs: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        for v in args {
+            inputs.push(v.ty.ty);
+        }
+        let adt_lifetimes = |k: ItemKey| facts.adt(k).map(|f| f.lifetimes);
+        let mut buf: SigBuf<A> = SigBuf::new_in(self.alloc.clone());
+        if read_callable_param(text, self.tys, param as u32, &inputs, dest_ty.ty, &adt_lifetimes, &mut buf, self.alloc.clone()).is_err() {
+            return self.refuse(Form::CalleeValueUnknown, e);
+        }
+        if !self.call_by_signature(buf.life(), args, dest, dest_ty, e)? {
+            return self.refuse(Form::CalleeValueUnknown, e);
+        }
+        self.stats.calls_by_signature += 1;
         Ok(())
     }
 

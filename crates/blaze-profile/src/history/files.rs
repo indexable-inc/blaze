@@ -1886,7 +1886,11 @@ impl Compact {
             .collect();
         // alloc: once a flush
         let names: Vec<Name> = ours.iter().map(|&at| st.kept[at].name).collect();
-        let merges = compact::plan(&names, ended)
+        // Named here: `Compact::new` has no allocator passed in yet, and the plan lives only
+        // until its merges are turned into names below.
+        // to thread (bstd move): the flush's driver passes its allocator to `Compact::new`.
+        let alloc = blaze_own::Alloc::global();
+        let merges = compact::plan(&names, ended, alloc)
             .into_iter()
             .map(|merge| Merge {
                 // clone: a merge's names, once a merge

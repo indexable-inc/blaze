@@ -1094,7 +1094,10 @@ impl<S: Sharing> Store for Layered<'_, S> {
         };
         match store {
             Some(store) => {
-                self.machine_put += 1;
+                // A key already held is not written (rule 21): the profile counts only new ones.
+                if !store.held(key) {
+                    self.machine_put += 1;
+                }
                 store.put(cx, key, bytes)
             }
             // No home: every record is the checkout's.

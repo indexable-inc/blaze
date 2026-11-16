@@ -85,9 +85,12 @@ impl<H: Heads> Builder<'_, '_, H> {
         // A path end (`HALF_USIZE` in core's `UsizeNoHighBit(usize is 0..=HALF_USIZE)`) is a
         // constant item's value, read as an array length's is: `Why::NeedConst` names it until
         // the evaluator has filled it (the caller's `eval_len` loop), then its value.
+        // An end that is another constant expression (`u32::MAX`, `A - 1`) is an anonymous
+        // constant of the BASE type (`Builder::end_value`), needed and evaluated the same way.
+        let base_node = tys.view().nodes.get(base.0 as usize).copied();
         let mut need: Option<Why> = None;
         let mut eval = |p: &str| -> Result<u128, Refused> {
-            match self.array_len(env, p, r) {
+            match self.end_value(env, p, r, base_node) {
                 Ok(value) => Ok(value),
                 Err(why) => {
                     need = Some(why);

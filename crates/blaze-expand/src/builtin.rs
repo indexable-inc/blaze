@@ -586,22 +586,31 @@ fn include(
         Inclusion::Tokens | Inclusion::Str => (ReadKind::IncludeStr, IncludeAs::Str),
         Inclusion::Bytes => (ReadKind::IncludeBytes, IncludeAs::Bytes),
     };
-    let bytes = match cx.include(path.as_str(), how)? {
-        Included::Bytes(bytes) => bytes,
-        Included::Missing => {
-            out.exp.reads.push(kind, path.as_str(), ReadAnswer::Absent)?;
-            let path = out.note(path.as_str())?;
-            out.diagnose(Diagnostic::Include { path, why: IncludeFailure::Missing });
-            return Ok(());
-        }
+    // The read list's subject: the root-relative path a host with a read root answers (D60),
+    // else the path as written. A host's root-relative path that is not one is refused, never
+    // recorded: it would put the machine's folder or a spelling into the record.
+    let (subject, found, rooted) = match cx.include(path.as_str(), how)? {
+        Included::Bytes(bytes) => (path.as_str(), Some(bytes), false),
+        Included::Missing => (path.as_str(), None, false),
+        Included::At { path: at, bytes } => (at, Some(bytes), true),
+        Included::MissingAt { path: at } => (at, None, true),
         Included::Outside => {
             let path = out.note(path.as_str())?;
             out.diagnose(Diagnostic::Include { path, why: IncludeFailure::Outside });
             return Ok(());
         }
     };
+    if rooted && !crate::cx::is_root_relative(subject) {
+        return Err(HostError { ask: HostAsk::Include, why: HostWhy::Unreadable }.into());
+    }
+    let Some(bytes) = found else {
+        out.exp.reads.push(kind, subject, ReadAnswer::Absent)?;
+        let path = out.note(path.as_str())?;
+        out.diagnose(Diagnostic::Include { path, why: IncludeFailure::Missing });
+        return Ok(());
+    };
     let digest = ContentId::of("blaze v2 expand included file 1", bytes);
-    out.exp.reads.push(kind, path.as_str(), ReadAnswer::Digest(digest))?;
+    out.exp.reads.push(kind, subject, ReadAnswer::Digest(digest))?;
     let not_utf8 = |out: &mut Out<'_, '_>| -> Result<(), ExpandError> {
         let path = out.note(path.as_str())?;
         out.diagnose(Diagnostic::Include { path, why: IncludeFailure::NotUtf8 });

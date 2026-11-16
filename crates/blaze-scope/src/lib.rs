@@ -73,6 +73,7 @@ pub mod resolve;
 mod resolver;
 mod scope;
 pub mod task;
+pub mod tests_record;
 pub mod units;
 mod work;
 

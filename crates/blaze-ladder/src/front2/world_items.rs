@@ -374,6 +374,12 @@ impl World for BodyWorld<'_, '_> {
             let row = self.fn_row(f)?;
             return Ok(Some(AssocItem { container, item: f, kind: AssocKind::Fn { self_param: row.self_param } }));
         }
+        // The trait's associated constant (`<B4 as Specifier>::BITS`, `P::WRITE`), declared or
+        // defaulted: its row's output is the type the checker gives the path; its value is
+        // the constant evaluator's (consts.rs `impl_const`) and only at a concrete `Self`.
+        if let Some(&(_, c)) = extra.consts.iter().find(|(n, _)| *n == name) {
+            return Ok(Some(AssocItem { container, item: c, kind: AssocKind::Const }));
+        }
         Ok(extra.assoc.iter().find(|a| a.name == name).map(|a| AssocItem { container, item: a.item, kind: AssocKind::Type }))
     }
 
@@ -478,7 +484,8 @@ impl World for BodyWorld<'_, '_> {
             MemberKind::Fn => AssocKind::Fn { self_param: self.fn_row(item)?.self_param },
             MemberKind::Const => AssocKind::Const,
             MemberKind::Type => AssocKind::Type,
-            MemberKind::Ctor => return Ok(None),
+            // An anonymous constant is a member of its module: no trait or impl is its parent.
+            MemberKind::Ctor | MemberKind::Anon => return Ok(None),
         };
         Ok(Some(AssocParent { container: *container, name: Name::of(name), kind }))
     }

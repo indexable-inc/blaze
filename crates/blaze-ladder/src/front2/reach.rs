@@ -242,7 +242,7 @@ pub fn reach<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, owner: ItemKe
     seen.insert(owner, ());
     let mut queue: Vec<(ItemKey, Option<Reached>), Global> = Vec::new_in(Global);
     for l in FnLang::ALL {
-        let Some(lib) = r.index.lang(l.lang()) else { continue };
+        let Some(lib) = r.index.fn_lang(l) else { continue };
         queue.push(match r.keys.item(lib) {
             Ok(k) => (k, None),
             Err(clash) => (clash.key, Some(Reached::Failed { class: Box::from("key clash"), detail: format!("{clash}").into_boxed_str() })),

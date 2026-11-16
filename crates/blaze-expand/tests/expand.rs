@@ -1261,3 +1261,167 @@ fn an_include_path_is_relative_to_the_calling_file_and_stays_in_its_root() {
     assert_eq!(target(SourceOrigin::Package, "reg-1.0.0", "src", "../../other/x.txt"), edge);
     assert_eq!(target(SourceOrigin::Package, "reg", "src", "../../reg-x/y"), edge);
 }
+
+/// `panic!` behaves by the edition of the code that WROTE the call, not core's. The pinned core
+/// (library/core/src/macros/mod.rs) marks it `#[rustc_builtin_macro(core_panic)]`
+/// `#[allow_internal_unstable(edition_panic)]` `macro_rules! panic`, and library/core/src/
+/// panic.rs holds its two forms, `pub macro panic_2015 {` and `pub macro panic_2021 {`
+/// (`#[unstable(feature = "edition_panic", ..)]`). The same text from a 2018 crate takes the
+/// 2015 form (its `"{}"` is no format string there); from a 2021 crate the 2021 form.
+/// Expected: the test passes, the two forms printed differ only in `panic_2015`/`panic_2021`.
+#[test]
+fn the_same_panic_takes_the_form_of_the_writing_crate_s_edition() {
+    let cx = TestCx::new();
+    let def = builtin(BuiltinFn::Panic);
+    let input = tokens("\"{}\", x");
+    let at = |edition| CallSite { edition, panic_edition: edition, ctx: Ctx::root(edition) };
+    let old = done(expand(&def, &Call::fn_like(&input, at(Edition::E2018)), &cx, Alloc::global()));
+    let new = done(expand(&def, &Call::fn_like(&input, at(Edition::E2021)), &cx, Alloc::global()));
+    assert_eq!(show(&old.tokens), "$crate :: panic :: panic_2015 ! ( \"{}\" , x )");
+    assert_eq!(show(&new.tokens), "$crate :: panic :: panic_2021 ! ( \"{}\" , x )");
+    // `assert!` with a message picks the same way (core's `assert!` is under `edition_panic`
+    // too): from 2018, `panic_2015!`.
+    let assert = done(expand(
+        &builtin(BuiltinFn::Assert),
+        &Call::fn_like(&tokens("c, \"{}\", x"), at(Edition::E2018)),
+        &cx,
+        Alloc::global(),
+    ));
+    assert_eq!(show(&assert.tokens), "if ! ( c ) { $crate :: panic :: panic_2015 ! ( \"{}\" , x ) }");
+}
+
+/// `cfg_select!` keeps the first arm whose predicate holds IN THE INVOKING CRATE'S cfg set:
+/// the pinned core (library/core/src/macros/mod.rs) documents it as "Selects code at
+/// compile-time based on `cfg` predicates. This macro evaluates, at compile-time, a series of
+/// `cfg` predicates, selects the first that is true, and emits the code guarded by that
+/// predicate." and marks it `#[rustc_builtin_macro] pub macro cfg_select($($tt:tt)*)`. The
+/// same call under two crates' sets (one sets `unix`, the other `feature`) keeps two arms.
+/// Expected: the test passes.
+#[test]
+fn cfg_select_keeps_the_arm_the_invoking_crate_s_cfg_holds() {
+    let def = builtin(BuiltinFn::CfgSelect);
+    let text = "feature => { small } unix => { cyclic } _ => { other }";
+    let unix = TestCx::new();
+    let sized = TestCx { cfgs: &["feature"], ..TestCx::new() };
+    let none = TestCx { cfgs: &[], ..TestCx::new() };
+    assert_eq!(show(&call_fn(&def, text, &unix).tokens), "cyclic");
+    assert_eq!(show(&call_fn(&def, text, &sized).tokens), "small");
+    assert_eq!(show(&call_fn(&def, text, &none).tokens), "other");
+    // Each outcome asked is in the read list, so a changed cfg set reruns the call.
+    let read = call_fn(&def, text, &unix);
+    let answers: Vec<_> = read.reads.list().iter().map(|it| (it.kind, it.answer)).collect();
+    assert_eq!(answers, [(ReadKind::Cfg, ReadAnswer::Bool(false)), (ReadKind::Cfg, ReadAnswer::Bool(true))]);
+}
+
+/// `asm!` expands to `builtin # asm ( .. )`, the parser's one typed form of inline assembly
+/// (`ASM_EXPR`): the pinned core (library/core/src/arch.rs) has `#[rustc_builtin_macro] pub
+/// macro asm("assembly template", $(operands,)* $(options($(option),*))?)`, and the Reference
+/// (inline-assembly.html) names the operand kinds `in`, `out`, `lateout`, `inout`,
+/// `inlateout`, `sym`, `const` and `label`, then `options(..)` and `clobber_abi(..)`. The
+/// expansion parses with no error into one `ASM_EXPR` of six operands of the kinds written,
+/// one `ASM_OPTIONS` and one `ASM_CLOBBER_ABI`; `global_asm!` and `naked_asm!` take their own
+/// keyword; an empty call is the builtin's error. Expected: the test passes.
+#[test]
+fn asm_expands_to_the_parser_s_typed_form_with_each_operand_s_kind() {
+    use parser::{Step, SyntaxKind};
+    let cx = TestCx::new();
+    let text = "\"mov {0}, {1}\", in(reg) a, out(\"x0\") b, inout(reg) c => d, lateout(reg) _, \
+                const 4, sym f, options(nomem, nostack), clobber_abi(\"C\")";
+    let exp = call_fn(&builtin(BuiltinFn::Asm), text, &cx);
+    assert!(exp.diagnostics.is_empty(), "{:?}", exp.diagnostics);
+    assert!(show(&exp.tokens).starts_with("builtin # asm ( \"mov {0}, {1}\" ,"), "{}", show(&exp.tokens));
+    let words = blaze_expand::parser_words(&exp.tokens, Alloc::global());
+    let output = parser::PrefixEntryPoint::Expr.parse(parser::Tokens::new(&words.words, true));
+    let (mut asm, mut options, mut abis) = (0, 0, 0);
+    let mut operands: Vec<String> = Vec::new();
+    let mut in_dir = false;
+    for step in output.iter() {
+        match step {
+            Step::Error { msg } => panic!("the expansion does not parse: {msg}"),
+            Step::Enter { kind: SyntaxKind::ASM_EXPR } => asm += 1,
+            Step::Enter { kind: SyntaxKind::ASM_OPTIONS } => options += 1,
+            Step::Enter { kind: SyntaxKind::ASM_CLOBBER_ABI } => abis += 1,
+            Step::Enter { kind: SyntaxKind::ASM_DIR_SPEC } => in_dir = true,
+            Step::Enter { kind: SyntaxKind::ASM_CONST } => operands.push("const".to_owned()),
+            Step::Enter { kind: SyntaxKind::ASM_SYM } => operands.push("sym".to_owned()),
+            Step::Enter { kind: SyntaxKind::ASM_LABEL } => operands.push("label".to_owned()),
+            Step::Token { kind, .. } if in_dir => {
+                operands.push(format!("{kind:?}").trim_end_matches("_KW").to_lowercase());
+                in_dir = false;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!((asm, options, abis), (1, 1, 1));
+    assert_eq!(operands, ["in", "out", "inout", "lateout", "const", "sym"]);
+    for (which, keyword) in [(BuiltinFn::GlobalAsm, "global_asm"), (BuiltinFn::NakedAsm, "naked_asm")] {
+        let exp = call_fn(&builtin(which), "\"nop\"", &cx);
+        assert_eq!(show(&exp.tokens), format!("builtin # {keyword} ( \"nop\" )"));
+    }
+    let empty = call_fn(&builtin(BuiltinFn::Asm), "", &cx);
+    assert!(matches!(empty.diagnostics[..], [Diagnostic::Builtin { .. }]), "{:?}", empty.diagnostics);
+}
+
+/// A host with a read root answers an include by the file's ROOT-RELATIVE path (decision D60,
+/// docs/v2/plan/decisions.json: an include is bounded by the unit's source root and its digest
+/// goes in the read list), and the read list names the file by that path: never the machine's
+/// folder (a leading `/`) nor the call's spelling (`../`). A host's answer that is not
+/// root-relative is refused, never recorded. Expected: the test passes.
+#[test]
+fn an_include_s_read_list_entry_is_root_relative() {
+    struct Rooted {
+        inner: TestCx,
+        /// What the host answers for every path: the root-relative path and whether it exists.
+        answer: (&'static str, bool),
+    }
+    impl ExpandCx for Rooted {
+        fn env(&self, name: &str) -> Result<Option<&str>, HostError> {
+            self.inner.env(name)
+        }
+        fn cfg(&self, predicate: &TokenStream<'_>) -> Result<bool, HostError> {
+            self.inner.cfg(predicate)
+        }
+        fn include(&self, _: &str, _: IncludeAs) -> Result<Included<'_>, HostError> {
+            Ok(match self.answer {
+                (path, true) => Included::At { path, bytes: b"{}" },
+                (path, false) => Included::MissingAt { path },
+            })
+        }
+        fn place(&self, what: PlaceOf) -> Result<Place<'_>, HostError> {
+            self.inner.place(what)
+        }
+        fn run_proc_macro<'a>(&self, def: &MacroDefinition<'_>, call: ProcCall<'_>, alloc: Alloc<'a>) -> Result<Produced<'a>, HostError> {
+            self.inner.run_proc_macro(def, call, alloc)
+        }
+    }
+    let written = "\"../../chainspec/src/genesis/dev.json\"";
+    let found = Rooted { inner: TestCx::new(), answer: ("crates/chainspec/src/genesis/dev.json", true) };
+    for which in [BuiltinFn::IncludeStr, BuiltinFn::IncludeBytes] {
+        let input = tokens(written);
+        let exp = done(expand(&builtin(which), &Call::fn_like(&input, site()), &found, Alloc::global()));
+        assert!(exp.diagnostics.is_empty(), "{:?}", exp.diagnostics);
+        let read = exp.reads.list()[0];
+        let subject = exp.reads.subject(&read);
+        assert_eq!(subject, "crates/chainspec/src/genesis/dev.json");
+        assert!(!subject.starts_with('/') && !subject.contains(".."), "{subject}");
+        assert_eq!(read.answer, ReadAnswer::Digest(ContentId::of("blaze v2 expand included file 1", b"{}")));
+    }
+    // A missing file is recorded absent under its root-relative path: creating it reruns.
+    let missing = Rooted { inner: TestCx::new(), answer: ("crates/chainspec/x.json", false) };
+    let input = tokens(written);
+    let exp = done(expand(&builtin(BuiltinFn::IncludeStr), &Call::fn_like(&input, site()), &missing, Alloc::global()));
+    let read = exp.reads.list()[0];
+    assert_eq!((exp.reads.subject(&read), read.answer), ("crates/chainspec/x.json", ReadAnswer::Absent));
+    assert!(matches!(exp.diagnostics[..], [Diagnostic::Include { .. }]), "{:?}", exp.diagnostics);
+    // A host that answers the machine's folder, or a spelling, is refused by name.
+    for bad in ["/Users/me/tempo/crates/x.json", "crates/../x.json", "crates//x.json", ""] {
+        let host = Rooted { inner: TestCx::new(), answer: (bad, true) };
+        let input = tokens(written);
+        let refused = expand(&builtin(BuiltinFn::IncludeStr), &Call::fn_like(&input, site()), &host, Alloc::global());
+        assert!(
+            matches!(refused, Err(ExpandError::Host(HostError { ask: HostAsk::Include, why: HostWhy::Unreadable }))),
+            "{bad:?}: {:?}",
+            refused.map(|_| ())
+        );
+    }
+}

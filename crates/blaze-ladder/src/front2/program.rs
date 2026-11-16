@@ -66,6 +66,10 @@ pub enum Front2Refusal {
     NoBody { function: Box<str> },
     /// Constant item `constant`, read by a checked body, was refused by front2's evaluator.
     Const { constant: Box<str>, why: Box<str> },
+    /// Static item `static_`, named by a checked body or pointed at by another static's
+    /// value, was not made: front2's evaluator refused its initializer, or its head or
+    /// attributes did not read (statics.rs).
+    Static { static_: Box<str>, why: Box<str> },
     /// The walk from `entry` (the program's start, named) met more fns than
     /// [`super::reach::MOST_FNS`]; `queued` were still waiting when it stopped.
     Capped { entry: Box<str>, queued: usize },
@@ -107,6 +111,7 @@ impl core::fmt::Display for Front2Refusal {
             }
             Front2Refusal::NoBody { function } => write!(f, "front2: `{function}`, reached from `main`, has no body (front2's)"),
             Front2Refusal::Const { constant, why } => write!(f, "front2: the constant `{constant}`, read by a body of the program, was not evaluated: {why}"),
+            Front2Refusal::Static { static_, why } => write!(f, "front2: the static `{static_}`, reached by the program, was not made: {why}"),
             Front2Refusal::Capped { entry, queued } => write!(
                 f,
                 "front2: `{entry}` reaches more than {} fns (the cap above the whole library's fn count; {queued} still queued): a walk that does not end",
@@ -160,6 +165,12 @@ struct Literals {
     strings: Vec<(ExprId, Box<[u8], Global>), Global>,
     /// Each float literal: its text rounded to the nearest `f64` and `f32` ([`float_bits`]).
     floats: Vec<(ExprId, (u64, u32)), Global>,
+    /// Each float literal pattern's magnitude (the `-` of a `NegLit` dropped), as `floats`.
+    float_pats: Vec<(PatId, (u64, u32)), Global>,
+    /// Each string literal pattern's text, unescaped.
+    str_pats: Vec<(PatId, Box<str, Global>), Global>,
+    /// Each `format_args!` template the builder reads (fmt_template.rs), by expression, sorted.
+    templates: Vec<(ExprId, super::fmt_template::Template), Global>,
 }
 
 /// A float literal's text (`1.5`, `2e-3_f32`, `1_000.0`) rounded once to the nearest `f64`
@@ -200,6 +211,9 @@ pub struct Front2Program<'n> {
     /// Each constant a checked body reads, by key (sorted), as front2's evaluator made it
     /// ([`const_values`]): the seam's `const_record`.
     const_values: Vec<(ItemKey, DataRecord<Global>), Global>,
+    /// Every static the program reaches, each evaluated once ([`super::statics`]): the
+    /// seam's `static_item` and `static_records`.
+    statics: super::statics::Statics,
     /// The cause of the last `normalize` with no answer (the seam's `last_projection`).
     projection_why: core::cell::RefCell<Option<Box<str>>>,
 }
@@ -576,6 +590,7 @@ impl<'n> Front2Program<'n> {
                 None => return Err(Front2Refusal::Const { constant, why }),
             }
         }
+        let statics = made_statics(&mut records, checked.iter().chain(census.bodies.iter().map(|(_, c)| c)), left_out.as_deref_mut(), &mut left)?;
         let views = core::iter::once(records.store.tys.view()).chain(checked.iter().map(|c| c.types.view())).chain(census.bodies.iter().map(|(_, c)| c.types.view()));
         let asked = dyn_principals(views);
         let objects = object_tables(&mut records, asked, left_out.as_deref_mut())?;
@@ -719,7 +734,7 @@ impl<'n> Front2Program<'n> {
         for (slot, item) in langs.iter_mut().zip(SEAM_LANGS) {
             *slot = (item, lang_of(&front, item).map_err(|l| Front2Refusal::Lang { item: l.item, why: l.why })?);
         }
-        Ok(Front2Program { front, store, tys, buckets, fns, by_key, entry, objects, langs, left, const_values: values, projection_why: core::cell::RefCell::new(None) })
+        Ok(Front2Program { front, store, tys, buckets, fns, by_key, entry, objects, langs, left, const_values: values, statics, projection_why: core::cell::RefCell::new(None) })
     }
 
     /// `f` over the checker's world of fn `i`'s body.
@@ -852,7 +867,7 @@ fn placed<'n>(names: &Names<'n>, lib: LibKey) -> (At, Option<&'n str>) {
 fn literals(body: &Body<'_>, path: &str) -> Result<Literals, Front2Refusal> {
     let view = body.lowered.view();
     let t = &body.typeck;
-    let mut out = Literals::default();
+    let mut out = Literals { templates: super::fmt_template::templates(body), ..Literals::default() };
     for (e, x) in t.exprs.iter().enumerate() {
         let tc::Expr::Lit(lit) = x else { continue };
         let id = ExprId(e as u32);
@@ -888,8 +903,22 @@ fn literals(body: &Body<'_>, path: &str) -> Result<Literals, Front2Refusal> {
         out.texts.text.push_str(text);
         out.texts.pats.push(id);
         out.texts.pat_ranges.push(tc::Range { start, end: out.texts.text.len() as u32 });
-        if let tc::Lit::Int(_) | tc::Lit::Char = lit {
-            out.int_pats.push((id, int_value(text).ok_or_else(|| refuse("this literal pattern"))?));
+        match lit {
+            tc::Lit::Int(_) | tc::Lit::Char => {
+                out.int_pats.push((id, int_value(text).ok_or_else(|| refuse("this literal pattern"))?));
+            }
+            // The magnitude: a `NegLit`'s text may hold its `-`; the build flips the sign.
+            tc::Lit::Float(_) => {
+                let magnitude = text.trim().trim_start_matches('-').trim();
+                out.float_pats.push((id, float_bits(magnitude).ok_or_else(|| refuse("this float literal pattern"))?));
+            }
+            tc::Lit::Str => {
+                let bytes = string_bytes(text).ok_or_else(|| refuse("this escape in a string literal pattern"))?;
+                let text = core::str::from_utf8(&bytes).map_err(|_| refuse("a string literal pattern that is not UTF-8"))?;
+                out.str_pats.push((id, Box::from(text)));
+            }
+            // The builder asks no other literal pattern's value (a byte string's, a `bool`'s).
+            tc::Lit::ByteStr(_) | tc::Lit::CStr | tc::Lit::Bool(_) => {}
         }
     }
     Ok(out)
@@ -971,7 +1000,7 @@ impl FrontEnd for Front2Program<'_> {
     }
 
     fn fn_lang(&self, l: FnLang) -> Option<ItemKey> {
-        self.front.index.lang(l.lang()).map(checker_of)
+        self.front.index.fn_lang(l).map(checker_of)
     }
 
     /// The `drop` lang trait and its `drop` fn (filed once the trait's head was made).
@@ -1030,9 +1059,48 @@ impl FrontEnd for Front2Program<'_> {
         s.binary_search_by_key(&e.0, |(x, _)| x.0).ok().map(|i| &*s[i].1)
     }
 
+    fn format_template(&self, owner: ItemKey, e: ExprId) -> Option<&[blaze_build::FmtPiece<'_>]> {
+        let s = &self.fns[self.fn_index(owner)?].lits.templates;
+        s.binary_search_by_key(&e.0, |(x, _)| x.0).ok().map(|i| s[i].1.pieces())
+    }
+
+    /// Core's `#[lang = "format_argument"] pub struct Argument<'a>` (library/core/src/fmt/rt.rs).
+    fn fmt_argument_adt(&self) -> Option<ItemKey> {
+        self.front.index.lang("format_argument").map(checker_of)
+    }
+
+    /// The constructor by name (blaze-build walk/fmt.rs `argument_new_name`) in rt.rs's one
+    /// inherent `impl Argument<'_>`, found among the impls of `Argument`'s own module whose
+    /// header is inherent on it, as its member key once the impl's head was made. Two such
+    /// impls, or none made, is no answer (the builder refuses naming the constructor).
+    fn fmt_argument_new(&self, trait_: tc::FmtTrait) -> Option<ItemKey> {
+        let name = super::fmt_template::argument_new_name(trait_);
+        let adt = self.front.index.lang("format_argument")?;
+        let module = self.front.names.module_of(adt)?;
+        let mut found = self
+            .front
+            .index
+            .impls
+            .iter()
+            .filter(|i| i.module == module && super::fmt_template::inherent_on(i.header, "Argument"))
+            .filter_map(|i| self.front.keys.filed_member(checker_of(i.key), MemberKind::Fn, name));
+        let first = found.next()?;
+        found.next().is_none().then_some(first)
+    }
+
     fn float_lit(&self, owner: ItemKey, e: ExprId) -> Option<(u64, u32)> {
         let s = &self.fns[self.fn_index(owner)?].lits.floats;
         s.binary_search_by_key(&e.0, |(x, _)| x.0).ok().map(|i| s[i].1)
+    }
+
+    fn float_pat(&self, owner: ItemKey, p: PatId) -> Option<(u64, u32)> {
+        let s = &self.fns[self.fn_index(owner)?].lits.float_pats;
+        s.binary_search_by_key(&p.0, |(x, _)| x.0).ok().map(|i| s[i].1)
+    }
+
+    fn str_pat(&self, owner: ItemKey, p: PatId) -> Option<&str> {
+        let s = &self.fns[self.fn_index(owner)?].lits.str_pats;
+        s.binary_search_by_key(&p.0, |(x, _)| x.0).ok().map(|i| &*s[i].1)
     }
 
     /// In the first tabled body's world: selection and the projection step read the impls and

@@ -912,6 +912,9 @@ fn draw<'f>(
     // (names.rs `placed`; rule 71). The id's item is a Rust file's outline item read in one
     // grammar for every file (fix.rs `ITEM_GRAMMAR`), so an id is a function of the text alone.
     let first = shown.listed.len();
+    // THE CALL SITE of `fix::checker_findings`, owed to the TYPES stage (work.rs CHECK_STAGES
+    // "types"): when a body's `BodyCheck` record carries the checker's `suggests`, each of its
+    // holes becomes a listed finding with its id and fix here, beside the prints below.
     for (i, finding) in prints.iter().enumerate() {
         let (path, place, words) = match finding.rule == names::UNRESOLVED && finding.file.is_none() {
             true => match names::placed(cx, root, &finding.message, frame)? {

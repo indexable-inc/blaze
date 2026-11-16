@@ -1776,10 +1776,22 @@ lane; sent to the integration lane a14c41bba58ed36a1 in two batches).
   unproven there: `_serde` through the inner block's `use super::*`, or the derive-expansion
   road (`expand_decls` -> `make_blocks`); that lane is out of runs; the switch is the two
   `make_blocks(..)` calls in blaze-scope resolve.rs.
-- FIRST for a successor: the integrator (a14c41bba58ed36a1) was sent this piece at ~12:45 and
-  had not run it when these notes were written: read BUILD-STATUS.md for its lines, fix what
-  it sends back, then read the walk's REACHABLE line and the "[asked: ..]" text of any
-  RefusedImpl left.
+- THE INTEGRATOR'S LINES (a14c41bba58ed36a1, then retired; its successor is a4960bb735b64971b):
+  piece 1 compiled with no slips. Walk list-AF: "REACHABLE: 2843 of 3270 reachable functions
+  type-check"; RefusedImpl is no longer a class; b6e412 in no line. Top six: 228 check Diags;
+  82 check Head (adt_const_params); 39 lower Convert; 32 gap TypeAlias; 11 gap FnHead ConstPath
+  size_of; 10 gap Local. front2_items (the 16-test state): "15 passed, 1 failed":
+  `a_trait_impl_is_no_candidate_of_an_inherent_question`: plain clean; block: "the impl
+  dd17f6b2ba81.. [asked: the inherent items of Adt(..)] .. has a refused header: ..
+  Program("`HasF<Client, value, { crate::SV }` is not a type", Range { start: 16, end: 49 })":
+  the header still arrived CUT at its first braced const argument in that build, so the cut
+  text was an inherent candidate, as said above. The 18-test state (bare unread, pattern type,
+  the ignored discriminant test) was NEVER RUN; the census and tempo were not run.
+- FIRST for a successor: a4960bb735b64971b was asked to run `blaze-file-items test nested`,
+  then front2_items again (expected "17 passed, 0 failed"), and to put the lines in
+  BUILD-STATUS.md. If the block fixture still fails with a cut header while nested is green, a
+  second reader cuts it (blaze-scope `blocks::module_text` or the tables' `header`). Then the
+  "pattern type head: UsizeNoHighBit" line decides head or seam for the 111 x NoAdt.
 - Tests added (front2_items.rs; 18 tests: expected "17 passed, 0 failed", one ignored):
   `a_trait_impl_is_no_candidate_of_an_inherent_question` (module-level and zerocopy's block
   shape), `a_trait_const_parameter_takes_a_literal_and_a_braced_constant`,

@@ -50,9 +50,22 @@ pub enum IncludeAs {
 /// A file read for `include_str!` or `include_bytes!`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Included<'a> {
+    /// The file's bytes, from a host with no [`ReadRoot`] (a test's files, a build script's
+    /// output record): the read list names it by the path as written.
     Bytes(&'a [u8]),
-    /// No file at that path.
+    /// No file at that path, from a host with no [`ReadRoot`].
     Missing,
+    /// The file at `path` under the unit's [`ReadRoot`], and its bytes. `path` is the
+    /// segments [`include_target`] gives joined by `/` (D60, docs/v2/plan/decisions.json: "an
+    /// include is bounded by the unit's source root and its digest goes in the read list"), so
+    /// the read list names the file by where it is in the root, never by the machine's folder
+    /// or the call's spelling: two calls naming one file from two folders read one subject, and
+    /// a changed file finds its readers by its root-relative path. A path that is not
+    /// root-relative ([`is_root_relative`]) is refused, never recorded.
+    At { path: &'a str, bytes: &'a [u8] },
+    /// No file at the root-relative `path` under the unit's [`ReadRoot`] (as [`Included::At`]):
+    /// recorded as absent under that path, so creating the file reruns the reader.
+    MissingAt { path: &'a str },
     /// The path leaves the unit's [`ReadRoot`] (decision D60: [`include_target`]); a build
     /// script's output folder is answered from its record before a host is asked. Decided by
     /// the written path and the calling file's place alone, so it is no read.
@@ -215,6 +228,14 @@ impl fmt::Display for OutsideRoot {
 }
 
 impl core::error::Error for OutsideRoot {}
+
+/// Whether `path` is a root-relative file path as [`include_target`]'s segments joined by `/`
+/// make one: not empty, no leading or doubled `/`, no `.` or `..` segment, no `\`. A path a
+/// host answers in [`Included::At`] or [`Included::MissingAt`] must be one, or a record would
+/// hold the machine's folder or a spelling of the path.
+pub fn is_root_relative(path: &str) -> bool {
+    !path.is_empty() && !path.contains('\\') && path.split('/').all(|segment| !matches!(segment, "" | "." | ".."))
+}
 
 /// The file `include!`, `include_str!` or `include_bytes!` reads when the call is written in a
 /// file of the folder `folder` (under the package of `root`) and names `written`, as segments

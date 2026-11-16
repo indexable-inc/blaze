@@ -545,10 +545,54 @@ pub fn eval_len(r: &mut Records<'_, '_>, c: LibKey) -> Result<(), ConstFail> {
     let Some((consts, prepared)) = r.consts.take() else {
         return Err(ConstFail::Nested { item: checker_of(c) });
     };
-    let value = consts.value(r, prepared, checker_of(c)).map(int_of);
+    // An anonymous constant a head asked for (`1 << 0`, `u8::MAX`: front2/anon.rs) is made a
+    // constant item's head first; `c` may be one's need key, whose checker key is that head's.
+    let filed = super::anon::file_asked(&mut *r.store, &mut *r.keys).map_err(|e| ConstFail::Eval(format!("constant {:?}: {e}", checker_of(c)).into_boxed_str()));
+    let (value, asked) = match filed {
+        Ok(asked) => (consts.value(r, prepared, checker_of(c)).map(int_of), asked),
+        Err(e) => (Err(e), Vec::new_in(Global)),
+    };
+    // The other anonymous constants asked with it (an enum's other discriminants) are
+    // evaluated in the same round.
+    // An ANONYMOUS constant the evaluator refuses is not this caller's failure: its refusal
+    // is filed (`Maps::anon_failed`) and the head that wrote the expression is refused by
+    // name when it is made again (`Builder::const_value_bits`), and only that head: an impl
+    // whose header writes `W<{ size_of::<u8>() }>` stays a refused candidate, a named gap of
+    // the questions it could answer, as before there was an evaluator behind the heads.
+    let anonymous = |k: LibKey| super::anon::need_key(checker_of(k)) == k;
+    let mut more: Vec<(LibKey, u128), Global> = Vec::new_in(Global);
+    let mut failed: Vec<(LibKey, Box<str, Global>), Global> = Vec::new_in(Global);
+    for &o in asked.iter() {
+        if o == c || r.store.maps.const_bits.contains_key(&o) || r.store.maps.anon_failed.contains_key(&o) {
+            continue;
+        }
+        match consts.value(r, prepared, checker_of(o)).map(int_of) {
+            Ok(Some(bits)) => more.push((o, bits)),
+            Ok(None) => failed.push((o, Box::from("its value is not an integer of at most 16 bytes"))),
+            Err(e) => failed.push((o, format!("{e}").into_boxed_str())),
+        }
+    }
     r.consts = Some((consts, prepared));
-    let v = value?.and_then(|v| u64::try_from(v).ok()).ok_or(ConstFail::NotUsize { item: checker_of(c) })?;
-    r.store.maps.const_lens.insert(c, v);
+    for &(o, bits) in more.iter() {
+        r.store.maps.const_bits.insert(o, bits);
+    }
+    for (o, why) in failed {
+        r.store.maps.anon_failed.insert(o, why);
+    }
+    let value = match value {
+        Err(e) if anonymous(c) => {
+            r.store.maps.anon_failed.insert(c, format!("{e}").into_boxed_str());
+            return Ok(());
+        }
+        other => other,
+    };
+    // The value's bits in its own type's width (at most 16 bytes): every reader knows the
+    // type. `const_lens` keeps those of 64 bits for `Heads::const_len`.
+    let bits = value?.ok_or(ConstFail::NotUsize { item: checker_of(c) })?;
+    r.store.maps.const_bits.insert(c, bits);
+    if let Ok(v) = u64::try_from(bits) {
+        r.store.maps.const_lens.insert(c, v);
+    }
     Ok(())
 }
 

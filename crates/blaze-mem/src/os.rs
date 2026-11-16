@@ -173,18 +173,30 @@ fn reserve_with(bytes: usize, huge: bool, prot: libc::c_int) -> io::Result<NonNu
 /// A refused reservation, named: on Linux a writable one is charged to the commit limit at once
 /// when the system ignores `MAP_NORESERVE` (`vm.overcommit_memory = 2`), which a reservation of
 /// tens of GiB passes.
+// to remove: callers pass HostMemory (bstd move): this reads the overcommit mode here.
 #[cfg(unix)]
 #[cold]
 fn refused_reservation(bytes: usize, prot: libc::c_int, why: io::Error) -> io::Error {
+    refused_reservation_in(bytes, prot, why, overcommit_here())
+}
+
+/// As [`refused_reservation`], worded with the host's `overcommit` mode given (a
+/// [`HostMemory`](crate::HostMemory) fact read at boot).
+#[cfg(unix)]
+#[cold]
+fn refused_reservation_in(
+    bytes: usize,
+    prot: libc::c_int,
+    why: io::Error,
+    overcommit: crate::host::Overcommit,
+) -> io::Error {
     if !(cfg!(target_os = "linux")
         && prot != libc::PROT_NONE
         && why.raw_os_error() == Some(libc::ENOMEM))
     {
         return why;
     }
-    let mode = std::fs::read_to_string("/proc/sys/vm/overcommit_memory")
-        .map(|it| it.trim().to_owned()) // alloc: the error of a refused reservation, once
-        .unwrap_or_else(|read| format!("unreadable: {read}")); // alloc: as above
+    let mode = overcommit.shown();
     // alloc: the error of a refused reservation, once
     io::Error::new(
         why.kind(),
@@ -193,6 +205,65 @@ fn refused_reservation(bytes: usize, prot: libc::c_int, why: io::Error) -> io::E
              vm.overcommit_memory is {mode}, and blaze needs 0 or 1 (2 charges every reservation whole)"
         ),
     )
+}
+
+/// The host's memory facts as read here, with the process's `huge_pages` choice: the overcommit
+/// mode, the transparent huge page setting and the 2 MiB pool's size.
+// to remove: callers pass HostMemory (bstd move): blaze-core reads these files at boot.
+pub(crate) fn host_memory_here(huge_pages: crate::host::HugeChoice) -> crate::HostMemory {
+    crate::HostMemory {
+        huge_pages,
+        overcommit: overcommit_here(),
+        thp: thp_here(),
+        huge_pool_2m: pool_here(),
+    }
+}
+
+/// `vm.overcommit_memory`, read here; [`Overcommit::Unread`](crate::host::Overcommit::Unread)
+/// when the file cannot be read or parsed.
+// to remove: callers pass HostMemory (bstd move).
+#[cfg(target_os = "linux")]
+fn overcommit_here() -> crate::host::Overcommit {
+    // alloc: the setting's few bytes, read once per process
+    match std::fs::read_to_string("/proc/sys/vm/overcommit_memory") {
+        Ok(text) => crate::host::Overcommit::parse(&text).unwrap_or(crate::host::Overcommit::Unread),
+        Err(_) => crate::host::Overcommit::Unread,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn overcommit_here() -> crate::host::Overcommit {
+    crate::host::Overcommit::Unread
+}
+
+/// The transparent huge page setting, read here; [`ThpSetting::Missing`](crate::host::ThpSetting::Missing)
+/// when the file cannot be read or marks no setting.
+// to remove: callers pass HostMemory (bstd move).
+#[cfg(target_os = "linux")]
+fn thp_here() -> crate::host::ThpSetting {
+    // alloc: the setting's few bytes, read once per process
+    match std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled") {
+        Ok(text) => crate::host::ThpSetting::parse(&text).unwrap_or(crate::host::ThpSetting::Missing),
+        Err(_) => crate::host::ThpSetting::Missing,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn thp_here() -> crate::host::ThpSetting {
+    crate::host::ThpSetting::Missing
+}
+
+/// The 2 MiB hugetlb pool's size in pages, read here; `None` when unreadable.
+// to remove: callers pass HostMemory (bstd move).
+#[cfg(target_os = "linux")]
+fn pool_here() -> Option<u64> {
+    // alloc: the pool's size, read once per process
+    std::fs::read_to_string(POOL).ok().as_deref().and_then(crate::host::parse_pool)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn pool_here() -> Option<u64> {
+    None
 }
 
 /// Tells Linux which pages `[ptr, ptr + bytes)` is made of: with `huge`, transparent huge
@@ -543,7 +614,7 @@ fn one_node(node: u32) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::InvalidInput,
         // alloc: an error naming the node, once
-        format!("{} has one memory node and no NUMA node {node}", std::env::consts::OS),
+        format!("{SYSTEM} has one memory node and no NUMA node {node}"),
     ))
 }
 
@@ -607,26 +678,23 @@ const POOL: &str = "/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages";
 
 /// Whether Linux makes transparent huge pages for a region advised `MADV_HUGEPAGE`: the
 /// setting is `always` or `madvise`, not `never`, and the kernel has them at all.
-#[cfg(target_os = "linux")]
+// to remove: callers pass HostMemory (bstd move): `HostMemory::transparent_offered`.
+#[cfg_attr(not(test), expect(dead_code, reason = "the tests' reader until they pass HostMemory"))]
 pub(crate) fn transparent_offered() -> bool {
-    // alloc: the setting's few bytes, read once per process
-    match std::fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled") {
-        Ok(setting) => !setting.contains("[never]"),
-        Err(_) => false,
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn transparent_offered() -> bool {
-    false
+    cfg!(target_os = "linux") && thp_here().offers()
 }
 
 /// Checks the 2 MiB hugetlb pool has pages: a commit takes them from it, and a pool of none
 /// would fail the first one.
-#[cfg(target_os = "linux")]
+// to remove: callers pass HostMemory (bstd move): `reserved_pool_in(host.huge_pool_2m)`.
 pub(crate) fn reserved_pool() -> io::Result<()> {
-    // alloc: the pool's size, read once per process
-    let pages = std::fs::read_to_string(POOL).ok().and_then(|text| text.trim().parse::<u64>().ok());
+    reserved_pool_in(pool_here())
+}
+
+/// As [`reserved_pool`], for a pool of `pages` 2 MiB pages (`None`: none to read), a
+/// [`HostMemory`](crate::HostMemory) fact read at boot.
+#[cfg(target_os = "linux")]
+pub(crate) fn reserved_pool_in(pages: Option<u64>) -> io::Result<()> {
     if pages.is_some_and(|pages| pages > 0) {
         return Ok(());
     }
@@ -643,7 +711,7 @@ pub(crate) fn reserved_pool() -> io::Result<()> {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn reserved_pool() -> io::Result<()> {
+pub(crate) fn reserved_pool_in(_pages: Option<u64>) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         // alloc: the error of a setting this system cannot honor, once
@@ -651,10 +719,34 @@ pub(crate) fn reserved_pool() -> io::Result<()> {
             "{}=reserved: reserved huge pages (hugetlbfs) are Linux's, and {} has none for \
              anonymous memory; unset it",
             crate::huge::VAR,
-            std::env::consts::OS
+            SYSTEM
         ),
     ))
 }
+
+/// The system's name for an error's text: the value Rust's `env::consts::OS` has, from `cfg!`.
+#[cfg_attr(target_os = "linux", expect(dead_code, reason = "named only in other systems' errors"))]
+const SYSTEM: &str = if cfg!(target_os = "macos") {
+    "macos"
+} else if cfg!(target_os = "ios") {
+    "ios"
+} else if cfg!(windows) {
+    "windows"
+} else if cfg!(target_os = "freebsd") {
+    "freebsd"
+} else if cfg!(target_os = "openbsd") {
+    "openbsd"
+} else if cfg!(target_os = "netbsd") {
+    "netbsd"
+} else if cfg!(target_os = "android") {
+    "android"
+} else if cfg!(target_os = "linux") {
+    "linux"
+} else if cfg!(target_os = "wasi") {
+    "wasi"
+} else {
+    "this system"
+};
 
 /// Makes `[ptr, ptr + bytes)` readable and writable on 2 MiB pages of the reserved hugetlb
 /// pool, every page made now, preferred on NUMA node `node` when given. Errs, with the range
@@ -1228,7 +1320,7 @@ fn system_release() -> std::string::String {
 #[cfg(any(windows, all(not(unix), target_arch = "wasm64")))]
 #[cold]
 fn system_release() -> std::string::String {
-    std::env::consts::OS.to_owned() // alloc: an error's text, once
+    SYSTEM.to_owned() // alloc: an error's text, once
 }
 
 /// Releases a whole reservation.

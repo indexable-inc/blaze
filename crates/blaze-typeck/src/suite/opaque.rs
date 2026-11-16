@@ -310,3 +310,99 @@ fn a_method_on_an_opaque_bound_by_let() {
     let d = written(differences(&fx, &b, &c, &want));
     assert!(d.is_empty(), "\n{}", d.join("\n"));
 }
+
+/// [type.impl-trait.return.constraint-body]: "Each possible return value from the function must
+/// resolve to the same concrete type": that ONE type is the record's, per opaque key
+/// (`Checked::hidden`): `{ return 1u8; 2u8 }` as `fn d() -> impl Tr2` records one row, `u8`.
+/// Without writeback's rows the list is empty and this fails at "one hidden type".
+/// Should print: "test suite::opaque::the_hidden_type_is_recorded_per_opaque ... ok".
+#[test]
+fn the_hidden_type_is_recorded_per_opaque() {
+    let (fx, _, _, c) = defining_body(|b| b.int(Some(IntSuffix::Uint(UintTy::U8))));
+    assert_eq!(c.hidden.len(), 1, "one hidden type: {:?}", c.hidden);
+    assert_eq!(crate::fixture::show(&fx, c.types.view(), c.hidden[0].1), "u8");
+}
+
+/// A caller's body defines nothing: `fn user() -> Option<u8>` calling `plain()` records no
+/// hidden type (the opaque stays opaque to it: "a caller of the function is not permitted to
+/// know the concrete type").
+#[test]
+fn a_caller_records_no_hidden_type() {
+    let (fx, user) = next_world();
+    let mut b = Bb::new();
+    let f = b.path(&["plain"]);
+    let call = b.call(f, &[]);
+    let i = b.bind("i");
+    let s = b.let_(i, None, call);
+    let recv = b.local(i);
+    let next = b.method(recv, "next", &[]);
+    let root = b.block(&[s], Some(next));
+    let c = check_body(&fx, &b, user, root, Plant::None, InferPlant::None);
+    assert!(c.hidden.is_empty(), "{:?}", c.hidden);
+}
+
+/// `trait Future { type Output; }` (the lang item) and `async fn NAME(x: u8) -> u8`, as the
+/// front end files an async fn (front2/heads.rs): the output is opaque 0 with the bounds
+/// `Future`, `Output == u8` and `Sized`.
+fn async_world(name: &str) -> (Fx, ItemKey) {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let future = fx.tr("Future", 1, Vec::new(), &["Output"]);
+    fx.lang(LangItem::Future, future);
+    let u8_ = fx.u8();
+    let o = fx.opaque_key(&format!("{name}::{{opaque#0}}"));
+    let none = fx.list(&[]);
+    let opaque = fx.ty(PNode::Opaque(o, none));
+    let is_future = fx.bound(future, &[opaque]);
+    let out_u8 = fx.proj(future, &[opaque], "Output", u8_);
+    let is_sized = fx.bound(sized, &[opaque]);
+    fx.set_opaque_bounds(o, std::vec![is_future, out_u8, is_sized]);
+    let f = fx.func(name, 0, &[u8_], opaque, Vec::new());
+    fx.finish();
+    (fx, f)
+}
+
+/// The Reference, "Async functions": "async fn example<'a>(x: &'a str) -> usize { .. } is
+/// roughly equivalent to: fn example<'a>(x: &'a str) -> impl Future<Output = usize> + 'a {
+/// async move { .. } }". `async fn af(x: u8) -> u8 { x }` in the form blaze-lower makes (the
+/// root is the `async move` block): the block's output is the written `u8`, its future is the
+/// opaque's hidden type and has `Future<Output = u8>`: clean, one hidden type recorded.
+/// Without the rule (control.rs `start_body` checking the root against the written type) the
+/// future meets `u8`: E0308 at the root.
+/// Should print: "test suite::opaque::an_async_fn_checks_as_its_async_move_block ... ok".
+#[test]
+fn an_async_fn_checks_as_its_async_move_block() {
+    let (fx, af) = async_world("af");
+    let mut b = Bb::new();
+    let x = b.param("x");
+    let u8_ = b.ty(PNode::Uint(UintTy::U8));
+    b.async_fn(u8_);
+    let e0 = b.local(x);
+    let inner = b.block(&[], Some(e0));
+    let root = b.async_block(inner, crate::body::Capture::Move);
+    let c = check_body(&fx, &b, af, root, Plant::None, InferPlant::None);
+    let want = Want { exprs: &[(e0, "u8"), (inner, "u8")], pats: &[], diags: &[] };
+    let d = written(differences(&fx, &b, &c, &want));
+    assert!(d.is_empty(), "\n{}", d.join("\n"));
+    assert_eq!(c.hidden.len(), 1, "the future is the opaque's hidden type: {:?}", c.hidden);
+}
+
+/// The same sentence: `async fn h(x: u8) -> u8 { "a" }` is `fn h(x: u8) -> impl Future<Output =
+/// u8> { async move { "a" } }` whose block must return the written `u8`: ONE finding, E0308 at
+/// the string (never a failed `Future<Output = u8>` bound at the block, and never two).
+#[test]
+fn an_async_fn_returning_the_wrong_type_is_one_mismatch_at_the_value() {
+    let (fx, h) = async_world("h");
+    let mut b = Bb::new();
+    let _x = b.param("x");
+    let u8_ = b.ty(PNode::Uint(UintTy::U8));
+    b.async_fn(u8_);
+    let a = b.str_();
+    let inner = b.block(&[], Some(a));
+    let root = b.async_block(inner, crate::body::Capture::Move);
+    let c = check_body(&fx, &b, h, root, Plant::None, InferPlant::None);
+    let want = Want { exprs: &[], pats: &[], diags: &[(DiagCode::Mismatch, a)] };
+    let d = written(differences(&fx, &b, &c, &want));
+    assert!(d.is_empty(), "\n{}", d.join("\n"));
+}

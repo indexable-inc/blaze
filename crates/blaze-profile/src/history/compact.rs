@@ -18,6 +18,10 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
+use core::fmt;
+
+use blaze_own::{Alloc, CollectIn as _, Vec, format_in, vec_in};
+
 use crate::schema;
 
 #[cfg(test)]
@@ -62,16 +66,17 @@ impl Name {
         }
     }
 
-    /// The file's name in the history's directory.
+    /// The file's name in the history's directory, in `alloc`: once a file.
+    pub(crate) fn file_name_in<'a>(&self, alloc: Alloc<'a>) -> blaze_own::String<Alloc<'a>> {
+        format_in!(alloc, "{self}")
+    }
+
+    /// [`Name::file_name_in`] in `std`'s string, for the history's file IO that still takes
+    /// one (history/files.rs, eleven calls, history.rs and the tests).
+    // to remove (bstd move): once history/files.rs passes its allocator to `file_name_in`.
     pub(crate) fn file_name(&self) -> String {
-        let Name { build, first, last, level, .. } = *self;
-        let table = schema::TABLES[self.table].name;
-        match level {
-            // alloc: a file's name, once a file
-            0 => format!("{build}-{first:08}.{table}.parquet"),
-            // alloc: a file's name, once a file
-            _ => format!("{build}-{first:08}-{last:08}-{level}.{table}.parquet"),
-        }
+        // alloc: a file's name, once a file
+        format!("{self}")
     }
 
     fn group(&self) -> (u64, usize) {
@@ -79,11 +84,26 @@ impl Name {
     }
 }
 
+/// The file's name, `<build>-<seq:08>.<table>.parquet` or
+/// `<build>-<first:08>-<last:08>-<level>.<table>.parquet`: what [`Name::parse`] reads back.
+impl fmt::Display for Name {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Name { build, first, last, level, .. } = *self;
+        let table = schema::TABLES[self.table].name;
+        match level {
+            0 => write!(f, "{build}-{first:08}.{table}.parquet"),
+            _ => write!(f, "{build}-{first:08}-{last:08}-{level}.{table}.parquet"),
+        }
+    }
+}
+
 /// Files to merge into one: `inputs` index the files given to [`plan`], in seq order, and
 /// `output` names the file they become.
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct Merge {
-    pub(crate) inputs: Vec<usize>,
+pub(crate) struct Merge<'a> {
+    /// A growable array, not a `FixedVec`: a level's merge takes [`FAN_IN`], but a build's end
+    /// folds every file of a table left, however many levels it reached.
+    pub(crate) inputs: Vec<usize, Alloc<'a>>,
     pub(crate) output: Name,
 }
 
@@ -93,48 +113,60 @@ pub(crate) struct Merge {
 /// above its highest. A merge that would take another's output takes that output's inputs
 /// instead, so each file is in at most one merge and each row is copied once a plan. Groups in
 /// (build, table) order; a single file is never merged.
-pub(crate) fn plan(files: &[Name], ended: Option<u64>) -> Vec<Merge> {
-    // alloc: once a flush that compacts
-    let mut order: Vec<usize> = (0..files.len()).collect();
+pub(crate) fn plan<'a>(files: &[Name], ended: Option<u64>, alloc: Alloc<'a>) -> Vec<Merge<'a>, Alloc<'a>> {
+    // A plain array of positions sorted by the files' keys: read once in order, never looked
+    // up. alloc: once a flush that compacts
+    let mut order: Vec<usize, Alloc<'a>> = (0..files.len()).collect_in(alloc);
     order.sort_unstable_by_key(|&at| {
         (files[at].group(), files[at].first, files[at].last, files[at].level)
     });
-    // alloc: once a flush that compacts
-    let mut merges = Vec::new();
+    // Appended once a merge and handed to the caller whole. alloc: once a flush that compacts
+    let mut merges = Vec::new_in(alloc);
     for group in order.chunk_by(|&a, &b| files[a].group() == files[b].group()) {
-        plan_group(files, group, ended, &mut merges);
+        plan_group(files, group, ended, &mut merges, alloc);
     }
     merges
 }
 
 /// A file of a group as the plan goes: one of the files given, or the output of merges.
-struct Item {
+struct Item<'a> {
     name: Name,
-    /// The files given that it holds the rows of: one for a file given.
-    covers: Vec<usize>,
+    /// The files given that it holds the rows of: one for a file given, any number for a
+    /// merge's output (a growable array: a fold appends them all).
+    covers: Vec<usize, Alloc<'a>>,
 }
 
-fn plan_group(files: &[Name], group: &[usize], ended: Option<u64>, merges: &mut Vec<Merge>) {
-    // alloc: a group's files, once a flush that compacts
-    let mut items: Vec<Item> =
-        group.iter().map(|&at| Item { name: files[at], covers: vec![at] }).collect();
+fn plan_group<'a>(
+    files: &[Name],
+    group: &[usize],
+    ended: Option<u64>,
+    merges: &mut Vec<Merge<'a>, Alloc<'a>>,
+    alloc: Alloc<'a>,
+) {
+    // A group's files as the plan folds them: a few dozen at most (`FAN_IN - 1` a level), so
+    // scanned by level, not indexed; a struct of arrays would split `covers` from its name for
+    // no scan worth it. alloc: a group's files, once a flush that compacts
+    let mut items: Vec<Item<'a>, Alloc<'a>> = group
+        .iter()
+        .map(|&at| Item { name: files[at], covers: vec_in![alloc; at] })
+        .collect_in(alloc);
     // Each merge takes `FAN_IN` items and gives back one, so a group of n files merges fewer
     // than n times.
     for _ in 0..group.len() {
-        let Some(level) = lowest_full(&items) else { break };
+        let Some(level) = lowest_full(&items, alloc) else { break };
         // alloc: a merge's files, once a merge
-        let mut at: Vec<usize> =
-            (0..items.len()).filter(|&it| items[it].name.level == level).collect();
+        let mut at: Vec<usize, Alloc<'a>> =
+            (0..items.len()).filter(|&it| items[it].name.level == level).collect_in(alloc);
         at.sort_unstable_by_key(|&it| (items[it].name.first, items[it].name.last));
         at.truncate(FAN_IN);
-        fold(&mut items, &mut at, level + 1);
+        fold(&mut items, &mut at, level + 1, alloc);
     }
     let build = files[group[0]].build;
     if ended == Some(build) && items.len() >= 2 {
         let level = items.iter().map(|it| it.name.level).max().unwrap_or(0) + 1;
         // alloc: a merge's files, once a merge
-        let mut at: Vec<usize> = (0..items.len()).collect();
-        fold(&mut items, &mut at, level);
+        let mut at: Vec<usize, Alloc<'a>> = (0..items.len()).collect_in(alloc);
+        fold(&mut items, &mut at, level, alloc);
     }
     for item in items.into_iter().filter(|it| it.covers.len() >= 2) {
         let mut inputs = item.covers;
@@ -144,19 +176,20 @@ fn plan_group(files: &[Name], group: &[usize], ended: Option<u64>, merges: &mut 
 }
 
 /// The lowest level of `items` holding [`FAN_IN`] files or more.
-fn lowest_full(items: &[Item]) -> Option<u32> {
-    let mut levels: Vec<u32> = items.iter().map(|it| it.name.level).collect(); // alloc: a group's levels, once a merge
+fn lowest_full(items: &[Item<'_>], alloc: Alloc<'_>) -> Option<u32> {
+    // alloc: a group's levels, once a merge
+    let mut levels: Vec<u32, Alloc<'_>> = items.iter().map(|it| it.name.level).collect_in(alloc);
     levels.sort_unstable();
     levels.chunk_by(|a, b| a == b).find(|it| it.len() >= FAN_IN).map(|it| it[0])
 }
 
 /// Replaces the items at the positions `at` with one item of `level` holding all their rows.
-fn fold(items: &mut Vec<Item>, at: &mut [usize], level: u32) {
+fn fold<'a>(items: &mut Vec<Item<'a>, Alloc<'a>>, at: &mut [usize], level: u32, alloc: Alloc<'a>) {
     at.sort_unstable_by(|a, b| b.cmp(a));
     let mut name = items[at[0]].name;
     name.level = level;
     // alloc: a merge's files, once a merge
-    let mut covers = Vec::new();
+    let mut covers = Vec::new_in(alloc);
     for &it in at.iter() {
         let item = items.remove(it);
         name.first = name.first.min(item.name.first);
@@ -170,12 +203,12 @@ fn fold(items: &mut Vec<Item>, at: &mut [usize], level: u32) {
 /// merged file, of a lower level, and with their seqs inside its `first..=last`. A crash
 /// between a merge's rename and its deletes, before manifests, left them; read, their rows
 /// would count twice. In ascending order.
-pub(crate) fn superseded(files: &[Name]) -> Vec<usize> {
-    // alloc: once a history opens
-    let mut order: Vec<usize> = (0..files.len()).collect();
+pub(crate) fn superseded<'a>(files: &[Name], alloc: Alloc<'a>) -> Vec<usize, Alloc<'a>> {
+    // Positions sorted by group, read once in order. alloc: once a history opens
+    let mut order: Vec<usize, Alloc<'a>> = (0..files.len()).collect_in(alloc);
     order.sort_unstable_by_key(|&at| files[at].group());
-    // alloc: once a history opens
-    let mut gone = Vec::new();
+    // Appended, then sorted and deduplicated for the caller. alloc: once a history opens
+    let mut gone = Vec::new_in(alloc);
     for group in order.chunk_by(|&a, &b| files[a].group() == files[b].group()) {
         for &merged in group.iter().filter(|&&it| files[it].level >= 1) {
             let outer = files[merged];

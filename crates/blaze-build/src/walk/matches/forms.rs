@@ -146,13 +146,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     pub(super) fn first_binds(&self, root: PatId, out: &mut Vec<(Name, PatId), A>) -> Result<(), BuildError> {
         let mut todo: Vec<PatId, A> = Vec::new_in(self.alloc.clone());
         todo.push(root);
+        // Children are pushed last first, so they pop in source order.
         while let Some(q) = todo.pop() {
-            // Children pushed last first, so they pop in source order.
-            let mut push_list = |todo: &mut Vec<PatId, A>, list: &[PatId]| {
-                for &s in list.iter().rev() {
-                    todo.push(s);
-                }
-            };
             match self.pat(q)? {
                 Pat::Bind { name, sub, .. } => {
                     if !out.iter().any(|&(n, _)| n == name) {
@@ -165,7 +160,9 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                 Pat::Ref { inner, .. } => todo.push(inner),
                 Pat::Tuple { elems, .. } | Pat::TupleStruct { elems, .. } | Pat::Slice { elems, .. } | Pat::Or { alts: elems } => {
                     let subs = self.body.pat_lists.get(elems.range()).ok_or(malformed("a pattern's elements past `pat_lists`"))?;
-                    push_list(&mut todo, subs);
+                    for &s in subs.iter().rev() {
+                        todo.push(s);
+                    }
                 }
                 Pat::Struct { fields, .. } => {
                     let fps = self.body.field_pats.get(fields.range()).ok_or(malformed("a struct pattern's fields past `field_pats`"))?;

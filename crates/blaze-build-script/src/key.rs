@@ -75,7 +75,19 @@ pub enum RunnerKey<'k> {
     /// C headers' identity known before the run (D69): `macos-sdk <version>` (the version from
     /// the SDK's `SDKSettings.json`), or a pinned sysroot's digest. The headers actually read
     /// are the record's read list ([`crate::toolchain::headers_digest`]), not its key.
-    Native { compiler: [u8; 32], target: &'k str, sysroot: &'k str },
+    ///
+    /// `host_tools`: the host tools it is granted (D71, [`crate::host_tools`]), sorted by name,
+    /// each by the SHA-256 of its binary; none adds nothing, so the keys of native records
+    /// without one stand.
+    Native { compiler: [u8; 32], target: &'k str, sysroot: &'k str, host_tools: &'k [HostToolKey<'k>] },
+}
+
+/// A granted host tool as the key sees it: its name and its binary's SHA-256 (never its path,
+/// which is the machine's).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct HostToolKey<'k> {
+    pub name: &'k str,
+    pub digest: [u8; 32],
 }
 
 /// The domain of the base key; a change to what it covers takes the next number.
@@ -101,8 +113,14 @@ pub fn base(inputs: &KeyInputs<'_>, scratch: &mut blaze_own::AVec<'_, u8>) -> Co
         .update(&l.out_dir_files.to_le_bytes())
         .update(&l.output.to_le_bytes())
         .update(&l.line.to_le_bytes());
-    if let RunnerKey::Native { compiler, target, sysroot } = inputs.runner {
+    if let RunnerKey::Native { compiler, target, sysroot, host_tools } = inputs.runner {
         hasher.part(b"native").part(&compiler).part(target.as_bytes()).part(sysroot.as_bytes());
+        if !host_tools.is_empty() {
+            hasher.part(b"host-tools").update(&(host_tools.len() as u64).to_le_bytes());
+            for tool in host_tools {
+                hasher.part(tool.name.as_bytes()).part(&tool.digest);
+            }
+        }
     }
     hasher.finish()
 }

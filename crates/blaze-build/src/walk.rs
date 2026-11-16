@@ -24,12 +24,17 @@ use crate::{Abi, Adts, BuildError, Built, Instance, Intrinsic, Subst, ground};
 
 #[path = "closure.rs"]
 mod closure;
-pub(crate) use closure::closures_in;
+pub(crate) use closure::{build_fn_shim, closures_in};
 
 mod casts;
+mod fmt;
+#[cfg(test)]
+pub(crate) use fmt::encode_text as fmt_encode_text_for_tests;
+mod index;
 mod lets;
 mod matches;
 mod numbers;
+mod moves;
 mod strs;
 mod temps;
 
@@ -164,6 +169,13 @@ struct Owned {
 enum Held {
     Pat(PatId),
     Rest { at: (Value, i32), l: u32, variant: Option<u32>, moved: u64 },
+    /// A temporary scrutinee of a match by tests that moves out of it (walk/moves.rs): of
+    /// ground type `g` at `at`, what its word `mask` says is held, dropped at its statement's
+    /// end like `Rest`.
+    Moved { at: (Value, i32), g: PTy, mask: SlotId },
+    /// An extended temporary (walk/temps.rs `hold_temp`): its `let`'s block's, dropped with its
+    /// locals; made under a branch, `flag` is its drop flag and the slot holding its address.
+    Temp { at: (Value, i32), l: u32, flag: Option<(SlotId, SlotId)> },
 }
 
 /// Who owns a `match`'s scrutinee while its arms move out of it.
@@ -283,6 +295,9 @@ enum Task {
     ScopeEnd(ExprId),
     /// The end of a statement: its borrowed temporaries dropped (walk/temps.rs).
     TempEnd,
+    /// The end of temporary scope `e` (an `if` condition, a lazy operand, an arm's body...):
+    /// its temporaries dropped under its value (walk/temps.rs `temp_close`).
+    TempScopeEnd(ExprId),
     PushNone,
     /// Bind the value on top to the pattern; the expression it is of, for an aggregate built
     /// in a temporary of its own, which becomes the binding's home.
@@ -324,6 +339,9 @@ enum Task {
     FieldPlace(ExprId),
     /// The place under the index on top: the element, after the bounds check.
     IndexPlace(ExprId),
+    /// Call `Index::index` for overloaded index `e` with `&base` and the index on top
+    /// (walk/index.rs); leaves the reference it returns.
+    IndexCall(ExprId),
     /// Load the value of expression `e` from the place on top.
     LoadPlace(ExprId),
     DerefPlace,
@@ -333,6 +351,8 @@ enum Task {
     /// Fill the array literal `[x; N]` from the value on top.
     Repeat(ExprId),
     Ref,
+    /// Build `format_args!` `e` from its arguments' references on top (walk/fmt.rs).
+    FormatArgs(ExprId),
 }
 
 struct Walk<'x, 'c, 't, A: Allocator + Clone> {
@@ -401,6 +421,15 @@ struct Walk<'x, 'c, 't, A: Allocator + Clone> {
     expr_parent: Vec<(u32, bool), A>,
     /// Per statement being built: where its temporaries start in `scope_pats`.
     temp_marks: Vec<u32, A>,
+    /// Per expression: whether it is a temporary scope of its own, and entered
+    /// (walk/temps.rs `scan_temp_scopes`).
+    temp_here: Vec<u8, A>,
+    /// Per open temporary scope, beside `temp_marks`: the expression it is of and how many
+    /// drop scopes were open when it began (walk/temps.rs).
+    temp_scopes: Vec<(u32, u32), A>,
+    /// Per extending borrow under a branch, of a `let` being built: its temporary's drop flag
+    /// (walk/temps.rs `ext_flags_for`).
+    ext_flags: Vec<(u32, SlotId), A>,
     /// Per pattern: the binding, if its type needs drop.
     owned: Vec<Option<Owned>, A>,
     /// Per pattern: whether a binding without a flag is initialized here.
@@ -410,6 +439,8 @@ struct Walk<'x, 'c, 't, A: Allocator + Clone> {
     /// Per open drop scope (a fn's parameters first, then each block): where its bindings
     /// start in `scope_pats`.
     scope_marks: Vec<u32, A>,
+    /// The parts matches by tests moved out of their scrutinees (walk/moves.rs).
+    moves: moves::Moves<A>,
 }
 
 fn unsupported(expr: ExprId, what: &'static str) -> BuildError {
@@ -627,10 +658,18 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         temp_scope_end,
         expr_parent: Vec::new_in(alloc.clone()),
         temp_marks: Vec::new_in(alloc.clone()),
+        temp_here: {
+            let mut here = Vec::with_capacity_in(body.exprs.len(), alloc.clone());
+            here.resize(body.exprs.len(), temps::NOT_SCOPE);
+            here
+        },
+        temp_scopes: Vec::new_in(alloc.clone()),
+        ext_flags: Vec::new_in(alloc.clone()),
         owned,
         init,
         scope_pats: Vec::new_in(alloc.clone()),
         scope_marks: Vec::new_in(alloc.clone()),
+        moves: moves::Moves::new_in(alloc.clone()),
     }
     }
 
@@ -1744,6 +1783,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// `rest`, each field of the live variant whose flag is set, in declaration order.
     fn drop_owned(&mut self, g: PTy, at: (Value, i32), rest: Option<SlotId>) -> Result<(), BuildError> {
         let Some(slot) = rest else { return self.drop_at(g, at) };
+        // A match by tests moved parts out of it (walk/moves.rs), or it is not an enum.
+        if self.moves_take(g, slot)? {
+            return self.drop_moved(g, at, slot, true);
+        }
         let l = self.layout(g).map_err(|_| malformed("a binding with field flags and no layout"))?;
         let Shape::Enum { id, first, len } = self.layouts[l as usize].shape else {
             return Err(malformed("field flags on other than an enum"));
@@ -1822,6 +1865,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         match h {
             Held::Pat(p) => self.drop_local(p, kill),
             Held::Rest { at, l, variant, moved } => self.drop_rest(at, l, variant, moved),
+            Held::Moved { at, g, mask } => self.drop_moved(g, at, mask, false),
+            Held::Temp { at, l, flag } => self.drop_temp(at, l, flag),
         }
     }
 
@@ -1896,7 +1941,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     /// Whether a binding from `start` of `scope_pats` on may be dropped here.
     fn pending_from(&self, start: usize) -> bool {
         self.scope_pats[start..].iter().any(|&h| match h {
-            Held::Rest { .. } => true,
+            Held::Rest { .. } | Held::Moved { .. } | Held::Temp { .. } => true,
             Held::Pat(p) => match self.owned[p.ix()] {
                 Some(Owned { flag: Some(_), .. }) => true,
                 Some(Owned { flag: None, .. }) => self.init[p.ix()],
@@ -2067,7 +2112,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                                     .any(|fp| by_value(fp.pat)),
                                 _ => false,
                             };
-                            if fields_by_value || subs.iter().any(|&p| by_value(p)) {
+                            // A deeper by-value binding moves through a match by tests
+                            // (walk/moves.rs), by the same field flags.
+                            if fields_by_value || subs.iter().any(|&p| by_value(p)) || self.moves_deep(arm.pat)? {
                                 self.partial[x.ix()] = true;
                             }
                         }
@@ -2144,7 +2191,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             let in_place = borrowed_first
                 || up != NO_EXPR
                 && match body.exprs[up as usize] {
-                    Expr::Ref { operand, .. } => operand.0 == c,
+                    Expr::Ref { operand, .. } | Expr::RawRef { operand, .. } => operand.0 == c,
                     Expr::Field { base, .. } | Expr::TupleField { base, .. } | Expr::Index { base, .. } => base.0 == c,
                     Expr::AssignOp { lhs, .. } => lhs.0 == c,
                     // A place expression: matched in place, its arms' moves are marked below.
@@ -2171,7 +2218,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             }
         }
         self.expr_parent = parent;
-        Ok(())
+        self.scan_temp_scopes()
     }
 
     /// Every binding of pattern `p` is declared by expression `by`.
@@ -2807,6 +2854,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 Expr::Local(_) | Expr::Lit(_) => {}
                 Expr::Paren(x) | Expr::Field { base: x, .. } | Expr::TupleField { base: x, .. } => todo.push(x),
                 Expr::Unary { op: UnOp::Deref, operand } => todo.push(operand),
+                // An overloaded index calls `Index::index`, which may write (walk/index.rs).
+                Expr::Index { .. } if !self.index_builtin(e)? => return Ok(false),
                 Expr::Index { base, index } => {
                     todo.push(base);
                     todo.push(index);
@@ -2838,6 +2887,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     fn step(&mut self, task: Task) -> Result<(), BuildError> {
         match task {
             Task::Eval(e) => {
+                // A temporary scope of its own: opened around its evaluation (walk/temps.rs).
+                if self.temp_enter(e)? {
+                    return Ok(());
+                }
                 let rows = self.adjust_rows(e);
                 if rows.is_empty() {
                     return self.raw(e);
@@ -2909,6 +2962,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.vals.push(v);
             }
             Task::TempEnd => self.temp_end()?,
+            Task::TempScopeEnd(e) => self.temp_close(e)?,
             Task::PushNone => self.vals.push(V::None),
             Task::Let(p, init) => {
                 let v = self.pop()?;
@@ -3177,6 +3231,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.vals.push(v);
             }
             Task::IndexPlace(e) => self.index_place(e)?,
+            Task::IndexCall(e) => self.index_call(e)?,
             Task::LoadPlace(e) => {
                 let v = self.pop()?;
                 let at = self.place_any(v)?;
@@ -3228,6 +3283,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.vals.push(v);
             }
             Task::Repeat(e) => self.repeat(e)?,
+            Task::FormatArgs(e) => self.format_args_done(e)?,
             Task::Ref => {
                 let v = match self.pop()? {
                     // A borrow of an unsized place is the wide pointer that reached it.
@@ -3251,6 +3307,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let kinds = &self.checked.adjusts.column::<1>()[rows];
         let lead = kinds.iter().take_while(|k| matches!(k, AdjustKind::Deref { .. })).count();
         let borrow = matches!(kinds.get(lead), Some(AdjustKind::Borrow { .. }));
+        // A `&mut` autoref or reborrow is a mutable place context (walk/index.rs).
+        if matches!(kinds.get(lead), Some(AdjustKind::Borrow { mutbl: Mutbl::Mut, .. })) {
+            self.refuse_mut_through_overloaded_index(e)?;
+        }
         let from = lead + usize::from(borrow);
         if kinds[from..].iter().any(|k| matches!(k, AdjustKind::Deref { .. } | AdjustKind::Borrow { .. })) {
             return Err(unsupported(e, "a dereference or a borrow after a coercion in one adjustment list"));
@@ -4107,12 +4167,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.work.push(Task::FieldPlace(e));
                 self.work.push(Task::Place(base));
             }
-            // The array's place, then the index: Rust's order.
-            Expr::Index { base, index } => {
-                self.work.push(Task::IndexPlace(e));
-                self.work.push(Task::Eval(index));
-                self.push_index_base(base)?;
-            }
+            // The builtin element or an overloaded index's place (walk/index.rs).
+            Expr::Index { .. } => self.push_index(e, false)?,
             // `*x` overloaded: the check put the dereference on `x` itself, so `x`'s adjusted
             // place is the place.
             Expr::Unary { op: UnOp::Deref, operand } if self.deref_on_operand(operand) => {
@@ -4134,8 +4190,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let stmt = self.body.stmts.get(s.ix()).copied().ok_or(malformed("a statement past `stmts`"))?;
         // A statement is a temporary scope: its end drops its borrowed temporaries, after its
         // own value and its `let`'s binding (walk/temps.rs).
-        self.temp_marks.push(self.scope_pats.len() as u32);
-        self.work.push(Task::TempEnd);
+        self.stmt_temps(stmt)?;
         match stmt {
             // `let P = e else { .. };`: walk/lets.rs.
             Stmt::Let { init: Some(init), else_: Some(_), .. } => self.let_else(s, init)?,
@@ -4254,11 +4309,12 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             // A `let` is built as a link of its `if` condition (walk/lets.rs); elsewhere (a
             // match guard's `if let`) it is not.
             Expr::Let { .. } => return Err(unsupported(e, "`let` outside an `if` or `while` condition")),
-            Expr::FormatArgs { .. } => return Err(unsupported(e, "`format_args!`")),
+            // walk/fmt.rs: the arguments, then `Task::FormatArgs`.
+            Expr::FormatArgs { args, uses } => self.format_args(e, args, uses)?,
             Expr::Await(_) => return Err(unsupported(e, "`.await`")),
             Expr::AsyncBlock { .. } => return Err(unsupported(e, "an async block")),
             Expr::Underscore => return Err(unsupported(e, "`_` (`_ = e` is not built yet)")),
-            Expr::RawRef { .. } => return Err(unsupported(e, "a raw borrow")),
+            Expr::RawRef { mutbl, operand } => self.push_raw_ref(e, mutbl, operand)?,
             Expr::ConstBlock { .. } => return Err(unsupported(e, "a const block")),
             // Its value is the container's layout: a field's offset, which the code builder
             // does not compute yet.
@@ -4424,6 +4480,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             }
             // The right side first, then the place: Rust's order for a primitive assignment.
             Expr::Assign { lhs, rhs } => {
+                self.refuse_mut_through_overloaded_index(lhs)?;
                 self.work.push(Task::Assign(e));
                 self.work.push(Task::Place(lhs));
                 // An aggregate right side is a place read late, at the store: copied first when
@@ -4436,11 +4493,15 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.work.push(Task::Eval(rhs));
             }
             Expr::AssignOp { op, lhs, rhs } => {
+                self.refuse_mut_through_overloaded_index(lhs)?;
                 self.work.push(Task::AssignOp(e, op));
                 self.work.push(Task::Place(lhs));
                 self.work.push(Task::Eval(rhs));
             }
-            Expr::Ref { operand, .. } => {
+            Expr::Ref { operand, mutbl } => {
+                if mutbl == Mutbl::Mut {
+                    self.refuse_mut_through_overloaded_index(operand)?;
+                }
                 self.work.push(Task::Ref);
                 self.work.push(Task::Place(operand));
             }
@@ -4521,12 +4582,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.work.push(Task::Repeat(e));
                 self.work.push(Task::Eval(elem));
             }
-            Expr::Index { base, index } => {
-                self.work.push(Task::LoadPlace(e));
-                self.work.push(Task::IndexPlace(e));
-                self.work.push(Task::Eval(index));
-                self.push_index_base(base)?;
-            }
+            Expr::Index { .. } => self.push_index(e, true)?,
             // Its environment, built from the captured bindings (closure.rs).
             Expr::Closure { .. } => self.closure_value(e)?,
         }

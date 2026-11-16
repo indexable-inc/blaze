@@ -17,5 +17,19 @@
   "sysroots": {
     "aarch64-apple-darwin": "macos-sdk",
     "aarch64-unknown-linux-gnu": null
+  },
+  "host_tools_comment": "D71: the only programs other than the C toolchain a native build script may start, per host target. `names`: the tools, space-separated, sorted. Per tool: `path`, the resolved real path (no link), granted read and execute; `reads`, space-separated folders its runtime needs, granted read-only (perl: libperl.dylib, privlib and archlib are /System/Library/Perl/<v>, vendorlib /System/Library/Perl/Extras/<v>, from libperl's own Config.pm; the site folder /Library/Perl is NOT granted: user-installed modules are not keyed); `needed_by`, the scripts' packages known to start it, space-separated, sorted. The tool's binary digest is in the run key and the record is marked `host-tool`: it never enters the shared cache. Read by blaze_build_script::host_tools.",
+  "host_tools": {
+    "aarch64-apple-darwin": {
+      "perl": {
+        "path": "/usr/bin/perl",
+        "reads": "/System/Library/Perl",
+        "needed_by": "sha3-asm"
+      },
+      "names": "perl"
+    },
+    "aarch64-unknown-linux-gnu": {
+      "names": ""
+    }
   }
 }

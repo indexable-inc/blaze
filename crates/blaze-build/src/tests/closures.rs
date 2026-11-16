@@ -232,7 +232,8 @@ fn run(w: &World, b: &Bb, root: ExprId, lits: &[(ExprId, u128)]) -> (u64, usize)
 
 /// [`run`] over several bodies, `main`'s first: every instance the calls reach is built (a
 /// generic fn at its ground arguments, a closure's `Fn*` method by its ordinal, the trait
-/// method its item names). Returns `main`'s value and the number of closure methods built.
+/// method its item names, a fn item's or fn pointer's `Fn*` shim). Returns `main`'s value and
+/// the number of `Fn*` methods built (closure bodies, entries and shims).
 fn run_progs(w: &World, progs: &[Prog<'_>]) -> (u64, usize) {
     let views: StdVec<_> = progs.iter().map(|p| p.b.view(p.item, p.root)).collect();
     let checked: StdVec<_> = views
@@ -277,20 +278,38 @@ fn run_progs(w: &World, progs: &[Prog<'_>]) -> (u64, usize) {
         other => panic!("the check of `drop_in_place` did not finish: {:?}", other.err()),
     };
     let mut todo: StdVec<(ItemKey, List)> = main.refs.iter().map(|r| (r.item, r.args)).collect();
+    // An instance is built once per KEY (instance.rs `instance_key`, as the store names it), not
+    // per argument list: two instances whose keys collide would share one body here too.
+    let key = |ground: &PortableTys<'_>, item: ItemKey, args: List| {
+        crate::instance_key(blaze_ids::ContentId::of("test code", &item.0.to_le_bytes()), args, ground.view(), Alloc::global()).expect("an instance key")
+    };
+    let mut keys: StdVec<crate::InstanceKey> = StdVec::new();
     while let Some((item, args)) = todo.pop() {
-        if bodies.iter().any(|(i, a, _)| *i == item && *a == args) {
+        let k = key(&ground, item, args);
+        if keys.contains(&k) {
             continue;
         }
         let built = if let Some(m) = w.methods.iter().position(|m| *m == item) {
-            let first = ground.view().list(args).expect("the instance's arguments")[0];
-            let c = crate::closure_of(ground.view(), first).unwrap_or_else(|| panic!("{item:?} at a type that is not a closure"));
-            let at = progs.iter().position(|p| p.item == c.owner).expect("the closure's owner among the bodies");
+            let all = ground.view().list(args).expect("the instance's arguments").to_vec();
             let which = [FnTrait::Fn, FnTrait::FnMut, FnTrait::FnOnce][m];
-            let oargs = ground.view().list(c.owner_args).expect("the owner's arguments").to_vec();
-            let sig = w.fx.sig_of(c.owner).expect("the owner's signature");
-            let mut subst = Subst { args: &oargs, ground: &mut ground, scratch: Alloc::global() };
-            closures += 1;            crate::build_closure(&views[at], &checked[at], c.ordinal, which, &sig, &mut subst, &adts, Global)
-                .unwrap_or_else(|e| panic!("the closure's {which:?} method failed: {e}"))
+            closures += 1;
+            if let Some(c) = crate::closure_of(ground.view(), all[0]) {
+                let at = progs.iter().position(|p| p.item == c.owner).expect("the closure's owner among the bodies");
+                let oargs = ground.view().list(c.owner_args).expect("the owner's arguments").to_vec();
+                let sig = w.fx.sig_of(c.owner).expect("the owner's signature");
+                let mut subst = Subst { args: &oargs, ground: &mut ground, scratch: Alloc::global() };
+                crate::build_closure(&views[at], &checked[at], c.ordinal, which, &sig, &mut subst, &adts, Global)
+                    .unwrap_or_else(|e| panic!("the closure's {which:?} method failed: {e}"))
+            } else {
+                // A fn item or fn pointer as an `Fn*` value: its shim (lib.rs `build_fn_shim`).
+                let (sig, fargs) = match ground.view().node(all[0]).expect("the callee's type") {
+                    PNode::FnDef(f, fa) => (w.fx.sig_of(f), ground.view().list(fa).expect("the fn item's arguments").to_vec()),
+                    _ => (None, StdVec::new()),
+                };
+                let mut subst = Subst { args: &fargs, ground: &mut ground, scratch: Alloc::global() };
+                crate::build_fn_shim(all[0], all[1], which, sig.as_ref(), &mut subst, &adts, Global)
+                    .unwrap_or_else(|e| panic!("the fn shim's {which:?} method failed: {e}"))
+            }
         } else if item == w.dip {
             let gargs = ground.view().list(args).expect("the glue's argument").to_vec();
             let sig = w.fx.sig_of(w.dip).expect("`drop_in_place`'s signature");
@@ -306,6 +325,7 @@ fn run_progs(w: &World, progs: &[Prog<'_>]) -> (u64, usize) {
         };
         super::emits(&built, &[]);
         todo.extend(built.refs.iter().map(|r| (r.item, r.args)));
+        keys.push(k);
         bodies.push((item, args, built));
     }
     // Callees before callers (the run places each fn after every fn it names): a pass places
@@ -829,4 +849,150 @@ fn a_move_closure_over_a_copy_value_copies_it() {
     let out = bin(&mut b, BinOp::Add, scaled, nr);
     let root = b.block(&[s0, s1, s2, s3], Some(out));
     assert_eq!(run(&w, &b, root, &lits), (4201, 1));
+}
+
+/// `fn double(x: u64) -> u64 { x + x }`, added to `w` (still open). Returns its item, builder
+/// and root.
+fn double(w: &mut World) -> (ItemKey, Bb, ExprId) {
+    let u64_ = w.fx.ty(PNode::Uint(UintTy::U64));
+    let item = w.fx.func("double", 0, &[u64_], u64_, Vec::new());
+    let mut b = Bb::new();
+    let x = b.param("x");
+    let (l, r) = (b.local(x), b.local(x));
+    let sum = bin(&mut b, BinOp::Add, l, r);
+    let root = b.block(&[], Some(sum));
+    (item, b, root)
+}
+
+/// The Reference, "Function item types": "All function items implement `Fn`, `FnMut`,
+/// `FnOnce`, `Copy`, `Clone`, `Send`, and `Sync`", and a fn item's type is zero-sized.
+/// `apply<F: Fn(u64) -> u64>(f: F, x: u64) -> u64 { f(x) }` called as `let a: u64 = 21;
+/// apply(double, a)` is 42: in `apply`'s instance `f(x)` borrows `f` and calls `Fn::call` at
+/// `[fn item double, (u64,)]`, whose instance is the SHIM (lib.rs `build_fn_shim`): it ignores
+/// its zero-sized `self` and calls `double(21)` directly. One `Fn*` method built. (Bounded by
+/// `FnOnce` the call grounds to the fn item itself and is a plain direct call: no shim.)
+#[test]
+fn a_fn_item_passed_where_fn_is_bound_is_called_through_its_shim() {
+    let mut w = open_world();
+    let (item, ab, aroot) = apply(&mut w, 0, 1);
+    let (ditem, db, droot) = double(&mut w);
+    w.fx.finish();
+    let mut b = Bb::new();
+    let mut lits = StdVec::new();
+    let (s0, a) = let_u64(&mut b, &mut lits, "a", 21);
+    let callee = b.path(&["apply"]);
+    let d = b.path(&["double"]);
+    let ae = b.local(a);
+    let call = b.call(callee, &[d, ae]);
+    let root = b.block(&[s0], Some(call));
+    let progs = [
+        Prog { item: w.main, b: &b, root, lits: &lits },
+        Prog { item, b: &ab, root: aroot, lits: &[] },
+        Prog { item: ditem, b: &db, root: droot, lits: &[] },
+    ];
+    assert_eq!(run_progs(&w, &progs), (42, 1));
+}
+
+/// core's library/core/src/ops/function.rs: "`Fn` is implemented automatically by closures
+/// ... as well as (safe) [function pointers]", `FnMut` likewise. `let p: fn(u64) -> u64 =
+/// double; let a: u64 = 21; apply(p, a)` with `apply<F: FnMut(u64) -> u64>` calling `f(x)`
+/// twice is 42 (its last call's value, `double(21)`): `f(x)` borrows `f` mutably and calls
+/// `FnMut::call_mut` at `[fn(u64) -> u64, (u64,)]`, whose SHIM loads the pointer through its
+/// `self` and calls it INDIRECTLY; the pointer is `double`'s address (the Reference, "Type
+/// coercions": "Function item types to `fn` pointers"). One `Fn*` method built, called twice.
+/// The instance `apply::<fn(u64) -> u64>` and the shim are keyed with the pointer type in their
+/// arguments (instance.rs: tag 21, the header's byte): without it `instance_key` refuses them
+/// ("a type with no ground form in an instance's arguments").
+#[test]
+fn a_fn_pointer_passed_where_fn_mut_is_bound_is_called_indirectly_through_its_shim() {
+    let mut w = open_world();
+    let (item, ab, aroot) = apply(&mut w, 1, 2);
+    let (ditem, db, droot) = double(&mut w);
+    w.fx.finish();
+    let mut b = Bb::new();
+    let mut lits = StdVec::new();
+    let u64_ = b.ty(PNode::Uint(UintTy::U64));
+    let io = b.t.intern_list(&[u64_, u64_]).expect("intern");
+    let fp = b.ty(PNode::FnPtr(io, FnPtrHeader::RUST));
+    let p = b.bind("p");
+    let d = b.path(&["double"]);
+    let s0 = b.let_(p, Some(fp), d);
+    let (s1, a) = let_u64(&mut b, &mut lits, "a", 21);
+    let callee = b.path(&["apply"]);
+    let (pe, ae) = (b.local(p), b.local(a));
+    let call = b.call(callee, &[pe, ae]);
+    let root = b.block(&[s0, s1], Some(call));
+    let progs = [
+        Prog { item: w.main, b: &b, root, lits: &lits },
+        Prog { item, b: &ab, root: aroot, lits: &[] },
+        Prog { item: ditem, b: &db, root: droot, lits: &[] },
+    ];
+    assert_eq!(run_progs(&w, &progs), (42, 1));
+}
+
+/// typeck.md, "A closure's identity": a closure is named by its owner, its ordinal AND the
+/// owner's generic arguments, so a generic owner's closure is one type per owner instance.
+/// `fn via<T>(t: T, n: u64) -> u64 { let f = move |x| { let k = &t; let v: u64 = x; v + n };
+/// apply(f, 2) }`, the closure built in `via` and called in ANOTHER body (`apply<F: Fn(u64) ->
+/// u64>`), and `let a: u8 = 7; let c: u64 = 9; via(a, 40) * 1000 + via(c, 30)` is 42032:
+/// `2 + 40 = 42` and `2 + 30 = 32`. Two closure bodies are built, `Fn::call` at
+/// `[Closure(via, 0, [u8]), (u64,)]` and at `[Closure(via, 0, [u64]), (u64,)]`, whose keys
+/// differ by the owner's arguments (instance.rs, tag 20: the owner's arguments are the node's
+/// children); `run_progs` builds once per KEY. Their environments differ too: `(t: u8, n:
+/// u64)` lays `n` at offset 0 (falling alignment), `(t: u64, n: u64)` at 8, so had both shared
+/// one key only one body would be built (1, not 2), and that body would read the other
+/// instance's `t` where it reads `n` (`2 + 9`: 42011).
+#[test]
+fn a_closure_of_a_generic_owner_is_one_instance_per_owner_argument() {
+    let mut w = open_world();
+    let (item, ab, aroot) = apply(&mut w, 0, 1);
+    let u64_ = w.fx.ty(PNode::Uint(UintTy::U64));
+    let p0 = w.fx.param(0);
+    let via = w.fx.func("via", 1, &[p0, u64_], u64_, Vec::new());
+    w.fx.finish();
+    // `via`.
+    let mut vb = Bb::new();
+    let mut vlits = StdVec::new();
+    let (t, n) = (vb.param("t"), vb.param("n"));
+    let x = vb.bind("x");
+    let k = vb.bind("k");
+    let te = vb.local(t);
+    let rt = vb.borrow(Mutbl::Not, te);
+    let sk = vb.let_(k, None, rt);
+    let (sv, xe) = param_u64(&mut vb, x);
+    let ne = vb.local(n);
+    let sum = bin(&mut vb, BinOp::Add, xe, ne);
+    let body = vb.block(&[sk, sv], Some(sum));
+    let clo = vb.move_closure(&[x], body);
+    let f = vb.bind("f");
+    let sf = vb.let_(f, None, clo);
+    let fe = vb.local(f);
+    let two = lit(&mut vb, &mut vlits, 2);
+    let callee = vb.path(&["apply"]);
+    let call = vb.call(callee, &[fe, two]);
+    let vroot = vb.block(&[sf], Some(call));
+    // `main`.
+    let mut b = Bb::new();
+    let mut lits = StdVec::new();
+    let a = b.bind("a");
+    let seven = lit(&mut b, &mut lits, 7);
+    let u8_ = b.ty(PNode::Uint(UintTy::U8));
+    let s0 = b.let_(a, Some(u8_), seven);
+    let (s1, c) = let_u64(&mut b, &mut lits, "c", 9);
+    let (ae, forty) = (b.local(a), lit(&mut b, &mut lits, 40));
+    let v1 = b.path(&["via"]);
+    let first = b.call(v1, &[ae, forty]);
+    let (ce, thirty) = (b.local(c), lit(&mut b, &mut lits, 30));
+    let v2 = b.path(&["via"]);
+    let second = b.call(v2, &[ce, thirty]);
+    let thousand = lit(&mut b, &mut lits, 1000);
+    let scaled = bin(&mut b, BinOp::Mul, first, thousand);
+    let out = bin(&mut b, BinOp::Add, scaled, second);
+    let root = b.block(&[s0, s1], Some(out));
+    let progs = [
+        Prog { item: w.main, b: &b, root, lits: &lits },
+        Prog { item, b: &ab, root: aroot, lits: &[] },
+        Prog { item: via, b: &vb, root: vroot, lits: &vlits },
+    ];
+    assert_eq!(run_progs(&w, &progs), (42032, 2));
 }

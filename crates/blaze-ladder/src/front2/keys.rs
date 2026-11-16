@@ -24,6 +24,17 @@ pub enum MemberKind {
     Type,
     /// A struct's constructor (a tuple struct's fn, a unit struct's value).
     Ctor,
+    /// An anonymous constant a head writes (an array length, a discriminant, a const argument,
+    /// a pattern type's range end that is an expression): a member of the MODULE it is written
+    /// in, named by its type and its text ([`super::anon`]). It has no associated parent.
+    Anon,
+}
+
+/// The key of the anonymous constant `name` of `module` ([`super::anon::Ask::name`]): a
+/// function of the module's key and the name alone, so the type builder computes it with no
+/// [`Keys`] at hand; [`Keys::member`] with [`MemberKind::Anon`] files the same key.
+pub fn anon_const_key(module: ItemKey, name: &str) -> ItemKey {
+    member_key(module, MemberKind::Anon, name)
 }
 
 /// What a checker key stands for.

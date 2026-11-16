@@ -11,9 +11,11 @@
 //! [`ConstFail::UnknownIntrinsic`] naming it); a `const fn` is interpreted from its checked
 //! body; any other fn is `NotConst`. A trait's member is not selected here (the checker's
 //! `resolve_instance` needs the records' mutable fill loop): [`ConstWorld::resolve`] answers
-//! `None` for it and the evaluation refuses, naming it. ADT layouts are not read yet:
-//! [`LayoutFacts::adt`] answers `None`, which the evaluator refuses as a missing ADT
-//! definition naming the type: never a guessed layout.
+//! `None` for it and the evaluation refuses, naming it. A trait's associated CONSTANT at a
+//! ground `Self` is selected (`impl_const`: the impl's definition, or the trait's default).
+//! An ADT's layout (`size_of::<S>()`) reads the store's row of the ADT ([`LayoutFacts::adt`]);
+//! a row not made yet is made when the layout asks for it ([`adt_row`]): never a guessed
+//! layout.
 
 use std::alloc::Global;
 use std::boxed::Box;
@@ -22,7 +24,7 @@ use std::string::String;
 use std::vec::Vec;
 
 use blaze_consteval::{
-    ConstError, ConstRecord, ConstWorld, FnKind, Intrinsic, LayoutFacts, Layouts, Lits, Missing as LayoutMissing, NeedKind, ReprAttrs, Settle, Typed,
+    ConstError, ConstRecord, ConstWorld, FnKind, Intrinsic, LayoutFacts, Layouts, Lits, Missing as LayoutMissing, NeedKind, Refusal, ReprAttrs, Settle, Typed,
     ValidRange,
 };
 use blaze_consteval::{Answer, Codes, Limits, Need, RecordKey, value_of};
@@ -77,6 +79,9 @@ pub enum ConstFail {
     NotUsize { item: ItemKey },
     /// One fill named more than `most` array-length constants.
     TooManyLengths { item: ItemKey, most: u32 },
+    /// The layout of a type constant `item` reads (`size_of::<S>()`) needs the row of ADT
+    /// `adt`, which could not be made or cannot be laid out here: `why` names the cause.
+    AdtRow { item: ItemKey, adt: ItemKey, why: Box<str> },
 }
 
 impl core::fmt::Display for ConstFail {
@@ -93,7 +98,32 @@ impl core::fmt::Display for ConstFail {
             ConstFail::Nested { item } => write!(f, "constant {item:?}: an array length needs it while another constant is evaluated"),
             ConstFail::NotUsize { item } => write!(f, "constant {item:?}: an array length's value is not a `usize` of 64 bits"),
             ConstFail::TooManyLengths { item, most } => write!(f, "constant {item:?}: one head named more than {most} array-length constants"),
+            ConstFail::AdtRow { item, adt, why } => write!(f, "constant {item:?}: a layout it reads needs the row of ADT {adt:?}: {why}"),
         }
+    }
+}
+
+/// Makes the store's row of ADT `adt`, which the evaluator's layout asked for and did not find
+/// (`size_of::<S>()` in constant `item`): by `Store::ensure(Want::Adt)`, the one maker of an
+/// ADT's row (the run path's too: program.rs), so the evaluator and the code builder lay out
+/// the same row. A row that cannot be made, or that is made and still gives no layout (a
+/// narrowed valid range: [`ConstsWorld::adt`]), is the constant's refusal, naming the ADT. A
+/// row whose head names a constant (`struct S([u8; N])`) is refused here by that name: the
+/// evaluator is busy with `item` (owed: one work list over constants and heads).
+fn adt_row<'n>(r: &mut Records<'_, 'n>, item: ItemKey, adt: ItemKey) -> Result<(), ConstFail> {
+    let refuse = |why: String| ConstFail::AdtRow { item, adt, why: why.into_boxed_str() };
+    let narrowed = "its valid range is narrowed (`rustc_layout_scalar_valid_range_*`), which the constant evaluator's layout does not read yet";
+    match r.store.adts.get(&adt) {
+        Some(a) if a.narrowed => return Err(refuse(String::from(narrowed))),
+        Some(_) => return Err(refuse(String::from("its row is made and the layout still does not find it"))),
+        None => {}
+    }
+    let lib = r.keys.library(adt).ok_or_else(|| refuse(String::from("it has no library key")))?;
+    r.store.ensure(r.names, &mut *r.keys, super::heads::Want::Adt(lib)).map_err(|e| refuse(format!("{e}")))?;
+    match r.store.adts.get(&adt) {
+        Some(a) if a.narrowed => Err(refuse(String::from(narrowed))),
+        Some(_) => Ok(()),
+        None => Err(refuse(String::from("its head was made, but no row is filed under its key"))),
     }
 }
 
@@ -221,6 +251,71 @@ impl ConstsWorld<'_, '_> {
         if v.head[head::FLAGS] & blaze_lower::machine::sig::CONST != 0 { FnKind::Const } else { FnKind::NotConst }
     }
 
+    /// `item` as an associated constant DECLARED by a trait (`Specifier::BITS`): the trait and
+    /// the constant's name; `None` for any other item (an impl's constant, a free one).
+    fn trait_const(&self, item: ItemKey) -> Option<(ItemKey, tc::Name)> {
+        match self.keys.origin(item)? {
+            super::keys::Origin::Member { container, kind: super::keys::MemberKind::Const, name } if self.store.trait_defs.contains_key(container) => Some((*container, tc::Name::of(name))),
+            _ => None,
+        }
+    }
+
+    /// The constant `name` of the impl of `trait_` for the ground type `args[0]`
+    /// (`<B4 as Specifier>::BITS`; the Reference, "Associated constants": the value is the
+    /// implementing type's definition). Selected here only where no solver is needed and the
+    /// answer cannot depend on one: the trait takes no argument but `Self`, `Self` is a
+    /// primitive (`bool`, `char`, an integer) or an ADT with no generic arguments, and EXACTLY
+    /// ONE impl of the trait made in the store has no generics and that very self type and
+    /// writes the constant or leaves it to the trait's default (`declared`, the trait's own
+    /// constant item, then evaluated at `args`). By coherence (the Reference, "Trait
+    /// implementation coherence": no two impls of a trait overlap) that impl is the one that
+    /// applies. Anything else (a generic impl, an impl whose head is not made) is `None`:
+    /// the evaluation refuses, naming the item; never a guessed impl. The impls are scanned
+    /// whole and the answer is the only match, so the map's order does not reach it.
+    fn impl_const(&self, declared: ItemKey, trait_: ItemKey, name: tc::Name, args: List, ground: &mut PortableTys<'_>) -> Option<(ItemKey, List)> {
+        let asked = {
+            let g = ground.view();
+            let list = g.list(args).ok()?;
+            let [self_ty] = list else { return None };
+            match g.node(*self_ty).ok()? {
+                n @ (tc::PNode::Bool | tc::PNode::Char | tc::PNode::Int(_) | tc::PNode::Uint(_)) => (Some(n), None),
+                tc::PNode::Adt(k, l) if g.list(l).ok()?.is_empty() => (None, Some(k)),
+                _ => return None,
+            }
+        };
+        let s = self.store.tys.view();
+        let mut found: Option<ItemKey> = None;
+        for (_, h) in self.store.impls.iter() {
+            if h.trait_ != Some(trait_) || h.generics != 0 {
+                continue;
+            }
+            let same = match (s.node(h.self_ty).ok()?, asked) {
+                (tc::PNode::Adt(k, l), (None, Some(a))) => k == a && s.list(l).ok()?.is_empty(),
+                (n, (Some(a), None)) => n == a,
+                _ => false,
+            };
+            if !same {
+                continue;
+            }
+            // The impl's own definition, or, where the impl writes none, the trait's default
+            // (the Reference, "Associated Items", "Associated Constants", its example "Using
+            // default values": `trait ConstantIdDefault { const ID: i32 = 1; }` with `impl
+            // ConstantIdDefault for Struct {}` gives `assert_eq!(1, <Struct as
+            // ConstantIdDefault>::ID)`). The default is the trait's own row (`declared`),
+            // evaluated at the asked `Self` (`args`); a trait constant with no default that
+            // the impl does not write is an error of the program (E0046): `None`.
+            let c = match h.consts.iter().find(|(n, _)| *n == name) {
+                Some(&(_, c)) => c,
+                None if self.store.fns.get(&declared).is_some_and(|f| f.has_body) => declared,
+                None => return None,
+            };
+            if found.replace(c).is_some() {
+                return None;
+            }
+        }
+        found.map(|c| (c, if c == declared { args } else { List::EMPTY }))
+    }
+
     /// Whether `item` is a member of a trait (its call is selected at the instance).
     fn of_trait(&self, item: ItemKey) -> bool {
         self.store.fns.get(&item).and_then(|f| f.container).is_some_and(|c| self.store.trait_defs.contains_key(&c))
@@ -228,17 +323,28 @@ impl ConstsWorld<'_, '_> {
 }
 
 impl LayoutFacts for ConstsWorld<'_, '_> {
-    fn adt(&self, _: ItemKey) -> Option<tc::Adt<'_>> {
-        None
+    /// The store's row of the ADT (heads.rs `Store::adt`: the one maker, the same row the run
+    /// path hands the code builder: program.rs `FrontEnd::adt`). `None` while the row is not
+    /// made: the layout refuses naming the ADT, and [`Consts::value`] makes the row and asks
+    /// again. `None` too for a row with a narrowed valid range
+    /// (`rustc_layout_scalar_valid_range_*`), which `valid_range` below does not read: its
+    /// niche would be wrong, so it has no layout here (`Consts::value` names that refusal).
+    fn adt(&self, key: ItemKey) -> Option<tc::Adt<'_>> {
+        let a = self.store.adts.get(&key).filter(|a| !a.narrowed)?;
+        Some(tc::Adt { kind: a.kind, generics: a.generics, variants: &a.variants, fields: &a.fields, types: self.store.tys.view() })
     }
 
-    fn repr(&self, _: ItemKey) -> ReprAttrs {
-        ReprAttrs::RUST
+    /// As the row read the ADT's `#[repr(..)]`.
+    fn repr(&self, key: ItemKey) -> ReprAttrs {
+        self.store.adts.get(&key).map_or(ReprAttrs::RUST, |a| a.repr)
     }
 
-    /// Never reached: with no ADT row, the layout refuses first.
-    fn discriminant(&self, key: ItemKey, _: u32) -> Result<Option<i128>, LayoutMissing> {
-        Err(LayoutMissing { item: key })
+    /// From the ADT's row: every variant's value, explicit or implicit (heads.rs `discrs`),
+    /// evaluated when the row was made, exactly as the run path answers (program.rs
+    /// `FrontEnd::discriminant`). Never `Err`: that names a constant's record to make, and no
+    /// record is owed here (the row holds the values; the layout asks only after `adt`).
+    fn discriminant(&self, key: ItemKey, variant: u32) -> Result<Option<i128>, LayoutMissing> {
+        Ok(self.store.adts.get(&key).and_then(|a| a.discrs.get(variant as usize)).copied())
     }
 
     fn valid_range(&self, _: ItemKey) -> ValidRange {
@@ -274,8 +380,18 @@ impl ConstWorld for ConstsWorld<'_, '_> {
         }
     }
 
-    fn resolve(&self, item: ItemKey, args: List, _: &mut PortableTys<'_>, _: Alloc<'_>) -> Option<(ItemKey, List)> {
-        if self.of_trait(item) { None } else { Some((item, args)) }
+    fn resolve(&self, item: ItemKey, args: List, ground: &mut PortableTys<'_>, _: Alloc<'_>) -> Option<(ItemKey, List)> {
+        // A trait's constant first: it has a row in `Store::fns` whose container is the trait
+        // (heads.rs `trait_members`), which `of_trait` would take for a trait's fn.
+        if let Some((trait_, name)) = self.trait_const(item) {
+            // A default selected for a ground `Self` is the trait's own item at the same
+            // arguments: asked again, the answer is the same (the selection is idempotent).
+            return self.impl_const(item, trait_, name, args, ground);
+        }
+        if self.of_trait(item) {
+            return None;
+        }
+        Some((item, args))
     }
 
     /// From the item's key and its text: the same whether or not its body is checked yet (a
@@ -341,10 +457,27 @@ impl<'n> Consts<'n> {
                     Ok(())
                 }
                 Ok(Answer::Need(m)) => settle.need(m).map_err(|e: ConstError<'_>| ConstFail::Eval(format!("{e}").into_boxed_str())),
-                Err(e) => Err(match unknown {
-                    Some((item, name)) => ConstFail::UnknownIntrinsic { item, name },
-                    None => ConstFail::Eval(format!("{e}").into_boxed_str()),
-                }),
+                Err(e) => {
+                    // The layout met an ADT whose row the store has not made (`size_of::<S>()`:
+                    // blaze-consteval's layout.rs turns the layout's `NoAdt` into this typed
+                    // refusal): the row is made now and the same need is evaluated again
+                    // (`settle.next()` gives it again; a refusal caches no layout). Each ADT
+                    // is made at most once (`adt_row` refuses one already made), and every
+                    // round counts against `MOST_STEPS`.
+                    let no_adt = match e.refusal {
+                        Refusal::Missing { what: "ADT definition", item: adt } => Some(adt),
+                        _ => None,
+                    };
+                    let text = format!("{e}").into_boxed_str();
+                    match (unknown, no_adt) {
+                        (Some((item, name)), _) => Err(ConstFail::UnknownIntrinsic { item, name }),
+                        (None, Some(adt)) => match adt_row(r, n.item, adt) {
+                            Ok(()) => continue,
+                            Err(e) => Err(e),
+                        },
+                        (None, None) => Err(ConstFail::Eval(text)),
+                    }
+                }
             };
             if let Err(e) = step {
                 out = Err(e);

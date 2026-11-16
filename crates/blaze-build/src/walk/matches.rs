@@ -27,9 +27,9 @@
 //! - A constant (compared with its evaluated value), a float literal (by `==`) and a string
 //!   literal (length and bytes) are matches/forms.rs's.
 //!
-//! Nothing here moves: a by-value binding of a part that needs drop is refused, and so is a
-//! scrutinee temporary that needs drop (its drop point is walk.rs's `Owner`), so the scrutinee
-//! drops where its owner drops it.
+//! Moves are walk/moves.rs's: a by-value binding of a part that needs drop moves it out of a
+//! scrutinee the match owns (a local, by its field flags; a temporary, held to its statement's
+//! end), which then drops minus what moved; anywhere else (`if let`, `let`-`else`) refused.
 
 use core::alloc::Allocator;
 
@@ -154,7 +154,13 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
     /// Starts match `e` by tests: the scrutinee's place (a scalar copied to a slot), every arm
     /// tested in turn (`arm_tested`).
     pub(super) fn match_tested(&mut self, e: ExprId, scrutinee: ExprId, arms: List, s: V, srepr: Repr) -> Result<(), BuildError> {
-        let at = self.tested_place(scrutinee, s, srepr, "a `match` by tests on a temporary that needs drop (its drop point is not built)")?;
+        // walk/moves.rs: a scrutinee that needs drop is owned (a local by its field flags, a
+        // temporary held to its statement's end), so arms may move parts out of it.
+        let m_next = self.matches.len() as u32;
+        let at = match self.own_scrutinee(m_next, e, scrutinee, s, srepr)? {
+            Some((p, off, g)) => At { at: (p, off), g, by_ref: false, copy: false },
+            None => self.tested_place(scrutinee, s, srepr, "a `match` by tests on a temporary that needs drop (its drop point is not built)")?,
+        };
         let (at, g, copy) = (at.at, at.g, at.copy);
         let list = self.body.arms.get(arms.range()).ok_or(malformed("a match's arms past `arms`"))?;
         let repr = self.expr_repr(e)?;
@@ -226,7 +232,11 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         self.test_pat(arm.pat, at, pass, next)?;
         self.begin(pass);
         self.scope_marks.push(self.scope_pats.len() as u32);
-        self.bind_tested(arm.pat, at)?;
+        // walk/moves.rs: a by-value binding of a part that needs drop moves it out.
+        self.move_arm(m, arm.pat, arm.guard.is_some());
+        let bound = self.bind_tested(arm.pat, at);
+        self.move_arm_end();
+        bound?;
         self.work.push(Task::ArmEnd { m });
         self.work.push(Task::ScopeEnd(arm.body));
         self.work.push(Task::Eval(arm.body));
@@ -403,6 +413,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                     // rules/pat.rs `pat_rule`: an explicit `ref`, else `mut` binds by move,
                     // else the default binding mode.
                     let by_ref = ann.by_ref.is_some() || (!ann.mutable && at.by_ref);
+                    let mut moved = false;
                     let v = if by_ref {
                         match self.ground_node(at.g).map_err(|error| Self::pat_ty_err(p, error))? {
                             // The wide pointer itself.
@@ -411,15 +422,20 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                         }
                     } else {
                         if self.needs_drop(at.g).map_err(|error| Self::pat_ty_err(p, error))? {
-                            return Err(BuildError::UnsupportedPat {
-                                pat: p,
-                                what: "a binding by value of a part that needs drop, in a match by tests (a move out)",
-                            });
+                            // walk/moves.rs: the part moves out of a scrutinee the match owns
+                            // (its bit cleared); anywhere else refused by name.
+                            self.move_out(p, at.g)?;
+                            moved = true;
                         }
                         let r = self.repr(at.g).map_err(|error| Self::pat_ty_err(p, error))?;
                         self.load(r, at.at)
                     };
-                    self.bind_slot(Self::bind_target(alias, name, p), v)?;
+                    let target = Self::bind_target(alias, name, p);
+                    self.bind_slot(target, v)?;
+                    if moved {
+                        // The binding owns the part: dropped at its arm's end unless moved on.
+                        self.own(target, true)?;
+                    }
                     if let Some(s) = sub {
                         todo.push((s, at));
                     }

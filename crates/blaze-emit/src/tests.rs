@@ -117,15 +117,20 @@ fn encodings() {
 /// Emitting refuses what is outside the subset, naming the instruction.
 #[test]
 fn refuses_what_it_does_not_emit() {
-    // `i128` division calls compiler_builtins' `__udivti3`, not linked yet (pass/wide.rs).
+    // `i128` division and `frem` are not refused: each is a call of the runtime's routine
+    // (pass/runtime.rs), named by the one literal word placement fills.
+    let calls = |code: &Code<Global>, r: crate::Routine| code.relocs.iter().any(|it| it.to == crate::RelocTo::Routine(r));
     let wide = one(&[Ty::I128, Ty::I128], Ty::I128, |b, v| b.binary(Op::Udiv, Flags::NONE, v[0], v[1]));
-    let refused = emitted(wide.view(), &[]).err();
-    assert!(matches!(refused, Some(EmitError::Unsupported { op: Op::Udiv, .. })), "{refused:?}");
-
-    // `frem` is a call of `fmod` (pass/float.rs).
+    let code = emitted(wide.view(), &[]).unwrap_or_else(|e| panic!("{e}"));
+    assert!(calls(&code, crate::Routine::Udivti3), "`udiv` at `i128` calls `__udivti3`");
     let float = one(&[Ty::F64, Ty::F64], Ty::F64, |b, v| b.binary(Op::Frem, Flags::NONE, v[0], v[1]));
-    let refused = emitted(float.view(), &[]).err();
-    assert!(matches!(refused, Some(EmitError::Unsupported { op: Op::Frem, .. })), "{refused:?}");
+    let code = emitted(float.view(), &[]).unwrap_or_else(|e| panic!("{e}"));
+    assert!(calls(&code, crate::Routine::Fmod), "`frem` at `f64` calls `fmod`");
+
+    // `fminnum` is still refused by name (pass/float.rs).
+    let min = one(&[Ty::F64, Ty::F64], Ty::F64, |b, v| b.binary(Op::FminNum, Flags::NONE, v[0], v[1]));
+    let refused = emitted(min.view(), &[]).err();
+    assert!(matches!(refused, Some(EmitError::Unsupported { op: Op::FminNum, .. })), "{refused:?}");
 
     let (caller, _) = caller_of(Ty::I32);
     assert_eq!(emitted(caller.view(), &[]).err(), Some(EmitError::NoVia { place: 0 }));

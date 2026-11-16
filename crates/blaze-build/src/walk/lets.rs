@@ -147,7 +147,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
         // temporaries (walk/temps.rs `hold_temp`): its drop around the `else` block is not built.
         let mark = *self.temp_marks.last().ok_or(malformed("a `let`-`else` outside a statement"))? as usize;
         let held = self.scope_pats.get(mark..).ok_or(malformed("a statement's temporaries mark past `scope_pats`"))?;
-        if held.iter().any(|h| matches!(h, Held::Rest { .. })) {
+        if held.iter().any(|h| matches!(h, Held::Rest { .. } | Held::Moved { .. })) {
             return Err(unsupported(
                 init,
                 "a borrowed temporary whose type needs drop in a `let`-`else` initializer (its drop around the `else` block is not built)",

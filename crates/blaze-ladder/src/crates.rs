@@ -135,8 +135,10 @@ pub struct Toolchain {
 impl Toolchain {
     /// No toolchain crate: for a `#![no_core]` program, which names nothing outside itself (no
     /// toolchain resolve per run). A program that names `core` or `std` over it does not resolve.
+    /// Its cfg is still [`TRIPLE`]'s whole target set ([`target_cfg`]): a `no_core` program's
+    /// pattern type (`usize is 0..=HALF`) reads `target_pointer_width` as any crate's does.
     pub fn none() -> Toolchain {
-        Toolchain { units: Vec::new(), cfg: Vec::new() }
+        Toolchain { units: Vec::new(), cfg: target_cfg() }
     }
 
     /// Opens the shelf's pinned manifest and reads the packs of every unit reachable from bstd,
@@ -214,6 +216,16 @@ impl Toolchain {
         let cfg = view.cfg(TRIPLE).ok_or(CratesError::NoTarget)?.map(|(n, v)| (n.to_owned(), v.map(str::to_owned))).collect();
         Ok(Toolchain { units, cfg })
     }
+}
+
+/// [`TRIPLE`]'s cfg atoms with no toolchain record open: blaze-scope's target list
+/// (`Cfg::of(&Target::AARCH64_APPLE_DARWIN, ..)`, crates/blaze-scope/src/task/lower.rs), the
+/// one list that names every target atom (`target_pointer_width`, `target_os`, ..). Asserted
+/// equal in triple by the constant's name: [`TRIPLE`] is `aarch64-apple-darwin`.
+fn target_cfg() -> Vec<(String, Option<String>)> {
+    let target = blaze_scope::task::Target::AARCH64_APPLE_DARWIN;
+    let cfg = blaze_scope::task::Cfg::of(&target, &[], Alloc::global());
+    cfg.atoms().iter().map(|&(n, v)| (n.to_owned(), v.map(str::to_owned))).collect()
 }
 
 /// A unit's key: its crate's pack digest and its features.

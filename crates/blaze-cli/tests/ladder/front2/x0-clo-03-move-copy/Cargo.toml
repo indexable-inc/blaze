@@ -1,0 +1,4 @@
+[package]
+name = "ladder-x0-clo-03-move-copy"
+version = "0.1.0"
+edition = "2024"

@@ -740,15 +740,22 @@ pub(crate) fn adopt(
         names.iter().enumerate().filter_map(|(at, it)| Some((at, Name::parse(it)?))).collect();
     // alloc: once a history is adopted
     let named: Vec<Name> = parsed.iter().map(|it| it.1).collect();
+    // A sorted array searched by halves, not a tree: `superseded` is ascending and `parsed`
+    // keeps `names`' order, so the positions stay ascending. Named here, the program's top
+    // for this path: `adopt` has no allocator passed in yet.
+    // to thread (bstd move): `adopt`'s callers pass their allocator.
+    let alloc = blaze_own::Alloc::global();
     // alloc: once a history is adopted
-    let gone: BTreeSet<usize> =
-        super::compact::superseded(&named).into_iter().map(|at| parsed[at].0).collect();
+    let mut gone = super::compact::superseded(&named, alloc);
+    for at in gone.iter_mut() {
+        *at = parsed[*at].0;
+    }
     let mut manifest = Manifest::new();
     manifest.retired = retired;
     // alloc: once a history is adopted
     let mut superseded = Vec::new();
     for (at, name) in names.into_iter().enumerate() {
-        if gone.contains(&at) {
+        if gone.binary_search(&at).is_ok() {
             superseded.push(name);
             continue;
         }

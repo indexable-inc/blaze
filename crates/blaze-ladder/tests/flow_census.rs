@@ -27,7 +27,7 @@ use blaze_ladder::front2::body::{BodyError, lower_fn, lower_member};
 use blaze_ladder::front2::check::{BuildOrder, Records, answer_impls, check_body, eval_len};
 use blaze_ladder::front2::consts::Consts;
 use blaze_ladder::front2::heads::{HeadError, Store, Want};
-use blaze_ladder::front2::keys::{MemberKind, checker_of};
+use blaze_ladder::front2::keys::{MemberKind, Origin, checker_of};
 use blaze_ladder::front2::spell::Spelling;
 use blaze_ladder::front2::types::Why;
 use blaze_ladder::refusal::SourceFile;
@@ -94,6 +94,24 @@ fn writes_lifetime(text: &str) -> bool {
     (0..b.len()).any(|i| b[i] == b'\'' && b.get(i + 1).is_some_and(|c| c.is_ascii_alphabetic() || *c == b'_') && b.get(i + 2) != Some(&b'\''))
 }
 
+/// Asks the store for one head, evaluating the array lengths it names; `false` when it cannot
+/// be made (the fact then stays unknown, and the lowering says so by name where it matters).
+fn ensure_one(r: &mut Records<'_, '_>, w: Want) -> bool {
+    let mut lens = 0;
+    loop {
+        match r.store.ensure(r.names, r.keys, w) {
+            Ok(()) => return true,
+            Err(HeadError::Item(_, Why::NeedConst(c, _))) if lens < MOST_LENS => {
+                lens += 1;
+                if eval_len(r, c).is_err() {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+}
+
 fn gather(r: &mut Records<'_, '_>, owner: tc::ItemKey, c: &tc::Checked<'_>, copy: Option<tc::ItemKey>, drop: Option<tc::ItemKey>, boxk: Option<tc::ItemKey>) -> Gathered {
     let mut g = Gathered::default();
     let mut adts: BTreeSet<u128> = BTreeSet::new();
@@ -109,18 +127,7 @@ fn gather(r: &mut Records<'_, '_>, owner: tc::ItemKey, c: &tc::Checked<'_>, copy
         if !r.store.adts.contains_key(&key)
             && let Some(lib) = r.keys.library(key)
         {
-            let mut lens = 0;
-            loop {
-                match r.store.ensure(r.names, r.keys, Want::Adt(lib)) {
-                    Err(HeadError::Item(_, Why::NeedConst(c, _))) if lens < MOST_LENS => {
-                        lens += 1;
-                        if eval_len(r, c).is_err() {
-                            break;
-                        }
-                    }
-                    _ => break,
-                }
-            }
+            ensure_one(r, Want::Adt(lib));
         }
         let Some(row) = r.store.adts.get(&key) else { continue };
         let (kind, variants) = (row.kind, row.variants.clone());
@@ -149,6 +156,25 @@ fn gather(r: &mut Records<'_, '_>, owner: tc::ItemKey, c: &tc::Checked<'_>, copy
     let mut items: BTreeSet<u128> = c.callees.column::<1>().iter().map(|k| k.0).collect();
     items.insert(owner.0);
     for k in items {
+        // A callee's head is made when something asks: ask, so its signature is read and not
+        // taken as unknown (a call of unknown signature is related coarsely, and cannot say
+        // that the callee demands `'static`). A member is made with its impl or its trait.
+        let key = tc::ItemKey(k);
+        if !r.store.fns.contains_key(&key) {
+            match r.keys.origin(key).cloned() {
+                Some(Origin::Item(lib)) => {
+                    ensure_one(r, Want::Fn(lib));
+                }
+                Some(Origin::Member { container, .. }) => {
+                    if let Some(lib) = r.keys.library(container)
+                        && !container_head(r, lib, false)
+                    {
+                        container_head(r, lib, true);
+                    }
+                }
+                None => {}
+            }
+        }
         let Some(f) = r.store.fns.get(&tc::ItemKey(k)) else { continue };
         let self_ref = f.self_param && f.inputs.first().is_some_and(|&t| matches!(r.store.tys.view().node(t), Ok(tc::PNode::Ref(..))));
         g.callees.insert(k, CalleeFacts { writes_lifetimes: writes_lifetime(f.text), self_ref });
@@ -283,6 +309,9 @@ fn take<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, t: Target<'_>, lan
                 calls_elided: l.stats.calls_elided,
                 calls_unified: l.stats.calls_unified,
                 sig_lifetimes: l.stats.sig_writes_lifetimes,
+                calls_by_signature: l.stats.calls_by_signature,
+                sig_read: l.stats.sig_read,
+                sig_refused: g.sig_refused.clone(),
             }))
         }
     }
@@ -376,6 +405,8 @@ fn flow_census() {
     let mut finding_kinds: BTreeMap<String, usize> = BTreeMap::new();
     let (mut lower_t, mut moves_t, mut tier1_t, mut tier2_t) = (Duration::ZERO, Duration::ZERO, Duration::ZERO, Duration::ZERO);
     let (mut elided, mut unified, mut sig_lt) = (0u64, 0u64, 0usize);
+    let (mut by_sig, mut sig_read) = (0u64, 0usize);
+    let mut sig_refused: BTreeMap<String, usize> = BTreeMap::new();
     let mut slowest: Vec<(Duration, String)> = Vec::new();
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
@@ -429,6 +460,11 @@ fn flow_census() {
                 elided += u64::from(d.calls_elided);
                 unified += u64::from(d.calls_unified);
                 sig_lt += usize::from(d.sig_lifetimes);
+                by_sig += u64::from(d.calls_by_signature);
+                sig_read += usize::from(d.sig_read);
+                for (name, n) in &d.sig_refused {
+                    *sig_refused.entry(name.clone()).or_default() += n;
+                }
                 let all = d.lower_t + d.moves_t + d.tier1_t + d.tier2_t.unwrap_or_default();
                 slowest.push((all, path.clone()));
                 if let Some(x) = d.tier2_t {
@@ -466,6 +502,9 @@ fn flow_census() {
         lowered - t1
     ));
     out.push_str(&format!("calls related by elision {elided}; calls unified (generic origins or unknown callee) {unified}; bodies whose signature writes lifetimes (placeholders taken as related) {sig_lt}\n"));
+    out.push_str(&format!(
+        "signatures: bodies whose own lifetime part was read {sig_read}; calls related through the callee's {by_sig}; signature texts not read (of lowered bodies, a callee counted once per body), by refusal: {sig_refused:?}\n"
+    ));
     let mut sorted: Vec<(&String, &(usize, Vec<String>))> = refusals.iter().collect();
     sorted.sort_by(|a, b| b.1.0.cmp(&a.1.0).then_with(|| a.0.cmp(b.0)));
     out.push_str(&format!("REFUSED by form ({}), largest first:\n", sorted.len()));

@@ -24,6 +24,7 @@ pub mod cx;
 pub mod env;
 pub mod git;
 mod git_objects;
+pub mod host_tools;
 pub mod instr;
 pub mod key;
 pub mod native;

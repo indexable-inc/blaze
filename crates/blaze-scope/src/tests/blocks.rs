@@ -245,6 +245,6 @@ fn blocks_expand_a_statement_call_named_by_textual_scope() {
     let local_c = impl_ending(&names, 0, "LocalforC");
     assert_eq!(named_in(&names, local_c, &["Local"]), 0, "written by the block's own `macro_rules!`: {all:?}");
     // When the owed case above is built this becomes 3 (`impl Local for B`).
-    println!("BLOCK impls by textual scope: {} of 3: {all:?}", all.len());
+    std::println!("BLOCK impls by textual scope: {} of 3: {all:?}", all.len());
     assert!(all.len() >= 2, "{all:?}");
 }

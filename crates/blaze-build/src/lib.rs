@@ -211,7 +211,7 @@ use core::fmt;
 use std::alloc::Global;
 
 use blaze_lir::{Func, VerifyError};
-use blaze_typeck::{Adt, BodyView, Checked, Expr, ExprId, FnSig, ItemKey, LangItem, List, Mutbl, PTy, PTys, PatId, PortableTys};
+use blaze_typeck::{Adt, BodyView, Checked, Expr, ExprId, FmtTrait, FnSig, ItemKey, LangItem, List, Mutbl, PTy, PTys, PatId, PortableTys};
 
 pub use instance::{Instance, InstanceKey, ground, instance_key, instance_key_normalized};
 
@@ -380,6 +380,41 @@ pub trait Adts {
         let _ = (item, args);
         None
     }
+
+    /// The template of `format_args!` expression `expr` of the body of `owner`: its literal
+    /// texts (escapes and `{{`/`}}` processed) and placeholders in order, one placeholder per
+    /// row of the expression's `fmt_uses` that is not a count (walk/fmt.rs). The checker's
+    /// body form keeps the uses but not the template. No answer refuses the expression by name.
+    fn format_template(&self, owner: ItemKey, expr: ExprId) -> Option<&[FmtPiece<'_>]> {
+        let _ = (owner, expr);
+        None
+    }
+
+    /// The pinned library's `core::fmt::rt::Argument` constructor for `trait_`
+    /// (`Argument::new_display` for `Display`, `new_debug` for `Debug`, ...; walk/fmt.rs quotes
+    /// them), a fn generic over the argument's type `T` alone. No answer is refused with
+    /// [`BuildError::NoLangFn`] naming the constructor.
+    fn fmt_argument_new(&self, trait_: FmtTrait) -> Option<ItemKey> {
+        let _ = trait_;
+        None
+    }
+
+    /// The struct `core::fmt::rt::Argument` (lang `format_argument`). No answer is refused
+    /// with [`BuildError::NoLangFn`] naming `format_argument`.
+    fn fmt_argument_adt(&self) -> Option<ItemKey> {
+        None
+    }
+}
+
+/// One piece of a `format_args!` template ([`Adts::format_template`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FmtPiece<'a> {
+    /// Literal text, written as is.
+    Text(&'a str),
+    /// A placeholder formatting the next of the expression's non-count uses. `plain`: written
+    /// with no fill, alignment, sign, `#`, `0`, width or precision (`{}`, `{x:?}`); the build
+    /// refuses the others by name.
+    Arg { plain: bool },
 }
 
 /// A `static` item's kind.
@@ -632,6 +667,29 @@ pub fn build_closure<A: Allocator + Clone>(
     let params = body.pat_lists.get(params.range()).ok_or(BuildError::Malformed { what: "a closure's parameters past `pat_lists`" })?;
     let view = BodyView { params, root, ..*body };
     walk::build(&view, checked, sig, subst, adts, walk::Kind::Closure(closure, which), alloc)
+}
+
+/// Builds the instance of trait method `which` (`Fn::call`, `FnMut::call_mut` or
+/// `FnOnce::call_once`) at `[callee, tuple]` where `callee` is a fn ITEM type or a fn POINTER
+/// type, not a closure. The Reference, "Function item types": "All function items implement
+/// `Fn`, `FnMut`, `FnOnce`, `Copy`, `Clone`, `Send`, and `Sync`"; core's function.rs: "`Fn` is
+/// implemented automatically by closures ... as well as (safe) function pointers". The
+/// instance is a SHIM: `self` taken as `which` takes it, ignored for a fn item (zero-sized),
+/// loaded and called indirectly for a fn pointer, the tuple's fields passed on as the callee's
+/// arguments (codegen.md, "Closures and the Fn traits"). For `FnDef(item, args)`, `sig` is
+/// `item`'s signature and `subst.args` the list `args` names; for a fn pointer `sig` is `None`
+/// and `subst.args` empty. The caller picks this for an `Fn*` method's instance whose first
+/// argument [`closure_of`] does not read as a closure.
+pub fn build_fn_shim<A: Allocator + Clone>(
+    callee: PTy,
+    tuple: PTy,
+    which: FnTrait,
+    sig: Option<&FnSig<'_>>,
+    subst: &mut Subst<'_, '_>,
+    adts: &dyn Adts,
+    alloc: A,
+) -> Result<Built<A>, BuildError> {
+    walk::build_fn_shim(callee, tuple, which, sig, subst, adts, alloc)
 }
 
 /// What the instance `subst` names of `body` reads of trait shapes, before it is built: its

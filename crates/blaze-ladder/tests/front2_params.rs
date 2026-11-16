@@ -98,7 +98,10 @@ const FREE: [(&str, bool, &str); 9] = [
 /// Some(\"Param(0)\")" (E0599), the census's own line for `T::IS_ZST` and `P::WRITE`. Each
 /// name here is asserted to say exactly that, so this list must shrink when the answer comes:
 /// remove a name and the table above states what the body must say then.
-const OWED: [&str; 10] = ["p1", "p2", "p3", "p6", "p7", "p8", "p9", "p10", "p5", "p5t"];
+/// EMPTIED 2026-11-16: heads.rs `trait_members` files a row per trait constant
+/// (`TraitExtra::consts`) and `assoc_item` answers it as `AssocKind::Const`; the ten names
+/// that were here (p1, p2, p3, p6, p7, p8, p9, p10, p5, p5t) now say what the table states.
+const OWED: [&str; 0] = [];
 
 /// The impl members that must check clean.
 const MEMBERS: [(&str, &str); 2] = [

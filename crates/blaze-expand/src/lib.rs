@@ -102,6 +102,7 @@ pub use crate::{
     cx::{
         ExpandCx, HostAsk, HostError, HostWhy, IncludeAs, Included, OutsideRoot, Place, PlaceOf,
         ProcCall, ProcDiagnostic, ProcLimit, Produced, ReadRoot, SourceOrigin, include_target,
+        is_root_relative,
     },
     def::{
         BuiltinAttr, BuiltinDerive, BuiltinFn, DefAt, DefinitionError, DefinitionRecords, Export,

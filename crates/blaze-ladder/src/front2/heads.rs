@@ -113,6 +113,20 @@ pub struct Maps {
     /// Each `usize` constant item a head's array length names, by its value
     /// ([`Why::NeedConst`]): filled by the driver that has the constant evaluator.
     pub const_lens: HashMap<LibKey, u64, Global>,
+    /// Each evaluated constant a head names, by its value's bits in its OWN type's width (an
+    /// `i8` of -8 is `0xf8`; a `u128` or `i128` whole), as blaze-consteval writes them and as
+    /// `PNode::ConstValue` holds them: the reader knows the type and extends by its sign.
+    /// Keyed by a constant item's key or an anonymous constant's need key
+    /// ([`super::anon::need_key`]); filled by `check::eval_len` beside `const_lens`, which
+    /// holds only those that fit 64 bits.
+    pub const_bits: HashMap<LibKey, u128, Global>,
+    /// The anonymous constants the type builder asked for and no head holds yet
+    /// ([`Heads::ask_anon`]): filed as heads by [`super::anon::file_asked`], which
+    /// `check::eval_len` calls before it evaluates. In asking order; a repeat is skipped there.
+    pub anon_asked: core::cell::RefCell<Vec<super::anon::Ask, Global>>,
+    /// Each anonymous constant the evaluator refused, by its need key, with the refusal as
+    /// printed ([`Heads::anon_failed`]): the head that wrote it is refused naming both.
+    pub anon_failed: HashMap<LibKey, std::boxed::Box<str, Global>, Global>,
     /// Each item's const generic parameters (index, declared type), sorted by index: a
     /// struct's, enum's, union's, trait's and alias's own (made with its head, what
     /// [`Heads::const_params`] reads), an impl's own, and a fn's with its container's first
@@ -123,6 +137,20 @@ pub struct Maps {
 impl Heads for Maps {
     fn const_len(&self, key: LibKey) -> Option<u64> {
         self.const_lens.get(&key).copied()
+    }
+    fn const_bits(&self, key: LibKey) -> Option<u128> {
+        self.const_bits.get(&key).copied().or_else(|| self.const_lens.get(&key).map(|&v| u128::from(v)))
+    }
+    fn anon_failed(&self, key: LibKey) -> Option<&str> {
+        self.anon_failed.get(&key).map(|why| &**why)
+    }
+    /// Kept for `check::eval_len` to file; one asked twice before then is kept once.
+    fn ask_anon(&self, ask: super::anon::Ask) -> bool {
+        let mut asked = self.anon_asked.borrow_mut();
+        if !asked.iter().any(|a| a.need == ask.need) {
+            asked.push(ask);
+        }
+        true
     }
     fn adt_generics(&self, adt: LibKey) -> Option<(u32, &[Option<PTy>])> {
         self.generics.get(&adt).map(|(g, d)| (*g, &d[..]))
@@ -218,22 +246,40 @@ fn discriminants(b: &Builder<'_, '_, Maps>, tys: &mut PortableTys<'_>, env: &Env
         (false, 128) => (0, i128::MAX),
         (false, w) => (0, (1i128 << w) - 1),
     };
+    // A written discriminant that is a constant not evaluated yet (a constant item, or an
+    // expression `1 << 0`: an anonymous constant, front2/anon.rs) is a need; EVERY written one
+    // is asked before the first need is returned, so the driver evaluates them in one round.
+    let mut need: Option<Why> = None;
     for (k, &(c, r)) in written.iter().enumerate() {
         let value = match c {
             Some(c) => {
                 let at = v.const_range(c)?;
                 let cr = v.site(at)?;
-                let made = b.const_term(tys, env, v.text_at(at)?, cr, &|_| Ok(ty))?;
+                let made = match b.const_term(tys, env, v.text_at(at)?, cr, &|_| Ok(ty)) {
+                    Ok(made) => made,
+                    Err(why @ Why::NeedConst(..)) => {
+                        need.get_or_insert(why);
+                        continue;
+                    }
+                    Err(why) => return Err(why),
+                };
+                if need.is_some() {
+                    continue;
+                }
                 let Some(&PNode::ConstValue { bits: raw, .. }) = tys.view().nodes.get(made.0 as usize) else {
                     return Err(Why::ConstPath(Box::from(v.text_at(at)?.trim()), cr));
                 };
                 // The bits are the value's in the type's width: sign-extend a signed one.
-                if signed && bits < 128 && raw >> (bits - 1) & 1 == 1 {
+                if signed && bits == 128 {
+                    raw as i128
+                } else if signed && raw >> (bits - 1) & 1 == 1 {
                     (raw | !((1u128 << bits) - 1)) as i128
                 } else {
                     i128::try_from(raw).map_err(|_| Why::Unsupported("a `u128` discriminant past `i128::MAX`", cr))?
                 }
             }
+            // After a need the values so far are not all known: nothing is judged this pass.
+            None if need.is_some() => continue,
             None => match out.last() {
                 None => 0,
                 Some(&prev) if prev < most => prev + 1,
@@ -247,6 +293,9 @@ fn discriminants(b: &Builder<'_, '_, Maps>, tys: &mut PortableTys<'_>, env: &Env
             return Err(Why::Program(format!("discriminant value `{value}` assigned more than once (E0081): variants {j} and {k}").into_boxed_str(), r));
         }
         out.push(value);
+    }
+    if let Some(why) = need {
+        return Err(why);
     }
     Ok(out)
 }
@@ -302,7 +351,8 @@ pub struct ImplHead {
     pub assoc: Vec<(Name, PTy), Global>,
     pub fns: Vec<(Name, ItemKey), Global>,
     /// Its associated constants (the Reference, "Associated constants"), each with a row in
-    /// `Store::fns` as the checker reads one: no inputs, its type the output, no body.
+    /// `Store::fns` as the checker reads one: no inputs, its type the output, and its body
+    /// where its value is written (`has_body`: what the constant evaluator lowers).
     pub consts: Vec<(Name, ItemKey), Global>,
     /// `impl !Trait for T` is negative (the Reference does not list negative impls: rustc's
     /// `negative_impls`, which core and alloc use); `#[rustc_reservation_impl]` reserves.
@@ -368,6 +418,10 @@ pub struct Store<'n> {
 pub struct TraitExtra {
     pub supertraits: Vec<PClause, Global>,
     pub assoc: Vec<tc::AssocTyDef, Global>,
+    /// Its associated constants, declared or defaulted (the Reference, "Associated
+    /// Constants"), in the order written: each with a row in `Store::fns` as an impl's has
+    /// ([`ImplHead::consts`]); the row's `has_body` says a default is written.
+    pub consts: Vec<(Name, ItemKey), Global>,
 }
 
 /// The step's result: done, or the head it needs first.
@@ -866,6 +920,7 @@ impl<'n> Store<'n> {
         }
         self.maps.supers.insert(key, supers);
         let mut assoc = Vec::new_in(Global);
+        let mut consts: Vec<(Name, ItemKey), Global> = Vec::new_in(Global);
         for m in &members(names, key).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))? {
             let low = lower(names, key, m.text).map_err(|e| Why::Program(format!("{e}").into_boxed_str(), whole))?;
             let mv = low.view();
@@ -886,10 +941,37 @@ impl<'n> Store<'n> {
                     };
                     assoc.push(tc::AssocTyDef { name: Name::of(m.name), item, default });
                 }
+                // A trait's associated constant (the Reference, "Associated Items",
+                // "Associated Constants": "An associated constant declaration declares a
+                // signature for associated constant definitions. It is written as `const`,
+                // then an identifier, then `:`, then a type, finished by a `;`"; "Associated
+                // constants definitions define a constant associated with a type. It is
+                // written the same as a constant item"): a row as an impl's constant has
+                // ([`ImplHead::consts`]): no inputs, its type the output, generic over the
+                // trait's parameters (`Self` = `Param(0)`), its clauses the trait's plus
+                // `Self: Trait<params>`. `has_body` says whether a DEFAULT is written
+                // (`const N: usize = 4;`), read from the text as the impl side reads it.
+                ItemDetail::Const { .. } => {
+                    let mk = keys.member(ck, MemberKind::Const, m.name).map_err(|c| Why::Program(format!("{c}").into_boxed_str(), whole))?;
+                    let at = Range::new(0, m.text.len() as u32);
+                    let t = mv.head_opt(head::TY).ok_or(Why::Unsupported("an associated constant with no type", at))?;
+                    let b = Builder { resolver: Resolver { names }, heads: &self.maps };
+                    let output = b.ty(&mut self.tys, &env, &mv, lf::TypeId(t))?;
+                    let mut own_bounds = Vec::with_capacity_in(bounds.len(), Global);
+                    own_bounds.extend_from_slice(&bounds);
+                    let mut cp = Preds::new();
+                    cp.clauses.extend_from_slice(&inherited);
+                    self.preds.insert(mk, cp);
+                    let header = tc::FnPtrHeader { abi: tc::Abi::Rust, safety: tc::Safety::Safe };
+                    let has_body = mv.head[head::FLAGS] & sig::HAS_BODY != 0;
+                    let row = FnHead { lib: key, text: m.text, container: Some(ck), parent: own + 1, own: 0, declared: 0, self_param: false, header, inputs: Vec::new_in(Global), output, has_body, module, params: ps.clone(), consts: cs.clone(), bounds: own_bounds, self_: env.self_, self_assoc: Vec::new_in(Global) };
+                    self.fns.insert(mk, row);
+                    consts.push((Name::of(m.name), mk));
+                }
                 _ => {}
             }
         }
-        self.trait_defs.insert(ck, TraitExtra { supertraits, assoc });
+        self.trait_defs.insert(ck, TraitExtra { supertraits, assoc, consts });
         self.preds.insert(ck, preds);
         Ok(())
     }

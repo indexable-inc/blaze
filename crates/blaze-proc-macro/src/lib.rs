@@ -32,6 +32,8 @@ pub mod native_sandbox;
 #[cfg(feature = "runtime")]
 pub mod native_script;
 #[cfg(feature = "runtime")]
+pub mod native_unit;
+#[cfg(feature = "runtime")]
 pub mod protocol;
 #[cfg(feature = "runtime")]
 pub mod script;

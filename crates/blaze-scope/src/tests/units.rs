@@ -158,3 +158,41 @@ fn a_proc_macro_is_kept_without_its_host_deps_and_a_dropped_dep_is_refused() {
         Some(UnitsError::DependencyNotKept { krate: "app", kind: "lib", dep: "syn", dep_kind: "lib", dep_for_host: true })
     );
 }
+
+/// A member's test units (the graph makes them when tests are asked) are crates of the list:
+/// roots, with `test` in their cfg, their dev-dependencies followed, each under its own key.
+/// Before: only `Lib` and `Bin` units were roots and kept, so `--tests` solved no unit with
+/// `test` on (the names here were `core, alloc, std, app`).
+///
+/// Expected line: `test units::tests::a_members_test_units_are_crates_with_test_in_their_cfg ... ok`.
+#[test]
+fn a_members_test_units_are_crates_with_test_in_their_cfg() {
+    let bytes = toolchain();
+    let view = ToolchainView::open(&bytes, ToolchainView::id_of_bytes(&bytes)).expect("its own id");
+    let lock = Lock::read(LOCK.as_bytes(), a()).expect("the lock");
+    let members = [LockId(0)];
+    let test_of = |bin: Option<&str>, deps: &[(&str, u32)]| {
+        let mut u = unit(0, "app", UnitKind::Test { bin: bin.map(t) }, false, deps);
+        u.cfg.push(CfgAtom::flag("test", a()));
+        u
+    };
+    // app's library, its test unit on the dev-dependency dep, and the test units of two binaries.
+    let g = graph(std::vec![
+        unit(0, "app", UnitKind::Lib, false, &[]),
+        unit(1, "dep", UnitKind::Lib, false, &[]),
+        test_of(None, &[("dep", 1)]),
+        test_of(Some("one"), &[("app", 0)]),
+        test_of(Some("two"), &[("app", 0)]),
+    ]);
+    let crates = unit_crates(&g, &lock, &members, view, TRIPLE, a()).expect("the crates");
+    let names: Vec<&str> = crates.crates.iter().map(|c| c.name).collect();
+    assert_eq!(names, ["core", "alloc", "std", "app", "dep", "app", "app", "app"]);
+    let has_test = |at: usize| crates.crates[at].cfg.iter().any(|(name, value)| *name == "test" && value.is_none());
+    assert!(!has_test(3), "the library's own unit is compiled without `test`");
+    assert!(has_test(5) && has_test(6) && has_test(7), "each test unit is compiled with `test`");
+    assert_eq!(crates.crates[5].origin, Origin::Unit(UnitId(2)));
+    assert_eq!(crates.crates[5].deps.as_slice(), [("dep", 4)], "the dev-dependency is followed from the test unit");
+    assert_eq!(crates.crates[6].deps.as_slice(), [("app", 3)]);
+    let keys: std::collections::BTreeSet<_> = crates.crates.iter().map(|c| c.key).collect();
+    assert_eq!(keys.len(), 8, "every crate's key is its own: the library's, its test unit's and each binary's test unit's");
+}

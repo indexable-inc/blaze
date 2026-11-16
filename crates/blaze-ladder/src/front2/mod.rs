@@ -10,6 +10,7 @@
 //! | [`index`] | every impl and lang item, from the library's tables |
 //! | [`types`] | a written type to a portable one through the resolver; `Why::Need` for a head not lowered yet |
 
+pub mod anon;
 pub mod body;
 pub mod buckets;
 pub mod check;
@@ -17,6 +18,7 @@ pub mod consts;
 pub mod dyn_ty;
 pub mod entry;
 pub mod fill;
+pub(crate) mod fmt_template;
 pub mod heads;
 pub mod index;
 pub mod keys;
@@ -28,6 +30,7 @@ pub mod program;
 pub mod project;
 pub mod reach;
 pub mod spell;
+pub mod statics;
 pub mod texts;
 pub mod types;
 pub mod world_items;

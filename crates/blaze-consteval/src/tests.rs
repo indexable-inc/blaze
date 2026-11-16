@@ -152,6 +152,40 @@ fn shifts_and_division_by_zero() {
     assert_eq!(refused("i32", "5i32 % 0"), std::format!("{:?}", Refusal::RemByZero));
 }
 
+/// The pinned core's `HALF_USIZE` (library/core/src/num/niche_types.rs:113 "const HALF_USIZE:
+/// usize = usize::MAX >> 1;", the range end of :129 "pub struct UsizeNoHighBit(usize is
+/// 0..=HALF_USIZE);") over `usize::MAX` (library/core/src/num/uint_macros.rs, in `impl usize`:
+/// "pub const MAX: Self = !0;"). The derivation on a 64-bit target: `0` at `usize` is 64 zero
+/// bits; `!` on an integer is bitwise NOT (the Reference, "Negation operators"), so `!0` is 64
+/// one bits = 2^64 - 1 = 18446744073709551615; `>>` on an unsigned integer is a logical shift
+/// (the Reference, "Arithmetic and Logical Binary Operators"), so `>> 1` is 2^63 - 1 =
+/// 9223372036854775807; `HALF_USIZE - 1` (niche_types.rs:114) is 9223372036854775806. Each
+/// constant READS the one before it (a constant's value asked of the world, not its text).
+/// The fixture world has no impl blocks, so core's associated `usize::MAX` is the free `MAX`
+/// here with core's own body; the path through `impl usize` is blaze-ladder's
+/// tests/front2_items.rs `a_pattern_type_range_end_is_a_constant_items_value`. Overflow stays an
+/// error in a constant (the Reference, "Constant evaluation", with "Arithmetic and Logical
+/// Binary Operators", "Overflow": "these operations panic when overflow occurs" and a panic
+/// during constant evaluation is a compile error): `MAX + 1` is refused, never wrapped to 0.
+/// Expected: "test tests::half_usize_is_usize_max_shifted_right_once ... ok".
+#[test]
+fn half_usize_is_usize_max_shifted_right_once() {
+    let mut w = world();
+    w.konst("MAX", "usize", "!0");
+    w.konst("HALF_USIZE", "usize", "MAX >> 1");
+    w.konst("HALF_USIZE_MINUS_ONE", "usize", "HALF_USIZE - 1");
+    w.konst("PAST", "usize", "MAX + 1");
+    w.konst("I8_MIN", "i8", "!0 << 7");
+    w.build();
+    assert_eq!(eval_int(&mut w, "MAX"), Ok(18_446_744_073_709_551_615));
+    assert_eq!(eval_int(&mut w, "HALF_USIZE"), Ok(9_223_372_036_854_775_807));
+    assert_eq!(eval_int(&mut w, "HALF_USIZE_MINUS_ONE"), Ok(9_223_372_036_854_775_806));
+    assert_eq!(refusal(&mut w, "PAST"), std::format!("{:?}", Refusal::Overflow { op: Op::Add }));
+    // At a signed width: `!0` at `i8` is -1 (eight one bits); `<< 7` keeps the low eight bits
+    // of the shifted value: 0x80, which is `i8::MIN` (-128).
+    assert_eq!(eval_int(&mut w, "I8_MIN").map(|v| sext(v, 8)), Ok(-128));
+}
+
 /// The Reference, "Type cast expressions": integer to integer truncates or extends by the
 /// source's sign; float to integer rounds toward zero and saturates, NaN to 0; integer to
 /// float rounds to nearest; `u8` to `char`; `char` and `bool` to integers.

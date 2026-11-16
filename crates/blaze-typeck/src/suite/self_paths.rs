@@ -117,6 +117,10 @@ fn param_world() -> (Fx, [ItemKey; 4]) {
     fx.imp("impl<T> Zst for T", 1, q, Some((zst, &[])), &[], Vec::new());
     let zb = fx.tr("Zb", 1, Vec::new(), &[]);
     fx.trait_const(zb, "Z", bool_);
+    // All four are in scope, as items of the module the fns are written in.
+    for t in [a1, a2, zst, zb] {
+        fx.use_trait(t);
+    }
     let c_a1 = fx.bound(a1, &[q]);
     let one = fx.func("one", 1, &[], u8_, std::vec![c_a1]);
     let (c_a1, c_a2) = (fx.bound(a1, &[q]), fx.bound(a2, &[q]));
@@ -146,11 +150,8 @@ fn a_parameters_constant_comes_from_its_bound() {
 }
 
 /// A constant through a blanket impl of a trait in scope where no bound has the name (core's
-/// `T::IS_ZST`). OPEN (typeck.md item (14)): today "want bool, got {error}; diagnostics: want
-/// [], got [(NoMethod, 0)]": `may_hold(Zst for Q)` answers no although the blanket impl is a
-/// candidate of the fixture's `impls_of`; the cause is not found yet.
+/// `T::IS_ZST`): the solver holds `Q: Zst` by the blanket impl.
 #[test]
-#[ignore = "open: `Q: Zst` through `impl<T> Zst for T` is answered no (typeck.md item (14))"]
 fn a_parameters_constant_comes_from_a_blanket_impl() {
     let (fx, [_, _, _, blanket]) = param_world();
     let d = param_path(&fx, blanket, "Z", &Want { exprs: &[(ExprId(0), "bool")], pats: &[], diags: &[] });

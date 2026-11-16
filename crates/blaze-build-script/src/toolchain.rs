@@ -60,7 +60,7 @@ impl core::fmt::Display for PinError<'_> {
 
 /// The text of the object that follows `"key":` at or after `from`, up to its matching close,
 /// with braces counted by a loop (no recursion); `None` when absent.
-fn object<'t>(text: &'t str, key: &str, from: usize) -> Option<(&'t str, usize)> {
+pub(crate) fn object<'t>(text: &'t str, key: &str, from: usize) -> Option<(&'t str, usize)> {
     let mut at = from;
     loop {
         let found = text.get(at..)?.find('"')? + at;
@@ -93,7 +93,7 @@ fn object<'t>(text: &'t str, key: &str, from: usize) -> Option<(&'t str, usize)>
 }
 
 /// The string or number value of `"key":` in `body`, quotes removed.
-fn scalar<'t>(body: &'t str, key: &str) -> Option<&'t str> {
+pub(crate) fn scalar<'t>(body: &'t str, key: &str) -> Option<&'t str> {
     let (value, _) = object(body, key, 0)?;
     let value = value.trim();
     Some(value.strip_prefix('"').and_then(|v| v.strip_suffix('"')).unwrap_or(value))

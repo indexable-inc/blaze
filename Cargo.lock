@@ -685,6 +685,7 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-format-core",
  "blaze-ids",
+ "blaze-own",
  "blaze-sim",
  "blaze-v2-proof",
 ]
@@ -1283,6 +1284,7 @@ dependencies = [
  "blaze-typeck",
  "blaze-unit-graph",
  "blaze-wasi",
+ "edition",
  "libc",
  "tracing",
  "wasmtime",
@@ -3859,6 +3861,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 name = "scripts"
 version = "0.0.0"
 dependencies = [
+ "blaze-build-script",
  "blaze-data",
  "blaze-fetch",
  "blaze-git-fetch",

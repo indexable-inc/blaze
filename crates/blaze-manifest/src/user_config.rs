@@ -1,6 +1,6 @@
 //! blaze's user configuration: `config.toml` in blaze's home (`$BLAZE_HOME`, else `~/.blaze`,
-//! where `versions/` is). The one place that finds blaze's home, names the file and reads it into
-//! a table; each module reads its own table of it and says a bad setting through
+//! where `versions/` is). The one place that finds blaze's home, names the file and parses its
+//! text (the caller reads it) into a table; each module reads its own table of it and says a bad setting through
 //! [`UserConfigError::setting`]:
 //!
 //! - `[update]`: blaze's own updates (crates/blaze-engine/src/update.rs).
@@ -40,16 +40,8 @@ pub fn file(home: &Path) -> PathBuf {
     home.join("config.toml")
 }
 
-/// `file`'s text, none when there is no file. [`parse`] makes it a document.
-pub fn read(file: &Path) -> Result<Option<String>, UserConfigError> {
-    match std::fs::read_to_string(file) {
-        Ok(text) => Ok(Some(text)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(UserConfigError::Unread { file: file.to_owned(), error }),
-    }
-}
-
-/// `text`, read from `file`, as a TOML document; its root is the table [`section`] looks in.
+/// `text`, read from `file` by the caller (through the effect layer: this crate opens no file),
+/// as a TOML document; its root is the table [`section`] looks in.
 pub fn parse<'t>(file: &Path, text: &'t str) -> Result<Document<'t, Global>, UserConfigError> {
     Document::parse_in(text, Limits::CARGO, Global).map_err(|error| {
         let (line, column) = error.line_col(text);
@@ -74,8 +66,6 @@ pub fn section<'d, 't>(
 /// What is wrong with blaze's user configuration, naming the file and the setting.
 #[derive(Debug)]
 pub enum UserConfigError {
-    /// The file is there and can't be read.
-    Unread { file: PathBuf, error: std::io::Error },
     /// The file is not TOML: what blaze-toml refused, at `line:column` (1-based).
     NotToml { file: PathBuf, error: blaze_toml::Error, line: usize, column: usize },
     /// `key`, at `line:column`, is set to `got` (its text in the file), which is not what it
@@ -105,7 +95,6 @@ impl UserConfigError {
 impl fmt::Display for UserConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            UserConfigError::Unread { file, error } => write!(f, "reading blaze's settings {}: {error}", file.display()),
             UserConfigError::NotToml { file, error, line, column } => write!(
                 f,
                 "{}:{line}:{column} is not TOML, so blaze's settings in it can't be told: {}",

@@ -773,7 +773,10 @@ fn signature_refuses_a_reference_to_a_local() {
 
 /// `fn h<'a>(x: &'a mut (u8, u8)) -> &'a mut u8 { &mut x.0 }`. Right: a mutable reborrow through
 /// a `&'a mut` may live as long as `'a` (RFC 2094, "Reborrow constraints": the supporting prefix
-/// `*x` adds `'a: 'r`), and nothing uses `x` again. Accepted.
+/// `*x` adds `'a: 'r`), and nothing uses `x` again. Accepted, by tier two: tier one has no
+/// points, so the loan, in `'a` and so live everywhere, looks live at the very borrow that
+/// issues it, a deep write of its own place. Tier one may not excuse a loan's own statement (in
+/// a loop the earlier iteration's loan is really live there), so this is tier two's to accept.
 #[test]
 fn signature_returns_a_reborrow_through_a_mutable_reference() {
     let mut b = FlowBuilder::new_in(3, 1, Global);
@@ -791,7 +794,12 @@ fn signature_returns_a_reborrow_through_a_mutable_reference() {
     b.assign(Place(0), Operand::Move(Place(2)), S);
     b.subset(or, oa);
     b.ret(S);
-    assert_eq!(tiers(&finish(b)), (TierOne::Accepted, Vec::new()));
+    let flow = finish(b);
+    assert_eq!(tiers(&flow), (TierOne::Refused, Vec::new()));
+    match check_body(&flow, Global) {
+        Ok(r) => assert_eq!(r.proof.map(|p| p.tier()), Some(2)),
+        Err(e) => panic!("{e:?}"),
+    }
 }
 
 /// `fn inner<'a, 'b>(x: &'a &'b u8) -> &'a u8 { *x }` (`wrong` false) and its nearest wrong

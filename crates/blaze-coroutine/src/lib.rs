@@ -9,6 +9,12 @@
 //! - [`transform`]: the rewrite to a [`Machine`]: `Park` for `Suspend`, the entry table of
 //!   `resume` and the entry table of the state's drop glue.
 //!
+//! - [`record`]: the adapter in: a [`Recorder`] takes the scope events of the builder's one walk
+//!   of a checked body (declare, move, drop, scope end, and each `.await` with the walk's open
+//!   drop scopes) and makes the form, desugaring `.await` once.
+//! - [`plan`]: the adapter out: a [`Plan`] is what the builder receives: the state's fields, each
+//!   saved local's home, the head switch, each point's tag and future, each point's cancel order.
+//!
 //! Every analysis is a sans-IO function of a body and an allocator the caller names; every loop
 //! over the graph counts its passes against a stated bound or marks what it has seen. The
 //! adapter from a checked body, and the builder's use of a machine, are the next leg
@@ -24,10 +30,14 @@ extern crate std;
 pub mod ir;
 pub mod layout;
 pub mod live;
+pub mod plan;
+pub mod record;
 pub mod transform;
 
 #[cfg(test)]
 mod interp;
+#[cfg(test)]
+mod record_tests;
 #[cfg(test)]
 mod tests;
 
@@ -37,6 +47,8 @@ pub use ir::{
 };
 pub use layout::{Home, Layout, Tag, layout};
 pub use live::{Across, across};
+pub use plan::{CancelDrop, Field, FieldId, FieldKind, Plan, PlanError, PointRow, Resume, plan};
+pub use record::{Awaited, INTO_FUTURE, LocalFacts, Lowered, Origin, RecordError, Recorder};
 pub use transform::{DropEntry, Entry, Machine, TransformError, transform, transform_planted};
 
 /// A planted bug, for the simulation's controls. Only test builds act on one.

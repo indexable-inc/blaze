@@ -52,7 +52,7 @@ use core::alloc::Allocator;
 use blaze_lir::builder::MemAttrs;
 use blaze_lir::func::{RefKind, SlotKind};
 use blaze_lir::{Flags, Ty};
-use blaze_typeck::{ExprId, FmtTrait, FmtUse, List, Mutbl, Name, PNode};
+use blaze_typeck::{Expr, ExprId, FmtTrait, FmtUse, List, Mutbl, Name, PNode};
 
 use super::{Callee, Repr, Shape, Task, V, Walk, malformed, unsupported};
 use crate::{Abi, BuildError, FmtPiece, Instance};
@@ -198,8 +198,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
 
         // The `rt::Argument` array, one per placeholder in template order.
         let arg_adt = self.adts.fmt_argument_adt().ok_or(BuildError::NoLangFn { expr: Some(e), name: "format_argument" })?;
-        let full = |_| malformed("the ground table is full");
-        let g_arg = self.ground.intern(PNode::Adt(arg_adt, List::EMPTY)).map_err(full)?;
+        let g_arg = self.ground.intern(PNode::Adt(arg_adt, List::EMPTY)).map_err(|_| malformed("the ground table is full"))?;
         let arg_repr = self.repr(g_arg).map_err(|error| Self::ty_err(e, error))?;
         let (stride, align) = self.size_align(arg_repr);
         let count = u32::try_from(uses_of.len()).map_err(|_| malformed("more `format_args!` placeholders than fit"))?;
@@ -224,7 +223,7 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             if abi != Abi::Rust {
                 return Err(unsupported(e, "an `rt::Argument` constructor not of the Rust ABI"));
             }
-            let targs = self.ground.intern_list(&[t]).map_err(full)?;
+            let targs = self.ground.intern_list(&[t]).map_err(|_| malformed("the ground table is full"))?;
             let pass = self.pass(g_ref, ref_repr, abi, Some(item))?;
             let rpass = self.pass(g_arg, arg_repr, abi, Some(item))?;
             let place = self.ref_place(Instance { item, args: targs });

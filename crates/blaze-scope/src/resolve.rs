@@ -1880,7 +1880,7 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
             wrapped.push_str("{");
             wrapped.push_str(text);
             wrapped.push_str("\n}");
-            let nested = blaze_file_items::nested::scan(&wrapped, alloc);
+            let nested = blaze_file_items::nested::scan(wrapped.as_str(), alloc);
             let plain = nested.end == blaze_file_items::nested::NestedEnd::Whole && nested.items.is_empty() && nested.calls.is_empty();
             if !plain {
                 note(ExpandNote::NotItems { macro_name: mac.name, message: made.outline.message(error) });

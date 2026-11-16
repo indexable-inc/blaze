@@ -20,6 +20,7 @@ use blaze_build_script::{
     Env,
     instr::OutputLimits,
     key::RunLimits,
+    host_tools::HostTool,
     native::Grant,
     outputs::{FileLimits, Outputs},
     toolchain::{CInputs, c_env, depfile_reads, headers_digest, map_paths},
@@ -45,6 +46,10 @@ pub struct NativeScript<'s> {
     pub env: &'s Env<'s>,
     /// More folders it reads: its dependencies' outputs.
     pub reads: &'s [&'s str],
+    /// The host tools it is granted (D71, [`blaze_build_script::host_tools::granted`]), each
+    /// `path` the resolved real path: started by a `PATH` of exactly their folders, read and
+    /// executed, their `reads` read-only. Empty for nearly every script.
+    pub host_tools: &'s [HostTool<'s>],
     pub limits: RunLimits,
     pub deadline: Duration,
 }
@@ -88,7 +93,7 @@ impl std::fmt::Display for NativeScriptError {
 impl std::error::Error for NativeScriptError {}
 
 /// The bytes of every file under `folder`, sorted by path, through the effect layer.
-fn files_under(folder: &str) -> Result<std::vec::Vec<(std::string::String, std::vec::Vec<u8>)>, NativeScriptError> {
+pub(crate) fn files_under(folder: &str) -> Result<std::vec::Vec<(std::string::String, std::vec::Vec<u8>)>, NativeScriptError> {
     let failed = |why: std::string::String| NativeScriptError::Files { folder: folder.to_owned(), why };
     let (io, root) = native_world(Path::new(folder)).map_err(|e| failed(e.to_string()))?;
     let cx = io.cx(Duration::from_secs(60), TASK_FRAME).map_err(|_| failed("its world stopped".to_owned()))?;
@@ -106,7 +111,7 @@ fn files_under(folder: &str) -> Result<std::vec::Vec<(std::string::String, std::
     Ok(out)
 }
 
-fn remove(folder: &str, name: &str) -> Result<(), NativeScriptError> {
+pub(crate) fn remove(folder: &str, name: &str) -> Result<(), NativeScriptError> {
     let failed = |why: std::string::String| NativeScriptError::Files { folder: folder.to_owned(), why };
     let (io, root) = native_world(Path::new(folder)).map_err(|e| failed(e.to_string()))?;
     let cx = io.cx(Duration::from_secs(60), TASK_FRAME).map_err(|_| failed("its world stopped".to_owned()))?;
@@ -145,7 +150,25 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
     for (name, value) in toolchain.iter() {
         vars.push((name.as_str(), value.as_str()));
     }
-    vars.push(("PATH", ""));
+    // `PATH`: empty, or exactly the folders of the granted host tools (D71: sha3-asm starts
+    // `Command::new("perl")` and reads no variable naming it, so the search must find the
+    // granted path; any other program the search finds there is not granted and the sandbox
+    // refuses its start).
+    let mut path: AString<'a> = String::new_in(alloc);
+    let mut folders: AVec<'a, &str> = Vec::new_in(alloc);
+    for tool in script.host_tools {
+        let (folder, _) = tool.path.rsplit_once('/').unwrap_or(("", tool.path));
+        folders.push(if folder.is_empty() { "/" } else { folder });
+    }
+    folders.sort_unstable();
+    folders.dedup();
+    for (at, folder) in folders.iter().enumerate() {
+        if at > 0 {
+            path.push(':');
+        }
+        path.push_str(folder);
+    }
+    vars.push(("PATH", path.as_str()));
     vars.push(("TMPDIR", c.out_dir));
 
     let mut exec: AVec<'a, AString<'a>> = Vec::new_in(alloc);
@@ -160,11 +183,19 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
         for path in exec.iter() {
             out.push(path.as_str());
         }
+        for tool in script.host_tools {
+            out.push(tool.path);
+        }
         out
     };
     let mut reads: AVec<'a, &str> = Vec::new_in(alloc);
     reads.extend_from_slice(&[c.package, c.shelf.dir, c.sysroot]);
     reads.extend_from_slice(script.reads);
+    for tool in script.host_tools {
+        for folder in tool.read_folders() {
+            reads.push(folder);
+        }
+    }
     let writes = [c.out_dir];
     let started = Instant::now();
     let ran = run(

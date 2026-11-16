@@ -15,12 +15,15 @@ use blaze_build_script::{
     Env, Outputs,
     env::{DepMetadata, Given, PackageFacts},
     key::{CMode, RunLimits},
+    native::Runner,
     probe::Row,
+    toolchain::Mode,
 };
 use blaze_own::Alloc;
 use blaze_unit_graph::{Unit, UnitGraph, UnitId, UnitKind};
 
 use crate::{
+    native_unit::{NativeSetting, NativeUnitError, native_outputs, placed},
     script::{LoadedScript, ScriptError, ScriptRun, ScriptRuntime},
     script_sandbox::{Script, Tree, owned_env},
 };
@@ -34,6 +37,12 @@ pub struct Setting<'s> {
     /// The probe table's rows (`probe::pinned_rows`).
     pub table: Arc<Vec<Row>>,
     pub c_mode: CMode,
+    /// What the command asked for: with each script's closure, where it runs (D69 (3),
+    /// [`crate::native_unit::placed`]).
+    pub mode: Mode,
+    /// The pinned C toolchain and SDK native scripts run with; `None` where the command has
+    /// none (a native script is then refused by name, never run as wasm).
+    pub native: Option<NativeSetting<'s>>,
 }
 
 /// A script ready to run: its loaded module, its sandboxed inputs, its environment.
@@ -63,6 +72,8 @@ pub enum UnitScriptError {
     Dependency { package: String, dependency: String, links: String },
     /// The scripts' `links` inputs form a cycle through this script.
     LinksCycle { package: String },
+    /// A native script's run (D65): its setting, binary, key, record or run.
+    Native(NativeUnitError),
 }
 
 impl std::fmt::Display for UnitScriptError {
@@ -84,6 +95,7 @@ impl std::fmt::Display for UnitScriptError {
                 "the build script of {package} needs the metadata of {dependency} (`links = \"{links}\"`, its DEP_* variables), whose build script gave no outputs"
             ),
             UnitScriptError::LinksCycle { package } => write!(f, "the build script of {package} is in a cycle of `links` metadata"),
+            UnitScriptError::Native(error) => write!(f, "{error}"),
         }
     }
 }
@@ -91,14 +103,33 @@ impl std::fmt::Display for UnitScriptError {
 impl std::error::Error for UnitScriptError {}
 
 /// The module record (`<store>/build-script/modules/<key>`) of `name version` compiled with
-/// exactly `features`: the one whose identity names all three.
+/// exactly `features`: the one whose identity names all three. A native script's record (its
+/// identity has a `target` line, D69) is never it: that one holds `script.bin`, not a module.
 pub fn module_of(store: &Path, name: &str, version: &str, features: &[&str]) -> Option<PathBuf> {
+    module_where(store, name, version, features, None)
+}
+
+/// The native binary record (`<store>/build-script/modules/<key>`, holding `script.bin`) of
+/// `name version` built for `host` with exactly `features` (D69: the interim builder's
+/// `native` mode, whose identity adds `target <host>`).
+pub fn module_of_native(store: &Path, name: &str, version: &str, features: &[&str], host: &str) -> Option<PathBuf> {
+    module_where(store, name, version, features, Some(host))
+}
+
+/// The record whose identity names `name`, `version`, `features` and, for `host`, `target
+/// <host>`; for `None`, one with no `target` line (a wasm module).
+fn module_where(store: &Path, name: &str, version: &str, features: &[&str], host: Option<&str>) -> Option<PathBuf> {
     let mut sorted = features.to_vec();
     sorted.sort_unstable();
     let lines = [format!("name {name}"), format!("version {version}"), format!("features {}", sorted.join(","))];
+    let target = host.map(|host| format!("target {host}"));
     for entry in std::fs::read_dir(store.join("build-script/modules")).ok()?.flatten() {
         let identity = std::fs::read_to_string(entry.path().join("identity")).unwrap_or_default();
-        if lines.iter().all(|want| identity.lines().any(|l| l == want)) {
+        let runner_fits = match &target {
+            Some(want) => identity.lines().any(|l| l == want),
+            None => !identity.lines().any(|l| l.starts_with("target ")),
+        };
+        if runner_fits && lines.iter().all(|want| identity.lines().any(|l| l == want)) {
             return Some(entry.path());
         }
     }
@@ -175,7 +206,10 @@ pub fn prepare<'a>(
     Ok(Prepared { loaded, script, env })
 }
 
-/// `script`'s outputs, from its record when one answers, else run and kept.
+/// `script`'s outputs, from its record when one answers, else run and kept: as wasm, or native
+/// when [`placed`] says so for the setting's mode (D65, D69). The choice is made here, before
+/// anything runs, and is in the run's key; a failure either way is returned, never tried the
+/// other way (rule 3).
 #[allow(clippy::too_many_arguments)]
 pub fn outputs<'a>(
     runtime: &ScriptRuntime,
@@ -187,8 +221,20 @@ pub fn outputs<'a>(
     deps: &[DepMetadata<'_>],
     alloc: Alloc<'a>,
 ) -> Result<ScriptRun<'a>, UnitScriptError> {
-    let prepared = prepare(runtime, setting, graph, script, tree, folder, deps, alloc)?;
-    runtime.run(&prepared.loaded, prepared.script, &prepared.env, alloc).map_err(UnitScriptError::Script)
+    let unit = graph.units.get(script.index()).ok_or(UnitScriptError::NotAScript { unit: script })?;
+    if unit.kind != UnitKind::BuildScript {
+        return Err(UnitScriptError::NotAScript { unit: script });
+    }
+    match placed(graph, script, setting.mode, alloc) {
+        Runner::Wasm => {
+            let prepared = prepare(runtime, setting, graph, script, tree, folder, deps, alloc)?;
+            runtime.run(&prepared.loaded, prepared.script, &prepared.env, alloc).map_err(UnitScriptError::Script)
+        }
+        Runner::Native { because } => {
+            let serves = served(graph, script).ok_or_else(|| UnitScriptError::ServesNothing { package: package(unit) })?;
+            native_outputs(runtime, setting, graph, script, serves, because, tree, folder, deps, alloc).map_err(UnitScriptError::Native)
+        }
+    }
 }
 
 /// The build-script units whose metadata `script` is given: for each direct dependency of the

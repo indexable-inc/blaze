@@ -15,6 +15,10 @@ use blaze_memchr::{memchr, memchr2, memmem, memrchr};
 use crate::Cpu;
 use crate::classify::{RUN_DIGITS, RUN_IDENT, RUN_SPACE, Runs, select_at};
 
+/// The first-byte table `advance_token` dispatches through, and the `char` match it replaced
+/// (the tests' reference).
+pub(crate) mod first;
+
 /// A token: its kind and its length in bytes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Token {
@@ -380,108 +384,19 @@ impl<'a> Cursor<'a> {
         }
     }
 
-    /// Parses a token from the input string (rustc_lexer's `advance_token`).
+    /// Parses a token from the input string (rustc_lexer's `advance_token`): by its first byte
+    /// through `first::FIRST`, a table load and a jump; only a byte of `0x80` and above decodes
+    /// a `char` (`first.rs` says which of the Reference's rules that path keeps). The `char`
+    /// match this replaced is `advance_token_reference`, which the tests compare it against.
+    #[inline]
     pub(crate) fn advance_token(&mut self) -> Token {
-        let Some(first_char) = self.bump() else {
+        let Some(&byte) = self.bytes.get(self.pos) else {
             return Token { kind: TokenKind::Eof, len: 0 };
         };
-        let kind = match first_char {
-            c if self.frontmatter && is_whitespace(c) => {
-                let mut last = first_char;
-                while is_whitespace(self.first()) {
-                    let Some(c) = self.bump() else {
-                        break;
-                    };
-                    last = c;
-                }
-                if last != '\n' && self.starts_with(b"---") {
-                    self.bump();
-                    self.frontmatter(true)
-                } else {
-                    TokenKind::Whitespace
-                }
-            }
-            '-' if self.frontmatter && self.starts_with(b"--") => self.frontmatter(false),
-            '/' => match self.first() {
-                '/' => self.line_comment(),
-                '*' => self.block_comment(),
-                _ => TokenKind::Slash,
-            },
-            c if is_whitespace(c) => self.whitespace(),
-            'r' => match (self.first(), self.second()) {
-                ('#', c1) if is_id_start(c1) => {
-                    self.bump();
-                    self.eat_identifier();
-                    TokenKind::RawIdent
-                }
-                ('#', _) | ('"', _) => {
-                    let n_hashes = self.raw_double_quoted_string();
-                    let suffix_start = self.pos_within_token();
-                    if n_hashes.is_some() {
-                        self.eat_identifier();
-                    }
-                    TokenKind::Literal { kind: LiteralKind::RawStr { n_hashes }, suffix_start }
-                }
-                _ => self.ident_or_unknown_prefix(),
-            },
-            'k' => match (self.first(), self.second()) {
-                ('#', c1) if is_id_start(c1) => {
-                    self.bump();
-                    self.eat_identifier();
-                    TokenKind::ForcedKeywordIdent
-                }
-                _ => self.ident_or_unknown_prefix(),
-            },
-            'b' => self.c_or_byte_string(Prefix::Byte),
-            'c' => self.c_or_byte_string(Prefix::C),
-            c if is_id_start(c) => self.ident_or_unknown_prefix(),
-            c @ '0'..='9' => {
-                let kind = self.number(c);
-                let suffix_start = self.pos_within_token();
-                self.eat_identifier();
-                TokenKind::Literal { kind, suffix_start }
-            }
-            '#' if matches!(self.first(), '"' | '#') => {
-                self.bump();
-                TokenKind::GuardedStrPrefix
-            }
-            ';' => TokenKind::Semi,
-            ',' => TokenKind::Comma,
-            '.' => TokenKind::Dot,
-            '(' => TokenKind::OpenParen,
-            ')' => TokenKind::CloseParen,
-            '{' => TokenKind::OpenBrace,
-            '}' => TokenKind::CloseBrace,
-            '[' => TokenKind::OpenBracket,
-            ']' => TokenKind::CloseBracket,
-            '@' => TokenKind::At,
-            '#' => TokenKind::Pound,
-            '~' => TokenKind::Tilde,
-            '?' => TokenKind::Question,
-            ':' => TokenKind::Colon,
-            '$' => TokenKind::Dollar,
-            '=' => TokenKind::Eq,
-            '!' => TokenKind::Bang,
-            '<' => TokenKind::Lt,
-            '>' => TokenKind::Gt,
-            '-' => TokenKind::Minus,
-            '&' => TokenKind::And,
-            '|' => TokenKind::Or,
-            '+' => TokenKind::Plus,
-            '*' => TokenKind::Star,
-            '^' => TokenKind::Caret,
-            '%' => TokenKind::Percent,
-            '\'' => self.lifetime_or_char(),
-            '"' => {
-                let terminated = self.double_quoted_string();
-                let suffix_start = self.pos_within_token();
-                if terminated {
-                    self.eat_identifier();
-                }
-                TokenKind::Literal { kind: LiteralKind::Str { terminated }, suffix_start }
-            }
-            c if is_emoji(c) => self.invalid_ident(),
-            _ => TokenKind::Unknown,
+        let fronted = if self.frontmatter { self.frontmatter_start() } else { None };
+        let kind = match fronted {
+            Some(kind) => kind,
+            None => self.by_first_byte(byte),
         };
         if self.frontmatter && kind != TokenKind::Whitespace {
             self.frontmatter = false;
@@ -533,22 +448,25 @@ impl<'a> Cursor<'a> {
         TokenKind::Frontmatter { has_invalid_preceding_whitespace, invalid_infostring }
     }
 
+    /// After the first `/`, with a second `/` at the cursor. Lookahead by byte: `!` and `/` are
+    /// ASCII, and no byte of a multi-byte character equals either.
     fn line_comment(&mut self) -> TokenKind {
-        self.bump();
-        let doc_style = match self.first() {
-            '!' => Some(DocStyle::Inner),
-            '/' if self.second() != '/' => Some(DocStyle::Outer),
+        self.pos += 1;
+        let doc_style = match (self.bytes.get(self.pos), self.bytes.get(self.pos + 1)) {
+            (Some(b'!'), _) => Some(DocStyle::Inner),
+            (Some(b'/'), next) if next != Some(&b'/') => Some(DocStyle::Outer),
             _ => None,
         };
         self.eat_until(b'\n');
         TokenKind::LineComment { doc_style }
     }
 
+    /// After the `/`, with a `*` at the cursor. Lookahead by byte, as in `line_comment`.
     fn block_comment(&mut self) -> TokenKind {
-        self.bump();
-        let doc_style = match self.first() {
-            '!' => Some(DocStyle::Inner),
-            '*' if !matches!(self.second(), '*' | '/') => Some(DocStyle::Outer),
+        self.pos += 1;
+        let doc_style = match (self.bytes.get(self.pos), self.bytes.get(self.pos + 1)) {
+            (Some(b'!'), _) => Some(DocStyle::Inner),
+            (Some(b'*'), next) if !matches!(next, Some(b'*' | b'/')) => Some(DocStyle::Outer),
             _ => None,
         };
         let (end, terminated) = block_comment_end(self.bytes, self.pos);
@@ -575,9 +493,11 @@ impl<'a> Cursor<'a> {
 
     fn ident_or_unknown_prefix(&mut self) -> TokenKind {
         self.eat_id_continue();
-        match self.first() {
-            '#' | '"' | '\'' => TokenKind::UnknownPrefix,
-            c if is_emoji(c) => self.invalid_ident(),
+        // By byte: the three prefix quotes are ASCII, and only a non-ASCII character can be an
+        // emoji, so only a byte of `0x80` and above decodes.
+        match self.bytes.get(self.pos) {
+            Some(b'#' | b'"' | b'\'') => TokenKind::UnknownPrefix,
+            Some(&byte) if byte >= 0x80 && is_emoji(self.first()) => self.invalid_ident(),
             _ => TokenKind::Ident,
         }
     }

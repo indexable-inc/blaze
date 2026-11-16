@@ -240,6 +240,13 @@ impl<'n> Locals<'n> {
         Locals { frame, bodies: HashMap::new_in(frame), heads: HashMap::new_in(frame) }
     }
 
+    /// A copy of `text` kept in the command's frame (an anonymous constant's item text,
+    /// [`super::anon`]: a head's text lives as long as the names do).
+    pub(super) fn keep_text(&self, text: &str) -> &'n str {
+        let frame = self.frame;
+        frame.alloc_str(text)
+    }
+
     /// How many bodies kept their local items.
     pub fn kept(&self) -> usize {
         self.bodies.len()

@@ -1607,8 +1607,10 @@ E0599, 151 E0277):
   every inherent impl the front end could not read by shape. FIXED in rules/lit_path.rs: a
   parameter has no inherent items and the world is not asked; after: "p4: clean".
 - ALSO in `assoc_value`: two tiers, a parameter's bounds before the traits in scope (fixture
-  suite/self_paths.rs `a_parameters_bound_comes_before_the_traits_in_scope`; NOT shown failing
-  without the change: owed). blaze-typeck "145 passed, 0 failed" (one new fixture ignored).
+  suite/self_paths.rs `a_parameters_bound_comes_before_the_traits_in_scope`; with the tiers
+  merged it says "want bool, got {error}; diagnostics: want [], got [(AmbiguousMethod, 0)]").
+  Four new fixtures (`Fx::trait_const` is new): a bound's constant, a blanket impl's, bounds
+  first, two bounds E0034.
 - THE FRONT END'S, open: every body naming a TRAIT's constant says "p1: diagnostics
   [(NoMethod, Range { start: 27, end: 36 }, \"found Some(\\\"Param(0)\\\"), expected None ..",
   the census's line. front2/world_items.rs `assoc_item` for a trait reads `t.fns` and
@@ -1617,13 +1619,11 @@ E0599, 151 E0277):
   impl's `consts`) and `AssocKind::Const` from `assoc_item`. Probably also tempo-front-5's
   "55 NEW diag E0576" at `<X as SolCall>::SELECTOR` (not reduced). The names in the test's
   `OWED` list assert today's line and must be removed as the answer arrives.
-- OPEN, the checker's or the solver's: the ignored fixture
-  `a_parameters_constant_comes_from_a_blanket_impl`: `Q::Z` through `impl<T> Zst for T`
-  says "want bool, got {error}; diagnostics: want [], got [(NoMethod, 0)]" although the
-  fixture's `impls_of` lists the blanket impl: `may_hold(Zst for Param(0))` is answered no.
-  Not found why (start: blaze-solve trait_goals.rs `assemble_impls` and prefilter.rs's
-  `Param` fingerprint on the goal side; whether the fixture gives the impl's `T: Sized`
-  something the env lacks). This is `T::IS_ZST`'s second blocker once the constants answer.
+- The checker and solver already hold `Q: Zst` through `impl<T> Zst for T` (fixture
+  `a_parameters_constant_comes_from_a_blanket_impl` passes): once the front end answers a
+  trait's constants, `T::IS_ZST` needs nothing more from the checker that is known today.
+  The fixture world answers a trait constant where the real world does not yet: the fixtures
+  are ahead of the front end here, by intent, and front2_params.rs is the real measure.
 - NOT STARTED: (D) `variant_value`, "Sort { node: 128 }", `S::View<'_, T>`, `u24`; bstd's
   `self.code.hash(state)` on `ContentId`.
 

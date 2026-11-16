@@ -80,7 +80,7 @@ fn x_rungs() -> Vec<String> {
         let entry = entry.expect("a directory entry");
         let name = entry.file_name().into_string().expect("a UTF-8 rung name");
         let dir = entry.path();
-        if !name.starts_with("x-") || !dir.is_dir() {
+        if !(name.starts_with("x-") || name.starts_with("x0-")) || !dir.is_dir() {
             continue;
         }
         if ["Cargo.toml", "expected", "src/main.rs"].iter().all(|f| dir.join(f).is_file()) {
@@ -147,6 +147,9 @@ fn every_x_rung_runs_right() {
     let (mut pass, mut refused, mut panicked) = (0u32, 0u32, 0u32);
     for rung in x_rungs() {
         eprintln!("front2_rungs: running {rung}");
+        // `x0-*` are the runnable twins (no_core, edition 2024, success is status 42);
+        // `x-*` the same checks on the blaze edition over the real `core` (success is 0).
+        let family = if rung.starts_with("x0-") { "twin" } else { "core" };
         let line = match run_one(&rung) {
             Verdict::Pass => {
                 pass += 1;
@@ -172,7 +175,7 @@ fn every_x_rung_runs_right() {
                 line
             }
         };
-        lines.push(line);
+        lines.push(format!("[{family}] {line}"));
     }
     let total = lines.len();
     let shown = format!(

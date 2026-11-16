@@ -425,7 +425,34 @@ impl Plan<'_> {
             argv.push("--features".into());
             argv.push(features.join(",").into());
         }
-        let argv = match sandboxed(argv.clone(), &self.work) {
+        // A native build (D65) runs under the deny-by-default profile: reads only of its own
+        // sources, its dependencies' (vendored), the pinned Rust toolchain, the shelf's clang
+        // and the SDK; writes only of its own folders. The wasm build keeps the builder's
+        // write-only confinement (its std copy and shim are read from the whole work folder).
+        let sandbox = match native {
+            None => sandboxed(argv.clone(), &self.work),
+            Some(native) => {
+                let target = self.work.join("bs-target");
+                let (cargo_home, tmp) = (self.work.join("cargo-home"), self.work.join("tmp"));
+                for dir in [&target, &cargo_home, &tmp] {
+                    std::fs::create_dir_all(dir).map_err(io(dir))?;
+                }
+                let own_source = match origin {
+                    Origin::Path { dir, .. } | Origin::Git { dir, .. } => Some(dir.as_path()),
+                    Origin::Registry { .. } => None,
+                };
+                let vendor = self.work.join("vendor");
+                let mut reads: Vec<&Path> = vec![vendor.as_path(), self.tool.sysroot.as_path(), native.clang.as_path(), native.sdk.as_path()];
+                reads.extend(own_source);
+                let shelf_bin = native.clang.join("bin");
+                let toolchain_bin = self.tool.sysroot.join("bin");
+                let writes: [&Path; 4] = [ws.as_path(), target.as_path(), cargo_home.as_path(), tmp.as_path()];
+                let exec_under: [&Path; 3] = [toolchain_bin.as_path(), shelf_bin.as_path(), target.as_path()];
+                let builder = NativeBuilder { cargo: Path::new(&self.tool.cargo()).to_owned(), reads: &reads, writes: &writes, exec_under: &exec_under };
+                builder.profile().and_then(|profile| native_sandboxed(argv.clone(), profile))
+            }
+        };
+        let argv = match sandbox {
             Ok(argv) => argv,
             Err(why) if self.args.unsandboxed_build_scripts => {
                 println!("{SCRIPT}: UNSANDBOXED: the build of {} {}'s script runs with no sandbox ({why}), as the input asked", wanted.name, wanted.version);
@@ -566,4 +593,105 @@ pub(super) fn main_with(text: &str) -> i32 {
         }
     }
     i32::from(failed > 0)
+}
+
+/// The confinement of a native script's build (D65, build-scripts.md "Runner 11"): what
+/// `cargo` may read, write and start. Its profile is blaze-build-script's deny-by-default one
+/// ([`blaze_build_script::native::seatbelt_with`], the profile a native script runs under), so
+/// there is one home for it: nothing outside the grant is read, the machine's compilers and
+/// `PATH` included; no network.
+struct NativeBuilder<'p> {
+    /// The pinned toolchain's `cargo`: the program `sandbox-exec` starts.
+    cargo: PathBuf,
+    /// Read with what is under them: the vendored sources, the script's own source folder,
+    /// the pinned Rust toolchain, the shelf's clang, the SDK.
+    reads: &'p [&'p Path],
+    /// Written (and read): the script's workspace, its target folder, `CARGO_HOME`, `TMPDIR`.
+    writes: &'p [&'p Path],
+    /// Any program under them may be started: the toolchain's and the shelf's `bin` (rustc,
+    /// the linking clang, `ld64.lld`) and the target folder (the build scripts and proc macros
+    /// of the script's build-dependencies cargo has just built).
+    exec_under: &'p [&'p Path],
+}
+
+/// `path`'s real path as text: Seatbelt matches resolved paths.
+fn real_text(path: &Path) -> Result<String, String> {
+    let real = std::fs::canonicalize(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    real.to_str().map(str::to_owned).ok_or_else(|| format!("{}: not UTF-8, which a Seatbelt profile cannot hold", real.display()))
+}
+
+impl NativeBuilder<'_> {
+    /// The Seatbelt profile's text; every path resolved first.
+    fn profile(&self) -> Result<String, String> {
+        let program = real_text(&self.cargo)?;
+        let all = |paths: &[&Path]| paths.iter().map(|p| real_text(p)).collect::<Result<Vec<String>, String>>();
+        let (reads, writes, exec_under) = (all(self.reads)?, all(self.writes)?, all(self.exec_under)?);
+        let refs = |list: &[String]| list.iter().map(String::as_str).collect::<Vec<&str>>();
+        let (reads, writes, exec_under) = (refs(&reads), refs(&writes), refs(&exec_under));
+        let grant = blaze_build_script::native::Grant { program: &program, exec: &[], read: &reads, write: &writes };
+        let text = blaze_build_script::native::seatbelt_with(&grant, &exec_under, blaze_own::Alloc::global()).map_err(|e| e.to_string())?;
+        Ok(text.as_str().to_owned())
+    }
+}
+
+/// The command that runs `argv` under `profile`. macOS only: Linux has no pinned sysroot, so no
+/// native script is built there yet (D69).
+fn native_sandboxed(argv: Vec<OsString>, profile: String) -> Result<Vec<OsString>, String> {
+    if !cfg!(target_os = "macos") {
+        return Err("a native build script is built only on macOS for now (D69: no Linux sysroot is pinned)".to_owned());
+    }
+    let exec = Path::new("/usr/bin/sandbox-exec");
+    if !exec.exists() {
+        return Err("/usr/bin/sandbox-exec is missing".to_owned());
+    }
+    let mut out = vec![exec.as_os_str().to_owned(), "-p".into(), profile.into()];
+    out.extend(argv);
+    Ok(out)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod native_builder_tests {
+    use std::{path::Path, process::Command};
+
+    use super::NativeBuilder;
+
+    /// What `/bin/cat <file>` printed under `profile`, or its error.
+    fn cat_under(profile: &str, file: &Path) -> Result<String, String> {
+        let out = Command::new("/usr/bin/sandbox-exec").args(["-p", profile, "/bin/cat"]).arg(file).output().map_err(|e| e.to_string())?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).into_owned())
+        }
+    }
+
+    /// The native builder's profile denies a read of a canary outside its grant, where the
+    /// builder's old write-only profile (`seatbelt(work)`, `(allow default)`) let it through:
+    /// the planted control that the canary is readable at all. Inside the grant the same
+    /// program reads. Prints "native builder: inside: ok | canary: denied (..) | old profile:
+    /// canary read".
+    #[test]
+    fn the_native_builders_profile_denies_a_read_outside_its_grant() {
+        let root = std::env::temp_dir().join(format!("blaze-native-builder-{}", std::process::id()));
+        _ = std::fs::remove_dir_all(&root);
+        for dir in ["work/in", "work/out", "outside"] {
+            std::fs::create_dir_all(root.join(dir)).expect("a test folder");
+        }
+        let root = root.canonicalize().expect("the folder's real path");
+        std::fs::write(root.join("work/in/source.rs"), b"inside").expect("a granted file");
+        std::fs::write(root.join("outside/canary.txt"), b"canary").expect("the canary");
+        let (inside, out, canary) = (root.join("work/in"), root.join("work/out"), root.join("outside/canary.txt"));
+        let (reads, writes): ([&Path; 1], [&Path; 1]) = ([inside.as_path()], [out.as_path()]);
+        let builder = NativeBuilder { cargo: "/bin/cat".into(), reads: &reads, writes: &writes, exec_under: &[] };
+        let profile = builder.profile().expect("the profile");
+
+        let read_inside = cat_under(&profile, &root.join("work/in/source.rs"));
+        let read_canary = cat_under(&profile, &canary);
+        let old = cat_under(&super::super::seatbelt(&root.join("work")), &canary);
+        println!("native builder: inside: {read_inside:?} | canary: {read_canary:?} | old profile: {old:?}");
+        assert_eq!(read_inside.as_deref(), Ok("inside"));
+        assert!(read_canary.as_ref().is_err_and(|e| e.contains("Operation not permitted")), "canary: {read_canary:?}");
+        assert_eq!(old.as_deref(), Ok("canary"), "the planted control: the old profile reads the canary");
+        _ = std::fs::remove_dir_all(&root);
+    }
 }

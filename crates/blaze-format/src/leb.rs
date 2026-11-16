@@ -15,7 +15,8 @@
 //! BMI2 `pext`, which is slow on AMD before Zen 3). The encode is the same steps backwards and
 //! one 8-byte store. docs/v2/plan/design/data.md gives the bound.
 
-use core::{alloc::Allocator, fmt};
+use core::alloc::Allocator;
+use core::fmt;
 
 /// The most bytes a 64-bit value takes.
 pub const MAX_LEN: usize = 10;
@@ -179,7 +180,7 @@ fn append<B: Bytes>(out: &mut B, bytes: &[u8; MAX_LEN], len: usize) {
 }
 
 #[inline]
-fn put_u64<B: Bytes>(out: &mut B, value: u64) {
+fn push_u64<B: Bytes>(out: &mut B, value: u64) {
     if value < 0x80 {
         out.push_byte(value as u8);
         return;
@@ -189,7 +190,7 @@ fn put_u64<B: Bytes>(out: &mut B, value: u64) {
 }
 
 #[inline]
-fn put_i64<B: Bytes>(out: &mut B, value: i64) {
+fn push_i64<B: Bytes>(out: &mut B, value: i64) {
     if (-64..64).contains(&value) {
         out.push_byte(value as u8 & 0x7f);
         return;
@@ -203,7 +204,7 @@ fn put_i64<B: Bytes>(out: &mut B, value: i64) {
 // [`write_u64_in`].
 #[inline]
 pub fn write_u64(out: &mut Vec<u8>, value: u64) {
-    put_u64(out, value);
+    push_u64(out, value);
 }
 
 /// Appends `value` signed.
@@ -211,21 +212,21 @@ pub fn write_u64(out: &mut Vec<u8>, value: u64) {
 // [`write_i64_in`].
 #[inline]
 pub fn write_i64(out: &mut Vec<u8>, value: i64) {
-    put_i64(out, value);
+    push_i64(out, value);
 }
 
 /// Appends `value` unsigned to `out`, a vector in the caller's allocator: the same bytes as
 /// [`write_u64`].
 #[inline]
 pub fn write_u64_in<A: Allocator>(out: &mut blaze_own::Vec<u8, A>, value: u64) {
-    put_u64(out, value);
+    push_u64(out, value);
 }
 
 /// Appends `value` signed to `out`, a vector in the caller's allocator: the same bytes as
 /// [`write_i64`].
 #[inline]
 pub fn write_i64_in<A: Allocator>(out: &mut blaze_own::Vec<u8, A>, value: i64) {
-    put_i64(out, value);
+    push_i64(out, value);
 }
 
 /// Writes `value` unsigned at the start of `place`, touching only the bytes it takes, and says

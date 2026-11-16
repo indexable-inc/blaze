@@ -44,6 +44,7 @@ mod procs;
 mod props;
 mod records;
 mod rules;
+mod tests_record;
 
 pub(crate) type N = &'static str;
 

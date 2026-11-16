@@ -11,9 +11,10 @@ use std::{path::Path, process::ExitCode, time::Duration};
 
 use blaze_build_script::{
     env::{Given, PackageFacts},
-    key::{CMode, KeyInputs, RunLimits, RunnerKey, base},
+    host_tools,
+    key::{CMode, HostToolKey, KeyInputs, RunLimits, RunnerKey, base},
     probe::Table,
-    toolchain::{CInputs, Shelf},
+    toolchain::{CInputs, PIN, Shelf},
 };
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_proc_macro::{
@@ -87,19 +88,43 @@ fn main() -> ExitCode {
             None => blaze_unit_graph::CfgAtom::flag(n, alloc),
         })
         .collect();
-    let given = Given { package, folder: "", features: &[], target_cfg: &cfg, target: TARGET, host: TARGET, deps: &[] };
+    // The script's features: `BLAZE_FEATURES` (comma-separated, as the unit has them: tempo's
+    // zstd-sys has more than `[]`), else none. An example's input, not the real path's: there
+    // the unit's own features are given (script_unit's `native_outputs`).
+    let features_text = std::env::var("BLAZE_FEATURES").unwrap_or_default();
+    let mut feature_list: std::vec::Vec<&str> = features_text.split(',').filter(|f| !f.is_empty()).collect();
+    feature_list.sort_unstable();
+    feature_list.dedup();
+    let features: std::vec::Vec<blaze_unit_graph::Text<'_>> = feature_list.iter().map(|f| blaze_unit_graph::Text::from_str_in(f, alloc)).collect();
+    let given = Given { package, folder: "", features: &features, target_cfg: &cfg, target: TARGET, host: TARGET, deps: &[] };
     let env = blaze_build_script::env(&given, alloc);
+    // D71: the host tools the pin table grants this package (sha3-asm: perl), each by its
+    // binary's digest in the key.
+    let table_tools = host_tools::host_tools(PIN, TARGET, alloc).unwrap_or_else(|e| panic!("{e}"));
+    let tools = host_tools::granted(&table_tools, name, alloc);
+    let tool_keys: std::vec::Vec<HostToolKey<'_>> = tools
+        .iter()
+        .map(|tool| {
+            let (dir, file) = tool.path.rsplit_once('/').expect("an absolute tool path");
+            let mut sha = blaze_sha256::Sha256::new();
+            sha.update(&read(dir, file));
+            HostToolKey { name: tool.name, digest: sha.finish() }
+        })
+        .collect();
     let inputs = KeyInputs {
         module,
         env: &env,
         answers: Table::EMPTY.id(),
         c_mode: CMode::Built,
         limits: RunLimits::STANDARD,
-        runner: RunnerKey::Native { compiler, target: TARGET, sysroot: &sysroot_key },
+        runner: RunnerKey::Native { compiler, target: TARGET, sysroot: &sysroot_key, host_tools: &tool_keys },
     };
     let mut scratch: AVec<'_, u8> = Vec::new_in(alloc);
     let key = base(&inputs, &mut scratch);
-    println!("key {} (native, {TARGET}, {sysroot_key}, compiler {})", hex(&key.0), hex(&compiler));
+    println!("key {} (native, {TARGET}, {sysroot_key}, compiler {}, features {feature_list:?})", hex(&key.0), hex(&compiler));
+    for tool in tool_keys.iter() {
+        println!("host tool {} granted (D71), binary sha256 {}; the record is marked {}", tool.name, hex(&tool.digest), host_tools::MARK);
+    }
 
     let mut records: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
     for (pass, package_dir, out_dir) in [("A", pkg_a, out_a), ("B", pkg_b, out_b)] {
@@ -111,7 +136,7 @@ fn main() -> ExitCode {
             package_name: &format!("{name}-{version}"),
             macos_min: "11.0",
         };
-        let script = NativeScript { program: script, c, env: &env, reads: &[], limits: RunLimits::STANDARD, deadline: Duration::from_secs(600) };
+        let script = NativeScript { program: script, c, env: &env, reads: &[], host_tools: &tools, limits: RunLimits::STANDARD, deadline: Duration::from_secs(600) };
         let ran = match run_script(&script, alloc) {
             Ok(ran) => ran,
             Err(error) => {

@@ -281,7 +281,7 @@ fn ranges_are_rustcs() {
 fn an_async_fn_returns_its_async_move_block() {
     let l = body("async fn af(x: u8) -> u8 { x }");
     let v = l.view();
-    let root = ExprId(v.head[crate::machine::head::ROOT]);
+    let root = ExprId(v.head[crate::columns::head::ROOT]);
     let Ok(Expr::Closure { row }) = v.expr(root) else { panic!("the root is an async block: {}", dump_of(&l)) };
     let c = Closure::decode(v.row(row).expect("the closure's row")).expect("a closure row");
     assert_eq!((c.kind, c.source, c.capture_by_value), (CoroutineKind::Async, CoroutineSource::Block, true), "{}", dump_of(&l));
@@ -294,8 +294,8 @@ fn an_async_fn_returns_its_async_move_block() {
     // The tail is the written `{ x }`.
     assert!(matches!(v.expr(tail), Ok(Expr::Block { tail: Some(_), .. })), "{}", dump_of(&l));
     // The head still says async, with the written return type.
-    assert_ne!(v.head[crate::machine::head::FLAGS] & crate::machine::sig::ASYNC, 0);
-    assert!(v.head_opt(crate::machine::head::TY).is_some());
+    assert_ne!(v.head[crate::columns::head::FLAGS] & crate::machine::sig::ASYNC, 0);
+    assert!(v.head_opt(crate::columns::head::TY).is_some());
 }
 
 /// `.await` is one node, in an async body only; an async fn's body is an `async move` block

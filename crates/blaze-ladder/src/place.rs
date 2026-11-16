@@ -15,7 +15,7 @@ use std::ffi::CString;
 use std::sync::Arc;
 
 use blaze_build::data::{DataError, StaticImage};
-use blaze_emit::{Code, Fixup, Reloc, RelocTo};
+use blaze_emit::{Code, Fixup, Reloc, RelocTo, Routine};
 use blaze_typeck::ItemKey;
 use blaze_launch::wire::{self, List, RecordId};
 use blaze_launch::{CodeId, Slot, Tier, Txn};
@@ -143,6 +143,9 @@ pub enum PlaceError {
     Edit(blaze_launch_rt::EditError),
     /// An outside symbol the program calls is not in this process.
     NoSymbol { name: Box<str, Global> },
+    /// A routine of the C library or the compiler runtime the code calls is not loaded in this
+    /// process: the routine and the library that exports it ([`routine_library`]).
+    NoRoutine { routine: Routine, library: &'static str },
     /// A literal word names a place the body's target table does not have.
     NoTarget { slot: u32, place: u32 },
     /// The entry's slot holds no code after the commit.
@@ -170,6 +173,11 @@ impl core::fmt::Display for PlaceError {
             PlaceError::NoSymbol { name } => {
                 write!(f, "the outside symbol `{name}` is not in this process (dlsym found nothing)")
             }
+            PlaceError::NoRoutine { routine, library } => write!(
+                f,
+                "the routine `{}` is not in this process: it comes from {library}, which the blaze process has not loaded (dlsym found nothing)",
+                routine.symbol()
+            ),
             PlaceError::NoTarget { slot, place } => {
                 write!(f, "slot {slot}: a literal word names reference {place}, which the body's table lacks")
             }
@@ -204,6 +212,34 @@ struct Table<'b> {
     vtables: Vtables<'b>,
     /// The first outside symbol that was not found, said after the edit fails.
     missing: Option<Box<str, Global>>,
+    /// The first routine that was not found, said after the edit fails.
+    missing_routine: Option<Routine>,
+}
+
+/// The library that exports `routine` on this host, named in [`PlaceError::NoRoutine`].
+/// macOS: libSystem re-exports all of them (checked with `dyld_info`). Linux: `memcpy` and
+/// kin are libc's, `fmod`/`fmodf` libm's, the `__*ti*` family libgcc_s's: the latter two are
+/// only found by `RTLD_DEFAULT` if the blaze process itself links them.
+fn routine_library(routine: Routine) -> &'static str {
+    if cfg!(target_os = "macos") {
+        return "libSystem.B.dylib";
+    }
+    match routine {
+        Routine::Memcpy | Routine::Memmove | Routine::Memset => "libc.so.6",
+        Routine::Fmod | Routine::Fmodf => "libm.so.6",
+        Routine::Udivti3
+        | Routine::Umodti3
+        | Routine::Divti3
+        | Routine::Modti3
+        | Routine::Floattidf
+        | Routine::Floatuntidf
+        | Routine::Floattisf
+        | Routine::Floatuntisf
+        | Routine::Fixdfti
+        | Routine::Fixunsdfti
+        | Routine::Fixsfti
+        | Routine::Fixunssfti => "libgcc_s.so.1",
+    }
 }
 
 /// The address of `name` in this process.
@@ -278,8 +314,9 @@ impl Records for Table<'_> {
                     match symbol(name) {
                         Some(at) => at,
                         None => {
-                            self.missing = Some(name.into());
-                            return Err(format!("the system routine `{name}` is not in this process"));
+                            self.missing_routine = Some(routine);
+                            let library = routine_library(routine);
+                            return Err(format!("the system routine `{name}` ({library}) is not in this process"));
                         }
                     }
                 }
@@ -393,12 +430,13 @@ pub fn place(bodies: &[Body], vtables: &[VtableImage], image: Option<(&StaticIma
             refs: List::of(&[]),
         });
     }
-    let mut table = Table { bodies, image, tls, vtables, missing: None };
+    let mut table = Table { bodies, image, tls, vtables, missing: None, missing_routine: None };
     // Not `together`: nothing runs before the commit, so no gate is needed.
     if let Err(error) = driver.edit(Txn(1), &binds, false, &mut table) {
-        return Err(match table.missing {
-            Some(name) => PlaceError::NoSymbol { name },
-            None => PlaceError::Edit(error),
+        return Err(match (table.missing_routine, table.missing) {
+            (Some(routine), _) => PlaceError::NoRoutine { routine, library: routine_library(routine) },
+            (None, Some(name)) => PlaceError::NoSymbol { name },
+            (None, None) => PlaceError::Edit(error),
         });
     }
     let shared = driver.shared();

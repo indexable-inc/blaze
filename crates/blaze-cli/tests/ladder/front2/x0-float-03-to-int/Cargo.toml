@@ -1,0 +1,4 @@
+[package]
+name = "ladder-x0-float-03-to-int"
+version = "0.1.0"
+edition = "2024"

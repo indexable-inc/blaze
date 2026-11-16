@@ -1025,6 +1025,21 @@ once; the plant `RanUnderCondition` (an asker served a fork it does not imply) i
       this (git stash is banned: check out the commit in a scratch worktree). Not done:
       `#[path]` absence (resolver probes go through `Recording` so they are recorded; untested),
       target roots, include!, build.rs, members; step 4.
+    - RUNNER 9 2026-11-16 (uncommitted; D70). Ids: blaze-cli fix.rs `Id`, a digest of the path,
+      the item's chain and text (the innermost outline item, read in `ITEM_GRAMMAR` for every
+      file so the id is text alone; a non-Rust file's item is its line), the code and the
+      item-relative range; alphabet `23456789abcdefghjkmnpqrstuvwxyz`, 5 shown, longer by the
+      shared prefix + 1 against its sorted neighbour. Views: blaze-report frame/plain.rs
+      (`--view person|agent|json`, default by the one terminal test in `command`). `--fix`:
+      main.rs `fix_then_check` (quiet check, `fix::apply`, the check again); writes through the
+      `fix::Writer` seam (`Atomic` = synced publish; `InPlace` the planted bug). DRIVE BUG
+      FIXED: a part whose record stood kept its findings' place from the last certificate, so
+      an edit above printed them at the old offset (request.rs merge: re-placed from
+      `part_locs`). FOUND, NOT FIXED: two unnamed `use` items share an item chain, so the
+      second's unresolved finding is placed at the first (names.rs `placed`, work.rs
+      `item_chain`; the property test draws one `use` until then). Unresolved-import fix: left;
+      the names world has no scope's names with their text (typeck.md owes the question).
+      `fix::checker_findings` waits for the TYPES stage (comment at main.rs `draw`).
 - Owed, not now: `run` after `check` writes its own certificate, because the command is in
   the key. That costs 3.5 ms against the second run's 1.0 ms on hello-world. A coarse proof
   covers all under it: `check`'s certificate should stand for `run`'s check part.

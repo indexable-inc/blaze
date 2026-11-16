@@ -167,6 +167,24 @@ pub fn intern_list(tys: &mut PortableTys<'_>, l: &[PTy]) -> Result<List, Why> {
 pub trait Heads {
     /// The value of the `usize` constant item `key` used as an array length, once evaluated.
     fn const_len(&self, key: LibKey) -> Option<u64>;
+    /// The value of the evaluated constant `key` (a constant item, or an anonymous constant's
+    /// need key) as bits in its own type's width; `None` until it is evaluated. By default
+    /// what [`Heads::const_len`] holds.
+    fn const_bits(&self, key: LibKey) -> Option<u128> {
+        self.const_len(key).map(u128::from)
+    }
+    /// Takes the anonymous constant `ask` to be made a head and evaluated
+    /// ([`super::anon`]); `false` where these heads have no evaluator behind them (the
+    /// default), and the expression stays the head's refusal.
+    fn ask_anon(&self, _ask: super::anon::Ask) -> bool {
+        false
+    }
+    /// Why the anonymous constant under need key `key` has no value (the evaluator's refusal,
+    /// as printed), once it was tried: the head that wrote it is then refused, naming the
+    /// expression and this reason, and only that head. `None`: not tried, or it has a value.
+    fn anon_failed(&self, _key: LibKey) -> Option<&str> {
+        None
+    }
     /// The ADT's type parameter count and each one's default (over the ADT's own parameters).
     fn adt_generics(&self, adt: LibKey) -> Option<(u32, &[Option<PTy>])>;
     /// The trait's generics (`Self` included) and its defaults, after `Self`.
@@ -493,34 +511,87 @@ impl<'b, 'n, H: Heads> Builder<'b, 'n, H> {
     /// ([`Why::NeedConst`] until then). Anything else (a type-relative `u32::MAX`, a const
     /// parameter, an expression) is [`Why::ConstPath`] naming the text.
     /// An array length's value from its written text (not `_`): an integer literal, or a
-    /// constant item's value ([`Builder::len_const`]).
+    /// constant's value at `usize` ([`Builder::end_value`]).
     pub(super) fn array_len(&self, env: &Env<'_>, text: &str, r: Range) -> Result<u128, Why> {
-        match usize_literal(text, r)? {
+        self.end_value(env, text, r, Some(PNode::Uint(tc::UintTy::Usize)))
+    }
+
+    /// Whether `text` is one token (a literal with its suffix, a name): an expression
+    /// (`1usize << 0`) is never read as a literal with a wrong suffix.
+    fn one_token(text: &str) -> bool {
+        !text.is_empty() && text.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    }
+
+    /// The value of a constant written where a head needs an unsigned value of type `ty` (an
+    /// array length, at `usize`; a pattern type's range end, at its base type): an integer
+    /// literal, or [`Builder::const_value_bits`]. `ty` is `None` where the type is not known:
+    /// then only a literal or a constant item's path has a value.
+    pub(super) fn end_value(&self, env: &Env<'_>, text: &str, r: Range, ty: Option<PNode>) -> Result<u128, Why> {
+        let text = text.trim();
+        let literal = if Self::one_token(text) { usize_literal(text, r)? } else { None };
+        match literal {
             Some(bits) => Ok(bits),
-            None => Ok(u128::from(self.len_const(env, text, r)?)),
+            None => {
+                let bits = self.const_value_bits(env, text, r, ty)?;
+                if ty == Some(PNode::Uint(tc::UintTy::Usize)) && bits > u128::from(u64::MAX) {
+                    return Err(program(format!("the constant `{text}` is past `usize` (64 bits here)"), r));
+                }
+                Ok(bits)
+            }
         }
     }
 
-    fn len_const(&self, env: &Env<'_>, text: &str, r: Range) -> Result<u64, Why> {
+    /// The value of the constant expression `text` of type `ty`, as bits in `ty`'s width (the
+    /// Reference, "Constant evaluation", "Const context"). A plain path the names library
+    /// resolves to a constant item is that item's value ([`Heads::const_bits`];
+    /// [`Why::NeedConst`] naming it until the driver's `eval_len` has evaluated it). Any other
+    /// expression (`u32::MAX`, `1 << 0`, `A + 1`, `size_of::<u64>()`, `<B4 as
+    /// Specifier>::BITS + 1`) is an ANONYMOUS constant ([`super::anon`]): asked of the heads
+    /// ([`Heads::ask_anon`]) and needed under its own key the same way, evaluated by the same
+    /// machine as a constant item's body. Not evaluated at the head, and refused by name:
+    /// an expression naming a generic parameter in scope or `Self` ("a constant expression
+    /// over a generic parameter": blaze-typeck's type form has no node for an unevaluated
+    /// expression), and one whose type is unknown or is not `bool`, `char` or an integer
+    /// ([`Why::ConstPath`] naming the text).
+    fn const_value_bits(&self, env: &Env<'_>, text: &str, r: Range, ty: Option<PNode>) -> Result<u128, Why> {
+        let text = text.trim();
         let other = || Why::ConstPath(Box::from(text), r);
         let (abs, rest) = match text.strip_prefix("::") {
             Some(rest) => (true, rest),
             None => (false, text),
         };
         let mut segs: Vec<&str, Global> = Vec::new_in(Global);
+        let mut plain = true;
         for s in rest.split("::") {
             let s = s.trim();
             let ident = s.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_') && s.chars().all(|c| c.is_alphanumeric() || c == '_');
             if !ident {
-                return Err(other());
+                plain = false;
+                break;
             }
             segs.push(s);
         }
-        let found = self.resolver.path(env.module, abs, &segs, Ns::Value).map_err(|e| Why::Resolve(e, r))?;
-        if found.kind != Kind::Const || found.consumed as usize != segs.len() {
-            return Err(other());
+        if super::anon::mentions(text, env.params) {
+            return Err(Why::Unsupported("a constant expression over a generic parameter", r));
         }
-        self.heads.const_len(found.key).ok_or(Why::NeedConst(found.key, r))
+        if plain {
+            let found = self.resolver.path(env.module, abs, &segs, Ns::Value).map_err(|e| Why::Resolve(e, r))?;
+            if found.kind == Kind::Const && found.consumed as usize == segs.len() {
+                return self.heads.const_bits(found.key).ok_or(Why::NeedConst(found.key, r));
+            }
+        }
+        let Some(ask) = ty.and_then(|ty| super::anon::Ask::of(env.module, ty, text)) else { return Err(other()) };
+        if let Some(bits) = self.heads.const_bits(ask.need) {
+            return Ok(bits);
+        }
+        // Tried and refused by the evaluator (`size_of::<u8>()` where a call it needs does not
+        // check): the head is refused by the expression's name with the evaluator's reason, as
+        // an expression was before there was an evaluator behind the heads; never asked again.
+        if let Some(why) = self.heads.anon_failed(ask.need) {
+            return Err(Why::ConstPath(format!("{text}: {why}").into_boxed_str(), r));
+        }
+        let need = ask.need;
+        if self.heads.ask_anon(ask) { Err(Why::NeedConst(need, r)) } else { Err(other()) }
     }
 
     /// A constant written as a generic argument, an array length or a const parameter's
@@ -544,11 +615,20 @@ impl<'b, 'n, H: Heads> Builder<'b, 'n, H> {
             return Err(program(format!("`{text}` is a type parameter; a constant is expected here"), r));
         }
         let ty = want(tys)?;
-        if let Some(value) = literal_value(tys, text, ty, r)? {
-            return Ok(value);
+        // A literal is one token, `-` before it for a signed one: `1usize << 0` is an
+        // expression, never a literal with the suffix `usize << 0`.
+        let digits = text.strip_prefix('-').map_or(text, str::trim_start);
+        if Self::one_token(digits) {
+            if let Some(value) = literal_value(tys, text, ty, r)? {
+                return Ok(value);
+            }
         }
-        let bits = self.len_const(env, text, r)?;
-        intern(tys, PNode::ConstValue { ty, bits: u128::from(bits) })
+        // Any other constant: a constant item's value or an anonymous constant's, in `ty`'s
+        // width (`ty`'s node says how the anonymous one is typed; an unknown type, a body's
+        // `_`, takes only a constant item's path).
+        let node = tys.view().nodes.get(ty.0 as usize).copied();
+        let bits = self.const_value_bits(env, text, r, node)?;
+        intern(tys, PNode::ConstValue { ty, bits })
     }
 
     /// The declared type of the const parameter that argument `index` of the path `texts`

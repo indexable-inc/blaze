@@ -157,7 +157,9 @@ pub fn unit_crates<'a>(
     reached.resize(units.len(), false);
     let mut todo: AVec<'a, usize> = AVec::new_in(alloc);
     for (at, u) in units.iter().enumerate() {
-        if members.contains(&u.package) && !u.for_host && matches!(u.kind, UnitKind::Lib | UnitKind::Bin(_)) {
+        // A member's test unit is a root too (the graph makes one only when tests are asked:
+        // `Ask::tests`): left out, `--tests` solved no unit with `test` in its cfg.
+        if members.contains(&u.package) && !u.for_host && matches!(u.kind, UnitKind::Lib | UnitKind::Bin(_) | UnitKind::Test { .. }) {
             todo.push(at);
         }
     }
@@ -170,7 +172,9 @@ pub fn unit_crates<'a>(
             todo.extend(units[at].deps.iter().map(|d| d.unit.index()));
         }
     }
-    let kept = |u: &Unit<'_>| u.kind == UnitKind::ProcMacro || (!u.for_host && matches!(u.kind, UnitKind::Lib | UnitKind::Bin(_)));
+    let kept = |u: &Unit<'_>| {
+        u.kind == UnitKind::ProcMacro || (!u.for_host && matches!(u.kind, UnitKind::Lib | UnitKind::Bin(_) | UnitKind::Test { .. }))
+    };
     let blaze = units
         .iter()
         .enumerate()
@@ -355,7 +359,8 @@ fn toolchain_crates<'a>(
 fn unit_key(u: &Unit<'_>, source: &str, alloc: Alloc<'_>) -> CrateItemKey {
     let mut bytes = AVec::new_in(alloc);
     let bin = match &u.kind {
-        UnitKind::Bin(name) => name.as_str(),
+        // A binary's test unit is keyed by its binary too: two of one package are two crates.
+        UnitKind::Bin(name) | UnitKind::Test { bin: Some(name) } => name.as_str(),
         _ => "",
     };
     for part in [u.name.as_str(), u.version.as_str(), source, kind_name(&u.kind), bin] {

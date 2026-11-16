@@ -41,6 +41,20 @@ impl FnLang {
     pub fn named(lang: &str) -> Option<FnLang> {
         FnLang::ALL.into_iter().find(|l| l.lang() == lang)
     }
+
+    /// The `#[lang = ".."]` names a library declares this fn under, the pinned core's first.
+    /// The pinned core (library/core/src/ptr/mod.rs) declares the glue as
+    /// `#[lang = "drop_glue"] pub(crate) const unsafe fn drop_glue<T: PointeeSized>(_: &mut T)`
+    /// (the public `drop_in_place` is only `#[rustc_diagnostic_item = "ptr_drop_in_place"]`
+    /// and calls it); a `#![no_core]` program written to the older form declares
+    /// `#[lang = "drop_in_place"] unsafe fn drop_in_place<T: ?Sized>(_: *mut T)`. Both are one
+    /// fn of one type parameter and one thin-or-wide pointer parameter, built as the glue.
+    pub const fn declared_as(self) -> &'static [&'static str] {
+        match self {
+            FnLang::PanicBoundsCheck => &["panic_bounds_check"],
+            FnLang::DropInPlace => &["drop_glue", "drop_in_place"],
+        }
+    }
 }
 
 /// A lang item core marks that the front end could not answer: the item and why.
@@ -127,6 +141,28 @@ pub trait FrontEnd {
     fn const_record(&self, _item: ItemKey) -> Option<&blaze_build::data::DataRecord<std::alloc::Global>> {
         None
     }
+    /// Every `static` item's record as the front end evaluated it, sorted by key (front2
+    /// evaluates every static its bodies name, once, when the program is made: front2
+    /// statics.rs); empty where it made none (the old front: run.rs `eval_consts` evaluates its
+    /// tabled statics instead). run.rs `static_image` places both.
+    fn static_records(&self) -> &[(ItemKey, blaze_build::data::DataRecord<std::alloc::Global>)] {
+        &[]
+    }
+    /// `format_args!` expression `e` of `owner`'s body as the builder reads its template
+    /// ([`blaze_build::Adts::format_template`]); `None` where the front end made none (the
+    /// builder refuses it by name).
+    fn format_template(&self, _owner: ItemKey, _e: ExprId) -> Option<&[blaze_build::FmtPiece<'_>]> {
+        None
+    }
+    /// The pinned core's `rt::Argument` constructor for `trait_`
+    /// ([`blaze_build::Adts::fmt_argument_new`]); `None` where the front end found none.
+    fn fmt_argument_new(&self, _trait_: blaze_typeck::FmtTrait) -> Option<ItemKey> {
+        None
+    }
+    /// The struct `core::fmt::rt::Argument` (`#[lang = "format_argument"]`).
+    fn fmt_argument_adt(&self) -> Option<ItemKey> {
+        None
+    }
     fn int_lit(&self, owner: ItemKey, e: ExprId) -> Option<u128>;
     fn int_pat(&self, owner: ItemKey, p: PatId) -> Option<u128>;
     fn string(&self, owner: ItemKey, e: ExprId) -> Option<&[u8]>;
@@ -135,6 +171,17 @@ pub trait FrontEnd {
     /// check gave it. `None`: the front end did not read it (the builder refuses it).
     fn float_lit(&self, owner: ItemKey, e: ExprId) -> Option<(u64, u32)> {
         let _ = (owner, e);
+        None
+    }
+    /// Float literal pattern `p` of `owner`'s body (`Pat::Lit` or `Pat::NegLit`): its
+    /// magnitude's text rounded to the nearest `f64` and `f32`, as [`FrontEnd::float_lit`].
+    fn float_pat(&self, owner: ItemKey, p: PatId) -> Option<(u64, u32)> {
+        let _ = (owner, p);
+        None
+    }
+    /// String literal pattern `p` of `owner`'s body, unescaped.
+    fn str_pat(&self, owner: ItemKey, p: PatId) -> Option<&str> {
+        let _ = (owner, p);
         None
     }
     /// The projection `<args[0] as trait_<args[1..]>>::name` at ground `args` (in `ground`),

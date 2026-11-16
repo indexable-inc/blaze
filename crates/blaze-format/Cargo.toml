@@ -21,9 +21,14 @@ blaze-format-core = { path = "../blaze-format-core", features = ["alloc"] }
 # By path, not `.workspace`: the workspace entry turns on blaze-ids' adapter feature (serde),
 # which a member's entry cannot turn off.
 blaze-ids = { path = "../blaze-ids" }
+# The own collections the `_in` forms write into (`blaze_own::Vec<u8, A>`, `String<A>`), in the
+# caller's allocator: the bstd move off `alloc`'s.
+blaze-own = { path = "../blaze-own" }
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
+# `Alloc::global()`, the allocator a test names at its top (blaze-own's `std` feature).
+blaze-own = { path = "../blaze-own", features = ["std"] }
 blaze-sim.workspace = true
 blaze-v2-proof.workspace = true
 

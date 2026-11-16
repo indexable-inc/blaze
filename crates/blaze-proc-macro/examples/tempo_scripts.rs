@@ -234,7 +234,18 @@ fn main() {
 
     let runtime = script_runtime(&store);
     let table = Arc::new(pinned_rows(TARGET, KNOWN, alloc).to_vec());
-    let setting = Setting { store: &store, target: TARGET, host: TARGET, table: Arc::clone(&table), c_mode: CMode::Deferred };
+    // `check`'s placement: C requests deferred; the bindgen class (D69's NATIVE_EVERY_MODE)
+    // would be refused by name here, as no shelf is given (this example calls `prepare`, the
+    // wasm step, directly).
+    let setting = Setting {
+        store: &store,
+        target: TARGET,
+        host: TARGET,
+        table: Arc::clone(&table),
+        c_mode: CMode::Deferred,
+        mode: blaze_build_script::toolchain::Mode::Check,
+        native: None,
+    };
     let units = &graph.units;
     let mut trees: BTreeMap<LockId, (Tree, String)> = BTreeMap::new();
     // `dependents`: for each package named, how many library units of the graph depend on its

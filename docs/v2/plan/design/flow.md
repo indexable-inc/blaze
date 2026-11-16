@@ -286,24 +286,133 @@ Named questions (their answers' shapes):
   ElisionAmbiguous 32, OrPatternBinding 3, PeelUnderAdtField 3, StructUpdate 2. Findings: 1180
   UnprovenOutlives and 143 Invalidated. No move findings.
 
+## Census 1, by class
+
+From flow-census-1.txt (port27/flow-1116): 1323 findings in 314 bodies, every one a false
+positive. Classes by the text at the finding; "cause" is read from the lowering's code, and where
+it says "supposed" no flow was printed to confirm it. Sources: the Reference says what a
+signature means ("Lifetime elision", "Lifetime bounds", "Subtyping and variance"); what a body
+may do with those lifetimes is RFC 2094 and Polonius as sections 3 to 5 state them: the design
+is the source there, not the Reference.
+
+| Class | Count | Example (body: the finding's words) | Cause | State |
+|---|---|---|---|---|
+| A tuple of two parameters | 874 | derived `eq`: UnprovenOutlives 50..66 `( self , other )` | INPUT: `aggregate` made every position of a tuple's operands equal through one origin, so `(self, other)` related the two parameters' lifetimes. Right: `(a, b): (A, B)` relates nothing between `A` and `B` (the Reference, "Subtyping and variance": a tuple is covariant in each field) | fixed: each element is related to its own field (`relate_at`) |
+| A call with two reference arguments | 100 | derived `eq`: UnprovenOutlives 63..187 `$crate::cmp::PartialEq::eq(a_self, a_other)` | INPUT: a call of unknown or generic signature made every position of its operands equal. Right: a reference passed by value is covariant in its own lifetime (RFC 2094, "Subtyping") | fixed: `unify_call` lets a reference operand's first position only flow in |
+| `Self` returned by a `&self` method | 64 | derived `clone`: UnprovenOutlives 41..51 `{ * self }` | INPUT: `return_place` gave every position of the output the receiver's lifetime; the Reference's elision assigns it to ELIDED output lifetimes only, and `Self`'s are the impl's | fixed when the lifetime part is read: `Self`'s positions are `Region::SelfTy` |
+| Other returns, struct literals, `x.clone()` | 142 | `<impl Written>::of`: UnprovenOutlives 68..141 `File { io: io.clone(), name, .. }`; `<impl Cx>::io`: 133..160 `{ &self.world }` | INPUT (supposed): the same three causes through a struct literal (related as a call of unknown signature) and through returns of bodies whose signature writes lifetimes | census 2 decides |
+| A live loan invalidated in a derived body | 131 | derived `fmt`: Invalidated 279..751 `{ let mut ra_expand_builder = ..` ; derived `eq`: 172..442 | INPUT (supposed): `b.field(..)` with `b: DebugStruct<'_, '_>` and no signature: the receiver's loan flowed through the call's one origin into `b`'s own lifetime position, live while `b` is | fixed only where the callee's lifetime part is read (the loan then flows to the result alone); else open |
+| A live loan invalidated elsewhere | 12 | `<impl Entered>::enter`: Invalidated 259..275 `CURRENT.set(run)`; `<impl Run>::current`: 263..276 `CURRENT.get()` | not read; `CURRENT` is a thread-local or a static: supposed a borrow of a static taken as a local's | open |
+
+Refusals (869): CallWritesLifetimes 377 (now lowered when the callee's lifetime part is read),
+UnknownAdt 322 (the census now asks the store for each ADT before lowering), Closure 130,
+ElisionAmbiguous 32 (the same as the first), OrPatternBinding 3, PeelUnderAdtField 3,
+StructUpdate 2.
+
+## What the signature must say (H1)
+
+Per fn head, beside its erased types (crates/blaze-flow-lower/src/sig.rs, `SigLife`, is this
+shape and the lowering takes nothing else):
+
+- `regions: [Region]`: one per ORIGIN POSITION of each input in order, then of the output. A
+  type's positions are counted in pre-order, a node's own before its children's: one per
+  reference, one per lifetime parameter of an ADT (today ONE per ADT with any: see the ADT part),
+  one per trait object (its bound, after the Reference's "Default trait object lifetimes"), one
+  per opaque or associated type. A `Region` is `Static`, `Named(i)` (a lifetime parameter of the
+  fn or of its impl, the impl's numbered first), `Anon(i)` (each elided input lifetime its own)
+  or `Hidden(i)`; elided OUTPUT lifetimes are already replaced by the Reference's two rules.
+- `ends: [u32]`: per input, where its regions end.
+- `bounds: [(Region, Region)]`: every declared `'a: 'b`, the fn's and its impl's, where clauses
+  included. Implied bounds are not wanted: the lowering derives them from the types.
+
+Per ADT head: `lifetimes: u32` (how many it declares), their variances `[Co|Contra|In]`, its
+declared bounds, and per field its regions in the ADT's own parameters (so a struct literal and a
+field projection relate each field exactly). Per impl head: the regions of its self type, so
+`Self` in a method is its impl's lifetimes and not a separate region.
+
+Until the heads carry it, the census reads it from the fn's own TEXT (`sig::read_signature`: a
+stand-in, said so in its doc). It refuses by name what it cannot line up and never guesses. Its
+known gaps, each of which can only refuse a correct body, never accept a wrong one: `Self` is a
+region apart from the impl's named lifetimes (`impl<'a> T<'a> { fn f(&self, x: &'a u8) -> ..`
+sees `Self`'s lifetime and `'a` as unrelated); the impl's declared bounds are not read; an ADT
+written with two different lifetimes is refused (`TwoLifetimesOneOrigin`); a type alias with
+positions is refused (`Unaligned`).
+
+## The signature in the flow (leg 2; written, see BUILD-STATUS.md for what compiled)
+
+- Own signature (`Lower::signature`): one placeholder per region; each position of each parameter
+  and of the return place takes its region's placeholder. Known among them, and nothing else:
+  the declared bounds, `'static: everything`, and for every reference `&'r T` in a parameter or
+  the output, `'x: 'r` for each position `'x` in `T` (the Reference, "Lifetime bounds": the type
+  is well formed). The check then refuses any `subset` between two placeholders outside the
+  closure of these (section 4's `subset_errors`), and any loan of a local that reaches a
+  placeholder (placeholders are live everywhere, so it is live at the local's `StorageDead`).
+- A call (`call_by_signature`): the callee's regions get fresh origins per call (`'static` is the
+  body's); operands flow into their parameter's regions and the output's regions into the
+  destination (a reference's first position one way, the rest both ways); the callee's declared
+  and implied bounds are added as subsets. A callee whose lifetime part is not read keeps the
+  older paths (elision by `CalleeFacts`, refusal when it writes lifetimes, one origin for all
+  when its head is unknown or its generic arguments carry origins).
+- Elided `&self` calls also flow every other position of the receiver into the output (before,
+  `self.items.iter()` on `&'a Vec<&'b T>` left `'b` unrelated to the result: a missed error).
+- Fixtures: crates/blaze-flow/src/tests.rs `signature_*` (ten, by hand-built flows: accept by
+  the same lifetime, elision, a declared bound, an implied bound, `&self`, a reborrow through
+  `&mut`; refuse the other argument's lifetime, a local's reference, the implied bound reversed;
+  controls `Plant::KnownIgnored` and `Plant::AllKnown`); crates/blaze-flow-lower/src/tests.rs
+  (nine through the real type checker: the reader's rules, each fix with the nearest wrong
+  program, controls `NoKnown`, `TupleUnified`, `HubBothWays`).
+
+## Census 3 (12:44, tree 11d224a93a, through mixcheck; census 2 never ran)
+
+"bstd: clean bodies 2223; lowered 1756; refused 467; tier one accepts 1427; tier two accepts 126;
+findings 536 (in 206 bodies)" (was: lowered 1247, refused 869, findings 1323 in 314). Signatures:
+own lifetime part read in 1702 bodies; 3265 calls related through the callee's; texts not read:
+ElisionUndecided 52, Unaligned 7, Token 5. Refused: Closure 198, CallWritesLifetimes 189,
+ElisionAmbiguous 30, UnknownAdt 25, PeelUnderAdtField 9, StructUpdate 6, TypeNode 6,
+OrPatternBinding 4. Findings: 309 UnprovenOutlives, 224 Invalidated, 3 moves. The goal (under
+100) is NOT met. By method, none of them diagnosed from a printed flow yet:
+
+- Invalidated in `fmt` 84 (derived, and hand-written `write!(f, ..)`): the `format_args!` path
+  (`aggregate` with `fmt`, now related by `unify_call`) and `f.debug_struct(..)` builders.
+- UnprovenOutlives 68 and Invalidated 66 in derived `eq`, at a `$crate::..` path call inside the
+  match: 12 + 12 more in `cmp` and `partial_cmp`. Supposed: bindings under a peeled reference
+  pattern have inexact places, so `unify_call`'s one-way rule does not apply to them.
+- UnprovenOutlives in `fmt` 40, `new` 32, `clone` 28, `only` 15: struct literals with a field
+  from a parameter (`File { io: io.clone(), name, .. }`, `Given { cx, .. }`) and `x.clone()`:
+  a struct literal is still a call of unknown signature (needs H1's ADT part).
+- `CURRENT.get()` / `CURRENT.set(..)` (a thread-local static): Invalidated, about 8.
+- Three MOVE findings, new because their bodies are newly lowered: `Shares::split` (UseOfMoved
+  at a struct literal), `Shares::whole` (MoveOut(Deref) at `*unsafe { Box::from_raw(..) }`: a
+  `Box` deref lowered as `Deref`, not `DerefBox`), `Pool::run_now` (UseOfMoved at
+  `(head.release)(job.0)`).
+
 ## For a successor
 
-Step 5 has not started. Every finding is a false positive, because bstd compiles. Take the
-classes largest first, each with a fixture in crates/blaze-flow-lower/src/tests.rs that fails
-without its fix.
-- UnprovenOutlives (1180): it shows on bodies whose signature names no lifetime, such as
-  `clone` returning `{ *self }`, `eq` on `(self, other)`, and `File { io: io.clone(), .. }`.
-  Leads to check first:
-  - `return_place` gives the output fresh placeholders when elision does not decide. It should
-    give them only for positions the signature writes; an output with no reference positions
-    needs none.
-  - Is an ADT's `lifetimes` set to true for derive-generated impls (`__dollar_crate_...`
-    heads)? The census reads a `'` anywhere in the head's text.
-  - A tuple or aggregate of references should relate covariantly, never both ways (`relate`
-    only treats the first position as covariant).
-  Print one flow (`Flow::print`) for `<impl Written>::of` and read where the subset to a
-  placeholder comes from.
-- Invalidated (143): read the examples in the census file, the lines after "FINDINGS".
-- UnknownAdt (322): the census Facts answers only ADTs the store has made. It should
-  `ensure(Want::Adt)` each ADT key before asking.
-- Closures (130) come next, once the findings are zero.
+- Read BUILD-STATUS.md for the last lines of blaze-flow, blaze-flow-lower and the census; the
+  census output is port27/flow-1116/flow-census-2.txt. Compare its head line with "findings 1323
+  (in 314 bodies)" and its new line "signatures: ..", which says how many signature texts were
+  not read and why: the largest refusal there is the next thing to teach `read_signature`, or
+  the first thing H1 replaces.
+- Invalidated in derived `fmt` and `eq` (131): print one flow (`Flow::print`) and confirm or
+  drop the supposed cause in the table above before changing anything.
+- A struct literal is related as a call of unknown signature: exact per field needs the ADT part
+  of H1.
+- The implied-bound fixture through the type checker needs a deref expression in the fixture
+  body builder (`Bb`); only the hand-built flow covers it today.
+- Refusals next: Closure 130 (captures as an `Aggregate` of borrows and moves, section 1), then
+  whatever census 2 lists first.
+- T1 and T2 (section 10) are unanswered.
+- Tier one cannot accept a MUTABLE reborrow returned into a placeholder (`fn h<'a>(x: &'a mut
+  (u8, u8)) -> &'a mut u8 { &mut x.0 }`): the loan is live everywhere, so its own issuing borrow
+  looks like a write under it. Tier two accepts (fixture
+  `signature_returns_a_reborrow_through_a_mutable_reference`). Every `&mut self -> &mut T`
+  accessor goes to tier two, which costs 46 ms a body today: the dense tier two is the floor's
+  problem, and this is its first common customer. Excusing a loan's own statement in tier one is
+  NOT sound (in a loop the earlier iteration's loan is live there).
+- OPEN SOUNDNESS HOLE, older than this leg: a call whose callee's head is not known (and a call
+  through a fn pointer or closure value) is related through one origin, which cannot say "this
+  argument must be `'static`": `spawn(&local)` with an unknown `spawn` is accepted. The census
+  now asks the store for every callee's head first; what is still unknown after that should be
+  refused by name (a new `Form`), and a fn pointer's type needs its lifetimes from the type
+  checker (question T3: `[(expr, the callee value's signature regions)]`). Count them in the
+  census ("calls unified") before deciding.
