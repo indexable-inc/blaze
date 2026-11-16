@@ -228,6 +228,16 @@ Andrew: "we should have 0 third party and all the things you said worth adding".
   and untyped-error lists do). New crates start at zero: a new crate may depend only on
   workspace crates that are themselves at zero, which first means a hash, a map and a channel
   of our own under `blaze-id`. Relax builds in about a minute with none.
+- **No `std` and no `alloc` in blaze's own code** (Andrew: "can we not even depend on the std
+  library for anything here? our own std library ... blaze-std"; "no alloc! we should have our
+  own"). `core` stays: it is the language. `std` is replaced by bstd (`crates/blaze-std`),
+  split so that rustc builds its base and blaze adds what needs its extensions. `alloc` is
+  replaced by collections of our own (`Vec`, `Box`, `Arc`, maps, strings, over `core::alloc`'s
+  `Allocator`) that have no default allocator: `new_in(alloc)` is the only constructor, so an
+  implied allocator cannot be written and rule 11 is held by the types, not by a ratchet. A
+  new crate is `#![no_std]` with no `extern crate alloc`. The parked crates are held by a
+  ratchet and moved by astlog rules once blaze checks itself again. Known cost: the compiler's
+  own `Box` moves out with `*b`; ours uses a method.
 - **Hot counters in the slot.** A function's stub counts its calls; past a bound the function
   is queued for the optimizing tier. No profiler is needed to tier up.
 - **Tests that pick themselves.** A test's record lists the functions its run entered (their
