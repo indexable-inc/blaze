@@ -26,7 +26,7 @@ use blaze_typeck::{ItemKey, List, Name, PClause, PNode, PTy, PortableTys};
 use super::dyn_ty::Member as DynMember;
 use super::keys::{KeyClash, Keys, MemberKind, checker_of};
 use super::preds::Preds;
-use super::types::{Bounds, Builder, Env, Heads, ParamBound, SelfTy, Why, intern, intern_list};
+use super::types::{Bounds, Builder, Env, Heads, ParamBound, SelfTy, TraitAliasHead, Why, intern, intern_list};
 use crate::resolve::Resolver;
 
 /// The most steps one [`Store::ensure`] takes: past it the needs are a cycle.
@@ -101,6 +101,8 @@ pub struct Maps {
     /// check, and one that is used fails only the item that names it.
     pub aliases: HashMap<LibKey, Option<(u32, PTy)>, Global>,
     pub alias_gaps: HashMap<LibKey, Why, Global>,
+    /// Each trait alias's head ([`Heads::trait_alias`]; made by `Store::trait_alias`).
+    pub trait_aliases: HashMap<LibKey, TraitAliasHead, Global>,
     /// Each `usize` constant item a head's array length names, by its value
     /// ([`Why::NeedConst`]): filled by the driver that has the constant evaluator.
     pub const_lens: HashMap<LibKey, u64, Global>,
@@ -123,6 +125,9 @@ impl Heads for Maps {
     }
     fn alias(&self, alias: LibKey) -> Option<Option<(u32, PTy)>> {
         self.aliases.get(&alias).copied()
+    }
+    fn trait_alias(&self, alias: LibKey) -> Option<&TraitAliasHead> {
+        self.trait_aliases.get(&alias)
     }
     fn trait_supers(&self, trait_: LibKey) -> Option<&[(LibKey, List)]> {
         self.supers.get(&trait_).map(|s| &s[..])
@@ -585,7 +590,7 @@ impl<'n> Store<'n> {
         let key = want.key();
         let ck = checker_of(key);
         let done = match want {
-            Want::Head(k) => self.maps.generics.contains_key(&k) || self.maps.traits.contains_key(&k) || self.maps.aliases.contains_key(&k),
+            Want::Head(k) => self.maps.generics.contains_key(&k) || self.maps.traits.contains_key(&k) || self.maps.aliases.contains_key(&k) || self.maps.trait_aliases.contains_key(&k),
             Want::Adt(_) => self.adts.contains_key(&ck),
             Want::Impl(_) => self.impls.contains_key(&ck),
             Want::Fn(_) => self.fns.contains_key(&ck),
@@ -605,6 +610,7 @@ impl<'n> Store<'n> {
                 self.adt_head(names, key, module, &v)
             }
             (Want::Head(_), ItemDetail::Trait) => self.trait_head(names, keys, key, module, &v, text),
+            (Want::Head(_), ItemDetail::TraitAlias) => self.trait_alias(names, keys, key, module, &v),
             (Want::Head(_), ItemDetail::TypeAlias) => match self.alias(names, key, module, &v) {
                 Err(why @ (Why::Need(_) | Why::NeedConst(..))) => Err(why),
                 Err(why) => {
@@ -651,6 +657,43 @@ impl<'n> Store<'n> {
             Err(Why::Need(k)) => Ok(Step::Need(k)),
             Err(why) => Err(HeadError::Item(key, why)),
         }
+    }
+
+    /// A trait alias's head (`trait A<T> = B<T> + C where ..;`): its generics (`Self` first)
+    /// and the clauses it stands for, read in its own module as a trait's supertraits and where
+    /// clauses are, with `Self` = `Param(0)`. An alias named in them is made first
+    /// ([`Why::Need`]), so its clauses arrive expanded; aliases naming each other in a cycle
+    /// are [`Store::ensure`]'s `HeadError::Cycle`.
+    fn trait_alias(&mut self, names: &'n Names<'n>, keys: &mut Keys, key: LibKey, module: LibKey, v: &View<'_>) -> Result<(), Why> {
+        let whole = Range::new(0, 0);
+        let mut ps = Vec::new_in(Global);
+        let mut cs = Vec::new_in(Global);
+        let b = Builder { resolver: Resolver { names }, heads: &self.maps };
+        let own = own_generics(&b, &mut self.tys, module, v, 1, &mut ps, &mut cs)?;
+        let me = intern(&mut self.tys, PNode::Param(0))?;
+        let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Ty(me, None), self_assoc: &[], anon: &[], consts: &cs };
+        let mut bounds = Vec::new_in(Global);
+        b.param_bounds(&mut self.tys, &env, v, 1, &mut bounds)?;
+        let env = Env { bounds: Bounds::Done(&bounds), ..env };
+        let mut preds = Preds::new();
+        // `sized` is not given: an alias adds no implied `Sized` on its own parameters (a use
+        // stands for what is written).
+        b.predicates(&mut self.tys, &env, v, 1, Some(me), None, &mut preds)?;
+        if !preds.conds.is_empty() {
+            return Err(Why::Unsupported("`where const` in a trait alias", whole));
+        }
+        let mut traits = Vec::new_in(Global);
+        for c in preds.clauses.iter() {
+            let PClause::Trait { trait_, args } = *c else { continue };
+            let first = self.tys.view().list(args).map_err(|_| Why::Unsupported("a clause list outside the store's table", whole))?.first().copied();
+            if first == Some(me) {
+                let lib = keys.library(trait_).ok_or(Why::Program(format!("the trait {trait_:?} has no library key").into_boxed_str(), whole))?;
+                traits.push((lib, args));
+            }
+        }
+        self.maps.trait_aliases.insert(key, TraitAliasHead { generics: own + 1, clauses: preds.clauses, traits });
+        self.maps.const_params.insert(key, cs);
+        Ok(())
     }
 
     /// A free type alias's head: its generics and the aliased type, read in the alias's own

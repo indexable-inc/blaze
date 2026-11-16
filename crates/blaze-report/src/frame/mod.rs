@@ -451,7 +451,7 @@ pub(crate) fn ink(severity: Severity) -> Ink {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Closing<'a> {
     /// The stages this command is defined to run that it did not: `None` when it ran them all.
-    /// Then the line never says `ok`: `incomplete · no errors in: … · NOT checked: …`.
+    /// Then the line never says `ok`: `incomplete · NOT checked: … · no errors in: …`.
     pub coverage: Option<Coverage<'a>>,
     /// The findings drawn.
     pub counts: Counts,
@@ -538,13 +538,16 @@ pub fn closing(out: &mut AString<'_>, closing: &Closing<'_>, caps: Caps) {
     };
     match closing.coverage {
         Some(coverage) => {
-            if counts.errors + counts.warnings + counts.notes == 0 {
+            // What was NOT checked comes first: a narrow line drops the tail, and the tail must
+            // never be the stages a reader would take as passed.
+            let clean = counts.errors + counts.warnings + counts.notes == 0;
+            if clean {
                 part(&mut pen, 10, &|pen| pen.put(Style { bold: true, ..Style { fg: Ink::Warning.colour(), ..Style::PLAIN } }, "incomplete", 10));
-                if !coverage.ran.is_empty() {
-                    fits = fits && part(&mut pen, 14 + joined(coverage.ran), &|pen| list(pen, "no errors in: ", coverage.ran));
-                }
             }
             fits = fits && part(&mut pen, 13 + joined(coverage.not), &|pen| list(pen, "NOT checked: ", coverage.not));
+            if clean && !coverage.ran.is_empty() {
+                fits = fits && part(&mut pen, 14 + joined(coverage.ran), &|pen| list(pen, "no errors in: ", coverage.ran));
+            }
         }
         None if counts.errors + counts.warnings + counts.notes == 0 => {
             part(&mut pen, 2, &|pen| pen.put(Style { bold: true, ..Style::fg(2) }, "ok", 2));

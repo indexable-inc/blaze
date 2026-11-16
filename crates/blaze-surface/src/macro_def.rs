@@ -235,6 +235,37 @@ pub struct DefSite {
 // SAFETY: a crate key and a module's item key.
 unsafe impl Portable for DefSite {}
 
+/// How an expansion's text writes the `$crate` of a [`DefSite`]: `__dollar_crate_` and the
+/// crate key's 64 hex digits, one identifier to the outline's parser, a body's lowering and the
+/// path reader, read back as `$crate` of that crate ([`dollar_crate_of`]). The Reference
+/// ("Macros By Example", Hygiene): `$crate` refers to the crate defining the macro, so the
+/// crate travels with the text wherever the expansion is read.
+pub const DOLLAR_CRATE: &str = "__dollar_crate_";
+
+/// [`DOLLAR_CRATE`] of a crate, as it is written.
+#[derive(Clone, Copy, Debug)]
+pub struct DollarCrate(pub CrateItemKey);
+
+impl fmt::Display for DollarCrate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(DOLLAR_CRATE)?;
+        self.0.0.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+    }
+}
+
+/// The crate a [`DOLLAR_CRATE`] identifier names.
+pub fn dollar_crate_of(text: &str) -> Option<CrateItemKey> {
+    let hex = text.strip_prefix(DOLLAR_CRATE)?;
+    if hex.len() != 64 {
+        return None;
+    }
+    let mut id = [0u8; 32];
+    for (at, byte) in id.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(hex.get(at * 2..at * 2 + 2)?, 16).ok()?;
+    }
+    Some(CrateItemKey(ContentId(id)))
+}
+
 blaze_format::record! {
     #[derive(Clone, Copy, Debug)]
     pub(crate) struct MacroDefRoot: 2 {

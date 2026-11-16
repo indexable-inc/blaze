@@ -625,7 +625,17 @@ dependencies = [
 name = "blaze-flow"
 version = "0.0.0"
 dependencies = [
+ "blaze-own",
  "blaze-sim",
+]
+
+[[package]]
+name = "blaze-flow-lower"
+version = "0.0.0"
+dependencies = [
+ "blaze-flow",
+ "blaze-own",
+ "blaze-typeck",
 ]
 
 [[package]]
@@ -984,6 +994,8 @@ dependencies = [
  "blaze-expand",
  "blaze-fetch",
  "blaze-file-items",
+ "blaze-flow",
+ "blaze-flow-lower",
  "blaze-hash",
  "blaze-id",
  "blaze-ids",
@@ -1259,6 +1271,7 @@ dependencies = [
  "blaze-record",
  "blaze-sha256",
  "blaze-sim",
+ "blaze-std",
  "blaze-surface",
  "blaze-typeck",
  "blaze-unit-graph",

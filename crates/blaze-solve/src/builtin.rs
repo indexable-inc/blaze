@@ -854,6 +854,78 @@ pub(crate) fn discriminant_ty<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, self_
     Ok(Some(cx.mk(k)?))
 }
 
+/// The most struct fields and tuple elements [`metadata_ty`] walks down to a tail.
+const MAX_TAIL_DEPTH: u32 = 256;
+
+/// What `<Self as Pointee>::Metadata` is (normalizes_to.rs
+/// `consider_builtin_pointee_candidate`). library/core/src/ptr/metadata.rs, on `Pointee`: "For
+/// structs whose last field is a DST, metadata is the metadata for the last field; For the `str`
+/// type, metadata is the length in bytes as `usize`; For slice types like `[T]`, metadata is
+/// the length in items as `usize`; For trait objects like `dyn SomeTrait`, metadata is
+/// [`DynMetadata<Self>`][DynMetadata] (e.g. `DynMetadata<dyn SomeTrait>`)"; and "For sized types
+/// ... the metadata is `()`". The tail is found by a loop over the last field (a struct's, a
+/// tuple's), never by recursion. A parameter, placeholder or alias tail is `()` when the env
+/// says it is `Sized`, else its own projection stays (rigid): [`Metadata::Rigid`].
+pub(crate) fn metadata_ty<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, self_ty: Ty) -> Result<Metadata, Stop> {
+    let mut t = self_ty;
+    for _ in 0..MAX_TAIL_DEPTH {
+        let k = match cx.kind(t) {
+            TyKind::Adt(d, args) => {
+                let adt = cx.adt(d)?;
+                if adt.flags.has(AdtFlags::ENUM) {
+                    TyKind::Tuple(List::EMPTY)
+                } else {
+                    match adt.sized_tail {
+                        Some(tail) => {
+                            t = cx.import(adt.portable, tail, args)?;
+                            continue;
+                        }
+                        None => TyKind::Tuple(List::EMPTY),
+                    }
+                }
+            }
+            TyKind::Tuple(l) if l.len > 0 => {
+                t = cx.arg(l, l.len - 1);
+                continue;
+            }
+            TyKind::Str | TyKind::Slice(_) => TyKind::Uint(UintTy::Usize),
+            TyKind::Dynamic(..) => {
+                let dm = require_lang(cx, Lang::DynMetadata)?;
+                let l = cx.mk_list(&[t])?;
+                TyKind::Adt(dm, l)
+            }
+            TyKind::Param(_) | TyKind::Placeholder(..) | TyKind::Alias(..) => {
+                let sized = require_lang(cx, Lang::Sized)?;
+                let known = cx.env.iter().any(|c| match c.pred {
+                    Pred::Trait { trait_, args, polarity: Polarity::Positive } => trait_ == sized && args.len > 0 && cx.arg(args, 0) == t,
+                    _ => false,
+                });
+                if !known {
+                    return Ok(Metadata::Rigid(t));
+                }
+                TyKind::Tuple(List::EMPTY)
+            }
+            TyKind::Infer(Var { kind: VarKind::Ty, .. }) => return Ok(Metadata::Ambiguous),
+            TyKind::Error => return Ok(Metadata::Is(t)),
+            TyKind::Infer(_) | TyKind::Bound(..) | TyKind::Canonical(_) => return Err(malformed()),
+            _ => TyKind::Tuple(List::EMPTY),
+        };
+        return Ok(Metadata::Is(cx.mk(k)?));
+    }
+    Err(Stop::Error(SolveError::Limit(Limit::Walk)))
+}
+
+/// [`metadata_ty`]'s answer.
+pub(crate) enum Metadata {
+    /// The metadata type.
+    Is(Ty),
+    /// The tail is a parameter, placeholder or alias not known `Sized`: `<tail as
+    /// Pointee>::Metadata` stays a rigid projection.
+    Rigid(Ty),
+    /// The tail is a type variable: not decided yet.
+    Ambiguous,
+}
+
 pub(crate) fn normalize_future_output<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, self_ty: Ty, term: Ty) -> Result<Step, Stop> {
     let TyKind::Coroutine(_, args) = cx.kind(self_ty) else { return Ok(Step::No) };
     if args.len != 2 {

@@ -16,8 +16,6 @@
 #![feature(allocator_api, register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 
-extern crate alloc;
-
 #[cfg(test)]
 extern crate std;
 

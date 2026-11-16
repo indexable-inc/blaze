@@ -36,6 +36,9 @@ pub enum Kind {
     Enum,
     Union,
     Trait,
+    /// `trait A = B + C;` (the unstable `trait_alias`): it names no trait of its own; a bound
+    /// that names it stands for its right-hand side (front2's `Heads::trait_alias`).
+    TraitAlias,
     TypeAlias,
     /// An enum's variant: the enum and the variant's index in it.
     Variant { adt: ItemKey, index: u32 },
@@ -166,7 +169,8 @@ impl<'n> Resolver<'n> {
             ItemDetail::Struct => Kind::Struct,
             ItemDetail::Enum => Kind::Enum,
             ItemDetail::Union => Kind::Union,
-            ItemDetail::Trait | ItemDetail::TraitAlias => Kind::Trait,
+            ItemDetail::Trait => Kind::Trait,
+            ItemDetail::TraitAlias => Kind::TraitAlias,
             ItemDetail::TypeAlias => Kind::TypeAlias,
             ItemDetail::Mod { .. } | ItemDetail::ExternCrate { .. } => Kind::Module,
             ItemDetail::MacroRules { .. } | ItemDetail::MacroDef => Kind::Macro,

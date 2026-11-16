@@ -206,6 +206,54 @@ No compiler's source or output is a source; every test expectation below is stat
 - Async bodies are checked before the coroutine transform, as plain bodies with `yield` as a
   `Call`; loans live across a yield are a finding of the coroutine layer.
 
+## 10. The lowering (crates/blaze-flow-lower)
+
+`lower(body: &BodyView, ck: &Checked, facts: &impl Facts, alloc) -> Result<Lowered, Refusal>`:
+one type-checked body in, its flow out, or one typed refusal naming the form and its
+item-relative range. A body is lowered whole or not at all.
+
+What it reads from the type checker (crates/blaze-typeck, lifetime-erased; read only):
+- `BodyView` (`body.typeck.view(body.tys.view())`): the expressions, patterns, statements and
+  params as the checker holds them, each with its range.
+- `Checked`: `expr_ty`, `pat_ty` (after peeling), `local_ty` (the binding's type); `adjusts`
+  (`(ExprId, AdjustKind, PTy)`, sorted by expression: `NeverToAny`, `Deref { overloaded }`,
+  `Borrow { mutbl, two_phase, raw }`, the pointer casts, `Unsize`); `callees` (`(ExprId,
+  ItemKey, generics)`); `expr_defs` and `pat_defs` (`Def`: local, item, ctor); `fields` (`(ExprId,
+  variant, field index)`); `captures` (read only to refuse closures); `types.view()`'s `PNode`s.
+- What the record lacks comes through the `Facts` trait, answered from the heads store in the
+  census: per ADT `{ copy, drop_impl, needs_drop, lifetimes, union, is_enum, is_box }`; per callee
+  `{ writes_lifetimes, self_ref }`; field index by name and field count per variant; whether a type
+  parameter is bounded by `Copy`.
+
+What it reads from crates/blaze-build/src/walk.rs: nothing; walk.rs is the code builder's walk of
+the same body, and it duplicates the flow's move analysis: E0382 at `moved()`, per-field init
+bits (`field_bit`) and drop flags, and `needs_drop` by the layout's repr. After the switch the
+builder takes the flow's `Checked` proof and its `drop_kind` per `Drop`, and its own copies go.
+
+Refused by name (`Form`): closures, async blocks, `.await`, coroutines, unions, `static mut`,
+struct update `..base`, destructuring assignment, bindings under or- and slice patterns, a
+peeled reference under an ADT field pattern that binds (`PeelUnderAdtField`, question T1), a
+binding mode that disagrees with `local_ty`, a guard that moves a binding, a call whose callee
+writes lifetimes (question H1), a call where elision does not decide (`ElisionAmbiguous`), and
+inline asm through `Missing`.
+
+Origins from types: one origin per reference position, per ADT with lifetimes (one for all its
+lifetimes until H1), per opaque, alias or dyn; a body's own signature takes the elision rules
+(the Reference, "Lifetime elision": one input position gives the output's; `&self` gives
+self's); a signature that writes lifetimes takes every pair of its placeholders as related (a
+stand-in, counted as `sig_writes_lifetimes`). Calls: elided callees relate the output to the one
+input position (or self); a callee with generic arguments carrying origins is unified through
+one hub origin (`calls_unified`): sound for refusal, too strong for acceptance, counted.
+
+Named questions (their answers' shapes):
+- T1 (type checker): pattern peel adjustments: `[(PatId, peeled: u32)]`, the references
+  default binding mode peeled before each pattern.
+- T2 (type checker): per type `Copy` and `Drop`: `[(PTy, copy: bool, drop_impl: bool)]`, and
+  per type parameter whether its bounds give `Copy`.
+- H1 (heads, "Front end heads, ITEMS"): the lifetime part of each fn and ADT head: `{ params:
+  [Lifetime], positions: [(param, position)], bounds: [(a, b)], variance: [Co|Contra|In] }`;
+  until then the census reads a `'` in the head's text, a stand-in named in its doc.
+
 ## What is built (crates/blaze-flow)
 
 - `flow`: the forms above as flat tables, `FlowBuilder`, and `Flow::print`'s stable text.

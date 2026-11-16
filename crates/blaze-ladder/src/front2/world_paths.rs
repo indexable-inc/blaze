@@ -89,7 +89,7 @@ impl BodyWorld<'_, '_> {
                 _ => return self.gap(Gap::BuiltinTypePath(written.join("::").into_boxed_str())),
             },
             Kind::WideInt { .. } => return self.gap(Gap::BuiltinTypePath(written.join("::").into_boxed_str())),
-            Kind::Module | Kind::Macro | Kind::Other(_) => return Ok(None),
+            Kind::Module | Kind::Macro | Kind::TraitAlias | Kind::Other(_) => return Ok(None),
         };
         Ok(Some(PathRes { def, consumed }))
     }

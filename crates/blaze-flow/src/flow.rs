@@ -2,7 +2,7 @@
 //! hand-made flows and a printer with a stable text form.
 #![blaze::sans_io]
 
-use alloc::vec::Vec;
+use blaze_own::Vec;
 use core::alloc::Allocator;
 use core::fmt;
 

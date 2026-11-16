@@ -644,6 +644,24 @@ fn ambiguity_reported() {
     expect(&fx, &b, &c, &WANT_AMBIGUOUS);
 }
 
+/// The E0283 finding names the goal left undecided (`A: Conv<?T>`), as an E0277 names its
+/// unmet goal: a person reads which bound had more than one answer, not "cannot satisfy".
+#[test]
+fn an_ambiguity_names_its_goal() {
+    let (fx, it) = world();
+    let (b, root, owner) = case_ambiguous(&it);
+    let c = check_body(&fx, &b, owner, root, Plant::None, InferPlant::None);
+    let named: Vec<String> = c
+        .diags
+        .iter()
+        .map(|d| match d.because {
+            Some(crate::diag::Because::Unmet { goal: crate::diag::UnmetGoal::Trait { trait_, .. }, leaf: None }) => format!("{}", fx.name_of(trait_)),
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(named, ["Conv"], "the E0283's goal");
+}
+
 /// The control: settling the leftover ambiguity by the first impl that unifies makes `x: u8`
 /// and drops the error.
 #[test]

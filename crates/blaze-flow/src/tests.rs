@@ -1,11 +1,11 @@
 //! The simulations (an oracle and a planted bug each) and the fixtures from the written sources
 //! (flow.md: the Reference, RFC 2094, RFC 2025, the Polonius book).
 
-use alloc::alloc::Global;
-use alloc::collections::BTreeSet;
-use alloc::string::String;
-use alloc::vec::Vec;
+use std::alloc::Global;
+use std::collections::BTreeSet;
 use std::format;
+use std::string::String;
+use std::vec::Vec;
 
 use blaze_sim::{Broke, Config, Tape, check, control};
 
@@ -149,9 +149,9 @@ fn oracle_moves(flow: &Flow<Global>) -> Result<Found, Broke> {
             !(l >= 1 && l <= flow.args)
         })
         .collect();
-    let mut visits = alloc::vec![0u8; flow.blocks.len()];
+    let mut visits = std::vec![0u8; flow.blocks.len()];
     visits[0] = 1;
-    let mut stack = alloc::vec![(flow.entry(), entry, visits)];
+    let mut stack = std::vec![(flow.entry(), entry, visits)];
     let mut steps = 0u32;
     while let Some((s, mut un, visits)) = stack.pop() {
         steps += 1;
@@ -588,7 +588,7 @@ fn live_mutable_loan_then_shared_borrow_is_refused() {
     let flow = finish(b);
     assert_eq!(
         tiers(&flow),
-        (TierOne::Refused, alloc::vec![BorrowFinding::Invalidated { at: Point::start(Stmt(2)), loan: l, span: S }])
+        (TierOne::Refused, std::vec![BorrowFinding::Invalidated { at: Point::start(Stmt(2)), loan: l, span: S }])
     );
     match check_body(&flow, Global) {
         Ok(r) => assert!(r.proof.is_none() && r.borrows.len() == 1),

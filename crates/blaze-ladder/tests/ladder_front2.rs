@@ -17,7 +17,8 @@ use rungs::{RUNNING, SUPPORT, expected, ladder, sources};
 const PASSING: &[&str] = &["1-empty", "2-exit", "3-hello", "4-modules", "5-generics", "6-aggregates", "7-traits", "7a-drops", "7c-main-io", "support/s1-layout", "support/s3-extern-c", "support/s4-intrinsics", "front2/f1-defaults", "front2/f2-generic-self"];
 
 /// front2's own programs (ladder/front2/*/): each one seam of the run path no rung covers.
-const OWN: &[&str] = &["front2/f1-defaults", "front2/f2-generic-self"];
+/// The old ladder's `&dyn` rung (no_core) runs here too: front2's vtables, placed.
+const OWN: &[&str] = &["7b-dyn", "front2/f1-defaults", "front2/f2-generic-self", "front2/f3-dyn"];
 
 fn capture(f: impl FnOnce() -> u8) -> (u8, Vec<u8>) {
     let mut fds = [0; 2];
@@ -61,7 +62,9 @@ fn every_rung_through_front2() {
         let files = sources(&dir);
         let views: Vec<SourceFile<'_>> = files.iter().map(|(path, text)| SourceFile { path, text }).collect();
         let edition = edition_of(&dir);
-        let choice = FrontChoice::New(NewFront { package: "ladder", edition: &edition, shelf: None });
+        // A blaze edition builds against the real libraries: the toolchain's shelf.
+        let shelf = edition.starts_with("blaze-").then(|| format!("{}/.blaze/v2/toolchain", std::env::var("HOME").expect("HOME")));
+        let choice = FrontChoice::New(NewFront { package: "ladder", edition: &edition, shelf: shelf.as_deref() });
         let mut failed = None;
         let (status, out) = capture(|| match run_with(&views, "src/main.rs", None, choice) {
             Ok(status) => status,

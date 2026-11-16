@@ -93,7 +93,7 @@ impl core::fmt::Display for BodyError {
             BodyError::Const { item, error } => write!(f, "constant {item:x}, an array length: {error}"),
             BodyError::NoText(k) => write!(f, "fn {k:x}: the names library holds no text for it (a member of a trait or an impl is lowered by `lower_member`)"),
             BodyError::NoHead(k) => write!(f, "member fn {k:?}: its head is not in the store (make its container's head first)"),
-            BodyError::NoBody(k) => write!(f, "member fn {k:?}: it has no body (a required trait method)"),
+            BodyError::NoBody(k) => write!(f, "fn {k:?}: its text has no body (a required trait method, an intrinsic or a foreign fn)"),
             BodyError::Cfg(k) => write!(f, "fn {k:x}: its lowering asks for a `cfg` the crate does not answer"),
             BodyError::Generics { item, why } => write!(f, "fn {item:x}: its generic parameters: {why:?}"),
             BodyError::Record { item, why } => write!(f, "fn {item:x}: its lowered record: {why:?}"),
@@ -384,6 +384,9 @@ fn lower_at<'n>(names: &'n Names<'n>, prepared: &Prepares<'n>, keys: &mut Keys, 
                 typeck = Some((b, own));
                 break;
             }
+            // A fn whose text has no body (an intrinsic's or a foreign fn's declaration, met
+            // before its head was made): the table's to say how it is called, never a lowering.
+            Err(Refused::NoBody) => return Err(BodyError::NoBody(owner)),
             Err(refused) => match types.failed.take() {
                 // Lowered again into a finished table: a head it lacks cannot be added there.
                 Some(why @ Why::Need(_)) if again_now => return Err(BodyError::Convert { item, refused, why: Some(why) }),

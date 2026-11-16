@@ -25,10 +25,12 @@ use crate::facts::ScopeFacts;
 use crate::{AmbiguityKind, Def, DefKind, Edition, Namespace, Path, PathKind, Rename, Unresolved, UseForm, Visibility, WrittenVis};
 
 mod deps;
+mod seam;
 #[cfg(test)]
 mod tests;
 
 pub(crate) use deps::{BuiltDeps, DepAnswer, DepNames};
+pub(crate) use seam::shadow;
 
 pub(crate) const NAMESPACES: [Namespace; 3] = [Namespace::Types, Namespace::Values, Namespace::Macros];
 

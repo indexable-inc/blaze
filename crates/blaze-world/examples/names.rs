@@ -475,6 +475,9 @@ struct Timed<'w> {
 /// moves its own crate's surface only, and its dependents see its exports digest unchanged.
 struct KeptDir<'w> {
     dir: PathBuf,
+    /// The checkout's root (paths `/0/<inner>`), and whether a file's stamp may stand for it.
+    root: PathBuf,
+    stamps: bool,
     /// The same texts the ready queue's workers read at once (`Texts` holds a `dyn Tree` that is
     /// not marked `Sync`; it is read from every worker already): [`OnGlobal`].
     texts: OnGlobal<&'w Timed<'w>>,
@@ -488,12 +491,31 @@ struct KeptDir<'w> {
     missed: Vec<std::sync::Mutex<Option<String>>>,
 }
 
-const KEPT_MAGIC: &[u8; 8] = b"BZKEPT1\0";
+const KEPT_MAGIC: &[u8; 8] = b"BZKEPT2\0";
 
 impl KeptDir<'_> {
     fn path(&self, krate: usize) -> PathBuf {
         let key = self.inputs[krate].key.0.0;
         self.dir.join(key.iter().map(|b| format!("{b:02x}")).collect::<String>())
+    }
+
+    /// A checkout file's stamp: its length, change time and inode (`stat`, one call, no read);
+    /// all zeros when absent. Equal stamps: the file is taken as unchanged, its surface not
+    /// computed again (step 3's fixed cost; `--no-stamps` turns this off to measure it).
+    fn stamp(&self, path: &str) -> [u8; 24] {
+        use std::os::unix::fs::MetadataExt as _;
+        let inner = path.strip_prefix("/0/").unwrap_or_else(|| panic!("kept record: `{path}` is not a checkout path"));
+        let mut out = [0u8; 24];
+        match std::fs::metadata(self.root.join(inner)) {
+            Ok(m) => {
+                out[..8].copy_from_slice(&m.len().to_le_bytes());
+                out[8..16].copy_from_slice(&(m.ctime() as u64 ^ ((m.ctime_nsec() as u64) << 34)).to_le_bytes());
+                out[16..].copy_from_slice(&m.ino().to_le_bytes());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => panic!("kept record: stat of checkout file {inner}: {e}"),
+        }
+        out
     }
 
     /// A checkout file's surface today: zeros when absent.
@@ -556,8 +578,9 @@ impl blaze_scope::crate_scope::Kept for KeptDir<'_> {
         for _ in 0..r.u32("the file count") {
             let len = r.u32("a path's length");
             let path = std::str::from_utf8(r.take(len, "a path")).unwrap_or_else(|e| panic!("kept record {}: a path not UTF-8: {e}", file.display()));
+            let stamp = r.take(24, "a stamp");
             let was = r.id("a surface");
-            if why.is_none() && self.surface(krate, path) != was {
+            if why.is_none() && !(self.stamps && self.stamp(path) == stamp) && self.surface(krate, path) != was {
                 why = Some(format!("the surface of {path} moved"));
             }
         }
@@ -595,6 +618,9 @@ impl blaze_scope::crate_scope::Kept for KeptDir<'_> {
         for path in &files {
             out.extend_from_slice(&(path.len() as u32).to_le_bytes());
             out.extend_from_slice(path.as_bytes());
+            // The stamp before the text is read: a write between the two leaves an old stamp,
+            // so the next run outlines the file again rather than trust it.
+            out.extend_from_slice(&self.stamp(path));
             out.extend_from_slice(&self.surface(krate, path));
         }
         out.extend_from_slice(&(read.len() as u32).to_le_bytes());
@@ -1271,6 +1297,8 @@ fn main() {
         if let Some(dir) = kept_dir.as_ref() {
             let kept = KeptDir {
                 dir: dir.clone(),
+                root: root.clone(),
+                stamps: !args.iter().any(|a| a == "--no-stamps"),
                 texts: OnGlobal(texts),
                 inputs,
                 by_key: inputs.iter().enumerate().map(|(i, c)| (c.key, i)).collect(),

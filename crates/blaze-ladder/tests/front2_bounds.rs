@@ -20,6 +20,13 @@
 //! trait impl that does not declare `X` (the Reference, "Paths", "`Self`"): `<Self as Tr>::X` for
 //! the trait or supertrait declaring it; core: `impl DoubleEndedIterator for CaseMappingIter {
 //! fn rfold<B, F>(..) where F: FnMut(B, Self::Item) -> B }` (core/src/char/mod.rs:598).
+//!
+//! Trait aliases (the unstable book, `trait_alias`: "Trait aliases ... `trait Foo = Bar + Baz;`
+//! ... used as a bound is equivalent to" its right-hand side; the pinned core declares `pub trait
+//! Thin = Pointee<Metadata = ()> + PointeeSized;` in core/src/ptr/metadata.rs and bounds by it,
+//! `pub unsafe fn catch_unwind<Data: ptr::Thin>`): a bound, a where clause, `impl Alias`, a
+//! supertrait and `dyn Alias` stand for its clauses with `Self` and its parameters substituted,
+//! through an alias of an alias; aliases naming each other are a typed cycle.
 
 #![feature(variant_count)]
 
@@ -66,10 +73,27 @@ fn gat_bound<'a, P: core::str::pattern::Pattern<Searcher<'a>: Clone>>(s: &P::Sea
 struct Count(u8);
 impl Iterator for Count { type Item = u8; fn next(&mut self) -> Option<u8> { None } }
 impl DoubleEndedIterator for Count { fn next_back(&mut self) -> Option<Self::Item> { None } }
+trait Conv<T> = Into<T> + Copy;
+trait Conv16 = Conv<u16>;
+trait Bytes = Iterator<Item = u8>;
+trait Sub: Bytes {}
+trait CycA = CycB;
+trait CycB = CycA;
+fn thin<T: core::ptr::Thin>(p: *const T) -> () { core::ptr::metadata(p) }
+fn thin_where<P>(p: *const P) -> () where P: core::ptr::Thin { core::ptr::metadata(p) }
+fn conv<A: Conv<u16>>(a: A) -> (u16, u16) { (a.into(), a.into()) }
+fn conv16<A: Conv16>(a: A) -> u16 { a.into() }
+fn bytes<I: Bytes>(mut i: I) -> Option<u8> { i.next() }
+fn bytes_item<I: Bytes>(mut i: I) -> Option<I::Item> { i.next() }
+fn bytes_apit(mut i: impl Bytes) -> Option<u8> { i.next() }
+fn bytes_dyn(i: &mut dyn Bytes) -> Option<u8> { i.next() }
+fn sub_next<S: Sub>(mut s: S) -> Option<u8> { s.next() }
+fn cyc<T: CycA>(t: T) -> T { t }
+fn use_conv() -> (u16, u16) { conv(3u8) }
 ";
 
 /// The bodies that must check clean, each with what it proves.
-const CLEAN: [(&str, &str); 18] = [
+const CLEAN: [(&str, &str); 28] = [
     ("call_bound", "`F: Fn(u8) -> u16` on the parameter: `Fn<(u8,)>` and `Output = u16`"),
     ("call_where", "`where F: FnMut(u8)`: the output is `()`"),
     ("call_apit", "`impl FnOnce(u8, bool) -> u16` in argument position"),
@@ -88,6 +112,16 @@ const CLEAN: [(&str, &str); 18] = [
     ("hr_ptr", "`for<'a> fn(&'a u8) -> u8`"),
     ("assoc_bound", "`I: Iterator<Item: Clone>` (an associated type bound): `<I as Iterator>::Item: Clone`"),
     ("gat_bound", "`P: Pattern<Searcher<'a>: Clone>`: a lifetime argument of the associated type is erased"),
+    ("thin", "`T: Thin` (core: `pub trait Thin = Pointee<Metadata = ()> + PointeeSized;`): the trait clause and the projection, so `metadata(p)` is `()`"),
+    ("thin_where", "`where P: Thin`"),
+    ("conv", "`trait Conv<T> = Into<T> + Copy`: a generic alias, its parameter substituted"),
+    ("conv16", "`trait Conv16 = Conv<u16>`: an alias of an alias"),
+    ("bytes", "`trait Bytes = Iterator<Item = u8>`: an alias with an associated type binding"),
+    ("bytes_item", "`I::Item` through `I: Bytes`: looked up through the traits the alias stands for"),
+    ("bytes_apit", "`impl Bytes` in argument position"),
+    ("bytes_dyn", "`dyn Bytes`: the object of `Iterator<Item = u8>`"),
+    ("sub_next", "`trait Sub: Bytes`: an alias as a supertrait"),
+    ("use_conv", "`conv(3u8)`: the alias's clauses are what the caller proves"),
 ];
 // `display` (`write!(f, \"{t}\")` with `T: Display`) is not in CLEAN: past the lang item it meets
 // the checker's internal `UnknownInCleanBody` at the format arguments (the checker's lane). The
@@ -174,6 +208,14 @@ fn bounds_through_front2() {
         }
     }
     assert_eq!(impls, 2, "the fixture's two impls");
+    // Two trait aliases that name each other stand for nothing: a typed cycle naming both.
+    match store.ensure(&names, &mut front.keys, Want::Fn(lib("cyc"))) {
+        Err(e @ blaze_ladder::front2::heads::HeadError::Cycle(_)) => println!("cyc: {e}"),
+        other => {
+            println!("cyc: not the cycle error: {other:?}");
+            failed.push("cyc");
+        }
+    }
     println!("clean: {clean:?}");
     assert!(failed.is_empty(), "bodies that must check clean, or impl heads that must build, did not: {failed:?}");
 

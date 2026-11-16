@@ -3010,7 +3010,10 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
         let text = |name: NameIdx| self.out.name_ranges[name.0 as usize].of(self.text());
         match path.segments.len {
             1 => {}
-            2 | 3 if matches!(text(self.segment_name(p, 0)?), "$crate" | "core" | "std") => {}
+            // An expansion writes its `$crate` as its crate's one identifier
+            // (blaze-expand's `body_words`).
+            2 | 3 if matches!(text(self.segment_name(p, 0)?), "$crate" | "core" | "std")
+                || text(self.segment_name(p, 0)?).starts_with(blaze_surface::DOLLAR_CRATE) => {}
             _ => return None,
         }
         let name = text(self.segment_name(p, usize::MAX)?);

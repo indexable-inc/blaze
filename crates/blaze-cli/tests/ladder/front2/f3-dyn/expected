@@ -1,0 +1,4 @@
+status 0
+stdout
+dyn: 42
+dropped: 2

@@ -982,34 +982,8 @@ fn path_tokens<'t, 'a>(text: &'t str, alloc: Alloc<'a>) -> Option<AVec<'a, PTok<
     Some(out)
 }
 
-/// How an expansion's text writes a `$crate` of another crate than the one it expands in:
-/// `__dollar_crate_` and the crate key's 64 hex digits: one identifier to the outline's parser
-/// and the path reader, read back as `$crate` of that crate.
-pub const DOLLAR_CRATE: &str = "__dollar_crate_";
-
-/// [`DOLLAR_CRATE`] of a crate, as it is written.
-#[derive(Clone, Copy, Debug)]
-pub struct DollarCrate(pub CrateItemKey);
-
-impl fmt::Display for DollarCrate {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(DOLLAR_CRATE)?;
-        self.0.0.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
-    }
-}
-
-/// The crate a [`DOLLAR_CRATE`] identifier names.
-pub fn dollar_crate_of(text: &str) -> Option<CrateItemKey> {
-    let hex = text.strip_prefix(DOLLAR_CRATE)?;
-    if hex.len() != 64 {
-        return None;
-    }
-    let mut id = [0u8; 32];
-    for (at, byte) in id.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(hex.get(at * 2..at * 2 + 2)?, 16).ok()?;
-    }
-    Some(CrateItemKey(ContentId(id)))
-}
+/// How an expansion's text writes a `$crate`: its one home is blaze-surface, beside `DefSite`.
+pub use blaze_surface::{DOLLAR_CRATE, DollarCrate, dollar_crate_of};
 
 /// The path of `segments` as written (`abs` for a leading `::`) in the crate `krate`.
 pub fn to_path<'t, 'a>(abs: bool, segments: &[&'t str], krate: CrateItemKey, alloc: Alloc<'a>) -> Path<'a, &'t str> {

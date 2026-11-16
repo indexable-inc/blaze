@@ -17,7 +17,7 @@ use blaze_lower::form as lf;
 use blaze_lower::{BodyRange, TextAt, View};
 use blaze_surface::Range;
 use blaze_typeck as tc;
-use blaze_typeck::{ItemKey, List, Name, PNode, PTy, PathIdx, PortableTys};
+use blaze_typeck::{ItemKey, List, Name, PClause, PNode, PTy, PathIdx, PortableTys};
 
 use crate::resolve::{Kind, Ns, ResolveError, Resolver};
 
@@ -161,11 +161,31 @@ pub trait Heads {
     /// i-th parameter): a path to it means the aliased type with its arguments substituted.
     /// `Some(None)`: its head was tried and refused (the why is in the store's `alias_gaps`).
     fn alias(&self, alias: LibKey) -> Option<Option<(u32, PTy)>>;
+    /// A trait alias's head (`trait A<T> = B<T> + C where ..;`): what a bound naming it stands
+    /// for. `None` when not lowered yet.
+    fn trait_alias(&self, alias: LibKey) -> Option<&TraitAliasHead>;
     /// The const generic parameters of the struct, enum, union, trait or type alias `item`
     /// (index, declared type), sorted by index; `None` when its head is not lowered yet.
     fn const_params(&self, item: LibKey) -> Option<&[(u32, PTy)]>;
     /// The checker key of a library key (filed in the key map at the start).
     fn checker(&self, key: LibKey) -> ItemKey;
+}
+
+/// A trait alias's head. The unstable book, `trait_alias`: "Trait aliases ... `trait Foo = Bar
+/// + Baz;` ... used as a bound is equivalent to" its right-hand side; the pinned core's
+/// `pub trait Thin = Pointee<Metadata = ()> + PointeeSized;` (library/core/src/ptr/metadata.rs).
+/// Its clauses are over `Self` = `Param(0)` and its own parameters after it; an alias named in
+/// them is already expanded (its head was made first), so a use substitutes once.
+#[derive(Clone, Debug)]
+pub struct TraitAliasHead {
+    /// Its generics, `Self` included.
+    pub generics: u32,
+    /// Its bounds on `Self` and its where clauses, as clauses (trait clauses and the
+    /// projections of `Name = T`); no implied `Sized` on its own parameters.
+    pub clauses: Vec<PClause, Global>,
+    /// Its trait clauses on `Self` by library key (what `T::X` is looked up through, as a
+    /// [`ParamBound`]), with their arguments over the same parameters.
+    pub traits: Vec<(LibKey, List), Global>,
 }
 
 /// What `Self` is where the type is written.
@@ -902,11 +922,45 @@ impl<'b, 'n, H: Heads> Builder<'b, 'n, H> {
 
     /// [`Self::trait_path`] over the path's texts.
     pub(super) fn trait_at(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, abs: bool, texts: &[&str], r: Range, self_ty: PTy, given: &[PTy]) -> Result<(LibKey, List), Why> {
-        let found = self.resolver.path(env.module, abs, texts, Ns::Type).map_err(|e| Why::Resolve(e, r))?;
-        if found.kind != Kind::Trait || found.consumed as usize != texts.len() {
-            return Err(program(format!("this path is not a trait"), r));
+        match self.bound_target(env, abs, texts, r)? {
+            Bounded::Trait(key) => self.trait_args(tys, key, r, self_ty, given),
+            Bounded::Alias(_) => Err(program(format!("`{}` is a trait alias, which stands for bounds, not one trait (an impl's trait, a `T::X` bound)", texts.join("::")), r)),
         }
-        let (g, defaults) = self.heads.trait_head(found.key).ok_or(Why::Need(found.key))?;
+    }
+
+    /// What a bound's path names, by the names library: a trait or a trait alias.
+    pub(super) fn bound_target(&self, env: &Env<'_>, abs: bool, texts: &[&str], r: Range) -> Result<Bounded, Why> {
+        let found = self.resolver.path(env.module, abs, texts, Ns::Type).map_err(|e| Why::Resolve(e, r))?;
+        match found.kind {
+            _ if found.consumed as usize != texts.len() => Err(program(format!("this path is not a trait"), r)),
+            Kind::Trait => Ok(Bounded::Trait(found.key)),
+            Kind::TraitAlias => Ok(Bounded::Alias(found.key)),
+            _ => Err(program(format!("this path is not a trait"), r)),
+        }
+    }
+
+    /// The trait alias `alias` as a bound on `self_ty` with the written arguments `given`: its
+    /// clauses with `Self` and its parameters substituted (the unstable book, `trait_alias`:
+    /// a bound naming it "is equivalent to" its right-hand side), into `out`.
+    pub(super) fn alias_clauses(&self, tys: &mut PortableTys<'_>, alias: LibKey, r: Range, self_ty: PTy, given: &[PTy], out: &mut Vec<PClause, Global>) -> Result<(), Why> {
+        let head = self.heads.trait_alias(alias).ok_or(Why::Need(alias))?;
+        let want = head.generics as usize - 1;
+        if given.len() != want {
+            return Err(program(format!("a trait alias written with {} type arguments; it takes {want}", given.len()), r));
+        }
+        let mut args = Vec::with_capacity_in(want + 1, Global);
+        args.push(self_ty);
+        args.extend_from_slice(given);
+        for &c in &head.clauses {
+            out.push(subst_clause(tys, c, &args)?);
+        }
+        Ok(())
+    }
+
+    /// The trait `key` with `self_ty` as `Self` and the written arguments `given`, the
+    /// defaults of those not written put in.
+    pub(super) fn trait_args(&self, tys: &mut PortableTys<'_>, key: LibKey, r: Range, self_ty: PTy, given: &[PTy]) -> Result<(LibKey, List), Why> {
+        let (g, defaults) = self.heads.trait_head(key).ok_or(Why::Need(key))?;
         let want = g as usize - 1;
         if given.len() > want {
             return Err(program(format!("a trait written with {} type arguments; it takes {want}", given.len()), r));
@@ -921,8 +975,35 @@ impl<'b, 'n, H: Heads> Builder<'b, 'n, H> {
             let d = subst(tys, d, &args)?;
             args.push(d);
         }
-        Ok((found.key, intern_list(tys, &args)?))
+        Ok((key, intern_list(tys, &args)?))
     }
+}
+
+/// What a bound's path names ([`Builder::bound_target`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Bounded {
+    Trait(LibKey),
+    Alias(LibKey),
+}
+
+/// The clause `c` with each `Param(i)` replaced by `args[i]` ([`subst`] over its parts).
+pub fn subst_clause(tys: &mut PortableTys<'_>, c: PClause, args: &[PTy]) -> Result<PClause, Why> {
+    let list = |tys: &mut PortableTys<'_>, l: List| -> Result<List, Why> {
+        let old = tys.view().list(l).map_err(|_| program(format!("a clause refers past the type table"), Range::new(0, 0)))?.to_vec_in(Global);
+        let mut new = Vec::with_capacity_in(old.len(), Global);
+        for t in old {
+            new.push(subst(tys, t, args)?);
+        }
+        intern_list(tys, &new)
+    };
+    Ok(match c {
+        PClause::Trait { trait_, args: l } => PClause::Trait { trait_, args: list(tys, l)? },
+        PClause::Projection { trait_, args: l, name, term } => {
+            let l = list(tys, l)?;
+            PClause::Projection { trait_, args: l, name, term: subst(tys, term, args)? }
+        }
+        PClause::Const { cond, args: l } => PClause::Const { cond, args: list(tys, l)? },
+    })
 }
 
 /// `t` with each `Param(i)` replaced by `args[i]`, by a work list. Moved here from front.rs,

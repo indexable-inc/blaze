@@ -118,7 +118,7 @@ impl std::error::Error for ScriptError {}
 #[derive(Debug)]
 pub enum RecordError {
     /// The read-list chain or the store under it.
-    Chain(blaze_record::Error<std::io::Error>),
+    Chain(blaze_record::Error<crate::record::FilesError>),
     /// The answer under `base` is not a run's outputs.
     NotOutputs { base: ContentId, why: blaze_build_script::outputs::RecordError },
 }

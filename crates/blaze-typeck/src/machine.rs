@@ -771,7 +771,24 @@ impl<'b, 'w, 'c, 'a, W: World, C: TypeCtx> Machine<'b, 'w, 'c, 'a, W, C> {
                             }
                             _ => DiagCode::AnnotationsNeeded,
                         };
-                        self.diag(code, at, None, None, None);
+                        // The finding names the goal left undecided, entire, as an unmet one
+                        // does: "cannot satisfy `T: Tr`" says which goal had two answers.
+                        let goal = match err.obligation.goal {
+                            crate::ty::Goal::Trait { trait_, args } => Some(PendingGoal::Trait { trait_, args }),
+                            crate::ty::Goal::Projection { trait_, args, name, term } => {
+                                Some(PendingGoal::Projection { trait_, args, name, term })
+                            }
+                            _ => None,
+                        };
+                        match goal {
+                            Some(goal) => {
+                                let (PendingGoal::Trait { args, .. } | PendingGoal::Projection { args, .. }) = goal;
+                                let found = if self.ty.list_len(args) > 0 { Some(self.ty.list_get(args, 0)) } else { None };
+                                self.errors += 1;
+                                self.diags.push(PendingDiag { code, at, expected: None, found, name: None, because: None, unmet: Some((goal, None)) });
+                            }
+                            None => self.diag(code, at, None, None, None),
+                        }
                     }
                 }
                 crate::ty::FulfillErrorKind::Unsatisfied | crate::ty::FulfillErrorKind::Mismatch => match err.because {

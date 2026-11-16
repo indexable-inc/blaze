@@ -282,7 +282,18 @@ toolchain shelf, two hello-world copies differing in package name, load 11.1):
    reads a member, a path or git package (a `[patch]`) stays the project's. Not yet in the
    chain oracle: the simulation's `EvenLengths` stands for the rule, not the names.
 
+The machine store's counts are profile rows now (`machine found .. written ..; packs .. read
+whole ..` in `.blaze/v2/profile.txt`), not a stderr line: `a_clean_run_says_nothing_of_its_own`
+"1 passed, 0 failed".
+
 **Next, in order:**
+0. MEASURE (not done: the first greenmix waited 1200 s on the build lock; a second was started
+   at hand-on and keeps its binary as `blaze-shared`): `port27/shared-1116/exp2.sh e3
+   <blaze-shared> proto` and `exp2.sh e4 <blaze-shared> proto-cfg` (a home beside, not under,
+   the projects; `check .` from inside each; b run twice). Quote: no "machine store off" line;
+   b's second run's profile row `read whole 0` and its gate time against e2's 30.670 ms;
+   proto-cfg b cold "names resolved for 1 crates". Then tell the driver lane (OWNERS.md) the
+   `UnitGraph` row (22.896 ms) in one message.
 1. HTTP origin: an `Origin` over blaze-h1 ranged GETs through bstd `Net` (`Net::connect`,
    `Conn::recv`; blaze-h1 `write_request` with `Range`, `Response::new_in(Limits, ..)` bounds the
    head and body before reading, `Response::ranged(asked)` checks `Content-Range`; a 3xx is

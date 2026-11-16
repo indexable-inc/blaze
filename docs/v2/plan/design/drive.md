@@ -841,6 +841,41 @@ once; the plant `RanUnderCondition` (an asker served a fork it does not imply) i
       `left_out_note` must stop deriving "check types" from it; (3c) unresolved own paths as
       errors, "N paths wait on: <cause> (k)", and "names resolved for N crates" always;
       "pass on": scripts/src/bin/smoke.rs may expect `check` exit 0.
+    - RUNNER 5 2026-11-16 (uncommitted). Seen run: "test blaze-drive: exit 0; 37 passed, 0
+      failed"; with request.rs `locate`'s home-failed check turned off,
+      `a_failed_file_fails_its_surface_and_its_readers_not_the_request` fails: "the request
+      failed: a task wanted Surface(53450ed73c83) of FileItems(53450ed73c83), which does not
+      list it"; back on, 37 passed. Written: (2) request.rs `absent_module`: a module part its
+      settled home lists, opened and found at neither place, is a drive-made record of one
+      finding (`MODULE_FILE_MISSING_RULE` 0xC0F7, both paths; `PATH_FILE_MISSING_RULE` 0xC0F8
+      for `#[path]`), placed at the `mod` item in the home's file (`settle`: `absent`), keyed
+      by the paths; words in blaze-report words.rs, Area::Drive in print.rs. (3a) main.rs
+      `close`: the closing line and status in one function `command` and the test helper `ask`
+      both call (`Checked.status`); `CHECK_STAGES` splits "syntax of items" (built) from
+      "syntax inside bodies" (not); tests `a_missing_module_file_is_one_finding_at_its_mod_line`,
+      `a_clean_check_says_incomplete_and_exits_3`. Pass on (not this lane's files):
+      scripts/src/bin/smoke.rs:45 and :163 (`Step::Check` expects exit 0; now 3);
+      docs/terminal.md:162 ("one `ok` or `failed` line always").
+      (3b) plan, not written: a `BodyCheck` part per fn/const/static item with a body in
+      work.rs `outline_file` (name = file subject + the item's ancestor chain of kind, name,
+      disambiguator; `Locate::Source(digest(item.hash, edition))`); its task reads the home's
+      file (`Request::file_of`) and finds the item by `task.place` in the home `FileItems`
+      record (a `Need` of the home), parses `parser::Reparser::top_level_item().parse` (the
+      entry of blaze-lower `lower_body`; add `parser.workspace` to blaze-cli), and emits SYNTAX
+      findings item-relative (lexer errors by `text_range`, parser `Step::Error` at the end of
+      the last taken token, trivia skipped as blaze-file-items walk.rs `skip_trivia`). Then
+      `builds(BodyCheck)` true and `CHECK_STAGES` "syntax inside bodies" true; `left_out`
+      still names "check types" while `Signature` is unbuilt (one stage, any kind short).
+      `CHECK_STAGES` and `work::left_out` are two homes of one concept: merge them.
+      (3c) plan, not written: names.rs `run` counts `done.names.notes` (blaze-scope resolve.rs
+      `NamesNote`: Lower, Root, Expand, Made, ExternDropped ..) into one u32; classify each
+      note instead: `Expand` of a call not run (which macro) and a path under a build
+      script's `OUT_DIR` / `env!` not given (which script) are waiting classes, each counted by
+      cause; every other unresolved path in a project crate is a SYNTAX-like finding of the
+      crate's record (`made.find`, its item-relative place from the note's `Loc`). main.rs
+      :732 "names resolved for N crates; N paths unresolved by known gaps" becomes "N paths
+      wait on: <cause> (k)" per cause, and "names resolved for N crates" moves to the profile.
+      Test: `use nothing::here;` is one error naming the path and line.
 - Owed, not now: `run` after `check` writes its own certificate, because the command is in
   the key. That costs 3.5 ms against the second run's 1.0 ms on hello-world. A coarse proof
   covers all under it: `check`'s certificate should stand for `run`'s check part.

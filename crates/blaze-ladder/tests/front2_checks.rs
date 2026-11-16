@@ -80,12 +80,23 @@ fn need_deref<T: Deref>(_: &T) {}
 fn vec_derefs(v: Vec<u8>) { need_deref(&v) }
 fn try_output<T: core::ops::Try<Output = ()>>(_: T) {}
 fn result_output(r: Result<(), E>) { try_output(r) }
+fn field_wrong(c: Arc<Cancel>) -> u8 { c.set }
+fn takes_bool(_: &bool) {}
+fn coerce_wrong(b: &Box<[u8]>) { takes_bool(b) }
+fn try_no_from(r: Result<(), E2>) -> Result<(), E> { r?; Ok(()) }
+fn option_in_result(o: Option<u8>) -> Result<u8, E> { let x = o?; Ok(x) }
 ";
 
-/// The bodies that must check clean, each with what it proves.
+/// The bodies that must check clean, each with what it proves. `vec_iter` and `try_same` come
+/// first, before any other body has filled the shared records, and again later: until the
+/// solver's `coherence::fresh_for` took an impl parameter's kind from the impl's own terms, an
+/// impl's type parameter became a const variable once any item with a const parameter at that
+/// index was in the shared table, so whether `Vec<u8>: Deref` or `Result<(), E>: Try` matched
+/// depended on what was checked before (census-bnd-1: E0599 112, E0308 41, E0609 31, E0277 Try
+/// 81).
 const CLEAN: &[(&str, &str)] = &[
-    ("vec_iter", "FIRST"),
-    ("try_same", "FIRST"),
+    ("vec_iter", "`[u8]::iter` on `Vec<u8>`, before any other body"),
+    ("try_same", "`?` on `Result<(), E>`, before any other body"),
     ("w_field", "a field through a local `Deref` impl"),
     ("arc_star", "`*a` on `Arc<u8>`"),
     ("vec_deref_bound", "`Vec<u8>: Deref<Target = [u8]>` as a bound"),
@@ -115,6 +126,17 @@ const CLEAN: &[(&str, &str)] = &[
     ("main", "the entry"),
 ];
 
+/// The bodies that must NOT check clean, with the finding each must have: the target a deref
+/// reaches is the impl's `Target`, not a type left open for the context to choose.
+const REFUSED: &[(&str, &str)] = &[
+    ("arc_star_wrong", "Mismatch"),
+    ("guard_star_wrong", "Mismatch"),
+    ("field_wrong", "Mismatch"),
+    ("coerce_wrong", "Mismatch"),
+    ("try_no_from", "Unsatisfied"),
+    ("option_in_result", "Unsatisfied"),
+];
+
 #[test]
 fn deref_and_try_through_front2() {
     let home = std::env::var("HOME").expect("HOME is set");
@@ -141,7 +163,8 @@ fn deref_and_try_through_front2() {
     let mut buckets = None;
     let mut failed = Vec::new();
     let mut report: Vec<String> = Vec::new();
-    for (name, proves) in CLEAN {
+    let cases = CLEAN.iter().map(|&(n, p)| (n, p, None)).chain(REFUSED.iter().map(|&(n, w)| (n, "must be refused", Some(w))));
+    for (name, proves, want) in cases {
         if let Err(e) = store.ensure(&names, &mut front.keys, Want::Fn(lib(name))) {
             report.push(format!("{name}: no head: {e:?}"));
             failed.push(name);
@@ -159,43 +182,22 @@ fn deref_and_try_through_front2() {
         let spell = Spelling::of(&view).expect("spelling");
         let scope = body.scope(&spell);
         let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: None };
-        match check_body(&mut records, &body, &scope) {
-            Ok(_) => report.push(format!("{name}: clean")),
-            Err(CheckFail::Diags { diags, .. }) => {
+        match (check_body(&mut records, &body, &scope), want) {
+            (Ok(_), None) => report.push(format!("{name}: clean")),
+            (Err(CheckFail::Diags { diags, .. }), Some(w)) if format!("{diags:?}").starts_with(&format!("[({w},")) => {
+                report.push(format!("{name}: clean"));
+            }
+            (Ok(_), Some(w)) => {
+                report.push(format!("{name}: checked clean, but must be refused with {w}"));
+                failed.push(name);
+            }
+            (Err(CheckFail::Diags { diags, .. }), _) => {
                 report.push(format!("{name}: diagnostics {diags:?} ({proves})"));
                 failed.push(name);
             }
-            Err(other) => {
+            (Err(other), _) => {
                 report.push(format!("{name}: {other:?} ({proves})"));
                 failed.push(name);
-            }
-        }
-    }
-    let mut probes = String::new();
-    if let Some(b) = buckets.as_ref() {
-        for lang in ["deref", "Try"] {
-            let t = front.index.lang(lang).map(blaze_ladder::front2::keys::checker_of).expect("lang");
-            for (tr, _, found) in b.answered() {
-                if tr != t {
-                    continue;
-                }
-                for k in found {
-                    let Some(h) = store.impls.get(k) else { println!("probe {lang}: {k:?} no head"); continue };
-                    let tys = store.tys.view();
-                    let named = |t: blaze_typeck::ItemKey| -> String {
-                        for l in ["sized", "meta_sized", "pointee_sized", "Try", "deref"] {
-                            if front.index.lang(l).map(blaze_ladder::front2::keys::checker_of) == Some(t) {
-                                return l.to_string();
-                            }
-                        }
-                        format!("{:x}", t.0 >> 96)
-                    };
-                    let preds: Vec<String> = store.preds.get(k).map(|p| p.clauses.iter().map(|c| match c {
-                        blaze_typeck::PClause::Trait { trait_, args } => format!("{}{:?}", named(*trait_), tys.list(*args).map(|l| l.iter().map(|t| tys.node(*t)).collect::<Vec<_>>())),
-                        other => format!("{other:?}"),
-                    }).collect()).unwrap_or_default();
-                    probes += &format!("\nprobe {lang}: g={} self={:?} assoc={:?} preds={preds:?}", h.generics, tys.node(h.self_ty), h.assoc.iter().map(|(_, t)| tys.node(*t)).collect::<Vec<_>>());
-                }
             }
         }
     }
@@ -205,5 +207,5 @@ fn deref_and_try_through_front2() {
         println!("{line}");
     }
     let why: Vec<String> = report.iter().filter(|l| !l.ends_with(": clean")).map(|l| l.chars().take(260).collect()).collect();
-    assert!(failed.is_empty(), "bodies that must check clean did not: {failed:?}\n{}{probes}", why.join("\n"));
+    assert!(failed.is_empty(), "bodies that did not check as they must: {failed:?}\n{}", why.join("\n"));
 }

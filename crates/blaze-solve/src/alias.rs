@@ -86,6 +86,9 @@ pub enum Rule {
     /// `DiscriminantKind::Discriminant` (normalizes_to.rs
     /// `consider_builtin_discriminant_kind_candidate`; builtin.rs `normalize_discriminant`).
     Discriminant,
+    /// `Pointee::Metadata` (normalizes_to.rs `consider_builtin_pointee_candidate`; builtin.rs
+    /// `metadata_ty`).
+    Metadata,
     /// Not a candidate: the frame's normalized self type kept from assembly stage 0 to stage 1
     /// in `Cand::a`; removed before assembly is done.
     Stash,
@@ -357,6 +360,9 @@ fn assemble_normalizes_to<T: Tys, F: Facts>(
             if cx.is_lang(item, Lang::Discriminant)? {
                 out.push(cand(Source::Builtin(BuiltinSource::Misc), Rule::Discriminant, self_ty));
             }
+            if cx.is_lang(item, Lang::Metadata)? {
+                out.push(cand(Source::Builtin(BuiltinSource::Misc), Rule::Metadata, self_ty));
+            }
             match shape_of_kind(cx.kind(self_ty)) {
                 None => out.push(forced_ambiguity(Source::Builtin(BuiltinSource::Misc))),
                 Some(shape) => {
@@ -555,6 +561,20 @@ pub fn step<T: Tys, F: Facts>(cx: &mut Cx<'_, '_, T, F>, cand: &mut Cand, rule: 
                     if cx.eq(term, r)? { Ok(Step::Done(Certainty::Yes)) } else { Ok(Step::No) }
                 }
             }
+        }
+        Rule::Metadata => {
+            let (alias, term) = nt_goal(cx)?;
+            let Some((_, kind, item, args)) = alias_parts(cx, alias) else { return Err(malformed()) };
+            let d = match crate::builtin::metadata_ty(cx, cand.a)? {
+                crate::builtin::Metadata::Is(d) => d,
+                // `<tail as Pointee>::Metadata`, rigid: the tail's sizedness is not known here.
+                crate::builtin::Metadata::Rigid(tail) => {
+                    let l = args_with_self(cx, args, tail)?;
+                    cx.mk(TyKind::Alias(Rigid::Yes, kind, item, l))?
+                }
+                crate::builtin::Metadata::Ambiguous => return Ok(Step::Done(Certainty::Ambiguous)),
+            };
+            if cx.eq(term, d)? { Ok(Step::Done(Certainty::Yes)) } else { Ok(Step::No) }
         }
         Rule::Stash => Err(malformed()),
     }

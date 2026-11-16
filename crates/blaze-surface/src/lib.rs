@@ -106,8 +106,8 @@ pub use crate::lang_items::{
 };
 pub use crate::locals::{AnyItem, Local, LocalTable};
 pub use crate::macro_def::{
-    BuiltinAttr, BuiltinDerive, BuiltinFn, DefSite, MacroDef, MacroDefHead, MacroDefView,
-    MacroKind, ProcKind, Transparency,
+    BuiltinAttr, BuiltinDerive, BuiltinFn, DOLLAR_CRATE, DefSite, DollarCrate, MacroDef,
+    MacroDefHead, MacroDefView, MacroKind, ProcKind, Transparency, dollar_crate_of,
 };
 pub use crate::module_decls::{
     ChildModDecl, DeclaredItem, DeclsBuilder, ExpandedDecls, ExternCrateDecl, MacroCallDecl,

@@ -66,7 +66,7 @@ pub fn framed(
     out: &Out,
 ) -> Result<(), CliError> {
     let area = match finding.rule {
-        OVER_CAP_RULE | MODULE_FILE_MISSING_RULE | PATH_FILE_MISSING_RULE => Area::Drive,
+        OVER_CAP_RULE | blaze_drive::request::MODULE_FILE_MISSING_RULE | blaze_drive::request::PATH_FILE_MISSING_RULE => Area::Drive,
         _ => Area::Cli,
     };
     let message = core::str::from_utf8(&finding.message).map_err(|_| CliError::Text { what: "a finding's message is not UTF-8" })?;
@@ -246,6 +246,8 @@ mod tests {
             (Area::Cli, crate::units::TOOLCHAIN_NAMED),
             (Area::Cli, crate::work::MODULE_AT_BOTH),
             (Area::Drive, OVER_CAP_RULE),
+            (Area::Drive, blaze_drive::request::MODULE_FILE_MISSING_RULE),
+            (Area::Drive, blaze_drive::request::PATH_FILE_MISSING_RULE),
             (Area::Ladder, RefusalRule::Unsupported as u16),
             (Area::Ladder, RefusalRule::Syntax as u16),
             (Area::Ladder, RefusalRule::Program as u16),

@@ -22,6 +22,10 @@
 //!   byte range of its line, for a finding to be placed on.
 
 #![feature(allocator_api)]
+// The bare crate (`default-features = false`: `layout` and `lock`, the shape every crate on the
+// rebuilt path takes) is sans-IO over text on blaze-own; only the `cargo` reader of the old
+// layer, which goes with that layer at the switch, is on `std`.
+#![cfg_attr(not(any(test, feature = "cargo")), no_std)]
 
 #[cfg(feature = "cargo")]
 pub mod config;

@@ -1,7 +1,7 @@
 //! One body's record (flow.md section 6): its findings, and the proof the code builder takes.
 #![blaze::sans_io]
 
-use alloc::vec::Vec;
+use blaze_own::Vec;
 use core::alloc::Allocator;
 
 use crate::flow::{Bound, Flow};

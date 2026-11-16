@@ -30,6 +30,7 @@ use blaze_surface::{Namespace, PathKind};
 const MAIN: &str = "fn main(cx: &Cx, io: Io) -> Result<(), Error> {
     Ok(())
 }
+extern crate alloc;
 use alloc::sync::Arc;
 fn f1<T>(a: &Arc<T>) -> Arc<T> { a.clone() }
 fn f1b<T>(a: &Arc<T>) -> Arc<T> { Clone::clone(a) }
@@ -50,10 +51,37 @@ enum Al<T> {
 struct Cam {
     allowed: Al<N>,
 }
+macro_rules! typed {
+    ($name:ident) => {
+        #[derive(Clone)]
+        pub struct $name(Arc<str>);
+    };
+}
+typed!(Dn);
+fn f7(a: &Al<Dn>) -> Al<Dn> { Clone::clone(a) }
+struct Tb<K, H, A: core::alloc::Allocator> {
+    k: Option<K>,
+    h: Option<H>,
+    a: A,
+}
+impl<K: Eq, H: Clone, A: core::alloc::Allocator> Tb<K, H, A> {
+    fn new_in(a: A) -> Tb<K, H, A> { Tb { k: None, h: None, a } }
+}
+struct Fl<K, V, A: core::alloc::AllocatorClone> {
+    t: Tb<K, Arc<Option<V>, A>, A>,
+    a: A,
+}
+impl<K: Eq + Clone, V: Clone, A: core::alloc::AllocatorClone> Fl<K, V, A> {
+    fn planted(a: A) -> Fl<K, V, A> {
+        let t = Tb::new_in(a.clone());
+        Fl { t, a }
+    }
+}
 ";
 
 /// The free bodies that must check clean, each with what it proves.
-const CLEAN: [(&str, &str); 8] = [
+const CLEAN: [(&str, &str); 9] = [
+    ("f7", "a derive written by a `macro_rules!` expansion (bstd's `typed_name!`)"),
     ("f1", "`Arc<T>` (allocator defaulted to `Global`) is `Clone` by method"),
     ("f1b", "`Arc<T>: Clone` by path: `Global: AllocatorClone`"),
     ("f2", "`Arc<T, A>: Clone` from `A: AllocatorClone` in the where clauses"),
@@ -89,18 +117,20 @@ fn clones_through_front2() {
     let mut buckets = None;
     let mut failed: Vec<String> = Vec::new();
     let mut clean: Vec<String> = Vec::new();
+    // What happened to each body that failed, carried into the assertion's message.
+    let mut notes: Vec<String> = Vec::new();
     let mut bodies = Vec::new();
     for (name, proves) in CLEAN {
         let key = find(0, &[name]);
         if let Err(e) = store.ensure(&names, &mut front.keys, Want::Fn(key)) {
-            println!("{name}: no head: {e:?}");
+            notes.push(format!("{name}: no head: {e:?}"));
             failed.push(name.to_string());
             continue;
         }
         match lower_fn(&names, prepared, &mut front.keys, &mut store, key) {
             Ok(b) => bodies.push((name.to_string(), b, proves)),
             Err(e) => {
-                println!("{name}: does not lower: {e}");
+                notes.push(format!("{name}: does not lower: {e}"));
                 failed.push(name.to_string());
             }
         }
@@ -110,16 +140,23 @@ fn clones_through_front2() {
     for (k, _, _) in names.items(0) {
         let Some(header) = names.item_text(k).and_then(|t| t.impl_header) else { continue };
         if let Err(e) = store.ensure(&names, &mut front.keys, Want::Impl(k)) {
-            println!("impl `{header}`: no head: {e:?}");
+            notes.push(format!("impl `{header}`: no head: {e:?}"));
             failed.push(header.to_string());
             continue;
         }
-        let Some(mk) = front.keys.filed_member(checker_of(k), MemberKind::Fn, "clone") else { continue };
-        derived += 1;
+        // `planted`: bstd::sync::flight's shape: the callee's `H: Clone` is asked while `H` is
+        // a variable the struct literal fixes later.
+        let Some((member, mk)) = ["clone", "planted"]
+            .into_iter()
+            .find_map(|m| front.keys.filed_member(checker_of(k), MemberKind::Fn, m).map(|mk| (m, mk)))
+        else {
+            continue;
+        };
+        derived += usize::from(member == "clone");
         match lower_member(&names, prepared, &mut front.keys, &mut store, mk) {
-            Ok(b) => bodies.push((format!("<{header}>::clone"), b, "a derived `clone`")),
+            Ok(b) => bodies.push((format!("<{header}>::{member}"), b, "a derived `clone`, or flight's `planted`")),
             Err(e) => {
-                println!("{header}: clone does not lower: {e}");
+                notes.push(format!("{header}: clone does not lower: {e}"));
                 failed.push(header.to_string());
             }
         }
@@ -132,20 +169,21 @@ fn clones_through_front2() {
         match check_body(&mut records, body, &scope) {
             Ok(done) if done.diags.is_empty() => clean.push(name.clone()),
             Ok(done) => {
-                println!("{name}: Ok with {} diagnostics ({proves})", done.diags.len());
+                notes.push(format!("{name}: Ok with {} diagnostics ({proves})", done.diags.len()));
                 failed.push(name.clone());
             }
             Err(CheckFail::Diags { diags, .. }) => {
-                println!("{name}: diagnostics {diags:?} ({proves})");
+                notes.push(format!("{name}: diagnostics {diags:?} ({proves})"));
                 failed.push(name.clone());
             }
             Err(other) => {
-                println!("{name}: {other:?} ({proves})");
+                notes.push(format!("{name}: {other:?} ({proves})"));
                 failed.push(name.clone());
             }
         }
     }
-    println!("clean: {clean:?}");
-    assert_eq!(derived, 3, "the three derived `clone` members were found");
-    assert!(failed.is_empty(), "bodies that must check clean did not: {failed:?}");
+    notes.push(format!("clean: {clean:?}"));
+    assert_eq!(derived, 4, "the four derived `clone` members were found");
+    assert!(bodies.iter().any(|b| b.0.ends_with("::planted")), "`Fl::planted` was taken");
+    assert!(failed.is_empty(), "bodies that must check clean did not: {failed:?}\n{}", notes.join("\n"));
 }

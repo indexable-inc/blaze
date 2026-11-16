@@ -1110,7 +1110,12 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
             alloc,
         };
         let cx = FillCx { base: &base, run: &run, facts: Facts { base: &base, run: &run } };
+        #[cfg(feature = "cells")]
+        let fill_start = std::time::Instant::now();
         fill.run(&cx, par, &all);
+        // The cell core on the same facts, timed and compared; the records stay the fill's.
+        #[cfg(feature = "cells")]
+        crate::cells::shadow(&cx.facts, built, input.name, tree.modules[0].key, &fill.done, fill_start.elapsed(), alloc);
     }
     let mut done = core::mem::replace(&mut fill.done, HashMap::new_in(alloc));
     let mut in_made: AVec<'a, (&'a str, ItemKey, MacroShapes)> = AVec::new_in(alloc);

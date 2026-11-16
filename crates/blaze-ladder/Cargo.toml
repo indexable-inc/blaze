@@ -52,6 +52,9 @@ blaze-expand.workspace = true
 blaze-sim.workspace = true
 # tests/hosted.rs: the host table a hosted rung is started with, its calls recorded.
 blaze-std.workspace = true
+# tests/flow_census.rs: every clean body of bstd lowered to its flow and move and borrow checked.
+blaze-flow.workspace = true
+blaze-flow-lower.workspace = true
 
 [lints]
 workspace = true

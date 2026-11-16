@@ -13,10 +13,10 @@ use blaze_lower::View;
 use blaze_lower::form as lf;
 use blaze_surface::Range;
 use blaze_typeck::dyn_compat::{FnFacts, MemberShape, Receiver, Unread};
-use blaze_typeck::{List, Name, PNode, PTy, PathIdx, PortableTys};
+use blaze_typeck::{ItemKey, List, Name, PClause, PNode, PTy, PathIdx, PortableTys};
 
 use super::preds::{lifetimes_only, segment_args};
-use super::types::{Builder, Env, Heads, Why, children, children_of, intern, intern_list, path_texts, path_texts_of};
+use super::types::{Bounded, Builder, Env, Heads, Why, children, children_of, intern, intern_list, path_texts, path_texts_of, subst_clause};
 use crate::resolve::{Ns, Resolver};
 
 /// One written member's dyn-compatibility facts (`v` its lowered text), `module` where its
@@ -201,26 +201,73 @@ impl<'b, 'n, H: Heads> Builder<'b, 'n, H> {
                 return Err(Why::Unsupported("an associated type bound in a trait object (`dyn Tr<Assoc: Bound>`)", r));
             }
             let (abs, texts, _, pr) = path_texts_of(v, p, true)?;
-            let (key, args) = self.trait_at(tys, env, abs, &texts, pr, erased, &given)?;
-            let auto = self.heads.trait_auto(key).ok_or(Why::Need(key))?;
-            if auto {
-                if !given.is_empty() || !binds.is_empty() {
-                    return Err(Why::Program("an auto trait in a trait object takes no arguments".into(), pr));
+            // The traits this bound names (`Self` erased) and its `Name = T` projections (the
+            // owner's checker key, its arguments `Self` first): one trait and its bindings, or
+            // what a trait alias stands for (the unstable book, `trait_alias`: `dyn Alias` is
+            // the object of its right-hand side, each trait's dyn-compatibility its own).
+            let mut traits: Vec<(LibKey, List), Global> = Vec::new_in(Global);
+            let mut projs: Vec<(ItemKey, Name, List, PTy), Global> = Vec::new_in(Global);
+            match self.bound_target(env, abs, &texts, pr)? {
+                Bounded::Trait(key) => {
+                    let (key, args) = self.trait_args(tys, key, pr, erased, &given)?;
+                    if !binds.is_empty() && self.heads.trait_auto(key).ok_or(Why::Need(key))? {
+                        return Err(Why::Program("an auto trait in a trait object takes no arguments".into(), pr));
+                    }
+                    let shown = v.text_at(v.path_range(p)?)?;
+                    for (name, term) in binds {
+                        let (owner, oargs) = self.assoc_owner(tys, key, args, name, pr, shown)?.ok_or_else(|| Why::AssocNotFound(shown.into(), pr))?;
+                        projs.push((self.heads.checker(owner), name, oargs, term));
+                    }
+                    traits.push((key, args));
                 }
-                preds.push(intern(tys, PNode::ExAuto(self.heads.checker(key)))?);
-                continue;
+                Bounded::Alias(alias) => {
+                    if !binds.is_empty() {
+                        return Err(Why::Unsupported("an associated type binding on a trait alias (`dyn Alias<Name = T>`)", pr));
+                    }
+                    let mut clauses = Vec::new_in(Global);
+                    self.alias_clauses(tys, alias, pr, erased, &given, &mut clauses)?;
+                    let head = self.heads.trait_alias(alias).ok_or(Why::Need(alias))?;
+                    let mut sargs = Vec::with_capacity_in(given.len() + 1, Global);
+                    sargs.push(erased);
+                    sargs.extend_from_slice(&given);
+                    for &(k, l) in &head.traits {
+                        let PClause::Trait { args, .. } = subst_clause(tys, PClause::Trait { trait_: self.heads.checker(k), args: l }, &sargs)? else { continue };
+                        traits.push((k, args));
+                    }
+                    for c in clauses {
+                        let (args, proj) = match c {
+                            PClause::Trait { args, .. } => (args, None),
+                            PClause::Projection { trait_, args, name, term } => (args, Some((trait_, name, term))),
+                            PClause::Const { .. } => return Err(Why::Unsupported("a trait alias with `where const` in a trait object", pr)),
+                        };
+                        let first = tys.view().list(args).map_err(|_| Why::Program("a list outside the table".into(), pr))?.first().copied();
+                        if first != Some(erased) {
+                            return Err(Why::Unsupported("a trait alias in a trait object whose clauses bound a type other than `Self`", pr));
+                        }
+                        if let Some((owner, name, term)) = proj {
+                            projs.push((owner, name, args, term));
+                        }
+                    }
+                }
             }
-            if let Some(prev) = principal {
-                return Err(Why::TwoPrincipals(prev, key, r));
+            for (key, args) in traits {
+                if self.heads.trait_auto(key).ok_or(Why::Need(key))? {
+                    if tys.view().list(args).map_err(|_| Why::Program("a list outside the table".into(), pr))?.len() != 1 {
+                        return Err(Why::Program("an auto trait in a trait object takes no arguments".into(), pr));
+                    }
+                    preds.push(intern(tys, PNode::ExAuto(self.heads.checker(key)))?);
+                    continue;
+                }
+                if let Some(prev) = principal {
+                    return Err(Why::TwoPrincipals(prev, key, r));
+                }
+                principal = Some(key);
+                let rest = after_self(tys, args, erased, pr)?;
+                preds.push(intern(tys, PNode::ExTrait(self.heads.checker(key), rest))?);
             }
-            principal = Some(key);
-            let shown = v.text_at(v.path_range(p)?)?;
-            let rest = after_self(tys, args, erased, pr)?;
-            preds.push(intern(tys, PNode::ExTrait(self.heads.checker(key), rest))?);
-            for (name, term) in binds {
-                let (owner, oargs) = self.assoc_owner(tys, key, args, name, pr, shown)?.ok_or_else(|| Why::AssocNotFound(shown.into(), pr))?;
+            for (owner, name, oargs, term) in projs {
                 let rest = after_self(tys, oargs, erased, pr)?;
-                preds.push(intern(tys, PNode::ExProj { trait_: self.heads.checker(owner), name, args: rest, term })?);
+                preds.push(intern(tys, PNode::ExProj { trait_: owner, name, args: rest, term })?);
             }
         }
         if at != kids.len() {

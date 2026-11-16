@@ -21,6 +21,8 @@ runtime = ["dep:wasmtime", "dep:tracing","dep:blaze-build-script", "dep:blaze-un
 default = ["runtime"]
 
 [dependencies]
+# The expansion records' files through the effect layer (`record::OnDir`).
+blaze-std.workspace = true
 # A build script's environment, outputs, key and compiler answers (`script.rs`).
 blaze-build-script = { workspace = true, optional = true }
 # `TokenStream`, `Produced`, `ProcDiagnostic`, `TokenOrigin`, `lex`: the hook's types.

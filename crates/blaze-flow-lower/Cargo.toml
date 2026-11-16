@@ -17,6 +17,7 @@ doctest = false
 [dependencies]
 blaze-flow.workspace = true
 blaze-typeck.workspace = true
+blaze-own.workspace = true
 
 [dev-dependencies]
 # `fixture`: hand-written bodies checked by the real type checker, lowered and checked here.

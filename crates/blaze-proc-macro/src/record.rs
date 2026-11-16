@@ -19,6 +19,11 @@
 
 use std::path::{Path, PathBuf};
 
+use bstd::cx::Cx;
+use bstd::fs::{Content, Dir, Durable, FsError, FsKind, ReadWrite};
+use bstd::mem::Bytes;
+use bstd::path::Path as BPath;
+
 use blaze_expand::{
     Ctx, Delim, Edition, LitKind, ProcCall, ProcDiagnostic, ProcKind, ProcLevel, Produced, Raw, ReadAnswer, ReadKind, Reads, Spacing, Text,
     TokenKind, TokenOrigin, TokenStream, Transparency,
@@ -32,10 +37,110 @@ use crate::{
     sandbox::{Package, answer_now},
 };
 
-/// The folder store of records.
-pub struct DirStore {
+/// What a record file ends in: the digest of every byte before it under this domain. A file
+/// whose end is not its body's seal is a crash's torn write (a publish is not synced: records
+/// are derived, remade by a rerun), read as a miss and replaced by the next put.
+const SEAL: &str = "blaze expansion record seal 1";
+const SEAL_LEN: usize = 32;
+
+/// Where a [`DirStore`]'s files live, its one effect seam (rule 78): [`OnDir`], the effect
+/// layer's directory, the end state; [`Ambient`], `std::fs` under a path, the interim form the
+/// callers still make (DEBT: goes when `blaze_expand::ExpandCx` hands a `Cx` to a run, so
+/// `ProcMacros` can hold an `OnDir`; NOTES.md of bstd-1116).
+pub trait RecordFiles {
+    /// The bytes at `name` (`list/<hex>`), none when nothing is there.
+    fn read(&self, name: &str) -> Result<Option<Vec<u8>>, FilesError>;
+    /// `name` made to hold `bytes`, replaced all at once for a reader (never a part), nothing
+    /// synced: after a power cut it holds what it held, or any prefix of `bytes`.
+    fn publish(&self, name: &str, bytes: &[u8]) -> Result<(), FilesError>;
+}
+
+/// The effect layer's directory under a task's context: the records' end-state home.
+pub struct OnDir<'c> {
+    pub cx: &'c Cx,
+    pub dir: Dir<ReadWrite>,
+}
+
+impl RecordFiles for OnDir<'_> {
+    fn read(&self, name: &str) -> Result<Option<Vec<u8>>, FilesError> {
+        let path = BPath::new(name).map_err(|_| FilesError::Name { name: name.to_owned() })?;
+        let mut into = Bytes::new_in(self.cx.frame(), "an expansion record read back");
+        match self.dir.read_all(self.cx, &path, &mut into) {
+            Ok(_) => Ok(Some(into.as_slice().to_vec())),
+            Err(error) if error.kind == FsKind::NotFound => Ok(None),
+            Err(error) => Err(FilesError::Effect(error)),
+        }
+    }
+
+    fn publish(&self, name: &str, bytes: &[u8]) -> Result<(), FilesError> {
+        let path = BPath::new(name).map_err(|_| FilesError::Name { name: name.to_owned() })?;
+        self.dir.publish(self.cx, &path, Content::bytes(bytes), Durable::No).map(|_| ()).map_err(FilesError::Effect)
+    }
+}
+
+/// `std::fs` under a folder: the interim form (DEBT, see [`RecordFiles`]); the same records,
+/// sealed and checked as [`OnDir`]'s, so only the effect route differs.
+pub struct Ambient {
     root: PathBuf,
+}
+
+impl RecordFiles for Ambient {
+    fn read(&self, name: &str) -> Result<Option<Vec<u8>>, FilesError> {
+        let path = self.root.join(name);
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(FilesError::Ambient { path, error }),
+        }
+    }
+
+    fn publish(&self, name: &str, bytes: &[u8]) -> Result<(), FilesError> {
+        let path = self.root.join(name);
+        let ambient = |error| FilesError::Ambient { path: path.clone(), error };
+        let dir = path.parent().unwrap_or(&self.root);
+        std::fs::create_dir_all(dir).map_err(ambient)?;
+        let staging = dir.join(format!(".{}.{}", std::process::id(), path.file_name().and_then(|it| it.to_str()).unwrap_or("record")));
+        std::fs::write(&staging, bytes).map_err(ambient)?;
+        std::fs::rename(&staging, &path).map_err(ambient)
+    }
+}
+
+/// A record file that could not be read or written, naming it.
+#[derive(Debug)]
+pub enum FilesError {
+    Ambient { path: PathBuf, error: std::io::Error },
+    Effect(FsError),
+    /// A record's name the effect layer refuses as a path.
+    Name { name: String },
+    /// `name` holds a whole record of other bytes than the put's (rule 21).
+    OtherBytes { name: String },
+}
+
+impl std::fmt::Display for FilesError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FilesError::Ambient { path, error } => write!(f, "the record {}: {error}", path.display()),
+            FilesError::Effect(error) => write!(f, "a record: {error}"),
+            FilesError::Name { name } => write!(f, "the record name {name:?} is no path under the store"),
+            FilesError::OtherBytes { name } => write!(f, "the record {name} holds other bytes than its put's (rule 21)"),
+        }
+    }
+}
+
+/// A planted bug the crash simulation must catch (`record_tests.rs`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RecordPlant {
+    None,
+    /// A read takes a file without checking its seal: a torn record is handed back.
+    SealSkipped,
+}
+
+/// The folder store of records: each file the record's bytes then their [`SEAL`], published
+/// whole (a reader sees all or none) and taken back only when the seal matches.
+pub struct DirStore<F: RecordFiles = Ambient> {
+    files: F,
     tally: Tally,
+    plant: RecordPlant,
 }
 
 impl DirStore {
@@ -46,49 +151,55 @@ impl DirStore {
 
     /// Records of another kind of run under `<store>/<within>` (`build-script/records`).
     pub fn at(store: &Path, within: &str) -> DirStore {
-        DirStore { root: store.join(within), tally: Tally::default() }
+        DirStore::on(Ambient { root: store.join(within) }, RecordPlant::None)
+    }
+}
+
+impl<F: RecordFiles> DirStore<F> {
+    /// The store over `files`; `plant` is [`RecordPlant::None`] but in the simulation.
+    pub fn on(files: F, plant: RecordPlant) -> DirStore<F> {
+        DirStore { files, tally: Tally::default(), plant }
     }
 
-    fn path(&self, kind: Kind, key: &ContentId) -> PathBuf {
+    fn name(kind: Kind, key: &ContentId) -> String {
         let kind = match kind {
-            Kind::List => "list",
-            Kind::Answer => "answer",
+            Kind::List => "list/",
+            Kind::Answer => "answer/",
         };
-        let mut name = String::with_capacity(64);
+        let mut name = String::with_capacity(kind.len() + 64);
+        name.push_str(kind);
         for byte in key.0 {
             name.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
             name.push(char::from_digit(u32::from(byte & 15), 16).unwrap_or('0'));
         }
-        self.root.join(kind).join(name)
+        name
     }
 }
 
-impl Store for DirStore {
+impl<F: RecordFiles> Store for DirStore<F> {
     type Held = Vec<u8>;
-    type Error = std::io::Error;
+    type Error = FilesError;
 
-    fn get(&self, kind: Kind, key: &ContentId) -> Result<Option<Vec<u8>>, std::io::Error> {
-        match std::fs::read(self.path(kind, key)) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
+    fn get(&self, kind: Kind, key: &ContentId) -> Result<Option<Vec<u8>>, FilesError> {
+        let Some(mut bytes) = self.files.read(&Self::name(kind, key))? else { return Ok(None) };
+        let Some(body_len) = bytes.len().checked_sub(SEAL_LEN) else { return Ok(None) };
+        let sealed = ContentId::of(SEAL, &bytes[..body_len]).0 == bytes[body_len..];
+        if !sealed && self.plant != RecordPlant::SealSkipped {
+            return Ok(None);
         }
+        bytes.truncate(body_len);
+        Ok(Some(bytes))
     }
 
-    fn put(&self, kind: Kind, key: ContentId, bytes: &[u8]) -> Result<(), std::io::Error> {
-        let path = self.path(kind, &key);
+    fn put(&self, kind: Kind, key: ContentId, bytes: &[u8]) -> Result<(), FilesError> {
+        let name = Self::name(kind, &key);
         if let Some(held) = self.get(kind, &key)? {
-            return if held == bytes {
-                Ok(())
-            } else {
-                Err(std::io::Error::new(std::io::ErrorKind::AlreadyExists, format!("{} holds other bytes", path.display())))
-            };
+            return if held == bytes { Ok(()) } else { Err(FilesError::OtherBytes { name }) };
         }
-        let dir = path.parent().unwrap_or(&self.root);
-        std::fs::create_dir_all(dir)?;
-        let staging = dir.join(format!(".{}.{}", std::process::id(), path.file_name().and_then(|it| it.to_str()).unwrap_or("record")));
-        std::fs::write(&staging, bytes)?;
-        std::fs::rename(&staging, &path)
+        let mut sealed = Vec::with_capacity(bytes.len() + SEAL_LEN);
+        sealed.extend_from_slice(bytes);
+        sealed.extend_from_slice(&ContentId::of(SEAL, bytes).0);
+        self.files.publish(&name, &sealed)
     }
 
     fn bytes(held: &Vec<u8>) -> &[u8] {
@@ -495,7 +606,7 @@ pub fn decode<'a>(list: ListRef<'_>, edition: Edition, alloc: Alloc<'a>) -> Resu
 pub enum RecordError {
     /// The store failed under the chain, or a slot of the base's chain holds what is no
     /// read-list of it: the error names the key or the slot and what was being done.
-    Chain(blaze_record::Error<std::io::Error>),
+    Chain(blaze_record::Error<FilesError>),
     /// The read-list under `base` is not this layout's record.
     Corrupt { base: ContentId, what: &'static str },
     /// The run's read `read` (its index) had an answer a note does not hold.
@@ -507,8 +618,8 @@ pub enum RecordError {
     Full { base: ContentId },
 }
 
-impl From<blaze_record::Error<std::io::Error>> for RecordError {
-    fn from(error: blaze_record::Error<std::io::Error>) -> RecordError {
+impl From<blaze_record::Error<FilesError>> for RecordError {
+    fn from(error: blaze_record::Error<FilesError>) -> RecordError {
         RecordError::Chain(error)
     }
 }
@@ -553,10 +664,10 @@ fn current(list: ListRef<'_>, package: &Package, valued: &mut u64) -> Result<boo
 
 /// The answer of `base` under what its reads are in `package` now, decoded in `alloc`. A hit
 /// on the base's first list is one read of one file: the list holds the answer.
-pub fn find<'a>(store: &DirStore, base: &ContentId, package: &Package, edition: Edition, alloc: Alloc<'a>) -> Result<Option<Produced<'a>>, RecordError> {
+pub fn find<'a, F: RecordFiles>(store: &DirStore<F>, base: &ContentId, package: &Package, edition: Edition, alloc: Alloc<'a>) -> Result<Option<Produced<'a>>, RecordError> {
     let corrupt = |Corrupt(what)| RecordError::Corrupt { base: *base, what };
     let mut valued = 0;
-    let walked = walk::<DirStore, Produced<'a>, RecordError, _>(store, Bounds::STANDARD, base, |_at, _bytes, list| {
+    let walked = walk::<DirStore<F>, Produced<'a>, RecordError, _>(store, Bounds::STANDARD, base, |_at, _bytes, list| {
         if !current(list, package, &mut valued).map_err(corrupt)? {
             return Ok(None);
         }
@@ -572,14 +683,14 @@ pub fn find<'a>(store: &DirStore, base: &ContentId, package: &Package, edition: 
 /// Keeps `produced` under `base`: one read-list naming its reads, whose note holds the digest
 /// each had and the answer. A list of the same reads and digests with another answer already
 /// under `base` is refused ([`RecordError::TwoAnswers`]).
-pub fn keep(store: &DirStore, base: ContentId, produced: &Produced<'_>) -> Result<(), RecordError> {
+pub fn keep<F: RecordFiles>(store: &DirStore<F>, base: ContentId, produced: &Produced<'_>) -> Result<(), RecordError> {
     let reads = &produced.reads;
     let list = record_bytes(base, produced)?;
     let mine = ListRef::open(&list, &base).map_err(|why| blaze_record::Error::List { at: blaze_record::Slot { generation: 0, n: 0 }, why })?;
     // The note's head, the layout and the digests: equal heads under equal reads are one
     // key's two values when the rest differs.
     let head = 4 + reads.list().iter().map(|read| if matches!(read.answer, ReadAnswer::Digest(_)) { 33 } else { 1 }).sum::<usize>();
-    let walked = walk::<DirStore, (), RecordError, _>(store, Bounds::STANDARD, &base, |_at, _bytes, held| {
+    let walked = walk::<DirStore<F>, (), RecordError, _>(store, Bounds::STANDARD, &base, |_at, _bytes, held| {
         let same_reads = held.len() == mine.len() && held.reads().eq(mine.reads());
         let same_head = held.note().get(..head) == mine.note().get(..head);
         Ok((same_reads && same_head && held.note() != mine.note()).then_some(()))
@@ -615,3 +726,7 @@ pub fn record_bytes(base: ContentId, produced: &Produced<'_>) -> Result<Vec<u8>,
     }
     Ok(list)
 }
+
+#[cfg(test)]
+#[path = "record_tests.rs"]
+mod tests;

@@ -16,9 +16,10 @@
 #![no_std]
 #![feature(allocator_api)]
 
-extern crate alloc;
+#[cfg(test)]
+extern crate std;
 
-use alloc::vec::Vec;
+use blaze_own::Vec;
 use core::alloc::Allocator;
 
 use blaze_flow::{Block, BorrowKind, Flow, FlowBuilder, Loan, Local, Operand, Origin, Place, Proj, Span, StmtKind};
@@ -343,7 +344,6 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             stats: Stats::default(),
             plant: Plant::None,
         };
-        l.ret_block = l.b.block();
         Ok(l)
     }
 
@@ -865,7 +865,9 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
     fn run(&mut self) -> Result<(), Refusal> {
         let body = self.body;
         let root = body.root;
+        // Block 0 is the flow's entry; the return block follows it.
         let entry = self.b.block();
+        self.ret_block = self.b.block();
         self.b.start(entry);
         // The parameters: locals 1..=n, the signature's placeholders.
         let nparams = body.params.len() as u32;

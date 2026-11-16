@@ -13,7 +13,7 @@ use blaze_lower::{View, form as lf, head};
 use blaze_surface::Range;
 use blaze_typeck::{List, Name, PClause, PNode, PTy, PortableTys};
 
-use super::types::{Bounds, Builder, Env, Heads, ParamBound, Why, intern, intern_list, path_texts, path_texts_of};
+use super::types::{Bounded, Bounds, Builder, Env, Heads, ParamBound, Why, intern, intern_list, path_texts, path_texts_of, subst_clause};
 
 /// What one bound says of its type's sizedness ([`Builder::bound`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -180,7 +180,23 @@ impl<'b, 'n, H: Heads> Builder<'b, 'n, H> {
             Some(last) => segment_args(tys, v, last, pr, &mut |tys, t| self.ty(tys, env, v, t))?,
             None => (Vec::new_in(Global), Vec::new_in(Global), Vec::new_in(Global)),
         };
-        let (key, args) = self.trait_at(tys, env, abs, &texts, pr, self_ty, &given)?;
+        let key = match self.bound_target(env, abs, &texts, pr)? {
+            Bounded::Trait(key) => key,
+            // A trait alias stands for its clauses (its head; nested aliases already expanded
+            // there). It states no sizedness of its own: core writes `T: PointeeSized + Thin`
+            // although `Thin`'s right-hand side holds `PointeeSized`.
+            Bounded::Alias(alias) => {
+                if mods.maybe {
+                    return Err(Why::Unsupported("`?` on a trait alias", r));
+                }
+                if !binds.is_empty() || !nested.is_empty() {
+                    return Err(Why::Unsupported("an associated type binding on a trait alias (`Alias<Name = T>`)", pr));
+                }
+                self.alias_clauses(tys, alias, pr, self_ty, &given, out)?;
+                return Ok(Sizing::NoTrait);
+            }
+        };
+        let (key, args) = self.trait_args(tys, key, pr, self_ty, &given)?;
         if mods.maybe {
             if Some(key) != sized {
                 return Err(Why::Unsupported("`?Trait` for a trait that is not `Sized`", r));
@@ -281,18 +297,33 @@ impl<'b, 'n, H: Heads> Builder<'b, 'n, H> {
             return Ok(());
         }
         let lf::TypeRef::Path(p) = v.ty(ty)? else { return Ok(()) };
-        let found = {
-            let e = Env { bounds: Bounds::Building(out), ..*env };
-            let (abs, texts, segs, pr) = path_texts_of(v, p, true)?;
-            let given = match segs.last() {
-                Some(last) => segment_args(tys, v, last, pr, &mut |tys, t| self.ty(tys, &e, v, t))?.0,
-                None => Vec::new_in(Global),
-            };
-            let me = intern(tys, PNode::Param(param))?;
-            let (trait_, args) = self.trait_at(tys, &e, abs, &texts, pr, me, &given)?;
-            ParamBound { param, trait_, args }
+        let e = Env { bounds: Bounds::Building(out), ..*env };
+        let (abs, texts, segs, pr) = path_texts_of(v, p, true)?;
+        let given = match segs.last() {
+            Some(last) => segment_args(tys, v, last, pr, &mut |tys, t| self.ty(tys, &e, v, t))?.0,
+            None => Vec::new_in(Global),
         };
-        out.push(found);
+        let me = intern(tys, PNode::Param(param))?;
+        match self.bound_target(&e, abs, &texts, pr)? {
+            Bounded::Trait(key) => {
+                let (trait_, args) = self.trait_args(tys, key, pr, me, &given)?;
+                out.push(ParamBound { param, trait_, args });
+            }
+            // `T: Thin` declares through each trait the alias stands for on `Self`.
+            Bounded::Alias(alias) => {
+                let head = self.heads.trait_alias(alias).ok_or(Why::Need(alias))?;
+                if given.len() + 1 != head.generics as usize {
+                    return Err(Why::Program(format!("a trait alias written with {} type arguments; it takes {}", given.len(), head.generics - 1).into_boxed_str(), pr));
+                }
+                let mut args = Vec::with_capacity_in(given.len() + 1, Global);
+                args.push(me);
+                args.extend_from_slice(&given);
+                for &(trait_, l) in &head.traits {
+                    let PClause::Trait { args, .. } = subst_clause(tys, PClause::Trait { trait_: self.heads.checker(trait_), args: l }, &args)? else { continue };
+                    out.push(ParamBound { param, trait_, args });
+                }
+            }
+        }
         Ok(())
     }
 

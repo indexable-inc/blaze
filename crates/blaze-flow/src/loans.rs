@@ -6,7 +6,7 @@
 //! fact of tier two is a fact of tier one, and tier one accepting a body means tier two does.
 #![blaze::sans_io]
 
-use alloc::vec::Vec;
+use blaze_own::Vec;
 use core::alloc::Allocator;
 
 use crate::bits::Bits;
@@ -549,6 +549,8 @@ pub fn tier_two<A: Allocator + Clone>(
             }
         }
     }
-    out.sort_by_key(|f| f.at());
+    // `core`'s sort (the stable one is `alloc`'s): the whole finding breaks ties, so the order
+    // is total and the same on every run.
+    out.sort_unstable_by_key(|f| (f.at(), *f));
     Ok(out)
 }

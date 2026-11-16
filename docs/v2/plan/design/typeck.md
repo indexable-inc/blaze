@@ -1459,6 +1459,40 @@ started, its result line not captured. The rust-call test: passed (not in the fa
   Until the heads fill it, `*const T: Send` IS answered yes structurally on front2 (no impl
   in the bucket, so the type's parts prove it).
 
+(11) Runner after (10) (2026-11-16):
+- "diag E0277: Clone" REDUCED on the real front end: crates/blaze-ladder/tests/front2_clone.rs
+  (`clones_through_front2`): `Arc<T>` by method and by path (the `Global` default filled,
+  `Global: AllocatorClone` proven), `Arc<T, A>` from `A: AllocatorClone`, `A: Clone` through
+  that supertrait, `Arc<[u8]>`, a derived generic enum at a concrete type, a derive written by
+  a `macro_rules!` expansion (bstd's `typed_name!`), and flight's shape (`Tb::new_in` asking
+  `H: Clone` while `H` is a variable a struct literal fixes later). ALL CLEAN: "test
+  blaze-ladder: exit 0; 1 passed, 0 failed". So no rule of the checker is missing for these.
+  The census itself says why: "from empty records: 1 of 3 examples the same; else [\"clean\",
+  \"clean\"]": the device and grant bodies are clean when checked first: ORDER DEPENDENCE (the
+  THIRD lane's class, front2_order.rs). The one that stays, flight's `planted`, differs from
+  the reduction only in its `Arc` being `blaze_own::Arc` (`impl<T: ?Sized, A: AllocatorClone>
+  Clone for Arc<T, A>`, crates/blaze-own/src/arc.rs:477): a user crate in the test cannot name
+  blaze_own (no dep), so the next step is a census run of just that body from empty records,
+  then whether blaze_own's impl reaches the bucket (the heads lane's if missing).
+- E0283 names its goal: `report_fulfill_errors` gives an ambiguous trait or projection goal
+  `unmet: Some((goal, None))` as E0277 does (suite `an_ambiguity_names_its_goal`; the
+  without-fix line was NOT run: owed). front2/check.rs's printer no longer says "(a projection
+  goal is not named by the checker yet)": every goal's finding carries `Unmet`; what is left
+  (E0599, E0308, E0609, E0425, ..) is about a node and prints its types and looked-up name.
+  Still unnamed: a failed `defer`red projection (its obligation's goal is `WellFormed`).
+- `Pointee::Metadata` normalized: alias.rs `Rule::Metadata`, builtin.rs `metadata_ty` (a loop
+  to the struct or tuple tail; `usize` for `str`/slices, `DynMetadata<dyn ..>` for an object,
+  `()` otherwise; a parameter or placeholder tail `()` when the env has its `Sized`, else the
+  rigid `<tail as Pointee>::Metadata`). OPEN: an ALIAS tail is answered rigid even when its
+  item bounds say `Sized` (rustc probes a `Sized` goal there; the solver has no in-step probe).
+  Fixtures: builtin.solve `metadata_*` (nine); the test world now reads `env T: ?Sized`.
+  Without the candidate: "solve cases: 287 cases, 312 goals, 304 passed, 8 failed".
+- `panic!` in a user crate: still `UnresolvedPath` `panic_fmt` (Name 8263167416644613366);
+  clean: "e", "core::panicking::panic_bounds_check", both `Display::fmt`. a2 now also has an
+  UnresolvedPath at 50..73 (Name 4032013252565412311: `core::intrinsics::abort`'s segment?).
+- NOT STARTED: step 5 (`{ None }` for an `Option<u8>` const parameter: `variant_value` makes
+  `Adt(enum, [])`, without the enum's arguments; then E0283 in bstd::kv::<impl Kv<P>>::get).
+
 ## Closures against `Fn` bounds (2026-11-16, closures lane)
 
 The library's definitions (library/core/src/ops/function.rs): `#[lang = "fn_once"] pub trait
@@ -1502,6 +1536,30 @@ fill change all five closure/fn-item cases fail with `diagnostics: want [], got
 deduction (`deduce_sig`, `closure_hint`) and `normalize_fn_once_output` were right; only the
 lang item's name was not. The census's `FnOnce<(KvError)>` is a one-tuple: check.rs's printer
 writes a one-tuple without its comma.
+
+## Overloaded deref and `?` on the real world (2026-11-16, second checker lane)
+
+The rules (the Reference: "Method call expressions", "Field access expressions", "Type
+coercions", the dereference operator, "The question mark operator") were already built as the
+Reference states them: `autoderef` (machine.rs) is a bounded loop of builtin and overloaded
+steps (`overloaded_deref`: `T: Deref` may hold, then `<T as Deref>::Target` normalized), shared
+by method probing (by value, `&`, `&mut` at each step, the array-to-slice step last), field
+access, the borrowed-pointer coercion and the unary `*`; `?` is lowered to `Try::branch` and
+`FromResidual::from_residual`. None of them needed a change.
+
+The census's five classes (E0599 112, E0308 41, E0609 31, E0614 19, E0277 `Try` 81) were one
+cause outside these rules: `coherence::fresh_for` (blaze-solve) took each impl parameter's kind
+from the whole shared table, so `impl<T, A: Allocator> Deref for Vec<T, A>` or `impl<T, E> Try
+for Result<T, E>` got a const variable for a type parameter once any item with a const
+parameter at that index had been read, and the impl never matched; whether it did depended on
+what was checked before (the third checker lane's fix, 10:07). The proof is the real world:
+crates/blaze-ladder/tests/front2_checks.rs checks 29 bodies clean through the real front end and
+toolchain (`Vec`, `Box`, `Rc`, `Arc` through `Deref`, one to three steps, `DerefMut` for a
+`&mut self` method and `*g = 1`, deref coercions at an argument and at a typed `let`, `?` on
+`Result` with and without a `From` conversion and on `Option`), `vec_iter` and `try_same` first
+of all, and six bodies that must be refused with their finding (a deref's target is the impl's
+`Target`, not a variable the context picks; no `From` for the error; `Option`'s residual in a
+`Result` fn). Before the fix eleven of its bodies failed with the census's findings.
 
 ## Not decided here
 

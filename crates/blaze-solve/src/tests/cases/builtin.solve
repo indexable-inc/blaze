@@ -238,7 +238,44 @@ case pointee_param_yes = trait_goals.rs::consider_builtin_pointee_candidate
 params T
 goal T: Pointee => yes
 
-case discriminant_kind_yes = trait_goals.rs::consider_builtin_discriminant_kind_candidate
+# `Pointee::Metadata` (core/src/ptr/metadata.rs, on `Pointee`: "For sized types ... `()`";
+# "For the `str` type, metadata is the length in bytes as `usize`"; "For slice types like `[T]`,
+# metadata is the length in items as `usize`"; "For trait objects like `dyn SomeTrait`, metadata
+# is `DynMetadata<Self>`"; "For structs whose last field is a DST, metadata is the metadata for
+# the last field"). A parameter not known `Sized` keeps its projection.
+case metadata_sized_unit = normalizes_to.rs::consider_builtin_pointee_candidate
+goal <u8 as Pointee>::Metadata == () => yes
+
+case metadata_sized_not_usize = normalizes_to.rs::consider_builtin_pointee_candidate
+goal <u8 as Pointee>::Metadata == usize => no
+
+case metadata_slice_usize = normalizes_to.rs::consider_builtin_pointee_candidate
+goal <[u8] as Pointee>::Metadata == ?0 => yes ?0 = usize
+
+case metadata_str_usize = normalizes_to.rs::consider_builtin_pointee_candidate
+goal <str as Pointee>::Metadata == usize => yes
+
+case metadata_dyn = normalizes_to.rs::consider_builtin_pointee_candidate
+goal <dyn Debug as Pointee>::Metadata == DynMetadata<dyn Debug> => yes
+
+case metadata_struct_tail = normalizes_to.rs::consider_builtin_pointee_candidate
+struct Tail(u8, str)
+goal <Tail as Pointee>::Metadata == usize => yes
+
+case metadata_tuple_tail = normalizes_to.rs::consider_builtin_pointee_candidate
+goal <(u8, [u16]) as Pointee>::Metadata == usize => yes
+
+case metadata_sized_param_unit = normalizes_to.rs::consider_builtin_pointee_candidate
+params T
+env T: Sized
+goal <T as Pointee>::Metadata == () => yes
+
+case metadata_unsized_param_rigid = normalizes_to.rs::consider_builtin_pointee_candidate
+params T
+env T: ?Sized
+goal <T as Pointee>::Metadata == ?0 => yes ?0 = rigid <T as Pointee>::Metadata
+
+case discriminant_kind_yes =trait_goals.rs::consider_builtin_discriminant_kind_candidate
 goal Option<u8>: DiscriminantKind => yes
 
 case destruct_yes = trait_goals.rs::consider_builtin_destruct_candidate

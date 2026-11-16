@@ -438,7 +438,13 @@ impl Buckets {
         let mut got = Vec::new_in(Global);
         // Candidates come sorted, so the first failed one is the least key.
         let mut first_failed = None;
-        for k in self.trait_candidates(trait_, shape) {
+        // The negative impls are candidates too: the solver reads their polarity (a negative
+        // impl decides an auto trait's structural rule and never meets a positive goal).
+        let mut candidates = self.trait_candidates(trait_, shape);
+        candidates.extend_from_slice(self.negative_of(trait_));
+        candidates.sort_unstable();
+        candidates.dedup();
+        for k in candidates {
             if self.has_failed(k) {
                 first_failed = first_failed.or(Some(k));
                 continue;

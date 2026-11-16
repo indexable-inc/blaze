@@ -138,7 +138,15 @@ fn run_case<T: Tys>(case: &CaseA, decls: &[(u32, &DeclA)], tys: &mut T) -> Parse
         for p in &case.env {
             world.names.pred(&mut a, sc, case.line, p, &mut clauses)?;
         }
-        world.names.case_sized(&mut a, case.line, case.params.len() as u32, &mut clauses)?;
+        // `env T: ?Sized` takes `T`'s implicit `Sized` away, as on a generic parameter.
+        let unsized_: Vec<bool> = case
+            .params
+            .iter()
+            .map(|n| {
+                case.env.iter().any(|p| matches!(p, crate::testing::parse::PredA::Bound(crate::testing::parse::TyA::Path(w, a), b) if b.maybe && a.is_empty() && w == n))
+            })
+            .collect();
+        world.names.case_sized(&mut a, case.line, &unsized_, &mut clauses)?;
     }
     let stop = |line: u32, s: Stop| CaseError { line, what: format!("the solver stopped: {s:?}") };
     let env = solver.env(tys, &world, &clauses, &mut reads).map_err(|s| stop(case.line, s))?;

@@ -15,6 +15,7 @@ doctest = false
 
 # core and alloc only; the allocator is a value the caller passes in.
 [dependencies]
+blaze-own.workspace = true
 
 [dev-dependencies]
 # `check`, `control`: the simulations and their planted-bug controls.

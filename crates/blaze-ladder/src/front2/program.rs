@@ -497,7 +497,15 @@ impl<'n> Front2Program<'n> {
             let abi = match head.header.abi {
                 tc::Abi::Rust => Abi::Rust,
                 tc::Abi::C => Abi::C,
-                abi => return Err(Front2Refusal::Abi { function: path, abi }),
+                // A survey files it and goes on (a call of it is then a refused callee); a run
+                // stops: the builder spreads no "rust-call" tuple yet.
+                abi => match left_out.as_deref_mut() {
+                    Some(out) => {
+                        out.push((path, format!("ABI {abi:?}: neither Rust nor C").into_boxed_str()));
+                        continue;
+                    }
+                    None => return Err(Front2Refusal::Abi { function: path, abi }),
+                },
             };
             let symbols = symbols_of(names, head.lib, head.text, &path)?;
             let (at, foreign) = placed(names, head.lib);
@@ -545,7 +553,13 @@ impl<'n> Front2Program<'n> {
                 None => abi,
                 Some("C" | "C-unwind") => Abi::C,
                 Some("Rust") => Abi::Rust,
-                Some(_) => return Err(Front2Refusal::Abi { function: path, abi: head.header.abi }),
+                Some(_) => match left_out.as_deref_mut() {
+                    Some(out) => {
+                        out.push((path, format!("ABI {:?}: neither Rust nor C", head.header.abi).into_boxed_str()));
+                        continue;
+                    }
+                    None => return Err(Front2Refusal::Abi { function: path, abi: head.header.abi }),
+                },
             };
             by_key.insert(key, fns.len());
             fns.push(Tabled { key, body, checked, kind, path, at, abi, symbol, export: symbols.export, lits, intrinsic });

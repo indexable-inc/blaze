@@ -819,7 +819,7 @@ impl super::DepNames<N> for SolvedDep {
 /// `root`'s crate solved with `dep`'s (crate 2) read as decided.
 fn with_dep(w: &World, root: ItemKey, dep: ItemKey, plant: CellPlant) -> Cells<'static, N> {
     let d = cells_of(w, dep, CellPlant::None);
-    let reader: &'static SolvedDep = Box::leak(Box::new(SolvedDep { cells: core::cell::RefCell::new(d), krate: crate::tests::crate_key(2), root: dep }));
+    let reader: &'static SolvedDep = std::boxed::Box::leak(std::boxed::Box::new(SolvedDep { cells: core::cell::RefCell::new(d), krate: crate::tests::crate_key(2), root: dep }));
     w.expanded.borrow_mut().clear();
     let mut c = Cells::load_with(w, root, Some(reader), Alloc::global()).expect("the core loads");
     c.plant = plant;
@@ -848,7 +848,7 @@ fn a_path_into_a_dependency_reads_its_decided_names() {
     w.item(m, "P", Namespace::Types, crate::DefKind::Other, V::Priv);
     let inner = w.module(dep, "inner", V::Priv);
     let t = w.item(inner, "T", Namespace::Types, crate::DefKind::Other, V::Pub);
-    w.glob(m, "crate::inner::*", V::Pub);
+    w.glob(m, "crate::inner", V::Pub);
     w.dep(root, "e", dep);
     w.use_(root, "e::m::S", V::Pub);
     w.use_(root, "e::m::P", V::Pub);
@@ -856,7 +856,7 @@ fn a_path_into_a_dependency_reads_its_decided_names() {
     w.use_(root, "e::m::Q", V::Pub);
     w.use_as(root, "::e::m::S", "S2", V::Pub);
     let b = w.module(root, "b", V::Pub);
-    w.glob(b, "e::m::*", V::Pub);
+    w.glob(b, "e::m", V::Pub);
     w.use_as(b, "self::T", "T2", V::Pub);
     w.use_as(b, "x::m::S", "S3", V::Pub);
     let u = w.decls.get_mut(&b).and_then(|d| d.uses.last_mut()).expect("the use just written");
@@ -865,7 +865,7 @@ fn a_path_into_a_dependency_reads_its_decided_names() {
     let ok = with_dep(&w, root, dep, CellPlant::None);
     assert_eq!(named_def(outcome(&ok, root, 0), Namespace::Types), Some(s));
     assert_eq!(outcome(&ok, root, 1), Outcome::Failed(Unresolved::Private));
-    assert_eq!(named_def(outcome(&ok, root, 2), Namespace::Types), Some(t), "through the dependency's own glob");
+    assert_eq!(named_def(outcome(&ok, root, 2), Namespace::Types), Some(t), "through the dependency's own glob: {:?}", outcome(&ok, root, 2));
     assert!(matches!(outcome(&ok, root, 3), Outcome::Failed(Unresolved::NotFound)), "{:?}", outcome(&ok, root, 3));
     assert_eq!(named_def(outcome(&ok, root, 4), Namespace::Types), Some(s), "`::e` is the extern prelude's");
     assert_eq!(named_def(outcome(&ok, b, 1), Namespace::Types), Some(t), "the dependency's glob layer");

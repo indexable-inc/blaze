@@ -1,7 +1,7 @@
 //! Rows of bits in one flat array: the one set structure of every dataflow here.
 #![blaze::sans_io]
 
-use alloc::vec::Vec;
+use blaze_own::Vec;
 use core::alloc::Allocator;
 
 /// `rows` rows of `cols` bits each, row-major, `cols.div_ceil(64)` words a row.

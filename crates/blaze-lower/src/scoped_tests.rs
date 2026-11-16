@@ -36,6 +36,9 @@ macro_rules! outer { () => { $crate::inner_m!() } }
 #[macro_export]
 macro_rules! inner_m { () => { $crate::deep::f() } }
 pub mod deep { pub fn f() -> u32 { 1 } }
+// core's `extern crate self as core;` and `assert_unsafe_precondition!`'s `::core::ub_checks::$kind()`.
+extern crate self as dep;
+macro_rules! kind_call { ($kind:ident) => { ::dep::deep::$kind() } }
 pub mod again { pub use crate::m as re; }
 pub mod globbed { pub use crate::seven_of; }
 
@@ -236,11 +239,52 @@ fn dollar_crate_in_a_macro_written_by_a_macro_names_the_defining_crate() {
 /// then the names library at the body's module), never to `user`'s own `deep::f`.
 #[test]
 fn a_value_path_a_nested_expansion_writes_names_the_defining_crate() {
+    let (asked, dump) = asked_paths(0, "fn k() -> u32 { dep::outer!() }");
+    let dep_f = item_of(1, &["deep", "f"]);
+    assert!(asked.iter().any(|(_, hit)| *hit == Some(dep_f)), "{asked:?} (dep's `deep::f` is {dep_f:?})\n{dump}");
+}
+
+/// The pinned core names itself through the extern prelude (`extern crate self as core;`, core
+/// lib.rs), and `assert_unsafe_precondition!` (core ub_checks.rs) writes `::core::ub_checks::
+/// $kind()` and `::core::panicking::panic_nounwind_fmt(..)` in bodies of core itself: a `::dep`
+/// path in a body of `dep` (which has `extern crate self as dep;`) resolves to `dep`'s item.
+#[test]
+fn a_global_path_through_the_crate_s_own_alias_in_its_body() {
+    let (asked, dump) = asked_paths(1, "fn q() -> u32 { ::dep::deep::f() }");
+    let dep_f = item_of(1, &["deep", "f"]);
+    assert!(asked.iter().any(|(_, hit)| *hit == Some(dep_f)), "{asked:?}\n{dump}");
+}
+
+/// `::core::ub_checks::$kind()`: an `ident` fragment as a path's last segment, written by a macro
+/// of `dep` called in `dep`'s own body through `::dep`.
+#[test]
+fn an_ident_fragment_as_a_path_segment_in_a_body() {
+    let (asked, dump) = asked_paths(1, "fn s() -> u32 { kind_call!(f) }");
+    let dep_f = item_of(1, &["deep", "f"]);
+    assert!(asked.iter().any(|(_, hit)| *hit == Some(dep_f)), "{asked:?}\n{dump}");
+}
+
+/// The library item `segments` name from crate `krate`'s root (`crate::..`).
+fn item_of(krate: usize, segments: &[&str]) -> blaze_id::ItemKey {
+    use blaze_scope::names::{self, Written};
+    use blaze_scope::{Namespace, PathKind};
+    let names = names();
+    names::path(names, names.root(krate), Namespace::Values, Written { kind: PathKind::Crate, segments }, Alloc::global())
+        .unwrap_or_else(|e| panic!("`crate::{}` of crate {krate}: {e:?}", segments.join("::")))
+        .def
+        .key
+}
+
+/// `text` lowered with expansion in crate `krate`'s root module, then every path of the body
+/// asked as the ladder's resolver asks it (`to_path` at the body's crate, then the names library
+/// at the body's module): each path as written and the library item it names; and the dump.
+fn asked_paths(krate: usize, text: &str) -> (StdVec<(String, Option<blaze_id::ItemKey>)>, String) {
     use crate::resolve::{Answer, Ns, resolve};
     use blaze_scope::names::{self, Written};
     use blaze_scope::task::to_path;
-    use blaze_scope::{Namespace, PathKind};
-    struct Ask(&'static Names<'static>, CrateItemKey);
+    use blaze_scope::Namespace;
+    /// Each value path asked, as written, and the library item it names from the crate's root.
+    struct Ask(&'static Names<'static>, usize, CrateItemKey, StdVec<(String, Option<blaze_id::ItemKey>)>);
     impl crate::resolve::Names for Ask {
         fn lookup(&mut self, ns: Ns, absolute: bool, segments: &[&str]) -> Answer {
             let ns = match ns {
@@ -248,29 +292,27 @@ fn a_value_path_a_nested_expansion_writes_names_the_defining_crate() {
                 Ns::Value => Namespace::Values,
                 Ns::Macro => Namespace::Macros,
             };
-            let p = to_path(absolute, segments, self.1, Alloc::global());
-            match names::path(self.0, self.0.root(0), ns, Written { kind: p.kind, segments: &p.segments }, Alloc::global()) {
-                Ok(r) if r.consumed == p.segments.len() => Answer::Found(r.def.key),
-                _ => Answer::Absent,
-            }
+            let p = to_path(absolute, segments, self.2, Alloc::global());
+            let hit = match names::path(self.0, self.0.root(self.1), ns, Written { kind: p.kind, segments: &p.segments }, Alloc::global()) {
+                Ok(r) if r.consumed == p.segments.len() => Some(r.def.key),
+                _ => None,
+            };
+            self.3.push((segments.join("::"), hit));
+            Answer::Absent
         }
         fn lang(&mut self, _: crate::form::LangItem) -> Answer {
             Answer::Absent
         }
     }
     let names = names();
-    let scoped = Scoped { names, module: names.root(0), prepared: Some(Prepares::new_in(Alloc::global())) };
+    let scoped = Scoped { names, module: names.root(krate), prepared: Some(Prepares::new_in(Alloc::global())) };
     let mut expander = ByName::with_names(&scoped, Host, Alloc::global());
-    let text = "fn k() -> u32 { dep::outer!() }";
-    let l = lower_body_expanding(text, names.edition(0), &mut Unix, &mut expander, Alloc::global()).unwrap_or_else(|need| panic!("{text}: needs {:?}", need.atoms));
-    let dep_f = names::path(names, names.root(1), Namespace::Values, Written { kind: PathKind::Crate, segments: &["deep", "f"] }, Alloc::global())
-        .unwrap_or_else(|e| panic!("dep's `deep::f`: {e:?}"))
-        .def
-        .key;
-    let user = CrateItemKey(ContentId::of("blaze-lower scoped test crate", b"user"));
-    let got = resolve(&l.view(), &mut Ask(names, user), Alloc::global()).unwrap_or_else(|e| panic!("{text}: {e:?}"));
-    let found: StdVec<_> = got.paths.iter().map(|r| r.target).collect();
-    assert!(found.contains(&crate::resolve::Target::Item(dep_f)), "{text}: {found:?} (dep's `deep::f` is {dep_f:?})\n{}", dump_of(&l));
+    let l = lower_body_expanding(text, names.edition(krate), &mut Unix, &mut expander, Alloc::global()).unwrap_or_else(|need| panic!("{text}: needs {:?}", need.atoms));
+    let name = ["user", "dep", "old"][krate];
+    let key = CrateItemKey(ContentId::of("blaze-lower scoped test crate", name.as_bytes()));
+    let mut ask = Ask(names, krate, key, StdVec::new());
+    resolve(&l.view(), &mut ask, Alloc::global()).unwrap_or_else(|e| panic!("{text}: {e:?}"));
+    (ask.3, std::format!("{text}\n{}", dump_of(&l)))
 }
 
 /// The same rule for a macro handed through an `item` fragment of another macro (tokio's

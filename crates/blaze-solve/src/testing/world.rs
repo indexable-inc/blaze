@@ -474,10 +474,13 @@ impl Names {
     }
 
     /// `P: Sized` for every case parameter (a case's params are a fn's).
-    pub fn case_sized<T: Tys>(&self, s: &mut Arena<'_, T>, line: u32, n: u32, out: &mut Vec<Clause>) -> Parsed<()> {
+    pub fn case_sized<T: Tys>(&self, s: &mut Arena<'_, T>, line: u32, unsized_: &[bool], out: &mut Vec<Clause>) -> Parsed<()> {
         let mut preds = Vec::new();
-        for i in 0..n {
-            let t = s.node(TyKind::Param(i)).map_err(|x| solve_err(line, x))?;
+        for (i, &u) in unsized_.iter().enumerate() {
+            if u {
+                continue;
+            }
+            let t = s.node(TyKind::Param(i as u32)).map_err(|x| solve_err(line, x))?;
             self.sized(s, line, t, &[], &mut preds)?;
         }
         out.extend(preds.into_iter().map(|pred| Clause { pred, bound: 0 }));

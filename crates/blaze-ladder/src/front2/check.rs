@@ -281,7 +281,10 @@ fn diag_about(r: &Records<'_, '_>, tys: tc::PTys<'_>, d: &tc::Diag) -> Box<str> 
             }
         }
         Some(tc::Because::NoLangItem(l)) => format!("no lang item {l:?}"),
-        other => format!("because {other:?}, found {:?}, expected {:?}, name {:?} (a projection goal is not named by the checker yet)", ty(d.found), ty(d.expected), d.name),
+        // Every goal's finding (E0277, E0283) carries `Unmet`; what is left is about a node, not a
+        // goal: its types and the name it looked up.
+        Some(other) => format!("because {other:?}, found {:?}, expected {:?}", ty(d.found), ty(d.expected)),
+        None => format!("found {:?}, expected {:?}, name {:?}", ty(d.found), ty(d.expected), d.name),
     };
     s.into_boxed_str()
 }
@@ -534,15 +537,12 @@ fn make_once(r: &mut Records<'_, '_>, fill: Fill) -> Result<(), MakeFail> {
         Fill::Impls(trait_, shape) => {
             let b = r.buckets.get_or_insert_with(|| Buckets::new(r.names, r.index));
             let mut candidates = b.trait_candidates(trait_, shape);
-            // A negative impl is no candidate of a goal of a non-auto trait (it never meets
-            // one, and no positive impl overlaps it). Of an auto trait (or one whose head is not
-            // made) it decides the auto rule, which the checker does not read: it stays a
-            // candidate, so its refused header is this question's gap, never a wrong `yes`.
-            let auto = r.keys.library(trait_).and_then(|t| r.store.maps.traits.get(&t)).is_none_or(|t| t.flags.has(tc::TraitFlags::AUTO));
-            if auto {
-                candidates.extend_from_slice(b.negative_of(trait_));
-                candidates.sort_unstable();
-            }
+            // A negative impl is a candidate of its trait's questions (`Buckets::answer`): it
+            // decides an auto trait's structural rule, and the solver matches it to no positive
+            // goal; its refused header is the question's gap, never a wrong `yes`.
+            candidates.extend_from_slice(b.negative_of(trait_));
+            candidates.sort_unstable();
+            candidates.dedup();
             lower_heads(r.names, r.keys, r.store, b, candidates, r.order)?;
             b.answer(r.store, trait_, shape).map_err(MakeFail::Buckets)
         }

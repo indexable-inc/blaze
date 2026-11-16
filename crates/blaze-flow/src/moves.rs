@@ -8,7 +8,7 @@
 //! The result of dereferencing an expression with type `Box<T>` ...".
 #![blaze::sans_io]
 
-use alloc::vec::Vec;
+use blaze_own::Vec;
 use core::alloc::Allocator;
 
 use crate::bits::{self, Bits};

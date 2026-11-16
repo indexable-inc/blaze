@@ -313,17 +313,24 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases) -> Resul
             ),
         )?;
     }
-    // Nothing follows a program that ran: its output is the command's.
-    // `check` names what it did not check, and never says `ok` over it (decision D61 item 5).
+    let status = close(cx, command, &finished, &shown, ran, phases.in_main(), frame, out);
+    phases.mark("answer printed");
+    // The answer is printed: the profile is written after it, in place, never synced.
+    print::profile(cx, &root, &finished.answer, phases, frame)?;
+    status
+}
+
+/// A request's closing line and its exit status, the one home of both (a command test calls
+/// it as `command` does). Nothing follows a program that ran: its output is the command's.
+/// `check` names what it did not check, and never says `ok` over it (decision D61 item 5).
+#[expect(clippy::too_many_arguments, reason = "the request's parts, each read once")]
+fn close(cx: &Cx, command: Command, finished: &Finished<'_>, shown: &print::Shown<'_>, ran: Option<u8>, in_main: u64, frame: &Frame, out: &Out) -> Result<Status, CliError> {
     let (ran_stages, not_stages) = check_coverage(frame);
     let coverage = (command == Command::Check && !not_stages.is_empty()).then_some(blaze_report::frame::Coverage { ran: &ran_stages, not: &not_stages });
     if ran.is_none() {
         let tail = (command == Command::Test).then_some("tests are not run yet: this build of blaze checks them");
-        print::closing(cx, &shown, finished.checked, phases.in_main(), Some(p.runs()), tail, coverage, frame, out)?;
+        print::closing(cx, shown, finished.checked, in_main, Some(finished.answer.profile.runs()), tail, coverage, frame, out)?;
     }
-    phases.mark("answer printed");
-    // The answer is printed: the profile is written after it, in place, never synced.
-    print::profile(cx, &root, &finished.answer, phases, frame)?;
     if shown.counts.errors > 0 || finished.answer.failed > 0 {
         return Ok(Status::FAILED);
     }
@@ -346,7 +353,7 @@ pub(crate) const INCOMPLETE: Status = Status(3);
 const STATUSES: [(u8, &str); 3] = [
     (0, "check: every stage `check` is defined to run ran and found nothing (run: the program's own status)"),
     (1, "an error was found, a task failed, or blaze itself failed (its message says which)"),
-    (3, "check: incomplete: the stages this build runs found nothing, but a stage `check` is defined to run (types, borrows) is not built yet; not a pass"),
+    (3, "check: incomplete: the stages this build runs found nothing, but a stage `check` is defined to run is not built yet (the closing line's \"NOT checked\" names which); not a pass"),
 ];
 
 fn explain(cx: &Cx, asked: Option<&str>, out: &Out) -> Result<Status, CliError> {
@@ -367,7 +374,8 @@ fn explain(cx: &Cx, asked: Option<&str>, out: &Out) -> Result<Status, CliError> 
 
 /// The one list of the stages `check` is defined to run, in order, and whether this build runs
 /// each. The day a stage lands, its entry turns `true`; when all are, `check` can say `ok`.
-pub(crate) const CHECK_STAGES: [(&str, bool); 5] = [("manifests", true), ("syntax", true), ("names", true), ("types", false), ("borrows", false)];
+pub(crate) const CHECK_STAGES: [(&str, bool); 6] =
+    [("manifests", true), ("syntax of items", true), ("syntax inside bodies", false), ("names", true), ("types", false), ("borrows", false)];
 
 /// [`CHECK_STAGES`] split: those this build runs, and those it does not.
 fn check_coverage(frame: &Frame) -> (Vec<&'static str, &Frame>, Vec<&'static str, &Frame>) {
@@ -998,6 +1006,8 @@ mod tests {
         profile: std::string::String,
         /// The errors it found.
         errors: u32,
+        /// The exit status `command` returns for it (`close`), `None` where `close` failed.
+        status: Option<u8>,
     }
 
     fn write(io: &Io, path: &str, text: &str) {
@@ -1051,7 +1061,10 @@ mod tests {
         let finished = request(&cx, &root, ("ws", None, None, Some("/h"), Some("/"), toolchain), None, command, 1, home::tool(b"test"), sizes, &launch, frame, said, &err, &mut ran, &mut shown, &mut phases)?;
         // The drive's count holds the parts it failed `Waited` itself (no task ran for them).
         assert!(finished.answer.failed as usize >= finished.failed.len());
+        // The closing line and the status, as `command` makes them.
+        let status = close(&cx, command.0, &finished, &shown, ran, 0, frame, said).ok().map(|status| status.0);
         Ok(Checked {
+            status,
             // The causes: a task failed only because one it needed failed is not one.
             failed: finished
                 .failed
@@ -1083,6 +1096,53 @@ mod tests {
         let created = check(&io, work::Sizes::USUAL);
         assert!(created.failed.is_empty(), "{:?}", created.failed);
         assert_eq!(created.errors, 0, "the created file clears the error:\n{}", created.profile);
+    }
+
+    /// A missing module file is one finding at its `mod` line, naming both places; the rest of
+    /// the crate is still checked (the request answers, nothing fails).
+    #[test]
+    fn a_missing_module_file_is_one_finding_at_its_mod_line() {
+        let io = Io::simulated(SimWorld::new(5, Limits::USUAL));
+        write(&io, "Cargo.toml", MANIFEST);
+        write(&io, "src/lib.rs", "pub fn f() {}\nmod x;\n");
+        let missing = check(&io, work::Sizes::USUAL);
+        assert!(missing.failed.is_empty(), "{:?}", missing.failed);
+        assert_eq!((missing.errors, missing.status), (1, Some(1)), "{}", missing.profile);
+        let out = stdout(&io);
+        assert!(out.contains("src/x.rs") && out.contains("src/x/mod.rs") && out.contains("lib.rs:2"), "{out}");
+    }
+
+    /// What the simulated host's standard output holds.
+    fn stdout(io: &Io) -> std::string::String {
+        let out = io.script(|host| host.out.clone()).expect("a simulated host");
+        std::string::String::from_utf8(out).expect("UTF-8")
+    }
+
+    /// `check` of a clean project says `incomplete`, names what it did and did not check, and
+    /// exits 3; an item-level syntax error exits 1 with the error; `blaze explain 3` says what
+    /// "incomplete" means.
+    #[test]
+    fn a_clean_check_says_incomplete_and_exits_3() {
+        let io = Io::simulated(SimWorld::new(6, Limits::USUAL));
+        write(&io, "Cargo.toml", MANIFEST);
+        write(&io, "src/lib.rs", "pub fn f() -> u8 { 1 }\n");
+        let clean = check(&io, work::Sizes::USUAL);
+        assert_eq!(clean.status, Some(3), "{}", clean.profile);
+        let out = stdout(&io);
+        let last = out.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("");
+        assert!(last.contains("incomplete"), "{out}");
+        assert!(last.contains("NOT checked") && last.contains("types") && last.contains("names") && !last.contains(" ok"), "{last}");
+        let io = Io::simulated(SimWorld::new(6, Limits::USUAL));
+        write(&io, "Cargo.toml", MANIFEST);
+        write(&io, "src/lib.rs", "pub fn f() -> u8 { 1 }\nfn fn\n");
+        let broken = check(&io, work::Sizes::USUAL);
+        assert_eq!((broken.status, broken.errors), (Some(1), 1), "{}", broken.profile);
+        assert!(stdout(&io).contains("error"), "{}", stdout(&io));
+        let io = Io::simulated(SimWorld::new(6, Limits::USUAL));
+        let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+        let said = explain(&cx, Some("3"), &io.need_out().expect("out")).expect("explain 3");
+        assert_eq!(said.0, 0);
+        assert!(stdout(&io).starts_with("exit status 3: check: incomplete"), "{}", stdout(&io));
     }
 
     /// The closing note says what the command left out, from the kinds the worker builds: each

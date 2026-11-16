@@ -65,5 +65,26 @@ blaze-data.workspace = true
 blaze-json.workspace = true
 blaze-sim.workspace = true
 
+# The old layer's `cargo` reader's tests; the bare crate (`layout`, `lock`) is tested without it.
+[[test]]
+name = "cargo_features"
+required-features = ["cargo"]
+
+[[test]]
+name = "config_get"
+required-features = ["cargo"]
+
+[[test]]
+name = "config_typed"
+required-features = ["cargo"]
+
+[[test]]
+name = "fixtures"
+required-features = ["cargo"]
+
+[[test]]
+name = "profiles"
+required-features = ["cargo"]
+
 [lints]
 workspace = true
