@@ -1,5 +1,6 @@
 ---
-status: plan
+status: superseded
+superseded_by: bottom.md#10-storage
 summary: The store's hot tier as a vmcache-style buffer pool - one reserved range with a fixed slot per page of every store file, a state word per page (optimistic and pinned reads), misses as explicit reads around the page cache through blaze-core that the task yields on, immutable records written once through the pool, eviction by the one evictor (a second-chance sweep that takes a page read once first) with MADV_DONTNEED / MADV_FREE_REUSABLE, prefetch we plan ourselves (each view's recorded trace replayed in order and paced by its hits, then the change set's cone in the query graph), codegen outputs then memos then the image on it, a DST, and the lanes.
 date: 2026-11-10
 ---

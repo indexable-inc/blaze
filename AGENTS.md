@@ -13,10 +13,10 @@ iterate. Rules 28, 62, 66 and 67 say how.
 
 ## The goal
 
-Fast incremental compiles of real Rust in a million-line workspace. When two trade, the order is:
-incremental time (large crates and files, after a restart too) and lints as fast; records from
-remote; memory; cold time; cleanup that never blocks; disk use. Best on 128 cores, good on a typical
-Mac (8 to 16 cores, 16 to 64 GB), with one code path sized by the machine.
+Fast incremental compiles, lints and tests of real Rust in monorepos of millions of lines, enormous
+crates and files included: an edit redoes only what changed. When two trade, the order is:
+incremental time (after a restart too) with lints as fast; records from remote; memory; cold time;
+cleanup that never blocks; disk use. Best on 128 cores, good on a typical Mac, one code path.
 
 ## The design ([in full](docs/v2/plan/design/bottom.md))
 
