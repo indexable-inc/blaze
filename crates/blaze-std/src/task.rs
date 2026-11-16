@@ -39,11 +39,32 @@
 //! a wait, because blaze refuses, at compile time, a value that is not `Send` live across a call
 //! that can wait (rule 27).
 //!
-//! **Layout.** S1 runs the `Inline` layout ([`LAYOUT`]): [`Scope::spawn`] runs its task to
-//! completion before it returns, so spawn is eager and nothing else runs while a task waits.
-//! [`Scope::spawn_concurrent`], which must overlap its task with what follows, cannot under
-//! `Inline` and is refused at run time with [`TaskWhy::CannotOverlap`] (the spec makes it a
-//! compile error; that check does not exist yet).
+//! **May overlap, or must** (the distinction is Zig's `std.Io`: `async` against `concurrent`).
+//! There are two ways to start a task, and the one chosen says what the code's correctness
+//! rests on:
+//!
+//! - [`Scope::may_overlap`]: the task may run later than its spawn, or at the same time as
+//!   what follows it, and the code is correct either way. With no worker free it runs inline,
+//!   to completion, at its spawn. Almost every task is this one: `par`'s chunks, independent
+//!   reads, anything joined before its result is used.
+//! - [`Scope::must_overlap`]: the code is correct only if the task and its spawner make
+//!   progress at once: a producer and a consumer of one bounded channel, a server and the
+//!   client that talks to it. Run inline, the first full or empty wait would never be answered
+//!   and would end only at its deadline; so where the scope cannot give the task a worker of
+//!   its own, `must_overlap` does not run it and returns [`NoParallelism`] at once, before
+//!   anything waits.
+//!
+//! How many tasks can run at once is the scope's [`Scope::workers`]: the layout's
+//! ([`Layout::workers`]) narrowed by the scope's budget ([`Scope::narrow_workers`]: a test
+//! runner narrowed to one thread proves code against the one-thread executor).
+//!
+//! **Layout.** S1 runs the `Inline` layout ([`LAYOUT`]), which has one worker: the simulation's
+//! executor and every narrowed test runner's. [`Scope::may_overlap`] runs its task to
+//! completion before it returns, in spawn order, so nothing else runs while a task waits, and
+//! [`Scope::must_overlap`] always returns [`NoParallelism`] `{ needed: 2, have: 1 }`. A layout
+//! with more than one worker (`Threads`, `Fibers`, `Frames`) runs a `must_overlap` task beside
+//! its spawner; none is built yet, since a task's context is made on its spawner's thread and
+//! is not `Send` (std.md, "Tasks and waiting").
 
 use alloc::{borrow::ToOwned, string::{String, ToString}};
 use core::{
@@ -51,6 +72,7 @@ use core::{
     cell::{Cell, RefCell},
     fmt,
     marker::PhantomData,
+    num::NonZeroU32,
     panic::AssertUnwindSafe,
 };
 
@@ -71,8 +93,53 @@ pub enum Layout {
     Inline,
 }
 
+impl Layout {
+    /// How many tasks it runs at once: what [`Scope::must_overlap`] asks of it.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub const fn workers(self) -> u32 {
+        match self {
+            Layout::Inline => 1,
+        }
+    }
+}
+
 /// This build's layout.
 pub const LAYOUT: Layout = Layout::Inline;
+
+/// [`Scope::must_overlap`] was asked for a task that must run at the same time as its spawner,
+/// and the scope has fewer workers than that needs: the task never ran. Nothing waited first,
+/// so a code path that is correct only with parallelism fails here, at once, instead of
+/// waiting out its deadline on a wait nobody else can answer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct NoParallelism {
+    /// The scope's task (its span).
+    pub scope: &'static str,
+    /// The task that was not run.
+    pub task: &'static str,
+    /// How many tasks must make progress at once: the task and its spawner.
+    pub needed: u32,
+    /// How many the scope can run at once ([`Scope::workers`]).
+    pub have: u32,
+    /// The layout that gave `have`, before the scope's budget narrowed it.
+    pub layout: Layout,
+}
+
+impl fmt::Display for NoParallelism {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let NoParallelism { scope, task, needed, have, layout } = *self;
+        write!(
+            f,
+            "bstd::task {task} of a scope in {scope}: must_overlap needs {needed} tasks running at once, and the \
+             scope has {have} worker(s) ({layout:?} layout, narrowed by the scope's budget); it never ran. Start \
+             it with may_overlap only if it is correct when run inline"
+        )
+    }
+}
+
+impl core::error::Error for NoParallelism {}
 
 /// How a task failed.
 #[derive(Clone, PartialEq, Eq, Debug)] // clone: an error
@@ -83,8 +150,6 @@ pub enum TaskWhy {
     Panicked(String),
     /// Its frame could not be made.
     OutOfMemory(Stopped),
-    /// It was spawned to overlap what follows, and the layout cannot overlap: it never ran.
-    CannotOverlap { layout: Layout },
     /// The scope was joined with this many tasks still running, after its wait for them
     /// stopped so.
     Unended { running: usize, stopped: Stopped },
@@ -109,11 +174,6 @@ impl fmt::Display for TaskError {
             TaskWhy::OutOfMemory(stopped) => {
                 write!(f, "bstd::task {task} of a scope in {scope} got no frame: {stopped}")
             }
-            TaskWhy::CannotOverlap { layout } => write!(
-                f,
-                "bstd::task {task} of a scope in {scope}: spawn_concurrent must overlap its task, and the \
-                 {layout:?} layout runs each task to completion at its spawn"
-            ),
             TaskWhy::Unended { running, stopped } => write!(
                 f,
                 "bstd::task the scope in {scope} was joined with {running} tasks still running (the last \
@@ -145,6 +205,9 @@ struct Live {
     /// Tasks spawned so far: the next one is placed on the worker after the scope's own plus
     /// this many (the model of a pool's spread under `Inline`).
     placed: Cell<u32>,
+    /// The most tasks the scope runs at once: the layout's, narrowed by
+    /// [`Scope::narrow_workers`], never widened.
+    workers: Cell<u32>,
     /// Whether the scope is still this value's to end: cleared by [`Scope::join`].
     armed: bool,
 }
@@ -221,20 +284,23 @@ impl<'p> Scope<'p> {
             running: Cell::new(0),
             last: Cell::new(""),
             placed: Cell::new(0),
+            workers: Cell::new(LAYOUT.workers()),
             armed: true,
         };
         Scope { live, parent: PhantomData }
     }
 
-    /// Runs `task` as the task `name` of this scope, in any order with its siblings (under
-    /// `Inline`, now, to completion). An error it returns, or a panic, cancels the scope: the
-    /// next wait of each task after it ends with [`Stopped::Cancelled`], and the scope fails
-    /// with the first. A `Task` value of a process's exit is never made: the exit unwinds on.
+    /// Runs `task` as the task `name` of this scope, which may overlap what follows it or not:
+    /// the code must be correct either way (the module's doc). With no worker free it runs
+    /// inline, now, to completion: always under `Inline`, so siblings run in spawn order. An
+    /// error it returns, or a panic, cancels the scope: the next wait of each task after it
+    /// ends with [`Stopped::Cancelled`], and the scope fails with the first. A `Task` value of
+    /// a process's exit is never made: the exit unwinds on.
     ///
     /// `scratch` is the most bytes the task's frame (`cx.frame()`) hands out: an allocation
     /// past it is the task's [`Stopped::OutOfMemory`], naming the task. It is reserved as
     /// address space here and committed as it is used.
-    pub fn spawn<T, E: fmt::Display>(
+    pub fn may_overlap<T, E: fmt::Display>(
         &self,
         name: &'static str,
         scratch: usize,
@@ -271,25 +337,50 @@ impl<'p> Scope<'p> {
         Task { name, outcome, scope: PhantomData }
     }
 
-    /// Runs `task` overlapping what follows it in the scope. The `Inline` layout cannot: the
-    /// task does not run, and it and the scope fail with [`TaskWhy::CannotOverlap`]. `scratch`
-    /// is the task's frame, as [`Scope::spawn`]'s; no frame is made for a task that does not
-    /// run.
-    pub fn spawn_concurrent<T, E: fmt::Display>(
+    /// Runs `task` as the task `name` of this scope, at the same time as what follows it: for
+    /// code that is correct only if both make progress at once (the module's doc). Where the
+    /// scope has fewer than the two workers that needs ([`Scope::workers`]), the task does not
+    /// run, no frame is made for it, nothing waits, and the answer is [`NoParallelism`]; the
+    /// scope is not failed by it, so the caller says what follows (usually `?`). Always so
+    /// under `Inline`, which has one worker. `scratch` is the task's frame, as
+    /// [`Scope::may_overlap`]'s.
+    pub fn must_overlap<T, E: fmt::Display>(
         &self,
         name: &'static str,
         scratch: usize,
         task: impl FnOnce(&Cx) -> Result<T, E>,
-    ) -> Task<'_, T> {
+    ) -> Result<Task<'_, T>, NoParallelism> {
+        // The task and its spawner.
+        let needed = 2;
+        let have = self.workers();
+        if have < needed {
+            return Err(NoParallelism { scope: self.live.cx.name(), task: name, needed, have, layout: LAYOUT });
+        }
+        let _: (usize, _) = (scratch, task);
         match LAYOUT {
             Layout::Inline => {
-                let _: usize = scratch;
-                drop(task);
-                self.live.last.set(name);
-                let error = self.live.fail(name, TaskWhy::CannotOverlap { layout: LAYOUT });
-                Task { name, outcome: Err(error), scope: PhantomData }
+                unreachable!("bstd::task {name}: the Inline layout has one worker, so must_overlap refused it above")
             }
         }
+    }
+
+    /// How many of its tasks the scope runs at once: the layout's [`Layout::workers`], narrowed
+    /// by [`Scope::narrow_workers`]. One under `Inline`.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn workers(&self) -> u32 {
+        self.live.workers.get()
+    }
+
+    /// Lets the scope run at most `most` of its tasks at once from now on; it only narrows. A
+    /// scope narrowed to one runs as the one-thread executor does: every
+    /// [`Scope::may_overlap`] inline and in order, every [`Scope::must_overlap`] refused.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn narrow_workers(&self, most: NonZeroU32) {
+        self.live.workers.set(self.live.workers.get().min(most.get()));
     }
 
     /// Cancels the scope: the next wait of each task under it ends with

@@ -21,24 +21,22 @@ use blaze_own::{SortedSet, Soa, Vec};
 
 use crate::{CodeId, Plant, SlotId, TestId};
 
-/// The code identities a test entered, from its lane's bytes: `marks[slot]` is non-zero for each
-/// slot entered, `ids[slot]` is the slot's body's identity, and `absorbed(slot)` lists what an
-/// optimized body in the slot inlined (empty for fast code). Pushed to `out` sorted, each once.
+/// The code identities a test entered: `marked` is each slot whose byte is set in a bitmap of
+/// the test's threads (in any order, a slot as often as threads marked it), `ids[slot]` is the
+/// slot's body's identity, and `inlined(slot)` lists the identities the optimizer inlined into
+/// the slot's optimized body (empty for fast code). Pushed to `out` sorted, each once.
 pub fn entered<'a, A: Allocator>(
-    marks: &[u8],
+    marked: &[SlotId],
     ids: &[CodeId],
-    absorbed: impl Fn(SlotId) -> &'a [CodeId],
+    inlined: impl Fn(SlotId) -> &'a [CodeId],
     out: &mut Vec<CodeId, A>,
 ) {
     let first = out.len();
-    for (at, mark) in marks.iter().enumerate() {
-        if *mark == 0 {
-            continue;
-        }
-        if let Some(id) = ids.get(at) {
+    for slot in marked {
+        if let Some(id) = ids.get(slot.index()) {
             out.push(*id);
         }
-        out.extend_from_slice(absorbed(SlotId(at as u32)));
+        out.extend_from_slice(inlined(*slot));
     }
     sort_tail(out, first);
 }

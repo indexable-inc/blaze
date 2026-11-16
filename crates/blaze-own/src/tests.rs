@@ -969,26 +969,70 @@ fn fn_mut<F: FnMut()>(f: F) -> F {
     f
 }
 
+/// `f`, its closure kind fixed to `FnOnce` by the bound.
+fn fn_once<F: FnOnce() -> u64>(f: F) -> F {
+    f
+}
+
 #[test]
 fn boxed_closures_are_called_once_and_freed() -> Result<(), Broke> {
     tokens::fresh();
     let alloc = Counting::new();
     {
+        // Each closure takes its token whole (`let held = token`): a closure that only reads
+        // `token.value` captures that `u64` alone (precise capture copies a `Copy` field even
+        // out of a type with `Drop`), and the token would stay in this block.
+        //
+        // Path 1: the unsized form, called. The call consumes the closure: its token is gone
+        // and its block freed.
         let token = Token::new(3);
-        let once: Box<dyn crate::CallOnce<(u64,), Output = u64>, &Counting> =
-            Box::new_in(move |x: u64| token.value + x, &alloc);
+        let once: Box<dyn crate::CallOnce<(u64,), Output = u64>, &Counting> = Box::new_in(
+            move |x: u64| {
+                let held = token;
+                held.value + x
+            },
+            &alloc,
+        );
         if once(4) != 7 {
             return Err(Broke::Oracle(String::from("a boxed one-shot closure returned the wrong value")));
         }
-        // The call consumed the closure: its token is gone and its block freed.
         tokens::check(0)?;
         if alloc.live() != 0 {
             return Err(Broke::Oracle(String::from("a called box was not freed")));
         }
+        // Path 2: the unsized form, dropped uncalled: the box's drop drops the closure.
         let token = Token::new(5);
-        let never: Box<dyn crate::CallOnce<(), Output = u64>, &Counting> = Box::new_in(move || token.value, &alloc);
+        let never: Box<dyn crate::CallOnce<(), Output = u64>, &Counting> = Box::new_in(
+            move || {
+                let held = token;
+                held.value
+            },
+            &alloc,
+        );
+        tokens::check(1)?;
         drop(never);
         tokens::check(0)?;
+        if alloc.live() != 0 {
+            return Err(Broke::Oracle(String::from("a box dropped uncalled was not freed")));
+        }
+        // Path 3: the sized form, called by value.
+        let token = Token::new(4);
+        let sized = Box::new_in(
+            fn_once(move || {
+                let held = token;
+                held.value
+            }),
+            &alloc,
+        );
+        if sized() != 4 {
+            return Err(Broke::Oracle(String::from("a boxed sized closure returned the wrong value")));
+        }
+        tokens::check(0)?;
+        if alloc.live() != 0 {
+            return Err(Broke::Oracle(String::from("a called sized box was not freed")));
+        }
+        // Path 4: the unsized form, panicking in the call: the token is dropped by the unwind
+        // and the block freed by the call's guard.
         let token = Token::new(6);
         let panicking: Box<dyn crate::CallOnce<(), Output = ()>, &Counting> = Box::new_in(
             move || {

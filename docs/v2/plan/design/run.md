@@ -1,6 +1,6 @@
 ---
 status: plan
-summary: "`blaze run` and `blaze test` with no daemon and no executable: the `blaze run` process is the program's parent for exactly its life; the program runs code records placed in its own process behind one slot word a function, each compiled on its first call and optimized across functions in the background. Built as sans-IO machines with simulations in crates/blaze-run (Parent, Slots, Heat, Tier, Registry, Tests); not built: the drivers, the real Compiler and Optimizer, `blaze export`."
+summary: "`blaze run` and `blaze test` with no daemon and no executable: the `blaze run` process is the program's parent for exactly its life; the program runs code records placed in its own process behind two words a function (the slot word callers jump through, the body word stubs jump through), each compiled on its first call and optimized across functions in the background; nothing observed is ever compiled into code: heat, test marks and the viewer's hooks are stubs swapped into the slot word. Built as sans-IO machines with simulations in crates/blaze-run (Parent, Slots, Heat, Tier, Registry, Tests); not built: the drivers, the real Compiler and Optimizer, `blaze export`."
 date: 2026-11-15
 ---
 # Run and test
@@ -16,16 +16,17 @@ The machines are `crates/blaze-run`; this page is what they decide and what is n
 ```
 blaze run (parent: alive exactly as long as the program)      the program's process (blaze-launcher)
   certificate stands? -> manifest of the program (records)       control thread: Slots, Heat
-  Registry: entry in <state>/runs/, events stream                 program threads: load word, jump
-  Parent: lookups, Compiler on workers, single flight             a stub fires -> queue -> control
-  Tier: Optimizer on background workers                           thread -> Need over the socket
+  Registry: entry in <state>/runs/, events stream                 program threads: load slot word,
+  Parent: lookups, Compiler on workers, single flight             jump; a need stub fires -> queue
+  Tier: Optimizer on background workers                           -> control thread -> Need
         <==== Unix socket, blaze_launch::wire (deterministic CBOR), one per run ====>
   Welcome{slots, known: slot -> code record}  ------------->  maps table, area; places entry + pre-main
   Begin                                      ------------->  runs initializers, then main
                                              <-------------  Need{slot, thread}   (no known record)
   Publish{slot, tier, record} / Failed{slot, error} ------>  reads record from the store, places,
-                                                             stores the word, wakes the thread
-                                             <-------------  Hot{slot}  (heat crossed its bound)
+                                                             stores the words, wakes the thread
+  Hooks{slot, hooks}                         ------------->  hook stub in or out of the slot word
+                                             <-------------  Hot{slot}  (a count stub reached 0)
                                              <-------------  TestEnded{test, verdict, entered}
                                              <-------------  Exited{status}  -> parent unregisters, exits
 ```
@@ -52,9 +53,9 @@ the last free worker (workers >= 2), so a thread waits only on its own function.
 compile answers every caller `Failed(CompileError)`: in the program, the call panics on that
 thread with that error (rule 20) and every other function goes on. A compile has a deadline on
 the driver's clock; past it the askers fail with `Why::Overran`, and a late success still
-serves later callers. The `Compiler` trait: `VersionKey` -> `Made::Done(FastRecord { code,
-callees, reads })`, `Made::Need(keys)` or `Why`; its task writes the record before it answers.
-No compile waits on another (bottom.md, "How a task waits"): on `Need` the version is
+serves later callers. The `Compiler` trait: `CodeKey { function, tier }` -> `Made::Done(FastRecord
+{ code, callees, reads })`, `Made::Need(keys)` or `Why`; its task writes the record before it
+answers. No compile waits on another (bottom.md, "How a task waits"): on `Need` the slot is
 `Blocked{left}` and holds no worker, each lacking record is made once however many compiles
 lack it (`Make`, `made`), and the compile is entered again from the top when it lacks nothing;
 one deadline covers all its entries. The `Optimizer` returns the same shape and `Tier` blocks

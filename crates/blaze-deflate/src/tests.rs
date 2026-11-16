@@ -12,7 +12,7 @@ use blaze_own::Vec;
 use blaze_sim::{Broke, Config, Tape, check, control};
 
 use crate::{
-    Adler32, Crc32, Deflate, Error, Format, GzipDecoder, Inflate, Level, Limits, Tree, Why,
+    Adler32, Crc32, Deflate, Error, GzipDecoder, Inflate, Level, Limits, Tree, Why,
     ZlibDecoder, adler32, crc32, gunzip, gzip, inflate, unzlib, unzlib_prefix, zlib,
     plant::{self, Plant},
 };
@@ -51,10 +51,9 @@ fn decompress(stream: &[u8], limits: Limits, splits: &[usize]) -> Result<Vec<u8,
     while at < stream.len() && !i.is_done() {
         let end = at.saturating_add(sizes.next().unwrap_or(usize::MAX).max(1)).min(stream.len());
         let fed = i.feed(&stream[at..end], &mut out)?;
+        // Until the stream ends, a feed takes all it is given (into the output or the bits).
+        assert!(fed.done || fed.consumed == end - at, "a feed left input before the stream's end");
         at += fed.consumed;
-        if fed.consumed < end - at + fed.consumed && !fed.done {
-            return Err(Error { format: Format::Deflate, at: at as u64, why: Why::Truncated });
-        }
     }
     i.finish()?;
     Ok(out)
@@ -264,7 +263,7 @@ fn zlib_round_trip_and_prefix() {
             return Err(oracle(String::from("the reference reads our zlib differently")));
         }
         // Two streams end to end, as a git pack has them: the first's length is found.
-        let mut both = first.clone();
+        let mut both = Vec::from_slice_in(&first, Global);
         zlib(b"second", Level::Fast, Global, &mut both).map_err(|e| Broke::Harness(format!("{e}")))?;
         let mut out = empty();
         let len = unzlib_prefix(&both, LOOSE, Global, &mut out).map_err(|e| oracle(format!("{e}")))?;

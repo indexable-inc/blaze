@@ -1,5 +1,5 @@
 //! [`Tests`] against tests recorded and recorded again with other entered sets; the oracle is a
-//! naive scan of each test's last record. And [`entered`] against a naive read of the marks.
+//! naive scan of each test's last record. And [`entered`] against a naive read of the bitmaps.
 
 use std::alloc::Global;
 use std::collections::{BTreeMap, BTreeSet};
@@ -73,21 +73,27 @@ fn the_oracle_catches_postings_kept_from_an_old_record() {
 }
 
 #[test]
-fn entered_reads_the_marks_and_what_optimized_bodies_absorbed() {
+fn entered_reads_the_bitmaps_and_what_optimized_bodies_inlined() {
     check(Config::cases(300), |tape| {
         let slots = 6usize;
-        let marks: Vec<u8> = (0..slots).map(|_| u8::from(tape.coin("marked"))).collect();
+        // Two threads of one test, a bitmap each; the driver hands over every byte set.
+        let bitmaps: Vec<Vec<u8>> =
+            (0..2).map(|_| (0..slots).map(|_| u8::from(tape.coin("marked"))).collect()).collect();
+        let marked: Vec<SlotId> = bitmaps
+            .iter()
+            .flat_map(|bitmap| (0..slots).filter(|at| bitmap[*at] != 0).map(|at| SlotId(at as u32)))
+            .collect();
         let ids: Vec<CodeId> = (0..slots as u64).map(|n| body(n % 4)).collect();
-        let absorbed: Vec<Vec<CodeId>> = (0..slots)
-            .map(|_| (0..BODIES).filter(|_| tape.one_in(4, "absorbed")).map(body).collect())
+        let inlined: Vec<Vec<CodeId>> = (0..slots)
+            .map(|_| (0..BODIES).filter(|_| tape.one_in(4, "inlined")).map(body).collect())
             .collect();
         let mut got = Own::new_in(Global);
-        entered(&marks, &ids, |slot: SlotId| absorbed[slot.index()].as_slice(), &mut got);
+        entered(&marked, &ids, |slot: SlotId| inlined[slot.index()].as_slice(), &mut got);
         let mut want = BTreeSet::new();
         for at in 0..slots {
-            if marks[at] != 0 {
+            if bitmaps.iter().any(|bitmap| bitmap[at] != 0) {
                 want.insert(ids[at]);
-                want.extend(absorbed[at].iter().copied());
+                want.extend(inlined[at].iter().copied());
             }
         }
         let want: Vec<CodeId> = want.into_iter().collect();

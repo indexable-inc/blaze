@@ -984,42 +984,21 @@ impl MacroId {
         matches!(self, MacroId::ProcMacroId(it) if it.lookup(db).kind == ProcMacroKind::Attr)
     }
 
-    /// The name the macro is declared by: a derive's by the trait it derives.
-    pub fn name(self, db: &Db) -> hir_expand::name::Name {
-        // Kept as an entry of the macro's item, keyed by its header (`deps::facts`).
-        let (kind, at) = match self {
-            MacroId::Macro2Id(it) => (11, deps::facts::at(db, it)),
-            MacroId::MacroRulesId(it) => (10, deps::facts::at(db, it)),
-            MacroId::ProcMacroId(it) => (12, deps::facts::at(db, it)),
-        };
-        let header = deps::facts::Part::Header;
-        deps::facts::fact(db, "macro name", "", kind, Some(at), header, || (self.name_made(db), true))
+    /// The macro's item key.
+    pub fn key(self, db: &Db) -> ItemKey {
+        match self {
+            MacroId::Macro2Id(it) => it.lookup(db).key,
+            MacroId::MacroRulesId(it) => it.lookup(db).key,
+            MacroId::ProcMacroId(it) => it.lookup(db).key,
+        }
     }
 
-    /// [`MacroId::name`] off the macro's syntax.
-    fn name_made(self, db: &Db) -> hir_expand::name::Name {
-        use hir_expand::name::{AsName as _, Name};
-        use src::HasSource as _;
-        use syntax::view::HasName as _;
-        let of = |name: Option<syntax::view::Name<'_>>| {
-            name.map_or_else(Name::missing, |it| it.as_name())
-        };
-        match self {
-            MacroId::Macro2Id(it) => of(it.lookup(db).source_view(db).value.name()),
-            MacroId::MacroRulesId(it) => of(it.lookup(db).source_view(db).value.name()),
-            MacroId::ProcMacroId(it) => {
-                let loc = it.lookup(db);
-                let source = loc.source_view(db);
-                match loc.kind {
-                    ProcMacroKind::CustomDerive => attrs::AttrFlags::derive_info(db, self)
-                        .map_or_else(
-                            || of(source.value.name()),
-                            |info| Name::new_symbol_root(info.trait_name),
-                        ),
-                    ProcMacroKind::Bang | ProcMacroKind::Attr => of(source.value.name()),
-                }
-            }
-        }
+    /// The name the macro is declared by, a derive's by the trait it derives: its `MacroDef`
+    /// record's (a proc macro's export name), so no text is read.
+    pub fn name(self, db: &Db) -> hir_expand::name::Name {
+        let def = blaze_surface::Items::macro_def(db.items(), self.key(db));
+        let def = base_db::OrNeed::or_need(def);
+        hir_expand::name::Name::new_symbol_root(intern::Symbol::intern(def.head().name))
     }
 }
 

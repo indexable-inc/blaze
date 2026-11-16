@@ -301,7 +301,7 @@ impl<T, A: Allocator> RawTable<T, A> {
         let (ctrl, slots) = allocate::<T, A>(&self.alloc, groups)?;
         // The new table owns no value until the move is done: if `hasher` panics part way,
         // the guard frees only the new allocation and the old table still owns every value.
-        let mut grown = Moving { table: self, ctrl, groups, items: 0 };
+        let mut grown = Moving { table: &mut *self, ctrl, groups, items: 0 };
         let mut live = grown.table.live();
         while let Some(index) = live.next(&*grown.table) {
             let value = grown.table.slot_ptr(index);
@@ -712,18 +712,27 @@ impl<T, A: Allocator> core::iter::FusedIterator for Drain<'_, T, A> {}
 
 impl<T, A: Allocator> Drop for Drain<'_, T, A> {
     fn drop(&mut self) {
-        /// Empties the table however the drops below end.
-        struct Empty<'b, T, A: Allocator>(&'b mut RawTable<T, A>);
-        impl<T, A: Allocator> Drop for Empty<'_, T, A> {
+        /// Gives the allocation back to the table, every slot empty, however the drops below
+        /// end: a value whose drop panics leaks the rest, and none is dropped twice.
+        struct GiveBack<'b, T, A: Allocator> {
+            table: &'b mut RawTable<T, A>,
+            ctrl: NonNull<u64>,
+            slots: NonNull<T>,
+            groups: usize,
+        }
+        impl<T, A: Allocator> Drop for GiveBack<'_, T, A> {
             fn drop(&mut self) {
-                self.0.clear_no_drop();
+                self.table.ctrl = self.ctrl;
+                self.table.slots = self.slots;
+                self.table.groups = self.groups;
+                self.table.clear_no_drop();
             }
         }
+        let Held { ctrl, slots, groups } = self.held;
         let mut live = self.live.clone();
-        let (ctrl, groups, slots) = (self.table.ctrl, self.table.groups, self.table.slots);
-        let _empty = Empty(&mut *self.table);
+        let _give_back = GiveBack { table: &mut *self.table, ctrl, slots, groups };
         while let Some(index) = live.next_in(ctrl, groups) {
-            // SAFETY: `index` was live and not yet taken; dropped once.
+            // SAFETY: `index` was live in the held allocation and not yet taken; dropped once.
             unsafe { slots.as_ptr().add(index).drop_in_place() };
         }
     }
