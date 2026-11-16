@@ -7,7 +7,7 @@
 
 use core::{alloc::Allocator, fmt};
 
-use blaze_data::{At, Value};
+use blaze_data::{Order, Value, Visit, Walk};
 use blaze_own::String;
 
 use crate::{Event, Str, stack::Stack};
@@ -169,73 +169,24 @@ fn newline<B: Allocator>(out: &mut String<B>, style: Style, depth: usize) {
     }
 }
 
-fn write_value<A: Allocator, B: Allocator + Clone>(
-    value: &Value<A>,
-    out: &mut String<B>,
-    options: WriteOptions,
-    at: &At<'_>,
-    depth: usize,
-) -> Result<(), WriteError<B>> {
+/// A value that is no list or map, as JSON.
+fn leaf_into<A: Allocator, B: Allocator>(value: &Value<A>, out: &mut String<B>, bytes_as: BytesAs) -> Result<(), Unwritable> {
     match value {
         Value::Null => out.push_str("null"),
         Value::Bool(true) => out.push_str("true"),
         Value::Bool(false) => out.push_str("false"),
         Value::Int(n) => blaze_own::format_into!(out, "{n}"),
-        Value::Float(x) => float(*x, out).map_err(|what| fail(out, at, what))?,
+        Value::Float(x) => float(*x, out)?,
         Value::Text(text) => escape(text.as_str(), out),
-        Value::Bytes(bytes) => match options.bytes {
-            BytesAs::Refuse => return Err(fail(out, at, Unwritable::Bytes)),
+        Value::Bytes(bytes) => match bytes_as {
+            BytesAs::Refuse => return Err(Unwritable::Bytes),
             BytesAs::Base64(engine) => {
                 out.push('"');
                 engine.encode_append(bytes.as_slice(), out);
                 out.push('"');
             }
         },
-        Value::List(list) => {
-            out.push('[');
-            for (i, item) in list.iter().enumerate() {
-                if i > 0 {
-                    out.push(',');
-                }
-                newline(out, options.style, depth + 1);
-                write_value(item, out, options, &at.index(i), depth + 1)?;
-            }
-            if !list.is_empty() {
-                newline(out, options.style, depth);
-            }
-            out.push(']');
-        }
-        Value::Map(map) => {
-            out.push('{');
-            let entry = |i: usize, key: &str, item: &Value<A>, out: &mut String<B>| {
-                if i > 0 {
-                    out.push(',');
-                }
-                newline(out, options.style, depth + 1);
-                escape(key, out);
-                out.push(':');
-                if let Style::Pretty { .. } = options.style {
-                    out.push(' ');
-                }
-                write_value(item, out, options, &at.key(key), depth + 1)
-            };
-            match options.keys {
-                KeyOrder::Sorted => {
-                    for (i, (key, item)) in map.sorted().enumerate() {
-                        entry(i, key, item, out)?;
-                    }
-                }
-                KeyOrder::Insertion => {
-                    for (i, (key, item)) in map.iter().enumerate() {
-                        entry(i, key, item, out)?;
-                    }
-                }
-            }
-            if !map.is_empty() {
-                newline(out, options.style, depth);
-            }
-            out.push('}');
-        }
+        Value::List(_) | Value::Map(_) => unreachable!("a walk visits containers as starts"),
     }
     Ok(())
 }
@@ -293,8 +244,6 @@ pub enum StreamWhat {
     ValueWithoutKey,
     /// An end that closes nothing open, or the other kind.
     Unbalanced,
-    /// More than [`MOST_DEPTH`](crate::MOST_DEPTH) open.
-    TooDeep,
     /// An event after the top value was whole.
     AfterEnd,
     /// [`Writer::finish`] with a value open or none written.

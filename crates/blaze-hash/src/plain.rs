@@ -44,10 +44,7 @@
 //! its `Hash` and does not meet the key's byte hash: such a key wants a non-`PlainKey` key
 //! type, or the probe made into the key.
 
-use core::{
-    hash::{BuildHasher, Hash, Hasher},
-    mem::size_of,
-};
+use core::hash::{BuildHasher, Hash, Hasher};
 
 use crate::{FixedHasher, FixedState};
 
@@ -147,13 +144,27 @@ const fn mix(word: u64) -> u64 {
 /// anything persisted or compared across runs: that is BLAKE3 (the crate's documentation).
 #[inline(always)]
 pub fn hash_plain<K: PlainKey>(key: &K) -> u64 {
-    let bytes = bytes_of(key);
-    if K::UNIFORM
-        && let Some(word) = bytes.first_chunk::<8>()
-    {
+    hash_bytes(bytes_of(key), K::UNIFORM)
+}
+
+/// The bytes of a slice of plain values, all `size_of_val(values)` of them.
+#[inline(always)]
+fn bytes_of_slice<T: PlainKey>(values: &[T]) -> &[u8] {
+    // SAFETY: `values` is a live shared slice, so its `size_of_val(values)` bytes are one
+    // readable allocation, unchanged for the borrow; elements sit at a stride of their size,
+    // so there is no padding between them, and `PlainKey` promises none within one.
+    unsafe { core::slice::from_raw_parts(values.as_ptr().cast::<u8>(), size_of_val(values)) }
+}
+
+/// [`hash_plain`]'s three paths on a key's bytes: one function, so an array key and its slice
+/// (the borrowed form a table may be asked with) hash alike. For a key of a fixed size the
+/// length is a constant and two of the paths fold away.
+#[inline(always)]
+fn hash_bytes(bytes: &[u8], uniform: bool) -> u64 {
+    if uniform && let Some(word) = bytes.first_chunk::<8>() {
         return u64::from_le_bytes(*word);
     }
-    if size_of::<K>() <= 8 {
+    if bytes.len() <= 8 {
         let mut word = [0u8; 8];
         word[..bytes.len()].copy_from_slice(bytes);
         return mix(u64::from_le_bytes(word));
@@ -164,29 +175,43 @@ pub fn hash_plain<K: PlainKey>(key: &K) -> u64 {
 }
 
 /// What hashes a table's key, the one seam its hashing is chosen at: any `BuildHasher` over a
-/// `Hash` key (`FixedState`, `BuildKeyHasher`, `SipKey`, `adaptive`'s), and [`Plain`] over a
-/// [`PlainKey`]. A table asked with a borrowed form `Q` needs `KeyHash<Q>` too.
+/// `Hash` key (`FixedState`, `BuildKeyHasher`, `SipKey`, `adaptive`'s) by `hash_one`, and
+/// [`FixedState`] over a [`PlainKey`] (or a slice of them) by [`hash_plain`]. A table asked
+/// with a borrowed form `Q` needs `KeyHash<Q>` too.
 pub trait KeyHash<Q: ?Sized> {
     fn hash_key(&self, key: &Q) -> u64;
 }
 
+/// The base impl, which the two below specialize for `FixedState`.
 impl<Q: Hash + ?Sized, S: BuildHasher> KeyHash<Q> for S {
     #[inline(always)]
-    fn hash_key(&self, key: &Q) -> u64 {
+    default fn hash_key(&self, key: &Q) -> u64 {
         self.hash_one(key)
     }
 }
 
-/// The hasher of a table of [`PlainKey`]s: [`hash_plain`]. Zero-sized and `Copy`, its own
-/// value (`Map::plain_in(alloc)`). Not a `BuildHasher`, so a table on it hashes no key by
-/// `Hash`, and its [`KeyHash`] impl is the only one.
-#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
-pub struct Plain;
-
-impl<K: PlainKey> KeyHash<K> for Plain {
+// In min_specialization's sound subset (always applicable): the self type is the concrete
+// `FixedState`; `K` appears once in the header; no lifetime parameter or bound; the one bound
+// beyond the base impl's (`FixedState: BuildHasher` holds, and `K: Hash` is `PlainKey`'s
+// supertrait) is `K: PlainKey`, a `#[rustc_specialization_trait]` whose impls are always
+// applicable themselves. Only `FixedState`: a seeded `SipKey` keeps its seeded hash, and
+// `BuildKeyHasher` its identity fold.
+impl<K: PlainKey> KeyHash<K> for FixedState {
     #[inline(always)]
     fn hash_key(&self, key: &K) -> u64 {
         hash_plain(key)
+    }
+}
+
+// In min_specialization's sound subset, as the impl above: concrete `FixedState`, `T` once,
+// no lifetimes, the one added bound `T: PlainKey` (`[T]: Hash` follows from `T: Hash`). It
+// does not overlap the impl above: `[T]` is unsized and a `PlainKey` is `Sized`. It is the
+// probe side of an array key: `map.get(&bytes[..])` on a table of `[u8; 16]` hashes the
+// slice's bytes exactly as `hash_plain` hashes the array's, so it finds the key.
+impl<T: PlainKey> KeyHash<[T]> for FixedState {
+    #[inline(always)]
+    fn hash_key(&self, key: &[T]) -> u64 {
+        hash_bytes(bytes_of_slice(key), T::UNIFORM)
     }
 }
 

@@ -133,7 +133,26 @@ pub struct Space<'a> {
     pub implications: &'a [(Var, Var)],
 }
 
+/// The rule a finding of [`ConditionError::OverCap`] carries (rule 81: a finding has no level;
+/// `Config::is_error` says it fails a `run`).
+pub const OVER_CAP_RULE: u16 = 0xC0F6;
+
+impl Space<'static> {
+    /// No variables: one configuration, every job under [`Condition::ANY`].
+    pub const NONE: Space<'static> = Space { values: &[], implications: &[] };
+}
+
 impl Space<'_> {
+    /// How many configurations a job under `condition` that forks on `var` spans at most: the
+    /// product of the value counts of every variable it then fixes. A function of the path
+    /// alone, so the cap ([`MOST_CONDITIONS`]) refuses the same node in every order the jobs
+    /// settle in (rule 25), never the one that happened to fork last.
+    pub fn span(&self, condition: &Condition, var: Var) -> u32 {
+        let count = |v: Var| u32::from(self.values.get(v as usize).copied().unwrap_or(1)).max(1);
+        let fixed = condition.vars().filter(|v| *v != var).fold(1u32, |n, v| n.saturating_mul(count(v)));
+        fixed.saturating_mul(count(var))
+    }
+
     /// Whether some configuration the space allows satisfies `condition`. Exact when the
     /// implications are closed: setting each unfixed boolean to 1 only where an implication from
     /// a fixed 1 forces it satisfies every other implication.

@@ -3,23 +3,110 @@
 //! as cargo's `unit_dependencies` derives it, and the strip and debuginfo adjustments of cargo's
 //! `rebuild_unit_graph_shared` are applied over the graph's dependencies.
 
-use std::fmt::Write as _;
+use std::fmt::{self, Write as _};
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context as _, anyhow, bail};
 use blaze_hash::HashMap;
-use blaze_manifest::config::CompileKind;
+use blaze_manifest::config::{CompileKind, ConfigError};
 use blaze_manifest::diagnostic::report;
 use blaze_manifest::files::Disk;
 use blaze_manifest::manifest::PackageId as Pkg;
 use blaze_manifest::metadata::root_manifest;
 use blaze_manifest::profiles::{Profile, Profiles, UnitFor, requested_profile};
 use blaze_manifest::source::{self, SourceId};
-use blaze_manifest::{Config, Context, Workspace};
-use cargo_util_schemas::core::PackageIdSpec;
-use cargo_util_schemas::lockfile::TomlLockfile;
+use blaze_manifest::{Config, Context, ManifestError, Workspace};
+use blaze_resolve::PackageIdSpec;
+use blaze_semver::{Limits, Version};
 use serde_json::Value;
 use std::alloc::Global;
+
+/// What the walk refused: blaze-manifest's error, or one about cargo's arguments, unit graph or
+/// lock file, which the fixtures were recorded to have none of.
+#[derive(Debug)]
+enum WalkError {
+    Manifest(ManifestError),
+    NoCommand,
+    MissingValue { flag: String },
+    Graph(serde_json::Error),
+    PackageId { id: String, what: PackageIdWhat },
+    Lockfile { path: PathBuf, error: Box<dyn core::error::Error + Send + Sync> },
+    LockVersion { name: String, version: String, error: blaze_semver::Error },
+    NoUnits,
+    NoRoots,
+    RootNotIndex,
+    RootNotUnit { root: usize },
+    TwoProfiles { unit: usize, identity: String, first: String, second: String },
+    Unreached { unit: usize },
+}
+
+/// What a unit's `pkg_id` lacks.
+#[derive(Debug)]
+enum PackageIdWhat {
+    Spec(blaze_resolve::ResolveError),
+    NoVersion,
+    NoSource,
+    NoKind,
+}
+
+impl fmt::Display for WalkError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WalkError::Manifest(e) => write!(f, "{e:#}"),
+            WalkError::NoCommand => f.write_str("no cargo command given"),
+            WalkError::MissingValue { flag } => {
+                write!(f, "a value is required for '{flag} <VALUE>'")
+            }
+            WalkError::Graph(e) => write!(f, "cargo's unit graph: {e}"),
+            WalkError::PackageId { id, what } => match what {
+                PackageIdWhat::Spec(e) => write!(f, "package id `{id}`: {e}"),
+                PackageIdWhat::NoVersion => write!(f, "package id `{id}` has no version"),
+                PackageIdWhat::NoSource => write!(f, "package id `{id}` has no source"),
+                PackageIdWhat::NoKind => write!(f, "package id `{id}` has no source kind"),
+            },
+            WalkError::Lockfile { path, error } => {
+                write!(f, "failed to parse `{}`: {error}", path.display())
+            }
+            WalkError::LockVersion { name, version, error } => {
+                write!(f, "`{name}` {version} in the lock file: {error}")
+            }
+            WalkError::NoUnits => f.write_str("no `units` in the unit graph"),
+            WalkError::NoRoots => f.write_str("no `roots` in the unit graph"),
+            WalkError::RootNotIndex => f.write_str("a root is not an index"),
+            WalkError::RootNotUnit { root } => write!(f, "root {root} is not a unit"),
+            WalkError::TwoProfiles { unit, identity, first, second } => {
+                write!(f, "unit {unit} ({identity}) gets two profiles:\n{first}\n{second}")
+            }
+            WalkError::Unreached { unit } => write!(f, "unit {unit} is reached from no root"),
+        }
+    }
+}
+
+impl core::error::Error for WalkError {}
+
+impl From<ManifestError> for WalkError {
+    fn from(e: ManifestError) -> WalkError {
+        WalkError::Manifest(e)
+    }
+}
+
+impl From<ConfigError> for WalkError {
+    fn from(e: ConfigError) -> WalkError {
+        WalkError::Manifest(e.into())
+    }
+}
+
+/// `err` as cargo prints it: blaze-manifest's with its report, the walk's own plainly.
+fn report_walk(err: &WalkError, cwd: &Path) -> String {
+    match err {
+        WalkError::Manifest(e) => report(e, cwd),
+        other => format!("error: {other}"),
+    }
+}
+
+/// `value` as one line of JSON, for comparing profiles.
+fn json<T: serde::Serialize>(value: &T) -> String {
+    serde_json::to_string(value).expect("a profile serializes")
+}
 
 /// What the profiles of `cargo <args> --unit-graph` were made from.
 pub(crate) struct Output {
@@ -40,9 +127,9 @@ struct Command {
     manifest_path: Option<PathBuf>,
 }
 
-fn parse_args(args: &[String]) -> anyhow::Result<Command> {
+fn parse_args(args: &[String]) -> Result<Command, WalkError> {
     let mut args = args.iter().cloned();
-    let Some(name) = args.next() else { bail!("no cargo command given") };
+    let Some(name) = args.next() else { return Err(WalkError::NoCommand) };
     let mut command = Command {
         requested_profile: String::new(),
         target: None,
@@ -61,7 +148,7 @@ fn parse_args(args: &[String]) -> anyhow::Result<Command> {
             inline
                 .clone()
                 .or_else(|| args.next())
-                .ok_or_else(|| anyhow!("a value is required for '{flag} <VALUE>'"))
+                .ok_or_else(|| WalkError::MissingValue { flag: flag.clone() })
         };
         match flag.as_str() {
             "--release" | "-r" => release = true,
@@ -101,6 +188,7 @@ pub(crate) fn main(
     let mut config = match Config::load(cwd, env, &[]) {
         Ok(config) => config,
         Err(err) => {
+            let err = ManifestError::from(err);
             return Output { code: 101, stdout: String::new(), stderr: report(&err, cwd) + "\n" };
         }
     };
@@ -121,7 +209,7 @@ pub(crate) fn main(
     match result {
         Ok(stdout) => Output { code: 0, stdout, stderr },
         Err(err) => {
-            let _ = writeln!(stderr, "{}", report(&err, cwd));
+            let _ = writeln!(stderr, "{}", report_walk(&err, cwd));
             Output { code: 101, stdout: String::new(), stderr }
         }
     }
@@ -133,8 +221,8 @@ fn run(
     command: &Command,
     graph: &str,
     stderr: &mut String,
-) -> anyhow::Result<String> {
-    let root = root_manifest(command.manifest_path.as_deref(), ctx)?;
+) -> Result<String, WalkError> {
+    let root = root_manifest(command.manifest_path.as_deref(), ctx).map_err(ManifestError::from)?;
     let ws = Workspace::new(&root, ctx)?;
     for warning in ws.workspace_warnings() {
         let _ = writeln!(stderr, "warning: {warning}");

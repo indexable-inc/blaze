@@ -26,11 +26,6 @@ pub struct ScriptSource<'s> {
 
 impl<'s> ScriptSource<'s> {
     pub fn parse(raw: &'s str) -> Result<Self, FrontmatterError> {
-        use winnow::stream::FindSlice as _;
-        use winnow::stream::Location as _;
-        use winnow::stream::Offset as _;
-        use winnow::stream::Stream as _;
-
         let content_end = raw.len();
         let mut source = Self {
             raw,
@@ -42,7 +37,7 @@ impl<'s> ScriptSource<'s> {
             content: 0..content_end,
         };
 
-        let mut input = winnow::stream::LocatingSlice::new(raw);
+        let mut input = Cursor { raw, at: 0 };
 
         if let Some(shebang_end) = strip_shebang(input.as_ref()) {
             let shebang_start = input.current_token_start();
@@ -96,7 +91,7 @@ impl<'s> ScriptSource<'s> {
         let info = info.strip_suffix('\r').unwrap_or(info); // already excludes `\n`
         let info = info.trim_matches(rustc_lexer::is_horizontal_whitespace);
         if !info.is_empty() {
-            let info_start = info.offset_from(&raw);
+            let info_start = offset_in(raw, info);
             let info_end = info_start + info.len();
             source.info = Some(info_start..info_end);
         }
@@ -163,7 +158,7 @@ impl<'s> ScriptSource<'s> {
                 after_closing_fence.trim_matches(rustc_lexer::is_horizontal_whitespace);
             if !after_closing_fence.is_empty() {
                 // extra characters beyond the original fence pattern
-                let after_start = after_closing_fence.offset_from(&raw);
+                let after_start = offset_in(raw, after_closing_fence);
                 let after_end = after_start + after_closing_fence.len();
                 return Err(FrontmatterError::new(
                     // alloc: the error path.

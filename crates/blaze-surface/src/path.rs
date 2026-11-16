@@ -3,12 +3,11 @@
 //! and what an `extern crate` names ([`ExternTarget`]); and the columns a record keeps its
 //! paths in, read back as a [`PathView`].
 
-use core::alloc::Allocator;
 use core::fmt;
 
 use blaze_format::FormatError;
 use blaze_id::{ContentId, CrateItemKey, Portable};
-use blaze_own::Vec;
+use blaze_own::{AVec, Alloc};
 
 use crate::column::{NONE, Strings, Text, at_of, at_of_record, check_text, count, text_of, wide};
 use crate::error::BuildError;

@@ -786,28 +786,7 @@ impl Signal {
     /// Runs `wait` inside the signal's span and wait-graph row; `left` is the time from now to
     /// its deadline (`None`: it has none), which the row says on the probe's clock.
     fn span<R>(&self, left: Option<Duration>, wait: impl FnOnce() -> R) -> R {
-        let probe = installed();
-        let token = probe.map(|it| it.wait_begin(Awaits::Signal(self.name)));
-        let registered = probe.map(|probe| {
-            let now_ns = probe.now_ns();
-            let deadline_ns = left.map(|it| {
-                now_ns.saturating_add(u64::try_from(it.as_nanos()).unwrap_or(u64::MAX))
-            });
-            graph::register(
-                stall::Blocked::Signal(self.name),
-                probe.span(),
-                now_ns,
-                deadline_ns,
-                None,
-                None,
-            )
-        });
-        let result = wait();
-        drop(registered);
-        if let (Some(probe), Some(token)) = (probe, token) {
-            probe.wait_end(token);
-        }
-        result
+        signal_span(self.name, left, wait)
     }
 
     /// Waits for a notify, letting `guard`'s lock go meanwhile.

@@ -10,6 +10,8 @@
 use blaze_id::ContentId;
 use blaze_ids::Hasher;
 
+use crate::condition::{Condition, Space};
+
 /// The kinds of task, in the order the queue runs them: a file's outline before the scopes it
 /// declares, scopes before signatures, signatures before bodies, bodies before code, code
 /// before tests. Discriminants are the wire's.
@@ -132,6 +134,43 @@ const TASK_DOMAIN: &str = "blaze-drive task key 1";
 const VALUE_DOMAIN: &str = "blaze-drive value key 1";
 const CERT_DOMAIN: &str = "blaze-drive certificate 1";
 const CONTENT_DOMAIN: &str = "blaze-drive content 1";
+
+const CONDITION_DOMAIN: &str = "blaze-drive condition name 1";
+const SPACE_DOMAIN: &str = "blaze-drive space 1";
+
+/// The job of `base` under `condition` (drive.md, "One check covers every configuration"): a
+/// name of its own, so its record, row and readers are an ordinary job's. Under
+/// [`Condition::ANY`] it is `base` itself: a request with no cfg reads costs nothing.
+pub fn at_condition(base: Name, condition: &Condition) -> Name {
+    if condition.atoms().is_empty() {
+        return base;
+    }
+    let mut h = Hasher::new(CONDITION_DOMAIN);
+    h.update(&[base.kind as u8]).id(&base.subject);
+    for (var, value) in condition.atoms() {
+        h.update(&var.to_le_bytes()).update(&value.to_le_bytes());
+    }
+    Name { kind: base.kind, subject: h.finish() }
+}
+
+/// The name a split record reads the request's space under: a split's forks are the values
+/// the space allows, so it is read-addressed by the space's digest ([`space_digest`]).
+pub fn space_name() -> Name {
+    Name { kind: Kind::Units, subject: ContentId::of(SPACE_DOMAIN, b"space") }
+}
+
+/// What a read of [`space_name`] sees: every variable's value count and every implication.
+pub fn space_digest(space: &Space<'_>) -> ContentId {
+    let mut h = Hasher::new(SPACE_DOMAIN);
+    h.update(&(space.values.len() as u64).to_le_bytes());
+    for count in space.values {
+        h.update(&count.to_le_bytes());
+    }
+    for (a, b) in space.implications {
+        h.update(&a.to_le_bytes()).update(&b.to_le_bytes());
+    }
+    h.finish()
+}
 
 /// A `FileItems` source: the file's bytes (their content id) and the edition it is read in.
 pub fn file_source(content: ContentId, edition: u8) -> ContentId {

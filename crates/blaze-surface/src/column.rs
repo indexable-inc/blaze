@@ -103,13 +103,13 @@ pub(crate) fn finish_with<'a, R: Record>(
 /// A builder pushes each name into a staging table as it is given, and at its end into the
 /// record's table in the record's own order ([`Strings::moved`]): two builders given the same
 /// rows in another order write equal bytes (rule 25).
-pub(crate) struct Strings<A: Allocator> {
-    bytes: Vec<u8, A>,
+pub(crate) struct Strings<'a> {
+    bytes: AVec<'a, u8>,
 }
 
-impl<A: Allocator> Strings<A> {
-    pub(crate) fn new_in(alloc: A) -> Strings<A> {
-        Strings { bytes: Vec::new_in(alloc) }
+impl<'a> Strings<'a> {
+    pub(crate) fn new_in(alloc: Alloc<'a>) -> Strings<'a> {
+        Strings { bytes: AVec::new_in(alloc) }
     }
 
     /// Appends `text`, refused when the table would pass `u32::MAX` bytes.
@@ -128,9 +128,9 @@ impl<A: Allocator> Strings<A> {
     }
 
     /// Appends the text `text` names in `staging` to this table.
-    pub(crate) fn moved<B: Allocator>(
+    pub(crate) fn moved(
         &mut self,
-        staging: &Strings<B>,
+        staging: &Strings<'_>,
         text: Text,
         table: &'static str,
     ) -> Result<Text, BuildError> {
