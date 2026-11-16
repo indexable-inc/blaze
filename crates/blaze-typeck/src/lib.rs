@@ -70,28 +70,28 @@ pub enum Outcome<A: Allocator + Clone> {
 /// `hints` is the previous record's `needs` (or empty): it goes to the world's `prefetch`
 /// before the walk and changes nothing else. A user's type error is a diagnostic in the record;
 /// `Err` is only a malformed body or a bound passed.
-pub fn check<W: World, C: TypeCtx, A: Allocator + Clone>(
+pub fn check<'a, W: World, C: TypeCtx>(
     body: &BodyView<'_>,
     world: &W,
     ty: &mut C,
-    hints: &Needs<A>,
-    alloc: A,
-) -> Result<Outcome<A>, CheckError> {
+    hints: &Needs<'_>,
+    alloc: Alloc<'a>,
+) -> Result<Outcome<'a>, CheckError> {
     check_with(body, world, ty, hints, Plant::None, alloc)
 }
 
 /// `check` with a planted bug for the read-list control; `Plant::None` outside tests.
-pub(crate) fn check_with<W: World, C: TypeCtx, A: Allocator + Clone>(
+pub(crate) fn check_with<'a, W: World, C: TypeCtx>(
     body: &BodyView<'_>,
     world: &W,
     ty: &mut C,
-    hints: &Needs<A>,
+    hints: &Needs<'_>,
     plant: Plant,
-    alloc: A,
-) -> Result<Outcome<A>, CheckError> {
-    let mut reads = Reads::new_in(world, alloc.clone());
+    alloc: Alloc<'a>,
+) -> Result<Outcome<'a>, CheckError> {
+    let mut reads = Reads::new_in(world, alloc);
     reads.prefetch(&hints.questions);
-    let mut m = Machine::new_in(*body, reads, ty, plant, alloc.clone())?;
+    let mut m = Machine::new_in(*body, reads, ty, plant, alloc)?;
     match walk(&mut m) {
         Ok(()) => Ok(Outcome::Done(m.writeback()?)),
         Err(Stop::Need(q)) => Ok(Outcome::Need(m.reads.finish_need(q, alloc))),
@@ -100,7 +100,7 @@ pub(crate) fn check_with<W: World, C: TypeCtx, A: Allocator + Clone>(
 }
 
 /// The walk and the end sequence (typeck.md, "The walk and its queues").
-fn walk<W: World, C: TypeCtx, A: Allocator + Clone>(m: &mut Machine<'_, '_, '_, W, C, A>) -> Result<(), Stop> {
+fn walk<'a, W: World, C: TypeCtx>(m: &mut Machine<'_, '_, '_, 'a, W, C>) -> Result<(), Stop> {
     let output = m.start_body()?;
     m.run()?;
     m.finish_body(output)?;

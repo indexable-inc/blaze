@@ -764,6 +764,30 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for ReadLock<T> {
 
 // --- Signal -----------------------------------------------------------------------------------
 
+/// Runs `wait`, a wait for a notify of the signal `name` (a [`Signal`]'s, a
+/// [`crate::chan`]'s), inside its span and wait-graph row; `left` is the time from now to its
+/// deadline (`None`: it has none), which the row says on the probe's clock.
+pub(crate) fn signal_span<R>(
+    name: &'static str,
+    left: Option<Duration>,
+    wait: impl FnOnce() -> R,
+) -> R {
+    let probe = installed();
+    let token = probe.map(|it| it.wait_begin(Awaits::Signal(name)));
+    let registered = probe.map(|probe| {
+        let now_ns = probe.now_ns();
+        let deadline_ns = left
+            .map(|it| now_ns.saturating_add(u64::try_from(it.as_nanos()).unwrap_or(u64::MAX)));
+        graph::register(stall::Blocked::Signal(name), probe.span(), now_ns, deadline_ns, None, None)
+    });
+    let result = wait();
+    drop(registered);
+    if let (Some(probe), Some(token)) = (probe, token) {
+        probe.wait_end(token);
+    }
+    result
+}
+
 /// A named condition on a [`Lock`]: a [`raw::Cond`], each wait inside a span naming it. Only
 /// a driver thread or the pool's idle park waits on one (`deadline-waits`): a fiber parks on
 /// the scheduler instead. A wait may end with no notify, as any condition's: wait in a loop on

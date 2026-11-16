@@ -26,7 +26,7 @@ use crate::machine::{Expectation, Flow, Frame, Lower, Machine, Then};
 use crate::ty::{Ty, TyList, TyView, TypeCtx};
 use crate::world::{AdtKind, Def, World};
 
-impl<W: World, C: TypeCtx, A: Allocator + Clone> Machine<'_, '_, '_, W, C, A> {
+impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// The expected tuple's elements, if the expectation is a tuple. `f.l` holds them, `f.c`
     /// whether there are any, `f.a` the next element.
     pub(crate) fn expr_tuple(&mut self, mut f: Frame, _e: ExprId, elems: List) -> Result<Flow, Stop> {

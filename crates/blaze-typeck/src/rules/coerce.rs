@@ -23,7 +23,7 @@ use crate::machine::Machine;
 use crate::ty::{Ty, TyView, TypeCtx};
 use crate::world::World;
 
-impl<W: World, C: TypeCtx, A: Allocator + Clone> Machine<'_, '_, '_, W, C, A> {
+impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// Coerces `a` to `b`, recording the adjustments on `e`. `false`: they do not coerce, and
     /// nothing was bound.
     pub(crate) fn coerce(&mut self, e: Option<ExprId>, a: Ty, b: Ty, two_phase: bool) -> Result<bool, Stop> {

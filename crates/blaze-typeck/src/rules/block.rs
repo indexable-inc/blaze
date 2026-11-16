@@ -27,7 +27,7 @@ use crate::machine::{BreakCtx, Expectation, Flow, Frame, Machine, Then};
 use crate::ty::TypeCtx;
 use crate::world::World;
 
-impl<W: World, C: TypeCtx, A: Allocator + Clone> Machine<'_, '_, '_, W, C, A> {
+impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// `f.a` is the coercion site, `f.b` the next statement.
     pub(crate) fn expr_block(&mut self, mut f: Frame, e: ExprId, stmts: List, tail: Option<ExprId>) -> Result<Flow, Stop> {
         let list = self.body.stmt_list(stmts)?;

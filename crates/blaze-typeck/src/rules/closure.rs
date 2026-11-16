@@ -32,7 +32,7 @@ use crate::portable::PTy;
 use crate::ty::{Ty, TyList, TyView, TypeCtx, Var, VarKind};
 use crate::world::World;
 
-impl<W: World, C: TypeCtx, A: Allocator + Clone> Machine<'_, '_, '_, W, C, A> {
+impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// The expected signature: inputs, and the output if known.
     fn deduce_sig(&mut self, ex: Expectation) -> Result<Option<(TyList, Option<Ty>)>, Stop> {
         let Some(t) = ex.to_option() else { return Ok(None) };

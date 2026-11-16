@@ -21,7 +21,6 @@ stdx.workspace = true
 blaze-trace.workspace = true
 
 edition.workspace = true
-winnow.workspace = true
 
 [dev-dependencies]
 crossbeam-channel.workspace = true

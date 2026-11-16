@@ -12,12 +12,11 @@
 
 #![allow(unsafe_code, reason = "blaze-format's `record!` writes `unsafe impl Record`, its layout asserted")]
 
-use core::alloc::Allocator;
 use core::fmt;
 use core::mem::offset_of;
 
 use blaze_format::{FormatError, Record, Slice, Writer, open, record};
-use blaze_own::Vec;
+use blaze_own::{AVec, Alloc};
 
 use crate::registry::RunEvent;
 use crate::{CheckoutKey, InstanceKey, Nanos, TestId};
@@ -89,8 +88,8 @@ fn row(event: &RunEvent) -> (u8, u64, u64, [u8; 32]) {
 }
 
 /// Pushes one column, each value through `pick`: where it starts and how long it is.
-fn column<T: Record, A: Allocator>(
-    writer: &mut Writer<A>,
+fn column<T: Record>(
+    writer: &mut Writer<Alloc<'_>>,
     events: &[RunEvent],
     pick: impl Fn(&RunEvent) -> Option<T>,
 ) -> (u64, usize) {
@@ -106,7 +105,7 @@ fn column<T: Record, A: Allocator>(
 /// `events` as one batch buffer in `alloc`. Equal events in equal order are equal bytes. The
 /// buffer is `std`'s vector because blaze-format's `Writer` still hands one back: blaze-own lacks
 /// nothing here, blaze-format has yet to move onto it.
-pub fn write<A: Allocator>(events: &[RunEvent], alloc: A) -> std::vec::Vec<u8, A> {
+pub fn write<'a>(events: &[RunEvent], alloc: Alloc<'a>) -> std::vec::Vec<u8, Alloc<'a>> {
     let mut writer = Writer::new_in(Batch::SCHEMA, alloc);
     let kinds = column(&mut writer, events, |event| Some(row(event).0));
     let at = column(&mut writer, events, |event| Some(row(event).1));
@@ -131,7 +130,7 @@ pub fn write<A: Allocator>(events: &[RunEvent], alloc: A) -> std::vec::Vec<u8, A
 
 /// The events of one batch buffer (aligned to `blaze_format::ALIGN`, as a stream lays it out),
 /// pushed to `out` in order.
-pub fn read<A: Allocator>(buffer: &[u8], out: &mut Vec<RunEvent, A>) -> Result<(), Bad> {
+pub fn read(buffer: &[u8], out: &mut AVec<'_, RunEvent>) -> Result<(), Bad> {
     let batch = open::<Batch>(buffer).map_err(Bad::Format)?;
     let kinds = batch.kinds.follow(buffer).map_err(Bad::Format)?;
     let at = batch.at.follow(buffer).map_err(Bad::Format)?;

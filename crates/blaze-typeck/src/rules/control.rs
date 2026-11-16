@@ -26,7 +26,7 @@ use crate::machine::{BreakCtx, Expectation, Flow, Frame, Lower, Machine, Then};
 use crate::ty::{Goal, Ty, TypeCtx};
 use crate::world::{PClause, World};
 
-impl<W: World, C: TypeCtx, A: Allocator + Clone> Machine<'_, '_, '_, W, C, A> {
+impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// `check_fn`'s start: the owner's where-clauses become assumptions, the return site is
     /// opened, and the body and then the parameter patterns are pushed (so the patterns run
     /// first). Returns the declared output.

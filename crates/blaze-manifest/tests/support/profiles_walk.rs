@@ -237,16 +237,17 @@ fn run(
         &command.requested_profile,
         host,
     )?;
-    let graph: Value = serde_json::from_str(graph).context("cargo's unit graph")?;
+    let graph: Value = serde_json::from_str(graph).map_err(WalkError::Graph)?;
     let profiles = profiles_of(&ws, &profiles, command, &graph, stderr)?;
-    Ok(serde_json::to_string_pretty(&profiles)? + "\n")
+    Ok(serde_json::to_string_pretty(&profiles).expect("profiles serialize") + "\n")
 }
 
-fn package(pkg_id: &str) -> anyhow::Result<Pkg> {
-    let spec = PackageIdSpec::parse(pkg_id).with_context(|| format!("package id `{pkg_id}`"))?;
-    let version = spec.version().ok_or_else(|| anyhow!("package id `{pkg_id}` has no version"))?;
-    let url = spec.url().ok_or_else(|| anyhow!("package id `{pkg_id}` has no source"))?;
-    let kind = spec.kind().ok_or_else(|| anyhow!("package id `{pkg_id}` has no source kind"))?;
+fn package(pkg_id: &str) -> Result<Pkg, WalkError> {
+    let refuse = |what| WalkError::PackageId { id: pkg_id.to_owned(), what };
+    let spec = PackageIdSpec::parse(pkg_id).map_err(|e| refuse(PackageIdWhat::Spec(e)))?;
+    let version = spec.version().ok_or_else(|| refuse(PackageIdWhat::NoVersion))?;
+    let url = spec.url().ok_or_else(|| refuse(PackageIdWhat::NoSource))?;
+    let kind = spec.kind().ok_or_else(|| refuse(PackageIdWhat::NoKind))?;
     let source_id = source::from_spec(kind, url)?;
     Ok(Pkg { name: spec.name().to_owned(), version, source_id })
 }
@@ -254,14 +255,23 @@ fn package(pkg_id: &str) -> anyhow::Result<Pkg> {
 /// The packages of the workspace's `Cargo.lock`, which cargo checks the package overrides
 /// against: every package of the resolve, built or not. A path package's directory is that of
 /// the unit or member of its name and version.
-fn lock_packages(ws: &Workspace<'_, Disk>, units: &[Unit]) -> anyhow::Result<Option<Vec<Pkg>>> {
+fn lock_packages(
+    ws: &Workspace<'_, Disk>,
+    units: &[Unit],
+) -> Result<Option<Vec<Pkg>>, WalkError> {
     let path = ws.root().join("Cargo.lock");
     let Ok(text) = std::fs::read_to_string(&path) else { return Ok(None) };
-    let lock: TomlLockfile =
-        toml::from_str(&text).with_context(|| format!("failed to parse `{}`", path.display()))?;
+    let lock = blaze_resolve::lockfile::parse(&text)
+        .map_err(|error| WalkError::Lockfile { path: path.clone(), error: error.into() })?;
     let mut packages = Vec::new();
     for package in lock.package.into_iter().flatten() {
-        let version: semver::Version = package.version.parse()?;
+        let version = Version::parse_in(&package.version, Limits::CARGO, Global).map_err(
+            |error| WalkError::LockVersion {
+                name: package.name.clone(),
+                version: package.version.clone(),
+                error,
+            },
+        )?;
         let source_id = match &package.source {
             Some(locked) => source::from_spec(locked.kind(), locked.url())?,
             None => {
@@ -276,7 +286,7 @@ fn lock_packages(ws: &Workspace<'_, Disk>, units: &[Unit]) -> anyhow::Result<Opt
                 match (unit, member) {
                     (Some(u), _) => u.pkg.source_id,
                     (None, Some((_, m))) => m.package_id.source_id,
-                    (None, None) => SourceId::for_path(ws.root())?,
+                    (None, None) => SourceId::for_path(ws.root()).map_err(ManifestError::from)?,
                 }
             }
         };
@@ -335,8 +345,8 @@ fn profiles_of(
     command: &Command,
     graph: &Value,
     stderr: &mut String,
-) -> anyhow::Result<Vec<Profile>> {
-    let units = graph["units"].as_array().ok_or_else(|| anyhow!("no `units` in the unit graph"))?;
+) -> Result<Vec<Profile>, WalkError> {
+    let units = graph["units"].as_array().ok_or(WalkError::NoUnits)?;
     let mut parsed = Vec::new();
     for unit in units {
         let pkg = package(unit["pkg_id"].as_str().unwrap_or_default())?;
@@ -354,12 +364,8 @@ fn profiles_of(
             Some(t) => CompileKind::Target(t.to_owned()),
             None => CompileKind::Host,
         };
-        let identity = serde_json::to_string(&[
-            &unit["pkg_id"],
-            &unit["target"],
-            &unit["mode"],
-            &unit["features"],
-        ])?;
+        let identity =
+            json(&[&unit["pkg_id"], &unit["target"], &unit["mode"], &unit["features"]]);
         parsed.push(Unit {
             pkg,
             is_member,
@@ -394,7 +400,7 @@ fn profiles_of(
     }
     let mut walk =
         Walk { units: &parsed, profiles, interned: Vec::new(), by_unit: HashMap::new_in(Global) };
-    let roots = graph["roots"].as_array().ok_or_else(|| anyhow!("no `roots` in the unit graph"))?;
+    let roots = graph["roots"].as_array().ok_or(WalkError::NoRoots)?;
     let is_test_command = matches!(command.name.as_str(), "test" | "bench");
     let requested = match &command.target {
         Some(t) => CompileKind::Target(t.clone()),
@@ -402,8 +408,8 @@ fn profiles_of(
     };
     let mut root_units = Vec::new();
     for root in roots {
-        let i = root.as_u64().ok_or_else(|| anyhow!("a root is not an index"))? as usize;
-        let unit = parsed.get(i).ok_or_else(|| anyhow!("root {i} is not a unit"))?;
+        let i = root.as_u64().ok_or(WalkError::RootNotIndex)? as usize;
+        let unit = parsed.get(i).ok_or(WalkError::RootNotUnit { root: i })?;
         let profile_for = if unit.is_any_test() || is_test_command {
             UnitFor::new_test()
         } else if unit.for_host() {
@@ -437,21 +443,20 @@ fn profiles_of(
     for (n, interned) in walk.interned.iter().enumerate() {
         let Some(profile) = shared[n].take() else { continue };
         match &out[interned.unit] {
-            Some(prev) if serde_json::to_string(prev)? != serde_json::to_string(&profile)? => {
-                bail!(
-                    "unit {} ({}) gets two profiles:\n{}\n{}",
-                    interned.unit,
-                    parsed[interned.unit].identity,
-                    serde_json::to_string(prev)?,
-                    serde_json::to_string(&profile)?
-                )
+            Some(prev) if json(prev) != json(&profile) => {
+                return Err(WalkError::TwoProfiles {
+                    unit: interned.unit,
+                    identity: parsed[interned.unit].identity.clone(),
+                    first: json(prev),
+                    second: json(&profile),
+                });
             }
             _ => out[interned.unit] = Some(profile),
         }
     }
     out.into_iter()
         .enumerate()
-        .map(|(i, v)| v.ok_or_else(|| anyhow!("unit {i} is reached from no root")))
+        .map(|(i, v)| v.ok_or(WalkError::Unreached { unit: i }))
         .collect()
 }
 

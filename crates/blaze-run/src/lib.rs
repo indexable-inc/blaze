@@ -48,9 +48,7 @@ pub mod viewer;
 #[cfg(test)]
 mod sim;
 
-use core::alloc::Allocator;
-
-use blaze_own::Vec;
+use blaze_own::AVec;
 use core::fmt;
 
 /// A function's slot: its index in the program's table of words, fixed for the run. Becomes
@@ -203,9 +201,9 @@ pub struct RecordKey(pub [u8; 32]);
 /// What a compile task returns (bottom.md, "How a task waits: it does not"): its record, or the
 /// records it lacks. On `Need` its driver makes those (as records or by running their tasks)
 /// and enters the task again from the top; no compile waits on another.
-pub enum Made<R, A: Allocator> {
+pub enum Made<'a, R> {
     Done(R),
-    Need(Vec<RecordKey, A>),
+    Need(AVec<'a, RecordKey>),
 }
 
 /// Why a function has no code, as every caller of it is told (rule 20: the callers fail, the

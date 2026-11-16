@@ -221,9 +221,37 @@ mod tests {
 
     use blaze_sim::{Config, Tape};
 
-    use super::{PLAIN_MUL, PLAIN_XOR, PlainKey, folded_multiply, hash_plain, mix};
-    use crate::{FixedHasher, PlainMap, hash_map::Entry};
-    use core::hash::Hasher;
+    use super::{KeyHash, PLAIN_MUL, PLAIN_XOR, PlainKey, folded_multiply, hash_plain, mix};
+    use crate::{
+        BuildKeyHasher, FixedHasher, FixedState, HashMap, HashSet, SipKey, hash_map::Entry,
+    };
+    use core::hash::{BuildHasher, Hasher};
+
+    /// The specialization takes effect: a `HashMap<u32>`'s hasher hashes a key, and a probe,
+    /// by `hash_plain`, not by `Hash`, and a slice probe of an array key finds it. A seeded
+    /// `SipKey` and `BuildKeyHasher` are not specialized: they hash by `Hash` still.
+    #[test]
+    fn a_hash_map_of_plain_keys_hashes_by_bytes() {
+        let mut map: HashMap<u32, u32, Global> = HashMap::new_in(Global);
+        map.insert(7, 1);
+        let hasher: &FixedState = map.hasher();
+        assert_eq!(KeyHash::<u32>::hash_key(hasher, &7), hash_plain(&7u32));
+        assert_ne!(hash_plain(&7u32), FixedState.hash_one(7u32), "the two paths differ");
+        assert_eq!(map.get(&7), Some(&1));
+
+        let key: [u8; 16] = core::array::from_fn(|at| at as u8 * 3);
+        let mut set: HashSet<[u8; 16], Global> = HashSet::new_in(Global);
+        set.insert(key);
+        assert_eq!(KeyHash::<[u8]>::hash_key(set.hasher(), &key[..]), hash_plain(&key));
+        assert!(set.contains(&key[..]), "a slice probe of an array key");
+        let digest = Digest([9; 32]);
+        assert_eq!(KeyHash::<[Digest]>::hash_key(&FixedState, &[digest][..]), hash_plain(&digest));
+
+        let sip = SipKey::new(1, 2);
+        assert_eq!(KeyHash::<u32>::hash_key(&sip, &7), BuildHasher::hash_one(&sip, 7u32));
+        let by_hash = BuildKeyHasher::default();
+        assert_eq!(KeyHash::<u64>::hash_key(&by_hash, &7), by_hash.hash_one(7u64));
+    }
 
     /// A digest-like key, uniform, as `blaze_ids::ContentId` is.
     #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]

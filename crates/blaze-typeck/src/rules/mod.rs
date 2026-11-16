@@ -28,7 +28,7 @@ pub(crate) mod op;
 pub(crate) mod pat;
 pub(crate) mod writeback;
 
-impl<W: World, C: TypeCtx, A: Allocator + Clone> Machine<'_, '_, '_, W, C, A> {
+impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// One step of `e`'s rule (`check_expr_kind`).
     pub(crate) fn expr_rule(&mut self, f: Frame, e: ExprId, expr: Expr) -> Result<Flow, Stop> {
         match expr {

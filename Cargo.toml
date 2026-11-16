@@ -402,7 +402,6 @@ blaze-bitflags = { path = "crates/blaze-bitflags" } # `bitflags!`, in place of b
 blaze-base64 = { path = "crates/blaze-base64" }
 # The profile's columns, its Parquet files and its Arrow IPC frames, in place of arrow-* and
 # parquet (docs/v2/plan/third-party.md, "The profile's file").
-blaze-columns = { path = "crates/blaze-columns" }
 blaze-parquet = { path = "crates/blaze-parquet" }
 blaze-arrow-ipc = { path = "crates/blaze-arrow-ipc" }
 # `TextSize` and `TextRange`, in place of text-size.
@@ -439,7 +438,6 @@ rustc_parse_format = { path = "vendor/rustc_parse_format", version = "0.0.0" }
 ra-ap-rustc_index = { version = "0.179", default-features = false }
 # rustc's layout code, from the tag of the stable in `harness/toolchain`.
 rustc_abi = { path = "crates/rustc_abi", version = "0.0.0", default-features = false }
-unicode-properties = { version = "0.1.4", default-features = false }
 ra-ap-rustc_pattern_analysis = { version = "0.179", default-features = false }
 ra-ap-rustc_ast_ir = { version = "0.179", default-features = false }
 rustc_apfloat = "0.2.3"

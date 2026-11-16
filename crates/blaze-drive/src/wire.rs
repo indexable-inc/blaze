@@ -8,6 +8,7 @@ use core::fmt;
 use blaze_id::ContentId;
 use blaze_own::Vec;
 
+use crate::condition::{Condition, Var};
 use crate::key::{Key, Kind, Name};
 
 /// Why bytes are not a record of the drive's.
@@ -113,6 +114,20 @@ impl<A: Allocator> Writer<A> {
     pub(crate) fn finish(self) -> Vec<u8, A> {
         self.bytes
     }
+
+    /// A condition: its atom count, then each (variable, value), sorted.
+    pub(crate) fn condition(&mut self, condition: &Condition) {
+        self.u8(condition.atoms().len() as u8);
+        for (var, value) in condition.atoms() {
+            self.u16(*var);
+            self.u16(*value);
+        }
+    }
+
+    /// A split variable or none: `u32::MAX` for none.
+    pub(crate) fn split(&mut self, split: Option<Var>) {
+        self.u32(split.map_or(u32::MAX, u32::from));
+    }
 }
 
 /// A record being read in place.
@@ -212,6 +227,33 @@ impl<'a> Reader<'a> {
             }
         }
         Ok(())
+    }
+
+    /// A condition [`Writer::condition`] wrote: sorted, no variable twice, at most
+    /// [`MOST_ATOMS`](crate::condition::MOST_ATOMS) atoms, or refused (one encoding).
+    pub(crate) fn condition(&mut self) -> Result<Condition, WireError> {
+        let n = self.u8()?;
+        let mut condition = Condition::ANY;
+        let mut last: Option<Var> = None;
+        for _ in 0..n {
+            let (var, value) = (self.u16()?, self.u16()?);
+            if last.is_some_and(|l| l >= var) {
+                return Err(self.error(WireWhy::Unsorted));
+            }
+            last = Some(var);
+            condition = match condition.with(var, value) {
+                Ok(Some(next)) => next,
+                _ => return Err(self.error(WireWhy::Count(u32::from(n)))),
+            };
+        }
+        Ok(condition)
+    }
+
+    pub(crate) fn split(&mut self) -> Result<Option<Var>, WireError> {
+        match self.u32()? {
+            u32::MAX => Ok(None),
+            var => Var::try_from(var).map(Some).map_err(|_| self.error(WireWhy::Tag(0xff))),
+        }
     }
 
     pub(crate) fn done(&self) -> Result<(), WireError> {

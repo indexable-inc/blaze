@@ -40,7 +40,7 @@ enum Kind {
     Other,
 }
 
-impl<W: World, C: TypeCtx, A: Allocator + Clone> Machine<'_, '_, '_, W, C, A> {
+impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     pub(crate) fn expr_cast(&mut self, mut f: Frame, e: ExprId, operand: ExprId, ty: PTy) -> Result<Flow, Stop> {
         if f.state == 0 {
             let to = self.lower_body_ty(ty)?;

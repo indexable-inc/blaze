@@ -22,7 +22,7 @@ use crate::machine::{Expectation, Flow, Frame, Lower, Machine, Then};
 use crate::ty::{Ty, TyList, TyView, TypeCtx};
 use crate::world::World;
 
-impl<W: World, C: TypeCtx, A: Allocator + Clone> Machine<'_, '_, '_, W, C, A> {
+impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// A fn item's inputs and output, instantiated with `args`.
     pub(crate) fn fn_def_sig(&mut self, k: ItemKey, args: TyList) -> Result<Option<(TyList, Ty)>, Stop> {
         let Some(sig) = self.reads.fn_sig(k)? else { return Ok(None) };

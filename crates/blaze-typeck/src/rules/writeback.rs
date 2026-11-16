@@ -55,7 +55,7 @@ impl<A: Allocator + Clone> Export<A> {
     }
 }
 
-impl<W: World, C: TypeCtx, A: Allocator + Clone> Machine<'_, '_, '_, W, C, A> {
+impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// The children of one level of a type.
     fn ty_children(&self, v: TyView, out: &mut Vec<Ty, A>) {
         let list = |l: TyList, out: &mut Vec<Ty, A>| {

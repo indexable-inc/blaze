@@ -253,10 +253,11 @@ pub enum StreamWhat {
 
 /// Events to compact JSON text, in the caller's key order, checked to make one well-formed
 /// value. A [`Str`] read with escapes is copied as written (its escapes are valid JSON); a
-/// [`Str::plain`] is escaped.
-pub struct Writer<'o, B: Allocator> {
+/// [`Str::plain`] is escaped. Nesting past the first thousand levels is held in the scratch
+/// allocator, so any depth is written without recursion.
+pub struct Writer<'o, B: Allocator, S: Allocator> {
     out: &'o mut String<B>,
-    stack: Stack,
+    stack: Stack<S>,
     /// The next event is a map's first key or a list's first element.
     first: bool,
     /// A key was written and its value is wanted.
@@ -265,9 +266,9 @@ pub struct Writer<'o, B: Allocator> {
     events: usize,
 }
 
-impl<'o, B: Allocator> Writer<'o, B> {
-    pub fn new(out: &'o mut String<B>) -> Writer<'o, B> {
-        Writer { out, stack: Stack::new(), first: true, after_key: false, done: false, events: 0 }
+impl<'o, B: Allocator, S: Allocator> Writer<'o, B, S> {
+    pub fn new_in(out: &'o mut String<B>, scratch: S) -> Writer<'o, B, S> {
+        Writer { out, stack: Stack::new_in(scratch), first: true, after_key: false, done: false, events: 0 }
     }
 
     fn refuse(&self, what: StreamWhat) -> StreamError {
@@ -321,9 +322,6 @@ impl<'o, B: Allocator> Writer<'o, B> {
             }
             Event::StartList | Event::StartMap => {
                 self.before(false)?;
-                if self.stack.depth() == crate::MOST_DEPTH {
-                    return Err(self.refuse(StreamWhat::TooDeep));
-                }
                 let map = matches!(event, Event::StartMap);
                 self.stack.push(map);
                 self.out.push(if map { '{' } else { '[' });

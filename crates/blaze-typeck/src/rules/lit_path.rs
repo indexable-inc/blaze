@@ -20,7 +20,7 @@ use crate::machine::{Expectation, Flow, Frame, Lower, Machine, Then};
 use crate::ty::{Cause, Goal, Ty, TyList, TyView, TypeCtx};
 use crate::world::{AssocKind, CtorKind, Def, World};
 
-impl<W: World, C: TypeCtx, A: Allocator + Clone> Machine<'_, '_, '_, W, C, A> {
+impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// `check_lit`.
     pub(crate) fn expr_lit(&mut self, f: Frame, lit: Lit) -> Result<Flow, Stop> {
         Ok(Flow::Done(self.lit_ty(lit, f.expect)?))

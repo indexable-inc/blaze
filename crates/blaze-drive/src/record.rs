@@ -21,7 +21,9 @@ use blaze_own::Vec;
 use crate::key::{Key, Name};
 use crate::wire::{NAME_BYTES, Reader, WireError, WireWhy, Writer};
 
-const MAGIC: &[u8; 4] = b"BDR1";
+/// 2: a whole record holds its split variable (drive.md, "One check covers every
+/// configuration"); a home of form 1 is refused by its magic, reported and rebuilt.
+const MAGIC: &[u8; 4] = b"BDR2";
 const WHOLE: u8 = 1;
 const SHAPE: u8 = 2;
 

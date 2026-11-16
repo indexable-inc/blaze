@@ -41,7 +41,7 @@ fn peeled_mode(mode: u32, m: Mutbl) -> u32 {
     }
 }
 
-impl<W: World, C: TypeCtx, A: Allocator + Clone> Machine<'_, '_, '_, W, C, A> {
+impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// One pattern. `f.expect` holds the expected type, `f.a` the default binding mode.
     pub(crate) fn step_pat(&mut self, f: Frame, p: PatId) -> Result<(), Stop> {
         let pat = self.body.pat(p)?;

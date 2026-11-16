@@ -5,6 +5,44 @@
 
 type Span = std::ops::Range<usize>;
 
+/// blaze: the part of winnow's `LocatingSlice<&str>` that cargo's code reads, so that winnow is
+/// no dependency: the text not yet taken, and where it starts in the whole.
+struct Cursor<'s> {
+    raw: &'s str,
+    at: usize,
+}
+
+impl<'s> Cursor<'s> {
+    fn as_ref(&self) -> &'s str {
+        &self.raw[self.at..]
+    }
+
+    fn current_token_start(&self) -> usize {
+        self.at
+    }
+
+    fn eof_offset(&self) -> usize {
+        self.raw.len() - self.at
+    }
+
+    /// The next `len` bytes, taken.
+    fn next_slice(&mut self, len: usize) -> &'s str {
+        let taken = &self.raw[self.at..self.at + len];
+        self.at += len;
+        taken
+    }
+
+    /// Where `needle` is first in what is not yet taken, from its start.
+    fn find_slice(&self, needle: &str) -> Option<Span> {
+        self.as_ref().find(needle).map(|start| start..start + needle.len())
+    }
+}
+
+/// Where `part`, a slice of `raw`, starts in it.
+fn offset_in(raw: &str, part: &str) -> usize {
+    part.as_ptr().addr() - raw.as_ptr().addr()
+}
+
 #[derive(Debug)]
 pub struct ScriptSource<'s> {
     /// The full file

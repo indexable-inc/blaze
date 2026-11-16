@@ -73,23 +73,23 @@ impl PathKind {
 /// A path as written: how it begins and its segments. `N` is a segment's name: `&str` read
 /// from a record, an interned symbol or a test's `&'static str` in a working form.
 #[derive(Clone, Debug)]
-pub struct Path<N, A: Allocator> {
+pub struct Path<'a, N> {
     pub kind: PathKind,
-    pub segments: Vec<N, A>,
+    pub segments: AVec<'a, N>,
 }
 
-impl<N: PartialEq, A: Allocator, B: Allocator> PartialEq<Path<N, B>> for Path<N, A> {
-    fn eq(&self, other: &Path<N, B>) -> bool {
+impl<'b, N: PartialEq> PartialEq<Path<'b, N>> for Path<'_, N> {
+    fn eq(&self, other: &Path<'b, N>) -> bool {
         self.kind == other.kind && self.segments[..] == other.segments[..]
     }
 }
 
-impl<N: Eq, A: Allocator> Eq for Path<N, A> {}
+impl<N: Eq> Eq for Path<'_, N> {}
 
-impl<N: Copy, A: Allocator> Path<N, A> {
+impl<N: Copy> Path<'_, N> {
     /// The same path in `alloc`.
-    pub fn copy_in<B: Allocator>(&self, alloc: B) -> Path<N, B> {
-        Path { kind: self.kind, segments: Vec::from_slice_in(&self.segments, alloc) }
+    pub fn copy_in<'b>(&self, alloc: Alloc<'b>) -> Path<'b, N> {
+        Path { kind: self.kind, segments: AVec::from_slice_in(&self.segments, alloc) }
     }
 }
 
@@ -182,21 +182,21 @@ blaze_format::record! {
 /// A record's paths while it is written: rows and their segments, in the order pushed. The
 /// writer pushes each path where the record's order reaches it, so the bytes are a function
 /// of the value written.
-pub(crate) struct PathTable<A: Allocator> {
-    pub(crate) rows: Vec<PathRow, A>,
-    pub(crate) segments: Vec<Text, A>,
+pub(crate) struct PathTable<'a> {
+    pub(crate) rows: AVec<'a, PathRow>,
+    pub(crate) segments: AVec<'a, Text>,
 }
 
-impl<A: Allocator + Clone> PathTable<A> {
-    pub(crate) fn new_in(alloc: A) -> PathTable<A> {
-        PathTable { rows: Vec::new_in(alloc.clone()), segments: Vec::new_in(alloc) }
+impl<'a> PathTable<'a> {
+    pub(crate) fn new_in(alloc: Alloc<'a>) -> PathTable<'a> {
+        PathTable { rows: AVec::new_in(alloc), segments: AVec::new_in(alloc) }
     }
 
     /// Pushes `path`, its segments' text into `strings`; its row's index.
-    pub(crate) fn push<N: AsRef<str>, B: Allocator, C: Allocator>(
+    pub(crate) fn push<N: AsRef<str>>(
         &mut self,
-        path: &Path<N, B>,
-        strings: &mut Strings<C>,
+        path: &Path<'_, N>,
+        strings: &mut Strings<'_>,
         table: &'static str,
     ) -> Result<u32, BuildError> {
         let index = count(self.rows.len(), table)?;
@@ -211,10 +211,10 @@ impl<A: Allocator + Clone> PathTable<A> {
     }
 
     /// [`PathTable::push`] of an optional path; [`NONE`] for none.
-    pub(crate) fn push_opt<N: AsRef<str>, B: Allocator, C: Allocator>(
+    pub(crate) fn push_opt<N: AsRef<str>>(
         &mut self,
-        path: Option<&Path<N, B>>,
-        strings: &mut Strings<C>,
+        path: Option<&Path<'_, N>>,
+        strings: &mut Strings<'_>,
         table: &'static str,
     ) -> Result<u32, BuildError> {
         match path {
@@ -321,8 +321,8 @@ impl<'a> PathView<'a> {
     }
 
     /// The path as a working form, its segments borrowed from the record, in `alloc`.
-    pub fn to_path_in<A: Allocator>(&self, alloc: A) -> Path<&'a str, A> {
-        let mut segments = Vec::with_capacity_in(self.segments.len(), alloc);
+    pub fn to_path_in<'b>(&self, alloc: Alloc<'b>) -> Path<'b, &'a str> {
+        let mut segments = AVec::with_capacity_in(self.segments.len(), alloc);
         segments.extend(self.segments());
         Path { kind: self.kind, segments }
     }

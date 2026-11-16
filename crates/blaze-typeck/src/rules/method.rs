@@ -54,7 +54,7 @@ struct Pick<A: Allocator> {
     unsize: bool,
 }
 
-impl<W: World, C: TypeCtx, A: Allocator + Clone> Machine<'_, '_, '_, W, C, A> {
+impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn expr_method_call(
         &mut self,

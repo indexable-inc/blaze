@@ -22,7 +22,7 @@ use crate::machine::Machine;
 use crate::ty::{TyView, TypeCtx, Var, VarKind};
 use crate::world::World;
 
-impl<W: World, C: TypeCtx, A: Allocator + Clone> Machine<'_, '_, '_, W, C, A> {
+impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// `type_inference_fallback`. Returns whether anything fell back.
     pub(crate) fn fallback(&mut self) -> Result<bool, Stop> {
         self.select()?;

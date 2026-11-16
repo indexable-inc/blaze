@@ -76,7 +76,7 @@ fn op_lang(op: BinOp, assign: bool) -> Option<LangItem> {
     })
 }
 
-impl<W: World, C: TypeCtx, A: Allocator + Clone> Machine<'_, '_, '_, W, C, A> {
+impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     fn is_integral(&mut self, t: Ty) -> bool {
         matches!(self.view(t), TyView::Int(_) | TyView::Uint(_) | TyView::Infer(Var { kind: VarKind::Int, .. }))
     }
