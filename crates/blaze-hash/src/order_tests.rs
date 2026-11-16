@@ -41,7 +41,7 @@ fn agrees(tape: &Tape) -> Result<(), String> {
     let mut map: IndexMap<u8, u32, Global> = IndexMap::new_in(Global); // alloc: a test's map
     let mut model: Vec<(u8, u32)> = Vec::new(); // alloc: a test's model
     let place = |model: &Vec<(u8, u32)>, key: u8| model.iter().position(|it| it.0 == key);
-    for step in 0..tape.below(200, "steps") {
+    for step in 0..tape.below(if cfg!(miri) { 60 } else { 200 }, "steps") {
         // Few keys, so that most operations meet a key that is there.
         let key = tape.below(24, "key") as u8;
         let value = step as u32;
@@ -177,7 +177,7 @@ fn an_ordered_set_keeps_insertion_order() {
 /// made empty allocates nothing until its first insert.
 #[test]
 fn a_table_with_room_allocates_only_when_made() {
-    const N: usize = 1000;
+    const N: usize = if cfg!(miri) { 100 } else { 1000 };
     let count = Cell::new(0);
     let mut map: HashMap<u32, u32, Counted<'_>> = HashMap::with_capacity_in(N, Counted(&count));
     assert_eq!(count.get(), 1, "a hash map with room");
@@ -229,6 +229,10 @@ const CHILD: &str = "BLAZE_HASH_ORDER_CHILD";
 /// control is the cause: a hash map of the same inserts under two random keys iterates in two
 /// orders, so the order this test compares is one a table can get wrong.
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "runs its own program as a child, which Miri's isolation refuses; the ordered table's raw paths are an_ordered_map_is_a_vec_of_pairs_under_any_operations's"
+)]
 fn insertion_order_is_the_same_under_any_hasher_and_in_another_process() {
     let expected = order_of(inserts());
     let fixed: IndexMap<u64, u64, Global> = IndexMap::from_iter_in(inserts(), Global); // alloc: a test's map
@@ -279,7 +283,8 @@ fn insertion_order_is_the_same_under_any_hasher_and_in_another_process() {
 /// place them differently. A keyed table is made only with its key.
 #[test]
 fn a_keyed_table_spreads_keys_picked_to_collide() {
-    let picked: Vec<[u64; 2]> = (0..4096u64).map(|it| [0x5eed, it]).collect(); // alloc: a test's keys
+    let picked: Vec<[u64; 2]> =
+        (0..if cfg!(miri) { 256 } else { 4096u64 }).map(|it| [0x5eed, it]).collect(); // alloc: a test's keys
     let known: crate::HashSet<u64, Global> =
         picked.iter().map(|it| BuildKeyHasher::default().hash_one(it)).collect(); // alloc: a test's set
     assert_eq!(known.len(), 1, "every picked key has one hash under the known hasher");

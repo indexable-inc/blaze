@@ -52,7 +52,8 @@ crossbeam-queue.workspace = true
 # `endian-reader`: `EndianArcSlice`, the reader the symbolizer keeps DWARF in.
 gimli = { workspace = true, features = ["endian-reader"] }
 object.workspace = true
-regex.workspace = true
+# The patterns of `peek` and `list` (`blaze_script::regex`).
+blaze-script.workspace = true
 rustc-demangle.workspace = true
 # The explorer's typed headers and what its session reads of a request, serialized and read
 # field by field: no JSON map is made in the session core (`explore::session`).

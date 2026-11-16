@@ -2442,3 +2442,724 @@ fn packed_stops_on_a_pack_that_reads_another_length() -> Result<(), Broke> {
     }
     alloc.check()
 }
+
+// ---------------------------------------------------------------------------------------------
+// The B-tree, against std's as the model.
+
+use std::{collections::btree_map::Entry as StdEntry, ops::Bound};
+
+use crate::{
+    String as OwnString,
+    btree::{BTreeMap as OwnMap, BTreeSet as OwnSet, Entry},
+    make::{CloneIn, DefaultIn, FromIn, FromStrIn, IntoIn, ParseIn, Share},
+};
+
+/// An invariant check's finding, as the oracle's.
+fn oracle(found: Result<(), String>) -> Result<(), Broke> {
+    found.map_err(|why| Broke::Oracle(format!("the tree is malformed: {why}")))
+}
+
+fn entries<A: Allocator>(map: &OwnMap<u64, Token, A>) -> StdVec<(u64, u64)> {
+    map.iter().map(|(k, t)| (*k, t.value)).collect()
+}
+
+fn model_entries(model: &BTreeMap<u64, u64>) -> StdVec<(u64, u64)> {
+    model.iter().map(|(k, v)| (*k, *v)).collect()
+}
+
+/// A random range's bounds over keys below `span`; never both excluded at one key, which both
+/// trees refuse with a panic.
+fn tree_bounds(tape: &Tape, span: u64) -> (Bound<u64>, Bound<u64>) {
+    let (x, y) = (tape.below(span, "start"), tape.below(span, "end"));
+    let (a, b) = (x.min(y), x.max(y));
+    match tape.below(6, "bounds") {
+        0 => (Bound::Included(a), Bound::Included(b)),
+        1 => (Bound::Included(a), Bound::Excluded(b)),
+        2 => (Bound::Excluded(a), Bound::Included(b)),
+        3 => (Bound::Unbounded, Bound::Excluded(b)),
+        4 => (Bound::Excluded(a), Bound::Unbounded),
+        _ => (Bound::Unbounded, Bound::Unbounded),
+    }
+}
+
+fn btree_case(tape: &Tape) -> Result<(), Broke> {
+    tokens::fresh();
+    let alloc = Counting::new();
+    {
+        // Small spans meet the same keys again; large ones and the runs below grow tall trees.
+        let span = *tape.pick(&[24, 300, 3000], "span").unwrap_or(&24);
+        let mut ours: OwnMap<u64, Token, &Counting> = OwnMap::new_in(&alloc);
+        let mut model: BTreeMap<u64, u64> = BTreeMap::new();
+        let mut set: OwnSet<u64, &Counting> = OwnSet::new_in(&alloc);
+        let mut model_set: BTreeSet<u64> = BTreeSet::new();
+        for _ in 0..tape.index(200, "steps") {
+            let k = tape.below(span, "key");
+            let v = tape.below(1000, "value");
+            match tape.below(16, "op") {
+                0..=3 => {
+                    let old = ours.insert(k, Token::new(v)).map(|t| t.value);
+                    same("insert", old.into_iter(), model.insert(k, v).into_iter())?;
+                    same("set insert", [set.insert(k)].into_iter(), [model_set.insert(k)].into_iter())?;
+                }
+                4 | 5 => {
+                    same("remove", ours.remove(&k).map(|t| t.value).into_iter(), model.remove(&k).into_iter())?;
+                    same("set remove", [set.remove(&k)].into_iter(), [model_set.remove(&k)].into_iter())?;
+                }
+                6 => {
+                    let range = tree_bounds(tape, span);
+                    same(
+                        "range",
+                        ours.range(range).map(|(k, t)| (*k, t.value)),
+                        model.range(range).map(|(k, v)| (*k, *v)),
+                    )?;
+                    same(
+                        "range from the back",
+                        ours.range(range).rev().map(|(k, t)| (*k, t.value)),
+                        model.range(range).rev().map(|(k, v)| (*k, *v)),
+                    )?;
+                    same("set range", set.range(range).rev().copied(), model_set.range(range).rev().copied())?;
+                    for (_, t) in ours.range_mut(range) {
+                        t.value += 1;
+                    }
+                    for (_, v) in model.range_mut(range) {
+                        *v += 1;
+                    }
+                }
+                7 => {
+                    if tape.coin("first") {
+                        let first = ours.pop_first().map(|(k, t)| (k, t.value));
+                        same("pop_first", first.into_iter(), model.pop_first().into_iter())?;
+                        same("set pop_first", set.pop_first().into_iter(), model_set.pop_first().into_iter())?;
+                    } else {
+                        let last = ours.pop_last().map(|(k, t)| (k, t.value));
+                        same("pop_last", last.into_iter(), model.pop_last().into_iter())?;
+                        same("set pop_last", set.pop_last().into_iter(), model_set.pop_last().into_iter())?;
+                    }
+                }
+                8 => {
+                    let m = tape.below(4, "m") + 2;
+                    ours.retain(|k, t| (k + t.value) % m != 0);
+                    model.retain(|k, v| (k + *v) % m != 0);
+                    set.retain(|k| k % m != 0);
+                    model_set.retain(|k| k % m != 0);
+                }
+                9 => match tape.below(3, "entry") {
+                    0 => {
+                        ours.entry(k).or_insert_with(|| Token::new(v));
+                        model.entry(k).or_insert(v);
+                    }
+                    1 => {
+                        ours.entry(k).and_modify(|t| t.value += 1).or_insert_with(|| Token::new(v));
+                        model.entry(k).and_modify(|x| *x += 1).or_insert(v);
+                    }
+                    _ => {
+                        let removed = match ours.entry(k) {
+                            Entry::Occupied(there) => Some(there.remove().value),
+                            Entry::Vacant(_) => None,
+                        };
+                        let model_removed = match model.entry(k) {
+                            StdEntry::Occupied(there) => Some(there.remove()),
+                            StdEntry::Vacant(_) => None,
+                        };
+                        same("entry remove", removed.into_iter(), model_removed.into_iter())?;
+                    }
+                },
+                10 => {
+                    if let Some(t) = ours.get_mut(&k) {
+                        t.value += 7;
+                    }
+                    if let Some(x) = model.get_mut(&k) {
+                        *x += 7;
+                    }
+                }
+                11 => {
+                    let mut right = ours.split_off(&k);
+                    let model_right = model.split_off(&k);
+                    oracle(right.invariants())?;
+                    oracle(ours.invariants())?;
+                    same("split_off's right part", entries(&right).into_iter(), model_entries(&model_right).into_iter())?;
+                    same("split_off's left part", entries(&ours).into_iter(), model_entries(&model).into_iter())?;
+                    let mut set_right = set.split_off(&k);
+                    let model_set_right = model_set.split_off(&k);
+                    oracle(set_right.invariants())?;
+                    same("set split_off", set_right.iter().copied(), model_set_right.iter().copied())?;
+                    if tape.coin("append") {
+                        ours.append(&mut right);
+                        model.extend(model_right);
+                        set.append(&mut set_right);
+                        model_set.extend(model_set_right);
+                        if !right.is_empty() || !set_right.is_empty() {
+                            return Err(Broke::Oracle(String::from("append left entries in the map appended")));
+                        }
+                    }
+                }
+                12 => {
+                    // Both ends at once, as the tape says, until either runs out.
+                    let (mut it, mut model_it) = (ours.iter(), model.iter());
+                    loop {
+                        let (got, want) = if tape.coin("back") {
+                            (it.next_back(), model_it.next_back())
+                        } else {
+                            (it.next(), model_it.next())
+                        };
+                        let done = got.is_none() || want.is_none();
+                        same(
+                            "iteration from both ends",
+                            got.map(|(k, t)| (*k, t.value)).into_iter(),
+                            want.map(|(k, v)| (*k, *v)).into_iter(),
+                        )?;
+                        if it.len() != model_it.len() {
+                            return Err(Broke::Oracle(format!("iter says {} left, the model {}", it.len(), model_it.len())));
+                        }
+                        if done {
+                            break;
+                        }
+                    }
+                }
+                13 => {
+                    // A run of increasing keys: the splits of an append-heavy load, and height.
+                    for i in 0..tape.below(60, "run") + 20 {
+                        let key = k * 7 + i;
+                        drop(ours.insert(key, Token::new(i)));
+                        model.insert(key, i);
+                        set.insert(key);
+                        model_set.insert(key);
+                    }
+                }
+                14 => {
+                    let copy = ours.clone();
+                    oracle(copy.invariants())?;
+                    if copy != ours {
+                        return Err(Broke::Oracle(String::from("the clone differs from the map")));
+                    }
+                    let (mut it, mut model_it) = (copy.into_iter(), model.clone().into_iter());
+                    for _ in 0..tape.index(model.len() + 1, "take") {
+                        let (got, want) = if tape.coin("back") {
+                            (it.next_back(), model_it.next_back())
+                        } else {
+                            (it.next(), model_it.next())
+                        };
+                        same("into_iter", got.map(|(k, t)| (k, t.value)).into_iter(), want.into_iter())?;
+                    }
+                    // The rest is dropped with the iterator.
+                }
+                _ => {
+                    same("get", ours.get(&k).map(|t| t.value).into_iter(), model.get(&k).copied().into_iter())?;
+                    same(
+                        "contains",
+                        [ours.contains_key(&k), set.contains(&k)].into_iter(),
+                        [model.contains_key(&k), model_set.contains(&k)].into_iter(),
+                    )?;
+                    same(
+                        "first and last",
+                        [ours.first_key_value(), ours.last_key_value()].into_iter().map(|e| e.map(|(k, t)| (*k, t.value))),
+                        [model.first_key_value(), model.last_key_value()].into_iter().map(|e| e.map(|(k, v)| (*k, *v))),
+                    )?;
+                    same(
+                        "set first and last",
+                        [set.first().copied(), set.last().copied()].into_iter(),
+                        [model_set.first().copied(), model_set.last().copied()].into_iter(),
+                    )?;
+                }
+            }
+            same("the map", entries(&ours).into_iter(), model_entries(&model).into_iter())?;
+            same(
+                "the map from the back",
+                ours.iter().rev().map(|(k, t)| (*k, t.value)),
+                model.iter().rev().map(|(k, v)| (*k, *v)),
+            )?;
+            same("keys", ours.keys().copied(), model.keys().copied())?;
+            same("the set", set.iter().copied(), model_set.iter().copied())?;
+            if ours.len() != model.len() || set.len() != model_set.len() {
+                return Err(Broke::Oracle(format!("lengths {} and {} differ from the model", ours.len(), set.len())));
+            }
+            oracle(ours.invariants())?;
+            oracle(set.invariants())?;
+            tokens::check(model.len())?;
+        }
+    }
+    tokens::check(0)?;
+    alloc.check()
+}
+
+#[test]
+fn btree_matches_std() {
+    blaze_sim::check(Config::cases(300), btree_case);
+}
+
+/// A tree of height two or more, emptied one tape-chosen key at a time: every merge, of leaves
+/// and of internal nodes, and every collapse of the root.
+fn btree_shrink_case(tape: &Tape) -> Result<(), Broke> {
+    let alloc = Counting::new();
+    {
+        let n = 300 + tape.below(300, "size");
+        let mut ours: OwnMap<u64, u64, &Counting> = OwnMap::new_in(&alloc);
+        let mut model = BTreeMap::new();
+        for k in 0..n {
+            ours.insert(k * 10, k);
+            model.insert(k * 10, k);
+        }
+        if ours.height() < 2 {
+            return Err(Broke::Harness(format!("{n} keys made a tree of height {}", ours.height())));
+        }
+        let mut left: StdVec<u64> = (0..n).map(|k| k * 10).collect();
+        while !left.is_empty() {
+            let k = left.swap_remove(tape.index(left.len(), "which"));
+            same("remove", ours.remove(&k).into_iter(), model.remove(&k).into_iter())?;
+            same("the map", ours.iter().map(|(k, v)| (*k, *v)), model.iter().map(|(k, v)| (*k, *v)))?;
+            oracle(ours.invariants())?;
+        }
+    }
+    alloc.check()
+}
+
+#[test]
+fn btree_shrinks_to_empty_like_std() {
+    blaze_sim::check(Config::cases(60), btree_shrink_case);
+}
+
+#[test]
+fn the_oracle_catches_a_merge_that_forgets_a_child() {
+    let run = |tape: &Tape, p: Plant| plant::with(p, || btree_shrink_case(tape));
+    blaze_sim::control(Config::cases(60), Plant::Clean, Plant::BTreeMergeForgetsChild, "differs from the model", run);
+}
+
+/// Keys `0, 10, .., 10 (n - 1)`, each with its index.
+fn spaced(n: u64, alloc: &Counting) -> OwnMap<u64, u64, &Counting> {
+    let mut map = OwnMap::new_in(alloc);
+    for k in 0..n {
+        map.insert(k * 10, k);
+    }
+    map
+}
+
+/// The tree is well formed, `height` high, in `blocks` nodes, and holds `keys`.
+fn shape(
+    what: &str,
+    map: &OwnMap<u64, u64, &Counting>,
+    alloc: &Counting,
+    height: usize,
+    blocks: usize,
+    keys: impl Iterator<Item = u64>,
+) -> Result<(), Broke> {
+    oracle(map.invariants())?;
+    if map.height() != height || alloc.live() != blocks {
+        return Err(Broke::Oracle(format!(
+            "{what}: height {} in {} nodes, not {height} in {blocks}",
+            map.height(),
+            alloc.live()
+        )));
+    }
+    same(what, map.keys().copied(), keys)
+}
+
+#[test]
+fn btree_structural_cases() -> Result<(), Broke> {
+    let alloc = Counting::new();
+    {
+        // Empty to one to empty: no node, one leaf, no node.
+        let mut map = OwnMap::new_in(&alloc);
+        shape("empty", &map, &alloc, 0, 0, [].into_iter())?;
+        map.insert(5, 5);
+        shape("one", &map, &alloc, 0, 1, [5].into_iter())?;
+        map.remove(&5);
+        shape("empty again", &map, &alloc, 0, 0, [].into_iter())?;
+        drop(map);
+
+        // A split at the root: 15 fill the root leaf; the 16th splits it into 0..=60 and
+        // 80..=150 under a new root holding 70.
+        let mut map = spaced(15, &alloc);
+        shape("fifteen", &map, &alloc, 0, 1, (0..15).map(|k| k * 10))?;
+        map.insert(150, 15);
+        shape("sixteen", &map, &alloc, 1, 3, (0..16).map(|k| k * 10))?;
+        if map.iter().nth(7) != Some((&70, &7)) || map.first_key_value() != Some((&0, &0)) {
+            return Err(Broke::Oracle(String::from("the split's median is not 70")));
+        }
+
+        // Borrow from the right sibling: the left leaf drops to 6, the right has 8.
+        map.remove(&0);
+        shape("borrowed from the right", &map, &alloc, 1, 3, (1..16).map(|k| k * 10))?;
+        drop(map);
+
+        // Borrow from the left sibling: the left leaf has 8, the right drops to 6.
+        let mut map = spaced(16, &alloc);
+        map.insert(5, 99);
+        map.remove(&150);
+        map.remove(&140);
+        let keys = [0, 5].into_iter().chain((1..14).map(|k| k * 10));
+        shape("borrowed from the left", &map, &alloc, 1, 3, keys)?;
+        drop(map);
+
+        // A merge: the right leaf drops to 6 beside a left one with only 7; the two and the root's
+        // key make one leaf of 14, and the root, left empty, goes.
+        let mut map = spaced(16, &alloc);
+        map.remove(&150);
+        map.remove(&140);
+        shape("merged", &map, &alloc, 0, 1, (0..14).map(|k| k * 10))?;
+        drop(map);
+
+        // A delete from an internal node: the root's 70 swaps with its predecessor 60, which then
+        // leaves the left leaf, which borrows from the right.
+        let mut map = spaced(16, &alloc);
+        if map.remove(&70) != Some(7) {
+            return Err(Broke::Oracle(String::from("the root's key was not removed")));
+        }
+        shape("deleted from the root", &map, &alloc, 1, 3, (0..16).filter(|&k| k != 7).map(|k| k * 10))?;
+        drop(map);
+
+        // Deep: 2000 keys, removed in a scattered order down to nothing.
+        let mut map = spaced(2000, &alloc);
+        if map.height() < 2 {
+            return Err(Broke::Oracle(format!("2000 keys made a tree of height {}", map.height())));
+        }
+        let mut model: BTreeMap<u64, u64> = (0..2000).map(|k| (k * 10, k)).collect();
+        for i in 0..2000u64 {
+            let k = (i * 7919 % 2000) * 10;
+            same("deep remove", map.remove(&k).into_iter(), model.remove(&k).into_iter())?;
+            oracle(map.invariants())?;
+        }
+        shape("emptied", &map, &alloc, 0, 0, [].into_iter())?;
+    }
+    alloc.check()
+}
+
+// Panics in user code: a comparison, a drop, a clone.
+
+std::thread_local! {
+    /// Comparisons left before one panics; `None` for never.
+    static TOUCHES: core::cell::Cell<Option<u64>> = const { core::cell::Cell::new(None) };
+}
+
+/// A key whose comparison panics when [`TOUCHES`] runs out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Touchy(u64);
+
+impl Ord for Touchy {
+    fn cmp(&self, other: &Touchy) -> core::cmp::Ordering {
+        let panics = TOUCHES.with(|left| match left.get() {
+            Some(0) => {
+                left.set(None);
+                true
+            }
+            Some(n) => {
+                left.set(Some(n - 1));
+                false
+            }
+            None => false,
+        });
+        if panics {
+            panic!("a planned panic in a comparison of {}", self.0);
+        }
+        self.0.cmp(&other.0)
+    }
+}
+
+impl PartialOrd for Touchy {
+    fn partial_cmp(&self, other: &Touchy) -> Option<core::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn btree_panic_case(tape: &Tape) -> Result<(), Broke> {
+    tokens::fresh();
+    let alloc = Counting::new();
+    {
+        let mut map: OwnMap<Touchy, Token, &Counting> = OwnMap::new_in(&alloc);
+        for n in 0..tape.below(400, "size") {
+            map.insert(Touchy(n * 2), Token::new(n));
+        }
+        for _ in 0..tape.index(12, "steps") {
+            let k = Touchy(tape.below(900, "key"));
+            let op = tape.below(6, "op");
+            TOUCHES.with(|left| left.set(Some(tape.below(16, "touches"))));
+            let _caught = catch_unwind(AssertUnwindSafe(|| match op {
+                0 => drop(map.insert(k, Token::new(k.0))),
+                1 => drop(map.remove(&k)),
+                2 => drop(map.range(k..).count()),
+                3 => {
+                    let mut right = map.split_off(&k);
+                    map.append(&mut right);
+                }
+                4 => drop(map.entry(k).or_insert_with(|| Token::new(1))),
+                _ => map.retain(|key, _| key.0 % 3 != 0),
+            }));
+            TOUCHES.with(|left| left.set(None));
+            oracle(map.invariants())?;
+            tokens::check(map.len())?;
+        }
+        // A clone whose value's clone panics frees the part copied.
+        if let Some(t) = map.values().next() {
+            tokens::panic_on_clone(t.value);
+            panics(|| drop(map.clone()))?;
+            tokens::check(map.len())?;
+        }
+        // An owning iterator whose value's drop panics drops the rest and frees every node.
+        let copy = map.clone();
+        if let Some(t) = copy.values().nth(tape.index(copy.len().max(1), "victim")) {
+            tokens::panic_on_drop(t.value);
+            panics(move || drop(copy))?;
+        } else {
+            drop(copy);
+        }
+        tokens::check(map.len())?;
+        // A `retain` whose dropped value's drop panics leaves a whole tree of the rest.
+        if let Some(t) = map.values().nth(tape.index(map.len().max(1), "victim")) {
+            tokens::panic_on_drop(t.value);
+            panics(|| map.retain(|_, _| false))?;
+            oracle(map.invariants())?;
+            tokens::check(map.len())?;
+        }
+    }
+    tokens::check(0)?;
+    alloc.check()
+}
+
+#[test]
+fn btree_stays_whole_when_user_code_panics() {
+    blaze_sim::check(Config::cases(200), btree_panic_case);
+}
+
+fn tree_values<A: Allocator, B: Allocator>(m: &OwnMap<u64, Box<u64, A>, B>) -> StdVec<(u64, u64)> {
+    m.iter().map(|(k, b)| (*k, **b)).collect()
+}
+
+#[test]
+fn btree_try_forms_fail_cleanly_at_every_allocation() -> Result<(), Broke> {
+    under_every_failure("BTreeMap", |alloc| {
+        // Ascending and descending: splits on the right edge and on the left.
+        let (mut up, mut down) = (OwnMap::new_in(alloc), OwnMap::new_in(alloc));
+        for n in 0..200u64 {
+            let value = Box::try_new_in(n, alloc)?;
+            step(&mut up, tree_values, |m| m.try_insert(n, value).map(|_| ()))?;
+            let value = Box::try_new_in(n, alloc)?;
+            step(&mut down, tree_values, |m| m.try_insert(1000 - n, value).map(|_| ()))?;
+        }
+        let value = Box::try_new_in(7, alloc)?;
+        step(&mut up, tree_values, |m| match m.entry(500) {
+            Entry::Vacant(free) => free.try_insert(value).map(|_| ()),
+            Entry::Occupied(_) => Ok(()),
+        })?;
+        let copy = up.try_clone_in(alloc)?;
+        if tree_values(&copy) != tree_values(&up) {
+            return Err(Why::Changed(String::from("the copy differs from the map")));
+        }
+        let right = step(&mut up, tree_values, |m| m.try_split_off(&100))?;
+        let mut want: StdVec<(u64, u64)> = (100..200).map(|k| (k, k)).collect();
+        want.push((500, 7));
+        if tree_values(&up) != (0..100).map(|k| (k, k)).collect::<StdVec<_>>() || tree_values(&right) != want {
+            return Err(Why::Changed(format!("split_off gave {:?} and {:?}", tree_values(&up), tree_values(&right))));
+        }
+        for map in [&up, &down, &copy, &right] {
+            map.invariants().map_err(Why::Changed)?;
+        }
+        let mut set = OwnSet::new_in(alloc);
+        for n in 0..60u64 {
+            step(&mut set, |s: &OwnSet<u64, &Failing>| s.iter().copied().collect::<StdVec<u64>>(), |s| {
+                s.try_insert(n * 7 % 61).map(|_| ())
+            })?;
+        }
+        set.invariants().map_err(Why::Changed)?;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------------------------
+// Making values with the allocator named (`make`), and the split of `Clone`.
+
+#[test]
+fn make_try_forms_fail_cleanly_at_every_allocation() -> Result<(), Broke> {
+    under_every_failure("make", |alloc| {
+        let source = "a text long enough to need a block";
+        let text: OwnString<&Failing> = match FromIn::try_from_in(source, alloc) {
+            Ok(text) => text,
+            Err(Refused { value, why }) if value == source => return Err(Why::Refused(why)),
+            Err(_) => return Err(Why::Changed(String::from("another text came back"))),
+        };
+        let words: Vec<u64, &Failing> = Vec::try_from_in(&[1, 2, 3][..], alloc)?;
+        let boxes: Vec<Box<u64, &Failing>, &Failing> =
+            Vec::try_from_in([Box::try_new_in(4, alloc)?, Box::try_new_in(5, alloc)?], alloc)?;
+        let boxed: Box<[Box<u64, &Failing>], &Failing> = boxes.try_into_in(alloc)?;
+        let parsed = <OwnString<&Failing> as FromStrIn<&Failing>>::try_from_str_in("parsed", alloc).map_err(|e| match e {
+            ParseIn::Refused(failure) => Why::Refused(failure),
+            ParseIn::Invalid(never) => match never {},
+        })?;
+        let number = <u64 as FromStrIn<&Failing>>::from_str_in("12", alloc);
+        let empty: Vec<u64, &Failing> = DefaultIn::try_default_in(alloc)?;
+        if text.as_str() != source
+            || words.as_slice() != [1, 2, 3]
+            || boxed.iter().map(|b| **b).collect::<StdVec<u64>>() != [4, 5]
+            || parsed.as_str() != "parsed"
+            || number != Ok(12)
+            || <u64 as FromStrIn<&Failing>>::from_str_in("x", alloc).is_ok()
+            || !empty.is_empty()
+        {
+            return Err(Why::Changed(String::from("a made value is not what it was made from")));
+        }
+
+        // Deep copies: a vector of strings, each string copied too.
+        let mut names = Vec::try_with_capacity_in(3, alloc)?;
+        for name in ["zero", "one", "two"] {
+            names.try_push(OwnString::try_from_str_in(name, alloc)?)?;
+        }
+        let names_copy = names.try_clone_in(alloc)?;
+        let mut deque = VecDeque::new_in(alloc);
+        for n in 0..9u64 {
+            deque.try_push_back(n)?;
+        }
+        let deque_copy = deque.try_clone_in(alloc)?;
+        let mut sorted = SortedMap::new_in(alloc);
+        sorted.try_insert(2u64, OwnString::try_from_str_in("two", alloc)?)?;
+        sorted.try_insert(1, OwnString::try_from_str_in("one", alloc)?)?;
+        let sorted_copy = sorted.try_clone_in(alloc)?;
+        let mut sorted_set = SortedSet::new_in(alloc);
+        sorted_set.try_insert(3u64)?;
+        let sorted_set_copy = sorted_set.try_clone_in(alloc)?;
+        let one = Box::try_new_in(8u64, alloc)?;
+        let one_copy = Box::try_clone_in(&one, alloc)?;
+        let boxed_copy = Box::try_clone_in(&boxed, alloc)?;
+        let mut soa: Soa<(u32, u64), &Failing> = Soa::new_in(alloc);
+        soa.try_push((1, 2))?;
+        let soa_copy = soa.try_clone_in(alloc)?;
+        let mut packed = Packed::<u64, &Failing>::new_in(alloc);
+        packed.try_push(&9)?;
+        let packed_copy = packed.try_clone_in(alloc)?;
+        let text_copy = text.try_clone_in(alloc)?;
+        let mut set = OwnSet::new_in(alloc);
+        for n in 0..20u64 {
+            set.try_insert(n)?;
+        }
+        let set_copy = set.try_clone_in(alloc)?;
+        if !names_copy.iter().map(|s| s.as_str()).eq(names.iter().map(|s| s.as_str()))
+            || !deque_copy.iter().eq(deque.iter())
+            || !sorted_copy.iter().map(|(k, v)| (*k, v.as_str())).eq(sorted.iter().map(|(k, v)| (*k, v.as_str())))
+            || !sorted_set_copy.iter().eq(sorted_set.iter())
+            || *one_copy != *one
+            || boxed_copy.iter().map(|b| **b).collect::<StdVec<u64>>() != [4, 5]
+            || !soa_copy.iter().eq(soa.iter())
+            || !packed_copy.iter().eq(packed.iter())
+            || text_copy.as_str() != text.as_str()
+            || !set_copy.iter().eq(set.iter())
+        {
+            return Err(Why::Changed(String::from("a copy differs from its original")));
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+#[test]
+fn share_adds_a_handle_and_allocates_nothing() -> Result<(), Broke> {
+    let alloc = Counting::new();
+    {
+        let arc = Arc::new_in(5u64, &alloc);
+        let weak = Arc::downgrade(&arc);
+        let rc = Rc::new_in(6u64, &alloc);
+        let rc_weak = Rc::downgrade(&rc);
+        let counts = |arc: &Arc<u64, &Counting>, rc: &Rc<u64, &Counting>| {
+            [Arc::strong_count(arc), Arc::weak_count(arc), Rc::strong_count(rc), Rc::weak_count(rc)]
+        };
+        let (before, allocs) = (counts(&arc, &rc), alloc.allocs());
+        let arc2 = arc.share();
+        let weak2 = weak.share();
+        let rc2 = rc.share();
+        let rc_weak2 = rc_weak.share();
+        let r = &*arc;
+        let r2 = Share::share(&r);
+        let after = counts(&arc, &rc);
+        if alloc.allocs() != allocs {
+            return Err(Broke::Oracle(format!("share allocated {} blocks", alloc.allocs() - allocs)));
+        }
+        if after != before.map(|n| n + 1) || !core::ptr::eq(r, r2) || *arc2 != 5 || *rc2 != 6 {
+            return Err(Broke::Oracle(format!("share took the counts from {before:?} to {after:?}")));
+        }
+        drop((arc2, weak2, rc2, rc_weak2));
+        if counts(&arc, &rc) != before {
+            return Err(Broke::Oracle(String::from("dropping the shares did not put the counts back")));
+        }
+    }
+    alloc.check()
+}
+
+#[test]
+fn clone_in_leaves_the_first_allocator_alone() -> Result<(), Broke> {
+    tokens::fresh();
+    let (first, second) = (Counting::new(), Counting::new());
+    {
+        let (a, b) = (&first, &second);
+        let mut names = Vec::new_in(a);
+        for name in ["zero", "one", "two"] {
+            names.push(OwnString::from_str_in(name, a));
+        }
+        let mut deque = VecDeque::new_in(a);
+        for n in 0..9u64 {
+            deque.push_front(n);
+        }
+        let text = OwnString::from_str_in("some text", a);
+        let mut sorted = SortedMap::new_in(a);
+        sorted.insert(3u64, OwnString::from_str_in("three", a));
+        sorted.insert(1, OwnString::from_str_in("one", a));
+        let mut sorted_set = SortedSet::new_in(a);
+        sorted_set.insert(4u64);
+        let mut soa: Soa<(u32, u64), &Counting> = Soa::new_in(a);
+        soa.push((1, 2));
+        soa.push((3, 4));
+        let mut rows = Rows::new_in(a);
+        rows.push(row(1, 2));
+        let one = Box::new_in(7u64, a);
+        let many = Box::from_slice_in(&[1u64, 2, 3], a);
+        let mut packed = Packed::<u64, &Counting>::new_in(a);
+        packed.push(&9);
+        packed.push(&10);
+        let mut tree = OwnMap::new_in(a);
+        for n in 0..40u64 {
+            tree.insert(n, OwnString::from_str_in("v", a));
+        }
+        let mut tree_set = OwnSet::new_in(a);
+        for n in 0..40u64 {
+            tree_set.insert(n);
+        }
+
+        let allocs = first.allocs();
+        let names_copy = names.clone_in(b);
+        let deque_copy = deque.clone_in(b);
+        let text_copy = text.clone_in(b);
+        let sorted_copy = sorted.clone_in(b);
+        let sorted_set_copy = sorted_set.clone_in(b);
+        let soa_copy = soa.clone_in(b);
+        let rows_copy = rows.clone_in(b);
+        let one_copy = Box::clone_in(&one, b);
+        let many_copy = Box::clone_in(&many, b);
+        let packed_copy = packed.clone_in(b);
+        let tree_copy = tree.clone_in(b);
+        let tree_set_copy = tree_set.clone_in(b);
+        let generic: Vec<OwnString<&Counting>, &Counting> = CloneIn::clone_in(&names, b);
+        if first.allocs() != allocs {
+            return Err(Broke::Oracle(format!("clone_in took {} blocks from the first allocator", first.allocs() - allocs)));
+        }
+        if second.allocs() == 0 {
+            return Err(Broke::Harness(String::from("nothing was copied into the second allocator")));
+        }
+        oracle(tree_copy.invariants())?;
+        oracle(tree_set_copy.invariants())?;
+        if !names_copy.iter().map(|s| s.as_str()).eq(names.iter().map(|s| s.as_str()))
+            || !generic.iter().map(|s| s.as_str()).eq(names.iter().map(|s| s.as_str()))
+            || !deque_copy.iter().eq(deque.iter())
+            || text_copy.as_str() != text.as_str()
+            || !sorted_copy.iter().map(|(k, v)| (*k, v.as_str())).eq(sorted.iter().map(|(k, v)| (*k, v.as_str())))
+            || !sorted_set_copy.iter().eq(sorted_set.iter())
+            || !soa_copy.iter().eq(soa.iter())
+            || rows_copy.len() != rows.len()
+            || *one_copy != *one
+            || *many_copy != *many
+            || !packed_copy.iter().eq(packed.iter())
+            || !tree_copy.iter().map(|(k, v)| (*k, v.as_str())).eq(tree.iter().map(|(k, v)| (*k, v.as_str())))
+            || !tree_set_copy.iter().eq(tree_set.iter())
+        {
+            return Err(Broke::Oracle(String::from("a copy differs from its original")));
+        }
+    }
+    tokens::check(0)?;
+    first.check()?;
+    second.check()
+}

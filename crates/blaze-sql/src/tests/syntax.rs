@@ -418,6 +418,8 @@ impl Spans<'_> {
                     }
                 }
             }
+            // The subset's parser never makes one; the generator does not either.
+            ExprKind::Analytic(_) => panic!("a query-grammar form in a subset tree at {at:?}"),
         }
     }
 

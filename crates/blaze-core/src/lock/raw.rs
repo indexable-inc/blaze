@@ -450,12 +450,19 @@ impl RawRwLock {
 
     #[inline]
     pub(crate) fn try_read(&self) -> bool {
-        self.state
-            .value
-            .fetch_update(Ordering::Acquire, Ordering::Relaxed, |it| {
-                is_read_lockable(it).then_some(it + READ_LOCKED)
-            })
-            .is_ok()
+        let mut state = self.state.value.load(Ordering::Relaxed);
+        while is_read_lockable(state) {
+            match self.state.value.compare_exchange_weak(
+                state,
+                state + READ_LOCKED,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(now) => state = now,
+            }
+        }
+        false
     }
 
     #[inline]
@@ -527,12 +534,19 @@ impl RawRwLock {
 
     #[inline]
     pub(crate) fn try_write(&self) -> bool {
-        self.state
-            .value
-            .fetch_update(Ordering::Acquire, Ordering::Relaxed, |it| {
-                is_unlocked(it).then_some(it + WRITE_LOCKED)
-            })
-            .is_ok()
+        let mut state = self.state.value.load(Ordering::Relaxed);
+        while is_unlocked(state) {
+            match self.state.value.compare_exchange_weak(
+                state,
+                state + WRITE_LOCKED,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(now) => state = now,
+            }
+        }
+        false
     }
 
     #[inline]

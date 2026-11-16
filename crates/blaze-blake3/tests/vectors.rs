@@ -77,6 +77,20 @@ fn fed(mut hasher: blaze_blake3::Hasher, input: &[u8], piece: usize) -> blaze_bl
     hasher
 }
 
+/// Under Miri, which interprets every round, only the cases up to one chunk past a batch of
+/// 16 chunks (17 KiB): every leaf, batch and tree boundary the hasher splits at, in a few
+/// minutes (`cargo miri test -p blaze-blake3`).
+fn sized(case: &&Case) -> bool {
+    !cfg!(miri) || case.input_len <= 17 * 1024
+}
+
+/// The pieces a case is fed in: fewer under Miri, still across a block and a chunk.
+const PIECES: &[usize] = if cfg!(miri) {
+    &[1, 64, 1025]
+} else {
+    &[1, 63, 64, 65, 1023, 1024, 1025, 4096, 8 * 1024 + 1, 17 * 1024]
+};
+
 fn extended(hasher: &blaze_blake3::Hasher, len: usize) -> Vec<u8> {
     let mut out = vec![0; len];
     hasher.finalize_xof().fill(&mut out);
@@ -92,7 +106,7 @@ fn every_official_vector() {
     for expected in [0, 1, 1023, 1024, 1025, 2048, 2049, 8192, 16384, 31744, 102400] {
         assert!(lens.contains(&expected), "a case of {expected} bytes");
     }
-    for case in &cases {
+    for case in cases.iter().filter(sized) {
         let len = case.input_len;
         let input = input(len);
         for (mode, want) in
@@ -106,7 +120,7 @@ fn every_official_vector() {
                 _ => blaze_blake3::derive_key(&context, &input),
             };
             assert_eq!(one_shot, short, "{mode}, {len} B, one shot");
-            for piece in [len, 1, 63, 64, 65, 1023, 1024, 1025, 4096, 8 * 1024 + 1, 17 * 1024] {
+            for &piece in [len].iter().chain(PIECES) {
                 let hasher = match mode {
                     "hash" => blaze_blake3::Hasher::new(),
                     "keyed_hash" => blaze_blake3::Hasher::new_keyed(&key),
@@ -125,7 +139,7 @@ fn every_official_vector() {
 #[test]
 fn extended_output_from_any_position() {
     let (_, _, cases) = parse();
-    for case in &cases {
+    for case in cases.iter().filter(sized) {
         let hasher = fed(blaze_blake3::Hasher::new(), &input(case.input_len), case.input_len);
         for start in [0, 1, 31, 32, 63, 64, 65, 100, 130] {
             let mut reader = hasher.finalize_xof();

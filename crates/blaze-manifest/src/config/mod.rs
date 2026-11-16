@@ -606,7 +606,7 @@ impl<F: Files> Config<F> {
 
     /// Each config file on its own, includes before what includes them, as cargo's
     /// `load_values_unmerged`.
-    pub fn load_values_unmerged(&self) -> anyhow::Result<Vec<ConfigValue>> {
+    pub fn load_values_unmerged(&self) -> Result<Vec<ConfigValue>, ConfigError> {
         let mut result = Vec::new();
         let mut seen = HashSet::new_in(Global);
         self.walk_tree(&self.cwd, &self.home, |path| {
@@ -615,7 +615,7 @@ impl<F: Files> Config<F> {
             result.push(cv);
             Ok(())
         })
-        .context("could not load Cargo configuration")?;
+        .context(|| ConfigWhat::CouldNotLoad)?;
         Ok(result)
     }
 
@@ -624,15 +624,11 @@ impl<F: Files> Config<F> {
         cv: &mut ConfigValue,
         seen: &mut HashSet<PathBuf, Global>,
         output: &mut Vec<ConfigValue>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), ConfigError> {
         for include in include_paths(cv, false)? {
             let Some(abs_path) = self.include_path(&include) else { continue };
-            let mut cv = self.load_file(&abs_path, seen, false, false).with_context(|| {
-                format!(
-                    "failed to load config include `{}` from `{}`",
-                    include.path.display(),
-                    include.def
-                )
+            let mut cv = self.load_file(&abs_path, seen, false, false).context(|| {
+                ConfigWhat::LoadInclude { path: include.path.clone(), from: include.def.clone() }
             })?;
             self.load_unmerged_include(&mut cv, seen, output)?;
             output.push(cv);
@@ -640,7 +636,7 @@ impl<F: Files> Config<F> {
         Ok(())
     }
 
-    fn merge_cli_args(&mut self, cli: &[String]) -> anyhow::Result<()> {
+    fn merge_cli_args(&mut self, cli: &[String]) -> Result<(), ConfigError> {
         if cli.is_empty() {
             return Ok(());
         }
@@ -658,56 +654,52 @@ impl<F: Files> Config<F> {
     }
 
     /// The `--config` arguments merged into one table.
-    pub fn cli_args_as_table(&self) -> anyhow::Result<ConfigValue> {
-        let mut loaded = CV::Table(HashMap::new_in(Global), Definition::Cli(None));
+    pub fn cli_args_as_table(&self) -> Result<ConfigValue, ConfigError> {
+        let mut loaded = CV::Table(HashMap::new_in(Global), Definition::Cli(None, None));
         for arg in &self.cli {
             let arg_as_path = self.cwd.join(arg);
             let table = if !arg.is_empty() && self.files.exists(&arg_as_path) {
                 self.load_file(&arg_as_path, &mut HashSet::new_in(Global), true, true)
-                    .with_context(|| {
-                        format!("failed to load config from `{}`", arg_as_path.display())
-                    })?
+                    .context(|| ConfigWhat::LoadCliFile { path: arg_as_path.clone() })?
             } else {
                 let doc = cli_dotted_keys(arg)?;
-                if doc.get("registry").and_then(|v| v.get("token")).is_some() {
-                    bail!("registry.token cannot be set through --config for security reasons");
+                let root = doc.root();
+                if root.get("registry").and_then(|v| v.get("token")).is_some() {
+                    return Err(ConfigError::new(ConfigWhat::CliToken));
                 }
-                if let Some((k, _)) = doc
+                if let Some(registry) = root
                     .get("registries")
-                    .and_then(|v| v.as_table())
-                    .and_then(|t| t.iter().find(|(_, v)| v.get("token").is_some()))
+                    .filter(|v| v.is_table())
+                    .and_then(|t| t.children().find(|v| v.get("token").is_some()))
                 {
-                    bail!(
-                        "registries.{k}.token cannot be set through --config for security reasons"
-                    );
+                    let registry = registry.key().to_owned();
+                    return Err(ConfigError::new(ConfigWhat::CliRegistryToken { registry }));
                 }
-                let value = CV::from_toml(Definition::Cli(None), toml::Value::Table(doc))
-                    .with_context(|| format!("failed to convert --config argument `{arg}`"))?;
+                let value = CV::from_item(&Definition::Cli(None, None), root)
+                    .context(|| ConfigWhat::CliConvert { arg: arg.clone() })?;
                 self.load_includes(value, &mut HashSet::new_in(Global), true)
-                    .context("failed to load --config include")?
+                    .context(|| ConfigWhat::CliInclude)?
             };
-            loaded
-                .merge(table, true)
-                .with_context(|| format!("failed to merge --config argument `{arg}`"))?;
+            loaded.merge(table, true).context(|| ConfigWhat::CliMerge { arg: arg.clone() })?;
         }
         Ok(loaded)
     }
 
     /// `T` from the value at the dotted `key`, each part of it from the files or its
     /// environment variable as cargo's `GlobalContext::get` takes it. `""` is the root.
-    pub fn get<'de, T: serde::Deserialize<'de>>(&self, key: &str) -> anyhow::Result<T> {
+    pub fn get<'de, T: serde::Deserialize<'de>>(&self, key: &str) -> Result<T, ConfigError> {
         let key = if key.is_empty() { ConfigKey::new() } else { ConfigKey::parse(key) };
         let d = de::Deserializer { config: self, key, env_prefix_ok: true };
-        T::deserialize(d).map_err(|e| e.into())
+        T::deserialize(d)
     }
 
-    pub fn get_string(&self, key: &str) -> anyhow::Result<OptValue<String>> {
+    pub fn get_string(&self, key: &str) -> Result<OptValue<String>, ConfigError> {
         self.get::<OptValue<String>>(key)
     }
 
     /// Reads the files now if they are not read yet, as cargo does on start to see its
     /// `[term]` table.
-    pub fn ensure_loaded(&self) -> anyhow::Result<()> {
+    pub fn ensure_loaded(&self) -> Result<(), ConfigError> {
         self.values().map(|_| ())
     }
 
@@ -722,16 +714,16 @@ impl<F: Files> Config<F> {
     }
 
     /// The merged value at `key` from files and `--config`, without the environment.
-    pub fn get_cv(&self, key: &ConfigKey) -> anyhow::Result<Option<ConfigValue>> {
+    pub fn get_cv(&self, key: &ConfigKey) -> Result<Option<ConfigValue>, ConfigError> {
         Self::get_cv_in(key, self.values()?)
     }
 
     fn get_cv_in(
         key: &ConfigKey,
         vals: &HashMap<String, ConfigValue, Global>,
-    ) -> anyhow::Result<Option<ConfigValue>> {
+    ) -> Result<Option<ConfigValue>, ConfigError> {
         if key.is_root() {
-            return Ok(Some(CV::Table(vals.clone(), Definition::Path(PathBuf::new()))));
+            return Ok(Some(CV::Table(vals.clone(), Definition::Path(PathBuf::new(), None))));
         }
         let mut parts = key.parts().enumerate();
         let Some(mut val) = vals.get(parts.next().unwrap().1) else { return Ok(None) };
@@ -746,11 +738,11 @@ impl<F: Files> Config<F> {
                     for part in key.parts().take(i) {
                         key_so_far.push(part);
                     }
-                    bail!(
-                        "expected table for configuration key `{key_so_far}`, but found {} in {}",
-                        other.desc(),
-                        other.definition()
-                    )
+                    return Err(ConfigError::new(ConfigWhat::NotATable {
+                        key: key_so_far.to_string(),
+                        found: other.desc(),
+                        definition: other.definition().clone(),
+                    }));
                 }
             }
         }
@@ -760,7 +752,7 @@ impl<F: Files> Config<F> {
     /// The value at `key` with its environment variable taken into account, as cargo's
     /// `get_cv_with_env`: the variable wins over files, a list gets the variable's words
     /// appended.
-    pub fn get_cv_with_env(&self, key: &ConfigKey) -> anyhow::Result<Option<ConfigValue>> {
+    pub fn get_cv_with_env(&self, key: &ConfigKey) -> Result<Option<ConfigValue>, ConfigError> {
         let cv = self.get_cv(key)?;
         if key.is_root() {
             return Ok(cv);
@@ -819,7 +811,11 @@ impl<F: Files> Config<F> {
         self.env.iter().map(|(k, v)| (k.as_str(), v.as_str()))
     }
 
-    pub(crate) fn has_key(&self, key: &ConfigKey, env_prefix_ok: bool) -> anyhow::Result<bool> {
+    pub(crate) fn has_key(
+        &self,
+        key: &ConfigKey,
+        env_prefix_ok: bool,
+    ) -> Result<bool, ConfigError> {
         if self.env.contains_key(key.as_env_key()) {
             return Ok(true);
         }
@@ -835,7 +831,7 @@ impl<F: Files> Config<F> {
     pub(crate) fn get_table(
         &self,
         key: &ConfigKey,
-    ) -> anyhow::Result<OptValue<HashMap<String, ConfigValue, Global>>> {
+    ) -> Result<OptValue<HashMap<String, ConfigValue, Global>>, ConfigError> {
         match self.get_cv(key)? {
             Some(CV::Table(val, definition)) => Ok(Some(Value { val, definition })),
             Some(val) => Err(self.expected("table", key, &val)),
@@ -852,9 +848,10 @@ impl<F: Files> Config<F> {
             Some(value) => {
                 let definition = Definition::Environment(key.as_env_key().to_owned());
                 Ok(Some(Value {
-                    val: value
-                        .parse()
-                        .map_err(|e| ConfigError::new(format!("{e}"), definition.clone()))?,
+                    val: value.parse().map_err(|e| {
+                        let what = ConfigWhat::EnvValue { message: format!("{e}") };
+                        ConfigError::defined(what, definition.clone())
+                    })?,
                     definition,
                 }))
             }
@@ -862,12 +859,18 @@ impl<F: Files> Config<F> {
         }
     }
 
-    pub(crate) fn expected(&self, ty: &str, key: &ConfigKey, val: &ConfigValue) -> anyhow::Error {
-        anyhow!(
-            "invalid configuration for key `{key}`\nexpected a {ty}, but found a {} for `{key}` in {}",
-            val.desc(),
-            val.definition()
-        )
+    pub(crate) fn expected(
+        &self,
+        ty: &'static str,
+        key: &ConfigKey,
+        val: &ConfigValue,
+    ) -> ConfigError {
+        ConfigError::new(ConfigWhat::InvalidFor {
+            key: key.to_string(),
+            ty,
+            found: val.desc(),
+            definition: val.definition().clone(),
+        })
     }
 
     get_value_typed! {get_integer_value, i64, Integer, "an integer"}
@@ -875,7 +878,7 @@ impl<F: Files> Config<F> {
     get_value_typed! {get_string_value, String, String, "a string"}
 
     /// `[build]`, as cargo's `GlobalContext::build_config`.
-    pub fn build_config(&self) -> anyhow::Result<&CargoBuildConfig> {
+    pub fn build_config(&self) -> Result<&CargoBuildConfig, ConfigError> {
         if let Some(build) = self.build_config.get() {
             return Ok(build);
         }
@@ -884,7 +887,7 @@ impl<F: Files> Config<F> {
     }
 
     /// `[net]`, as cargo's `GlobalContext::net_config`.
-    pub fn net_config(&self) -> anyhow::Result<CargoNetConfig> {
+    pub fn net_config(&self) -> Result<CargoNetConfig, ConfigError> {
         self.get::<CargoNetConfig>("net")
     }
 
@@ -893,20 +896,17 @@ impl<F: Files> Config<F> {
     pub fn config_profile(
         &self,
         name: &str,
-    ) -> anyhow::Result<OptValue<cargo_util_schemas::manifest::TomlProfile>> {
+    ) -> Result<OptValue<cargo_util_schemas::manifest::TomlProfile>, ConfigError> {
         self.get(&format!("profile.{name}"))
     }
 
     /// The variables `[env]` adds to what cargo runs, as cargo's `GlobalContext::env_config`:
     /// each unless the process has it already or it is `force`d.
-    pub fn env_config(&self) -> anyhow::Result<BTreeMap<String, OsString>> {
+    pub fn env_config(&self) -> Result<BTreeMap<String, OsString>, ConfigError> {
         let env_config = self.get::<EnvConfig>("env")?;
         for disallowed in ["CARGO_HOME", "RUSTUP_HOME", "RUSTUP_TOOLCHAIN"] {
             if env_config.contains_key(disallowed) {
-                bail!(
-                    "setting the `{disallowed}` environment variable is not supported \
-                     in the `[env]` configuration table"
-                );
+                return Err(ConfigError::new(ConfigWhat::EnvDisallowed { name: disallowed }));
             }
         }
         Ok(env_config
@@ -921,42 +921,40 @@ impl<F: Files> Config<F> {
 
     /// The `build.target-dir` of `CARGO_TARGET_DIR` or the config, as cargo's
     /// `GlobalContext::target_dir`.
-    pub fn target_dir(&self) -> anyhow::Result<Option<PathBuf>> {
+    pub fn target_dir(&self) -> Result<Option<PathBuf>, ConfigError> {
         if let Some(dir) = self.env("CARGO_TARGET_DIR") {
             if dir.is_empty() {
-                bail!(
-                    "the target directory is set to an empty string in the `CARGO_TARGET_DIR` environment variable"
-                )
+                return Err(ConfigError::new(ConfigWhat::TargetDirEmptyEnv));
             }
             return Ok(Some(self.cwd.join(dir)));
         }
         let Some(val) = &self.build_config()?.target_dir else { return Ok(None) };
         if val.raw_value().is_empty() {
-            bail!("the target directory is set to an empty string in {}", val.value().definition)
+            let definition = val.value().definition.clone();
+            return Err(ConfigError::new(ConfigWhat::TargetDirEmpty { definition }));
         }
         Ok(Some(val.resolve_path(&self.cwd)))
     }
 
     /// `build.build-dir` with its templates filled in, as cargo's `GlobalContext::build_dir`.
-    pub fn build_dir(&self, workspace_manifest_path: &Path) -> anyhow::Result<Option<PathBuf>> {
+    pub fn build_dir(
+        &self,
+        workspace_manifest_path: &Path,
+    ) -> Result<Option<PathBuf>, ConfigError> {
         let Some(val) = &self.build_config()?.build_dir else { return Ok(None) };
         let root = workspace_manifest_path.parent().unwrap();
+        let utf8 = |path: &Path, what: &'static str| match path.to_str() {
+            Some(path) => Ok(path.to_owned()),
+            None => Err(ConfigError::new(ConfigWhat::NotUtf8 { what })),
+        };
         let replacements = [
-            (
-                "{workspace-root}",
-                root.to_str().context("workspace root was not valid utf-8")?.to_owned(),
-            ),
-            (
-                "{cargo-cache-home}",
-                self.home.to_str().context("cargo home was not valid utf-8")?.to_owned(),
-            ),
+            ("{workspace-root}", utf8(root, "workspace root")?),
+            ("{cargo-cache-home}", utf8(&self.home, "cargo home")?),
         ];
         if val.raw_value().contains("{workspace-path-hash}") {
             // cargo's hash of the path is its `StableHasher` over `Path`'s `Hash`, not ported yet.
-            bail!(
-                "`{{workspace-path-hash}}` in build.build-dir (defined in {}) is not supported by blaze yet",
-                val.value().definition
-            );
+            let definition = val.value().definition.clone();
+            return Err(ConfigError::new(ConfigWhat::BuildDirHash { definition }));
         }
         let mut value = val.raw_value().to_owned();
         for (from, to) in &replacements {
@@ -981,55 +979,61 @@ impl<F: Files> Config<F> {
             } else {
                 suggestion
             };
-            bail!(
-                "unexpected variable `{variable}` in build.build-dir path `{}`{suggestion}",
-                val.raw_value()
-            );
+            let what = ConfigWhat::BuildDirVariable {
+                variable: variable.to_owned(),
+                value: val.raw_value().to_owned(),
+                help: suggestion,
+            };
+            return Err(ConfigError::new(what));
         }
         if value.contains('{') {
-            bail!("unexpected opening bracket `{{` in build.build-dir path `{}`", val.raw_value());
+            let value = val.raw_value().to_owned();
+            return Err(ConfigError::new(ConfigWhat::BuildDirOpen { value }));
         }
         if value.contains('}') {
-            bail!("unexpected closing bracket `}}` in build.build-dir path `{}`", val.raw_value());
+            let value = val.raw_value().to_owned();
+            return Err(ConfigError::new(ConfigWhat::BuildDirClose { value }));
         }
         if val.raw_value().is_empty() {
-            bail!("the build directory is set to an empty string in {}", val.value().definition)
+            let definition = val.value().definition.clone();
+            return Err(ConfigError::new(ConfigWhat::BuildDirEmpty { definition }));
         }
         Ok(Some(val.value().definition.root(&self.cwd).join(value)))
     }
 
     /// `registries.<name>.index`, as cargo's `GlobalContext::get_registry_index`.
-    pub fn registry_index(&self, registry: &str) -> anyhow::Result<Url> {
-        cargo_util_schemas::manifest::RegistryName::new(registry)?;
+    pub fn registry_index(&self, registry: &str) -> Result<Url, ConfigError> {
+        cargo_util_schemas::manifest::RegistryName::new(registry).map_err(ConfigError::foreign)?;
         let Some(index) = self.get_string(&format!("registries.{registry}.index"))? else {
-            bail!("registry index was not found in any configuration: `{registry}`");
+            let registry = registry.to_owned();
+            return Err(ConfigError::new(ConfigWhat::RegistryIndexMissing { registry }));
         };
-        self.resolve_registry_index(&index).with_context(|| {
-            format!("invalid index URL for registry `{registry}` defined in {}", index.definition)
+        self.resolve_registry_index(&index).context(|| ConfigWhat::RegistryIndexInvalid {
+            registry: registry.to_owned(),
+            definition: index.definition.clone(),
         })
     }
 
-    fn resolve_registry_index(&self, index: &Value<String>) -> anyhow::Result<Url> {
+    fn resolve_registry_index(&self, index: &Value<String>) -> Result<Url, ConfigError> {
         let base = index.definition.root(&self.cwd).join("truncated-by-url_with_base");
-        crate::source::into_url(&index.val)?;
+        crate::source::into_url(&index.val).map_err(ConfigError::foreign)?;
         let base = blaze_source::file_url(&base).ok();
-        let url = Url::options()
-            .base_url(base.as_ref())
-            .parse(&index.val)
-            .map_err(|e| anyhow!("invalid url `{}`: {}", index.val, e))?;
+        let url = Url::options().base_url(base.as_ref()).parse(&index.val).map_err(|error| {
+            ConfigError::new(ConfigWhat::InvalidUrl { url: index.val.clone(), error })
+        })?;
         if url.password().is_some() {
-            bail!("registry URLs may not contain passwords");
+            return Err(ConfigError::new(ConfigWhat::UrlPassword));
         }
         Ok(url)
     }
 
     /// Reads `$CARGO_HOME/credentials.toml` (or the old `credentials`) once, as cargo's
     /// `load_credentials`: a top-level `token` is the old spelling of `registry.token`.
-    pub fn load_credentials(&self) -> anyhow::Result<()> {
+    pub fn load_credentials(&self) -> Result<(), ConfigError> {
         self.credentials().map(|_| ())
     }
 
-    fn credentials(&self) -> anyhow::Result<&HashMap<String, ConfigValue, Global>> {
+    fn credentials(&self) -> Result<&HashMap<String, ConfigValue, Global>, ConfigError> {
         if let Some(credentials) = self.credentials.get() {
             return Ok(credentials);
         }
@@ -1050,11 +1054,11 @@ impl<F: Files> Config<F> {
     /// The token of `table` (`registry` for crates.io, `registries.<name>`) as cargo's
     /// `registry_credentials` takes it: `credentials.toml`'s, unless the configuration's
     /// comes from a place cargo ranks above that file (its environment variable).
-    pub fn credentials_token(&self, table: &str) -> anyhow::Result<OptValue<String>> {
+    pub fn credentials_token(&self, table: &str) -> Result<OptValue<String>, ConfigError> {
         let key = ConfigKey::parse(&format!("{table}.token"));
         let from_file = match Self::get_cv_in(&key, self.credentials()?)? {
             Some(CV::String(val, definition)) => Some(Value { val, definition }),
-            Some(cv) => return Err(ConfigError::expected(&key, "a string", &cv).into()),
+            Some(cv) => return Err(ConfigError::expected(&key, "a string", &cv)),
             None => None,
         };
         let configured = self.get::<OptValue<String>>(&format!("{table}.token"))?;

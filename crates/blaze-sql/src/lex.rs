@@ -154,6 +154,30 @@ pub(crate) enum Punct {
     Comma,
     Dot,
     Semicolon,
+    /// `::`, the query grammar's postfix cast.
+    DoubleColon,
+}
+
+/// The keywords the query grammar does not reserve: it has no `insert`, `update` or `delete`,
+/// so these are names there (a column may be called `values`).
+const NOT_RESERVED_IN_QUERIES: [Keyword; 7] = [
+    Keyword::Insert,
+    Keyword::Into,
+    Keyword::Values,
+    Keyword::Update,
+    Keyword::Set,
+    Keyword::Delete,
+    Keyword::Returning,
+];
+
+/// Which grammar the lexer reads for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Grammar {
+    /// The typed subset (sql.md): no comment, no `::`, no `@name`.
+    Subset,
+    /// The query grammar (query.md): comments are space, `::` is a token, `@name` names a
+    /// table's files, and the words of [`NOT_RESERVED_IN_QUERIES`] are names.
+    Query,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -173,6 +197,8 @@ pub(crate) enum Tok<'s> {
     /// `x'..'`: the hex digits, an even count of them.
     Blob(&'s str),
     Punct(Punct),
+    /// `@name`, only in [`Grammar::Query`]: the name without its `@`.
+    At(&'s str),
     /// Past the last token; its span is empty, at the end of the text.
     End,
 }
@@ -208,6 +234,7 @@ pub(crate) struct Token<'s> {
 pub(crate) struct Lexer<'s> {
     text: &'s str,
     at: usize,
+    grammar: Grammar,
 }
 
 /// A refusal of the bytes `range`.
@@ -237,7 +264,54 @@ impl<'s> Lexer<'s> {
     #[blaze::noalloc]
     #[blaze::nonblocking]
     pub(crate) fn new(text: &'s str) -> Lexer<'s> {
-        Lexer { text, at: 0 }
+        Lexer { text, at: 0, grammar: Grammar::Subset }
+    }
+
+    /// A lexer for the query grammar.
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn for_queries(text: &'s str) -> Lexer<'s> {
+        Lexer { text, at: 0, grammar: Grammar::Query }
+    }
+
+    #[blaze::pure]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn grammar(&self) -> Grammar {
+        self.grammar
+    }
+
+    /// The first offset from `at` that is neither space nor, in the query grammar, a comment.
+    /// A `/*` with no `*/` is refused.
+    fn space(&self, at: usize) -> Result<usize, SyntaxError<'s>> {
+        let mut at = self.scan(at, is_space);
+        if self.grammar == Grammar::Subset {
+            return Ok(at);
+        }
+        // Every turn takes at least the two bytes of an opener, so the text bounds the loop.
+        loop {
+            match (self.byte(at), self.byte(at + 1)) {
+                (Some(b'-'), Some(b'-')) => {
+                    at = self.find(at, b'\n').unwrap_or(self.text.len());
+                }
+                (Some(b'/'), Some(b'*')) => {
+                    let Some(close) = self.text.get(at + PAIR..).and_then(|rest| rest.find("*/"))
+                    else {
+                        let len = self.text.len();
+                        return Err(error(
+                            SyntaxErrorKind::UnterminatedComment(self.slice(at..len)),
+                            at..len,
+                        ));
+                    };
+                    at += PAIR + close + PAIR;
+                }
+                _ => return Ok(at),
+            }
+            at = self.scan(at, is_space);
+        }
     }
 
     fn byte(&self, at: usize) -> Option<u8> {
@@ -268,7 +342,8 @@ impl<'s> Lexer<'s> {
     #[blaze::noalloc]
     #[blaze::nonblocking]
     pub(crate) fn next_token(&mut self) -> Result<Token<'s>, SyntaxError<'s>> {
-        let start = self.scan(self.at, is_space);
+        let start = self.space(self.at)?;
+        let query = self.grammar == Grammar::Query;
         let Some(first) = self.byte(start) else {
             self.at = start;
             return Ok(Token { tok: Tok::End, span: Span::of(start..start) });
@@ -318,6 +393,11 @@ impl<'s> Lexer<'s> {
                 };
                 Err(error(kind, start..end))
             }
+            b':' if query && second == Some(b':') => two(Punct::DoubleColon),
+            b'@' if query && second.is_some_and(is_name_start) => {
+                let end = self.scan(start + 1, is_name_byte);
+                Ok((Tok::At(self.slice(start + 1..end)), end))
+            }
             b':' | b'@' if second.is_some_and(is_name_start) => {
                 let end = self.scan(start + 1, is_name_byte);
                 let token = self.slice(start..end);
@@ -333,7 +413,9 @@ impl<'s> Lexer<'s> {
             byte if is_name_start(byte) => {
                 let end = self.scan(start, is_name_byte);
                 let word = self.slice(start..end);
-                Ok((keyword(word).map_or(Tok::Ident(word), Tok::Keyword), end))
+                let reserved = keyword(word)
+                    .filter(|keyword| !(query && NOT_RESERVED_IN_QUERIES.contains(keyword)));
+                Ok((reserved.map_or(Tok::Ident(word), Tok::Keyword), end))
             }
             byte => Err(error(SyntaxErrorKind::UnexpectedByte(byte), start..start + 1)),
         }?;

@@ -48,9 +48,19 @@ impl Mode<'_> {
     }
 }
 
-/// A length near a boundary the hasher splits at, or anywhere up to 300 KiB.
+/// A length near a boundary the hasher splits at, or anywhere up to 300 KiB; under Miri, only
+/// near a boundary up to 17 KiB, or a few blocks.
 fn length(tape: &Tape) -> usize {
     let boundaries = [0, 64, 1024, 2048, 8 * 1024, 9 * 1024, 16 * 1024, 17 * 1024, 32 * 1024];
+    if cfg!(miri) {
+        return match tape.below(2, "length kind") {
+            0 => {
+                let at = boundaries[tape.index(boundaries.len() - 1, "boundary")] as i64;
+                (at + tape.range(0..5, "offset") as i64 - 2).max(0) as usize
+            }
+            _ => tape.range(0..4 * 64 + 1, "short length") as usize,
+        };
+    }
     match tape.below(4, "length kind") {
         0 => {
             let at = boundaries[tape.index(boundaries.len(), "boundary")] as i64;
@@ -130,7 +140,7 @@ fn agrees(tape: &Tape) {
 
 #[test]
 fn official_blake3_agrees() {
-    blaze_sim::check(Config::DEFAULT, agrees);
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { Config::DEFAULT.cases }), agrees);
 }
 
 /// Every length to three chunks past a batch of 16, one shot and in one update, plain mode:
@@ -139,7 +149,16 @@ fn official_blake3_agrees() {
 fn every_length_to_nineteen_chunks() {
     let input: Vec<u8> =
         (0..19 * 1024 + 1).map(|at: u32| (at.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
-    for len in (0..input.len()).step_by(7).chain([1024, 8 * 1024, 16 * 1024, 17 * 1024]) {
+    // Under Miri, the lengths at each block, chunk and batch boundary only.
+    let lens: Vec<usize> = if cfg!(miri) {
+        [0, 1, 63, 64, 65, 1023, 1024, 1025, 2048, 2049, 8 * 1024, 8 * 1024 + 1]
+            .into_iter()
+            .chain([16 * 1024 - 1, 16 * 1024, 16 * 1024 + 1, 17 * 1024, 19 * 1024])
+            .collect()
+    } else {
+        (0..input.len()).step_by(7).chain([1024, 8 * 1024, 16 * 1024, 17 * 1024]).collect()
+    };
+    for len in lens {
         let input = &input[..len];
         let expected = *blake3::hash(input).as_bytes();
         assert_eq!(blaze_blake3::hash(input), expected, "{len} B");

@@ -14,7 +14,7 @@
 //! (.github/workflows/blaze.yaml). docs/v2/plan/third-party.md says what replaces each package.
 //!
 //! It adds nothing to the graph it counts: it starts no cargo and reads the manifests and
-//! Cargo.lock with a TOML subset of its own, not blaze-script's `toml` (a crates.io crate).
+//! Cargo.lock with blaze-toml (through blaze-script's `toml`), the workspace's own reader.
 
 /// What the usage error prints.
 const DOC: &str = r#"deps: the third-party packages each workspace crate depends on only go down, to none (docs/v2/plan/design/bottom.md, "Also decided on 2026-11-15").
@@ -62,12 +62,10 @@ An optional dependency Cargo.lock does not list (no feature anywhere turns it on
 build and not counted; one it lists counts, whichever crate's features turn it on. A crate that
 is not a member has no dev-dependencies read: cargo resolves none for it.
 
-The manifests and Cargo.lock are read as a TOML subset: tables and arrays of tables, dotted and
-quoted keys, basic and literal strings (one-line and multi-line, with TOML's escapes), integers,
-booleans, arrays and inline tables. It refuses, naming the file and line: a float, a date or a
-time, `inf` or `nan`, a hex, octal or binary integer, a key or table defined twice, an unclosed
-string, array or table, a bad escape, and what is not TOML. A Cargo.lock that does not list a
-dependency is refused, naming the crate, the dependency and its manifest line: update the lock.
+The manifests and Cargo.lock are read as TOML 1.0 by blaze-toml, which refuses what is not TOML
+naming the file, line and column. A key whose value is not of the shape it must be is refused
+naming the file and line. A Cargo.lock that does not list a dependency is refused, naming the
+crate, the dependency and its manifest line: update the lock.
 "#;
 
 use std::{
@@ -79,7 +77,9 @@ use std::{
 use blaze_script::{
     fail, git,
     input::{self, Fields, Input, InputError},
-    read_text, universal_newlines,
+    read_text,
+    toml::{self, Node},
+    universal_newlines,
 };
 
 const SCRIPT: &str = "thirdparty";
@@ -130,552 +130,19 @@ impl Input for Args {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The TOML subset.
+// TOML: blaze-toml, through blaze-script.
 
-/// A value the subset reads.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum Toml {
-    Str(String),
-    Int(i64),
-    Bool(bool),
-    Array(Vec<Toml>),
-    Table(Table),
-    /// An array of tables, one per `[[name]]` header.
-    Tables(Vec<Table>),
+/// The TOML text `text` of the file `file` (named in errors), as a document.
+fn read_toml<'t>(file: &str, text: &'t str) -> Result<toml::Doc<'t>, DepsError> {
+    toml::read(text).map_err(|e| {
+        let (line, col) = e.line_col(text);
+        DepsError::Toml { at: Place { file: file.to_owned(), line }, col, what: e.what }
+    })
 }
 
-/// A table: each key with the line (from 1) that wrote it and its value.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct Table {
-    entries: BTreeMap<String, (usize, Toml)>,
-    /// Defined by its own header or inline: a header may not define it again.
-    defined: bool,
-}
-
-/// What is wrong at a line of TOML.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum TomlWhat {
-    /// TOML the subset does not read: what it is.
-    Unread(&'static str),
-    /// Not TOML: what was expected there.
-    Expected(&'static str),
-    /// A key or table defined a second time: its dotted name.
-    Twice(String),
-    /// A key used as a table whose value is not one.
-    NotATable(String),
-    /// A string, array or table that does not close: which.
-    Unclosed(&'static str),
-    /// An escape TOML has not, as written.
-    Escape(String),
-}
-
-impl fmt::Display for TomlWhat {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TomlWhat::Unread(what) => write!(f, "{what}, which the TOML subset does not read"),
-            TomlWhat::Expected(what) => write!(f, "expected {what}"),
-            TomlWhat::Twice(key) => write!(f, "`{key}` is defined twice"),
-            TomlWhat::NotATable(key) => write!(f, "`{key}` is used as a table but is a value"),
-            TomlWhat::Unclosed(what) => write!(f, "this {what} does not close"),
-            TomlWhat::Escape(text) => write!(f, "`{text}` is no escape of TOML's"),
-        }
-    }
-}
-
-/// TOML read wrong: the file, the line (from 1) and what is wrong there.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TomlError {
-    file: String,
-    line: usize,
-    what: TomlWhat,
-}
-
-impl fmt::Display for TomlError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}: {} (scripts/src/bin/thirdparty.rs reads manifests and Cargo.lock as a TOML subset)", self.file, self.line, self.what)
-    }
-}
-
-impl std::error::Error for TomlError {}
-
-/// One TOML text being read: the byte and the line (from 1) it is at.
-struct Reader<'a> {
-    file: &'a str,
-    text: &'a str,
-    at: usize,
-    line: usize,
-}
-
-impl<'a> Reader<'a> {
-    fn peek(&self) -> Option<u8> {
-        self.text.as_bytes().get(self.at).copied()
-    }
-
-    fn peek_at(&self, ahead: usize) -> Option<u8> {
-        self.text.as_bytes().get(self.at + ahead).copied()
-    }
-
-    fn starts(&self, prefix: &str) -> bool {
-        self.text[self.at..].starts_with(prefix)
-    }
-
-    fn err(&self, what: TomlWhat) -> TomlError {
-        self.err_at(self.line, what)
-    }
-
-    fn err_at(&self, line: usize, what: TomlWhat) -> TomlError {
-        TomlError { file: self.file.to_owned(), line, what }
-    }
-
-    /// Spaces and tabs (and a `\r`, which a line's end may keep).
-    fn spaces(&mut self) {
-        // Bounded: each turn moves on one byte.
-        while matches!(self.peek(), Some(b' ' | b'\t' | b'\r')) {
-            self.at += 1;
-        }
-    }
-
-    /// A comment, to the end of its line (the newline not taken).
-    fn comment(&mut self) {
-        if self.peek() == Some(b'#') {
-            let text = self.text;
-            self.at = text[self.at..].find('\n').map_or(text.len(), |n| self.at + n);
-        }
-    }
-
-    /// Spaces, comments and newlines: between a table's lines, and in arrays and inline tables.
-    fn blank(&mut self) {
-        // Bounded: each turn takes a newline, or returns.
-        loop {
-            self.spaces();
-            self.comment();
-            if self.peek() != Some(b'\n') {
-                return;
-            }
-            self.at += 1;
-            self.line += 1;
-        }
-    }
-
-    fn expect(&mut self, byte: u8, what: &'static str) -> Result<(), TomlError> {
-        if self.peek() != Some(byte) {
-            return Err(self.err(TomlWhat::Expected(what)));
-        }
-        self.at += 1;
-        Ok(())
-    }
-
-    /// The rest of a line after a value or a header: spaces, a comment, its newline.
-    fn end_of_line(&mut self) -> Result<(), TomlError> {
-        self.spaces();
-        self.comment();
-        match self.peek() {
-            None => Ok(()),
-            Some(b'\n') => {
-                self.at += 1;
-                self.line += 1;
-                Ok(())
-            }
-            Some(_) => Err(self.err(TomlWhat::Expected("the end of the line after a value or a header"))),
-        }
-    }
-
-    /// A key, its dotted parts each bare (`A-Za-z0-9_-`), a basic string or a literal one.
-    fn key(&mut self) -> Result<Vec<String>, TomlError> {
-        let text = self.text;
-        let mut out = Vec::new();
-        // Bounded: each turn takes a part and a `.`, or returns.
-        loop {
-            self.spaces();
-            let part = match self.peek() {
-                Some(b'"' | b'\'') if self.starts("\"\"\"") || self.starts("'''") => {
-                    return Err(self.err(TomlWhat::Expected("a key, which is never a multi-line string")));
-                }
-                Some(b'"') => {
-                    self.at += 1;
-                    self.basic(false)?
-                }
-                Some(b'\'') => {
-                    self.at += 1;
-                    self.literal(false)?
-                }
-                _ => {
-                    let len = text.as_bytes()[self.at..]
-                        .iter()
-                        .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_' || **b == b'-')
-                        .count();
-                    if len == 0 {
-                        return Err(self.err(TomlWhat::Expected("a key")));
-                    }
-                    let part = text[self.at..self.at + len].to_owned();
-                    self.at += len;
-                    part
-                }
-            };
-            out.push(part);
-            self.spaces();
-            if self.peek() != Some(b'.') {
-                return Ok(out);
-            }
-            self.at += 1;
-        }
-    }
-
-    /// A basic string whose opening quote (or three) is taken: to its closing one, escapes read.
-    fn basic(&mut self, multi: bool) -> Result<String, TomlError> {
-        let text = self.text;
-        let bytes = text.as_bytes();
-        let opened = self.line;
-        let mut out: Vec<u8> = Vec::new();
-        // Bounded: every turn moves on at least one byte, or returns.
-        loop {
-            let Some(byte) = self.peek() else { return Err(self.err_at(opened, TomlWhat::Unclosed("string"))) };
-            match byte {
-                b'"' if !multi => {
-                    self.at += 1;
-                    break;
-                }
-                b'"' if self.starts("\"\"\"") => {
-                    // Up to two quotes before the closing three are the string's.
-                    let quotes = bytes[self.at..].iter().take_while(|b| **b == b'"').count();
-                    if quotes > 5 {
-                        return Err(self.err(TomlWhat::Expected("at most five quotes where a multi-line string closes")));
-                    }
-                    out.extend(std::iter::repeat_n(b'"', quotes - 3));
-                    self.at += quotes;
-                    break;
-                }
-                b'\n' if !multi => return Err(self.err_at(opened, TomlWhat::Unclosed("one-line string"))),
-                b'\n' => {
-                    out.push(b'\n');
-                    self.at += 1;
-                    self.line += 1;
-                }
-                b'\\' => {
-                    let Some(next) = self.peek_at(1) else { return Err(self.err_at(opened, TomlWhat::Unclosed("string"))) };
-                    self.at += 2;
-                    let c = match next {
-                        b'"' => '"',
-                        b'\\' => '\\',
-                        b'b' => '\u{8}',
-                        b't' => '\t',
-                        b'n' => '\n',
-                        b'f' => '\u{c}',
-                        b'r' => '\r',
-                        b'e' => '\u{1b}',
-                        b'u' | b'U' => {
-                            let len = if next == b'u' { 4 } else { 8 };
-                            let written = |hex: &str| format!("\\{}{hex}", char::from(next));
-                            let Some(hex) = text.get(self.at..self.at + len) else {
-                                return Err(self.err(TomlWhat::Escape(written(text.get(self.at..).unwrap_or("")))));
-                            };
-                            let Some(c) = u32::from_str_radix(hex, 16).ok().and_then(char::from_u32) else {
-                                return Err(self.err(TomlWhat::Escape(written(hex))));
-                            };
-                            self.at += len;
-                            c
-                        }
-                        b' ' | b'\t' | b'\r' | b'\n' if multi => {
-                            // A line-ending backslash: the newline and the blanks after it go.
-                            self.at -= 1;
-                            self.spaces();
-                            if self.peek() != Some(b'\n') {
-                                return Err(self.err(TomlWhat::Escape("\\ before a blank that does not end the line".to_owned())));
-                            }
-                            // Bounded: each turn moves on one byte.
-                            loop {
-                                match self.peek() {
-                                    Some(b' ' | b'\t' | b'\r') => self.at += 1,
-                                    Some(b'\n') => {
-                                        self.at += 1;
-                                        self.line += 1;
-                                    }
-                                    _ => break,
-                                }
-                            }
-                            continue;
-                        }
-                        other => return Err(self.err(TomlWhat::Escape(format!("\\{}", char::from(other))))),
-                    };
-                    let mut buf = [0_u8; 4];
-                    out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-                }
-                _ => {
-                    out.push(byte);
-                    self.at += 1;
-                }
-            }
-        }
-        // The text is UTF-8 and was cut only at ASCII bytes.
-        String::from_utf8(out).map_err(|_| self.err_at(opened, TomlWhat::Unread("a string that is not UTF-8")))
-    }
-
-    /// A literal string whose opening quote (or three) is taken: to its closing one, no escapes.
-    fn literal(&mut self, multi: bool) -> Result<String, TomlError> {
-        let text = self.text;
-        let opened = self.line;
-        let from = self.at;
-        // Bounded: every turn moves on one byte, or returns.
-        loop {
-            match self.peek() {
-                None => return Err(self.err_at(opened, TomlWhat::Unclosed("string"))),
-                Some(b'\'') if !multi => {
-                    let out = text[from..self.at].to_owned();
-                    self.at += 1;
-                    return Ok(out);
-                }
-                Some(b'\'') if self.starts("'''") => {
-                    let quotes = text.as_bytes()[self.at..].iter().take_while(|b| **b == b'\'').count();
-                    if quotes > 5 {
-                        return Err(self.err(TomlWhat::Expected("at most five quotes where a multi-line string closes")));
-                    }
-                    let out = text[from..self.at + quotes - 3].to_owned();
-                    self.at += quotes;
-                    return Ok(out);
-                }
-                Some(b'\n') if !multi => return Err(self.err_at(opened, TomlWhat::Unclosed("one-line string"))),
-                Some(b'\n') => {
-                    self.at += 1;
-                    self.line += 1;
-                }
-                Some(_) => self.at += 1,
-            }
-        }
-    }
-
-    /// After a multi-line string's opening quotes: a newline right after them is not its text.
-    fn trim_first_newline(&mut self) {
-        if self.starts("\r\n") {
-            self.at += 1;
-        }
-        if self.peek() == Some(b'\n') {
-            self.at += 1;
-            self.line += 1;
-        }
-    }
-
-    fn value(&mut self) -> Result<Toml, TomlError> {
-        match self.peek() {
-            Some(b'"') if self.starts("\"\"\"") => {
-                self.at += 3;
-                self.trim_first_newline();
-                self.basic(true).map(Toml::Str)
-            }
-            Some(b'"') => {
-                self.at += 1;
-                self.basic(false).map(Toml::Str)
-            }
-            Some(b'\'') if self.starts("'''") => {
-                self.at += 3;
-                self.trim_first_newline();
-                self.literal(true).map(Toml::Str)
-            }
-            Some(b'\'') => {
-                self.at += 1;
-                self.literal(false).map(Toml::Str)
-            }
-            Some(b'[') => {
-                self.at += 1;
-                self.array()
-            }
-            Some(b'{') => {
-                self.at += 1;
-                self.inline()
-            }
-            Some(b't') if self.starts("true") => {
-                self.at += 4;
-                Ok(Toml::Bool(true))
-            }
-            Some(b'f') if self.starts("false") => {
-                self.at += 5;
-                Ok(Toml::Bool(false))
-            }
-            Some(b'i' | b'n') if self.starts("inf") || self.starts("nan") => Err(self.err(TomlWhat::Unread("`inf` or `nan`, a float"))),
-            Some(b'+' | b'-' | b'0'..=b'9') => self.integer(),
-            _ => Err(self.err(TomlWhat::Expected("a value: a string, an integer, a boolean, an array or an inline table"))),
-        }
-    }
-
-    /// A decimal integer, `_` between digits allowed; a float, a date or a time is refused.
-    fn integer(&mut self) -> Result<Toml, TomlError> {
-        let text = self.text;
-        let bytes = text.as_bytes();
-        let from = self.at;
-        let mut at = from;
-        if matches!(bytes.get(at), Some(b'+' | b'-')) {
-            at += 1;
-        }
-        if matches!(bytes.get(at), Some(b'i' | b'n')) {
-            return Err(self.err(TomlWhat::Unread("`inf` or `nan`, a float")));
-        }
-        if bytes.get(at) == Some(&b'0') && matches!(bytes.get(at + 1), Some(b'x' | b'o' | b'b')) {
-            return Err(self.err(TomlWhat::Unread("a hex, octal or binary integer")));
-        }
-        let digits = bytes[at..].iter().take_while(|b| b.is_ascii_digit() || **b == b'_').count();
-        if digits == 0 {
-            return Err(self.err(TomlWhat::Expected("digits")));
-        }
-        let end = at + digits;
-        if matches!(bytes.get(end), Some(b'.' | b'e' | b'E' | b':' | b'-' | b'T' | b'Z')) {
-            return Err(self.err(TomlWhat::Unread("a float, a date or a time")));
-        }
-        let digits: String = text[from..end].chars().filter(|c| *c != '_').collect();
-        let Ok(n) = digits.parse::<i64>() else { return Err(self.err(TomlWhat::Unread("an integer outside 64 bits"))) };
-        self.at = end;
-        Ok(Toml::Int(n))
-    }
-
-    /// An array whose `[` is taken: values, commas between (one after the last allowed), over
-    /// lines and comments.
-    fn array(&mut self) -> Result<Toml, TomlError> {
-        let opened = self.line;
-        let mut out = Vec::new();
-        // Bounded: each turn takes a value, or returns.
-        loop {
-            self.blank();
-            match self.peek() {
-                None => return Err(self.err_at(opened, TomlWhat::Unclosed("array"))),
-                Some(b']') => {
-                    self.at += 1;
-                    return Ok(Toml::Array(out));
-                }
-                Some(_) => {}
-            }
-            out.push(self.value()?);
-            self.blank();
-            match self.peek() {
-                Some(b',') => self.at += 1,
-                Some(b']') => {
-                    self.at += 1;
-                    return Ok(Toml::Array(out));
-                }
-                None => return Err(self.err_at(opened, TomlWhat::Unclosed("array"))),
-                Some(_) => return Err(self.err(TomlWhat::Expected("`,` or `]` after an array's value"))),
-            }
-        }
-    }
-
-    /// An inline table whose `{` is taken: `key = value` pairs and commas, over lines too.
-    fn inline(&mut self) -> Result<Toml, TomlError> {
-        let opened = self.line;
-        let mut table = Table { defined: true, ..Table::default() };
-        // Bounded: each turn takes a key and its value, or returns.
-        loop {
-            self.blank();
-            match self.peek() {
-                None => return Err(self.err_at(opened, TomlWhat::Unclosed("inline table"))),
-                Some(b'}') => {
-                    self.at += 1;
-                    return Ok(Toml::Table(table));
-                }
-                Some(_) => {}
-            }
-            let line = self.line;
-            let key = self.key()?;
-            self.spaces();
-            self.expect(b'=', "`=` after a key")?;
-            self.spaces();
-            let value = self.value()?;
-            put(&mut table, &key, line, value).map_err(|what| self.err_at(line, what))?;
-            self.blank();
-            match self.peek() {
-                Some(b',') => self.at += 1,
-                Some(b'}') => {
-                    self.at += 1;
-                    return Ok(Toml::Table(table));
-                }
-                None => return Err(self.err_at(opened, TomlWhat::Unclosed("inline table"))),
-                Some(_) => return Err(self.err(TomlWhat::Expected("`,` or `}` after an inline table's value"))),
-            }
-        }
-    }
-}
-
-/// The table `key` of `table`, made (as a table no header defined) when there is none; the last
-/// of an array of tables.
-fn step<'t>(table: &'t mut Table, key: &str, line: usize) -> Result<&'t mut Table, TomlWhat> {
-    let entry = table.entries.entry(key.to_owned()).or_insert_with(|| (line, Toml::Table(Table::default())));
-    match &mut entry.1 {
-        Toml::Table(it) => Ok(it),
-        Toml::Tables(them) => them.last_mut().ok_or_else(|| TomlWhat::NotATable(key.to_owned())),
-        _ => Err(TomlWhat::NotATable(key.to_owned())),
-    }
-}
-
-/// The table at the dotted `path` under `table`, each table on the way made when there is none.
-fn walk<'t>(mut table: &'t mut Table, path: &[String], line: usize) -> Result<&'t mut Table, TomlWhat> {
-    for key in path {
-        table = step(table, key, line)?;
-    }
-    Ok(table)
-}
-
-/// The header `[path]` (or `[[path]]`, an array of tables, when `array`) at `line`.
-fn define(root: &mut Table, path: &[String], array: bool, line: usize) -> Result<(), TomlWhat> {
-    let Some((last, parents)) = path.split_last() else { return Err(TomlWhat::Expected("a key in the header")) };
-    let parent = walk(root, parents, line)?;
-    let fresh = || Table { defined: true, ..Table::default() };
-    match parent.entries.get_mut(last) {
-        None => {
-            let value = if array { Toml::Tables(vec![fresh()]) } else { Toml::Table(fresh()) };
-            parent.entries.insert(last.clone(), (line, value));
-        }
-        Some((_, Toml::Tables(them))) if array => them.push(fresh()),
-        Some((_, Toml::Table(it))) if !array && !it.defined => it.defined = true,
-        Some(_) => return Err(TomlWhat::Twice(path.join("."))),
-    }
-    Ok(())
-}
-
-/// `key = value` at `line`, the key dotted from `table`.
-fn put(table: &mut Table, key: &[String], line: usize, value: Toml) -> Result<(), TomlWhat> {
-    let Some((last, parents)) = key.split_last() else { return Err(TomlWhat::Expected("a key")) };
-    let parent = walk(table, parents, line)?;
-    if parent.entries.contains_key(last) {
-        return Err(TomlWhat::Twice(key.join(".")));
-    }
-    parent.entries.insert(last.clone(), (line, value));
-    Ok(())
-}
-
-/// The TOML text `text` of the file `file` (named in errors), as its root table.
-fn parse_toml(file: &str, text: &str) -> Result<Table, TomlError> {
-    let mut r = Reader { file, text, at: 0, line: 1 };
-    let mut root = Table::default();
-    // The table the lines after the last header go into.
-    let mut current: Vec<String> = Vec::new();
-    // Bounded: each turn takes a header or a key's line, and every one moves on.
-    loop {
-        r.blank();
-        match r.peek() {
-            None => return Ok(root),
-            Some(b'[') => {
-                let line = r.line;
-                let array = r.peek_at(1) == Some(b'[');
-                r.at += if array { 2 } else { 1 };
-                let path = r.key()?;
-                r.spaces();
-                r.expect(b']', "`]` closing a table's header")?;
-                if array {
-                    r.expect(b']', "`]]` closing the header of an array of tables")?;
-                }
-                define(&mut root, &path, array, line).map_err(|what| r.err_at(line, what))?;
-                current = path;
-                r.end_of_line()?;
-            }
-            Some(_) => {
-                let line = r.line;
-                let key = r.key()?;
-                r.spaces();
-                r.expect(b'=', "`=` after a key")?;
-                r.spaces();
-                let value = r.value()?;
-                let table = walk(&mut root, &current, line).map_err(|what| r.err_at(line, what))?;
-                put(table, &key, line, value).map_err(|what| r.err_at(line, what))?;
-                r.end_of_line()?;
-            }
-        }
-    }
+/// The line (from 1) a key, table or value of a document starts at.
+fn line_of(item: Node<'_, '_>) -> usize {
+    item.line_col().0
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -697,8 +164,8 @@ impl fmt::Display for Place {
 /// The graph could not be read: what and where.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum DepsError {
-    /// A manifest or the lock read wrong.
-    Toml(TomlError),
+    /// A manifest or the lock is not TOML: the file, line and column, and what is wrong there.
+    Toml { at: Place, col: usize, what: toml::What },
     /// A file the graph needs is not there: which, and what it is.
     Missing { path: String, what: String },
     /// A file could not be read: which, and the system's reason.
@@ -730,7 +197,7 @@ enum DepsError {
 impl fmt::Display for DepsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DepsError::Toml(e) => write!(f, "{e}"),
+            DepsError::Toml { at, col, what } => write!(f, "{at}:{col}: {what}"),
             DepsError::Missing { path, what } => write!(f, "{path}, {what}, is not there"),
             DepsError::Unreadable { path, why } => write!(f, "{path} could not be read: {why}"),
             DepsError::Shape { at, key, want } => write!(f, "{at}: `{key}` is not {want}"),
@@ -895,41 +362,41 @@ fn manifest_path(dir: &str) -> String {
     if dir.is_empty() { ROOT.to_owned() } else { format!("{dir}/Cargo.toml") }
 }
 
-fn get_str(table: &Table, key: &str, file: &str) -> Result<Option<String>, DepsError> {
-    match table.entries.get(key) {
-        None => Ok(None),
-        Some((_, Toml::Str(it))) => Ok(Some(it.clone())),
-        Some((line, _)) => Err(DepsError::Shape { at: Place { file: file.to_owned(), line: *line }, key: key.to_owned(), want: "a string" }),
-    }
+/// The key `key` of `table` is not `want`: refused at its line.
+fn shape(item: Node<'_, '_>, key: &str, file: &str, want: &'static str) -> DepsError {
+    DepsError::Shape { at: Place { file: file.to_owned(), line: line_of(item) }, key: key.to_owned(), want }
 }
 
-fn get_bool(table: &Table, key: &str, file: &str) -> Result<Option<bool>, DepsError> {
-    match table.entries.get(key) {
-        None => Ok(None),
-        Some((_, Toml::Bool(it))) => Ok(Some(*it)),
-        Some((line, _)) => Err(DepsError::Shape { at: Place { file: file.to_owned(), line: *line }, key: key.to_owned(), want: "a boolean" }),
-    }
+fn get_str(table: Node<'_, '_>, key: &str, file: &str) -> Result<Option<String>, DepsError> {
+    let Some(item) = table.get(key) else { return Ok(None) };
+    item.as_str().map(|it| Some(it.to_owned())).ok_or_else(|| shape(item, key, file, "a string"))
 }
 
-fn get_table<'t>(table: &'t Table, key: &str, file: &str) -> Result<Option<&'t Table>, DepsError> {
-    match table.entries.get(key) {
+fn get_bool(table: Node<'_, '_>, key: &str, file: &str) -> Result<Option<bool>, DepsError> {
+    let Some(item) = table.get(key) else { return Ok(None) };
+    item.as_bool().map(Some).ok_or_else(|| shape(item, key, file, "a boolean"))
+}
+
+fn get_table<'d, 't>(table: Node<'d, 't>, key: &str, file: &str) -> Result<Option<Node<'d, 't>>, DepsError> {
+    match table.get(key) {
         None => Ok(None),
-        Some((_, Toml::Table(it))) => Ok(Some(it)),
-        Some((line, _)) => Err(DepsError::Shape { at: Place { file: file.to_owned(), line: *line }, key: key.to_owned(), want: "a table" }),
+        Some(item) if item.is_table() => Ok(Some(item)),
+        Some(item) => Err(shape(item, key, file, "a table")),
     }
 }
 
 /// An array of strings, with the line of its key.
-fn get_strs(table: &Table, key: &str, file: &str) -> Result<Option<(usize, Vec<String>)>, DepsError> {
-    let Some((line, value)) = table.entries.get(key) else { return Ok(None) };
-    let shape = || DepsError::Shape { at: Place { file: file.to_owned(), line: *line }, key: key.to_owned(), want: "an array of strings" };
-    let Toml::Array(items) = value else { return Err(shape()) };
-    let mut out = Vec::new();
-    for item in items {
-        let Toml::Str(it) = item else { return Err(shape()) };
-        out.push(it.clone());
+fn get_strs(table: Node<'_, '_>, key: &str, file: &str) -> Result<Option<(usize, Vec<String>)>, DepsError> {
+    let Some(item) = table.get(key) else { return Ok(None) };
+    let refused = || shape(item, key, file, "an array of strings");
+    if !item.is_array() {
+        return Err(refused());
     }
-    Ok(Some((*line, out)))
+    let mut out = Vec::new();
+    for it in item.children() {
+        out.push(it.as_str().ok_or_else(refused)?.to_owned());
+    }
+    Ok(Some((line_of(item), out)))
 }
 
 /// Which table names a dependency.
@@ -969,22 +436,23 @@ struct Dep {
 
 /// The dependency `key = value` at `at` of a manifest in `dir`; `root_deps` the root's
 /// `[workspace.dependencies]`, which `workspace = true` reads (its paths from the root).
-fn dep_of(key: &str, value: &Toml, kind: DepKind, at: &Place, dir: &str, root_deps: &Table) -> Result<Dep, DepsError> {
+fn dep_of(key: &str, value: Node<'_, '_>, kind: DepKind, at: &Place, dir: &str, root_deps: Option<Node<'_, '_>>) -> Result<Dep, DepsError> {
     let mut dep = Dep { key: key.to_owned(), package: key.to_owned(), path: None, version: None, optional: false, kind, at: at.clone() };
     let shape = |want: &'static str| DepsError::Shape { at: at.clone(), key: key.to_owned(), want };
     let file = at.file.as_str();
-    match value {
-        Toml::Str(version) => dep.version = Some(version.clone()),
-        Toml::Table(table) => {
+    match value.as_str() {
+        Some(version) => dep.version = Some(version.to_owned()),
+        None if value.is_table() => {
+            let table = value;
             dep.optional = get_bool(table, "optional", file)?.unwrap_or(false);
             if get_bool(table, "workspace", file)? == Some(true) {
-                if ["package", "path", "version", "git"].iter().any(|it| table.entries.contains_key(*it)) {
+                if ["package", "path", "version", "git"].iter().any(|it| table.get(it).is_some()) {
                     return Err(shape("`workspace = true` with no `package`, `path`, `version` or `git` of its own"));
                 }
-                let Some((_, inherited)) = root_deps.entries.get(key) else {
+                let Some(inherited) = root_deps.and_then(|it| it.get(key)) else {
                     return Err(DepsError::NoWorkspaceDep { at: at.clone(), key: key.to_owned() });
                 };
-                let from_root = dep_of(key, inherited, kind, at, "", &Table::default())?;
+                let from_root = dep_of(key, inherited, kind, at, "", None)?;
                 dep.package = from_root.package;
                 dep.path = from_root.path;
                 dep.version = from_root.version;
@@ -999,24 +467,24 @@ fn dep_of(key: &str, value: &Toml, kind: DepKind, at: &Place, dir: &str, root_de
                 }
             }
         }
-        _ => return Err(shape("a version string or a table")),
+        None => return Err(shape("a version string or a table")),
     }
     Ok(dep)
 }
 
 /// Every dependency the manifest `table` (the file `file`, in `dir`) names, in line order.
-fn deps_of(file: &str, dir: &str, table: &Table, root_deps: &Table) -> Result<Vec<Dep>, DepsError> {
-    let mut tables: Vec<(&Table, DepKind)> = Vec::new();
+fn deps_of(file: &str, dir: &str, table: Node<'_, '_>, root_deps: Option<Node<'_, '_>>) -> Result<Vec<Dep>, DepsError> {
+    let mut tables: Vec<(Node<'_, '_>, DepKind)> = Vec::new();
     for (name, kind) in DEP_TABLES {
         if let Some(it) = get_table(table, name, file)? {
             tables.push((it, kind));
         }
     }
     if let Some(targets) = get_table(table, "target", file)? {
-        for (cfg, (line, value)) in &targets.entries {
-            let Toml::Table(target) = value else {
-                return Err(DepsError::Shape { at: Place { file: file.to_owned(), line: *line }, key: format!("target.{cfg}"), want: "a table" });
-            };
+        for target in targets.children() {
+            if !target.is_table() {
+                return Err(shape(target, &format!("target.{}", target.key()), file, "a table"));
+            }
             for (name, kind) in DEP_TABLES {
                 if let Some(it) = get_table(target, name, file)? {
                     tables.push((it, kind));
@@ -1026,8 +494,8 @@ fn deps_of(file: &str, dir: &str, table: &Table, root_deps: &Table) -> Result<Ve
     }
     let mut out = Vec::new();
     for (deps, kind) in tables {
-        for (key, (line, value)) in &deps.entries {
-            out.push(dep_of(key, value, kind, &Place { file: file.to_owned(), line: *line }, dir, root_deps)?);
+        for value in deps.children() {
+            out.push(dep_of(value.key(), value, kind, &Place { file: file.to_owned(), line: line_of(value) }, dir, root_deps)?);
         }
     }
     out.sort_by(|a, b| a.at.cmp(&b.at));
@@ -1048,7 +516,7 @@ struct Manifest {
 }
 
 /// Whether the `[package]` table `package` says `[package.metadata.blaze] ours = true`.
-fn fork_is_ours(package: &Table, file: &str) -> Result<bool, DepsError> {
+fn fork_is_ours(package: Node<'_, '_>, file: &str) -> Result<bool, DepsError> {
     let Some(metadata) = get_table(package, "metadata", file)? else { return Ok(false) };
     let Some(blaze) = get_table(metadata, "blaze", file)? else { return Ok(false) };
     Ok(get_bool(blaze, OURS, file)? == Some(true))
@@ -1058,12 +526,12 @@ fn fork_is_ours(package: &Table, file: &str) -> Result<bool, DepsError> {
 /// members, and what their `path` dependencies and the root's `[patch]`es reach.
 fn workspace(tree: &dyn Tree) -> Result<BTreeMap<String, Manifest>, DepsError> {
     let Some(text) = tree.read(ROOT)? else { return Err(DepsError::Missing { path: ROOT.to_owned(), what: "the root manifest".to_owned() }) };
-    let root = parse_toml(ROOT, &text).map_err(DepsError::Toml)?;
-    let Some(ws) = get_table(&root, "workspace", ROOT)? else {
+    let root_doc = read_toml(ROOT, &text)?;
+    let root = root_doc.root();
+    let Some(ws) = get_table(root, "workspace", ROOT)? else {
         return Err(DepsError::Shape { at: Place { file: ROOT.to_owned(), line: 1 }, key: "workspace".to_owned(), want: "a table: the root is no workspace" });
     };
-    let empty = Table::default();
-    let root_deps = get_table(ws, "dependencies", ROOT)?.unwrap_or(&empty);
+    let root_deps = get_table(ws, "dependencies", ROOT)?;
     let excluded: BTreeSet<String> = get_strs(ws, "exclude", ROOT)?
         .map_or_else(Vec::new, |(_, them)| them)
         .iter()
@@ -1071,7 +539,7 @@ fn workspace(tree: &dyn Tree) -> Result<BTreeMap<String, Manifest>, DepsError> {
         .collect();
     let globbed = |text: &str| text.contains(|c: char| matches!(c, '*' | '?' | '[' | ']'));
     let mut members: BTreeSet<String> = BTreeSet::new();
-    if root.entries.contains_key("package") {
+    if root.get("package").is_some() {
         members.insert(String::new());
     }
     if let Some((line, patterns)) = get_strs(ws, "members", ROOT)? {
@@ -1092,14 +560,14 @@ fn workspace(tree: &dyn Tree) -> Result<BTreeMap<String, Manifest>, DepsError> {
     }
     // Each directory to read, and the line that named it (none for a member).
     let mut todo: Vec<(String, Option<Place>)> = members.iter().rev().map(|dir| (dir.clone(), None)).collect();
-    if let Some(patches) = get_table(&root, "patch", ROOT)? {
-        for (source, (line, value)) in &patches.entries {
-            let Toml::Table(patch) = value else {
-                return Err(DepsError::Shape { at: Place { file: ROOT.to_owned(), line: *line }, key: format!("patch.{source}"), want: "a table" });
-            };
-            for (name, (line, value)) in &patch.entries {
-                let at = Place { file: ROOT.to_owned(), line: *line };
-                if let Some(path) = dep_of(name, value, DepKind::Normal, &at, "", &empty)?.path {
+    if let Some(patches) = get_table(root, "patch", ROOT)? {
+        for patch in patches.children() {
+            if !patch.is_table() {
+                return Err(shape(patch, &format!("patch.{}", patch.key()), ROOT, "a table"));
+            }
+            for value in patch.children() {
+                let at = Place { file: ROOT.to_owned(), line: line_of(value) };
+                if let Some(path) = dep_of(value.key(), value, DepKind::Normal, &at, "", None)?.path {
                     todo.push((path, Some(at)));
                 }
             }
@@ -1936,9 +1404,7 @@ fn refused(edits: &[(&str, &str, &str)]) -> Option<DepsError> {
 }
 
 /// What the TOML `text` is refused with: its line and what.
-fn toml_refused(text: &str) -> Option<(usize, TomlWhat)> {
-    parse_toml("t.toml", text).err().map(|e| (e.line, e.what))
-}
+
 
 fn selftest() {
     // The TOML subset: what it reads.

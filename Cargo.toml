@@ -442,8 +442,6 @@ rustc_next_trait_solver = { path = "vendor/rustc_next_trait_solver", version = "
 la-arena = { version = "0.3.1" }
 
 # non-local crates
-# `blaze_usercode::roots`' one-pass scan of a run's written files for every spelling of its roots.
-aho-corasick = "1.1.5"
 anyhow = "1.0.104"
 bitflags = "2.13.2"
 # Official BLAKE3: the reference blaze-blake3 (`blaze_ids::b3`) is tested and benched against,
@@ -633,7 +631,6 @@ astlog-engine = { path = "tools/astlog/engine" }
 error-chain = { path = "tools/astlog/error-chain" }
 clap = "4.6.7"
 ignore = "0.4.33"
-regex = { version = "1.13.1", default-features = false, features = ["perf", "std", "unicode-perl"] }
 similar = "3.2.1"
 snafu = "0.8.9"
 tree-sitter = "0.26.13"

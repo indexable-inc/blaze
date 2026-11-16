@@ -58,15 +58,48 @@
 //! ([`Layout::workers`]) narrowed by the scope's budget ([`Scope::narrow_workers`]: a test
 //! runner narrowed to one thread proves code against the one-thread executor).
 //!
-//! **Layout.** S1 runs the `Inline` layout ([`LAYOUT`]), which has one worker: the simulation's
-//! executor and every narrowed test runner's. [`Scope::may_overlap`] runs its task to
-//! completion before it returns, in spawn order, so nothing else runs while a task waits, and
-//! [`Scope::must_overlap`] always returns [`NoParallelism`] `{ needed: 2, have: 1 }`. A layout
-//! with more than one worker (`Threads`, `Fibers`, `Frames`) runs a `must_overlap` task beside
-//! its spawner; none is built yet, since a task's context is made on its spawner's thread and
-//! is not `Send` (std.md, "Tasks and waiting").
+//! **Layout** (std.md, "Layouts"), chosen by the root a context comes from:
+//!
+//! - `Inline` ([`LAYOUT`]), a root made by `Io::cx` (the simulation's, a test's): one worker.
+//!   [`Scope::may_overlap`] runs its task to completion before it returns, in spawn order, so
+//!   nothing else runs while a task waits, and [`Scope::must_overlap`] always returns
+//!   [`NoParallelism`] `{ needed: 2, have: 1 }`.
+//! - `Threads` (task/threads.rs), the root `crate::entry::run` gives `main`: a thread-per-core
+//!   pool. A `may_overlap` task is queued on the spawner's worker (or an injection queue from
+//!   outside the pool) and taken by whichever worker starts it, which keeps it to its end; a
+//!   full queue, or a scope narrowed to one worker, runs it inline as under `Inline`. Its
+//!   joiner runs it itself if no worker started it. A `must_overlap` task is handed to a worker
+//!   that is idle now; with none, it is refused as under `Inline`. A task's context crosses to
+//!   its worker as a `Seed` (crate::cx), so both spawns take `Send` closures and results in
+//!   every layout: code proven under `Inline` runs unchanged on the pool.
+//!
+//! A scope's failure is the failure of its lowest spawn index under both, the one `Inline`
+//! meets first, so a scope fails the same whatever ran first.
+//!
+//! **A scope never ends while a task of it runs.** Its tasks borrow from its frame (as
+//! `std::thread::scope`'s do), so under `Threads` [`Task::join`] waits for a started task,
+//! until the context's deadline and then [`crate::io::Limits::abandon_wait`] more with the
+//! scope cancelled; a task still running then is a hang (rule 18), and the process stops,
+//! naming it, rather than free what it borrows.
 
-use alloc::{borrow::ToOwned, string::{String, ToString}};
+mod deque;
+mod idle;
+#[expect(unsafe_code, reason = "per-worker slots handed to the worker that owns them: each `unsafe` states why")]
+mod per_worker;
+#[expect(unsafe_code, reason = "type-erased tasks shared with the pool's workers: each `unsafe` states its invariant")]
+pub(crate) mod threads;
+#[cfg(all(test, not(blaze_check)))]
+mod tests;
+
+pub use per_worker::{Exclusive, NotAWorker, PerWorker, Racy, Shared};
+pub use threads::{Class, Hung, Stuck};
+
+use alloc::{
+    alloc::Global,
+    borrow::ToOwned,
+    boxed::Box as Payload,
+    string::{String, ToString},
+};
 use core::{
     any::Any,
     cell::{Cell, RefCell},
@@ -76,22 +109,27 @@ use core::{
     panic::AssertUnwindSafe,
 };
 
-use blaze_core::wait::Deadline;
+use blaze_core::wait::{Clock, Deadline};
 use blaze_mem::Frame;
+use blaze_own::Arc;
 
 use crate::{
     Plant, Stopped,
-    rt::{catch_unwind, resume_unwind},
-    cx::Cx,
+    cx::{Cx, Here},
     host::Exit,
+    rt::{catch_unwind, resume_unwind},
     unfinished::Unfinished,
 };
+use threads::{Full, Pool, Queued, Ran, Tally};
 
 /// How a waiting task's frames are stored (std.md, "Layouts").
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Layout {
     /// A task runs to completion at its spawn; nothing else runs while it waits.
     Inline,
+    /// A thread-per-core pool of `workers` (task/threads.rs): a task runs on one worker, from
+    /// its start to its end, and blocks that worker's thread while it waits.
+    Threads { workers: u32 },
 }
 
 impl Layout {
@@ -103,11 +141,12 @@ impl Layout {
     pub const fn workers(self) -> u32 {
         match self {
             Layout::Inline => 1,
+            Layout::Threads { workers } => workers,
         }
     }
 }
 
-/// This build's layout.
+/// The layout of a context with no pool: a root made by `Io::cx`, and the simulation's.
 pub const LAYOUT: Layout = Layout::Inline;
 
 /// [`Scope::must_overlap`] was asked for a task that must run at the same time as its spawner,
@@ -198,8 +237,16 @@ pub enum Settled {
 /// What a scope keeps of its tasks while they run, and its abandonment path.
 struct Live {
     cx: Cx,
+    /// The first failure, under `Inline`.
     failed: RefCell<Option<TaskError>>,
-    /// Tasks spawned and not yet ended.
+    /// What the scope shares with the workers that run its tasks: under `Threads` only. One
+    /// `Arc` per scope, in `Global`: it outlives no task of the scope but is shared by them.
+    shared: Option<Arc<Tally, Global>>,
+    /// The scope's class: what its tasks and the scopes in them are queued as.
+    class: Cell<threads::Class>,
+    /// The layout its context gave it.
+    layout: Layout,
+    /// Tasks run inline and not yet ended (under `Threads`, those queued are its tally's).
     running: Cell<usize>,
     /// The task spawned last: who an [`TaskWhy::Unended`] names.
     last: Cell<&'static str>,

@@ -22,6 +22,7 @@
 #![feature(allocator_api)]
 
 mod dependency;
+mod error;
 mod graph;
 pub mod lockfile;
 pub mod metadata;
@@ -29,6 +30,7 @@ mod names;
 mod package_id;
 mod package_id_spec;
 mod persistent;
+mod platform;
 mod poll;
 mod registry;
 mod resolve;
@@ -55,6 +57,7 @@ pub use resolve::{LockfileMetadata, Resolve, ResolveVersion};
 pub use summary::{
     FeatureDep, FeatureMap, FeatureValue, MissingDependencyError, Summary, build_feature_map,
 };
-pub use version::{OptVersionReq, PartialVersion, RustVersion};
+pub use version::{OptVersionReq, PartialVersion, RustVersion, Version, VersionReq};
 
-pub use cargo_platform::{Cfg, Platform};
+pub use error::{PartialWhy, ResolveError};
+pub use platform::{Cfg, CfgError, CfgExpr, CfgWhat, Ident, Platform};

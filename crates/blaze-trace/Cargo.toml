@@ -15,3 +15,8 @@ doctest = false
 
 [lints]
 workspace = true
+
+# Only for examples/cost.rs, the comparison with the crate this one replaces; removed once its
+# numbers are in docs/profiling.md.
+[dev-dependencies]
+tracing = { version = "0.1.44", default-features = false, features = ["std"] }

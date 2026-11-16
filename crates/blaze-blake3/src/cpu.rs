@@ -135,13 +135,21 @@ fn find() -> u8 {
     if getauxval(AT_HWCAP) & HWCAP_CRC32 != 0 { Feature::Crc.bit() } else { 0 }
 }
 
-#[cfg(all(target_arch = "aarch64", not(target_os = "linux")))]
+#[cfg(all(target_arch = "aarch64", not(target_os = "linux"), not(miri)))]
 fn find() -> u8 {
     // Apple's cores, the only other aarch64 host, all have CRC32 (Armv8.1 and later).
     if cfg!(target_vendor = "apple") { Feature::Crc.bit() } else { 0 }
 }
 
-#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+#[cfg(all(not(any(target_arch = "x86_64", target_arch = "aarch64")), not(miri)))]
+fn find() -> u8 {
+    0
+}
+
+/// Under Miri, which runs neither CPUID nor `getauxval`: only what the build enables, so a
+/// SIMD path runs under Miri when the build enables its feature (`RUSTFLAGS="-C
+/// target-feature=+avx2"`), and the scalar path otherwise.
+#[cfg(miri)]
 fn find() -> u8 {
     0
 }

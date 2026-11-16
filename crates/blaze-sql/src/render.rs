@@ -622,7 +622,8 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
                             | ExprKind::Like { .. }
                             | ExprKind::Case { .. }
                             | ExprKind::Cast { .. }
-                            | ExprKind::Call { .. } => {
+                            | ExprKind::Call { .. }
+                            | ExprKind::Analytic(_) => {
                                 return Err(RenderError::Inconsistent { span: expr.span });
                             }
                         },
@@ -748,7 +749,8 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
             | ExprKind::InList { .. }
             | ExprKind::InParam { .. }
             | ExprKind::Between { .. }
-            | ExprKind::Like { .. } => false,
+            | ExprKind::Like { .. }
+            | ExprKind::Analytic(_) => false,
         };
         if single {
             self.expr(e)
@@ -979,6 +981,8 @@ impl<'s, B: Allocator + Copy> Writer<'_, 's, B> {
             ExprKind::Call { function, args: args @ (CallArgs::Star | CallArgs::List { .. }) } => {
                 self.call(function, args, e.span)?
             }
+            // Only a `Checked` statement renders, and the checker refuses this form.
+            ExprKind::Analytic(_) => return Err(RenderError::Inconsistent { span: e.span }),
         }
         Ok(())
     }

@@ -2,10 +2,35 @@
 //! versions of `rust-version` and package id specs (`cargo-util-schemas`'
 //! `core/partial_version.rs` and `manifest/rust_version.rs`), of cargo 1.99.0 (5f94df4789).
 
+use std::alloc::Global;
 use std::fmt;
 
-use anyhow::{Result, bail};
-use semver::{Comparator, Op, Version, VersionReq};
+use blaze_semver::{BuildMetadata, Comparator, Limits, Op, Prerelease};
+
+use crate::error::{PartialWhy, ResolveError};
+
+/// A package's version. Pre-release and build metadata past blaze-semver's inline size live in
+/// the process allocator: a version is kept as long as the package ids interned with it.
+pub type Version = blaze_semver::Version<Global>;
+
+/// A dependency's version requirement, its comparators in the process allocator, as long as
+/// the dependency that holds it.
+pub type VersionReq = blaze_semver::VersionReq<Global>;
+
+/// `text` as a version, by cargo's limits.
+pub fn parse_version(text: &str) -> Result<Version, blaze_semver::Error> {
+    Version::parse_in(text, Limits::CARGO, Global)
+}
+
+/// `text` as a version requirement, by cargo's limits.
+pub fn parse_req(text: &str) -> Result<VersionReq, blaze_semver::Error> {
+    VersionReq::parse_in(text, Limits::CARGO, Global)
+}
+
+/// `*`: any release.
+pub fn star() -> VersionReq {
+    VersionReq::star_in(Global)
+}
 
 /// A dependency's version requirement, and what a lock file or `cargo update --precise` pinned
 /// it to.
@@ -21,15 +46,14 @@ pub enum OptVersionReq {
 }
 
 pub(crate) fn to_req(version: &Version, op: Op) -> VersionReq {
-    VersionReq {
-        comparators: vec![Comparator {
-            op,
-            major: version.major,
-            minor: Some(version.minor),
-            patch: Some(version.patch),
-            pre: version.pre.clone(),
-        }],
-    }
+    let comparator = Comparator {
+        op,
+        major: version.major,
+        minor: Some(version.minor),
+        patch: Some(version.patch),
+        pre: version.pre.clone(),
+    };
+    VersionReq { comparators: blaze_own::Vec::from_array_in([comparator], Global) }
 }
 
 impl OptVersionReq {
@@ -60,7 +84,7 @@ impl OptVersionReq {
         assert!(self.matches(version), "cannot lock {} to {}", self, version);
         let version = version.clone();
         *self = match self {
-            OptVersionReq::Any => OptVersionReq::Locked(version, VersionReq::STAR),
+            OptVersionReq::Any => OptVersionReq::Locked(version, star()),
             OptVersionReq::Req(req)
             | OptVersionReq::Locked(_, req)
             | OptVersionReq::Precise(_, req) => OptVersionReq::Locked(version, req.clone()),
@@ -70,7 +94,7 @@ impl OptVersionReq {
     pub fn precise_to(&mut self, version: &Version) {
         let version = version.clone();
         *self = match self {
-            OptVersionReq::Any => OptVersionReq::Precise(version, VersionReq::STAR),
+            OptVersionReq::Any => OptVersionReq::Precise(version, star()),
             OptVersionReq::Req(req)
             | OptVersionReq::Locked(_, req)
             | OptVersionReq::Precise(_, req) => OptVersionReq::Precise(version, req.clone()),
@@ -141,8 +165,8 @@ pub struct PartialVersion {
     pub major: u64,
     pub minor: Option<u64>,
     pub patch: Option<u64>,
-    pub pre: Option<semver::Prerelease>,
-    pub build: Option<semver::BuildMetadata>,
+    pub pre: Option<Prerelease<Global>>,
+    pub build: Option<BuildMetadata<Global>>,
 }
 
 impl PartialVersion {
@@ -151,21 +175,20 @@ impl PartialVersion {
             major: self.major,
             minor: self.minor?,
             patch: self.patch?,
-            pre: self.pre.clone().unwrap_or_default(),
-            build: self.build.clone().unwrap_or_default(),
+            pre: self.pre.clone().unwrap_or(Prerelease::EMPTY),
+            build: self.build.clone().unwrap_or(BuildMetadata::EMPTY),
         })
     }
 
     pub fn to_caret_req(&self) -> VersionReq {
-        VersionReq {
-            comparators: vec![Comparator {
-                op: Op::Caret,
-                major: self.major,
-                minor: self.minor,
-                patch: self.patch,
-                pre: self.pre.clone().unwrap_or_default(),
-            }],
-        }
+        let comparator = Comparator {
+            op: Op::Caret,
+            major: self.major,
+            minor: self.minor,
+            patch: self.patch,
+            pre: self.pre.clone().unwrap_or(Prerelease::EMPTY),
+        };
+        VersionReq { comparators: blaze_own::Vec::from_array_in([comparator], Global) }
     }
 
     /// Whether `version` is this one, build metadata included where this has some. A

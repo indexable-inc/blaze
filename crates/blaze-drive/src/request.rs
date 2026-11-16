@@ -1948,6 +1948,9 @@ impl<A: Allocator + Clone> Request<A> {
                 cycle.push(*name);
             }
         }
+        // The group's name hashes its members: in name order, not the table's (rule 25).
+        // One scan per quiet point with jobs left, not per event.
+        cycle.sort_unstable();
         if cycle.iter().all(|name| name.kind == Kind::ModuleScope) {
             let mut h = Hasher::new(GROUP_DOMAIN);
             for member in cycle.iter() {
@@ -2015,20 +2018,20 @@ impl<A: Allocator + Clone> Request<A> {
         let rows = (old_rows + added).saturating_sub(removed);
         let bits = answers::bits_for(rows);
         let old_bits = self.root.as_ref().map(|root| root.bits);
-        let mut wanted = SortedSet::new_in(a.clone());
+        // Page indices collected, then sorted once (an insert into a sorted set per name would
+        // shift: O(names x pages)).
+        let mut wanted = Vec::new_in(a.clone());
         match old_bits {
-            Some(old_bits) if old_bits != bits => {
-                for index in 0..(1u32 << old_bits) {
-                    wanted.insert(index);
-                }
-            }
+            Some(old_bits) if old_bits != bits => wanted.extend(0..(1u32 << old_bits)),
             Some(old_bits) => {
                 for name in self.new.keys().chain(self.dropped.iter()).chain(updates.iter().map(|(t, _, _)| t)) {
-                    wanted.insert(answers::page_of(*name, old_bits));
+                    wanted.push(answers::page_of(*name, old_bits));
                 }
             }
             None => {}
         }
+        wanted.sort_unstable();
+        wanted.dedup();
         let mut requests = Vec::new_in(a.clone());
         if let Some(root) = &self.root {
             for index in wanted.iter() {
@@ -2050,38 +2053,69 @@ impl<A: Allocator + Clone> Request<A> {
         if loading {
             return Ok(());
         }
-        // Apply the reverse index's updates.
-        for (target, reader, add) in updates.iter() {
-            if self.dropped.contains(target) {
+        // Apply the reverse index's updates: sorted by target once, then each target's readers
+        // rebuilt in one merge, so a name read by r readers costs O(r + its updates), never an
+        // insert per update.
+        updates.sort_unstable();
+        let mut at = 0;
+        while at < updates.len() {
+            let target = updates[at].0;
+            let end = at + updates[at..].iter().take_while(|(t, _, _)| *t == target).count();
+            let group = &updates[at..end];
+            at = end;
+            if self.dropped.contains(&target) {
                 continue;
             }
-            if !self.new.contains_key(target) {
-                let Some(old) = self.old(*target).cloned() else { continue };
-                self.new.insert(*target, old);
+            if !self.new.contains_key(&target) {
+                let Some(old) = self.old(target).cloned() else { continue };
+                self.new.insert(target, old);
             }
-            let row = self.new.get_mut(target).expect("inserted above");
-            match (*add, row.readers.binary_search(reader)) {
-                (true, Err(at)) => row.readers.insert(at, *reader),
-                (false, Ok(at)) => {
-                    row.readers.remove(at);
+            let row = self.new.get_mut(&target).expect("inserted above");
+            let mut readers = Vec::with_capacity_in(row.readers.len() + group.len(), a.clone());
+            let (mut i, mut j) = (0, 0);
+            while i < row.readers.len() || j < group.len() {
+                let held = row.readers.get(i).copied();
+                let update = group.get(j).map(|(_, reader, add)| (*reader, *add));
+                match (held, update) {
+                    (Some(h), Some((u, add))) if u == h => {
+                        // Removed, or added again: an add keeps it once.
+                        if add {
+                            readers.push(h);
+                        }
+                        i += 1;
+                        j += 1;
+                    }
+                    (Some(h), Some((u, _))) if h < u => {
+                        readers.push(h);
+                        i += 1;
+                    }
+                    (Some(h), None) => {
+                        readers.push(h);
+                        i += 1;
+                    }
+                    (_, Some((u, add))) => {
+                        if add && readers.last() != Some(&u) {
+                            readers.push(u);
+                        }
+                        j += 1;
+                    }
+                    (None, None) => break,
                 }
-                _ => {}
             }
+            row.readers = readers;
         }
         // The touched pages, rewritten whole, and the root.
-        let mut touched = SortedSet::new_in(a.clone());
+        let mut touched = Vec::new_in(a.clone());
         match old_bits {
             Some(old_bits) if old_bits == bits => {
                 for name in self.new.keys().chain(self.dropped.iter()) {
-                    touched.insert(answers::page_of(*name, bits));
+                    touched.push(answers::page_of(*name, bits));
                 }
             }
-            _ => {
-                for index in 0..(1u32 << bits) {
-                    touched.insert(index);
-                }
-            }
+            _ => touched.extend(0..(1u32 << bits)),
         }
+        touched.sort_unstable();
+        touched.dedup();
         let mut page_keys = match (&self.root, old_bits) {
             (Some(root), Some(old_bits)) if old_bits == bits => root.pages.clone(),
             _ => {
@@ -2090,22 +2124,41 @@ impl<A: Allocator + Clone> Request<A> {
                 keys
             }
         };
-        for index in touched.iter() {
-            let mut page: Page<A> = SortedMap::new_in(a.clone());
-            for state in self.pages.values() {
-                if let PageState::Loaded(old) = state {
-                    for (name, row) in old.iter() {
-                        if answers::page_of(*name, bits) == *index && !self.dropped.contains(name) && !self.new.contains_key(name) {
-                            page.insert(*name, row.clone());
-                        }
+        // Every row of a touched page, bucketed by page once: O(rows), not pages x rows.
+        let mut buckets: Table<u32, Vec<(Name, Row<A>), A>, A> = Table::new_in(a.clone());
+        let bucket = |buckets: &mut Table<u32, Vec<(Name, Row<A>), A>, A>, name: Name, row: &Row<A>| {
+            let index = answers::page_of(name, bits);
+            if touched.binary_search(&index).is_err() {
+                return;
+            }
+            match buckets.get_mut(&index) {
+                Some(list) => list.push((name, row.clone())),
+                None => {
+                    let mut list = Vec::new_in(a.clone());
+                    list.push((name, row.clone()));
+                    buckets.insert(index, list);
+                }
+            }
+        };
+        for state in self.pages.values() {
+            if let PageState::Loaded(old) = state {
+                for (name, row) in old.iter() {
+                    if !self.dropped.contains(name) && !self.new.contains_key(name) {
+                        bucket(&mut buckets, *name, row);
                     }
                 }
             }
-            for (name, row) in self.new.iter() {
-                if answers::page_of(*name, bits) == *index && !self.dropped.contains(name) {
-                    page.insert(*name, row.clone());
-                }
+        }
+        for (name, row) in self.new.iter() {
+            if !self.dropped.contains(name) {
+                bucket(&mut buckets, *name, row);
             }
+        }
+        for index in touched.iter() {
+            let mut rows = buckets.remove(index).unwrap_or_else(|| Vec::new_in(a.clone()));
+            rows.sort_unstable_by_key(|(name, _)| *name);
+            rows.dedup_by_key(|(name, _)| *name);
+            let page: Page<A> = SortedMap::from_sorted(rows).expect("sorted and deduplicated above");
             let key = match page.is_empty() {
                 true => Key::default(),
                 false => {
@@ -2124,12 +2177,36 @@ impl<A: Allocator + Clone> Request<A> {
         self.put(root_key, root_bytes, out);
 
         // The findings: this run's records over the last certificate's, less what went.
-        let mut all = core::mem::replace(&mut self.old_findings, SortedMap::new_in(a.clone()));
-        let made = core::mem::replace(&mut self.findings, SortedMap::new_in(a.clone()));
-        for (name, held) in made.into_iter() {
-            all.insert(name, held);
+        // Merged in one pass: this run's, sorted once, over the last certificate's (sorted).
+        let old = core::mem::replace(&mut self.old_findings, SortedMap::new_in(a.clone()));
+        let mut made = Vec::with_capacity_in(self.findings.len(), a.clone());
+        made.extend(self.findings.take_all());
+        made.sort_unstable_by_key(|(name, _)| *name);
+        let mut merged = Vec::with_capacity_in(old.len() + made.len(), a.clone());
+        let mut old = old.into_iter().peekable();
+        let mut made = made.into_iter().peekable();
+        loop {
+            let take_made = match (old.peek(), made.peek()) {
+                (Some((o, _)), Some((m, _))) => m <= o,
+                (None, Some(_)) => true,
+                (Some(_), None) => false,
+                (None, None) => break,
+            };
+            let (name, held) = match take_made {
+                true => {
+                    let entry = made.next().expect("peeked");
+                    if old.peek().is_some_and(|(o, _)| *o == entry.0) {
+                        old.next();
+                    }
+                    entry
+                }
+                false => old.next().expect("peeked"),
+            };
+            if !held.findings.is_empty() && !self.dropped.contains(&name) {
+                merged.push((name, held));
+            }
         }
-        all.retain(|name, held| !held.findings.is_empty() && !self.dropped.contains(name));
+        let all = SortedMap::from_sorted(merged).expect("merged in name order, one entry a name");
         for (name, job) in self.jobs.iter() {
             if name.kind == Kind::Test {
                 match self.new.get(name).is_some_and(|row| Some(row.key) == Some(job.key)) && job.entries > 0 {

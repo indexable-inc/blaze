@@ -169,7 +169,7 @@ impl Unit for MixedUnit {
     const ZERO: Result<MixedUnit, EscapeError> = Err(EscapeError::NulInCStr);
 
     fn ascii(byte: NonZero<u8>) -> MixedUnit {
-        MixedUnit::Char(NonZero::<char>::from(byte))
+        MixedUnit::Char(NonZero::new(char::from(byte.get())).expect("a byte that is not zero is a char that is not"))
     }
 
     fn char(c: char) -> Result<MixedUnit, EscapeError> {
