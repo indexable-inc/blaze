@@ -137,8 +137,6 @@ impl Image {
     /// of its file the commit overwrites: what a failed file commit puts back.
     pub(crate) fn take(&mut self, state: State, full: bool, undo: Vec<(u64, u64)>) -> Revert {
         self.generations = self.generations.max(state.generation);
-        // The first commit's file is written whole, whatever the stage said of it.
-        self.filed.wrote(full || !self.state.laid_out, &undo);
         let before = std::mem::replace(&mut self.state, state);
         if before.laid_out {
             let len = before.file_len;
@@ -183,7 +181,6 @@ impl Image {
     pub(crate) fn take_undo(&mut self) -> Revert {
         let Undo { state, full, len, writes } =
             self.history.pop_back().expect("a rollback's writes were made of it");
-        self.filed.wrote(full, &writes);
         let current = std::mem::replace(&mut self.state, state);
         Revert::Push { state: current, full, len, writes }
     }
@@ -393,8 +390,6 @@ impl Image {
         }
         if let Some(failed) = pending.failed.take() {
             let pending = self.pending.take().expect("in flight");
-            // The state put back is another than the file's digest was last told of.
-            self.filed.wrote_any();
             match pending.revert {
                 Some(Revert::Pop) => {
                     let undo = self.history.pop_back().expect("the commit pushed its undo");

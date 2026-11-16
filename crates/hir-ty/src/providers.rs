@@ -122,7 +122,7 @@ pub fn mir() -> &'static Mir {
 fn one<T: inventory::Collect>(by: &str) -> &'static T {
     let mut all = inventory::iter::<T>();
     let first = all.next().unwrap_or_else(|| {
-        panic!("no `{}` is linked: link {by} (`use hir as _;`)", std::any::type_name::<T>())
+        panic!("no `{}` is linked: link {by}", std::any::type_name::<T>())
     });
     assert!(all.next().is_none(), "two `{}` are linked", std::any::type_name::<T>());
     first
@@ -160,8 +160,8 @@ pub fn mir_at<'db>(db: &'db Db, owner: MirOwner<'db>, stage: MirStage) -> Kept<'
 /// caller owns and drops. For a reader that reads one instance's body once and keeps only what
 /// it worked out of it (a coroutine's layout, its debug type, a walk's summary): the memo keeps
 /// one body per instance on the global heap until the build lets every MIR go, so a program's
-/// instances are a program's bodies (docs/v2/plan/design/end-state/memory.md 4.3: "a value read
-/// once is frame scratch, not a record and not a memo"). The interpreter, which runs one
+/// instances are a program's bodies (a value read once is frame scratch, not a record
+/// and not a memo). The interpreter, which runs one
 /// instance's body many times and takes it by `&'db`, is what the memo is for.
 ///
 /// Its reads are the caller's: the generic memo's and those instantiating makes, so the

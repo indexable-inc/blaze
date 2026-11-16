@@ -155,7 +155,7 @@ runs:
     # was 34.2 GB on 2026-10-30 (green) and passed 36.4 GB, still rising, on 2026-11-04 (run
     # 41755023516), when 20 GB of swap ran out and the runner was shut down. So 40 GB, as the disk
     # allows with 20 GB left for the store and target/, until the release the gate builds with
-    # bounds its own memory (#1376; docs/memory-budget.md). Not on an ix runner:
+    # bounds its own memory (#1376). Not on an ix runner:
     # its memory grows on demand up to 256 GiB, and ix's scrub refuses to snapshot a machine
     # with swap on, so a job that turned it on would never become its label set's seed.
     - name: swap

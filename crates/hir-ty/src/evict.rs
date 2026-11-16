@@ -2,7 +2,7 @@
 //! interner's tables.
 //!
 //! The memo's own values are not evicted one by one: a value lives as long as its arena, and
-//! memory is bounded by dropping arenas (spec docs/v2/plan/design/front-end-on-memo.md, rule 3:
+//! memory is bounded by dropping arenas (the memo port's rule 3:
 //! `lru` and `weigh` go with no replacement). The per-body drops that were here
 //! (`drop_inference`, `drop_all_inference`, `drop_statics`, `drop_all_const_eval`, `drop_all`)
 //! went with them.

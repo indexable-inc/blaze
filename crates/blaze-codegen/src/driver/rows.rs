@@ -1,5 +1,5 @@
 //! A map sorted by key, kept in chunks shared by reference count: what a walk's nodes and a
-//! kept `Built`'s rows are held in (docs/v2/plan/design/incremental-walk.md).
+//! kept `Built`'s rows are held in.
 //!
 //! The entries are in key order, cut into chunks of at most [`CHUNK`]; the directory is the
 //! chunks in order. A lookup is two binary searches. An insert, a removal or a change touches

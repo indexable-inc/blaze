@@ -16,8 +16,9 @@
 //!   [`task::Scope`] and its [`task::Task`]s are joined, an op in flight
 //!   ([`pending::Pending`]) is waited for or cancelled, a writable [`fs::File`] is closed, a
 //!   buffered writer ([`fs::Buffered`]) is finished and a [`net::Conn`] or [`net::Listener`]
-//!   is finished. Leaving one is a compile error; a panic
-//!   that unwinds past one runs its abandonment path, which each type's doc names.
+//!   is finished. Leaving one is a compile error when blaze builds the crate; under rustc,
+//!   which ignores the mark, it is a `#[must_use]` warning and runs the abandonment path, as a
+//!   panic that unwinds past one does: each type's doc names it (std.md, "Two builders").
 //! - A capability the host does not offer is `None` at the root ([`io::Io::fs`], ...;
 //!   [`io::Offers`]), with a `need_` form whose [`io::Missing`] names it.
 //! - Nothing is global: the crate holds no `static` with interior mutability, no `static mut`

@@ -1,7 +1,7 @@
 //! One macro call: its tokens, its kind, its call-site hygiene and, for an eager macro
 //! re-entered, the answers to the calls in its input.
 
-use std::alloc::Allocator;
+use core::alloc::Allocator;
 
 use crate::{
     error::{ExpandError, Stream},
@@ -22,8 +22,37 @@ pub enum CallKind<'a, A: Allocator> {
     FnLike { args: &'a TokenStream<A> },
     /// `#[m]` (`args` `None`) or `#[m(args)]` on `item`: the item without this attribute.
     Attr { args: Option<&'a TokenStream<A>>, item: &'a TokenStream<A> },
-    /// `#[derive(m)]` on `item`.
-    Derive { item: &'a TokenStream<A> },
+    /// `#[derive(m)]` or `#[derive_const(m)]` on `item`.
+    Derive { item: &'a TokenStream<A>, facts: DeriveFacts },
+}
+
+/// What a derive's output depends on besides the item: they are in the call's key.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct DeriveFacts {
+    /// Whether the item's derives include the builtin `Copy` (rustc's `has_derive_copy`):
+    /// `Clone` of a type with no type parameter is then `*self`.
+    pub copy: AlsoCopy,
+    /// `#[derive_const]`: the impl is `impl const`, its parameters bounded `[const]`.
+    pub constness: Constness,
+}
+
+impl DeriveFacts {
+    /// A plain `#[derive]` of an item that does not also derive `Copy`.
+    pub const PLAIN: DeriveFacts = DeriveFacts { copy: AlsoCopy::No, constness: Constness::NotConst };
+}
+
+/// Whether the item also derives the builtin `Copy`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum AlsoCopy {
+    No,
+    Yes,
+}
+
+/// `#[derive]` or `#[derive_const]`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Constness {
+    NotConst,
+    Const,
 }
 
 /// The hygiene of the call site: what tokens the expansion makes resolve against.
@@ -91,7 +120,7 @@ impl<'a, A: Allocator> Call<'a, A> {
     pub fn input(&self) -> &'a TokenStream<A> {
         match self.kind {
             CallKind::FnLike { args } => args,
-            CallKind::Attr { item, .. } | CallKind::Derive { item } => item,
+            CallKind::Attr { item, .. } | CallKind::Derive { item, .. } => item,
         }
     }
 
@@ -105,9 +134,12 @@ impl<'a, A: Allocator> Call<'a, A> {
 
     /// Every stream of the call, with its name.
     pub(crate) fn streams(&self) -> impl Iterator<Item = (Stream, &'a TokenStream<A>)> + '_ {
-        let answers = self.eager.answers.iter().enumerate().map(|(at, answer)| {
-            (Stream::Answer(crate::tokens::index(at)), *answer)
-        });
+        let answers = self
+            .eager
+            .answers
+            .iter()
+            .enumerate()
+            .map(|(at, answer)| (Stream::Answer(crate::tokens::index(at)), *answer));
         core::iter::once((Stream::Input, self.input()))
             .chain(self.attr_args().map(|args| (Stream::AttrArgs, args)))
             .chain(answers)
@@ -141,6 +173,14 @@ impl<'a, A: Allocator> Call<'a, A> {
         let CallSite { edition, panic_edition, ctx } = self.site;
         out.put(&[shape, edition.byte(), panic_edition.byte(), inside]);
         out.put(&ctx.raw().to_be_bytes());
+        match self.kind {
+            CallKind::Derive { facts, .. } => {
+                let copy = u8::from(facts.copy == AlsoCopy::Yes);
+                let constness = u8::from(facts.constness == Constness::Const);
+                out.put(&[copy, constness]);
+            }
+            CallKind::FnLike { .. } | CallKind::Attr { .. } => {}
+        }
         self.input().encode(out);
         match self.attr_args() {
             None => out.put(&[0]),

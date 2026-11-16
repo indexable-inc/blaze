@@ -34,8 +34,6 @@ pub enum ResolveError {
     Finished { module: ItemKey },
     /// A group made of no machine, or of two machines of one module.
     BadGroup { module: Option<ItemKey> },
-    /// A group member waits on a module that answered `InProgress` and is not in the group.
-    NotAFellow { module: ItemKey, waits_on: ItemKey },
 }
 
 impl fmt::Display for ResolveError {
@@ -73,10 +71,6 @@ impl fmt::Display for ResolveError {
                 write!(f, "a resolution group holds module {module:x} twice")
             }
             ResolveError::BadGroup { module: None } => write!(f, "a resolution group of no module"),
-            ResolveError::NotAFellow { module, waits_on } => write!(
-                f,
-                "name resolution of module {module:x} waits on {waits_on:x}, which is in progress and not in its group"
-            ),
         }
     }
 }

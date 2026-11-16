@@ -173,8 +173,7 @@ every diagnostic below it. Two diagnostics with one id are told apart by count.
 
 The end state is the item's form: the rule's code, the path of the item the span is in and the
 span relative to that item, so an edit of the line itself, or of another item, keeps it. A
-diagnostic does not carry its item yet; when the front end says it, the id changes form and the
-module (`crates/blaze-api/src/diagnostics.rs`) says so.
+diagnostic does not carry its item yet; when the front end says it, the id changes form.
 
 The formats each agent's hooks read and write, with the documentation they rest on, are in
 `plugins/claude/FORMAT-NOTES.md` and `plugins/codex/FORMAT-NOTES.md`. The hook's decisions are

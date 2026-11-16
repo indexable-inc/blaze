@@ -7,42 +7,44 @@ summary: The crates kept on disk but out of the build (the root Cargo.toml's `[w
 On 2026-11-15 the old item layer was deleted to be rebuilt from scratch
 ([design/bottom.md](design/bottom.md)): the daemon (blaze-cargo's serve, blaze-api, blaze-client),
 the query database (blaze-query), the lints (blaze-lints), the old name resolution and stored
-pages of hir-def, most of hir-expand and base-db's input graph. A crate kept that no longer
+pages of hir-def, most of hir-expand and base-db's input graph. A second pass the same day
+deleted the old path's binaries and driver (blaze-engine, blaze-thin, blaze-command, blaze-front)
+and the IDE facade `hir`; each is in git history at 71767c46ce. A crate kept that no longer
 compiles is parked: it stays on disk, unedited but for dependency lines on deleted crates, and is
 listed in the root Cargo.toml's `exclude`. A crate leaves this list when it compiles again on
 the new layer; delete its line here then.
 
 Many of them used blaze-query only for its fact kinds (`QueryKind`, `QueryKey`) or its `carry`;
-those uses wait on the records of the new layer's keys.
+those uses wait on the records of the new layer's keys. A test that linked `hir` for hir-ty-mir's
+MIR table links hir-ty-mir itself now.
 
 ## Waiting on the new item layer (Items, Source; design/bottom.md)
 
-- `crates/base-db`: its input graph, file roots and database were deleted; what is left (crate
-  attributes, editioned file ids, reparse, settings) waits on the `Source` trait.
-- `crates/hir-expand`: its database and file layer were deleted; `builtin`, `declarative`,
-  `eager`, `hygiene`, `span_map`, `name`, `mod_path`, `fixup` wait on base-db's replacement.
-- `crates/hir-def`: name resolution, `DefMap`, the resolver, item scopes, import map, find path,
-  lang items and stored pages were deleted; body lowering and the item tree wait on `Items`.
-- `crates/mbe`: takes `&base_db::Db` (lib.rs, expander.rs); waits on base-db's replacement.
-- `crates/proc-macro-api`: base-db, hir-expand.
-- `crates/hir-lint-levels`: base-db, hir-def, hir-expand (read by hir-ty-mir and hir-ty-unsafeck).
-- `crates/hir`: hir-def, hir-ty and the checkers.
+- `crates/base-db`: crate attributes, editioned file ids, reparse, settings; waits on `Source`.
+- `crates/hir-expand`: `builtin`, `declarative`, `eager`, `hygiene`, `span_map`, `name`,
+  `mod_path`, `fixup`; waits on base-db's replacement.
+- `crates/hir-def`: body lowering, signatures and the item tree; waits on `Items`.
+- `crates/mbe`: takes `&base_db::Db`; waits on base-db's replacement.
+- `crates/proc-macro-api`: the expansion store and bridge blaze-macro-eval speaks; on base-db,
+  hir-expand.
+- `crates/hir-lint-levels`: lint levels that change what a program does (const eval), read by
+  hir-ty-mir and hir-ty-unsafeck; on base-db, hir-def, hir-expand.
 - `crates/hir-ty` and every checker on it (`crates/hir-ty-borrowck`, `crates/hir-ty-coherence`,
   `crates/hir-ty-comptime`, `crates/hir-ty-identity`, `crates/hir-ty-lean`, `crates/hir-ty-linear`,
   `crates/hir-ty-matchck`, `crates/hir-ty-mir`, `crates/hir-ty-print`, `crates/hir-ty-pure`,
   `crates/hir-ty-share`, `crates/hir-ty-specialization`, `crates/hir-ty-suspend`,
   `crates/hir-ty-tailck`, `crates/hir-ty-ub`, `crates/hir-ty-unsafeck`, `crates/hir-ty-wfcheck`):
-  hir-def and hir-expand, and blaze-query's fact kinds; the type checker is to ask through
-  `Items` and `Source`.
+  hir-def, hir-expand and blaze-query's fact kinds; to ask through `Items` and `Source`.
 - `crates/hir-ty-codegen`: hir-ty, blaze-codegen, blaze-stencil, blaze-query.
-- `crates/blaze-items`: hir, hir-def, hir-ty, blaze-query.
-- `crates/blaze-item-hash`: hir-def, hir-ty and its checkers, blaze-query.
-- `crates/blaze-front`: hir-def, hir-ty, blaze-items, blaze-query.
+- `crates/blaze-items`: item keys, layouts and code hashes that hir-ty-identity, hir-ty-pure,
+  hir-ty-share, hir-ty-codegen, blaze-codegen and the launcher crates read; on hir-def, hir-ty,
+  blaze-query. Its keys move to blaze-id; what codegen keys on stays until then.
+- `crates/blaze-item-hash`: `identity`, `reads` and `values`, which hir-ty-codegen and
+  hir-ty-pure read; on hir-def, hir-ty, blaze-query.
 - `crates/blaze-shader`: hir-def, hir-ty-mir.
-- `crates/blaze-doc`: hir, hir-def.
-- `crates/blaze-diagnostics`: its lint passes were deleted; what is left (the rendering of the
-  type checker's errors, `lower/`, `checks/`, emit, print, levels) waits on hir and hir-ty, and on
-  the request types blaze-api had.
+- `crates/blaze-doc`: written over `hir` (deleted); waits on `Items` for its places and model.
+- `crates/blaze-diagnostics`: the rendering of the type checker's errors (`lower/`, `checks/`,
+  emit, print, levels); waits on hir-ty and on the request types blaze-api had.
 
 ## Waiting on the build graph off blaze-query
 
@@ -56,26 +58,20 @@ those uses wait on the records of the new layer's keys.
 ## Waiting on code records (the back end without the daemon)
 
 - `crates/blaze-codegen`: blaze-api, blaze-query, blaze-items.
-- `crates/blaze-stencil` (the copy-and-patch stencils): blaze-query, blaze-lower, blaze-codegen,
-  hir-ty-codegen.
-- `crates/blaze-lazy` (compile on first call): its default feature `daemon` (plans, stubs, the
-  fetcher) needs blaze-codegen, blaze-items and blaze-stencil; without `daemon` it needs only
-  blaze-core, blaze-bytes, blaze-inproc and blaze-spin. Waits on being re-seated on code
-  records: a stub calls the resolver, which reads the code record by its key, made on a miss by
-  the program's helper.
-- `crates/blaze-link`: blaze-live (deleted), blaze-codegen, blaze-items, blaze-lazy's `daemon`;
-  the same re-seating as blaze-lazy.
-- `crates/blaze-launch-host`: blaze-codegen, blaze-items, blaze-link; the same re-seating.
-- `crates/blaze-launcher`: blaze-client (deleted), its request path to the daemon; the same
-  re-seating, the launcher asking the program's helper.
-- `crates/blaze-command`: the no-daemon request, on hir-ty, blaze-front, blaze-codegen, blaze-link,
-  blaze-units.
+- `crates/blaze-stencil` (the copy-and-patch stencils): blaze-codegen (`CompiledFunction`,
+  `InstanceKey` throughout); its coverage test also hir-ty-codegen.
+- `crates/blaze-lazy` (compile on first call): blaze-codegen, blaze-items, blaze-stencil. The
+  daemon's hook, compiler and answers are deleted; a stub is to call a resolver that reads the
+  code record by its key, made on a miss by the program's helper.
+- `crates/blaze-link`: blaze-live (deleted: the jump table's layout, the descriptor, the
+  messages to running programs), blaze-codegen, blaze-items.
+- `crates/blaze-launch-host`: blaze-codegen, blaze-items, blaze-link.
 
 ## Waiting on a command line without the daemon
 
-- `crates/blaze-cargo`: its daemon (serve, socket, inspect, resume, daemon client) was deleted;
-  `cli.rs` still routes through them. Waits on the CLI made over blaze-command alone.
-- `crates/blaze-certify`: the request certificate, on blaze-api's request types (deleted).
-- `crates/blaze-thin`: the thin `blaze`, a round trip on the daemon's socket (blaze-api,
-  blaze-client deleted) and blaze-certify.
-- `crates/blaze-engine`: blaze-cargo, blaze-query, blaze-lower.
+- `crates/blaze-cargo`: its `cli/` routes through the deleted daemon, client and blaze-command.
+  What stands alone and the new command line takes: `sandbox/` (the only sandbox of build
+  scripts and proc macros), `toolchain/`, `raw/`, `as_rustc`, `directives`, `unstable`,
+  `release`. Waits on the CLI made over blaze-run.
+- `crates/blaze-certify`: the request certificate, on blaze-api's request types (deleted); its
+  `slot` is the daemon's file for its client.

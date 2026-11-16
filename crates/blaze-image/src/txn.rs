@@ -1,5 +1,4 @@
-//! An image being made, as a value that has to end (docs/v2/plan/design/restore.md, "Persisted
-//! state that is hard to get wrong", the write path): [`Txn`] holds the sections written so
+//! An image being made, as a value that has to end (the write path): [`Txn`] holds the sections written so
 //! far, and ends in [`Txn::commit`], which hands the finished image to the file's
 //! [`Placer`], or in [`Txn::abort`], which writes nothing.
 //!

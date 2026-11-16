@@ -89,7 +89,6 @@ blaze-store-check.workspace = true
 # The revision tests' cases (`v2/edits/revisions.rs`): each `test.toml`, and the report's lines.
 toml.workspace = true
 serde_json.workspace = true
-hir.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 # Runs what `wasm::lower` writes: a function whose values share locals computes what its IR says
 # (`wasm.rs`'s tests).

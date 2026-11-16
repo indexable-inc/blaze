@@ -133,7 +133,11 @@ impl fmt::Display for ExpandError {
                 write!(f, "the builtin macro `{}!` is not built in blaze-expand yet", it.name())
             }
             ExpandError::NotBuilt { what: Unbuilt::BuiltinAttr(it) } => {
-                write!(f, "the builtin attribute `#[{}]` is not built in blaze-expand yet", it.name())
+                write!(
+                    f,
+                    "the builtin attribute `#[{}]` is not built in blaze-expand yet",
+                    it.name()
+                )
             }
             ExpandError::Stream { stream: Some(stream), error } => write!(f, "{stream}: {error}"),
             ExpandError::Stream { stream: None, error } => write!(f, "{error}"),
@@ -142,7 +146,10 @@ impl fmt::Display for ExpandError {
                 write!(f, "a {def:?} macro was called as a {call:?} macro")
             }
             ExpandError::ForeignSpan { role } => {
-                write!(f, "a span of role {role} came back from mbe or a derive: no stream of the call has it")
+                write!(
+                    f,
+                    "a span of role {role} came back from mbe or a derive: no stream of the call has it"
+                )
             }
             ExpandError::ForeignOrigin { origin } => {
                 write!(f, "the origin {origin:?} names no token of its stream")
@@ -154,10 +161,9 @@ impl fmt::Display for ExpandError {
                 f,
                 "{stream} holds a context of an expansion's own (`MarkOf::This`): seal an expansion's tokens with its key before they are input"
             ),
-            ExpandError::EagerAnswers { wanted, given } => write!(
-                f,
-                "an eager call has {wanted} nested calls and was given {given} answers"
-            ),
+            ExpandError::EagerAnswers { wanted, given } => {
+                write!(f, "an eager call has {wanted} nested calls and was given {given} answers")
+            }
             ExpandError::ProcMacroOutput { tokens, origins } => write!(
                 f,
                 "a proc macro gave {tokens} tokens and {origins} origins: one origin per token"
@@ -186,7 +192,9 @@ impl From<StreamError> for LexError {
 impl fmt::Display for LexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            LexError::Refused { edition } => write!(f, "the text does not lex in edition {edition:?}"),
+            LexError::Refused { edition } => {
+                write!(f, "the text does not lex in edition {edition:?}")
+            }
             LexError::Stream(error) => write!(f, "{error}"),
         }
     }

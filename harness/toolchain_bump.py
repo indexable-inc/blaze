@@ -95,7 +95,7 @@ DOCS = ["README.md", "docs/toolchain.md", "docs/cargo.md"]
 ABI = ("crates/rustc_abi/src", "compiler/rustc_abi/src")
 # blaze's lines at the top of crates/rustc_abi/src/lib.rs, kept across a copy: the first is this
 # comment's marker, and it and the three after it (the tool and the crate's
-# `#![blaze::trust(unsafe, ..)]`, docs/lints.md#workspace_unsafe) go above upstream's root.
+# `#![blaze::trust(unsafe, ..)]`) go above upstream's root.
 ABI_ROOT = ("crates/rustc_abi/src/lib.rs", "// blaze's, not upstream's:", 4)
 LEXER = ("crates/rustc_lexer/src", "compiler/rustc_lexer/src")
 # What crates/blaze-lint-defs/src/rustc.rs is written from (scripts/src/bin/lint_table.rs).

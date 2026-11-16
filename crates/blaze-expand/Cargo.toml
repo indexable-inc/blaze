@@ -19,7 +19,7 @@ doctest = false
 blaze-id.workspace = true
 # `Hasher`: the keys and a definition's content hash.
 blaze-ids.workspace = true
-# `frame::task`: the task frame mbe and the derives write their output trees into.
+# `frame::task`: the task frame mbe writes its output tree into.
 blaze-mem.workspace = true
 # `DeclarativeMacro`: the matcher and transcriber of `macro_rules!` and `macro`, driven pure.
 mbe.workspace = true
@@ -29,13 +29,6 @@ span.workspace = true
 intern.workspace = true
 # `parse_to_token_tree`: text to tokens, for `lex`.
 syntax-bridge.workspace = true
-# `Db`: the parameter mbe and the derive expanders thread through and never read
-# (`ExpandCx::host_db`).
-base-db.workspace = true
-# `BuiltinDeriveExpander`: the builtin derives' token writers.
-hir-expand.workspace = true
-# `unescape_str`, `unescape_char`: rustc's reader of a literal's escapes, for the builtins.
-rustc-literal-escaper.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true

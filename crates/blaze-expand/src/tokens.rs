@@ -7,7 +7,9 @@
 //! context is pushed once (an equal one is found and reused), so a stream is canonical by
 //! construction.
 
-use std::alloc::Allocator;
+use core::alloc::Allocator;
+
+use alloc::{alloc::Global, vec::Vec};
 
 use blaze_id::{ContentId, CrateItemKey, ItemKey, Portable};
 use span::{EditionedFileId, FileId, ROOT_ERASED_FILE_AST_ID, SpanAnchor, SyntaxContext};
@@ -533,7 +535,7 @@ impl<A: Allocator> TokenStream<A> {
 
     /// The first token at which the delimiters do not pair up, if any.
     pub(crate) fn unbalanced(&self) -> Option<u32> {
-        let mut open: Vec<Delim, std::alloc::Global> = Vec::new_in(std::alloc::Global);
+        let mut open: Vec<Delim, Global> = Vec::new_in(Global);
         for (at, token) in self.tokens.iter().enumerate() {
             match token.kind {
                 TokenKind::Open(delim) => open.push(delim),
@@ -655,7 +657,8 @@ impl<A: Allocator + Clone> TokenStream<A> {
         ctx: Ctx,
     ) -> Result<Ctx, StreamError> {
         let Some(at) = ctx.node() else { return Ok(ctx) };
-        let node = *from.contexts.get(at as usize).ok_or(StreamError::NoSuchContext { ctx: ctx.0 })?;
+        let node =
+            *from.contexts.get(at as usize).ok_or(StreamError::NoSuchContext { ctx: ctx.0 })?;
         let parent = self.import_ctx(from, node.parent)?;
         self.context(CtxNode { parent, mark: node.mark })
     }
@@ -784,7 +787,11 @@ fn lex_walk<A: Allocator + Clone>(
 }
 
 /// Marks the pending identifier or literal joint when the next token starts where it ends.
-fn joined_to<A: Allocator + Clone>(out: &mut TokenStream<A>, last: &mut Pending, next: tt::TextSize) {
+fn joined_to<A: Allocator + Clone>(
+    out: &mut TokenStream<A>,
+    last: &mut Pending,
+    next: tt::TextSize,
+) {
     if let Some((at, end)) = last.take()
         && end == next
     {

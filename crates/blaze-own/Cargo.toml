@@ -1,0 +1,24 @@
+[package]
+name = "blaze-own"
+description = "blaze's own owning types in place of Rust's `alloc` crate: Vec, Box, Arc, Rc, VecDeque, a sorted map and set, a borrow-or-own Cow and a struct-of-arrays vector, each over `core::alloc::Allocator` with no default allocator (`new_in(alloc)` is the only constructor); `no_std`, no `alloc`, no dependencies"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# Nothing: `core` only. A dependency here would be a dependency of every crate's collections.
+[dependencies]
+
+[dev-dependencies]
+# The tree's property engine; itself depends only on blaze-rng, which depends on nothing.
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

@@ -1,5 +1,5 @@
 //! A body's inference, its built MIR and its borrow check's verdict as `blaze_kernel` step
-//! entries (docs/v2/plan/design/end-state.md, "The front end as kernel steps", order row 3):
+//! entries:
 //! [`InferEntry`] and [`BorrowckEntry`], each of one body by its syntax ([`BodyKey`]: its file
 //! and its content-hashed `blaze_front_items` item id, never a dense id), and a [`MirEntry`] for
 //! each MIR owner of the body ([`OwnerKey`]: the body and the owner's [`Place`] in it, the body

@@ -2,7 +2,7 @@
 //! error, took a lock, opened a frame, owed a write), the one type for it: a return trace's
 //! entry, a lock's holder, a watchdog's stall line.
 //!
-//! The rule (docs/lints.md, `absolute_position`): a position that reaches code or a kept value
+//! The rule (`absolute_position`): a position that reaches code or a kept value
 //! is item-relative, and the absolute `file:line:column` is made only where it is printed. In
 //! code blaze builds, a `core::panic::Location` is a record the link places for one span of one
 //! item (`blaze_codegen::Target::Position`, a `blaze_format::SpanRef`: the item's anchor and the

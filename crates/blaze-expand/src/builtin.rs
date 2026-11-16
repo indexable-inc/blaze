@@ -6,7 +6,9 @@
 //! the answers, they read the input with each call replaced by its answer, whose tokens take
 //! the origin of the call's path.
 
-use std::alloc::Allocator;
+use core::alloc::Allocator;
+
+use alloc::vec::Vec;
 
 use blaze_id::ContentId;
 
@@ -142,13 +144,9 @@ impl<A: Allocator> Args<'_, A> {
     fn atom(&self, range: core::ops::Range<usize>) -> Atom<'_> {
         let tokens = &self.stream.tokens()[range.clone()];
         let literal = |at: usize, negative: bool| match self.stream.tokens()[at].kind {
-            TokenKind::Literal { kind, suffix_len, .. } => Atom::Lit {
-                kind,
-                text: self.stream.text_at(at),
-                suffix_len,
-                negative,
-                at,
-            },
+            TokenKind::Literal { kind, suffix_len, .. } => {
+                Atom::Lit { kind, text: self.stream.text_at(at), suffix_len, negative, at }
+            }
             _ => Atom::Other { at },
         };
         match tokens {
@@ -176,10 +174,18 @@ impl<A: Allocator> Args<'_, A> {
 }
 
 enum Atom<'s> {
-    Lit { kind: LitKind, text: &'s str, suffix_len: u32, negative: bool, at: usize },
+    Lit {
+        kind: LitKind,
+        text: &'s str,
+        suffix_len: u32,
+        negative: bool,
+        at: usize,
+    },
     Bool(bool),
     /// Anything else, starting at `at` (the end of the input for an empty argument).
-    Other { at: usize },
+    Other {
+        at: usize,
+    },
 }
 
 /// An eager builtin: its nested calls first, then the builtin on the input with the answers.
@@ -224,7 +230,8 @@ fn eager<A: Allocator + Clone>(
             from.push(Origin::Input(index(at)));
             at += 1;
         }
-        let in_answer = |error| ExpandError::Stream { stream: Some(Stream::Answer(index(n))), error };
+        let in_answer =
+            |error| ExpandError::Stream { stream: Some(Stream::Answer(index(n))), error };
         for token in 0..answer.len() {
             stream.push_from(*answer, token).map_err(in_answer)?;
             from.push(Origin::Input(nested.path.start));
@@ -283,15 +290,21 @@ fn string_arg<A: Allocator + Clone>(
 ) -> Result<(), (LitError, Option<Origin>)> {
     match args.atom(range) {
         Atom::Lit { kind, text, suffix_len, negative: false, at } => {
-            literal::string_value(kind, text, suffix_len, value).map_err(|it| (it, Some(args.origin(at))))
+            literal::string_value(kind, text, suffix_len, value)
+                .map_err(|it| (it, Some(args.origin(at))))
         }
-        Atom::Lit { at, .. } | Atom::Other { at } => Err((LitError::NotAString, at_token(args, at))),
+        Atom::Lit { at, .. } | Atom::Other { at } => {
+            Err((LitError::NotAString, at_token(args, at)))
+        }
         Atom::Bool(_) => Err((LitError::NotAString, None)),
     }
 }
 
 /// Pushes a made string literal whose value is `value`.
-fn push_str_literal<A: Allocator + Clone>(out: &mut Out<'_, A>, value: &str) -> Result<(), ExpandError> {
+fn push_str_literal<A: Allocator + Clone>(
+    out: &mut Out<'_, A>,
+    value: &str,
+) -> Result<(), ExpandError> {
     let mut text = Buf::new_in(out.alloc.clone());
     literal::escape_str(value, &mut text);
     let kind = TokenKind::Literal { kind: LitKind::Str, suffix_len: 0, spacing: Spacing::Alone };
@@ -302,12 +315,19 @@ fn ident<A: Allocator + Clone>(out: &mut Out<'_, A>, name: &str) -> Result<(), E
     out.made(TokenKind::Ident { raw: Raw::No, spacing: Spacing::Alone }, name, MADE)
 }
 
-fn punct<A: Allocator + Clone>(out: &mut Out<'_, A>, char: char, spacing: Spacing) -> Result<(), ExpandError> {
+fn punct<A: Allocator + Clone>(
+    out: &mut Out<'_, A>,
+    char: char,
+    spacing: Spacing,
+) -> Result<(), ExpandError> {
     out.made(TokenKind::Punct { char, spacing }, "", MADE)
 }
 
 /// `::name` for each name, after `$crate`.
-fn crate_path<A: Allocator + Clone>(out: &mut Out<'_, A>, names: &[&str]) -> Result<(), ExpandError> {
+fn crate_path<A: Allocator + Clone>(
+    out: &mut Out<'_, A>,
+    names: &[&str],
+) -> Result<(), ExpandError> {
     ident(out, "$crate")?;
     for name in names {
         punct(out, ':', Spacing::Joint)?;
@@ -317,12 +337,17 @@ fn crate_path<A: Allocator + Clone>(out: &mut Out<'_, A>, names: &[&str]) -> Res
     Ok(())
 }
 
-fn concat<A: Allocator + Clone>(args: &Args<'_, A>, out: &mut Out<'_, A>) -> Result<(), ExpandError> {
+fn concat<A: Allocator + Clone>(
+    args: &Args<'_, A>,
+    out: &mut Out<'_, A>,
+) -> Result<(), ExpandError> {
     let mut value = Buf::new_in(out.alloc.clone());
     for range in args.split(out.alloc.clone()) {
         match args.atom(range) {
             Atom::Lit { kind, text, suffix_len, negative, at } => {
-                if let Err(error) = literal::concat_piece(kind, text, suffix_len, negative, &mut value) {
+                if let Err(error) =
+                    literal::concat_piece(kind, text, suffix_len, negative, &mut value)
+                {
                     return refuse(out, error.message(), Some(args.origin(at)));
                 }
             }
@@ -368,7 +393,9 @@ fn env<A: Allocator + Clone>(
     }
     let value = cx.env(name.as_str())?;
     let answer = match value {
-        Some(value) => ReadAnswer::Digest(ContentId::of("blaze v2 expand env value 1", value.as_bytes())),
+        Some(value) => {
+            ReadAnswer::Digest(ContentId::of("blaze v2 expand env value 1", value.as_bytes()))
+        }
         None => ReadAnswer::Absent,
     };
     out.exp.reads.push(ReadKind::Env, name.as_str(), answer)?;
@@ -386,7 +413,8 @@ fn env<A: Allocator + Clone>(
             punct(out, ':', Spacing::Joint)?;
             punct(out, ':', Spacing::Alone)?;
             punct(out, '<', Spacing::Alone)?;
-            punct(out, '&', Spacing::Joint)?;
+            // `&` is not joined to the lifetime after it: `&'` is no operator.
+            punct(out, '&', Spacing::Alone)?;
             punct(out, '\'', Spacing::Joint)?;
             ident(out, "static")?;
             ident(out, "str")?;
@@ -442,13 +470,20 @@ fn include<A: Allocator + Clone>(
         IncludeAs::Bytes => {
             let mut text = Buf::new_in(out.alloc.clone());
             literal::escape_bytes(bytes, &mut text);
-            let kind = TokenKind::Literal { kind: LitKind::ByteStr, suffix_len: 0, spacing: Spacing::Alone };
+            let kind = TokenKind::Literal {
+                kind: LitKind::ByteStr,
+                suffix_len: 0,
+                spacing: Spacing::Alone,
+            };
             out.made(kind, text.as_str(), MADE)
         }
     }
 }
 
-fn compile_error<A: Allocator + Clone>(args: &Args<'_, A>, out: &mut Out<'_, A>) -> Result<(), ExpandError> {
+fn compile_error<A: Allocator + Clone>(
+    args: &Args<'_, A>,
+    out: &mut Out<'_, A>,
+) -> Result<(), ExpandError> {
     let pieces = args.split(out.alloc.clone());
     let mut message = Buf::new_in(out.alloc.clone());
     if pieces.len() != 1 {
@@ -481,7 +516,13 @@ fn format_args<A: Allocator + Clone>(
             return refuse(out, "`format_args_nl!` takes a format string", None);
         };
         match args.atom(first.clone()) {
-            Atom::Lit { kind: kind @ (LitKind::Str | LitKind::StrRaw(_)), text, suffix_len: 0, negative: false, at } => {
+            Atom::Lit {
+                kind: kind @ (LitKind::Str | LitKind::StrRaw(_)),
+                text,
+                suffix_len: 0,
+                negative: false,
+                at,
+            } => {
                 let mut with_newline = Buf::new_in(out.alloc.clone());
                 match kind {
                     LitKind::Str => with_newline.push_str(text),
@@ -507,7 +548,8 @@ fn format_args<A: Allocator + Clone>(
         if let Some((range, literal_at, text)) = &template
             && at == range.start
         {
-            let kind = TokenKind::Literal { kind: LitKind::Str, suffix_len: 0, spacing: Spacing::Alone };
+            let kind =
+                TokenKind::Literal { kind: LitKind::Str, suffix_len: 0, spacing: Spacing::Alone };
             out.push(kind, text.as_str(), args.origin(*literal_at))?;
             at = range.end;
             continue;
@@ -554,7 +596,11 @@ fn cfg<A: Allocator + Clone>(out: &mut Out<'_, A>, cx: &impl ExpandCx) -> Result
 
 /// `line!()`, `column!()`, `file!()`, `module_path!()`: a placeholder and a [`Hole`] where the
 /// call is written; inside eager input, the value read.
-fn place<A: Allocator + Clone>(out: &mut Out<'_, A>, cx: &impl ExpandCx, of: HoleOf) -> Result<(), ExpandError> {
+fn place<A: Allocator + Clone>(
+    out: &mut Out<'_, A>,
+    cx: &impl ExpandCx,
+    of: HoleOf,
+) -> Result<(), ExpandError> {
     if !out.call.input().is_empty() {
         return refuse(out, "takes no arguments", Some(Origin::Input(0)));
     }
@@ -562,7 +608,11 @@ fn place<A: Allocator + Clone>(out: &mut Out<'_, A>, cx: &impl ExpandCx, of: Hol
     if out.call.eager.inside == Inside::Plain {
         let token = index(out.exp.tokens.len());
         if number {
-            let kind = TokenKind::Literal { kind: LitKind::Integer, suffix_len: 3, spacing: Spacing::Alone };
+            let kind = TokenKind::Literal {
+                kind: LitKind::Integer,
+                suffix_len: 3,
+                spacing: Spacing::Alone,
+            };
             out.made(kind, "0u32", MADE)?;
         } else {
             push_str_literal(out, "")?;
@@ -583,7 +633,11 @@ fn place<A: Allocator + Clone>(out: &mut Out<'_, A>, cx: &impl ExpandCx, of: Hol
             let mut text = Buf::new_in(out.alloc.clone());
             core::fmt::Write::write_fmt(&mut text, format_args!("{value}u32"))
                 .expect("a `Buf` takes any text");
-            let kind = TokenKind::Literal { kind: LitKind::Integer, suffix_len: 3, spacing: Spacing::Alone };
+            let kind = TokenKind::Literal {
+                kind: LitKind::Integer,
+                suffix_len: 3,
+                spacing: Spacing::Alone,
+            };
             out.made(kind, text.as_str(), MADE)
         }
         (Place::Text(value), false) => {

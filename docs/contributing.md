@@ -129,6 +129,17 @@ type aliases of such a `Result`, equal its row in
 held to none; a change over its row is refused with the new sites named
 (`scripts/src/bin/untyped.rs`).
 
+blaze depends on no third-party crate in the end: every crate depends only on crates of this
+workspace, and a new crate starts at none (`docs/v2/plan/design/bottom.md`, "Also decided on
+2026-11-15"). The gate holds the way there by crate: each workspace crate's third-party packages
+in its normal and build dependencies, in its dev-dependencies only, and in the closure they reach
+through the workspace's manifests and `Cargo.lock` equal its row in
+`tools/ratchets/third-party.txt`, which only shrinks, and a crate with no row is held to none. A
+fork under `vendor/` counts as third-party unless its manifest says
+`[package.metadata.blaze] ours = true`. A change over its row is refused with the new packages and
+the manifest lines they came in by (`scripts/src/bin/thirdparty.rs`); `docs/v2/plan/third-party.md`
+says what replaces each.
+
 blaze's machinery stays out of the front end, in crates of its own: the code generator's backends, object and debug-info
 writing, the linker, the daemon and its socket, the cargo drop-in, the store and the remote,
 the sandbox, and the harnesses. A change there is one ordinary

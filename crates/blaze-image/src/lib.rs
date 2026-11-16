@@ -1,4 +1,4 @@
-//! The daemon's image (docs/v2/plan/design/restore.md): the database's memos, values, edges
+//! The daemon's image: the database's memos, values, edges
 //! and fingerprints, the interners, the VFS tree and the plane's history in one file, mapped
 //! and used in place. Restoring is mapping the file and checking its spine; nothing is
 //! deserialized, rebuilt or rehashed, and a page is read when something first reads it.
@@ -93,8 +93,7 @@ impl SectionId {
     /// retired once the daemon's image (`blaze_cargo::serve::image`) stops writing it.
     pub const ADMISSION_PEAKS: SectionId = SectionId(0x0401);
     /// Ids no blaze writes any more and none may take again: an image of the layout before still
-    /// holds them, and its owner's start reads around them (a restart restores no engine state,
-    /// docs/v2/plan/design/end-state.md). `0x0100..=0x0104` held the old database's memos,
+    /// holds them, and its owner's start reads around them (a restart restores no engine state). `0x0100..=0x0104` held the old database's memos,
     /// edges, key table, inputs and values, `0x0200` `intern`'s symbol table, `0x0500` and
     /// `0x0501` the query database's interned rows and graph, `0x0600` the library files' syntax
     /// trees, `0x0700` the front end's carry sessions (now a journal mark a checkout,

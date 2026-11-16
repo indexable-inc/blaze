@@ -3,7 +3,7 @@
 //! registered, documented and `allow` by default, and its message says X is planned. Each
 //! switch is one `const`, read by this crate's table (the lint's default level) and by
 //! blaze-lints (the same default, and which text its findings carry), so the two cannot
-//! disagree. docs/lints.md's table of defaults is held to these by blaze-lints' tests. A
+//! disagree. A
 //! workspace can wait for a switch too: a line of `[workspace.metadata.blaze.lints-when-ready]`
 //! sets its lint's level once the lint's switch is `true` and nothing until then (blaze-units'
 //! `workspace_lints`).

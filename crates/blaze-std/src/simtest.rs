@@ -194,10 +194,14 @@ where
 /// The attribute of a simulation test (the module's doc): `#[bstd::test]` on a function
 /// shaped like `main`, `fn(cx: &Cx, io: Io)`, returning `()` or a `Result`. A fault kind is
 /// left out by name: `#[bstd::test(without(Crashes, IoFailures))]`
-/// ([`crate::test::Fault`]).
+/// ([`crate::test::Fault`]). One seed alone, the one a failure named, is
+/// `#[bstd::test(seed = 41)]` (or `seed = 41, without(..)`): the seed is an argument of the
+/// test, never drawn from the machine (rule nothing-ambient), and every failure says its seed
+/// and the line that replays it. Generated inputs are `blaze_sim::check`'s, another engine:
+/// it draws a case from a tape, where this draws a world from a seed.
 #[macro_export]
 macro_rules! test {
-    attr($(without($($fault:ident),+ $(,)?))?) (
+    attr($(seed = $seed:literal $(,)?)? $(without($($fault:ident),+ $(,)?))?) (
         $(#[$meta:meta])*
         $vis:vis fn $name:ident($($params:tt)*) $(-> $returns:ty)? $body:block
     ) => {
@@ -209,7 +213,7 @@ macro_rules! test {
                 ::core::env!("CARGO_PKG_NAME"),
                 ::core::module_path!(),
                 ::core::stringify!($name),
-                $crate::test::Seeds::DEFAULT $($(.without($crate::test::Fault::$fault))+)?,
+                $crate::test::Seeds::DEFAULT $(.from($seed, 1))? $($(.without($crate::test::Fault::$fault))+)?,
                 $name,
             )
         }

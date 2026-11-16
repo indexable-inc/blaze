@@ -3,8 +3,7 @@
 //! not, and hashing one of this crate's facts again allocates nothing.
 //!
 //! The tests of the read classifier (the rule table; sealed rows) went with it: on blaze-memo a
-//! step's read list is what `blaze_memo::record` lists (docs/v2/plan/design/front-end-on-memo.md
-//! rule 5). What the rows of real steps stand for is `super::steps`'.
+//! step's read list is what `blaze_memo::record` lists. What the rows of real steps stand for is `super::steps`'.
 
 use std::sync::Arc;
 

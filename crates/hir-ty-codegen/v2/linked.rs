@@ -1,7 +1,7 @@
 //! What the link takes of a build besides its code: the native libraries a crate's
 //! `#[link(..)]`s name ([`HirFrontend::linked`]), and the span tables the code's positions
 //! name ([`HirFrontend::link_inputs`]), kept between links so that a link after an edit makes
-//! the tables the edit changed (docs/v2/plan/design/patch-in-place.md).
+//! the tables the edit changed.
 
 #[cfg(test)]
 mod tests;

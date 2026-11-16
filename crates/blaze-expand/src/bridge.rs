@@ -1,4 +1,4 @@
-//! The portable form to tt's token trees and back, for mbe and the derive writers.
+//! The portable form to tt's token trees and back, for mbe and `stringify!`.
 //!
 //! A token on its way through them gets a span that says where it is from and nothing else:
 //! its anchor's file is the stream's role ([`Role`]), its range starts at twice its index
@@ -6,7 +6,7 @@
 //! source tokens holds), and its context is the root of its edition. Every span that comes
 //! back maps to an [`Origin`]; one of another anchor is refused.
 
-use std::alloc::Allocator;
+use core::alloc::Allocator;
 
 use intern::Symbol;
 use span::{
@@ -130,39 +130,23 @@ fn spacing_of(span: Span) -> Spacing {
     }
 }
 
-/// Whether `#[automatically_derived]` goes before each `impl` the derive writes.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum MarkImpls {
-    No,
-    Yes,
-}
-
 /// Appends the token trees of `iter` to `out`, each with the origin its span names.
 pub(crate) fn from_tt<A: Allocator + Clone>(
     out: &mut Out<'_, A>,
     iter: tt::TtIter<'_>,
     made: Transparency,
-    mark_impls: MarkImpls,
-    depth: u32,
 ) -> Result<(), ExpandError> {
     for element in iter {
         match element {
             tt::TtElement::Leaf(tt::Leaf::Ident(ident)) => {
                 let origin = origin_of(ident.span, made)?;
                 let raw = if ident.is_raw.yes() { Raw::Yes } else { Raw::No };
-                if mark_impls == MarkImpls::Yes
-                    && depth == 0
-                    && matches!(origin, Origin::Made(_))
-                    && raw == Raw::No
-                    && ident.sym.as_str() == "impl"
-                {
-                    out.automatically_derived()?;
-                }
                 let kind = TokenKind::Ident { raw, spacing: spacing_of(ident.span) };
                 out.push(kind, ident.sym.as_str(), origin)?;
             }
             tt::TtElement::Leaf(tt::Leaf::Punct(punct)) => {
-                let kind = TokenKind::Punct { char: punct.char, spacing: Spacing::of_tt(punct.spacing) };
+                let kind =
+                    TokenKind::Punct { char: punct.char, spacing: Spacing::of_tt(punct.spacing) };
                 out.push(kind, "", origin_of(punct.span, made)?)?;
             }
             tt::TtElement::Leaf(tt::Leaf::Literal(literal)) => {
@@ -176,8 +160,7 @@ pub(crate) fn from_tt<A: Allocator + Clone>(
             tt::TtElement::Subtree(subtree, inner) => {
                 let delim = Delim::of_tt(subtree.delimiter.kind);
                 out.push(TokenKind::Open(delim), "", origin_of(subtree.delimiter.open, made)?)?;
-                let depth = if delim == Delim::Invisible { depth } else { depth + 1 };
-                from_tt(out, inner, made, mark_impls, depth)?;
+                from_tt(out, inner, made)?;
                 out.push(TokenKind::Close(delim), "", origin_of(subtree.delimiter.close, made)?)?;
             }
         }

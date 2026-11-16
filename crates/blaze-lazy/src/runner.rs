@@ -8,8 +8,9 @@
 //!   is placed), then publishes its slot: one release store of the slot's word after the code
 //!   is written and visible to the process's instruction fetch (blaze-link into
 //!   blaze-inproc's code memory, whose publish does the cache maintenance).
-//! - [`Answers`] sends a frame to a run process and stops one; [`Runs`] is blaze-inproc's, and
-//!   [`Runner::serve`] reads one run process's asks.
+//! - [`Answers`] sends a frame to a run process and stops one; [`Runner::frame`] takes one
+//!   of its asks. (The daemon's `Answers` over blaze-inproc's channel, `Runs`, and its reader
+//!   of a run process's asks, `Runner::serve`, were deleted with the daemon on 2026-11-15.)
 //! - With a [`TierUp`], a run whose functions start at tier 0 (blaze-stencil) is tiered up:
 //!   blaze-stencil's tier [`tier::Runner`] reads each function's counter cells through a
 //!   [`Cells`] view, and recompiles a hot one with [`Compiler::tier_up`], which
@@ -37,9 +38,9 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use blaze_codegen::{CompiledFunction, InstanceKey};
-use blaze_hash::{HashMap, SharedMap};
+use blaze_hash::HashMap;
 use blaze_inproc::CellView;
-use blaze_inproc::ask::{self, Reader, Sender};
+use blaze_inproc::ask;
 use blaze_inproc::frame::Kind;
 use blaze_items::{CodeHash, ItemKey};
 use blaze_stencil::tier::{self, Tier};
@@ -292,23 +293,6 @@ impl<C: Compiler, P: Placer, A: Answers> Runner<C, P, A> {
             }
         }
         Ok(Runner { shared, threads })
-    }
-
-    /// Reads `client`'s asks from `reader` until it ends or sends what is not an ask: why, for
-    /// the daemon to stop the run with when it still runs. Blocking: on a thread of the run's.
-    pub fn serve(&self, client: u32, reader: &mut Reader) -> String {
-        loop {
-            let frame = match reader.recv() {
-                Ok(frame) => frame,
-                Err(error) => return error.to_string(), // alloc: the run's end
-            };
-            if let Err(error) = self.frame(client, frame.kind, frame.seq, frame.body) {
-                // alloc: the run's end.
-                return format!(
-                    "process {client} asked what is not a lazy function's code: {error}"
-                );
-            }
-        }
     }
 
     /// A blaze-inproc frame of `kind` and sequence number `seq` from `client`'s run process,
@@ -765,52 +749,6 @@ pub(crate) fn fit(why: &str) -> &str {
     }
     let end = (0..=most).rev().find(|it| why.is_char_boundary(*it)).unwrap_or(0);
     &why[..end]
-}
-
-/// The [`Answers`] of one runner's run processes, which blaze-inproc started: each one's
-/// [`Sender`], by process ID, its client. A run whose answer can't be sent, or that called a
-/// function that can't be compiled, is killed, that its error.
-#[derive(Default)]
-pub struct Runs {
-    senders: SharedMap<u32, Sender>,
-}
-
-impl Runs {
-    /// Answers `sender`'s process from now on: its client.
-    pub fn add(&self, sender: Sender) -> u32 {
-        let client = sender.pid();
-        self.senders.pin().insert(client, sender);
-        client
-    }
-
-    /// Once `client`'s process ended.
-    pub fn remove(&self, client: u32) {
-        self.senders.pin().remove(&client);
-    }
-}
-
-fn kill(sender: &Sender, why: &str) {
-    if let Err(error) = sender.kill(why) {
-        eprintln!("blaze-lazy: {error}");
-    }
-}
-
-impl Answers for Runs {
-    fn send(&self, client: u32, seq: u32, kind: Kind, body: &[u8]) {
-        let senders = self.senders.pin();
-        let Some(sender) = senders.get(&client) else { return };
-        if let Err(error) = sender.send(kind, seq, body) {
-            // alloc: the run's end.
-            kill(sender, &format!("answering its ask for a lazy function's code: {error}"));
-        }
-    }
-
-    /// Kills every run process it answers: they run one program, which called the function.
-    fn stop(&self, _: Option<(InstanceKey, ItemKey)>, why: &str) {
-        for sender in self.senders.pin().values() {
-            kill(sender, why);
-        }
-    }
 }
 
 // dyn: a panic's payload, which is what `catch_unwind` gives.

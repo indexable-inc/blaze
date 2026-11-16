@@ -11,9 +11,7 @@ verdict: the same errors, on the same lines, and none where rustc gives none. At
 scoring it gave rustc's verdict on 99.8% of the rustc borrow-check tests in scope, and on
 every one rustc accepts; how they were scored and what is left is below.
 
-It runs as part of the front end's diagnostics (`crates/hir/src/diagnostics.rs`), in each
-unit's check beside its codegen (`crates/blaze-cargo/src/serve/unit/checks.rs`), and `blaze
-check` reports what it finds. A build it finds a borrow-check error in fails (below), but the
+It runs as part of the front end's diagnostics, in each unit's check, and `blaze check` reports what it finds. A build it finds a borrow-check error in fails (below), but the
 checker still misses some errors rustc gives (What is left, below).
 
 ## Refusing builds
@@ -686,8 +684,8 @@ missed rather than errors made up:
 
 ## What it costs
 
-A unit's check runs beside its codegen (`crates/blaze-cargo/src/serve/unit/checks.rs`), so
-it adds to a build only when it takes longer than the codegen. The numbers below are v1's,
+In v1 a unit's check ran beside its codegen, so
+it added to a build only when it takes longer than the codegen. The numbers below are v1's,
 whose daemon checked the edited files on a thread of their own beside the build.
 For an edit of the corpus's largest file, the check went from a median of 40 ms with the
 checker off to 52-74 ms with it on, while the build took 250-400 ms. A cold check of all of

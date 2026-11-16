@@ -1,6 +1,6 @@
 [package]
 name = "blaze-hash"
-description = "blaze v2's in-memory hashing: maps and sets on foldhash with a fixed seed, and the identity hasher for keys that are hashes already"
+description = "blaze v2's in-memory hashing: maps and sets on a port of foldhash with a fixed seed, and the identity hasher for keys that are hashes already"
 publish = false
 
 version.workspace = true
@@ -13,15 +13,28 @@ repository.workspace = true
 [lib]
 doctest = false
 
+# Adapters to crates from outside the workspace, which the crates above turn on (the root
+# manifest's `blaze-hash` entry): with none on, this crate's one dependency is hashbrown, with
+# no dependency of its own (docs/v2/plan/design/bottom.md, "Also decided on 2026-11-15").
+[features]
+# serde's forms of `Map` and `Set`.
+serde = ["dep:serde", "hashbrown/serde"]
+# `SharedMap`, `SharedSet` and `SharedByHash`: papaya's lock-free tables on these hashers.
+shared = ["dep:papaya"]
+
 [dependencies]
-foldhash.workspace = true
-hashbrown.workspace = true
-papaya.workspace = true
-serde.workspace = true
+# Named here, not `.workspace`: the workspace entry would turn on its `serde` feature for every
+# crate, which this crate's own graph must not hold. The same version and features otherwise.
+hashbrown = { version = "0.17.1", default-features = false, features = ["inline-more", "nightly"] }
+papaya = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 blaze-sim.workspace = true
+# What `fold` is a port of: `fold_is_foldhash` holds it to this, and `hash_cost` measures its
+# random-seeded form.
+foldhash.workspace = true
 # What `IndexMap` replaces: the other side of `collections_cost`'s rows.
 indexmap.workspace = true
 

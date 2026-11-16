@@ -1,6 +1,5 @@
 //! What a set of roots reaches in a graph that is edited, kept through each edit by work in
-//! proportion to what the edit changes (docs/v2/plan/design/incremental-walk.md, "Added and
-//! removed edges"): the delete and re-derive rule of incremental view maintenance (DRed).
+//! proportion to what the edit changes: the delete and re-derive rule of incremental view maintenance (DRed).
 //!
 //! The graph is items and the edges of what each refers to. A *set* is what some roots
 //! reach: the walk keeps two over one graph, everything its check's roots and its own reach

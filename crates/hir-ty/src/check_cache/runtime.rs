@@ -1,5 +1,5 @@
-//! A dependency's runtime MIR, lowered once for everyone (docs/v2/plan/design/restore.md,
-//! "Bodies, inference and MIR as records"): each MIR owner of a crate (a body, a closure, a
+//! A dependency's runtime MIR, lowered once for everyone:
+//! each MIR owner of a crate (a body, a closure, a
 //! coroutine, an anonymous constant of a body) as one entry of the crate's bodies value
 //! ([`super::pages`]), its body at [`MirStage::Runtime`], the stage code generation reads and
 //! every optimized body is made from.

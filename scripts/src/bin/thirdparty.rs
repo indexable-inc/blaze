@@ -3,9 +3,9 @@
 //! error prints; it says what each count is, what a workspace crate is, how a dependency is
 //! resolved, what the TOML reader refuses, and the rule.
 //!
-//!     blaze run -q -p scripts --bin deps -- '{"command": "check", "base": "origin/main"}'
-//!     blaze run -q -p scripts --bin deps -- '{"command": "write"}'
-//!     blaze run -q -p scripts --bin deps -- selftest
+//!     blaze run -q -p scripts --bin thirdparty-- '{"command": "check", "base": "origin/main"}'
+//!     blaze run -q -p scripts --bin thirdparty-- '{"command": "write"}'
+//!     blaze run -q -p scripts --bin thirdparty-- selftest
 //!
 //! Why (2026-11-15): Andrew decided the compiler has no third-party crates ("we should have 0
 //! third party"). Measured on main that day: 413 third-party packages in the lock graph, 102 named
@@ -19,9 +19,9 @@
 /// What the usage error prints.
 const DOC: &str = r#"deps: the third-party packages each workspace crate depends on only go down, to none (docs/v2/plan/design/bottom.md, "Also decided on 2026-11-15").
 
-    blaze run -q -p scripts --bin deps -- '{"command": "check", "base": "<rev>"}'
-    blaze run -q -p scripts --bin deps -- '{"command": "write"}'
-    blaze run -q -p scripts --bin deps -- selftest
+    blaze run -q -p scripts --bin thirdparty-- '{"command": "check", "base": "<rev>"}'
+    blaze run -q -p scripts --bin thirdparty-- '{"command": "write"}'
+    blaze run -q -p scripts --bin thirdparty-- selftest
 
     command   check   each count of every workspace crate, and of `(all)`, equals its row's in
                       the list: one over its row is refused, naming each package that is new
@@ -82,7 +82,7 @@ use blaze_script::{
     read_text, universal_newlines,
 };
 
-const SCRIPT: &str = "deps";
+const SCRIPT: &str = "thirdparty";
 /// The list, from the root.
 const LIST: &str = "tools/ratchets/third-party.txt";
 /// The list's row of the whole workspace: no package's name, which has no parentheses.
@@ -107,7 +107,7 @@ const HEADER: &str = "# The third-party packages each workspace crate depends on
                       # named in its normal and build dependencies; `dev`: in its dev-dependencies only; `closure`:\n\
                       # reached by its normal and build dependencies, through the workspace's crates and Cargo.lock.\n\
                       # A package is a name and a version. `(all)` is the workspace's, each package once. Only\n\
-                      # shrinks; a crate with no row is held to 0. Written by scripts/src/bin/deps.rs\n\
+                      # shrinks; a crate with no row is held to 0. Written by scripts/src/bin/thirdparty.rs\n\
                       # (`{\"command\": \"write\"}`), checked in CI; docs/v2/plan/third-party.md says what replaces each.\n\
                       # crate\tdirect\tdev\tclosure\n";
 
@@ -192,7 +192,7 @@ struct TomlError {
 
 impl fmt::Display for TomlError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}:{}: {} (scripts/src/bin/deps.rs reads manifests and Cargo.lock as a TOML subset)", self.file, self.line, self.what)
+        write!(f, "{}:{}: {} (scripts/src/bin/thirdparty.rs reads manifests and Cargo.lock as a TOML subset)", self.file, self.line, self.what)
     }
 }
 
@@ -735,7 +735,7 @@ impl fmt::Display for DepsError {
             DepsError::Unreadable { path, why } => write!(f, "{path} could not be read: {why}"),
             DepsError::Shape { at, key, want } => write!(f, "{at}: `{key}` is not {want}"),
             DepsError::Glob { at, pattern } => {
-                write!(f, "{at}: the member pattern {pattern:?} is neither a path nor `<dir>/*`, the two forms scripts/src/bin/deps.rs expands")
+                write!(f, "{at}: the member pattern {pattern:?} is neither a path nor `<dir>/*`, the two forms scripts/src/bin/thirdparty.rs expands")
             }
             DepsError::Outside { at, path } => write!(f, "{at}: the path {path:?} leaves the repository"),
             DepsError::NoWorkspaceDep { at, key } => {
@@ -1041,8 +1041,6 @@ struct Manifest {
     dir: String,
     file: String,
     name: String,
-    /// A member of the workspace: its dev-dependencies are resolved.
-    member: bool,
     /// A workspace crate: not under vendor/, or a fork there that says it is ours.
     ours: bool,
     /// Its dependencies in line order; a non-member's without its dev-dependencies.
@@ -1071,7 +1069,7 @@ fn workspace(tree: &dyn Tree) -> Result<BTreeMap<String, Manifest>, DepsError> {
         .iter()
         .map(|it| it.trim_end_matches('/').to_owned())
         .collect();
-    let globbed = |text: &str| text.contains(|c| matches!(c, '*' | '?' | '[' | ']'));
+    let globbed = |text: &str| text.contains(|c: char| matches!(c, '*' | '?' | '[' | ']'));
     let mut members: BTreeSet<String> = BTreeSet::new();
     if root.entries.contains_key("package") {
         members.insert(String::new());
@@ -1148,7 +1146,7 @@ fn workspace(tree: &dyn Tree) -> Result<BTreeMap<String, Manifest>, DepsError> {
         if let Some(first) = out.get(&name) {
             return Err(DepsError::TwoPackages { name, first: first.file.clone(), second: file });
         }
-        out.insert(name.clone(), Manifest { dir, file, name, member, ours, deps });
+        out.insert(name.clone(), Manifest { dir, file, name, ours, deps });
     }
     Ok(out)
 }
@@ -1224,7 +1222,7 @@ fn may_be(req: &str, version: &str) -> Option<bool> {
     };
     let parts = |text: &str| -> Option<Vec<u64>> { text.split('.').map(|it| it.parse::<u64>().ok()).collect() };
     let want = parts(req)?;
-    let have = parts(version.split(|c| c == '-' || c == '+').next()?)?;
+    let have = parts(version.split(|c: char| c == '-' || c == '+').next()?)?;
     if want.is_empty() || want.len() > 3 || have.len() != 3 {
         return None;
     }
@@ -1798,7 +1796,7 @@ a = { path = "../../crates/a" }
 
 const FIXTURE_FORKED: &str = "[package]\nname = \"forked\"\nversion = \"1.0.0\"\n\n[dependencies]\nlibc = \"0.2\"\n";
 const FIXTURE_MINE: &str = "[package]\nname = \"mine\"\nversion = \"1.0.0\"\n\n[package.metadata.blaze]\nours = true\n";
-/// Excluded: if it were read, `huge`, which Cargo.lock lists not, would be refused.
+/// Excluded: if it were read, it would be refused, as Cargo.lock has no entry for it.
 const FIXTURE_PARKED: &str = "[package]\nname = \"parked\"\n\n[dependencies]\nhuge = \"1\"\n";
 
 const FIXTURE_LOCK: &str = r#"# This file is automatically @generated by Cargo.
@@ -2099,10 +2097,10 @@ fn selftest() {
         upstream.get("a").is_some_and(|it| it.direct.get(&pkg("mine", "1.0.0")) == Some(&place(a_toml, 11))) && !upstream.contains_key("mine"),
         "a fork under vendor/ is third-party unless its manifest says it is ours",
     );
-    // Planted: the exclusion taken out, the parked crate is read, and its unlocked dependency
-    // refused.
+    // Planted: the exclusion taken out, the parked crate is read, and refused: the lock has no
+    // entry for it.
     expect(
-        matches!(refused(&[(ROOT, "exclude = [\"crates/parked\"]\n", "")]), Some(DepsError::NotInLock { krate, .. }) if krate == "parked"),
+        matches!(refused(&[(ROOT, "exclude = [\"crates/parked\"]\n", "")]), Some(DepsError::CrateNotLocked { krate, .. }) if krate == "parked"),
         "an excluded member is not read",
     );
     expect(

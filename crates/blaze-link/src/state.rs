@@ -13,10 +13,6 @@
 
 #![forbid(unsafe_code)]
 
-mod kept;
-
-pub(crate) use kept::Opening;
-
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::sync::Arc;

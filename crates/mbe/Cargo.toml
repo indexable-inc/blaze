@@ -21,7 +21,6 @@ rustc_lexer.workspace = true
 bitflags.workspace = true
 
 # local deps
-base-db.workspace = true
 blaze-mem.workspace = true
 parser.workspace = true
 tt.workspace = true

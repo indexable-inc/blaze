@@ -403,7 +403,7 @@ const NO_DAEMON: &[Flag] = &[Flag::switch("no-daemon")];
 /// ([`super::replace`]), and checks nothing; `--rules FILE` makes every rewrite of an astlog
 /// rules file the same way, after the replaces; `--dry-run` prints the diff either would write
 /// and writes nothing; `--query FILE` prints what a rules file derives and finds, and writes
-/// nothing (docs/v2/plan/design/astlog-sema.md).
+/// nothing.
 const CHECK_ONLY: &[Flag] = &[
     Flag::switch("fix"),
     Flag::new("lint", None, Takes::Value, "NAME").many(),

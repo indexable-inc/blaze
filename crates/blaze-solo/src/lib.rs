@@ -1,5 +1,4 @@
-//! A command alone drives the kernel (docs/v2/plan/design/end-state.md, the no-daemon end
-//! state, piece 1): every command is a process that reads the checkout's on-disk state, redoes
+//! A command alone drives the kernel (the no-daemon end state, piece 1): every command is a process that reads the checkout's on-disk state, redoes
 //! only what changed, saves, and exits. No daemon, no watcher, no lease.
 //!
 //! - [`table`]: the leaf table, one a checkout: sorted rows `(path, stamp, content id or not

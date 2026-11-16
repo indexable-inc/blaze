@@ -17,8 +17,7 @@
 //!   of a body leaves it as it was.
 //! - `TraitsInScope(module)`: the traits in scope in a module (its blocks', its own and the
 //!   prelude's, as `module_trait_set` gives them), by key, sorted: what a read of a scope's
-//!   traits by a body's step stands for (docs/v2/plan/design/restore.md, "One form, a
-//!   function: the end state").
+//!   traits by a body's step stands for.
 //! - `WholeScope(module)`: every name of a module's scope with what it is there (each name's
 //!   `Resolves` value): what a read of a whole scope stands for, an iteration and never a
 //!   lookup. Any name added to the module changes it; it is per module, never per crate.

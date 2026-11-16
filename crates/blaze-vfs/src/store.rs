@@ -16,7 +16,7 @@
 //!   long as anything it lends lives; a replaced table is freed once every such task has ended.
 //! - Names are interned once, as spans of one byte column; a table hands its names on to the
 //!   next generation with their numbers.
-//! - A table restored from the daemon's image (docs/v2/plan/design/restore.md) starts with a
+//! - A table restored from the daemon's image starts with a
 //!   **base**: its nodes, entries, names and both indexes are the image's own bytes, checked
 //!   once ([`Base::check`]) and read in place; nodes made after are appended in the columns
 //!   with numbers after the base's, and the index of the appended ones is probed after the

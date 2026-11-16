@@ -216,19 +216,19 @@ jobs:
       # workspace's manifests and Cargo.lock equal its row of tools/ratchets/third-party.txt, a
       # crate with no row is held to 0, and no row is above the base's; a count over its row has
       # its new packages named with the manifest line they came in by, from the base's manifests
-      # and lock (scripts/src/bin/deps.rs). It reads the TOML itself and starts no cargo. Against
+      # and lock (scripts/src/bin/thirdparty.rs). It reads the TOML itself and starts no cargo. Against
       # the base itself: the checkout is shallow.
       - name: third-party dependencies only go down
         env:
           BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
         run: |
-          "$BLAZE_SCRIPTS/deps" selftest
+          "$BLAZE_SCRIPTS/thirdparty" selftest
           if [ -n "$BASE" ]; then
             git fetch -q --depth=1 origin "$BASE"
-            "$BLAZE_SCRIPTS/deps" "{\"command\": \"check\", \"base\": \"$BASE\"}"
+            "$BLAZE_SCRIPTS/thirdparty" "{\"command\": \"check\", \"base\": \"$BASE\"}"
           else
             echo "no base to compare with (a run by hand): each crate is held to its row only"
-            "$BLAZE_SCRIPTS/deps" '{"command": "check"}'
+            "$BLAZE_SCRIPTS/thirdparty" '{"command": "check"}'
           fi
       # Every SCHEMA/LAYOUT/FORMAT/MAGIC/VERSION constant under crates/ has a row of
       # scripts/layouts.txt, and a persisted one whose value changed against the base names its

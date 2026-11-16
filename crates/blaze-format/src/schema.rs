@@ -347,7 +347,7 @@ mod tests {
         let long = "a context longer than one block of sixty-four bytes, so the key takes two";
         let input = bytes(3000);
         let expected =
-            blaze_ids::b3::official::Hasher::new_derive_key(long).update(&input).finalize();
+            blaze_ids::b3::Hasher::new_derive_key(long).update(&input).finalize();
         assert_eq!(derive_key(long, Input::Bytes(&input)), expected);
     }
 

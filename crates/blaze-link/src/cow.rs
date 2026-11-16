@@ -18,8 +18,6 @@
 
 #![forbid(unsafe_code)]
 
-mod kept;
-
 use std::alloc::{Allocator, Global};
 use std::borrow::Cow;
 use std::cell::RefCell;

@@ -5,8 +5,8 @@
 //! linked: a cold hello-world made the codegen walk of all it reaches (2,938 ms of 9,727 ms)
 //! for some 210 functions it calls.
 //!
-//! What a launched run does not do ahead, exactly (docs/v2/plan/design/end-state.md, the
-//! owner's decision 2). `blaze build`, `check`, `test` and release profiles are not launched:
+//! What a launched run does not do ahead, exactly (the owner's decision 2
+//! of the end state). `blaze build`, `check`, `test` and release profiles are not launched:
 //! they walk whole and refuse ahead. A launched run still checks ahead every body's type and
 //! borrow check (the unit's check, outside this crate) and a symbol defined twice among its
 //! roots (here, as [`Build::reach`] does over its walk).

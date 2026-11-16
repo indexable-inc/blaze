@@ -71,7 +71,7 @@
 //! over ([`Buffers::build`]).
 
 use arrayvec::ArrayVec;
-use base_db::Db;
+
 use blaze_mem::frame::Frame;
 use intern::sym;
 use tt::{
@@ -727,13 +727,12 @@ impl<'t> Bindings<'t> {
 
 /// Matching errors are added to the `Match`.
 pub(super) fn match_<'t>(
-    db: &Db,
     matcher: &Matcher,
     input: &'t tt::TopSubtree,
     buffers: &mut Buffers<'t>,
     res: &mut Match<'t>,
 ) {
-    match_loop(db, matcher, input, buffers, res, None);
+    match_loop(matcher, input, buffers, res, None);
     let bindings = &res.bindings;
     res.bound_count = bindings
         .roots
@@ -766,7 +765,6 @@ fn token_span(token: &Option<TtElement<'_>>, delim_span: DelimSpan) -> span::Spa
 ///   errors, used for error-resilient parsing. And `stack`, the "parent" frames of the input.
 #[inline]
 fn match_loop_inner<'t>(
-    db: &Db,
     matcher: &Matcher,
     src: &TtIter<'t>,
     res: &mut Match<'t>,
@@ -863,7 +861,7 @@ fn match_loop_inner<'t>(
                 if let Some(kind) = kind {
                     // clone: a cursor, one view.
                     let mut fork = src.clone();
-                    let match_res = match_meta_var(db, kind, &mut fork, delim_span);
+                    let match_res = match_meta_var(kind, &mut fork, delim_span);
                     match match_res.err {
                         None => {
                             // Some meta variables are optional (e.g. vis)
@@ -1008,7 +1006,6 @@ fn match_loop_inner<'t>(
 }
 
 fn match_loop<'t>(
-    db: &Db,
     matcher: &Matcher,
     input: &'t tt::TopSubtree,
     a: &mut Buffers<'t>,
@@ -1033,7 +1030,7 @@ fn match_loop<'t>(
 
         assert!(a.next_items.is_empty());
 
-        match_loop_inner(db, matcher, &src, res, a, span, track.as_deref_mut());
+        match_loop_inner(matcher, &src, res, a, span, track.as_deref_mut());
         assert!(a.cur_items.is_empty());
 
         if let Some(item) = a.error_items.pop() {
@@ -1060,7 +1057,7 @@ fn match_loop<'t>(
                 if a.eof_items.is_empty()
                     && let Some(track) = track
                 {
-                    track.fail(db, None);
+                    track.fail(None);
                 }
             }
             return;
@@ -1082,7 +1079,7 @@ fn match_loop<'t>(
                 && a.next_items.is_empty()
                 && let Some(track) = track
             {
-                track.fail(db, Some(&src));
+                track.fail(Some(&src));
             }
 
             if let Some(item) = error_recover_item {
@@ -1153,7 +1150,6 @@ fn match_loop<'t>(
 }
 
 fn match_meta_var<'t>(
-    db: &Db,
     kind: MetaVarKind,
     input: &mut TtIter<'t>,
     delim_span: DelimSpan,
@@ -1161,7 +1157,6 @@ fn match_meta_var<'t>(
     let fragment = match kind {
         MetaVarKind::Path => {
             return fragment_parsed(expect_fragment(
-                db,
                 input,
                 parser::PrefixEntryPoint::Path,
                 delim_span,
@@ -1170,7 +1165,6 @@ fn match_meta_var<'t>(
         }
         MetaVarKind::Ty => {
             return fragment_parsed(expect_fragment(
-                db,
                 input,
                 parser::PrefixEntryPoint::Ty,
                 delim_span,
@@ -1203,7 +1197,6 @@ fn match_meta_var<'t>(
                 _ => {}
             };
             return fragment_parsed(expect_fragment(
-                db,
                 input,
                 parser::PrefixEntryPoint::Expr,
                 delim_span,
@@ -1252,7 +1245,7 @@ fn match_meta_var<'t>(
         MetaVarKind::Vis => (parser::PrefixEntryPoint::Vis, TokensOrigin::Ast),
     };
     let (entry_point, origin) = fragment;
-    fragment_parsed(expect_fragment(db, input, entry_point, delim_span))
+    fragment_parsed(expect_fragment(input, entry_point, delim_span))
         .map(|tree| Fragment::Tokens { tree, origin })
 }
 

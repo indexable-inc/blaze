@@ -1,6 +1,6 @@
 [package]
 name = "blaze-lazy"
-description = "blaze v2's lazy compilation: a dev run or test compiles only the functions that execute; every other function is a stub that fetches its code from the daemon on first call"
+description = "blaze v2's lazy compilation: a run compiles only the functions that execute; every other function is a stub whose first call fetches its code: the stubs and resolver, the single-flight fetcher, the plan of what is compiled ahead"
 publish = false
 
 version.workspace = true
@@ -13,30 +13,23 @@ repository.workspace = true
 [lib]
 doctest = false
 
-[features]
-default = ["daemon"]
-# The daemon's side: plans, stubs, the fetcher and its runner. A lazy run's image links the
-# crate without it, for the hook its stubs call and the frames it sends.
-daemon = ["dep:blaze-codegen", "dep:blaze-ids", "dep:blaze-items", "dep:blaze-mem", "dep:blaze-stencil", "dep:blaze-hash", "dep:crossbeam-queue"]
-
 [dependencies]
 blaze-core.workspace = true
 blaze-bytes.workspace = true
-blaze-hash = { workspace = true, optional = true }
+blaze-hash.workspace = true
 blaze-inproc.workspace = true
-blaze-codegen = { workspace = true, optional = true }
-blaze-ids = { workspace = true, optional = true }
-blaze-items = { workspace = true, optional = true }
-blaze-mem = { workspace = true, optional = true }
+blaze-codegen.workspace = true
+blaze-ids.workspace = true
+blaze-items.workspace = true
+blaze-mem.workspace = true
 blaze-spin.workspace = true
 # Tier-up: when a run's code is recompiled at a higher tier (`blaze_stencil::tier`).
-blaze-stencil = { workspace = true, optional = true }
-crossbeam-queue = { workspace = true, optional = true }
+blaze-stencil.workspace = true
+crossbeam-queue.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 blaze-cas.workspace = true
-blaze-ids.workspace = true
 
 [target.'cfg(unix)'.dev-dependencies]
 libc.workspace = true

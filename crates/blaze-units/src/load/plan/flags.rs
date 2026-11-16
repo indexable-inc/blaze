@@ -265,8 +265,7 @@ pub(crate) const WORKSPACE_LINTS_WHEN_READY: &str = "[workspace.metadata.blaze.l
 /// [`WORKSPACE_LINTS`] when a workspace has the table, which a released blaze does not read (it
 /// refuses a name it does not know in [`WORKSPACE_LINTS`], and the levels there must hold for
 /// the release that checks the workspace too). Its lints are `deny`, and each crate a lint's
-/// baseline lists is held at `warn` by [`ratchet_downgrades`]: the list only shrinks
-/// (docs/lints.md, "Workspace levels and the ratchet").
+/// baseline lists is held at `warn` by [`ratchet_downgrades`]: the list only shrinks.
 pub(crate) const WORKSPACE_LINTS_RATCHET: &str = "[workspace.metadata.blaze.lints-ratchet]";
 
 /// The key of [`WORKSPACE_LINTS_RATCHET`] naming the directory of the lints' baselines

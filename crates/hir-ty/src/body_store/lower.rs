@@ -1,5 +1,5 @@
-//! A body's lowering as a step of the item store (docs/v2/plan/design/restore.md, "Bodies,
-//! inference and MIR as records", the plan for `Step::Lower`): [`Step::Lower`], what the body's
+//! A body's lowering as a step of the item store (the plan for
+//! `Step::Lower`): [`Step::Lower`], what the body's
 //! lowering gives that its later steps need before they run, found by the item's own content
 //! and the facts the lowering read, with no lowering.
 //!

@@ -1,5 +1,4 @@
-//! The bottom of the front end as kernel steps (docs/v2/plan/design/end-state.md, "The front
-//! end as kernel steps", the review's points 3, 4 and 7, piece 2 of its order).
+//! The bottom of the front end as kernel steps (the end state's review's points 3, 4 and 7, piece 2 of its order).
 //!
 //! - [`items::file_items`] is `items(file)`: a pure function of a file's tree giving a table,
 //!   one [`entry::Entry`] an item under a stable, content-hashed [`entry::ItemId`], with the

@@ -12,8 +12,8 @@
 //! - **A node's bytes are a function of the entries under it** (rule 25): a subtree of at most
 //!   [`LEAF`] entries is one leaf, its entries in key order; any other is a branch of its
 //!   children in nibble order. Nothing is ever taken out, so an update keeps that form.
-//! - **What it costs on disk.** The store pays a fixed overhead a record
-//!   (docs/v2/plan/design/end-state/disk.md), so the records are what is counted: a map of `n`
+//! - **What it costs on disk.** The store pays a fixed overhead a record,
+//!   so the records are what is counted: a map of `n`
 //!   keys is between `n / 64` and `n / 4` leaves (a leaf of 65 becomes up to 16) and a
 //!   sixteenth as many branches, at most about 0.27 records a key. A changed key writes its
 //!   leaf and the branches above it anew: `1 + log16(n / LEAF)` records, the leaf's other

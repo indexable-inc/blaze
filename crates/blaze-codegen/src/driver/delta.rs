@@ -1,7 +1,7 @@
 //! What a build changed of its program since the build before it: [`Built`] is a whole value,
 //! and [`Delta`] says which of its functions and statics are other than in the last `Built`
 //! of the same program, so a consumer that holds state for that one (a link, an image) patches
-//! it and reads nothing of the rest (docs/v2/plan/design/incremental-walk.md).
+//! it and reads nothing of the rest.
 //!
 //! Each function and static of a `Built` has an *entry*: one content ID of everything the
 //! `Built` says of it ([`function_entries`], [`static_entries`]). A function or static is

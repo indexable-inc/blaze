@@ -1,7 +1,9 @@
 //! What one macro call makes: [`Expansion`], a portable value written as one record.
 
+use core::alloc::Allocator;
 use core::fmt;
-use std::alloc::Allocator;
+
+use alloc::vec::Vec;
 
 use blaze_id::{ContentId, Portable};
 
@@ -210,7 +212,8 @@ impl<A: Allocator + Clone> Reads<A> {
         subject: &str,
         answer: ReadAnswer,
     ) -> Result<(), StreamError> {
-        u32::try_from(self.list.len() + 1).map_err(|_| StreamError::TooLarge { table: Table::Reads })?;
+        u32::try_from(self.list.len() + 1)
+            .map_err(|_| StreamError::TooLarge { table: Table::Reads })?;
         let subject = push_text(&mut self.text, subject, Table::Reads)?;
         self.list.push(Read { kind, subject, answer });
         Ok(())

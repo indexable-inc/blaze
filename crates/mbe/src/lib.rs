@@ -26,7 +26,6 @@ mod tests;
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
-use base_db::Db;
 use blaze_mem::frame::Frame;
 use smallvec::SmallVec;
 use span::{Edition, Span, SyntaxContext};
@@ -339,19 +338,19 @@ impl DeclarativeMacro {
 
     pub fn expand(
         &self,
-        db: &Db,
+
         tt: &tt::TopSubtree,
         marker: impl Fn(&mut Span) + Copy,
         call: MacroCall<'_>,
         call_site: Span,
     ) -> ExpandResult<(tt::TopSubtree, MatchedArmIndex)> {
-        self.expand_making(db, tt, marker, call, call_site).map(|(tree, arm, _)| (tree, arm))
+        self.expand_making(tt, marker, call, call_site).map(|(tree, arm, _)| (tree, arm))
     }
 
     /// [`Self::expand`], with the spans of the identifiers the expansion's `${concat(..)}`s made.
     pub fn expand_making(
         &self,
-        db: &Db,
+
         tt: &tt::TopSubtree,
         marker: impl Fn(&mut Span) + Copy,
         call: MacroCall<'_>,
@@ -359,7 +358,7 @@ impl DeclarativeMacro {
     ) -> ExpandResult<(tt::TopSubtree, MatchedArmIndex, MadeIdents)> {
         let input = self.input(tt, call, call_site);
         let input = input.as_ref().unwrap_or(tt);
-        expander::expand_rules(db, &self.rules, input, marker, call.style(), call_site)
+        expander::expand_rules(&self.rules, input, marker, call.style(), call_site)
     }
 
     /// [`Self::expand`] with the output in `frame`, a temporary of the caller's task; the
@@ -367,21 +366,20 @@ impl DeclarativeMacro {
     pub fn expand_in<'f>(
         &self,
         frame: &'f Frame,
-        db: &Db,
+
         tt: &tt::TopSubtree,
         marker: impl Fn(&mut Span) + Copy,
         call: MacroCall<'_>,
         call_site: Span,
     ) -> ExpandResult<(tt::TopSubtree<&'f Frame>, MatchedArmIndex)> {
-        self.expand_making_in(frame, db, tt, marker, call, call_site)
-            .map(|(tree, arm, _)| (tree, arm))
+        self.expand_making_in(frame, tt, marker, call, call_site).map(|(tree, arm, _)| (tree, arm))
     }
 
     /// [`Self::expand_making`] with the output in `frame`, as [`Self::expand_in`].
     pub fn expand_making_in<'f>(
         &self,
         frame: &'f Frame,
-        db: &Db,
+
         tt: &tt::TopSubtree,
         marker: impl Fn(&mut Span) + Copy,
         call: MacroCall<'_>,
@@ -393,7 +391,7 @@ impl DeclarativeMacro {
         let style = call.style();
         blaze_mem::frame::task(blaze_mem::Tag::Expand, |scratch| {
             let rules = &self.rules;
-            expander::expand_rules_in(scratch, build, db, rules, input, marker, style, call_site)
+            expander::expand_rules_in(scratch, build, rules, input, marker, style, call_site)
         })
     }
 
@@ -554,7 +552,6 @@ impl<T: Default, E> From<Result<T, E>> for ValueResult<T, E> {
 }
 
 pub fn expect_fragment<'t>(
-    db: &Db,
     tt_iter: &mut TtIter<'t>,
     entry_point: ::parser::PrefixEntryPoint,
     delim_span: DelimSpan,

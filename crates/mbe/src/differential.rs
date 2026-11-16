@@ -8,7 +8,6 @@
 
 use std::fmt::Write;
 
-use base_db::Db;
 use blaze_ids::rng::SplitMix64;
 
 use span::{
@@ -57,7 +56,6 @@ fn call_site() -> Span {
 /// Expands `input` with `mac` by both expanders in every call style, with no marker and, when
 /// `marked`, with one that moves every span, and asserts they agree. Returns the expansions.
 fn assert_same(
-    db: &Db,
     mac: &DeclarativeMacro,
     input: &tt::TopSubtree,
     marked: bool,
@@ -65,24 +63,23 @@ fn assert_same(
 ) -> Vec<tt::TopSubtree> {
     let call_site = call_site();
     let mut expansions = Vec::new();
-    assert_same_parses(db, input, &|| format!("{}\nthe input", what()));
+    assert_same_parses(input, &|| format!("{}\nthe input", what()));
     for call in calls(input) {
         let style = call.style();
         let what = || format!("{}\ncall: {call:?}", what());
         let call_input = mac.input(input, call, call_site);
         let input = call_input.as_ref().unwrap_or(input);
-        let new = expander::expand_rules(db, &mac.rules, input, |_| (), style, call_site)
+        let new = expander::expand_rules(&mac.rules, input, |_| (), style, call_site)
             .map(|(tree, arm, _)| (tree, arm));
-        let old = expander::model::expand_rules(db, &mac.rules, input, |_| (), style, call_site);
+        let old = expander::model::expand_rules(&mac.rules, input, |_| (), style, call_site);
         assert_eq!(new, old, "{}", what());
-        assert_same_parses(db, &new.value.0, &what);
+        assert_same_parses(&new.value.0, &what);
         expansions.push(new.value.0);
         if marked {
             let marker = |span: &mut Span| span.range = TextRange::empty(TextSize::from(7));
-            let new = expander::expand_rules(db, &mac.rules, input, marker, style, call_site)
+            let new = expander::expand_rules(&mac.rules, input, marker, style, call_site)
                 .map(|(tree, arm, _)| (tree, arm));
-            let old =
-                expander::model::expand_rules(db, &mac.rules, input, marker, style, call_site);
+            let old = expander::model::expand_rules(&mac.rules, input, marker, style, call_site);
             assert_eq!(new, old, "{}, marked", what());
         }
     }
@@ -109,7 +106,7 @@ fn caught<T>(f: impl FnOnce() -> T) -> Option<T> {
 /// columns and through the one the old cursor conversion made, and asserts the trees, their
 /// errors and their span maps are the same, and so are the inputs, as a parser's and as a
 /// matcher's.
-fn assert_same_parses(db: &Db, tt: &tt::TopSubtree, what: &impl Fn() -> String) {
+fn assert_same_parses(tt: &tt::TopSubtree, what: &impl Fn() -> String) {
     use syntax_bridge::reference;
     let mut edition = |ctx: SyntaxContext| ctx.edition();
     for view in [tt.view().strip_invisible(), tt.token_trees(), tt.view().as_token_trees()] {
@@ -162,15 +159,14 @@ fn entry_point(idx: usize) -> parser::PrefixEntryPoint {
 
 /// Takes fragments of every kind from every position of `input` by both
 /// [`crate::expect_fragment`] and the model's, and asserts they agree.
-fn assert_same_fragments(db: &Db, input: &tt::TopSubtree, what: &impl Fn() -> String) {
+fn assert_same_fragments(input: &tt::TopSubtree, what: &impl Fn() -> String) {
     let delim_span = input.top_subtree().delimiter.delim_span();
     for idx in 0..ENTRY_POINTS {
         let mut new_iter = input.iter();
         let mut old_iter = input.iter();
         while !new_iter.is_empty() {
-            let new = crate::expect_fragment(db, &mut new_iter, entry_point(idx), delim_span);
-            let old =
-                expander::model::expect_fragment(db, &mut old_iter, entry_point(idx), delim_span);
+            let new = crate::expect_fragment(&mut new_iter, entry_point(idx), delim_span);
+            let old = expander::model::expect_fragment(&mut old_iter, entry_point(idx), delim_span);
             let flat = |view: tt::TokenTreesView<'_>| view.iter_flat_tokens().collect::<Vec<_>>();
             let context = || format!("{}\nentry point: {:?}", what(), entry_point(idx));
             assert_eq!(flat(new.value), flat(old.value), "{}", context());
@@ -296,7 +292,6 @@ const EDITION_PAIRS: [(Edition, Edition); 3] = [
 
 #[test]
 fn corpus() {
-    let db = base_db::Db::for_tests(|_| {});
     for &(decl, inputs) in CORPUS {
         for (pair, (def_edition, call_edition)) in EDITION_PAIRS.into_iter().enumerate() {
             let def = token_tree(0, def_edition, decl).expect("a corpus macro lexes");
@@ -309,12 +304,12 @@ fn corpus() {
                     )
                 };
                 let marked = pair + 1 == EDITION_PAIRS.len();
-                let expansions = assert_same(&db, &mac, &input, marked, &what);
-                assert_same_fragments(&db, &input, &what);
+                let expansions = assert_same(&mac, &input, marked, &what);
+                assert_same_fragments(&input, &what);
                 // Expansions hold the groups without delimiters an earlier expansion puts around
                 // its fragments.
                 for expansion in &expansions {
-                    assert_same_fragments(&db, expansion, &|| {
+                    assert_same_fragments(expansion, &|| {
                         format!("{}\nthe fragments of its expansion", what())
                     });
                 }
@@ -325,7 +320,6 @@ fn corpus() {
 
 #[test]
 fn long_fragments() {
-    let db = base_db::Db::for_tests(|_| {});
     let mut texts = vec![
         "a < b < c < d < e < f < g < h < i < j > > > > > > > > > , x".to_owned(),
         "Vec :: < u8 > :: new ( ) . iter ( ) . map ( | x | x + 1 ) . collect :: < Vec < _ > > ( ) ;"
@@ -348,7 +342,7 @@ fn long_fragments() {
     for text in &texts {
         for edition in EDITIONS {
             let input = token_tree(1, edition, text).expect("a test input lexes");
-            assert_same_fragments(&db, &input, &|| format!("input: {text} ({edition:?})"));
+            assert_same_fragments(&input, &|| format!("input: {text} ({edition:?})"));
         }
     }
 }
@@ -359,11 +353,11 @@ fn benchmark_macros() {
     if test_utils::skip_slow_tests() {
         return;
     }
-    let db = base_db::Db::for_tests(|_| {});
+
     let rules = crate::benchmark::macro_rules_fixtures();
-    let invocations = crate::benchmark::invocation_fixtures(&db, &rules);
+    let invocations = crate::benchmark::invocation_fixtures(&rules);
     for (id, input) in &invocations {
-        assert_same(&db, &rules[id], input, false, &|| format!("benchmark macro {id}\n{input:?}"));
+        assert_same(&rules[id], input, false, &|| format!("benchmark macro {id}\n{input:?}"));
     }
 }
 
@@ -683,7 +677,6 @@ const INPUTS_PER_MACRO: usize = 5;
 
 #[test]
 fn random_macros() {
-    let db = base_db::Db::for_tests(|_| {});
     let seeds = if test_utils::skip_slow_tests() { SEEDS } else { SLOW_SEEDS };
     let mut checked = 0;
     for seed in 0..seeds {
@@ -723,9 +716,9 @@ fn random_macros() {
                     "seed {seed}: macro_rules! m {{ {decl} }} ({def_edition:?})\ninput: {text} ({call_edition:?})"
                 )
             };
-            assert_same(&db, &mac, &input, input_idx == 0, &what);
+            assert_same(&mac, &input, input_idx == 0, &what);
             if input_idx == 0 {
-                assert_same_fragments(&db, &input, &what);
+                assert_same_fragments(&input, &what);
             }
             checked += 1;
         }

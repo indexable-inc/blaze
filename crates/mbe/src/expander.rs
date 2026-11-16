@@ -9,7 +9,6 @@ mod transcriber;
 
 use std::alloc::Allocator;
 
-use base_db::Db;
 use blaze_mem::frame::Frame;
 use span::Span;
 
@@ -23,7 +22,6 @@ use crate::{
 const NONE: u32 = u32::MAX;
 
 pub(crate) fn expand_rules(
-    db: &Db,
     rules: &[crate::Rule],
     input: &tt::TopSubtree,
     marker: impl Fn(&mut Span) + Copy,
@@ -32,7 +30,7 @@ pub(crate) fn expand_rules(
 ) -> ExpandResult<(tt::TopSubtree, MatchedArmIndex, MadeIdents)> {
     blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
         let build = tt::TopSubtreeBuilder::build;
-        expand_rules_in(frame, build, db, rules, input, marker, call_style, call_site)
+        expand_rules_in(frame, build, rules, input, marker, call_style, call_site)
     })
 }
 
@@ -69,7 +67,7 @@ pub(crate) fn attr_input(
 pub(crate) fn expand_rules_in<'t, A: Allocator>(
     frame: &'t Frame,
     build: impl Fn(tt::TopSubtreeBuilder) -> tt::TopSubtree<A> + Copy,
-    db: &Db,
+
     rules: &[crate::Rule],
     input: &'t tt::TopSubtree,
     marker: impl Fn(&mut Span) + Copy,
@@ -87,7 +85,7 @@ pub(crate) fn expand_rules_in<'t, A: Allocator>(
             continue;
         }
 
-        matcher::match_(db, &rule.matcher, input, &mut buffers, &mut scratch);
+        matcher::match_(&rule.matcher, input, &mut buffers, &mut scratch);
 
         if scratch.err.is_none() {
             // If we find a rule that applies without errors, we're done.
@@ -124,7 +122,7 @@ pub(crate) fn expand_rules_in<'t, A: Allocator>(
         // fragment that failed inside is reported where its parse failed.
         let match_err = match_.err.map(|err| match err {
             matcher::MatchError::Fragment(it) => it,
-            err => matcher::match_failure(db, frame, rules, input, call_style)
+            err => matcher::match_failure(frame, rules, input, call_style)
                 .unwrap_or_else(|| err.build()),
         });
         ExpandResult { value: (tree, idx.try_into().ok(), made), err: match_err.or(transcribe_err) }

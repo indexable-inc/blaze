@@ -21,7 +21,6 @@ fn check_(
     expect: &expect_test::Expect,
     parse: parser::TopEntryPoint,
 ) {
-    let db = base_db::Db::for_tests(|_| {});
     let decl_tt = &syntax_bridge::parse_to_token_tree(
         def_edition,
         SpanAnchor {
@@ -49,7 +48,6 @@ fn check_(
     )
     .unwrap();
     let res = mac.expand(
-        &db,
         &arg_tt,
         |_| (),
         crate::MacroCall::FnLike,
@@ -526,7 +524,6 @@ fn minus_belongs_to_literal() {
 /// window of the level, not the rest of it, into the thread's input words.
 #[test]
 fn a_fragment_allocates_the_same_however_much_follows_it() {
-    let db = base_db::Db::for_tests(|_| {});
     let anchor = SpanAnchor {
         file_id: EditionedFileId::new(FileId::from_raw(0), Edition::CURRENT),
         ast_id: ROOT_ERASED_FILE_AST_ID,
@@ -539,7 +536,7 @@ fn a_fragment_allocates_the_same_however_much_follows_it() {
             let mut iter = tt.iter();
             let delim_span = tt.top_subtree().delimiter.delim_span();
             let parsed =
-                crate::expect_fragment(&db, &mut iter, parser::PrefixEntryPoint::Expr, delim_span);
+                crate::expect_fragment(&mut iter, parser::PrefixEntryPoint::Expr, delim_span);
             assert!(parsed.err.is_none());
             parsed.value.len()
         };
@@ -562,7 +559,6 @@ fn a_fragment_allocates_the_same_however_much_follows_it() {
 /// grow with it, so the counts are compared, not the bytes.
 #[test]
 fn a_warm_expansion_allocates_the_same_for_any_input() {
-    let db = base_db::Db::for_tests(|_| {});
     let anchor = SpanAnchor {
         file_id: EditionedFileId::new(FileId::from_raw(0), Edition::CURRENT),
         ast_id: ROOT_ERASED_FILE_AST_ID,
@@ -576,7 +572,7 @@ fn a_warm_expansion_allocates_the_same_for_any_input() {
         let text = "x ".repeat(trees);
         let arg = syntax_bridge::parse_to_token_tree(Edition::CURRENT, anchor, ctx, &text).unwrap();
         let expand = || {
-            let expanded = mac.expand(&db, &arg, |_| (), crate::MacroCall::FnLike, call_site);
+            let expanded = mac.expand(&arg, |_| (), crate::MacroCall::FnLike, call_site);
             assert!(expanded.err.is_none());
             expanded.value.0.view().token_trees().len()
         };
@@ -593,7 +589,6 @@ fn a_warm_expansion_allocates_the_same_for_any_input() {
 /// the global expansion gives.
 #[test]
 fn an_expansion_into_a_frame_allocates_nothing() {
-    let db = base_db::Db::for_tests(|_| {});
     let anchor = SpanAnchor {
         file_id: EditionedFileId::new(FileId::from_raw(0), Edition::CURRENT),
         ast_id: ROOT_ERASED_FILE_AST_ID,
@@ -606,17 +601,16 @@ fn an_expansion_into_a_frame_allocates_nothing() {
     let arg = syntax_bridge::parse_to_token_tree(Edition::CURRENT, anchor, ctx, &"x ".repeat(100))
         .unwrap();
     let style = crate::MacroCall::FnLike;
-    let global = mac.expand(&db, &arg, |_| (), style, call_site).value.0;
+    let global = mac.expand(&arg, |_| (), style, call_site).value.0;
     assert!(global.keeps_words());
     // The first task warms the thread's two frame levels, the builder's buffers and tt's walk
     // stack.
     blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
-        drop(mac.expand_in(frame, &db, &arg, |_| (), style, call_site))
+        drop(mac.expand_in(frame, &arg, |_| (), style, call_site))
     });
     blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
-        let (expanded, used) = blaze_alloc_count::measure(|| {
-            mac.expand_in(frame, &db, &arg, |_| (), style, call_site)
-        });
+        let (expanded, used) =
+            blaze_alloc_count::measure(|| mac.expand_in(frame, &arg, |_| (), style, call_site));
         assert!(expanded.err.is_none());
         assert_eq!(used.allocations, 0, "{used:?}");
         assert!(expanded.value.0 == global && !expanded.value.0.keeps_words());
@@ -628,7 +622,6 @@ fn an_expansion_into_a_frame_allocates_nothing() {
 /// `$s:stmt`'s statement at the metavariable.
 #[test]
 fn a_stmt_and_a_block_go_out_in_groups_spanned_by_their_metavariables() {
-    let db = base_db::Db::for_tests(|_| {});
     let def = SpanAnchor {
         file_id: EditionedFileId::new(FileId::from_raw(0), Edition::CURRENT),
         ast_id: ROOT_ERASED_FILE_AST_ID,
@@ -642,7 +635,7 @@ fn a_stmt_and_a_block_go_out_in_groups_spanned_by_their_metavariables() {
     let input = "let x = 1 ; { x }";
     let arg = syntax_bridge::parse_to_token_tree(Edition::CURRENT, call, ctx, input).unwrap();
     let call_site = Span { range: TextRange::empty(TextSize::new(0)), anchor: call, ctx };
-    let expanded = mac.expand(&db, &arg, |_| (), crate::MacroCall::FnLike, call_site);
+    let expanded = mac.expand(&arg, |_| (), crate::MacroCall::FnLike, call_site);
     assert!(expanded.err.is_none(), "{:?}", expanded.err);
     let tree = expanded.value.0;
 
@@ -678,7 +671,6 @@ fn a_stmt_and_a_block_go_out_in_groups_spanned_by_their_metavariables() {
 /// `${concat(..)}` gives the spans of the identifiers it made, which no source has.
 #[test]
 fn concat_gives_the_spans_of_the_identifiers_it_made() {
-    let db = base_db::Db::for_tests(|_| {});
     let anchor = SpanAnchor {
         file_id: EditionedFileId::new(FileId::from_raw(0), Edition::CURRENT),
         ast_id: ROOT_ERASED_FILE_AST_ID,
@@ -689,7 +681,7 @@ fn concat_gives_the_spans_of_the_identifiers_it_made() {
     let mac = DeclarativeMacro::parse_macro_rules(&decl, |_| Edition::CURRENT);
     let arg = syntax_bridge::parse_to_token_tree(Edition::CURRENT, anchor, ctx, "a").unwrap();
     let call_site = Span { range: TextRange::empty(TextSize::new(0)), anchor, ctx };
-    let expanded = mac.expand_making(&db, &arg, |_| (), crate::MacroCall::FnLike, call_site);
+    let expanded = mac.expand_making(&arg, |_| (), crate::MacroCall::FnLike, call_site);
     assert!(expanded.err.is_none(), "{:?}", expanded.err);
     let (tree, _, made) = expanded.value;
     let idents: Vec<(String, Span)> = tree
@@ -734,11 +726,11 @@ fn a_repetitions_separator_is_one_glued_token_and_its_operator_is_one_character(
 "#,
     );
     assert!(mac.err().is_none(), "{:?}", mac.err());
-    let db = base_db::Db::for_tests(|_| {});
+
     let expand = |arg: &str| {
         let arg = syntax_bridge::parse_to_token_tree(Edition::CURRENT, anchor, ctx, arg).unwrap();
         let call_site = Span { range: TextRange::empty(TextSize::new(0)), anchor, ctx };
-        let expanded = mac.expand(&db, &arg, |_| (), crate::MacroCall::FnLike, call_site);
+        let expanded = mac.expand(&arg, |_| (), crate::MacroCall::FnLike, call_site);
         assert!(expanded.err.is_none(), "{:?}", expanded.err);
         let leaves: Vec<String> = expanded
             .value
@@ -779,14 +771,14 @@ fn expanded_across(
         ast_id: ROOT_ERASED_FILE_AST_ID,
     };
     let ctx = SyntaxContext::root(edition);
-    let db = base_db::Db::for_tests(|_| {});
+
     let decl = syntax_bridge::parse_to_token_tree(edition, anchor(0, def), ctx, decl).unwrap();
     let mac = DeclarativeMacro::parse_macro_rules(&decl, |_| edition);
     assert!(mac.err().is_none(), "{:?}", mac.err());
     let call_anchor = anchor(1, call);
     let arg_tt = syntax_bridge::parse_to_token_tree(edition, call_anchor, ctx, arg).unwrap();
     let call_site = Span { range: TextRange::up_to(TextSize::of(arg)), anchor: call_anchor, ctx };
-    let res = mac.expand(&db, &arg_tt, |_| (), crate::MacroCall::FnLike, call_site);
+    let res = mac.expand(&arg_tt, |_| (), crate::MacroCall::FnLike, call_site);
     let entry = parser::TopEntryPoint::MacroItems;
     let (node, _) =
         syntax_bridge::token_tree_to_syntax_node(res.value.0.view(), entry, &mut |_| edition);
@@ -869,7 +861,6 @@ fn a_token_keeps_its_crates_syntax_extensions_through_a_macro() {
 
 /// The error, if any, of expanding `arg` by the `macro_rules` rules `decl`.
 fn expansion_error(decl: &str, arg: &str) -> Option<String> {
-    let db = base_db::Db::for_tests(|_| {});
     let anchor = |file: u32| SpanAnchor {
         file_id: EditionedFileId::new(FileId::from_raw(file), Edition::CURRENT),
         ast_id: ROOT_ERASED_FILE_AST_ID,
@@ -880,7 +871,6 @@ fn expansion_error(decl: &str, arg: &str) -> Option<String> {
     let mac = DeclarativeMacro::parse_macro_rules(&decl_tt, |_| Edition::CURRENT);
     let arg_tt = syntax_bridge::parse_to_token_tree(Edition::CURRENT, anchor(1), ctx, arg).unwrap();
     let res = mac.expand(
-        &db,
         &arg_tt,
         |_| (),
         crate::MacroCall::FnLike,
@@ -942,7 +932,6 @@ fn expand_as(
     call: impl Fn(Option<&tt::TopSubtree>) -> crate::MacroCall<'_>,
     args: Option<&str>,
 ) -> String {
-    let db = base_db::Db::for_tests(|_| {});
     let def = SpanAnchor {
         file_id: EditionedFileId::new(FileId::from_raw(0), Edition::CURRENT),
         ast_id: ROOT_ERASED_FILE_AST_ID,
@@ -957,7 +946,7 @@ fn expand_as(
     let args = args
         .map(|args| syntax_bridge::parse_to_token_tree(Edition::CURRENT, at, ctx, args).unwrap());
     let call_site = Span { range: TextRange::empty(TextSize::new(0)), anchor: at, ctx };
-    let expanded = mac.expand(&db, &item, |_| (), call(args.as_ref()), call_site);
+    let expanded = mac.expand(&item, |_| (), call(args.as_ref()), call_site);
     let mut out = String::new();
     if let Some(err) = expanded.err {
         format_to!(out, "error: {err}\n");

@@ -1,9 +1,12 @@
 //! Literal values for the builtins: a string literal's value, `concat!`'s pieces, and the
-//! escaped inside of a literal the expansion makes. Escapes are read by rustc's own reader,
-//! `rustc-literal-escaper`.
+//! escaped inside of a literal the expansion makes. Escapes are read here, by the rules of the
+//! Reference's "Tokens" chapter (no crate of the tree reads them: the lexer leaves a literal's
+//! text as written).
 
+use core::alloc::Allocator;
 use core::fmt;
-use std::alloc::Allocator;
+
+use alloc::vec::Vec;
 
 use crate::tokens::LitKind;
 
@@ -98,7 +101,7 @@ pub(crate) fn concat_piece<A: Allocator>(
     match kind {
         LitKind::Str | LitKind::StrRaw(_) => string_value(kind, text, suffix_len, out),
         LitKind::Char => {
-            let char = rustc_literal_escaper::unescape_char(body).map_err(|_| LitError::BadEscape)?;
+            let char = unescape_char(body)?;
             out.push_char(char);
             Ok(())
         }
@@ -127,15 +130,111 @@ fn without_suffix(text: &str, suffix_len: u32) -> &str {
     &text[..text.len() - suffix_len as usize]
 }
 
+/// The value of a `"…"` literal's inside, appended: its escapes read, a `\` before a line
+/// break skipping the break and the ASCII whitespace after it, and `\r\n` read as `\n` (rustc
+/// reads a file's CRLFs as LFs); a lone `\r` is refused, as rustc's lexer refuses it.
 fn unescape_str<A: Allocator>(body: &str, out: &mut Buf<A>) -> Result<(), LitError> {
-    let mut failed = false;
-    rustc_literal_escaper::unescape_str(body, |_, char| match char {
-        Ok(char) => out.push_char(char),
-        Err(error) if error.is_fatal() => failed = true,
-        // A warning (a `\` line continuation's trailing space): the value stands.
-        Err(_) => {}
-    });
-    if failed { Err(LitError::BadEscape) } else { Ok(()) }
+    let bytes = body.as_bytes();
+    let mut at = 0;
+    while let Some(char) = body[at..].chars().next() {
+        match char {
+            '\\' if matches!(bytes.get(at + 1), Some(b'\n' | b'\r')) => {
+                at += 1;
+                if bytes[at] == b'\r' && bytes.get(at + 1) != Some(&b'\n') {
+                    return Err(LitError::BadEscape);
+                }
+                while bytes.get(at).is_some_and(|it| matches!(it, b' ' | b'\t' | b'\n' | b'\r')) {
+                    at += 1;
+                }
+            }
+            '\\' => {
+                let (char, len) = escape(&body[at + 1..])?;
+                out.push_char(char);
+                at += 1 + len;
+            }
+            '\r' if bytes.get(at + 1) == Some(&b'\n') => {
+                out.push_char('\n');
+                at += 2;
+            }
+            '\r' => return Err(LitError::BadEscape),
+            char => {
+                out.push_char(char);
+                at += char.len_utf8();
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The value of a `'…'` literal's inside: one character, or one escape.
+fn unescape_char(body: &str) -> Result<char, LitError> {
+    let (char, len) = match body.chars().next() {
+        Some('\\') => {
+            let (char, len) = escape(&body[1..])?;
+            (char, 1 + len)
+        }
+        Some('\'' | '\n' | '\r' | '\t') | None => return Err(LitError::BadEscape),
+        Some(char) => (char, char.len_utf8()),
+    };
+    if len == body.len() { Ok(char) } else { Err(LitError::BadEscape) }
+}
+
+/// The escape at the start of `rest`, the text after a `\`: its character, and how many bytes
+/// of `rest` it is. `\x` takes two hex digits up to `7f`; `\u{…}` one to six hex digits
+/// (`_` after the first) naming a scalar value.
+fn escape(rest: &str) -> Result<(char, usize), LitError> {
+    let bytes = rest.as_bytes();
+    let simple = match bytes.first() {
+        Some(b'n') => Some('\n'),
+        Some(b'r') => Some('\r'),
+        Some(b't') => Some('\t'),
+        Some(b'\\') => Some('\\'),
+        Some(b'0') => Some('\0'),
+        Some(b'\'') => Some('\''),
+        Some(b'"') => Some('"'),
+        _ => None,
+    };
+    if let Some(char) = simple {
+        return Ok((char, 1));
+    }
+    let hex = |byte: u8| char::from(byte).to_digit(16);
+    match bytes.first() {
+        Some(b'x') => {
+            let high = bytes.get(1).copied().and_then(hex).ok_or(LitError::BadEscape)?;
+            let low = bytes.get(2).copied().and_then(hex).ok_or(LitError::BadEscape)?;
+            let value = high * 16 + low;
+            if value > 0x7f {
+                return Err(LitError::BadEscape);
+            }
+            let char = char::from_u32(value).ok_or(LitError::BadEscape)?;
+            Ok((char, 3))
+        }
+        Some(b'u') => {
+            if bytes.get(1) != Some(&b'{') {
+                return Err(LitError::BadEscape);
+            }
+            let (mut value, mut digits, mut at) = (0u32, 0u32, 2);
+            loop {
+                match bytes.get(at) {
+                    Some(b'}') if digits > 0 => break,
+                    Some(b'_') if digits > 0 => {}
+                    Some(&byte) => {
+                        let digit = hex(byte).ok_or(LitError::BadEscape)?;
+                        digits += 1;
+                        if digits > 6 {
+                            return Err(LitError::BadEscape);
+                        }
+                        value = value * 16 + digit;
+                    }
+                    None => return Err(LitError::BadEscape),
+                }
+                at += 1;
+            }
+            let char = char::from_u32(value).ok_or(LitError::BadEscape)?;
+            Ok((char, at + 1))
+        }
+        _ => Err(LitError::BadEscape),
+    }
 }
 
 /// An integer literal's value: its radix prefix and `_`s read.

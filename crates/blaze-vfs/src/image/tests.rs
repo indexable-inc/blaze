@@ -1,5 +1,5 @@
 //! The tree opened in place from an image against the same history recovered from a journal
-//! that never had one (docs/v2/plan/design/restore.md): equal over random histories, at every
+//! that never had one: equal over random histories, at every
 //! step of writing an image and rewriting the journal to start from it, with no file's text
 //! asked of the store until something reads that file, a text the store lacks named, and an
 //! image that holds no file's bytes.

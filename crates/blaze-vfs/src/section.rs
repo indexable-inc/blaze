@@ -1,4 +1,4 @@
-//! A section of the daemon's mapped image (docs/v2/plan/design/restore.md), held for as long as
+//! A section of the daemon's mapped image, held for as long as
 //! a view of it lives: the VFS's tree and its watchers' metadata are read from one in place.
 
 use std::{fmt, ops::Range};

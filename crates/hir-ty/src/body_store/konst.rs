@@ -25,8 +25,8 @@
 //!   constant that is not a literal would be offered and refused, and pay a lookup, a capture
 //!   and a classification for an entry it can never have. The same holds of a `const fn` a
 //!   constant calls: its runtime MIR is another body's, with no fact either.
-//! - **The one condition that turns it on:** runtime MIR being a step of the item store
-//!   (docs/v2/plan/design/restore.md, "One form, a function: the end state"). The constant's
+//! - **The one condition that turns it on:** runtime MIR being a step of the item store.
+//!   The constant's
 //!   own runtime MIR is then that step's fact, a callee's is the callee's, and
 //!   `const_eval_query` calls `consteval::stored_constant` for a constant with no generic
 //!   arguments; `consteval::deps` is deleted in the same change. Until then the step is

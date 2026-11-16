@@ -1,7 +1,7 @@
 //! `blaze check --replace FROM=TO` and `--rules FILE`: every reference that resolves to the item
 //! `FROM` names, retargeted to the item `TO` names ([`Edit::Replace`], which blaze-intent makes
 //! through the front end's name resolution), and every rewrite of an astlog rules file
-//! ([`Edit::Rules`], docs/v2/plan/design/astlog-sema.md), in the checkout as saved. The daemon
+//! ([`Edit::Rules`]), in the checkout as saved. The daemon
 //! opens the checkout's head, makes the edits in its front end and commits them to the head;
 //! they are written to the checkout's files here, which the daemon's watcher then sees as the
 //! head already has them. With `--dry-run` the daemon commits nothing and nothing is written:

@@ -17,7 +17,7 @@
 //! back opens no expression store and lowers no body.
 //!
 //! Any other item, one of the body's paths' targets among them, is named by its plain item
-//! key (docs/v2/plan/design/restore.md, "One form, a function: the end state"): a key that
+//! key: a key that
 //! was "the target of path `i` of the body's resolutions" needed the body lowered and
 //! resolved to be read back. The price: a callee renamed misses its callers' records (the
 //! name they looked up changed too).

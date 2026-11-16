@@ -2277,15 +2277,15 @@ fn owning_and_completing_an_effect_allocate_nothing() {
 
 mod ties;
 
-mod counter;
 
-mod lazy;
+
+
 
 mod wasm_imports;
 
 mod wasm_statics;
 
-mod dev_run;
+
 
 mod natives;
 
@@ -2299,7 +2299,7 @@ mod premap;
 
 mod sanitize;
 
-mod splice;
+
 
 mod icf;
 
@@ -2307,13 +2307,13 @@ mod layout;
 
 mod thunks;
 
-mod patch;
 
-mod keep;
+
+
 
 mod beside;
 
-mod eh_frame_reach;
+
 
 mod tls_desc;
 

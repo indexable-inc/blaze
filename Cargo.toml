@@ -18,16 +18,12 @@ exclude = [
     "crates/blaze-cargo",
     "crates/blaze-certify",
     "crates/blaze-codegen",
-    "crates/blaze-command",
     "crates/blaze-diagnostics",
     "crates/blaze-doc",
-    "crates/blaze-engine",
-    "crates/blaze-front",
     "crates/blaze-global",
     "crates/blaze-item-hash",
     "crates/blaze-items",
     "crates/blaze-launch-host",
-    "crates/blaze-launcher",
     "crates/blaze-lazy",
     "crates/blaze-link",
     "crates/blaze-macro-eval",
@@ -36,11 +32,9 @@ exclude = [
     "crates/blaze-shader",
     "crates/blaze-stencil",
     "crates/blaze-testsel",
-    "crates/blaze-thin",
     "crates/blaze-tree",
     "crates/blaze-units",
     "crates/blaze-usercode",
-    "crates/hir",
     "crates/hir-def",
     "crates/hir-expand",
     "crates/hir-lint-levels",
@@ -63,7 +57,6 @@ exclude = [
     "crates/hir-ty-ub",
     "crates/hir-ty-unsafeck",
     "crates/hir-ty-wfcheck",
-    "crates/mbe",
     "crates/proc-macro-api",
     # harness, its own workspace with its own lock: a macOS app and daemon blaze does not build
     # (crates/harness/README.md).
@@ -146,8 +139,8 @@ miniz_oxide.opt-level = 3
 # (the model is blaze-inproc-rt's now; blaze-inproc's own tests run the same fences).
 blaze-inproc.opt-level = 3
 blaze-inproc-rt.opt-level = 3
-# blaze-engine's build script hashes the code generator's sources (blaze-codegen-code), which
-# reruns on every edit of them: optimized, as a build dependency is not by default.
+# blaze-codegen-code hashes the code generator's sources, which reruns on every edit of them:
+# optimized, as a build dependency is not by default.
 blake3.opt-level = 3
 blaze-codegen-code.opt-level = 3
 # The tier 0 scripts (`blaze run -p scripts --bin <name>`) are run, not developed: `docs check`
@@ -247,7 +240,6 @@ macros = { path = "crates/macros", version = "0.0.0" }
 base-db = { path = "crates/base-db", version = "0.0.0" }
 blaze-build-script = { path = "crates/blaze-build-script" }
 cfg = { path = "crates/cfg", version = "0.0.0" }
-hir = { path = "crates/hir", version = "0.0.0" }
 hir-def = { path = "crates/hir-def", version = "0.0.0" }
 hir-expand = { path = "crates/hir-expand", version = "0.0.0" }
 hir-lint-levels = { path = "crates/hir-lint-levels", version = "0.0.0" }
@@ -296,7 +288,6 @@ blaze-serde-derive = { path = "crates/blaze-serde-derive" }
 # v2 (docs/v2/plan.md)
 blaze-alloc-count = { path = "crates/blaze-alloc-count" }
 blaze-bytes = { path = "crates/blaze-bytes" }
-blaze-thin = { path = "crates/blaze-thin" }
 blaze-cas = { path = "crates/blaze-cas" }
 blaze-kernel = { path = "crates/blaze-kernel" }
 blaze-front-items = { path = "crates/blaze-front-items" }
@@ -312,12 +303,19 @@ blaze-diagnostics = { path = "crates/blaze-diagnostics", version = "0.0.0" }
 blaze-audit = { path = "crates/blaze-audit" }
 blaze-fetch = { path = "crates/blaze-fetch" }
 blaze-format = { path = "crates/blaze-format" }
-blaze-hash = { path = "crates/blaze-hash" }
+# The bottom of the tree depends on no crate from outside the workspace
+# (docs/v2/plan/design/bottom.md, "Also decided on 2026-11-15"): its adapters to such crates are
+# features, on here for the crates above, and the bottom crates name each other by path without
+# them. blaze's own BLAKE3, bit for bit official BLAKE3:
+blaze-blake3 = { path = "crates/blaze-blake3" }
+# The SwissTable group probe and `Index`, re-exported as `blaze_mem::swiss`.
+blaze-swiss = { path = "crates/blaze-swiss" }
+blaze-hash = { path = "crates/blaze-hash", features = ["serde", "shared"] }
 # blaze's sans-IO HTTP/1.1 and HTTP/3 cores and their drivers on blaze-core's effects.
 blaze-http = { path = "crates/blaze-http", default-features = false }
-blaze-ids = { path = "crates/blaze-ids" }
+blaze-ids = { path = "crates/blaze-ids", features = ["serde", "smallvec", "thin-vec"] }
 # An item's portable identity: its key, the `Portable` bound and the tables that outlive a snapshot (docs/v2/plan/design/identity.md).
-blaze-id = { path = "crates/blaze-id" }
+blaze-id = { path = "crates/blaze-id", features = ["serde"] }
 blaze-impls = { path = "crates/blaze-impls" } # The impl index, lang items and crate graph records (docs/v2/plan/design/bottom.md).
 blaze-expand = { path = "crates/blaze-expand" }
 blaze-scope = { path = "crates/blaze-scope" }
@@ -327,12 +325,9 @@ blaze-surface = { path = "crates/blaze-surface" }
 blaze-keyed = { path = "crates/blaze-keyed" }
 blaze-run = { path = "crates/blaze-run" } # `blaze run`/`blaze test` as sans-IO machines (docs/v2/plan/design/run.md).
 # The host of the keyed driver (docs/v2/plan/design/host.md): a unit's keys from its own text,
-# the front end's tasks, and the process that performs the driver's effects.
+# and the process that performs the driver's effects.
 blaze-unitkey = { path = "crates/blaze-unitkey" }
-blaze-front = { path = "crates/blaze-front" }
 blaze-host = { path = "crates/blaze-host" }
-# `blaze check --no-daemon`: a checkout to a request for the host, run and printed.
-blaze-command = { path = "crates/blaze-command" }
 # The no-daemon leaf table and its sweep.
 blaze-solo = { path = "crates/blaze-solo" }
 blaze-lir = { path = "crates/blaze-lir" }
@@ -377,6 +372,7 @@ blaze-memo = { path = "crates/blaze-memo" }
 blaze-memo-macros = { path = "crates/blaze-memo-macros" }
 blaze-reclaim = { path = "crates/blaze-reclaim" }
 blaze-mem = { path = "crates/blaze-mem" }
+blaze-own = { path = "crates/blaze-own" } # Vec, Box, Arc, Rc, ... with no default allocator, in place of `alloc`.
 blaze-usercode = { path = "crates/blaze-usercode" }
 blaze-v2-proof = { path = "crates/blaze-v2-proof" }
 blaze-vfs = { path = "crates/blaze-vfs" }
@@ -421,16 +417,11 @@ aho-corasick = "1.1.5"
 anyhow = "1.0.104"
 arrayvec = "0.7.8"
 bitflags = "2.13.2"
-# Official BLAKE3: `blaze_ids::b3`'s backend where blake3-servil doesn't build (Windows, x86-64
-# macOS), and the reference beside it. `neon`: aarch64 picks NEON at compile time; x86_64
-# detects AVX-512 at run time without a feature. `wasm32_simd`: its SIMD128 code (Rust, no C) on
-# wasm32, the seed's; it does nothing on any other target.
+# Official BLAKE3: the reference blaze-blake3 (`blaze_ids::b3`) is tested and benched against,
+# and what the crates not yet moved to blaze-blake3 call. `neon`: aarch64 picks NEON at compile
+# time; x86_64 detects AVX-512 at run time without a feature. `wasm32_simd`: its SIMD128 code
+# (Rust, no C) on wasm32, the seed's; it does nothing on any other target.
 blake3 = { version = "1.8", default-features = false, features = ["std", "neon", "wasm32_simd"] }
-# BLAKE3-Servil (johnservil/BLAKE3 `servil`, 0.8.0 on official 1.8.7): `blaze_ids::b3`'s
-# backend on x86-64 Linux and AArch64 Linux and macOS (docs/v2/plan.md).
-# Its kernels are chosen at run time; `std` alone, and its pool's threads start only in
-# `initialize_multithreaded`, which blaze never calls.
-blake3-servil = { path = "vendor/blake3-servil", default-features = false, features = ["std"] }
 camino = "1.2.6"
 # The Cranelift hir-ty-codegen compiles with.
 # `=`: the version of vendor/cranelift-codegen, which every crate here that needs it must match.
@@ -706,10 +697,8 @@ type_complexity = "allow"
 wrong_self_convention = "allow"
 
 ## deny: allocation, dyn and clones are controlled mechanically
-## (docs/v2/plan.md). The lints marked `no baseline yet` were lowered from deny to be
-## ratcheted by counts in crates/blaze-lints/baselines/, which holds no file yet: blaze cannot
-## finish its own check of the workspace, so nothing holds their counts today
-## (docs/cargo.md#lints; `blaze check --baselines DIR --new-baseline LINT` starts one).
+## (docs/v2/plan.md). The lints marked `no baseline yet` were lowered from deny until their
+## findings are fixed.
 redundant_clone = "warn" # no baseline yet; back to deny at zero findings
 clone_on_ref_ptr = "warn" # no baseline yet; back to deny at zero findings
 implicit_clone = "warn" # no baseline yet; back to deny at zero findings
@@ -741,16 +730,16 @@ print_stdout = "warn"
 print_stderr = "warn"
 
 ## restriction lints for code written by agents: more typing, and each choice made where it
-## is written (`blaze check` implements each of these; crates/blaze-lints/src/lints/mod.rs)
+## is written
 # an `#[allow]` that no longer suppresses anything is never noticed; `#[expect]` is. These two are
 # the "unexplained allow" check (any `#[allow]`, an `#[expect]` with no reason), so blaze has no
-# lint of its own for it (docs/lints.md#suspicious-code); `--fix` turns an outer `allow` into
+# lint of its own for it; `--fix` turns an outer `allow` into
 # `expect`.
 allow_attributes = "warn"
 allow_attributes_without_reason = "warn"
 # `let _ = f()` of a `#[must_use]` value throws away what it says
 let_underscore_must_use = "warn"
-# Copy-paste mistakes in one expression (docs/lints.md#duplicates): `eq_op`, `ifs_same_cond` and
+# Copy-paste mistakes in one expression: `eq_op`, `ifs_same_cond` and
 # `self_assignment` are in `correctness`, denied above. Two branches written alike is the same
 # mistake, so `if_same_then_else` (in `style`) is denied too; `match_same_arms` (pedantic) warns,
 # since arms kept apart for their patterns' sake are common. Like the list below, `blaze check`

@@ -1,19 +1,29 @@
-//! [`Resolver`]: one module's name resolution as a sans-IO state machine.
+//! [`Resolver`]: one module's name resolution as a sans-IO state machine, and the loop that
+//! runs one machine or the members of a group.
 //!
 //! The machine holds what the module declares (its own text and each expansion as a
 //! *fragment*), the state of each `use`, glob and macro call, and the answers it was given.
 //! A step runs passes until nothing moves (each pass plans every update from the state as it
-//! is, then applies them), and then returns what it needs: reads, expansions, or the modules
-//! of a cycle. When nothing is pending it forces what is stuck (macro paths first, then
-//! imports), as rustc does, and finally re-resolves everything once against the final scope:
-//! that last pass checks every early resolution with rustc's ambiguity kinds and is what the
-//! read list is made of, so the list is a function of the final state, not of the order the
-//! answers came in.
+//! is, then applies them all), and then returns what it needs: reads, expansions, or the
+//! modules of a cycle. When nothing is pending it forces what is stuck (macro paths first,
+//! then imports), as rustc does, and at last re-resolves everything once against the final
+//! state: that pass checks each early resolution with rustc's ambiguity kinds and is what the
+//! read list is made of.
+//!
+//! Order independence. An item still pending is *blocked* while what it waits on is an answer
+//! not given yet, and a lookup that meets a blocked item waits too, where it would otherwise
+//! take the item as undetermined and go on to an outer scope (rustc's weak undeterminacy).
+//! So no decision is made on a guess that one more answer would change: a step's result is a
+//! function of the records, not of the order or the batches the answers came in. Blocked
+//! flags are set conservatively after every move and lowered to their least fixpoint only
+//! when no answer is outstanding (`relax`), which is when "undetermined" means what rustc
+//! means by it.
 
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
 use core::alloc::Allocator;
+use core::cmp::Ordering;
 
 use alloc::vec::Vec;
 use blaze_hash::HashMap;
@@ -24,20 +34,20 @@ use crate::facts::{
     Dep, Edition, ExternTarget, ModuleDecls, Name, Path, PathKind, Rename, ScopeFacts, UseLeaf,
     VisDecl,
 };
+use crate::finish::Finish;
 use crate::read::{Answer, ExpandRequest, NameAnswer, Read, Reply, Step};
 use crate::scope::{
-    Asker, BindingState, Def, DefKind, ExportEntry, MacroKind, Namespace, Origin, Resolved,
-    TextualDef, Unresolved, UseSite, Visibility, VisibilityClass,
+    AmbiguityKind, Asker, BindingState, Def, DefKind, ExportEntry, MacroKind, Namespace, Origin,
+    ReadEntry, Resolved, Saw, TextualDef, Unresolved, UseSite, Visibility, VisibilityClass,
 };
 
-/// The most parents a module may have (rule 18): rust-analyzer's and rustc's module depth
-/// limits are of this order, and no real crate comes near it.
+/// The most parents a module may have (rule 18); no real crate comes near it.
 pub const MAX_MODULE_DEPTH: usize = 128;
 
 /// rustc's default `recursion_limit`: a macro call written at this expansion depth is an error.
 pub const RECURSION_LIMIT: u16 = 128;
 
-/// The most macro expansions one module may absorb (rule 18).
+/// The most macro expansions one module may take in (rule 18).
 pub const MAX_EXPANSIONS: usize = 1 << 16;
 
 /// A place in a module's text: a fragment and a slot of it.
@@ -57,24 +67,23 @@ pub(crate) enum Slot<N> {
     Glob(u32),
 }
 
-/// A declaration that is not ordered: an item, a `mod`, an `extern crate`, a macro export.
-#[derive(Clone, Copy, Debug)]
+/// A non-glob declaration: an item, a `mod`, an `extern crate`, a macro export.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct DefEntry {
     pub(crate) def: Def,
     pub(crate) vis: Visibility,
     pub(crate) origin: Origin,
     pub(crate) expansion: u16,
+    pub(crate) frag: u32,
 }
 
 /// The module's own text, or one call's expansion.
 pub(crate) struct Fragment<N, A: Allocator> {
-    /// The call it is the expansion of; `None` for the module's own text.
-    pub(crate) call: Option<ItemKey>,
     pub(crate) expansion: u16,
-    /// Where the call is, for a textual lookup that runs off the fragment's start.
+    /// The call it is the expansion of, for a lookup that runs off the fragment's start.
     pub(crate) parent: Option<At>,
     pub(crate) slots: Vec<Slot<N>, A>,
-    /// Its unordered declarations, in the order written, for the final pass.
+    /// Its non-glob declarations, in the order written.
     pub(crate) items: Vec<(Namespace, N, DefEntry), A>,
     /// Its `extern crate`s of no dependency.
     pub(crate) bad_extern: Vec<N, A>,
@@ -82,12 +91,11 @@ pub(crate) struct Fragment<N, A: Allocator> {
     pub(crate) bad_vis: Vec<Path<N, A>, A>,
 }
 
-/// Which scope layer a hit was found in.
+/// Which scope a hit was found in.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Layer {
     Textual,
     Module,
-    CrateRoot,
     ExternPrelude,
     MacroUsePrelude,
     StdPrelude,
@@ -102,8 +110,26 @@ pub(crate) struct Hit {
     pub(crate) vis: Visibility,
     pub(crate) origin: Origin,
     pub(crate) expansion: u16,
+    /// The fragment of this machine it was written in; `None` for a binding of another
+    /// module or a prelude (which rustc's expansion order puts at the root).
+    pub(crate) frag: Option<u32>,
     pub(crate) state: BindingState,
     pub(crate) layer: Layer,
+}
+
+impl Hit {
+    /// A module named by a path's start (`crate`, `self`, `super`, `$crate`).
+    pub(crate) fn module(key: ItemKey) -> Hit {
+        Hit {
+            def: Def::module(key),
+            vis: Visibility::Public,
+            origin: Origin::Declared,
+            expansion: 0,
+            frag: None,
+            state: BindingState::Determined,
+            layer: Layer::Path,
+        }
+    }
 }
 
 impl DefEntry {
@@ -113,6 +139,7 @@ impl DefEntry {
             vis: self.vis,
             origin: self.origin,
             expansion: self.expansion,
+            frag: Some(self.frag),
             state: BindingState::Determined,
             layer: Layer::Module,
         }
@@ -125,10 +152,10 @@ pub(crate) enum Res {
     Found(Hit),
     /// Determined: no binding.
     None,
-    /// Not determined yet. `weak`: nothing but a glob or an unexpanded macro can still define
-    /// it, so an early lexical lookup may go on to outer scopes (rustc's `Weak::Yes`).
+    /// Not determined. `weak`: only a glob or a macro expansion can still define it, so an
+    /// early lexical lookup goes on to outer scopes (rustc's `Weak::Yes`).
     Undet { weak: bool },
-    /// An answer is needed first (asked, or in progress); never forced.
+    /// An answer not given yet decides it.
     Wait,
 }
 
@@ -153,10 +180,13 @@ pub(crate) struct Import<N, A: Allocator> {
     pub(crate) at: At,
     pub(crate) ns: [NsRes; 3],
     pub(crate) failed: Option<(u32, Unresolved)>,
+    /// What its first segment resolved to, early.
+    pub(crate) first: Option<Def>,
+    pub(crate) blocked: bool,
 }
 
 impl<N, A: Allocator> Import<N, A> {
-    /// Whether namespace `ns` is one it imports.
+    /// Whether it imports namespace `ns`.
     pub(crate) fn imports(&self, ns: Namespace) -> bool {
         !self.types_only || ns == Namespace::Types
     }
@@ -169,8 +199,11 @@ impl<N, A: Allocator> Import<N, A> {
     }
 }
 
+/// A glob's source.
 pub(crate) enum Source<A: Allocator> {
     Pending,
+    /// A module or an enum, read in the visibility classes the importer can see; an enum's
+    /// variants are as visible as the enum (`clamp`).
     Resolved { def: Def, clamp: Option<Visibility>, classes: Vec<VisibilityClass, A> },
     /// `use self::*`: imports nothing new.
     Itself,
@@ -184,6 +217,8 @@ pub(crate) struct Glob<N, A: Allocator> {
     pub(crate) expansion: u16,
     pub(crate) at: At,
     pub(crate) source: Source<A>,
+    pub(crate) first: Option<Def>,
+    pub(crate) blocked: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -199,13 +234,21 @@ pub(crate) enum CallState {
     TooDeep,
 }
 
+impl CallState {
+    /// Whether the call may still add names.
+    pub(crate) fn unexpanded(self) -> bool {
+        matches!(self, CallState::Pending | CallState::Resolved(_))
+    }
+}
+
 pub(crate) struct Call<N, A: Allocator> {
     pub(crate) key: ItemKey,
     pub(crate) path: Path<N, A>,
     pub(crate) kind: MacroKind,
-    pub(crate) expansion: u16,
     pub(crate) at: At,
     pub(crate) state: CallState,
+    pub(crate) first: Option<Def>,
+    pub(crate) blocked: bool,
 }
 
 /// An answer as kept.
@@ -216,34 +259,56 @@ pub(crate) enum Cached<N, A: Allocator> {
     InProgress,
 }
 
-/// Where a pass's reads go: the reads it needs, the reads it used (only in the final pass)
-/// and the reads that answered `InProgress`. Off for a lookup into a fellow of a group, whose
-/// reads are its own.
+/// What a pass is for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Scan {
+    /// Resolve what can be resolved.
+    Early,
+    /// Expansion is stuck: a macro path still undetermined fails (rustc's `force`).
+    Force,
+    /// The last pass: every layer is visited for ambiguity, and the reads used are kept.
+    Final,
+}
+
+/// An ambiguity an early resolution meets in the final pass.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct Amb<N> {
+    pub(crate) ns: Namespace,
+    pub(crate) name: N,
+    pub(crate) kind: AmbiguityKind,
+    pub(crate) first: Def,
+    pub(crate) second: Def,
+}
+
+/// Where a pass's reads go: those it needs and has no answer to, those answered `InProgress`,
+/// and in the final pass those it used with what they saw.
 pub(crate) struct Sink<N, A: Allocator> {
-    pub(crate) on: bool,
+    pub(crate) scan: Scan,
     pub(crate) need: Vec<Read<N>, A>,
-    pub(crate) used: Vec<Read<N>, A>,
     pub(crate) waits: Vec<Read<N>, A>,
-    /// The planted bug of the read-list tests: negative reads are not recorded.
+    pub(crate) used: Vec<ReadEntry<N>, A>,
+    pub(crate) amb: Option<Amb<N>>,
+    /// The planted bug of the read-list control: a read that found nothing is not kept.
     #[cfg(test)]
     pub(crate) forget_negative: bool,
 }
 
 impl<N, A: Allocator + Clone> Sink<N, A> {
-    pub(crate) fn new_in(on: bool, alloc: &A) -> Sink<N, A> {
+    pub(crate) fn new_in(alloc: &A, scan: Scan) -> Sink<N, A> {
         Sink {
-            on,
+            scan,
             need: Vec::new_in(alloc.clone()),
-            used: Vec::new_in(alloc.clone()),
             waits: Vec::new_in(alloc.clone()),
+            used: Vec::new_in(alloc.clone()),
+            amb: None,
             #[cfg(test)]
             forget_negative: false,
         }
     }
 }
 
-/// The other machines a lookup may read live: the members of the group being solved (sorted
-/// by module), or none.
+/// The machines a lookup reads live: the members of the group being solved, sorted by module
+/// (a machine alone is a group of one).
 pub(crate) struct Env<'a, N, A: Allocator + Clone> {
     pub(crate) members: &'a [Resolver<N, A>],
 }
@@ -257,17 +322,13 @@ impl<N, A: Allocator + Clone> Clone for Env<'_, N, A> {
 impl<N, A: Allocator + Clone> Copy for Env<'_, N, A> {}
 
 impl<'a, N, A: Allocator + Clone> Env<'a, N, A> {
-    pub(crate) fn solo() -> Env<'a, N, A> {
-        Env { members: &[] }
-    }
-
     pub(crate) fn fellow(&self, module: ItemKey) -> Option<&'a Resolver<N, A>> {
         self.members.binary_search_by(|m| m.module.cmp(&module)).ok().map(|at| &self.members[at])
     }
 }
 
-/// The modules a glob traversal has passed through: a glob cycle contributes nothing beyond
-/// what is bound somewhere on it (the least fixpoint).
+/// The modules a glob traversal has passed through: a cycle of globs contributes nothing
+/// beyond what is bound somewhere on it (the least fixpoint).
 #[derive(Clone, Copy)]
 pub(crate) struct Visited<'v> {
     pub(crate) module: ItemKey,
@@ -298,6 +359,59 @@ pub(crate) struct Query<'q> {
     pub(crate) visited: Option<&'q Visited<'q>>,
 }
 
+/// A pending item, for its blocked flag.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub(crate) enum Item {
+    Import(u32),
+    Glob(u32),
+    Call(u32),
+}
+
+/// What resolving an import found, before it is merged into its state.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ImportOutcome {
+    pub(crate) ns: [NsRes; 3],
+    pub(crate) failed: Option<(u32, Unresolved)>,
+    pub(crate) first: Option<Def>,
+    pub(crate) wait: bool,
+}
+
+/// The updates one pass plans, applied after.
+pub(crate) struct Plan<A: Allocator> {
+    pub(crate) imports: Vec<(u32, [NsRes; 3], Option<(u32, Unresolved)>, Option<Def>), A>,
+    pub(crate) globs: Vec<(u32, Source<A>, Option<Def>), A>,
+    pub(crate) calls: Vec<(u32, CallState, Option<Def>), A>,
+    /// The pending items whose plan waited on an answer, sorted.
+    pub(crate) waiting: Vec<Item, A>,
+    /// How many imports, globs and calls there were when it was planned.
+    pub(crate) upto: [usize; 3],
+}
+
+/// What a step hands its caller, kept so the step can lend it.
+pub(crate) struct Outbox<N, A: Allocator> {
+    pub(crate) asks: Vec<Read<N>, A>,
+    pub(crate) expand: Vec<ExpandRequest, A>,
+    pub(crate) cycle: Vec<ItemKey, A>,
+}
+
+impl<N, A: Allocator + Clone> Outbox<N, A> {
+    pub(crate) fn new_in(alloc: &A) -> Outbox<N, A> {
+        Outbox {
+            asks: Vec::new_in(alloc.clone()),
+            expand: Vec::new_in(alloc.clone()),
+            cycle: Vec::new_in(alloc.clone()),
+        }
+    }
+}
+
+/// What [`run`] stopped on.
+pub(crate) enum Ran<N, A: Allocator> {
+    Ask,
+    Expand,
+    Cycle,
+    Done(Vec<Resolved<N, A>, A>),
+}
+
 /// The planted bugs the tests' controls switch on.
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -307,7 +421,7 @@ pub(crate) enum Plant {
     ForgetNegativeReads,
 }
 
-/// One module's name resolution (see the crate's documentation for the protocol).
+/// One module's name resolution (the protocol is in the crate's documentation).
 pub struct Resolver<N, A: Allocator + Clone> {
     pub(crate) module: ItemKey,
     pub(crate) krate: CrateItemKey,
@@ -315,7 +429,7 @@ pub struct Resolver<N, A: Allocator + Clone> {
     pub(crate) edition: Edition,
     /// The module, its parent, ..., the crate root.
     pub(crate) chain: Vec<ItemKey, A>,
-    /// Each of `chain`'s names in its parent.
+    /// The name of each of `chain` in its parent.
     pub(crate) chain_names: Vec<Option<N>, A>,
     /// No `#[no_implicit_prelude]` on the module or above it.
     pub(crate) implicit_prelude: bool,
@@ -325,33 +439,22 @@ pub struct Resolver<N, A: Allocator + Clone> {
     pub(crate) prelude: Option<ItemKey>,
     pub(crate) tools: Vec<N, A>,
     pub(crate) frags: Vec<Fragment<N, A>, A>,
-    /// The non-glob declarations by namespace and name, the first written kept.
+    /// The non-glob declarations by namespace and name, the first in the module's tree kept.
     pub(crate) defs: HashMap<(Namespace, N), DefEntry, A>,
     pub(crate) imports: Vec<Import<N, A>, A>,
     /// The imports by the name they bind.
     pub(crate) named: HashMap<N, Vec<u32, A>, A>,
     pub(crate) globs: Vec<Glob<N, A>, A>,
     pub(crate) calls: Vec<Call<N, A>, A>,
-    /// Calls not expanded yet (pending or asked for).
+    /// Calls that may still add names (pending or asked to be expanded).
     pub(crate) unexpanded: u32,
     pub(crate) expansions: usize,
     pub(crate) answers: HashMap<Read<N>, Cached<N, A>, A>,
-    /// What the last pass that moved nothing needed.
-    pub(crate) asks: Vec<Read<N>, A>,
-    pub(crate) wait_reads: Vec<Read<N>, A>,
-    pub(crate) waits: Vec<ItemKey, A>,
-    pub(crate) expand: Vec<ExpandRequest, A>,
+    pub(crate) out: Outbox<N, A>,
     pub(crate) finished: bool,
     pub(crate) alloc: A,
     #[cfg(test)]
     pub(crate) plant: Plant,
-}
-
-/// The updates one pass plans, applied after.
-pub(crate) struct Plan<A: Allocator> {
-    pub(crate) imports: Vec<(u32, [NsRes; 3], Option<(u32, Unresolved)>), A>,
-    pub(crate) globs: Vec<(u32, Source<A>), A>,
-    pub(crate) calls: Vec<(u32, CallState), A>,
 }
 
 fn count(n: usize, module: ItemKey) -> Result<u32, ResolveError> {
@@ -420,10 +523,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
             unexpanded: 0,
             expansions: 0,
             answers: HashMap::new_in(alloc.clone()),
-            asks: Vec::new_in(alloc.clone()),
-            wait_reads: Vec::new_in(alloc.clone()),
-            waits: Vec::new_in(alloc.clone()),
-            expand: Vec::new_in(alloc.clone()),
+            out: Outbox::new_in(&alloc),
             finished: false,
             alloc,
             #[cfg(test)]
@@ -441,9 +541,10 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
                     vis: Visibility::Public,
                     origin: Origin::MacroExport,
                     expansion: 0,
+                    frag: 0,
                 };
                 r.frags[0].items.push((Namespace::Macros, name, entry));
-                r.defs.entry((Namespace::Macros, name)).or_insert(entry);
+                r.insert_def(Namespace::Macros, name, entry);
             }
         }
         Ok(r)
@@ -460,15 +561,11 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
 
     /// A visibility restricted to `module`, in its one form.
     pub(crate) fn restricted(&self, module: ItemKey) -> Visibility {
-        if module == self.root {
-            Visibility::Crate(self.krate)
-        } else {
-            Visibility::Restricted(module)
-        }
+        if module == self.root { Visibility::Crate(self.krate) } else { Visibility::Restricted(module) }
     }
 
-    /// A written visibility resolved against the module's chain; a `pub(in path)` naming no
-    /// ancestor is reported in `bad` and is private.
+    /// A written visibility resolved against the module's own chain; a `pub(in path)` naming
+    /// no ancestor goes to `bad` and is private.
     fn resolve_vis<B: Allocator>(
         &self,
         vis: &VisDecl<N, B>,
@@ -504,7 +601,7 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
                 for seg in path.segments.iter() {
                     at = match at {
                         Some(i) if i > 0 && self.chain_names[i - 1] == Some(*seg) => Some(i - 1),
-                        _ => None,
+                        Some(_) | None => None,
                     };
                 }
                 match at {
@@ -533,19 +630,21 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         let mut bad_extern = Vec::new_in(a.clone());
         let mut bad_vis = Vec::new_in(a.clone());
         let mut ordered: Vec<(u32, Slot<N>), A> = Vec::new_in(a.clone());
+        let entry = |def: Def, vis: Visibility, origin: Origin| DefEntry {
+            def,
+            vis,
+            origin,
+            expansion,
+            frag: fid,
+        };
 
         for it in decls.items.iter() {
             let vis = self.resolve_vis(&it.vis, &mut bad_vis);
-            let entry = DefEntry { def: it.def, vis, origin: Origin::Declared, expansion };
-            items.push((it.ns, it.name, entry));
-            self.defs.entry((it.ns, it.name)).or_insert(entry);
+            items.push((it.ns, it.name, entry(it.def, vis, Origin::Declared)));
         }
         for m in decls.mods.iter() {
             let vis = self.resolve_vis(&m.vis, &mut bad_vis);
-            let entry =
-                DefEntry { def: Def::module(m.module), vis, origin: Origin::Declared, expansion };
-            items.push((Namespace::Types, m.name, entry));
-            self.defs.entry((Namespace::Types, m.name)).or_insert(entry);
+            items.push((Namespace::Types, m.name, entry(Def::module(m.module), vis, Origin::Declared)));
             ordered.push((m.pos, Slot::Mod { child: m.module, macro_use: m.macro_use }));
         }
         for ec in decls.extern_crates.iter() {
@@ -561,20 +660,12 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
                 Rename::To(name) => Some(name),
                 Rename::Underscore => None,
             };
-            match target {
-                Some(root) => {
-                    if let Some(name) = bound {
-                        let entry = DefEntry {
-                            def: Def::module(root),
-                            vis,
-                            origin: Origin::ExternCrate,
-                            expansion,
-                        };
-                        items.push((Namespace::Types, name, entry));
-                        self.defs.entry((Namespace::Types, name)).or_insert(entry);
-                    }
+            match (target, bound) {
+                (Some(root), Some(name)) => {
+                    items.push((Namespace::Types, name, entry(Def::module(root), vis, Origin::ExternCrate)));
                 }
-                None => {
+                (Some(_), None) => {}
+                (None, _) => {
                     if let Some(name) = written {
                         bad_extern.push(name);
                     }
@@ -596,6 +687,8 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
                         expansion,
                         at: placeholder,
                         source: Source::Pending,
+                        first: None,
+                        blocked: true,
                     });
                     ordered.push((u.pos, Slot::Glob(g)));
                 }
@@ -619,6 +712,8 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
                         at: placeholder,
                         ns: [NsRes::Pending; 3],
                         failed: None,
+                        first: None,
+                        blocked: true,
                     });
                     ordered.push((u.pos, Slot::Use(i)));
                 }
@@ -639,9 +734,10 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
                 key: c.call,
                 path: c.path.copy_in(a.clone()),
                 kind: c.kind,
-                expansion,
                 at: At { frag: fid, slot: 0 },
                 state,
+                first: None,
+                blocked: true,
             });
             ordered.push((c.pos, Slot::Call(i)));
         }
@@ -657,8 +753,65 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
             }
             slots.push(slot);
         }
-        self.frags.push(Fragment { call, expansion, parent, slots, items, bad_extern, bad_vis });
+        self.frags.push(Fragment { expansion, parent, slots, items, bad_extern, bad_vis });
+        for k in 0..self.frags[fid as usize].items.len() {
+            let (ns, name, e) = self.frags[fid as usize].items[k];
+            self.insert_def(ns, name, e);
+        }
         Ok(fid)
+    }
+
+    /// Keeps `e` as the binding of `(ns, name)` unless one written before it in the module's
+    /// tree is kept (the later one is a `Duplicate` error of the final pass).
+    fn insert_def(&mut self, ns: Namespace, name: N, e: DefEntry) {
+        let replace = match self.defs.get(&(ns, name)).copied() {
+            Some(old) => self.frag_before(e.frag, old.frag),
+            None => true,
+        };
+        if replace {
+            self.defs.insert((ns, name), e);
+        }
+    }
+
+    /// The slots of the calls a fragment is inside, from the module's text down.
+    fn frag_path(&self, frag: u32) -> Vec<u32, A> {
+        let mut path = Vec::new_in(self.alloc.clone());
+        let mut cur = frag;
+        while let Some(p) = self.frags[cur as usize].parent {
+            path.push(p.slot);
+            cur = p.frag;
+        }
+        path.reverse();
+        path
+    }
+
+    /// Whether fragment `a` is before `b` in the module's tree (an enclosing fragment first).
+    fn frag_before(&self, a: u32, b: u32) -> bool {
+        a != b && self.frag_path(a).as_slice() < self.frag_path(b).as_slice()
+    }
+
+    /// The order of two places in the module's tree: what "written first" means once
+    /// expansions are in, whatever order they were taken in.
+    pub(crate) fn tree_cmp(&self, a: At, b: At) -> Ordering {
+        let mut pa = self.frag_path(a.frag);
+        pa.push(a.slot);
+        let mut pb = self.frag_path(b.frag);
+        pb.push(b.slot);
+        pa.as_slice().cmp(pb.as_slice())
+    }
+
+    /// Whether fragment `a` is `b` or inside `b`.
+    pub(crate) fn is_desc(&self, a: u32, b: u32) -> bool {
+        let mut cur = a;
+        loop {
+            if cur == b {
+                return true;
+            }
+            match self.frags[cur as usize].parent {
+                Some(p) => cur = p.frag,
+                None => return false,
+            }
+        }
     }
 
     /// Keeps the answers of `replies`. An `InProgress` never replaces a final answer.
@@ -681,7 +834,13 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
                     v.extend_from_slice(defs);
                     Cached::Textual { defs: v, digest }
                 }
-                _ => {
+                (
+                    Read::Name { .. }
+                    | Read::Exports { .. }
+                    | Read::TextualEntry { .. }
+                    | Read::TextualOut { .. },
+                    Answer::Name(_) | Answer::Exports { .. } | Answer::Textual { .. },
+                ) => {
                     return Err(ResolveError::WrongAnswer {
                         module: self.module,
                         read_of: reply.read.module(),
@@ -697,112 +856,71 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         Ok(())
     }
 
-    /// The answer to `read`, recording it in `sink`: a missing one is needed, one in progress
-    /// is waited on, any other is used.
+    /// The answer to `read`: a missing one is needed, one in progress is waited on, any other
+    /// is used (and kept with what it saw, in the final pass).
     pub(crate) fn cached(&self, read: Read<N>, sink: &mut Sink<N, A>) -> Option<&Cached<N, A>> {
-        match self.answers.get(&read) {
-            None => {
-                if sink.on {
-                    sink.need.push(read);
-                }
-                None
-            }
-            Some(Cached::InProgress) => {
-                if sink.on {
-                    sink.waits.push(read);
-                }
-                None
-            }
-            Some(c) => {
-                #[cfg(test)]
-                let forget = sink.forget_negative && matches!(c, Cached::Name(NameAnswer::Absent));
-                #[cfg(not(test))]
-                let forget = false;
-                if sink.on && !forget {
-                    sink.used.push(read);
-                }
-                Some(c)
-            }
-        }
-    }
-
-    /// Plans one pass: every import, glob and call that can move, from the state as it is.
-    pub(crate) fn plan<F: ScopeFacts<Name = N>>(
-        &self,
-        facts: &F,
-        env: Env<'_, N, A>,
-        force: bool,
-        sink: &mut Sink<N, A>,
-    ) -> Result<Plan<A>, ResolveError> {
-        let a = self.alloc.clone();
-        let mut plan = Plan {
-            imports: Vec::new_in(a.clone()),
-            globs: Vec::new_in(a.clone()),
-            calls: Vec::new_in(a),
+        let Some(c) = self.answers.get(&read) else {
+            sink.need.push(read);
+            return None;
         };
-        for g in 0..self.globs.len() {
-            let i = count(g, self.module)?;
-            match &self.globs[g].source {
-                Source::Pending => {
-                    if let Some(source) = self.plan_glob(i, facts, force, env, sink)? {
-                        plan.globs.push((i, source));
-                    }
-                }
-                Source::Resolved { def, classes, .. } => {
-                    // A glob's source is read whole once it is known: its names, and the
-                    // absence of any other, decide the module's glob bindings.
-                    if env.fellow(def.key).is_none() {
-                        for &class in classes.iter() {
-                            let _ = self.cached(Read::Exports { module: def.key, class }, sink);
-                        }
-                    }
-                }
-                Source::Itself | Source::Failed(..) => {}
+        let saw = match c {
+            Cached::Name(answer) => Saw::Name(*answer),
+            Cached::Exports { digest, .. } | Cached::Textual { digest, .. } => Saw::Digest(*digest),
+            Cached::InProgress => {
+                sink.waits.push(read);
+                return None;
+            }
+        };
+        if sink.scan == Scan::Final {
+            #[cfg(test)]
+            let keep = !(sink.forget_negative && saw == Saw::Name(NameAnswer::Absent));
+            #[cfg(not(test))]
+            let keep = true;
+            if keep {
+                sink.used.push(ReadEntry { read, saw });
             }
         }
-        for i in 0..self.imports.len() {
-            let i = count(i, self.module)?;
-            if let Some(update) = self.plan_import(i, force, env, sink) {
-                plan.imports.push(update);
-            }
-        }
-        for c in 0..self.calls.len() {
-            let i = count(c, self.module)?;
-            if self.calls[c].state == CallState::Pending {
-                if let Some(state) = self.plan_call(i, force, env, sink) {
-                    plan.calls.push((i, state));
-                }
-            }
-        }
-        Ok(plan)
+        Some(c)
     }
 
-    /// Applies a plan, then takes in every expansion now available. Whether anything moved.
+    /// Applies a plan, then takes in every expansion now given. Whether anything moved.
     pub(crate) fn apply<F: ScopeFacts<Name = N>>(
         &mut self,
         facts: &F,
         plan: Plan<A>,
     ) -> Result<bool, ResolveError> {
         let mut moved = false;
-        for (i, ns, failed) in plan.imports {
+        self.set_flags(&plan.waiting, plan.upto);
+        for (i, ns, failed, first) in plan.imports {
             let imp = &mut self.imports[i as usize];
             if imp.ns != ns || imp.failed != failed {
-                imp.ns = ns;
-                imp.failed = failed;
                 moved = true;
             }
+            imp.ns = ns;
+            imp.failed = failed;
+            if imp.first.is_none() {
+                imp.first = first;
+            }
         }
-        for (i, source) in plan.globs {
-            self.globs[i as usize].source = source;
+        for (i, source, first) in plan.globs {
+            let g = &mut self.globs[i as usize];
+            g.source = source;
+            if g.first.is_none() {
+                g.first = first;
+            }
             moved = true;
         }
-        for (i, state) in plan.calls {
-            let call = &mut self.calls[i as usize];
-            if call.state != state {
-                if matches!(state, CallState::Failed(..) | CallState::Inert) {
+        for (i, state, first) in plan.calls {
+            let old = self.calls[i as usize].state;
+            if old != state {
+                if old.unexpanded() && !state.unexpanded() {
                     self.unexpanded -= 1;
                 }
+                let call = &mut self.calls[i as usize];
                 call.state = state;
+                if call.first.is_none() {
+                    call.first = first;
+                }
                 moved = true;
             }
         }
@@ -814,8 +932,8 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
             if self.expansions > MAX_EXPANSIONS {
                 return Err(ResolveError::TooManyExpansions { module: self.module });
             }
-            let depth = self.calls[c].expansion + 1;
             let at = self.calls[c].at;
+            let depth = self.frags[at.frag as usize].expansion + 1;
             let frag = self.add_fragment(expanded, Some(key), depth, Some(at))?;
             self.calls[c].state = CallState::Expanded { frag, def };
             self.unexpanded -= 1;
@@ -824,99 +942,51 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         Ok(moved)
     }
 
-    /// The most passes that can each move something: every import namespace, glob and call
-    /// state moves forward only (rule 18).
-    pub(crate) fn pass_bound(&self) -> u32 {
-        let work = 4 * self.imports.len() + 2 * self.globs.len() + 3 * self.calls.len() + 4;
-        u32::try_from(work).unwrap_or(u32::MAX)
-    }
-
-    /// Keeps what the last pass, which moved nothing, needed and waited on.
-    pub(crate) fn keep_needs(&mut self, sink: Sink<N, A>) {
-        let Sink { mut need, mut waits, .. } = sink;
-        need.sort();
-        need.dedup();
-        waits.sort();
-        waits.dedup();
-        self.asks = need;
-        self.wait_reads = waits;
-        let mut keys = Vec::with_capacity_in(self.wait_reads.len(), self.alloc.clone());
-        for read in self.wait_reads.iter() {
-            if let Some(owner) = self.owner(read) {
-                keys.push(owner);
-            }
-        }
-        keys.sort();
-        keys.dedup();
-        self.waits = keys;
-    }
-
-    /// The module whose record answers `read`: a `TextualEntry` of this module is its
-    /// parent's; any other read is of the module it names.
-    pub(crate) fn owner(&self, read: &Read<N>) -> Option<ItemKey> {
-        match *read {
-            Read::TextualEntry { module } if module == self.module => self.chain.get(1).copied(),
-            _ => Some(read.module()),
-        }
-    }
-
-    /// The calls asked to be expanded, sorted.
-    pub(crate) fn collect_expands(&mut self) {
-        self.expand.clear();
-        for call in self.calls.iter() {
-            if let CallState::Resolved(def) = call.state {
-                self.expand.push(ExpandRequest { call: call.key, def });
-            }
-        }
-        self.expand.sort();
-    }
-
-    /// Passes until one moves nothing.
-    fn settle<F: ScopeFacts<Name = N>>(&mut self, facts: &F) -> Result<(), ResolveError> {
-        let mut passes = 0u32;
-        loop {
-            let mut sink = Sink::new_in(true, &self.alloc);
-            let plan = self.plan(facts, Env::solo(), false, &mut sink)?;
-            let moved = self.apply(facts, plan)?;
-            passes += 1;
-            if !moved {
-                self.keep_needs(sink);
-                return Ok(());
-            }
-            if passes > self.pass_bound() {
-                return Err(ResolveError::NoProgressBound { module: self.module, passes });
-            }
-        }
-    }
-
-    /// Whether a call is still pending.
-    pub(crate) fn has_pending_calls(&self) -> bool {
-        self.calls.iter().any(|c| c.state == CallState::Pending)
-    }
-
-    /// Plans the forced resolution of the pending calls (rustc's `force` when expansion is
-    /// stuck): a lookup that only a glob or an expansion could still change goes on to outer
-    /// scopes, one that something else could change fails.
-    pub(crate) fn plan_forced_calls(
-        &self,
-        env: Env<'_, N, A>,
-        sink: &mut Sink<N, A>,
-    ) -> Result<Plan<A>, ResolveError> {
-        let a = self.alloc.clone();
-        let mut plan = Plan {
-            imports: Vec::new_in(a.clone()),
-            globs: Vec::new_in(a.clone()),
-            calls: Vec::new_in(a),
+    /// Sets each pending item's flag to whether it is in `waiting`; whether a flag changed.
+    pub(crate) fn set_flags(&mut self, waiting: &[Item], upto: [usize; 3]) -> bool {
+        let mut changed = false;
+        let mut set = |flag: &mut bool, item: Item, pending: bool| {
+            let new = pending && waiting.binary_search(&item).is_ok();
+            changed |= *flag != new;
+            *flag = new;
         };
-        for c in 0..self.calls.len() {
-            if self.calls[c].state == CallState::Pending {
-                let i = count(c, self.module)?;
-                if let Some(state) = self.plan_call(i, true, env, sink) {
-                    plan.calls.push((i, state));
-                }
-            }
+        for (i, imp) in self.imports.iter_mut().enumerate().take(upto[0]) {
+            let pending = !imp.done();
+            set(&mut imp.blocked, Item::Import(i as u32), pending);
         }
-        Ok(plan)
+        for (i, g) in self.globs.iter_mut().enumerate().take(upto[1]) {
+            let pending = matches!(g.source, Source::Pending);
+            set(&mut g.blocked, Item::Glob(i as u32), pending);
+        }
+        for (i, c) in self.calls.iter_mut().enumerate().take(upto[2]) {
+            let pending = c.state == CallState::Pending;
+            set(&mut c.blocked, Item::Call(i as u32), pending);
+        }
+        changed
+    }
+
+    /// Every pending item blocked: after a move, nothing is known not to wait.
+    pub(crate) fn block_all(&mut self) {
+        for imp in self.imports.iter_mut() {
+            imp.blocked = !imp.done();
+        }
+        for g in self.globs.iter_mut() {
+            g.blocked = matches!(g.source, Source::Pending);
+        }
+        for c in self.calls.iter_mut() {
+            c.blocked = c.state == CallState::Pending;
+        }
+    }
+
+    /// The flags of every item, in order, for [`relax`] to compare.
+    fn flags_into(&self, out: &mut Vec<bool, A>) {
+        out.extend(self.imports.iter().map(|i| i.blocked));
+        out.extend(self.globs.iter().map(|g| g.blocked));
+        out.extend(self.calls.iter().map(|c| c.blocked));
+    }
+
+    pub(crate) fn upto(&self) -> [usize; 3] {
+        [self.imports.len(), self.globs.len(), self.calls.len()]
     }
 
     /// Fails every import and glob still pending: nothing can move them any more.
@@ -931,11 +1001,11 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
                 match imp.ns[ns.index()] {
                     NsRes::Pending if imp.imports(ns) => imp.ns[ns.index()] = NsRes::Absent,
                     NsRes::Found(_) => any = true,
-                    _ => {}
+                    NsRes::Pending | NsRes::Absent | NsRes::Private(_) => {}
                 }
             }
             if !any {
-                let last = u32::try_from(imp.path.segments.len().saturating_sub(1)).unwrap_or(0);
+                let last = u32::try_from(imp.path.segments.len().saturating_sub(1)).unwrap_or(u32::MAX);
                 imp.failed = Some((last, Unresolved::Undetermined));
             }
             moved = true;
@@ -949,6 +1019,13 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
         moved
     }
 
+    /// The most passes that can each move something: every import namespace, glob and call
+    /// moves forward only (rule 18).
+    pub(crate) fn pass_bound(&self) -> u32 {
+        let work = 4 * self.imports.len() + 2 * self.globs.len() + 3 * self.calls.len() + 4;
+        u32::try_from(work).unwrap_or(u32::MAX)
+    }
+
     /// One step of the protocol: takes `replies`, runs until it needs something, and says what.
     pub fn step<F: ScopeFacts<Name = N>>(
         &mut self,
@@ -959,63 +1036,254 @@ impl<N: Name, A: Allocator + Clone> Resolver<N, A> {
             return Err(ResolveError::Finished { module: self.module });
         }
         self.absorb(replies)?;
-        let mut forced = 0u32;
-        loop {
-            self.settle(facts)?;
-            if !self.asks.is_empty() {
-                return Ok(Step::Ask(&self.asks));
-            }
-            self.collect_expands();
-            if !self.expand.is_empty() {
-                return Ok(Step::Expand(&self.expand));
-            }
-            if !self.waits.is_empty() {
-                return Ok(Step::Cycle(&self.waits));
-            }
-            let mut moved = false;
-            if self.has_pending_calls() {
-                let mut sink = Sink::new_in(true, &self.alloc);
-                let plan = self.plan_forced_calls(Env::solo(), &mut sink)?;
-                moved = self.apply(facts, plan)?;
-            }
-            if !moved {
-                moved = self.fail_pending();
-            }
-            if moved {
-                forced += 1;
-                if forced > self.pass_bound() {
-                    return Err(ResolveError::NoProgressBound { module: self.module, passes: forced });
-                }
-                continue;
-            }
-            match self.finalize(Env::solo(), &[])? {
-                crate::finish::Finish::Need { asks, waits } => {
-                    self.asks = asks;
-                    self.wait_reads = waits;
-                    let mut keys = Vec::new_in(self.alloc.clone());
-                    for read in self.wait_reads.iter() {
-                        if let Some(owner) = self.owner(read) {
-                            keys.push(owner);
-                        }
-                    }
-                    keys.sort();
-                    keys.dedup();
-                    self.waits = keys;
-                    if !self.asks.is_empty() {
-                        return Ok(Step::Ask(&self.asks));
-                    }
-                    return Ok(Step::Cycle(&self.waits));
-                }
-                crate::finish::Finish::Done(resolved) => {
-                    self.finished = true;
-                    return Ok(Step::Done(resolved));
-                }
+        let alloc = self.alloc.clone();
+        let mut out = core::mem::replace(&mut self.out, Outbox::new_in(&alloc));
+        let ran = run(core::slice::from_mut(self), facts, &mut out, &alloc);
+        self.out = out;
+        match ran? {
+            Ran::Ask => Ok(Step::Ask(&self.out.asks)),
+            Ran::Expand => Ok(Step::Expand(&self.out.expand)),
+            Ran::Cycle => Ok(Step::Cycle(&self.out.cycle)),
+            Ran::Done(mut all) => {
+                all.pop().map(Step::Done).ok_or(ResolveError::BadGroup { module: None })
             }
         }
     }
 
+    /// Switches on a planted bug, for a control.
     #[cfg(test)]
     pub(crate) fn set_plant(&mut self, plant: Plant) {
         self.plant = plant;
+    }
+}
+
+/// One pass over every member: all plans from the state as it is, then all applied.
+fn pass<N: Name, A: Allocator + Clone, F: ScopeFacts<Name = N>>(
+    ms: &mut [Resolver<N, A>],
+    facts: &F,
+    scan: Scan,
+    alloc: &A,
+) -> Result<(bool, Sink<N, A>), ResolveError> {
+    let mut sink = Sink::new_in(alloc, scan);
+    let mut plans = Vec::with_capacity_in(ms.len(), alloc.clone());
+    {
+        let env = Env { members: &*ms };
+        for m in ms.iter() {
+            plans.push(m.plan(facts, env, &mut sink)?);
+        }
+    }
+    let mut moved = false;
+    for (m, plan) in ms.iter_mut().zip(plans) {
+        moved |= m.apply(facts, plan)?;
+    }
+    Ok((moved, sink))
+}
+
+/// Lowers the blocked flags to their least fixpoint: from none, each round blocks what waits
+/// on an answer or on a blocked item, until a round blocks nothing new. Whether any flag ends
+/// lower than it was, and the last round's sink: the reads the settled flags need. Run only
+/// when no answer is outstanding.
+fn relax<N: Name, A: Allocator + Clone, F: ScopeFacts<Name = N>>(
+    ms: &mut [Resolver<N, A>],
+    facts: &F,
+    alloc: &A,
+) -> Result<(bool, Sink<N, A>), ResolveError> {
+    let mut before = Vec::new_in(alloc.clone());
+    for m in ms.iter() {
+        m.flags_into(&mut before);
+    }
+    let none: Vec<Item, A> = Vec::new_in(alloc.clone());
+    for m in ms.iter_mut() {
+        let upto = m.upto();
+        m.set_flags(&none, upto);
+    }
+    let rounds = before.len() + 2;
+    // Every round's reads: an item blocks once a read it makes has no answer, and blocked it
+    // no longer makes that read, so the reads come from the rounds before it blocked.
+    let mut all = Sink::new_in(alloc, Scan::Early);
+    let mut settled = false;
+    for _ in 0..rounds {
+        let mut sink = Sink::new_in(alloc, Scan::Early);
+        let mut plans = Vec::with_capacity_in(ms.len(), alloc.clone());
+        {
+            let env = Env { members: &*ms };
+            for m in ms.iter() {
+                plans.push(m.plan(facts, env, &mut sink)?);
+            }
+        }
+        all.need.extend_from_slice(&sink.need);
+        all.waits.extend_from_slice(&sink.waits);
+        let mut changed = false;
+        for (m, plan) in ms.iter_mut().zip(plans.iter()) {
+            changed |= m.set_flags(&plan.waiting, plan.upto);
+        }
+        if !changed {
+            settled = true;
+            break;
+        }
+    }
+    if !settled {
+        let passes = u32::try_from(rounds).unwrap_or(u32::MAX);
+        return Err(ResolveError::NoProgressBound { module: ms[0].module, passes });
+    }
+    let sink = all;
+    let mut after = Vec::new_in(alloc.clone());
+    for m in ms.iter() {
+        m.flags_into(&mut after);
+    }
+    Ok((after != before, sink))
+}
+
+/// Passes until one moves nothing and asks nothing new; returns that pass's sink.
+fn settle<N: Name, A: Allocator + Clone, F: ScopeFacts<Name = N>>(
+    ms: &mut [Resolver<N, A>],
+    facts: &F,
+    alloc: &A,
+) -> Result<Sink<N, A>, ResolveError> {
+    let mut passes = 0u32;
+    loop {
+        let (moved, sink) = pass(ms, facts, Scan::Early, alloc)?;
+        passes += 1;
+        let bound = ms
+            .iter()
+            .map(|m| m.pass_bound())
+            .fold(4u32, |a, b| a.saturating_add(b.saturating_mul(2)));
+        if passes > bound {
+            return Err(ResolveError::NoProgressBound { module: ms[0].module, passes });
+        }
+        if moved {
+            for m in ms.iter_mut() {
+                m.block_all();
+            }
+            continue;
+        }
+        if !sink.need.is_empty() || !sink.waits.is_empty() {
+            return Ok(sink);
+        }
+        let (lowered, relaxed) = relax(ms, facts, alloc)?;
+        if lowered {
+            continue;
+        }
+        // The flags were already settled: what the settled plan needs is what to ask.
+        return Ok(relaxed);
+    }
+}
+
+/// The module whose record answers `read`.
+fn owner<N: Copy, A: Allocator + Clone>(ms: &[Resolver<N, A>], read: &Read<N>) -> Option<ItemKey> {
+    match *read {
+        Read::TextualEntry { module } => {
+            ms.iter().find(|m| m.module == module).and_then(|m| m.chain.get(1).copied())
+        }
+        Read::Name { .. } | Read::Exports { .. } | Read::TextualOut { .. } => Some(read.module()),
+    }
+}
+
+/// Fills `out.cycle` with the modules of `waits` that are not members; whether there is one.
+fn cycle_of<N: Name, A: Allocator + Clone>(
+    ms: &[Resolver<N, A>],
+    waits: &[Read<N>],
+    out: &mut Outbox<N, A>,
+) -> bool {
+    out.cycle.clear();
+    for read in waits {
+        if let Some(m) = owner(ms, read) {
+            if ms.binary_search_by(|r| r.module.cmp(&m)).is_err() {
+                out.cycle.push(m);
+            }
+        }
+    }
+    out.cycle.sort();
+    out.cycle.dedup();
+    !out.cycle.is_empty()
+}
+
+/// Runs a group of machines (one, for a machine alone) until it needs something or is done.
+pub(crate) fn run<N: Name, A: Allocator + Clone, F: ScopeFacts<Name = N>>(
+    ms: &mut [Resolver<N, A>],
+    facts: &F,
+    out: &mut Outbox<N, A>,
+    alloc: &A,
+) -> Result<Ran<N, A>, ResolveError> {
+    let mut forced = 0u32;
+    loop {
+        let sink = settle(ms, facts, alloc)?;
+        out.asks.clear();
+        out.asks.extend_from_slice(&sink.need);
+        out.asks.sort();
+        out.asks.dedup();
+        if !out.asks.is_empty() {
+            return Ok(Ran::Ask);
+        }
+        out.expand.clear();
+        for m in ms.iter() {
+            for call in m.calls.iter() {
+                if let CallState::Resolved(def) = call.state {
+                    out.expand.push(ExpandRequest { call: call.key, def });
+                }
+            }
+        }
+        out.expand.sort();
+        out.expand.dedup();
+        if !out.expand.is_empty() {
+            return Ok(Ran::Expand);
+        }
+        if cycle_of(ms, &sink.waits, out) {
+            return Ok(Ran::Cycle);
+        }
+        // Stuck: force the macro paths, then the imports (rustc's order).
+        let (mut moved, _) = pass(ms, facts, Scan::Force, alloc)?;
+        if !moved {
+            for m in ms.iter_mut() {
+                moved |= m.fail_pending();
+            }
+        }
+        if moved {
+            for m in ms.iter_mut() {
+                m.block_all();
+            }
+            forced += 1;
+            let bound = ms.iter().map(|m| m.pass_bound()).fold(2u32, u32::saturating_add);
+            if forced > bound {
+                return Err(ResolveError::NoProgressBound { module: ms[0].module, passes: forced });
+            }
+            continue;
+        }
+        let mut fellows = Vec::with_capacity_in(ms.len(), alloc.clone());
+        fellows.extend(ms.iter().map(|m| m.module));
+        let mut done = Vec::with_capacity_in(ms.len(), alloc.clone());
+        let mut asks = Vec::new_in(alloc.clone());
+        let mut waits = Vec::new_in(alloc.clone());
+        {
+            let env = Env { members: &*ms };
+            for m in ms.iter() {
+                match m.finalize(facts, env, &fellows)? {
+                    Finish::Need { asks: a, waits: w } => {
+                        asks.extend_from_slice(&a);
+                        waits.extend_from_slice(&w);
+                    }
+                    Finish::Done(resolved) => done.push(resolved),
+                }
+            }
+        }
+        if !asks.is_empty() {
+            out.asks.clear();
+            out.asks.extend_from_slice(&asks);
+            out.asks.sort();
+            out.asks.dedup();
+            return Ok(Ran::Ask);
+        }
+        if cycle_of(ms, &waits, out) {
+            return Ok(Ran::Cycle);
+        }
+        if done.len() != ms.len() {
+            // A final pass waited on a member: a member's records are read live, never
+            // waited on, so this is the machine's own bug, stopped on rather than hidden.
+            return Err(ResolveError::NoProgressBound { module: ms[0].module, passes: forced });
+        }
+        for m in ms.iter_mut() {
+            m.finished = true;
+        }
+        return Ok(Ran::Done(done));
     }
 }

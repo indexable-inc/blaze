@@ -1,5 +1,5 @@
-//! A walk made by patching the walk kept of the same program
-//! (docs/v2/plan/design/incremental-walk.md): the work of an edit, not of the program.
+//! A walk made by patching the walk kept of the same program:
+//! the work of an edit, not of the program.
 //!
 //! The kept walk ([`Walked`]) is the whole result of a walk that had no error, with what
 //! finds the changed set and what a change touches ([`Keep`]): every *item* the walk
@@ -536,8 +536,7 @@ impl<'a, B: Prepare> Build<'a, B> {
         // all cores. A describe that fails is the whole walk's to report.
         type Answer<I, S> = (Option<(Option<Arc<Described<I, S>>>, Counted)>, bool);
         // The asking is the edit's size where the front end names its changed set, and the
-        // program's where it does not (docs/v2/plan/design/incremental-walk.md, "The changed
-        // set from the engine"): its span says which, with what was named and held.
+        // program's where it does not: its span says which, with what was named and held.
         let asking = tracing::info_span!(
             target: "blaze",
             "codegen walk: ask functions",

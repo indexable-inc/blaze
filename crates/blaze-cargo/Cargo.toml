@@ -29,7 +29,6 @@ blaze-hash.workspace = true
 blaze-item-hash.workspace = true
 blaze-items.workspace = true
 blaze-serde.workspace = true
-hir.workspace = true
 hir-def.workspace = true
 hir-ty.workspace = true
 hir-ty-ub.workspace = true
@@ -106,10 +105,6 @@ zstd.workspace = true
 # The `.tar.xz` files of blaze's own toolchain (`cargo/toolchain/own.rs`): in Rust, within 1.3x
 # of liblzma's time on rustc's 84 MB.
 lzma-rust2 = { workspace = true, features = ["std", "xz", "optimization"] }
-# What the thin `blaze` and this CLI must say and send alike, each written once there: the
-# status and `Finished` lines, the color rule, the request of a plain build or run, and what
-# the thin `blaze` hands a command it began to this one with (`cli/resume.rs`).
-blaze-thin.workspace = true
 blaze-core.workspace = true
 blaze-vfs.workspace = true
 blaze-memo.workspace = true
@@ -129,8 +124,6 @@ blaze-store-check.workspace = true
 blaze-testsel.workspace = true
 # Test selection's keys, records and snapshot (`serve/unit/test.rs`, `serve/unit/test/image.rs`).
 blaze-keyed.workspace = true
-# `check --no-daemon`: the keyed request in this process (`cli::no_daemon`).
-blaze-command.workspace = true
 blaze-lazy = { workspace = true, features = ["daemon"] }
 blaze-link.workspace = true
 # The launcher's protocol and the daemon's side of a launched program (`serve/unit/run/launch.rs`).

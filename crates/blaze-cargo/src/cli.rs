@@ -10,7 +10,7 @@
 //! - [`daemon`]: finding and starting `blaze serve`, and the [`daemon::Api`] it is spoken to by.
 //! - [`print`]: a build's responses as cargo's lines; [`say`] and [`json`] are their texts.
 //! - [`run`] and [`test`]: what runs after the build; [`doc`]: `doc`'s pages, written.
-//! - [`resume`]: a build or a run the thin `blaze` began (blaze-thin, docs/client.md), gone on
+//! - [`resume`]: a build or a run the thin `blaze` began (blaze-thin), gone on
 //!   with from the connection and the answer it hands over.
 //! - [`inspect`]: blaze's own looks at the last build (`codegen-inputs`, `trace`, `tables`).
 //! - [`observe`]: blaze's looks at itself: `explore`, `debug profile|live|sql`, `explain`.

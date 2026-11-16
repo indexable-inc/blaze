@@ -1,6 +1,6 @@
 //! [`expand`]: one macro call of one definition to its [`Expanded`].
 
-use std::alloc::Allocator;
+use core::alloc::Allocator;
 
 use mbe::DeclarativeMacro;
 
@@ -78,14 +78,14 @@ pub fn expand_prepared<A: Allocator + Clone>(
     match def.kind() {
         MacroKind::Rules | MacroKind::Macro2 => {
             let rules = prepared.rules.as_ref().expect("`prepare` parses a declarative definition");
-            declarative::expand(rules, &mut out, cx)?;
+            declarative::expand(rules, &mut out)?;
         }
         MacroKind::BuiltinFn(which) => {
             if let builtin::Step::Needs(calls) = builtin::expand(which, &mut out, cx)? {
                 return Ok(Expanded::NeedsExpanded(calls));
             }
         }
-        MacroKind::BuiltinDerive(which) => derive::expand(which, &mut out, cx)?,
+        MacroKind::BuiltinDerive(which) => derive::expand(which, &mut out)?,
         MacroKind::BuiltinAttr(which) => {
             return Err(ExpandError::NotBuilt { what: Unbuilt::BuiltinAttr(which) });
         }

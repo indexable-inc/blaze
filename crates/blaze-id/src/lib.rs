@@ -30,7 +30,6 @@ mod carried;
 use core::fmt;
 
 pub use blaze_ids::{ContentId, Fingerprint};
-use serde::{Deserialize, Serialize};
 
 pub use crate::carried::Carried;
 
@@ -148,7 +147,8 @@ portable_tuples! {
 /// It has rustc's `DefPathHash` shape: bytes 0..8 are the first 8 of its crate's key
 /// ([`ItemKey::crate_prefix`]), the top bit of byte 8 says whether it is of something inside a
 /// body ([`ItemKey::is_inner`]), and the other 247 bits are the hash.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ItemKey(pub ContentId);
 
 impl ItemKey {
@@ -191,7 +191,8 @@ impl fmt::LowerHex for ItemKey {
 /// Which crate: the hash of its content (its name, version, origin, what it is built for and
 /// as, its edition, crate attributes, dependencies by name and key, and its cfg), never its
 /// session's `Crate` id. base-db computes it (`base_db::crate_item_key`).
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CrateItemKey(pub ContentId);
 
 impl CrateItemKey {

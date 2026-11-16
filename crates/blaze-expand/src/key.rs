@@ -1,7 +1,7 @@
 //! The keys of an expansion: [`call_key`] before the work, from text alone (rule 65), and
 //! [`expansion_key`], the record's, which adds the outside reads the work made.
 
-use std::alloc::Allocator;
+use core::alloc::Allocator;
 
 use blaze_id::{ContentId, Portable};
 use blaze_ids::Hasher;

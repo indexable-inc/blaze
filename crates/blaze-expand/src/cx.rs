@@ -2,8 +2,10 @@
 //! each answer recorded in the expansion as a [`crate::Read`] so the record is valid exactly
 //! while those answers stand.
 
+use core::alloc::Allocator;
 use core::fmt;
-use std::alloc::Allocator;
+
+use alloc::vec::Vec;
 
 use crate::{
     def::{MacroDef, ProcKind},
@@ -35,10 +37,6 @@ pub trait ExpandCx {
         call: ProcCall<'_, A>,
         alloc: A,
     ) -> Result<Produced<A>, HostError>;
-
-    /// The database mbe's `DeclarativeMacro::expand_in` and hir-expand's derive writers take
-    /// as a parameter and never read: it is only passed down. It goes when they drop it.
-    fn host_db(&self) -> &base_db::Db;
 }
 
 /// How an included file is read.

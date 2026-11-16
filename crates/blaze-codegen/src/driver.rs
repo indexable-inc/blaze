@@ -2255,7 +2255,7 @@ impl<'a, B: Prepare> Build<'a, B> {
     }
 
     /// Takes from `kept` each describe an earlier walk kept that the front end says still
-    /// holds, and keeps this walk's there for the next (docs/v2/plan/design/incremental-walk.md).
+    /// holds, and keeps this walk's there for the next.
     /// `kept` is of this front end's database and configuration and of no other: its
     /// instances are that database's. The walk reaches the same functions either way; with
     /// it, an unchanged function costs the front end's answer in place of a describe.
@@ -2366,7 +2366,7 @@ impl<'a, B: Prepare> Build<'a, B> {
     /// What the front end says of `asked`, a function and whose code asks for it, as a walk
     /// that visits it takes it: the store's record of it, else a describe
     /// ([`Self::found_or_described`]). Nothing is kept of it but the walk's node, so between
-    /// builds the record is its one holder (docs/v2/plan/design/end-state/memory.md 4.4): a
+    /// builds the record is its one holder: a
     /// describe is never held a second time by the instance it is of. A describe that fails
     /// is the build's error.
     fn described(

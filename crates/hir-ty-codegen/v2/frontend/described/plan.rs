@@ -1,5 +1,4 @@
-//! An instance's plan as a record (docs/v2/plan/design/command.md, "Code"; the no-daemon
-//! command's decision 1): its describe, keyed by what the instance is and filed by the driver
+//! An instance's plan as a record (the no-daemon command's decision 1): its describe, keyed by what the instance is and filed by the driver
 //! at the address of what it read, with its edges named so a driver with no database keys the
 //! plans of what it refers to.
 //!

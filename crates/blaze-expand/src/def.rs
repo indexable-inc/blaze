@@ -2,7 +2,9 @@
 //! what an expansion's key names it by (never its item key: two definitions with equal content
 //! expand alike, and a renamed or moved one keeps its expansions; rule 21).
 
-use std::alloc::Allocator;
+use core::alloc::Allocator;
+
+use alloc::vec::Vec;
 
 use blaze_id::{ContentId, CrateItemKey, Portable};
 use blaze_ids::Hasher;
@@ -116,7 +118,7 @@ impl BuiltinAttr {
     }
 }
 
-/// The builtin derives built here, each by hir-expand's token writer.
+/// The builtin derives built here, each written by `crate::derive`.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum BuiltinDerive {
     Copy,
@@ -144,21 +146,6 @@ impl BuiltinDerive {
             BuiltinDerive::PartialEq => "PartialEq",
         }
     }
-
-    pub(crate) fn expander(self) -> hir_expand::builtin::BuiltinDeriveExpander {
-        use hir_expand::builtin::BuiltinDeriveExpander as Old;
-        match self {
-            BuiltinDerive::Copy => Old::Copy,
-            BuiltinDerive::Clone => Old::Clone,
-            BuiltinDerive::Default => Old::Default,
-            BuiltinDerive::Debug => Old::Debug,
-            BuiltinDerive::Hash => Old::Hash,
-            BuiltinDerive::Ord => Old::Ord,
-            BuiltinDerive::PartialOrd => Old::PartialOrd,
-            BuiltinDerive::Eq => Old::Eq,
-            BuiltinDerive::PartialEq => Old::PartialEq,
-        }
-    }
 }
 
 /// How a proc macro is called.
@@ -180,7 +167,11 @@ pub enum MacroKind {
     BuiltinAttr(BuiltinAttr),
     BuiltinDerive(BuiltinDerive),
     /// A proc macro: its crate's key and its export name ([`MacroDef::proc_name`]).
-    ProcMacro { krate: CrateItemKey, kind: ProcKind, name: Text },
+    ProcMacro {
+        krate: CrateItemKey,
+        kind: ProcKind,
+        name: Text,
+    },
 }
 
 impl MacroKind {

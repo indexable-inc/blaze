@@ -2,20 +2,16 @@
 //! and the call go in as token trees whose spans say only which token each is
 //! ([`crate::bridge`]), and the output's spans come back as origins.
 //!
-//! What of mbe needs the old database: `DeclarativeMacro::expand_in` (and `expand`,
-//! `expand_making`, `expand_making_in`, `mbe::expect_fragment`) take a `&base_db::Db`, which
-//! `expander::expand_rules_in`, `matcher::match_` and `matcher::match_failure` pass on and
-//! nothing reads. `parse_macro_rules` and `parse_macro2` take none.
+//! mbe takes no database: its matcher and transcriber read only the trees and the spans.
 
-use std::alloc::Allocator;
+use core::alloc::Allocator;
 
 use mbe::{DeclarativeMacro, ExpandErrorKind, MacroCall};
 use span::SyntaxContext;
 
 use crate::{
-    bridge::{self, MarkImpls, Role},
+    bridge::{self, Role},
     call::CallKind,
-    cx::ExpandCx,
     def::{MacroDef, MacroKind},
     error::{ExpandError, Stream},
     expand::Out,
@@ -45,7 +41,6 @@ pub(crate) fn parse<A: Allocator>(def: &MacroDef<A>) -> Result<DeclarativeMacro,
 pub(crate) fn expand<A: Allocator + Clone>(
     rules: &DeclarativeMacro,
     out: &mut Out<'_, A>,
-    cx: &impl ExpandCx,
 ) -> Result<(), ExpandError> {
     if let Some(error) = rules.err() {
         let message = out.note_display(error)?;
@@ -68,13 +63,13 @@ pub(crate) fn expand<A: Allocator + Clone>(
     let rule_count = index(rules.num_rules());
     blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
         let same = |_: &mut span::Span| {};
-        let result = rules.expand_in(frame, cx.host_db(), &input, same, style, call_site);
+        let result = rules.expand_in(frame, &input, same, style, call_site);
         if let Some(error) = &result.err {
             return diagnose(out, error, rule_count);
         }
         let (tree, arm) = &result.value;
         out.exp.arm = *arm;
-        bridge::from_tt(out, tree.iter(), Transparency::Transparent, MarkImpls::No, 0)
+        bridge::from_tt(out, tree.iter(), Transparency::Transparent)
     })
 }
 

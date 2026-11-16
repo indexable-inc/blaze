@@ -1,5 +1,5 @@
-//! What a program's walk keeps for the next build of the same program over the same front end
-//! (docs/v2/plan/design/incremental-walk.md): its last walk ([`Walked`]), to be patched by
+//! What a program's walk keeps for the next build of the same program over the same front end:
+//! its last walk ([`Walked`]), to be patched by
 //! what the front end names as changed, and its last `Built` by row or by its entries, for
 //! the next build's delta.
 //!
@@ -10,7 +10,7 @@
 //! no root reached any more was never removed (lane F6 of the memory wave, read from code).
 //! A function a whole walk reaches is now the store's record of it or the front end's
 //! describe ([`super::records`], `Build::found_or_described`): the record is its one holder
-//! between builds (docs/v2/plan/design/end-state/memory.md 4.4).
+//! between builds.
 //!
 //! Nothing here decides what a build holds. The walk reaches what it reaches from its roots
 //! every time, patched or whole, so the walk over a kept walk equals the walk over none
@@ -195,7 +195,7 @@ pub struct Walk {
 
 /// What a build's walk and the passes after it did, counted: each a bound on the work of
 /// one pass, so a test holds each to the edit and a span records each
-/// (docs/v2/plan/design/incremental-walk.md, "Cost"). All 0 for a build whose walk ran
+/// ("Cost"). All 0 for a build whose walk ran
 /// whole, which counts nothing: its work is the program's.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
 pub struct Work {

@@ -32,7 +32,7 @@
 //!   heads reach. Records of nodes a collection dropped stay in the file until then; each
 //!   still makes its node, and a head keeps its latest record. Nothing is appended while a
 //!   rewrite is in flight; a failed one is made again from the state then.
-//! - **An image** (docs/v2/plan/design/restore.md): once the daemon's image holding the tree is
+//! - **An image**: once the daemon's image holding the tree is
 //!   durable ([`Journal::durable`]), the next flush rewrites the file to start with a base
 //!   record naming it (the hash of its tree and its node count), then only what the image does
 //!   not hold. A start maps the image and reads only that tail. The image records the base the

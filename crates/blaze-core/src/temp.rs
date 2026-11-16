@@ -1,5 +1,5 @@
 //! The one place blaze makes a directory under the system's temporary directory (rule
-//! `blaze::tmp_path`, docs/lints.md#tmp_path): [`TempDir`], a directory of its own that is
+//! `blaze::tmp_path`): [`TempDir`], a directory of its own that is
 //! removed with all it holds when it drops, so a test's home or a probe's scratch never
 //! outlives what made it. Nothing else names `/tmp`, `/private/tmp`, `/var/tmp` or calls
 //! `std::env::temp_dir`: a home left there leaked, and a reboot wiped a round's notes kept

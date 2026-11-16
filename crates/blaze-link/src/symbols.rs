@@ -28,7 +28,6 @@ use blaze_mem::MemError;
 use smallvec::SmallVec;
 
 use crate::intern::{IdShard, KeyShard, NameShard, Shard, shards};
-use crate::keep::{Bad, In, Kept, Out};
 use crate::model::Sym;
 use crate::reloc::GotKind;
 
@@ -771,102 +770,6 @@ impl Symbols {
     #[inline]
     pub fn split_id(id: IdNo) -> (usize, usize) {
         split(id.0)
-    }
-}
-
-crate::keep::kept_enum!(SymKey {
-    0 => Body(id),
-    1 => Slot(id),
-    2 => Data(id),
-    3 => Static(item, instance),
-    4 => Tlv(item, instance),
-    5 => Name(name),
-    6 => Local(obj, index),
-    7 => Section(obj, index),
-    8 => Position(anchor, index),
-    9 => FileName(name),
-    10 => Cie(id),
-    11 => Fde(id),
-    12 => WinInfo(id),
-    13 => Frame(obj, section, at),
-    14 => Got(kind, target),
-    15 => Plt(target),
-    16 => IatEnd(name),
-    17 => Common(name),
-    18 => Generation,
-    19 => Cells,
-    20 => Stubs,
-    21 => Descriptor,
-    23 => Coverage(id, array),
-    24 => CoveragePcs(id),
-    25 => StartHook,
-    26 => Counters,
-    27 => LazyStubs,
-    28 => LazyEntry(id),
-    29 => StaticList(item, instance),
-    30 => Thunk(target, island, addend),
-    31 => Text(id),
-});
-
-/// The tables as a kept state holds them ([`crate::keep`]): each shard's entries in the order
-/// they were interned, so putting them back in that order gives each its id again. No index
-/// is kept: rebuilding one costs a hash per entry, less than reading it would.
-impl Symbols {
-    pub(crate) fn keep<A: Allocator>(&self, out: &mut Out<A>) {
-        for shard in &self.ids {
-            out.len(shard.len());
-            for at in 0..shard.len() {
-                shard.id(at).put(out);
-            }
-        }
-        for shard in &self.names {
-            out.len(shard.len());
-            for at in 0..shard.len() {
-                out.text(shard.get(at));
-            }
-        }
-        for shard in &self.keys {
-            out.len(shard.len());
-            for at in 0..shard.len() {
-                shard.key(at).put(out);
-            }
-        }
-    }
-
-    pub(crate) fn open(input: &mut In<'_>) -> Result<Symbols, Bad> {
-        const MISPLACED: &str = "an entry kept in a shard, or at a place in it, that interning does not give it";
-        let mut symbols = Symbols::new().map_err(|error| Bad::Text(error.to_string()))?;
-        for shard in 0..SHARDS {
-            let count = input.count(32)?;
-            for at in 0..count {
-                let id = ContentId::take(input)?;
-                let hash = hash_id(&id);
-                if shard_of(hash) != shard || symbols.ids[shard].get_or_insert(hash, &id) as usize != at {
-                    return Err(Bad::What(MISPLACED));
-                }
-            }
-        }
-        for shard in 0..SHARDS {
-            let count = input.count(8)?;
-            for at in 0..count {
-                let name = input.text()?;
-                let hash = hash_name(name);
-                if shard_of(hash) != shard || symbols.names[shard].get_or_insert(hash, name) as usize != at {
-                    return Err(Bad::What(MISPLACED));
-                }
-            }
-        }
-        for shard in 0..SHARDS {
-            let count = input.count(1)?;
-            for at in 0..count {
-                let key = SymKey::take(input)?;
-                let hash = hash_key(key);
-                if shard_of(hash) != shard || symbols.keys[shard].get_or_insert(hash, key) as usize != at {
-                    return Err(Bad::What(MISPLACED));
-                }
-            }
-        }
-        Ok(symbols)
     }
 }
 

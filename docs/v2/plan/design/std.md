@@ -104,6 +104,40 @@ Each layer uses only the ones below it.
 | 1 | `bstd::sys` | raw system calls per target, the only home of `unsafe`; Linux by syscall number with no libc, macOS through libSystem, Windows through ntdll and kernel32 ([sys](sys.md); today the crate `crates/blaze-sys`) |
 | 0 | `core`, `alloc` | the language's own libraries, unchanged |
 
+## Two builders
+
+While blaze cannot build itself (its item layer is being rebuilt: [bottom](bottom.md)), cargo
+with the pinned nightly builds bstd, and blaze must still read the same source. So bstd is plain
+Rust that both compile, plus what needs blaze's extensions under `cfg(blaze)`, the cfg blaze sets
+for every crate it compiles (Andrew, 2026-11-15: a simplified bstd rustc can use, and blaze's
+bstd that plus the custom parts). Each use of an extension takes the first of:
+
+1. **A form both read**, kept in place: a tool attribute (`#[blaze::pure]`, `#[blaze::linear]`,
+   ...), an attribute under `cfg_attr(blaze, ..)`, or nightly's own spelling where blaze lowers
+   it as nightly does (`#[core::contracts::ensures]`, `core::mem::type_info`, `#[rustc_comptime]`).
+2. **Syntax or an API rustc lacks**: the item goes under `#[cfg(blaze)]` (an out-of-line module
+   when rustc cannot parse it, since rustc never opens a cfg'd-out module's file), with a plain
+   item of the same name beside it under `#[cfg(not(blaze))]` whose doc says what blaze's adds.
+3. **Never weaker in silence**: a property blaze proves at compile time keeps a check in the plain
+   form (a `const` assertion of the instance, a runtime check), and the doc says who enforces what.
+
+Until blaze sets `cfg(blaze)` it compiles the plain forms, which it accepts as any Rust.
+
+| part | base (rustc and blaze) | blaze only, and its plain form |
+|---|---|---|
+| tool attributes (`pure`, `noalloc`, `linear`, `consumes`, `memo`, `policy`, `sans_io`, ...) | read by blaze, ignored by rustc | — |
+| contracts (`budget`, `clock`, `kv`, `fs`) | `#[core::contracts::ensures]`, run under `contract_checks` | native `requires`/`ensures`: after the switch |
+| `own`'s walk (`reach`, `raw`) | nightly's `type_info` and `#[rustc_comptime]` | `raw::name` (`core::reflect::name_of`); plain: a fixed word, so a refusal names fields, not types |
+| `Acyclic`, `NoCapability` | the traits, the questions, `none` | the `where const` impls (`own/extended.rs`); plain: a blanket impl, with the walk asserted in a `const` where `Shared::holding` and `Shares::new` make a handle |
+| `Shares` | the type, `Deref`, `Send`/`Sync`, `Owns` | `where const` and `{ N + M }` (`own/shares/extended.rs`); plain (`plain.rs`): the same conditions as `const` assertions, `join` with the sum as a parameter `S` |
+| `eval` | `Eval`, `Point`, keys, providers | `MemoPoint` and `code_id_of` (`core::reflect`); plain: every type is a point, and its identity is its `TypeId`'s, for one process |
+| linear types (`Scope`, `Pending`, `File`, `Conn`, ...) | the types and their abandonment path in `Drop`, `#[must_use]` | leaving one unfinished is a compile error under blaze only |
+| features `blaze_comptime`, `blaze_const_exprs`, `blaze_verify` | — | `cfg_attr(blaze, feature(..))` |
+
+**What a new crate may depend on today**: bstd by its plain form, `core`, `alloc` (until bstd's own
+collections replace it), and blaze's piece crates bstd re-exports. Not Rust's `std` (only
+`bstd::rt` names it, the driver boundary), and no extension outside a form both builders read.
+
 ## What is in it
 
 bstd is batteries included, and most of the batteries exist. It is a **facade**: the pieces stay
@@ -993,7 +1027,7 @@ Zig's rule, and it buys what the plan needs: every byte belongs to a task or a n
 | `Cache` | `mem.cache("name", limit)` | until evicted; the one evictor may take entries back |
 
 `Mem` is a capability from `io.mem()`: it hands out named arenas and caches against the process's
-one memory budget ([memory](memory.md), [memory-budget](../../../memory-budget.md)). Every arena has
+one memory budget ([memory](memory.md)). Every arena has
 a name and a limit, so "what holds the memory" always has an answer.
 
 **Running out is an outcome, not a crash.** An allocation over its limit or the budget fails the
@@ -1082,8 +1116,12 @@ what holds it: `blaze-hash` builds under cargo.
 
 ### Contracts
 
-bstd's public functions carry `requires` and `ensures` (ledger V3), in the native clause syntax
-([contracts](contracts.md); `#![feature(blaze_verify)]`), checked in the dev and test profiles.
+bstd's public functions carry `requires` and `ensures` (ledger V3). While rustc also builds bstd
+("Two builders") they are nightly's `#[core::contracts::ensures(..)]`, which both builders read
+and run under `cfg(contract_checks)`; the native clause syntax ([contracts](contracts.md);
+`#![feature(blaze_verify)]`), checked by default in the dev and test profiles and the form the
+generator and the proofs read, comes back through `blaze::native_contracts` when blaze is the
+only builder.
 
 | function | contract | generated test |
 |---|---|---|

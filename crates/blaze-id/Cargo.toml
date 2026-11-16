@@ -13,12 +13,21 @@ repository.workspace = true
 # Doc tests run here, unlike most of the workspace's crates: `Portable`'s refusal of an
 # interned id is a `compile_fail` doc test, and its control a doc test that compiles.
 
+[features]
+# serde's forms of the keys, for the crates above that persist them with serde (the root
+# manifest's entry turns it on): with it off, this crate depends only on workspace crates that
+# depend on no crate from outside it (docs/v2/plan/design/bottom.md, "Also decided on
+# 2026-11-15").
+serde = ["dep:serde", "blaze-ids/serde"]
+
 [dependencies]
+# By path, not `.workspace`: the workspace entries turn on the adapter features the crates above
+# need, which a member's entry cannot turn off, so this crate's own graph would hold them.
 # `ContentId` and `Fingerprint`: the hashes a key is made of.
-blaze-ids.workspace = true
+blaze-ids = { path = "../blaze-ids" }
 # `HashMap`: what a carried table is.
-blaze-hash.workspace = true
-serde = { workspace = true, features = ["derive"] }
+blaze-hash = { path = "../blaze-hash" }
+serde = { workspace = true, features = ["derive"], optional = true }
 
 [dev-dependencies]
 blaze-sim.workspace = true

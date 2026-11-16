@@ -380,17 +380,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "blake3-servil"
-version = "0.8.0+b3c5efc7c975d903762dea809066f7c0a0603861"
-dependencies = [
- "arrayvec",
- "cc",
- "cfg-if",
- "constant_time_eq",
- "libc",
-]
-
-[[package]]
 name = "blaze-alloc-count"
 version = "0.0.0"
 
@@ -419,6 +408,14 @@ dependencies = [
  "blaze-profile",
  "blaze-rng",
  "tracing",
+]
+
+[[package]]
+name = "blaze-blake3"
+version = "0.0.0"
+dependencies = [
+ "blake3",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -533,6 +530,21 @@ dependencies = [
  "blaze-ids",
  "blaze-sim",
  "smallvec",
+]
+
+[[package]]
+name = "blaze-expand"
+version = "0.0.0"
+dependencies = [
+ "blaze-id",
+ "blaze-ids",
+ "blaze-mem",
+ "blaze-sim",
+ "intern",
+ "mbe",
+ "span",
+ "syntax-bridge",
+ "tt",
 ]
 
 [[package]]
@@ -660,7 +672,6 @@ dependencies = [
  "blaze-core",
  "blaze-hash",
  "blaze-ids",
- "blaze-image",
  "blaze-mem",
  "blaze-protocol",
  "blaze-radix",
@@ -757,16 +768,15 @@ name = "blaze-ids"
 version = "0.0.0"
 dependencies = [
  "blake3",
- "blake3-servil",
  "blaze-alloc-count",
+ "blaze-blake3",
  "blaze-check",
- "blaze-core",
  "blaze-hash",
  "blaze-mem",
  "blaze-radix",
  "blaze-rng",
- "blaze-serde",
  "blaze-sim",
+ "blaze-swiss",
  "postcard",
  "serde",
  "serde_json",
@@ -783,6 +793,15 @@ dependencies = [
  "blaze-core",
  "blaze-format",
  "blaze-ids",
+ "blaze-sim",
+]
+
+[[package]]
+name = "blaze-impls"
+version = "0.0.0"
+dependencies = [
+ "blaze-format",
+ "blaze-id",
  "blaze-sim",
 ]
 
@@ -856,6 +875,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-launcher"
+version = "0.0.0"
+dependencies = [
+ "blaze-launch",
+ "blaze-launch-rt",
+ "crossbeam-channel",
+ "libc",
+]
+
+[[package]]
 name = "blaze-lint-defs"
 version = "0.0.0"
 dependencies = [
@@ -915,6 +944,7 @@ dependencies = [
  "blaze-reclaim",
  "blaze-rng",
  "blaze-sim",
+ "blaze-swiss",
  "crossbeam-channel",
  "libc",
  "parking_lot",
@@ -960,6 +990,13 @@ dependencies = [
  "glob",
  "pathdiff",
  "toml_edit",
+]
+
+[[package]]
+name = "blaze-own"
+version = "0.0.0"
+dependencies = [
+ "blaze-sim",
 ]
 
 [[package]]
@@ -1132,6 +1169,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-run"
+version = "0.0.0"
+dependencies = [
+ "blaze-sim",
+]
+
+[[package]]
+name = "blaze-scope"
+version = "0.0.0"
+dependencies = [
+ "blaze-hash",
+ "blaze-id",
+ "blaze-sim",
+]
+
+[[package]]
 name = "blaze-screen"
 version = "0.0.0"
 dependencies = [
@@ -1300,6 +1353,16 @@ dependencies = [
  "blaze-format",
  "blaze-hash",
  "blaze-id",
+ "blaze-sim",
+]
+
+[[package]]
+name = "blaze-swiss"
+version = "0.0.0"
+dependencies = [
+ "blaze-alloc-count",
+ "blaze-check",
+ "blaze-rng",
  "blaze-sim",
 ]
 
@@ -1645,6 +1708,12 @@ dependencies = [
  "scopeguard",
  "windows-sys 0.59.0",
 ]
+
+[[package]]
+name = "cov-mark"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "90863d8442510cddf7f46618c4f92413774635771a3e80830c8b30d183420b14"
 
 [[package]]
 name = "cpp_demangle"
@@ -2797,6 +2866,30 @@ dependencies = [
  "quote",
  "syn 2.0.117",
  "synstructure",
+]
+
+[[package]]
+name = "mbe"
+version = "0.0.0"
+dependencies = [
+ "arrayvec",
+ "bitflags 2.13.2",
+ "blaze-alloc-count",
+ "blaze-hash",
+ "blaze-ids",
+ "blaze-mem",
+ "cov-mark",
+ "expect-test",
+ "intern",
+ "parser",
+ "rustc_lexer",
+ "smallvec",
+ "span",
+ "stdx",
+ "syntax",
+ "syntax-bridge",
+ "test-utils",
+ "tt",
 ]
 
 [[package]]

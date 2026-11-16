@@ -1,4 +1,4 @@
-//! The walk over kept describes ([`Build::keeping`], docs/v2/plan/design/incremental-walk.md)
+//! The walk over kept describes ([`Build::keeping`])
 //! against the walk that keeps none: after any edit the two build the same program, and an
 //! unchanged function costs the front end's answer, never a describe.
 //!

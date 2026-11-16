@@ -443,7 +443,7 @@ fn selftest() {
     // (`hash`, which `ids` needs, depends on a changed package only to test itself, and goes first).
     let found = affected_or_fail(
         &packages,
-        &["crates/ids/src/keyed.rs", "crates/link/src/lib.rs", "crates/codegen/src/delta.rs", "docs/lints.md"],
+        &["crates/ids/src/keyed.rs", "crates/link/src/lib.rs", "crates/codegen/src/delta.rs", "docs/cargo.md"],
         true,
     );
     expect(

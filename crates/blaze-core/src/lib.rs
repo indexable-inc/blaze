@@ -674,8 +674,8 @@ pub enum Effect {
         dir: FileName,
         tag: Tag,
     },
-    /// A watch of `dir` that starts where `since` left the system's journal of changes
-    /// (docs/v2/plan/design/restore.md): it completes with [`Done::Journaled`] for the changes
+    /// A watch of `dir` that starts where `since` left the system's journal of changes:
+    /// it completes with [`Done::Journaled`] for the changes
     /// made since then, one with `caught_up` once they are all told, then for each change
     /// made after, until an [`Effect::Unwatch`] of the same tag ends it with
     /// [`Done::Unwatched`] or a [`Done::Failed`] does. [`Cursor::None`] starts now, its first
@@ -792,7 +792,7 @@ pub enum Effect {
         tag: Tag,
     },
     /// The system's memory pressure, watched: completes with [`Done::Pressed`] each time the
-    /// system says memory is short (docs/memory-budget.md section 7, "Pressure"), until an
+    /// system says memory is short, until an
     /// [`Effect::Unwatch`] of the same tag ends it with [`Done::Unwatched`]. In flight until it
     /// ends, as a watch is. Where the system has no such source (Linux without PSI, or one
     /// this process may not arm; Windows and the other targets, not yet), it ends at once with

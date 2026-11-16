@@ -1,5 +1,4 @@
-//! The early identity (docs/v2/plan/design/restore.md, "The entry's key, made before
-//! lowering"): it changes with the item's own text, its owner and the macros that wrote it,
+//! The early identity (the entry's key, made before lowering): it changes with the item's own text, its owner and the macros that wrote it,
 //! and with nothing else of its crate.
 //!
 //! Each test builds two databases from two fixtures and compares the body of the one function

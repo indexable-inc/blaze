@@ -11,7 +11,7 @@
 #![blaze::sans_io]
 
 use alloc::vec::Vec;
-use core::alloc::Allocator;
+use core::alloc::AllocatorClone;
 
 use crate::{Nanos, Plant, SlotId};
 
@@ -51,7 +51,7 @@ impl core::fmt::Display for Error {
 impl core::error::Error for Error {}
 
 /// The counts of one program's slots. See the module's documentation.
-pub struct Heat<A: Allocator + Clone> {
+pub struct Heat<A: AllocatorClone> {
     config: Config,
     counts: Vec<u32, A>,
     /// Whether a slot was given to the tier: once, for the run.
@@ -61,7 +61,7 @@ pub struct Heat<A: Allocator + Clone> {
     pub(crate) plant: Plant,
 }
 
-impl<A: Allocator + Clone> Heat<A> {
+impl<A: AllocatorClone> Heat<A> {
     pub fn new(slots: u32, config: Config, start: Nanos, alloc: A) -> Result<Heat<A>, Error> {
         if config.bound == 0 {
             return Err(Error::Config { what: "a bound of 0 makes every function hot", value: 0 });

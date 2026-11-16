@@ -1,7 +1,6 @@
 //! The expansion key: what a macro call's expansion is a function of, by content, so the items
 //! a macro wrote are keyed by their expansion's inputs and never by the expansion
-//! (docs/v2/plan/design/restore.md, "Items read in place", row D; the form agreed in "Agreed
-//! with the lanes beside this one"): the outermost call's tokens, each definition's content
+//! (the form agreed with the lanes beside this one): the outermost call's tokens, each definition's content
 //! hash, hygiene, cfg and edition. Written by claude-opus-5-5.
 //!
 //! The key of a call is made from:

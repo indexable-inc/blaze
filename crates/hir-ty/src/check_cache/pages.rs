@@ -1,5 +1,5 @@
-//! A crate's bodies as one store value read an entry at a time (docs/v2/plan/design/restore.md,
-//! "Bodies, inference and MIR as records"): the container. What an entry holds is its writer's
+//! A crate's bodies as one store value read an entry at a time:
+//! the container. What an entry holds is its writer's
 //! ([`super::runtime`]: a MIR owner's runtime body); here is only how one is found.
 //!
 //! | Segment | Holds | Read when |

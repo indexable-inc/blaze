@@ -150,17 +150,17 @@ Coroutine bodies are never optimized.
 
 A program that takes edits with `blaze-live` has its hot functions compiled again while it
 runs, at LLVM `-O3` with what they call built in and then with a profile, and patched in
-([tiers.md](tiers.md)). macOS arm64 with `--features llvm` only, like live edits; on by
+(tiers.md, deleted). macOS arm64 with `--features llvm` only, like live edits; on by
 default there, off with `BLAZE_TIER=off`.
 
 | | macOS arm64 | elsewhere |
 |---|---|---|
-| Sampling, under 1% of a core at 500 Hz | yes (local, 2026-10-20) | no: live edits are macOS only (Linux would sample with `perf_event_open`, [tiers.md](tiers.md#linux)) |
+| Sampling, under 1% of a core at 500 Hz | yes (local, 2026-10-20) | no: live edits are macOS only (Linux would sample with `perf_event_open`) |
 | The sampler stops once the worker reading it is gone | yes (local, by killing the worker) | no |
 | Levels 2 and 3, output identical to cargo's | yes, `harness/tiers.py` (local) | no |
 | An edit demotes a tiered function in the same build | yes, `harness/tiers.py` (local) | no |
 | An edit does not wait for a compile at a higher level | yes (local, with LLVM's part stretched to a second) | no |
-| Code no patch can hold stays out, the program is not started over | yes (local, 12 runs of the Life benchmark under one daemon, [tiers.md](tiers.md#code-no-patch-can-hold)) | no |
+| Code no patch can hold stays out, the program is not started over | yes (local, 12 runs of the Life benchmark under one daemon) | no |
 | `BLAZE_TIER=off` changes nothing | yes, `harness/tiers.py` (local) | does not apply |
 | Within 10% of a release build | within 6% of a release build that checks overflow as the dev profile does, which is as far as the tiered code may go, and 88% of release, on the Life benchmark under load | no |
 

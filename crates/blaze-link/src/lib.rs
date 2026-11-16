@@ -27,20 +27,15 @@ mod beside;
 mod commit;
 mod counter;
 mod cow;
-pub mod digest;
 mod dwarf;
 mod elf;
 mod file;
 mod intern;
-mod keep;
 mod layout;
-mod lazy;
-mod live;
 mod macho;
 mod model;
 mod native;
 mod output;
-mod patch;
 mod pe;
 mod place;
 mod position;
@@ -51,7 +46,6 @@ mod sanitize;
 mod shape;
 mod stage;
 mod state;
-mod step;
 mod symbols;
 mod table;
 pub mod target;
@@ -79,11 +73,7 @@ use blaze_items::ItemKey;
 use blaze_mem::Frame;
 use std::alloc::Global;
 
-pub use keep::{KeepError, KeepRefusal, LAYOUT, Unkept, Verified, verify};
 pub use layout::Heat;
-pub use live::descriptor_of;
-pub use lazy::{LazyPlacer, Slots};
-pub use patch::{FileEdit, Patch, PatchBase};
 pub use beside::{DebugWrite, crc32 as debuglink_crc32, id_of as debug_file_id};
 pub use output::{
     Debug, DevRun, Format, LinkArgs, Live, Native, NativeKind, Output, OutputKind, Platform,
@@ -95,7 +85,7 @@ pub use position::{
 };
 pub use premap::{NoOutside, Outside};
 pub use shape::RegionShape;
-pub use step::{StepError, Stepped, step};
+
 
 use commit::{Pending, Undo, Writes};
 use model::{Formats, NativeFile, Plan, Writer};
@@ -233,11 +223,6 @@ pub enum Refusal {
     /// islands through the code and takes the change. `branch` is the branch, its code, its
     /// target and how far that is, as the build says them.
     NoThunk { branch: String },
-    /// A file is not the one the image's last link left ([`Image::verify`]): `len` bytes where
-    /// the link state has `kept`, first differing in `block` (of [`digest::BLOCK`] bytes). A
-    /// write cut short by a crash, or a file changed by another hand. The kept image patches
-    /// only the file its digest names, so it is let go and linked from scratch.
-    Torn { block: u64, len: u64, kept: u64 },
 }
 
 /// What a laid-out image is past ([`Refusal::OutOfReach`]).
@@ -294,14 +279,10 @@ impl LinkError {
     /// The refusal, when the image refused the stage for want of room: [`Refusal::NoRoom`],
     /// `NoRegion`, `TableFull`, `TlsMoved`, or an incremental stage's `OutOfReach`, which a
     /// link from scratch takes. Never `NotFound` or `FieldRange`, which one does not, nor
-    /// `NoThunk`, which is no want of room ([`LinkError::no_thunk`]), nor `Torn`, which is of
-    /// a file and not of the image ([`LinkError::torn`]).
+    /// `NoThunk`, which is no want of room ([`LinkError::no_thunk`]).
     pub fn no_room(&self) -> Option<&Refusal> {
         self.refusal.as_ref().filter(|it| match it {
-            Refusal::NotFound(_)
-            | Refusal::FieldRange
-            | Refusal::NoThunk { .. }
-            | Refusal::Torn { .. } => false,
+            Refusal::NotFound(_) | Refusal::FieldRange | Refusal::NoThunk { .. } => false,
             Refusal::OutOfReach(reach) => reach.scratch,
             _ => true,
         })
@@ -314,12 +295,6 @@ impl LinkError {
             Some(Refusal::NoThunk { branch }) => Some(branch),
             _ => None,
         }
-    }
-
-    /// Whether a file was refused as not the one the image's last link left
-    /// ([`Refusal::Torn`]): the kept image is let go and linked from scratch.
-    pub fn torn(&self) -> bool {
-        matches!(self.refusal, Some(Refusal::Torn { .. }))
     }
 
     /// The limit the laid-out image is past, when that refused it.
@@ -378,20 +353,9 @@ pub struct Image {
     /// The offset of the cells part of the code memory the image was last committed into
     /// ([`Image::commit_into`]), which [`Image::counter`] counts from.
     cells: Option<u64>,
-    /// A lazy image's session ([`Image::stage_lazy`]); `None` for every other image.
-    lazy: Option<lazy::Lazy>,
-    /// The counter pairs [`LazyPlacer`] gave since the last commit, which a commit of a stage
-    /// made before them carries over ([`Image::carry_placed_pairs`]).
-    placed_pairs: Vec<(symbols::IdNo, u32)>,
-    /// The file's identity, kept as commits change it ([`Image::digest`]).
-    filed: patch::Filed,
     /// The debug side file as last given ([`Image::debug_file`]), of an image whose debug
     /// info is beside it ([`Debug::Beside`]); empty for every other.
     beside: beside::Kept,
-    /// The planted bug of `a_column_left_out_of_keep_is_named`: [`Image::keep`] writes this
-    /// section of the state as an empty state's.
-    #[cfg(test)]
-    plant_keep_empty: Option<&'static str>,
 }
 
 impl Image {
@@ -504,13 +468,7 @@ impl Image {
             scratch: Vec::with_capacity(64),
             place,
             cells: None,
-            lazy: None,
-            // alloc: none until the lazy placer gives a pair
-            placed_pairs: Vec::new(),
-            filed: patch::Filed::new(),
             beside: beside::Kept::new(),
-            #[cfg(test)]
-            plant_keep_empty: None,
         })
     }
 
@@ -526,52 +484,6 @@ impl Image {
             });
         }
         self.stage_with(change, &NoOutside)
-    }
-
-    /// [`Image::stage`] of a lazy image ([`lazy`]): the dev run whose lazy functions `session`
-    /// lists and whose stub region is `stubs` (both from [`blaze_lazy::Session::new`], for the
-    /// image's architecture). Its first link places the region and starts each lazy function's
-    /// slot at its entry; every reference to a lazy function, [`Target::Direct`] too, reaches
-    /// its slot stub, and [`LazyPlacer`] places its code. Later links are [`Image::stage`]'s
-    /// or this with the same session. An image that is not a dev run with a jump table, or a
-    /// different session than the first link's, is an error.
-    pub fn stage_lazy(
-        &mut self,
-        change: Change<'_>,
-        session: &blaze_lazy::Session,
-        stubs: &blaze_lazy::stub::Stubs,
-    ) -> Result<Staged, LinkError> {
-        if self.state.laid_out {
-            if !self.lazy.as_ref().is_some_and(|it| it.is(session, stubs)) {
-                return Err(LinkError {
-                    function: None,
-                    refusal: None,
-                    // alloc: error path
-                    what: format!(
-                        "{}: staged lazy with another session than its first link's: an image is made lazy, for one \
-                         session, at its first link",
-                        self.to
-                    ),
-                });
-            }
-            return self.stage(change);
-        }
-        let table = has_table(&self.output, self.plan.indexed_code);
-        let was = self.lazy.replace(lazy::Lazy::new(&self.output, table, session, stubs)?);
-        let staged = self.stage(change);
-        if staged.is_err() {
-            self.lazy = was;
-        }
-        staged
-    }
-
-    /// The linked address of a lazy image's stub region: the `base` its session's
-    /// [`blaze_lazy::Session::slots`] and [`blaze_lazy::Session::entry`] take, as the code
-    /// memory has it at [`blaze_inproc::CodeMemory::offset_of`]. `None` before the first link
-    /// and for an image that is not lazy.
-    pub fn lazy_stubs(&self) -> Option<u64> {
-        self.lazy.as_ref()?;
-        self.state.addr_of(self.symbols.find(SymKey::LazyStubs)?)
     }
 
     /// [`Image::stage`] of an image made by [`Image::beside`]: names, functions and statics
@@ -679,7 +591,6 @@ impl Image {
             spans_changed: false,
             sancov: [None; 4],
             frames_end: None,
-            lazy: self.lazy.as_ref(),
             layout: layout::Pass::new(change.heat, &change.cold),
             thunked: false,
             island: None,
@@ -696,7 +607,6 @@ impl Image {
         stage.start_hook()?;
         stage.counter_cells();
         stage.resolve(outside)?;
-        stage.lazy_hook()?;
         stage.referrers();
         stage.needs()?;
         stage.sweep()?;
@@ -791,35 +701,14 @@ impl Image {
     /// changes: its patches reach them only through the code memory ([`Image::commit_into`]).
     pub fn commit(
         &mut self,
-        mut staged: Staged,
+        staged: Staged,
         effects: &mut Vec<Effect>,
     ) -> Result<(), LinkError> {
         self.can_commit(&staged)?;
-        self.carry_placed_pairs(&mut staged.state)?;
         let full = staged.writes.full;
         let steps = self.steps(staged.writes)?;
         let revert = self.take(staged.state, full, staged.undo);
-        self.placed_pairs.clear();
         self.begin(steps, revert, effects);
-        Ok(())
-    }
-
-    /// Carries the counter pairs [`LazyPlacer`] gave while `state` was staged into it: they are
-    /// its keys' for as long as the image lives. A stage that gave one of those keys another
-    /// pair, or gave pairs into the ones the placer took, is refused: stage it again.
-    fn carry_placed_pairs(&self, state: &mut State) -> Result<(), LinkError> {
-        let capacity = counter::capacity(&self.output);
-        for (id, pair) in &self.placed_pairs {
-            if !state.pairs.carry(*id, *pair, &self.state.pairs, capacity) {
-                return Err(LinkError {
-                    function: Some(self.symbols.instance(*id)),
-                    refusal: None,
-                    what: "given a tier-up counter pair by the lazy placer while this was staged, which gave counter \
-                           pairs that clash with it: stage it again"
-                        .into(),
-                });
-            }
-        }
         Ok(())
     }
 
@@ -834,16 +723,14 @@ impl Image {
     /// image's first commit, which no program runs yet, and without [`Output::live`]).
     pub fn commit_into(
         &mut self,
-        mut staged: Staged,
+        staged: Staged,
         memory: &mut blaze_inproc::CodeMemory,
     ) -> Result<Option<Vec<u8>>, LinkError> {
         self.can_commit(&staged)?;
-        self.carry_placed_pairs(&mut staged.state)?;
         let cells = self.cells_in(memory)?;
         self.write_into(&staged.writes, memory)?;
         let message = staged.writes.message;
         self.take(staged.state, staged.writes.full, staged.undo);
-        self.placed_pairs.clear();
         self.cells = Some(cells);
         Ok(message)
     }
@@ -927,9 +814,8 @@ impl Image {
     /// of writing it: for a caller that puts the file in its store. A commit that would tell
     /// running programs (a later link of a [`Output::live`] image) is refused, since its
     /// patches reach them only through the code memory ([`Image::commit_into`]).
-    pub fn bytes(&mut self, mut staged: Staged) -> Result<Vec<u8>, LinkError> {
+    pub fn bytes(&mut self, staged: Staged) -> Result<Vec<u8>, LinkError> {
         self.can_commit(&staged)?;
-        self.carry_placed_pairs(&mut staged.state)?;
         if staged.writes.message.is_some() {
             return Err(LinkError {
                 function: None,
@@ -951,7 +837,6 @@ impl Image {
             out[at..at + bytes.len()].copy_from_slice(bytes);
         }
         self.take(staged.state, staged.writes.full, staged.undo);
-        self.placed_pairs.clear();
         Ok(out)
     }
 

@@ -158,7 +158,7 @@ The commands that run SQL (`blaze slow`, the problems `blaze why` adds, `blaze e
    (relative, empty, missing), it is that command's error, naming the variable, the path and
    `unset BLAZE_DUCKDB`; nothing else is tried.
 2. Unset: the DuckDB blaze pins (1.5.5, by SHA-256 per host in `DUCKDB_PINS`,
-   `crates/blaze-cargo/src/serve/observe.rs`), fetched once through the daemon's store with a
+   blaze-cargo's `serve/observe.rs`, deleted with the daemon), fetched once through the store with a
    line saying so and laid out at `<state>/duckdb/1.5.5-<sha16>/duckdb`
    (`crates/blaze-cargo/src/cli/duckdb.rs`). A failed fetch names the URL and the file.
 

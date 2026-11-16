@@ -1,6 +1,5 @@
 //! The slot: the one file a request the daemon writes for its client
-//! (docs/v2/plan/design/end-state/daemon.md 4.2, "Slot" and "Leaf table" as one file a
-//! request; /tmp/plan/10-no-daemon-run.md, section 1).
+//! ("Slot" and "Leaf table" as one file a request; /tmp/plan/10-no-daemon-run.md, section 1).
 //!
 //! `<state>/slots/<key hex>`, written by the daemon alone, replaced by rename, never read by
 //! the daemon for an answer of its own. It is everything a check needs but the disk: the

@@ -1,4 +1,4 @@
-//! A body's key, made before lowering (docs/v2/plan/design/end-state/engine.md 4.2 and 4.5):
+//! A body's key, made before lowering:
 //! it changes with each input of it alone (its crate's settings, the front end's build, its
 //! own text, its owner, its module) and with nothing else. What a body resolves (a path's
 //! target, a glob shadowed, a trait in scope, a named item's signature) is not in the key: it

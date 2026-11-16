@@ -67,7 +67,6 @@ is; "measure" rows name the measurement that decides them, below the tables.
 | The daemon's ceiling is `memorystatus_control(SET_MEMLIMIT_PROPERTIES)` (`crates/blaze-cargo/src/raw/memory.rs`) | `task_set_phys_footprint_limit` | The same limit by another door, and kernel-private | Root or an entitlement either way | In use |
 | A child's limit is a thread reading its footprint every 2 ms (`crates/blaze-core/src/footprint.rs`) | `posix_spawnattr_setjetsam_ext` (private, `spawn_private.h`) with a fatal memory limit at spawn | The kernel enforces it at the page fault: no polling thread, no overshoot | Private; may need an entitlement on macOS | Measure (M7) |
 | The pressure signal is `EVFILT_MEMORYSTATUS` (above) | the same | | | In use |
-| Copy-on-write views: the live patch remaps a written copy over read-only pages with `mach_vm_remap` (`crates/blaze-live/src/slots/macos.rs`) | the same | One atomic swap of pages other threads read | Mach call, stable | In use; its symbols have no resolve test yet |
 | Caches are evicted by the pool on the pressure signal | `mach_vm_purgable_control` | The kernel drops volatile memory itself | Purgeable memory still counts in footprint while non-volatile, and a dropped range must be detected at every read: the pool's evictor already decides by footprint | Not used |
 
 ## Processes
@@ -102,7 +101,6 @@ is; "measure" rows name the measurement that decides them, below the tables.
 | Today | Better call | Buys | Risk | Decision |
 |---|---|---|---|---|
 | The dev run's code memory is `MAP_JIT` with `pthread_jit_write_protect_np` per thread and `sys_icache_invalidate` after a write (`crates/blaze-inproc/src/exec.rs`) | the same | The only way to write and run pages on Apple silicon without a signature | Hardened runtime needs the JIT entitlement | In use: right |
-| The image's read-only pages are never made writable: a copy is remapped over them (`crates/blaze-live/src/slots/macos.rs`) | `mach_vm_protect` in place | A window where another thread faults | | In use: right |
 
 ## To measure
 

@@ -1,5 +1,5 @@
 //! A crate's impl tables as pages: one record a lookup reads a bounded part of
-//! (docs/v2/plan/design/restore.md, "Impl tables read in place"), with the discipline of
+//! with the discipline of
 //! `hir_def::nameres::frozen::pages`.
 //!
 //! The record is segments (`hir_def::nameres::frozen::segments`), each found through an

@@ -1,6 +1,5 @@
 //! The impls of a crate kept as a record and read back instead of found (frozen dependency
-//! artifacts, blaze's `docs/v2/plan.md`, item 1; docs/v2/plan/design/restore.md, "Impl tables
-//! read in place"), with `hir_def`'s frozen encoding.
+//! artifacts, blaze's `docs/v2/plan.md`, item 1), with `hir_def`'s frozen encoding.
 //!
 //! The record is [`pages`]: a crate's trait impls, inherent impls and its traits' value items
 //! as tables a lookup reads one entry of. This file is what has a crate read from one: the

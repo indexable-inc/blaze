@@ -22,7 +22,6 @@ use super::{
     VERNEED, VERSYM, error,
 };
 use crate::cow::CowBytes;
-use crate::keep::{Bad, In, Kept, Out};
 use crate::model::{Class, Counts, Delta, Holds, Placed, Region, SymbolKind, Tls, View};
 use crate::unwind::Frame;
 use crate::{LinkError, Output, OutputKind};
@@ -708,51 +707,11 @@ impl KeptRela {
     /// empty slot where an address went and a new address in the first empty one, which a table
     /// made whole in address order does not, so an opened image that made it whole would write
     /// another file than the image that kept it. The table's bytes are not here: they are the
-    /// state's `.rela.dyn` region, kept with the state and opened in place ([`KeptRela::open`]).
-    pub(crate) fn keep<A: std::alloc::Allocator>(&self, of: u64, out: &mut Out<A>) {
-        let held = self.synthesis != 0 && self.synthesis == of;
-        out.bool(held);
-        if held {
-            out.len(self.slots);
-            self.slot_of.put(out);
-        }
-    }
-
+    /// state's `.rela.dyn` region. (Its keeping between processes, `keep` and `open`, was
+    /// deleted with the daemon on 2026-11-15.)
     /// Whether it holds no table.
     pub(crate) fn is_empty(&self) -> bool {
         self.synthesis == 0
-    }
-
-    /// The table [`KeptRela::keep`] wrote, as of the opened state's synthesis `synthesis` (a
-    /// number of this process's), over `region`: the opened state's `.rela.dyn` bytes (`None`:
-    /// the state has no such region), shared with it page by page until a patch writes one.
-    /// Every slot held is below the run's end and held once, the region holds the run, and each
-    /// empty slot is zeros in it: else the state is refused.
-    pub(crate) fn open(input: &mut In<'_>, synthesis: u64, region: Option<&CowBytes>) -> Result<KeptRela, Bad> {
-        if !input.bool()? {
-            return Ok(KeptRela::default());
-        }
-        let slots = input.len()?;
-        let slot_of = Vec::<u32>::take(input)?;
-        let Some(region) = region else {
-            return Err(Bad::What("`.rela.dyn` slots kept for a state with no `.rela.dyn` region"));
-        };
-        if slot_of.len() > slots || region.len() < RELA as usize * slots {
-            return Err(Bad::What("a `.rela.dyn` run longer than its region or with more addresses than slots"));
-        }
-        let mut free = std::collections::BTreeSet::new_in(std::alloc::Global);
-        free.extend(0..slots as u32);
-        for slot in &slot_of {
-            if !free.remove(slot) {
-                return Err(Bad::What("a `.rela.dyn` slot past the run's end, or held twice"));
-            }
-        }
-        let empty = |slot: &u32| region.read(RELA as usize * *slot as usize, RELA as usize).iter().all(|it| *it == 0);
-        if !free.iter().all(empty) {
-            return Err(Bad::What("an empty `.rela.dyn` slot that is not zeros in the region"));
-        }
-        // clone: two reference counts, the table shared with the opened state's region
-        Ok(KeptRela { synthesis, bytes: region.clone(), slot_of, free, slots, ..KeptRela::default() })
     }
 
     /// The table made whole holds `relative` slid addresses, each in the slot of its index.

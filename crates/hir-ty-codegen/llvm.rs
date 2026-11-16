@@ -1188,8 +1188,7 @@ pub(super) fn assemble(target: &'static super::Target, text: &str) -> Result<Vec
 /// values in registers across an unwind edge, a landing pad then reads the selector where it
 /// wants a drop flag (`breakers/cases/src/unwind_many_flags.rs`).
 /// LLVM's inliner threshold: 500, over the level's own (225 at -O2, 250 at -O3). Measured on
-/// LLVM 23 against 225 and 1000, and against leaving every call to LLVM's inliner (docs/tiers.md,
-/// "LLVM's inliner"): 500 takes the runtime set's geomean from 1.091 to 1.080 of rustc's for
+/// LLVM 23 against 225 and 1000, and against leaving every call to LLVM's inliner: 500 takes the runtime set's geomean from 1.091 to 1.080 of rustc's for
 /// 2 to 5% more code and no more compile time; 1000 is no faster (1.079) for twice the code.
 const INLINE_THRESHOLD: u32 = 500;
 

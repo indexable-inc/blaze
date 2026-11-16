@@ -15,7 +15,7 @@
 //!   when the static is placed, before the program starts.
 //! - **TLS destructors** (`thread_local!` with drop, `__cxa_thread_atexit_impl`) and `atexit`
 //!   handlers: registered as stub addresses; a first call during thread or process exit
-//!   resolves like any other, since the run process's hook ([`crate::hook`]) uses no
+//!   resolves like any other, since the run process's hook (`hook`, deleted with the daemon) uses no
 //!   thread-local of its own. A first call from a signal handler resolves the same way only
 //!   while the hook's ask is async-signal-safe, which waits on blaze-inproc's channel
 //!   taking requests with no lock and no allocation (fed1eb428d:docs/v2/requests/fastcompile.md,

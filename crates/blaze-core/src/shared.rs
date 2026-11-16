@@ -1,7 +1,6 @@
 //! A small file of `u64` words mapped shared by every process that opens it, with waits and
 //! wakes on its words across processes: the driver of a ledger every blaze process of one user
-//! counts in (`blaze_graph::shared_ledger`, docs/v2/plan/design/end-state/memory.md section
-//! 4.5), with no daemon to own it.
+//! counts in (`blaze_graph::shared_ledger`), with no daemon to own it.
 //!
 //! [`Shared::open_or_create`] opens the file, or makes it: the first process writes the whole
 //! file (its header, then zeros) under a name of its own and links it into place, so every

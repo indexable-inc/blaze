@@ -1,28 +1,27 @@
-//! Root goals answered before the solver canonicalizes them
-//! (docs/v2/plan/design/frontend.md).
+//! The goal store's gate (docs/v2/plan/design/typeck-store.md): which root goals the store
+//! is asked about and offered, before the solver canonicalizes them.
 //!
 //! A root goal whose predicate and param env, resolved through the unification table, hold no
 //! inference variable, placeholder, local region, error or escaping bound variable, asked in a
 //! typing mode that defines no opaque type, with no opaque type in the inference context, has
-//! one answer per (crate, regions flag, revision): the solver reads nothing else of the
-//! inference context for it. Such a goal is named by a [`GoalKey`], one `u64` packed from the hash-consed rows of its predicate and
-//! param env and its typing mode, and its answer is kept in a lock-free [`Goals`] table that
-//! lives in the shared solver cache's generation for that (crate, regions flag, revision).
+//! one answer per crate and regions flag: the solver reads nothing else of the inference
+//! context for it. Such a goal is named inside the task by a [`GoalKey`], one `u64` packed from
+//! the rows of its predicate and param env and its typing mode: a row is this process's
+//! interning order, so a `GoalKey` never leaves the task; the store names the goal by its
+//! stable form (`super::stable`).
 //!
-//! Only answers that leave the inference context as they found it are kept: `Ok(Yes)` with no
-//! change, or `Err(NoSolution)`, with an equal [`Mark`] before and after, so no overflow note,
-//! region constraint, variable or universe was added. Such an answer replayed has the effect
-//! the evaluation had. The query reads of the evaluation are kept with it and replayed on a
-//! hit, as `tls_cache`'s shared cache does, so the asking query depends on what the answer
-//! read; an evaluation recorded with no read list (`interner::recorded` gives none when the
-//! snapshot keeps no read lists) is not kept.
+//! Only answers that leave the inference context as they found it are offered: `Ok(Yes)` with
+//! no change, or `Err(NoSolution)`, with an equal [`Mark`] before and after, so no overflow
+//! note, region constraint, variable or universe was added. Such an answer replayed has the
+//! effect the evaluation had. An evaluation recorded with no read list (`interner::recorded`
+//! gives none when the snapshot keeps no read lists) is not offered.
+//!
+//! The in-memory table of these answers per (crate, regions flag, revision) and the shape
+//! table of auto-trait, `Copy` and `Clone` goals were deleted on 2026-11-15 with the daemon's
+//! revisions: within one run the solver's own global cache (`interner::tls_cache`) answers a
+//! goal asked again.
 
-pub(crate) mod shape;
-mod table;
-#[cfg(test)]
-mod tests;
-
-use std::{alloc::Global, num::NonZeroU32};
+use std::num::NonZeroU32;
 
 use rustc_next_trait_solver::solve::{
     GoalEvaluation, GoalStalledOn, HasChanged, SolverDelegateEvalExt,
@@ -32,67 +31,15 @@ use rustc_type_ir::{
     solve::{Certainty, NoSolution},
 };
 
-use super::{
-    Clauses, DbInterner, Goal, ParamEnv, Predicate, SolverContext, SolverDefIds, TypingMode,
-    goal_store,
-    infer::InferCtxt,
-    interner::{Reads, recorded, replay},
+use crate::{
+    Span,
+    next_solver::{
+        Clauses, DbInterner, Goal, ParamEnv, Predicate, SolverContext, SolverDefIds, TypingMode,
+        goal_store,
+        infer::InferCtxt,
+        interner::recorded,
+    },
 };
-use crate::Span;
-
-/// The table of one (crate, regions flag, snapshot): each global goal's answer and its reads.
-///
-/// The table's values are `Copy`, and a read list ([`Reads`]) is reference counted, so a slot
-/// holds the address of a list boxed in `kept`, which owns every list the table names and is
-/// dropped with it: a hit copies the address and replays the list in place, with no count
-/// written. Cost against the old 64-byte slot of a `Copy` list handle: the same slot (an
-/// answer and an address, 16 bytes, in a 64-byte line), plus on each insert (a miss) one box
-/// of 8 bytes and a push under `kept`'s lock; nothing on a hit.
-pub(crate) struct Goals {
-    table: table::Table<(Answer, KeptReads)>,
-    kept: blaze_core::lock::Lock<Vec<Box<Reads, Global>, Global>>,
-}
-
-const _: () = assert!(table::slot_size::<(Answer, KeptReads)>() == 64);
-
-/// A read list that [`Goals::kept`] holds, by its address.
-#[derive(Clone, Copy)]
-struct KeptReads(*const Reads);
-
-// SAFETY: the list it points to is `Send + Sync` (an `Arc` of facts) and lives in its table's
-// `kept` until the table is dropped, which outlives every copy read out of the table (a copy is
-// used only inside the `with_global_goals` closure that borrowed the table).
-unsafe impl Send for KeptReads {}
-// SAFETY: as for `Send`.
-unsafe impl Sync for KeptReads {}
-
-impl Default for Goals {
-    fn default() -> Goals {
-        Goals {
-            table: table::Table::default(),
-            kept: blaze_core::lock::Lock::new("ty.global_goals.kept", Vec::new_in(Global)),
-        }
-    }
-}
-
-impl Goals {
-    /// The answer of `key`, its read list replayed into the current run.
-    #[inline]
-    fn get(&self, db: &base_db::Db, key: GoalKey) -> Option<Answer> {
-        let (answer, reads) = self.table.get(key)?;
-        // SAFETY: `reads` points into a box `kept` holds while `self` lives (`KeptReads`).
-        replay(db, unsafe { &*reads.0 });
-        Some(answer)
-    }
-
-    /// Keeps `answer` and `reads` for `key` unless the table has the key or is full.
-    fn insert(&self, key: GoalKey, answer: Answer, reads: &Reads) {
-        let boxed = Box::new_in(reads.clone(), Global);
-        let at = KeptReads(std::ptr::from_ref::<Reads>(&boxed));
-        self.kept.lock().push(boxed);
-        self.table.insert(key, (answer, at));
-    }
-}
 
 /// A goal with these flags reads the inference context, or is not one goal for every body.
 const NOT_GLOBAL: TypeFlags = TypeFlags::HAS_INFER
@@ -106,14 +53,12 @@ const MODE_SHIFT: u32 = 2 * ROW_BITS;
 const MODE_MASK: u64 = 0b111;
 
 /// A global root goal: the predicate's row in bits 0..30, the param env's clause-list row in
-/// bits 30..60, the typing mode's tag in bits 60..63. Bit 63 is never set; the table uses it.
+/// bits 30..60, the typing mode's tag in bits 60..63. Rows are this process's interning order:
+/// a key is used inside the task that made it and never written.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) struct GoalKey(u64);
 
 impl GoalKey {
-    /// Set in a table slot whose key is claimed but whose answer is not yet written.
-    pub(crate) const PENDING: u64 = 1 << 63;
-
     #[inline]
     pub(crate) fn of<'db>(
         predicate: Predicate<'db>,

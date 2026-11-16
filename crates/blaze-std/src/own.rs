@@ -176,9 +176,9 @@ unsafe impl<T, A: Allocator> Owns<Solely> for LinkedList<T, A> {}
 unsafe impl<T, A: Allocator> Owns<Solely> for BinaryHeap<T, A> {}
 // SAFETY: a `BTreeMap` is the one owner of its nodes, which hold the keys and values; a
 // node's parent pointer stays inside the same tree.
-unsafe impl<K, V, A: Allocator + Clone> Owns<Solely> for BTreeMap<K, V, A> {}
+unsafe impl<K, V, A: core::alloc::AllocatorClone> Owns<Solely> for BTreeMap<K, V, A> {}
 // SAFETY: a `BTreeSet` is a `BTreeMap<T, SetValZST, A>`.
-unsafe impl<T, A: Allocator + Clone> Owns<Solely> for BTreeSet<T, A> {}
+unsafe impl<T, A: core::alloc::AllocatorClone> Owns<Solely> for BTreeSet<T, A> {}
 // SAFETY: a `String` is a `Vec<u8>`: bytes, which own nothing. It has no type argument, so
 // the impl only tells the walk not to read its fields.
 unsafe impl Owns<Solely> for String {}

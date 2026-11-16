@@ -1,6 +1,6 @@
 //! A declarative macro's definition as entries (AGENTS.md rule 65): its tokens found by what
 //! the definition is, so a crate that calls `vec!` makes the expander without a parse of the
-//! file `vec!` is written in (docs/v2/plan/design/restore.md, "Items read in place", row D).
+//! file `vec!` is written in.
 //!
 //! Neither of the two things read is keyed by the definition's crate:
 //!

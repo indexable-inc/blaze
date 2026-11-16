@@ -46,7 +46,6 @@ blaze-phf.workspace = true
 # Messages written with `say!`, whose parts are typed (`blaze_report::say`).
 blaze-report.workspace = true
 cfg.workspace = true
-hir.workspace = true
 hir-def.workspace = true
 hir-expand.workspace = true
 hir-lint-levels.workspace = true
@@ -65,6 +64,8 @@ tt.workspace = true
 blaze-core.workspace = true
 blaze-alloc-count.workspace = true
 blaze-sim.workspace = true
+# Links hir-ty-mir's MIR table (`src/tests/db.rs`).
+hir-ty-mir.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 
 [lints]

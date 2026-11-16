@@ -56,6 +56,7 @@ use std::hash::{BuildHasher, Hasher};
 
 pub mod adaptive;
 mod blake3;
+mod fold;
 mod key;
 pub mod order;
 #[cfg(test)]
@@ -104,17 +105,22 @@ pub type KeyedSet<K, A> = Set<K, SipKey, A>;
 
 /// A map of ordinary keys shared between threads, made by `SharedMap::default()`. Like the
 /// other shared tables it names no allocator: papaya takes none, and a shared table is
-/// long-lived, so it is on the global heap (see the crate's documentation).
+/// long-lived, so it is on the global heap (see the crate's documentation). Behind the
+/// `shared` feature, which the crates that share a table turn on (the root manifest's entry).
+#[cfg(feature = "shared")]
 pub type SharedMap<K, V> = papaya::HashMap<K, V, FixedState>;
 
 /// A set of ordinary keys shared between threads, made by `SharedSet::default()`.
+#[cfg(feature = "shared")]
 pub type SharedSet<K> = papaya::HashSet<K, FixedState>;
 
 /// A map on hashes shared between threads, indexed by the hash itself.
+#[cfg(feature = "shared")]
 pub type SharedByHash<K, V> = papaya::HashMap<K, V, BuildKeyHasher>;
 
 /// What the shared tables are asked with: a borrowed form of a key ([`Equivalent`]), and what
 /// a compare-and-swap of an entry does ([`Operation`], for `map.pin().compute(..)`).
+#[cfg(feature = "shared")]
 pub use papaya::{Equivalent, Operation};
 
 /// The `BuildHasher` of [`HashMap`] and [`HashSet`], and of any other table of ordinary keys
@@ -136,21 +142,21 @@ impl BuildHasher for FixedState {
 /// foldhash's fast hasher with its fixed seed: what [`FixedState`] builds, and what hashes one
 /// value outside a table.
 #[derive(Clone)]
-pub struct FixedHasher(foldhash::fast::FoldHasher<'static>);
+pub struct FixedHasher(fold::Fold);
 
 impl FixedHasher {
     /// A hasher of the family [`FixedHasher::default`] is the first of (`with_seed(0)`), for
     /// hashing one value several independent ways.
     #[inline]
     pub fn with_seed(seed: u64) -> FixedHasher {
-        FixedHasher(foldhash::fast::FixedState::with_seed(seed).build_hasher())
+        FixedHasher(fold::Fold::with_seed(seed))
     }
 }
 
 impl Default for FixedHasher {
     #[inline]
     fn default() -> FixedHasher {
-        FixedHasher(foldhash::fast::FixedState::default().build_hasher())
+        FixedHasher(fold::Fold::with_seed(0))
     }
 }
 

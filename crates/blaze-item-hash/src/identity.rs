@@ -1,5 +1,4 @@
-//! A body's key (docs/v2/plan/design/end-state/engine.md 4.2 and 4.5, the `Fn` record;
-//! restore.md, "The entry's key, made before lowering"): the base key its inference, MIR,
+//! A body's key (the `Fn` record; the entry's key, made before lowering): the base key its inference, MIR,
 //! borrow check, constant value and lowering are filed under, made from the parse alone, the
 //! same for the same item in every database.
 //!
@@ -54,7 +53,7 @@ fn module_chain(db: &Db, def: DefWithBodyId, mut h: Hasher) -> ContentId {
 pub const EARLY_DOMAIN: &str = "blaze v2 item early identity 2";
 
 /// The identity of `def`'s body made before the body is lowered
-/// (docs/v2/plan/design/restore.md, "The entry's key, made before lowering"): what
+/// (the entry's key, made before lowering): what
 /// [`crate::Bodies`] files a body's steps under. It reads the item's own text and no
 /// `Body::of`, resolution or signature: what a step reads of those is in the step's read list
 /// (`blaze_memo::record`), the owner's signature and attributes among them.

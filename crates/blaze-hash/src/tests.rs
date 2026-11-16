@@ -156,6 +156,71 @@ fn a_lookup_on_a_hash_allocates_nothing() {
     });
 }
 
+/// The port of foldhash's fast hasher (`fold`) gives foldhash 0.2.0's hashes under its fixed
+/// seed, `with_seed` and the default alike, for any run of writes: byte strings of every length
+/// past each of its paths (16, 128 and 256 bytes) and integers of every width, which fill and
+/// fold its sponge at every offset.
+#[test]
+fn fold_is_foldhash() {
+    blaze_sim::check(Config::DEFAULT, |tape| {
+        let seed: u64 = if tape.coin("default seed") { 0 } else { tape.int("seed") };
+        let mut ours = FixedHasher::with_seed(seed);
+        let mut theirs = foldhash::fast::FixedState::with_seed(seed).build_hasher();
+        let mut bytes = [0u8; 600];
+        tape.fill(&mut bytes, "bytes");
+        for _ in 0..tape.below(24, "writes") {
+            match tape.below(7, "write") {
+                0 => {
+                    let len = if tape.one_in(3, "long") {
+                        tape.index(bytes.len() + 1, "long length")
+                    } else {
+                        tape.index(33, "short length")
+                    };
+                    let from = tape.index(bytes.len() - len + 1, "offset");
+                    ours.write(&bytes[from..from + len]);
+                    theirs.write(&bytes[from..from + len]);
+                }
+                1 => {
+                    let it = tape.int::<u8>("u8");
+                    ours.write_u8(it);
+                    theirs.write_u8(it);
+                }
+                2 => {
+                    let it = tape.int::<u16>("u16");
+                    ours.write_u16(it);
+                    theirs.write_u16(it);
+                }
+                3 => {
+                    let it = tape.int::<u32>("u32");
+                    ours.write_u32(it);
+                    theirs.write_u32(it);
+                }
+                4 => {
+                    let it = tape.int::<u64>("u64");
+                    ours.write_u64(it);
+                    theirs.write_u64(it);
+                }
+                5 => {
+                    let it = u128::from(tape.int::<u64>("u128 high")) << 64
+                        | u128::from(tape.int::<u64>("u128 low"));
+                    ours.write_u128(it);
+                    theirs.write_u128(it);
+                }
+                _ => {
+                    let it = tape.int::<u64>("usize") as usize;
+                    ours.write_usize(it);
+                    theirs.write_usize(it);
+                }
+            }
+            assert_eq!(ours.finish(), theirs.finish(), "seed {seed:#x}");
+        }
+        assert_eq!(
+            FixedState.hash_one(&bytes[..]),
+            foldhash::fast::FixedState::default().hash_one(&bytes[..])
+        );
+    });
+}
+
 #[test]
 fn hashes_as_the_copies_did() {
     blaze_sim::check(Config::DEFAULT, |tape| {

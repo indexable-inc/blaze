@@ -403,8 +403,7 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::swappable_parameters", Allow, "detects two adjacent parameters of one primitive or string type")
         .externally_loaded(),
-    // How hard code is to hold in one's head: each measure over its bound (docs/lints.md,
-    // "Complexity"), an existing item held at its value.
+    // How hard code is to hold in one's head: each measure over its bound, an existing item held at its value.
     l("blaze::function_weight", Allow, "detects a function whose cognitive complexity is over its bound")
         .externally_loaded(),
     l("blaze::path_count", Allow, "detects a function with more acyclic paths through it, loops taken once, than its bound")
@@ -463,7 +462,7 @@ pub(super) const BLAZE: &[Lint] = &[
         .externally_loaded(),
     l("blaze::comment_claims", Allow, "detects a body comment claiming what nothing checks (`cannot overflow`, `unreachable`, `can't be None`)")
         .externally_loaded(),
-    // Duplicated code and copy-paste mistakes, by the shape of code (docs/lints.md, Duplicates).
+    // Duplicated code and copy-paste mistakes, by the shape of code.
     l("blaze::same_fn", Allow, "detects two functions with the same body and signature up to the names of their locals")
         .externally_loaded(),
     l("blaze::same_impl_fn", Allow, "detects one method body written in several impls, which a default method or blanket impl would hold once")

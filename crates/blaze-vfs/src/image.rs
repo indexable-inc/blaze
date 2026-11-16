@@ -1,4 +1,4 @@
-//! The tree in the daemon's image (docs/v2/plan/design/restore.md), opened in place: two
+//! The tree in the daemon's image, opened in place: two
 //! sections of `blaze-image`'s file, read where they are mapped. Nothing is re-interned or
 //! hashed again on a start. The image holds no file's bytes: a file is its content ID and its
 //! size, its text the content store's ([`crate::Texts`], /tmp/plan/vfs-image-next.md), paged in

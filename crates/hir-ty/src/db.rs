@@ -1325,10 +1325,9 @@ pub mod kinds {
         CONST_PARAM_ENV = 0x2433, "const_param_env_query";
         ITEM_BOUNDS = 0x2434, "ItemBounds::of";
         IMPL_SUPER_OUTLIVES = 0x2435, "impl_super_outlives";
-        CRATE_FIELD_TYPES = 0x2436, "crate_field_types";
-        CRATE_IMPL_SELF_TYS = 0x2437, "crate_impl_self_tys";
-        CRATE_IMPL_TRAITS = 0x2438, "crate_impl_traits";
-        CRATE_IMPL_PREDICATES = 0x2439, "crate_impl_predicates";
+        // 0x2436..=0x2439 were a dependency crate's signature batches (`crate_field_types`,
+        // `crate_impl_self_tys`, `crate_impl_traits`, `crate_impl_predicates`), gone
+        // 2026-11-15 with `lower/batch`: every item's signature is a query of the item.
         CONST_PARAM_TY_ERRORS = 0x243a, "const_param_ty_errors";
         INHERENT_ASSOC_TYPES = 0x243b, "inherent_assoc_types";
         FN_SIG_WITH_ELIDED_BOUND = 0x243c, "fn_sig_with_elided_bound";
@@ -1508,12 +1507,9 @@ pub mod kinds {
         // A record function's parameter defaults (`lower/record`).
         RECORD_PARAM_DEFAULTS = 0x2513, "record_param_defaults";
         RECORD_PARAM_DEFAULT = 0x2514, "record_param_default";
-        // A dependency's variant's row of its crate's field types batch.
-        BATCHED_FIELD_TYPES = 0x2515, "batched_field_types";
-        // A dependency's impl's rows of its crate's impl batches.
-        BATCHED_IMPL_SELF_TY = 0x2516, "batched_impl_self_ty";
-        BATCHED_IMPL_TRAIT = 0x2517, "batched_impl_trait";
-        BATCHED_IMPL_PREDICATES = 0x2518, "batched_impl_predicates";
+        // 0x2515..=0x2518 were the rows of a dependency's signature batches
+        // (`batched_field_types`, `batched_impl_self_ty`, `batched_impl_trait`,
+        // `batched_impl_predicates`), gone 2026-11-15 with `lower/batch`.
         // A trait's predicates as declared, without the bounds its header implies.
         DECLARED_TRAIT_PREDICATES = 0x2519, "declared_trait_predicates_of";
 

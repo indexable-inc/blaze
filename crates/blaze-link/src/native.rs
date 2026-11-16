@@ -2769,9 +2769,6 @@ impl<'a> Stage<'a> {
                 ),
             ));
         }
-        if self.lazy.is_some() && name == blaze_lazy::hook::SYMBOL {
-            return Err(crate::lazy::no_hook(self.output.format));
-        }
         if let Some(special) = self.writer.special(name) {
             return Ok(Decision::Special(match special {
                 // ELF's `__start_X` is defined only when a section `X` is: one only weak
@@ -4207,10 +4204,6 @@ fn keep<T: PartialEq>(was: &Arc<Vec<T>>, now: Vec<T>) -> Arc<Vec<T>> {
         Arc::new(now)
     }
 }
-
-mod kept;
-
-pub(crate) use kept::open_input;
 
 #[cfg(test)]
 mod ties_tests;

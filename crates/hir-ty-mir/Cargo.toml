@@ -65,7 +65,6 @@ blaze-format.workspace = true
 blaze-items.workspace = true
 blaze-sim.workspace = true
 blaze-units.workspace = true
-hir.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 test-utils.workspace = true
 

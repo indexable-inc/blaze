@@ -376,6 +376,9 @@ macro_rules! set_operator {
 
 set_operator!(BitOr bitor, BitAnd bitand, BitXor bitxor, Sub sub);
 
+// serde's forms, hashbrown's: behind the `serde` feature, which the crates that persist a table
+// with serde turn on (the root manifest's entry).
+#[cfg(feature = "serde")]
 impl<K, V, S, A> serde::Serialize for Map<K, V, S, A>
 where
     K: serde::Serialize + Eq + Hash,
@@ -388,6 +391,7 @@ where
     }
 }
 
+#[cfg(feature = "serde")]
 impl<'de, K, V, S, A> serde::Deserialize<'de> for Map<K, V, S, A>
 where
     K: serde::Deserialize<'de> + Eq + Hash,
@@ -401,6 +405,7 @@ where
     }
 }
 
+#[cfg(feature = "serde")]
 impl<T, S, A> serde::Serialize for Set<T, S, A>
 where
     T: serde::Serialize + Eq + Hash,
@@ -412,6 +417,7 @@ where
     }
 }
 
+#[cfg(feature = "serde")]
 impl<'de, T, S, A> serde::Deserialize<'de> for Set<T, S, A>
 where
     T: serde::Deserialize<'de> + Eq + Hash,

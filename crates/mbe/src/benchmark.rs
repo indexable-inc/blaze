@@ -1,6 +1,5 @@
 //! This module add real world mbe example for benchmark tests
 
-use base_db::Db;
 use blaze_hash::HashMap;
 use intern::Symbol;
 use std::alloc::Global;
@@ -41,16 +40,16 @@ fn benchmark_expand_macro_rules() {
     if skip_slow_tests() {
         return;
     }
-    let db = base_db::Db::for_tests(|_| {});
+
     let rules = macro_rules_fixtures();
-    let invocations = invocation_fixtures(&db, &rules);
+    let invocations = invocation_fixtures(&rules);
 
     let hash: usize = {
         let _pt = bench("mbe expand macro rules");
         invocations
             .into_iter()
             .map(|(id, tt)| {
-                let res = rules[&id].expand(&db, &tt, |_| (), MacroCall::FnLike, DUMMY);
+                let res = rules[&id].expand(&tt, |_| (), MacroCall::FnLike, DUMMY);
                 assert!(res.err.is_none());
                 res.value.0.as_token_trees().len()
             })
@@ -91,7 +90,6 @@ fn macro_rules_fixtures_tt() -> HashMap<String, tt::TopSubtree, Global> {
 
 /// Generate random invocation fixtures from rules
 pub(crate) fn invocation_fixtures(
-    db: &Db,
     rules: &HashMap<String, DeclarativeMacro, Global>,
 ) -> Vec<(String, tt::TopSubtree)> {
     let mut seed = 123456789;
@@ -123,7 +121,7 @@ pub(crate) fn invocation_fixtures(
                     }
                     let subtree = builder.build();
 
-                    if it.expand(db, &subtree, |_| (), MacroCall::FnLike, DUMMY).err.is_none() {
+                    if it.expand(&subtree, |_| (), MacroCall::FnLike, DUMMY).err.is_none() {
                         res.push((name.clone(), subtree));
                         break;
                     }

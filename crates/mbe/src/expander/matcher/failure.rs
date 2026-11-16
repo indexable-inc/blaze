@@ -7,7 +7,6 @@
 
 use std::borrow::Cow;
 
-use base_db::Db;
 use blaze_mem::frame::Frame;
 use intern::Symbol;
 use span::{Edition, Span, TextRange};
@@ -112,7 +111,7 @@ impl Tracker {
 
     /// rustc's `failure`: no position goes on at the token `src` is at, or (`None`) at the end
     /// of the input. The first failure at the furthest position is kept.
-    pub(super) fn fail(&mut self, db: &Db, src: Option<&TtIter<'_>>) {
+    pub(super) fn fail(&mut self, src: Option<&TtIter<'_>>) {
         if self.best.as_ref().is_some_and(|best| self.position <= best.position) {
             return;
         }
@@ -120,7 +119,7 @@ impl Tracker {
         let (token, span) = match src {
             None => (None, self.end),
             Some(src) => {
-                let (token, span) = self.token_at(db, src);
+                let (token, span) = self.token_at(src);
                 // alloc: an error's text, when no rule matches.
                 (Some(Box::from(token)), span)
             }
@@ -129,7 +128,7 @@ impl Tracker {
     }
 
     /// rustc's `token_descr` of the token `src` is at, and its span.
-    fn token_at(&self, db: &Db, src: &TtIter<'_>) -> (Cow<'static, str>, Span) {
+    fn token_at(&self, src: &TtIter<'_>) -> (Cow<'static, str>, Span) {
         match src.peek() {
             Some(TtElement::Leaf(tt::Leaf::Punct(_))) => {
                 // clone: a cursor, one view.
@@ -192,7 +191,6 @@ pub(super) fn tokens(view: tt::TokenTreesView<'_>) -> u32 {
 /// when no rule failed as rustc's fail, which is where rustc gives its ambiguity error. The
 /// matches' buffers are in `frame`, the call's.
 pub(crate) fn match_failure(
-    db: &Db,
     frame: &Frame,
     rules: &[Rule],
     input: &tt::TopSubtree,
@@ -214,13 +212,13 @@ pub(crate) fn match_failure(
             continue;
         }
         track.rule = idx as u32;
-        match_loop(db, &rule.matcher, input, &mut buffers, &mut res, Some(&mut track));
+        match_loop(&rule.matcher, input, &mut buffers, &mut res, Some(&mut track));
     }
     let best = track.best?;
     let (remaining, remaining_span) =
-        describe(db, &rules[best.remaining.rule as usize].matcher, best.remaining);
+        describe(&rules[best.remaining.rule as usize].matcher, best.remaining);
     let missing_comma = match call_style {
-        MacroCallStyle::FnLike => missing_comma(db, frame, rules, input),
+        MacroCallStyle::FnLike => missing_comma(frame, rules, input),
         MacroCallStyle::Attr | MacroCallStyle::Derive => None,
     };
     let failure = MatchFailure {
@@ -238,7 +236,7 @@ pub(crate) fn match_failure(
 /// input's top level that is a group, or an identifier or literal not joined to the identifier
 /// or literal after it, and is not followed by a `,`, a `,` makes some function-like rule
 /// match. The span is empty, at the end of that token tree.
-fn missing_comma(db: &Db, frame: &Frame, rules: &[Rule], input: &tt::TopSubtree) -> Option<Span> {
+fn missing_comma(frame: &Frame, rules: &[Rule], input: &tt::TopSubtree) -> Option<Span> {
     let mut iter = input.iter();
     let start = iter.savepoint();
     let mut at = None;
@@ -247,9 +245,7 @@ fn missing_comma(db: &Db, frame: &Frame, rules: &[Rule], input: &tt::TopSubtree)
         let end = match (&left, &right) {
             (_, TtElement::Leaf(tt::Leaf::Punct(comma))) if comma.char == ',' => continue,
             (TtElement::Leaf(left), TtElement::Leaf(right))
-                if is_word(db, left)
-                    && is_word(db, right)
-                    && !joined(*left.span(), *right.span()) =>
+                if is_word(left) && is_word(right) && !joined(*left.span(), *right.span()) =>
             {
                 *left.span()
             }
@@ -273,14 +269,14 @@ fn missing_comma(db: &Db, frame: &Frame, rules: &[Rule], input: &tt::TopSubtree)
     let mut buffers = Buffers::new_in(frame);
     let mut res = Match::new_in(frame);
     let matches = rules.iter().filter(|rule| rule.style == MacroCallStyle::FnLike).any(|rule| {
-        match_loop(db, &rule.matcher, &with_comma, &mut buffers, &mut res, None);
+        match_loop(&rule.matcher, &with_comma, &mut buffers, &mut res, None);
         res.err.is_none()
     });
     matches.then_some(comma)
 }
 
 /// rustc's `is_non_reserved_ident() || is_lit()`.
-fn is_word(db: &Db, leaf: &tt::Leaf) -> bool {
+fn is_word(leaf: &tt::Leaf) -> bool {
     match leaf {
         tt::Leaf::Literal(_) => true,
         tt::Leaf::Ident(ident) => {
@@ -297,7 +293,7 @@ fn joined(left: Span, right: Span) -> bool {
 }
 
 /// rustc's `MatcherLoc` `Display` of `at`, and its `MatcherLoc::span`.
-fn describe(db: &Db, matcher: &Matcher, at: At) -> (Cow<'static, str>, Option<Span>) {
+fn describe(matcher: &Matcher, at: At) -> (Cow<'static, str>, Option<Span>) {
     let dot = at.dot;
     let group = |pick: fn(&Group) -> u32| {
         matcher
@@ -356,7 +352,7 @@ fn describe(db: &Db, matcher: &Matcher, at: At) -> (Cow<'static, str>, Option<Sp
             if rep.separator == NONE || at.sep_matched {
                 return (Cow::Borrowed("sequence end"), None);
             }
-            let (text, span) = separator_descr(db, &matcher.separators[rep.separator as usize]);
+            let (text, span) = separator_descr(&matcher.separators[rep.separator as usize]);
             (Cow::Owned(text), Some(span))
         }
         Loc::MetaExpr => unreachable!("a pattern has no metavariable expressions"),
@@ -374,7 +370,7 @@ fn puncts_descr(puncts: &[tt::Punct]) -> String {
 }
 
 /// rustc's `token_descr` of a repetition's separator, and its span.
-fn separator_descr(db: &Db, separator: &Separator) -> (String, Span) {
+fn separator_descr(separator: &Separator) -> (String, Span) {
     match separator {
         // alloc: an error's text, when no rule matches.
         Separator::Literal(lit) => (format!("`{lit}`"), lit.span),

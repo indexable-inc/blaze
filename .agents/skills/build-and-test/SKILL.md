@@ -269,8 +269,8 @@ From [docs/contributing.md#working-in-parallel](../../../docs/contributing.md#wo
   `cargo +<harness/toolchain> check -p <crate> --all-targets`, then
   `cargo +<harness/toolchain> check --workspace --all-targets` with the piece applied alone onto
   the last green head; the head moves only if that passes. Errors go back to the lane at once.
-- Rounds on the green head: the one VM builds the whole tree once and runs everything
-  (`harness/v2/integrate.py`), keep-going, every failure handed back with the tree, command and
+- Rounds on the green head: the one VM builds the whole tree once and runs everything,
+  keep-going, every failure handed back with the tree, command and
   error.
 - Before a merge: the hello-world smoke of a release blaze built from the exact merge commit
   (`proof-before-merge`, the `landing` skill).
@@ -285,11 +285,6 @@ From [docs/contributing.md#working-in-parallel](../../../docs/contributing.md#wo
   that does not exist (`blaze daemon stop`; it is `blaze stop`) exits 101 and a script that
   goes on measures nothing true
   ([docs/contributing.md#scripts-that-run-commands](../../../docs/contributing.md#scripts-that-run-commands)).
-- The gate holds the budget smoke's guards
-  ([docs/harness.md#the-smokes-guards](../../../docs/harness.md#the-smokes-guards)): run
-  `uv run --frozen python harness/v2/budgets.py '{"command": "smoke", "engine": {"kind": "v2", "blaze": "<built blaze>"}}'`
-  on the built blaze before landing anything that touches the daemon, the plane, the front end
-  or the store; a guard that fails is fixed, or recorded with its cause (`"record": true`).
 - Run harnesses with `RUST_BACKTRACE=0`.
 - Done (`clean-up-lane`): the lane's `/root/wt/<lane>/` and homes on `blaze-vm`, any blaze
   process it left running, and any worktree (`blaze clean` in it, `git worktree remove <dir>`)

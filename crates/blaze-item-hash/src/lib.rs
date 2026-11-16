@@ -3,8 +3,7 @@
 //! `hir_ty::body_store` asks above hir-ty.
 //!
 //! - [`identity`]: a body's key, made before the body is lowered
-//!   (docs/v2/plan/design/end-state/engine.md 4.2, the `Fn` record; restore.md, "The entry's
-//!   key, made before lowering"): its crate's settings, its owner by key, its module chain and
+//!   (the `Fn` record): its crate's settings, its owner by key, its module chain and
 //!   its item's own text. Nothing it resolves is in it: what a step resolves is a fact of the
 //!   step's shape, negatives included. One tracked query per body, with early cutoff.
 //! - [`reads`]: what each row of a step's read list stands for (section 6), the one table of

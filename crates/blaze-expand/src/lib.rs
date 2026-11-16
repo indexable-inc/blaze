@@ -8,7 +8,7 @@
 //!   `local_inner_macros` flags, a derive's helper attributes and its transparency, and the
 //!   hash of all of that, its [`MacroContent`]: never its item key (rule 21).
 //! - [`Call`]: one call: its tokens and kind (fn-like, attribute with the item, derive with the
-//!   item), its call-site hygiene ([`CallSite`]) and, for an eager macro re-entered, the
+//!   item and its [`DeriveFacts`]), its call-site hygiene ([`CallSite`]) and, for an eager macro re-entered, the
 //!   expansions of the calls in its input ([`Eager`]).
 //! - [`ExpandCx`]: every outside fact, each one asked for through it and recorded as a
 //!   [`Read`]: env vars, included files, cfg outcomes, positions inside eager input, and the
@@ -37,14 +37,19 @@
 //! edition and its definition's crate and module. That is what `$crate`, def-site `self` and
 //! local variable hygiene are resolved by; nothing is an interned id or an arena index.
 //!
-//! # The old database
+//! # What is reused
 //!
-//! mbe's matcher and transcriber and hir-expand's builtin derive writers are reused as they
-//! are. They take a `&base_db::Db` they only pass down and never read; [`ExpandCx::host_db`]
-//! hands one in until they drop the parameter.
+//! mbe's matcher and transcriber run `macro_rules!` and `macro`, on token trees made from the
+//! portable form and read back into it ([`crate::bridge`]). The builtin derives and the
+//! builtin function-like macros are written here, token to token, and a literal's escapes are
+//! read here too: no database and no syntax tree is involved.
 
+#![no_std]
 #![feature(allocator_api)]
 
+extern crate alloc;
+
+mod adt;
 mod bridge;
 mod builtin;
 mod call;
@@ -62,7 +67,7 @@ mod nested;
 mod tokens;
 
 pub use crate::{
-    call::{Call, CallKind, CallShape, CallSite, Eager, Inside},
+    call::{AlsoCopy, Call, CallKind, CallShape, CallSite, Constness, DeriveFacts, Eager, Inside},
     cx::{
         ExpandCx, HostAsk, HostError, HostWhy, IncludeAs, Included, Place, PlaceOf, ProcCall,
         Produced,
@@ -71,7 +76,7 @@ pub use crate::{
         BuiltinAttr, BuiltinDerive, BuiltinFn, DefAt, Export, LocalInner, MacroContent, MacroDef,
         MacroKind, ProcKind,
     },
-    error::{ExpandError, LexError, StreamError, Stream, Table, Unbuilt},
+    error::{ExpandError, LexError, Stream, StreamError, Table, Unbuilt},
     expand::{Prepared, expand, expand_prepared, prepare},
     expansion::{
         Diagnostic, Expanded, Expansion, Hole, HoleOf, IncludeFailure, NestedCall, NestedKind,

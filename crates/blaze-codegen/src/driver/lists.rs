@@ -1,5 +1,4 @@
-//! A program's last `Built`, kept by row and patched by the next build
-//! (docs/v2/plan/design/incremental-walk.md, "`Built` is kept and patched").
+//! A program's last `Built`, kept by row and patched by the next build.
 //!
 //! [`Lists`] holds one row a function and one a static, in maps sorted by key whose chunks
 //! are shared ([`rows`](super::rows)): everything the `Built` says of it, its compiled

@@ -6,7 +6,6 @@
 mod matcher;
 mod transcriber;
 
-use base_db::Db;
 use blaze_hash::HashMap;
 use span::Span;
 use std::alloc::Global;
@@ -20,7 +19,6 @@ use crate::{
 };
 
 pub(crate) fn expand_rules(
-    db: &Db,
     rules: &[crate::Rule],
     input: &tt::TopSubtree,
     marker: impl Fn(&mut Span) + Copy,
@@ -33,7 +31,7 @@ pub(crate) fn expand_rules(
             continue;
         }
 
-        let new_match = matcher::match_(db, &rule.lhs, input);
+        let new_match = matcher::match_(&rule.lhs, input);
 
         if new_match.err.is_none() {
             let ExpandResult { value, err: transcribe_err } =
@@ -61,7 +59,7 @@ pub(crate) fn expand_rules(
         let match_err = match_.err.map(|err| match in_fragment {
             true => err,
             false => blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
-                super::matcher::match_failure(db, frame, rules, input, call_style)
+                super::matcher::match_failure(frame, rules, input, call_style)
             })
             .unwrap_or(err),
         });
@@ -92,7 +90,6 @@ enum Binding<'a> {
 /// [`crate::expect_fragment`] as it was: the parser's input made from every token left in the
 /// level, whatever the fragment's length.
 pub(crate) fn expect_fragment<'t>(
-    db: &Db,
     tt_iter: &mut TtIter<'t>,
     entry_point: ::parser::PrefixEntryPoint,
     delim_span: DelimSpan,

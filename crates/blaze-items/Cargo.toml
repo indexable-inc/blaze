@@ -44,7 +44,8 @@ stdx.workspace = true
 blaze-alloc-count.workspace = true
 blaze-core.workspace = true
 blaze-sim.workspace = true
-hir.workspace = true
+# Links hir-ty-mir's MIR table, which the hashes read (`src/tests/db.rs`).
+hir-ty-mir.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 
 [lints]

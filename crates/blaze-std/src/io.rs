@@ -160,12 +160,16 @@ impl Backend {
 
     /// A poll brought nothing before `until`: the simulation has nothing that completes by
     /// then, so its clock moves to `until`, as a real wait sleeps to it. A real driver's
-    /// clock moves by itself.
+    /// clock moves by itself. [`Deadline::NEVER`] is no time to move to: a real wait with no
+    /// deadline blocks until something completes, so the clock stays, and the caller's poll
+    /// fuel ends the wait as [`Stopped::Stalled`] (moving it to `Duration::MAX` left a clock
+    /// that every later delay overflowed).
     fn idle_until(&mut self, until: Deadline) {
         match self {
             #[cfg(any(target_os = "linux", target_os = "macos", windows, target_os = "wasi"))]
             Backend::Native(_) => {}
             Backend::Sim(sim) => {
+                let Some(until) = until.finite() else { return };
                 let now = sim.now();
                 if !until.passed(now) {
                     sim.advance(until.get().saturating_sub(now));

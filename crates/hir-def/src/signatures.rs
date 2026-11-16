@@ -89,7 +89,7 @@ fn child_tokens<const N: usize>(node: ast::Node<'_>, kinds: [SyntaxKind; N]) -> 
 /// when it is lowered from its file.
 type Maps<'a> = Option<(&'a RealSpanMap, &'a AstIdMap)>;
 
-/// Served-else-lowered (docs/v2/plan/design/front-end-on-memo.md, A.4): what every per-item
+/// Served-else-lowered: what every per-item
 /// query of the front end reads its value through, the one shape of it.
 ///
 /// - **Served.** The item's crate has an image ([`crate::deps::image_of`]): the value is read

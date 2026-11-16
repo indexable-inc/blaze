@@ -26,7 +26,11 @@ use alloc::{
 };
 use core::{fmt, time::Duration};
 
-use crate::{cx::Cx, io::Io, mem::TASK_FRAME};
+use crate::{
+    cx::Cx,
+    io::{Io, Missing},
+    mem::TASK_FRAME,
+};
 
 pub use crate::rt::{Exit, run};
 
@@ -135,4 +139,112 @@ pub fn run_in<R: Outcome>(io: Io, said: &mut dyn fmt::Write, main: impl FnOnce(&
         }
     };
     main(&cx, io).status(said)
+}
+
+/// A parameter `main` may take: the root context, the world, or a capability the world hands
+/// out by type. `#[bstd::main]` ([`crate::main!`]) gives each of `main`'s parameters
+/// `<Type as Root>::root(cx, &io)`, so which roots exist is this trait's impls, never a list
+/// in a macro or the compiler; a capability the host does not offer stops the program before
+/// `main` with its [`Missing`]. `Out` is not one: standard output and standard error are both
+/// `Out`, so `main` takes `io` and asks [`Io::need_out`] or [`Io::need_err`].
+#[diagnostic::on_unimplemented(
+    message = "`main` cannot take a `{Self}`",
+    label = "not a root of `main`",
+    note = "the roots: `&Cx`, `Io`, `Fs`, `Clock`, `Rng`, `Env`, `Args`, `Host`, `Mem`, `Net`, \
+            `Http`, `Streams`, `Term`, `Keys`, `Roots`, `Locale`, `User`, `Code`, `Window`, \
+            `Automation`, `Opener`, `Power`, `Audio`, `Camera`, `Screen`, `Location`, \
+            `Bluetooth`, `Usb`, `Serial`, `Clipboard`, `Notify` (bstd::entry::Root)"
+)]
+pub trait Root<'cx>: Sized {
+    /// The root out of the context `main` is run in and its world.
+    fn root(cx: &'cx Cx, io: &Io) -> Result<Self, Missing>;
+}
+
+impl<'cx> Root<'cx> for &'cx Cx {
+    fn root(cx: &'cx Cx, _io: &Io) -> Result<&'cx Cx, Missing> {
+        Ok(cx)
+    }
+}
+
+impl Root<'_> for Io {
+    fn root(_cx: &Cx, io: &Io) -> Result<Io, Missing> {
+        // clone: the world's handle, one for `main`, as `run_in` hands one.
+        Ok(io.clone())
+    }
+}
+
+macro_rules! roots {
+    ($($ty:path => $need:ident),* $(,)?) => {$(
+        impl Root<'_> for $ty {
+            fn root(_cx: &Cx, io: &Io) -> Result<$ty, Missing> {
+                io.$need()
+            }
+        }
+    )*};
+}
+
+roots! {
+    crate::fs::Fs => need_fs,
+    crate::clock::Clock => need_clock,
+    crate::rng::Rng => need_rng,
+    crate::env::Env => need_env,
+    crate::args::Args => need_args,
+    crate::host::Host => need_host,
+    crate::mem::Mem => need_mem,
+    crate::net::Net => need_net,
+    crate::requests::Http => need_http,
+    crate::streams::Streams => need_streams,
+    crate::term::Term => need_term,
+    crate::keys::Keys => need_keys,
+    crate::roots::Roots => need_roots,
+    crate::locale::Locale => need_locale,
+    crate::user::User => need_user,
+    crate::code::Code => need_code,
+    crate::window::Window => need_windows,
+    crate::automation::Automation => need_automation,
+    crate::opener::Opener => need_opener,
+    crate::power::Power => need_power,
+    crate::audio::Audio => need_audio,
+    crate::device::Camera => need_camera,
+    crate::device::Screen => need_screen,
+    crate::device::Location => need_location,
+    crate::device::Bluetooth => need_bluetooth,
+    crate::device::Usb => need_usb,
+    crate::device::Serial => need_serial,
+    crate::device::Clipboard => need_clipboard,
+    crate::device::Notify => need_notify,
+}
+
+/// `#[bstd::main]`: a `main` that takes its world, one spelling for rustc and for blaze. It
+/// keeps the function as written and makes the process's `main` the call [`run`] of a closure
+/// that hands it each root by its type ([`Root`]):
+///
+/// ```ignore
+/// #[bstd::main]
+/// fn main(cx: &Cx, io: Io, fs: Fs) -> Result<(), bstd::entry::Error> { .. }
+/// ```
+///
+/// A parameter is a name or `_`, then its type; a type that is not a root is the error of
+/// [`Root`], which lists them. What `main` returns is an [`Outcome`]. It is a `macro_rules!`
+/// attribute (`macro_attr`), as `#[bstd::test]` is, so it needs no proc macro and nothing
+/// to run on `wasm32-wasip1` under blaze. A crate of the blaze edition needs none of it: its
+/// front end appends the same call (this module's doc).
+#[macro_export]
+macro_rules! main {
+    attr() (
+        $(#[$meta:meta])*
+        $vis:vis fn main($($root:tt : $ty:ty),* $(,)?) $(-> $returns:ty)? $body:block
+    ) => {
+        $(#[$meta])*
+        $vis fn main() -> $crate::entry::Exit {
+            fn main($($root: $ty),*) $(-> $returns)? $body
+            $crate::entry::run(
+                |_bstd_cx: &$crate::Cx, _bstd_io: $crate::Io| -> ::core::result::Result<_, $crate::Missing> {
+                    ::core::result::Result::Ok(main($(
+                        <$ty as $crate::entry::Root<'_>>::root(_bstd_cx, &_bstd_io)?
+                    ),*))
+                },
+            )
+        }
+    };
 }

@@ -21,14 +21,11 @@
 //! it, started by the kernel, so `current_exe`, `/proc/self/exe`, dyld's image 0, the PEB,
 //! `dl_iterate_phdr` and backtraces all see the program there, as in a whole build.
 //!
-//! 1. The build places the executable at cargo's path, as any output: the bytes the memory
-//!    object holds, under the same content key. That placement is the path's one writer; the
-//!    daemon's host writes no file. A launch is asked once its job's placements have ended,
-//!    with the key the build's record holds for the path, and starts only where that is the
-//!    memory's file's key ([`host::Program::command`]); else it is refused naming the path
-//!    and both keys ([`host::StartError::NotPlaced`]).
-//! 2. It spawns that file through `blaze-core`'s `Effect::Spawn` in the run's sandbox, with
-//!    `BLAZE_INPROC` naming its host and a token ([`host::Program::command`]).
+//! 1. The executable is placed at its path, the bytes the memory object holds, and started
+//!    with `BLAZE_INPROC` naming the host that holds the memory and a token. The daemon's
+//!    host that did both (`host`) was deleted on 2026-11-15 with the daemon; nothing starts
+//!    such a run now.
+//! 2. (Deleted with step 1.)
 //! 3. Before `main` and before any other code of the program, the program's runtime
 //!    ([`runtime`], linked into the executable) runs its start hook: an ELF `.preinit_array`
 //!    entry, the first pointer of the Mach-O `__mod_init_func`, a PE TLS callback in
@@ -69,7 +66,7 @@
 //!   slide: code is position-independent, and a word that names code names it relative to
 //!   itself, never by absolute address;
 //! - [`CodeMemory::linked`] gives an offset's linked address; a process's address is that
-//!   plus its slide ([`host::Session::slide`], [`runtime::Attached::slide`]);
+//!   plus its slide ([`runtime::Attached::slide`]);
 //! - the fence's ranges are linked addresses, and each thread subtracts its slide from its
 //!   return addresses before comparing.
 //!
@@ -86,7 +83,7 @@
 // runtime"). This crate is the daemon's side built on it, and names its modules as its own.
 #[cfg(test)]
 pub(crate) use blaze_inproc_rt::bind;
-#[cfg(any(test, feature = "host"))]
+#[cfg(test)]
 pub(crate) use blaze_inproc_rt::handshake;
 pub(crate) use blaze_inproc_rt::sys;
 pub use blaze_inproc_rt::{
@@ -94,8 +91,6 @@ pub use blaze_inproc_rt::{
 };
 
 pub mod exec;
-#[cfg(feature = "host")]
-pub mod host;
 
 mod alloc;
 

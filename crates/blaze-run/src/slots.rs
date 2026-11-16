@@ -27,10 +27,10 @@
 #![blaze::sans_io]
 
 use alloc::vec::Vec;
-use core::alloc::Allocator;
+use core::alloc::{Allocator, AllocatorClone};
 use core::fmt;
 
-use crate::{CodeRef, Plant, SlotId, ThreadId, Tier};
+use crate::{CodeRef, Hooks, Plant, SlotId, ThreadId, Tier};
 
 /// A placed body, by its number among every body the program ever placed: the offset the code
 /// area handed out for it, which is never handed out again (launcher.md, "Code is appended").
@@ -94,11 +94,9 @@ pub enum Error {
     /// A table of no slot, or of more than a word can number.
     Config { what: &'static str, value: u64 },
     NoSlot { slot: SlotId, slots: u32 },
-    /// Fast code for a slot that has fast code: two compiles of one function (single flight
-    /// broken upstream).
-    FastTwice { slot: SlotId },
-    /// Anything for a slot that has optimized code: nothing is above it in one run.
-    AlreadyOptimized { slot: SlotId, tier: Tier },
+    /// The code the slot's word names already, published again: two publishes of one version
+    /// (single flight broken upstream).
+    Same { slot: SlotId, code: CodeRef },
     /// More bodies than the code area numbers: the program is restarted in place.
     Full { most: u32 },
     NoThread { thread: ThreadId },
@@ -116,15 +114,11 @@ impl fmt::Display for Error {
             Error::NoSlot { slot, slots } => {
                 write!(f, "slot {} is past the table's {slots} slots", slot.0)
             }
-            Error::FastTwice { slot } => write!(
+            Error::Same { slot, code } => write!(
                 f,
-                "slot {} was given fast code twice: its function was compiled twice",
-                slot.0
-            ),
-            Error::AlreadyOptimized { slot, tier } => write!(
-                f,
-                "slot {} has optimized code and was given {tier:?} code: nothing is above it",
-                slot.0
+                "slot {} was given the code it runs, {:02x?}, again: one version published twice",
+                slot.0,
+                &code.0[..8]
             ),
             Error::Full { most } => write!(
                 f,
@@ -161,6 +155,7 @@ enum Life {
 struct Placed {
     slot: SlotId,
     tier: Tier,
+    hooks: Hooks,
     code: CodeRef,
     life: Life,
 }
@@ -178,6 +173,7 @@ struct Batch<A: Allocator> {
 pub struct Found {
     pub slot: SlotId,
     pub tier: Tier,
+    pub hooks: Hooks,
     pub code: CodeRef,
     /// Whether its slot's word names it now; else it is retired or freed.
     pub bound: bool,
@@ -185,7 +181,7 @@ pub struct Found {
 }
 
 /// The table of one program. See the module's documentation.
-pub struct Slots<A: Allocator + Clone> {
+pub struct Slots<A: AllocatorClone> {
     alloc: A,
     words: Vec<Word, A>,
     bodies: Vec<Placed, A>,
@@ -198,7 +194,7 @@ pub struct Slots<A: Allocator + Clone> {
     pub(crate) plant: Plant,
 }
 
-impl<A: Allocator + Clone> Slots<A> {
+impl<A: AllocatorClone> Slots<A> {
     /// A table of `slots` stubs, whose area numbers at most `most_bodies` bodies, in `alloc`.
     pub fn new(slots: u32, most_bodies: u32, alloc: A) -> Result<Slots<A>, Error> {
         if slots == 0 {
@@ -249,37 +245,36 @@ impl<A: Allocator + Clone> Slots<A> {
         Some(Found {
             slot: placed.slot,
             tier: placed.tier,
+            hooks: placed.hooks,
             code: placed.code,
             bound: placed.life == Life::Bound,
             freed: placed.life == Life::Freed,
         })
     }
 
-    /// Makes `code` what `slot` runs, at `tier`: a new body placed, then the word stored; the
-    /// body it replaces, if any, retired under the epoch published last. A stub takes either
-    /// tier, fast code only optimized code, optimized code nothing.
+    /// Makes `code` what `slot` runs, at `tier` with `hooks`: a new body placed, then the word
+    /// stored; the body it replaces, if any, retired under the epoch it publishes. Any version
+    /// may replace any other (a first call, a promotion, a hook turned on or off), each meaning
+    /// what the function means; the code the word names already is refused.
     pub fn publish(
         &mut self,
         slot: SlotId,
         tier: Tier,
+        hooks: Hooks,
         code: CodeRef,
         out: &mut Vec<Write, A>,
     ) -> Result<Body, Error> {
         let old = self.word(slot)?.names();
-        match (old, tier) {
-            (Names::Stub, _) | (Names::Code { tier: Tier::Fast, .. }, Tier::Optimized) => {}
-            (Names::Code { tier: Tier::Fast, .. }, Tier::Fast) => {
-                return Err(Error::FastTwice { slot });
-            }
-            (Names::Code { tier: Tier::Optimized, .. }, tier) => {
-                return Err(Error::AlreadyOptimized { slot, tier });
-            }
+        if let Names::Code { body, .. } = old
+            && self.bodies[body.0 as usize].code == code
+        {
+            return Err(Error::Same { slot, code });
         }
         if self.bodies.len() as u64 >= u64::from(self.most_bodies) {
             return Err(Error::Full { most: self.most_bodies });
         }
         let body = Body(self.bodies.len() as u32);
-        self.bodies.push(Placed { slot, tier, code, life: Life::Bound });
+        self.bodies.push(Placed { slot, tier, hooks, code, life: Life::Bound });
         let word = Word::of(body, tier);
         self.words[slot.index()] = word;
         match self.plant {

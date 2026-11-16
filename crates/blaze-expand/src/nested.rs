@@ -6,7 +6,9 @@
 //! resolution, and their items' extents a parse, so the caller's parse of the expansion (the
 //! same one a file's items come from) finds them.
 
-use std::alloc::Allocator;
+use core::alloc::Allocator;
+
+use alloc::vec::Vec;
 
 use crate::{
     error::StreamError,

@@ -398,7 +398,7 @@ fn parent() -> io::Result<&'static Path> {
 /// The file whose memory pressure an [`crate::Effect::Pressure`] arms its PSI trigger on: the
 /// process's own cgroup's `memory.pressure` where the memory controller is delegated to it, so
 /// the pressure counted is the daemon's and its builds' (in cgroups below it), else the whole
-/// system's, `/proc/pressure/memory` (docs/memory-budget.md section 7, "Pressure"). Read
+/// system's, `/proc/pressure/memory`. Read
 /// without readying the cgroup: watching pressure moves no process.
 pub(crate) fn pressure_file() -> PathBuf {
     // alloc: the paths, once per watch of memory pressure (one per daemon).

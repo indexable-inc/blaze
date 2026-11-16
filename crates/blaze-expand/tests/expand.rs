@@ -7,12 +7,12 @@
 use std::alloc::{Allocator, Global};
 
 use blaze_expand::{
-    Call, CallKind, CallShape, CallSite, Ctx, DefAt, DefSite, Diagnostic, Eager, Edition,
-    ExpandCx, ExpandError, Expanded, Expansion, Export, HoleOf, HostAsk, HostError, HostWhy,
-    IncludeAs, Included, Inside, LitKind, LocalInner, MacroDef, MarkOf, NestedKind, Origin, Place,
-    PlaceOf, ProcCall, ProcKind, Produced, Raw, ReadAnswer, ReadKind, Reads, TokenKind,
-    TokenStream, BuiltinDerive, BuiltinFn, Delim, Hole, call_key, expand, expansion_key,
-    find_calls, lex,
+    BuiltinDerive, BuiltinFn, Call, CallKind, CallShape, CallSite, Ctx, DefAt, DefSite, Delim,
+    Diagnostic, Eager, Edition, ExpandCx, ExpandError, Expanded, Expansion, Export, Hole, HoleOf,
+    HostAsk, HostError, HostWhy, IncludeAs, Included, Inside, LitKind, LocalInner, MacroDef,
+    MarkOf, NestedKind, Origin, Place, PlaceOf, ProcCall, ProcKind, Produced, Raw, ReadAnswer,
+    ReadKind, Reads, Spacing, TokenKind, TokenStream, call_key, expand, expansion_key, find_calls,
+    lex,
 };
 use blaze_id::{ContentId, CrateItemKey};
 use blaze_sim::{Broke, Config, Tape};
@@ -24,26 +24,11 @@ struct TestCx {
     files: &'static [(&'static str, &'static [u8])],
     cfgs: &'static [&'static str],
     line: u32,
-    db: &'static base_db::Db,
-}
-
-/// The database mbe and the derive writers are handed and never read: one per test thread.
-fn db() -> &'static base_db::Db {
-    thread_local! {
-        static DB: &'static base_db::Db = Box::leak(Box::new(base_db::Db::for_tests(|_| {})));
-    }
-    DB.with(|it| *it)
 }
 
 impl TestCx {
     fn new() -> TestCx {
-        TestCx {
-            env: &[("V", "v")],
-            files: &[("a.txt", b"hi")],
-            cfgs: &["unix"],
-            line: 12,
-            db: db(),
-        }
+        TestCx { env: &[("V", "v")], files: &[("a.txt", b"hi")], cfgs: &["unix"], line: 12 }
     }
 }
 
@@ -93,10 +78,6 @@ impl ExpandCx for TestCx {
         reads.push(ReadKind::ProcMacro, name, ReadAnswer::Bool(true)).map_err(|_| FAILED)?;
         Ok(Produced { tokens, origins, reads })
     }
-
-    fn host_db(&self) -> &base_db::Db {
-        self.db
-    }
 }
 
 fn at(krate: u8) -> DefAt {
@@ -110,7 +91,11 @@ fn at(krate: u8) -> DefAt {
 }
 
 fn site() -> CallSite {
-    CallSite { edition: Edition::E2021, panic_edition: Edition::E2021, ctx: Ctx::root(Edition::E2021) }
+    CallSite {
+        edition: Edition::E2021,
+        panic_edition: Edition::E2021,
+        ctx: Ctx::root(Edition::E2021),
+    }
 }
 
 fn tokens(text: &str) -> TokenStream<Global> {
@@ -128,7 +113,9 @@ fn builtin(which: BuiltinFn) -> MacroDef<Global> {
 fn done(expanded: Result<Expanded<Global>, ExpandError>) -> Expansion<Global> {
     match expanded.expect("the call expands") {
         Expanded::Expansion(expansion) => expansion,
-        Expanded::NeedsExpanded(nested) => panic!("the call needs {} nested calls first", nested.len()),
+        Expanded::NeedsExpanded(nested) => {
+            panic!("the call needs {} nested calls first", nested.len())
+        }
     }
 }
 
@@ -138,10 +125,14 @@ fn call_fn(def: &MacroDef<Global>, args: &str, cx: &TestCx) -> Expansion<Global>
     done(expand(def, &Call::fn_like(&input, site()), cx, Global))
 }
 
-/// The tokens as text, one space between each; invisible groups not shown.
+/// The tokens as text, one space between each but between a joint punct and the punct it is
+/// joined to (`::` is one operator, `: :` two tokens); invisible groups not shown.
 fn show<A: Allocator>(stream: &TokenStream<A>) -> String {
     let mut out = String::new();
+    let mut joined = false;
     for token in stream.tokens() {
+        let glued = joined && matches!(token.kind, TokenKind::Punct { .. });
+        joined = matches!(token.kind, TokenKind::Punct { spacing: Spacing::Joint, .. });
         let text = stream.text_of(token);
         let piece = match token.kind {
             TokenKind::Ident { raw: Raw::Yes, .. } => format!("r#{text}"),
@@ -159,7 +150,7 @@ fn show<A: Allocator>(stream: &TokenStream<A>) -> String {
             TokenKind::Close(Delim::Bracket) => "]".to_owned(),
             TokenKind::Open(Delim::Invisible) | TokenKind::Close(Delim::Invisible) => continue,
         };
-        if !out.is_empty() {
+        if !out.is_empty() && !glued {
             out.push(' ');
         }
         out.push_str(&piece);
@@ -171,7 +162,9 @@ fn show<A: Allocator>(stream: &TokenStream<A>) -> String {
 fn an_expr_fragment_is_transcribed() {
     let cx = TestCx::new();
     let exp = call_fn(&rules("($e:expr) => { $e * 2 }", 1), "1 + 2", &cx);
-    assert_eq!(show(&exp.tokens), "1 + 2 * 2");
+    // A multi-token `expr` fragment is one operand where it is put, as rustc's: mbe writes it
+    // parenthesised (inside its invisible group), so `$e * 2` of `1 + 2` is 6, not 5.
+    assert_eq!(show(&exp.tokens), "( 1 + 2 ) * 2");
     assert_eq!(exp.arm, Some(0));
     assert!(exp.diagnostics.is_empty());
 }
@@ -237,7 +230,9 @@ fn the_same_call_at_two_offsets_expands_equal() {
         let one = expand_in_source(&def, &format!("{first}m!({args})"), &cx);
         let two = expand_in_source(&def, &format!("{second}m!({args})"), &cx);
         if one.0 != two.0 || one.1[..] != two.1[..] {
-            return Err(Broke::Oracle(format!("`{args}` expands unequal after `{first:?}` and `{second:?}`")));
+            return Err(Broke::Oracle(format!(
+                "`{args}` expands unequal after `{first:?}` and `{second:?}`"
+            )));
         }
         if one.2 != two.2 {
             return Err(Broke::Oracle(format!("`{args}` has two keys")));
@@ -351,7 +346,10 @@ fn include_str_records_its_late_read() {
     let read = exp.reads.list()[0];
     assert_eq!(read.kind, ReadKind::IncludeStr);
     assert_eq!(exp.reads.subject(&read), "a.txt");
-    assert_eq!(read.answer, ReadAnswer::Digest(ContentId::of("blaze v2 expand included file 1", b"hi")));
+    assert_eq!(
+        read.answer,
+        ReadAnswer::Digest(ContentId::of("blaze v2 expand included file 1", b"hi"))
+    );
 }
 
 #[test]
@@ -414,10 +412,66 @@ fn debug_and_clone_derive_their_impls() {
 }
 
 #[test]
+fn partial_eq_bounds_parameters_predicates_and_assoc_types() {
+    let item = "enum E<'a, T: Copy, const N: usize> where T: Sized \
+                { A(&'a T, [u8; N]), B { x: T::Out }, C }";
+    let exp = derive(BuiltinDerive::PartialEq, item);
+    assert!(exp.diagnostics.is_empty(), "{:?}", exp.diagnostics);
+    let text = show(&exp.tokens);
+    let header = "impl < ' a , T : $crate :: cmp :: PartialEq , const N : usize , > \
+                  $crate :: cmp :: PartialEq for E < ' a , T , N , > \
+                  where T : Sized , T : Copy , T :: Out : $crate :: cmp :: PartialEq , {";
+    assert!(text.contains(header), "{text}");
+    assert!(text.contains("$crate :: marker :: StructuralPartialEq for E"), "{text}");
+    assert!(text.contains("__self_discr == __arg1_discr && match ( self , other ) {"), "{text}");
+    assert!(text.contains("E :: B { x : x_self , }"), "{text}");
+    assert!(text.contains("_unused => true }"), "{text}");
+    // `T::Out` is the item's tokens, not made ones.
+    let out = exp.tokens.tokens().iter().position(|it| exp.tokens.text_of(it) == "Out");
+    assert!(matches!(out.map(|at| exp.origins[at]), Some(Origin::Input(_))));
+}
+
+#[test]
+fn default_takes_the_marked_variant_and_refuses_without_one() {
+    let exp = derive(BuiltinDerive::Default, "enum E { A, #[default] B }");
+    assert!(
+        show(&exp.tokens).contains("fn default ( ) -> Self { E :: B } }"),
+        "{}",
+        show(&exp.tokens)
+    );
+    let refused = derive(BuiltinDerive::Default, "enum E { A }");
+    assert!(
+        matches!(refused.diagnostics[..], [Diagnostic::Derive { .. }]),
+        "{:?}",
+        refused.diagnostics
+    );
+    assert!(refused.tokens.is_empty());
+}
+
+#[test]
+fn a_packed_struct_copies_its_fields_out() {
+    let exp = derive(BuiltinDerive::Clone, "#[repr(packed)] struct P<T> { a: T, b: u8 }");
+    let text = show(&exp.tokens);
+    assert!(text.contains("where T : $crate :: marker :: Copy ,"), "{text}");
+    assert!(text.contains("let a_self = { self . a } ;"), "{text}");
+    assert!(text.contains("$crate :: clone :: Clone :: clone ( & a_self )"), "{text}");
+}
+
+#[test]
+fn concat_reads_escapes() {
+    let cx = TestCx::new();
+    let exp = call_fn(&builtin(BuiltinFn::Concat), "\"a\\u{4_1}\\x42\\n\", '\\''", &cx);
+    assert_eq!(show(&exp.tokens), "\"aAB\\n'\"");
+    let bad = call_fn(&builtin(BuiltinFn::Concat), "\"\\x80\"", &cx);
+    assert!(!bad.diagnostics.is_empty());
+}
+
+#[test]
 fn an_attribute_call_takes_its_args_and_item() {
     let cx = TestCx::new();
     let krate = CrateItemKey(ContentId([9; 32]));
-    let def = MacroDef::proc_macro(krate, ProcKind::Attr, "echo", &[], at(9), Global).expect("names fit");
+    let def =
+        MacroDef::proc_macro(krate, ProcKind::Attr, "echo", &[], at(9), Global).expect("names fit");
     let args = tokens("x");
     let item = tokens("fn f() {}");
     let call = Call {
@@ -427,7 +481,12 @@ fn an_attribute_call_takes_its_args_and_item() {
     };
     let exp = done(expand(&def, &call, &cx, Global));
     assert_eq!(show(&exp.tokens), "fn f ( ) { }");
-    assert!(exp.origins.iter().enumerate().all(|(at, it)| u32::try_from(at).map(Origin::Input) == Ok(*it)));
+    assert!(
+        exp.origins
+            .iter()
+            .enumerate()
+            .all(|(at, it)| u32::try_from(at).map(Origin::Input) == Ok(*it))
+    );
     assert_eq!(exp.reads.list()[0].kind, ReadKind::ProcMacro);
 
     let wrong = expand(&def, &Call::fn_like(&args, site()), &cx, Global);
@@ -477,7 +536,7 @@ fn keys_follow_expansions(tape: &Tape, key_of: KeyOf) -> Result<(), Broke> {
     let input = tokens("\"V\"");
     let call = Call::fn_like(&input, site());
     let run = |env: &'static [(&'static str, &'static str)]| {
-        let cx = TestCx { env, files: &[], cfgs: &[], line: 1, db: db() };
+        let cx = TestCx { env, files: &[], cfgs: &[], line: 1 };
         let exp = done(expand(&def, &call, &cx, Global));
         let mut bytes = Vec::new_in(Global);
         exp.encode(&mut bytes);

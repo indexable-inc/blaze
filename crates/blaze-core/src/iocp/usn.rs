@@ -1,5 +1,4 @@
-//! The NTFS change journal behind [`crate::Effect::Journal`] on Windows
-//! (docs/v2/plan/design/restore.md, docs/v2/plan/design/restore.md).
+//! The NTFS change journal behind [`crate::Effect::Journal`] on Windows.
 //!
 //! The watched directory's volume is opened for traversal only, which any user may, and read
 //! with `FSCTL_READ_UNPRIVILEGED_USN_JOURNAL` (Windows 10 1709 on), overlapped on the port: from

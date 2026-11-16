@@ -5,13 +5,11 @@
 //!  - Building the type for an item: This happens through the `ty` query.
 //!
 //! This usually involves resolving names, collecting generic arguments etc.
-pub(crate) mod batch;
 pub(crate) mod diagnostics;
 mod error_union;
 pub(crate) mod implied;
 pub(crate) mod path;
 pub(crate) mod record;
-pub mod persist;
 
 use std::{alloc::Allocator, iter, mem, ops::ControlFlow};
 
@@ -2794,53 +2792,13 @@ pub(crate) fn impl_trait_query<'db>(
     impl_trait_with_diagnostics(db, impl_id).map(|it| it.value.get(DbInterner::new_no_crate(db)))
 }
 
-/// The trait an impl implements, `None` for an inherent impl. A dependency crate's module-level
-/// impls are read from its batch (`lower::batch::batched_crate`).
+/// The trait an impl implements, `None` for an inherent impl: a query of the impl, in every
+/// crate.
 pub(crate) fn impl_trait_with_diagnostics<'db>(
     db: &'db Db,
     impl_id: ImplId,
 ) -> Option<Lowered<'db, StoredEarlyBinder<StoredTraitRef>>> {
-    let row = match batch::batched_crate(db, impl_id.module(db)) {
-        Some(_) => batched_impl_trait(db, impl_id),
-        None => impl_trait_of_impl(db, impl_id),
-    };
-    row.as_ref().map(TyLoweringResult::as_lowered)
-}
-
-/// A dependency's module-level impl's trait, its row of its crate's batch copied out: a query
-/// of the impl, so a reader reads the impl and not the batch, as `batched_field_types` is for a
-/// variant. A body's step that read `crate_impl_traits` itself named all of the crate's impls
-/// (a read of the batch names no row of it), the crate's whole-crate fact, which no record can
-/// hold; a read of this is a fact boundary, the impl's `Signature` fact
-/// (`blaze_item_hash::reads::BOUNDARIES`), which moves when the impl's trait reference can and
-/// not when another impl of the crate is added or edited.
-#[blaze_memo::tracked(returns(ref), owns, mem_tag = Infer)]
-pub fn batched_impl_trait<'db>(
-    db: &'db Db,
-    impl_id: ImplId,
-) -> Option<TyLoweringResult<'db, StoredEarlyBinder<StoredTraitRef>>> {
-    let krate = batched_impl_crate(db, impl_id);
-    let row = batch::CrateImplTraits::of(db, krate).get(impl_id).unwrap_or_else(|| {
-        panic!("{impl_id:?} is a module-level impl of {krate:?} but not in its batch")
-    });
-    row.map(copied_row)
-}
-
-/// The crate whose batch holds `impl_id`'s signature rows; a panic naming the impl when it has
-/// none, as only a batched impl's read-through query asks.
-fn batched_impl_crate(db: &Db, impl_id: ImplId) -> Crate {
-    batch::batched_crate(db, impl_id.module(db)).unwrap_or_else(|| {
-        panic!("{impl_id:?} is no module-level impl of a dependency crate, so in no batch")
-    })
-}
-
-/// A row of a batch as a query of its own item's result: its value and what lowering it found.
-fn copied_row<'db, T: Clone>(row: Lowered<'db, T>) -> TyLoweringResult<'db, T> {
-    TyLoweringResult::new(
-        row.value.clone(),
-        row.diagnostics().iter().cloned(),
-        row.defined_anon_consts().iter().copied(),
-    )
+    impl_trait_of_impl(db, impl_id).as_ref().map(TyLoweringResult::as_lowered)
 }
 
 #[blaze_memo::tracked(returns(ref), cycle_result = impl_trait_with_diagnostics_cycle_result, owns, mem_tag = Infer)]
@@ -3223,31 +3181,12 @@ pub(crate) fn impl_self_ty_query<'db>(db: &'db Db, impl_id: ImplId) -> EarlyBind
     impl_self_ty_with_diagnostics(db, impl_id).value.get()
 }
 
-/// The self type of an impl. A dependency crate's module-level impls are read from its batch
-/// (`lower::batch::batched_crate`).
+/// The self type of an impl: a query of the impl, in every crate.
 pub(crate) fn impl_self_ty_with_diagnostics<'db>(
     db: &'db Db,
     impl_id: ImplId,
 ) -> Lowered<'db, StoredEarlyBinder<StoredTy>> {
-    match batch::batched_crate(db, impl_id.module(db)) {
-        Some(_) => batched_impl_self_ty(db, impl_id).as_lowered(),
-        None => impl_self_ty_of_impl(db, impl_id).as_lowered(),
-    }
-}
-
-/// A dependency's module-level impl's self type, its row of its crate's batch copied out, as
-/// [`batched_impl_trait`] is its trait: a reader reads the impl's `Signature` fact, never all
-/// of the crate's impls.
-#[blaze_memo::tracked(returns(ref), owns, mem_tag = Infer)]
-pub fn batched_impl_self_ty<'db>(
-    db: &'db Db,
-    impl_id: ImplId,
-) -> TyLoweringResult<'db, StoredEarlyBinder<StoredTy>> {
-    let krate = batched_impl_crate(db, impl_id);
-    let row = batch::CrateImplSelfTys::of(db, krate).get(impl_id).unwrap_or_else(|| {
-        panic!("{impl_id:?} is a module-level impl of {krate:?} but not in its batch")
-    });
-    copied_row(row)
+    impl_self_ty_of_impl(db, impl_id).as_lowered()
 }
 
 #[blaze_memo::tracked(returns(ref), cycle_result = impl_self_ty_with_diagnostics_cycle_result, owns, mem_tag = Infer)]
@@ -3477,17 +3416,13 @@ impl FieldType {
     }
 }
 
-/// The types of the fields of a struct, union or enum variant. A dependency crate's module-level
-/// variants are read from its batch, every other variant from a query of its own
-/// (`lower::batch::batched_crate` says which and why).
+/// The types of the fields of a struct, union or enum variant: a query of the variant, in every
+/// crate.
 pub(crate) fn field_types_with_diagnostics<'db>(
     db: &'db Db,
     variant_id: VariantId,
 ) -> Lowered<'db, FieldTypes> {
-    let result = match batch::batched_crate(db, variant_id.module(db)) {
-        Some(_) => batched_field_types(db, variant_id),
-        None => field_types_of_variant(db, variant_id),
-    };
+    let result = field_types_of_variant(db, variant_id);
     Lowered::new(
         FieldTypes::from_slice(&result.value),
         result.diagnostics(),
@@ -3498,37 +3433,7 @@ pub(crate) fn field_types_with_diagnostics<'db>(
 /// The kind names of the field-type queries, for a test database that marks them fact
 /// boundaries (`blaze_memo::Builder::mark_boundary`): named here, where they are in scope.
 #[cfg(test)]
-pub(crate) const FIELD_TYPES_KINDS: &[&str] = &[
-    field_types_of_variant::KIND_NAME,
-    batched_field_types::KIND_NAME,
-    batch::crate_field_types::KIND_NAME,
-];
-
-/// A dependency's module-level variant's field types, its row of its crate's batch
-/// (`lower::batch`) copied out: a query of the variant, so a reader reads the variant and not
-/// the batch. A body's step that read the batch itself was kept by the item store under the
-/// whole crate (a read of the batch names no row of it), so a private body's edit of the
-/// dependency reran every dependent body that named one of its types; a read of this is a fact
-/// boundary, the `Signature` fact of the variant's ADT (`blaze_items::goals::fact_of_read`), so
-/// a body's read list names the ADT and not the crate's batch. Its key names the variant's
-/// crate, the arena it is homed at, which is the batch's.
-#[blaze_memo::tracked(returns(ref), owns, mem_tag = Infer)]
-pub fn batched_field_types<'db>(
-    db: &'db Db,
-    variant_id: VariantId,
-) -> TyLoweringResult<'db, ThinVec<FieldType>> {
-    let krate = batch::batched_crate(db, variant_id.module(db)).unwrap_or_else(|| {
-        panic!("{variant_id:?} is no module-level variant of a dependency crate, so in no batch")
-    });
-    let row = batch::CrateFieldTypes::of(db, krate).get(variant_id).unwrap_or_else(|| {
-        panic!("{variant_id:?} is a module-level variant of {krate:?} but not in its batch")
-    });
-    TyLoweringResult::new(
-        exact_thin(row.value.values().cloned()),
-        row.diagnostics().iter().cloned(),
-        row.defined_anon_consts().iter().copied(),
-    )
-}
+pub(crate) const FIELD_TYPES_KINDS: &[&str] = &[field_types_of_variant::KIND_NAME];
 
 #[blaze_memo::tracked(returns(ref), owns, mem_tag = Infer)]
 pub fn field_types_of_variant<'db>(
@@ -4455,35 +4360,13 @@ const _: () = assert!(size_of::<GenericPredicates>() <= 24);
 impl GenericPredicates {
     /// Resolve the where clause(s) of an item with generics.
     ///
-    /// Diagnostics are computed only for this item's predicates, not for parents. The impls of a
-    /// dependency crate's modules are read from its batch (`lower::batch::batched_crate`), each
-    /// through its own row's query ([`batched_impl_predicates`]).
+    /// Diagnostics are computed only for this item's predicates, not for parents.
     pub fn query_with_diagnostics<'db>(
         db: &'db Db,
         def: GenericDefId,
     ) -> Lowered<'db, GenericPredicates> {
-        if let GenericDefId::ImplId(impl_id) = def
-            && batch::batched_crate(db, impl_id.module(db)).is_some()
-        {
-            return batched_impl_predicates(db, impl_id).as_lowered();
-        }
         generic_predicates_of(db, def).as_lowered()
     }
-}
-
-/// A dependency's module-level impl's where clauses, its row of its crate's batch copied out,
-/// as [`batched_impl_trait`] is its trait: a reader reads the impl's `Signature` fact, never
-/// all of the crate's impls.
-#[blaze_memo::tracked(returns(ref), owns, mem_tag = Infer)]
-pub fn batched_impl_predicates<'db>(
-    db: &'db Db,
-    impl_id: ImplId,
-) -> TyLoweringResult<'db, GenericPredicates> {
-    let krate = batched_impl_crate(db, impl_id);
-    let row = batch::CrateImplPredicates::of(db, krate).get(impl_id).unwrap_or_else(|| {
-        panic!("{impl_id:?} is a module-level impl of {krate:?} but not in its batch")
-    });
-    copied_row(row)
 }
 
 #[blaze_memo::tracked(returns(ref), cycle_result = generic_predicates_cycle_result, owns, mem_tag = Infer)]

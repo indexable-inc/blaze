@@ -2,7 +2,7 @@
 
 Datalog over tree-sitter syntax trees. Query matches become relations, rules join them by tree position, by value or recursively, and derived rows become lint findings or rewrite edits. "An `unwrap()` inside a function returning `Result`" is one rule here. In ast-grep or Semgrep it is a join those tools cannot express.
 
-`astlog-engine` (`engine/`) is the language and its evaluator, generic over a fact source. `astlog-core` (`core/`) is the tree-sitter source: the `match` atom, the corpus, edits. blaze's own front end, Rust patterns matched by name resolution and types, is `crates/blaze-astlog` over the same engine (`docs/v2/plan/design/astlog-sema.md`); the daemon links the engine and never tree-sitter. blaze's rules live in `rules/`, with a good/bad fixture pair per rule under `rules/tests/`, and `scan.py` runs them over the tree (see [Rules in blaze](#rules-in-blaze)). Copied from ix; `UPSTREAM` names the commit.
+`astlog-engine` (`engine/`) is the language and its evaluator, generic over a fact source. `astlog-core` (`core/`) is the tree-sitter source: the `match` atom, the corpus, edits. blaze's rules live in `rules/`, with a good/bad fixture pair per rule under `rules/tests/`, and `scan.py` runs them over the tree (see [Rules in blaze](#rules-in-blaze)). Copied from ix; `UPSTREAM` names the commit.
 
 ## The language
 

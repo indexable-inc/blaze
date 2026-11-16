@@ -1,10 +1,10 @@
-//! A database for the tests: the build's database, as `Db::for_tests()` makes it. Linking
-//! `hir` links hir-ty-mir's MIR table.
+//! A database for the tests: the build's database, as `Db::for_tests()` makes it. It links
+//! hir-ty-mir's MIR table.
 
 use std::{alloc::Global, sync::Arc};
 
 use blaze_memo::testing::Ran;
-use hir as _;
+use hir_ty_mir as _;
 
 pub(crate) type TestDB = base_db::Db;
 

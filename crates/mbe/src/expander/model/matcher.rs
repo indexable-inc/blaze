@@ -61,7 +61,6 @@
 
 use std::{rc::Rc, sync::Arc};
 
-use base_db::Db;
 use intern::sym;
 use smallvec::{SmallVec, smallvec};
 use tt::{
@@ -114,12 +113,8 @@ impl Match<'_> {
 }
 
 /// Matching errors are added to the `Match`.
-pub(super) fn match_<'t>(
-    db: &Db,
-    pattern: &'t MetaTemplate,
-    input: &'t tt::TopSubtree,
-) -> Match<'t> {
-    let mut res = match_loop(db, pattern, input);
+pub(super) fn match_<'t>(pattern: &'t MetaTemplate, input: &'t tt::TopSubtree) -> Match<'t> {
+    let mut res = match_loop(pattern, input);
     res.bound_count = count(res.bindings.bindings());
     return res;
 
@@ -368,7 +363,6 @@ struct MatchState<'t> {
 /// - `error_items`: the set of items in errors, used for error-resilient parsing
 #[inline]
 fn match_loop_inner<'t>(
-    db: &Db,
     src: &TtIter<'t>,
     stack: &[TtIter<'t>],
     res: &mut Match<'t>,
@@ -490,7 +484,7 @@ fn match_loop_inner<'t>(
             OpDelimited::Op(Op::Var { kind, name, .. }) => {
                 if let &Some(kind) = kind {
                     let mut fork = src.clone();
-                    let match_res = match_meta_var(db, kind, &mut fork, delim_span);
+                    let match_res = match_meta_var(kind, &mut fork, delim_span);
                     match match_res.err {
                         None => {
                             // Some meta variables are optional (e.g. vis)
@@ -629,7 +623,7 @@ fn match_loop_inner<'t>(
     }
 }
 
-fn match_loop<'t>(db: &Db, pattern: &'t MetaTemplate, src: &'t tt::TopSubtree) -> Match<'t> {
+fn match_loop<'t>(pattern: &'t MetaTemplate, src: &'t tt::TopSubtree) -> Match<'t> {
     let span = src.top_subtree().delimiter.delim_span();
     let mut src = src.iter();
     let mut stack: SmallVec<[TtIter<'_>; 1]> = SmallVec::new();
@@ -660,7 +654,6 @@ fn match_loop<'t>(db: &Db, pattern: &'t MetaTemplate, src: &'t tt::TopSubtree) -
         stdx::always!(next_items.is_empty());
 
         match_loop_inner(
-            db,
             &src,
             &stack,
             &mut res,
@@ -777,18 +770,17 @@ fn match_loop<'t>(db: &Db, pattern: &'t MetaTemplate, src: &'t tt::TopSubtree) -
 }
 
 fn match_meta_var<'t>(
-    db: &Db,
     kind: MetaVarKind,
     input: &mut TtIter<'t>,
     delim_span: DelimSpan,
 ) -> ExpandResult<Fragment<'t>> {
     let fragment = match kind {
         MetaVarKind::Path => {
-            return expect_fragment(db, input, parser::PrefixEntryPoint::Path, delim_span)
+            return expect_fragment(input, parser::PrefixEntryPoint::Path, delim_span)
                 .map(Fragment::Path);
         }
         MetaVarKind::Ty => {
-            return expect_fragment(db, input, parser::PrefixEntryPoint::Ty, delim_span)
+            return expect_fragment(input, parser::PrefixEntryPoint::Ty, delim_span)
                 .map(Fragment::Ty);
         }
         MetaVarKind::Expr(expr) => {
@@ -816,7 +808,7 @@ fn match_meta_var<'t>(
                 }
                 _ => {}
             };
-            return expect_fragment(db, input, parser::PrefixEntryPoint::Expr, delim_span)
+            return expect_fragment(input, parser::PrefixEntryPoint::Expr, delim_span)
                 .map(Fragment::Expr);
         }
         MetaVarKind::Ident | MetaVarKind::Tt | MetaVarKind::Lifetime | MetaVarKind::Literal => {
@@ -876,8 +868,7 @@ fn match_meta_var<'t>(
         MetaVarKind::Vis => (parser::PrefixEntryPoint::Vis, TokensOrigin::Ast),
     };
     let (entry_point, origin) = fragment;
-    expect_fragment(db, input, entry_point, delim_span)
-        .map(|tree| Fragment::Tokens { tree, origin })
+    expect_fragment(input, entry_point, delim_span).map(|tree| Fragment::Tokens { tree, origin })
 }
 
 /// Whether `tree` is what an earlier expansion put in for one of its metavariables.

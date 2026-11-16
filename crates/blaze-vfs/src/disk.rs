@@ -1,4 +1,4 @@
-//! What a watcher last saw of the disk (docs/v2/plan/design/restore.md): per head, the watched
+//! What a watcher last saw of the disk: per head, the watched
 //! directory, the cursor into the system's journal of changes, and each path's [`Stamp`] (its
 //! inode, size, mtime and ctime) when the head took what was there. Saved with the tree in the
 //! daemon's image, so a restart asks the journal for what changed since the cursor and reads only

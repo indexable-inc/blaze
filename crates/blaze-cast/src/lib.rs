@@ -1,4 +1,4 @@
-//! blaze's named casts: the target of `blaze::as_cast`'s fix (docs/lints.md#as_cast) for each
+//! blaze's named casts: the target of `blaze::as_cast`'s fix for each
 //! `as` between numbers that std has no named operation for. Each is a `const fn`, inlined
 //! always, whose name says what it does to a value, `<to>_<how>_from_<from>`:
 //!

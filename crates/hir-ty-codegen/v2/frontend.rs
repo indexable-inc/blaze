@@ -785,7 +785,7 @@ impl<'db> HirFrontend<'db> {
     }
 
     /// The describe of `instance` for `requester`, run now by the task that asks, as a value
-    /// read once (docs/v2/plan/design/end-state/memory.md): no row of the database holds it.
+    /// read once: no row of the database holds it.
     /// What it reads hits the session memo wherever the arena holding it was carried.
     fn described_now(
         &self,
@@ -1252,7 +1252,7 @@ impl Frontend for HirFrontend<'_> {
     }
 
     // No `changed_since`, `view` or `durable_view` (the trait's defaults, `None`): the session
-    // memo names no changed set (docs/v2/plan/design/front-end-on-memo.md, rule 1), so the walk
+    // memo names no changed set, so the walk
     // is never patched and asks every function and static again each build, each describe's
     // reads hitting the memo where their arenas were carried.
 

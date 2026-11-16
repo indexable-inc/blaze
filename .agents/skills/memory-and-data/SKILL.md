@@ -203,11 +203,11 @@ crate version, a sorted index, payloads mapped).
 - Kept: blaze-mem's frames (`frame.rs`); blaze-format (`Persist`, records read in place); `for
   const` and `for<F: Field<T>>` bounds (blaze_comptime phase 2); const heap (`const_allocate`,
   `const_make_global`) in the const evaluator; tags for reporting only.
-- Exists today and is deleted by the target design (accepted audit, 2026-11-13): mimalloc with a
-  heap per tag (`crates/blaze-engine/src/heaps.rs`) and the C malloc override
-  (`crates/blaze-engine/src/malloc.rs`); blaze-mem's gate and budget; admission, its giveback
-  and the machine ledger in blaze-graph; wound-wait; the store's buffer pool, collector and
-  tenants in blaze-cas, and blaze-gc; the daemon image. Do not extend any of these (`one-memory-measure`).
+- Deleted with the daemon and blaze-engine (2026-11-15): mimalloc with a heap per tag, the C
+  malloc override and the daemon image; blaze-mem's gate and budget, the machine ledger and
+  wound-wait before it. Still to delete (accepted audit, 2026-11-13): blaze-graph's `admission`;
+  the store's buffer pool, collector and tenants in blaze-cas, and blaze-gc. Do not extend any of
+  these (`one-memory-measure`).
 - Planned: frame markers per item in long tasks; the generic `Persist` over `for const`; the
   store in the target's form (small records by pread, plain arrays mapped, pruning at start by
   roots under a byte cap); per-instance code records; `fn_info(&f).code_id` answered by const

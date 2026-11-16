@@ -1,5 +1,5 @@
 //! A file's index: for every item written in it, what the item is made of, as three hashes
-//! (AGENTS.md rule 65; docs/v2/plan/design/restore.md, "Items read in place").
+//! (AGENTS.md rule 65).
 //!
 //! One entry a file, under the file's content and how it is read (its edition and syntax
 //! extensions; [`super::file_set`]): never under a crate. A file whose content the store has
