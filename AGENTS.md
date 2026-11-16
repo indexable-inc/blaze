@@ -20,7 +20,7 @@ Mac (8 to 16 cores, 16 to 64 GB), with one code path sized by the machine.
 
 ## The design ([in full](docs/v2/plan/design/bottom.md))
 
-- Everything kept is a record: keyed from text before the work, written once, read in place.
+- Everything kept is a record: keyed from text, written once, read in place, in columns.
 - A command is a process that answers and exits; no daemon holds state between builds.
 - A record is valid by its key, or else by its read list checked against today's facts.
 - No dependency graph in memory: candidates are found forward from what changed.
@@ -29,7 +29,7 @@ Mac (8 to 16 cores, 16 to 64 GB), with one code path sized by the machine.
 - A dependency is only its records and an item only its key; text for the crate compiled alone.
 - A check happens once and leaves a proof later code takes; a coarse proof covers all under it.
 - Records are shared by content: CI fills a cache anyone can read, so std arrives precompiled.
-- Remote execution is the same driver with another executor.
+- Decide at run time: a hook, check or optimization is a version swapped into a slot.
 - A lint finding is a record too: errors before the answer, advice after, analyses in the
   background.
 
@@ -45,7 +45,7 @@ In scope:
 - The shared cache is read without a login. Only CI, and later the remote workers, write to it.
 - Private builds can always stay local: nothing leaves the machine unless an organisation opts in.
 - An old home after an upgrade is detected, reported and rebuilt; nothing is migrated.
-- Code that stays for the long term is sans-IO. New crates move to bstd once blaze builds blaze.
+- blaze's own code is on bstd and our collections: no `std`, `alloc` or third-party crate.
 - A plain Rust project adopts blaze's checks by steps: `rust`, `suggest`, `edition`, `strict`.
 
 Not now:
@@ -54,7 +54,7 @@ Not now:
 
 ## How work is done
 
-- Lanes write; the main agent compiles each piece within minutes and admits it alone (35, 36, 48).
+- Lanes write in one directory, one pull request; the main agent compiles and merges (35, 36).
 - Until `blaze run` exists again, a merge's proof is the whole build and its tests, quoted (68).
 - Every command has a timeout; a hang is a bug to report, never one to wait out (69, 18).
 - Facts come from tool output in this session (61); verdicts from real projects, run first (7, 82).
@@ -78,7 +78,7 @@ tools/agents/rules.ts, then run `bun tools/agents/rules.ts --write`.
 - **1. no-rustc**: blaze never runs rustc, rustdoc or a cargo that runs them; each place that still does is a bug.
 - **4. superset-of-rust**: Every program nightly accepts builds and runs correctly; only rustc soundness holes are refused.
 - **5. useful-not-parity**: rustc and cargo are references, not specs: design each output and interface as if from scratch.
-- **6. blaze-uses-its-extensions**: blaze's crates use them, enforced; while cargo also builds blaze, only in forms rustc ignores.
+- **6. blaze-uses-its-extensions**: Use them in blaze's crates: while rustc builds too, in forms it reads or under `cfg(blaze)`.
 - **9. sandbox-everything**: Build scripts and proc macros always run sandboxed; where no sandbox can be made, blaze stops.
 - **10. proc-macros-on-wasm**: Proc macros compile to `wasm32-wasip1` and run in Wasmtime; Cranelift never makes native code.
 - **21. keys-cover-every-input**: Two values under one key is a typed refusal, and the fix is the key, never the check.
