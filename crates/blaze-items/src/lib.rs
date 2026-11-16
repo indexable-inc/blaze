@@ -45,6 +45,7 @@ mod facts;
 pub mod field_order;
 mod form;
 pub mod goals;
+mod identity;
 pub mod hash;
 mod index;
 pub mod key;
@@ -169,9 +170,9 @@ impl ItemId {
     }
 }
 
-/// Which item: stable across edits of what it is, changed by a rename or a move.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
-pub struct ItemKey(pub ContentId);
+/// Which item: stable across edits of what it is, changed by a rename or a move. Its home is
+/// blaze-id, below every crate that names items (docs/v2/plan/design/identity.md).
+pub use blaze_id::ItemKey;
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub enum ItemKind {

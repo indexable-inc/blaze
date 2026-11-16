@@ -16,6 +16,8 @@ doctest = false
 [dependencies]
 blaze-format.workspace = true
 blaze-hash.workspace = true
+# `ItemKey`, `Portable`, and the two ways between an id and its key this crate implements.
+blaze-id.workspace = true
 blaze-ids.workspace = true
 blaze-mem.workspace = true
 blaze-memo.workspace = true
@@ -43,6 +45,7 @@ stdx.workspace = true
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 blaze-core.workspace = true
+blaze-sim.workspace = true
 hir.workspace = true
 hir-expand = { workspace = true, features = ["fixture"] }
 
