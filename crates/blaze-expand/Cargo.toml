@@ -1,0 +1,44 @@
+[package]
+name = "blaze-expand"
+description = "Macro expansion for the item layer (docs/v2/plan/design/bottom.md, `Expansion` and `MacroDef`): one pure function from a macro's definition and one call's tokens to a portable expansion record, its key, its outside reads and its errors as values"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `ContentId`, `CrateItemKey`, `ItemKey`, `Portable`: what a record names a crate, a module
+# and a definition's content by.
+blaze-id.workspace = true
+# `Hasher`: the keys and a definition's content hash.
+blaze-ids.workspace = true
+# `frame::task`: the task frame mbe and the derives write their output trees into.
+blaze-mem.workspace = true
+# `DeclarativeMacro`: the matcher and transcriber of `macro_rules!` and `macro`, driven pure.
+mbe.workspace = true
+# The token trees mbe and the derives read and write, converted to and from the portable form.
+tt.workspace = true
+span.workspace = true
+intern.workspace = true
+# `parse_to_token_tree`: text to tokens, for `lex`.
+syntax-bridge.workspace = true
+# `Db`: the parameter mbe and the derive expanders thread through and never read
+# (`ExpandCx::host_db`).
+base-db.workspace = true
+# `BuiltinDeriveExpander`: the builtin derives' token writers.
+hir-expand.workspace = true
+# `unescape_str`, `unescape_char`: rustc's reader of a literal's escapes, for the builtins.
+rustc-literal-escaper.workspace = true
+
+[dev-dependencies]
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,575 @@
+//! A crate's impl index: its impls filed in buckets, a directory of the buckets, and the
+//! crate's `NoImplsOf`, each a record of its own.
+//!
+//! - **A bucket** (`BucketRoot`, version 1) holds the impls of one [`BucketKey`]: the impls
+//!   of a trait for one self shape, a trait's blanket impls (`impl<T> Tr for T`), or the
+//!   inherent impls of one shape. Its key is written once at its head (kind, trait, shape),
+//!   then its rows (`StoredRow`: impl key, header hash, flags; 68 bytes), sorted by impl key,
+//!   so a row is found by a binary search in place. A bucket is addressed by its content id:
+//!   two crates, or two checkouts, with equal impls of a key share it.
+//! - **The directory** (`DirectoryRoot`, version 1) maps each bucket's [`BucketHash`] (16
+//!   bytes of a hash of its key) to the bucket's content id and row count, sorted by hash: a
+//!   lookup is one binary search, and a key with no bucket is a definite miss there. Two keys
+//!   of one hash are a typed refusal ([`ImplIndexError::BucketHashClash`]), so a hash names
+//!   one bucket; the bucket's own key is still compared by the reader.
+//! - **`NoImplsOf`** (`NoImplsRoot`, version 1) is two sorted columns of `u64`: a mark per
+//!   trait the crate has an impl of ([`trait_mark`]) and a mark per bucket (the first 8 bytes
+//!   of its hash). A mark absent is an exact "none": every impl puts its trait's mark and its
+//!   bucket's mark in. A mark present that is another key's (two keys' marks equal) sends the
+//!   reader to the directory, which answers exactly: the false positive is one wasted probe,
+//!   never a wrong answer. It is 8 bytes a bucket, a seventh of the directory, so the crates a
+//!   lookup cannot use are passed over on a record that stays in the page cache.
+//!
+//! [`build_impl_index`] takes the rows in any order and writes equal bytes for every order.
+//! Adding an impl changes its one bucket, the directory and, when its trait or bucket is new
+//! to the crate, `NoImplsOf`: no other bucket, and no other crate's records.
+
+use alloc::vec::Vec;
+use core::alloc::Allocator;
+use core::fmt;
+use core::mem::offset_of;
+
+use blaze_format::{FormatError, Part, Record, SchemaHash, Slice, Writer, schema_of};
+use blaze_id::{ContentId, CrateItemKey, ItemKey, Portable};
+
+use crate::graph::slice_field;
+use crate::row::{ImplFlags, ImplRow};
+use crate::shape::SelfShape;
+
+/// The most impl rows one crate's index holds.
+pub const MAX_ROWS: usize = 1 << 22;
+
+/// The domain of a bucket key's hash.
+const BUCKET_DOMAIN: &str = "blaze-impls bucket key 1";
+
+const KIND_TRAIT: u32 = 1;
+const KIND_BLANKET: u32 = 2;
+const KIND_INHERENT: u32 = 3;
+
+/// 16 bytes of the hash of a [`BucketKey`]: what the directory is sorted and searched by.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct BucketHash(pub [u8; 16]);
+
+// SAFETY: bytes of a content hash.
+unsafe impl Portable for BucketHash {}
+
+impl BucketHash {
+    /// Its first 8 bytes: the bucket's mark in `NoImplsOf`.
+    pub fn mark(self) -> u64 {
+        let [a, b, c, d, e, f, g, h, ..] = self.0;
+        u64::from_le_bytes([a, b, c, d, e, f, g, h])
+    }
+}
+
+impl fmt::Display for BucketHash {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+    }
+}
+
+/// The mark of `trait_` in `NoImplsOf`: 8 bytes of its key's hash, past the crate prefix and
+/// the inner bit, so traits of one crate do not share it.
+pub fn trait_mark(trait_: ItemKey) -> u64 {
+    let bytes = trait_.0.0;
+    u64::from_le_bytes([
+        bytes[16], bytes[17], bytes[18], bytes[19], bytes[20], bytes[21], bytes[22], bytes[23],
+    ])
+}
+
+/// What a bucket files: the key of a lookup.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub enum BucketKey {
+    /// The impls of a trait for one self shape (never a blanket's or a placeholder's).
+    Trait { trait_: ItemKey, shape: SelfShape },
+    /// A trait's blanket impls.
+    Blanket { trait_: ItemKey },
+    /// The inherent impls of one self shape.
+    Inherent { shape: SelfShape },
+}
+
+// SAFETY: keys and a shape, each `Portable`.
+unsafe impl Portable for BucketKey {}
+
+impl BucketKey {
+    /// The bucket `row` is filed in.
+    pub fn of(row: &ImplRow) -> BucketKey {
+        match row.trait_ {
+            Some(trait_) if row.shape.is_blanket() => BucketKey::Blanket { trait_ },
+            Some(trait_) => BucketKey::Trait { trait_, shape: row.shape },
+            None => BucketKey::Inherent { shape: row.shape },
+        }
+    }
+
+    /// Its kind, trait and shape as a bucket's head holds them: zeros for no trait.
+    fn parts(self) -> (u32, [u8; 32], [u8; 32]) {
+        match self {
+            BucketKey::Trait { trait_, shape } => (KIND_TRAIT, trait_.0.0, shape.to_bytes()),
+            BucketKey::Blanket { trait_ } => (KIND_BLANKET, trait_.0.0, SelfShape::BLANKET.to_bytes()),
+            BucketKey::Inherent { shape } => (KIND_INHERENT, [0; 32], shape.to_bytes()),
+        }
+    }
+
+    /// The key a bucket's head holds, refused when no key writes it.
+    fn from_parts(kind: u32, trait_: [u8; 32], shape: [u8; 32]) -> Option<BucketKey> {
+        let shape = SelfShape::from_bytes(shape).ok()?;
+        let trait_key = ItemKey(ContentId(trait_));
+        match kind {
+            KIND_TRAIT if !shape.files_no_impl() => Some(BucketKey::Trait { trait_: trait_key, shape }),
+            KIND_BLANKET if shape.is_blanket() => Some(BucketKey::Blanket { trait_: trait_key }),
+            KIND_INHERENT if trait_ == [0; 32] && !shape.files_no_impl() => {
+                Some(BucketKey::Inherent { shape })
+            }
+            _ => None,
+        }
+    }
+
+    /// The trait it files impls of, none for inherent impls.
+    pub fn trait_(self) -> Option<ItemKey> {
+        match self {
+            BucketKey::Trait { trait_, .. } | BucketKey::Blanket { trait_ } => Some(trait_),
+            BucketKey::Inherent { .. } => None,
+        }
+    }
+
+    /// The self shape of its rows.
+    pub fn shape(self) -> SelfShape {
+        match self {
+            BucketKey::Trait { shape, .. } | BucketKey::Inherent { shape } => shape,
+            BucketKey::Blanket { .. } => SelfShape::BLANKET,
+        }
+    }
+
+    /// The hash the directory finds it by: of its kind, trait and shape.
+    pub fn hash(self) -> BucketHash {
+        let (kind, trait_, shape) = self.parts();
+        let mut bytes = [0u8; 68];
+        bytes[..4].copy_from_slice(&kind.to_le_bytes());
+        bytes[4..36].copy_from_slice(&trait_);
+        bytes[36..].copy_from_slice(&shape);
+        let id = ContentId::of(BUCKET_DOMAIN, &bytes);
+        let mut hash = [0u8; 16];
+        hash.copy_from_slice(&id.0[..16]);
+        BucketHash(hash)
+    }
+}
+
+/// Why rows are not a crate's impl index.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ImplIndexError {
+    TooManyRows { krate: CrateItemKey, count: usize },
+    /// An impl whose key is not of the crate whose index is built.
+    ForeignImpl { krate: CrateItemKey, impl_: ItemKey },
+    /// One impl given twice.
+    DuplicateImpl { impl_: ItemKey },
+    /// An impl for a placeholder: a goal's shape, which no impl's self type simplifies to.
+    PlaceholderSelf { impl_: ItemKey },
+    /// `impl<T> T { .. }`: an inherent impl for a parameter (rustc's E0118).
+    InherentBlanket { impl_: ItemKey },
+    /// An inherent impl with a flag only a trait impl has (`unsafe`, `!`, `default`,
+    /// `const`, a reservation, a derive).
+    InherentFlags { impl_: ItemKey, flags: ImplFlags },
+    /// Two bucket keys with one hash: `first` and `second` are an impl of each.
+    BucketHashClash { first: ItemKey, second: ItemKey },
+}
+
+impl fmt::Display for ImplIndexError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ImplIndexError::TooManyRows { krate, count } => write!(
+                f,
+                "the crate {krate:x} has {count} impls, past the impl index's bound of {MAX_ROWS}"
+            ),
+            ImplIndexError::ForeignImpl { krate, impl_ } => {
+                write!(f, "the impl {impl_:x} is not of the crate {krate:x} whose impl index is built")
+            }
+            ImplIndexError::DuplicateImpl { impl_ } => {
+                write!(f, "the impl {impl_:x} is given to the impl index twice")
+            }
+            ImplIndexError::PlaceholderSelf { impl_ } => write!(
+                f,
+                "the impl {impl_:x} has a placeholder for its self shape, which only a goal's has"
+            ),
+            ImplIndexError::InherentBlanket { impl_ } => write!(
+                f,
+                "the inherent impl {impl_:x} is for a type parameter (E0118): no shape files it"
+            ),
+            ImplIndexError::InherentFlags { impl_, flags } => write!(
+                f,
+                "the inherent impl {impl_:x} has the flags {:#x}, which only a trait impl has",
+                flags.bits()
+            ),
+            ImplIndexError::BucketHashClash { first, second } => write!(
+                f,
+                "the impls {first:x} and {second:x} are filed under two bucket keys of one hash"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for ImplIndexError {}
+
+blaze_format::record! {
+    #[derive(Clone, Copy, Debug)]
+    struct StoredRow: 1 {
+        impl_: ContentId,
+        header: ContentId,
+        flags: u32,
+    }
+}
+
+blaze_format::record! {
+    #[derive(Clone, Copy)]
+    struct BucketRoot: 1 {
+        hash: [u8; 16],
+        trait_: ContentId,
+        shape: [u8; 32],
+        kind: u32,
+        rows: Slice<StoredRow>,
+    }
+}
+
+blaze_format::record! {
+    #[derive(Clone, Copy, Debug)]
+    struct DirEntry: 1 {
+        hash: [u8; 16],
+        bucket: ContentId,
+        rows: u32,
+        kind: u32,
+    }
+}
+
+blaze_format::record! {
+    #[derive(Clone, Copy)]
+    struct DirectoryRoot: 1 {
+        krate: ContentId,
+        entries: Slice<DirEntry>,
+    }
+}
+
+blaze_format::record! {
+    #[derive(Clone, Copy)]
+    struct NoImplsRoot: 1 {
+        krate: ContentId,
+        traits: Slice<u64>,
+        buckets: Slice<u64>,
+    }
+}
+
+/// The schema of an impl bucket's buffer.
+pub const BUCKET_SCHEMA: SchemaHash =
+    schema_of(&[Part::Str("ImplBucket"), Part::U64(1), Part::Schema(BucketRoot::SCHEMA)]);
+
+/// The schema of an impl directory's buffer.
+pub const DIRECTORY_SCHEMA: SchemaHash =
+    schema_of(&[Part::Str("ImplDirectory"), Part::U64(1), Part::Schema(DirectoryRoot::SCHEMA)]);
+
+/// The schema of a `NoImplsOf` buffer.
+pub const NO_IMPLS_SCHEMA: SchemaHash =
+    schema_of(&[Part::Str("NoImplsOf"), Part::U64(1), Part::Schema(NoImplsRoot::SCHEMA)]);
+
+/// One bucket a build wrote: its content id (what the directory names it by), its key and
+/// its buffer.
+#[derive(Clone, Debug)]
+pub struct Bucket<A: Allocator> {
+    pub id: ContentId,
+    pub hash: BucketHash,
+    pub key: BucketKey,
+    pub bytes: Vec<u8, A>,
+}
+
+/// A crate's impl index as [`build_impl_index`] writes it: three kinds of record, each a
+/// buffer of its own. The buckets are in the directory's order.
+#[derive(Clone, Debug)]
+pub struct CrateImpls<A: Allocator> {
+    pub directory: Vec<u8, A>,
+    pub no_impls_of: Vec<u8, A>,
+    pub buckets: Vec<Bucket<A>, A>,
+}
+
+/// Refuses `row` as a row of `krate`'s index.
+fn check_row(krate: CrateItemKey, row: &ImplRow) -> Result<(), ImplIndexError> {
+    let impl_ = row.impl_;
+    if !impl_.is_of(krate) {
+        return Err(ImplIndexError::ForeignImpl { krate, impl_ });
+    }
+    if row.shape == SelfShape::PLACEHOLDER {
+        return Err(ImplIndexError::PlaceholderSelf { impl_ });
+    }
+    if row.trait_.is_none() {
+        if row.shape.is_blanket() {
+            return Err(ImplIndexError::InherentBlanket { impl_ });
+        }
+        if !row.flags.is_empty() {
+            return Err(ImplIndexError::InherentFlags { impl_, flags: row.flags });
+        }
+    }
+    Ok(())
+}
+
+/// `krate`'s impl index of `rows`, in any order, its buffers in `alloc`: equal bytes for
+/// every order of the same rows.
+pub fn build_impl_index<A: Allocator + Clone>(
+    krate: CrateItemKey,
+    rows: &[ImplRow],
+    alloc: A,
+) -> Result<CrateImpls<A>, ImplIndexError> {
+    if rows.len() > MAX_ROWS {
+        return Err(ImplIndexError::TooManyRows { krate, count: rows.len() });
+    }
+    rows.iter().try_for_each(|row| check_row(krate, row))?;
+    let mut impls: Vec<ItemKey, A> = Vec::with_capacity_in(rows.len(), alloc.clone());
+    impls.extend(rows.iter().map(|row| row.impl_));
+    impls.sort_unstable();
+    if let Some(pair) = impls.windows(2).find(|pair| pair[0] == pair[1]) {
+        return Err(ImplIndexError::DuplicateImpl { impl_: pair[0] });
+    }
+    drop(impls);
+    // Every row with its bucket, by the bucket's hash and then the impl's key.
+    let mut keyed: Vec<(BucketHash, BucketKey, ImplRow), A> =
+        Vec::with_capacity_in(rows.len(), alloc.clone());
+    keyed.extend(rows.iter().map(|row| {
+        let key = BucketKey::of(row);
+        (key.hash(), key, *row)
+    }));
+    keyed.sort_unstable_by(|a, b| (a.0, a.2.impl_).cmp(&(b.0, b.2.impl_)));
+
+    let mut buckets: Vec<Bucket<A>, A> = Vec::new_in(alloc.clone());
+    let mut entries: Vec<DirEntry, A> = Vec::new_in(alloc.clone());
+    let mut stored: Vec<StoredRow, A> = Vec::new_in(alloc.clone());
+    let mut start = 0;
+    while start < keyed.len() {
+        let (hash, key, first) = keyed[start];
+        let mut end = start + 1;
+        while end < keyed.len() && keyed[end].0 == hash {
+            if keyed[end].1 != key {
+                return Err(ImplIndexError::BucketHashClash {
+                    first: first.impl_,
+                    second: keyed[end].2.impl_,
+                });
+            }
+            end += 1;
+        }
+        stored.clear();
+        stored.extend(keyed[start..end].iter().map(|(_, _, row)| StoredRow {
+            impl_: row.impl_.0,
+            header: row.header,
+            flags: row.flags.bits(),
+        }));
+        let bytes = write_bucket(hash, key, &stored, alloc.clone());
+        let id = blaze_format::buffer_id(&bytes);
+        let (kind, _, _) = key.parts();
+        entries.push(DirEntry { hash: hash.0, bucket: id, rows: (end - start) as u32, kind });
+        buckets.push(Bucket { id, hash, key, bytes });
+        start = end;
+    }
+    drop(stored);
+    drop(keyed);
+
+    let mut traits: Vec<u64, A> = Vec::with_capacity_in(rows.len(), alloc.clone());
+    traits.extend(rows.iter().filter_map(|row| row.trait_).map(trait_mark));
+    traits.sort_unstable();
+    traits.dedup();
+    let mut marks: Vec<u64, A> = Vec::with_capacity_in(entries.len(), alloc.clone());
+    marks.extend(entries.iter().map(|entry| BucketHash(entry.hash).mark()));
+    marks.sort_unstable();
+    marks.dedup();
+
+    Ok(CrateImpls {
+        directory: write_directory(krate, &entries, alloc.clone()),
+        no_impls_of: write_no_impls(krate, &traits, &marks, alloc),
+        buckets,
+    })
+}
+
+fn write_bucket<A: Allocator>(hash: BucketHash, key: BucketKey, rows: &[StoredRow], alloc: A) -> Vec<u8, A> {
+    let (kind, trait_, shape) = key.parts();
+    let mut out = Writer::new_in(BUCKET_SCHEMA, alloc);
+    let rows_at = out.push_slice(rows);
+    let at = out.next::<BucketRoot>();
+    let root = BucketRoot {
+        hash: hash.0,
+        trait_: ContentId(trait_),
+        shape,
+        kind,
+        rows: slice_field(at, offset_of!(BucketRoot, rows), rows_at, rows.len()),
+    };
+    let written = out.push(&root);
+    debug_assert_eq!(written, at);
+    out.finish(at)
+}
+
+fn write_directory<A: Allocator>(krate: CrateItemKey, entries: &[DirEntry], alloc: A) -> Vec<u8, A> {
+    let mut out = Writer::new_in(DIRECTORY_SCHEMA, alloc);
+    let entries_at = out.push_slice(entries);
+    let at = out.next::<DirectoryRoot>();
+    let root = DirectoryRoot {
+        krate: krate.0,
+        entries: slice_field(at, offset_of!(DirectoryRoot, entries), entries_at, entries.len()),
+    };
+    let written = out.push(&root);
+    debug_assert_eq!(written, at);
+    out.finish(at)
+}
+
+fn write_no_impls<A: Allocator>(krate: CrateItemKey, traits: &[u64], buckets: &[u64], alloc: A) -> Vec<u8, A> {
+    let mut out = Writer::new_in(NO_IMPLS_SCHEMA, alloc);
+    let traits_at = out.push_slice(traits);
+    let buckets_at = out.push_slice(buckets);
+    let at = out.next::<NoImplsRoot>();
+    let root = NoImplsRoot {
+        krate: krate.0,
+        traits: slice_field(at, offset_of!(NoImplsRoot, traits), traits_at, traits.len()),
+        buckets: slice_field(at, offset_of!(NoImplsRoot, buckets), buckets_at, buckets.len()),
+    };
+    let written = out.push(&root);
+    debug_assert_eq!(written, at);
+    out.finish(at)
+}
+
+/// Where the directory says a bucket is.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct DirHit {
+    pub hash: BucketHash,
+    /// The bucket's content id.
+    pub bucket: ContentId,
+    pub rows: u32,
+}
+
+/// A crate's impl directory read in place.
+#[derive(Clone, Copy, Debug)]
+pub struct DirectoryView<'a> {
+    krate: CrateItemKey,
+    entries: &'a [DirEntry],
+}
+
+impl<'a> DirectoryView<'a> {
+    /// The directory in `buffer`, its schema and layout checked: O(1), the entries being
+    /// plain.
+    pub fn open(buffer: &'a [u8]) -> Result<DirectoryView<'a>, FormatError> {
+        let root = blaze_format::open_as::<DirectoryRoot>(buffer, DIRECTORY_SCHEMA)?;
+        Ok(DirectoryView { krate: CrateItemKey(root.krate), entries: root.entries.follow(buffer)? })
+    }
+
+    /// The crate whose directory it is.
+    pub fn krate(&self) -> CrateItemKey {
+        self.krate
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The bucket of `hash`, none when the crate has no impl of its key.
+    pub fn lookup(&self, hash: BucketHash) -> Option<DirHit> {
+        let at = self.entries.binary_search_by(|entry| entry.hash.cmp(&hash.0)).ok()?;
+        let entry = &self.entries[at];
+        Some(DirHit { hash, bucket: entry.bucket, rows: entry.rows })
+    }
+
+    /// Every bucket, by hash.
+    pub fn hits(&self) -> impl Iterator<Item = DirHit> + use<'a> {
+        let entries: &'a [DirEntry] = self.entries;
+        entries.iter().map(|entry| DirHit {
+            hash: BucketHash(entry.hash),
+            bucket: entry.bucket,
+            rows: entry.rows,
+        })
+    }
+}
+
+/// An impl bucket read in place.
+#[derive(Clone, Copy, Debug)]
+pub struct BucketView<'a> {
+    hash: BucketHash,
+    key: BucketKey,
+    rows: &'a [StoredRow],
+    at: u64,
+}
+
+impl<'a> BucketView<'a> {
+    /// The bucket in `buffer`, its schema, layout and key checked: O(1), the rows being plain;
+    /// a row's flags are checked when it is read.
+    pub fn open(buffer: &'a [u8]) -> Result<BucketView<'a>, FormatError> {
+        let root = blaze_format::open_as::<BucketRoot>(buffer, BUCKET_SCHEMA)?;
+        let at = blaze_format::header(buffer)?.root;
+        let Some(key) = BucketKey::from_parts(root.kind, root.trait_.0, root.shape) else {
+            return Err(FormatError::Invalid { at, what: "an impl bucket's key that no bucket writes" });
+        };
+        Ok(BucketView { hash: BucketHash(root.hash), key, rows: root.rows.follow(buffer)?, at })
+    }
+
+    pub fn key(&self) -> BucketKey {
+        self.key
+    }
+
+    pub fn hash(&self) -> BucketHash {
+        self.hash
+    }
+
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// Row `at`, by impl key's order.
+    pub fn row(&self, at: usize) -> Option<Result<ImplRow, FormatError>> {
+        let stored = self.rows.get(at)?;
+        Some(match ImplFlags::from_bits(stored.flags) {
+            Ok(flags) => Ok(ImplRow {
+                impl_: ItemKey(stored.impl_),
+                trait_: self.key.trait_(),
+                shape: self.key.shape(),
+                flags,
+                header: stored.header,
+            }),
+            Err(_) => Err(FormatError::Invalid { at: self.at, what: "an impl row with flags blaze does not know" }),
+        })
+    }
+
+    /// The row of `impl_`, by a binary search.
+    pub fn find(&self, impl_: ItemKey) -> Option<Result<ImplRow, FormatError>> {
+        let at = self.rows.binary_search_by(|row| row.impl_.cmp(&impl_.0)).ok()?;
+        self.row(at)
+    }
+}
+
+/// A crate's `NoImplsOf` read in place.
+#[derive(Clone, Copy, Debug)]
+pub struct NoImplsOfView<'a> {
+    krate: CrateItemKey,
+    traits: &'a [u64],
+    buckets: &'a [u64],
+}
+
+impl<'a> NoImplsOfView<'a> {
+    /// The record in `buffer`, its schema and layout checked: O(1).
+    pub fn open(buffer: &'a [u8]) -> Result<NoImplsOfView<'a>, FormatError> {
+        let root = blaze_format::open_as::<NoImplsRoot>(buffer, NO_IMPLS_SCHEMA)?;
+        Ok(NoImplsOfView {
+            krate: CrateItemKey(root.krate),
+            traits: root.traits.follow(buffer)?,
+            buckets: root.buckets.follow(buffer)?,
+        })
+    }
+
+    pub fn krate(&self) -> CrateItemKey {
+        self.krate
+    }
+
+    /// False when the crate has no impl of `trait_`: exact. True when it may.
+    pub fn may_hold_trait(&self, trait_: ItemKey) -> bool {
+        self.traits.binary_search(&trait_mark(trait_)).is_ok()
+    }
+
+    /// False when the crate has no bucket of `hash`: exact. True when it may.
+    pub fn may_hold_bucket(&self, hash: BucketHash) -> bool {
+        self.buckets.binary_search(&hash.mark()).is_ok()
+    }
+}

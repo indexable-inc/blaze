@@ -1,0 +1,26 @@
+[package]
+name = "blaze-scope"
+description = "Name resolution of the item layer (docs/v2/plan/design/bottom.md, \"Name resolution without resolving a crate\"): a sans-IO machine that computes one module's scope from its own declarations and per-name reads of other modules' scopes, a group machine that solves a cycle of modules found at run time as a least fixpoint, and the read list each scope is valid by"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# `ItemKey`, `CrateItemKey`, `ContentId`: every module, item and crate is named by its key.
+blaze-id.workspace = true
+# `HashMap`: the machine's single-owner indexes, in the allocator it is made in.
+blaze-hash.workspace = true
+
+[dev-dependencies]
+blaze-sim.workspace = true
+
+[lints]
+workspace = true
