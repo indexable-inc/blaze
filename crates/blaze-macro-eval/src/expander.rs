@@ -1895,8 +1895,7 @@ impl ProcMacroExpander for Evaluated {
             return false;
         }
         let (new, old) = (&self.library, &other.library);
-        let another_module = self.function == other.function
-            && self.index == other.index
+        let another_module = self.index == other.index
             && self.kind == other.kind
             && self.name == other.name
             && Arc::ptr_eq(&new.macros, &old.macros)
@@ -1928,8 +1927,13 @@ impl ProcMacroExpander for Evaluated {
                         "a proc macro's expanders loaded again are not the ones its crate has"
                     );
                 }
+                // Not by `function`: a `FunctionId` is of the proc-macro crate's arena, which
+                // a write to the crate renews, so the same macro loaded again in the next build
+                // has another id. Equal libraries (the crate's key, its code, the module it
+                // runs) and the same index, kind and name are the same macro; comparing the id
+                // gave the crate its expanders again each build, which renewed its arena and
+                // its dependents', whose bodies were all inferred again.
                 self.library.same(&other.library)
-                    && self.function == other.function
                     && self.index == other.index
                     && self.kind == other.kind
                     && self.name == other.name
