@@ -456,6 +456,28 @@ impl Memo {
         }
     }
 
+    /// The arena this snapshot holds at `index`, of whatever generation; `None` where it holds
+    /// none.
+    pub(crate) fn held_at(&self, index: u32) -> Option<ArenaId> {
+        self.slots.get(index as usize)?.as_ref().map(|slot| slot.id)
+    }
+
+    /// `value` with the proof that this snapshot holds every arena it names at the generation
+    /// its ids hold ([`Live`]), or the first arena it names that this snapshot does not
+    /// ([`Dead`]): an id of an arena a commit dropped since, or of one a later snapshot made.
+    ///
+    /// What a value kept outside the memo across [`Memo::next`] (a driver's table keyed by
+    /// ids, read by tasks of more than one snapshot) is passed through before any of its ids
+    /// is looked up here: a dead id is then a typed answer, never the panic of a lookup
+    /// ([`Memo::slot`]). A spill id is refused whatever its arena: it is of the spill table of
+    /// the snapshot that made it, which a value kept across snapshots cannot say.
+    pub fn live<T: crate::Home>(&self, value: T) -> Result<Live<'_, T>, Dead> {
+        match crate::home::first_dead(self, &value) {
+            None => Ok(Live { value, _memo: std::marker::PhantomData }),
+            Some(named) => Err(Dead { named, held: self.held_at(named.index()) }),
+        }
+    }
+
     /// The arena `id`, if this snapshot holds that arena of that generation.
     pub(crate) fn try_slot(&self, id: ArenaId) -> Option<&Slot> {
         match self.slots.get(id.index() as usize) {
@@ -847,6 +869,42 @@ impl Builder {
             boundaries: self.boundaries,
             ids: self.ids,
         }
+    }
+}
+
+/// A value whose every id names an arena the snapshot `'m` borrows holds at that generation
+/// ([`Memo::live`]): the proof a reader of a table kept across [`Memo::next`] takes before it
+/// looks any of the value's ids up in that snapshot (rule verify-once). Made only by
+/// [`Memo::live`]; it lives no longer than the borrow of the snapshot that checked it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Live<'m, T> {
+    value: T,
+    _memo: std::marker::PhantomData<&'m Memo>,
+}
+
+impl<T: Copy> Live<'_, T> {
+    /// The value, live in the snapshot that checked it.
+    pub fn get(&self) -> T {
+        self.value
+    }
+}
+
+/// Why [`Memo::live`] refused a value: the first arena it names that the snapshot does not hold
+/// at that generation, and what the snapshot holds at that index (none, an earlier making, or
+/// a later one).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Dead {
+    pub named: ArenaId,
+    pub held: Option<ArenaId>,
+}
+
+impl Dead {
+    /// Whether neither the snapshot nor any made after it can hold the id: it holds a later
+    /// making of the named index, or this very making, which then refused a spill id (of the
+    /// spill table of an older snapshot, which only that snapshot reads). Generations only rise
+    /// within an id space, and a new id space is a new database nonce.
+    pub fn superseded(&self) -> bool {
+        self.held.is_some_and(|held| held.generation() >= self.named.generation())
     }
 }
 

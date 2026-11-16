@@ -772,7 +772,7 @@ pub(crate) mod bodies {
         Seen, Session, World, WorldError,
     };
     use blaze_lower::Lowered;
-    use blaze_memo::Epoch;
+    use blaze_memo::{Epoch, Live};
     use blaze_store_check::Setting;
     use hir_def::{DefWithBodyId, HasModule as _, nameres::crate_def_map};
     use hir_ty::{
@@ -1460,6 +1460,12 @@ pub(crate) mod bodies {
         /// Runs of a MIR no entry keys (an inline const's, a by-move or a `gen` coroutine's):
         /// claimed, not kept.
         pub(crate) unkeyed: usize,
+        /// Traces of a body of an arena making this keep's snapshot holds a later one of:
+        /// dropped, kept by no keep (`entries::Claim::superseded`).
+        pub(crate) superseded: usize,
+        /// Traces of a body of an arena making this keep's snapshot does not hold yet: left to
+        /// a later snapshot's keep (`entries::Claim::elsewhere`).
+        pub(crate) elsewhere: usize,
         /// What the serve's carry of its session did (all zero where none ran).
         pub(crate) carry: Carried,
     }
@@ -1792,10 +1798,14 @@ pub(crate) mod bodies {
             tracing::debug!(target: "blaze", def = ?it.def, step = ?it.step, "a run the item store refused to trace, kept as no entry: {}", it.why);
         }
         // alloc: once a keep, the steps it keeps by crate, in order (rule 25)
-        let mut by_crate: BTreeMap<Crate, Vec<(DefWithBodyId, Step, SchemaHash)>> = BTreeMap::new();
+        let mut by_crate: BTreeMap<Crate, Vec<(Live<'_, DefWithBodyId>, Step, SchemaHash)>> = BTreeMap::new();
         for &(def, step, schema) in &claim.steps {
-            by_crate.entry(def.krate(db)).or_default().push((def, step, schema));
+            by_crate.entry(def.get().krate(db)).or_default().push((def, step, schema));
         }
+        // Traces of bodies of other snapshots' arena makings, which this keep cannot look up
+        // (`entries::claim_keeps`): counted, never quietly passed over (rule 3).
+        did.superseded += claim.superseded;
+        did.elsewhere += claim.elsewhere;
         // alloc: once a keep, the sessions it saved
         let mut saved = Vec::new();
         for (krate, steps) in by_crate {
@@ -1811,7 +1821,7 @@ pub(crate) mod bodies {
         kernel: &Kernel<Bodies>,
         front: &Arc<Lowered>,
         krate: Crate,
-        steps: &[(DefWithBodyId, Step, SchemaHash)],
+        steps: &[(Live<'_, DefWithBodyId>, Step, SchemaHash)],
         in_view: &impl Fn(&str) -> Option<String>,
         sessions: &Sessions,
         store: &mut Overlay<'_, G>,
@@ -1845,7 +1855,8 @@ pub(crate) mod bodies {
         blaze_memo::attach(db, || -> Result<(), FrontError> {
             // alloc: once a crate a keep, what it keeps in key order (rule 25)
             let mut todo: Vec<(&BodyKey, Of)> = Vec::new();
-            for &(def, step, schema) in steps {
+            for &(live, step, schema) in steps {
+                let def = live.get();
                 let Some(key) = world.by_def.get(&def) else {
                     world.passed_over(def, did);
                     continue;

@@ -1188,6 +1188,16 @@ pub fn drive<A: Api, O: Write, S: show::Sink, P: Programs>(
                 found.add(diagnostic);
             }
         }
+        // What a failed run did not check: the baselines' crates it left unmeasured.
+        if let Some(counted) = &mut counted {
+            match &response {
+                ResponseRef::Unchecked(unchecked) => counted.unchecked(unchecked),
+                ResponseRef::Report { unit: Some(unit), report } => {
+                    counted.report(unit, &report.headline.flat());
+                }
+                _ => {}
+            }
+        }
         if let ResponseRef::Work(worked) = &response {
             client_rows::heard(worked.build_id, worked.misses);
             client_rows::summarized(worked.build_id, worked.why.as_deref());
@@ -1296,6 +1306,37 @@ pub fn drive<A: Api, O: Write, S: show::Sink, P: Programs>(
     // (each failure was said, naming its unit), and the run then fails.
     let tests_past_failure =
         !asked.flags.fail_fast && matches!(asked.command(), Command::Test | Command::Bench);
+    // `check --baselines`: the run's counts held to the baselines. A failed run is still
+    // measured in part under `--bless-baselines` (`baselines::Counted`): the crates whose check
+    // completed are recorded, the rest named, and the command fails. Without a bless a failed
+    // run fails as it is; a run whose numbering the client refused measured nothing.
+    if asked.command() == Command::Check
+        && let Some(dir) = &asked.flags.baselines
+        && (ok || (asked.flags.bless_baselines && !printer.refused()))
+        && let Some(counted) = counted.take()
+    {
+        // args.rs refuses `--baselines` without exactly one `--target`.
+        let target = asked.flags.targets.first().map_or("", String::as_str);
+        let finished = counted.finish(
+            &place.root,
+            dir,
+            target,
+            asked.flags.bless_baselines,
+            &asked.flags.new_baselines,
+        );
+        return match finished {
+            Ok(said) => {
+                for line in said {
+                    printer.err().write_all(say::status("Baseline", &line, shown.color).as_bytes())?;
+                }
+                Ok(Then::Exit(if ok { 0 } else { Exit::Failed.code() }))
+            }
+            Err(what) => {
+                printer.err().write_all(say::error(&what, shown.color).as_bytes())?;
+                Ok(Then::Exit(Exit::Failed.code()))
+            }
+        };
+    }
     if !ok && !tests_past_failure {
         return Ok(Then::Exit(Exit::Failed.code()));
     }
@@ -1311,33 +1352,8 @@ pub fn drive<A: Api, O: Write, S: show::Sink, P: Programs>(
     let members = printer.members();
     match asked.command() {
         Command::Build => Ok(Then::Exit(0)),
-        Command::Check => {
-            let (Some(counted), Some(dir)) = (counted, &asked.flags.baselines) else {
-                return Ok(Then::Exit(0));
-            };
-            // args.rs refuses `--baselines` without exactly one `--target`.
-            let target = asked.flags.targets.first().map_or("", String::as_str);
-            match counted.finish(
-                &place.root,
-                dir,
-                target,
-                asked.flags.bless_baselines,
-                &asked.flags.new_baselines,
-            ) {
-                Ok(said) => {
-                    for line in said {
-                        printer
-                            .err()
-                            .write_all(say::status("Baseline", &line, shown.color).as_bytes())?;
-                    }
-                    Ok(Then::Exit(0))
-                }
-                Err(what) => {
-                    printer.err().write_all(say::error(&what, shown.color).as_bytes())?;
-                    Ok(Then::Exit(Exit::Failed.code()))
-                }
-            }
-        }
+        // Its baselines were held above.
+        Command::Check => Ok(Then::Exit(0)),
         Command::Doc => {
             if let Some(documented) = &documented {
                 doc::done(documented, asked.flags.open, shown.quiet, shown.color, &mut printer.err())?;

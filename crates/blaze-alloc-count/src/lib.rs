@@ -25,8 +25,12 @@
 //! measurement shows where the allocations it counted came from.
 
 // `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
-#![feature(register_tool)]
+#![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
+#![blaze::trust(
+    unsafe,
+    reason = "a `GlobalAlloc` is an `unsafe impl`: `Counting` counts each call and forwards it unchanged to `System`, with the caller's own layout and pointer"
+)]
 
 use std::{
     alloc::{GlobalAlloc, Layout, System},

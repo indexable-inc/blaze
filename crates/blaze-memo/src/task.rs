@@ -75,6 +75,9 @@ struct Book {
     provs: Vec<Prov, Global>,
     /// An inner head's value moved this round.
     moved: bool,
+    /// The first [`MOVERS_NAMED`] members whose value moved this round, by name and key: what a
+    /// head that does not settle names in its panic ([`Moved::named`]).
+    movers: Vec<String, Global>,
     /// The flight of every fixpoint member run so far, held by this task until the head
     /// settles: another task asking a member waits (for the head) instead of running it again,
     /// so no member's function runs on two tasks in one snapshot. Declared last: dropped
@@ -84,8 +87,25 @@ struct Book {
 
 impl Book {
     fn new() -> Book {
-        Book { round: 0, provs: Vec::new_in(Global), moved: false, keeps: Vec::new_in(Global) }
+        Book {
+            round: 0,
+            provs: Vec::new_in(Global),
+            moved: false,
+            movers: Vec::new_in(Global),
+            keeps: Vec::new_in(Global),
+        }
     }
+}
+
+/// How many moved members a round names ([`Book::movers`]): enough to see which member
+/// flips, bounded so a cycle of thousands names a few.
+pub(crate) const MOVERS_NAMED: usize = 4;
+
+/// Whether a head's members moved in the round just ended ([`Run::next_round`]), and the first
+/// [`MOVERS_NAMED`] that did, each by name and key.
+pub(crate) struct Moved {
+    pub(crate) any: bool,
+    pub(crate) named: Vec<String, Global>,
 }
 
 /// A member whose flight the head holds.
@@ -393,10 +413,10 @@ impl Run {
     }
 
     /// Whether the head's members moved this round, and starts the next.
-    pub(crate) fn next_round(&self) -> bool {
+    pub(crate) fn next_round(&self) -> Moved {
         let mut book = self.book.borrow_mut();
-        let Some(book) = book.as_mut() else { return false };
-        let moved = book.moved;
+        let Some(book) = book.as_mut() else { return Moved { any: false, named: Vec::new_in(Global) } };
+        let moved = Moved { any: book.moved, named: std::mem::replace(&mut book.movers, Vec::new_in(Global)) };
         book.moved = false;
         book.round += 1;
         moved
@@ -797,6 +817,9 @@ pub(crate) fn member_done(
     let mut book = head.book.borrow_mut();
     let book = book.get_or_insert_with(Book::new);
     book.moved |= moved;
+    if moved && book.movers.len() < MOVERS_NAMED {
+        book.movers.push(run.name().to_string());
+    }
     book.provs.push(Prov {
         kind: run.kind,
         hash: run.hash,

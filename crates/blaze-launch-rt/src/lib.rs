@@ -36,6 +36,13 @@
     all(target_os = "linux", any(target_arch = "x86_64", target_arch = "aarch64")),
 ))]
 #![feature(allocator_api)]
+// `#![blaze::trust]` below names blaze's tool; inert under rustc.
+#![feature(register_tool, custom_inner_attributes)]
+#![register_tool(blaze)]
+#![blaze::trust(
+    unsafe,
+    reason = "a launcher runs code it placed itself: memory that code runs from (`MAP_JIT`, a memfd mapped twice), its own machine code (gates, stubs, the resolver), slot words and thread-locals the program's threads read, `dlsym` and the system's unwinder; the control thread is the only writer, and writes code only where nothing can be running"
+)]
 
 pub mod arch;
 pub mod control;

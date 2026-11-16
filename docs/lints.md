@@ -128,7 +128,12 @@ list only shrinks:
 - `blaze check --workspace --target aarch64-unknown-linux-gnu --baselines
   crates/blaze-lints/baselines` fails on a count over its line or a line over its count.
   Adding `--bless-baselines` records each count, drops each crate at zero, and deletes a
-  baseline with no crate left, saying so. That lint is then `deny` everywhere.
+  baseline with no crate left, saying so. That lint is then `deny` everywhere. A bless of a run
+  that failed still records every crate whose check completed: a crate a unit of which gave an
+  error that is no lint finding (a panic of blaze's among them), whose build script failed, or
+  which was not checked behind a failure is kept as its line holds it (`unmeasured` stays so),
+  named with why, and the command fails. A count over its line is never raised, and the rest
+  are still recorded. Without the bless a failed run fails as it is.
 
 Two lints are apart from this. `todo` is named `warn` in the ratchet table, so a hole is a
 warning in a local check and the gate denies it on its command line

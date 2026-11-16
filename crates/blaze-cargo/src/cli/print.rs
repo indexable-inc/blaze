@@ -280,7 +280,7 @@ impl<'a, O: Write, S: Sink> Printer<'a, O, S> {
             };
             let mut all: Vec<String> = Vec::new(); // alloc: a failure's, once
             for unit in &behind.units {
-                let package = unit.split(' ').next().unwrap_or(unit);
+                let package = say::unit_package(unit);
                 if !all.iter().any(|it| it == package) {
                     all.push(package.to_owned()); // alloc: as above
                 }

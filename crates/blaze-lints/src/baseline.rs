@@ -12,6 +12,11 @@
 //! to `deny` before a run had counted them. Any count passes it, and it is stale, as a count under
 //! its baseline is, until a bless records the run's count in its place or drops the crate at zero.
 //!
+//! A run in which some crates' checks did not complete ([`Unmeasured`]: a unit failed for
+//! something other than a lint finding, a compiler panic among them, or was not checked behind a
+//! failure) still measures every other crate: a bless records those, and keeps each crate it
+//! did not measure as its baseline holds it, so one broken unit holds no other crate's count back.
+//!
 //! A `blaze` lint's file is also what holds a crate at `warn` under the workspace's
 //! `[workspace.metadata.blaze.lints-ratchet]`, which denies the lint everywhere else
 //! (blaze-units' `flags::ratchet_downgrades` reads the crate names of these files): dropping a
@@ -23,7 +28,13 @@
 //! The counting itself is the client's (`blaze-cargo`'s `cli/baselines.rs`), from the findings a
 //! run prints: this module is the files and the comparison.
 
-use std::{collections::BTreeMap, path::Path};
+use std::{
+    alloc::{Allocator, Global},
+    borrow::Borrow,
+    collections::BTreeMap,
+    fmt,
+    path::Path,
+};
 
 pub mod items;
 
@@ -143,6 +154,39 @@ impl std::fmt::Display for Off {
     }
 }
 
+/// The crates a run did not measure, each with why: a crate whose check did not complete (a unit
+/// of it failed for something other than a lint finding, or was not checked behind a failure),
+/// so its counts are of part of it. Every other crate of the workspace was checked whole, and its
+/// count, 0 when it has no finding, is the run's measure of it. A check holds a crate of these
+/// only to a count over its baseline, and a bless keeps it as its baseline holds it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Unmeasured {
+    /// Why, by crate (the package's name): the first cause the run gave. On the heap: a few
+    /// lines a run, kept to its end.
+    pub crates: BTreeMap<blaze_mem::String<Global>, blaze_mem::String<Global>, Global>,
+}
+
+impl Unmeasured {
+    /// A run that checked every crate whole.
+    pub const NONE: Unmeasured = Unmeasured { crates: BTreeMap::new() };
+
+    /// Whether the run left `krate` unmeasured.
+    pub fn has(&self, krate: &str) -> bool {
+        self.crates.contains_key(krate)
+    }
+
+    /// Leaves `krate` unmeasured for `why`, unless it already is (its first cause is kept, and
+    /// a later one is never formatted).
+    pub fn add(&mut self, krate: &str, why: fmt::Arguments<'_>) {
+        if !self.has(krate) {
+            self.crates.insert(
+                blaze_mem::String::from_str_in(krate, Global),
+                blaze_mem::text::format(Global, why),
+            );
+        }
+    }
+}
+
 impl Baseline {
     /// The baseline of the file `name` whose text is `text`.
     pub fn parse(name: &str, text: &str) -> Result<Baseline, BaselineError> {
@@ -192,9 +236,17 @@ impl Baseline {
         text
     }
 
-    /// Where `now`, the counts of a run, are off the baseline, in the order of the crates.
-    pub fn off(&self, now: &BTreeMap<String, u32>) -> Vec<Off> {
-        let mut off = Vec::new();
+    /// Where `now`, the counts of a run, are off the baseline, in the order of the crates. A
+    /// crate of `unmeasured` is held only to its count being over (a partial count can only be
+    /// short of the whole, so one over is over): it is never said to be under or stale. `now`
+    /// is by crate name in any text type that orders as `str` does; what is off goes in `alloc`.
+    pub fn off<K: Borrow<str> + Ord, B: std::alloc::AllocatorClone, A: Allocator>(
+        &self,
+        now: &BTreeMap<K, u32, B>,
+        unmeasured: &Unmeasured,
+        alloc: A,
+    ) -> Vec<Off, A> {
+        let mut off = Vec::new_in(alloc);
         let mut was = self.counts.iter().peekable();
         let mut now = now.iter().filter(|(_, count)| **count > 0).peekable();
         loop {
@@ -202,11 +254,14 @@ impl Baseline {
                 (None, None) => return off,
                 (Some(_), None) => std::cmp::Ordering::Less,
                 (None, Some(_)) => std::cmp::Ordering::Greater,
-                (Some((a, _)), Some((b, _))) => a.cmp(b),
+                (Some((a, _)), Some((b, _))) => a.as_str().cmp(<K as Borrow<str>>::borrow(b)),
             };
             match order {
                 std::cmp::Ordering::Less => {
                     let (krate, &was) = was.next().unwrap();
+                    if unmeasured.has(krate) {
+                        continue;
+                    }
                     off.push(match was {
                         Held::Count(was) => Off::Shrank { krate: krate.clone(), was, now: 0 },
                         Held::Unmeasured => Off::Unmeasured { krate: krate.clone(), now: 0 },
@@ -214,7 +269,7 @@ impl Baseline {
                 }
                 std::cmp::Ordering::Greater => {
                     let (krate, &now) = now.next().unwrap();
-                    off.push(Off::New { krate: krate.clone(), now });
+                    off.push(Off::New { krate: <K as Borrow<str>>::borrow(krate).to_owned(), now });
                 }
                 std::cmp::Ordering::Equal => {
                     let ((krate, &was), (_, &now)) = (was.next().unwrap(), now.next().unwrap());
@@ -222,6 +277,7 @@ impl Baseline {
                         Held::Count(was) if now > was => {
                             off.push(Off::Grew { krate: krate.clone(), was, now })
                         }
+                        Held::Count(_) | Held::Unmeasured if unmeasured.has(krate) => {}
                         Held::Count(was) if now < was => {
                             off.push(Off::Shrank { krate: krate.clone(), was, now })
                         }
@@ -234,13 +290,21 @@ impl Baseline {
     }
 
     /// The baseline lowered to `now`: each crate's count at most what it was, an unmeasured
-    /// crate's the run's, a crate at zero dropped, and none added or raised.
-    pub fn blessed(&self, now: &BTreeMap<String, u32>) -> Baseline {
+    /// crate's the run's, a crate at zero dropped, and none added or raised. A crate of
+    /// `unmeasured`, whose check the run did not complete, is kept as it was.
+    pub fn blessed<K: Borrow<str> + Ord, B: std::alloc::AllocatorClone>(
+        &self,
+        now: &BTreeMap<K, u32, B>,
+        unmeasured: &Unmeasured,
+    ) -> Baseline {
         let counts = self
             .counts
             .iter()
             .filter_map(|(krate, &was)| {
-                let now = now.get(krate).copied().unwrap_or(0);
+                if unmeasured.has(krate) {
+                    return Some((krate.clone(), was));
+                }
+                let now = now.get(krate.as_str()).copied().unwrap_or(0);
                 let now = match was {
                     Held::Count(was) => now.min(was),
                     Held::Unmeasured => now,
@@ -345,24 +409,34 @@ pub fn read(dir: &Path) -> Result<BTreeMap<String, Baseline>, BaselineError> {
 
 /// Where `counts`, a run's by lint then crate, are off the baselines in `dir`, by lint, then
 /// crate: every lint of the run's and every lint with a baseline. The run must be of the whole
-/// workspace, every target: a crate it did not check reads as at zero.
-pub fn check(dir: &Path, counts: &Counts) -> Result<Vec<(String, Off)>, BaselineError> {
+/// workspace, every target: a crate it did not check reads as at zero unless it is in
+/// `unmeasured`, which [`Baseline::off`] holds only to a count over. What is off, and its lint's
+/// name, go in `alloc`.
+pub fn check<A: Allocator + Clone>(
+    dir: &Path,
+    counts: &Counts,
+    unmeasured: &Unmeasured,
+    alloc: A,
+) -> Result<Vec<(blaze_mem::String<A>, Off), A>, BaselineError> {
     let baselines = read(dir)?;
     let none = BTreeMap::new();
     // alloc: the run's and the baselines' lint names, once a run
     let lints: std::collections::BTreeSet<&String> =
         baselines.keys().chain(counts.keys()).collect();
-    let mut off = Vec::new();
+    let mut off = Vec::new_in(alloc.clone());
     for lint in lints {
         let now = counts.get(lint).unwrap_or(&none);
+        let named = || blaze_mem::String::from_str_in(lint, alloc.clone());
         match baselines.get(lint) {
             Some(baseline) => {
-                off.extend(baseline.off(now).into_iter().map(|it| (lint.clone(), it)))
+                for it in baseline.off(now, unmeasured, alloc.clone()) {
+                    off.push((named(), it));
+                }
             }
             None => {
                 let now = now.values().sum::<u32>();
                 if now > 0 {
-                    off.push((lint.clone(), Off::Unbaselined { now }));
+                    off.push((named(), Off::Unbaselined { now }));
                 }
             }
         }
@@ -381,12 +455,20 @@ pub enum Blessed {
 
 /// Lowers each baseline in `dir` to `counts`, writes those that changed and deletes those that
 /// reach empty, returning what it did, by lint. `counts` must be of a run over the whole
-/// workspace, every target: a crate it did not check reads as at zero and is dropped.
-pub fn bless(dir: &Path, counts: &Counts) -> Result<Vec<(String, Blessed)>, BaselineError> {
+/// workspace, every target: a crate it did not check reads as at zero and is dropped, unless it
+/// is in `unmeasured`, which is kept as its baseline holds it. A count over its baseline is not
+/// raised, so a bless of a run with one still lowers the rest. What it did, and each lint's
+/// name, go in `alloc`.
+pub fn bless<A: Allocator + Clone>(
+    dir: &Path,
+    counts: &Counts,
+    unmeasured: &Unmeasured,
+    alloc: A,
+) -> Result<Vec<(blaze_mem::String<A>, Blessed), A>, BaselineError> {
     let none = BTreeMap::new();
-    let mut done = Vec::new();
+    let mut done = Vec::new_in(alloc.clone());
     for (lint, baseline) in read(dir)? {
-        let blessed = baseline.blessed(counts.get(&lint).unwrap_or(&none));
+        let blessed = baseline.blessed(counts.get(&lint).unwrap_or(&none), unmeasured);
         if blessed == baseline {
             continue;
         }
@@ -395,12 +477,13 @@ pub fn bless(dir: &Path, counts: &Counts) -> Result<Vec<(String, Blessed)>, Base
             file: path.display().to_string(),
             error: error.to_string(),
         };
+        let named = blaze_mem::String::from_str_in(&lint, alloc.clone());
         if blessed.counts.is_empty() {
             std::fs::remove_file(&path).map_err(write_error)?;
-            done.push((lint, Blessed::Emptied));
+            done.push((named, Blessed::Emptied));
         } else {
             std::fs::write(&path, blessed.render()).map_err(write_error)?;
-            done.push((lint, Blessed::Lowered));
+            done.push((named, Blessed::Lowered));
         }
     }
     Ok(done)
@@ -461,8 +544,9 @@ mod tests {
     fn a_count_off_its_baseline_either_way_is_named_and_a_bless_only_lowers() {
         let baseline = Baseline { counts: held(&[("a", 3), ("b", 2), ("c", 1), ("e", 4)]) };
         let now = map(&[("a", 4), ("b", 1), ("d", 2), ("e", 4), ("f", 0)]);
+        let all = &Unmeasured::NONE;
         assert_eq!(
-            baseline.off(&now),
+            baseline.off(&now, all, Global),
             [
                 Off::Grew { krate: "a".to_owned(), was: 3, now: 4 },
                 Off::Shrank { krate: "b".to_owned(), was: 2, now: 1 },
@@ -470,10 +554,10 @@ mod tests {
                 Off::New { krate: "d".to_owned(), now: 2 },
             ]
         );
-        assert_eq!(baseline.blessed(&now).counts, held(&[("a", 3), ("b", 1), ("e", 4)]));
-        assert!(baseline.off(&map(&[("a", 3), ("b", 2), ("c", 1), ("e", 4)])).is_empty());
-        assert!(baseline.off(&map(&[("a", 4)])).iter().any(Off::over));
-        assert!(!baseline.off(&map(&[("a", 2)])).iter().any(Off::over));
+        assert_eq!(baseline.blessed(&now, all).counts, held(&[("a", 3), ("b", 1), ("e", 4)]));
+        assert!(baseline.off(&map(&[("a", 3), ("b", 2), ("c", 1), ("e", 4)]), all, Global).is_empty());
+        assert!(baseline.off(&map(&[("a", 4)]), all, Global).iter().any(Off::over));
+        assert!(!baseline.off(&map(&[("a", 2)]), all, Global).iter().any(Off::over));
     }
 
     /// What `off` and `blessed`, a run of `now` against `baseline`, did with each of the
@@ -526,18 +610,20 @@ mod tests {
     #[test]
     fn an_unmeasured_crate_takes_any_count_until_a_bless_records_it() {
         let (baseline, now) = unmeasured_case();
-        unmeasured_held(&baseline, &now, &baseline.off(&now), &baseline.blessed(&now)).unwrap();
+        let all = &Unmeasured::NONE;
+        unmeasured_held(&baseline, &now, &baseline.off(&now, all, Global), &baseline.blessed(&now, all))
+            .unwrap();
         assert_eq!(
-            baseline.off(&now),
+            baseline.off(&now, all, Global),
             [
                 Off::Unmeasured { krate: "b".to_owned(), now: 40 },
                 Off::Unmeasured { krate: "c".to_owned(), now: 0 },
             ]
         );
-        assert!(!baseline.off(&now).iter().any(Off::over), "no count is over `unmeasured`");
-        assert_eq!(baseline.blessed(&now).counts, held(&[("a", 2), ("b", 40)]));
+        assert!(!baseline.off(&now, all, Global).iter().any(Off::over), "no count is over `unmeasured`");
+        assert_eq!(baseline.blessed(&now, all).counts, held(&[("a", 2), ("b", 40)]));
         // Once measured, the same count over it is over.
-        assert!(baseline.blessed(&now).off(&map(&[("b", 41)])).iter().any(Off::over));
+        assert!(baseline.blessed(&now, all).off(&map(&[("b", 41)]), all, Global).iter().any(Off::over));
     }
 
     #[test]
@@ -553,8 +639,10 @@ mod tests {
                 })
                 .collect(),
         };
-        let why = unmeasured_held(&baseline, &now, &zero.off(&now), &baseline.blessed(&now))
-            .expect_err("the oracle missed an unmeasured crate held at zero");
+        let all = &Unmeasured::NONE;
+        let why =
+            unmeasured_held(&baseline, &now, &zero.off(&now, all, Global),&baseline.blessed(&now, all))
+                .expect_err("the oracle missed an unmeasured crate held at zero");
         assert!(why.contains("unmeasured `b` at 40 was said as [Grew"), "{why}");
     }
 
@@ -562,13 +650,14 @@ mod tests {
     fn the_oracle_catches_a_bless_that_keeps_a_crate_unmeasured() {
         let (baseline, now) = unmeasured_case();
         // The planted bug: a bless that lowers counts and leaves `unmeasured` as it was.
-        let mut kept = baseline.blessed(&now);
+        let all = &Unmeasured::NONE;
+        let mut kept = baseline.blessed(&now, all);
         for (krate, held) in &baseline.counts {
             if *held == Held::Unmeasured {
                 kept.counts.insert(krate.clone(), Held::Unmeasured);
             }
         }
-        let why = unmeasured_held(&baseline, &now, &baseline.off(&now), &kept)
+        let why = unmeasured_held(&baseline, &now, &baseline.off(&now, all, Global), &kept)
             .expect_err("the oracle missed a bless that kept `unmeasured`");
         assert!(why.contains("a bless of unmeasured `b` at 40 gave Some(Unmeasured)"), "{why}");
     }
@@ -587,55 +676,164 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let types_lint = "clippy::disallowed_types".to_owned();
+        let named = |lint: &str| blaze_mem::String::from_str_in(lint, Global);
+        let types_lint = named("clippy::disallowed_types");
+        let all = &Unmeasured::NONE;
         assert_eq!(
-            check(&dir, &counts).unwrap(),
+            check(&dir, &counts, all, Global).unwrap(),
             [
                 (
-                    "blaze::wall_clock".to_owned(),
+                    named("blaze::wall_clock"),
                     Off::Shrank { krate: "c".to_owned(), was: 1, now: 0 }
                 ),
-                ("clippy::disallowed_methods".to_owned(), Off::Unbaselined { now: 9 }),
+                (named("clippy::disallowed_methods"), Off::Unbaselined { now: 9 }),
                 (types_lint.clone(), Off::Grew { krate: "a".to_owned(), was: 3, now: 4 }),
                 (types_lint.clone(), Off::Shrank { krate: "b".to_owned(), was: 2, now: 1 }),
             ]
         );
         assert_eq!(
-            bless(&dir, &counts).unwrap(),
-            [
-                ("blaze::wall_clock".to_owned(), Blessed::Emptied),
-                (types_lint.clone(), Blessed::Lowered)
-            ]
+            bless(&dir, &counts, all, Global).unwrap(),
+            [(named("blaze::wall_clock"), Blessed::Emptied), (types_lint.clone(), Blessed::Lowered)]
         );
         assert_eq!(std::fs::read_to_string(&types).unwrap(), "a\t3\nb\t1\n");
         assert!(!clock.exists(), "a baseline lowered to nothing is deleted");
-        assert!(bless(&dir, &counts).unwrap().is_empty());
+        assert!(bless(&dir, &counts, all, Global).unwrap().is_empty());
 
         assert_eq!(target_of(&dir).unwrap(), None);
         std::fs::write(dir.join(TARGET_FILE), "x86_64-unknown-linux-gnu\n").unwrap();
         assert_eq!(target_of(&dir).unwrap().as_deref(), Some("x86_64-unknown-linux-gnu"));
-        assert!(check(&dir, &Counts::new()).is_ok(), "the target file is not a lint's");
+        assert!(check(&dir, &Counts::new(), all, Global).is_ok(), "the target file is not a lint's");
         std::fs::write(dir.join(ALLOC_SITES_FILE), "blaze-core\t12\n").unwrap();
         assert!(
-            check(&dir, &Counts::new()).is_ok(),
+            check(&dir, &Counts::new(), all, Global).is_ok(),
             "the allocation ratchet's counts are not a lint's baseline"
         );
         std::fs::write(dir.join(UNTYPED_ERRORS_FILE), "blaze-core\t1\t0\t0\t0\t0\n").unwrap();
         assert!(
-            check(&dir, &Counts::new()).is_ok(),
+            check(&dir, &Counts::new(), all, Global).is_ok(),
             "the untyped-error ratchet's counts are not a lint's baseline"
         );
         std::fs::write(dir.join("alloc-sites.txt.bak"), "").unwrap();
         assert!(
-            matches!(check(&dir, &Counts::new()), Err(BaselineError::Lint { .. })),
+            matches!(check(&dir, &Counts::new(), all, Global), Err(BaselineError::Lint { .. })),
             "only the ratchet's own file name is passed by"
         );
         std::fs::remove_file(dir.join("alloc-sites.txt.bak")).unwrap();
         std::fs::write(dir.join(TARGET_FILE), "a b\n").unwrap();
         assert!(matches!(target_of(&dir), Err(BaselineError::Line { .. })));
         std::fs::write(dir.join("clippy.no_such_lint.txt"), "").unwrap();
-        assert!(matches!(check(&dir, &counts), Err(BaselineError::Lint { .. })));
+        assert!(matches!(check(&dir, &counts, all, Global), Err(BaselineError::Lint { .. })));
         std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(check(&dir, &Counts::new()).unwrap(), []);
+        assert_eq!(check(&dir, &Counts::new(), all, Global).unwrap(), []);
+    }
+
+    /// What `off` and `blessed`, a run of `now` that left `unmeasured` unmeasured, did against
+    /// the invariant of a partial run, the first way they broke it: a crate the run measured is
+    /// held and blessed as in a whole run; a crate it did not is said only when over, and a bless
+    /// keeps it exactly as the baseline held it (`unmeasured` stays so, a count stays its count).
+    fn partial_held(
+        baseline: &Baseline,
+        now: &BTreeMap<String, u32>,
+        unmeasured: &Unmeasured,
+        off: &[Off],
+        blessed: &Baseline,
+    ) -> Result<(), String> {
+        let whole = baseline.off(now, &Unmeasured::NONE, Global);
+        let whole_blessed = baseline.blessed(now, &Unmeasured::NONE);
+        let krate_of = |it: &Off| match it {
+            Off::Grew { krate, .. }
+            | Off::New { krate, .. }
+            | Off::Shrank { krate, .. }
+            | Off::Unmeasured { krate, .. } => Some(krate.clone()),
+            Off::Unbaselined { .. } => None,
+        };
+        let crates: std::collections::BTreeSet<&str> = baseline
+            .counts
+            .keys()
+            .chain(now.keys())
+            .map(String::as_str)
+            .chain(unmeasured.crates.keys().map(|it| it.as_str()))
+            .collect();
+        for krate in crates {
+            let said: Vec<&Off> = off.iter().filter(|it| krate_of(it).as_deref() == Some(krate)).collect();
+            let kept = blessed.counts.get(krate);
+            if !unmeasured.has(krate) {
+                let alone: Vec<&Off> =
+                    whole.iter().filter(|it| krate_of(it).as_deref() == Some(krate)).collect();
+                if said != alone {
+                    return Err(format!("measured `{krate}` was said as {said:?}, a whole run as {alone:?}"));
+                }
+                if kept != whole_blessed.counts.get(krate) {
+                    return Err(format!("a bless of measured `{krate}` gave {kept:?}"));
+                }
+                continue;
+            }
+            if let Some(it) = said.iter().find(|it| !it.over()) {
+                return Err(format!("unmeasured `{krate}` was said as {it:?}, which is not over"));
+            }
+            if kept != baseline.counts.get(krate) {
+                let was = baseline.counts.get(krate);
+                return Err(format!("a bless of unmeasured `{krate}` gave {kept:?}, where it held {was:?}"));
+            }
+        }
+        Ok(())
+    }
+
+    /// A baseline, a run of it, and what the run left unmeasured: `p` (a panic) held at a
+    /// count and found under it, `q` (behind a failure) still `unmeasured` and found at 0, `r`
+    /// unmeasured and over its count; `a` measured and under, `b` measured and still
+    /// `unmeasured` at 5.
+    fn partial_case() -> (Baseline, BTreeMap<String, u32>, Unmeasured) {
+        let mut counts = held(&[("a", 4), ("p", 6), ("r", 2)]);
+        counts.insert("b".to_owned(), Held::Unmeasured);
+        counts.insert("q".to_owned(), Held::Unmeasured);
+        let now = map(&[("a", 1), ("b", 5), ("p", 2), ("r", 3)]);
+        let mut unmeasured = Unmeasured::default();
+        for krate in ["p", "q", "r"] {
+            unmeasured.add(krate, format_args!("`{krate}` did not finish"));
+        }
+        (Baseline { counts }, now, unmeasured)
+    }
+
+    /// The invariant: a run that did not complete every crate's check still measures the rest,
+    /// and a bless of it records those alone.
+    #[test]
+    fn a_partial_run_records_the_crates_it_measured_and_keeps_the_rest() {
+        let (baseline, now, unmeasured) = partial_case();
+        let off = baseline.off(&now, &unmeasured, Global);
+        let blessed = baseline.blessed(&now, &unmeasured);
+        partial_held(&baseline, &now, &unmeasured, &off, &blessed).unwrap();
+        assert_eq!(
+            off,
+            [
+                Off::Shrank { krate: "a".to_owned(), was: 4, now: 1 },
+                Off::Unmeasured { krate: "b".to_owned(), now: 5 },
+                Off::Grew { krate: "r".to_owned(), was: 2, now: 3 },
+            ]
+        );
+        let mut want = held(&[("a", 1), ("b", 5), ("p", 6), ("r", 2)]);
+        want.insert("q".to_owned(), Held::Unmeasured);
+        assert_eq!(blessed.counts, want);
+        // The first cause of a crate is the one kept.
+        let mut twice = Unmeasured::default();
+        twice.add("p", format_args!("a panic"));
+        twice.add("p", format_args!("behind `x`"));
+        assert_eq!(twice.crates.get("p").map(|it| it.as_str()), Some("a panic"));
+    }
+
+    #[test]
+    fn the_partial_oracle_catches_a_bless_that_reads_an_unmeasured_crate_as_measured() {
+        let (baseline, now, unmeasured) = partial_case();
+        // The planted bug: the run's partial counts blessed as if it had checked every crate
+        // whole, so `p` is lowered to 2 and `q` dropped at 0.
+        let whole = baseline.blessed(&now, &Unmeasured::NONE);
+        let why = partial_held(&baseline, &now, &unmeasured, &baseline.off(&now, &unmeasured, Global), &whole)
+            .expect_err("the oracle missed a bless of a crate the run did not measure");
+        assert!(why.contains("a bless of unmeasured `p` gave Some(Count(2))"), "{why}");
+        // And one that says an unmeasured crate's short count as stale.
+        let stale = baseline.off(&now, &Unmeasured::NONE, Global);
+        let why = partial_held(&baseline, &now, &unmeasured, &stale, &baseline.blessed(&now, &unmeasured))
+            .expect_err("the oracle missed an unmeasured crate said to be under");
+        assert!(why.contains("unmeasured `p` was said as Shrank"), "{why}");
     }
 }

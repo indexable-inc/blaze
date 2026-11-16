@@ -18,12 +18,22 @@ pub struct Homes<'a> {
     /// The first arena named outside the marking home's declared closure that is not open
     /// ([`crate::Inputs::open`]).
     outside: Option<ArenaId>,
+    /// The snapshot a liveness walk asks ([`Memo::live`]), and the first arena named that it
+    /// does not hold at that generation.
+    checking: Option<&'a Memo>,
+    dead: Option<ArenaId>,
 }
 
 impl Homes<'_> {
     pub fn arena(&mut self, arena: ArenaId) {
         if self.max.is_none_or(|max| arena > max) {
             self.max = Some(arena);
+        }
+        if let Some(memo) = self.checking
+            && self.dead.is_none()
+            && memo.try_slot(arena).is_none()
+        {
+            self.dead = Some(arena);
         }
         if let Some((memo, slot)) = self.marking {
             // An open arena is any home's to name: the borrow below is what keeps it sound.
@@ -41,9 +51,18 @@ impl Homes<'_> {
 /// The greatest arena `key` names, of the generation its ids hold; `None` when it names none.
 #[inline]
 pub(crate) fn named_home<K: Home + ?Sized>(key: &K) -> Option<ArenaId> {
-    let mut homes = Homes { max: None, marking: None, outside: None };
+    let mut homes = Homes { max: None, marking: None, outside: None, checking: None, dead: None };
     key.home(&mut homes);
     homes.max
+}
+
+/// The first arena `value` names that `memo` does not hold at the generation its ids hold
+/// (an id of a dropped arena, or of one made after `memo`); `None` when every id is live.
+#[inline]
+pub(crate) fn first_dead<K: Home + ?Sized>(memo: &Memo, value: &K) -> Option<ArenaId> {
+    let mut homes = Homes { max: None, marking: None, outside: None, checking: Some(memo), dead: None };
+    value.home(&mut homes);
+    homes.dead
 }
 
 /// The home of `key` in `memo`: the greatest arena it names, and for a key that names none,
@@ -73,17 +92,29 @@ pub(crate) fn mark_borrows<K: Home + ?Sized>(
     key: &K,
     name: &dyn Fn(&mut dyn std::fmt::Write),
 ) {
-    let mut homes = Homes { max: None, marking: Some((memo, slot)), outside: None };
+    let mut homes = Homes { max: None, marking: Some((memo, slot)), outside: None, checking: None, dead: None };
     key.home(&mut homes);
     if let Some(outside) = homes.outside
         && memo.plant() != crate::Plant::MarkOutsideClosure
     {
         let mut text = String::new();
         name(&mut text);
+        // Which of two mistakes it is: a live id of an unrelated crate (the key misses its
+        // asking crate), or an id of an arena this snapshot does not hold at that generation
+        // (an id kept past `Memo::next`, whatever its key).
+        let held = memo.held_at(outside.index());
+        if held == Some(outside) {
+            panic!(
+                "{text} is homed at {:?} but names {outside:?}, which is outside its home's declared \
+                 borrows (`Inputs::borrows`, closed over each dependency's): a key naming two \
+                 unrelated crates is missing its asking crate; add the asking `Crate` to the key",
+                slot.id
+            );
+        }
         panic!(
-            "{text} is homed at {:?} but names {outside:?}, which is outside its home's declared \
-             borrows (`Inputs::borrows`, closed over each dependency's): a key naming two \
-             unrelated crates is missing its asking crate; add the asking `Crate` to the key",
+            "{text} is homed at {:?} but names {outside:?}, which this snapshot does not hold (it \
+             holds {held:?} at that index): an id of a dropped arena, or of a later snapshot's, \
+             was kept across `Memo::next` and reached this key",
             slot.id
         );
     }
@@ -93,6 +124,14 @@ impl Home for Gid {
     #[inline]
     fn home(&self, homes: &mut Homes<'_>) {
         homes.arena(self.arena());
+        // A spill id is of the spill table of the one snapshot that made it, which a value kept
+        // across `Memo::next` cannot say: a liveness walk refuses it whatever its arena.
+        if self.is_spill()
+            && homes.checking.is_some()
+            && homes.dead.is_none()
+        {
+            homes.dead = Some(self.arena());
+        }
     }
 }
 

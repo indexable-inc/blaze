@@ -424,11 +424,12 @@ impl Walk {
 }
 
 /// What every test that can see `krate` observes, merged by function, and what they reach;
-/// once per crate and edit. Keyed by `top` ([`crate::query::top_crate`]) as well: its scope
-/// is the test targets that depend on `krate`, above it, so the entry lives in `top`'s arena.
+/// once per crate and edit. Keyed by `krate` alone, and homed in its arena: its scope is the
+/// test targets that depend on `krate`, above it, which a read may reach (each sets a borrow)
+/// but a key may not name (as [`crate::blaze::weight::rows::readers`] says, which was keyed
+/// the same way and refused the same way until 2026-11-15).
 #[blaze_memo::tracked(returns(ref), owns)]
-pub(crate) fn strength_index(db: &Db, krate: base_db::Crate, top: base_db::Crate) -> Index {
-    debug_assert!(krate <= top, "{krate:?} is past the top crate {top:?}");
+pub(crate) fn strength_index(db: &Db, krate: base_db::Crate) -> Index {
     let mut index = Index::default();
     
     let mut walk = Walk { queue: Vec::new(), queued: HashSet::new_in(Global) };
@@ -488,14 +489,11 @@ pub(crate) fn strength_index(db: &Db, krate: base_db::Crate, top: base_db::Crate
 pub(crate) struct StrengthKey {
     krate: base_db::Crate,
     f: FunctionId,
-    /// The session's greatest crate ([`crate::query::top_crate`]): the index reads the test
-    /// targets that depend on `krate`, above it, so the key names a crate at or above them.
-    top: base_db::Crate,
 }
 
 impl StrengthKey {
-    pub(crate) fn new(db: &Db, krate: base_db::Crate, f: FunctionId) -> StrengthKey {
-        StrengthKey { krate, f, top: crate::query::top_crate(db) }
+    pub(crate) fn new(_db: &Db, krate: base_db::Crate, f: FunctionId) -> StrengthKey {
+        StrengthKey { krate, f }
     }
 }
 
@@ -503,8 +501,8 @@ impl StrengthKey {
 /// it was leaves them as they were.
 #[blaze_memo::tracked(returns(ref), owns)]
 pub(crate) fn strength(db: &Db, key: StrengthKey) -> Answer {
-    let StrengthKey { krate, f, top } = key;
-    let index = strength_index(db, krate, top);
+    let StrengthKey { krate, f } = key;
+    let index = strength_index(db, krate);
     let mut answer = index.by_key.get(&root_path(db, f)).cloned().unwrap_or_default(); // clone: one function's answer
     answer.any_tests = index.tests > 0;
     answer.unread = index.unread.clone(); // clone: a few names
