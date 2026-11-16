@@ -4,8 +4,7 @@
 //! made, so readers take it as a type parameter, never as a trait object.
 
 use std::borrow::Cow;
-use std::fmt;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use crate::error::ManifestError;
 use crate::schema::TomlManifest;
@@ -91,185 +90,36 @@ impl Files for Disk {
     }
 }
 
-/// A directory of a glob pattern that could not be listed: `glob::GlobError`'s text, which
-/// cargo's "unable to match path to pattern" context wraps.
-#[derive(Debug)]
-pub struct GlobError {
-    path: PathBuf,
-    error: std::io::Error,
-}
+/// A directory of a glob pattern that could not be listed, which cargo's "unable to match path
+/// to pattern" context wraps.
+pub use blaze_glob::{GlobError, PatternError};
 
-impl fmt::Display for GlobError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "attempting to read `{}` resulted in an error: {}",
-            self.path.display(),
-            self.error
-        )
+/// `files` as the tree a pattern is walked over.
+struct Walked<'a, F>(&'a F);
+
+impl<F: Files> blaze_glob::Tree for Walked<'_, F> {
+    fn exists(&self, path: &Path) -> bool {
+        self.0.exists(path)
     }
-}
 
-impl std::error::Error for GlobError {
-    // dyn: std's error chain, read only on an error path.
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.error)
+    fn is_dir(&self, path: &Path) -> bool {
+        self.0.is_dir(path)
     }
-}
 
-/// One component of a pattern, parsed once.
-struct Part {
-    pattern: glob::Pattern,
-    /// `glob::Pattern`'s `has_metachars`: a `*`, `?` or `[` (a `[` that opens no class is a
-    /// pattern error already).
-    meta: bool,
-    /// `**`, which `glob::Pattern::new` only accepts as a whole component.
-    recursive: bool,
-    /// The first token is a literal `.`, so `.` and `..` match.
-    dot: bool,
-}
-
-/// A path to match against the parts from `.1` on; `usize::MAX` for one already matched whole.
-struct Todo {
-    path: PathBuf,
-    dir: bool,
-    at: usize,
+    fn list(&self, path: &Path) -> std::io::Result<Vec<(String, bool), std::alloc::Global>> {
+        let mut out = Vec::new_in(std::alloc::Global);
+        out.extend(self.0.list(path)?);
+        Ok(out)
+    }
 }
 
 /// `glob::glob(pattern)` read through `files`: the same matches in the same (alphabetical) order,
-/// the same pattern errors, and a [`GlobError`] where glob would give one. Ported from glob
-/// 0.3.3's `glob_with` and `fill_todo` with the default `MatchOptions`.
+/// the same pattern errors, and a [`GlobError`] where glob would give one (`blaze_glob::glob`).
 pub fn glob<F: Files>(
     files: &F,
     pattern: &str,
-) -> Result<Vec<Result<PathBuf, GlobError>>, glob::PatternError> {
-    glob::Pattern::new(pattern)?;
-    let mut components = Path::new(pattern).components().peekable();
-    while matches!(components.peek(), Some(Component::Prefix(..) | Component::RootDir)) {
-        components.next();
-    }
-    let rest: PathBuf = components.map(|c| c.as_os_str()).collect();
-    let normalized: PathBuf = Path::new(pattern).iter().collect();
-    let root_len = normalized.as_os_str().len() - rest.as_os_str().len();
-    let scope = if root_len > 0 { PathBuf::from(&pattern[..root_len]) } else { PathBuf::from(".") };
-
-    let mut parts = Vec::new();
-    for component in
-        pattern[root_len.min(pattern.len())..].split_terminator(std::path::is_separator)
-    {
-        parts.push(Part {
-            pattern: glob::Pattern::new(component)?,
-            meta: component.contains(['*', '?', '[']),
-            recursive: component == "**",
-            dot: component.starts_with('.'),
-        });
-    }
-    if root_len == pattern.len() {
-        parts.push(Part {
-            pattern: glob::Pattern::new("")?,
-            meta: false,
-            recursive: false,
-            dot: false,
-        });
-    }
-    let require_dir = pattern.chars().next_back().is_some_and(std::path::is_separator);
-    let options = glob::MatchOptions::new();
-
-    let mut out = Vec::new();
-    let mut todo: Vec<Result<Todo, GlobError>> = Vec::new();
-    let scope_dir = files.is_dir(&scope);
-    fill(files, &mut todo, &parts, 0, &scope, scope_dir);
-    while let Some(next) = todo.pop() {
-        let Todo { path, dir, mut at } = match next {
-            Ok(next) => next,
-            Err(e) => {
-                out.push(Err(e));
-                continue;
-            }
-        };
-        if at == usize::MAX {
-            if !require_dir || dir {
-                out.push(Ok(path));
-            }
-            continue;
-        }
-        if parts[at].recursive {
-            let mut last = at;
-            while last + 1 < parts.len() && parts[last + 1].recursive {
-                last += 1;
-            }
-            if dir {
-                fill(files, &mut todo, &parts, last, &path, dir);
-                if last == parts.len() - 1 {
-                    out.push(Ok(path));
-                    continue;
-                }
-                at = last + 1;
-            } else if last == parts.len() - 1 {
-                continue;
-            } else {
-                at = last + 1;
-            }
-        }
-        let Some(name) = path.file_name().and_then(|s| s.to_str()) else { continue };
-        if parts[at].pattern.matches_with(name, options) {
-            if at == parts.len() - 1 {
-                if !require_dir || dir {
-                    out.push(Ok(path));
-                }
-            } else {
-                fill(files, &mut todo, &parts, at + 1, &path, dir);
-            }
-        }
-    }
-    Ok(out)
-}
-
-fn fill<F: Files>(
-    files: &F,
-    todo: &mut Vec<Result<Todo, GlobError>>,
-    parts: &[Part],
-    at: usize,
-    path: &Path,
-    dir: bool,
-) {
-    let add = |todo: &mut Vec<Result<Todo, GlobError>>, next: PathBuf| {
-        let next_dir = files.is_dir(&next);
-        if at + 1 == parts.len() {
-            todo.push(Ok(Todo { path: next, dir: next_dir, at: usize::MAX }));
-        } else {
-            fill(files, todo, parts, at + 1, &next, next_dir);
-        }
-    };
-    let part = &parts[at];
-    let curdir = path == Path::new(".");
-    if !part.meta {
-        let s = part.pattern.as_str();
-        let special = s == "." || s == "..";
-        let next = if curdir { PathBuf::from(s) } else { path.join(s) };
-        if (special && dir) || (!special && files.exists(&next)) {
-            add(todo, next);
-        }
-    } else if dir {
-        match files.list(path) {
-            Ok(names) => {
-                for (name, is_dir) in names.into_iter().rev() {
-                    let child = if curdir { PathBuf::from(&name) } else { path.join(&name) };
-                    // glob follows a link to learn whether it is a directory.
-                    let child_dir = is_dir || files.is_dir(&child);
-                    todo.push(Ok(Todo { path: child, dir: child_dir, at }));
-                }
-                if part.dot {
-                    for special in [".", ".."] {
-                        if part.pattern.matches_with(special, glob::MatchOptions::new()) {
-                            add(todo, path.join(special));
-                        }
-                    }
-                }
-            }
-            Err(error) => todo.push(Err(GlobError { path: path.to_path_buf(), error })),
-        }
-    }
+) -> Result<Vec<Result<PathBuf, GlobError>, std::alloc::Global>, PatternError> {
+    blaze_glob::glob(&Walked(files), pattern)
 }
 
 #[cfg(test)]
@@ -527,9 +377,9 @@ pub(crate) mod tests {
         assert!(json.contains("/blaze-nowhere/w/crates/a/src/bin/multi/main.rs"), "{json}");
     }
 
-    /// On the machine's disk the port gives what glob itself gives.
+    /// On the machine's disk a walk gives what it gives over the same tree in memory.
     #[test]
-    fn on_disk_it_is_glob() {
+    fn on_disk_it_is_the_walk_in_memory() {
         let made = blaze_core::temp::TempDir::for_test("blaze-manifest-glob-");
         let root = made.path();
         for dir in ["m/a/src", "m/b", "m/.c", "n"] {
@@ -538,12 +388,21 @@ pub(crate) mod tests {
         std::fs::write(root.join("m/a/Cargo.toml"), "").unwrap();
         std::fs::write(root.join("m/file"), "").unwrap();
         let root = root.canonicalize().unwrap();
+        let at = |it: &str| format!("{}/{it}", root.display());
+        let mem = Mem::default()
+            .dir(&at("m/a/src"))
+            .dir(&at("m/b"))
+            .dir(&at("m/.c"))
+            .dir(&at("n"))
+            .file(&at("m/a/Cargo.toml"), "")
+            .file(&at("m/file"), "");
         for pattern in ["m/*", "m/*/", "m/**", "m/**/Cargo.toml", "[mn]", "m/a", "m/zz", "m/.*"] {
-            let pattern = format!("{}/{pattern}", root.display());
-            let ours: Vec<PathBuf> =
+            let pattern = at(pattern);
+            let disk: Vec<PathBuf> =
                 glob(&Disk, &pattern).unwrap().into_iter().map(Result::unwrap).collect();
-            let theirs: Vec<PathBuf> = glob::glob(&pattern).unwrap().map(Result::unwrap).collect();
-            assert_eq!(ours, theirs, "{pattern}");
+            let kept: Vec<PathBuf> =
+                glob(&mem, &pattern).unwrap().into_iter().map(Result::unwrap).collect();
+            assert_eq!(disk, kept, "{pattern}");
         }
     }
 }

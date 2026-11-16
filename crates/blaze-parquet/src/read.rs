@@ -363,7 +363,7 @@ impl<'a, A: Allocator + Clone> File<'a, A> {
 }
 
 /// The footer of `bytes`, and where it begins.
-fn footer<A: Allocator + Clone>(bytes: &[u8], alloc: &A) -> Result<(FileMeta<A>, usize), ParquetError> {
+pub(crate) fn footer<A: Allocator + Clone>(bytes: &[u8], alloc: &A) -> Result<(FileMeta<A>, usize), ParquetError> {
     if bytes.len() < 12 {
         return Err(ParquetError::NotParquet { why: "fewer than 12 bytes" });
     }
@@ -687,7 +687,7 @@ impl<'n, A: Allocator + Clone> State<'n, A> {
                 Cursor::Dict { indices, at, dict } => {
                     let index = indices[*at].widen_to::<usize>();
                     *at += 1;
-                    sink.copy(dict, index, name)
+                    sink.copy(*dict, index, name)
                 }
             }
         };

@@ -105,17 +105,56 @@ pub fn to_string_in<A: Allocator, B: Allocator + Clone>(
 
 /// `value` as JSON text appended to `out`; an error's path is made in `out`'s allocator. On an
 /// error, `out` holds what was written before it.
+///
+/// The value is walked with its open containers on a stack in `out`'s allocator, so no depth
+/// recurses.
 pub fn write_into<A: Allocator, B: Allocator + Clone>(
     value: &Value<A>,
     out: &mut String<B>,
     options: WriteOptions,
 ) -> Result<(), WriteError<B>> {
-    write_value(value, out, options, &At::ROOT, 0)
+    let order = match options.keys {
+        KeyOrder::Sorted => Order::Sorted,
+        KeyOrder::Insertion => Order::Insertion,
+    };
+    let pretty = matches!(options.style, Style::Pretty { .. });
+    let mut walk = Walk::new_in(value, order, out.allocator().clone());
+    while let Some(visit) = walk.next() {
+        match visit {
+            Visit::Leaf(leaf) => leaf_into(leaf, out, options.bytes).map_err(|what| fail(out, &walk, what))?,
+            Visit::StartList(_) => out.push('['),
+            Visit::StartMap(_) => out.push('{'),
+            Visit::Item(i) => {
+                if i > 0 {
+                    out.push(',');
+                }
+                newline(out, options.style, walk.depth());
+            }
+            Visit::Key(i, key) => {
+                if i > 0 {
+                    out.push(',');
+                }
+                newline(out, options.style, walk.depth());
+                escape(key, out);
+                out.push(':');
+                if pretty {
+                    out.push(' ');
+                }
+            }
+            Visit::EndList(len) | Visit::EndMap(len) => {
+                if len > 0 {
+                    newline(out, options.style, walk.depth());
+                }
+                out.push(if matches!(visit, Visit::EndMap(_)) { '}' } else { ']' });
+            }
+        }
+    }
+    Ok(())
 }
 
-fn fail<B: Allocator + Clone>(out: &String<B>, at: &At<'_>, what: Unwritable) -> WriteError<B> {
+fn fail<A: Allocator, B: Allocator + Clone>(out: &String<B>, walk: &Walk<'_, A, B>, what: Unwritable) -> WriteError<B> {
     let mut path = String::new_in(out.allocator().clone());
-    if at.write_into(&mut path).is_err() {
+    if walk.path_into(&mut path).is_err() {
         unreachable!("writing into a `String` does not fail");
     }
     WriteError { path, what }

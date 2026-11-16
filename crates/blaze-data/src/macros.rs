@@ -132,3 +132,54 @@ macro_rules! __value {
         $crate::ToValue::to_value(&$other, ::core::clone::Clone::clone(&$a))
     };
 }
+
+/// [`FromValue`](crate::FromValue) and [`ToValue`](crate::ToValue) for a plain struct, a map
+/// with one key per field named as the field: the required fields, then after `;` the
+/// optional ones (each an `Option`, missing or null read as `None`, `None` left out when
+/// written):
+///
+/// ```ignore
+/// struct Run<A: Allocator> { suite: String<A>, timeout: u32, ids: Option<Vec<String<A>, A>> }
+/// blaze_data::fields!(for<A> Run<A> { suite, timeout; ids });
+/// struct Flags { on: bool }
+/// blaze_data::fields!(for<A> Flags { on });
+/// ```
+///
+/// The read is [`Cursor::fields`](crate::Cursor::fields), so a key that is no field is refused,
+/// naming it and the fields.
+#[macro_export]
+macro_rules! fields {
+    (for<$a:ident> $name:ident $(<$p:ident>)? { $($req:ident),* $(,)? $(; $($opt:ident),* $(,)?)? }) => {
+        impl<$a: ::core::alloc::Allocator + ::core::clone::Clone> $crate::FromValue<$a> for $name $(<$p>)? {
+            fn from_value(c: &$crate::Cursor<'_, '_, $a>) -> ::core::result::Result<Self, $crate::ShapeError<$a>> {
+                c.fields(|f| {
+                    ::core::result::Result::Ok($name {
+                        $($req: f.take(::core::stringify!($req))?,)*
+                        $($($opt: f.take_opt(::core::stringify!($opt))?,)*)?
+                    })
+                })
+            }
+        }
+
+        impl<$a: ::core::alloc::Allocator + ::core::clone::Clone> $crate::ToValue<$a> for $name $(<$p>)? {
+            fn to_value(&self, alloc: $a) -> $crate::Value<$a> {
+                let mut map = $crate::Map::new_in(::core::clone::Clone::clone(&alloc));
+                $(
+                    map.insert(
+                        $crate::__private::String::from_str_in(::core::stringify!($req), ::core::clone::Clone::clone(&alloc)),
+                        $crate::ToValue::to_value(&self.$req, ::core::clone::Clone::clone(&alloc)),
+                    );
+                )*
+                $($(
+                    if let ::core::option::Option::Some(value) = &self.$opt {
+                        map.insert(
+                            $crate::__private::String::from_str_in(::core::stringify!($opt), ::core::clone::Clone::clone(&alloc)),
+                            $crate::ToValue::to_value(value, ::core::clone::Clone::clone(&alloc)),
+                        );
+                    }
+                )*)?
+                $crate::Value::Map(map)
+            }
+        }
+    };
+}

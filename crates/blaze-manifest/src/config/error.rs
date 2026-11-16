@@ -101,7 +101,13 @@ pub enum ConfigWhat {
     SourceTwoLocations { name: String },
     SourceNotFound { name: String, orig: String, location: String },
     SourceCycle { name: String, location: String },
-    SeveralMatching { what: &'static str, first: String, first_in: Definition, second: String, second_in: Definition },
+    SeveralMatching {
+        what: &'static str,
+        first: String,
+        first_in: Definition,
+        second: String,
+        second_in: Definition,
+    },
     TargetEmpty,
     TargetSpec { target: String },
     NoHostLine { verbose: String },
@@ -393,7 +399,7 @@ pub struct TomlError {
 impl TomlError {
     pub(crate) fn new(error: &blaze_toml::Error, text: &str) -> TomlError {
         let (line, column) = error.line_col(text);
-        let at = error.at.min(text.len());
+        let at = text.floor_char_boundary(error.at);
         let start = text[..at].rfind('\n').map_or(0, |i| i + 1);
         let end = text[at..].find('\n').map_or(text.len(), |i| at + i);
         let line_text = text[start..end].strip_suffix('\r').unwrap_or(&text[start..end]);

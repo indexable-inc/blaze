@@ -18,7 +18,6 @@ blaze-data.workspace = true
 blaze-toml.workspace = true
 serde = { workspace = true, features = ["derive"] }
 sonic-rs.workspace = true
-toml.workspace = true
 blaze-unicode.workspace = true
 
 [dev-dependencies]

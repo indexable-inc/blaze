@@ -22,10 +22,9 @@ use crate::resolver::{
     ActivateError, ActivateResult, CliFeatures, RequestedFeatures, ResolveOpts, VersionOrdering,
     VersionPreferences,
 };
-use crate::{Dependency, FeatureValue, PackageId, PackageIdSpec, Registry, Summary};
+use crate::{Dependency, FeatureValue, PackageId, PackageIdSpec, Registry, ResolveError, Summary};
 
 use crate::resolver::{HashMap, HashSet};
-use anyhow::Context as _;
 use blaze_ids::radix;
 use std::alloc::Global;
 use std::cell::RefCell;
@@ -106,27 +105,18 @@ impl<'a, T: Registry> RegistryQueryerAsync<'a, T> {
                         _ => None,
                     }
                 });
-            let s = summaries.next().ok_or_else(|| {
-                anyhow::format_err!(
-                    "no matching package for override `{}` found\n\
-                     location searched: {}\n\
-                     version required: {}",
-                    spec,
-                    dep.source_id(),
-                    dep.version_req()
-                )
+            let s = summaries.next().ok_or_else(|| ResolveError::OverrideNotFound {
+                spec: spec.clone(), // clone: error path
+                source: dep.source_id(),
+                req: dep.version_req().clone(), // clone: error path
             })?;
             let summaries = summaries.collect::<Vec<_>>();
             if !summaries.is_empty() {
-                let bullets =
-                    summaries.iter().map(|s| format!("  * {}", s.package_id())).collect::<Vec<_>>();
-                return Err(anyhow::anyhow!(
-                    "the replacement specification `{}` matched \
-                     multiple packages:\n  * {}\n{}",
-                    spec,
-                    s.package_id(),
-                    bullets.join("\n")
-                ));
+                return Err(ResolveError::OverrideAmbiguous {
+                    spec: spec.clone(), // clone: error path
+                    first: s.package_id(),
+                    rest: summaries.iter().map(|s| s.package_id()).collect(),
+                });
             }
 
             assert_eq!(
@@ -135,13 +125,11 @@ impl<'a, T: Registry> RegistryQueryerAsync<'a, T> {
                 "dependency should be hard coded to have the same name"
             );
             if s.version() != summary.version() {
-                return Err(anyhow::anyhow!(
-                    "replacement specification `{}` matched {} and tried to override it with {}\n\
-                     avoid matching unrelated packages by being more specific",
-                    spec,
-                    summary.version(),
-                    s.version(),
-                ));
+                return Err(ResolveError::OverrideVersion {
+                    spec: spec.clone(), // clone: error path
+                    version: summary.version().clone(),
+                    with: s.version().clone(),
+                });
             }
 
             let replace = if s.source_id() == summary.source_id() {
@@ -154,13 +142,11 @@ impl<'a, T: Registry> RegistryQueryerAsync<'a, T> {
 
             // Make sure no duplicates
             if let Some((spec, _)) = potential_matches.next() {
-                return Err(anyhow::anyhow!(
-                    "overlapping replacement specifications found:\n\n  \
-                     * {}\n  * {}\n\nboth specifications match: {}",
-                    matched_spec,
-                    spec,
-                    summary.package_id()
-                ));
+                return Err(ResolveError::OverrideOverlap {
+                    first: matched_spec,
+                    second: spec.clone(), // clone: error path
+                    package: summary.package_id(),
+                });
             }
 
             for dep in summary.dependencies() {
@@ -297,12 +283,10 @@ impl<'a, T: Registry, Q: Query> RegistryQueryer<'a, T, Q> {
                     // until there are none to ignore
                     None
                 }
-                Poll::Ready(Err(e)) => Some(Err(e).with_context(|| {
-                    format!(
-                        "failed to get `{}` as a dependency of {}",
-                        dep.package_name(),
-                        describe_path_in_context(cx, &candidate.package_id()),
-                    )
+                Poll::Ready(Err(e)) => Some(Err(ResolveError::DependencyQuery {
+                    dep: dep.package_name(),
+                    path: describe_path_in_context(cx, &candidate.package_id()),
+                    cause: Box::new(e),
                 })),
             })
             .collect::<CargoResult<Vec<DepInfo>>>()?;
@@ -553,12 +537,11 @@ impl RequirementError {
                                 |key| key,
                                 "feature",
                             );
-                            ActivateError::Fatal(anyhow::format_err!(
-                                "package `{}` does not have the feature `{}`{}",
-                                summary.package_id(),
-                                feat,
-                                closest
-                            ))
+                            ActivateError::Fatal(ResolveError::NoFeature {
+                                package: summary.package_id(),
+                                feature: feat,
+                                closest,
+                            })
                         }
                         Some(p) => ActivateError::Conflict(p, ConflictReason::MissingFeature(feat)),
                     };
@@ -581,17 +564,11 @@ impl RequirementError {
                                     suggestion.push_str("\n\t  ...");
                                 }
                             }
-                            ActivateError::Fatal(anyhow::format_err!(
-                                "\
-package `{}` does not have feature `{}`
-
-help: an optional dependency \
-with that name exists, but the `features` table includes it with the \"dep:\" \
-syntax so it does not have an implicit feature with that name{}",
-                                summary.package_id(),
-                                feat,
-                                suggestion
-                            ))
+                            ActivateError::Fatal(ResolveError::NonImplicitFeature {
+                                package: summary.package_id(),
+                                feature: feat,
+                                suggestion,
+                            })
                         }
                         Some(p) => ActivateError::Conflict(
                             p,
@@ -600,13 +577,10 @@ syntax so it does not have an implicit feature with that name{}",
                     }
                 } else {
                     match parent {
-                        None => ActivateError::Fatal(anyhow::format_err!(
-                            "package `{}` does not have feature `{}`
-
-help: a dependency with that name exists but it is required dependency and only optional dependencies can be used as features.",
-                            summary.package_id(),
-                            feat,
-                        )),
+                        None => ActivateError::Fatal(ResolveError::RequiredDependencyAsFeature {
+                            package: summary.package_id(),
+                            feature: feat,
+                        }),
                         Some(p) => ActivateError::Conflict(
                             p,
                             ConflictReason::RequiredDependencyAsFeature(feat),
@@ -616,20 +590,18 @@ help: a dependency with that name exists but it is required dependency and only 
             }
             RequirementError::MissingDependency(dep_name) => {
                 match parent {
-                    None => ActivateError::Fatal(anyhow::format_err!(
-                        "package `{}` does not have a dependency named `{}`",
-                        summary.package_id(),
-                        dep_name
-                    )),
+                    None => ActivateError::Fatal(ResolveError::NoDependencyNamed {
+                        package: summary.package_id(),
+                        dep: dep_name,
+                    }),
                     // This code path currently isn't used, since `foo/bar`
                     // and `dep:` syntax is not allowed in a dependency.
                     Some(p) => ActivateError::Conflict(p, ConflictReason::MissingFeature(dep_name)),
                 }
             }
-            RequirementError::Cycle(feat) => ActivateError::Fatal(anyhow::format_err!(
-                "cyclic feature dependency: feature `{}` depends on itself",
-                feat
-            )),
+            RequirementError::Cycle(feat) => {
+                ActivateError::Fatal(ResolveError::FeatureCycle { feature: feat })
+            }
         }
     }
 }

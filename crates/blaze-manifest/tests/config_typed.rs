@@ -9,7 +9,7 @@ use blaze_core::temp::TempDir;
 use blaze_manifest::Config;
 use blaze_manifest::config::{CompileKind, Flags, Replacement};
 use blaze_manifest::files::Disk;
-use cargo_platform::Cfg;
+use blaze_resolve::Cfg;
 
 struct Tree {
     root: PathBuf,

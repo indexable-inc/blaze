@@ -52,7 +52,8 @@ impl Place {
             Ok(n) => n,
             Err(_) => unreachable!("half of a word fits in 32 bits"),
         };
-        (word != 0).then(|| Place { line: half(word >> 32), column: half(word & u64::from(u32::MAX)) })
+        let place = || Place { line: half(word >> 32), column: half(word & u64::from(u32::MAX)) };
+        (word != 0).then(place)
     }
 }
 

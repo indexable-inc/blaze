@@ -131,15 +131,8 @@ impl fmt::Display for ProfileError {
     }
 }
 
-impl core::error::Error for ProfileError {
-    // dyn: std's error chain, read only on an error path.
-    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-        match self {
-            ProfileError::Name(e) => Some(e),
-            _ => None,
-        }
-    }
-}
+// A `Name` prints its error's words, so it has no cause of its own to chain.
+impl core::error::Error for ProfileError {}
 
 fn spec_matches(spec: &PackageIdSpec, pkg: &PackageId) -> bool {
     if spec.name() != pkg.name {
@@ -156,7 +149,7 @@ fn spec_matches(spec: &PackageIdSpec, pkg: &PackageId) -> bool {
         return false;
     }
     if let Some(k) = spec.kind()
-        && !crate::source::spec_kind_is(k, pkg.source_id.kind())
+        && k != pkg.source_id.kind()
     {
         return false;
     }
@@ -187,7 +180,7 @@ impl Profiles {
         config: &Config<F>,
         requested_profile: &str,
         rustc_host: &str,
-    ) -> anyhow::Result<Profiles> {
+    ) -> Result<Profiles, ManifestError> {
         let incremental = match config.env("CARGO_INCREMENTAL") {
             Some(v) => Some(v == "1"),
             None => config.build_config()?.incremental.or_else(|| is_ci(config).then_some(false)),
@@ -237,13 +230,13 @@ impl Profiles {
         name: &str,
         profile: &TomlProfile,
         profiles: &BTreeMap<String, TomlProfile>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), ProfileError> {
         if let Some(dir_name) = &profile.dir_name {
             self.dir_names.insert(name.to_owned(), dir_name.clone());
         }
         if name == "dev" || name == "release" {
             if profile.inherits.is_some() {
-                bail!("`inherits` must not be specified in root profile `{name}`");
+                return Err(ProfileError::InheritsInRoot { name: name.to_owned() });
             }
             return Ok(());
         }
@@ -260,28 +253,29 @@ impl Profiles {
         profile: &TomlProfile,
         set: &mut HashSet<String, Global>,
         profiles: &BTreeMap<String, TomlProfile>,
-    ) -> anyhow::Result<ProfileMaker> {
+    ) -> Result<ProfileMaker, ProfileError> {
         let mut maker = match &profile.inherits {
             Some(inherits_name) if inherits_name == "dev" || inherits_name == "release" => {
-                self.get_profile_maker(inherits_name).unwrap().clone()
+                self.get_profile_maker(inherits_name)?.clone()
             }
             Some(inherits_name) => {
                 if !set.insert(inherits_name.clone()) {
-                    bail!(
-                        "profile inheritance loop detected with profile `{name}` inheriting `{inherits_name}`"
-                    );
+                    return Err(ProfileError::InheritanceLoop {
+                        name: name.to_owned(),
+                        inherits: inherits_name.clone(),
+                    });
                 }
                 match profiles.get(inherits_name) {
-                    None => bail!(
-                        "profile `{name}` inherits from `{inherits_name}`, but that profile is not defined"
-                    ),
+                    None => {
+                        return Err(ProfileError::InheritsUndefined {
+                            name: name.to_owned(),
+                            inherits: inherits_name.clone(),
+                        });
+                    }
                     Some(parent) => self.process_chain(inherits_name, parent, set, profiles)?,
                 }
             }
-            None => bail!(
-                "profile `{name}` is missing an `inherits` directive \
-                 (`inherits` is required for all profiles except `dev` or `release`)"
-            ),
+            None => return Err(ProfileError::MissingInherits { name: name.to_owned() }),
         };
         match &mut maker.toml {
             Some(toml) => toml.merge(profile),
@@ -384,7 +378,7 @@ impl Profiles {
         manifest_profiles: Option<&TomlProfiles>,
         packages: &[&PackageId],
         warnings: &mut Vec<String>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), ManifestError> {
         let mut names: Vec<&String> = self.by_name.keys().collect();
         names.sort();
         for name in names {
@@ -400,8 +394,8 @@ impl Profiles {
         Ok(())
     }
 
-    fn get_profile_maker(&self, name: &str) -> anyhow::Result<&ProfileMaker> {
-        self.by_name.get(name).ok_or_else(|| anyhow::anyhow!("profile `{name}` is not defined"))
+    fn get_profile_maker(&self, name: &str) -> Result<&ProfileMaker, ProfileError> {
+        self.by_name.get(name).ok_or_else(|| ProfileError::NotDefined { name: name.to_owned() })
     }
 
     pub fn profile_names(&self) -> impl Iterator<Item = &str> {
@@ -411,7 +405,7 @@ impl Profiles {
     /// blaze: takes the requested profile's `contract-checks` from `keys` (the root manifest's,
     /// [`read_contract_checks`]): the first profile of its `inherits` chain that sets one, else
     /// the default of the chain's root (`dev` on, `release` off), which the makers carry.
-    pub fn set_contract_checks(&mut self, keys: &ContractChecks) -> anyhow::Result<()> {
+    pub fn set_contract_checks(&mut self, keys: &ContractChecks) -> Result<(), ManifestError> {
         let mut name = self.requested_profile.as_str();
         // `Profiles::new` refused every cycle; the bound is for a chain it did not walk.
         for _ in 0..=self.original_profiles.len() + PREDEFINED_INHERITS.len() {
@@ -430,10 +424,7 @@ impl Profiles {
                 },
             };
         }
-        bail!(
-            "profile `{}`'s `inherits` chain does not end at `dev` or `release`, reading its `contract-checks`",
-            self.requested_profile
-        )
+        Err(ProfileError::ContractChecksChain { name: self.requested_profile.clone() }.into())
     }
 }
 
@@ -454,43 +445,48 @@ pub struct ContractChecks {
 /// setting: the crate cfg of every unit of the build), is an error naming the key.
 pub fn read_contract_checks<F: Files>(
     files: &F,
-    path: &std::path::Path,
-) -> anyhow::Result<ContractChecks> {
-    // alloc: an error's context, made only when the read fails.
-    let bytes = files.read(path).with_context(|| format!("failed to read `{}`", path.display()))?;
+    path: &Path,
+) -> Result<ContractChecks, ManifestError> {
+    let bytes = files
+        .read(path)
+        .map_err(|error| ManifestError::Read { path: path.to_owned(), error })?;
     let text = std::str::from_utf8(&bytes)
-        .map_err(|_| anyhow::anyhow!("path at `{}` was not valid utf-8", path.display()))?;
-    contract_checks_of(text)
-        .with_context(|| format!("failed to parse manifest at `{}`", path.display()))
+        .map_err(|_| ManifestError::NotUtf8 { path: path.to_owned() })?;
+    contract_checks_of(text, path).context(|| Context::ParseManifest { path: path.to_owned() })
 }
 
-/// [`read_contract_checks`] of a manifest's text.
-pub fn contract_checks_of(manifest: &str) -> anyhow::Result<ContractChecks> {
+/// [`read_contract_checks`] of the text of the manifest at `path` (named by a TOML error).
+pub fn contract_checks_of(manifest: &str, path: &Path) -> Result<ContractChecks, ManifestError> {
     const KEY: &str = "contract-checks";
-    let table: toml::Table = manifest.parse()?;
+    let doc = Document::parse_in(manifest, blaze_toml::Limits::CARGO, Global)
+        .map_err(|e| ManifestDiagnostic::toml(e, manifest, path))?;
     let mut by_profile = BTreeMap::new();
-    let Some(profiles) = table.get("profile").and_then(toml::Value::as_table) else {
+    let Some(profiles) = doc.root().get("profile").filter(Item::is_table) else {
         return Ok(ContractChecks { by_profile });
     };
-    for (name, profile) in profiles {
-        let Some(profile) = profile.as_table() else { continue };
+    for profile in profiles.children() {
+        let name = profile.key();
+        if !profile.is_table() {
+            continue;
+        }
         if let Some(value) = profile.get(KEY) {
             let Some(on) = value.as_bool() else {
-                bail!("`profile.{name}.{KEY}` is a boolean (`true` or `false`), not `{value}`");
+                // alloc: the error's words, on the error path
+                let value = manifest[value.span()].to_owned();
+                return Err(ProfileError::ContractChecksNotBool { name: name.to_owned(), value }
+                    .into());
             };
-            by_profile.insert(name.clone(), on);
+            by_profile.insert(name.to_owned(), on);
         }
-        let nested =
-            profile.get("build-override").into_iter().map(|it| ("build-override".to_owned(), it));
-        let packages = profile.get("package").and_then(toml::Value::as_table).into_iter().flatten();
+        let nested = profile.get("build-override").map(|it| ("build-override".to_owned(), it));
+        let packages = profile.get("package").filter(Item::is_table);
+        let packages = packages.into_iter().flat_map(|it| it.children());
         for (place, table) in
-            nested.chain(packages.map(|(spec, it)| (format!("package.{spec}"), it)))
+            nested.into_iter().chain(packages.map(|it| (format!("package.{}", it.key()), it)))
         {
             if table.get(KEY).is_some() {
-                bail!(
-                    "`profile.{name}.{place}.{KEY}`: `{KEY}` is a setting of the whole profile, \
-                     set under `[profile.{name}]`, not for one package or the build's host units"
-                );
+                return Err(ProfileError::ContractChecksNested { name: name.to_owned(), place }
+                    .into());
             }
         }
     }
@@ -503,15 +499,13 @@ pub fn requested_profile(
     default: &str,
     release: bool,
     profile: Option<&str>,
-) -> anyhow::Result<String> {
+) -> Result<String, ManifestError> {
     match (release, profile) {
         (false, None) => Ok(default.to_owned()),
         (true, None) => Ok("release".to_owned()),
-        (_, Some("doc")) => {
-            bail!("profile `doc` is reserved and not allowed to be explicitly specified")
-        }
+        (_, Some("doc")) => Err(ProfileError::DocReserved.into()),
         (_, Some(name)) => {
-            ProfileName::new(name)?;
+            ProfileName::new(name).map_err(ProfileError::Name)?;
             Ok(name.to_owned())
         }
     }
@@ -954,7 +948,7 @@ fn merge_config_profiles<F: Files>(
     features: &Features,
     config: &Config<F>,
     requested_profile: &str,
-) -> anyhow::Result<BTreeMap<String, TomlProfile>> {
+) -> Result<BTreeMap<String, TomlProfile>, ManifestError> {
     let mut profiles: BTreeMap<String, TomlProfile> = match manifest_profiles {
         Some(profiles) => {
             profiles.get_all().iter().map(|(k, v)| (k.to_string(), v.clone())).collect()
@@ -995,11 +989,14 @@ fn get_config_profile<F: Files>(
     features: &Features,
     config: &Config<F>,
     name: &str,
-) -> anyhow::Result<Option<TomlProfile>> {
+) -> Result<Option<TomlProfile>, ManifestError> {
     let Some(profile) = config.config_profile(name)? else { return Ok(None) };
     let mut warnings = Vec::new();
-    validate_profile(&profile.val, name, features, config.unstable(), &mut warnings).with_context(
-        || format!("config profile `{name}` is not valid (defined in `{}`)", profile.definition),
+    validate_profile(&profile.val, name, features, config.unstable(), &mut warnings).context(
+        || Context::ConfigProfile {
+            name: name.to_owned(),
+            definition: profile.definition.to_string(),
+        },
     )?;
     for warning in warnings {
         config.warn(warning);
@@ -1011,7 +1008,7 @@ fn validate_packages_unique(
     packages: &[&PackageId],
     name: &str,
     toml: Option<&TomlProfile>,
-) -> anyhow::Result<Vec<PackageIdSpec>> {
+) -> Result<Vec<PackageIdSpec>, ProfileError> {
     let Some(overrides) = toml.and_then(|t| t.package.as_ref()) else { return Ok(Vec::new()) };
     let mut found = Vec::new();
     for pkg in packages {
@@ -1030,11 +1027,11 @@ fn validate_packages_unique(
                 }
             }
             _ => {
-                let specs = matches.iter().map(|s| s.to_string()).collect::<Vec<_>>().join(", ");
-                bail!(
-                    "multiple package overrides in profile `{name}` match package `{pkg}`\n\
-                     found package specs: {specs}"
-                );
+                return Err(ProfileError::MultipleOverrides {
+                    name: name.to_owned(),
+                    package: pkg.to_string(),
+                    specs: matches.iter().map(|s| s.to_string()).collect(),
+                });
             }
         }
     }
@@ -1082,7 +1079,7 @@ pub fn validate_profiles(
     features: &Features,
     unstable: &CliUnstable,
     warnings: &mut Vec<String>,
-) -> anyhow::Result<()> {
+) -> Result<(), ManifestError> {
     for (name, profile) in profiles.get_all() {
         validate_profile(profile, name, features, unstable, warnings)?;
     }
@@ -1100,7 +1097,7 @@ pub fn validate_profile(
     features: &Features,
     unstable: &CliUnstable,
     warnings: &mut Vec<String>,
-) -> anyhow::Result<()> {
+) -> Result<(), ManifestError> {
     validate_profile_layer(root, features, unstable)?;
     if let Some(profile) = &root.build_override {
         validate_profile_override(profile, "build-override")?;
@@ -1113,10 +1110,8 @@ pub fn validate_profile(
         }
     }
     if let Some(dir_name) = &root.dir_name {
-        bail!(
-            "dir-name=\"{dir_name}\" in profile `{name}` is not currently allowed, \
-             directory names are tied to the profile name for custom profiles"
-        );
+        return Err(ProfileError::DirName { dir_name: dir_name.clone(), name: name.to_owned() }
+            .into());
     }
     match name {
         "doc" => warnings.push("profile `doc` is deprecated and has no effect".to_owned()),
@@ -1130,19 +1125,12 @@ pub fn validate_profile(
         && panic != "abort"
         && panic != "immediate-abort"
     {
-        bail!(
-            "`panic` setting of `{panic}` is not a valid setting, \
-             must be `unwind`, `abort`, or `immediate-abort`."
-        );
+        return Err(ProfileError::Panic { panic: panic.clone() }.into());
     }
     if let Some(StringOrBool::String(arg)) = &root.lto
         && (arg == "true" || arg == "false")
     {
-        bail!(
-            "`lto` setting of string `\"{arg}\"` for `{name}` profile is not \
-             a valid setting, must be a boolean (`true`/`false`) or a string \
-             (`\"thin\"`/`\"fat\"`/`\"off\"`) or omitted."
-        );
+        return Err(ProfileError::LtoString { arg: arg.clone(), name: name.to_owned() }.into());
     }
     Ok(())
 }
@@ -1151,7 +1139,7 @@ fn validate_profile_layer(
     profile: &TomlProfile,
     features: &Features,
     unstable: &CliUnstable,
-) -> anyhow::Result<()> {
+) -> Result<(), ManifestError> {
     if profile.codegen_backend.is_some() && !unstable.codegen_backend {
         features.require(Feature::codegen_backend)?;
     }
@@ -1164,21 +1152,23 @@ fn validate_profile_layer(
     Ok(())
 }
 
-fn validate_profile_override(profile: &TomlProfile, which: &str) -> anyhow::Result<()> {
+fn validate_profile_override(
+    profile: &TomlProfile,
+    which: &'static str,
+) -> Result<(), ProfileError> {
     if profile.package.is_some() {
-        bail!("package-specific profiles cannot be nested");
+        return Err(ProfileError::NestedPackage);
     }
     if profile.build_override.is_some() {
-        bail!("build-override profiles cannot be nested");
+        return Err(ProfileError::NestedBuildOverride);
     }
-    if profile.panic.is_some() {
-        bail!("`panic` may not be specified in a `{which}` profile")
+    let set = [
+        ("panic", profile.panic.is_some()),
+        ("lto", profile.lto.is_some()),
+        ("rpath", profile.rpath.is_some()),
+    ];
+    match set.into_iter().find(|&(_, is_set)| is_set) {
+        Some((key, _)) => Err(ProfileError::InOverride { key, which }),
+        None => Ok(()),
     }
-    if profile.lto.is_some() {
-        bail!("`lto` may not be specified in a `{which}` profile")
-    }
-    if profile.rpath.is_some() {
-        bail!("`rpath` may not be specified in a `{which}` profile")
-    }
-    Ok(())
 }

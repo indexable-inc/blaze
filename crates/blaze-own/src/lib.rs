@@ -71,7 +71,7 @@
 //!
 //! # Send and Sync
 //!
-//! Exactly as std's: `Vec`, `Box`, `VecDeque`, the sorted map and set and the
+//! Exactly as std's: `Vec`, `Box`, `VecDeque`, the sorted and B-tree maps and sets and the
 //! struct-of-arrays vector are `Send` when `T: Send, A: Send` and `Sync` when
 //! `T: Sync, A: Sync`; `Arc` and `arc::Weak` are both when `T: Send + Sync, A: Send + Sync`;
 //! `Rc` and `rc::Weak` are neither.

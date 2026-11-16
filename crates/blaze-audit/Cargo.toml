@@ -14,15 +14,13 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
-blaze-toml.workspace = true
-blaze-semver.workspace = true
 # The one tree listing (`blaze tree 2`) a git source's digest is over, and `Digest`'s one
 # spelling (`blake3:<hex>`) and refusal of weak algorithms by name.
 blaze-fetch.workspace = true
 # The advisories' version ranges and the lock's exact versions.
-semver.workspace = true
+blaze-semver.workspace = true
 # The advisories' front matter, blaze.lock's tables and the workspace's settings.
-toml.workspace = true
+blaze-toml.workspace = true
 # `--json`, and the sparse index's lines the yanked check reads.
 blaze-data.workspace = true
 blaze-json.workspace = true

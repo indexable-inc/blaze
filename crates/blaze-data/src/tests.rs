@@ -98,12 +98,12 @@ struct Run {
 
 impl FromValue<Global> for Run {
     fn from_value(c: &Cursor<'_, '_, Global>) -> Result<Run, ShapeError<Global>> {
-        c.deny_unknown(&["suite", "timeout_minutes", "ids"])?;
-        let ids: Option<blaze_own::Vec<String<Global>, Global>> = c.opt("ids")?;
-        Ok(Run {
-            suite: c.field("suite")?.text()?.to_string(),
-            timeout_minutes: c.opt("timeout_minutes")?.unwrap_or(300),
-            ids: ids.map(|ids| ids.iter().map(|s| s.as_str().to_string()).collect()).unwrap_or_default(),
+        c.fields(|f| {
+            let suite = f.cursor("suite")?.text()?.to_string();
+            let timeout_minutes = f.take_opt("timeout_minutes")?.unwrap_or(300);
+            let ids: Option<blaze_own::Vec<String<Global>, Global>> = f.take_opt("ids")?;
+            let ids = ids.map(|ids| ids.iter().map(|s| s.as_str().to_string()).collect()).unwrap_or_default();
+            Ok(Run { suite, timeout_minutes, ids })
         })
     }
 }
@@ -118,7 +118,10 @@ fn typed_reading_names_the_path() {
     assert_eq!(run, Run { suite: "uv".into(), timeout_minutes: 300, ids: ["a".into()].into() });
     assert_eq!(read(&value!(in Global; [1])).unwrap_err(), "the value: expected map, found list");
     assert_eq!(read(&value!(in Global; {})).unwrap_err(), "suite: missing");
-    assert_eq!(read(&value!(in Global; {"suite": "uv", "zeta": 1})).unwrap_err(), "zeta: no such field");
+    assert_eq!(
+        read(&value!(in Global; {"suite": "uv", "zeta": 1})).unwrap_err(),
+        r#"the value: unknown field "zeta"; known: "suite", "timeout_minutes", "ids""#
+    );
     assert_eq!(
         read(&value!(in Global; {"suite": "uv", "ids": ["a", 2]})).unwrap_err(),
         "ids[1]: expected text, found integer"
@@ -136,6 +139,133 @@ fn typed_reading_names_the_path() {
     assert_eq!(error.to_string(), r#"a.b[3]."x.y": expected text, found bool"#);
     assert_eq!(b.index(9).unwrap_err().shape, Shape::NoIndex { len: 4 });
     assert_eq!(root.field("a").unwrap().expected(Kind::Text).shape, Shape::Expected { expected: Kind::Text, found: Kind::Map });
+}
+
+/// A plain struct through `fields!`: both fields optional, so only the unknown-field check
+/// speaks.
+struct Paint<A: core::alloc::Allocator> {
+    color: Option<String<A>>,
+    size: Option<u32>,
+}
+crate::fields!(for<A> Paint<A> { ; color, size });
+
+/// One required field, for the missing-but-near case.
+struct Pen<A: core::alloc::Allocator> {
+    color: String<A>,
+}
+crate::fields!(for<A> Pen<A> { color });
+
+fn at_a_b<T: FromValue<Global>>(v: &Value<Global>) -> Result<T, StdString> {
+    let root = Cursor::root(v, Global);
+    let a = root.field("a").map_err(|e| e.to_string())?;
+    let b = a.field("b").map_err(|e| e.to_string())?;
+    b.get::<T>().map_err(|e| e.to_string())
+}
+
+#[test]
+fn reading_is_strict_by_default() {
+    let paint = at_a_b::<Paint<Global>>(&value!(in Global; {"a": {"b": {"color": "red", "size": 3}}})).unwrap();
+    assert_eq!((paint.color.as_deref(), paint.size), (Some("red"), Some(3)));
+    assert_eq!(
+        at_a_b::<Paint<Global>>(&value!(in Global; {"a": {"b": {"colour": "red", "size": 3}}})).err().unwrap(),
+        r#"a.b: unknown field "colour" (did you mean "color"?); known: "color", "size""#,
+        "the exact text: every extra key, the nearest known name, the known names"
+    );
+    assert_eq!(
+        at_a_b::<Paint<Global>>(&value!(in Global; {"a": {"b": {"colour": 1, "zzz": 2}}})).err().unwrap(),
+        r#"a.b: unknown fields "colour" (did you mean "color"?), "zzz"; known: "color", "size""#
+    );
+    assert_eq!(
+        at_a_b::<Pen<Global>>(&value!(in Global; {"a": {"b": {"colour": "red"}}})).err().unwrap(),
+        r#"a.b.color: missing (found unknown field "colour")"#
+    );
+    let written = Paint::<Global> { color: None, size: Some(2) }.to_value(Global);
+    assert_eq!(written, value!(in Global; {"size": 2}), "`None` is left out");
+
+    // The opt-out is named at the call and hands the extra keys back.
+    let v = value!(in Global; {"color": "red", "extra": 1});
+    let (color, extra) = Cursor::root(&v, Global)
+        .fields_allowing_extra(|f| f.take::<String<Global>>("color"))
+        .unwrap();
+    assert_eq!((color.as_str(), extra.keys.as_slice()), ("red", ["extra"].as_slice()));
+
+    // No coercion between kinds; an integer outside its type is refused.
+    let one = value!(in Global; 1);
+    let get = |v: &Value<Global>| Cursor::root(v, Global).get::<bool>().map_err(|e| e.to_string());
+    assert_eq!(get(&one).unwrap_err(), "the value: expected bool, found integer", "`1` is no `true`");
+    let text_one = value!(in Global; "1");
+    assert_eq!(
+        Cursor::root(&text_one, Global).get::<u32>().unwrap_err().to_string(),
+        "the value: expected integer, found text",
+        "a number in a string is text"
+    );
+    let float_one = value!(in Global; 1.0);
+    assert_eq!(
+        Cursor::root(&float_one, Global).get::<i64>().unwrap_err().to_string(),
+        "the value: expected integer, found float"
+    );
+    assert_eq!(
+        Cursor::root(&one, Global).get::<f64>().unwrap_err().to_string(),
+        "the value: expected float, found integer"
+    );
+    assert_eq!(Cursor::root(&one, Global).f64_or_int().unwrap(), 1.0, "only when asked by name");
+    let big = value!(in Global; 300);
+    assert_eq!(Cursor::root(&big, Global).get::<u8>().unwrap_err().to_string(), "the value: out of range for u8");
+
+    // An enum's unknown name lists the known ones.
+    let blue = value!(in Global; "Blue");
+    assert_eq!(
+        Cursor::root(&blue, Global).one_of(&["red", "blue"]).unwrap_err().to_string(),
+        r#"the value: unknown variant "Blue" (did you mean "blue"?); known: "red", "blue""#
+    );
+    let red = value!(in Global; "red");
+    assert_eq!(Cursor::root(&red, Global).one_of(&["red", "blue"]).unwrap(), 0);
+}
+
+/// `body` on a thread with a 64 KiB stack, where a recursion on depth overflows long before a
+/// million levels.
+fn small_stack(body: impl FnOnce() + Send + 'static) {
+    let thread = std::thread::Builder::new().stack_size(64 << 10).spawn(body).unwrap();
+    thread.join().unwrap();
+}
+
+/// A value `n` deep, lists and maps by turns, built without recursion.
+fn deep(n: usize) -> Value<Global> {
+    let mut v = Value::Null;
+    for i in 0..n {
+        v = match i % 2 {
+            0 => Value::List(blaze_own::Vec::from_array_in([v], Global)),
+            _ => {
+                let mut map = Map::new_in(Global);
+                map.insert(text("k"), v);
+                Value::Map(map)
+            }
+        };
+    }
+    v
+}
+
+/// The most containers open at once, walked.
+fn depth_of(v: &Value<Global>) -> usize {
+    let mut walk = crate::Walk::new_in(v, crate::Order::Sorted, Global);
+    let mut most = 0;
+    while walk.next().is_some() {
+        most = most.max(walk.depth());
+    }
+    most
+}
+
+#[test]
+fn deep_values_copy_and_drop_in_a_small_stack() {
+    for n in [128, 1_000_000] {
+        small_stack(move || {
+            let v = deep(n);
+            let copy = v.copy_in(Global);
+            assert_eq!(depth_of(&copy), n);
+            drop(v);
+            drop(copy);
+        });
+    }
 }
 
 #[test]

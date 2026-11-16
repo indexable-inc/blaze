@@ -46,8 +46,8 @@ pub enum ManifestError {
     Config(ConfigError),
     Version(blaze_semver::Error),
     Cfg(blaze_resolve::CfgError),
-    Pattern(glob::PatternError),
-    Glob(glob::GlobError),
+    Pattern(crate::files::PatternError),
+    Glob(crate::files::GlobError),
     Url(url::ParseError),
 }
 
@@ -82,6 +82,14 @@ pub enum Context {
     DependencyManifest { name: String },
     /// `config profile `{name}` is not valid (defined in `{definition}`)`.
     ConfigProfile { name: String, definition: String },
+    /// The unstable `im-a-teapot` key was used.
+    ImATeapot,
+    /// The unstable `package.default-target` or `package.forced-target` key was used.
+    PerPackageTarget,
+    /// A `[replace]` key that is no package id spec.
+    ReplaceSpec { spec: String },
+    /// A `[patch]` key that is neither a URL nor a registry name.
+    PatchEntry { url: String },
 }
 
 impl fmt::Display for Context {
@@ -143,6 +151,24 @@ impl fmt::Display for Context {
             }
             Context::ConfigProfile { name, definition } => {
                 write!(f, "config profile `{name}` is not valid (defined in `{definition}`)")
+            }
+            Context::ImATeapot => f.write_str(
+                "the `im-a-teapot` manifest key is unstable and may not work properly in England",
+            ),
+            Context::PerPackageTarget => f.write_str(
+                "the `package.default-target` and `package.forced-target` manifest keys are \
+                 unstable and may not work properly",
+            ),
+            Context::ReplaceSpec { spec } => write!(
+                f,
+                "replacements must specify a valid semver version to replace, but `{spec}` does not"
+            ),
+            Context::PatchEntry { url } => {
+                write!(f, "[patch] entry `{url}` should be a URL or registry name")?;
+                if url == "crates" {
+                    f.write_str("\nFor crates.io, use [patch.crates-io] (with a dash)")?;
+                }
+                Ok(())
             }
         }
     }
@@ -281,8 +307,8 @@ from!(
     Config(ConfigError),
     Version(blaze_semver::Error),
     Cfg(blaze_resolve::CfgError),
-    Pattern(glob::PatternError),
-    Glob(glob::GlobError),
+    Pattern(crate::files::PatternError),
+    Glob(crate::files::GlobError),
     Url(url::ParseError),
 );
 

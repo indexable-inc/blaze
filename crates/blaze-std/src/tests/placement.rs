@@ -5,7 +5,9 @@
 //!
 //! Plant: [`Plant::TaskMigrates`], a resume that moves the task to the next worker.
 
-use std::{cell::RefCell, time::Duration};
+use std::time::Duration;
+
+use blaze_core::lock::Lock;
 
 use blaze_sim::{Config, Tape};
 
@@ -49,10 +51,11 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
     let io = world(plan.seed, plant);
     let cx = root(&io);
     let clock = io.need_clock().map_err(|e| format!("harness: {e}"))?;
-    let wrong: RefCell<Option<String>> = RefCell::new(None);
+    // Behind a lock: a task's closure is `Send`.
+    let wrong: Lock<Option<String>> = Lock::new("test.wrong", None);
     let note = |found: Result<(), String>| {
         if let Err(why) = found {
-            wrong.borrow_mut().get_or_insert(why);
+            wrong.lock().get_or_insert(why);
         }
     };
     let scope = cx.scope();
@@ -76,7 +79,7 @@ fn run(plan: &Plan, plant: Plant) -> Result<(), String> {
         let _ = task.join(&cx);
     }
     let joined = scope.join(&cx);
-    if let Some(why) = wrong.into_inner() {
+    if let Some(why) = wrong.lock().take() {
         return Err(why);
     }
     joined.map_err(|e| format!("the scope: {e}"))

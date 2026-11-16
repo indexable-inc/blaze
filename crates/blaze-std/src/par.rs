@@ -34,9 +34,9 @@
 //!   and once started it stays there (crate::task, "A started task never changes its thread").
 //!   Under `Inline` the chunks run one after another on the calling thread, in an order the
 //!   simulation draws, which is how the tests show the result does not depend on it.
-//! - **Bounds for later layouts.** The closures are `Sync` and the chunks and results `Send`
-//!   now, though `Inline` runs everything on one thread, so code written today runs unchanged
-//!   on a pool.
+//! - **Bounds.** The closures are `Sync` and the chunks and results `Send`: under `Threads`
+//!   the chunks run on the pool's workers. Each left half is a task that cuts its own half in
+//!   a scope of its own (a scope is its thread's), so the tree of halves is a tree of scopes.
 
 use core::{convert::Infallible, fmt, num::NonZeroUsize};
 
@@ -233,7 +233,15 @@ where
     if right_first && let Some(right) = right.take() {
         ran_right = Some(cut(cx, scope, right, len - at, ops));
     }
-    let task = scope.may_overlap("bstd.par", ops.grain.scratch, |cx| Ok::<_, Infallible>(cut(cx, scope, left, at, ops)));
+    // The left half's task cuts its own half in a scope of its own: a scope is its thread's
+    // (not `Sync`), so the task, which may run on another worker, cannot spawn on `scope`.
+    let task = scope.may_overlap("bstd.par", ops.grain.scratch, move |cx| {
+        let left = match cx.scope_with(|inner| cut(cx, inner, left, at, ops)) {
+            Ok(left) => left,
+            Err(failed) => Err(ParError::Task(failed)),
+        };
+        Ok::<_, Infallible>(left)
+    });
     if let Some(right) = right.take() {
         ran_right = Some(cut(cx, scope, right, len - at, ops));
     }

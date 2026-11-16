@@ -43,8 +43,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::rc::Rc;
 
-use anyhow::bail;
-use cargo_platform::Platform;
+use crate::platform::Platform;
 
 use super::types::{FeaturesSet, ResolveBehavior};
 use super::{CargoResult, HashMap, HashSet};
@@ -232,11 +231,13 @@ impl CliFeatures {
                 // Maybe call validate_feature_name here once it is an error?
                 FeatureValue::Feature(_) => {}
                 FeatureValue::Dep { .. } => {
-                    bail!("feature `{}` is not allowed to use explicit `dep:` syntax", feature);
+                    let feature = feature.clone(); // clone: error path
+                    return Err(crate::ResolveError::CliDepSyntax { feature });
                 }
                 FeatureValue::DepFeature { dep_feature, .. } => {
                     if dep_feature.contains('/') {
-                        bail!("multiple slashes in feature `{}` is not allowed", feature);
+                        let feature = feature.clone(); // clone: error path
+                        return Err(crate::ResolveError::CliSlashes { feature });
                     }
                 }
             }

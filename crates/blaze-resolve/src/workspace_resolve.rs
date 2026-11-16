@@ -8,13 +8,13 @@
 //! prints along the way (unused patches, fields a patch or `[replace]` ignores) are not
 //! written.
 
-use anyhow::{Context as _, Result, anyhow};
 use blaze_hash::{HashMap, HashSet};
 use std::alloc::Global;
 use blaze_trace::{debug, trace};
 use url::Url;
 
 use crate::dependency::Dependency;
+use crate::error::ResolveError;
 use crate::interning::InternedString;
 use crate::package_id::PackageId;
 use crate::package_id_spec::PackageIdSpec;
@@ -28,6 +28,15 @@ use crate::resolver::{
 use crate::source_id::{CanonicalUrl, GitReference, SourceId};
 use crate::summary::Summary;
 use crate::version::PartialVersion;
+
+type Result<T, E = ResolveError> = std::result::Result<T, E>;
+
+/// A query's failure as the dependency whose source it loads: cargo's two contexts, "failed
+/// to load source for dependency" over "unable to update" the source.
+fn load_source(dep: &Dependency) -> impl FnOnce(ResolveError) -> ResolveError {
+    let (name, source) = (dep.package_name(), dep.source_id());
+    move |cause| ResolveError::LoadSource { dep: name, source, cause: Box::new(cause) }
+}
 
 /// One entry of a `[patch]` table.
 #[derive(Clone, Debug)]
@@ -186,10 +195,7 @@ impl<R: Registry> PackageRegistry<R> {
 
             let what = "the registry's versions of a `[patch]` dependency (bounded by the HTTP client's timeouts)";
             let summaries = answer(what, self.sources.query_vec(dep, QueryKind::Exact))
-                .with_context(|| format!("unable to update {}", dep.source_id()))
-                .with_context(|| {
-                    format!("failed to load source for dependency `{}`", dep.package_name())
-                })?
+                .map_err(load_source(dep))?
                 .into_iter()
                 .filter_map(|s| match s {
                     IndexSummary::Candidate(s) => Some(s),
@@ -204,14 +210,11 @@ impl<R: Registry> PackageRegistry<R> {
             }
 
             if *summary.package_id().source_id().canonical_url() == canonical {
-                return Err(anyhow!(
-                    "patch for `{}` points to the same source, but patches must point to different sources\n\
-                    help: check `{}` patch definition for `{}` in `{}`",
-                    dep.package_name(),
-                    dep.package_name(),
-                    url,
-                    orig_patch.loc
-                ));
+                return Err(ResolveError::PatchSameSource {
+                    dep: dep.package_name(),
+                    url: url.clone(),
+                    loc: orig_patch.loc.clone(),
+                });
             }
             unlocked_summaries.push(summary);
         }
@@ -228,15 +231,12 @@ impl<R: Registry> PackageRegistry<R> {
                         locations.push(loc);
                     }
                 }
-                return Err(anyhow!(
-                    "several `[patch]` entries resolving to same version `{} v{}`\n\
-                    help: check `{}` patch definitions for `{}` in {}",
+                return Err(ResolveError::PatchSameVersion {
                     name,
-                    version,
-                    name,
-                    url,
-                    locations.join(", ")
-                ));
+                    version: version.clone(),
+                    url: url.clone(),
+                    locations,
+                });
             }
         }
 
@@ -363,10 +363,7 @@ impl<R: Registry> Registry for PackageRegistry<R> {
         self.sources
             .query(dep, kind, callback)
             .await
-            .with_context(|| format!("unable to update {}", dep.source_id()))
-            .with_context(|| {
-                format!("failed to load source for dependency `{}`", dep.package_name())
-            })
+            .map_err(load_source(dep))
     }
 
     fn describe_source(&self, source: SourceId) -> String {
@@ -509,19 +506,13 @@ fn summary_for_patch(
         let mut vers: Vec<_> = summaries.iter().map(|summary| summary.version()).collect();
         vers.sort();
         let versions: Vec<_> = vers.into_iter().map(|v| v.to_string()).collect();
-        return Err(anyhow!(
-            "patch for `{}` in `{}` resolved to more than one candidate\n\
-            note: found versions: {}\n\
-            help: check `{}` patch definition for `{}` in `{}`\n\
-            help: select only one package using `version = \"={}\"`",
-            original_patch.dep.package_name(),
-            original_patch.dep.source_id(),
-            versions.join(", "),
-            original_patch.dep.package_name(),
-            orig_patch_url,
-            original_patch.loc,
-            versions.last().unwrap()
-        ));
+        return Err(ResolveError::PatchManyCandidates {
+            dep: original_patch.dep.package_name(),
+            source: original_patch.dep.source_id(),
+            versions,
+            url: orig_patch_url.clone(),
+            loc: original_patch.loc.clone(),
+        });
     }
     assert!(summaries.is_empty());
     let candidates = |dep: &Dependency| -> Vec<Summary> {
@@ -559,30 +550,13 @@ fn summary_for_patch(
             format!("versions `{}`", strs.join(", "))
         }
     };
+    let (dep, source) = (original_patch.dep.package_name(), original_patch.dep.source_id());
+    let (url, loc) = (orig_patch_url.clone(), original_patch.loc.clone());
     Err(if found.is_empty() {
-        anyhow!(
-            "patch location `{}` does not contain packages matching `{}`\n\
-            help: check `{}` patch definition for `{}` in `{}`",
-            original_patch.dep.source_id(),
-            original_patch.dep.package_name(),
-            original_patch.dep.package_name(),
-            orig_patch_url,
-            original_patch.loc
-        )
+        ResolveError::PatchNoMatch { dep, source, url, loc }
     } else {
-        anyhow!(
-            "patch `{}` version mismatch\n\
-            note: patch location contains {}, but patch definition requires `{}`\n\
-            help: check patch location `{}`\n\
-            help: check `{}` patch definition for `{}` in `{}`",
-            original_patch.dep.package_name(),
-            found,
-            original_patch.dep.version_req(),
-            original_patch.dep.source_id(),
-            original_patch.dep.package_name(),
-            orig_patch_url,
-            original_patch.loc
-        )
+        let req = original_patch.dep.version_req().clone();
+        ResolveError::PatchVersionMismatch { dep, found, req, source, url, loc }
     })
 }
 

@@ -1,8 +1,9 @@
-//! [`Reader`]: JSON text to [`Event`]s, one at a time, allocating nothing.
+//! [`Reader`]: JSON text to [`Event`]s, one at a time.
 //!
 //! The reader checks the whole grammar as it goes (escapes and surrogate pairs included), so
 //! a [`Str`] it hands out is known to decode; it does not see duplicate keys, which need
-//! memory: [`read_in`](crate::read_in) checks those.
+//! memory: [`read_in`](crate::read_in) checks those. It allocates only for nesting past the
+//! first thousand levels.
 
 use core::alloc::Allocator;
 
@@ -147,29 +148,27 @@ enum State {
 }
 
 /// JSON text to [`Event`]s; see the module documentation.
-pub struct Reader<'t> {
+pub struct Reader<'t, S: Allocator> {
     text: &'t str,
     at: usize,
     limits: Limits,
-    stack: Stack,
+    stack: Stack<S>,
     state: State,
 }
 
-impl<'t> Reader<'t> {
-    /// A reader over `bytes`, refused when they are past the size limit or not UTF-8.
-    pub fn new(bytes: &'t [u8], limits: Limits) -> Result<Reader<'t>, Error> {
+impl<'t, S: Allocator> Reader<'t, S> {
+    /// A reader over `bytes`, refused when they are past the size limit or not UTF-8. Nesting
+    /// past the first thousand levels is held in `scratch`, a bit a level, so any depth limit
+    /// is accepted and none recurses.
+    pub fn new_in(bytes: &'t [u8], limits: Limits, scratch: S) -> Result<Reader<'t, S>, Error> {
         if bytes.len() > limits.most_bytes {
             return Err(Error { at: 0, what: What::TooLarge { len: bytes.len(), most: limits.most_bytes } });
-        }
-        if limits.most_depth > crate::MOST_DEPTH {
-            let what = What::DepthLimitPastMost { asked: limits.most_depth, most: crate::MOST_DEPTH };
-            return Err(Error { at: 0, what });
         }
         let text = match core::str::from_utf8(bytes) {
             Ok(text) => text,
             Err(error) => return Err(Error { at: error.valid_up_to(), what: What::Utf8 }),
         };
-        Ok(Reader { text, at: 0, limits, stack: Stack::new(), state: State::Value })
+        Ok(Reader { text, at: 0, limits, stack: Stack::new_in(scratch), state: State::Value })
     }
 
     /// The text, as UTF-8.

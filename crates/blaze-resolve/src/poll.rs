@@ -23,8 +23,8 @@ const QUERY: &str = "the registry's answers to the resolver's queries (bounded b
 /// wait's failure and the query's own as one error.
 pub(crate) fn answer<T>(
     what: &'static str,
-    future: impl Future<Output = anyhow::Result<T>>,
-) -> anyhow::Result<T> {
+    future: impl Future<Output = Result<T, crate::ResolveError>>,
+) -> Result<T, crate::ResolveError> {
     blaze_core::wait::block_on(what, None, future)?
 }
 

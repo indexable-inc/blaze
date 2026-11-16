@@ -290,6 +290,8 @@ blaze-front-items = { path = "crates/blaze-front-items" }
 blaze-gc = { path = "crates/blaze-gc" }
 blaze-check = { path = "crates/blaze-check" }
 blaze-spin = { path = "crates/blaze-spin" }
+# The two lock-free queues, bounded and unbounded (rule standard-structures).
+blaze-queue = { path = "crates/blaze-queue" }
 # Spans and events, the one home of tracing (crates/blaze-trace; docs/v2/plan/design/no-tracing.md).
 blaze-trace = { path = "crates/blaze-trace" }
 blaze-sys = { path = "crates/blaze-sys" }

@@ -673,6 +673,11 @@ fn read_matches(out: &str) -> Result<Vec<Match>, ToolError> {
 /// Runs a program under its limit in `cwd`, with this process's PATH and HOME, and gives its
 /// standard output; `status_ok` says which statuses are not a failure.
 fn run(argv: &[String], cwd: &Path, limit: Duration, tmp: &Path, status_ok: fn(i32) -> bool) -> Result<String, ToolError> {
+    run_both(argv, cwd, limit, tmp, status_ok).map(|(out, _)| out)
+}
+
+/// [`run`], giving its standard output and its error output.
+fn run_both(argv: &[String], cwd: &Path, limit: Duration, tmp: &Path, status_ok: fn(i32) -> bool) -> Result<(String, String), ToolError> {
     let program = argv.first().cloned().unwrap_or_default();
     let keep = ["PATH", "HOME", "TMPDIR", "USER", "RUSTUP_HOME", "CARGO_HOME"];
     let env: Vec<(&str, String)> = keep.iter().filter_map(|k| std::env::var(k).ok().map(|v| (*k, v))).collect();
@@ -681,7 +686,7 @@ fn run(argv: &[String], cwd: &Path, limit: Duration, tmp: &Path, status_ok: fn(i
     let read = |ext: &str| std::fs::read_to_string(log.with_extension(ext)).unwrap_or_default();
     match ended {
         Ended::TimedOut { after } => Err(ToolError::TimedOut { program, after }),
-        Ended::Exited(m) if status_ok(m.status) => Ok(read("out")),
+        Ended::Exited(m) if status_ok(m.status) => Ok((read("out"), read("err"))),
         Ended::Exited(m) => {
             let err = read("err");
             Err(ToolError::Failed { program, status: m.status, last: err.trim_end().rsplit('\n').next().unwrap_or("").to_owned() })
@@ -726,8 +731,9 @@ impl Grep<'_> {
         for _ in 0..passes {
             let mut argv = vec!["ast-grep".to_owned(), "scan".to_owned(), "--rule".to_owned(), path.display().to_string(), "-U".to_owned()];
             argv.extend(files.iter().cloned());
-            let out = run(&argv, self.dir, AST_GREP_LIMIT, self.tmp, |s| s == 0)?;
-            let applied = out
+            // ast-grep says "Applied N changes" on its error output.
+            let (_, err) = run_both(&argv, self.dir, AST_GREP_LIMIT, self.tmp, |s| s == 0)?;
+            let applied = err
                 .rsplit('\n')
                 .find_map(|line| line.trim().strip_prefix("Applied ").and_then(|it| it.split(' ').next()).and_then(|n| n.parse::<usize>().ok()))
                 .unwrap_or(0);

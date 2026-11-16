@@ -2,15 +2,17 @@
 //! (`src/workspace/registry.rs`), `QueryKind` (`src/sources/source.rs`) and `IndexSummary`
 //! (`src/sources/registry/index/mod.rs`).
 
-use anyhow::Result;
 use blaze_hash::HashMap;
 use std::alloc::Global;
 
 use crate::dependency::Dependency;
+use crate::error::ResolveError;
 use crate::interning::InternedString;
 use crate::package_id::PackageId;
 use crate::source_id::SourceId;
 use crate::summary::Summary;
+
+type Result<T, E = ResolveError> = std::result::Result<T, E>;
 
 /// How a query matches.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -208,12 +210,10 @@ pub async fn query_pinned(
         return Ok(true);
     }
     if !registered {
-        anyhow::bail!(
-            "`{}` of {} is not pinned by Cargo.lock, and blaze reads that source only at the \
-             versions Cargo.lock pins",
-            dep.package_name(),
-            describe(dep.source_id())
-        );
+        return Err(ResolveError::NotPinned {
+            dep: dep.package_name(),
+            source: describe(dep.source_id()),
+        });
     }
     Ok(false)
 }

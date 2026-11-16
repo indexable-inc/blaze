@@ -10,8 +10,11 @@
 //! (`$BLAZE_HOME`, else a cache directory), which a user may delete; this is where what blaze
 //! installs and what its user says live.
 
+use std::alloc::Global;
 use std::fmt;
 use std::path::{Path, PathBuf};
+
+use blaze_toml::{Document, Item, Kind, Limits};
 
 /// blaze's home: `$BLAZE_HOME`, else `.blaze` in the user's home ([`blaze_core::home::user`]:
 /// `HOME`, else the system's record of the user).
@@ -32,22 +35,34 @@ pub fn file(home: &Path) -> PathBuf {
     home.join("config.toml")
 }
 
-/// `file` as a table, none when there is no file.
-pub fn read(file: &Path) -> Result<Option<toml::Table>, UserConfigError> {
-    let text = match std::fs::read_to_string(file) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(UserConfigError::Unread { file: file.to_owned(), error }),
-    };
-    toml::from_str(&text).map(Some).map_err(|error| UserConfigError::NotToml { file: file.to_owned(), error })
+/// `file`'s text, none when there is no file. [`parse`] makes it a document.
+pub fn read(file: &Path) -> Result<Option<String>, UserConfigError> {
+    match std::fs::read_to_string(file) {
+        Ok(text) => Ok(Some(text)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(UserConfigError::Unread { file: file.to_owned(), error }),
+    }
+}
+
+/// `text`, read from `file`, as a TOML document; its root is the table [`section`] looks in.
+pub fn parse<'t>(file: &Path, text: &'t str) -> Result<Document<'t, Global>, UserConfigError> {
+    Document::parse_in(text, Limits::CARGO, Global).map_err(|error| {
+        let (line, column) = error.line_col(text);
+        UserConfigError::NotToml { file: file.to_owned(), error, line, column }
+    })
 }
 
 /// `[name]` of `table` (read from `file`): none when it has none; a `name` that is no table is
 /// an error naming it.
-pub fn section<'t>(table: &'t toml::Table, file: &Path, name: &str) -> Result<Option<&'t toml::Table>, UserConfigError> {
+pub fn section<'d, 't>(
+    table: Item<'d, 't, Global>,
+    file: &Path,
+    name: &str,
+) -> Result<Option<Item<'d, 't, Global>>, UserConfigError> {
     match table.get(name) {
         None => Ok(None),
-        Some(value) => value.as_table().map(Some).ok_or_else(|| UserConfigError::setting(file, name, "a table", value)),
+        Some(value) if value.kind() == Kind::Table => Ok(Some(value)),
+        Some(value) => Err(UserConfigError::setting(file, name, "a table", value)),
     }
 }
 
@@ -56,15 +71,29 @@ pub fn section<'t>(table: &'t toml::Table, file: &Path, name: &str) -> Result<Op
 pub enum UserConfigError {
     /// The file is there and can't be read.
     Unread { file: PathBuf, error: std::io::Error },
-    /// The file is not TOML.
-    NotToml { file: PathBuf, error: toml::de::Error },
-    /// `key` is set to `got`, which is not what it takes (`wants`).
-    Setting { file: PathBuf, key: String, wants: String, got: String },
+    /// The file is not TOML: what blaze-toml refused, at `line:column` (1-based).
+    NotToml { file: PathBuf, error: blaze_toml::Error, line: usize, column: usize },
+    /// `key`, at `line:column`, is set to `got` (its text in the file), which is not what it
+    /// takes (`wants`).
+    Setting { file: PathBuf, key: String, wants: String, got: String, line: usize, column: usize },
 }
 
 impl UserConfigError {
-    pub fn setting(file: &Path, key: &str, wants: &str, got: &toml::Value) -> UserConfigError {
-        UserConfigError::Setting { file: file.to_owned(), key: key.to_owned(), wants: wants.to_owned(), got: got.to_string() }
+    /// `key` set to `got`, an item of the document read from `file`, which is not `wants`.
+    pub fn setting(file: &Path, key: &str, wants: &str, got: Item<'_, '_, Global>) -> UserConfigError {
+        let (line, column) = got.line_col();
+        let mut text = blaze_own::String::new_in(Global);
+        if blaze_toml::write_inline(&got.to_value_in(Global), &mut text).is_err() {
+            unreachable!("a value read from TOML is one TOML can write");
+        }
+        UserConfigError::Setting {
+            file: file.to_owned(),
+            key: key.to_owned(),
+            wants: wants.to_owned(),
+            got: text.as_str().to_owned(),
+            line,
+            column,
+        }
     }
 }
 
@@ -72,11 +101,14 @@ impl fmt::Display for UserConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             UserConfigError::Unread { file, error } => write!(f, "reading blaze's settings {}: {error}", file.display()),
-            UserConfigError::NotToml { file, error } => {
-                write!(f, "{} is not TOML, so blaze's settings in it can't be told: {error}", file.display())
-            }
-            UserConfigError::Setting { file, key, wants, got } => {
-                write!(f, "{} sets `{key}` to {got}, which is not {wants}", file.display())
+            UserConfigError::NotToml { file, error, line, column } => write!(
+                f,
+                "{}:{line}:{column} is not TOML, so blaze's settings in it can't be told: {}",
+                file.display(),
+                error.what
+            ),
+            UserConfigError::Setting { file, key, wants, got, line, column } => {
+                write!(f, "{}:{line}:{column} sets `{key}` to {got}, which is not {wants}", file.display())
             }
         }
     }

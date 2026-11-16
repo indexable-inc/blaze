@@ -168,11 +168,15 @@ impl Artifact {
 }
 
 impl Dependency {
-    pub fn parse(name: &str, version: Option<&str>, source_id: SourceId) -> anyhow::Result<Self> {
+    pub fn parse(
+        name: &str,
+        version: Option<&str>,
+        source_id: SourceId,
+    ) -> Result<Self, ManifestError> {
         let req = version
             .map(|v| {
-                VersionReq::parse(v).with_context(|| {
-                    format!("failed to parse the version requirement `{v}` for dependency `{name}`")
+                VersionReq::parse_in(v, Limits::CARGO, Global).context(|| {
+                    Context::VersionRequirement { version: v.to_owned(), name: name.to_owned() }
                 })
             })
             .transpose()?;
@@ -250,10 +254,11 @@ pub use blaze_resolve::{FeatureMap, FeatureValue};
 pub fn build_summary_features(
     features: &BTreeMap<String, Vec<String>>,
     dependencies: &[Dependency],
-) -> anyhow::Result<FeatureMap> {
+) -> Result<FeatureMap, ManifestError> {
     for dep in dependencies {
         if dep.optional && !dep.is_transitive() {
-            bail!("dev-dependencies are not allowed to be optional: `{}`", dep.name_in_toml());
+            let name = dep.name_in_toml().to_owned();
+            return Err(DependencyError::OptionalDevDependency { name }.into());
         }
     }
     let features: BTreeMap<InternedString, Vec<InternedString>> = features
@@ -266,7 +271,7 @@ pub fn build_summary_features(
         name_in_toml: InternedString::new(dep.name_in_toml()),
         optional: dep.optional,
     });
-    blaze_resolve::build_feature_map(&features, deps)
+    Ok(blaze_resolve::build_feature_map(&features, deps)?)
 }
 
 #[cfg(test)]
@@ -336,7 +341,7 @@ mod tests {
             .file(&format!("{ROOT}/b/src/main.rs"), "")
     }
 
-    fn config(files: Mem, flags: &[&str]) -> anyhow::Result<crate::Config<Mem>> {
+    fn config(files: Mem, flags: &[&str]) -> Result<crate::Config<Mem>, ManifestError> {
         let env = [
             ("CARGO_HOME".to_owned(), format!("{ROOT}/home")),
             ("BLAZE_HOME".to_owned(), format!("{ROOT}/blaze")),
@@ -346,11 +351,12 @@ mod tests {
         Ok(config)
     }
 
-    fn metadata(files: Mem, flags: &[&str]) -> anyhow::Result<String> {
+    fn metadata(files: Mem, flags: &[&str]) -> Result<String, ManifestError> {
         let ctx = crate::Context::new(config(files, flags)?);
         let manifest = crate::metadata::root_manifest(None, &ctx)?;
         let ws = crate::Workspace::new(&manifest, &ctx)?;
-        Ok(serde_json::to_string(&crate::metadata::export_no_deps(&ws)?)?)
+        let json = crate::metadata::export_no_deps(&ws)?;
+        Ok(serde_json::to_string(&json).expect("metadata serializes"))
     }
 
     #[test]

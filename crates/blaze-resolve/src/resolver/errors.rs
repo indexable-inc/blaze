@@ -1,10 +1,8 @@
 //! Why a resolve failed: `src/resolver/errors.rs` of cargo 1.99.0 (5f94df4789).
 
-use std::fmt;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
-use anyhow::Error;
 use blaze_ids::radix;
 
 use crate::edit_distance::{closest, edit_distance};
@@ -12,59 +10,22 @@ use crate::interning::InternedString;
 use crate::registry::{IndexSummary, QueryKind};
 use crate::resolver::CargoResult;
 use crate::version::OptVersionReq;
-use crate::{Dependency, PackageId, Registry, Summary};
+use crate::{Dependency, PackageId, Registry, ResolveError, Summary};
 
 use super::ResolveSettings;
 use super::context::ResolverContext;
 use super::types::{ConflictMap, ConflictReason};
 
-/// Error during resolution providing a path of `PackageId`s.
-pub struct ResolveError {
-    cause: Error,
-    package_path: Vec<PackageId>,
-}
-
-impl ResolveError {
-    pub fn new<E: Into<Error>>(cause: E, package_path: Vec<PackageId>) -> Self {
-        Self { cause: cause.into(), package_path }
-    }
-
-    /// Returns a path of packages from the package whose requirements could not be resolved up to
-    /// the root.
-    pub fn package_path(&self) -> &[PackageId] {
-        &self.package_path
-    }
-}
-
-impl std::error::Error for ResolveError {
-    // dyn: `std::error::Error::source`'s own signature, on the error path.
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        self.cause.source()
-    }
-}
-
-impl fmt::Debug for ResolveError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.cause.fmt(f)
-    }
-}
-
-impl fmt::Display for ResolveError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.cause.fmt(f)
-    }
-}
-
 pub type ActivateResult<T> = Result<T, ActivateError>;
 
 #[derive(Debug)]
 pub enum ActivateError {
-    Fatal(anyhow::Error),
+    Fatal(ResolveError),
     Conflict(PackageId, ConflictReason),
 }
 
-impl From<::anyhow::Error> for ActivateError {
-    fn from(t: ::anyhow::Error) -> Self {
+impl From<ResolveError> for ActivateError {
+    fn from(t: ResolveError) -> Self {
         ActivateError::Fatal(t)
     }
 }
@@ -84,17 +45,15 @@ pub(super) fn activation_error(
     candidates: &[Summary],
     settings: &ResolveSettings<'_>,
 ) -> ResolveError {
-    let to_resolve_err = |err| {
-        ResolveError::new(
-            err,
-            resolver_ctx
-                .parents
-                .path_to_bottom(&parent.package_id())
-                .into_iter()
-                .map(|(node, _)| node)
-                .cloned()
-                .collect(),
-        )
+    let to_resolve_err = |report: String| ResolveError::Unresolvable {
+        report,
+        package_path: resolver_ctx
+            .parents
+            .path_to_bottom(&parent.package_id())
+            .into_iter()
+            .map(|(node, _)| node)
+            .cloned()
+            .collect(),
     };
 
     if !candidates.is_empty() {
@@ -228,7 +187,7 @@ pub(super) fn activation_error(
         msg.push_str(&dep.package_name());
         msg.push_str("` which could resolve this conflict");
 
-        return to_resolve_err(anyhow::format_err!("{}", msg));
+        return to_resolve_err(msg);
     }
 
     // We didn't actually find any candidates, so we need to
@@ -238,7 +197,7 @@ pub(super) fn activation_error(
     if let Some(version_candidates) = rejected_versions(registry, dep) {
         let version_candidates = match version_candidates {
             Ok(c) => c,
-            Err(e) => return to_resolve_err(e),
+            Err(e) => return e,
         };
 
         let locked_version = dep
@@ -297,7 +256,7 @@ pub(super) fn activation_error(
     } else if let Some(candidates) = alt_versions(registry, dep) {
         let candidates = match candidates {
             Ok(c) => c,
-            Err(e) => return to_resolve_err(e),
+            Err(e) => return e,
         };
         let versions = {
             let mut versions = candidates
@@ -393,7 +352,7 @@ pub(super) fn activation_error(
     } else if let Some(name_candidates) = alt_names(registry, dep) {
         let name_candidates = match name_candidates {
             Ok(c) => c,
-            Err(e) => return to_resolve_err(e),
+            Err(e) => return e,
         };
         let _ = writeln!(&mut msg, "no matching package named `{}` found", dep.package_name());
 
@@ -434,7 +393,8 @@ pub(super) fn activation_error(
         );
     }
 
-    to_resolve_err(anyhow::format_err!("{msg}{hints}"))
+    msg.push_str(&hints);
+    to_resolve_err(msg)
 }
 
 // Maybe the user mistyped the ver_req? Like `dep="2"` when `dep="0.2"`

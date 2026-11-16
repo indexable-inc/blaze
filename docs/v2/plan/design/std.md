@@ -1335,6 +1335,26 @@ uses the `try_` forms (`try_push`, `try_reserve`), which return the error.
 Until S4's runtime ([sys](sys.md), "Runtime"), `alloc`'s global allocator still exists underneath; the `ambient` check treats a use of
 it in a capabilities crate as an effect (`global_alloc`), which replaces the `// alloc:` comment.
 
+### One handle, not a type parameter
+
+The allocator is a value of one type, `Alloc<'a>` (blaze-own's `alloc_ref`), as Zig's is: one
+word, `Copy`, the address of an allocator whose first field is a header pointing at a table of
+its functions, borrowing that allocator for `'a`. `Erased::new(a).handle()` makes one of any
+allocator. A generic function is type-checked with its trait obligations at every call, compiled
+once per instantiation, and cannot be a plain function pointer or a stored task; a function over
+the handle is checked and compiled once.
+
+- A function that allocates takes `alloc: Alloc<'_>` (`Alloc<'a>` when its result holds it).
+- A type that owns collections holds them as `AVec<'a, T>`, `AString<'a>`, `ADeque`, `ABox`,
+  `ASortedMap`, `ABTreeMap`, `ASoa` (a `soa!` table is `Rows<Alloc<'a>>`) and takes the handle
+  once, in `new_in(alloc)`; a view that only borrows record bytes names no allocator at all.
+- A function or type is generic over `A: Allocator` only if it is collection library code (a
+  container over any allocator) or a measured hot loop, the measurement named in a comment
+  beside it (`examples/alloc_cost.rs` in blaze-own is the template); such a loop names `&Frame`.
+- Tests and a program's top may use `Alloc::global()`; nothing below the top names it.
+- `Alloc` is neither `Send` nor `Sync` (it may be a task's frame); a value that crosses threads
+  names a `Sync` allocator concretely, or takes a fresh handle on the other side.
+
 ### Collections
 
 One type per need. Each is made with `new_in(alloc)` or `with_capacity_in(n, alloc)`; none has a
@@ -1735,7 +1755,7 @@ for every edition. bstd can. Status is as of that evening.
 | `usize` for every index and length; any `usize` indexes any slice | twice the index memory; wrong-table bugs | typed 32-bit ids (built); an index type per table | partly |
 | Closures have no name | a task cannot be stored, keyed, sent to another machine or cached | a job is a function and a flat value of arguments (`Eval`) | designed |
 | Iterator adaptors are free only after heavy inlining | slow in a fast tier that does not inline | whole-slice and batch methods first; plain loops in hot code | to do |
-| Everything generic by default | each use compiles again | a concrete core under a thin generic shell; the allocator as a value, not a type parameter | to decide |
+| Everything generic by default | each use compiles again | a concrete core under a thin generic shell; the allocator as a value, not a type parameter ("One handle, not a type parameter") | the allocator decided 2026-11-15 and being built; the rest to decide |
 | `println!` locks and flushes per line | slow tools | `Out` with a buffer the caller owns | built |
 | `Path`, `OsString`, `CStr`: one idea, six types | conversions and lossy fallbacks | typed names | built |
 

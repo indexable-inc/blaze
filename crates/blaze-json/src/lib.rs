@@ -44,7 +44,6 @@ mod plant {
 }
 
 pub use read::{Event, Item, Reader, Str};
-pub use stack::MOST_DEPTH;
 pub use tree::read_in;
 pub use write::{
     BytesAs, KeyOrder, Style, StreamError, StreamWhat, Unwritable, WriteError, WriteOptions, Writer, to_string_in,
@@ -65,7 +64,8 @@ pub enum Duplicates {
 pub struct Limits {
     /// The most bytes of text.
     pub most_bytes: usize,
-    /// The most lists and maps open at once; at most [`MOST_DEPTH`].
+    /// The most lists and maps open at once. Any limit is held: nothing recurses on depth, and
+    /// the open levels cost a bit each in the reader and a slot each in [`read_in`]'s build.
     pub most_depth: usize,
     /// The most bytes of one number as written.
     pub most_number_len: usize,
@@ -135,8 +135,6 @@ pub enum What {
     TooLarge { len: usize, most: usize },
     /// A list or map opened past the depth limit.
     TooDeep { most: usize },
-    /// A depth limit past what the reader can hold.
-    DepthLimitPastMost { asked: usize, most: usize },
     /// The text ended where something was wanted.
     End { expected: Expected },
     /// A character where something else was wanted.
@@ -164,9 +162,6 @@ impl fmt::Display for What {
             What::Utf8 => f.write_str("the text is not UTF-8"),
             What::TooLarge { len, most } => write!(f, "the text is {len} bytes, past the limit of {most}"),
             What::TooDeep { most } => write!(f, "more than {most} lists and maps are open"),
-            What::DepthLimitPastMost { asked, most } => {
-                write!(f, "a depth limit of {asked} is past the reader's most, {most}")
-            }
             What::End { expected } => write!(f, "the text ends where {expected} was wanted"),
             What::Unexpected { found, expected } => write!(f, "{found:?} where {expected} was wanted"),
             What::Control { byte } => write!(f, "control character 0x{byte:02x} in a string"),

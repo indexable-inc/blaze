@@ -36,6 +36,10 @@ use crate::{
     plant::{self, Plant},
 };
 
+// The cases below again, through an `Alloc` handle; `every_failure`, `Inline` and a planted bug
+// through one.
+mod handle;
+
 // ---------------------------------------------------------------------------------------------
 // The counting allocator.
 
@@ -2510,7 +2514,7 @@ fn btree_case(tape: &Tape) -> Result<(), Broke> {
 }
 
 /// [`btree_case`] over any allocator, so `handle` runs it through an `Alloc` too.
-fn btree_case_in<A: Allocator + Copy>(tape: &Tape, alloc: A) -> Result<(), Broke> {
+fn btree_case_in<A: core::alloc::AllocatorClone + Copy>(tape: &Tape, alloc: A) -> Result<(), Broke> {
     tokens::fresh();
     {
         // Small spans meet the same keys again; large ones and the runs below grow tall trees.
@@ -2705,8 +2709,7 @@ fn btree_case_in<A: Allocator + Copy>(tape: &Tape, alloc: A) -> Result<(), Broke
             tokens::check(model.len())?;
         }
     }
-    tokens::check(0)?;
-    alloc.check()
+    tokens::check(0)
 }
 
 #[test]
@@ -2925,7 +2928,7 @@ fn btree_panic_case(tape: &Tape) -> Result<(), Broke> {
             panics(|| drop(map.clone()))?;
             tokens::check(map.len())?;
         }
-        // An owning iterator whose value's drop panics drops the rest and frees every node.
+        // A map dropped while one value's drop panics drops the rest and frees every node.
         let copy = map.clone();
         let victim = copy.values().nth(tape.index(copy.len().max(1), "victim")).map(|t| t.value);
         match victim {

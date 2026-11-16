@@ -26,12 +26,13 @@ pub(crate) use std::{
 };
 
 use alloc::{string::{String, ToString as _}, sync::Arc, vec::Vec};
-use core::fmt::Write as _;
+use core::{fmt::Write as _, time::Duration};
 
 use crate::{
     cx::Cx,
-    entry::{Outcome, Status, run_in},
+    entry::{Outcome, Status, run_on},
     io::{Io, Limits, NativeWorld},
+    task::threads::{Plants, Topology},
 };
 
 /// The threads the native driver runs file calls on where it has a pool (kqueue, IOCP): a
@@ -63,11 +64,34 @@ impl std::process::Termination for Exit {
 /// - the start directory, the root every `Path` is beneath;
 /// - the seed of `Rng`, from the system's randomness as Rust std's hasher keys draw it;
 /// - the host's name, empty: neither blaze-core nor Rust std asks the system for it yet.
+///
+/// `main`'s context is the root of the process's `Threads` pool (task/threads.rs): one worker
+/// per core of the machine's [`topology`], started here and stopped when `main` returns, each
+/// given [`POOL_STOP`] to leave; a worker that does not is reported by name and the process
+/// fails.
 pub fn run<R: Outcome>(main: impl FnOnce(&Cx, Io) -> R) -> Exit {
     // alloc: once per process, what a failure says.
     let mut said = String::new();
     let status = match native() {
-        Ok(io) => run_in(io, &mut said, main),
+        Ok(io) => match topology().map_err(pool::StartError::from).and_then(|machine| pool::start(&machine, Plants::NONE)) {
+            Ok(running) => {
+                let status = run_on(io, running.pool().clone(), &mut said, main);
+                match running.stop(POOL_STOP) {
+                    Ok(()) => status,
+                    Err(hung) => {
+                        if !said.is_empty() {
+                            said.push_str("; ");
+                        }
+                        let _ = write!(said, "{hung}");
+                        Status::FAILED
+                    }
+                }
+            }
+            Err(why) => {
+                let _ = write!(said, "{why}");
+                Status::FAILED
+            }
+        },
         Err(why) => {
             said.push_str(&why);
             Status::FAILED
@@ -77,6 +101,436 @@ pub fn run<R: Outcome>(main: impl FnOnce(&Cx, Io) -> R) -> Exit {
         error_line(&said);
     }
     Exit(status)
+}
+
+/// How long the pool's workers have to leave their loops at the end of `main`: they leave
+/// once they find nothing to run, so only a task that ignores its cancellation takes longer.
+pub(crate) const POOL_STOP: Duration = Duration::from_secs(1);
+
+/// A task that will not end while its scope must (crate::task, "A scope never ends while a
+/// task of it runs"): the process stops, naming it, rather than free what the task borrows.
+pub(crate) fn hang(scope: &'static str, task: &'static str) -> ! {
+    // alloc: once, the process's last words.
+    let mut said = String::new();
+    let _ = write!(
+        said,
+        "bstd::task {task} of a scope in {scope} is still running past its deadline and the abandon wait, with the \
+         scope cancelled: a hang (rule bounded-progress); the process stops rather than free what the task borrows"
+    );
+    error_line(&said);
+    std::process::abort()
+}
+
+/// The machine as the pool sees it (task/threads.rs, `Topology`): its cores in groups that
+/// share a last-level cache, each pinned (Linux) or given its class's QoS (macOS).
+///
+/// - Linux: the cores this process may run on (`sched_getaffinity`), grouped by the
+///   `shared_cpu_list` of each core's highest-level cache in
+///   `/sys/devices/system/cpu/cpuN/cache/indexM/` (`index3` on EPYC; Graviton names its
+///   last level the same way where the firmware exposes it, else its L2 groups it).
+/// - macOS: one group per L2 cluster of each performance level (`hw.perflevelN.logicalcpu`,
+///   `hw.perflevelN.cpusperl2`): level 0's foreground, the others background. macOS has no
+///   pinning; a worker's QoS steers it.
+pub(crate) fn topology() -> Result<Topology, TopologyError> {
+    machine::read()
+}
+
+/// Why the machine's cores could not be read.
+#[derive(Debug)]
+pub(crate) struct TopologyError {
+    pub(crate) what: &'static str,
+    pub(crate) why: String,
+}
+
+impl core::fmt::Display for TopologyError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "bstd::rt: the machine's cores ({}): {}", self.what, self.why)
+    }
+}
+
+pub(crate) mod pool {
+    //! Starting and stopping the pool's threads: the driver of task/threads.rs.
+
+    use std::{format, string::String, sync::mpsc, thread, vec::Vec as StdVec};
+
+    use alloc::string::ToString as _;
+    use core::time::Duration;
+
+    use blaze_core::wait::{Clock, Deadline, Monotonic, Parker};
+
+    use super::machine;
+    use crate::task::threads::{Hung, Plants, Pool, Topology};
+
+    /// Each worker's stack: tasks run on it to their end, and a waiting worker runs its own
+    /// queued tasks on top of the wait, so it is deeper than a thread's usual 2 MiB.
+    pub(crate) const WORKER_STACK: usize = 16 << 20;
+
+    /// How long the pool's threads have to start and report their pinning.
+    pub(crate) const START_WAIT: Duration = Duration::from_secs(5);
+
+    /// A running pool and its threads.
+    pub(crate) struct Running {
+        pool: Pool,
+        threads: StdVec<Option<thread::JoinHandle<()>>>,
+    }
+
+    /// Why the pool did not start: the worker, and what refused.
+    #[derive(Debug)]
+    pub(crate) struct StartError {
+        pub(crate) worker: u32,
+        pub(crate) why: String,
+    }
+
+    impl core::fmt::Display for StartError {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            write!(f, "bstd::rt: the pool's worker {} did not start: {}", self.worker, self.why)
+        }
+    }
+
+    impl From<super::TopologyError> for StartError {
+        fn from(error: super::TopologyError) -> StartError {
+            StartError { worker: 0, why: error.to_string() }
+        }
+    }
+
+    /// The pool of `topology`, its threads started, each pinned or given its QoS first.
+    pub(crate) fn start(topology: &Topology, plants: Plants) -> Result<Running, StartError> {
+        let pool = Pool::new(topology, Monotonic::new(), plants);
+        let (told, heard) = mpsc::channel::<(u32, Result<(), String>)>();
+        let mut threads = StdVec::new();
+        let mut at = 0u32;
+        for group in &topology.groups {
+            for &cpu in group.cpus.iter() {
+                let (pool, told, class, pin) = (pool.clone(), told.clone(), group.class, topology.pin);
+                let me = at;
+                let spawned = thread::Builder::new()
+                    .name(format!("bstd-worker-{me}"))
+                    .stack_size(WORKER_STACK)
+                    .spawn(move || {
+                        let placed = if pin { machine::place(cpu, class) } else { Ok(()) };
+                        let ok = placed.is_ok();
+                        let _ = told.send((me, placed));
+                        drop(told);
+                        if ok {
+                            pool.work(me);
+                        }
+                    });
+                match spawned {
+                    Ok(handle) => threads.push(Some(handle)),
+                    Err(error) => {
+                        let running = Running { pool, threads };
+                        let _ = running.stop(super::POOL_STOP);
+                        return Err(StartError { worker: me, why: error.to_string() });
+                    }
+                }
+                at += 1;
+            }
+        }
+        drop(told);
+        let mut failed = None;
+        for _ in 0..at {
+            match heard.recv_timeout(START_WAIT) {
+                Ok((_, Ok(()))) => {}
+                Ok((worker, Err(why))) => {
+                    failed.get_or_insert(StartError { worker, why });
+                }
+                Err(error) => {
+                    failed.get_or_insert(StartError { worker: at, why: format!("no word within {START_WAIT:?}: {error}") });
+                    break;
+                }
+            }
+        }
+        let running = Running { pool, threads };
+        match failed {
+            None => Ok(running),
+            Some(failed) => {
+                let _ = running.stop(super::POOL_STOP);
+                Err(failed)
+            }
+        }
+    }
+
+    impl Running {
+        pub(crate) fn pool(&self) -> &Pool {
+            &self.pool
+        }
+
+        /// Stops every worker once it finds nothing to run, and joins each that left its loop
+        /// within `within`; the rest are named, with the task each still runs, and left
+        /// detached (the process is ending).
+        pub(crate) fn stop(mut self, within: Duration) -> Result<(), Hung> {
+            self.pool.stop();
+            let clock = Monotonic::new();
+            let until = Deadline::after(clock.now(), within);
+            let nap = Parker::new();
+            let count = u32::try_from(self.threads.len()).unwrap_or(u32::MAX);
+            while !(0..count).all(|at| self.pool.exited(at)) && !until.passed(clock.now()) {
+                // Nobody unparks it: a timed nap of the one kernel wait (rule 44).
+                let slice = Deadline::after(clock.now(), Duration::from_millis(1));
+                if nap.park("bstd.rt.pool.stop", Some(slice), &clock).is_err() {
+                    break;
+                }
+            }
+            for (at, slot) in self.threads.iter_mut().enumerate() {
+                let at = u32::try_from(at).unwrap_or(u32::MAX);
+                if self.pool.exited(at)
+                    && let Some(handle) = slot.take()
+                {
+                    // A worker's loop does not panic (its tasks' panics are caught): a join
+                    // error is the pool's own bug, reported as the worker's.
+                    if handle.join().is_err() {
+                        panic!("bstd::rt: the pool's worker {at} panicked outside a task");
+                    }
+                }
+            }
+            match self.pool.hung() {
+                None => Ok(()),
+                Some(hung) => Err(hung),
+            }
+        }
+    }
+}
+
+#[expect(unsafe_code, reason = "the kernel's calls that place a thread and read the machine's cores: each states its contract")]
+mod machine {
+    //! The machine's cores, and placing a worker on one (rule 45 for macOS's).
+
+    use std::{format, fs, string::String, vec::Vec as StdVec};
+
+    use alloc::{alloc::Global, string::ToString as _};
+
+    use blaze_own::Vec;
+
+    use super::TopologyError;
+    use crate::task::threads::{Class, Group, Topology};
+
+    fn failed(what: &'static str, why: impl core::fmt::Display) -> TopologyError {
+        TopologyError { what, why: why.to_string() }
+    }
+
+    /// `0-3,8,10-11` as its numbers.
+    pub(super) fn cpu_list(text: &str) -> Result<StdVec<u32>, String> {
+        let mut cpus = StdVec::new();
+        for part in text.trim().split(',').filter(|part| !part.is_empty()) {
+            let (low, high) = match part.split_once('-') {
+                Some((low, high)) => (low, high),
+                None => (part, part),
+            };
+            let low: u32 = low.parse().map_err(|error| format!("{part:?} in {text:?}: {error}"))?;
+            let high: u32 = high.parse().map_err(|error| format!("{part:?} in {text:?}: {error}"))?;
+            if high < low {
+                return Err(format!("{part:?} in {text:?}: a range that runs backwards"));
+            }
+            cpus.extend(low..=high);
+        }
+        Ok(cpus)
+    }
+
+    #[cfg(target_os = "linux")]
+    mod linux {
+        /// glibc's and musl's `cpu_set_t`: 1024 bits.
+        pub(super) const SET_BYTES: usize = 128;
+
+        unsafe extern "C" {
+            /// `sched_getaffinity(2)`: the cores thread `pid` (0: the caller) may run on.
+            pub(super) fn sched_getaffinity(pid: i32, size: usize, mask: *mut u8) -> i32;
+            /// `sched_setaffinity(2)`: lets thread `pid` (0: the caller) run only on `mask`.
+            pub(super) fn sched_setaffinity(pid: i32, size: usize, mask: *const u8) -> i32;
+        }
+    }
+
+    /// The machine's cores in last-level-cache groups, all foreground, pinned.
+    #[cfg(target_os = "linux")]
+    pub(super) fn read() -> Result<Topology, TopologyError> {
+        let mut mask = [0u8; linux::SET_BYTES];
+        // SAFETY: `mask` is `SET_BYTES` writable bytes, the size passed.
+        if unsafe { linux::sched_getaffinity(0, linux::SET_BYTES, mask.as_mut_ptr()) } != 0 {
+            return Err(failed("sched_getaffinity", std::io::Error::last_os_error()));
+        }
+        let allowed = |cpu: u32| (cpu as usize) < linux::SET_BYTES * 8 && mask[cpu as usize / 8] & (1 << (cpu % 8)) != 0;
+        let online = fs::read_to_string("/sys/devices/system/cpu/online").map_err(|error| failed("/sys/devices/system/cpu/online", error))?;
+        let online = cpu_list(&online).map_err(|why| failed("/sys/devices/system/cpu/online", why))?;
+        let mut groups: StdVec<StdVec<u32>> = StdVec::new();
+        let mut seen: StdVec<u32> = StdVec::new();
+        for cpu in online.into_iter().filter(|&cpu| allowed(cpu)) {
+            if seen.contains(&cpu) {
+                continue;
+            }
+            let shared = last_level(cpu)?;
+            let group: StdVec<u32> = shared.into_iter().filter(|&it| allowed(it) && !seen.contains(&it)).collect();
+            seen.extend(group.iter().copied());
+            if !group.is_empty() {
+                groups.push(group);
+            }
+        }
+        Ok(made(groups.into_iter().map(|cpus| (Class::Foreground, cpus)), true))
+    }
+
+    /// The cores sharing `cpu`'s highest-level cache: itself alone when sysfs names no cache.
+    #[cfg(target_os = "linux")]
+    fn last_level(cpu: u32) -> Result<StdVec<u32>, TopologyError> {
+        let mut best: Option<(u32, String)> = None;
+        for index in 0..16 {
+            let dir = format!("/sys/devices/system/cpu/cpu{cpu}/cache/index{index}");
+            let Ok(level) = fs::read_to_string(format!("{dir}/level")) else {
+                break;
+            };
+            let level: u32 = level.trim().parse().map_err(|error| failed("a cache's level", error))?;
+            let shared = fs::read_to_string(format!("{dir}/shared_cpu_list")).map_err(|error| failed("a cache's shared_cpu_list", error))?;
+            if best.as_ref().is_none_or(|(kept, _)| level > *kept) {
+                best = Some((level, shared));
+            }
+        }
+        match best {
+            Some((_, shared)) => cpu_list(&shared).map_err(|why| failed("a cache's shared_cpu_list", why)),
+            None => Ok(std::vec![cpu]),
+        }
+    }
+
+    /// Pins the calling thread to `cpu` (Linux has no QoS class: `class` places nothing).
+    #[cfg(target_os = "linux")]
+    pub(super) fn place(cpu: u32, _class: Class) -> Result<(), String> {
+        let mut mask = [0u8; linux::SET_BYTES];
+        let at = cpu as usize;
+        if at >= linux::SET_BYTES * 8 {
+            return Err(format!("core {cpu} is past cpu_set_t's 1024"));
+        }
+        mask[at / 8] |= 1 << (at % 8);
+        // SAFETY: `mask` is `SET_BYTES` readable bytes, the size passed; 0 is this thread.
+        match unsafe { linux::sched_setaffinity(0, linux::SET_BYTES, mask.as_ptr()) } {
+            0 => Ok(()),
+            _ => Err(format!("sched_setaffinity to core {cpu}: {}", std::io::Error::last_os_error())),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) mod darwin {
+        use core::ffi::{c_char, c_int, c_void};
+
+        /// `QOS_CLASS_USER_INITIATED` (`<sys/qos.h>`): what a foreground worker runs at.
+        pub(crate) const QOS_USER_INITIATED: u32 = 0x19;
+        /// `QOS_CLASS_UTILITY`: a background worker, which the scheduler keeps to efficiency
+        /// cores when the performance cores are busy.
+        pub(crate) const QOS_UTILITY: u32 = 0x11;
+
+        unsafe extern "C" {
+            /// `sysctlbyname(3)`.
+            pub(crate) fn sysctlbyname(
+                name: *const c_char,
+                oldp: *mut c_void,
+                oldlenp: *mut usize,
+                newp: *mut c_void,
+                newlen: usize,
+            ) -> c_int;
+            /// `pthread_set_qos_class_self_np` (`<pthread/qos.h>`): Darwin's own call, not
+            /// POSIX (rule 45): it is how a thread says what kind of work it does, which is
+            /// what places it on a performance or an efficiency core; there is no affinity
+            /// call on macOS. Its symbol is tested to exist (rt's tests).
+            pub(crate) fn pthread_set_qos_class_self_np(class: u32, relative: c_int) -> c_int;
+        }
+    }
+
+    /// A sysctl's 32-bit value, by name.
+    #[cfg(target_os = "macos")]
+    fn sysctl(name: &'static core::ffi::CStr) -> Result<u32, TopologyError> {
+        let mut value: u32 = 0;
+        let mut len = size_of::<u32>();
+        // SAFETY: `name` is NUL-terminated; `value` is `len` writable bytes; nothing is set.
+        let said = unsafe {
+            darwin::sysctlbyname(name.as_ptr(), (&raw mut value).cast(), &raw mut len, core::ptr::null_mut(), 0)
+        };
+        if said != 0 || len != size_of::<u32>() {
+            return Err(failed("sysctlbyname", format!("{name:?}: {}", std::io::Error::last_os_error())));
+        }
+        Ok(value)
+    }
+
+    /// The machine's cores: a group per L2 cluster of each performance level.
+    #[cfg(target_os = "macos")]
+    pub(super) fn read() -> Result<Topology, TopologyError> {
+        let levels = sysctl(c"hw.nperflevels")?;
+        let mut groups = StdVec::new();
+        let mut next = 0;
+        for level in 0..levels.min(2) {
+            let (cpus, per_l2) = match level {
+                0 => (sysctl(c"hw.perflevel0.logicalcpu")?, sysctl(c"hw.perflevel0.cpusperl2")?),
+                _ => (sysctl(c"hw.perflevel1.logicalcpu")?, sysctl(c"hw.perflevel1.cpusperl2")?),
+            };
+            let class = if level == 0 { Class::Foreground } else { Class::Background };
+            let per_l2 = per_l2.clamp(1, cpus.max(1));
+            let mut left = cpus;
+            while left > 0 {
+                let size = left.min(per_l2);
+                groups.push((class, (next..next + size).collect::<StdVec<u32>>()));
+                next += size;
+                left -= size;
+            }
+        }
+        Ok(made(groups.into_iter(), true))
+    }
+
+    /// Gives the calling thread its class's QoS (macOS places by QoS, not by core).
+    #[cfg(target_os = "macos")]
+    pub(super) fn place(_cpu: u32, class: Class) -> Result<(), String> {
+        let qos = match class {
+            Class::Foreground => darwin::QOS_USER_INITIATED,
+            Class::Background => darwin::QOS_UTILITY,
+        };
+        // SAFETY: a plain call on the calling thread with a valid class and priority 0.
+        match unsafe { darwin::pthread_set_qos_class_self_np(qos, 0) } {
+            0 => Ok(()),
+            errno => Err(format!("pthread_set_qos_class_self_np({qos:#x}): errno {errno}")),
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(super) fn read() -> Result<Topology, TopologyError> {
+        let cores = std::thread::available_parallelism().map_err(|error| failed("available_parallelism", error))?;
+        let cores = u32::try_from(cores.get()).unwrap_or(u32::MAX);
+        let mut topology = Topology::flat(cores);
+        topology.pin = false;
+        Ok(topology)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(super) fn place(_cpu: u32, _class: Class) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn made(groups: impl Iterator<Item = (Class, StdVec<u32>)>, pin: bool) -> Topology {
+        let mut out = Vec::new_in(Global);
+        for (class, cpus) in groups {
+            let mut own = Vec::with_capacity_in(cpus.len(), Global);
+            for cpu in cpus {
+                own.push(cpu);
+            }
+            out.push(Group { class, cpus: own });
+        }
+        Topology { groups: out, pin }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::cpu_list;
+
+        #[test]
+        fn a_cpu_list_reads_ranges_and_singles() {
+            assert_eq!(cpu_list("0-3,8,10-11\n"), Ok(std::vec![0, 1, 2, 3, 8, 10, 11]));
+            assert!(cpu_list("3-1").is_err());
+        }
+
+        /// Rule 45: the Darwin calls the pool makes exist, and the QoS call works on this
+        /// thread.
+        #[cfg(target_os = "macos")]
+        #[test]
+        fn the_darwin_symbols_exist() {
+            use super::darwin;
+            // SAFETY: as `place`'s.
+            assert_eq!(unsafe { darwin::pthread_set_qos_class_self_np(darwin::QOS_USER_INITIATED, 0) }, 0);
+            let topology = super::read().expect("the machine's performance levels");
+            assert!(topology.workers() >= 1, "at least one core");
+        }
+    }
 }
 
 /// The process's world, or why it cannot be made.

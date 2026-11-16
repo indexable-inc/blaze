@@ -11,6 +11,9 @@
 //! - Keys that are hashes already (a content ID, a store key, a fingerprint): [`ByHash`] and
 //!   [`ByHashSet`], on [`KeyHasher`], which takes the key's first word and hashes nothing, in
 //!   a named allocator as above.
+//! - Keys that are their bytes (integers, indices, digests, arrays of them, [`PlainKey`]):
+//!   [`PlainMap`] and [`PlainSet`], on [`Plain`], which hashes the bytes in one step
+//!   ([`hash_plain`]) with no `Hasher`; a digest's first word is its hash, as [`KeyHasher`]'s.
 //! - A table whose iteration reaches an output, or whose entries are named by position:
 //!   [`IndexMap`] and [`IndexSet`] ([`order`]), which iterate in insertion order whatever the
 //!   hasher, the capacity or the process: dense entries and a table of `u32` indices, in a
@@ -53,7 +56,7 @@
 #![register_tool(blaze)]
 #![blaze::trust(
     unsafe,
-    reason = "the table's own memory (`raw`: control words, slots initialized exactly where tagged live, one allocation in the table's allocator) and libc's `getentropy` for `SipKey::random`; each block names the invariant it relies on"
+    reason = "the table's own memory (`raw`: control words, slots initialized exactly where tagged live, one allocation in the table's allocator), a `PlainKey`'s bytes read as `u8`s (`plain`: the trait's contract says none is padding) and libc's `getentropy` for `SipKey::random`; each block names the invariant it relies on"
 )]
 #![cfg_attr(test, feature(hashmap_internals))]
 #![cfg_attr(
@@ -81,6 +84,7 @@ mod key;
 pub mod order;
 #[cfg(test)]
 mod order_tests;
+mod plain;
 mod raw;
 #[cfg(test)]
 mod raw_tests;
@@ -92,6 +96,7 @@ pub use blake3::{Blake3, Blake3Hasher};
 pub use key::{BuildKeyHasher, ByHash, ByHashSet, KeyHasher};
 pub use sip::{LazyKey, SipHasher, SipKey};
 pub use order::{OrderMap, OrderSet};
+pub use plain::{KeyHash, Plain, PlainKey, hash_plain};
 pub use hash_map::Map;
 pub use hash_set::Set;
 /// Why a `try_reserve` was refused: blaze-own's, the one allocation failure of the tree.
@@ -120,6 +125,14 @@ pub type HashMap<K, V, A> = Map<K, V, FixedState, A>;
 
 /// A set of ordinary keys in the allocator `A`, which every use names, as for [`HashMap`].
 pub type HashSet<K, A> = Set<K, FixedState, A>;
+
+/// A map of keys that are their bytes ([`PlainKey`]: integers, indices, digests, arrays of
+/// them) in the allocator `A`, made by `PlainMap::plain_in(alloc)`: a lookup hashes the key's
+/// bytes in one step ([`hash_plain`]) instead of feeding a `Hasher` field by field.
+pub type PlainMap<K, V, A> = Map<K, V, Plain, A>;
+
+/// A set of [`PlainKey`]s, as [`PlainMap`]: `PlainSet::plain_in(alloc)`.
+pub type PlainSet<K, A> = Set<K, Plain, A>;
 
 /// A map of ordinary keys that iterates in insertion order, in the allocator `A`, which every
 /// use names: `IndexMap::new_in(frame)`, `IndexMap::with_capacity_in(n, frame)`.

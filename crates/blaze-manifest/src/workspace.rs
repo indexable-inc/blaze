@@ -2,27 +2,130 @@
 //! walking up from the current manifest; its members, from `members` globs and path
 //! dependencies, less `exclude`; its default members; and cargo's checks that they agree.
 
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 use annotate_snippets::{Level, Renderer};
-use anyhow::{Context as _, bail};
+use blaze_core::home::NoHome;
+use blaze_data::Value;
 use blaze_hash::{HashMap, HashSet};
-use cargo_util_schemas::manifest::TomlProfiles;
 use std::alloc::Global;
 
+use crate::error::{self, ManifestError, ResultExt};
 use crate::features::{Edition, Features, ResolveBehavior};
 use crate::files::Files;
 use crate::manifest::{
     Context, EitherManifest, Manifest, WorkspaceConfig, WorkspaceRootConfig, read_manifest,
 };
 use crate::paths::{ancestors, normalize_path};
+use crate::schema::TomlProfiles;
 use crate::source;
+
+/// What cargo refuses of a workspace's shape, in its words.
+#[derive(Debug)]
+pub enum WorkspaceError {
+    /// A manifest path that is not absolute.
+    NotAbsolute { manifest: PathBuf },
+    /// No variable says where blaze keeps the workspace's build directory.
+    NoBuildHome { workspace: PathBuf, why: NoHome },
+    /// The root found is a member's manifest, not a root's.
+    InferredNotRoot { root: PathBuf },
+    /// A `default-members` entry that is not a member.
+    DefaultNotMember { path: PathBuf, glob: Option<String>, root: PathBuf },
+    DuplicateName { name: String, first: PathBuf, second: PathBuf },
+    /// `package.workspace` points to a manifest with no `[workspace]`.
+    RootNotWorkspace { current: PathBuf, root: PathBuf },
+    MultipleRoots { roots: Vec<PathBuf> },
+    WrongWorkspace { member: PathBuf, expected: PathBuf, actual: PathBuf },
+    NotBelowRoot { member: PathBuf, root: PathBuf },
+    /// The current package believes it is in a workspace that does not list it; `help` is
+    /// cargo's line of what may fix it.
+    NotInMembers { current: PathBuf, root: PathBuf, help: String },
+}
+
+impl fmt::Display for WorkspaceError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WorkspaceError::NotAbsolute { manifest } => write!(
+                f,
+                "manifest_path:{manifest:?} is not an absolute path. Please provide an absolute \
+                 path."
+            ),
+            WorkspaceError::NoBuildHome { workspace, why } => write!(
+                f,
+                "no BLAZE_HOME or XDG_CACHE_HOME says where blaze keeps the build directory of \
+                 the workspace at {}, and {why}",
+                workspace.display()
+            ),
+            WorkspaceError::InferredNotRoot { root } => {
+                write!(f, "root of a workspace inferred but wasn't a root: {}", root.display())
+            }
+            WorkspaceError::DefaultNotMember { path, glob, root } => {
+                write!(f, "package `{}` is listed in default-members", path.display())?;
+                if let Some(glob) = glob {
+                    write!(f, " via `{glob}`")?;
+                }
+                write!(f, " but is not a member\nfor workspace at `{}`.", root.display())
+            }
+            WorkspaceError::DuplicateName { name, first, second } => write!(
+                f,
+                "two packages named `{name}` in this workspace:\n- {}\n- {}",
+                first.display(),
+                second.display()
+            ),
+            WorkspaceError::RootNotWorkspace { current, root } => write!(
+                f,
+                "`package.workspace` configuration points to a crate \
+                 which is not configured with [workspace]: \n\
+                 configuration at: {}\n\
+                 points to: {}",
+                current.display(),
+                root.display()
+            ),
+            WorkspaceError::MultipleRoots { roots } => {
+                f.write_str("multiple workspace roots found in the same workspace:")?;
+                for root in roots {
+                    write!(f, "\n  {}", root.display())?;
+                }
+                Ok(())
+            }
+            WorkspaceError::WrongWorkspace { member, expected, actual } => write!(
+                f,
+                "package `{}` is a member of the wrong workspace\n\
+                 expected: {}\n\
+                 actual:   {}",
+                member.display(),
+                expected.display(),
+                actual.display()
+            ),
+            WorkspaceError::NotBelowRoot { member, root } => write!(
+                f,
+                "workspace member `{}` is not hierarchically below the workspace root `{}`",
+                member.display(),
+                root.display()
+            ),
+            WorkspaceError::NotInMembers { current, root, help } => write!(
+                f,
+                "current package believes it's in a workspace when it's not:\n\
+                 current:   {}\n\
+                 workspace: {}\n\n{help}\n\
+                 Alternatively, to keep it out of the workspace, add the package \
+                 to the `workspace.exclude` array, or add an empty `[workspace]` \
+                 table to the package's manifest.",
+                current.display(),
+                root.display(),
+            ),
+        }
+    }
+}
+
+impl core::error::Error for WorkspaceError {}
 
 /// The manifest of the workspace root above `manifest_path`, if one claims it.
 pub(crate) fn find_workspace_root<F: Files>(
     manifest_path: &Path,
     ctx: &Context<F>,
-) -> anyhow::Result<Option<PathBuf>> {
+) -> Result<Option<PathBuf>, ManifestError> {
     find_workspace_root_with_loader(manifest_path, ctx, |self_path| {
         let source_id = source::for_manifest_path(self_path)?;
         let manifest = read_manifest(self_path, source_id, ctx)?;
@@ -33,8 +136,8 @@ pub(crate) fn find_workspace_root<F: Files>(
 fn find_workspace_root_with_loader<F: Files>(
     manifest_path: &Path,
     ctx: &Context<F>,
-    mut loader: impl FnMut(&Path) -> anyhow::Result<Option<PathBuf>>,
-) -> anyhow::Result<Option<PathBuf>> {
+    mut loader: impl FnMut(&Path) -> Result<Option<PathBuf>, ManifestError>,
+) -> Result<Option<PathBuf>, ManifestError> {
     {
         let roots = ctx.ws_roots.borrow();
         for current in manifest_path.ancestors().skip(1) {
@@ -47,18 +150,11 @@ fn find_workspace_root_with_loader<F: Files>(
     }
 
     for ances_manifest_path in find_root_iter(manifest_path, ctx) {
-        let ws_root_path = loader(&ances_manifest_path).with_context(|| {
-            format!(
-                "failed searching for potential workspace\n\
-                 package manifest: `{}`\n\
-                 invalid potential workspace manifest: `{}`\n\
-                 \n\
-                 help: to avoid searching for a non-existent workspace, add \
-                 `[workspace]` to the package manifest",
-                manifest_path.display(),
-                ances_manifest_path.display(),
-            )
-        })?;
+        let ws_root_path =
+            loader(&ances_manifest_path).context(|| error::Context::WorkspaceSearch {
+                manifest: manifest_path.to_owned(),
+                potential: ances_manifest_path.clone(),
+            })?;
         if let Some(ws_root_path) = ws_root_path {
             return Ok(Some(ws_root_path));
         }
@@ -99,12 +195,15 @@ pub struct Workspace<'c, F: Files> {
     member_set: HashSet<PathBuf, Global>,
     default_members: Vec<PathBuf>,
     resolve_behavior: ResolveBehavior,
-    custom_metadata: Option<toml::Value>,
+    custom_metadata: Option<Value<Global>>,
     warnings: Vec<String>,
 }
 
 impl<'c, F: Files> Workspace<'c, F> {
-    pub fn new(manifest_path: &Path, ctx: &'c Context<F>) -> anyhow::Result<Workspace<'c, F>> {
+    pub fn new(
+        manifest_path: &Path,
+        ctx: &'c Context<F>,
+    ) -> Result<Workspace<'c, F>, ManifestError> {
         let mut ws = Workspace {
             ctx,
             current_manifest: manifest_path.to_owned(),
@@ -121,9 +220,7 @@ impl<'c, F: Files> Workspace<'c, F> {
         };
         // `has_root`: on Windows the daemon names `C:\a` as `/C:/a`, which has no prefix.
         if !manifest_path.has_root() {
-            bail!(
-                "manifest_path:{manifest_path:?} is not an absolute path. Please provide an absolute path."
-            )
+            return Err(WorkspaceError::NotAbsolute { manifest: manifest_path.to_owned() }.into());
         }
         ws.root_manifest = ws.find_root(manifest_path)?;
         ws.target_dir = ctx.config.target_dir()?;
@@ -135,7 +232,7 @@ impl<'c, F: Files> Workspace<'c, F> {
         Ok(ws)
     }
 
-    fn load(&mut self, manifest_path: &Path) -> anyhow::Result<&EitherManifest> {
+    fn load(&mut self, manifest_path: &Path) -> Result<&EitherManifest, ManifestError> {
         if !self.packages.contains_key(manifest_path) {
             let source_id = source::for_manifest_path(manifest_path)?;
             let manifest = read_manifest(manifest_path, source_id, self.ctx)?;
@@ -178,7 +275,7 @@ impl<'c, F: Files> Workspace<'c, F> {
     /// directory under blaze's root ([`crate::home::build_dir`]), never one in the checkout.
     /// The root is read from the configuration's variables; with none to say it this is an
     /// error naming the workspace, never a directory guessed.
-    pub fn target_dir(&self) -> anyhow::Result<PathBuf> {
+    pub fn target_dir(&self) -> Result<PathBuf, ManifestError> {
         if let Some(dir) = &self.target_dir {
             return Ok(dir.clone());
         }
@@ -187,25 +284,22 @@ impl<'c, F: Files> Workspace<'c, F> {
             |name| config.env(name).map(std::ffi::OsString::from),
             blaze_core::home::record,
         );
-        let root = root.map_err(|why| {
-            anyhow::anyhow!(
-                "no BLAZE_HOME or XDG_CACHE_HOME says where blaze keeps the build directory of \
-                 the workspace at {}, and {why}",
-                self.root().display()
-            )
+        let root = root.map_err(|why| WorkspaceError::NoBuildHome {
+            workspace: self.root().to_owned(),
+            why,
         })?;
         Ok(crate::home::build_dir(&crate::home::builds(&root), self.root()))
     }
 
     /// `build.build-dir`, else [`Workspace::target_dir`].
-    pub fn build_dir(&self) -> anyhow::Result<PathBuf> {
+    pub fn build_dir(&self) -> Result<PathBuf, ManifestError> {
         match &self.build_dir {
             Some(dir) => Ok(dir.clone()),
             None => self.target_dir(),
         }
     }
 
-    pub fn custom_metadata(&self) -> Option<&toml::Value> {
+    pub fn custom_metadata(&self) -> Option<&Value<Global>> {
         self.custom_metadata.as_ref()
     }
 
@@ -278,17 +372,17 @@ impl<'c, F: Files> Workspace<'c, F> {
         })
     }
 
-    fn load_workspace_config(&mut self) -> anyhow::Result<Option<WorkspaceRootConfig>> {
+    fn load_workspace_config(&mut self) -> Result<Option<WorkspaceRootConfig>, ManifestError> {
         let Some(root_path) = self.root_manifest.clone() else {
             return Ok(None);
         };
         match self.load(&root_path)?.workspace_config() {
             WorkspaceConfig::Root(root_config) => Ok(Some((**root_config).clone())),
-            _ => bail!("root of a workspace inferred but wasn't a root: {}", root_path.display()),
+            _ => Err(WorkspaceError::InferredNotRoot { root: root_path }.into()),
         }
     }
 
-    fn find_root(&mut self, manifest_path: &Path) -> anyhow::Result<Option<PathBuf>> {
+    fn find_root(&mut self, manifest_path: &Path) -> Result<Option<PathBuf>, ManifestError> {
         let current = self.load(manifest_path)?;
         if let Some(root_path) =
             current.workspace_config().get_ws_root(manifest_path, manifest_path)
@@ -307,7 +401,7 @@ impl<'c, F: Files> Workspace<'c, F> {
         }
     }
 
-    fn find_members(&mut self) -> anyhow::Result<()> {
+    fn find_members(&mut self) -> Result<(), ManifestError> {
         let Some(workspace_config) = self.load_workspace_config()? else {
             let current = self.current_manifest.clone();
             self.insert_member(current.clone());
@@ -330,16 +424,13 @@ impl<'c, F: Files> Workspace<'c, F> {
         };
 
         for (path, glob) in &members_paths {
-            self.find_path_deps(&path.join("Cargo.toml"), &root_manifest_path, false)
-                .with_context(|| {
-                    format!(
-                        "failed to load manifest for workspace member `{}`\n\
-                         referenced{} by workspace at `{}`",
-                        path.display(),
-                        glob.map(|g| format!(" via `{g}`")).unwrap_or_default(),
-                        root_manifest_path.display(),
-                    )
-                })?;
+            self.find_path_deps(&path.join("Cargo.toml"), &root_manifest_path, false).context(
+                || error::Context::WorkspaceMember {
+                    path: path.clone(),
+                    glob: glob.map(str::to_owned),
+                    root: root_manifest_path.clone(),
+                },
+            )?;
         }
 
         self.find_path_deps(&root_manifest_path, &root_manifest_path, false)?;
@@ -354,13 +445,12 @@ impl<'c, F: Files> Workspace<'c, F> {
                     if exclude {
                         continue;
                     }
-                    bail!(
-                        "package `{}` is listed in default-members{} but is not a member\n\
-                         for workspace at `{}`.",
-                        path.display(),
-                        default_member_glob.map(|g| format!(" via `{g}`")).unwrap_or_default(),
-                        root_manifest_path.display(),
-                    )
+                    return Err(WorkspaceError::DefaultNotMember {
+                        path,
+                        glob: default_member_glob.map(str::to_owned),
+                        root: root_manifest_path,
+                    }
+                    .into());
                 }
                 self.default_members.push(manifest_path)
             }
@@ -377,7 +467,7 @@ impl<'c, F: Files> Workspace<'c, F> {
         manifest_path: &Path,
         root_manifest: &Path,
         is_path_dep: bool,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), ManifestError> {
         let manifest_path = normalize_path(manifest_path);
         if self.member_set.contains(&manifest_path) {
             return Ok(());
@@ -409,7 +499,7 @@ impl<'c, F: Files> Workspace<'c, F> {
         };
         for (path, name) in candidates {
             self.find_path_deps(&path, root_manifest, true)
-                .with_context(|| format!("failed to load manifest for dependency `{name}`"))?;
+                .context(|| error::Context::DependencyManifest { name: name.to_string() })?;
         }
         Ok(())
     }
@@ -423,7 +513,7 @@ impl<'c, F: Files> Workspace<'c, F> {
         };
     }
 
-    fn validate(&mut self) -> anyhow::Result<()> {
+    fn validate(&mut self) -> Result<(), ManifestError> {
         if self.root_manifest.is_none() {
             return Ok(());
         }
@@ -435,7 +525,7 @@ impl<'c, F: Files> Workspace<'c, F> {
         Ok(())
     }
 
-    fn validate_unique_names(&self) -> anyhow::Result<()> {
+    fn validate_unique_names(&self) -> Result<(), WorkspaceError> {
         let mut names = HashMap::new_in(Global);
         for member in &self.members {
             let name = match self.get(member) {
@@ -443,19 +533,17 @@ impl<'c, F: Files> Workspace<'c, F> {
                 EitherManifest::Virtual(_) => continue,
             };
             if let Some(prev) = names.insert(name, member) {
-                bail!(
-                    "two packages named `{name}` in this workspace:\n\
-                     - {}\n\
-                     - {}",
-                    prev.display(),
-                    member.display()
-                );
+                return Err(WorkspaceError::DuplicateName {
+                    name: name.to_string(),
+                    first: prev.clone(),
+                    second: member.clone(),
+                });
             }
         }
         Ok(())
     }
 
-    fn validate_workspace_roots(&self) -> anyhow::Result<()> {
+    fn validate_workspace_roots(&self) -> Result<(), WorkspaceError> {
         let roots: Vec<PathBuf> = self
             .members
             .iter()
@@ -466,48 +554,31 @@ impl<'c, F: Files> Workspace<'c, F> {
             .collect();
         match roots.len() {
             1 => Ok(()),
-            0 => bail!(
-                "`package.workspace` configuration points to a crate \
-                 which is not configured with [workspace]: \n\
-                 configuration at: {}\n\
-                 points to: {}",
-                self.current_manifest.display(),
-                self.root_manifest.as_ref().unwrap().display()
-            ),
-            _ => bail!(
-                "multiple workspace roots found in the same workspace:\n{}",
-                roots.iter().map(|r| format!("  {}", r.display())).collect::<Vec<_>>().join("\n")
-            ),
+            0 => Err(WorkspaceError::RootNotWorkspace {
+                current: self.current_manifest.clone(),
+                root: self.root_manifest.clone().unwrap(),
+            }),
+            _ => Err(WorkspaceError::MultipleRoots { roots }),
         }
     }
 
-    fn validate_members(&mut self) -> anyhow::Result<()> {
+    fn validate_members(&mut self) -> Result<(), ManifestError> {
         for member in self.members.clone() {
             let root = self.find_root(&member)?;
             if root == self.root_manifest {
                 continue;
             }
-            match root {
-                Some(root) => bail!(
-                    "package `{}` is a member of the wrong workspace\n\
-                     expected: {}\n\
-                     actual:   {}",
-                    member.display(),
-                    self.root_manifest.as_ref().unwrap().display(),
-                    root.display()
-                ),
-                None => bail!(
-                    "workspace member `{}` is not hierarchically below \
-                     the workspace root `{}`",
-                    member.display(),
-                    self.root_manifest.as_ref().unwrap().display()
-                ),
+            let expected = self.root_manifest.clone().unwrap();
+            return Err(match root {
+                Some(actual) => WorkspaceError::WrongWorkspace { member, expected, actual },
+                None => WorkspaceError::NotBelowRoot { member, root: expected },
             }
+            .into());
         }
         Ok(())
     }
 
-    fn error_if_manifest_not_in_members(&mut self) -> anyhow::Result<()> {
+    fn error_if_manifest_not_in_members(&mut self) -> Result<(), WorkspaceError> {
         if self.member_set.contains(&self.current_manifest) {
             return Ok(());
         }
@@ -548,17 +619,11 @@ impl<'c, F: Files> Workspace<'c, F> {
                 }
             }
         };
-        bail!(
-            "current package believes it's in a workspace when it's not:\n\
-             current:   {}\n\
-             workspace: {}\n\n{}\n\
-             Alternatively, to keep it out of the workspace, add the package \
-             to the `workspace.exclude` array, or add an empty `[workspace]` \
-             table to the package's manifest.",
-            self.current_manifest.display(),
-            root.display(),
-            extra
-        );
+        Err(WorkspaceError::NotInMembers {
+            current: self.current_manifest.clone(),
+            root: root.clone(),
+            help: extra,
+        })
     }
 
     /// cargo's warnings for settings only the root may have.

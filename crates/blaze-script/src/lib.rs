@@ -23,6 +23,8 @@
 //! - [`engine`], [`report`]: harness/v2's `engine.py` and `report.py`, the blaze under test and
 //!   a run's result.
 //! - [`toml`]: TOML read by blaze-toml and lowered to blaze-data's `Value`.
+//! - [`ratchet`]: what a per-crate ratchet of scripts/ shares: Rust read as text, test code,
+//!   the walk of crates/, the list and the base.
 //! - [`finding`]: the record a ratchet's `findings` command prints and `advise` ranks.
 //!
 //! When a release carries bstd and reflection, a script's `Input::parse` is derived
@@ -40,6 +42,7 @@ pub mod pyfmt;
 pub mod pyjson;
 pub mod pypath;
 pub mod pystr;
+pub mod ratchet;
 pub mod regex;
 pub mod report;
 pub mod toml;

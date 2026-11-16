@@ -23,7 +23,7 @@ use crate::{
     clock::Clock,
     mem::TASK_FRAME,
     sync::{SendError, chan},
-    task::{LAYOUT, Layout, NoParallelism, Scope},
+    task::{Class, LAYOUT, Layout, NoParallelism, Scope},
 };
 
 #[derive(Debug)]
@@ -52,7 +52,7 @@ fn run(plan: &Plan) -> Result<(), String> {
     let jobs = chan::bounded::<u32, _>("test.jobs", capacity, Global);
     let scope = cx.scope();
     if plan.narrowed {
-        scope.narrow_workers(NonZeroU32::MIN);
+        scope.narrow_workers(NonZeroU32::MIN, Class::Foreground);
     }
     let found = pair(plan, &cx, &scope, &jobs, &clock);
     let joined = scope.join(&cx);
@@ -125,7 +125,7 @@ fn squares(seed: u64, n: u32, workers: Option<NonZeroU32>) -> Result<Vec<u64>, S
     let cx = root(&io);
     let scope = cx.scope();
     if let Some(workers) = workers {
-        scope.narrow_workers(workers);
+        scope.narrow_workers(workers, Class::Foreground);
     }
     let mut out = Vec::new();
     let mut failed = None;

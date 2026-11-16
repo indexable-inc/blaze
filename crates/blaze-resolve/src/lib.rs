@@ -57,7 +57,9 @@ pub use resolve::{LockfileMetadata, Resolve, ResolveVersion};
 pub use summary::{
     FeatureDep, FeatureMap, FeatureValue, MissingDependencyError, Summary, build_feature_map,
 };
-pub use version::{OptVersionReq, PartialVersion, RustVersion, Version, VersionReq};
+pub use version::{
+    OptVersionReq, PartialVersion, RustVersion, Version, VersionReq, parse_req, parse_version,
+};
 
 pub use error::{PartialWhy, ResolveError};
 pub use platform::{Cfg, CfgError, CfgExpr, CfgWhat, Ident, Platform};

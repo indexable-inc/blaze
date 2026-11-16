@@ -312,10 +312,7 @@ where
     if let Some(dep) =
         dependencies.map(|d| d.name_in_toml).find(|dep| dep_map[dep] && !used.contains(dep))
     {
-        bail!(
-            "optional dependency `{dep}` is not included in any feature\n\
-            Make sure that `dep:{dep}` is included in one of features in the [features] table."
-        );
+        return Err(ResolveError::OptionalUnused { dep });
     }
 
     Ok(map)
@@ -516,7 +513,7 @@ mod tests {
     #[test]
     fn missing_dependency_is_typed() {
         let e = summary(vec![], &[("f", &["x?/a"])]).unwrap_err();
-        let missing = e.downcast_ref::<MissingDependencyError>().unwrap();
+        let ResolveError::MissingDependency(missing) = &e else { panic!("{e}") };
         assert!(missing.weak_optional);
         assert_eq!(missing.dep_name, "x");
     }

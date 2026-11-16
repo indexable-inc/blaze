@@ -295,13 +295,13 @@ macro_rules! __flags {
             /// Every declared flag.
             #[inline]
             pub const fn all() -> Self {
-                Self::from_bits_retain(0 $(| Self::$Flag.bits())*)
+                Self::from_bits_retain(0 $(| Self::bits(&Self::$Flag))*)
             }
 
             /// `bits`, or `None` when it has a bit no flag declares.
             #[inline]
             pub const fn from_bits(bits: $T) -> ::core::option::Option<Self> {
-                if bits & !Self::all().bits() == 0 {
+                if bits & !Self::bits(&Self::all()) == 0 {
                     ::core::option::Option::Some(Self::from_bits_retain(bits))
                 } else {
                     ::core::option::Option::None
@@ -311,7 +311,7 @@ macro_rules! __flags {
             /// `bits` without the bits no flag declares.
             #[inline]
             pub const fn from_bits_truncate(bits: $T) -> Self {
-                Self::from_bits_retain(bits & Self::all().bits())
+                Self::from_bits_retain(bits & Self::bits(&Self::all()))
             }
 
             /// The flag declared as `name`.
@@ -326,79 +326,80 @@ macro_rules! __flags {
 
             #[inline]
             pub const fn is_empty(&self) -> bool {
-                self.bits() == 0
+                Self::bits(self) == 0
             }
 
             /// Whether every declared flag is in the set.
             #[inline]
             pub const fn is_all(&self) -> bool {
-                Self::all().bits() & self.bits() == Self::all().bits()
+                let all = Self::bits(&Self::all());
+                all & Self::bits(self) == all
             }
 
             #[inline]
             pub const fn intersects(&self, other: Self) -> bool {
-                self.bits() & other.bits() != 0
+                Self::bits(self) & Self::bits(&other) != 0
             }
 
             #[inline]
             pub const fn contains(&self, other: Self) -> bool {
-                self.bits() & other.bits() == other.bits()
+                Self::bits(self) & Self::bits(&other) == Self::bits(&other)
             }
 
             #[inline]
             pub const fn insert(&mut self, other: Self) {
-                *self = Self::from_bits_retain(self.bits() | other.bits());
+                *self = Self::from_bits_retain(Self::bits(self) | Self::bits(&other));
             }
 
             #[inline]
             pub const fn remove(&mut self, other: Self) {
-                *self = Self::from_bits_retain(self.bits() & !other.bits());
+                *self = Self::from_bits_retain(Self::bits(self) & !Self::bits(&other));
             }
 
             #[inline]
             pub const fn toggle(&mut self, other: Self) {
-                *self = Self::from_bits_retain(self.bits() ^ other.bits());
+                *self = Self::from_bits_retain(Self::bits(self) ^ Self::bits(&other));
             }
 
             /// Inserts `other` when `value`, else removes it.
             #[inline]
             pub const fn set(&mut self, other: Self, value: bool) {
                 if value {
-                    self.insert(other);
+                    Self::insert(self, other);
                 } else {
-                    self.remove(other);
+                    Self::remove(self, other);
                 }
             }
 
             #[inline]
             #[must_use]
             pub const fn intersection(self, other: Self) -> Self {
-                Self::from_bits_retain(self.bits() & other.bits())
+                Self::from_bits_retain(Self::bits(&self) & Self::bits(&other))
             }
 
             #[inline]
             #[must_use]
             pub const fn union(self, other: Self) -> Self {
-                Self::from_bits_retain(self.bits() | other.bits())
+                Self::from_bits_retain(Self::bits(&self) | Self::bits(&other))
             }
 
             #[inline]
             #[must_use]
             pub const fn difference(self, other: Self) -> Self {
-                Self::from_bits_retain(self.bits() & !other.bits())
+                Self::from_bits_retain(Self::bits(&self) & !Self::bits(&other))
             }
 
             #[inline]
             #[must_use]
             pub const fn symmetric_difference(self, other: Self) -> Self {
-                Self::from_bits_retain(self.bits() ^ other.bits())
+                Self::from_bits_retain(Self::bits(&self) ^ Self::bits(&other))
             }
 
             /// The declared flags not in the set.
             #[inline]
             #[must_use]
             pub const fn complement(self) -> Self {
-                Self::from_bits_truncate(!self.bits())
+                Self::from_bits_truncate(!Self::bits(&self))
             }
 
             /// The named flags, then the bits no flag names as one value.
@@ -433,14 +434,14 @@ macro_rules! __flags {
             type Output = Self;
             #[inline]
             fn bitor(self, other: Self) -> Self {
-                Self::from_bits_retain(self.bits() | other.bits())
+                Self::union(self, other)
             }
         }
 
         impl ::core::ops::BitOrAssign for $Name {
             #[inline]
             fn bitor_assign(&mut self, other: Self) {
-                self.insert(other);
+                Self::insert(self, other);
             }
         }
 
@@ -448,14 +449,14 @@ macro_rules! __flags {
             type Output = Self;
             #[inline]
             fn bitand(self, other: Self) -> Self {
-                Self::from_bits_retain(self.bits() & other.bits())
+                Self::intersection(self, other)
             }
         }
 
         impl ::core::ops::BitAndAssign for $Name {
             #[inline]
             fn bitand_assign(&mut self, other: Self) {
-                *self = Self::from_bits_retain(self.bits() & other.bits());
+                *self = Self::intersection(*self, other);
             }
         }
 
@@ -463,14 +464,14 @@ macro_rules! __flags {
             type Output = Self;
             #[inline]
             fn bitxor(self, other: Self) -> Self {
-                Self::from_bits_retain(self.bits() ^ other.bits())
+                Self::symmetric_difference(self, other)
             }
         }
 
         impl ::core::ops::BitXorAssign for $Name {
             #[inline]
             fn bitxor_assign(&mut self, other: Self) {
-                self.toggle(other);
+                Self::toggle(self, other);
             }
         }
 
@@ -478,14 +479,14 @@ macro_rules! __flags {
             type Output = Self;
             #[inline]
             fn sub(self, other: Self) -> Self {
-                Self::from_bits_retain(self.bits() & !other.bits())
+                Self::difference(self, other)
             }
         }
 
         impl ::core::ops::SubAssign for $Name {
             #[inline]
             fn sub_assign(&mut self, other: Self) {
-                self.remove(other);
+                Self::remove(self, other);
             }
         }
 
@@ -493,14 +494,14 @@ macro_rules! __flags {
             type Output = Self;
             #[inline]
             fn not(self) -> Self {
-                Self::from_bits_truncate(!self.bits())
+                Self::complement(self)
             }
         }
 
         impl ::core::iter::Extend<$Name> for $Name {
             fn extend<I: ::core::iter::IntoIterator<Item = Self>>(&mut self, flags: I) {
                 for flag in flags {
-                    self.insert(flag);
+                    Self::insert(self, flag);
                 }
             }
         }

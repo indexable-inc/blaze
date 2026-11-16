@@ -1,0 +1,24 @@
+[package]
+name = "blaze-queue"
+description = "blaze's two lock-free queues (AGENTS.md rule 12): a bounded many-producer many-consumer ring and an unbounded queue of segments, on atomics alone, below every crate that hands values between threads; under `--cfg blaze_check` each is the model checker's to explore"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# The one bounded spin, for a slot another thread is mid-way through.
+blaze-spin.workspace = true
+
+[target.'cfg(blaze_check)'.dependencies]
+blaze-check.workspace = true
+
+[lints]
+workspace = true

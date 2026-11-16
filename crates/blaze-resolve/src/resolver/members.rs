@@ -6,8 +6,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 use std::rc::Rc;
 
-use anyhow::bail;
-
 use super::features::CliFeatures;
 use super::{CargoResult, HashMap, HashSet};
 use crate::dependency::Dependency;
@@ -302,18 +300,18 @@ fn report_unknown_features_error(
     };
 
     if !missing_packages_with_the_features.is_empty() {
-        write!(
+        let _ = write!(
             &mut msg,
             "\nhelp: package{} with the missing feature{}: {}",
             if missing_packages_with_the_features.len() != 1 { "s" } else { "" },
             if unknown.len() != 1 { "s" } else { "" },
             missing_packages_with_the_features.join(", ")
-        )?;
+        );
     } else {
         let suggestions =
             missing_feature_spelling_suggestions(&selected_members, cli_features, found_features);
         if !suggestions.is_empty() {
-            write!(
+            let _ = write!(
                 &mut msg,
                 "\nhelp: there {}: {}",
                 if suggestions.len() == 1 {
@@ -322,11 +320,11 @@ fn report_unknown_features_error(
                     "are similarly named features"
                 },
                 suggestions.join(", ")
-            )?;
+            );
         }
     }
 
-    bail!("{msg}")
+    Err(crate::ResolveError::UnknownFeatures { report: msg })
 }
 
 /// New command-line feature selection behavior with resolver = "2" or the
@@ -366,7 +364,7 @@ fn members_with_features_new<'a>(
                 })
                 .find(|msg| !msg.is_empty())
                 .unwrap_or_default();
-            bail!("cannot specify features for packages outside of workspace{hint}");
+            return Err(crate::ResolveError::FeaturesOutsideWorkspace { hint });
         }
         // Add all members from the workspace so we can ensure `-p nonmember`
         // is in the resolve graph.

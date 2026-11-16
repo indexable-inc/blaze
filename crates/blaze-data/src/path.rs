@@ -125,7 +125,8 @@ impl<A: Allocator> fmt::Display for ShapeError<A> {
             Shape::Expected { expected, found } => {
                 write!(f, "{path}: expected {expected}, found {found}")
             }
-            Shape::Missing => write!(f, "{path}: missing"),
+            Shape::Missing if self.note.is_empty() => write!(f, "{path}: missing"),
+            Shape::Missing => write!(f, "{path}: missing ({})", self.note.as_str()),
             Shape::UnknownFields { .. } | Shape::UnknownVariant => write!(f, "{path}: {}", self.note.as_str()),
             Shape::OutOfRange { ty } => write!(f, "{path}: out of range for {ty}"),
             Shape::NoIndex { len } => write!(f, "{path}: past the end of a list of {len}"),
@@ -343,6 +344,15 @@ impl<'v, 'p, A: Allocator + Clone> Cursor<'v, 'p, A> {
     }
 }
 
+/// The path and the value: `Cursor(a.b[3]: true)`.
+impl<A: Allocator + Clone> fmt::Debug for Cursor<'_, '_, A> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Cursor(")?;
+        self.at.write_into(f)?;
+        write!(f, ": {:?})", self.value)
+    }
+}
+
 /// A map being read as a struct, inside [`Cursor::fields`]: each field is taken by name, and
 /// what is not taken is refused when the read ends. The names are `'static`, as a struct's
 /// field names are.
@@ -365,10 +375,20 @@ impl<'c, 'v, 'p, A: Allocator + Clone> Fields<'c, 'v, 'p, A> {
         }
     }
 
-    /// The field `key`, which must be there.
+    /// The field `key`, which must be there; when it is not and a key near it is, the error
+    /// says so (`a.color: missing (found unknown field "colour")`), since the unknown-field
+    /// check that would name it comes only after the read.
     pub fn cursor(&self, key: &'static str) -> Result<Cursor<'v, '_, A>, ShapeError<A>> {
         self.ask(key);
-        self.cursor.field(key)
+        self.cursor.field(key).map_err(|mut error| {
+            let near = self.map.iter().map(|(k, _)| k).find(|k| closest(k, core::iter::once(key)).is_some());
+            if let Some(near) = near {
+                if write!(error.note, "found unknown field {near:?}").is_err() {
+                    unreachable!("writing into a `String` does not fail");
+                }
+            }
+            error
+        })
     }
 
     /// The field `key`, if it is there.

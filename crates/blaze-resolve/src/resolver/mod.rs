@@ -81,7 +81,7 @@ use self::features::RequestedFeatures;
 use self::types::{ConflictMap, ConflictReason, DepsFrame};
 use self::types::{FeaturesSet, RcVecIter, RemainingDeps, ResolverProgress};
 
-pub use self::errors::{ActivateError, ActivateResult, ResolveError};
+pub use self::errors::{ActivateError, ActivateResult};
 pub use self::features::{
     CliFeatures, CompileKind, FeatureOpts, FeatureResolver, FeaturesFor, ForceAllTargets,
     HasDevUnits, PackageTargets, ResolvedFeatures,
@@ -91,7 +91,7 @@ pub use self::types::{ResolveBehavior, ResolveOpts};
 pub use self::version_prefs::VersionOrdering;
 pub use self::version_prefs::VersionPreferences;
 
-pub(crate) type CargoResult<T> = anyhow::Result<T>;
+pub(crate) type CargoResult<T> = Result<T, crate::ResolveError>;
 pub(crate) use blaze_hash::{HashMap, HashSet};
 
 mod conflict_cache;
@@ -1009,10 +1009,8 @@ fn check_cycles(resolve: &Resolve) -> CargoResult<()> {
                 Some((parent, dep))
             });
             let iter = std::iter::once((&id, None)).chain(iter);
-            let describe_path = errors::describe_path(iter);
-            anyhow::bail!(
-                "cyclic package dependency: package `{id}` depends on itself. Cycle:\n{describe_path}"
-            );
+            let cycle = errors::describe_path(iter);
+            return Err(crate::ResolveError::PackageCycle { package: id, path: cycle });
         }
 
         if checked.insert(id) {
@@ -1042,12 +1040,10 @@ fn check_duplicate_pkgs_in_lockfile(resolve: &Resolve) -> CargoResult<()> {
     for pkg_id in resolve.iter() {
         let encodable_pkd_id = lockfile::encodable_package_id(pkg_id, &state, resolve.version());
         if let Some(prev_pkg_id) = unique_pkg_ids.insert(encodable_pkd_id, pkg_id) {
-            anyhow::bail!(
-                "package collision in the lockfile: packages {} and {} are different, \
-                 but only one can be written to lockfile unambiguously",
-                prev_pkg_id,
-                pkg_id
-            )
+            return Err(crate::ResolveError::LockfileCollision {
+                first: prev_pkg_id,
+                second: pkg_id,
+            });
         }
     }
     Ok(())

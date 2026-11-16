@@ -8,9 +8,8 @@
 
 use std::path::{Path, PathBuf};
 
-use blaze_manifest::diagnostic::ManifestDiagnostic;
 use blaze_manifest::metadata::{export_no_deps, root_manifest};
-use blaze_manifest::{Config, Context, Workspace};
+use blaze_manifest::{Config, Context, ManifestError, Workspace};
 use serde::Serialize;
 
 fn copy_dir(from: &Path, to: &Path) {
@@ -30,8 +29,8 @@ fn copy_dir(from: &Path, to: &Path) {
 }
 
 /// The error as cargo prints it, blank lines dropped as they were when `expected.json` was recorded.
-fn error_text(err: &anyhow::Error, cwd: &Path) -> String {
-    if let Some(diagnostic) = err.downcast_ref::<ManifestDiagnostic>() {
+fn error_text(err: &ManifestError, cwd: &Path) -> String {
+    if let Some(diagnostic) = err.diagnostic() {
         return diagnostic
             .render(cwd)
             .lines()
@@ -76,15 +75,16 @@ fn read(fixture: &Path, scratch: &Path) -> String {
         ("CARGO_HOME".to_owned(), home.display().to_string()),
         ("BLAZE_HOME".to_owned(), blaze_home.display().to_string()),
     ];
-    let result = (|| {
+    let result = (|| -> Result<String, ManifestError> {
         let ctx = Context::new(Config::load(&cwd, env, &[])?);
         let manifest = root_manifest(None, &ctx)?;
         let ws = Workspace::new(&manifest, &ctx)?;
         let mut out = Vec::new();
         let formatter = serde_json::ser::PrettyFormatter::with_indent(b" ");
         export_no_deps(&ws)?
-            .serialize(&mut serde_json::Serializer::with_formatter(&mut out, formatter))?;
-        anyhow::Ok(String::from_utf8(out)?)
+            .serialize(&mut serde_json::Serializer::with_formatter(&mut out, formatter))
+            .expect("metadata serializes to a Vec");
+        Ok(String::from_utf8(out).expect("serde_json writes UTF-8"))
     })();
     let root = root.display().to_string();
     let home = home.canonicalize().unwrap().display().to_string();

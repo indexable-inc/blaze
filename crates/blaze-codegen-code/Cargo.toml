@@ -16,14 +16,13 @@ doctest = false
 # A build-dependency of the programs (blaze-engine, which works out the code generator's and the
 # front end's identities), and a dev-dependency of the coverage checks
 # (hir-ty-codegen, blaze-cargo) and hir-ty's store tests: nothing of it is linked into blaze.
-# It reads `Cargo.lock` and the manifests itself (`toml`, `glob` for `members`): a build script
+# It reads `Cargo.lock` and the manifests itself (`blaze-toml`, `blaze-glob` for `members`): a build script
 # runs no cargo, whose `$CARGO` is blaze under blaze.
 [dependencies]
 blaze-data.workspace = true
 blaze-toml.workspace = true
 blake3.workspace = true
-glob.workspace = true
-toml.workspace = true
+blaze-glob.workspace = true
 # The request of `ship-code-identity`.
 blaze-json.workspace = true
 

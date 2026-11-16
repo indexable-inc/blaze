@@ -69,7 +69,7 @@ mod write;
 mod tests;
 
 pub use concat::{Concat, Failed, Input};
-pub use read::File;
+pub use read::{File, IntStats};
 pub use write::{Options, STAT_BYTES, Writer, write};
 
 /// The four bytes a Parquet file begins and ends with.
@@ -109,6 +109,8 @@ pub enum ParquetError {
     TooLarge { column: ColumnName, what: &'static str },
     /// A column could not be made of what was read.
     Column { column: ColumnName, error: ColumnError },
+    /// A merge's input of another schema than its first.
+    SchemaDiffers,
 }
 
 impl fmt::Display for ParquetError {
@@ -124,6 +126,7 @@ impl fmt::Display for ParquetError {
             ParquetError::Corrupt { column, what } => write!(f, "the Parquet column `{column}`: {what}"),
             ParquetError::TooLarge { column, what } => write!(f, "the Parquet column `{column}`: {what}"),
             ParquetError::Column { column, error } => write!(f, "the Parquet column `{column}`: {error}"),
+            ParquetError::SchemaDiffers => f.write_str("a Parquet file of another schema than the merge's first"),
         }
     }
 }

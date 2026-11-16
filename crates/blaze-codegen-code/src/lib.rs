@@ -1388,7 +1388,7 @@ impl Workspace {
         {
             let full = root.join(pattern);
             let full = full.to_str().ok_or_else(|| format!("{} is not UTF-8", full.display()))?;
-            let paths = glob::glob(full).map_err(|why| {
+            let paths = blaze_glob::glob(&blaze_glob::Disk, full).map_err(|why| {
                 format!("member pattern `{pattern}` of {}: {why}", root_manifest.display())
             })?;
             for path in paths {

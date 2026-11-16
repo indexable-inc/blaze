@@ -76,8 +76,8 @@ pub(crate) fn write_string(s: &str, out: &mut String) {
 
 /// `s` as a TOML key, appended to `out`: bare when it can be.
 pub(crate) fn write_key(s: &str, out: &mut String) {
-    let bare = !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
-    if bare {
+    let bare_byte = |b: u8| b.is_ascii_alphanumeric() || b == b'-' || b == b'_';
+    if !s.is_empty() && s.bytes().all(bare_byte) {
         out.push_str(s);
         return;
     }

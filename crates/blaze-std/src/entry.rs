@@ -141,6 +141,27 @@ pub fn run_in<R: Outcome>(io: Io, said: &mut dyn fmt::Write, main: impl FnOnce(&
     main(&cx, io).status(said)
 }
 
+/// As [`run_in`], its root context on `pool` (the process's `Threads` layout, which
+/// `crate::rt::run` starts): `main`'s tasks run on the pool's workers.
+pub(crate) fn run_on<R: Outcome>(
+    io: Io,
+    pool: crate::task::threads::Pool,
+    said: &mut dyn fmt::Write,
+    main: impl FnOnce(&Cx, Io) -> R,
+) -> Status {
+    let frame = match blaze_mem::Frame::with_reserve(MAIN_SCRATCH, blaze_mem::Tag::Frames) {
+        Ok(frame) => frame,
+        Err(_) => {
+            let stopped = crate::Stopped::OutOfMemory { arena: "main's frame", asked: MAIN_SCRATCH };
+            let _ = write!(said, "bstd::entry: the root context of `main` could not be made: {stopped}");
+            return Status::FAILED;
+        }
+    };
+    let deadline = blaze_core::wait::Deadline::after(io.now(), MAIN_BUDGET);
+    let cx = Cx::root_on(deadline, frame, io.clone(), pool);
+    main(&cx, io).status(said)
+}
+
 /// A parameter `main` may take: the root context, the world, or a capability the world hands
 /// out by type. `#[bstd::main]` ([`crate::main!`]) gives each of `main`'s parameters
 /// `<Type as Root>::root(cx, &io)`, so which roots exist is this trait's impls, never a list

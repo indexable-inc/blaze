@@ -8,7 +8,6 @@ use crate::persistent;
 use crate::resolver::HashMap;
 use crate::resolver::HashSet;
 use crate::{Dependency, PackageId, Registry, Summary};
-use anyhow::format_err;
 use std::alloc::Global;
 use std::collections::BTreeSet;
 use blaze_trace::debug;
@@ -83,13 +82,7 @@ impl ResolverContext {
                 if let Some(link) = summary.links()
                     && self.links.insert(link, id).is_some()
                 {
-                    return Err(format_err!(
-                        "Attempting to resolve a dependency with more than \
-                             one crate with links={}.\nThis will not build as \
-                             is. Consider rebuilding the .lock file.",
-                        &*link
-                    )
-                    .into());
+                    return Err(crate::ResolveError::LinksTwice { links: link }.into());
                 }
                 v.insert((summary.clone(), age));
 

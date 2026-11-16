@@ -209,6 +209,64 @@ impl<A: Allocator> FileMeta<A> {
     }
 }
 
+impl<A: Allocator + Clone> Clone for SchemaElement<A> {
+    fn clone(&self) -> SchemaElement<A> {
+        SchemaElement {
+            ty: self.ty,
+            type_length: self.type_length,
+            repetition: self.repetition,
+            // clone: a schema's names, once a merge
+            name: self.name.clone(),
+            num_children: self.num_children,
+            converted: self.converted,
+            scale: self.scale,
+            precision: self.precision,
+            field_id: self.field_id,
+            logical: self.logical,
+        }
+    }
+}
+
+impl<A: Allocator + Clone> Clone for Statistics<A> {
+    fn clone(&self) -> Statistics<A> {
+        // clone: a chunk's statistics, as a merge copies the chunk
+        Statistics {
+            max: self.max.clone(),
+            min: self.min.clone(),
+            null_count: self.null_count,
+            distinct_count: self.distinct_count,
+            max_value: self.max_value.clone(),
+            min_value: self.min_value.clone(),
+        }
+    }
+}
+
+impl<A: Allocator + Clone> Clone for ColumnMeta<A> {
+    fn clone(&self) -> ColumnMeta<A> {
+        // clone: a chunk's metadata, as a merge copies the chunk
+        ColumnMeta {
+            ty: self.ty,
+            encodings: self.encodings.clone(),
+            path: self.path.clone(),
+            codec: self.codec,
+            num_values: self.num_values,
+            total_uncompressed_size: self.total_uncompressed_size,
+            total_compressed_size: self.total_compressed_size,
+            data_page_offset: self.data_page_offset,
+            index_page_offset: self.index_page_offset,
+            dictionary_page_offset: self.dictionary_page_offset,
+            statistics: self.statistics.clone(),
+        }
+    }
+}
+
+impl<A: Allocator + Clone> Clone for KeyValue<A> {
+    fn clone(&self) -> KeyValue<A> {
+        // clone: a key and its value, a few a merge
+        KeyValue { key: self.key.clone(), value: self.value.clone() }
+    }
+}
+
 /// `DataPageHeader` and `DataPageHeaderV2`, as one: what a reader needs of either.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DataHeader {

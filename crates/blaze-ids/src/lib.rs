@@ -313,6 +313,28 @@ impl<T> hash::Hash for Idx<T> {
     }
 }
 
+// SAFETY: `#[repr(transparent)]` over a `u32` and a zero-sized `PhantomData`, so no padding
+// and no address; equal exactly when `raw` is, so when the four bytes are. Not uniform: an
+// index is small and sequential, so `hash_plain` mixes it.
+#[allow(unsafe_code, reason = "a `PlainKey` impl: the promise its SAFETY comment states")]
+unsafe impl<T> blaze_hash::PlainKey for Idx<T> {}
+
+// SAFETY: `#[repr(transparent)]` over `[u8; 32]` with derived `Eq`: no padding, no address,
+// equal exactly when the bytes are. Uniform: a BLAKE3 digest, so its first word is its hash,
+// as `ByHash` takes it.
+#[allow(unsafe_code, reason = "a `PlainKey` impl: the promise its SAFETY comment states")]
+unsafe impl blaze_hash::PlainKey for ContentId {
+    const UNIFORM: bool = true;
+}
+
+// SAFETY: `#[repr(transparent)]` over a `u128` with derived `Eq`: no padding, no address,
+// equal exactly when the bytes are. Uniform: its bits are a BLAKE3 digest's first 128
+// (`ContentId::fingerprint`).
+#[allow(unsafe_code, reason = "a `PlainKey` impl: the promise its SAFETY comment states")]
+unsafe impl blaze_hash::PlainKey for Fingerprint {
+    const UNIFORM: bool = true;
+}
+
 impl<T> fmt::Debug for Idx<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "#{}", self.raw)

@@ -200,7 +200,8 @@ impl<K: Eq, V, S: KeyHash<K>, A: Allocator> Map<K, V, S, A> {
     where
         S: KeyHash<Q>,
     {
-        let hash = self.hasher.hash_key(key);
+        // Named, as `S` is `KeyHash` of both `K` and `Q` here.
+        let hash = <S as KeyHash<Q>>::hash_key(&self.hasher, key);
         self.table.find(hash, |(held, _)| key.equivalent(held))
     }
 

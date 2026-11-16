@@ -529,6 +529,15 @@ impl Cx {
         self.placed.here
     }
 
+    /// How many workers its scopes run tasks on: the pool's count, one under `Inline`. What a
+    /// [`crate::task::PerWorker`] is made with.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub fn workers(&self) -> u32 {
+        self.layout().workers()
+    }
+
     /// The class of the scope this context is in.
     #[blaze::nopanic]
     #[blaze::noalloc]

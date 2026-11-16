@@ -22,7 +22,7 @@ crate::bitflags! {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Own(u16);
 
 crate::bitflags! {
@@ -32,13 +32,18 @@ crate::bitflags! {
     }
 }
 
+// The set operations work in a constant, with the test's `Ops` trait in scope.
+const _: () = assert!(Set::A.union(Set::C).contains(Set::C) && Set::all().bits() == SET_ALL);
+
 /// The declared bits of `Set`, written out: the model's `all`.
 const SET_ALL: u8 = 0b1000_1011;
 
-/// The operations the oracle checks, so a planted copy can stand in for `Set`.
+/// The operations the oracle checks, so a planted copy can stand in for `Set`. `bits` takes
+/// `&self` as the inherent one does: a by-value `bits` in scope would be picked before the
+/// inherent `const fn` on a by-value receiver (`Set::A.bits()` in a constant).
 trait Ops: Copy {
     fn from_bits_retain(bits: u8) -> Self;
-    fn bits(self) -> u8;
+    fn bits(&self) -> u8;
     fn complement(self) -> Self;
 }
 
@@ -46,8 +51,8 @@ impl Ops for Set {
     fn from_bits_retain(bits: u8) -> Set {
         Set::from_bits_retain(bits)
     }
-    fn bits(self) -> u8 {
-        Set::bits(&self)
+    fn bits(&self) -> u8 {
+        Set::bits(self)
     }
     fn complement(self) -> Set {
         Set::complement(self)
@@ -62,8 +67,8 @@ impl Ops for KeepsUndeclared {
     fn from_bits_retain(bits: u8) -> KeepsUndeclared {
         KeepsUndeclared(Set::from_bits_retain(bits))
     }
-    fn bits(self) -> u8 {
-        self.0.bits()
+    fn bits(&self) -> u8 {
+        Set::bits(&self.0)
     }
     fn complement(self) -> KeepsUndeclared {
         KeepsUndeclared(Set::from_bits_retain(!self.0.bits()))

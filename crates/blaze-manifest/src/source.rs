@@ -1,111 +1,94 @@
 //! Where a package comes from: cargo's `SourceId`, which is blaze-source's, plus the two
-//! constructors that read the configuration and the match of a `PackageIdSpec`'s kind.
+//! constructors that read the configuration and the source a `PackageIdSpec`'s kind names.
 
-use std::path::Path;
+use std::fmt;
+use std::path::{Path, PathBuf};
 
-use anyhow::anyhow;
-use cargo_util_schemas::core as spec;
 use url::Url;
 
 use crate::config::Config;
+use crate::error::ManifestError;
 use crate::files::Files;
 
 pub use blaze_source::{
     CRATES_IO_HTTP_INDEX, CRATES_IO_INDEX, CRATES_IO_REGISTRY, GitReference, SourceId, SourceKind,
 };
 
+/// A place a package cannot come from, in cargo's words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceRefusal {
+    /// A manifest path with no directory above it.
+    NoDirectory { manifest: PathBuf },
+    /// A URL that names no local path where one is wanted.
+    NotAPath { url: Url },
+    /// A URL that does not parse; `ssh` is the `ssh://` form to suggest for `git@host:path`.
+    BadUrl { text: String, error: url::ParseError, ssh: Option<String> },
+}
+
+impl fmt::Display for SourceRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SourceRefusal::NoDirectory { manifest } => {
+                write!(f, "the manifest path `{}` has no directory", manifest.display())
+            }
+            SourceRefusal::NotAPath { url } => write!(f, "`{url}` is not a path"),
+            SourceRefusal::BadUrl { text, error, ssh } => {
+                write!(f, "invalid url `{text}`: {error}")?;
+                if let Some(ssh) = ssh {
+                    write!(f, "; try using `{ssh}` instead")?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl core::error::Error for SourceRefusal {}
+
 /// The source of the package whose manifest is at `manifest_path`: its directory.
-pub fn for_manifest_path(manifest_path: &Path) -> anyhow::Result<SourceId> {
-    let dir = manifest_path.parent().ok_or_else(|| {
-        anyhow!("the manifest path `{}` has no directory", manifest_path.display())
+pub fn for_manifest_path(manifest_path: &Path) -> Result<SourceId, ManifestError> {
+    let dir = manifest_path.parent().ok_or_else(|| SourceRefusal::NoDirectory {
+        manifest: manifest_path.to_owned(),
     })?;
-    SourceId::for_path(dir)
+    Ok(SourceId::for_path(dir)?)
 }
 
 /// crates.io as cargo names it in metadata: its git index, whatever protocol fetches it.
-pub fn crates_io<F: Files>(config: &Config<F>) -> anyhow::Result<SourceId> {
+pub fn crates_io<F: Files>(config: &Config<F>) -> Result<SourceId, ManifestError> {
     config.check_registry_index_not_set()?;
     Ok(SourceId::crates_io())
 }
 
 /// A registry by its name in `[registries]` (cargo's `SourceId::alt_registry`).
-pub fn alt_registry<F: Files>(config: &Config<F>, key: &str) -> anyhow::Result<SourceId> {
+pub fn alt_registry<F: Files>(config: &Config<F>, key: &str) -> Result<SourceId, ManifestError> {
     if key == CRATES_IO_REGISTRY {
         return crates_io(config);
     }
     let url = config.registry_index(key)?;
-    SourceId::for_alt_registry(&url, key)
-}
-
-/// The kind as cargo's `PackageIdSpec` (cargo-util-schemas) names it, for `with_kind`.
-pub fn spec_kind(kind: &SourceKind) -> spec::SourceKind {
-    match kind {
-        SourceKind::Git(reference) => spec::SourceKind::Git(match reference {
-            GitReference::Tag(it) => spec::GitReference::Tag(it.clone()), // clone: the spec owns it, once per spec
-            GitReference::Branch(it) => spec::GitReference::Branch(it.clone()), // clone: as above
-            GitReference::Rev(it) => spec::GitReference::Rev(it.clone()), // clone: as above
-            GitReference::DefaultBranch => spec::GitReference::DefaultBranch,
-        }),
-        SourceKind::Path => spec::SourceKind::Path,
-        SourceKind::Registry => spec::SourceKind::Registry,
-        SourceKind::SparseRegistry => spec::SourceKind::SparseRegistry,
-        SourceKind::LocalRegistry => spec::SourceKind::LocalRegistry,
-        SourceKind::Directory => spec::SourceKind::Directory,
-    }
-}
-
-/// Whether a `PackageIdSpec`'s kind is `kind`, compared in place.
-pub fn spec_kind_is(want: &spec::SourceKind, kind: &SourceKind) -> bool {
-    match (want, kind) {
-        (spec::SourceKind::Git(want), SourceKind::Git(reference)) => match (want, reference) {
-            (spec::GitReference::Tag(a), GitReference::Tag(b))
-            | (spec::GitReference::Branch(a), GitReference::Branch(b))
-            | (spec::GitReference::Rev(a), GitReference::Rev(b)) => a == b,
-            (spec::GitReference::DefaultBranch, GitReference::DefaultBranch) => true,
-            _ => false,
-        },
-        (spec::SourceKind::Path, SourceKind::Path)
-        | (spec::SourceKind::Registry, SourceKind::Registry)
-        | (spec::SourceKind::SparseRegistry, SourceKind::SparseRegistry)
-        | (spec::SourceKind::LocalRegistry, SourceKind::LocalRegistry)
-        | (spec::SourceKind::Directory, SourceKind::Directory) => true,
-        _ => false,
-    }
+    Ok(SourceId::for_alt_registry(&url, key)?)
 }
 
 /// The source a `PackageIdSpec`'s kind and URL name.
-pub fn from_spec(kind: &spec::SourceKind, url: &Url) -> anyhow::Result<SourceId> {
-    let path = || blaze_source::url_file(&url).map_err(|()| anyhow!("`{url}` is not a path"));
-    match kind {
-        spec::SourceKind::Git(reference) => SourceId::for_git(
-            url,
-            match reference {
-                spec::GitReference::Tag(it) => GitReference::Tag(it.clone()), // clone: the interned source owns it, once per spec
-                spec::GitReference::Branch(it) => GitReference::Branch(it.clone()), // clone: as above
-                spec::GitReference::Rev(it) => GitReference::Rev(it.clone()), // clone: as above
-                spec::GitReference::DefaultBranch => GitReference::DefaultBranch,
-            },
-        ),
-        spec::SourceKind::Path => SourceId::for_path(&path()?),
-        spec::SourceKind::Registry | spec::SourceKind::SparseRegistry => {
-            SourceId::for_registry(url)
-        }
-        spec::SourceKind::LocalRegistry => SourceId::for_local_registry(&path()?),
-        spec::SourceKind::Directory => SourceId::for_directory(&path()?),
-    }
+pub fn from_spec(kind: &SourceKind, url: &Url) -> Result<SourceId, ManifestError> {
+    let path = || {
+        blaze_source::url_file(url).map_err(|()| SourceRefusal::NotAPath { url: url.clone() })
+    };
+    Ok(match kind {
+        // clone: the interned source owns it, once per spec
+        SourceKind::Git(reference) => SourceId::for_git(url, reference.clone())?,
+        SourceKind::Path => SourceId::for_path(&path()?)?,
+        SourceKind::Registry | SourceKind::SparseRegistry => SourceId::for_registry(url)?,
+        SourceKind::LocalRegistry => SourceId::for_local_registry(&path()?)?,
+        SourceKind::Directory => SourceId::for_directory(&path()?)?,
+    })
 }
 
 /// A URL as cargo's `IntoUrl` parses one, with its hint for scp-like git addresses.
-pub(crate) fn into_url(s: &str) -> anyhow::Result<Url> {
-    Url::parse(s).map_err(|e| {
-        if s.starts_with("git@") {
-            anyhow!(
-                "invalid url `{s}`: {e}; try using `{}` instead",
-                format_args!("ssh://{}", s.replacen(':', "/", 1))
-            )
-        } else {
-            anyhow!("invalid url `{s}`: {e}")
-        }
+pub(crate) fn into_url(s: &str) -> Result<Url, SourceRefusal> {
+    Url::parse(s).map_err(|error| SourceRefusal::BadUrl {
+        text: s.to_owned(),
+        error,
+        ssh: s.starts_with("git@").then(|| format!("ssh://{}", s.replacen(':', "/", 1))),
     })
 }
 
@@ -115,7 +98,7 @@ mod tests {
     use crate::manifest::PackageId;
 
     fn id(source_id: SourceId) -> String {
-        PackageId { name: "a".to_owned(), version: semver::Version::new(1, 2, 3), source_id }
+        PackageId { name: "a".to_owned(), version: blaze_semver::Version::new(1, 2, 3), source_id }
             .to_string()
     }
 
@@ -152,30 +135,19 @@ mod tests {
         assert_eq!(id(SourceId::for_path(Path::new("/w/a")).unwrap()), "a v1.2.3 (/w/a)");
     }
 
-    /// A spec's kind converts to blaze-source's and back, and matches only its own kind.
+    /// A spec's git kind names the source of that kind and URL.
     #[test]
-    fn a_spec_kind_round_trips_and_matches_itself() {
-        let kinds = [
-            SourceKind::Git(GitReference::Tag("t".to_owned())),
-            SourceKind::Git(GitReference::Branch("b".to_owned())),
-            SourceKind::Git(GitReference::Rev("r".to_owned())),
-            SourceKind::Git(GitReference::DefaultBranch),
-            SourceKind::Path,
-            SourceKind::Registry,
-            SourceKind::SparseRegistry,
-            SourceKind::LocalRegistry,
-            SourceKind::Directory,
-        ];
-        for (i, kind) in kinds.iter().enumerate() {
-            let converted = spec_kind(kind);
-            for (j, other) in kinds.iter().enumerate() {
-                assert_eq!(spec_kind_is(&converted, other), i == j, "{kind:?} against {other:?}");
-            }
-        }
+    fn a_spec_kind_names_its_source() {
         let git = url("https://g.example/a");
-        let branch = spec::SourceKind::Git(spec::GitReference::Branch("dev".to_owned()));
+        let branch = SourceKind::Git(GitReference::Branch("dev".to_owned()));
         let id = from_spec(&branch, &git).unwrap();
-        assert!(spec_kind_is(&branch, id.kind()));
+        assert_eq!(id.kind(), &branch);
         assert_eq!(id.url(), &git);
+    }
+
+    #[test]
+    fn an_scp_like_address_is_refused_with_the_ssh_form() {
+        let error = into_url("git@g.example:a/b").unwrap_err().to_string();
+        assert!(error.ends_with("; try using `ssh://git@g.example/a/b` instead"), "{error}");
     }
 }
