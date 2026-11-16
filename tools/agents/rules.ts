@@ -142,7 +142,7 @@ Fast incremental compiles of real Rust in a million-line workspace. When two tra
 
 ## The design ([in full](docs/v2/plan/design/bottom.md))
 
-- Everything kept is a record: keyed from text before the work, written once, read in place.
+- Everything kept is a record: keyed from text, written once, read in place, in columns.
 - A command is a process that answers and exits; no daemon holds state between builds.
 - A record is valid by its key, or else by its read list checked against today's facts.
 - No dependency graph in memory: candidates are found forward from what changed.
@@ -151,7 +151,7 @@ Fast incremental compiles of real Rust in a million-line workspace. When two tra
 - A dependency is only its records and an item only its key; text for the crate compiled alone.
 - A check happens once and leaves a proof later code takes; a coarse proof covers all under it.
 - Records are shared by content: CI fills a cache anyone can read, so std arrives precompiled.
-- Remote execution is the same driver with another executor.
+- Decide at run time: a hook, check or optimization is a version swapped into a slot.
 - A lint finding is a record too: errors before the answer, advice after, analyses in the background.
 
 ## Scope
@@ -165,7 +165,7 @@ In scope:
 - The shared cache is read without a login. Only CI, and later the remote workers, write to it.
 - Private builds can always stay local: nothing leaves the machine unless an organisation opts in.
 - An old home after an upgrade is detected, reported and rebuilt; nothing is migrated.
-- Code that stays for the long term is sans-IO. New crates move to bstd once blaze builds blaze.
+- blaze's own code is on bstd and our collections: no \`std\`, \`alloc\` or third-party crate.
 - A plain Rust project adopts blaze's checks by steps: \`rust\`, \`suggest\`, \`edition\`, \`strict\`.
 
 Not now:
@@ -174,7 +174,7 @@ Not now:
 
 ## How work is done
 
-- Lanes write; the main agent compiles each piece within minutes and admits it alone (35, 36, 48).
+- Lanes write in one directory, one pull request; the main agent compiles and merges (35, 36).
 - Until \`blaze run\` exists again, a merge's proof is the whole build and its tests, quoted (68).
 - Every command has a timeout; a hang is a bug to report, never one to wait out (69, 18).
 - Facts come from tool output in this session (61); verdicts from real projects, run first (7, 82).
@@ -225,7 +225,7 @@ export const rules = [
 	{
 		id: "blaze-uses-its-extensions",
 		skill: "compiler-correctness",
-		line: "blaze's crates use them, enforced; while cargo also builds blaze, only in forms rustc ignores.",
+		line: "Use them in blaze's crates: while rustc builds too, in forms it reads or under `cfg(blaze)`.",
 		info: "blaze's own source uses blaze's extensions (`#[blaze::pure]`, `nopanic`/`noalloc`/`nonblocking`, `#[blaze::linear]`, contracts, comptime, sealed traits) wherever they make blaze more correct or more incremental, and relies on them being checked when blaze builds blaze. While cargo also builds blaze (`blaze-builds-blaze`), an extension is used only in a form rustc ignores (an attribute, a tool attribute), and code only blaze accepts waits until blaze builds blaze again. No `cfg_attr` guard, no rustc-compatible copy, no inert-under-rustc fallback: an extension blaze can't check yet is an error to fix in blaze. The one limit is stage 0: an extension blaze's source uses must be one the stage-0 blaze (`.github/blaze-version`) already reads, so a new extension lands in a release before blaze's source depends on it.",
 		reason: "\"now that we are only blaze can we do proper blaze pure invalidation ... with our custom language features? mention in AGENTS.md we can use custom language features in blaze with no fallback cause building with blaze\" (Andrew, 2026-11-03). Until then `#[blaze::pure]` was written to stay inert under rustc, so it promised nothing the build relied on.",
 		link: "docs/future/bootstrap.md",
