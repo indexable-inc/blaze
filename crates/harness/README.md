@@ -14,6 +14,16 @@ Only blaze can: harness-native-render takes Kip's shaders from blaze's device bu
 harness-native-shaders (`artifact = "gpu"`, docs/future/gpu/shaders.md), a dependency cargo
 refuses to read.
 
+Install the existing release build as a regular macOS app (Finder, Spotlight and Dock):
+
+    uv run --frozen crates/harness/scripts/cef.py '{"op": "install"}'
+
+This installs `/Applications/blaze.app` with the blaze icon, GUI, daemon, Bun, kernel dependencies and
+the already-bundled `Harness Browser.app`. It preserves running sessions. Build the binaries and
+bundle the browser first; `target_dir`, `profile` and `destination` can select another build or
+`~/Applications/blaze.app`. The installer verifies the app's ad-hoc signature before replacing
+an existing harness installation. Agent CLIs use the tool PATH captured at installation.
+
 ## Map
 
 | Path | What |

@@ -64,7 +64,7 @@ hn {
   prefab SideClip : ui.Row {
     Clip
     Fill: $tone_sidebar
-    Size: {w: {kind: Fixed, value: 248, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    Size: {w: {kind: Fixed, value: 220, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
     Flex: {axis: Row, gap: 0, align: Stretch, justify: Start, wrap: false}
     Padding: {l: 0, r: 0, t: 0, b: 0}
   }
@@ -73,7 +73,7 @@ hn {
   // title-bar strip; SafeAreaPadding adds the strip (the window's SafeAreaInset, set by the host in lay_chrome).
   // Its left margin is its children's (side_inset): the tree's clip runs to the sidebar's edge so a chevron can hang there.
   prefab Sidebar : ui.Column {
-    Size: {w: {kind: Fixed, value: 248, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
+    Size: {w: {kind: Fixed, value: 220, min: 0, max: 0}, h: {kind: Grow, value: 1, min: 0, max: 0}}
     Flex: {axis: Column, gap: 2, align: Stretch, justify: Start, wrap: false}
     Padding: {l: 0, r: $side_inset, t: 4, b: 10}
     SafeAreaPadding: {l: false, r: false, t: true, b: false}
