@@ -31,7 +31,7 @@ memchr.workspace = true
 postcard.workspace = true
 serde = { workspace = true, features = ["derive", "rc"] }
 serde_json.workspace = true
-tracing.workspace = true
+blaze-trace.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

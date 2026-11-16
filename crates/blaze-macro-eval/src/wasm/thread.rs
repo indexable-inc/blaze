@@ -124,12 +124,12 @@ pub(crate) fn run<T: Send + 'static>(
     let nested = answering() > 0;
     // The expansion's span (`proc macro expansion`, naming the macro and its input) holds the
     // thread's time too, so a profile says which macro ran on it.
-    let parent = tracing::Span::current();
+    let parent = blaze_trace::Span::current();
     submit(
         nested,
         Box::new(move || {
             let _running =
-                tracing::info_span!(target: "blaze", parent: &parent, "wasm expansion run")
+                blaze_trace::info_span!(target: "blaze", parent: &parent, "wasm expansion run")
                     .entered();
             let done =
                 panic::catch_unwind(AssertUnwindSafe(|| expansion(&theirs))).map_err(|payload| {

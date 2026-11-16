@@ -822,7 +822,7 @@ impl Signal {
         mut condition: impl FnMut(&mut T) -> bool,
     ) {
         self.span(None, || {
-            while condition(&mut guard.inner) {
+            while condition(&mut *guard.inner) {
                 self.raw.wait(&mut guard.inner, None);
             }
         });
@@ -847,8 +847,9 @@ impl Signal {
         condition: impl FnMut(&mut T) -> bool,
         deadline: Instant,
     ) -> bool {
-        let left = deadline.saturating_duration_since(Instant::now());
-        self.span(Some(left), || Self::wait_while_within(&self.raw, guard, condition, deadline))
+        let now = Instant::now();
+        let left = deadline.saturating_duration_since(now);
+        self.span(Some(left), || Self::wait_while_within(&self.raw, guard, condition, now, left))
     }
 
     /// Waits while `condition` holds, for at most `most`: whether it passed first (with
@@ -859,19 +860,21 @@ impl Signal {
         condition: impl FnMut(&mut T) -> bool,
         most: Duration,
     ) -> bool {
-        let deadline = Instant::now() + most;
-        self.span(Some(most), || Self::wait_while_within(&self.raw, guard, condition, deadline))
+        let now = Instant::now();
+        self.span(Some(most), || Self::wait_while_within(&self.raw, guard, condition, now, most))
     }
 
-    /// The loop of the two waits above: each wait is given what is left of `deadline` now.
+    /// The loop of the two waits above: each wait is given what is left now of `most` from
+    /// `start`.
     fn wait_while_within<T: ?Sized>(
         raw: &raw::Cond,
         guard: &mut LockGuard<'_, T>,
         mut condition: impl FnMut(&mut T) -> bool,
-        deadline: Instant,
+        start: Instant,
+        most: Duration,
     ) -> bool {
-        while condition(&mut guard.inner) {
-            let left = deadline.saturating_duration_since(Instant::now());
+        while condition(&mut *guard.inner) {
+            let left = most.saturating_sub(start.elapsed());
             if left.is_zero() {
                 return true;
             }

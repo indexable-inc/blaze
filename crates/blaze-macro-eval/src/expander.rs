@@ -803,7 +803,7 @@ fn load_on(
     });
     // Said once a load: what the crate's macros run and what the store says of their state,
     // so two loads of one crate that give other expanders say what moved between them.
-    tracing::info!(
+    blaze_trace::info!(
         target: "blaze",
         krate = %library.name,
         code = %format_args!("{:x}", library.loaded),
@@ -978,7 +978,7 @@ impl Evaluated {
                     std::panic::resume_unwind(panic);
                 }
             };
-            tracing::Span::current().record("ahead", true);
+            blaze_trace::Span::current().record("ahead", true);
             if ran.asked.is_some() {
                 // What it asked the database of a span was read outside this query, which so
                 // depends on nothing it read: run again in the next revision.
@@ -1027,7 +1027,7 @@ impl Evaluated {
                     )
                 })
                 .collect();
-            tracing::info!(
+            blaze_trace::info!(
                 target: "blaze",
                 krate = %library.name,
                 r#macro = %self.name,
@@ -1170,7 +1170,7 @@ impl Evaluated {
         // clone: the statics a run ahead starts from, once per call run ahead
         let preset = session.lock().statics.clone();
         let this = self.kept(db, calling, call);
-        let _span = tracing::info_span!(
+        let _span = blaze_trace::info_span!(
             target: "blaze",
             "proc macro run ahead",
             r#macro = %MacroPath(self),
@@ -1327,7 +1327,7 @@ impl Evaluated {
         let this = self.kept(db, calling, call);
         let again = {
             // Its own span, beside the run's `macro expand`: the extra run this check costs.
-            let _span = tracing::info_span!(
+            let _span = blaze_trace::info_span!(
                 target: "blaze",
                 "proc macro expansion again from the other state",
                 r#macro = %MacroPath(self),
@@ -1399,7 +1399,7 @@ impl Evaluated {
         let this = self.kept(db, calling, call);
         let again = {
             // Its own span, beside the run's `macro expand`: the extra run this check costs.
-            let _span = tracing::info_span!(
+            let _span = blaze_trace::info_span!(
                 target: "blaze",
                 "proc macro expansion again from the fresh state",
                 r#macro = %MacroPath(self),
@@ -1424,7 +1424,7 @@ impl Evaluated {
         let library = &*self.library;
         // One span per expansion, kept or run: which macro, on what, by which engine. The
         // fields format only when a subscriber records them.
-        let _span = tracing::info_span!(
+        let _span = blaze_trace::info_span!(
             target: "blaze",
             "proc macro expansion",
             r#macro = %MacroPath(self),
@@ -1433,7 +1433,7 @@ impl Evaluated {
                 Engine::Evaluator(_) => "evaluator",
                 Engine::Wasm(_) => "wasm",
             },
-            ahead = tracing::field::Empty,
+            ahead = blaze_trace::field::Empty,
         )
         .entered();
         let verdict = library.seen.verdict();
@@ -1918,7 +1918,7 @@ impl ProcMacroExpander for Evaluated {
                 if !Arc::ptr_eq(&self.library, &other.library)
                     && let Some(what) = self.library.differs(&other.library)
                 {
-                    tracing::info!(
+                    blaze_trace::info!(
                         target: "blaze",
                         krate = %self.library.name,
                         r#macro = %self.name,

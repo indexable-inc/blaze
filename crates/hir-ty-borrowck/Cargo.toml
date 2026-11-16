@@ -16,7 +16,7 @@ doctest = false
 blaze-hash.workspace = true
 la-arena.workspace = true
 smallvec.workspace = true
-tracing.workspace = true
+blaze-trace.workspace = true
 blaze-mem.workspace = true
 blaze-memo.workspace = true
 

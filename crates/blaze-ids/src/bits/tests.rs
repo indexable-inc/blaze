@@ -440,7 +440,7 @@ fn reads_and_writes_allocate_nothing() {
 /// The shared set against the reference copy, op by op.
 #[test]
 fn the_set_is_the_reference() {
-    blaze_sim::check(Config::DEFAULT, |tape| {
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
         let len: usize = tape.int_in(1..=399, "len");
         let ops: Vec<(u8, usize)> = tape.vec(0..=199, "ops", |tape| {
             (tape.int_in(0..=3, "op"), tape.int_in(0..=len - 1, "at"))
@@ -474,7 +474,7 @@ fn the_set_is_the_reference() {
 /// the changed flag a dataflow iterates on.
 #[test]
 fn set_operations_are_the_references() {
-    blaze_sim::check(Config::DEFAULT, |tape| {
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
         let len: usize = tape.int_in(1..=299, "len");
         let a: Vec<usize> = tape.vec(0..=99, "a", |tape| tape.int_in(0..=len - 1, "member"));
         let b: Vec<usize> = tape.vec(0..=99, "b", |tape| tape.int_in(0..=len - 1, "member"));
@@ -522,7 +522,7 @@ fn set_operations_are_the_references() {
 /// Iteration from both ends at once meets in the middle with every member once.
 #[test]
 fn both_ends_meet() {
-    blaze_sim::check(Config::DEFAULT, |tape| {
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
         let words: Vec<u64> = tape.vec(0..=5, "words", |tape| tape.int("word"));
         let backs: Vec<bool> = tape.vec(0..=399, "backs", |tape| tape.bool("from the back"));
         let set = BitSlice::<usize>::from_words(&words[..]);
@@ -546,7 +546,7 @@ fn both_ends_meet() {
 /// A splice of a range of one set into another at an offset, against a bit at a time.
 #[test]
 fn a_range_ors_in_at_an_offset() {
-    blaze_sim::check(Config::DEFAULT, |tape| {
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
         let words: Vec<u64> = tape.vec(1..=4, "words", |tape| tape.int("word"));
         let into: Vec<u64> = tape.vec(1..=4, "into", |tape| tape.int("word"));
         let x: usize = tape.int_in(0..=words.len() * 64, "x");
@@ -571,7 +571,7 @@ fn a_range_ors_in_at_an_offset() {
 /// A rank against a count of the reference's members below it.
 #[test]
 fn a_rank_counts_the_members_below() {
-    blaze_sim::check(Config::DEFAULT, |tape| {
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
         let bools: Vec<bool> = tape.vec(1..=499, "bools", |tape| tape.bool("member"));
         let ranked = Ranked::from_bools(bools.iter().copied());
         let mut below = 0;

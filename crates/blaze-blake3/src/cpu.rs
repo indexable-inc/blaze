@@ -70,7 +70,7 @@ const fn enabled(feature: Feature) -> bool {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(miri)))]
 #[allow(
     unsafe_code,
     reason = "CPUID and XGETBV: `xgetbv` is called only once CPUID says the OS enabled it"
@@ -114,7 +114,7 @@ fn find() -> u8 {
 /// # Safety
 ///
 /// The CPU's OSXSAVE bit is set.
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(miri)))]
 #[allow(unsafe_code, reason = "calls `xgetbv` under the caller's OSXSAVE check")]
 #[target_feature(enable = "xsave")]
 unsafe fn xcr0() -> u64 {
@@ -122,7 +122,7 @@ unsafe fn xcr0() -> u64 {
     unsafe { core::arch::x86_64::_xgetbv(0) }
 }
 
-#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
+#[cfg(all(target_arch = "aarch64", target_os = "linux", not(miri)))]
 #[allow(unsafe_code, reason = "libc's `getauxval`, which reads the process's auxiliary vector")]
 fn find() -> u8 {
     /// `AT_HWCAP` (linux/auxvec.h) and its `HWCAP_CRC32` bit (asm/hwcap.h, arm64).

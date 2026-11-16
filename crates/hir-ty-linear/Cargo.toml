@@ -19,7 +19,7 @@ blaze-memo.workspace = true
 
 either.workspace = true
 rustc_type_ir.workspace = true
-tracing.workspace = true
+blaze-trace.workspace = true
 
 # local deps
 base-db.workspace = true

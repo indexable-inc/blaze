@@ -520,18 +520,6 @@ serde_json = "1.0.154"
 sonic-rs = { version = "0.5", default-features = false }
 rustc-literal-escaper = "0.0.8"
 toml = "1.1.8"
-# Debug and trace callsites compile out of release builds: blaze's one subscriber there, the trace
-# recorder (crates/blaze-cargo/src/trace.rs), takes INFO and above.
-tracing = { version = "0.1.44", default-features = false, features = ["std", "release_max_level_debug"] }
-tracing-tree = "0.4.1"
-tracing-subscriber = { version = "0.3.23", default-features = false, features = [
-    "registry",
-    "fmt",
-    "local-time",
-    "std",
-    "time",
-    "tracing-log",
-] }
 unicode-width = "0.2.3"
 url = "2.5.8"
 windows-sys = { version = "0.61.2", features = [

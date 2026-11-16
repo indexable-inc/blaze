@@ -131,7 +131,7 @@ fn agrees(tape: &Tape) -> Result<(), String> {
 /// under the same operations holds, in its order, and finds each key at its index.
 #[test]
 fn an_ordered_map_is_a_vec_of_pairs_under_any_operations() {
-    blaze_sim::check(Config::cases(300), agrees);
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 300 }), agrees);
 }
 
 /// The two removals are two orders, so the model above tells them apart: `swap_remove` moves

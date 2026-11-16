@@ -751,10 +751,10 @@ impl<A: Allocator + Clone> Request<A> {
         match self.jobs.get(&want.name).map(|job| (job.class, job.state)) {
             None => self.add_job(want.name, want.home, None, false, Class::Foreground),
             Some((class, state)) if class > Class::Foreground => {
-                let home = self.jobs.get(&want.name).map_or(want.name, |job| job.home);
-                self.jobs.get_mut(&want.name).expect("a job").class = Class::Foreground;
-                if state == State::Queued && self.ready.remove(&(class, want.name.kind, home, want.name)) {
-                    self.queue(Class::Foreground, want.name);
+                match state {
+                    // Out of its ring (O(1): the entry goes stale), into the person's.
+                    State::Queued => self.queue(Class::Foreground, want.name),
+                    _ => self.jobs.get_mut(&want.name).expect("a job").class = Class::Foreground,
                 }
                 Ok(())
             }
@@ -804,8 +804,10 @@ impl<A: Allocator + Clone> Request<A> {
 
     /// The table's writes of this step, after its `Put`s.
     fn flush_publish<B: Allocator>(&mut self, out: &mut Vec<Effect<A>, B>) {
-        let pending = core::mem::replace(&mut self.publish, SortedMap::new_in(self.alloc.clone()));
-        for (name, input) in pending.into_iter() {
+        if self.publish.is_empty() {
+            return;
+        }
+        for (name, input) in self.publish.take_all() {
             out.push(match input {
                 Some(input) => Effect::Publish(input),
                 None => Effect::Unpublish(name),
@@ -1085,11 +1087,12 @@ impl<A: Allocator + Clone> Request<A> {
                         tasks.push(self.emit(want.name));
                         self.send(tasks, out);
                     }
-                    let job = self.jobs.get_mut(&name).expect("a running job's ticket names it");
-                    if let Err(at) = job.needs.binary_search(&want.name) {
-                        job.needs.insert(at, want.name);
-                    }
+                    self.jobs.get_mut(&name).expect("a running job's ticket names it").needs.push(want.name);
                 }
+                // Sorted once per answer, not per want: O(d log d) for d needs.
+                let job = self.jobs.get_mut(&name).expect("a running job's ticket names it");
+                job.needs.sort_unstable();
+                job.needs.dedup();
                 self.set_state(name, State::Gather);
                 self.wake.push_back(name);
                 Ok(())
@@ -1290,6 +1293,7 @@ impl<A: Allocator + Clone> Request<A> {
     fn pump<B: Allocator>(&mut self, out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
         loop {
             while let Some(name) = self.wake.pop_front() {
+                self.ready_ops += 1;
                 self.advance(name, out)?;
             }
             self.emit_ready(out);
@@ -1656,11 +1660,9 @@ impl<A: Allocator + Clone> Request<A> {
         let hints = self.current(name).map(|row| row.reads.iter().map(|(n, _)| *n).collect_in(self.alloc.clone()));
         if let Some(hints) = hints {
             let job = self.jobs.get_mut(&name).expect("a job");
-            for hint in hints.iter() {
-                if let Err(at) = job.needs.binary_search(hint) {
-                    job.needs.insert(at, *hint);
-                }
-            }
+            job.needs.extend_from_slice(&hints);
+            job.needs.sort_unstable();
+            job.needs.dedup();
         }
         self.set_state(name, State::Gather);
         self.gather(name, out)
@@ -1787,7 +1789,7 @@ impl<A: Allocator + Clone> Request<A> {
                 }
                 for (read, _) in reads.iter() {
                     match self.posted.get_mut(read) {
-                        Some(list) if list.contains(&name) => {}
+                        // No `contains`: a name settled twice posts twice, `dirty_readers` dedups.
                         Some(list) => list.push(name),
                         None => {
                             let mut list = Vec::new_in(a.clone());

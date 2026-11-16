@@ -45,6 +45,7 @@ fn hashes<T: Hash>(keys: impl Iterator<Item = T>) -> Vec<u64> {
 // 1.1 on average. FxHash puts the high-bits keys 110 groups deep on average.
 
 #[test]
+#[cfg_attr(miri, ignore = "a statistic of the safe hash over 57,000 keys: no unsafe code")]
 fn sequential_ids_spread_over_the_table() {
     let (longest, mean) = probes(&hashes(0..57_000u32));
     assert!(
@@ -54,12 +55,14 @@ fn sequential_ids_spread_over_the_table() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "a statistic of the safe hash over 57,000 keys: no unsafe code")]
 fn aligned_pointers_spread_over_the_table() {
     let (longest, mean) = probes(&hashes((0..57_000usize).map(|it| 0x7f12_3456_0000 + 64 * it)));
     assert!(longest <= 16 && mean < 1.2, "pointers: longest probe {longest} groups, mean {mean}");
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "a statistic of the safe hash over 3,500 keys: no unsafe code")]
 fn keys_that_differ_in_their_high_bits_spread_over_the_table() {
     let (longest, mean) = probes(&hashes((0..3_500u64).map(|it| it << 52)));
     assert!(longest <= 16 && mean < 1.2, "high bits: longest probe {longest} groups, mean {mean}");
@@ -163,7 +166,7 @@ fn a_lookup_on_a_hash_allocates_nothing() {
 /// fold its sponge at every offset.
 #[test]
 fn fold_is_foldhash() {
-    blaze_sim::check(Config::DEFAULT, |tape| {
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
         let seed: u64 = if tape.coin("default seed") { 0 } else { tape.int("seed") };
         let mut ours = FixedHasher::with_seed(seed);
         let mut theirs = foldhash::fast::FixedState::with_seed(seed).build_hasher();
@@ -224,7 +227,7 @@ fn fold_is_foldhash() {
 
 #[test]
 fn hashes_as_the_copies_did() {
-    blaze_sim::check(Config::DEFAULT, |tape| {
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
         let bytes: [u8; 32] = tape.array("bytes", |tape| tape.int::<u8>("byte"));
         let word: u64 = tape.int("word");
         assert_eq!(key_hash_of(&Id(bytes)), reference_of(&Id(bytes)));
@@ -294,7 +297,7 @@ fn the_streaming_hasher_is_siphash_of_the_bytes_written() {
         state ^= state << 17;
         state
     };
-    for round in 0..2000 {
+    for round in 0..if cfg!(miri) { 40 } else { 2000 } {
         let key = SipKey::new(next(), next());
         let mut ours = key.hasher();
         let [k0, k1] = key.words();
@@ -427,6 +430,7 @@ fn hash_cost() {
 /// never below the longest walk of honest keys: sequential integers placed by the fixed hash in
 /// linear-probing tables filled to half, the most an adaptive index holds before it grows.
 #[test]
+#[cfg_attr(miri, ignore = "a statistic of the safe hash in tables of up to 2^16 slots: no unsafe code")]
 fn honest_keys_never_walk_the_refused_run() {
     use crate::adaptive::refused_run;
     assert_eq!([refused_run(4), refused_run(9), refused_run(27)], [169, 187, 252]);

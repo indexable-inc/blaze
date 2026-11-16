@@ -13,7 +13,7 @@ pub enum Error<S: std::error::Error + 'static> {
 
     TooDeep { line: usize, max: usize },
 
-    Regex { line: usize, name: String, pattern: String, source: regex::Error },
+    Regex { line: usize, name: String, pattern: String, source: blaze_script::regex::Error },
 
     UnboundHeadVar { line: usize, var: String },
 

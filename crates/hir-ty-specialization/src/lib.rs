@@ -181,7 +181,7 @@ pub fn rules_of(db: &Db, impl_id: ImplId) -> Option<Rules> {
 /// The specialization errors of `impl_id`, a trait impl; none for an inherent impl.
 pub fn check_impl(db: &Db, impl_id: ImplId) -> Vec<SpecializationError> {
     let _span =
-        tracing::info_span!(target: "blaze", "specialization_check", impl_ = ?impl_id).entered();
+        blaze_trace::info_span!(target: "blaze", "specialization_check", impl_ = ?impl_id).entered();
     blaze_mem::frame::task(blaze_mem::Tag::Infer, |frame| {
         let mut found = Vec::new_in(frame);
         Check { db, frame, impl_id, found: &mut found }.run();

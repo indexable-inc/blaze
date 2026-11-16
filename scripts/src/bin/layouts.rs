@@ -47,7 +47,7 @@ use blaze_script::{
     input::{self, Fields, Input, InputError},
     read_text,
 };
-use regex::Regex;
+use blaze_script::regex::Regex;
 
 const SCRIPT: &str = "layouts";
 /// The list, from the root.

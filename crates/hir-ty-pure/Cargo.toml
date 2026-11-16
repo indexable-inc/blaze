@@ -14,7 +14,7 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
-tracing.workspace = true
+blaze-trace.workspace = true
 blaze-core.workspace = true
 blaze-hash.workspace = true
 blaze-ids.workspace = true

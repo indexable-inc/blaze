@@ -463,7 +463,7 @@ fn run(
         return Err(first(wasmtime::Error::msg("a run of no calls")));
     }
     store.set_fuel(FUEL).map_err(first)?;
-    let instantiating = tracing::info_span!(target: "blaze", "macro instantiate").entered();
+    let instantiating = blaze_trace::info_span!(target: "blaze", "macro instantiate").entered();
     let instance = pre.instantiate(&mut *store).map_err(first)?;
     let Some(memory) = instance.get_memory(&mut *store, abi::MEMORY) else {
         return Err(first(wasmtime::Error::msg("the module has no memory export")));
@@ -506,7 +506,7 @@ fn run(
         memory.write(&mut *store, input as usize, &call.input).map_err(|e| failed(e.into()))?;
         // What the macro spent in its module, and how often it asked the server: fuel over the
         // requests is the module's own work, the rest the bridge's.
-        let running = tracing::info_span!(target: "blaze", "macro wasm run", fuel = tracing::field::Empty, requests = tracing::field::Empty).entered();
+        let running = blaze_trace::info_span!(target: "blaze", "macro wasm run", fuel = blaze_trace::field::Empty, requests = blaze_trace::field::Empty).entered();
         let called = expand.call(&mut *store, (index, input, len));
         // The engine counts fuel (`engine.rs`), so the store always says what is left.
         let left = store.get_fuel().map_err(|e| {

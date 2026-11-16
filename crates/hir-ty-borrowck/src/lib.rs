@@ -393,7 +393,7 @@ pub(crate) fn kept(def: DefWithBodyId, result: &BorrowckResult) -> bool {
         return true;
     }
     if !result.diagnostics.is_empty() || result.not_checked.is_some() {
-        tracing::debug!(
+        blaze_trace::debug!(
             target: "blaze",
             ?def,
             lints = result.diagnostics.len(),
@@ -645,7 +645,7 @@ fn check_owner<'db>(
         _ => "",
     };
     let _span =
-        tracing::info_span!(target: "blaze", "borrowck.flow", name, owner = ?owner).entered();
+        blaze_trace::info_span!(target: "blaze", "borrowck.flow", name, owner = ?owner).entered();
     check_owner_once(db, owner, def, Mode::PoloniusFlow, root, frame)
 }
 

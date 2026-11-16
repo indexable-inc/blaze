@@ -224,7 +224,7 @@ pub fn check<'db>(
 ) -> Result<BorrowckResult, MirLowerError<'db>> {
     let drops =
         [EarlyDrop { block: point.block, statement: point.statement, binding: point.binding }];
-    let _span = tracing::info_span!(target: "blaze", "borrowck.drop_early", def = ?def, binding = ?point.binding).entered();
+    let _span = blaze_trace::info_span!(target: "blaze", "borrowck.drop_early", def = ?def, binding = ?point.binding).entered();
     let body = hir_ty_mir::mir::lower_with_early_drops(db, def, &drops)?;
     Ok(crate::borrowck_rewritten(db, def, &body, mode))
 }
@@ -256,7 +256,7 @@ pub(crate) fn add_notes(db: &Db, def: DefWithBodyId, mode: Mode, result: &mut Bo
         let point = match drop_point(db, def, mir, binding) {
             Ok(it) => it,
             Err(refused) => {
-                tracing::debug!(target: "blaze", ?def, ?binding, why = refused.why(), "no early drop");
+                blaze_trace::debug!(target: "blaze", ?def, ?binding, why = refused.why(), "no early drop");
                 continue;
             }
         };
@@ -266,7 +266,7 @@ pub(crate) fn add_notes(db: &Db, def: DefWithBodyId, mode: Mode, result: &mut Bo
             Err(error) => {
                 // Rendered with `db` attached: the error's types name themselves only through it.
                 blaze_memo::attach(db, || {
-                    tracing::debug!(target: "blaze", ?def, ?binding, ?error, "early drop not lowered");
+                    blaze_trace::debug!(target: "blaze", ?def, ?binding, ?error, "early drop not lowered");
                 });
                 continue;
             }

@@ -45,7 +45,7 @@ proc-macro-api.workspace = true
 blaze-memo.workspace = true
 span.workspace = true
 stdx.workspace = true
-tracing.workspace = true
+blaze-trace.workspace = true
 tt.workspace = true
 wasmtime.workspace = true
 

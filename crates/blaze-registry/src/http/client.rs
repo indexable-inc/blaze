@@ -72,7 +72,7 @@ impl HyperHttp {
     /// and is every request's error, naming what could not be made.
     fn made(&self) -> anyhow::Result<&Requests> {
         let made = self.made.get_or_init(|| {
-            let _span = tracing::info_span!(
+            let _span = blaze_trace::info_span!(
                 target: "blaze",
                 "http client: start the driver and load the system's root certificates"
             )

@@ -18,8 +18,6 @@ blaze-toml.workspace = true
 blaze-script.workspace = true
 # The workspace's one SHA-256, with no dependencies: `smoke` names the binary it ran by its hash.
 blaze-sha256.workspace = true
-# `unicode-case` for `(?i)` as Python's `re.IGNORECASE` folds (crates/blaze-script/Cargo.toml).
-regex = { workspace = true, features = ["unicode-case"] }
 serde_json = { workspace = true, features = ["preserve_order"] }
 toml = { workspace = true, features = ["preserve_order"] }
 

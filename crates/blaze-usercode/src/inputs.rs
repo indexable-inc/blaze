@@ -96,7 +96,7 @@ impl Began {
     pub fn moved(&self, traced: &blaze_core::Traced) -> Option<Moved> {
         // A `stat` of each name the watches can't vouch for, and of every directory above it:
         // a row naming how many paths were asked, so its time is never unnamed.
-        let _span = tracing::info_span!(
+        let _span = blaze_trace::info_span!(
             target: "blaze",
             "ask whether what a run read changed since it began",
             files = traced.files.len() as u64,
@@ -110,7 +110,7 @@ impl Began {
 
     fn path_moved(&self, path: &Path, answer: Option<[u8; 32]>) -> Option<Moved> {
         let Some(names) = names(path, answer) else {
-            tracing::info!(
+            blaze_trace::info!(
                 target: "blaze",
                 read = %path.display(),
                 "a run's read is taken as changed since the run began: the names its answer rests on can't be told"
@@ -122,7 +122,7 @@ impl Began {
         names.iter().enumerate().find_map(|(n, name)| {
             let at = stamped_since(name, self.wall_ns)?;
             let why = MovedWhy::of(path, name, n == last, at);
-            tracing::info!(
+            blaze_trace::info!(
                 target: "blaze",
                 read = %path.display(),
                 at = %at.display(),

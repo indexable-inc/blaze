@@ -182,6 +182,9 @@ pub enum TypeErrorKind<'s> {
     NullableNotAllowed { what: What<'s>, place: Place },
     /// `cast(x as boolean)` of an `x` that is neither a Boolean nor a parameter.
     CastToBoolean { what: What<'s>, found: Storage },
+    /// A construct only the query grammar has ([`crate::query`]: a subquery, `exists`, a
+    /// window, `filter`, `::`): the typed subset does not take it.
+    NotInSubset { what: &'static str },
 }
 
 /// Where an expression stands, for a message.
@@ -645,6 +648,10 @@ impl fmt::Display for TypeErrorKind<'_> {
                 "{what} is {}, and `cast(.. as boolean)` takes only a boolean or a parameter (SQLite has no boolean to cast to); write `x <> 0` instead",
                 storage_with_article(*found)
             ),
+            K::NotInSubset { what } => write!(
+                f,
+                "{what} is of the query grammar (blaze_sql::query), not the typed subset: the subset has no subquery, window, `filter` or `::`"
+            ),
         }
     }
 }
@@ -831,7 +838,8 @@ fn is_literal<X: Allocator>(e: &Expr<'_, X>) -> bool {
         | ExprKind::Like { .. }
         | ExprKind::Case { .. }
         | ExprKind::Cast { .. }
-        | ExprKind::Call { .. } => false,
+        | ExprKind::Call { .. }
+        | ExprKind::Analytic(_) => false,
     }
 }
 
@@ -919,6 +927,7 @@ fn what<'s, X: Allocator>(e: &Expr<'s, X>) -> What<'s> {
         ExprKind::Case { .. } => What::Operator(keyword::CASE),
         ExprKind::Cast { .. } => What::Operator("cast"),
         ExprKind::Call { function, .. } => What::Call(function.text),
+        ExprKind::Analytic(analytic) => What::Operator(analytic.what()),
     }
 }
 
@@ -948,7 +957,8 @@ fn no_anchor<'e, 's: 'e, X: Allocator + 'e>(
         | ExprKind::Like { .. }
         | ExprKind::Case { .. }
         | ExprKind::Cast { .. }
-        | ExprKind::Call { .. } => None,
+        | ExprKind::Call { .. }
+        | ExprKind::Analytic(_) => None,
     });
     let kind = match (params.next(), params.next()) {
         (Some(left), Some(right)) => TypeErrorKind::ParamsBothSides { place, left, right },
@@ -1490,6 +1500,9 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
             ExprKind::Call { function, args: args @ (CallArgs::Star | CallArgs::List { .. }) } => {
                 self.call(function, args, e.span)?
             }
+            ExprKind::Analytic(analytic) => {
+                return err(TypeErrorKind::NotInSubset { what: analytic.what() }, e.span);
+            }
         };
         Ok(Shape::Typed(ty))
     }
@@ -2000,7 +2013,8 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
                             | ExprKind::Like { .. }
                             | ExprKind::Case { .. }
                             | ExprKind::Cast { .. }
-                            | ExprKind::Call { .. } => {
+                            | ExprKind::Call { .. }
+                            | ExprKind::Analytic(_) => {
                                 return err(TypeErrorKind::Unnamed { what: what(expr) }, expr.span);
                             }
                         },
@@ -2140,7 +2154,8 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
             | ExprKind::Like { .. }
             | ExprKind::Case { .. }
             | ExprKind::Cast { .. }
-            | ExprKind::Call { .. } => false,
+            | ExprKind::Call { .. }
+            | ExprKind::Analytic(_) => false,
         })
     }
 
@@ -2208,7 +2223,8 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
             | ExprKind::Like { .. }
             | ExprKind::Case { .. }
             | ExprKind::Cast { .. }
-            | ExprKind::Call { .. } => {
+            | ExprKind::Call { .. }
+            | ExprKind::Analytic(_) => {
                 for_each_child(e, &mut |child| self.grouped(child, group_by, depth + 1))
             }
         }
@@ -2240,7 +2256,8 @@ impl<'s, A: Allocator + Copy> Cx<'s, A> {
             | ExprKind::Like { .. }
             | ExprKind::Case { .. }
             | ExprKind::Cast { .. }
-            | ExprKind::Call { .. } => None,
+            | ExprKind::Call { .. }
+            | ExprKind::Analytic(_) => None,
         };
         Ok(columns.iter().any(|column| match column {
             ResultColumn::Expr { expr, .. } => {
@@ -2420,7 +2437,8 @@ fn positional<'s, X: Allocator>(
         | ExprKind::Like { .. }
         | ExprKind::Case { .. }
         | ExprKind::Cast { .. }
-        | ExprKind::Call { .. } => Ok(()),
+        | ExprKind::Call { .. }
+        | ExprKind::Analytic(_) => Ok(()),
     }
 }
 
@@ -2456,7 +2474,9 @@ fn for_each_child<'s, X: Allocator, E>(
         | ExprKind::Text(_)
         | ExprKind::Blob(_)
         | ExprKind::Column { .. }
-        | ExprKind::Param(_) => Ok(()),
+        | ExprKind::Param(_)
+        // The subset's checker refuses it when typing; it has no children of the subset.
+        | ExprKind::Analytic(_) => Ok(()),
         ExprKind::Unary { operand, .. }
         | ExprKind::IsNull { operand, .. }
         | ExprKind::InParam { operand, .. }

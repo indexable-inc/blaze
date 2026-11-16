@@ -439,7 +439,7 @@ mod tests {
 
     #[test]
     fn matches_the_bitwise_definition() {
-        blaze_sim::check(Config::DEFAULT, |tape| {
+        blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
             let bytes: Vec<u8> = tape.bytes(0..=39_999, "bytes");
             let at: usize = tape.int_in(0..=bytes.len(), "at");
             let want = bitwise(&bytes);

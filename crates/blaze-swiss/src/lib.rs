@@ -737,12 +737,14 @@ mod tests {
     const CASES: u32 = if cfg!(miri) { 16 } else { Config::DEFAULT.cases };
 
     /// A bound that is `small` under Miri.
-    const fn sized<T: Copy>(full: T, small: T) -> T {
-        if cfg!(miri) { small } else { full }
+    macro_rules! sized {
+        ($full:expr, $small:expr) => {
+            if cfg!(miri) { $small } else { $full }
+        };
     }
 
     fn probes_agree(tape: &Tape) {
-        let log_groups: u32 = tape.int_in(0..=sized(5u32, 2), "log groups");
+        let log_groups: u32 = tape.int_in(0..=sized!(5u32, 2), "log groups");
         let fill: u64 = tape.int_in(3..=7u64, "fill eighths");
         let hash: u64 = tape.int("hash");
         const SLOTS: usize = 7;
@@ -855,8 +857,8 @@ mod tests {
     #[cfg(not(blaze_check))]
     #[test]
     fn index_agrees_with_a_map() {
-        let (steps, distinct) = sized((40_000, 9_000), (600, 150));
-        for seed in 0..sized(4u64, 1) {
+        let (steps, distinct) = sized!((40_000, 9_000), (600, 150));
+        for seed in 0..sized!(4u64, 1) {
             let mut index = Index::new_in(Global);
             assert_eq!(index.capacity(), 0);
             let mut keys: Vec<u64> = Vec::new();
@@ -897,8 +899,8 @@ mod tests {
     fn readers_race_a_growing_index() {
         use std::sync::{Mutex, atomic::AtomicU64 as Key};
 
-        const KEYS: usize = sized(20_000, 400);
-        const EARLY: u64 = sized(100, 20);
+        const KEYS: usize = sized!(20_000, 400);
+        const EARLY: u64 = sized!(100, 20);
         let index = Index::new_in(Global);
         let column: Box<[Key]> = (0..KEYS).map(|_| Key::new(u64::MAX)).collect();
         let len = Mutex::new(0usize);
@@ -921,7 +923,7 @@ mod tests {
         };
         let early: Vec<u32> = (0..EARLY).map(intern).collect();
         std::thread::scope(|scope| {
-            for worker in 0..sized(8u64, 3) {
+            for worker in 0..sized!(8u64, 3) {
                 let (intern, early, column, index) = (&intern, &early, &column, &index);
                 scope.spawn(move || {
                     for n in 0..KEYS as u64 / 2 {
@@ -946,8 +948,8 @@ mod tests {
     #[test]
     fn index_groups_never_straddle_a_line() {
         let index = Index::new_in(Global);
-        // Under Miri, enough for six levels (the sixth grows past 144 values).
-        let keys: Vec<u64> = (0..sized(5_000, 200)).collect();
+        // Under Miri, enough for six levels: the sixth (32 groups) is made at the 73rd value.
+        let keys: Vec<u64> = (0..sized!(5_000, 200)).collect();
         for (len, &key) in keys.iter().enumerate() {
             index.insert(len, hash_of(key), len as u32, |value| hash_of(keys[value as usize]));
         }
@@ -965,7 +967,7 @@ mod tests {
     #[test]
     fn an_index_allocates_only_to_grow() {
         let index = blaze_alloc_count::assert_at_most(0, "a new index", || Index::new_in(Global));
-        let keys: Vec<u64> = (0..sized(1_000, 100)).collect();
+        let keys: Vec<u64> = (0..sized!(1_000, 100)).collect();
         for (len, &key) in keys.iter().enumerate() {
             index.insert(len, hash_of(key), len as u32, |value| hash_of(keys[value as usize]));
         }

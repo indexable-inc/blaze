@@ -103,7 +103,7 @@ mod tests {
     /// `hir-ty-codegen` and the old query engine each carried, here as the bytes they wrote.
     #[test]
     fn matches_the_reference() {
-        blaze_sim::check(Config::DEFAULT, |tape| {
+        blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
             let a: u8 = tape.int("a");
             let b: i16 = tape.int("b");
             let c: u32 = tape.int("c");

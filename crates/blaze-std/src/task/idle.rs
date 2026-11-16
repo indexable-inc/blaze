@@ -182,6 +182,19 @@ impl Idle {
         None
     }
 
+    /// The second half of a spawn onto one worker's own queue (its pinned queue): the fence,
+    /// then whether to unpark it, its mark moved `Parked -> Searching` and counted a searcher.
+    /// A worker that is busy or searching looks at its pinned queue before anything else.
+    pub(crate) fn wake_this(&self, mark: &Mark) -> bool {
+        fence(Ordering::SeqCst);
+        if mark.state.compare_exchange(PARKED, SEARCHING, Ordering::SeqCst, Ordering::Relaxed).is_err() {
+            return false;
+        }
+        self.parked.0.fetch_sub(1, Ordering::SeqCst);
+        self.searching.0.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
     /// `must_overlap`'s reservation: a worker that is searching or parked, its mark moved to
     /// `Reserved` (after the caller wrote its mailbox, which this compare-and-swap publishes),
     /// or none. A parked one is uncounted here; a searching one leaves the search itself when

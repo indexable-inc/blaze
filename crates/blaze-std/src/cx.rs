@@ -490,7 +490,72 @@ impl Cx {
     /// It is placed on `worker` and stays there (std.md, "Layouts").
     pub(crate) fn task(&self, name: &'static str, frame: Frame, worker: u32) -> Cx {
         self.world.record_trace(name, RecordKind::Opened { parent: self.span });
-        Cx { span: name, frame: shared(frame), placed: Placed::on(worker), ..self.child() }
+        let placed = Placed::on(worker, self.placed.pool.clone(), self.placed.here);
+        Cx { span: name, frame: shared(frame), placed, ..self.child() }
+    }
+
+    /// What of the context of a task of the scope `self` is crosses to the thread that will
+    /// run it (std.md, "A `Seed`"): as [`Cx::task`], with the scope's `class`; `worker` is the
+    /// placement model's, used if the task is grown outside the pool. The task's opening is
+    /// recorded here, on the spawner, so the trace's order of openings is the spawner's.
+    pub(crate) fn seed(&self, name: &'static str, frame: Frame, class: Class, worker: u32) -> Seed {
+        self.world.record_trace(name, RecordKind::Opened { parent: self.span });
+        Seed {
+            deadline: self.deadline,
+            cancel: Arc::clone(&self.cancel),
+            span: name,
+            frame,
+            world: self.world.clone(),
+            plant: self.plant,
+            pool: self.placed.pool.clone(),
+            class,
+            worker,
+        }
+    }
+
+    /// The pool its tasks are spawned on: none under `Inline`.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn pool(&self) -> Option<&Pool> {
+        self.placed.pool.as_ref()
+    }
+
+    /// Where the code holding this context runs, as its pool knows it.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn here(&self) -> Here {
+        self.placed.here
+    }
+
+    /// The class of the scope this context is in.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn class(&self) -> Class {
+        self.class
+    }
+
+    /// The layout a scope of this context runs: `Threads` on a pool, `Inline` without one.
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn layout(&self) -> Layout {
+        match &self.placed.pool {
+            Some(pool) => Layout::Threads { workers: pool.workers() },
+            None => Layout::Inline,
+        }
+    }
+
+    /// This context's cancellation, to be set from another thread (a task's failure).
+    pub(crate) fn canceller(&self) -> Canceller {
+        Canceller(Arc::clone(&self.cancel))
+    }
+
+    /// The context of a scope of `class` inside this task: as [`Cx::scoped`].
+    pub(crate) fn scoped_as(&self, class: Class) -> Cx {
+        Cx { class, ..self.scoped() }
     }
 
     /// Cancels the scope this context's cancellation is: every context sharing it, and every
@@ -509,6 +574,7 @@ impl Cx {
             frame: Arc::clone(&self.frame),
             world: self.world.clone(),
             plant: self.plant,
+            class: self.class,
             placed: Rc::clone(&self.placed),
         }
     }

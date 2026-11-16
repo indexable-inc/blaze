@@ -467,3 +467,112 @@ mod model {
         }
     }
 }
+
+/// The cells' `unsafe` under real threads, sized for Miri (`cargo miri test -p blaze-swiss
+/// sync`): each test reaches the blocks its name says.
+#[cfg(all(test, not(blaze_check)))]
+mod tests {
+    use std::{
+        sync::atomic::{AtomicUsize, Ordering::Relaxed},
+        thread,
+        vec::Vec,
+    };
+
+    use super::*;
+
+    const THREADS: usize = if cfg!(miri) { 3 } else { 8 };
+    const ROUNDS: usize = if cfg!(miri) { 50 } else { 10_000 };
+
+    /// A value that counts its drops.
+    struct Counted<'a>(&'a AtomicUsize);
+
+    impl Drop for Counted<'_> {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Relaxed);
+        }
+    }
+
+    /// `Claim::fill`'s write and `get`'s read across threads, `set` refused after, and the
+    /// cell's `Drop` dropping the one value written.
+    #[test]
+    fn once_is_written_by_one_thread_and_dropped_once() {
+        let (made, dropped) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let cell = Once::new();
+        thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    let value = cell.get_or_init(|| {
+                        made.fetch_add(1, Relaxed);
+                        Counted(&dropped)
+                    });
+                    assert!(core::ptr::eq(value.0, &dropped));
+                });
+            }
+        });
+        assert_eq!(made.load(Relaxed), 1);
+        assert!(cell.set(Counted(&dropped)).is_err());
+        assert_eq!(dropped.load(Relaxed), 1, "the refused value dropped");
+        drop(cell);
+        assert_eq!(dropped.load(Relaxed), 2, "the written value dropped with the cell");
+    }
+
+    /// `Claim`'s `Drop` on a panicking initializer leaves the cell empty, and the next ask
+    /// writes it; an empty cell's `Drop` drops nothing.
+    #[test]
+    fn a_panicking_initializer_leaves_the_cell_empty() {
+        let cell: Once<Vec<u8>> = Once::new();
+        let caught = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| {
+            cell.get_or_init(|| panic!("the initializer fails"));
+        }));
+        assert!(caught.is_err());
+        assert!(cell.get().is_none());
+        assert_eq!(cell.get_or_init(|| std::vec![7]).as_slice(), [7]);
+        drop(Once::<Vec<u8>>::new());
+    }
+
+    /// `Spin`'s guard (`Deref`, `DerefMut`, its release) under contention, through the backoff:
+    /// every increment is counted exactly.
+    #[test]
+    fn a_spin_lock_counts_every_claim() {
+        let lock = Spin::new("swiss.test.count", 0usize);
+        thread::scope(|scope| {
+            for _ in 0..THREADS {
+                scope.spawn(|| {
+                    for _ in 0..ROUNDS {
+                        *lock.lock() += 1;
+                    }
+                });
+            }
+        });
+        assert_eq!(*lock.lock(), THREADS * ROUNDS);
+    }
+
+    /// The backoff past its spin rounds calls the installed hook (the `hook` module's pointer
+    /// read), and a second install is refused; a clock's budget turns a wait into a [`Hang`].
+    #[test]
+    fn the_hook_is_installed_once_and_bounds_a_wait() {
+        static YIELDS: AtomicUsize = AtomicUsize::new(0);
+        static NOW: AtomicUsize = AtomicUsize::new(0);
+        fn yield_now() {
+            YIELDS.fetch_add(1, Relaxed);
+            std::thread::yield_now();
+        }
+        fn now() -> u64 {
+            NOW.fetch_add(1, Relaxed) as u64
+        }
+        static WAITING: Waiting =
+            Waiting { yield_now, clock: Some(Clock { now, budget: 1_000_000, unit: "calls" }) };
+        assert_eq!(install(&WAITING), Ok(()));
+        assert_eq!(install(&WAITING), Err(AlreadyInstalled));
+        let mut backoff = Backoff::new("swiss.test.hook");
+        for _ in 0..SPIN_STEPS + 3 {
+            backoff.snooze();
+        }
+        assert!(YIELDS.load(Relaxed) >= 3, "the yields past the spin rounds");
+        NOW.store(10_000_000, Relaxed);
+        let hang = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| backoff.snooze()));
+        let message = hang.expect_err("past the budget: a hang");
+        let message = message.downcast_ref::<std::string::String>().expect("a message");
+        assert!(message.contains("swiss.test.hook"), "{message}");
+    }
+}

@@ -1,21 +1,31 @@
-//! TOML for the scripts, the one home: blaze-toml's reader, and a document lowered to
-//! blaze-data's [`Value`] (tables in the order the text names their keys, a datetime as its
-//! RFC 3339 text). A script that needs a key's line reads the [`Document`] and its [`Item`]s.
+//! TOML for the scripts, the one home: blaze-toml's reader, a document lowered to blaze-data's
+//! value (tables in the order the text names their keys, a datetime as its RFC 3339 text), and
+//! the document itself for a script whose errors name a key's line ([`read`], [`Node`]). Each
+//! is named here with the allocator, `Global`, so a script names none.
 
 use std::alloc::Global;
 
-pub use blaze_data::{Map, Value};
-pub use blaze_toml::{Document, Error, Item, Limits};
+pub use blaze_toml::{Error, Kind, Limits, What};
 
+/// A TOML value, lowered.
+pub type Value = blaze_data::Value<Global>;
 /// A TOML table, lowered.
-pub type Table = Map<Global>;
+pub type Table = blaze_data::Map<Global>;
+/// A TOML document as read: every key and value with its place in the text.
+pub type Doc<'t> = blaze_toml::Document<'t, Global>;
+/// A table, array or value of a [`Doc`].
+pub type Node<'d, 't> = blaze_toml::Item<'d, 't, Global>;
 
-/// `text` read as TOML, bounded by [`Limits::CARGO`], and lowered to its root table. A refusal
-/// is shown with `error.display(text)`: its line, column and what.
+/// `text` read as TOML, bounded by [`Limits::CARGO`]. A refusal is shown with
+/// `error.display(text)`: its line, column and what.
+pub fn read(text: &str) -> Result<Doc<'_>, Error> {
+    blaze_toml::Document::parse_in(text, Limits::CARGO, Global)
+}
+
+/// `text` read as TOML and lowered to its root table.
 pub fn parse(text: &str) -> Result<Table, Error> {
-    let doc = Document::parse_in(text, Limits::CARGO, Global)?;
-    match doc.to_value_in(Global) {
-        Value::Map(table) => Ok(table),
+    match read(text)?.to_value_in(Global) {
+        blaze_data::Value::Map(table) => Ok(table),
         _ => unreachable!("a TOML document's root is a table"),
     }
 }

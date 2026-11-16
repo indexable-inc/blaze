@@ -17,6 +17,8 @@
 use std::alloc::Global;
 use std::fmt;
 
+use blaze_script::regex;
+
 use blaze_hash::{HashMap, HashSet};
 
 use crate::error::Error;
@@ -140,11 +142,12 @@ pub(crate) const CASES: &[&str] = &["snake", "camel", "pascal", "upper-snake", "
 /// The builtins whose arity is a least: `text-capture` binds one variable per capture group.
 const VARIADIC: &[&str] = &["text-capture"];
 
-/// The most bytes one compiled regex may take, its lazy DFA's cache included. The `regex` crate
-/// matches in time linear in the text; this bounds the memory a rules file's pattern takes.
-pub(crate) const MAX_REGEX_BYTES: usize = 1 << 20;
+/// The most instructions one compiled regex may have. The matcher (`blaze_script::regex`) runs
+/// in time linear in the text and holds a thread per instruction; this bounds the memory a rules
+/// file's pattern takes.
+pub(crate) const MAX_REGEX_INSTRUCTIONS: usize = 1 << 14;
 
-/// `pattern` compiled within [`MAX_REGEX_BYTES`].
+/// `pattern` compiled within [`MAX_REGEX_INSTRUCTIONS`].
 ///
 /// # Errors
 ///
@@ -155,10 +158,7 @@ fn compile_regex<S: std::error::Error + 'static>(
     pattern: &str,
     line: usize,
 ) -> Result<regex::Regex, Error<S>> {
-    regex::RegexBuilder::new(pattern)
-        .size_limit(MAX_REGEX_BYTES)
-        .dfa_size_limit(MAX_REGEX_BYTES)
-        .build()
+    regex::Regex::with_limit(pattern, MAX_REGEX_INSTRUCTIONS)
         .map_err(|source| Error::Regex {
             line,
             name: name.to_owned(),

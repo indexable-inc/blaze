@@ -78,7 +78,9 @@ fn agrees_on<S: BuildHasher + Clone>(tape: &Tape, hasher: S) -> Result<(), Strin
     let mut model: BTreeMap<u16, u32> = BTreeMap::new();
     // Enough keys to fill several groups, few enough that most operations meet a held one.
     let keys = tape.range(8..80, "keys") as u16;
-    for step in 0..tape.below(400, "steps") {
+    // Under Miri, enough steps to fill, empty and regrow a few groups (with `keys` up to 80,
+    // a resize, a rehash of DEAD slots and a reuse of one are all met within 60).
+    for step in 0..tape.below(if cfg!(miri) { 60 } else { 400 }, "steps") {
         let key = tape.below(u64::from(keys), "key") as u16;
         let value = step as u32;
         match tape.below(16, "op") {
@@ -153,7 +155,181 @@ fn agrees(tape: &Tape) -> Result<(), String> {
 /// so that removals leave DEAD slots and growth rehashes them.
 #[test]
 fn a_map_is_a_btree_map_under_any_operations() {
-    blaze_sim::check(Config::cases(400), agrees);
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 400 }), agrees);
+}
+
+/// What a value of the tests below counts: its drops, into a shared cell.
+struct Counted(std::rc::Rc<std::cell::Cell<usize>>);
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        self.0.set(self.0.get() + 1);
+    }
+}
+
+/// A table that grows, has a key removed from a full group and another inserted into the
+/// DEAD slot it left, then is walked mutably: the unsafe paths of `resize`, `remove` and
+/// `insert_no_grow` on a reused slot, and `IterMut`, at Miri's size.
+#[test]
+fn a_dead_slot_is_reused_after_growth() {
+    let mut map: Map<u16, u32, Clustered, Global> = Map::with_hasher_in(Clustered, Global);
+    for key in 0..40 {
+        map.insert(key, u32::from(key));
+    }
+    for key in (0..40).step_by(2) {
+        assert_eq!(map.remove(&key), Some(u32::from(key)));
+    }
+    for key in 40..50 {
+        map.insert(key, u32::from(key));
+    }
+    for (_, value) in map.iter_mut() {
+        *value += 1;
+    }
+    assert!(
+        (1..50).step_by(2).chain(40..50).all(|key| map.get(&key) == Some(&(u32::from(key) + 1)))
+    );
+}
+
+/// A drain forgotten with `mem::forget` leaks its values, never exposes a moved-out one: the
+/// map is empty and usable after it.
+#[test]
+fn a_forgotten_drain_leaves_the_map_empty() {
+    let dropped = std::rc::Rc::new(std::cell::Cell::new(0));
+    let mut map: Map<u32, Counted, FixedState, Global> = Map::new_in(Global);
+    for key in 0..20 {
+        map.insert(key, Counted(dropped.clone()));
+    }
+    let mut drain = map.drain();
+    drop(drain.next());
+    std::mem::forget(drain);
+    assert_eq!(dropped.get(), 1, "only the value taken is dropped");
+    assert_eq!(map.len(), 0);
+    assert!(map.get(&3).is_none());
+    map.insert(3, Counted(dropped.clone()));
+    assert_eq!(map.len(), 1);
+    drop(map);
+    assert_eq!(dropped.get(), 2);
+}
+
+/// An owning iterator dropped partway drops the values it did not hand out, once each.
+#[test]
+fn an_into_iter_dropped_partway_drops_the_rest() {
+    let dropped = std::rc::Rc::new(std::cell::Cell::new(0));
+    let mut map: Map<u32, Counted, FixedState, Global> = Map::new_in(Global);
+    for key in 0..20 {
+        map.insert(key, Counted(dropped.clone()));
+    }
+    let mut values = map.into_values();
+    drop(values.next());
+    drop(values.next());
+    assert_eq!(dropped.get(), 2);
+    drop(values);
+    assert_eq!(dropped.get(), 20);
+}
+
+/// A set of keys borrowed from a map, dropped after the map is moved out: the table's drop
+/// reads no borrow (`#[may_dangle]`), so this compiles, and Miri sees no use of the moved map.
+#[test]
+fn a_set_of_borrowed_keys_outlives_its_owner_by_its_drop() {
+    fn keep(map: Map<String, u32, FixedState, Global>) -> Map<String, u32, FixedState, Global> {
+        let mut used: crate::Set<&str, FixedState, Global> = crate::Set::new_in(Global);
+        for key in map.keys() {
+            used.insert(key.as_str());
+        }
+        assert_eq!(used.len(), map.len());
+        map
+    }
+    let mut map: Map<String, u32, FixedState, Global> = Map::new_in(Global);
+    for key in 0..12u32 {
+        map.insert(format!("key {key}"), key);
+    }
+    assert_eq!(keep(map).len(), 12);
+}
+
+/// A clone whose value's `clone` panics partway leaves a copy that drops exactly the values
+/// cloned, and frees its memory: the clone's unwinding path.
+#[test]
+fn a_clone_that_panics_drops_what_it_cloned() {
+    use std::{cell::Cell, rc::Rc};
+
+    struct Brittle {
+        clones: Rc<Cell<usize>>,
+        drops: Rc<Cell<usize>>,
+    }
+
+    impl Clone for Brittle {
+        fn clone(&self) -> Brittle {
+            self.clones.set(self.clones.get() + 1);
+            assert!(self.clones.get() < 6, "the sixth clone panics");
+            Brittle { clones: self.clones.clone(), drops: self.drops.clone() }
+        }
+    }
+
+    impl Drop for Brittle {
+        fn drop(&mut self) {
+            self.drops.set(self.drops.get() + 1);
+        }
+    }
+
+    let (clones, drops) = (Rc::new(Cell::new(0)), Rc::new(Cell::new(0)));
+    let mut map: Map<u32, Brittle, FixedState, Global> = Map::new_in(Global);
+    for key in 0..12 {
+        map.insert(key, Brittle { clones: clones.clone(), drops: drops.clone() });
+    }
+    let copy = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| map.clone()));
+    assert!(copy.is_err());
+    assert_eq!(drops.get(), 5, "the five values cloned are dropped with the copy");
+    assert_eq!(map.len(), 12);
+}
+
+/// A hash that panics in the middle of a resize leaves every value in the old table, and the
+/// new allocation freed (`Moving`'s drop): the map still finds what it held.
+#[test]
+fn a_resize_whose_hash_panics_keeps_the_old_table() {
+    use std::{cell::Cell, rc::Rc};
+
+    #[derive(Clone, Default)]
+    struct Fragile(Rc<Cell<bool>>);
+
+    struct FragileHasher(u64, bool);
+
+    impl Hasher for FragileHasher {
+        fn write(&mut self, bytes: &[u8]) {
+            assert!(!self.1, "the hash panics");
+            for &byte in bytes {
+                self.0 = self.0.wrapping_mul(31).wrapping_add(u64::from(byte));
+            }
+        }
+
+        fn finish(&self) -> u64 {
+            self.0.wrapping_mul(0x9e37_79b9_7f4a_7c15)
+        }
+    }
+
+    impl BuildHasher for Fragile {
+        type Hasher = FragileHasher;
+
+        fn build_hasher(&self) -> FragileHasher {
+            FragileHasher(0, self.0.get())
+        }
+    }
+
+    let fragile = Fragile::default();
+    let mut map: Map<u32, u32, Fragile, Global> = Map::with_hasher_in(fragile.clone(), Global);
+    let mut key = 0;
+    let capacity = loop {
+        map.insert(key, key);
+        key += 1;
+        if map.len() == map.capacity() {
+            break map.capacity();
+        }
+    };
+    fragile.0.set(true);
+    let grown = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| map.reserve(1)));
+    assert!(grown.is_err());
+    fragile.0.set(false);
+    assert_eq!(map.capacity(), capacity, "the old table kept");
+    assert!((0..key).all(|it| map.get(&it) == Some(&it)));
 }
 
 /// Values with a `Drop` are dropped once each, by removal, `clear`, `retain`, a drain cut short
@@ -171,7 +347,7 @@ fn every_value_is_dropped_once() {
     }
 
     let dropped = Rc::new(Cell::new(0));
-    let made = 300;
+    let made = if cfg!(miri) { 40 } else { 300 };
     {
         let mut map: Map<u32, Counted, FixedState, Global> = Map::new_in(Global);
         for key in 0..made {

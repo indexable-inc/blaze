@@ -408,7 +408,7 @@ impl<'a> Os<'a> {
     ) -> Result<Result<(Kind, u64), Errno>, Stop> {
         // Each path a macro names is a span of its expansion, the path as it gave it (its
         // `subject`, the profile's `function` column).
-        let _span = tracing::info_span!(target: "blaze", "proc macro reads a path", subject = path, seen = ?seen).entered();
+        let _span = blaze_trace::info_span!(target: "blaze", "proc macro reads a path", subject = path, seen = ?seen).entered();
         if path.is_empty() {
             return Ok(Err(Errno::Noent));
         }
@@ -598,7 +598,7 @@ impl<'a> Os<'a> {
                 slot.bytes.clear();
                 slot.listed = false;
                 if kind == Kind::File {
-                    let _span = tracing::info_span!(target: "blaze", "proc macro reads a file", subject = %self.real).entered();
+                    let _span = blaze_trace::info_span!(target: "blaze", "proc macro reads a file", subject = %self.real).entered();
                     let read = fs::File::open(&self.real)
                         .and_then(|mut file| file.read_to_end(&mut slot.bytes));
                     if let Err(error) = read {
@@ -1061,7 +1061,7 @@ impl<'a> Os<'a> {
     /// `readdir` gives them, and notes it listed.
     fn list(&mut self, index: usize) -> io::Result<()> {
         let slot = &mut self.fds[index];
-        let _span = tracing::info_span!(target: "blaze", "proc macro lists a directory", subject = %slot.path).entered();
+        let _span = blaze_trace::info_span!(target: "blaze", "proc macro lists a directory", subject = %slot.path).entered();
         slot.names.clear();
         slot.entries.clear();
         let parent_ino = match slot.path.rfind('/') {

@@ -1306,16 +1306,16 @@ pub fn prove<'db>(
     }
     let blocks = body.basic_blocks.len();
     let steps = body_steps(body);
-    let span = tracing::info_span!(
+    let span = blaze_trace::info_span!(
         target: "blaze",
         "reach prove",
         body = %body_name(db, body.owner),
         blocks,
         steps,
-        facts = tracing::field::Empty,
-        work = tracing::field::Empty,
-        bound = tracing::field::Empty,
-        outcome = tracing::field::Empty,
+        facts = blaze_trace::field::Empty,
+        work = blaze_trace::field::Empty,
+        bound = blaze_trace::field::Empty,
+        outcome = blaze_trace::field::Empty,
     )
     .entered();
     let reach = prove_untraced(db, infcx, env, body, explain);

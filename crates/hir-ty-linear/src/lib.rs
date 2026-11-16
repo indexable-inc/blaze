@@ -87,7 +87,7 @@ pub fn check_body<'db>(
     kind: BodyKind,
     out: &mut Vec<LinearDiagnostic>,
 ) {
-    let _p = tracing::info_span!(target: "blaze", "linear_check", owner = ?body.owner).entered();
+    let _p = blaze_trace::info_span!(target: "blaze", "linear_check", owner = ?body.owner).entered();
     blaze_mem::frame::task(blaze_mem::Tag::Mir, |frame| {
         let types = ty::Types::new(db, body, kind, frame);
         generic::check_calls(&types, body, out);

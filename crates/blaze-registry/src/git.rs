@@ -257,7 +257,7 @@ fn watch(
     said: &str,
     shown: &str,
 ) -> anyhow::Result<()> {
-    let _waiting = tracing::info_span!(target: "blaze", "git fetch", repo = %said).entered();
+    let _waiting = blaze_trace::info_span!(target: "blaze", "git fetch", repo = %said).entered();
     let mut child = command.spawn().context("could not run `git`")?;
     let stderr = child.stderr.take().expect("a piped stderr");
     let (send, pieces) = crossbeam_channel::unbounded();

@@ -95,6 +95,8 @@ fn package_dir(package: &str) -> &'static str {
 enum Find {
     /// Python's `(?<![\w.'])<word>(?![\w'])`.
     Bare(&'static str),
+    /// The text itself, anywhere.
+    Text(&'static str),
     Re(Regex),
 }
 
@@ -112,6 +114,7 @@ impl Find {
                 })
                 .map(|(at, _)| at)
                 .collect(),
+            Find::Text(text) => code.match_indices(text).map(|(at, _)| at).collect(),
             Find::Re(re) => re.find_iter(code).map(|m| m.start()).collect(),
         }
     }
@@ -138,11 +141,11 @@ impl Patterns {
             refused: vec![
                 ("sorry", Find::Bare("sorry")),
                 ("admit", Find::Bare("admit")),
-                ("native_decide", Find::Re(re(r"native_decide"))),
+                ("native_decide", Find::Text("native_decide")),
                 ("decide +native", Find::Re(re(r"\+native\b"))),
                 ("axiom", Find::Re(re(r"(?m)^\s*(?:(?:private|protected|noncomputable|unsafe)\s+)*axiom\s"))),
                 ("partial def", Find::Re(re(r"\bpartial\s+def\b"))),
-                ("debug.skipKernelTC", Find::Re(re(r"skipKernelTC"))),
+                ("debug.skipKernelTC", Find::Text("skipKernelTC")),
             ],
             axioms: re(r"'([^'\s]+)' depends on axioms: \[([^\]]*)\]"),
             no_axioms: re(r"'([^'\s]+)' does not depend on any axioms"),

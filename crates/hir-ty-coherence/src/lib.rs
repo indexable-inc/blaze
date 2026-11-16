@@ -435,7 +435,7 @@ pub fn overlapping_impl(db: &Db, impl_: ImplId) -> Option<AnyImplId> {
     let trait_ = db.impl_trait(impl_)?.skip_binder().def_id.0;
     let krate = impl_.krate(db);
     let _p =
-        tracing::info_span!(target: "blaze", "sealed_overlap", ?impl_, ?trait_, ?krate).entered();
+        blaze_trace::info_span!(target: "blaze", "sealed_overlap", ?impl_, ?trait_, ?krate).entered();
     let interner = DbInterner::new_with(db, krate);
     let infcx = interner.infer_ctxt().build(TypingMode::Coherence);
     let this = AnyImplId::ImplId(impl_);

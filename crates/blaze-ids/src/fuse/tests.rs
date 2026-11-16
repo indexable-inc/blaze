@@ -12,7 +12,7 @@ fn random(seed: u64, n: usize) -> Vec<u64> {
 /// and the same after an encoding and decoding.
 #[test]
 fn a_filter_never_hides_a_key_it_was_built_of() {
-    blaze_sim::check(Config::DEFAULT, |tape| {
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
         let mut keys: Vec<u64> = tape.vec(0..=3000, "keys", |tape| tape.int("key"));
         let repeated: usize = tape.int_in(0..=keys.len(), "repeated");
         keys.extend_from_within(..repeated);

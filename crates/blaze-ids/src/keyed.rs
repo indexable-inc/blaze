@@ -345,7 +345,7 @@ mod tests {
     /// are the nodes kept.
     #[test]
     fn a_keyed_set_kept_by_edits_is_the_set_made_whole() {
-        blaze_sim::check(Config::DEFAULT, |tape| {
+        blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
             let ops: Vec<Op> = tape.vec(0..=24, "ops", op);
             kept_is_whole(&ops, false)
         });

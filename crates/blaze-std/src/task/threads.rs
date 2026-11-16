@@ -27,19 +27,19 @@
 //!   task/idle.rs that loses no wake and wakes at most one worker per spawn.
 //! - **Per-worker state** is padded to [`LINE`], the target's cache line.
 
-#[cfg(not(blaze_check))]
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use alloc::alloc::Global;
 use core::{
     cell::UnsafeCell,
     fmt,
     hint,
     ptr::{self, NonNull},
+    sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     time::Duration,
 };
 
-#[cfg(blaze_check)]
-use blaze_check::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+// The pool's own atomics are std's even under `cfg(blaze_check)`: the model covers the deque
+// and the idle protocol (their modules), each with its own model test; the pool is tested
+// under real threads, and is not used under that cfg.
 use blaze_core::{
     lock::Lock,
     wait::{Clock, Deadline, Monotonic, Parker, WaitError, Waited},
@@ -601,9 +601,23 @@ impl Pool {
             Class::Foreground => &group.foreground,
             Class::Background => &group.background,
         };
-        match queue.lock().try_push_back(job) {
-            Ok(()) => Ok(()),
-            Err(refused) => Err(Full(refused.0)),
+        bounded_push(&mut queue.lock(), INJECT, job)
+    }
+
+    /// Runs a task a full queue gave back, on the spawner's thread `here`, now.
+    pub(crate) fn run_now(&self, here: Here, job: JobPtr) {
+        match here {
+            Here::Worker(at) => self.run_job(at, job),
+            Here::Outside => {
+                // SAFETY: the queue's reference, which the full queue handed back.
+                let head = unsafe { job.0.as_ref() };
+                if head.claim() {
+                    // SAFETY: claimed by this thread just now.
+                    unsafe { (head.run)(job.0, Here::Outside) };
+                }
+                // SAFETY: that reference, given up once.
+                unsafe { (head.release)(job.0) };
+            }
         }
     }
 
@@ -657,9 +671,7 @@ impl Pool {
     pub(crate) fn spawn_on(&self, at: u32, job: JobPtr) -> Result<(), Full> {
         let shared = &*self.0;
         let worker = &shared.workers[at as usize].0;
-        if let Err(refused) = worker.pinned.lock().try_push_back(job) {
-            return Err(Full(refused.0));
-        }
+        bounded_push(&mut worker.pinned.lock(), PINNED, job)?;
         if shared.idle.wake_this(&worker.mark) {
             worker.parker.unpark();
         }
@@ -946,6 +958,16 @@ impl Pool {
         }
         order
     }
+}
+
+/// `job` onto `queue`, which holds at most `most`: never grown (its room was made at the
+/// pool's start), so a full one gives the task back.
+fn bounded_push(queue: &mut VecDeque<JobPtr, Global>, most: usize, job: JobPtr) -> Result<(), Full> {
+    if queue.len() >= most {
+        return Err(Full(job));
+    }
+    queue.push_back(job);
+    Ok(())
 }
 
 /// One task off `group`'s queue of `class`.

@@ -14,7 +14,7 @@ doctest = false
 
 [dependencies]
 either.workspace = true
-tracing.workspace = true
+blaze-trace.workspace = true
 
 rustc_type_ir.workspace = true
 
