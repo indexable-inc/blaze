@@ -238,6 +238,13 @@ Andrew: "we should have 0 third party and all the things you said worth adding".
   new crate is `#![no_std]` with no `extern crate alloc`. The parked crates are held by a
   ratchet and moved by astlog rules once blaze checks itself again. Known cost: the compiler's
   own `Box` moves out with `*b`; ours uses a method.
+- **Cleanup on every exit is `core::mem::DropGuard`** (stable in the pinned library; Andrew:
+  "like zig's drop thing"). `DropGuard::new(value, |v| ..)` runs the closure when the guard
+  leaves scope by any path; `DropGuard::dismiss(guard)` gives the value back and runs nothing
+  (the rollback that is cancelled on success). It replaces a hand-written struct with a `Drop`
+  impl. It is for cleanup that cannot fail and cannot wait: what must be finished with a result
+  or under a deadline is a linear type (`#[blaze::linear]`) with an explicit `finish(cx)`.
+  `async_drop` is not used (a destructor takes no context and returns no error).
 - **Hot counters in the slot.** A function's stub counts its calls; past a bound the function
   is queued for the optimizing tier. No profiler is needed to tier up.
 - **Tests that pick themselves.** A test's record lists the functions its run entered (their

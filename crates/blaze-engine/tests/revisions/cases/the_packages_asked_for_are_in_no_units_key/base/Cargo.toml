@@ -1,4 +1,0 @@
-[workspace]
-members = ["a", "b", "up"]
-exclude = ["vendor"]
-resolver = "3"
