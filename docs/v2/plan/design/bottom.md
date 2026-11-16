@@ -235,9 +235,14 @@ Andrew: "we should have 0 third party and all the things you said worth adding".
   function: a lookup, not a build.
 - **Looking inside a running program.** The loader is ours, so a run can pause on a panic with
   its stack, say why it hangs, and sample itself. Every `run` and `test` registers itself and
-  answers on a local socket; `blaze view`, a helper with an expiry that never builds, lists
-  them and serves the profile history to a page (origin checked, a secret per session,
-  read-only).
+  answers on a local socket. A viewer helper lists them and serves the profile history to a
+  page hosted on ix.dev: no command starts it (Andrew: "doing separate blaze view seems
+  annoying ... ix.dev thing show automatically whatever is running or building"); any blaze
+  command starts it when it is not listening on its fixed local port, and it ends by itself
+  when no blaze process is alive and no page is connected. It never builds and holds nothing
+  a record does not. It answers only the ix.dev origin, read-only, after a browser was paired
+  once (the page shows a code, the next blaze command asks). The data goes to the browser and
+  no further.
 - **Relax's failures as a checklist.** Its `KNOWN_GAPS.md` and tests (MIT) are the list of
   Rust that trips a front end written from scratch; each is a test here.
 
