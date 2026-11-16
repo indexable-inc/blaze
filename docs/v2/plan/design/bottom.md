@@ -143,6 +143,44 @@ work only for a crate never seen before and not fetched, and is the one part no 
 has built: it is not built unless a measured crate-wide first pass over item lists costs more
 than about 10 ms on reth's or tempo's largest crate.
 
+## What Relax does, and what is taken from it
+
+Relax (makepad, MIT; read at commit f05459f on 2026-11-15, source only) is the compiler this
+one is judged against. What its code does, by file:
+
+- Names: collection is eager and the import fixpoint runs over the whole program's import list
+  (`front/src/program.rs`); lookups are memoised per (module, name, namespace) and every binding
+  change clears the memos of the whole program. So it resolves whole, as rustc does.
+- It keeps a full AST of every file for the life of the process; positions are absolute byte
+  offsets; a line inserted above a function changes that function's code key.
+- Cache: one mmap'd file per crate version (a header, a sorted index, append-only payloads of
+  raw in-memory structs, readable only by the same build). Keys hash absolute worktree paths,
+  so the cache is not shareable across checkouts or machines; std is compiled per workspace.
+- `check`: a crate's verdict is keyed by every file's text (one edit misses the crate); a
+  signature edit drops every body verdict of the crate; a body with a warning is never stored.
+- Its speed comes from elsewhere: a function is compiled when first called (stubs), a warm
+  start maps the whole resolved program in place after a stat-only certificate, a check with
+  unchanged inputs prints stored diagnostics with no load, and there is no link step.
+
+Taken from it:
+
+1. **Compile on first call.** `run` emits stubs and compiles a function when it is first hit,
+   the rest in the background; `build` compiles what is reached. This is the largest part of
+   Relax's lead on time to first run and is independent of the item layer.
+2. **The early record.** A check whose certificate stands prints its stored findings and
+   exits before anything is loaded (the certificate here already; the findings as a record).
+3. **Stat stamps with a racy window**, hashing only files whose stat changed (here already).
+4. **One mapped pack per crate with a sorted index** for a crate's records (the store's packs).
+5. **Packed tokens** (4 bytes each) and LEB128 position tables for `FileItems` and expansions.
+6. **Function bodies skipped at load**: an outline never parses a body; a body is parsed when
+   its own task runs.
+7. **A key that covers what a name can find**: its per-item name graph with a Merkle hash per
+   strongly connected set is the same idea as a per-name read list; blanket impls are indexed
+   under the trait's name.
+
+Not taken: absolute positions and paths in keys, crate-grain verdicts, raw in-memory structs
+as the stored form, whole-program memo flushes, ASTs kept alive, dependencies read from source.
+
 ## How it is built and proven
 
 - New crates beside the old: `blaze-id` (done), `blaze-surface` (the schema and the two
