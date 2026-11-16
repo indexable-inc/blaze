@@ -276,13 +276,27 @@ Andrew: "we should have 0 third party and all the things you said worth adding".
   each call is one `Effect` given to the one driver, under a `Cx` that knows its task and
   span. The driver records, per effect: its kind and the sizes of its arguments, when it was
   asked, started and done, its outcome, the task and span, and the call site
-  (`#[track_caller]`, no cost at run time). A fixed entry in a per-thread ring, always on (the
-  last minutes); the whole stream to the profile only when asked. Argument values (paths,
+  (`#[track_caller]`, no cost at run time). It is off until asked (see the next point). Argument values (paths,
   hosts, bytes) are kept only when asked and never leave the machine without the opt-in. The
   simulation implements the same driver, so a test can state what a function may do ("no
   network", "writes one file"). A program on Rust's own `std` does not pass through this
   driver; because blaze compiles `std` itself, its system layer can carry the same hooks:
   later.
+- **Decide at run time** (Andrew: "this is a JIT! ideally these things could be toggled
+  dynamically at runtime"). A function is reached through its slot, and a slot can hold another
+  version of the same function at any moment, so what an ahead-of-time compiler fixes with a
+  build flag is here a version swapped in while the program runs, and swapped out again:
+  tracing a function or a module, recording effects for one task or crate, exact call counts
+  and times, a breakpoint that parks the thread with its stack, coverage, allocation tracking,
+  extra checks (overflow, bounds, contracts) on the function one suspects. Off costs nothing:
+  the plain version has no test of a flag in it. A version is a code record keyed by the
+  function and the set of hooks in it, so it is made once and shared. The same holds for
+  speed: the optimizing tier works from what was observed (the target a `dyn` call really has,
+  under a guard; real counts for layout; the argument values a function keeps getting). The
+  rule: decide at run time from what is observed wherever the slot allows it; a build-time
+  switch is the exception and says why. What stays at compile time is what decides whether
+  the program is right: types, borrows, capabilities. A toggle is a request to a live run
+  through the viewer's channel and is a permitted action of a paired browser, never open.
 - **Many machines on one page** (Andrew: "a monitor of what might be happening even on
   multiple machines"). The viewer's events (a command began or ended, what it runs, compiles
   or tests, on which machine and checkout, time and memory) are one stream. When an
