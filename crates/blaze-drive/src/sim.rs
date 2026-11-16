@@ -1407,13 +1407,28 @@ fn commands(tape: &Tape, plant: Plant) -> Result<(), Broke> {
             Some(error) => return Err(Broke::Oracle(format!("`{command:?}` stopped with an error: {error}"))),
             None => {}
         }
-        let (_, ended) = finished(ended)?;
+        let (answer, ended) = finished(ended)?;
+        // `test` is its check alone until tests run on this path: it starts no program (a
+        // package's `main` is not its tests) and never answers as a program's pass or failure.
+        if command == Command::Test {
+            oracle(!ended.started, || String::from("`test` started a program: `main` is not a test"))?;
+            oracle(matches!(answer.verdict, Verdict::Checked | Verdict::Failed { started: false, .. }), || {
+                format!("`test` answered {:?}: its answer is its check's alone", answer.verdict)
+            })?;
+        }
         if ended.last.is_some() {
             last = ended.last;
         }
         before = Some(world.clone());
     }
     Ok(())
+}
+
+/// `test` starting the package's program (what `blaze test` did until 2026-11-16: the check,
+/// then `src/main.rs` run as if `main` were the tests) is caught by the commands property.
+#[test]
+fn control_a_test_that_starts_a_program_is_caught() {
+    control(SimConfig::cases(2000), Plant::None, Plant::TestStartsProgram, "`test` started a program", commands);
 }
 
 #[test]

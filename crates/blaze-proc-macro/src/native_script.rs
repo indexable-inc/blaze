@@ -183,8 +183,9 @@ pub fn run_script<'a>(script: &NativeScript<'_>, alloc: Alloc<'a>) -> Result<Nat
         for path in exec.iter() {
             out.push(path.as_str());
         }
+        // Each tool and the programs it starts itself (perl's piped `open`: /bin/sh, /bin/bash).
         for tool in script.host_tools {
-            out.push(tool.path);
+            out.extend(tool.programs());
         }
         out
     };

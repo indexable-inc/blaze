@@ -5,7 +5,11 @@ date: 2026-10-29
 ---
 # Memory, the way a game engine does it
 
-Where this leads: memory as one buffer pool with one evictor.
+Superseded where it differs (2026-11-16): a command's memory is as
+[parallel.md](parallel.md), "End state (architect, 2026-11-16)", points 5 to 7, says: a frame
+per worker reset per item, records as what outlives a task, footprint the one measure, nothing
+admitted by memory, no buffer pool or evictor (the page cache is the only cache, rule 51), and
+no daemon heaps. The allocators-by-lifetime table and `Kept` below still stand.
 
 A game has a frame budget and never calls `malloc` per frame. blaze's frame is an edit: from
 a file changing to code patched in. The warm loop should allocate nothing from the

@@ -28,7 +28,8 @@ use super::keys::{Keys, MemberKind, Origin, checker_of};
 use super::langs::{lang_name, trait_lang};
 use super::spell::{Spelling, Unspelled};
 use super::types::SelfTy;
-use crate::resolve::{ResolveError, Resolver};
+use super::source::NamesSource;
+use crate::resolve::{Paths, ResolveError};
 
 /// What the check loop makes before it checks the body again.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,9 +155,10 @@ pub fn item_place(names: &Names<'_>, key: LibKey) -> Box<str> {
     "(no file place)".into()
 }
 
-/// The world one body is checked in.
-pub struct BodyWorld<'w, 'n> {
-    pub names: &'n Names<'n>,
+/// The world one body is checked in, its names from the source `S` ([`NamesSource`]: the
+/// solved names by default, or each crate's records).
+pub struct BodyWorld<'w, 'n, S = &'n Names<'n>> {
+    pub names: S,
     pub keys: &'w Keys,
     pub index: &'w Index<'n>,
     pub store: &'w Store<'n>,
@@ -175,9 +177,21 @@ pub struct BodyWorld<'w, 'n> {
     pub gaps: RefCell<Vec<Gap, Global>>,
 }
 
-impl<'w, 'n> BodyWorld<'w, 'n> {
-    pub(super) fn resolver(&self) -> Resolver<'n> {
-        Resolver { names: self.names }
+impl<'w, 'n, S: NamesSource<'n>> BodyWorld<'w, 'n, S> {
+    pub(super) fn resolver(&self) -> Paths<S> {
+        Paths { names: self.names }
+    }
+
+    /// Where the impl `k` is, for a gap's text: over the solved names its file and line
+    /// ([`item_place`]); over records its module's path (no text is opened to count lines).
+    fn place_shown(&self, k: LibKey) -> Box<str> {
+        match self.names.solved() {
+            Some(solved) => item_place(solved, k),
+            None => match self.names.home_of(k).and_then(|m| self.names.module_path(m)) {
+                Some(path) => format!("in {path}").into_boxed_str(),
+                None => "(no place in the records)".into(),
+            },
+        }
     }
 
     pub(super) fn fill<T>(&self, f: Fill) -> Fetch<T> {
@@ -214,7 +228,7 @@ impl<'w, 'n> BodyWorld<'w, 'n> {
     /// `asked` says the question (which trait at which shape, or the inherent items of which
     /// shape): it follows the place, so a gap names what was asked beside who could not answer.
     fn failed_impl(&self, k: LibKey, why: &str, asked: &str) -> Gap {
-        let place = format!("{} [asked: {asked}]", item_place(self.names, k));
+        let place = format!("{} [asked: {asked}]", self.place_shown(k));
         match self.buckets.is_some_and(|b| b.is_unread(k)) {
             // The place leads the why: a census cuts the text, and the impl is to be found.
             true => Gap::UnreadImpl(k, format!("at {place}: {why}").into_boxed_str()),
@@ -257,7 +271,7 @@ impl<'w, 'n> BodyWorld<'w, 'n> {
     }
 }
 
-impl World for BodyWorld<'_, '_> {
+impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
     fn fn_sig(&self, _: Seal, item: ItemKey) -> Fetch<Option<FnSig<'_>>> {
         if let Some(f) = self.store.fns.get(&item) {
             return Ok(Some(FnSig {
@@ -308,6 +322,12 @@ impl World for BodyWorld<'_, '_> {
         match self.store.preds.get(&item) {
             Some(p) if !p.conds.is_empty() => self.gap(Gap::WhereConst(item)),
             Some(p) => Ok(Predicates { clauses: &p.clauses, types: self.types() }),
+            // A trait's associated type whose bounds were refused (`Store::trait_members`
+            // files the refusal under the type's own key): the gap names it and why.
+            None if self.store.fn_gaps.contains_key(&item) => {
+                let why = self.store.fn_gaps.get(&item).map(|w| format!("{w:?}")).unwrap_or_default();
+                self.gap(Gap::FnHead(item, why.into_boxed_str()))
+            }
             None => self.want(item),
         }
     }

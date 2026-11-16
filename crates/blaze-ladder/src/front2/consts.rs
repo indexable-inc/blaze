@@ -34,7 +34,7 @@ use blaze_lower::scoped::Prepares;
 use blaze_lower::typeck::TypeckBody;
 use blaze_lower::{View, head};
 use blaze_own::Alloc;
-use blaze_scope::resolve::Names;
+use super::source::NamesSource;
 use blaze_typeck as tc;
 use blaze_typeck::{Checked, ExprId, Fetch, ItemKey, List, Missing, PatId, PortableTys, Range};
 
@@ -82,6 +82,32 @@ pub enum ConstFail {
     /// The layout of a type constant `item` reads (`size_of::<S>()`) needs the row of ADT
     /// `adt`, which could not be made or cannot be laid out here: `why` names the cause.
     AdtRow { item: ItemKey, adt: ItemKey, why: Box<str> },
+    /// The evaluation of `item` asked for the value of a TRAIT's constant `constant` with no
+    /// arguments, so with no `Self` to select an impl by. A checked body records a constant
+    /// path as `Def::Const(key)` alone (blaze-typeck `Checked::expr_defs`) and the evaluator
+    /// instances it at `List::EMPTY` (blaze-consteval machine/code.rs, `Expr::Path`), never
+    /// asking [`ConstWorld::resolve`]. Refused by name: evaluating the trait's own text would
+    /// give the DEFAULT where an impl overrides it. Owed in those two crates.
+    TraitConstNoSelf { item: ItemKey, constant: ItemKey },
+    /// `<Self as Trait>::NAME` in a head ([`super::const_qpath`]): no impl of `trait_` for
+    /// `self_ty` was selected for the trait's constant `constant` (none is made in the store,
+    /// more than one is, or only the solver could choose: [`ConstsWorld::impl_const`]), or the
+    /// one selected neither writes the constant nor has a default in the trait.
+    NoImplConst { trait_: ItemKey, self_ty: tc::PNode, constant: ItemKey },
+    /// `<Self as Trait>::NAME` in a head: the trait `trait_` declares no constant under the
+    /// member key `constant`.
+    NoTraitConst { trait_: ItemKey, constant: ItemKey },
+    /// `<Self as Trait>::NAME` in a head: the type of the trait's constant `constant` is not
+    /// `bool`, `char` or an integer, or its value is not one of at most 16 bytes.
+    QPathType { constant: ItemKey },
+    /// The qualified constant leaf under need key `need` is needed while it is being answered
+    /// (an impl header of its own selection writes it).
+    QPathCycle { need: ItemKey },
+    /// More than `most` qualified constant leaves are being answered inside one another.
+    QPathDepth { need: ItemKey, most: u32 },
+    /// A key of the qualified constant leaf `need` (its trait, its type, the trait's
+    /// constant) clashes in the front end's key map.
+    QPathKey { need: ItemKey, clash: super::keys::KeyClash },
 }
 
 impl core::fmt::Display for ConstFail {
@@ -99,6 +125,13 @@ impl core::fmt::Display for ConstFail {
             ConstFail::NotUsize { item } => write!(f, "constant {item:?}: an array length's value is not a `usize` of 64 bits"),
             ConstFail::TooManyLengths { item, most } => write!(f, "constant {item:?}: one head named more than {most} array-length constants"),
             ConstFail::AdtRow { item, adt, why } => write!(f, "constant {item:?}: a layout it reads needs the row of ADT {adt:?}: {why}"),
+            ConstFail::TraitConstNoSelf { item, constant } => write!(f, "constant {item:?}: the trait's constant {constant:?} is read with no `Self` (a checked body's constant path holds no arguments yet): no impl can be selected"),
+            ConstFail::NoImplConst { trait_, self_ty, constant } => write!(f, "no impl of trait {trait_:?} for the type {self_ty:?} gives its constant {constant:?} (rule: one impl with no generics and that self type, or `impl<T> Tr for T`, is selected; none made, several, or one only the solver can choose is not)"),
+            ConstFail::NoTraitConst { trait_, constant } => write!(f, "trait {trait_:?} declares no constant under the key {constant:?}"),
+            ConstFail::QPathType { constant } => write!(f, "the trait's constant {constant:?}: a qualified path in a head has a value only at `bool`, `char` or an integer type of at most 16 bytes"),
+            ConstFail::QPathCycle { need } => write!(f, "the qualified constant {need:?} needs itself: an impl header of its own selection writes it"),
+            ConstFail::QPathDepth { need, most } => write!(f, "the qualified constant {need:?}: more than {most} are answered inside one another"),
+            ConstFail::QPathKey { need, clash } => write!(f, "the qualified constant {need:?}: two origins under one checker key: {clash:?}"),
         }
     }
 }
@@ -110,7 +143,7 @@ impl core::fmt::Display for ConstFail {
 /// narrowed valid range: [`ConstsWorld::adt`]), is the constant's refusal, naming the ADT. A
 /// row whose head names a constant (`struct S([u8; N])`) is refused here by that name: the
 /// evaluator is busy with `item` (owed: one work list over constants and heads).
-fn adt_row<'n>(r: &mut Records<'_, 'n>, item: ItemKey, adt: ItemKey) -> Result<(), ConstFail> {
+fn adt_row<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,item: ItemKey, adt: ItemKey) -> Result<(), ConstFail> {
     let refuse = |why: String| ConstFail::AdtRow { item, adt, why: why.into_boxed_str() };
     let narrowed = "its valid range is narrowed (`rustc_layout_scalar_valid_range_*`), which the constant evaluator's layout does not read yet";
     match r.store.adts.get(&adt) {
@@ -194,8 +227,8 @@ impl Default for Consts<'_> {
 }
 
 /// The world one evaluation step reads: front2's records as they are now.
-struct ConstsWorld<'w, 'n> {
-    names: &'n Names<'n>,
+struct ConstsWorld<'w, 'n, S> {
+    names: S,
     keys: &'w Keys,
     index: &'w Index<'n>,
     store: &'w Store<'n>,
@@ -217,23 +250,23 @@ fn is_panic_lang(name: &str) -> bool {
         || name.starts_with("panic_const_")
 }
 
-/// Library item `lib`'s name as written, from its outline entry.
-fn written_name<'n>(names: &'n Names<'n>, lib: LibKey) -> Option<&'n str> {
-    let place = names.place(lib)?;
-    let (text, outline) = names.outline_at(place.krate, place.at)?;
-    let r = outline.item(place.item).name?;
-    text.get(r.start as usize..r.end as usize)
+/// Library item `lib`'s name as written: its item text's own name (`Names::item_text`, as
+/// program.rs `item_named` reads it). Not sliced from the outline's text by the entry's name
+/// range: that range was not the text's (`size_of` came out as "onst_ev", seven bytes of
+/// another item, and the intrinsic was refused as unknown).
+fn written_name<'n, S: NamesSource<'n>>(names: S, lib: LibKey) -> Option<&'n str> {
+    names.name_of(lib)
 }
 
-impl ConstsWorld<'_, '_> {
+impl<'n, S: NamesSource<'n>> ConstsWorld<'_, 'n, S> {
     /// A free fn's kind from its signature: `const`, `#[rustc_intrinsic]`, or neither.
     fn free_fn_kind(&self, item: ItemKey, lib: LibKey) -> FnKind {
         if self.index.lang_name_of(lib).is_some_and(is_panic_lang) {
             return FnKind::Panic;
         }
-        let (Some(it), Some(krate)) = (self.names.item_text(lib), self.names.crate_of(lib)) else { return FnKind::NotConst };
-        let atoms = self.names.krate(krate).cfg.atoms();
-        let Ok(sig) = blaze_lower::lower_signature(it.text, self.names.edition(krate), &mut CrateCfg(atoms), Alloc::global()) else { return FnKind::NotConst };
+        let (Some(it), Some(krate)) = (self.names.text_of(lib), self.names.crate_of(lib)) else { return FnKind::NotConst };
+        let (Some(atoms), Some(edition)) = (self.names.cfg_atoms(krate), self.names.edition_of(krate)) else { return FnKind::NotConst };
+        let Ok(sig) = blaze_lower::lower_signature(it.text, edition, &mut CrateCfg(atoms), Alloc::global()) else { return FnKind::NotConst };
         let v = sig.view();
         let intrinsic = v.rows(v.list(head::ATTRS)).ok().is_some_and(|rows| {
             rows.iter().any(|&n| v.attr(n).ok().and_then(|a| v.text_at(a.path).ok()).is_some_and(|p| p == "rustc_intrinsic"))
@@ -348,7 +381,7 @@ impl ConstsWorld<'_, '_> {
     }
 }
 
-impl LayoutFacts for ConstsWorld<'_, '_> {
+impl<'n, S: NamesSource<'n>> LayoutFacts for ConstsWorld<'_, 'n, S> {
     /// The store's row of the ADT (heads.rs `Store::adt`: the one maker, the same row the run
     /// path hands the code builder: program.rs `FrontEnd::adt`). `None` while the row is not
     /// made: the layout refuses naming the ADT, and [`Consts::value`] makes the row and asks
@@ -378,7 +411,7 @@ impl LayoutFacts for ConstsWorld<'_, '_> {
     }
 }
 
-impl ConstWorld for ConstsWorld<'_, '_> {
+impl<'n, S: NamesSource<'n>> ConstWorld for ConstsWorld<'_, 'n, S> {
     fn body(&self, item: ItemKey) -> Fetch<Option<Typed<'_>>> {
         let b = self.bodies.iter().find(|b| b.key == item).ok_or(Missing)?;
         Ok(Some(Typed::new(b.typeck.view(b.tys.view()), &b.checked, b.text, b.lits.lend(), b.hash)))
@@ -386,7 +419,7 @@ impl ConstWorld for ConstsWorld<'_, '_> {
 
     fn fn_kind(&self, item: ItemKey) -> FnKind {
         if let Some(c) = self.store.ctors.get(&item) {
-            let variant = self.keys.library(item).and_then(|lib| crate::resolve::Resolver { names: self.names }.variant_of(lib)).map_or(0, |(_, i)| i);
+            let variant = self.keys.library(item).and_then(|lib| crate::resolve::Paths { names: self.names }.variant_of(lib)).map_or(0, |(_, i)| i);
             return FnKind::Ctor { adt: c.adt, variant };
         }
         match self.keys.library(item) {
@@ -394,9 +427,9 @@ impl ConstWorld for ConstsWorld<'_, '_> {
             None => match self.store.fns.get(&item) {
                 Some(f) if f.has_body => {
                     let v = f.text;
-                    let atoms_ok = self.names.crate_of(f.lib).map(|k| (k, self.names.krate(k).cfg.atoms()));
-                    let Some((krate, atoms)) = atoms_ok else { return FnKind::NotConst };
-                    match blaze_lower::lower_signature(v, self.names.edition(krate), &mut CrateCfg(atoms), Alloc::global()) {
+                    let atoms_ok = self.names.crate_of(f.lib).and_then(|k| Some((self.names.edition_of(k)?, self.names.cfg_atoms(k)?)));
+                    let Some((edition, atoms)) = atoms_ok else { return FnKind::NotConst };
+                    match blaze_lower::lower_signature(v, edition, &mut CrateCfg(atoms), Alloc::global()) {
                         Ok(sig) if sig.view().head[head::FLAGS] & blaze_lower::machine::sig::CONST != 0 => FnKind::Const,
                         _ => FnKind::NotConst,
                     }
@@ -426,7 +459,7 @@ impl ConstWorld for ConstsWorld<'_, '_> {
         let mut h = Hasher::new("blaze-ladder front2 constant item");
         h.update(&item.0.to_le_bytes());
         let text = match self.keys.library(item) {
-            Some(lib) => self.names.item_text(lib).map(|t| t.text),
+            Some(lib) => self.names.text_of(lib).map(|t| t.text),
             None => self.store.fns.get(&item).map(|f| f.text),
         };
         if let Some(t) = text {
@@ -446,17 +479,68 @@ impl ConstWorld for ConstsWorld<'_, '_> {
 
 impl<'n> Consts<'n> {
     /// The record of constant `item` (a checker key), evaluating every constant it needs first.
-    pub fn value(&mut self, r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, item: ItemKey) -> Result<&ConstRecord<Alloc<'static>>, ConstFail> {
+    pub fn value<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>,prepared: &Prepares<'n>, item: ItemKey) -> Result<&ConstRecord<Alloc<'static>>, ConstFail> {
+        self.value_at(r, prepared, item, None)
+    }
+
+    /// The record of `<Self as Trait>::NAME` for the ground type `self_ty` (a primitive, or
+    /// an ADT with no generic arguments), where `declared` is the TRAIT's constant
+    /// (front2/const_qpath.rs: a qualified path leaf of a head's constant expression). The
+    /// impl is selected by [`ConstsWorld::impl_const`] over the impls made in the store (the
+    /// caller makes the candidates of (trait, type) first), and what it selects (the impl's
+    /// definition, or the trait's default at `[self_ty]`) is evaluated as [`Consts::value`]
+    /// evaluates any constant. No impl selected: [`ConstFail::NoImplConst`].
+    pub fn trait_const_value<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, declared: ItemKey, self_ty: tc::PNode) -> Result<&ConstRecord<Alloc<'static>>, ConstFail> {
+        self.value_at(r, prepared, declared, Some(self_ty))
+    }
+
+    /// The root of an evaluation that starts at the trait's constant `declared` for the
+    /// ground `self_ty`: the selected item and its arguments (in `ground`).
+    fn select_root<S: NamesSource<'n>>(&self, r: &Records<'_, 'n, S>, declared: ItemKey, self_ty: tc::PNode, ground: &mut PortableTys<'_>) -> Result<(ItemKey, List), ConstFail> {
+        let world = ConstsWorld { names: r.names, keys: &*r.keys, index: r.index, store: &*r.store, bodies: &self.bodies, records: &self.records, unknown: core::cell::RefCell::new(None) };
+        let Some((trait_, name)) = world.trait_const(declared) else {
+            return Err(ConstFail::TraitConstNoSelf { item: declared, constant: declared });
+        };
+        let full = |_| ConstFail::Eval(Box::from("the constant evaluator's type table is full"));
+        let self_arg = ground.intern(self_ty).map_err(full)?;
+        let args = ground.intern_list(&[self_arg]).map_err(full)?;
+        world.impl_const(declared, trait_, name, args, ground).ok_or(ConstFail::NoImplConst { trait_, self_ty, constant: declared })
+    }
+
+    /// [`Consts::value`] (`self_ty` is `None`: `item` at no arguments), or
+    /// [`Consts::trait_const_value`] (`item` is a trait's constant, selected for `self_ty`).
+    fn value_at<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>, prepared: &Prepares<'n>, item: ItemKey, self_ty: Option<tc::PNode>) -> Result<&ConstRecord<Alloc<'static>>, ConstFail> {
         let alloc = Alloc::global();
-        let mut settle = Settle::new(Need { kind: NeedKind::Value, item, args: List::EMPTY }, MOST_NEEDS, alloc);
-        let mut last = None;
         let (mut ground, mut layout, mut codes) = self.unit.take().unwrap_or_else(|| (PortableTys::new_in(alloc), Layouts::new_in(alloc), Codes::new_in(alloc)));
+        let root = match self_ty {
+            None => Ok((item, List::EMPTY)),
+            Some(node) => self.select_root(&*r, item, node, &mut ground),
+        };
+        let (item, root_args) = match root {
+            Ok(root) => root,
+            Err(e) => {
+                self.unit = Some((ground, layout, codes));
+                return Err(e);
+            }
+        };
+        let mut settle = Settle::new(Need { kind: NeedKind::Value, item, args: root_args }, MOST_NEEDS, alloc);
+        let mut last = None;
         let mut out = Ok(());
         let mut steps = 0u32;
         while let Some(n) = settle.next() {
             steps += 1;
             if steps > MOST_STEPS {
                 out = Err(ConstFail::Steps { item, last: n });
+                break;
+            }
+            // A trait's constant has `Self` among its parameters: a need for it with no
+            // arguments has no impl to select ([`ConstFail::TraitConstNoSelf`]).
+            let of_a_trait = matches!(
+                r.keys.origin(n.item),
+                Some(super::keys::Origin::Member { container, kind: super::keys::MemberKind::Const, .. }) if r.store.trait_defs.contains_key(container)
+            );
+            if of_a_trait && ground.view().list(n.args).map_or(true, |l| l.is_empty()) {
+                out = Err(ConstFail::TraitConstNoSelf { item, constant: n.item });
                 break;
             }
             if !self.bodies.iter().any(|b| b.key == n.item) && (n.kind == NeedKind::Body || n.item == item) {
@@ -518,7 +602,7 @@ impl<'n> Consts<'n> {
 
     /// Lowers and checks the body of `item` (a constant, a static or a `const fn`) for the
     /// evaluator.
-    fn check_one(&mut self, r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, item: ItemKey) -> Result<(), ConstFail> {
+    fn check_one<S: NamesSource<'n>>(&mut self, r: &mut Records<'_, 'n, S>,prepared: &Prepares<'n>, item: ItemKey) -> Result<(), ConstFail> {
         let lowered = match r.keys.library(item) {
             Some(lib) => lower_fn(r.names, prepared, r.keys, r.store, lib),
             None => lower_member(r.names, prepared, r.keys, r.store, item),
@@ -536,7 +620,7 @@ impl<'n> Consts<'n> {
             (checked, lits)
         };
         let text = match r.keys.library(item) {
-            Some(lib) => r.names.item_text(lib).map(|t| t.text),
+            Some(lib) => r.names.text_of(lib).map(|t| t.text),
             None => r.store.fns.get(&item).map(|f| f.text),
         }
         .ok_or(ConstFail::Body { item, error: BodyError::NoHead(item) })?;

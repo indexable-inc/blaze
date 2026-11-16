@@ -252,3 +252,133 @@ read: 28.9 ms with `open_source_put`, 563 ms with `open_source` (the BLAKE3 of 1
      Today only `trust::macos::reads()` rising on an explicit call is tested.
   5. **`Effect::Roots`**, which the effect lane wires after Boot.
 - Lane ids: read /Volumes/Projects/blaze-int-1112-notes/OWNERS.md, never a brief.
+
+## End state: dependencies on the command path (architect, 2026-11-16)
+
+`blaze check` reads every outside package it reaches from one machine-wide place, verified once,
+mapped, shared by every project and worktree; the network is asked only for what no place holds.
+**Identity.** A package's sources are keyed from the lock's text before any work (rule 65):
+`SourceId::key()`, BLAKE3 under a versioned domain of (name, version, the `.crate`'s SHA-256) for a
+registry package, of the 40-hex commit for git. Never a path, a host, a time, a folder name, or the
+place the bytes came from. A path dependency is not fetched: its files are the checkout's, keyed by
+text like any member. A package the lock cannot pin (no checksum, another registry, non-https git)
+is named by `Skip` and stops the command with that name (rule 3).
+
+**Where bytes come from, cheapest first.** Each place is tried in this order; every byte is checked
+against the key before it is trusted, and a unit no place gives fails naming every place tried
+(`local::Tried`), never skipped and never handed to another tool:
+1. The machine's sources store, `<home>/.blaze/v2/sources/<64 hex key>`: one record a package
+   (`BLZFPK03`), written once, verified once a boot (the machine store's boot rule), then mapped.
+2. Another tool's archive of the same bytes: cargo's `<cargo home>/registry/cache/<crates.io
+   folder>/<name>-<version>.crate`. Its SHA-256 is compared with the lock's before one byte is
+   inflated, then it is made into the same record at the same key as step 3 would make. Cargo's
+   unpacked `registry/src` is never read: no digest covers it. Git: cargo's bare repositories may
+   be read the same way later, bound to the pinned commit by walking its tree (piece 14).
+3. The registry over HTTPS: `static.crates.io/crates/<name>/<name>-<version>.crate`. The sparse
+   index is not needed: the lock already pins name, version and digest, and the download URL is a
+   fixed template. Git: protocol v2 `fetch` of the one commit at depth 1.
+A path package is read from the checkout. Nothing is copied or unpacked into a folder tree: a file
+of a dependency is a slice of its mapped record, so a thousand packages cost a thousand mappings
+and no inodes per project. A second checkout or worktree finds every record by key and writes none.
+
+**Writes.** Two commands may make one key at once: each writes a temporary name and renames whole
+bytes onto the key (equal bytes, rule 25). A record's presence under its key is the fact: no other
+record vouches for it, so a deleted file is made again, never a wedge.
+**Per-package records.** Later stages write, per package, an outline, names (`CrateScope`), items,
+checked signatures and bodies, keyed by the package's source key plus features, cfg, target and
+the toolchain (rule 21). A registry package's records are public (target.md "Namespaces"): they go
+to `v2/shared` and CI seals them into the bucket; anyone reads them without a login; a fetched
+record is checked against its signed statement, its digest and the size limits before it is mapped
+(remote-read.md "Trust"). A package whose records all arrive this way needs no source bytes at all
+(deferred, as Buck2 defers materializing): sources are fetched only when a task asks for a file.
+Private code (members, path, git, private registries) never leaves `v2/own` or the checkout.
+
+**`blaze check` on three machines.** Never seen the package: the graph task wants each level's
+packages at once; each is adopted from cargo's archive or fetched, overlapping up to the in-flight
+limit. Seen: every key is a mapped record; when the graph record stands, no source record is even
+opened. Offline: the units no place holds fail with the typed finding naming the package and each
+place tried; packages that were held are checked; the next command tries again.
+
+**Build scripts and proc macros of dependencies** run sandboxed and are records keyed like their
+inputs: build-scripts.md ("Native scripts (D65)") and proc-macros.md own them.
+
+**Cost and floors.** First fetch of tempo's ~1,170 crates: 187.5 MiB down. Floor: (3 + D) round
+trips (name lookup, connection, TLS, then one per level of the graph, D about 15 to 20) plus the
+archives' bytes over the link; the bytes dominate (15.5 s at the measured 12.1 MiB/s, 2 s at
+100 MB/s). Multiplexing on one connection (HTTP/2 or 3, 100 streams) removes per-request waits:
+1,000 small requests at 16 in flight and 20 ms cost about 1.25 s of waiting, at 100 streams 0.2 s.
+Everything on the machine: one open and map a package, about 10 us: 10 ms on one thread, 2 ms on 8
+cores for a cold graph; 0 ms when the graph record stands. Today 28.9 ms for 1,173 records and
+every `Cargo.toml` on one thread (ratio about 3). Adopting cargo's archives: one SHA-256 and inflate
+a package, once a machine.
+
+**Rules.** Keys from text (65); home, cargo home, roots and clock passed in (75); places in a fixed
+order, each verified, every miss named (3, 19); equal bytes (25); private code stays (Namespaces).
+
+**The best systems, and blaze against them.**
+- cargo: no index needed, no unpacked copy; compiled results shared across projects (not `target/`).
+- pnpm: one copy a machine, matched; no link farm, so a project costs no inodes and no link step.
+- uv: warm installs in milliseconds and parallel streaming unpack, matched; the lock resolves.
+- Nix: signed statements over keys from text, matched; finer grain: per item, not per package.
+- Bazel's repository cache: sha256-keyed, matched; the archive is mapped, never extracted.
+- Buck2's deferred materialization: matched; sources fetched only when a task reads a file.
+
+### Gap (from search, 2026-11-16, tree /Volumes/Projects/blaze-fresh-1115)
+
+| Needed | Today, with evidence | Missing | Reached by |
+|---|---|---|---|
+| Key from the lock | plan.rs `SourceId::key`, `Unit::key` | nothing | the command |
+| Machine sources store | fetch.rs `SOURCES` = `.blaze/v2/sources` under the checkout; graph.rs `Mapped`, names.rs `Folder` read it there; store.rs `Sharing` keeps `Fetch` records in the checkout | the home's `v2/sources`; every worktree refetches | the command (checkout form) |
+| Another tool's archive | none; blaze-unit-graph sources.rs says "Nothing is read from cargo's caches" | the driver step; `blaze_fetch::local` written 2026-11-16, never compiled | only a test |
+| Registry over HTTPS | fetch.rs `net::Net` on blaze-http (HTTP/1.1 pool), `Machine::wanting`, `want_ahead` per level | multiplexing (HTTP/2 or 3) | the command (feature `fetch`) |
+| Verified once a boot | fetch.rs `held_record` reads and BLAKE3s the whole record on every `Fetch` run; graph.rs and names.rs use `open_source_put`, trusting the checkout's `Fetch` record | a boot record for sources; a proof type | the command |
+| Racing writers | fetch.md: temp name and rename, its DST "not built" | the DST with a planted early rename | nothing |
+| No vouching record | a standing `Fetch` record with its file deleted: graph.rs fails "the next command asks again", but `Fetch` does not rerun (from reading, untested) | presence by key | the command |
+| Records read in place | names.rs `Reader::read` reads each record whole into a frame; `.ok()?` turns an IO error into absence | map; typed IO error | the command |
+| Many members | names.rs `world`: `PathPackages` when more than one path package is reached (blaze's own workspace) | not this part's; blocks blaze's checkout | the command |
+| Offline error | `CANNOT_FETCH` (13) without `fetch`; with it, the machine's `Why` | every place tried (`local::Tried`) | the command |
+| Records from the shared cache | `--origin <folder> --origin-key` (main.rs), `v2/shared` public records; keys hold `Tool` = the binary's build id (home.rs `tool`) | a release identity in public keys; HTTP origin (remote-read.md "Next" 1); a bundle a lock (blaze-global bundle.rs) | the command (folder origin only) |
+| Deferred sources | every reached package is fetched before the graph goes on | fetch only on a record miss | nothing |
+| Memory floor | whole answer bodies in the heap (85 to 117 MiB peak; floor about 12 MiB) | body to a scratch file | the command |
+| Git from another tool | none | cargo's git db read by the pinned commit's tree | nothing |
+| Harness stores | tempo_front's `<fetch-store>` argument: a store filled by `examples/fetch.rs` by hand | the command's store is the same records, so it goes | only an example |
+
+### Pieces, in build order
+
+1. **Adopt a local archive** (blaze-fetch `src/local.rs`, written): `crates_io_folder`,
+   `archive_name`, `adopt`/`adopt_in` (SHA-256 then `crate_record_in`), `Try`, `Miss`, `Tried`.
+   Test: another valid archive under the lock's name is refused; the adopted record equals the
+   network path's. Depends on nothing. With piece 2 it is the shortest route for blaze's own
+   checkout: all 297 registry archives of its lock are in cargo's cache on this Mac (counted).
+2. **The command adopts** (blaze-cli fetch.rs, driver lane): `FetchEnv` gains the cargo home
+   (`CARGO_HOME`, else `<home>/.cargo`, read in main.rs); where `held_record` is false (no
+   `fetch`) and in `net::Net::lookup` (with it), list `registry/cache` through `Fs::home`, keep
+   `crates_io_folder`, sorted, read `<folder>/<archive_name>`, `adopt`, write the record as `put`
+   does, answer held. Test: a temp cargo home with one `.crate`, a lock pinning it, no network:
+   the graph holds the package and no finding 13; a tampered archive gives the finding with tries.
+3. **Sources in the home** (fetch.rs `record_path`, graph.rs `run`'s folder, names.rs `Folder`;
+   store.rs `Place` of a `Fetch` record to `Own`): `<home>/.blaze/v2/sources`. Test (worktree
+   tests): a second worktree fetches and adopts nothing. Same lane as 2, after it.
+4. **Racing writers, proven** (the publish of piece 3): unique temporary name, whole bytes, rename
+   onto the key; a simulation of two commands, a crash mid-write; oracle: no reader maps a record
+   that fails its digest, none is lost; planted bug: rename before the bytes are whole. Parallel.
+5. **Verified once a boot**: a `boot` file beside the sources (the machine store's form), a proof
+   type that `held_record`'s BLAKE3 makes; test: a second command in one boot hashes 0 bytes;
+   planted: the proof made without the check. After 3.
+6. **Presence by key**: the graph task's failed map reruns that unit's `Fetch` instead of failing
+   the command. Test: delete a source file between two commands; the second answers. After 3.
+7. **The machine's own local step** (blaze-fetch `fetch.rs`, `drive.rs`, `FetchIo::local`): the
+   machine asks for a crate's local archive before HTTP, so 2's glue in `lookup` goes. Test: the
+   simulation with a cargo cache, some archives tampered; oracle: none adopted, a held one asks no
+   HTTP; planted: adoption before the checksum. After 2.
+8. **The offline finding**: finding 14 `source-not-on-machine` (blaze-report words.rs) with
+   `Tried` and the network's outcome. After 2.
+9. **Names maps records** (names.rs `Reader`, `Folder`): `Mapping` as graph.rs does; IO errors
+   typed. Parallel.
+10. **Bodies to scratch files** (fetch.md open item 2): peak from 93 to about 12 MiB. Parallel.
+11. **Multiplexed client** for static.crates.io (blaze-http's h3, or HTTP/2), proven on the
+    simulated origin only. Parallel; after the bandwidth floor is met.
+12. **Public keys by release identity**, then a bundle a lock and the HTTP origin (store lane):
+    a CI record is this binary's record. Needs a decision. Parallel.
+13. **Deferred sources**: `Fetch` wanted only on a record miss. After 6 and 12.
+14. **Git from cargo's bare repositories**, bound to the pinned commit's tree. After 7.

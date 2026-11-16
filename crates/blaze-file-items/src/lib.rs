@@ -185,6 +185,10 @@ pub use header::{HeaderError, ImplHeader, impl_header};
 pub use walk::Bodies;
 pub use parser::SyntaxKind;
 
+/// A removal experiment's switch (crate::skeleton::read_body), 0 in every real run.
+#[doc(hidden)]
+pub static REMOVAL: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+
 /// The domain of [`Item::hash`]: the Merkle step over an item's signature digest, the rest of
 /// its own bytes and its children's digests (crate docs, "Identity").
 pub const ITEM_DOMAIN: &str = "blaze v2 file item merkle 2";

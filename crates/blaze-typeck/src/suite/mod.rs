@@ -35,6 +35,7 @@ use crate::{Outcome, check_with};
 use crate::fixture::{Bb, Fx, show};
 
 mod anon_params;
+mod assoc_item_bounds;
 mod async_fmt;
 mod closure_identity;
 mod closures;

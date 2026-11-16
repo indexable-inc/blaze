@@ -9,24 +9,33 @@
 //! kind u8, namespace u8, two zero bytes, name length u32, module key, answer digest, name
 //! bytes), sorted by (kind, module, namespace, name, answer), no repeats. Its bytes are a
 //! function of the questions asked, never of the order a worker asked them in.
+//!
+//! An answer's digest (version 2) is canonical: [`ANSWER`]'s hasher fed the answer's fields in
+//! declaration order, a tag byte first for every choice (the question's kind, each enum's
+//! variant, `Option`'s none or some), each string length-prefixed, each key its 32 bytes, and a
+//! crate's `reaches` as a sorted set. Never the answer's `Debug` text (version 1): how a type
+//! prints is no stable form, and the text cost a buffer per question.
 
-use core::fmt::{self, Debug};
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
 use blaze_hash::HashMap;
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
+use blaze_ids::{Domain, Hasher};
 use blaze_own::{AVec, Alloc, Box};
-use blaze_surface::{Binding, Namespace};
+use blaze_surface::{Binding, BindingState, Def, DefKind, Edition, Namespace, Visibility};
 
 use crate::crate_scope::{Dep, DepScope};
-use crate::read::Read;
+use crate::read::{NameAnswer, Read};
 use crate::resolve::Built;
-use crate::task::{Held, MacroSrc, Own, Records, answer};
+use crate::task::{Held, MacroBody, MacroSrc, Own, Records, answer};
 
 const MAGIC: [u8; 4] = *b"BZRL";
-const VERSION: u32 = 1;
-const ANSWER_DOMAIN: &str = "blaze-scope question answer 1";
+/// 2: answers digested canonically ([`ANSWER`]), no longer from `Debug` text; a version 1
+/// record is refused as [`ReadListError::NotThisRecord`] and its solve is redone.
+const VERSION: u32 = 2;
+/// The domain every answer digest is hashed in; its context key is derived once.
+static ANSWER: Domain = Domain::new("blaze-scope question answer 2");
 
 /// What a question asks of another crate's records.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -66,12 +75,14 @@ pub(crate) struct Question<'a> {
 impl<'a> Question<'a> {
     /// A `Read` the fill asked and what it was answered; `None` for a read that is no question
     /// of another crate's record (a derive's helpers are asked as [`Kind::Macro`]).
-    pub(crate) fn of_read(read: Read<&'a str>, own: &Own<'_, &'a str>, alloc: Alloc<'_>) -> Option<Question<'a>> {
+    /// `_alloc` is unused since answers are digested without a buffer; it goes with its
+    /// callers' next batch.
+    pub(crate) fn of_read(read: Read<&'a str>, own: &Own<'_, &'a str>, _alloc: Alloc<'_>) -> Option<Question<'a>> {
         #[cfg(test)]
         if plant::forgets(read, own) {
             return None;
         }
-        let answer = own_digest(own, alloc)?;
+        let answer = own_digest(own)?;
         let (kind, module, ns, name) = match read {
             Read::Name { module, ns, name } => (Kind::Name, module, ns.byte(), name),
             Read::Globs { module } => (Kind::Globs, module, 0, ""),
@@ -82,16 +93,18 @@ impl<'a> Question<'a> {
         Some(Question { kind, module, ns, name, answer })
     }
 
-    pub(crate) fn macro_src(key: ItemKey, src: Option<MacroSrc<'_>>, alloc: Alloc<'_>) -> Question<'a> {
-        Question { kind: Kind::Macro, module: key, ns: 0, name: "", answer: debug_digest(&src, alloc) }
+    /// `_alloc` as in [`Question::of_read`].
+    pub(crate) fn macro_src(key: ItemKey, src: Option<MacroSrc<'_>>, _alloc: Alloc<'_>) -> Question<'a> {
+        Question { kind: Kind::Macro, module: key, ns: 0, name: "", answer: macro_digest(src) }
     }
 
-    pub(crate) fn lookup(module: ItemKey, ns: Namespace, name: &'a str, found: Option<Binding>, alloc: Alloc<'_>) -> Question<'a> {
-        Question { kind: Kind::Lookup, module, ns: ns.byte(), name, answer: debug_digest(&found, alloc) }
+    /// `_alloc` as in [`Question::of_read`].
+    pub(crate) fn lookup(module: ItemKey, ns: Namespace, name: &'a str, found: Option<Binding>, _alloc: Alloc<'_>) -> Question<'a> {
+        Question { kind: Kind::Lookup, module, ns: ns.byte(), name, answer: lookup_digest(found) }
     }
 
     pub(crate) fn shadow(module: ItemKey, ns: Namespace, name: &'a str, may: bool) -> Question<'a> {
-        Question { kind: Kind::Shadow, module, ns: ns.byte(), name, answer: ContentId::of(ANSWER_DOMAIN, &[u8::from(may)]) }
+        Question { kind: Kind::Shadow, module, ns: ns.byte(), name, answer: shadow_digest(may) }
     }
 
     pub(crate) fn krate(dep: Dep<'_>, alloc: Alloc<'_>) -> Question<'a> {
@@ -190,34 +203,164 @@ impl<'a> Asked<'a> {
     }
 }
 
-/// A byte sink for `Debug` text: the answer of a question is digested from it (every field of
-/// a derived `Debug`, in declaration order; keys print as their bytes, no address).
-struct Sink<'b>(AVec<'b, u8>);
+// ---------------------------------------------------------------------------------------------
+// Answer digests: each answer's fields fed to [`ANSWER`]'s hasher in declaration order, a tag
+// byte before every choice, strings length-prefixed, keys as their 32 bytes. Every digest
+// starts with its question's kind byte. No buffer: nothing is allocated per question.
 
-impl fmt::Write for Sink<'_> {
-    fn write_str(&mut self, s: &str) -> fmt::Result {
-        self.0.extend_from_slice(s.as_bytes());
-        Ok(())
+/// A hasher in [`ANSWER`] with the question's kind byte fed.
+fn answer_hasher(kind: Kind) -> Hasher {
+    let mut h = Hasher::of(&ANSWER);
+    h.update(&[kind as u8]);
+    h
+}
+
+/// A binding's target: its key, then its kind's tag (a macro's shapes after its tag).
+fn feed_def(h: &mut Hasher, def: Def) {
+    h.id(&def.key.0);
+    match def.kind {
+        DefKind::Module => h.update(&[0]),
+        DefKind::Enum => h.update(&[1]),
+        DefKind::Trait => h.update(&[2]),
+        DefKind::Macro(shapes) => h.update(&[3, shapes.byte()]),
+        DefKind::Other => h.update(&[4]),
+    };
+}
+
+/// A visibility: its tag, then the crate or module it names.
+fn feed_vis(h: &mut Hasher, vis: Visibility) {
+    match vis {
+        Visibility::Public => h.update(&[0]),
+        Visibility::Crate(krate) => h.update(&[1]).id(&krate.0),
+        Visibility::Restricted(module) => h.update(&[2]).id(&module.0),
+    };
+}
+
+/// A binding's state: its tag, then an ambiguity's kind.
+fn feed_state(h: &mut Hasher, state: BindingState) {
+    match state {
+        BindingState::Determined => h.update(&[0]),
+        BindingState::Ambiguous(kind) => h.update(&[1, kind.byte()]),
+    };
+}
+
+/// The digest of a [`Kind::Name`] answer: none, or the binding's def, vis, state and origin.
+pub(crate) fn name_digest(answer: &NameAnswer) -> ContentId {
+    let mut h = answer_hasher(Kind::Name);
+    match *answer {
+        NameAnswer::Absent => {
+            h.update(&[0]);
+        }
+        NameAnswer::Found { def, vis, state, origin } => {
+            h.update(&[1]);
+            feed_def(&mut h, def);
+            feed_vis(&mut h, vis);
+            feed_state(&mut h, state);
+            h.update(&[origin.byte()]);
+        }
     }
+    h.finish()
 }
 
-fn debug_digest(value: &dyn Debug, alloc: Alloc<'_>) -> ContentId {
-    let mut sink = Sink(AVec::new_in(alloc));
-    fmt::write(&mut sink, format_args!("{value:?}")).unwrap_or_else(|e| panic!("a Debug answer did not format: {e}"));
-    ContentId::of(ANSWER_DOMAIN, &sink.0)
+/// The digest of a [`Kind::Lookup`] answer: none, or every field of the binding found.
+pub(crate) fn lookup_digest(found: Option<Binding>) -> ContentId {
+    let mut h = answer_hasher(Kind::Lookup);
+    match found {
+        None => {
+            h.update(&[0]);
+        }
+        Some(Binding { def, vis, origin, expansion, state }) => {
+            h.update(&[1]);
+            feed_def(&mut h, def);
+            feed_vis(&mut h, vis);
+            h.update(&[origin.byte()]).update(&expansion.to_le_bytes());
+            feed_state(&mut h, state);
+        }
+    }
+    h.finish()
 }
 
-fn own_digest<N: Copy + Debug>(own: &Own<'_, N>, alloc: Alloc<'_>) -> Option<ContentId> {
+/// The digest of a [`Kind::Macro`] answer: none, or the macro's name, body (its variant's tag,
+/// then its fields), module, and its `export` and `local_inner` flags.
+pub(crate) fn macro_digest(src: Option<MacroSrc<'_>>) -> ContentId {
+    let mut h = answer_hasher(Kind::Macro);
+    match src {
+        None => {
+            h.update(&[0]);
+        }
+        Some(MacroSrc { name, body, module, export, local_inner }) => {
+            h.update(&[1]).part(name.as_bytes());
+            match body {
+                MacroBody::Rules(text) => h.update(&[0]).part(text.as_bytes()),
+                MacroBody::Macro2 { params, body } => h.update(&[1]).opt_part(params).part(body.as_bytes()),
+                MacroBody::BuiltinFn(name) => h.update(&[2]).part(name.as_bytes()),
+                MacroBody::BuiltinOther(shape) => h.update(&[3, shape.byte()]),
+                MacroBody::Proc { kind, helpers } => h.update(&[4, kind.byte()]).part(helpers.as_bytes()),
+            };
+            h.id(&module.0).update(&[u8::from(export), u8::from(local_inner)]);
+        }
+    }
+    h.finish()
+}
+
+/// The digest of a [`Kind::Shadow`] answer.
+pub(crate) fn shadow_digest(may: bool) -> ContentId {
+    let mut h = answer_hasher(Kind::Shadow);
+    h.update(&[u8::from(may)]);
+    h.finish()
+}
+
+/// A handed crate's facts, what a [`Kind::Crate`] question is answered.
+#[derive(Clone, Copy)]
+pub(crate) struct CrateFacts<'a> {
+    pub(crate) key: CrateItemKey,
+    pub(crate) root: ItemKey,
+    pub(crate) name: &'a str,
+    pub(crate) edition: Edition,
+    pub(crate) proc_key: Option<CrateItemKey>,
+    /// A set: digested sorted and once each, whatever order it is held in.
+    pub(crate) reaches: &'a [CrateItemKey],
+}
+
+/// The digest of a [`Kind::Crate`] answer: key, root, name, edition, proc key, then `reaches`
+/// as a sorted set (count, keys). A record holds `reaches` sorted, so `alloc` is used only for
+/// a list held in another order.
+pub(crate) fn facts_digest(facts: CrateFacts<'_>, alloc: Alloc<'_>) -> ContentId {
+    let CrateFacts { key, root, name, edition, proc_key, reaches } = facts;
+    let mut h = answer_hasher(Kind::Crate);
+    h.id(&key.0).id(&root.0).part(name.as_bytes()).update(&[edition.byte()]);
+    match proc_key {
+        None => h.update(&[0]),
+        Some(k) => h.update(&[1]).id(&k.0),
+    };
+    let feed = |h: &mut Hasher, keys: &[CrateItemKey]| {
+        h.update(&count(keys.len()).to_le_bytes());
+        for k in keys {
+            h.id(&k.0);
+        }
+    };
+    if reaches.windows(2).all(|w| w[0] < w[1]) {
+        feed(&mut h, reaches);
+    } else {
+        let mut set = AVec::from_slice_in(reaches, alloc);
+        set.sort_unstable();
+        set.dedup();
+        feed(&mut h, set.as_slice());
+    }
+    h.finish()
+}
+
+fn own_digest<N>(own: &Own<'_, N>) -> Option<ContentId> {
     match own {
-        Own::Name(a) => Some(debug_digest(a, alloc)),
+        Own::Name(a) => Some(name_digest(a)),
         Own::Globs { digest, .. } | Own::Textual(_, digest) | Own::Helpers(digest) => Some(*digest),
         Own::InProgress(_) => None,
     }
 }
 
 fn crate_digest(dep: Dep<'_>, alloc: Alloc<'_>) -> ContentId {
-    let facts = (dep.key(), dep.root(), dep.name(), dep.edition(), dep.proc_key(), dep.reaches());
-    debug_digest(&facts, alloc)
+    let facts = CrateFacts { key: dep.key(), root: dep.root(), name: dep.name(), edition: dep.edition(), proc_key: dep.proc_key(), reaches: dep.reaches() };
+    facts_digest(facts, alloc)
 }
 
 /// The read list record of a solve of `here`: `handed`, each crate whose exports record it was
@@ -353,10 +496,10 @@ pub fn check<'a>(bytes: &'a [u8], now: &dyn Fn(CrateItemKey) -> Option<Option<No
         }
         let ns = || Namespace::from_byte(ns_byte).ok_or(ReadListError::BadByte { at, what: "a byte that is no namespace" });
         let answer = match kind {
-            Kind::Name => own_digest(&check.answer(Read::Name { module, ns: ns()?, name }, here), alloc),
-            Kind::Globs => own_digest(&check.answer(Read::Globs { module }, here), alloc),
-            Kind::TextualEntry => own_digest(&check.answer(Read::TextualEntry { module }, here), alloc),
-            Kind::TextualOut => own_digest(&check.answer(Read::TextualOut { module }, here), alloc),
+            Kind::Name => own_digest(&check.answer(Read::Name { module, ns: ns()?, name }, here)),
+            Kind::Globs => own_digest(&check.answer(Read::Globs { module }, here)),
+            Kind::TextualEntry => own_digest(&check.answer(Read::TextualEntry { module }, here)),
+            Kind::TextualOut => own_digest(&check.answer(Read::TextualOut { module }, here)),
             Kind::Macro => Some(Question::macro_src(module, built.of(module).and_then(|d| d.macro_of(module)), alloc).answer),
             Kind::Lookup => Some(Question::lookup(module, ns()?, name, built.lookup(module, ns()?, name, alloc), alloc).answer),
             Kind::Shadow => Some(Question::shadow(module, ns()?, name, crate::crate_scope::dep_may_shadow(&built, module, ns()?, name)).answer),

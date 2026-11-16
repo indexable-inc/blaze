@@ -34,6 +34,8 @@ mod instance;
 mod intern;
 mod machine;
 mod portable;
+/// A kept check's read list asked again of today's world (read-addressed.md, "End state").
+mod replay;
 mod rules;
 mod ty;
 mod world;
@@ -52,6 +54,7 @@ mod toy;
 use blaze_own::Alloc;
 
 pub use infer::{InferCtx, InferSnapshot};
+pub use replay::{Replay, replay};
 pub use instance::{ResolveError, Resolved, normalize_projection, resolve_instance, select_impl};
 pub use asks::{Ask, AskLog, Clock, Order, QUESTION_KINDS, R_THRESHOLD, Restarts, Solve, Tally, entries_histogram, question_kind, restarts};
 pub use body::{

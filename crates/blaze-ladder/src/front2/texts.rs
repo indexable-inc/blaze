@@ -57,6 +57,13 @@ fn plain(p: &str) -> &str {
 }
 
 impl<'n> Texts<'n> {
+    /// A table with no row: what `Front2::from_records` starts with. A row holds its text's
+    /// outline, which no crate record holds (the file's own `FileItems` record does): filling
+    /// this on demand over records is owed with that record's reader.
+    pub fn empty() -> Texts<'n> {
+        Texts { rows: Vec::new_in(Global), by_at: HashMap::new_in(Global) }
+    }
+
     /// The table: `user` (the program's files, as the caller gave them) first, then every other
     /// file and expansion of every crate in crate order.
     pub fn new(names: &'n Names<'n>, user: &[SourceFile<'_>]) -> Result<Texts<'n>, TextsError> {

@@ -24,6 +24,7 @@ use super::buckets::{Buckets, Unfilled, inherent_home, trait_home};
 use super::heads::{HeadError, Store, Want};
 use super::index::Index;
 use super::keys::{Keys, Origin, checker_of};
+use super::source::NamesSource;
 use super::spell::Spelling;
 use super::consts::{ConstFail, Consts, int_of};
 use super::types::{SelfTy, Why};
@@ -102,9 +103,10 @@ impl core::fmt::Display for CheckFail {
     }
 }
 
-/// The program's records the loop reads and fills.
-pub struct Records<'r, 'n> {
-    pub names: &'n Names<'n>,
+/// The program's records the loop reads and fills, its names from the source `S`
+/// ([`NamesSource`]: the solved names by default, or each crate's records).
+pub struct Records<'r, 'n, S = &'n Names<'n>> {
+    pub names: S,
     pub keys: &'r mut Keys,
     pub index: &'r Index<'n>,
     pub store: &'r mut Store<'n>,
@@ -128,14 +130,14 @@ pub enum BuildOrder {
 /// Checks `body` (written at `scope`, its types in its own table, `Body::tys`), filling the
 /// records it needs. The records are answered from `r.store`'s table, which holds no body's
 /// type: a body's check reads the same records whatever was checked before it.
-pub fn check_body(r: &mut Records<'_, '_>, body: &Body<'_>, scope: &BodyScope<'_>) -> Result<tc::Checked<'static>, CheckFail> {
+pub fn check_body<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,body: &Body<'_>, scope: &BodyScope<'_>) -> Result<tc::Checked<'static>, CheckFail> {
     check_body_counted(r, body, scope, None)
 }
 
 /// `check_body` that adds each round's questions and costs into a tally (blaze-typeck asks.rs
 /// `Tally`), reading the caller's clock: a measurement, never an input to the outcome.
-pub fn check_body_counted(
-    r: &mut Records<'_, '_>,
+pub fn check_body_counted<'n, S: NamesSource<'n>>(
+    r: &mut Records<'_, 'n, S>,
     body: &Body<'_>,
     scope: &BodyScope<'_>,
     mut count: Option<(&mut tc::Tally, &dyn tc::Clock)>,
@@ -222,7 +224,7 @@ pub fn check_body_counted(
 /// the round was made: the next run asks it for real if it matters, and meets the real
 /// refusal then. A round that made nothing new is the real refusal: the least one by its
 /// `Debug` text, as `make_all` names it, so the error does not depend on the order.
-fn make_round(r: &mut Records<'_, '_>, fills: Vec<Fill, Global>, owner: ItemKey) -> Result<u64, CheckFail> {
+fn make_round<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fills: Vec<Fill, Global>, owner: ItemKey) -> Result<u64, CheckFail> {
     let mut made = 0u64;
     let mut refused: Option<(String, MakeFail)> = None;
     let mut dropped = 0u64;
@@ -245,8 +247,8 @@ fn make_round(r: &mut Records<'_, '_>, fills: Vec<Fill, Global>, owner: ItemKey)
 }
 
 /// An item's name for a finding: its written name, else its key.
-pub(crate) fn item_shown(r: &Records<'_, '_>, k: ItemKey) -> String {
-    match r.keys.library(k).and_then(|lib| r.names.item_text(lib)).and_then(|t| t.name) {
+pub(crate) fn item_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>,k: ItemKey) -> String {
+    match r.keys.library(k).and_then(|lib| r.names.name_of(lib)) {
         Some(n) => n.to_string(),
         None => format!("{k:?}"),
     }
@@ -254,7 +256,7 @@ pub(crate) fn item_shown(r: &Records<'_, '_>, k: ItemKey) -> String {
 
 /// `t` of `tys` as Rust spells it (`Result<Out, Missing>`), by a work list; a node with no
 /// spelling here is its `Debug`.
-fn ty_shown(r: &Records<'_, '_>, tys: tc::PTys<'_>, t: tc::PTy) -> String {
+fn ty_shown<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>,tys: tc::PTys<'_>, t: tc::PTy) -> String {
     enum Step {
         Ty(tc::PTy),
         Lit(&'static str),
@@ -323,7 +325,7 @@ fn ty_shown(r: &Records<'_, '_>, tys: tc::PTys<'_>, t: tc::PTy) -> String {
 
 /// What a diagnostic is about, printed: an unmet goal entire, the leaf where-clause first when
 /// the checker names one (`Error: From<Other>` because `Result<u8, Error>: FromResidual<..>`).
-fn diag_about(r: &Records<'_, '_>, tys: tc::PTys<'_>, d: &tc::Diag) -> Box<str> {
+fn diag_about<'n, S: NamesSource<'n>>(r: &Records<'_, 'n, S>,tys: tc::PTys<'_>, d: &tc::Diag) -> Box<str> {
     let ty = |t: Option<tc::PTy>| t.map(|t| ty_shown(r, tys, t));
     let s = match d.because {
         Some(tc::Because::Unmet { goal, leaf }) => {
@@ -352,7 +354,7 @@ fn diag_about(r: &Records<'_, '_>, tys: tc::PTys<'_>, d: &tc::Diag) -> Box<str> 
 }
 
 /// The world a body written at `scope` is checked in, over `r`'s records as they are now.
-pub(super) fn world_at<'w, 'n>(r: &'w Records<'_, 'n>, scope: &'w BodyScope<'w>) -> BodyWorld<'w, 'n> {
+pub(super) fn world_at<'w, 'n, S: NamesSource<'n>>(r: &'w Records<'_, 'n, S>, scope: &'w BodyScope<'w>) -> BodyWorld<'w, 'n, S> {
     BodyWorld {
         names: r.names,
         keys: &*r.keys,
@@ -389,7 +391,7 @@ pub enum Target {
 
 /// What the call of `item` at `args` (in `ground`, the calling body's checked types) runs, in
 /// the calling body's world `scope`; the fills the selection needs are made on the way.
-pub fn callee_target(r: &mut Records<'_, '_>, scope: &BodyScope<'_>, owner: ItemKey, item: ItemKey, args: tc::List, ground: &mut tc::PortableTys<'_>) -> Result<Target, CheckFail> {
+pub fn callee_target<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,scope: &BodyScope<'_>, owner: ItemKey, item: ItemKey, args: tc::List, ground: &mut tc::PortableTys<'_>) -> Result<Target, CheckFail> {
     if r.store.ctors.contains_key(&item) {
         return Ok(Target::Ctor(item));
     }
@@ -527,7 +529,7 @@ const MOST_CONSTS: u32 = 64;
 /// constant evaluated (`Records::consts`) and the fill made again. While a constant is being
 /// evaluated the evaluator is taken out of `r`, so one needed inside it is
 /// [`ConstFail::Nested`] naming it: never a nested evaluation.
-fn make(r: &mut Records<'_, '_>, fill: Fill) -> Result<(), MakeFail> {
+fn make<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fill: Fill) -> Result<(), MakeFail> {
     let mut asked = 0;
     loop {
         let c = match make_once(r, fill) {
@@ -545,7 +547,7 @@ fn make(r: &mut Records<'_, '_>, fill: Fill) -> Result<(), MakeFail> {
 /// Evaluates the `usize` constant `c` an array length names and files its value in
 /// `Maps::const_lens`. The evaluator is taken out of `r` meanwhile, so a length met inside
 /// that evaluation is [`ConstFail::Nested`]: never a nested evaluation.
-pub fn eval_len(r: &mut Records<'_, '_>, c: LibKey) -> Result<(), ConstFail> {
+pub fn eval_len<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,c: LibKey) -> Result<(), ConstFail> {
     let Some((consts, prepared)) = r.consts.take() else {
         return Err(ConstFail::Nested { item: checker_of(c) });
     };
@@ -602,7 +604,7 @@ pub fn eval_len(r: &mut Records<'_, '_>, c: LibKey) -> Result<(), ConstFail> {
 
 /// Makes every fill of a round, in the given order; a refusal named is that of the least fill
 /// (by its `Debug` text: `Shape` has no order), so the error does not depend on the order.
-pub(super) fn make_all(r: &mut Records<'_, '_>, fills: Vec<Fill, Global>, owner: ItemKey) -> Result<(), CheckFail> {
+pub(super) fn make_all<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fills: Vec<Fill, Global>, owner: ItemKey) -> Result<(), CheckFail> {
     let mut refused: Option<(String, MakeFail)> = None;
     for fill in fills {
         if let Err(e) = make(r, fill) {
@@ -621,7 +623,7 @@ pub(super) fn make_all(r: &mut Records<'_, '_>, fills: Vec<Fill, Global>, owner:
 /// Makes the answer to `ImplsOf(trait_, shape)` from the one impl index (the same buckets the
 /// checker's questions fill) and returns the impls it holds; `None` when a candidate's header
 /// refused: the question then stays a gap, so the back half's asking it refuses by name.
-pub fn answer_impls(r: &mut Records<'_, '_>, trait_: ItemKey, shape: tc::Shape) -> Option<Vec<ItemKey, Global>> {
+pub fn answer_impls<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,trait_: ItemKey, shape: tc::Shape) -> Option<Vec<ItemKey, Global>> {
     // Selection reads the trait's head too (`TraitDef`): made with its answer.
     if !r.store.trait_defs.contains_key(&trait_) {
         let want = super::fill::want_of_key(r.names, r.keys, trait_).ok()?;
@@ -639,13 +641,13 @@ pub fn answer_impls(r: &mut Records<'_, '_>, trait_: ItemKey, shape: tc::Shape) 
     Some(out)
 }
 
-fn make_once(r: &mut Records<'_, '_>, fill: Fill) -> Result<(), MakeFail> {
+fn make_once<'n, S: NamesSource<'n>>(r: &mut Records<'_, 'n, S>,fill: Fill) -> Result<(), MakeFail> {
     match fill {
         Fill::Store(want) => r.store.ensure(r.names, r.keys, want).map_err(MakeFail::Head),
         Fill::Impls(trait_, shape) => {
             // Only impls written where the orphan rules allow (`trait_home`) are candidates.
             let home = trait_home(r.names, r.keys, r.store, trait_, shape);
-            let b = r.buckets.get_or_insert_with(|| Buckets::new(r.names, r.index));
+            let b = buckets_for(r.buckets, r.names, r.index, home);
             let mut candidates = b.trait_candidates(trait_, shape, home);
             // A negative impl is a candidate of its trait's questions (`Buckets::answer`): it
             // decides an auto trait's structural rule, and the solver matches it to no positive
@@ -659,7 +661,7 @@ fn make_once(r: &mut Records<'_, '_>, fill: Fill) -> Result<(), MakeFail> {
         Fill::Inherent(shape) => {
             // Only impls written in the type's own crate (`inherent_home`) are candidates.
             let home = inherent_home(r.names, r.keys, shape);
-            let b = r.buckets.get_or_insert_with(|| Buckets::new(r.names, r.index));
+            let b = buckets_for(r.buckets, r.names, r.index, home);
             let candidates = b.inherent_candidates(shape, home);
             lower_heads(r.names, r.keys, r.store, b, candidates, r.order)?;
             b.answer_inherent(r.store, shape, home).map_err(MakeFail::Buckets)
@@ -667,8 +669,21 @@ fn make_once(r: &mut Records<'_, '_>, fill: Fill) -> Result<(), MakeFail> {
     }
 }
 
+/// The impl index a question at `home` reads. Over the solved names every impl is filed when it
+/// is first made (`Buckets::new`); over records none is (`Buckets::lazy`), and the crates
+/// `home` admits are filed here, once each, before the question (`Buckets::admit`: nothing over
+/// the solved names).
+fn buckets_for<'b, 'n, S: NamesSource<'n>>(buckets: &'b mut Option<Buckets>, names: S, index: &Index<'n>, home: super::buckets::Homes) -> &'b mut Buckets {
+    let b = buckets.get_or_insert_with(|| match names.solved() {
+        Some(solved) => Buckets::new(solved, index),
+        None => Buckets::lazy(names),
+    });
+    b.admit(names, home);
+    b
+}
+
 /// Lowers the headers of `candidates` the store does not hold yet, counting them.
-fn lower_heads<'n>(names: &'n Names<'n>, keys: &mut Keys, store: &mut Store<'n>, b: &mut Buckets, mut candidates: Vec<LibKey, Global>, order: BuildOrder) -> Result<(), MakeFail> {
+fn lower_heads<'n, S: NamesSource<'n>>(names: S, keys: &mut Keys, store: &mut Store<'n>, b: &mut Buckets, mut candidates: Vec<LibKey, Global>, order: BuildOrder) -> Result<(), MakeFail> {
     if order == BuildOrder::Reversed {
         candidates.reverse();
     }

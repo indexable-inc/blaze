@@ -39,6 +39,8 @@
 //! - [`verify`]: the structure every reader relies on, then types, flags and dominance.
 //! - [`print`] and [`parse`]: the text form, which round-trips byte for byte.
 //! - [`persist`]: the blaze-format record, the columns as one buffer read in place.
+//! - [`coroutine`]: the pass that splits a coroutine body, the one place `suspend` and
+//!   `cancelled` are taken.
 //!
 //! The crate is a sans-IO core: it reads no clock, file or thread.
 
@@ -48,6 +50,9 @@
 #![deny(blaze::sans_io_core)]
 
 pub mod builder;
+/// The coroutine pass (decision D73): a body with `suspend`s to its `poll`, its state's drop
+/// glue and the state's layout.
+pub mod coroutine;
 /// The reference evaluator backends are tested against: in this crate's tests, and for a
 /// backend's tests through the `eval` feature. Never in a build.
 #[cfg(any(test, feature = "eval"))]
@@ -73,8 +78,10 @@ pub use verify::{VerifyError, verify};
 /// The version of what LIR's bytes mean: its operations, their operands and flags, its types
 /// and tables. Part of the record's schema ([`persist::SCHEMA`]) and of every key of a LIR, so
 /// a change to any of them is a new version.
-pub const VERSION: u64 = 1;
+pub const VERSION: u64 = 2;
 
+#[cfg(test)]
+mod coroutine_tests;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]

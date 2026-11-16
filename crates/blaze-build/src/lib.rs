@@ -214,6 +214,7 @@ use blaze_lir::{Func, VerifyError};
 use blaze_typeck::{Adt, BodyView, Checked, Expr, ExprId, FmtTrait, FnSig, ItemKey, LangItem, List, Mutbl, PTy, PTys, PatId, PortableTys};
 
 pub use instance::{Instance, InstanceKey, ground, instance_key, instance_key_normalized};
+pub use walk::coroutine::{CoroutineFacts, CoroutineOf, StateShape, coroutine_facts, coroutine_of, coroutines_in, identity as coroutine_identity};
 
 /// The instance being built: its generic arguments, types of `ground`, the program's one table
 /// of ground types. Every type the build lays out is first carried into `ground` with each
@@ -291,6 +292,15 @@ pub trait Adts {
     /// call is refused with [`BuildError::NoLangFn`] naming `call`, `call_mut` or `call_once`.
     fn fn_trait_method(&self, which: FnTrait) -> Option<ItemKey> {
         let _ = which;
+        None
+    }
+
+    /// The trait method `Future::poll` (core's future/future.rs: `fn poll(self: Pin<&mut
+    /// Self>, cx: &mut Context<'_>) -> Poll<Self::Output>;`): an `.await` calls its instance at
+    /// `[the held future's type]`, and a coroutine's split `poll` function is that instance at
+    /// `[the coroutine]` (coroutine.rs; [`coroutine_of`] reads the identity from the type). With
+    /// no answer an `.await` is refused with [`BuildError::NoLangFn`] naming `poll`.
+    fn future_poll(&self) -> Option<ItemKey> {
         None
     }
 

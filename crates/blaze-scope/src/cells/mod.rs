@@ -22,7 +22,7 @@ use blaze_own::{ABTreeMap, ABTreeSet, AVec, Alloc};
 use blaze_surface::{DeclsBuilder, SurfaceError};
 
 use crate::facts::ScopeFacts;
-use crate::{AmbiguityKind, Def, DefKind, Edition, Namespace, Path, PathKind, Rename, Unresolved, UseForm, Visibility, WrittenVis};
+use crate::{AmbiguityKind, Def, DefKind, Edition, ExternTarget, Namespace, Path, PathKind, Rename, Unresolved, UseForm, Visibility, WrittenVis};
 
 mod deps;
 mod seam;
@@ -251,6 +251,14 @@ pub(crate) enum CellPlant {
     /// R6 broken by order: a definition an earlier expansion wrote beside a different outer
     /// binding wins over it (the answer then depends on which came first).
     InnerAfterWrite,
+    /// An `extern crate` item binds nothing in its module (Reference `items.extern-crate`).
+    ExternCrateBindsNothing,
+    /// R8 broken: a macro-written root `extern crate` adds no extern-prelude name.
+    R8AddsNothing,
+    /// R8 broken: a macro-written root `extern crate .. as n;` replaces a dependency's `n`.
+    R8MacroReplaces,
+    /// A `use` of an `extern crate` item is narrowed to the item's own visibility.
+    ExternReexportNarrowed,
 }
 
 type ModId = u32;
@@ -386,6 +394,9 @@ enum From {
 struct Outer<'a, N> {
     /// The extern prelude, sorted by name: each name to a dependency's root module (R8: final).
     externs: AVec<'a, (N, ItemKey)>,
+    /// The names macro-written root `extern crate` items added (R8), asked after `externs`: a
+    /// dependency's name is never replaced.
+    added: ABTreeMap<'a, N, ItemKey>,
     /// The standard prelude's module when it is one of this crate's (core's `#[prelude_import]`).
     local: Option<ModId>,
     /// A standard prelude of another crate: its own items and modules by name.
@@ -431,6 +442,18 @@ pub(crate) struct Cells<'a, N> {
     edition: Edition,
     /// The `#[macro_use]` prelude's crates' root modules, in order (their exported macros).
     macro_use: AVec<'a, ItemKey>,
+    /// Every dependency by name, sorted (the root record's): what an `extern crate` names.
+    dep_roots: AVec<'a, (N, ItemKey)>,
+    /// The names `extern crate` items bind, by module: a `use` re-exports one at the `use`'s own
+    /// visibility.
+    extern_items: ABTreeSet<'a, (ModId, N)>,
+    /// The `extern crate` items naming no dependency: the module and the name written.
+    pub(crate) bad_extern: AVec<'a, (ItemKey, N)>,
+    /// R8's errors: a macro-written root `extern crate .. as n;` whose `n` a dependency holds.
+    pub(crate) r8: AVec<'a, N>,
+    /// R6's watches for the extern prelude: a use whose first segment took a later outer scope's
+    /// binding while the root's calls could still add an extern-prelude name, by name.
+    extern_watches: ABTreeMap<'a, N, AVec<'a, (ItemId, Def)>>,
 }
 
 /// A read of a cell by an item: decided, or the item now waits on it.
@@ -487,7 +510,14 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             item_queue: ABTreeSet::new_in(alloc),
             expand_queue: ABTreeSet::new_in(alloc),
             extra: ABTreeSet::new_in(alloc),
-            outer: Outer { externs: AVec::new_in(alloc), local: None, foreign: ABTreeMap::new_in(alloc), foreign_open: false, macro_use: false },
+            outer: Outer {
+                externs: AVec::new_in(alloc),
+                added: ABTreeMap::new_in(alloc),
+                local: None,
+                foreign: ABTreeMap::new_in(alloc),
+                foreign_open: false,
+                macro_use: false,
+            },
             watches: ABTreeMap::new_in(alloc),
             written: ABTreeMap::new_in(alloc),
             r6: ABTreeSet::new_in(alloc),
@@ -496,7 +526,18 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             deps,
             edition: Edition::E2021,
             macro_use: AVec::new_in(alloc),
+            dep_roots: AVec::new_in(alloc),
+            extern_items: ABTreeSet::new_in(alloc),
+            bad_extern: AVec::new_in(alloc),
+            r8: AVec::new_in(alloc),
+            extern_watches: ABTreeMap::new_in(alloc),
         };
+        // The dependencies by name before any text is read: an `extern crate` of any module
+        // names one.
+        {
+            let r = facts.crate_root(info.krate).map_err(|error| CellError::Facts { module: root, error })?;
+            cells.dep_roots.extend(r.deps.iter().map(|d| (d.name, d.root)));
+        }
         let made = cells.make_modules(facts, &[root])?;
         cells.root = cells.by_key[&root];
         for &m in made.iter() {
@@ -653,6 +694,10 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             self.modules[child as usize].mod_line = Some((fid, c.pos));
             slots.push((c.pos, Slot::Mod(child, c.macro_use)));
         }
+        for ec in d.extern_crates.iter() {
+            let vis = self.vis_of(m, &ec.vis)?;
+            self.extern_crate(m, ec.target, ec.rename, vis, up.map(|_| fid))?;
+        }
         for r in d.macro_rules.iter() {
             let def = Def { key: r.def, kind: DefKind::Macro(r.shapes) };
             slots.push((r.pos, Slot::Rules(r.name, def)));
@@ -746,6 +791,70 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             self.stats.items += 1;
         }
         Ok(fid)
+    }
+
+    /// One `extern crate` item of `m` (Reference `items.extern-crate`: "The external crate is
+    /// then bound into the declaring scope as the identifier provided in the extern crate
+    /// declaration"; `as _` binds nothing; `extern crate self` binds only with `as name`).
+    /// `wrote`: the expansion fragment that wrote it. One a macro wrote at the crate root also
+    /// adds its name to the extern prelude (R8, Reference `names.preludes.extern`), never in
+    /// place of a dependency's: `.. as n;` beside a dependency's `n` is R8's error (rustc's
+    /// "macro-expanded `extern crate` items cannot shadow names passed with `--extern`"). The
+    /// root text's own are in the root record's extern prelude already.
+    fn extern_crate(&mut self, m: ModId, target: ExternTarget<N>, rename: Rename<N>, vis: Visibility, wrote: Option<FragId>) -> Result<(), CellError> {
+        let (root, written) = match target {
+            ExternTarget::Dep(name) => (self.dep_roots.binary_search_by(|d| d.0.cmp(&name)).ok().map(|k| self.dep_roots[k].1), Some(name)),
+            ExternTarget::SelfCrate => (Some(self.modules[self.root as usize].key), None),
+        };
+        let bound = match rename {
+            Rename::Same => written,
+            Rename::To(name) => Some(name),
+            Rename::Underscore => None,
+        };
+        let Some(root) = root else {
+            if let Some(name) = written {
+                self.bad_extern.push((self.modules[m as usize].key, name));
+            }
+            return Ok(());
+        };
+        let Some(name) = bound else { return Ok(()) };
+        if self.plant == CellPlant::ExternCrateBindsNothing {
+            return Ok(());
+        }
+        let def = Def::module(root);
+        self.add_explicit(m, Namespace::Types, name, (def, vis))?;
+        self.stats.names_declared += 1;
+        if self.modules[m as usize].explicit.get(&(Namespace::Types, name)).is_some_and(|e| e.0 == def) {
+            self.extern_items.insert((m, name));
+        }
+        let Some(f) = wrote else { return Ok(()) };
+        self.wrote(m, Namespace::Types, name, def, f);
+        if m != self.root || self.plant == CellPlant::R8AddsNothing {
+            return Ok(());
+        }
+        if self.outer.externs.binary_search_by(|e| e.0.cmp(&name)).is_ok() {
+            if matches!(rename, Rename::To(_)) {
+                self.r8.push(name);
+                if self.plant == CellPlant::R8MacroReplaces {
+                    self.outer.added.insert(name, root);
+                }
+            }
+            return Ok(());
+        }
+        if self.outer.added.contains_key(&name) {
+            return Ok(());
+        }
+        self.outer.added.insert(name, root);
+        // A use that went past the extern prelude for this name while the root could still add it.
+        if let Some(ws) = self.extern_watches.get(&name) {
+            let ws: AVec<'a, (ItemId, Def)> = AVec::from_slice_in(ws, self.alloc);
+            for &(u, od) in ws.iter() {
+                if od != def && !self.encloses(f, self.items[u as usize].at) {
+                    self.r6_error(u);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Expands call `i`, resolved: the driver expands it, the facts hand back what it writes,
@@ -1266,11 +1375,20 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     return Step::Done(Outcome::Outside);
                 }
                 let s = self.items[i as usize].segments[0];
-                let Ok(k) = self.outer.externs.binary_search_by(|e| e.0.cmp(&s)) else {
+                let named = match self.outer.externs.binary_search_by(|e| e.0.cmp(&s)) {
+                    Ok(k) => Some(self.outer.externs[k].1),
+                    Err(_) => self.outer.added.get(&s).copied(),
+                };
+                let Some(named) = named else {
+                    // A root call may still write `extern crate .. as s;` (R8).
+                    if let Some(j) = self.growing(self.root, i, guess) {
+                        self.items[i as usize].waits.push(Node::Item(j));
+                        return Step::Wait(Node::Item(j));
+                    }
                     return Step::Done(Outcome::Failed(Unresolved::NotFound));
                 };
                 first = 1;
-                match self.module_at(self.outer.externs[k].1) {
+                match self.module_at(named) {
                     Some(r) => r,
                     None => return Step::Done(Outcome::Outside),
                 }
@@ -1395,7 +1513,15 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 Read::Ready(Value::Ambiguous(..)) => amb = true,
                 Read::Ready(Value::Found(def, vis)) => {
                     found = true;
-                    out[ns_at(ns)] = Some((def, self.narrower(ivis, vis, m)));
+                    // A binding of an `extern crate` item is re-exported at the `use`'s own
+                    // visibility (rustc's `Resolver::import`: `pub use core as core_;` over the
+                    // private injected `extern crate core;` is a public re-export, a lint at most).
+                    let through = if lexical { m } else { cur };
+                    let of_extern = ns == Namespace::Types
+                        && self.plant != CellPlant::ExternReexportNarrowed
+                        && self.extern_items.contains(&(through, leaf))
+                        && self.modules[through as usize].explicit.get(&(ns, leaf)).is_some_and(|e| e.0 == def);
+                    out[ns_at(ns)] = Some((def, if of_extern { ivis } else { self.narrower(ivis, vis, m) }));
                 }
             }
         }
@@ -1483,9 +1609,20 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     /// (R9), not a path's first segment.
     fn outer_of(&mut self, ns: Namespace, name: N, guess: Option<&Guess<'a>>) -> Step<Option<Value>> {
         if ns == Namespace::Types
+            && self.plant == CellPlant::R8MacroReplaces
+            && let Some(&k) = self.outer.added.get(&name)
+        {
+            return Step::Done(Some(Value::Found(Def::module(k), Visibility::Public)));
+        }
+        if ns == Namespace::Types
             && let Ok(k) = self.outer.externs.binary_search_by(|e| e.0.cmp(&name))
         {
             return Step::Done(Some(Value::Found(Def::module(self.outer.externs[k].1), Visibility::Public)));
+        }
+        if ns == Namespace::Types
+            && let Some(&k) = self.outer.added.get(&name)
+        {
+            return Step::Done(Some(Value::Found(Def::module(k), Visibility::Public)));
         }
         if ns == Namespace::Macros && self.outer.macro_use {
             // The `#[macro_use]` prelude: the macros each such crate's root exports, the first
@@ -1604,6 +1741,16 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                             && self.growing(m, me, None).is_some()
                         {
                             self.watches.entry((m, ns, name)).or_insert_with(|| AVec::new_in(self.alloc)).push((me, od));
+                        }
+                        // The binding of a scope after the extern prelude, while a root call
+                        // may still write `extern crate .. as name;` (R6 for the extern prelude).
+                        if let Some(od) = outer_def
+                            && ns == Namespace::Types
+                            && self.outer.externs.binary_search_by(|e| e.0.cmp(&name)).is_err()
+                            && !self.outer.added.contains_key(&name)
+                            && self.growing(self.root, me, None).is_some()
+                        {
+                            self.extern_watches.entry(name).or_insert_with(|| AVec::new_in(self.alloc)).push((me, od));
                         }
                     }
                     Step::Done(o)

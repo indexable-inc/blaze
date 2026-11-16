@@ -104,4 +104,7 @@ pub enum Plant {
     /// A run's answer is given while the program it started is still running (stopped or
     /// not): the caller then steps the answered machine with the program's exit.
     AnswerWhileRunning,
+    /// `test` starts the package's program as `run` does: `main` is no test, and until tests
+    /// run on this path `test` is its check alone (decision D61 item 5).
+    TestStartsProgram,
 }

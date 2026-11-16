@@ -444,10 +444,19 @@ impl Plan<'_> {
                 let vendor = self.work.join("vendor");
                 let mut reads: Vec<&Path> = vec![vendor.as_path(), self.tool.sysroot.as_path(), native.clang.as_path(), native.sdk.as_path()];
                 reads.extend(own_source);
+                // The interim builder's own start-up config: the LibreSSL cargo links reads it
+                // when it starts and stops if refused. One file, read-only, no secret in it; the
+                // scripts cargo starts inherit the grant, as they inherit this whole profile (the
+                // interim builder is one sandbox; the real path confines each script alone).
+                let openssl_config = Path::new("/private/etc/ssl/openssl.cnf");
+                reads.push(openssl_config);
                 let shelf_bin = native.clang.join("bin");
                 let toolchain_bin = self.tool.sysroot.join("bin");
+                // rustc starts the tools under `lib/rustlib/<host>/bin` (`rust-objcopy`,
+                // `rust-lld`, `gcc-ld`): the pinned toolchain's, read-only.
+                let toolchain_tools = self.tool.sysroot.join("lib").join("rustlib");
                 let writes: [&Path; 4] = [ws.as_path(), target.as_path(), cargo_home.as_path(), tmp.as_path()];
-                let exec_under: [&Path; 3] = [toolchain_bin.as_path(), shelf_bin.as_path(), target.as_path()];
+                let exec_under: [&Path; 4] = [toolchain_bin.as_path(), toolchain_tools.as_path(), shelf_bin.as_path(), target.as_path()];
                 let builder = NativeBuilder { cargo: Path::new(&self.tool.cargo()).to_owned(), reads: &reads, writes: &writes, exec_under: &exec_under };
                 builder.profile().and_then(|profile| native_sandboxed(argv.clone(), profile))
             }
@@ -626,7 +635,9 @@ impl NativeBuilder<'_> {
         let program = real_text(&self.cargo)?;
         let all = |paths: &[&Path]| paths.iter().map(|p| real_text(p)).collect::<Result<Vec<String>, String>>();
         let (reads, writes, exec_under) = (all(self.reads)?, all(self.writes)?, all(self.exec_under)?);
-        let refs = |list: &[String]| list.iter().map(String::as_str).collect::<Vec<&str>>();
+        fn refs(list: &[String]) -> Vec<&str> {
+            list.iter().map(String::as_str).collect()
+        }
         let (reads, writes, exec_under) = (refs(&reads), refs(&writes), refs(&exec_under));
         let grant = blaze_build_script::native::Grant { program: &program, exec: &[], read: &reads, write: &writes };
         let text = blaze_build_script::native::seatbelt_with(&grant, &exec_under, blaze_own::Alloc::global()).map_err(|e| e.to_string())?;

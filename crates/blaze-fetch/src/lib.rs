@@ -34,6 +34,7 @@ pub mod correct;
 pub mod digest;
 pub mod drive;
 pub mod fetch;
+pub mod local;
 pub mod pack;
 pub mod plan;
 pub mod tree;

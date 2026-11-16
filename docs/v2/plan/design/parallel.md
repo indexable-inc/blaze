@@ -1,9 +1,118 @@
 ---
 status: plan
-summary: How the new compiler layer runs on 128 cores and on a typical Mac, piece by piece: the unit of work, what threads share, what is serial today and whether it must be, what limits scaling first, the state-of-the-art answer blaze takes or refuses, and a ranked change list naming crate and file, each with the span or counter that measures it. Includes the Amdahl arithmetic for a cold check of a million-line workspace, the Mac's QoS classes, five first experiments and what looks parallel but is not.
-date: 2026-11-15
+summary: How one command uses every core and holds little memory. The end state (architect, 2026-11-16) first: one work-stealing thread pool, item-grain tasks that never block (a missing record parks the task on a per-key claim and it is re-entered), no global interner, a frame per worker reset per item, records as the only thing that outlives a task, footprint as the one measure, a refused allocation as a typed failure of one job, determinism by sorting at record boundaries; then the gap against today's code and the pieces in build order. Below them, the 2026-11-15 audit of the older layer, kept as a record.
+date: 2026-11-16
 ---
 # Parallelism on 128 cores, and on a Mac
+
+## End state (architect, 2026-11-16)
+
+Workload: hundreds of thousands of tasks of 10 us to 10 ms (an outline, a crate's names, a
+signature, a body, an instance), some needing a record another task is writing. Measured today
+(tempo, one thread, port27/tempo-front-1116/tempo-front-9.txt): names of 1,026 crates 29.5 s,
+heap 2,309 MB live after them; 20,000 bodies of one crate 31.2 s (640 a second); peak 2,589 MB.
+
+1. **One scheduler: bstd's `Threads` pool; threads, work stealing, no fibers** (task/threads.rs
+   stands: a worker per core of every level, LIFO slot, Chase-Lev deque, injection per LLC
+   group). A parked fiber costs a stack per wait (hundreds of thousands of them) and carries
+   thread-bound values across it (rule 27). A task here is restartable: its key fixes the
+   questions it asks (rule 21), so re-entering costs its prefix, whose reads are hits.
+2. **Grain.** One item a task: a file's outline, a module's names (a glob cycle one `Group`), a
+   signature, a body, an instance. The driver hands out batches of about 1 ms of predicted cost
+   (learned per code identity; text length the first time), the items of one file; each item
+   keeps its own key, record and failure. Dispatch stays under 1%.
+3. **Waiting without a graph.** A record being written has a claim: a slot in a fixed lock-free
+   table by key (`blaze_core::claims`): empty, claimed by a task, or done with its address. A
+   task needing key k claims it and runs it inline if free (help first: no restart), reads it if
+   done, else parks: it joins k's waiter list, its frame is reset, and the publisher pushes the
+   waiters onto its own deque. Each slot knows its owner and each parked task its one slot;
+   before parking a task walks owner, owner's wait, ... (at most `live` steps): reaching itself
+   is a cycle, found at the edge that closes it (SeqCst: of two tasks closing one cycle at once,
+   one sees it). A module-scope cycle becomes one `Group`; any other is `Failure::MadeCycle`
+   naming the items. The watchdog names a claim past its kind's deadline (`Hung`, rule 18).
+4. **Sharing.** Only immutable bytes: records read in place (mapped, or a fresh record in its
+   writer's per-worker segment buffer, published by the claim's Release store) and the claim
+   table; counters per worker. **No global interner**: each task interns into a table in its
+   frame; a record carries its own canonical table in the first-use order its key fixes; a
+   reader re-interns what it touches (stands: typeck-store.md, "The type tables", option A,
+   "process-global" read as "per task"). No shard lock, no id counter, no stop-the-world.
+5. **Memory by lifetime.** A frame per worker, reset per item; reserve is address space
+   (`FRAME_RESERVE`, 4 GiB), committed pages are footprint. What outlives an item leaves as a
+   record, never a pointer into a frame. The command's frame holds the request's rows and what
+   the answer prints, nothing per task (a job names its file by index into the request's file
+   table). Footprint = workers x largest working set in flight + the rows; mapped records are
+   clean pages. Tempo keeps every crate's solved names live today (2.3 GB); here a crate's solve
+   leaves as its `CrateScope` record. Estimate: under 0.5 GB private on 8 workers, about 4 GB on 128.
+6. **One measure, one ceiling.** Footprint (phys_footprint; on Linux the cgroup's charge) per
+   task (its frame's peak) and per command; the kernel's limit is the ceiling; nothing admits,
+   throttles or narrows by memory (rule 50; withdraws scheduler.md's point 7).
+7. **A refused allocation fails one job, typed**: `FrameFull { task, frame, asked, peak,
+   reserve }`; the build goes on. Closed by a type: blaze-own's growing methods that cannot fail
+   (`push`, `reserve`, `with_capacity_in`) need `A: NeverRefuses` (global heap, `Kept`); a frame
+   is not one, so only `try_*` and `?`. Until the bound lands, the lint `blaze::infallible_on_frame`
+   denies them and the job seam reads the refusal from a slot the alloc hook fills, never a panic's text.
+8. **Determinism.** A record's bytes are a function of its key and answers. Merges sort at the
+   boundary: a unit's chunk and manifest by item key, findings by (item, ordinal), per-worker
+   store batches by key at commit, gap lists by key (not by text). A test compares bytes of 1
+   worker, 8, and reversed order.
+9. **Sized by one rule.** Workers = cores of every level (Mac perflevel0 + perflevel1 at
+   user-initiated; Linux the cgroup quota), started in proportion to queued work (a one-body edit
+   stays on the main thread); frames, the claim table (a power of two, 4 x the tasks in flight)
+   and queues scale with workers. Only that number differs between 8 cores and 128.
+10. **Expected** (estimates; wall = T1/P + Tinf). Tempo cold front end at today's item costs:
+   T1 about 130 s (names 29.5, heads 5, about 60,000 own bodies at 640 a second 94); Tinf, the
+   crate chain's names, assumed 3 s (1 s with a crate's modules in parallel): 8 cores about 17 s,
+   16 about 9 s, 128 about 2 to 4 s (today about 130 s). blaze's workspace (198 crates, 32.8 s
+   today, mostly the one-thread names run): about 5, 3 and 1 s. Floor (a body 14 us, the same
+   chain at its floor): tempo under 1 s on 16 cores, about 0.2 s on 128.
+
+| System | What blaze matches, or does better by design |
+|---|---|
+| rustc parallel front end | sharded interner locks, blocking query waits, a deadlock-detector thread; blaze: no shared interner, a cycle found at the edge that closes it |
+| Sorbet | frozen global state, files checked in parallel, merged on one thread; blaze merges by sorting per unit and runs names in parallel too |
+| Hack, Flow | a lock-free shared hash heap over forked workers; blaze's mapped records are that heap, with threads and no heap collector |
+| TypeScript's Go port | N checkers with their own types, some files checked twice; blaze: tables per task, each body once (its claim) |
+| Zig | InternPool shards per thread under one index; blaze needs no index: records are keyed by content |
+| mold | sizes first, then every thread writes at computed offsets; blaze writes segments and manifests so |
+| Tokio, Rayon | LIFO slot, bounded queues, stealing, helping joins: bstd's pool; here no task blocks a worker |
+| Fiber job systems (Go, Naughty Dog) | a stack parked per wait; blaze parks a restartable item with no stack |
+| Roc, Carbon | an arena per module or check unit, canonical exposed types; blaze the same at item grain |
+| salsa | blocking waits, cycles from an in-memory graph; blaze keeps no graph |
+
+### Gap (tree of 2026-11-16, by search)
+
+| End state needs | Today, with evidence | Missing | In `blaze check`? |
+|---|---|---|---|
+| Body checks on every core | One thread. `ProjectWorld::check(&mut self, ..)` (blaze-ladder front2/project.rs:187); `Records` holds `keys: &mut Keys`, `store: &mut Store`, `buckets: &mut Option<Buckets>`, `consts` (front2/check.rs:106); a body's missing heads are made in place into the one `Store` (`make_round`, check.rs:225); `Store::tys` is one `PortableTys` for every head (front2/heads.rs:401) over `Alloc`, a `NonNull` word, so `!Send` and `!Sync` (blaze-own alloc_ref.rs:169); `BodyWorld.fills`/`gaps` are `RefCell` (front2/world_items.rs:174) | a frozen, `Sync` view of published heads plus a per-task overlay; heads made by claim | No: the command's `BodyCheck` is a syntax pass (`pooled` -> `body_syntax`, blaze-cli work.rs:998) |
+| Names on every core | One thread. `resolve_crates_with` runs `for &id in wave` serially (blaze-scope resolve.rs:734); `Par::map<T, F: Fn(usize) -> T>` has no `Send`/`Sync` bound (blaze-scope task/fill.rs:27), so only `Serial` is sound, and the tests' threaded `Par` needs `unsafe impl Send for OnGlobal<T>` (tests/per_crate.rs:30); the command passes `&Serial` (blaze-cli names.rs:582) and runs `CrateScope` on the coordinator (`run_one`, work.rs:469) | `Par` bounded by `Send + Sync`; a crate per task; module rounds through a bstd scope | Yes, serially |
+| Names leave as records, not a live heap | Each crate's `CrateNames` is `Box::leak`ed into the global heap (resolve.rs, after `resolve_one`); the command's names world leaks a 4 GiB frame and a decoded graph (names.rs:338-345); tempo: 2,309 MB live after names | the solve in its task's frame, its record read back mapped | Partly (records written; the heap kept too) |
+| A command frame sized for the request, nothing per task in it | Root `cx.frame()` of `TASK_FRAME` = 64 MiB (blaze-std mem.rs:35; main.rs:280); `job_of` copies every pooled task's path into it (work.rs:668); failures' paths and words too (work.rs:386,390); `Settled` grows into it | reserve `FRAME_RESERVE`; jobs by file index; try_ growth | Yes: the 52-byte refusal on blaze's workspace |
+| A refusal is a typed failure | `blaze_own::error::fail` panics (blaze-own error.rs:49); the cli's hook makes std's refusals panics (work.rs:452-457); `pooled` reports `Why::Panicked { used, limit }` (work.rs:1009) | `FrameFull` typed; `A: NeverRefuses` on infallible growth; the lint | Yes, as a panic |
+| Tasks run on the pool | bstd `Threads` exists (work stealing, task/threads.rs); the command pools only `FileItems` and `BodyCheck` (`may_overlap`, work.rs:297); every other kind runs on the coordinator thread | every kind on the pool | Partly |
+| Waiting for a record in flight | The driver's `Need` re-enters a task once its wants are answered; bstd `Flight` scans under one lock and blocks the asker's thread, and a self-wait ends only at the deadline (blaze-std sync/flight.rs:1-25) | a lock-free claim table with waiter lists and the cycle walk | No |
+| No global heap per item | `check_body_counted` makes `InferCtx::new_in(Alloc::global())` and round vectors on `Global` each round (check.rs:142-150) | the task's frame through `check_body`'s `alloc` | No (not wired) |
+| Deterministic merges | `BuildOrder::Reversed` test exists (check.rs:119); the gap list is kept sorted by `format!("{g:?}")`, a format per comparison (check.rs:170-178) | sort by key | n/a |
+
+### Pieces, in build order (one writer each; A = can be written at the same time as the others marked A)
+
+1. **A. Command frame** (DRIVER runner 10, owns it; design sent): root frame reserve `FRAME_RESERVE`; `Job` names its file by index; try_ growth; `CliError` naming the frame. Test: a check of a few thousand generated files under a small command frame finishes; with the copy back it fails typed, not by panic.
+2. **A. `blaze_core::claims`** (this architect, written, NEVER COMPILED): the claim table, waiter lists, the cycle walk. Test: two-thread schedules (`world::threads::two`) with oracles, and three planted bugs caught.
+3. **A. Typed refusal at the job seam** (blaze-cli work.rs `pooled`, the hook; blaze-drive `Why::FrameFull`, additive): the hook writes the refused layout into the running job's slot; the seam reports it. Test: a job planted to over-ask its frame fails with `FrameFull` naming the bytes; the scope is not cancelled.
+4. **A. `Par` bounded** (NAMES runner 22; blaze-scope task/fill.rs and its four impls, one batch): `fn map<T: Send, F: Fn(usize) -> T + Sync>`; the test `Threads` loses `OnGlobal`. Test: per_crate's threaded run equals `Serial` and `Reversed` bytes.
+5. **A. Frame per body** (RECORDS SWITCH writer; front2 check.rs `check_body_counted`): `InferCtx` and round vectors in the caller's frame; gaps sorted by key. Test: a counting allocator sees zero global allocations per checked body.
+6. **A. `NeverRefuses`** (blaze-own, a new file; the lint in blaze-lints): the marker on `Global`, `Kept`, `Erased<Global>`; the lint on infallible growth over a frame. Test: lint UI cases (a frame `push` denied, `try_push` allowed, `Global` `push` allowed).
+7. **A. Footprint per task** (blaze-cli profile rows; blaze-core footprint.rs read once per batch): each task's frame peak and the process footprint at batch end into the profile. Test: a planted 8 MB task shows a peak at least 8 MB on its row.
+8. **Names, a crate per task** (NAMES runner 22; blaze-scope resolve.rs, blaze-cli names.rs), after 4: each crate of a wave a `may_overlap` task in its own frame, its `CrateNames` written as the record and read back mapped, the frame reset. Test: 4 workers equal 1 in bytes; live heap after the run is not the sum of crates (a planted keep-alive fails it).
+9. **Frozen heads and an overlay** (RECORDS SWITCH writer; front2 heads.rs `Store`, check.rs `Records`), after 5: published heads are `Sync` (each head with its own portable table); a body's fills go to its overlay. Test: the determinism test under both orders, and 2 workers equal 1.
+10. **Heads by claim** (same writer), after 2 and 9: a body's fill of head k claims k: mine, make and publish; done, read; claimed, return `Need`. Test: the simulation of two bodies needing one head makes it once (a planted double-claim is caught).
+11. **Bodies on the pool** (the front-end writer; front2 project.rs, tempo_front's `bodies`), after 10: bodies of a file as one batch, a worker frame reset per body, results sorted by item key. Test: tempo_front with 1 and 8 workers prints the same body table.
+12. **Typed `BodyCheck` in the command** (DRIVER), after 11: the command's `BodyCheck` runs the typed check. Test: a type error in a ladder rung is printed by `blaze check`.
+13. **Watchdog over claims** (DRIVER), after 2: a claim past its kind's deadline named as `Hung`. Test: the simulation's virtual clock, a planted stuck owner.
+
+## Audit of the older layer (record, 2026-11-15)
+
+Kept for its findings on crates outside the rebuilt path (blaze-launch-rt, blaze-cas, hir-ty);
+where it differs from the end state above, the end state holds.
 
 The rule is [bottom.md](bottom.md) section 1: no global lock and no single-threaded stage on a hot
 path; one code path sized by the machine. This page audits the layer written on 2026-11-15

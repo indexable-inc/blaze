@@ -73,6 +73,9 @@ struct TraitRow {
     lang: Option<Lang>,
     supers: Span,
     assoc: Span,
+    /// The associated types' item bounds, each type's a range of this span
+    /// (`AssocTy::bounds_start`/`bounds_len`): the solver's `TraitDef::item_bounds`.
+    item_bounds: Span,
     por: Por,
     digest: u64,
 }
@@ -755,6 +758,16 @@ impl<'a> FactCache<'a> {
         self.clauses(t.supertraits, c)?;
         let supers = Span::of(&self.preds, supers);
         let assoc = self.assoc_tys.len();
+        // An associated type's item bounds (`type A: Bound;` and its implied `Sized`) are the
+        // predicates of its own item, each with `Self` the alias `<Self as Trait<..>>::A` over
+        // the trait's parameters, as an opaque type's bounds are its key's predicates
+        // (`fill_opaque`). The Reference, "Associated Items", "Associated Types": "The optional
+        // trait bounds must be fulfilled by the implementations of the type alias. There is an
+        // implicit `Sized` bound on associated types that can be relaxed using the special
+        // `?Sized` bound.": every implementation meets them, so the solver assembles them for a
+        // rigid alias (`<S as Serializer>::SerializeStruct: Sized` in a body generic over `S`).
+        let items = self.preds.len();
+        let mut bounds_digest = 0u64;
         for a in t.assoc_types {
             let d = assoc_def(k, a.name);
             self.names.insert(d, (k, a.name));
@@ -762,8 +775,23 @@ impl<'a> FactCache<'a> {
                 Some(p) => Some(self.ty(c, p)?),
                 None => None,
             };
-            self.assoc_tys.push(AssocTy { def: SDef(d), own_generics: 0, bounds_start: 0, bounds_len: 0, default });
+            let bq = Question::Predicates(a.item);
+            let bounds = reads.predicates(a.item)?;
+            let bc = self.table(bq, bounds.types);
+            let start = self.preds.len();
+            self.clauses(bounds.clauses, bc)?;
+            // In the records' order of the associated types, so equal answers of two types
+            // do not cancel.
+            bounds_digest = bounds_digest.rotate_left(1) ^ digest("blaze-typeck assoc bounds", &reads.digest(bq)?);
+            self.assoc_tys.push(AssocTy {
+                def: SDef(d),
+                own_generics: 0,
+                bounds_start: (start - items) as u32,
+                bounds_len: (self.preds.len() - start) as u32,
+                default,
+            });
         }
+        let item_bounds = Span::of(&self.preds, items);
         let assoc = Span::of(&self.assoc_tys, assoc);
         let f = t.flags;
         let mut flags = 0u16;
@@ -789,8 +817,9 @@ impl<'a> FactCache<'a> {
             lang: t.lang.and_then(solver_lang),
             supers,
             assoc,
+            item_bounds,
             por: self.end(por),
-            digest: digest("blaze-typeck trait", &reads.digest(q)?),
+            digest: digest("blaze-typeck trait", &reads.digest(q)?) ^ digest("blaze-typeck trait item bounds", &bounds_digest),
         };
         self.traits.insert(k.0, row);
         Ok(())
@@ -1035,7 +1064,7 @@ impl Facts for FactCache<'_> {
             supertraits: r.supers.get(&self.preds),
             where_clauses: &[],
             assoc: r.assoc.get(&self.assoc_tys),
-            item_bounds: &[],
+            item_bounds: r.item_bounds.get(&self.preds),
             portable: self.portable(r.por),
             digest: r.digest,
         })

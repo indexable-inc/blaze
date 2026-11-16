@@ -149,26 +149,137 @@ parameters are that block's by-move captures. So `root` is always an `Expr::Asyn
 fn itself is an ordinary body that makes the state and returns it. Best is to make it a second output of blaze-flow-lower itself, so there is one
 walk from the typed body to statements, not two.
 
-Back: the builder does NOT walk the machine's blocks. blaze-build walks the expression tree with
-structured drop scopes (walk.rs `scope_pats`, `drop_from`); a second builder from a block form
-would double every expression form. So the walk goes on walking the tree and takes three things
-from `Machine`: (1) homes: a saved binding or temporary lives at its state field, as a captured
-binding lives at its environment field; (2) at `Expr::Await`, the loop, and on Pending "store tag
-`3 + k`, return Pending", with the loop head as the resume block of `k`; (3) at the head, a
-switch on the tag over those blocks. The drop glue is a second function: per point, a snapshot of
-the walk's drop scopes at the await, replayed by `drop_from` with every home in the state. The
-simulation proves the plan; that the walk emits what the plan says is proven by native tests in
-blaze-build (futures that count their drops, polled and cancelled by a hand-written executor).
+Back (decision D73, which replaced hooks in the walk: homes for named bindings alone are unsound,
+since the walk keeps temporaries in stack slots and its cached values do not dominate a resume
+block): the builder builds the body as an ORDINARY function and one pass over LIR splits it.
+
+## The LIR pass (crates/blaze-lir/src/coroutine.rs; 2026-11-16, blaze-lir "32 passed, 0 failed")
+
+In: one function whose entry parameters are what every poll passes (the return pointer if any,
+the state pointer, the context) and whose returns are `Poll<T>`'s; each await ends a block in
+`suspend point, resume, cancel, (the Pending this poll returns)`; a cancel path ends in
+`cancelled`; and `Shape { state_param, prefix_size, prefix_align, unresumed }`: the upvars are
+the first bytes of the state, read through the state pointer as a closure reads its environment,
+and `unresumed` is the block that drops them. Out: `poll`, `drop(state)` and `StateLayout { size,
+align, tag_offset, tag_ty, points, fields }`.
+
+- A slot is kept when at some suspend its address may have been taken and its storage not ended
+  (forward, made by `slot_addr`/`slot_live`, ended by `slot_dead`): D4's coarse rule on LIR. Every
+  `slot_addr` of a kept slot is the state pointer plus its offset (D3).
+- A value is kept when it is live into a resume or cancel block. It is stored once where it is
+  made and loaded in each other block that uses it; constants and addresses are made again. Entry
+  parameters are never kept: each poll passes its own.
+- The state: upvars, then kept slots and values by falling alignment, then the tag (`i8`, `i16`
+  or `i32`). The head of `poll` switches on the tag (a completed state traps, 0xfe10, until the
+  library's panic is passed in); a suspend stores its tag and returns its values; a return stores
+  `Returned`. `drop` switches into the cancel blocks, `unresumed` at tag 0.
+- The verifier has no "pass done" flag: a `suspend` is a two-way edge in the body, and the
+  ordinary dominance rule refuses, in the outputs, any value crossing a poll outside the state.
+- Proof (coroutine_tests.rs): random bodies run directly and as the machine, every schedule,
+  traces equal; planted `SlotLeftOut`, `NoReloadOnCancel`, `TagAfterReturn`, `ResumeNext`.
+- Owed: debug rows of kept slots; overlap (D8); exact byte liveness; `Panicked` with unwinding.
+
+## The builder's two emit points (the next leg: a NEW crates/blaze-build/src/coroutine.rs)
+
+1. `Expr::AsyncBlock` in the PARENT body (one dispatch arm in walk.rs): build closure.rs's
+   environment value into a slot of the state's size and alignment, store 0 at `tag_offset`.
+   Both come from `LayoutFacts::coroutine(owner, ordinal)`, which is the pass's `StateLayout` for
+   that body: so a body's LIR and its split are a record made before any parent that holds its
+   state is built (the same order a closure's environment already needs).
+2. The body: a third `Kind` in `run`: parameters as `poll`'s ABI has them (`Poll<T>` returned
+   by the function's ordinary return form), captures bound at environment offsets off the state
+   parameter exactly as a closure's are, `ret_value` wrapping in `Poll::Ready` by the ordinary
+   enum construction. Nothing else in the walk changes: slots and cached values are the pass's.
+3. `Expr::Await` (one dispatch arm): the Reference's steps: call `into_future` (the checker's
+   callee row) into a `temp()` slot; a loop head block L; `Pin::new_unchecked(&mut tmp)` is the
+   slot's address; call `Future::poll(pin, cx)` (`Adts::future_poll`, the instance at the held
+   type; `cx` is the entry parameter); test the returned `Poll`'s tag with the walk's own
+   discriminant read; Ready: its payload is the value. Pending: make block C, emit there what
+   `return` emits for its exit (`drop_from(0)`, the future's temporary included) and then
+   `cancelled` in place of the return; emit `suspend k, L, C, (Poll::Pending in return form)`.
+4. The unresumed block: after the body, one block that drops the captures (closure.rs's
+   environment drop) and ends in `cancelled`; its index is `Shape::unresumed`.
+5. lib.rs: after `finish`, a function of this `Kind` goes through `blaze_lir::coroutine::split`;
+   `poll` is emitted under the body's symbol, `drop` is the state type's drop glue
+   (`build_drop_glue` calls it for `PNode::Future`), the layout is the record of item 1.
+6. Proof: native tests in blaze-build (futures that count their drops, polled and cancelled by
+   a hand-written executor): `an_async_block_polled_to_completion` first.
 
 What the builder needs, by name (from a search of walk.rs, closure.rs, lib.rs, layout.rs):
 - walk.rs dispatch: `Expr::AsyncBlock` (make the state: closure.rs's environment value plus the
-  tag) and `Expr::Await` (the loop); `run` (a third `Kind`: parameters `(state, cx)`, the head
-  switch); `own`, `own_pat`, `home` and `slots` (a home that is a state field); `scan_flags` and
-  `set_flag` (a flag's home in the state when the layout saves it); `drop_local`, `drop_held`,
-  `drop_owned`, `drop_from`, `scope_start` (replayed in the glue from a snapshot).
+  tag) and `Expr::Await` (the loop); `run` (a third `Kind`); `drop_from` (the cancel block);
+  `temp()` (the awaited future's slot).
 - closure.rs: `closures_in` (a sibling listing a body's async blocks), `Parts`, `run_entry`.
 - layout.rs `closure_facts` and `LayoutFacts::closure`: a sibling `coroutine` giving the state's
   fields (upvars, saved locals' types, the tag); lib.rs `build_drop_glue` (the state's glue is
   the `match` above, not a tuple's); instance.rs's closure key (owner, ordinal, arguments).
 - blaze-typeck: `Future::poll` at each `awaited` type as a callee; the exact interior (D9).
 - The library: `Poll`, `Context`, `Pin` lang items, and the `panic_const_async_fn_resumed` path.
+
+## Builder writer 4's notes (2026-11-16; piece 1 green on the integrator's run at 13:31: "test blaze-build: exit 0; 139 passed, 0 failed", filter coroutines "2 passed, 0 failed"; handed on by rule 12)
+
+Built (crates/blaze-build; tests `src/tests/coroutines.rs`, run with the filter `coroutines`):
+
+- **Identity** (coroutine.rs): owner, ORDINAL among the owner body's `Expr::AsyncBlock`s in
+  expression order (`coroutines_in`), the owner's arguments: a closure's scheme. The checker's
+  `PNode::Future(ExprId, output, interior)` holds a body-local expression id, so it cannot be a
+  ground type. Interim ground form, one constructor (`identity`, exported as
+  `coroutine_identity`) and one reader (`coroutine_of`): `Future(ExprId(ordinal), output,
+  FnDef(owner, owner_args))`. instance.rs `ground` passes that form on and refuses the checker's
+  form by name; the instance key hashes tag 22 and the ordinal, children the output and the
+  `FnDef`. WANTED in blaze-typeck (not additive, so not done): `PNode::Coroutine { owner,
+  ordinal, args }` made by `open_future`; then `identity`, `coroutine_of` and `ground_node` are
+  the only three functions to change.
+- **Facts** (layout.rs, both defaulted): `LayoutFacts::coroutine(owner, ordinal) ->
+  Option<CoroutineFacts>` (the upvars' tuple and the output, in the owner's parameters; made by
+  `coroutine_facts(body, checked, ordinal, generics, out, scratch) -> (env, output)`), and
+  `LayoutFacts::coroutine_state(owner, ordinal, args, ground) -> Result<Option<StateShape>,
+  Missing>`: per INSTANCE, since the pass's layout depends on the owner's arguments (the plan
+  above said one fact; a generic `async fn` needs the arguments). `Err(Missing)` is "that body
+  is not built and split yet": the layout caches nothing and is asked again.
+- **Layout** (layout.rs `parts`, `compute`): one field, the upvars at offset 0, in the state's
+  size and alignment; no scalar form, no niche; a state smaller than its upvars is refused.
+- `Adts::future_poll() -> Option<ItemKey>` is declared (defaulted); nothing calls it yet.
+
+Not built: every emit point (items 1 to 5 above) and their four tests. For the successor, what
+the search found, in the order to write:
+
+1. walk.rs treats a closure's type in three places a coroutine needs too: `repr` (the
+   aggregate arm, near "A closure: a struct of one field"; the `PNode::Future` refusal below it
+   goes), `is_agg`, and the walk's own layout rows (`parts.push((Name(0), env))`). Add a
+   `coroutine_parts(g)` beside closure.rs `closure_parts`. The row's `needs_drop` must be TRUE
+   always (core's `needs_drop`: "may return true for types that don't actually need to be
+   dropped"); its drop is a CALL of the `drop_in_place` instance at `[the coroutine]`, which IS
+   the split `drop` function: find where `drop_at`/`glue` choose between fields and an impl.
+2. The type of an `Expr::AsyncBlock` in its own body: never through `ground` (refused there):
+   a `Walk::coroutine_ty(e)` = `identity(self.ground, self.body.owner, ordinal, own args list,
+   ground_ty(output))`, and `expr_ty`-based callers (`repr_at`, `expr_ty` then `ground_ty`)
+   must reach it for a block's expression. A future NESTED in another type of the body's
+   record (`Option<impl Future>` of a local) stays refused by name until the checker's change.
+3. `Expr::AsyncBlock` value: closure.rs `closure_value` with the state's layout (`temp(repr)`,
+   captures at `capture_offsets`' sibling), then a store of 0 in `StateShape::tag_ty` at
+   `tag_offset` (ask `facts.coroutine_state` again; `Missing` becomes
+   `BuildError::MissingRecord { item: owner }`). `Capture::Ref` versus `Capture::Move` is the
+   checker's capture kind per row: build what the rows say, refuse a block with no rows that
+   names an outer binding.
+4. `Kind::Coroutine(ExprId)` and `build_coroutine(body, checked, ordinal, sig, subst, adts,
+   alloc)` shaped as `build_closure`: parameters `(sret?, state: ptr, cx: ptr)`, `self.ret` the
+   ground `Poll<output>` (`Adts::lang_adt(LangItem::Poll)` if the lang item exists in ids.rs:
+   check), captures bound as `run_closure` binds an `FnOnce` body's (by-value ones owned:
+   `own_pat`), `walk_root`, then the unresumed block, then `blaze_lir::coroutine::split`. It
+   returns poll, drop and `StateShape::of(&split.layout)`: the driver keeps the shape as the
+   record `coroutine_state` answers from. The poll instance is `(future_poll, [coroutine])`,
+   the drop instance `(drop_in_place, [coroutine])`.
+5. `Expr::Await`: item 3 of the list above; `Adts::future_poll` at `[held type]`; the held
+   type needs a seam answer too (`Checked` has no `awaited` column: the checker keeps it in
+   the machine only; wanted: a `Checked::awaited` table `(ExprId, PTy)`, or the builder
+   normalizes `<T as IntoFuture>::IntoFuture` through `LayoutFacts::normalize`, which exists).
+6. The resumed panic: pass the block that calls `Adts::lang_fn("panic_const_async_fn_resumed")`
+   to the pass in place of trap 0xfe10 (the pass takes no such block yet: writer 3's side).
+
+Wanted from the front end, by name: rows in `Checked::captures` for an async block (keyed by
+the block's expression; an `async fn`'s parameters by value): the checker writes none today
+(rules/coroutine.rs: "Capture kinds are not computed"); an `async fn`'s return type is
+`PNode::Opaque`, which instance.rs `ground` refuses: the builder needs the hidden type through
+a seam (`opaque_hidden`, answered in the identity form over the owner's parameters), and
+blaze-typeck instance.rs refuses to export a `Future` (`Limit::Export`).

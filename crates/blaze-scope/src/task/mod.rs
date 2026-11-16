@@ -29,7 +29,7 @@ mod solve;
 
 pub use answer::{Held, Lack, Note, Own, Records, Variant, answer, helpers_digest};
 pub use exports::publish_expanded_exports;
-pub use fill::{Fill, FillEnv, FillReport, First, Par, Serial};
+pub use fill::{ExpandPart, Fill, FillEnv, FillReport, First, Par, Serial, Stage};
 pub use lower::{Attrs, BodySrc, BUILTIN_ATTRS, CallSrc, Cfg, DOLLAR_CRATE, DollarCrate, Files, Fragment, ImplSrc, ItemText, KNOWN_FALSE, LangSrc, Loc, LowerCx, LowerNote, LowerNoteKind, Lowered, MOST_CFG_DEPTH, MOST_MODULES, MacroBody, MacroSrc, Member, ModMade, ProcAttr, ProcDecls, ProcExport, Module, prelude_attr, PreludeImport, RootInput, RootNote, RootPlan, SplitTop, Target, Tree, UseLeaf, WalkNote, Walked, Where, args, crate_root, dollar_crate_of, file_attrs, first_line, head, inside, is_builtin_attr, item_attrs, key_of, lower, make_key, parse_path, root_key, rules_shapes, string_value, strip_attr, to_path, unraw, use_leaves, walk};
 // resolve.rs: a made module's paths joined as the walk joins them.
 pub(crate) use lower::{joined, pop_dir};

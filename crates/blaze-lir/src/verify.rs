@@ -12,6 +12,14 @@
 //! edge's arguments against its block's parameters, landing blocks reached by unwind edges
 //! alone, and every use dominated by its value. The builder runs it in debug builds, and in
 //! release builds behind a check mode ([`crate::Builder::finish_checked`]).
+//!
+//! A coroutine body's `suspend` is, here, a two-way edge like any other: both of its blocks
+//! exist, take no parameters and are not landing blocks, and what it returns is the
+//! signature's. A value made before a `suspend` may be used after it, since in the body the
+//! suspending block dominates what follows. There is no "pass done" flag: the coroutine pass
+//! ([`crate::coroutine`]) leaves no `suspend`, enters each resume block from a switch at the
+//! head, and so the dominance rule above, unchanged, is what refuses in its output any value
+//! that would cross a poll outside the state.
 
 use std::fmt;
 
@@ -531,6 +539,8 @@ enum EdgeKind<'a> {
     Unwind,
     /// An `asm_br`'s label.
     Label,
+    /// A `suspend`'s resume or cancel block.
+    Suspend,
 }
 
 /// Calls `f` with every edge from the terminator `at`.
@@ -564,6 +574,10 @@ fn edges<'a>(view: &View<'a>, at: usize, mut f: impl FnMut(Edge<'a>)) {
         for &label in operands.blocks() {
             f(Edge { to: Block(label), kind: EdgeKind::Label });
         }
+    } else if op == Op::Suspend {
+        operands.imm();
+        f(Edge { to: operands.block(), kind: EdgeKind::Suspend });
+        f(Edge { to: operands.block(), kind: EdgeKind::Suspend });
     }
 }
 
@@ -772,6 +786,8 @@ fn semantics(view: &View<'_>) -> Result {
                 EdgeKind::Unwind => (!kind.is_landing()).then_some("an unwind edge to a block that is not a landing block"),
                 EdgeKind::Label => (kind.is_landing() || !params.is_empty())
                     .then_some("a label to a block with parameters or a landing block"),
+                EdgeKind::Suspend => (kind.is_landing() || !params.is_empty())
+                    .then_some("a suspend whose resume or cancel block has parameters or is a landing block"),
             };
         });
         if let Some(rule) = bad {
@@ -1195,6 +1211,17 @@ fn types(
             )
         }
         Op::Resume => need(t(o.value()) == Ty::PTR, "a resume of a value that is not the exception pointer"),
+        Op::Suspend => {
+            o.imm();
+            o.block();
+            o.block();
+            let values = o.values();
+            need(
+                values.len() == own.rets.len() && values.iter().zip(own.rets).all(|(v, r)| t(v).0 == r.ty),
+                "a suspend whose returns are not its signature's",
+            )
+        }
+        Op::Cancelled => Ok(()),
     }
 }
 

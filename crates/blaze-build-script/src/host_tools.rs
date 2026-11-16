@@ -45,6 +45,10 @@ pub struct HostTool<'t> {
     pub path: &'t str,
     /// The folders its runtime reads, space-separated: granted read-only.
     pub reads: &'t str,
+    /// The programs the tool itself starts, space-separated real paths, sorted: granted
+    /// execute, each keyed by its digest (perl's piped `open` starts `/bin/sh`, which starts
+    /// the shell `/private/var/select/sh` names).
+    pub runs: &'t str,
     /// The packages whose scripts are known to start it, space-separated, sorted.
     pub needed_by: &'t str,
 }
@@ -53,6 +57,17 @@ impl<'t> HostTool<'t> {
     /// The folders its runtime reads.
     pub fn read_folders(&self) -> impl Iterator<Item = &'t str> + use<'t> {
         self.reads.split(' ').filter(|r| !r.is_empty())
+    }
+
+    /// The programs it starts.
+    pub fn run_paths(&self) -> impl Iterator<Item = &'t str> + use<'t> {
+        self.runs.split(' ').filter(|r| !r.is_empty())
+    }
+
+    /// Every program granted for it, its own path first: what the sandbox may start and the
+    /// key digests.
+    pub fn programs(&self) -> impl Iterator<Item = &'t str> + use<'t> {
+        core::iter::once(self.path).chain(self.run_paths())
     }
 
     /// Whether `package`'s script is known to start it.
@@ -103,8 +118,12 @@ pub fn host_tools<'t, 'a>(text: &'t str, target: &'t str, alloc: Alloc<'a>) -> R
         }
         let path = scalar(body, "path").filter(|p| p.starts_with('/')).ok_or(malformed("path"))?;
         let reads = scalar(body, "reads").ok_or(malformed("reads"))?;
+        let runs = scalar(body, "runs").ok_or(malformed("runs"))?;
+        if runs.split(' ').filter(|r| !r.is_empty()).any(|r| !r.starts_with('/')) {
+            return Err(malformed("runs"));
+        }
         let needed_by = scalar(body, "needed_by").ok_or(malformed("needed_by"))?;
-        out.push(HostTool { name, path, reads, needed_by });
+        out.push(HostTool { name, path, reads, runs, needed_by });
     }
     Ok(out)
 }
@@ -129,7 +148,8 @@ mod tests {
 
     /// The checked-in table grants perl, at its real path with the system's Perl folders, to
     /// sha3-asm alone (D71); Linux lists none; a target with no row is refused by name.
-    /// Prints "host tools: perl /usr/bin/perl reads /System/Library/Perl for sha3-asm".
+    /// Prints "host tools: perl /usr/bin/perl reads /System/Library/Perl /private/var/select/sh
+    /// for sha3-asm".
     #[test]
     fn the_pin_table_grants_perl_to_sha3_asm_only() {
         let alloc = Alloc::global();
@@ -137,7 +157,8 @@ mod tests {
         assert_eq!(mac.len(), 1);
         let perl = mac[0];
         assert_eq!((perl.name, perl.path), ("perl", "/usr/bin/perl"));
-        assert_eq!(perl.read_folders().collect::<std::vec::Vec<_>>(), ["/System/Library/Perl"]);
+        assert_eq!(perl.read_folders().collect::<std::vec::Vec<_>>(), ["/System/Library/Perl", "/private/var/select/sh"]);
+        assert_eq!(perl.programs().collect::<std::vec::Vec<_>>(), ["/usr/bin/perl", "/bin/bash", "/bin/sh"]);
         assert_eq!(granted(&mac, "sha3-asm", alloc).len(), 1);
         assert_eq!(granted(&mac, "zstd-sys", alloc).len(), 0);
         // A prefix of a listed package is not the package.
@@ -161,7 +182,7 @@ mod tests {
     /// Unsorted names are refused, never read in some order.
     #[test]
     fn unsorted_names_are_refused() {
-        let text = r#"{"host_tools": {"t": {"names": "perl make", "make": {"path": "/usr/bin/make", "reads": "", "needed_by": "x"}, "perl": {"path": "/usr/bin/perl", "reads": "", "needed_by": "y"}}}}"#;
+        let text = r#"{"host_tools": {"t": {"names": "perl make", "make": {"path": "/usr/bin/make", "reads": "", "runs": "", "needed_by": "x"}, "perl": {"path": "/usr/bin/perl", "reads": "", "runs": "", "needed_by": "y"}}}}"#;
         assert_eq!(host_tools(text, "t", Alloc::global()).err(), Some(HostToolError::Unsorted { target: "t" }));
     }
 }

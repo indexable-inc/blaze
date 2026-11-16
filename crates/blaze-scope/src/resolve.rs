@@ -61,6 +61,7 @@ use crate::task::{
     crate_root, file_attrs, lower, walk,
 };
 use crate::task::{joined, pop_dir};
+use crate::task::ExpandPart;
 use crate::task::{ProcAttr, ProcDecls, ProcExport};
 use blaze_surface::ProcKind;
 use crate::{ExpandRequest, NameAnswer, Node, Passed, Resolved, ScopeFacts, through};
@@ -1006,6 +1007,7 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
     let mut notes: AVec<'a, NamesNote<'a>> = AVec::new_in(alloc);
 
     // The files: the root's, then each the walk names, until it names no file not read.
+    par.stage(crate::task::Stage::Files);
     let root_text = sources.read(index, input.root).ok_or(NamesError::RootNotRead { krate: input.name, path: input.root })?;
     let mut set = FileSet::new_in(alloc);
     let root_file = set.add(file_of(input.root, root_text, outline(root_text, edition, alloc), input.shown_from, alloc));
@@ -1039,6 +1041,7 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
     let tree = walked.ok_or(NamesError::WalkUnbounded { krate: input.name })?;
 
     // Each walked module's own text, lowered.
+    par.stage(crate::task::Stage::Lower);
     let listed = if input.implicit.proc_macro { sources.proc_exports(index) } else { None };
     let mut low = lower_modules(input.key, edition, &cfg, &set, &tree, listed, &mut notes, par, alloc);
     let root = set.files[root_file as usize];
@@ -1064,6 +1067,7 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
     notes.extend(root_notes.into_iter().map(NamesNote::Root));
 
     // The records, written and read back: what the fill and later crates read.
+    par.stage(crate::task::Stage::Decls);
     let mut decls = HashMap::new_in(alloc);
     for (i, m) in tree.modules.iter().enumerate() {
         let info = ModuleInfo {
@@ -1131,13 +1135,17 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
             listed: listed.is_some(),
             alloc,
         };
-        let cx = FillCx { base: &base, run: &run, facts: Facts { base: &base, run: &run } };
+        let mark = |stage: crate::task::Stage| par.stage(stage);
+        let part = |part: ExpandPart, macro_name: &str, size: usize| par.expand_part(part, macro_name, size);
+        let seen = |def: ItemKey, input: &str| par.expand_call(def, input);
+        let cx = FillCx { base: &base, run: &run, facts: Facts { base: &base, run: &run }, mark: &mark, part: &part, seen: &seen };
         // The cell core on the same facts, timed by the caller's clock and compared, the report
         // handed to the caller; the records stay the fill's.
         #[cfg(feature = "cells")]
         let seam = par.cells_seam().map(|seam| (seam, seam.now()));
         // The files' blocks that hold impls are modules before the fill starts: it is told
         // of them as of any made module.
+        par.stage(crate::task::Stage::Solve);
         make_blocks(&base, &run, &low.bodies);
         fill.run(&cx, par, &all);
         #[cfg(feature = "cells")]
@@ -1146,6 +1154,7 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
             seam.report(input.name, crate::cells::shadow(&cx.facts, built, tree.modules[0].key, &fill.done, old, seam, alloc));
         }
     }
+    par.stage(crate::task::Stage::Publish);
     let mut done = core::mem::replace(&mut fill.done, HashMap::new_in(alloc));
     let mut in_made: AVec<'a, (&'a str, ItemKey, MacroShapes)> = AVec::new_in(alloc);
     for module in held(run.made.read(), "made modules").values() {
@@ -1437,12 +1446,26 @@ struct FillCx<'r, 'a, S> {
     base: &'r Base<'r, 'a, S>,
     run: &'r Run<'a>,
     facts: Facts<'r, 'a, S>,
+    /// The caller's stage mark ([`crate::task::Par::stage`]): an expansion is its own stretch.
+    mark: &'r dyn Fn(crate::task::Stage),
+    /// The caller's part mark ([`crate::task::Par::expand_part`]).
+    part: PartMark<'r>,
+    /// The caller's call mark ([`crate::task::Par::expand_call`]).
+    seen: &'r dyn Fn(ItemKey, &str),
 }
+
+/// [`crate::task::Par::expand_part`] as [`expand_decls`] takes it.
+type PartMark<'r> = &'r dyn Fn(ExpandPart, &str, usize);
 
 impl<'a, S: SourceTexts<'a>> crate::task::Expand for FillCx<'_, 'a, S> {
     fn expand(&self, request: ExpandRequest) -> crate::task::Expanded {
-        let (decls, made) = expand_decls(self.base, self.run, request).unwrap_or_else(|| (DeclsBuilder::new_in(self.base.alloc), None));
+        (self.mark)(crate::task::Stage::Expand);
+        (self.part)(ExpandPart::Find, "", 0);
+        let (decls, made) = expand_decls(self.base, self.run, request, self.part, self.seen).unwrap_or_else(|| (DeclsBuilder::new_in(self.base.alloc), None));
+        (self.part)(ExpandPart::Store, "", 0);
         held(self.run.expansions.lock(), "expansions").insert(request.call, Expansion { decls, made });
+        (self.part)(ExpandPart::End, "", 0);
+        (self.mark)(crate::task::Stage::Solve);
         crate::task::Expanded::Made
     }
 }
@@ -1553,18 +1576,10 @@ impl<'a, S: SourceTexts<'a>> ExpandCx for Host<'_, 'a, S> {
     /// (`SourceOrigin::Package`); a member's item-position read under its source root (D60)
     /// needs the root from `SourceTexts`, not given yet.
     fn include(&self, written: &str, _: IncludeAs) -> Result<Included<'_>, HostError> {
-        let folder = self.path.rsplit_once('/').map_or("", |(dir, _)| dir);
-        let Some(folder) = folder.strip_prefix(self.package) else { return Ok(Included::Outside) };
-        let root = blaze_expand::ReadRoot { origin: blaze_expand::SourceOrigin::Package, package: "" };
-        let Ok(target) = blaze_expand::include_target(root, folder, written, self.alloc) else {
+        // The one place the path is made: the modules the file writes are found from it too.
+        let Some(path) = crate::included::included_file(self.package, self.path, written, self.alloc) else {
             return Ok(Included::Outside);
         };
-        let mut path = AString::new_in(self.alloc);
-        path.push_str(self.package.trim_end_matches('/'));
-        for segment in target.iter() {
-            path.push('/');
-            path.push_str(segment);
-        }
         Ok(self.sources.read(self.krate, &path).map_or(Included::Missing, |text| Included::Bytes(text.as_bytes())))
     }
 
@@ -1717,6 +1732,8 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     base: &Base<'_, 'a, S>,
     run: &Run<'a>,
     request: ExpandRequest,
+    part: PartMark<'_>,
+    seen: &dyn Fn(ItemKey, &str),
 ) -> Option<(DeclsBuilder<'a, &'a str>, Option<&'a ExpansionText<'a>>)> {
     let alloc = base.alloc;
     let call = request.call;
@@ -1755,6 +1772,8 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     // A `macro_rules!` or `macro` is lexed and compiled once, by its defining item's key; a
     // builtin or a proc macro has nothing to compile and is built for its call's shape.
     let declarative = matches!(mac.body, MacroBody::Rules(_) | MacroBody::Macro2 { .. });
+    seen(def_key, src.input);
+    part(ExpandPart::Define, mac.name, 0);
     let written;
     let def: Kept<'_> = match run.prepares.get(def_key).filter(|_| declarative) {
         Some(kept) => kept,
@@ -1770,7 +1789,10 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
             }
         },
     };
+    part(ExpandPart::LexInput, mac.name, src.input.len());
     let input = lexed(src.input, Lexed::Input)?;
+    part(ExpandPart::Shape, mac.name, 0);
+    let input_tokens = input.len();
     let site = CallSite { edition, panic_edition: edition, ctx: Ctx::root(edition) };
     let file = held(base_files(run), "files").files[src.loc.file as usize];
     let host = Host {
@@ -1843,6 +1865,13 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     let shadowed = |name: &str| base.tables.macros.values().any(|m| m.name == name && !matches!(m.body, MacroBody::BuiltinFn(b) if b == name));
     let nested_at = DefAt { site: DefSite { krate: def_krate, module: None }, edition: def_edition, export: Export::Exported, local_inner: LocalInner::No, transparency: None };
     let eager = EagerDriver { macro_name: mac.name, def_at: nested_at, shadowed: &shadowed, alloc };
+    let run_part = match mac.body {
+        MacroBody::Rules(_) | MacroBody::Macro2 { .. } => ExpandPart::RunRules,
+        MacroBody::BuiltinFn(_) => ExpandPart::RunBuiltin,
+        MacroBody::BuiltinOther(_) => ExpandPart::RunDerive,
+        MacroBody::Proc { .. } => ExpandPart::RunProc,
+    };
+    part(run_part, mac.name, input_tokens);
     let expanded = match base.script {
         Some(out) => eager.expand(def, &call_of, &ScriptCx { inner: host, out }),
         None => eager.expand(def, &call_of, &host),
@@ -1862,9 +1891,12 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     def_crate_starts.extend(expansion.nested.iter().filter(|c| c.scope == PathScope::DefCrate).map(|c| c.path.start));
     def_crate_starts.sort_unstable();
     let def_crate = |at: usize| def_crate_starts.binary_search(&(at as u32)).is_ok();
+    part(ExpandPart::Render, mac.name, expansion.tokens.len());
     let rendered = render_with(&expansion.tokens, Some(here), |at| expansion.hygiene(at).mark.map(|mark| mark.site.krate), def_crate, alloc);
     let text: &'a str = Box::leak(rendered.into_boxed_str());
+    part(ExpandPart::Outline, mac.name, text.len());
     let made: &'a ExpansionText<'a> = Box::leak(Box::new_in(ExpansionText { text, outline: outline(text, edition, alloc) }, alloc));
+    part(ExpandPart::Lower, mac.name, text.len());
     if let Some(error) = made.outline.errors().first() {
         // A call a block's module holds ([`crate::blocks`]) stands in STATEMENT position: the
         // Reference, "Macro invocation", "Statements": its expansion is statements, and one
@@ -1901,12 +1933,23 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
         members_of: src.owner,
     };
     let mut out = lower(LowerCx { krate: base.key, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs() }, fragment, alloc);
+    part(ExpandPart::Modules, mac.name, out.mods_made.len());
     let mods =core::mem::replace(&mut out.mods_made, AVec::new_in(alloc));
-    let place = Made { text, outline: &made.outline, at: Where::Expansion(src.loc), place: At::Expansion(call) };
+    // An `include!`'s file is the current file of what it writes ([`crate::included`]): a
+    // `mod x;` in it is found from the INCLUDED file's folder, not the calling module's.
+    let included_dir: Option<&'a str> = match mac.body {
+        MacroBody::BuiltinFn("include") if !mods.is_empty() => {
+            crate::included::included_dir(base.shown_from, file.path, &expansion.reads, alloc).map(|dir| keep(&dir, alloc))
+        }
+        _ => None,
+    };
+    let place = Made { text, outline: &made.outline, at: Where::Expansion(src.loc), place: At::Expansion(call), dir: included_dir };
     let mut bodies = core::mem::replace(&mut out.bodies, AVec::new_in(alloc));
     make_modules(base, run, src.module, &mods, place, src.depth + 1, &mut bodies);
     let decls = core::mem::replace(&mut out.decls, DeclsBuilder::new_in(alloc));
+    part(ExpandPart::Tables, mac.name, 0);
     add_lowered(run, call, At::Expansion(call), out);
+    part(ExpandPart::Blocks, mac.name, bodies.len());
     make_blocks(base, run, &bodies);
     Some((decls, Some(made)))
 }
@@ -1955,7 +1998,7 @@ fn make_blocks<'a, S: SourceTexts<'a>>(base: &Base<'_, 'a, S>, run: &Run<'a>, bo
         };
         let mut out = lower(LowerCx { krate: base.key, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs() }, fragment, alloc);
         let mods = core::mem::replace(&mut out.mods_made, AVec::new_in(alloc));
-        let place = Made { text, outline: &made.outline, at: Where::Expansion(body.loc), place: At::Expansion(call) };
+        let place = Made { text, outline: &made.outline, at: Where::Expansion(body.loc), place: At::Expansion(call), dir: None };
         make_modules(base, run, body.module, &mods, place, body.depth + 1, &mut work);
         // The outermost block's `mod` declaration: dropped, so the body's module binds nothing.
         out.decls = DeclsBuilder::new_in(alloc);
@@ -2195,6 +2238,10 @@ struct Made<'a> {
     outline: &'a Outline<'a>,
     at: Where,
     place: At,
+    /// The folder of the file an `include!` read this fragment from ([`crate::included`]):
+    /// where a `mod x;` written at the fragment's top is found and what its `#[path]` is
+    /// relative to, in place of the calling module's folder. `None` for any other fragment.
+    dir: Option<&'a str>,
 }
 
 /// Where a module of this crate is: its children's directory, what their `#[path]` is relative
@@ -2238,6 +2285,7 @@ fn make_modules<'a, S: SourceTexts<'a>>(
     bodies: &mut AVec<'a, crate::task::BodySrc<'a>>,
 ) {
     let alloc = base.alloc;
+    let top = parent;
     let mut work: AVec<'a, (ItemKey, ModMade<'a>, Made<'a>)> = AVec::with_capacity_in(mods.len(), alloc);
     work.extend(mods.iter().map(|m| (parent, *m, made)));
     while let Some((parent, m, made)) = work.pop() {
@@ -2256,6 +2304,13 @@ fn make_modules<'a, S: SourceTexts<'a>>(
         let Some((dir, path_dir, parent_chain, parent_path)) = place_of(base, run, parent) else {
             note(MadeNote::NoPlace);
             continue;
+        };
+        // A module written at the top of an included file ([`crate::included`]): the included
+        // file's folder is its parent's folder. One inside an inline module of that file has
+        // that module as its parent, whose folder was made from this one.
+        let (dir, path_dir) = match made.dir {
+            Some(included) if parent == top => (included, included),
+            _ => (dir, path_dir),
         };
         let (fragment_of, item, mdir, mpdir): (Made<'a>, Option<ItemIndex>, &'a str, &'a str) = if m.inline {
             let d = keep(&joined(dir, &[m.path_attr.unwrap_or(m.name)], alloc), alloc);
@@ -2294,7 +2349,7 @@ fn make_modules<'a, S: SourceTexts<'a>>(
                 note(MadeNote::CfgOff);
                 continue;
             }
-            (Made { text: file.text, outline: &file.outline, at: Where::File(at), place: At::File(at) }, None, mdir, mpdir)
+            (Made { text: file.text, outline: &file.outline, at: Where::File(at), place: At::File(at), dir: None }, None, mdir, mpdir)
         };
         let fragment = Fragment {
             module: m.key,

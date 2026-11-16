@@ -102,13 +102,19 @@ fn main() -> ExitCode {
     // binary's digest in the key.
     let table_tools = host_tools::host_tools(PIN, TARGET, alloc).unwrap_or_else(|e| panic!("{e}"));
     let tools = host_tools::granted(&table_tools, name, alloc);
-    let tool_keys: std::vec::Vec<HostToolKey<'_>> = tools
+    // Each tool under its name, then each program it starts under `<tool>+<path>`, as
+    // native_unit keys them.
+    let names: std::vec::Vec<(std::string::String, &str)> = tools
         .iter()
-        .map(|tool| {
-            let (dir, file) = tool.path.rsplit_once('/').expect("an absolute tool path");
+        .flat_map(|tool| tool.programs().map(move |p| (if p == tool.path { tool.name.to_owned() } else { format!("{}+{p}", tool.name) }, p)))
+        .collect();
+    let tool_keys: std::vec::Vec<HostToolKey<'_>> = names
+        .iter()
+        .map(|(name, program)| {
+            let (dir, file) = program.rsplit_once('/').expect("an absolute tool path");
             let mut sha = blaze_sha256::Sha256::new();
-            sha.update(&read(dir, file));
-            HostToolKey { name: tool.name, digest: sha.finish() }
+            sha.update(&read(if dir.is_empty() { "/" } else { dir }, file));
+            HostToolKey { name: name.as_str(), digest: sha.finish() }
         })
         .collect();
     let inputs = KeyInputs {

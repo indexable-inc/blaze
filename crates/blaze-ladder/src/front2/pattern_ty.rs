@@ -21,7 +21,6 @@ use std::vec::Vec;
 
 use blaze_lower::by_name::ByName;
 use blaze_lower::form as lf;
-use blaze_lower::scoped::Scoped;
 use blaze_lower::typeck::{Refused, parse_pattern_type, pattern_type};
 use blaze_lower::View;
 use blaze_own::Alloc;
@@ -30,23 +29,26 @@ use blaze_typeck::{PTy, PortableTys};
 
 use super::body::NoHost;
 use super::heads::CrateCfg;
+use super::scoped::ScopedBy;
+use super::source::NamesSource;
 use super::types::{Builder, Env, Heads, Why, children};
 
 fn refused(what: String, r: Range) -> Why {
     Why::PatternType(what.into_boxed_str(), r)
 }
 
-impl<H: Heads> Builder<'_, '_, H> {
+impl<'n, H: Heads, S: NamesSource<'n>> Builder<'_, H, S> {
     /// The type the unexpanded type macro `t` of a signature's `v` stands for, written in
     /// `env.module`: its text expanded and lowered, then read as a type.
     pub(super) fn macro_ty(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, t: lf::TypeId, r: Range) -> Result<PTy, Why> {
         let text = v.text_at(v.type_range(t)?)?;
         let names = self.resolver.names;
         let krate = names.crate_of(env.module).ok_or_else(|| refused(format!("the crate of module {:x} is not read", env.module), r))?;
-        let atoms = names.krate(krate).cfg.atoms();
-        let scoped = Scoped { names, module: env.module, prepared: None };
+        let atoms = names.cfg_atoms(krate).ok_or_else(|| refused(format!("the cfg of the crate of module {:x} is not read", env.module), r))?;
+        let edition = names.edition_of(krate).ok_or_else(|| refused(format!("the edition of the crate of module {:x} is not read", env.module), r))?;
+        let scoped = ScopedBy { names, module: env.module, prepared: None };
         let mut expand = ByName::with_names(&scoped, NoHost, Alloc::global());
-        let lowered = blaze_lower::lower_type_text_expanding(text, names.edition(krate), &mut CrateCfg(atoms), &mut expand, Alloc::global())
+        let lowered = blaze_lower::lower_type_text_expanding(text, edition, &mut CrateCfg(atoms), &mut expand, Alloc::global())
             .map_err(|e| Why::TypeMacro(format!("`{text}`: {e}").into_boxed_str(), r))?;
         let bv = lowered.view();
         let root = bv.type_root().ok_or_else(|| Why::TypeMacro(format!("`{text}` expanded to no type").into_boxed_str(), r))?;
@@ -75,7 +77,7 @@ impl<H: Heads> Builder<'_, '_, H> {
         let text = parse_pattern_type(&written, r).map_err(|e| refused(format!("{e:?}"), r))?;
         let names = self.resolver.names;
         let krate = names.crate_of(env.module).ok_or_else(|| refused(format!("the crate of module {:x} is not read", env.module), r))?;
-        let atoms = names.krate(krate).cfg.atoms();
+        let atoms = names.cfg_atoms(krate).ok_or_else(|| refused(format!("the cfg of the crate of module {:x} is not read", env.module), r))?;
         // The target's pointer width, from the crate's cfg (`target_pointer_width`).
         let bits = atoms
             .iter()

@@ -246,15 +246,32 @@ pub fn native_outputs<'a>(
     let pin = |why: String| NativeUnitError::PinTable { package: package.clone(), why };
     let table = host_tools::host_tools(PIN, setting.host, alloc).map_err(|e| pin(e.to_string()))?;
     let tools: AVec<'a, HostTool<'_>> = host_tools::granted(&table, name, alloc);
-    let mut tool_keys: AVec<'a, HostToolKey<'_>> = Vec::new_in(alloc);
+    // Every granted program is keyed: the tool under its name, then each program it starts
+    // under `<tool>+<path>` (sorted after the tool's own name, in the table's sorted order).
+    let mut names: AVec<'a, blaze_own::AString<'a>> = Vec::new_in(alloc);
     for tool in tools.iter() {
-        let real = std::fs::canonicalize(tool.path).map_err(|e| NativeUnitError::Read { path: tool.path.to_owned(), why: e.to_string() })?;
-        if real.as_os_str() != tool.path {
-            return Err(NativeUnitError::ToolNotReal { package: package.clone(), tool: tool.name.to_owned(), path: tool.path.to_owned(), real: real.display().to_string() });
+        for program in tool.programs() {
+            let mut name: blaze_own::AString<'a> = blaze_own::String::from_str_in(tool.name, alloc);
+            if program != tool.path {
+                name.push('+');
+                name.push_str(program);
+            }
+            names.push(name);
         }
-        let (dir, file) = tool.path.rsplit_once('/').unwrap_or(("/", tool.path));
-        let digest = blaze_sha256::digest(&read_file(if dir.is_empty() { "/" } else { dir }, file)?);
-        tool_keys.push(HostToolKey { name: tool.name, digest });
+    }
+    let mut tool_keys: AVec<'a, HostToolKey<'_>> = Vec::new_in(alloc);
+    let mut at = 0;
+    for tool in tools.iter() {
+        for program in tool.programs() {
+            let real = std::fs::canonicalize(program).map_err(|e| NativeUnitError::Read { path: program.to_owned(), why: e.to_string() })?;
+            if real.as_os_str() != program {
+                return Err(NativeUnitError::ToolNotReal { package: package.clone(), tool: tool.name.to_owned(), path: program.to_owned(), real: real.display().to_string() });
+            }
+            let (dir, file) = program.rsplit_once('/').unwrap_or(("/", program));
+            let digest = blaze_sha256::digest(&read_file(if dir.is_empty() { "/" } else { dir }, file)?);
+            tool_keys.push(HostToolKey { name: names[at].as_str(), digest });
+            at += 1;
+        }
     }
 
     // The key: the compiler by its shelf digest, the SDK by its version (D69), the tools.

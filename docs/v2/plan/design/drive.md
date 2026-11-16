@@ -279,10 +279,12 @@ once; the plant `RanUnderCondition` (an asker served a fork it does not imply) i
   workspace's outside dependencies are one finding, 10, on the root manifest's
   `[workspace.dependencies]` (else `[dependencies]`) header: their count and the first four
   names, sorted, each once (tempo had 1,204 per-line findings before).
-- **Tasks today** (`work.rs`): `Units`, and `FileItems` (blaze-file-items' outline). A file's
+- **Tasks today** (`work.rs` `builds`): `Units`, `UnitGraph`, `Fetch`, `FileItems`, `Surface`,
+  `MacroModule`, `CrateScope`, and `BodyCheck` for syntax only (`whole` says so). A file's
   record is its `FileItems` record bytes, each `mod x;` is a `Locate::File` part (the slot `x.rs`,
   `x/mod.rs` probed on `Open`; `#[path]` read), and each syntax error is a finding. Every other
-  kind answers `Failed(NotBuilt)`. Runs go one at a time (the pool waits on bstd).
+  kind answers `Failed(NotBuilt)`. `FileItems` and `BodyCheck` run on the pool, the rest on the
+  main thread. What comes next: "End state: the whole pipeline on the command", below.
 - **What a command says it covered.** `Command::needs` (request.rs) lists the kinds a command
   is defined to cover; `work::builds` says which this worker builds and `work::runner_does`
   which the program runner does for `run`. The closing note names each stage left out, from
@@ -1040,6 +1042,85 @@ once; the plant `RanUnderCondition` (an asker served a fork it does not imply) i
       `item_chain`; the property test draws one `use` until then). Unresolved-import fix: left;
       the names world has no scope's names with their text (typeck.md owes the question).
       `fix::checker_findings` waits for the TYPES stage (comment at main.rs `draw`).
+    - RUNNER 10 2026-11-16 (uncommitted; handed on early, out of context; tree 3f8b478055
+      dirty). Task: `blaze check` and `blaze test` in blaze's own checkout (198 crates) answer
+      correctly and fast. DONE, one piece: `test` starts no program. request.rs
+      `starts_program(command, plant)` is the one home (`run` alone); the walk's class asks it
+      too. sim.rs: the commands property now refuses a `test` that started a program or
+      answered as one; `Plant::TestStartsProgram` is the old behaviour, caught by
+      `control_a_test_that_starts_a_program_is_caught`. Seen: "test blaze-drive: exit 0; 38
+      passed, 0 failed" (37 before), "blaze-cli: check ok (all targets)". blaze-cli's `close`
+      already prints "tests are not run yet" and returns FAILED for `test`; NOT yet seen on a
+      real run (no release build of this tree was made).
+      WHERE RUNS GO. Never in /Volumes/Projects/blaze: a run writes `<checkout>/.blaze/v2/last`
+      under its own tool id and knocks out the installed blaze's standing answer there. Use the
+      clone: `cd /Volumes/Projects/blaze-int-1112-notes/port27/drive-1116/main-clone` (APFS
+      clone of the main checkout at 10ca641a15 dirty, `target/` cloned too: 374,012 entries)
+      with `HOME=.../port27/drive-1116/home` (a clone of the toolchain shelf; the machine
+      stores `own` and `shared` start empty). The 11:10 build is kept beside as `blaze-1110`.
+      DEFECT, not fixed (the coordinator's order: after items 1 to 3): `last` is one file at a
+      fixed path holding one tool's answer, so two builds in one checkout replace each other's
+      certificate. A record is valid by its key and the tool is in the key: the pointer should
+      be found by the tool's id (`.blaze/v2/last/<tool id>`, or the pointer a record under a
+      key of tool + checkout), each written whole, the old ones swept by age.
+      DIAGNOSIS SO FAR of the check (11:10 build in the clone, load 12 to 17): cold home,
+      "42.79 real 133.99 user", 811 MB peak RSS, exit 101: "blaze_own: the allocator refused
+      2850816 bytes aligned to 8 for `blaze_drive::request::Effect<'_>`" (raw.rs:170). A cold
+      home FETCHED 291 crates from the network into `.blaze/v2/sources` (161 MB) before it
+      died. Second run (sources present): "75.17 real 118.63 user", the same panic. No
+      profile is written by a command that panics, so the phases line does not exist for
+      this run: the first job is to make it exist (below). From `sample` (14,143 samples of the
+      main thread, port27/drive-1116/clone-check-1110.sample.txt): 12,736 in
+      `work::run_batches`, of them 9,415 parked in `Task<Pooled>::join` while 18 workers
+      outline files (lexer, parser, `blaze_file_items::skeleton`), 3,303 running a pooled job
+      inline on the main thread; 849 in `PackStore::put`, 832 of them `memmove` (the pack's
+      buffer grown by copying: store.rs, the store lane's); 137 in `Request::step`.
+      WHAT FILLS THE COMMAND'S 64 MiB FRAME (read, not yet measured: measure before fixing).
+      The root frame is bstd's `MAIN_SCRATCH` = `TASK_FRAME` (blaze-std entry.rs:42). Into it
+      go, for the whole command: (1) main.rs `effects: Vec<Effect, Alloc>` and `todo:
+      VecDeque<Effect, Alloc>` over `alloc` = the ERASED COMMAND FRAME (main.rs `erased`): a
+      bump frame keeps every outgrown buffer, and the refusal seen is this vector's growth;
+      (2) work.rs `job_of`: every `FileItems` and `BodyCheck` task's path copied into the
+      command's frame (one copy per BODY); (3) `answer_batch`: a failed task's path and words;
+      (4) `Settled::grown_in(frame)`: each growth leaves the old table; (5) `run_one(..,
+      frame, ..)` hands the command's frame to every task run on the main thread (`UnitGraph`,
+      `CrateScope` in names.rs: `Facts::names: Option<Names<'f>>`, the graph, the layout,
+      fetch). Each is per-task or per-batch work held for the command's life, against
+      "memory is held by lifetime".
+      THE FIX, in order: (a) the profile is written when the command fails too, and `Phases`
+      gets the command frame's bytes per phase and per effect kind (`frame.used()` deltas at
+      each `mark`, around `req.step`, around `run_one` by task kind): then quote the rows;
+      (b) `effects`/`todo` move to the named global allocator like the machine itself
+      (`Request::planted_in(.., Alloc::global())`: what it hands out is freed once
+      performed); `job_of`'s path lives in the batch's frame or is borrowed from the request
+      (`req.file_of`) for the spawn; tasks on the main thread get the scratch and batch
+      frames only, and what a `CrateScope` keeps for later tasks is its record; (c) the class
+      "an infallible push into a bounded frame": blaze-cli has hundreds of `Vec<_, &Frame>`
+      pushes into the command's frame; close it at one seam, not per call: the request's
+      state takes a `Kept<'f>` handle whose only growth is `try_` (a typed
+      `CliError::FrameFull { frame, doing, asked, used, limit }`), the bare `&Frame` no
+      longer passed below `request`; until then the command's edge has no `catch_unwind`, so
+      a refusal on the main thread is a panic with a backtrace (tasks have one: `run_one`).
+      NOT DONE (items 1, 3, 4, 5 of the brief): program.rs `run` still calls `root.list`
+      (whole depth, the `target/` walk): hand it the rows' slots as `program_refusals`
+      (main.rs) already reads them, the package from the units record, a typed refusal for a
+      workspace; no timings taken with a build of this tree; `tests/run_output.rs
+      a_clean_run_prints_only_its_program` (the "names resolved for .." note is printed by
+      main.rs `request` after `draw` whenever `names.unresolved > 0`: on `run` it goes to the
+      error stream with the findings; decide there whether a clean run says it).
+      TWO DESIGNS ARRIVED AFTER THE HAND-ON (read both before item 3; neither is built):
+      the parallelism architect's, parallel.md "End state (architect, 2026-11-16)" points 5
+      and 7: the command's root frame takes `FRAME_RESERVE` (4 GiB of address space,
+      blaze-mem frame.rs:64), not `TASK_FRAME`, its peak reported in `HighWater`; `Job` names
+      its file by index into the `files` table instead of `job_of`'s copy; growth on the
+      command frame through blaze-own's `try_*` forms with a typed error naming the frame
+      ("command"), the bytes asked, its peak and reserve; a pooled task's refusal a typed
+      `FrameFull { used, limit, asked }` in `pooled`, not `Why::Panicked`; the test: a few
+      thousand generated files with the command frame made small by a `Sizes` plant finish,
+      and with the per-task copy put back fail with the typed error. And the pipeline
+      architect's build order for this lane's files, "End state: the whole pipeline on the
+      command" below, "Gap" and "Pieces" (1 MEMBERS, 2 POOLED SCOPES, 3, 6, 7, 9, 11, 13; 14
+      any time after 2).
 - Owed, not now: `run` after `check` writes its own certificate, because the command is in
   the key. That costs 3.5 ms against the second run's 1.0 ms on hello-world. A coarse proof
   covers all under it: `check`'s certificate should stand for `run`'s check part.
@@ -1056,3 +1137,143 @@ once; the plant `RanUnderCondition` (an asker served a fork it does not imply) i
   step from the manifest, default `rust`; one counted dependency finding; get_many; the
   upgrade note once a command; conditions (piece 3); a test that a workspace past one frame
   checks and a planted oversize item fails one task.
+
+## End state: the whole pipeline on the command (architect, 2026-11-16)
+
+The finished command: `blaze check` in a real workspace runs every stage as tasks of the request
+machine, in parallel, each result a record; `run` and `test` run the same tasks for what their
+program reaches. Stands: "The request machine", "Names, sources and keys", "Records and
+validity" (value keys, the answer table and its readers, the forward check), "Tasks and Need",
+"Scheduling on many cores", "One check covers every configuration", "The gate". Key =
+H(tool, kind, subject, source); the source is text known before the work; no key holds a path.
+
+| Kind (grain) | Source | Reads (read list) | Record; out digest |
+|---|---|---|---|
+| `Units`, `UnitGraph` (request) | manifests, lock, target, ask | `Fetch`'s manifests | units, cfg, deps; its bytes |
+| `FileItems` (file) | content id, edition | none | outline; per item a names, a signature and a body piece digest; slots; syntax findings |
+| `Surface` (file) | its names pieces' digest | none | none; out = source, so a body or a type edit leaves it |
+| `CrateScope` (crate) | the unit's identity row | its `Surface`s, deps' exports, its `ScriptRun`, `Expansion`s | exports, inner, names and items records (item at file + chain + piece digests; impls by resolved (trait, self head)); out = exports' digest |
+| `Expansion` (call) | expander code id, tokens, attribute, edition | the macro's module | tokens; made in place on the asking worker |
+| `Signature` (item head) | crate identity, item key, signature piece | its paths' name answers, aliases' heads | lowered head with lifetimes; its digest |
+| `BodyCheck` (fn, const, static body; its closures) | crate identity, item key, body + signature pieces | each fact asked: names, heads, buckets, const values, Copy/Drop | types; findings and refusals, item-relative; made facts; out = made facts' digest (empty for most) |
+
+- An impl bucket is a fact, not a task: (trait, self head) is answered from the items records of
+  the crates the orphan rule allows (RFC 2451: the trait's crate and those of the nominal types
+  in the trait reference; inherent: the self type's crate) plus their unresolved rows. A body's
+  read list names each (crate, bucket) it asked, so an impl added elsewhere moves no body.
+- Types and borrows are one task: the flow is lowered from the typed body in the same frame.
+- No world in memory (rule 70): `CrateScope` reads its own crate and its dependencies' exports
+  by key; `BodyCheck` opens records as its questions reach them (`front2::source::Records` over
+  the store) in its worker's frame. Peak: workers times the frame cap, plus mapped pages.
+- Parallel, deterministic: batches of one kind; needs answered in place (settled table); a
+  record is a function of its key and answers, so any worker or machine writes equal bytes; the
+  answer is the sorted merge of rows; findings are printed by (path, item start, range, rule).
+- **Repeat**: the certificate, one read, no task. **Body edit**: `FileItems` of the file runs;
+  its `Surface` and other parts stand unrun; one `BodyCheck` runs; its out is unchanged, so no
+  reader is dirtied: two tasks. **Signature edit** (types, not names): `FileItems`, then the
+  item's `Signature`; its out moved, so its readers in the answer table run: its body and N.
+  **Name edit**: the `Surface` moves; its crate's `CrateScope` runs; an equal exports digest stops
+  there; bodies whose name answers moved run. Re-solving the whole crate is over the floor until
+  `ModuleScope`/`Group` take the solve at module grain.
+- **Errors before the answer**: jobs dirtied by changed files are queued first; an error-class
+  finding is shown as its record settles (`Effect::Found`, a live line in the person view on a
+  terminal); the answer prints the full sorted list, the same bytes whatever the settle order.
+- **A form a stage cannot take** is a refusal record of that item (`Why::Refused { what, rule }`,
+  the item named), filed at its key, so a repeat does not retry it and a new tool does. Its
+  readers fail `Waited` naming it. The closing line counts refused items per stage with the
+  first three reasons; the status is 3 (incomplete); `ok` only when every `CHECK_STAGES` stage
+  ran on every item. No fallback; a panic fails its task alone.
+
+**Floors** (rule 67). Measured inputs: tempo's outline 194.7 ms for 816 files and its 52
+members' names 0.57 s, one thread (tempo.md rows c, e); a body check 1.56 ms mean (31.2 s for
+20,000, one thread) and a head 65 µs (2.4 s for 36,707), tempo-front-9.txt; a question through a
+names record 0.13 to 0.45 ms cold. blaze: 5,181 files, 2.37 M lines under crates/ (git ls-files),
+5.8 times tempo's 409,322, so about 87,000 bodies (estimate). Floor = work / cores + critical path.
+
+| Operation | tempo | blaze | Derivation |
+|---|---|---|---|
+| Repeat | 2 ms (13 ms today) | 3 ms | ~870 / ~5,800 stats on 8 cores + one certificate read |
+| Body edit | 4 ms | 4 ms | sweep + one outline (0.24 ms) + one body (1.56 ms) + pages; design 6-10 ms (cold scope decode) |
+| Signature edit, N readers | (N+1) x 1.6 ms / cores | same | the head + N bodies |
+| First run, deps from the bucket | 1.8 s / 18 cores; 0.3 s / 128 | 13 s / 12-core Mac; 1.3 s / 128 | CPU 32 s (tempo), ~160 s (blaze): outline + member names + bodies + borrows (+30%, estimate) |
+| First run, no bucket | + 29.5 s CPU of names | (today: 42.8 s, then a panic) | the graph's names once (tempo-front-9.txt), over the crate graph's levels |
+
+The body check's own 1.56 ms is the type checker's floor question, not the driver's.
+
+Others (match, then what blaze does better by design): rust-analyzer/salsa, early cutoff by value
+(out digests), but its graph dies with the process. Buck2/Bazel, input-keyed actions and a
+shared cache, but target grain and a daemon. Zig, per-declaration dependencies, held in one
+process. Sorbet, parallel per-method checks and a fast path while the symbol table's hash holds:
+`Surface` is that path. Hack, CI's saved naming state and fan-out by declaration edges: the
+bucket's public records and the reverse index, no server. Flow types-first, bodies independent
+given annotated exports: Rust's are written. TypeScript's Go port, checkers sharded over files
+but a whole check per run: here an edit costs its bodies.
+
+### Gap (code read 2026-11-16, tree 3f8b478055 dirty)
+
+| Needed | Today (evidence) | Missing | Reached by |
+|---|---|---|---|
+| Names in a multi-member workspace | cli names.rs `world`: more than one path package is `NamesError::PathPackages` | each member placed at its directory (`blaze_world::Fetched::paths`) | the command (refuses tempo and blaze) |
+| Scopes in parallel | work.rs `run_batches` pools `FileItems`, `BodyCheck` only; `CrateScope` runs in `run` on main, `resolve_crate(.., &Serial, ..)` | pooled, per-task frame | the command |
+| No per-command world | names.rs `world`: every crate's inputs, leaked, `Alloc::global()` | per task, by key | the command |
+| Build scripts' outputs | names.rs: `blaze_world::world(.., None, ..)` | `ScriptOutputs` from `ScriptRun` | the command (missing) |
+| Names and items records | names.rs `run` writes exports + inner; `names_record::encode`, `items_record::encode` only via blaze-scope `Kept` hooks | filed in the `CrateScope` record | tests, blaze-world examples/names.rs |
+| Item-grain text in the items record | items_record.rs `Seen::Stale`: a file's whole digest, so any edit voids its items | per item: chain and piece digest | tests |
+| Body types | work.rs `body_syntax` parses only (`whole(BodyCheck)` false); `ProjectWorld::check` | the call, over records | tests/front2_project.rs, examples/tempo_front.rs |
+| Front end over records | `Front2::from_records`; `ProjectWorld::new` takes `&Names` | `ProjectWorld` over `&Records` | tests/front2_records.rs |
+| One body identity | cli `body_name` (file + chain) vs front2 `BodyRef` (LibKey) | a body found by (file, chain) | neither |
+| Read lists as facts | `BodyVerdict::reads`: one digest, clean bodies only | sorted (fact, digest) pairs, every body | tests |
+| Signatures as records | front2 heads.rs `Store`, in memory per command; `builds(Signature)` false | a head record, a task | examples |
+| Impl buckets per crate | buckets.rs `Buckets::new` reads every impl header of the index | rows per crate, orphan-bounded question | examples, tests |
+| Borrow check | blaze-flow-lower `lower`, blaze-flow | in the body task | tests/flow_census.rs |
+| Errors before the answer | main.rs `Effect::Print(f) => prints.push(f)`, printed at the end | `Effect::Found` at settle | the command (at the end only) |
+| Expansions kept | per-command `Prepares`; `builds(Expansion)` false | records by key | the command (redone each solve) |
+
+### Pieces (build order; one writer each; the dependencies' architect is assumed to give: each
+outside package's files through its `Fetch` record or `NotFetched` by name; `ScriptRun(unit)`
+answering `blaze_world::ScriptOutputs::served`; public `CrateScope` and `Signature` records of
+registry and toolchain crates found by key in the machine store or bucket; `MacroModule` records)
+
+1. MEMBERS. cli names.rs `world`: every path package at its member's directory from the
+   `Units` record. Test: two members, `b` calls `a::f`, no unresolved finding; `a::g` is one.
+2. POOLED SCOPES (after 1). work.rs `run_batches`/`answer_batch`: `CrateScope` on the pool, its
+   world read-only and `Sync`, each solve in its task frame. Test: a six-crate diamond gives equal
+   records and findings at `--workers 1` and 4; a counter shows two solves at once.
+3. NAMES AND ITEMS FILED (after 2, same file). names.rs `run`: append both encodings to the
+   payload, offsets in the head; `sections(payload)`. Test: the record answers `crate::m::f`
+   through `RecordNames` and `f`'s row through `RecordItems`.
+4. ITEM-GRAIN ITEMS RECORD (any time). blaze-scope items_record.rs: a row carries its item chain
+   and piece digests; `Stale` for that item only; front2 `Load::item` by (file, chain). Test: a
+   body edit of `g` leaves `f` readable; an edit of `f`'s signature is `Stale` for `f` alone.
+5. PROJECT WORLD OVER RECORDS (any time). front2 project.rs: `ProjectWorld` over a
+   `NamesSource`, `from_records`, `body_by_chain(file, chain)` (the chain function moved to
+   blaze-file-items, one home). Test: every rung body's verdict over records equals over `&Names`.
+6. STORE LOAD (after 3). NEW blaze-cli front_load.rs: front2 `Load` over the store (sections by
+   crate key from the `UnitGraph` parts; files from the checkout or the `Fetch` pack). Test: a
+   body checked through it equals the solved path.
+7. TYPES IN THE BODY TASK (after 4, 5, 6). work.rs `BodyCheck` arm: one `Records` per worker per
+   command; diagnostics as `TYPES` findings; gaps and refusals as refusal findings; status 3.
+   Test: `fn f() -> u32 { "x" }` is one error at its range, a line added above moves it with the
+   record reused; an `.await` body prints "not checked: types" and never `ok`.
+8. READ LISTS AS FACTS (any time). front2 check.rs: `reads` as sorted (fact, digest) for every
+   body. Test: of two bodies, only the one naming `a::f` lists `f`'s head.
+9. FACTS AS READERS (after 7, 8). work.rs/request.rs: each fact a drive name (a `CrateScope`
+   section, a `Signature`), read-listed. Test: a signature edit re-runs only its readers.
+10. HEAD RECORDS (any time). NEW front2 head_record.rs: one head encoded, decoded, round trip.
+    Test: every head of the rungs round-trips equal.
+11. SIGNATURE TASKS (after 9, 10). `builds(Signature)`; its arm lowers one head over records;
+    a body's need of it answered in place. Test: a body edit runs 0 `Signature`s; a type edit 1.
+12. BUCKETS PER CRATE (after 3). items_record.rs files impls by resolved (trait, head); front2
+    `Buckets` asks the orphan rule's crates only. Test: `Display for a::T` opens `core` and `a`.
+13. BORROWS IN THE BODY TASK (after 7; heads' lifetimes). Test: a use after a move is one error
+    at its range; a refused form is "not checked: borrows"; `whole(BodyCheck)` true with both.
+14. ERRORS AS THEY SETTLE (after 2). request.rs `Effect::Found` at settle, dirtied jobs first;
+    main.rs a live line. Test (sim): `Found` precedes `Done`; the JSON view is byte-equal.
+15. SCRIPTS IN (after 2; the dependencies' `ScriptRun`). names.rs `world`'s `ScriptOutputs`.
+    Test: `rustc-cfg=foo` from build.rs turns on `#[cfg(foo)] fn f`.
+16. EXPANSION RECORDS (any time). blaze-scope: an expansion kept by key through a `Kept` hook.
+    Test: re-solving a crate after a name edit expands no unchanged derive again.
+17. MODULE GRAIN (after 11). `ModuleScope`/`Group` take the solve; `CrateScope` assembles.
+
+At once: 1, 4, 5, 8, 10, 16 (separate crates or files); then 2, 3, 12, 14 and 6; then 7, 15;
+then 9, 13; then 11, 17.

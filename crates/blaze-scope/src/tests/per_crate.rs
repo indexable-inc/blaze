@@ -390,6 +390,54 @@ fn an_include_of_a_package_file_declares_its_items_relative_to_the_calling_file(
     }
 }
 
+/// Reduced from libp2p-identity 0.2 (`src/lib.rs`: `mod proto { include!("generated/mod.rs");
+/// pub(crate) use self::keys_proto::*; }`, whose `src/generated/mod.rs` writes `pub mod
+/// keys_proto;` for `src/generated/keys_proto.rs`): the header `impl From<&PublicKey> for
+/// proto::PublicKey` that stopped 1,897 bodies of tempo, since `keys_proto` was looked for in
+/// `src/proto/` (the calling module's folder) and not found.
+///
+/// The rules: core `macros/mod.rs`, `include!`: "The file is located relative to the current
+/// file (similarly to how modules are found)"; the Reference, "Modules", "Module Source
+/// Filenames": "A module without a body is loaded from an external file. When the module does
+/// not have a `path` attribute, the path to the file mirrors the logical module path. Ancestor
+/// module path components are directories, and the module's contents are in a file with the
+/// name of the module plus the `.rs` extension." The included file is the current file of what
+/// it writes (`crate::included`): its `mod keys_proto;` is `generated/keys_proto.rs`, and its
+/// inline `mod deep { pub mod leaf; }` is `generated/deep/leaf.rs`.
+///
+/// A fix that keeps the calling module's folder finds the planted `src/proto/keys_proto.rs`
+/// (which has no `PublicKey`) and fails on "Unresolved"; one that finds no file fails on the
+/// `Made { .. FileNotFound .. }` note. Passing prints
+/// "test tests::per_crate::a_mod_in_an_included_file_is_found_from_the_included_file_s_folder ... ok".
+#[test]
+fn a_mod_in_an_included_file_is_found_from_the_included_file_s_folder() {
+    static ID: Texts = Texts(&[&[
+        (
+            "/id/src/lib.rs",
+            "#![no_core]\n#[rustc_builtin_macro]\nmacro_rules! include { () => {} }\nmod proto {\n    include!(\"generated/mod.rs\");\n    pub(crate) use self::keys_proto::*;\n    pub(crate) use self::deep::leaf::Leaf;\n}\npub(crate) use proto::PublicKey;\npub(crate) use proto::Leaf;\n",
+        ),
+        ("/id/src/generated/mod.rs", "pub mod keys_proto;\npub mod deep {\n    pub mod leaf;\n}\n"),
+        ("/id/src/generated/keys_proto.rs", "pub struct PublicKey;\n"),
+        ("/id/src/generated/deep/leaf.rs", "pub struct Leaf;\n"),
+        // The plant: what the calling module's folder would give.
+        ("/id/src/proto/keys_proto.rs", "pub struct Decoy;\n"),
+    ]]);
+    let mut id = input("id", "/id/src/lib.rs", &[]);
+    id.shown_from = "/id/";
+    let crates = [id];
+    let (done, _) = resolve_by_records(&crates, Sysroot::default(), &ID, &Serial, &Ready::serial(WAIT), Alloc::global()).unwrap_or_else(|e| panic!("by records: {e:?}"));
+    for c in &done {
+        let text = scopes_of(c.names).join("\n");
+        let notes = format!("{:?}", c.names.notes);
+        assert!(
+            text.contains("PublicKey") && text.contains("Leaf") && !text.contains("Decoy") && !text.contains("Unresolved") && !text.contains("NotFound"),
+            "crate `{}`: the names of the included file's modules resolve:\n{text}\nnotes: {notes}",
+            c.names.name
+        );
+        assert!(!notes.contains("Made {"), "crate `{}`: every module the included file writes is made: {notes}", c.names.name);
+    }
+}
+
 /// Reduced from serde_core 1.0.228 (`src/lib.rs`: `include!(concat!(env!("OUT_DIR"),
 /// "/private.rs"));`, the file its build script writes): the 5 unresolved imports of
 /// `serde_core_private` in tempo. The builtins take macro calls in their arguments' places and

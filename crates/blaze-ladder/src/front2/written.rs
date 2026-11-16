@@ -26,10 +26,7 @@
 //! program (rustc's E0391): step 3 would re-enter itself, which [`Heads::written_depth`]
 //! counts and [`MOST_NESTED`] bounds with a typed refusal.
 
-use std::alloc::Global;
-use std::boxed::Box;
-use std::format;
-use std::vec::Vec;
+use std::{alloc::Global, vec::Vec};
 
 use blaze_id::ItemKey as LibKey;
 use blaze_lower::{View, form as lf, head};
@@ -96,7 +93,7 @@ fn written_bounds(v: &View<'_>, subject: Subject, out: &mut Vec<lf::TypeId, Glob
     Ok(())
 }
 
-impl<'b, 'n, H: Heads> Builder<'b, 'n, H> {
+impl<'b, 'n, H: Heads, S: super::source::NamesSource<'n>> Builder<'b, H, S> {
     /// Whether `tr` or one of its supertraits (through theirs, a work list) declares an
     /// associated type `name`: by name only, from the heads; no argument is read.
     fn declares(&self, tr: LibKey, name: Name, r: Range) -> Result<bool, Why> {
@@ -180,10 +177,7 @@ impl<'b, 'n, H: Heads> Builder<'b, 'n, H> {
             };
             let d = depth.get();
             if d >= MOST_NESTED {
-                return Err(Why::Program(
-                    format!("`{shown}` is written in a bound that must itself be read to find the trait of `{shown}`: the bounds need each other in a cycle").into_boxed_str(),
-                    r,
-                ));
+                return Err(Why::Program("this type-relative path is written in a bound that must itself be read to find the path's trait: the header's bounds need each other in a cycle".into(), r));
             }
             // Set back on every way out: a `Why::Need` passes up and the item is lowered again.
             depth.set(d + 1);
@@ -205,7 +199,7 @@ impl<'b, 'n, H: Heads> Builder<'b, 'n, H> {
             many => {
                 let mut traits = Vec::with_capacity_in(many.len(), Global);
                 traits.extend(many.iter().map(|&(t, _)| t));
-                Err(Why::AssocAmbiguous(Box::from(shown), traits, r))
+                Err(Why::AssocAmbiguous(shown.into(), traits, r))
             }
         }
     }
@@ -217,7 +211,7 @@ impl<'b, 'n, H: Heads> Builder<'b, 'n, H> {
         let me = intern(tys, PNode::Param(0))?;
         match self.written_assoc(tys, env, v, Subject::TraitSelf, me, name, r, shown)? {
             Some(t) => Ok(t),
-            None => Err(Why::AssocNotFound(Box::from(shown), r)),
+            None => Err(Why::AssocNotFound(shown.into(), r)),
         }
     }
 

@@ -985,6 +985,7 @@ fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
             let mut tries = 0;
             let result = match found { Err(e) => Err(e), Ok(Some(found)) => Ok(found), Ok(None) => loop {
                 tries += 1;
+                par.stage(crate::task::Stage::Try);
                 let me = local.len();
                 let ids = mapped.map(|p| p.map(|p| CrateId(p as u32)));
                 let own = |s: Option<CrateId>| s.filter(|s| s.index() == at).map(|_| CrateId(me as u32));
@@ -1051,16 +1052,17 @@ fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
                         let q = locked(&queue);
                         handed.extend(local.iter().filter_map(|&g| q.digests[g].map(|d| (crates[g].key, d))));
                     }
+                    par.stage(crate::task::Stage::ReadList);
                     let read = crate::asked::encode(input.key, &handed, &done.asked, alloc);
                     k.made(at, &done.record, &done.inner, &read);
                     if k.keeps_names() {
-                        let names = crate::names_record::encode(done.names, alloc)
-                            .unwrap_or_else(|e| panic!("the names record of `{}` did not write: {e:?}", input.name));
+                        par.stage(crate::task::Stage::NamesRecord);
+                        let names = crate::names_record::encode(done.names, alloc).unwrap_or_else(|e| panic!("the names record of `{}` did not write: {e:?}", input.name));
                         k.names(at, &names);
                     }
                     if k.keeps_items() {
-                        let items = crate::items_record::encode(done.names, alloc)
-                            .unwrap_or_else(|e| panic!("the items record of `{}` did not write: {e:?}", input.name));
+                        par.stage(crate::task::Stage::ItemsRecord);
+                        let items = crate::items_record::encode(done.names, alloc).unwrap_or_else(|e| panic!("the items record of `{}` did not write: {e:?}", input.name));
                         k.items(at, &items);
                     }
                 }
@@ -1074,6 +1076,7 @@ fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
                     Solved::Found { record, .. } => record,
                 };
                 let digest = ContentId::of(EXPORTS_DOMAIN, own);
+                par.stage(crate::task::Stage::Decode);
                 ready.hooks.decoding(at);
                 let bytes = crate::resolve::aligned(own, alloc);
                 let decoded = read_record(bytes, alloc).map_err(|error| CrateScopeError::OwnRecord { krate: input.name, error })?;
@@ -1101,6 +1104,7 @@ fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
                 }
                 woken.notify_all();
             }
+            par.stage(crate::task::Stage::Done);
             ready.hooks.ended(at, w);
         }
     };
@@ -1200,6 +1204,7 @@ fn resolve_crate_decoded<'a, S: SourceTexts<'a>, P: Par>(
         built.ask(|| Question::krate(*d, alloc));
     }
     let names = resolve_one::<S, P>(&graph, input, id, source, &built, sources, par, First::Prefetch, prepares, alloc).map_err(CrateScopeError::Names)?;
+    par.stage(crate::task::Stage::Write);
     let Records { exports, inner } = write_records(&names, &built, leak_private, alloc).map_err(|error| CrateScopeError::Write { krate: input.name, error })?;
     let names: &'a CrateNames<'a> = Box::leak(Box::new_in(names, alloc));
     Ok(CrateScope { names, record: exports, inner, asked: asked.take() })

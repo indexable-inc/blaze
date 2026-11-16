@@ -1181,6 +1181,11 @@ impl<A: Allocator> Pass<'_, '_, A> {
             Op::Invoke | Op::InvokeIndirect | Op::Resume => return Err(unsupported(inst, op, "unwinding")),
             Op::TailCall | Op::TailCallIndirect => return Err(unsupported(inst, op, "a tail call")),
             Op::Asm | Op::AsmBr => return Err(unsupported(inst, op, "inline assembly")),
+            // A coroutine body is split by `blaze_lir::coroutine::split` before any backend
+            // (decision D73); its two outputs hold neither operation.
+            Op::Suspend | Op::Cancelled => {
+                return Err(unsupported(inst, op, "a suspend reached the emitter: the coroutine pass did not run"));
+            }
             Op::TargetIntrinsic => return Err(unsupported(inst, op, "a target intrinsic")),
             Op::FrameAddress | Op::ReturnAddress | Op::StackPointer => {
                 return Err(unsupported(inst, op, "a machine register read (frame or return address, stack pointer)"));

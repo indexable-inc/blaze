@@ -543,6 +543,17 @@ by default; bindgen's text holds no paths. Proven by a two-run byte compare once
     `native_sandbox::run` keeps `t0`, and on a non-zero exit `NativeScriptError::Failed` gains
     `refused: [(op, path)]` from the tagged lines, each printed beside the script's own error.
     Not written: it runs `/usr/bin/log`, which needs the tag test first.
+  - First round, integrator's lines: blaze-build-script "check ok (all targets)", "45 passed, 0
+    failed"; blaze-proc-macro "check ok", "test (filter native): 13 passed, 0 failed"; scripts
+    "check ok", native builder test "1 passed". Real runs: (a) the builder under the new
+    profile was refused: cargo's LibreSSL reads `/private/etc/ssl/openssl.cnf` at start ("Auto
+    configuration failed ... Operation not permitted"); (b) sha3-asm reached perl, but the
+    `.S` was untranslated perlasm: `keccak1600-armv8.pl` opens `| "$^X" arm-xlate.pl ..`, a
+    quoted command perl hands to `/bin/sh`, which reads the link `/private/var/select/sh` and
+    starts `/bin/bash`; neither was granted. Fixes, second round (NEVER COMPILED): the builder
+    reads that one file; a host tool gains `runs` (perl: `/bin/bash /bin/sh`, granted execute,
+    each keyed by its digest as `perl+<path>`), and `reads` gains `/private/var/select/sh`.
+    The host-tool test's perl now does a piped open of a quoted command.
 
 - **Runner 10: the first native scripts ran (D69), 2026-11-16.** Built: the pin table
   `crates/hir-ty-codegen/clang.json` (both 23.1.4 rows; `sysroots`: macOS `macos-sdk`, Linux

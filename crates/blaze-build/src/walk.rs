@@ -25,6 +25,8 @@ use crate::{Abi, Adts, BuildError, Built, Instance, Intrinsic, Subst, ground};
 #[path = "closure.rs"]
 mod closure;
 pub(crate) use closure::{build_fn_shim, closures_in};
+#[path = "coroutine.rs"]
+pub(crate) mod coroutine;
 
 mod casts;
 mod fmt;

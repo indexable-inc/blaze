@@ -103,6 +103,9 @@ pub enum CliError {
     Shelf(toolchain::ShelfError),
     /// The pinned toolchain's manifest could not be read from the shelf.
     Toolchain(blaze_toolchain::ToolchainError),
+    /// The command's own code panicked outside any task (a task's panic fails that task): its
+    /// message is the panic hook's, above this on the error stream; the profile is written.
+    Panicked { command: &'static str },
 }
 
 impl fmt::Display for CliError {
@@ -126,6 +129,7 @@ impl fmt::Display for CliError {
             CliError::Input { name, why } => write!(f, "the input {name} a task needed could not be read: {why}"),
             CliError::Shelf(error) => write!(f, "{error}"),
             CliError::Toolchain(error) => write!(f, "the pinned toolchain: {error}"),
+            CliError::Panicked { command } => write!(f, "blaze {command} panicked (its message is above); what it had done is in .blaze/v2/profile.txt"),
         }
     }
 }
@@ -283,7 +287,7 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases) -> Resul
     drop(Vec::<u8, &Frame>::with_capacity_in(1, frame));
     phases.first_chunk();
     let checkout = checkout::checkout(flags.dir, frame)?;
-    phases.mark("arguments");
+    phases.mark_in("arguments", frame);
     let fs = io.need_fs()?;
     let checkout_at: &str = match &checkout {
         Checkout::Under(dir) => work::held_str(dir.as_str(), frame),
@@ -315,8 +319,8 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases) -> Resul
         (Some(pwd), None) => bstd::mem::format_in!(frame, "{pwd}"),
         (None, dir) => bstd::mem::format_in!(frame, "{}", dir.unwrap_or(".")),
     };
-    let mut shown = print::Shown::new(caps, view, shown_root.as_str(), frame);
-    phases.mark("open checkout");
+    let shown = print::Shown::new(caps, view, shown_root.as_str(), frame);
+    phases.mark_in("open checkout", frame);
     let mut ran = None;
     let workers = flags.workers.map_or(u32::try_from(workers).unwrap_or(u32::MAX), |n| n.get());
     let launch = program::Launch { io, grants: &flags.grants, args: &flags.program };
@@ -325,12 +329,10 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases) -> Resul
         let finished = request(cx, &root, (checkout_at, var("SSL_CERT_FILE"), var("SSL_CERT_DIR"), var("HOME"), var("PWD"), blaze_toolchain::PINNED), origin.as_ref(), (command, word), workers, tool, work::Sizes::USUAL, &launch, frame, out, err, ran, &mut shown, phases);
         finished.map(|finished| (finished, shown))
     };
-    let mut finished = match flags.fix {
-        None => {
-            let (finished, again) = ask(shown, &mut ran, phases)?;
-            shown = again;
-            finished
-        }
+    // The whole request, behind the command's one edge for a panic (rule 20): a command that
+    // fails or panics still leaves its profile, so why it stopped is read, not guessed (rule 17).
+    let asked = work::unwinding(|| match flags.fix {
+        None => ask(shown, &mut ran, phases).map(Some),
         Some((start, end)) => {
             if command != Command::Check {
                 return Err(CliError::Usage("--fix is `blaze check`'s"));
@@ -338,12 +340,22 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases) -> Resul
             let mut selectors: Vec<&str, &Frame> = Vec::with_capacity_in(end - start, frame);
             selectors.extend((start..end).filter_map(|at| args.get(at)));
             match fix_then_check::<fix::Atomic>(cx, &root, &selectors, (caps, view, shown_root.as_str()), frame, out, &mut |shown| ask(shown, &mut ran, phases))? {
-                Fixed::Refused => return Ok(Status::FAILED),
-                Fixed::Checked(finished, again) => {
-                    shown = again;
-                    finished
-                }
+                Fixed::Refused => Ok(None),
+                Fixed::Checked(finished, again) => Ok(Some((finished, again))),
             }
+        }
+    });
+    let (mut finished, shown) = match asked {
+        Ok(Ok(Some(done))) => done,
+        Ok(Ok(None)) => return Ok(Status::FAILED),
+        Ok(Err(error)) => {
+            print::profile_failed(cx, &root, &error, phases, frame)?;
+            return Err(error);
+        }
+        Err(work::Panicked) => {
+            let error = CliError::Panicked { command: word };
+            print::profile_failed(cx, &root, &error, phases, frame)?;
+            return Err(error);
         }
     };
     phases.frames = Some(finished.high);
@@ -364,7 +376,7 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases) -> Resul
         )?;
     }
     let status = close(cx, command, &finished, &shown, ran, phases.in_main(), frame, out);
-    phases.mark("answer printed");
+    phases.mark_in("answer printed", frame);
     // The answer is printed: the profile is written after it, in place, never synced.
     print::profile(cx, &root, &finished.answer, phases, frame)?;
     status
@@ -576,14 +588,14 @@ fn request<'f>(
             },
         },
     };
-    phases.mark("pointer read (last answer and leaf table)");
+    phases.mark_in("pointer read (last answer and leaf table)", frame);
     let stamps = FromMeta::now(phases.clock());
     let sweep_plant = match sizes.plant {
         work::Plant::Sweep(plant) => plant,
         _ => sweep::Plant::None,
     };
     let followed = sweep::Follow { stamps, plant: sweep_plant }.follow(&cx, root, &leaves, frame)?;
-    phases.mark("sweep");
+    phases.mark_in("sweep", frame);
     // No table: nothing to follow; the layout discovers forward from the root manifest, and the
     // drive opens each file as a record names it.
     let cold = leaves.len() == 0;
@@ -599,7 +611,7 @@ fn request<'f>(
             facts.rows.push(leaf.kind, leaf.flags, followed.now.path(leaf), leaf.stamp, leaf.id);
         }
     }
-    phases.mark("layout");
+    phases.mark_in("layout", frame);
     // The units' source: what the layout read. Equal reads, equal layout.
     let units = sweep::units_source(facts.rows.rows.iter().map(|leaf| (facts.rows.path(leaf), leaf)), frame);
     // The dependency graph's job, when a lock was read with the layout: its source needs the
@@ -609,7 +621,7 @@ fn request<'f>(
     {
         let target = graph::target(&cx, &facts.fetch_env, frame)?;
         laid.graph = Some(graph::Graph::new(parts, lockfile, units, target, command == Command::Test, frame));
-        phases.mark("the target's cfg");
+        phases.mark_in("the target's cfg", frame);
     }
     let mut files: Vec<FileEntry<'_>, &Frame> = Vec::with_capacity_in(followed.now.rows.len(), frame);
     let mut gone: Vec<&[u8], &Frame> = Vec::new_in(frame);
@@ -678,10 +690,12 @@ fn request<'f>(
     let mut opens: std::vec::Vec<(blaze_drive::Name, Vec<u8, Alloc<'_>>, bool), std::alloc::Global> = std::vec::Vec::new_in(std::alloc::Global);
     // The program's lowering refused it: its refusals are drawn with the request's findings.
     let mut refused = false;
-    phases.mark("machine and store open");
+    phases.mark_in("machine and store open", frame);
     let at = phases.now();
     let graph = facts.laid.as_ref().and_then(|laid| laid.graph.as_ref()).map(|graph| graph.source);
+    phases.took("before the machine starts", frame);
     req.step(Event::Start { files: &files, gone: &gone, last, units, cold, graph }, &mut effects)?;
+    phases.took(STEP, frame);
     phases.request.steps += phases.since(at);
     let mut started = 0;
     // The machine's answer once it came. Under the reached gate it answers at the program's exit
@@ -692,6 +706,7 @@ fn request<'f>(
         for effect in effects.drain(..) {
             todo.push_back(effect);
         }
+        phases.took("the work list (effects moved to it)", frame);
         let Some(effect) = todo.pop_front() else {
             // Every open asked is probed together on the pool once nothing else is asked, then
             // answered in the order asked: each answer may ask a read, then a run.
@@ -703,6 +718,7 @@ fn request<'f>(
                 }
                 let at = phases.now();
                 let probed = work::open_all(&cx, root, &facts.stamps, facts.workers, sizes.scratch, &slots)?;
+                phases.took("opens probed", frame);
                 for ((name, path, _), probed) in slots.iter().zip(probed) {
                     let slot = core::str::from_utf8(path).map_err(|_| CliError::Text { what: "a path a record names is not UTF-8" })?;
                     let id = sweep::opened(slot, probed?, &mut facts.rows);
@@ -710,7 +726,9 @@ fn request<'f>(
                         facts.found.note(slot, leaf.flags);
                     }
                     let stepped = phases.now();
+                    phases.took("rows of the files opened", frame);
                     req.step(Event::Opened { name: *name, id }, &mut effects)?;
+                    phases.took(STEP, frame);
                     phases.request.steps += phases.since(stepped);
                 }
                 phases.request.gets += phases.since(at);
@@ -725,6 +743,7 @@ fn request<'f>(
                 };
                 let ready = core::mem::replace(&mut batches, std::vec::Vec::new_in(std::alloc::Global));
                 work::run_batches(&cx, root, &mut store, &mut facts, &mut req, ready, frame, held, &mut failed, &mut high, alloc, &mut effects, phases)?;
+                phases.took("batches joined", frame);
                 continue;
             }
             // A request that is out of effects without its answer is the machine's bug: named.
@@ -736,6 +755,18 @@ fn request<'f>(
         {
             continue;
         }
+        let kind = match &effect {
+            Effect::Get { .. } => "effect get",
+            Effect::Put { .. } => "effect put",
+            Effect::Run { .. } => "effect run (a batch queued)",
+            Effect::Publish(_) | Effect::Unpublish(_) => "effect publish (the settled table)",
+            Effect::Open { .. } => "effect open (queued)",
+            Effect::StartProgram { .. } => "effect start program",
+            Effect::Stop { .. } => "effect stop",
+            Effect::Print(_) => "effect print",
+            Effect::WriteLast { .. } => "effect write last",
+            Effect::Done(_) => "effect done",
+        };
         match effect {
             Effect::Get { key } => {
                 // Read into a frame reset once the machine has taken what it keeps of it.
@@ -745,7 +776,9 @@ fn request<'f>(
                     let bytes = found.then_some(bytes.as_slice());
                     let stepped = phases.now();
                     phases.request.gets += phases.since(at);
+                    phases.took(kind, frame);
                     req.step(Event::Got { key, bytes }, &mut effects)?;
+                    phases.took(STEP, frame);
                     phases.request.steps += phases.since(stepped);
                 }
                 high.got = high.got.max(got.peak());
@@ -792,7 +825,9 @@ fn request<'f>(
                     Err(error) => return Err(error),
                 };
                 let stepped = phases.now();
+                phases.took(kind, frame);
                 req.step(Event::Exited { ok }, &mut effects)?;
+                phases.took(STEP, frame);
                 phases.request.steps += phases.since(stepped);
             }
             // The in-process program has ended before any finding comes (above): nothing to stop.
@@ -808,16 +843,17 @@ fn request<'f>(
                 phases.request.write_last += phases.since(at);
             }
             Effect::Done(mut answer) => {
-                phases.mark("request");
+                phases.mark_in("request", frame);
                 answer.profile.start_ns = started;
                 answer.profile.verdict_ns = phases.since(began);
                 answered = Some(answer);
             }
         }
+        phases.took(kind, frame);
     };
     let mut answer = answer;
     store.after_answer(&cx, &mut answer.profile)?;
-    phases.mark("store after answer");
+    phases.mark_in("store after answer", frame);
     let rows = kept(&req, &followed, &facts.rows, frame);
     let at = phases.now();
     // `blaze run` with findings: the program's refusals too, from its lowering alone.
@@ -844,6 +880,10 @@ fn request<'f>(
 }
 
 const LAST: &str = ".blaze/v2/last";
+
+/// The machine's own step in the profile's frame rows (`Phases::took`): what it pushed to the
+/// effects list is counted here.
+pub(crate) const STEP: &str = "machine step (the effects list)";
 
 /// The crate root `blaze run` lowers (program.rs's): a binary package's.
 const PROGRAM_ROOT: &str = "src/main.rs";

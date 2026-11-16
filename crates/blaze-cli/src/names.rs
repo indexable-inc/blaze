@@ -18,9 +18,9 @@
 //! Interim, said in the closing note: build scripts' outputs are not given (each crate with a
 //! script is resolved without them); proc macros are not run (their calls are counted as
 //! unresolved by a known gap); every record lives in the project's store, the toolchain's and
-//! fetched crates' too (they belong in the shared store); one path package only (the member
-//! at the checkout's root); the world and the records are held in the global allocator for
-//! the command.
+//! fetched crates' too (they belong in the shared store); a path package must be a workspace
+//! member (each is read under its own directory; one outside the workspace root is refused);
+//! the world and the records are held in the global allocator for the command.
 
 use core::cell::RefCell;
 use std::alloc::Global;
@@ -83,8 +83,12 @@ pub enum NamesError {
     Sources(String),
     /// The world could not be laid out (its words).
     World(String),
-    /// More than one path package: their folders are not passed to the names step yet.
-    PathPackages { count: usize },
+    /// Two members whose directory is one: neither's files can be told apart.
+    SharedDirectory { first: String, second: String, dir: String },
+    /// A path package the graph reaches that is no member of the workspace (a path dependency
+    /// outside the workspace root): the names step reads members' directories only. `dependent`
+    /// is the first unit that depends on it, `None` when none does.
+    PathNotMember { package: String, dependent: Option<String> },
 }
 
 impl core::fmt::Display for NamesError {
@@ -98,8 +102,15 @@ impl core::fmt::Display for NamesError {
             NamesError::Toolchain(words) => write!(f, "the pinned toolchain: {words}"),
             NamesError::Sources(words) => write!(f, "the fetched sources: {words}"),
             NamesError::World(words) => write!(f, "the crates' inputs: {words}"),
-            NamesError::PathPackages { count } => {
-                write!(f, "{count} path packages: only one, the member at the checkout's root, is placed by the names step yet")
+            NamesError::SharedDirectory { first, second, dir } => {
+                write!(f, "the members `{first}` and `{second}` are both in the directory `{dir}`: one directory holds one package")
+            }
+            NamesError::PathNotMember { package, dependent: Some(dependent) } => write!(
+                f,
+                "the path package `{package}`, a dependency of `{dependent}`, is no member of the workspace (a path outside the workspace root): its directory is not known to the names step"
+            ),
+            NamesError::PathNotMember { package, dependent: None } => {
+                write!(f, "the path package `{package}` is no member of the workspace (a path outside the workspace root): its directory is not known to the names step")
             }
         }
     }
@@ -329,8 +340,16 @@ pub struct Names<'f> {
     pub unresolved: u64,
 }
 
-/// The names world of a command, made from the graph record `graph_record`.
-pub(crate) fn world<'f>(cx: &Cx, root: &Dir<ReadWrite>, graph_record: &[u8], lock: Option<&'f Lock<'static>>, env: &FetchEnv<'_>) -> Result<Names<'f>, NamesError> {
+/// The names world of a command, made from the graph record `graph_record`; `members` is each
+/// workspace member's lock entry and directory, anchor-relative (`Graph::member_dirs`).
+pub(crate) fn world<'f>(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    graph_record: &[u8],
+    lock: Option<&'f Lock<'static>>,
+    members: &[(LockId, blaze_unit_graph::Text<'_>)],
+    env: &FetchEnv<'_>,
+) -> Result<Names<'f>, NamesError> {
     let lock: &'f Lock<'f> = lock.ok_or(NamesError::NoLock)?;
     // The command's allocator for the world and the records: the global one, held to the end.
     let alloc: Alloc<'f> = Alloc::global();
@@ -351,19 +370,39 @@ pub(crate) fn world<'f>(cx: &Cx, root: &Dir<ReadWrite>, graph_record: &[u8], loc
     let sources = StoreSources::new(lock, Folder(reader), PackView::open_source_put, Alloc::global())
         .map_err(|e| NamesError::Sources(std::format!("{e}")))?;
     let sources = std::boxed::Box::leak(std::boxed::Box::new(sources));
-    // The one path package the graph reaches is the member at the checkout's root (a lock may
-    // name path packages no unit reaches: they are never placed).
+    // Every path package the graph reaches is a member, placed at its own directory (the
+    // layout's, anchor-relative: `""` for the root's own package), so its root file and its
+    // `mod x;` files are read under it. A lock may name path packages no unit reaches: they are
+    // never placed. Two members in one directory, or a reached path package that is no member
+    // (a path dependency outside the workspace root), is refused by name: nothing is guessed.
+    let mut by_dir: blaze_own::Vec<(&str, &str), &Frame> = blaze_own::Vec::with_capacity_in(members.len(), frame);
+    for (id, dir) in members.iter() {
+        by_dir.push((dir.as_str(), lock.package(*id).name.as_str()));
+    }
+    by_dir.sort_unstable();
+    if let Some(pair) = by_dir.windows(2).find(|pair| pair[0].0 == pair[1].0) {
+        return Err(NamesError::SharedDirectory { first: String::from(pair[0].1), second: String::from(pair[1].1), dir: String::from(pair[0].0) });
+    }
     let reached = |name: &str| graph.units.iter().any(|unit| unit.name.as_str().bytes().map(|b| if b == b'-' { b'_' } else { b }).eq(name.bytes().map(|b| if b == b'-' { b'_' } else { b })));
     let mut paths: std::vec::Vec<(LockId, &'f str), Global> = std::vec::Vec::new();
     for at in 0..lock.packages.len() {
         let id = LockId(at as u32);
         let package = lock.package(id);
-        if matches!(package.source, LockSource::Path) && reached(package.name.as_str()) {
-            paths.push((id, ""));
+        if !matches!(package.source, LockSource::Path) || !reached(package.name.as_str()) {
+            continue;
         }
-    }
-    if paths.len() > 1 {
-        return Err(NamesError::PathPackages { count: paths.len() });
+        let Some((_, dir)) = members.iter().find(|(member, _)| *member == id) else {
+            // The first unit that depends on a unit of this package, by the graph's order.
+            let dependent = graph
+                .units
+                .iter()
+                .find(|unit| unit.deps.iter().any(|dep| graph.units[dep.unit.0 as usize].package == id))
+                .map(|unit| String::from(unit.name.as_str()));
+            return Err(NamesError::PathNotMember { package: String::from(package.name.as_str()), dependent });
+        };
+        // Held to the end of the command, in the names frame, as the files read under it are.
+        let held: &'static blaze_own::String<&'static Frame> = blaze_own::Box::leak(blaze_own::Box::new_in(blaze_own::String::from_str_in(dir.as_str(), frame), frame));
+        paths.push((id, held.as_str()));
     }
     let paths: &'f [(LockId, &'f str)] = std::vec::Vec::leak(paths);
     let checkout: &'f ReadTree = std::boxed::Box::leak(std::boxed::Box::new(ReadTree(reader)));

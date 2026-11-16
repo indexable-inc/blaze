@@ -618,6 +618,46 @@
    "why": "The adapter writer found that homes for named bindings alone are unsound: the walk keeps temporaries in stack slots (`temp()` and ten direct slot sites), so a reference into a temporary dangles after the first Pending, and cached SSA values do not dominate a resume block. Putting the whole frame in the state through hooks would need a hook in every expression form of a 240 KiB walk that eight writers edit; a CFG pass needs none, sees every slot and value, and is the form liveness is defined on. It is also where the storage-overlap optimisation and later generator forms belong.",
    "recommended": "One writer: the `suspend` terminator in blaze-lir with its verifier rule, the pass with its property test and planted bugs, then the builder's two emit points (async block entry, `.await`). The seam's three answers (`LayoutFacts::coroutine`, `Adts::future_poll`, the held future's type) follow.",
    "state": "decided by the coordinator; assigned"
+  },
+  {
+   "id": "D74",
+   "date": "2026-11-16",
+   "decision": "`blaze test` starts no program. Until tests run on the rebuilt path, `test` is the check of everything `test` reaches (test code included), then the closing line that tests are not run, and a FAILED status: never a pass over a stage that did not run. `run` alone has a program (blaze-drive `starts_program`). `program::run` lists nothing: the program's files are the ones the walk opened; the whole-depth `Dir::list` has no caller on a command's path.",
+   "recommended": "`blaze test` starts no program.",
+   "why": "The owner ran `blaze test` in blaze's own checkout: it froze, then failed: \"bstd::fs list of .: arena bstd::fs list: 72 more bytes would pass its limit\". Cause: `test` was routed like `run`, and `run`'s skeleton listed every file under the checkout at any depth (target/, .git) into the command's one 64 MiB frame, then ran `src/main.rs`.",
+   "state": "decided 2026-11-16 by the coordinator; the owner: \"`blaze test` in blaze just kinda freezes for a while etc this is cncerning need to be sota super fast\"; in work"
+  },
+  {
+   "id": "D75",
+   "date": "2026-11-16",
+   "decision": "The command's memory follows lifetime: the command's frame holds only what the whole command needs; a task has its own frame, reset per item; what outlives a task is a record; the effect and work lists are not bump-allocated vectors. A refused allocation is a typed error naming the task, the frame and the bytes, failing that one job; never a panic. The class (an infallible push into a bounded frame) is closed by a type with only fallible growth.",
+   "recommended": "The command's memory follows lifetime: the command's frame holds only what the whole command needs; a task has its own frame, reset per item; what outlives a task is a record; the effect and work lists are not bump-allocated vectors.",
+   "why": "`blaze check` on blaze's own workspace (198 crates, 291 packages) with the 11:10 build: 42.8 to 75.2 s, then \"blaze_own: the allocator refused 2850816 bytes aligned to 8 for `blaze_drive::request::Effect<'_>`\": main.rs's `effects`/`todo`, `job_of`'s paths, `Settled::grown_in` and every main-thread task allocate from one 64 MiB frame.",
+   "state": "decided 2026-11-16 by the coordinator; in work"
+  },
+  {
+   "id": "D76",
+   "date": "2026-11-16",
+   "decision": "Six architects (Opus), one per part, each write an \"End state\" section (the finished design with its floor in numbers, a gap table with evidence, and a piece list sized for one writer) into the part's existing design doc: the whole pipeline on the command (drive.md), dependencies on the command path (fetch.md), `blaze test` (test.md), run and build (run.md), parallelism and memory (parallel.md), what an edit costs (read-addressed.md). The coordinator starts one writer per piece.",
+   "recommended": "Six architects (Opus), one per part, each write an \"End state\" section (the finished design with its floor in numbers, a gap table with evidence, and a piece list sized for one writer) into the part's existing design doc: the whole pipeline on the command (drive.md), dependencies on the command path (fetch.md), `blaze test` (test.md), run and build (run.md), parallelism and memory (parallel.md), what an edit costs (read-addressed.md).",
+   "why": "The stages exist as libraries proven in harnesses (tempo: 100% of signatures, 86.7% of 20,000 bodies clean) but the command a person types does not run them: the installed build answers \"cannot read the workspace's 144 outside dependencies yet\".",
+   "state": "decided 2026-11-16 by the coordinator; the owner: \"get evrythig working proeprly ; spawn opus in parllel to do sota architecture\"; in work"
+  },
+  {
+   "id": "D77",
+   "date": "2026-11-16",
+   "decision": "A lane never runs a blaze it built in the owner's checkouts: it runs in an APFS clone with HOME pointed at a scratch home, and with no network (the packages' sources are already in that home). Reason beyond tidiness: a run writes `<checkout>/.blaze/v2/last` under its own tool id and knocks out the installed blaze's standing answer; that file becomes keyed by the tool's id so two builds' answers stand side by side. The name solver's speed is won by finishing the switch to the new core (crates/blaze-scope/src/cells/); the old core stays frozen. Lanes hand on at about 200k tokens of context, not 105k.",
+   "recommended": "A lane never runs a blaze it built in the owner's checkouts: it runs in an APFS clone with HOME pointed at a scratch home, and with no network (the packages' sources are already in that home).",
+   "why": "Driver runner 10 found the `last` collision before its first run; its cold-home run fetched 291 public packages (161 MB) from the registry, which no lane had been cleared to do. The names profile on tempo (25.8 s, one thread): expansion 47.2%, the old solver 35.3% (the new core: 1.17 s against 9.1 s), the outline 12.6% at 67 MB/s. Two lanes handed on after six and eight minutes having only read.",
+   "state": "decided 2026-11-16 by the coordinator; in work"
+  },
+  {
+   "id": "D78",
+   "date": "2026-11-16",
+   "decision": "The command may read another tool's cache of the same archive on this machine (cargo's `registry/cache/<index folder>/<name>-<version>.crate`) as one source of a package's bytes: adopted only when its SHA-256 equals the checksum the lock file pins; the adopted record is byte-equal to the network path's. The cargo home is passed in at the command's edge (`CARGO_HOME`, else `<home>/.cargo`). Fetched and adopted sources live under `<home>/.blaze/v2/sources`, shared by every project and worktree, not under the checkout. A miss names what was tried.",
+   "recommended": "The dependencies architect's pieces 1 to 3 (docs/v2/plan/design/fetch.md, \"End state: dependencies on the command path\"): piece 1 is written and green; one writer has pieces 2 and 3.",
+   "why": "The owner's `blaze check` in blaze's checkout: \"this build of blaze cannot read the workspace's 144 outside dependencies yet\". All 297 registry archives of blaze's lock are already in cargo's cache on this Mac (the architect's count), so the shortest correct route needs no network; nothing is trusted from the cache because the lock's checksum decides.",
+   "state": "decided by the coordinator; assigned; the owner may veto reading cargo's cache"
   }
  ]
 }

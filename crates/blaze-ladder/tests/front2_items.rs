@@ -170,20 +170,68 @@ fn main() {}
     all_clean("one-name arguments", &got);
 }
 
-/// A const parameter named as a bound's argument (`T: Tr<N>`) is a const argument (the
-/// Reference, "Generic parameters": "an ambiguous generic argument is resolved as a const if
-/// it does not resolve to a type"). A bound takes no const argument yet, so the head is a typed
-/// refusal naming it; before the fix it became the type `Param(0)` and the solver stopped with
-/// `Malformed(Sort ..)`.
+/// A bound's generic argument is what the TRAIT's parameter in that position is, not what its
+/// tokens look like. The Reference, "Generic parameters", "Const generics": "A const argument in
+/// a path specifies the const value to use for that item."; "The const expression must be a
+/// block expression (surrounded with braces) unless it is a single path segment (an IDENTIFIER)
+/// or a literal (with a possibly leading - token)."; "When there is ambiguity if a generic
+/// argument could be resolved as either a type or const argument, it is always resolved as a
+/// type." (so a one-segment path naming a const parameter is written without braces, is parsed
+/// as a type, and is a constant because the parameter it fills is one).
+///
+/// - `impl .. where Uint<LO>: Concat<HI>` (crypto_bigint's form, which stopped 57 bodies of
+///   tempo_contracts): `HI` fills `Concat`'s const parameter, so it is the const parameter's
+///   term; `needs` calls a method only that impl gives, so its where clause is proved with
+///   `Concat<2>`.
+/// - `T: Tr<N>` written on a parameter (`inline`), and a constant item and a braced const
+///   parameter in the same position (`item`, `braced`).
+/// - `H: Holds<T, N>` (`typed`): `T` is a one-segment path too, in a position `Holds` declares
+///   a TYPE, so it stays a type: a fix that reads every one-segment path as a constant refuses
+///   it ("`T` is a type parameter; a constant is expected here").
+///
+/// Expected line: `const arguments in bounds: needs: clean` (and the same for `inline`, `item`,
+/// `braced`, `typed`). Before the fix each was "not lowered"/"not checked" with
+/// `Unsupported("a const parameter in a type position (a bound's const argument `Tr<N>`)")`.
 #[test]
-fn a_const_parameter_as_a_bound_argument_is_refused_by_name() {
-    const TEXT: &str = "trait Tr<const K: usize> { fn k(&self) -> usize; }
-fn bound<const N: usize, T: Tr<N>>(t: &T) -> usize { t.k() }
+fn a_bound_argument_is_const_where_the_trait_declares_const() {
+    const TEXT: &str = "struct Uint<const L: usize> { limbs: [u64; L] }
+trait Concat<const HI: usize> { fn low(&self) -> u64; }
+impl Concat<2> for Uint<2> { fn low(&self) -> u64 { self.limbs[0] } }
+struct Pair<const LO: usize, const HI: usize> { lo: Uint<LO> }
+trait Low { fn first(&self) -> u64; }
+impl<const LO: usize, const HI: usize> Low for Pair<LO, HI> where Uint<LO>: Concat<HI> {
+    fn first(&self) -> u64 { self.lo.low() }
+}
+trait Tr<const K: usize> { fn k(&self) -> usize; }
+trait Holds<T, const K: usize> { fn held(&self) -> T; }
+const CAP: usize = 4;
+fn needs(p: &Pair<2, 2>) -> u64 { p.first() }
+fn inline<const N: usize, T: Tr<N>>(t: &T) -> usize { t.k() }
+fn item<T: Tr<CAP>>(t: &T) -> usize { t.k() }
+fn braced<const N: usize, T>(t: &T) -> usize where T: Tr<{ N }> { t.k() }
+fn typed<const N: usize, T, H: Holds<T, N>>(h: &H) -> T { h.held() }
 fn main() {}
 ";
-    let got = check_fns(TEXT, &["bound"]);
+    let got = check_fns(TEXT, &["needs", "inline", "item", "braced", "typed"]);
+    all_clean("const arguments in bounds", &got);
+}
+
+/// What a bound's const argument still cannot be: an expression over a generic parameter
+/// (`{ N + 1 }`; the Reference, "Const generics": "const parameters may only appear as a
+/// standalone argument inside of a type or array repeat expression. In those contexts, they may
+/// only be used as a single segment path expression, possibly inside a block (such as N or {N}).
+/// That is, they cannot be combined with other expressions."). It is a typed refusal with its
+/// own name, never a guessed value. Expected line: the outcome of `plus` contains
+/// `a constant expression over a generic parameter`.
+#[test]
+fn a_bound_argument_that_computes_over_a_parameter_is_refused_by_name() {
+    const TEXT: &str = "trait Tr<const K: usize> { fn k(&self) -> usize; }
+fn plus<const N: usize, T: Tr<{ N + 1 }>>(t: &T) -> usize { t.k() }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["plus"]);
     println!("{got:?}");
-    assert!(got[0].1.contains("a const parameter in a type position"), "{got:?}");
+    assert!(got[0].1.contains("a constant expression over a generic parameter"), "{got:?}");
 }
 
 /// Statics as items with their type (the Reference, "Static items": "A static item is similar
@@ -349,6 +397,78 @@ fn main() {}
 ";
     let got = check_fns(TEXT, &["uses"]);
     all_clean("self need", &got);
+}
+
+/// A type-relative path is read through the bounds AS WRITTEN while those bounds are lowered
+/// (front2/written.rs), and a blanket impl is a candidate only of its own crate's traits.
+/// `BUILDS`: the Reference, "Traits", "Supertraits": "anywhere a generic or trait object is
+/// bounded by a trait, it has access to the associated items of its supertraits"; "Associated
+/// Items", "Associated Types": "Associated types are type aliases associated with another
+/// type"; two bounds declaring one name are the ambiguity error (rustc's E0221: "An attempt
+/// was made to retrieve an associated type, but the type was ambiguous"), none here. `trait
+/// Full: Types + Wrap<Self::Net>` names `Self::Net` inside its OWN supertrait list (reth's
+/// rpc-eth-api: `trait Call: LoadState<Error: FromEvmError<Self::Evm>> + ..`, `trait
+/// FullEthApiServer: EthApiServer<RpcTxReq<Self::NetworkTypes>, ..> + FullEthApi`): `Net` is
+/// found by NAME among the written bounds (`Types` declares it) and `Wrap<..>`, which does not
+/// declare it, is not read to find it. So the header of `impl<T> Server<Req<T::Net>> for T
+/// where T: Full` (reth_rpc_eth_api core.rs:458's shape) builds, `K.s()` checks clean, a body
+/// about the unrelated `U: Other` is clean, and `early`'s `T: Wrap<T::Net> + Types` (the name
+/// used in a bound written BEFORE the bound that declares it) builds too.
+/// `UNREAD`: the Reference, "Orphan rules": "Given `impl<P1..=Pn> Trait<T1..=Tn> for T0`, an
+/// `impl` is valid only if at least one of the following is true: `Trait` is a local trait; At
+/// least one of the types `T0..=Tn` must be a local type. Let `Ti` be the first such type. No
+/// uncovered type parameters `P1..=Pn` may appear in `T0..Ti` (excluding `Ti`)": in `impl<T>
+/// Nope<T> for T {}` (`Nope` names nothing: an unread header) `T0` is an uncovered parameter,
+/// so the impl can only be of a trait of this crate: `u16: From<u8>` (core's trait) is clean,
+/// `U: Local` (this crate's) stays the gap naming the unread impl.
+/// Without the fix the expected lines are "written bounds: builds: calls: not checked: ..
+/// these items need each other's heads in a cycle: [..]" (the members of `Full` asking for the
+/// supertraits of `Full`), "written bounds: builds: early: not lowered: .. `T::X` in a bound
+/// written before the bound of `T` that declares `X`" and "written bounds: unread: foreign:
+/// not checked: .. a candidate filed without its trait or self type (unread as written), has
+/// no header" (NOT RUN by the writer: a writer runs nothing). With it: "written bounds: builds:
+/// calls: clean", ".. unrelated: clean", ".. early: clean", "written bounds: unread: foreign:
+/// clean" and "written bounds: unread: local: not checked: .. unread as written ..".
+#[test]
+fn a_projection_in_a_header_reads_the_written_bounds() {
+    const BUILDS: &str = "trait Types { type Net; }
+trait Wrap<A> {}
+trait Full: Types + Wrap<Self::Net> {}
+trait Server<A> { fn s(&self) -> u8; }
+struct Req<N>(N);
+impl<T> Server<Req<T::Net>> for T where T: Full { fn s(&self) -> u8 { 1 } }
+struct K;
+impl Types for K { type Net = u8; }
+impl Wrap<u8> for K {}
+impl Full for K {}
+trait Other { fn o(&self) -> u8; }
+struct U;
+impl Other for U { fn o(&self) -> u8 { 2 } }
+fn calls() -> u8 { K.s() }
+fn unrelated() -> u8 { U.o() }
+fn early<T: Wrap<T::Net> + Types>(_t: &T) -> u8 { 0 }
+fn main() {}
+";
+    const UNREAD: &str = "trait Local { fn l(&self) -> u8 { 0 } }
+struct U;
+impl Local for U {}
+impl<T> Nope<T> for T {}
+fn need_from<T: From<u8>>(_t: T) {}
+fn need_local<T: Local>(_t: T) {}
+fn foreign() { need_from(7u16) }
+fn local() { need_local(U) }
+fn main() {}
+";
+    let builds = check_fns(BUILDS, &["calls", "unrelated", "early"]);
+    let unread = check_fns(UNREAD, &["foreign", "local"]);
+    for (what, got) in [("builds", &builds), ("unread", &unread)] {
+        for (n, o) in got.iter() {
+            println!("written bounds: {what}: {n}: {o}");
+        }
+    }
+    all_clean("written bounds: builds", &builds);
+    assert_eq!(unread[0].1, "clean", "{unread:?}");
+    assert!(unread[1].1.contains("unread as written"), "{unread:?}");
 }
 
 /// A type alias's defaulted parameter left out of a path takes its default (the Reference,
@@ -717,9 +837,26 @@ fn main() {}
     for (n, o) in &got {
         println!("trait constants: {n}: {o}");
     }
+    if CONST_PATH_ARGS_OWED {
+        // Today each is refused BY NAME (never the trait's default taken for an impl that
+        // overrides it: the first run of this test printed "Padded: .. len 6", 3 + 3).
+        for (n, o) in &got {
+            assert!(o.starts_with("refused: ") && (o.contains("TraitConstNoSelf") || o.contains("with no `Self`")), "{n}: {o}");
+        }
+        return;
+    }
     assert!(got[0].1.starts_with("fields [array of ") && got[0].1.ends_with(" len 2] discrs []"), "{got:?}");
     assert!(got[1].1.starts_with("fields [array of ") && got[1].1.ends_with(" len 8] discrs []"), "{got:?}");
 }
+
+/// OWED BY THE CHECKER AND THE EVALUATOR (2026-11-16): a checked body records a constant path
+/// as `Def::Const(key)` with no arguments (blaze-typeck rules/lit_path.rs `assoc_item_ty`
+/// pushes `Def::Const(item)` and drops `parent_args`), and blaze-consteval's machine/code.rs
+/// `Expr::Path` instances it at `List::EMPTY` without asking `ConstWorld::resolve`. So
+/// `<B4 as Spec>::BITS` reaches front2 with no `Self`, and front2 refuses it by name
+/// (`ConstFail::TraitConstNoSelf`). While `true`, the trait-constant test asserts exactly that
+/// refusal; set it to `false` when the arguments arrive, and the values above are asserted.
+const CONST_PATH_ARGS_OWED: bool = true;
 
 /// A struct's size in a constant: `size_of::<S>()` reaches the constant evaluator's layout,
 /// which reads the store's row of `S` (front2/consts.rs `LayoutFacts::adt`, the row made on
@@ -739,8 +876,12 @@ fn main() {}
 /// ..". Expected line: "struct size: T: fields [array of Uint(U8) len 8] discrs []".
 #[test]
 fn a_structs_size_in_a_constant_is_its_layouts() {
-    const TEXT: &str = "struct S { a: u8, b: u32 }
-const N: usize = core::mem::size_of::<S>();
+    // The intrinsic itself (the pinned core's `SizedTypeProperties::SIZE` is
+    // "intrinsics::size_of::<Self>()"): `core::mem::size_of::<S>()` reads that trait constant
+    // through a path, which is owed ([`CONST_PATH_ARGS_OWED`]).
+    const TEXT: &str = "#![feature(core_intrinsics)]
+struct S { a: u8, b: u32 }
+const N: usize = core::intrinsics::size_of::<S>();
 struct T([u8; N]);
 fn main() {}
 ";

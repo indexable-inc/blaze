@@ -23,20 +23,21 @@ use blaze_expand::{ExpandCx, HostAsk, HostError, HostWhy, IncludeAs, Included, M
 use blaze_id::ItemKey as LibKey;
 use blaze_lower::by_name::ByName;
 use blaze_lower::form as lf;
-use blaze_lower::scoped::{Prepares, Scoped};
+use blaze_lower::scoped::Prepares;
 use blaze_lower::typeck::{ConstGapWhy, ConstTerm, Refused, TypeckBody, Types, to_typeck};
 use blaze_lower::{Lowered, View};
 use blaze_own::Alloc;
-use blaze_scope::resolve::Names;
 use blaze_surface::Range;
 use blaze_typeck::{ExprId, ItemKey, Name, PTy, PortableTys};
 
 use super::check::{BodyScope, MOST_ROUNDS};
 use super::heads::{CrateCfg, FnHead, HeadError, Maps, Store, Want, own_generics};
 use super::keys::{Keys, checker_of};
+use super::scoped::ScopedBy;
+use super::source::NamesSource;
 use super::spell::Spelling;
 use super::types::{Bounds, Builder, Env, ParamBound, SelfTy, Why};
-use crate::resolve::Resolver;
+use crate::resolve::Paths;
 
 /// What a body's lowering did not take, by its range in the item's text (or past it, in an
 /// expansion appended to it).
@@ -128,15 +129,15 @@ enum ValuesFail {
 /// through the same [`Resolver::path`] a body's paths take (its `use`s, globs and the
 /// prelude), and a constructor's shape from its ADT's head in the store. The first failure is
 /// kept and the lowering's `Need` turned into it.
-struct ModuleValues<'n, 's> {
-    names: &'n Names<'n>,
+struct ModuleValues<'n, 's, S> {
+    names: S,
     module: LibKey,
     store: &'s mut Store<'n>,
     keys: &'s mut Keys,
     failed: Option<ValuesFail>,
 }
 
-impl ModuleValues<'_, '_> {
+impl<'n, S: NamesSource<'n>> ModuleValues<'n, '_, S> {
     /// The shape of `adt`'s variant `index` (0 for a struct), its head made when not yet.
     fn shape(&mut self, adt: LibKey, index: u32, unit: blaze_lower::ValueName) -> Result<blaze_lower::ValueName, ValuesFail> {
         use blaze_lower::ValueName as V;
@@ -154,14 +155,14 @@ impl ModuleValues<'_, '_> {
     }
 }
 
-impl blaze_lower::ValueNames for ModuleValues<'_, '_> {
+impl<'n, S: NamesSource<'n>> blaze_lower::ValueNames for ModuleValues<'n, '_, S> {
     fn value_name(&mut self, name: &str) -> blaze_lower::ValueName {
         use crate::resolve::{Kind, Ns, ResolveError};
         use blaze_lower::ValueName as V;
         if self.failed.is_some() {
             return V::Need;
         }
-        let target = match (Resolver { names: self.names }).path(self.module, false, &[name], Ns::Value) {
+        let target = match (Paths { names: self.names }).path(self.module, false, &[name], Ns::Value) {
             Ok(t) => t,
             // Nothing by that name: the pattern binds it.
             Err(ResolveError::Path(_)) => return V::Nothing,
@@ -173,7 +174,7 @@ impl blaze_lower::ValueNames for ModuleValues<'_, '_> {
         let answer = match target.kind {
             Kind::Const => Ok(V::Const),
             Kind::Static => Ok(V::Static),
-            Kind::Struct if self.names.ctor(target.key).is_some() => self.shape(target.key, 0, V::UnitStruct),
+            Kind::Struct if super::source::NamesSource::is_ctor(self.names, target.key) => self.shape(target.key, 0, V::UnitStruct),
             Kind::Variant { adt, index } => self.shape(adt, index, V::UnitVariant),
             _ => Ok(V::Nothing),
         };
@@ -242,8 +243,8 @@ impl ExpandCx for NoHost {
 
 /// A body's written types: built by [`Builder`] where its fn's names hold; the builder's
 /// reason kept, since `to_typeck`'s refusal has no room for it.
-struct BodyTypes<'b, 'n> {
-    builder: Builder<'b, 'n, Maps>,
+struct BodyTypes<'b, S> {
+    builder: Builder<'b, Maps, S>,
     env: Env<'b>,
     failed: Option<Why>,
     /// The body's blocks that are modules of the names library holding a struct, enum, union
@@ -251,7 +252,7 @@ struct BodyTypes<'b, 'n> {
     blocks: &'b [super::locals::BlockModule],
 }
 
-impl<'b> BodyTypes<'b, '_> {
+impl<'b, 'n, S: NamesSource<'n>> BodyTypes<'b, S> {
     /// Where the type `t` is written: the body's names, read at the module of the innermost
     /// block around it that declares a type (the Reference, "Statements", "Item
     /// declarations": "Declaring an item within a statement block restricts its scope to the
@@ -278,7 +279,7 @@ impl<'b> BodyTypes<'b, '_> {
     }
 }
 
-impl Types for BodyTypes<'_, '_> {
+impl<'n, S: NamesSource<'n>> Types for BodyTypes<'_, S> {
     fn ty(&mut self, view: &View<'_>, t: lf::TypeId, tys: &mut PortableTys<'_>) -> Result<PTy, Refused> {
         let env = self.env_at(view, t)?;
         match self.builder.ty(tys, &env, view, t) {
@@ -428,7 +429,7 @@ fn const_gap(why: &Why) -> Option<ConstGapWhy> {
     }
 }
 
-impl BodyTypes<'_, '_> {
+impl<'n, S: NamesSource<'n>> BodyTypes<'_, S> {
     /// A made const term: the term, its gap ([`const_gap`]), or the refusal `what` at `range`
     /// with the builder's reason kept.
     fn term(&mut self, made: Result<PTy, Why>, what: &'static str, range: Range) -> Result<ConstTerm, Refused> {
@@ -448,7 +449,7 @@ impl BodyTypes<'_, '_> {
 /// Lowers and converts the body of the free fn `item`, making the heads its written types need.
 /// `prepared` is the build's one set of prepared macro definitions (each kept by its item's
 /// key), shared by every body the build lowers.
-pub fn lower_fn<'n>(names: &'n Names<'n>, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, item: LibKey) -> Result<Body<'n>, BodyError> {
+pub fn lower_fn<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, item: LibKey) -> Result<Body<'n>, BodyError> {
     lower_fn_into(names, prepared, keys, store, item, None)
 }
 
@@ -456,25 +457,27 @@ pub fn lower_fn<'n>(names: &'n Names<'n>, prepared: &Prepares<'n>, keys: &mut Ke
 /// head it needs: a head it would still need is a refusal), for a driver that reads every
 /// body and record from one table (the run path's seam). The returned body's own `tys` is
 /// empty: its types are `into`'s.
-pub fn lower_again<'n>(names: &'n Names<'n>, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, body: &Body<'n>, into: &mut PortableTys<'static>) -> Result<Body<'n>, BodyError> {
+pub fn lower_again<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, body: &Body<'n>, into: &mut PortableTys<'static>) -> Result<Body<'n>, BodyError> {
     match keys.library(body.owner) {
         Some(lib) => lower_fn_into(names, prepared, keys, store, lib, Some(into)),
         None => lower_member_into(names, prepared, keys, store, body.owner, Some(into)),
     }
 }
 
-fn lower_fn_into<'n>(names: &'n Names<'n>, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, item: LibKey, into: Option<&mut PortableTys<'static>>) -> Result<Body<'n>, BodyError> {
+fn lower_fn_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, item: LibKey, into: Option<&mut PortableTys<'static>>) -> Result<Body<'n>, BodyError> {
     let krate = names.crate_of(item).ok_or(BodyError::NoText(item))?;
     // A fn declared in a body: its kept text, in its enclosing body's module.
     let (module, text) = match store.locals.head(checker_of(item)) {
         Some(h) => (h.module, h.text),
-        None => names.item_text(item).map(|it| (it.module, it.text)).ok_or(BodyError::NoText(item))?,
+        None => names.text_of(item).map(|it| (it.module, it.text)).ok_or(BodyError::NoText(item))?,
     };
-    let atoms = names.krate(krate).cfg.atoms();
-    let sig = blaze_lower::lower_signature(text, names.edition(krate), &mut CrateCfg(atoms), Alloc::global()).map_err(|_| BodyError::Cfg(item))?;
+    // A crate whose cfg or edition the source has not read has no text for the item either.
+    let atoms = names.cfg_atoms(krate).ok_or(BodyError::NoText(item))?;
+    let edition = names.edition_of(krate).ok_or(BodyError::NoText(item))?;
+    let sig = blaze_lower::lower_signature(text, edition, &mut CrateCfg(atoms), Alloc::global()).map_err(|_| BodyError::Cfg(item))?;
     let mut params = Vec::new_in(Global);
     let mut consts = Vec::new_in(Global);
-    let b = Builder { resolver: Resolver { names }, heads: &store.maps };
+    let b = Builder { resolver: Paths { names }, heads: &store.maps };
     own_generics(&b, &mut store.tys, module, &sig.view(), 0, &mut params, &mut consts).map_err(|why| BodyError::Generics { item, why })?;
     let mut bounds = Vec::new_in(Global);
     let env = Env { module, params: &params, bounds: Bounds::Building(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &consts };
@@ -488,11 +491,11 @@ fn lower_fn_into<'n>(names: &'n Names<'n>, prepared: &Prepares<'n>, keys: &mut K
 /// the container's generic parameters are in scope in its associated items, before the item's
 /// own; `Self` is the implementing type in an impl, and the trait's implicit type parameter,
 /// index 0, in a trait). Its head must be made: a callee the checker picked always has one.
-pub fn lower_member<'n>(names: &'n Names<'n>, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, key: ItemKey) -> Result<Body<'n>, BodyError> {
+pub fn lower_member<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, key: ItemKey) -> Result<Body<'n>, BodyError> {
     lower_member_into(names, prepared, keys, store, key, None)
 }
 
-fn lower_member_into<'n>(names: &'n Names<'n>, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, key: ItemKey, into: Option<&mut PortableTys<'static>>) -> Result<Body<'n>, BodyError> {
+fn lower_member_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, key: ItemKey, into: Option<&mut PortableTys<'static>>) -> Result<Body<'n>, BodyError> {
     let head: &FnHead<'n> = store.fns.get(&key).ok_or(BodyError::NoHead(key))?;
     if !head.has_body {
         return Err(BodyError::NoBody(key));
@@ -529,12 +532,12 @@ struct Site<'n> {
     self_assoc: Vec<(Name, PTy), Global>,
 }
 
-fn lower_at<'n>(names: &'n Names<'n>, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, site: Site<'n>, mut into: Option<&mut PortableTys<'static>>) -> Result<Body<'n>, BodyError> {
+fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mut Keys, store: &mut Store<'n>, site: Site<'n>, mut into: Option<&mut PortableTys<'static>>) -> Result<Body<'n>, BodyError> {
     let Site { item, owner, krate, module, text, params, consts, bounds, self_, self_assoc } = site;
-    let edition = names.edition(krate);
-    let atoms = names.krate(krate).cfg.atoms();
+    let edition = names.edition_of(krate).ok_or(BodyError::NoText(item))?;
+    let atoms = names.cfg_atoms(krate).ok_or(BodyError::NoText(item))?;
 
-    let scoped = Scoped { names, module, prepared: Some(prepared) };
+    let scoped = ScopedBy { names, module, prepared: Some(prepared) };
     let mut expand = ByName::with_names(&scoped, NoHost, Alloc::global());
     let mut values = ModuleValues { names, module, store: &mut *store, keys: &mut *keys, failed: None };
     let lowered = blaze_lower::lower_body_expanding(text, edition, &mut CrateCfg(atoms), &mut values, &mut expand, Alloc::global());
@@ -576,7 +579,7 @@ fn lower_at<'n>(names: &'n Names<'n>, prepared: &Prepares<'n>, keys: &mut Keys, 
     let mut typeck = None;
     for _ in 0..MOST_ROUNDS {
         let mut types = BodyTypes {
-            builder: Builder { resolver: Resolver { names }, heads: &store.maps },
+            builder: Builder { resolver: Paths { names }, heads: &store.maps },
             env: Env { module, params: &params, bounds: Bounds::Done(&bounds), self_, self_assoc: &self_assoc, anon: &[], consts: &consts },
             failed: None,
             blocks,

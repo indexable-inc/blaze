@@ -25,6 +25,7 @@ use crate::{
 };
 
 mod asked;
+mod asked_digest;
 mod edits;
 mod attrs;
 mod blocks;

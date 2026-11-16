@@ -1,0 +1,54 @@
+//! Where an `include!` reads, and where the modules its file writes are found.
+//!
+//! The rules. The pinned library, core `macros/mod.rs`, `include!`: "Parses a file as an
+//! expression or an item according to the context. The file is located relative to the current
+//! file (similarly to how modules are found)." The Reference, "Modules", "Module Source
+//! Filenames": "A module without a body is loaded from an external file. When the module does
+//! not have a `path` attribute, the path to the file mirrors the logical module path. Ancestor
+//! module path components are directories, and the module's contents are in a file with the
+//! name of the module plus the `.rs` extension."
+//!
+//! The Reference has no sentence for a `mod x;` an INCLUDED file writes. What real crates rest
+//! on (libp2p-identity 0.2: `mod proto { include!("generated/mod.rs"); .. }` in `src/lib.rs`,
+//! whose `generated/mod.rs` writes `pub mod keys_proto;` beside itself, at
+//! `src/generated/keys_proto.rs`) is that the included file is the current file of what it
+//! writes: its folder is where its `mod x;` is looked for (`x.rs`, then `x/mod.rs`) and what
+//! its `#[path]` is relative to, whatever module the `include!` call stands in. An inline
+//! `mod y { mod z; }` in the included file then looks under that folder's `y/`, as in any file.
+
+use blaze_expand::{ReadAnswer, ReadKind, ReadRoot, Reads, SourceOrigin, include_target};
+use blaze_own::{AString, Alloc};
+
+/// The absolute path of the file an `include!` written in the file `calling` (absolute, under
+/// the package folder `package`) names by `written`: the calling file's folder joined with the
+/// written path, `.` and `..` taken lexically ([`include_target`]). `None` when the calling
+/// file is not under the package or the path leaves it (the texts hold the package alone).
+pub(crate) fn included_file<'a>(package: &str, calling: &str, written: &str, alloc: Alloc<'a>) -> Option<AString<'a>> {
+    let folder = calling.rsplit_once('/').map_or("", |(dir, _)| dir);
+    let folder = folder.strip_prefix(package)?;
+    let root = ReadRoot { origin: SourceOrigin::Package, package: "" };
+    let target = include_target(root, folder, written, alloc).ok()?;
+    let mut path = AString::new_in(alloc);
+    path.push_str(package.trim_end_matches('/'));
+    for segment in target.iter() {
+        path.push('/');
+        path.push_str(segment);
+    }
+    Some(path)
+}
+
+/// The folder of the file one `include!` call read, from the call's own read list: the one
+/// file read as text that was there. `None` when the call read no file that was there (its
+/// diagnostic says so), read more than one (not an `include!` of one path: nothing is guessed),
+/// or read a file that is not under the package (a build script's output: its `mod x;` keeps
+/// the calling module's folder, as before this rule).
+pub(crate) fn included_dir<'a>(package: &str, calling: &str, reads: &Reads<'_>, alloc: Alloc<'a>) -> Option<AString<'a>> {
+    let mut found = reads.list().iter().filter(|read| read.kind == ReadKind::IncludeStr && matches!(read.answer, ReadAnswer::Digest(_)));
+    let read = found.next()?;
+    if found.next().is_some() {
+        return None;
+    }
+    let mut path = included_file(package, calling, reads.subject(read), alloc)?;
+    crate::task::pop_dir(&mut path);
+    Some(path)
+}

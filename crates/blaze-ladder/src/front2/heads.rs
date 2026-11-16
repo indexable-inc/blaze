@@ -18,7 +18,6 @@ use blaze_id::ItemKey as LibKey;
 use blaze_lower::machine::sig;
 use blaze_lower::{CfgAnswer, Lowered, View, form as lf, head};
 use blaze_own::Alloc;
-use blaze_scope::resolve::Names;
 use blaze_surface::{ItemDetail, Range};
 use blaze_typeck as tc;
 use blaze_typeck::{ItemKey, List, Name, PClause, PNode, PTy, PortableTys};
@@ -26,8 +25,9 @@ use blaze_typeck::{ItemKey, List, Name, PClause, PNode, PTy, PortableTys};
 use super::dyn_ty::Member as DynMember;
 use super::keys::{KeyClash, Keys, MemberKind, checker_of};
 use super::preds::Preds;
+use super::source::NamesSource;
 use super::types::{Bounds, Builder, Env, Heads, ParamBound, SelfTy, TraitAliasHead, Why, intern, intern_list};
-use crate::resolve::Resolver;
+use crate::resolve::Paths;
 
 /// The most steps one [`Store::ensure`] takes: past it the needs are a cycle.
 const MOST_STEPS: usize = 1 << 16;
@@ -235,7 +235,7 @@ pub fn discr_ty(repr: blaze_build::layout::ReprAttrs) -> tc::DiscrRepr {
 /// a constant item; another expression is [`Why::ConstPath`] naming it); an implicit one is
 /// the previous variant's plus one (the first's is 0). Two variants with one value are the
 /// language's error (E0081), as is one past the type's range.
-fn discriminants(b: &Builder<'_, '_, Maps>, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, repr: blaze_build::layout::ReprAttrs, written: &[(Option<lf::ConstIdx>, Range)]) -> Result<Vec<i128, Global>, Why> {
+fn discriminants<'n, S: NamesSource<'n>>(b: &Builder<'_, Maps, S>, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, repr: blaze_build::layout::ReprAttrs, written: &[(Option<lf::ConstIdx>, Range)]) -> Result<Vec<i128, Global>, Why> {
     let mut out: Vec<i128, Global> = Vec::with_capacity_in(written.len(), Global);
     if written.is_empty() {
         return Ok(out);
@@ -549,7 +549,7 @@ fn params(tys: &mut PortableTys<'_>, from: u32, to: u32, consts: &[(u32, PTy)]) 
 /// parameters in scope: the Reference, "Const generics": "The only allowed types of const
 /// parameters are `u8` .. `usize`, `char` and `bool`", none of which names a parameter).
 /// Their count.
-pub(super) fn own_generics(b: &Builder<'_, '_, Maps>, tys: &mut PortableTys<'_>, module: LibKey, v: &View<'_>, base: u32, ps: &mut Vec<(Name, u32), Global>, consts: &mut Vec<(u32, PTy), Global>) -> Result<u32, Why> {
+pub(super) fn own_generics<'n, S: NamesSource<'n>>(b: &Builder<'_, Maps, S>, tys: &mut PortableTys<'_>, module: LibKey, v: &View<'_>, base: u32, ps: &mut Vec<(Name, u32), Global>, consts: &mut Vec<(u32, PTy), Global>) -> Result<u32, Why> {
     let n = param_names(v, base, ps, Consts::Keep)?;
     let env = Env { module, params: &[], bounds: Bounds::Done(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &[] };
     let mut i = base;
@@ -578,7 +578,7 @@ pub(super) fn own_generics(b: &Builder<'_, '_, Maps>, tys: &mut PortableTys<'_>,
 /// Each own generic parameter's default from index `base`, in order (the Reference, "Generic
 /// parameters": a type parameter's is a type, a const parameter's a constant of its type), read
 /// in `env` (the parameters before it in scope); `None` where none is written.
-fn own_defaults(b: &Builder<'_, '_, Maps>, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, base: u32, out: &mut Vec<Option<PTy>, Global>) -> Result<(), Why> {
+fn own_defaults<'n, S: NamesSource<'n>>(b: &Builder<'_, Maps, S>, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, base: u32, out: &mut Vec<Option<PTy>, Global>) -> Result<(), Why> {
     let mut i = base;
     for &row in v.rows(v.list(head::GENERICS))? {
         match lf::GenericParam::decode(row)? {
@@ -604,10 +604,13 @@ fn own_defaults(b: &Builder<'_, '_, Maps>, tys: &mut PortableTys<'_>, env: &Env<
 }
 
 /// One item's signature, lowered from `text` under its crate's cfg.
-pub(super) fn lower<'n>(names: &'n Names<'n>, key: LibKey, text: &'n str) -> Result<Lowered<'static, 'n>, HeadError> {
+pub(super) fn lower<'n, S: super::source::NamesSource<'n>>(names: S, key: LibKey, text: &'n str) -> Result<Lowered<'static, 'n>, HeadError> {
     let krate = names.crate_of(key).ok_or(HeadError::NoText(key))?;
-    let mut cfg = CrateCfg(names.krate(krate).cfg.atoms());
-    blaze_lower::lower_signature(text, names.edition(krate), &mut cfg, Alloc::global()).map_err(|_| HeadError::Cfg(key))
+    // Over records a crate with no items record has no atoms and no edition: the source filed
+    // why (`source::SourceError::NoRecord`), and the item has no text to lower.
+    let mut cfg = CrateCfg(names.cfg_atoms(krate).ok_or(HeadError::NoText(key))?);
+    let edition = names.edition_of(krate).ok_or(HeadError::NoText(key))?;
+    blaze_lower::lower_signature(text, edition, &mut cfg, Alloc::global()).map_err(|_| HeadError::Cfg(key))
 }
 
 /// A member of a trait or an impl: its name, kind and text, as the names library lists it.
@@ -619,17 +622,31 @@ struct Member<'n> {
 
 /// The members of trait or impl `key` from `Names::members`: those written in its body and
 /// those a macro call there expands to (core's `impl u32 { uint_impl! { .. } }`), one list.
-fn members<'n>(names: &'n Names<'n>, key: LibKey) -> Result<Vec<Member<'n>, Global>, HeadError> {
-    let krate = names.crate_of(key).ok_or(HeadError::NoText(key))?;
-    names.krate(krate).tables.texts.get(&key).ok_or(HeadError::NoText(key))?;
+fn members<'n, S: super::source::NamesSource<'n>>(names: S, key: LibKey) -> Result<Vec<Member<'n>, Global>, HeadError> {
+    names.crate_of(key).ok_or(HeadError::NoText(key))?;
+    if !names.has_text(key) {
+        return Err(HeadError::NoText(key));
+    }
     let mut out = Vec::new_in(Global);
+    // A member of a kind whose detail the source cannot give (over records: one that holds
+    // ranges of its text; the source filed the gap).
+    let mut no_detail = false;
     // A container with no member has no row in the library's members table.
-    for m in names.members(key).unwrap_or(&[]) {
+    names.each_member(key, &mut |m| {
         // The call itself: its expansion's members are listed beside it (`written_by`).
-        if matches!(m.detail, ItemDetail::MacroCall { .. }) {
-            continue;
+        if m.kind == blaze_surface::ItemKind::MacroCall {
+            return;
         }
-        out.push(Member { name: m.name.unwrap_or(""), detail: m.detail, text: m.text });
+        match m.detail {
+            Some(detail) => out.push(Member { name: m.name.unwrap_or(""), detail, text: m.text }),
+            None => {
+                names.gap("a member's outline detail beyond its kind (heads.rs: members)", Some(m.key));
+                no_detail = true;
+            }
+        }
+    });
+    if no_detail {
+        return Err(HeadError::NoText(key));
     }
     Ok(out)
 }
@@ -664,7 +681,7 @@ impl<'n> Store<'n> {
     }
 
     /// Makes `want` and every head it needs, by a work list.
-    pub fn ensure(&mut self, names: &'n Names<'n>, keys: &mut Keys, want: Want) -> Result<(), HeadError> {
+    pub fn ensure<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, want: Want) -> Result<(), HeadError> {
         let mut stack = Vec::new_in(Global);
         stack.push(want);
         // The want made by the step before: asked again at once, it was made and its lookup
@@ -692,7 +709,7 @@ impl<'n> Store<'n> {
         Err(HeadError::Cycle(cycle(&stack)))
     }
 
-    fn step(&mut self, names: &'n Names<'n>, keys: &mut Keys, want: Want) -> Result<Step, HeadError> {
+    fn step<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, want: Want) -> Result<Step, HeadError> {
         let key = want.key();
         let ck = checker_of(key);
         let done = match want {
@@ -705,15 +722,16 @@ impl<'n> Store<'n> {
         if done {
             return Ok(Step::Done);
         }
-        let resolver = Resolver { names };
+        let resolver = Paths { names };
         // An item declared in a body: its row's text and its enclosing body's module.
         let (detail, text, module) = match self.locals.head_of(key) {
             Some(local) => local?,
-            None => (
-                resolver.detail(key).ok_or(HeadError::NoText(key))?,
-                names.item_text(key).ok_or(HeadError::NoText(key))?.text,
-                names.module_of(key).ok_or(HeadError::NoText(key))?,
-            ),
+            None => {
+                let detail = resolver.detail(key).ok_or(HeadError::NoText(key))?;
+                // One row over records: the text and the module its names are read in.
+                let it = names.text_of(key).ok_or(HeadError::NoText(key))?;
+                (detail, it.text, it.module)
+            }
         };
         let low = lower(names, key, text)?;
         let v = low.view();
@@ -776,11 +794,11 @@ impl<'n> Store<'n> {
     /// clauses are, with `Self` = `Param(0)`. An alias named in them is made first
     /// ([`Why::Need`]), so its clauses arrive expanded; aliases naming each other in a cycle
     /// are [`Store::ensure`]'s `HeadError::Cycle`.
-    fn trait_alias(&mut self, names: &'n Names<'n>, keys: &mut Keys, key: LibKey, module: LibKey, v: &View<'_>) -> Result<(), Why> {
+    fn trait_alias<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, key: LibKey, module: LibKey, v: &View<'_>) -> Result<(), Why> {
         let whole = Range::new(0, 0);
         let mut ps = Vec::new_in(Global);
         let mut cs = Vec::new_in(Global);
-        let b = Builder { resolver: Resolver { names }, heads: &self.maps };
+        let b = Builder { resolver: Paths { names }, heads: &self.maps };
         let own = own_generics(&b, &mut self.tys, module, v, 1, &mut ps, &mut cs)?;
         let me = intern(&mut self.tys, PNode::Param(0))?;
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Ty(me, None), self_assoc: &[], anon: &[], consts: &cs };
@@ -810,10 +828,10 @@ impl<'n> Store<'n> {
 
     /// A free type alias's head: its generics and the aliased type, read in the alias's own
     /// module with its own parameters (a bound on an alias's parameter binds nothing).
-    fn alias(&mut self, names: &'n Names<'n>, key: LibKey, module: LibKey, v: &View<'_>) -> Result<(), Why> {
+    fn alias<S: NamesSource<'n>>(&mut self, names: S, key: LibKey, module: LibKey, v: &View<'_>) -> Result<(), Why> {
         let mut ps = Vec::new_in(Global);
         let mut cs = Vec::new_in(Global);
-        let b = Builder { resolver: Resolver { names }, heads: &self.maps };
+        let b = Builder { resolver: Paths { names }, heads: &self.maps };
         let generics = own_generics(&b, &mut self.tys, module, v, 0, &mut ps, &mut cs)?;
         let t = v.head_opt(head::TY).ok_or(Why::Unsupported("a type alias with no type (`type T;`)", Range::new(0, 0)))?;
         // A bound on an alias's parameter is not checked where the alias is used, but it is
@@ -835,10 +853,10 @@ impl<'n> Store<'n> {
 
     /// A struct's, enum's or union's head: its type parameter count and each one's default,
     /// lowered over the parameters before it (`struct Vec<T, A: Allocator = Global>`).
-    fn adt_head(&mut self, names: &'n Names<'n>, key: LibKey, module: LibKey, v: &View<'_>) -> Result<(), Why> {
+    fn adt_head<S: NamesSource<'n>>(&mut self, names: S, key: LibKey, module: LibKey, v: &View<'_>) -> Result<(), Why> {
         let mut ps = Vec::new_in(Global);
         let mut cs = Vec::new_in(Global);
-        let b = Builder { resolver: Resolver { names }, heads: &self.maps };
+        let b = Builder { resolver: Paths { names }, heads: &self.maps };
         let g = own_generics(&b, &mut self.tys, module, v, 0, &mut ps, &mut cs)?;
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &cs };
         let mut defaults = Vec::new_in(Global);
@@ -848,7 +866,7 @@ impl<'n> Store<'n> {
         Ok(())
     }
 
-    fn trait_head(&mut self, names: &'n Names<'n>, keys: &mut Keys, key: LibKey, module: LibKey, v: &View<'_>, _text: &'n str) -> Result<(), Why> {
+    fn trait_head<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, key: LibKey, module: LibKey, v: &View<'_>, _text: &'n str) -> Result<(), Why> {
         let whole = Range::new(0, 0);
         let written = v.head[head::FLAGS];
         if written & sig::TRAIT_ALIAS != 0 {
@@ -863,7 +881,7 @@ impl<'n> Store<'n> {
         }
         let mut ps = Vec::new_in(Global);
         let mut cs = Vec::new_in(Global);
-        let b = Builder { resolver: Resolver { names }, heads: &self.maps };
+        let b = Builder { resolver: Paths { names }, heads: &self.maps };
         let own = own_generics(&b, &mut self.tys, module, v, 1, &mut ps, &mut cs)?;
         // The trait's bounds are lowered after its head (they may name the trait): a default
         // written with `T::X` is refused as not yet readable, never as not found.
@@ -904,14 +922,14 @@ impl<'n> Store<'n> {
     /// A trait's predicates (its supertraits and where clauses on its generics, `Self` =
     /// `Param(0)`) and its fns' signatures, each fn's clauses its trait's plus
     /// `Self: Trait<params>`.
-    fn trait_members(&mut self, names: &'n Names<'n>, keys: &mut Keys, key: LibKey, module: LibKey, v: &View<'_>) -> Result<(), Why> {
+    fn trait_members<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, key: LibKey, module: LibKey, v: &View<'_>) -> Result<(), Why> {
         let whole = Range::new(0, 0);
         let ck = checker_of(key);
         let mut ps = Vec::new_in(Global);
         let own = param_names(v, 1, &mut ps, Consts::Keep)?;
         let cs = self.maps.const_params.get(&key).cloned().ok_or(Why::Need(key))?;
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Trait(key), self_assoc: &[], anon: &[], consts: &cs };
-        let b = Builder { resolver: Resolver { names }, heads: &self.maps };
+        let b = Builder { resolver: Paths { names }, heads: &self.maps };
         let mut bounds = Vec::new_in(Global);
         b.param_bounds(&mut self.tys, &env, v, 1, &mut bounds)?;
         let env = Env { bounds: Bounds::Done(&bounds), ..env };
@@ -956,11 +974,32 @@ impl<'n> Store<'n> {
                 }
                 ItemDetail::TypeAlias => {
                     let item = keys.member(ck, MemberKind::Type, m.name).map_err(|c| Why::Program(format!("{c}").into_boxed_str(), whole))?;
-                    let b = Builder { resolver: Resolver { names }, heads: &self.maps };
+                    let b = Builder { resolver: Paths { names }, heads: &self.maps };
                     let default = match mv.head_opt(head::TY) {
                         Some(t) => Some(b.ty(&mut self.tys, &env, &mv, lf::TypeId(t))?),
                         None => None,
                     };
+                    // Its item bounds (`type A: B;` and the implied `Sized`), filed as the
+                    // predicates of its own key with `Self` the alias `<Self as Trait<params>>::A`
+                    // ([`Builder::assoc_ty_bounds`]): what the checker gives the solver as the
+                    // alias's bounds. As a member fn's signature ([`Store::member_fn_head`]): a
+                    // need is passed up; any other refusal is filed in `fn_gaps` under the
+                    // type's key and the trait's head goes on: a body whose solve reads the
+                    // bounds then gets the gap, by name (`BodyWorld::predicates`).
+                    let alias_args = params(&mut self.tys, 0, own + 1, &cs)?;
+                    let alias = intern(&mut self.tys, PNode::Alias { trait_: ck, name: Name::of(m.name), args: alias_args })?;
+                    let mut ap = Preds::new();
+                    match b.assoc_ty_bounds(&mut self.tys, &env, &mv, alias, self.sized, &mut ap) {
+                        Ok(()) => {
+                            self.fn_gaps.remove(&item);
+                            self.preds.insert(item, ap);
+                        }
+                        Err(why @ (Why::Need(_) | Why::NeedConst(..))) => return Err(why),
+                        Err(why) => {
+                            self.preds.remove(&item);
+                            self.fn_gaps.insert(item, why);
+                        }
+                    }
                     assoc.push(tc::AssocTyDef { name: Name::of(m.name), item, default });
                 }
                 // A trait's associated constant (the Reference, "Associated Items",
@@ -978,7 +1017,7 @@ impl<'n> Store<'n> {
                     let at = Range::new(0, m.text.len() as u32);
                     let t = mv.head_opt(head::TY).ok_or(Why::Unsupported("an associated constant with no type", at))?;
                     consts.push((Name::of(m.name), mk));
-                    let b = Builder { resolver: Resolver { names }, heads: &self.maps };
+                    let b = Builder { resolver: Paths { names }, heads: &self.maps };
                     // As a member fn's signature ([`Store::member_fn_head`]): a need is passed
                     // up; any other refusal of the constant's type is filed in `fn_gaps` and
                     // the trait's head goes on (core's `SizedTypeProperties` has six
@@ -1012,7 +1051,7 @@ impl<'n> Store<'n> {
     }
 
     #[expect(clippy::too_many_arguments, reason = "the item's parts, each read once by the caller")]
-    fn adt(&mut self, names: &'n Names<'n>, keys: &mut Keys, key: LibKey, module: LibKey, v: &View<'_>, detail: ItemDetail) -> Result<(), Why> {
+    fn adt<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, key: LibKey, module: LibKey, v: &View<'_>, detail: ItemDetail) -> Result<(), Why> {
         let ck = checker_of(key);
         let mut ps = Vec::new_in(Global);
         let generics = param_names(v, 0, &mut ps, Consts::Keep)?;
@@ -1020,7 +1059,7 @@ impl<'n> Store<'n> {
         let pl = params(&mut self.tys, 0, generics, &cs)?;
         let self_ty = intern(&mut self.tys, PNode::Adt(ck, pl))?;
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::Ty(self_ty, None), self_assoc: &[], anon: &[], consts: &cs };
-        let b = Builder { resolver: Resolver { names }, heads: &self.maps };
+        let b = Builder { resolver: Paths { names }, heads: &self.maps };
         let mut bounds = Vec::new_in(Global);
         b.param_bounds(&mut self.tys, &env, v, 0, &mut bounds)?;
         let env = Env { bounds: Bounds::Done(&bounds), ..env };
@@ -1039,8 +1078,8 @@ impl<'n> Store<'n> {
         // Each variant's written discriminant (`A = 1`) and the variant's range.
         let mut written = Vec::new_in(Global);
         if kind == tc::AdtKind::Enum {
-            let krate = names.crate_of(key).ok_or(Why::Need(key))?;
-            let lib_vs = names.krate(krate).tables.enums.get(&key);
+            names.crate_of(key).ok_or(Why::Need(key))?;
+            let lib_vs = names.variants(key);
             for (i, &n) in v.rows(v.list(head::FIELDS))?.iter().enumerate() {
                 let var = lf::Variant::decode(n)?;
                 let r = v.site(v.row_range(v.list(head::FIELDS).start + i as u32)?)?;
@@ -1056,7 +1095,7 @@ impl<'n> Store<'n> {
                 1 => tc::CtorKind::Tuple,
                 _ => tc::CtorKind::Unit,
             };
-            let name = names.item_text(key).and_then(|t| t.name).unwrap_or("");
+            let name = names.name_of(key).unwrap_or("");
             let vk = keys.member(ck, MemberKind::Ctor, "").map_err(|c| Why::Program(format!("{c}").into_boxed_str(), Range::new(0, 0)))?;
             shapes.push((vk, Name::of(name), ctor, v.list(head::FIELDS)));
         }
@@ -1103,7 +1142,7 @@ impl<'n> Store<'n> {
         Ok(())
     }
 
-    fn impl_(&mut self, names: &'n Names<'n>, keys: &mut Keys, key: LibKey, module: LibKey, v: &View<'_>) -> Result<(), Why> {
+    fn impl_<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, key: LibKey, module: LibKey, v: &View<'_>) -> Result<(), Why> {
         let whole = Range::new(0, 0);
         let mut polarity = if v.head[head::FLAGS] & sig::NEGATIVE != 0 { tc::ImplPolarity::Negative } else { tc::ImplPolarity::Positive };
         for &n in v.rows(v.list(head::ATTRS))? {
@@ -1114,7 +1153,7 @@ impl<'n> Store<'n> {
         let ck = checker_of(key);
         let mut ps = Vec::new_in(Global);
         let mut cs = Vec::new_in(Global);
-        let b = Builder { resolver: Resolver { names }, heads: &self.maps };
+        let b = Builder { resolver: Paths { names }, heads: &self.maps };
         let generics = own_generics(&b, &mut self.tys, module, v, 0, &mut ps, &mut cs)?;
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &cs };
         let mut bounds = Vec::new_in(Global);
@@ -1207,7 +1246,7 @@ impl<'n> Store<'n> {
     /// `fn_gaps` and the container's head goes on (a need is passed up: the store makes the
     /// head it names and makes the container again).
     #[expect(clippy::too_many_arguments, reason = "the fn's parts and its container's")]
-    fn member_fn_head(&mut self, names: &'n Names<'n>, lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, text: &'n str) -> Result<(), Why> {
+    fn member_fn_head<S: NamesSource<'n>>(&mut self, names: S, lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, text: &'n str) -> Result<(), Why> {
         match self.fn_head(names, lib, key, container, outer, parent, inherited, v, text) {
             Err(why @ (Why::Need(_) | Why::NeedConst(..))) => Err(why),
             Err(why) => {
@@ -1224,13 +1263,13 @@ impl<'n> Store<'n> {
     /// A fn's signature and clauses: `env` is its container's (its params `0..parent`),
     /// `inherited` its container's clauses, `v` its own text's.
     #[expect(clippy::too_many_arguments, reason = "the fn's parts and its container's")]
-    fn fn_head(&mut self, names: &'n Names<'n>, lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, text: &'n str) -> Result<(), Why> {
+    fn fn_head<S: NamesSource<'n>>(&mut self, names: S, lib: LibKey, key: ItemKey, container: Option<ItemKey>, outer: &Env<'_>, parent: u32, inherited: &[PClause], v: &View<'_>, text: &'n str) -> Result<(), Why> {
         let mut ps = Vec::new_in(Global);
         ps.extend_from_slice(outer.params);
         let mut cs = Vec::new_in(Global);
         cs.extend_from_slice(outer.consts);
         let declared = {
-            let b = Builder { resolver: Resolver { names }, heads: &self.maps };
+            let b = Builder { resolver: Paths { names }, heads: &self.maps };
             own_generics(&b, &mut self.tys, outer.module, v, parent, &mut ps, &mut cs)?
         };
         // Each `impl Trait` parameter type is one more own type parameter, after the declared
@@ -1273,7 +1312,7 @@ impl<'n> Store<'n> {
             return Err(Why::Program("a fn's container's bounds were not lowered before the fn".into(), Range::new(0, 0)));
         };
         bounds.extend_from_slice(outer_bounds);
-        let b = Builder { resolver: Resolver { names }, heads: &self.maps };
+        let b = Builder { resolver: Paths { names }, heads: &self.maps };
         let env = Env { module: outer.module, params: &ps, bounds: Bounds::Building(&[]), self_: outer.self_, self_assoc: outer.self_assoc, anon: &anon, consts: &cs };
         b.param_bounds(&mut self.tys, &env, v, parent, &mut bounds)?;
         let env = Env { bounds: Bounds::Done(&bounds), ..env };
@@ -1321,7 +1360,7 @@ impl<'n> Store<'n> {
         // its output is opaque 0 with the bounds `Future`, `Output = T` and `Sized`. Its body
         // is an async block (a coroutine): the checker's and the code builder's, not the head's.
         let output = if is_async {
-            let fut = super::langs::future_trait(Resolver { names }, self.sized.ok_or(Why::Unsupported("an `async fn` in a program with no `Sized` (no core)", whole))?)
+            let fut = super::langs::future_trait(Paths { names }, self.sized.ok_or(Why::Unsupported("an `async fn` in a program with no `Sized` (no core)", whole))?)
                 .map_err(|e| Why::Program(format!("the `Future` trait of an `async fn`: {e}").into_boxed_str(), whole))?
                 .ok_or(Why::Unsupported("an `async fn` in a program whose core has no `future::Future`", whole))?;
             let k = super::keys::opaque_key(key, 0);

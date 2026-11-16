@@ -169,6 +169,26 @@ pub trait LayoutFacts {
         let _ = (owner, ordinal);
         None
     }
+
+    /// The facts of coroutine `ordinal` of `owner`'s body (coroutine.rs, the module doc: the
+    /// `async` blocks of the body in expression order): its upvars' tuple and its output, in
+    /// the owner's generic parameters, made from the owner's body and check record by
+    /// [`crate::coroutine_facts`]. `None`: not answered, and the layout refuses naming it.
+    fn coroutine(&self, owner: ItemKey, ordinal: u32) -> Option<crate::CoroutineFacts<'_>> {
+        let _ = (owner, ordinal);
+        None
+    }
+
+    /// The state of coroutine `ordinal` of `owner` at the owner's ground arguments `args`
+    /// (types of `ground`): [`crate::StateShape::of`] the layout `blaze_lir::coroutine::split`
+    /// returned for that instance's built body ([`crate::CoroutineOf`] names it). `Ok(None)`:
+    /// not answered, refused by name. `Err(Missing)`: that body is not built and split yet;
+    /// the layout refuses with [`Refusal::Missing`] and caches nothing, and is asked again
+    /// once the record exists.
+    fn coroutine_state(&self, owner: ItemKey, ordinal: u32, args: &[PTy], ground: blaze_typeck::PTys<'_>) -> Result<Option<crate::StateShape>, Missing> {
+        let _ = (owner, ordinal, args, ground);
+        Ok(None)
+    }
 }
 
 /// A closure's facts, of its owner's generic parameters (`Param(i)`) in `types`.
@@ -234,7 +254,7 @@ pub fn closure_facts(
 }
 
 /// Facts that answer nothing: copying a record's types keeps its projections as written.
-struct NoFacts;
+pub(crate) struct NoFacts;
 
 impl LayoutFacts for NoFacts {
     fn adt(&self, _: ItemKey) -> Option<Adt<'_>> {
@@ -826,6 +846,16 @@ impl<A: Allocator + Clone> Layouts<A> {
                 args.extend_from_slice(view.list(l).map_err(|_| Refusal::Malformed("a list past the ground table"))?);
                 out.push(ground(c.types, c.env, &args, cx.ground, cx.scratch, facts).map_err(Refusal::Ground)?);
             }
+            // A coroutine's state (coroutine.rs): its upvars' tuple first, a fact of its
+            // identity grounded at the owner's arguments; the rest is the pass's (`compute`).
+            PNode::Future(..) => {
+                let facts = cx.facts;
+                let of = crate::coroutine_of(view, t).ok_or(Refusal::Unsupported("an async block's future named by its expression (it has no identity form: coroutine.rs)"))?;
+                let c = facts.coroutine(of.owner, of.ordinal).ok_or(Refusal::Unsupported("a coroutine whose facts the world did not answer"))?;
+                let mut args: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+                args.extend_from_slice(view.list(of.owner_args).map_err(|_| Refusal::Malformed("a list past the ground table"))?);
+                out.push(ground(c.types, c.env, &args, cx.ground, cx.scratch, facts).map_err(Refusal::Ground)?);
+            }
             PNode::Adt(key, l) => {
                 let facts = cx.facts;
                 let adt = facts.adt(key).ok_or(Refusal::NoAdt(key))?;
@@ -1012,7 +1042,30 @@ impl<A: Allocator + Clone> Layouts<A> {
                 self.struct_row(t, u)
             }
             PNode::Adt(key, _) => return self.adt(t, key, cx, parts),
-            PNode::Future(..) => return Err(Refusal::Unsupported("an async block's future (its state machine is built by codegen)")),
+            // A coroutine's state (coroutine.rs): a struct of one field, its upvars' tuple at
+            // offset 0, in the size and alignment the pass gave the instance's built body. No
+            // scalar form and no niche: the bytes past the upvars are the pass's.
+            PNode::Future(..) => {
+                let view = cx.ground.view();
+                let of = crate::coroutine_of(view, t).ok_or(Refusal::Unsupported("an async block's future named by its expression (it has no identity form: coroutine.rs)"))?;
+                let args = view.list(of.owner_args).map_err(|_| Refusal::Malformed("a list past the ground table"))?;
+                let state = match cx.facts.coroutine_state(of.owner, of.ordinal, args, view) {
+                    Err(missing) => return Err(Refusal::Missing(missing)),
+                    Ok(None) => return Err(Refusal::Unsupported("a coroutine whose state the world did not answer")),
+                    Ok(Some(state)) => state,
+                };
+                let u = self.univariant(parts, Order::Decreasing, ReprAttrs::RUST, 0, 0)?;
+                if u64::from(state.size) < u.size || state.align < u.align || u64::from(state.tag_offset) < u.size {
+                    return Err(Refusal::Malformed("a coroutine's state smaller than its upvars"));
+                }
+                let mut row = self.struct_row(t, u);
+                row.size = u64::from(state.size);
+                row.align = state.align;
+                row.scalar = None;
+                row.pair = None;
+                row.niche = None;
+                row
+            }
             // codegen.md "Trait objects": unsized, its size and alignment the vtable's words 1
             // and 2; no field is visible through it.
             PNode::Dynamic(_) => Layout {

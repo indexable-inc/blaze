@@ -133,6 +133,13 @@ pub(crate) enum Body {
 /// keyword after a non-ASCII character counts: every miss is on the safe side. Strings and
 /// comments are read as code, also on the safe side, and so for `may_flag`.
 pub(crate) fn read_body(body: &[u8]) -> Body {
+    // A removal experiment of the outline lane (2026-11-16), off unless an example sets it:
+    // 1 cuts every body unread, 2 cuts every body and lexes each for its flags.
+    match crate::REMOVAL.load(core::sync::atomic::Ordering::Relaxed) {
+        1 => return Body::Plain { may_flag: false },
+        2 => return Body::Plain { may_flag: true },
+        _ => {}
+    }
     const ITEMS: [&[u8]; 13] =
         [b"fn", b"struct", b"enum", b"union", b"trait", b"impl", b"const", b"static", b"type", b"mod", b"use", b"extern", b"macro"];
     let mut may_flag = false;

@@ -387,6 +387,257 @@ fn par_map<T: Send>(threads: usize, n: usize, f: impl Fn(usize) -> T + Sync) -> 
 
 struct Threads(usize);
 
+/// The stages of the solves, timed (`Par::stage`): each thread's time since its last mark goes
+/// to the stage that mark named. The time of a try that ended in a `Need` (a `Try` mark after
+/// a `Try` with no `Done` between) is also summed apart: that solve was thrown away. The
+/// footprint's growth between marks goes to the stage too (a fill with its expansions is one
+/// stretch): it says where bytes went only when one thread solves.
+mod stages {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+    use std::time::Instant;
+
+    use blaze_scope::task::Stage;
+
+    const N: usize = Stage::ALL.len();
+    pub static NS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    pub static BYTES: [AtomicI64; N] = [const { AtomicI64::new(0) }; N];
+    pub static MARKS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    pub static THROWN_NS: AtomicU64 = AtomicU64::new(0);
+    pub static THROWN_TRIES: AtomicU64 = AtomicU64::new(0);
+
+    thread_local! {
+        /// The stage this thread is in and since when; the footprint at its last sample; the
+        /// ns of the try in progress (`None`: no try is open).
+        static AT: Cell<Option<(Stage, Instant)>> = const { Cell::new(None) };
+        static FOOT: Cell<u64> = const { Cell::new(0) };
+        static TRY: Cell<Option<u64>> = const { Cell::new(None) };
+    }
+
+    pub fn mark(stage: Stage) {
+        let now = Instant::now();
+        let before = AT.replace(Some((stage, now)));
+        MARKS[stage as usize].fetch_add(1, Ordering::Relaxed);
+        let mut spent = 0;
+        if let Some((prev, since)) = before
+            && prev != Stage::Done
+        {
+            spent = now.duration_since(since).as_nanos() as u64;
+            NS[prev as usize].fetch_add(spent, Ordering::Relaxed);
+            let in_fill = stage == Stage::Expand || (stage == Stage::Solve && prev == Stage::Expand);
+            if !in_fill {
+                let foot = super::now_footprint();
+                BYTES[prev as usize].fetch_add(foot as i64 - FOOT.get() as i64, Ordering::Relaxed);
+                FOOT.set(foot);
+            }
+        } else {
+            FOOT.set(super::now_footprint());
+        }
+        match stage {
+            Stage::Try => {
+                if let Some(thrown) = TRY.replace(Some(0)) {
+                    THROWN_NS.fetch_add(thrown + spent, Ordering::Relaxed);
+                    THROWN_TRIES.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            Stage::Done => TRY.set(None),
+            _ => {
+                if let Some(t) = TRY.get() {
+                    TRY.set(Some(t + spent));
+                }
+            }
+        }
+    }
+
+    /// The rows, then every counter back to zero for the next thread count.
+    pub fn print(threads: usize) {
+        let total: u64 = NS.iter().map(|n| n.load(Ordering::Relaxed)).sum();
+        for s in Stage::ALL {
+            let (ns, bytes, marks) = (NS[s as usize].swap(0, Ordering::Relaxed), BYTES[s as usize].swap(0, Ordering::Relaxed), MARKS[s as usize].swap(0, Ordering::Relaxed));
+            if s != Stage::Done {
+                println!(
+                    "threads {threads}: stage {:<12} {:>10.1} ms {:>5.1}%  footprint {:>+9.1} MB  entered {marks}",
+                    format!("{s:?}"),
+                    ns as f64 / 1e6,
+                    100.0 * ns as f64 / total.max(1) as f64,
+                    bytes as f64 / 1e6
+                );
+            }
+        }
+        println!(
+            "threads {threads}: stages in all {:.1} ms; of it thrown away by {} tries that ended in a Need: {:.1} ms",
+            total as f64 / 1e6,
+            THROWN_TRIES.swap(0, Ordering::Relaxed),
+            THROWN_NS.swap(0, Ordering::Relaxed) as f64 / 1e6
+        );
+    }
+}
+
+/// The parts of the macro expansions, timed (`Par::expand_part`): each thread's time since its
+/// last part mark goes to the part that mark named and to the macro the call named (by name
+/// and kind of run), with the part's size (bytes or tokens). `End` closes a call.
+mod parts {
+    use std::cell::{Cell, RefCell};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+
+    use blaze_scope::task::ExpandPart;
+
+    const N: usize = ExpandPart::ALL.len();
+    pub static NS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    pub static SIZE: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    pub static MARKS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    /// By macro name and run kind: calls, ns, output bytes (the rendered text), and how many
+    /// calls repeated an input text already seen for that macro in this process.
+    pub static MACROS: Mutex<Option<HashMap<(String, &'static str), Row>>> = Mutex::new(None);
+
+    #[derive(Default, Clone, Copy)]
+    pub struct Row {
+        calls: u64,
+        ns: u64,
+        run_ns: u64,
+        out_bytes: u64,
+    }
+
+    thread_local! {
+        static AT: Cell<Option<(ExpandPart, Instant)>> = const { Cell::new(None) };
+        /// The open call: its macro's name, the kind of its run, its ns so far, its run's ns,
+        /// its rendered bytes.
+        static CALL: RefCell<(String, &'static str, u64, u64, u64)> = const { RefCell::new((String::new(), "none", 0, 0, 0)) };
+    }
+
+    fn run_kind(part: ExpandPart) -> Option<&'static str> {
+        match part {
+            ExpandPart::RunRules => Some("rules"),
+            ExpandPart::RunBuiltin => Some("builtin"),
+            ExpandPart::RunDerive => Some("derive"),
+            ExpandPart::RunProc => Some("proc"),
+            _ => None,
+        }
+    }
+
+    pub fn mark(part: ExpandPart, macro_name: &str, size: usize) {
+        let now = Instant::now();
+        let before = AT.replace((part != ExpandPart::End).then_some((part, now)));
+        MARKS[part as usize].fetch_add(1, Ordering::Relaxed);
+        SIZE[part as usize].fetch_add(size as u64, Ordering::Relaxed);
+        CALL.with_borrow_mut(|call| {
+            if let Some((prev, since)) = before {
+                let spent = now.duration_since(since).as_nanos() as u64;
+                NS[prev as usize].fetch_add(spent, Ordering::Relaxed);
+                call.2 += spent;
+                if run_kind(prev).is_some() {
+                    call.3 += spent;
+                }
+            }
+            if !macro_name.is_empty() && call.0 != macro_name {
+                call.0.clear();
+                call.0.push_str(macro_name);
+            }
+            if let Some(kind) = run_kind(part) {
+                call.1 = kind;
+            }
+            if part == ExpandPart::Outline {
+                call.4 = size as u64;
+            }
+            if part == ExpandPart::End {
+                let mut macros = MACROS.lock().unwrap_or_else(|p| panic!("the macro rows' lock was poisoned: {p}"));
+                let row = macros.get_or_insert_with(HashMap::new).entry((core::mem::take(&mut call.0), call.1)).or_default();
+                row.calls += 1;
+                row.ns += call.2;
+                row.run_ns += call.3;
+                row.out_bytes += call.4;
+                *call = (String::new(), "none", 0, 0, 0);
+            }
+        });
+    }
+
+    /// By (definition, digest of the input text): the calls seen and the input's bytes.
+    static SEEN: Mutex<Option<HashMap<(blaze_id::ItemKey, [u8; 32]), (u64, u64)>>> = Mutex::new(None);
+
+    pub fn seen(def: blaze_id::ItemKey, input: &str) {
+        let start = Instant::now();
+        let digest = blaze_id::ContentId::of("names example macro input", input.as_bytes()).0;
+        let mut seen = SEEN.lock().unwrap_or_else(|p| panic!("the seen calls' lock was poisoned: {p}"));
+        let row = seen.get_or_insert_with(HashMap::new).entry((def, digest)).or_insert((0, input.len() as u64));
+        row.0 += 1;
+        drop(seen);
+        // The count's own time is no part's: the open part started that much later.
+        let own = start.elapsed();
+        AT.set(AT.get().map(|(part, since)| (part, since + own)));
+    }
+
+    /// The rows, then every counter back to zero for the next thread count.
+    pub fn print(threads: usize) {
+        let seen = SEEN.lock().unwrap_or_else(|p| panic!("the seen calls' lock was poisoned: {p}")).take().unwrap_or_default();
+        let (all, bytes): (u64, u64) = seen.values().fold((0, 0), |a, r| (a.0 + r.0, a.1 + r.0 * r.1));
+        let distinct_bytes: u64 = seen.values().map(|r| r.1).sum();
+        let once = seen.values().filter(|r| r.0 == 1).count();
+        println!(
+            "threads {threads}: expand calls with a definition {all} ({bytes} input bytes): distinct (definition, input text) {} ({distinct_bytes} input bytes), of them called once {once}; calls that repeat an earlier one {} ({:.1}%)",
+            seen.len(),
+            all - seen.len() as u64,
+            100.0 * (all - seen.len() as u64) as f64 / all.max(1) as f64
+        );
+        let total: u64 = NS.iter().map(|n| n.load(Ordering::Relaxed)).sum();
+        let calls = MARKS[ExpandPart::End as usize].load(Ordering::Relaxed).max(1);
+        for p in ExpandPart::ALL {
+            let (ns, size, marks) = (NS[p as usize].swap(0, Ordering::Relaxed), SIZE[p as usize].swap(0, Ordering::Relaxed), MARKS[p as usize].swap(0, Ordering::Relaxed));
+            if p != ExpandPart::End {
+                println!(
+                    "threads {threads}: expand part {:<10} {:>9.1} ms {:>5.1}%  {:>6.2} us/call over all calls  entered {marks:>7} ({:>7.2} us each)  size {size} ({:.1} ns/unit)",
+                    format!("{p:?}"),
+                    ns as f64 / 1e6,
+                    100.0 * ns as f64 / total.max(1) as f64,
+                    ns as f64 / 1e3 / calls as f64,
+                    ns as f64 / 1e3 / marks.max(1) as f64,
+                    ns as f64 / size.max(1) as f64
+                );
+            }
+        }
+        println!("threads {threads}: expand parts in all {:.1} ms over {calls} calls ({:.1} us a call)", total as f64 / 1e6, total as f64 / 1e3 / calls as f64);
+        let macros = MACROS.lock().unwrap_or_else(|p| panic!("the macro rows' lock was poisoned: {p}")).take().unwrap_or_default();
+        let mut rows: Vec<(&(String, &'static str), &Row)> = macros.iter().collect();
+        let row = |what: &str, ((name, kind), r): &(&(String, &'static str), &Row)| {
+            println!(
+                "threads {threads}: expand macro by {what}: {name}! ({kind}): {} calls, {:.1} ms ({:.1}% of expand), {:.1} us a call (run {:.1} us), {} output bytes ({:.0} a call)",
+                r.calls,
+                r.ns as f64 / 1e6,
+                100.0 * r.ns as f64 / total.max(1) as f64,
+                r.ns as f64 / 1e3 / r.calls.max(1) as f64,
+                r.run_ns as f64 / 1e3 / r.calls.max(1) as f64,
+                r.out_bytes,
+                r.out_bytes as f64 / r.calls.max(1) as f64
+            );
+        };
+        rows.sort_by(|a, b| b.1.ns.cmp(&a.1.ns).then_with(|| a.0.cmp(b.0)));
+        rows.iter().take(10).for_each(|r| row("time", r));
+        rows.sort_by(|a, b| b.1.calls.cmp(&a.1.calls).then_with(|| a.0.cmp(b.0)));
+        rows.iter().take(10).for_each(|r| row("calls", r));
+        let mut kinds: std::collections::BTreeMap<&'static str, Row> = std::collections::BTreeMap::new();
+        for ((_, kind), r) in macros.iter() {
+            let k = kinds.entry(*kind).or_default();
+            k.calls += r.calls;
+            k.ns += r.ns;
+            k.run_ns += r.run_ns;
+            k.out_bytes += r.out_bytes;
+        }
+        for (kind, r) in kinds {
+            println!(
+                "threads {threads}: expand kind {kind}: {} macros' {} calls, {:.1} ms, {:.1} us a call (run {:.1} us), {} output bytes",
+                macros.keys().filter(|k| k.1 == kind).count(),
+                r.calls,
+                r.ns as f64 / 1e6,
+                r.ns as f64 / 1e3 / r.calls.max(1) as f64,
+                r.run_ns as f64 / 1e3 / r.calls.max(1) as f64,
+                r.out_bytes
+            );
+        }
+    }
+}
+
 /// `--crates`: each crate's start and end on the ready queue, in ns since `start`.
 struct Clock {
     start: Instant,
@@ -466,6 +717,18 @@ impl blaze_scope::task::Par for Threads {
         Some(&PrintShadows)
     }
 
+    fn stage(&self, stage: blaze_scope::task::Stage) {
+        stages::mark(stage);
+    }
+
+    fn expand_part(&self, part: blaze_scope::task::ExpandPart, macro_name: &str, size: usize) {
+        parts::mark(part, macro_name, size);
+    }
+
+    fn expand_call(&self, def: blaze_id::ItemKey, input: &str) {
+        parts::seen(def, input);
+    }
+
     fn map<T, F: Fn(usize) -> T>(&self, n: usize, f: F, out: &mut AVec<'_, T>) {
         if self.0 <= 1 {
             for at in 0..n {
@@ -530,6 +793,12 @@ struct KeptDir<'w> {
     read_bytes: AtomicU64,
     /// Bytes of the full-names records written this run ([`blaze_scope::names_record`]).
     names_bytes: AtomicU64,
+    /// Digests of the records written this run, each the wrapping sum over crates of the
+    /// first eight bytes of the content id of (the crate's key, the record's bytes): the same
+    /// in any order of solving. The exports with the inner record, the read lists, the names.
+    made_digest: AtomicU64,
+    read_digest: AtomicU64,
+    names_digest: AtomicU64,
     keeps_names: bool,
     outlined: AtomicU64,
     /// By crate: why it was not found (`None`: found, or not asked).
@@ -539,6 +808,19 @@ struct KeptDir<'w> {
 const KEPT_MAGIC: &[u8; 8] = b"BZKEPT3\0";
 
 impl KeptDir<'_> {
+    /// One record's part of a run digest: the content id of `parts` (each with its length
+    /// before it) mixed with the crate's key, as a number the run sums.
+    fn record_digest(&self, krate: usize, parts: &[&[u8]]) -> u64 {
+        let key = self.inputs[krate].key.0.0;
+        let mut mixed = u64::from_le_bytes([key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7]]);
+        for part in parts {
+            let id = blaze_id::ContentId::of("names example record digest", part).0;
+            let id = u64::from_le_bytes([id[0], id[1], id[2], id[3], id[4], id[5], id[6], id[7]]);
+            mixed = (mixed.rotate_left(17) ^ id ^ part.len() as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+        mixed
+    }
+
     fn path(&self, krate: usize) -> PathBuf {
         let key = self.inputs[krate].key.0.0;
         self.dir.join(key.iter().map(|b| format!("{b:02x}")).collect::<String>())
@@ -673,6 +955,8 @@ impl blaze_scope::crate_scope::Kept for KeptDir<'_> {
         out.extend_from_slice(&(read.len() as u64).to_le_bytes());
         out.extend_from_slice(read);
         self.read_bytes.fetch_add(read.len() as u64, Ordering::Relaxed);
+        self.read_digest.fetch_add(self.record_digest(krate, &[read]), Ordering::Relaxed);
+        self.made_digest.fetch_add(self.record_digest(krate, &[record, inner]), Ordering::Relaxed);
         out.extend_from_slice(&(record.len() as u64).to_le_bytes());
         out.extend_from_slice(record);
         out.extend_from_slice(&(inner.len() as u64).to_le_bytes());
@@ -695,6 +979,7 @@ impl blaze_scope::crate_scope::Kept for KeptDir<'_> {
         std::fs::write(&part, names).unwrap_or_else(|e| panic!("names record {}: {e}", part.display()));
         std::fs::rename(&part, &path).unwrap_or_else(|e| panic!("names record {}: {e}", path.display()));
         self.names_bytes.fetch_add(names.len() as u64, Ordering::Relaxed);
+        self.names_digest.fetch_add(self.record_digest(krate, &[names]), Ordering::Relaxed);
     }
 }
 
@@ -1370,6 +1655,9 @@ fn main() {
                 find_ns: AtomicU64::new(0),
                 read_bytes: AtomicU64::new(0),
                 names_bytes: AtomicU64::new(0),
+                made_digest: AtomicU64::new(0),
+                read_digest: AtomicU64::new(0),
+                names_digest: AtomicU64::new(0),
                 keeps_names: !args.iter().any(|a| a == "--no-names"),
                 outlined: AtomicU64::new(0),
                 missed: (0..inputs.len()).map(|_| std::sync::Mutex::new(None)).collect(),
@@ -1403,6 +1691,20 @@ fn main() {
             );
             println!("threads {t}: read lists written this run: {} bytes", kept.read_bytes.load(Ordering::Relaxed));
             println!("threads {t}: names records written this run: {} bytes", kept.names_bytes.load(Ordering::Relaxed));
+            println!(
+                "threads {t}: records digest: exports and inner {:016x}, read lists {:016x}, names {:016x}",
+                kept.made_digest.load(Ordering::Relaxed),
+                kept.read_digest.load(Ordering::Relaxed),
+                kept.names_digest.load(Ordering::Relaxed)
+            );
+            parts::print(t);
+            stages::print(t);
+            let mut slowest: Vec<(u64, usize)> =
+                solved.iter().map(|&i| (clock.spans[i].1.load(Ordering::Relaxed).saturating_sub(clock.spans[i].0.load(Ordering::Relaxed)), i)).collect();
+            slowest.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+            for (ns, i) in slowest.iter().take(10) {
+                println!("threads {t}: crate {:<28} {:>9.1} ms ({:.1}% of solving)", inputs[*i].name, *ns as f64 / 1e6, 100.0 * *ns as f64 / solve_work.max(1) as f64);
+            }
             // `--question`: ten crates, evenly spaced by index; each solved this run prints its
             // solve's span; then one path in each is resolved through its names record alone,
             // opened (mapped) on that first ask: the time and the bytes decoded per crate.

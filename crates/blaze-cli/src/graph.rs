@@ -104,6 +104,9 @@ pub fn members_lock<'f>(units: &layout::Units<'_>, frame: &'f Frame) -> &'f [u8]
 /// toolchain line dropped, and the workspace's resolver.
 pub struct Members {
     packages: std::vec::Vec<Package<'static>, std::alloc::Global>,
+    /// Each member's directory, anchor-relative (`""` for the root's own package), in
+    /// `packages`' order: the names world reads each member's files under its own.
+    dirs: Vec<blaze_unit_graph::Text<'static>, Alloc<'static>>,
     resolver: Result<Resolver, NoResolver>,
     written: Option<std::string::String>,
 }
@@ -112,30 +115,36 @@ impl Members {
     /// The facts of `units`' members, on the global heap (they live as long as the command).
     pub fn of(units: &layout::Units<'_>) -> Members {
         let mut packages = std::vec::Vec::with_capacity_in(units.members.len(), std::alloc::Global);
+        let mut dirs = Vec::with_capacity_in(units.members.len(), Alloc::global());
         for member in units.members.iter() {
             let mut package = Package::from_member(member, Alloc::global());
             let blaze = member.edition.blaze.is_some();
             package.deps.retain(|dep| !toolchain_line(blaze, dep.key.as_str(), dep.package.as_str()));
             packages.push(package);
+            dirs.push(blaze_unit_graph::Text::from_str_in(member.dir.as_str(), Alloc::global()));
         }
         let written = units.resolver.as_ref().map(|(text, _)| text.as_str());
-        Members { packages, resolver: Resolver::of(written, units.root_edition), written: written.map(std::string::String::from) }
+        Members { packages, dirs, resolver: Resolver::of(written, units.root_edition), written: written.map(std::string::String::from) }
     }
 
     /// Each member matched to its lock entry (a path entry of its name).
     pub fn locked(self, lock: &Lock<'_>) -> Result<Parts, Unlocked> {
         let resolver = self.resolver.map_err(|NoResolver| Unlocked::Resolver { written: self.written.unwrap_or_default() })?;
         let mut members = std::vec::Vec::with_capacity_in(self.packages.len(), std::alloc::Global);
-        for package in self.packages {
+        let mut dirs = Vec::with_capacity_in(self.packages.len(), Alloc::global());
+        for (package, dir) in self.packages.into_iter().zip(self.dirs) {
             let mut ids = lock.named(package.name.as_str()).filter(|id| matches!(lock.package(*id).source, LockSource::Path));
             let found = (ids.next(), ids.next());
             drop(ids);
             match found {
-                (Some(id), None) => members.push((id, package)),
+                (Some(id), None) => {
+                    members.push((id, package));
+                    dirs.push((id, dir));
+                }
                 _ => return Err(Unlocked::Member { name: std::string::String::from(package.name.as_str()) }),
             }
         }
-        Ok(Parts { members, resolver })
+        Ok(Parts { members, dirs, resolver })
     }
 }
 
@@ -160,6 +169,8 @@ impl core::fmt::Display for Unlocked {
 /// The members matched to the lock, with the resolver.
 pub struct Parts {
     members: std::vec::Vec<(LockId, Package<'static>), std::alloc::Global>,
+    /// Each member's lock entry and its directory, anchor-relative, in `members`' order.
+    dirs: Vec<(LockId, blaze_unit_graph::Text<'static>), Alloc<'static>>,
     resolver: Resolver,
 }
 
@@ -170,6 +181,9 @@ pub struct Graph<'f> {
     inputs: UnitGraphInputs<'f, 'static>,
     /// The records mapped so far, by key, sorted: a re-entry maps nothing again.
     mapped: Vec<(ContentId, &'f [u8]), &'f Frame>,
+    /// Each member's lock entry and its directory, anchor-relative (`""` for the root's own
+    /// package): where the names world reads that member's files ([`Graph::member_dirs`]).
+    dirs: Vec<(LockId, blaze_unit_graph::Text<'static>), Alloc<'static>>,
 }
 
 impl<'f> Graph<'f> {
@@ -182,7 +196,12 @@ impl<'f> Graph<'f> {
         let target: &'f TargetDesc<'static> = std::boxed::Box::leak(std::boxed::Box::new_in(target, frame));
         let ask: &'f Ask<'static> = std::boxed::Box::leak(std::boxed::Box::new_in(ask, frame));
         let inputs = UnitGraphInputs { lock: lockfile.text, workspace_read, members, resolver: parts.resolver, target, host: target, ask };
-        Graph { source: unit_graph_task::source(&inputs), inputs, mapped: Vec::new_in(frame) }
+        Graph { source: unit_graph_task::source(&inputs), inputs, mapped: Vec::new_in(frame), dirs: parts.dirs }
+    }
+
+    /// Each member's lock entry and its directory, anchor-relative, in the layout's order.
+    pub fn member_dirs(&self) -> &[(LockId, blaze_unit_graph::Text<'static>)] {
+        &self.dirs
     }
 }
 

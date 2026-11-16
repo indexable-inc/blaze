@@ -442,6 +442,19 @@ ops! {
     /// then its inputs. Its outputs are a value of the block it falls through to, whose one
     /// predecessor it is.
     AsmBr = "asm_br": Layout::Extra(&[Field::Asm, Field::Block, Field::Blocks, Field::Values]), Any, None, None, Yes;
+
+    // Coroutines (decision D73; docs/v2/plan/design/coroutines.md). Both exist only between
+    // the builder and the coroutine pass (`crate::coroutine::split`), whose two outputs hold
+    // neither: no backend takes one. They are last so every other operation keeps its byte.
+    /// A suspension point of a coroutine body: its number, the block the next poll goes on
+    /// at, the block the state's drop goes on at when the state is dropped parked here, then
+    /// what this poll returns (the function's returns: the builder's `Poll::Pending`). Neither
+    /// block has parameters. In the body it is a two-way edge: the next poll's arguments
+    /// replace every entry parameter but the state pointer.
+    Suspend = "suspend": Layout::Extra(&[Field::Imm, Field::Block, Field::Block, Field::Values]), None, None, None, Yes;
+    /// The end of a cancel path (a `suspend`'s second block and what follows it): where the
+    /// state's drop glue returns.
+    Cancelled = "cancelled": NONE, None, None, None, Yes;
 }
 
 /// A code of the operation table: its name, layout, result, flags, attributes and end, so a

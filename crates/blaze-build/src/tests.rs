@@ -3364,3 +3364,4 @@ mod lets;
 mod wide;
 mod index;
 mod fmt;
+mod coroutines;

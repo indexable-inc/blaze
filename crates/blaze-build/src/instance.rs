@@ -85,8 +85,11 @@ pub fn instance_key(code: ContentId, args: List, ground: PTys<'_>, scratch: Allo
             // a generic fn at `T = fn(..)`): its header (ABI and safety, one byte) is part of
             // the type; its children the inputs, then the output.
             PNode::FnPtr(_, header) => (21, u128::from(header.bits())),
-            PNode::Future(..)
-            | PNode::Alias { .. }
+            // A coroutine (coroutine.rs, the module doc): a ground table holds a future only in
+            // its identity form, so the first part is its ORDINAL among the owner body's async
+            // blocks; its children the output, then the owner and the owner's arguments.
+            PNode::Future(ordinal, ..) => (22, u128::from(ordinal.0)),
+            PNode::Alias { .. }
             | PNode::Opaque(..)
             | PNode::Param(_)
             | PNode::ConstParam(_)
@@ -199,7 +202,7 @@ pub fn ground(
             PNode::FnDef(key, l) => PNode::FnDef(key, map_list(l, &mut list)?),
             PNode::FnPtr(l, header) => PNode::FnPtr(map_list(l, &mut list)?, header),
             PNode::Closure { owner, ordinal, args } => PNode::Closure { owner, ordinal, args: map_list(args, &mut list)? },
-            PNode::Future(..) => return Err(BuildError::UnsupportedSig { what: "an async block's future in an instance" }),
+            PNode::Future(e, o, i) => crate::walk::coroutine::ground_node(from, e, i, mapped[o.0 as usize], mapped[i.0 as usize])?,
             PNode::Alias { trait_, name, args } => {
                 projections = true;
                 PNode::Alias { trait_, name, args: map_list(args, &mut list)? }

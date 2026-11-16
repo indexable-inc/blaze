@@ -30,7 +30,7 @@ use blaze_id::ItemKey as LibKey;
 use blaze_lower::{Range, RowIdx, ScopeId, View};
 use blaze_mem::Frame;
 use blaze_own::Alloc;
-use blaze_scope::resolve::Names;
+use super::source::NamesSource;
 use blaze_surface::{ItemDetail, Rename, UseForm};
 use blaze_typeck::ItemKey;
 use parser::SyntaxKind;
@@ -309,19 +309,19 @@ impl<'n> Locals<'n> {
 
     /// The key every local item of `at`'s body is derived under: the body's own, by its
     /// item and its checker key (a member's body is not its container's).
-    fn parent(names: &Names<'_>, at: Enclosing<'_>) -> LibKey {
+    fn parent(crate_key: blaze_id::CrateItemKey, at: Enclosing<'_>) -> LibKey {
         let mut hex = [0u8; 32];
         for (n, b) in hex.iter_mut().enumerate() {
             *b = hex_digit(at.owner.0, n);
         }
         let name = core::str::from_utf8(&hex).unwrap_or("");
-        blaze_scope::task::key_of(names.krate(at.krate).key, at.item, "Body", name, 0)
+        blaze_scope::task::key_of(crate_key, at.item, "Body", name, 0)
     }
 
     /// Keeps the local items of the body `at` lowered to `view`, once per body: their rows in
     /// the frame, their keys filed in `keys`. A body with none keeps nothing. `alloc` holds
     /// the `use` trees' scratch.
-    pub fn keep(&mut self, names: &'n Names<'n>, keys: &mut Keys, at: Enclosing<'n>, view: &View<'_>, alloc: Alloc<'_>) -> Result<(), HeadError> {
+    pub fn keep<S: NamesSource<'n>>(&mut self, names: S, keys: &mut Keys, at: Enclosing<'n>, view: &View<'_>, alloc: Alloc<'_>) -> Result<(), HeadError> {
         if self.bodies.contains_key(&at.owner) {
             return Ok(());
         }
@@ -334,14 +334,17 @@ impl<'n> Locals<'n> {
         if count == 0 {
             return Ok(());
         }
-        let parent = Self::parent(names, at);
+        // The body's crate's key (every local key is derived under it); a crate the source has
+        // not read has no text for the body's item either.
+        let crate_key = names.crate_key(at.krate).ok_or(HeadError::NoText(at.item))?;
+        let parent = Self::parent(crate_key, at);
         let frame = self.frame;
         // The body's blocks as the names library made them modules: the same scan of the same
         // text, so the same keys (`blaze_scope::blocks::block_modules`). None when the body
         // is not an item or member of the library (a local item's own body).
         let nested = blaze_file_items::nested::scan(at.text, alloc);
         let modules = match Self::library_body(names, at) {
-            Some(body) if nested.end == blaze_file_items::nested::NestedEnd::Whole => Some(blaze_scope::blocks::block_modules(names.krate(at.krate).key, body, &nested, alloc)),
+            Some(body) if nested.end == blaze_file_items::nested::NestedEnd::Whole => Some(blaze_scope::blocks::block_modules(crate_key, body, &nested, alloc)),
             _ => None,
         };
         // The blocks whose module is known to exist: one that binds a kept item's name, and
@@ -395,7 +398,7 @@ impl<'n> Locals<'n> {
                     let stmt = nested.items.iter().find(|i| i.range.start <= r.start && r.start < i.range.end);
                     let module = stmt.and_then(|i| ms.get(i.block as usize).copied().flatten());
                     if let (Some(i), Some(m)) = (stmt, module) {
-                        if names.lookup(m, blaze_surface::Namespace::Types, name).is_some() {
+                        if names.binds(m, blaze_surface::Namespace::Types, name) {
                             in_module = Some(m);
                             let mut b = Some(i.block);
                             // A chain is at most as long as the body's blocks.
@@ -415,7 +418,7 @@ impl<'n> Locals<'n> {
                 // was checked first).
                 let last = rows.len() - 1;
                 let ordinal = rows[..last].iter().filter(|r| r.kind == kind && r.name == name).count() as u32;
-                let mut key = blaze_scope::task::key_of(names.krate(at.krate).key, parent, kind.tag(), name, ordinal);
+                let mut key = blaze_scope::task::key_of(crate_key, parent, kind.tag(), name, ordinal);
                 key.0.0[8] |= LibKey::INNER;
                 rows[last].key = key;
                 let ck = keys.item(key).map_err(HeadError::Key)?;
@@ -440,12 +443,19 @@ impl<'n> Locals<'n> {
     /// library: the item whose text is the body's text itself (the same slice), or the member
     /// of `at.item` (a member's body is kept under its container) whose text is. `None`: a
     /// body the library does not list under `at.item` (a local item's own body).
-    fn library_body(names: &Names<'_>, at: Enclosing<'_>) -> Option<LibKey> {
+    fn library_body<S: NamesSource<'n>>(names: S, at: Enclosing<'_>) -> Option<LibKey> {
         let same = |t: &str| core::ptr::eq(t.as_ptr(), at.text.as_ptr()) && t.len() == at.text.len();
-        if names.item_text(at.item).is_some_and(|it| same(it.text)) {
+        if names.text_of(at.item).is_some_and(|it| same(it.text)) {
             return Some(at.item);
         }
-        names.members(at.item)?.iter().find(|m| same(m.text)).map(|m| m.key)
+        // The first member whose text is the body's, in declaration order.
+        let mut found = None;
+        names.each_member(at.item, &mut |m| {
+            if found.is_none() && same(m.text) {
+                found = Some(m.key);
+            }
+        });
+        found
     }
 
     /// The local item `name` names in `ns`, written in block `scope` of the body `owner`: the

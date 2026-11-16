@@ -17,12 +17,13 @@ use blaze_typeck::{ItemKey, List, Name, PClause, PNode, PTy, PathIdx, PortableTy
 
 use super::preds::{lifetimes_only, segment_args};
 use super::types::{Bounded, Builder, Env, Heads, Why, children, children_of, intern, intern_list, path_texts, path_texts_of, subst_clause};
-use crate::resolve::{Ns, Resolver};
+use super::source::NamesSource;
+use crate::resolve::{Ns, Paths};
 
 /// One written member's dyn-compatibility facts (`v` its lowered text), `module` where its
 /// names resolve, `sized` the `#[lang = "sized"]` trait. The checker decides from them
 /// (`blaze_typeck::dyn_compat`, the rule's one home), through `TraitDef.members`.
-pub fn member(resolver: &Resolver<'_>, module: LibKey, sized: Option<LibKey>, detail: Member, v: &View<'_>) -> Result<MemberShape, Why> {
+pub fn member<'n, S: NamesSource<'n>>(resolver: &Paths<S>, module: LibKey, sized: Option<LibKey>, detail: Member, v: &View<'_>) -> Result<MemberShape, Why> {
     use blaze_lower::head;
     match detail {
         Member::Const => return Ok(MemberShape::Const),
@@ -175,7 +176,7 @@ fn mentions(tys: &PortableTys<'_>, l: &[PTy], needle: PTy, r: Range) -> Result<b
     Ok(false)
 }
 
-impl<'b, 'n, H: Heads> Builder<'b, 'n, H> {
+impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
     /// `dyn A<X, N = T> + Auto + 'a` (the type node of typeck.md "Trait objects" (a)): the
     /// principal's `ExTrait(A, args after Self)`, an `ExProj` per binding (its owner found
     /// through the supertraits), an `ExAuto` per auto trait (an auto trait by its own head), the

@@ -27,12 +27,148 @@ use crate::error::ResolveError;
 pub trait Par {
     fn map<T, F: Fn(usize) -> T>(&self, n: usize, f: F, out: &mut AVec<'_, T>);
 
+    /// The calling thread's solve passes into the stretch `stage` (rule 16: every stretch of
+    /// a solve has a name the caller's clock can time). The stretch lasts until the thread's
+    /// next mark. The library holds no clock: nothing by default.
+    fn stage(&self, stage: Stage) {
+        let _ = stage;
+    }
+
+    /// Inside [`Stage::Expand`]: the calling thread's expansion of a call of the macro named
+    /// `macro_name` passes into `part`, which works on `size` units (bytes of text or tokens,
+    /// by the part; 0 where a part has no size). The part lasts until the thread's next mark;
+    /// [`ExpandPart::End`] closes the call. The library holds no clock: nothing by default.
+    fn expand_part(&self, part: ExpandPart, macro_name: &str, size: usize) {
+        let _ = (part, macro_name, size);
+    }
+
+    /// Inside [`Stage::Expand`]: the calling thread expands a call of the macro defined by the
+    /// item `def` whose input text is `input` (for a caller that counts the calls a record
+    /// keyed by the definition and the input would answer). Nothing by default.
+    fn expand_call(&self, def: ItemKey, input: &str) {
+        let _ = (def, input);
+    }
+
     /// The cell core's shadow (feature `cells`): its clock and where its reports go. `None`, the
     /// default, runs no shadow.
     #[cfg(feature = "cells")]
     fn cells_seam(&self) -> Option<&dyn crate::cells::Seam> {
         None
     }
+}
+
+/// The stretches of one crate's solve, in the order a solve passes them ([`Par::stage`]).
+/// `Expand` is entered from `Solve` and returns to it, once per macro call expanded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum Stage {
+    /// A try starts: the handed crates' records are gathered and the local graph is made. A
+    /// try that ends in a `Need` is followed by another `Try` of the same crate, never `Done`.
+    Try,
+    /// Files read, outlined and walked into the module tree.
+    Files,
+    /// Each walked module's own text lowered to declarations; the crate root planned.
+    Lower,
+    /// The declaration records written and read back; the module chains.
+    Decls,
+    /// The fill: imports and macro paths solved to a fixed point (expansion excluded).
+    Solve,
+    /// One macro call expanded: the macro run, its output outlined and lowered.
+    Expand,
+    /// After the fill: exports published, tables merged.
+    Publish,
+    /// The exports and inner records written.
+    Write,
+    /// The read list encoded and handed to the store with the two records.
+    ReadList,
+    /// The names record encoded and handed to the store.
+    NamesRecord,
+    /// The items record encoded and handed to the store.
+    ItemsRecord,
+    /// The crate's own exports record decoded for its dependents.
+    Decode,
+    /// The crate is done on this thread.
+    Done,
+}
+
+impl Stage {
+    /// Every stage, in [`Stage`]'s order: `ALL[s as usize] == s`.
+    pub const ALL: [Stage; 13] = [
+        Stage::Try,
+        Stage::Files,
+        Stage::Lower,
+        Stage::Decls,
+        Stage::Solve,
+        Stage::Expand,
+        Stage::Publish,
+        Stage::Write,
+        Stage::ReadList,
+        Stage::NamesRecord,
+        Stage::ItemsRecord,
+        Stage::Decode,
+        Stage::Done,
+    ];
+}
+
+/// The parts of one macro call's expansion ([`Stage::Expand`]), in the order a call passes
+/// them ([`Par::expand_part`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ExpandPart {
+    /// The call and its macro found in the crate's tables, or asked of the defining crate.
+    Find,
+    /// The definition: found prepared, or else its text lexed and its rules compiled.
+    Define,
+    /// The call's input text lexed into tokens (size: its bytes).
+    LexInput,
+    /// The call's shape taken from the input: an attribute's item, a derive's facts.
+    Shape,
+    /// A `macro_rules!` or `macro` run: matching and transcription (size: input tokens).
+    RunRules,
+    /// A function-like builtin run, its eager nested calls included (size: input tokens).
+    RunBuiltin,
+    /// A builtin derive or attribute run (size: input tokens).
+    RunDerive,
+    /// A proc macro run by the host (size: input tokens).
+    RunProc,
+    /// The expansion's tokens written as text (size: tokens).
+    Render,
+    /// The text outlined: lexed and parsed again (size: its bytes).
+    Outline,
+    /// The outline lowered to declarations (size: the text's bytes).
+    Lower,
+    /// The expansion's modules made.
+    Modules,
+    /// The lowered tables merged into the run's.
+    Tables,
+    /// The blocks of the expansion's bodies that hold impls made modules.
+    Blocks,
+    /// The call's result stored for the fill.
+    Store,
+    /// The call is over.
+    End,
+}
+
+impl ExpandPart {
+    /// Every part, in [`ExpandPart`]'s order: `ALL[p as usize] == p`.
+    pub const ALL: [ExpandPart; 16] = [
+        ExpandPart::Find,
+        ExpandPart::Define,
+        ExpandPart::LexInput,
+        ExpandPart::Shape,
+        ExpandPart::RunRules,
+        ExpandPart::RunBuiltin,
+        ExpandPart::RunDerive,
+        ExpandPart::RunProc,
+        ExpandPart::Render,
+        ExpandPart::Outline,
+        ExpandPart::Lower,
+        ExpandPart::Modules,
+        ExpandPart::Tables,
+        ExpandPart::Blocks,
+        ExpandPart::Store,
+        ExpandPart::End,
+    ];
 }
 
 /// One thread.

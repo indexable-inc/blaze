@@ -1,17 +1,163 @@
 ---
 status: plan
-summary: "`blaze run` and `blaze test` with no daemon and no executable: the `blaze run` process is the program's parent for exactly its life; the program runs code records placed in its own process behind two words a function (the slot word callers jump through, the body word stubs jump through), each compiled on its first call and optimized across functions in the background; nothing observed is ever compiled into code: heat, test marks and the viewer's hooks are stubs swapped into the slot word. Built as sans-IO machines with simulations in crates/blaze-run (Parent, Slots, Heat, Tier, Registry, Tests); not built: the drivers, the real Compiler and Optimizer, `blaze export`."
-date: 2026-11-15
+summary: "`blaze run` and `blaze build` from checked bodies to a running program. End state (2026-11-16): a code record per instance and tier, position-independent, every outside reference through an import word; records grouped in segments mapped read-only and executable in place (dependency bundles from the shared cache, one delta segment per command); the program a manifest of rows over records; the image its prebound import tables at fixed addresses; `blaze run` execs the launcher, which maps, binds the C library's names and starts `main` in about 5 ms; an edit writes the new record, one manifest chunk and the words that name the edited function; `blaze build` writes the same records as one signed Mach-O or ELF. Then the gap and the pieces. Below it, kept for live patching later: blaze-run's sans-IO machines (Parent, Slots, Heat, Tier, Registry, Tests)."
+date: 2026-11-16
 ---
 # Run and test
 
-Andrew, 2026-11-15: no daemon, no `blaze build`; `blaze run` and `blaze test` run a program from
-code records placed in its own process, compiled on first call, optimized across functions in
-the background while it runs; "make it exist properly all in one go". This page re-seats the
-launcher (launcher.md), tiers (tiers.md) and lazy compilation (blaze-lazy) without the daemon.
-The machines are `crates/blaze-run`; this page is what they decide and what is not built.
+Andrew, 2026-11-15: no daemon; "make it exist properly all in one go". AGENTS.md (2026-11-16)
+puts `blaze build` back in scope and live patching out ("now: patch the file, rerun"). The end
+state below is the run path. The sections after it (the live picture, the blaze-run machines)
+describe live patching, kept for later: nothing on the run path calls them (decision R1).
 
-## The picture
+## End state (architect, 2026-11-16)
+
+Estimates, not measured. Rules: records keyed from text before the work, a program is a
+manifest over shared records, an edit patches bytes in proportion to it, no fallback to another
+linker or backend, two builders of one key write equal bytes, no daemon.
+
+**The code record** (blaze-keyed `CodeRecord`, tag 27; value form `crates/blaze-code`, `record`).
+One per function instance at one tier. *Key*: the instance's symbol (the item's stable id and its
+type arguments by content), the body record's result digest, target, tier, code settings (panic
+strategy, overflow checks, debug assertions) and toolchain; read-addressed (target.md, "the
+shape") by the layouts, impls and constants its build read, so a field edit moves exactly the
+instances that read the field. *Value*, read in place: position-independent code with its pure
+read-only data; a relro part (data holding addresses); its targets, sorted, each a (space,
+symbol): a function, static, vtable, thread-local or C name, never an address, slot or path; its
+sites (import load, import call, address of its own relro), sorted; one compact unwind word and
+a landing-pad table; positions item-relative. Debug rows are a separate record of the same key.
+Every outside reference goes through an import word (`adrp x16; ldr x16; blr x16` for a call),
+so the code bytes hold no address and serve every program at every base.
+
+**The segment.** Records written together, mapped read-only and executable in place: a bundle
+(one dependency crate at the top tier, built and signed by CI; std among them) or one command's
+delta segment (the records it made). Layout: records 16-aligned in manifest order; on the next
+page the import table (one word per distinct target) and the relro parts, at a fixed distance
+from the code. In a bundle, a call to a record of the same bundle is relaxed to `bl` (a bundle
+never changes record by record); a delta segment never relaxes. macOS: a minimal Mach-O with an
+ad-hoc code directory, registered with `fcntl(F_ADDFILESIGS_RETURN)` and mapped as dyld maps a
+library; Linux: the file mapped with `PROT_EXEC`. Equal records (bytes and targets) are placed
+once, every symbol naming them bound to one address: folding at record grain (icf.md stands for
+folding by key before codegen).
+
+**The program**: blaze-program's `Program` (stands: the row rule, `Chunks`): rows sorted by
+symbol (symbol, tier, code record key, segment), the static and vtable rows, entry, settings,
+in chunks of 64 rows under a root. Two programs share every record and segment in common.
+**The image**: a record keyed by the manifest key, target and address plan: each segment's fixed
+base (dev runs give up ASLR) and its bound import table and relro words, in page chunks, with
+postings from each symbol to the words that name it. C names are bound at start, one `dlsym` each.
+
+**`blaze run`** checks what the program reaches, builds every reached instance that has no
+record (eagerly: the walk is sound, so no stub waits on a compiler), files manifest and image,
+and `execve`s the launcher: no parent stays. The launcher maps each segment at its base and the
+image's pages private, binds C names, registers one unwind finder, applies the run spec's
+sandbox and calls the entry with the hosted table.
+- *First run* (the owner's hello world): std, core and alloc arrive as bundles; only workspace
+  bodies and std's generic instances over workspace types are built here.
+- *Repeat, nothing changed*: blaze's start (about 1.5 ms) + the certificate (2 ms, target.md) +
+  `execve` (about 1 ms) + about ten `mmap`s and a signature registration a segment file (under
+  0.2 ms) + about 100 `dlsym` (0.1 ms): about 5 ms to `main`'s first instruction, against 4.5 ms
+  for starting a linked file after the certificate (ratio 1.1). No code byte is copied.
+- *Edit of one body*: that body is checked; its instances' records are rebuilt (usually one);
+  callers are untouched. The delta segment holds the new record; the manifest rewrites one chunk
+  and its root; the image appends the segment at the next free address and rewrites each word
+  the postings name (8 bytes per importing segment, vtable or relro word) and the chunks holding
+  them. A grown body is placed new, never in place: no slack, nothing beside it moves. Written:
+  the record and about 4 KB a touched chunk, about 0.3 ms past the check. Dead bodies are
+  dropped by re-laying workspace segments after an answer, never on the edit path.
+
+**`blaze build`** writes the same records as one standalone file: Mach-O (`LC_MAIN`, libSystem,
+chained fixups, `__unwind_info`, `LC_FUNCTION_STARTS`, `LC_UUID` of the content, an ad-hoc
+`LC_CODE_SIGNATURE`) or ELF (PIE, `PT_INTERP`, RELR, `.eh_frame_hdr`, `PT_GNU_RELRO`, a build
+id). Unlike run's image: ASLR on; one GOT, every import site retargeted to it; every call in reach
+relaxed to `bl`; code ordered by profile (code-layout.md and "Export takes what runs observed"
+below: stand); debug info in the side file (debug-side-file.md stands). An edit clones the last
+file (`clonefile`, `FICLONE`) and writes the delta's code into room reserved before
+`__LINKEDIT`, the changed GOT words, their fixup pages and the changed code-directory slots.
+**Cost to the program**: a call that leaves its segment is a load and an indirect branch: about
+1%, up to 5% on call-bound loops (to be measured on reth); bundles and `blaze build` pay nothing.
+
+**Unwinding.** Panics unwind (the strategy is in the key). A segment carries an unwind index
+(starts, compact words, landing pads) made when it is written; the launcher registers one finder:
+macOS `__unw_add_find_dynamic_unwind_sections` (libunwind, macOS 14+; rule 45), Linux
+`__register_frame_info` per segment. A backtrace is symbolized through the hosted table's
+`symbolize(pc)` from the segment's symbol column and the debug rows; `blaze run --debug` writes
+one debug object for the image, registered through the GDB JIT interface (a perf map on Linux).
+
+**Tiers.** One fast backend (blaze-emit's baseline; stencils when they return), named by the
+tier in the key, never a fallback. Dependencies at the top tier (LLVM from LIR, lir.md), keyed
+with their inlinees (blaze-program `key`, stands). Tier-up is the command's own work continued
+after the answer at utility priority, with an expiry: it optimizes the workspace instances the
+program named, hottest first by the launcher's 1 kHz program-counter samples of the last run (a
+profile record). It swaps in at the next start: a row whose optimized record exists for its
+current key is at the top tier; an edit of an inlined callee moves its callers back to fast.
+
+**The launcher** is `blaze-launcher`, a small bstd program beside `blaze`, signed at release
+(hardened runtime with `disable-library-validation`; no JIT entitlement: no page is ever both
+writable and executable). It maps, binds, registers, sandboxes and starts; then it is the program.
+
+**Best systems.** mold and wild: fast parallel links; run links nothing and build patches a clone
+in proportion (wild's incremental aim). Zig: in-place patching with padding and an offset table;
+blaze needs no padding and shares records across programs and machines. Cranelift JIT, Dioxus
+subsecond: patch a live process through a jump table; blaze reruns from a prebound image in about
+5 ms, and its import words take a live patch later. Julia pkgimages, LuaJIT: per-package or
+per-session caches; blaze's are content-keyed and shared by the bucket. Makepad, Bevy: reload
+with state kept: later. dyld shared cache, launch closures, chained fixups: the bundles are the
+shared cache, the image is a prebuilt closure, `blaze build` writes chained fixups.
+
+### Gap (read 2026-11-16)
+
+| End state needs | Today (file: function) | Missing | Reached by |
+|---|---|---|---|
+| The new front end on `blaze run` | blaze-cli program.rs `run` calls `blaze_ladder::run::run`, which is `run_with(.., FrontChoice::Old)` (run.rs) | `FrontChoice::New` with package, edition, shelf | only tests (ladder_front2.rs, front2_rungs.rs, front2_main.rs) |
+| Hello world's `main` builds | 1,371 of 2,344 instances; `main` stops at `UsizeNoHighBit` | front-end and builder lanes' pieces | only tests |
+| Code records in the store | place.rs `Body { code: blaze_emit::Code, targets }`, held in memory; blaze-keyed `CodeRecord` has no writer | the value form, the put, the read | the command, in memory only |
+| Targets by symbol | `Target::Slot(u32)`: slot n is the nth reached (run.rs `Reached::slot`) | (space, symbol) per target | the command |
+| Code key covers its inputs | blaze-build instance.rs `instance_key`: item key and text (front2 program.rs `code_of`) and arguments; an ADT argument hashed by item key only | target, tier, settings, toolchain; layouts and impls read as its shape | the command |
+| Code with no address in it | blaze-emit: literal words after the code, filled per run by place.rs `Table::code` (copy, then patch) | import sites (`adrp`/`ldr`) and a relro part, as relocations | the command (old form) |
+| Reached walk at scale | run.rs `Reached::slot`: a linear `position` per call | a map by key | the command |
+| Segments mapped in place, signed | none; blaze-launch-rt maps an anonymous area and copies | writer, signature, mapping | nothing |
+| Manifest | blaze-program `Program`, `Chunks`, `RowChange`: no crate depends on it | wiring from the walk | only tests |
+| Image and its patch | none (blaze-link's patch room is the parked linker's) | the record, postings, patch | nothing |
+| The program's own process | `Placed::call` transmutes and calls on blaze's thread; blaze-launcher main.rs is the daemon-era socket client | the exec, the launcher's map-and-bind mode | the command (in-process) |
+| C names bound once | place.rs `symbol`: a `dlsym` for every reference of every body | one per distinct name | the command |
+| Unwinding | blaze-emit refuses `Invoke`/`Resume` ("unwinding"); blaze-launch-rt unwind.rs registers single FDEs | records' unwind rows, segment index, finder | nothing |
+| `blaze build` | blaze-cli main.rs: `Some("build") => NotBuilt` | the writer; blaze-link's macho/sign.rs and macho/chained.rs are parked code to take from | nothing |
+| Tier-up | blaze-run tier.rs, heat.rs (sans-IO); no LLVM-from-LIR backend | the optimizer, the samples, the queue | nothing |
+| Statics and vtables as records | run.rs `static_image`: every static evaluated before the walk, in memory | data records, homes in the image | the command |
+| Symbolize, debug object | none on this path | symbol column, debug rows, `symbolize` entry | nothing |
+| Code name without hooks | blaze-drive run.rs `code_name` hashes `hooks` into a `Code` name | drop it (nothing observed is in a key) | nothing |
+
+### Pieces (one writer each; "||" marks pieces that can be written at the same time)
+
+1. || `blaze run` takes the new front end (blaze-cli program.rs): package and edition from the
+   manifest, the shelf the check resolved. Test: the hello-world rung prints through the command.
+2. || `Reached::slot` by map (blaze-ladder run.rs). Test: 65,536 synthetic instances in linear time.
+3. || The code record's value form (NEW crates/blaze-code record.rs): WRITTEN by the architect.
+4. || Segment layout, image binding and the edit patch (NEW crates/blaze-code image.rs): WRITTEN.
+5. blaze-emit emits import sites and a relro part instead of literal words (after 3). Test: no
+   literal word in the code; every outside reference is a site.
+6. The run path writes and reads code records (ladder place.rs, run.rs, after 3 and 5): targets
+   by symbol, put under the drive's `Code` name. Test: a second run builds nothing.
+7. || The code key gains target, tier, settings, toolchain and its shape (blaze-build instance.rs,
+   after 6). Test: a field edit moves the instance's key; a comment edit does not.
+8. || Signed segment files and their mapping (NEW blaze-launch-rt module, after 4). Test: a
+   signed segment returning 42 runs; an unsigned one is refused by name (rule 45).
+9. The launcher's map-and-bind mode (blaze-launcher, after 4 and 8): image on descriptor 3,
+   `dlsym` once per name, the hosted table, the entry. Test: the hello-world image prints.
+10. `blaze run` files the manifest (blaze-program `Program`) and the image and execs the launcher
+    (blaze-cli, after 6 and 9). Test: a repeat run builds 0 and reaches `main` from records.
+11. The edit patch on the command path (after 10): the image's postings rewrite the words.
+    Test: one body edit writes the record, one manifest chunk and only the words naming it.
+12. || Unwinding (blaze-emit landing pads, record rows, segment index, finder; after 5).
+    Test: a rung's `catch_unwind` catches a panic.
+13. || `blaze build` writes Mach-O and ELF from segments (NEW crate from blaze-link's macho and
+    elf writers, after 4). Test: the built hello world runs and its signature verifies.
+14. `blaze build` patches a clone after an edit (after 13).
+15. Symbolize and the debug object (after 9). 16. Tier-up: samples, queue, LLVM records (after
+    lir.md's LLVM path).
+
+## The live picture (live patching, later; not the run path)
 
 ```
 blaze run (parent: alive exactly as long as the program)      the program's process (blaze-launcher)

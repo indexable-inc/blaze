@@ -899,3 +899,80 @@ fn the_macro_use_prelude_reads_the_dependencys_exports() {
     let bad = with_dep(&w, root, dep, CellPlant::DepIsOutside);
     assert_eq!(bad.call_outcome(call), Some(Outcome::Outside), "the control DepIsOutside");
 }
+
+/// An `extern crate` item binds its name in its module. The Reference, `items.extern-crate`:
+/// "The external crate is then bound into the declaring scope as the identifier provided in the
+/// extern crate declaration." Dependency `e` (crate 2): `pub struct x;`. The crate: `mod b {
+/// extern crate e as k; use self::k::x as u; pub use self::k as r; extern crate nothere; }` and
+/// `mod c { extern crate e; use self::e::x as v; }`. `u` and `v` are the dependency's `x`; `r` is
+/// a public re-export of the private item (rustc's `Resolver::import`: a `use` of an `extern
+/// crate` binding has the `use`'s own visibility, a lint at most); `nothere` is named as an
+/// `extern crate` of no dependency. Controls: `ExternCrateBindsNothing` fails `u` as not found;
+/// `ExternReexportNarrowed` leaves `r` private to `b`.
+/// Prints: "test cells::tests::an_extern_crate_item_binds_its_name_in_its_module ... ok".
+#[test]
+fn an_extern_crate_item_binds_its_name_in_its_module() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let dep = w.root(2, Edition::E2021);
+    let x = w.item(dep, "x", Namespace::Types, crate::DefKind::Other, V::Pub);
+    w.dep(root, "e", dep);
+    let b = w.module(root, "b", V::Pub);
+    w.extern_crate(b, crate::ExternTarget::Dep("e"), crate::Rename::To("k"), V::Priv);
+    w.use_as(b, "self::k::x", "u", V::Priv);
+    w.use_as(b, "self::k", "r", V::Pub);
+    w.extern_crate(b, crate::ExternTarget::Dep("nothere"), crate::Rename::Same, V::Priv);
+    let c = w.module(root, "c", V::Pub);
+    w.extern_crate(c, crate::ExternTarget::Dep("e"), crate::Rename::Same, V::Priv);
+    w.use_as(c, "self::e::x", "v", V::Priv);
+    let ok = with_dep(&w, root, dep, CellPlant::None);
+    assert_eq!(named_def(outcome(&ok, b, 0), Namespace::Types), Some(x), "`u`: {:?}", outcome(&ok, b, 0));
+    assert_eq!(named_def(outcome(&ok, c, 0), Namespace::Types), Some(x), "`v`: {:?}", outcome(&ok, c, 0));
+    let r = |c: &Cells<'static, N>| match outcome(c, b, 1) {
+        Outcome::Named(n) => n[super::ns_at(Namespace::Types)],
+        other => panic!("`r` is not bound: {other:?}"),
+    };
+    assert_eq!(r(&ok), Some((crate::Def::module(dep), crate::Visibility::Public)), "`pub use self::k as r;`");
+    assert_eq!(&ok.bad_extern[..], &[(b, "nothere")][..]);
+    let bad = with_dep(&w, root, dep, CellPlant::ExternCrateBindsNothing);
+    assert!(matches!(outcome(&bad, b, 0), Outcome::Failed(Unresolved::NotFound)), "the control ExternCrateBindsNothing: {:?}", outcome(&bad, b, 0));
+    let bad = with_dep(&w, root, dep, CellPlant::ExternReexportNarrowed);
+    assert_ne!(r(&bad).map(|b| b.1), Some(crate::Visibility::Public), "the control ExternReexportNarrowed");
+}
+
+/// R8 (bottom.md section 6): "a macro-written root `extern crate X as n;` may add a name
+/// (`names.preludes.extern`), seen from every module, never replace one (an error, whether or
+/// not a path reads it; D56)". The Reference, `names.preludes.extern`: "External crates imported
+/// with `extern crate` in the root module or provided to the compiler (as with the `--extern`
+/// flag) are added to the extern prelude." Dependency `n` (crate 2): `pub struct x;`; crate 3 a
+/// dependency named `other`. The crate: `macro_rules! mk; mk!{ extern crate n as k; extern
+/// crate other as n; }` and `mod b { use k::x as u; use n::x as t; }`. `u` is crate 2's `x`
+/// through the added name `k`, read from a module that is not the root; `t` stays crate 2's `x`
+/// and the second `extern crate` is R8's error. Controls: `R8AddsNothing` fails `u` as not
+/// found; `R8MacroReplaces` takes `n` as crate 3, where `t` is no longer crate 2's `x`.
+/// Prints: "test cells::tests::r8_a_macro_written_root_extern_crate_adds_a_name_and_never_replaces_one ... ok".
+#[test]
+fn r8_a_macro_written_root_extern_crate_adds_a_name_and_never_replaces_one() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let dep = w.root(2, Edition::E2021);
+    let x = w.item(dep, "x", Namespace::Types, crate::DefKind::Other, V::Pub);
+    let other = w.root(3, Edition::E2021);
+    w.dep(root, "n", dep);
+    w.dep(root, "other", other);
+    w.rules(root, "mk");
+    let call = w.call(root, "mk", crate::CallShape::FnLike);
+    w.extern_crate(call, crate::ExternTarget::Dep("n"), crate::Rename::To("k"), V::Priv);
+    w.extern_crate(call, crate::ExternTarget::Dep("other"), crate::Rename::To("n"), V::Priv);
+    let b = w.module(root, "b", V::Pub);
+    w.use_as(b, "k::x", "u", V::Priv);
+    w.use_as(b, "n::x", "t", V::Priv);
+    let ok = with_dep(&w, root, dep, CellPlant::None);
+    assert_eq!(named_def(outcome(&ok, b, 0), Namespace::Types), Some(x), "`u`: {:?}", outcome(&ok, b, 0));
+    assert_eq!(named_def(outcome(&ok, b, 1), Namespace::Types), Some(x), "`t`: {:?}", outcome(&ok, b, 1));
+    assert_eq!(&ok.r8[..], &["n"][..], "R8's error names the replaced name");
+    let bad = with_dep(&w, root, dep, CellPlant::R8AddsNothing);
+    assert!(matches!(outcome(&bad, b, 0), Outcome::Failed(Unresolved::NotFound)), "the control R8AddsNothing: {:?}", outcome(&bad, b, 0));
+    let bad = with_dep(&w, root, dep, CellPlant::R8MacroReplaces);
+    assert_ne!(named_def(outcome(&bad, b, 1), Namespace::Types), Some(x), "the control R8MacroReplaces: {:?}", outcome(&bad, b, 1));
+}

@@ -114,7 +114,7 @@ fn attempt_with_tools(place: &Place, attempt: &str, package: &str) -> std::strin
     let tools = host_tools::granted(&table, package, alloc);
     let exe = std::env::current_exe().expect("the test binary").canonicalize().expect("its real path");
     let exe = exe.to_str().expect("a UTF-8 path");
-    let exec: std::vec::Vec<&str> = tools.iter().map(|t| t.path).collect();
+    let exec: std::vec::Vec<&str> = tools.iter().flat_map(|t| t.programs()).collect();
     let mut reads: std::vec::Vec<&str> = vec![place.package.as_str()];
     reads.extend(tools.iter().flat_map(|t| t.read_folders()));
     let mut folders: std::vec::Vec<&str> = tools.iter().map(|t| t.path.rsplit_once('/').map_or("/", |(d, _)| d)).collect();
@@ -145,7 +145,9 @@ fn attempt_with_tools(place: &Place, attempt: &str, package: &str) -> std::strin
 #[cfg(target_os = "macos")]
 fn a_granted_host_tool_runs_and_an_unlisted_one_is_denied() {
     let place = place("host-tool");
-    let code = "use strict; print 1+1";
+    // A piped open of a quoted command, as cryptogams' perlasm opens arm-xlate.pl: perl starts
+    // /bin/sh, which starts /bin/bash, which starts perl again to copy the `2` through.
+    let code = r#"use strict; open(STDOUT, "| \"$^X\" -pe 1") or die "pipe: $!"; print 1+1"#;
     let granted = attempt_with_tools(&place, &format!("perl {code}"), "sha3-asm");
     let not_granted = attempt_with_tools(&place, &format!("perl {code}"), "zstd-sys");
     let python = attempt_with_tools(&place, "exec /usr/bin/python3", "sha3-asm");

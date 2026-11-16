@@ -306,6 +306,7 @@ pub fn run_batches<'f, 'r>(
         }
         pending.push(of_batch);
     }
+    phases.took("jobs made (each pooled task's path copied)", frame);
     let mut answered = Ok(());
     for (batch, of_batch) in batches.into_iter().zip(pending) {
         if answered.is_err() {
@@ -358,7 +359,9 @@ fn answer_batch<'f, 'r>(
             continue;
         }
         let at = phases.now();
+        phases.took("a batch's lists", frame);
         let done = run_one(&cx, root, store, facts, task, frame, held, scratch, high, alloc)?;
+        phases.took(row_of(task.name.kind), frame);
         ran_here.push(Some((done, phases.since(at))));
     }
     for (((ticket, task), pending), here) in batch.tasks.iter().zip(pending).zip(ran_here) {
@@ -377,6 +380,7 @@ fn answer_batch<'f, 'r>(
                     Ok(record) => Did::Done(record.clone_in(held)),
                     Err(why) => Did::Failed(TaskFailure { name: task.name, why }),
                 };
+                phases.worked(row_of(task.name.kind), joined.ns);
                 (done, joined.ns)
             }
             (None, None) => unreachable!("a task neither pooled nor run here"),
@@ -395,6 +399,8 @@ fn answer_batch<'f, 'r>(
         did.push((*ticket, done));
         took.push(ns);
     }
+    phases.took("pooled tasks joined (a failed task's path and words kept)", frame);
+    let request_frame = frame;
     let frame = held;
     let mut paths: Vec<Vec<PathOf<'_>, &Frame>, &Frame> = Vec::with_capacity_in(did.len(), frame);
     for (_, done) in did.iter() {
@@ -444,9 +450,27 @@ fn answer_batch<'f, 'r>(
         results.push(Outcome { ticket: *ticket, ran, in_place: 0, ns: *ns });
     }
     let stepped = phases.now();
+    phases.took("a batch's lists", request_frame);
     req.step(Event::Ran { batch: batch.id, results: &results }, effects)?;
+    phases.took(crate::STEP, request_frame);
     phases.request.steps += phases.since(stepped);
     Ok(())
+}
+
+/// A task kind's row in the profile's frame lines (`Phases::took` for a task run on the main
+/// thread, `Phases::worked` for a pooled one).
+fn row_of(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Units => "task Units",
+        Kind::UnitGraph => "task UnitGraph",
+        Kind::Fetch => "task Fetch",
+        Kind::Surface => "task Surface",
+        Kind::MacroModule => "task MacroModule",
+        Kind::CrateScope => "task CrateScope",
+        Kind::FileItems => "pooled FileItems (worker ns)",
+        Kind::BodyCheck => "pooled BodyCheck (worker ns)",
+        _ => "task of another kind",
+    }
 }
 
 /// A collection outside bstd's (std's `Vec` over a frame, as blaze-format's writer uses) meets
@@ -478,8 +502,7 @@ pub(crate) fn run_one<'f, 'b>(
     high: &mut HighWater,
     alloc: blaze_own::Alloc<'_>,
 ) -> Result<Did<'b>, CliError> {
-    unwind_refusals();
-    let ran = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| run(cx, root, store, facts, task, frame, held, scratch, alloc)));
+    let ran = unwinding(|| run(cx, root, store, facts, task, frame, held, scratch, alloc));
     let (used, limit) = (scratch.peak(), scratch.reserved());
     high.scratch = high.scratch.max(used);
     scratch.reset();
@@ -488,8 +511,19 @@ pub(crate) fn run_one<'f, 'b>(
         Ok(Ok(done)) => Ok(done),
         Ok(Err(CliError::Text { what })) => failed(Why::Refused { what, rule: "blaze-cli work.rs" }),
         Ok(Err(error)) => Err(error),
-        Err(_) => failed(Why::Panicked { used: used as u64, limit: limit as u64 }),
+        Err(Panicked) => failed(Why::Panicked { used: used as u64, limit: limit as u64 }),
     }
+}
+
+/// A panic caught at an edge: its message went to the error stream by the panic hook.
+pub(crate) struct Panicked;
+
+/// `work`, with a panic inside it caught: the one home of the catch, for a task's edge
+/// ([`run_one`]) and the command's (`main.rs`, `command`). What `work` borrowed is read again
+/// only for what a stopped piece of work leaves true (a frame's peak, the phases marked).
+pub(crate) fn unwinding<T>(work: impl FnOnce() -> T) -> Result<T, Panicked> {
+    unwind_refusals();
+    std::panic::catch_unwind(core::panic::AssertUnwindSafe(work)).map_err(|_| Panicked)
 }
 
 /// Whether this worker builds tasks of `kind`: the one place that says so. `run` answers every

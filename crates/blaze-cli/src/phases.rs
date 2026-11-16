@@ -32,6 +32,30 @@ pub struct Phases {
     at_main: Syscalls,
     /// The most each frame held over the request, once it answered.
     pub frames: Option<crate::work::HighWater>,
+    /// The command's own frame, by what took its bytes ([`Phases::mark_in`], [`Phases::took`]).
+    held: Held,
+}
+
+/// The most kinds [`Held`] names; past it a kind is added to the last row.
+const MOST_KINDS: usize = 40;
+
+/// The command frame's bytes by lifetime's evidence (rule 17): how many each phase took, and
+/// inside the request how many each kind of effect and each kind of task took, with the times
+/// it came and the main thread's nanoseconds in it. A frame only grows, so each number is the
+/// frame's `used` at one boundary less its `used` at the one before: every byte is in one row.
+#[derive(Clone, Copy)]
+struct Held {
+    /// The frame's `used` at the last phase marked, and at the last kind charged.
+    phase_at: usize,
+    kind_at: usize,
+    /// When the last kind was charged.
+    kind_since: Option<Instant>,
+    phases: [u64; MOST],
+    /// A kind's name, the bytes it took, the times it came, its nanoseconds.
+    kinds: [(&'static str, u64, u64, u64); MOST_KINDS],
+    len: usize,
+    /// The frame's `used` and reserve when last seen.
+    seen: (usize, usize),
 }
 
 type Syscalls = [(blaze_mem::syscalls::Kind, blaze_mem::syscalls::Calls); blaze_mem::syscalls::KINDS.len()];
@@ -73,7 +97,55 @@ impl Phases {
             first_chunk: None,
             at_main: blaze_mem::syscalls::snapshot(),
             frames: None,
+            held: Held { phase_at: 0, kind_at: 0, kind_since: None, phases: [0; MOST], kinds: [("", 0, 0, 0); MOST_KINDS], len: 0, seen: (0, 0) },
         }
+    }
+
+    /// [`Phases::mark`], and the bytes of the command's `frame` taken since the last phase
+    /// marked so are the phase's.
+    pub fn mark_in(&mut self, name: &'static str, frame: &bstd::mem::Frame) {
+        let row = self.len.min(MOST - 1);
+        self.mark(name);
+        let used = frame.used();
+        self.held.phases[row] += used.saturating_sub(self.held.phase_at) as u64;
+        self.held.phase_at = used;
+        self.held.seen = (used, frame.reserved());
+    }
+
+    /// The bytes of the command's `frame` taken since the last call, and the main thread's time
+    /// since it, are `kind`'s: an effect performed, a task run here, the machine's step. Called
+    /// at every boundary inside the request, so the kinds' rows sum to the request's.
+    pub fn took(&mut self, kind: &'static str, frame: &bstd::mem::Frame) {
+        let now = self.clock.now();
+        let ns = self.held.kind_since.and_then(|since| now.since(since)).map_or(0, nanos);
+        self.held.kind_since = Some(now);
+        let used = frame.used();
+        let bytes = used.saturating_sub(self.held.kind_at) as u64;
+        self.held.kind_at = used;
+        self.held.seen = (used, frame.reserved());
+        self.charge(kind, bytes, ns);
+    }
+
+    /// A pooled task of `kind` took `ns` on its worker: a row beside the main thread's, with no
+    /// bytes of the command's frame (a pooled task works in its own).
+    pub fn worked(&mut self, kind: &'static str, ns: u64) {
+        self.charge(kind, 0, ns);
+    }
+
+    fn charge(&mut self, kind: &'static str, bytes: u64, ns: u64) {
+        let at = match self.held.kinds[..self.held.len].iter().position(|row| row.0 == kind) {
+            Some(at) => at,
+            None if self.held.len < MOST_KINDS => {
+                self.held.kinds[self.held.len].0 = kind;
+                self.held.len += 1;
+                self.held.len - 1
+            }
+            None => MOST_KINDS - 1,
+        };
+        let row = &mut self.held.kinds[at];
+        row.1 += bytes;
+        row.2 += 1;
+        row.3 += ns;
     }
 
     /// The frame's first chunk is taken: marks it as a phase and keeps the memory layer's calls
@@ -145,6 +217,17 @@ impl fmt::Display for Phases {
                 h.request, h.scratch, h.batch, h.got
             )?;
         }
+        let held = &self.held;
+        write!(f, "frame        the command's frame: {} of {} bytes used · by phase (bytes):", held.seen.0, held.seen.1)?;
+        for ((name, _), bytes) in self.rows[..self.len].iter().zip(held.phases.iter()).filter(|(_, bytes)| **bytes > 0) {
+            write!(f, " · {name} {bytes}")?;
+        }
+        writeln!(f)?;
+        write!(f, "frame        inside the request, by what took them (bytes, times, main thread ns):")?;
+        for (kind, bytes, times, ns) in held.kinds[..held.len].iter() {
+            write!(f, " · {kind} {bytes} {times}x {ns}")?;
+        }
+        writeln!(f)?;
         memory_line(f, "by main", &self.at_main)?;
         if let Some(calls) = &self.first_chunk {
             memory_line(f, "by the first chunk", calls)?;

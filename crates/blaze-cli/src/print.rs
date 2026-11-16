@@ -380,6 +380,20 @@ pub fn profile(cx: &Cx, root: &Dir<ReadWrite>, answer: &Answer, phases: &Phases,
     Ok(())
 }
 
+/// The profile of a command that stopped without an answer (an error, a panic): why it
+/// stopped, then the phases it got through and what its frame held, in the same file. Worked
+/// in a frame of its own: the command's may be the full one that stopped it.
+pub fn profile_failed(cx: &Cx, root: &Dir<ReadWrite>, error: &CliError, phases: &mut Phases, frame: &Frame) -> Result<(), CliError> {
+    phases.mark_in("stopped", frame);
+    phases.took("stopped", frame);
+    let own = Frame::with_reserve(1 << 20, bstd::mem::Tag::Other).map_err(|_| CliError::Text { what: "the frame for a failed command's profile could not be reserved" })?;
+    let text = format_in!(&own, "stopped      {error}\n{phases}");
+    let file = root.create(cx, &Path::new(PROFILE)?)?;
+    file.append(cx, text.as_bytes(), Durable::No)?;
+    file.close(cx, Durable::No)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use blaze_drive::condition::OVER_CAP_RULE;

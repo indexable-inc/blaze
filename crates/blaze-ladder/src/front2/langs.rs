@@ -9,7 +9,7 @@ use blaze_id::ItemKey as LibKey;
 use blaze_typeck::LangItem;
 
 use super::index::Index;
-use crate::resolve::{Kind, Ns, Resolver};
+use crate::resolve::{Kind, Ns};
 
 /// The lang items that are traits: what `TraitDef::lang` may be.
 pub const TRAITS: [LangItem; 48] = [
@@ -97,7 +97,7 @@ pub type NoAnswer = &'static str;
 /// `Ok(None)` when the program's crates hold none (a `no_core` program).
 ///
 /// [`World::lang_item`]: blaze_typeck::World::lang_item
-pub fn find(index: &Index<'_>, resolver: Resolver<'_>, item: LangItem) -> Result<Option<LibKey>, NoAnswer> {
+pub fn find<'n, S: super::source::NamesSource<'n>>(index: &Index<'_>, resolver: crate::resolve::Paths<S>, item: LangItem) -> Result<Option<LibKey>, NoAnswer> {
     let path = match mark(item) {
         Mark::Lang(n) => return Ok(index.lang(n)),
         Mark::CorePath(p) => p,
@@ -111,13 +111,13 @@ pub fn find(index: &Index<'_>, resolver: Resolver<'_>, item: LangItem) -> Result
 /// `Sized` ([`super::heads::Store::sized`]) and no lang table. Core declares
 /// `#[lang = "future_trait"] pub trait Future` at `core::future::Future`; this is the same
 /// item [`find`] gives for [`LangItem::Future`], reached by its path through the names library.
-pub fn future_trait(resolver: Resolver<'_>, sized: LibKey) -> Result<Option<LibKey>, NoAnswer> {
+pub fn future_trait<'n, S: super::source::NamesSource<'n>>(resolver: crate::resolve::Paths<S>, sized: LibKey) -> Result<Option<LibKey>, NoAnswer> {
     in_core(resolver, sized, &["future", "Future"])
 }
 
 /// The trait at `path` in the crate of `sized` (core), resolved by the names library.
-fn in_core(resolver: Resolver<'_>, sized: LibKey, path: &[&str]) -> Result<Option<LibKey>, NoAnswer> {
-    let module = resolver.names.module_of(sized).ok_or("core's `Sized` is in no module the names library knows")?;
+fn in_core<'n, S: super::source::NamesSource<'n>>(resolver: crate::resolve::Paths<S>, sized: LibKey, path: &[&str]) -> Result<Option<LibKey>, NoAnswer> {
+    let module = resolver.names.home_of(sized).ok_or("core's `Sized` is in no module the names library knows")?;
     let mut texts: [&str; 4] = ["crate"; 4];
     let n = path.len() + 1;
     if n > texts.len() {

@@ -16,7 +16,7 @@ use super::types::SelfTy;
 use super::world_items::{BodyWorld, Fill, Gap};
 use crate::resolve::{Kind, Ns, ResolveError};
 
-impl BodyWorld<'_, '_> {
+impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
     /// What `segments`, written in the body, name.
     pub(super) fn path(&self, scope: ScopeId, segments: &[Name]) -> Fetch<Option<PathRes>> {
         let mut written = Vec::with_capacity_in(segments.len(), Global);
@@ -134,7 +134,7 @@ impl BodyWorld<'_, '_> {
                 Some(&m) => Def::Static(k, m),
                 None => return self.want(k),
             },
-            Kind::Struct if all && self.names.ctor(target.key).is_some() => self.ctor(target.key, 0)?,
+            Kind::Struct if all && super::source::NamesSource::is_ctor(self.names, target.key) => self.ctor(target.key, 0)?,
             Kind::Struct | Kind::Enum | Kind::Union => Def::Adt(k),
             Kind::Variant { adt, index } => self.ctor(adt, index)?,
             Kind::Trait => {

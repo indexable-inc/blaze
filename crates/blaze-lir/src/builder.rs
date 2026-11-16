@@ -1259,6 +1259,25 @@ impl<A: Allocator + Clone, S: Sink> Builder<A, S> {
         self.push(Op::Resume, Flags::NONE, Ty::NONE, 0, |w| w.value(exception));
     }
 
+    /// Suspension point `point` of a coroutine body ([`Op::Suspend`]): this poll returns
+    /// `pending` (the function's returns); the next poll goes on at `resume`, and the state's
+    /// drop, when the state is dropped parked here, at `cancel`. Neither block takes
+    /// parameters.
+    pub fn suspend(&mut self, point: u32, resume: Block, cancel: Block, pending: &[Value]) {
+        self.push_targets(&[resume, cancel]);
+        self.push(Op::Suspend, Flags::NONE, Ty::NONE, 0, |w| {
+            w.word(point);
+            w.block(resume);
+            w.block(cancel);
+            w.values(pending);
+        });
+    }
+
+    /// The end of a cancel path ([`Op::Cancelled`]).
+    pub fn cancelled(&mut self) {
+        self.push(Op::Cancelled, Flags::NONE, Ty::NONE, 0, |_| {});
+    }
+
     /// A call that may unwind to `unwind` (a landing block), returning to `normal`, whose
     /// one predecessor it must be. Its value is the call's result, usable from `normal` on.
     pub fn invoke(&mut self, flags: Flags, callee: RefId, sig: SigId, args: &[Value], normal: Block, unwind: Block) -> Value {

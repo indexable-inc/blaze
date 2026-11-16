@@ -227,6 +227,19 @@ impl Fx {
         }
     }
 
+    /// The item bounds of `trait_`'s associated type `name` (`type A: Bound;`), each with
+    /// `Self` the alias `<Self as trait_<..>>::name` over the trait's parameters; the implied
+    /// `Sized` is written by the caller (a type declared `?Sized` has none). Answered as the
+    /// predicates of the associated type's own key (`AssocTyDef::item`), as the front end
+    /// answers them (blaze-ladder front2/heads.rs `trait_members`).
+    pub fn set_assoc_bounds(&mut self, trait_: ItemKey, name: &str, bounds: Vec<PClause>) {
+        let item = ItemKey(crate::infer::assoc_def(trait_, Name::of(name)));
+        match self.opaques.iter_mut().find(|(o, _)| *o == item) {
+            Some(row) => row.1 = bounds,
+            None => self.opaques.push((item, bounds)),
+        }
+    }
+
     fn key(&mut self, name: &str) -> ItemKey {
         self.next += 1;
         let k = ItemKey(self.next);

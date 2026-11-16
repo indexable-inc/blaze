@@ -64,7 +64,7 @@ pub(super) fn lifetimes_only(v: &View<'_>, binder: lf::List, r: Range) -> Result
 
 /// Whether the generic arguments `args` (rows of [`lf::GenericArg`]) are lifetimes only (or
 /// none).
-fn lifetime_args(v: &View<'_>, args: lf::List) -> Result<bool, Why> {
+pub(super) fn lifetime_args(v: &View<'_>, args: lf::List) -> Result<bool, Why> {
     for &n in v.rows(args)? {
         if !matches!(lf::GenericArg::decode(n)?, lf::GenericArg::Lifetime(_)) {
             return Ok(false);
@@ -88,7 +88,7 @@ pub(super) type SegArgs = (Vec<PTy, Global>, Vec<(Name, PTy), Global>, Vec<(Name
 pub(super) fn segment_args<'t>(tys: &mut PortableTys<'t>, v: &View<'_>, seg: &lf::Segment, r: Range, make: &mut dyn FnMut(&mut PortableTys<'t>, lf::TypeId) -> Result<PTy, Why>) -> Result<SegArgs, Why> {
     let mut given = Vec::new_in(Global);
     let mut binds = Vec::new_in(Global);
-    let mut nested = Vec::new_in(Global);
+    let nested = Vec::new_in(Global);
     if seg.return_notation {
         return Err(Why::Unsupported("return type notation (`Tr(..)`)", r));
     }
@@ -112,24 +112,13 @@ pub(super) fn segment_args<'t>(tys: &mut PortableTys<'t>, v: &View<'_>, seg: &lf
     if !seg.has_args {
         return Ok((given, binds, nested));
     }
-    for &n in v.rows(seg.args)? {
-        match lf::GenericArg::decode(n)? {
-            lf::GenericArg::Type(t) => given.push(make(tys, t)?),
-            lf::GenericArg::Lifetime(_) => {}
-            // A lifetime argument of a generic associated type is erased like every lifetime
-            // (`Pattern<Searcher<'a>: Clone>`, core/src/str/iter.rs:612), as `P::Searcher<'a>`
-            // is in a type.
-            lf::GenericArg::AssocType { name, args, ty } if lifetime_args(v, args)? => binds.push((Name(v.name(name)?), make(tys, ty)?)),
-            lf::GenericArg::AssocBound { name, args, bounds } if lifetime_args(v, args)? => nested.push((Name(v.name(name)?), bounds)),
-            lf::GenericArg::AssocBound { .. } => return Err(Why::Unsupported("an associated type bound with type or const arguments (`Item<T>: Bound`)", r)),
-            lf::GenericArg::Const(_) => return Err(Why::Unsupported("a const generic argument in a bound", r)),
-            _ => return Err(Why::Unsupported("this generic argument in a bound", r)),
-        }
-    }
-    Ok((given, binds, nested))
+    // The angle form has one walk (const_args_in_bounds.rs); this caller does not know the
+    // trait's parameter kinds, so a const argument is refused by name there.
+    super::const_args_in_bounds::angle_args(tys, v, seg, r, None, make)
 }
 
-impl<'b, 'n, H: Heads> Builder<'b, 'n, H> {
+// `'n` is the lowered text's (`View<'n>`); `'s` the names source's.
+impl<'b, 'n, 's, H: Heads, S: super::source::NamesSource<'s>> Builder<'b, H, S> {
     /// The bound `b` on `self_ty` as clauses into `out`: the trait's, and a projection for each
     /// `Name = Type` argument; what it says of sizedness (`sized` is the `sized` lang trait).
     #[expect(clippy::too_many_arguments, reason = "the bound, where it is written, and the out list")]
@@ -176,11 +165,14 @@ impl<'b, 'n, H: Heads> Builder<'b, 'n, H> {
         }
         let lf::TypeRef::Path(p) = v.ty(ty)? else { return Err(Why::Program(format!("a bound that is no path").into_boxed_str(), r)) };
         let (abs, texts, segs, pr) = path_texts_of(v, p, true)?;
+        // What the path names comes first: the trait's head says which of the written
+        // arguments are constants (`Uint<LO>: Concat<HI>`; const_args_in_bounds.rs).
+        let target = self.bound_target(env, abs, &texts, pr)?;
         let (given, binds, nested) = match segs.last() {
-            Some(last) => segment_args(tys, v, last, pr, &mut |tys, t| self.ty(tys, env, v, t))?,
+            Some(last) => self.bound_segment_args(tys, env, v, target, last, pr)?,
             None => (Vec::new_in(Global), Vec::new_in(Global), Vec::new_in(Global)),
         };
-        let key = match self.bound_target(env, abs, &texts, pr)? {
+        let key = match target {
             Bounded::Trait(key) => key,
             // A trait alias stands for its clauses (its head; nested aliases already expanded
             // there). It states no sizedness of its own: core writes `T: PointeeSized + Thin`
@@ -299,12 +291,13 @@ impl<'b, 'n, H: Heads> Builder<'b, 'n, H> {
         let lf::TypeRef::Path(p) = v.ty(ty)? else { return Ok(()) };
         let e = Env { bounds: Bounds::Building(out), ..*env };
         let (abs, texts, segs, pr) = path_texts_of(v, p, true)?;
+        let target = self.bound_target(&e, abs, &texts, pr)?;
         let given = match segs.last() {
-            Some(last) => segment_args(tys, v, last, pr, &mut |tys, t| self.ty(tys, &e, v, t))?.0,
+            Some(last) => self.bound_segment_args(tys, &e, v, target, last, pr)?.0,
             None => Vec::new_in(Global),
         };
         let me = intern(tys, PNode::Param(param))?;
-        match self.bound_target(&e, abs, &texts, pr)? {
+        match target {
             Bounded::Trait(key) => {
                 let (trait_, args) = self.trait_args(tys, key, pr, me, &given)?;
                 out.push(ParamBound { param, trait_, args });
@@ -350,6 +343,35 @@ impl<'b, 'n, H: Heads> Builder<'b, 'n, H> {
                 let args = intern_list(tys, &[me])?;
                 out.clauses.push(PClause::Trait { trait_: self.heads.checker(s), args });
             }
+        }
+        Ok(())
+    }
+
+    /// The item bounds of a trait's associated type `v` (`type A: B1 + B2;`), `me` the type it
+    /// is in its trait (`<Self as Trait<params>>::A`), `env` the trait's: each bound written on
+    /// it (BOUNDS) with `me` as `Self`, and its implied `Sized`. The Reference, "Associated
+    /// Items", "Associated Types": "The optional trait bounds must be fulfilled by the
+    /// implementations of the type alias. There is an implicit `Sized` bound on associated
+    /// types that can be relaxed using the special `?Sized` bound." What the checker reads as `Predicates(the associated type's key)` and gives the
+    /// solver as the alias's bounds: without them `<S as Serializer>::SerializeStruct` is
+    /// neither `Sized` nor a `SerializeStruct` in a body generic over `S: Serializer`.
+    ///
+    /// Refused by name: an associated type with type or const parameters of its own (its
+    /// bounds name them, and the checker's alias carries no arguments for them yet).
+    pub fn assoc_ty_bounds(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'n>, me: PTy, sized: Option<LibKey>, out: &mut Preds) -> Result<(), Why> {
+        for &n in v.rows(v.list(head::GENERICS))? {
+            if let lf::GenericParam::Type { .. } | lf::GenericParam::Const { .. } = lf::GenericParam::decode(n)? {
+                return Err(Why::Unsupported("the bounds of an associated type with type or const parameters of its own", Range::new(0, 0)));
+            }
+        }
+        let mut stated = false;
+        for &b in v.rows(v.list(head::BOUNDS))? {
+            let s = self.bound(tys, env, v, lf::Bound::decode(b)?, me, sized, &mut out.clauses)?;
+            stated |= self.states_size(s, sized)?;
+        }
+        if let (false, Some(s)) = (stated, sized) {
+            let args = intern_list(tys, &[me])?;
+            out.clauses.push(PClause::Trait { trait_: self.heads.checker(s), args });
         }
         Ok(())
     }

@@ -11,14 +11,18 @@
 //! - `REFUSED <class>: <first line>`: the front end or the builder said by name what it does
 //!   not build yet (the work list; not a failure);
 //! - `PANICKED <first line>`: the run path panicked (a bug, reported, not a wrong answer);
-//! - `WRONG got status <n> stdout <..> want status <n> stdout <..>`: a wrong answer.
+//! - `WRONG got status <n> stdout <..> want status <n> stdout <..>`: a wrong answer;
+//! - `HUNG after <s> s`: the rung's child did not finish by its deadline and was killed;
+//! - `CRASHED <exit status>`: the rung's child ended with no verdict (a signal, an abort).
 //!
-//! The test FAILS only when a rung is WRONG. `FRONT2_RUNGS_OUT` names a file the table is
-//! written to (the checker scripts keep no test output).
+//! Each rung runs in its OWN CHILD PROCESS: this test binary run again with
+//! `FRONT2_RUNGS_ONE=<rung>`, which builds and runs that one rung in-process (the run path
+//! runs programs in-process) and prints one `VERDICT ..` line. The parent waits for it with a
+//! deadline (`FRONT2_RUNG_SECS`, default 120), so one hang or crash costs one line, not the run.
 //!
-//! A rung that crashes the process (a signal) takes this test with it: the run path runs the
-//! program in-process; the last line printed before the crash names the rung (each rung's
-//! name goes to standard error before it runs).
+//! The test FAILS only when a rung is WRONG. `FRONT2_RUNGS_OUT` names a file the table goes to:
+//! each line is appended as its rung finishes (the checker scripts keep no test output, and a
+//! run cut short still leaves every finished line).
 
 #![feature(allocator_api)]
 
@@ -140,52 +144,117 @@ fn run_one(rung: &str) -> Verdict {
     if (status, &out) == (expected(&dir).0, &expected(&dir).1) { Verdict::Pass } else { Verdict::Wrong { status, out } }
 }
 
+/// The verdict's word and its rest, one line: what a child prints after `VERDICT `.
+fn verdict_line(rung: &str, verdict: Verdict) -> (&'static str, String) {
+    match verdict {
+        Verdict::Pass => ("PASS", String::new()),
+        Verdict::Refused { class, first } => ("REFUSED", format!("{class}: {first}")),
+        Verdict::Panicked { first } => ("PANICKED", first),
+        Verdict::Wrong { status, out } => {
+            let want = expected(&ladder().join("front2").join(rung));
+            let rest = format!(
+                "got status {status} stdout {:?} want status {} stdout {:?}",
+                String::from_utf8_lossy(&out),
+                want.0,
+                String::from_utf8_lossy(&want.1)
+            );
+            ("WRONG", rest)
+        }
+    }
+}
+
+/// Runs `rung` in a child (this binary, `FRONT2_RUNGS_ONE=rung`) with a deadline: the word and
+/// rest of its verdict, `HUNG` when killed at the deadline, `CRASHED` when it gave none.
+fn run_child(rung: &str, deadline: std::time::Duration) -> (String, String) {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    let exe = std::env::current_exe().expect("this test binary's path");
+    let mut child = Command::new(exe)
+        .args(["every_x_rung_runs_right", "--exact", "--nocapture", "--test-threads=1"])
+        .env("FRONT2_RUNGS_ONE", rung)
+        .env_remove("FRONT2_RUNGS_OUT")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("starting a rung's child");
+    // Drained on its own thread so a child writing much can never block on a full pipe.
+    let mut pipe = child.stdout.take().expect("the child's stdout");
+    let reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = pipe.read_to_string(&mut text);
+        text
+    });
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("waiting for a rung's child") {
+            break Some(status);
+        }
+        if started.elapsed() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    let text = reader.join().expect("the child's stdout reader");
+    let Some(status) = status else {
+        return ("HUNG".to_string(), format!("after {} s", deadline.as_secs()));
+    };
+    match text.lines().find_map(|l| l.strip_prefix("VERDICT ")) {
+        Some(v) => {
+            let (word, rest) = v.split_once(' ').unwrap_or((v, ""));
+            (word.to_string(), rest.to_string())
+        }
+        None => ("CRASHED".to_string(), format!("{status}")),
+    }
+}
+
+/// Appends one line to `FRONT2_RUNGS_OUT` (when set) at once: a run cut short keeps it.
+fn append_out(line: &str) {
+    use std::io::Write;
+    if let Some(path) = std::env::var_os("FRONT2_RUNGS_OUT") {
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).open(&path).expect("opening FRONT2_RUNGS_OUT");
+        file.write_all(format!("{line}\n").as_bytes()).expect("writing FRONT2_RUNGS_OUT");
+    }
+}
+
 #[test]
 fn every_x_rung_runs_right() {
-    let mut lines = Vec::new();
+    // The child's side: one rung, in this process, one verdict line on stdout.
+    if let Ok(rung) = std::env::var("FRONT2_RUNGS_ONE") {
+        let (word, rest) = verdict_line(&rung, run_one(&rung));
+        println!("VERDICT {word} {rest}");
+        return;
+    }
+    let secs: u64 = std::env::var("FRONT2_RUNG_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(120);
+    let deadline = std::time::Duration::from_secs(secs);
+    let all = x_rungs();
+    if let Some(path) = std::env::var_os("FRONT2_RUNGS_OUT") {
+        std::fs::write(&path, format!("FRONT2 X RUNGS: started, {} rungs, {secs} s each at most\n", all.len()))
+            .expect("starting FRONT2_RUNGS_OUT");
+    }
     let mut wrong = Vec::new();
-    let (mut pass, mut refused, mut panicked) = (0u32, 0u32, 0u32);
-    for rung in x_rungs() {
-        eprintln!("front2_rungs: running {rung}");
+    let mut counts: Vec<(String, u32)> = Vec::new();
+    for rung in &all {
         // `x0-*` are the runnable twins (no_core, edition 2024, success is status 42);
         // `x-*` the same checks on the blaze edition over the real `core` (success is 0).
         let family = if rung.starts_with("x0-") { "twin" } else { "core" };
-        let line = match run_one(&rung) {
-            Verdict::Pass => {
-                pass += 1;
-                format!("{rung}: PASS")
-            }
-            Verdict::Refused { class, first } => {
-                refused += 1;
-                format!("{rung}: REFUSED {class}: {first}")
-            }
-            Verdict::Panicked { first } => {
-                panicked += 1;
-                format!("{rung}: PANICKED {first}")
-            }
-            Verdict::Wrong { status, out } => {
-                let want = expected(&ladder().join("front2").join(&rung));
-                let line = format!(
-                    "{rung}: WRONG got status {status} stdout {:?} want status {} stdout {:?}",
-                    String::from_utf8_lossy(&out),
-                    want.0,
-                    String::from_utf8_lossy(&want.1)
-                );
-                wrong.push(line.clone());
-                line
-            }
-        };
-        lines.push(format!("[{family}] {line}"));
+        let (word, rest) = run_child(rung, deadline);
+        let line = format!("[{family}] {rung}: {word} {rest}").trim_end().to_string();
+        println!("{line}");
+        append_out(&line);
+        if word == "WRONG" {
+            wrong.push(line.clone());
+        }
+        match counts.iter_mut().find(|(w, _)| *w == word) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((word, 1)),
+        }
     }
-    let total = lines.len();
-    let shown = format!(
-        "FRONT2 X RUNGS: {total} rungs: {pass} PASS, {refused} REFUSED, {panicked} PANICKED, {} WRONG\n{}\n",
-        wrong.len(),
-        lines.join("\n")
-    );
-    println!("{shown}");
-    if let Some(path) = std::env::var_os("FRONT2_RUNGS_OUT") {
-        std::fs::write(&path, &shown).expect("writing FRONT2_RUNGS_OUT");
-    }
+    let summary: Vec<String> = counts.iter().map(|(w, n)| format!("{n} {w}")).collect();
+    let last = format!("FRONT2 X RUNGS: {} rungs: {}", all.len(), summary.join(", "));
+    println!("{last}");
+    append_out(&last);
     assert!(wrong.is_empty(), "rungs that ran and gave a wrong answer:\n{}", wrong.join("\n"));
 }

@@ -4,13 +4,11 @@
 //! checker asks to what the store makes.
 
 use blaze_id::ItemKey as LibKey;
-use blaze_scope::resolve::Names;
 use blaze_surface::ItemDetail;
 use blaze_typeck::{ItemKey, Question};
 
 use super::heads::Want;
 use super::keys::{Keys, Origin};
-use crate::resolve::Resolver;
 
 /// Why a question has no [`Want`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -35,8 +33,8 @@ impl core::fmt::Display for FillError {
 
 /// The want that makes library item `lib`'s whole record: an ADT's definition, a trait's
 /// members and predicates, an impl's header with its fns, a fn's signature.
-pub fn want_of_item(names: &Names<'_>, lib: LibKey) -> Result<Want, FillError> {
-    let detail = Resolver { names }.detail(lib).ok_or(FillError::NoDetail(lib))?;
+pub fn want_of_item<'n, S: super::source::NamesSource<'n>>(names: S, lib: LibKey) -> Result<Want, FillError> {
+    let detail = names.detail_of(lib).ok_or(FillError::NoDetail(lib))?;
     Ok(match detail {
         ItemDetail::Struct | ItemDetail::Enum | ItemDetail::Union => Want::Adt(lib),
         ItemDetail::Trait => Want::Members(lib),
@@ -46,7 +44,7 @@ pub fn want_of_item(names: &Names<'_>, lib: LibKey) -> Result<Want, FillError> {
 }
 
 /// The want for checker key `key`: its own item's, or a member's container's.
-pub fn want_of_key(names: &Names<'_>, keys: &Keys, key: ItemKey) -> Result<Want, FillError> {
+pub fn want_of_key<'n, S: super::source::NamesSource<'n>>(names: S, keys: &Keys, key: ItemKey) -> Result<Want, FillError> {
     let container = match keys.origin(key).ok_or(FillError::UnknownKey(key))? {
         Origin::Item(lib) => return want_of_item(names, *lib),
         Origin::Member { container, .. } => *container,
@@ -58,7 +56,7 @@ pub fn want_of_key(names: &Names<'_>, keys: &Keys, key: ItemKey) -> Result<Want,
 }
 
 /// The want that answers `q`, for the questions answered from item heads.
-pub fn want_of(names: &Names<'_>, keys: &Keys, q: Question) -> Result<Want, FillError> {
+pub fn want_of<'n, S: super::source::NamesSource<'n>>(names: S, keys: &Keys, q: Question) -> Result<Want, FillError> {
     match q {
         Question::FnSig(k)
         | Question::Predicates(k)

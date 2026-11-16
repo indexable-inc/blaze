@@ -854,8 +854,9 @@ impl<'a> Request<'a> {
             unwalked: Vec::new_in(a.clone()),
             walked: Vec::new_in(a.clone()),
             gate: ask.gate,
-            walk: match (ask.command, ask.gate) {
-                (Command::Run | Command::Test, Gate::Beside) => Class::Gate,
+            // Beside a program the walk is the gate's; with no program it is the answer itself.
+            walk: match (starts_program(ask.command, plant), ask.gate) {
+                (true, Gate::Beside) => Class::Gate,
                 _ => Class::Foreground,
             },
             program: Program::Unstarted,
@@ -885,9 +886,12 @@ impl<'a> Request<'a> {
         Some(self.path(u32::try_from(index).ok()?))
     }
 
-    /// `run` or `test`: a program is part of the answer.
+    /// `run`: a program is part of the answer. `test` starts none: a package's `main` is not
+    /// its tests, and until tests run on this path (docs/v2/plan/design/test.md) `test` is the
+    /// check of all it reaches, answered [`Verdict::Checked`] or failed, never passed (decision
+    /// D61 item 5: no pass over a stage that did not run).
     fn runs_program(&self) -> bool {
-        matches!(self.command, Command::Run | Command::Test)
+        starts_program(self.command, self.plant)
     }
 
     /// The units are known: under `Beside` and `Reached` the program starts now, unless an
@@ -3130,6 +3134,17 @@ fn watch_row<'a>(name: Name, readers: Vec<Name, Alloc<'a>>, alloc: Alloc<'a>) ->
         readers,
         split: None,
         cond: None,
+    }
+}
+
+/// Whether `command` has a program in its answer: `run` alone. The one home of the rule, asked
+/// by the walk's class and by every place a program could start. Under
+/// [`Plant::TestStartsProgram`] `test` starts one too (the simulation's control).
+fn starts_program(command: Command, plant: Plant) -> bool {
+    match command {
+        Command::Run => true,
+        Command::Test => plant == Plant::TestStartsProgram,
+        Command::Check => false,
     }
 }
 

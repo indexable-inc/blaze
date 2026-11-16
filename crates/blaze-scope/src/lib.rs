@@ -63,6 +63,7 @@ mod facts;
 mod finish;
 pub mod graph;
 mod group;
+mod included;
 pub mod items_record;
 mod lookup;
 pub mod names;

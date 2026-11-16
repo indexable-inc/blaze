@@ -1,5 +1,5 @@
 //! A written type (a signature's, a field's, an impl header's) to the checker's portable type,
-//! every path through [`Resolver::path`] (rule 30: no lookup rule here). A path to an ADT or a
+//! every path through [`Paths::path`] (rule 30: no lookup rule here). A path to an ADT or a
 //! trait whose head is not lowered yet stops with [`Why::Need`]: the driver lowers that head
 //! and runs the item again (the pull-with-restart protocol; no recursion, README step 2).
 //!
@@ -19,7 +19,8 @@ use blaze_surface::Range;
 use blaze_typeck as tc;
 use blaze_typeck::{ItemKey, List, Name, PClause, PNode, PTy, PathIdx, PortableTys};
 
-use crate::resolve::{Kind, Ns, ResolveError, Resolver};
+use super::source::NamesSource;
+use crate::resolve::{Kind, Ns, Paths, ResolveError};
 
 /// Why a written type has no portable type yet.
 #[derive(Debug)]
@@ -476,13 +477,14 @@ fn int_literal(text: &str) -> Option<(u128, &str)> {
     Some((value, &text[end..]))
 }
 
-/// The type builder of one item: its resolver and the heads lowered so far.
-pub struct Builder<'b, 'n, H: Heads> {
-    pub resolver: Resolver<'n>,
+/// The type builder of one item: its resolver, over the names source `S`
+/// ([`NamesSource`]: the solved names or each crate's records), and the heads lowered so far.
+pub struct Builder<'b, H: Heads, S> {
+    pub resolver: Paths<S>,
     pub heads: &'b H,
 }
 
-impl<'b, 'n, H: Heads> Builder<'b, 'n, H> {
+impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
     /// The portable type of `t`, by a work list (no recursion).
     pub fn ty(&self, tys: &mut PortableTys<'_>, env: &Env<'_>, v: &View<'_>, t: lf::TypeId) -> Result<PTy, Why> {
         enum S {
@@ -862,8 +864,11 @@ impl<'b, 'n, H: Heads> Builder<'b, 'n, H> {
         if !abs && texts.len() == 1 {
             if let Some(&(_, i)) = env.params.iter().find(|(n, _)| *n == Name::of(texts[0])) {
                 // A const parameter is no type (its sort is checked here, never a `Param` the
-                // solver meets as a malformed term): written as a bound's argument (`Tr<N>`) it
-                // is a const argument, which a bound does not take yet.
+                // solver meets as a malformed term). A bound's argument in a position its trait
+                // declares const never comes here (const_args_in_bounds.rs makes it a
+                // constant); what does is a const parameter where a type is declared, or one in
+                // a trait object's or an `impl Trait`'s bound, whose trait is not known to the
+                // walk yet.
                 if env.consts.iter().any(|(c, _)| *c == i) {
                     return Err(Why::Unsupported("a const parameter in a type position (a bound's const argument `Tr<N>`)", r));
                 }
