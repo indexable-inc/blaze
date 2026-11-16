@@ -130,10 +130,90 @@ of the design that is new.
   into a crate-wide task. The size distribution of glob cycles on std, reth and tempo is
   measured with the old layer's resolved maps before the pull producer is trusted.
 
-The review recommended a first producer that resolves a crate whole and writes these same
-records and read lists, replaced by the pull producer later. Andrew, the same hour: "ideally
-we want to do sota all at once no incremental". So the pull producer is built first; the
-records and the read lists are the same either way, which is what the type checker sees.
+**The producer (decided with Andrew, 2026-11-15 18:37).** Three grains were weighed: one
+record per crate (any new name redoes the crate), per module updated incrementally, and
+per-name pull from cold. The choice is the middle one. The first time a crate is seen, all its
+modules are resolved together by the known fixpoint, which settles every name; each module's
+scope is its own record with its per-name read list. After an edit only the modules whose read
+lists no longer hold are run again (the edited module, and readers of a name that changed,
+appeared or went), and a module in a glob cycle runs with its partners. The machine is per
+module and asks for what it needs, so the same machine serves both "all modules of this crate"
+and "these modules again". Pull from cold (resolving only the modules a program reaches) saves
+work only for a crate never seen before and not fetched, and is the one part no Rust compiler
+has built: it is not built unless a measured crate-wide first pass over item lists costs more
+than about 10 ms on reth's or tempo's largest crate.
+
+## What Relax does, and what is taken from it
+
+Relax (makepad, MIT; read at commit f05459f on 2026-11-15, source only) is the compiler this
+one is judged against. What its code does, by file:
+
+- Names: collection is eager and the import fixpoint runs over the whole program's import list
+  (`front/src/program.rs`); lookups are memoised per (module, name, namespace) and every binding
+  change clears the memos of the whole program. So it resolves whole, as rustc does.
+- It keeps a full AST of every file for the life of the process; positions are absolute byte
+  offsets; a line inserted above a function changes that function's code key.
+- Cache: one mmap'd file per crate version (a header, a sorted index, append-only payloads of
+  raw in-memory structs, readable only by the same build). Keys hash absolute worktree paths,
+  so the cache is not shareable across checkouts or machines; std is compiled per workspace.
+- `check`: a crate's verdict is keyed by every file's text (one edit misses the crate); a
+  signature edit drops every body verdict of the crate; a body with a warning is never stored.
+- Its speed comes from elsewhere: a function is compiled when first called (stubs), a warm
+  start maps the whole resolved program in place after a stat-only certificate, a check with
+  unchanged inputs prints stored diagnostics with no load, and there is no link step.
+
+Taken from it:
+
+1. **Compile on first call.** `run` emits stubs and compiles a function when it is first hit,
+   the rest in the background; `build` compiles what is reached. This is the largest part of
+   Relax's lead on time to first run and is independent of the item layer.
+2. **The early record.** A check whose certificate stands prints its stored findings and
+   exits before anything is loaded (the certificate here already; the findings as a record).
+3. **Stat stamps with a racy window**, hashing only files whose stat changed (here already).
+4. **One mapped pack per crate with a sorted index** for a crate's records (the store's packs).
+5. **Packed tokens** (4 bytes each) and LEB128 position tables for `FileItems` and expansions.
+6. **Function bodies skipped at load**: an outline never parses a body; a body is parsed when
+   its own task runs.
+7. **A key that covers what a name can find**: its per-item name graph with a Merkle hash per
+   strongly connected set is the same idea as a per-name read list; blanket impls are indexed
+   under the trait's name.
+
+Not taken: absolute positions and paths in keys, crate-grain verdicts, raw in-memory structs
+as the stored form, whole-program memo flushes, ASTs kept alive, dependencies read from source.
+
+## The commands: run, test, check, export
+
+Andrew, 2026-11-15 18:45: "no blaze build and just blaze export ... and blaze run / test /
+check that are fast"; "everything in JIT world".
+
+- **`blaze run` and `blaze test`** never write an executable. Code is records; the launcher
+  places them in the program's own process behind one slot word a function. A function not
+  yet compiled is a stub in its slot: the first call asks the program's helper for the code
+  record (found by key, or made then), which is published in the slot; what is likely to run
+  next is compiled behind it. There is no link step. A test run is a program run.
+- **Tiers.** The first code of a function is the fast tier, which calls through slots. A
+  background tier optimizes hot functions across functions (inlining). Its record lists, in
+  its read list, the code identity of every callee body it inlined, so an edit of a callee
+  makes the caller's optimized record stale and the caller runs its fast-tier record until
+  the tier makes it again. A better version of a function is one slot word written.
+- **`blaze check`** makes no code.
+- **`blaze export`** writes a native executable (Mach-O, ELF): every function the program
+  reaches, at the optimized tier, no stubs, laid out as the launcher lays them out and written
+  once, whole. It is not incremental and keeps nothing between runs: nobody edits through it.
+  It comes after `run`; until then the command says it is not built.
+- **Gone:** `blaze build`, the linker's patching of a file in place (kept slots in a file,
+  spare room, growth bounds, unwind tables patched, a signature made again per edit), and
+  compiling everything reachable before the first instruction runs.
+
+## Measured so far
+
+- `blaze_file_items::outline` (a file's text to its items, hashes and ranges; one thread, an
+  M-series Mac, release, 2026-11-15, bodies parsed in full): `core` 299 files, 180,413 lines,
+  13,443 items in 132.5 ms; `alloc` 64.2 ms; `std` 170.9 ms; all of `library/` (1.53 M lines,
+  207,552 items) 1,671 ms; blaze's own crates (2.63 M lines, 321,674 items) 3,332 ms: about
+  1 microsecond a line, 32 to 51 MB/s. On N cores it divides by N (a file is independent); with
+  bodies skipped it falls further. 9 syntax errors in `core` and 1,531 in blaze's crates are
+  syntax the outline does not read yet (it parses with no extensions): to fix.
 
 ## How it is built and proven
 

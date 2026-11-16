@@ -318,6 +318,9 @@ blaze-http = { path = "crates/blaze-http", default-features = false }
 blaze-ids = { path = "crates/blaze-ids" }
 # An item's portable identity: its key, the `Portable` bound and the tables that outlive a snapshot (docs/v2/plan/design/identity.md).
 blaze-id = { path = "crates/blaze-id" }
+blaze-impls = { path = "crates/blaze-impls" } # The impl index, lang items and crate graph records (docs/v2/plan/design/bottom.md).
+blaze-file-items = { path = "crates/blaze-file-items" } # A file's text to its outline of items, no tree kept (docs/v2/plan/design/bottom.md, `FileItems`).
+blaze-surface = { path = "crates/blaze-surface" }
 # The fresh core's vocabulary: record kinds, keys, the store, memo, executor and driver interfaces.
 blaze-keyed = { path = "crates/blaze-keyed" }
 # The host of the keyed driver (docs/v2/plan/design/host.md): a unit's keys from its own text,
