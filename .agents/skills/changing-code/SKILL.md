@@ -9,13 +9,26 @@ description: "How a change that spans the tree is made: a type before a lint bef
 
 ## fix-through-blaze-lints (rule 13)
 
-A change that moves a type, path, API or idiom across the code is a ban with a `replacement` in
-`.clippy.toml` (mirrored in the hot crates' `clippy.toml`), which blaze-lints'
-`disallowed_types`/`disallowed_methods`/`disallowed_macros` enforce with a MachineApplicable fix, or
-a `blaze::` lint where the rule needs types or MIR; either is applied with `blaze check --fix`, and
-its count lives in `crates/blaze-lints/baselines/`, which may only shrink (the merge gate's
-`lint-baselines` job, docs/cargo.md#lints, holds them, and its `blaze.<lint>.txt` files are the
-ratchet's: every blaze lint is `deny` except in the crates a file lists,
+Reach for astlog first for any change of many sites, and for the question before it. astlog is
+blaze's Datalog over its own syntax trees and semantic database
+(docs/v2/plan/design/astlog-sema.md): a rules file under tools/astlog/rules/ matches Rust code
+patterns with `$name` metavariables and joins them with what the front end knows (`type-of`,
+`resolves`, `callee`, `implements`, `references`, enclosing items), so a rule says what the code
+means, not how it is spelled. Before a refactor, a query (`blaze check --query FILE`) lists every
+site the change must touch, the hard ones included (every expression of an id type cast to an
+integer or used as an index, say), so they are known up front and not found by breaking the build;
+then the same file's `(rewrite ..)` actions make the edit (`blaze check --rules FILE`, `--dry-run`
+first, the diff read), and the file is checked in so the change can be run again and reviewed
+against intent. Do not write a one-off script that loops over compile errors, and do not hand a
+mechanical change of many sites to lanes to make by hand: write the rule. Where blaze cannot yet
+check a crate, say so, fix that, and use the compiler's error list for that crate meanwhile. A
+change that moves a type, path, API or idiom across the code and must keep holding afterward is a
+ban with a `replacement` in `.clippy.toml` (mirrored in the hot crates' `clippy.toml`), which
+blaze-lints' `disallowed_types`/`disallowed_methods`/`disallowed_macros` enforce with a
+MachineApplicable fix, or a `blaze::` lint where the rule needs types or MIR; either is applied with
+`blaze check --fix`, and its count lives in `crates/blaze-lints/baselines/`, which may only shrink
+(the merge gate's `lint-baselines` job, docs/cargo.md#lints, holds them, and its `blaze.<lint>.txt`
+files are the ratchet's: every blaze lint is `deny` except in the crates a file lists,
 docs/lints.md#workspace-levels-and-the-ratchet); a one-off move of a path is `blaze check --replace
 A=B`. Both find code by name resolution (imports, renames, globs, re-exports, macro output), never
 by text, and leave it compiling and lint-clean, so the rule keeps holding after the port. A shape
@@ -214,7 +227,8 @@ See [docs/v2/plan.md#how-the-work-is-run](../../../docs/v2/plan.md#how-the-work-
 ## edit-rust-by-syntax (rule 72)
 
 Every change to a `.rs` file goes through the agent's edit tools (Edit, or Write after a Read) or a
-tool that parses Rust: `blaze check --fix` or `--replace` for anything resolved by name
+tool that parses Rust: an astlog rules file (`blaze check --rules`) for a change of many sites that
+depends on what the code means, `blaze check --fix` or `--replace` for anything resolved by name
 (`fix-through-blaze-lints`), and `ast-grep` (`ast-grep run --lang rust --pattern '<pattern>'
 --rewrite '<rewrite>' <paths>`) for a syntax-only shape across many files, scoped to the paths
 named, with the diff read afterward. Never `cat <<EOF > x.rs`, `sed -i`, `perl -pi`, `awk`, `rg
