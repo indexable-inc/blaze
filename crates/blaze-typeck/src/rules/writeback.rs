@@ -425,9 +425,25 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             holes: &expects,
             alloc,
         })?;
+        // The hidden type of each opaque this body defines (rules/opaque_def.rs): the Reference,
+        // "Abstract return types": "Each possible return value from the function must resolve
+        // to the same concrete type": that type, per opaque key. A hidden type that is not
+        // wholly known adds no finding here (the body's own diagnostics say why) and no row.
+        let defined = self.defined_hidden()?;
+        let mut hidden: Vec<(crate::ids::ItemKey, PTy), Alloc<'a>> = Vec::with_capacity_in(defined.len(), alloc);
+        for &(k, t) in defined.iter() {
+            let n = self.diags.len();
+            let p = self.export(&mut ex, t, At::Body)?;
+            if self.diags.len() == n {
+                hidden.push((k, p));
+            } else {
+                self.diags.truncate(n);
+            }
+        }
         let (reads, needs) = self.reads.finish(alloc);
         Ok(Checked {
             suggests,
+            hidden,
             types: ex.out,
             expr_ty,
             pat_ty,

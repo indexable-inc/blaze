@@ -1,0 +1,4 @@
+[package]
+name = "ladder-x-ref-02-reborrow"
+version = "0.1.0"
+edition = "blaze-2026.11"

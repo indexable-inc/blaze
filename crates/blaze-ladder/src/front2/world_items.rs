@@ -192,11 +192,14 @@ impl<'w, 'n> BodyWorld<'w, 'n> {
     }
 
     /// The gap of a candidate impl whose header failed: unread as written, else refused.
-    fn failed_impl(&self, k: LibKey, why: &str) -> Gap {
+    /// `asked` says the question (which trait at which shape, or the inherent items of which
+    /// shape): it follows the place, so a gap names what was asked beside who could not answer.
+    fn failed_impl(&self, k: LibKey, why: &str, asked: &str) -> Gap {
+        let place = format!("{} [asked: {asked}]", item_place(self.names, k));
         match self.buckets.is_some_and(|b| b.is_unread(k)) {
             // The place leads the why: a census cuts the text, and the impl is to be found.
-            true => Gap::UnreadImpl(k, format!("at {}: {why}", item_place(self.names, k)).into_boxed_str()),
-            false => Gap::RefusedImpl { impl_: k, place: item_place(self.names, k), why: why.into() },
+            true => Gap::UnreadImpl(k, format!("at {place}: {why}").into_boxed_str()),
+            false => Gap::RefusedImpl { impl_: k, place: place.into_boxed_str(), why: why.into() },
         }
     }
 
@@ -302,7 +305,11 @@ impl World for BodyWorld<'_, '_> {
 
     fn impls_of(&self, _: Seal, trait_: ItemKey, shape: Shape) -> Fetch<&[ItemKey]> {
         if let Some((k, why)) = self.buckets.and_then(|b| b.trait_gap(trait_, shape)) {
-            return self.gap(self.failed_impl(k, why));
+            let asked = match self.keys.library(trait_) {
+                Some(lib) => format!("the impls of the trait {lib:x} at {shape:?}"),
+                None => format!("the impls of the trait {trait_:?} at {shape:?}"),
+            };
+            return self.gap(self.failed_impl(k, why, &asked));
         }
         match self.buckets.and_then(|b| b.impls_of(trait_, shape)) {
             Some(v) => Ok(v),
@@ -334,7 +341,7 @@ impl World for BodyWorld<'_, '_> {
             return self.gap(Gap::FnHead(f, why.into_boxed_str()));
         }
         if let Some((k, why)) = self.buckets.and_then(|b| b.inherent_gap(shape)) {
-            return self.gap(self.failed_impl(k, why));
+            return self.gap(self.failed_impl(k, why, &format!("the inherent items of {shape:?}")));
         }
         match self.buckets.and_then(|b| b.inherent(shape, name)) {
             Some(v) => Ok(v),

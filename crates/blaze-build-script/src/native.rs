@@ -157,6 +157,17 @@ pub fn seatbelt<'a, 'g>(grant: &Grant<'g>, alloc: Alloc<'a>) -> Result<AString<'
         quoted(&mut out, "subpath", checked(path)?);
     }
     quoted(&mut out, "literal", "/dev/null");
+    // The folders above each granted path, their metadata only (not what is in them): a
+    // program finds its own real path by `realpath`, which looks at each one (clang finds its
+    // resource headers, `lib/clang/<v>/include`, beside its real path so; without this it
+    // finds none, D69).
+    out.push_str(")\n(allow file-read-metadata");
+    let named = [grant.program].into_iter().chain(grant.exec.iter().copied()).chain(grant.read.iter().copied()).chain(grant.write.iter().copied());
+    for path in named {
+        for (at, _) in path.match_indices('/').filter(|(at, _)| *at > 0) {
+            quoted(&mut out, "literal", &path[..at]);
+        }
+    }
     out.push_str(")\n(allow file-write*");
     for path in grant.write {
         quoted(&mut out, "subpath", path);

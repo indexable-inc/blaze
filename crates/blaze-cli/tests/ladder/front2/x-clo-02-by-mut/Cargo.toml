@@ -1,0 +1,4 @@
+[package]
+name = "ladder-x-clo-02-by-mut"
+version = "0.1.0"
+edition = "blaze-2026.11"

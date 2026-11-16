@@ -36,7 +36,7 @@
 //! ..b  => RangeTo { end: b }              ..  => RangeFull {}
 //! a..=b => RangeInclusive::new(a, b)      ..=b => RangeToInclusive { end: b }
 //! async fn f(PAT: T) BODY
-//!   => fn f(__arg0: T) { let PAT = __arg0; BODY }, the body's head marked async
+//!   => fn f(__arg0: T) { async move { let PAT = __arg0; BODY } }, the body's head marked async
 //!      (the parameters move into the future; their drop order is the `let`s')
 //! ```
 
@@ -277,10 +277,25 @@ impl Machine<'_, '_, '_> {
                 }
             }
         }
-        // The root is the block itself: the body's head says it is an async fn's (`sig::ASYNC`,
-        // its written return type at `head::TY`), and the coroutine is made from that by whoever
-        // builds code, not spelled here as a closure.
-        let root = self.block_of(&stmts, Some(body), BlockKind::Plain, r);
+        // The Reference, "Async functions": "async fn example<'a>(x: &'a str) -> usize { .. } is
+        // roughly equivalent to: fn example<'a>(x: &'a str) -> impl Future<Output = usize> + 'a
+        // { async move { .. } }". The root is that `async move` block (the same node a written
+        // one lowers to: `Machine::block`), holding the parameters' `let`s and the written body.
+        // The head still says the fn is async (`sig::ASYNC`) and keeps the written return type
+        // at `head::TY`: what the block's output is checked against.
+        let inner = self.block_of(&stmts, Some(body), BlockKind::Plain, r);
+        let c = Closure {
+            params: List { start: 0, len: 0 },
+            ret: None,
+            body: inner,
+            kind: CoroutineKind::Async,
+            source: CoroutineSource::Block,
+            capture_by_value: true,
+            konst: false,
+            immovable: false,
+        };
+        let row = self.put_row(c.encode(), r);
+        let root = self.put_expr(Expr::Closure { row }, r);
         let params = self.put_ids_of(&params);
         (root, params)
     }

@@ -109,6 +109,24 @@ pub trait FrontEnd {
     fn adt(&self, key: ItemKey) -> Option<Adt<'_>>;
     /// An item's name for messages, where the front end can give it.
     fn item_named(&self, key: ItemKey) -> Option<Box<str>>;
+    /// Why a survey left `key` out of the program (a reached fn whose check failed, an ADT row
+    /// not made, a fn with no head or no body): the build's "no ABI", "no ADT row" and "no
+    /// callee" refusals of a call or a type naming it then say this cause instead of only the
+    /// symptom. `None` in a run (a run stops at the first such cause) and for the old front.
+    fn left_out(&self, _key: ItemKey) -> Option<&str> {
+        None
+    }
+    /// The cause of the last `normalize` that gave no type (the trait by name, `Self`'s form,
+    /// the solver's error or "no answer"): the build's `Projection` refusal then names it.
+    fn last_projection(&self) -> Option<Box<str>> {
+        None
+    }
+    /// Constant item `item`'s value as the front end evaluated it (front2 evaluates every
+    /// constant a checked body reads, once, when the program is made); `None` where it made
+    /// none (the old front: run.rs `eval_consts` evaluates its tabled constants instead).
+    fn const_record(&self, _item: ItemKey) -> Option<&blaze_build::data::DataRecord<std::alloc::Global>> {
+        None
+    }
     fn int_lit(&self, owner: ItemKey, e: ExprId) -> Option<u128>;
     fn int_pat(&self, owner: ItemKey, p: PatId) -> Option<u128>;
     fn string(&self, owner: ItemKey, e: ExprId) -> Option<&[u8]>;

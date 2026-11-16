@@ -27,6 +27,8 @@ blaze-file-items.workspace = true
 parser.workspace = true
 # `Edition`, `ItemDetail`, `ItemKind`: the outline's value types.
 blaze-surface.workspace = true
+# `suggest::pick`: the type checker's fix for an unknown name, made a finding (fix.rs).
+blaze-typeck.workspace = true
 # `BlazeEdition`: the one home of the blaze editions' spellings (std.md, "The blaze edition").
 edition.workspace = true
 # `ContentId`: file and item digests. By path: the workspace entry turns on serde adapters.

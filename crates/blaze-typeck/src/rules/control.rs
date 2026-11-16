@@ -61,18 +61,22 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 for &t in sig.inputs {
                     inputs.push(self.lower_sig_ty(sig.types, t)?);
                 }
-                // Each opaque the output names is this body's to define (rules/opaque_def.rs);
-                // an async fn's is its body's future, below.
-                let output = match self.body.coroutine {
-                    None => {
-                        let t = self.lower_defining_output(sig.types, sig.output)?;
-                        // rustc's order (`replace_opaque_types_with_inference_vars`): the
-                        // bounds are obligations from the start, so a returned closure is
-                        // typed from its `Fn` bound.
-                        self.close_opaques()?;
-                        t
-                    }
-                    Some(_) => self.lower_sig_ty(sig.types, sig.output)?,
+                // Each opaque the output names is this body's to define (rules/opaque_def.rs).
+                // An async fn whose root is its `async move` block (the Reference, "Async
+                // functions": `fn f() -> impl Future<Output = T> { async move { .. } }`, what
+                // blaze-lower's `async_fn` makes) defines its `impl Future` the same way: the
+                // hidden type is the block's future. A body marked async whose root is NOT an
+                // async block (the hand-built fixtures' older form) is checked against the
+                // written type, below.
+                let output = if self.body.coroutine.is_none() || self.async_root()? {
+                    let t = self.lower_defining_output(sig.types, sig.output)?;
+                    // rustc's order (`replace_opaque_types_with_inference_vars`): the
+                    // bounds are obligations from the start, so a returned closure is
+                    // typed from its `Fn` bound.
+                    self.close_opaques()?;
+                    t
+                } else {
+                    self.lower_sig_ty(sig.types, sig.output)?
                 };
                 (inputs, output, sig.header.abi == crate::ids::Abi::RustCall)
             }
@@ -92,13 +96,17 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
         }
         // An `async fn`'s body returns the written type; its signature's output is the future.
+        // With the `async move` block as the root, the fn returns the future (the signature's
+        // output, above) and the BLOCK returns the written type (`async_fn_output`, read by
+        // rules/coroutine.rs `expr_async_block`); the fn's own body is then not an async site.
+        let async_root = self.async_root()?;
         let output = match self.body.coroutine {
-            Some(CoroutineKind::Async { output }) => self.lower_body_ty(output, At::Body)?,
-            None => output,
+            Some(CoroutineKind::Async { output }) if !async_root => self.lower_body_ty(output, At::Body)?,
+            _ => output,
         };
         let site = self.new_coerce_many(output)?;
         self.ret_sites.push(site);
-        self.async_sites.push(self.body.coroutine.is_some());
+        self.async_sites.push(self.body.coroutine.is_some() && !async_root);
         let root = self.body.root;
         self.push_expr(root, Expectation::HasType(output), Then::CoerceMany(site))?;
         let params = self.body.params;

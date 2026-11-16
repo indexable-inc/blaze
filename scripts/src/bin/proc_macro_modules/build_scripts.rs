@@ -61,14 +61,53 @@ const PERM_PATCH: &str = "    pub fn perm(&self) -> FilePermissions {
     }
 ";
 
-/// The input: the proc-macro mode's fields under `build_scripts`.
-struct Wrapped(Args);
+/// The input: the proc-macro mode's fields under `build_scripts`, and `native` for scripts
+/// built for the host (D65, D69).
+struct Wrapped(Args, Option<Native>);
 
 impl Input for Wrapped {
-    const FIELDS: &'static [&'static str] = &["build_scripts"];
+    const FIELDS: &'static [&'static str] = &["build_scripts", "native"];
 
     fn parse(f: &Fields<'_>) -> Result<Wrapped, InputError> {
-        f.object_required::<Args>("build_scripts").map(Wrapped)
+        let native = match f.get("native") {
+            None => None,
+            Some(_) => Some(f.object_required::<Native>("native")?),
+        };
+        Ok(Wrapped(f.object_required::<Args>("build_scripts")?, native))
+    }
+}
+
+/// The host the native mode builds for; the only one with a pinned clang and a sysroot today
+/// (crates/hir-ty-codegen/clang.json: Linux's sysroot is not pinned).
+const HOST: &str = "aarch64-apple-darwin";
+
+/// `native`: the scripts are built as host binaries (no process shim: they really start the
+/// pinned clang), linked by the shelf's clang (`bin/clang`, whose `bin/clang.cfg` says
+/// `-fuse-ld=lld`: the release's `ld64.lld`) against the SDK; the machine's `cc` and `ld` are
+/// never asked.
+struct Native {
+    /// `<home>/.blaze/v2/toolchain/clang/<sha256>`: the unpacked pin.
+    clang: PathBuf,
+    /// The macOS SDK folder, resolved once by the caller (`xcrun --show-sdk-path`).
+    sdk: PathBuf,
+}
+
+impl Input for Native {
+    const FIELDS: &'static [&'static str] = &["clang", "sdk"];
+
+    fn parse(f: &Fields<'_>) -> Result<Native, InputError> {
+        Ok(Native { clang: PathBuf::from(f.str("clang", None)?), sdk: PathBuf::from(f.str("sdk", None)?) })
+    }
+}
+
+impl Native {
+    /// The identity's lines: the target, the compiler by its shelf digest (the folder's name),
+    /// the SDK by its settings file's digest; no machine path.
+    fn identity(&self) -> Result<String, Failure> {
+        let digest = self.clang.file_name().map(|it| it.to_string_lossy().into_owned()).unwrap_or_default();
+        let settings = self.sdk.join("SDKSettings.json");
+        let settings = std::fs::read(&settings).map_err(io(&settings))?;
+        Ok(format!("target {HOST}\nlinker clang {digest}\nsdk settings {}\n", sha256(&settings)))
     }
 }
 
@@ -311,7 +350,7 @@ struct BuiltScript {
 
 impl Plan<'_> {
     /// One package's script: its workspace, its sandboxed offline build, its record.
-    fn build_script(&self, at: usize, library: &Path, shim_digest: &str, rt_digest: &str) -> Result<BuiltScript, Failure> {
+    fn build_script(&self, at: usize, library: &Path, shim_digest: &str, rt_digest: &str, native: Option<&Native>) -> Result<BuiltScript, Failure> {
         let (wanted, origin) = (&self.args.crates[at], self.origin(at)?);
         let no_module = |why: String| Failure::NoModule { name: wanted.name.clone(), version: wanted.version.clone(), why };
         let original = self.manifest_of(at)?;
@@ -323,8 +362,14 @@ impl Plan<'_> {
         })?;
         features.sort();
         features.dedup();
+        // A wasm module's identity is unchanged (its records stand); a native one names the
+        // host target, the linking clang and the SDK instead of the shim and the patches.
+        let runner = match native {
+            None => format!("shim {shim_digest}\npatches {rt_digest}\n"),
+            Some(native) => native.identity()?,
+        };
         let identity = format!(
-            "blaze build-script module 3\nname {}\nversion {}\n{}\ndeps {}\nfeatures {}\ntoolchain {}\nshim {shim_digest}\npatches {rt_digest}\nbuilder bootstrap\n",
+            "blaze build-script module 3\nname {}\nversion {}\n{}\ndeps {}\nfeatures {}\ntoolchain {}\n{runner}builder bootstrap\n",
             wanted.name,
             wanted.version,
             origin.identity_line(),
@@ -361,13 +406,21 @@ impl Plan<'_> {
             "--offline".into(),
             "--workspace".into(),
             "--message-format=json".into(),
-            "-Zbuild-std=std,panic_abort".into(),
+        ];
+        let triple = match native {
+            None => {
+                argv.push("-Zbuild-std=std,panic_abort".into());
+                "wasm32-wasip1"
+            }
+            Some(_) => HOST,
+        };
+        argv.extend::<[OsString; 3]>([
             "--target".into(),
-            "wasm32-wasip1".into(),
+            triple.into(),
             // Exactly the unit's set: the member declares each as empty, `default` among them
             // when the unit has it, so nothing else is turned on.
             "--no-default-features".into(),
-        ];
+        ]);
         if !features.is_empty() {
             argv.push("--features".into());
             argv.push(features.join(",").into());
@@ -388,7 +441,18 @@ impl Plan<'_> {
         env.push(("CARGO_ENCODED_RUSTFLAGS".to_owned(), flags.join("\u{1f}").into()));
         let target = self.work.join("bs-target");
         env.push(("CARGO_TARGET_DIR".to_owned(), target.clone().into_os_string()));
-        env.push(("__CARGO_TESTS_ONLY_SRC_ROOT".to_owned(), library.as_os_str().to_owned()));
+        match native {
+            None => env.push(("__CARGO_TESTS_ONLY_SRC_ROOT".to_owned(), library.as_os_str().to_owned())),
+            Some(native) => {
+                // Every host artifact (the script, its build-dependencies' scripts and proc
+                // macros) links with the shelf's clang, which links with `ld64.lld`, against
+                // the SDK: the machine's `cc` and `ld` are never asked.
+                env.push(("CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER".to_owned(), native.clang.join("bin/clang").into_os_string()));
+                env.push(("SDKROOT".to_owned(), native.sdk.clone().into_os_string()));
+                env.push(("MACOSX_DEPLOYMENT_TARGET".to_owned(), "11.0".into()));
+                env.push(("ZERO_AR_DATE".to_owned(), "1".into()));
+            }
+        }
         let what = format!("the build of {} {}'s script", wanted.name, wanted.version);
         let mut ran = run(&argv, &ws, &env, Duration::from_secs(self.args.build_seconds), &what)?;
         let (compiled, readable) = artifacts_of(&String::from_utf8_lossy(&ran.output));
@@ -397,14 +461,19 @@ impl Plan<'_> {
         write(&log, &readable)?;
         let what = format!("{what} (its whole output: {})", log.display());
         ran_ok(ran, &what)?;
-        let std_lock = read(&library.join("Cargo.lock"))?;
+        // A native build compiles no std of its own: the toolchain's host std is used.
+        let std_lock = if native.is_none() { read(&library.join("Cargo.lock"))? } else { String::new() };
         check_compiled(&compiled, &closure, &std_lock, library, &wanted.name, &wanted.version)?;
 
-        let wasm_path = target.join("wasm32-wasip1/release/build-script-build.wasm");
+        let (artifact, module_file, digest_file) = match native {
+            None => ("wasm32-wasip1/release/build-script-build.wasm", "module.wasm", "wasm-sha256"),
+            Some(_) => ("aarch64-apple-darwin/release/build-script-build", "script.bin", "bin-sha256"),
+        };
+        let wasm_path = target.join(artifact);
         let wasm = std::fs::read(&wasm_path).map_err(io(&wasm_path))?;
         let wasm_sha256 = sha256(&wasm);
         let record = self.args.store.join("build-script/modules").join(&key);
-        let held = record.join("wasm-sha256");
+        let held = record.join(digest_file);
         let fresh = if held.exists() {
             let held = read(&held)?.trim().to_owned();
             if held != wasm_sha256 {
@@ -415,8 +484,12 @@ impl Plan<'_> {
             let staging = self.args.store.join("build-script/staging").join(&key);
             let _ = std::fs::remove_dir_all(&staging);
             write(&staging.join("identity"), &identity)?;
-            write(&staging.join("module.wasm"), &wasm)?;
-            write(&staging.join("wasm-sha256"), format!("{wasm_sha256}\n"))?;
+            write(&staging.join(module_file), &wasm)?;
+            write(&staging.join(digest_file), format!("{wasm_sha256}\n"))?;
+            if native.is_some() {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(staging.join(module_file), std::fs::Permissions::from_mode(0o555)).map_err(io(&staging))?;
+            }
             std::fs::create_dir_all(record.parent().expect("a record has a parent")).map_err(io(&record))?;
             std::fs::rename(&staging, &record).map_err(io(&record))?;
             true
@@ -427,8 +500,9 @@ impl Plan<'_> {
 
 /// The mode's run: every script asked for built and kept; 1 when any failed.
 pub(super) fn main_with(text: &str) -> i32 {
-    let Wrapped(args) = input::parse::<Wrapped>(text, SCRIPT);
+    let Wrapped(args, native) = input::parse::<Wrapped>(text, SCRIPT);
     let args = &args;
+    let native = native.as_ref();
     let env = |name: &str| std::env::var(name).unwrap_or_default();
     let home = env("HOME");
     let fail = |failure: Failure| -> ! { blaze_script::fail(SCRIPT, &failure.to_string()) };
@@ -453,6 +527,7 @@ pub(super) fn main_with(text: &str) -> i32 {
     let origins: Vec<Result<Origin, Failure>> = args.crates.iter().map(|wanted| Origin::of(args, &lock, wanted).map(cut)).collect();
     let plan = Plan {
         args,
+        offline: native.is_some(),
         origins,
         target_json: work.join("unused-target.json"),
         work,
@@ -472,7 +547,7 @@ pub(super) fn main_with(text: &str) -> i32 {
     let mut failed = 0;
     for (at, wanted) in args.crates.iter().enumerate() {
         let started = Instant::now();
-        match plan.build_script(at, &library, &shim_digest, &rt_digest) {
+        match plan.build_script(at, &library, &shim_digest, &rt_digest, native) {
             Ok(built) => println!(
                 "{} {} [{}]: script module {} wasm-sha256 {} {} bytes{} in {:.1}s",
                 wanted.name,

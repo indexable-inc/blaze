@@ -8,10 +8,10 @@
 //! even-numbered pair of `x` registers (`x0:x1`, `x2:x3`, ...), low word first; one is returned
 //! in `x0:x1` (pass.rs `run`, `call`, `Op::Return`).
 //!
-//! Refused by name: division and remainder (compiler_builtins' `__udivti3`, `__divti3`,
-//! `__umodti3`, `__modti3`: no routine of the run path calls them yet), conversions to and
-//! from floats (`__floattidf` and kin), the overflow and saturating forms, rotations and the
-//! bit counts.
+//! Division and remainder, and conversions to and from floats, are calls of the runtime's
+//! routines (pass/runtime.rs: `__udivti3` and kin, `__floattidf` and kin).
+//!
+//! Refused by name: the overflow and saturating forms, rotations and the bit counts.
 
 use std::alloc::Allocator;
 
@@ -240,13 +240,8 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 self.put(enc::csel(X1, X1, X3, Cond::Ne));
                 self.st2(X0, X1, inst);
             }
-            Op::Udiv | Op::Sdiv | Op::Urem | Op::Srem => {
-                return Err(unsupported(
-                    inst,
-                    op,
-                    "`i128` division or remainder (compiler_builtins' `__udivti3`, `__divti3`, `__umodti3`, `__modti3` are not linked on the run path yet)",
-                ));
-            }
+            // The runtime's routines (pass/runtime.rs), after the zero and overflow checks.
+            Op::Udiv | Op::Sdiv | Op::Urem | Op::Srem => return self.wide_div(inst, op),
             _ => return Err(unsupported(inst, op, "this `i128` operation (overflow, saturating, rotate, bit count, float conversion)")),
         }
         Ok(())

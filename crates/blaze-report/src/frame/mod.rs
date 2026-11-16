@@ -40,6 +40,9 @@
 
 mod draw;
 pub(crate) mod lex;
+pub mod plain;
+#[cfg(test)]
+mod plain_tests;
 #[cfg(test)]
 mod spec;
 #[cfg(test)]
@@ -289,6 +292,9 @@ pub struct Input<'a> {
     pub link: &'a str,
     /// Whether this command can apply the findings' fixes.
     pub fixes: Fixes,
+    /// Each finding's id (D70), beside [`Input::findings`]; empty for none. Drawn only where a
+    /// fix can be applied: `fix: blaze check --fix <id>`.
+    pub ids: &'a [&'a str],
 }
 
 /// The default link: the file itself.
@@ -386,6 +392,13 @@ pub(crate) fn render_planted(
         Form::Lines => {
             for &at in order.iter() {
                 lines_into(out, input, &input.findings[at as usize]);
+                // The id where a fix can be applied by it (D70), on its own line.
+                if input.fixes == Fixes::Command
+                    && !input.findings[at as usize].fix.is_empty()
+                    && let Some(id) = input.ids.get(at as usize).filter(|id| !id.is_empty())
+                {
+                    out.str("  fix: blaze check --fix ").str(id).str("\n");
+                }
             }
             return Ok(());
         }
@@ -463,6 +476,8 @@ pub struct Closing<'a> {
     pub changed: Option<u32>,
     /// Whether this command can apply fixes: only then does the line count the fixable.
     pub fixes: Fixes,
+    /// What `--fix` is given to apply them (D70): the one fix's id, or `all`; empty for none.
+    pub fix_with: &'a str,
 }
 
 /// What an incomplete command checked and what it did not, each a list of stage words.
@@ -556,11 +571,16 @@ pub fn closing(out: &mut AString<'_>, closing: &Closing<'_>, caps: Caps) {
     }
     // A fix is claimed only where this command can apply it.
     if counts.fixable > 0 && closing.fixes == Fixes::Command && fits {
-        fits = part(&mut pen, digits(counts.fixable) + 27, &|pen| {
+        let with = closing.fix_with.len() as u32 + u32::from(!closing.fix_with.is_empty());
+        fits = part(&mut pen, digits(counts.fixable) + 27 + with, &|pen| {
             pen.style(Style::DIM);
             pen.out.int(counts.fixable);
             pen.cols += digits(counts.fixable);
             pen.put(Style::DIM, " fixable: blaze check --fix", 27);
+            if !closing.fix_with.is_empty() {
+                pen.put(Style::DIM, " ", 1);
+                pen.put(Style::DIM, closing.fix_with, with - 1);
+            }
         });
     }
     let files = if closing.checked == 1 { " file checked" } else { " files checked" };

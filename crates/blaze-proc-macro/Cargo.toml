@@ -54,6 +54,8 @@ blaze-fetch.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
+# `clang_shelf`: the pinned C toolchain's archive fetched over HTTPS, streamed (D69).
+blaze-http.workspace = true
 # A test's table of source corrections, read with the lexer's scalar width.
 blaze-lex.workspace = true
 # The example's check that an expansion's output outlines as items.

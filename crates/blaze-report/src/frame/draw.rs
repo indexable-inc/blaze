@@ -932,17 +932,22 @@ fn footer(pen: &mut Pen<'_, '_>, frame: &Frame<'_, '_>, input: &Input<'_>, group
     let room = caps.width();
     let mut first = true;
     let offered = group.iter().any(|&at| !input.findings[at as usize].fix.is_empty());
-    let words = match input.fixes {
+    // The fix's id where the caller gave ids (D70): the command that applies this one fix.
+    let id = group.iter().find(|&&at| !input.findings[at as usize].fix.is_empty()).and_then(|&at| input.ids.get(at as usize)).filter(|id| !id.is_empty());
+    let words = match (input.fixes, id) {
+        (Fixes::Command, Some(_)) if offered => Some("fix: blaze check --fix "),
         // One command fixes it only when it is the input's one fix.
-        Fixes::Command if counts.fixable == 1 && offered => Some("fix: blaze check --fix"),
-        Fixes::ByHand if offered => Some("apply by hand"),
+        (Fixes::Command, None) if counts.fixable == 1 && offered => Some("fix: blaze check --fix"),
+        (Fixes::ByHand, _) if offered => Some("apply by hand"),
         _ => None,
     };
+    let id = id.filter(|_| input.fixes == Fixes::Command).copied().unwrap_or("");
     if let Some(words) = words
-        && pen.cols + 1 + words.len() as u32 <= room
+        && pen.cols + 1 + (words.len() + id.len()) as u32 <= room
     {
         pen.spaces(1);
         pen.put(Style::DIM, words, words.len() as u32);
+        pen.put(Style::DIM, id, id.len() as u32);
         first = false;
     }
     for (index, &at) in group.iter().enumerate() {

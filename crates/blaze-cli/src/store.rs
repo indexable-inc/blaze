@@ -55,8 +55,13 @@ pub trait Store {
 /// The project's store, under the checkout.
 const PACKS: &str = ".blaze/v2/packs";
 /// The machine store, under the user's home (remote-read.md, "One chain of stores"): records
-/// this machine computed whose key holds nothing of a project. Beneath [`HOME_FOLDER`].
+/// this machine computed whose key holds nothing of a project. Beneath [`HOME_FOLDER`]. The
+/// only store an origin is sealed from (remote-read.md, "Shared across worktrees").
 pub(crate) const SHARED: &str = "v2/shared";
+/// The user's own store, under the same home: every other drive record of every project and
+/// every worktree on this machine, found by key whoever made it (remote-read.md, "Shared across
+/// worktrees (2026-11-16)"). Never sealed into an origin, never read by anything but this user.
+pub(crate) const OWN: &str = "v2/own";
 /// blaze's folder in the user's home, made by the first file made in it.
 const HOME_FOLDER: &str = ".blaze";
 /// A store's record of the boot its packs were last known whole in, in its folder.
@@ -96,8 +101,12 @@ pub(crate) enum StorePlant {
     VerifySkipped,
     /// A pack vouches for itself: its index matching its name stands for the boot record.
     SelfVouching,
-    /// The chain puts every record in the machine store, a project's too ([`Layered`]).
+    /// The chain puts every record in the public machine store ([`SHARED`]), a project's too
+    /// ([`Layered`]).
     PrivateIntoMachine,
+    /// The chain puts a record about the checkout (a certificate, a page) in the user's own
+    /// store ([`OWN`]), where another checkout would take it as its own answer.
+    CheckoutIntoOwn,
 }
 
 /// A pack's index, read once at the open: rows sorted by key.
@@ -484,6 +493,37 @@ impl PackStore {
         drop(old);
         Ok(())
     }
+
+    /// Every record the open's packs hold, once a key, sorted by key, each read whole into
+    /// `scratch` and handed to `each`: what an origin is sealed from (remote-read.md, "One chain
+    /// of stores": the public machine store only). A pack read short is refused by name; one a
+    /// merge removed since the open is skipped (its records are in the merge's pack, which the
+    /// next open lists).
+    pub(crate) fn each_record(&self, cx: &Cx, scratch: &bstd::mem::Frame, each: &mut dyn FnMut(Key, &[u8]) -> Result<(), CliError>) -> Result<u32, CliError> {
+        let mut rows: std::vec::Vec<(Key, usize, u64, u32), Global> = std::vec::Vec::new_in(Global);
+        for (at, (_, pack)) in self.packs.iter().enumerate() {
+            rows.extend(pack.rows.iter().map(|(key, offset, len)| (*key, at, *offset, *len)));
+        }
+        rows.sort_by_key(|row| row.0);
+        rows.dedup_by_key(|row| row.0);
+        let mut handed = 0u32;
+        for (key, at, offset, len) in rows.iter() {
+            let pack = &self.packs[*at].1;
+            let mut bytes = Bytes::new_in(scratch, "a record sealed into an origin");
+            let read = pack.file.read_at(cx, *offset, *len as usize, &mut bytes);
+            if matches!(read, Ok(_)) && bytes.len() == *len as usize {
+                each(*key, bytes.as_slice())?;
+                handed += 1;
+                continue;
+            }
+            if pack.removed(cx)? {
+                continue;
+            }
+            read?;
+            return Err(CliError::Text { what: "a pack of the machine store is shorter than its index" });
+        }
+        Ok(handed)
+    }
 }
 
 /// A pack's bytes from records sorted by key: each payload at an 8-aligned offset, the
@@ -773,18 +813,39 @@ impl HttpOrigin<'_> {
     }
 }
 
-/// Which records belong in the machine store (remote-read.md, "One chain of stores"): the one
-/// seam where the choice is made (rule 78). The command's is [`ToolchainCrates`].
+/// Where a record is put (remote-read.md, "Shared across worktrees (2026-11-16)"). A get looks
+/// in every store of the chain whatever the place: the place decides only where it is written,
+/// and so who else finds it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Place {
+    /// The checkout's own store: what is about this checkout and no other (a certificate that
+    /// this request was answered over these files, its pages, a unit's sources fetched into this
+    /// checkout's folder).
+    Checkout,
+    /// The user's own store under the home ([`OWN`]): a record keyed by text alone, found by
+    /// every project and worktree of this user on this machine; never sealed into an origin.
+    Own,
+    /// The public machine store ([`SHARED`]): a record whose names are all public (target.md,
+    /// "Namespaces"); the only store an origin is sealed from.
+    Public,
+}
+
+/// Where records go (remote-read.md, "One chain of stores", "Shared across worktrees"): the
+/// one seam where the choice is made (rule 78). The command's is [`ToolchainCrates`].
 pub trait Sharing {
     /// The crates whose records hold nothing of a project, by their `CrateScope` subjects.
     fn add_public(&mut self, subjects: &[ContentId]);
-    /// Whether `bytes`, a record about to be put, belongs in the machine store.
-    fn shared(&self, bytes: &[u8]) -> bool;
+    /// Where `bytes`, a record about to be put, belongs.
+    fn place(&self, bytes: &[u8]) -> Place;
 }
 
-/// A drive record is public when its name and every name it reads are the `CrateScope` of a
-/// toolchain crate (target.md, "Namespaces"). Anything else, a certificate, a root, a page or
-/// a record that read one checkout file, stays the project's.
+/// A drive record is [`Place::Public`] when its name and every name it reads are the
+/// `CrateScope` of a public crate (the toolchain's, a checksummed registry archive's: target.md,
+/// "Namespaces"); any other drive record is [`Place::Own`]: its key is from text alone (rules 25
+/// and 71: no path of the checkout, no stamp), so another worktree with the same text finds it.
+/// A `Fetch` record stands for this checkout's sources folder (fetch.rs `SOURCES`), so it is
+/// [`Place::Checkout`] until that folder is the home's; so is anything not a drive record (a
+/// certificate, a root, a page).
 pub struct ToolchainCrates {
     /// Sorted, without repeats.
     subjects: std::vec::Vec<ContentId, Global>,
@@ -803,13 +864,18 @@ impl Sharing for ToolchainCrates {
         self.subjects.dedup();
     }
 
-    fn shared(&self, bytes: &[u8]) -> bool {
+    fn place(&self, bytes: &[u8]) -> Place {
         let public = |name: Name| name.kind == Kind::CrateScope && self.subjects.binary_search(&name.subject).is_ok();
-        match blaze_drive::record::open(bytes) {
-            Ok(Stored::Whole(view)) => public(view.name) && view.reads().all(|(name, _)| public(name)),
-            Ok(Stored::Shape(view)) => public(view.name) && view.names().all(public),
-            // Not a drive record (a certificate, a root, a page): the project's.
-            Err(_) => false,
+        let (name, all_public) = match blaze_drive::record::open(bytes) {
+            Ok(Stored::Whole(view)) => (view.name, public(view.name) && view.reads().all(|(name, _)| public(name))),
+            Ok(Stored::Shape(view)) => (view.name, public(view.name) && view.names().all(public)),
+            // Not a drive record (a certificate, a root, a page): the checkout's.
+            Err(_) => return Place::Checkout,
+        };
+        match (name.kind, all_public) {
+            (Kind::Fetch, _) => Place::Checkout,
+            (_, true) => Place::Public,
+            (_, false) => Place::Own,
         }
     }
 }
@@ -860,12 +926,17 @@ impl Machine {
 /// origin unreadable, late, refused, short) is a typed miss: one line on stderr says what and
 /// why for each kind, and the request computes the record locally. That is not a fallback
 /// (remote-read.md, "Not fetched"): the local computation is the record's definition and the
-/// origin a cache of it byte for byte, so both routes give equal bytes. A put goes to the
-/// machine store when [`Sharing`] says the record holds nothing of a project, else to the
-/// project's: the machine store holds only what this machine computed.
+/// origin a cache of it byte for byte, so both routes give equal bytes. A put goes where
+/// [`Sharing::place`] says: the public machine store, the user's own store (every other record
+/// keyed by text, found by every worktree), or the checkout's (what is about this checkout).
+/// The machine stores hold only what this machine computed; with no home, all is the
+/// checkout's.
 pub struct Layered<'r, S: Sharing = ToolchainCrates> {
     local: PackStore,
+    /// [`SHARED`]: public records only.
     machine: Option<PackStore>,
+    /// [`OWN`]: this user's records of any project, opened beside `machine`.
+    own: Option<PackStore>,
     sharing: S,
     plant: StorePlant,
     err: &'r Out,
@@ -904,7 +975,7 @@ impl<'r> Layered<'r, ToolchainCrates> {
         let home = match machine {
             Machine::Home(home) => Some(home),
             Machine::Off(why) => {
-                err.line(cx, format_args!("blaze: machine store off: {why}; the toolchain's records are kept in the project's store"))?;
+                err.line(cx, format_args!("blaze: machine store off: {why}; every record is kept in the project's store, found by no other worktree"))?;
                 None
             }
         };
@@ -920,17 +991,18 @@ impl<'r, S: Sharing> Layered<'r, S> {
         if local.refused > 0 {
             err.line(cx, format_args!("blaze: {} torn pack(s) under {PACKS} (a crash while one was written?): removed; their records are made again", local.refused))?;
         }
-        let machine = match home {
-            Some(home) => {
-                let machine = PackStore::open_in(cx, home, SHARED, boot, packs_most, plant)?;
-                if machine.refused > 0 {
-                    err.line(cx, format_args!("blaze: {} torn pack(s) under the home's {SHARED} (a crash while one was written?): removed; their records are made again", machine.refused))?;
+        let mut machines = [None, None];
+        if let Some(home) = home {
+            for (at, folder) in [SHARED, OWN].into_iter().enumerate() {
+                let store = PackStore::open_in(cx, home, folder, boot, packs_most, plant)?;
+                if store.refused > 0 {
+                    err.line(cx, format_args!("blaze: {} torn pack(s) under the home's {folder} (a crash while one was written?): removed; their records are made again", store.refused))?;
                 }
-                Some(machine)
+                machines[at] = Some(store);
             }
-            None => None,
-        };
-        Ok(Layered { local, machine, sharing, plant, err, machine_found: 0, machine_put: 0, remote })
+        }
+        let [machine, own] = machines;
+        Ok(Layered { local, machine, own, sharing, plant, err, machine_found: 0, machine_put: 0, remote })
     }
 }
 
@@ -973,11 +1045,11 @@ impl<S: Sharing> Store for Layered<'_, S> {
         if self.local.get_into(cx, key, into)? {
             return Ok(true);
         }
-        if let Some(machine) = &mut self.machine
-            && machine.get_into(cx, key, into)?
-        {
-            self.machine_found += 1;
-            return Ok(true);
+        for store in [&mut self.machine, &mut self.own].into_iter().flatten() {
+            if store.get_into(cx, key, into)? {
+                self.machine_found += 1;
+                return Ok(true);
+            }
         }
         let Some(remote) = &mut self.remote else { return Ok(false) };
         let began = remote.now_ns();
@@ -1010,34 +1082,50 @@ impl<S: Sharing> Store for Layered<'_, S> {
     }
 
     fn put(&mut self, cx: &Cx, key: Key, bytes: &[u8]) -> Result<(), CliError> {
-        let shared = self.plant == StorePlant::PrivateIntoMachine || self.sharing.shared(bytes);
-        match (&mut self.machine, shared) {
-            (Some(machine), true) => {
+        let place = match (self.plant, self.sharing.place(bytes)) {
+            (StorePlant::PrivateIntoMachine, _) => Place::Public,
+            (StorePlant::CheckoutIntoOwn, Place::Checkout) => Place::Own,
+            (_, place) => place,
+        };
+        let store = match place {
+            Place::Public => self.machine.as_mut(),
+            Place::Own => self.own.as_mut(),
+            Place::Checkout => None,
+        };
+        match store {
+            Some(store) => {
                 self.machine_put += 1;
-                machine.put(cx, key, bytes)
+                store.put(cx, key, bytes)
             }
-            _ => self.local.put(cx, key, bytes),
+            // No home: every record is the checkout's.
+            None => self.local.put(cx, key, bytes),
         }
     }
 
-    /// Both stores before anything names their records: the answer's pointer names project
-    /// records whose reads may be the machine store's.
+    /// Every store before anything names their records: the answer's pointer names checkout
+    /// records whose reads may be the machine stores'.
     fn seal(&mut self, cx: &Cx) -> Result<(), CliError> {
-        if let Some(machine) = &mut self.machine {
-            machine.seal(cx)?;
+        for store in [&mut self.machine, &mut self.own].into_iter().flatten() {
+            store.seal(cx)?;
         }
         self.local.seal(cx)
     }
 
     fn after_answer(&mut self, cx: &Cx, profile: &mut Profile) -> Result<(), CliError> {
         self.local.after_answer(cx, profile)?;
-        if let Some(machine) = &mut self.machine {
-            machine.after_answer(cx, profile)?;
+        if self.machine.is_some() || self.own.is_some() {
+            let (mut packs, mut read_whole) = (0usize, 0u32);
+            for store in [&mut self.machine, &mut self.own].into_iter().flatten() {
+                store.after_answer(cx, profile)?;
+                packs += store.packs.len();
+                read_whole = read_whole.saturating_add(store.verified);
+            }
             // Facts of the run, not news: the profile's rows (and `--stats`), never plain stderr.
+            // Both machine stores together: found and written in either.
             profile.machine_found = self.machine_found;
             profile.machine_put = self.machine_put;
-            profile.machine_packs = u32::try_from(machine.packs.len()).unwrap_or(u32::MAX);
-            profile.machine_read_whole = machine.verified;
+            profile.machine_packs = u32::try_from(packs).unwrap_or(u32::MAX);
+            profile.machine_read_whole = read_whole;
         }
         if let Some(remote) = &self.remote {
             let r = remote.reader.report();
@@ -1070,6 +1158,11 @@ impl<S: Sharing> Store for Layered<'_, S> {
 #[cfg(test)]
 #[path = "store_http_tests.rs"]
 mod http_tests;
+
+/// Two worktrees on one home (remote-read.md, "Shared across worktrees (2026-11-16)").
+#[cfg(test)]
+#[path = "store_worktree_tests.rs"]
+mod worktree_tests;
 
 /// The pack store's proof (rule 43): simulations, never review. Each record's bytes are a
 /// function of its key, so any bytes a get returns are checked without a model. A witness
@@ -1224,15 +1317,25 @@ mod tests {
         caught(StorePlant::SelfVouching, "store oracle");
     }
 
-    /// The chain's test sharing: a record is public when its length is even, a function of
-    /// its key, so the oracle knows which store each belongs in.
+    /// The chain's test sharing: a record's place is a function of its length, so of its key,
+    /// so the oracle knows which store each belongs in.
     struct EvenLengths;
+
+    /// Public when even; the user's own when one past a multiple of four; the checkout's when
+    /// three past.
+    fn place_of(len: usize) -> Place {
+        match len % 4 {
+            0 | 2 => Place::Public,
+            1 => Place::Own,
+            _ => Place::Checkout,
+        }
+    }
 
     impl Sharing for EvenLengths {
         fn add_public(&mut self, _subjects: &[ContentId]) {}
 
-        fn shared(&self, bytes: &[u8]) -> bool {
-            bytes.len() % 2 == 0
+        fn place(&self, bytes: &[u8]) -> Place {
+            place_of(bytes.len())
         }
     }
 
@@ -1258,13 +1361,19 @@ mod tests {
         }
     }
 
-    /// The machine store as another command finds it: no record of a project in it.
+    /// The machine stores as another command finds them: no record of a project in the public
+    /// one, no record about a checkout in the user's own.
     fn machine_alone(cx: &Cx, home: &Dir<ReadWrite>, boot: Boot, plant: StorePlant) -> Result<(), CliError> {
         let mut machine = PackStore::open_in(cx, home, SHARED, boot, 2, plant)?;
+        let mut own = PackStore::open_in(cx, home, OWN, boot, 2, plant)?;
         for k in 0..KEYS {
             let mut into = Bytes::new_in(cx.frame(), "a machine record read back");
             if machine.get_into(cx, key(k), &mut into)? {
-                assert!(payload(k).len() % 2 == 0, "machine oracle: key {k}, a project's record, is in the machine store");
+                assert!(place_of(payload(k).len()) == Place::Public, "machine oracle: key {k}, a project's record, is in the machine store");
+            }
+            let mut into = Bytes::new_in(cx.frame(), "an own record read back");
+            if own.get_into(cx, key(k), &mut into)? {
+                assert!(place_of(payload(k).len()) == Place::Own, "own oracle: key {k}, placed {:?}, is in the user's own store", place_of(payload(k).len()));
             }
         }
         Ok(())
@@ -1344,6 +1453,13 @@ mod tests {
     #[test]
     fn the_chain_oracle_catches_a_project_record_in_the_machine_store() {
         chain_caught(StorePlant::PrivateIntoMachine, "machine oracle");
+    }
+
+    /// A certificate in the user's own store would answer another checkout from this one's
+    /// leaf table: the own store's oracle must see it.
+    #[test]
+    fn the_chain_oracle_catches_a_checkout_record_in_the_own_store() {
+        chain_caught(StorePlant::CheckoutIntoOwn, "own oracle");
     }
 
     /// The machine store's packs are published unsynced like the project's: taking one from

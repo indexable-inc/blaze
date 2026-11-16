@@ -19,16 +19,25 @@
 //!   every other obligation: a hidden type that
 //!   lacks a bound is the solver's E0277 naming that bound. `Sized` is among them (the head
 //!   adds it unless `?Sized` is written).
-//! - An `async fn` is not lowered here: its body has `CoroutineKind::Async { output }` and is
-//!   checked against the written `T`; its hidden type is the body's own future, which the head's
-//!   bounds (`Future<Output = T>`) describe by construction.
+//! - An `async fn` (the Reference, "Async functions": `async fn f(x: A) -> T { body }` "is
+//!   roughly equivalent to" `fn f(x: A) -> impl Future<Output = T> { async move { body } }`):
+//!   blaze-lower makes the root that `async move` block (desugar.rs `async_fn`), so the fn
+//!   defines its `impl Future` as any other opaque: the hidden type is the block's future
+//!   (`TyView::Future`), and the block's output is the written `T` (`async_fn_output`), so a
+//!   wrong returned value is E0308 at the value. A body marked async whose root is not an
+//!   async block (hand-built fixtures) is still checked against the written `T` directly.
+//! - Each defined opaque's hidden type is written to the record (`Checked::hidden`, by
+//!   writeback through `defined_hidden`).
 //!
-//! Owed: the hidden types are not yet written to `Checked` (writeback), so the world still
-//! answers `opaque_hidden` with `None` and an auto-trait goal on an opaque (`Send`) stays
-//! ambiguous (blaze-solve structural.rs: "ambiguous until it does").
+//! Owed: the world does not yet answer `opaque_hidden` from `Checked::hidden` (blaze-ladder
+//! front2 world_items.rs), so a CALLER's auto-trait goal on an opaque (`Send`) stays ambiguous
+//! in the solver (blaze-solve structural.rs: "ambiguous until it does") and is the typed gap
+//! of `opaque_ambiguity_gap`. That gap is `CheckError::Unported(&'static str)`: it cannot name
+//! the opaque's key; the variant wanted is `OpaqueHiddenUnknown { opaque, trait_ }` (not
+//! additive: blaze-real's and blaze-ladder's matches on `CheckError` are exhaustive).
 
 use crate::error::Stop;
-use crate::ids::ItemKey;
+use crate::ids::{ExprId, ItemKey};
 use crate::machine::{Lower, Machine};
 use crate::portable::{PTy, PTys};
 use crate::ty::{Cause, Goal, Ty, TypeCtx};
@@ -46,6 +55,47 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         let got = self.lower_sig_ty(types, t);
         self.opening = false;
         got
+    }
+
+    /// Whether this body is an `async fn`'s in the Reference's form ("Async functions":
+    /// `async fn f(x: A) -> T { body }` "is roughly equivalent to" `fn f(x: A) -> impl
+    /// Future<Output = T> { async move { body } }`): marked async, its root the async block.
+    pub(crate) fn async_root(&mut self) -> Result<bool, Stop> {
+        if self.body.coroutine.is_none() {
+            return Ok(false);
+        }
+        Ok(matches!(self.body.expr(self.body.root)?, crate::body::Expr::AsyncBlock { .. }))
+    }
+
+    /// The output of the async block `e`, when `e` is the root block of an `async fn` (see
+    /// [`Self::async_root`]): the fn's WRITTEN return type, so a returned value of another type
+    /// is E0308 at that value, not a failed `Future<Output = T>` bound at the block. An opaque
+    /// the written type names (`async fn f() -> impl Tr`) is this body's to define too: it is
+    /// lowered as its hidden-type variable, the same variable the `Output = ..` bound names.
+    pub(crate) fn async_fn_output(&mut self, e: ExprId) -> Result<Option<Ty>, Stop> {
+        if e != self.body.root || !self.async_root()? {
+            return Ok(None);
+        }
+        let Some(crate::body::CoroutineKind::Async { output }) = self.body.coroutine else { return Ok(None) };
+        self.opening = true;
+        let got = self.lower_body_ty(output, crate::diag::At::Expr(e));
+        self.opening = false;
+        Ok(Some(got?))
+    }
+
+    /// Each opaque this body defined with its hidden type, for the record (`Checked::hidden`),
+    /// in the order the opaques were met in the signature. An opaque whose hidden type is still
+    /// an inference variable (a body that never returns, or one with errors) has no row.
+    pub(crate) fn defined_hidden(&mut self) -> Result<blaze_own::Vec<(ItemKey, Ty), blaze_own::Alloc<'a>>, crate::error::CheckError> {
+        let mut out: blaze_own::Vec<(ItemKey, Ty), blaze_own::Alloc<'a>> = blaze_own::Vec::with_capacity_in(self.defining.len(), self.alloc);
+        for i in 0..self.defining.len() {
+            let (k, v) = self.defining[i];
+            let t = self.ty.resolve(v)?;
+            if !self.is_ty_var(t) && !self.is_err(t) {
+                out.push((k, t));
+            }
+        }
+        Ok(out)
     }
 
     /// The hidden-type variable of the opaque `k` this body defines, made on first use.
@@ -75,18 +125,25 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// A goal left ambiguous whose self type is an opaque: its hidden type is not recorded (the
     /// world answers `opaque_hidden` with `None`), so an auto trait of it (`Send`, which "leaks"
     /// from the hidden type) has no answer yet. A typed gap naming the form, never E0283.
-    pub(crate) fn opaque_ambiguity_gap(&mut self, goal: Goal) -> Option<crate::error::CheckError> {
-        let Goal::Trait { args, .. } = goal else { return None };
+    ///
+    /// Only an AUTO trait is the gap (the Reference, "Abstract return types": the caller "may
+    /// only use the methods declared by the specified Trait", auto traits excepted: they are
+    /// read from the hidden type): any other ambiguous trait goal on an opaque is decided from
+    /// its bounds alone, so its ambiguity is the ordinary E0283.
+    pub(crate) fn opaque_ambiguity_gap(&mut self, goal: Goal) -> Result<Option<crate::error::CheckError>, Stop> {
+        let Goal::Trait { trait_, args } = goal else { return Ok(None) };
         if self.ty.list_len(args) == 0 {
-            return None;
+            return Ok(None);
         }
         let this = self.ty.shallow_resolve(self.ty.list_get(args, 0));
-        match self.view(this) {
-            crate::ty::TyView::Opaque(..) => {
-                Some(crate::error::CheckError::Unported("an auto trait of an opaque type: its hidden type is not recorded yet"))
-            }
-            _ => None,
+        if !matches!(self.view(this), crate::ty::TyView::Opaque(..)) {
+            return Ok(None);
         }
+        let auto = match self.reads.trait_def(trait_)? {
+            Some(def) => def.flags.0 & crate::world::TraitFlags::AUTO != 0,
+            None => false,
+        };
+        Ok(auto.then_some(crate::error::CheckError::Unported("an auto trait of an opaque type: its hidden type is not recorded yet")))
     }
 
     fn close_one(&mut self, k: ItemKey, cause: Cause) -> Result<(), Stop> {

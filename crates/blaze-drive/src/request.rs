@@ -2926,7 +2926,19 @@ impl<'a> Request<'a> {
                     }
                     entry
                 }
-                false => old.next().expect("peeked"),
+                false => {
+                    let (name, mut held) = old.next().expect("peeked");
+                    // A part whose record stands (its text unchanged, so it did not run) keeps
+                    // its findings, item-relative; where they print is its start in its file
+                    // today, which an edit above it moves: its home's parts, settled this run,
+                    // say where. A file's findings are placed in its own text, from 0.
+                    if name.kind != Kind::FileItems
+                        && let Some((_, place, _)) = self.part_locs.get(&name)
+                    {
+                        held.place = *place;
+                    }
+                    (name, held)
+                }
             };
             if !held.findings.is_empty() && !self.dropped.contains(&name) {
                 merged.push((name, held));

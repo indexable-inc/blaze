@@ -167,6 +167,7 @@ extern crate std;
 mod digest;
 mod flags;
 mod header;
+pub mod nested;
 mod skeleton;
 mod split;
 mod walk;

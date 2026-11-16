@@ -1,0 +1,4 @@
+[package]
+name = "ladder-x-iter-02-map-filter-sum"
+version = "0.1.0"
+edition = "blaze-2026.11"

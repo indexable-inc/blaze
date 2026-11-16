@@ -1,0 +1,180 @@
+//! `let` in a condition and `let`-`else`: `if let`, `while let` (the lowering's `loop { if
+//! COND BODY else { break } }`, blaze-lower desugar.rs `while_loop`, so it is an `if let`
+//! here), let chains, and `let P = e else { .. };`. Each `let` is one arm of walk/matches.rs's
+//! match by tests: its pattern's tests on the scrutinee's place (`test_pat`), a failure to the
+//! `else`, then its bindings from the place (`bind_tested`). Rules from the Reference:
+//! - "If expressions", "if let": "If the value of the scrutinee matches the pattern, the
+//!   corresponding block will execute. Otherwise, flow proceeds to the following `else` block
+//!   if it exists."
+//! - "If expressions", chains of conditions (edition 2024): "Multiple condition operands can
+//!   be separated with `&&`"; "each operand is evaluated from left-to-right until an operand
+//!   evaluates as `false` or a `let` match fails, in which case the subsequent operands are
+//!   not evaluated"; "The bindings of each pattern are put into scope to be available for the
+//!   next condition operand and the consequent block." A chain is flattened into its links in
+//!   order; every failed link jumps to the one `else` block.
+//! - "let statements", let-else: "If the pattern does not match (this requires it to be
+//!   refutable), the `else` block is executed. The `else` block must always diverge (evaluate
+//!   to the never type)"; its bindings are the enclosing block's, made where the pattern
+//!   matched.
+//! - "Temporary scopes": "The pattern-matching condition(s) and consequent body of `if`", "The
+//!   pattern-matching condition and loop body of `while`".
+//!
+//! Nothing here needs a drop flag, so nothing is dropped on a failed link: a binding by value
+//! of a part that needs drop is refused by `bind_tested` (so no earlier link holds one), a
+//! scrutinee temporary that needs drop is refused by `tested_place`, and a borrowed temporary
+//! that needs drop in a condition is refused by walk/temps.rs `hold_temp`; in a `let`-`else`
+//! initializer it is refused here (`let_else_test`), since its drop around the `else` block is
+//! not built.
+
+use core::alloc::Allocator;
+
+use blaze_lir::Block;
+use blaze_own::Vec;
+use blaze_typeck::{BinOp, Expr, ExprId, Stmt, StmtId};
+
+use super::{Held, Task, Walk, malformed, unsupported};
+use crate::BuildError;
+
+impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
+    /// Whether `if` condition `cond` holds a `let`: alone or as a link of an `&&` chain.
+    pub(super) fn cond_has_let(&self, cond: ExprId) -> Result<bool, BuildError> {
+        let mut todo: Vec<ExprId, A> = Vec::new_in(self.alloc.clone());
+        todo.push(cond);
+        while let Some(x) = todo.pop() {
+            match self.expr(x)? {
+                Expr::Let { .. } => return Ok(true),
+                Expr::Binary { op: BinOp::And, lhs, rhs } => {
+                    todo.push(lhs);
+                    todo.push(rhs);
+                }
+                _ => {}
+            }
+        }
+        Ok(false)
+    }
+
+    /// `if` expression `e` whose condition holds a `let`: its links in order (a `let`'s
+    /// scrutinee, then its tests and bindings; a `bool`, then its branch), each failure to
+    /// the `else` block; then the consequent and the `else` as walk.rs `Task::IfThen` builds
+    /// them.
+    pub(super) fn if_let(&mut self, e: ExprId, cond: ExprId, then: ExprId, else_: Option<ExprId>) -> Result<(), BuildError> {
+        // `a && b && c` is `(a && b) && c`: the links left to right.
+        let mut links: Vec<ExprId, A> = Vec::new_in(self.alloc.clone());
+        let mut todo: Vec<ExprId, A> = Vec::new_in(self.alloc.clone());
+        todo.push(cond);
+        while let Some(x) = todo.pop() {
+            match self.expr(x)? {
+                Expr::Binary { op: BinOp::And, lhs, rhs } => {
+                    todo.push(rhs);
+                    todo.push(lhs);
+                }
+                _ => links.push(x),
+            }
+        }
+        let else_block = self.create();
+        let join = self.create();
+        self.work.push(Task::IfThen { expr: e, else_, else_block, join });
+        self.work.push(Task::Eval(then));
+        for &x in links.iter().rev() {
+            match self.expr(x)? {
+                Expr::Let { init, .. } => {
+                    self.work.push(Task::LetLink { expr: x, fail: else_block });
+                    self.push_scrutinee(init)?;
+                }
+                _ => {
+                    self.work.push(Task::CondLink(else_block));
+                    self.work.push(Task::Eval(x));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A `let`'s scrutinee as walk.rs's `match` pushes one: a local that needs drop is a
+    /// place expression, matched in place, not moved.
+    fn push_scrutinee(&mut self, init: ExprId) -> Result<(), BuildError> {
+        let mut s = init;
+        while let Expr::Paren(inner) = self.expr(s)? {
+            s = inner;
+        }
+        match self.expr(s)? {
+            Expr::Local(p) if self.owned[p.ix()].is_some() && self.adjust_rows(init).is_empty() => {
+                self.work.push(Task::Place(s));
+            }
+            _ => self.work.push(Task::Eval(init)),
+        }
+        Ok(())
+    }
+
+    /// `Task::LetLink`: `let` expression `l`'s scrutinee on top; its tests, a failure to
+    /// `fail`; its bindings in the block where it matched, for the later links and the body.
+    pub(super) fn let_link(&mut self, l: ExprId, fail: Block) -> Result<(), BuildError> {
+        let Expr::Let { pat, init } = self.expr(l)? else { return Err(malformed("a `let` link's task on another expression")) };
+        let s = self.pop()?;
+        let srepr = self.adjusted_repr(init)?;
+        let at = self.tested_place(init, s, srepr, "an `if let` or `while let` on a temporary that needs drop (its drop point is not built)")?;
+        let pass = self.create();
+        self.test_pat(pat, at, pass, fail)?;
+        self.begin(pass);
+        self.bind_tested(pat, at)
+    }
+
+    /// `Task::CondLink`: a `bool` link's value on top; false to `fail`.
+    pub(super) fn cond_link(&mut self, fail: Block) -> Result<(), BuildError> {
+        let v = self.pop()?;
+        let c = self.cond(v)?;
+        let next = self.create();
+        self.br(c, (next, &[]), (fail, &[]));
+        self.begin(next);
+        Ok(())
+    }
+
+    /// `let P = init else { .. };` (statement `s`): its scrutinee, then `Task::LetElse`.
+    pub(super) fn let_else(&mut self, s: StmtId, init: ExprId) -> Result<(), BuildError> {
+        self.work.push(Task::LetElse(s));
+        self.push_scrutinee(init)
+    }
+
+    /// `Task::LetElse`: statement `s`'s scrutinee on top. The tests; on a match the bindings,
+    /// then on to a block the rest of the enclosing block continues in; on a failure the
+    /// `else` block, which diverges (`Task::LetElseEnd`).
+    pub(super) fn let_else_test(&mut self, s: StmtId) -> Result<(), BuildError> {
+        let stmt = self.body.stmts.get(s.ix()).copied().ok_or(malformed("a statement past `stmts`"))?;
+        let Stmt::Let { pat, init: Some(init), else_: Some(els), .. } = stmt else {
+            return Err(malformed("a `let`-`else` task on another statement"));
+        };
+        // A borrowed temporary of the initializer that needs drop joined the statement's
+        // temporaries (walk/temps.rs `hold_temp`): its drop around the `else` block is not built.
+        let mark = *self.temp_marks.last().ok_or(malformed("a `let`-`else` outside a statement"))? as usize;
+        let held = self.scope_pats.get(mark..).ok_or(malformed("a statement's temporaries mark past `scope_pats`"))?;
+        if held.iter().any(|h| matches!(h, Held::Rest { .. })) {
+            return Err(unsupported(
+                init,
+                "a borrowed temporary whose type needs drop in a `let`-`else` initializer (its drop around the `else` block is not built)",
+            ));
+        }
+        let v = self.pop()?;
+        let srepr = self.adjusted_repr(init)?;
+        let at = self.tested_place(init, v, srepr, "a `let`-`else` on a temporary that needs drop (its drop point is not built)")?;
+        let pass = self.create();
+        let fail = self.create();
+        self.test_pat(pat, at, pass, fail)?;
+        self.begin(pass);
+        self.bind_tested(pat, at)?;
+        let cont = self.create();
+        self.jump(cont, &[]);
+        self.begin(fail);
+        self.work.push(Task::LetElseEnd(cont));
+        self.work.push(Task::Eval(els));
+        Ok(())
+    }
+
+    /// `Task::LetElseEnd`: the `else` block's value (of type `!`) on top; nothing follows it,
+    /// and the statement goes on in `cont`.
+    pub(super) fn let_else_end(&mut self, cont: Block) -> Result<(), BuildError> {
+        self.pop()?;
+        self.b.unreachable();
+        self.begin(cont);
+        Ok(())
+    }
+}

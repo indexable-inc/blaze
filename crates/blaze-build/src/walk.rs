@@ -27,8 +27,11 @@ mod closure;
 pub(crate) use closure::closures_in;
 
 mod casts;
+mod lets;
+mod matches;
 mod numbers;
 mod strs;
+mod temps;
 
 /// The target's pointer width: the ladder runs on AArch64.
 const PTR_BITS: u32 = 64;
@@ -244,6 +247,8 @@ struct MatchState {
     by_ref: bool,
     /// By value on an enum that needs drop: who holds what the arms do not move.
     owner: Owner,
+    /// A match by tests (walk/matches.rs): the scrutinee's place each arm tests and binds from.
+    tested: Option<matches::At>,
 }
 
 #[derive(Clone, Copy)]
@@ -276,6 +281,8 @@ enum Task {
     DropValue(ExprId),
     /// The end of block `e`'s drop scope: its bindings dropped under its value.
     ScopeEnd(ExprId),
+    /// The end of a statement: its borrowed temporaries dropped (walk/temps.rs).
+    TempEnd,
     PushNone,
     /// Bind the value on top to the pattern; the expression it is of, for an aggregate built
     /// in a temporary of its own, which becomes the binding's home.
@@ -284,6 +291,16 @@ enum Task {
     If { expr: ExprId, then: ExprId, else_: Option<ExprId> },
     IfThen { expr: ExprId, else_: Option<ExprId>, else_block: Block, join: Block },
     IfElse { expr: ExprId, join: Block },
+    /// A `let` link of an `if` condition (walk/lets.rs): `let` expression `expr`, its
+    /// scrutinee on top; a failed test to `fail`.
+    LetLink { expr: ExprId, fail: Block },
+    /// A `bool` link of an `if` condition holding a `let`, its value on top; false to the
+    /// block given.
+    CondLink(Block),
+    /// `let`-`else` statement (walk/lets.rs), its scrutinee on top.
+    LetElse(StmtId),
+    /// The end of a `let`-`else`'s diverging block: the statement goes on in the block given.
+    LetElseEnd(Block),
     LoopEnd(ExprId),
     Break(ExprId, bool),
     Return(bool),
@@ -379,6 +396,11 @@ struct Walk<'x, 'c, 't, A: Allocator + Clone> {
     /// initializer, an arm's body, an edition-2024 block's tail), so a temporary made in it
     /// drops right after it.
     temp_scope_end: Vec<bool, A>,
+    /// Per expression: its parent (`NO_EXPR` for none) and whether the edge to it is
+    /// conditional, from `scan_flags` (walk/temps.rs finds a temporary's scope by it).
+    expr_parent: Vec<(u32, bool), A>,
+    /// Per statement being built: where its temporaries start in `scope_pats`.
+    temp_marks: Vec<u32, A>,
     /// Per pattern: the binding, if its type needs drop.
     owned: Vec<Option<Owned>, A>,
     /// Per pattern: whether a binding without a flag is initialized here.
@@ -603,6 +625,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         needs_flag,
         partial,
         temp_scope_end,
+        expr_parent: Vec::new_in(alloc.clone()),
+        temp_marks: Vec::new_in(alloc.clone()),
         owned,
         init,
         scope_pats: Vec::new_in(alloc.clone()),
@@ -2125,6 +2149,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     Expr::AssignOp { lhs, .. } => lhs.0 == c,
                     // A place expression: matched in place, its arms' moves are marked below.
                     Expr::Match { scrutinee, .. } => scrutinee.0 == c,
+                    // A `let` condition's scrutinee likewise (walk/lets.rs: nothing moves out).
+                    Expr::Let { init, .. } => init.0 == c,
                     _ => false,
                 };
             if in_place {
@@ -2144,6 +2170,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 c = up;
             }
         }
+        self.expr_parent = parent;
         Ok(())
     }
 
@@ -2834,17 +2861,19 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             Task::SpillAdjusted(e) => {
                 let v = self.pop()?;
                 let repr = self.adjusted_repr(e)?;
-                if self.repr_needs_drop(repr) {
-                    return Err(unsupported(e, "a borrowed temporary whose type needs drop"));
-                }
+                let drop = self.repr_needs_drop(repr);
                 let at = match v {
-                    V::Place(p, off) => (p, off),
+                    V::Place(p, off) if !drop || self.is_fresh(e)? => (p, off),
                     _ => {
                         let at = self.temp(repr);
                         self.store(v, repr, at)?;
                         at
                     }
                 };
+                // Dropped at its statement's end (walk/temps.rs).
+                if drop && self.live {
+                    self.hold_temp(e, at, repr)?;
+                }
                 self.vals.push(V::Place(at.0, at.1));
             }
             Task::Place(e) => self.place_of(e)?,
@@ -2879,6 +2908,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.scope_pats.truncate(mark);
                 self.vals.push(v);
             }
+            Task::TempEnd => self.temp_end()?,
             Task::PushNone => self.vals.push(V::None),
             Task::Let(p, init) => {
                 let v = self.pop()?;
@@ -2942,6 +2972,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 let v = self.join_param(repr);
                 self.vals.push(v);
             }
+            Task::LetLink { expr, fail } => self.let_link(expr, fail)?,
+            Task::CondLink(fail) => self.cond_link(fail)?,
+            Task::LetElse(s) => self.let_else_test(s)?,
+            Task::LetElseEnd(cont) => self.let_else_end(cont)?,
             Task::LoopEnd(e) => {
                 let t = self.targets.pop().filter(|t| t.expr == e).ok_or(malformed("a loop's target out of order"))?;
                 let header = t.header.ok_or(malformed("a loop without its head"))?;
@@ -3165,17 +3199,20 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             Task::Spill(e) => {
                 let v = self.pop()?;
                 let repr = self.expr_repr(e)?;
-                if self.repr_needs_drop(repr) {
-                    return Err(unsupported(e, "a borrowed temporary whose type needs drop"));
+                let drop = self.repr_needs_drop(repr);
+                let at = match v {
+                    V::Place(p, off) if !drop || self.is_fresh(e)? => (p, off),
+                    _ => {
+                        let at = self.temp(repr);
+                        self.store(v, repr, at)?;
+                        at
+                    }
+                };
+                // Dropped at its statement's end (walk/temps.rs).
+                if drop && self.live {
+                    self.hold_temp(e, at, repr)?;
                 }
-                if let V::Place(..) = v {
-                    self.vals.push(v);
-                } else {
-                    let repr = self.expr_repr(e)?;
-                    let at = self.temp(repr);
-                    self.store(v, repr, at)?;
-                    self.vals.push(V::Place(at.0, at.1));
-                }
+                self.vals.push(V::Place(at.0, at.1));
             }
             Task::ArgCopy(a) => {
                 let v = self.pop()?;
@@ -4095,8 +4132,14 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
 
     fn stmt(&mut self, s: StmtId) -> Result<(), BuildError> {
         let stmt = self.body.stmts.get(s.ix()).copied().ok_or(malformed("a statement past `stmts`"))?;
+        // A statement is a temporary scope: its end drops its borrowed temporaries, after its
+        // own value and its `let`'s binding (walk/temps.rs).
+        self.temp_marks.push(self.scope_pats.len() as u32);
+        self.work.push(Task::TempEnd);
         match stmt {
-            Stmt::Let { else_: Some(e), .. } => return Err(unsupported(e, "`let`-`else`")),
+            // `let P = e else { .. };`: walk/lets.rs.
+            Stmt::Let { init: Some(init), else_: Some(_), .. } => self.let_else(s, init)?,
+            Stmt::Let { init: None, else_: Some(_), .. } => return Err(malformed("a `let`-`else` without an initializer")),
             // `let _ = <place>` reads nothing and moves nothing; `let _ = <value>` drops the
             // value at once.
             Stmt::Let { pat, init: Some(init), else_: None, .. } if matches!(self.pat(pat)?, Pat::Wild) => {
@@ -4202,13 +4245,15 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     self.work.push(Task::Stmt(s));
                 }
             }
+            // A condition holding a `let` (`if let`, `while let`, a let chain): walk/lets.rs.
+            Expr::If { cond, then, else_ } if self.cond_has_let(cond)? => self.if_let(e, cond, then, else_)?,
             Expr::If { cond, then, else_ } => {
                 self.work.push(Task::If { expr: e, then, else_ });
                 self.work.push(Task::Eval(cond));
             }
-            // The checker types it (blaze-typeck `expr_let`); building its test and bindings is
-            // this walk's to add.
-            Expr::Let { .. } => return Err(unsupported(e, "`let` in a condition")),
+            // A `let` is built as a link of its `if` condition (walk/lets.rs); elsewhere (a
+            // match guard's `if let`) it is not.
+            Expr::Let { .. } => return Err(unsupported(e, "`let` outside an `if` or `while` condition")),
             Expr::FormatArgs { .. } => return Err(unsupported(e, "`format_args!`")),
             Expr::Await(_) => return Err(unsupported(e, "`.await`")),
             Expr::AsyncBlock { .. } => return Err(unsupported(e, "an async block")),
@@ -5058,6 +5103,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let Expr::Match { scrutinee, arms } = self.expr(e)? else { return Err(malformed("a match task on another expression")) };
         let mut s = self.pop()?;
         let mut srepr = self.adjusted_repr(scrutinee)?;
+        if !self.switch_takes(scrutinee, arms, srepr)? {
+            return self.match_tested(e, scrutinee, arms, s, srepr);
+        }
         // A reference to an enum, matched by variant patterns: the default binding mode (the
         // reference, "Binding modes"): the references are followed to the enum's place.
         let mut by_ref = false;
@@ -5176,7 +5224,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             }
             self.switch(x, default, &cases);
         }
-        self.matches.push(MatchState { expr: e, scrutinee: x, width, of_enum, join, repr, first, arms: n, guarded, by_ref, owner });
+        self.matches.push(MatchState { expr: e, scrutinee: x, width, of_enum, join, repr, first, arms: n, guarded, by_ref, owner, tested: None });
         let m = (self.matches.len() - 1) as u32;
         self.work.push(Task::MatchEnd);
         for i in (0..n).rev() {
@@ -5191,6 +5239,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         let arm = *self.body.arms.get(arms.range()).and_then(|l| l.get(i as usize)).ok_or(malformed("an arm past `arms`"))?;
         let block = self.arm_blocks[(st.first + i) as usize];
         let next = self.arm_blocks[(st.first + i + 1) as usize];
+        if let Some(at) = st.tested {
+            return self.arm_tested(m, i, arm, at, block, next);
+        }
         self.begin(block);
         if st.guarded {
             let mut values = Vec::new_in(self.alloc.clone());

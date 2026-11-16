@@ -26,6 +26,7 @@
 
 mod checkout;
 mod fetch;
+mod fix;
 mod home;
 mod macros;
 mod names;
@@ -50,6 +51,7 @@ use blaze_ladder::refusal::{Refusal, SourceFile};
 use blaze_ladder::run::RunError;
 use blaze_own::{Alloc, Vec, VecDeque};
 use blaze_report::frame::Choice;
+use blaze_report::frame::plain::View;
 use bstd::args::Args;
 use bstd::entry::Status;
 use bstd::env::VarName;
@@ -161,10 +163,16 @@ struct Flags<'a> {
     /// `--workers N`: at most N of a batch's tasks at once (default: one per core). For
     /// measuring how the work scales; it never changes a record.
     workers: Option<core::num::NonZeroU32>,
+    /// `--view person|agent|json` (D70); none asked: by whether the output is a terminal.
+    view: Option<View>,
+    /// `--fix <selector>...`: the arguments that are its selectors, `start..end` of the list.
+    fix: Option<(usize, usize)>,
 }
 
 fn flags(args: &Args) -> Result<Flags<'_>, CliError> {
     let mut flags = Flags {
+        view: None,
+        fix: None,
         dir: None,
         color: Choice::Auto,
         stats: false,
@@ -189,6 +197,20 @@ fn flags(args: &Args) -> Result<Flags<'_>, CliError> {
             args.get(at - 1).ok_or(CliError::Usage("--color, --origin, --origin-key, --grant and --workers each take a value"))
         };
         match arg {
+            "--view" => flags.view = Some(View::parse(value()?).ok_or(CliError::Usage("--view is person, agent or json"))?),
+            _ if arg.starts_with("--view=") => flags.view = Some(View::parse(&arg["--view=".len()..]).ok_or(CliError::Usage("--view is person, agent or json"))?),
+            // Every word after `--fix` up to the next flag is a selector: an id or a prefix of
+            // one, a code, a path, or `all` (fix.rs).
+            "--fix" => {
+                let start = at;
+                while args.get(at).is_some_and(|word| !word.starts_with("--")) {
+                    at += 1;
+                }
+                if at == start {
+                    return Err(CliError::Usage("--fix takes one or more selectors: an id or a prefix of one, a code, a path, or `all`"));
+                }
+                flags.fix = Some((start, at));
+            }
             "--grant" => {
                 let grant = value()?;
                 let pair = grant.split_once('=').ok_or(CliError::Usage("--grant takes name=value"))?;
@@ -281,7 +303,11 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases) -> Resul
     // here at the edge: whether it is a terminal, and how wide.
     let env = io.env();
     let var = |name: &str| -> Option<&str> { env.as_ref()?.get(&VarName::new(name).ok()?).ok().flatten() };
-    let caps = blaze_report::frame::detect(&var, out.is_terminal(), out.size().map(|size| size.cols), flags.color);
+    // Whether the findings' stream is a terminal: tested once, here, and given to both choices
+    // it makes (the drawing's abilities, and the view: D70).
+    let terminal = out.is_terminal();
+    let caps = blaze_report::frame::detect(&var, terminal, out.size().map(|size| size.cols), flags.color);
+    let view = blaze_report::frame::plain::view(flags.view, terminal);
     // A frame's header links to the file by its absolute path: the start directory's (`PWD`),
     // then the checkout's.
     let shown_root = match (var("PWD"), flags.dir) {
@@ -289,13 +315,37 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases) -> Resul
         (Some(pwd), None) => bstd::mem::format_in!(frame, "{pwd}"),
         (None, dir) => bstd::mem::format_in!(frame, "{}", dir.unwrap_or(".")),
     };
-    let mut shown = print::Shown::new(caps, shown_root.as_str(), frame);
+    let mut shown = print::Shown::new(caps, view, shown_root.as_str(), frame);
     phases.mark("open checkout");
     let mut ran = None;
     let workers = flags.workers.map_or(u32::try_from(workers).unwrap_or(u32::MAX), |n| n.get());
     let launch = program::Launch { io, grants: &flags.grants, args: &flags.program };
-    let mut finished =
-        request(cx, &root, (checkout_at, var("SSL_CERT_FILE"), var("SSL_CERT_DIR"), var("HOME"), var("PWD"), blaze_toolchain::PINNED), origin.as_ref(), (command, word), workers, tool, work::Sizes::USUAL, &launch, frame, out, err, &mut ran, &mut shown, phases)?;
+    // The request as this command makes it; it takes what it prints into and gives it back.
+    let mut ask = |mut shown, ran: &mut Option<u8>, phases: &mut Phases| {
+        let finished = request(cx, &root, (checkout_at, var("SSL_CERT_FILE"), var("SSL_CERT_DIR"), var("HOME"), var("PWD"), blaze_toolchain::PINNED), origin.as_ref(), (command, word), workers, tool, work::Sizes::USUAL, &launch, frame, out, err, ran, &mut shown, phases);
+        finished.map(|finished| (finished, shown))
+    };
+    let mut finished = match flags.fix {
+        None => {
+            let (finished, again) = ask(shown, &mut ran, phases)?;
+            shown = again;
+            finished
+        }
+        Some((start, end)) => {
+            if command != Command::Check {
+                return Err(CliError::Usage("--fix is `blaze check`'s"));
+            }
+            let mut selectors: Vec<&str, &Frame> = Vec::with_capacity_in(end - start, frame);
+            selectors.extend((start..end).filter_map(|at| args.get(at)));
+            match fix_then_check::<fix::Atomic>(cx, &root, &selectors, (caps, view, shown_root.as_str()), frame, out, &mut |shown| ask(shown, &mut ran, phases))? {
+                Fixed::Refused => return Ok(Status::FAILED),
+                Fixed::Checked(finished, again) => {
+                    shown = again;
+                    finished
+                }
+            }
+        }
+    };
     phases.frames = Some(finished.high);
     finished.answer.profile.coordinator_ns = phases.request.steps;
     let p = &finished.answer.profile;
@@ -341,6 +391,51 @@ fn close(cx: &Cx, command: Command, finished: &Finished<'_>, shown: &print::Show
         // The program ran at the machine's `StartProgram`: its status is the command's.
         Command::Run => ran.map(Status).ok_or(CliError::Drive(DriveError::Finished)),
         Command::Test => Ok(Status::FAILED),
+    }
+}
+
+/// What `blaze check --fix` ended with.
+enum Fixed<'f> {
+    /// A refusal was printed; nothing was written.
+    Refused,
+    /// The fixes were written and the check ran again: its answer, and what it printed.
+    Checked(Finished<'f>, print::Shown<'f>),
+}
+
+/// `blaze check --fix <selector>...` (D70; fix.rs): the check run once with nothing printed, its
+/// findings chosen by `selectors` and their fixes written through `W` as one transaction (every
+/// refusal decided before a byte is written), then the check run again in the same command,
+/// printing what is left in the command's view. `run` is the request as `command` makes it.
+fn fix_then_check<'f, W: fix::Writer + Default>(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    selectors: &[&str],
+    (caps, view, shown_root): (blaze_report::frame::Caps, View, &'f str),
+    frame: &'f Frame,
+    out: &Out,
+    run: &mut dyn FnMut(print::Shown<'f>) -> Result<(Finished<'f>, print::Shown<'f>), CliError>,
+) -> Result<Fixed<'f>, CliError> {
+    let mut first = print::Shown::new(caps, view, shown_root, frame);
+    first.quiet = true;
+    let (_, first) = run(first)?;
+    let shown = print::Shown::new(caps, view, shown_root, frame);
+    match fix::apply(cx, root, &W::default(), &first.listed, selectors, frame)? {
+        Err(refusal) => {
+            let words = bstd::mem::format_in!(frame, "{refusal}");
+            print::refused(cx, words.as_str(), &shown, frame, out)?;
+            Ok(Fixed::Refused)
+        }
+        Ok(applied) => {
+            let n = applied.fixed.len();
+            let mut words = bstd::mem::format_in!(frame, "applied {n} {} in {} {}:", if n == 1 { "fix" } else { "fixes" }, applied.files, if applied.files == 1 { "file" } else { "files" });
+            for id in applied.fixed.iter() {
+                words.push_str(" ");
+                words.push_str(id.as_str());
+            }
+            print::note(cx, words.as_str(), &shown, frame, out)?;
+            let (finished, shown) = run(shown)?;
+            Ok(Fixed::Checked(finished, shown))
+        }
     }
 }
 
@@ -440,7 +535,7 @@ fn request<'f>(
     out: &Out,
     err: &Out,
     ran: &mut Option<u8>,
-    shown: &mut print::Shown<'_>,
+    shown: &mut print::Shown<'f>,
     phases: &mut Phases,
 ) -> Result<Finished<'f>, CliError> {
     let cx = cx.span("blaze request");
@@ -796,7 +891,7 @@ fn program_refusals<'f>(cx: &Cx, root: &Dir<ReadWrite>, rows: &Rows<'_>, frame: 
 /// refusal is still listed after a manifest's finding, never left out and never invented: the
 /// runner's own front end makes it. After the findings, the notes ([`print::note`]).
 #[expect(clippy::too_many_arguments, reason = "the drawing's inputs: each argument a different source of findings or of their text")]
-fn draw(
+fn draw<'f>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
     req: &Request<'_>,
@@ -806,15 +901,17 @@ fn draw(
     program: Option<&Refused<'_>>,
     failed: &[work::Failed<'_>],
     notices: &[Notice],
-    shown: &mut print::Shown<'_>,
-    frame: &Frame,
+    shown: &mut print::Shown<'f>,
+    frame: &'f Frame,
     out: &Out,
 ) -> Result<(), CliError> {
     // (file, position, the request's finding or the program's refusal, its index).
     let mut order: Vec<(Option<&str>, u32, bool, usize), &Frame> = Vec::new_in(frame);
-    // Each finding's (item start, words): a crate's unresolved path carries its file and item
-    // in its message, placed now in the file as it is (names.rs `placed`; rule 71).
-    let mut places: Vec<(u32, &[u8]), &Frame> = Vec::with_capacity_in(prints.len(), frame);
+    // Each finding placed in today's text with its id and fix (fix.rs): a crate's unresolved
+    // path carries its file, item and edition in its message, placed now in the file as it is
+    // (names.rs `placed`; rule 71). The id's item is a Rust file's outline item read in one
+    // grammar for every file (fix.rs `ITEM_GRAMMAR`), so an id is a function of the text alone.
+    let first = shown.listed.len();
     for (i, finding) in prints.iter().enumerate() {
         let (path, place, words) = match finding.rule == names::UNRESOLVED && finding.file.is_none() {
             true => match names::placed(cx, root, &finding.message, frame)? {
@@ -823,9 +920,12 @@ fn draw(
             },
             false => (print::file_of(req, found, finding, frame)?, finding.place, &finding.message[..]),
         };
-        places.push((place, words));
+        let edition = path.filter(|path| path.ends_with(".rs")).map(|_| fix::ITEM_GRAMMAR);
+        let words: &'f [u8] = Vec::from_slice_in(words, frame).leak();
+        shown.listed.push(print::listed(cx, root, path, place, words, edition, finding, frame)?);
         order.push((path, place.saturating_add(finding.start), false, i));
     }
+    fix::lengths(&mut shown.listed[first..], frame);
     if let Some(program) = program {
         for (i, refusal) in program.refusals.iter().enumerate() {
             let path = refusal.file.and_then(|file| program.texts.get(file as usize)).map(|it| it.0);
@@ -837,7 +937,10 @@ fn draw(
     for &(path, _, of_program, i) in order.iter() {
         match (of_program, program) {
             (true, Some(program)) => print::refusal(cx, &program.refusals[i], &program.texts, shown, frame, out)?,
-            _ => print::framed(cx, root, path, places[i].0, places[i].1, &prints[i], shown, frame, out)?,
+            _ => {
+                let listed = shown.listed[first + i];
+                print::finding(cx, &listed, shown, frame, out)?;
+            }
         }
     }
     // A failed task is the tool's, not the code's: named with its file, and the command fails
@@ -1028,7 +1131,31 @@ mod tests {
         errors: u32,
         /// The exit status `command` returns for it (`close`), `None` where `close` failed.
         status: Option<u8>,
+        /// `--fix` refused (its line printed) and wrote nothing.
+        refused: bool,
+        /// Each finding's (code, id), in the order listed.
+        ids: std::vec::Vec<(std::string::String, std::string::String)>,
     }
+
+    impl Checked {
+        fn refused() -> Checked {
+            Checked {
+                failed: std::vec::Vec::new(),
+                runs: 0,
+                certified: false,
+                checked: 0,
+                high: work::HighWater::default(),
+                resolved: 0,
+                profile: std::string::String::new(),
+                errors: 0,
+                status: Some(1),
+                refused: true,
+                ids: std::vec::Vec::new(),
+            }
+        }
+    }
+
+    mod fix_tests;
 
     fn write(io: &Io, path: &str, text: &str) {
         let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
@@ -1068,17 +1195,33 @@ mod tests {
     }
 
     fn ask(io: &Io, command: (Command, &'static str), sizes: work::Sizes) -> Result<Checked, CliError> {
+        ask_view::<fix::Atomic>(io, command, sizes, View::Person, None)
+    }
+
+    /// The command as `command` runs it, in `view` (its lines drawn as off a terminal), with
+    /// `--fix` when `fix` gives its selectors, the fixed files written through `W`.
+    fn ask_view<W: fix::Writer + Default>(io: &Io, command: (Command, &'static str), sizes: work::Sizes, view: View, fix: Option<&[&str]>) -> Result<Checked, CliError> {
         let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
         let frame = cx.frame();
         let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
         let (out, err) = (io.need_out().expect("out"), io.need_err().expect("err"));
         let mut phases = Phases::new(io.need_clock().expect("a clock"));
-        let mut shown = print::Shown::new(blaze_report::frame::Caps::LINES, "/ws", frame);
+        let shown = print::Shown::new(blaze_report::frame::Caps::LINES, view, "/ws", frame);
         let mut ran = None;
         let launch = program::Launch { io, grants: &[], args: &[] };
         let said = words(command.0, &out, &err);
         let toolchain = shelf(io);
-        let finished = request(&cx, &root, ("ws", None, None, Some("/h"), Some("/"), toolchain), None, command, 1, home::tool(b"test"), sizes, &launch, frame, said, &err, &mut ran, &mut shown, &mut phases)?;
+        let mut run = |mut shown, ran: &mut Option<u8>, phases: &mut Phases| {
+            let finished = request(&cx, &root, ("ws", None, None, Some("/h"), Some("/"), toolchain), None, command, 1, home::tool(b"test"), sizes, &launch, frame, said, &err, ran, &mut shown, phases);
+            finished.map(|finished| (finished, shown))
+        };
+        let (finished, shown) = match fix {
+            None => run(shown, &mut ran, &mut phases)?,
+            Some(selectors) => match fix_then_check::<W>(&cx, &root, selectors, (blaze_report::frame::Caps::LINES, view, "/ws"), frame, said, &mut |shown| run(shown, &mut ran, &mut phases))? {
+                Fixed::Refused => return Ok(Checked::refused()),
+                Fixed::Checked(finished, shown) => (finished, shown),
+            },
+        };
         // The drive's count holds the parts it failed `Waited` itself (no task ran for them).
         assert!(finished.answer.failed as usize >= finished.failed.len());
         // The closing line and the status, as `command` makes them.
@@ -1099,6 +1242,8 @@ mod tests {
             resolved: finished.resolved,
             profile: finished.answer.profile.to_string(),
             errors: finished.answer.findings,
+            refused: false,
+            ids: shown.listed.iter().map(|l| (l.code().to_owned(), l.id.as_str().to_owned())).collect(),
         })
     }
 

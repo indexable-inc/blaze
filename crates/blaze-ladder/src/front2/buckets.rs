@@ -276,6 +276,66 @@ fn file(names: &Names<'_>, key: LibKey, module: LibKey) -> Filed {
     }
 }
 
+/// The trait an impl's header names BY ITS TOKENS ([`blaze_file_items::impl_header`], the one
+/// reader of a header's text): `Some` for `impl Tr<..> for X`, `None` for `impl X` and for a
+/// header whose text does not read at all. An impl has this kind before anything of it is
+/// lowered or resolved (the Reference, "Implementations": "Inherent implementations" are `impl`
+/// followed by a type, "Trait implementations" are written `impl Trait for Type`), so a header
+/// that is refused, not lowered, or lowered without its trait is still known to be a trait
+/// impl, and a trait impl is never a candidate of an inherent question.
+fn written_trait<'n>(names: &Names<'_>, at: &super::index::ImplAt<'n>) -> Option<&'n str> {
+    let h = blaze_file_items::impl_header(at.header, names.edition(at.krate), blaze_own::Alloc::global()).ok()?;
+    h.trait_
+}
+
+/// Whether the trait path `trait_text` of a header is written with no type or const argument:
+/// no argument list, or one of lifetimes only (`Deserialize<'de>`). Any other list, and one
+/// this does not read (a bracket inside it), is not bare: the wide side.
+fn bare_text(trait_text: &str) -> bool {
+    let t = trait_text.trim();
+    let Some(open) = t.find(['<', '(']) else { return true };
+    let Some(inside) = t[open..].strip_prefix('<').and_then(|rest| rest.trim_end().strip_suffix('>')) else { return false };
+    if inside.contains(['<', '(', '[', '{']) {
+        return false;
+    }
+    // A lifetime starts with `'` and holds no second one (`'a'` is a `char` const argument).
+    inside.split(',').all(|a| {
+        let a = a.trim();
+        a.is_empty() || a.strip_prefix('\'').is_some_and(|rest| !rest.contains('\''))
+    })
+}
+
+/// Files a trait impl by the trait path of its header's TEXT (`trait_text`, as
+/// [`written_trait`] gave it), for an impl whose lowered header did not say which trait it is
+/// of: under that trait's "any" list when the names library resolves the path to a trait in the
+/// impl's module, else unread with why (a trait impl, so a candidate of trait questions only).
+/// Its self type's shape is not read here (`None`: a candidate at every shape of its trait).
+fn file_by_text(names: &Names<'_>, module: LibKey, trait_text: &str) -> Filed {
+    let whole = trait_text.trim();
+    // The path before its generic arguments (`Tr<..>`) or its parenthesized ones (`Fn(..)`).
+    let head = whole.split(['<', '(']).next().unwrap_or("").trim();
+    let (abs, rest) = match head.strip_prefix("::") {
+        Some(rest) => (true, rest),
+        None => (false, head),
+    };
+    let mut texts: Vec<&str, Global> = Vec::new_in(Global);
+    for s in rest.split("::") {
+        let s = s.trim();
+        let ident = s.chars().next().is_some_and(|c| c.is_alphabetic() || c == '_') && s.chars().all(|c| c.is_alphanumeric() || c == '_');
+        if !ident {
+            return Filed::Unread(Unread::PathUnread, None);
+        }
+        texts.push(s);
+    }
+    let bare = head.len() == whole.len();
+    let path: Box<str> = Box::from(head);
+    match (Resolver { names }).path(module, abs, &texts, Ns::Type) {
+        Ok(f) if f.kind == Kind::Trait && f.consumed as usize == texts.len() => Filed::Trait(checker_of(f.key), None, bare),
+        Ok(f) => Filed::Unread(Unread::NotATrait { path, kind: f.kind, consumed: f.consumed, written: texts.len() as u32 }, None),
+        Err(why) => Filed::Unread(Unread::Resolve { path, why }, None),
+    }
+}
+
 /// The crates an impl must be written in to answer one question, by the coherence rules of the
 /// Reference, "Implementations"; `Any` where they do not narrow it. An impl is filed with its
 /// crate without reading its header, so this narrows unread and refused impls too.
@@ -468,6 +528,10 @@ pub struct Buckets {
     bare: Vec<LibKey, Global>,
     /// Per crate: whether its root turns on `rustc_attrs` ([`Home::Incoherent`]).
     incoherent: Vec<bool, Global>,
+    /// The trait impls filed by their header's text ([`file_by_text`]) because the lowered
+    /// header did not name their trait, in the index's order: each is a defect of the lowering
+    /// or of the block's module to remove at its home, counted here so it is seen.
+    pub by_text: Vec<LibKey, Global>,
 }
 
 impl Buckets {
@@ -496,6 +560,7 @@ impl Buckets {
             homes: HashMap::new_in(Global),
             bare: Vec::new_in(Global),
             incoherent: Vec::new_in(Global),
+            by_text: Vec::new_in(Global),
         };
         b.krates.extend(index.impls.iter().map(|at| (at.key, at.krate)));
         b.krates.sort_unstable_by_key(|k| k.0);
@@ -503,7 +568,22 @@ impl Buckets {
         // read; a mention anywhere in that text keeps the crate on the wide side.
         b.incoherent.extend(names.crates().iter().map(|c| c.files.first().is_none_or(|f| f.text.contains("rustc_attrs") || f.text.contains("rustc_coherence_is_core"))));
         for at in index.impls.iter() {
-            let filed = file(names, at.key, at.module);
+            // The kind as written decides first: an impl whose text names a trait is filed as
+            // that trait's even when its lowered header holds no trait (`Filed::Inherent`) or
+            // did not lower (`NoText`, `Unlowered`, `Generics`): it is then never a candidate
+            // of an inherent question. Only an impl whose header text does not read stays blind.
+            let written = written_trait(names, at);
+            let filed = match (file(names, at.key, at.module), written) {
+                (Filed::Inherent(_), Some(t)) => {
+                    b.by_text.push(at.key);
+                    file_by_text(names, at.module, t)
+                }
+                (Filed::Unread(why, _), Some(t)) if !why.is_trait_impl() => {
+                    b.by_text.push(at.key);
+                    file_by_text(names, at.module, t)
+                }
+                (f, _) => f,
+            };
             if let Filed::Trait(_, _, true) = filed {
                 b.bare.push(at.key);
             }
@@ -523,6 +603,13 @@ impl Buckets {
                 Filed::Negative(tr) => push(&mut b.negative, tr, at.key),
                 Filed::Unread(why, shape) => {
                     b.unread.push(at.key);
+                    // An unread trait impl written with no type or const argument on its trait
+                    // is judged by `Homes::bare` as a read one is: if it is of the asked trait
+                    // at all, that trait's parameters are at their defaults, so where those
+                    // are `Self` only its self type can be its crate's local type.
+                    if why.is_trait_impl() && written.is_some_and(bare_text) {
+                        b.bare.push(at.key);
+                    }
                     match (why.is_trait_impl(), shape) {
                         (false, _) => b.unread_blind.push(at.key),
                         (true, None) => b.unread_any.push(at.key),
@@ -604,7 +691,9 @@ impl Buckets {
         let mut out = Vec::new_in(Global);
         out.extend_from_slice(self.inherent_by_shape.get(&shape).map_or(&[], |v| v.as_slice()));
         out.extend_from_slice(&self.inherent_any);
-        // A trait impl (its trait path written, though unread) is never an inherent candidate.
+        // A trait impl (its trait written in its header's text, though unread, refused or
+        // lost by the lowering: `written_trait`) is never an inherent candidate; `unread_blind`
+        // holds only impls whose header text does not read as an impl at all.
         out.extend_from_slice(&self.unread_blind);
         self.keep_home(&mut out, home);
         out.sort_unstable();
@@ -655,6 +744,13 @@ impl Buckets {
                 continue;
             }
             let h = store.impls.get(&checker_of(k)).ok_or(Unfilled::Impl(k))?;
+            // A header built WITHOUT the trait its text names answers nothing: it is the
+            // question's gap, never an impl left out of the answer unseen.
+            if h.trait_.is_none() && self.by_text.binary_search(&k).is_ok() {
+                self.fail(k, Box::from("its header's text names a trait; the header as lowered holds none"));
+                first_failed = first_failed.or(Some(k));
+                continue;
+            }
             if h.trait_ == Some(trait_) && fits(shape_of(view, h.self_ty), shape) {
                 got.push(checker_of(k));
             }

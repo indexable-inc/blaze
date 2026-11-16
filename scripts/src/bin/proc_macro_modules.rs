@@ -1356,6 +1356,9 @@ struct Built {
 /// Everything a build shares: the toolchain, the paths, the deadline, the environment.
 struct Plan<'a> {
     args: &'a Args,
+    /// cargo reads only its cache: no network (`CARGO_NET_OFFLINE`); the native build-script
+    /// mode asks it.
+    offline: bool,
     /// Each crate's origin, in the order of `args.crates`.
     origins: Vec<Result<Origin, Failure>>,
     tool: Toolchain,
@@ -1403,14 +1406,18 @@ impl Plan<'_> {
 
     /// The environment of every cargo this tool starts: nothing inherited but `HOME` and `PATH`.
     fn env(&self, cargo_home: &Path) -> Vec<(String, OsString)> {
-        vec![
+        let mut env = vec![
             ("HOME".to_owned(), self.home.clone().into()),
             ("PATH".to_owned(), self.path.clone().into()),
             ("CARGO_HOME".to_owned(), cargo_home.as_os_str().to_owned()),
             ("RUSTC".to_owned(), self.tool.rustc().into_os_string()),
             ("TMPDIR".to_owned(), self.work.join("tmp").into_os_string()),
             ("LANG".to_owned(), "C.UTF-8".into()),
-        ]
+        ];
+        if self.offline {
+            env.push(("CARGO_NET_OFFLINE".to_owned(), "true".into()));
+        }
+        env
     }
 
     /// Step one: `cargo vendor` of every crate asked for, with its dependencies as the lock
@@ -1734,6 +1741,7 @@ fn main_with(args: &Args) -> i32 {
     let origins: Vec<Result<Origin, Failure>> = args.crates.iter().map(|wanted| Origin::of(&args, &lock, wanted)).collect();
     let plan = Plan {
         args,
+        offline: false,
         origins,
         work,
         lock,

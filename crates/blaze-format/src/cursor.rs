@@ -19,7 +19,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::{fmt, mem::size_of};
+use core::{alloc::Allocator, fmt, mem::size_of};
 
 use crate::leb::{self, LebError};
 
@@ -92,8 +92,10 @@ impl fmt::Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl core::error::Error for Error {}
 
+// to remove: a `String` error is rule 7's `Result<_, String>`; its callers take the typed
+// `Error` (bstd move).
 impl From<Error> for String {
     fn from(error: Error) -> String {
         error.to_string() // alloc: error path
@@ -147,7 +149,7 @@ impl<'a> Reader<'a> {
     /// The bytes left, moving past them all.
     #[inline]
     pub fn take_rest(&mut self) -> &'a [u8] {
-        std::mem::take(&mut self.rest)
+        core::mem::take(&mut self.rest)
     }
 
     /// Moves the next read to `at`, from the start of the bytes; at most their length.
@@ -402,7 +404,7 @@ impl<'a> Reader<'a> {
 
     #[inline]
     fn utf8(&mut self, start: Reader<'a>, bytes: &'a [u8]) -> Result<&'a str, Error> {
-        match std::str::from_utf8(bytes) {
+        match core::str::from_utf8(bytes) {
             Ok(text) => Ok(text),
             Err(_) => Err(self.reset(start, Wanted::Utf8 { len: bytes.len() })),
         }

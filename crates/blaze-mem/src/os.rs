@@ -112,7 +112,7 @@ pub(crate) fn reserve_sparse(bytes: usize) -> io::Result<NonNull<u8>> {
     };
     // SAFETY: a fresh reservation at an address the kernel picks, committed whole.
     let base =
-        unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        unsafe { VirtualAlloc(core::ptr::null(), bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
     NonNull::new(base.cast::<u8>()).ok_or_else(io::Error::last_os_error)
 }
 
@@ -131,7 +131,7 @@ fn reserve_with(bytes: usize, huge: bool, prot: libc::c_int) -> io::Result<NonNu
     // program holds.
     let base = timed(Kind::Reserve, || unsafe {
         libc::mmap(
-            std::ptr::null_mut(),
+            core::ptr::null_mut(),
             padded,
             prot,
             libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_NORESERVE,
@@ -268,7 +268,7 @@ pub(crate) fn opt_out_unadvised(_pages: crate::huge::Pages) -> crate::huge::Thp 
 pub(crate) fn reserve(bytes: usize, _huge: bool) -> io::Result<NonNull<u8>> {
     use windows_sys::Win32::System::Memory::{MEM_RESERVE, PAGE_NOACCESS, VirtualAlloc};
     // SAFETY: a fresh reservation at an address the kernel picks.
-    let base = unsafe { VirtualAlloc(std::ptr::null(), bytes, MEM_RESERVE, PAGE_NOACCESS) };
+    let base = unsafe { VirtualAlloc(core::ptr::null(), bytes, MEM_RESERVE, PAGE_NOACCESS) };
     NonNull::new(base.cast::<u8>()).ok_or_else(io::Error::last_os_error)
 }
 
@@ -285,7 +285,7 @@ pub(crate) fn reserve(bytes: usize, _huge: bool) -> io::Result<NonNull<u8>> {
     let pages = bytes.div_ceil(RESERVE_ALIGN).max(1);
     if let Some(at) = freed::take(pages) {
         // As below: an address in the module's own memory, from the free list's answer.
-        let base = std::ptr::with_exposed_provenance_mut::<u8>(at * RESERVE_ALIGN);
+        let base = core::ptr::with_exposed_provenance_mut::<u8>(at * RESERVE_ALIGN);
         return NonNull::new(base)
             .ok_or_else(|| io::Error::other("the free list gave pages at address 0"));
     }
@@ -301,7 +301,7 @@ pub(crate) fn reserve(bytes: usize, _huge: bool) -> io::Result<NonNull<u8>> {
     }
     // The pages are the module's own memory at `old` pages in: an address, with nothing to
     // derive it from but the instruction's answer.
-    let base = std::ptr::with_exposed_provenance_mut::<u8>(old * RESERVE_ALIGN);
+    let base = core::ptr::with_exposed_provenance_mut::<u8>(old * RESERVE_ALIGN);
     NonNull::new(base).ok_or_else(|| io::Error::other("memory.grow gave pages at address 0"))
 }
 
@@ -431,7 +431,7 @@ pub(crate) fn reserve_on(bytes: usize, _huge: bool, node: u32) -> io::Result<Non
     let base = unsafe {
         VirtualAllocExNuma(
             GetCurrentProcess(),
-            std::ptr::null(),
+            core::ptr::null(),
             bytes,
             MEM_RESERVE,
             PAGE_NOACCESS,
@@ -548,8 +548,8 @@ fn one_node(node: u32) -> io::Result<()> {
 }
 
 #[cfg(all(not(any(unix, windows)), not(target_arch = "wasm64")))]
-fn whole(bytes: usize) -> io::Result<std::alloc::Layout> {
-    std::alloc::Layout::from_size_align(bytes.max(1), RESERVE_ALIGN)
+fn whole(bytes: usize) -> io::Result<core::alloc::Layout> {
+    core::alloc::Layout::from_size_align(bytes.max(1), RESERVE_ALIGN)
         .map_err(|_| io::Error::new(io::ErrorKind::OutOfMemory, "reservation overflows"))
 }
 
@@ -1005,10 +1005,10 @@ pub(crate) const EVICT_BATCH: usize = 256;
 /// [`reserve_sparse`] at `base`, and nothing reads or writes it through a plain reference
 /// meanwhile (only [`crate::racy`]'s atomic copies, which may see any bytes).
 #[cfg(target_os = "linux")]
-pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>]) -> usize {
+pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[core::ops::Range<usize>]) -> usize {
     let mut given = 0;
     for batch in ranges.chunks(EVICT_BATCH) {
-        let mut iov = [libc::iovec { iov_base: std::ptr::null_mut(), iov_len: 0 }; EVICT_BATCH];
+        let mut iov = [libc::iovec { iov_base: core::ptr::null_mut(), iov_len: 0 }; EVICT_BATCH];
         let mut want = 0;
         for (slot, range) in iov.iter_mut().zip(batch) {
             slot.iov_base = base.as_ptr().wrapping_add(range.start).cast();
@@ -1044,7 +1044,7 @@ pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>])
 const PIDFD_SELF_THREAD_GROUP: libc::c_int = -10001;
 
 #[cfg(target_os = "macos")]
-pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>]) -> usize {
+pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[core::ops::Range<usize>]) -> usize {
     let mut given = 0;
     for range in ranges {
         let at = base.as_ptr().wrapping_add(range.start);
@@ -1064,7 +1064,7 @@ pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>])
 /// The other Unixes have no reusable advice and no vector call: `MADV_DONTNEED` per range,
 /// which drops a private anonymous page now there too.
 #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
-pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>]) -> usize {
+pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[core::ops::Range<usize>]) -> usize {
     let mut given = 0;
     for range in ranges {
         let at = base.as_ptr().wrapping_add(range.start);
@@ -1081,7 +1081,7 @@ pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>])
 }
 
 #[cfg(windows)]
-pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>]) -> usize {
+pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[core::ops::Range<usize>]) -> usize {
     use windows_sys::Win32::System::Memory::{MEM_DECOMMIT, VirtualFree};
     let mut given = 0;
     for range in ranges {
@@ -1098,7 +1098,7 @@ pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>])
 
 /// Through the seed's runner, which leaves the pages reading zeros, as on Linux.
 #[cfg(all(not(any(unix, windows)), target_arch = "wasm64"))]
-pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>]) -> usize {
+pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[core::ops::Range<usize>]) -> usize {
     let mut given = 0;
     for range in ranges {
         // SAFETY: the caller says the range is inside a live reservation of ours, grown linear
@@ -1111,7 +1111,7 @@ pub(crate) unsafe fn evict(base: NonNull<u8>, ranges: &[std::ops::Range<usize>])
 
 /// Nothing gives pages back here ([`check_evict`] says so).
 #[cfg(all(not(any(unix, windows)), not(target_arch = "wasm64")))]
-pub(crate) unsafe fn evict(_base: NonNull<u8>, _ranges: &[std::ops::Range<usize>]) -> usize {
+pub(crate) unsafe fn evict(_base: NonNull<u8>, _ranges: &[core::ops::Range<usize>]) -> usize {
     0
 }
 
@@ -1212,7 +1212,7 @@ const EVICT_NEEDS: &str = "the store's pool cannot give its pages back on this s
 #[cold]
 fn system_release() -> std::string::String {
     // SAFETY: `utsname` is plain bytes, valid zeroed.
-    let mut name: libc::utsname = unsafe { std::mem::zeroed() };
+    let mut name: libc::utsname = unsafe { core::mem::zeroed() };
     // SAFETY: `uname` writes the live struct it is given.
     if unsafe { libc::uname(&mut name) } != 0 {
         return "a kernel uname does not name".to_owned(); // alloc: an error's text, once

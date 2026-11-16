@@ -120,8 +120,8 @@ impl Thp {
     }
 }
 
-impl std::fmt::Display for Thp {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for Thp {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
             Thp::Unset => "unset",
             Thp::AdvisedOnly => "advised only",
@@ -147,7 +147,7 @@ pub fn thp() -> Thp {
 /// # Safety
 ///
 /// The range is a live mapping the caller owns.
-pub unsafe fn keep_base_pages(ptr: std::ptr::NonNull<u8>, bytes: usize) {
+pub unsafe fn keep_base_pages(ptr: core::ptr::NonNull<u8>, bytes: usize) {
     // SAFETY: the caller's contract.
     unsafe { crate::os::keep_base_pages(ptr, bytes) };
 }

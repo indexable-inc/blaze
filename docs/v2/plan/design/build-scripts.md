@@ -498,6 +498,31 @@ by default; bindgen's text holds no paths. Proven by a two-run byte compare once
 
 ## For a successor
 
+- **Runner 10: the first native scripts ran (D69), 2026-11-16.** Built: the pin table
+  `crates/hir-ty-codegen/clang.json` (both 23.1.4 rows; `sysroots`: macOS `macos-sdk`, Linux
+  `null`, a typed `PinError::NoSysroot`), read by `blaze_build_script::toolchain` (`clang_pin`,
+  `sysroot`, `c_env`, `depfile_reads`, `headers_digest`, `map_paths`, `placement` with
+  `NATIVE_EVERY_MODE`); `RunnerKey::Native` adds `sysroot` (`macos-sdk <SDKSettings Version>`);
+  the Seatbelt profile grants `file-read-metadata` of each granted path's ancestors (clang's
+  `realpath` finds its resource headers so). blaze-proc-macro: `native_script::run_script`
+  (cargo's env with real folders, the C env, `PATH` empty, `TMPDIR`=`OUT_DIR`; stdout's real
+  paths mapped to the key's; `-MD` files read into the headers digest and removed), examples
+  `clang_shelf` (the fetch: blaze-http streaming, sha256 checked before the name is given; 25.2 s)
+  and `native_run` (two runs from two folders, records compared). The interim builder takes
+  `"native": {"clang", "sdk"}`: host target, no shim, linked by the shelf's clang + `ld64.lld`
+  (`bin/clang.cfg` = `-fuse-ld=lld`, added on the shelf), `CARGO_NET_OFFLINE`.
+  - Shelf: `~/.blaze/v2/toolchain/clang/5d3179db..39ef/` 577 MB (bin: clang-23, clang, clang++,
+    lld, ld64.lld, llvm-ar, clang.cfg, clang++.cfg; lib: libclang.dylib, clang/23/{include,lib,share});
+    the archive is kept beside it.
+  - Ran confined, byte-equal across folders: fixture (cc, one C file: `static=hello`, 84 SDK
+    headers), zstd-sys (libzstd.a 3.9 MB, 9.2 s), libproc (bindgen: osx_libproc_bindings.rs
+    313,527 bytes; 0 headers listed: libclang's reads are not in `-MD`). sha3-asm stops: it
+    starts `perl` (PATH empty): needs its own answer (perlasm output as a pinned input?).
+  - Not done: the mode rule is a unit test, not yet run over tempo's graph; not wired into
+    script_unit (the real path still runs only wasm); zstd-sys ran with features `[]`, not
+    tempo's; the witness naming refused paths; Linux; compiler-rt for the fork (llvm.py edited
+    only: clang;lld projects and components).
+
 - **Runner 9: native scripts (D65), 2026-11-16.** Built: `blaze_build_script::native`
   (`runner`, `TOOLCHAIN_CLASS`, `Grant`, `seatbelt`, `GrantError`), `key::RunnerKey`, census row
   `runners`; blaze-proc-macro `native_sandbox` (`run`, `NativeRefusal`, Linux Landlock + user and

@@ -1067,7 +1067,12 @@ impl<'n> Store<'n> {
             let mut cp = Preds::new();
             cp.clauses.extend_from_slice(&preds.clauses);
             self.preds.insert(mk, cp);
-            let row = FnHead { lib: key, text, container: Some(ck), parent: generics, own: 0, declared: 0, self_param: false, header, inputs: Vec::new_in(Global), output, has_body: false, module, params: ps.clone(), consts: cs.clone(), bounds: own_bounds, self_: env.self_, self_assoc };
+            // An impl's constant has its value written (`pub const MAX: Self = !0;` inside
+            // `impl usize`): its body is lowered by `lower_member` like a member fn's, which
+            // is what the constant evaluator reads when another constant names it
+            // (`usize::MAX >> 1`). Read from the text, never assumed.
+            let has_body = cv.head[head::FLAGS] & sig::HAS_BODY != 0;
+            let row = FnHead { lib: key, text, container: Some(ck), parent: generics, own: 0, declared: 0, self_param: false, header, inputs: Vec::new_in(Global), output, has_body, module, params: ps.clone(), consts: cs.clone(), bounds: own_bounds, self_: env.self_, self_assoc };
             self.fns.insert(mk, row);
             consts.push((name, mk));
         }

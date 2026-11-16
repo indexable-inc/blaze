@@ -731,6 +731,18 @@ pub trait Kept: Sync {
     /// `krate` was solved: its full-names record ([`crate::names_record::encode`]), kept with
     /// the bytes `made` was given and found with them.
     fn names(&self, _krate: usize, _names: &[u8]) {}
+
+    /// Whether `items` wants each solved crate's items record ([`crate::items_record`]): the
+    /// second half of a crate's full names, what the type-checking front end reads in place of
+    /// the crate's tables. Encoding one costs a pass over the crate's items, so nothing is
+    /// written unasked.
+    fn keeps_items(&self) -> bool {
+        false
+    }
+
+    /// `krate` was solved: its items record ([`crate::items_record::encode`]), kept with the
+    /// bytes `made` was given and found with them.
+    fn items(&self, _krate: usize, _items: &[u8]) {}
 }
 
 /// One crate's answer from [`resolve_kept`].
@@ -1045,6 +1057,11 @@ fn resolve_queue<'a, S: SourceTexts<'a>, P: Par>(
                         let names = crate::names_record::encode(done.names, alloc)
                             .unwrap_or_else(|e| panic!("the names record of `{}` did not write: {e:?}", input.name));
                         k.names(at, &names);
+                    }
+                    if k.keeps_items() {
+                        let items = crate::items_record::encode(done.names, alloc)
+                            .unwrap_or_else(|e| panic!("the items record of `{}` did not write: {e:?}", input.name));
+                        k.items(at, &items);
                     }
                 }
                 Solved::Solved(done)

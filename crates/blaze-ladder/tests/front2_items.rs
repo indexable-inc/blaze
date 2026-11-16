@@ -370,6 +370,286 @@ fn main() {}
 }
 
 /// Reduction probe for the census's `Malformed/Sort` (bstd::blobs `from_key`).
+/// A trait impl is never a candidate of an inherent question (the Reference, "Implementations":
+/// "Inherent implementations": "The nominal type is called the implementing type and the
+/// associable items are the associated items to the implementing type"; a "Trait
+/// implementation" is "defined like an inherent implementation except that the optional
+/// generic type declarations are followed by a trait, followed by the keyword `for`"): the
+/// inherent items named `m` of `X` come from `impl X` blocks only, so a trait impl whose header
+/// is refused cannot stand in the way of `X.m()`. An impl's kind is read from its header's
+/// tokens (`blaze_file_items::impl_header`) before anything of it is lowered.
+/// Two crates. `plain`: the refused trait impl is at module level (`impl Display for dyn
+/// Tr<W<{ size_of::<u16>() }>>`, the form of `a_refused_impl_blocks_only_its_crates_goals`).
+/// `block`: zerocopy 0.8.63's src/impls.rs:751..800 reduced: `const _: () = { pub enum value {}
+/// unsafe impl<Client, T: ?Sized> HasField<Client, value, { crate::STRUCT_VARIANT_ID }, {
+/// crate::ident_id!(value) }> for ManuallyDrop<T> { .. } };`: a trait impl in a block naming a
+/// type of that block, with a macro call as a const argument (refused: the evaluator runs no
+/// macro call in a head). The walk of 12:12 had this impl as "88 x check gap: RefusedImpl ..
+/// the impl b6e41207260879b0.. at (no file place), a candidate of this question, has a refused
+/// header: .. Program("argument 2 of `HasField` is a constant; that parameter is not a const
+/// parameter", Range { start: 56, end: 61 })" in bodies that ask nothing of `HasField`.
+/// Without the fix the expected line of `block` is "trait impls: block: calls: not checked: ..
+/// check gap: RefusedImpl .. a candidate of this question, has a refused header" (NOT RUN by
+/// the writer: a writer runs nothing; if `block` is clean without the fix too, the walk's 88
+/// came by another road and the gap's new "[asked: ..]" text names it).
+#[test]
+fn a_trait_impl_is_no_candidate_of_an_inherent_question() {
+    const PLAIN: &str = "trait Tr<T> {}
+struct W<const N: usize>;
+struct X;
+impl X { fn m(&self) -> u8 { 1 } }
+impl core::fmt::Display for dyn Tr<W<{ core::mem::size_of::<u16>() }>> { fn fmt(&self, _f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result { Ok(()) } }
+fn calls() -> u8 { X.m() }
+fn main() {}
+";
+    const BLOCK: &str = "trait HasF<Client, Field, const V: i128, const F: i128> { fn only(&self) -> u8 { 0 } }
+const SV: i128 = 2;
+macro_rules! id { ($f:ident) => { 7 } }
+struct M<T>(T);
+struct X;
+impl X { fn m(&self) -> u8 { 1 } }
+const _: () = {
+    pub enum value {}
+    impl<Client, T> HasF<Client, value, { crate::SV }, { crate::id!(value) }> for M<T> {}
+};
+fn calls() -> u8 { X.m() }
+fn by_ref(x: &X) -> u8 { x.m() }
+fn main() {}
+";
+    let plain = check_fns(PLAIN, &["calls"]);
+    let block = check_fns(BLOCK, &["calls", "by_ref"]);
+    for (what, got) in [("plain", &plain), ("block", &block)] {
+        for (n, o) in got.iter() {
+            println!("trait impls: {what}: {n}: {o}");
+        }
+    }
+    all_clean("trait impls: plain", &plain);
+    all_clean("trait impls: block", &block);
+}
+
+/// A trait's const parameters keep their places in its head, and an impl's const arguments
+/// are read against them (the Reference, "Generic parameters", "Const generics": "A const
+/// argument in a path specifies the const value to use for that item"; a const argument is "a
+/// literal", "a single segment path" or "a block expression"): zerocopy 0.8.63 src/lib.rs:1310
+/// is `pub unsafe trait HasField<Client, Field, const VARIANT_ID: i128, const FIELD_ID: i128>`
+/// (`Self` is parameter 0, so the two const parameters are 3 and 4), and its impls give them
+/// `{ crate::STRUCT_VARIANT_ID }` and a literal. Here the trait has its first const parameter
+/// in third place (after `Self` and `Field`): `impl HasF<Val, 3, { SV }> for M` (a literal, a
+/// braced constant item) and `impl HasF<Val, { 4 }, -1> for Z` (a braced literal, a negative
+/// literal) build, so `M.f()` and `Z.f()` check clean. The walk's refusal "argument 2 of
+/// `HasField` is a constant; that parameter is not a const parameter" was NOT a lost const
+/// parameter: argument 2 there is `value`, a type of the impl's block that the impl's module
+/// does not name; `unresolved` has that shape at module level (`Nope` names nothing) and must
+/// say so by the name's resolution, never as "is a constant".
+#[test]
+fn a_trait_const_parameter_takes_a_literal_and_a_braced_constant() {
+    const TEXT: &str = "trait HasF<Field, const V: i128, const F: i128> { fn f(&self) -> u8 { 0 } }
+const SV: i128 = 2;
+enum Val {}
+struct M;
+struct Z;
+impl HasF<Val, 3, { SV }> for M {}
+impl HasF<Val, { 4 }, -1> for Z {}
+fn m() -> u8 { M.f() }
+fn z() -> u8 { Z.f() }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["m", "z"]);
+    all_clean("trait const parameters", &got);
+    const UNRESOLVED: &str = "trait HasF<Field, const V: i128, const F: i128> { fn f(&self) -> u8 { 0 } }
+struct M;
+impl HasF<Nope, 3, 4> for M {}
+fn m() -> u8 { M.f() }
+fn main() {}
+";
+    let got = check_fns(UNRESOLVED, &["m"]);
+    println!("trait const parameters: unresolved: {got:?}");
+    assert!(got[0].1.contains("has a refused header") && !got[0].1.contains("is a constant"), "{got:?}");
+}
+
+/// An UNREAD trait impl written with no type argument on its trait is judged by the bare home
+/// as a read one is (the Reference, "Orphan rules": "at least one of the types `T0..=Tn` must be
+/// a local type"; with the trait's parameters at their default `Self` only `T0` can be). `impl
+/// Nope for Missing {}` resolves neither its trait nor its self type (serde's `impl<'de>
+/// _serde::Deserialize<'de> for __Field` in a block is filed so today: tempo-front-6b's "7443
+/// NEW gap UnreadImpl"), so it is a candidate of every trait question at every shape; `u16:
+/// PartialEq` (core's trait, `Rhs = Self`, a built-in self type) cannot be answered by an impl
+/// of this crate written without arguments: clean. `u16: From<u8>` (a parameter with no
+/// default: no narrowing without the goal's arguments) stays the gap naming the unread impl.
+/// Without the fix the expected line is "unread bare: bare: not checked: .. a candidate filed
+/// without its trait or self type (unread as written), has no header" (NOT RUN by the writer).
+#[test]
+fn an_unread_bare_trait_impl_is_judged_by_the_bare_home() {
+    const TEXT: &str = "impl Nope for Missing {}
+fn need_eq<T: PartialEq>(_t: T) {}
+fn need_from<T: From<u8>>(_t: T) {}
+fn bare() { need_eq(7u16) }
+fn with_args() { need_from(7u16) }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["bare", "with_args"]);
+    for (n, o) in &got {
+        println!("unread bare: {n}: {o}");
+    }
+    assert_eq!(got[0].1, "clean", "{got:?}");
+    assert!(got[1].1.contains("unread as written"), "{got:?}");
+}
+
+/// The row of each ADT named `adts` in the crate `text`, made as front2/program.rs's ADT-row
+/// loop makes it (`Store::ensure(Want::Adt)`; a constant its head names is evaluated by
+/// `eval_len` and the head made again, at most four times): per ADT its name and either
+/// "fields [..]" with each field's type node printed (a pattern type as `base is [lo..=hi, ..]`
+/// with the bits the constant evaluator gave) and "discrs [..]", or the refusal as printed.
+fn adt_rows(text: &str, adts: &[&str]) -> Vec<(String, String)> {
+    use blaze_ladder::front2::check::eval_len;
+    use blaze_ladder::front2::heads::{HeadError, Want};
+    use blaze_ladder::front2::keys::checker_of;
+    use blaze_ladder::front2::types::Why;
+    use blaze_typeck::PNode;
+    let home = std::env::var("HOME").expect("HOME is set");
+    let shelf = format!("{home}/.blaze/v2/toolchain");
+    let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+    let files = [("/hello-world/src/main.rs".to_string(), text.to_string())];
+    let edition = edition::PackageEdition::of_manifest(EDITION).expect("a known edition");
+    let user = UserCrate { name: "hello_world", dir: "/hello-world/", root: "/hello-world/src/main.rs", files: &files, edition };
+    let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let sources = [SourceFile { path: "src/main.rs", text }];
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
+    let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+    let prepared = Prepares::new_in(Alloc::global());
+    let mut store = Store::new(front.index.lang("sized"), front.frame);
+    let (mut buckets, mut consts) = (None, Consts::default());
+    let mut got = Vec::new();
+    for &n in adts {
+        let found = names::path(&names, names.root(0), Namespace::Types, Written { kind: PathKind::Plain, segments: &[n] }, Alloc::global())
+            .unwrap_or_else(|e| panic!("`{n}`: {e}"));
+        let lib = found.whole(1).unwrap_or_else(|| panic!("`{n}` not named")).key;
+        let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: Some((&mut consts, prepared)) };
+        let mut lens = 0;
+        let refused = loop {
+            match records.store.ensure(records.names, records.keys, Want::Adt(lib)) {
+                Err(HeadError::Item(_, Why::NeedConst(c, _))) if lens < 4 => {
+                    lens += 1;
+                    if let Err(e) = eval_len(&mut records, c) {
+                        break Some(format!("the constant {c:x} its head names: {e:?}"));
+                    }
+                }
+                Err(e) => break Some(format!("{e:?}")),
+                Ok(()) => break None,
+            }
+        };
+        let outcome = match (refused, store.adts.get(&checker_of(lib))) {
+            (Some(why), _) => format!("refused: {why}"),
+            (None, None) => "made, but no row filed under its key".to_string(),
+            (None, Some(row)) => {
+                let view = store.tys.view();
+                let mut fields = Vec::new();
+                for f in row.fields.iter() {
+                    fields.push(match view.node(f.ty) {
+                        Ok(PNode::Pat(base, ends)) => {
+                            let ends = view.list(ends).expect("the pattern's ends");
+                            let mut runs = Vec::new();
+                            for pair in ends.chunks(2) {
+                                let bits = |t| match view.node(t) {
+                                    Ok(PNode::ConstValue { bits, .. }) => format!("{bits:#x}"),
+                                    other => format!("{other:?}"),
+                                };
+                                runs.push(format!("{}..={}", bits(pair[0]), bits(pair[1])));
+                            }
+                            format!("{:?} is [{}]", view.node(base).expect("the base"), runs.join(", "))
+                        }
+                        other => format!("{other:?}"),
+                    });
+                }
+                format!("fields [{}] discrs {:?}", fields.join("; "), row.discrs)
+            }
+        };
+        got.push((n.to_string(), outcome));
+    }
+    got
+}
+
+/// A pattern type whose range end is a constant item (the pinned core,
+/// library/core/src/num/niche_types.rs:113 "const HALF_USIZE: usize = usize::MAX >> 1;" and
+/// :129 "    pub struct UsizeNoHighBit(usize is 0..=HALF_USIZE);", inside
+/// `define_valid_range_type! { .. }` whose arm writes "$vis struct $name(pattern_type!($int is
+/// $pat));"; :114 "const HALF_USIZE_MINUS_ONE: usize = HALF_USIZE - 1;" is a constant that
+/// names a constant). The struct's row is made with ONE field whose type is the pattern type
+/// over `usize` with the one range `0..=0x7fffffffffffffff` (`usize::MAX >> 1` on a 64-bit
+/// target, the value the constant evaluator gave for `HALF_USIZE`), and the second's with
+/// `0..=0x7ffffffffffffffe`. The walk's "111 x NoAdt: no row for the ADT
+/// `core::num::niche_types::UsizeNoHighBit`; the first: `main`" is the builder finding no row:
+/// this fixture says whether the HEAD is the reason (a refusal printed here) or the seam
+/// (the row is made here and still not found there).
+#[test]
+fn a_pattern_type_range_end_is_a_constant_items_value() {
+    const TEXT: &str = "#![feature(pattern_types, pattern_type_macro)]
+use core::pattern_type;
+macro_rules! define_valid_range_type {
+    ($(
+        $(#[$m:meta])*
+        $vis:vis struct $name:ident($int:ident is $pat:pat);
+    )+) => {$(
+        #[repr(transparent)]
+        $(#[$m])*
+        $vis struct $name(pattern_type!($int is $pat));
+    )+};
+}
+const HALF_USIZE: usize = usize::MAX >> 1;
+const HALF_USIZE_MINUS_ONE: usize = HALF_USIZE - 1;
+define_valid_range_type! {
+    pub struct UsizeNoHighBit(usize is 0..=HALF_USIZE);
+    pub struct UsizeNoHighBitMinusOne(usize is 0..=HALF_USIZE_MINUS_ONE);
+}
+fn main() {}
+";
+    let got = adt_rows(TEXT, &["UsizeNoHighBit", "UsizeNoHighBitMinusOne"]);
+    for (n, o) in &got {
+        println!("pattern type head: {n}: {o}");
+    }
+    assert_eq!(got[0].1, "fields [Uint(Usize) is [0x0..=0x7fffffffffffffff]] discrs []", "{got:?}");
+    assert_eq!(got[1].1, "fields [Uint(Usize) is [0x0..=0x7ffffffffffffffe]] discrs []", "{got:?}");
+}
+
+/// An enum's written discriminant is a constant expression (the Reference, "Enumerations",
+/// "Discriminants": "an enumeration can explicitly state its discriminants by following the
+/// variant name with `=` and a constant expression"), not only a literal or a constant item: the
+/// pinned core's library/core/src/mem/alignment.rs:377 has "#[repr(usize)]" / "enum
+/// AlignmentEnum {" / "    _Align1Shl0 = 1 << 0," / "    _Align1Shl1 = 1 << 1," .. (the walk's
+/// "14 x NoAdt" on `AlignmentEnum`). The row holds each value: 1, 2, 4, and `(1 << 3) | 1` = 9.
+/// IGNORED until the constant evaluator can be asked an ANONYMOUS constant: today heads.rs
+/// `discriminants` refuses `1 << 0` as `Why::ConstPath` (expected line today: "discriminant
+/// expressions: AlignmentEnum: refused: Item(.., ConstPath(\"1 << 0\", ..))"). What is missing,
+/// in order: a key for (enum, variant)'s discriminant (keys.rs `MemberKind`), a head in
+/// `Store::fns` for it (no inputs, output the enum's `discr_ty`, text the expression) so
+/// body.rs `lower_member` lowers the expression as a body, consts.rs
+/// `ConstsWorld::explicit_discriminant` answering that key (it answers `None`), and a
+/// `Why::NeedConst`-like need carrying a checker key (`NeedConst` and `check::eval_len` take a
+/// library key, which an anonymous constant has not).
+#[test]
+#[ignore = "an anonymous constant (a discriminant expression) cannot be asked of the evaluator yet"]
+fn a_discriminant_is_a_constant_expression() {
+    const TEXT: &str = "#[repr(usize)]
+enum AlignmentEnum {
+    _Align1Shl0 = 1 << 0,
+    _Align1Shl1 = 1 << 1,
+    _Align1Shl2 = 1 << 2,
+    Odd = (1 << 3) | 1,
+}
+#[repr(i8)]
+enum Signed { A = -(1 << 3), B = 5 - 2, C }
+fn main() {}
+";
+    let got = adt_rows(TEXT, &["AlignmentEnum", "Signed"]);
+    for (n, o) in &got {
+        println!("discriminant expressions: {n}: {o}");
+    }
+    assert_eq!(got[0].1, "fields [] discrs [1, 2, 4, 9]", "{got:?}");
+    assert_eq!(got[1].1, "fields [] discrs [-8, 3, 4]", "{got:?}");
+}
+
 #[test]
 fn sort_probe() {
     const TEXT: &str = "fn chunks(hex: &[u8]) -> usize { let mut n = 0; for (at, _p) in hex.chunks_exact(2).enumerate() { n = at; } n }

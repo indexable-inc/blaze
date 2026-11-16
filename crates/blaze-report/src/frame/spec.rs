@@ -51,7 +51,7 @@ fn draw(shown: &str, absolute: &str, text: &str, finding: Finding<'_>, caps: Cap
 fn draw_fixes(shown: &str, absolute: &str, text: &str, finding: Finding<'_>, caps: Caps, fixes: Fixes) -> String {
     let sources = [Source { shown, absolute, text: text.as_bytes() }];
     let findings = [finding];
-    let input = Input { findings: &findings, sources: &sources, link: LINK_FILE, fixes };
+    let input = Input { findings: &findings, sources: &sources, link: LINK_FILE, fixes, ids: &[] };
     let mut out = AString::new_in(Alloc::global());
     render(&mut out, &input, caps, Alloc::global()).expect("the finding's ranges are in its file");
     out.as_str().to_string()
@@ -437,7 +437,7 @@ fn a_fix_names_a_command_only_where_one_applies_it() {
     let line = |fixes| {
         let counts = Counts { warnings: 1, files: 1, fixable: 1, ..Counts::default() };
         let mut out = AString::new_in(Alloc::global());
-        closing(&mut out, &Closing { counts, checked: 1, nanos: 1_090_000, changed: None, fixes, coverage: None }, ansi(80));
+        closing(&mut out, &Closing { counts, checked: 1, nanos: 1_090_000, changed: None, fixes, coverage: None, fix_with: "" }, ansi(80));
         out.as_str().to_string()
     };
     same("closing by hand", &line(Fixes::ByHand), &[WARNING, "1 warning", D, " · 1 file checked · 1.1 ms", R, "\n"].concat());

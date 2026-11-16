@@ -1,0 +1,4 @@
+[package]
+name = "ladder-x-clo-04-generic-fn"
+version = "0.1.0"
+edition = "blaze-2026.11"

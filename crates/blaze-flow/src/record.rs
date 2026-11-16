@@ -19,6 +19,10 @@ pub enum Plant {
     TierTwoReversed,
     /// Tier one does not close contained loans over the subset graph.
     TierOneUnclosed,
+    /// The signature's relations are ignored: no placeholder is known to outlive another.
+    KnownIgnored,
+    /// A relation the signature does not state is taken as known: every pair of placeholders.
+    AllKnown,
 }
 
 /// The proof that a body passed the move and borrow checks: only [`check`] makes one, and the

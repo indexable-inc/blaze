@@ -30,6 +30,7 @@ pub mod native;
 pub mod outputs;
 pub mod pinned;
 pub mod probe;
+pub mod toolchain;
 
 #[cfg(test)]
 mod git_tests;

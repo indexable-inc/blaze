@@ -1,0 +1,21 @@
+{
+  "comment": "D65/D69: the pinned C toolchain native build scripts run with (clang, libclang, llvm-ar), the LLVM project's own release of the LLVM version llvm.json pins (23.1.4) until our fork's archive carries a clang (.github/scripts/llvm.py). Read by blaze_build_script::native::pin. `sysroots`: the C library headers per target; macOS takes the machine's SDK by version and the headers read (D69), Linux a pinned glibc sysroot: none pinned yet (null).",
+  "version": "23.1.4",
+  "release": "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.4",
+  "targets": {
+    "aarch64-apple-darwin": {
+      "name": "LLVM-23.1.4-macOS-ARM64.tar.xz",
+      "size": 1570051292,
+      "sha256": "5d3179db39adeca5b17a34d82708fe976bc60e055b05fe557878fb3fb64d39ef"
+    },
+    "aarch64-unknown-linux-gnu": {
+      "name": "LLVM-23.1.4-Linux-ARM64.tar.xz",
+      "size": 1829686400,
+      "sha256": "9b27cf263d711aa6ebfd4045ab241d947bd09b3cd19ffa5728f48a80c9eb3a91"
+    }
+  },
+  "sysroots": {
+    "aarch64-apple-darwin": "macos-sdk",
+    "aarch64-unknown-linux-gnu": null
+  }
+}

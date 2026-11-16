@@ -1,8 +1,8 @@
 //! Floats and 128-bit integers in the walk.
 //!
 //! - `f32` and `f64` are `Repr::Float` (their LIR scalar); `f16` and `f128` are refused by name.
-//!   Arithmetic is `fadd`/`fsub`/`fmul`/`fdiv`/`frem` (the emitter refuses `frem`: a call of
-//!   `fmod`); unary `-` is `fneg`. The Reference, "Comparison operators": a float comparison is
+//!   Arithmetic is `fadd`/`fsub`/`fmul`/`fdiv`/`frem` (the emitter calls `fmod`/`fmodf` for
+//!   `frem`); unary `-` is `fneg`. The Reference, "Comparison operators": a float comparison is
 //!   IEEE 754's, so with a `NaN` on either side `==`, `<`, `<=`, `>`, `>=` are false and `!=` is
 //!   true: `fcmp` `oeq`, `olt`, `ole`, `ogt`, `oge`, and `une`.
 //! - "Type cast expressions" (the table's rows for numeric casts): "Casting from a float to an
@@ -87,16 +87,12 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
             }
             (Repr::Float(f), Repr::Int { ty, signed }) => {
                 let x = self.scalar(v, f)?;
-                if ty == Ty::I128 {
-                    return Err(unsupported(e, "a float to `u128`/`i128` cast (compiler_builtins' `__fixdfti` and kin)"));
-                }
+                // At `i128` too: the emitter calls `__fixdfti` and kin, saturating around them.
                 self.b.convert(if signed { Op::FptoSi } else { Op::FptoUi }, Flags::NONE, ty, x)
             }
             (Repr::Int { ty, signed }, Repr::Float(t)) => {
                 let x = self.scalar(v, ty)?;
-                if ty == Ty::I128 {
-                    return Err(unsupported(e, "a `u128`/`i128` to float cast (compiler_builtins' `__floattidf` and kin)"));
-                }
+                // At `i128` too: the emitter calls `__floattidf` and kin.
                 self.b.convert(if signed { Op::SitoFp } else { Op::UitoFp }, Flags::NONE, t, x)
             }
             _ => return Err(unsupported(e, "this cast of a float (to or from other than a number)")),

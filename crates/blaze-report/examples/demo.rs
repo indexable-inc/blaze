@@ -269,7 +269,7 @@ fn main() {
         out.push_str("── before ──\n");
         old_render(&mut out, findings, &sources, old);
         out.push_str("── after ──\n");
-        render(&mut out, &Input { findings, sources: &sources, link: LINK_FILE, fixes: Fixes::ByHand }, caps, Alloc::global())
+        render(&mut out, &Input { findings, sources: &sources, link: LINK_FILE, fixes: Fixes::ByHand, ids: &[] }, caps, Alloc::global())
             .expect("every range is in its file");
         out.push_str("\n");
         for finding in findings {
@@ -279,6 +279,6 @@ fn main() {
     if caps.form == Form::Frames {
         out.push_str("── after: the closing line ──\n");
     }
-    closing(&mut out, &Closing { counts, checked: 8, nanos: 2_400_000, changed: Some(0), fixes: Fixes::ByHand, coverage: None }, caps);
+    closing(&mut out, &Closing { counts, checked: 8, nanos: 2_400_000, changed: Some(0), fixes: Fixes::ByHand, coverage: None, fix_with: "" }, caps);
     print!("{}", out.as_str());
 }

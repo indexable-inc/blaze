@@ -14,7 +14,7 @@
 //! Cost: a small allocation is a bump in the local block (about 2 ns); a block refill is one
 //! compare-and-swap on the arena; a chunk refill is one pop from the cache.
 
-use std::{
+use core::{
     alloc::{AllocError, Allocator, Layout},
     cell::Cell,
     mem::{ManuallyDrop, MaybeUninit},
@@ -252,8 +252,8 @@ impl Drop for Arena {
     }
 }
 
-impl std::fmt::Debug for Arena {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for Arena {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Arena")
             .field("tag", &self.tag)
             .field("held", &self.held())

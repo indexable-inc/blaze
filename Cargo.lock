@@ -426,6 +426,7 @@ dependencies = [
  "blaze-surface",
  "blaze-text",
  "blaze-toolchain",
+ "blaze-typeck",
  "blaze-unit-graph",
  "blaze-world",
  "edition",
@@ -503,6 +504,15 @@ dependencies = [
  "blaze-sys",
  "libc",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "blaze-coroutine"
+version = "0.0.0"
+dependencies = [
+ "blaze-flow",
+ "blaze-own",
+ "blaze-sim",
 ]
 
 [[package]]
@@ -1258,6 +1268,7 @@ dependencies = [
  "blaze-fetch",
  "blaze-file-items",
  "blaze-format",
+ "blaze-http",
  "blaze-id",
  "blaze-ids",
  "blaze-lex",

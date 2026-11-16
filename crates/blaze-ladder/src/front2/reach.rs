@@ -29,8 +29,14 @@ use super::types::Why;
 use super::spell::Spelling;
 use crate::front::FnLang;
 
-/// The most fns one walk visits (rule 18: a table has a cap).
-pub const MOST_FNS: usize = 4096;
+/// The most fns one walk visits (rule 18: a table has a cap), sized by need: a walk reaches
+/// only fns of the program's crates, and the toolchain's core alone holds 29,243 fn heads
+/// (port27/front2/heads-4.txt: 10,979 fns and 18,264 impl fns), alloc and std together fewer
+/// than as many again, bstd a few thousand: 65,536 is above the whole library's fn count, so
+/// the cap is met only by a walk that does not end (a bug). The hello world's walk reached
+/// 1,093 from `main` (list-AE); the entry program's reach was refused at the old 4,096.
+/// [`Census::queued`] says how many were still waiting when the cap stopped it.
+pub const MOST_FNS: usize = 65_536;
 
 /// The most array-length constants one body may need evaluated before it lowers (rule 18).
 const MOST_LENS: u32 = 64;
@@ -61,6 +67,8 @@ pub struct Census<'n> {
     pub bodies: Vec<(Body<'n>, Checked<'static>), Global>,
     /// Whether [`MOST_FNS`] stopped the walk.
     pub capped: bool,
+    /// The fns still waiting in the work list when [`MOST_FNS`] stopped it (0 when it ended).
+    pub queued: usize,
     /// The calls of bodies that did not check which only their types could name (a method
     /// call, a path through a type, a trait's fn, a qualified path): not followed.
     pub not_followed: usize,
@@ -240,7 +248,7 @@ pub fn reach<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, owner: ItemKe
             Err(clash) => (clash.key, Some(Reached::Failed { class: Box::from("key clash"), detail: format!("{clash}").into_boxed_str() })),
         });
     }
-    let mut census = Census { fns: Vec::new_in(Global), bodies: Vec::new_in(Global), capped: false, not_followed: 0 };
+    let mut census = Census { fns: Vec::new_in(Global), bodies: Vec::new_in(Global), capped: false, queued: 0, not_followed: 0 };
     let first: Option<&Checked<'_>> = match first {
         First::Checked(c) => {
             queue_targets(r, scope, owner, c, &mut queue);
@@ -270,6 +278,7 @@ pub fn reach<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, owner: ItemKe
         }
         if census.fns.len() == MOST_FNS {
             census.capped = true;
+            census.queued = queue.len() + 1;
             break;
         }
         if let Some(outcome) = decided {

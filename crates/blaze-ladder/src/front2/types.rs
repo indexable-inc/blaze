@@ -618,6 +618,16 @@ impl<'b, 'n, H: Heads> Builder<'b, 'n, H> {
                                     self.path_ty(tys, env, v, tp, &[])?
                                 } else {
                                     let ar = place(v, v.type_range(t))?;
+                                    // A name that is no parameter, no type and no value here
+                                    // names nothing: refused as unresolved, never guessed to be
+                                    // a constant (zerocopy's `HasField<Client, value, ..>`, whose
+                                    // `value` is an enum of the impl's own block, was refused
+                                    // "argument 2 of `HasField` is a constant").
+                                    if param.is_none() && name != "true" && name != "false" {
+                                        if let Err(e) = self.resolver.path(env.module, false, &[name], Ns::Value) {
+                                            return Err(Why::Resolve(e, ar));
+                                        }
+                                    }
                                     let want = |_: &mut PortableTys<'_>| self.const_want(env, sabs, &stexts, index, ar);
                                     self.const_term(tys, env, name, ar, &want)?
                                 }

@@ -19,6 +19,7 @@ mod atomic;
 mod bulk;
 mod float;
 mod int;
+mod runtime;
 mod tls;
 mod wide;
 
@@ -603,7 +604,9 @@ impl<A: Allocator> Pass<'_, '_, A> {
         self.put_to(enc::ldr_lit(rt, 0), Field::Imm19, Label::Word(index));
     }
 
-    /// Calls the system routine `routine` with the arguments already in `x0..x2`.
+    /// Calls the system routine `routine` with its arguments already in their registers
+    /// (`x0..x3`, `d0`/`d1`); it may take every caller-saved register, which nothing holds
+    /// across an instruction (every value lives in its cell).
     fn call_routine(&mut self, routine: crate::Routine) {
         self.ld_word(X16, RelocTo::Routine(routine));
         self.put(enc::blr(X16));

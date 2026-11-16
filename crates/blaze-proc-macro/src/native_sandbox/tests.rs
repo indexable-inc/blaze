@@ -124,6 +124,23 @@ fn a_native_script_cannot_start_a_program_it_was_not_granted() {
     hostile("exec", |_| "exec /bin/echo".to_owned());
 }
 
+/// D69: the machine's own C compiler is never reachable: `/usr/bin/cc` (the shim that would
+/// start Xcode's clang) cannot be started from inside.
+#[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "the Linux sandbox's tests run on the VM: remove this on Linux")]
+fn a_native_script_cannot_start_the_machines_cc() {
+    hostile("cc", |_| "exec /usr/bin/cc".to_owned());
+}
+
+/// D69: nor can Xcode's clang be read (so not copied into `OUT_DIR` and started from there).
+#[test]
+#[cfg(target_os = "macos")]
+fn a_native_script_cannot_read_xcodes_clang() {
+    const XCODE_CLANG: &str = "/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang";
+    assert!(std::path::Path::new(XCODE_CLANG).is_file(), "this machine has no Xcode clang at {XCODE_CLANG}: the test proves nothing");
+    hostile("xcode-clang", |_| format!("read {XCODE_CLANG}"));
+}
+
 #[test]
 #[cfg_attr(not(target_os = "macos"), ignore = "the Linux sandbox's tests run on the VM: remove this on Linux")]
 fn a_native_script_inside_its_grant_reads_its_package_and_writes_out_dir() {

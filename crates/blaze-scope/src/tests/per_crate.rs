@@ -190,7 +190,8 @@ fn records_equal_across_workers_and_orders() {
         all.iter()
             .map(|c| {
                 let names = crate::names_record::encode(c.names, g).unwrap_or_else(|e| panic!("names record of `{}`: {e:?}", c.names.name));
-                (c.record.to_vec(), c.inner.to_vec(), crate::asked::encode(c.names.key, &[], &c.asked, g).to_vec(), names.to_vec())
+                let items = crate::items_record::encode(c.names, g).unwrap_or_else(|e| panic!("items record of `{}`: {e:?}", c.names.name));
+                (c.record.to_vec(), c.inner.to_vec(), crate::asked::encode(c.names.key, &[], &c.asked, g).to_vec(), names.to_vec(), items.to_vec())
             })
             .collect::<Vec<_>>()
     };
@@ -208,6 +209,7 @@ fn records_equal_across_workers_and_orders() {
                 assert!(a.1 == b.1, "crate `{}`: inner differs, 1 worker vs 4 with ranks {rank:?} (core {:?})", crates[i].name, sysroot.core);
                 assert!(!a.2.is_empty() && a.2 == b.2, "crate `{}`: read list differs, 1 worker vs 4 with ranks {rank:?} (core {:?})", crates[i].name, sysroot.core);
                 assert!(!a.3.is_empty() && a.3 == b.3, "crate `{}`: names record differs, 1 worker vs 4 with ranks {rank:?} (core {:?})", crates[i].name, sysroot.core);
+                assert!(!a.4.is_empty() && a.4 == b.4, "crate `{}`: items record differs, 1 worker vs 4 with ranks {rank:?} (core {:?})", crates[i].name, sysroot.core);
             }
         }
     }

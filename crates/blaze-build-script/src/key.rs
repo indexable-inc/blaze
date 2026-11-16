@@ -71,8 +71,11 @@ pub struct KeyInputs<'k> {
 pub enum RunnerKey<'k> {
     /// Wasm: adds nothing, so the keys of wasm records made before D65 stand.
     Wasm,
-    /// Native: the pinned C toolchain's shelf digest and the host target the binary is for.
-    Native { compiler: [u8; 32], target: &'k str },
+    /// Native: the pinned C toolchain's shelf digest, the host target the binary is for, and the
+    /// C headers' identity known before the run (D69): `macos-sdk <version>` (the version from
+    /// the SDK's `SDKSettings.json`), or a pinned sysroot's digest. The headers actually read
+    /// are the record's read list ([`crate::toolchain::headers_digest`]), not its key.
+    Native { compiler: [u8; 32], target: &'k str, sysroot: &'k str },
 }
 
 /// The domain of the base key; a change to what it covers takes the next number.
@@ -98,8 +101,8 @@ pub fn base(inputs: &KeyInputs<'_>, scratch: &mut blaze_own::AVec<'_, u8>) -> Co
         .update(&l.out_dir_files.to_le_bytes())
         .update(&l.output.to_le_bytes())
         .update(&l.line.to_le_bytes());
-    if let RunnerKey::Native { compiler, target } = inputs.runner {
-        hasher.part(b"native").part(&compiler).part(target.as_bytes());
+    if let RunnerKey::Native { compiler, target, sysroot } = inputs.runner {
+        hasher.part(b"native").part(&compiler).part(target.as_bytes()).part(sysroot.as_bytes());
     }
     hasher.finish()
 }

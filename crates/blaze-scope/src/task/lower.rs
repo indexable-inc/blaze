@@ -1457,6 +1457,33 @@ pub struct ImplSrc<'t> {
     pub loc: Loc,
 }
 
+/// A `fn`, `const` or `static` (an item or a member) whose text may write an `impl` in a
+/// block: its outline flag says its body holds items and its text holds the word. The driver
+/// scans it ([`blaze_file_items::nested::scan`]) and makes its blocks' modules
+/// ([`crate::blocks`]).
+#[derive(Clone, Copy, Debug)]
+pub struct BodySrc<'t> {
+    pub key: ItemKey,
+    /// The module its names are read in.
+    pub module: ItemKey,
+    /// Its whole text.
+    pub text: &'t str,
+    pub loc: Loc,
+    /// How many expansions (and bodies) deep its text is.
+    pub depth: u16,
+}
+
+impl<'t> BodySrc<'t> {
+    /// The entry for an item of `detail` and `text`, if its body may write an impl.
+    fn of(detail: ItemDetail, key: ItemKey, module: ItemKey, text: &'t str, loc: Loc, depth: u16) -> Option<BodySrc<'t>> {
+        let holds = matches!(
+            detail,
+            ItemDetail::Fn { body_holds_items: true } | ItemDetail::Const { body_holds_items: true } | ItemDetail::Static { body_holds_items: true }
+        );
+        (holds && text.contains("impl")).then_some(BodySrc { key, module, text, loc, depth })
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct LangSrc<'t> {
     pub name: &'t str,
@@ -1577,6 +1604,8 @@ pub struct Lowered<'t, 'a> {
     pub macro_use: AVec<'a, &'t str>,
     /// Each item's text (an impl's too).
     pub texts: AVec<'a, ItemText<'t>>,
+    /// The items and members whose body may write an impl in a block ([`BodySrc`]).
+    pub bodies: AVec<'a, BodySrc<'t>>,
     /// The `mod` items of a module a macro wrote (or of one inside it): modules the walk did
     /// not see, for the driver to make.
     pub mods_made: AVec<'a, ModMade<'t>>,
@@ -1667,6 +1696,7 @@ pub fn lower<'p: 't, 't, 'a, W: Walked + ?Sized>(cx: LowerCx<'_, 'p, W>, fragmen
             prelude: None,
             macro_use: AVec::new_in(alloc),
             texts: AVec::new_in(alloc),
+            bodies: AVec::new_in(alloc),
             mods_made: AVec::new_in(alloc),
             members: AVec::new_in(alloc),
             ctors: AVec::new_in(alloc),
@@ -1862,6 +1892,9 @@ impl<'t, 'a, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
         if let Some(lang) = attrs.lang {
             let loc = self.loc(at);
             self.out.langs.push(LangSrc { name: lang, key, loc });
+        }
+        if let Some(body) = BodySrc::of(item.detail, key, self.module, whole, self.loc(at), self.depth) {
+            self.out.bodies.push(body);
         }
         match item.detail {
             ItemDetail::Fn { .. } | ItemDetail::Const { .. } | ItemDetail::Static { .. } => {
@@ -2119,6 +2152,9 @@ impl<'t, 'a, W: Walked + ?Sized> Lower<'_, 't, 'a, W> {
             let key = self.key(key_owner, "assoc", name.unwrap_or(""));
             let whole = &text[item.range.start as usize..item.range.end as usize];
             members.push(Member { key, name, item: idx, detail: item.detail, text: whole, written_by });
+            if let Some(body) = BodySrc::of(item.detail, key, self.module, whole, self.loc(item.range.start), self.depth) {
+                self.out.bodies.push(body);
+            }
             if is_call {
                 self.fn_like_call(item, key, Some(parent_key));
             }

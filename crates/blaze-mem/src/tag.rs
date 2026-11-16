@@ -29,10 +29,10 @@
 
 use std::{cell::Cell, fmt, sync::OnceLock};
 
-// `std`'s even under `cfg(blaze_check)`: the counters are process-wide statics every test
+// `core`'s even under `cfg(blaze_check)`: the counters are process-wide statics every test
 // shares, and a model execution restarts a checker atomic from its initial value and writes
 // its own newest value back, which would drop the bytes of regions alive outside the model.
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 /// The subsystem memory is held for.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]

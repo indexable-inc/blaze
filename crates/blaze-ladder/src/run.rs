@@ -72,6 +72,14 @@ pub enum RunError {
     Emit { function: Named, error: EmitError },
     /// A function the program calls that is neither a body nor an outside symbol.
     Callee { function: Named, callee: ItemKey },
+    /// The build of `function` met `item` (a fn it calls, an ADT a type names), which the
+    /// survey left out of the program for `why` (the seam's `left_out`: the callee's own check
+    /// failed, its ADT row was not made, it has no head): the cause, not the symptom ("no ABI",
+    /// "no ADT row", "no callee"). `path` is its name where the front end gives it.
+    LeftOut { function: Named, item: ItemKey, path: Option<Box<str>>, why: Box<str> },
+    /// The build of `function` asked the seam to normalize a projection and got no type: `why`
+    /// names the trait, `Self`'s form and the solver's error (the seam's `last_projection`).
+    Projection { function: Named, why: Box<str> },
     /// A call of a trait's fn found no impl to run.
     Resolve { function: Named, callee: ItemKey, error: ResolveError },
     /// A vtable the function takes the address of could not be made.
@@ -126,6 +134,11 @@ impl core::fmt::Display for RunError {
             RunError::Callee { function, callee } => {
                 write!(f, "`{function}` calls item {:#x}, which is neither a body nor an outside symbol", callee.0)
             }
+            RunError::Projection { function, why } => write!(f, "`{function}`: a projection the seam did not normalize: {why}"),
+            RunError::LeftOut { function, item, path, why } => match path {
+                Some(path) => write!(f, "`{function}` needs `{path}` ({:#x}), which the program left out: {why}", item.0),
+                None => write!(f, "`{function}` needs item {:#x}, which the program left out: {why}", item.0),
+            },
             RunError::Resolve { function, callee, error } => {
                 write!(f, "`{function}` calls trait fn {:#x}: {error}", callee.0)
             }
@@ -230,6 +243,8 @@ impl RunError {
             | RunError::NoAdt { ref function, .. }
             | RunError::Emit { ref function, .. }
             | RunError::Callee { ref function, .. }
+            | RunError::LeftOut { ref function, .. }
+            | RunError::Projection { ref function, .. }
             | RunError::Resolve { ref function, .. }
             | RunError::Vtable { ref function, .. }
             | RunError::MainShape { main: ref function, .. }
@@ -729,12 +744,18 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
         self.0.static_item(item)
     }
 
-    /// A `const` item's value as `eval_consts` made it; none at generic arguments yet.
+    /// A `const` item's value: the front end's own (front2 evaluates every constant its bodies
+    /// read) or, for a front that evaluates none, as `eval_consts` made it from the tabled
+    /// constants (the two never both hold one: front2 tables no constant); none at generic
+    /// arguments yet.
     fn const_value(&self, item: ItemKey, args: &[PTy]) -> Option<&DataRecord<Global>> {
         if !args.is_empty() {
             return None;
         }
-        self.2.iter().find(|(k, _)| *k == item).map(|(_, record)| record)
+        match self.0.const_record(item) {
+            Some(record) => Some(record),
+            None => self.2.iter().find(|(k, _)| *k == item).map(|(_, record)| record),
+        }
     }
 
     fn intrinsic(&self, item: ItemKey) -> Option<Intrinsic> {
@@ -1034,13 +1055,33 @@ fn filed(survey: &mut Option<&mut Vec<(Box<str>, Box<str>), Global>>, e: RunErro
             (function, format!("NoAdt: no row for the ADT {shown}").into_boxed_str())
         }
         RunError::Emit { function, error } => (function, format!("emit: {}", class_of(&format!("{error:?}"))).into_boxed_str()),
-        RunError::Callee { function, .. } => (function, Box::from("callee: neither a tabled body nor an outside symbol")),
+        // By the callee's key, so each fn the walk never reached is its own class.
+        RunError::Callee { function, callee } => {
+            (function, format!("callee {:#x}: neither a tabled body nor an outside symbol (never reached by the walk)", callee.0).into_boxed_str())
+        }
+        RunError::Projection { function, why } => (function, format!("Projection: {why}").into_boxed_str()),
+        // Grouped by the item and its cause, so each left-out item is one class.
+        RunError::LeftOut { function, item, path, why } => {
+            let shown = path.as_deref().map_or_else(|| format!("{:#x}", item.0), |p| format!("`{p}`"));
+            let said = format!("left out: {shown}: {why}");
+            (function, Box::from(said.char_indices().nth(240).map_or(&*said, |(i, _)| &said[..i])))
+        }
         RunError::Resolve { function, error, .. } => (function, format!("callee: resolve {}", class_of(&format!("{error:?}"))).into_boxed_str()),
         RunError::Vtable { function, why, .. } => (function, format!("vtable: {}", class_of(&format!("{why:?}"))).into_boxed_str()),
         _ => return Err(e),
     };
     out.push((format!("{function}").into_boxed_str(), class));
     Ok(())
+}
+
+/// The refusal of `function`'s call of `callee`, which is neither a tabled body nor an outside
+/// symbol: the survey's cause where it left the callee out ([`RunError::LeftOut`]), else
+/// [`RunError::Callee`] (a fn the walk never reached: reach.rs's `Instances` did not table it).
+fn callee_refusal<P: FrontEnd>(program: &P, function: Named, callee: ItemKey) -> RunError {
+    match program.left_out(callee) {
+        Some(why) => RunError::LeftOut { function, item: callee, path: program.item_named(callee), why: Box::from(why) },
+        None => RunError::Callee { function, callee },
+    }
 }
 
 /// Why a vtable was not made, named.
@@ -1127,7 +1168,11 @@ fn build_from<P: FrontEnd>(program: &mut P, surveyed: Option<(&mut Vec<(Box<str>
     // then the method and the instance's own arguments ([`closure_key_args`]).
     let checked_bodies = Bodies { checked: &checked, closures: ClosureTable::of(program, &checked) };
     let key_of = |c: usize, instance: Instance, ground: &mut PortableTys<'_>, facts: &dyn LayoutFacts| {
-        let fail = |error| RunError::Build { function: program.function(c).named(), error, range: None };
+        let fail = |error| match error {
+            // A key's projection the seam did not answer: named by its cause.
+            BuildError::Projection { .. } if let Some(why) = program.last_projection() => RunError::Projection { function: program.function(c).named(), why },
+            error => RunError::Build { function: program.function(c).named(), error, range: None },
+        };
         let from = checked.get(c).and_then(Option::as_ref).map_or(PTys::EMPTY, |d| d.types.view());
         let args = if instance.item == program.function(c).key { instance.args } else { closure_key_args(instance, ground).map_err(fail)? };
         blaze_build::instance_key_normalized(program.code_of(c), args, from, ground, facts, Alloc::global()).map_err(fail)
@@ -1224,7 +1269,13 @@ fn build_from<P: FrontEnd>(program: &mut P, surveyed: Option<(&mut Vec<(Box<str>
                     ranges(&body.expr_ranges, expr.0)
                 }
                 BuildError::UnsupportedPat { pat, .. } => ranges(&body.pat_ranges, pat.0),
+                BuildError::NoAdt { adt } | BuildError::NoAbi { item: adt } | BuildError::NoConstValue { item: adt, .. } if let Some(why) = program.left_out(adt) => {
+                    return RunError::LeftOut { function: name(), item: adt, path: program.item_named(adt), why: Box::from(why) };
+                }
                 BuildError::NoAdt { adt } => return RunError::NoAdt { function: name(), adt, path: program.item_named(adt) },
+                BuildError::Projection { .. } if let Some(why) = program.last_projection() => {
+                    return RunError::Projection { function: name(), why };
+                }
                 _ => None,
             };
             RunError::Build { function: name(), error, range }
@@ -1267,7 +1318,7 @@ fn build_from<P: FrontEnd>(program: &mut P, surveyed: Option<(&mut Vec<(Box<str>
             };
             let callee = Instance { item, args: resolved };
             let Some(c) = program.fn_index(callee.item) else {
-                filed(&mut survey, RunError::Callee { function: name(), callee: callee.item })?;
+                filed(&mut survey, callee_refusal(&*program, name(), callee.item))?;
                 broken = true;
                 continue;
             };
@@ -1288,7 +1339,7 @@ fn build_from<P: FrontEnd>(program: &mut P, surveyed: Option<(&mut Vec<(Box<str>
                 via.push(Via::Address);
                 targets.push(Target::Symbol(target.symbol.into()));
             } else {
-                filed(&mut survey, RunError::Callee { function: name(), callee: callee.item })?;
+                filed(&mut survey, callee_refusal(&*program, name(), callee.item))?;
                 broken = true;
             }
         }

@@ -477,6 +477,22 @@ fn unescape(inner: &str, out: &mut Vec<u8, Global>) -> Option<()> {
                 let lo = chars.next()?.to_digit(16)?;
                 out.push((hi * 16 + lo) as u8);
             }
+            // `\u{7FFF}`: up to six hex digits (underscores allowed), a scalar value, as UTF-8.
+            'u' => {
+                if chars.next()? != '{' {
+                    return None;
+                }
+                let mut v = 0u32;
+                loop {
+                    match chars.next()? {
+                        '}' => break,
+                        '_' => {}
+                        d => v = v.checked_mul(16)?.checked_add(d.to_digit(16)?)?,
+                    }
+                }
+                let mut buf = [0u8; 4];
+                out.extend_from_slice(char::from_u32(v)?.encode_utf8(&mut buf).as_bytes());
+            }
             '\n' => {
                 while chars.peek().is_some_and(|c| c.is_whitespace()) {
                     chars.next();

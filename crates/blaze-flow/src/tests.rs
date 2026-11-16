@@ -9,7 +9,7 @@ use std::vec::Vec;
 
 use blaze_sim::{Broke, Config, Tape, check, control};
 
-use crate::flow::{BorrowKind, Flow, FlowBuilder, Operand, Place, Point, Proj, Span, Stmt, StmtKind};
+use crate::flow::{BorrowKind, Flow, FlowBuilder, Local, Operand, Origin, Place, Point, Proj, Span, Stmt, StmtKind};
 use crate::loans::{BorrowFinding, TierOne, facts, tier_one, tier_two};
 use crate::moves::{DropKind, MoveFindingKind, MoveOut, check_moves, check_moves_planted, drop_kind, inits, move_out};
 use crate::record::{Plant, check as check_body};
@@ -594,4 +594,261 @@ fn live_mutable_loan_then_shared_borrow_is_refused() {
         Ok(r) => assert!(r.proof.is_none() && r.borrows.len() == 1),
         Err(e) => panic!("{e:?}"),
     }
+}
+
+// ---------------------------------------------------------------- fixtures: the signature's origins
+//
+// A signature's lifetimes are placeholders (flow.md section 3), live at every point, and the
+// relations the signature states among them (`'b: 'a` written, or implied by a well-formed
+// argument type) are the `known` table. The body is right when every `subset` it derives between
+// two placeholders is in that table's closure (Polonius `subset_errors`), and when no loan of a
+// local reaches a placeholder (the loan is live at the local's `StorageDead`). The source of the
+// rule is the design (RFC 2094, "Named lifetimes" and Polonius' `known_placeholder_subset`): the
+// Reference's "Lifetime elision" and "Lifetime bounds" say only what the signature means.
+
+fn tiers_with(flow: &Flow<Global>, plant: Plant) -> (TierOne, Vec<BorrowFinding>) {
+    let f = match facts(flow, Global) {
+        Ok(f) => f,
+        Err(e) => panic!("{e:?}"),
+    };
+    let one = tier_one(flow, &f, plant, Global);
+    let two = tier_two(flow, &f, plant, Global);
+    match (one, two) {
+        (Ok(one), Ok(two)) => (one, two.iter().copied().collect()),
+        (a, b) => panic!("{a:?} {b:?}"),
+    }
+}
+
+/// The one finding is `from` flowing into `into` without the signature saying `from: into`.
+fn unproven(found: &(TierOne, Vec<BorrowFinding>), from: Origin, into: Origin) -> bool {
+    found.0 == TierOne::Refused
+        && matches!(found.1[..], [BorrowFinding::UnprovenOutlives { from: f, into: i, .. }] if f == from && i == into)
+}
+
+/// `fn first<'a>(x: &'a (u8, u8)) -> &'a u8 { &x.0 }`. Right: the reborrow `&(*x).0` lives no
+/// longer than `'a` (RFC 2094, "Reborrow constraints": `'a: 'r`), and the result goes back into
+/// `'a` itself, so no two distinct placeholders are related. Accepted by tier one.
+#[test]
+fn signature_returns_a_field_of_its_argument() {
+    // _0 the returned &'a u8, _1 x: &'a (u8, u8), _2 the reborrow.
+    let mut b = FlowBuilder::new_in(3, 1, Global);
+    let oa = b.origin(true);
+    let or = b.origin(false);
+    b.mentions(0, oa);
+    b.mentions(1, oa);
+    b.mentions(2, or);
+    let star = b.project(Place(1), Proj::Deref);
+    let field = b.project(star, Proj::Field(0));
+    let bb = b.block();
+    b.start(bb);
+    b.borrow(Place(2), BorrowKind::Shared, field, or, S);
+    b.subset(oa, or);
+    b.assign(Place(0), Operand::Move(Place(2)), S);
+    b.subset(or, oa);
+    b.ret(S);
+    assert_eq!(tiers(&finish(b)), (TierOne::Accepted, Vec::new()));
+}
+
+/// `fn pick<'a, 'b>(x: &'a u8, y: &'b u8) -> &'a u8 { y }`: the flow, with `'a` and `'b`.
+fn pick_flow() -> (Flow<Global>, Origin, Origin) {
+    // _0 the returned &'a u8, _1 x: &'a u8, _2 y: &'b u8.
+    let mut b = FlowBuilder::new_in(3, 2, Global);
+    let (oa, ob) = (b.origin(true), b.origin(true));
+    b.mentions(0, oa);
+    b.mentions(1, oa);
+    b.mentions(2, ob);
+    let bb = b.block();
+    b.start(bb);
+    b.assign(Place(0), Operand::Copy(Place(2)), S);
+    b.subset(ob, oa);
+    b.ret(S);
+    (finish(b), oa, ob)
+}
+
+/// `pick` is wrong: the signature states no relation between `'a` and `'b`, and the body needs
+/// `'b: 'a` (rustc's E0621 family: "lifetime may not live long enough"). Both tiers refuse, and
+/// the finding names the two lifetimes: from `'b` into `'a`.
+#[test]
+fn signature_refuses_the_other_arguments_lifetime() {
+    let (flow, oa, ob) = pick_flow();
+    let found = tiers(&flow);
+    assert!(unproven(&found, ob, oa), "{found:?}");
+    match check_body(&flow, Global) {
+        Ok(r) => assert!(r.proof.is_none()),
+        Err(e) => panic!("{e:?}"),
+    }
+}
+
+/// `fn f(x: &u8) -> &u8 { x }`. The Reference, "Lifetime elision": "If there is exactly one
+/// lifetime used in the parameters (elided or not), that lifetime is assigned to all elided
+/// output lifetimes." So the output's origin is the input's: one placeholder. Accepted.
+#[test]
+fn signature_elided_output_takes_the_one_input() {
+    let mut b = FlowBuilder::new_in(2, 1, Global);
+    let o = b.origin(true);
+    b.mentions(0, o);
+    b.mentions(1, o);
+    let bb = b.block();
+    b.start(bb);
+    b.assign(Place(0), Operand::Copy(Place(1)), S);
+    b.subset(o, o);
+    b.ret(S);
+    assert_eq!(tiers(&finish(b)), (TierOne::Accepted, Vec::new()));
+}
+
+/// `fn g<'a, 'b: 'a>(x: &'b u8) -> &'a u8 { x }`: the flow, with `'a` and `'b`.
+fn declared_bound_flow() -> (Flow<Global>, Origin, Origin) {
+    let mut b = FlowBuilder::new_in(2, 1, Global);
+    let (oa, ob) = (b.origin(true), b.origin(true));
+    b.mentions(0, oa);
+    b.mentions(1, ob);
+    // The Reference, "Lifetime bounds": "`'a: 'b` is usually read as 'a outlives 'b".
+    b.known(ob, oa);
+    let bb = b.block();
+    b.start(bb);
+    b.assign(Place(0), Operand::Copy(Place(1)), S);
+    b.subset(ob, oa);
+    b.ret(S);
+    (finish(b), oa, ob)
+}
+
+/// `g` is right by the bound it declares. Accepted by tier one.
+#[test]
+fn signature_declared_bound_is_known() {
+    assert_eq!(tiers(&declared_bound_flow().0), (TierOne::Accepted, Vec::new()));
+}
+
+/// `fn name(&self) -> &Name { &self.name }`. The Reference, "Lifetime elision": "If the receiver
+/// has type `&Self` or `&mut Self`, then the lifetime of that reference to `Self` is assigned to
+/// all elided output lifetime parameters." One placeholder; the reborrow of the field goes back
+/// into it. Accepted.
+#[test]
+fn signature_method_returns_a_borrow_of_self() {
+    // _0 the returned &'s Name, _1 self: &'s Self, _2 other: &'o u8 (unused), _3 the reborrow.
+    let mut b = FlowBuilder::new_in(4, 2, Global);
+    let (os, oo) = (b.origin(true), b.origin(true));
+    let or = b.origin(false);
+    b.mentions(0, os);
+    b.mentions(1, os);
+    b.mentions(2, oo);
+    b.mentions(3, or);
+    let star = b.project(Place(1), Proj::Deref);
+    let name = b.project(star, Proj::Field(1));
+    let bb = b.block();
+    b.start(bb);
+    b.borrow(Place(3), BorrowKind::Shared, name, or, S);
+    b.subset(os, or);
+    b.assign(Place(0), Operand::Move(Place(3)), S);
+    b.subset(or, os);
+    b.ret(S);
+    assert_eq!(tiers(&finish(b)), (TierOne::Accepted, Vec::new()));
+}
+
+/// `fn f<'a>() -> &'a u8 { let v = 0; &v }` is wrong, the classic (rustc's E0515, "cannot return
+/// reference to local variable"): the loan of `v` is in `'a`, a placeholder, live at every point,
+/// when `v`'s storage dies. Both tiers refuse; the finding names the loan at the `StorageDead`.
+#[test]
+fn signature_refuses_a_reference_to_a_local() {
+    // _0 the returned &'a u8, _1 v, _2 the borrow.
+    let mut b = FlowBuilder::new_in(3, 0, Global);
+    let oa = b.origin(true);
+    let or = b.origin(false);
+    b.mentions(0, oa);
+    b.mentions(2, or);
+    let bb = b.block();
+    b.start(bb);
+    b.stmt(StmtKind::StorageLive(Local(1)), S);
+    b.assign(Place(1), Operand::Const, S);
+    let l = b.borrow(Place(2), BorrowKind::Shared, Place(1), or, S);
+    b.assign(Place(0), Operand::Move(Place(2)), S);
+    b.subset(or, oa);
+    b.stmt(StmtKind::StorageDead(Local(1)), S);
+    b.ret(S);
+    let flow = finish(b);
+    assert_eq!(
+        tiers(&flow),
+        (TierOne::Refused, std::vec![BorrowFinding::Invalidated { at: Point::start(Stmt(4)), loan: l, span: S }])
+    );
+}
+
+/// `fn h<'a>(x: &'a mut (u8, u8)) -> &'a mut u8 { &mut x.0 }`. Right: a mutable reborrow through
+/// a `&'a mut` may live as long as `'a` (RFC 2094, "Reborrow constraints": the supporting prefix
+/// `*x` adds `'a: 'r`), and nothing uses `x` again. Accepted.
+#[test]
+fn signature_returns_a_reborrow_through_a_mutable_reference() {
+    let mut b = FlowBuilder::new_in(3, 1, Global);
+    let oa = b.origin(true);
+    let or = b.origin(false);
+    b.mentions(0, oa);
+    b.mentions(1, oa);
+    b.mentions(2, or);
+    let star = b.project(Place(1), Proj::Deref);
+    let field = b.project(star, Proj::Field(0));
+    let bb = b.block();
+    b.start(bb);
+    b.borrow(Place(2), BorrowKind::Mut, field, or, S);
+    b.subset(oa, or);
+    b.assign(Place(0), Operand::Move(Place(2)), S);
+    b.subset(or, oa);
+    b.ret(S);
+    assert_eq!(tiers(&finish(b)), (TierOne::Accepted, Vec::new()));
+}
+
+/// `fn inner<'a, 'b>(x: &'a &'b u8) -> &'a u8 { *x }` (`wrong` false) and its nearest wrong
+/// program `fn bad<'a, 'b>(x: &'a &'b u8, y: &'a u8) -> &'b u8 { y }` (`wrong` true). The type
+/// `&'a &'b u8` is well formed only when `'b: 'a` (the Reference, "Lifetime bounds": "`&'a T`
+/// requires `T: 'a`", an implied bound of the signature), so `'b: 'a` is known and `'a: 'b` is not.
+fn implied_bound_flow(wrong: bool) -> (Flow<Global>, Origin, Origin) {
+    // _0 the result, _1 x: &'a &'b u8, _2 y: &'a u8.
+    let mut b = FlowBuilder::new_in(3, 2, Global);
+    let (oa, ob) = (b.origin(true), b.origin(true));
+    b.mentions(0, if wrong { ob } else { oa });
+    b.mentions(1, oa);
+    b.mentions(1, ob);
+    b.mentions(2, oa);
+    b.known(ob, oa);
+    let star = b.project(Place(1), Proj::Deref);
+    let bb = b.block();
+    b.start(bb);
+    if wrong {
+        b.assign(Place(0), Operand::Copy(Place(2)), S);
+        b.subset(oa, ob);
+    } else {
+        b.assign(Place(0), Operand::Copy(star), S);
+        b.subset(ob, oa);
+    }
+    b.ret(S);
+    (finish(b), oa, ob)
+}
+
+/// `inner` is right by the implied bound; `bad` needs the bound's reverse and is refused, the
+/// finding naming `'a` flowing into `'b`.
+#[test]
+fn signature_implied_bound_of_a_nested_reference() {
+    assert_eq!(tiers(&implied_bound_flow(false).0), (TierOne::Accepted, Vec::new()));
+    let (flow, oa, ob) = implied_bound_flow(true);
+    let found = tiers(&flow);
+    assert!(unproven(&found, oa, ob), "{found:?}");
+}
+
+/// Control: with the signature's relations ignored (`Plant::KnownIgnored`) the two programs that
+/// are right only by a known relation (the declared bound, the implied bound) are refused: the
+/// accept fixtures above rest on the `known` table and nothing else.
+#[test]
+fn signature_control_relations_ignored() {
+    let (flow, oa, ob) = declared_bound_flow();
+    let found = tiers_with(&flow, Plant::KnownIgnored);
+    assert!(unproven(&found, ob, oa), "{found:?}");
+    let (flow, oa, ob) = implied_bound_flow(false);
+    let found = tiers_with(&flow, Plant::KnownIgnored);
+    assert!(unproven(&found, ob, oa), "{found:?}");
+}
+
+/// Control: with a relation the signature does not state taken as known (`Plant::AllKnown`),
+/// `pick` and `bad` wrongly pass both tiers: the refuse fixtures above rest on the table being
+/// exactly the signature's.
+#[test]
+fn signature_control_missing_relation_taken_as_known() {
+    assert_eq!(tiers_with(&pick_flow().0, Plant::AllKnown), (TierOne::Accepted, Vec::new()));
+    assert_eq!(tiers_with(&implied_bound_flow(true).0, Plant::AllKnown), (TierOne::Accepted, Vec::new()));
 }

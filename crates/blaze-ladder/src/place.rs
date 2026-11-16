@@ -15,7 +15,7 @@ use std::ffi::CString;
 use std::sync::Arc;
 
 use blaze_build::data::{DataError, StaticImage};
-use blaze_emit::{Code, Fixup, Reloc, RelocTo, Routine};
+use blaze_emit::{Code, Fixup, Reloc, RelocTo};
 use blaze_typeck::ItemKey;
 use blaze_launch::wire::{self, List, RecordId};
 use blaze_launch::{CodeId, Slot, Tier, Txn};
@@ -273,11 +273,8 @@ impl Records for Table<'_> {
                     None => return Err(format!("slot {slot}: reference {p} is not in the body's table")),
                 },
                 RelocTo::Routine(routine) => {
-                    let name = match routine {
-                        Routine::Memcpy => "memcpy",
-                        Routine::Memmove => "memmove",
-                        Routine::Memset => "memset",
-                    };
+                    // The emitter's one table of routine names (`Routine::symbol`).
+                    let name = routine.symbol();
                     match symbol(name) {
                         Some(at) => at,
                         None => {

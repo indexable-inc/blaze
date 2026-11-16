@@ -1,0 +1,4 @@
+[package]
+name = "ladder-x-int-02-checked"
+version = "0.1.0"
+edition = "blaze-2026.11"

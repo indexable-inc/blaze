@@ -346,13 +346,26 @@ fn subset_edges<A: Allocator + Clone>(flow: &Flow<A>, alloc: A) -> Vec<(Origin, 
 }
 
 /// The signature's known relations among placeholders, closed: row `into` holds every `from`.
-fn known_closure<A: Allocator + Clone>(flow: &Flow<A>, alloc: A) -> Result<Bits<A>, Bound> {
+///
+/// The origins are re-related (flow.md section 3): what the signature states is the only thing a
+/// body may assume among its placeholders, so a `subset` between two of them that this closure
+/// does not hold is `UnprovenOutlives`. The two planted controls bend exactly this table.
+fn known_closure<A: Allocator + Clone>(flow: &Flow<A>, plant: Plant, alloc: A) -> Result<Bits<A>, Bound> {
     let o = flow.origins as usize;
     let mut known = Bits::new_in(o, o, alloc.clone());
     for x in 0..o {
         known.set(x, x);
     }
-    close(&flow.known, &mut known, o, o, alloc)?;
+    if plant == Plant::AllKnown {
+        for into in 0..o {
+            for from in 0..o {
+                known.set(into, from);
+            }
+        }
+    }
+    if plant != Plant::KnownIgnored {
+        close(&flow.known, &mut known, o, o, alloc)?;
+    }
     Ok(known)
 }
 
@@ -390,7 +403,7 @@ pub fn tier_one<A: Allocator + Clone>(
         reach.set(x, x);
     }
     close(&edges, &mut reach, o, o, alloc.clone())?;
-    let known = known_closure(flow, alloc)?;
+    let known = known_closure(flow, plant, alloc)?;
     for into in 0..o {
         for from in 0..o {
             if from != into
@@ -527,7 +540,7 @@ pub fn tier_two<A: Allocator + Clone>(
     }
     // subset_errors(O1, O2, P) :- subset(O1, O2, P), placeholder(O1), placeholder(O2),
     //   !known_placeholder_subset(O1, O2). Reported once per pair, at its first point.
-    let known = known_closure(flow, alloc.clone())?;
+    let known = known_closure(flow, plant, alloc.clone())?;
     let mut reported = Bits::new_in(o, o, alloc);
     for p in 0..points {
         for a in 0..o {

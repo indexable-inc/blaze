@@ -1268,6 +1268,66 @@ FIRST JOB: `lanecheck.sh blaze-ladder test "--test front2_project"`, fix my file
 - ALSO OWED to the builder lane: fill `Adts::float_lit` and add `tc::Lit::CStr` to the strings arm
   of `literals` (program.rs ~736). Steps 4 (38 callees, 8 NoAbi), 5 (the 4096 cap), 6 not started.
 
+Twenty-fifth port lane (2026-11-16 ~12:15; done, compiled: "blaze-ladder: check ok (all targets)").
+- (1) PROJECTIONS: blaze-typeck instance.rs `normalize_projection` (additive: a `Goal::Projection`
+  with a fresh term through the solver's own step, exported into the ground table; one home with
+  `select_impl`); seam.rs `FrontEnd::normalize` (defaulted), program.rs answers it in the first
+  tabled body's world; run.rs `normalized` fills `LayoutFacts::normalize` for FrontAdts and
+  FrontConsts. Instances are keyed by `instance_key_normalized` over the fn's CHECKED types
+  (`Checked::types`); a key refused is filed for the caller (survey goes on).
+- (2) CLOSURES: run.rs `ClosureTable` (every checked body's closures through
+  `layout::closure_facts`, sorted by owner and ordinal) answers `LayoutFacts::closure`;
+  `Adts::fn_trait_method` from SEAM_LANGS (now with Fn, FnMut, FnOnce); a ref to a `Fn*` method
+  whose self is a closure is tabled as its owner (`closure_owner`), keyed by `closure_key_args`
+  (owner args, the method as a `FnDef`, the instance args) and built with `build_closure`.
+- (3) LITERALS: program.rs `float_bits` (text to the nearest f64 and f32, each once) behind
+  `FrontEnd::float_lit`; FrontAdts picks the width from the literal's checked type; `Lit::CStr`
+  in the strings arm; front.rs `unescape` reads `\u{..}`.
+- RUNGS (no_core, status 42): front2/f4-assoc, f5-closures, f6-literals PASS, the 15 kept (18
+  PASS). With the three answers removed: f4 "was not normalized by the seam's `normalize`", f5
+  "a value of a closure whose facts the world did not answer", f6 "the build's `Adts` gave no
+  value for this literal". In the blaze edition all three stop before the seam (`metadata`
+  E0277 `Alias: Sized`; "reaches more than 4096 fns").
+- WALK list-AE: "BUILDS: 269 of 627" (was 577 of 1687; the front walk itself shrank: REACHABLE
+  775 of 1036 against 2478 of 2953, 88 RefusedImpl gaps: not this lane). Associated-type
+  classes 302 + 61 gone; 13 x Projection left (one trait); closure class gone, 1 x Select
+  `BodyTypeInRecord(Closure ..)` in `char_count_general_case`.
+
+Twenty-sixth port lane (2026-11-16 afternoon; WRITER: everything below NEVER COMPILED by this
+lane; sent to the integration lane a14c41bba58ed36a1 in two batches).
+- WHY the walk's classes hid their causes: the survey files every left-out fn and every ADT row
+  it gave up on in `left_out`, which front2_main never prints (273 rows in list-AE); a caller's
+  build then refused only the SYMPTOM ("no row for the ADT", "no ABI" = the callee is not in
+  the program's table, "neither a tabled body"). NEW: seam.rs `FrontEnd::left_out(key)`;
+  program.rs keeps `left` (key -> cause) at every keyed `left_out` push; run.rs
+  `RunError::LeftOut { function, item, path, why }` replaces NoAdt / NoAbi / NoConstValue /
+  Callee when the item was left out (`callee_refusal`); `Callee`'s class now carries the key.
+- (1) `UsizeNoHighBit`: heads-4.txt shows its head refused with "const length: Body": the
+  ADT-row loop's `eval_len` of `HALF_USIZE` (`usize::MAX >> 1`) fails with `ConstFail::Body`
+  (a body the evaluation needs did not lower): which body, the next walk's "left out:" line
+  says. `AlignmentEnum`: heads.rs `discriminants` takes a literal or a const item only; `1 << 0`
+  needs an anonymous constant through the evaluator (heads.rs is not this lane's). RUNG
+  front2/x-niche-01 (no_core, `pattern_type!` declared as core declares it; `const HALF: usize
+  = !0 >> 1`; `Half` and `Option<Half>` one word; `Lit` with a literal end the control).
+- (2) NoAbi: `Adts::abi` answers only a TABLED fn (run.rs `FrontAdts::abi` -> `fn_index`): every
+  NoAbi item is a callee the survey left out (its check failed, no body, an intrinsic the
+  build's table lacks: that one now says the intrinsic's name). Per item: the next walk.
+- (3) callee rows: a resolved impl fn not tabled and not left out = never reached by reach.rs
+  `Instances`; now one class per callee key.
+- (4) Projection: program.rs `normalize` records its cause (trait path, Self's form, the
+  solver's error or "no type"): `RunError::Projection` at the build and in `key_of`. The Err of
+  `normalize` was swallowed before (run.rs `normalized`, `Ok(None) | Err(_)`).
+- (5) NoConstValue: front2 tabled NO constant (only run.rs `eval_consts` over `FnKind::Const`,
+  which front2 never makes), so every const read was refused. NEW program.rs `const_values`:
+  each `Def::Const` of a checked body's `expr_defs` evaluated once by `Consts::value`; refused
+  ones named (`Front2Refusal::Const`, or left out with "constant: <ConstFail>"); seam
+  `const_record`, read first by `FrontAdts::const_value`. Generic consts at arguments: not yet.
+- (7) reach.rs `MOST_FNS` 4,096 -> 65,536 (above core's 29,243 fn heads plus alloc, std, bstd);
+  `Front2Refusal::Capped { entry, queued }` names the entry and what was still queued.
+- NOT DONE: (6) "unsized type held by value" in `as_ref` (not reduced); the entry proof; the
+  hello world rung on a copy of the owner's folder. Class counts before: list-AE lines 24-45;
+  after: owed (the integrator's next walk).
+
 #### Heads lane (2026-11-16, first runner; handing on)
 
 - DONE, step 1 (poisoned records). Root cause: body lowering interned a body's own types
@@ -1662,6 +1722,91 @@ FIRST JOB: `lanecheck.sh blaze-ladder test "--test front2_project"`, fix my file
 - Seen in the all-suites mixcheck: front2_main `his_main_through_the_checker` and
   `the_entry_programs_as_far_as_each_gets` panic at blaze-ty infer.rs:247 (index out of
   bounds, a variable of another table) against the typeck green snapshot: not attributed.
+
+##### Fifth runner (2026-11-16, ~12:40; a WRITER: nothing below was compiled or run by it)
+
+- THE REGRESSION (walk "2478 of 2953" -> "775 of 1036"; "88 x check gap: RefusedImpl .. b6e412..
+  argument 2 of `HasField` is a constant"). Read, not run:
+  - The impl is zerocopy 0.8.63 src/impls.rs:800, `unsafe impl<Client, T: ?Sized>
+    HasField<Client, value, { crate::STRUCT_VARIANT_ID }, { crate::ident_id!(value) }> for
+    ManuallyDrop<T>`, written INSIDE `const _: () = { pub enum value {} .. }` (:751, :758). The
+    trait (src/lib.rs:1310, `HasField<Client, Field, const VARIANT_ID: i128, const FIELD_ID:
+    i128>`) lost nothing: "argument 2" is `value` (56..61 of the header), a type of the impl's
+    own block. It reached the index when the blocks' impls did (blaze-scope `make_blocks`, the
+    impls-in-blocks lane), and its header is read where `value` names nothing; types.rs
+    `path_args` then GUESSED "not a type, so a constant". The same arrival is tempo's newest
+    top class (tempo-front-6b: "7443 NEW gap UnreadImpl: item", e.g. reth_execution_types'
+    `impl<'de> _serde::Deserialize<'de> for __Field`: serde's block, `_serde` and `__Field`
+    unresolved, so filed with neither trait nor shape: a candidate of every trait question).
+    The cure for both is the block's scope for headers (that lane's); not in these files.
+  - (a) buckets.rs: an impl's KIND is now read from its header's tokens first
+    (`written_trait`: `blaze_file_items::impl_header(..).trait_`); one that names a trait but
+    was filed `Inherent` (a lowered header without its trait) or blind (`NoText`, `Unlowered`,
+    `Generics`) is filed by `file_by_text` under its trait's "any" list (or unread as a trait
+    impl) and counted in `Buckets::by_text`: never an inherent candidate. `Buckets::answer`
+    makes a by-text impl whose built header has no trait the question's gap.
+  - (b) types.rs `path_args`: a one-name argument that resolves in neither namespace is
+    `Why::Resolve`, never "is a constant". The zerocopy header still cannot BUILD: it needs
+    the block scope, a macro call as a const argument (`{ crate::ident_id!(value) }`:
+    `len_const` reads only a path), and an `i128` constant item of value -1
+    (`Maps::const_lens` holds `u64`; `eval_len` refuses `NotUsize`).
+  - world_items.rs: a refused or unread candidate's gap now says the question: "at <place>
+    [asked: the inherent items of <Shape>]" / "[asked: the impls of the trait <key> at <Shape>]".
+  - Which road the 88 bodies took (an inherent question through a header lowered without
+    `Trait for`, or a trait question) could not be told by reading: `by_text.len()` and the
+    "[asked: ..]" text of the next walk say.
+  - An UNREAD trait impl whose trait is written with no type or const argument
+    (`bare_text`: none, or lifetimes only) is now in `Buckets::bare`, so `Homes::bare` drops
+    it from a question whose trait's parameters default to `Self` when its crate is neither
+    the trait's nor the self type's (test `an_unread_bare_trait_impl_is_judged_by_the_bare_home`).
+    It frees `PartialEq`/`PartialOrd`/operator goals from serde's unread block impls; goals of
+    a trait with a parameter that has no default (`From<T>`) still need the goal's arguments
+    in `trait_home` (`World::impls_of` carries only `T0`'s shape).
+- THE ROAD, told by the impls-in-blocks lane (ac9f8e81febc06704) after the above was written:
+  crates/blaze-file-items/src/nested.rs ended a block's item at the `}` of its FIRST top-level
+  `{`, so the zerocopy impl was CUT at its const argument (`.. HasField<Client, value, {
+  crate::STRUCT_VARIANT_ID }`) and the cut text was lowered: no `for`, so `Filed::Inherent`
+  with no shape: a candidate of every inherent question. A block impl's `ImplAt.module` IS its
+  block's module (`__blaze_block_N`, the block's items and `use super::*`). Someone added
+  `Skip::closed` to nested.rs for it (`lanecheck.sh blaze-file-items test nested`): THAT is the
+  walk's fix. `written_trait` does not catch a cut header (its `<` is unclosed, so
+  `impl_header` errs and the kind stays as lowered): if the walk still has the class after
+  nested.rs is green, make a header whose text does not read `Unread` (blind) by name instead
+  of trusting its lowering. Serde's `_serde::Deserialize for __Field` (tempo's 7443) is
+  unproven there: `_serde` through the inner block's `use super::*`, or the derive-expansion
+  road (`expand_decls` -> `make_blocks`); that lane is out of runs; the switch is the two
+  `make_blocks(..)` calls in blaze-scope resolve.rs.
+- FIRST for a successor: the integrator (a14c41bba58ed36a1) was sent this piece at ~12:45 and
+  had not run it when these notes were written: read BUILD-STATUS.md for its lines, fix what
+  it sends back, then read the walk's REACHABLE line and the "[asked: ..]" text of any
+  RefusedImpl left.
+- Tests added (front2_items.rs; 18 tests: expected "17 passed, 0 failed", one ignored):
+  `a_trait_impl_is_no_candidate_of_an_inherent_question` (module-level and zerocopy's block
+  shape), `a_trait_const_parameter_takes_a_literal_and_a_braced_constant`,
+  `a_pattern_type_range_end_is_a_constant_items_value` (core's `define_valid_range_type!`
+  with `HALF_USIZE`, through the new helper `adt_rows`, which makes a row as program.rs's
+  ADT-row loop does and prints it: if it prints the row, "NoAdt .. UsizeNoHighBit" is the
+  seam's, not the head's), `a_discriminant_is_a_constant_expression` (IGNORED: its doc lists
+  the four pieces an anonymous constant needs before `AlignmentEnum`'s `1 << 0` can be asked
+  of the evaluator: a key, a head in `Store::fns`, `ConstsWorld::explicit_discriminant`, and a
+  need that carries a checker key).
+- Tempo's impls: (i) the refused alias's whole reason is in tempo-front-5.txt line 41:
+  "the type alias `FieldElement` is refused: Resolve(Path(PathError { .. at: 2, why:
+  NotFound }), Range { start: 287, end: 336 })": the alias's path's third segment is in no
+  module: the fourth runner's reading stands (curve25519-dalek chooses `backend::serial::u64`
+  by `cfg(curve25519_dalek_bits = "64")`, which its build.rs sets): the owner is the build
+  scripts' cfg reaching the names library, not the heads. The `bare` home should release every
+  `PartialEq` goal whose self type is not curve25519's ("Orphan rules": "at least one of the
+  types `T0..=Tn` must be a local type", and with `Rhs = Self` only `T0` can be): the census
+  that showed 850 bodies predates its first run. (ii), (iii): not reached; in tempo-front-6b
+  both are under the block impls' class. (iv) narrowing (c), the rule: for a goal with no
+  inference variable, an impl that matches and whose where clauses are proven is the only one
+  that can ("Trait implementation coherence": a program with "overlapping implementation
+  instances" is rejected), so a refused candidate beside it cannot change the answer. Limits:
+  only ground goals (a variable left open may be decided by the refused impl); only "holds",
+  not "which impl gives the items", in a crate with specialization (core's `default impl`s
+  overlap by design); never for an auto trait's negative impls. It needs `World::impls_of` to
+  answer "proved by" beside "candidates unread": the checker's batch, not started.
 
 ## For a successor lane (2026-11-16 03:20, rung 8: the port onto real names)
 
@@ -2258,4 +2403,94 @@ passed, 0 failed" (the closures lane's earlier red test passes now too).
   i128 div/rem (`__udivti3` and friends: compiler_builtins on the toolchain shelf; not looked up),
   i128 <-> float. The run lane should rerun the survey: expect the 35 "a place where a scalar was
   expected", the 6 reverse, and the cast rows (22 + 18 + 10 + 6) to move.
+
+## Integration, 2026-11-16
+
+The four hand-offs (items inside bodies, the run path's project.rs, heads items' second round, the
+closure batch's arms) compiled with two test edits: "blaze-ladder: check ok (all targets)" (11:32).
+- Fixed on the way: blaze-consteval's three callers of `blaze_build::ground` (now takes the world
+  as `&dyn LayoutFacts`; layout.rs `field_ty` takes it, `is_unsized` lost `?Sized`); front2_census
+  `body_class` gained `BodyError::PatternName`; front2_project's `name_of` returns an owned name
+  (the "lifetime may not live long enough" at :52). blaze-typeck: the blaze-ty infer.rs:247 panic
+  ("index out of bounds: the len is 31 but the index is 31", ladder_front2 and front2_main's two
+  checker tests) was machine.rs `failed_leaf`'s rollback deleting variables a returned leaf clause
+  still named; `leaf_clause_of` now returns "no leaf" when the clause holds an inference variable
+  (new `TypeCtx::list_has_infer`). Conservative: a leaf naming the body's own unresolved variables
+  is not reported either (only the wording of a diagnostic, never acceptance). No test of its own.
+- Test lines (each binary run alone): ladder_front2 "1 passed" with 17 PASS rungs (f4-assoc and
+  f5-closures new); front2_main "5 passed; 0 failed"; front2_order 2/0; front2_checks 1/0;
+  front2_items 13/0; front2_project 1/0 (`main` clean, `bad` one E0308 at 27..30; "COST: names
+  36.6s; world 62.6ms; first body (main) 1.66s; next body (bad) 757.6us; main again 22.2ms");
+  front2_panics 1/0; front2_clone 2/0 (`unit_struct_patterns_through_front2` un-ignored, ok);
+  front2_bounds 1/0; front2_dyn 1/0. front2_locals "0 passed; 1 failed": local_fn, local_fn_before,
+  local_const, local_use, local_shadows, local_macro clean, out_of_block refused with
+  UnresolvedPath; local_struct gives `Gap::Local` ("a struct in a block": as designed, not built);
+  core::ptr::read and ptr::write_bytes (the `assert_unsafe_precondition!` local fns) now resolve
+  and fail later with NoMethod "found Param(0), expected None" (probably `T::IS_ZST` through the
+  blanket `SizedTypeProperties`: a checker class). blaze-real "check ok (all targets)".
+- Nothing is switched off.
+- Walk (list-AD.txt; list-AC.txt before): "REACHABLE: 775 of 1036" (was 2478 of 2953; 1093 reached
+  against 3177), "BUILDS: 269 of 627" (was 577 of 1687). The ub_checks unresolved-name class is
+  gone (was 290). `main`'s own instance still does not build: "111 x NoAdt: no row for the ADT
+  `core::num::niche_types::UsizeNoHighBit`; the first: `main`" (the pattern_ty path end and the
+  ADT-row retry did not reach it). The walk shrank behind a new top class, "88 x check gap:
+  RefusedImpl": impl b6e412072608 (`HasField` with const arguments: "argument 2 of `HasField` is a
+  constant; that parameter is not a const parameter") is a candidate of inherent questions.
+- Census on bstd (census-int-1.txt): "HEAD crate bstd: bodies 2310, clean 2156 (93.3%)" (was 2136
+  of 2309, 92.5%); E0425 1 body (was 74); "LOCALS: .. 8"; top class the same refused `HasField`
+  impl, 83 bodies.
+- FIRST for each successor: HEADS ITEMS: the refused `HasField` impl (a trait's const parameters
+  read as type parameters) and why an impl of a trait is a candidate of an inherent question
+  (buckets.rs `Homes`): it is the top class of both the walk and the census. RUN PATH: why
+  `UsizeNoHighBit` still has no ADT row (print the head refusal for it), then AlignmentEnum's
+  `1 << 0`. ITEMS INSIDE BODIES: local structs and impls (`Gap::Local`, 4 walk bodies), then
+  ptr::read's NoMethod with the checker lane.
+
+### Code builder: forms, runner 4 (2026-11-16; handing on at the call budget)
+
+Uncommitted, in /Volumes/Projects/blaze-fresh-1115. Suite: "test blaze-build: exit 0; 124 passed,
+0 failed". No signature other crates use changed (no batch token taken).
+- DONE, (3) matches by tests: walk/matches.rs. `match_dispatch` asks `switch_takes` (an integer,
+  bool or enum scrutinee and every arm flat) and else `match_tested`: the scrutinee's place (a
+  scalar copied to a slot), each arm a chain of tests on it, one block per subpattern, a failure to
+  the next arm (guards reuse `Task::Guard`), then its bindings from the place again. Covered: a
+  reference scrutinee and default binding modes (peeled as blaze-typeck rules/pat.rs `step_pat`
+  peels), tuples, structs, variants with refutable fields, literals of int/`char`/`bool`, ranges
+  (signed compare for signed types), slice patterns on arrays and slices with `..` and `x @ ..` (a
+  new wide pointer), `&p`, `x @ p`, nested or-patterns. New `layout_field_tys` (row for row with
+  `layout_fields`: each field's ground type). Trap met and fixed: the work list emits a block
+  before the edge into it, so `begin` read it as dead and the rest of the function became
+  `unreachable`; each chain block is live as its arm is. Test tests/matches.rs (native 3_005_692:
+  overlapping arms, a failing guard that must fall through); removed-line run (routing off): "the
+  build failed: expression 16: a match on other than an integer, a bool or an enum is not built to
+  LIR yet". Refused by name: an or-pattern whose alternatives bind, a by-value binding of a part
+  that needs drop, a temporary scrutinee that needs drop, a const pattern, float and string
+  literal patterns, `ref mut` of a scalar scrutinee held as a copy. tests.rs's
+  `a_match_by_value_refuses_what_it_does_not_build`: `W(P(s), _)` now reaches the match by tests
+  and is refused there ("a binding by value of a part that needs drop, in a match by tests (a move
+  out)"); its expected line changed accordingly.
+- DONE, (4) borrowed temporaries that need drop: walk/temps.rs. The Reference, "Temporary
+  scopes": "the smallest scope that contains the expression and is one of: ... A statement";
+  "Drop scopes": reverse order. Every statement pushes a mark and `Task::TempEnd`; `Spill` and
+  `SpillAdjusted` of a value that needs drop hold it (`Held::Rest`, whole) when the walk-up of the
+  new `expr_parent` (kept from `scan_flags`) reaches a statement; `TempEnd` drops the statement's
+  temporaries after its value and its `let`'s binding; return/break drop them with the scope.
+  Refused by name: extended temporaries (`let x = &temp`, through extending exprs), a temporary
+  under a branch (lazy operand, arm, guard, closure: needs a flag), in an `if` condition, a loop
+  body, a block tail. Test tests/temps.rs (aarch64; drops [1, 4, 3, 5, 2]; the extended
+  refusal); removed-line run (`TempEnd` not pushed): "left: [5, 4, 3, 2, 1] right: [1, 4, 3, 5,
+  2]".
+- NOT MINE, (4) NoConstValue: raised at walk.rs `const_value` when `Adts::const_value` has no
+  record; the survey's implementer is blaze-ladder run.rs `FrontAdts::const_value` (a list the run
+  path fills from consteval). For the run lane: which consts it lacks (print the item keys).
+- NEXT, untouched: `let` in a condition (walk.rs "`let` in a condition", and `let`-`else` in
+  `stmt`): the test chain of walk/matches.rs `test_pat` + `bind_tested` is the piece to reuse
+  (an `if let` is a two-arm match by tests); `format_args!` (walk.rs `Expr::FormatArgs`: not
+  looked at); (5) overloaded `Index`, float `%`, i128 div/rem (`__udivti3`: not looked up),
+  i128 <-> float, the untested casts. Not natively tested here: a `&` pattern, `x @ p` with a
+  refutable `p`, a struct pattern, a `ref` binding.
+- SURVEY: rerun; expect the 15 + 7 + 3 + 3 "a match on other than an integer, a bool or an enum",
+  and the 6 + 4 "a borrowed temporary whose type needs drop" to move (each may stop at a later
+  refusal; the 4 "a pattern other than a binding, `_`, a tuple or an array pattern" come from
+  `let`'s `bind_value`, untouched).
 

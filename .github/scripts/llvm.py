@@ -61,7 +61,14 @@ MARKER = "blaze-llvm.json"
 # The sha256 of the archive a directory was unpacked from, written by `fetch`.
 UNPACKED = "blaze-llvm.sha256"
 # What the prefix has: `ninja install-distribution` installs these components.
-COMPONENTS = ["llvm-libraries", "llvm-headers", "cmake-exports", "llvm-config", "llvm-dwarfdump", "llvm-pdbutil"]
+# D69: the C toolchain native build scripts run with comes from the same build: `clang` (also
+# `clang++`), its resource headers, `libclang` (bindgen loads it), `lld` (`ld64.lld`, the
+# linker the shelf's `clang.cfg` names) and `llvm-ar`. The pin in crates/hir-ty-codegen/clang.json
+# moves to this archive once it carries them.
+COMPONENTS = [
+    "llvm-libraries", "llvm-headers", "cmake-exports", "llvm-config", "llvm-dwarfdump", "llvm-pdbutil",
+    "clang", "clang-resource-headers", "libclang", "lld", "llvm-ar",
+]
 WINDOWS = sys.platform == "win32"
 
 
@@ -132,7 +139,12 @@ def cmake_args(target):
         "-DCMAKE_BUILD_TYPE=Release",
         # WebAssembly: blaze builds proc-macro crates for wasm32-wasip1 and runs them in Wasmtime.
         "-DLLVM_TARGETS_TO_BUILD=X86;AArch64;WebAssembly",
-        "-DLLVM_ENABLE_PROJECTS=",
+        "-DLLVM_ENABLE_PROJECTS=clang;lld",
+        # `clang` as `clang++` too; no clang tools beyond the driver and libclang.
+        "-DCLANG_ENABLE_ARCMT=OFF",
+        "-DCLANG_ENABLE_STATIC_ANALYZER=OFF",
+        "-DCLANG_INCLUDE_TESTS=OFF",
+        "-DCLANG_INCLUDE_DOCS=OFF",
         "-DLLVM_ENABLE_ASSERTIONS=OFF",
         "-DLLVM_INCLUDE_TESTS=OFF",
         "-DLLVM_INCLUDE_BENCHMARKS=OFF",

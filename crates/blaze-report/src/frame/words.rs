@@ -14,6 +14,8 @@ pub enum Area {
     Drive,
     /// blaze-ladder's refusals (`RefusalRule`).
     Ladder,
+    /// The type checker's findings (blaze-typeck `DiagCode`), numbered as rustc's codes.
+    Types,
 }
 
 /// One rule's words.
@@ -102,7 +104,7 @@ pub const WORDINGS: &[Wording] = &[
         number: 9,
         name: "toolchain-crate-named",
         headline: "under edition blaze-2026.11 blaze gives this package {code:0}: this line names another copy",
-        label: "delete this line (by hand for now); the crate is `std` with no line",
+        label: "delete this line; the crate is `std` with no line",
         args: 1,
     },
     // 10, `dependencies-not-read`, retired 2026-11-16: the unit-graph job reads the
@@ -195,6 +197,14 @@ pub const WORDINGS: &[Wording] = &[
         label: "inert: nothing in this build reads it",
         args: 1,
     },
+    Wording {
+        area: Area::Types,
+        number: 425,
+        name: "E0425",
+        headline: "cannot find value {code:0} in this scope",
+        label: "not found in this scope",
+        args: 1,
+    },
 ];
 
 /// What a help line says about a name that did not resolve, by what the fix leaves wrong
@@ -207,6 +217,8 @@ pub enum HelpKind {
     SpelledAlike,
     /// Two candidates equal on every count, no fix: `{0}` and `{1}` their names.
     Tied,
+    /// A manifest line naming the toolchain's crate again, deleted: `{0}` the name it gave.
+    ToolchainLine,
 }
 
 /// One help's words.
@@ -237,6 +249,12 @@ pub const HELPS: &[HelpWording] = &[
         name: "help-tied",
         template: "{code:0} and {code:1} are both in scope and fit equally well: no fix is offered",
         args: 2,
+    },
+    HelpWording {
+        kind: HelpKind::ToolchainLine,
+        name: "help-toolchain-line",
+        template: "under edition blaze-2026.11 the package is given {code:0} with no line",
+        args: 1,
     },
 ];
 

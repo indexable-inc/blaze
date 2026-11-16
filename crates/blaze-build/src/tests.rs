@@ -41,6 +41,8 @@ struct BodyBuf {
     lits: Vec<(ExprId, u128), Global>,
     pat_lits: Vec<(PatId, u128), Global>,
     strs: Vec<(ExprId, &'static str), Global>,
+    /// String literal patterns' texts (`Adts::str_pat`).
+    pat_strs: Vec<(PatId, &'static str), Global>,
 }
 
 impl BodyBuf {
@@ -63,6 +65,7 @@ impl BodyBuf {
             lits: Vec::new_in(Global),
             pat_lits: Vec::new_in(Global),
             strs: Vec::new_in(Global),
+            pat_strs: Vec::new_in(Global),
         }
     }
 
@@ -616,6 +619,15 @@ impl Adts for TestAdts<'_> {
 
     fn int_pat(&self, _: ItemKey, pat: PatId) -> Option<u128> {
         self.body.pat_lits.iter().find(|(p, _)| *p == pat).map(|&(_, v)| v)
+    }
+
+    /// tests/matches.rs: a float pattern's bits ride in `pat_lits` as an integer's do.
+    fn float_pat(&self, owner: ItemKey, pat: PatId) -> Option<u128> {
+        self.int_pat(owner, pat)
+    }
+
+    fn str_pat(&self, _: ItemKey, pat: PatId) -> Option<&str> {
+        self.body.pat_strs.iter().find(|(p, _)| *p == pat).map(|&(_, s)| s)
     }
 
     fn lang_fn(&self, name: &str) -> Option<ItemKey> {
@@ -3229,7 +3241,8 @@ fn a_match_by_value_refuses_drop_impl_enums_and_wide_enums() {
 #[test]
 fn a_match_by_value_refuses_what_it_does_not_build() {
     let deep = match_drops(Scrut::W, Arms::Deep, false).expect_err("a deeper move is refused");
-    assert!(deep.contains("a move path deeper than one field"), "{deep}");
+    // (A nested variant pattern goes to the match by tests, walk/matches.rs, which moves nothing.)
+    assert!(deep.contains("a binding by value of a part that needs drop, in a match by tests (a move out)"), "{deep}");
     let guard = match_drops(Scrut::A, Arms::Guard, false).expect_err("a guard on a moving arm is refused");
     assert!(guard.contains("a guard on an arm that moves out of its scrutinee"), "{guard}");
 
@@ -3268,3 +3281,7 @@ mod forms;
 mod projections;
 mod places;
 mod casts;
+mod matches;
+#[cfg(target_arch = "aarch64")]
+mod temps;
+mod lets;

@@ -42,7 +42,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// `f.b` the divergence before it.
     pub(crate) fn expr_async_block(&mut self, mut f: Frame, e: ExprId, body: ExprId, capture: Capture) -> Result<Flow, Stop> {
         if f.state == 0 {
-            let output = self.fresh()?;
+            // The root block of an `async fn` returns the fn's written type (the Reference,
+            // "Async functions"; rules/opaque_def.rs `async_fn_output`).
+            let output = match self.async_fn_output(e)? {
+                Some(written) => written,
+                None => self.fresh()?,
+            };
             #[cfg(test)]
             let fut_out = match self.plant {
                 crate::machine::Plant::AsyncOutputFromFirst => self.fresh()?,

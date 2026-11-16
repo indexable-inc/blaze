@@ -62,11 +62,10 @@ pub(crate) fn expand<'a>(
         BuiltinFn::Panic => panic(out, "panic")?,
         BuiltinFn::Unreachable => panic(out, "unreachable")?,
         BuiltinFn::PatternType => pattern_type(out)?,
-        BuiltinFn::Asm
-        | BuiltinFn::GlobalAsm
-        | BuiltinFn::NakedAsm
-        | BuiltinFn::TraceMacros
-        | BuiltinFn::LogSyntax => {
+        BuiltinFn::Asm => asm(out, "asm")?,
+        BuiltinFn::GlobalAsm => asm(out, "global_asm")?,
+        BuiltinFn::NakedAsm => asm(out, "naked_asm")?,
+        BuiltinFn::TraceMacros | BuiltinFn::LogSyntax => {
             return Err(ExpandError::NotBuilt { what: Unbuilt::BuiltinFn(which) });
         }
     }
@@ -898,6 +897,32 @@ fn format_args(
         let token = args.stream.tokens()[at];
         out.push(token.kind, args.stream.text_of(&token), args.origin(at))?;
         at += 1;
+    }
+    out.made(TokenKind::Close(Delim::Paren), "", MADE)
+}
+
+/// `asm!(..)`, `global_asm!(..)` and `naked_asm!(..)` as `builtin # asm ( input )` (and
+/// `global_asm`, `naked_asm`): the one typed form of inline assembly is the parser's
+/// `ASM_EXPR` (the template pieces, then each operand as `ASM_OPERAND_NAMED` over an
+/// `ASM_REG_OPERAND` with its `ASM_DIR_SPEC` (`in`, `out`, `inout`, `lateout`, `inlateout`) and
+/// `ASM_REG_SPEC`, or an `ASM_CONST`, `ASM_SYM` or `ASM_LABEL`; `ASM_OPTIONS`;
+/// `ASM_CLOBBER_ABI`), so nothing here reads the operands a second time. The input's tokens
+/// are kept, each from its place, so an operand's expression lowers and type-checks where it
+/// is written. The pinned core (library/core/src/arch.rs): "`pub macro asm("assembly
+/// template", $(operands,)* $(options($(option),*))?) { /* compiler built-in */ }`"; rustc
+/// refuses a call with no template ("requires at least a template string argument").
+fn asm(out: &mut Out<'_, '_>, keyword: &str) -> Result<(), ExpandError> {
+    let input = out.call.input();
+    if input.is_empty() {
+        return refuse(out, "requires at least a template string argument", None);
+    }
+    ident(out, "builtin")?;
+    punct(out, '#', Spacing::Alone)?;
+    ident(out, keyword)?;
+    out.made(TokenKind::Open(Delim::Paren), "", MADE)?;
+    for at in 0..input.len() {
+        let token = input.tokens()[at];
+        out.push(token.kind, input.text_of(&token), TokenOrigin::Input(index(at)))?;
     }
     out.made(TokenKind::Close(Delim::Paren), "", MADE)
 }

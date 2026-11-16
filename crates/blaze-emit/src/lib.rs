@@ -223,7 +223,9 @@ pub enum Os {
     Linux,
 }
 
-/// A routine of the system's C library the code calls.
+/// A routine of the system's C library or its compiler runtime the code calls (C convention,
+/// AAPCS64: a 128-bit integer in an `x` register pair, low word first, starting at `x0` or
+/// `x2` here, so Apple's and Linux's pair rules agree; a float in `d0`/`s0`, `d1`/`s1`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Routine {
     /// `memcpy(dst, src, len)`.
@@ -232,6 +234,61 @@ pub enum Routine {
     Memmove,
     /// `memset(dst, byte, len)`.
     Memset,
+    /// `fmod(f64, f64) -> f64`: `frem` at `f64` (the remainder takes the dividend's sign).
+    Fmod,
+    /// `fmodf(f32, f32) -> f32`: `frem` at `f32`.
+    Fmodf,
+    /// `__udivti3(u128, u128) -> u128`: `udiv` at `i128` (the divisor checked non-zero first).
+    Udivti3,
+    /// `__umodti3(u128, u128) -> u128`: `urem` at `i128`.
+    Umodti3,
+    /// `__divti3(i128, i128) -> i128`: `sdiv` at `i128` (zero and `MIN / -1` trapped first).
+    Divti3,
+    /// `__modti3(i128, i128) -> i128`: `srem` at `i128` (`MIN % -1` is 0, as LIR says).
+    Modti3,
+    /// `__floattidf(i128) -> f64`.
+    Floattidf,
+    /// `__floatuntidf(u128) -> f64`.
+    Floatuntidf,
+    /// `__floattisf(i128) -> f32`.
+    Floattisf,
+    /// `__floatuntisf(u128) -> f32`.
+    Floatuntisf,
+    /// `__fixdfti(f64) -> i128` (a `NaN` is made 0 before the call: pass/wide.rs).
+    Fixdfti,
+    /// `__fixunsdfti(f64) -> u128`.
+    Fixunsdfti,
+    /// `__fixsfti(f32) -> i128`.
+    Fixsfti,
+    /// `__fixunssfti(f32) -> u128`.
+    Fixunssfti,
+}
+
+impl Routine {
+    /// The symbol placement binds, as C writes it (`dlsym` adds Mach-O's leading underscore).
+    /// macOS: libSystem (`libsystem_m` for `fmod`/`fmodf`, `libcompiler_rt` for the `__*ti*`
+    /// family); Linux: libc, libm (`fmod`, `fmodf`) and libgcc_s (the `__*ti*` family).
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Routine::Memcpy => "memcpy",
+            Routine::Memmove => "memmove",
+            Routine::Memset => "memset",
+            Routine::Fmod => "fmod",
+            Routine::Fmodf => "fmodf",
+            Routine::Udivti3 => "__udivti3",
+            Routine::Umodti3 => "__umodti3",
+            Routine::Divti3 => "__divti3",
+            Routine::Modti3 => "__modti3",
+            Routine::Floattidf => "__floattidf",
+            Routine::Floatuntidf => "__floatuntidf",
+            Routine::Floattisf => "__floattisf",
+            Routine::Floatuntisf => "__floatuntisf",
+            Routine::Fixdfti => "__fixdfti",
+            Routine::Fixunsdfti => "__fixunsdfti",
+            Routine::Fixsfti => "__fixsfti",
+            Routine::Fixunssfti => "__fixunssfti",
+        }
+    }
 }
 
 /// How a call of one function reference is made.

@@ -13,7 +13,7 @@
 //! with one store. A commit system call per quarter of growth. Per read: one acquire load and a
 //! bounds compare.
 
-use std::{
+use core::{
     fmt,
     marker::PhantomData,
     mem, slice,
@@ -248,7 +248,7 @@ impl<T> Writer<'_, T> {
         // SAFETY: `[len, len + values.len())` is committed (`room`), aligned, past the published
         // length and this writer's alone, so it overlaps neither `values` (a live borrow, so not
         // unpublished room) nor anything a reader reaches.
-        unsafe { std::ptr::copy_nonoverlapping(values.as_ptr(), self.slot(len), values.len()) };
+        unsafe { core::ptr::copy_nonoverlapping(values.as_ptr(), self.slot(len), values.len()) };
         self.publish(len + values.len());
         Ok(len as u32)
     }

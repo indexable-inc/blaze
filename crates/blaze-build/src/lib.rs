@@ -249,6 +249,20 @@ pub trait Adts {
         None
     }
 
+    /// The bits of float literal pattern `pat` (`Pat::Lit` or `Pat::NegLit` of `Lit::Float`)
+    /// of the body of `owner` at its type (an `f32`'s in the low 32), as [`Adts::float_lit`]
+    /// gives an expression's; the magnitude: the build flips the sign of a `NegLit`.
+    fn float_pat(&self, owner: ItemKey, pat: PatId) -> Option<u128> {
+        let _ = (owner, pat);
+        None
+    }
+
+    /// The text of string literal pattern `pat` (`Pat::Lit(Lit::Str)`) of the body of `owner`.
+    fn str_pat(&self, owner: ItemKey, pat: PatId) -> Option<&str> {
+        let _ = (owner, pat);
+        None
+    }
+
     /// The bits of float literal `expr` of the body of `owner` at its type (an `f32`'s in the
     /// low 32), the literal's text rounded to the nearest value of the type (the Reference,
     /// "Floating-point literal expressions").
@@ -285,6 +299,15 @@ pub trait Adts {
     /// overloaded dereference with no answer is refused with [`BuildError::NoLangFn`] naming
     /// `deref` or `deref_mut`.
     fn deref_fn(&self, mutbl: Mutbl) -> Option<ItemKey> {
+        let _ = mutbl;
+        None
+    }
+
+    /// The `Index::index` (`Mutbl::Not`) or `IndexMut::index_mut` (`Mutbl::Mut`) trait method,
+    /// which a call at `[Self, Idx]` runs as `Self`'s impl's, as with [`Adts::deref_fn`]. An
+    /// overloaded index (walk/index.rs) with no answer is refused with [`BuildError::NoLangFn`]
+    /// naming `index`.
+    fn index_fn(&self, mutbl: Mutbl) -> Option<ItemKey> {
         let _ = mutbl;
         None
     }
@@ -471,6 +494,8 @@ pub enum BuildError {
     /// Path `expr` names const `item`, whose value [`Adts::const_value`] does not hold. The
     /// const's body is never built in its place.
     NoConstValue { expr: ExprId, item: ItemKey },
+    /// Path pattern `pat` names const `item`, whose value [`Adts::const_value`] does not hold.
+    NoPatConstValue { pat: PatId, item: ItemKey },
     /// A layout read a record that is not made yet: `item`'s (an enum's explicit discriminant).
     /// Nothing was cached; the build can be asked again once the record exists.
     MissingRecord { item: ItemKey },
@@ -528,6 +553,9 @@ impl fmt::Display for BuildError {
             }
             BuildError::NoConstValue { expr, item } => {
                 write!(f, "expression {}: const item {:#x} has no evaluated value in the build's `Adts`", expr.0, item.0)
+            }
+            BuildError::NoPatConstValue { pat, item } => {
+                write!(f, "pattern {}: const item {:#x} has no evaluated value in the build's `Adts`", pat.0, item.0)
             }
             BuildError::MissingRecord { item } => {
                 write!(f, "a layout needs the record of item {:#x} (an explicit discriminant), which is not made yet", item.0)

@@ -407,17 +407,19 @@ fn missed(key: impl Fn(&KeyInputs<'_>) -> ContentId) -> Option<&'static str> {
         limits: LIMITS,
         runner: RunnerKey::Wasm,
     };
-    let native = KeyInputs { runner: RunnerKey::Native { compiler: [4; 32], target: "aarch64-apple-darwin" }, ..at };
+    const SDK: &str = "macos-sdk 27.2";
+    let native = KeyInputs { runner: RunnerKey::Native { compiler: [4; 32], target: "aarch64-apple-darwin", sysroot: SDK }, ..at };
     let row = [probe::Row { key: ContentId([7; 32]), accepted: true }];
-    let changed: [(&str, KeyInputs<'_>, KeyInputs<'_>); 8] = [
+    let changed: [(&str, KeyInputs<'_>, KeyInputs<'_>); 9] = [
         ("module", at, KeyInputs { module: [2; 32], ..at }),
         ("env", at, KeyInputs { env: &env_b, ..at }),
         ("answers", at, KeyInputs { answers: Table { rows: &row }.id(), ..at }),
         ("c_mode", at, KeyInputs { c_mode: CMode::Built, ..at }),
         ("limits", at, KeyInputs { limits: RunLimits { fuel: 1, ..LIMITS }, ..at }),
         ("runner", at, native),
-        ("compiler", native, KeyInputs { runner: RunnerKey::Native { compiler: [5; 32], target: "aarch64-apple-darwin" }, ..at }),
-        ("target", native, KeyInputs { runner: RunnerKey::Native { compiler: [4; 32], target: "aarch64-unknown-linux-gnu" }, ..at }),
+        ("compiler", native, KeyInputs { runner: RunnerKey::Native { compiler: [5; 32], target: "aarch64-apple-darwin", sysroot: SDK }, ..at }),
+        ("target", native, KeyInputs { runner: RunnerKey::Native { compiler: [4; 32], target: "aarch64-unknown-linux-gnu", sysroot: SDK }, ..at }),
+        ("sysroot", native, KeyInputs { runner: RunnerKey::Native { compiler: [4; 32], target: "aarch64-apple-darwin", sysroot: "macos-sdk 27.3" }, ..at }),
     ];
     changed.iter().find(|(_, from, to)| key(from) == key(to)).map(|(name, _, _)| *name)
 }

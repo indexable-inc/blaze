@@ -15,7 +15,7 @@ pub mod cursor;
 pub mod hex;
 pub mod leb;
 
-use std::mem::offset_of;
+use core::mem::offset_of;
 
 use blaze_ids::ContentId;
 

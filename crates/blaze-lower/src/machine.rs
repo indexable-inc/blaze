@@ -2234,8 +2234,10 @@ impl<'t, 'c, 'a> Machine<'t, 'c, 'a> {
                 Expr::Underscore
             }
             ASM_EXPR => {
+                // `builtin # asm(..)`, the form blaze-expand writes for `asm!`: refused by name
+                // (`Why::Asm`) until `Expr::Asm` carries its operands' expressions.
                 self.done(f);
-                self.unhandled(f.kind, r, Why::Kind);
+                self.unhandled(f.kind, r, Why::Asm);
                 Expr::Asm
             }
             OFFSET_OF_EXPR => {

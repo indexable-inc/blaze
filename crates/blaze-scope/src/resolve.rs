@@ -921,8 +921,9 @@ impl<'a> Files<'a> for FileSet<'a> {
     }
 }
 
-/// The content id of a source file's text.
-fn file_id(text: &str) -> ContentId {
+/// The content id of a source file's text: what a `SourceFile::id` is, and what an items
+/// record's file row holds ([`crate::items_record`] checks a text against it on read).
+pub(crate) fn file_id(text: &str) -> ContentId {
     ContentId::of("blaze-scope source file 1", text.as_bytes())
 }
 
@@ -977,6 +978,8 @@ struct Lowering<'a> {
     prelude: Option<PreludeImport<'a, 'a>>,
     macro_use: AVec<'a, &'a str>,
     macro_exports: AVec<'a, (&'a str, ItemKey, MacroShapes)>,
+    /// The files' bodies that may write an impl in a block, in module then text order.
+    bodies: AVec<'a, crate::task::BodySrc<'a>>,
 }
 
 #[expect(clippy::too_many_arguments, reason = "one crate's every input, named")]
@@ -1133,6 +1136,9 @@ pub(crate) fn resolve_one<'a, S: SourceTexts<'a>, P: Par>(
         // handed to the caller; the records stay the fill's.
         #[cfg(feature = "cells")]
         let seam = par.cells_seam().map(|seam| (seam, seam.now()));
+        // The files' blocks that hold impls are modules before the fill starts: it is told
+        // of them as of any made module.
+        make_blocks(&base, &run, &low.bodies);
         fill.run(&cx, par, &all);
         #[cfg(feature = "cells")]
         if let Some((seam, fill_start)) = seam {
@@ -1236,9 +1242,11 @@ fn lower_modules<'a, P: Par>(
         prelude: None,
         macro_use: AVec::new_in(alloc),
         macro_exports: AVec::new_in(alloc),
+        bodies: AVec::new_in(alloc),
     };
     for (i, mut part) in parts.into_iter().enumerate() {
         let m = &tree.modules[i];
+        out.bodies.extend(part.bodies.iter().copied());
         for rules in part.decls.macro_rules.iter() {
             if rules.export {
                 out.macro_exports.push((rules.name, rules.def, rules.shapes));
@@ -1858,6 +1866,27 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     let text: &'a str = Box::leak(rendered.into_boxed_str());
     let made: &'a ExpansionText<'a> = Box::leak(Box::new_in(ExpansionText { text, outline: outline(text, edition, alloc) }, alloc));
     if let Some(error) = made.outline.errors().first() {
+        // A call a block's module holds ([`crate::blocks`]) stands in STATEMENT position: the
+        // Reference, "Macro invocation", "Statements": its expansion is statements, and one
+        // that is an expression or a `let` (`assert!(..)`, `println!(..)`) writes no item:
+        // nothing is lowered from it and nothing is wrong. One whose statements hold an item
+        // or a call beside what is not an item cannot be read by the item outline: refused by
+        // name below (never half read).
+        let in_block = held(run.made.read(), "made modules")
+            .get(&src.module)
+            .is_some_and(|m| m.info.name.is_some_and(|name| name.starts_with(crate::blocks::BLOCK_MODULE)));
+        if in_block {
+            let mut wrapped = AString::new_in(alloc);
+            wrapped.push_str("{");
+            wrapped.push_str(text);
+            wrapped.push_str("\n}");
+            let nested = blaze_file_items::nested::scan(&wrapped, alloc);
+            let plain = nested.end == blaze_file_items::nested::NestedEnd::Whole && nested.items.is_empty() && nested.calls.is_empty();
+            if !plain {
+                note(ExpandNote::NotItems { macro_name: mac.name, message: made.outline.message(error) });
+            }
+            return Some((DeclsBuilder::new_in(alloc), None));
+        }
         note(ExpandNote::NotItems { macro_name: mac.name, message: made.outline.message(error) });
     }
     let fragment = Fragment {
@@ -1874,10 +1903,62 @@ fn expand_decls<'a, S: SourceTexts<'a>>(
     let mut out = lower(LowerCx { krate: base.key, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs() }, fragment, alloc);
     let mods =core::mem::replace(&mut out.mods_made, AVec::new_in(alloc));
     let place = Made { text, outline: &made.outline, at: Where::Expansion(src.loc), place: At::Expansion(call) };
-    make_modules(base, run, src.module, &mods, place, src.depth + 1);
+    let mut bodies = core::mem::replace(&mut out.bodies, AVec::new_in(alloc));
+    make_modules(base, run, src.module, &mods, place, src.depth + 1, &mut bodies);
     let decls = core::mem::replace(&mut out.decls, DeclsBuilder::new_in(alloc));
     add_lowered(run, call, At::Expansion(call), out);
+    make_blocks(base, run, &bodies);
     Some((decls, Some(made)))
+}
+
+/// The most bodies deep (with expansions) a block's module is made: a body in a block of a
+/// body in a block, each level one more (rule 18).
+const MAX_BLOCK_DEPTH: u16 = 64;
+
+/// Makes the modules of the blocks of `bodies` that hold an `impl` ([`crate::blocks`]): each
+/// body's text is scanned once by syntax; one that writes an impl in a block gets a fragment
+/// under the key `(body, "blocks")`, lowered like an expansion's, whose modules are made
+/// modules of the body's module: their impls land in the crate's tables with every other
+/// impl, their members' bodies are bodies. The fragment's own declarations (its outermost
+/// block's module) are given to no module: no name reaches a block from outside it. A body
+/// lowered inside a block's module is scanned in turn: a work list, no recursion.
+fn make_blocks<'a, S: SourceTexts<'a>>(base: &Base<'_, 'a, S>, run: &Run<'a>, bodies: &[crate::task::BodySrc<'a>]) {
+    let alloc = base.alloc;
+    let mut work: AVec<'a, crate::task::BodySrc<'a>> = AVec::from_slice_in(bodies, alloc);
+    while let Some(body) = work.pop() {
+        let nested = blaze_file_items::nested::scan(body.text, alloc);
+        // An unbalanced body is the parser's error to report; nothing is read from it.
+        if nested.end != blaze_file_items::nested::NestedEnd::Whole || !nested.has_impl() {
+            continue;
+        }
+        if body.depth >= MAX_BLOCK_DEPTH {
+            run.note(NamesNote::Made { name: crate::blocks::BLOCK_MODULE, at: body.loc, note: MadeNote::TooMany });
+            continue;
+        }
+        let rendered = crate::blocks::module_text(body.text, &nested, alloc);
+        let text: &'a str = Box::leak(rendered.into_boxed_str());
+        let made: &'a ExpansionText<'a> = Box::leak(Box::new_in(ExpansionText { text, outline: outline(text, base.edition, alloc) }, alloc));
+        let call = crate::task::key_of(base.key, body.key, "blocks", "", 0);
+        let fragment = Fragment {
+            module: body.module,
+            owner: call,
+            text,
+            outline: &made.outline,
+            items: None,
+            at: Where::Expansion(body.loc),
+            depth: body.depth + 1,
+            made: false,
+            members_of: None,
+        };
+        let mut out = lower(LowerCx { krate: base.key, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs() }, fragment, alloc);
+        let mods = core::mem::replace(&mut out.mods_made, AVec::new_in(alloc));
+        let place = Made { text, outline: &made.outline, at: Where::Expansion(body.loc), place: At::Expansion(call) };
+        make_modules(base, run, body.module, &mods, place, body.depth + 1, &mut work);
+        // The outermost block's `mod` declaration: dropped, so the body's module binds nothing.
+        out.decls = DeclsBuilder::new_in(alloc);
+        add_lowered(run, call, At::Expansion(call), out);
+        held(run.expansions.lock(), "expansions").insert(call, Expansion { decls: DeclsBuilder::new_in(alloc), made: Some(made) });
+    }
 }
 
 /// Drives an eager builtin's nested calls: `include!(concat!(env!("OUT_DIR"), "/x.rs"))`.
@@ -2143,7 +2224,16 @@ fn file_at<'a, S: SourceTexts<'a>>(base: &Base<'_, 'a, S>, run: &Run<'a>, path: 
 /// body, a `mod x;` one's from its file, found as the walk finds one), its place recorded in
 /// `run.made`, and its key queued for the fill. A worklist, not recursion: a module inside a
 /// made one is pushed once its parent is recorded.
-fn make_modules<'a, S: SourceTexts<'a>>(base: &Base<'_, 'a, S>, run: &Run<'a>, parent: ItemKey, mods: &[ModMade<'a>], made: Made<'a>, depth: u16) {
+fn make_modules<'a, S: SourceTexts<'a>>(
+    base: &Base<'_, 'a, S>,
+    run: &Run<'a>,
+    parent: ItemKey,
+    mods: &[ModMade<'a>],
+    made: Made<'a>,
+    depth: u16,
+    // The bodies lowered in the made modules that may write an impl in a block, added.
+    bodies: &mut AVec<'a, crate::task::BodySrc<'a>>,
+) {
     let alloc = base.alloc;
     let mut work: AVec<'a, (ItemKey, ModMade<'a>, Made<'a>)> = AVec::with_capacity_in(mods.len(), alloc);
     work.extend(mods.iter().map(|m| (parent, *m, made)));
@@ -2215,6 +2305,7 @@ fn make_modules<'a, S: SourceTexts<'a>>(base: &Base<'_, 'a, S>, run: &Run<'a>, p
             members_of: None,
         };
         let mut out = lower(LowerCx { krate: base.key, edition: base.edition, cfg: base.cfg, walked: base.tree, procs: base.expansion_procs() }, fragment, alloc);
+        bodies.extend(out.bodies.iter().copied());
         let mut chain = AVec::with_capacity_in(parent_chain.len() + 1, alloc);
         chain.push(m.key);
         chain.extend_from_slice(&parent_chain);

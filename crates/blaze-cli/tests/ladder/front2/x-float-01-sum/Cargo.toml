@@ -1,0 +1,4 @@
+[package]
+name = "ladder-x-float-01-sum"
+version = "0.1.0"
+edition = "blaze-2026.11"

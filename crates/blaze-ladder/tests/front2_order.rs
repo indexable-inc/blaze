@@ -153,3 +153,50 @@ fn outcome_does_not_depend_on_order() {
     let alone_shown: Vec<String> = alone.iter().map(|(n, o)| format!("`{n}`: {}", o.chars().take(160).collect::<String>())).collect();
     assert!(differ.is_empty(), "{} outcomes depend on what was checked before:\n{}\nalone:\n{}", differ.len(), differ.join("\n"), alone_shown.join("\n"));
 }
+
+/// Impls written in blocks (tests/front2_nested.rs): `via_const` and `via_fn` are answered by
+/// impls in another item's block, `via_module` by a module-level impl (the control: all three
+/// have one outcome); `holder` is the fn whose body writes one of the impls.
+const NESTED: &str = "trait Tr { fn f(&self) -> u8; }
+struct A;
+struct B;
+struct M;
+const _: () = { use crate::Tr as T2; impl T2 for A { fn f(&self) -> u8 { 1 } } };
+fn holder() -> u8 { impl Tr for B { fn f(&self) -> u8 { 2 } } 0 }
+impl Tr for M { fn f(&self) -> u8 { 3 } }
+fn via_const(x: A) -> u8 { x.f() }
+fn via_fn(x: B) -> u8 { x.f() }
+fn via_module(x: M) -> u8 { x.f() }
+fn main() {}
+";
+
+const NESTED_BODIES: [&str; 4] = ["via_const", "holder", "via_fn", "via_module"];
+
+/// An impl in a block answers the same whether the body that writes it was checked before the
+/// body that uses it, after it, or never.
+#[test]
+fn an_impl_in_a_block_does_not_depend_on_order() {
+    let forward: Vec<&str> = NESTED_BODIES.to_vec();
+    let backward: Vec<&str> = NESTED_BODIES.iter().rev().copied().collect();
+    let mut runs: Vec<&[&str]> = NESTED_BODIES.chunks(1).collect();
+    runs.extend([&forward[..], &backward[..]]);
+    let mut got = check_runs(NESTED, &runs);
+    let orders = got.split_off(NESTED_BODIES.len());
+    let alone: Vec<(String, String)> = got.into_iter().map(|mut r| r.remove(0)).collect();
+    let of = |n: &str| alone.iter().find(|(m, _)| m == n).expect("each body checked alone").1.clone();
+    let mut differ = Vec::new();
+    for (label, order) in ["forward", "backward"].into_iter().zip(orders) {
+        for (n, got) in order {
+            if got != of(&n) {
+                differ.push(format!("{label}: `{n}`: alone {:?}, here {:?}", short(&of(&n)), short(&got)));
+            }
+        }
+    }
+    for (n, o) in &alone {
+        println!("NESTED ORDER alone `{n}`: {}", short(o));
+    }
+    println!("NESTED ORDER {} bodies, 2 orders on one store, {} outcomes differ from alone", NESTED_BODIES.len(), differ.len());
+    assert!(differ.is_empty(), "{} outcomes depend on what was checked before:\n{}", differ.len(), differ.join("\n"));
+    let control = of("via_module");
+    assert_eq!((of("via_const"), of("via_fn")), (control.clone(), control), "an impl in a block answers as a module-level impl does");
+}

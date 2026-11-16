@@ -90,6 +90,11 @@ pub struct Checked<'a> {
     /// (rules/suggest.rs; `suggest::pick` chooses the one fix with the item's text). Empty, and
     /// no work done, for a body where every name resolved.
     pub suggests: crate::rules::suggest::Suggests<'a>,
+    /// For each return-position `impl Trait` (and an `async fn`'s future) this body DEFINES: the
+    /// opaque's key and its hidden type, over the owner's generics (rules/opaque_def.rs), in the
+    /// order the signature names them. What the world's `opaque_hidden` answers from, so a
+    /// caller's auto-trait goal on the opaque (`Send` "leaks" from the hidden type) is decided.
+    pub hidden: Vec<(crate::ids::ItemKey, PTy), Alloc<'a>>,
 }
 
 /// Two two-column tables are equal column by column.
@@ -144,6 +149,7 @@ impl<'a> Checked<'a> {
             && soa3_eq(&self.closures, &other.closures)
             && self.diags == other.diags
             && self.suggests == other.suggests
+            && self.hidden == other.hidden
     }
 }
 
@@ -169,6 +175,7 @@ impl<'a> core::fmt::Debug for Checked<'a> {
             .field("closures", &self.closures)
             .field("diags", &self.diags)
             .field("suggests", &self.suggests)
+            .field("hidden", &self.hidden)
             .field("reads", &self.reads)
             .field("needs", &self.needs)
             .finish()

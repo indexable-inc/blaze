@@ -16,8 +16,10 @@
 //! - comparisons: every ordered condition is false when either side is `NaN`, every unordered
 //!   one true (`!=` is unordered: `NaN != NaN`).
 //!
-//! Refused by name: `frem` (a call of `fmod`), the min/max/rounding family, `fma`, `f16` and
-//! `f128`, and the two conditions that need two flags (`one`, `ueq`).
+//! `frem` and the conversions to and from `i128` are calls (pass/runtime.rs).
+//!
+//! Refused by name: the min/max/rounding family, `fma`, `f16` and `f128`, and the two
+//! conditions that need two flags (`one`, `ueq`).
 
 use std::alloc::Allocator;
 
@@ -156,6 +158,9 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 self.put(enc::fcvt(to, V0, V0));
                 self.fst(V0, inst, to);
             }
+            // To and from `i128`: the runtime's routines (pass/runtime.rs).
+            Op::FptoSi | Op::FptoUi if Self::is_wide(view.ty(Value(inst as u32))) => return self.float_to_wide(inst, op),
+            Op::SitoFp | Op::UitoFp if Self::is_wide(view.ty(view.operands(inst).value())) => return self.wide_to_float(inst, op),
             Op::FptoSi | Op::FptoUi => {
                 let a = o.value();
                 let double = self.float_of(inst, op, a)?;
@@ -228,7 +233,8 @@ impl<A: Allocator> Pass<'_, '_, A> {
                 self.ld(X10, ptr);
                 self.mem(false, if double { enc::Size::X } else { enc::Size::W }, X9, X10, off);
             }
-            Op::Frem => return Err(unsupported(inst, op, "`frem` (a call of `fmod`, not linked on the run path yet)")),
+            // A call of `fmod`/`fmodf` (pass/runtime.rs).
+            Op::Frem => return self.frem(inst, op),
             _ => return Err(unsupported(inst, op, "this float operation (min/max, rounding, `fma`, `sqrt`, `copysign`, `fabs`)")),
         }
         Ok(())

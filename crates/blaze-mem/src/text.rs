@@ -33,7 +33,7 @@ mod unix;
 #[cfg(unix)]
 pub use unix::{OsString, PathBuf};
 
-use std::alloc::Allocator;
+use core::alloc::Allocator;
 
 #[doc(hidden)]
 pub use blaze_own::text::{format, format_into};

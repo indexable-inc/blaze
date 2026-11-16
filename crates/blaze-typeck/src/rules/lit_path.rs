@@ -18,7 +18,7 @@ use crate::ids::{ExprId, ItemKey, Mutbl, Name, PathIdx, ScopeId};
 use crate::machine::{Expectation, Flow, Frame, Lower, Machine, Then};
 use crate::portable::{PNode, PTy, PTys};
 use crate::ty::{Cause, Goal, Ty, TyList, TyView, TypeCtx, VarKind};
-use crate::world::{AssocKind, CtorKind, Def, FnSig, PathRes, World};
+use crate::world::{AssocKind, CtorKind, Def, FnSig, PathRes, Shape, World};
 
 /// Why a body path has no definition.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -526,7 +526,12 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// counts the current impl's trait in scope: `Self::g()` in `impl Tr for E` needs no
     /// `use`). An item reached twice is one candidate: candidates are counted by item key.
     fn assoc_value(&mut self, at: At, cause: Cause, self_ty: Ty, seg: Segment, scope: ScopeId) -> Result<Ty, Stop> {
-        if let Some(shape) = self.shape(self_ty) {
+        // A type parameter has no inherent items (the Reference, "Implementations", "Inherent
+        // implementations": the implementing type is a nominal type), so the world is not asked:
+        // its answer for "any type" would list every inherent impl whose self type it could
+        // not read, and one refused header there made every `T::NAME` a gap.
+        let nominal = self.shape(self_ty).filter(|s| !matches!(s, Shape::Param));
+        if let Some(shape) = nominal {
             let cands = self.reads.inherent(shape, seg.name)?;
             let mut found: Option<(ItemKey, ItemKey, AssocKind)> = None;
             let mut count = 0u32;
@@ -554,47 +559,53 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 return self.assoc_item_ty(at, cause, item, kind, impl_args, Some(seg));
             }
         }
-        // Trait candidates.
+        // Trait candidates, in two tiers: the traits of a parameter's bounds come before the
+        // rest (the Reference, "Method call expressions": "If `T` is a type parameter, methods
+        // provided by trait bounds on `T` are looked up first. Then all remaining methods in
+        // scope are looked up."; for a path the Reference is silent and this is rustc's order:
+        // `assemble_inherent_candidates_from_param` gives inherent candidates, which `pick`
+        // tries before the extension candidates). A tier with one applicable candidate ends
+        // the search; with two it is E0034.
+        let mut bounds: Vec<ItemKey, Alloc<'a>> = Vec::new_in(self.alloc);
+        if let TyView::Param(i) = self.view(self_ty) {
+            self.param_bound_traits(i, &mut bounds)?;
+        }
         let mut traits: Vec<ItemKey, Alloc<'a>> = Vec::new_in(self.alloc);
         traits.extend_from_slice(self.reads.traits_in_scope(scope)?);
-        if let TyView::Param(i) = self.view(self_ty) {
-            self.param_bound_traits(i, &mut traits)?;
-        }
         if let Some(parent) = self.reads.assoc_parent(self.body.owner)? {
             if let Some(tr) = self.reads.impl_header(parent.container)?.and_then(|h| h.trait_) {
                 traits.push(tr);
             }
         }
-        // A trait reached twice (in scope and as a bound, say) is one candidate.
-        traits.sort_unstable();
-        traits.dedup();
-        let mut picked: Option<(ItemKey, ItemKey, AssocKind, TyList)> = None;
-        let mut count = 0u32;
-        for &tr in traits.iter() {
-            let Some(item) = self.reads.assoc_item(tr, seg.name)? else { continue };
-            let trait_args = self.trait_args_for(item.item, self_ty)?;
-            let goal = Goal::Trait { trait_: tr, args: trait_args };
-            if self.ty.may_hold(goal, &mut self.reads)? {
-                count += 1;
-                if picked.is_none() {
-                    picked = Some((tr, item.item, item.kind, trait_args));
+        for tier in [&mut bounds, &mut traits] {
+            // A trait reached twice (in scope and as the impl's own, say) is one candidate.
+            tier.sort_unstable();
+            tier.dedup();
+            let mut picked: Option<(ItemKey, ItemKey, AssocKind, TyList)> = None;
+            let mut count = 0u32;
+            for &tr in tier.iter() {
+                let Some(item) = self.reads.assoc_item(tr, seg.name)? else { continue };
+                let trait_args = self.trait_args_for(item.item, self_ty)?;
+                let goal = Goal::Trait { trait_: tr, args: trait_args };
+                // A candidate the world cannot decide stops here as the body's gap (`?`).
+                if self.ty.may_hold(goal, &mut self.reads)? {
+                    count += 1;
+                    if picked.is_none() {
+                        picked = Some((tr, item.item, item.kind, trait_args));
+                    }
                 }
             }
-        }
-        if count > 1 {
-            self.diag(DiagCode::AmbiguousMethod, at, None, Some(self_ty), Some(seg.name));
-            return Ok(self.common.err);
-        }
-        match picked {
-            Some((tr, item, kind, trait_args)) => {
+            if count > 1 {
+                self.diag(DiagCode::AmbiguousMethod, at, None, Some(self_ty), Some(seg.name));
+                return Ok(self.common.err);
+            }
+            if let Some((tr, item, kind, trait_args)) = picked {
                 self.register_trait(tr, trait_args, cause)?;
-                self.assoc_item_ty(at, cause, item, kind, trait_args, Some(seg))
-            }
-            None => {
-                self.diag(DiagCode::NoMethod, at, None, Some(self_ty), Some(seg.name));
-                Ok(self.common.err)
+                return self.assoc_item_ty(at, cause, item, kind, trait_args, Some(seg));
             }
         }
+        self.diag(DiagCode::NoMethod, at, None, Some(self_ty), Some(seg.name));
+        Ok(self.common.err)
     }
 
     /// The traits of the body's where-clauses whose self type is parameter `i`, elaborated

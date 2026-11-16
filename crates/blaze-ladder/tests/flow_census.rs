@@ -20,7 +20,7 @@ use blaze_flow::flow::Flow;
 use blaze_flow::loans::{BorrowFinding, TierOne, facts, tier_one, tier_two};
 use blaze_flow::moves::check_moves_planted;
 use blaze_flow::record::Plant as FlowPlant;
-use blaze_flow_lower::{AdtFacts, CalleeFacts, Facts, lower};
+use blaze_flow_lower::{AdtFacts, CalleeFacts, Facts, SigBuf, SigLife, lower, read_signature};
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::Front2;
 use blaze_ladder::front2::body::{BodyError, lower_fn, lower_member};
@@ -58,9 +58,17 @@ struct Gathered {
     adts: BTreeMap<u128, AdtFacts>,
     callees: BTreeMap<u128, CalleeFacts>,
     fields: BTreeMap<(u128, u32), Vec<tc::Name>>,
+    /// The lifetime part of each fn whose text `read_signature` could line up with its head
+    /// (the stand-in for question H1: read from the fn's own text, never guessed).
+    sigs: BTreeMap<u128, SigBuf<Alloc<'static>>>,
+    /// Why the others were not read, by the refusal's name.
+    sig_refused: BTreeMap<String, usize>,
 }
 
 impl Facts for Gathered {
+    fn sig(&self, item: tc::ItemKey) -> Option<SigLife<'_>> {
+        self.sigs.get(&item.0).map(|s| s.life())
+    }
     fn adt(&self, adt: tc::ItemKey) -> Option<AdtFacts> {
         self.adts.get(&adt.0).copied()
     }
@@ -96,6 +104,24 @@ fn gather(r: &mut Records<'_, '_>, owner: tc::ItemKey, c: &tc::Checked<'_>, copy
     }
     for k in adts {
         let key = tc::ItemKey(k);
+        // The store holds only the ADTs something asked for: ask. One that cannot be made stays
+        // unknown here, and the lowering refuses its body by name (`UnknownAdt`).
+        if !r.store.adts.contains_key(&key)
+            && let Some(lib) = r.keys.library(key)
+        {
+            let mut lens = 0;
+            loop {
+                match r.store.ensure(r.names, r.keys, Want::Adt(lib)) {
+                    Err(HeadError::Item(_, Why::NeedConst(c, _))) if lens < MOST_LENS => {
+                        lens += 1;
+                        if eval_len(r, c).is_err() {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+        }
         let Some(row) = r.store.adts.get(&key) else { continue };
         let (kind, variants) = (row.kind, row.variants.clone());
         let fields = row.fields.clone();
@@ -126,6 +152,22 @@ fn gather(r: &mut Records<'_, '_>, owner: tc::ItemKey, c: &tc::Checked<'_>, copy
         let Some(f) = r.store.fns.get(&tc::ItemKey(k)) else { continue };
         let self_ref = f.self_param && f.inputs.first().is_some_and(|&t| matches!(r.store.tys.view().node(t), Ok(tc::PNode::Ref(..))));
         g.callees.insert(k, CalleeFacts { writes_lifetimes: writes_lifetime(f.text), self_ref });
+        // An ADT's lifetimes exactly as the ADT facts above say them: a `'` in its head's text.
+        let (keys, names) = (&*r.keys, r.names);
+        let adt_lifetimes = |a: tc::ItemKey| {
+            Some(keys.library(a).and_then(|lib| names.item_text(lib)).is_some_and(|t| t.text.split(['{', '(', ';']).next().unwrap_or("").contains('\'')))
+        };
+        let mut buf = SigBuf::new_in(Alloc::global());
+        match read_signature(f.text, r.store.tys.view(), &f.inputs[..], f.output, &adt_lifetimes, &mut buf, Alloc::global()) {
+            Ok(()) => {
+                g.sigs.insert(k, buf);
+            }
+            Err(why) => {
+                let name = format!("{why:?}");
+                let name = name.split([' ', '{']).next().unwrap_or("").to_string();
+                *g.sig_refused.entry(name).or_default() += 1;
+            }
+        }
     }
     g
 }
@@ -148,6 +190,11 @@ struct Done {
     calls_elided: u32,
     calls_unified: u32,
     sig_lifetimes: bool,
+    /// Calls related through the callee's lifetime part; whether the body's own was read.
+    calls_by_signature: u32,
+    sig_read: bool,
+    /// Signatures (the body's and its callees') whose text was not read, by refusal.
+    sig_refused: BTreeMap<String, usize>,
 }
 
 fn snippet(text: &str, lo: u32, hi: u32) -> String {

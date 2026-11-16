@@ -217,7 +217,7 @@ link the same pack store or an `Origin`, and stops at the first that holds the k
    "Namespaces", a record is public when its name and every name it reads are a toolchain
    crate's (a registry archive known by its checksum is next). Today that is the `CrateScope`
    records of core, alloc, std, bstd and their dependencies. A put of a public record goes
-   here, every other put to the project's store. Two builds racing write equal bytes under one
+   here, every other put to the project's store (superseded: "Shared across worktrees"). Two builds racing write equal bytes under one
    key; either pack stands (the store's rule). Not `v2/records`: an old one-file-a-record
    layout used that name, and the open removes what it cannot read.
 2. **The named origins**, a folder or an HTTP base address, checked as above. A fetched record
@@ -317,6 +317,89 @@ projects, never beneath the start; load 52 to 55, so times are not comparable wi
    per key, the misses as ONE `fetch(reader, origin, clock, &missed, alloc)`, then `got` for
    each key in the order asked, which steps `Event::Got`. Floor 5 origin reads where
    one-at-a-time gets make 19.
+
+## Shared across worktrees (2026-11-16)
+
+The owner: not only the standard library, every library, and a project's own code, shared
+between worktrees. **What the keys hold** (searched: blaze-drive key.rs, every `Name::file` and
+`cert_key` caller, blaze-world `unit_input`, `unit_graph_task::source`, names.rs `world`,
+blaze-cli for `PWD`, `mtime`, `stamp`, `absolute`): no key and no record holds the checkout's
+path, an absolute path or a stamp. A file's name is its checkout-relative path (key.rs:170); a
+unit's key holds its root relative to its package (blaze-unit-graph lib.rs:169) and the lock's
+`source` text, empty for a member; the certificate key is the command and each file's relative
+path and digest (key.rs:275); `Tool` is the binary's digest. Stamps live in the leaf table,
+`.blaze/v2/last` (sweep.rs:556), outside the store; `PWD` is printed only (print.rs:27). So two
+worktrees with the same texts compute the same keys, and sharing is only where a record is put.
+
+**Design.** A get goes down the chain: the checkout's store, the public machine store
+(`v2/shared`), the user's own store (`v2/own`), an origin. A put goes where `Sharing::place`
+says (store.rs `Place`): a drive record whose names are all public to `v2/shared`; every other
+drive record to `v2/own`, whoever made it; the checkout's store keeps only what is about this
+checkout: certificates ("this request was answered over these files"), their pages and roots,
+and `Fetch` records, which vouch for the checkout's `.blaze/v2/sources` folder (fetch.rs:50)
+until that folder moves to the home. The leaf table and the profile stay files of the
+checkout. Private code is as private as before: both stores are under the user's home, on this
+machine; another user on a shared machine has another home and another store, and no write
+reaches the network. What an origin may serve is a separate, narrower rule: it is sealed from
+`v2/shared` alone (the public names of target.md, "Namespaces"); `v2/own` is never sealed, so
+the seam is a folder, not a filter a sealer could forget. Disk: `v2/own` now grows with every
+checkout's records (each edit adds packs; equal keys are written once). Nothing collects packs
+today: a store merges past 8 packs (`PackStore::merge`), dropping only duplicate keys. Owed,
+per target.md "cleanup by generation and last use, no lock": each command appends its read
+keys' pack numbers to a last-use log beside the packs; a collector run after the answer
+(never waited on) rewrites the coldest packs without the records no command read in N days,
+under a byte cap. One project's answer can no longer be its own root set: many checkouts read
+one store, so last use, not reachability, decides.
+
+**Seen in reading, a cost not a bug:** a task key whose source is its identity (`CrateScope`)
+holds one shape (its read names); the store keeps the first put of a key, so a worktree whose
+text reads another file set misses that task's value record each command and reruns it. Never
+wrong (a value key is its reads), but two diverging worktrees pay it; the fix is a shape keyed
+by its own names, a list of shapes under the task key.
+
+**Written, never compiled (2026-11-16):** store.rs `Place`, `Sharing::place`, `OWN`, `Layered`
+with `own`; the chain test's three places and the plant `CheckoutIntoOwn` ("own oracle");
+store_worktree_tests.rs: (i) a second worktree runs no task, `machine found N written 0`, its
+findings a fresh home's; (ii) a body edit in it reruns one `BodyCheck`, no `CrateScope`, and
+the first stays certified with no run; (iii) the planted path in the keys (in the tool every
+key holds) is caught: "the second worktree ran".
+
+**The origin sealed from packs (written, never compiled, 2026-11-16).** `PackStore::each_record`
+walks a store's packs once a key, sorted; store_http_tests.rs `public_records` reads
+`v2/shared` alone through it and `seal_records` seals them (plain segments, `publish`, a
+signed head) as CI's writer would. Test `an_origin_sealed_from_the_machine_packs_answers_a_second_machine`:
+project A fills the home; the sealed origin is laid out in a folder; every record comes back
+byte-equal through `FolderOrigin` and over HTTP from the simulated ranged server (bstd's
+`Http`), a liar's flipped byte taken nowhere; project B, empty home, origin named, answers as a
+fresh build with fewer runs and "0 not fetched". B's own request reads the origin as a FOLDER:
+the request is one blocking lane and the simulation cannot run the server beside it, so HTTP is
+proven byte-equal on the same objects instead. Owed: crates/blaze-remote/examples/seal_origin.rs
+still reads `.blaze/v2/records/`; a tool over a real home needs the pack reader out of blaze-cli
+(a binary) into a library crate, one home for the pack format, then the measured run on
+`port27/shared-1116/`.
+
+**TLS under bstd's `Http` (design, no code).** The tree has a sans-IO TLS machine already:
+blaze-http `tls.rs` (98 lines), `Session::{Plain, Tls(Box<rustls::ClientConnection>)}` with
+`send(plain, out)`, `outgoing(out)`, `received(bytes, plain) -> Result<bool, String>` over
+rustls's buffered sans-IO calls (`read_tls`, `process_new_packets`, `reader`, `write_tls`);
+config from `roots.rs` (ring provider). Move it, not a second one: bstd `requests` gains a
+`tls` feature (rustls with ring) and `requests::Tls`, one type between `Conn` and blaze-h1:
+```rust
+pub enum Wrap { Plain, Tls(Box<rustls::ClientConnection>) }
+impl Wrap {
+    pub fn for_url(url: &Url, roots: &Roots) -> Result<Wrap, HttpError>;       // https: SNI = host
+    pub fn seal(&mut self, plain: &[u8], wire: &mut Bytes) -> Result<(), HttpError>;
+    pub fn open(&mut self, wire: &[u8], plain: &mut Bytes) -> Result<Opened, HttpError>; // Opened { closed: bool }
+    pub fn pending(&mut self, wire: &mut Bytes) -> Result<(), HttpError>;      // handshake bytes to send
+}
+```
+`Exchange` sends `pending` until the handshake ends, then `seal`s the request; `read_answer`
+feeds each `recv` through `open` before blaze-h1's `Response`. Roots come from `Net::roots`
+(`Effect::Roots`), held in `Provider::Over::roots`, turned into a `RootCertStore` once a
+command. Errors typed (`HttpKind::Tls { why }`, naming the host), never `String`. The
+simulation's server speaks rustls's `ServerConnection` with a test certificate whose root
+the sim's `Roots` hold; planted bug: the name check skipped (a certificate for another host
+must be refused). Then blaze-http's `tls.rs` and `Session` are deleted with its driver.
 
 ## HTTP in the tree (third runner, 2026-11-16: facts by search)
 

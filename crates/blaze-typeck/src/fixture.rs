@@ -645,6 +645,14 @@ impl Fx {
         self.impl_fn_own(imp, name, self_param, 0, inputs, output, Vec::new())
     }
 
+    /// `const name: ty;` in the trait `tr` (core's `SizedTypeProperties::IS_ZST`): the world's
+    /// `assoc_item(tr, name)` answers it as `AssocKind::Const`, its type the row's output.
+    pub fn trait_const(&mut self, tr: ItemKey, name: &str, ty: PTy) -> ItemKey {
+        let key = self.trait_fn_own(tr, name, false, 0, &[], ty, Vec::new());
+        self.consts.push(key);
+        key
+    }
+
     /// `const name: ty;` in the impl `imp` (core's `impl u32 { pub const MAX: Self = ..; }`).
     pub fn impl_const(&mut self, imp: ItemKey, name: &str, ty: PTy) -> ItemKey {
         let key = self.impl_fn_own(imp, name, false, 0, &[], ty, Vec::new());

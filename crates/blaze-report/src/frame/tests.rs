@@ -172,7 +172,7 @@ fn levels() -> [(&'static str, Caps); 4] {
 fn draw(case: &Case, caps: Caps, plant: Plant) -> String {
     let sources = [Source { shown: case.path, absolute: "/work/hello world/src/main.rs", text: case.text }];
     // The goldens draw the day `--fix` exists; the spec tests draw both states.
-    let input = Input { findings: &case.findings, sources: &sources, link: LINK_FILE, fixes: Fixes::Command };
+    let input = Input { findings: &case.findings, sources: &sources, link: LINK_FILE, fixes: Fixes::Command, ids: &[] };
     let mut out = AString::new_in(Alloc::global());
     render_planted(&mut out, &input, caps, Alloc::global(), plant).expect("the case's ranges are in its file");
     out.as_str().to_string()
@@ -203,8 +203,8 @@ fn goldens() {
     }
     golden("lines", &lines);
     let mut ends = String::new();
-    let failed = Closing { counts: Counts { errors: 1, files: 1, ..Counts::default() }, checked: 1, nanos: 1_090_000, changed: None, fixes: Fixes::ByHand, coverage: None };
-    let clean = Closing { counts: Counts::default(), checked: 14, nanos: 480_000, changed: Some(0), fixes: Fixes::ByHand, coverage: None };
+    let failed = Closing { counts: Counts { errors: 1, files: 1, ..Counts::default() }, checked: 1, nanos: 1_090_000, changed: None, fixes: Fixes::ByHand, coverage: None, fix_with: "" };
+    let clean = Closing { counts: Counts::default(), checked: 14, nanos: 480_000, changed: Some(0), fixes: Fixes::ByHand, coverage: None, fix_with: "" };
     let mixed = Closing {
         coverage: None,
         counts: Counts { errors: 2, warnings: 3, notes: 0, files: 2, fixable: 1 },
@@ -212,6 +212,7 @@ fn goldens() {
         nanos: 2_430_000_000,
         changed: Some(12),
         fixes: Fixes::Command,
+        fix_with: "",
     };
     for (_, caps) in levels().into_iter().chain([("lines", Caps::LINES)]) {
         for end in [failed, clean, mixed] {
@@ -584,4 +585,25 @@ fn a_mark_off_by_one_after_a_wide_character_is_caught() {
     blaze_sim::control(Config::cases(400), Plant::Clean, Plant::WideOffByOne, "caret column", |tape, plant| {
         properties(tape, plant)
     });
+}
+
+/// The owner's case (2026-11-16): the fix for `c` is `b`, the parameter nobody used; the help
+/// says why and draws the line before and after, from the fix's data (the hole's range and the
+/// bytes of `b`'s declaration). Plain: no escapes.
+#[test]
+fn the_owners_case_says_why_b_and_draws_the_line_before_and_after() {
+    use super::help;
+    use super::words::{HelpKind, help_words};
+    let text = "fn add(a: u32, b: u32) -> u32 { a + c }\n";
+    let hole = at(text, "c }", 0);
+    let b = at(text, "b:", 0) as usize;
+    let mut words = AString::new_in(Alloc::global());
+    help_words(&mut words, HelpKind::NeverUsed, &["b", "u32"]).expect("two arguments");
+    let fix = Edit { start: hole, end: hole + 1, insert: &text[b..b + 1] };
+    let mut out = AString::new_in(Alloc::global());
+    help(&mut out, words.as_str(), text.as_bytes(), Some(fix), Caps { width: 80, ..Caps::FRAMES }).expect("the fix is on one line");
+    let want = "help: `b` is in scope, is a `u32`, and is never used\n\
+                1 - fn add(a: u32, b: u32) -> u32 { a + c }\n\
+                1 + fn add(a: u32, b: u32) -> u32 { a + b }\n";
+    assert_eq!(out.as_str(), want, "\n{}", out.as_str());
 }

@@ -40,7 +40,7 @@
 //! allocation happens in place, so a `Vec<T, &Frame>` pushed in a loop never copies while
 //! nothing else is allocated after it and it stays in its block (in a span, always).
 
-use std::{
+use core::{
     alloc::{AllocError, Allocator, Layout},
     cell::Cell,
     mem::{self, ManuallyDrop, MaybeUninit},
@@ -972,8 +972,8 @@ unsafe impl Allocator for Frame {
     }
 }
 
-impl std::fmt::Debug for Frame {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for Frame {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Frame")
             .field("tag", &self.tag.get())
             .field("used", &self.used())

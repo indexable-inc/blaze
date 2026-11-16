@@ -48,6 +48,7 @@ extern crate std;
 
 mod again;
 pub mod asked;
+pub mod blocks;
 mod builtin;
 // The cell core, stage 1 (bottom.md section 6): no caller until stage 2's seam.
 #[cfg(feature = "cells")]
@@ -62,6 +63,7 @@ mod facts;
 mod finish;
 pub mod graph;
 mod group;
+pub mod items_record;
 mod lookup;
 pub mod names;
 pub mod names_record;

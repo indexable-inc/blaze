@@ -27,10 +27,12 @@ use crate::{
 mod asked;
 mod edits;
 mod attrs;
+mod blocks;
 mod entry;
 mod exports;
 mod fixtures;
 mod items;
+mod items_record;
 mod more;
 mod names_record;
 mod name_rules;

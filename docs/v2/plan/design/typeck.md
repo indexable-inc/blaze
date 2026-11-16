@@ -1592,6 +1592,41 @@ E0599, 151 E0277):
   variable (needs a small "has inference variables" query on `TypeCtx`), with a fixture whose
   failed goal's impl leaves a parameter unfixed by its header.
 
+(14) Runner after (13) (2026-11-16), `T::NAME` on a type parameter (core's `T::IS_ZST`, bstd's
+`P::WRITE`) and what the reductions said. Handing on.
+- RUN: tests/front2_selfpaths.rs as (13) left it: "test blaze-ladder: exit 0; 1 passed, 0
+  failed": A1..B5 and C1..C9 all check clean on the real front end. So the projection class
+  (tempo-front-5 "81 diag E0277 `<InboundKind as SolType>::RustType == InboundKind`") is NOT a
+  generic associated type beside `type RustType = Self;` (C7..C9 pass). Unproven lead: alloy
+  writes `impl SolType for X` inside `const _: () = { .. }`, the impls-inside-blocks lane's
+  class; a reduction with the impl inside a block was not run.
+- NEW tests/front2_params.rs (eleven bodies). Before the change every body, `P::make()` too:
+  "p1: Gap { .. gaps: [RefusedImpl { impl_: ItemKey(b6e412072608), place: \"(no file place)\",
+  why: .. argument 2 of `HasField` is a constant; that parameter is not a const parameter".
+  Cause, the checker's: `assoc_value` asked `inherent(Shape::Param, name)`, whose answer lists
+  every inherent impl the front end could not read by shape. FIXED in rules/lit_path.rs: a
+  parameter has no inherent items and the world is not asked; after: "p4: clean".
+- ALSO in `assoc_value`: two tiers, a parameter's bounds before the traits in scope (fixture
+  suite/self_paths.rs `a_parameters_bound_comes_before_the_traits_in_scope`; NOT shown failing
+  without the change: owed). blaze-typeck "145 passed, 0 failed" (one new fixture ignored).
+- THE FRONT END'S, open: every body naming a TRAIT's constant says "p1: diagnostics
+  [(NoMethod, Range { start: 27, end: 36 }, \"found Some(\\\"Param(0)\\\"), expected None ..",
+  the census's line. front2/world_items.rs `assoc_item` for a trait reads `t.fns` and
+  `extra.assoc` only; heads.rs `TraitHead` has no constants (a `Const` member is only
+  `DynMember::Const`). Needed: a member key and signature row per trait constant (as an
+  impl's `consts`) and `AssocKind::Const` from `assoc_item`. Probably also tempo-front-5's
+  "55 NEW diag E0576" at `<X as SolCall>::SELECTOR` (not reduced). The names in the test's
+  `OWED` list assert today's line and must be removed as the answer arrives.
+- OPEN, the checker's or the solver's: the ignored fixture
+  `a_parameters_constant_comes_from_a_blanket_impl`: `Q::Z` through `impl<T> Zst for T`
+  says "want bool, got {error}; diagnostics: want [], got [(NoMethod, 0)]" although the
+  fixture's `impls_of` lists the blanket impl: `may_hold(Zst for Param(0))` is answered no.
+  Not found why (start: blaze-solve trait_goals.rs `assemble_impls` and prefilter.rs's
+  `Param` fingerprint on the goal side; whether the fixture gives the impl's `T: Sized`
+  something the env lacks). This is `T::IS_ZST`'s second blocker once the constants answer.
+- NOT STARTED: (D) `variant_value`, "Sort { node: 128 }", `S::View<'_, T>`, `u24`; bstd's
+  `self.code.hash(state)` on `ContentId`.
+
 ## Closures against `Fn` bounds (2026-11-16, closures lane)
 
 The library's definitions (library/core/src/ops/function.rs): `#[lang = "fn_once"] pub trait
@@ -1853,12 +1888,131 @@ on eight correct bodies (the census's E0599, E0576 and E0277).
    (explicit declarations shadow the glob: innermost first), and a head resolves in a block
    exactly as in a module: no second lookup rule. The enclosing fn's generics and locals are not
    items, so they are not in scope (the Reference: no capture).
-4. Identity: the block fragment's key is `key_of(crate, enclosing item, "blocks", "", 0)` with
-   `INNER`; a block module's is that plus its ordinal among the body's blocks in text order; an
-   impl's is its ordinal among the impls of its block (the lowering's `key`); members under it as
-   at module level. Nothing depends on which body was read first.
+4. Identity: the block fragment's key is `key_of(crate, enclosing item, "blocks", "", 0)` (a
+   names-library key like a macro call's: `INNER` is not set, the lowering's `make_key` clears
+   it); a block module's is `(fragment or outer block, "mod", "__blaze_block_N")`, N its ordinal
+   among the body's WRITTEN blocks in text order (an unrelated `if { }` before it moves nothing);
+   an impl's is its ordinal among the impls of its block (the lowering's `key`); members under it
+   as at module level. Nothing depends on which body was read first.
 5. Member bodies are bodies (their module is the block's); a body inside one that holds impls
    again is scanned the same way: a work list, bounded by a depth cap.
+
+**Built (2026-11-16, one runner; nothing in blaze-ladder/src changed).**
+- crates/blaze-file-items/src/nested.rs: `scan(text, alloc) -> Nested { blocks: [Block { parent,
+  open, close }], items: [NestedItem { block, kind, range }], calls: [NestedCall { block, path }],
+  end }`; "5 passed" (sol's shape, serde's, every keyword form, a word in a string / comment /
+  macro arguments, an unclosed body).
+- crates/blaze-scope/src/blocks.rs `module_text`: the written blocks as `mod __blaze_block_N {
+  use super::*; <the block's item statements, verbatim, in text order> <inner written blocks> }`;
+  "3 passed". THE RECORD'S FORM today is that text, held like an expansion's
+  (`CrateNames::expansions[(body, "blocks")]`, text and outline), and what the lowering makes of
+  it in the crate's tables (`impls`, `texts`, `members`, the made modules): no new record type.
+- blaze-scope task/lower.rs: `Lowered::bodies: [BodySrc { key, module, text, loc, depth }]`, one
+  per fn/const/static item or member whose outline flag is `body_holds_items` and whose text
+  holds the word `impl` (so a body without one costs one substring search). resolve.rs
+  `make_blocks` (a work list) runs before the fill on the files' bodies, and after each
+  expansion and made module on theirs (`sol!`'s `const _` is an expansion's item); the fragment's
+  own `mod` declaration is dropped, so no name reaches a block from outside.
+- Proof: tests/front2_nested.rs "NESTED impls in the index: 11" and "1 passed, 0 failed" (eight
+  bodies that failed with NoMethod / NoAssocItem / Unsatisfied before, the fns of the nested
+  impls as bodies of their own, a refused control); front2_order.rs
+  `an_impl_in_a_block_does_not_depend_on_order` ("3 passed, 0 failed").
+
+**Not built, each owed.**
+- A body that NAMES a struct declared in its own block still gets front2's typed gap ("a struct in
+  a block": front2/locals.rs, world_paths.rs `path`): the block's module now holds that struct when
+  the block also holds an impl; `Locals::find` should answer struct / enum / alias / trait rows
+  from the block's module (and fn / const / static too, so a local item has ONE key: today a local
+  fn of a written block has the names library's key and `Locals`' derived key).
+- `<X as Tr>::K` and `Self::K` (an associated const as a value) fail for a module-level impl
+  exactly as for a nested one (front2_nested `in_const_k` against `module_k`): the type checker's
+  `assoc_value`, not this.
+- A statement-position macro call that writes an impl: listed by the scan (`Nested::calls`),
+  not expanded, no gap raised: the impl stays unseen (a wrong NO for that shape).
+- `super::` inside a nested item names the item's module (one level short); a private inherent fn
+  of a block impl is private to the block's module (the language: to the enclosing module).
+- The scan is not yet a record of its own keyed by the body's text: it runs inside the crate's
+  names resolution (D62's "impl index as records" would key `module_text` by the body's digest).
+- A const generic argument in braces in a nested item's header before its body
+  (`impl Tr<{ N }> for X {}`) ends the item early in the scan.
+
+## Impls inside blocks, runner 2 (2026-11-16)
+
+A WRITE-ONLY leg: every line below marked NEVER COMPILED was written and not run by its writer.
+
+**What the real project said** (tempo-front-6b.txt, the census right after runner 1):
+tempo_contracts "heads 48693, built 29198 (60.0%); bodies 20000, clean 2394 (12.0%)" (before
+nested impls: 6263 bodies, 3056 clean). Three new classes: "9781 container head: Resolve Path"
+(`<impl _serde :: Serialize for Burn>::serialize`), "7443 gap UnreadImpl" (`impl < 'de >
+_serde :: Deserialize < 'de > for __Field`: `PathError { .., at: 0, why: NotFound }`), "156
+lower Convert: Form" (`<impl alloy_sol_types :: private :: SolTypeValue < Self > for
+Call>::stv_abi_encoded_size`).
+
+**One cause for all three** (read from the code, the census lines 42-336 and the derives'
+sources; not yet confirmed by a run): crates/blaze-file-items/src/nested.rs `scan` lost the
+statement's start at any group INSIDE an attribute. `#[doc(hidden)]`'s `(` was pushed as
+`Open::Other { stmt: false }`, which set `fresh = false`, so the item after the attribute was
+no item. What the derives write (quoted):
+- serde_derive 1.0.229 src/dummy.rs `wrap_in_const`: `None => quote! {
+  #[allow(unused_extern_crates, clippy::useless_attribute)] extern crate serde as _serde; }`
+  (and `Some(path) => quote! { use #path as _serde; }` under `#[serde(crate = "..")]`), inside
+  `const _: () = { #use_serde _serde::__require_serde_not_serde_core!(); #code };`. The
+  `extern crate` was dropped from the block's module: `_serde` named nothing: classes 1 and 2
+  (the 7,443 bodies are every body offered one of some thirty unread `_serde` impls, the
+  largest `impl<'de> _serde::Deserialize<'de> for __Field` of reth_execution_types at 4,567).
+  tempo's `sol!` calls pass `extra_derives(serde::Serialize, serde::Deserialize)`
+  (crates/contracts/src/lib.rs:32); alloy-sol-macro-expander 1.7.3 writes no
+  `#[serde(crate = ..)]` (its only serde attribute is `#[serde(other)]`, expand/enum.rs:50), so
+  tempo takes the `extern crate` arm.
+- alloy-sol-macro-expander 1.7.3 src/expand/mod.rs:931: `#[doc(hidden)] #[allow(dead_code)]
+  type UnderlyingSolTuple<'a> = #sol_tuple;` in the `const _` block, named by
+  `stv_abi_encoded_size` (expand/struct.rs:98-99): the alias was dropped: class 3.
+- serde's `fn deserialize` body: `#[allow(non_camel_case_types)] #[doc(hidden)] enum __Field`,
+  `#[doc(hidden)] struct __FieldVisitor;`: dropped the same way.
+The five suspects of the brief, (b) to (e), are not the cause: the path fails at segment 0.
+
+**Written.**
+- nested.rs `scan`: a group opened inside an attribute's brackets is the attribute's
+  (`in_attr`: no block, no call, the statement stays at its start). `Skip::closed`: an item
+  with a body ends at the `}` of its first top-level `{` only when the next token is not `>` or
+  `,` (a braced const argument, `Tr<{ N }>`; no statement starts with either). `NestedCall`
+  gained `range` (the whole call). Tests: `an_attribute_with_arguments_keeps_its_item`,
+  `every_attribute_shape_keeps_its_item`, `a_braced_const_argument_does_not_end_an_item`,
+  `a_statement_call_has_its_whole_range`.
+- blaze-scope blocks.rs `module_text`: a statement call of a WRITTEN block is written into the
+  block's module as the item-position call it also is (`;` added after `(..)` and `[..]`), so
+  the one expansion driver expands it and an impl it writes lands in the tables, read in the
+  block's module. resolve.rs `expand_decls`: an expansion in a block's module that does not
+  read as items and holds no item or statement call (an expression: `assert!(..)`) writes
+  nothing and raises nothing; one that mixes items with other statements is refused by name
+  (`ExpandNote::NotItems`).
+- blaze-scope src/tests/blocks.rs (two crates, a stand-in for serde): the derive's exact shape
+  for Serialize and Deserialize, the `use path as _serde` arm, a statement call by path, a
+  block's own `macro_rules!`. blaze-ladder tests/front2_nested.rs: `attr_extern_crate`,
+  `attr_alias`.
+
+**Class 2's filing.** front2/buckets.rs already files an unread impl whose text names a trait
+as a trait impl (`written_trait`, `file_by_text`): never a candidate of an inherent question;
+"filed without its trait or self type" is the gap's fixed text (world_items.rs:105). What made
+one impl reach 4,567 bodies is `unread_any`: an unread trait impl whose self type has no shape
+is a candidate of every trait question its crate's `Home` allows. Not changed here (the file is
+the ITEMS lane's); with `_serde` bound the class should be gone.
+
+**Owed, in order.**
+1. A statement call in a body with NO written impl is not expanded (the body makes no module;
+   `BodySrc::of` also asks for the word `impl` in the text): an impl it writes is unseen and
+   no gap is raised: still a wrong NO. A gap "for every trait and every local type" on each
+   such call would fire for every `println!` statement; the sound fix is to expand statement
+   calls of every body (a cost to measure first), or to ask the macro's definition whether
+   any arm's text holds `impl`.
+2. A `macro_rules!` written before the fn in its MODULE is not in a block module's textual
+   scope: task/answer.rs `entry` reads `scope.mark(module)`, and a block's module has no `mod`
+   line in its parent (tests/blocks.rs `blocks_expand_a_statement_call_named_by_textual_scope`
+   prints "BLOCK impls by textual scope: N of 3"). Paths (`serde::m!`, `crate::m!`) and the
+   block's own `macro_rules!` are found.
+3. `super::` inside a nested item one level short; a private inherent fn of a block impl is
+   private to the block's module; `Locals::find` answering local types from the block's
+   module (runner 1's list, unchanged).
 
 ## Speed on real code (2026-11-16)
 
@@ -2015,3 +2169,58 @@ facts a goal's candidates need at once, or facts.rs filling an impl set's header
   `a_binding_that_becomes_a_constant_is_lowered_again` (115 passed). front2_clone.rs
   `unit_struct_patterns_through_front2` (11 cases) NOT RUN: blaze-consteval red under the code
   builder's `blaze_build::ground` batch; still `#[ignore]`d.
+
+## Fixes ranked by what is left (2026-11-16)
+
+The owner, on `fn add(a: u32, b: u32) -> u32 { a + c }`: the help offered `a` (one letter from
+`c`); `b` is right, the parameter nobody used. The rule: a fix is ranked by what is left wrong
+after it.
+
+Design (built):
+- Where it lives: a new side table `Checked::suggests` (blaze-typeck rules/suggest.rs
+  `Suggests`): per E0425 at a one-segment value name, its item-relative range, the expected type
+  there, and the bindings in scope whose type fits it, each with "used nowhere" and its scope
+  depth. No cross-crate change: `Checked` is built by literal only in writeback.rs, `Diag` and
+  `DiagCode` are untouched, no `Question` and no `World` method was added, so no batch token.
+- The walk notes a hole only when `expr_path` pushed an E0425 at a one-segment path
+  (`Machine::named_holes`, with the frame's expectation); writeback keeps the holes whose E0425
+  survived (a rolled-back probe's do not), exports the expectation (a variable, or an export that
+  would add an E0282, is "no expectation"), and `suggest::collect` lists candidates.
+- Rules: (1) type: a candidate whose type is not the expectation is not recorded (the
+  expectation, else for an operand of a builtin arithmetic/bitwise/comparison operator the other
+  operand's scalar type); (2) used nowhere ranks first, a `_name` never counts as unused;
+  (3) spelling: optimal-string-alignment distance, at most `max(len, 3) / 3` for a candidate (2)
+  does not rank; (4) scope depth. Two best equal on every count: no fix, both named.
+- The choice needs spelling, which is text, and the checker holds none (a `Name` is a hash):
+  `suggest::pick(&Suggests, &Hole, &dyn NameText, Rules, alloc)` is a pure function of the
+  record and the item's text (already an input of the body's key: every spelling it reads is a
+  binding's `Name`). It returns `Pick::{Nothing, Unused, Spelled, Tied}`; `Pick::fix` is data:
+  `Fix { at, from }`, the hole's item-relative range replaced by the item's own bytes at `from`
+  (the binding's name, trimmed of `ref`/`mut` in `pick`). No string is stored.
+- Words: blaze-report frame/words.rs `HELPS` (`HelpKind::{NeverUsed, SpelledAlike, Tied}`);
+  drawing: frame/mod.rs `help` (`help: ..`, then `N - line` and `N + line`).
+- Cost: zero on a clean body (`steps == 0`, no allocation: one length compare per path at the
+  walk); with a hole, one pass over expressions (parent column, use marks), then per hole its
+  ancestors and the patterns of the scopes passed, shadowing in a hash set: 200 locals, 404
+  steps (the floor: each expression and pattern once). A list for shadowing was 20304.
+- Tests: blaze-typeck suite/suggest.rs (7 pass: owner's case and its control without rule (2):
+  "tied a b", the type filter, spelling with transposition, a tie, nothing in scope, the hole is
+  no use, `_b`, cost); blaze-report frame/tests.rs
+  `the_owners_case_says_why_b_and_draws_the_line_before_and_after` (exact bytes).
+
+Owed:
+- Module items (`halp()` with `fn help()` in the module): needs a world question listing a
+  scope's value names WITH their text (a new `Question` variant breaks blaze-real check.rs's
+  exhaustive match and `World` gains a method: one batch). Candidates then carry
+  `Taken::Item(Def)` and rank after locals at equal counts; an item is never "unused".
+- The glue: the driver calls `pick` with the item's text, prints the candidate's type for the
+  words, adds the item's place to the ranges, and calls `frame::help` after the finding; `blaze
+  check --fix` applies `Fix`.
+- Extensions, same ranking: a field that does not exist (E0609/E0560): candidates are the ADT's
+  fields; (1) the field's type against the expectation; (2) in a struct expression, a field not
+  yet initialised, at a read, a field never read in the body; (3) spelling; tie: none. A method:
+  candidates by the receiver's inherent and in-scope trait methods; (1) arity and the expected
+  return type; (2) none (methods are not "unused" locally); (3) spelling. A type name: the types in
+  scope; (1) the kind the position needs (a trait in a bound, a type elsewhere), generic arity;
+  (3) spelling. A path of several segments: rank the first unresolved segment among the names of
+  its parent module or type, with the same counts.

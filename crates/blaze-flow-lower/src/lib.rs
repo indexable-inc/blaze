@@ -28,8 +28,11 @@ use blaze_typeck::{
     PatId, Range, Stmt as TStmt, StmtId, UnOp,
 };
 
+pub mod sig;
 #[cfg(test)]
 mod tests;
+
+pub use sig::{Region, SigBuf, SigLife, SigRefusal, read_signature};
 
 /// What the lowering needs to know about an ADT (flow.md section 7, question (e)).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -61,6 +64,13 @@ pub struct CalleeFacts {
 pub trait Facts {
     fn adt(&self, adt: ItemKey) -> Option<AdtFacts>;
     fn callee(&self, item: ItemKey) -> Option<CalleeFacts>;
+    /// The lifetime part of `item`'s signature (flow.md, "What the signature must say (H1)"):
+    /// the body's own gives its placeholders and what is known among them; a callee's is
+    /// instantiated at each call. `None`: not known, and the older stand-ins apply (elision from
+    /// [`CalleeFacts`], a call that writes lifetimes refused).
+    fn sig(&self, _item: ItemKey) -> Option<SigLife<'_>> {
+        None
+    }
     /// The index of field `name` of `variant`.
     fn field(&self, adt: ItemKey, variant: u32, name: Name) -> Option<u32>;
     /// The number of fields of `variant`.
@@ -91,7 +101,10 @@ pub enum Form {
     GuardMovesBinding,
     /// The callee's signature writes lifetimes (needs the heads' lifetime part).
     CallWritesLifetimes,
-    /// The output has elided lifetimes but no single input lifetime.
+    /// The signature's lifetime part does not have one region per origin position of the
+    /// body's parameters and return type.
+    SigUnaligned,
+    ///The output has elided lifetimes but no single input lifetime.
     ElisionAmbiguous,
     /// The body's own signature writes lifetimes the record cannot read.
     LetOutsideCondition,
@@ -122,6 +135,10 @@ pub struct Stats {
     /// Calls whose instantiation holds an origin, or whose callee is a value: every origin of
     /// their operands and destination made equal (a superset of any signature's relations).
     pub calls_unified: u32,
+    /// Calls related by instantiating the callee's lifetime part ([`Facts::sig`]).
+    pub calls_by_signature: u32,
+    /// The body's own placeholders and known relations came from its lifetime part.
+    pub sig_read: bool,
     /// The body's signature writes lifetimes: its placeholders are taken as all related.
     pub sig_writes_lifetimes: bool,
 }
@@ -140,6 +157,14 @@ pub enum Plant {
     AllCopy,
     /// An assignment relates no origins: a loan stays in the temporary it was made into.
     NoRelate,
+    /// A call of unknown signature makes a reference operand's own lifetime equal to every
+    /// other position (the form before the first position flowed one way).
+    HubBothWays,
+    /// A tuple is built with every position of its operands made equal (the form before each
+    /// element was related to its own field).
+    TupleUnified,
+    /// The signature's implied and declared bounds are not given to the flow as known.
+    NoKnown,
 }
 
 /// Lowers one checked body.
@@ -293,6 +318,8 @@ struct Lower<'b, 'c, F: Facts, A: Allocator + Clone> {
     two_phase: Vec<Loan, A>,
     extended: Vec<bool, A>,
     is_target: Vec<bool, A>,
+    /// The signature's regions and their placeholder origins (`'static` among them once met).
+    uni: Vec<(Region, Origin), A>,
     ret_block: Block,
     stats: Stats,
     plant: Plant,
@@ -340,6 +367,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             two_phase: Vec::new_in(alloc.clone()),
             extended,
             is_target,
+            uni: Vec::new_in(alloc.clone()),
             ret_block: Block(0),
             stats: Stats::default(),
             plant: Plant::None,
@@ -686,6 +714,45 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         }
     }
 
+    /// A call whose signature is not known: every position of its operands and its destination
+    /// made equal through one origin (a superset of any signature's relations among them),
+    /// except the first position of an operand that is itself a reference, which only flows
+    /// in. The callee holds that reference by value: its lifetime is covariant there, and
+    /// nothing the callee writes can put a loan into it (RFC 2094, "Subtyping": `&'a T` is
+    /// covariant in `'a`). What this cannot state is a callee that demands `'static`: a callee
+    /// whose head is known and writes lifetimes is refused before it comes here.
+    fn unify_call(&mut self, vs: &[Val], dest: Place, e: ExprId) -> Result<(), Refusal> {
+        let mut any = self.info(dest).len > 0;
+        for v in vs {
+            if let At::Place(p) = v.at {
+                any |= self.info(p).len > 0;
+            }
+        }
+        if !any {
+            return Ok(());
+        }
+        let hub = self.b.origin(false);
+        for i in 0..=vs.len() {
+            let (p, one_way) = if i < vs.len() {
+                let v = vs[i];
+                let At::Place(p) = v.at else { continue };
+                let top_ref = v.ty.wrap.is_some() || matches!(self.node(v.ty.ty, e)?, PNode::Ref(..));
+                (p, top_ref && self.info(p).exact && self.plant != Plant::HubBothWays)
+            } else {
+                (dest, false)
+            };
+            let s = self.info(p);
+            for k in s.start..s.start + s.len {
+                let o = self.origs[k as usize];
+                self.b.subset(o, hub);
+                if !(one_way && k == s.start) {
+                    self.b.subset(hub, o);
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// `dst = src` relates `src`'s type to `dst`'s at the statement just added: position by
     /// position when both are exact, the first covariantly when it is a reference, every other
     /// both ways (invariant: more relations refuse more, never less); else all made equal.
@@ -872,16 +939,22 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         // The parameters: locals 1..=n, the signature's placeholders.
         let nparams = body.params.len() as u32;
         self.scope_marks.push(0);
-        for (i, &p) in body.params.iter().enumerate() {
-            let t = match self.ck.pat_ty.get(p.ix()) {
-                Some(&t) => TyD::of(t),
-                None => return self.refuse_pat(Form::Malformed, p),
-            };
-            let l = Local(1 + i as u32);
-            self.new_local_with(t, true, Some(l), root)?;
-            self.vars.push(l);
+        let facts: &'b F = self.facts;
+        match facts.sig(body.owner) {
+            Some(sig) => self.signature(sig, nparams, root)?,
+            None => {
+                for (i, &p) in body.params.iter().enumerate() {
+                    let t = match self.ck.pat_ty.get(p.ix()) {
+                        Some(&t) => TyD::of(t),
+                        None => return self.refuse_pat(Form::Malformed, p),
+                    };
+                    let l = Local(1 + i as u32);
+                    self.new_local_with(t, true, Some(l), root)?;
+                    self.vars.push(l);
+                }
+                self.return_place(nparams, root)?;
+            }
         }
-        self.return_place(nparams, root)?;
         for (i, &p) in body.params.iter().enumerate() {
             let l = Local(1 + i as u32);
             let ty = self.local_ty[l.0 as usize];
@@ -956,6 +1029,225 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             }
         }
         Ok(())
+    }
+
+    /// The placeholder origin of a region of the body's own signature. `'static` outlives every
+    /// other (the Reference, "Lifetime bounds": `'static` "outlives all other lifetimes").
+    fn universal(&mut self, r: Region) -> Origin {
+        if let Some(&(_, o)) = self.uni.iter().find(|(x, _)| *x == r) {
+            return o;
+        }
+        let o = self.b.origin(true);
+        if r == Region::Static {
+            for i in 0..self.uni.len() {
+                let x = self.uni[i].1;
+                self.b.known(o, x);
+            }
+        } else if let Some(&(_, st)) = self.uni.iter().find(|(x, _)| *x == Region::Static) {
+            self.b.known(st, o);
+        }
+        self.uni.push((r, o));
+        o
+    }
+
+    /// Every reference of `t` and how many positions its referent has, positions counted from
+    /// `t`'s first: `&'a T` is well formed only when `T: 'a` (the Reference, "Lifetime bounds"),
+    /// so each position in the referent outlives the reference's. A signature's types are well
+    /// formed by assumption in its body (an implied bound) and by proof at each call.
+    fn ref_ranges(&self, t: TyD, e: ExprId, out: &mut Vec<(u32, u32), A>) -> Result<(), Refusal> {
+        out.clear();
+        let mut stack: Vec<(PTy, u32), A> = Vec::new_in(self.alloc.clone());
+        if t.wrap.is_some() {
+            out.push((0, self.npos(t.ty, e)?));
+            stack.push((t.ty, 1));
+        } else {
+            stack.push((t.ty, 0));
+        }
+        let mut steps = 0u32;
+        while let Some((t, at)) = stack.pop() {
+            steps += 1;
+            if steps > MOST_POSITIONS {
+                return self.refuse(Form::Bound, e);
+            }
+            match self.node(t, e)? {
+                PNode::Ref(_, i) => {
+                    out.push((at, self.npos(i, e)?));
+                    stack.push((i, at + 1));
+                }
+                PNode::Ptr(_, i) | PNode::Slice(i) | PNode::Pat(i, _) => stack.push((i, at)),
+                PNode::Array(i, _) => stack.push((i, at)),
+                PNode::Tuple(l) => {
+                    let mut off = at;
+                    for &x in self.list(l, e)? {
+                        stack.push((x, off));
+                        off += self.npos(x, e)?;
+                    }
+                }
+                PNode::Adt(k, l) => {
+                    let mut off = at + u32::from(self.adt_facts(k, e)?.lifetimes);
+                    for &x in self.list(l, e)? {
+                        stack.push((x, off));
+                        off += self.npos(x, e)?;
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// The parameters and the return place from the signature's lifetime part: one placeholder
+    /// per region, each position of each parameter and of the return type taking its region's;
+    /// known among them exactly what the signature states: its declared bounds, `'static`, and
+    /// the bounds implied by its types being well formed. Nothing else is known, so a `subset`
+    /// the body derives between two placeholders beyond these is a finding (flow.md section 3).
+    fn signature(&mut self, sig: SigLife<'_>, nparams: u32, root: ExprId) -> Result<(), Refusal> {
+        if sig.ends.len() != nparams as usize {
+            return self.refuse(Form::SigUnaligned, root);
+        }
+        let mut ranges: Vec<(u32, u32), A> = Vec::new_in(self.alloc.clone());
+        let mut lo = 0usize;
+        for i in 0..=nparams as usize {
+            let (l, t, hi) = if i < nparams as usize {
+                let p = self.body.params[i];
+                let t = match self.ck.pat_ty.get(p.ix()) {
+                    Some(&t) => TyD::of(t),
+                    None => return self.refuse_pat(Form::Malformed, p),
+                };
+                (Local(1 + i as u32), t, sig.ends[i] as usize)
+            } else {
+                (Local(0), TyD::of(self.adjusted_ty(root)?), sig.regions.len())
+            };
+            let n = self.npos_d(t, root)? as usize;
+            if hi < lo || hi > sig.regions.len() || hi - lo != n {
+                return self.refuse(Form::SigUnaligned, root);
+            }
+            let start = self.origs.len() as u32;
+            for k in lo..hi {
+                let o = self.universal(sig.regions[k]);
+                self.b.mentions(l.0, o);
+                self.origs.push(o);
+            }
+            self.set_local(l, t, start, n as u32);
+            if i < nparams as usize {
+                self.vars.push(l);
+            }
+            self.ref_ranges(t, root, &mut ranges)?;
+            for j in 0..ranges.len() {
+                let (at, inner) = ranges[j];
+                let outer = self.origs[(start + at) as usize];
+                for k in 1..=inner {
+                    let o = self.origs[(start + at + k) as usize];
+                    if o != outer && self.plant != Plant::NoKnown {
+                        self.b.known(o, outer);
+                    }
+                }
+            }
+            lo = hi;
+        }
+        for &(a, b) in sig.bounds {
+            let (oa, ob) = (self.universal(a), self.universal(b));
+            if self.plant != Plant::NoKnown {
+                self.b.known(oa, ob);
+            }
+        }
+        self.stats.sig_read = true;
+        Ok(())
+    }
+
+    /// The origin a callee's region takes at one call: `'static` is the body's; every other is
+    /// fresh for the call.
+    fn instance(&mut self, inst: &mut Vec<(Region, Origin), A>, r: Region) -> Origin {
+        if r == Region::Static {
+            return self.universal(r);
+        }
+        if let Some(&(_, o)) = inst.iter().find(|(x, _)| *x == r) {
+            return o;
+        }
+        let o = self.b.origin(false);
+        inst.push((r, o));
+        o
+    }
+
+    /// Relates a call's operands and destination through the callee's lifetime part, at the
+    /// call statement just added: each operand's positions flow into the regions of its
+    /// parameter, the output's regions into the destination's positions (the first position of
+    /// a reference one way, every other both ways, as [`Self::relate`] does); the declared
+    /// bounds and the bounds implied by the parameter and output types hold among the regions.
+    /// `false`, relating nothing, when the positions do not line up one for one or a region is
+    /// hidden: the caller takes its older, coarser path.
+    fn call_by_signature(&mut self, life: SigLife<'_>, vs: &[Val], dest: Place, dest_ty: TyD, e: ExprId) -> Result<bool, Refusal> {
+        if life.ends.len() != vs.len() || life.regions.iter().any(|r| matches!(r, Region::Hidden(_))) {
+            return Ok(false);
+        }
+        let mut lo = 0usize;
+        for (i, v) in vs.iter().enumerate() {
+            let hi = life.ends[i] as usize;
+            if hi < lo || hi > life.regions.len() {
+                return Ok(false);
+            }
+            if let At::Place(p) = v.at {
+                let s = self.info(p);
+                if !s.exact || s.len as usize != hi - lo {
+                    return Ok(false);
+                }
+            }
+            lo = hi;
+        }
+        let d = self.info(dest);
+        if !d.exact || d.len as usize != life.regions.len() - lo {
+            return Ok(false);
+        }
+        let out_at = lo;
+        let mut inst: Vec<(Region, Origin), A> = Vec::new_in(self.alloc.clone());
+        let mut ranges: Vec<(u32, u32), A> = Vec::new_in(self.alloc.clone());
+        lo = 0;
+        for i in 0..=vs.len() {
+            // The operands, then the destination.
+            let (place, ty, into_callee) = if i < vs.len() {
+                let v = vs[i];
+                match v.at {
+                    At::Place(p) => (p, v.ty, true),
+                    At::Const => {
+                        lo = life.ends[i] as usize;
+                        continue;
+                    }
+                }
+            } else {
+                lo = out_at;
+                (dest, dest_ty, false)
+            };
+            let s = self.info(place);
+            let top_ref = ty.wrap.is_some() || matches!(self.node(ty.ty, e)?, PNode::Ref(..));
+            for k in 0..s.len {
+                let here = self.origs[(s.start + k) as usize];
+                let there = self.instance(&mut inst, life.regions[lo + k as usize]);
+                let (from, into) = if into_callee { (here, there) } else { (there, here) };
+                self.b.subset(from, into);
+                if !(k == 0 && top_ref) {
+                    self.b.subset(into, from);
+                }
+            }
+            self.ref_ranges(ty, e, &mut ranges)?;
+            for j in 0..ranges.len() {
+                let (at, inner) = ranges[j];
+                let outer = self.instance(&mut inst, life.regions[lo + at as usize]);
+                for k in 1..=inner {
+                    let o = self.instance(&mut inst, life.regions[lo + (at + k) as usize]);
+                    if o != outer {
+                        self.b.subset(o, outer);
+                    }
+                }
+            }
+            if i < vs.len() {
+                lo = life.ends[i] as usize;
+            }
+        }
+        for &(a, b) in life.bounds {
+            let (oa, ob) = (self.instance(&mut inst, a), self.instance(&mut inst, b));
+            self.b.subset(oa, ob);
+        }
+        Ok(true)
     }
 
     fn step(&mut self, t: Task) -> Result<(), Refusal> {
@@ -1707,17 +1999,21 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
         }
         let mut ops: Vec<Operand, A> = Vec::new_in(self.alloc.clone());
         let mut ps: Vec<Place, A> = Vec::new_in(self.alloc.clone());
+        // The values as they go into the aggregate (for `format_args!`, the borrows).
+        let mut parts: Vec<Val, A> = Vec::new_in(self.alloc.clone());
         for v in vs.iter().copied() {
             if fmt {
                 // `format_args!` borrows each argument.
                 match v.at {
                     At::Const => ops.push(Operand::Const),
                     At::Place(p) => {
-                        let t = self.temp(TyD { wrap: Some(Mutbl::Not), ty: v.ty.ty }, e)?;
+                        let rt = TyD { wrap: Some(Mutbl::Not), ty: v.ty.ty };
+                        let t = self.temp(rt, e)?;
                         self.borrow(p, v.ty, BorrowKind::Shared, t, e)?;
                         let tp = self.place_of(t);
                         ops.push(Operand::Copy(tp));
                         ps.push(tp);
+                        parts.push(Val { at: At::Place(tp), ty: rt });
                     }
                 }
             } else {
@@ -1725,14 +2021,67 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 if let At::Place(p) = v.at {
                     ps.push(p);
                 }
+                parts.push(v);
             }
         }
         let t = self.temp(ty, e)?;
         let tp = self.place_of(t);
         self.b.aggregate(tp, &ops, self.span(e));
-        ps.push(tp);
-        self.unify(&ps);
+        let d = self.info(tp);
+        // A tuple's element goes into its own field: related as an assignment to
+        // that field is (the type of `(a, b)` is `(A, B)`: nothing relates `A`'s lifetimes to
+        // `B`'s). Every other aggregate (a struct or variant, whose field types the heads do not
+        // give yet) is related as a call of unknown signature.
+        let elems: Option<&'c [PTy]> = match (ty.wrap, self.node(ty.ty, e)?) {
+            (None, PNode::Tuple(l)) => Some(self.list(l, e)?),
+            _ => None,
+        };
+        match elems {
+            Some(tys) if !fmt && d.exact && tys.len() == vs.len() && self.plant != Plant::TupleUnified => {
+                let mut off = d.start;
+                for (j, &et) in tys.iter().enumerate() {
+                    let n = self.npos(et, e)?;
+                    if let At::Place(p) = vs[j].at {
+                        self.relate_at(p, off, n, TyD::of(et), e)?;
+                    }
+                    off += n;
+                }
+            }
+            _ if self.plant == Plant::TupleUnified => {
+                ps.push(tp);
+                self.unify(&ps);
+            }
+            _ => self.unify_call(&parts, tp, e)?,
+        }
         self.push_place(tp, ty);
+        Ok(())
+    }
+
+    /// `src` goes into the positions `start..start + n` of some place, whose type there is
+    /// `dst_ty`: position by position when `src` is exact and as long, the first covariantly
+    /// when it is a reference, every other both ways; else all made equal through one origin.
+    fn relate_at(&mut self, src: Place, start: u32, n: u32, dst_ty: TyD, e: ExprId) -> Result<(), Refusal> {
+        let s = self.info(src);
+        if s.len == 0 || n == 0 || self.plant == Plant::NoRelate {
+            return Ok(());
+        }
+        if s.exact && s.len == n {
+            let top_ref = dst_ty.wrap.is_some() || matches!(self.node(dst_ty.ty, e)?, PNode::Ref(..));
+            for k in 0..n {
+                let (a, b) = (self.origs[(s.start + k) as usize], self.origs[(start + k) as usize]);
+                self.b.subset(a, b);
+                if !(k == 0 && top_ref) {
+                    self.b.subset(b, a);
+                }
+            }
+            return Ok(());
+        }
+        let hub = self.b.origin(false);
+        for k in (s.start..s.start + s.len).chain(start..start + n) {
+            let o = self.origs[k as usize];
+            self.b.subset(o, hub);
+            self.b.subset(hub, o);
+        }
         Ok(())
     }
 
@@ -1777,6 +2126,16 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
             }
             None => false,
         };
+        let facts: &'b F = self.facts;
+        if !generic_origins
+            && let Some((item, _)) = callee
+            && let Some(life) = facts.sig(item)
+            && self.call_by_signature(life, &vs, tp, ty, e)?
+        {
+            self.stats.calls_by_signature += 1;
+            self.push_place(tp, ty);
+            return Ok(());
+        }
         match sig {
             Some(s) if s.writes_lifetimes => return self.refuse(Form::CallWritesLifetimes, e),
             Some(s) if !generic_origins => {
@@ -1805,6 +2164,22 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                                 let x = self.origs[k as usize];
                                 self.b.subset(o, x);
                             }
+                            // `&'s Self` is well formed only when `Self: 's`, and the callee may
+                            // return what `Self` holds as if it lived for `'s`: every position
+                            // of the receiver flows into the output, not its first alone.
+                            if s.self_ref
+                                && !value_callee
+                                && let Some(p) = first_in
+                            {
+                                let fi = self.info(p);
+                                for j in fi.start + 1..fi.start + fi.len {
+                                    let y = self.origs[j as usize];
+                                    for k in out.start..out.start + out.len {
+                                        let x = self.origs[k as usize];
+                                        self.b.subset(y, x);
+                                    }
+                                }
+                            }
                         }
                         None => return self.refuse(Form::ElisionAmbiguous, e),
                     }
@@ -1812,8 +2187,7 @@ impl<'b, 'c, F: Facts, A: Allocator + Clone> Lower<'b, 'c, F, A> {
                 self.stats.calls_elided += 1;
             }
             _ => {
-                ins.push(tp);
-                self.unify(&ins);
+                self.unify_call(&vs, tp, e)?;
                 self.stats.calls_unified += 1;
             }
         }

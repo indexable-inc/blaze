@@ -10,6 +10,7 @@ use core::cell::RefCell;
 use std::alloc::Global;
 use std::vec::Vec;
 
+use blaze_build::data::{DataAlloc, DataRecord};
 use blaze_build::layout::ReprAttrs;
 use blaze_build::{Abi, Intrinsic, StaticItem};
 use blaze_id::ItemKey as LibKey;
@@ -63,8 +64,11 @@ pub enum Front2Refusal {
     Unchecked { function: Box<str>, class: Box<str>, first: Box<str> },
     /// A fn `main` reaches has no body and is no fn the back half calls by symbol.
     NoBody { function: Box<str> },
-    /// The walk from `main` met more fns than [`super::reach::MOST_FNS`].
-    Capped,
+    /// Constant item `constant`, read by a checked body, was refused by front2's evaluator.
+    Const { constant: Box<str>, why: Box<str> },
+    /// The walk from `entry` (the program's start, named) met more fns than
+    /// [`super::reach::MOST_FNS`]; `queued` were still waiting when it stopped.
+    Capped { entry: Box<str>, queued: usize },
     /// A tabled fn has no head in front2's store.
     NoHead { function: Box<str> },
     /// A fn's attributes could not be read from its signature's lowering.
@@ -102,7 +106,12 @@ impl core::fmt::Display for Front2Refusal {
                 write!(f, "front2: `{function}`, reached from `main`, is not checked ({class}): {first}")
             }
             Front2Refusal::NoBody { function } => write!(f, "front2: `{function}`, reached from `main`, has no body (front2's)"),
-            Front2Refusal::Capped => write!(f, "front2: `main` reaches more than {} fns", super::reach::MOST_FNS),
+            Front2Refusal::Const { constant, why } => write!(f, "front2: the constant `{constant}`, read by a body of the program, was not evaluated: {why}"),
+            Front2Refusal::Capped { entry, queued } => write!(
+                f,
+                "front2: `{entry}` reaches more than {} fns (the cap above the whole library's fn count; {queued} still queued): a walk that does not end",
+                super::reach::MOST_FNS
+            ),
             Front2Refusal::NoHead { function } => write!(f, "front2: `{function}` has no head in the store (front2's)"),
             Front2Refusal::Attrs { function, why } => write!(f, "front2: `{function}`'s attributes: {why}"),
             Front2Refusal::Abi { function, abi } => write!(f, "front2: `{function}`'s ABI {abi:?} is neither Rust nor C"),
@@ -185,6 +194,14 @@ pub struct Front2Program<'n> {
     objects: HashMap<ItemKey, ObjectTable, Global>,
     /// [`SEAM_LANGS`]' answers.
     langs: [(LangItem, Option<ItemKey>); SEAM_LANGS.len()],
+    /// In a survey, each fn or ADT left out of the program, by key, with the cause filed in
+    /// `left_out` (the seam's `left_out`); empty in a run.
+    left: HashMap<ItemKey, Box<str>, Global>,
+    /// Each constant a checked body reads, by key (sorted), as front2's evaluator made it
+    /// ([`const_values`]): the seam's `const_record`.
+    const_values: Vec<(ItemKey, DataRecord<Global>), Global>,
+    /// The cause of the last `normalize` with no answer (the seam's `last_projection`).
+    projection_why: core::cell::RefCell<Option<Box<str>>>,
 }
 
 /// The lang traits the seam's own `Option` answers name (`drop_trait`, `lang_trait_fn`):
@@ -226,6 +243,53 @@ const MOST_OBJECT_TRAITS: usize = 1024;
 /// The constants one ADT head may name before its row is given up on (reach.rs's
 /// `MOST_LENS`): a pattern type's ends, an array length.
 const MOST_ADT_LENS: u32 = 64;
+
+/// Each constant item `bodies` read by value (`Def::Const` in a checked body's `expr_defs`:
+/// what the builder's `Adts::const_value` asks), evaluated once by front2's evaluator
+/// (consts.rs `Consts::value`, the one that fills array lengths), in key order. Returns the
+/// records, sorted by key, and each constant the evaluator refused with its words (a nested
+/// evaluation included: `ConstFail` names the constant it stopped on). A generic constant's
+/// value at arguments is not asked here (the builder asks only at none).
+fn const_values<'c>(r: &mut Records<'_, '_>, bodies: impl Iterator<Item = &'c Checked<'static>>) -> (Vec<(ItemKey, DataRecord<Global>), Global>, Vec<(ItemKey, Box<str>), Global>) {
+    let mut asked: Vec<ItemKey, Global> = Vec::new_in(Global);
+    for c in bodies {
+        asked.extend(c.expr_defs.column::<1>().iter().filter_map(|d| match d {
+            tc::Def::Const(k) => Some(*k),
+            _ => None,
+        }));
+    }
+    asked.sort_unstable();
+    asked.dedup();
+    let mut values = Vec::with_capacity_in(asked.len(), Global);
+    let mut refused = Vec::new_in(Global);
+    for k in asked {
+        let Some((consts, prepared)) = r.consts.take() else {
+            refused.push((k, Box::from("no evaluator: the program's records hold none")));
+            continue;
+        };
+        let made = consts.value(r, prepared, k).map(|record| {
+            let mut allocs = Vec::with_capacity_in(record.data.allocs.len(), Global);
+            for a in record.data.allocs.iter() {
+                let mut bytes = Vec::with_capacity_in(a.bytes.len(), Global);
+                bytes.extend_from_slice(&a.bytes);
+                let mut relocs = Vec::with_capacity_in(a.relocs.len(), Global);
+                relocs.extend_from_slice(&a.relocs);
+                allocs.push(DataAlloc { bytes, align: a.align, mutable: a.mutable, relocs });
+            }
+            DataRecord { allocs }
+        });
+        r.consts = Some((consts, prepared));
+        match made {
+            Ok(record) => values.push((k, record)),
+            Err(e) => {
+                let said = format!("{e}");
+                let cut = said.char_indices().nth(200).map_or(&*said, |(i, _)| &said[..i]);
+                refused.push((k, Box::from(cut)));
+            }
+        }
+    }
+    (values, refused)
+}
 
 /// The table of every trait a type in `views` names as a `dyn` principal, and of every
 /// supertrait under it (each after its supertraits, by a work list: its shape hashes theirs).
@@ -392,17 +456,20 @@ impl<'n> Front2Program<'n> {
         };
         let census = reach(&mut records, prepared, main.owner, first, &scope);
         if census.capped {
-            return Err(Front2Refusal::Capped);
+            return Err(Front2Refusal::Capped { entry: fn_shown(&records, main.owner).into_boxed_str(), queued: census.queued });
         }
         // Every fn the walk met is checked clean, or the program is refused by its first one
         // that is not: a fn with any diagnostic or gap is never built.
         let mut bodiless: Vec<(ItemKey, Box<str>), Global> = Vec::new_in(Global);
         let mut ctors: Vec<(ItemKey, Box<str>), Global> = Vec::new_in(Global);
         let mut declared: Vec<(ItemKey, Box<str>), Global> = Vec::new_in(Global);
+        // Every key a survey leaves out, with its cause: the seam's `left_out`.
+        let mut left: HashMap<ItemKey, Box<str>, Global> = HashMap::new_in(Global);
         for (k, outcome) in census.fns.iter() {
             match outcome {
                 Reached::Failed { class, .. } if let Some(out) = left_out.as_deref_mut() => {
                     out.push((fn_shown(&records, *k).into_boxed_str(), class.clone()));
+                    left.insert(*k, class.clone());
                 }
                 Reached::Failed { class, detail } => {
                     return Err(Front2Refusal::Unchecked { function: fn_shown(&records, *k).into_boxed_str(), class: class.clone(), first: detail.clone() });
@@ -485,11 +552,28 @@ impl<'n> Front2Program<'n> {
                 match left_out.as_deref_mut() {
                     Some(out) => {
                         let cut = why.char_indices().nth(160).map_or(&*why, |(i, _)| &why[..i]);
-                        out.push((adt, format!("ADT row: {cut}").into_boxed_str()));
+                        let class = format!("ADT row: {cut}").into_boxed_str();
+                        left.insert(k, class.clone());
+                        out.push((adt, class));
                         given_up.insert(k, ());
                     }
                     None => return Err(Front2Refusal::AdtRow { adt, why }),
                 }
+            }
+        }
+        // Every constant a checked body reads by value, evaluated once now (the builder's
+        // `const_value` reads the record); one the evaluator refuses is named: in a survey filed
+        // and left out (each reader's build then names it), in a run the program's refusal.
+        let (values, refused) = const_values(&mut records, checked.iter().chain(census.bodies.iter().map(|(_, c)| c)));
+        for (k, why) in refused {
+            let constant = fn_shown(&records, k).into_boxed_str();
+            match left_out.as_deref_mut() {
+                Some(out) => {
+                    let class = format!("constant: {why}").into_boxed_str();
+                    left.insert(k, class.clone());
+                    out.push((constant, class));
+                }
+                None => return Err(Front2Refusal::Const { constant, why }),
             }
         }
         let views = core::iter::once(records.store.tys.view()).chain(checked.iter().map(|c| c.types.view())).chain(census.bodies.iter().map(|(_, c)| c.types.view()));
@@ -533,7 +617,9 @@ impl<'n> Front2Program<'n> {
                 // A survey files it and goes on (a call of it is then a refused callee).
                 match left_out.as_deref_mut() {
                     Some(out) => {
-                        out.push((path, Box::from("no head in the store (front2's)")));
+                        let class: Box<str> = Box::from("no head in the store (front2's)");
+                        left.insert(key, class.clone());
+                        out.push((path, class));
                         continue;
                     }
                     None => return Err(Front2Refusal::NoHead { function: path }),
@@ -547,7 +633,9 @@ impl<'n> Front2Program<'n> {
                 // stops: the builder spreads no "rust-call" tuple yet.
                 abi => match left_out.as_deref_mut() {
                     Some(out) => {
-                        out.push((path, format!("ABI {abi:?}: neither Rust nor C").into_boxed_str()));
+                        let class = format!("ABI {abi:?}: neither Rust nor C").into_boxed_str();
+                        left.insert(key, class.clone());
+                        out.push((path, class));
                         continue;
                     }
                     None => return Err(Front2Refusal::Abi { function: path, abi }),
@@ -574,7 +662,9 @@ impl<'n> Front2Program<'n> {
                 None if symbols.intrinsic => (None, None, FnKind::Free, Box::<str>::from(""), Literals::default()),
                 None => match left_out.as_deref_mut() {
                     Some(out) => {
-                        out.push((path, Box::from("no body (front2's)")));
+                        let class: Box<str> = Box::from("no body (front2's)");
+                        left.insert(key, class.clone());
+                        out.push((path, class));
                         continue;
                     }
                     None => return Err(Front2Refusal::NoBody { function: path }),
@@ -586,7 +676,9 @@ impl<'n> Front2Program<'n> {
                     match (blaze_build::intrinsics::Which::named(name), left_out.as_deref_mut()) {
                         (Ok(which), _) => Some(Intrinsic::Table(which)),
                         (Err(_), Some(out)) => {
-                            out.push((path, Box::from("an intrinsic the build's table does not name")));
+                            let class = format!("the intrinsic `{name}`, which the build's table does not name").into_boxed_str();
+                            left.insert(key, class.clone());
+                            out.push((path, class));
                             continue;
                         }
                         (Err(_), None) => return Err(Front2Refusal::Intrinsic { function: path }),
@@ -602,7 +694,9 @@ impl<'n> Front2Program<'n> {
                 Some("rust-call") => Abi::RustCall,
                 Some(_) => match left_out.as_deref_mut() {
                     Some(out) => {
-                        out.push((path, format!("ABI {:?}: neither Rust nor C", head.header.abi).into_boxed_str()));
+                        let class = format!("ABI {:?}: neither Rust nor C", head.header.abi).into_boxed_str();
+                        left.insert(key, class.clone());
+                        out.push((path, class));
                         continue;
                     }
                     None => return Err(Front2Refusal::Abi { function: path, abi: head.header.abi }),
@@ -625,7 +719,7 @@ impl<'n> Front2Program<'n> {
         for (slot, item) in langs.iter_mut().zip(SEAM_LANGS) {
             *slot = (item, lang_of(&front, item).map_err(|l| Front2Refusal::Lang { item: l.item, why: l.why })?);
         }
-        Ok(Front2Program { front, store, tys, buckets, fns, by_key, entry, objects, langs })
+        Ok(Front2Program { front, store, tys, buckets, fns, by_key, entry, objects, langs, left, const_values: values, projection_why: core::cell::RefCell::new(None) })
     }
 
     /// `f` over the checker's world of fn `i`'s body.
@@ -909,6 +1003,10 @@ impl FrontEnd for Front2Program<'_> {
         Some(Adt { kind: a.kind, generics: a.generics, variants: &a.variants, fields: &a.fields, types: self.tys.view() })
     }
 
+    fn left_out(&self, key: ItemKey) -> Option<&str> {
+        self.left.get(&key).map(|why| &**why)
+    }
+
     /// The item's path in the names library (`crate::module::Name`).
     fn item_named(&self, key: ItemKey) -> Option<Box<str>> {
         let (names, lib) = (self.front.names, self.front.keys.library(key)?);
@@ -941,9 +1039,41 @@ impl FrontEnd for Front2Program<'_> {
     /// the traits, never a body's own scope, so any body's world answers alike.
     fn normalize(&self, trait_: ItemKey, name: tc::Name, args: &[PTy], ground: &mut PortableTys<'_>) -> Result<Option<PTy>, ResolveError> {
         let Some(i) = self.fns.iter().position(|f| f.body.is_some()) else {
+            *self.projection_why.borrow_mut() = Some(Box::from("the program tables no body to ask in"));
             return Ok(None);
         };
-        self.in_world(i, |w| blaze_typeck::normalize_projection(w, trait_, name, args, ground, Alloc::global()))
+        let out = self.in_world(i, |w| blaze_typeck::normalize_projection(w, trait_, name, args, ground, Alloc::global()));
+        if !matches!(out, Ok(Some(_))) {
+            // Named for the refusal: the trait, `Self`'s form (an ADT by its path, else the
+            // node's kind: `FnDef`, `Closure`, `Slice`..), and the solver's error or none.
+            let trait_shown = self.item_named(trait_).unwrap_or_else(|| format!("{:#x}", trait_.0).into_boxed_str());
+            let self_shown = match args.first().map(|&a| ground.view().node(a)) {
+                Some(Ok(tc::PNode::Adt(k, _))) => self.item_named(k).map_or_else(|| format!("ADT {:#x}", k.0), |p| format!("`{p}`")),
+                Some(Ok(n)) => {
+                    let d = format!("{n:?}");
+                    String::from(&d[..d.find(['(', ' ', '{']).unwrap_or(d.len())])
+                }
+                Some(Err(_)) | None => String::from("(no Self)"),
+            };
+            let why = match &out {
+                Err(e) => {
+                    let d = format!("{e:?}");
+                    String::from(&d[..d.find(['(', ' ', '{']).unwrap_or(d.len())])
+                }
+                Ok(_) => String::from("the solver's step gave no type"),
+            };
+            *self.projection_why.borrow_mut() = Some(format!("`{trait_shown}`'s associated type {:#x} at Self = {self_shown}: {why}", name.0).into_boxed_str());
+        }
+        out
+    }
+
+    fn const_record(&self, item: ItemKey) -> Option<&DataRecord<Global>> {
+        let at = self.const_values.binary_search_by_key(&item, |(k, _)| *k).ok()?;
+        Some(&self.const_values[at].1)
+    }
+
+    fn last_projection(&self) -> Option<Box<str>> {
+        self.projection_why.borrow_mut().take()
     }
 
     fn repr(&self, key: ItemKey) -> ReprAttrs {

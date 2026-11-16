@@ -270,11 +270,40 @@ fn ranges_are_rustcs() {
     );
 }
 
-/// `.await` is one node, in an async body only; an async fn's body is its block, its head
-/// marked async with the written return type; an async block is a coroutine closure.
+/// The Reference, "Async functions": "async fn example<'a>(x: &'a str) -> usize { .. } is
+/// roughly equivalent to: fn example<'a>(x: &'a str) -> impl Future<Output = usize> + 'a {
+/// async move { .. } }". So the lowered body's ROOT (the function's returned expression) is an
+/// `async move` block (a coroutine closure: kind async, source block, captures by value, no
+/// parameters), whose body is a block holding the parameter's `let` and then the written block.
+/// Before `Machine::async_fn` made that shape the root was the plain block and this test fails
+/// at "the root is an async block". Should print: "test tests::an_async_fn_returns_its_async_move_block ... ok".
+#[test]
+fn an_async_fn_returns_its_async_move_block() {
+    let l = body("async fn af(x: u8) -> u8 { x }");
+    let v = l.view();
+    let root = ExprId(v.head[crate::machine::head::ROOT]);
+    let Ok(Expr::Closure { row }) = v.expr(root) else { panic!("the root is an async block: {}", dump_of(&l)) };
+    let c = Closure::decode(v.row(row).expect("the closure's row")).expect("a closure row");
+    assert_eq!((c.kind, c.source, c.capture_by_value), (CoroutineKind::Async, CoroutineSource::Block, true), "{}", dump_of(&l));
+    assert_eq!((c.params.len, c.ret, c.konst, c.immovable), (0, None, false, false), "{}", dump_of(&l));
+    let Ok(Expr::Block { stmts, tail: Some(tail), kind: BlockKind::Plain, .. }) = v.expr(c.body) else {
+        panic!("the async block's body is a block with a tail: {}", dump_of(&l))
+    };
+    // `let x = x;`: the parameter moved into the future.
+    assert_eq!(stmts.len, 1, "{}", dump_of(&l));
+    // The tail is the written `{ x }`.
+    assert!(matches!(v.expr(tail), Ok(Expr::Block { tail: Some(_), .. })), "{}", dump_of(&l));
+    // The head still says async, with the written return type.
+    assert_ne!(v.head[crate::machine::head::FLAGS] & crate::machine::sig::ASYNC, 0);
+    assert!(v.head_opt(crate::machine::head::TY).is_some());
+}
+
+/// `.await` is one node, in an async body only; an async fn's body is an `async move` block
+/// (the test above), its head marked async with the written return type; an async block is a
+/// coroutine closure.
 #[test]
 fn await_is_one_node() {
-    assert_body("async fn f() -> u8 { g().await }", &["(body (block e", "(await (call (path g)))"]);
+    assert_body("async fn f() -> u8 { g().await }", &["(body (async-block move", "(block e", "(await (call (path g)))"]);
     let l = body("async fn f() -> u8 { g().await }");
     assert!(!dump_of(&l).contains("yield"), "{}", dump_of(&l));
     assert_body("fn f() { async move { g().await }; }", &["(async-block move", "(await (call (path g)))"]);
@@ -320,7 +349,12 @@ fn an_async_body_converts_with_its_output() {
         assert_eq!(b.coroutine, output.map(|output| blaze_typeck::CoroutineKind::Async { output }), "{text}");
         let awaits = b.exprs.iter().filter(|e| matches!(e, blaze_typeck::Expr::Await(_))).count();
         let blocks = b.exprs.iter().filter(|e| matches!(e, blaze_typeck::Expr::AsyncBlock { .. })).count();
-        assert_eq!((awaits, blocks), (usize::from(output.is_some()), usize::from(output.is_none())), "{text}");
+        // One async block each: the written one, or the one an async fn's body is (the
+        // Reference, "Async functions": `fn f() -> impl Future<Output = T> { async move { .. } }`).
+        assert_eq!((awaits, blocks), (usize::from(output.is_some()), 1), "{text}");
+        if output.is_some() {
+            assert!(b.exprs.iter().any(|e| matches!(e, blaze_typeck::Expr::AsyncBlock { capture: blaze_typeck::Capture::Move, .. })), "{text}");
+        }
     }
 }
 

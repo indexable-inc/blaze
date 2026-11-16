@@ -421,6 +421,8 @@ blaze-solve = { path = "crates/blaze-solve" }
 blaze-flow = { path = "crates/blaze-flow" }
 # The lowering from a type-checked body to its flow (flow.md, "The lowering").
 blaze-flow-lower = { path = "crates/blaze-flow-lower" }
+# The coroutine transform: a body with suspension points to a state and a resume body (docs/v2/plan/design/coroutines.md).
+blaze-coroutine = { path = "crates/blaze-coroutine" }
 # Typed SQL (docs/v2/plan/design/sql.md): the checker, and its drivers for C SQLite and Postgres.
 blaze-sql = { path = "crates/blaze-sql" }
 blaze-rel = { path = "crates/blaze-rel" }

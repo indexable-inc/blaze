@@ -11,7 +11,7 @@
 //! side by side in its arena) and no shared write; a publish is one arena reset (its chunks
 //! back to the cache), the build, and two release stores.
 
-use std::{
+use core::{
     cell::UnsafeCell,
     marker::PhantomData,
     ptr,
@@ -42,8 +42,8 @@ pub enum PublishError {
     Busy,
 }
 
-impl std::fmt::Display for PublishError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Display for PublishError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
             PublishError::Readers => {
                 "the revision before the current one may still be read by a task"
@@ -53,7 +53,7 @@ impl std::fmt::Display for PublishError {
     }
 }
 
-impl std::error::Error for PublishError {}
+impl core::error::Error for PublishError {}
 
 /// A revision as placed in its arena: what a reader reaches with one load.
 struct Placed<'a, B: Built> {

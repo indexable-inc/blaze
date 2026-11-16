@@ -726,8 +726,8 @@ impl Drop for Region {
     }
 }
 
-impl std::fmt::Debug for Region {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl core::fmt::Debug for Region {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Region")
             .field("tag", &self.tag)
             .field("reserved", &self.reserved)
