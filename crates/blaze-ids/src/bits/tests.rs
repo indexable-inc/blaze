@@ -52,13 +52,17 @@ fn filled_holds_exactly_the_bits_below_its_size() {
 /// A set in a frame's `Vec` grows, resets and truncates like a [`BitSet`] given the same
 /// members.
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "blaze-mem's frame reserves with mmap and mprotect, which Miri does not run; a growing BitSet's Vec is bits_are_a_set's"
+)]
 fn a_set_in_an_allocators_vec_matches_a_bitset() {
     let frame = blaze_mem::Frame::new(blaze_mem::Tag::Intern).expect("reserve");
     let mut rng = SplitMix64::new(0x5851_f42d_4c95_7f2d);
     let mut held: Bits<Vec<u64, &blaze_mem::Frame>, u32> = Bits::from_words(Vec::new_in(&frame));
     let mut plain = BitSet::<u32>::default();
-    for round in 0..64 {
-        for _ in 0..200 {
+    for round in 0..if cfg!(miri) { 6 } else { 64 } {
+        for _ in 0..if cfg!(miri) { 40 } else { 200 } {
             let at = rng.index(5000) as u32;
             assert_eq!(held.insert_growing(at), plain.insert_growing(at));
         }
@@ -83,7 +87,7 @@ fn a_set_in_an_allocators_vec_matches_a_bitset() {
 #[test]
 fn ranges_match_a_bit_at_a_time() {
     let mut rng = SplitMix64::new(0x9e37_79b9_7f4a_7c15);
-    for _ in 0..2000 {
+    for _ in 0..if cfg!(miri) { 60 } else { 2000 } {
         let size = 1 + rng.index(300);
         let mut fast = BitSet::<usize>::new(size);
         let mut slow = vec![false; size];
@@ -255,7 +259,7 @@ fn bits_are_a_set() {
             assert_eq!(bits.first(), None);
             continue;
         }
-        for _ in 0..2_000 {
+        for _ in 0..if cfg!(miri) { 200 } else { 2_000 } {
             let at = rng.index(len) as u32;
             match rng.index(3) {
                 0 => {

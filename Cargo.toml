@@ -392,6 +392,7 @@ blaze-reclaim = { path = "crates/blaze-reclaim" }
 blaze-mem = { path = "crates/blaze-mem" }
 blaze-own = { path = "crates/blaze-own" } # Vec, Box, Arc, Rc, ... with no default allocator, in place of `alloc`.
 blaze-int = { path = "crates/blaze-int" } # Integer conversions that say what they do (widen, narrow, truncate, saturate), in place of `as`.
+blaze-columns = { path = "crates/blaze-columns" }
 blaze-kit = { path = "crates/blaze-kit" } # Specialized collections: typed tables, inline vectors, union-find, sparse and chunked sets, heaps, a timer wheel, column codecs, static search.
 blaze-memchr = { path = "crates/blaze-memchr" } # Byte search (NEON, SSE2, SWAR), in place of memchr.
 blaze-bitflags = { path = "crates/blaze-bitflags" } # `bitflags!`, in place of bitflags.
@@ -451,7 +452,6 @@ bitflags = "2.13.2"
 # time; x86_64 detects AVX-512 at run time without a feature. `wasm32_simd`: its SIMD128 code
 # (Rust, no C) on wasm32, the seed's; it does nothing on any other target.
 blake3 = { version = "1.8", default-features = false, features = ["std", "neon", "wasm32_simd"] }
-camino = "1.2.6"
 # The Cranelift hir-ty-codegen compiles with.
 # `=`: the version of vendor/cranelift-codegen, which every crate here that needs it must match.
 cranelift-codegen = "=0.137.1"

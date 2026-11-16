@@ -91,7 +91,7 @@ pub(crate) mod threads;
 #[cfg(all(test, not(blaze_check)))]
 mod tests;
 
-pub use per_worker::{Exclusive, NotAWorker, PerWorker, Racy, Shared};
+pub use per_worker::{Exclusive, FoldError, NotAWorker, PerWorker, Racy, Shared};
 pub use threads::{Class, Hung, Stuck};
 
 use alloc::{
@@ -433,7 +433,8 @@ impl<T> Drop for Pending<T> {
         let tally = self.queued.tally();
         let ready = || self.queued.done();
         match self.pool.wait(self.here, tally, "bstd.task.drop", ready, || deadline.passed(world.now()) || until.passed(clock.now())) {
-            Ok(true) => drop(self.queued.take()),
+            // A joined handle's result was taken already; an unjoined one's is dropped now.
+            Ok(true) => self.queued.drop_out(),
             Ok(false) | Err(_) => crate::rt::hang(self.scope, self.queued.name()),
         }
     }
@@ -566,7 +567,7 @@ impl<'p> Scope<'p> {
             return Scope::handle(name, Held::Queued(self.pending(pool, queued)));
         }
         // A new task may go to any worker; once started it stays there (the module's doc).
-        let cx = live.cx.task(name, frame, live.cx.worker().wrapping_add(index));
+        let cx = live.cx.task(name, frame, live.cx.worker().wrapping_add(index)).with_class(live.class.get());
         live.running.set(live.running.get() + 1);
         let ran = catch_unwind(AssertUnwindSafe(|| task(&cx)));
         live.running.set(live.running.get() - 1);
@@ -632,8 +633,10 @@ impl<'p> Scope<'p> {
         match pool.reserve(live.cx.here(), job) {
             Ok(_) => Ok(Scope::handle(name, Held::Queued(self.pending(pool, queued)))),
             Err(job) => {
-                // No worker idle: the task never runs. Its queue pointer goes first, then the
-                // handle, which drops it unrun.
+                // No worker idle: the task never runs. It was never queued, so this thread
+                // claims it and drops it unrun, then gives up both references.
+                let unrun = queued.drop_unstarted();
+                assert!(unrun, "bstd::task {name}: a task no worker took had started");
                 job.release_unrun();
                 drop(queued);
                 Err(NoParallelism { have: 1, ..refused })
@@ -682,12 +685,14 @@ impl<'p> Scope<'p> {
         &self.live.cx
     }
 
-    /// How many of its tasks are running now: none, under `Inline`, outside a task.
+    /// How many of its tasks are running (or, under `Threads`, queued) now: none, under
+    /// `Inline`, outside a task.
     #[blaze::nopanic]
     #[blaze::noalloc]
     #[blaze::nonblocking]
     pub fn running(&self) -> usize {
-        self.live.running.get()
+        let queued = self.live.shared.as_ref().map_or(0, |tally| tally.running());
+        self.live.running.get() + queued
     }
 
     /// The scope finished: once each of its tasks has ended (waited for until `cx`'s
@@ -697,8 +702,9 @@ impl<'p> Scope<'p> {
     pub fn join(mut self, cx: &Cx) -> Result<(), TaskError> {
         self.unfinished.finished();
         self.live.armed = false;
-        let failed = self.live.failed.borrow_mut().take();
-        match self.live.settle(cx.deadline()) {
+        let settled = self.live.settle(cx.deadline());
+        let failed = self.live.take_failed();
+        match settled {
             Settled::Left { running, stopped } => Err(TaskError {
                 scope: self.live.cx.name(),
                 task: self.live.last.get(),
@@ -722,14 +728,18 @@ impl<T> Task<'_, T> {
     }
 
     /// The task finished: what it returned, or how it failed (named by its scope and its
-    /// name). Under `Inline` it ended at its spawn, so this does not wait.
+    /// name). Under `Inline` it ended at its spawn, so this does not wait. Under `Threads` it
+    /// runs the task here if no worker has started it, else waits for it on `cx`'s thread (a
+    /// worker runs its own queued tasks meanwhile), until `cx`'s deadline and the abandon wait
+    /// (the module's doc).
     #[blaze::consumes]
-    #[blaze::nopanic]
-    #[blaze::noalloc]
-    #[blaze::nonblocking]
-    pub fn join(self, _cx: &Cx) -> Result<T, TaskError> {
-        self.unfinished.finished();
-        self.outcome
+    pub fn join(self, cx: &Cx) -> Result<T, TaskError> {
+        let Task { name, held, unfinished, .. } = self;
+        unfinished.finished();
+        match held {
+            Held::Ended(outcome) => outcome,
+            Held::Queued(pending) => Scope::outcome(pending.finish(cx, name)),
+        }
     }
 }
 
@@ -761,9 +771,11 @@ impl fmt::Debug for Scope<'_> {
 
 impl<T> fmt::Debug for Task<'_, T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let outcome = match &self.outcome {
-            Ok(_) => "ended",
-            Err(_) => "failed",
+        let outcome = match &self.held {
+            Held::Ended(Ok(_)) => "ended",
+            Held::Ended(Err(_)) => "failed",
+            Held::Queued(pending) if pending.queued.done() => "ended, not joined",
+            Held::Queued(_) => "queued or running",
         };
         write!(f, "Task({}, {outcome})", self.name)
     }

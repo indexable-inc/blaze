@@ -212,7 +212,8 @@ impl<T: CloneIn<B>, A: Allocator, B: Allocator + Clone> CloneIn<B> for Box<T, A>
     type In = Box<T::In, B>;
 
     fn try_clone_in(&self, alloc: B) -> Result<Box<T::In, B>, AllocFailure> {
-        Box::<T, A>::try_clone_in(self, alloc)
+        let copy = (**self).try_clone_in(alloc.clone())?;
+        Box::<T::In, B>::try_new_in(copy, alloc).map_err(|refused| refused.why)
     }
 }
 
@@ -220,7 +221,8 @@ impl<T: CloneIn<B>, A: Allocator, B: Allocator + Clone> CloneIn<B> for Box<[T], 
     type In = Box<[T::In], B>;
 
     fn try_clone_in(&self, alloc: B) -> Result<Box<[T::In], B>, AllocFailure> {
-        Box::<[T], A>::try_clone_in(self, alloc)
+        // The vector's room is exactly the length, so the box's shrink is a no-op.
+        Ok((**self).try_clone_in(alloc)?.into_boxed_slice())
     }
 }
 

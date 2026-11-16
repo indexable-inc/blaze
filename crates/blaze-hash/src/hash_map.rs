@@ -196,32 +196,47 @@ impl<K: Eq, V, S: KeyHash<K>, A: Allocator> Map<K, V, S, A> {
 
     /// The slot of `key`.
     #[inline]
-    fn find<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> Option<usize> {
-        let hash = self.hasher.hash_one(key);
+    fn find<Q: ?Sized + Equivalent<K>>(&self, key: &Q) -> Option<usize>
+    where
+        S: KeyHash<Q>,
+    {
+        let hash = self.hasher.hash_key(key);
         self.table.find(hash, |(held, _)| key.equivalent(held))
     }
 
     #[inline]
-    pub fn get<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> Option<&V> {
+    pub fn get<Q: ?Sized + Equivalent<K>>(&self, key: &Q) -> Option<&V>
+    where
+        S: KeyHash<Q>,
+    {
         let index = self.find(key)?;
         Some(&self.table.get(index).1)
     }
 
     #[inline]
-    pub fn get_mut<Q: ?Sized + Hash + Equivalent<K>>(&mut self, key: &Q) -> Option<&mut V> {
+    pub fn get_mut<Q: ?Sized + Equivalent<K>>(&mut self, key: &Q) -> Option<&mut V>
+    where
+        S: KeyHash<Q>,
+    {
         let index = self.find(key)?;
         Some(&mut self.table.get_mut(index).1)
     }
 
     #[inline]
-    pub fn get_key_value<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> Option<(&K, &V)> {
+    pub fn get_key_value<Q: ?Sized + Equivalent<K>>(&self, key: &Q) -> Option<(&K, &V)>
+    where
+        S: KeyHash<Q>,
+    {
         let index = self.find(key)?;
         let (key, value) = self.table.get(index);
         Some((key, value))
     }
 
     #[inline]
-    pub fn contains_key<Q: ?Sized + Hash + Equivalent<K>>(&self, key: &Q) -> bool {
+    pub fn contains_key<Q: ?Sized + Equivalent<K>>(&self, key: &Q) -> bool
+    where
+        S: KeyHash<Q>,
+    {
         self.find(key).is_some()
     }
 
@@ -238,12 +253,18 @@ impl<K: Eq, V, S: KeyHash<K>, A: Allocator> Map<K, V, S, A> {
     }
 
     #[inline]
-    pub fn remove<Q: ?Sized + Hash + Equivalent<K>>(&mut self, key: &Q) -> Option<V> {
+    pub fn remove<Q: ?Sized + Equivalent<K>>(&mut self, key: &Q) -> Option<V>
+    where
+        S: KeyHash<Q>,
+    {
         self.remove_entry(key).map(|(_, value)| value)
     }
 
     #[inline]
-    pub fn remove_entry<Q: ?Sized + Hash + Equivalent<K>>(&mut self, key: &Q) -> Option<(K, V)> {
+    pub fn remove_entry<Q: ?Sized + Equivalent<K>>(&mut self, key: &Q) -> Option<(K, V)>
+    where
+        S: KeyHash<Q>,
+    {
         let index = self.find(key)?;
         Some(self.table.remove(index))
     }
@@ -251,7 +272,7 @@ impl<K: Eq, V, S: KeyHash<K>, A: Allocator> Map<K, V, S, A> {
     /// The entry of `key`, to read, fill or change in place.
     #[inline]
     pub fn entry(&mut self, key: K) -> Entry<'_, K, V, S, A> {
-        let hash = self.hasher.hash_one(&key);
+        let hash = self.hasher.hash_key(&key);
         match self.table.find(hash, |(held, _)| *held == key) {
             Some(index) => Entry::Occupied(OccupiedEntry { map: self, index }),
             None => Entry::Vacant(VacantEntry { map: self, hash, key }),
@@ -278,7 +299,7 @@ pub struct VacantEntry<'a, K, V, S, A: Allocator> {
     key: K,
 }
 
-impl<'a, K: Hash, V, S: BuildHasher, A: Allocator> Entry<'a, K, V, S, A> {
+impl<'a, K, V, S: KeyHash<K>, A: Allocator> Entry<'a, K, V, S, A> {
     #[inline]
     pub fn or_insert(self, default: V) -> &'a mut V {
         match self {
@@ -409,7 +430,7 @@ impl<'a, K, V, S, A: Allocator> VacantEntry<'a, K, V, S, A> {
     }
 }
 
-impl<'a, K: Hash, V, S: BuildHasher, A: Allocator> VacantEntry<'a, K, V, S, A> {
+impl<'a, K, V, S: KeyHash<K>, A: Allocator> VacantEntry<'a, K, V, S, A> {
     /// `value` under the key: the value, borrowed for as long as the map was.
     #[inline]
     pub fn insert(self, value: V) -> &'a mut V {
@@ -738,21 +759,21 @@ impl<K: fmt::Debug, V: fmt::Debug, S, A: Allocator> fmt::Debug for Map<K, V, S, 
 }
 
 /// The same keys, each with an equal value, whatever the order.
-impl<K: Eq + Hash, V: PartialEq, S: BuildHasher, A: Allocator> PartialEq for Map<K, V, S, A> {
+impl<K: Eq, V: PartialEq, S: KeyHash<K>, A: Allocator> PartialEq for Map<K, V, S, A> {
     fn eq(&self, other: &Self) -> bool {
         self.len() == other.len()
             && self.iter().all(|(key, value)| other.get(key).is_some_and(|it| *value == *it))
     }
 }
 
-impl<K: Eq + Hash, V: Eq, S: BuildHasher, A: Allocator> Eq for Map<K, V, S, A> {}
+impl<K: Eq, V: Eq, S: KeyHash<K>, A: Allocator> Eq for Map<K, V, S, A> {}
 
 /// The value under `key`; a key not held panics, as a slice's index out of range does.
 impl<K, Q, V, S, A> Index<&Q> for Map<K, V, S, A>
 where
-    K: Eq + Hash,
-    Q: Hash + Equivalent<K> + ?Sized,
-    S: BuildHasher,
+    K: Eq,
+    Q: Equivalent<K> + ?Sized,
+    S: KeyHash<K> + KeyHash<Q>,
     A: Allocator,
 {
     type Output = V;
@@ -795,7 +816,7 @@ impl<'a, K, V, S, A: Allocator> IntoIterator for &'a mut Map<K, V, S, A> {
 
 /// `collect()` into a map in an allocator that is `Default` (`Global`); one in a frame is
 /// made with [`Map::from_iter_in`]. The ratchet's, as [`Default`].
-impl<K: Eq + Hash, V, S: BuildHasher + Default, A: Allocator + Default> FromIterator<(K, V)>
+impl<K: Eq, V, S: KeyHash<K> + Default, A: Allocator + Default> FromIterator<(K, V)>
     for Map<K, V, S, A>
 {
     #[inline]
@@ -804,7 +825,7 @@ impl<K: Eq + Hash, V, S: BuildHasher + Default, A: Allocator + Default> FromIter
     }
 }
 
-impl<K: Eq + Hash, V, S: BuildHasher, A: Allocator> Extend<(K, V)> for Map<K, V, S, A> {
+impl<K: Eq, V, S: KeyHash<K>, A: Allocator> Extend<(K, V)> for Map<K, V, S, A> {
     #[inline]
     fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
         let iter = iter.into_iter();
@@ -817,7 +838,7 @@ impl<K: Eq + Hash, V, S: BuildHasher, A: Allocator> Extend<(K, V)> for Map<K, V,
     }
 }
 
-impl<'a, K: Eq + Hash + Copy, V: Copy, S: BuildHasher, A: Allocator> Extend<(&'a K, &'a V)>
+impl<'a, K: Eq + Copy, V: Copy, S: KeyHash<K>, A: Allocator> Extend<(&'a K, &'a V)>
     for Map<K, V, S, A>
 {
     #[inline]
@@ -843,9 +864,9 @@ where
 #[cfg(feature = "serde")]
 impl<'de, K, V, S, A> serde::Deserialize<'de> for Map<K, V, S, A>
 where
-    K: serde::Deserialize<'de> + Eq + Hash,
+    K: serde::Deserialize<'de> + Eq,
     V: serde::Deserialize<'de>,
-    S: BuildHasher + Default,
+    S: KeyHash<K> + Default,
     A: Allocator + Default,
 {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -855,9 +876,9 @@ where
 
         impl<'de, K, V, S, A> serde::de::Visitor<'de> for Entries<K, V, S, A>
         where
-            K: serde::Deserialize<'de> + Eq + Hash,
+            K: serde::Deserialize<'de> + Eq,
             V: serde::Deserialize<'de>,
-            S: BuildHasher + Default,
+            S: KeyHash<K> + Default,
             A: Allocator + Default,
         {
             type Value = Map<K, V, S, A>;

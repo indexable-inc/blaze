@@ -2,16 +2,18 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Result, bail};
 use blaze_hash::{HashMap, HashSet};
 use std::alloc::Global;
 
 use crate::dependency::Dependency;
+use crate::error::ResolveError;
 use crate::graph::Graph;
 use crate::interning::InternedString;
 use crate::package_id::PackageId;
 use crate::summary::Summary;
 use crate::version::{PartialVersion, RustVersion};
+
+type Result<T, E = ResolveError> = std::result::Result<T, E>;
 
 /// The encoding of a `Cargo.lock`. A lock file keeps the encoding it was found in until it
 /// changes for another reason, and is then raised to the default.
@@ -124,56 +126,14 @@ impl Resolve {
             if mine == cksum {
                 continue;
             }
-            if cksum.is_none() {
-                bail!(
-                    "\
-checksum for `{}` was not previously calculated, but a checksum could now \
-be calculated
-
-this could be indicative of a few possible situations:
-
-    * the source `{}` did not previously support checksums,
-      but was replaced with one that does
-    * newer Cargo implementations know how to checksum this source, but this
-      older implementation does not
-    * the lock file is corrupt
-",
-                    id,
-                    id.source_id()
-                )
+            let package = *id;
+            return Err(if cksum.is_none() {
+                ResolveError::ChecksumNotPreviouslyCalculated { package }
             } else if mine.is_none() {
-                bail!(
-                    "\
-checksum for `{}` could not be calculated, but a checksum is listed in \
-the existing lock file
-
-this could be indicative of a few possible situations:
-
-    * the source `{}` supports checksums,
-      but was replaced with one that doesn't
-    * the lock file is corrupt
-
-unable to verify that `{0}` is the same as when the lockfile was generated
-",
-                    id,
-                    id.source_id()
-                )
+                ResolveError::ChecksumUncomputable { package }
             } else {
-                bail!(
-                    "\
-checksum for `{}` changed between lock files
-
-this could be indicative of a few possible errors:
-
-    * the lock file is corrupt
-    * a replacement source in use (e.g., a mirror) returned a different checksum
-    * the source itself may be corrupt in one way or another
-
-unable to verify that `{0}` is the same as when the lockfile was generated
-",
-                    id
-                );
-            }
+                ResolveError::ChecksumChanged { package }
+            });
         }
         self.metadata = previous.metadata.clone();
         self.version = previous.version;
@@ -259,12 +219,9 @@ unable to verify that `{0}` is the same as when the lockfile was generated
         });
         let (extern_crate_name, dep_name) = name_pairs.next().unwrap_or_else(target_crate_name);
         for (n, _) in name_pairs {
-            anyhow::ensure!(
-                n == extern_crate_name,
-                "the crate `{}` depends on crate `{}` multiple times with different names",
-                from,
-                to,
-            );
+            if n != extern_crate_name {
+                return Err(ResolveError::CrateNamedTwice { from, to });
+            }
         }
         Ok((InternedString::new(&extern_crate_name), dep_name))
     }

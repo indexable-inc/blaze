@@ -18,16 +18,16 @@ blaze-own.workspace = true
 blaze-data.workspace = true
 blaze-toml.workspace = true
 blaze-semver.workspace = true
-# The versions the pinned nightly's rustfmt is built with (rust-lang/rust's Cargo.lock at
-# 12433c307): widths, grapheme breaks and the line diff of `--check` are theirs.
+# The version the pinned nightly's rustfmt is built with (rust-lang/rust's Cargo.lock at
+# 12433c307): the line diff of `--check` is its.
 annotate-snippets.workspace = true
 # The user's home directory (`blaze_core::home`), the one answer to it.
 blaze-core.workspace = true
 blaze-serde.workspace = true
 diff.workspace = true
-unicode-segmentation.workspace = true
-rustfmt-unicode-width.workspace = true
-unicode-properties = { workspace = true, features = ["general-category"] }
+# Widths, legacy grapheme clusters and General_Category=Po, where rustfmt reads unicode-width
+# 0.1.14, unicode-segmentation and unicode-properties.
+blaze-unicode.workspace = true
 # The iterator adaptors rustfmt's code calls (`stdx::iter`); syntax brings stdx in already.
 stdx.workspace = true
 serde = { workspace = true, features = ["derive"] }

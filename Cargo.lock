@@ -63,22 +63,7 @@ checksum = "f211a51805bc641f3ad5b7664c77d2547af685cc33b4cd8d31964027a46f13f1"
 dependencies = [
  "anstyle",
  "memchr",
- "unicode-width 0.2.3",
-]
-
-[[package]]
-name = "anstream"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "824a212faf96e9acacdbd09febd34438f8f711fb84e09a8916013cd7815ca28d"
-dependencies = [
- "anstyle",
- "anstyle-parse",
- "anstyle-query",
- "anstyle-wincon",
- "colorchoice",
- "is_terminal_polyfill",
- "utf8parse",
+ "unicode-width",
 ]
 
 [[package]]
@@ -86,35 +71,6 @@ name = "anstyle"
 version = "1.0.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
-
-[[package]]
-name = "anstyle-parse"
-version = "1.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "52ce7f38b242319f7cabaa6813055467063ecdc9d355bbb4ce0c68908cd8130e"
-dependencies = [
- "utf8parse",
-]
-
-[[package]]
-name = "anstyle-query"
-version = "1.1.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "40c48f72fd53cd289104fc64099abca73db4166ad86ea0b4341abe65af83dadc"
-dependencies = [
- "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "anstyle-wincon"
-version = "3.0.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "291e6a250ff86cd4a820112fb8898808a366d8f9f58ce16d1f538353ad55747d"
-dependencies = [
- "anstyle",
- "once_cell_polyfill",
- "windows-sys 0.61.2",
-]
 
 [[package]]
 name = "anyhow"
@@ -291,10 +247,8 @@ name = "astlog"
 version = "0.0.0"
 dependencies = [
  "astlog-core",
- "clap",
  "error-chain",
  "serde_json",
- "snafu",
 ]
 
 [[package]]
@@ -305,9 +259,6 @@ dependencies = [
  "astlog-engine",
  "blaze-hash",
  "edit-applier",
- "ignore",
- "regex",
- "snafu",
  "tempfile",
  "tree-sitter",
 ]
@@ -317,9 +268,8 @@ name = "astlog-engine"
 version = "0.0.0"
 dependencies = [
  "blaze-hash",
+ "blaze-script",
  "blaze-sim",
- "regex",
- "snafu",
 ]
 
 [[package]]
@@ -350,6 +300,7 @@ dependencies = [
  "blaze-ids",
  "blaze-mem",
  "blaze-memo",
+ "blaze-semver",
  "blaze-surface",
  "cfg",
  "intern",
@@ -410,7 +361,9 @@ dependencies = [
  "blaze-fetch",
  "blaze-json",
  "blaze-own",
+ "blaze-semver",
  "blaze-sim",
+ "blaze-toml",
  "semver",
  "toml",
 ]
@@ -435,7 +388,7 @@ dependencies = [
  "blaze-memo",
  "blaze-profile",
  "blaze-rng",
- "tracing",
+ "blaze-trace",
 ]
 
 [[package]]
@@ -498,12 +451,12 @@ dependencies = [
  "blaze-reclaim",
  "blaze-sim",
  "blaze-spin",
+ "blaze-trace",
  "blaze-v2-proof",
  "crossbeam-channel",
  "crossbeam-queue",
  "libc",
  "lz4_flex",
- "tracing",
  "zstd",
 ]
 
@@ -551,7 +504,9 @@ name = "blaze-codegen-code"
 version = "0.0.0"
 dependencies = [
  "blake3",
+ "blaze-data",
  "blaze-json",
+ "blaze-toml",
  "glob",
  "toml",
 ]
@@ -581,7 +536,6 @@ dependencies = [
  "crossbeam-channel",
  "crossbeam-queue",
  "libc",
- "parking_lot",
  "windows-sys 0.61.2",
 ]
 
@@ -656,15 +610,15 @@ dependencies = [
  "blaze-json",
  "blaze-sha256",
  "blaze-sim",
+ "blaze-tar",
+ "blaze-trace",
+ "blaze-unicode",
  "crossbeam-channel",
  "filetime",
  "papaya",
  "sha2 0.11.1",
  "stdx",
- "tar",
  "tempfile",
- "tracing",
- "unicode-normalization",
 ]
 
 [[package]]
@@ -685,27 +639,25 @@ name = "blaze-fmt"
 version = "0.0.0"
 dependencies = [
  "annotate-snippets",
- "anyhow",
  "blaze-core",
+ "blaze-data",
  "blaze-manifest",
+ "blaze-own",
+ "blaze-semver",
  "blaze-serde",
+ "blaze-toml",
+ "blaze-trace",
+ "blaze-unicode",
  "diff",
- "expect-test",
  "intern",
  "libc",
  "parser",
  "rustc_lexer",
- "semver",
  "serde",
  "serde_json",
  "stdx",
  "syntax",
- "thiserror",
- "toml",
- "tracing",
- "unicode-properties",
- "unicode-segmentation",
- "unicode-width 0.1.14",
+ "test-utils",
 ]
 
 [[package]]
@@ -766,17 +718,17 @@ name = "blaze-gc"
 version = "0.0.0"
 dependencies = [
  "blaze-core",
+ "blaze-data",
  "blaze-hash",
  "blaze-ids",
- "blaze-serde",
+ "blaze-json",
+ "blaze-own",
  "blaze-spin",
+ "blaze-trace",
  "crossbeam-channel",
  "crossbeam-queue",
  "libc",
- "serde",
- "serde_json",
  "stdx",
- "tracing",
  "windows-sys 0.61.2",
 ]
 
@@ -812,11 +764,11 @@ dependencies = [
  "crossbeam-channel",
  "crossbeam-deque",
  "crossbeam-queue",
- "expect-test",
  "libc",
  "serde",
  "serde_json",
  "stdx",
+ "test-utils",
  "windows-sys 0.61.2",
 ]
 
@@ -873,21 +825,22 @@ dependencies = [
  "blaze-ids",
  "blaze-keyed",
  "blaze-sim",
+ "blaze-trace",
  "blaze-vfs",
  "crossbeam-queue",
- "tracing",
 ]
 
 [[package]]
 name = "blaze-http"
 version = "0.0.0"
 dependencies = [
- "base64",
+ "blaze-base64",
  "blaze-core",
+ "blaze-deflate",
+ "blaze-own",
  "blaze-sha256",
  "blaze-sim",
  "bytes",
- "flate2",
  "http",
  "httparse",
  "percent-encoding",
@@ -1016,6 +969,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "blaze-kit"
+version = "0.0.0"
+dependencies = [
+ "blaze-hash",
+ "blaze-int",
+ "blaze-own",
+ "blaze-sim",
+]
+
+[[package]]
 name = "blaze-launch"
 version = "0.0.0"
 dependencies = [
@@ -1070,12 +1033,16 @@ dependencies = [
  "annotate-snippets",
  "anyhow",
  "blaze-core",
+ "blaze-data",
  "blaze-hash",
  "blaze-ids",
+ "blaze-own",
  "blaze-resolve",
+ "blaze-semver",
  "blaze-serde",
  "blaze-sim",
  "blaze-source",
+ "blaze-toml",
  "cargo-platform",
  "cargo-util-schemas",
  "dunce",
@@ -1151,7 +1118,10 @@ name = "blaze-new"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "blaze-data",
  "blaze-manifest",
+ "blaze-own",
+ "blaze-toml",
  "cargo-util-schemas",
  "edition",
  "glob",
@@ -1172,6 +1142,15 @@ version = "0.0.0"
 dependencies = [
  "blaze-cbor",
  "blaze-report",
+]
+
+[[package]]
+name = "blaze-parquet"
+version = "0.0.0"
+dependencies = [
+ "blaze-columns",
+ "blaze-int",
+ "blaze-own",
 ]
 
 [[package]]
@@ -1201,7 +1180,7 @@ dependencies = [
  "arrow-buffer",
  "arrow-ipc",
  "arrow-schema",
- "base64",
+ "blaze-base64",
  "blaze-core",
  "blaze-graph",
  "blaze-hash",
@@ -1210,6 +1189,7 @@ dependencies = [
  "blaze-report",
  "blaze-serde",
  "blaze-sim",
+ "blaze-trace",
  "blaze-v2-proof",
  "bytes",
  "crossbeam-channel",
@@ -1221,8 +1201,6 @@ dependencies = [
  "serde_derive",
  "serde_json",
  "stdx",
- "thiserror",
- "tracing",
  "windows-sys 0.61.2",
 ]
 
@@ -1297,12 +1275,14 @@ dependencies = [
 name = "blaze-report"
 version = "0.0.0"
 dependencies = [
+ "blaze-data",
  "blaze-protocol",
+ "blaze-toml",
+ "blaze-unicode",
  "serde",
  "sonic-rs",
  "stdx",
  "toml",
- "unicode-width 0.2.3",
 ]
 
 [[package]]
@@ -1311,11 +1291,17 @@ version = "0.0.0"
 dependencies = [
  "anyhow",
  "blaze-core",
+ "blaze-data",
  "blaze-hash",
  "blaze-ids",
+ "blaze-own",
+ "blaze-semver",
  "blaze-serde",
  "blaze-source",
  "blaze-spin",
+ "blaze-toml",
+ "blaze-trace",
+ "blaze-unicode",
  "cargo-platform",
  "imbl",
  "semver",
@@ -1323,8 +1309,6 @@ dependencies = [
  "serde_json",
  "stdx",
  "toml",
- "tracing",
- "unicode-ident",
  "url",
 ]
 
@@ -1364,10 +1348,10 @@ dependencies = [
  "blaze-protocol",
  "blaze-report",
  "blaze-sim",
- "expect-test",
+ "blaze-unicode",
  "serde",
  "serde_json",
- "unicode-width 0.2.3",
+ "test-utils",
 ]
 
 [[package]]
@@ -1375,7 +1359,10 @@ name = "blaze-script"
 version = "0.0.0"
 dependencies = [
  "blaze-core",
- "regex",
+ "blaze-data",
+ "blaze-sim",
+ "blaze-toml",
+ "blaze-unicode",
  "serde_json",
  "toml",
 ]
@@ -1432,9 +1419,9 @@ dependencies = [
  "blaze-own",
  "blaze-sim",
  "blaze-store-check",
+ "blaze-trace",
  "blaze-vfs",
  "syntax",
- "tracing",
 ]
 
 [[package]]
@@ -1445,6 +1432,8 @@ dependencies = [
  "blaze-alloc-count",
  "blaze-hash",
  "blaze-ids",
+ "blaze-own",
+ "blaze-semver",
  "rustc-stable-hash",
  "semver",
  "serde",
@@ -1584,6 +1573,9 @@ dependencies = [
 [[package]]
 name = "blaze-trace"
 version = "0.0.0"
+dependencies = [
+ "tracing",
+]
 
 [[package]]
 name = "blaze-typeck"
@@ -1591,6 +1583,13 @@ version = "0.0.0"
 dependencies = [
  "blaze-hash",
  "blaze-own",
+ "blaze-sim",
+]
+
+[[package]]
+name = "blaze-unicode"
+version = "0.0.0"
+dependencies = [
  "blaze-sim",
 ]
 
@@ -1683,16 +1682,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bstr"
-version = "1.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6bb31b46c14244e20ee9984b11bf5c992b91fb6939fea616e3512c8baecdbe5f"
-dependencies = [
- "memchr",
- "serde_core",
-]
-
-[[package]]
 name = "bumpalo"
 version = "3.20.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1712,12 +1701,6 @@ name = "bytes"
 version = "1.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
-
-[[package]]
-name = "camino"
-version = "1.2.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bbbad30e4b4c14a39e3cc8aed085a12a327257c316619c93581e017bc52be591"
 
 [[package]]
 name = "cargo-platform"
@@ -1764,11 +1747,11 @@ version = "0.0.0"
 dependencies = [
  "blaze-hash",
  "blaze-sim",
- "expect-test",
+ "blaze-trace",
  "intern",
  "syntax",
  "syntax-bridge",
- "tracing",
+ "test-utils",
  "tt",
 ]
 
@@ -1801,46 +1784,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "clap"
-version = "4.6.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa8876b300ab35ba921adea3dfd70157a46249b33f95c9084ae5709785478946"
-dependencies = [
- "clap_builder",
- "clap_derive",
-]
-
-[[package]]
-name = "clap_builder"
-version = "4.6.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec0797fb7aeb1406c84efac526901f7ec3ead2124f946b494e72879d4b54704d"
-dependencies = [
- "anstream",
- "anstyle",
- "clap_lex",
- "strsim",
-]
-
-[[package]]
-name = "clap_derive"
-version = "4.6.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f9c751b79415d4e559e3d1fcf128e09e720eb673a06d26cf6f392d37d75b66e0"
-dependencies = [
- "heck",
- "proc-macro2",
- "quote",
- "syn 3.0.9",
-]
-
-[[package]]
-name = "clap_lex"
-version = "1.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
-
-[[package]]
 name = "cobs"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1848,12 +1791,6 @@ checksum = "0fa961b519f0b462e3a3b4a34b64d119eeaca1d59af726fe450bbba07a9fc0a1"
 dependencies = [
  "thiserror",
 ]
-
-[[package]]
-name = "colorchoice"
-version = "1.0.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 
 [[package]]
 name = "const-ast"
@@ -2307,8 +2244,7 @@ checksum = "92773504d58c093f6de2459af4af33faa518c13451eb8f2b5698ed3d36e7c813"
 name = "edit-applier"
 version = "0.0.0"
 dependencies = [
- "similar",
- "snafu",
+ "stdx",
 ]
 
 [[package]]
@@ -2365,16 +2301,6 @@ name = "error-chain"
 version = "0.0.0"
 
 [[package]]
-name = "expect-test"
-version = "1.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63af43ff4431e848fb47472a920f14fa71c24de13255a5692e93d4e90302acb0"
-dependencies = [
- "dissimilar",
- "once_cell",
-]
-
-[[package]]
 name = "fastrand"
 version = "2.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2416,16 +2342,6 @@ checksum = "35f6839d7b3b98adde531effaf34f0c2badc6f4735d26fe74709d8e513a96ef3"
 dependencies = [
  "bitflags 2.13.2",
  "rustc_version",
-]
-
-[[package]]
-name = "flate2"
-version = "1.1.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e634e2e0ebac1ee034020da1ca582e17ffe4e0f5e985823721e168928136dcb"
-dependencies = [
- "crc32fast",
- "miniz_oxide",
 ]
 
 [[package]]
@@ -2587,19 +2503,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e4eba85ea1d0a966a983acd07deee566e67395d2d96b6fb39e62b5a833f1eb0b"
 
 [[package]]
-name = "globset"
-version = "0.4.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f98b0d85522dc0a824cfebbc9594ff4a9b289c568bea0370319dfbdf20ccdd2d"
-dependencies = [
- "aho-corasick",
- "bstr",
- "log",
- "regex-automata",
- "regex-syntax",
-]
-
-[[package]]
 name = "gpu"
 version = "0.0.0"
 dependencies = [
@@ -2655,10 +2558,9 @@ checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
 name = "hir-def"
 version = "0.0.0"
 dependencies = [
- "arrayvec",
  "base-db",
- "bitflags 2.13.2",
  "blaze-alloc-count",
+ "blaze-bitflags",
  "blaze-core",
  "blaze-dbsp",
  "blaze-format",
@@ -2670,17 +2572,19 @@ dependencies = [
  "blaze-keyed",
  "blaze-mem",
  "blaze-memo",
+ "blaze-own",
  "blaze-phf",
  "blaze-record",
  "blaze-sim",
  "blaze-surface",
+ "blaze-trace",
+ "blaze-unicode",
  "blaze-unitkey",
  "blaze-vfs",
  "cfg",
  "cov-mark",
  "crossbeam-channel",
  "drop_bomb",
- "expect-test",
  "fst",
  "hashbrown 0.17.1",
  "hir-expand",
@@ -2691,16 +2595,12 @@ dependencies = [
  "rustc_abi",
  "rustc_apfloat",
  "rustc_parse_format",
- "smallvec",
  "span",
  "stdx",
  "syntax",
  "syntax-bridge",
  "test-utils",
- "thin-vec",
- "tracing",
  "tt",
- "unicode-ident",
 ]
 
 [[package]]
@@ -2714,10 +2614,10 @@ dependencies = [
  "blaze-mem",
  "blaze-memo",
  "blaze-phf",
+ "blaze-trace",
  "blaze-vfs",
  "cfg",
  "cov-mark",
- "expect-test",
  "intern",
  "mbe",
  "parser",
@@ -2726,7 +2626,6 @@ dependencies = [
  "syntax",
  "syntax-bridge",
  "test-utils",
- "tracing",
  "tt",
 ]
 
@@ -2889,22 +2788,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ignore"
-version = "0.4.34"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "484be5657551d7868d67587df967fb4fcbe9d266a761cc855aaa148fda0b3cc7"
-dependencies = [
- "crossbeam-deque",
- "globset",
- "log",
- "memchr",
- "regex-automata",
- "same-file",
- "walkdir",
- "winapi-util",
-]
-
-[[package]]
 name = "imbl"
 version = "7.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2960,12 +2843,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "is_terminal_polyfill"
-version = "1.70.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
-
-[[package]]
 name = "itertools"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2988,26 +2865,26 @@ dependencies = [
  "arrow-array",
  "arrow-ipc",
  "arrow-schema",
- "base64",
  "blake3",
+ "blaze-base64",
  "blaze-core",
+ "blaze-deflate",
  "blaze-http",
  "blaze-inproc-rt",
+ "blaze-own",
+ "blaze-script",
  "blaze-sha256",
  "blaze-sim",
+ "blaze-trace",
  "crossbeam-channel",
  "crossbeam-queue",
- "flate2",
  "gimli",
  "libc",
  "object 0.40.0",
  "rcgen",
- "regex",
  "rustc-demangle",
  "serde",
  "serde_json",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -3176,14 +3053,13 @@ dependencies = [
 name = "mbe"
 version = "0.0.0"
 dependencies = [
- "bitflags 2.13.2",
  "blaze-alloc-count",
+ "blaze-bitflags",
  "blaze-hash",
  "blaze-ids",
  "blaze-mem",
  "blaze-own",
  "cov-mark",
- "expect-test",
  "intern",
  "parser",
  "rustc_lexer",
@@ -3223,7 +3099,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b63fbc4a50860e98e7b2aa7804ded1db5cbc3aff9193adaff57a6931bf7c4b4c"
 dependencies = [
  "adler2",
- "simd-adler32",
 ]
 
 [[package]]
@@ -3308,15 +3183,6 @@ checksum = "071dfc062690e90b734c0b2273ce72ad0ffa95f0c74596bc250dcfd960262841"
 dependencies = [
  "autocfg",
  "libm",
-]
-
-[[package]]
-name = "num_threads"
-version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c7398b9c8b70908f6371f47ed36737907c87c52af34c268fed0bf0ceb92ead9"
-dependencies = [
- "libc",
 ]
 
 [[package]]
@@ -3472,12 +3338,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
-name = "once_cell_polyfill"
-version = "1.70.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
-
-[[package]]
 name = "openssl-probe"
 version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3561,13 +3421,12 @@ dependencies = [
  "blaze-mem",
  "blaze-phf",
  "blaze-sim",
+ "blaze-trace",
  "crossbeam-channel",
  "edition",
- "expect-test",
- "rustc-literal-escaper",
  "rustc_lexer",
  "stdx",
- "tracing",
+ "test-utils",
  "winnow",
 ]
 
@@ -3580,9 +3439,6 @@ checksum = "df94ce210e5bc13cb6651479fa48d14f601d9858cfe0467f43ae157023b938d3"
 [[package]]
 name = "paths"
 version = "0.0.0"
-dependencies = [
- "camino",
-]
 
 [[package]]
 name = "percent-encoding"
@@ -3992,10 +3848,10 @@ checksum = "781442f29170c5c93b7185ad559492601acdc71d5bb0706f5868094f45cfcd08"
 name = "rustc_abi"
 version = "0.0.0"
 dependencies = [
- "bitflags 2.13.2",
+ "blaze-bitflags",
+ "blaze-trace",
  "ra-ap-rustc_hashes",
  "ra-ap-rustc_index",
- "tracing",
 ]
 
 [[package]]
@@ -4013,9 +3869,8 @@ name = "rustc_lexer"
 version = "0.0.0"
 dependencies = [
  "blaze-memchr",
- "expect-test",
- "unicode-ident",
- "unicode-properties",
+ "blaze-unicode",
+ "test-utils",
 ]
 
 [[package]]
@@ -4119,15 +3974,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "same-file"
-version = "1.0.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
-dependencies = [
- "winapi-util",
-]
-
-[[package]]
 name = "schannel"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4146,9 +3992,10 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 name = "scripts"
 version = "0.0.0"
 dependencies = [
+ "blaze-data",
  "blaze-script",
  "blaze-sha256",
- "regex",
+ "blaze-toml",
  "serde_json",
  "toml",
 ]
@@ -4301,15 +4148,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "sharded-slab"
-version = "0.1.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
-dependencies = [
- "lazy_static",
-]
-
-[[package]]
 name = "shell-escape"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4322,25 +4160,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
-name = "simd-adler32"
-version = "0.3.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
-
-[[package]]
 name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
-
-[[package]]
-name = "similar"
-version = "3.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d2f8bec09ae8fae0f4f265a4559a9334be3929d8504e9b536df0a41302bd1733"
-dependencies = [
- "bstr",
-]
 
 [[package]]
 name = "slab"
@@ -4355,27 +4178,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d0d5d4b1981b8bbbb7aed204cae5726d683d5d6ac7e74ec54122ea28f315e7c8"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "snafu"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e84b3f4eacbf3a1ce05eac6763b4d629d60cbc94d632e4092c54ade71f1e1a2"
-dependencies = [
- "snafu-derive",
-]
-
-[[package]]
-name = "snafu-derive"
-version = "0.8.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1c97747dbf44bb1ca44a561ece23508e99cb592e862f22222dcf42f51d1e451"
-dependencies = [
- "heck",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
 ]
 
 [[package]]
@@ -4426,9 +4228,9 @@ dependencies = [
  "blaze-mem",
  "blaze-memo",
  "blaze-text-size",
+ "blaze-unicode",
  "stdx",
  "syntax",
- "unicode-width 0.2.3",
 ]
 
 [[package]]
@@ -4456,10 +4258,10 @@ version = "0.0.0"
 dependencies = [
  "blaze-core",
  "blaze-sim",
+ "blaze-trace",
  "crossbeam-channel",
  "libc",
  "stacker",
- "tracing",
 ]
 
 [[package]]
@@ -4467,12 +4269,6 @@ name = "streaming-iterator"
 version = "0.1.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b2231b7c3057d5e4ad0156fb3dc807d900806020c5ffa3ee6ff2c8c76fb8520"
-
-[[package]]
-name = "strsim"
-version = "0.11.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
 name = "subtle"
@@ -4524,16 +4320,14 @@ dependencies = [
  "blaze-ids",
  "blaze-mem",
  "blaze-phf",
+ "blaze-trace",
  "crossbeam-channel",
- "expect-test",
  "parser",
- "rustc-literal-escaper",
  "rustc_apfloat",
  "rustc_lexer",
  "stdx",
  "syntax-tree",
  "test-utils",
- "tracing",
 ]
 
 [[package]]
@@ -4544,7 +4338,6 @@ dependencies = [
  "blaze-hash",
  "blaze-ids",
  "blaze-mem",
- "expect-test",
  "hashbrown 0.17.1",
  "intern",
  "parser",
@@ -4620,18 +4413,14 @@ dependencies = [
 name = "test-utils"
 version = "0.0.0"
 dependencies = [
+ "blaze-core",
  "blaze-hash",
+ "blaze-sim",
  "blaze-text-size",
  "dissimilar",
  "paths",
  "stdx",
 ]
-
-[[package]]
-name = "thin-vec"
-version = "0.2.21"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d6a4b9ba8738cb4a4f399d37e266becfd475e75eb73425b87a05a2f2039ba63e"
 
 [[package]]
 name = "thiserror"
@@ -4654,15 +4443,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "thread_local"
-version = "1.1.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f60246a4944f24f6e018aa17cdeffb7818b76356965d03b07d6a9886e8962185"
-dependencies = [
- "cfg-if",
-]
-
-[[package]]
 name = "time"
 version = "0.3.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4670,9 +4450,7 @@ checksum = "743bd48c283afc0388f9b8827b976905fb217ad9e647fae3a379a9283c4def2c"
 dependencies = [
  "deranged",
  "itoa",
- "libc",
  "num-conv",
- "num_threads",
  "powerfmt",
  "serde_core",
  "time-core",
@@ -4779,19 +4557,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "63e71662fa4b2a2c3a26f570f037eb95bb1f85397f3cd8076caed2f026a6d100"
 dependencies = [
  "pin-project-lite",
- "tracing-attributes",
  "tracing-core",
-]
-
-[[package]]
-name = "tracing-attributes"
-version = "0.1.31"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7490cfa5ec963746568740651ac6781f701c9c5ea257c58e057f3ba8cf69e8da"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.117",
 ]
 
 [[package]]
@@ -4801,31 +4567,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db97caf9d906fbde555dd62fa95ddba9eecfd14cb388e4f491a66d74cd5fb79a"
 dependencies = [
  "once_cell",
- "valuable",
-]
-
-[[package]]
-name = "tracing-log"
-version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ee855f1f400bd0e5c02d150ae5de3840039a3f54b025156404e34c23c03f47c3"
-dependencies = [
- "log",
- "once_cell",
- "tracing-core",
-]
-
-[[package]]
-name = "tracing-subscriber"
-version = "0.3.23"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
-dependencies = [
- "sharded-slab",
- "thread_local",
- "time",
- "tracing-core",
- "tracing-log",
 ]
 
 [[package]]
@@ -4923,33 +4664,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
 
 [[package]]
-name = "unicode-normalization"
-version = "0.1.25"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5fd4f6878c9cb28d874b009da9e8d183b5abc80117c40bbd187a1fde336be6e8"
-dependencies = [
- "tinyvec",
-]
-
-[[package]]
-name = "unicode-properties"
-version = "0.1.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7df058c713841ad818f1dc5d3fd88063241cc61f49f5fbea4b951e8cf5a8d71d"
-
-[[package]]
-name = "unicode-segmentation"
-version = "1.12.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6ccf251212114b54433ec949fd6a7841275f9ada20dddd2f29e9ceea4501493"
-
-[[package]]
-name = "unicode-width"
-version = "0.1.14"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7dd6e30e90baa6f72411720665d41d89b9a3d039dc45b8faea1ddd07f617f6af"
-
-[[package]]
 name = "unicode-width"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4980,12 +4694,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
-name = "utf8parse"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "06abde3611657adf66d383f00b093d7faecc7fa57071cce2578660c9f1010821"
-
-[[package]]
 name = "uuid"
 version = "1.28.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4994,12 +4702,6 @@ dependencies = [
  "js-sys",
  "wasm-bindgen",
 ]
-
-[[package]]
-name = "valuable"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vcpkg"
@@ -5012,16 +4714,6 @@ name = "version_check"
 version = "0.9.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
-
-[[package]]
-name = "walkdir"
-version = "2.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29790946404f91d9c5d06f9874efddea1dc06c5efe94541a7d6863108e3a5e4b"
-dependencies = [
- "same-file",
- "winapi-util",
-]
 
 [[package]]
 name = "wasi"

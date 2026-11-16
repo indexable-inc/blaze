@@ -7,21 +7,139 @@
 //! What a unit is built for (`UnitFor`) is the unit graph's to compute; this module takes it.
 
 use std::collections::BTreeMap;
+use std::fmt;
+use std::path::Path;
 
-use anyhow::{Context as _, bail};
 use blaze_hash::{HashMap, HashSet};
-use cargo_util_schemas::core::PackageIdSpec;
-use cargo_util_schemas::manifest::{
-    ProfileName, ProfilePackageSpec, StringOrBool, TomlDebugInfo, TomlProfile, TomlProfiles,
-    TomlTrimPaths,
-};
+use blaze_resolve::PackageIdSpec;
+use blaze_toml::{Document, Item};
 use serde::Serialize;
 use std::alloc::Global;
 
 use crate::config::{CliUnstable, CompileKind, Config};
+use crate::diagnostic::ManifestDiagnostic;
+use crate::error::{Context, ManifestError, ResultExt};
 use crate::features::{Feature, Features};
 use crate::files::Files;
 use crate::manifest::PackageId;
+use crate::schema::{
+    ProfileName, ProfileNameError, ProfilePackageSpec, StringOrBool, TomlDebugInfo, TomlProfile,
+    TomlProfiles, TomlTrimPaths,
+};
+
+/// What a profile, its `inherits` chain or its overrides do that cargo refuses, in cargo's
+/// words.
+#[derive(Debug)]
+pub enum ProfileError {
+    /// `inherits` under `dev` or `release`.
+    InheritsInRoot { name: String },
+    InheritanceLoop { name: String, inherits: String },
+    InheritsUndefined { name: String, inherits: String },
+    MissingInherits { name: String },
+    NotDefined { name: String },
+    /// blaze: an `inherits` chain that does not end at `dev` or `release`, met reading its
+    /// `contract-checks`.
+    ContractChecksChain { name: String },
+    /// blaze: `contract-checks` that is no bool; `value` is its TOML text.
+    ContractChecksNotBool { name: String, value: String },
+    /// blaze: `contract-checks` under a profile's `build-override` or `package.<spec>`.
+    ContractChecksNested { name: String, place: String },
+    /// `--profile doc`.
+    DocReserved,
+    Name(ProfileNameError),
+    MultipleOverrides { name: String, package: String, specs: Vec<String> },
+    DirName { dir_name: String, name: String },
+    Panic { panic: String },
+    LtoString { arg: String, name: String },
+    NestedPackage,
+    NestedBuildOverride,
+    /// `panic`, `lto` or `rpath` in a `build-override` or `package` profile.
+    InOverride { key: &'static str, which: &'static str },
+}
+
+impl fmt::Display for ProfileError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        const KEY: &str = "contract-checks";
+        match self {
+            ProfileError::InheritsInRoot { name } => {
+                write!(f, "`inherits` must not be specified in root profile `{name}`")
+            }
+            ProfileError::InheritanceLoop { name, inherits } => write!(
+                f,
+                "profile inheritance loop detected with profile `{name}` inheriting `{inherits}`"
+            ),
+            ProfileError::InheritsUndefined { name, inherits } => write!(
+                f,
+                "profile `{name}` inherits from `{inherits}`, but that profile is not defined"
+            ),
+            ProfileError::MissingInherits { name } => write!(
+                f,
+                "profile `{name}` is missing an `inherits` directive \
+                 (`inherits` is required for all profiles except `dev` or `release`)"
+            ),
+            ProfileError::NotDefined { name } => write!(f, "profile `{name}` is not defined"),
+            ProfileError::ContractChecksChain { name } => write!(
+                f,
+                "profile `{name}`'s `inherits` chain does not end at `dev` or `release`, reading \
+                 its `contract-checks`"
+            ),
+            ProfileError::ContractChecksNotBool { name, value } => write!(
+                f,
+                "`profile.{name}.{KEY}` is a boolean (`true` or `false`), not `{value}`"
+            ),
+            ProfileError::ContractChecksNested { name, place } => write!(
+                f,
+                "`profile.{name}.{place}.{KEY}`: `{KEY}` is a setting of the whole profile, \
+                 set under `[profile.{name}]`, not for one package or the build's host units"
+            ),
+            ProfileError::DocReserved => {
+                f.write_str("profile `doc` is reserved and not allowed to be explicitly specified")
+            }
+            ProfileError::Name(e) => write!(f, "{e}"),
+            ProfileError::MultipleOverrides { name, package, specs } => write!(
+                f,
+                "multiple package overrides in profile `{name}` match package `{package}`\n\
+                 found package specs: {}",
+                specs.join(", ")
+            ),
+            ProfileError::DirName { dir_name, name } => write!(
+                f,
+                "dir-name=\"{dir_name}\" in profile `{name}` is not currently allowed, \
+                 directory names are tied to the profile name for custom profiles"
+            ),
+            ProfileError::Panic { panic } => write!(
+                f,
+                "`panic` setting of `{panic}` is not a valid setting, \
+                 must be `unwind`, `abort`, or `immediate-abort`."
+            ),
+            ProfileError::LtoString { arg, name } => write!(
+                f,
+                "`lto` setting of string `\"{arg}\"` for `{name}` profile is not \
+                 a valid setting, must be a boolean (`true`/`false`) or a string \
+                 (`\"thin\"`/`\"fat\"`/`\"off\"`) or omitted."
+            ),
+            ProfileError::NestedPackage => {
+                f.write_str("package-specific profiles cannot be nested")
+            }
+            ProfileError::NestedBuildOverride => {
+                f.write_str("build-override profiles cannot be nested")
+            }
+            ProfileError::InOverride { key, which } => {
+                write!(f, "`{key}` may not be specified in a `{which}` profile")
+            }
+        }
+    }
+}
+
+impl core::error::Error for ProfileError {
+    // dyn: std's error chain, read only on an error path.
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            ProfileError::Name(e) => Some(e),
+            _ => None,
+        }
+    }
+}
 
 fn spec_matches(spec: &PackageIdSpec, pkg: &PackageId) -> bool {
     if spec.name() != pkg.name {

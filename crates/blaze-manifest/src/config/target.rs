@@ -7,10 +7,11 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use anyhow::bail;
-use cargo_platform::{Cfg, CfgExpr, Platform};
+use blaze_resolve::{Cfg, CfgExpr, Platform};
 use serde::Deserialize;
+use serde::de::IgnoredAny;
 
+use super::error::{ConfigError, ConfigWhat};
 use super::{Config, ConfigRelativePath, OptValue, PathAndArgs, StringList};
 use crate::files::Files;
 
@@ -21,9 +22,10 @@ pub struct TargetCfgConfig {
     pub rustflags: OptValue<StringList>,
     pub rustdocflags: OptValue<StringList>,
     pub linker: OptValue<ConfigRelativePath>,
-    /// Whatever else a `[target]` table has: every one is read, `cfg(` or not.
+    /// The names of whatever else a `[target]` table has, warned of, never read: every one is
+    /// accepted, `cfg(` or not.
     #[serde(flatten)]
-    pub other: BTreeMap<String, toml::Value>,
+    pub other: BTreeMap<String, IgnoredAny>,
 }
 
 /// A `[target.<triple>]` table. Its `links` overrides are not read yet.
@@ -76,7 +78,7 @@ impl Flags {
 
 impl<F: Files> Config<F> {
     /// The `[target.'cfg(..)']` tables by name, as cargo's `GlobalContext::target_cfgs`.
-    pub fn target_cfgs(&self) -> anyhow::Result<&Vec<(String, TargetCfgConfig)>> {
+    pub fn target_cfgs(&self) -> Result<&Vec<(String, TargetCfgConfig)>, ConfigError> {
         if let Some(cfgs) = self.target_cfgs.get() {
             return Ok(cfgs);
         }
@@ -101,7 +103,7 @@ impl<F: Files> Config<F> {
     }
 
     /// `[target.<triple>]`, each field from the files or its variable.
-    pub fn target_cfg_triple(&self, triple: &str) -> anyhow::Result<TargetConfig> {
+    pub fn target_cfg_triple(&self, triple: &str) -> Result<TargetConfig, ConfigError> {
         let prefix = format!("target.{triple}");
         Ok(TargetConfig {
             runner: self.get(&format!("{prefix}.runner"))?,
@@ -118,7 +120,7 @@ impl<F: Files> Config<F> {
         kind: &CompileKind,
         host: &str,
         cfg: &[Cfg],
-    ) -> anyhow::Result<Option<(PathBuf, Vec<String>)>> {
+    ) -> Result<Option<(PathBuf, Vec<String>)>, ConfigError> {
         if let Some(runner) = self.target_cfg_triple(kind.short_name(host))?.runner {
             return Ok(Some((runner.val.path.resolve_program(self.cwd()), runner.val.args)));
         }
@@ -130,13 +132,13 @@ impl<F: Files> Config<F> {
         let matching = cfgs.next();
         if let Some((key, runner)) = cfgs.next() {
             let (first, first_runner) = matching.unwrap();
-            bail!(
-                "several matching instances of `target.'cfg(..)'.runner` in configurations\n\
-                 first match `{first}` located in {}\n\
-                 second match `{key}` located in {}",
-                first_runner.definition,
-                runner.definition
-            );
+            return Err(ConfigError::new(ConfigWhat::SeveralMatching {
+                what: "runner",
+                first: first.clone(),
+                first_in: first_runner.definition.clone(),
+                second: key.clone(),
+                second_in: runner.definition.clone(),
+            }));
         }
         Ok(matching.map(|(_, runner)| {
             (runner.val.path.resolve_program(self.cwd()), runner.val.args.clone())
@@ -150,7 +152,7 @@ impl<F: Files> Config<F> {
         kind: &CompileKind,
         host: &str,
         cfg: &[Cfg],
-    ) -> anyhow::Result<Option<PathBuf>> {
+    ) -> Result<Option<PathBuf>, ConfigError> {
         if let Some(linker) = self.target_cfg_triple(kind.short_name(host))?.linker {
             return Ok(Some(linker.val.resolve_program(self.cwd())));
         }
@@ -162,13 +164,13 @@ impl<F: Files> Config<F> {
         let matching = cfgs.next();
         if let Some((key, linker)) = cfgs.next() {
             let (first, first_linker) = matching.unwrap();
-            bail!(
-                "several matching instances of `target.'cfg(..)'.linker` in configurations\n\
-                 first match `{first}` located in {}\n\
-                 second match `{key}` located in {}",
-                first_linker.definition,
-                linker.definition
-            );
+            return Err(ConfigError::new(ConfigWhat::SeveralMatching {
+                what: "linker",
+                first: first.clone(),
+                first_in: first_linker.definition.clone(),
+                second: key.clone(),
+                second_in: linker.definition.clone(),
+            }));
         }
         Ok(matching.map(|(_, linker)| linker.val.resolve_program(self.cwd())))
     }
@@ -185,7 +187,7 @@ impl<F: Files> Config<F> {
         target_cfg: Option<&[Cfg]>,
         kind: &CompileKind,
         flags: Flags,
-    ) -> anyhow::Result<Vec<String>> {
+    ) -> Result<Vec<String>, ConfigError> {
         if *kind == CompileKind::Host && requested != [CompileKind::Host] {
             return Ok(Vec::new());
         }
@@ -220,7 +222,7 @@ impl<F: Files> Config<F> {
         target_cfg: Option<&[Cfg]>,
         kind: &CompileKind,
         flags: Flags,
-    ) -> anyhow::Result<Option<Vec<String>>> {
+    ) -> Result<Option<Vec<String>>, ConfigError> {
         let mut rustflags = Vec::new();
         let key = format!("target.{}.{}", kind.short_name(host), flags.as_key());
         if let Some(args) = self.get::<Option<StringList>>(&key)? {

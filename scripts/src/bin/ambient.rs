@@ -34,6 +34,7 @@ const DOC: &str = r#"ambient: what each crate takes from `std` and `alloc`, and 
                       lowered with `write`; a crate with no row is held to 0 in every column;
                       with `base`, no count of a row is above the base's (CI)
               write   write the list from the tree as it is
+              findings  print every site as a `blaze_script::finding` document (for `advise`)
     root      the checkout (".")
     base      the commit the change is against, or null: its list (`git show`) holds every
               row down, and the lines added since it (`git diff --unified=0`) name a crate's
@@ -114,7 +115,9 @@ use std::{
 };
 
 use blaze_script::{
-    TempDir, fail, git,
+    TempDir, fail,
+    finding::{self, Finding},
+    git,
     input::{self, Fields, Input, InputError},
     read_text, universal_newlines,
 };
@@ -176,7 +179,7 @@ impl Input for Args {
 
     fn parse(f: &Fields<'_>) -> Result<Args, InputError> {
         Ok(Args {
-            command: f.one_of("command", &["check", "write"], None)?,
+            command: f.one_of("command", &["check", "write", "findings"], None)?,
             root: f.str("root", Some("."))?,
             base: f.str_or_null("base")?,
         })
@@ -237,6 +240,12 @@ impl Kind {
             Kind::Alloc => INSTEAD_ALLOC,
             Kind::VecBox => INSTEAD_VEC_BOX,
         }
+    }
+
+    /// The kind as a finding (`blaze_script::finding`), for `advise`, which refines a line's by
+    /// tools/std-map.json's class of what it names.
+    const fn finding(self) -> finding::Kind {
+        finding::Kind { name: self.name(), label: self.what(), rule: "75 nothing-ambient", instead: self.instead(), mechanical: false }
     }
 }
 
@@ -1215,6 +1224,13 @@ fn main_with(it: &Args) {
         fail(SCRIPT, &format!("{} has no crates/ directory", root.display()));
     }
     let counts = count(&root).unwrap_or_else(|e| fail(SCRIPT, &e.to_string()));
+    if it.command == "findings" {
+        let found = counts.iter().flat_map(|(krate, sites)| {
+            sites.iter().map(|it| Finding { krate: krate.clone(), file: it.path.clone(), line: it.line, kind: it.kind.name(), detail: None })
+        });
+        finding::print(SCRIPT, &KINDS.map(Kind::finding), found.collect());
+        return;
+    }
     let text = render(&counts);
     if it.command == "write" {
         if let Err(e) = std::fs::write(root.join(LIST), &text) {

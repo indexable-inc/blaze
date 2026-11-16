@@ -308,10 +308,16 @@ impl Drop for Unit {
 // Vec.
 
 fn vec_case(tape: &Tape) -> Result<(), Broke> {
-    tokens::fresh();
     let alloc = Counting::new();
+    vec_case_in(tape, &alloc)?;
+    alloc.check()
+}
+
+/// [`vec_case`] over any allocator, so `handle` runs it through an `Alloc` too.
+fn vec_case_in<A: Allocator + Copy>(tape: &Tape, alloc: A) -> Result<(), Broke> {
+    tokens::fresh();
     {
-        let mut ours: Vec<Token, &Counting> = Vec::new_in(&alloc);
+        let mut ours: Vec<Token, A> = Vec::new_in(alloc);
         let mut model: StdVec<u64> = StdVec::new();
         for _ in 0..tape.index(48, "steps") {
             let len = model.len();
@@ -414,8 +420,7 @@ fn vec_case(tape: &Tape) -> Result<(), Broke> {
             drop(iter);
         }
     }
-    tokens::check(0)?;
-    alloc.check()
+    tokens::check(0)
 }
 
 #[test]
@@ -1147,10 +1152,16 @@ fn rc_counts_and_frees() -> Result<(), Broke> {
 // VecDeque.
 
 fn deque_case(tape: &Tape) -> Result<(), Broke> {
-    tokens::fresh();
     let alloc = Counting::new();
+    deque_case_in(tape, &alloc)?;
+    alloc.check()
+}
+
+/// [`deque_case`] over any allocator, so `handle` runs it through an `Alloc` too.
+fn deque_case_in<A: Allocator + Copy>(tape: &Tape, alloc: A) -> Result<(), Broke> {
+    tokens::fresh();
     {
-        let mut ours: VecDeque<Token, &Counting> = VecDeque::new_in(&alloc);
+        let mut ours: VecDeque<Token, A> = VecDeque::new_in(alloc);
         let mut model: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
         for _ in 0..tape.index(64, "steps") {
             let len = model.len();
@@ -1181,7 +1192,7 @@ fn deque_case(tape: &Tape) -> Result<(), Broke> {
                     model.retain(|v| v % keep != 0);
                 }
                 14 => {
-                    let mut other: VecDeque<Token, &Counting> = VecDeque::new_in(&alloc);
+                    let mut other: VecDeque<Token, A> = VecDeque::new_in(alloc);
                     let mut model_other = std::collections::VecDeque::new();
                     for i in 0..tape.index(6, "appended") {
                         // Wrapped sometimes, so the copy crosses the other ring's end.
@@ -1240,8 +1251,7 @@ fn deque_case(tape: &Tape) -> Result<(), Broke> {
             tokens::check(model.len())?;
         }
     }
-    tokens::check(0)?;
-    alloc.check()
+    tokens::check(0)
 }
 
 #[test]
@@ -1391,12 +1401,18 @@ fn deque_drain_and_retain_keep_order_when_a_drop_panics() -> Result<(), Broke> {
 // SortedMap and SortedSet.
 
 fn sorted_case(tape: &Tape) -> Result<(), Broke> {
-    tokens::fresh();
     let alloc = Counting::new();
+    sorted_case_in(tape, &alloc)?;
+    alloc.check()
+}
+
+/// [`sorted_case`] over any allocator, so `handle` runs it through an `Alloc` too.
+fn sorted_case_in<A: Allocator + Copy>(tape: &Tape, alloc: A) -> Result<(), Broke> {
+    tokens::fresh();
     {
-        let mut ours: SortedMap<u64, Token, &Counting> = SortedMap::new_in(&alloc);
+        let mut ours: SortedMap<u64, Token, A> = SortedMap::new_in(alloc);
         let mut model: BTreeMap<u64, u64> = BTreeMap::new();
-        let mut set: SortedSet<u64, &Counting> = SortedSet::new_in(&alloc);
+        let mut set: SortedSet<u64, A> = SortedSet::new_in(alloc);
         let mut model_set: BTreeSet<u64> = BTreeSet::new();
         for _ in 0..tape.index(64, "steps") {
             let k = tape.below(24, "key");
@@ -1443,8 +1459,7 @@ fn sorted_case(tape: &Tape) -> Result<(), Broke> {
             tokens::check(model.len())?;
         }
     }
-    tokens::check(0)?;
-    alloc.check()
+    tokens::check(0)
 }
 
 #[test]
@@ -1584,17 +1599,24 @@ fn unrow(r: RowRef<'_>) -> Model {
 }
 
 fn soa_case(tape: &Tape) -> Result<(), Broke> {
-    tokens::fresh();
     let alloc = Counting::new();
+    soa_case_in(tape, &alloc, &alloc)?;
+    alloc.check()
+}
+
+/// [`soa_case`] over any allocator that allocates from `counted`, so `handle` runs it through
+/// an `Alloc` too; `counted` says how many blocks it made and holds.
+fn soa_case_in<A: Allocator + Copy>(tape: &Tape, counted: &Counting, alloc: A) -> Result<(), Broke> {
+    tokens::fresh();
     {
-        let mut ours = Rows::new_in(&alloc);
+        let mut ours = Rows::new_in(alloc);
         let mut model: StdVec<Model> = StdVec::new();
         for step in 0..tape.index(64, "steps") {
             let len = model.len();
             let id = 1000 + step as u64;
             let tag = tape.below(5, "tag") as u8;
             let capacity = ours.capacity();
-            let allocs = alloc.allocs();
+            let allocs = counted.allocs();
             match tape.below(12, "op") {
                 8 => {
                     let at = tape.index(len + 1, "at");
@@ -1614,7 +1636,7 @@ fn soa_case(tape: &Tape) -> Result<(), Broke> {
                 0..=2 => {
                     ours.push(row(id, tag));
                     model.push(model_row(id, tag));
-                    if ours.capacity() != capacity && alloc.allocs() != allocs + 1 {
+                    if ours.capacity() != capacity && counted.allocs() != allocs + 1 {
                         return Err(Broke::Oracle(String::from("growth made more than one block")));
                     }
                 }
@@ -1653,8 +1675,8 @@ fn soa_case(tape: &Tape) -> Result<(), Broke> {
             if ours.wides().as_ptr().addr() % 64 != 0 {
                 return Err(Broke::Oracle(String::from("the over-aligned column is misaligned")));
             }
-            if alloc.live() > 1 {
-                return Err(Broke::Oracle(format!("{} blocks live for one vector", alloc.live())));
+            if counted.live() > 1 {
+                return Err(Broke::Oracle(format!("{} blocks live for one vector", counted.live())));
             }
             tokens::check(model.len())?;
         }
@@ -1665,8 +1687,7 @@ fn soa_case(tape: &Tape) -> Result<(), Broke> {
         same("a clone", copy.iter().map(unrow), model.iter().copied())?;
         tokens::check(2 * model.len())?;
     }
-    tokens::check(0)?;
-    alloc.check()
+    tokens::check(0)
 }
 
 #[test]
@@ -2483,14 +2504,20 @@ fn tree_bounds(tape: &Tape, span: u64) -> (Bound<u64>, Bound<u64>) {
 }
 
 fn btree_case(tape: &Tape) -> Result<(), Broke> {
-    tokens::fresh();
     let alloc = Counting::new();
+    btree_case_in(tape, &alloc)?;
+    alloc.check()
+}
+
+/// [`btree_case`] over any allocator, so `handle` runs it through an `Alloc` too.
+fn btree_case_in<A: Allocator + Copy>(tape: &Tape, alloc: A) -> Result<(), Broke> {
+    tokens::fresh();
     {
         // Small spans meet the same keys again; large ones and the runs below grow tall trees.
         let span = *tape.pick(&[24, 300, 3000], "span").unwrap_or(&24);
-        let mut ours: OwnMap<u64, Token, &Counting> = OwnMap::new_in(&alloc);
+        let mut ours: OwnMap<u64, Token, A> = OwnMap::new_in(alloc);
         let mut model: BTreeMap<u64, u64> = BTreeMap::new();
-        let mut set: OwnSet<u64, &Counting> = OwnSet::new_in(&alloc);
+        let mut set: OwnSet<u64, A> = OwnSet::new_in(alloc);
         let mut model_set: BTreeSet<u64> = BTreeSet::new();
         for _ in 0..tape.index(200, "steps") {
             let k = tape.below(span, "key");
@@ -3020,8 +3047,8 @@ fn make_try_forms_fail_cleanly_at_every_allocation() -> Result<(), Broke> {
         sorted.try_insert(2u64, OwnString::try_from_str_in("two", alloc)?)?;
         sorted.try_insert(1, OwnString::try_from_str_in("one", alloc)?)?;
         let sorted_copy = sorted.try_clone_in(alloc)?;
-        let mut sorted_set = SortedSet::new_in(alloc);
-        sorted_set.try_insert(3u64)?;
+        let sorted_set: SortedSet<u64, &Failing> =
+            SortedSet::from_sorted(Vec::try_from_in(&[1, 3][..], alloc)?).map_err(|e| Why::Changed(format!("{e}")))?;
         let sorted_set_copy = sorted_set.try_clone_in(alloc)?;
         let one = Box::try_new_in(8u64, alloc)?;
         let one_copy = Box::try_clone_in(&one, alloc)?;

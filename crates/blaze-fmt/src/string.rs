@@ -2,9 +2,6 @@
 
 // Format string literals.
 
-use unicode_properties::{GeneralCategory, UnicodeGeneralCategory};
-use unicode_segmentation::UnicodeSegmentation;
-
 use crate::config::Config;
 use crate::shape::Shape;
 use crate::utils::{unicode_str_width, wrap_str};
@@ -76,7 +73,7 @@ pub(crate) fn rewrite_string<'a>(
     // With this regex applied, all remaining whitespaces are significant
     let stripped_str = strip_line_breaks(orig);
 
-    let graphemes = UnicodeSegmentation::graphemes(&*stripped_str, false).collect::<Vec<&str>>();
+    let graphemes = blaze_unicode::graphemes(&stripped_str).collect::<Vec<&str>>();
 
     // `cur_start` is the position in `orig` of the start of the current line.
     let mut cur_start = 0;
@@ -380,7 +377,7 @@ fn is_whitespace(grapheme: &str) -> bool {
 fn is_punctuation(grapheme: &str) -> bool {
     grapheme
         .chars()
-        .all(|c| c.general_category() == GeneralCategory::OtherPunctuation)
+        .all(blaze_unicode::is_other_punctuation)
 }
 
 fn graphemes_width(graphemes: &[&str]) -> usize {

@@ -10,16 +10,16 @@ use std::hash::{Hash, Hasher};
 use std::mem;
 use std::sync::Arc;
 
-use anyhow::{Result, bail};
-use semver::Version;
-
 use crate::dependency::Dependency;
 use crate::edit_distance::closest_msg;
+use crate::error::ResolveError;
 use crate::interning::InternedString;
 use crate::names::validate_feature_name;
 use crate::package_id::PackageId;
 use crate::source_id::SourceId;
-use crate::version::RustVersion;
+use crate::version::{RustVersion, Version};
+
+type Result<T, E = ResolveError> = std::result::Result<T, E>;
 
 /// A package's id, dependencies, features, `links`, `rust-version` and, from a registry, its
 /// checksum and publish time. Equal and hashed by the id alone. Cheap to clone.
@@ -72,7 +72,7 @@ impl Summary {
     ) -> Result<Summary> {
         for dep in dependencies.iter() {
             if dep.is_optional() && !dep.is_transitive() {
-                bail!("dev-dependencies are not allowed to be optional: `{}`", dep.name_in_toml())
+                return Err(ResolveError::OptionalDevDependency { dep: dep.name_in_toml() });
             }
         }
         let feature_map = build_feature_map(
@@ -241,83 +241,59 @@ where
             match fv {
                 Feature(f) => {
                     if !features.contains_key(f) {
+                        let (feature, value) = (*feature, fv.clone()); // clone: error path
                         if !is_any_dep {
                             let closest = closest_msg(f, features.keys(), |k| k, "feature");
-                            bail!(
-                                "feature `{feature}` includes `{fv}` which is neither a dependency \
-                                 nor another feature{closest}"
-                            );
+                            return Err(ResolveError::FeatureUnknown { feature, value, closest });
                         }
                         if is_optional_dep {
                             if !map.contains_key(f) {
-                                bail!(
-                                    "feature `{feature}` includes `{fv}`, but `{f}` is an \
-                                     optional dependency without an implicit feature\n\
-                                     Use `dep:{f}` to enable the dependency."
-                                );
+                                let dep = *f;
+                                return Err(ResolveError::FeatureNoImplicit { feature, value, dep });
                             }
                         } else {
-                            bail!(
-                                "feature `{feature}` includes `{fv}`, but `{f}` is not an optional dependency\n\
-                                A non-optional dependency of the same name is defined; \
-                                consider adding `optional = true` to its definition."
-                            );
+                            let dep = *f;
+                            return Err(ResolveError::FeatureNotOptional { feature, value, dep });
                         }
                     }
                 }
                 Dep { dep_name } => {
+                    let (feature, value, dep) = (*feature, fv.clone(), *dep_name); // clone: error path
                     if !is_any_dep {
-                        bail!(
-                            "feature `{feature}` includes `{fv}`, but `{dep_name}` is not listed as a dependency"
-                        );
+                        return Err(ResolveError::FeatureDepNotListed { feature, value, dep });
                     }
                     if !is_optional_dep {
-                        bail!(
-                            "feature `{feature}` includes `{fv}`, but `{dep_name}` is not an optional dependency\n\
-                             A non-optional dependency of the same name is defined; \
-                             consider adding `optional = true` to its definition."
-                        );
+                        return Err(ResolveError::FeatureNotOptional { feature, value, dep });
                     }
                 }
                 DepFeature { dep_name, dep_feature, weak } => {
                     if dep_feature.contains('/') {
-                        bail!(
-                            "multiple slashes in feature `{fv}` (included by feature `{feature}`) are not allowed"
-                        );
+                        let value = fv.clone(); // clone: error path
+                        return Err(ResolveError::FeatureSlashes { feature: *feature, value });
                     }
                     if let Some(stripped_dep) = dep_name.strip_prefix("dep:") {
                         let has_other_dep = explicitly_listed.contains(stripped_dep);
                         let is_optional = dep_map.get(stripped_dep).is_some_and(|&o| o);
-                        let extra_help = if *weak || has_other_dep || !is_optional {
-                            String::new() // alloc: error path
-                        } else {
-                            format!(
-                                // alloc: error path
-                                "\nIf the intent is to avoid creating an implicit feature \
-                                 `{stripped_dep}` for an optional dependency, \
-                                 then consider replacing this with two values:\n    \
-                                 \"dep:{stripped_dep}\", \"{stripped_dep}/{dep_feature}\""
-                            )
-                        };
-                        bail!(
-                            "feature `{feature}` includes `{fv}` with both `dep:` and `/`\n\
-                            To fix this, remove the `dep:` prefix.{extra_help}"
-                        )
+                        let help = (!(*weak || has_other_dep || !is_optional))
+                            .then(|| (InternedString::new(stripped_dep), *dep_feature));
+                        let value = fv.clone(); // clone: error path
+                        return Err(ResolveError::FeatureDepAndSlash {
+                            feature: *feature,
+                            value,
+                            help,
+                        });
                     }
                     if !is_any_dep {
-                        bail!(MissingDependencyError {
+                        return Err(ResolveError::MissingDependency(MissingDependencyError {
                             feature: *feature,
                             feature_value: fv.clone(), // clone: error path
                             dep_name: *dep_name,
                             weak_optional: *weak,
-                        })
+                        }));
                     }
                     if *weak && !is_optional_dep {
-                        bail!(
-                            "feature `{feature}` includes `{fv}` with a `?`, but `{dep_name}` is not an optional dependency\n\
-                            A non-optional dependency of the same name is defined; \
-                            consider removing the `?` or changing the dependency to be optional"
-                        );
+                        let (feature, value, dep) = (*feature, fv.clone(), *dep_name); // clone: error path
+                        return Err(ResolveError::FeatureWeakNotOptional { feature, value, dep });
                     }
                 }
             }

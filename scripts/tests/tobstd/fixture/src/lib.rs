@@ -16,8 +16,8 @@ pub fn renamed(x: &mut u32) -> u32 {
     old
 }
 
-/// add-arg: a function with no allocator gains `alloc: A` and `A: Allocator + Copy`; its types
-/// follow.
+/// add-arg: a function with no allocator gains `alloc: blaze_own::Alloc<'_>` (no generic); its
+/// types follow.
 pub fn words(n: usize) -> Vec<u32> {
     let mut v = Vec::with_capacity(n);
     v.push(1);
@@ -39,7 +39,7 @@ pub fn listed<T: Copy>(items: &[T]) -> Vec<T> {
 }
 
 /// add-arg: an `alloc` already in scope: used, no parameter added.
-pub fn with_alloc<A: core::alloc::Allocator + Copy>(alloc: A) -> blaze_own::Vec<u8, A> {
+pub fn with_alloc(alloc: blaze_own::Alloc<'_>) -> blaze_own::AVec<'_, u8> {
     vec![1, 2, 3]
 }
 
@@ -49,18 +49,19 @@ pub fn evens(n: u32) -> usize {
 }
 
 /// add-arg: a method on a type that holds its allocator: `self.alloc`.
-pub struct Pool<A: core::alloc::Allocator + Copy> {
-    pub alloc: A,
+pub struct Pool<'a> {
+    pub alloc: blaze_own::Alloc<'a>,
 }
 
-impl<A: core::alloc::Allocator + Copy> Pool<A> {
+impl<'a> Pool<'a> {
     pub fn fresh(&self) -> usize {
         let b = Box::new(5u8);
         usize::from(*b)
     }
 }
 
-/// wall `trait-method`: `Default::default` takes no argument.
+/// wall `trait-method`: `Default::default` takes no argument; and wall `needs-lifetime`: `Bag`
+/// owns a `Vec`.
 pub struct Bag {
     pub items: Vec<u8>,
 }
@@ -93,20 +94,21 @@ pub fn make() -> usize {
     3
 }
 
-/// wall `name-taken`: a generic already named `A`.
+/// A generic already named `A`: no clash, the parameter's type is concrete.
 pub fn taken<A: Copy>(a: A) -> A {
     let _ = String::new();
     a
 }
 
-/// wall `fn-pointer`: `words` gains a parameter, and is passed as a value here.
+/// wall `fn-pointer`: `words` gains a parameter, and is passed as a value here (listed, not
+/// attempted).
 pub fn lengths(ns: &[usize]) -> usize {
     ns.iter().copied().map(words).count()
 }
 
 #[cfg(test)]
 mod tests {
-    /// A test passes `Global`.
+    /// A test passes `Alloc::global()`.
     #[test]
     fn a_test() {
         let v = vec![1u8];
@@ -114,7 +116,7 @@ mod tests {
     }
 }
 
-/// `entry`: `main` passes `Global` (in a library this is only a function named `main`).
+/// `entry`: `main` passes `Alloc::global()` (in a library this is only a function named `main`).
 pub fn main() {
     let s = format!("{}", 1);
     let _ = fmt::Debug::fmt;

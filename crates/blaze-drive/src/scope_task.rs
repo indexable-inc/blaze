@@ -116,6 +116,81 @@ pub fn module_scope<N: blaze_scope::Name, F: ScopeFacts<Name = N>, R: ScopeReads
     Err(ScopeTaskError::Steps { module })
 }
 
+/// One crate's facts for a round of its first fill (drive.md, "Scheduling on many cores" 5;
+/// parallel.md change 9): the `CrateRoot` record decoded once, its lists sorted as the resolver
+/// sorts them, and handed to every module of the round, so a fill of m modules decodes the root
+/// once, not m times per entry. Every other fact goes to the inner facts.
+///
+/// The resolver still copies the lists it keeps (blaze-scope's `Resolver::new_in`; a borrow
+/// there is that crate's change): what is shared here is the decode and the sort, and the
+/// resolver's own sort of an already sorted list is one pass.
+pub struct SharedRoot<'f, F: ScopeFacts> {
+    facts: &'f F,
+    krate: blaze_id::CrateItemKey,
+    root: blaze_surface::CrateRootBuilder<F::Name, F::Alloc>,
+}
+
+impl<'f, F: ScopeFacts> SharedRoot<'f, F> {
+    pub fn new(facts: &'f F, krate: blaze_id::CrateItemKey) -> Result<SharedRoot<'f, F>, SurfaceError> {
+        let mut root = facts.crate_root(krate)?;
+        root.extern_prelude.sort_unstable();
+        root.builtin_attrs.sort_unstable();
+        Ok(SharedRoot { facts, krate, root })
+    }
+}
+
+impl<F: ScopeFacts> ScopeFacts for SharedRoot<'_, F> {
+    type Name = F::Name;
+    type Alloc = F::Alloc;
+
+    fn module(&self, module: ItemKey) -> Result<blaze_scope::ModuleInfo<F::Name>, SurfaceError> {
+        self.facts.module(module)
+    }
+
+    fn decls(&self, module: ItemKey) -> Result<blaze_scope::DeclsBuilder<F::Name, F::Alloc>, SurfaceError> {
+        self.facts.decls(module)
+    }
+
+    fn crate_root(
+        &self,
+        krate: blaze_id::CrateItemKey,
+    ) -> Result<blaze_surface::CrateRootBuilder<F::Name, F::Alloc>, SurfaceError> {
+        match krate == self.krate {
+            true => Ok(self.root.clone()),
+            false => self.facts.crate_root(krate),
+        }
+    }
+
+    fn expansion(&self, call: ItemKey) -> Result<Option<blaze_scope::ExpandedDecls<F::Name, F::Alloc>>, SurfaceError> {
+        self.facts.expansion(call)
+    }
+}
+
+/// One round of a crate's first fill: an entry of every module in `modules` over one decoded
+/// root, each outcome pushed in order. A module's error is its own (rule 20): it is pushed as
+/// that module's outcome, and the round goes on.
+pub fn fill_round<N, F, R, A, B>(
+    facts: &F,
+    krate: blaze_id::CrateItemKey,
+    modules: &[ItemKey],
+    reads: &R,
+    alloc: A,
+    out: &mut Vec<Result<ScopeOutcome<N, A>, ScopeTaskError>, B>,
+) -> Result<(), SurfaceError>
+where
+    N: blaze_scope::Name,
+    F: ScopeFacts<Name = N>,
+    R: ScopeReads<N>,
+    A: Allocator + Clone,
+    B: Allocator,
+{
+    let shared = SharedRoot::new(facts, krate)?;
+    for module in modules {
+        out.push(module_scope(*module, &shared, reads, alloc.clone()));
+    }
+    Ok(())
+}
+
 fn add<A: Allocator>(needs: &mut Vec<Name, A>, name: Name) {
     if let Err(at) = needs.binary_search(&name) {
         needs.insert(at, name);

@@ -141,15 +141,18 @@ fn bad_path(path: &str) -> Option<&'static str> {
 /// is refused here. Folding is per character, so a `/` stays where it was and a folded path's
 /// directories are the folded directories.
 pub(crate) fn fold(path: &str) -> String {
-    use unicode_normalization::UnicodeNormalization as _;
-    let mut folded = String::with_capacity(path.len()); // alloc: once a path compared
-    for it in path.nfd() {
+    let mut decomposed = String::with_capacity(path.len()); // alloc: once a path compared
+    blaze_unicode::nfd(path, &mut decomposed);
+    let mut folded = String::with_capacity(decomposed.len()); // alloc: as above
+    for it in decomposed.chars() {
         match crate::casefold::FOLD.binary_search_by_key(&it, |row| row.0) {
             Ok(at) => folded.push_str(crate::casefold::FOLD[at].1),
             Err(_) => folded.push(it),
         }
     }
-    folded.nfd().collect() // alloc: as above
+    decomposed.clear();
+    blaze_unicode::nfd(&folded, &mut decomposed);
+    decomposed
 }
 
 /// Every rule of a tree over `entries`, sorted by path: no bad path, no two paths that are one

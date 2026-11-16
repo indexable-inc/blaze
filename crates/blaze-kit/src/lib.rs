@@ -71,8 +71,7 @@ pub mod table;
 pub mod union_find;
 pub mod wheel;
 
-// A test-only switch that plants a known bug, for the oracles' controls (rule 53).
-#[cfg(test)]
+// A switch that plants a known bug, for the oracles' controls (rule 53); `false` outside tests.
 mod plant;
 
 #[cfg(test)]

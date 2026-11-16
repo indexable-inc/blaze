@@ -5,8 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Context as _, bail};
-
+use super::error::{ConfigError, ConfigWhat};
 use super::{Config, SourceConfigDef, Value};
 use crate::files::Files;
 use crate::source::{self, CRATES_IO_REGISTRY, GitReference, SourceId, into_url};
@@ -33,31 +32,32 @@ pub enum Replacement {
 impl<F: Files> Config<F> {
     /// crates.io as cargo reaches it: its sparse index unless
     /// `registries.crates-io.protocol = "git"`.
-    pub fn crates_io_maybe_sparse_http(&self) -> anyhow::Result<SourceId> {
+    pub fn crates_io_maybe_sparse_http(&self) -> Result<SourceId, ConfigError> {
         let proto = self.get_string("registries.crates-io.protocol")?;
-        let is_sparse = match proto.as_ref().map(|v| v.val.as_str()) {
-            Some("sparse") | None => true,
-            Some("git") => false,
-            Some(unknown) => bail!(
-                "unsupported registry protocol `{unknown}` (defined in {})",
-                proto.as_ref().unwrap().definition
-            ),
+        let is_sparse = match &proto {
+            Some(v) if v.val == "sparse" => true,
+            None => true,
+            Some(v) if v.val == "git" => false,
+            Some(unknown) => {
+                return Err(ConfigError::new(ConfigWhat::UnsupportedProtocol {
+                    protocol: unknown.val.clone(),
+                    definition: unknown.definition.clone(),
+                }));
+            }
         };
         if is_sparse {
             self.check_registry_index_not_set()?;
             Ok(SourceId::crates_io_sparse())
         } else {
-            source::crates_io(self)
+            source::crates_io(self).map_err(ConfigError::foreign)
         }
     }
 
     /// Every `[source]` table, with crates.io's built-in one, by name.
-    pub fn source_configs(&self) -> anyhow::Result<BTreeMap<String, SourceConfig>> {
+    pub fn source_configs(&self) -> Result<BTreeMap<String, SourceConfig>, ConfigError> {
         let mut map = BTreeMap::new();
-        map.insert(
-            CRATES_IO_REGISTRY.to_owned(),
-            SourceConfig { id: source::crates_io(self)?, replace_with: None },
-        );
+        let crates_io = source::crates_io(self).map_err(ConfigError::foreign)?;
+        map.insert(CRATES_IO_REGISTRY.to_owned(), SourceConfig { id: crates_io, replace_with: None });
         let sources: Option<BTreeMap<String, SourceConfigDef>> = self.get("source")?;
         for (name, def) in sources.into_iter().flatten() {
             let config = self.source_config(&name, def)?;
@@ -66,25 +66,38 @@ impl<F: Files> Config<F> {
         Ok(map)
     }
 
-    fn source_config(&self, name: &str, def: SourceConfigDef) -> anyhow::Result<SourceConfig> {
+    fn source_config(
+        &self,
+        name: &str,
+        def: SourceConfigDef,
+    ) -> Result<SourceConfig, ConfigError> {
         let url = |val: &Value<String>, key: &str| {
-            into_url(&val.val).with_context(|| {
-                format!(
-                    "configuration key `{key}` specified an invalid URL (in {})",
-                    val.definition
-                )
+            into_url(&val.val).map_err(|e| {
+                ConfigError::foreign(e).context(ConfigWhat::InvalidSourceUrl {
+                    key: key.to_owned(),
+                    definition: val.definition.clone(),
+                })
             })
         };
         let mut srcs = Vec::new();
         if let Some(registry) = &def.registry {
             let url = url(registry, &format!("source.{name}.registry"))?;
-            srcs.push(SourceId::for_source_replacement_registry(&url, name)?);
+            srcs.push(
+                SourceId::for_source_replacement_registry(&url, name)
+                    .map_err(ConfigError::foreign)?,
+            );
         }
         if let Some(local_registry) = &def.local_registry {
-            srcs.push(SourceId::for_local_registry(&local_registry.resolve_path(self.cwd()))?);
+            srcs.push(
+                SourceId::for_local_registry(&local_registry.resolve_path(self.cwd()))
+                    .map_err(ConfigError::foreign)?,
+            );
         }
         if let Some(directory) = &def.directory {
-            srcs.push(SourceId::for_directory(&directory.resolve_path(self.cwd()))?);
+            srcs.push(
+                SourceId::for_directory(&directory.resolve_path(self.cwd()))
+                    .map_err(ConfigError::foreign)?,
+            );
         }
         if let Some(git) = &def.git {
             let url = url(git, &format!("source.{name}.git"))?;
@@ -94,15 +107,15 @@ impl<F: Files> Config<F> {
                 (None, None, Some(r)) => GitReference::Rev(r.val),
                 (None, None, None) => GitReference::DefaultBranch,
             };
-            srcs.push(SourceId::for_git(&url, reference)?);
+            srcs.push(SourceId::for_git(&url, reference).map_err(ConfigError::foreign)?);
         } else {
             for (key, v) in [("branch", &def.branch), ("tag", &def.tag), ("rev", &def.rev)] {
                 if let Some(val) = v {
-                    bail!(
-                        "source definition `source.{name}` specifies `{key}`, \
-                         but that requires a `git` key to be specified (in {})",
-                        val.definition
-                    );
+                    return Err(ConfigError::new(ConfigWhat::SourceNeedsGit {
+                        name: name.to_owned(),
+                        key,
+                        definition: val.definition.clone(),
+                    }));
                 }
             }
         }
@@ -110,12 +123,15 @@ impl<F: Files> Config<F> {
             srcs.push(self.crates_io_maybe_sparse_http()?);
         }
         let id = match srcs.len() {
-            0 => bail!(
-                "no source location specified for `source.{name}`, need \
-                 `registry`, `local-registry`, `directory`, or `git` defined"
-            ),
+            0 => {
+                let name = name.to_owned();
+                return Err(ConfigError::new(ConfigWhat::SourceNoLocation { name }));
+            }
             1 => srcs.pop().unwrap(),
-            _ => bail!("more than one source location specified for `source.{name}`"),
+            _ => {
+                let name = name.to_owned();
+                return Err(ConfigError::new(ConfigWhat::SourceTwoLocations { name }));
+            }
         };
         let replace_with = def.replace_with.map(|val| (val.val, val.definition.to_string()));
         Ok(SourceConfig { id, replace_with })
@@ -123,7 +139,7 @@ impl<F: Files> Config<F> {
 
     /// What serves the source named `name`, following `replace-with` as cargo's
     /// `SourceConfigMap::load` does, with its errors for a missing name and a cycle.
-    pub fn replacement(&self, name: &str) -> anyhow::Result<Replacement> {
+    pub fn replacement(&self, name: &str) -> Result<Replacement, ConfigError> {
         let cfgs = self.source_configs()?;
         let orig_name = name;
         let mut name = name;
@@ -134,10 +150,11 @@ impl<F: Files> Config<F> {
                 if source::alt_registry(self, name).is_ok() {
                     return Ok(Replacement::Registry(name.to_owned()));
                 }
-                bail!(
-                    "could not find a configured source with the name `{name}` when attempting to \
-                     lookup `{orig_name}` (configuration in `{cfg_loc}`)"
-                );
+                return Err(ConfigError::new(ConfigWhat::SourceNotFound {
+                    name: name.to_owned(),
+                    orig: orig_name.to_owned(),
+                    location: cfg_loc.to_owned(),
+                }));
             };
             match &cfg.replace_with {
                 Some((s, c)) => {
@@ -149,10 +166,10 @@ impl<F: Files> Config<F> {
                 None => return Ok(Replacement::Source(name.to_owned())),
             }
             if name == orig_name {
-                bail!(
-                    "detected a cycle of `replace-with` sources, the source `{name}` is eventually \
-                     replaced with itself (configuration in `{cfg_loc}`)"
-                );
+                return Err(ConfigError::new(ConfigWhat::SourceCycle {
+                    name: name.to_owned(),
+                    location: cfg_loc.to_owned(),
+                }));
             }
         }
     }

@@ -1,12 +1,18 @@
 //! [`ToValue`] and [`FromValue`], written by hand for the standard shapes.
 //!
-//! A struct implements them as reflection will (docs/v2/plan/design/std.md, `bstd::data`):
+//! A struct implements them as reflection will (docs/v2/plan/design/std.md, `bstd::data`), and
+//! as [`fields!`](crate::fields) writes them for a plain struct. Reading is strict by default:
+//! [`Cursor::fields`] refuses every key the closure did not take, after it returns, so a reader
+//! cannot leave the check out; [`Cursor::fields_allowing_extra`] is the opt-out, visible at the
+//! call and handing the extra keys back. No kind is read as another (`1` is no `true`, `"1"` no
+//! integer, `1.0` no integer, `1` no float but through [`Cursor::f64_or_int`]), an integer
+//! outside its type is refused, and an enum's name outside its variants is refused by
+//! [`Cursor::one_of`] listing them.
 //!
 //! ```ignore
 //! impl<A: Allocator + Clone> FromValue<A> for Run<A> {
 //!     fn from_value(c: &Cursor<'_, '_, A>) -> Result<Run<A>, ShapeError<A>> {
-//!         c.deny_unknown(&["suite", "ids"])?;
-//!         Ok(Run { suite: c.req("suite")?, ids: c.opt("ids")? })
+//!         c.fields(|f| Ok(Run { suite: f.take("suite")?, ids: f.take_opt("ids")? }))
 //!     }
 //! }
 //! impl<A: Allocator + Clone> ToValue<A> for Run<A> {
@@ -214,12 +220,12 @@ impl<A: Allocator + Clone> FromValue<A> for Int {
     }
 }
 
-/// A float, or an integer the float holds exactly; another integer is out of range.
+/// A float only: an integer is another kind, refused as every kind is (strict by default);
+/// [`Cursor::f64_or_int`] reads one where a reader asks for it by name.
 impl<A: Allocator + Clone> FromValue<A> for f64 {
     fn from_value(c: &Cursor<'_, '_, A>) -> Result<f64, ShapeError<A>> {
         match c.value() {
             Value::Float(f) => Ok(*f),
-            Value::Int(n) => n.as_f64_exact().ok_or_else(|| c.error(Shape::OutOfRange { ty: "f64" })),
             _ => Err(c.expected(Kind::Float)),
         }
     }

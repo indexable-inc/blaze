@@ -11,8 +11,6 @@
 
 use std::borrow::Cow;
 
-use unicode_width::UnicodeWidthStr as _;
-
 use crate::{Report, Severity, Span, Text};
 
 const RESET: &str = "\x1b[0m";
@@ -472,7 +470,7 @@ impl<'t> Atoms<'t> {
                         if word.is_empty() {
                             continue;
                         }
-                        let width = word.width();
+                        let width = blaze_unicode::str_width(word);
                         // alloc: a report's atoms, once
                         self.list.push(Atom { space, what: Piece::Word(word), width });
                         space = 0;
@@ -497,7 +495,7 @@ fn visible_width(text: &str) -> usize {
     let mut width = 0;
     let mut rest = text;
     while let Some((before, after)) = rest.split_once('\x1b') {
-        width += before.width();
+        width += blaze_unicode::str_width(before);
         rest = if let Some(params) = after.strip_prefix('[') {
             params
                 .split_once(|c: char| ('\x40'..='\x7e').contains(&c))
@@ -517,7 +515,7 @@ fn visible_width(text: &str) -> usize {
             after
         };
     }
-    width + rest.width()
+    width + blaze_unicode::str_width(rest)
 }
 
 #[cfg(test)]

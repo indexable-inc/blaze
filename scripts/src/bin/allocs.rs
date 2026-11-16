@@ -41,6 +41,7 @@ const DOC: &str = r#"allocs: what is left of the global heap in each crate only 
                       left in any crate (while some are, converting them to `Global` raises it)
                       (CI)
               write   write the list from the tree as it is
+              findings  print every site as a `blaze_script::finding` document (for `advise`)
     root      the checkout (".")
     base      the commit the change is against, or null: its list (`git show`) holds every
               row down, and the lines added since it (`git diff --unified=0`) name a crate's
@@ -104,7 +105,9 @@ use std::{
 };
 
 use blaze_script::{
-    TempDir, fail, git,
+    TempDir, fail,
+    finding::{self, Finding},
+    git,
     input::{self, Fields, Input, InputError},
     read_text,
     regex::Regex,
@@ -162,7 +165,7 @@ impl Input for Args {
 
     fn parse(f: &Fields<'_>) -> Result<Args, InputError> {
         Ok(Args {
-            command: f.one_of("command", &["check", "write"], None)?,
+            command: f.one_of("command", &["check", "write", "findings"], None)?,
             root: f.str("root", Some("."))?,
             base: f.str_or_null("base")?,
         })
@@ -213,6 +216,17 @@ impl Kind {
             Kind::Global => "lines that name `Global`",
             Kind::Signature => "function signatures that fix the caller's allocator (`blaze::unwritten_allocator`)",
         }
+    }
+
+    /// The kind as a finding (`blaze_script::finding`), for `advise`.
+    const fn finding(self) -> finding::Kind {
+        let instead = match self {
+            Kind::Comment => "delete the comment and name the allocator in the code it kept: `new_in(frame)`, or `new_in(Global)`",
+            Kind::Expect => "name the allocator where the item allocates, then drop the `allow`/`expect`",
+            Kind::Global => "the task's frame where the value dies with the task; `Global` only where it outlives it",
+            Kind::Signature => "make the function generic over `A: Allocator + Clone`, take `alloc: A`, and let the caller name `Global`",
+        };
+        finding::Kind { name: self.name(), label: self.what(), rule: "11 bump-allocate", instead, mechanical: false }
     }
 }
 
@@ -1023,6 +1037,13 @@ fn main_with(p: &Patterns, it: &Args) {
         fail(SCRIPT, &format!("{} has no crates/ directory", root.display()));
     }
     let counts = count(p, &root);
+    if it.command == "findings" {
+        let found = counts.iter().flat_map(|(krate, sites)| {
+            sites.iter().map(|it| Finding { krate: krate.clone(), file: it.path.clone(), line: it.line, kind: it.kind.name(), detail: None })
+        });
+        finding::print(SCRIPT, &KINDS.map(Kind::finding), found.collect());
+        return;
+    }
     let text = render(&counts);
     if it.command == "write" {
         if let Err(e) = std::fs::write(root.join(LIST), &text) {

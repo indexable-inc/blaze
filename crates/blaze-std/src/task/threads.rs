@@ -165,6 +165,8 @@ pub(crate) struct Header {
     state: AtomicU8,
     /// Runs the claimed task's body on `Here` and marks it done.
     run: unsafe fn(NonNull<Header>, Here),
+    /// Drops the claimed task's body unrun and marks it done.
+    discard: unsafe fn(NonNull<Header>),
     /// Gives up one reference to the job.
     release: unsafe fn(NonNull<Header>),
     pub(crate) name: &'static str,
@@ -189,6 +191,17 @@ pub(crate) struct JobPtr(NonNull<Header>);
 // field a second thread touches is atomic or written before the `Release` that publishes it;
 // the body (`F: Send`) and the result (`T: Send`) move to the thread that claims it.
 unsafe impl Send for JobPtr {}
+
+impl JobPtr {
+    /// Gives up the queue's reference to a job that was never queued (a refused reservation):
+    /// its handle drops the task unrun.
+    pub(crate) fn release_unrun(self) {
+        // SAFETY: the queue's reference, never put in a queue, given up once.
+        let head = unsafe { self.0.as_ref() };
+        // SAFETY: as above.
+        unsafe { (head.release)(self.0) };
+    }
+}
 
 /// What a scope shares with the threads that run its tasks.
 pub(crate) struct Tally {
@@ -226,6 +239,11 @@ impl Tally {
         if keep {
             *failed = Some((index, error));
         }
+    }
+
+    /// Cancels the scope: a join past its deadline does, before its last wait.
+    pub(crate) fn cancel(&self) {
+        self.cancel.cancel();
     }
 
     pub(crate) fn take_failed(&self) -> Option<(u32, TaskError)> {
@@ -301,6 +319,34 @@ impl<T> Queued<T> {
         self.header().done()
     }
 
+    pub(crate) fn name(&self) -> &'static str {
+        self.header().name
+    }
+
+    /// The scope's shared state.
+    pub(crate) fn tally(&self) -> &Tally {
+        // SAFETY: the handle holds a reference, so the job is alive.
+        unsafe { &self.head.as_ref().tally }
+    }
+
+    /// Drops the task unrun if nobody started it: whether it did.
+    pub(crate) fn drop_unstarted(&self) -> bool {
+        let header = self.header();
+        if !header.claim() {
+            return false;
+        }
+        // SAFETY: claimed by this thread just now.
+        unsafe { (header.discard)(NonNull::from(header)) };
+        true
+    }
+
+    /// Drops what it made, if it is still held: once [`Queued::done`].
+    pub(crate) fn drop_out(&self) {
+        assert!(self.done(), "bstd::task::threads: a task's result dropped before it ended");
+        // SAFETY: as `take`'s.
+        drop(unsafe { (*self.head.as_ref().out.get()).take() });
+    }
+
     /// What it made, once [`Queued::done`].
     pub(crate) fn take(&self) -> Ran<T> {
         assert!(self.done(), "bstd::task::threads: a task's result taken before it ended");
@@ -336,7 +382,13 @@ where
 {
     let job = Job {
         head: JobHead {
-            header: Header { state: AtomicU8::new(QUEUED), run: run::<F, T>, release: release::<F, T>, name },
+            header: Header {
+                state: AtomicU8::new(QUEUED),
+                run: run::<F, T>,
+                discard: discard::<F, T>,
+                release: release::<F, T>,
+                name,
+            },
             tally: Arc::clone(tally),
             out: UnsafeCell::new(None),
         },
@@ -373,6 +425,20 @@ where
     // SAFETY: claimed and not yet done: this thread alone touches the result until the store
     // of `DONE` below publishes it.
     unsafe { *job.head.out.get() = Some(ran) };
+    job.head.header.state.store(DONE, Ordering::Release);
+    job.head.tally.ended();
+}
+
+/// Drops a claimed job's body unrun and marks it done, with no result.
+///
+/// # Safety
+///
+/// `header` is the head of a live `Job<F, T>` this thread claimed.
+unsafe fn discard<F, T>(header: NonNull<Header>) {
+    // SAFETY: the caller's contract; `repr(C)` puts the header first.
+    let job = unsafe { header.cast::<Job<F, T>>().as_ref() };
+    // SAFETY: claimed, so this thread alone touches the body.
+    drop(unsafe { (*job.body.get()).take() });
     job.head.header.state.store(DONE, Ordering::Release);
     job.head.tally.ended();
 }

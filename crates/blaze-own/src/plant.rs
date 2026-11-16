@@ -22,6 +22,9 @@ pub(crate) enum Plant {
     /// The B-tree's merge of two internal nodes forgets the right one's last child (and the
     /// entry before it); the map's length follows, so only the entries tell.
     BTreeMergeForgetsChild,
+    /// An `Alloc` handle's `grow` entry allocates a fresh block instead: the old bytes are lost
+    /// and the old block is never freed.
+    HandleGrowAllocates,
 }
 
 std::thread_local! {

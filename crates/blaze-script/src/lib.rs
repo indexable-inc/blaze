@@ -23,6 +23,7 @@
 //! - [`engine`], [`report`]: harness/v2's `engine.py` and `report.py`, the blaze under test and
 //!   a run's result.
 //! - [`toml`]: TOML read by blaze-toml and lowered to blaze-data's `Value`.
+//! - [`finding`]: the record a ratchet's `findings` command prints and `advise` ranks.
 //!
 //! When a release carries bstd and reflection, a script's `Input::parse` is derived
 //! (`bstd::data`) and these become bstd's (`blaze::std_use` moves the callers).
@@ -33,6 +34,7 @@
 
 pub mod child;
 pub mod engine;
+pub mod finding;
 pub mod input;
 pub mod pyfmt;
 pub mod pyjson;

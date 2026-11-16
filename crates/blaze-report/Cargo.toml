@@ -19,7 +19,7 @@ blaze-toml.workspace = true
 serde = { workspace = true, features = ["derive"] }
 sonic-rs.workspace = true
 toml.workspace = true
-unicode-width.workspace = true
+blaze-unicode.workspace = true
 
 [dev-dependencies]
 blaze-protocol.workspace = true

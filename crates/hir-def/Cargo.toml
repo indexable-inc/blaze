@@ -9,9 +9,6 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
-[package.metadata.cargo-machete]
-ignored = ["unicode-ident"]
-
 [lib]
 doctest = false
 
@@ -57,9 +54,8 @@ blaze-phf.workspace = true
 blaze-memo.workspace = true
 blaze-record.workspace = true
 
-# This is a transitive dep, but we need to specify this
-# for the workspace-wide pinning
-unicode-ident.workspace = true
+# XID_Start and XID_Continue: a stability attribute's feature name is an identifier.
+blaze-unicode.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true

@@ -1013,6 +1013,16 @@ impl Regex {
         CaptureMatches { regex: self, walk: Walk { haystack, at: 0, last_end: None } }
     }
 
+    /// `haystack` with its first match replaced, as [`Regex::replace_all`] replaces each.
+    pub fn replace<'h, R: Replacer>(&self, haystack: &'h str, mut replacer: R) -> Cow<'h, str> {
+        let Some(caps) = self.captures(haystack) else { return Cow::Borrowed(haystack) };
+        let mut out = String::with_capacity(haystack.len());
+        out.push_str(&haystack[..caps.start()]);
+        replacer.replace_append(&caps, &mut out);
+        out.push_str(&haystack[caps.end()..]);
+        Cow::Owned(out)
+    }
+
     /// `haystack` with every match replaced: a `&str` replacement expands `$1`, `$name`,
     /// `${name}` and `$$` ([`Captures::expand`]); a closure writes what it returns.
     pub fn replace_all<'h, R: Replacer>(&self, haystack: &'h str, mut replacer: R) -> Cow<'h, str> {

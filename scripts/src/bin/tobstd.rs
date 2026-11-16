@@ -500,7 +500,7 @@ fn add_arg_shapes(rows: &[Row], roots: &[String], types: bool) -> (Vec<Shape>, B
             ("macro", _) => macro_shape(row, to),
             ("method", _) => method_shape(row, to),
             (_, "type") if types => type_shape(row, to),
-            (_, "type") => Err("a type gains its allocator only with `generic`".to_owned()),
+            (_, "type") => Err("a type gains its allocator only with value `alloc`".to_owned()),
             _ => Err(format!("a {} written as a {}: no shape this tool writes", row.kind, row.form)),
         };
         match shape {
@@ -782,14 +782,15 @@ fn context_rules() -> Vec<Rule> {
     ]
 }
 
-/// The type parameter named `field`'s type, or none: `struct S<T, A: Allocator> { buf: Vec<T, A>, alloc: A }` gives `alloc`.
+/// The struct's field that holds its allocator, or none: one of type `Alloc<..>`
+/// (`struct S<'a> { buf: AVec<'a, u8>, alloc: Alloc<'a> }` gives `alloc`), or of a type
+/// parameter bounded by `Allocator` (`struct S<T, A: Allocator> { .., alloc: A }`).
 fn alloc_field(text: &str) -> Option<String> {
-    let open = text.find('<')?;
     let body = text.find('{')?;
-    if open > body {
-        return None;
-    }
-    let generics = &text[open + 1..body];
+    let generics = match text.find('<') {
+        Some(open) if open < body => &text[open + 1..body],
+        _ => "",
+    };
     let bounded: Vec<&str> = generics
         .split(',')
         .filter(|it| it.contains("Allocator"))
@@ -801,7 +802,10 @@ fn alloc_field(text: &str) -> Option<String> {
     fields.split(',').find_map(|field| {
         let (name, ty) = field.split_once(':')?;
         let name = name.trim().trim_start_matches("pub(crate)").trim_start_matches("pub").trim();
-        bounded.contains(&ty.trim()).then(|| name.to_owned())
+        let ty = ty.trim();
+        let head = ty.split('<').next().unwrap_or(ty).trim();
+        let concrete = head.rsplit("::").next() == Some("Alloc");
+        (concrete || bounded.contains(&ty)).then(|| name.to_owned())
     })
 }
 
@@ -1124,7 +1128,27 @@ fn thread_sites(grep: &Grep<'_>, a: &Args, shapes: &[Shape], files: &[String], o
             }
         }
     }
+    needs_lifetime_walls(grep, shapes, files, out)?;
     apply_plan(grep, a, shapes, &ctx, &plan, &gaining, out)
+}
+
+/// A type definition whose fields name a collection that moves to blaze-own: it takes a
+/// lifetime and `Alloc<'a>`, which this tool leaves to a person or a lane.
+fn needs_lifetime_walls(grep: &Grep<'_>, shapes: &[Shape], files: &[String], out: &mut Summary) -> Result<(), ToolError> {
+    let def = o(&[("inside", o(&[("stopBy", s("end")), ("any", J::A(vec![o(&[("kind", s("struct_item"))]), o(&[("kind", s("enum_item"))]), o(&[("kind", s("union_item"))])]))]))]);
+    let rules: Vec<Rule> = shapes
+        .iter()
+        .filter(|sh| sh.is_type)
+        .enumerate()
+        .map(|(n, sh)| Rule { id: format!("def{n}"), rule: all(sh.rule.clone(), def.clone()), constraints: None, fix: None, transform: None })
+        .collect();
+    let defs: Vec<&Shape> = shapes.iter().filter(|sh| sh.is_type).collect();
+    for m in grep.query(&rules, files)? {
+        let n: usize = m.rule.trim_start_matches("def").parse().unwrap_or(0);
+        let row = defs.get(n).map_or("", |sh| sh.row.as_str());
+        out.wall("needs-lifetime", &m.file, m.line, &format!("`{row}` in a type definition"));
+    }
+    Ok(())
 }
 
 /// Applies the plan: per file, each expression's site rules inside its functions, then the
@@ -1218,6 +1242,8 @@ struct CompileError {
     start: usize,
     end: usize,
     message: String,
+    /// Its notes' and helps' messages, joined.
+    notes: String,
 }
 
 fn read_errors(out: &str, prefix: &str) -> Vec<CompileError> {
@@ -1233,15 +1259,17 @@ fn read_errors(out: &str, prefix: &str) -> Vec<CompileError> {
         }
         let code = msg.get("code").and_then(|c| c.get("code")).and_then(|c| c.as_str()).unwrap_or("").to_owned();
         let text = msg.get("message").and_then(|m| m.as_str()).unwrap_or("").to_owned();
+        let notes: Vec<&str> = msg.get("children").and_then(|c| c.as_array()).into_iter().flatten().filter_map(|c| c.get("message").and_then(|m| m.as_str())).collect();
+        let notes = notes.join("\n");
         let primary = msg.get("spans").and_then(|s| s.as_array()).and_then(|spans| spans.iter().find(|s| s.get("is_primary").and_then(|p| p.as_bool()) == Some(true)));
         let Some(span) = primary else {
-            errors.push(CompileError { code, file: String::new(), line: 0, start: 0, end: 0, message: text });
+            errors.push(CompileError { code, file: String::new(), line: 0, start: 0, end: 0, message: text, notes });
             continue;
         };
         let num = |k: &str| span.get(k).and_then(|n| n.as_u64()).map_or(0, |n| n as usize);
         let file = span.get("file_name").and_then(|f| f.as_str()).unwrap_or("");
         let file = file.strip_prefix(prefix).unwrap_or(file).trim_start_matches('/').to_owned();
-        errors.push(CompileError { code, file, line: num("line_start"), start: num("byte_start"), end: num("byte_end"), message: text });
+        errors.push(CompileError { code, file, line: num("line_start"), start: num("byte_start"), end: num("byte_end"), message: text, notes });
     }
     errors.sort_by(|a, b| (&a.file, a.start, &a.code).cmp(&(&b.file, b.start, &b.code)));
     errors.dedup();
@@ -1270,12 +1298,106 @@ fn call_rules(name: &str, given: usize, expr: &str, fns: &BTreeSet<String>) -> V
     ]
 }
 
-fn settle(grep: &Grep<'_>, a: &Args, root: &Path, out: &mut Summary) -> Result<(), ToolError> {
+/// The names an error prints for blaze-own's collections: the last segment of each type the
+/// table moves to `blaze_own`, and its alias with `A` before it (`Vec`, `AVec`).
+fn own_collections(rows: &[Row]) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for to in rows.iter().filter(|r| r.kind == "type").filter_map(|r| r.replacement.as_deref()) {
+        if root_of(to) != "blaze_own" {
+            continue;
+        }
+        let head = to.split('<').next().unwrap_or(to);
+        let last = head.rsplit("::").next().unwrap_or(head);
+        names.insert(format!("A{last}"));
+        names.insert(last.to_owned());
+    }
+    names
+}
+
+/// What an E0599 at a `.share()` says its receiver is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ShareSite {
+    /// A blaze-own collection over `Alloc`: `.clone_in(alloc)`.
+    Own,
+    /// Any other type, named: `.clone()` again.
+    Kept(String),
+    /// The trait's import is not seen there: `.clone()` again.
+    NotInScope,
+}
+
+/// The receiver's kind from the error's message ("no method named `share` found for struct
+/// `Vec<u8, Alloc<'_>>` in the current scope", "the method `share` exists for reference
+/// `&Foo`, but its trait bounds were not satisfied") and notes; none for another error.
+fn share_site(message: &str, notes: &str, own: &BTreeSet<String>) -> Option<ShareSite> {
+    if !message.contains("`share`") {
+        return None;
+    }
+    if notes.contains("not in scope") || notes.contains("trait is in scope") {
+        return Some(ShareSite::NotInScope);
+    }
+    let ty = message.split(" for ").nth(1).and_then(|it| it.split('`').nth(1)).unwrap_or("").to_owned();
+    let mut bare = ty.trim();
+    while let Some(rest) = bare.strip_prefix('&') {
+        bare = rest.trim_start().strip_prefix("mut ").unwrap_or(rest).trim_start();
+    }
+    let head = bare.split('<').next().unwrap_or(bare);
+    let last = head.rsplit("::").next().unwrap_or(head);
+    match own.contains(last) && bare.contains("Alloc") {
+        true => Some(ShareSite::Own),
+        false => Some(ShareSite::Kept(ty)),
+    }
+}
+
+/// A rule for the one `$R.share()` whose method name is at bytes `start..end` of `text`
+/// (ast-grep's `range` counts lines from 0 and columns in characters), fixed to `fix`.
+fn share_at_rule(id: String, text: &str, start: usize, end: usize, fix: String) -> Option<Rule> {
+    let point = |at: usize| -> Option<J> {
+        let before = text.get(..at)?;
+        let line_start = before.rfind('\n').map_or(0, |n| n + 1);
+        let line = before.matches('\n').count();
+        let column = before[line_start..].chars().count();
+        Some(o(&[("line", J::N(line)), ("column", J::N(column))]))
+    };
+    let name = o(&[("stopBy", s("end")), ("kind", s("field_identifier")), ("regex", s("^share$")), ("range", o(&[("start", point(start)?), ("end", point(end)?)]))]);
+    Some(Rule { id, rule: all(o(&[("pattern", s("$R.share()"))]), o(&[("has", name)])), constraints: None, fix: Some(fix), transform: None })
+}
+
+/// share-clone's first step: each file with a top-level `use` has its `.clone()` calls made
+/// `.share()` and gains the trait's import; then settle's loop sorts the calls out.
+fn share_clone(grep: &Grep<'_>, a: &Args, root: &Path, files: &[String], own: &BTreeSet<String>, out: &mut Summary) -> Result<(), ToolError> {
+    let first_use = o(&[("all", J::A(vec![
+        o(&[("pattern", s("$U"))]),
+        o(&[("kind", s("use_declaration"))]),
+        o(&[("inside", o(&[("kind", s("source_file"))]))]),
+        o(&[("not", o(&[("follows", o(&[("stopBy", s("end")), ("kind", s("use_declaration"))]))]))]),
+    ]))]);
+    let q = |id: &str, rule: J, fix: Option<String>| Rule { id: id.to_owned(), rule, constraints: None, fix, transform: None };
+    let clone = q("clone", o(&[("pattern", s("$R.clone()"))]), Some("$R.share()".to_owned()));
+    let found = grep.query(&[q("first-use", first_use.clone(), None), Rule { fix: None, ..clone.clone() }], files)?;
+    let with_use: BTreeSet<&str> = found.iter().filter(|m| m.rule == "first-use").map(|m| m.file.as_str()).collect();
+    let mut eligible = BTreeSet::new();
+    for m in found.iter().filter(|m| m.rule == "clone") {
+        match with_use.contains(m.file.as_str()) {
+            true => {
+                *out.sites.entry(".clone() to .share()".to_owned()).or_default() += 1;
+                eligible.insert(m.file.clone());
+            }
+            false => out.wall("no-use", &m.file, m.line, "a `.clone()` in a file with no top-level `use`"),
+        }
+    }
+    let eligible: Vec<String> = eligible.into_iter().collect();
+    grep.apply(&[clone], &eligible, PASSES)?;
+    // One pass: the import is then the file's first `use`, which a second pass would precede.
+    grep.apply(&[q("share-use", first_use, Some(format!("{SHARE_USE}\n$U")))], &eligible, 1)?;
+    settle(grep, a, root, Some(own), out)
+}
+
+fn settle(grep: &Grep<'_>, a: &Args, root: &Path, own: Option<&BTreeSet<String>>, out: &mut Summary) -> Result<(), ToolError> {
     let manifest = grep.dir.join("Cargo.toml");
     let prefix = grep.dir.strip_prefix(root).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
     for step in 0..=a.steps {
         if step == a.steps {
-            out.wall("steps", &a.krate, 0, &format!("{} checks run, E0061s left", a.steps));
+            out.wall("steps", &a.krate, 0, &format!("{} checks run, errors left", a.steps));
             return Ok(());
         }
         let argv = vec![a.cargo.clone(), "check".to_owned(), "--message-format=json".to_owned(), "--all-targets".to_owned(), "--manifest-path".to_owned(), manifest.display().to_string()];
@@ -1296,7 +1418,15 @@ fn settle(grep: &Grep<'_>, a: &Args, root: &Path, out: &mut Summary) -> Result<(
         let mut calls: BTreeMap<String, BTreeMap<(String, usize, String), BTreeSet<String>>> = BTreeMap::new();
         let mut left = Vec::new();
         let mut acting = Vec::new();
+        let mut sharing = Vec::new();
         for e in &errors {
+            if let Some(own) = own
+                && e.code == "E0599"
+                && let Some(site) = share_site(&e.message, &e.notes, own)
+            {
+                sharing.push((e, site));
+                continue;
+            }
             let callee = texts.get(&e.file).and_then(|t| t.get(e.start..e.end)).map(|t| t.rsplit("::").next().unwrap_or(t).rsplit('.').next().unwrap_or(t).trim().to_owned());
             let fits = e.code == "E0061" && arity(&e.message).is_some_and(|(w, g)| w == g + 1);
             match callee.filter(|c| fits && threaded.contains(c)) {
@@ -1329,6 +1459,54 @@ fn settle(grep: &Grep<'_>, a: &Args, root: &Path, out: &mut Summary) -> Result<(
                 }
             }
         }
+        // share-clone: each `.share()` the compiler refused, by file, at its own place.
+        let mut share_rules: BTreeMap<String, Vec<(Rule, &'static str, usize)>> = BTreeMap::new();
+        let own_ats: Vec<(String, usize)> = sharing.iter().filter(|(_, s)| *s == ShareSite::Own).map(|(e, _)| (e.file.clone(), e.start)).collect();
+        let own_cands = candidates(&ctx, a, &own_ats);
+        let own_sources: Vec<Source> = own_ats.iter().map(|(file, at)| source_of(&ctx, a, file, *at, Some(&own_cands))).collect();
+        let own_mixed = mixed_names(&ctx, &own_ats, &own_sources);
+        let mut own_sources = own_sources.into_iter();
+        let back = || ("$R.clone()".to_owned(), ".share() back to .clone()");
+        for (n, (e, site)) in sharing.iter().enumerate() {
+            let (fix, row) = match site {
+                ShareSite::Own => {
+                    let name = innermost(&ctx, &e.file, e.start).map(|f| f.name.clone()).unwrap_or_default();
+                    let source = own_sources.next().unwrap_or(Source::Wall("outside", String::new()));
+                    let source = if own_mixed.contains(&(e.file.clone(), name.clone())) {
+                        Source::Wall("ambiguous", format!("`{name}` names functions of the file whose sites differ"))
+                    } else {
+                        source
+                    };
+                    match source {
+                        Source::Expr(x) => (format!("$R.clone_in({x})"), ".share() to .clone_in"),
+                        Source::Gain(f, g, _) => {
+                            gaining.insert((f, g));
+                            (format!("$R.clone_in({})", a.value), ".share() to .clone_in")
+                        }
+                        Source::Wall(kind, what) => {
+                            out.wall(kind, &e.file, e.line, format!("a `.share()` of a blaze-own collection {what}").trim());
+                            back()
+                        }
+                    }
+                }
+                ShareSite::Kept(ty) => {
+                    out.wall("kept-clone", &e.file, e.line, &format!("`{ty}`"));
+                    back()
+                }
+                ShareSite::NotInScope => {
+                    out.wall("not-in-scope", &e.file, e.line, "the module does not see the file's `blaze_own::Share` import");
+                    back()
+                }
+            };
+            let text = texts.get(&e.file).map_or("", String::as_str);
+            match share_at_rule(format!("share{n}"), text, e.start, e.end, fix) {
+                Some(rule) => {
+                    share_rules.entry(e.file.clone()).or_default().push((rule, row, e.line));
+                    acted = true;
+                }
+                None => out.wall("unmatched", &e.file, e.line, "a `.share()` error whose place is not in its file"),
+            }
+        }
         if !acted {
             for e in left {
                 out.wall("error", &e.file, e.line, &format!("{} {}", e.code, e.message).trim().to_owned());
@@ -1336,6 +1514,21 @@ fn settle(grep: &Grep<'_>, a: &Args, root: &Path, out: &mut Summary) -> Result<(
             return Ok(());
         }
         let mut changed = 0;
+        // The `.share()` sites first: their places are the check's, before any other edit.
+        for (file, planned) in &share_rules {
+            let rules: Vec<Rule> = planned.iter().map(|(r, _, _)| r.clone()).collect();
+            let applied = grep.apply(&rules, &[file.clone()], 1)?;
+            changed += applied;
+            if applied == planned.len() {
+                for (_, row, _) in planned {
+                    *out.sites.entry((*row).to_owned()).or_default() += 1;
+                }
+            } else {
+                let lines: Vec<String> = planned.iter().map(|(_, _, l)| l.to_string()).collect();
+                out.wall("unmatched", file, planned[0].2, &format!("{} of {} `.share()` sites rewritten (lines {})", applied, planned.len(), lines.join(", ")));
+            }
+        }
+        let mut called = 0;
         for (file, by) in &calls {
             let rules: Vec<Rule> = by
                 .iter()
@@ -1347,9 +1540,12 @@ fn settle(grep: &Grep<'_>, a: &Args, root: &Path, out: &mut Summary) -> Result<(
                     })
                 })
                 .collect();
-            changed += grep.apply(&rules, &[file.clone()], 1)?;
+            called += grep.apply(&rules, &[file.clone()], 1)?;
         }
-        *out.sites.entry("E0061".to_owned()).or_default() += changed;
+        if called > 0 {
+            *out.sites.entry("E0061".to_owned()).or_default() += called;
+        }
+        changed += called;
         if changed == 0 {
             // The errors' calls are where ast-grep's rules do not reach: a macro's tokens.
             for e in errors.iter().filter(|e| e.code == "E0061") {
@@ -1402,11 +1598,16 @@ fn run_mode(a: &Args) -> Result<Summary, ToolError> {
         }
         Mode::AddArg => {
             let text = std::fs::read_to_string(root.join(TABLE)).map_err(|e| ToolError::File { path: TABLE.to_owned(), why: e.to_string() })?;
-            let (shapes, skipped) = add_arg_shapes(&read_table(&text)?, &a.roots, a.generic.is_some());
+            let (shapes, skipped) = add_arg_shapes(&read_table(&text)?, &a.roots, a.value == "alloc");
             out.skipped = skipped;
             thread_sites(&grep, a, &shapes, &files, &mut out)?;
         }
-        Mode::Settle => settle(&grep, a, &root, &mut out)?,
+        Mode::Settle => settle(&grep, a, &root, None, &mut out)?,
+        Mode::ShareClone => {
+            let text = std::fs::read_to_string(root.join(TABLE)).map_err(|e| ToolError::File { path: TABLE.to_owned(), why: e.to_string() })?;
+            let own = own_collections(&read_table(&text)?);
+            share_clone(&grep, a, &root, &files, &own, &mut out)?;
+        }
     }
     Ok(out)
 }
@@ -1428,9 +1629,9 @@ fn args(krate: &str, mode: Mode, root: &str) -> Args {
         mode,
         steps: 8,
         value: "alloc".to_owned(),
-        ty: "A".to_owned(),
-        generic: Some("A: core::alloc::Allocator + Copy".to_owned()),
-        entry: Some("std::alloc::Global".to_owned()),
+        ty: ALLOC_TYPE.to_owned(),
+        generic: None,
+        entry: Some(ALLOC_ENTRY.to_owned()),
         roots: vec!["core".to_owned(), "blaze_own".to_owned()],
         cargo: String::new(),
         root: root.to_owned(),
@@ -1467,7 +1668,21 @@ fn selftest() {
     expect(arity("this method takes 1 argument but 0 arguments were supplied") == Some((1, 0)), "E0061's counts for a method");
     expect(has_param("(&self, x: u8, mut alloc: A)", "alloc") && !has_param("(allocs: u8)", "alloc"), "a parameter by name");
     expect(alloc_field("struct S<T, A: Allocator + Copy> { buf: Vec<T, A>, pub alloc: A }").as_deref() == Some("alloc"), "a struct's allocator field");
+    expect(alloc_field("struct S<'a> { buf: Vec<u8>, pub(crate) alloc: blaze_own::Alloc<'a> }").as_deref() == Some("alloc"), "a struct's concrete allocator field");
     expect(package_name("[package]\nname = \"x\"\n") == Some("x".to_owned()), "a package's name");
+    // share-clone's classifier, from E0599's messages.
+    let own: BTreeSet<String> = ["Vec", "AVec", "String"].into_iter().map(str::to_owned).collect();
+    let site = |m: &str, notes: &str| share_site(m, notes, &own);
+    expect(site("no method named `share` found for struct `Vec<u8, Alloc<'_>>` in the current scope", "") == Some(ShareSite::Own), "a blaze-own collection's share");
+    expect(site("the method `share` exists for reference `&blaze_own::Vec<u8, Alloc<'_>>`, but its trait bounds were not satisfied", "") == Some(ShareSite::Own), "a reference to one");
+    expect(site("no method named `share` found for struct `Vec<u8>` in the current scope", "") == Some(ShareSite::Kept("Vec<u8>".to_owned())), "std's `Vec` keeps `.clone()`");
+    expect(site("no method named `share` found for type parameter `T` in the current scope", "") == Some(ShareSite::Kept("T".to_owned())), "a type parameter keeps `.clone()`");
+    expect(site("no method named `share` found for struct `Arc<u8>` in the current scope", "items from traits can only be used if the trait is in scope") == Some(ShareSite::NotInScope), "an import not seen");
+    expect(site("no method named `push` found for struct `Vec<u8>`", "").is_none(), "another method's error");
+    let text = "fn f() {\n    let s = \"é\"; let t = a.share();\n}\n";
+    let at = text.find("share").unwrap_or(0);
+    let r = share_at_rule("x".to_owned(), text, at, at + 5, "$R.clone()".to_owned());
+    expect(r.is_some_and(|r| r.rule.text().contains("\"line\": 1") && r.rule.text().contains("\"column\": 27")), "a place in lines from 0 and columns in characters");
 
     // The fixture, through ast-grep.
     let here = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/tobstd");

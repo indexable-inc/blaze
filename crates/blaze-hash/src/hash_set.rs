@@ -6,7 +6,6 @@
 use core::{
     alloc::Allocator,
     fmt,
-    hash::{BuildHasher, Hash},
     iter::FusedIterator,
     ops::{BitAnd, BitOr, BitXor, Sub},
 };
@@ -14,12 +13,20 @@ use core::{
 use blaze_own::AllocFailure;
 
 use crate::{
-    Equivalent,
+    Equivalent, KeyHash, Plain,
     hash_map::{self, Entry, Map},
 };
 
-/// A set on the hasher `S`, in the allocator `A`.
+/// A set on the hasher `S`, in the allocator `A`: a `BuildHasher` or [`Plain`], as [`Map`]'s.
 pub struct Set<T, S, A: Allocator>(Map<T, (), S, A>);
+
+impl<T, A: Allocator> Set<T, Plain, A> {
+    /// An empty set in `alloc` hashed by [`hash_plain`](crate::hash_plain).
+    #[inline]
+    pub const fn plain_in(alloc: A) -> Self {
+        Set(Map::plain_in(alloc))
+    }
+}
 
 impl<T, S: Default, A: Allocator> Set<T, S, A> {
     /// An empty set in `alloc`; it allocates nothing until the first insert.
@@ -97,7 +104,7 @@ impl<T, S, A: Allocator> Set<T, S, A> {
     }
 }
 
-impl<T: Eq + Hash, S: BuildHasher + Default, A: Allocator> Set<T, S, A> {
+impl<T: Eq, S: KeyHash<T> + Default, A: Allocator> Set<T, S, A> {
     /// The set of `iter`'s elements in `alloc`: what `collect()` makes, with the allocator
     /// named.
     #[inline]
@@ -109,7 +116,7 @@ impl<T: Eq + Hash, S: BuildHasher + Default, A: Allocator> Set<T, S, A> {
     }
 }
 
-impl<T: Eq + Hash, S: BuildHasher, A: Allocator> Set<T, S, A> {
+impl<T: Eq, S: KeyHash<T>, A: Allocator> Set<T, S, A> {
     #[inline]
     pub fn reserve(&mut self, additional: usize) {
         self.0.reserve(additional);
@@ -157,25 +164,37 @@ impl<T: Eq + Hash, S: BuildHasher, A: Allocator> Set<T, S, A> {
     }
 
     #[inline]
-    pub fn contains<Q: ?Sized + Hash + Equivalent<T>>(&self, value: &Q) -> bool {
+    pub fn contains<Q: ?Sized + Equivalent<T>>(&self, value: &Q) -> bool
+    where
+        S: KeyHash<Q>,
+    {
         self.0.contains_key(value)
     }
 
     /// The held element equal to `value`.
     #[inline]
-    pub fn get<Q: ?Sized + Hash + Equivalent<T>>(&self, value: &Q) -> Option<&T> {
+    pub fn get<Q: ?Sized + Equivalent<T>>(&self, value: &Q) -> Option<&T>
+    where
+        S: KeyHash<Q>,
+    {
         self.0.get_key_value(value).map(|(it, ())| it)
     }
 
     /// Removes `value`: whether it was held.
     #[inline]
-    pub fn remove<Q: ?Sized + Hash + Equivalent<T>>(&mut self, value: &Q) -> bool {
+    pub fn remove<Q: ?Sized + Equivalent<T>>(&mut self, value: &Q) -> bool
+    where
+        S: KeyHash<Q>,
+    {
         self.0.remove(value).is_some()
     }
 
     /// Removes and returns the held element equal to `value`.
     #[inline]
-    pub fn take<Q: ?Sized + Hash + Equivalent<T>>(&mut self, value: &Q) -> Option<T> {
+    pub fn take<Q: ?Sized + Equivalent<T>>(&mut self, value: &Q) -> Option<T>
+    where
+        S: KeyHash<Q>,
+    {
         self.0.remove_entry(value).map(|(it, ())| it)
     }
 
@@ -312,7 +331,7 @@ impl<T: fmt::Debug, A: Allocator> fmt::Debug for Drain<'_, T, A> {
 /// The elements a set operation has not yet yielded, listed from a copy of it, as hashbrown's.
 macro_rules! debug_by_clone {
     ($($name:ident),* $(,)?) => {$(
-        impl<T: fmt::Debug + Eq + Hash, S: BuildHasher, A: Allocator> fmt::Debug
+        impl<T: fmt::Debug + Eq, S: KeyHash<T>, A: Allocator> fmt::Debug
             for $name<'_, T, S, A>
         {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -337,7 +356,7 @@ impl<T, S, A: Allocator> Clone for Difference<'_, T, S, A> {
     }
 }
 
-impl<'a, T: Eq + Hash, S: BuildHasher, A: Allocator> Iterator for Difference<'a, T, S, A> {
+impl<'a, T: Eq, S: KeyHash<T>, A: Allocator> Iterator for Difference<'a, T, S, A> {
     type Item = &'a T;
 
     #[inline]
@@ -352,7 +371,7 @@ impl<'a, T: Eq + Hash, S: BuildHasher, A: Allocator> Iterator for Difference<'a,
     }
 }
 
-impl<T: Eq + Hash, S: BuildHasher, A: Allocator> FusedIterator for Difference<'_, T, S, A> {}
+impl<T: Eq, S: KeyHash<T>, A: Allocator> FusedIterator for Difference<'_, T, S, A> {}
 
 /// The elements of both sets: [`Set::intersection`].
 pub struct Intersection<'a, T, S, A: Allocator> {
@@ -367,7 +386,7 @@ impl<T, S, A: Allocator> Clone for Intersection<'_, T, S, A> {
     }
 }
 
-impl<'a, T: Eq + Hash, S: BuildHasher, A: Allocator> Iterator for Intersection<'a, T, S, A> {
+impl<'a, T: Eq, S: KeyHash<T>, A: Allocator> Iterator for Intersection<'a, T, S, A> {
     type Item = &'a T;
 
     #[inline]
@@ -382,7 +401,7 @@ impl<'a, T: Eq + Hash, S: BuildHasher, A: Allocator> Iterator for Intersection<'
     }
 }
 
-impl<T: Eq + Hash, S: BuildHasher, A: Allocator> FusedIterator for Intersection<'_, T, S, A> {}
+impl<T: Eq, S: KeyHash<T>, A: Allocator> FusedIterator for Intersection<'_, T, S, A> {}
 
 /// The elements of either set, each once: [`Set::union`].
 pub struct Union<'a, T, S, A: Allocator> {
@@ -397,7 +416,7 @@ impl<T, S, A: Allocator> Clone for Union<'_, T, S, A> {
     }
 }
 
-impl<'a, T: Eq + Hash, S: BuildHasher, A: Allocator> Iterator for Union<'a, T, S, A> {
+impl<'a, T: Eq, S: KeyHash<T>, A: Allocator> Iterator for Union<'a, T, S, A> {
     type Item = &'a T;
 
     #[inline]
@@ -412,7 +431,7 @@ impl<'a, T: Eq + Hash, S: BuildHasher, A: Allocator> Iterator for Union<'a, T, S
     }
 }
 
-impl<T: Eq + Hash, S: BuildHasher, A: Allocator> FusedIterator for Union<'_, T, S, A> {}
+impl<T: Eq, S: KeyHash<T>, A: Allocator> FusedIterator for Union<'_, T, S, A> {}
 
 /// The elements of exactly one of two sets: [`Set::symmetric_difference`].
 pub struct SymmetricDifference<'a, T, S, A: Allocator> {
@@ -427,7 +446,7 @@ impl<T, S, A: Allocator> Clone for SymmetricDifference<'_, T, S, A> {
     }
 }
 
-impl<'a, T: Eq + Hash, S: BuildHasher, A: Allocator> Iterator
+impl<'a, T: Eq, S: KeyHash<T>, A: Allocator> Iterator
     for SymmetricDifference<'a, T, S, A>
 {
     type Item = &'a T;
@@ -443,7 +462,7 @@ impl<'a, T: Eq + Hash, S: BuildHasher, A: Allocator> Iterator
     }
 }
 
-impl<T: Eq + Hash, S: BuildHasher, A: Allocator> FusedIterator
+impl<T: Eq, S: KeyHash<T>, A: Allocator> FusedIterator
     for SymmetricDifference<'_, T, S, A>
 {
 }
@@ -471,14 +490,14 @@ impl<T: fmt::Debug, S, A: Allocator> fmt::Debug for Set<T, S, A> {
 }
 
 /// The same elements, whatever the order.
-impl<T: Eq + Hash, S: BuildHasher, A: Allocator> PartialEq for Set<T, S, A> {
+impl<T: Eq, S: KeyHash<T>, A: Allocator> PartialEq for Set<T, S, A> {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
         self.0 == other.0
     }
 }
 
-impl<T: Eq + Hash, S: BuildHasher, A: Allocator> Eq for Set<T, S, A> {}
+impl<T: Eq, S: KeyHash<T>, A: Allocator> Eq for Set<T, S, A> {}
 
 impl<T, S, A: Allocator> IntoIterator for Set<T, S, A> {
     type Item = T;
@@ -502,7 +521,7 @@ impl<'a, T, S, A: Allocator> IntoIterator for &'a Set<T, S, A> {
 
 /// `collect()` into a set in an allocator that is `Default` (`Global`); one in a frame is
 /// made with [`Set::from_iter_in`]. The ratchet's, as [`Default`].
-impl<T: Eq + Hash, S: BuildHasher + Default, A: Allocator + Default> FromIterator<T>
+impl<T: Eq, S: KeyHash<T> + Default, A: Allocator + Default> FromIterator<T>
     for Set<T, S, A>
 {
     #[inline]
@@ -511,14 +530,14 @@ impl<T: Eq + Hash, S: BuildHasher + Default, A: Allocator + Default> FromIterato
     }
 }
 
-impl<T: Eq + Hash, S: BuildHasher, A: Allocator> Extend<T> for Set<T, S, A> {
+impl<T: Eq, S: KeyHash<T>, A: Allocator> Extend<T> for Set<T, S, A> {
     #[inline]
     fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
         self.0.extend(iter.into_iter().map(|it| (it, ())));
     }
 }
 
-impl<'a, T: 'a + Eq + Hash + Copy, S: BuildHasher, A: Allocator> Extend<&'a T> for Set<T, S, A> {
+impl<'a, T: 'a + Eq + Copy, S: KeyHash<T>, A: Allocator> Extend<&'a T> for Set<T, S, A> {
     #[inline]
     fn extend<I: IntoIterator<Item = &'a T>>(&mut self, iter: I) {
         self.extend(iter.into_iter().copied());
@@ -530,8 +549,8 @@ macro_rules! set_operator {
     ($($trait:ident $method:ident $walk:ident),*) => {$(
         impl<T, S, A> $trait<&Set<T, S, A>> for &Set<T, S, A>
         where
-            T: Eq + Hash + Clone,
-            S: BuildHasher + Default,
+            T: Eq + Clone,
+            S: KeyHash<T> + Default,
             A: Allocator + Default,
         {
             type Output = Set<T, S, A>;
@@ -562,8 +581,8 @@ impl<T: serde::Serialize, S, A: Allocator> serde::Serialize for Set<T, S, A> {
 #[cfg(feature = "serde")]
 impl<'de, T, S, A> serde::Deserialize<'de> for Set<T, S, A>
 where
-    T: serde::Deserialize<'de> + Eq + Hash,
-    S: BuildHasher + Default,
+    T: serde::Deserialize<'de> + Eq,
+    S: KeyHash<T> + Default,
     A: Allocator + Default,
 {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -573,8 +592,8 @@ where
 
         impl<'de, T, S, A> serde::de::Visitor<'de> for Elements<T, S, A>
         where
-            T: serde::Deserialize<'de> + Eq + Hash,
-            S: BuildHasher + Default,
+            T: serde::Deserialize<'de> + Eq,
+            S: KeyHash<T> + Default,
             A: Allocator + Default,
         {
             type Value = Set<T, S, A>;

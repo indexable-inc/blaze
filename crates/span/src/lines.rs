@@ -29,7 +29,6 @@ use std::fmt;
 
 use blaze_ids::bits::below;
 use blaze_text_size::TextSize;
-use unicode_width::UnicodeWidthChar;
 
 pub use self::simd::Kernel;
 
@@ -339,6 +338,6 @@ pub fn char_width(ch: char) -> usize {
         | '\u{7f}'
         | '\u{202a}'..='\u{202e}'
         | '\u{2066}'..='\u{2069}' => 1,
-        _ => UnicodeWidthChar::width(ch).unwrap_or(1),
+        _ => blaze_unicode::char_width(ch).unwrap_or(1),
     }
 }

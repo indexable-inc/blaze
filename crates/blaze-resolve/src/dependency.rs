@@ -89,13 +89,10 @@ impl Dependency {
     ) -> Result<Dependency> {
         let name = name.into();
         let (specified_req, version_req) = match version {
-            Some(v) => match VersionReq::parse(v) {
+            Some(v) => match parse_req(v) {
                 Ok(req) => (true, OptVersionReq::Req(req)),
-                Err(err) => {
-                    return Err(anyhow::Error::new(err).context(format!(
-                        "failed to parse the version requirement `{}` for dependency `{}`",
-                        v, name,
-                    )));
+                Err(error) => {
+                    return Err(ResolveError::DependencyReq { name, req: v.to_owned(), error });
                 }
             },
             None => (false, OptVersionReq::Any),
@@ -261,7 +258,7 @@ impl Dependency {
     }
 
     /// Pins the version only, as `[patch]` and `[replace]` do.
-    pub fn lock_version(&mut self, version: &semver::Version) -> &mut Dependency {
+    pub fn lock_version(&mut self, version: &Version) -> &mut Dependency {
         Arc::make_mut(&mut self.inner).req.lock_to(version);
         self
     }

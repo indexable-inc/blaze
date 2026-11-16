@@ -7,8 +7,8 @@ use std::borrow::Cow;
 use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
-use anyhow::Context as _;
-use cargo_util_schemas::manifest::TomlManifest;
+use crate::error::ManifestError;
+use crate::schema::TomlManifest;
 
 pub trait Files {
     /// The bytes of the file at `path`: borrowed where the files are kept already (a view's,
@@ -17,10 +17,10 @@ pub trait Files {
     /// The manifest at `path` parsed, as [`crate::manifest::read_manifest`] reads it, with its
     /// errors: one that can't be read, isn't UTF-8 or isn't TOML of a manifest names `path`.
     /// A `Files` that keeps manifests parsed answers from them, so nothing parses one twice.
-    fn manifest(&self, path: &Path) -> anyhow::Result<TomlManifest> {
-        // alloc: an error's context, made only when the read fails.
-        let bytes =
-            self.read(path).with_context(|| format!("failed to read `{}`", path.display()))?;
+    fn manifest(&self, path: &Path) -> Result<TomlManifest, ManifestError> {
+        let bytes = self
+            .read(path)
+            .map_err(|error| ManifestError::Read { path: path.to_owned(), error })?;
         crate::manifest::parse_manifest(path, &bytes)
     }
     /// What is at `path`, following links; `None` for nothing there.

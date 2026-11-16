@@ -11,6 +11,7 @@
 pub mod config;
 pub mod dependency;
 pub mod diagnostic;
+pub mod error;
 pub mod features;
 pub mod files;
 pub mod home;
@@ -18,6 +19,7 @@ pub mod manifest;
 pub mod metadata;
 pub mod paths;
 pub mod profiles;
+pub mod schema;
 pub mod source;
 pub mod targets;
 pub mod user_config;
@@ -26,5 +28,6 @@ pub mod workspace;
 use stdx::edit_distance::cargo as edit_distance;
 
 pub use config::Config;
+pub use error::ManifestError;
 pub use manifest::Context;
 pub use workspace::Workspace;

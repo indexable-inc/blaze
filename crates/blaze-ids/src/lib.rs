@@ -648,7 +648,9 @@ mod tests {
     #[test]
     fn a_warm_of_many_into_allocates_nothing() {
         let bytes: Vec<u8> = (0..2_000u32).map(|n| n as u8).collect();
-        let inputs: Vec<&[u8]> = (0..600).map(|n| &bytes[n % 7..n % 7 + n % 1_100]).collect();
+        // Under Miri, enough inputs for every lane count `of_many` batches by.
+        let count = if cfg!(miri) { 40 } else { 600 };
+        let inputs: Vec<&[u8]> = (0..count).map(|n| &bytes[n % 7..n % 7 + n % 1_100]).collect();
         let expected = ContentId::of_many("blaze v2 a 1", &inputs);
         let mut out = Vec::new();
         ContentId::of_many_into("blaze v2 a 1", &inputs, &mut out);
@@ -890,9 +892,11 @@ mod tests {
     #[cfg(not(blaze_check))]
     #[test]
     fn an_interner_maps_both_ways() {
+        // Under Miri, enough for each shard's index to grow four times and three slot chunks.
+        const COUNT: u64 = if cfg!(miri) { 300 } else { 20_000 };
         let interner = Sharded::<u64>::new(SHARDS);
-        let indices: Vec<_> = (0..20_000).map(|n| interner.intern(id(n), || n)).collect();
-        assert_eq!(interner.len(), 20_000);
+        let indices: Vec<_> = (0..COUNT).map(|n| interner.intern(id(n), || n)).collect();
+        assert_eq!(interner.len(), COUNT as usize);
         for (n, &idx) in indices.iter().enumerate() {
             let n = n as u64;
             assert_eq!(*interner.get(idx), n);
@@ -901,7 +905,7 @@ mod tests {
             assert_eq!(interner.intern(id(n), || unreachable!("interned twice")), idx);
         }
         assert_eq!(interner.find(&id(1 << 40)), None);
-        assert_eq!(interner.len(), 20_000);
+        assert_eq!(interner.len(), COUNT as usize);
     }
 
     #[cfg(not(blaze_check))]
@@ -910,7 +914,8 @@ mod tests {
         let interner = Sharded::<String>::new(SHARDS);
         let first = interner.intern(id(0), || "zero".to_owned());
         let at = interner.get(first) as *const String;
-        for n in 1..50_000 {
+        let count = if cfg!(miri) { 400 } else { 50_000 };
+        for n in 1..count {
             interner.intern(id(n), || n.to_string());
         }
         assert!(std::ptr::eq(at, interner.get(first)));
@@ -918,6 +923,7 @@ mod tests {
 
     #[cfg(not(blaze_check))]
     #[test]
+    #[cfg_attr(miri, ignore = "threads_claim_each_key_exactly_once is its Miri-sized form")]
     fn threads_intern_one_index_per_value() {
         let interner = Sharded::<u64>::new(SHARDS);
         let seen: Vec<Vec<Idx<u64>>> = std::thread::scope(|scope| {
@@ -1148,8 +1154,10 @@ mod model {
 
     /// Nine keys fill a shard's second index table (two groups of six) to three quarters, so
     /// whichever of 9 and 10 goes in first starts its growth and builds the next table after
-    /// unlocking, while the other thread finds a key from before the growth and inserts the
-    /// other key before, during or after the build: the swap under the lock keeps it.
+    /// unlocking, while the other thread finds a key from before the growth. The other key,
+    /// the eleventh value, would pass seven eighths of the old table: its writer meets `Full`,
+    /// unlocks and waits for the swap, then inserts into the new table. (Inserts logged during
+    /// a build are blaze-swiss's `model_swiss_swap_keeps_an_insert_during_the_build`.)
     #[test]
     fn model_growth_keeps_every_index() {
         blaze_check::model(|| {

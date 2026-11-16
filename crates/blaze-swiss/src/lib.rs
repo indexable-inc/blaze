@@ -576,7 +576,7 @@ impl<A: Allocator + Clone> Built<'_, A> {
     }
 
     /// The planted bug of the model test: publishing what the build saw, without the re-check.
-    #[cfg(test)]
+    #[cfg(all(test, blaze_check))]
     fn publish_without_recheck(self) {
         self.swap();
     }

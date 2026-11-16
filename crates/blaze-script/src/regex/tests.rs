@@ -138,6 +138,7 @@ fn replacement_expands_groups_as_the_regex_crate_does() {
     let regex = Regex::new("a").unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(regex.replace_all("bab", |c: &super::Captures<'_>| c[0].to_uppercase()), "bAb");
     assert!(matches!(regex.replace_all("bbb", "x"), std::borrow::Cow::Borrowed("bbb")));
+    assert_eq!(regex.replace("aba", "x"), "xba", "`replace` replaces the first match only");
     let named = Regex::new("(a)(?P<n>b)(?:c)").unwrap_or_else(|e| panic!("{e}"));
     assert_eq!(named.captures_len(), 3);
     assert_eq!(named.capture_names().collect::<Vec<_>>(), [None, None, Some("n")]);

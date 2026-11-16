@@ -25,6 +25,7 @@
 //! | [`FixedVec`] | up to `N` values inline, no allocator; a push past `N` is refused with [`Full`], the value handed back |
 //! | [`Packed`], [`Pack`] | values of different sizes end to end in one byte buffer, each its own size; iterated, not indexed, with an optional checkpoint every `K` values for seeking |
 //! | [`Inline`] | an allocator over a buffer inside itself (`&Inline<BYTES>`), so any of these lives on the stack; refuses when full, never falls back |
+//! | [`Alloc`], [`Erased`], [`AVec`] and friends | the allocator as a value of one type, one word: what a function takes (`alloc: Alloc<'_>`) instead of a type parameter; [`Erased`] makes any allocator hand one out ([`alloc_ref`]) |
 //!
 //! The cargo feature `std` (off by default; blaze-mem turns it on) adds what only this crate
 //! may write by the orphan rule and only std has: `AsRef<OsStr>` and `AsRef<Path>` for
@@ -97,6 +98,7 @@ extern crate std;
 #[macro_use]
 mod macros;
 
+pub mod alloc_ref;
 pub mod arc;
 pub mod boxed;
 pub mod btree;
@@ -120,6 +122,10 @@ pub mod vec;
 #[cfg(test)]
 mod plant;
 
+pub use alloc_ref::{
+    AArc, ABTreeMap, ABTreeSet, ABox, ADeque, ARc, ASoa, ASortedMap, ASortedSet, AString, AVec, Alloc, Erased,
+    Headed, Header,
+};
 pub use arc::Arc;
 pub use boxed::{Box, CallOnce};
 pub use btree::{BTreeMap, BTreeSet};

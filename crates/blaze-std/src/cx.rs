@@ -553,9 +553,9 @@ impl Cx {
         Canceller(Arc::clone(&self.cancel))
     }
 
-    /// The context of a scope of `class` inside this task: as [`Cx::scoped`].
-    pub(crate) fn scoped_as(&self, class: Class) -> Cx {
-        Cx { class, ..self.scoped() }
+    /// This context, in a scope of `class`: what a narrowed scope gives the tasks it runs.
+    pub(crate) fn with_class(self, class: Class) -> Cx {
+        Cx { class, ..self }
     }
 
     /// Cancels the scope this context's cancellation is: every context sharing it, and every

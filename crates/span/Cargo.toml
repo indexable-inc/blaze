@@ -14,7 +14,7 @@ authors.workspace = true
 blaze-hash.workspace = true
 blaze-memo.workspace = true
 blaze-text-size.workspace = true
-unicode-width.workspace = true
+blaze-unicode.workspace = true
 
 # local deps
 blaze-format.workspace = true

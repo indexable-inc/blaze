@@ -257,49 +257,26 @@ impl<T: Clone, A: Allocator + Clone> Clone for Box<[T], A> {
 }
 
 // The copies into another allocator are associated functions (`Box::clone_in(&b, alloc)`), as
-// `Box::allocator` is: a method would hide the boxed value's own `clone_in`.
-impl<T, A: Allocator> Box<T, A> {
+// `Box::allocator` is: a method would hide the boxed value's own `clone_in`. One impl over
+// `T: ?Sized` (two, for `T` and `[T]`, would make `Box::clone_in` ambiguous), the work in
+// `CloneIn`'s impls for `Box<T, A>` and `Box<[T], A>` (crate::make).
+impl<T: ?Sized, A: Allocator> Box<T, A> {
     /// A deep copy in another allocator: the value copied with [`CloneIn`] into `alloc`, and a
-    /// block for it there.
-    pub fn try_clone_in<B: Allocator + Clone>(b: &Box<T, A>, alloc: B) -> Result<Box<T::In, B>, AllocFailure>
+    /// block for it there (for a slice, of exactly its length). A refusal drops what was copied.
+    pub fn try_clone_in<B: Allocator>(b: &Box<T, A>, alloc: B) -> Result<<Box<T, A> as CloneIn<B>>::In, AllocFailure>
     where
-        T: CloneIn<B>,
+        Box<T, A>: CloneIn<B>,
     {
-        let copy = (**b).try_clone_in(alloc.clone())?;
-        Box::<T::In, B>::try_new_in(copy, alloc).map_err(|refused| refused.why)
+        CloneIn::try_clone_in(b, alloc)
     }
 
     /// [`Box::try_clone_in`], panicking with the [`AllocFailure`].
     #[track_caller]
-    pub fn clone_in<B: Allocator + Clone>(b: &Box<T, A>, alloc: B) -> Box<T::In, B>
+    pub fn clone_in<B: Allocator>(b: &Box<T, A>, alloc: B) -> <Box<T, A> as CloneIn<B>>::In
     where
-        T: CloneIn<B>,
+        Box<T, A>: CloneIn<B>,
     {
-        match Box::<T, A>::try_clone_in(b, alloc) {
-            Ok(copy) => copy,
-            Err(failure) => fail(failure),
-        }
-    }
-}
-
-impl<T, A: Allocator> Box<[T], A> {
-    /// A deep copy in another allocator: a block of exactly the length in `alloc`, each value
-    /// copied with [`CloneIn`] into `alloc` too. A refusal drops what was copied.
-    pub fn try_clone_in<B: Allocator + Clone>(b: &Box<[T], A>, alloc: B) -> Result<Box<[T::In], B>, AllocFailure>
-    where
-        T: CloneIn<B>,
-    {
-        // The vector's room is exactly the length, so the box's shrink is a no-op.
-        Ok((**b).try_clone_in(alloc)?.into_boxed_slice())
-    }
-
-    /// [`Box::try_clone_in`], panicking with the [`AllocFailure`].
-    #[track_caller]
-    pub fn clone_in<B: Allocator + Clone>(b: &Box<[T], A>, alloc: B) -> Box<[T::In], B>
-    where
-        T: CloneIn<B>,
-    {
-        match Box::<[T], A>::try_clone_in(b, alloc) {
+        match CloneIn::try_clone_in(b, alloc) {
             Ok(copy) => copy,
             Err(failure) => fail(failure),
         }

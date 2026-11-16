@@ -35,6 +35,8 @@ const DOC: &str = r#"clones: the `.clone()` calls only go down, per crate (AGENT
               write     write the list from the tree as it is
               classify  print, as JSON, each crate's calls by kind (below), and with `sites`
                         each call's file, line, kind, what gave it and its comment
+              findings  print every call, with its kind, as a `blaze_script::finding`
+                        document (for `advise`): `handle` is the mechanical one (`.share()`)
     root      the checkout (".")
     base      the commit the change is against, or null: its list (`git show`) holds every
               row it has down, and the lines added since it (`git diff --unified=0`) name a
@@ -99,7 +101,9 @@ use std::{
 };
 
 use blaze_script::{
-    Map, TempDir, Value, fail, git,
+    Map, TempDir, Value, fail,
+    finding::{self, Finding},
+    git,
     input::{self, Fields, Input, InputError},
     json, read_text,
     regex::Regex,
@@ -156,7 +160,7 @@ impl Input for Args {
 
     fn parse(f: &Fields<'_>) -> Result<Args, InputError> {
         Ok(Args {
-            command: f.one_of("command", &["check", "write", "classify"], None)?,
+            command: f.one_of("command", &["check", "write", "classify", "findings"], None)?,
             root: f.str("root", Some("."))?,
             base: f.str_or_null("base")?,
             sites: f.bool("sites", Some(false))?,
@@ -186,6 +190,41 @@ impl Kind {
             Kind::ErrorPath => "error-path",
             Kind::Deep => "deep",
             Kind::Unknown => "unknown",
+        }
+    }
+
+    /// The kind as a finding: a handle's duplicate is the mechanical rewrite, `.share()`.
+    const fn finding(self) -> finding::Kind {
+        const RULES: &str = "11 bump-allocate, 76 correct-by-construction";
+        match self {
+            Kind::Handle => finding::Kind {
+                name: "handle",
+                label: "handle clones",
+                rule: RULES,
+                instead: "`x.share()` (blaze-own's `Share`): an O(1) duplicate that allocates nothing",
+                mechanical: true,
+            },
+            Kind::ErrorPath => finding::Kind {
+                name: "error-path",
+                label: "error-path clones",
+                rule: RULES,
+                instead: "`x.clone_in(alloc)` with the error's allocator, or move the value into the error",
+                mechanical: false,
+            },
+            Kind::Deep => finding::Kind {
+                name: "deep",
+                label: "deep clones",
+                rule: RULES,
+                instead: "`x.clone_in(alloc)` (blaze-own's `CloneIn`), the allocator named, or a borrow",
+                mechanical: false,
+            },
+            Kind::Unknown => finding::Kind {
+                name: "unknown",
+                label: "unexplained clones",
+                rule: RULES,
+                instead: "`x.share()` for a handle, `x.clone_in(alloc)` for a deep copy, a borrow where one does",
+                mechanical: false,
+            },
         }
     }
 }
@@ -1021,6 +1060,19 @@ fn main_with(p: &Patterns, it: &Args) {
         fail(SCRIPT, &format!("{} has no crates/ directory", root.display()));
     }
     let counts = count(p, &root);
+    if it.command == "findings" {
+        let found = counts.iter().flat_map(|(krate, sites)| {
+            sites.iter().map(|it| Finding {
+                krate: krate.clone(),
+                file: it.path.clone(),
+                line: it.line,
+                kind: it.kind.finding().name,
+                detail: it.why.clone(),
+            })
+        });
+        finding::print(SCRIPT, &Kind::ALL.map(Kind::finding), found.collect());
+        return;
+    }
     if it.command == "classify" {
         let shown = json::to_string_pretty(&report(&counts, it.sites)).unwrap_or_else(|e| fail(SCRIPT, &e.to_string()));
         println!("{shown}");

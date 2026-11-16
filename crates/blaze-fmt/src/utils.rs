@@ -10,7 +10,6 @@ use crate::ast::{
 use crate::ast_pretty as pprust;
 use crate::feature::is_builtin_attr_name;
 use crate::span::{BytePos, LocalExpnId, Span, Symbol, SyntaxContext, sym, symbol};
-use rustfmt_unicode_width::UnicodeWidthStr;
 
 use crate::comment::{CharClasses, FullCodeCharKind, LineClasses, filter_normal_code};
 use crate::config::{Config, StyleEdition};
@@ -773,6 +772,8 @@ impl NodeIdExt for NodeId {
     }
 }
 
+/// rustfmt's width (unicode-width 0.1.14's), which takes a `\n` as no column where
+/// `blaze_unicode::str_width` takes it as one.
 pub(crate) fn unicode_str_width(s: &str) -> usize {
-    s.width()
+    blaze_unicode::str_width(s) - s.bytes().filter(|it| *it == b'\n').count()
 }

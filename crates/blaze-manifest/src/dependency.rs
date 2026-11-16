@@ -1,18 +1,76 @@
 //! A dependency as a manifest declares it (cargo's `Dependency`), and the feature map of a
 //! package (cargo's `build_feature_map`), with cargo's checks and messages.
 
+use std::alloc::Global;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::path::PathBuf;
 
-use anyhow::{Context as _, bail};
-use blaze_resolve::{FeatureDep, InternedString};
-use cargo_platform::Platform;
-use semver::VersionReq;
+use blaze_resolve::{FeatureDep, InternedString, Platform};
+use blaze_semver::{Limits, VersionReq};
 use serde::Serialize;
 
+use crate::error::{Context, ManifestError, ResultExt as _};
 use crate::source::SourceId;
 
 pub use blaze_resolve::DepKind;
+
+/// What a dependency's declaration refuses, in cargo's words.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DependencyError {
+    /// `artifact = "gpu"` with other kinds (the other kinds named).
+    GpuWithOtherKinds { others: Vec<String> },
+    /// `artifact = "gpu"` with a `target`.
+    GpuWithTarget { target: String },
+    /// An artifact kind cargo does not know.
+    ArtifactKind { kind: String },
+    /// `bin` and `bin:<name>` together.
+    BinAndNamedBin,
+    /// The same artifact kind more than once.
+    DuplicateArtifacts { dupes: usize },
+    /// `target = ""`.
+    EmptyTarget,
+    /// `target = "<file>.json"`.
+    JsonTarget,
+    /// `optional = true` in `[dev-dependencies]`.
+    OptionalDevDependency { name: String },
+}
+
+impl fmt::Display for DependencyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DependencyError::GpuWithOtherKinds { others } => write!(
+                f,
+                "artifact `gpu` (blaze's device build) takes no other artifact kind, but `{}` is asked with it",
+                others.join("`, `")
+            ),
+            DependencyError::GpuWithTarget { target } => write!(
+                f,
+                "artifact `gpu` is built for `naga-unknown-unknown` alone, so it takes no `target` (`{target}` is asked)"
+            ),
+            DependencyError::ArtifactKind { kind } => {
+                write!(f, "'{kind}' is not a valid artifact specifier")
+            }
+            DependencyError::BinAndNamedBin => f.write_str(
+                "Cannot specify both 'bin' and 'bin:<name>' binary artifacts, as 'bin' selects all available binaries.",
+            ),
+            DependencyError::DuplicateArtifacts { dupes } => write!(
+                f,
+                "Found {dupes} duplicate binary artifact{}",
+                if *dupes > 1 { "s" } else { "" }
+            ),
+            DependencyError::EmptyTarget => f.write_str("target was empty"),
+            DependencyError::JsonTarget => {
+                f.write_str("`.json` target specs require -Zjson-target-spec")
+            }
+            DependencyError::OptionalDevDependency { name } => {
+                write!(f, "dev-dependencies are not allowed to be optional: `{name}`")
+            }
+        }
+    }
+}
+
+impl core::error::Error for DependencyError {}
 
 #[derive(Clone, Debug)]
 pub struct Dependency {
@@ -22,7 +80,7 @@ pub struct Dependency {
     /// The registry named by `registry` or `registry-index`, when one is.
     pub registry_id: Option<SourceId>,
     /// `None` is any version, cargo's `OptVersionReq::Any`.
-    pub req: Option<VersionReq>,
+    pub req: Option<VersionReq<Global>>,
     pub kind: DepKind,
     pub optional: bool,
     pub public: bool,
@@ -61,39 +119,37 @@ impl Artifact {
         Self::asks_gpu(&self.kinds)
     }
 
-    pub fn parse(kinds: &[String], lib: bool, target: Option<&str>) -> anyhow::Result<Artifact> {
+    pub fn parse(
+        kinds: &[String],
+        lib: bool,
+        target: Option<&str>,
+    ) -> Result<Artifact, DependencyError> {
         if Self::asks_gpu(kinds) {
             // The device build has one target, blaze's own, and one output, its MSL.
             if kinds.len() != 1 {
-                bail!(
-                    "artifact `gpu` (blaze's device build) takes no other artifact kind, but `{}` is asked with it",
-                    kinds.iter().filter(|it| *it != Self::GPU).cloned().collect::<Vec<_>>().join("`, `")
-                );
+                let others = kinds.iter().filter(|it| *it != Self::GPU).cloned().collect();
+                return Err(DependencyError::GpuWithOtherKinds { others });
             }
             if let Some(target) = target {
-                bail!(
-                    "artifact `gpu` is built for `naga-unknown-unknown` alone, so it takes no `target` (`{target}` is asked)"
-                );
+                return Err(DependencyError::GpuWithTarget { target: target.to_owned() });
             }
             return Ok(Artifact { kinds: kinds.to_vec(), lib, target: None });
         }
         for kind in kinds {
             if !matches!(kind.as_str(), "bin" | "cdylib" | "staticlib") && !kind.starts_with("bin:")
             {
-                bail!("'{kind}' is not a valid artifact specifier");
+                return Err(DependencyError::ArtifactKind { kind: kind.clone() });
             }
         }
         if kinds.iter().any(|it| it == "bin") && kinds.iter().any(|it| it.starts_with("bin:")) {
-            bail!(
-                "Cannot specify both 'bin' and 'bin:<name>' binary artifacts, as 'bin' selects all available binaries."
-            );
+            return Err(DependencyError::BinAndNamedBin);
         }
         let mut unique: Vec<&str> = kinds.iter().map(String::as_str).collect();
         unique.sort_unstable();
         unique.dedup();
         let dupes = kinds.len() - unique.len();
         if dupes != 0 {
-            bail!("Found {dupes} duplicate binary artifact{}", if dupes > 1 { "s" } else { "" });
+            return Err(DependencyError::DuplicateArtifacts { dupes });
         }
         if let Some(target) = target
             && target != "target"
@@ -101,10 +157,10 @@ impl Artifact {
             // cargo's `CompileTarget::new`; blaze does not read `-Zjson-target-spec`.
             let target = target.trim();
             if target.is_empty() {
-                bail!("target was empty");
+                return Err(DependencyError::EmptyTarget);
             }
             if target.ends_with(".json") {
-                bail!("`.json` target specs require -Zjson-target-spec");
+                return Err(DependencyError::JsonTarget);
             }
         }
         Ok(Artifact { kinds: kinds.to_vec(), lib, target: target.map(str::to_owned) })

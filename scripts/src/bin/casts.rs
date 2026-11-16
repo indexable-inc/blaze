@@ -33,6 +33,7 @@ const DOC: &str = r#"casts: the integer `as` casts only go down, per crate (AGEN
                       with `write`; a crate with no row is held to 0, so a new crate starts at
                       0; with `base`, no row is above the base's (CI)
               write   write the list from the tree as it is
+              findings  print every cast as a `blaze_script::finding` document (for `advise`)
     root      the checkout (".")
     base      the commit the change is against, or null: its list (`git show`) holds every
               row down, and the lines added since it (`git diff --unified=0`) name a crate's
@@ -82,7 +83,9 @@ use std::{
 };
 
 use blaze_script::{
-    TempDir, fail, git,
+    TempDir, fail,
+    finding::{self, Finding},
+    git,
     input::{self, Fields, Input, InputError},
     read_text,
     regex::Regex,
@@ -109,6 +112,15 @@ const INSTEAD: &str = "write the conversion that says what it does, from blaze-i
                        the point (hashing, codecs), `x.saturate::<u8>()` to clamp; `cast_signed()`/`cast_unsigned()` for \
                        a sign change of equal width; `blaze_int::idx(id)` for an id as an index, `blaze_int::len32(len)` \
                        for a length as a `u32`; `Cast::<S, T>::..` in a `const`";
+/// What a cast is as a finding: not mechanical, since which conversion it is depends on what the
+/// value can hold.
+const KIND: finding::Kind = finding::Kind {
+    name: "cast",
+    label: "bare casts",
+    rule: "76 correct-by-construction",
+    instead: "the blaze-int conversion that says what happens: `widen_to`, `narrow`, `narrow_or_stop`, `truncate_to`, `saturate`",
+    mechanical: false,
+};
 /// The list's first lines.
 const HEADER: &str = "# The integer `as` casts outside test code, by crate (its directory under crates/): `as`\n\
                       # followed by a primitive integer type (`u8`..`u128`, `usize`, `i8`..`i128`, `isize`), not in a\n\
@@ -128,7 +140,7 @@ impl Input for Args {
 
     fn parse(f: &Fields<'_>) -> Result<Args, InputError> {
         Ok(Args {
-            command: f.one_of("command", &["check", "write"], None)?,
+            command: f.one_of("command", &["check", "write", "findings"], None)?,
             root: f.str("root", Some("."))?,
             base: f.str_or_null("base")?,
         })
@@ -704,6 +716,13 @@ fn main_with(p: &Patterns, it: &Args) {
         fail(SCRIPT, &format!("{} has no crates/ directory", root.display()));
     }
     let counts = count(p, &root);
+    if it.command == "findings" {
+        let found = counts.iter().flat_map(|(krate, sites)| {
+            sites.iter().map(|it| Finding { krate: krate.clone(), file: it.path.clone(), line: it.line, kind: KIND.name, detail: None })
+        });
+        finding::print(SCRIPT, &[KIND], found.collect());
+        return;
+    }
     let text = render(&counts);
     if it.command == "write" {
         if let Err(e) = std::fs::write(root.join(LIST), &text) {

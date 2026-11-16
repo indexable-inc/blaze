@@ -35,7 +35,7 @@ filetime.workspace = true
 sha2.workspace = true
 blaze-trace.workspace = true
 # A tree's paths compared as a case- and normalization-insensitive disk (APFS) compares them.
-unicode-normalization.workspace = true
+blaze-unicode.workspace = true
 
 [dev-dependencies]
 # The resume property test (`tests::a_cut_download_resumes_and_keeps_only_the_pinned_bytes`).
