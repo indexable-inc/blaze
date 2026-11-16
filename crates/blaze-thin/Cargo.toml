@@ -21,8 +21,6 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
-# The one schema and its frames: the requests this sends are the CLI's, byte for byte.
-blaze-api.workspace = true
 # The name of the file a pin's lookup is kept in (`pin.rs`).
 blaze-format.workspace = true
 blaze-ids.workspace = true
@@ -41,8 +39,6 @@ toml.workspace = true
 # The program's alone (`main.rs`), which is Unix's: the library (what blaze-cargo and
 # blaze-engine take from here) links none of these, so the wasm seed builds none of them.
 [target.'cfg(unix)'.dependencies]
-# Where the daemon listens, the checkout, the config files outside it, the environment.
-blaze-client.workspace = true
 # The decoder of what a certified build said (`solo.rs`), the daemon's own.
 blaze-protocol.workspace = true
 # `serve.lock`'s holder, asked without waiting (`solo.rs`).

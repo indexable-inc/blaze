@@ -14,7 +14,6 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
-blaze-api.workspace = true
 blaze-core.workspace = true
 blaze-cas.workspace = true
 blaze-format.workspace = true
@@ -25,7 +24,6 @@ blaze-ids.workspace = true
 blaze-items.workspace = true
 blaze-kernel.workspace = true
 blaze-mem.workspace = true
-blaze-query.workspace = true
 blaze-report.workspace = true
 blaze-serde.workspace = true
 blaze-store-check.workspace = true

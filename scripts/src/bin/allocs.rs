@@ -13,7 +13,7 @@
 //! explicit form. This counts, per crate, what is left to convert: the `// alloc:` lines (to 0,
 //! after which a crate with no row is refused any), the `allow`/`expect`s of the lint, and the
 //! lines that name `Global` (the number moving to frames brings down later). Each column of
-//! crates/blaze-lints/baselines/alloc-sites.txt only shrinks, except `global` while any
+//! tools/ratchets/alloc-sites.txt only shrinks, except `global` while any
 //! `// alloc:` line is left: converting those to `Global` raises it. It runs with no
 //! compiler: a gate step of the `scripts` job (.github/workflows/blaze.yaml), beside `domains`.
 //!
@@ -113,7 +113,7 @@ use blaze_script::{
 
 const SCRIPT: &str = "allocs";
 /// The list, from the root.
-const LIST: &str = "crates/blaze-lints/baselines/alloc-sites.txt";
+const LIST: &str = "tools/ratchets/alloc-sites.txt";
 /// The word of the comment that once kept an allocator lint's finding and keeps nothing now.
 const TAG: &str = "alloc";
 /// The global heap's name where it is used (`Vec::new_in(Global)`).

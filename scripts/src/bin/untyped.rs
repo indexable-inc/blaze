@@ -124,7 +124,7 @@ use blaze_script::{
 
 const SCRIPT: &str = "untyped";
 /// The list, from the root.
-const LIST: &str = "crates/blaze-lints/baselines/untyped-errors.txt";
+const LIST: &str = "tools/ratchets/untyped-errors.txt";
 const TEST_DIRS: [&str; 2] = ["tests", "benches"];
 const TEST_FILES: [&str; 2] = ["tests.rs", "test.rs"];
 /// The files whose out-of-line modules are beside them, not in a directory named for them.

@@ -1,0 +1,630 @@
+;; identity-census: every site in blaze's Rust that depends on an item id being an arena number,
+;; the work list for docs/v2/plan/design/identity.md. A query, no rewrites: the rewrites are
+;; written after these rows are read. How to run it and read it: identity-census.md beside this.
+;;
+;; Six census lints, each with a `-in-test` twin (test code: under `#[cfg(test)]` or a test
+;; attribute, or in a file named `tests.rs`, `*_tests.rs`, or under `tests/` or `benches/`):
+;;   id-bits              a read of an id's or a Gid's bits (`gid`, `session_bits`, `.0`, ...)
+;;   id-cast              an `as` cast of an expression that reads an id or a Gid
+;;   id-order             an order over ids: sort, binary search, cmp/min/max, `<`, a BTreeMap
+;;                        or BTreeSet key, a derived `Ord` on a type holding an id
+;;   id-in-record         a record, `Persist` or serde impl (or derive) of a type holding an id,
+;;                        and each field of it that holds one
+;;   id-in-carried-table  a shared table (a lock, a papaya map, a static) holding an id;
+;;                        id-in-table, all map and Vec fields holding one, for a human read
+;;   id-debug-in-output   an id printed with `{:?}` outside tests
+;; and `census`, the count of each per crate.
+;;
+;; Every relation is demand-driven (astlog-sema.md: "Needs"): a relation over types can only
+;; hold for types some rule bound first. So `item-id-type` and `holds-id` hold over
+;; `seen-type`, the types the census sites have, and what the peeling below reaches from them.
+
+;; ------------------------------------------------------------------------------------------
+;; The ids.
+;;
+;; item-id-def: the def of each item id type, pinned by def path so a look-alike of another
+;; crate never counts. `ModuleId` and `BlockId` are type aliases of `ModuleIdLt<'static>` and
+;; `BlockIdLt<'static>`: a type's def is the struct, so the struct is listed here and the
+;; alias in `id-name-def` (a written name resolves to the alias). Macro2Id, MacroRulesId,
+;; ProcMacroId, UseId, ExternCrateId and ExternBlockId are item ids too, interned the same way,
+;; and are listed with the ones the design names. The enums that wrap ids beyond these
+;; (AttrDefId, AssocItemId, GenericParamId, ...) are found as holders below.
+(rule (item-id-def d) (def-path d "hir_def::FunctionId"))
+(rule (item-id-def d) (def-path d "hir_def::StructId"))
+(rule (item-id-def d) (def-path d "hir_def::UnionId"))
+(rule (item-id-def d) (def-path d "hir_def::EnumId"))
+(rule (item-id-def d) (def-path d "hir_def::TraitId"))
+(rule (item-id-def d) (def-path d "hir_def::ImplId"))
+(rule (item-id-def d) (def-path d "hir_def::ConstId"))
+(rule (item-id-def d) (def-path d "hir_def::StaticId"))
+(rule (item-id-def d) (def-path d "hir_def::TypeAliasId"))
+(rule (item-id-def d) (def-path d "hir_def::EnumVariantId"))
+(rule (item-id-def d) (def-path d "hir_def::ModuleIdLt"))
+(rule (item-id-def d) (def-path d "hir_def::BlockIdLt"))
+(rule (item-id-def d) (def-path d "hir_def::AdtId"))
+(rule (item-id-def d) (def-path d "hir_def::DefWithBodyId"))
+(rule (item-id-def d) (def-path d "hir_def::GenericDefId"))
+(rule (item-id-def d) (def-path d "hir_def::MacroId"))
+(rule (item-id-def d) (def-path d "hir_def::VariantId"))
+(rule (item-id-def d) (def-path d "hir_def::ItemContainerId"))
+(rule (item-id-def d) (def-path d "hir_def::FieldId"))
+(rule (item-id-def d) (def-path d "hir_def::Macro2Id"))
+(rule (item-id-def d) (def-path d "hir_def::MacroRulesId"))
+(rule (item-id-def d) (def-path d "hir_def::ProcMacroId"))
+(rule (item-id-def d) (def-path d "hir_def::UseId"))
+(rule (item-id-def d) (def-path d "hir_def::ExternCrateId"))
+(rule (item-id-def d) (def-path d "hir_def::ExternBlockId"))
+(rule (item-id-def d) (def-path d "base_db::Crate"))
+
+;; gid-def: `blaze_memo::Gid`, the arena index, generation and slot every id above wraps.
+(rule (gid-def d) (def-path d "blaze_memo::Gid"))
+
+(rule (id-or-gid-def d) (item-id-def d))
+(rule (id-or-gid-def d) (gid-def d))
+
+;; id-name-def: every def a written type name can resolve to and mean an id: the ids, Gid, and
+;; the two aliases.
+(rule (id-name-def d) (id-or-gid-def d))
+(rule (id-name-def d) (def-path d "hir_def::ModuleId"))
+(rule (id-name-def d) (def-path d "hir_def::BlockId"))
+
+;; ------------------------------------------------------------------------------------------
+;; Holders: the types whose values carry an id, found by syntax and name resolution.
+;;
+;; The language has no relation from a field to its type (`type-of` takes an expression or a
+;; pattern), so a field's type is read from its written type: a field holds an id when its type
+;; names an id, or names a holder, at an owning position (the path itself, its generic
+;; arguments, a tuple, an array or a slice). Behind `&`, `*const`, `fn(..)` or `dyn` is not
+;; owning, so a `&Db` field does not make its struct a holder. Over-approximations a reader
+;; checks: `PhantomData<FunctionId>` counts; a generic `Table<K>` counts only where it is
+;; written with an id (`Table<FunctionId>`), at that field. Missed: a type that holds an id only
+;; through a generic parameter filled elsewhere, an alias in an impl (`type Output = ..`), and
+;; a type written by a macro whose input does not spell it.
+(rule (holder d) (id-name-def d))
+(rule (holder a) (field-holds fs f a d))
+(rule (holder ta) (alias-holds s ta d))
+
+;; mention: each written path that resolves to the holder `d` (through imports, aliases and
+;; re-exports; `references` searches by the name, then resolves each hit).
+(rule (mention p d) (holder d) (references d p))
+
+;; owned-up: `x` is the mention or a type node above it reached only through owning syntax.
+(rule (owned-up p d) (mention p d))
+(rule (owned-up up d)
+  (owned-up x d)
+  (parent up x)
+  (kind up k)
+  (text-match k "^(PATH|PATH_SEGMENT|PATH_TYPE|GENERIC_ARG_LIST|TYPE_ARG|TUPLE_TYPE|ARRAY_TYPE|SLICE_TYPE|PAREN_TYPE)$"))
+
+;; field-holds: field syntax `fs` (def `f`) of the struct, union or enum `a` holds holder `d`.
+(rule (field-holds fs f a d)
+  (owned-up x d)
+  (parent fs x)
+  (kind fs k)
+  (text-match k "^(RECORD_FIELD|TUPLE_FIELD)$")
+  (defines fs f)
+  (def-parent f a)
+  (def-kind a ak)
+  (text-match ak "^(struct|union)$"))
+(rule (field-holds fs f a d)
+  (owned-up x d)
+  (parent fs x)
+  (kind fs k)
+  (text-match k "^(RECORD_FIELD|TUPLE_FIELD)$")
+  (defines fs f)
+  (def-parent f v)
+  (def-kind v vk)
+  (text-match vk "^variant$")
+  (def-parent v a))
+
+;; alias-holds: a module-level `type` alias whose type holds `d` (an associated type is left
+;; out: its name, `Output`, `Item`, is everywhere and names nothing alone).
+(rule (alias-holds s ta d)
+  (owned-up x d)
+  (parent s x)
+  (kind s "TYPE_ALIAS")
+  (defines s ta)
+  (def-parent ta m)
+  (def-kind m mk)
+  (text-match mk "^module$"))
+
+;; static-holds: a `static` (a `thread_local!` included, through its expansion) whose type
+;; holds `d`. A static outlives every snapshot.
+(rule (static-holds s d)
+  (owned-up x d)
+  (parent s x)
+  (kind s "STATIC"))
+
+;; ------------------------------------------------------------------------------------------
+;; Types: item-id-type and holds-id over the types the census sites have.
+;;
+;; ty-part peels a type into the types it owns: references, Option, Result, Box, Vec,
+;; VecDeque, SmallVec, ThinVec, slices, arrays, tuples of two to four, the maps and sets
+;; (HashMap, HashSet, BTreeMap, BTreeSet, IndexMap, IndexSet), Arc, Rc, Cell, RefCell and the
+;; locks (Lock, Mutex, RwLock, OnceLock). A single name matches every ADT of that name (std's,
+;; blaze_hash's, papaya's alike), and the std prelude's own for Vec, Box, Option and Result.
+;; Not peeled: tuples past four, raw and fn pointers, `dyn`, closures, iterators and any other
+;; generic ADT, which counts only when it is itself a holder.
+(rule (seen-type t) (site-type t))
+(rule (seen-type u) (ty-part t u))
+
+(rule (ty-part t u) (seen-type t) (peel-refs t u))
+(rule (ty-part t a) (seen-type t) (type-matches t "Option<$a>"))
+(rule (ty-part t a) (seen-type t) (type-matches t "Result<$a, $b>"))
+(rule (ty-part t b) (seen-type t) (type-matches t "Result<$a, $b>"))
+(rule (ty-part t a) (seen-type t) (type-matches t "Box<$a>"))
+(rule (ty-part t a) (seen-type t) (type-matches t "Vec<$a>"))
+(rule (ty-part t a) (seen-type t) (type-matches t "VecDeque<$a>"))
+(rule (ty-part t a) (seen-type t) (type-matches t "SmallVec<$a>"))
+(rule (ty-part t a) (seen-type t) (type-matches t "ThinVec<$a>"))
+(rule (ty-part t a) (seen-type t) (type-matches t "[$a]"))
+(rule (ty-part t a) (seen-type t) (type-matches t "[$a; _]"))
+(rule (ty-part t a) (seen-type t) (type-matches t "($a, $b)"))
+(rule (ty-part t b) (seen-type t) (type-matches t "($a, $b)"))
+(rule (ty-part t a) (seen-type t) (type-matches t "($a, $b, $c)"))
+(rule (ty-part t b) (seen-type t) (type-matches t "($a, $b, $c)"))
+(rule (ty-part t c) (seen-type t) (type-matches t "($a, $b, $c)"))
+(rule (ty-part t a) (seen-type t) (type-matches t "($a, $b, $c, $e)"))
+(rule (ty-part t b) (seen-type t) (type-matches t "($a, $b, $c, $e)"))
+(rule (ty-part t c) (seen-type t) (type-matches t "($a, $b, $c, $e)"))
+(rule (ty-part t e) (seen-type t) (type-matches t "($a, $b, $c, $e)"))
+(rule (ty-part t a) (seen-type t) (type-matches t "HashMap<$a, $b>"))
+(rule (ty-part t b) (seen-type t) (type-matches t "HashMap<$a, $b>"))
+(rule (ty-part t a) (seen-type t) (type-matches t "HashSet<$a>"))
+(rule (ty-part t a) (seen-type t) (type-matches t "BTreeMap<$a, $b>"))
+(rule (ty-part t b) (seen-type t) (type-matches t "BTreeMap<$a, $b>"))
+(rule (ty-part t a) (seen-type t) (type-matches t "BTreeSet<$a>"))
+(rule (ty-part t a) (seen-type t) (type-matches t "IndexMap<$a, $b>"))
+(rule (ty-part t b) (seen-type t) (type-matches t "IndexMap<$a, $b>"))
+(rule (ty-part t a) (seen-type t) (type-matches t "IndexSet<$a>"))
+(rule (ty-part t a) (seen-type t) (type-matches t "Arc<$a>"))
+(rule (ty-part t a) (seen-type t) (type-matches t "Rc<$a>"))
+(rule (ty-part t a) (seen-type t) (type-matches t "Cell<$a>"))
+(rule (ty-part t a) (seen-type t) (type-matches t "RefCell<$a>"))
+(rule (ty-part t a) (seen-type t) (type-matches t "Lock<$a>"))
+(rule (ty-part t a) (seen-type t) (type-matches t "Mutex<$a>"))
+(rule (ty-part t a) (seen-type t) (type-matches t "RwLock<$a>"))
+(rule (ty-part t a) (seen-type t) (type-matches t "OnceLock<$a>"))
+
+;; item-id-type: a seen type that is an item id itself (not Gid, not through anything).
+(rule (item-id-type t) (seen-type t) (type-def t d) (item-id-def d))
+
+;; is-id: an item id or a Gid, behind any references, or in an Option or a Result's Ok: the
+;; strict test the bit reads use.
+(rule (is-id t) (seen-type t) (peel-refs t u) (type-def u d) (id-or-gid-def d))
+(rule (is-id t)
+  (seen-type t) (peel-refs t u) (type-matches u "Option<$a>")
+  (peel-refs a v) (type-def v d) (id-or-gid-def d))
+(rule (is-id t)
+  (seen-type t) (peel-refs t u) (type-matches u "Result<$a, $b>")
+  (peel-refs a v) (type-def v d) (id-or-gid-def d))
+
+;; holds-id: an id, a Gid or a holder type, or a type that owns one through ty-part.
+(rule (holds-id t) (seen-type t) (type-def t d) (holder d))
+(rule (holds-id t) (ty-part t u) (holds-id u))
+
+;; ------------------------------------------------------------------------------------------
+;; Calls by name. One walk of the call expressions: the callee path's last segment, for the
+;; names the bit reads and the orders use. A turbofish callee (`from_gid::<T>`) is missed.
+(rule (named-call n what)
+  (syntax n "CALL_EXPR")
+  (child n f)
+  (kind f "PATH_EXPR")
+  (text-capture f "(^|::)(gid|from_gid|try_from_gid|session_bits|from_session_bits|gid_bits|word_of|session_word|into_raw|from_raw|as_u32|index|in_arena|cmp|partial_cmp|max|min)$" sep what))
+
+;; Each argument of a call or a method call: `al` its argument list, `a` the argument.
+(rule (call-arg n a) (named-call n what) (child n al) (kind al "ARG_LIST") (child al a))
+
+;; ------------------------------------------------------------------------------------------
+;; 1. id-bits: a read of an id's bits.
+;;
+;; Finds a call of gid, from_gid, try_from_gid, session_bits, from_session_bits, gid_bits,
+;; word_of, session_word, into_raw, from_raw, as_u32, index (and Gid's arena, local and
+;; in_arena, which read the same bits) whose receiver, result or an argument is an item id or a
+;; Gid (`is-id`); a method of that name whose callee is blaze-memo's (`blaze_memo::Id::gid` on a
+;; generic `T: Id`, `blaze_memo::Gid::session_bits`), or one of hir-ty's and hir-def's own bit
+;; readers, whatever the types; and `.0` on an id, the Gid inside it. Why: the bits are the
+;; slot interning happened to hand out, in this process and this arena generation; a record
+;; that keeps them, or a table that outlives `Memo::next`, names a different item or a dead
+;; arena later (the 2026-11-15 `traces` panics). What to do: a record or a carried table goes
+;; through `blaze_id::key_of` and `blaze_id::resolve`; an in-process table keeps the id itself.
+;; `index` and `as_u32` on other types (a `Vec`, a span) are excluded by the type test; read the
+;; `via` column of each row.
+(rule (bits-method n r) (expr n "$r.gid()"))
+(rule (bits-method n r) (expr n "$r.session_bits()"))
+(rule (bits-method n r) (expr n "$r.into_raw()"))
+(rule (bits-method n r) (expr n "$r.as_u32()"))
+(rule (bits-method n r) (expr n "$r.index()"))
+(rule (bits-method n r) (expr n "$r.arena()"))
+(rule (bits-method n r) (expr n "$r.local()"))
+
+(rule (bits-method-named n r what) (bits-method n r) (child n nr) (kind nr "NAME_REF") (text nr what))
+
+(rule (bits-call n what)
+  (named-call n what)
+  (text-match what "^(gid|from_gid|try_from_gid|session_bits|from_session_bits|gid_bits|word_of|session_word|into_raw|from_raw|as_u32|index|in_arena)$"))
+
+;; bits-evidence: a type at the site: the receiver's, the result's, or an argument's.
+(rule (bits-evidence n what t) (bits-method-named n r what) (type-of r t))
+(rule (bits-evidence n what t) (bits-method-named n r what) (type-of n t))
+(rule (bits-evidence n what t) (bits-call n what) (type-of n t))
+(rule (bits-evidence n what t) (bits-call n what) (call-arg n a) (type-of a t))
+(rule (site-type t) (bits-evidence n what t))
+
+;; `.0` of an id: the Gid inside it.
+(rule (field-zero n x t) (expr n "$x.0") (type-of x t))
+(rule (site-type t) (field-zero n x t))
+
+(rule (id-bits-site n what via) (bits-evidence n what via) (is-id via))
+(rule (id-bits-site n what via)
+  (bits-method-named n r what)
+  (callee n d)
+  (def-path d via)
+  (text-match via "^blaze_memo::(Id|Gid)::"))
+(rule (id-bits-site n what via)
+  (bits-call n what)
+  (callee n d)
+  (def-path d via)
+  (text-match via "^(blaze_memo::(Id|Gid)::|hir_ty::.*::(gid_bits|word_of)$|hir_def::.*::session_word$)"))
+(rule (id-bits-site n what via)
+  (field-zero n x via)
+  (peel-refs via u)
+  (type-def u d)
+  (id-or-gid-def d)
+  (text-capture n "(\\.0)$" what))
+
+(rule (id-bits n what via)
+  (id-bits-site n what via)
+  (not (in-test n))
+  (file-path n p)
+  (not (text-match p "(^|/)(tests|benches)/|(^|/|_)tests?\\.rs$")))
+(rule (id-bits-in-test n what via) (id-bits-site n what via) (in-test n))
+(rule (id-bits-in-test n what via)
+  (id-bits-site n what via)
+  (file-path n p)
+  (text-match p "(^|/)(tests|benches)/|(^|/|_)tests?\\.rs$"))
+
+(lint id-bits warning
+  "an id's arena bits are read here (`$what`, through `$via`): under the identity design an item id is local to its snapshot; a record or a table that outlives `Memo::next` names the item by its key (`blaze_id::key_of`, back with `blaze_id::resolve`), and an in-process use keeps the id whole, never its bits")
+(lint id-bits-in-test warning
+  "test code reads an id's arena bits (`$what`, through `$via`): it moves with the code under test to `blaze_id::key_of`/`blaze_id::resolve` or to the id itself")
+
+;; ------------------------------------------------------------------------------------------
+;; 2. id-cast: `x as T` where `x` reads an id or a Gid.
+;;
+;; An id is a struct and cannot be cast itself, so the census is a cast whose operand, or any
+;; expression inside the operand, is an id or a Gid (`is-id`): `gid.local() as u64`,
+;; `id.as_u32() as usize`, `(word >> 32) as u32` where `word` is not typed is missed unless an id
+;; appears in the operand. Over-approximation a reader checks: an id used inside the operand only
+;; to look something up (`db.len_of(id) as u32`) is listed too. Why: the cast is where the
+;; slot leaves the id's type and nothing checks its arena again. What to do: the same as id-bits.
+(rule (cast-operand e x) (syntax e "CAST_EXPR") (child e x) (type-of x tx))
+(rule (cast-reads e x t) (cast-operand e x) (type-of x t))
+(rule (cast-reads e y t) (cast-operand e x) (descendant x y) (type-of y t))
+(rule (site-type t) (cast-reads e y t))
+
+(rule (id-cast-site e y t) (cast-reads e y t) (is-id t))
+
+(rule (id-cast e y t)
+  (id-cast-site e y t)
+  (not (in-test e))
+  (file-path e p)
+  (not (text-match p "(^|/)(tests|benches)/|(^|/|_)tests?\\.rs$")))
+(rule (id-cast-in-test e y t) (id-cast-site e y t) (in-test e))
+(rule (id-cast-in-test e y t)
+  (id-cast-site e y t)
+  (file-path e p)
+  (text-match p "(^|/)(tests|benches)/|(^|/|_)tests?\\.rs$"))
+
+(lint id-cast warning
+  "an id's bits are cast to a number here (`$y`, a `$t`): the slot leaves the id's type and no arena check follows it; persist or compare the item key (`blaze_id::key_of`), or keep the id whole in an in-process table")
+(lint id-cast-in-test warning
+  "test code casts an id's bits (`$y`, a `$t`)")
+
+;; ------------------------------------------------------------------------------------------
+;; 3. id-order: an order over item ids.
+;;
+;; Finds: `sort`, `sort_unstable`, `is_sorted`, `binary_search` on a receiver that holds an id;
+;; the `*_by_key` sorts, searches, `max_by_key` and `min_by_key` whose key closure's body is
+;; typed with an id (a key given as a fn path, not a closure, is missed); `cmp`, `partial_cmp`,
+;; `max`, `min`, `clamp` as methods on an id-holding receiver or result (`iter.max()` over ids
+;; included), and as `Ord::cmp(a, b)`-style calls on id-holding arguments; `<`, `>`, `<=`, `>=`
+;; on id-holding operands; a `BTreeMap`/`BTreeSet` whose written key type names a holder (the
+;; name matched as written, so `std::collections::BTreeMap<..>` spelled out in full and a
+;; BTreeMap whose type is only inferred are missed); and a derived `Ord`/`PartialOrd` on a
+;; holder type (a hand-written `impl Ord` is found through its body's `cmp` calls instead).
+;; Why: ids are numbered in the order threads reached the items, so any order over them differs
+;; between runs and between thread counts, and output or keys built from it are not
+;; deterministic (rule 25). What to do: sort by the item key for output or a key, use a hash map
+;; where only lookup is needed; an order kept purely in memory for a lookup structure can stay,
+;; and the reader says so on the row.
+(rule (order-recv n r) (expr n "$r.sort()"))
+(rule (order-recv n r) (expr n "$r.sort_unstable()"))
+(rule (order-recv n r) (expr n "$r.is_sorted()"))
+(rule (order-recv n r) (expr n "$r.binary_search($k)"))
+(rule (order-recv n r) (expr n "$r.cmp($o)"))
+(rule (order-recv n r) (expr n "$r.partial_cmp($o)"))
+(rule (order-recv n r) (expr n "$r.max($o)"))
+(rule (order-recv n r) (expr n "$r.min($o)"))
+(rule (order-recv n r) (expr n "$r.clamp($lo, $hi)"))
+
+;; Zero-argument max and min are the iterator's: the result says what is ordered.
+(rule (order-result n) (expr n "$r.max()"))
+(rule (order-result n) (expr n "$r.min()"))
+
+(rule (order-key n f) (expr n "$r.sort_by_key($f)"))
+(rule (order-key n f) (expr n "$r.sort_unstable_by_key($f)"))
+(rule (order-key n f) (expr n "$r.sort_by_cached_key($f)"))
+(rule (order-key n f) (expr n "$r.is_sorted_by_key($f)"))
+(rule (order-key n f) (expr n "$r.max_by_key($f)"))
+(rule (order-key n f) (expr n "$r.min_by_key($f)"))
+(rule (order-key n f) (expr n "$r.binary_search_by_key($k, $f)"))
+(rule (order-search-key n k) (expr n "$r.binary_search_by_key($k, $f)"))
+
+(rule (order-binop n a) (expr n "$a < $b"))
+(rule (order-binop n b) (expr n "$a < $b"))
+(rule (order-binop n a) (expr n "$a > $b"))
+(rule (order-binop n b) (expr n "$a > $b"))
+(rule (order-binop n a) (expr n "$a <= $b"))
+(rule (order-binop n b) (expr n "$a <= $b"))
+(rule (order-binop n a) (expr n "$a >= $b"))
+(rule (order-binop n b) (expr n "$a >= $b"))
+
+;; order-evidence: the method's (or operator's) name and a type it orders by.
+(rule (order-evidence n what t) (order-recv n r) (child n nr) (kind nr "NAME_REF") (text nr what) (type-of r t))
+(rule (order-evidence n what t) (order-recv n r) (child n nr) (kind nr "NAME_REF") (text nr what) (type-of n t))
+(rule (order-evidence n what t) (order-result n) (child n nr) (kind nr "NAME_REF") (text nr what) (type-of n t))
+(rule (order-evidence n what t)
+  (order-key n f)
+  (kind f "CLOSURE_EXPR")
+  (child f body)
+  (type-of body t)
+  (child n nr) (kind nr "NAME_REF") (text nr what))
+(rule (order-evidence n what t)
+  (order-search-key n k)
+  (type-of k t)
+  (child n nr) (kind nr "NAME_REF") (text nr what))
+(rule (order-evidence n what t)
+  (named-call n what)
+  (text-match what "^(cmp|partial_cmp|max|min)$")
+  (call-arg n a)
+  (type-of a t))
+(rule (order-evidence n what t) (order-binop n a) (type-of a t) (text-capture n "^.*?(<=|>=|<|>)" what))
+(rule (site-type t) (order-evidence n what t))
+
+(rule (id-order-site n what t) (order-evidence n what t) (holds-id t))
+
+;; A BTreeMap or BTreeSet written with a key that names a holder.
+(rule (id-order-site n what d)
+  (type n "BTreeMap<$k, $v>")
+  (descendant k p)
+  (kind p "PATH")
+  (resolves p d)
+  (holder d)
+  (text-capture n "^(BTreeMap)" what))
+(rule (id-order-site n what d)
+  (type n "BTreeSet<$k>")
+  (descendant k p)
+  (kind p "PATH")
+  (resolves p d)
+  (holder d)
+  (text-capture n "^(BTreeSet)" what))
+
+;; A derived Ord or PartialOrd on a holder type.
+(rule (id-order-site at what a)
+  (holder a)
+  (defines s a)
+  (child s at)
+  (kind at "ATTR")
+  (text-capture at "derive\\([^)]*\\b(Ord|PartialOrd)\\b" what))
+
+(rule (id-order n what t)
+  (id-order-site n what t)
+  (not (in-test n))
+  (file-path n p)
+  (not (text-match p "(^|/)(tests|benches)/|(^|/|_)tests?\\.rs$")))
+(rule (id-order-in-test n what t) (id-order-site n what t) (in-test n))
+(rule (id-order-in-test n what t)
+  (id-order-site n what t)
+  (file-path n p)
+  (text-match p "(^|/)(tests|benches)/|(^|/|_)tests?\\.rs$"))
+
+(lint id-order warning
+  "an order over item ids (`$what` over `$t`): ids are numbered in the order threads interned them, so this order differs between runs; sort by the item key (`blaze_id::key_of`) for output or a key, or use a hash map where only lookup is needed")
+(lint id-order-in-test warning
+  "test code orders item ids (`$what` over `$t`): a test that compares this order is flaky by thread count")
+
+;; ------------------------------------------------------------------------------------------
+;; 4. id-in-record: a type written as a record, or serialized, that holds an id.
+;;
+;; Finds an `impl` of `blaze_format::Record`, `blaze_format::Persist`, `serde::ser::Serialize`
+;; or `serde::de::Deserialize` (the tree's CBOR, blaze-protocol's `cbor`, is a serde
+;; serializer, so serde's traits are its encode and decode) whose self type is a holder, matched
+;; by resolving the impl's two type paths; a `#[derive(..)]` naming Serialize, Deserialize,
+;; Record or Persist on a holder (a derive's impl is not expanded for the query, so the derive
+;; is matched by its text, any path to those names); and each field of such a type that holds an
+;; id (`id-in-record-field`). A blanket impl (`impl<T: Record> Persist for T`) is not a holder's
+;; and is not listed: its instances are found at their own derive or impl. Why: an id in a record
+;; is a slot of one process's arena; read back in another process, after an edit or after
+;; `Memo::next` it names another item or a dead arena. Under the design `blaze_id::Portable` is
+;; required by these traits and no id implements it. What to do: the field becomes an `ItemKey`,
+;; encoded by `blaze_id::key_of` and decoded by `blaze_id::resolve`; the record family's own
+;; portable form (session bits, a DefMap position, PortableIds) is deleted with it.
+(rule (record-trait d) (def-path d "blaze_format::Record"))
+(rule (record-trait d) (def-path d "blaze_format::Persist"))
+(rule (record-trait d) (def-path d "serde::ser::Serialize"))
+(rule (record-trait d) (def-path d "serde::de::Deserialize"))
+
+(rule (record-impl i a how)
+  (syntax i "IMPL")
+  (child i tp)
+  (kind tp "PATH_TYPE")
+  (resolves tp td)
+  (record-trait td)
+  (def-path td how)
+  (child i sp)
+  (kind sp "PATH_TYPE")
+  (resolves sp a)
+  (holder a))
+(rule (record-derive s a how)
+  (holder a)
+  (defines s a)
+  (child s at)
+  (kind at "ATTR")
+  (text-capture at "derive\\([^)]*\\b(Serialize|Deserialize|Record|Persist)\\b" how))
+
+(rule (record-type a) (record-impl i a how))
+(rule (record-type a) (record-derive s a how))
+
+(rule (id-in-record-site n a how) (record-impl n a how))
+(rule (id-in-record-site n a how) (record-derive n a how))
+
+(rule (id-in-record n a how)
+  (id-in-record-site n a how)
+  (not (in-test n))
+  (file-path n p)
+  (not (text-match p "(^|/)(tests|benches)/|(^|/|_)tests?\\.rs$")))
+(rule (id-in-record-in-test n a how) (id-in-record-site n a how) (in-test n))
+(rule (id-in-record-in-test n a how)
+  (id-in-record-site n a how)
+  (file-path n p)
+  (text-match p "(^|/)(tests|benches)/|(^|/|_)tests?\\.rs$"))
+
+(rule (id-in-record-field fs a d) (record-type a) (field-holds fs f a d))
+(rule (id-in-record-field-in-test fs a d) (id-in-record-field fs a d) (in-test fs))
+
+(lint id-in-record warning
+  "`$a` holds an item id and is a record or serialized here (`$how`): the id is a slot of this process's arena; the record names the item by `ItemKey` (`blaze_id::key_of` to write, `blaze_id::resolve` to read), and `blaze_id::Portable` will refuse this type")
+(lint id-in-record-in-test warning
+  "a test type holding an item id is a record or serialized (`$a`, `$how`)")
+(lint id-in-record-field warning
+  "this field of record type `$a` holds an item id (through `$d`): it becomes an `ItemKey` in the record's form")
+(lint id-in-record-field-in-test warning
+  "this field of test record type `$a` holds an item id (through `$d`)")
+
+;; ------------------------------------------------------------------------------------------
+;; 5. id-in-carried-table: a table that can outlive its snapshot, holding an id.
+;;
+;; The language cannot say "outlives a snapshot" (no relation follows ownership from the
+;; database, a static or the store to a field), so this is the nearest sound
+;; over-approximation: every field holding an id (directly or through a holder) whose written
+;; type is shared (a `Lock`, `Mutex`, `RwLock`, `OnceLock`, `OnceCell`, `ArcSwap`, a papaya or
+;; dash map), and every `static` holding one. It finds the body store's `traces` (a `Lock` of
+;; a map keyed by `DefWithBodyId`). The id may sit in the key or the value; the row's `d` says
+;; which type it came through. A human reads each row: a table rebuilt per snapshot stays; one
+;; that outlives `Memo::next` is keyed by `ItemKey`. `id-in-table` lists the plain map and Vec
+;; fields holding an id for the same read, since an owner struct may itself be carried.
+(rule (id-in-carried-table-site fs a d)
+  (field-holds fs f a d)
+  (text-match fs "\\b(Lock|Mutex|RwLock|OnceLock|OnceCell|ArcSwap|DashMap|papaya)\\b"))
+(rule (id-in-carried-table-site fs a d) (static-holds fs d) (defines fs a))
+
+(rule (id-in-carried-table fs a d)
+  (id-in-carried-table-site fs a d)
+  (not (in-test fs))
+  (file-path fs p)
+  (not (text-match p "(^|/)(tests|benches)/|(^|/|_)tests?\\.rs$")))
+(rule (id-in-carried-table-in-test fs a d) (id-in-carried-table-site fs a d) (in-test fs))
+(rule (id-in-carried-table-in-test fs a d)
+  (id-in-carried-table-site fs a d)
+  (file-path fs p)
+  (text-match p "(^|/)(tests|benches)/|(^|/|_)tests?\\.rs$"))
+
+(rule (id-in-table-site fs a d)
+  (field-holds fs f a d)
+  (text-match fs "\\b(HashMap|HashSet|BTreeMap|BTreeSet|IndexMap|IndexSet|Vec|VecDeque|SmallVec|ThinVec)\\b")
+  (not (text-match fs "\\b(Lock|Mutex|RwLock|OnceLock|OnceCell|ArcSwap|DashMap|papaya)\\b")))
+(rule (id-in-table fs a d)
+  (id-in-table-site fs a d)
+  (not (in-test fs))
+  (file-path fs p)
+  (not (text-match p "(^|/)(tests|benches)/|(^|/|_)tests?\\.rs$")))
+
+(lint id-in-carried-table warning
+  "a shared table in `$a` holds an item id (through `$d`): if it outlives a snapshot (a static, the store, a long-lived owner) it hands out ids of dropped arenas after `Memo::next`; key it by `ItemKey`, or show it is rebuilt per snapshot")
+(lint id-in-carried-table-in-test warning
+  "a shared table in test code holds an item id (`$a`, through `$d`)")
+(lint id-in-table warning
+  "a map or Vec field of `$a` holds an item id (through `$d`): read whether `$a` outlives its snapshot; if it does, key it by `ItemKey`")
+
+;; ------------------------------------------------------------------------------------------
+;; 6. id-debug-in-output: an id printed with `{:?}` outside tests.
+;;
+;; Finds each argument of a `format_args!` (so `format!`, `write!`, `println!`, `panic!`,
+;; `assert!`'s message and every macro built on it) whose template has a Debug placeholder and
+;; whose type holds an id. An id implements Debug and not Display, so an id argument of such a
+;; template is printed by Debug; a holder argument prints its ids inside. Inline captures
+;; (`{def:?}`) have no argument node: they are found by the name of the template's first inline
+;; Debug capture, matched to a binding of that name in the enclosing fn whose type holds an id
+;; (shadowing is ignored, and only the first capture of a template is read). Missed: `tracing`
+;; fields (`?id`), `dbg!`, and a Debug impl that forwards an id. Why: the number printed is the
+;; slot and arena (`4.1:17914`), which mean nothing to a user and differ between runs, so a
+;; message, a log line kept as a record, or a snapshot test built from it is not deterministic.
+;; What to do: print the item's path (or its key) instead.
+(rule (debug-template fa tl)
+  (syntax fa "FORMAT_ARGS_EXPR")
+  (child fa tl)
+  (kind tl "LITERAL")
+  (text-match tl "\\?\\}"))
+(rule (debug-arg x t)
+  (debug-template fa tl)
+  (child fa arg)
+  (kind arg "FORMAT_ARGS_ARG")
+  (child arg x)
+  (type-of x t))
+(rule (site-type t) (debug-arg x t))
+
+(rule (inline-capture tl nm)
+  (debug-template fa tl)
+  (text-capture tl "\\{([A-Za-z_][A-Za-z0-9_]*):[^}]*\\?\\}" nm))
+(rule (inline-binding tl t)
+  (inline-capture tl nm)
+  (enclosing-fn tl f)
+  (defines fsyn f)
+  (descendant fsyn p)
+  (kind p "IDENT_PAT")
+  (child p pn)
+  (kind pn "NAME")
+  (same-text pn nm)
+  (type-of p t))
+(rule (site-type t) (inline-binding tl t))
+
+(rule (id-debug-site x t) (debug-arg x t) (holds-id t))
+(rule (id-debug-site tl t) (inline-binding tl t) (holds-id t))
+
+(rule (id-debug-in-output x t)
+  (id-debug-site x t)
+  (not (in-test x))
+  (file-path x p)
+  (not (text-match p "(^|/)(tests|benches)/|(^|/|_)tests?\\.rs$")))
+(rule (id-debug-in-output-in-test x t) (id-debug-site x t) (in-test x))
+(rule (id-debug-in-output-in-test x t)
+  (id-debug-site x t)
+  (file-path x p)
+  (text-match p "(^|/)(tests|benches)/|(^|/|_)tests?\\.rs$"))
+
+(lint id-debug-in-output warning
+  "an item id is printed with `{:?}` (`$x`, a `$t`): it prints the arena slot, which differs between runs and means nothing to a reader; print the item's path or key instead")
+(lint id-debug-in-output-in-test warning
+  "test code prints an item id with `{:?}` (`$x`, a `$t`): an expectation built from it is flaky")
+
+;; ------------------------------------------------------------------------------------------
+;; census: the count of each lint's sites per crate, `(census crate lint count)`. The lint's
+;; name is bound as text by replacing the crate name's whole text (`text-replace` always
+;; holds), the one way a rule head can carry a constant.
+(rule (census-site k l n) (id-bits n w v) (crate-of n k) (text-replace k "^.*$" "id-bits" l))
+(rule (census-site k l n) (id-bits-in-test n w v) (crate-of n k) (text-replace k "^.*$" "id-bits-in-test" l))
+(rule (census-site k l n) (id-cast n y t) (crate-of n k) (text-replace k "^.*$" "id-cast" l))
+(rule (census-site k l n) (id-cast-in-test n y t) (crate-of n k) (text-replace k "^.*$" "id-cast-in-test" l))
+(rule (census-site k l n) (id-order n w t) (crate-of n k) (text-replace k "^.*$" "id-order" l))
+(rule (census-site k l n) (id-order-in-test n w t) (crate-of n k) (text-replace k "^.*$" "id-order-in-test" l))
+(rule (census-site k l n) (id-in-record n a h) (crate-of n k) (text-replace k "^.*$" "id-in-record" l))
+(rule (census-site k l n) (id-in-record-in-test n a h) (crate-of n k) (text-replace k "^.*$" "id-in-record-in-test" l))
+(rule (census-site k l n) (id-in-record-field n a d) (crate-of n k) (text-replace k "^.*$" "id-in-record-field" l))
+(rule (census-site k l n) (id-in-carried-table n a d) (crate-of n k) (text-replace k "^.*$" "id-in-carried-table" l))
+(rule (census-site k l n) (id-in-carried-table-in-test n a d) (crate-of n k) (text-replace k "^.*$" "id-in-carried-table-in-test" l))
+(rule (census-site k l n) (id-in-table n a d) (crate-of n k) (text-replace k "^.*$" "id-in-table" l))
+(rule (census-site k l n) (id-debug-in-output n t) (crate-of n k) (text-replace k "^.*$" "id-debug-in-output" l))
+(rule (census-site k l n) (id-debug-in-output-in-test n t) (crate-of n k) (text-replace k "^.*$" "id-debug-in-output-in-test" l))
+
+(rule (census k l c) (census-site k l n0) (count c (census-site k l n)))

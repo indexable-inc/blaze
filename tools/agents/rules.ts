@@ -138,16 +138,17 @@ Build only what you are proud of, on the first iteration too. Aim every design a
 
 ## The goal
 
-Fast incremental compiles of real Rust in a million-line workspace. When two things trade, the order is: incremental compile time, then memory use, then cold compile time, then disk cleanup that never blocks, then disk use. Best on 128 cores, good on a typical Mac (8 to 16 cores, 16 to 64 GB), with one code path sized by the machine.
+Fast incremental compiles of real Rust in a million-line workspace. When two trade, the order is: incremental time (large crates and files, after a restart too) and lints as fast; records from remote; memory; cold time; cleanup that never blocks; disk use. Best on 128 cores, good on a typical Mac (8 to 16 cores, 16 to 64 GB), with one code path sized by the machine.
 
-## The design ([in full](docs/v2/plan/design/target.md))
+## The design ([in full](docs/v2/plan/design/bottom.md))
 
 - Everything kept is a record: keyed from text before the work, written once, read in place.
 - A command is a process that answers and exits; no daemon holds state between builds.
 - A record is valid by its key, or else by its read list checked against today's facts.
 - No dependency graph in memory: candidates are found forward from what changed.
 - Work is at item grain: one body, instance, macro call or script run per task.
-- A program is a manifest over shared code records; an edit patches bytes in proportion to it.
+- A program runs from code records in its own process: compiled on first call, no link step.
+- A dependency is only its records and an item only its key; text for the crate compiled alone.
 - A check happens once and leaves a proof later code takes; a coarse proof covers all under it.
 - Records are shared by content: CI fills a cache anyone can read, so std arrives precompiled.
 - Remote execution is the same driver with another executor.
@@ -159,7 +160,7 @@ In scope:
 - Cargo workspaces. The acceptance projects are reth, tempo and blaze itself.
 - Hosts: macOS on arm64, and Linux (arm64 first; x86-64 is covered by CI).
 - A build runs when asked, and may leave a helper with an expiry that never builds on its own.
-- \`run\` and \`build\` check only the code the program reaches; \`check\` checks everything asked.
+- \`run\`, \`test\`, \`check\`; later \`export\` (a native file). No \`build\`. A run compiles what is called.
 - Dependencies and cached records are fully optimized; workspace code is built fast, then tiered up in the background, the top tier optimizing across functions at function grain.
 - The shared cache is read without a login. Only CI, and later the remote workers, write to it.
 - Private builds can always stay local: nothing leaves the machine unless an organisation opts in.
@@ -168,14 +169,13 @@ In scope:
 - A plain Rust project adopts blaze's checks by steps: \`rust\`, \`suggest\`, \`edition\`, \`strict\`.
 
 Not now:
-- \`blaze watch\`, or building on save: edits come in transactions whose middle states are invalid.
-- Live patching that keeps a running program's state; wanted later (now: patch the file, rerun).
+- \`blaze watch\` or building on save; live patching that keeps a program's state (wanted later).
 - Windows, and Buck or Bazel workspaces.
 
 ## How work is done
 
 - Lanes write; the main agent compiles each piece within minutes and admits it alone (35, 36, 48).
-- Nothing merges until a release blaze of the exact merge commit has passed the smoke run (68).
+- Until \`blaze run\` exists again, a merge's proof is the whole build and its tests, quoted (68).
 - Every command has a timeout; a hang is a bug to report, never one to wait out (69, 18).
 - Facts come from tool output in this session (61); verdicts from real projects, run first (7, 82).
 - Build, test and land: docs/contributing.md. Every doc: docs/README.md.
@@ -688,8 +688,8 @@ export const rules = [
 	{
 		id: "proof-before-merge",
 		skill: "landing",
-		line: "Nothing merges until a release blaze of the exact merge commit has passed the smoke run.",
-		info: "Nothing merges to main (through `land.py`, an admin merge, or a cut of the integration tree) until a release blaze built from the exact tree that will be main has run the smoke (on the Mac or on blaze-vm; the quote names its host) and its quote is in the pull request's body. That tree is the head of a branch that contains the main it joins (`git merge origin/main` first, then build and smoke that commit): a `--no-ff` merge of it has the head's tree. When main moves past the head, the merge's tree changes, and the quote is made again. The smoke is `scripts/src/bin/smoke.rs`: `blaze run -q -p scripts --bin smoke -- '{\"blaze\": \"<release blaze>\", \"work\": \"<empty dir>\"}' > smoke.txt`. It runs hello-world in a fresh home, each step one child under a deadline that kills its process group (cold 180 s, the rest 60 s: ceilings for something being wrong, not performance bars): a cold `blaze run`, a no-op `blaze run`, a body edit then `blaze run`, a comment edit then `blaze run` (each counted only with exit status 0 and the program's own line, the new line after the body edit), then `blaze check` and `blaze stop`. Its standard output is the quote, a block whose first line is `blaze-smoke 1`: the tree (`git rev-parse HEAD^{tree}`, with `+dirty <sha256>` when the checkout had changes), the binary's sha256, the host, each step's outcome and wall time, and `verdict ok` or `verdict FAILED <the first failure>` (`measure-the-exact-tree`). It exits 0 only for `verdict ok`; a failed step's output tail, `serve.log`'s tail and the slowest spans of the last build go to standard error, so the finding needs no rerun (`every-command-has-a-timeout`). `land.py` puts the quote in the body and will not open, resume or merge a pull request unless `smoke '{\"verify\": ...}'` holds the quote to the head's tree, clean, with verdict ok; it asks again just before it merges, against the head GitHub has, and refuses when main has moved past that head. No flag skips this, and an admin merge needs it as much. A change to build scripts, proc macros, C dependencies or the sandbox also runs `harness/v2/real_smoke.py` (how-to `real-smoke`). A step that fails or times out blocks the merge: fix it, never run it again hoping it passes (`no-fallback`). The merge gate's compile and unit tests do not stand in for this, and neither does a smoke of the branch before the merge or of another commit. A change that builds no binary (only docs or these rules) is smoked too: an exemption a pull request declares for itself is the kind of stand-in this rule removes.",
+		line: "Until `blaze run` exists again: the workspace compiles and its tests pass on the exact tree.",
+		info: "SUSPENDED IN PART since 2026-11-15, by the owner: the old item layer, the daemon and the lints were deleted from main that day to rebuild the item layer from scratch (docs/v2/plan/design/bottom.md), so no blaze exists that can run the hello-world smoke, and `land.py`, which demands its quote, cannot be used. Until `blaze run` of hello-world passes on the new layer, the proof of a merge is: on the exact tree that will be main (the head of a branch that contains main), `cargo check --workspace --exclude blaze-std --all-targets` passes and the tests of every crate the change touches pass, both quoted in the pull request with the tree hash and the host; the allocator and untyped-error ratchets pass; then an admin merge pinned to that head. The first change that makes `blaze run` of hello-world pass restores this rule as written below, with the smoke rewritten for `run`, `test` and `check`. The rule as it was and will be again: Nothing merges to main (through `land.py`, an admin merge, or a cut of the integration tree) until a release blaze built from the exact tree that will be main has run the smoke (on the Mac or on blaze-vm; the quote names its host) and its quote is in the pull request's body. That tree is the head of a branch that contains the main it joins (`git merge origin/main` first, then build and smoke that commit): a `--no-ff` merge of it has the head's tree. When main moves past the head, the merge's tree changes, and the quote is made again. The smoke is `scripts/src/bin/smoke.rs`: `blaze run -q -p scripts --bin smoke -- '{\"blaze\": \"<release blaze>\", \"work\": \"<empty dir>\"}' > smoke.txt`. It runs hello-world in a fresh home, each step one child under a deadline that kills its process group (cold 180 s, the rest 60 s: ceilings for something being wrong, not performance bars): a cold `blaze run`, a no-op `blaze run`, a body edit then `blaze run`, a comment edit then `blaze run` (each counted only with exit status 0 and the program's own line, the new line after the body edit), then `blaze check` and `blaze stop`. Its standard output is the quote, a block whose first line is `blaze-smoke 1`: the tree (`git rev-parse HEAD^{tree}`, with `+dirty <sha256>` when the checkout had changes), the binary's sha256, the host, each step's outcome and wall time, and `verdict ok` or `verdict FAILED <the first failure>` (`measure-the-exact-tree`). It exits 0 only for `verdict ok`; a failed step's output tail, `serve.log`'s tail and the slowest spans of the last build go to standard error, so the finding needs no rerun (`every-command-has-a-timeout`). `land.py` puts the quote in the body and will not open, resume or merge a pull request unless `smoke '{\"verify\": ...}'` holds the quote to the head's tree, clean, with verdict ok; it asks again just before it merges, against the head GitHub has, and refuses when main has moved past that head. No flag skips this, and an admin merge needs it as much. A change to build scripts, proc macros, C dependencies or the sandbox also runs `harness/v2/real_smoke.py` (how-to `real-smoke`). A step that fails or times out blocks the merge: fix it, never run it again hoping it passes (`no-fallback`). The merge gate's compile and unit tests do not stand in for this, and neither does a smoke of the branch before the merge or of another commit. A change that builds no binary (only docs or these rules) is smoked too: an exemption a pull request declares for itself is the kind of stand-in this rule removes.",
 		reason: "2026-11-13: two merges went to main with only a compile check; the built engine then segfaulted at start on Linux and a cold hello-world build looped forever, found hours later because the binary was never run.",
 		link: "docs/contributing.md#landing-a-change",
 	},

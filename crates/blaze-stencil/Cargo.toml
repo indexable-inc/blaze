@@ -51,10 +51,8 @@ blaze-inproc.workspace = true
 # as a build does, each function's IR from hir-ty-codegen.
 base-db.workspace = true
 blaze-format.workspace = true
-blaze-lower.workspace = true
 blaze-macro-eval.workspace = true
 blaze-memo.workspace = true
-blaze-query.workspace = true
 blaze-units.workspace = true
 blaze-vfs.workspace = true
 hir-ty-codegen.workspace = true

@@ -205,8 +205,7 @@ is an error. Where a mechanical fix exists, `blaze check --fix` applies it.
 | `blaze::std_use` | a use of an item of Rust's `std` that [bstd](std.md) replaces or forbids (ambient authority, a hidden cost, a global-heap allocation, a renamed type), by what it resolves to, one finding per item per function with its count; `build_script_ambient` is the same table and walk over a build script | the renames (`Arc` to `bstd::sync::Shared`, ...); none for the rest, which change what a function is handed |
 
 The last three rows are built: the lints of code blaze cannot analyse
-([lints.md](../../../lints.md#proc_macro), [lints.md](../../../lints.md#build_script_ambient))
-and `std_use` ([lints.md](../../../lints.md#std_use)), which names what is written where
+and `std_use`, which names what is written where
 `blaze::ambient` and `blaze::global_alloc`, the effects, will prove what is reached. `std_use`
 is `allow` everywhere until a crate has `#![blaze::capabilities]` or a workspace asks for it
 once [bstd](std.md) is in the tree (`BSTD_IN_TREE`). The first two

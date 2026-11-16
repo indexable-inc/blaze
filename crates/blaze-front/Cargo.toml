@@ -30,8 +30,6 @@ hir-ty-pure.workspace = true
 # A body's identity and the classification of what its check read into facts.
 blaze-item-hash.workspace = true
 blaze-items.workspace = true
-# The query kinds facts are named by.
-blaze-query.workspace = true
 # What a late read answers (`outside::var_answer`, `outside::file_answer`): the one rule the
 # host's outside table and a task's check of what its expansions saw share.
 blaze-host.workspace = true

@@ -19,8 +19,6 @@ doctest = false
 plants = []
 
 [dependencies]
-# `Targets`, which a slot's key is of (`slot::key_of`).
-blaze-api.workspace = true
 # `Stamp`, compared whole.
 blaze-core.workspace = true
 # `ContentId`, `Hasher`: every key and digest.

@@ -13,19 +13,20 @@ iterate. Rules 28, 62, 66 and 67 say how.
 
 ## The goal
 
-Fast incremental compiles of real Rust in a million-line workspace. When two things trade, the order
-is: incremental compile time, then memory use, then cold compile time, then disk cleanup that never
-blocks, then disk use. Best on 128 cores, good on a typical Mac (8 to 16 cores, 16 to 64 GB), with
-one code path sized by the machine.
+Fast incremental compiles of real Rust in a million-line workspace. When two trade, the order is:
+incremental time (large crates and files, after a restart too) and lints as fast; records from
+remote; memory; cold time; cleanup that never blocks; disk use. Best on 128 cores, good on a typical
+Mac (8 to 16 cores, 16 to 64 GB), with one code path sized by the machine.
 
-## The design ([in full](docs/v2/plan/design/target.md))
+## The design ([in full](docs/v2/plan/design/bottom.md))
 
 - Everything kept is a record: keyed from text before the work, written once, read in place.
 - A command is a process that answers and exits; no daemon holds state between builds.
 - A record is valid by its key, or else by its read list checked against today's facts.
 - No dependency graph in memory: candidates are found forward from what changed.
 - Work is at item grain: one body, instance, macro call or script run per task.
-- A program is a manifest over shared code records; an edit patches bytes in proportion to it.
+- A program runs from code records in its own process: compiled on first call, no link step.
+- A dependency is only its records and an item only its key; text for the crate compiled alone.
 - A check happens once and leaves a proof later code takes; a coarse proof covers all under it.
 - Records are shared by content: CI fills a cache anyone can read, so std arrives precompiled.
 - Remote execution is the same driver with another executor.
@@ -38,7 +39,7 @@ In scope:
 - Cargo workspaces. The acceptance projects are reth, tempo and blaze itself.
 - Hosts: macOS on arm64, and Linux (arm64 first; x86-64 is covered by CI).
 - A build runs when asked, and may leave a helper with an expiry that never builds on its own.
-- `run` and `build` check only the code the program reaches; `check` checks everything asked.
+- `run`, `test`, `check`; later `export` (a native file). No `build`. A run compiles what is called.
 - Dependencies and cached records are fully optimized; workspace code is built fast, then tiered up
   in the background, the top tier optimizing across functions at function grain.
 - The shared cache is read without a login. Only CI, and later the remote workers, write to it.
@@ -48,14 +49,13 @@ In scope:
 - A plain Rust project adopts blaze's checks by steps: `rust`, `suggest`, `edition`, `strict`.
 
 Not now:
-- `blaze watch`, or building on save: edits come in transactions whose middle states are invalid.
-- Live patching that keeps a running program's state; wanted later (now: patch the file, rerun).
+- `blaze watch` or building on save; live patching that keeps a program's state (wanted later).
 - Windows, and Buck or Bazel workspaces.
 
 ## How work is done
 
 - Lanes write; the main agent compiles each piece within minutes and admits it alone (35, 36, 48).
-- Nothing merges until a release blaze of the exact merge commit has passed the smoke run (68).
+- Until `blaze run` exists again, a merge's proof is the whole build and its tests, quoted (68).
 - Every command has a timeout; a hang is a bug to report, never one to wait out (69, 18).
 - Facts come from tool output in this session (61); verdicts from real projects, run first (7, 82).
 - Build, test and land: docs/contributing.md. Every doc: docs/README.md.
@@ -160,7 +160,7 @@ tools/agents/rules.ts, then run `bun tools/agents/rules.ts --write`.
 - **37. land-through-pr**: Land small and often through a pull request with `.github/scripts/land.py`; never push to main.
 - **38. own-prs-to-merge**: Any agent may take any open pull request or issue to done; tell the owning lane what changed.
 - **40. credit-people**: Credit a suggestion, diagnosis or patch with a `Co-authored-by:` trailer.
-- **68. proof-before-merge**: Nothing merges until a release blaze of the exact merge commit has passed the smoke run.
+- **68. proof-before-merge**: Until `blaze run` exists again: the workspace compiles and its tests pass on the exact tree.
 
 ### Docs and scripts (skill `docs-and-scripts`)
 - **33. no-mcp**: Agent interfaces are a Unix socket or HTTP with one versioned schema in deterministic CBOR.

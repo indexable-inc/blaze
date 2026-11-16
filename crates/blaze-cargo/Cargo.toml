@@ -62,32 +62,21 @@ blaze-macro-eval.workspace = true
 blaze-manifest.workspace = true
 blaze-global.workspace = true
 blaze-graph.workspace = true
-blaze-history.workspace = true
 # The flight recorder in both; the daemon writes the history, the client sends its rows and
 # exports `BLAZE_PROFILE`'s trace from it.
 blaze-profile.workspace = true
 # `blaze pprof`: the reader, views, reports and exports of .ixprof and pprof files.
 ix-prof.workspace = true
 regex.workspace = true
-# `blaze explore`: the explorer's server, started in the daemon on the first request for it.
-blaze-explore = { workspace = true, optional = true }
 # The record batches of `blaze debug sql`, encoded in the daemon and printed by the CLI.
 arrow-array.workspace = true
 blaze-inproc.workspace = true
-blaze-intent.workspace = true
-# Astlog rules over the front end: `Request::Query`'s rows and `Edit::Rules`' rewrites. The
-# daemon links its engine only; tree-sitter stays in `tools/astlog`.
-blaze-astlog.workspace = true
 # `--dry-run`'s unified diff of the edits a `--rules` or `--replace` would write.
 similar.workspace = true
-# `blaze check`'s lints: clippy's and blaze's, run over a unit's crate beside its check, and the
-# baselines the client checks a run's counts against.
-blaze-lints.workspace = true
 blaze-image.workspace = true
 blaze-mem.workspace = true
 blaze-protocol.workspace = true
 proc-macro-api.workspace = true
-blaze-ui.workspace = true
 blaze-units.workspace = true
 # `blaze audit`, and the git fetcher's check of a tree against its pin (`weak_source_pin`).
 blaze-audit.workspace = true
@@ -117,17 +106,12 @@ zstd.workspace = true
 # The `.tar.xz` files of blaze's own toolchain (`cargo/toolchain/own.rs`): in Rust, within 1.3x
 # of liblzma's time on rustc's 84 MB.
 lzma-rust2 = { workspace = true, features = ["std", "xz", "optimization"] }
-blaze-live.workspace = true
-# blaze v2's daemon (`serve`): the agent API, the sans-IO core and its drivers, the VFS, the
-# query database, the store, the workspace load's queries, user code, codegen and the linker.
-blaze-api.workspace = true
 # What the thin `blaze` and this CLI must say and send alike, each written once there: the
 # status and `Finished` lines, the color rule, the request of a plain build or run, and what
 # the thin `blaze` hands a command it began to this one with (`cli/resume.rs`).
 blaze-thin.workspace = true
 blaze-core.workspace = true
 blaze-vfs.workspace = true
-blaze-query.workspace = true
 blaze-memo.workspace = true
 blaze-cas.workspace = true
 blaze-gc.workspace = true
@@ -154,7 +138,6 @@ blaze-launch.workspace = true
 # Packs (docs/remote-cache.md, "Packs"): the sans-IO cores `serve/packs` and `cli/store` drive.
 blaze-pack.workspace = true
 blaze-launch-host.workspace = true
-blaze-lower.workspace = true
 # The device build of an `artifact = "gpu"` dependency: its `GPU_ENTRIES` written as MSL at its
 # link (`serve/unit/compile.rs`, `assemble`), which the record key covers as this crate's code.
 blaze-shader.workspace = true
@@ -204,7 +187,6 @@ native = [
     "hir-ty-codegen/llvm",
     "blaze-registry/net",
     "blaze-global/net",
-    "dep:blaze-explore",
     "dep:blaze-tree",
     "dep:blaze-metadata",
 ]

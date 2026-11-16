@@ -36,7 +36,6 @@ unicode-normalization.workspace = true
 unicode-security.workspace = true
 
 base-db.workspace = true
-blaze-api.workspace = true
 blaze-format.workspace = true
 blaze-ids.workspace = true
 blaze-items.workspace = true

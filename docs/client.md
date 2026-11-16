@@ -1,6 +1,8 @@
 ---
-status: current
+status: superseded
 summary: Reaching the daemon with no process launch (blaze-client from Rust, its C ABI, the Node-API addon for TypeScript, the small `blaze-fast` command line), and the thin `blaze`, the small program a no-op build or run costs one round trip through.
+date: 2026-11-15
+superseded_by: v2/plan/design/bottom.md
 ---
 # Calling the daemon without launching blaze
 

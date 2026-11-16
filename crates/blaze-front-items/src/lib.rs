@@ -37,8 +37,6 @@ pub mod lines;
 pub mod modules;
 #[cfg(test)]
 mod cutoffs;
-#[cfg(test)]
-mod oracle;
 pub mod parse;
 pub mod steps;
 pub mod table;

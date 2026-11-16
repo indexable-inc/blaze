@@ -149,27 +149,13 @@ fn hashed<R>(write: impl FnOnce(&mut Bytes) -> R) -> (R, ContentId) {
     })
 }
 
-/// The top bit of a key's byte 8: the key is of something inside a body (an item of a block,
-/// a block's module, a closure, an anonymous constant, an opaque type).
-const INNER: u8 = 0x80;
-
-/// A key has rustc's `DefPathHash` shape, so [`resolve`] goes straight to one index of one
-/// crate: bytes 0..8 are the first 8 of its crate's key, byte 8's top bit is [`INNER`], and the
-/// other 247 bits are the hash of its preimage.
-impl ItemKey {
-    fn crate_prefix(&self) -> [u8; 8] {
-        *self.0.0.first_chunk().expect("a key is 32 bytes")
-    }
-
-    fn is_inner(&self) -> bool {
-        self.0.0[8] & INNER != 0
-    }
-}
-
+/// A key of rustc's `DefPathHash` shape (`blaze_id::ItemKey`), so [`resolve`] goes straight to
+/// one index of one crate: bytes 0..8 are the first 8 of its crate's key, byte 8's top bit is
+/// [`ItemKey::INNER`], and the other 247 bits are `hash`.
 fn shaped(prefix: [u8; 8], inner: bool, hash: ContentId) -> ItemKey {
     let mut bytes = hash.0;
     bytes[..8].copy_from_slice(&prefix);
-    bytes[8] = (bytes[8] & !INNER) | if inner { INNER } else { 0 };
+    bytes[8] = (bytes[8] & !ItemKey::INNER) | if inner { ItemKey::INNER } else { 0 };
     ItemKey(ContentId(bytes))
 }
 

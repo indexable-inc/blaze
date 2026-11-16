@@ -28,7 +28,6 @@ blaze-ids.workspace = true
 blaze-lint-defs.workspace = true
 blaze-radix.workspace = true
 blaze-protocol.workspace = true
-blaze-query.workspace = true
 blaze-serde.workspace = true
 blaze-source.workspace = true
 blaze-manifest.workspace = true

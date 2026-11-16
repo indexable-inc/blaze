@@ -28,7 +28,6 @@ blaze-ids.workspace = true
 blaze-inproc.workspace = true
 blaze-items.workspace = true
 blaze-lazy = { workspace = true, features = ["daemon"] }
-blaze-live.workspace = true
 blaze-mem.workspace = true
 blaze-sha256.workspace = true
 gimli.workspace = true
