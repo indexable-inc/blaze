@@ -21,7 +21,7 @@
 /// What the usage error prints.
 const DOC: &str = r#"tobstd: moves one crate from `std` onto bstd and blaze-own by tools/std-map.json, editing only through ast-grep (AGENTS.md rule 72).
 
-    blaze run -q -p scripts --bin tobstd -- '{"crate": "<dir>", "mode": "rename"|"add-arg"|"settle", ...}'
+    blaze run -q -p scripts --bin tobstd -- '{"crate": "<dir>", "mode": "rename"|"add-arg"|"settle"|"share-clone", ...}'
     blaze run -q -p scripts --bin tobstd -- selftest
 
     crate     the crate's directory, from `root` (its Cargo.toml and every `.rs` under it but
@@ -32,22 +32,33 @@ const DOC: &str = r#"tobstd: moves one crate from `std` onto bstd and blaze-own 
               add-arg  every `add-arg` row whose shape needs no type: a call `T::f(..)` of a
                        prelude type, a macro (`format!`, `vec!`), a method whose target the text
                        pins (`.collect::<Vec<_>>()`, a string literal's `.to_string()`), and,
-                       with `generic`, the prelude collection types (`Vec<T>` to
-                       `blaze_own::Vec<T, A>`) in the functions that gain the parameter. Each
-                       rewritten site takes `value`; a function that has no parameter of that
-                       name gains `<value>: <type>` and the generic `generic`
+                       with value "alloc", the prelude collection types (`Vec<T>` to
+                       `blaze_own::Vec<T, blaze_own::Alloc<'_>>`) in the functions that gain
+                       the parameter. Each rewritten site takes `value`; a function that has no
+                       parameter of that name gains `<value>: <type>` (and `generic`, if one is
+                       given). A struct, enum or union whose fields name such a type is a wall
+                       `needs-lifetime`: type definitions are not rewritten
               settle   `cargo check --message-format=json --all-targets` on the crate (through
                        `cargo`); each E0061 at a call of a function with a `value` parameter gets
                        `value` added (the call's function gaining the parameter as above), and
                        again, until no such error is left or `steps` checks have run
+              share-clone
+                       the `clone` split, with the compiler as the classifier: every
+                       `$R.clone()` of a file that has a top-level `use` becomes `$R.share()`
+                       (the file gaining `use blaze_own::Share as _;`), then settle's loop,
+                       which also reads each E0599 at a `.share()`: a receiver that is a
+                       blaze-own collection over `Alloc` (its name the last segment of a type
+                       the table moves to blaze_own, or that with `A` before it) becomes
+                       `$R.clone_in(<value>)`, threading `value` as add-arg does; any other is
+                       `$R.clone()` again and a wall `kept-clone` naming its type
     steps     settle's most checks (8)
     value     the name threaded ("alloc"; "fs", "net", "clock" for a capability)
-    type      the parameter's type ("A"; "&bstd::fs::Fs" for a capability)
-    generic   the generic a function gains with the parameter ("A: core::alloc::Allocator +
-              Copy"), or null for a concrete `type`
+    type      the parameter's type ("blaze_own::Alloc<'_>", a one-word `Copy` handle; "&bstd::fs::Fs"
+              for a capability)
+    generic   a generic a function gains with the parameter (null: none, for a concrete `type`;
+              "A: core::alloc::Allocator + Copy" with type "A" for a generic allocator)
     entry     what `main` and a test pass in place of gaining the parameter
-              ("std::alloc::Global", which keeps behaviour exactly as it was), or null: then
-              each is a wall `entry`
+              ("blaze_own::Alloc::global()"), or null: then each is a wall `entry`
     roots     the crates a replacement may name (["core", "blaze_own"]): a row whose
               replacement is elsewhere is skipped, and the summary says so
     cargo     the cargo to run ("/Volumes/Projects/blaze-int-1112-notes/wtcargo.sh")
@@ -56,8 +67,8 @@ const DOC: &str = r#"tobstd: moves one crate from `std` onto bstd and blaze-own 
 Where a site's value would come from:
   - a parameter of its function named `value`: that one;
   - `main`, or a function after `#[test]` (or an attribute whose path ends in `test`): `entry`;
-  - a method with `self` of an inherent impl whose type has a field of a type parameter bounded
-    by `Allocator`: `self.<field>` (with value "alloc" only);
+  - a method with `self` of an inherent impl whose type has a field of type `Alloc<..>` or of a
+    type parameter bounded by `Allocator`: `self.<field>` (with value "alloc" only);
   - else its function gains the parameter.
 A wall is listed with its file and line, and nothing there is changed:
   trait-method  the site is in a method of a trait impl, whose signature the trait fixes
@@ -68,13 +79,26 @@ A wall is listed with its file and line, and nothing there is changed:
   outside       in no function (a closure in a `static`, an array length)
   ambiguous     its function's name names two functions of its file, which ast-grep's rules,
                 selecting by name, cannot tell apart
-  name-taken    its function already has a generic named as `type`'s generic
+  name-taken    its function already has a generic named as `generic` (only with a `generic`)
+  needs-lifetime
+                a type definition's field names a collection that moves to blaze-own: the type
+                gains a lifetime `'a` and its fields `Alloc<'a>`, by a person or a lane
   fn-pointer    a function that gained the parameter is named as a value (an argument: a
-                function pointer, or a closure's stand-in)
+                function pointer, or a closure's stand-in). With a concrete `type` the pointer
+                can take the argument too when every site that builds its type is in the crate;
+                that is listed, not attempted
   entry         `main` or a test, with `entry` null
-  error         (settle) a compile error that is not an E0061 this tool can act on
-  unmatched     (settle) an E0061 whose call no rule matched (inside a macro's tokens, or a
-                call shape the rules do not know); settle stops when a pass changes nothing
+  error         (settle) a compile error that is not an E0061 (or, in share-clone, an E0599 at
+                a `.share()`) this tool can act on
+  unmatched     (settle) an E0061 or `.share()` E0599 that no rule matched (inside a macro's
+                tokens, or a shape the rules do not know); settle stops when a pass changes
+                nothing
+  no-use        (share-clone) a file with `.clone()` calls and no top-level `use`, where the
+                trait's import has no place: its calls stay
+  kept-clone    (share-clone) a `.share()` whose receiver is not a blaze-own collection (a
+                foreign type, a type parameter, a reference to one): `.clone()` again
+  not-in-scope  (share-clone) a `.share()` in a module that does not see the file's import (an
+                inline `mod` with no `use super::*`): `.clone()` again
   steps         (settle) the step limit was reached with E0061s left
 The summary (standard output, JSON): sites converted per row, rows skipped and why, the
 functions that gained the parameter, the walls by kind, and settle's checks run.
@@ -126,6 +150,7 @@ enum Mode {
     Rename,
     AddArg,
     Settle,
+    ShareClone,
 }
 
 impl Mode {
@@ -134,19 +159,28 @@ impl Mode {
             Mode::Rename => "rename",
             Mode::AddArg => "add-arg",
             Mode::Settle => "settle",
+            Mode::ShareClone => "share-clone",
         }
     }
 }
+
+/// The allocator's parameter type: one concrete `Copy` handle, so a function gains no generic.
+const ALLOC_TYPE: &str = "blaze_own::Alloc<'_>";
+/// What `main` and a test pass.
+const ALLOC_ENTRY: &str = "blaze_own::Alloc::global()";
+/// The trait whose `share` a `.clone()` becomes, imported by share-clone.
+const SHARE_USE: &str = "use blaze_own::Share as _;";
 
 impl Input for Args {
     const FIELDS: &'static [&'static str] =
         &["crate", "mode", "steps", "value", "type", "generic", "entry", "roots", "cargo", "root"];
 
     fn parse(f: &Fields<'_>) -> Result<Args, InputError> {
-        let mode = match f.one_of("mode", &["rename", "add-arg", "settle"], None)?.as_str() {
+        let mode = match f.one_of("mode", &["rename", "add-arg", "settle", "share-clone"], None)?.as_str() {
             "rename" => Mode::Rename,
             "add-arg" => Mode::AddArg,
-            _ => Mode::Settle,
+            "settle" => Mode::Settle,
+            _ => Mode::ShareClone,
         };
         let steps = f.int("steps", Some(8))?;
         let steps = usize::try_from(steps).map_err(|_| InputError(format!("{} is {steps}: a count of checks", f.at("steps"))))?;
@@ -154,12 +188,14 @@ impl Input for Args {
         if ident_len(value.as_bytes()) != value.len() || value.is_empty() {
             return Err(InputError(format!("{} is {value:?}: a parameter's name", f.at("value"))));
         }
-        // `null` and absent differ for `generic` and `entry`: absent is the allocator's default.
-        let or_default = |name: &str, default: &str| -> Result<Option<String>, InputError> {
-            match f.get(name) {
-                None => Ok(Some(default.to_owned())),
-                Some(_) => f.str_or_null(name),
-            }
+        // `null` and absent differ for `entry`: absent is the allocator's default.
+        let entry = match f.get("entry") {
+            None => Some(ALLOC_ENTRY.to_owned()),
+            Some(_) => f.str_or_null("entry")?,
+        };
+        let generic = match f.get("generic") {
+            None => None,
+            Some(_) => f.str_or_null("generic")?,
         };
         let roots = f.strs("roots")?;
         Ok(Args {
@@ -167,9 +203,9 @@ impl Input for Args {
             mode,
             steps,
             value,
-            ty: f.str("type", Some("A"))?,
-            generic: or_default("generic", "A: core::alloc::Allocator + Copy")?,
-            entry: or_default("entry", "std::alloc::Global")?,
+            ty: f.str("type", Some(ALLOC_TYPE))?,
+            generic,
+            entry,
             roots: if roots.is_empty() { vec!["core".to_owned(), "blaze_own".to_owned()] } else { roots },
             cargo: f.str("cargo", Some("/Volumes/Projects/blaze-int-1112-notes/wtcargo.sh"))?,
             root: f.str("root", Some("."))?,

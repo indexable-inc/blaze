@@ -731,8 +731,8 @@ fn string_literal(mut expr: ast::Expr<'_>) -> Option<Symbol> {
 /// rustc_lexer's `is_ident`, for a feature's name.
 fn is_ident(text: &str) -> bool {
     let mut chars = text.chars();
-    chars.next().is_some_and(|it| it == '_' || unicode_ident::is_xid_start(it))
-        && chars.all(unicode_ident::is_xid_continue)
+    chars.next().is_some_and(|it| it == '_' || blaze_unicode::is_xid_start(it))
+        && chars.all(blaze_unicode::is_xid_continue)
 }
 
 /// The definition `def` is in, as rustc's def path has it (`opt_local_parent`): an item's

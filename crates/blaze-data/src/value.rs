@@ -4,7 +4,7 @@ use core::{alloc::Allocator, cmp::Ordering, fmt};
 
 use blaze_own::{String, Vec};
 
-use crate::Map;
+use crate::{Build, Map, Order, Visit, Walk};
 
 /// An integer as written: any `u64` or any `i64`, one representation per number (a
 /// non-negative one is always held as `u64`), so equality is the numbers' equality.
@@ -331,8 +331,28 @@ impl<A: Allocator> Value<A> {
         self.as_list().and_then(|list| list.get(index))
     }
 
-    /// A deep copy into `alloc`.
+    /// A deep copy into `alloc`, walked without recursion (its stack in `alloc` too).
     pub fn copy_in<B: Allocator + Clone>(&self, alloc: B) -> Value<B> {
+        let mut build = Build::new_in(alloc.clone(), alloc.clone());
+        for visit in Walk::new_in(self, Order::Insertion, alloc.clone()) {
+            match visit {
+                Visit::Leaf(leaf) => build.value(leaf.copy_leaf_in(alloc.clone())),
+                Visit::StartList(list) => build.start_list(list.len()),
+                Visit::StartMap(map) => build.start_map(map.len()),
+                Visit::Item(_) => {}
+                // The source's keys are unique, so none replaces.
+                Visit::Key(_, key) => build.key_last_wins(String::from_str_in(key, alloc.clone())),
+                Visit::EndList(_) | Visit::EndMap(_) => build.end(),
+            }
+        }
+        match build.finish() {
+            Some(value) => value,
+            None => unreachable!("a walk closes everything it opens"),
+        }
+    }
+
+    /// A copy of a value that is no list or map.
+    fn copy_leaf_in<B: Allocator + Clone>(&self, alloc: B) -> Value<B> {
         match self {
             Value::Null => Value::Null,
             Value::Bool(b) => Value::Bool(*b),
@@ -344,14 +364,7 @@ impl<A: Allocator> Value<A> {
                 out.extend_from_slice(bytes.as_slice());
                 Value::Bytes(out)
             }
-            Value::List(list) => {
-                let mut out = Vec::with_capacity_in(list.len(), alloc.clone());
-                for item in list.iter() {
-                    out.push(item.copy_in(alloc.clone()));
-                }
-                Value::List(out)
-            }
-            Value::Map(map) => Value::Map(map.copy_in(alloc)),
+            Value::List(_) | Value::Map(_) => unreachable!("a walk visits containers as starts"),
         }
     }
 }

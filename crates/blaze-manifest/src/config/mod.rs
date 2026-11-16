@@ -30,8 +30,8 @@ pub mod target;
 mod toml_text;
 mod value;
 
-use error::{Context as _, ConfigWhat};
-pub use error::{ConfigError, ConfigWhat as ConfigErrorWhat, TomlError};
+use error::Context as _;
+pub use error::{ConfigError, ConfigWhat, TomlError};
 pub use key::ConfigKey;
 pub use path::{ConfigRelativePath, PathAndArgs, StringList};
 pub use schema::*;
@@ -1082,119 +1082,158 @@ impl Config<Disk> {
         &self,
         token: Option<&str>,
         registry: Option<&str>,
-    ) -> anyhow::Result<()> {
+    ) -> Result<(), ConfigError> {
+        use blaze_data::{Map, Value as Data};
+        use blaze_own::String as Text;
+
         let name = match self.get_file_path_quiet(&self.home, "credentials") {
             Some(path) => path.file_name().map_or("credentials.toml".into(), PathBuf::from),
             None => PathBuf::from("credentials.toml"),
         };
-        std::fs::create_dir_all(&self.home)
-            .with_context(|| format!("failed to create directory `{}`", self.home.display()))?;
+        std::fs::create_dir_all(&self.home).map_err(|e| {
+            ConfigError::io(ConfigWhat::CreateDir { path: self.home.clone() }, e)
+        })?;
         let path = self.home.join(name);
+        let io = |what: fn(PathBuf) -> ConfigWhat| {
+            let path = path.clone();
+            move |e| ConfigError::io(what(path.clone()), e)
+        };
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(false)
             .open(&path)
-            .with_context(|| format!("failed to open: {}", path.display()))?;
+            .map_err(io(|path| ConfigWhat::Open { path }))?;
         let mut file = stdx::file_lock::Locked::lock(file)
-            .with_context(|| format!("failed to lock file: {}", path.display()))?;
+            .map_err(io(|path| ConfigWhat::Lock { path }))?;
         let mut contents = String::new();
         std::io::Read::read_to_string(&mut *file, &mut contents)
-            .with_context(|| format!("failed to read configuration file `{}`", path.display()))?;
-        let mut toml: toml::Table = contents.parse()?;
+            .map_err(io(|path| ConfigWhat::ReadFile { path }))?;
+        let doc = Document::parse_in(&contents, Limits::CARGO, Global).map_err(|e| {
+            ConfigError::toml(ConfigWhat::ParseToml { path: path.clone() }, &e, &contents)
+        })?;
+        let Data::Map(mut toml) = doc.to_value_in(Global) else {
+            unreachable!("a document's root is a table")
+        };
+        let text = |s: &str| Text::from_str_in(s, Global);
+        let table_of = |key: &str, value: Data<Global>| {
+            let mut map = Map::new_in(Global);
+            map.insert(text(key), value);
+            Data::Map(map)
+        };
         if let Some(token) = toml.remove("token") {
-            toml.insert(
-                "registry".into(),
-                toml::Table::from_iter([("token".into(), token)]).into(),
-            );
+            toml.insert(text("registry"), table_of("token", token));
         }
-        match token {
-            Some(token) => {
-                let def = Definition::Path(path.clone());
-                let table = CV::Table(
-                    HashMap::from_iter_in(
-                        [("token".to_owned(), CV::String(token.to_owned(), def.clone()))],
-                        Global,
-                    ),
-                    def.clone(),
-                );
-                let (key, mut value) = match registry {
-                    Some(registry) => (
-                        "registries",
-                        CV::Table(
-                            HashMap::from_iter_in([(registry.to_owned(), table)], Global),
-                            def.clone(),
-                        ),
-                    ),
-                    None => ("registry", table),
-                };
-                if registry.is_some()
-                    && let Some(table) = toml.remove("registries")
-                {
-                    value.merge(CV::from_toml(def, table)?, false)?;
+        let not_table = |what: String| ConfigError::new(ConfigWhat::CredentialsNotTable { what });
+        match (token, registry) {
+            (Some(token), Some(registry)) => {
+                // Into what `registries` holds, the token of this registry replacing its old one.
+                if !toml.contains_key("registries") {
+                    toml.insert(text("registries"), Data::Map(Map::new_in(Global)));
                 }
-                toml.insert(key.into(), value.into_toml());
+                let Some(Data::Map(registries)) = toml.get_mut("registries") else {
+                    return Err(not_table("[registries]".to_owned()));
+                };
+                if !registries.contains_key(registry) {
+                    registries.insert(text(registry), Data::Map(Map::new_in(Global)));
+                }
+                let Some(Data::Map(table)) = registries.get_mut(registry) else {
+                    return Err(not_table(format!("[registries.{registry}]")));
+                };
+                table.insert(text("token"), Data::Text(text(token)));
             }
-            None => {
+            (Some(token), None) => {
+                toml.insert(text("registry"), table_of("token", Data::Text(text(token))));
+            }
+            (None, registry) => {
                 let table = match registry {
-                    Some(registry) => {
-                        toml.get_mut("registries").and_then(|it| it.get_mut(registry))
-                    }
+                    Some(registry) => match toml.get_mut("registries") {
+                        Some(Data::Map(registries)) => registries.get_mut(registry),
+                        Some(_) => return Err(not_table("[registries]".to_owned())),
+                        None => None,
+                    },
                     None => toml.get_mut("registry"),
                 };
                 if let Some(table) = table {
-                    let what =
-                        registry.map_or("[registry]".to_owned(), |it| format!("[registries.{it}]"));
-                    let table = table
-                        .as_table_mut()
-                        .with_context(|| format!("expected `{what}` to be a table"))?;
+                    let Data::Map(table) = table else {
+                        let what = registry
+                            .map_or("[registry]".to_owned(), |it| format!("[registries.{it}]"));
+                        return Err(not_table(what));
+                    };
                     table.remove("token");
                 }
             }
         }
-        let contents = toml.to_string();
+        // In the keys' order, as cargo's `toml::Table` writes them; every table under a header.
+        let mut contents = Text::new_in(Global);
+        let options = blaze_toml::DocumentOptions { inline_from_depth: usize::MAX };
+        blaze_toml::write_document(&sorted(&toml), &mut contents, options)
+            .map_err(ConfigError::foreign)?;
         use std::io::{Seek as _, Write as _};
-        file.seek(std::io::SeekFrom::Start(0))?;
-        file.write_all(contents.as_bytes())
-            .with_context(|| format!("failed to write to `{}`", path.display()))?;
-        file.set_len(contents.len() as u64)?;
+        let write = io(|path| ConfigWhat::WriteFile { path });
+        file.seek(std::io::SeekFrom::Start(0)).map_err(&write)?;
+        file.write_all(contents.as_bytes()).map_err(&write)?;
+        file.set_len(contents.len() as u64).map_err(&write)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             file.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("failed to set permissions of `{}`", path.display()))?;
+                .map_err(io(|path| ConfigWhat::Permissions { path }))?;
         }
         Ok(())
     }
 }
 
+/// `map` with every table's keys in order, lists' tables too.
+fn sorted(map: &blaze_data::Map<Global>) -> blaze_data::Map<Global> {
+    use blaze_data::{Map, Value as Data};
+    fn value(v: &Data<Global>) -> Data<Global> {
+        match v {
+            Data::Map(map) => Data::Map(sorted(map)),
+            Data::List(list) => {
+                let mut out = blaze_own::Vec::with_capacity_in(list.len(), Global);
+                for item in list.iter() {
+                    out.push(value(item));
+                }
+                Data::List(out)
+            }
+            other => other.clone(),
+        }
+    }
+    let mut out = Map::new_in(Global);
+    for (key, v) in map.sorted() {
+        out.insert(blaze_own::String::from_str_in(key, Global), value(v));
+    }
+    out
+}
+
 impl<F: Files> Config<F> {
     /// `registry.default`, the registry `--registry` defaults to.
-    pub fn default_registry(&self) -> anyhow::Result<Option<String>> {
+    pub fn default_registry(&self) -> Result<Option<String>, ConfigError> {
         Ok(self.get_string("registry.default")?.map(|it| it.val))
     }
 
     /// Fails if `registry.index` is set, as cargo does since it stopped supporting it.
-    pub fn check_registry_index_not_set(&self) -> anyhow::Result<()> {
+    pub fn check_registry_index_not_set(&self) -> Result<(), ConfigError> {
         if self.get_string("registry.index")?.is_some() {
-            bail!(
-                "the `registry.index` config value is no longer supported\n\
-                 Use `[source]` replacement to alter the default index for crates.io."
-            );
+            return Err(ConfigError::new(ConfigWhat::RegistryIndexSet));
         }
         Ok(())
     }
 }
 
 /// One config file's text as a value defined at `path` (from `--config` with `cli`).
-fn parse_file(path: &Path, contents: &str, cli: bool) -> anyhow::Result<ConfigValue> {
-    let toml: toml::Table = contents
-        .parse()
-        .with_context(|| format!("could not parse TOML configuration in `{}`", path.display()))?;
-    let def = if cli { Definition::Cli(Some(path.into())) } else { Definition::Path(path.into()) };
-    CV::from_toml(def, toml::Value::Table(toml))
-        .with_context(|| format!("failed to load TOML configuration from `{}`", path.display()))
+fn parse_file(path: &Path, contents: &str, cli: bool) -> Result<ConfigValue, ConfigError> {
+    let doc = Document::parse_in(contents, Limits::CARGO, Global).map_err(|e| {
+        ConfigError::toml(ConfigWhat::ParseToml { path: path.to_path_buf() }, &e, contents)
+    })?;
+    let def = match cli {
+        true => Definition::Cli(Some(path.into()), None),
+        false => Definition::Path(path.into(), None),
+    };
+    CV::from_item(&def, doc.root())
+        .context(|| ConfigWhat::LoadToml { path: path.to_path_buf() })
 }
 
 struct Include {
@@ -1203,70 +1242,74 @@ struct Include {
     optional: bool,
 }
 
-fn include_paths(cv: &mut ConfigValue, remove: bool) -> anyhow::Result<Vec<Include>> {
+fn refuse<T>(what: ConfigWhat) -> Result<T, ConfigError> {
+    Err(ConfigError::new(what))
+}
+
+fn include_paths(cv: &mut ConfigValue, remove: bool) -> Result<Vec<Include>, ConfigError> {
     let CV::Table(table, _) = cv else { unreachable!() };
     let include = if remove { table.remove("include") } else { table.get("include").cloned() };
     let includes = match include {
         Some(CV::List(list, _)) => list
             .into_iter()
             .enumerate()
-            .map(|(idx, cv)| match cv {
+            .map(|(index, cv)| match cv {
                 CV::String(s, def) => Ok(Include { path: s.into(), def, optional: false }),
                 CV::Table(mut table, def) => {
                     let path = match table.remove("path") {
                         Some(CV::String(s, _)) => s,
-                        Some(other) => bail!(
-                            "expected a string, but found {} at `include[{idx}].path` in `{def}`",
-                            other.desc()
-                        ),
-                        None => bail!("missing field `path` at `include[{idx}]` in `{def}`"),
+                        Some(other) => {
+                            let found = other.desc();
+                            return refuse(ConfigWhat::IncludePathNotString {
+                                index,
+                                found,
+                                definition: def,
+                            });
+                        }
+                        None => {
+                            return refuse(ConfigWhat::IncludeMissingPath { index, definition: def });
+                        }
                     };
                     let optional = match table.remove("optional") {
                         Some(CV::Boolean(b, _)) => b,
-                        Some(other) => bail!(
-                            "expected a boolean, but found {} at `include[{idx}].optional` in `{def}`",
-                            other.desc()
-                        ),
+                        Some(other) => {
+                            let found = other.desc();
+                            return refuse(ConfigWhat::IncludeOptionalNotBool {
+                                index,
+                                found,
+                                definition: def,
+                            });
+                        }
                         None => false,
                     };
                     Ok(Include { path: path.into(), def, optional })
                 }
-                other => bail!(
-                    "expected a string or table, but found {} at `include[{idx}]` in {}",
-                    other.desc(),
-                    other.definition(),
-                ),
+                other => refuse(ConfigWhat::IncludeItem {
+                    index,
+                    found: other.desc(),
+                    definition: other.definition().clone(),
+                }),
             })
-            .collect::<anyhow::Result<Vec<_>>>()?,
-        Some(other) => bail!(
-            "expected a list of strings or a list of tables, but found {} at `include` in `{}",
-            other.desc(),
-            other.definition()
-        ),
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(other) => {
+            return refuse(ConfigWhat::IncludeNotList {
+                found: other.desc(),
+                definition: other.definition().clone(),
+            });
+        }
         None => return Ok(Vec::new()),
     };
     for include in &includes {
+        let (path, definition) = (include.path.clone(), include.def.clone());
         if include.path.extension() != Some(std::ffi::OsStr::new("toml")) {
-            bail!(
-                "expected a config include path ending with `.toml`, but found `{}` from `{}`",
-                include.path.display(),
-                include.def,
-            )
+            return refuse(ConfigWhat::IncludeNotToml { path, definition });
         }
-        if let Some(path) = include.path.to_str() {
-            if path.contains(['*', '?', '[', ']']) {
-                bail!(
-                    "expected a config include path without glob patterns, but found `{}` from `{}`",
-                    include.path.display(),
-                    include.def,
-                )
+        if let Some(text) = include.path.to_str() {
+            if text.contains(['*', '?', '[', ']']) {
+                return refuse(ConfigWhat::IncludeGlob { path, definition });
             }
-            if path.contains(['{', '}']) {
-                bail!(
-                    "expected a config include path without template braces, but found `{}` from `{}`",
-                    include.path.display(),
-                    include.def,
-                )
+            if text.contains(['{', '}']) {
+                return refuse(ConfigWhat::IncludeBraces { path, definition });
             }
         }
     }
@@ -1316,61 +1359,40 @@ impl<F: Files> Config<F> {
     }
 }
 
-impl ConfigValue {
-    fn into_toml(self) -> toml::Value {
-        match self {
-            CV::Boolean(it, _) => toml::Value::Boolean(it),
-            CV::String(it, _) => toml::Value::String(it),
-            CV::Integer(it, _) => toml::Value::Integer(it),
-            CV::List(it, _) => toml::Value::Array(it.into_iter().map(CV::into_toml).collect()),
-            // cargo's tables are a `HashMap`, in no order; these are in the keys' order.
-            CV::Table(it, _) => {
-                let mut entries: Vec<_> = it.into_iter().collect();
-                entries.sort_by(|a, b| a.0.cmp(&b.0));
-                toml::Value::Table(entries.into_iter().map(|(k, v)| (k, v.into_toml())).collect())
-            }
-        }
-    }
-}
-
 /// A `--config KEY=VALUE` argument, which must be one dotted key and a value.
-fn cli_dotted_keys(arg: &str) -> anyhow::Result<toml::Table> {
-    const HELP: &str =
-        "--config argument `{arg}` was not a TOML dotted key expression (such as `build.jobs = 2`)";
-    let fail = || anyhow!(HELP.replace("{arg}", arg));
-    let table: toml::Table = arg.parse().map_err(|e: toml::de::Error| {
-        anyhow!(e.to_string()).context(format!(
-            "failed to parse value from --config argument `{arg}` as a dotted key expression"
-        ))
+fn cli_dotted_keys(arg: &str) -> Result<Document<'_, Global>, ConfigError> {
+    let fail = || ConfigError::new(ConfigWhat::CliNotDotted { arg: arg.to_owned() });
+    let doc = Document::parse_in(arg, Limits::CARGO, Global).map_err(|e| {
+        ConfigError::toml(ConfigWhat::CliParse { arg: arg.to_owned() }, &e, arg)
     })?;
     // Exactly one key path ending in a value that is not a table.
-    let mut current = &table;
+    let mut current = doc.root();
     loop {
         if current.len() != 1 {
             return Err(fail());
         }
-        let (_, value) = current.iter().next().unwrap();
-        match value {
-            toml::Value::Table(t) => current = t,
+        let Some(value) = current.at(0) else { unreachable!("a table of one has its first") };
+        match value.kind() {
+            Kind::Table => current = value,
             _ => break,
         }
     }
     if arg.contains('\n') || arg.trim_start().starts_with('[') {
         return Err(fail());
     }
-    Ok(table)
+    Ok(doc)
 }
 
 /// `$CARGO_HOME` relative to `cwd`, or `.cargo` in the home directory, as the `home` crate
 /// cargo uses finds it.
-fn cargo_home(cwd: &Path, env: &BTreeMap<String, String>) -> anyhow::Result<PathBuf> {
+fn cargo_home(cwd: &Path, env: &BTreeMap<String, String>) -> Result<PathBuf, ConfigError> {
     match env.get("CARGO_HOME").filter(|h| !h.is_empty()) {
         Some(home) => Ok(cwd.join(home)),
         None => {
             // The home of the user whose environment `env` is ([`blaze_core::home`], the one
             // answer): its `HOME`, else the system's record of the user.
             let dir = blaze_core::home::user_in(|name| env.get(name).map(std::ffi::OsString::from))
-                .map_err(|why| anyhow!("CARGO_HOME is not set, and cargo's home is .cargo in your home directory: {why}"))?;
+                .map_err(|why| ConfigError::new(ConfigWhat::NoCargoHome { why }))?;
             Ok(dir.join(".cargo"))
         }
     }

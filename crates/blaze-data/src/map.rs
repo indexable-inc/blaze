@@ -76,6 +76,11 @@ impl<A: Allocator> Map<A> {
         self.find(key).is_ok()
     }
 
+    /// The insertion index of `key`'s entry.
+    pub fn position(&self, key: &str) -> Option<usize> {
+        self.find(key).ok().map(|slot| self.order[slot])
+    }
+
     /// `key` set to `value`: a new key goes last in insertion order; a present one keeps its
     /// place and its old value is handed back.
     pub fn insert(&mut self, key: String<A>, value: Value<A>) -> Option<Value<A>> {

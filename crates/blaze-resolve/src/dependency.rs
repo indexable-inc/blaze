@@ -4,15 +4,15 @@
 use std::fmt;
 use std::sync::Arc;
 
-use anyhow::Result;
-use cargo_platform::Platform;
-use semver::VersionReq;
-
+use crate::error::ResolveError;
 use crate::interning::InternedString;
 use crate::package_id::PackageId;
+use crate::platform::Platform;
 use crate::source_id::SourceId;
 use crate::summary::Summary;
-use crate::version::OptVersionReq;
+use crate::version::{OptVersionReq, Version, parse_req};
+
+type Result<T, E = ResolveError> = std::result::Result<T, E>;
 
 /// Cheap to clone; changed through its setters, which copy on write.
 #[derive(PartialEq, Eq, Hash, Clone, Debug)]

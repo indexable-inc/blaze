@@ -401,7 +401,8 @@ mod tests {
     fn one_entry_set_hashes_its_path() {
         let entry = |at: u32| (crate::ContentId::of("keyed test", &at.to_le_bytes()).0, [1; 32]);
         let mut cost = [0u64; 2];
-        for (slot, count) in [100u32, 10_000].into_iter().enumerate() {
+        let many = if cfg!(miri) { 1_000 } else { 10_000 };
+        for (slot, count) in [100u32, many].into_iter().enumerate() {
             let mut kept = Keyed::of((0..count).map(entry));
             let before = kept.hashed();
             let (key, _) = entry(7);

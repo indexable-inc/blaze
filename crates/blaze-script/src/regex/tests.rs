@@ -181,8 +181,8 @@ fn what_the_matcher_does_not_take_is_refused_by_name() {
         ("(?P<1a>x)", ErrorKind::BadGroupName),
         ("(?P<a>x)(?P<a>y)", ErrorKind::DuplicateName("a".to_owned())),
         ("\\p{L}", ErrorKind::UnicodeClass),
-        (&deep_groups, ErrorKind::TooDeep),
-        (&deep_repeats, ErrorKind::TooDeep),
+        (deep_groups.as_str(), ErrorKind::TooDeep),
+        (deep_repeats.as_str(), ErrorKind::TooDeep),
         ("a{1000}{1000}", ErrorKind::TooBig { limit: super::DEFAULT_LIMIT }),
     ];
     for (pattern, kind) in cases {

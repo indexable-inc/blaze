@@ -45,6 +45,10 @@ struct World {
     files: StdVec<StdVec<Item>>,
     /// A crate with no text: a part of the units found only by this record key.
     dep: Option<Key>,
+    /// Item and file names to their places, so the harness's own lookups are not a scan (the
+    /// linearity test steps 100,000 jobs). Names do not depend on the text, so an edit keeps it.
+    items: BTreeMap<Name, (usize, usize)>,
+    file_subjects: BTreeMap<ContentId, usize>,
 }
 
 fn path(file: usize) -> StdVec<u8> {
@@ -96,7 +100,20 @@ impl World {
             }
             files.push(items);
         }
-        World { files, dep: None }
+        World::new(files)
+    }
+
+    fn new(files: StdVec<StdVec<Item>>) -> World {
+        let mut items = BTreeMap::new();
+        let mut file_subjects = BTreeMap::new();
+        for (f, file) in files.iter().enumerate() {
+            file_subjects.insert(file_name(f).subject, f);
+            for i in 0..file.len() {
+                items.insert(sig_name(f, i), (f, i));
+                items.insert(body_name(f, i), (f, i));
+            }
+        }
+        World { files, dep: None, items, file_subjects }
     }
 
     fn bytes(&self, file: usize) -> StdVec<u8> {
@@ -108,16 +125,11 @@ impl World {
     }
 
     fn file_of(&self, subject: &ContentId) -> Option<usize> {
-        (0..self.files.len()).find(|f| file_name(*f).subject == *subject)
+        self.file_subjects.get(subject).copied()
     }
 
     fn item_of(&self, name: Name) -> Option<(usize, usize)> {
-        let make = match name.kind {
-            Kind::Signature => sig_name,
-            Kind::BodyCheck => body_name,
-            _ => return None,
-        };
-        (0..self.files.len()).flat_map(|f| (0..self.files[f].len()).map(move |i| (f, i))).find(|(f, i)| make(*f, *i) == name)
+        self.items.get(&name).copied()
     }
 }
 
@@ -273,7 +285,7 @@ fn every_rule(_: u16) -> bool {
 }
 
 fn config(workers: u32) -> Config {
-    Config { tool: Tool(key::digest("sim tool", b"tool")), workers, most_entries: 32, most_jobs: 10_000, is_error: every_rule }
+    Config { tool: Tool(key::digest("sim tool", b"tool")), workers, most_entries: 32, most_jobs: 1 << 20, is_error: every_rule }
 }
 
 const ASK: Ask<'static> = Ask { command: Command::Check, args: b"", gate: Gate::Beside };
@@ -789,4 +801,115 @@ fn no_success_is_reported_while_an_error_could_be_found() {
 #[test]
 fn control_a_success_before_the_gate_is_done_is_caught() {
     control(SimConfig::cases(2000), Plant::None, Plant::EarlySuccess, "could still find an error", gates);
+}
+
+// --- Linear bookkeeping (parallel.md change 3) ------------------------------------------------
+
+/// `files` files of `items` items: each signature uses the one before it in its file (a chain
+/// of `Need` rounds), each body calls two signatures elsewhere.
+fn wide(files: usize, items: usize) -> World {
+    let world = (0..files)
+        .map(|f| {
+            (0..items)
+                .map(|i| Item {
+                    sig: (f * items + i) as u64 % 4,
+                    body: 0,
+                    uses: (i > 0).then(|| (f, i - 1)),
+                    calls: (1..=2).map(|k| ((f * 7 + k) % files, (i * 3 + k) % items)).collect(),
+                })
+                .collect()
+        })
+        .collect();
+    World::new(world)
+}
+
+/// One cold `check` of `world`, its effects answered first in, first out: the jobs, the edges
+/// (parts listed plus reads), and the machine's bookkeeping count.
+fn counted(world: &World) -> Result<(u64, u64, u64), Broke> {
+    let ids: StdVec<ContentId> = (0..world.files.len()).map(|f| world.id(f)).collect();
+    let paths: StdVec<StdVec<u8>> = (0..world.files.len()).map(path).collect();
+    let mut files: StdVec<FileEntry<'_>> = (0..world.files.len())
+        .map(|f| FileEntry { path: &paths[f], id: ids[f], changed: true, manifest: false })
+        .collect();
+    let manifest = b"Cargo.toml".to_vec();
+    files.push(FileEntry { path: &manifest, id: key::digest("sim manifest", b"[package]"), changed: false, manifest: true });
+    files.sort_by(|a, b| a.path.cmp(b.path));
+    let mut req = Request::new_in(config(16), ASK, Global);
+    let mut store: BTreeMap<Key, StdVec<u8>> = BTreeMap::new();
+    let mut todo: std::collections::VecDeque<Effect<Global>> = std::collections::VecDeque::new();
+    let mut out: Vec<Effect<Global>, Global> = Vec::new_in(Global);
+    let (mut jobs, mut edges) = (0u64, 0u64);
+    req.step(Event::Start { files: &files, gone: &[], last: None }, &mut out).map_err(|e| Broke::Oracle(format!("{e}")))?;
+    loop {
+        todo.extend(out.drain(..));
+        let effect = todo.pop_front().ok_or(Broke::Oracle(String::from("the request stalled")))?;
+        let stepped = match effect {
+            Effect::Get { key } => {
+                let bytes = store.get(&key).cloned();
+                req.step(Event::Got { key, bytes: bytes.as_deref() }, &mut out)
+            }
+            Effect::Put { key, bytes } => {
+                store.insert(key, bytes.as_slice().to_vec());
+                continue;
+            }
+            Effect::Run { batch } => {
+                let mut answered = StdVec::new();
+                for (ticket, task) in batch.tasks.iter() {
+                    answered.push((*ticket, execute(world, task)?));
+                }
+                let made: StdVec<&Made> = answered
+                    .iter()
+                    .filter_map(|(_, a)| match a {
+                        Answered::Done(made) => Some(made),
+                        Answered::Need(_) => None,
+                    })
+                    .collect();
+                let held: StdVec<StdVec<Finding<'_>>> = made
+                    .iter()
+                    .map(|m| m.findings.iter().map(|(rule, start, end, message)| Finding { rule: *rule, start: *start, end: *end, message }).collect())
+                    .collect();
+                let outputs: StdVec<Output<'_>> = made
+                    .iter()
+                    .zip(held.iter())
+                    .map(|(m, findings)| Output { name: m.name, out: m.out, reads: &m.reads, parts: &m.parts, findings, payload: b"" })
+                    .collect();
+                let mut at = 0;
+                let mut results = StdVec::new();
+                for (ticket, answer) in &answered {
+                    let ran = match answer {
+                        Answered::Need(wants) => Ran::Need(wants),
+                        Answered::Done(m) => {
+                            jobs += 1;
+                            edges += (m.parts.len() + m.reads.len()) as u64;
+                            at += 1;
+                            Ran::Done(&outputs[at - 1..at])
+                        }
+                    };
+                    results.push(Outcome { ticket: *ticket, ran, in_place: 0, ns: 1_000 });
+                }
+                req.step(Event::Ran { batch: batch.id, results: &results }, &mut out)
+            }
+            Effect::Done(_) => return Ok((jobs, edges, req.bookkeeping())),
+            _ => continue,
+        };
+        stepped.map_err(|e| Broke::Oracle(format!("{e}")))?;
+    }
+}
+
+/// The machine's bookkeeping per job and edge stays flat from 2,000 jobs to 100,000: no step
+/// costs in proportion to the jobs (parallel.md change 3). A count, not a time.
+#[test]
+fn bookkeeping_is_linear_in_jobs_and_edges() {
+    check(SimConfig::cases(1), |_| {
+        let (small_jobs, small_edges, small) = counted(&wide(100, 10))?;
+        let (large_jobs, large_edges, large) = counted(&wide(1_000, 50))?;
+        oracle(large_jobs >= 100_000, || format!("the large world made {large_jobs} jobs, not 100,000"))?;
+        let per_small = small as f64 / (small_jobs + small_edges) as f64;
+        let per_large = large as f64 / (large_jobs + large_edges) as f64;
+        oracle(per_large <= 2.0 * per_small && per_large <= 64.0, || {
+            format!(
+                "bookkeeping per job and edge grew from {per_small:.1} ({small_jobs} jobs) to {per_large:.1} ({large_jobs} jobs)"
+            )
+        })
+    });
 }

@@ -371,6 +371,7 @@ blaze-item-hash = { path = "crates/blaze-item-hash" }
 blaze-link = { path = "crates/blaze-link", default-features = false }
 blaze-store-check = { path = "crates/blaze-store-check" }
 blaze-phf = { path = "crates/blaze-phf", version = "0.0.0" }
+blaze-unicode = { path = "crates/blaze-unicode" }
 # fastcompile (docs/v2/plan/design/compile-time.md)
 blaze-global = { path = "crates/blaze-global", default-features = false }
 blaze-hashcons = { path = "crates/blaze-hashcons" }
@@ -391,6 +392,7 @@ blaze-reclaim = { path = "crates/blaze-reclaim" }
 blaze-mem = { path = "crates/blaze-mem" }
 blaze-own = { path = "crates/blaze-own" } # Vec, Box, Arc, Rc, ... with no default allocator, in place of `alloc`.
 blaze-int = { path = "crates/blaze-int" } # Integer conversions that say what they do (widen, narrow, truncate, saturate), in place of `as`.
+blaze-kit = { path = "crates/blaze-kit" } # Specialized collections: typed tables, inline vectors, union-find, sparse and chunked sets, heaps, a timer wheel, column codecs, static search.
 blaze-memchr = { path = "crates/blaze-memchr" } # Byte search (NEON, SSE2, SWAR), in place of memchr.
 blaze-bitflags = { path = "crates/blaze-bitflags" } # `bitflags!`, in place of bitflags.
 # blaze's own data formats, on blaze-own and core only, in place of base64, serde_json,

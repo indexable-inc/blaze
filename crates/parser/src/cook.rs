@@ -9,7 +9,7 @@ use std::borrow::Cow;
 use std::ops::Range;
 
 use rustc_lexer::{Base, LiteralKind, RawStrError, validate_raw_str};
-use rustc_literal_escaper::{EscapeError, Mode, check_for_errors};
+use crate::unescape::{EscapeError, Mode, check_for_errors};
 
 /// `rustc_ast::token::LitKind` as rustc's lexer makes it: never `Bool`, and `Err` without the
 /// `ErrorGuaranteed`.

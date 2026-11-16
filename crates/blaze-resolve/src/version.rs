@@ -218,29 +218,28 @@ impl From<Version> for PartialVersion {
 }
 
 impl std::str::FromStr for PartialVersion {
-    type Err = anyhow::Error;
+    type Err = ResolveError;
 
-    fn from_str(value: &str) -> Result<Self> {
-        if let Ok(ver) = Version::parse(value) {
+    fn from_str(value: &str) -> Result<Self, ResolveError> {
+        if let Ok(ver) = parse_version(value) {
             return Ok(ver.into());
         }
+        let refuse = |why| ResolveError::PartialVersion { text: value.to_owned(), why };
         // A one-comparator caret requirement without the `^` is a partial version.
-        let mut version_req = match VersionReq::parse(value) {
+        let mut version_req = match parse_req(value) {
             Ok(req) => req,
-            Err(_) if value.contains('-') => {
-                bail!("unexpected prerelease field, expected a version like \"1.32\"")
-            }
-            Err(_) if value.contains('+') => {
-                bail!("unexpected build field, expected a version like \"1.32\"")
-            }
-            Err(_) => bail!("expected a version like \"1.32\""),
+            Err(_) if value.contains('-') => return Err(refuse(PartialWhy::Prerelease)),
+            Err(_) if value.contains('+') => return Err(refuse(PartialWhy::Build)),
+            Err(_) => return Err(refuse(PartialWhy::NotAVersion)),
         };
         if version_req.comparators.len() != 1 {
-            bail!("unexpected version requirement, expected a version like \"1.32\"")
+            return Err(refuse(PartialWhy::Requirement));
         }
-        let comp = version_req.comparators.pop().unwrap();
+        let Some(comp) = version_req.comparators.pop() else {
+            unreachable!("a requirement of one comparator has one to pop")
+        };
         if comp.op != Op::Caret || value.starts_with('^') {
-            bail!("unexpected version requirement, expected a version like \"1.32\"")
+            return Err(refuse(PartialWhy::Requirement));
         }
         Ok(PartialVersion {
             major: comp.major,
@@ -287,13 +286,8 @@ impl RustVersion {
     /// Whether a toolchain of version `rustc` (its prerelease ignored) meets this.
     pub fn is_compatible_with(&self, rustc: &PartialVersion) -> bool {
         let msrv = self.to_partial().to_caret_req();
-        let rustc = Version {
-            major: rustc.major,
-            minor: rustc.minor.unwrap_or_default(),
-            patch: rustc.patch.unwrap_or_default(),
-            pre: Default::default(),
-            build: Default::default(),
-        };
+        let rustc =
+            Version::new(rustc.major, rustc.minor.unwrap_or(0), rustc.patch.unwrap_or(0));
         msrv.matches(&rustc)
     }
 
@@ -309,15 +303,16 @@ impl RustVersion {
 }
 
 impl std::str::FromStr for RustVersion {
-    type Err = anyhow::Error;
+    type Err = ResolveError;
 
-    fn from_str(value: &str) -> Result<Self> {
+    fn from_str(value: &str) -> Result<Self, ResolveError> {
         let partial: PartialVersion = value.parse()?;
+        let refuse = |why| ResolveError::PartialVersion { text: value.to_owned(), why };
         if partial.pre.is_some() {
-            bail!("unexpected prerelease field, expected a version like \"1.32\"")
+            return Err(refuse(PartialWhy::Prerelease));
         }
         if partial.build.is_some() {
-            bail!("unexpected build field, expected a version like \"1.32\"")
+            return Err(refuse(PartialWhy::Build));
         }
         Ok(RustVersion { major: partial.major, minor: partial.minor, patch: partial.patch })
     }
@@ -334,12 +329,16 @@ mod tests {
     use super::*;
 
     fn v(s: &str) -> Version {
-        s.parse().unwrap()
+        parse_version(s).unwrap()
+    }
+
+    fn r(s: &str) -> VersionReq {
+        parse_req(s).unwrap()
     }
 
     #[test]
     fn locked_matches_build_metadata_exactly() {
-        let mut req = OptVersionReq::Req("^1".parse().unwrap());
+        let mut req = OptVersionReq::Req(r("^1"));
         req.lock_to(&v("1.0.0+bar"));
         assert!(req.is_locked() && req.is_exact());
         assert!(req.matches(&v("1.0.0+bar")));
@@ -362,13 +361,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "cannot lock")]
     fn lock_outside_requirement() {
-        OptVersionReq::Req("^1".parse().unwrap()).lock_to(&v("2.0.0"));
+        OptVersionReq::Req(r("^1")).lock_to(&v("2.0.0"));
     }
 
     #[test]
     fn exactness() {
         assert!(OptVersionReq::exact(&v("1.2.3")).is_exact());
-        assert!(!OptVersionReq::Req("=1.2".parse().unwrap()).is_exact());
+        assert!(!OptVersionReq::Req(r("=1.2")).is_exact());
         assert!(!OptVersionReq::Any.is_exact());
     }
 

@@ -62,9 +62,9 @@ impl<'p> At<'p> {
 }
 
 /// One step of a path written as [`At::write_into`] writes it, after `before` (whether a step
-/// was written already); says whether anything is written now. A writer that walks a value
-/// with its own stack, not a chain of `At`s, writes its path step by step with this.
-pub fn write_step<W: fmt::Write + ?Sized>(out: &mut W, step: Step<'_>, before: bool) -> Result<bool, fmt::Error> {
+/// was written already); says whether anything is written now. [`Walk`](crate::Walk), which
+/// keeps its own stack and no chain of `At`s, writes its path step by step with this.
+pub(crate) fn write_step<W: fmt::Write + ?Sized>(out: &mut W, step: Step<'_>, before: bool) -> Result<bool, fmt::Error> {
     match step {
         Step::Root => Ok(before),
         Step::Key(key) => {

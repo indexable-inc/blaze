@@ -32,6 +32,7 @@ pub mod infer;
 mod lex;
 pub mod parse;
 pub mod print;
+pub mod query;
 pub mod render;
 pub mod same;
 pub mod schema;

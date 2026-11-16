@@ -2875,12 +2875,16 @@ fn btree_panic_case(tape: &Tape) -> Result<(), Broke> {
             let _caught = catch_unwind(AssertUnwindSafe(|| match op {
                 0 => drop(map.insert(k, Token::new(k.0))),
                 1 => drop(map.remove(&k)),
-                2 => drop(map.range(k..).count()),
+                2 => {
+                    let _seen = map.range(k..).count();
+                }
                 3 => {
                     let mut right = map.split_off(&k);
                     map.append(&mut right);
                 }
-                4 => drop(map.entry(k).or_insert_with(|| Token::new(1))),
+                4 => {
+                    let _value = map.entry(k).or_insert_with(|| Token::new(1));
+                }
                 _ => map.retain(|key, _| key.0 % 3 != 0),
             }));
             TOUCHES.with(|left| left.set(None));
@@ -2888,23 +2892,27 @@ fn btree_panic_case(tape: &Tape) -> Result<(), Broke> {
             tokens::check(map.len())?;
         }
         // A clone whose value's clone panics frees the part copied.
-        if let Some(t) = map.values().next() {
-            tokens::panic_on_clone(t.value);
+        let first = map.values().next().map(|t| t.value);
+        if let Some(value) = first {
+            tokens::panic_on_clone(value);
             panics(|| drop(map.clone()))?;
             tokens::check(map.len())?;
         }
         // An owning iterator whose value's drop panics drops the rest and frees every node.
         let copy = map.clone();
-        if let Some(t) = copy.values().nth(tape.index(copy.len().max(1), "victim")) {
-            tokens::panic_on_drop(t.value);
-            panics(move || drop(copy))?;
-        } else {
-            drop(copy);
+        let victim = copy.values().nth(tape.index(copy.len().max(1), "victim")).map(|t| t.value);
+        match victim {
+            Some(value) => {
+                tokens::panic_on_drop(value);
+                panics(move || drop(copy))?;
+            }
+            None => drop(copy),
         }
         tokens::check(map.len())?;
         // A `retain` whose dropped value's drop panics leaves a whole tree of the rest.
-        if let Some(t) = map.values().nth(tape.index(map.len().max(1), "victim")) {
-            tokens::panic_on_drop(t.value);
+        let victim = map.values().nth(tape.index(map.len().max(1), "victim")).map(|t| t.value);
+        if let Some(value) = victim {
+            tokens::panic_on_drop(value);
             panics(|| map.retain(|_, _| false))?;
             oracle(map.invariants())?;
             tokens::check(map.len())?;

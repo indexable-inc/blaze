@@ -262,8 +262,13 @@ struct Live {
 
 impl Live {
     /// Waits until `until` for the scope's tasks to end. Under `Inline` each task ended at its
-    /// spawn, so none is ever left; a layout that overlaps tasks parks here on its scheduler.
+    /// spawn, so none is ever left. Under `Threads` every task's handle waited for it already
+    /// ([`Task::join`] or its drop), so this waits only for the count to reach zero; a task
+    /// still running past `until` and the abandon wait stops the process (the module's doc).
     fn settle(&self, until: Deadline) -> Settled {
+        if let (Some(pool), Some(tally)) = (self.cx.pool(), &self.shared) {
+            outlast(&self.cx, pool, tally, self.last.get(), until, || tally.running() == 0);
+        }
         let running = self.running.get();
         match running {
             0 => Settled::All,
@@ -274,16 +279,71 @@ impl Live {
         }
     }
 
-    /// `task` failed so: the scope is cancelled, and the first failure kept.
-    fn fail(&self, task: &'static str, why: TaskWhy) -> TaskError {
+    /// Task `index`, `task`, failed so: the scope is cancelled, and the failure of the lowest
+    /// index kept (under `Inline` that is the first).
+    fn fail(&self, index: u32, task: &'static str, why: TaskWhy) -> TaskError {
         self.cx.cancel();
         let error = TaskError { scope: self.cx.name(), task, why };
+        if let Some(tally) = &self.shared {
+            // clone: an error, kept for the scope and returned to its task.
+            tally.fail(index, error.clone());
+            return error;
+        }
         let mut failed = self.failed.borrow_mut();
         if failed.is_none() {
             // clone: an error, kept for the scope and returned to its task.
             *failed = Some(error.clone());
         }
         error
+    }
+
+    /// The scope's kept failure, taken.
+    fn take_failed(&self) -> Option<TaskError> {
+        match &self.shared {
+            Some(tally) => tally.take_failed().map(|(_, error)| error),
+            None => self.failed.borrow_mut().take(),
+        }
+    }
+}
+
+/// Waits on `cx`'s thread until `ready`: until `until` on the world's clock, then, with the
+/// scope cancelled, [`crate::io::Limits::abandon_wait`] more on the pool's. Past that, what it
+/// waits for is a task still running that may borrow the frame the waiter is about to leave:
+/// a hang, and the process stops naming `task` (rule 18; the module's doc).
+fn outlast(cx: &Cx, pool: &Pool, tally: &Tally, task: &'static str, until: Deadline, mut ready: impl FnMut() -> bool) {
+    let io = cx.io();
+    let waited = pool.wait(cx.here(), tally, "bstd.task.join", &mut ready, || until.passed(io.now()));
+    match waited {
+        Ok(true) => return,
+        Ok(false) => {}
+        Err(why) => panic!("bstd::task {task} of a scope in {}: the join's park failed: {why}", cx.name()),
+    }
+    tally.cancel();
+    let clock = *pool.clock();
+    let grace = Deadline::after(clock.now(), io.limits().abandon_wait);
+    match pool.wait(cx.here(), tally, "bstd.task.join.abandon", &mut ready, || grace.passed(clock.now())) {
+        Ok(true) => {}
+        Ok(false) | Err(_) => crate::rt::hang(cx.name(), task),
+    }
+}
+
+/// How a task's closure ended, short of a result.
+enum Ending {
+    Why(TaskWhy),
+    /// The process exits: passed on.
+    Exit(Payload<dyn Any + Send>),
+}
+
+/// A task's closure's outcome, its error said and a panic's payload read.
+fn ended<T, E: fmt::Display>(ran: Result<Result<T, E>, Payload<dyn Any + Send>>) -> Result<T, Ending> {
+    match ran {
+        Ok(Ok(made)) => Ok(made),
+        // alloc: an error's message.
+        Ok(Err(error)) => Err(Ending::Why(TaskWhy::Failed(error.to_string()))),
+        Err(payload) => match payload.downcast::<Exit>() {
+            Ok(exit) => Err(Ending::Exit(exit)),
+            Err(payload) => Err(Ending::Why(TaskWhy::Panicked(said(&*payload)))),
+        },
     }
 }
 
@@ -320,25 +380,150 @@ pub struct Scope<'p> {
 #[must_use = "a task is finished with join(cx)"]
 pub struct Task<'s, T> {
     name: &'static str,
-    outcome: Result<T, TaskError>,
+    held: Held<T>,
     scope: PhantomData<&'s ()>,
+    /// Not `Send`: it is joined on its scope's thread, the one that parks on the scope.
+    thread: PhantomData<*const ()>,
     unfinished: Unfinished,
+}
+
+/// What a task's handle holds.
+enum Held<T> {
+    /// It ran inline (or never ran): its outcome.
+    Ended(Result<T, TaskError>),
+    /// It is queued on the pool, or running there.
+    Queued(Pending<T>),
+}
+
+/// A task on the pool, and what its handle needs to wait for it.
+struct Pending<T> {
+    queued: Queued<T>,
+    pool: Pool,
+    /// The scope's thread, its name and its context's deadline: what a wait in the handle's
+    /// drop is bounded by.
+    here: Here,
+    scope: &'static str,
+    deadline: Deadline,
+    world: crate::io::Io,
+}
+
+impl<T> Pending<T> {
+    /// Its outcome: run here if no worker started it, else waited for.
+    fn finish(&self, cx: &Cx, name: &'static str) -> Ran<T> {
+        if let Some(ran) = self.queued.run_here(cx.here()) {
+            return ran;
+        }
+        outlast(cx, &self.pool, self.queued.tally(), name, cx.deadline(), || self.queued.done());
+        self.queued.take()
+    }
+}
+
+impl<T> Drop for Pending<T> {
+    /// A handle dropped unjoined (a panic unwinds past it): an unstarted task is dropped unrun;
+    /// a started one is waited for, since it may borrow the frame the unwind leaves, and what it
+    /// made is dropped here, while what it borrows still lives.
+    fn drop(&mut self) {
+        if self.queued.drop_unstarted() {
+            return;
+        }
+        let clock = *self.pool.clock();
+        let until = Deadline::after(clock.now(), self.world.limits().abandon_wait);
+        let world = &self.world;
+        let deadline = self.deadline;
+        let tally = self.queued.tally();
+        let ready = || self.queued.done();
+        match self.pool.wait(self.here, tally, "bstd.task.drop", ready, || deadline.passed(world.now()) || until.passed(clock.now())) {
+            Ok(true) => drop(self.queued.take()),
+            Ok(false) | Err(_) => crate::rt::hang(self.scope, self.queued.name()),
+        }
+    }
 }
 
 impl<'p> Scope<'p> {
     /// The scope whose context is `cx`, from [`Cx::scope`].
     #[track_caller]
     pub(crate) fn new(cx: Cx) -> Scope<'p> {
+        let layout = cx.layout();
+        let shared = cx.pool().map(|_| Tally::new(cx.canceller()));
+        let class = cx.class();
         let live = Live {
             cx,
             failed: RefCell::new(None),
+            shared,
+            class: Cell::new(class),
+            layout,
             running: Cell::new(0),
             last: Cell::new(""),
             placed: Cell::new(0),
-            workers: Cell::new(LAYOUT.workers()),
+            workers: Cell::new(layout.workers()),
             armed: true,
         };
         Scope { live, parent: PhantomData, unfinished: Unfinished::new("task::Scope", "join(cx)") }
+    }
+
+    /// A task's handle.
+    fn handle<T>(name: &'static str, held: Held<T>) -> Task<'_, T> {
+        Task { name, held, scope: PhantomData, thread: PhantomData, unfinished: Unfinished::new("task::Task", "join(cx)") }
+    }
+
+    /// The next spawn's index and frame: `Err` with the task's handle when no frame can be had.
+    fn prepare<T>(&self, name: &'static str, scratch: usize) -> Result<(u32, Frame), Task<'_, T>> {
+        let live = &self.live;
+        live.last.set(name);
+        let index = live.placed.get() + 1;
+        live.placed.set(index);
+        match Frame::with_reserve(scratch, blaze_mem::Tag::Frames) {
+            Ok(frame) => Ok((index, frame)),
+            Err(blaze_mem::MemError::Reserve { .. } | blaze_mem::MemError::Commit { .. } | blaze_mem::MemError::Exhausted { .. } | blaze_mem::MemError::TooLarge { .. } | blaze_mem::MemError::Evict { .. }) => {
+                let stopped = Stopped::OutOfMemory { arena: name, asked: scratch };
+                let error = live.fail(index, name, TaskWhy::OutOfMemory(stopped));
+                Err(Scope::handle(name, Held::Ended(Err(error))))
+            }
+        }
+    }
+
+    /// A job for `task` on the pool, its context grown from a seed on the thread that runs it.
+    fn pool_job<T: Send, E: fmt::Display>(
+        &self,
+        tally: &Arc<Tally, Global>,
+        name: &'static str,
+        index: u32,
+        frame: Frame,
+        task: impl FnOnce(&Cx) -> Result<T, E> + Send,
+    ) -> (Queued<T>, threads::JobPtr) {
+        let live = &self.live;
+        let worker = live.cx.worker().wrapping_add(index);
+        let seed = live.cx.seed(name, frame, live.class.get(), worker);
+        let scope = live.cx.name();
+        let failures = Arc::clone(tally);
+        let body = move |here: Here| -> Ran<T> {
+            let cx = seed.grow(here);
+            let ran = catch_unwind(AssertUnwindSafe(|| task(&cx)));
+            drop(cx);
+            match ended(ran) {
+                Ok(made) => Ran::Made(made),
+                Err(Ending::Exit(exit)) => Ran::Exit(exit),
+                Err(Ending::Why(why)) => {
+                    let error = TaskError { scope, task: name, why };
+                    // clone: an error, kept for the scope and returned to its task.
+                    failures.fail(index, error.clone());
+                    Ran::Failed(error)
+                }
+            }
+        };
+        // SAFETY: the job's body borrows no longer than the scope, and the scope does not end
+        // while the job is queued or running: its handle runs it, waits for it or drops it
+        // unrun (`Pending`), and a task that will not end stops the process (`outlast`).
+        unsafe { threads::job(name, tally, body) }
+    }
+
+    /// A pool task's outcome, as its handle gives it.
+    fn outcome<T>(ran: Ran<T>) -> Result<T, TaskError> {
+        match ran {
+            Ran::Made(made) => Ok(made),
+            Ran::Failed(error) => Err(error),
+            Ran::Exit(exit) => resume_unwind(exit),
+        }
     }
 
     /// Runs `task` as the task `name` of this scope, which may overlap what follows it or not:
@@ -351,42 +536,61 @@ impl<'p> Scope<'p> {
     /// `scratch` is the most bytes the task's frame (`cx.frame()`) hands out: an allocation
     /// past it is the task's [`Stopped::OutOfMemory`], naming the task. It is reserved as
     /// address space here and committed as it is used.
+    ///
+    /// Under `Threads` the task is queued (its spawner's worker's own queue, or an injection
+    /// queue from outside the pool) and runs on whichever worker starts it, or on its joiner if
+    /// none has; it runs inline as under `Inline` when the scope is narrowed to one worker or
+    /// the queue is full (a bound of [`threads::DEQUE`] per worker and [`threads::INJECT`] per
+    /// group: a spawn never waits for room and never grows a queue). The closure and its result
+    /// are `Send` in every layout, so code proven under `Inline` runs unchanged on the pool.
     #[track_caller]
-    pub fn may_overlap<T, E: fmt::Display>(
+    pub fn may_overlap<T: Send, E: fmt::Display>(
         &self,
         name: &'static str,
         scratch: usize,
-        task: impl FnOnce(&Cx) -> Result<T, E>,
+        task: impl FnOnce(&Cx) -> Result<T, E> + Send,
     ) -> Task<'_, T> {
         let live = &self.live;
-        live.last.set(name);
-        let frame = match Frame::with_reserve(scratch, blaze_mem::Tag::Frames) {
-            Ok(frame) => frame,
-            Err(blaze_mem::MemError::Reserve { .. } | blaze_mem::MemError::Commit { .. } | blaze_mem::MemError::Exhausted { .. } | blaze_mem::MemError::TooLarge { .. } | blaze_mem::MemError::Evict { .. }) => {
-                let stopped = Stopped::OutOfMemory { arena: name, asked: scratch };
-                let error = live.fail(name, TaskWhy::OutOfMemory(stopped));
-                return Task { name, outcome: Err(error), scope: PhantomData, unfinished: Unfinished::new("task::Task", "join(cx)") };
-            }
+        let (index, frame) = match self.prepare(name, scratch) {
+            Ok(prepared) => prepared,
+            Err(failed) => return failed,
         };
+        if let (Some(pool), Some(tally)) = (live.cx.pool(), &live.shared)
+            && self.workers() > 1
+        {
+            let (queued, job) = self.pool_job(tally, name, index, frame, task);
+            let here = live.cx.here();
+            if let Err(Full(job)) = pool.spawn(here, live.class.get(), job) {
+                pool.run_now(here, job);
+            }
+            return Scope::handle(name, Held::Queued(self.pending(pool, queued)));
+        }
         // A new task may go to any worker; once started it stays there (the module's doc).
-        let placed = live.placed.get() + 1;
-        live.placed.set(placed);
-        let cx = live.cx.task(name, frame, live.cx.worker().wrapping_add(placed));
+        let cx = live.cx.task(name, frame, live.cx.worker().wrapping_add(index));
         live.running.set(live.running.get() + 1);
         let ran = catch_unwind(AssertUnwindSafe(|| task(&cx)));
         live.running.set(live.running.get() - 1);
         drop(cx);
-        let outcome = match ran {
-            Ok(Ok(made)) => Ok(made),
-            // alloc: an error's message.
-            Ok(Err(error)) => Err(live.fail(name, TaskWhy::Failed(error.to_string()))),
-            Err(payload) => match payload.downcast::<Exit>() {
-                // The process exits: not this task's failure, so it is passed on.
-                Ok(exit) => resume_unwind(exit),
-                Err(payload) => Err(live.fail(name, TaskWhy::Panicked(said(&*payload)))),
-            },
+        let outcome = match ended(ran) {
+            Ok(made) => Ok(made),
+            // The process exits: not this task's failure, so it is passed on.
+            Err(Ending::Exit(exit)) => resume_unwind(exit),
+            Err(Ending::Why(why)) => Err(live.fail(index, name, why)),
         };
-        Task { name, outcome, scope: PhantomData, unfinished: Unfinished::new("task::Task", "join(cx)") }
+        Scope::handle(name, Held::Ended(outcome))
+    }
+
+    /// A queued task's handle state.
+    fn pending<T>(&self, pool: &Pool, queued: Queued<T>) -> Pending<T> {
+        let cx = &self.live.cx;
+        Pending {
+            queued,
+            pool: pool.clone(),
+            here: cx.here(),
+            scope: cx.name(),
+            deadline: cx.deadline(),
+            world: cx.io().clone(),
+        }
     }
 
     /// Runs `task` as the task `name` of this scope, at the same time as what follows it: for
@@ -396,22 +600,43 @@ impl<'p> Scope<'p> {
     /// scope is not failed by it, so the caller says what follows (usually `?`). Always so
     /// under `Inline`, which has one worker. `scratch` is the task's frame, as
     /// [`Scope::may_overlap`]'s.
-    pub fn must_overlap<T, E: fmt::Display>(
+    ///
+    /// Under `Threads` the task is handed to a worker that is idle now (searching or parked),
+    /// its spawner's group first, which starts it before anything else. It is refused the
+    /// same way when no worker is idle at that moment, or when the scope already has
+    /// `workers - 1` tasks out (its budget, the spawner being one): a spawn never waits for a
+    /// worker.
+    pub fn must_overlap<T: Send, E: fmt::Display>(
         &self,
         name: &'static str,
         scratch: usize,
-        task: impl FnOnce(&Cx) -> Result<T, E>,
+        task: impl FnOnce(&Cx) -> Result<T, E> + Send,
     ) -> Result<Task<'_, T>, NoParallelism> {
+        let live = &self.live;
         // The task and its spawner.
         let needed = 2;
         let have = self.workers();
-        if have < needed {
-            return Err(NoParallelism { scope: self.live.cx.name(), task: name, needed, have, layout: LAYOUT });
+        let refused = NoParallelism { scope: live.cx.name(), task: name, needed, have, layout: live.layout };
+        let (Some(pool), Some(tally)) = (live.cx.pool(), &live.shared) else {
+            return Err(NoParallelism { have: have.min(1), ..refused });
+        };
+        let out = u32::try_from(tally.running()).unwrap_or(u32::MAX);
+        if have < needed || out.saturating_add(needed) > have {
+            return Err(NoParallelism { have: have.saturating_sub(out).min(have), ..refused });
         }
-        let _: (usize, _) = (scratch, task);
-        match LAYOUT {
-            Layout::Inline => {
-                unreachable!("bstd::task {name}: the Inline layout has one worker, so must_overlap refused it above")
+        let (index, frame) = match self.prepare(name, scratch) {
+            Ok(prepared) => prepared,
+            Err(failed) => return Ok(failed),
+        };
+        let (queued, job) = self.pool_job(tally, name, index, frame, task);
+        match pool.reserve(live.cx.here(), job) {
+            Ok(_) => Ok(Scope::handle(name, Held::Queued(self.pending(pool, queued)))),
+            Err(job) => {
+                // No worker idle: the task never runs. Its queue pointer goes first, then the
+                // handle, which drops it unrun.
+                job.release_unrun();
+                drop(queued);
+                Err(NoParallelism { have: 1, ..refused })
             }
         }
     }
@@ -425,14 +650,20 @@ impl<'p> Scope<'p> {
         self.live.workers.get()
     }
 
-    /// Lets the scope run at most `most` of its tasks at once from now on; it only narrows. A
-    /// scope narrowed to one runs as the one-thread executor does: every
-    /// [`Scope::may_overlap`] inline and in order, every [`Scope::must_overlap`] refused.
+    /// Lets the scope run at most `most` of its tasks at once from now on, as `class`; both
+    /// only narrow. A scope narrowed to one runs as the one-thread executor does: every
+    /// [`Scope::may_overlap`] inline and in order, every [`Scope::must_overlap`] refused. A
+    /// scope narrowed to [`Class::Background`] queues its tasks, and the scopes in them, on the
+    /// pool's background queues: on a background worker (macOS: an efficiency core, at utility
+    /// QoS), or on a foreground worker only when it sees no foreground work.
     #[blaze::nopanic]
     #[blaze::noalloc]
     #[blaze::nonblocking]
-    pub fn narrow_workers(&self, most: NonZeroU32) {
+    pub fn narrow_workers(&self, most: NonZeroU32, class: Class) {
         self.live.workers.set(self.live.workers.get().min(most.get()));
+        if class == Class::Background {
+            self.live.class.set(Class::Background);
+        }
     }
 
     /// Cancels the scope: the next wait of each task under it ends with

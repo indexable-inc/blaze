@@ -18,7 +18,7 @@ use std::{borrow::Cow, ops};
 
 use blaze_mem::scratch::{self, Lent};
 
-use rustc_literal_escaper::{
+use crate::unescape::{
     EscapeError, Mode, unescape_byte, unescape_byte_str, unescape_c_str, unescape_char,
     unescape_str,
 };

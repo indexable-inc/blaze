@@ -32,25 +32,9 @@ use std::str::Chars;
 
 use LiteralKind::*;
 use TokenKind::*;
-pub use unicode_ident::UNICODE_VERSION;
-use unicode_properties::UnicodeEmoji;
-
-// Make sure that the Unicode version of the dependencies is the same.
-const _: () = {
-    let properties = unicode_properties::UNICODE_VERSION;
-    let ident = unicode_ident::UNICODE_VERSION;
-
-    if properties.0 != ident.0 as u64
-        || properties.1 != ident.1 as u64
-        || properties.2 != ident.2 as u64
-    {
-        panic!(
-            "unicode-properties and unicode-ident must use the same Unicode version, \
-            `unicode_properties::UNICODE_VERSION` and `unicode_ident::UNICODE_VERSION` are \
-            different."
-        );
-    }
-};
+// blaze: upstream reads `unicode-ident` and `unicode-properties`, whose versions it checks are
+// equal; blaze reads both properties from its one table crate, of one version.
+pub use blaze_unicode::UNICODE_VERSION;
 
 /// Parsed token.
 /// It doesn't contain information about data that has been parsed,
@@ -389,14 +373,14 @@ pub fn is_horizontal_whitespace(c: char) -> bool {
 /// a formal definition of valid identifier name.
 pub fn is_id_start(c: char) -> bool {
     // This is XID_Start OR '_' (which formally is not a XID_Start).
-    c == '_' || unicode_ident::is_xid_start(c)
+    c == '_' || blaze_unicode::is_xid_start(c)
 }
 
 /// True if `c` is valid as a non-first character of an identifier.
 /// See [Rust language reference](https://doc.rust-lang.org/reference/identifiers.html) for
 /// a formal definition of valid identifier name.
 pub fn is_id_continue(c: char) -> bool {
-    unicode_ident::is_xid_continue(c)
+    blaze_unicode::is_xid_continue(c)
 }
 
 /// The passed string is lexically an identifier.
@@ -678,7 +662,7 @@ impl<'a> Cursor<'a> {
                 Literal { kind, suffix_start }
             }
             // Identifier starting with an emoji. Only lexed for graceful error recovery.
-            c if !c.is_ascii() && c.is_emoji_char() => self.invalid_ident(),
+            c if !c.is_ascii() && blaze_unicode::is_emoji(c) => self.invalid_ident(),
             _ => Unknown,
         };
         if matches!(self.frontmatter_allowed, FrontmatterAllowed::Yes)
@@ -848,7 +832,7 @@ impl<'a> Cursor<'a> {
         // we see a prefix here, it is definitely an unknown prefix.
         match self.first() {
             '#' | '"' | '\'' => UnknownPrefix,
-            c if !c.is_ascii() && c.is_emoji_char() => self.invalid_ident(),
+            c if !c.is_ascii() && blaze_unicode::is_emoji(c) => self.invalid_ident(),
             _ => Ident,
         }
     }
@@ -857,7 +841,7 @@ impl<'a> Cursor<'a> {
         // Start is already eaten, eat the rest of identifier.
         self.eat_while(|c| {
             const ZERO_WIDTH_JOINER: char = '\u{200d}';
-            is_id_continue(c) || (!c.is_ascii() && c.is_emoji_char()) || c == ZERO_WIDTH_JOINER
+            is_id_continue(c) || (!c.is_ascii() && blaze_unicode::is_emoji(c)) || c == ZERO_WIDTH_JOINER
         });
         // An invalid identifier followed by '#' or '"' or '\'' could be
         // interpreted as an invalid literal prefix. We don't bother doing that

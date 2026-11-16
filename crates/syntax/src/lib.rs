@@ -72,7 +72,7 @@ pub use crate::{
     },
 };
 pub use parser::{BlazeEdition, Edition, Extensions, LexedStr, SyntaxKind, T, UnknownBlazeEdition};
-pub use rustc_literal_escaper as unescape;
+pub use parser::unescape;
 pub use crate::small_str::SmolStr;
 pub use syntax_tree::{
     Direction, Expand, FlatTree, FlatTreeBuilder, IMAGE_LAYOUT, NodeOrToken, SyntaxText, Text,

@@ -6,7 +6,7 @@
 
 use blaze_sim::{Config, Tape};
 use rustc_lexer::{Base, Cursor, FrontmatterAllowed, LiteralKind, TokenKind};
-use rustc_literal_escaper::{Mode, check_for_errors};
+use crate::unescape::{Mode, check_for_errors};
 
 use super::*;
 

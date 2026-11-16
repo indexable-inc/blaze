@@ -581,19 +581,24 @@ fn workspace(tree: &dyn Tree) -> Result<BTreeMap<String, Manifest>, DepsError> {
             continue;
         }
         let file = manifest_path(&dir);
+        // A member's text and document, read here and done with by the end of the turn.
+        let member_text: String;
+        let doc: toml::Doc<'_>;
         let table = if dir.is_empty() {
-            root.clone()
+            root
         } else {
-            let Some(text) = tree.read(&file)? else {
+            let Some(read) = tree.read(&file)? else {
                 let what = match &by {
                     Some(at) => format!("the manifest of the package {at} names"),
                     None => "a member's manifest".to_owned(),
                 };
                 return Err(DepsError::Missing { path: file, what });
             };
-            parse_toml(&file, &text).map_err(DepsError::Toml)?
+            member_text = read;
+            doc = read_toml(&file, &member_text)?;
+            doc.root()
         };
-        let Some(package) = get_table(&table, "package", &file)? else {
+        let Some(package) = get_table(table, "package", &file)? else {
             return Err(DepsError::Shape { at: Place { file, line: 1 }, key: "package".to_owned(), want: "a table: the manifest has no `[package]`" });
         };
         let Some(name) = get_str(package, "name", &file)? else {
@@ -602,7 +607,7 @@ fn workspace(tree: &dyn Tree) -> Result<BTreeMap<String, Manifest>, DepsError> {
         let member = members.contains(&dir);
         let vendored = dir == VENDOR || dir.starts_with("vendor/");
         let ours = !vendored || fork_is_ours(package, &file)?;
-        let mut deps = deps_of(&file, &dir, &table, root_deps)?;
+        let mut deps = deps_of(&file, &dir, table, root_deps)?;
         if !member {
             deps.retain(|it| it.kind != DepKind::Dev);
         }
@@ -635,17 +640,19 @@ struct Locked {
 
 fn read_lock(tree: &dyn Tree) -> Result<Vec<Locked>, DepsError> {
     let Some(text) = tree.read(LOCK)? else { return Err(DepsError::Missing { path: LOCK.to_owned(), what: "the lock".to_owned() }) };
-    let table = parse_toml(LOCK, &text).map_err(DepsError::Toml)?;
-    let packages = match table.entries.get("package") {
+    let doc = read_toml(LOCK, &text)?;
+    let want = "an array of tables, `[[package]]`";
+    let packages = match doc.root().get("package") {
         None => return Ok(Vec::new()),
-        Some((_, Toml::Tables(them))) => them,
-        Some((line, _)) => {
-            return Err(DepsError::Shape { at: Place { file: LOCK.to_owned(), line: *line }, key: "package".to_owned(), want: "an array of tables, `[[package]]`" });
-        }
+        Some(them) if them.is_array() => them,
+        Some(it) => return Err(shape(it, "package", LOCK, want)),
     };
     let mut out = Vec::new();
-    for package in packages {
-        let line = package.entries.values().map(|(line, _)| *line).min().unwrap_or(1);
+    for package in packages.children() {
+        if !package.is_table() {
+            return Err(shape(package, "package", LOCK, want));
+        }
+        let line = line_of(package);
         let need = |key: &str| DepsError::Shape { at: Place { file: LOCK.to_owned(), line }, key: key.to_owned(), want: "a string, which every package has" };
         let Some(name) = get_str(package, "name", LOCK)? else { return Err(need("name")) };
         let Some(version) = get_str(package, "version", LOCK)? else { return Err(need("version")) };
@@ -1403,55 +1410,27 @@ fn refused(edits: &[(&str, &str, &str)]) -> Option<DepsError> {
     census(&fixture(edits)).err()
 }
 
-/// What the TOML `text` is refused with: its line and what.
-
-
 fn selftest() {
-    // The TOML subset: what it reads.
-    let text = "a.b = 1 # a comment\n[\"q k\".'lit']\nx = [\n  1, # one\n  -2_0,\n]\ny = { z = 'w', n.m = true }\n\n[[arr]]\nv = \"\\u00e9\\t\"\n[[arr]]\nv = '''\nraw \\n'''\n";
-    match parse_toml("t.toml", text) {
-        Ok(root) => {
-            let a = get_table(&root, "a", "t.toml").ok().flatten();
-            expect(a.and_then(|it| it.entries.get("b")) == Some(&(1, Toml::Int(1))), &format!("a dotted key: {root:?}"));
-            let lit = get_table(&root, "q k", "t.toml").ok().flatten().and_then(|it| get_table(it, "lit", "t.toml").ok().flatten());
-            let x = lit.and_then(|it| it.entries.get("x"));
-            expect(x == Some(&(3, Toml::Array(vec![Toml::Int(1), Toml::Int(-20)]))), &format!("quoted keys in a header, an array over lines: {x:?}"));
-            let y = lit.and_then(|it| get_table(it, "y", "t.toml").ok().flatten());
-            let n = y.and_then(|it| get_table(it, "n", "t.toml").ok().flatten()).and_then(|it| it.entries.get("m"));
-            expect(
-                y.and_then(|it| it.entries.get("z")) == Some(&(7, Toml::Str("w".to_owned()))) && n == Some(&(7, Toml::Bool(true))),
-                &format!("an inline table with a dotted key: {y:?}"),
-            );
-            let arr = match root.entries.get("arr") {
-                Some((_, Toml::Tables(them))) => them.iter().map(|it| get_str(it, "v", "t.toml").ok().flatten()).collect(),
-                _ => Vec::new(),
-            };
-            expect(
-                arr == [Some("\u{e9}\t".to_owned()), Some("raw \\n".to_owned())],
-                &format!("an array of tables, escapes in a basic string, none in a literal one: {arr:?}"),
-            );
+    // TOML, read by blaze-toml (whose own tests hold the language): a refusal names the file
+    // and line, and a key of the wrong shape its line.
+    let twice = read_toml("t.toml", "x = 1\na = 1\na = 2\n").err();
+    expect(
+        matches!(&twice, Some(DepsError::Toml { at, what: toml::What::Duplicate { .. }, .. }) if *at == place("t.toml", 3)),
+        &format!("a key written twice is refused at its line: {twice:?}"),
+    );
+    let text = "[t]\nname = 1\ndeps = [\n  \"a\",\n  2,\n]\n";
+    match read_toml("t.toml", text) {
+        Ok(doc) => {
+            let t = get_table(doc.root(), "t", "t.toml").ok().flatten();
+            let name = t.map(|it| get_str(it, "name", "t.toml"));
+            let want = DepsError::Shape { at: place("t.toml", 2), key: "name".to_owned(), want: "a string" };
+            expect(name == Some(Err(want)), &format!("a number where a string must be, at its line: {name:?}"));
+            let deps = t.map(|it| get_strs(it, "deps", "t.toml"));
+            let want = DepsError::Shape { at: place("t.toml", 3), key: "deps".to_owned(), want: "an array of strings" };
+            expect(deps == Some(Err(want)), &format!("a number in an array of strings, at the array's line: {deps:?}"));
         }
-        Err(e) => expect(false, &format!("the subset reads {text:?}: {e}")),
+        Err(e) => expect(false, &format!("blaze-toml reads {text:?}: {e}")),
     }
-    // What it refuses, each at its line.
-    let cases: [(&str, usize, TomlWhat); 10] = [
-        ("a = 1.5\n", 1, TomlWhat::Unread("a float, a date or a time")),
-        ("x = 1\nd = 1979-05-27\n", 2, TomlWhat::Unread("a float, a date or a time")),
-        ("a = 0x1F\n", 1, TomlWhat::Unread("a hex, octal or binary integer")),
-        ("a = nan\n", 1, TomlWhat::Unread("`inf` or `nan`, a float")),
-        ("a = 1\na = 2\n", 2, TomlWhat::Twice("a".to_owned())),
-        ("[t]\nk = 1\n[t]\n", 3, TomlWhat::Twice("t".to_owned())),
-        ("x = 1\n[[x]]\n", 2, TomlWhat::Twice("x".to_owned())),
-        ("a = \"x\nb = 1\n", 1, TomlWhat::Unclosed("one-line string")),
-        ("a = 1 b = 2\n", 1, TomlWhat::Expected("the end of the line after a value or a header")),
-        ("s = '''\nok'''\nt = \"\\q\"\n", 3, TomlWhat::Escape("\\q".to_owned())),
-    ];
-    for (text, line, what) in cases {
-        let got = toml_refused(text);
-        expect(got == Some((line, what.clone())), &format!("{text:?} is refused at line {line} with {what:?}: {got:?}"));
-    }
-    expect(toml_refused("x = [1, 2\n").is_some_and(|(line, what)| line == 1 && what == TomlWhat::Unclosed("array")), "an unclosed array");
-    expect(toml_refused("k = 1\n[k.j]\n").is_some_and(|(_, what)| what == TomlWhat::NotATable("k".to_owned())), "a value used as a table");
 
     // The pieces: paths, the lock's dependency forms, version requirements.
     expect(join("crates/x", "../y/./z") == Some("crates/y/z".to_owned()) && join("tools/t", "../../../up").is_none(), "paths join lexically");
@@ -1524,8 +1503,10 @@ fn selftest() {
         .read(b_toml)
         .ok()
         .flatten()
-        .and_then(|text| parse_toml(b_toml, &text).ok())
-        .and_then(|root| get_table(&root, "package", b_toml).ok().flatten().and_then(|it| get_str(it, "description", b_toml).ok().flatten()));
+        .and_then(|text| {
+            let doc = read_toml(b_toml, &text).ok()?;
+            get_table(doc.root(), "package", b_toml).ok().flatten().and_then(|it| get_str(it, "description", b_toml).ok().flatten())
+        });
     expect(description.as_deref() == Some("One line, then the next: \u{e9}."), &format!("a multi-line string's line-ending backslash: {description:?}"));
     expect(row_of(&now, TOTAL) == [7, 1, 8], &format!("the total, each package once: {:?}", row_of(&now, TOTAL)));
 

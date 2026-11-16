@@ -15,22 +15,17 @@
 //! names and meanings; its iteration order is the table's slot order, a function of the inserts,
 //! the removals and the hasher, the same on every run.
 
-use core::{
-    alloc::Allocator,
-    fmt,
-    hash::{BuildHasher, Hash},
-    iter::FusedIterator,
-    ops::Index,
-};
+use core::{alloc::Allocator, fmt, iter::FusedIterator, ops::Index};
 
 use blaze_own::AllocFailure;
 
 use crate::{
-    Equivalent,
+    Equivalent, KeyHash, Plain,
     raw::{self, RawTable},
 };
 
-/// A map on the hasher `S`, in the allocator `A`.
+/// A map on the hasher `S`, in the allocator `A`: `S` is a `BuildHasher` over `Hash` keys, or
+/// [`Plain`] over [`PlainKey`](crate::PlainKey)s, one seam ([`KeyHash`]).
 pub struct Map<K, V, S, A: Allocator> {
     pub(crate) table: RawTable<(K, V), A>,
     pub(crate) hasher: S,
@@ -38,8 +33,17 @@ pub struct Map<K, V, S, A: Allocator> {
 
 /// What hashes a held entry when the table is made again: its key, by `hasher`.
 #[inline]
-fn by_key<K: Hash, V, S: BuildHasher>(hasher: &S) -> impl Fn(&(K, V)) -> u64 + '_ {
-    move |entry| hasher.hash_one(&entry.0)
+fn by_key<K, V, S: KeyHash<K>>(hasher: &S) -> impl Fn(&(K, V)) -> u64 + '_ {
+    move |entry| hasher.hash_key(&entry.0)
+}
+
+impl<K, V, A: Allocator> Map<K, V, Plain, A> {
+    /// An empty map in `alloc` hashed by [`hash_plain`](crate::hash_plain): a lookup hashes
+    /// the key's bytes in one step and builds no `Hasher`.
+    #[inline]
+    pub const fn plain_in(alloc: A) -> Self {
+        Map::with_hasher_in(Plain, alloc)
+    }
 }
 
 impl<K, V, S: Default, A: Allocator> Map<K, V, S, A> {
@@ -56,7 +60,7 @@ impl<K, V, S: Default, A: Allocator> Map<K, V, S, A> {
     }
 }
 
-impl<K: Eq + Hash, V, S: BuildHasher + Default, A: Allocator> Map<K, V, S, A> {
+impl<K: Eq, V, S: KeyHash<K> + Default, A: Allocator> Map<K, V, S, A> {
     /// The map of `iter`'s pairs in `alloc`, a later pair replacing an earlier one's value:
     /// what `collect()` makes, with the allocator named.
     #[inline]
@@ -165,7 +169,7 @@ impl<K, V, S, A: Allocator> Map<K, V, S, A> {
     }
 }
 
-impl<K: Eq + Hash, V, S: BuildHasher, A: Allocator> Map<K, V, S, A> {
+impl<K: Eq, V, S: KeyHash<K>, A: Allocator> Map<K, V, S, A> {
     /// Room for `additional` more entries; a refused allocation is a panic naming it.
     #[inline]
     pub fn reserve(&mut self, additional: usize) {

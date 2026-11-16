@@ -360,12 +360,11 @@ fn tables(dir: &Path, version: &str) -> Result<String, TableError> {
          \n\
          pub(crate) const UNICODE_VERSION: (u8, u8, u8) = ({major}, {minor}, {update});\n"
     ));
-    let gc = |key: &'static str| move |cp: u32| has(&general, key, cp);
     e.set("XID_START", "XID_Start (DerivedCoreProperties.txt)", &set_ranges(|cp| has(&core, "XID_Start", cp)));
     e.set("XID_CONTINUE", "XID_Continue (DerivedCoreProperties.txt)", &set_ranges(|cp| has(&core, "XID_Continue", cp)));
     e.set("EMOJI", "Emoji=Yes (emoji/emoji-data.txt)", &set_ranges(|cp| has(&emoji, "Emoji", cp)));
-    e.set("OTHER_PUNCTUATION", "General_Category=Po (extracted/DerivedGeneralCategory.txt)", &set_ranges(gc("Po")));
-    e.set("DECIMAL_NUMBER", "General_Category=Nd (extracted/DerivedGeneralCategory.txt)", &set_ranges(gc("Nd")));
+    e.set("OTHER_PUNCTUATION", "General_Category=Po (extracted/DerivedGeneralCategory.txt)", &set_ranges(|cp| has(&general, "Po", cp)));
+    e.set("DECIMAL_NUMBER", "General_Category=Nd (extracted/DerivedGeneralCategory.txt)", &set_ranges(|cp| has(&general, "Nd", cp)));
     e.valued(
         "WIDTH",
         "Display width from U+00A0, default 1; 4 is 2 and Emoji_Presentation (EastAsianWidth.txt and the zero-width properties)",

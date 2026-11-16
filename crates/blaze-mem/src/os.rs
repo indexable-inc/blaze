@@ -337,13 +337,13 @@ mod freed {
         blaze::process_static,
         reason = "the released address ranges, merged with their neighbours: bounded by the process's one reserved address space"
     )]
-    static FREE: parking_lot::Mutex<BTreeMap<usize, usize>> =
-        parking_lot::Mutex::new(BTreeMap::new());
+    static FREE: std::sync::Mutex<BTreeMap<usize, usize>> =
+        std::sync::Mutex::new(BTreeMap::new());
 
     /// The first page of the smallest released range of at least `pages`, its tail filed
     /// again, or `None` when no range is big enough.
     pub(super) fn take(pages: usize) -> Option<usize> {
-        let mut free = FREE.lock();
+        let mut free = FREE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let (&at, &have) = free
             .iter()
             .filter(|&(_, &have)| have >= pages)
@@ -359,7 +359,7 @@ mod freed {
     /// overlaps one already filed was released twice, or is not what `reserve` gave: filing it
     /// would hand the same pages to two regions, so the process aborts, naming both.
     pub(super) fn give(mut at: usize, mut pages: usize) {
-        let mut free = FREE.lock();
+        let mut free = FREE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let before = free.range(..at).next_back().filter(|&(&before, &len)| before + len > at);
         let after = free.range(at..).next().filter(|&(&next, _)| next < at + pages);
         if let Some((&filed, &len)) = before.or(after) {

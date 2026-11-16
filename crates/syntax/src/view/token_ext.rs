@@ -4,7 +4,7 @@
 
 use std::{borrow::Cow, num::ParseIntError, ops::Range};
 
-use rustc_literal_escaper::{
+use parser::unescape::{
     EscapeError, unescape_byte, unescape_byte_str, unescape_c_str, unescape_char,
     unescape_str,
 };

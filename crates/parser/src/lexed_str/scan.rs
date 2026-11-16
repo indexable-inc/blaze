@@ -19,7 +19,7 @@
 //! second set of rules: the tests check both agree at every offset of every test file.
 
 use blaze_phf::{name_hash_finish, name_hash_start, name_hash_word};
-use rustc_literal_escaper::{Mode, unescape_byte, unescape_byte_str, unescape_char, unescape_str};
+use crate::unescape::{Mode, unescape_byte, unescape_byte_str, unescape_char, unescape_str};
 
 use super::{
     CHECKPOINT, KIND_BITS, LONG, LexedStr, can_be_raw,
@@ -519,7 +519,7 @@ fn close_single(bytes: &[u8], i: usize) -> Option<usize> {
 /// would report has no message.
 fn clean_str(text: &str, mode: Mode) -> bool {
     let mut clean = true;
-    let mut check = |error: Option<rustc_literal_escaper::EscapeError>| {
+    let mut check = |error: Option<crate::unescape::EscapeError>| {
         clean &= error.is_none_or(|e| err_to_msg(&e, mode).is_empty());
     };
     match mode {

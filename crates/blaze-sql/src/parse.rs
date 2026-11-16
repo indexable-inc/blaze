@@ -14,6 +14,11 @@
 
 #![blaze::sans_io]
 
+/// The query grammar's statements and forms (query.md), as more methods of [`Parser`].
+mod script;
+
+pub use self::script::{parse_query, parse_script};
+
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::alloc::Allocator;
@@ -25,7 +30,7 @@ use crate::ast::{
     UnaryOp, Update,
 };
 use crate::desc::Storage;
-use crate::lex::{Keyword, Lexer, Punct, Tok, Token};
+use crate::lex::{Grammar, Keyword, Lexer, Punct, Tok, Token};
 
 /// The deepest expression tree the subset has: a leaf is 1 deep, and a node one more than its
 /// deepest operand. Deeper text is refused as [`SyntaxErrorKind::NestedTooDeeply`].
@@ -137,6 +142,10 @@ pub enum SyntaxErrorKind<'s> {
     UnknownCastType(&'s str),
     /// `offset` without `limit`: SQLite has no `offset` alone.
     OffsetWithoutLimit,
+    /// `/*` with no `*/`, in the query grammar; the text from the opener to the end.
+    UnterminatedComment(&'s str),
+    /// A type of the query grammar's `cast` or `::` it does not know.
+    UnknownQueryType(&'s str),
 }
 
 /// Writes `text` cut at 40 bytes (on a char boundary), so a message about an unterminated
@@ -298,6 +307,17 @@ impl fmt::Display for SyntaxError<'_> {
             SyntaxErrorKind::OffsetWithoutLimit => write!(
                 f,
                 "`offset` at byte {at} has no `limit` before it: write `limit .. offset ..`"
+            ),
+            SyntaxErrorKind::UnterminatedComment(text) => {
+                f.write_str("comment `")?;
+                excerpt(f, text)?;
+                write!(f, "` at byte {at} has no closing `*/`")
+            }
+            SyntaxErrorKind::UnknownQueryType(name) => write!(
+                f,
+                "`{name}` at byte {at} is not a type of the query grammar: write `boolean`, \
+                 `tinyint`, `smallint`, `integer`, `bigint`, `hugeint`, `utinyint`, `usmallint`, \
+                 `uinteger`, `ubigint`, `double`, `real`, `float` or `varchar`"
             ),
         }
     }
@@ -847,6 +867,9 @@ impl<'s, A: Allocator + Copy> Parser<'s, A> {
     fn operand(&mut self, min: u8) -> Parsed<'s, Node<'s, A>> {
         #[cfg(test)]
         crate::tests::stack::touch();
+        if self.lex.grammar() == Grammar::Query {
+            return self.query_operand(min);
+        }
         let start = self.tok.span;
         // `not` binds looser than a comparison, so it starts an operand only where nothing
         // tighter than `not` is required (`a = not b` is refused).
@@ -972,6 +995,9 @@ impl<'s, A: Allocator + Copy> Parser<'s, A> {
             }
             Comparison::Is => {
                 let not = self.eat_keyword(Keyword::Not)?.is_some();
+                if self.lex.grammar() == Grammar::Query && self.at_keyword(Keyword::Distinct) {
+                    return self.distinct_from(left, not);
+                }
                 if let Some(null) = self.eat_keyword(Keyword::Null)? {
                     let kind = ExprKind::IsNull { operand: left.expr, negated: not };
                     return self.node(kind, cover(start, null), left.height);
@@ -985,6 +1011,9 @@ impl<'s, A: Allocator + Copy> Parser<'s, A> {
                     let list = Name { text, quoted: false, span };
                     let kind = ExprKind::InParam { operand: left.expr, list, negated };
                     return self.node(kind, cover(start, span), left.height);
+                }
+                if self.lex.grammar() == Grammar::Query && self.query_ahead()? {
+                    return self.in_query(left, negated);
                 }
                 self.expect_punct(
                     Punct::LParen,

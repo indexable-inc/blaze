@@ -10,19 +10,21 @@ use crate::{ContentId, rng::SplitMix64};
 #[test]
 fn hashes_as_official_blake3() {
     let mut rng = SplitMix64::new(7);
-    let mut bytes = vec![0; 70_000];
+    // Under Miri, a few chunks (1 KiB each) and a few rounds a context.
+    let (most, rounds) = if cfg!(miri) { (4_100, 6) } else { (70_000, 200) };
+    let mut bytes = vec![0; most];
     rng.fill(&mut bytes);
     for context in ["blaze v2 a 1", "", "blaze v2 a domain of some length 7"] {
         let key = context_key(context);
         assert_eq!(key, blake3::hazmat::hash_derive_key_context(context), "{context:?}");
-        for _ in 0..200 {
+        for _ in 0..rounds {
             let mut ours = super::Hasher::new_from_context_key(&key);
             let mut derived = super::Hasher::new_derive_key(context);
             let mut theirs = blake3::Hasher::new_derive_key(context);
             let mut whole = Vec::new();
             for _ in 0..rng.range(0..12) {
                 let len =
-                    if rng.one_in(8) { rng.range(0..70_000) } else { rng.range(0..80) } as usize;
+                    if rng.one_in(8) { rng.range(0..most as u64) } else { rng.range(0..80) } as usize;
                 let start = rng.index(bytes.len() - len + 1);
                 let part = &bytes[start..start + len];
                 ours.update(part);
@@ -45,9 +47,12 @@ fn hashes_as_official_blake3() {
 fn of_many_is_official_blake3() {
     let bytes: Vec<u8> =
         (0..2100u32).map(|n| (n.wrapping_mul(2_654_435_761) >> 24) as u8).collect();
-    for copies in [1, 2, 3, 7, 8, 9, 16, 17, 64, 65] {
+    // Under Miri, each side of 8 and 16 lanes, at one length in 37 across a chunk and past it.
+    let all: &[usize] =
+        if cfg!(miri) { &[1, 8, 9, 16, 17] } else { &[1, 2, 3, 7, 8, 9, 16, 17, 64, 65] };
+    for &copies in all {
         let inputs: Vec<&[u8]> = (0..=1100)
-            .step_by(if copies > 16 { 7 } else { 1 })
+            .step_by(if cfg!(miri) { 37 } else if copies > 16 { 7 } else { 1 })
             .flat_map(|len| (0..copies).map(move |copy| (len, copy)))
             .map(|(len, copy)| &bytes[copy * 13..copy * 13 + len])
             .collect();

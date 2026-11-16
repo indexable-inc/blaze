@@ -1,6 +1,6 @@
 # rustc's `rustc_lexer`, as it is at the toolchain in `harness/toolchain` (nightly-2026-10-27,
 # rustc 1.101.0-nightly 16d1ffac1 2026-10-26): `src` is `compiler/rustc_lexer/src` of
-# rust-lang/rust at commit 16d1ffac17ad8b739e32483ac2e65fe7e1804977, unchanged, re-vendored by
+# rust-lang/rust at commit 16d1ffac17ad8b739e32483ac2e65fe7e1804977, unchanged but its Unicode lines (below), re-vendored by
 # harness/toolchain_bump.py. It is blaze's one lexer, the pinned nightly's, so source and a
 # macro's `TokenStream::from_str` lex as the toolchain's rustc and `proc_macro` do.
 [package]
@@ -16,8 +16,10 @@ name = "rustc_lexer"
 [dependencies]
 # blaze's byte search under memchr's name, so `src`, copied unchanged, names it as `memchr::`.
 memchr = { package = "blaze-memchr", path = "../blaze-memchr" }
-unicode-properties = { workspace = true, features = ["emoji"] }
-unicode-ident.workspace = true
+# XID_Start, XID_Continue and Emoji, where upstream reads unicode-ident and unicode-properties
+# (cargo takes no package under two names, so `src` cannot stay unchanged here): the lines of
+# src/lib.rs that name `blaze_unicode` are blaze's, to keep at the next re-vendor.
+blaze-unicode.workspace = true
 
 [dev-dependencies]
 test-utils.workspace = true
