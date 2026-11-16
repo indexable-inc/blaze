@@ -130,10 +130,18 @@ of the design that is new.
   into a crate-wide task. The size distribution of glob cycles on std, reth and tempo is
   measured with the old layer's resolved maps before the pull producer is trusted.
 
-The review recommended a first producer that resolves a crate whole and writes these same
-records and read lists, replaced by the pull producer later. Andrew, the same hour: "ideally
-we want to do sota all at once no incremental". So the pull producer is built first; the
-records and the read lists are the same either way, which is what the type checker sees.
+**The producer (decided with Andrew, 2026-11-15 18:37).** Three grains were weighed: one
+record per crate (any new name redoes the crate), per module updated incrementally, and
+per-name pull from cold. The choice is the middle one. The first time a crate is seen, all its
+modules are resolved together by the known fixpoint, which settles every name; each module's
+scope is its own record with its per-name read list. After an edit only the modules whose read
+lists no longer hold are run again (the edited module, and readers of a name that changed,
+appeared or went), and a module in a glob cycle runs with its partners. The machine is per
+module and asks for what it needs, so the same machine serves both "all modules of this crate"
+and "these modules again". Pull from cold (resolving only the modules a program reaches) saves
+work only for a crate never seen before and not fetched, and is the one part no Rust compiler
+has built: it is not built unless a measured crate-wide first pass over item lists costs more
+than about 10 ms on reth's or tempo's largest crate.
 
 ## How it is built and proven
 
