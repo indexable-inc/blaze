@@ -85,7 +85,8 @@ const STATX_INO: u32 = 0x0100;
 /// How a kept file is opened: for reading and appending.
 const KEEP: i32 = libc::O_RDWR | libc::O_APPEND;
 /// How a kept file for reads into and writes from memory is opened: for reading and writing at
-/// offsets, never made (its asker makes it first).
+/// offsets, never made (its asker makes it first); kept by a read alone ([`READ_ONLY`]),
+/// `O_RDONLY`, as a file sealed read-only refuses an open for writing (`Kept::read_only`).
 const POSITIONAL_KEEP: i32 = libc::O_RDWR;
 /// How a directory is opened to be synced.
 const DIR: i32 = libc::O_RDONLY | libc::O_DIRECTORY;
@@ -882,9 +883,13 @@ impl Uring {
                 1
             }
             (Kind::Open, _) => {
+                let positional = match hot.flags & READ_ONLY != 0 {
+                    true => libc::O_RDONLY,
+                    false => POSITIONAL_KEEP,
+                };
                 let flags = match (hot.flags & ops::POSITIONAL != 0, hot.flags & DIRECT != 0) {
-                    (true, true) => POSITIONAL_KEEP | libc::O_DIRECT,
-                    (true, false) => POSITIONAL_KEEP,
+                    (true, true) => positional | libc::O_DIRECT,
+                    (true, false) => positional,
                     // Made where missing is opened to append, a sync's too (`Kept::read_only`).
                     (false, _) => match (hot.flags & MAKE != 0, hot.flags & READ_ONLY != 0) {
                         (true, _) => KEEP | libc::O_CREAT,
