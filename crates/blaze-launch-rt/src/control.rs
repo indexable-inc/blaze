@@ -33,20 +33,10 @@
 //!
 //! # A start from the program's file
 //!
-//! A launcher may hold its start already ([`Held`]: the `Tell::Image` frame of the program's
-//! start file, `<program>.blaze-start`, which the daemon places beside the program once the
-//! image is durable). Then:
-//!
-//! - with a socket ([`Join::Now`]) it says `Hello { holds: Some(check), running: false }` and
-//!   waits: `Welcome` (the daemon holds that image) takes the held frame, an `Image` is taken
-//!   as it is told (the daemon holds another), `Unheld` ends as it always has;
-//! - with none ([`Join::Later`]: no daemon listened) it takes the held frame at once and the
-//!   program runs, asking no one. The first stub that fires runs the join, once a process: the
-//!   caller's closure starts a daemon and connects (bounded by its own deadline,
-//!   [`JOIN_WITHIN`]), the launcher says `Hello { holds: Some(check), running: true }` and,
-//!   once `Welcome`d, asks for every slot that waited. A join that failed, or an `Unheld`,
-//!   answers that need and every later one [`Bound::Refused`] with why: the program stops on
-//!   that call, by name, never on other code.
+//! A launcher may hold its start already ([`Held`]: a `Tell::Image` frame and the check word
+//! of its image). Then it says `Hello { holds: Some(check), running: false }` and waits:
+//! `Welcome` (the other side holds that image) takes the held frame, an `Image` is taken as it
+//! is told (the other side holds another), `Unheld` ends the launcher, naming why.
 //!
 //! The waits of this module, each on a thread of its own and none on a fiber: the control
 //! thread on its queue ([`Driver::wait`]); the reader in `read`; a write of a frame to the
@@ -55,7 +45,6 @@
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
-use std::time::Duration;
 
 use blaze_launch::wire::{self, Ask, ProgramId, Tell, WireError};
 use blaze_launch::{Slot, Target, Thread};
@@ -144,90 +133,37 @@ pub(crate) const OS: wire::Os = wire::Os::Macos;
 #[cfg(target_os = "linux")]
 pub(crate) const OS: wire::Os = wire::Os::Linux;
 
-/// The longest a launcher that started from its file waits, at a first call no image held,
-/// for the daemon it starts to listen (the join's closure holds itself to it).
-pub const JOIN_WITHIN: Duration = Duration::from_secs(120);
-
-/// A start file's start: its `Tell::Image` frame, length first as a daemon sends it, and the
-/// check word of the image it is the frame of (the start file's bytes 8..40).
+/// A held start: its `Tell::Image` frame, length first as the other side sends it, and the
+/// check word of the image it is the frame of.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Held<'a> {
     pub frame: &'a [u8],
     pub check: [u8; 32],
 }
 
-/// How the launcher reaches its daemon.
-pub enum Join {
-    /// A daemon listened: its socket.
-    Now(UnixStream),
-    /// None listened: what starts one and connects to it, run at most once a process, at the
-    /// first call no held image answers. `dyn`: one a process.
-    Later(Box<dyn FnMut() -> Result<UnixStream, String> + Send>),
-}
-
-/// Where the launcher is with its daemon.
+/// Where the launcher is with the other side of its socket.
 enum Joining {
-    /// Connected, `Hello` said: what the daemon says is served as it comes.
+    /// Connected, `Hello` said: what the other side says is served as it comes.
     Joined,
     /// Connected, `Hello { holds, running: false }` said for the held image, which the
-    /// daemon's `Welcome` gives the launcher.
+    /// other side's `Welcome` gives the launcher.
     Holds,
-    /// No daemon yet: the closure that joins one, at the first need.
-    Later(Box<dyn FnMut() -> Result<UnixStream, String> + Send>),
-    /// Connected after the program started from its image: `Hello { running: true }` said,
-    /// and the needs wait, unasked, for the daemon's `Welcome`.
-    Waits,
-    /// No daemon can serve this program: every need is refused with why.
-    Refused(String),
-}
-
-/// A bug planted in the join, for its test's control.
-#[cfg(test)]
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Plant {
-    /// The join is not remembered: each need runs the closure again.
-    JoinsTwice,
-}
-
-/// Whether [`Plant::JoinsTwice`] is planted; never outside a test.
-#[cfg(test)]
-pub(crate) static JOINS_TWICE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-#[cfg(test)]
-fn planted(plant: Plant) -> bool {
-    match plant {
-        Plant::JoinsTwice => JOINS_TWICE.load(std::sync::atomic::Ordering::Relaxed),
-    }
-}
-
-#[cfg(not(test))]
-fn planted(_: Plant) -> bool {
-    false
-}
-
-#[cfg(not(test))]
-#[derive(Clone, Copy)]
-enum Plant {
-    JoinsTwice,
 }
 
 struct Control<'a, 'h> {
     driver: Driver,
-    /// `None` until a [`Join::Later`] joins.
+    /// `None` until [`Control::connect`].
     socket: Option<UnixStream>,
     joining: Joining,
-    /// The program, for a `Hello` said at a join.
+    /// The program, for its `Hello`.
     program: ProgramId,
-    /// The start file's start, until it is taken.
+    /// The held start, until it is taken.
     held: Option<Held<'h>>,
-    /// The check word of the start file's image, for a `Hello`: `None` with no start file.
-    holds: Option<[u8; 32]>,
     /// The reader thread of the socket, once there is one.
     reader: Option<std::thread::JoinHandle<()>>,
     records: &'a mut dyn Records,
     /// The slots whose stub fired, each with the thread that fired it first, while no `Need`
-    /// can be said yet (no daemon, or one that has not welcomed the launcher): asked once it
-    /// has.
+    /// can be said yet (the other side has not welcomed the launcher): asked once it has.
     unasked: Vec<(Slot, Thread)>,
     /// By slot: the threads waiting in its stub, for which one `Need` was said.
     needs: Vec<(Slot, Vec<std::sync::Arc<sys::Handoff<Bound>>>)>,
@@ -253,13 +189,13 @@ pub struct Start {
     pub inits: Vec<usize>,
 }
 
-/// Runs the control thread's loop on this thread until [`Shared::stop`]: reaches the daemon
-/// as `join` says, starts from `held` where the launcher holds its start (module docs, "A
-/// start from the program's file"), says `Hello` for `program`, then serves the daemon and the
-/// threads of `driver`. Gives the driver back, with the first failure if there was one.
+/// Runs the control thread's loop on this thread until [`Shared::stop`]: takes `socket`,
+/// holds `held` where the launcher holds its start (module docs, "A start from the program's
+/// file"), says `Hello` for `program`, then serves the other side and the threads of
+/// `driver`. Gives the driver back, with the first failure if there was one.
 pub fn run(
     driver: Driver,
-    join: Join,
+    socket: UnixStream,
     held: Option<Held<'_>>,
     program: ProgramId,
     records: &mut dyn Records,
@@ -267,12 +203,12 @@ pub fn run(
     restart: fn(&str) -> String,
 ) -> (Driver, Result<(), ControlError>) {
     let shared = driver.shared();
+    let holds = held.map(|it| it.check);
     let mut control = Control {
         driver,
         socket: None,
-        joining: Joining::Joined,
+        joining: if holds.is_some() { Joining::Holds } else { Joining::Joined },
         program,
-        holds: held.map(|it| it.check),
         held,
         reader: None,
         records,
@@ -284,28 +220,7 @@ pub fn run(
         ready,
         restart,
     };
-    let begun = match join {
-        Join::Now(socket) => {
-            let holds = control.held.map(|it| it.check);
-            if holds.is_some() {
-                control.joining = Joining::Holds;
-            }
-            control.connect(socket, holds, false, &shared)
-        }
-        Join::Later(mut join) => match control.held {
-            // The program runs from its file, asking no one; the daemon is joined at the
-            // first call the image does not hold.
-            Some(_) => {
-                control.joining = Joining::Later(join);
-                control.start_held()
-            }
-            // Nothing to run without a daemon: it is joined now.
-            None => match join() {
-                Ok(socket) => control.connect(socket, None, false, &shared),
-                Err(why) => Err(ControlError::Unheld { why }),
-            },
-        },
-    };
+    let begun = control.connect(socket, holds, false, &shared);
     if let Err(why) = begun {
         control.lose(why);
     }
@@ -320,7 +235,7 @@ pub fn run(
                 control.driver.wait()
             }
         };
-        match control.handle(event, &shared) {
+        match control.handle(event) {
             Ok(true) => {}
             Ok(false) => break,
             Err(why) => control.lose(why),
@@ -448,43 +363,6 @@ impl Control<'_, '_> {
         Ok(())
     }
 
-    /// The first need of a program that started from its file with no daemon: the join, run
-    /// once a process. Its `Err` refuses this need and every later one.
-    fn join(&mut self, slot: Slot, shared: &std::sync::Arc<Shared>) {
-        let Joining::Later(join) = &mut self.joining else { return };
-        // The wait: the closure's, for a daemon to start and listen, bounded by its own
-        // deadline (`JOIN_WITHIN`). The launcher opens no spans; it is named here: the first
-        // call of the slot that fired waits for a daemon to start.
-        let joined = join();
-        match joined {
-            Ok(socket) => {
-                if !planted(Plant::JoinsTwice) {
-                    self.joining = Joining::Waits;
-                }
-                if let Err(why) = self.connect(socket, self.holds, true, shared) {
-                    self.refuse(format!("the first call of slot {} joined a daemon, and saying hello failed: {why}", slot.0));
-                }
-            }
-            Err(why) => {
-                self.refuse(format!("the first call of slot {} waits for a daemon to start, and it did not: {why}", slot.0));
-            }
-        }
-    }
-
-    /// No daemon can serve this program: every need waiting and to come is refused with
-    /// `why`, which stops the program on that call, by name.
-    fn refuse(&mut self, why: String) {
-        self.unasked.clear();
-        for (_, waiters) in self.needs.drain(..) {
-            for waiter in waiters {
-                waiter.put(Bound::Refused(why.clone())); // clone: one answer a waiter
-            }
-        }
-        if !planted(Plant::JoinsTwice) {
-            self.joining = Joining::Refused(why);
-        }
-    }
-
     /// Writes one message to the daemon: under `id` when it answers a message of the
     /// daemon's, else under this side's next.
     fn ask(&mut self, id: Option<u64>, ask: &Ask<'_>) -> Result<(), ControlError> {
@@ -495,7 +373,7 @@ impl Control<'_, '_> {
         self.out.clear();
         ask.encode(id, &mut self.out).map_err(ControlError::Wire)?;
         let Some(socket) = &mut self.socket else {
-            return Err(ControlError::Socket { call: "write", why: "no daemon is joined yet".to_owned() });
+            return Err(ControlError::Socket { call: "write", why: "no socket is connected yet".to_owned() });
         };
         // The wait: for the socket to take the frame.
         socket.write_all(&self.out).map_err(|why| ControlError::Socket { call: "write", why: why.to_string() })
@@ -524,10 +402,10 @@ impl Control<'_, '_> {
     }
 
     /// Serves one event. `false` is the word to stop.
-    fn handle(&mut self, event: Event, shared: &std::sync::Arc<Shared>) -> Result<bool, ControlError> {
+    fn handle(&mut self, event: Event) -> Result<bool, ControlError> {
         match event {
             Event::Thread(told) => self.driver.told(told)?,
-            Event::Need { slot, thread, reply } => self.need(slot, thread, reply, shared)?,
+            Event::Need { slot, thread, reply } => self.need(slot, thread, reply)?,
             Event::Frame(item) => self.tell(&item)?,
             Event::Closed(why) => return Err(ControlError::Closed(why)),
             Event::Stop => return Ok(false),
@@ -541,7 +419,6 @@ impl Control<'_, '_> {
         slot: Slot,
         thread: Thread,
         reply: std::sync::Arc<sys::Handoff<Bound>>,
-        shared: &std::sync::Arc<Shared>,
     ) -> Result<(), ControlError> {
         if let Some(lost) = &self.lost {
             reply.put(Bound::Lost(lost.to_string()));
@@ -552,10 +429,6 @@ impl Control<'_, '_> {
             reply.put(Bound::Code);
             return Ok(());
         }
-        if let Joining::Refused(why) = &self.joining {
-            reply.put(Bound::Refused(why.clone())); // clone: one answer a waiter
-            return Ok(());
-        }
         match self.needs.iter_mut().find(|(waited, _)| *waited == slot) {
             Some((_, waiters)) => waiters.push(reply),
             None => {
@@ -563,20 +436,16 @@ impl Control<'_, '_> {
                 self.needs.push((slot, vec![reply]));
                 match self.joining {
                     Joining::Joined => self.ask(None, &Ask::Need { slot, thread })?,
-                    // Asked once the daemon has welcomed the launcher (`Tell::Welcome`).
-                    Joining::Holds | Joining::Waits | Joining::Refused(_) => self.unasked.push((slot, thread)),
-                    Joining::Later(_) => {
-                        self.unasked.push((slot, thread));
-                        self.join(slot, shared);
-                    }
+                    // Asked once the other side has welcomed the launcher (`Tell::Welcome`).
+                    Joining::Holds => self.unasked.push((slot, thread)),
                 }
             }
         }
         Ok(())
     }
 
-    /// The daemon welcomed a launcher that joined it after starting from its image: every
-    /// slot whose stub waits is asked for, under the thread that first fired it.
+    /// The other side welcomed a launcher that holds its start: every slot whose stub waits
+    /// is asked for, under the thread that first fired it.
     fn ask_waiting(&mut self) -> Result<(), ControlError> {
         for (slot, thread) in std::mem::take(&mut self.unasked) {
             self.ask(None, &Ask::Need { slot, thread })?;
@@ -597,15 +466,6 @@ impl Control<'_, '_> {
                     self.joining = Joining::Joined;
                     self.start_held()?;
                     self.ask_waiting()?;
-                }
-                // Joined after starting from the image: the daemon bound this launcher as
-                // welcomed with that image, whose slots are declared already.
-                Joining::Waits => {
-                    self.joining = Joining::Joined;
-                    self.ask_waiting()?;
-                }
-                Joining::Later(_) | Joining::Refused(_) => {
-                    return Err(ControlError::NotBuilt { what: "a Welcome to a launcher that said no Hello" });
                 }
             },
             Tell::Start { entry, inits } => {
@@ -668,12 +528,7 @@ impl Control<'_, '_> {
                     waiter.put(Bound::Refused(diagnostic.to_owned()));
                 }
             }
-            Tell::Unheld { why } => match self.joining {
-                // The program runs from its image and the daemon holds no code of it: each
-                // first call from here on stops the program, naming why.
-                Joining::Waits => self.refuse(why.to_owned()),
-                _ => return Err(ControlError::Unheld { why: why.to_owned() }),
-            },
+            Tell::Unheld { why } => return Err(ControlError::Unheld { why: why.to_owned() }),
             Tell::Image { bytes } => {
                 // The whole start in one message: what `Welcome`, `Statics`, the first `Edit`
                 // and `Start` leave, copied in. A launcher that held another image is told
@@ -682,12 +537,6 @@ impl Control<'_, '_> {
                     Joining::Holds => {
                         self.joining = Joining::Joined;
                         self.held = None;
-                    }
-                    // The program runs: another start under it would be another program.
-                    Joining::Waits | Joining::Later(_) | Joining::Refused(_) => {
-                        return Err(ControlError::NotBuilt {
-                            what: "an image of the program's start to a launcher whose program already runs",
-                        });
                     }
                     Joining::Joined => {}
                 }
