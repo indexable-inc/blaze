@@ -43,14 +43,15 @@ global allocation (`blaze::lock_held_across_slow`); raw `std::sync` and `parking
 banned in `.clippy.toml` outside `crates/blaze-core/src/lock.rs`, and a contended wait records who
 waited behind whom into the profile's `lock_waits` (`blaze debug locks` ranks them and says what to
 use instead: arc-swap or RCU for reads, papaya for a map, an atomic for an integer, a channel for a
-queue, an owner for one holder); a shared map is `blaze_hash::SharedMap` (papaya's, `papaya::HashMap` itself banned); a single-owner map or set is
-`blaze_hash::{HashMap<K, V, A>, HashSet<K, A>}` (foldhash with a fixed seed, its allocator named as
-`bump-allocate` says: a frame's for a task, `Global` with a reason otherwise), with
-`blaze_hash::KeyHasher` for keys that are already content hashes and `blaze_hash::Blake3Hasher` for
-persisted content IDs; results of parallel items come back from `blaze_graph::par` in order, never
-pushed into a `Mutex<Vec>`; a queue is `crossbeam::queue::{SegQueue, ArrayQueue}`; a channel is
-`crossbeam-channel`; a counter or flag is an atomic. How a thread or fiber waits is
-`deadline-waits`. `BTreeMap` only where iteration order is part of the output.
+queue, an owner for one holder); a shared map is `blaze_hash::SharedMap` (papaya's,
+`papaya::HashMap` itself banned); a single-owner map or set is `blaze_hash::{HashMap<K, V, A>,
+HashSet<K, A>}` (foldhash with a fixed seed, its allocator named as `bump-allocate` says: a frame's
+for a task, `Global` with a reason otherwise), with `blaze_hash::KeyHasher` for keys that are
+already content hashes and `blaze_hash::Blake3Hasher` for persisted content IDs; results of parallel
+items come back from `blaze_graph::par` in order, never pushed into a `Mutex<Vec>`; a queue is
+`crossbeam::queue::{SegQueue, ArrayQueue}`; a channel is `crossbeam-channel`; a counter or flag is
+an atomic. How a thread or fiber waits is `deadline-waits`. `BTreeMap` only where iteration order is
+part of the output.
 
 ## sans-io-cores (rule 14)
 
@@ -151,8 +152,8 @@ thread: no thread-local borrow, lock guard or `Rc`. Mark regions that must not w
 read thread-locals in `#[inline(never)]` functions that end before any wait. That holds for a
 dependency's thread-local too: the compiler may keep a thread-local's address across a call that
 waits, so an inlined read after the wait reads the first thread's slot (papaya's `pin`, inlined,
-made seize guards on the wrong thread's slot and freed a table under a reader; `blaze_hash::SharedMap`
-pins in a call of its own).
+made seize guards on the wrong thread's slot and freed a table under a reader;
+`blaze_hash::SharedMap` pins in a call of its own).
 
 ## deadline-waits (rule 44)
 

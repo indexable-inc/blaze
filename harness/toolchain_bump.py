@@ -241,21 +241,28 @@ def replace_tree(src, dst):
     shutil.copytree(src, dst, symlinks=True)
 
 
+def read_text(path):
+    """The UTF-8 text of `path`, read outside any coroutine (ruff ASYNC230)."""
+    with open(path, encoding="utf-8") as f:
+        return f.read()
+
+
+def write_text(path, text):
+    """Writes `text` to `path` as UTF-8, outside any coroutine (ruff ASYNC230)."""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+
 async def vendor(new):
     """crates/rustc_abi/src and crates/rustc_lexer/src as rust-lang/rust has them at `new`."""
     repo = await checkout(new, [ABI[1], LEXER[1]])
     root, marker, count = ABI_ROOT
     root = os.path.join(ROOT, root)
-    with open(root, encoding="utf-8") as f:
-        kept = f.read().splitlines(keepends=True)[:count]
+    kept = read_text(root).splitlines(keepends=True)[:count]
     if not kept or not kept[0].startswith(marker):
         raise Failed(f"vendor: {ABI_ROOT[0]} does not start with blaze's lines (`{marker}`)")
     for ours, theirs in (ABI, LEXER):
         replace_tree(os.path.join(repo, theirs), os.path.join(ROOT, ours))
-    with open(root, encoding="utf-8") as f:
-        upstream = f.read()
-    with open(root, "w", encoding="utf-8") as f:
-        f.write("".join(kept) + upstream)
+    write_text(root, "".join(kept) + read_text(root))
 
 
 async def lints(new):

@@ -11,8 +11,8 @@ opening `/// The invariant:`, `/// The refinement:` or `/// The reference model:
 refinement counts only with a control in its file, a test that plants a bug its oracle must
 catch. A change to this file in a pull request is a promise added, reworded or dropped.
 
-913 invariants, 68 refinements, 22 reference models.
-By level: 710 tested, 254 simulated, 1 model-checked, 16 proved.
+915 invariants, 68 refinements, 22 reference models.
+By level: 712 tested, 254 simulated, 1 model-checked, 16 proved.
 
 ## Invariants
 
@@ -811,6 +811,8 @@ By level: 710 tested, 254 simulated, 1 model-checked, 16 proved.
 
 - **`an_unmeasured_crate_takes_any_count_until_a_bless_records_it`** *tested* (`crates/blaze-lints/src/baseline.rs`): an unmeasured crate passes any count and is never over, is stale until a bless, and a bless gives it the run's count or drops it at zero, so the ratchet's first measured run only turns `unmeasured` into numbers or into `deny`.
   Controls: `an_unmeasured_crate_read_as_a_count_of_zero`, `a_bless_that_keeps_a_crate_unmeasured`.
+- **`a_partial_run_records_the_crates_it_measured_and_keeps_the_rest`** *tested* (`crates/blaze-lints/src/baseline.rs`): a run that did not complete every crate's check still measures the rest, and a bless of it records those alone.
+  Controls: `an_unmeasured_crate_read_as_a_count_of_zero`, `a_bless_that_keeps_a_crate_unmeasured`.
 - **`a_bless_only_lowers_and_never_adds`** *tested* (`crates/blaze-lints/src/baseline/items.rs`): a bless never raises a line's value and never adds an item once the file has lines.
 - **`the_count_is_npath_whatever_the_block_order`** *tested* (`crates/blaze-lints/src/blaze/complexity/paths.rs`): on a structured program the count is NPATH's, and numbering the blocks otherwise (the order items or blocks are laid out in) changes nothing.
 - **`renaming_locals_and_reordering_items_changes_no_value`** *tested* (`crates/blaze-lints/src/blaze/complexity/tests.rs`): renaming a function's locals and reordering a file's items changes no measured value of any item (each measure reads structure, not names or order).
@@ -959,6 +961,8 @@ By level: 710 tested, 254 simulated, 1 model-checked, 16 proved.
 - **`a_scoped_function_outside_a_scope_is_refused`** *tested* (`crates/blaze-query/src/db/tests.rs`): a scoped function called with no task scope open is refused, naming it and its key, and never answered from a row: called directly, and from inside a persistent query. Control: the same call inside a scope is served.
   Controls: `an_equal_set_that_opens_a_view`.
 - **`a_cycle_through_a_scoped_function_iterates_to_its_fixpoint`** *tested* (`crates/blaze-query/src/db/tests.rs`): a cycle through a scoped function iterates from its `cycle_initial` at the run it reached until a round gives the last round's value: from 0, each round one higher, to the cell's `a` (4), the fifth round giving 4 again. Control: one with no `cycle_initial` is refused by name.
+  Controls: `an_equal_set_that_opens_a_view`.
+- **`a_scoped_cycle_passes_a_witness_frame_and_is_refused_through_a_persistent_row`** *tested* (`crates/blaze-query/src/db/tests.rs`): a witness frame is no row, so a scoped cycle passes one, here a covered frame with no query below it (whose `id` is 0 and names nothing: blaze panicked on `Id::from_u32(0)` there, crates/blaze-query/src/db/scoped.rs, on blaze's own tree) and iterates to the same fixpoint as [`Climb`]. Control: a cycle through a persistent query's row is still refused, naming that query.
   Controls: `an_equal_set_that_opens_a_view`.
 - **`held_by_function_says_from_counters_what_the_walk_finds`** *tested* (`crates/blaze-query/src/db/tests.rs`): `held_by_function` says, from counters alone, what the walk of `memory_usage` finds: each function's bytes are its `held()`, and while no value was let go its values are its rows that ran. Control: once a function's values are evicted its count is 0 while the walk still finds every row that ran: the count is of values, not rows.
   Controls: `an_equal_set_that_opens_a_view`.
@@ -1692,7 +1696,7 @@ By level: 710 tested, 254 simulated, 1 model-checked, 16 proved.
 - **`a_carried_v_holding_a_dead_sealed_id_is_refused_by_name`** *tested* (`crates/blaze-memo/tests/sealed.rs`): V holds R's crate id in its input (made with it; base-db hands out crate ids with no read) and never read R; R, sealed, is edited and V carried. A later ask of V that uses the id is refused by a panic naming the dead arena (`arena 1.0 is dead`), never answered from the rows of R's next making. The control (the cause removed): V asked before the edit read R, so it is dropped with R and the same later ask is answered.
   Controls: `a_sealed_arena_skipping_its_borrows`, `ignored_borrows_of_a_sealed_arena`.
 - **`every_interleaving_answers_as_the_evaluator`** *simulated* (`crates/blaze-memo/tests/sim.rs`): the one at the top of this file (in every snapshot, under any interleaving), over many cases.
-  Controls: `a_held_key_taken_for_the_askers_own`, `a_carried_changed_arena`, `a_carried_dependent`, `a_hit_that_does_not_replay`, `a_check_on_a_hit`, `a_member_run_twice`.
+  Controls: `a_held_key_taken_for_the_askers_own`, `a_carried_changed_arena`, `a_carried_dependent`, `a_hit_that_does_not_replay`, `a_check_on_a_hit`, `a_member_run_twice`, `a_reader_that_looks_up_a_dead_id`.
 - **`a_reader_that_closes_early_ends_the_command_quietly`** *tested* (`crates/blaze-report/tests/closed_pipe.rs`): a command that writes through `blaze_report::out` to a pipe whose reader closed ends with status 141 and says nothing on stderr.
   Controls: `a_print_that_panics_on_a_closed_pipe`.
 - **`the_region_fits_and_leaves_nothing_behind`** *tested* (`crates/blaze-screen/tests/properties.rs`): on a terminal of any size the live region fits (never taller than the terminal less a row, never wider than it less a column), every frame leaves exactly the lines that stay and the region with no stale row, a resize in the middle included, and the last frame leaves the lines that stay alone, the cursor shown and the progress report cleared.
@@ -2105,10 +2109,10 @@ A checked attribute and an obligation are counted, not listed.
 - **`blaze-kernel::reads::part#1`** *unverified* trusted (`crates/blaze-kernel/src/reads.rs:246`): `part` is pure Unverified: the kernel records the step, the key asked for and the digest of the part it gave.
 - **`blaze-kernel::reads::step#1`** *unverified* trusted (`crates/blaze-kernel/src/reads.rs:192`): `step` is pure Unverified: the kernel records the step asked for and the hash of the value it gave.
 - **`blaze-shapes::hunts_find_the_hit#1`** *proved* proved (`lean/theorems.json`): The statement blaze generates from the fixture's theorem function hunts_find_the_hit holds of its model: a loop that returns, or breaks with, a field its match arm bound gives the Rust's values on the inputs it names. Evidence: Lean blaze_shapes.hunts_find_the_hit.spec.proof.
-- **`blaze-sqlite::CText#1`** *none* none (`crates/blaze-sqlite/src/lib.rs:466`): `CText::bytes` ends in a NUL and holds no other. Upheld by `nul_terminated`, its one constructor.
-- **`blaze-sqlite::Connection#1`** *none* none (`crates/blaze-sqlite/src/lib.rs:382`): `Connection::db` is an open `sqlite3` handle from when the connection is made until its drop, which alone closes it. Upheld by `Connection::open_named`, the one constructor, and `Connection::drop`.
-- **`blaze-sqlite::Raw#1`** *none* none (`crates/blaze-sqlite/src/lib.rs:454`): `Raw::stmt` is a live statement prepared on `Raw::connection`, finalized by the raw's drop and by nothing else. Upheld by `Raw::prepare`, the one constructor, and `Raw::drop`.
-- **`blaze-sqlite::Text#1`** *none* none (`crates/blaze-sqlite/src/lib.rs:88`): `Text::bytes` is UTF-8. Upheld by its constructors (`Text::of`, `Text::empty`, `Text::lossy`, `Text::from_utf8`) and by `Text::push_str`, the one way it grows, which appends a whole `str`.
+- **`blaze-sqlite::CText#1`** *none* none (`crates/blaze-sqlite/src/lib.rs:470`): `CText::bytes` ends in a NUL and holds no other. Upheld by `nul_terminated`, its one constructor.
+- **`blaze-sqlite::Connection#1`** *none* none (`crates/blaze-sqlite/src/lib.rs:386`): `Connection::db` is an open `sqlite3` handle from when the connection is made until its drop, which alone closes it. Upheld by `Connection::open_named`, the one constructor, and `Connection::drop`.
+- **`blaze-sqlite::Raw#1`** *none* none (`crates/blaze-sqlite/src/lib.rs:458`): `Raw::stmt` is a live statement prepared on `Raw::connection`, finalized by the raw's drop and by nothing else. Upheld by `Raw::prepare`, the one constructor, and `Raw::drop`.
+- **`blaze-sqlite::Text#1`** *none* none (`crates/blaze-sqlite/src/lib.rs:92`): `Text::bytes` is UTF-8. Upheld by its constructors (`Text::of`, `Text::empty`, `Text::lossy`, `Text::from_utf8`) and by `Text::push_str`, the one way it grows, which appends a whole `str`.
 - **`blaze-sys::linux::mem::mapped#2`** *unverified* trusted (`crates/blaze-sys/src/linux/mem.rs:114`): `mapped` is nopanic Unverified: NonNull::new aborts only in new_unchecked's check that the pointer is not null, which new itself tests before it calls it.
 - **`blaze-sys::types::to_duration#2`** *unverified* trusted (`crates/blaze-sys/src/types.rs:141`): `to_duration` is nopanic Unverified: Duration::new panics only when nanos of 1_000_000_000 or more carry the seconds past u64::MAX; nsec is refused above before it is called.
 - **`consts::constants_are_their_values#1`** *proved* proved (`lean/theorems.json`): The statement blaze generates from the fixture's theorem function constants_are_their_values holds of its model: a trait's associated constant at its implementor (its own value or the trait's default), an inherent constant, an anonymous constant and an array length given by an expression are the values blaze's evaluator gives. Evidence: Lean consts.constants_are_their_values.spec.proof.

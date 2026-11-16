@@ -14,7 +14,7 @@ blaze-audit	0	0	65	25
 blaze-bench	0	0	0	12
 blaze-build-script	67	0	7	26
 blaze-bytes	0	0	0	3
-blaze-cargo	2299	2	241	1462
+blaze-cargo	2295	2	242	1462
 blaze-cas	817	0	170	355
 blaze-certify	83	0	0	51
 blaze-check	47	0	2	34
@@ -70,7 +70,7 @@ blaze-lint-defs	22	0	0	8
 blaze-lints	816	0	687	611
 blaze-lir	21	0	8	6
 blaze-live	149	0	0	113
-blaze-lower	147	0	87	64
+blaze-lower	147	0	92	64
 blaze-macro-eval	269	0	6	87
 blaze-manifest	9	0	50	136
 blaze-mem	31	0	0	5
@@ -147,11 +147,11 @@ harness/harness-vt	0	0	0	10
 harness/vendor/hyperion-ecs	0	0	0	13
 harness/vendor/hyperion-manifest-types	0	0	0	3
 hir	233	0	61	121
-hir-def	789	0	247	305
+hir-def	788	0	248	305
 hir-expand	157	0	14	45
 hir-firewall	2	0	22	11
 hir-lint-levels	12	0	2	2
-hir-ty	729	0	103	257
+hir-ty	729	0	104	257
 hir-ty-borrowck	52	0	7	9
 hir-ty-charon	116	0	8	19
 hir-ty-codegen	1648	0	260	692
