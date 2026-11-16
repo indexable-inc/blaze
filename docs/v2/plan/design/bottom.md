@@ -215,6 +215,32 @@ check that are fast"; "everything in JIT world".
   bodies skipped it falls further. 9 syntax errors in `core` and 1,531 in blaze's crates are
   syntax the outline does not read yet (it parses with no extensions): to fix.
 
+## Also decided on 2026-11-15
+
+Andrew: "we should have 0 third party and all the things you said worth adding".
+
+- **No third-party crates in the compiler.** Measured on main after the delete: 413 third-party
+  packages in the lock graph, 102 used directly by workspace crates (serde by 25 crates,
+  serde_json 16, tracing 14, libc 12, crossbeam-channel 10); even `blaze-id` pulls 58 through
+  `blaze-ids` and `blaze-hash` (blake3, hashbrown, crossbeam, futures). The end state is zero:
+  every crate that the `blaze` binary links depends only on crates of this workspace. A gate
+  ratchet holds the count per crate and only lets it fall (tools/ratchets, as the allocator
+  and untyped-error lists do). New crates start at zero: a new crate may depend only on
+  workspace crates that are themselves at zero, which first means a hash, a map and a channel
+  of our own under `blaze-id`. Relax builds in about a minute with none.
+- **Hot counters in the slot.** A function's stub counts its calls; past a bound the function
+  is queued for the optimizing tier. No profiler is needed to tier up.
+- **Tests that pick themselves.** A test's record lists the functions its run entered (their
+  code identities). After an edit, the tests to run are the ones whose list holds a changed
+  function: a lookup, not a build.
+- **Looking inside a running program.** The loader is ours, so a run can pause on a panic with
+  its stack, say why it hangs, and sample itself. Every `run` and `test` registers itself and
+  answers on a local socket; `blaze view`, a helper with an expiry that never builds, lists
+  them and serves the profile history to a page (origin checked, a secret per session,
+  read-only).
+- **Relax's failures as a checklist.** Its `KNOWN_GAPS.md` and tests (MIT) are the list of
+  Rust that trips a front end written from scratch; each is a test here.
+
 ## How it is built and proven
 
 - New crates beside the old: `blaze-id` (done), `blaze-surface` (the schema and the two
