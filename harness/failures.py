@@ -803,11 +803,12 @@ def recorded(
     """The list after a run of the packages `asked` under `context`: what the run says of that
     context, and what the list said of every other one.
 
-    Of an entry the run could check (its package was asked for, it applies to the profile), the
-    run decides whether it holds on this OS: it stays for this OS when the test still fails (its
+    Of an entry the run could check (its package was asked for, it applies to the profile and
+    builder), the run decides whether it holds on this OS: it stays for this OS when the test still fails (its
     binary still does not finish, its package still does not run) and leaves it otherwise; what
-    it said of the other OSes stays as it was. A failure the list did not have joins it for this
-    OS alone, with the first line of what it said as its cause. An entry the run could not check
+    it said of the other OSes stays as it was; but an entry of either builder that a cargo run
+    sees pass is kept for blaze's runs alone. A failure the list did not have joins it for this
+    OS and this run's builder alone, with the first line of what it said as its cause. An entry the run could not check
     (another profile's, a package not asked for, a test filtered out or unreached, a test of a
     binary that did not finish or run) is kept as it is. An entry of a package the workspace no
     longer has is dropped."""
@@ -826,6 +827,11 @@ def recorded(
         if id(entry) in unchecked:
             keep(entry)
             continue
+        # An entry of either builder that a cargo run sees pass fails under blaze alone: every such
+        # entry was written from blaze's runs before the list named builders.
+        if entry.builder is None and context.builder == "cargo" and id(entry) not in failing:
+            keep(Entry(entry.crate, entry.test, entry.cause, entry.profile, entry.oses, "blaze"))
+            continue
         after: set[Os] = set(entry.oses if entry.oses is not None else OSES) - {context.os}
         if id(entry) in failing:
             after.add(context.os)
@@ -836,7 +842,7 @@ def recorded(
     def new(crate: str, test: str, cause: str) -> None:
         had = out.get((crate, test))
         if had is None:
-            keep(Entry(crate, test, cause, None, (context.os,)))
+            keep(Entry(crate, test, cause, None, (context.os,), context.builder))
             return
         # The list has it for another OS or profile: it holds for this run's too.
         profile = had.profile if had.profile == context.profile else None
@@ -1055,6 +1061,12 @@ def selftest() -> None:
     under_cargo = compare(by_blaze, ran, cargo, asked, binaries)
     assert not under_cargo.failed and "only for builder blaze" in under_cargo.unchecked, under_cargo
     assert recorded(by_blaze, ran, cargo, asked, targets, binaries)[-1].builder == "blaze"
+    either = [Entry("pkg-a", "a::ok", "fails under blaze", None, ("linux",))]
+    under = recorded(either, results({"a::ok": "ok", "a::new": "failed", "b::t": "ok", "c::t": "ok"}), cargo, asked, targets, binaries)
+    assert [(e.test, e.oses, e.builder) for e in under] == [
+        ("a::new", ("linux",), "cargo"),
+        ("a::ok", ("linux",), "blaze"),
+    ], under
     crashed = results({"a::fails": "failed", "c::t": "ok"}, unfinished=("b",))
     assert [b.name for b in compare(listed, crashed, linux, asked, binaries).crashed] == ["b"]
     assert compare(listed, results({"a::fails": "failed", "b::t": "ok"}), linux, asked, binaries).not_run == [
