@@ -38,9 +38,14 @@ site {
   //   blaze edition ... a `main(cx: &Cx, io: Io)`"; "the edition becomes the default when blaze ships bstd";
   //   docs/v2/plan/invariants.md:326 (`a_withheld_capability_is_missing_and_named`: "its `need_` form is `Ok` then
   //   and otherwise a `Missing` naming it"); the code is docs/v2/plan/design/std.md:31-35 (a plan: the spelling).
-  //   Effects: docs/v2/plan/invariants.md:424 ("the checker accepts a crate exactly when every function's inferred
-  //   effects are within its allowed set"); its crate, hir-ty-pure, is parked (docs/v2/plan/parked.md:30-36); the
-  //   spelling is docs/v2/plan/design/effects.md:12-26 (a plan). Reflection: docs/const.md:87-94
+  //   Parameters (2026-11-16; these three docs as in the compiler lanes' tree that day, not yet on main):
+  //   docs/v2/plan/design/extensions.md:191-192 ("on bstd an effect is a value you are handed (an allocator, `Io` or
+  //   a narrower capability, `&Cx` for a wait)"), :204 ("The earlier decision of one effect row spelled `expect(..)`
+  //   is withdrawn"); docs/v2/plan/design/std.md:1851 (the blaze edition: "Rust's `std` has no name in the crate ...
+  //   So `std::fs`, `std::env`, `println!` and the rest of Rust std's ambient authority are not reachable by any
+  //   path", built); docs/v2/plan/design/run.md:310-312 ("Capabilities are values ... a library ... reaches only
+  //   what a caller hands it"). The code's spellings: std.md:31-46 (`Dir<ReadOnly>`, `path!`,
+  //   `Vec::new_in(cx.frame())`), :1508 (`read_all(into)`); all three are plans. Reflection: docs/const.md:87-94
   //   ("`#![feature(blaze_comptime)]` ... `for const f in core::reflect::fields_of::<T>()` ... v2 has none of it
   //   yet"); the code is docs/v2/plan/design/comptime.md:21-28 (a plan). The error: blaze-screen's golden rendering,
   //   crates/blaze-screen/tests/golden/fail-80x24.txt (not a doc), and docs/terminal.md:20 (a failure: "the
@@ -99,14 +104,23 @@ site {
           load(cx, &cfg)
       }`)
 
-      H3 effects("Effects")
-      Dim effects_says("A function lists what it may do. The rest is checked absent, through every call it makes.")
-      Code effects_rust(lang: "rust", text: `pub fn checksum(bytes: &[u8]) -> u32 \{
-          bytes.iter().fold(0, |h, b| h.rotate_left(5) ^ *b as u32)
+      // Replaces the effects card (`#[blaze::expect()]`), withdrawn on 2026-11-16: on blaze's std an effect is a value a
+      // function is handed, so its signature says what it can do and no attribute is needed.
+      H3 reach("Parameters")
+      Dim reach_says("A function reaches only what it is handed. In the blaze edition Rust's `std::fs` is out of reach: to read a file, a function takes a `Dir`.")
+      Code reach_rust(lang: "rust", text: `fn load() -> Result<Config, Error> \{
+          let text = std::fs::read("config.toml")?;
+          Config::parse(&text)
       }`)
-      Code effects_blaze(lang: "rust", text: `#[blaze::expect()]
-      pub fn checksum(bytes: &[u8]) -> u32 \{
-          bytes.iter().fold(0, |h, b| h.rotate_left(5) ^ *b as u32)
+      Code reach_handed(lang: "rust", text: `fn load(cx: &Cx, cfg: &Dir<ReadOnly>) -> Result<Config, Error> \{
+          let mut text = Vec::new_in(cx.frame());
+          cfg.read_all(cx, path!("config.toml"), &mut text)?;
+          Config::parse(&text)
+      }`)
+      Code reach_refused(lang: "rust", text: `fn load(cx: &Cx) -> Result<Config, Error> \{
+          let text = std::fs::read("config.toml")?;
+          // error: Rust's std::fs is not reachable; take a &Dir
+          Config::parse(&text)
       }`)
 
       H3 reflect("Reflection")

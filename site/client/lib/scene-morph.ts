@@ -149,6 +149,18 @@ export function morph(section: HTMLElement, stage: HTMLElement): Picture {
 	const pad = 20;
 	const head = 40; // room for the tag above the first line
 	const N = steps.length;
+	// How each move from step k to k + 1 splits its stretch between its parts (see draw): a part with nothing to do
+	// takes no time, and one that only resizes the card takes half a part.
+	const phases = steps.slice(0, -1).map((a, k) => {
+		const b = steps[k + 1]!;
+		const label = a.tag !== b.tag || a.feature !== b.feature;
+		const kept = lines.filter((l) => l.rows.has(k) && l.rows.has(k + 1));
+		const wOut = label || lines.some((l) => l.rows.has(k) && !l.rows.has(k + 1)) ? 1 : 0;
+		const wMove = kept.some((l) => l.rows.get(k) !== l.rows.get(k + 1)) ? 1 : a.text.length !== b.text.length ? 0.5 : 0;
+		const wIn = label || lines.some((l) => l.rows.has(k + 1) && !l.rows.has(k)) ? 1 : 0;
+		const all = Math.max(wOut + wMove + wIn, 1e-6);
+		return { b1: wOut / all, b2: (wOut + wMove) / all };
+	});
 	return {
 		len: 1 + N * 0.85,
 		still: 0,
@@ -161,11 +173,20 @@ export function morph(section: HTMLElement, stage: HTMLElement): Picture {
 			card.style.setProperty('--lh', `${lh}px`);
 		},
 		draw(p) {
-			// Each step holds, then moves to the next over the middle of its stretch.
+			// Each step holds, then moves to the next over the middle of its stretch, in three parts that never
+			// share a frame, so no text is drawn over other text wherever the scroll stops:
+			// 1. `out`: the lines the next step drops fade where they stand, and so does a label that changes;
+			// 2. `move`: the lines both steps have slide to their new rows and the card takes its new height,
+			//    opening the rows the next step adds (shared lines keep their order, so they never cross);
+			// 3. `inn`: the added lines and the new label fade in, into the room made for them.
 			const s = clamp(p * 1.04 - 0.02) * (N - 1);
 			const k = Math.min(N - 2, Math.floor(s));
 			const f = span(s - k, 0.3, 0.75);
-			const rows = lerp(steps[k]!.text.length, steps[k + 1]!.text.length, f);
+			const { b1, b2 } = phases[k]!;
+			const out = b1 > 0 ? clamp(f / b1) : 1;
+			const move = b2 > b1 ? span(f, b1, b2) : Number(f >= b1);
+			const inn = b2 < 1 ? clamp((f - b2) / (1 - b2)) : 1;
+			const rows = lerp(steps[k]!.text.length, steps[k + 1]!.text.length, move);
 			const top = head;
 			// The card grows and shrinks with its step: its own layout only (contain: layout paint), one element.
 			card.style.height = `${Math.round(head + pad + rows * lh)}px`;
@@ -176,30 +197,34 @@ export function morph(section: HTMLElement, stage: HTMLElement): Picture {
 				let o = 0;
 				let dx = 0;
 				if (a !== undefined && b !== undefined) {
-					y = lerp(a, b, f);
+					y = lerp(a, b, move);
 					o = 1;
 				} else if (a !== undefined) {
 					y = a;
-					o = 1 - f;
-					dx = -f * 12;
+					o = 1 - out;
+					dx = -out * 12;
 				} else if (b !== undefined) {
 					y = b;
-					o = f;
-					dx = (1 - f) * 12;
+					o = inn;
+					dx = (1 - inn) * 12;
 				}
 				l.el.style.opacity = o.toFixed(3);
 				l.el.style.transform = `translate(${dx.toFixed(1)}px, ${(top + y * lh).toFixed(1)}px)`;
 				if (l.hl) {
-					const lit = l.added.has(k + 1) && b !== undefined ? f : l.added.has(k) && a !== undefined ? 1 : 0;
+					const lit = l.added.has(k + 1) && b !== undefined ? inn : l.added.has(k) && a !== undefined ? 1 : 0;
 					l.hl.style.opacity = lit.toFixed(3);
 				}
 			}
-			for (const [i, t] of tags.entries()) t.style.opacity = String(i === k ? 1 - f : i === k + 1 ? f : 0);
+			// A label both steps share stays as it is; one that changes is gone before the next comes in.
+			const same = steps[k]!.tag === steps[k + 1]!.tag;
+			for (const [i, t] of tags.entries()) {
+				const o = i === k ? (same ? Number(f < 0.5) : 1 - out) : i === k + 1 ? (same ? Number(f >= 0.5) : inn) : 0;
+				t.style.opacity = String(o);
+			}
 			for (const [i, c] of caps.entries()) {
-				const fa = steps[k]!.feature === i ? 1 - f : 0;
-				const fb = steps[k + 1]!.feature === i ? f : 0;
-				const both = steps[k]!.feature === i && steps[k + 1]!.feature === i;
-				const o = both ? 1 : fa + fb;
+				const was = steps[k]!.feature === i;
+				const next = steps[k + 1]!.feature === i;
+				const o = was && next ? 1 : was ? 1 - out : next ? inn : 0;
 				c.style.opacity = o.toFixed(3);
 				c.style.transform = `translateY(${((1 - o) * 8).toFixed(1)}px)`;
 			}

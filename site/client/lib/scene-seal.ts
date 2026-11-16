@@ -95,7 +95,9 @@ export function seal(_section: HTMLElement, stage: HTMLElement): Picture {
 			}
 			// The script and the macro, over the lines that leave them.
 			chip(ctx, ...P(...FROM), 'build.rs', k, fs, k.ink);
-			chip(ctx, ...P(0.3, 0.74), 'proc macro · wasm', k, fs, k.ink2);
+			// On a phone the box is narrow: the macro goes centred along its floor, inside the wall and clear of
+			// OUT_DIR's "written".
+			chip(ctx, ...(small ? P(0.5, 0.9) : P(0.3, 0.74)), 'proc macro · wasm', k, fs, k.ink2);
 			ctx.globalAlpha = 1;
 		},
 	};
