@@ -40,7 +40,6 @@ hir-ty-mir.workspace = true
 intern.workspace = true
 # Names a proc macro's machine code in CPU samples (`ix_prof::jit`).
 ix-prof.workspace = true
-blaze-lower.workspace = true
 parser.workspace = true
 proc-macro-api.workspace = true
 blaze-memo.workspace = true
@@ -55,7 +54,6 @@ libc.workspace = true
 
 [dev-dependencies]
 blaze-alloc-count.workspace = true
-blaze-query.workspace = true
 blaze-serde.workspace = true
 blaze-units.workspace = true
 blaze-vfs.workspace = true

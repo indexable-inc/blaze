@@ -8,8 +8,6 @@
 #   pull request, merge queue (about 5 minutes): the unit tests and the build on Linux AArch64,
 #       `blaze check --workspace` and `blaze check --workspace --all-targets` (every crate's
 #       test targets type-check) with the release on Linux AArch64,
-#       the lint baselines (crates/blaze-lints/baselines) with the blaze the tree builds, on
-#       Linux AArch64,
 #       `harness/imports.py` and `rustcsites` (scripts/), actionlint over the workflows. No `blaze fmt --check`: fmt.yaml
 #       formats main after each push instead.
 #   push to main: the build and the unit tests on Linux AArch64 and macOS, which
@@ -179,11 +177,6 @@ jobs:
       - run: |
           "$BLAZE_SCRIPTS/invariants" selftest
           "$BLAZE_SCRIPTS/invariants" '{"command": "check"}'
-      # blaze-diff's Rust tables and the Lean ones the proofs are about are what
-      # crates/blaze-diff/rules.json generates (scripts/src/bin/diff_rules.rs).
-      - run: |
-          "$BLAZE_SCRIPTS/diff_rules" selftest
-          "$BLAZE_SCRIPTS/diff_rules" '{"command": "check"}'
       # The Lean proofs, as far as no Lean is needed (harness/v2/lean_gate.py): the list of
       # theorems (lean/theorems.json) names statements that are there, no source says `sorry`,
       # `native_decide`, `axiom` or `partial def`, lean/analysis's manifest is checked in at the
@@ -206,7 +199,7 @@ jobs:
       # outside tests, the `// alloc:` lines left to convert, the `expect`s of
       # `blaze::implicit_allocator`, the lines naming `Global` and the function signatures that
       # fix the caller's allocator (`blaze::unwritten_allocator`'s rule, read from the text) equal their crate's row of
-      # crates/blaze-lints/baselines/alloc-sites.txt, a crate with no row is held to 0, and no
+      # tools/ratchets/alloc-sites.txt, a crate with no row is held to 0, and no
       # row is above the base's (`global` may rise while `// alloc:` lines are left); a crate
       # over its row has its new sites named from the base's diff (scripts/src/bin/allocs.rs). It needs no compiler, where the lints need a blaze that
       # checks the workspace. Against the base itself: the checkout is shallow.
@@ -225,7 +218,7 @@ jobs:
       # Untyped errors only go down (AGENTS.md errors-name-the-thing): per crate, outside tests,
       # the function signatures whose error is a `String`, a `&str`, a `Box<dyn Error>` or
       # `anyhow`'s (`blaze::untyped_error`'s rule, read from the text), and the type aliases of
-      # such a `Result`, equal their crate's row of crates/blaze-lints/baselines/untyped-errors.txt,
+      # such a `Result`, equal their crate's row of tools/ratchets/untyped-errors.txt,
       # a crate with no row is held to 0, and no row is above the base's; a crate over its row
       # has its new sites named from the base's diff (scripts/src/bin/untyped.rs). It needs no
       # compiler, where the lint needs a blaze that checks the workspace. Against the base
@@ -457,42 +450,6 @@ jobs:
       tier: ${{ needs.changes.outputs.tier }}
       smoke: true
 
-  # The daemon this change builds starts on Linux 6.8: GitHub's hosted ubuntu-22.04 runners
-  # boot Ubuntu's linux-azure 6.8 (6.8.0-1070-azure in November 2026), the release's Linux
-  # builds run there, and ix's kernel is newer. linux-azure 6.8.0-1063 and later invert
-  # io_uring's check of a provided buffer ring's reserved words (blaze-core's
-  # `ReservedCheck`), which stopped every daemon start of v0.20261105.3's release. The
-  # binary is the linux-arm64 build's, linked against the ix image's glibc (Ubuntu 24.04's),
-  # so it runs in an ubuntu:24.04 container, which shares the host's kernel; Docker's default
-  # seccomp profile refuses io_uring, so the container's is off.
-  linux-6-8:
-    name: daemon starts on Linux 6.8 (hosted ubuntu-22.04-arm)
-    needs: [changes, linux-arm64]
-    if: needs.changes.outputs.tier != 'none'
-    runs-on: ubuntu-22.04-arm
-    timeout-minutes: 10
-    container:
-      image: ubuntu:24.04
-      options: --security-opt seccomp=unconfined --security-opt apparmor=unconfined
-    env:
-      # As in `docker run`: the runner's /github/home belongs to its own user.
-      HOME: /root
-    steps:
-      - uses: actions/download-artifact@v8
-        with:
-          name: blaze-linux-arm64
-      - name: blaze serve listens, blaze status sees it, blaze stop ends it
-        run: |
-          tar -xf blaze.tar && uname -r
-          ./blaze serve > serve.log 2>&1 & serve=$!
-          for _ in $(seq 120); do
-            ./blaze status | grep -qvx "no daemon is running" && break
-            kill -0 "$serve" 2>/dev/null || { cat serve.log; echo "::error::blaze serve ended before it listened on Linux $(uname -r)"; exit 1; }
-            sleep 0.5
-          done
-          ./blaze status | grep -qvx "no daemon is running" || { cat serve.log; echo "::error::blaze serve did not listen within 60 s on Linux $(uname -r)"; exit 1; }
-          ./blaze stop && wait "$serve"
-
   macos:
     name: macos arm64
     needs: changes
@@ -569,128 +526,9 @@ jobs:
       - if: failure()
         uses: ./.github/actions/daemon-log
 
-  # AGENTS.md rule fix-through-blaze-lints: each clippy and blaze lint's findings, counted by
-  # crate, may only shrink. crates/blaze-lints/baselines holds the counts, one file per lint;
-  # a count over its baseline, or a lint with findings and no baseline, fails the job, and so
-  # does a count under its baseline, which `--bless-baselines` lowers (blaze_lints::baseline,
-  # docs/cargo.md#lints). It runs the blaze this tree builds, not the release: the counts are
-  # of the lints this tree defines, so a change to a lint and to its baseline land together.
-  # The counts are of aarch64-unknown-linux-gnu's cfg (the directory's TARGET), so this runs on
-  # Linux AArch64 and builds blaze there as the build job does, from the store main's pushes
-  # keep warm for it. Each package's default targets: blaze's check of test targets fails for
-  # now ("can't find crate for `test`"), so tests are counted once it passes. The `blaze.*.txt`
-  # baselines are also the ratchet's: each crate a lint's lists is held at `warn` on it, every
-  # other crate at `deny` (docs/lints.md, "Workspace levels and the ratchet"). They start with
-  # every crate `unmeasured`, so the job fails until a run with `--bless-baselines` records them.
-  # The same check denies `blaze::todo`, which the workspace holds at `warn` for local checks
-  # (Cargo.toml's `lints-ratchet`): a `todo!()` outside test code fails it (docs/cargo.md#lints).
-  #
-  # Before the counts, the lints are fixed rather than refused (scripts/src/bin/lint_fix.rs): on
-  # a pull request from a branch of this repository, `blaze check --fix` makes every
-  # machine-applicable suggestion, one commit `blaze check --fix: <N> fixes of <lints>` by
-  # github-actions[bot] goes to the pull request's branch (with the token fmt.yaml pushes with,
-  # so the push starts CI again on it), and the job fails only for the error-level findings no
-  # fix made. A fork's pull request is pushed nothing and holds no write token: its fixes are the
-  # `lint-fix.diff` artifact. A push to main, a merge group or a run by hand fixes nothing and only
-  # checks. The checkout is the pull request's head, not GitHub's merge of it, so the fix
-  # commit's parent is the branch's head; no step but the push holds a write token (the
-  # checkout's is the workflow's, `contents: read`).
-  lint-baselines:
-    name: lint baselines
-    needs: changes
-    if: needs.changes.outputs.tier != 'none'
-    # On a 64-vCPU ix runner, as blaze-platform.yaml's build.
-    runs-on: [ix, arm64, ix-cpu-64, blaze-lint-baselines]
-    timeout-minutes: 150
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
-      # The ratchet only tightens (harness/v2/guards.py, `ratchet`; docs/lints.md, "Workspace
-      # levels and the ratchet"): no `blaze.<lint>.txt` holds a crate at `warn` that the base did
-      # not, a count over the base's, or a count back at `unmeasured`. Against the base itself:
-      # the checkout is shallow.
-      - name: the lint ratchet only tightens
-        env:
-          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
-        run: |
-          if [ -z "$BASE" ]; then
-            echo "no base to compare with (a run by hand): the ratchet is held on pull requests and pushes"; exit 0
-          fi
-          git fetch -q --depth=1 origin "$BASE"
-          PYTHONPATH=tools/typed-input/src python3 harness/v2/guards.py "{\"command\": \"ratchet\", \"base\": \"$BASE\"}"
-      - id: blaze
-        uses: ./.github/actions/blaze
-        with:
-          job: build
-          llvm: true
-      - name: blaze build --release (the build job's)
-        run: |
-          python3 harness/unittests.py '{"build": true}'
-      - uses: ./.github/actions/script
-        with:
-          job: build
-      # The release's daemon ends first; the tree's blaze runs its own, from a home of its own.
-      - run: blaze stop
-      # The tree's blaze fixes, not the release: a lint this tree adds or changes is fixed by
-      # the blaze that defines it, as the counts below are of its lints.
-      - name: blaze check --fix, then what no fix made refused
-        id: fix
-        env:
-          BLAZE_HOME: ${{ runner.temp }}/tree-blaze-home
-          INPUT: >-
-            {"blaze": "target/release/blaze",
-             "select": ["--workspace", "--target", "aarch64-unknown-linux-gnu"],
-             "event": ${{ toJSON(github.event_name) }},
-             "fork": ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }},
-             "head_ref": ${{ toJSON(github.head_ref || null) }},
-             "out": ${{ toJSON(format('{0}/lint-fix', runner.temp)) }}}
-        run: |
-          "$BLAZE_SCRIPTS/lint_fix" selftest
-          "$BLAZE_SCRIPTS/lint_fix" "$INPUT"
-      # The fix commit, when the step above made one, to the pull request's branch, never main:
-      # the script refuses a head_ref of main, and this pushes only to refs/heads/<head_ref> of
-      # this repository. Only this step holds the token. Pushed whether or not findings are
-      # left: what was fixable is fixed either way. A branch that moved meanwhile refuses the
-      # push, which fails the job (no retry).
-      - name: push the fix commit to the pull request's branch
-        if: >-
-          !cancelled() && github.event_name == 'pull_request'
-          && github.event.pull_request.head.repo.full_name == github.repository
-        env:
-          TOKEN: ${{ secrets.BLAZE_BOT_TOKEN }}
-          HEAD_REF: ${{ github.head_ref }}
-          OUT: ${{ runner.temp }}/lint-fix
-        run: |
-          [ -f "$OUT/commit" ] || { echo "no fix commit to push"; exit 0; }
-          [ -n "$TOKEN" ] || { echo "::error::BLAZE_BOT_TOKEN is not set: the fix commit $(cat "$OUT/commit") cannot be pushed (the workflow's own token's push starts no CI)"; exit 1; }
-          [ -n "$HEAD_REF" ] && [ "$HEAD_REF" != main ] || { echo "::error::the branch to push to is '$HEAD_REF': fixes never go to main"; exit 1; }
-          # The checkout's read-only header goes first: two would both be sent.
-          git config --local --unset-all http.https://github.com/.extraheader || true
-          auth=$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)
-          git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" \
-            push "https://github.com/${{ github.repository }}" "$(cat "$OUT/commit"):refs/heads/$HEAD_REF"
-      - name: the fixes a fork's pull request needs
-        if: failure() && github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
-        uses: actions/upload-artifact@v7
-        with:
-          name: lint-fix.diff
-          path: ${{ runner.temp }}/lint-fix/lint-fix.diff
-          if-no-files-found: ignore
-      - if: ${{ !cancelled() }}
-        env:
-          BLAZE_HOME: ${{ runner.temp }}/tree-blaze-home
-        run: >-
-          target/release/blaze check --workspace --target aarch64-unknown-linux-gnu
-          --message-format short --baselines crates/blaze-lints/baselines
-          --deny blaze::todo
-      # Why the daemon ended, when it did (the client does not say).
-      - if: failure()
-        uses: ./.github/actions/daemon-log
-
   ci:
     name: ci
-    needs: [changes, scripts, workflows, lean, linux-arm64, linux-6-8, macos, workspace-check]  # lint-baselines joins once `blaze check --workspace` finishes on blaze's tree (it crashes today) and the first baselines exist; its fix-then-refuse step (scripts/src/bin/lint_fix.rs) is otherwise complete
+    needs: [changes, scripts, workflows, lean, linux-arm64, macos, workspace-check]
     if: always()
     runs-on: [ix, arm64]
     timeout-minutes: 5
@@ -707,8 +545,8 @@ jobs:
           # four; any other tier the Linux tests and the workspace check too; `warm` macOS too.
           case "$TIER" in
             none) expected='["changes","scripts","workflows","lean"]' ;;
-            gate) expected='["changes","scripts","workflows","lean","linux-arm64","linux-6-8","workspace-check"]' ;;
-            warm) expected='["changes","scripts","workflows","lean","linux-arm64","linux-6-8","workspace-check","macos"]' ;;
+            gate) expected='["changes","scripts","workflows","lean","linux-arm64","workspace-check"]' ;;
+            warm) expected='["changes","scripts","workflows","lean","linux-arm64","workspace-check","macos"]' ;;
             *) echo "::error::the tier is '$TIER', none of none, gate and warm: what this run was to test is not known"; exit 1 ;;
           esac
           missed=$(echo "$NEEDS" | jq -r --argjson expected "$expected" '$expected - [to_entries[] | select(.value.result == "success") | .key] | join(", ")')

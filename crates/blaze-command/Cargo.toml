@@ -47,8 +47,6 @@ blaze-keyed.workspace = true
 blaze-mem.workspace = true
 # The memo the snapshots keep their reads in (snapshot.rs).
 blaze-memo.workspace = true
-# The database the load runs on, and its `Tree`.
-blaze-query.workspace = true
 # The leaf table and its sans-IO sweep.
 blaze-solo.workspace = true
 # A unit's keys from its own text (front.rs).

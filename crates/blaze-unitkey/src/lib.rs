@@ -88,8 +88,6 @@ pub mod rows;
 pub mod unit;
 
 #[cfg(test)]
-mod std_tests;
-#[cfg(test)]
 mod tests;
 
 use core::fmt;

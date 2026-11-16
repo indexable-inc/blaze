@@ -1294,8 +1294,7 @@ default only where `--bstd <PATH>` says where bstd is; without it `blaze new` st
 the Rust package, and `--edition blaze-2026.11` alone is refused naming the flag. One
 constant, `blaze_new::BSTD_SHIPS`, makes it the default everywhere.
 
-**Not on the latest edition** is one lint, `blaze::not_latest_edition`
-([lints](../../../lints.md#not_latest_edition)), for a Rust edition and an older blaze edition
+**Not on the latest edition** is one lint, `blaze::not_latest_edition`, for a Rust edition and an older blaze edition
 alike: one finding a package, only for the workspace's own packages, saying what opting in
 gives and the manifest line; a diagnostic like any other (stored in the crate's record, a
 `compiler-message` in JSON, allowed or denied in the workspace's lint table or by flag). It
@@ -1336,7 +1335,7 @@ Interface first, bottom last, so nothing waits on the runtime and every step lan
 S1 and S2 do not depend on each other. S3 is the long one: about 270 files name `std::fs`, 280
 `std::env`, 200 `std::process`, 200 `std::thread`, 160 the clock, and 410 `std::sync`.
 
-**S3's worklist is a lint.** `blaze::std_use` ([lints.md](../../../lints.md#std_use)) finds
+**S3's worklist is a lint.** `blaze::std_use` finds
 each use of an item of Rust's `std` that bstd replaces, by what the use resolves to, once per
 item per function, and names what is written instead from one table of rows (ambient
 authority, hidden cost, global-heap allocation, renamed) that is revised as bstd's API

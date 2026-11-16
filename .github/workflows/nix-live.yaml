@@ -1,10 +1,9 @@
 # What is new since the fork: the flake (per-unit nix builds of the daemon and the demo), the
-# unit graphs behind them, the Game of Life demo, and live edits (blaze-live). A cold build of
+# unit graphs behind them and the Game of Life demo. A cold build of
 # the flake takes up to two hours, so they run on every push to main in a workflow of their own,
 # not in the release train: the train's run would stay open until they ended, and main's next
 # train waits for it. A pull request that changes the flake, tools/nix/ or the dependencies (which the
-# unit graphs are generated from) checks the unit graphs alone, in two minutes. The train's
-# harnesses have live edits too (live_e2e.py, tiers.py). Nothing waits on this workflow; what it
+# unit graphs are generated from) checks the unit graphs alone, in two minutes. Nothing waits on this workflow; what it
 # says is shown on main's commits. The unit graphs were stale for a week before 2026-10-26, and
 # nothing said so but this workflow.
 #
@@ -12,7 +11,6 @@
 #   nix           `nix build` of the daemon, the demo and the per-unit builds, and the flake's apps
 #   nix (darwin)  the flake evaluates and builds its cheapest outputs on aarch64-darwin
 #   demo          demo/life builds and its window opens (xvfb) and stays up
-#   live edits    macOS arm64: edit a running program's function, blaze-live applies the patch
 #
 # The nix store is cached in the GitHub Actions cache. FlakeHub Cache needs an organization
 # `indexable-inc` on FlakeHub, which does not exist, and `id-token: write` on the jobs.
@@ -111,7 +109,7 @@ jobs:
         run: nix build --print-build-logs --no-link .#daemon-units .#run
 
   demo:
-    name: demo/life and blaze-live (linux)
+    name: demo/life (linux)
     if: github.event_name != 'pull_request'
     runs-on: [ix, arm64, ix-cpu-16, blaze-nix-live-demo]
     timeout-minutes: 60
@@ -124,8 +122,6 @@ jobs:
       - uses: ./.github/actions/blaze
         with:
           job: tests
-      # blaze-live is a stub where live edits are not supported, and says so.
-      - run: nix develop --command blaze test --release -p blaze-live --locked
       # With cargo: what this checks is that the demo builds with rustc, as a user's would.
       - run: cargo build --locked
         working-directory: demo/life
@@ -140,47 +136,6 @@ jobs:
           # timeout's own 124: the window was still up when it was stopped.
           test "$status" = 124 || { echo "::error::the window exited ($status) before it was stopped"; exit 1; }
           ! grep -E -i "panicked|Err\(" life.log
-      # Why the daemon ended, when it did (the client does not say).
-      - if: failure()
-        uses: ./.github/actions/daemon-log
-
-  live-edits:
-    name: live edits (macOS arm64)
-    if: github.event_name != 'pull_request'
-    runs-on: macos-15
-    # blaze-engine's build by blaze, from the tests job's store: longer than an hour when cold.
-    timeout-minutes: 240
-    # Not required: it runs a daemon, a program and a patch between them on a hosted macOS VM,
-    # which has been the least steady thing in the repository. Whatever it says is still shown.
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v7
-      - uses: ./.github/actions/toolchain
-        with:
-          llvm: build
-      # blaze tests blaze (AGENTS.md rule blaze-builds-blaze) from the store main's tests job pushed.
-      - uses: ./.github/actions/blaze
-        with:
-          job: tests
-      # Where it is real code: the whole of macos.rs and the patch format.
-      - run: nix develop --command blaze test --release -p blaze-live --locked
-      # The blaze that edits the program: blaze's build of it (AGENTS.md rule
-      # blaze-builds-blaze), the one users get; then the stage 0's daemon ends before it starts.
-      - run: nix develop --command blaze build --release -p blaze-engine --locked
-      - run: blaze stop
-      - name: edit a running program
-        run: |
-          python3 harness/live_e2e.py "{\"blaze\": \"$GITHUB_WORKSPACE/target/release/blaze-engine\"}"
-      - name: crash reports
-        if: failure()
-        run: |
-          for report in "$HOME"/Library/Logs/DiagnosticReports/*; do
-            case "$report" in *blaze*|*liveprobe*) echo "::group::$report"; head -c 20000 "$report"; echo; echo "::endgroup::";; esac
-          done
-      # With cargo, as in the demo job.
-      - name: the demo builds on macOS
-        run: cargo build --locked
-        working-directory: demo/life
       # Why the daemon ended, when it did (the client does not say).
       - if: failure()
         uses: ./.github/actions/daemon-log

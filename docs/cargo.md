@@ -1898,7 +1898,7 @@ workspace's tables, the ratchet and the package's own `[lints]`, so the command 
 is the one that holds: `blaze check --deny blaze::todo`. `LINT` is `tool::name` or one of
 rustc's by its plain name; `blaze::name` must be a lint or group blaze has. No other command
 takes them, and `--allow` and `--warn` of `blaze::unreachable` are refused, as a table that
-sets either is ([`unreachable`](lints.md#unreachable)). A level is one of the unit's lint
+sets either is (`unreachable`). A level is one of the unit's lint
 flags, which its plan holds and its check's kept results are keyed by.
 
 Once every unit ends, `blaze check` lints each workspace package's items over every
@@ -1927,7 +1927,7 @@ baseline holds a lint at `warn`: a `deny` lint's finding fails the check, baseli
 line may read `crate<TAB>unmeasured`: any count passes it and it is stale, and the bless
 records the run's count in its place or drops the crate at zero. A workspace whose
 `lints-ratchet` names the directory holds each crate a `blaze.<lint>.txt` lists at `warn` on
-that lint and every other crate at `deny` ([the ratchet](lints.md#workspace-levels-and-the-ratchet)).
+that lint and every other crate at `deny` (`the ratchet`).
 
 blaze's own baselines go in crates/blaze-lints/baselines, of `aarch64-unknown-linux-gnu`
 (AGENTS.md rule fix-through-blaze-lints), and the merge gate's `lint-baselines` job holds every

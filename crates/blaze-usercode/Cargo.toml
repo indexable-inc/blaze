@@ -25,7 +25,6 @@ blaze-ids.workspace = true
 blaze-inproc = { workspace = true, features = ["host"] }
 blaze-items.workspace = true
 blaze-mem.workspace = true
-blaze-query.workspace = true
 blaze-serde.workspace = true
 blaze-vfs.workspace = true
 memchr.workspace = true

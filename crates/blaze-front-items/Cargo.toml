@@ -24,7 +24,6 @@ syntax.workspace = true
 [dev-dependencies]
 blaze-sim.workspace = true
 blaze-store-check.workspace = true
-hir-expand.workspace = true
 span.workspace = true
 
 [lints]

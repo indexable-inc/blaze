@@ -85,10 +85,8 @@ tracing.workspace = true
 # into the front end and checked as `blaze check` checks a crate.
 base-db.workspace = true
 blaze-diagnostics.workspace = true
-blaze-lower.workspace = true
 # The probe's database keeps no read lists (`blaze_memo::Reads::Off`).
 blaze-memo.workspace = true
-blaze-query.workspace = true
 blaze-units.workspace = true
 blaze-vfs.workspace = true
 cfg.workspace = true

@@ -20,8 +20,6 @@ blaze-ids.workspace = true
 blaze-items.workspace = true
 blaze-mem.workspace = true
 blaze-memo.workspace = true
-# `QueryKind` only: the fact kinds (`blaze_query::kinds::FACTS`), outside the deleted engine.
-blaze-query.workspace = true
 
 la-arena.workspace = true
 smallvec.workspace = true
