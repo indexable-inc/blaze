@@ -447,6 +447,19 @@ panic unwinds across slab frames by a second return path each may-suspend call c
 The simulation is not a layout: `Io::sim(seed)` picks a seeded scheduler and world at run time,
 under any layout.
 
+**A started task never changes its thread** ([bottom](bottom.md), "Fibers and `Send`"). A new
+task may be placed on any worker (`Scope::spawn` and every `par` chunk); once it has started it
+resumes from each wait on that worker and OS thread, so a value that is not `Send` (an `Rc`, a
+`LocalLock`, a guard) held across a wait is still on the thread that made it. That is the
+contract of the plain form, the one rustc builds: a fiber or frames scheduler must put a parked
+task back where it ran, and a debug build checks it at every resume (`Cx`'s `resumed`, a panic
+naming the task). `tests/placement.rs` proves it on the simulation, with a planted resume that
+moves the task. Built by blaze the contract is wider: a value that is not `Send` live across a
+call that can wait is a compile error, so a task may move between waits and the check goes;
+this is stated, not yet code. bstd has no thread-local storage, so nothing else could tell, and
+each one-thread type (`LocalShared`, `LocalLock`, `LocalOnce`, `LocalLazy`) checks in a debug
+build that it is dropped on the thread that made it.
+
 **The layout is chosen per build, not per signature.** `Cx` and the capabilities are concrete
 types; the build configuration says which layout they are, as it says which IO driver a target
 gets. Functions are compiled once, and no signature carries a type parameter for it. (The
@@ -849,9 +862,11 @@ they mean.
 |---|---|---|
 | `Shared<T>` / `LocalShared<T>` | `Arc` / `Rc` | both are `Handle`s ([edition](edition.md), change 1); over an `Acyclic` type they hold a linear value and are released by hand ([ownership](ownership.md)) |
 | `Shares<T, K, N, D>` | none | `N` of `D` parts of one `T`, the fraction in the type, no count at run time |
-| `Lock<T>`, `RwLock<T>` / `LocalLock<T>` | `Mutex`, `RwLock` / `RefCell` | the first waits, the second panics; the same operation |
-| `Once<T>`, `Lazy<T>` / `LocalOnce<T>`, `LocalLazy<T>` | `OnceLock`, `LazyLock` / `OnceCell`, `LazyCell` | |
-| `Atomic<T>` | `AtomicU32`, `AtomicBool`, ... | one generic type |
+| `Lock<T>` / `LocalLock<T>` | `Mutex` / `RefCell` | the first waits, the second panics; the same operation |
+| `RankedLock<T, R>` | none | a lock in a rank order the compiler checks (below) |
+| `RwLock<T>` | `RwLock` | demoted: prefer `Swap<T>` (below) |
+| `PublishOnce<T>` / `LocalOnce<T>`, `LocalLazy<T>` | `OnceLock` / `OnceCell`, `LazyCell` | `Once` and `Lazy`, which wait on first use, come when bstd's own wait is under them |
+| `Counter`, `Flag`, `Seq`; `sync::raw::Atomic<T>` | `AtomicU64`, `AtomicBool`, ... | one type per use, its ordering chosen inside; the generic one under a longer name |
 | `Cell<T>` | `Cell` | unchanged |
 | `RawCell<T>` | `UnsafeCell` | trusted code only |
 
@@ -878,6 +893,83 @@ they mean.
   reflection ([comptime](comptime.md)) before any syntax is considered.
 - Kept from Rust: a lock owns its data, the `Send`/`Sync` split, and shared mutation as an
   opt-in per type.
+- **Moving a `Lock` to a `RankedLock`.** A lock that is ever held with another gets a rank:
+  declare `enum StoreRank {}` with `impl Rank { const LEVEL: u32 = 10; const NAME = "store"; }`,
+  change the type to `RankedLock<T, StoreRank>` and each `lock(cx)` to `lock(&mut order)`, with
+  `order` from `cx.lock_order()` or a lower guard's `order()`. A call site that took two locks
+  in an order the ranks forbid stops compiling, which is the point; fix it by the ranks, never
+  by a third lock. A lock never held with another stays a `Lock`. The move is by name, through
+  a `.clippy.toml` ban on `Lock` in a crate once its locks are ranked (rule 13).
+
+## Concurrency: what to reach for
+
+bstd offers a primitive named for each pattern of parallel or shared work, so code reaches for
+the pattern, not for a lock and an atomic. What a pattern does not need is absent or awkward on
+purpose. All live in `bstd::sync`, except `par`.
+
+| you want to | use | instead of |
+|---|---|---|
+| work on parts of one slice, or columns of one table, at once | `par::for_each`, `par::map_into`, `par::reduce` | threads over `Arc<Mutex<Vec<_>>>`, rayon |
+| build a table, then share it read-only | `Building<T>` then `.freeze()` to `Frozen<T>` | `Arc<RwLock<T>>` read for ever |
+| readers that never block, a writer replacing the whole value | `Swap<T>` | `RwLock<T>`, `ArcSwap` |
+| compute a key once while other askers wait | `Flight<K, V, E>` | a map of `OnceLock`s, a lock held over the computation |
+| hand values from task to task | `Chan<T>` (bounded) | an unbounded channel |
+| count, flag, number versions, publish one value | `Counter`, `Flag`, `Seq`, `PublishOnce<T>` | `AtomicU64` with an ordering chosen at each call |
+| hold two locks at once | `RankedLock<T, R>` | two `Lock`s and a comment about their order |
+| state for one thread | `LocalLock`, `LocalOnce`, `LocalLazy`, `LocalShared` | `thread_local!` |
+
+**Guarantees and costs.**
+
+- `par`: chunks are disjoint `&mut` ranges cut by `split_at_mut`, so the borrow checker proves
+  no two overlap; where the cuts fall depends on the length and the grain alone, and `reduce`
+  joins neighbours left to right by position, so the result is the same in every schedule and
+  layout, for a join that is neither associative nor commutative too. The grain (`Grain`: the
+  fewest items a chunk is worth, and each chunk's frame) is the caller's. Cost: one task and
+  frame a chunk; `n / items` chunks, and the calling task runs one itself.
+- `Frozen<T>`: `T: Freeze`, so nothing inside can change; a clone is a count, a read is a
+  pointer, no lock. One allocation at the freeze, and no way back to a `Building`.
+- `Swap<T>`: a read is an acquire load inside a reclamation task (`reclaim::enter`), never a
+  wait; a publish takes the writers' lock, swaps the pointer and holds the old value until every
+  task that was in when it was replaced has left (blaze-reclaim's epochs). Cost: a writer
+  allocates the whole new value; readers pay nothing but the task's entry.
+- `Flight<K, V, E>`: at most one computation of a key at a time; waiters wait under their own
+  deadlines; a failure or a panic fails its waiters with a typed `FlightError` and leaves no
+  entry, so the next asker retries; the table holds at most its capacity, a full one replacing
+  its oldest finished key or refusing with `FlightError::Full`. Cost: a scan of the table under
+  its lock per ask (a hashed core is the same interface for large tables), a clone of the value
+  per asker.
+- `Chan<T>`: its capacity is an argument and its room is allocated when made; `send` and `recv`
+  take `cx` and end in `Stopped` at its deadline, a send giving its value back; closed is a
+  typed outcome after what is left is drained. Cost: a lock, a move and a notify per value.
+- `Counter` (relaxed: a total publishes nothing), `Flag` (release set, acquire read), `Seq`
+  (acquire/release steps), `PublishOnce<T>` (set once, never waits; a second set gets its value
+  back). Cost: one atomic instruction each.
+- `RankedLock<T, R>`: taken with a token of a lower rank, a `const` check of the two ranks
+  that fails to compile out of order, in both builders; one token a task (`cx.lock_order()`);
+  a guard borrows the token, so code written against the token has no `Cx` to wait with while
+  it holds a guard. Cost: what a `Lock` costs; the ranks are types.
+
+**What the types enforce, and what is convention.** Enforced: disjoint chunks; a frozen value
+never changes; a channel's bound (no constructor without one); every wait takes `cx`; rank
+order; one token a task. By convention until blaze's checks: that ranked code reaches its `Cx`
+only through the token (blaze's "a guard or a value that is not `Send` live across a call that
+can wait" makes it a compile error everywhere); the atomics' orderings, argued in their docs and
+not yet run under blaze-check's interleavings.
+
+**Absent on purpose.**
+
+- **No unbounded channel.** It turns a slow consumer into unbounded memory (rule
+  bounded-progress); a producer that must not wait says so with `try_send` and handles `Full`.
+- **No bare thread spawn.** Work starts as a task of a `Scope`, which joins it: nothing
+  outlives the scope that started it, and a task's failure is its scope's.
+- **No thread-local storage.** State for a thread is a value passed to it; bstd has no
+  `thread_local!` and no ambient state to read through one (rule nothing-ambient).
+- **No sleep without `cx`.** `Clock::sleep(cx, ..)` is the only sleep: it has the task's
+  deadline and its cancellation.
+- **`RwLock` demoted.** Its readers block a writer and its waits take no `cx`; `Swap` covers its
+  use, and the rest say why in a comment.
+- **No generic atomic under the short name.** `sync::raw::Atomic<T>` makes each caller choose
+  an ordering at each call; the named ones choose once, with a reason.
 
 ## Names are typed, and authority is stored
 

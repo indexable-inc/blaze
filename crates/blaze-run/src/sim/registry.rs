@@ -5,9 +5,11 @@
 use std::alloc::Global;
 use std::collections::BTreeMap;
 
+use blaze_format::Aligned;
 use blaze_sim::{Broke, Config, Tape, check, control};
 
 use super::{harness, key, oracle};
+use crate::events;
 use crate::registry::{Effect, Entry, Name, Pid, ProcessStart, Processes, Registry, RunEvent};
 use crate::{CheckoutKey, InstanceKey, Nanos, Plant, TestId};
 
@@ -111,22 +113,34 @@ fn the_oracle_catches_a_pid_taken_for_its_run() {
 }
 
 #[test]
-fn an_event_reads_back_as_written() {
+fn a_batch_of_events_reads_back_as_written() {
     check(Config::cases(200), |tape| {
-        let at = Nanos(tape.next_u64("at"));
-        let one = InstanceKey(key(tape.next_u64("key")));
-        let event = match tape.below(9, "kind") {
-            0 => RunEvent::Began { at, program: one, checkout: CheckoutKey(key(tape.next_u64("checkout"))) },
-            1 => RunEvent::Compiling { function: one },
-            2 => RunEvent::Published { function: one },
-            3 => RunEvent::Tiered { function: one },
-            4 => RunEvent::Failed { function: one },
-            5 => RunEvent::TestPassed { test: TestId(one.0) },
-            6 => RunEvent::TestFailed { test: TestId(one.0) },
-            7 => RunEvent::Memory { at, bytes: tape.next_u64("bytes") },
-            _ => RunEvent::Ended { at, status: tape.next_u32("status") as i32 },
-        };
-        let back = RunEvent::decode(event.encode().as_bytes());
-        oracle(back == Ok(event), || format!("{event:?} read back as {back:?}"))
+        let rows = tape.below(12, "rows") as usize;
+        let events: Vec<RunEvent> = (0..rows)
+            .map(|_| {
+                let at = Nanos(tape.next_u64("at"));
+                let one = InstanceKey(key(tape.next_u64("key")));
+                match tape.below(9, "kind") {
+                    0 => RunEvent::Began { at, program: one, checkout: CheckoutKey(key(tape.next_u64("checkout"))) },
+                    1 => RunEvent::Compiling { function: one },
+                    2 => RunEvent::Published { function: one },
+                    3 => RunEvent::Tiered { function: one },
+                    4 => RunEvent::Failed { function: one },
+                    5 => RunEvent::TestPassed { test: TestId(one.0) },
+                    6 => RunEvent::TestFailed { test: TestId(one.0) },
+                    7 => RunEvent::Memory { at, bytes: tape.next_u64("bytes") },
+                    _ => RunEvent::Ended { at, status: tape.next_u32("status") as i32 },
+                }
+            })
+            .collect();
+        let bytes = events::write(&events, Global);
+        // Equal events are equal bytes (rule 25).
+        oracle(events::write(&events, Global) == bytes, || "a batch written twice differs".into())?;
+        let aligned = Aligned::copy_from(&bytes);
+        let mut back = Vec::new_in(Global);
+        let read = events::read(&aligned, &mut back);
+        oracle(read.is_ok() && back.as_slice() == events.as_slice(), || {
+            format!("{events:?} read back as {back:?} ({read:?})")
+        })
     });
 }

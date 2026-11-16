@@ -7,9 +7,9 @@
 //! next reader of the directory finds that no process with that pid and that start time lives,
 //! leaves it out of what it lists and removes it. So a read never lists a dead run.
 //!
-//! Beside its entry each run appends its events to its stream (`<name>.events`): each one a
-//! length byte and [`RunEvent::encode`]'s bytes, little-endian, nothing of the machine but the
-//! pid. A viewer tails the streams of the runs a read lists.
+//! Beside its entry each run appends its events to its stream (`<name>.events`): a blaze-format
+//! record in columns a flush ([`crate::events`]), keys and numbers only. A viewer tails the
+//! streams of the runs a read lists.
 
 #![blaze::sans_io]
 
@@ -100,13 +100,11 @@ impl Cursor {
     }
 }
 
-/// Why bytes are not an entry or an event.
+/// Why bytes are not an entry.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Bad {
     Length { len: usize, want: usize },
     Version { version: u32 },
-    Kind { kind: u8 },
-    Tier { tier: u8 },
 }
 
 impl fmt::Display for Bad {
@@ -116,8 +114,6 @@ impl fmt::Display for Bad {
             Bad::Version { version } => {
                 write!(f, "layout {version}, where this blaze writes {ENTRY_VERSION}")
             }
-            Bad::Kind { kind } => write!(f, "an event of unknown kind {kind}"),
-            Bad::Tier { tier } => write!(f, "a tier of unknown number {tier}"),
         }
     }
 }
@@ -130,8 +126,9 @@ pub enum Effect {
     /// Remove the entry file `name` and its stream; one already gone is not an error (another
     /// reader removed it first).
     Remove { name: Name },
-    /// Append one event to `name`'s stream.
-    Append { name: Name, event: Encoded },
+    /// One event for `name`'s stream: the driver gathers them and appends each flush as one
+    /// columnar batch ([`crate::events::write`]).
+    Append { name: Name, event: RunEvent },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -212,7 +209,7 @@ impl Registry {
     /// One event of this run, for its stream.
     pub fn say<A: Allocator>(&self, event: &RunEvent, out: &mut Vec<Effect, A>) -> Result<(), Error> {
         let name = self.me.ok_or(Error::NotRegistered)?;
-        out.push(Effect::Append { name, event: event.encode() });
+        out.push(Effect::Append { name, event: *event });
         Ok(())
     }
 
@@ -266,103 +263,3 @@ pub enum RunEvent {
     Ended { at: Nanos, status: i32 },
 }
 
-/// The longest event: a kind byte, a time and two keys.
-pub const MOST_EVENT: usize = 1 + 8 + 32 + 32;
-
-/// One event's bytes, held without an allocator.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Encoded {
-    bytes: [u8; MOST_EVENT],
-    len: u8,
-}
-
-impl Encoded {
-    pub fn as_bytes(&self) -> &[u8] {
-        &self.bytes[..usize::from(self.len)]
-    }
-}
-
-impl RunEvent {
-    pub fn encode(&self) -> Encoded {
-        let mut bytes = [0; MOST_EVENT];
-        let mut at = Cursor(0);
-        match self {
-            RunEvent::Began { at: time, program, checkout } => {
-                at.put(&mut bytes, &[0]);
-                at.put(&mut bytes, &time.0.to_le_bytes());
-                at.put(&mut bytes, &program.0);
-                at.put(&mut bytes, &checkout.0);
-            }
-            RunEvent::Compiling { function: key }
-            | RunEvent::Published { function: key }
-            | RunEvent::Tiered { function: key }
-            | RunEvent::Failed { function: key } => {
-                let kind = match self {
-                    RunEvent::Compiling { .. } => 1,
-                    RunEvent::Published { .. } => 2,
-                    RunEvent::Tiered { .. } => 3,
-                    _ => 4,
-                };
-                at.put(&mut bytes, &[kind]);
-                at.put(&mut bytes, &key.0);
-            }
-            RunEvent::TestPassed { test } => {
-                at.put(&mut bytes, &[5]);
-                at.put(&mut bytes, &test.0);
-            }
-            RunEvent::TestFailed { test } => {
-                at.put(&mut bytes, &[6]);
-                at.put(&mut bytes, &test.0);
-            }
-            RunEvent::Memory { at: time, bytes: value } => {
-                at.put(&mut bytes, &[7]);
-                at.put(&mut bytes, &time.0.to_le_bytes());
-                at.put(&mut bytes, &value.to_le_bytes());
-            }
-            RunEvent::Ended { at: time, status } => {
-                at.put(&mut bytes, &[8]);
-                at.put(&mut bytes, &time.0.to_le_bytes());
-                at.put(&mut bytes, &status.to_le_bytes());
-            }
-        }
-        Encoded { bytes, len: at.0 as u8 }
-    }
-
-    pub fn decode(bytes: &[u8]) -> Result<RunEvent, Bad> {
-        let Some(&kind) = bytes.first() else {
-            return Err(Bad::Length { len: 0, want: 1 });
-        };
-        let want = match kind {
-            0 => 1 + 8 + 64,
-            1..=6 => 1 + 32,
-            7 => 1 + 8 + 8,
-            8 => 1 + 8 + 4,
-            _ => return Err(Bad::Kind { kind }),
-        };
-        if bytes.len() != want {
-            return Err(Bad::Length { len: bytes.len(), want });
-        }
-        let mut at = Cursor(1);
-        Ok(match kind {
-            0 => {
-                let time = Nanos(u64::from_le_bytes(at.take(bytes)));
-                let program = InstanceKey(at.take(bytes));
-                RunEvent::Began { at: time, program, checkout: CheckoutKey(at.take(bytes)) }
-            }
-            1 => RunEvent::Compiling { function: InstanceKey(at.take(bytes)) },
-            2 => RunEvent::Published { function: InstanceKey(at.take(bytes)) },
-            3 => RunEvent::Tiered { function: InstanceKey(at.take(bytes)) },
-            4 => RunEvent::Failed { function: InstanceKey(at.take(bytes)) },
-            5 => RunEvent::TestPassed { test: TestId(at.take(bytes)) },
-            6 => RunEvent::TestFailed { test: TestId(at.take(bytes)) },
-            7 => {
-                let time = Nanos(u64::from_le_bytes(at.take(bytes)));
-                RunEvent::Memory { at: time, bytes: u64::from_le_bytes(at.take(bytes)) }
-            }
-            _ => {
-                let time = Nanos(u64::from_le_bytes(at.take(bytes)));
-                RunEvent::Ended { at: time, status: i32::from_le_bytes(at.take(bytes)) }
-            }
-        })
-    }
-}

@@ -14,26 +14,30 @@
 //! | [`heat`] | [`heat::Heat`]: a counter a slot, charged by fast code; past a bound a function is hot, once | the program's control thread |
 //! | [`tier`] | [`tier::Tier`]: hot functions optimized across functions; the record valid while every inlined callee is | the parent |
 //! | [`registry`] | [`registry::Registry`]: the directory of live runs; [`registry::RunEvent`], the stream a viewer reads | the parent |
+//! | [`events`] | a flush of [`registry::RunEvent`]s as one blaze-format batch in columns | the parent's driver |
+//! | [`viewer`] | a viewer's `Toggle` request, deterministic CBOR, decoded with limits | the parent's driver |
 //! | [`suite`] | [`suite::Tests`]: what each test entered; which tests an edit affects | the parent of a test run |
 //!
 //! The ids below are this crate's own so that it compiles alone today; each says the type it
 //! becomes when the crate that owns that type is on the new item layer (bottom.md).
 
-#![cfg_attr(not(test), no_std)]
 #![feature(allocator_api, btreemap_alloc, register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
-#![forbid(unsafe_code)]
+// Denied, not forbidden: `events` takes blaze-format's `record!`, whose impl is unsafe.
+#![deny(unsafe_code)]
 
 extern crate alloc;
 
+pub mod events;
 pub mod heat;
 pub mod parent;
 pub mod registry;
 pub mod slots;
 pub mod suite;
 pub mod tier;
+pub mod viewer;
 
 #[cfg(test)]
 mod sim;

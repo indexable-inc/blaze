@@ -45,6 +45,18 @@
 //! - [`requests`]: `Http::handler` and `Http::over` give the same answer to the same request,
 //!   and refuse the same ones once narrowed.
 //! - [`hosted`]: each simulated provider once, a scripted value in and a recorded one out.
+//! - [`par`]: `reduce`, `map_into` and `for_each` give the sequential result in every order
+//!   their halves ran, and ragged columns are refused.
+//! - [`placement`]: a started task resumes from every wait on the worker it started on.
+//! - [`freeze`]: a frozen value is read the same through every handle and dropped once.
+//! - [`swap`]: a `Swap`'s reader sees the last publish, and a replaced value outlives every task
+//!   that was in when it was replaced.
+//! - [`flight`]: a key is computed at most once at a time, failures are retried, the table
+//!   stays in its bound; and the driver once.
+//! - [`chan`]: a channel is bounded, in order, each value once, drained before closed; its
+//!   waits end at their deadline.
+//! - [`atomics`]: the named atomics mean what their docs say (their orderings are untested).
+//! - [`ranks`]: one lock-order token a task, back when dropped.
 //!
 //! The compile-time half, that dropping a `Scope`, `Task`, `Pending` or `File<ReadWrite>`
 //! unfinished is an error, is in crates/hir-ty-linear's fixtures (`bstd_*`): that harness
@@ -61,9 +73,11 @@
 //! the plan that caught its plant.
 
 mod arena;
+mod atomics;
 mod budget;
 mod cancel;
 mod cell;
+mod chan;
 mod close;
 mod contexts;
 mod crash;
@@ -74,6 +88,8 @@ mod entry;
 mod env;
 mod eval;
 mod explicit;
+mod flight;
+mod freeze;
 mod hosted;
 mod inflight;
 mod kv;
@@ -85,10 +101,14 @@ mod names;
 mod narrowing;
 mod narrows;
 mod own;
+mod par;
 mod paths;
+mod placement;
+mod ranks;
 mod requests;
 mod scopes;
 mod simtest;
+mod swap;
 mod world;
 
 use std::{fmt, time::Duration};

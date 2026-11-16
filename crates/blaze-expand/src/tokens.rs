@@ -733,7 +733,20 @@ pub fn lex<A: Allocator + Clone>(
         .ok_or(LexError::Refused { edition })?;
     let mut out = TokenStream::new_in(alloc);
     let mut last = None;
-    lex_walk(&mut out, tree.iter(), Ctx::root(edition), &mut last)?;
+    let ctx = Ctx::root(edition);
+    // A text that is one group (`[[1]]`) is built with that group as the top, whose delimiters
+    // `iter` does not yield: they are tokens of the text, so they are written here.
+    let top = tree.top_subtree().delimiter;
+    let wrapped = (top.kind != tt::DelimiterKind::Invisible).then(|| Delim::of_tt(top.kind));
+    if let Some(delim) = wrapped {
+        out.open(delim, ctx)?;
+    }
+    lex_walk(&mut out, tree.iter(), ctx, &mut last)?;
+    if let Some(delim) = wrapped {
+        // As a nested group's close in `lex_walk`: what ends where it starts is joint with it.
+        joined_to(&mut out, &mut last, top.close.range.start());
+        out.close(delim, ctx)?;
+    }
     Ok(out)
 }
 

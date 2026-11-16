@@ -10,10 +10,12 @@ use stdx::impl_from;
 use crate::{
     AdtId, AssocItemId, AttrDefId, ConstId, Crate, EnumId, EnumVariantId, FunctionId, ImplId,
     ItemContainerId, MacroId, ModuleDefId, StaticId, StructId, TraitId, TypeAliasId, UnionId,
-    attrs::{AttrFlags, CrateAttrFlags},
-    item_scope::ImportOrExternCrate,
-    nameres::{DefMap, assoc::TraitItems, crate_def_map, crate_local_def_map},
+    attrs::AttrFlags,
+    key::FromKey,
+    nameres::DefMap,
 };
+use base_db::{ItemKey, OrNeed};
+use blaze_surface::{ItemKind, Items};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LangItemTarget {
@@ -34,154 +36,95 @@ impl_from!(
     EnumId, FunctionId, ImplId, StaticId, StructId, UnionId, TypeAliasId, TraitId, EnumVariantId, ConstId, MacroId for LangItemTarget
 );
 
-/// A query. This will look for lang items in a specific crate.
-#[blaze_query::tracked(returns(as_deref), mem_tag = Nameres)]
+/// The target a lang item's key names, by the kind its record gives.
+fn target_of(db: &Db, key: ItemKey) -> Option<LangItemTarget> {
+    Some(match db.items().kind(key).or_need() {
+        ItemKind::Function => LangItemTarget::FunctionId(FunctionId::of_key(db, key)),
+        ItemKind::Struct => LangItemTarget::StructId(StructId::of_key(db, key)),
+        ItemKind::Enum => LangItemTarget::EnumId(EnumId::of_key(db, key)),
+        ItemKind::Union => LangItemTarget::UnionId(UnionId::of_key(db, key)),
+        ItemKind::Trait => LangItemTarget::TraitId(TraitId::of_key(db, key)),
+        ItemKind::Impl => LangItemTarget::ImplId(ImplId::of_key(db, key)),
+        ItemKind::Const => LangItemTarget::ConstId(ConstId::of_key(db, key)),
+        ItemKind::Static => LangItemTarget::StaticId(StaticId::of_key(db, key)),
+        ItemKind::TypeAlias => LangItemTarget::TypeAliasId(TypeAliasId::of_key(db, key)),
+        ItemKind::Variant => LangItemTarget::EnumVariantId(EnumVariantId::of_key(db, key)),
+        // A macro's id needs its definition record's expander (not built); the rest are no
+        // lang item's kind.
+        ItemKind::Macro
+        | ItemKind::Module
+        | ItemKind::Use
+        | ItemKind::ExternCrate
+        | ItemKind::Field => return None,
+    })
+}
+
+/// The lang items one crate defines: its `LangItems` record (blaze-surface), each row's key
+/// made an id by the kind its record gives. One read; a crate without the record stops the
+/// task with a `Need` naming it.
+#[blaze_memo::tracked(returns(as_deref), mem_tag = Nameres)]
 pub fn crate_lang_items(db: &Db, krate: Crate) -> Option<Box<LangItems>> {
     let _p = tracing::info_span!("crate_lang_items_query").entered();
-    if let Some(frozen) = crate::nameres::frozen::served_lang_items(db, krate) {
-        return frozen;
-    }
-
+    let view = db.items().lang_items(krate.key(db)).or_need();
     let mut lang_items = LangItems::default();
-
-    let crate_def_map = crate_def_map(db, krate);
-
-    if !crate_def_map.features().lang_items {
-        return None;
-    }
-
-    // Each item's flags off its file's column, not its own query: the pass is often the first
-    // reader of a crate's flags, so the columns are built first, on every core.
-    blaze_mem::frame::current(|frame| {
-        let mut files = Vec::new_in(frame);
-        files.extend(crate_def_map.modules(db).filter_map(|(_, module)| module.origin.file_id()));
-        crate::attrs::build_columns(db, krate, &files);
-    });
-    let mut flags = CrateAttrFlags::new(db);
-    for (_, module_data) in crate_def_map.modules(db) {
-        for impl_def in module_data.scope(db).inherent_impls() {
-            lang_items.collect_lang_item(&mut flags, impl_def);
-            for &(_, assoc) in impl_def.impl_items(db).items.iter() {
-                match assoc {
-                    AssocItemId::FunctionId(f) => lang_items.collect_lang_item(&mut flags, f),
-                    AssocItemId::TypeAliasId(t) => lang_items.collect_lang_item(&mut flags, t),
-                    AssocItemId::ConstId(c) => lang_items.collect_lang_item(&mut flags, c),
-                }
-            }
-        }
-
-        for def in module_data.scope(db).declarations() {
-            match def {
-                ModuleDefId::TraitId(trait_) => {
-                    lang_items.collect_lang_item(&mut flags, trait_);
-                    TraitItems::query(db, trait_).items.iter().for_each(|&(_, assoc_id)| {
-                        match assoc_id {
-                            AssocItemId::FunctionId(f) => {
-                                lang_items.collect_lang_item(&mut flags, f);
-                            }
-                            AssocItemId::TypeAliasId(alias) => {
-                                lang_items.collect_lang_item(&mut flags, alias)
-                            }
-                            AssocItemId::ConstId(c) => lang_items.collect_lang_item(&mut flags, c),
-                        }
-                    });
-                }
-                ModuleDefId::AdtId(AdtId::EnumId(e)) => {
-                    lang_items.collect_lang_item(&mut flags, e);
-                    e.enum_variants(db).variants.values().for_each(|&(id, _)| {
-                        lang_items.collect_lang_item(&mut flags, id);
-                    });
-                }
-                ModuleDefId::AdtId(AdtId::StructId(s)) => {
-                    lang_items.collect_lang_item(&mut flags, s);
-                }
-                ModuleDefId::AdtId(AdtId::UnionId(u)) => {
-                    lang_items.collect_lang_item(&mut flags, u);
-                }
-                ModuleDefId::FunctionId(f) => {
-                    lang_items.collect_lang_item(&mut flags, f);
-                }
-                ModuleDefId::StaticId(s) => {
-                    lang_items.collect_lang_item(&mut flags, s);
-                }
-                ModuleDefId::TypeAliasId(t) => {
-                    lang_items.collect_lang_item(&mut flags, t);
-                }
-                ModuleDefId::ConstId(c) => lang_items.collect_lang_item(&mut flags, c),
-                _ => {}
-            }
+    for (name, key) in view.items() {
+        if let Some(target) = target_of(db, key) {
+            lang_items.assign_lang_item(Symbol::intern(name), target);
         }
     }
-
     if matches!(krate.data(db).origin, base_db::CrateOrigin::Lang(base_db::LangCrateOrigin::Core)) {
-        lang_items.fill_non_lang_core_items(db, crate_def_map);
+        lang_items.fill_non_lang_core_items(db, crate::nameres::crate_def_map(db, krate));
     }
-
     lang_items.resolve_manually(db);
-
     // alloc: the memo's value, once per crate
     if lang_items.is_empty() { None } else { Some(Box::new(lang_items)) }
 }
 
 /// A query. Look for a lang items, starting from the specified crate and recursively
 /// traversing its dependencies.
-#[blaze_query::tracked(returns(ref), mem_tag = Nameres)]
+#[blaze_memo::tracked(returns(ref), mem_tag = Nameres)]
 pub fn lang_items(db: &Db, start_crate: Crate) -> LangItems {
     let _p = tracing::info_span!("lang_items_query").entered();
 
     let mut result = crate_lang_items(db, start_crate).cloned().unwrap_or_default();
 
-    // Our `CrateGraph` eagerly inserts sysroot dependencies like `core` or `std` into dependencies
-    // even if the target crate has `#![no_std]`, `#![no_core]` or shadowed sysroot dependencies
-    // like `dependencies.std.path = ".."`. So we use `extern_prelude()` instead of
-    // `CrateData.dependencies` here, which has already come through such sysroot complexities
-    // while nameres.
-    //
-    // See https://github.com/rust-lang/rust-analyzer/pull/20475 for details.
-    for (_, (module, _)) in crate_local_def_map(db, start_crate).local(db).extern_prelude() {
-        // Some crates declares themselves as extern crate like `extern crate self as core`.
-        // Ignore these to prevent cycles.
-        let krate = module.krate(db);
-        if krate != start_crate && !krate.loads_only_macros(db) {
+    // The crates the start crate can name, as its crate graph record lists them (the extern
+    // prelude and every `extern crate`, sysroot complexities already settled there), each
+    // once; the start crate itself is skipped (`extern crate self as core`).
+    let graph = db.items().crate_graph(start_crate.key(db)).or_need();
+    for dep in graph.deps_of(start_crate.key(db)) {
+        let Some(krate) = db.crate_of_key(dep) else {
+            return Err(base_db::SurfaceError::NoCrateRecord { fact: "CrateGraph", krate: dep })
+                .or_need();
+        };
+        if krate != start_crate {
             result.merge_prefer_self(lang_items(db, krate));
-        }
-    }
-
-    // An `extern crate` loads its crate wherever it is, as rustc's crate loader does, but only
-    // one in the crate's root is in the extern prelude. A test harness of a `#![no_std]` crate
-    // reaches `std` (and its `start`) only through the `extern crate test;` in its module.
-    let def_map = crate_def_map(db, start_crate);
-    for (_, module_data) in def_map.modules(db) {
-        let scope = module_data.scope(db);
-        if scope.extern_crate_decls().next().is_none() {
-            continue;
-        }
-        for (_, item) in scope.types() {
-            if let (ModuleDefId::ModuleId(module), Some(ImportOrExternCrate::ExternCrate(_))) =
-                (item.def, item.import)
-            {
-                let krate = module.krate(db);
-                if krate != start_crate && !krate.loads_only_macros(db) {
-                    result.merge_prefer_self(lang_items(db, krate));
-                }
-            }
         }
     }
 
     result
 }
 
-#[cfg(test)]
-mod extern_tests;
-
-impl LangItems {
-    fn collect_lang_item<T>(&mut self, flags: &mut CrateAttrFlags<'_>, item: T)
-    where
-        T: Into<AttrDefId> + Into<LangItemTarget> + Copy,
-    {
-        if let Some(lang_item) = flags.lang_item(item.into()) {
-            self.assign_lang_item(lang_item, item.into());
+/// The item `path` then `name` names from core's root, each step one read of a module's scope.
+fn resolve_core_path(
+    db: &Db,
+    core_def_map: &DefMap,
+    modules: &[Symbol],
+    name: Symbol,
+    ns: blaze_surface::Namespace,
+) -> Option<ItemKey> {
+    let mut current = core_def_map.module(db, core_def_map.root_module_id());
+    for module in modules {
+        let target = current.scope(db).get(db, blaze_surface::Namespace::Types, &Name::new_symbol_root(*module))?;
+        let blaze_surface::Target::Item(key) = target else { return None };
+        if !key.is_of(core_def_map.krate().key(db)) {
+            return None;
         }
+        current = core_def_map.module(db, crate::key::module_of_key(db, key));
+    }
+    match current.scope(db).get(db, ns, &Name::new_symbol_root(name))? {
+        blaze_surface::Target::Item(key) => Some(key),
+        blaze_surface::Target::Undetermined | blaze_surface::Target::Ambiguous => None,
     }
 }
 
@@ -191,24 +134,8 @@ fn resolve_core_trait(
     modules: &[Symbol],
     name: Symbol,
 ) -> Option<TraitId> {
-    let mut current = core_def_map.module(db, core_def_map.root);
-    for module in modules {
-        let Some((ModuleDefId::ModuleId(cur), _)) =
-            current.scope(db).type_(&Name::new_symbol_root(*module))
-        else {
-            return None;
-        };
-        if cur.krate(db) != core_def_map.krate() || cur.block(db) != core_def_map.block_id() {
-            return None;
-        }
-        current = core_def_map.module(db, cur);
-    }
-    let Some((ModuleDefId::TraitId(trait_), _)) =
-        current.scope(db).type_(&Name::new_symbol_root(name))
-    else {
-        return None;
-    };
-    Some(trait_)
+    let key = resolve_core_path(db, core_def_map, modules, name, blaze_surface::Namespace::Types)?;
+    (db.items().kind(key).or_need() == ItemKind::Trait).then(|| TraitId::of_key(db, key))
 }
 
 fn resolve_core_macro(
@@ -217,19 +144,14 @@ fn resolve_core_macro(
     modules: &[Symbol],
     name: Symbol,
 ) -> Option<MacroId> {
-    let mut current = core_def_map.module(db, core_def_map.root);
-    for module in modules {
-        let Some((ModuleDefId::ModuleId(cur), _)) =
-            current.scope(db).type_(&Name::new_symbol_root(*module))
-        else {
-            return None;
-        };
-        if cur.krate(db) != core_def_map.krate() || cur.block(db) != core_def_map.block_id() {
-            return None;
-        }
-        current = core_def_map.module(db, cur);
-    }
-    current.scope(db).makro(&Name::new_symbol_root(name))
+    let key = resolve_core_path(db, core_def_map, modules, name, blaze_surface::Namespace::Macros)?;
+    // A macro's id is made from its definition record's expander, which no record holds yet.
+    Err::<MacroId, _>(base_db::SurfaceError::NotBuilt(blaze_surface::NotBuilt {
+        method: "a core macro's id",
+        item: key,
+    }))
+    .or_need()
+    .into()
 }
 
 impl LangItems {
@@ -354,23 +276,15 @@ impl LangItems {
     }
 }
 
-#[blaze_query::tracked(returns(as_deref), mem_tag = Nameres)]
+/// The crate's `#[doc(notable_trait)]` traits. Not built: it is a walk of every module of the
+/// crate, which the records answer only as `DefMap::modules` (design, "Narrow def-map
+/// accessors"); the attribute wants a crate-level record (a `LangItems`-like list).
+#[blaze_memo::tracked(returns(as_deref), mem_tag = Nameres)]
 pub fn crate_notable_traits(db: &Db, krate: Crate) -> Option<Box<[TraitId]>> {
-    blaze_mem::frame::current(|frame| {
-        let mut traits = Vec::new_in(frame);
-        let crate_def_map = crate_def_map(db, krate);
-        for (_, module_data) in crate_def_map.modules(db) {
-            for def in module_data.scope(db).declarations() {
-                if let ModuleDefId::TraitId(trait_) = def
-                    && AttrFlags::query(db, trait_.into()).contains(AttrFlags::IS_DOC_NOTABLE_TRAIT)
-                {
-                    traits.push(trait_);
-                }
-            }
-        }
-        // alloc: the memo's traits, exact
-        if traits.is_empty() { None } else { Some(Box::from(&traits[..])) }
-    })
+    let item = crate::key::crate_root_module(db, krate).key(db);
+    let item = item.unwrap_or(ItemKey(blaze_id::ContentId([0; 32])));
+    Err(base_db::SurfaceError::NotBuilt(blaze_surface::NotBuilt { method: "crate_notable_traits", item }))
+        .or_need()
 }
 
 macro_rules! language_item_table {

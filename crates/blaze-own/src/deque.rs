@@ -2,8 +2,8 @@
 //! amortized time.
 //!
 //! Costs: `insert` and `remove` move every value after the index one slot (std moves the shorter
-//! side; this moves the back). `make_contiguous` rotates the whole buffer, `O(capacity)`. Not
-//! here yet: `drain`, `retain`, `range`, `split_off`, `append`.
+//! side; this moves the back). `make_contiguous` rotates the whole buffer, `O(capacity)`. A
+//! drain's gap closes by moving the shorter side. Not here yet: `range`, `split_off`.
 
 use core::{
     alloc::Allocator,
@@ -11,9 +11,11 @@ use core::{
     fmt,
     hash::{Hash, Hasher},
     iter::FusedIterator,
+    marker::PhantomData,
     mem::{DropGuard, MaybeUninit, size_of},
     ops::{Index, IndexMut},
-    ptr, slice,
+    ptr::{self, NonNull},
+    slice,
 };
 
 #[cfg(test)]
@@ -283,6 +285,96 @@ impl<T, A: Allocator> VecDeque<T, A> {
         self.head = 0;
     }
 
+    /// The slots of the `n` values from index `from`, as the one or two runs they sit in.
+    fn runs(&self, from: usize, n: usize) -> (*mut [T], *mut [T]) {
+        let first = self.slot(from);
+        let to_end = self.buf.capacity() - first;
+        if n <= to_end {
+            (ptr::slice_from_raw_parts_mut(self.at(first), n), ptr::slice_from_raw_parts_mut(self.buf.ptr(), 0))
+        } else {
+            (
+                ptr::slice_from_raw_parts_mut(self.at(first), to_end),
+                ptr::slice_from_raw_parts_mut(self.buf.ptr(), n - to_end),
+            )
+        }
+    }
+
+    /// Moves the value at index `from` to index `to`, a bitwise move.
+    ///
+    /// # Safety
+    ///
+    /// Index `from` holds a value and index `to` is empty (or is `from`).
+    #[inline]
+    unsafe fn move_value(&mut self, from: usize, to: usize) {
+        if from != to {
+            // SAFETY: as the caller promises; distinct slots of one value each.
+            unsafe { ptr::copy_nonoverlapping(self.at(self.slot(from)), self.at(self.slot(to)), 1) };
+        }
+    }
+
+    pub fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
+        self.retain_mut(|value| keep(value));
+    }
+
+    /// Keeps the values `keep` says yes to, in order. A panic in `keep` or in a value's drop
+    /// keeps the values not yet seen; none is dropped twice.
+    pub fn retain_mut(&mut self, mut keep: impl FnMut(&mut T) -> bool) {
+        let len = self.len;
+        // Nothing counts as in the ring while it is compacted; the guard sets the length.
+        self.len = 0;
+        let mut at = DropGuard::new(Compact { ring: self, read: 0, write: 0, len }, Compact::finish);
+        while at.read < len {
+            let slot = at.ring.slot(at.read);
+            // SAFETY: index `read < len` holds a value not yet moved or dropped.
+            let value = unsafe { &mut *at.ring.at(slot) };
+            if !keep(&mut *value) {
+                // Counted as gone before its drop, so a panic there does not drop it again.
+                at.read += 1;
+                // SAFETY: the value is no longer counted by `Compact` and is dropped once.
+                unsafe { ptr::drop_in_place(value) };
+                continue;
+            }
+            let (read, write) = (at.read, at.write);
+            // SAFETY: `write <= read`; index `write` was emptied (moved down or dropped) or is
+            // `read`.
+            unsafe { at.ring.move_value(read, write) };
+            at.read += 1;
+            at.write += 1;
+        }
+    }
+
+    /// Takes the values in `range` out, front to back. The values after it close the gap when
+    /// the drain is dropped, by moving whichever side of the gap is shorter.
+    ///
+    /// # Panics
+    ///
+    /// When `range` is backwards or ends past the length.
+    #[track_caller]
+    pub fn drain<R: core::ops::RangeBounds<usize>>(&mut self, range: R) -> Drain<'_, T, A> {
+        let len = self.len;
+        let core::ops::Range { start, end } = crate::vec::range_of(&range, len, "VecDeque::drain");
+        // Only the values before the range count while the drain lives.
+        self.len = start;
+        Drain { ring: NonNull::from(self), start, front: start, back: end, end, len, _ring: PhantomData }
+    }
+
+    /// Moves every value of `other` to the back of this ring; `other` is left empty with its
+    /// capacity.
+    pub fn append<B: Allocator>(&mut self, other: &mut VecDeque<T, B>) {
+        let n = other.len;
+        self.reserve(n);
+        for i in 0..n {
+            let from = other.at(other.slot(i));
+            let to = self.at(self.slot(self.len + i));
+            // SAFETY: index `i` of `other` holds a value; index `len + i` of this ring is in its
+            // capacity (reserved) and empty; two buffers.
+            unsafe { ptr::copy_nonoverlapping(from, to, 1) };
+        }
+        self.len += n;
+        other.len = 0;
+        other.head = 0;
+    }
+
     /// Puts `value` at `index` from the front, moving the values after it back one.
     #[track_caller]
     pub fn insert(&mut self, index: usize, value: T) {
@@ -327,6 +419,140 @@ impl<T, A: Allocator> VecDeque<T, A> {
     pub fn iter_mut(&mut self) -> IterMut<'_, T> {
         let (front, back) = self.as_mut_slices();
         IterMut { front: front.iter_mut(), back: back.iter_mut() }
+    }
+}
+
+/// The state of a [`VecDeque::retain_mut`]: indices below `write` are kept, `write..read` are
+/// empty, `read..len` not yet seen.
+struct Compact<'a, T, A: Allocator> {
+    ring: &'a mut VecDeque<T, A>,
+    read: usize,
+    write: usize,
+    len: usize,
+}
+
+impl<T, A: Allocator> Compact<'_, T, A> {
+    /// Moves the values not yet seen down to the kept ones and sets the length: the end of a
+    /// compaction, or its unwinding.
+    fn finish(mut c: Compact<'_, T, A>) {
+        while c.read < c.len {
+            // SAFETY: `read` holds a value not yet seen; `write <= read` is empty or `read`.
+            unsafe { c.ring.move_value(c.read, c.write) };
+            c.read += 1;
+            c.write += 1;
+        }
+        c.ring.len = c.write;
+    }
+}
+
+/// The values of a range taken out of a ring ([`VecDeque::drain`]).
+///
+/// # Invariants
+///
+/// The ring's length is `start` and its head unchanged; indices `front..back` hold the values
+/// not yet given out, `end..len` the values after the range.
+pub struct Drain<'a, T, A: Allocator> {
+    ring: NonNull<VecDeque<T, A>>,
+    start: usize,
+    front: usize,
+    back: usize,
+    end: usize,
+    len: usize,
+    _ring: PhantomData<&'a mut VecDeque<T, A>>,
+}
+
+// SAFETY: a drain is a `&mut VecDeque` and the values it moves out, as `vec::Drain`.
+unsafe impl<T: Send, A: Allocator + Send> Send for Drain<'_, T, A> {}
+// SAFETY: a shared drain gives out nothing.
+unsafe impl<T: Sync, A: Allocator + Sync> Sync for Drain<'_, T, A> {}
+
+impl<T, A: Allocator> Drain<'_, T, A> {
+    fn ring(&self) -> &VecDeque<T, A> {
+        // SAFETY: the drain holds the ring's `&mut` for its lifetime.
+        unsafe { self.ring.as_ref() }
+    }
+
+    /// Closes the gap `start..end` by moving the shorter side, and counts the values again.
+    fn close(&mut self) {
+        let (start, end, len) = (self.start, self.end, self.len);
+        // SAFETY: the drain holds the ring's `&mut` for its lifetime.
+        let ring = unsafe { self.ring.as_mut() };
+        let (gap, tail) = (end - start, len - end);
+        if gap == 0 {
+            ring.len = len;
+            return;
+        }
+        if start < tail {
+            // The front part moves back by the gap, last first (the destinations are later).
+            for i in (0..start).rev() {
+                // SAFETY: index `i` holds a value; `i + gap` is in the gap or was emptied by the
+                // step before.
+                unsafe { ring.move_value(i, i + gap) };
+            }
+            ring.head = ring.slot(gap);
+        } else {
+            // The tail moves forward by the gap, first first.
+            for i in end..len {
+                // SAFETY: index `i` holds a value; `i - gap` is in the gap or was emptied.
+                unsafe { ring.move_value(i, i - gap) };
+            }
+        }
+        ring.len = start + tail;
+        if ring.len == 0 {
+            ring.head = 0;
+        }
+    }
+}
+
+impl<T, A: Allocator> Iterator for Drain<'_, T, A> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<T> {
+        if self.front == self.back {
+            return None;
+        }
+        let ring = self.ring();
+        // SAFETY: index `front < back` holds a value, read out once as `front` passes it.
+        let value = unsafe { ptr::read(ring.at(ring.slot(self.front))) };
+        self.front += 1;
+        Some(value)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let left = self.back - self.front;
+        (left, Some(left))
+    }
+}
+
+impl<T, A: Allocator> DoubleEndedIterator for Drain<'_, T, A> {
+    fn next_back(&mut self) -> Option<T> {
+        if self.front == self.back {
+            return None;
+        }
+        self.back -= 1;
+        let ring = self.ring();
+        // SAFETY: index `back` held the last value not given out, read out once.
+        Some(unsafe { ptr::read(ring.at(ring.slot(self.back))) })
+    }
+}
+
+impl<T, A: Allocator> ExactSizeIterator for Drain<'_, T, A> {}
+impl<T, A: Allocator> FusedIterator for Drain<'_, T, A> {}
+
+impl<T, A: Allocator> Drop for Drain<'_, T, A> {
+    fn drop(&mut self) {
+        let (first, second) = self.ring().runs(self.front, self.back - self.front);
+        self.front = self.back;
+        // The gap closes after the values left are dropped, a panic in one among the ways; the
+        // second run is dropped after the first, the same way.
+        let _close = DropGuard::new(self, |drain: &mut Drain<'_, T, A>| drain.close());
+        let _second = DropGuard::new(second, |run| {
+            // SAFETY: the run's slots hold values not given out, which nothing counts now;
+            // each dropped once.
+            unsafe { ptr::drop_in_place(run) };
+        });
+        // SAFETY: as above.
+        unsafe { ptr::drop_in_place(first) };
     }
 }
 

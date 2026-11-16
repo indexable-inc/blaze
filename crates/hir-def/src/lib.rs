@@ -43,34 +43,25 @@ pub mod resolver;
 pub mod span_names;
 pub mod upvars;
 
+// The facade over the new item layer (docs/v2/plan/design/reconnect.md): ids from item keys,
+// narrow def-map accessors and the resolver over per-module scope records.
+pub mod key;
 pub mod nameres;
-
-pub mod deps;
 
 pub mod src;
 
-pub mod find_path;
-pub mod import_map;
 pub mod kinds;
 pub mod test_items;
 pub mod visibility;
-
-#[cfg(test)]
-mod alloc_budgets;
-#[cfg(test)]
-mod macro_expansion_tests;
-#[cfg(test)]
-mod nameres_budgets;
-#[cfg(test)]
-mod test_db;
 
 use std::{
     alloc::Allocator,
     fmt,
     hash::{Hash, Hasher},
+    marker::PhantomData,
 };
 
-use base_db::{Crate, Db};
+use base_db::{Crate, Db, ItemKey};
 use hir_expand::{
     AstId, EditionedFileId, ExpandResult, ExpandTo, HirFileId, InFile, MacroCallId, MacroCallKind,
     MacroCallStyles, MacroDefId, MacroDefKind,
@@ -106,17 +97,34 @@ use crate::{
 };
 
 pub use crate::{
-    find_path::FindPathConfig, hir::type_ref, item_tree::file_item_tree,
-    lang_item::crate_notable_traits, signatures::LocalFieldId,
+    hir::type_ref, item_tree::file_item_tree, lang_item::crate_notable_traits,
+    signatures::LocalFieldId,
 };
 pub use hir_expand::{Intern, Lookup, tt};
 
 type FxIndexMap<K, V> = indexmap::IndexMap<K, V, blaze_hash::FixedState>;
 
-#[derive(Debug)]
+/// Where a module-level item is: the module it is declared in, and what it is, its item key
+/// (docs/v2/plan/design/reconnect.md, "Ids"). Interned from the key: two locations of one item
+/// are one id. The container is the record's parent, read once when the id is made
+/// ([`crate::key`]).
 pub struct ItemLoc<N: AstIdNode> {
     pub container: ModuleId,
-    pub id: AstId<N>,
+    pub key: ItemKey,
+    pub node: PhantomData<fn() -> N>,
+}
+
+impl<N: AstIdNode> ItemLoc<N> {
+    #[inline]
+    pub fn new(container: ModuleId, key: ItemKey) -> Self {
+        ItemLoc { container, key, node: PhantomData }
+    }
+}
+
+impl<N: AstIdNode> fmt::Debug for ItemLoc<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ItemLoc").field("container", &self.container).field("key", &self.key).finish()
+    }
 }
 
 impl<N: AstIdNode> Clone for ItemLoc<N> {
@@ -127,9 +135,10 @@ impl<N: AstIdNode> Clone for ItemLoc<N> {
 
 impl<N: AstIdNode> Copy for ItemLoc<N> {}
 
+/// The key decides: the container is a function of it.
 impl<N: AstIdNode> PartialEq for ItemLoc<N> {
     fn eq(&self, other: &Self) -> bool {
-        self.container == other.container && self.id == other.id
+        self.key == other.key
     }
 }
 
@@ -137,46 +146,17 @@ impl<N: AstIdNode> Eq for ItemLoc<N> {}
 
 impl<N: AstIdNode> Hash for ItemLoc<N> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let ItemLoc { container, id } = *self;
-        container.hash(state);
-        let word = hash_ast_id(id, state);
-        state.write_u64(word);
+        self.key.hash(state);
     }
 }
 
-/// Homed by its module: the `AstId`'s file is of the same crate, so it decides nothing.
+/// Homed by its module, whose crate the key is of.
 impl<N: AstIdNode> blaze_memo::Home for ItemLoc<N> {
     #[inline]
     fn home(&self, homes: &mut blaze_memo::Homes<'_>) {
         self.container.home(homes);
     }
 }
-
-/// Hashes the id of `id`'s file alone and returns the rest of `id` as the low 40 bits of a word
-/// (the file-local id, then the file's variant), for a loc to fill the high bits with its own
-/// small fields and hash the word once.
-#[inline]
-fn hash_ast_id<N, H: Hasher>(id: AstId<N>, state: &mut H) -> u64 {
-    let file: u64 = match id.file_id {
-        HirFileId::FileId(it) => {
-            it.hash(state);
-            0
-        }
-        HirFileId::MacroFile(it) => {
-            it.hash(state);
-            1
-        }
-    };
-    u64::from(id.value.erase().into_raw()) | file << 32
-}
-
-// An `AstId` is 16 bytes: the file 12 (a tag word and an 8-byte `Gid`), the file-local id 4.
-const _: () = assert!(size_of::<AstId<ast::Struct>>() == 16);
-
-// 24 bytes per item (module 8, `AstId` 16), no padding; hashed in 3 writes (module, file,
-// file-local id with the file's variant).
-const _: () = assert!(size_of::<ItemLoc<ast::Struct>>() == 24);
-const _: () = assert!(align_of::<ItemLoc<ast::Struct>>() == 4);
 
 impl<N: AstIdNode> HasModule for ItemLoc<N> {
     #[inline]
@@ -185,10 +165,28 @@ impl<N: AstIdNode> HasModule for ItemLoc<N> {
     }
 }
 
-#[derive(Debug)]
+/// Where an item that may sit in a trait, an impl or an extern block is: its container and its
+/// item key, as [`ItemLoc`].
 pub struct AssocItemLoc<N: AstIdNode> {
     pub container: ItemContainerId,
-    pub id: AstId<N>,
+    pub key: ItemKey,
+    pub node: PhantomData<fn() -> N>,
+}
+
+impl<N: AstIdNode> AssocItemLoc<N> {
+    #[inline]
+    pub fn new(container: ItemContainerId, key: ItemKey) -> Self {
+        AssocItemLoc { container, key, node: PhantomData }
+    }
+}
+
+impl<N: AstIdNode> fmt::Debug for AssocItemLoc<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AssocItemLoc")
+            .field("container", &self.container)
+            .field("key", &self.key)
+            .finish()
+    }
 }
 
 impl<N: AstIdNode> Clone for AssocItemLoc<N> {
@@ -201,7 +199,7 @@ impl<N: AstIdNode> Copy for AssocItemLoc<N> {}
 
 impl<N: AstIdNode> PartialEq for AssocItemLoc<N> {
     fn eq(&self, other: &Self) -> bool {
-        self.container == other.container && self.id == other.id
+        self.key == other.key
     }
 }
 
@@ -209,10 +207,7 @@ impl<N: AstIdNode> Eq for AssocItemLoc<N> {}
 
 impl<N: AstIdNode> Hash for AssocItemLoc<N> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let AssocItemLoc { container, id } = *self;
-        let container = container.hash_id(state);
-        let word = hash_ast_id(id, state);
-        state.write_u64(word | u64::from(container) << 40);
+        self.key.hash(state);
     }
 }
 
@@ -224,11 +219,6 @@ impl<N: AstIdNode> blaze_memo::Home for AssocItemLoc<N> {
     }
 }
 
-// 28 bytes per item (container 12: a tag word and an 8-byte id, `AstId` 16); hashed in 3
-// writes (container, file, file-local id with both variants).
-const _: () = assert!(size_of::<AssocItemLoc<ast::Fn>>() == 28);
-const _: () = assert!(align_of::<AssocItemLoc<ast::Fn>>() == 4);
-
 impl<N: AstIdNode> HasModule for AssocItemLoc<N> {
     #[inline]
     fn module(&self, db: &Db) -> ModuleId {
@@ -236,19 +226,25 @@ impl<N: AstIdNode> HasModule for AssocItemLoc<N> {
     }
 }
 
+/// A location whose item has syntax: its node's [`AstId`] is found from its key, for the crate
+/// whose text the task holds ([`crate::key::ast_id_of`]); for any other crate the read stops the
+/// task with a [`base_db::Need`] (its text is never read).
 pub trait AstIdLoc {
     type Container;
-    type Ast: AstNode;
-    fn ast_id(&self) -> AstId<Self::Ast>;
+    type Ast: AstIdNode;
+    fn key(&self) -> ItemKey;
     fn container(&self) -> Self::Container;
+    fn ast_id(&self, db: &Db) -> AstId<Self::Ast> {
+        key::ast_id_of::<Self::Ast>(db, self.key())
+    }
 }
 
 impl<N: AstIdNode> AstIdLoc for ItemLoc<N> {
     type Container = ModuleId;
     type Ast = N;
     #[inline]
-    fn ast_id(&self) -> AstId<Self::Ast> {
-        self.id
+    fn key(&self) -> ItemKey {
+        self.key
     }
     #[inline]
     fn container(&self) -> Self::Container {
@@ -260,8 +256,8 @@ impl<N: AstIdNode> AstIdLoc for AssocItemLoc<N> {
     type Container = ItemContainerId;
     type Ast = N;
     #[inline]
-    fn ast_id(&self) -> AstId<Self::Ast> {
-        self.id
+    fn key(&self) -> ItemKey {
+        self.key
     }
     #[inline]
     fn container(&self) -> Self::Container {
@@ -301,7 +297,7 @@ macro_rules! impl_loc {
         impl AstIdLoc for $loc {
             type Container = $container_type;
             type Ast = ast::$id_ty;
-            fn ast_id(&self) -> AstId<Self::Ast> {
+            fn key(&self) -> ItemKey {
                 self.$id
             }
             fn container(&self) -> Self::Container {
@@ -448,23 +444,20 @@ impl ExternBlockId {
 
 #[derive(Debug, Clone, PartialEq, Eq, blaze_memo::Home)]
 pub struct EnumVariantLoc {
-    /// Of the enum's crate: homed by `parent`.
+    /// The variant's item key, of the enum's crate: homed by `parent`.
     #[home(skip)]
-    pub id: AstId<ast::Variant>,
+    pub key: ItemKey,
     pub parent: EnumId,
     #[home(skip)]
     pub name: Name,
 }
 impl_intern!(EnumVariantId, EnumVariantLoc);
-impl_loc!(EnumVariantLoc, id: Variant, parent: EnumId);
+impl_loc!(EnumVariantLoc, key: Variant, parent: EnumId);
 
+/// The key decides, as [`ItemLoc`]'s.
 impl Hash for EnumVariantLoc {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let EnumVariantLoc { id, parent, name } = self;
-        let word = hash_ast_id(*id, state);
-        state.write_u64(word);
-        parent.hash(state);
-        name.hash(state);
+        self.key.hash(state);
     }
 }
 
@@ -502,7 +495,7 @@ impl EnumVariantId {
 pub struct Macro2Loc {
     pub container: ModuleId,
     #[home(skip)]
-    pub id: AstId<ast::MacroDef>,
+    pub key: ItemKey,
     #[home(skip)]
     pub expander: MacroExpander,
     pub allow_internal_unsafe: bool,
@@ -510,29 +503,20 @@ pub struct Macro2Loc {
     pub edition: Edition,
 }
 impl_intern!(Macro2Id, Macro2Loc);
-impl_loc!(Macro2Loc, id: MacroDef, container: ModuleId);
+impl_loc!(Macro2Loc, key: MacroDef, container: ModuleId);
 
+/// The key decides: the rest is read from the macro's record by it.
 impl Hash for Macro2Loc {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let Macro2Loc { container, id, expander, allow_internal_unsafe, edition } = *self;
-        container.hash(state);
-        let word = hash_ast_id(id, state);
-        state.write_u64(
-            word | u64::from(expander.hash_word()) << 40
-                | (u64::from(allow_internal_unsafe) | u64::from(edition as u8) << 1) << 56,
-        );
+        self.key.hash(state);
     }
 }
-
-// 28 bytes per macro (module 8, `AstId` 16, expander 2, flag 1, edition 1), no padding; hashed
-// in 3 writes.
-const _: () = assert!(size_of::<Macro2Loc>() == 28);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, blaze_memo::Home)]
 pub struct MacroRulesLoc {
     pub container: ModuleId,
     #[home(skip)]
-    pub id: AstId<ast::MacroRules>,
+    pub key: ItemKey,
     #[home(skip)]
     pub expander: MacroExpander,
     #[home(skip)]
@@ -541,23 +525,14 @@ pub struct MacroRulesLoc {
     pub edition: Edition,
 }
 impl_intern!(MacroRulesId, MacroRulesLoc);
-impl_loc!(MacroRulesLoc, id: MacroRules, container: ModuleId);
+impl_loc!(MacroRulesLoc, key: MacroRules, container: ModuleId);
 
+/// The key decides, as [`Macro2Loc`]'s.
 impl Hash for MacroRulesLoc {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let MacroRulesLoc { container, id, expander, flags, edition } = *self;
-        container.hash(state);
-        let word = hash_ast_id(id, state);
-        state.write_u64(
-            word | u64::from(expander.hash_word()) << 40
-                | (u64::from(flags.bits()) | u64::from(edition as u8) << 3) << 56,
-        );
+        self.key.hash(state);
     }
 }
-
-// 28 bytes per macro (module 8, `AstId` 16, expander 2, flags 1, edition 1), no padding; hashed
-// in 3 writes.
-const _: () = assert!(size_of::<MacroRulesLoc>() == 28);
 
 bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -601,7 +576,7 @@ impl MacroExpander {
 pub struct ProcMacroLoc {
     pub container: ModuleId,
     #[home(skip)]
-    pub id: AstId<ast::Fn>,
+    pub key: ItemKey,
     #[home(skip)]
     pub expander: CustomProcMacroExpander,
     #[home(skip)]
@@ -610,21 +585,16 @@ pub struct ProcMacroLoc {
     pub edition: Edition,
 }
 impl_intern!(ProcMacroId, ProcMacroLoc);
-impl_loc!(ProcMacroLoc, id: Fn, container: ModuleId);
+impl_loc!(ProcMacroLoc, key: Fn, container: ModuleId);
 
+/// The key and the expander decide: one function is one macro, and its expander is the code
+/// the driver gave.
 impl Hash for ProcMacroLoc {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        let ProcMacroLoc { container, id, expander, kind, edition } = *self;
-        container.hash(state);
-        let word = hash_ast_id(id, state);
-        expander.hash(state);
-        state.write_u64(word | u64::from(kind as u8) << 40 | u64::from(edition as u8) << 48);
+        self.key.hash(state);
+        self.expander.hash(state);
     }
 }
-
-// 32 bytes per proc macro (module 8, `AstId` 16, expander 4, kind 1, edition 1, 2 of padding);
-// hashed in 4 writes (module, file, expander, the rest in one word).
-const _: () = assert!(size_of::<ProcMacroLoc>() == 32);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, blaze_memo::Home)]
 pub enum LoweringMode {
@@ -731,6 +701,10 @@ pub struct ModuleIdLt<'db> {
     /// The name of this module, or [`sym::__empty`] for the root module.
     #[returns(clone)]
     name_or_empty: Name,
+    /// The module's item key (its crate root's for the root module); `None` for a block's
+    /// module, which is no item and is found by its block.
+    #[returns(copy)]
+    pub key: Option<ItemKey>,
 }
 pub type ModuleId = ModuleIdLt<'static>;
 

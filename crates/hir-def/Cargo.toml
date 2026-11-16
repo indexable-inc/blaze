@@ -17,6 +17,8 @@ doctest = false
 
 [dependencies]
 blaze-core.workspace = true
+blaze-id.workspace = true
+blaze-surface.workspace = true
 arrayvec.workspace = true
 bitflags.workspace = true
 blaze-hash.workspace = true

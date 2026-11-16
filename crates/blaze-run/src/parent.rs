@@ -588,7 +588,7 @@ impl<A: AllocatorClone> Parent<A> {
                     Some(optimized) => (Tier::Optimized, optimized.code),
                     None => (Tier::Fast, found.fast),
                 };
-                self.ready(version, tier, code, found.callees, out);
+                self.has_code(version, tier, code, found.callees, out);
             }
             None => {
                 self.set(version, State::Queued { priority, deadline: None });
@@ -624,7 +624,7 @@ impl<A: AllocatorClone> Parent<A> {
         match ended {
             // A late success still serves every later caller; the early ones were failed.
             Compiled::Record(record) => {
-                self.ready(version, Tier::Fast, record.code, &record.callees, out);
+                self.has_code(version, Tier::Fast, record.code, &record.callees, out);
             }
             Compiled::Need(_) | Compiled::Failed(_) if late => {}
             Compiled::Need(keys) => {
@@ -710,7 +710,7 @@ impl<A: AllocatorClone> Parent<A> {
 
     /// `version` has code: kept, shown if it is what its slot is to run, its askers answered,
     /// its callees wanted.
-    fn ready(&mut self, version: Version, tier: Tier, code: CodeRef, callees: &[SlotId], out: &mut Vec<Effect, A>) {
+    fn has_code(&mut self, version: Version, tier: Tier, code: CodeRef, callees: &[SlotId], out: &mut Vec<Effect, A>) {
         self.set(version, State::Ready { tier, code });
         let function = self.functions[version.slot.index()].instance;
         out.push(Effect::Say(match tier {

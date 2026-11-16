@@ -1064,10 +1064,17 @@ fn cow_owns_only_when_it_must() -> Result<(), Broke> {
         if alloc.allocs() != 0 || &*cow != [1, 2, 3].as_slice() {
             return Err(Broke::Oracle(String::from("a borrowed Cow allocated or changed")));
         }
-        cow.to_mut(&alloc).push(4);
-        if !cow.is_owned() || &*cow != [1, 2, 3, 4].as_slice() || alloc.allocs() != 1 {
+        // The first `to_mut` copies into one block (exactly the three values, so a push would
+        // grow it: the count is read before any push).
+        let first = cow.to_mut(&alloc).as_ptr();
+        if !cow.is_owned() || &*cow != [1, 2, 3].as_slice() || alloc.allocs() != 1 {
             return Err(Broke::Oracle(String::from("to_mut did not own once")));
         }
+        // A second `to_mut` of an owned value copies nothing.
+        if cow.to_mut(&alloc).as_ptr() != first || alloc.allocs() != 1 {
+            return Err(Broke::Oracle(String::from("to_mut owned a second time")));
+        }
+        cow.to_mut(&alloc).push(4);
         cow.to_mut(&alloc).push(5);
         let owned = cow.into_owned(&alloc);
         same("into_owned", owned.iter(), [1, 2, 3, 4, 5].iter())?;

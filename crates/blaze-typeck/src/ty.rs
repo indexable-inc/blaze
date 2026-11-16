@@ -1,0 +1,207 @@
+//! What the driver asks of the type tables and the trait solver (typeck.md, "`TypeCtx`"). These
+//! are the minimal traits until `crates/blaze-ty` exists; each item names what it becomes there.
+//! The tests implement them over a toy type language (`crate::toy`).
+
+use core::alloc::Allocator;
+
+use crate::error::{CheckError, Stop};
+use crate::ids::{ExprId, FloatTy, IntTy, ItemKey, Mutbl, Name, PatId, UintTy};
+use crate::world::{Reads, World};
+
+/// A type: a 4-byte handle into the context's tables. Becomes blaze-ty's `Ty`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Ty(pub u32);
+
+/// An interned list of types (generic arguments, tuple elements, fn inputs). Becomes blaze-ty's
+/// `GenericArgs`; regions are erased in typeck as rustc's typeck sees them, and const arguments
+/// are not yet carried (array lengths are values in `TyView::Array`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct TyList(pub u32);
+
+/// What kind of inference variable.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum VarKind {
+    /// Any type.
+    Ty,
+    /// An integer type (from an unsuffixed integer literal).
+    Int,
+    /// A float type (from an unsuffixed float literal).
+    Float,
+}
+
+/// An inference variable: its kind and its index in the context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Var {
+    pub kind: VarKind,
+    pub index: u32,
+}
+
+/// One level of a type, its children by handle. Becomes `rustc_type_ir::TyKind` through
+/// blaze-ty's interner.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TyView {
+    Bool,
+    Char,
+    Int(IntTy),
+    Uint(UintTy),
+    Float(FloatTy),
+    Str,
+    Never,
+    Tuple(TyList),
+    Ref(Mutbl, Ty),
+    Ptr(Mutbl, Ty),
+    Array(Ty, u64),
+    Slice(Ty),
+    Adt(ItemKey, TyList),
+    FnDef(ItemKey, TyList),
+    /// Inputs, then the output last.
+    FnPtr(TyList),
+    /// A closure of this body and its signature (a `FnPtr`).
+    Closure(ExprId, Ty),
+    Param(u32),
+    /// `<args[0] as trait_<args[1..]>>::name`, not yet normalized.
+    Alias { trait_: ItemKey, name: Name, args: TyList },
+    Opaque(ItemKey, TyList),
+    Infer(Var),
+    Error,
+}
+
+/// What an obligation asks. `args[0]` is the self type.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Goal {
+    /// `args[0]: trait_<args[1..]>`.
+    Trait { trait_: ItemKey, args: TyList },
+    /// `<args[0] as trait_<args[1..]>>::name == term`.
+    Projection { trait_: ItemKey, args: TyList, name: Name, term: Ty },
+    /// `ty` is well formed.
+    WellFormed(Ty),
+}
+
+/// Where an obligation came from, for its error.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Cause {
+    Expr(ExprId),
+    Pat(PatId),
+    Body,
+}
+
+/// A goal and its cause.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Obligation {
+    pub goal: Goal,
+    pub cause: Cause,
+}
+
+/// How an obligation failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FulfillErrorKind {
+    /// No impl or bound can hold it.
+    Unsatisfied,
+    /// Still ambiguous at `select_all`: "type annotations needed".
+    Ambiguous,
+    /// A projection's normalized type does not equal its term.
+    Mismatch,
+}
+
+/// An obligation that failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FulfillError {
+    pub obligation: Obligation,
+    pub kind: FulfillErrorKind,
+}
+
+/// The type tables, the inference table and the solver, as the driver uses them. Becomes the
+/// type context of blaze-ty over `rustc_type_ir::Interner` and the next solver's
+/// `FulfillmentCtxt`.
+pub trait TypeCtx {
+    /// A snapshot of the inference table and the pending obligations
+    /// (`InferCtxt::start_snapshot`).
+    type Snapshot;
+
+    /// The interned type of `v`.
+    fn mk(&mut self, v: TyView) -> Result<Ty, CheckError>;
+    /// One level of `t`, unresolved: a variable is `Infer` even when bound (see
+    /// `shallow_resolve`).
+    fn view(&self, t: Ty) -> TyView;
+    /// The interned list of `tys`.
+    fn mk_list(&mut self, tys: &[Ty]) -> Result<TyList, CheckError>;
+    /// The length of `l`.
+    fn list_len(&self, l: TyList) -> u32;
+    /// The `i`th type of `l`; `i < list_len(l)`.
+    fn list_get(&self, l: TyList, i: u32) -> Ty;
+
+    /// A new variable of `kind`.
+    fn fresh(&mut self, kind: VarKind) -> Result<Ty, CheckError>;
+    /// `t`, with a bound variable at its top replaced by its value, repeatedly.
+    fn shallow_resolve(&mut self, t: Ty) -> Ty;
+    /// `t` with every bound variable inside it replaced by its value. Unbound ones stay.
+    fn resolve(&mut self, t: Ty) -> Result<Ty, CheckError>;
+    /// Makes `a` and `b` equal, binding variables. `Ok(false)`: they cannot be, and nothing was
+    /// bound (the context rolls back its own partial work).
+    fn unify(&mut self, a: Ty, b: Ty) -> Result<bool, CheckError>;
+
+    /// Starts a snapshot.
+    fn snapshot(&mut self) -> Self::Snapshot;
+    /// Undoes everything since `s`, obligations registered included.
+    fn rollback_to(&mut self, s: Self::Snapshot);
+    /// Keeps everything since `s`.
+    fn commit(&mut self, s: Self::Snapshot);
+
+    /// Adds a where-clause of the body's item to the param env.
+    fn assume(&mut self, clause: Goal) -> Result<(), CheckError>;
+    /// Registers an obligation to be proved.
+    fn register(&mut self, ob: Obligation) -> Result<(), CheckError>;
+    /// Proves what can be proved now; failures go to `next_error`, ambiguous ones stay.
+    fn select_where_possible<W: World, A: Allocator + Clone>(
+        &mut self,
+        reads: &mut Reads<'_, W, A>,
+    ) -> Result<(), Stop>;
+    /// As `select_where_possible`, then every obligation left is an `Ambiguous` error.
+    fn select_all<W: World, A: Allocator + Clone>(
+        &mut self,
+        reads: &mut Reads<'_, W, A>,
+    ) -> Result<(), Stop>;
+    /// The next failed obligation, in the order they failed.
+    fn next_error(&mut self) -> Option<FulfillError>;
+    /// Whether `goal` may hold, evaluated in a probe (`predicate_may_hold`): nothing is bound.
+    fn may_hold<W: World, A: Allocator + Clone>(
+        &mut self,
+        goal: Goal,
+        reads: &mut Reads<'_, W, A>,
+    ) -> Result<bool, Stop>;
+    /// `<args[0] as trait_<args[1..]>>::name` normalized now, if one impl or bound selects it;
+    /// `None` when ambiguous or unsatisfied. Binds what the selection binds.
+    fn normalize<W: World, A: Allocator + Clone>(
+        &mut self,
+        trait_: ItemKey,
+        args: TyList,
+        name: Name,
+        reads: &mut Reads<'_, W, A>,
+    ) -> Result<Option<Ty>, Stop>;
+}
+
+/// Runs `f` in a snapshot that is always rolled back, whichever way `f` returns
+/// (`InferCtxt::probe`). The rollback is a `DropGuard`, so a `?` inside rolls back too.
+pub(crate) fn probe<C: TypeCtx, R>(ty: &mut C, f: impl FnOnce(&mut C) -> R) -> R {
+    let snap = ty.snapshot();
+    let mut guard = core::mem::DropGuard::new((ty, snap), |(ty, snap)| C::rollback_to(ty, snap));
+    f(&mut *guard.0)
+}
+
+/// Runs `f` in a snapshot kept when it returns `Ok(Some(_))` and rolled back otherwise
+/// (`InferCtxt::commit_if_ok`).
+pub(crate) fn commit_if<C: TypeCtx, T, E>(
+    ty: &mut C,
+    f: impl FnOnce(&mut C) -> Result<Option<T>, E>,
+) -> Result<Option<T>, E> {
+    let snap = ty.snapshot();
+    let mut guard = core::mem::DropGuard::new((ty, snap), |(ty, snap)| C::rollback_to(ty, snap));
+    match f(&mut *guard.0) {
+        Ok(Some(v)) => {
+            let (ty, snap) = core::mem::DropGuard::dismiss(guard);
+            ty.commit(snap);
+            Ok(Some(v))
+        }
+        other => other,
+    }
+}

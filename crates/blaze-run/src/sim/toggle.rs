@@ -16,6 +16,7 @@ use super::key;
 use super::oracle;
 use super::parent::functions;
 use crate::parent::{Compiled, Config as ParentConfig, Effect, FastRecord, Found, Parent};
+use crate::viewer;
 use crate::{CodeRef, Hooks, Nanos, Plant, SlotId, ThreadId, Version};
 
 const FUNCTIONS: u32 = 3;
@@ -135,6 +136,39 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
 #[test]
 fn a_toggle_changes_what_runs_never_what_it_computes() {
     check(Config::cases(500), |tape| run(tape, Plant::None));
+}
+
+/// The viewer's toggle reads back as written, and a request in any other form of the same
+/// value (a longer head) is refused: one encoding a value.
+#[test]
+fn a_toggle_request_reads_back_and_only_its_shortest_form_does() {
+    check(Config::cases(300), |tape| {
+        let hooks = Hooks(tape.next_u32("hooks") as u16);
+        let on = tape.coin("on");
+        let slots: Vec<SlotId> = (0..tape.below(6, "slots")).map(|_| SlotId(tape.next_u32("slot"))).collect();
+        let mut bytes = Vec::new_in(Global);
+        viewer::toggle(&slots, hooks, on, &mut bytes);
+        let mut back = Vec::new_in(Global);
+        let read = viewer::read(&bytes, 8, &mut back);
+        oracle(read == Ok(viewer::Request::Toggle { hooks, on }) && back.as_slice() == slots.as_slice(), || {
+            format!("{slots:?} {hooks:?} {on} read back as {read:?} {back:?}")
+        })?;
+        // The version, 1, as a one-byte head (0x18 0x01): the same value, not the shortest form.
+        let mut longer = Vec::new_in(Global);
+        longer.push(bytes[0]);
+        longer.extend_from_slice(&[0x18, 0x01]);
+        longer.extend_from_slice(&bytes[2..]);
+        let mut ignored = Vec::new_in(Global);
+        let refused = viewer::read(&longer, 8, &mut ignored);
+        oracle(refused == Err(viewer::Bad::NotDeterministic { at: 1 }), || {
+            format!("a longer head was read as {refused:?}")
+        })?;
+        let mut few = Vec::new_in(Global);
+        let capped = viewer::read(&bytes, 0, &mut few);
+        oracle(slots.is_empty() || matches!(capped, Err(viewer::Bad::TooMany { .. })), || {
+            format!("the slot cap was not kept: {capped:?}")
+        })
+    });
 }
 
 #[test]

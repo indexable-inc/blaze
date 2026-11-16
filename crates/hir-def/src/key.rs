@@ -1,0 +1,240 @@
+//! Ids from item keys and back (docs/v2/plan/design/reconnect.md, "Ids";
+//! docs/v2/plan/design/identity.md).
+//!
+//! Every id of an item is interned from its [`ItemKey`] and the container its record names
+//! (`Items::parent`), read once when the id is made. The one pair of functions between the two
+//! forms is blaze-id's: [`blaze_id::KeyOf`] and [`blaze_id::Resolve`], implemented here for
+//! `Db` and every id type (the ids are this crate's, so the orphan rule allows it).
+//!
+//! Every read here is of a record; one the task lacks stops the task with a [`base_db::Need`]
+//! naming its key ([`OrNeed`]).
+
+use base_db::{Crate, Db, ItemKey, OrNeed, SurfaceError};
+use blaze_id::{CrateItemKey, KeyOf, NoItem, Resolve};
+use blaze_surface::{ItemKind, Items, Place};
+use hir_expand::{AstId, HirFileId, name::Name};
+use intern::sym;
+use span::AstIdNode;
+use syntax::{AstNode, AstPtr, TextRange, TextSize};
+
+use crate::{
+    AssocItemLoc, ConstId, EnumId, EnumVariantId, EnumVariantLoc, ExternCrateId, FunctionId,
+    ImplId, Intern, ItemContainerId, ItemLoc, Lookup, ModuleId, ModuleIdLt, StaticId, StructId,
+    TraitId, TypeAliasId, UnionId, UseId,
+};
+
+/// The crate an item key is of, which the task holds; one it does not is a stop naming the
+/// item (a key carries only its crate's prefix, so the item is what the stop can name: the
+/// crate graph record that lists its crate is the one missing).
+pub fn crate_of(db: &Db, key: ItemKey) -> Crate {
+    match db.crate_of_item(key) {
+        Some(krate) => krate,
+        None => Err(SurfaceError::NoRecord { fact: "CrateGraph", item: key }).or_need(),
+    }
+}
+
+/// The module of a module's item key: its crate, its parent module and its name, each read
+/// from the records once.
+pub fn module_of_key(db: &Db, key: ItemKey) -> ModuleId {
+    let krate = crate_of(db, key);
+    let items = db.items();
+    let parent = items.parent(key).or_need();
+    let (parent, name) = match parent {
+        None => (None, Name::new_symbol_root(sym::__empty)),
+        Some(parent) => (Some(module_of_key(db, parent)), item_name(db, key)),
+    };
+    ModuleIdLt::new(db, krate, None, parent, name, Some(key))
+}
+
+/// The root module of a crate: the module whose key the crate's `CrateRoot` record names.
+pub fn crate_root_module(db: &Db, krate: Crate) -> ModuleId {
+    let root = db.items().crate_root(krate.key(db)).or_need();
+    module_of_key(db, root.head().root_module)
+}
+
+/// An item's name, as its file's items record holds it.
+pub fn item_name(db: &Db, key: ItemKey) -> Name {
+    let items = db.items();
+    match items.place(key).or_need() {
+        Place::File { file, index } => {
+            let view = items.file_items(file).or_need();
+            let Some(item) = view.item(index) else {
+                panic!("item {key:x}: its key index names row {} of a file with fewer", index.0)
+            };
+            Name::new_symbol_root(intern::Symbol::intern(item.name))
+        }
+        Place::Expansion { .. } => {
+            Err(SurfaceError::NotBuilt(blaze_surface::NotBuilt { method: "item_name of an expansion's item", item: key }))
+                .or_need()
+        }
+    }
+}
+
+/// The container of an associated item or a module-level one, from its record's parent.
+pub fn container_of(db: &Db, key: ItemKey) -> ItemContainerId {
+    let items = db.items();
+    let Some(parent) = items.parent(key).or_need() else {
+        panic!("item {key:x} has no parent: only a crate root module is so, and it is no member")
+    };
+    match items.kind(parent).or_need() {
+        ItemKind::Trait => ItemContainerId::TraitId(TraitId::of_key(db, parent)),
+        ItemKind::Impl => ItemContainerId::ImplId(ImplId::of_key(db, parent)),
+        ItemKind::Module => ItemContainerId::ModuleId(module_of_key(db, parent)),
+        other => panic!(
+            "item {key:x} is inside a {}: a record names no such container",
+            other.name()
+        ),
+    }
+}
+
+/// The module an item is declared in: its container's module.
+fn module_container_of(db: &Db, key: ItemKey) -> ModuleId {
+    let Some(parent) = db.items().parent(key).or_need() else {
+        panic!("item {key:x} has no parent: only a crate root module is so")
+    };
+    module_of_key(db, parent)
+}
+
+/// An id made from an item key, and the key it is made from.
+pub trait FromKey: Sized + Copy {
+    const KIND: ItemKind;
+    fn of_key(db: &Db, key: ItemKey) -> Self;
+    fn key(self, db: &Db) -> ItemKey;
+}
+
+macro_rules! module_item {
+    ($($id:ident => $kind:ident),* $(,)?) => {$(
+        impl FromKey for $id {
+            const KIND: ItemKind = ItemKind::$kind;
+            fn of_key(db: &Db, key: ItemKey) -> Self {
+                ItemLoc::new(module_container_of(db, key), key).intern(db)
+            }
+            fn key(self, db: &Db) -> ItemKey {
+                self.lookup(db).key
+            }
+        }
+    )*};
+}
+
+macro_rules! assoc_item {
+    ($($id:ident => $kind:ident),* $(,)?) => {$(
+        impl FromKey for $id {
+            const KIND: ItemKind = ItemKind::$kind;
+            fn of_key(db: &Db, key: ItemKey) -> Self {
+                AssocItemLoc::new(container_of(db, key), key).intern(db)
+            }
+            fn key(self, db: &Db) -> ItemKey {
+                self.lookup(db).key
+            }
+        }
+    )*};
+}
+
+module_item!(
+    StructId => Struct, UnionId => Union, EnumId => Enum, TraitId => Trait, ImplId => Impl,
+    UseId => Use, ExternCrateId => ExternCrate,
+);
+assoc_item!(FunctionId => Function, ConstId => Const, StaticId => Static, TypeAliasId => TypeAlias);
+
+impl FromKey for EnumVariantId {
+    const KIND: ItemKind = ItemKind::Variant;
+    fn of_key(db: &Db, key: ItemKey) -> Self {
+        let Some(parent) = db.items().parent(key).or_need() else {
+            panic!("variant {key:x} has no enum")
+        };
+        let loc = EnumVariantLoc { key, parent: EnumId::of_key(db, parent), name: item_name(db, key) };
+        loc.intern(db)
+    }
+    fn key(self, db: &Db) -> ItemKey {
+        self.lookup(db).key
+    }
+}
+
+impl FromKey for ModuleId {
+    const KIND: ItemKind = ItemKind::Module;
+    fn of_key(db: &Db, key: ItemKey) -> Self {
+        module_of_key(db, key)
+    }
+    fn key(self, db: &Db) -> ItemKey {
+        match ModuleIdLt::key(self, db) {
+            Some(key) => key,
+            None => panic!("a block's module is no item and has no key"),
+        }
+    }
+}
+
+macro_rules! key_of_and_resolve {
+    ($($id:ty),* $(,)?) => {$(
+        impl KeyOf<$id> for Db {
+            fn key_of(&self, id: $id) -> ItemKey {
+                FromKey::key(id, self)
+            }
+        }
+
+        impl Resolve<$id> for Db {
+            /// The id of the item `key` names in `krate`: its kind is checked against the id's,
+            /// and a key of another kind is no item of this type.
+            fn resolve(&self, krate: CrateItemKey, key: ItemKey) -> Result<$id, NoItem> {
+                let no_item = NoItem { krate, key };
+                if !key.is_of(krate) {
+                    return Err(no_item);
+                }
+                match self.items().kind(key) {
+                    Ok(kind) if kind == <$id as FromKey>::KIND => Ok(<$id as FromKey>::of_key(self, key)),
+                    Ok(_) | Err(SurfaceError::NoItem(_)) => Err(no_item),
+                    Err(other) => Err(other).or_need(),
+                }
+            }
+        }
+    )*};
+}
+
+key_of_and_resolve!(
+    FunctionId, StructId, UnionId, EnumId, EnumVariantId, ConstId, StaticId, TraitId,
+    TypeAliasId, ImplId, UseId, ExternCrateId, ModuleId,
+);
+
+/// The [`AstId`] of an item's node: found by the item's range in its file's items record, in
+/// the parse of that file. Only the crate whose text the task holds has syntax; asking it of
+/// another crate's item is a typed stop (`NotBuilt`), never a read of that crate's text.
+pub fn ast_id_of<N: AstIdNode>(db: &Db, key: ItemKey) -> AstId<N> {
+    let not_built = |method| {
+        Err::<AstId<N>, _>(SurfaceError::NotBuilt(blaze_surface::NotBuilt { method, item: key })).or_need()
+    };
+    let krate = crate_of(db, key);
+    if db.source_of(krate.key(db)).is_none() {
+        return not_built("ast_id_of an item of a crate without text");
+    }
+    let items = db.items();
+    let (file, index) = match items.place(key).or_need() {
+        Place::File { file, index } => (file, index),
+        Place::Expansion { .. } => return not_built("ast_id_of an expansion's item"),
+    };
+    let view = items.file_items(file).or_need();
+    let Some(item) = view.item(index) else {
+        panic!("item {key:x}: its key index names row {} of a file with fewer", index.0)
+    };
+    let Some(file_id) = db.file_id(file) else {
+        panic!("item {key:x}: its file {file:x} is not of the task's file table")
+    };
+    let file_id = base_db::EditionedFileId::new_with_extensions(
+        db,
+        file_id,
+        krate.data(db).edition,
+        krate.extensions(db),
+    );
+    let range = TextRange::at(TextSize::new(item.at), TextSize::new(item.len));
+    let tree = file_id.parse(db).tree();
+    let node = tree
+        .syntax()
+        .covering_element(range)
+        .ancestors()
+        .filter_map(N::cast)
+        .find(|node| node.syntax().text_range() == range);
+    let Some(node) = node else {
+        panic!("item {key:x}: no {} node covers {range:?} of its file", std::any::type_name::<N>())
+    };
+    let hir_file = HirFileId::from(file_id);
+    let id = hir_file.ast_id_map(db).ast_id_for_ptr(AstPtr::new(&node));
+    AstId::new(hir_file, id)
+}

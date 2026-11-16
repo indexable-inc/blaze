@@ -395,6 +395,13 @@ fn assert_panics_with_its_condition_or_its_message() {
 }
 
 #[test]
+fn a_text_that_is_one_group_keeps_its_delimiters() {
+    assert_eq!(show(&tokens("[[1]]")), "[ [ 1 ] ]");
+    assert_eq!(show(&tokens("(a)")), "( a )");
+    assert_eq!(tokens("{ x }").len(), 3);
+}
+
+#[test]
 fn concat_bytes_joins_bytes_and_arrays() {
     let cx = TestCx::new();
     let exp = call_fn(&builtin(BuiltinFn::ConcatBytes), "b\"ab\", b'c', [1, 2u8], [b'z'; 2]", &cx);
@@ -574,8 +581,11 @@ fn concat_reads_escapes() {
     let cx = TestCx::new();
     let exp = call_fn(&builtin(BuiltinFn::Concat), "\"a\\u{4_1}\\x42\\n\", '\\''", &cx);
     assert_eq!(show(&exp.tokens), "\"aAB\\n'\"");
-    let bad = call_fn(&builtin(BuiltinFn::Concat), "\"\\x80\"", &cx);
-    assert!(!bad.diagnostics.is_empty());
+    // `"\x80"` is no Rust text (rustc's lexer refuses an escape past `\x7f` in a `str`), so
+    // `lex` refuses it too; what `concat!` itself refuses is a byte string.
+    assert!(lex("\"\\x80\"", Edition::E2021, Global).is_err());
+    let bad = call_fn(&builtin(BuiltinFn::Concat), "b\"x\"", &cx);
+    assert!(matches!(bad.diagnostics[..], [Diagnostic::Builtin { .. }]), "{:?}", bad.diagnostics);
 }
 
 #[test]

@@ -45,6 +45,7 @@ pub use core::alloc::Allocator;
 use core::{
     alloc::Layout,
     any::type_name,
+    fmt,
     iter::FusedIterator,
     marker::PhantomData,
     mem::{DropGuard, align_of, size_of},
@@ -255,6 +256,18 @@ pub trait ColumnAt<const I: usize>: Columns {
     type T;
 }
 
+/// Rows whose every field is `Clone`: a row clones from its references.
+pub trait CloneColumns: Columns {
+    #[doc(hidden)]
+    fn clone_row(row: Self::Ref<'_>) -> Self;
+}
+
+/// Rows whose every field is `Debug`.
+pub trait DebugColumns: Columns {
+    #[doc(hidden)]
+    fn debug_row(row: Self::Ref<'_>, list: &mut fmt::DebugList<'_, '_>);
+}
+
 /// Moves the rows of one column into the order `order` names, through `scratch`.
 ///
 /// # Safety
@@ -282,6 +295,18 @@ macro_rules! tuple_columns {
         }
     };
     ($($i:tt $t:ident),+) => {
+        impl<$($t: Clone),+> CloneColumns for ($($t,)+) {
+            fn clone_row(row: Self::Ref<'_>) -> Self {
+                ($( row.$i.clone(), )+)
+            }
+        }
+
+        impl<$($t: fmt::Debug),+> DebugColumns for ($($t,)+) {
+            fn debug_row(row: Self::Ref<'_>, list: &mut fmt::DebugList<'_, '_>) {
+                list.entry(&row);
+            }
+        }
+
         impl<$($t),+> sealed::Sealed for ($($t,)+) {}
 
         impl<$($t),+> Columns for ($($t,)+) {

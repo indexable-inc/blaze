@@ -83,7 +83,8 @@ every thread alive at its stamp cleared it or ended; a thread born later is told
 parent loaded.
 
 **Heat** (`heat::Heat`, in the control thread). Fast code's prologue adds one to its slot's
-`u32` beside the words (a plain add: a lost increment only cools a function a little). The
+`u32` beside the words (a plain add: a lost increment only cools a function a little), on every
+call; never the stub, which runs once, at the first call, and is gone once the word is set. The
 control thread samples the counters every period of its clock and charges the differences.
 At `bound` a function is hot, exactly once per run; every `period` each count shifts right by
 `shift`. The parameters are a `Config`; the first values are to be measured (open questions).
@@ -100,9 +101,11 @@ identity)` is the reverse map `inlined_into`.
 the OS's start time of the process, so a reused pid is another name), 88 bytes, written whole by
 rename; removed at the run's end. `read(listing, processes)` lists the live runs and removes
 each entry whose pid has no process or a process of another start: a read never lists a dead
-run. Beside it, `<name>.events`, appended with `RunEvent`s (began, compiling X, published X,
-tiered X, failed X, test passed or failed, memory, ended): fixed little-endian, keys and numbers
-only, so a viewer on any machine reads them, names coming from records.
+run. Beside it, `<name>.events`: the `RunEvent`s (began, compiling X, published X, tiered X,
+failed X, test passed or failed, memory, ended) the machines push as `Append`, written each
+flush as one blaze-format `events::Batch` in columns (`kinds`, `at`, `values`, `keys`, and
+`checkouts` for the `Began` rows), each buffer at an `ALIGN` multiple so a viewer maps it in
+place; opening one is O(1) in its rows. Keys and numbers only, names coming from records.
 
 **Tests** (`suite::Tests`, in a test run's parent). A test run is a program run whose entry calls
 each test. Entered functions are collected by one byte a slot a lane: the fast prologue stores
@@ -130,7 +133,7 @@ one Mach-O or ELF whole. It keeps nothing between runs.
 | Program manifest | the checkout's certificate and the entry | slot -> (instance, code identity, fast record key); what the run reached last (`history`) |
 | Test result (`TestRun`, tag 8) | the test's base key | its asks: the code identities it entered, and its outside reads |
 | Findings of a refused compile | as the compile's | as the compile's |
-| Registry entry, events | not records: a live run's process state, gone with it | — |
+| Registry entry, event batches | not in the store: a live run's state, gone with it (batches are blaze-format buffers) | — |
 
 ## What crosses the boundary, and how
 
@@ -148,7 +151,9 @@ The control thread places a known record without the parent: `Welcome` carries, 
 whose fast record the manifest names and the store has, its key. Only a slot with no record
 crosses the socket. New messages on the wire: `Hot{slot}`, `TestEnded{test, verdict, entered}`,
 `Publish{slot, tier, hooks, record}`, `Failed{slot, error}`; from the viewer to the parent,
-`Toggle{slots, hooks, on}` (over the parent's own socket, beside the registry entry).
+`Toggle{slots, hooks, on}` (over the parent's own socket `<name>.sock`, mode 0600, beside the
+registry entry; `viewer`: the array `[1, 0, hooks, on, [slot...]]` in deterministic CBOR, a
+non-shortest head, a trailing byte or slots past the caller's cap refused by name).
 
 ## Floors (rule 67), with everything a record
 

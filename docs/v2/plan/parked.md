@@ -20,10 +20,14 @@ MIR table links hir-ty-mir itself now.
 
 ## Waiting on the new item layer (Items, Source; design/bottom.md)
 
-- `crates/base-db`: crate attributes, editioned file ids, reparse, settings; waits on `Source`.
-- `crates/hir-expand`: `builtin`, `declarative`, `eager`, `hygiene`, `span_map`, `name`,
-  `mod_path`, `fixup`; waits on base-db's replacement.
-- `crates/hir-def`: body lowering, signatures and the item tree; waits on `Items`.
+- `crates/base-db`: rewritten over the records (design/reconnect.md): the task's `Db`,
+  `Records`, `Need`, the `Crate` input, gifts and the include table; awaiting its first compile.
+- `crates/hir-expand`: its lib, files, attrs, proc-macro and cfg modules restored and moved onto
+  the new `Db` (no expansion-read log, no edit, proc macros as gifts); awaiting its first
+  compile; its tests still name the deleted fixture.
+- `crates/hir-def`: ids from item keys (`key`), the narrow `nameres` facade and record-backed
+  lang items written; the resolver, `item_scope`, trait and impl item lists, and the lowering's
+  use of the deleted def map are not yet ported (design/reconnect.md).
 - `crates/mbe`: takes `&base_db::Db`; waits on base-db's replacement.
 - `crates/proc-macro-api`: the expansion store and bridge blaze-macro-eval speaks; on base-db,
   hir-expand.
