@@ -9,7 +9,6 @@ use std::alloc::{Allocator, Global};
 
 use blaze_hash::HashMap;
 use parser::TopEntryPoint;
-use smallvec::SmallVec;
 use span::{Edition, Span, SpanMap, SyntaxContext};
 use stdx::never;
 use syntax::{
@@ -251,7 +250,7 @@ struct Converter<SpanMap, OnEvent, A: Allocator + Clone> {
     float: Option<TextRange>,
     /// Whether `current` ends a token of the source's lexing.
     ends_token: bool,
-    current_leaves: SmallVec<[tt::Leaf; 4]>,
+    current_leaves: Vec<tt::Leaf>,
     preorder: PreorderWithTokens,
     range: TextRange,
     punct_offset: Option<(SyntaxToken, TextSize)>,
@@ -288,7 +287,7 @@ where
             append,
             remove,
             call_site,
-            current_leaves: SmallVec::new(),
+            current_leaves: Vec::new(),
             mode,
             on_event: on_enter,
         };

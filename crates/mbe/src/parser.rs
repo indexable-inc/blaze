@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use arrayvec::ArrayVec;
+use blaze_own::FixedVec;
 use blaze_hash::HashMap;
 use intern::{Symbol, sym};
 use span::{Edition, Span, SyntaxContext};
@@ -198,7 +198,7 @@ pub(crate) enum Op {
         delimiter: tt::Delimiter,
     },
     Literal(tt::Literal),
-    Punct(Box<ArrayVec<tt::Punct, MAX_GLUED_PUNCT_LEN>>),
+    Punct(Box<FixedVec<tt::Punct, MAX_GLUED_PUNCT_LEN>>),
     Ident(tt::Ident),
 }
 
@@ -278,7 +278,7 @@ pub(crate) enum MetaVarKind {
 pub(crate) enum Separator {
     Literal(tt::Literal),
     Ident(tt::Ident),
-    Puncts(ArrayVec<tt::Punct, MAX_GLUED_PUNCT_LEN>),
+    Puncts(FixedVec<tt::Punct, MAX_GLUED_PUNCT_LEN>),
     Lifetime(tt::Punct, tt::Ident),
 }
 
@@ -320,8 +320,8 @@ fn next_op(
             let second = match src.next() {
                 None => {
                     return Ok(Op::Punct({
-                        let mut res = ArrayVec::new();
-                        res.push(p);
+                        let mut res = FixedVec::new();
+                        res.push(p).expect("an empty vector has room for one punct");
                         // alloc: the template, once per rule, when the macro is defined.
                         Box::new(res)
                     }));
@@ -383,8 +383,8 @@ fn next_op(
                             ));
                         }
                         Mode::Template => Op::Punct({
-                            let mut res = ArrayVec::new();
-                            res.push(punct);
+                            let mut res = FixedVec::new();
+                            res.push(punct).expect("an empty vector has room for one punct");
                             // alloc: the template, once per rule, when the macro is defined.
                             Box::new(res)
                         }),

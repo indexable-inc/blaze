@@ -234,7 +234,7 @@ impl Driven<Native> {
     }
 
     /// [`Driven::commit_with`], then the new segments opened for `pread`.
-    pub fn commit(&mut self, batches: Vec<Batch>) -> Result<Committed, StoreError> {
+    pub fn commit(&mut self, batches: &[&Batch]) -> Result<Committed, StoreError> {
         let committed = self.commit_with(batches)?;
         self.open_files()?;
         Ok(committed)
@@ -324,6 +324,11 @@ impl<D: Driver> Driven<D> {
         &mut self.driver
     }
 
+    /// The driver back, the store let go of (a test's simulation, crashed and opened again).
+    pub fn into_driver(self) -> D {
+        self.driver
+    }
+
     pub fn report(&self) -> &Report {
         self.core.report()
     }
@@ -355,7 +360,7 @@ impl<D: Driver> Driven<D> {
 
     /// Writes the store's puts and `batches` as one segment for each namespace that holds
     /// records, and flips to a generation naming them, driven until done.
-    pub fn commit_with(&mut self, batches: Vec<Batch>) -> Result<Committed, StoreError> {
+    pub fn commit_with(&mut self, batches: &[&Batch]) -> Result<Committed, StoreError> {
         let now = self.driver.wall_ns();
         self.core.commit(batches, now, &mut self.effects)?;
         self.run("committing")?;

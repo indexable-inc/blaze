@@ -15,6 +15,7 @@ use blaze_sim::{Broke, Config, Tape};
 use crate::{
     Cursor, FromValue, Int, Kind, Map, Shape, ShapeError, ToValue, Value,
     plant::{self, Plant},
+    value,
 };
 
 fn text(s: &str) -> String<Global> {

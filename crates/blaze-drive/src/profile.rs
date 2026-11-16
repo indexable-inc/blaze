@@ -57,9 +57,28 @@ pub struct Profile {
     /// The caller's: nanoseconds the coordinator spent in `step`, and workers spent idle.
     pub coordinator_ns: u64,
     pub idle_ns: u64,
+    /// Items by how many conditions they were checked under: 1, 2, 3-4, 5 or more
+    /// (drive.md, "One check covers every configuration").
+    pub conditions_hist: [u32; 4],
+    /// The gate (drive.md, "The gate"), the caller's clock: from the request's start to the
+    /// program's start and to the verdict; items the gate checked while the program ran.
+    pub start_ns: u64,
+    pub verdict_ns: u64,
+    pub checked_beside: u32,
 }
 
 impl Profile {
+    /// An item settled under `conditions` conditions.
+    pub fn conditions_seen(&mut self, conditions: u32) {
+        let bucket = match conditions {
+            0 | 1 => 0,
+            2 => 1,
+            3 | 4 => 2,
+            _ => 3,
+        };
+        self.conditions_hist[bucket] += 1;
+    }
+
     /// A job settled after `entries` entries.
     pub fn entries_seen(&mut self, entries: u32) {
         let bucket = match entries {
@@ -133,6 +152,14 @@ impl fmt::Display for Profile {
             self.coordinator_ns as f64 / 1e6,
             self.idle_ns as f64 / 1e6,
             self.entries_hist,
+        )?;
+        writeln!(
+            f,
+            "gate         start {:.3} ms verdict {:.3} ms checked beside {}; items by conditions 1|2|3-4|5+ {:?}",
+            self.start_ns as f64 / 1e6,
+            self.verdict_ns as f64 / 1e6,
+            self.checked_beside,
+            self.conditions_hist,
         )
     }
 }

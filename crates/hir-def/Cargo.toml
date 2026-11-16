@@ -26,12 +26,10 @@ cov-mark.workspace = true
 drop_bomb.workspace = true
 either.workspace = true
 hashbrown.workspace = true
-indexmap.workspace = true
 itertools.workspace = true
 la-arena.workspace = true
 tracing = { workspace = true, features = ["attributes"] }
 smallvec.workspace = true
-triomphe.workspace = true
 rustc_apfloat.workspace = true
 
 rustc_parse_format.workspace = true

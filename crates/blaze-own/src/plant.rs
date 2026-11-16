@@ -19,10 +19,24 @@ pub(crate) enum Plant {
     DequeGrowKeepsWrap,
     /// The struct-of-arrays vector's growth copies every column but the last.
     SoaGrowSkipsColumn,
+    /// The B-tree's merge of two internal nodes forgets the right one's last child (and the
+    /// entry before it); the map's length follows, so only the entries tell.
+    BTreeMergeForgetsChild,
 }
 
 std::thread_local! {
     static PLANTED: Cell<Plant> = const { Cell::new(Plant::Clean) };
+    static LOST: Cell<usize> = const { Cell::new(0) };
+}
+
+/// A planted bug lost `n` entries; the code that keeps a count takes them with [`take_lost`].
+pub(crate) fn lose(n: usize) {
+    LOST.with(|lost| lost.set(lost.get() + n));
+}
+
+/// The entries lost since the last call, the count reset.
+pub(crate) fn take_lost() -> usize {
+    LOST.with(|lost| lost.replace(0))
 }
 
 /// Whether `plant` is planted on this thread.

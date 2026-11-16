@@ -1,0 +1,17 @@
+[package]
+name = "blaze-trace"
+description = "blaze's spans and events, the one home (docs/v2/plan/design/no-tracing.md): a no_std core with no dependency, sites as static data, typed field values, a sink the program's entry installs and a thread may override, and the `info_span!`/`info!` macros every crate writes; the flight recorder (blaze-profile) is its sink"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[lints]
+workspace = true

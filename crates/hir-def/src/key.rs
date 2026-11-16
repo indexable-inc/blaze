@@ -323,8 +323,8 @@ pub fn macro_of_key(db: &Db, key: ItemKey) -> MacroId {
         kind @ (MacroKind::BuiltinFn(_) | MacroKind::BuiltinAttr(_) | MacroKind::BuiltinDerive(_)) => {
             let expander = match kind {
                 MacroKind::BuiltinFn(_) => match find_builtin_macro(&name) {
-                    Some(either::Either::Left(it)) => MacroExpander::BuiltIn(it),
-                    Some(either::Either::Right(it)) => MacroExpander::BuiltInEager(it),
+                    Some(stdx::Either::Left(it)) => MacroExpander::BuiltIn(it),
+                    Some(stdx::Either::Right(it)) => MacroExpander::BuiltInEager(it),
                     None => MacroExpander::UnimplementedBuiltIn,
                 },
                 MacroKind::BuiltinAttr(_) => match find_builtin_attr(&name) {

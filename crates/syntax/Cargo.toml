@@ -24,8 +24,6 @@ itertools.workspace = true
 rustc_lexer.workspace = true
 syntax-tree.workspace = true
 rustc-literal-escaper.workspace = true
-smol_str.workspace = true
-triomphe.workspace = true
 tracing.workspace = true
 
 parser.workspace = true

@@ -881,13 +881,13 @@ impl<T: Code> Code for Box<T> {
     }
 }
 
-impl<T: Code> Code for triomphe::Arc<T> {
+impl<T: Code> Code for std::sync::Arc<T> {
     fn put(&self, w: &mut Words) {
         (**self).put(w);
     }
 
     fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        T::get(r).map(triomphe::Arc::new)
+        T::get(r).map(std::sync::Arc::new)
     }
 }
 

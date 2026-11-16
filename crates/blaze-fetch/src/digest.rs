@@ -185,19 +185,6 @@ impl std::str::FromStr for Digest {
     }
 }
 
-impl serde::Serialize for Digest {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(self)
-    }
-}
-
-impl<'de> serde::Deserialize<'de> for Digest {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Digest, D::Error> {
-        let text = <std::borrow::Cow<'de, str>>::deserialize(deserializer)?;
-        Digest::parse(&text).map_err(serde::de::Error::custom)
-    }
-}
-
 /// Plain BLAKE3 of some bytes, as `b3sum` prints it: what the store files an object by.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct Blake3(pub [u8; 32]);

@@ -15,19 +15,18 @@ use std::{
 };
 
 use intern::Symbol;
-use smallvec::SmallVec;
 use span::{Edition, Span, SpanAnchor, SpanMap, SyntaxContext};
 use stdx::never;
 use syntax::{
     FlatTree, Parse,
     SyntaxKind::{self, *},
-    SyntaxTreeBuilder, T, TextRange, TextSize, WalkEvent, format_smolstr,
+    SyntaxTreeBuilder, T, TextRange, TextSize, WalkEvent,
     view::Untyped,
 };
 use tt::{Punct, buffer::Cursor, token_to_literal};
 
 /// The leaves a conversion's callback inserts at one event: at most three, inline.
-pub type Inserted = SmallVec<[tt::Leaf; 3]>;
+pub type Inserted = Vec<tt::Leaf>;
 /// The leaves to append after an element (a view's `NodeId`), by element.
 pub type Appended<K, A = Global> = hashbrown::HashMap<K, Inserted, blaze_hash::FixedState, A>;
 /// The elements to leave out.
@@ -586,7 +585,7 @@ pub fn desugar_doc_comment_text(text: &str, mode: DocCommentDesugarMode) -> (Sym
         }
         // Quote string with delimiters
         DocCommentDesugarMode::ProcMacro => {
-            (Symbol::intern(&format_smolstr!("{}", text.escape_debug())), tt::LitKind::Str)
+            (Symbol::intern(&format!("{}", text.escape_debug())), tt::LitKind::Str)
         }
     }
 }
@@ -894,12 +893,12 @@ struct FlatTok<'t> {
 struct FlatTokens<'t> {
     /// The trees being walked, the innermost last: each with its next element, the element its
     /// walk ends before, and where the next element starts.
-    stack: SmallVec<[(&'t FlatTree, u32, u32, u32); 4]>,
+    stack: Vec<(&'t FlatTree, u32, u32, u32)>,
 }
 
 impl<'t> FlatTokens<'t> {
     fn new(tree: &'t FlatTree, at: u32) -> FlatTokens<'t> {
-        let mut tokens = FlatTokens { stack: SmallVec::new() };
+        let mut tokens = FlatTokens { stack: Vec::new() };
         tokens.enter(tree, at);
         tokens
     }
@@ -1455,7 +1454,7 @@ struct TtTreeSink<'a> {
     token_map: SpanMap,
     /// Where the token trees without delimiters start that the cursor is in, each with its
     /// group's span: an invisible delimiter has no text to keep it in the map.
-    open_fragments: SmallVec<[(TextSize, Span); 4]>,
+    open_fragments: Vec<(TextSize, Span)>,
     /// Where the last token ends, before the whitespace that may follow it.
     token_end: TextSize,
     /// The span of the last token, when it is an unsuffixed decimal integer that a `.` right
@@ -1480,7 +1479,7 @@ impl<'a> TtTreeSink<'a> {
             text_pos: 0.into(),
             inner: SyntaxTreeBuilder::default(),
             token_map,
-            open_fragments: SmallVec::new(),
+            open_fragments: Vec::new(),
             token_end: 0.into(),
             int_before: None,
         }

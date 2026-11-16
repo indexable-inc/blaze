@@ -136,24 +136,35 @@ fn is_package(name: &str) -> bool {
     !name.is_empty() && name.len() <= 64 && name.bytes().all(|it| it.is_ascii_alphanumeric() || it == b'-' || it == b'_')
 }
 
-struct Fields<'a> {
+/// The front matter starts on the file's second line, after the fence.
+const FRONT_LINE: usize = 1;
+
+/// ` (line L, column C)`: where `item` is in the advisory's file.
+fn place(item: &Item<'_, '_, Global>) -> String {
+    let (line, col) = item.line_col();
+    format!(" (line {}, column {col})", line + FRONT_LINE)
+}
+
+struct Fields<'a, 'd, 't> {
     file: &'a str,
-    table: &'a toml::Table,
+    table: Item<'d, 't, Global>,
     part: &'a str,
 }
 
-impl<'a> Fields<'a> {
+impl<'a, 'd, 't> Fields<'a, 'd, 't> {
     fn bad(&self, why: String) -> AdvisoryRefused {
         AdvisoryRefused::Bad { file: self.file.to_owned(), why }
     }
 
     /// Every key of the table is one of `known`.
     fn only(&self, known: &[&str]) -> Result<(), AdvisoryRefused> {
-        match self.table.keys().find(|key| !known.contains(&key.as_str())) {
-            Some(key) => Err(self.bad(format!(
-                "has `{}.{key}`, which is not a field of the format (`{}` are)",
+        match self.table.children().find(|it| !known.contains(&it.key())) {
+            Some(item) => Err(self.bad(format!(
+                "has `{}.{}`, which is not a field of the format (`{}` are){}",
                 self.part,
-                known.join("`, `")
+                item.key(),
+                known.join("`, `"),
+                place(&item)
             ))),
             None => Ok(()),
         }
@@ -162,8 +173,10 @@ impl<'a> Fields<'a> {
     fn text(&self, key: &str) -> Result<Option<String>, AdvisoryRefused> {
         match self.table.get(key) {
             None => Ok(None),
-            Some(toml::Value::String(it)) => Ok(Some(it.clone())),
-            Some(_) => Err(self.bad(format!("has `{}.{key}`, which is not a string", self.part))),
+            Some(item) => match item.as_str() {
+                Some(it) => Ok(Some(it.to_owned())),
+                None => Err(self.bad(format!("has `{}.{key}`, which is not a string{}", self.part, place(&item)))),
+            },
         }
     }
 
@@ -172,17 +185,23 @@ impl<'a> Fields<'a> {
     }
 
     fn date(&self, key: &str) -> Result<Option<Date>, AdvisoryRefused> {
-        match self.table.get(key) {
-            None => Ok(None),
-            Some(toml::Value::String(it)) => {
-                Date::parse(it).map(Some).map_err(|why| self.bad(format!("has `{}.{key}`: {why}", self.part)))
-            }
-            // TOML's own date, as `date = 2021-01-01` unquoted.
-            Some(toml::Value::Datetime(it)) => {
+        let Some(item) = self.table.get(key) else {
+            return Ok(None);
+        };
+        if let Some(it) = item.as_str() {
+            return Date::parse(it)
+                .map(Some)
+                .map_err(|why| self.bad(format!("has `{}.{key}`: {why}{}", self.part, place(&item))));
+        }
+        // TOML's own date, as `date = 2021-01-01` unquoted.
+        match item.as_datetime() {
+            Some(it) => {
                 let text = it.to_string();
-                Date::parse(&text).map(Some).map_err(|_| self.bad(format!("has `{}.{key}` = {text}, which is no day", self.part)))
+                Date::parse(&text)
+                    .map(Some)
+                    .map_err(|_| self.bad(format!("has `{}.{key}` = {text}, which is no day{}", self.part, place(&item))))
             }
-            Some(_) => Err(self.bad(format!("has `{}.{key}`, which is not a day", self.part))),
+            None => Err(self.bad(format!("has `{}.{key}`, which is not a day{}", self.part, place(&item)))),
         }
     }
 
@@ -190,24 +209,26 @@ impl<'a> Fields<'a> {
         let mut out = Vec::new_in(Global);
         match self.table.get(key) {
             None => {}
-            Some(toml::Value::Array(items)) => {
-                for item in items {
-                    let text = item
-                        .as_str()
-                        .ok_or_else(|| self.bad(format!("has `{}.{key}` with an item that is not a string", self.part)))?;
+            Some(items) if items.is_array() => {
+                for item in items.children() {
+                    let text = item.as_str().ok_or_else(|| {
+                        self.bad(format!("has `{}.{key}` with an item that is not a string{}", self.part, place(&item)))
+                    })?;
                     out.push(text.to_owned());
                 }
             }
-            Some(_) => return Err(self.bad(format!("has `{}.{key}`, which is not a list of strings", self.part))),
+            Some(item) => {
+                return Err(self.bad(format!("has `{}.{key}`, which is not a list of strings{}", self.part, place(&item))));
+            }
         }
         Ok(out)
     }
 }
 
-fn reqs(file: &str, part: &str, ranges: &[String]) -> Result<Vec<VersionReq, Global>, AdvisoryRefused> {
+fn reqs(file: &str, part: &str, ranges: &[String]) -> Result<Vec<VersionReq<Global>, Global>, AdvisoryRefused> {
     let mut out = Vec::with_capacity_in(ranges.len(), Global);
     for range in ranges {
-        let req = VersionReq::parse(range).map_err(|why| AdvisoryRefused::Bad {
+        let req = VersionReq::parse_in(range, blaze_semver::Limits::CARGO, Global).map_err(|why| AdvisoryRefused::Bad {
             file: file.to_owned(),
             why: format!("has `{part}` range `{range}`, which is no semver requirement: {why}"),
         })?;
@@ -216,18 +237,38 @@ fn reqs(file: &str, part: &str, ranges: &[String]) -> Result<Vec<VersionReq, Glo
     Ok(out)
 }
 
-/// A TOML list of `items`.
-fn strings(items: &[String]) -> toml::Value {
-    let mut out = Vec::with_capacity_in(items.len(), Global);
-    out.extend(items.iter().cloned().map(toml::Value::String));
-    toml::Value::Array(out)
+fn text_value(text: &str) -> Value<Global> {
+    Value::Text(blaze_own::String::from_str_in(text, Global))
 }
 
-fn table_of<'a>(doc: &'a toml::Table, key: &str, file: &str) -> Result<Option<&'a toml::Table>, AdvisoryRefused> {
+/// A TOML list of `items`.
+fn strings(items: &[String]) -> Value<Global> {
+    let mut out = blaze_own::Vec::with_capacity_in(items.len(), Global);
+    for item in items {
+        out.push(text_value(item));
+    }
+    Value::List(out)
+}
+
+/// `key = value` into `table`, when there is a value.
+fn put(table: &mut Map<Global>, key: &str, value: Option<Value<Global>>) {
+    if let Some(value) = value {
+        table.insert(blaze_own::String::from_str_in(key, Global), value);
+    }
+}
+
+fn table_of<'d, 't>(
+    doc: Item<'d, 't, Global>,
+    key: &str,
+    file: &str,
+) -> Result<Option<Item<'d, 't, Global>>, AdvisoryRefused> {
     match doc.get(key) {
         None => Ok(None),
-        Some(toml::Value::Table(it)) => Ok(Some(it)),
-        Some(_) => Err(AdvisoryRefused::Bad { file: file.to_owned(), why: format!("has `{key}`, which is not a table") }),
+        Some(it) if it.is_table() => Ok(Some(it)),
+        Some(it) => Err(AdvisoryRefused::Bad {
+            file: file.to_owned(),
+            why: format!("has `{key}`, which is not a table{}", place(&it)),
+        }),
     }
 }
 

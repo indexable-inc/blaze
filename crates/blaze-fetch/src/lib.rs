@@ -34,7 +34,7 @@
 //!   record onto them.
 //! - cargo's `.crate` checksums: the registry's sha256 is the pin, now checked here once.
 
-#![feature(register_tool, custom_inner_attributes)]
+#![feature(allocator_api, register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 
 mod casefold;

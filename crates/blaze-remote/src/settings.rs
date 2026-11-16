@@ -23,13 +23,14 @@
 //! prints a secret, and an error about one names the setting, never its value.
 
 use std::{
+    alloc::Global,
     ffi::OsString,
     fmt,
     path::{Path, PathBuf},
 };
 
 use blaze_cas::plain::Namespace;
-use serde::Deserialize;
+use blaze_data::{Cursor, FromValue, ShapeError};
 
 use crate::{
     name,

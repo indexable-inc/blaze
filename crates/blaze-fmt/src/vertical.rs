@@ -6,7 +6,7 @@ use std::cmp;
 
 use crate::ast;
 use crate::span::{BytePos, Span};
-use itertools::Itertools;
+use stdx::iter::IterExt;
 
 use crate::comment::combine_strs_with_missing_comments;
 use crate::config::lists::*;

@@ -14,7 +14,6 @@ use crate::{
 use base_db::{Crate, Db};
 use blaze_memo::ArenaId;
 use intern::{InternedSlice, sym};
-use smallvec::SmallVec;
 use span::{Edition, SyntaxContext};
 use syntax::view::{self, AstNode as _};
 
@@ -41,11 +40,11 @@ pub struct ModPath {
 // `base_db::CrateKey` brings this back to 16 (port notes, "ModPath grew").
 const _: () = assert!(size_of::<ModPath>() == 16 + size_of::<usize>());
 
-/// Segments are gathered here before they are interned: paths longer than this spill to the heap.
-type SegmentBuf = SmallVec<[Name; 8]>;
+/// Segments are gathered here before they are interned.
+type SegmentBuf = Vec<Name>;
 
 /// The segments' contexts, gathered as [`SegmentBuf`].
-type ContextBuf = SmallVec<[SyntaxContext; 8]>;
+type ContextBuf = Vec<SyntaxContext>;
 
 fn intern_segments(segments: &[Name]) -> Option<InternedSlice<PathSegments>> {
     intern_segments_in(segments, &[])
@@ -180,7 +179,7 @@ impl ModPath {
     }
 
     pub fn from_segments(kind: PathKind, segments: impl IntoIterator<Item = Name>) -> ModPath {
-        // alloc: none for up to 8 segments, gathered on the stack
+        // alloc: the segments, gathered before they are interned
         let segments: SegmentBuf = segments.into_iter().collect();
         ModPath { kind, segments: intern_segments(&segments) }
     }
@@ -191,7 +190,7 @@ impl ModPath {
         kind: PathKind,
         segments: impl IntoIterator<Item = (Name, SyntaxContext)>,
     ) -> ModPath {
-        // alloc: none for up to 8 segments, gathered on the stack
+        // alloc: the segments, gathered before they are interned
         let (names, contexts): (SegmentBuf, ContextBuf) = segments.into_iter().unzip();
         ModPath { kind, segments: intern_segments_in(&names, &contexts) }
     }
@@ -229,7 +228,7 @@ impl ModPath {
 
     /// [`ModPath::push_segment`] of a segment written with `ctxt` (normalized to macros 2.0).
     pub fn push_segment_in(&mut self, segment: Name, ctxt: SyntaxContext) {
-        let mut segments = SegmentBuf::from_slice(self.segments());
+        let mut segments: SegmentBuf = self.segments().to_vec();
         segments.push(segment);
         let contexts = self.contexts_or_roots(ctxt);
         self.segments = intern_segments_in(&segments, &contexts);
@@ -250,7 +249,7 @@ impl ModPath {
 
     /// `other`'s segments after this path's, with their contexts.
     pub fn append(&mut self, other: &ModPath) {
-        let mut segments = SegmentBuf::from_slice(self.segments());
+        let mut segments: SegmentBuf = self.segments().to_vec();
         segments.extend_from_slice(other.segments());
         let root = SyntaxContext::root(Edition::Edition2015);
         let contexts: ContextBuf = match (self.contexts(), other.contexts()) {
@@ -323,7 +322,7 @@ impl ModPath {
 
 impl Extend<Name> for ModPath {
     fn extend<T: IntoIterator<Item = Name>>(&mut self, iter: T) {
-        let mut segments = SegmentBuf::from_slice(self.segments());
+        let mut segments: SegmentBuf = self.segments().to_vec();
         segments.extend(iter);
         let root = SyntaxContext::root(Edition::Edition2015);
         let contexts: ContextBuf = match self.contexts() {
@@ -403,9 +402,9 @@ fn convert_path_view(
     let mut segments = path.segments();
 
     let segment = segments.next()?;
-    let mut names = SegmentBuf::new_const();
+    let mut names = SegmentBuf::new();
     // Each name's context normalized to macros 2.0, pushed with it (`ModPath::contexts`).
-    let mut contexts = ContextBuf::new_const();
+    let mut contexts = ContextBuf::new();
     let handle_super_kw = &mut |init_deg,
                                 names: &mut SegmentBuf,
                                 contexts: &mut ContextBuf,
@@ -516,8 +515,8 @@ fn convert_path_tt(db: &Db, arena: ArenaId, tt: tt::TokenTreesView<'_>) -> Optio
         tt::TtElement::Leaf(leaf) => Some(leaf),
         tt::TtElement::Subtree(..) => None,
     });
-    let mut segments = SegmentBuf::new_const();
-    let mut contexts = ContextBuf::new_const();
+    let mut segments = SegmentBuf::new();
+    let mut contexts = ContextBuf::new();
     let kind = match leaves.next()? {
         tt::Leaf::Punct(tt::Punct { char: ':', .. }) => match leaves.next()? {
             tt::Leaf::Punct(tt::Punct { char: ':', .. }) => PathKind::Abs,
@@ -738,7 +737,7 @@ mod tests {
     #[test]
     fn debug_is_as_before() {
         let path = ModPath::from_segments(PathKind::Abs, names(&["core", "fmt"]));
-        let segments: smallvec::SmallVec<[Name; 1]> = path.segments().iter().copied().collect();
+        let segments: Vec<Name> = path.segments().to_vec();
         assert_eq!(format!("{path:?}"), format!("ModPath {{ kind: Abs, segments: {segments:?} }}"));
         assert_eq!(
             format!("{:?}", ModPath::from_kind(PathKind::Crate)),

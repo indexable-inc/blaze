@@ -181,22 +181,22 @@ fn write_node(out: &mut Out, aims: &mut Aims, node: &NodeModel) -> u64 {
     let field = |offset: usize| at + offset as u64;
     fn rel_to<O: Offset>(field_at: u64, target: Option<u64>) -> Result<Rel<Leaf, O>, Unfit> {
         match target {
-            Some(target) => Rel::between(field_at, target),
+            Some(target) => Rel::between_as(field_at, target),
             None => Ok(Rel::NONE),
         }
     }
     let rel = |offset: usize, target: Option<u64>| rel_to::<i32>(field(offset), target);
     let fit = "a test node's references are written to fit";
     let record = Node {
-        words: Slice::between(field(offset_of!(Node, words)), words, node.words.len()).expect(fit),
-        leaves: Slice::between(field(offset_of!(Node, leaves)), leaves, node.leaves.len())
+        words: Slice::between_as(field(offset_of!(Node, words)), words, node.words.len()).expect(fit),
+        leaves: Slice::between_as(field(offset_of!(Node, leaves)), leaves, node.leaves.len())
             .expect(fit),
-        name: Text::between(field(offset_of!(Node, name)), name, node.name.len()).expect(fit),
+        name: Text::between_as(field(offset_of!(Node, name)), name, node.name.len()).expect(fit),
         leaf: rel(offset_of!(Node, leaf), leaf).expect(fit),
-        short: Slice::between(field(offset_of!(Node, short)), short, node.short.len()).expect(fit),
+        short: Slice::between_as(field(offset_of!(Node, short)), short, node.short.len()).expect(fit),
         near: rel_to::<i16>(field(offset_of!(Node, near)), near).expect(fit),
-        tiny: Slice::between(field(offset_of!(Node, tiny)), tiny, node.tiny.len()).expect(fit),
-        small: Text::between(field(offset_of!(Node, small)), small, node.small.len()).expect(fit),
+        tiny: Slice::between_as(field(offset_of!(Node, tiny)), tiny, node.tiny.len()).expect(fit),
+        small: Text::between_as(field(offset_of!(Node, small)), small, node.small.len()).expect(fit),
         pad: [0; 2],
     };
     aim::<i32>(aims, field(offset_of!(Node, words)), true);
@@ -230,7 +230,7 @@ fn write(model: &RootModel) -> (Aligned, Aims) {
             let field_at = rels_at + (index * size_of::<Rel<Node>>()) as u64;
             aims.words.push((field_at, 4));
             match node {
-                Some(node) => Rel::between(field_at, *node).expect(fit),
+                Some(node) => Rel::between_as(field_at, *node).expect(fit),
                 None => Rel::NONE,
             }
         })
@@ -241,13 +241,13 @@ fn write(model: &RootModel) -> (Aligned, Aims) {
     let at = out.next::<Root>();
     let field = |offset: usize| at + offset as u64;
     let first = match model.first {
-        Some(_) => Rel::between(field(offset_of!(Root, first)), nodes[0].expect(fit)).expect(fit),
+        Some(_) => Rel::between_as(field(offset_of!(Root, first)), nodes[0].expect(fit)).expect(fit),
         None => Rel::NONE,
     };
     let root = Root {
-        nodes: Slice::between(field(offset_of!(Root, nodes)), rels_at, rels.len()).expect(fit),
+        nodes: Slice::between_as(field(offset_of!(Root, nodes)), rels_at, rels.len()).expect(fit),
         first,
-        title: Text::between(field(offset_of!(Root, title)), title, model.title.len())
+        title: Text::between_as(field(offset_of!(Root, title)), title, model.title.len())
             .expect(fit),
     };
     aim::<i32>(&mut aims, field(offset_of!(Root, nodes)), true);
@@ -590,8 +590,8 @@ fn fits_back<O: Offset>(distance: u64) -> Result<(), Broke> {
     let field_at = 1 << 40;
     let target_at = field_at - distance;
     let fits = i64::try_from(distance).is_ok_and(|distance| O::of_distance(-distance).is_some());
-    let rel = Rel::<u32, O>::between(field_at, target_at);
-    let slice = Slice::<u32, O>::between(field_at, target_at, 1);
+    let rel = Rel::<u32, O>::between_as(field_at, target_at);
+    let slice = Slice::<u32, O>::between_as(field_at, target_at, 1);
     let far = Unfit::Far { field_at, target_at, offset: O::NAME };
     match (fits, rel, slice) {
         (true, Ok(rel), Ok(slice)) if rel.offset.distance() == -(distance as i64)
@@ -627,16 +627,16 @@ fn a_narrow_reference_is_refused_past_its_width() {
     });
     // The length of a narrow slice is refused past its width, and a reference ahead of its
     // field always.
-    assert_eq!(Slice::<u8, i8>::between(1000, 900, 255).map(|it| it.len), Ok(255));
+    assert_eq!(Slice::<u8, i8>::between_as(1000, 900, 255).map(|it| it.len), Ok(255));
     assert_eq!(
-        Slice::<u8, i8>::between(1000, 900, 256),
+        Slice::<u8, i8>::between_as(1000, 900, 256),
         Err(Unfit::Long { field_at: 1000, len: 256, offset: "i8" })
     );
-    assert_eq!(Slice::<u8, i16>::between(1000, 900, 65_535).map(|it| it.len), Ok(65_535));
-    assert!(Slice::<u8, i16>::between(1000, 900, 65_536).is_err());
-    assert_eq!(Rel::<u8, i8>::between(100, 100), Err(Unfit::Forward { field_at: 100, target_at: 100 }));
-    assert_eq!(Slice::<u8, i8>::between(100, 100, 0).map(|it| it.offset), Ok(0));
-    assert!(Slice::<u8, i8>::between(100, 101, 0).is_err());
+    assert_eq!(Slice::<u8, i16>::between_as(1000, 900, 65_535).map(|it| it.len), Ok(65_535));
+    assert!(Slice::<u8, i16>::between_as(1000, 900, 65_536).is_err());
+    assert_eq!(Rel::<u8, i8>::between_as(100, 100), Err(Unfit::Forward { field_at: 100, target_at: 100 }));
+    assert_eq!(Slice::<u8, i8>::between_as(100, 100, 0).map(|it| it.offset), Ok(0));
+    assert!(Slice::<u8, i8>::between_as(100, 101, 0).is_err());
 }
 
 #[test]
@@ -653,12 +653,12 @@ fn a_narrow_reference_at_its_edge_opens_and_reads() {
     out.push_slice(&[0u8; 124]);
     let at = out.next::<Edge>();
     assert_eq!(at - word, 128);
-    let root = Edge { word: Rel::between(at, word).expect("128 bytes back fits an i8") };
+    let root = Edge { word: Rel::between_as(at, word).expect("128 bytes back fits an i8") };
     out.push(&root);
     let buffer = Aligned::of(&out.finish(at));
     let root = open::<Edge>(buffer.bytes()).expect("a buffer just written");
     assert_eq!(field!(root, Edge, word).target().map(|it| *Verified::get(it)), Some(0xfeed));
-    assert_eq!(Rel::<u32, i8>::between(at + 1, word), Err(Unfit::Far { field_at: at + 1, target_at: word, offset: "i8" }));
+    assert_eq!(Rel::<u32, i8>::between_as(at + 1, word), Err(Unfit::Far { field_at: at + 1, target_at: word, offset: "i8" }));
 }
 
 #[test]

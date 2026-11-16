@@ -418,7 +418,7 @@ pub(crate) fn apply<B: Allocator>(base: &[u8], delta: &[u8], most: u64, out: &mu
         return Err(PackWhy::ObjectOver { size, most });
     }
     out.try_reserve(size as usize).map_err(PackWhy::Alloc)?;
-    let mut byte = |pos: &mut usize| -> Result<u64, PackWhy> {
+    let byte = |pos: &mut usize| -> Result<u64, PackWhy> {
         let b = *delta.get(*pos).ok_or(delta_why(DeltaWhy::Truncated))?;
         *pos += 1;
         Ok(u64::from(b))

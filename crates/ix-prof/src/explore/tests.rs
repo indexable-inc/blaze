@@ -14,7 +14,6 @@ use std::{
 use arrow_array::{Int64Array, RecordBatch};
 use arrow_ipc::reader::StreamReader;
 use arrow_schema::{DataType, Field, Schema};
-use base64::Engine as _;
 use blaze_core::{
     Driver as _, Effect, Tag,
     sim::{Datagrams, Faults, Sim},
@@ -391,7 +390,11 @@ fn explorer(dev_origin: bool) -> Explorer {
 /// A client pinning the explorer's certificate, as the page does, on a driver thread of its
 /// own; its handles' futures are polled by the runtime the test awaits them on.
 fn client(explorer: &Explorer) -> Driver {
-    let raw = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(explorer.certhash()).unwrap();
+    let raw = blaze_base64::URL_SAFE_NO_PAD
+        .decode_in(explorer.certhash().as_bytes(), std::alloc::Global)
+        .unwrap()
+        .as_slice()
+        .to_vec();
     let config =
         ClientConfig { trust: Trust::Pinned(vec![raw.try_into().unwrap()]), transport: Transport::default() };
     Driver::spawn(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)), None, Some(config)).unwrap().0

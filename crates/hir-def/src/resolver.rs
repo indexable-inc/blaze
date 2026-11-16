@@ -1519,7 +1519,7 @@ struct ScopeNames<'a> {
 
 impl ScopeNames<'_> {
     fn add(&mut self, name: &Name, def: ScopeDef) {
-        let set = self.map.entry(*name).or_default();
+        let set = self.map.get_or_insert_with(*name, Default::default).1;
         if !set.contains(&def) {
             set.push(def)
         }
@@ -1539,7 +1539,7 @@ impl ScopeNames<'_> {
         }
     }
     fn add_local(&mut self, name: &Name, binding: BindingId) {
-        let set = self.map.entry(*name).or_default();
+        let set = self.map.get_or_insert_with(*name, Default::default).1;
         // XXX: hack, account for local (and only local) shadowing.
         //
         // This should be somewhat more principled and take namespaces into

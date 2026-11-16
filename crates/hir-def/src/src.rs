@@ -1,7 +1,7 @@
 //! Utilities for mapping between hir IDs and the surface syntax.
 
 use base_db::Db;
-use either::Either;
+use stdx::Either;
 use hir_expand::{AstId, InFile};
 use la_arena::{Arena, ArenaMap, Idx};
 use syntax::{

@@ -1,0 +1,417 @@
+//! Conditions (drive.md, "One check covers every configuration"; bottom.md 11): `blaze check`
+//! answers for every target, feature set and switch in one run.
+//!
+//! A [`Condition`] is a partial assignment of cfg variables: a target is one variable whose
+//! value fixes every `target_*` atom; each package's `feature = "x"` is a boolean variable; `test`,
+//! `debug_assertions` and each `--cfg` flag are booleans. Atoms of one variable are one choice,
+//! so a variable has one value or none. A task runs under a condition; reading a variable the
+//! condition does not fix answers `Need(Cfg(variable))`, and the machine re-enters it once per
+//! value the request's [`Space`] still allows, each narrower ([`Space::fork`]). Its record is
+//! stored with the condition it *read*, and a lookup takes a stored record whose condition the
+//! asker's [`implies`](Condition::implies): the record that read nothing serves everyone.
+//!
+//! An item's conditions are capped at [`MOST_CONDITIONS`]: past it the answer is a typed
+//! finding naming the item and the variables ([`ConditionError::OverCap`]), never a sample.
+//!
+//! Memory: a condition is [`MOST_ATOMS`] pairs inline, 66 bytes, `Copy`; no allocation.
+
+use core::fmt;
+
+/// A cfg variable, numbered by the request (targets first, then features per package, then
+/// switches): an interned id within one request.
+pub type Var = u16;
+/// A variable's value: a target's index in the request's list, or 0/1 for a boolean.
+pub type Value = u16;
+
+/// The most variables one condition fixes.
+pub const MOST_ATOMS: usize = 16;
+/// The most conditions one item is checked under (bottom.md 11, bound 2).
+pub const MOST_CONDITIONS: u32 = 64;
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum ConditionError {
+    /// More than [`MOST_ATOMS`] variables read by one item.
+    TooManyAtoms { var: Var },
+    /// A variable the space does not have.
+    UnknownVar { var: Var },
+    /// An item forked past [`MOST_CONDITIONS`]; `vars` are the variables it read.
+    OverCap { conditions: u32, vars: Condition },
+}
+
+impl fmt::Display for ConditionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ConditionError::TooManyAtoms { var } => {
+                write!(f, "an item reads more than {MOST_ATOMS} cfg variables (at variable {var})")
+            }
+            ConditionError::UnknownVar { var } => write!(f, "cfg variable {var} is not in the request's space"),
+            ConditionError::OverCap { conditions, vars } => write!(
+                f,
+                "an item forks into {conditions} configurations, past {MOST_CONDITIONS} (bottom.md 11): it reads {:?}",
+                vars.vars()
+            ),
+        }
+    }
+}
+
+impl core::error::Error for ConditionError {}
+
+/// A partial assignment, sorted by variable; unused pairs are zero so equal conditions are equal
+/// bytes (rule 25).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct Condition {
+    len: u8,
+    atoms: [(Var, Value); MOST_ATOMS],
+}
+
+impl Default for Condition {
+    fn default() -> Condition {
+        Condition::ANY
+    }
+}
+
+impl Condition {
+    /// Fixes nothing: every configuration the request allows.
+    pub const ANY: Condition = Condition { len: 0, atoms: [(0, 0); MOST_ATOMS] };
+
+    pub fn atoms(&self) -> &[(Var, Value)] {
+        &self.atoms[..self.len as usize]
+    }
+
+    /// The variables fixed, in order (`OverCap`'s list).
+    pub fn vars(&self) -> impl Iterator<Item = Var> + '_ {
+        self.atoms().iter().map(|(var, _)| *var)
+    }
+
+    pub fn get(&self, var: Var) -> Option<Value> {
+        let atoms = self.atoms();
+        atoms.binary_search_by_key(&var, |(v, _)| *v).ok().map(|at| atoms[at].1)
+    }
+
+    /// This condition with `var` fixed at `value`; `None` if it fixes `var` otherwise.
+    pub fn with(&self, var: Var, value: Value) -> Result<Option<Condition>, ConditionError> {
+        let atoms = self.atoms();
+        match atoms.binary_search_by_key(&var, |(v, _)| *v) {
+            Ok(at) => Ok((atoms[at].1 == value).then_some(*self)),
+            Err(at) => {
+                if self.len as usize == MOST_ATOMS {
+                    return Err(ConditionError::TooManyAtoms { var });
+                }
+                let mut next = *self;
+                next.atoms.copy_within(at..self.len as usize, at + 1);
+                next.atoms[at] = (var, value);
+                next.len += 1;
+                Ok(Some(next))
+            }
+        }
+    }
+
+    /// Every configuration this admits, `other` admits: this fixes each atom `other` does.
+    pub fn implies(&self, other: &Condition) -> bool {
+        other.atoms().iter().all(|(var, value)| self.get(*var) == Some(*value))
+    }
+
+    /// Both at once; `None` if they disagree on a variable.
+    pub fn and(&self, other: &Condition) -> Result<Option<Condition>, ConditionError> {
+        let mut out = *self;
+        for (var, value) in other.atoms() {
+            match out.with(*var, *value)? {
+                Some(next) => out = next,
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(out))
+    }
+}
+
+/// The configurations a request allows: how many values each variable has, and the feature
+/// dependencies as boolean implications (`a = 1` needs `b = 1`), transitively closed by the
+/// caller ([`Space::closed`] checks) so a pairwise test is exact.
+#[derive(Clone, Copy, Debug)]
+pub struct Space<'a> {
+    pub values: &'a [u16],
+    pub implications: &'a [(Var, Var)],
+}
+
+impl Space<'_> {
+    /// Whether some configuration the space allows satisfies `condition`. Exact when the
+    /// implications are closed: setting each unfixed boolean to 1 only where an implication from
+    /// a fixed 1 forces it satisfies every other implication.
+    pub fn allows(&self, condition: &Condition) -> bool {
+        condition.atoms().iter().all(|(var, value)| self.values.get(*var as usize).is_some_and(|n| value < n))
+            && !self.implications.iter().any(|(a, b)| condition.get(*a) == Some(1) && condition.get(*b) == Some(0))
+    }
+
+    /// Whether the implications are closed: `a -> b` and `b -> c` give `a -> c`.
+    pub fn closed(&self) -> bool {
+        self.implications.iter().all(|(a, b)| {
+            self.implications.iter().filter(|(b2, _)| b2 == b).all(|(_, c)| a == c || self.implications.contains(&(*a, *c)))
+        })
+    }
+
+    /// The narrower conditions a task re-entered on `Need(Cfg(var))` runs under: one per value
+    /// of `var` the space still allows under `condition`, in value order.
+    pub fn fork(&self, condition: &Condition, var: Var) -> Result<impl Iterator<Item = Condition> + '_, ConditionError> {
+        let count = *self.values.get(var as usize).ok_or(ConditionError::UnknownVar { var })?;
+        let condition = *condition;
+        if condition.len as usize == MOST_ATOMS && condition.get(var).is_none() {
+            return Err(ConditionError::TooManyAtoms { var });
+        }
+        Ok((0..count).filter_map(move |value| condition.with(var, value).ok().flatten()).filter(move |next| self.allows(next)))
+    }
+}
+
+#[cfg(test)]
+mod model {
+    //! The model (rule 64): items read cfg variables (which ones may depend on the values read)
+    //! and use earlier items' results. Checked once under the whole space, forking on each
+    //! unfixed read and storing each record under what it read, the findings must equal the
+    //! union of checking every full configuration separately.
+
+    use std::collections::{BTreeMap, BTreeSet};
+    use std::format;
+    use std::string::String;
+    use std::vec::Vec;
+
+    use blaze_sim::{Broke, Config as SimConfig, Tape, check, control};
+
+    use super::{Condition, ConditionError, MOST_CONDITIONS, Space, Value, Var};
+    use crate::Plant;
+
+    #[derive(Clone, Copy, Debug)]
+    enum Step {
+        Atom(Var),
+        Use(usize),
+        /// Skip the next step when the result so far is odd: which variables are read depends
+        /// on the values read.
+        SkipIfOdd,
+    }
+
+    struct World {
+        values: Vec<u16>,
+        implications: Vec<(Var, Var)>,
+        items: Vec<Vec<Step>>,
+    }
+
+    fn mix(h: u64, x: u64) -> u64 {
+        (h ^ (x + 1)).wrapping_mul(0x0100_0000_01b3)
+    }
+
+    fn draw(tape: &Tape) -> World {
+        let targets = 1 + tape.index(3, "targets") as u16;
+        let features = tape.index(4, "features");
+        let mut values = Vec::from([targets]);
+        values.extend((0..features).map(|_| 2));
+        values.push(2); // `test`
+        let vars = values.len();
+        let mut implications = Vec::new();
+        for a in 1..=features {
+            for b in a + 1..=features {
+                if tape.one_in(3, "feature dependency") {
+                    implications.push((a as Var, b as Var));
+                }
+            }
+        }
+        // Close them: a -> b -> c gives a -> c.
+        loop {
+            let more: Vec<(Var, Var)> = implications
+                .iter()
+                .flat_map(|(a, b)| implications.iter().filter(move |(b2, _)| b2 == b).map(move |(_, c)| (*a, *c)))
+                .filter(|pair| !implications.contains(pair))
+                .collect();
+            if more.is_empty() {
+                break;
+            }
+            implications.extend(more);
+            implications.sort();
+            implications.dedup();
+        }
+        let n = 1 + tape.index(6, "items");
+        let items = (0..n)
+            .map(|i| {
+                (0..tape.index(5, "steps"))
+                    .map(|_| match tape.index(if i == 0 { 2 } else { 3 }, "step") {
+                        0 => Step::Atom(tape.index(vars, "variable") as Var),
+                        1 => Step::SkipIfOdd,
+                        _ => Step::Use(tape.index(i, "used item")),
+                    })
+                    .collect()
+            })
+            .collect();
+        World { values, implications, items }
+    }
+
+    fn space(world: &World) -> Space<'_> {
+        Space { values: &world.values, implications: &world.implications }
+    }
+
+    /// The finding of a result: a third of results are findings.
+    fn finding(h: u64) -> Option<u64> {
+        (h % 3 == 0).then_some(h)
+    }
+
+    /// One full configuration, directly.
+    fn eval(world: &World, item: usize, config: &[Value]) -> u64 {
+        let mut h = item as u64;
+        let mut skip = false;
+        for step in &world.items[item] {
+            if core::mem::take(&mut skip) {
+                continue;
+            }
+            match *step {
+                Step::Atom(var) => h = mix(h, u64::from(config[var as usize])),
+                Step::Use(j) => h = mix(h, eval(world, j, config)),
+                Step::SkipIfOdd => skip = h % 2 == 1,
+            }
+        }
+        h
+    }
+
+    enum Ran {
+        Done { read: Condition, h: u64 },
+        Need(Var),
+    }
+
+    type Records = BTreeMap<usize, Vec<(Condition, u64)>>;
+
+    /// One entry of `item` under `under`, using the stored records of earlier items.
+    fn run(world: &World, records: &Records, item: usize, under: &Condition) -> Result<Ran, Broke> {
+        let harness = |e: ConditionError| Broke::Harness(format!("{e}"));
+        let mut h = item as u64;
+        let mut read = Condition::ANY;
+        let mut skip = false;
+        for step in &world.items[item] {
+            if core::mem::take(&mut skip) {
+                continue;
+            }
+            match *step {
+                Step::Atom(var) => match under.get(var) {
+                    Some(value) => {
+                        read = read.with(var, value).map_err(harness)?.ok_or(Broke::Harness(String::from("read disagrees")))?;
+                        h = mix(h, u64::from(value));
+                    }
+                    None => return Ok(Ran::Need(var)),
+                },
+                Step::Use(j) => {
+                    let held = records.get(&j).map_or(&[][..], |r| r.as_slice());
+                    match held.iter().find(|(cond, _)| under.implies(cond)) {
+                        Some((cond, hj)) => {
+                            read = read.and(cond).map_err(harness)?.ok_or(Broke::Harness(String::from("use disagrees")))?;
+                            h = mix(h, *hj);
+                        }
+                        // No record the asker's condition implies: the asker forks on a
+                        // variable a record of `j` fixes and it does not.
+                        None => {
+                            let var = held
+                                .iter()
+                                .flat_map(|(cond, _)| cond.atoms().iter().copied())
+                                .find(|(var, _)| under.get(*var).is_none())
+                                .map(|(var, _)| var)
+                                .ok_or(Broke::Oracle(format!("item {j} has no record for {under:?}")))?;
+                            return Ok(Ran::Need(var));
+                        }
+                    }
+                }
+                Step::SkipIfOdd => skip = h % 2 == 1,
+            }
+        }
+        Ok(Ran::Done { read, h })
+    }
+
+    /// The whole space at once: each item from `ANY`, forked on each unfixed read.
+    fn whole(world: &World, plant: Plant) -> Result<Records, Broke> {
+        let space = space(world);
+        let mut records = Records::new();
+        for item in 0..world.items.len() {
+            let mut queue = Vec::from([Condition::ANY]);
+            let mut conditions = 1;
+            while let Some(under) = queue.pop() {
+                match run(world, &records, item, &under)? {
+                    Ran::Done { read, h } => {
+                        // The planted bug: stored under the condition the job began at, not
+                        // what it read.
+                        let stored = if plant == Plant::RanUnderCondition { Condition::ANY } else { read };
+                        records.entry(item).or_default().push((stored, h));
+                    }
+                    Ran::Need(var) => {
+                        let forks: Vec<Condition> =
+                            space.fork(&under, var).map_err(|e| Broke::Harness(format!("{e}")))?.collect();
+                        conditions = (conditions + forks.len() as u32).saturating_sub(1);
+                        if conditions > MOST_CONDITIONS {
+                            return Err(Broke::Harness(format!("{}", ConditionError::OverCap { conditions, vars: under })));
+                        }
+                        queue.extend(forks);
+                    }
+                }
+            }
+        }
+        Ok(records)
+    }
+
+    fn configs(world: &World) -> Vec<Vec<Value>> {
+        let space = space(world);
+        let mut all: Vec<Vec<Value>> = Vec::from([Vec::new()]);
+        for count in &world.values {
+            all = all.into_iter().flat_map(|c| (0..*count).map(move |v| [c.as_slice(), &[v]].concat())).collect();
+        }
+        all.into_iter()
+            .filter(|c| {
+                let mut cond = Condition::ANY;
+                for (var, value) in c.iter().enumerate() {
+                    cond = cond.with(var as Var, *value).ok().flatten().unwrap_or(cond);
+                }
+                space.allows(&cond)
+            })
+            .collect()
+    }
+
+    fn whole_equals_each(tape: &Tape, plant: Plant) -> Result<(), Broke> {
+        let world = draw(tape);
+        let records = whole(&world, plant)?;
+        let mut each = BTreeSet::new();
+        let mut once = BTreeSet::new();
+        for (at, config) in configs(&world).iter().enumerate() {
+            let mut full = Condition::ANY;
+            for (var, value) in config.iter().enumerate() {
+                full = full.with(var as Var, *value).ok().flatten().ok_or(Broke::Harness(String::from("config")))?;
+            }
+            for item in 0..world.items.len() {
+                if let Some(f) = finding(eval(&world, item, config)) {
+                    each.insert((at, item, f));
+                }
+                for (cond, h) in records.get(&item).map_or(&[][..], |r| r.as_slice()) {
+                    if let (true, Some(f)) = (full.implies(cond), finding(*h)) {
+                        once.insert((at, item, f));
+                    }
+                }
+            }
+        }
+        match each == once {
+            true => Ok(()),
+            false => Err(Broke::Oracle(format!(
+                "checking the whole space found {} findings, each configuration {}: they differ",
+                once.len(),
+                each.len()
+            ))),
+        }
+    }
+
+    #[test]
+    fn the_whole_space_equals_each_configuration() {
+        check(SimConfig::cases(500), |tape| whole_equals_each(tape, Plant::None));
+    }
+
+    #[test]
+    fn control_a_record_stored_under_its_start_condition_is_caught() {
+        control(SimConfig::cases(4000), Plant::None, Plant::RanUnderCondition, "they differ", whole_equals_each);
+    }
+
+    #[test]
+    fn a_condition_is_sorted_and_implies_its_parts() {
+        let a = Condition::ANY.with(3, 1).unwrap().unwrap().with(1, 0).unwrap().unwrap();
+        assert_eq!(a.atoms(), &[(1, 0), (3, 1)]);
+        assert!(a.implies(&Condition::ANY.with(3, 1).unwrap().unwrap()));
+        assert!(!Condition::ANY.implies(&a));
+        assert_eq!(a.with(1, 1).unwrap(), None);
+    }
+}

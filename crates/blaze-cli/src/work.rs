@@ -8,9 +8,13 @@
 //!   `check` is a syntax check of every file the crate roots reach until blaze-typeck's
 //!   `Signature` and `BodyCheck` tasks exist (their lane).
 //!
-//! Each run is entered on this thread, one at a time, in the order the machine emits them.
+//! A batch's tasks are entered on this thread, one after another, and answered together in one
+//! `Ran` (drive.md, "Scheduling on many cores"); the pool over `workers` waits on bstd's threaded
+//! layout. Neither task kind here answers `Need`, so nothing is answered in place yet.
 
-use blaze_drive::{Effect, Event, FileEntry, Kind, Locate, Name, Output, Part, Ran, Request, Task, TaskFailure, Ticket};
+use blaze_drive::{
+    Batch, Effect, Event, FileEntry, Kind, Locate, Name, Outcome, Output, Part, Ran, Request, Task, TaskFailure,
+};
 use blaze_drive::record::Finding;
 use blaze_ids::ContentId;
 use blaze_own::Vec;
@@ -27,16 +31,85 @@ pub const SYNTAX: u16 = 1;
 
 const OUT_DOMAIN: &str = "blaze-cli parts out 1";
 
-pub fn run<'f>(
+/// What one task made, held in the frame until its batch is answered.
+struct Made<'f> {
+    name: Name,
+    out: ContentId,
+    parts: Vec<Part, &'f Frame>,
+    /// (rule, start, end, message start, message end) into `messages`.
+    findings: Vec<(u16, u32, u32, usize, usize), &'f Frame>,
+    messages: Vec<u8, &'f Frame>,
+    payload: Vec<u8, &'f Frame>,
+}
+
+enum Did<'f> {
+    Done(Made<'f>),
+    Failed(TaskFailure),
+}
+
+/// Run every task of `batch`, then answer the machine once.
+pub fn run_batch<'f>(
     cx: &Cx,
     root: &Dir<ReadWrite>,
     files: &[FileEntry<'_>],
     req: &mut Request<&'f Frame>,
-    ticket: Ticket,
-    task: &Task<&'f Frame>,
+    batch: Batch<&'f Frame>,
     frame: &'f Frame,
     effects: &mut Vec<Effect<&'f Frame>, &'f Frame>,
 ) -> Result<(), CliError> {
+    let cx = cx.span("batch");
+    let mut did = Vec::with_capacity_in(batch.tasks.len(), frame);
+    for (ticket, task) in batch.tasks.iter() {
+        did.push((*ticket, run(&cx, root, files, req, task, frame)?));
+    }
+    let mut findings: Vec<Vec<Finding<'_>, &Frame>, &Frame> = Vec::with_capacity_in(did.len(), frame);
+    for (_, done) in did.iter() {
+        let mut held = Vec::new_in(frame);
+        if let Did::Done(made) = done {
+            for (rule, start, end, at, to) in made.findings.iter().copied() {
+                held.push(Finding { rule, start, end, message: &made.messages[at..to] });
+            }
+        }
+        findings.push(held);
+    }
+    let mut outputs: Vec<Output<'_>, &Frame> = Vec::with_capacity_in(did.len(), frame);
+    for ((_, done), findings) in did.iter().zip(findings.iter()) {
+        if let Did::Done(made) = done {
+            outputs.push(Output {
+                name: made.name,
+                out: made.out,
+                reads: &[],
+                parts: &made.parts,
+                findings,
+                payload: &made.payload,
+            });
+        }
+    }
+    let mut results = Vec::with_capacity_in(did.len(), frame);
+    let mut at = 0;
+    for (ticket, done) in did.iter() {
+        let ran = match done {
+            Did::Done(_) => {
+                at += 1;
+                Ran::Done(&outputs[at - 1..at])
+            }
+            Did::Failed(failure) => Ran::Failed(*failure),
+        };
+        // No clock in this binary yet (bstd has none passed in): time is 0, said by the profile.
+        results.push(Outcome { ticket: *ticket, ran, in_place: 0, ns: 0 });
+    }
+    req.step(Event::Ran { batch: batch.id, results: &results }, effects)?;
+    Ok(())
+}
+
+fn run<'f>(
+    cx: &Cx,
+    root: &Dir<ReadWrite>,
+    files: &[FileEntry<'_>],
+    req: &Request<&'f Frame>,
+    task: &Task<&'f Frame>,
+    frame: &'f Frame,
+) -> Result<Did<'f>, CliError> {
     let cx = cx.span("task");
     match task.name.kind {
         Kind::Units => {
@@ -59,8 +132,8 @@ pub fn run<'f>(
             }
             parts.sort_unstable_by_key(|part| part.name);
             let out = parts_out(&parts);
-            let done = [Output { name: task.name, out, reads: &[], parts: &parts, findings: &[], payload: &[] }];
-            req.step(Event::Ran { ticket, ran: Ran::Done(&done) }, effects)?;
+            let (findings, messages, payload) = (Vec::new_in(frame), Vec::new_in(frame), Vec::new_in(frame));
+            Ok(Did::Done(Made { name: task.name, out, parts, findings, messages, payload }))
         }
         Kind::FileItems => {
             let index = task.file.ok_or(CliError::Text { what: "a FileItems task with no file" })?;
@@ -79,8 +152,7 @@ pub fn run<'f>(
                 let ItemDetail::Mod { inline: false, path: attr } = item.detail else { continue };
                 if attr.is_some() {
                     let failure = TaskFailure { name: task.name, what: "a `#[path]` module is not read yet", rule: "blaze-cli work.rs" };
-                    req.step(Event::Ran { ticket, ran: Ran::Failed(failure) }, effects)?;
-                    return Ok(());
+                    return Ok(Did::Failed(failure));
                 }
                 let Some(name) = item.name else { continue };
                 let child = module_file(path, text, &outline, item, item.text(text, name), frame)?;
@@ -89,26 +161,25 @@ pub fn run<'f>(
             }
             parts.sort_unstable_by_key(|part| part.name);
             let mut findings = Vec::new_in(frame);
+            let mut messages = Vec::new_in(frame);
             for error in outline.errors() {
-                findings.push(Finding { rule: SYNTAX, start: error.range.start, end: error.range.end, message: outline.message(error).as_bytes() });
+                let at = messages.len();
+                messages.extend_from_slice(outline.message(error).as_bytes());
+                findings.push((SYNTAX, error.range.start, error.range.end, at, messages.len()));
             }
             let record = outline
                 .to_file_items(text, ContentId::of(crate::sweep::FILE_DOMAIN, text.as_bytes()), frame)
                 .map_err(|_| CliError::Text { what: "the outline is not one of its file" })?;
+            let payload = Vec::from_slice_in(&record, frame);
             let out = parts_out(&parts);
-            let done = [Output { name: task.name, out, reads: &[], parts: &parts, findings: &findings, payload: &record }];
-            req.step(Event::Ran { ticket, ran: Ran::Done(&done) }, effects)?;
+            Ok(Did::Done(Made { name: task.name, out, parts, findings, messages, payload }))
         }
-        _ => {
-            let failure = TaskFailure {
-                name: task.name,
-                what: "this task kind is not built on the new item layer yet",
-                rule: "drive.md, \"Tasks and Need\"",
-            };
-            req.step(Event::Ran { ticket, ran: Ran::Failed(failure) }, effects)?;
-        }
+        _ => Ok(Did::Failed(TaskFailure {
+            name: task.name,
+            what: "this task kind is not built on the new item layer yet",
+            rule: "drive.md, \"Tasks and Need\"",
+        })),
     }
-    Ok(())
 }
 
 /// What a reader of a parts list sees: the parts' names, how each is found and where.

@@ -180,11 +180,9 @@ pub(super) fn encode<'db>(
     let nodes = Nodes::of(Body::of(db, def));
     let root = InferRoot {
         locs,
-        record: Slice::between(
-            field(offset_of!(InferRoot, record)),
-            record_at as u64,
-            record.len(),
-        ),
+        record: Slice::between(field(offset_of!(InferRoot, record)),
+        record_at as u64,
+        record.len(),),
         ids: words.slice(field(offset_of!(InferRoot, ids))),
         items: keys.slice(field(offset_of!(InferRoot, items))),
         kinds: kinds.slice(field(offset_of!(InferRoot, kinds))),

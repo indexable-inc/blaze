@@ -21,11 +21,7 @@ use std::sync::Arc;
 
 use blaze_hash::{HashMap, HashSet};
 
-use crate::error::{
-    BuiltinNotNodeSnafu, BuiltinNotNumberSnafu, CaseNotIdentifierSnafu, Error, InternalSnafu,
-    TooManyBindingsSnafu,
-    TooManyRowsSnafu, TooManySourceRowsSnafu,
-};
+use crate::error::Error;
 use crate::program::{AppAtom, BodyAtom, CASES, Language, Program, Term};
 
 /// One value in a relation row.
@@ -344,7 +340,7 @@ impl<'p, F: Facts> Evaluator<'p, F> {
                 .iter()
                 .map(|var| {
                     body.slot(var).ok_or_else(|| {
-                        InternalSnafu { what: format!("head variable `{var}` has no slot") }.build()
+                        Error::Internal { what: format!("head variable `{var}` has no slot") }
                     })
                 })
                 .collect::<Result<_, _>>()?;
@@ -355,7 +351,7 @@ impl<'p, F: Facts> Evaluator<'p, F> {
 
     fn relation(&self, name: &str) -> Result<usize, FError<F>> {
         self.names.iter().position(|n| n == name).ok_or_else(|| {
-            InternalSnafu { what: format!("relation `{name}` missing from the program") }.build()
+            Error::Internal { what: format!("relation `{name}` missing from the program") }
         })
     }
 
@@ -408,7 +404,7 @@ impl<'p, F: Facts> Evaluator<'p, F> {
                     let mut result =
                         crate::eval::args(&mut names, std::slice::from_ref(&count.result), true);
                     let result = result.pop().ok_or_else(|| {
-                        InternalSnafu { what: "count without a result".to_owned() }.build()
+                        Error::Internal { what: "count without a result".to_owned() }
                     })?;
                     Step::Count { relation, args, index, result }
                 }
@@ -440,7 +436,7 @@ impl<'p, F: Facts> Evaluator<'p, F> {
         self.facts.solve(atom, line, &key.1, &mut rows)?;
         let held = self.held.get() + rows.len();
         if held > self.limits.rows {
-            return TooManySourceRowsSnafu { line, cap: self.limits.rows }.fail();
+            return Err(Error::TooManySourceRows { line, cap: self.limits.rows });
         }
         self.held.set(held);
         let rows = Rc::new(rows);
@@ -530,23 +526,21 @@ impl<'p, F: Facts> Evaluator<'p, F> {
                 Some(row) if self.relations[compiled.relation].seen.contains(&row) => Ok(()),
                 Some(row) => {
                     if self.held.get() + staged.len() >= self.limits.rows {
-                        return TooManyRowsSnafu {
+                        return Err(Error::TooManyRows {
                             relation: self.names[compiled.relation].clone(),
                             line: compiled.line,
                             cap: self.limits.rows,
-                        }
-                        .fail();
+                        });
                     }
                     staged.push((compiled.relation, row));
                     Ok(())
                 }
-                None => InternalSnafu {
+                None => Err(Error::Internal {
                     what: format!(
                         "rule for `{}` left a head slot unbound",
                         self.names[compiled.relation]
                     ),
-                }
-                .fail(),
+                }),
             }
         })
     }
@@ -663,55 +657,50 @@ impl<'p, F: Facts> Evaluator<'p, F> {
         let facts = self.facts;
         let regex = || {
             app.regex.as_ref().ok_or_else(|| {
-                InternalSnafu { what: format!("{} at rules:{} has no regex", app.name, app.line) }
-                    .build()
+                Error::Internal { what: format!("{} at rules:{} has no regex", app.name, app.line) }
             })
         };
         let value = |at: usize| {
             input(&args[at], env).ok_or_else(|| {
-                InternalSnafu {
+                Error::Internal {
                     what: format!(
                         "builtin `{}` at rules:{} ran with an input unbound",
                         app.name, app.line
                     ),
                 }
-                .build()
             })
         };
         let node = |at: usize| -> Result<F::Node, FError<F>> {
             match value(at)? {
                 Value::Node(node) => Ok(node),
-                other => BuiltinNotNodeSnafu {
+                other => Err(Error::BuiltinNotNode {
                     line: app.line,
                     name: app.name.clone(),
                     arg: crate::program::term_display(&app.args[at]),
                     what: other.what(),
-                }
-                .fail(),
+                }),
             }
         };
         let span = |at: usize| -> Result<(usize, Range<usize>), FError<F>> {
             let n = node(at)?;
             facts.span(n).ok_or_else(|| {
-                BuiltinNotNodeSnafu {
+                Error::BuiltinNotNode {
                     line: app.line,
                     name: app.name.clone(),
                     arg: crate::program::term_display(&app.args[at]),
                     what: "not syntax",
                 }
-                .build()
             })
         };
         let int = |at: usize| -> Result<i64, FError<F>> {
             match value(at)? {
                 Value::Int(int) => Ok(int),
-                other => BuiltinNotNumberSnafu {
+                other => Err(Error::BuiltinNotNumber {
                     line: app.line,
                     name: app.name.clone(),
                     arg: crate::program::term_display(&app.args[at]),
                     what: other.what(),
-                }
-                .fail(),
+                }),
             }
         };
         let holds = |yes: bool, row: Row<F::Node>| if yes { vec![row] } else { Vec::new() };
@@ -800,13 +789,12 @@ impl<'p, F: Facts> Evaluator<'p, F> {
                 let style = value(1)?;
                 let text = facts.value_text(&subject);
                 let Some(&case) = CASES.iter().find(|it| **it == facts.value_text(&style)) else {
-                    return InternalSnafu {
+                    return Err(Error::Internal {
                         what: format!("case at rules:{} ran with a style load did not check", app.line),
-                    }
-                    .fail();
+                    });
                 };
                 let cased = recase(&text, case).ok_or_else(|| {
-                    CaseNotIdentifierSnafu { line: app.line, text: text.as_ref() }.build()
+                    Error::CaseNotIdentifier { line: app.line, text: text.to_string() }
                 })?;
                 vec![vec![subject, style, Value::Text(Arc::from(cased.as_str()))]]
             }
@@ -842,7 +830,7 @@ impl<'p, F: Facts> Evaluator<'p, F> {
         let (held, cap) = (self.held.get(), self.limits.rows);
         self.solve(&body, 0, &windows, &mut env, &mut |env| {
             if held + out.len() >= cap {
-                return TooManyBindingsSnafu { line, cap }.fail();
+                return Err(Error::TooManyBindings { line, cap });
             }
             let binding = body
                 .names

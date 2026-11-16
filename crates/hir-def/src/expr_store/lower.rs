@@ -13,7 +13,7 @@ use std::{cell::RefCell, mem, sync::Arc};
 use base_db::{Db, FxIndexSet};
 use blaze_hash::HashMap;
 use cfg::CfgOptions;
-use either::Either;
+use stdx::Either;
 use hir_expand::{
     HirFileId, InFile, MacroDefId,
     builtin::MODULE_PATH_PLACEHOLDER,
@@ -22,7 +22,6 @@ use hir_expand::{
     span_map::SpanMap,
 };
 use intern::{Symbol, sym};
-use itertools::Itertools;
 use rustc_abi::ExternAbi;
 use smallvec::SmallVec;
 use span::{AstIdMap, RealSpanMap, SyntaxContext};
@@ -2300,10 +2299,10 @@ impl<'db> ExprCollector<'db> {
                         );
                         let top = this.store.list_mark();
                         let mut lists = this.store.take_lists();
-                        lists
-                            .pats_since_mut(mark)
-                            .iter_mut()
-                            .set_from(params[params_base..].iter().map(|arg| arg.formal));
+                        let formals = params[params_base..].iter().map(|arg| arg.formal);
+                        for (slot, formal) in lists.pats_since_mut(mark).iter_mut().zip(formals) {
+                            *slot = formal;
+                        }
                         this.store.put_lists(lists, top);
                         params.truncate(params_base);
                         this.stacks.closure_params = params;

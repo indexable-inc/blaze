@@ -95,16 +95,16 @@ impl<N: AstNode> AstPtr<N> {
         N::can_cast(raw.kind()).then_some(AstPtr { raw, _ty: PhantomData })
     }
 
-    pub fn wrap_left<R>(self) -> AstPtr<either::Either<N, R>>
+    pub fn wrap_left<R>(self) -> AstPtr<stdx::Either<N, R>>
     where
-        either::Either<N, R>: AstNode,
+        stdx::Either<N, R>: AstNode,
     {
         AstPtr { raw: self.raw, _ty: PhantomData }
     }
 
-    pub fn wrap_right<L>(self) -> AstPtr<either::Either<L, N>>
+    pub fn wrap_right<L>(self) -> AstPtr<stdx::Either<L, N>>
     where
-        either::Either<L, N>: AstNode,
+        stdx::Either<L, N>: AstNode,
     {
         AstPtr { raw: self.raw, _ty: PhantomData }
     }

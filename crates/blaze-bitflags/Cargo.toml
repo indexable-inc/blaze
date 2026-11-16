@@ -1,0 +1,23 @@
+[package]
+name = "blaze-bitflags"
+description = "blaze's `bitflags!`, in place of the crates.io `bitflags`: a set of named bits over an unsigned integer, declared as a struct or on one of the caller's, with the set operations as `const fn`s and operators, and Debug as `A | B | 0x10`; the paths `bitflags::bitflags`, `bitflags::Flags` and `bitflags::parser::to_writer` of the crate it replaces, so rustc's copied `rustc_abi` names it unchanged; `no_std`, no dependencies"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# Nothing: `core` only.
+[dependencies]
+
+[dev-dependencies]
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

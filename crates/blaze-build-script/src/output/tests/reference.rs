@@ -71,7 +71,7 @@ pub fn parse(input: &[u8], cx: &Context<'_>) -> Result<Output, Error> {
     let mut new_syntax_msrv: Option<Option<String>> = None;
     let mut rest = Some(input);
     while let Some(bytes) = rest {
-        let line = match memchr::memchr(b'\n', bytes) {
+        let line = match blaze_memchr::memchr(b'\n', bytes) {
             Some(at) => {
                 rest = Some(&bytes[at + 1..]);
                 &bytes[..at]

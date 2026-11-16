@@ -27,6 +27,9 @@
 //!   build checks it at each resume against the OS thread the task started on.
 //! - Lock order: [`Cx::lock_order`] hands the task its one [`crate::sync::ranks::Order`], the
 //!   token ranked locks are taken with.
+//! - Crossing threads: a `Cx` never does. A task that runs on a pool's worker gets its context
+//!   from a [`Seed`] made by its spawner (std.md, "A `Seed`"): what of a context may cross,
+//!   grown into the task's `Cx` on the thread that runs it.
 
 use alloc::{rc::Rc, sync::Arc};
 use core::{
@@ -41,12 +44,15 @@ use crate::{
     Plant, Stopped,
     io::{Ends, Io},
     mem::Bytes,
-    task::{Scope, TaskError},
+    task::{
+        Layout, Scope, TaskError,
+        threads::{Class, Pool},
+    },
     trace::RecordKind,
 };
 
-/// The task's context. Not `Send`: it shares its task's frame, which is not `Sync`; a fiber
-/// that moves threads takes its whole task with it.
+/// The task's context. Not `Send`: it shares its task's frame, which is not `Sync`, and its
+/// placement, an `Rc`; a task on another thread gets its own from a [`Seed`].
 pub struct Cx {
     deadline: Deadline,
     cancel: Arc<Cancel>,
@@ -55,9 +61,20 @@ pub struct Cx {
     /// The world the root context came from: where its spans and events are recorded.
     world: Io,
     plant: Plant,
+    /// The class of the scope the context is in: a background scope's tasks run on the
+    /// pool's background queues (std.md, "`Threads`", point 5), and so do its scopes'.
+    class: Class,
     /// Where its task runs, and its task's lock-order token: one per task, shared by the
     /// task's contexts.
     placed: Rc<Placed>,
+}
+
+/// Where the code holding a context runs: worker `n` of its pool, or a thread outside the pool
+/// (the entry's, a test's, or any thread of an `Inline` root).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Here {
+    Outside,
+    Worker(u32),
 }
 
 /// Where a task runs, kept from its start (std.md, "Layouts": a started task never changes its
@@ -65,7 +82,8 @@ pub struct Cx {
 struct Placed {
     /// The worker it was placed on at its start. Under `Inline` every task runs on the thread
     /// that spawned it, so the worker is the scope's count of spawns, a model of the placement
-    /// a pool makes; a simulated migration is [`Plant::TaskMigrates`].
+    /// a pool makes; a simulated migration is [`Plant::TaskMigrates`]. On a pool's worker it is
+    /// that worker's index.
     worker: Cell<u32>,
     /// The OS thread it started on: a debug build checks each resume against it (rustc's
     /// builds only: blaze's lets a task move).
@@ -73,17 +91,86 @@ struct Placed {
     thread: crate::rt::ThreadMark,
     /// Whether [`Cx::lock_order`]'s token is out.
     order_out: Cell<bool>,
+    /// The pool its tasks are spawned on: none for an `Inline` root and what is under it.
+    pool: Option<Pool>,
+    /// The thread it runs on, as the pool knows it: a spawn from worker `n` goes to `n`'s own
+    /// queue, which only `n` pushes to.
+    here: Here,
 }
 
 impl Placed {
-    fn on(worker: u32) -> Rc<Placed> {
+    fn on(worker: u32, pool: Option<Pool>, here: Here) -> Rc<Placed> {
         // alloc: once per task, where it runs.
         Rc::new(Placed {
             worker: Cell::new(worker),
             #[cfg(all(debug_assertions, not(blaze)))]
             thread: crate::rt::thread_mark(),
             order_out: Cell::new(false),
+            pool,
+            here,
         })
+    }
+}
+
+/// What of a task's context crosses to the thread that runs it (std.md, "A `Seed`"), made by
+/// [`Cx::seed`] on the spawner and grown into the task's `Cx` by [`Seed::grow`] there.
+///
+/// It carries: the deadline (a time); the scope's cancellation (an `Arc` of an atomic flag and
+/// its outer chain, read and set from any thread); the task's name and its parent's span (for
+/// the trace, recorded on the spawner so the order of openings is the spawner's); the task's
+/// frame, reserved by the spawner (so a frame that cannot be had fails the task at its spawn,
+/// as under `Inline`) and never touched by it again (`Frame` is `Send`, not `Sync`: one thread
+/// at a time bumps it, and from here on that is the runner); the world (`Io` is `Send` and
+/// `Sync`: one handle behind its lock); the plant; the pool; and the scope's class.
+///
+/// It does not carry what is one thread's: the shared owner of the frame (an `Arc` of a
+/// `Frame`, which is not `Sync`), the placement and its lock-order token (one task's, made where
+/// it runs, as is the debug check of its thread), and anything a closure borrowed, which is the
+/// closure's to be `Send` about (both spawns take `Send` closures and results).
+pub(crate) struct Seed {
+    deadline: Deadline,
+    cancel: Arc<Cancel>,
+    span: &'static str,
+    frame: Frame,
+    world: Io,
+    plant: Plant,
+    pool: Option<Pool>,
+    class: Class,
+    /// The placement model's worker, for a task grown outside the pool (a joiner that runs its
+    /// task itself): what the spawner would have counted under `Inline`.
+    worker: u32,
+}
+
+// A `Seed` crosses threads; the bound is stated where it is defined, so a field that is not
+// `Send` fails here, naming it, rather than at a spawn far away.
+const _: () = {
+    const fn crosses<T: Send>() {}
+    crosses::<Seed>();
+    crosses::<Io>();
+};
+
+impl Seed {
+    /// The task's context on the thread that runs it, which is `here`: its frame shared from
+    /// now on by the task's contexts on this thread, its placement made here.
+    pub(crate) fn grow(self, here: Here) -> Cx {
+        let Seed { deadline, cancel, span, frame, world, plant, pool, class, worker } = self;
+        let worker = match here {
+            Here::Worker(at) => at,
+            Here::Outside => worker,
+        };
+        Cx { deadline, cancel, span, frame: shared(frame), world, plant, class, placed: Placed::on(worker, pool, here) }
+    }
+}
+
+/// A scope's cancellation, held where a scope's state is shared with its tasks' threads.
+pub(crate) struct Canceller(Arc<Cancel>);
+
+impl Canceller {
+    /// Cancels the scope: as [`Cx::cancel`].
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    pub(crate) fn cancel(&self) {
+        self.0.set.store(true, Ordering::Release);
     }
 }
 
@@ -133,8 +220,16 @@ impl Cx {
             frame: shared(frame),
             world,
             plant,
-            placed: Placed::on(0),
+            class: Class::Foreground,
+            placed: Placed::on(0, None, Here::Outside),
         }
+    }
+
+    /// The root context of `world` on `pool` (std.md, "`Threads`"): as [`Cx::root`], its tasks
+    /// spawned on the pool's workers, its own code on the calling thread, outside the pool.
+    pub(crate) fn root_on(deadline: Deadline, frame: Frame, world: Io, pool: Pool) -> Cx {
+        let cx = Cx::root(deadline, frame, world);
+        Cx { placed: Placed::on(0, Some(pool), Here::Outside), ..cx }
     }
 
     /// A child whose deadline is the earlier of this one's and `deadline`: never later.

@@ -18,7 +18,7 @@ blaze-core.workspace = true
 blaze-hash.workspace = true
 blaze-mem.workspace = true
 blaze-serde.workspace = true
-memchr.workspace = true
+blaze-memchr.workspace = true
 serde.workspace = true
 serde_derive.workspace = true
 

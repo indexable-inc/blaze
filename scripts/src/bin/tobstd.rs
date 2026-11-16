@@ -338,8 +338,11 @@ fn names_regex(names: &BTreeSet<String>) -> String {
 }
 
 /// The condition that a node is inside a function named one of `names`.
+/// Not inside a `static` or `const` in it, whose initializer is a wall.
 fn inside_fns(names: &BTreeSet<String>) -> J {
-    o(&[("inside", o(&[("stopBy", s("end")), ("kind", s("function_item")), ("has", o(&[("field", s("name")), ("regex", s(&names_regex(names)))]))]))])
+    let in_fn = o(&[("inside", o(&[("stopBy", s("end")), ("kind", s("function_item")), ("has", o(&[("field", s("name")), ("regex", s(&names_regex(names)))]))]))]);
+    let item = o(&[("stopBy", s("end")), ("any", J::A(vec![o(&[("kind", s("static_item"))]), o(&[("kind", s("const_item"))])]))]);
+    all(in_fn, o(&[("not", o(&[("inside", item)]))]))
 }
 
 /// `rule` and `extra` both.
@@ -875,6 +878,31 @@ fn source_of(ctx: &Context, a: &Args, file: &str, at: usize, cands: Option<&BTre
     Source::Gain(file.to_owned(), func.name.clone(), func.start)
 }
 
+/// The innermost function around byte `at` of `file`.
+fn innermost<'c>(ctx: &'c Context, file: &str, at: usize) -> Option<&'c Func> {
+    ctx.funcs.iter().filter(|f| f.file == file && f.start <= at && at < f.end).min_by_key(|f| f.end - f.start)
+}
+
+/// The names (file, name) that name two functions of a file whose sites would be rewritten
+/// differently: a rule selects functions by name, so it would rewrite them all alike.
+fn mixed_names(ctx: &Context, ats: &[(String, usize)], sources: &[Source]) -> BTreeSet<(String, String)> {
+    let mut outcomes: BTreeMap<(String, String), BTreeSet<String>> = BTreeMap::new();
+    for ((file, at), source) in ats.iter().zip(sources) {
+        let Some(func) = innermost(ctx, file, *at) else { continue };
+        let outcome = match source {
+            Source::Expr(e) => e.clone(),
+            Source::Gain(..) => "\0gain".to_owned(),
+            Source::Wall(..) => "\0wall".to_owned(),
+        };
+        outcomes.entry((file.clone(), func.name.clone())).or_default().insert(outcome);
+    }
+    outcomes
+        .into_iter()
+        .filter(|((file, name), seen)| seen.len() > 1 && ctx.funcs.iter().filter(|f| &f.file == file && &f.name == name).count() > 1)
+        .map(|(key, _)| key)
+        .collect()
+}
+
 /// The functions (file, start) that the sites at `ats` would give the parameter.
 fn candidates(ctx: &Context, a: &Args, ats: &[(String, usize)]) -> BTreeSet<(String, usize)> {
     ats.iter()
@@ -1023,29 +1051,33 @@ fn thread_sites(grep: &Grep<'_>, a: &Args, shapes: &[Shape], files: &[String], o
         .map(|(n, sh)| Rule { id: format!("site{n}"), rule: sh.rule.clone(), constraints: sh.constraints.clone(), fix: None, transform: None })
         .collect();
     let sites = grep.query(&query, files)?;
-    // First every function that gains, so that a name's other functions are judged with them.
+    // First every function that would gain, so that a name's other functions are judged with them.
+    let ats: Vec<(String, usize)> = sites.iter().map(|m| (m.file.clone(), m.start)).collect();
+    let cands = candidates(&ctx, a, &ats);
+    let sources: Vec<Source> = sites.iter().map(|m| source_of(&ctx, a, &m.file, m.start, Some(&cands))).collect();
+    let mixed = mixed_names(&ctx, &ats, &sources);
     let mut gaining: BTreeSet<(String, String)> = BTreeSet::new();
-    for _ in 0..2 {
-        for m in &sites {
-            if let Source::Gain(f, n) = source_of(&ctx, a, &m.file, m.start, &gaining) {
-                gaining.insert((f, n));
-            }
-        }
-    }
     // By file, then by the value's expression: the functions whose sites take it.
     let mut plan: BTreeMap<String, BTreeMap<String, BTreeSet<String>>> = BTreeMap::new();
-    for m in &sites {
+    for (m, source) in sites.iter().zip(sources) {
         let index: usize = m.rule.trim_start_matches("site").parse().unwrap_or(0);
         let shape = site_shapes[index];
-        let func = ctx.funcs.iter().filter(|f| f.file == m.file && f.start <= m.start && m.start < f.end).min_by_key(|f| f.end - f.start);
-        match source_of(&ctx, a, &m.file, m.start, &gaining) {
-            Source::Wall(kind, what) => out.wall(kind, &m.file, m.line, &format!("{} {what}", shape.row).trim().to_owned()),
+        let func = innermost(&ctx, &m.file, m.start);
+        let name = func.map(|f| f.name.clone()).unwrap_or_default();
+        let source = if mixed.contains(&(m.file.clone(), name.clone())) {
+            Source::Wall("ambiguous", format!("`{name}` names functions of the file whose sites differ"))
+        } else {
+            source
+        };
+        match source {
+            Source::Wall(kind, what) => out.wall(kind, &m.file, m.line, format!("{} {what}", shape.row).trim()),
             Source::Expr(e) => {
                 *out.sites.entry(shape.row.clone()).or_default() += 1;
-                plan.entry(m.file.clone()).or_default().entry(e).or_default().insert(func.map(|f| f.name.clone()).unwrap_or_default());
+                plan.entry(m.file.clone()).or_default().entry(e).or_default().insert(name);
             }
-            Source::Gain(f, n) => {
+            Source::Gain(f, n, _) => {
                 *out.sites.entry(shape.row.clone()).or_default() += 1;
+                gaining.insert((f.clone(), n.clone()));
                 plan.entry(f).or_default().entry(a.value.clone()).or_default().insert(n);
             }
         }
@@ -1218,25 +1250,37 @@ fn settle(grep: &Grep<'_>, a: &Args, root: &Path, out: &mut Summary) -> Result<(
         let threaded: BTreeSet<String> = ctx.funcs.iter().filter(|f| has_param(&f.params, &a.value)).map(|f| f.name.clone()).collect();
         let mut acted = false;
         let mut gaining: BTreeSet<(String, String)> = BTreeSet::new();
-        // By file: (callee, given) to the expression to the functions the calls are in.
+        // By file: (callee, given, the expression) to the functions the calls are in.
         let mut calls: BTreeMap<String, BTreeMap<(String, usize, String), BTreeSet<String>>> = BTreeMap::new();
         let mut left = Vec::new();
+        let mut acting = Vec::new();
         for e in &errors {
             let callee = texts.get(&e.file).and_then(|t| t.get(e.start..e.end)).map(|t| t.rsplit("::").next().unwrap_or(t).rsplit('.').next().unwrap_or(t).trim().to_owned());
             let fits = e.code == "E0061" && arity(&e.message).is_some_and(|(w, g)| w == g + 1);
-            let Some(callee) = callee.filter(|c| fits && threaded.contains(c)) else {
-                left.push(e);
-                continue;
-            };
+            match callee.filter(|c| fits && threaded.contains(c)) {
+                Some(callee) => acting.push((e, callee)),
+                None => left.push(e),
+            }
+        }
+        let ats: Vec<(String, usize)> = acting.iter().map(|(e, _)| (e.file.clone(), e.start)).collect();
+        let cands = candidates(&ctx, a, &ats);
+        let sources: Vec<Source> = ats.iter().map(|(file, at)| source_of(&ctx, a, file, *at, Some(&cands))).collect();
+        let mixed = mixed_names(&ctx, &ats, &sources);
+        for ((e, callee), source) in acting.into_iter().zip(sources) {
             let (_, given) = arity(&e.message).unwrap_or((0, 0));
-            let func = ctx.funcs.iter().filter(|f| f.file == e.file && f.start <= e.start && e.start < f.end).min_by_key(|f| f.end - f.start);
-            match source_of(&ctx, a, &e.file, e.start, &gaining) {
-                Source::Wall(kind, what) => out.wall(kind, &e.file, e.line, &format!("a call of `{callee}` {what}").trim().to_owned()),
+            let name = innermost(&ctx, &e.file, e.start).map(|f| f.name.clone()).unwrap_or_default();
+            let source = if mixed.contains(&(e.file.clone(), name.clone())) {
+                Source::Wall("ambiguous", format!("`{name}` names functions of the file whose calls differ"))
+            } else {
+                source
+            };
+            match source {
+                Source::Wall(kind, what) => out.wall(kind, &e.file, e.line, format!("a call of `{callee}` {what}").trim()),
                 Source::Expr(x) => {
-                    calls.entry(e.file.clone()).or_default().entry((callee, given, x)).or_default().insert(func.map(|f| f.name.clone()).unwrap_or_default());
+                    calls.entry(e.file.clone()).or_default().entry((callee, given, x)).or_default().insert(name);
                     acted = true;
                 }
-                Source::Gain(f, n) => {
+                Source::Gain(f, n, _) => {
                     gaining.insert((f.clone(), n.clone()));
                     calls.entry(f).or_default().entry((callee, given, a.value.clone())).or_default().insert(n);
                     acted = true;
@@ -1357,7 +1401,10 @@ fn selftest() {
     let lit = method_shape(&row("\"..\".to_string()", "method", "method", "blaze_own::String::from_str_in(\"..\", alloc)", "add-arg"), "blaze_own::String::from_str_in(\"..\", alloc)");
     expect(lit.as_ref().is_ok_and(|m| m.fix == "blaze_own::String::from_str_in($X, {V})"), &format!("a literal's method: {lit:?}"));
     let untyped = method_shape(&row(".to_owned()", "method", "method", "blaze_own::ToOwnedIn::to_owned_in(alloc)", "add-arg"), "blaze_own::ToOwnedIn::to_owned_in(alloc)");
-    expect(untyped.is_err(), "a method whose receiver's type decides it is skipped");
+    expect(
+        untyped.as_ref().is_ok_and(|m| m.constraints.as_ref().is_some_and(|c| c.text().contains("string_literal")) && m.fix == "blaze_own::ToOwnedIn::to_owned_in($X, {V})"),
+        &format!("a method whose receiver's type decides it is taken on a literal only: {untyped:?}"),
+    );
     let ty = type_shape(&row("Vec", "prelude", "type", "blaze_own::Vec<T, A>", "add-arg"), "blaze_own::Vec<T, A>");
     expect(ty.as_ref().is_ok_and(|t| t.fix == "blaze_own::Vec<$T0, {T}>"), &format!("a type's shape: {ty:?}"));
     expect(arity("this function takes 2 arguments but 1 argument was supplied") == Some((2, 1)), "E0061's counts");

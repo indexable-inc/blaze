@@ -235,7 +235,8 @@ path = "src/a.rs"
         Some(&value!(in Global; {"opt-level": 3}))
     );
     assert_eq!(v.get("bin"), Some(&value!(in Global; [{"name": "a", "path": "src/a.rs"}])));
-    let edit = Edit::new_in(&parse(text), Global);
+    let doc = parse(text);
+    let edit = Edit::new_in(&doc, Global);
     assert_eq!(edit.finish().unwrap().as_str(), text, "no edits: byte for byte");
 }
 

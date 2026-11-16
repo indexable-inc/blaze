@@ -127,8 +127,6 @@ fn digests_parse_and_print_as_algo_colon_hex() {
     let blake3 = Digest::of(Algo::Blake3, b"abc");
     assert_eq!(blake3.to_string(), format!("blake3:{}", Blake3::of(b"abc").hex()));
     assert_eq!(Digest::parse(&blake3.to_string()), Ok(blake3));
-    let json: Digest = serde_json::from_str(&format!("\"{sha256}\"")).unwrap();
-    assert_eq!(json, sha256);
 }
 
 #[test]
@@ -152,7 +150,6 @@ fn weak_unknown_and_malformed_digests_are_refused_by_name() {
     assert!(matches!(refused("sha256:zz"), DigestRefused::NotHex { algo: Algo::Sha256, .. }));
     assert!(matches!(refused("sha256:ba78"), DigestRefused::Length { digits: 4, .. }));
     assert!(refused("md5:00").to_string().contains("weak"));
-    assert!(serde_json::from_str::<Digest>("\"sha1:00\"").is_err());
 }
 
 #[test]

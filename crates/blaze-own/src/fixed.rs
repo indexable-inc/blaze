@@ -3,6 +3,8 @@
 //!
 //! - [`FixedVec<T, N>`]: up to `N` values stored inline, no allocator at all. A push past `N`
 //!   is refused with [`Full`], which hands the value back and names the capacity; nothing grows.
+//! - [`FixedString<N>`]: up to `N` bytes of UTF-8 inline, refused past `N` alike; a
+//!   `fmt::Write` sink that fails rather than allocates.
 //! - [`Inline<BYTES>`]: an allocator over a buffer of `BYTES` inside itself, so any collection
 //!   here can live on the stack: `Vec::new_in(&inline)`. It bumps a top and refuses when the
 //!   buffer is full; it never asks another allocator. A free of the newest block, and a growth
@@ -374,6 +376,112 @@ impl<T, const N: usize> Drop for IntoIter<T, N> {
         );
         // SAFETY: the slots in `left` hold values, dropped once.
         unsafe { ptr::drop_in_place(left) };
+    }
+}
+
+/// Up to `N` bytes of UTF-8, inline (see the module).
+#[derive(Clone, Copy)]
+pub struct FixedString<const N: usize> {
+    /// Bytes `..len` are UTF-8, cut only at a character's boundary; the rest are zero.
+    len: usize,
+    bytes: [u8; N],
+}
+
+impl<const N: usize> FixedString<N> {
+    pub const fn new() -> FixedString<N> {
+        FixedString { len: 0, bytes: [0; N] }
+    }
+
+    #[inline]
+    pub fn as_str(&self) -> &str {
+        // SAFETY: bytes `..len` are only ever written from whole `str`s (`try_push_str`), so
+        // they are UTF-8 and end at a character's boundary.
+        unsafe { core::str::from_utf8_unchecked(&self.bytes[..self.len]) }
+    }
+
+    #[inline]
+    pub const fn len(&self) -> usize {
+        self.len
+    }
+
+    #[inline]
+    pub const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// `N`.
+    #[inline]
+    pub const fn capacity(&self) -> usize {
+        N
+    }
+
+    /// `text` at the end, or handed back whole (nothing written) when it does not fit.
+    pub fn try_push_str<'t>(&mut self, text: &'t str) -> Result<(), Full<&'t str>> {
+        let end = self.len + text.len();
+        if end > N {
+            return Err(Full { value: text, cap: N });
+        }
+        self.bytes[self.len..end].copy_from_slice(text.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+
+    /// `char` at the end, or handed back when its UTF-8 does not fit.
+    pub fn try_push(&mut self, char: char) -> Result<(), Full<char>> {
+        let mut buf = [0; 4];
+        self.try_push_str(char.encode_utf8(&mut buf)).map_err(|_| Full { value: char, cap: N })
+    }
+
+    pub fn clear(&mut self) {
+        self.len = 0;
+    }
+}
+
+impl<const N: usize> Default for FixedString<N> {
+    fn default() -> FixedString<N> {
+        FixedString::new()
+    }
+}
+
+impl<const N: usize> Deref for FixedString<N> {
+    type Target = str;
+
+    #[inline]
+    fn deref(&self) -> &str {
+        self.as_str()
+    }
+}
+
+/// A write that does not fit fails with `fmt::Error` and writes nothing of that piece.
+impl<const N: usize> fmt::Write for FixedString<N> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        self.try_push_str(text).map_err(|_| fmt::Error)
+    }
+}
+
+impl<const N: usize> fmt::Debug for FixedString<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(self.as_str(), f)
+    }
+}
+
+impl<const N: usize> fmt::Display for FixedString<N> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self.as_str(), f)
+    }
+}
+
+impl<const N: usize> PartialEq for FixedString<N> {
+    fn eq(&self, other: &FixedString<N>) -> bool {
+        self.as_str() == other.as_str()
+    }
+}
+
+impl<const N: usize> Eq for FixedString<N> {}
+
+impl<const N: usize> Hash for FixedString<N> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_str().hash(state);
     }
 }
 

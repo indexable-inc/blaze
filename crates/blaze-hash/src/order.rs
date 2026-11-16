@@ -642,6 +642,28 @@ impl<T, S, A: Allocator + Clone> OrderSet<T, S, A> {
     pub fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
         self.0.retain(|it, ()| keep(it));
     }
+
+    /// Takes every value out in insertion order and keeps the memory, as [`OrderSet::clear`]
+    /// does. The index table is emptied first, so a drain dropped part way leaves an empty set.
+    pub fn drain(&mut self) -> impl Iterator<Item = T> + '_ {
+        self.0.table.clear();
+        self.0.entries.drain(..).map(|slot| slot.key)
+    }
+}
+
+/// The key of a set's entry, as the borrowing iterator gives it.
+fn set_value<'a, T>((it, ()): (&'a T, &'a ())) -> &'a T {
+    it
+}
+
+impl<'a, T, S, A: Allocator + Clone> IntoIterator for &'a OrderSet<T, S, A> {
+    type Item = &'a T;
+    type IntoIter = core::iter::Map<Iter<'a, T, ()>, fn((&'a T, &'a ())) -> &'a T>;
+
+    #[inline]
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter().map(set_value as fn((&'a T, &'a ())) -> &'a T)
+    }
 }
 
 impl<T: Eq + Hash, S: BuildHasher, A: Allocator + Clone> OrderSet<T, S, A> {

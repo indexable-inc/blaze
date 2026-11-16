@@ -29,7 +29,6 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use crate::span::symbol;
-use thiserror::Error;
 
 use crate::comment::LineClasses;
 use crate::emitter::Emitter;
@@ -106,42 +105,69 @@ pub(crate) const RUSTFMT_VERSION: &str = "1.11.0";
 
 /// The various errors that can occur during formatting. Note that not all of
 /// these can currently be propagated to clients.
-#[derive(Error, Debug)]
+#[derive(Debug)]
 pub enum ErrorKind {
     /// Line has exceeded character limit (found, maximum).
-    #[error(
-        "line formatted, but exceeded maximum width \
-         (maximum: {1} (see `max_width` option), found: {0})"
-    )]
     LineOverflow(usize, usize),
     /// Line ends in whitespace.
-    #[error("left behind trailing whitespace")]
     TrailingWhitespace,
     /// Used deprecated skip attribute.
-    #[error("`rustfmt_skip` is deprecated; use `rustfmt::skip`")]
     DeprecatedAttr,
     /// Used a rustfmt:: attribute other than skip or skip::macros.
-    #[error("invalid attribute")]
     BadAttr,
     /// An io error during reading or writing.
-    #[error("io error: {0}")]
     IoError(io::Error),
     /// Error during module resolution.
-    #[error("{0}")]
-    ModuleResolutionError(#[from] ModuleResolutionErrors),
+    ModuleResolutionError(ModuleResolutionErrors),
     /// Parse error occurred when parsing the input.
-    #[error("parse error")]
     ParseError,
     /// The user mandated a version and the current version of Rustfmt does not
     /// satisfy that requirement.
-    #[error("version mismatch")]
     VersionMismatch,
     /// If we had formatted the given node, then we would have lost a comment.
-    #[error("not formatted because a comment would be lost")]
     LostComment,
     /// Invalid glob pattern in `ignore` configuration option.
-    #[error("Invalid glob pattern found in ignore list: {0}")]
     InvalidGlobPattern(ignore_path::IgnoreUnsupported),
+}
+
+impl fmt::Display for ErrorKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ErrorKind::LineOverflow(found, maximum) => write!(
+                f,
+                "line formatted, but exceeded maximum width \
+                 (maximum: {maximum} (see `max_width` option), found: {found})"
+            ),
+            ErrorKind::TrailingWhitespace => f.write_str("left behind trailing whitespace"),
+            ErrorKind::DeprecatedAttr => {
+                f.write_str("`rustfmt_skip` is deprecated; use `rustfmt::skip`")
+            }
+            ErrorKind::BadAttr => f.write_str("invalid attribute"),
+            ErrorKind::IoError(e) => write!(f, "io error: {e}"),
+            ErrorKind::ModuleResolutionError(e) => write!(f, "{e}"),
+            ErrorKind::ParseError => f.write_str("parse error"),
+            ErrorKind::VersionMismatch => f.write_str("version mismatch"),
+            ErrorKind::LostComment => f.write_str("not formatted because a comment would be lost"),
+            ErrorKind::InvalidGlobPattern(e) => {
+                write!(f, "Invalid glob pattern found in ignore list: {e}")
+            }
+        }
+    }
+}
+
+impl core::error::Error for ErrorKind {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            ErrorKind::ModuleResolutionError(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<ModuleResolutionErrors> for ErrorKind {
+    fn from(e: ModuleResolutionErrors) -> ErrorKind {
+        ErrorKind::ModuleResolutionError(e)
+    }
 }
 
 impl ErrorKind {

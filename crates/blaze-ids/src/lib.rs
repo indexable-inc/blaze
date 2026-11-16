@@ -10,7 +10,7 @@
 //! - A [`Fingerprint`] is the 128 bits of a result kept for early cutoff (docs/v2/plan/design/item-hash.md
 //!   section 6.2).
 
-#![feature(allocator_ext, portable_simd, register_tool)]
+#![feature(allocator_api, allocator_ext, portable_simd, register_tool)]
 #![register_tool(blaze)]
 #![deny(unsafe_code)]
 
@@ -39,6 +39,8 @@ pub mod names;
 pub use blaze_radix as radix;
 pub use blaze_rng as rng;
 mod std_hash;
+// blaze-data's forms of the IDs (`ToValue`, `FromValue`): one byte string each.
+mod data;
 // serde's forms of the IDs, for the crates above that persist them with serde: behind the
 // `serde` feature, which they turn on (the root manifest's entry), so this crate depends on no
 // crate from outside the workspace (docs/v2/plan/design/bottom.md, "Also decided on 2026-11-15").

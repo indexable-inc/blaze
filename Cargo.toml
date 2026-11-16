@@ -299,11 +299,9 @@ blaze-diagnostics = { path = "crates/blaze-diagnostics", version = "0.0.0" }
 # `blaze audit`: sources pinned by strong digests, advisories, yanked versions (sans-IO).
 blaze-audit = { path = "crates/blaze-audit" }
 blaze-fetch = { path = "crates/blaze-fetch" }
-# `serde` on for the old layer's crates; the new layer's name blaze-format by path, which keeps
-# its closure to workspace crates.
-blaze-format = { path = "crates/blaze-format", features = ["serde"] }
+blaze-format = { path = "crates/blaze-format" }
 # The record half of blaze-format on `core` alone, for the new item layer's `no_std` crates;
-# blaze-format re-exports it whole, with its `alloc` feature on (`serde` by blaze-format's).
+# blaze-format re-exports it whole, with its `alloc` feature on.
 blaze-format-core = { path = "crates/blaze-format-core" }
 # Compression by tier of blaze-format buffers (hot, warm, cold under zstd): the store's, split
 # out so blaze-format brings no third-party package.
@@ -392,6 +390,8 @@ blaze-reclaim = { path = "crates/blaze-reclaim" }
 blaze-mem = { path = "crates/blaze-mem" }
 blaze-own = { path = "crates/blaze-own" } # Vec, Box, Arc, Rc, ... with no default allocator, in place of `alloc`.
 blaze-int = { path = "crates/blaze-int" } # Integer conversions that say what they do (widen, narrow, truncate, saturate), in place of `as`.
+blaze-memchr = { path = "crates/blaze-memchr" } # Byte search (NEON, SSE2, SWAR), in place of memchr.
+blaze-bitflags = { path = "crates/blaze-bitflags" } # `bitflags!`, in place of bitflags.
 # blaze's own data formats, on blaze-own and core only, in place of base64, serde_json,
 # toml/toml_edit and semver (docs/v2/plan/third-party.md).
 blaze-base64 = { path = "crates/blaze-base64" }

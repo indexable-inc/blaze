@@ -240,8 +240,8 @@ fn an_untyped_parse_keeps_its_tree_and_casts_as_the_handle_does() {
 #[test]
 fn either_and_macro_pointers_view_their_nodes() {
     let f = Fixture::source();
-    type Handle = either::Either<ast::Fn, ast::Struct>;
-    type View<'t> = either::Either<view::Fn<'t>, view::Struct<'t>>;
+    type Handle = stdx::Either<ast::Fn, ast::Struct>;
+    type View<'t> = stdx::Either<view::Fn<'t>, view::Struct<'t>>;
     for (h, v) in some(f.nodes::<Handle, View<'_>>()) {
         let found = crate::AstPtr::new(&h).to_view(f.view());
         assert_eq!(vn(&found), vn(&v));

@@ -23,10 +23,12 @@
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 
-use std::alloc::Global;
+use std::alloc::{Allocator, Global};
 use std::fmt::Write as _;
 
+use blaze_data::Value;
 use blaze_fetch::Digest;
+use blaze_toml::Item;
 
 /// One git source's pin.
 #[derive(Clone, PartialEq, Eq, Debug, PartialOrd, Ord)]
@@ -60,9 +62,20 @@ pub fn is_commit(commit: &str) -> bool {
     matches!(commit.len(), 40 | 64) && commit.bytes().all(|it| matches!(it, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// A TOML string, quoted as the `toml` crate quotes one.
+/// A TOML basic string.
 fn quoted(text: &str) -> String {
-    toml::Value::String(text.to_owned()).to_string()
+    let value: Value<Global> = Value::Text(blaze_own::String::from_str_in(text, Global));
+    let mut out = blaze_own::String::new_in(Global);
+    match blaze_toml::write_inline(&value, &mut out) {
+        Ok(()) => out.as_str().to_owned(),
+        Err(why) => unreachable!("a text has a TOML form: {why}"),
+    }
+}
+
+/// ` (line L, column C)`: where `item` is in `blaze.lock`.
+fn place<A: Allocator>(item: &Item<'_, '_, A>) -> String {
+    let (line, col) = item.line_col();
+    format!(" (line {line}, column {col})")
 }
 
 fn digest_of(text: &str, at: &str, bad: &impl Fn(String) -> String) -> Result<Digest, String> {
@@ -90,43 +103,54 @@ impl SourcePins {
 
     /// The `[git]` table of `blaze.lock` at `path` (for errors): every value a strong digest
     /// under a whole commit. `bad` makes an error of what is wrong, naming the file and fix.
-    pub fn parse_git(&mut self, value: &toml::Value, bad: &impl Fn(String) -> String) -> Result<(), String> {
-        let urls = value.as_table().ok_or_else(|| bad("has `git`, which is not a table".to_owned()))?;
-        for (url, commits) in urls {
+    pub fn parse_git<A: Allocator>(&mut self, value: Item<'_, '_, A>, bad: &impl Fn(String) -> String) -> Result<(), String> {
+        if !value.is_table() {
+            return Err(bad(format!("has `git`, which is not a table{}", place(&value))));
+        }
+        for commits in value.children() {
+            let url = commits.key();
             if url.is_empty() || url.contains(char::is_whitespace) {
-                return Err(bad(format!("has `git.{}`, which is no url", quoted(url))));
+                return Err(bad(format!("has `git.{}`, which is no url{}", quoted(url), place(&commits))));
             }
-            let commits = commits
-                .as_table()
-                .ok_or_else(|| bad(format!("has `git.{}`, which is not a table of commits", quoted(url))))?;
-            for (commit, tree) in commits {
+            if !commits.is_table() {
+                return Err(bad(format!("has `git.{}`, which is not a table of commits{}", quoted(url), place(&commits))));
+            }
+            for tree in commits.children() {
+                let commit = tree.key();
                 let at = format!("git.{}.{commit}", quoted(url));
                 if !is_commit(commit) {
-                    return Err(bad(format!("has `{at}`, whose key is no whole commit id (40 or 64 lower-case hex digits)")));
+                    return Err(bad(format!(
+                        "has `{at}`, whose key is no whole commit id (40 or 64 lower-case hex digits){}",
+                        place(&tree)
+                    )));
                 }
-                let tree = tree.as_str().ok_or_else(|| bad(format!("has `{at}`, which is not a string")))?;
-                let tree = digest_of(tree, &at, bad)?;
-                self.set_git(GitPin { url: url.clone(), commit: commit.clone(), tree });
+                let text = tree.as_str().ok_or_else(|| bad(format!("has `{at}`, which is not a string{}", place(&tree))))?;
+                let tree = digest_of(text, &at, bad)?;
+                self.set_git(GitPin { url: url.to_owned(), commit: commit.to_owned(), tree });
             }
         }
         Ok(())
     }
 
     /// The `[advisories]` table of `blaze.lock`.
-    pub fn parse_advisories(&mut self, value: &toml::Value, bad: &impl Fn(String) -> String) -> Result<(), String> {
-        let table = value.as_table().ok_or_else(|| bad("has `advisories`, which is not a table".to_owned()))?;
+    pub fn parse_advisories<A: Allocator>(&mut self, value: Item<'_, '_, A>, bad: &impl Fn(String) -> String) -> Result<(), String> {
+        if !value.is_table() {
+            return Err(bad(format!("has `advisories`, which is not a table{}", place(&value))));
+        }
         let (mut url, mut commit, mut tree) = (None, None, None);
-        for (key, value) in table {
+        for value in value.children() {
+            let key = value.key();
             let at = format!("advisories.{key}");
-            let text = value.as_str().ok_or_else(|| bad(format!("has `{at}`, which is not a string")))?;
-            match key.as_str() {
+            let text = value.as_str().ok_or_else(|| bad(format!("has `{at}`, which is not a string{}", place(&value))))?;
+            match key {
                 "url" => url = Some(text.to_owned()),
                 "commit" if is_commit(text) => commit = Some(text.to_owned()),
-                "commit" => return Err(bad(format!("has `{at}` = `{text}`, which is no whole commit id"))),
+                "commit" => return Err(bad(format!("has `{at}` = `{text}`, which is no whole commit id{}", place(&value)))),
                 "tree" => tree = Some(digest_of(text, &at, bad)?),
                 other => {
                     return Err(bad(format!(
-                        "has `advisories.{other}`, which is not known (`url`, `commit` and `tree` are)"
+                        "has `advisories.{other}`, which is not known (`url`, `commit` and `tree` are){}",
+                        place(&value)
                     )));
                 }
             }

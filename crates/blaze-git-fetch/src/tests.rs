@@ -337,7 +337,7 @@ fn a_missing_base_and_an_oversized_object_are_refused() {
     let (d, target) = delta(&base, &[Op::Copy(0, 3), Op::Insert(b"!".to_vec())]);
     // The delta's base is not in the pack: a thin pack.
     let objects = vec![(Kind::Blob, base, How::Whole), (Kind::Blob, target, How::Ref(0))];
-    let full = write_pack(&objects, &[StdVec::new(), d.clone()], &[false, false]);
+    let full = write_pack(&objects, &[StdVec::new(), d], &[false, false]);
     let alone = {
         let mut out = StdVec::from(&full[..8]);
         out.extend_from_slice(&1u32.to_be_bytes());

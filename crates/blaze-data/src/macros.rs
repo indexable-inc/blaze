@@ -106,14 +106,16 @@ macro_rules! __value {
     };
 
     // One value.
+    // A scalar names no allocator, so it is tied to `$a`'s here: `value!(in a; null)` is a
+    // `Value<A>` of the allocator given, never one left to inference.
     ($a:ident; null) => {
-        $crate::Value::Null
+        $crate::__private::of(&$a, $crate::Value::Null)
     };
     ($a:ident; true) => {
-        $crate::Value::Bool(true)
+        $crate::__private::of(&$a, $crate::Value::Bool(true))
     };
     ($a:ident; false) => {
-        $crate::Value::Bool(false)
+        $crate::__private::of(&$a, $crate::Value::Bool(false))
     };
     ($a:ident; [$($inner:tt)*]) => {
         $crate::__value!(@list $a [] $($inner)*)

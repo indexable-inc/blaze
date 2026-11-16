@@ -101,7 +101,7 @@ pub use crate::{
 };
 pub use hir_expand::{Intern, Lookup, tt};
 
-type FxIndexMap<K, V> = indexmap::IndexMap<K, V, blaze_hash::FixedState>;
+type FxIndexMap<K, V> = blaze_hash::IndexMap<K, V, std::alloc::Global>;
 
 /// Where a module-level item is: the module it is declared in, and what it is, its item key
 /// (docs/v2/plan/design/reconnect.md, "Ids"). Interned from the key: two locations of one item

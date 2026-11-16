@@ -1708,6 +1708,9 @@ impl<A: Allocator + Clone> Request<A> {
         let redo = core::mem::replace(&mut job.redo, false) || stale;
         let entries = job.entries;
         self.profile.entries_seen(entries);
+        if self.program == Program::Running && job.class == Class::Gate {
+            self.profile.checked_beside += 1;
+        }
         // A record about to be decided again is not one a worker should read.
         if !redo {
             let input = Input { name, at: now.at, out: now.out };

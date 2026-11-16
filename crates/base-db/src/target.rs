@@ -4,7 +4,7 @@ use std::fmt;
 
 use blaze_ids::{ContentId, Hasher};
 use intern::Symbol;
-use triomphe::Arc;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Arch {

@@ -957,7 +957,7 @@ mod tests {
         editor.delete(attr.syntax());
         let preds = ["T", "U"].map(|name| {
             let bound = make::type_bound_text("Clone");
-            make::where_pred(either::Either::Right(make::ty(name)), [bound])
+            make::where_pred(stdx::Either::Right(make::ty(name)), [bound])
         });
         strukt.get_or_create_where_clause(&editor, preds.into_iter());
         let edit = editor.finish();

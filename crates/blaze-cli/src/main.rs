@@ -21,7 +21,8 @@ mod work;
 use core::fmt;
 
 use blaze_drive::{
-    Answer, Ask, Command, Config, DriveError, Effect, Event, FileEntry, Request, Tool, WireError,
+    Answer, Ask, Command, Config, DriveError, Effect, Event, FileEntry, Gate, Request, Settled, TableFull, Tool,
+    WireError,
 };
 use blaze_own::{Vec, VecDeque};
 use bstd::fs::{Dir, FsError, ReadWrite};
@@ -53,6 +54,8 @@ pub enum CliError {
     Text { what: &'static str },
     /// The command answered with findings.
     Findings(u32),
+    /// The workers' settled table was sized below the run.
+    Table(TableFull),
 }
 
 impl fmt::Display for CliError {
@@ -69,6 +72,7 @@ impl fmt::Display for CliError {
             CliError::Manifest { line, why } => write!(f, "Cargo.toml:{line}: {why} (drive.md: the units reader takes a single package)"),
             CliError::Text { what } => write!(f, "{what}"),
             CliError::Findings(n) => write!(f, "{n} findings"),
+            CliError::Table(full) => write!(f, "{full}"),
         }
     }
 }
@@ -85,7 +89,12 @@ macro_rules! from {
     };
 }
 
-from!(Missing(Missing), Path(PathError), Fs(FsError), Out(OutError), Drive(DriveError));
+from!(Missing(Missing), Path(PathError), Fs(FsError), Out(OutError), Drive(DriveError), Table(TableFull));
+
+/// `blaze run` and `test` fail on any finding, lints included (bottom.md 11); `check` reports.
+fn every_rule(_: u16) -> bool {
+    true
+}
 
 /// The tool's identity: what every key starts from. A new binary's records are not an old one's.
 fn tool() -> Tool {
@@ -179,9 +188,12 @@ fn request(cx: &Cx, root: &Dir<ReadWrite>, command: Command, workers: u32, frame
         }
         None => None,
     };
-    let config = Config { tool: tool(), workers, most_entries: 64, most_jobs: 1 << 24 };
-    let mut req = Request::new_in(config, Ask { command, args: b"" }, frame);
+    let config = Config { tool: tool(), workers, most_entries: 64, most_jobs: 1 << 24, is_error: every_rule };
+    let mut req = Request::new_in(config, Ask { command, args: b"", gate: Gate::Beside }, frame);
     let mut store = FileStore::open(root)?;
+    // The workers' read side: two slots a name at most a half full; about 128 names a file
+    // (items, bodies, scopes) is the sizing until the profile says otherwise.
+    let table = Settled::new_in(files.len().saturating_mul(128), frame);
     let mut effects: Vec<Effect<&Frame>, &Frame> = Vec::new_in(frame);
     let mut todo: VecDeque<Effect<&Frame>, &Frame> = VecDeque::new_in(frame);
     req.step(Event::Start { files: &files, gone: &gone, last }, &mut effects)?;
@@ -201,7 +213,13 @@ fn request(cx: &Cx, root: &Dir<ReadWrite>, command: Command, workers: u32, frame
                 req.step(Event::Got { key, bytes }, &mut effects)?;
             }
             Effect::Put { key, bytes } => store.put(&cx, key, &bytes)?,
-            Effect::Run { ticket, task } => work::run(&cx, root, &files, &mut req, ticket, &task, frame, &mut effects)?,
+            Effect::Run { batch } => work::run_batch(&cx, root, &files, &mut req, batch, frame, &mut effects)?,
+            // Puts are performed as they come, so every one before this is written.
+            Effect::Publish(input) => table.publish(input)?,
+            Effect::Unpublish(name) => table.clear(name)?,
+            // blaze-run's Parent is not wired: its `Code` names answer NotBuilt (drive.md, "Run").
+            Effect::StartProgram { .. } => return Err(CliError::NotBuilt { command: "run" }),
+            Effect::Stop { errors } => return Err(CliError::Findings(errors)),
             Effect::Print(finding) => print::finding(&cx, root, &req, &finding, frame, out)?,
             Effect::WriteLast { bytes } => {
                 root.publish(&cx, &last_path, bstd::fs::Content::bytes(&bytes), bstd::fs::Durable::No)?;

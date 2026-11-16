@@ -117,7 +117,7 @@ fn run(cli: &Cli) -> Result<(), Error> {
             }
             match blocking_count(&findings, *error) {
                 0 => Ok(()),
-                count => FindingsSnafu { count }.fail(),
+                count => Err(Error::Findings { count }),
             }
         }
         Command::Suppressions { rules, paths, json } => {
@@ -136,7 +136,7 @@ fn run(cli: &Cli) -> Result<(), Error> {
             if *write {
                 for fixed in analysis.rewritten() {
                     std::fs::write(&fixed.path, fixed.content)
-                        .context(WriteFixedSnafu { path: &fixed.path })?;
+                        .context(Error::WriteFixed { path: &fixed.path })?;
                 }
                 eprintln!("astlog: applied {} edit(s)", analysis.edits.len());
             } else {
@@ -148,7 +148,7 @@ fn run(cli: &Cli) -> Result<(), Error> {
 }
 
 fn load(rules: &Path, paths: &[PathBuf]) -> Result<Analysis, Error> {
-    let source = std::fs::read_to_string(rules).context(ReadRulesSnafu { path: rules })?;
+    let source = std::fs::read_to_string(rules).context(Error::ReadRules { path: rules })?;
     Ok(astlog_core::analyze(&source, paths)?)
 }
 
@@ -252,7 +252,7 @@ fn select(analysis: &Analysis, relation: Option<&str>) -> Result<Vec<String>, Er
     match relation {
         None => Ok(all),
         Some(name) if all.iter().any(|key| key == name) => Ok(vec![name.to_owned()]),
-        Some(name) => NoRelationSnafu { name, available: all.join(", ") }.fail(),
+        Some(name) => Err(Error::NoRelation { name, available: all.join(", ") }),
     }
 }
 

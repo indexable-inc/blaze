@@ -73,13 +73,22 @@ pub struct Hot {
 }
 
 /// Why there is nothing to read.
-#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum HotError {
-    #[error(
-        "no build has ended in this process, so there is no last build to read the sketches of"
-    )]
     NoBuild,
 }
+
+impl std::fmt::Display for HotError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HotError::NoBuild => f.write_str(
+                "no build has ended in this process, so there is no last build to read the sketches of",
+            ),
+        }
+    }
+}
+
+impl core::error::Error for HotError {}
 
 /// Every ring's counters summed at one moment.
 struct Summed {

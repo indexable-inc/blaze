@@ -6,7 +6,7 @@ use base_db::Db;
 use intern::{Symbol, sym};
 use span::{Edition, SyntaxContext};
 use syntax::utils::is_raw_identifier;
-use syntax::{ast, format_smolstr, view};
+use syntax::{ast, view};
 
 /// `Name` is a wrapper around string, which is used in hir for both references
 /// and declarations. In theory, names should also carry hygiene info, but we are
@@ -127,7 +127,7 @@ impl Name {
     #[inline]
     pub fn new_lifetime(lt: &str) -> Name {
         match lt.strip_prefix("'r#") {
-            Some(lt) => Self::new_text(&format_smolstr!("'{lt}")),
+            Some(lt) => Self::new_text(&format!("'{lt}")),
             None => Self::new_text(lt),
         }
     }
@@ -220,7 +220,7 @@ impl Name {
         if ctxt.is_root() {
             return name;
         }
-        let text = format_smolstr!("\0{}\0{}", ctxt.into_u32(), name.as_str());
+        let text = format!("\0{}\0{}", ctxt.into_u32(), name.as_str());
         Name { symbol: Symbol::intern(&text), ctx: () }
     }
 

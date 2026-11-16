@@ -13,12 +13,6 @@ repository.workspace = true
 [lib]
 doctest = false
 
-[features]
-# serde's forms of `SchemaHash`, `SpanRef` and `RelSpan` (blaze-format-core's `serde`), for the
-# old layer's crates that persist them with serde: the workspace entry turns it on; a crate that
-# wants this crate's closure free of third-party packages names it by path instead.
-serde = ["blaze-format-core/serde"]
-
 [dependencies]
 # The records, views and writer; this crate re-exports them at their old paths. `alloc` for
 # `Writer`'s default and `Persist`. Nothing here may bring a third-party package: compression by

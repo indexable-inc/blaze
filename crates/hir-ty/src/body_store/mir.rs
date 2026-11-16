@@ -652,11 +652,9 @@ fn write_answer<'db>(
     let field = |offset: usize| at + offset as u64;
     let root = MirAnswerRoot {
         locs,
-        body: Slice::between(
-            field(offset_of!(MirAnswerRoot, body)),
-            record_at as u64,
-            record.len(),
-        ),
+        body: Slice::between(field(offset_of!(MirAnswerRoot, body)),
+        record_at as u64,
+        record.len(),),
         ids: words.slice(field(offset_of!(MirAnswerRoot, ids))),
         items: keys.slice(field(offset_of!(MirAnswerRoot, items))),
         kinds: kinds.slice(field(offset_of!(MirAnswerRoot, kinds))),

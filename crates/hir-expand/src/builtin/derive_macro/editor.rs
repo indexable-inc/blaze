@@ -5,8 +5,8 @@
 //! read a tree the editor built.
 
 use blaze_mem::Frame;
-use either::Either;
-use itertools::Itertools;
+use stdx::Either;
+use stdx::iter::IterExt;
 use parser::SyntaxKind;
 use smallvec::SmallVec;
 use span::Span;
@@ -127,7 +127,7 @@ pub(super) fn coerce_pointee_derive<'f>(
                 _ => None,
             })
         })
-        .collect_vec();
+        .collect::<Vec<_>>();
     if type_params.is_empty() {
         return refuse(
             pointee_error(
@@ -698,7 +698,7 @@ pub(super) fn parse_adt_from_handle(
         .flat_map(|param_list| param_list.lifetime_params())
         .filter_map(|param| Some((to_tt(param.syntax()), to_tt(param.lifetime()?.syntax()))))
         .collect(); // alloc: one tree per lifetime parameter; none without generics
-    let mut param_names: SmallVec<[Name; 4]> = SmallVec::new();
+    let mut param_names: Vec<Name> = Vec::new();
     let param_types = generic_param_list
         .into_iter()
         .flat_map(|param_list| param_list.type_or_const_params())

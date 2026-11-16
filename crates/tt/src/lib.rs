@@ -22,7 +22,7 @@ static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 use std::fmt;
 
-use arrayvec::ArrayString;
+use blaze_own::FixedString;
 use buffer::Cursor;
 use intern::Symbol;
 use stdx::{impl_from, itertools::Itertools as _};
@@ -529,9 +529,10 @@ impl Literal {
         let text_and_suffix = if suffix.is_empty() {
             Symbol::intern(text)
         } else if (text.len() + suffix.len()) < MAX_INLINE_CAPACITY {
-            let mut text_and_suffix = ArrayString::<MAX_INLINE_CAPACITY>::new();
-            text_and_suffix.push_str(text);
-            text_and_suffix.push_str(suffix);
+            let mut text_and_suffix = FixedString::<MAX_INLINE_CAPACITY>::new();
+            let fits = "under `MAX_INLINE_CAPACITY` bytes, checked above";
+            text_and_suffix.try_push_str(text).expect(fits);
+            text_and_suffix.try_push_str(suffix).expect(fits);
             Symbol::intern(&text_and_suffix)
         } else {
             let mut text_and_suffix = String::with_capacity(text.len() + suffix.len());
@@ -923,7 +924,7 @@ pub fn stringify<F: Fn(Span, &str) -> Option<bool> + ?Sized>(
         false => source_joined(span, text),
     };
     // A leaf's text, written again for each one `source_joined` is asked about.
-    let mut leaf_text = ArrayString::<64>::new();
+    let mut leaf_text = FixedString::<64>::new();
     // alloc: grows once to the longest leaf over 64 bytes, if there is one.
     let mut long_text = String::new();
     let mut scratch = Scratch { short: &mut leaf_text, long: &mut long_text };
@@ -932,7 +933,7 @@ pub fn stringify<F: Fn(Span, &str) -> Option<bool> + ?Sized>(
 
     /// Where a leaf's text is written to be asked about, without allocating for a short one.
     struct Scratch<'s> {
-        short: &'s mut ArrayString<64>,
+        short: &'s mut FixedString<64>,
         long: &'s mut String,
     }
 
@@ -953,7 +954,7 @@ pub fn stringify<F: Fn(Span, &str) -> Option<bool> + ?Sized>(
     /// characters; `None` once longer, when no operator starts with it.
     #[derive(Default)]
     struct Operator {
-        chars: ArrayString<3>,
+        chars: FixedString<3>,
         overlong: bool,
     }
 

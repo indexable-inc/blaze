@@ -22,12 +22,10 @@ blaze-mem.workspace = true
 blaze-memo.workspace = true
 blaze-surface.workspace = true
 cfg.workspace = true
-indexmap.workspace = true
 intern.workspace = true
 semver.workspace = true
 span.workspace = true
 syntax.workspace = true
-triomphe.workspace = true
 
 [lints]
 workspace = true

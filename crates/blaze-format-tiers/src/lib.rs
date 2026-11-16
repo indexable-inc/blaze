@@ -106,22 +106,18 @@ impl HotColumn {
     pub fn new(field_at: u64, placed: PlacedHot) -> HotColumn {
         let field = |offset: usize| field_at + offset as u64;
         let mut column = HotColumn { u8s: Slice::EMPTY, u16s: Slice::EMPTY, u32s: Slice::EMPTY };
-        let fit = "a hot column's values are written before it, in a buffer under 2 GiB";
         match placed.width {
             Width::U8 => {
                 column.u8s =
                     Slice::between(field(offset_of!(HotColumn, u8s)), placed.at, placed.len)
-                        .expect(fit)
             }
             Width::U16 => {
                 column.u16s =
                     Slice::between(field(offset_of!(HotColumn, u16s)), placed.at, placed.len)
-                        .expect(fit)
             }
             Width::U32 => {
                 column.u32s =
                     Slice::between(field(offset_of!(HotColumn, u32s)), placed.at, placed.len)
-                        .expect(fit)
             }
         }
         column
@@ -380,8 +376,7 @@ impl WarmColumn {
             min: placed.min,
             bits: placed.bits,
             len,
-            words: Slice::between(words, placed.at, placed.words)
-                .expect("a warm column's words are written before it, in a buffer under 2 GiB"),
+            words: Slice::between(words, placed.at, placed.words),
         }
     }
 

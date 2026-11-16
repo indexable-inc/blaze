@@ -851,7 +851,7 @@ fn scenario_traced(
                 let who = trace.who(i);
                 trace.push(Event::Put { who, keys: put });
             }
-            let returned = actor.store.commit(Vec::new_in(Global), sim.wall_ns(), &mut actor.effects);
+            let returned = actor.store.commit(&[],sim.wall_ns(), &mut actor.effects);
             if let Some(trace) = trace {
                 let who = trace.who(i);
                 trace.push(Event::Commit { who, returned: format!("{returned:?}") });
@@ -977,7 +977,7 @@ fn a_head_torn_by_a_power_cut_is_read_through_not_refused() {
             next[i] += 1;
             actor.store.put(key(n), space(n), TAG, &value(n)).unwrap();
             ledger.maybe.insert(n, space(n));
-            actor.store.commit(Vec::new_in(Global), sim.wall_ns(), &mut actor.effects).unwrap();
+            actor.store.commit(&[],sim.wall_ns(), &mut actor.effects).unwrap();
             pending[i] = Some(n);
         }
         let settled = run(&mut sim, &mut actors, &mut budget);
@@ -1153,7 +1153,7 @@ fn the_oracle_catches_a_flip_before_the_sync() {
             ledger.maybe.insert(n, space(n));
         }
         let effects = &mut w[0].effects;
-        w[0].store.commit(Vec::new_in(Global), sim.wall_ns(), effects).unwrap();
+        w[0].store.commit(&[],sim.wall_ns(), effects).unwrap();
         let mut told = false;
         let mut done = Vec::new_in(Global);
         'run: for _ in 0..100_000 {
@@ -1211,7 +1211,7 @@ fn two_writers_commit_at_once() {
         for (i, actor) in actors.iter_mut().enumerate() {
             let n = round * 2 + i as u32;
             actor.store.put(key(n), space(n), TAG, &value(n)).unwrap();
-            actor.store.commit(Vec::new_in(Global), sim.wall_ns(), &mut actor.effects).unwrap();
+            actor.store.commit(&[],sim.wall_ns(), &mut actor.effects).unwrap();
         }
         settle(&mut sim, &mut actors);
         for actor in &mut actors {
@@ -1244,7 +1244,7 @@ fn commit_local(sim: &mut Sim, w: &mut [Actor], keys: std::ops::Range<u32>, ledg
         ledger.maybe.insert(n, Namespace::LOCAL);
     }
     let effects = &mut w[0].effects;
-    w[0].store.commit(Vec::new_in(Global), sim.wall_ns(), effects).unwrap();
+    w[0].store.commit(&[],sim.wall_ns(), effects).unwrap();
     settle(sim, w);
     let committed = w[0].store.take_committed().unwrap().unwrap();
     ledger.land(&keys, &committed).unwrap();
@@ -1481,7 +1481,7 @@ fn build(seed: u64) -> (BTreeMap<String, Vec<u8>>, Sim) {
             w[0].store.put(key(n), space(n), TAG, &value(n)).unwrap();
         }
         let effects = &mut w[0].effects;
-        w[0].store.commit(Vec::new_in(Global), sim.wall_ns(), effects).unwrap();
+        w[0].store.commit(&[],sim.wall_ns(), effects).unwrap();
         settle(&mut sim, &mut w);
         assert!(matches!(w[0].store.take_committed(), Some(Ok(_))));
     }
@@ -1534,7 +1534,7 @@ fn a_head_cut_at_any_length_reads_the_slot_before_or_the_orphans_and_says_so() {
             ledger.maybe.insert(n, space(n));
         }
         let effects = &mut w[0].effects;
-        w[0].store.commit(Vec::new_in(Global), sim.wall_ns(), effects).unwrap();
+        w[0].store.commit(&[],sim.wall_ns(), effects).unwrap();
         settle(&mut sim, &mut w);
         let committed = w[0].store.take_committed().unwrap().unwrap();
         assert_eq!(committed.generation, u64::from(round) + 1);
@@ -1704,7 +1704,7 @@ fn compaction_keeps_roots_and_the_grace_period() {
             w[0].store.root("kept", &[key(1), key(2), key(3)]).unwrap();
         }
         let effects = &mut w[0].effects;
-        w[0].store.commit(Vec::new_in(Global), sim.wall_ns(), effects).unwrap();
+        w[0].store.commit(&[],sim.wall_ns(), effects).unwrap();
         settle(&mut sim, &mut w);
         named.extend(w[0].store.take_committed().unwrap().unwrap().segments);
     }
@@ -1756,14 +1756,14 @@ fn pruning_keeps_what_roots_name() {
         w[0].store.put(key(n), Namespace::LOCAL, TAG, &value(n)).unwrap();
     }
     let effects = &mut w[0].effects;
-    w[0].store.commit(Vec::new_in(Global), sim.wall_ns(), effects).unwrap();
+    w[0].store.commit(&[],sim.wall_ns(), effects).unwrap();
     settle(&mut sim, &mut w);
     assert!(matches!(w[0].store.take_committed(), Some(Ok(_))));
     // Age it past the window.
     for n in 100..100 + super::WINDOW as u32 + 1 {
         w[0].store.put(key(n), Namespace::LOCAL, TAG, &value(n)).unwrap();
         let effects = &mut w[0].effects;
-        w[0].store.commit(Vec::new_in(Global), sim.wall_ns(), effects).unwrap();
+        w[0].store.commit(&[],sim.wall_ns(), effects).unwrap();
         settle(&mut sim, &mut w);
         assert!(matches!(w[0].store.take_committed(), Some(Ok(_))));
     }
@@ -1890,7 +1890,7 @@ fn published(source: &LocalDir, builder: &Builder) -> (Vec<u8>, ContentId) {
     for n in 0..8 {
         ci.put(key(n), Namespace::PUBLIC, TAG, &value(n)).unwrap();
     }
-    let committed = ci.commit_with(Vec::new_in(Global)).unwrap();
+    let committed = ci.commit_with(&[]).unwrap();
     assert_eq!(committed.segments.len(), 1);
     let (seg, bytes) = ci.core().segment(committed.segments[0]).unwrap();
     let bytes = bytes.unwrap().to_vec();
@@ -2029,7 +2029,7 @@ fn sealing(seed: u64, rounds: u32, per: u32, cut_after: Option<u32>, fail_one_in
                 actor.store.put(key(n), space(n), TAG, &value(n)).map_err(|it| it.to_string())?;
                 ledger.maybe.insert(n, space(n));
             }
-            actor.store.commit(Vec::new_in(Global), sim.wall_ns(), &mut actor.effects).map_err(|it| it.to_string())?;
+            actor.store.commit(&[],sim.wall_ns(), &mut actor.effects).map_err(|it| it.to_string())?;
             pending[i] = Some(keys);
         }
         let settled = run(&mut sim, &mut actors, &mut budget);
@@ -2411,7 +2411,7 @@ fn a_record_naming_the_machine_never_reaches_a_shared_namespace() {
     assert!(w[0].store.put(key(1), Namespace::LOCAL, TAG, &leaky).is_ok(), "the local namespace keeps it");
     let mut batch = super::core::Batch::new(org());
     batch.put(key(2), TAG, &leaky).unwrap();
-    let refused = w[0].store.commit(vec![batch], sim.wall_ns(), &mut w[0].effects);
+    let refused = w[0].store.commit(&[&batch],sim.wall_ns(), &mut w[0].effects);
     assert!(matches!(refused, Err(StoreError::Other { .. })), "{refused:?}");
     // The control: a store that lists no path of the machine takes both.
     let mut open = cfg(1, 1, false);
@@ -2421,7 +2421,7 @@ fn a_record_naming_the_machine_never_reaches_a_shared_namespace() {
     assert!(c[0].store.put(key(3), Namespace::PUBLIC, TAG, &leaky).is_ok());
     let mut batch = super::core::Batch::new(org());
     batch.put(key(4), TAG, &leaky).unwrap();
-    assert!(c[0].store.commit(vec![batch], sim.wall_ns(), &mut c[0].effects).is_ok());
+    assert!(c[0].store.commit(&[&batch],sim.wall_ns(), &mut c[0].effects).is_ok());
     settle(&mut sim, &mut c);
 }
 
@@ -2441,7 +2441,7 @@ fn a_startup_image_round_trips_and_reads_in_place_order() {
         for &n in half {
             w[0].store.put(key(n), Namespace::LOCAL, TAG, &value(n)).unwrap();
         }
-        w[0].store.commit(Vec::new_in(Global), sim.wall_ns(), &mut w[0].effects).unwrap();
+        w[0].store.commit(&[],sim.wall_ns(), &mut w[0].effects).unwrap();
         settle(&mut sim, &mut w);
         assert!(matches!(w[0].store.take_committed(), Some(Ok(_))));
     }

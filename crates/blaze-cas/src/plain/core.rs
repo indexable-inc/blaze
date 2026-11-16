@@ -602,18 +602,56 @@ pub struct Plain {
 }
 
 /// One namespace's held puts, and where each key is in them.
-struct Held {
+pub(crate) struct Held {
     batch: Batch,
     at: BTreeMap<Key, usize>,
 }
 
 impl Held {
-    fn new(namespace: Namespace) -> Held {
+    pub(crate) fn new(namespace: Namespace) -> Held {
         Held { batch: Batch::new(namespace), at: BTreeMap::new() }
     }
 
     fn entry(&self, key: &Key) -> Option<&Entry> {
         self.at.get(key).map(|&i| &self.batch.entries[i])
+    }
+
+    pub(crate) fn batch(&self) -> &Batch {
+        &self.batch
+    }
+
+    /// The record under `key` held here: its tag and payload.
+    pub(crate) fn get(&self, key: &Key) -> Option<(Tag, &[u8])> {
+        self.entry(key).map(|entry| (entry.tag, self.batch.payload(entry)))
+    }
+
+    /// `value` under `key`, unless held already: [`Put::Same`] for the same record, a
+    /// [`PutError::Mismatch`] naming both for other bytes.
+    pub(crate) fn put(&mut self, key: Key, tag: Tag, value: &[u8]) -> Result<Put, PutError> {
+        if let Some(entry) = self.entry(&key) {
+            if entry.tag == tag && entry.len as usize == value.len() && entry.crc == record_crc(&key.0, tag, value) {
+                return Ok(Put::Same);
+            }
+            let kept = self.batch.payload(entry);
+            return Err(PutError::Mismatch(Mismatch { key, kept: content_of(kept), given: content_of(value) }));
+        }
+        self.batch.put(key, tag, value)?;
+        self.at.insert(key, self.batch.entries.len() - 1);
+        Ok(Put::Written)
+    }
+
+    /// Every record of `other` not held here, copied in after this one's (a commit that failed
+    /// gives its records back ahead of the puts made while it ran; a put checked both, so no
+    /// key is held with two values).
+    pub(crate) fn absorb(&mut self, other: &Held) {
+        for entry in &other.batch.entries {
+            let key = Key(entry.key);
+            if self.at.contains_key(&key) {
+                continue;
+            }
+            self.batch.put_known(entry, other.batch.payload(entry)).expect("it fit before");
+            self.at.insert(key, self.batch.entries.len() - 1);
+        }
     }
 }
 
@@ -1053,11 +1091,12 @@ impl Plain {
 
     // ---- the commit ----
 
-    /// Writes the store's batches and `batches` (the workers', handed off) as one new segment
-    /// for each namespace that holds records, one after another, with no lock, then flips the
-    /// head once to a generation naming them all. The outcome is [`Plain::take_committed`]'s
-    /// once the store is ready again.
-    pub fn commit(&mut self, batches: Vec<Batch>, now_ns: u64, effects: &mut Vec<Effect>) -> Result<(), StoreError> {
+    /// Writes the store's batches and `batches` (the workers', borrowed: their bytes are copied
+    /// into the layout here, so a worker's batch stays readable by its worker until the flip
+    /// lands) as one new segment for each namespace that holds records, one after another,
+    /// with no lock, then flips the head once to a generation naming them all. The outcome is
+    /// [`Plain::take_committed`]'s once the store is ready again.
+    pub fn commit(&mut self, batches: &[&Batch], now_ns: u64, effects: &mut Vec<Effect>) -> Result<(), StoreError> {
         if !self.ready() {
             return Err(StoreError::Busy { phase: self.what() });
         }
@@ -1106,64 +1145,70 @@ impl Plain {
 
     /// One segment laid out for each namespace of [`PlainConfig::writes`] (in its order) that
     /// holds a record not already committed under it.
-    fn lay_out(&self, batches: Vec<Batch>) -> Result<Vec<Laid>, StoreError> {
+    ///
+    /// Laid out in key order, whatever order the puts came in and whichever worker's batch
+    /// holds each: two builders of the same records write equal bytes (rule 25), however
+    /// their threads interleaved. A key in two batches with equal records is laid once (the
+    /// workers converge on one record); with other bytes it is [`StoreError::TwoValues`]. The
+    /// payloads are copied into one piece, so no batch is kept by the commit.
+    fn lay_out(&self, batches: &[&Batch]) -> Result<Vec<Laid>, StoreError> {
         let mut out = Vec::with_capacity_in(self.cfg.writes.len(), Global);
-        let mut batches = batches;
         for &namespace in &self.cfg.writes {
-            let mut entries: Vec<Entry> = Vec::new_in(Global);
-            let mut pieces: Vec<(u64, Vec<u8>)> = Vec::new_in(Global);
-            let mut base = HEADER as u64;
             let own = self.sealed.iter().find(|it| it.batch.namespace == namespace).map(|it| &it.batch);
-            // The store's own batch first (copied: it is read until the commit ends), then each
-            // worker's of this namespace (moved).
-            // In the order handed, so the same puts lay out the same bytes.
-            let mut theirs = Vec::new_in(Global);
-            theirs.extend(batches.extract_if(.., |it| it.namespace == namespace));
-            // Lays out one batch's entries after what is laid: the offset its bytes go at.
-            let mut lay = |batch: &Batch| -> Result<u64, StoreError> {
-                let at = base;
-                for entry in &batch.entries {
-                    if let Some((_, kept)) = self.find_in(std::slice::from_ref(&namespace), &Key(entry.key)) {
-                        if kept.same_record(entry) {
-                            // Its bytes stay in the segment unreferenced; compaction drops them.
-                            continue;
-                        }
-                        // A record committed under the key with other bytes: two values
-                        // under one key (rule 21).
+            // Every record of the namespace, the store's own batch's and each worker's: the
+            // global heap, freed when the commit's layout is made.
+            let mut all: Vec<(Entry, &[u8])> = Vec::new_in(Global);
+            for batch in own.into_iter().chain(batches.iter().copied().filter(|it| it.namespace == namespace)) {
+                all.extend(batch.entries.iter().map(|it| (*it, batch.payload(it))));
+            }
+            all.sort_unstable_by(|a, b| a.0.key.cmp(&b.0.key));
+            let mut entries: Vec<Entry> = Vec::with_capacity_in(all.len(), Global);
+            // The payloads from [`HEADER`] on, each at a multiple of [`ALIGN`] of the segment.
+            let mut bytes: Vec<u8> = Vec::new_in(Global);
+            let mut last: Option<Entry> = None;
+            for (entry, payload) in all {
+                if let Some(kept) = last
+                    && kept.key == entry.key
+                {
+                    if !kept.same_record(&entry) {
+                        // Two workers put other bytes under one key: two values (rule 21).
                         return Err(StoreError::TwoValues { tag: entry.tag, key: entry.key });
                     }
-                    let mut moved = *entry;
-                    moved.at += base;
-                    if self.plant() == Plant::IndexOffByOne {
-                        moved.at += ALIGN;
+                    continue;
+                }
+                last = Some(entry);
+                if let Some((_, kept)) = self.find_in(std::slice::from_ref(&namespace), &Key(entry.key)) {
+                    if kept.same_record(&entry) {
+                        // Committed already: not laid again.
+                        continue;
                     }
-                    entries.push(moved);
+                    // A record committed under the key with other bytes (rule 21).
+                    return Err(StoreError::TwoValues { tag: entry.tag, key: entry.key });
                 }
-                base += batch.bytes.len() as u64;
-                if base > OFFSET_MOST {
-                    // Bytes past the bound are some entry's: the last one laid is named.
-                    let last = batch.entries.last().expect("a batch's bytes are its entries'");
-                    return Err(StoreError::TooLong { tag: last.tag, key: last.key, len: base });
+                let at = HEADER as u64 + bytes.len() as u64;
+                let end = at + u64::from(entry.len);
+                if end > OFFSET_MOST {
+                    return Err(StoreError::TooLong { tag: entry.tag, key: entry.key, len: end });
                 }
-                Ok(at)
-            };
-            if let Some(own) = own {
-                let at = lay(own)?;
-                if !own.bytes.is_empty() {
-                    pieces.push((at, own.bytes.clone()));
+                bytes.extend_from_slice(payload);
+                bytes.resize((aligned(end) - HEADER as u64) as usize, 0);
+                let mut placed = entry;
+                placed.at = at;
+                if self.plant() == Plant::IndexOffByOne {
+                    placed.at += ALIGN;
                 }
-            }
-            for batch in theirs {
-                let at = lay(&batch)?;
-                if !batch.bytes.is_empty() {
-                    pieces.push((at, batch.bytes));
-                }
+                entries.push(placed);
             }
             if entries.is_empty() {
                 continue;
             }
+            let index_at = HEADER as u64 + bytes.len() as u64;
+            let mut pieces: Vec<(u64, Vec<u8>)> = Vec::with_capacity_in(1, Global);
+            if !bytes.is_empty() {
+                pieces.push((HEADER as u64, bytes));
+            }
             let run = format::sorted_run(entries)?;
-            out.push(Laid { pieces, index_at: base, run, namespace });
+            out.push(Laid { pieces, index_at, run, namespace });
         }
         Ok(out)
     }
@@ -1916,6 +1961,11 @@ impl Plain {
     /// Where this machine's first path occurs in `bytes`, when it does ([`machine_in`]).
     fn machine_at(&self, bytes: &[u8]) -> Option<(u64, u32)> {
         machine_in(&self.cfg.machine, bytes)
+    }
+
+    /// What names this machine ([`PlainConfig::machine`] and [`Plain::machine`]'s).
+    pub(crate) fn needles(&self) -> &[Vec<u8>] {
+        &self.cfg.machine
     }
 
     /// The exit tail sealed (store-next.md), asked by a command after it answered, as

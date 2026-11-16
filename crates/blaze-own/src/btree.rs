@@ -59,9 +59,9 @@ use crate::{
 };
 
 /// Half the fan-out: see the module docs for why 8.
-pub const B: usize = 8;
+pub(crate) const B: usize = 8;
 /// The most entries a node holds.
-pub const CAPACITY: usize = 2 * B - 1;
+pub(crate) const CAPACITY: usize = 2 * B - 1;
 /// The fewest entries a node other than the root holds.
 const MIN: usize = B - 1;
 
@@ -1153,7 +1153,8 @@ impl<K: Ord, V, A: Allocator> BTreeMap<K, V, A> {
             // SAFETY: `after + 1` entries follow the gap, in this map.
             let at = unsafe { next_kv(gap) };
             // SAFETY: the entry is live; `keep` borrows it for the call only.
-            if keep(unsafe { &*key_at(at.node, at.idx) }, unsafe { &mut *val_at(at.node, at.idx) }) {
+            let (k, v) = unsafe { (&*key_at(at.node, at.idx), &mut *val_at(at.node, at.idx)) };
+            if keep(k, v) {
                 // SAFETY: as above.
                 gap = unsafe { gap_after(at) };
                 continue;
@@ -1234,9 +1235,17 @@ impl<K: Ord, V, A: Allocator> BTreeMap<K, V, A> {
             spares.free(&*self.alloc);
             (right.root, right.height) = (top, self.height);
             self.fix_right_border();
+            // A planted merge's lost entries: this side's are taken from its length, the other
+            // side's length is counted below.
+            #[cfg(test)]
+            {
+                self.len -= plant::take_lost();
+            }
             right.fix_left_border();
             #[cfg(test)]
-            plant::take_lost();
+            {
+                plant::take_lost();
+            }
             let moved = match right.root {
                 Some(root) => count_entries(root, right.height),
                 None => 0,

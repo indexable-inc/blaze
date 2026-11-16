@@ -37,8 +37,6 @@
 
 use std::{ffi::OsString, fmt, io::Write as _, net::IpAddr};
 
-use base64::Engine as _;
-
 use crate::h1;
 
 /// A proxy's port when its address names none: curl's.
@@ -92,7 +90,7 @@ impl Credentials {
         // alloc: one per connection through a proxy with a user, its header's value.
         let pair = format!("{}:{password}", self.user);
         // alloc: one per connection through a proxy with a user, its header's value.
-        format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(pair))
+        format!("Basic {}", blaze_base64::STANDARD.encode_in(pair.as_bytes(), std::alloc::Global))
     }
 }
 

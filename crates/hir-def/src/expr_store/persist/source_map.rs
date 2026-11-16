@@ -20,7 +20,7 @@ use blaze_format::{
     FormatError, Part, Persist, Record, SchemaHash, Slice, Writer, open_as, schema_of,
 };
 use blaze_memo::Id;
-use either::Either;
+use stdx::Either;
 use hir_expand::{HirFileId, InFile, MacroCallId};
 use syntax::{AstNode, AstPtr, SyntaxKind, SyntaxNodePtr, TextRange, TextSize, ast};
 

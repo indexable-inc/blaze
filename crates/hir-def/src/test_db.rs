@@ -8,7 +8,7 @@ use base_db::{
     set_run_order,
 };
 use hir_expand::{InFile, files::FilePosition};
-use itertools::Itertools;
+use stdx::iter::IterExt;
 use span::FileId;
 use syntax::view::{self as ast, AstNode};
 

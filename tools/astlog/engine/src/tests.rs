@@ -23,9 +23,16 @@ enum GraphAtom {
     Succ,
 }
 
-#[derive(Debug, snafu::Snafu)]
-#[snafu(display("graph source failed"))]
+#[derive(Debug)]
 struct GraphError;
+
+impl std::fmt::Display for GraphError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("graph source failed")
+    }
+}
+
+impl std::error::Error for GraphError {}
 
 impl Language for Graph {
     type Atom = GraphAtom;

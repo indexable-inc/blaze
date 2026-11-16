@@ -330,7 +330,7 @@ fn format(
             }
             b'{' => {
                 out.push(&spec[copied..at])?;
-                let close = at + 1 + memchr::memchr(b'}', &bytes[at + 1..])?;
+                let close = at + 1 + blaze_memchr::memchr(b'}', &bytes[at + 1..])?;
                 let argument = &spec[at + 1..close];
                 let index = if argument.is_empty() {
                     next += 1;

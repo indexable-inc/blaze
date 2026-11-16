@@ -107,7 +107,7 @@ fn unescape_into(text: &str, out: &mut String) -> Option<()> {
     let bytes = text.as_bytes();
     let mut lexer = Lexer { source: text, at: 1 };
     loop {
-        let end = lexer.at + memchr::memchr2(b'"', b'\\', &bytes[lexer.at..])?;
+        let end = lexer.at + blaze_memchr::memchr2(b'"', b'\\', &bytes[lexer.at..])?;
         out.push_str(&text[lexer.at..end]);
         lexer.at = end + 1;
         if bytes[end] == b'"' {
@@ -131,7 +131,7 @@ pub struct Unlexed {
 pub fn normalize<'a>(source: &'a str, frame: &'a Frame) -> &'a str {
     let source = source.strip_prefix('\u{feff}').unwrap_or(source);
     let bytes = source.as_bytes();
-    let mut crlf = memchr::memmem::find_iter(bytes, b"\r\n").peekable();
+    let mut crlf = blaze_memchr::memmem::find_iter(bytes, b"\r\n").peekable();
     if crlf.peek().is_none() {
         return source;
     }
@@ -219,7 +219,7 @@ fn class(byte: Option<&u8>) -> u8 {
 /// memchr's search for their lead byte, not by decoding every character.
 fn text_direction(source: &str) -> Option<usize> {
     let bytes = source.as_bytes();
-    memchr::memchr_iter(0xe2, bytes).find(|&at| {
+    blaze_memchr::memchr_iter(0xe2, bytes).find(|&at| {
         matches!(
             (bytes.get(at + 1), bytes.get(at + 2)),
             (Some(0x80), Some(0xaa..=0xae)) | (Some(0x81), Some(0xa6..=0xa9))
@@ -237,7 +237,7 @@ impl<'a> Tokens<'a> {
     /// The tokens of `source`, or why it is refused as a whole: a lone `\r` or a text
     /// direction code point anywhere.
     pub fn new(source: &'a str) -> Result<Tokens<'a>, Unlexed> {
-        if let Some(at) = memchr::memchr(b'\r', source.as_bytes()) {
+        if let Some(at) = blaze_memchr::memchr(b'\r', source.as_bytes()) {
             return Err(Unlexed { at, why: "a carriage return not before a line feed" });
         }
         if let Some(at) = text_direction(source) {
@@ -372,7 +372,7 @@ impl<'a> Lexer<'a> {
     /// `//…` to the end of the line: a doc comment's kind, or none for a plain comment.
     fn line_comment(&mut self) -> Option<Kind<'a>> {
         let start = self.at;
-        let end = memchr::memchr(b'\n', &self.source.as_bytes()[start..])
+        let end = blaze_memchr::memchr(b'\n', &self.source.as_bytes()[start..])
             .map_or(self.source.len(), |it| start + it);
         self.at = end;
         let text = &self.source.as_bytes()[start..end];
@@ -393,7 +393,7 @@ impl<'a> Lexer<'a> {
         self.at += 2;
         let mut depth = 1usize;
         while depth > 0 {
-            let Some(found) = memchr::memchr2(b'/', b'*', &bytes[self.at..]) else {
+            let Some(found) = blaze_memchr::memchr2(b'/', b'*', &bytes[self.at..]) else {
                 return Err(Unlexed { at: start, why: "an unterminated block comment" });
             };
             let at = self.at + found;
@@ -426,7 +426,7 @@ impl<'a> Lexer<'a> {
         let bytes = self.source.as_bytes();
         let (mut escaped, mut escaped_brace) = (false, false);
         loop {
-            let Some(found) = memchr::memchr2(b'"', b'\\', &bytes[self.at..]) else {
+            let Some(found) = blaze_memchr::memchr2(b'"', b'\\', &bytes[self.at..]) else {
                 return Err(Unlexed { at: start, why: "an unterminated string" });
             };
             self.at += found + 1;
@@ -508,7 +508,7 @@ impl<'a> Lexer<'a> {
         }
         let content = self.at;
         loop {
-            let Some(quote) = memchr::memchr(b'"', &bytes[self.at..]) else {
+            let Some(quote) = blaze_memchr::memchr(b'"', &bytes[self.at..]) else {
                 return Err(Unlexed { at: start, why: "an unterminated raw string" });
             };
             let close = self.at + quote;

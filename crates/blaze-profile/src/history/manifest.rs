@@ -362,9 +362,9 @@ fn footer_version(metadata: &ParquetMetaData) -> Option<u32> {
 /// `Schema` is built, whose metadata map would draw a hasher's random state, which a sans-IO
 /// core does not read.
 fn arrow_schema_version(encoded: &str) -> Option<u32> {
-    use base64::Engine as _;
     // alloc: the footer's encoded schema, decoded once a file read
-    let bytes = base64::engine::general_purpose::STANDARD.decode(encoded).ok()?;
+    let bytes = blaze_base64::STANDARD.decode_in(encoded.as_bytes(), std::alloc::Global).ok()?;
+    let bytes = bytes.as_slice();
     let message = match bytes.get(..4) {
         Some([0xff, 0xff, 0xff, 0xff]) if bytes.len() > 8 => &bytes[8..],
         _ => &bytes[..],

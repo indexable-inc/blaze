@@ -5,7 +5,7 @@
 use std::hint::black_box;
 
 use base_db::{Crate, relevant_crates};
-use either::Either;
+use stdx::Either;
 use hir_expand::fixture;
 use hir_expand::{Intern, Lookup};
 use intern::{Symbol, sym};

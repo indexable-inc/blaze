@@ -339,9 +339,9 @@ fn a_malformed_answer_fails_naming_the_host_and_step() {
 #[test]
 fn gzip_is_decoded_where_asked_and_bodies_are_held_to_their_bound() {
     let plain = b"hello ".repeat(100);
-    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
-    encoder.write_all(&plain).unwrap();
-    let zipped = encoder.finish().unwrap();
+    let mut zipped = blaze_own::Vec::new_in(std::alloc::Global);
+    blaze_deflate::gzip(&plain, blaze_deflate::Level::Default, std::alloc::Global, &mut zipped).unwrap();
+    let zipped = zipped.as_slice().to_vec();
     let head = format!(
         "HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: {}\r\n\r\n",
         zipped.len()

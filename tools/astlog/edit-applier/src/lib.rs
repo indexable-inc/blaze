@@ -70,14 +70,13 @@ pub fn check_overlaps(paths: &[PathBuf], edits: &[Edit]) -> Result<(), OverlapEr
         // `edits` is sorted, so the pair overlaps exactly when the later edit
         // starts before the earlier one ends.
         if first.file == second.file && second.start < first.end {
-            return OverlapSnafu {
+            return Err(Error::Overlap {
                 path: paths.get(first.file).cloned().unwrap_or_default(),
                 first_start: first.start,
                 first_end: first.end,
                 second_start: second.start,
                 second_end: second.end,
-            }
-            .fail();
+            });
         }
     }
     Ok(())

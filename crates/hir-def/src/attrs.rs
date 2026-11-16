@@ -29,7 +29,7 @@ use blaze_hash::HashSet;
 use blaze_mem::Frame;
 use blaze_memo::Id;
 use cfg::{CfgExpr, CfgOptions};
-use either::Either;
+use stdx::Either;
 use hir_expand::{
     AstId, HirFileId, InFile, Lookup,
     attrs::expand_cfg_attr_view,
@@ -37,7 +37,7 @@ use hir_expand::{
     name::Name,
 };
 use intern::Symbol;
-use itertools::Itertools;
+use stdx::iter::IterExt;
 use la_arena::ArenaMap;
 use rustc_abi::ReprOptions;
 use smallvec::SmallVec;
@@ -433,7 +433,7 @@ fn doc_test_attrs_of(tt: ast::TokenTree<'_>, out: &mut Vec<String>) {
 
 fn extract_ra_completions(attr_flags: &mut AttrFlags, tt: ast::TokenTree<'_>) {
     let tt = TokenTreeChildren::new(tt);
-    if let Ok(NodeOrToken::Token(option)) = Itertools::exactly_one(tt)
+    if let Ok(NodeOrToken::Token(option)) = IterExt::exactly_one(tt)
         && option.kind().is_any_identifier()
     {
         match Completions::of(option.text()) {
@@ -453,7 +453,7 @@ fn extract_ra_completions(attr_flags: &mut AttrFlags, tt: ast::TokenTree<'_>) {
 
 fn extract_ra_macro_style(attr_flags: &mut AttrFlags, tt: ast::TokenTree<'_>) {
     let tt = TokenTreeChildren::new(tt);
-    if let Ok(NodeOrToken::Token(option)) = Itertools::exactly_one(tt)
+    if let Ok(NodeOrToken::Token(option)) = IterExt::exactly_one(tt)
         && option.kind().is_any_identifier()
     {
         match MacroStyle::of(option.text()) {
@@ -3145,7 +3145,7 @@ impl AttrFlags {
                         || is_one(path, "rustc_layout_scalar_valid_range_end"))
                     && let Some(tt) = attr.token_tree()
                     && let tt = TokenTreeChildren::new(tt)
-                    && let Ok(NodeOrToken::Token(value)) = Itertools::exactly_one(tt)
+                    && let Ok(NodeOrToken::Token(value)) = IterExt::exactly_one(tt)
                     && let Some(value) = ast::IntNumber::cast(value)
                     && let Ok(value) = value.value()
                 {

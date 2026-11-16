@@ -1,7 +1,7 @@
 use std::{convert::Infallible, ops::ControlFlow};
 
 use base_db::Db;
-use either::Either;
+use stdx::Either;
 use hir_expand::fixture;
 use hir_expand::{
     HirFileId, Lookup,
@@ -918,7 +918,7 @@ fn option_sets_flag_as_the_string_match_did() {
 
     fn old_ra_completions(attr_flags: &mut AttrFlags, tt: &ast::TokenTree) {
         let tt = TokenTreeChildren::new(tt);
-        if let Ok(NodeOrToken::Token(option)) = itertools::Itertools::exactly_one(tt)
+        if let Ok(NodeOrToken::Token(option)) = stdx::iter::IterExt::exactly_one(tt)
             && option.kind().is_any_identifier()
         {
             match option.text() {
@@ -933,7 +933,7 @@ fn option_sets_flag_as_the_string_match_did() {
     }
     fn old_ra_macro_style(attr_flags: &mut AttrFlags, tt: &ast::TokenTree) {
         let tt = TokenTreeChildren::new(tt);
-        if let Ok(NodeOrToken::Token(option)) = itertools::Itertools::exactly_one(tt)
+        if let Ok(NodeOrToken::Token(option)) = stdx::iter::IterExt::exactly_one(tt)
             && option.kind().is_any_identifier()
         {
             match option.text() {
@@ -1026,7 +1026,7 @@ fn doc_atoms_flag_as_the_string_match_did() {
 /// `parse_repr_tt` as it was, by string `match` and `BuiltinInt::from_suffix`.
 fn old_parse_repr_tt(tt: &ast::TokenTree) -> Option<rustc_abi::ReprOptions> {
     use crate::builtin_type::{BuiltinInt, BuiltinUint};
-    use either::Either;
+    use stdx::Either;
     use rustc_abi::{Align, Integer, IntegerType, ReprFlags, ReprOptions};
     use syntax::{AstToken, NodeOrToken, ast::TokenTreeChildren};
 

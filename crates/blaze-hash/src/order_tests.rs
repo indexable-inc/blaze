@@ -15,8 +15,7 @@ use std::{
 use blaze_sim::{Config, Tape};
 
 use crate::{
-    BuildKeyHasher, ByHash, FixedState, HashMap, IndexMap, IndexSet, KeyedMap, KeyedSet, OrderMap,
-    SipKey,
+    BuildKeyHasher, ByHash, HashMap, IndexMap, IndexSet, KeyedMap, KeyedSet, OrderMap, SipKey,
 };
 
 /// The global heap, each allocation counted.
@@ -166,6 +165,11 @@ fn an_ordered_set_keeps_insertion_order() {
     assert!(set.shift_remove("d"));
     assert_eq!(set.iter().copied().collect::<Vec<_>>(), ["a", "b"]);
     assert_eq!((set.insert_full("b"), set.insert_full("z")), ((1, false), (2, true)));
+    assert_eq!((&set).into_iter().copied().collect::<Vec<_>>(), ["a", "b", "z"]);
+    let room = set.capacity();
+    assert_eq!(set.drain().collect::<Vec<_>>(), ["a", "b", "z"]);
+    assert!(set.is_empty() && !set.contains("a") && set.capacity() == room);
+    assert_eq!(set.insert_full("a"), (0, true));
 }
 
 /// A table made with room for what it will hold allocates when it is made and never after:
@@ -314,7 +318,6 @@ fn collections_cost() {
 
     let mut hash: HashMap<u32, u32, Global> = HashMap::new_in(Global); // alloc: measured
     let mut ours: IndexMap<u32, u32, Global> = IndexMap::new_in(Global); // alloc: measured
-    let mut theirs: indexmap::IndexMap<u32, u32, FixedState> = indexmap::IndexMap::default(); // alloc: measured
     let fill_hash = median(|| {
         hash = HashMap::new_in(Global);
         (0..N).for_each(|it| drop(hash.insert(it, it)));
@@ -325,23 +328,16 @@ fn collections_cost() {
         (0..N).for_each(|it| drop(ours.insert(it, it)));
         ours.len() as u64
     });
-    let fill_theirs = median(|| {
-        theirs = indexmap::IndexMap::default();
-        (0..N).for_each(|it| drop(theirs.insert(it, it)));
-        theirs.len() as u64
-    });
-    println!("insert 1M u32 ids, growing: IndexMap {fill_ours:.1} ns, indexmap {fill_theirs:.1} ns, HashMap {fill_hash:.1} ns");
+    println!("insert 1M u32 ids, growing: IndexMap {fill_ours:.1} ns, HashMap {fill_hash:.1} ns");
 
     let sum = |get: &dyn Fn(u32) -> u32| ids.iter().map(|&it| u64::from(get(it))).sum::<u64>();
     let look_hash = median(|| sum(&|it| hash[&it]));
     let look_ours = median(|| sum(&|it| *ours.get(&it).expect("held")));
-    let look_theirs = median(|| sum(&|it| theirs[&it]));
-    println!("hash + lookup of 1M u32 ids: IndexMap {look_ours:.1} ns, indexmap {look_theirs:.1} ns, HashMap {look_hash:.1} ns");
+    println!("hash + lookup of 1M u32 ids: IndexMap {look_ours:.1} ns, HashMap {look_hash:.1} ns");
 
     let walk_hash = median(|| hash.values().map(|&it| u64::from(it)).sum());
     let walk_ours = median(|| ours.values().map(|&it| u64::from(it)).sum());
-    let walk_theirs = median(|| theirs.values().map(|&it| u64::from(it)).sum());
-    println!("iteration of 1M entries: IndexMap {walk_ours:.2} ns, indexmap {walk_theirs:.2} ns, HashMap {walk_hash:.2} ns");
+    println!("iteration of 1M entries: IndexMap {walk_ours:.2} ns, HashMap {walk_hash:.2} ns");
 
     // 32-byte hashes: spread by a multiply per word, as a digest's bytes are.
     let digest = |it: u32| {

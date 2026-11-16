@@ -12,7 +12,7 @@ use std::{
 
 use base_db::Db;
 use cfg::{CfgExpr, CfgOptions};
-use either::Either;
+use stdx::Either;
 use hir_expand::{
     attrs::{Attr, AttrId, AttrInput, collect_item_tree_attrs_view},
     mod_path::ModPath,

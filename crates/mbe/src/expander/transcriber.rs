@@ -6,7 +6,7 @@ use std::alloc::Allocator;
 use blaze_mem::frame::Frame;
 use intern::{Symbol, sym};
 use span::{Edition, Span};
-use stdx::itertools::Itertools;
+use stdx::iter::IterExt;
 use tt::{Delimiter, TopSubtreeBuilder, iter::TtElement};
 
 use crate::{

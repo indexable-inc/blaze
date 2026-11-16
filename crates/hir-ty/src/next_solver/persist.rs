@@ -2048,16 +2048,12 @@ impl<'db> TyTableWriter<'db> {
         let at = out.next::<TableRec>();
         let field = |offset: usize| at + offset as u64;
         out.push(&TableRec {
-            nodes: Slice::between(
-                field(std::mem::offset_of!(TableRec, nodes)),
-                nodes,
-                self.nodes.len(),
-            ),
-            words: Slice::between(
-                field(std::mem::offset_of!(TableRec, words)),
-                words,
-                self.words.len(),
-            ),
+            nodes: Slice::between(field(std::mem::offset_of!(TableRec, nodes)),
+            nodes,
+            self.nodes.len(),),
+            words: Slice::between(field(std::mem::offset_of!(TableRec, words)),
+            words,
+            self.words.len(),),
         })
     }
 
@@ -2908,16 +2904,12 @@ mod tests {
         let at = out.next::<TableRec>();
         let field = |offset: usize| at + offset as u64;
         let table = out.push(&TableRec {
-            nodes: Slice::between(
-                field(std::mem::offset_of!(TableRec, nodes)),
-                nodes_at,
-                nodes.len(),
-            ),
-            words: Slice::between(
-                field(std::mem::offset_of!(TableRec, words)),
-                words_at,
-                words.len(),
-            ),
+            nodes: Slice::between(field(std::mem::offset_of!(TableRec, nodes)),
+            nodes_at,
+            nodes.len(),),
+            words: Slice::between(field(std::mem::offset_of!(TableRec, words)),
+            words_at,
+            words.len(),),
         });
         let buffer = Aligned::copy_from(&out.finish(table));
         TyTableReader::open_with(&buffer, table, adt).is_ok()

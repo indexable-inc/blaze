@@ -18,7 +18,7 @@ use blaze_surface::{ContentId, CrateItemKey};
 use cfg::CfgOptions;
 use intern::Symbol;
 use span::{Edition, FileId};
-use triomphe::Arc;
+use std::sync::Arc;
 
 use crate::{CrateWorkspaceData, Db, EditionedFileId};
 

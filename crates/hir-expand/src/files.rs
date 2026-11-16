@@ -2,7 +2,7 @@
 use std::borrow::Borrow;
 
 use base_db::Db;
-use either::Either;
+use stdx::Either;
 use span::{AstIdNode, ErasedFileAstId, FileAstId, FileId, SyntaxContext};
 use syntax::{AstNode, AstPtr, SyntaxNode, SyntaxNodePtr, TextRange, TextSize, view};
 

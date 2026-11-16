@@ -27,7 +27,6 @@ mod tests;
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 use blaze_mem::frame::Frame;
-use smallvec::SmallVec;
 use span::{Edition, Span, SyntaxContext};
 use tt::DelimSpan;
 use tt::iter::TtIter;
@@ -414,7 +413,7 @@ impl DeclarativeMacro {
 
 /// The spans of the identifiers an expansion made with `${concat(..)}`, in the order it made
 /// them: tokens no source has, which only the transcriber can tell from the others.
-pub type MadeIdents = SmallVec<[Span; 2]>;
+pub type MadeIdents = Vec<Span>;
 
 impl Rule {
     fn parse(

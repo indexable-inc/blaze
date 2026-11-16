@@ -8,9 +8,9 @@ use std::ops::Range;
 
 use base_db::Db;
 use blaze_mem::Frame;
-use either::Either;
+use stdx::Either;
 use intern::{Symbol, sym};
-use itertools::Itertools;
+use stdx::iter::IterExt;
 use parser::SyntaxKind;
 use smallvec::SmallVec;
 use span::{Edition, Span};
@@ -157,7 +157,7 @@ fn with_item_attrs<'f>(
     expanded: tt::TopSubtree<&'f Frame>,
 ) -> tt::TopSubtree<&'f Frame> {
     // alloc: none unless the item has more than four such attributes
-    let mut attrs = SmallVec::<[tt::TokenTreesView<'_>; 4]>::new();
+    let mut attrs = Vec::<tt::TokenTreesView<'_>>::new();
     let mut outer = item.token_trees().iter();
     loop {
         let at = outer.savepoint();
@@ -807,7 +807,7 @@ fn parse_adt_from_syntax(
         .flat_map(|param_list| param_list.lifetime_params())
         .filter_map(|param| Some((to_tt(param.syntax()), to_tt(param.lifetime()?.syntax()))))
         .collect(); // alloc: one tree per lifetime parameter; none without generics
-    let mut param_names: SmallVec<[Name; 4]> = SmallVec::new();
+    let mut param_names: Vec<Name> = Vec::new();
     let param_types = generic_param_list
         .into_iter()
         .flat_map(|param_list| param_list.type_or_const_params())
@@ -1165,7 +1165,7 @@ fn from_derive<'f>(
         ast::Adt::Enum(_) => return refuse("`#[derive(From)]` used on an enum"),
         ast::Adt::Union(_) => return refuse("`#[derive(From)]` used on a union"),
     };
-    let mut field_types: SmallVec<[Option<ast::Type<'_>>; 2]> = SmallVec::new();
+    let mut field_types: Vec<Option<ast::Type<'_>>> = Vec::new();
     match strukt.field_list() {
         Some(FieldList::RecordFieldList(it)) => {
             field_types.extend(it.fields().map(|it| it.ty()).take(2))
@@ -2253,7 +2253,7 @@ fn write_pointee_predicates(
 ) {
     let pointee_text = unraw(pointee.text());
     let alone = |char| tt::Leaf::Punct(punct(char, tt::Spacing::Alone, span));
-    let mut paths: SmallVec<[TextRange; 4]> = SmallVec::new();
+    let mut paths: Vec<TextRange> = Vec::new();
     for param in strukt.generic_param_list().into_iter().flat_map(|it| it.generic_params()) {
         let ast::GenericParam::TypeParam(param) = param else { continue };
         let (Some(name), Some(bounds)) = (param.name(), param.type_bound_list()) else { continue };
@@ -2317,7 +2317,7 @@ fn write_pointee_predicates(
 /// Pushes to `paths` the range of each path in `ty` that is the pointee by name, and says
 /// whether there was one. Every part of the type is walked, none skipped: it may name the
 /// pointee twice.
-fn pointee_paths(ty: ast::Type<'_>, pointee: &str, paths: &mut SmallVec<[TextRange; 4]>) -> bool {
+fn pointee_paths(ty: ast::Type<'_>, pointee: &str, paths: &mut Vec<TextRange>) -> bool {
     match ty {
         ast::Type::ArrayType(ty) => ty.ty().is_some_and(|ty| pointee_paths(ty, pointee, paths)),
         ast::Type::DynTraitType(ty) => bounds_pointee_paths(ty.type_bound_list(), pointee, paths),
@@ -2362,7 +2362,7 @@ fn pointee_paths(ty: ast::Type<'_>, pointee: &str, paths: &mut SmallVec<[TextRan
 fn all_pointee_paths<'t>(
     types: impl Iterator<Item = ast::Type<'t>>,
     pointee: &str,
-    paths: &mut SmallVec<[TextRange; 4]>,
+    paths: &mut Vec<TextRange>,
 ) -> bool {
     let mut found = false;
     for ty in types {
@@ -2375,7 +2375,7 @@ fn all_pointee_paths<'t>(
 fn bounds_pointee_paths(
     bounds: Option<ast::TypeBoundList<'_>>,
     pointee: &str,
-    paths: &mut SmallVec<[TextRange; 4]>,
+    paths: &mut Vec<TextRange>,
 ) -> bool {
     let mut found = false;
     for bound in bounds.into_iter().flat_map(|it| it.bounds()) {
@@ -2389,7 +2389,7 @@ fn bounds_pointee_paths(
 fn bound_pointee_paths(
     bound: ast::TypeBound<'_>,
     pointee: &str,
-    paths: &mut SmallVec<[TextRange; 4]>,
+    paths: &mut Vec<TextRange>,
 ) -> bool {
     let mut found = binder_pointee_paths(bound.for_binder(), pointee, paths);
     found |= match bound.ty() {
@@ -2418,7 +2418,7 @@ fn bound_pointee_paths(
 fn path_pointee_paths(
     path: ast::Path<'_>,
     pointee: &str,
-    paths: &mut SmallVec<[TextRange; 4]>,
+    paths: &mut Vec<TextRange>,
 ) -> bool {
     let mut found = false;
     for segment in path.segments() {
@@ -2449,7 +2449,7 @@ fn path_pointee_paths(
 fn generic_arg_pointee_paths(
     arg: ast::GenericArg<'_>,
     pointee: &str,
-    paths: &mut SmallVec<[TextRange; 4]>,
+    paths: &mut Vec<TextRange>,
 ) -> bool {
     match arg {
         ast::GenericArg::TypeArg(arg) => {
@@ -2471,7 +2471,7 @@ fn generic_arg_pointee_paths(
 fn binder_pointee_paths(
     binder: Option<ast::ForBinder<'_>>,
     pointee: &str,
-    paths: &mut SmallVec<[TextRange; 4]>,
+    paths: &mut Vec<TextRange>,
 ) -> bool {
     params_pointee_paths(binder.and_then(|it| it.generic_param_list()), pointee, paths)
 }
@@ -2481,7 +2481,7 @@ fn binder_pointee_paths(
 fn params_pointee_paths(
     params: Option<ast::GenericParamList<'_>>,
     pointee: &str,
-    paths: &mut SmallVec<[TextRange; 4]>,
+    paths: &mut Vec<TextRange>,
 ) -> bool {
     let mut found = false;
     for param in params.into_iter().flat_map(|it| it.generic_params()) {

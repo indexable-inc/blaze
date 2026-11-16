@@ -370,9 +370,10 @@ impl<O: Offset> Text<O> {
     pub const EMPTY: Text<O> = Text { bytes: Slice::EMPTY };
 
     /// The text a field at `field_at` holds of `len` bytes at `target_at`: as
-    /// [`Slice::between`], written by [`crate::Writer::push_str`].
-    pub fn between(field_at: u64, target_at: u64, len: usize) -> Result<Text<O>, Unfit> {
-        Slice::between(field_at, target_at, len).map(|bytes| Text { bytes })
+    /// [`Slice::between_as`], written by [`crate::Writer::push_str`]: the form for a narrow
+    /// offset (an `i32` one is [`Text::between`]).
+    pub fn between_as(field_at: u64, target_at: u64, len: usize) -> Result<Text<O>, Unfit> {
+        Slice::between_as(field_at, target_at, len).map(|bytes| Text { bytes })
     }
 
     pub fn is_empty(&self) -> bool {
@@ -382,6 +383,14 @@ impl<O: Offset> Text<O> {
     /// The text, checked where it is and that it is UTF-8: for bytes no [`crate::open`] checked.
     pub fn as_str<'a>(&'a self, buffer: &'a [u8]) -> Result<&'a str, FormatError> {
         self.bytes.as_str(buffer)
+    }
+}
+
+impl Text {
+    /// [`Text::between_as`] for the default `i32` offset: a plain value; panics as
+    /// [`Slice::between`] does.
+    pub fn between(field_at: u64, target_at: u64, len: usize) -> Text {
+        Text { bytes: Slice::between(field_at, target_at, len) }
     }
 }
 

@@ -41,7 +41,7 @@ enum NextExpandedAttrState {
 #[derive(Debug)]
 struct AstAttrToProcess {
     range: TextRange,
-    expanded_attrs: SmallVec<[ExpandedAttrToProcess; 1]>,
+    expanded_attrs: Vec<ExpandedAttrToProcess>,
     expanded_attrs_idx: usize,
     next_expanded_attr: NextExpandedAttrState,
     pound_span: Span,

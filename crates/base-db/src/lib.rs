@@ -25,8 +25,11 @@ use std::sync::atomic::AtomicUsize;
 
 pub use blaze_ids::ContentId;
 pub use blaze_surface::{CrateItemKey, HasText, ItemKey, SurfaceError};
-pub use semver::{BuildMetadata, Prerelease, Version, VersionReq};
 pub use span::FileId;
+
+/// A toolchain's version, its pre-release and build metadata past blaze-semver's inline size in
+/// the process allocator (a crate graph's workspace data lives as long as the task).
+pub type Version = blaze_semver::Version<std::alloc::Global>;
 
 pub use crate::db::{
     AnchoredPath, BorrowckMode, CFG_OPTIONS_DOMAIN, Db, DbError, FileText, FrontSettings, Includes,
@@ -49,8 +52,8 @@ use blaze_ids::Hasher;
 /// kept for the readers that only name the type.
 pub type CrateKey = CrateItemKey;
 
-pub type FxIndexMap<K, V> = indexmap::IndexMap<K, V, blaze_hash::FixedState>;
-pub type FxIndexSet<T> = indexmap::IndexSet<T, blaze_hash::FixedState>;
+pub type FxIndexMap<K, V> = blaze_hash::IndexMap<K, V, std::alloc::Global>;
+pub type FxIndexSet<T> = blaze_hash::IndexSet<T, std::alloc::Global>;
 
 static NEXT_NONCE: AtomicUsize = AtomicUsize::new(0);
 
@@ -150,19 +153,13 @@ impl CrateWorkspaceData {
     }
 
     pub fn is_atleast_187(&self) -> bool {
-        const VERSION_187: Version = Version {
-            major: 1,
-            minor: 87,
-            patch: 0,
-            pre: Prerelease::EMPTY,
-            build: BuildMetadata::EMPTY,
-        };
+        const VERSION_187: Version = Version::new(1, 87, 0);
         self.toolchain.as_ref().is_some_and(|v| *v >= VERSION_187)
     }
 }
 
 pub fn toolchain_channel(db: &Db, krate: Crate) -> Option<ReleaseChannel> {
-    krate.workspace_data(db).toolchain.as_ref().and_then(|v| ReleaseChannel::from_str(&v.pre).ok())
+    krate.workspace_data(db).toolchain.as_ref().and_then(|v| ReleaseChannel::from_str(v.pre.as_str()).ok())
 }
 
 /// A variable of the crate's environment, as `env!` reads it.

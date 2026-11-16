@@ -22,20 +22,121 @@
 use std::alloc::Global;
 use std::fmt::Write as _;
 
-use serde::Serialize;
+use blaze_data::{Map, ToValue, Value};
 
 use crate::policy::{Accept, Severity};
 
 /// The version of [`Report`]'s JSON: bumped when a field changes meaning or goes away.
 pub const VERSION: u32 = 1;
 
-/// Serializes a value by its `Display`: a [`crate::date::Date`] as `YYYY-MM-DD`.
-pub fn as_text<T: std::fmt::Display, S: serde::Serializer>(value: &T, to: S) -> Result<S::Ok, S::Error> {
-    to.collect_str(value)
+/// `key: value` appended to `map`, in insertion order: the JSON's field order is the
+/// declaration order, as serde's derive wrote it.
+fn put(map: &mut Map<Global>, key: &str, value: Value<Global>) {
+    map.insert(blaze_own::String::from_str_in(key, Global), value);
+}
+
+fn text(text: &str) -> Value<Global> {
+    text.to_value(Global)
+}
+
+fn opt_text(text: &Option<String>) -> Value<Global> {
+    text.as_deref().to_value(Global)
+}
+
+fn texts(texts: &[String]) -> Value<Global> {
+    Value::List(blaze_own::Vec::from_iter_in(texts.iter().map(|it| text(it)), Global))
+}
+
+impl ToValue<Global> for Severity {
+    fn to_value(&self, _: Global) -> Value<Global> {
+        text(match self {
+            Severity::Error => "error",
+            Severity::Warning => "warning",
+            Severity::Accepted => "accepted",
+        })
+    }
+}
+
+/// `until` as its `Display`, `YYYY-MM-DD`.
+impl ToValue<Global> for Accept {
+    fn to_value(&self, _: Global) -> Value<Global> {
+        let mut map = Map::with_capacity_in(3, Global);
+        put(&mut map, "id", text(&self.id));
+        put(&mut map, "reason", text(&self.reason));
+        put(&mut map, "until", text(&self.until.to_string()));
+        Value::Map(map)
+    }
+}
+
+impl ToValue<Global> for Finding {
+    fn to_value(&self, _: Global) -> Value<Global> {
+        let mut map = Map::with_capacity_in(18, Global);
+        put(&mut map, "severity", self.severity.to_value(Global));
+        put(&mut map, "rule", text(self.rule));
+        put(&mut map, "package", text(&self.package));
+        put(&mut map, "version", text(&self.version));
+        put(&mut map, "advisory", opt_text(&self.advisory));
+        put(&mut map, "title", text(&self.title));
+        put(&mut map, "said", text(&self.said));
+        put(&mut map, "chain", texts(&self.chain));
+        put(&mut map, "fix", opt_text(&self.fix));
+        put(&mut map, "compatible", Value::Bool(self.compatible));
+        put(&mut map, "change", opt_text(&self.change));
+        put(&mut map, "functions", texts(&self.functions));
+        put(&mut map, "url", opt_text(&self.url));
+        put(&mut map, "aliases", texts(&self.aliases));
+        put(&mut map, "cvss", opt_text(&self.cvss));
+        put(&mut map, "date", opt_text(&self.date));
+        put(&mut map, "accepted", self.accepted.to_value(Global));
+        put(&mut map, "expired", opt_text(&self.expired));
+        Value::Map(map)
+    }
+}
+
+impl ToValue<Global> for DatabaseFacts {
+    fn to_value(&self, _: Global) -> Value<Global> {
+        let mut map = Map::with_capacity_in(6, Global);
+        put(&mut map, "path", text(&self.path));
+        put(&mut map, "tree", text(&self.tree));
+        put(&mut map, "advisories", self.advisories.to_value(Global));
+        put(&mut map, "withdrawn", self.withdrawn.to_value(Global));
+        put(&mut map, "newest", opt_text(&self.newest));
+        put(&mut map, "age_days", self.age_days.to_value(Global));
+        Value::Map(map)
+    }
+}
+
+impl ToValue<Global> for PinnedFacts {
+    fn to_value(&self, _: Global) -> Value<Global> {
+        let mut map = Map::with_capacity_in(4, Global);
+        put(&mut map, "package", text(&self.package));
+        put(&mut map, "source", text(&self.source));
+        put(&mut map, "pin", text(&self.pin));
+        put(&mut map, "verified", Value::Bool(self.verified));
+        Value::Map(map)
+    }
+}
+
+impl ToValue<Global> for Report {
+    fn to_value(&self, _: Global) -> Value<Global> {
+        let mut map = Map::with_capacity_in(11, Global);
+        put(&mut map, "version", self.version.to_value(Global));
+        put(&mut map, "today", text(&self.today));
+        put(&mut map, "ok", Value::Bool(self.ok));
+        put(&mut map, "errors", self.errors.to_value(Global));
+        put(&mut map, "warnings", self.warnings.to_value(Global));
+        put(&mut map, "accepted", self.accepted.to_value(Global));
+        put(&mut map, "packages", self.packages.to_value(Global));
+        put(&mut map, "database", self.database.to_value(Global));
+        put(&mut map, "not_checked", texts(&self.not_checked));
+        put(&mut map, "pinned", self.pinned.as_slice().to_value(Global));
+        put(&mut map, "findings", self.findings.as_slice().to_value(Global));
+        Value::Map(map)
+    }
 }
 
 /// One finding.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Finding {
     pub severity: Severity,
     /// The rule: one of the crate's rule names ([`crate::WEAK_SOURCE_PIN`], …).
@@ -101,7 +202,7 @@ impl Finding {
 }
 
 /// The advisory database read, as the report says it.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DatabaseFacts {
     pub path: String,
     /// Its tree's digest, as `blaze.lock` pins it.
@@ -114,7 +215,7 @@ pub struct DatabaseFacts {
 }
 
 /// One source the pin check passed.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize, PartialOrd, Ord)]
+#[derive(Clone, PartialEq, Eq, Debug, PartialOrd, Ord)]
 pub struct PinnedFacts {
     pub package: String,
     pub source: String,
@@ -125,7 +226,7 @@ pub struct PinnedFacts {
 }
 
 /// What `blaze audit` found.
-#[derive(Clone, PartialEq, Eq, Debug, Serialize)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Report {
     pub version: u32,
     pub today: String,
@@ -176,7 +277,11 @@ impl Report {
 
     /// The report as JSON, one line.
     pub fn json(&self) -> String {
-        serde_json::to_string(self).expect("a report of strings and numbers serializes")
+        let options = blaze_json::WriteOptions { keys: blaze_json::KeyOrder::Insertion, ..blaze_json::WriteOptions::COMPACT };
+        match blaze_json::to_string_in(&self.to_value(Global), options, Global) {
+            Ok(json) => json.as_str().to_owned(),
+            Err(why) => unreachable!("a report of strings and numbers has a JSON form: {why}"),
+        }
     }
 
     /// The report for people: the answer first, then each finding, then what was not checked.

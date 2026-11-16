@@ -18,7 +18,7 @@ use std::{
 
 use blaze_ids::radix;
 use blaze_memo::Id as _;
-use either::Either;
+use stdx::Either;
 use hir_expand::{HirFileId, InFile, MacroCallId, name::Name};
 use la_arena::{Idx, RawIdx};
 use syntax::{AstNode, AstPtr, SyntaxKind, SyntaxNodePtr, TextRange, TextSize, ast, view};

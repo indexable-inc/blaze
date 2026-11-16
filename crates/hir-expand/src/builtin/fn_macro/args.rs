@@ -6,7 +6,7 @@
 use std::borrow::Cow;
 
 use intern::{Symbol, sym};
-use itertools::Itertools;
+use stdx::iter::IterExt;
 use mbe::expect_fragment;
 use smallvec::SmallVec;
 use span::Span;
@@ -130,10 +130,10 @@ fn expr<'t>(iter: &mut TtIter<'t>, delim_span: DelimSpan) -> Result<Arg<'t>, Exp
 }
 
 /// rustc's `get_exprs_from_tts`: the expressions `tt` has, each followed by a `,` or the end.
-pub(super) fn exprs<'t>(tt: &'t tt::TopSubtree) -> Result<SmallVec<[Arg<'t>; 4]>, ExpandError> {
+pub(super) fn exprs<'t>(tt: &'t tt::TopSubtree) -> Result<Vec<Arg<'t>>, ExpandError> {
     let delim_span = tt.top_subtree().delimiter.delim_span();
     let mut iter = tt.iter();
-    let mut exprs = SmallVec::new();
+    let mut exprs = Vec::new();
     while !iter.is_empty() {
         exprs.push(expr(&mut iter, delim_span)?);
         match iter.peek() {
@@ -150,10 +150,10 @@ pub(super) fn exprs<'t>(tt: &'t tt::TopSubtree) -> Result<SmallVec<[Arg<'t>; 4]>
 /// `tt`'s arguments, each its trees up to the next top-level `,`: what [`exprs`] gives for
 /// arguments that are one literal or `true`/`false`, with no parse and so no database.
 #[cfg(test)]
-pub(super) fn comma_separated(tt: &tt::TopSubtree) -> SmallVec<[Arg<'_>; 4]> {
+pub(super) fn comma_separated(tt: &tt::TopSubtree) -> Vec<Arg<'_>> {
     let close = tt.top_subtree().delimiter.close;
     let mut iter = tt.iter();
-    let mut args = SmallVec::new();
+    let mut args = Vec::new();
     while !iter.is_empty() {
         let at = iter.next_span().unwrap_or(close);
         let start = iter.savepoint();
@@ -226,7 +226,7 @@ pub(super) fn single_string(
 /// An array argument, as rustc's `parse_expr_array_or_repeat` reads it.
 pub(super) enum Array<'t> {
     /// `[a, b, ..]`.
-    List(SmallVec<[Arg<'t>; 8]>),
+    List(Vec<Arg<'t>>),
     /// `[element; count]`.
     Repeat(Arg<'t>, Arg<'t>),
 }
@@ -235,7 +235,7 @@ pub(super) enum Array<'t> {
 pub(super) fn array<'t>(arg: &Arg<'t>) -> Option<Result<Array<'t>, ExpandError>> {
     let (subtree, mut iter) = arg.bracketed()?;
     let delim_span = subtree.delimiter.delim_span();
-    let mut elements = SmallVec::new();
+    let mut elements = Vec::new();
     let read = (|| {
         while !iter.is_empty() {
             let element = expr(&mut iter, delim_span)?;

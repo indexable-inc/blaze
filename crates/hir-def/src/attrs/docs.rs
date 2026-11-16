@@ -14,7 +14,7 @@ use std::{
 
 use base_db::{Crate, Db};
 use cfg::CfgOptions;
-use either::Either;
+use stdx::Either;
 use hir_expand::{
     AstId, ExpandTo, HirFileId, InFile, MacroCallId, attrs::expand_cfg_attr_with_doc_comments_view,
     mod_path::ModPath, span_map::SpanMap,

@@ -68,6 +68,12 @@ pub mod __private {
 
     use crate::{Map, Value};
 
+    /// `value` as a value of `alloc`'s type.
+    #[inline(always)]
+    pub fn of<A: Allocator>(_alloc: &A, value: Value<A>) -> Value<A> {
+        value
+    }
+
     /// `key` into `map`, a later one replacing an earlier one as a literal's would.
     pub fn insert<A: Allocator + Clone, K: AsRef<str> + ?Sized>(
         map: &mut Map<A>,

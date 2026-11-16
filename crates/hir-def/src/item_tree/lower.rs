@@ -135,7 +135,7 @@ impl<T: Hash + Eq> Scoped<T> {
                 }
                 self.done[from..].reverse();
             }
-            _ => self.done.extend(self.scope.drain(..)),
+            _ => self.done.extend(self.scope.drain()),
         }
     }
 

@@ -15,8 +15,7 @@ doctest = false
 [dependencies]
 blaze-hash.workspace = true
 cov-mark.workspace = true
-smallvec.workspace = true
-arrayvec.workspace = true
+blaze-own.workspace = true
 rustc_lexer.workspace = true
 bitflags.workspace = true
 

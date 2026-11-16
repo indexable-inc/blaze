@@ -129,10 +129,9 @@ impl Facts for TreeFacts<'_> {
             Atom::Match(m) => {
                 let key = MatchKey { lang: m.lang, query: m.query.clone() };
                 let rows = self.matches.get(&key).ok_or_else(|| {
-                    InternalSnafu {
+                    Error::Internal {
                         what: format!("match query at line {line} was not materialized"),
                     }
-                    .build()
                 })?;
                 out.extend(rows.iter().cloned());
             }
@@ -145,8 +144,7 @@ impl Facts for TreeFacts<'_> {
                     } else {
                         "attached-sibling"
                     };
-                    return NotNodeSnafu { line, name, arg: "the first argument", what }
-                        .fail()
+                    return Err(SourceError::NotNode { line, name, arg: "the first argument", what })
                         .map_err(Into::into);
                 };
                 let kind = self.value_text(kind);
@@ -191,10 +189,10 @@ impl Facts for TreeFacts<'_> {
 /// capture in [`MatchAtom::captures`] order.
 fn materialize(corpus: &Corpus, m: &MatchAtom, line: usize) -> Result<Vec<Row<NodeRef>>, Error> {
     if has_predicate(&m.query) {
-        return PredicateUnsupportedSnafu { line }.fail().map_err(Into::into);
+        return Err(SourceError::PredicateUnsupported { line }).map_err(Into::into);
     }
     let language = m.lang.to_tree_sitter();
-    let query = tree_sitter::Query::new(&language, &m.query).context(QuerySnafu { line })?;
+    let query = tree_sitter::Query::new(&language, &m.query).context(SourceError::Query { line })?;
     let names = query.capture_names();
     let mut rows = Vec::new();
     for (file_index, file) in corpus.files.iter().enumerate() {
@@ -207,30 +205,26 @@ fn materialize(corpus: &Corpus, m: &MatchAtom, line: usize) -> Result<Vec<Row<No
             let mut row: Vec<Option<Value>> = vec![None; m.captures.len()];
             for capture in found.captures {
                 let Ok(index) = usize::try_from(capture.index) else {
-                    return CaptureIndexSnafu { line, index: capture.index }
-                        .fail()
+                    return Err(SourceError::CaptureIndex { line, index: capture.index })
                         .map_err(Into::into);
                 };
                 let Some(name) = names.get(index) else {
-                    return CaptureIndexSnafu { line, index: capture.index }
-                        .fail()
+                    return Err(SourceError::CaptureIndex { line, index: capture.index })
                         .map_err(Into::into);
                 };
                 let Some(column) = m.captures.iter().position(|c| c == name) else {
-                    return InternalSnafu {
+                    return Err(Error::Internal {
                         what: format!("capture `{name}` at rules:{line} is not a column"),
-                    }
-                    .fail();
+                    });
                 };
                 // A quantified capture contributes its first node per match.
                 if row[column].is_some() {
                     continue;
                 }
                 let node = file.node_index(capture.node.id()).ok_or_else(|| {
-                    InternalSnafu {
+                    Error::Internal {
                         what: format!("query capture `{name}` missing from the node table"),
                     }
-                    .build()
                 })?;
                 row[column] = Some(Value::Node(NodeRef { file: file_index, node }));
             }
@@ -240,12 +234,11 @@ fn materialize(corpus: &Corpus, m: &MatchAtom, line: usize) -> Result<Vec<Row<No
                 .map(|(value, capture)| {
                     value.ok_or_else(|| {
                         Error::from(
-                            CaptureAbsentSnafu {
+                            SourceError::CaptureAbsent {
                                 line,
                                 capture: capture.clone(),
                                 path: file.path.clone(),
-                            }
-                            .build(),
+                            },
                         )
                     })
                 })

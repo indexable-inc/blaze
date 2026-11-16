@@ -1,3 +1,5 @@
+//! Registers a stub may write: AArch64 x16 and x17 only (flags untouched); x86-64 r10 and r11, and the flags.
+//!
 //! The observe stubs as machine code, and the per-thread mark bitmap they write.
 //!
 //! A slot's word can point for a while at one of three small stubs instead of at the body
@@ -8,6 +10,12 @@
 //! so no instruction-cache flush), so the stub is written once and never re-emitted when the
 //! body changes.
 //!
+//! A stub runs between a call and the callee's first instruction, so every argument register
+//! (x0 to x7, x8 the indirect-result address, v0 to v7), the stack pointer and the return
+//! address must reach the body as the caller left them. AAPCS64 gives a veneer x16 and x17
+//! (IP0, IP1) and nothing else; the count and mark stubs write those two alone, and the hook
+//! trampoline saves and restores everything else it or the Rust routine it calls may touch.
+//!
 //! **A stub never stores a slot word or a body word**: the control thread is the only writer
 //! of either (`blaze-run`'s `Slots`). A stub writes only the counter table and the mark
 //! bitmap, which are ordinary data a program thread stores to, so they live in the mapping's
@@ -16,18 +24,22 @@
 //!
 //! The three kinds:
 //!
-//! - [`count`]: increments a per-function 32-bit counter in the data table (not atomic: a lost
-//!   count only cools a function a little), and when it first reaches the threshold stored
-//!   beside it sets the **queued** byte beside that (so it queues once). The control thread
-//!   drains the queued bytes on its clock, raises `Heat::reached(slot)`, and does `plain(slot)`
-//!   and the optimizing compile; the stub itself stores no word. Below the threshold it is an
-//!   increment and a jump.
+//! - [`count`]: counts down a per-function 32-bit counter in the data table (not atomic: a lost
+//!   count only cools a function a little). The control thread stores the threshold as the
+//!   starting count; a call that finds it at zero sets the **queued** word beside it instead,
+//!   so the stub needs no compare register and touches no flags. The control thread drains
+//!   the queued words on its clock, raises `Heat::reached(slot)` (idempotent: a function is
+//!   queued again on every call until it is made plain), and does `plain(slot)` and the
+//!   optimizing compile; the stub itself stores no word.
 //! - [`mark`]: sets one byte in a per-thread bitmap indexed by the function id, then jumps on.
-//!   The bitmap's base is found through the thread pointer at a fixed offset the runtime
-//!   reserves (`mrs TPIDRRO_EL0` on macOS, `mrs TPIDR_EL0` on Linux; `fs` on x86-64).
+//!   The bitmap's base is a pointer at a fixed offset from the thread pointer. On macOS it is
+//!   a pthread key's value: `TPIDRRO_EL0` (its low three bits masked off, as libsystem's
+//!   `_os_tsd_get_base` does) is the thread's TSD array, and key `k`'s value is at `8 * k`.
+//!   On Linux it is an initial-exec TLS word of the launcher at its positive offset from
+//!   `TPIDR_EL0` (AArch64 TLS variant 1). On x86-64 it is `fs:` at the same kind of offset.
 //! - [`hook_stub`]: a tail branch to [`hook_entry`], which calls a runtime routine with the
 //!   function id and the return address, then jumps on (for the monitor's count, break and
-//!   allocation sampling).
+//!   allocation sampling). A hook entry out of branch reach goes through a [`veneer`].
 //!
 //! Some byte sequences are adapted from makepad/relax (MIT): the counting and entry-mark
 //! stubs of `libs/relax/backend/src/arm64.rs` and `.../x64.rs`.
@@ -36,23 +48,28 @@
 use crate::arch::OutOfReach;
 
 /// One entry of the counter table, 16 bytes, little-endian and deterministic; the table is in
-/// the data region, one entry a counted function. `queued` is 0 until the counter first
-/// reaches `threshold`, then 1; the control thread clears it when it has queued the function.
+/// the data region, one entry a counted function. `left` counts down from `threshold`; a call
+/// that finds it at zero sets `queued` to 1 (so the function is queued on the call after
+/// `threshold` counted ones). The control thread re-arms an entry by storing `threshold` in
+/// `left` and 0 in `queued`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 #[repr(C)]
 pub struct Counter {
-    pub count: u32,
+    pub left: u32,
     pub threshold: u32,
     pub queued: u32,
     _pad: u32,
 }
 
 impl Counter {
-    /// A fresh counter with `threshold`.
+    /// A fresh counter that queues after `threshold` calls.
     pub fn new(threshold: u32) -> Counter {
-        Counter { count: 0, threshold, queued: 0, _pad: 0 }
+        Counter { left: threshold, threshold, queued: 0, _pad: 0 }
     }
 }
+
+/// The offset of [`Counter::queued`] in a [`Counter`], which the count stub stores to.
+const QUEUED: u32 = 8;
 
 /// Which kind of stub a slot's word names: the control thread stores a body at a kind's body
 /// word offset ([`body_offset`]).
@@ -68,10 +85,17 @@ pub enum Kind {
 pub const COUNT_STUB: usize = 64;
 /// The bytes of a mark stub (AArch64), including its trailing body-word `.quad`.
 #[cfg(target_arch = "aarch64")]
-pub const MARK_STUB: usize = 40;
+pub const MARK_STUB: usize = 48;
 /// The bytes of a hook stub (AArch64): `adr x16, .; b hook_entry; .quad body`.
 #[cfg(target_arch = "aarch64")]
 pub const HOOK_STUB: usize = 24;
+/// The bytes of a veneer (AArch64): `ldr x17, .+8; br x17; .quad target`.
+#[cfg(target_arch = "aarch64")]
+pub const VENEER: usize = 16;
+
+/// The largest function id a mark stub takes, plus one: two 12-bit immediates into x16.
+#[cfg(target_arch = "aarch64")]
+pub const MARK_SLOTS: u32 = 1 << 24;
 
 /// The byte offset of the body-word `.quad` in a stub of each kind. The control thread stores
 /// the plain body address here on a publish (8-aligned: one atomic store a thread reads via a
@@ -80,7 +104,7 @@ pub const HOOK_STUB: usize = 24;
 pub const fn body_offset(kind: Kind) -> usize {
     match kind {
         Kind::Count => 56,
-        Kind::Mark => 32,
+        Kind::Mark => 40,
         Kind::Hook => 16,
     }
 }
@@ -92,6 +116,10 @@ mod a64 {
     }
     pub(super) const fn movk(rd: u32, imm16: u16, shift: u32) -> u32 {
         0xF280_0000 | (shift << 21) | ((imm16 as u32) << 5) | rd
+    }
+    /// `movz w<rd>, #imm16`.
+    pub(super) const fn movz_w(rd: u32, imm16: u16) -> u32 {
+        0x5280_0000 | ((imm16 as u32) << 5) | rd
     }
     pub(super) const fn mov_abs(rd: u32, value: u64) -> [u32; 4] {
         [
@@ -117,17 +145,21 @@ mod a64 {
     pub(super) const fn strb(rt: u32, rn: u32) -> u32 {
         0x3900_0000 | (rn << 5) | rt
     }
-    /// `add x<rd>, x<rn>, #<imm12>` (`shift12`: `imm12` shifted left 12).
+    /// `add x<rd>, x<rn>, #<imm12>` (`shift12`: `imm12` shifted left 12). Sets no flags.
     pub(super) const fn add_imm(rd: u32, rn: u32, imm12: u32, shift12: bool) -> u32 {
         0x9100_0000 | ((shift12 as u32) << 22) | (imm12 << 10) | (rn << 5) | rd
     }
-    /// `subs wzr, w<rn>, w<rm>` (`cmp`).
-    pub(super) const fn cmp_w(rn: u32, rm: u32) -> u32 {
-        0x6B00_0000 | (rm << 16) | (rn << 5) | 31
+    /// `sub w<rd>, w<rn>, #<imm12>`. Sets no flags (not `subs`).
+    pub(super) const fn sub_imm_w(rd: u32, rn: u32, imm12: u32) -> u32 {
+        0x5100_0000 | (imm12 << 10) | (rn << 5) | rd
     }
-    /// `b.<cond> .+delta`: `delta` a multiple of 4 within 1 MiB.
-    pub(super) const fn bcond(cond: u32, delta: i64) -> u32 {
-        0x5400_0000 | ((((delta >> 2) as u32) & 0x7_ffff) << 5) | cond
+    /// `and x<rd>, x<rn>, #~7` (logical immediate N=1, immr=61, imms=60). Sets no flags.
+    pub(super) const fn and_not7(rd: u32, rn: u32) -> u32 {
+        0x9240_0000 | (61 << 16) | (60 << 10) | (rn << 5) | rd
+    }
+    /// `cbz w<rt>, .+delta`: `delta` a multiple of 4 within 1 MiB. Reads no flags.
+    pub(super) const fn cbz_w(rt: u32, delta: i64) -> u32 {
+        0x3400_0000 | ((((delta >> 2) as u32) & 0x7_ffff) << 5) | rt
     }
     /// `ldr x<rt>, .+delta` (a literal load).
     pub(super) const fn ldr_lit(rt: u32, delta: i64) -> u32 {
@@ -142,9 +174,11 @@ mod a64 {
     pub(super) const fn adr_here(rd: u32) -> u32 {
         0x1000_0000 | rd
     }
-    /// `b.lo` (unsigned lower): below the threshold.
-    pub(super) const COND_LO: u32 = 3;
+    /// `udf #0`: the padding after a stub's last branch, which nothing reaches.
+    pub(super) const UDF: u32 = 0;
+    #[cfg_attr(target_os = "linux", allow(dead_code, reason = "macOS's thread register"))]
     pub(super) const TPIDRRO_EL0: u32 = 0xd53b_d060; // mrs x16, TPIDRRO_EL0
+    #[cfg_attr(target_os = "macos", allow(dead_code, reason = "Linux's thread register"))]
     pub(super) const TPIDR_EL0: u32 = 0xd53b_d040; // mrs x16, TPIDR_EL0
 }
 
@@ -155,34 +189,30 @@ fn emit(code: &[u32], into: &mut [u8]) {
     }
 }
 
-/// A count stub at `at` for the function in `slot`, counting into the 16-byte [`Counter`] at
-/// `counter` (in the data region). `body` is the initial plain body the control thread also
-/// stores at the body word ([`body_offset`]`(Kind::Count)`).
+/// A count stub at `at`, counting down the 16-byte [`Counter`] at `counter` (in the data
+/// region). `body` is the initial plain body the control thread also stores at the body word
+/// ([`body_offset`]`(Kind::Count)`). Writes x16 and x17 only, and no flags.
 ///
 /// adapted from makepad/relax (MIT), libs/relax/backend/src/arm64.rs (`count_stub`).
 #[cfg(target_arch = "aarch64")]
-pub fn count(at: u64, counter: u64, slot: u32, body: u64) -> Result<[u8; COUNT_STUB], OutOfReach> {
+pub fn count(at: u64, counter: u64, body: u64) -> Result<[u8; COUNT_STUB], OutOfReach> {
     use a64::*;
-    let _ = slot;
-    if counter % 4 != 0 {
-        return Err(OutOfReach { what: "a count stub's counter is not 4-aligned", from: at, to: counter });
+    if counter % 16 != 0 {
+        return Err(OutOfReach { what: "a count stub's counter is not 16-aligned", from: at, to: counter });
     }
     // Offsets (body `.quad` at 56):
-    //  0 movz/movk x16, counter (4 words)
-    // 16 ldr  w17,[x16]           ; count
-    // 20 add  w17,w17,#1
-    // 24 str  w17,[x16]
-    // 28 ldr  w1,[x16,#4]         ; threshold
-    // 32 cmp  w17,w1
-    // 36 b.lo +20 (to 56, body)   ; below threshold
-    // 40 ldr  w1,[x16,#8]         ; queued
-    // 44 cbnz w1,+12 (to 56)      ; already queued
-    // 48 movz w1,#1
-    // 52 str  w1,[x16,#8]         ; queue once
-    // 56 ldr  x16, .+8 ; br x16   ; (two words) -- but that reaches 64, past the body `.quad`.
-    //
-    // The body jump needs two words; place it before the `.quad`. Re-lay so the jump is at
-    // 48/52 and the `.quad` at 56, folding the queue-set earlier.
+    //  0 movz/movk x16, counter    (4 words)
+    // 16 ldr  w17, [x16]           ; left
+    // 20 cbz  w17, .+20            ; at zero: to 40
+    // 24 sub  w17, w17, #1
+    // 28 str  w17, [x16]
+    // 32 ldr  x16, .+24            ; the body word at 56
+    // 36 br   x16
+    // 40 movz w17, #1              ; at_zero
+    // 44 str  w17, [x16, #8]       ; queued
+    // 48 ldr  x16, .+8             ; the body word at 56
+    // 52 br   x16
+    // 56 .quad body
     let ci = mov_abs(16, counter);
     let code: [u32; 14] = [
         ci[0],
@@ -190,17 +220,13 @@ pub fn count(at: u64, counter: u64, slot: u32, body: u64) -> Result<[u8; COUNT_S
         ci[2],
         ci[3],
         ldr_w(17, 16, 0),
-        add_imm(17, 17, 1, false),
+        cbz_w(17, 20),
+        sub_imm_w(17, 17, 1),
         str_w(17, 16, 0),
-        ldr_w(1, 16, 4),
-        cmp_w(17, 1),
-        // below threshold -> body jump at word 12 (offset 48): delta from word 9 (36) = 12.
-        bcond(COND_LO, 12),
-        // at/above threshold: set queued (we skip the "already queued" guard here and rely on
-        // the control thread clearing it; a redundant store of 1 is harmless and idempotent).
-        movz(1, 1, 0),
-        str_w(1, 16, 8),
-        // body jump (words 12,13 at offsets 48,52); `.quad` at 56.
+        ldr_lit(16, 24),
+        br(16),
+        movz_w(17, 1),
+        str_w(17, 16, QUEUED),
         ldr_lit(16, 8),
         br(16),
     ];
@@ -210,9 +236,10 @@ pub fn count(at: u64, counter: u64, slot: u32, body: u64) -> Result<[u8; COUNT_S
     Ok(bytes)
 }
 
-/// A mark stub at `at` for the function in `slot`: reads this thread's bitmap base from the
+/// A mark stub at `at` for the function `slot`: reads this thread's bitmap base from the
 /// thread pointer at `tp_off`, sets the byte at `slot`, then loads the body word and jumps.
-/// `body` is the initial body the control thread also stores at the body word.
+/// `body` is the initial body the control thread also stores at the body word. Writes x16
+/// and x17 only, and no flags; a `slot` of [`MARK_SLOTS`] or more is refused.
 ///
 /// adapted from makepad/relax (MIT), libs/relax/backend/src/arm64.rs (`entry_thunk`).
 #[cfg(target_arch = "aarch64")]
@@ -223,42 +250,44 @@ pub fn mark(at: u64, tp_off: u32, slot: u32, body: u64) -> Result<[u8; MARK_STUB
     let mrs = TPIDRRO_EL0;
     #[cfg(target_os = "linux")]
     let mrs = TPIDR_EL0;
-    let _ = (TPIDRRO_EL0, TPIDR_EL0);
     if tp_off % 8 != 0 || tp_off >= 1 << 15 {
         return Err(OutOfReach { what: "a mark stub's thread-pointer offset", from: at, to: u64::from(tp_off) });
     }
-    let slot_lo = slot & 0xfff;
-    let slot_hi = (slot >> 12) & 0xfff;
+    if slot >= MARK_SLOTS {
+        return Err(OutOfReach { what: "a mark stub's function id is 2^24 or more", from: at, to: u64::from(slot) });
+    }
     // Offsets (body `.quad` at 40):
     //  0 mrs  x16, tp
-    //  4 ldr  x16,[x16,#tp_off]   ; this thread's bitmap base
-    //  8 add  x16,x16,#slot_lo
-    // 12 add  x16,x16,#slot_hi,lsl 12
-    // 16 movz w17,#1
-    // 20 strb w17,[x16]
-    // 24 (pad)
-    // 28 (pad)
-    // 32 ldr  x16, .+8 ; br x16   -> reaches 40, past `.quad`. So put jump at 32/36, `.quad` 40.
-    let code: [u32; 8] = [
+    //  4 and  x16, x16, #~7        ; macOS keeps the CPU number in the low bits; harmless on Linux
+    //  8 ldr  x16, [x16, #tp_off]  ; this thread's bitmap base
+    // 12 add  x16, x16, #slot_lo
+    // 16 add  x16, x16, #slot_hi, lsl 12
+    // 20 movz w17, #1
+    // 24 strb w17, [x16]
+    // 28 ldr  x16, .+12            ; the body word at 40
+    // 32 br   x16
+    // 36 udf  #0
+    // 40 .quad body
+    let code: [u32; 10] = [
         mrs,
+        and_not7(16, 16),
         ldr_x(16, 16, tp_off),
-        add_imm(16, 16, slot_lo, false),
-        add_imm(16, 16, slot_hi, true),
-        movz(17, 1, 0),
+        add_imm(16, 16, slot & 0xfff, false),
+        add_imm(16, 16, (slot >> 12) & 0xfff, true),
+        movz_w(17, 1),
         strb(17, 16),
-        ldr_lit(16, 8), // offset 24, reads `.quad` at 32
+        ldr_lit(16, 12),
         br(16),
+        UDF,
     ];
     let mut bytes = [0u8; MARK_STUB];
     emit(&code, &mut bytes);
-    // The `ldr x16, .+8` is at offset 24, so its `.quad` is at 32, not 40. Keep body at 32 and
-    // fix `body_offset(Mark)` accordingly.
-    bytes[32..40].copy_from_slice(&body.to_le_bytes());
+    bytes[40..48].copy_from_slice(&body.to_le_bytes());
     Ok(bytes)
 }
 
-/// A hook stub at `at`: `adr x16, .; b hook_entry; .quad body`. The branch is near (±128 MiB);
-/// [`hook_entry`] is in the same mapping.
+/// A hook stub at `at`: `adr x16, .; b entry; .quad body`. The branch is near (±128 MiB):
+/// `entry` is [`hook_entry`] or a [`veneer`] to it in the same mapping.
 #[cfg(target_arch = "aarch64")]
 pub fn hook_stub(at: u64, entry: u64, body: u64) -> Result<[u8; HOOK_STUB], OutOfReach> {
     use a64::*;
@@ -274,52 +303,78 @@ pub fn hook_stub(at: u64, entry: u64, body: u64) -> Result<[u8; HOOK_STUB], OutO
     Ok(bytes)
 }
 
-/// Where a hook stub's branch arrives: x16 is the stub's own address. Saves the argument
-/// registers, calls [`hook_resolve`] with the stub address and the caller's return address,
-/// restores them, then jumps to the body read from the stub's body word (x16 + 16).
+/// A veneer: `ldr x17, .+8; br x17; .quad target`, for a branch whose target is beyond
+/// ±128 MiB. It writes x17 alone, so x16 (a hook stub's own address) passes through it.
+/// The island of veneers per code-area span that the linker places is built on this.
+#[cfg(target_arch = "aarch64")]
+pub fn veneer(target: u64) -> [u8; VENEER] {
+    use a64::*;
+    let mut bytes = [0u8; VENEER];
+    emit(&[ldr_lit(17, 8), br(17)], &mut bytes);
+    bytes[8..16].copy_from_slice(&target.to_le_bytes());
+    bytes
+}
+
+/// Where a hook stub's branch arrives: x16 is the stub's own address. Saves x0 to x15, x18
+/// and v0 to v7 (whole q registers), calls [`hook_resolve`] with the stub address and the
+/// caller's return address, restores them, then jumps to the body read from the stub's body
+/// word (x16 + 16). The frame is 288 bytes, so sp stays 16-aligned for the call; x29 and x30
+/// are saved and restored by the frame record. x9 to x15 are dead at a callee's entry by
+/// AAPCS64 and x18 is the platform register: they are kept anyway, so a body sees every
+/// register but x16 and x17 as its caller left it.
 ///
 /// # Safety
 ///
-/// Reached only by a branch from a hook stub ([`hook_stub`]): x16 is the stub's address and
-/// x30 the caller's return address. It does not follow the C convention on entry or exit.
+/// Reached only by a branch from a hook stub ([`hook_stub`]), directly or through a
+/// [`veneer`]: x16 is the stub's address and x30 the caller's return address. It does not
+/// follow the C convention on entry or exit.
 #[cfg(target_arch = "aarch64")]
 #[unsafe(naked)]
 pub unsafe extern "C" fn hook_entry() {
     core::arch::naked_asm!(
-        "stp x29, x30, [sp, #-224]!",
+        "stp x29, x30, [sp, #-288]!",
         "mov x29, sp",
         "stp x0, x1, [sp, #16]",
         "stp x2, x3, [sp, #32]",
         "stp x4, x5, [sp, #48]",
         "stp x6, x7, [sp, #64]",
-        "str x8, [sp, #80]",
-        "stp q0, q1, [sp, #96]",
-        "stp q2, q3, [sp, #128]",
-        "stp q4, q5, [sp, #160]",
-        "stp q6, q7, [sp, #192]",
-        // x16 (stub) is callee-saved-safe only across this block; keep it in x19? x19 is
-        // callee-saved and we have not saved it. Keep the stub address on the stack instead.
-        "str x16, [sp, #88]",
+        "stp x8, x9, [sp, #80]",
+        "stp x10, x11, [sp, #96]",
+        "stp x12, x13, [sp, #112]",
+        "stp x14, x15, [sp, #128]",
+        // x16 (the stub) is not kept across a call, so it goes on the stack beside x18.
+        "stp x16, x18, [sp, #144]",
+        "stp q0, q1, [sp, #160]",
+        "stp q2, q3, [sp, #192]",
+        "stp q4, q5, [sp, #224]",
+        "stp q6, q7, [sp, #256]",
         "mov x0, x16", // the stub address: hook_resolve derives the slot from it
         "mov x1, x30", // the caller's return address
         "bl {resolve}",
-        "ldr x16, [sp, #88]",
-        "ldp q6, q7, [sp, #192]",
-        "ldp q4, q5, [sp, #160]",
-        "ldp q2, q3, [sp, #128]",
-        "ldp q0, q1, [sp, #96]",
-        "ldr x8, [sp, #80]",
+        "ldp q6, q7, [sp, #256]",
+        "ldp q4, q5, [sp, #224]",
+        "ldp q2, q3, [sp, #192]",
+        "ldp q0, q1, [sp, #160]",
+        "ldp x16, x18, [sp, #144]",
+        "ldp x14, x15, [sp, #128]",
+        "ldp x12, x13, [sp, #112]",
+        "ldp x10, x11, [sp, #96]",
+        "ldp x8, x9, [sp, #80]",
         "ldp x6, x7, [sp, #64]",
         "ldp x4, x5, [sp, #48]",
         "ldp x2, x3, [sp, #32]",
         "ldp x0, x1, [sp, #16]",
-        "ldp x29, x30, [sp], #224",
+        "ldp x29, x30, [sp], #288",
         // Jump to the body read from the stub's body word (offset 16).
         "ldr x16, [x16, #16]",
         "br x16",
         resolve = sym hook_resolve,
     )
 }
+
+/// How many times [`hook_resolve`] ran, for the tests.
+#[cfg(all(test, target_arch = "aarch64"))]
+static HOOKED: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 
 /// What a hook stub calls: `stub` is the stub's address, `retaddr` the caller's return address.
 /// Derives the slot and hands both to the monitor. Stores no word.
@@ -328,111 +383,324 @@ pub unsafe extern "C" fn hook_entry() {
 #[cfg(target_arch = "aarch64")]
 extern "C" fn hook_resolve(stub: usize, retaddr: usize) {
     // The control thread knows each stub's slot; this seam hands the raw pair on. Until the
-    // monitor is wired (blaze-run), it is a no-op that reads its arguments so they are live.
+    // monitor is wired (blaze-run), it only reads its arguments so they are live.
     let _ = (stub, retaddr);
+    #[cfg(test)]
+    HOOKED.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(all(test, target_arch = "aarch64"))]
 mod tests {
     use super::*;
+    use crate::sys::Code;
 
     fn word(bytes: &[u8], at: usize) -> u32 {
         u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap())
     }
 
+    fn quad(bytes: &[u8], at: usize) -> u64 {
+        u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap())
+    }
+
     /// The count stub's instructions and its body `.quad`, against known encodings.
     #[test]
     fn a_count_stub_encodes_to_known_bytes() {
-        // counter = 0x2000 (4-aligned), body = 0xdead_beef_0000_0008.
-        let bytes = count(0x1000, 0x2000, 3, 0xdead_beef_0000_0008).expect("in reach");
-        assert_eq!(bytes.len(), COUNT_STUB);
-        assert_eq!(word(&bytes, 0), 0xd284_0010, "movz x16, #0x2000");
-        assert_eq!(word(&bytes, 16), 0xb940_0211, "ldr w17, [x16]");
-        assert_eq!(word(&bytes, 20), 0x9100_0631, "add w17, w17, #1");
-        assert_eq!(word(&bytes, 24), 0xb900_0211, "str w17, [x16]");
-        assert_eq!(word(&bytes, 32), 0x6b01_023f, "cmp w17, w1");
-        assert_eq!(word(&bytes, 36), 0x5400_0063, "b.lo .+12");
-        assert_eq!(word(&bytes, 48), 0x5800_0050, "ldr x16, .+8");
-        assert_eq!(word(&bytes, 52), 0xd61f_0200, "br x16");
-        assert_eq!(
-            u64::from_le_bytes(bytes[body_offset(Kind::Count)..body_offset(Kind::Count) + 8].try_into().unwrap()),
-            0xdead_beef_0000_0008,
-        );
+        let bytes = count(0x1000, 0x2000, 0xdead_beef_0000_0008).expect("in reach");
+        let expect: [(usize, u32, &str); 11] = [
+            (0, 0xd284_0010, "movz x16, #0x2000"),
+            (16, 0xb940_0211, "ldr w17, [x16]"),
+            (20, 0x3400_00b1, "cbz w17, .+20"),
+            (24, 0x5100_0631, "sub w17, w17, #1"),
+            (28, 0xb900_0211, "str w17, [x16]"),
+            (32, 0x5800_00d0, "ldr x16, .+24"),
+            (36, 0xd61f_0200, "br x16"),
+            (40, 0x5280_0031, "movz w17, #1"),
+            (44, 0xb900_0a11, "str w17, [x16, #8]"),
+            (48, 0x5800_0050, "ldr x16, .+8"),
+            (52, 0xd61f_0200, "br x16"),
+        ];
+        for (at, encoding, what) in expect {
+            assert_eq!(word(&bytes, at), encoding, "{what} at {at}");
+        }
         assert_eq!(body_offset(Kind::Count), 56);
+        assert_eq!(quad(&bytes, 56), 0xdead_beef_0000_0008);
     }
 
     /// The mark stub's instructions and its body `.quad`.
     #[test]
     fn a_mark_stub_encodes_to_known_bytes() {
-        let bytes = mark(0x1000, 8, 5, 0x1234_5678_0000_0010).expect("in reach");
-        assert_eq!(bytes.len(), MARK_STUB);
+        let bytes = mark(0x1000, 8, 0x12_3456, 0x1234_5678_0000_0010).expect("in reach");
         #[cfg(target_os = "macos")]
         assert_eq!(word(&bytes, 0), 0xd53b_d060, "mrs x16, TPIDRRO_EL0");
-        assert_eq!(word(&bytes, 20), 0x3900_0211, "strb w17, [x16]");
-        assert_eq!(word(&bytes, 24), 0x5800_0050, "ldr x16, .+8");
-        assert_eq!(word(&bytes, 28), 0xd61f_0200, "br x16");
-        assert_eq!(
-            u64::from_le_bytes(bytes[body_offset(Kind::Mark)..body_offset(Kind::Mark) + 8].try_into().unwrap()),
-            0x1234_5678_0000_0010,
-        );
-        assert_eq!(body_offset(Kind::Mark), 32);
+        #[cfg(target_os = "linux")]
+        assert_eq!(word(&bytes, 0), 0xd53b_d040, "mrs x16, TPIDR_EL0");
+        let expect: [(usize, u32, &str); 9] = [
+            (4, 0x927d_f210, "and x16, x16, #~7"),
+            (8, 0xf940_0610, "ldr x16, [x16, #8]"),
+            (12, 0x9100_0000 | (0x456 << 10) | (16 << 5) | 16, "add x16, x16, #0x456"),
+            (16, 0x9140_0000 | (0x123 << 10) | (16 << 5) | 16, "add x16, x16, #0x123, lsl 12"),
+            (20, 0x5280_0031, "movz w17, #1"),
+            (24, 0x3900_0211, "strb w17, [x16]"),
+            (28, 0x5800_0070, "ldr x16, .+12"),
+            (32, 0xd61f_0200, "br x16"),
+            (36, 0, "udf #0"),
+        ];
+        for (at, encoding, what) in expect {
+            assert_eq!(word(&bytes, at), encoding, "{what} at {at}");
+        }
+        assert_eq!(body_offset(Kind::Mark), 40);
+        assert_eq!(quad(&bytes, 40), 0x1234_5678_0000_0010);
     }
 
-    /// The hook stub: `adr x16, .; b hook_entry; .quad body`.
+    /// A function id past two 12-bit immediates is refused, not truncated.
     #[test]
-    fn a_hook_stub_encodes_to_known_bytes() {
-        let at = 0x1000;
-        let entry = 0x2000;
-        let bytes = hook_stub(at, entry, 0xbeef).expect("in reach");
-        assert_eq!(bytes.len(), HOOK_STUB);
+    fn a_mark_stub_refuses_an_id_past_its_reach() {
+        assert!(mark(0x1000, 8, MARK_SLOTS - 1, 0).is_ok());
+        assert!(mark(0x1000, 8, MARK_SLOTS, 0).is_err());
+    }
+
+    /// The hook stub: `adr x16, .; b hook_entry; .quad body`; and the veneer.
+    #[test]
+    fn a_hook_stub_and_a_veneer_encode_to_known_bytes() {
+        let bytes = hook_stub(0x1000, 0x2000, 0xbeef).expect("in reach");
         assert_eq!(word(&bytes, 0), 0x1000_0010, "adr x16, .");
-        // b (entry - (at+4)) / 4 = (0x2000 - 0x1004) / 4 = 0xFFF/... compute by the encoder.
-        let delta = (entry - (at + 4)) as i64;
-        assert_eq!(word(&bytes, 4), 0x1400_0000 | (((delta >> 2) as u32) & 0x03ff_ffff));
-        assert_eq!(
-            u64::from_le_bytes(bytes[body_offset(Kind::Hook)..body_offset(Kind::Hook) + 8].try_into().unwrap()),
-            0xbeef,
-        );
+        // (0x2000 - 0x1004) / 4 = 0x3ff.
+        assert_eq!(word(&bytes, 4), 0x1400_03ff, "b .+0xffc");
+        assert_eq!(quad(&bytes, body_offset(Kind::Hook)), 0xbeef);
+        assert!(hook_stub(0x1000, 0x1004 + (1 << 27), 0).is_err(), "128 MiB forward is out of reach");
+        assert!(hook_stub(0x1000, 0x1004 + (1 << 27) - 4, 0).is_ok());
+
+        let bytes = veneer(0x1122_3344_5566_7788);
+        assert_eq!(word(&bytes, 0), 0x5800_0051, "ldr x17, .+8");
+        assert_eq!(word(&bytes, 4), 0xd61f_0220, "br x17");
+        assert_eq!(quad(&bytes, 8), 0x1122_3344_5566_7788);
     }
 
-    /// Maps a count stub and a body, runs the stub past its threshold, and checks the counter
-    /// counts, queues once, and the call still reaches the body.
+    /// Eight integer and eight floating-point arguments, folded so that any one changed or
+    /// two swapped changes the sum.
+    #[expect(clippy::too_many_arguments, reason = "every argument register is the point")]
+    extern "C" fn sixteen(
+        a: u64,
+        b: u64,
+        c: u64,
+        d: u64,
+        e: u64,
+        f: u64,
+        g: u64,
+        h: u64,
+        p: f64,
+        q: f64,
+        r: f64,
+        s: f64,
+        t: f64,
+        u: f64,
+        v: f64,
+        w: f64,
+    ) -> u64 {
+        let mut sum = 0u64;
+        for x in [a, b, c, d, e, f, g, h] {
+            sum = sum.wrapping_mul(31).wrapping_add(x);
+        }
+        for x in [p, q, r, s, t, u, v, w] {
+            sum = sum.wrapping_mul(31).wrapping_add(x.to_bits());
+        }
+        sum
+    }
+
+    type Sixteen = extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, f64, f64, f64, f64, f64, f64, f64, f64) -> u64;
+
+    /// Returned through x8: larger than 16 bytes, so AAPCS64 passes its address in x8.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    #[repr(C)]
+    struct Wide {
+        words: [u64; 6],
+    }
+
+    #[expect(clippy::too_many_arguments, reason = "every argument register beside x8 is the point")]
+    extern "C" fn wide(a: u64, b: u64, c: u64, d: u64, e: u64, f: u64, g: u64, h: u64, p: f64) -> Wide {
+        Wide { words: [a ^ h, b ^ g, c ^ f, d ^ e, p.to_bits(), a.wrapping_add(h).wrapping_mul(3)] }
+    }
+
+    type WideFn = extern "C" fn(u64, u64, u64, u64, u64, u64, u64, u64, f64) -> Wide;
+
+    /// Returns x8 in x0: what a body sees in the indirect-result register.
+    #[unsafe(naked)]
+    extern "C" fn echo_x8() {
+        core::arch::naked_asm!("mov x0, x8", "ret")
+    }
+
+    /// The stubs of each kind in one mapping in front of `body`, and what they write.
+    struct Rig {
+        code: Code,
+        count: u64,
+        #[cfg(target_os = "macos")]
+        mark: u64,
+        hook: u64,
+        /// The pthread key whose value is the bitmap base (macOS).
+        #[cfg(target_os = "macos")]
+        key: libc::pthread_key_t,
+    }
+
+    const MARKED: u32 = 5;
+    const BITMAP: usize = 64;
+
+    impl Rig {
+        fn new(body: u64) -> Rig {
+            let page = crate::sys::page().expect("a page");
+            let mut code = Code::map_with_data(page, page).expect("a mapping");
+            let base = code.base() as u64;
+            let data = code.data_base();
+            // SAFETY: `data` is the data region's writable base (`Code::data_base`), a whole
+            // page, zero until written; the counter is its first 16 bytes and nothing else
+            // in this test writes them.
+            unsafe { (data as *mut Counter).write(Counter::new(3)) };
+
+            let count_at = 0u64;
+            let stub = count(base + count_at, data as u64, body).expect("in reach");
+            code.write(count_at as usize, &stub).expect("count stub written");
+
+            #[cfg(target_os = "macos")]
+            let (mark_at, key) = {
+                let mut key: libc::pthread_key_t = 0;
+                // SAFETY: `key` is a live local the call fills; no destructor.
+                assert_eq!(unsafe { libc::pthread_key_create(&mut key, None) }, 0, "a pthread key");
+                // SAFETY: the value is the bitmap in the data region, live while the rig is.
+                assert_eq!(unsafe { libc::pthread_setspecific(key, (data + BITMAP) as *const _) }, 0);
+                let at = 64u64;
+                let tp_off = u32::try_from(key * 8).expect("a TSD offset");
+                let stub = mark(base + at, tp_off, MARKED, body).expect("in reach");
+                code.write(at as usize, &stub).expect("mark stub written");
+                (at, key)
+            };
+
+            // hook_entry is in the test binary, maybe beyond ±128 MiB: through a veneer.
+            let veneer_at = 128u64;
+            code.write(veneer_at as usize, &veneer(hook_entry as usize as u64)).expect("veneer written");
+            let hook_at = 192u64;
+            let stub = hook_stub(base + hook_at, base + veneer_at, body).expect("in reach");
+            code.write(hook_at as usize, &stub).expect("hook stub written");
+
+            Rig {
+                code,
+                count: base + count_at,
+                #[cfg(target_os = "macos")]
+                mark: base + mark_at,
+                hook: base + hook_at,
+                #[cfg(target_os = "macos")]
+                key,
+            }
+        }
+
+        /// Every stub's address.
+        fn stubs(&self) -> impl Iterator<Item = (Kind, u64)> {
+            #[cfg(target_os = "macos")]
+            let stubs = [(Kind::Count, self.count), (Kind::Mark, self.mark), (Kind::Hook, self.hook)];
+            #[cfg(not(target_os = "macos"))]
+            let stubs = [(Kind::Count, self.count), (Kind::Hook, self.hook)];
+            stubs.into_iter()
+        }
+
+        fn counter(&self) -> Counter {
+            // SAFETY: the counter is the data region's first 16 bytes, live with `code`.
+            unsafe { (self.code.data_base() as *const Counter).read() }
+        }
+
+        #[cfg(target_os = "macos")]
+        fn marked(&self) -> u8 {
+            // SAFETY: the bitmap is in the data region, live with `code`; byte MARKED of it.
+            unsafe { ((self.code.data_base() + BITMAP + MARKED as usize) as *const u8).read() }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for Rig {
+        fn drop(&mut self) {
+            // SAFETY: the key this rig made, which no stub reads once the rig is gone.
+            unsafe { libc::pthread_key_delete(self.key) };
+        }
+    }
+
+    /// The count stub counts down from its threshold, queues once it finds zero, and every
+    /// call still reaches the body.
     #[test]
-    fn a_count_stub_counts_and_queues_and_reaches_the_body() {
-        use crate::sys::Code;
+    fn a_count_stub_counts_down_and_queues_and_reaches_the_body() {
+        let rig = Rig::new(sixteen as usize as u64);
+        // SAFETY: the count stub forwards every argument register to `sixteen` unchanged.
+        let call: Sixteen = unsafe { core::mem::transmute::<usize, Sixteen>(rig.count as usize) };
+        for n in 1..=5u32 {
+            assert_eq!(call(1, 2, 3, 4, 5, 6, 7, 8, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0), sixteen(1, 2, 3, 4, 5, 6, 7, 8, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0));
+            let seen = rig.counter();
+            assert_eq!(seen.left, 3u32.saturating_sub(n), "counted down after call {n}");
+            assert_eq!(seen.queued, u32::from(n > 3), "queued only once it found zero (call {n})");
+        }
+    }
 
-        let page = crate::sys::page().expect("a page");
-        // One page of code, one of data.
-        let mut code = Code::map_with_data(page, page).expect("a mapping");
-        let base = code.base() as u64;
-        let data = code.data_base();
+    /// Through each stub kind, sixteen argument registers reach the body as a direct call
+    /// passes them, and each stub wrote what it is for.
+    #[test]
+    fn every_stub_passes_eight_integer_and_eight_float_arguments() {
+        let rig = Rig::new(sixteen as usize as u64);
+        let args = (
+            0x0101_0101_0101_0101u64,
+            0x0202,
+            u64::MAX,
+            0x8000_0000_0000_0000,
+            5,
+            6,
+            7,
+            0xfeed_face,
+            -1.5f64,
+            2.25,
+            f64::MIN_POSITIVE,
+            1e300,
+            -0.0,
+            3.5,
+            7.125,
+            f64::MAX,
+        );
+        let direct = sixteen(args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9, args.10, args.11, args.12, args.13, args.14, args.15);
+        let hooked = HOOKED.load(core::sync::atomic::Ordering::Relaxed);
+        for (kind, at) in rig.stubs() {
+            // SAFETY: each stub forwards every argument register to `sixteen` unchanged; the
+            // mapping is live with `rig`.
+            let call: Sixteen = unsafe { core::mem::transmute::<usize, Sixteen>(at as usize) };
+            let through = call(args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9, args.10, args.11, args.12, args.13, args.14, args.15);
+            assert_eq!(through, direct, "through the {kind:?} stub");
+        }
+        assert_eq!(rig.counter().left, 2, "the count stub counted");
+        #[cfg(target_os = "macos")]
+        assert_eq!(rig.marked(), 1, "the mark stub set its byte");
+        assert!(HOOKED.load(core::sync::atomic::Ordering::Relaxed) > hooked, "the hook ran");
+    }
 
-        // The counter at the data region's start: count 0, threshold 3.
-        // SAFETY: `data` is the data region's writable base (`Code::data_base`), covering a
-        // whole page; a `Counter` is 16 bytes, well inside it, and nothing else uses it here.
-        let counter_ptr = data as *mut Counter;
-        unsafe { counter_ptr.write(Counter::new(3)) };
-        let counter_addr = data as u64;
+    /// Through each stub kind, x8 reaches the body unchanged, and a struct returned through
+    /// the x8 address arrives whole.
+    #[test]
+    fn every_stub_keeps_x8_and_a_struct_returned_by_pointer() {
+        let echo = Rig::new(echo_x8 as usize as u64);
+        for (kind, at) in echo.stubs() {
+            let sent = 0x5a5a_0000_1234_5678u64 ^ at;
+            let got: u64;
+            // SAFETY: the stub forwards to `echo_x8`, which returns x8 in x0 and touches
+            // nothing else; the C convention's clobbers cover what the stub and veneer write.
+            unsafe {
+                core::arch::asm!(
+                    "blr {f}",
+                    f = in(reg) at,
+                    inout("x8") sent => _,
+                    lateout("x0") got,
+                    clobber_abi("C"),
+                );
+            }
+            assert_eq!(got, sent, "x8 through the {kind:?} stub");
+        }
 
-        // The body `extern "C" fn() -> u32 { 7 }` at code offset 0: `movz w0,#7; ret`.
-        let body_off = 0u64;
-        let body = [0x52_80_00_e0u32.to_le_bytes(), 0xd6_5f_03_c0u32.to_le_bytes()].concat();
-        code.write(body_off as usize, &body).expect("body written");
-
-        // The count stub at an 8-aligned offset past the body.
-        let stub_off = 64u64;
-        let stub = count(base + stub_off, counter_addr, 1, base + body_off).expect("in reach");
-        code.write(stub_off as usize, &stub).expect("stub written");
-
-        // SAFETY: the stub at `base + stub_off` is `extern "C" fn() -> u32`: it counts and
-        // jumps to the body, which returns 7. The mapping is live for the call.
-        let call: extern "C" fn() -> u32 = unsafe { core::mem::transmute(base + stub_off) };
-        for n in 1..=4u32 {
-            assert_eq!(call(), 7, "the stub reaches the body");
-            // SAFETY: the counter is live in the data region for the test.
-            let seen = unsafe { counter_ptr.read() };
-            assert_eq!(seen.count, n, "the count rose");
-            assert_eq!(seen.queued, 1, "queued once at or past the threshold");
+        let rig = Rig::new(wide as usize as u64);
+        let direct = wide(1, 2, 3, 4, 5, 6, 7, 8, 9.5);
+        for (kind, at) in rig.stubs() {
+            // SAFETY: each stub forwards every argument register and x8 to `wide` unchanged.
+            let call: WideFn = unsafe { core::mem::transmute::<usize, WideFn>(at as usize) };
+            assert_eq!(call(1, 2, 3, 4, 5, 6, 7, 8, 9.5), direct, "a struct by pointer through the {kind:?} stub");
         }
     }
 }

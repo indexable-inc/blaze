@@ -8,7 +8,7 @@ use base_db::{Crate, CrateKey, Db, Env, Given, ProcMacroLoadingError};
 use intern::Symbol;
 use span::Span;
 use std::alloc::Global;
-use triomphe::Arc;
+use std::sync::Arc;
 
 use crate::{ExpandError, ExpandErrorKind, ExpandResult, tt};
 

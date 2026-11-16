@@ -9,6 +9,8 @@
 use std::alloc::Global;
 use std::fmt;
 
+use blaze_semver::Version;
+
 /// The largest `Cargo.lock` read: 64 MiB. The largest real ones (thousands of packages) are a
 /// few MiB; past this is a file no workspace has, refused before TOML decodes it.
 pub const MOST_LOCK_BYTES: usize = 64 << 20;
@@ -32,7 +34,7 @@ pub enum Source {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Package {
     pub name: String,
-    pub version: semver::Version,
+    pub version: Version<Global>,
     pub source: Source,
     /// Indices into [`Lock::packages`], sorted by (name, version, source).
     pub deps: Vec<usize, Global>,
@@ -107,35 +109,47 @@ impl Lock {
             return Err(LockRefused::TooBig { bytes: bytes.len() });
         }
         let text = std::str::from_utf8(bytes).map_err(|it| LockRefused::NotToml(it.to_string()))?;
-        let doc: toml::Table = toml::from_str(text).map_err(|it| LockRefused::NotToml(it.to_string()))?;
-        let empty = toml::value::Array::new();
-        let listed = match doc.get("package") {
-            Some(toml::Value::Array(it)) => it,
-            Some(_) => return Err(LockRefused::NotToml("`package` is not an array of tables".to_owned())),
-            None => &empty,
+        let doc = blaze_toml::Document::parse_in(text, blaze_toml::Limits::CARGO, Global)
+            .map_err(|it| LockRefused::NotToml(it.display(text).to_string()))?;
+        let listed = match doc.root().get("package") {
+            Some(it) if it.is_array() => Some(it),
+            Some(it) => {
+                let (line, col) = it.line_col();
+                return Err(LockRefused::NotToml(format!(
+                    "`package` at line {line}, column {col} is not an array of tables"
+                )));
+            }
+            None => None,
         };
-        if listed.len() > MOST_PACKAGES {
-            return Err(LockRefused::TooMany { packages: listed.len() });
+        let count = listed.map_or(0, |it| it.len());
+        if count > MOST_PACKAGES {
+            return Err(LockRefused::TooMany { packages: count });
         }
-        let mut packages: Vec<Package, Global> = Vec::with_capacity_in(listed.len(), Global);
-        let mut wanted: Vec<Vec<String, Global>, Global> = Vec::with_capacity_in(listed.len(), Global);
-        for (at, item) in listed.iter().enumerate() {
-            let table = item
-                .as_table()
-                .ok_or_else(|| LockRefused::Bad { package: format!("#{at}"), why: "is not a table".to_owned() })?;
-            let field = |key: &str| table.get(key).and_then(toml::Value::as_str);
+        let mut packages: Vec<Package, Global> = Vec::with_capacity_in(count, Global);
+        let mut wanted: Vec<Vec<String, Global>, Global> = Vec::with_capacity_in(count, Global);
+        for (at, table) in listed.into_iter().flat_map(|it| it.children()).enumerate() {
+            if !table.is_table() {
+                let (line, col) = table.line_col();
+                return Err(LockRefused::Bad {
+                    package: format!("#{at}"),
+                    why: format!("at line {line}, column {col} is not a table"),
+                });
+            }
+            let field = |key: &str| table.get(key).and_then(|it| it.as_str());
             let name = field("name")
                 .ok_or_else(|| LockRefused::Bad { package: format!("#{at}"), why: "has no `name`".to_owned() })?
                 .to_owned();
             let bad = |why: String| LockRefused::Bad { package: name.clone(), why };
             let version = field("version").ok_or_else(|| bad("has no `version`".to_owned()))?;
-            let version = semver::Version::parse(version)
+            let version = Version::parse_in(version, blaze_semver::Limits::CARGO, Global)
                 .map_err(|why| bad(format!("has the version `{version}`, which is not semver: {why}")))?;
             let source = source_of(field("source"), field("checksum").map(str::to_owned), &name)?;
             let mut deps = Vec::new_in(Global);
             if let Some(list) = table.get("dependencies") {
-                let list = list.as_array().ok_or_else(|| bad("has `dependencies` that is not an array".to_owned()))?;
-                for dep in list {
+                if !list.is_array() {
+                    return Err(bad("has `dependencies` that is not an array".to_owned()));
+                }
+                for dep in list.children() {
                     let dep = dep.as_str().ok_or_else(|| bad("has a dependency that is not a string".to_owned()))?;
                     deps.push(dep.to_owned());
                 }
@@ -163,7 +177,11 @@ impl Lock {
         let dangling = || LockRefused::Dangling { package: of.to_owned(), dep: dep.to_owned() };
         let mut parts = dep.splitn(3, ' ');
         let name = parts.next().unwrap_or_default();
-        let version = parts.next().map(semver::Version::parse).transpose().map_err(|_| dangling())?;
+        let version = parts
+            .next()
+            .map(|it| Version::parse_in(it, blaze_semver::Limits::CARGO, Global))
+            .transpose()
+            .map_err(|_| dangling())?;
         let source = parts.next().map(|it| it.trim_start_matches('(').trim_end_matches(')'));
         let mut hits = packages.iter().enumerate().filter(|(_, it)| {
             it.name == name

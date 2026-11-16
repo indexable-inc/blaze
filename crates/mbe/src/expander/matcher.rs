@@ -70,7 +70,7 @@
 //! is built. The trees the transcriber reads are built from the cells once, when the match is
 //! over ([`Buffers::build`]).
 
-use arrayvec::ArrayVec;
+use blaze_own::FixedVec;
 
 use blaze_mem::frame::Frame;
 use intern::sym;
@@ -99,7 +99,7 @@ pub(crate) struct Matcher {
     rep_vars: Box<[Binder]>,
     literals: Box<[tt::Literal]>,
     idents: Box<[tt::Ident]>,
-    puncts: Box<[ArrayVec<tt::Punct, MAX_GLUED_PUNCT_LEN>]>,
+    puncts: Box<[FixedVec<tt::Punct, MAX_GLUED_PUNCT_LEN>]>,
     separators: Box<[Separator]>,
     /// How many binders the rule has ([`crate::parser::resolve_binders`]).
     binders: u32,
@@ -194,7 +194,7 @@ struct MatcherBuilder {
     rep_vars: Vec<Binder>,
     literals: Vec<tt::Literal>,
     idents: Vec<tt::Ident>,
-    puncts: Vec<ArrayVec<tt::Punct, MAX_GLUED_PUNCT_LEN>>,
+    puncts: Vec<FixedVec<tt::Punct, MAX_GLUED_PUNCT_LEN>>,
     separators: Vec<Separator>,
     var_decls: Vec<(u32, failure::VarDecl)>,
     groups: Vec<failure::Group>,
@@ -775,7 +775,7 @@ fn match_loop_inner<'t>(
     let is_delim_closed = src.is_empty() && !a.stack.is_empty();
     // The token at the dot, decoded once for every position, and the punctuation glued from it.
     let token = src.peek();
-    let mut glued: Option<Result<(ArrayVec<tt::Punct, MAX_GLUED_PUNCT_LEN>, TtIter<'t>), ()>> =
+    let mut glued: Option<Result<(FixedVec<tt::Punct, MAX_GLUED_PUNCT_LEN>, TtIter<'t>), ()>> =
         None;
     let mut glued_meta = NONE;
 

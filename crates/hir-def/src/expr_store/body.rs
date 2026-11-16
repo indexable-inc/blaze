@@ -11,7 +11,7 @@ use syntax::{
     FlatTree, NodeOrToken, SyntaxKind, SyntaxNodePtr, TextRange, TextSize,
     view::{self, AstNode as _},
 };
-use triomphe::Arc;
+use std::sync::Arc;
 
 use crate::{
     DefWithBodyId, ExpressionStoreOwnerId, HasModule,

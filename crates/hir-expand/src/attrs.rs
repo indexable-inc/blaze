@@ -20,10 +20,9 @@ use ::tt::TextRange;
 use base_db::{Crate, Db};
 use blaze_mem::{Tag, frame};
 use cfg::{CfgExpr, CfgOptions};
-use either::Either;
-use itertools::Itertools;
+use stdx::Either;
+use stdx::iter::IterExt;
 use mbe::{DelimiterKind, Punct};
-use smallvec::SmallVec;
 use span::{RealSpanMap, Span, SyntaxContext};
 use syntax::{
     AstNode, SmolStr, ast, unescape,
@@ -124,8 +123,8 @@ pub fn expand_cfg_attr_with_doc_comments_view<'t, 'a, DocComment, BreakValue>(
         Either<(view::Meta<'t>, view::Attr<'t>), DocComment>,
     ) -> ControlFlow<BreakValue>,
 ) -> Option<BreakValue> {
-    // alloc: none until a `cfg_attr` holds more than one attribute
-    let mut stack = SmallVec::<[(view::Meta<'t>, view::Attr<'t>); 1]>::new();
+    // alloc: none until a `cfg_attr` is met
+    let mut stack = Vec::<(view::Meta<'t>, view::Attr<'t>)>::new();
     'process_attrs: loop {
         let (mut meta, top_attr) = match stack.pop() {
             Some(it) => it,
@@ -168,15 +167,15 @@ pub fn cfg_attrs_view<'t, 'a, I: Iterator<Item = view::Attr<'t>>>(
     attrs: I,
     cfg_options: &'a CfgOptions,
 ) -> CfgAttrsView<'t, 'a, I> {
-    CfgAttrsView { attrs, cfg_options, stack: SmallVec::new() }
+    CfgAttrsView { attrs, cfg_options, stack: Vec::new() }
 }
 
 /// What [`cfg_attrs_view`] gives.
 pub struct CfgAttrsView<'t, 'a, I> {
     attrs: I,
     cfg_options: &'a CfgOptions,
-    // alloc: none until a `cfg_attr` holds more than one attribute
-    stack: SmallVec<[(view::Meta<'t>, view::Attr<'t>); 1]>,
+    // alloc: none until a `cfg_attr` is met
+    stack: Vec<(view::Meta<'t>, view::Attr<'t>)>,
 }
 
 impl<'t, I: Iterator<Item = view::Attr<'t>>> Iterator for CfgAttrsView<'t, '_, I> {
@@ -274,7 +273,7 @@ pub struct Attr {
     pub path: ModPath,
     /// Shared: an item tree assembled from its items' trees clones every attribute of the file
     /// on each edit, and a clone is then one count.
-    pub input: Option<triomphe::Arc<AttrInput>>,
+    pub input: Option<std::sync::Arc<AttrInput>>,
     pub ctxt: SyntaxContext,
 }
 

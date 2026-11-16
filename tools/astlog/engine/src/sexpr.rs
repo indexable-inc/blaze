@@ -5,7 +5,7 @@
 //! `;` comments run to end of line. Every form remembers the 1-based line it
 //! started on so later passes can report positions.
 
-use crate::error::{DslSnafu, Error, TooDeepSnafu};
+use crate::error::Error;
 
 /// The deepest a list may nest. The reader, and every pass over what it read, recurses once a
 /// level, so request text nested without bound would overflow the stack; a real rule nests a
@@ -65,28 +65,26 @@ impl Reader<'_> {
         let mut text = String::new();
         loop {
             let Some(c) = self.bump() else {
-                return DslSnafu { line, message: "unterminated string".to_owned() }.fail();
+                return Err(Error::Dsl { line, message: "unterminated string".to_owned() });
             };
             match c {
                 '"' => return Ok(Sexpr::Str { text, line }),
                 '\\' => {
                     let Some(escaped) = self.bump() else {
-                        return DslSnafu {
+                        return Err(Error::Dsl {
                             line: self.line,
                             message: "dangling `\\` at end of input".to_owned(),
-                        }
-                        .fail();
+                        });
                     };
                     match escaped {
                         'n' => text.push('\n'),
                         't' => text.push('\t'),
                         '"' | '\\' => text.push(escaped),
                         other => {
-                            return DslSnafu {
+                            return Err(Error::Dsl {
                                 line: self.line,
                                 message: format!("unknown escape `\\{other}`"),
-                            }
-                            .fail();
+                            });
                         }
                     }
                 }
@@ -121,7 +119,7 @@ impl Reader<'_> {
             '(' => {
                 let line = self.line;
                 if depth == MAX_DEPTH {
-                    return TooDeepSnafu { line, max: MAX_DEPTH }.fail();
+                    return Err(Error::TooDeep { line, max: MAX_DEPTH });
                 }
                 self.bump();
                 let mut items = Vec::new();
@@ -132,12 +130,12 @@ impl Reader<'_> {
                         return Ok(Some(Sexpr::List { items, line }));
                     }
                     let Some(item) = self.read_form(depth + 1)? else {
-                        return DslSnafu { line, message: "unclosed `(`".to_owned() }.fail();
+                        return Err(Error::Dsl { line, message: "unclosed `(`".to_owned() });
                     };
                     items.push(item);
                 }
             }
-            ')' => DslSnafu { line: self.line, message: "unexpected `)`".to_owned() }.fail(),
+            ')' => Err(Error::Dsl { line: self.line, message: "unexpected `)`".to_owned() }),
             '"' => self.read_string().map(Some),
             _ => Ok(Some(self.read_atom())),
         }

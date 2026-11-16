@@ -98,15 +98,14 @@ fn plan<'p, F: Facts>(
     let action = match action {
         Action::Text(text) => {
             let target = binding.get(&text.target).ok_or_else(|| {
-                TemplateVarSnafu { var: text.target.clone(), line: text.line }.build()
+                Error::TemplateVar { var: text.target.clone(), line: text.line }
             })?;
             let Value::Node(node) = target else {
-                return ReplaceNotNodeSnafu {
+                return Err(Error::ReplaceNotNode {
                     name: rewrite.name.clone(),
                     var: text.target.clone(),
                     what: target.what(),
-                }
-                .fail();
+                });
             };
             PlannedAction::Text {
                 kind: text.kind,
@@ -122,7 +121,7 @@ fn plan<'p, F: Facts>(
                 .iter()
                 .map(|term| match term {
                     Term::Var(var) => binding.get(var).cloned().ok_or_else(|| {
-                        TemplateVarSnafu { var: var.clone(), line: source.line }.build()
+                        Error::TemplateVar { var: var.clone(), line: source.line }
                     }),
                     Term::Text(text) => Ok(Value::Text(std::sync::Arc::from(text.as_str()))),
                     Term::Int(int) => Ok(Value::Int(*int)),
@@ -150,7 +149,7 @@ pub fn render<F: Facts>(
             Segment::Lit(lit) => out.push_str(lit),
             Segment::Var(var) => {
                 let value = binding.get(var).ok_or_else(|| {
-                    TemplateVarSnafu { var: var.clone(), line: template.line }.build()
+                    Error::TemplateVar { var: var.clone(), line: template.line }
                 })?;
                 out.push_str(&facts.value_text(value));
             }

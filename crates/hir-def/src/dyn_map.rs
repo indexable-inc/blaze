@@ -27,7 +27,7 @@
 pub mod keys {
     use std::marker::PhantomData;
 
-    use either::Either;
+    use stdx::Either;
     use hir_expand::{MacroCallId, attrs::AttrId};
     use syntax::{AstNode, AstPtr, ast};
 

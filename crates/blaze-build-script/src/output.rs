@@ -474,12 +474,12 @@ pub fn read<'a>(input: &'a [u8], cx: &Context<'_>, sink: &mut impl Sink<'a>) -> 
     // A path the output names in the `OUT_DIR` it ran with is moved to the one it has now;
     // when they are the same nothing moves, and nothing is searched for or copied.
     let moved = (!generated.is_empty() && generated != out_dir_text)
-        .then(|| memchr::memmem::Finder::new(generated.as_bytes()));
+        .then(|| blaze_memchr::memmem::Finder::new(generated.as_bytes()));
     // Whether `cargo::` is refused, worked out at the first such line.
     let mut new_syntax_msrv: Option<Option<String>> = None;
     let mut rest = Some(input);
     while let Some(bytes) = rest {
-        let line = match memchr::memchr(b'\n', bytes) {
+        let line = match blaze_memchr::memchr(b'\n', bytes) {
             Some(at) => {
                 rest = Some(&bytes[at + 1..]);
                 &bytes[..at]
@@ -514,7 +514,7 @@ pub fn read<'a>(input: &'a [u8], cx: &Context<'_>, sink: &mut impl Sink<'a>) -> 
             }
             _ => {
                 let data = &line[6..];
-                let reserved = memchr::memchr(b'=', data.as_bytes()).and_then(|at| {
+                let reserved = blaze_memchr::memchr(b'=', data.as_bytes()).and_then(|at| {
                     let key = Key::of(&data.as_bytes()[..at]).filter(|it| it.reserved())?;
                     Some((key, data[at + 1..].trim_end()))
                 });

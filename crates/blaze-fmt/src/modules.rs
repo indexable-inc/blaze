@@ -9,7 +9,6 @@ use crate::ast::ThinVec;
 use crate::ast::visit::Visitor;
 use crate::span::Span;
 use crate::span::symbol::{self, Symbol, sym};
-use thiserror::Error;
 
 use crate::attr::MetaVisitor;
 use crate::config::FileName;
@@ -70,8 +69,7 @@ pub(crate) struct ModResolver<'ast, 'psess> {
 }
 
 /// Represents errors while trying to resolve modules.
-#[derive(Debug, Error)]
-#[error("failed to resolve `mod {module}` declared at {declared_at}: {kind}")]
+#[derive(Debug)]
 pub struct ModuleResolutionError {
     pub(crate) module: String,
     /// blaze: where the `mod` is declared (`file:line:col`), so the error names both the missing
@@ -79,6 +77,18 @@ pub struct ModuleResolutionError {
     pub(crate) declared_at: String,
     pub(crate) kind: ModuleResolutionErrorKind,
 }
+
+impl std::fmt::Display for ModuleResolutionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "failed to resolve `mod {}` declared at {}: {}",
+            self.module, self.declared_at, self.kind
+        )
+    }
+}
+
+impl std::error::Error for ModuleResolutionError {}
 
 /// blaze: every module of one crate that could not be resolved, one per line.
 #[derive(Debug)]
@@ -99,21 +109,40 @@ impl std::fmt::Display for ModuleResolutionErrors {
 impl std::error::Error for ModuleResolutionErrors {}
 
 /// Defines variants similar to those of [crate::expand_module::ModError]
-#[derive(Debug, Error)]
+#[derive(Debug)]
 pub(crate) enum ModuleResolutionErrorKind {
     /// Find a file that cannot be parsed.
-    #[error("cannot parse {file}")]
     ParseError { file: PathBuf },
     /// File cannot be found.
-    #[error("{file} does not exist")]
     NotFound { file: PathBuf },
     /// File a.rs and a/mod.rs both exist
-    #[error("file for module found at both {default_path:?} and {secondary_path:?}")]
     MultipleCandidates {
         default_path: PathBuf,
         secondary_path: PathBuf,
     },
 }
+
+impl std::fmt::Display for ModuleResolutionErrorKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ModuleResolutionErrorKind::ParseError { file } => {
+                write!(f, "cannot parse {}", file.display())
+            }
+            ModuleResolutionErrorKind::NotFound { file } => {
+                write!(f, "{} does not exist", file.display())
+            }
+            ModuleResolutionErrorKind::MultipleCandidates {
+                default_path,
+                secondary_path,
+            } => write!(
+                f,
+                "file for module found at both {default_path:?} and {secondary_path:?}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ModuleResolutionErrorKind {}
 
 #[derive(Clone)]
 enum SubModKind<'a, 'ast> {

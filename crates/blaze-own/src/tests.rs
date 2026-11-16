@@ -2206,6 +2206,25 @@ fn fixed_vec_refuses_past_its_capacity_and_drops_once() -> Result<(), Broke> {
 }
 
 #[test]
+fn fixed_string_refuses_a_piece_whole_and_cuts_at_no_boundary() -> Result<(), Broke> {
+    use core::fmt::Write as _;
+    let mut s = crate::FixedString::<5>::new();
+    s.try_push_str("ab").map_err(|_| Broke::Oracle(String::from("two bytes refused")))?;
+    // A three-byte char past the cap is refused whole: the string stays UTF-8.
+    if s.try_push_str("c€").is_ok() || s.as_str() != "ab" {
+        return Err(Broke::Oracle(format!("a refused piece was cut in: {s:?}")));
+    }
+    if s.try_push('€').is_err() || s.as_str() != "ab€" || s.try_push('x').is_ok() {
+        return Err(Broke::Oracle(format!("the char pushes gave {s:?}")));
+    }
+    s.clear();
+    if write!(s, "{}", 12345).is_err() || write!(s, "{}", 6).is_ok() || &*s != "12345" {
+        return Err(Broke::Oracle(format!("the writes gave {s:?}")));
+    }
+    Ok(())
+}
+
+#[test]
 fn inline_holds_collections_on_the_stack_and_refuses_when_full() -> Result<(), Broke> {
     let inline = Inline::<256>::new();
     {

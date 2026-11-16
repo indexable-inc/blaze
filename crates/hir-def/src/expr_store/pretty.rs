@@ -9,7 +9,7 @@ use std::{
 
 use base_db::Db;
 use hir_expand::{Lookup, mod_path::PathKind};
-use itertools::Itertools;
+use stdx::iter::IterExt;
 use rustc_abi::ExternAbi;
 use span::Edition;
 use stdx::never;
@@ -544,7 +544,7 @@ impl Printer<'_> {
                 }
             }
         } else {
-            match self.buf.chars().rev().find_position(|ch| *ch != ' ') {
+            match self.buf.chars().rev().enumerate().find(|&(_, ch)| ch != ' ') {
                 Some((_, '\n')) | None => {}
                 Some((idx, _)) => {
                     if idx != 0 {

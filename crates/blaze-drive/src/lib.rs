@@ -31,6 +31,7 @@
 extern crate std;
 
 pub mod answers;
+pub mod condition;
 pub mod items;
 pub mod key;
 pub mod lines;
@@ -72,4 +73,7 @@ pub enum Plant {
     PublishBeforePut,
     /// A program's success is reported at its exit, before the gate's check is done.
     EarlySuccess,
+    /// A record is stored under the condition its job began at, not the one it read: an asker
+    /// that does not imply what it read is served it.
+    RanUnderCondition,
 }

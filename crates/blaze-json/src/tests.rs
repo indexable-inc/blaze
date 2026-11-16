@@ -165,7 +165,7 @@ fn what_json_cannot_say_is_refused_by_path() {
     v.get_mut("a").unwrap().as_list_mut().unwrap()[1] = Value::Bytes(bytes);
     let error = to_string_in(&v, WriteOptions::COMPACT, Global).unwrap_err();
     assert_eq!((error.path.as_str(), error.what), ("a[1]", Unwritable::Bytes));
-    let base64 = WriteOptions { bytes: BytesAs::Base64(blaze_base64::Engine::STANDARD), ..WriteOptions::COMPACT };
+    let base64 = WriteOptions { bytes: BytesAs::Base64(blaze_base64::STANDARD), ..WriteOptions::COMPACT };
     assert_eq!(to_string_in(&v, base64, Global).unwrap().as_str(), r#"{"a":[0,"aGk="]}"#);
     let nan = value!(in Global; {"x y": f64::NAN});
     let error = to_string_in(&nan, WriteOptions::COMPACT, Global).unwrap_err();

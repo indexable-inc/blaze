@@ -4,7 +4,6 @@
 //! through handles.
 
 use blaze_hash::HashSet;
-use itertools::izip;
 use span::Span;
 use std::alloc::Global;
 use stdx::never;
@@ -1025,7 +1024,9 @@ fn partial_eq_impl_expand(
             let discriminants =
                 matches!(&adt.shape, AdtShape::Enum { variants, .. } if variants.len() > 1);
             let (self_patterns, other_patterns) = self_and_other_patterns(adt, name, span);
-            let arms = izip!(self_patterns, other_patterns, adt.shape.field_names());
+            let arms = std::iter::zip(self_patterns, other_patterns)
+                .zip(adt.shape.field_names())
+                .map(|((pat1, pat2), names)| (pat1, pat2, names));
             let arms = arms.filter(|(_, _, names)| !discriminants || !names.is_empty());
             let arms: Vec<_> = arms.collect();
             if discriminants {
@@ -1137,7 +1138,9 @@ pub(super) fn ord_expand(
         // variant without fields is then equal.
         let discriminants =
             matches!(&adt.shape, AdtShape::Enum { variants, .. } if variants.len() > 1);
-        let arms = izip!(self_patterns, other_patterns, adt.shape.field_names());
+        let arms = std::iter::zip(self_patterns, other_patterns)
+            .zip(adt.shape.field_names())
+            .map(|((pat1, pat2), names)| (pat1, pat2, names));
         let arms = arms.filter(|(_, _, fields)| !discriminants || !fields.is_empty()).map(
             |(pat1, pat2, fields)| {
                 let mut body = quote!(span =>#krate::cmp::Ordering::Equal);
@@ -1204,7 +1207,9 @@ pub(super) fn partial_ord_expand(
             // variant without fields is then equal. A struct compares its fields alone.
             let discriminants =
                 matches!(&adt.shape, AdtShape::Enum { variants, .. } if variants.len() > 1);
-            let arms = izip!(self_patterns, other_patterns, adt.shape.field_names());
+            let arms = std::iter::zip(self_patterns, other_patterns)
+                .zip(adt.shape.field_names())
+                .map(|((pat1, pat2), names)| (pat1, pat2, names));
             let arms = arms.filter(|(_, _, fields)| !discriminants || !fields.is_empty()).map(
                 |(pat1, pat2, fields)| {
                     let mut body =
@@ -1274,7 +1279,7 @@ pub(super) mod handle {
             ast::Adt::Enum(_) => return refuse("`#[derive(From)]` used on an enum"),
             ast::Adt::Union(_) => return refuse("`#[derive(From)]` used on a union"),
         };
-        let mut field_types: SmallVec<[Option<ast::Type>; 2]> = SmallVec::new();
+        let mut field_types: Vec<Option<ast::Type>> = Vec::new();
         match strukt.field_list() {
             Some(FieldList::RecordFieldList(it)) => {
                 field_types.extend(it.fields().map(|it| it.ty()).take(2))

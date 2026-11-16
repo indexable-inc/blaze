@@ -56,24 +56,128 @@ enum Operation {
 }
 
 /// Rustfmt operations errors.
-#[derive(Error, Debug)]
+#[derive(Debug)]
 pub enum OperationError {
     /// An unknown help topic was requested.
-    #[error("Unknown help topic: `{0}`.")]
     UnknownHelpTopic(String),
     /// An unknown print-config option was requested.
-    #[error("Unknown print-config option: `{0}`.")]
     UnknownPrintConfigTopic(String),
     /// Attempt to generate a minimal config from standard input.
-    #[error("The `--print-config=minimal` option doesn't work with standard input.")]
     MinimalPathWithStdin,
     /// An io error during reading or writing.
-    #[error("{0}")]
     IoError(IoError),
     /// Attempt to use --emit with a mode which is not currently
     /// supported with standard input.
-    #[error("Emit mode {0} not supported with standard output.")]
     StdinBadEmit(EmitMode),
+    /// The command line is no options rustfmt takes.
+    Getopts(Fail),
+    /// `--file-lines` is no list of file line ranges.
+    FileLines(FileLinesError),
+    /// A rustfmt.toml could not be found, read or used.
+    Config(ConfigError),
+    /// The config could not be written out as TOML.
+    ToToml(ToTomlError),
+    /// `--print-config current` without its PATH.
+    CurrentConfigWithoutPath,
+    /// `--verbose` and `--quiet` together.
+    VerboseAndQuiet,
+    /// Unstable options without `--unstable-features`: each option as written.
+    UnstableWithoutFeatures(Vec<&'static str>),
+    /// A `--config` item that is no known option with a value it takes.
+    InvalidKeyVal(String),
+    /// A `--config` item with no `=`.
+    ConfigNotKeyVal(String),
+    /// `--emit` and `--check` together.
+    EmitAndCheck,
+    /// `--config=emit_mode=<mode>` and `--check` together.
+    EmitModeConfigAndCheck,
+    /// `--config=emit_mode=<mode>` and `--emit` together.
+    EmitModeConfigAndEmit,
+    /// An unstable `--emit` value without `--unstable-features`.
+    UnstableEmit,
+    /// A `--color` value that is none of always, never and auto.
+    InvalidColor(String),
+    /// A `--edition` value that is no edition.
+    InvalidEdition,
+    /// A `--style-edition` value that is no style edition.
+    InvalidStyleEdition,
+    /// A `--emit` value that is no emit mode.
+    InvalidEmit,
+}
+
+impl std::fmt::Display for OperationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            OperationError::UnknownHelpTopic(topic) => {
+                write!(f, "Unknown help topic: `{topic}`.")
+            }
+            OperationError::UnknownPrintConfigTopic(topic) => {
+                write!(f, "Unknown print-config option: `{topic}`.")
+            }
+            OperationError::MinimalPathWithStdin => f.write_str(
+                "The `--print-config=minimal` option doesn't work with standard input.",
+            ),
+            OperationError::IoError(e) => write!(f, "{e}"),
+            OperationError::StdinBadEmit(mode) => {
+                write!(f, "Emit mode {mode} not supported with standard output.")
+            }
+            OperationError::Getopts(e) => write!(f, "{e}"),
+            OperationError::FileLines(e) => write!(f, "{e}"),
+            OperationError::Config(e) => write!(f, "{e}"),
+            OperationError::ToToml(e) => write!(f, "{e}"),
+            OperationError::CurrentConfigWithoutPath => {
+                f.write_str("PATH required for `--print-config current`")
+            }
+            OperationError::VerboseAndQuiet => {
+                f.write_str("Can't use both `--verbose` and `--quiet`")
+            }
+            OperationError::UnstableWithoutFeatures(options) => {
+                let s = if options.len() == 1 { "" } else { "s" };
+                write!(
+                    f,
+                    "Unstable option{s} ({}) used without `--unstable-features`",
+                    options.join(", ")
+                )
+            }
+            OperationError::InvalidKeyVal(key_val) => {
+                write!(f, "invalid key=val pair: `{key_val}`")
+            }
+            OperationError::ConfigNotKeyVal(key_val) => write!(
+                f,
+                "--config expects comma-separated list of key=val pairs, found `{key_val}`"
+            ),
+            OperationError::EmitAndCheck => f.write_str("Invalid to use `--emit` and `--check`"),
+            OperationError::EmitModeConfigAndCheck => {
+                f.write_str("Invalid to use `--config=emit_mode=<mode>` and `--check`")
+            }
+            OperationError::EmitModeConfigAndEmit => {
+                f.write_str("Invalid to use `--config=emit_mode=<mode>` and `--emit`")
+            }
+            OperationError::UnstableEmit => f.write_str(
+                "Invalid value for `--emit` - using an unstable value without \
+                 `--unstable-features`",
+            ),
+            OperationError::InvalidColor(color) => write!(f, "Invalid color: {color}"),
+            OperationError::InvalidEdition => f.write_str("Invalid value for `--edition`"),
+            OperationError::InvalidStyleEdition => {
+                f.write_str("Invalid value for `--style-edition`")
+            }
+            OperationError::InvalidEmit => f.write_str("Invalid value for `--emit`"),
+        }
+    }
+}
+
+impl core::error::Error for OperationError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            OperationError::IoError(e) => Some(e),
+            OperationError::Getopts(e) => Some(e),
+            OperationError::FileLines(e) => Some(e),
+            OperationError::Config(e) => Some(e),
+            OperationError::ToToml(e) => Some(e),
+            _ => None,
+        }
+    }
 }
 
 impl From<IoError> for OperationError {
@@ -81,6 +185,32 @@ impl From<IoError> for OperationError {
         OperationError::IoError(e)
     }
 }
+
+impl From<Fail> for OperationError {
+    fn from(e: Fail) -> OperationError {
+        OperationError::Getopts(e)
+    }
+}
+
+impl From<FileLinesError> for OperationError {
+    fn from(e: FileLinesError) -> OperationError {
+        OperationError::FileLines(e)
+    }
+}
+
+impl From<ConfigError> for OperationError {
+    fn from(e: ConfigError) -> OperationError {
+        OperationError::Config(e)
+    }
+}
+
+impl From<ToTomlError> for OperationError {
+    fn from(e: ToTomlError) -> OperationError {
+        OperationError::ToToml(e)
+    }
+}
+
+type Result<T, E = OperationError> = std::result::Result<T, E>;
 
 /// Arguments to `--help`
 enum HelpOp {

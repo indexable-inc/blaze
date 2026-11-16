@@ -56,7 +56,7 @@ impl Placed {
     pub fn slice_as<T, O: Offset>(self, field_at: u64) -> Result<Slice<T, O>, Unfit> {
         match self.len {
             0 => Ok(Slice::EMPTY),
-            len => Slice::between(field_at, self.at, len),
+            len => Slice::between_as(field_at, self.at, len),
         }
     }
 }

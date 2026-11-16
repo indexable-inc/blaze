@@ -7,7 +7,6 @@ use std::{
 use blaze_hash::HashMap;
 use blaze_ids::rng::SplitMix64;
 use expect_test::expect;
-use smallvec::smallvec;
 use span::{Edition, Span};
 use syntax::{NodeOrToken, ast, view};
 use test_utils::extract_annotations;
@@ -461,7 +460,7 @@ fn a_views_modified_input_is_the_cursors() {
                                 view_remove.insert(seen.id());
                             }
                             if rng.one_in(10) {
-                                let leaves = smallvec![punct('$'), punct(',')];
+                                let leaves = vec![punct('$'), punct(',')];
                                 view_append.insert(seen.id(), leaves.clone());
                                 append.insert(element, leaves);
                             }
@@ -488,9 +487,9 @@ fn a_views_modified_input_is_the_cursors() {
                             {
                                 0 if enter && matches!(element, Node(_)) => {
                                     preorder.skip_subtree();
-                                    (false, smallvec![punct('#')])
+                                    (false, vec![punct('#')])
                                 }
-                                1 => (true, smallvec![punct('@')]),
+                                1 => (true, vec![punct('@')]),
                                 2 => (false, Inserted::new()),
                                 _ => (true, Inserted::new()),
                             }
@@ -512,9 +511,9 @@ fn a_views_modified_input_is_the_cursors() {
                             {
                                 0 if enter && matches!(element, Node(_)) => {
                                     preorder.skip_subtree();
-                                    (false, smallvec![punct('#')])
+                                    (false, vec![punct('#')])
                                 }
-                                1 => (true, smallvec![punct('@')]),
+                                1 => (true, vec![punct('@')]),
                                 2 => (false, Inserted::new()),
                                 _ => (true, Inserted::new()),
                             }
@@ -544,8 +543,8 @@ fn inserted_leaves_allocate_nothing() {
             DUMMY,
             DocCommentDesugarMode::Mbe,
             move |_, _| {
-                // clone: a test's leaf, inline in the `SmallVec`.
-                (true, if insert { smallvec![leaf.clone()] } else { Inserted::new() })
+                // clone: a test's leaf, into the inserted leaves.
+                (true, if insert { vec![leaf.clone()] } else { Inserted::new() })
             },
         )
     };

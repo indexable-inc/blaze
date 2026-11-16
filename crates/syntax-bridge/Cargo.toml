@@ -14,7 +14,6 @@ doctest = false
 
 [dependencies]
 blaze-hash.workspace = true
-smallvec.workspace = true
 blaze-mem.workspace = true
 hashbrown.workspace = true
 

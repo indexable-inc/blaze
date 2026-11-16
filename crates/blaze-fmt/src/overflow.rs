@@ -7,7 +7,7 @@ use std::cmp::min;
 use crate::ast;
 use crate::ast::token::Delimiter;
 use crate::span::Span;
-use itertools::Itertools;
+use stdx::iter::IterExt;
 use tracing::debug;
 
 use crate::closures;

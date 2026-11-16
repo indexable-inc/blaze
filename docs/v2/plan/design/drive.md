@@ -20,10 +20,13 @@ in any order and in parallel. The machine never waits.
 |---|---|
 | `Start { files, gone, last }` | (first) |
 | `Got { key, bytes }` | `Get { key }` |
-| `Ran { ticket, ran: Done(outputs) \| Need(wants) \| Failed(why) }` | `Run { ticket, task }` |
+| `Ran { batch, results: [Outcome { ticket, ran, in_place, ns }] }` | `Run { batch }` |
+| `Want(want)` (the running program waits on a name) | `StartProgram { units }` |
+| `Exited { ok }` | `StartProgram { units }`, `Stop { errors }` |
 
-Other effects need no answer: `Put { key, bytes }`, `Print { .. }`, `WriteLast { bytes }`,
-`Done(answer)`.
+`ran` is `Done(outputs) | Need(wants) | Failed(why)`. Other effects need no answer: `Put`,
+`Publish(input)` and `Unpublish(name)` (the settled table, below; performed after every `Put`
+before them), `Print`, `WriteLast`, `Done(answer)`; the answer carries a `Verdict`.
 
 1. **Start.** The cli has swept the checkout (below) and hands every file as (path, content id,
    changed since the last answer), the files gone since, and the per-checkout `last` file. The
@@ -122,13 +125,13 @@ makes what is wanted and enters the task again from the top with the inputs it l
   last needs.
 - A wait cycle among `ModuleScope` jobs becomes one `Group` task; any other cycle is
   `DriveError::NeedCycle` naming its names.
-- Work is parallel in the cli's pool; the drive keeps at most `workers` runs outstanding and
-  orders the queue by kind (files, then scopes, signatures, bodies, code).
-- **Two classes** (adapted from Relax's `cpu_budget`): a task is `Foreground` (what the command
-  was asked) or `Background` (speculative code, the optimizing tier). A background task is
-  emitted only when no foreground task is queued and fewer than `workers` runs are out, so the
-  person's work never waits behind it; `workers` is the machine's (one code path, 128 cores to a
-  Mac).
+- Work is parallel in the cli's pool, in batches (below); the queue is ordered by class, then
+  kind (files, scopes, signatures, bodies, code), then home.
+- **Three classes** (adapted from Relax's `cpu_budget`): `Foreground` (what the command asked, or
+  what a running program waits on), `Gate` (`run`'s check of its scope beside the program) and
+  `Background` (speculative code, the optimizing tier). A lower class is emitted only when no
+  higher one is queued, so the person's work never waits behind it; `workers` is the machine's
+  (one code path, 128 cores to a Mac).
 - An output for a name no job asked for, or a read whose digest is not today's, is a typed error.
 
 ## Dependencies and std
@@ -142,10 +145,35 @@ read std's text. CI runs the same command and publishes the pack.
 
 ## Run
 
-`run` checks what `check` checks (until reachability from the entry is built), then hands the
-unit record to the cli, which is blaze-run's `Parent` for the program's life: `Compile` and
-`Make` become drive `Code` names (`run::code_name`), answered as tasks. Today `Code` answers
-`NotBuilt`, so `blaze run` stops with that error, by name.
+`run` hands the units record to the cli (`StartProgram { units }`), which is blaze-run's `Parent`
+for the program's life: `Compile` and `Make` become drive `Code` names (`run::code_name`), sent
+back as `Want`s and answered as tasks. Today `Code` answers `NotBuilt`, so `blaze run` stops with
+that error, by name.
+
+### The gate
+
+`run` and `test` fail when the check of their program's scope fails, lints included (bottom.md
+11): the scope is the workspace packages the program's package depends on, whole. Findings carry
+no level (rule 81); `Config::is_error(rule)` is the command's policy. One seam, `Ask::gate`
+(rule 78):
+
+- **`Beside`** (default). A stored certificate is read first: an error in it refuses the start at
+  that one read; a clean one starts the program at once. Otherwise the program starts when the
+  units' record settles, and the walk's jobs run in class `Gate`, under what the program waits
+  on (`Want` lifts a job to `Foreground`). The first error-level finding settled emits
+  `Stop { errors }`. A program that exits first is not reported: its success is held
+  (`Phase::Held`) until the walk is done, so a test's pass waits for the check.
+- **`Before`**. The walk finishes, then the program starts if it is clean.
+- **`Reached`**. Only what runs is checked; the answer comes at the exit with
+  `Verdict::PassedReached`, printed "checked only what ran".
+
+Verdicts: `Checked`, `Passed`, `PassedReached`, `Failed { errors, started }`, `ProgramFailed`.
+A `Want` after the walk is done, for a name the walk did not settle, is `DriveError::LateWant`.
+The profile records the time to the program's start and to the verdict (the caller's clock), and
+the items the gate checked while the program ran (`checked_beside`). The simulation's oracle: no
+`Passed` while work is out or before the answer is written; the plant `EarlySuccess` (success at
+the exit) is caught. Open: whether the gate covers every configuration (below) or only the one
+run; today the one run.
 
 **Tests.** A test's result is a `Test(test)` record whose read list is the code identities its
 run entered (the run side's entry marks). It is a job like any other: after an edit, a test whose
@@ -153,6 +181,74 @@ read list holds a changed function is dirtied by the forward check and runs agai
 test's record stands and its verdict is printed marked as reused. The answer counts both
 (`Answer::tests_run`, `tests_reused`). blaze-run's `Tests::affected` is the same postings as a
 run-side index; the drive's readers column is the store form of it.
+
+## Scheduling on many cores
+
+**Arithmetic** (assumed costs, labelled; parallel.md A1-A5). One coordinator step costs about
+1-2 µs; a task about 50 µs. One step per task caps one coordinator near 50/2 = 25 to 50 cores.
+parallel.md's row: "With the pool alone and the coordinator and store lock left as they are, the
+serial part is about 150k completions x 2 us = 0.3 s plus 400k x 0.5 us = 0.2 s plus the serial
+sweep and the critical path, about 0.65 s in all: speedup about 17." This design removes each term:
+
+1. **Batches.** `Run { batch }` carries up to `min(1 ms / the kind's mean time, the kind's queue /
+   free workers, 256)` tasks of one class, kind and home (`TARGET_BATCH_NS`, `MOST_BATCH`); a
+   worker answers them together in one `Ran`. Coordinator steps fall from one a task to one a
+   millisecond of work a worker: 128 steps per ms at 2 µs is 26% of one thread, not 128 threads'
+   worth. 150k completions become about 11k batches: 22 ms.
+2. **Needs answered off the coordinator.** The settled table (`settled.rs`): one writer (the
+   coordinator performs `Publish` after the `Put`s before it), many readers, a seqlock of 11
+   atomic words a slot, open addressing, 32 probes, `TableFull` typed. A worker whose task answers
+   `Need` takes each want from the table (`worker::answer_in_place`) and re-enters the task in
+   place; only wants with no row reach the coordinator, which keeps the one-flight rule (a worker
+   never starts a job). The table never decides correctness: every read is checked against the
+   settled digest in `made()`, so a stale or colliding row costs a run. Expected entries per body:
+   cold 2 (one `Need` of its signatures, one in place), 1 at the coordinator; warm 1 (hints).
+   Counted: `in_place`, the `entries` histogram (0, 1, 2, 3, 4, 5-8, 9-16, more).
+3. **Kind order cold**: files, scopes, signatures, bodies; a body's signatures are usually
+   settled before it runs, so its `Need` is answered in place.
+4. **Workers.** Each has its own deque of batches (owner LIFO, thieves take half, FIFO; Chase-Lev,
+   Lê et al.), its own frame reset per task, and its own producer ring of `Ran` events to the
+   coordinator. Shared structures a worker touches: the store (lock-free mapped lookups; puts in a
+   per-worker `Batch`, one commit, parallel.md change 4), the settled table (reads only), the sweep
+   (frozen). No interner: names are content ids. No lock on the hot path.
+5. **The names' first fill**: `ModuleScope` jobs in rounds over all modules of a crate, a wait cycle
+   as one `Group`; expected rounds = the longest import chain, about 3-5. The crate root is decoded
+   once per fill and shared (parallel.md change 9; scope_task.rs today decodes it per module).
+6. **Classes and workers** as above; `workers` from `Host::cores()`.
+7. **Profile**: tasks, batches, steps, in place, coordinator ns, idle ns, entries histogram.
+   **Floor** (rule 67): total task work / N plus the serial part: the sweep's parallel share,
+   `Units`, the critical path of `Need` rounds (A5: 20 ms), and the finish (pages, certificate).
+   parallel.md's after-column: about 130 ms against 106 ms, ratio 1.2.
+
+Not yet O(1) (parallel.md change 3): the ready set, jobs and tickets are sorted vectors, and
+`unsettled()` scans every job; each must become a ring per (class, kind), a hash from name to
+job, and a live-job counter, with a test that steps 100,000 jobs and counts operations. The pool
+needs from bstd: a threaded layout with N workers spawned by `scope.must_overlap`, a stealing
+deque, an MPSC ring, and a `Send` cx; none exist yet (`Layout::Inline` only). The cli runs batches
+inline on one thread until then.
+
+## One check covers every configuration
+
+`check` answers for every target, feature set and switch at once (bottom.md 11). `condition.rs`:
+
+- A `Condition` is a sorted list of (variable, value), at most 16, inline and `Copy`: a target is
+  one variable (it fixes every `target_*`), each package's feature a boolean, `test`,
+  `debug_assertions` and each `--cfg` a boolean. The request carries the `Space`: values per
+  variable and the feature dependencies as closed implications.
+- A task runs under a condition. Reading a variable it does not fix answers `Need(Cfg(var))`;
+  the machine re-enters it once per value `Space::fork` allows, each narrower. Its record is
+  stored under the condition it **read**; a lookup takes a record whose condition the asker's
+  implies, so a record that read nothing serves every configuration.
+- Batches group by condition, so a worker's world is stable within one.
+- More than 64 conditions for one item is `ConditionError::OverCap`, a finding naming the item
+  and its variables; never a sample.
+- A finding carries its condition reduced to the variables read.
+- The profile counts items by conditions: 1, 2, 3-4, 5+.
+
+The model (condition.rs tests): checking the whole space equals the union of checking each full
+configuration; the plant `RanUnderCondition` (stored under the job's start condition) is caught.
+Not yet in the request machine: `Want` needs a `Cfg` form, jobs a condition in their name, and
+the answer table a condition column.
 
 ## The system side (blaze-cli)
 
@@ -184,8 +280,8 @@ run-side index; the drive's readers column is the store form of it.
   rustc's rule; `x/mod.rs` and `#[path]` are not looked for yet), and each syntax error is a
   finding. No item part is listed until blaze-typeck's `Signature` and `BodyCheck` tasks exist.
   So `blaze check` today is a syntax check of every file the crate roots reach. Every other kind
-  answers `Failed`, naming itself. Runs go one at a time on the cli's thread; the pool over
-  `workers` is the next piece.
+  answers `Failed`, naming itself. Runs go one at a time on the cli's thread (not yet ported to
+  batches); the pool waits on bstd (above).
 - **Printing.** `file:line:col` from the file's line table at print time (`lines.rs`).
 - **Profile.** Per kind: standing, found, made, fetched, entries, time; gets, hits, puts, pages;
   the store's segments sealed and checked whole at open.

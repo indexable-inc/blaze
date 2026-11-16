@@ -1,7 +1,7 @@
 // Follows `src/tools/rustfmt/src/sort.rs` at rust-lang/rust 12433c307 (MIT or Apache-2.0).
 
-use itertools::EitherOrBoth;
-use itertools::Itertools;
+use stdx::iter::EitherOrBoth;
+use stdx::iter::IterExt;
 
 /// Iterator which breaks an identifier into various [VersionChunk]s.
 struct VersionChunkIter<'a> {

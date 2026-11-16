@@ -3,7 +3,7 @@
 //! generic parameters. See also the `Generics` type and the `generics_of` query
 //! in rustc.
 
-use either::Either;
+use stdx::Either;
 use hir_expand::name::{AsName, Name};
 use intern::sym;
 use la_arena::Arena;

@@ -20,7 +20,7 @@ use syntax::{
     view::{self as ast, AstNode, HasGenericParams, HasName, HasVisibility, IsString},
 };
 use thin_vec::ThinVec;
-use triomphe::Arc;
+use std::sync::Arc;
 
 use crate::{
     AdtId, ConstId, DefWithBodyId, EnumId, EnumVariantId, EnumVariantLoc, ExternBlockId,
@@ -339,7 +339,7 @@ pub struct SignatureSyntax {
 
 impl PartialEq for SignatureSyntax {
     fn eq(&self, other: &Self) -> bool {
-        // The trees compare by pointer first (`triomphe::Arc`'s `eq`): an item read again from
+        // The trees compare by pointer first (`Arc`'s `eq` on `Eq`): an item read again from
         // an anchor that didn't change shares its tree, and compares no byte of it.
         self.file_id == other.file_id
             && self.item == other.item
@@ -2547,7 +2547,7 @@ impl EnumVariants {
                 }
             }
             // alloc: the memo's map, exact unless a name is written twice (an error)
-            let mut variants = FxIndexMap::with_capacity_and_hasher(kept.len(), Default::default());
+            let mut variants = FxIndexMap::with_capacity_in(kept.len(), std::alloc::Global);
             let kept_len = kept.len();
             // alloc: the memo's bits, inline up to 64 variants
             let mut explicit_discriminant = VariantBits::new(kept_len);

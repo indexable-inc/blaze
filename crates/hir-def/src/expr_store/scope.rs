@@ -552,7 +552,7 @@ impl<S: ScopeSink> StoreVisitor for ExprScopeVisitor<'_, S> {
 mod tests {
     use hir_expand::InFile;
     use hir_expand::fixture;
-    use itertools::Itertools as _;
+    use stdx::iter::IterExt as _;
     use la_arena::ArenaMap;
     use span::FileId;
     use syntax::{

@@ -46,7 +46,7 @@ fn compress(data: &[u8], level: Level, splits: &[usize]) -> Vec<u8, Global> {
 fn decompress(stream: &[u8], limits: Limits, splits: &[usize]) -> Result<Vec<u8, Global>, Error> {
     let mut i = Inflate::new_in(limits, Global);
     let mut out = empty();
-    let mut at = 0;
+    let mut at = 0usize;
     let mut sizes = splits.iter().copied().chain(core::iter::repeat(usize::MAX));
     while at < stream.len() && !i.is_done() {
         let end = at.saturating_add(sizes.next().unwrap_or(usize::MAX).max(1)).min(stream.len());
@@ -315,7 +315,7 @@ fn gzip_case(tape: &Tape) -> Result<(), Broke> {
     }
     let mut g = GzipDecoder::new_in(LOOSE, Global);
     let mut out = empty();
-    let mut at = 0;
+    let mut at = 0usize;
     let mut result = Ok(());
     for size in splits(tape, "gzip splits").into_iter().chain(core::iter::once(usize::MAX)) {
         let end = at.saturating_add(size.max(1)).min(member.len());

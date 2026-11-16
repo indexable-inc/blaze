@@ -5,7 +5,7 @@
 use std::{borrow::Cow, iter};
 
 use crate::span::Span;
-use itertools::{Itertools as _, MultiPeek, multipeek};
+use stdx::iter::{IterExt as _, MultiPeek, multipeek};
 use tracing::{debug, trace};
 
 use crate::config::Config;

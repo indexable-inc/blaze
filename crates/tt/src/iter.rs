@@ -3,7 +3,7 @@
 
 use std::fmt;
 
-use arrayvec::ArrayVec;
+use blaze_own::FixedVec;
 use intern::sym;
 use span::Span;
 
@@ -115,12 +115,12 @@ impl<'a> TtIter<'a> {
     ///
     /// This method currently may return a single quotation, which is part of lifetime ident and
     /// conceptually not a punct in the context of mbe. Callers should handle this.
-    pub fn expect_glued_punct(&mut self) -> Result<ArrayVec<Punct, MAX_GLUED_PUNCT_LEN>, ()> {
+    pub fn expect_glued_punct(&mut self) -> Result<FixedVec<Punct, MAX_GLUED_PUNCT_LEN>, ()> {
         let TtElement::Leaf(Leaf::Punct(first)) = self.next().ok_or(())? else {
             return Err(());
         };
-        let mut res = ArrayVec::new();
-        res.push(first);
+        let mut res = FixedVec::new();
+        res.push(first).expect("an empty vector has room for one punct");
         let mut buf = [0; 4];
         let mut glued: &str = first.char.encode_utf8(&mut buf);
         let mut last = first;
@@ -129,7 +129,7 @@ impl<'a> TtIter<'a> {
             let Some(TtElement::Leaf(Leaf::Punct(next))) = self.peek() else { break };
             let Some(joined) = crate::glue(glued, next.char) else { break };
             self.next();
-            res.push(next);
+            res.push(next).expect("`glue` makes nothing longer than `MAX_GLUED_PUNCT_LEN`");
             glued = joined;
             last = next;
         }

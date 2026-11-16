@@ -1,0 +1,23 @@
+[package]
+name = "blaze-columns"
+description = "Columns of rows in memory, in place of Arrow's arrays and record batches: one plain buffer a column (numbers, text as offsets and bytes, dictionary keys over text, lists of either), a validity a nullable column, and a batch of named columns of one length; typed views to read them; what blaze-parquet writes and reads and blaze-arrow-ipc sends; `no_std`, on blaze-own"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# Every buffer, in the allocator the caller names.
+blaze-own.workspace = true
+# Integer conversions that say what they do, in place of `as`.
+blaze-int.workspace = true
+
+[lints]
+workspace = true

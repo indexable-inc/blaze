@@ -87,7 +87,7 @@ impl Corpus {
                 collect_dir(path, &mut sources)?;
             } else {
                 let lang = ast_merge_langs::detect(path)
-                    .ok_or_else(|| UnknownLanguageSnafu { path: path.clone() }.build())?;
+                    .ok_or_else(|| SourceError::UnknownLanguage { path: path.clone() })?;
                 sources.push((path.clone(), lang));
             }
         }
@@ -134,7 +134,7 @@ impl Corpus {
 
 fn collect_dir(path: &Path, sources: &mut Vec<(PathBuf, Lang)>) -> Result<(), Error> {
     for entry in ignore::Walk::new(path) {
-        let entry = entry.context(WalkSnafu { path })?;
+        let entry = entry.context(SourceError::Walk { path })?;
         let is_file = entry.file_type().is_some_and(|ty| ty.is_file());
         if !is_file {
             continue;
@@ -151,9 +151,9 @@ fn load_file(
     path: PathBuf,
     lang: Lang,
 ) -> Result<SourceFile, Error> {
-    let text = std::fs::read_to_string(&path).context(ReadFileSnafu { path: &path })?;
-    parser.set_language(&lang.to_tree_sitter()).context(LanguageSnafu { path: &path })?;
-    let tree = parser.parse(&text, None).ok_or_else(|| ParseFileSnafu { path: &path }.build())?;
+    let text = std::fs::read_to_string(&path).context(SourceError::ReadFile { path: &path })?;
+    parser.set_language(&lang.to_tree_sitter()).context(SourceError::Language { path: &path })?;
+    let tree = parser.parse(&text, None).ok_or_else(|| SourceError::ParseFile { path: &path })?;
     let table = build_node_table(&tree);
     let line_starts = build_line_starts(&text);
     Ok(SourceFile { path, lang, text, nodes: table.nodes, line_starts, by_id: table.by_id, tree })

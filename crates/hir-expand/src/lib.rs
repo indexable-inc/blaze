@@ -29,8 +29,7 @@ mod cfg_process;
 mod fixup;
 
 use blaze_memo::Id;
-use thin_vec::ThinVec;
-use triomphe::Arc;
+use std::sync::Arc;
 
 use core::fmt;
 use std::ops;
@@ -38,7 +37,7 @@ use std::ops;
 use base_db::{Crate, Db};
 use blaze_ids::radix;
 use blaze_mem::Frame;
-use either::Either;
+use stdx::Either;
 use mbe::MatchedArmIndex;
 use span::{
     AstIdMap, Edition, ErasedFileAstId, NO_DOWNMAP_ERASED_FILE_AST_ID_MARKER, Span, SyntaxContext,
@@ -539,7 +538,7 @@ impl AttrMacroAttrIds {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum AttrMacroAttrIdsRepr {
     One(AttrId),
-    ManyDerives(ThinVec<AttrId>),
+    ManyDerives(Box<[AttrId]>),
 }
 
 impl ops::Deref for AttrMacroAttrIds {
@@ -1790,7 +1789,7 @@ impl<'db> ExpansionInfo<'db> {
         &self,
         db: &Db,
         token: TextRange,
-    ) -> InFile<smallvec::SmallVec<[TextRange; 1]>> {
+    ) -> InFile<Vec<TextRange>> {
         debug_assert!(self.expanded_root.text_range().contains_range(token));
         let span = self.exp_map.span_at(token.start());
         match &self.arg_map {
@@ -1798,12 +1797,12 @@ impl<'db> ExpansionInfo<'db> {
                 let range = resolve_span(db, span);
                 InFile {
                     file_id: range.file_id.into(),
-                    value: smallvec::SmallVec::from_buf([range.range]),
+                    value: vec![range.range],
                 }
             }
             SpanMap::ExpansionSpanMap(arg_map) => {
                 let Some(arg_node) = self.arg_root else {
-                    return InFile::new(self.arg_file, smallvec::SmallVec::new());
+                    return InFile::new(self.arg_file, Vec::new());
                 };
                 let arg_range = arg_node.text_range();
                 InFile::new(
@@ -1812,7 +1811,7 @@ impl<'db> ExpansionInfo<'db> {
                         .ranges_with_span_exact(span)
                         .map(|(range, _)| range)
                         .filter(|range| range.intersect(arg_range).is_some())
-                        .collect(), // alloc: none for one range (inline); IDE up-mapping
+                        .collect(), // alloc: the ranges found; IDE up-mapping
                 )
             }
         }

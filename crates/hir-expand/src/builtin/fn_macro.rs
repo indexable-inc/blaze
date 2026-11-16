@@ -16,9 +16,9 @@ use crate::{
 use base_db::{AnchoredPath, Db};
 use blaze_mem::Frame;
 use cfg::CfgExpr;
-use either::Either;
+use stdx::Either;
 use intern::{Symbol, sym};
-use itertools::Itertools;
+use stdx::iter::IterExt;
 use mbe::{DelimiterKind, expect_fragment};
 use span::{Edition, FileId, Span};
 use stdx::edit_distance::edit_distance;

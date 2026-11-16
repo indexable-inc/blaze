@@ -108,7 +108,7 @@ fn is_punct(c: char) -> bool {
 /// memchr's search for their lead byte, not by decoding every character.
 fn text_direction(source: &str) -> Option<usize> {
     let bytes = source.as_bytes();
-    memchr::memchr_iter(0xe2, bytes).find(|&at| {
+    blaze_memchr::memchr_iter(0xe2, bytes).find(|&at| {
         matches!(
             (bytes.get(at + 1), bytes.get(at + 2)),
             (Some(0x80), Some(0xaa..=0xae)) | (Some(0x81), Some(0xa6..=0xa9))
@@ -127,7 +127,7 @@ fn is_ident_continue(c: char) -> bool {
 /// The tokens of a normalized source ([`normalize`]), comments other than doc comments left
 /// out.
 pub fn lex(source: &str) -> Result<Vec<Token<'_>>, Unlexed> {
-    if let Some(at) = memchr::memchr(b'\r', source.as_bytes()) {
+    if let Some(at) = blaze_memchr::memchr(b'\r', source.as_bytes()) {
         return Err(Unlexed { at, why: "a carriage return not before a line feed" });
     }
     if let Some(at) = text_direction(source) {
@@ -230,7 +230,7 @@ impl<'a> Lexer<'a> {
     /// `//…` to the end of the line: a doc comment's kind, or none for a plain comment.
     fn line_comment(&mut self) -> Option<Kind<'a>> {
         let start = self.at;
-        let end = memchr::memchr(b'\n', &self.source.as_bytes()[start..])
+        let end = blaze_memchr::memchr(b'\n', &self.source.as_bytes()[start..])
             .map_or(self.source.len(), |it| start + it);
         self.at = end;
         let text = &self.source[start..end];
@@ -374,7 +374,7 @@ impl<'a> Lexer<'a> {
         }
         let content = self.at;
         loop {
-            let Some(quote) = memchr::memchr(b'"', &self.source.as_bytes()[self.at..]) else {
+            let Some(quote) = blaze_memchr::memchr(b'"', &self.source.as_bytes()[self.at..]) else {
                 return Err(Unlexed { at: start, why: "an unterminated raw string" });
             };
             let close = self.at + quote;

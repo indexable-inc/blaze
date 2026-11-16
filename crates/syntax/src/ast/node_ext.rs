@@ -5,7 +5,6 @@
 
 use std::{fmt, iter::successors};
 
-use itertools::Itertools;
 use parser::SyntaxKind;
 use syntax_tree::TextSize;
 
@@ -488,8 +487,9 @@ impl ast::UseTreeList {
         // Returns true iff there is a single subtree and it is not the self keyword. The braces in
         // `use x::{self};` are necessary and so we should not remove them.
         let has_single_subtree_that_is_not_self = |u: &ast::UseTreeList| {
-            let use_trees = u.use_trees().filter(|use_tree| !editor.deleted(use_tree.syntax()));
-            if let Some((single_subtree,)) = use_trees.collect_tuple() {
+            let mut use_trees =
+                u.use_trees().filter(|use_tree| !editor.deleted(use_tree.syntax()));
+            if let (Some(single_subtree), None) = (use_trees.next(), use_trees.next()) {
                 // We have a single subtree, check whether it is self.
 
                 let is_self = single_subtree.path().as_ref().is_some_and(|path| {
@@ -847,8 +847,8 @@ pub struct SlicePatComponents {
 impl ast::SlicePat {
     pub fn components(&self) -> SlicePatComponents {
         let mut args = self.pats().peekable();
-        let prefix = args
-            .peeking_take_while(|p| match p {
+        let prefix = std::iter::from_fn(|| {
+            args.next_if(|p| match p {
                 ast::Pat::RestPat(_) => false,
                 ast::Pat::IdentPat(bp) => !matches!(bp.pat(), Some(ast::Pat::RestPat(_))),
                 ast::Pat::RefPat(rp) => match rp.pat() {
@@ -858,7 +858,8 @@ impl ast::SlicePat {
                 },
                 _ => true,
             })
-            .collect();
+        })
+        .collect();
         let slice = args.next();
         let suffix = args.collect();
 

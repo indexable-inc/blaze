@@ -89,11 +89,22 @@ impl Policy {
 }
 
 /// [`POLICY_VAR`] names no policy.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{var}={value:?} names no history level: it takes `info` (the default) or `debug`", var = POLICY_VAR)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyError {
     pub value: String,
 }
+
+impl std::fmt::Display for PolicyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{POLICY_VAR}={:?} names no history level: it takes `info` (the default) or `debug`",
+            self.value
+        )
+    }
+}
+
+impl core::error::Error for PolicyError {}
 
 /// DEBUG rows held a build, at most: past it, its oldest go, with their fields.
 pub const HOLD_EVENTS: usize = 1 << 14;

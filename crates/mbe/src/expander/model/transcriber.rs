@@ -3,7 +3,7 @@
 
 use intern::{Symbol, sym};
 use span::{Edition, Span};
-use stdx::itertools::Itertools;
+use stdx::iter::IterExt;
 use tt::{Delimiter, TopSubtreeBuilder, iter::TtElement};
 
 use super::{Binding, Bindings};

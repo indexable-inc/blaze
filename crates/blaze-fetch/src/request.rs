@@ -10,15 +10,16 @@
 //! directory to write the bytes out in, named by their BLAKE3. Without it they are only kept
 //! in the store, and the answer is their BLAKE3.
 
-use serde::Deserialize;
+use std::alloc::Global;
+
+use blaze_data::{Cursor, FromValue, ShapeError};
 
 use crate::{
     digest::Digest,
     fetcher::{Source, is_commit},
 };
 
-#[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 struct Json {
     url: Option<String>,
     git: Option<GitJson>,
@@ -27,11 +28,40 @@ struct Json {
     out: Option<String>,
 }
 
-#[derive(Deserialize, Debug)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug)]
 struct GitJson {
     repo: String,
     rev: String,
+}
+
+/// The field `key`, text, if it is there and not null.
+fn opt_text(c: &Cursor<'_, '_, Global>, key: &str) -> Result<Option<String>, ShapeError<Global>> {
+    match c.field_opt(key)? {
+        Some(field) if !field.is_null() => Ok(Some(field.text()?.to_owned())),
+        _ => Ok(None),
+    }
+}
+
+/// Unknown fields refused.
+impl FromValue<Global> for Json {
+    fn from_value(c: &Cursor<'_, '_, Global>) -> Result<Json, ShapeError<Global>> {
+        c.deny_unknown(&["url", "git", "digest", "most_bytes", "out"])?;
+        Ok(Json {
+            url: opt_text(c, "url")?,
+            git: c.opt("git")?,
+            digest: c.field("digest")?.text()?.to_owned(),
+            most_bytes: c.opt("most_bytes")?,
+            out: opt_text(c, "out")?,
+        })
+    }
+}
+
+/// Unknown fields refused.
+impl FromValue<Global> for GitJson {
+    fn from_value(c: &Cursor<'_, '_, Global>) -> Result<GitJson, ShapeError<Global>> {
+        c.deny_unknown(&["repo", "rev"])?;
+        Ok(GitJson { repo: c.field("repo")?.text()?.to_owned(), rev: c.field("rev")?.text()?.to_owned() })
+    }
 }
 
 /// A `blaze fetch-url` request, read and checked.
@@ -45,8 +75,10 @@ pub struct Asked {
 
 /// `json` as an [`Asked`], or why not: naming the field.
 pub fn parse(json: &str) -> Result<Asked, String> {
+    let value = blaze_json::read_in(json.as_bytes(), blaze_json::Limits::DEFAULT, Global)
+        .map_err(|e| format!("blaze fetch-url's request: {e}"))?; // alloc: error path
     let ask: Json =
-        serde_json::from_str(json).map_err(|e| format!("blaze fetch-url's request: {e}"))?; // alloc: error path
+        Cursor::root(&value, Global).get().map_err(|e| format!("blaze fetch-url's request: {e}"))?; // alloc: error path
     let (repo, rev) = ask.git.map(|it| (it.repo, it.rev)).unzip();
     from_fields(ask.url, repo, rev, &ask.digest, ask.most_bytes, ask.out)
 }

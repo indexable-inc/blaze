@@ -27,7 +27,7 @@ use syntax::{
     view::{self, AstNode as _},
 };
 use syntax_bridge::DocCommentDesugarMode;
-use triomphe::Arc;
+use std::sync::Arc;
 
 use crate::{
     AstId, EagerCallInfo, ExpandError, ExpandErrorKind, ExpandResult, ExpandTo, ExpansionSpanMap,

@@ -14,7 +14,8 @@ publish = false
 name = "rustc_lexer"
 
 [dependencies]
-memchr.workspace = true
+# blaze's byte search under memchr's name, so `src`, copied unchanged, names it as `memchr::`.
+memchr = { package = "blaze-memchr", path = "../blaze-memchr" }
 unicode-properties = { workspace = true, features = ["emoji"] }
 unicode-ident.workspace = true
 

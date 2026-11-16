@@ -277,7 +277,7 @@ pub enum Kind {
     /// `step` with `host:port` failed: `why`.
     Io { step: Step, host: String, port: u16, why: String },
     /// A body its head says is gzip, which is not.
-    Gzip(String),
+    Gzip(blaze_deflate::Error),
     /// Its [`RequestId`] is another request's, still in flight: the driver's mistake.
     InUse,
 }
@@ -1057,7 +1057,7 @@ impl Client {
             return self.fail(request, Kind::TooBig { most, said: Some(length), decoded: false });
         }
         if gzip && exchange.request.gzip {
-            exchange.gzip = Some(Gunzip::new());
+            exchange.gzip = Some(Gunzip::new(most));
         }
         exchange.answered = true;
         exchange.deadline = Some(now + timeout);
@@ -1076,7 +1076,7 @@ impl Client {
         let ended = match exchange.gzip.as_mut().map(Gunzip::finish) {
             None => Ok(()),
             Some(Ok(rest)) => give(exchange, rest, &mut self.events, request),
-            Some(Err(why)) => Err(Kind::Gzip(why)),
+            Some(Err(kind)) => Err(kind),
         };
         if let Err(kind) = ended {
             return self.fail(request, kind);
@@ -1172,7 +1172,7 @@ fn deliver(
         return Err(Kind::TooBig { most, said: None, decoded: false });
     }
     let bytes = match exchange.gzip.as_mut() {
-        Some(gzip) => gzip.feed(&data).map_err(Kind::Gzip)?,
+        Some(gzip) => gzip.feed(&data)?,
         None => data,
     };
     give(exchange, bytes, events, request)

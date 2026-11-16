@@ -13,7 +13,7 @@ mod traits;
 
 use std::marker::PhantomData;
 
-use either::Either;
+use stdx::Either;
 
 use crate::{
     SyntaxKind,
@@ -172,7 +172,7 @@ mod support {
 
 #[cfg(test)]
 fn doc_comment_text(owner: &impl HasAttrs) -> Option<std::string::String> {
-    use itertools::Itertools;
+    use stdx::iter::IterExt;
 
     let docs = owner.doc_comments().map(|comment| comment.text().to_owned()).join("\n");
     if docs.is_empty() { None } else { Some(docs) }

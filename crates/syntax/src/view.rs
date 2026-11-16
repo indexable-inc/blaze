@@ -20,7 +20,7 @@ mod tests;
 
 use std::{marker::PhantomData, sync::Arc};
 
-use either::Either;
+use stdx::Either;
 
 use crate::{AstPtr, FlatTree, Parse, RustLanguage, SyntaxKind, SyntaxNodePtr, TextRange};
 

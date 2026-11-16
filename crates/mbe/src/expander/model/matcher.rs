@@ -62,7 +62,6 @@
 use std::{rc::Rc, sync::Arc};
 
 use intern::sym;
-use smallvec::{SmallVec, smallvec};
 use tt::{
     DelimSpan,
     iter::{TtElement, TtIter},
@@ -318,7 +317,7 @@ struct MatchState<'t> {
     /// When matching against matchers with nested delimited submatchers (e.g., `pat ( pat ( .. )
     /// pat ) pat`), we need to keep track of the matchers we are descending into. This stack does
     /// that where the bottom of the stack is the outermost matcher.
-    stack: SmallVec<[OpDelimitedIter<'t>; 4]>,
+    stack: Vec<OpDelimitedIter<'t>>,
 
     /// The "parent" matcher position if we are in a repetition. That is, the matcher position just
     /// before we enter the repetition.
@@ -367,11 +366,11 @@ fn match_loop_inner<'t>(
     stack: &[TtIter<'t>],
     res: &mut Match<'t>,
     bindings_builder: &mut BindingsBuilder<'t>,
-    cur_items: &mut SmallVec<[MatchState<'t>; 1]>,
-    bb_items: &mut SmallVec<[MatchState<'t>; 1]>,
+    cur_items: &mut Vec<MatchState<'t>>,
+    bb_items: &mut Vec<MatchState<'t>>,
     next_items: &mut Vec<MatchState<'t>>,
-    eof_items: &mut SmallVec<[MatchState<'t>; 1]>,
-    error_items: &mut SmallVec<[MatchState<'t>; 1]>,
+    eof_items: &mut Vec<MatchState<'t>>,
+    error_items: &mut Vec<MatchState<'t>>,
     delim_span: tt::DelimSpan,
 ) {
     macro_rules! try_push {
@@ -626,13 +625,13 @@ fn match_loop_inner<'t>(
 fn match_loop<'t>(pattern: &'t MetaTemplate, src: &'t tt::TopSubtree) -> Match<'t> {
     let span = src.top_subtree().delimiter.delim_span();
     let mut src = src.iter();
-    let mut stack: SmallVec<[TtIter<'_>; 1]> = SmallVec::new();
+    let mut stack: Vec<TtIter<'_>> = Vec::new();
     let mut res = Match::default();
     let mut error_recover_item = None;
 
     let mut bindings_builder = BindingsBuilder::default();
 
-    let mut cur_items = smallvec![MatchState {
+    let mut cur_items = vec![MatchState {
         dot: pattern.iter_delimited(span),
         stack: Default::default(),
         up: None,
@@ -647,9 +646,9 @@ fn match_loop<'t>(pattern: &'t MetaTemplate, src: &'t tt::TopSubtree) -> Match<'
     let mut next_items = vec![];
 
     loop {
-        let mut bb_items = SmallVec::new();
-        let mut eof_items = SmallVec::new();
-        let mut error_items = SmallVec::new();
+        let mut bb_items = Vec::new();
+        let mut eof_items = Vec::new();
+        let mut error_items = Vec::new();
 
         stdx::always!(next_items.is_empty());
 

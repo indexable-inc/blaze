@@ -1,6 +1,6 @@
 //! Parses `format_args` input.
 
-use either::Either;
+use stdx::Either;
 use hir_expand::name::Name;
 use intern::Symbol;
 use rustc_parse_format as parse;

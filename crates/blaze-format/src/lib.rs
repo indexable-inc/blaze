@@ -100,8 +100,7 @@ impl Persist for Spans {
         let field = at + offset_of!(SpansRoot, spans) as u64;
         let root = SpansRoot {
             anchor: self.anchor,
-            spans: Slice::between(field, spans, self.spans.len())
-                .expect("the spans are written before their root, in a buffer under 2 GiB"),
+            spans: Slice::between(field, spans, self.spans.len()),
         };
         let written = out.push(&root);
         debug_assert_eq!(written, at);

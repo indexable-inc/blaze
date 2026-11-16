@@ -6,7 +6,7 @@ use std::cmp::min;
 use crate::ast::token::{Delimiter, Lit, LitKind};
 use crate::ast::{self, ForLoopKind, MatchKind, token};
 use crate::span::{BytePos, Span};
-use itertools::Itertools;
+use stdx::iter::IterExt;
 use tracing::debug;
 
 use crate::chains::rewrite_chain;

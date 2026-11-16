@@ -121,7 +121,7 @@ pub use boxed::{Box, CallOnce};
 pub use cow::{Cow, ToOwnedIn};
 pub use deque::VecDeque;
 pub use error::AllocFailure;
-pub use fixed::{FixedVec, Full, Inline};
+pub use fixed::{FixedString, FixedVec, Full, Inline};
 pub use packed::{Pack, Packed};
 pub use raw::RawBuf;
 pub use rc::Rc;

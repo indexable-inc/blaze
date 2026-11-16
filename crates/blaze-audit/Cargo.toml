@@ -22,8 +22,9 @@ semver.workspace = true
 # The advisories' front matter, blaze.lock's tables and the workspace's settings.
 toml.workspace = true
 # `--json`, and the sparse index's lines the yanked check reads.
-serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
+blaze-data.workspace = true
+blaze-json.workspace = true
+blaze-own.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true

@@ -36,7 +36,7 @@ struct Got {
 fn read_all(archive: &[u8], limits: Limits, splits: &[usize]) -> Result<StdVec<Got>, Error> {
     let mut reader = Reader::new_in(limits, Global);
     let mut got: StdVec<Got> = StdVec::new();
-    let mut at = 0;
+    let mut at = 0usize;
     let mut sizes = splits.iter().copied().chain(core::iter::repeat(usize::MAX));
     loop {
         let end = at.saturating_add(sizes.next().unwrap_or(usize::MAX).max(1)).min(archive.len());

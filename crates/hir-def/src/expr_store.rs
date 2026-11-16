@@ -18,7 +18,7 @@ use blaze_hash::{HashMap, HashSet};
 use blaze_ids::radix;
 use blaze_mem::Kept;
 use cfg::CfgExpr;
-use either::Either;
+use stdx::Either;
 use hir_expand::{InFile, MacroCallId, mod_path::ModPath, name::Name};
 use la_arena::Arena;
 use smallvec::SmallVec;

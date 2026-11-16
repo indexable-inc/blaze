@@ -36,6 +36,8 @@ mod parsing;
 mod ptr;
 #[allow(unsafe_code)]
 mod raw;
+#[expect(unsafe_code, reason = "an inline text is read back as `str` without checking its UTF-8 again")]
+mod small_str;
 mod syntax_error;
 mod syntax_node;
 #[cfg(test)]
@@ -58,7 +60,7 @@ use std::{cell::RefCell, marker::PhantomData};
 use blaze_mem::scratch::Scratch;
 
 use stdx::format_to;
-use triomphe::Arc;
+use std::sync::Arc;
 
 pub use crate::{
     ast::{AstNode, AstToken},
@@ -71,7 +73,7 @@ pub use crate::{
 };
 pub use parser::{BlazeEdition, Edition, Extensions, LexedStr, SyntaxKind, T, UnknownBlazeEdition};
 pub use rustc_literal_escaper as unescape;
-pub use smol_str::{SmolStr, SmolStrBuilder, ToSmolStr, format_smolstr};
+pub use crate::small_str::SmolStr;
 pub use syntax_tree::{
     Direction, Expand, FlatTree, FlatTreeBuilder, IMAGE_LAYOUT, NodeOrToken, SyntaxText, Text,
     TextRange, TextSize, TokenAtOffset, WalkEvent, api::Preorder,

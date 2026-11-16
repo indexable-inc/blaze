@@ -6,6 +6,7 @@
 
 #![feature(allocator_api)]
 
+mod error;
 pub mod interning;
 pub mod source_id;
 
@@ -14,6 +15,7 @@ pub mod source_id;
 #[global_allocator]
 static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
+pub use error::SourceError;
 pub use interning::InternedString;
 pub use source_id::{
     CRATES_IO_DOMAIN, CRATES_IO_HTTP_INDEX, CRATES_IO_INDEX, CRATES_IO_REGISTRY, CanonicalUrl,

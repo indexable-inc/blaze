@@ -7,7 +7,8 @@
 //! children written just before it) takes `i16` (32 KiB back, a `u16` length) or `i8` (128
 //! bytes back, a `u8` length): a `Rel` of 2 or 1 bytes, a `Slice` of 4 or 2, against 4 and 8.
 //! The writer finds out whether a distance fits when it makes the reference
-//! ([`Rel::between`]), and is refused by type when it does not.
+//! ([`Rel::between_as`]), and is refused by type when it does not; the default `i32` offset's
+//! [`Rel::between`] is a plain value, which panics past 2 GiB.
 //!
 //! [`Text`]: crate::Text
 
@@ -79,8 +80,8 @@ offset! {
     i32, u32, "i32", true;
 }
 
-/// Why a reference cannot be made between two places of a buffer: what [`Rel::between`] and
-/// [`Slice::between`] refuse. Both places are from the buffer's start.
+/// Why a reference cannot be made between two places of a buffer: what [`Rel::between_as`] and
+/// [`Slice::between_as`] refuse. Both places are from the buffer's start.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Unfit {
     /// The target is not before the field: a buffer's references point back, at what was

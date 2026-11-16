@@ -84,7 +84,6 @@ compile_error!("blaze's format is little-endian, as every target blaze runs on i
 /// The hash of a record type's layout: its fields' names, types, offsets and the schema hashes
 /// of the records it holds. A change to any of them is a new schema.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[repr(transparent)]
 pub struct SchemaHash(pub ContentId);
 
@@ -373,14 +372,25 @@ impl<T, O: Offset> Rel<T, O> {
 
     /// The reference a field at `field_at` holds to a `T` at `target_at`, both from the
     /// buffer's start: the `T` was written before the record holding the field. Refused when
-    /// it was not, or when the distance does not fit an `O`.
-    pub fn between(field_at: u64, target_at: u64) -> Result<Rel<T, O>, Unfit> {
+    /// it was not, or when the distance does not fit an `O`: the form for a narrow offset
+    /// (an `i32` one is [`Rel::between`]).
+    pub fn between_as(field_at: u64, target_at: u64) -> Result<Rel<T, O>, Unfit> {
         let offset = offset::offset_between::<O>(field_at, target_at, true)?;
         Ok(Rel { offset, of: PhantomData })
     }
 
     pub fn is_none(&self) -> bool {
         self.offset == O::ZERO
+    }
+}
+
+impl<T> Rel<T> {
+    /// [`Rel::between_as`] for the default `i32` offset, which reaches across any buffer under
+    /// 2 GiB: a plain value, as every writer of a record makes one. Panics, naming the
+    /// [`Unfit`], when the `T` was not written before the field or the buffer is 2 GiB or
+    /// more, as it always did.
+    pub fn between(field_at: u64, target_at: u64) -> Rel<T> {
+        Rel::between_as(field_at, target_at).unwrap_or_else(|unfit| panic!("{unfit}"))
     }
 }
 
@@ -418,8 +428,9 @@ impl<T, O: Offset> Slice<T, O> {
 
     /// The slice a field at `field_at` holds of `len` `T`s at `target_at`, both from the
     /// buffer's start: the `T`s were written before the record holding the field. Refused
-    /// when they were not, or when the distance or the length does not fit an `O`.
-    pub fn between(field_at: u64, target_at: u64, len: usize) -> Result<Slice<T, O>, Unfit> {
+    /// when they were not, or when the distance or the length does not fit an `O`: the form
+    /// for a narrow offset (an `i32` one is [`Slice::between`]).
+    pub fn between_as(field_at: u64, target_at: u64, len: usize) -> Result<Slice<T, O>, Unfit> {
         let long = Unfit::Long { field_at, len: len as u64, offset: O::NAME };
         let len = O::of_count(len as u64).ok_or(long)?;
         let offset = offset::offset_between::<O>(field_at, target_at, false)?;
@@ -433,6 +444,15 @@ impl<T, O: Offset> Slice<T, O> {
 
     pub fn is_empty(&self) -> bool {
         self.len == O::LEN_ZERO
+    }
+}
+
+impl<T> Slice<T> {
+    /// [`Slice::between_as`] for the default `i32` offset: a plain value, as [`Rel::between`]
+    /// is. Panics, naming the [`Unfit`], when the `T`s were not written before the field, or
+    /// the buffer is 2 GiB or more, or they are 2^32 or more, as it always did.
+    pub fn between(field_at: u64, target_at: u64, len: usize) -> Slice<T> {
+        Slice::between_as(field_at, target_at, len).unwrap_or_else(|unfit| panic!("{unfit}"))
     }
 }
 
@@ -666,7 +686,6 @@ record! {
     /// table. Never hashed into code: a formatting edit changes the table, not the code that
     /// names it.
     #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
-    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
     pub struct SpanRef: 1 {
         pub anchor: ContentId,
         pub index: u32,
@@ -679,7 +698,6 @@ record! {
     /// A span of an anchor's span table: bytes from the anchor's start, so an edit that moves
     /// the anchor in its file moves none of its spans.
     #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
-    #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
     pub struct RelSpan: 1 {
         pub start: u32,
         pub len: u32,

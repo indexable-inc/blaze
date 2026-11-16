@@ -166,10 +166,10 @@ pub fn logged(stdout: &[u8]) -> Vec<(Severity, String)> {
 /// at, found by one search for a line break before it.
 fn log_lines(stdout: &[u8]) -> impl Iterator<Item = (Severity, &[u8])> {
     let first = stdout.starts_with(b"cargo:").then_some(0);
-    let rest = memchr::memmem::find_iter(stdout, b"\ncargo:").map(|at| at + 1);
+    let rest = blaze_memchr::memmem::find_iter(stdout, b"\ncargo:").map(|at| at + 1);
     first.into_iter().chain(rest).filter_map(move |start| {
         let line = &stdout[start + b"cargo:".len()..];
-        let line = match memchr::memchr(b'\n', line) {
+        let line = match blaze_memchr::memchr(b'\n', line) {
             Some(end) => line[..end].strip_suffix(b"\r").unwrap_or(&line[..end]),
             None => line,
         };
