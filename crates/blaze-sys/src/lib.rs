@@ -20,8 +20,12 @@
 //! target, never another route (rule no-fallback).
 
 #![cfg_attr(not(test), no_std)]
-#![feature(register_tool)]
+#![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
+#![blaze::trust(
+    unsafe,
+    reason = "the one home of system calls: raw `asm!` system calls on Linux and libSystem's declared symbols on macOS, each `unsafe` block stating the kernel contract it relies on"
+)]
 #![allow(
     unsafe_code,
     reason = "the one home of system calls: each `unsafe` block states the kernel contract it relies on"

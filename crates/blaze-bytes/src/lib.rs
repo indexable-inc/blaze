@@ -19,8 +19,12 @@
 
 #![feature(allocator_ext)]
 // `#[expect(blaze::..)]` names blaze's own lints; inert under rustc.
-#![feature(register_tool)]
+#![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
+#![blaze::trust(
+    unsafe,
+    reason = "bytes held without a copy: an owner's bytes lent as `&'static [u8]` beside the owner that keeps them (`Bytes::held`), checked UTF-8 viewed as `&str`, and a heap `Arc<[u8]>` of checked UTF-8 cast to `Arc<str>`"
+)]
 
 use std::{borrow::Borrow, fmt, hash, ops::Deref, str::Utf8Error, sync::Arc};
 

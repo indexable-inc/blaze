@@ -39,6 +39,7 @@
 //! inside one scope are one task's, one at a time, so the tables are cells, never locks.
 
 use std::{
+    alloc::Global,
     any::TypeId,
     cell::{Cell, RefCell},
     hash::Hash,
@@ -429,23 +430,35 @@ fn reenter<F: Scoped, R>(
         );
     }
     let run = scope.runs.borrow()[at as usize];
+    // The frames pushed since the run began that hold a row a fixpoint cannot carry: a
+    // persistent query's run or verify, or a wait that may pump another task's work. A witness
+    // frame is no row and never a cycle's member (`local::Kind::Witness`), so the cycle passes
+    // it; its `id` names the query below it, or is 0 with none, and names nothing crossed.
     let crossed = local::with(|local| {
-        (local.frames.len() as u32 != run.frames)
-            .then(|| local.frames.get(run.frames as usize).map(|it| (it.ingredient, it.id)))
+        let above = local.frames.get(run.frames as usize..).unwrap_or(&[]);
+        above.iter().find_map(|it| match it.kind {
+            local::Kind::Run | local::Kind::Verify => Some(Some((it.ingredient, it.id))),
+            local::Kind::Barrier { lifted: false } => Some(None),
+            local::Kind::Barrier { lifted: true } | local::Kind::Witness { .. } => None,
+        })
     });
     if let Some(through) = crossed {
-        let through = match through {
-            Some((ingredient, id)) => {
+        // The panic's text, on the heap once: the task is refused.
+        let mut what = blaze_mem::String::new_in(Global);
+        blaze_mem::format_into!(&mut what, "({}) goes through ", key_text::<F>(key));
+        match through {
+            Some((ingredient, id)) => blaze_mem::format_into!(
+                &mut what,
+                "the persistent query {}",
                 super::key_text(storage, ingredient, super::Id::from_u32(id))
-            }
-            None => "<a frame gone>".to_owned(), // alloc: the panic's text
-        };
-        // alloc: the panic's text
+            ),
+            None => what.push_str("a wait that may run other tasks' work"),
+        }
         refuse(
             blaze_report::say!(
                 "a cycle through task-scoped ",
                 Code(F::NAME),
-                Words(&format!("({}) goes through the persistent query {through}", key_text::<F>(key))), // alloc: as above
+                Words(&what),
                 ": a scoped fixpoint cannot hold a persistent row to its rounds",
             )
             .flat(),

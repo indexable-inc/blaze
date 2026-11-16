@@ -451,9 +451,9 @@ mod tests {
         let mut buf = String::with_capacity_in(64, Global);
         let capacity = buf.capacity();
         for n in 0..3 {
-            crate::format_into!(&mut buf, "{n}-");
+            format_into!(&mut buf, "{n}-");
         }
-        crate::format_into!(&mut buf, "end");
+        format_into!(&mut buf, "end");
         assert_eq!(&*buf, "0-1-2-end");
         assert_eq!(buf.capacity(), capacity, "it wrote into the buffer it was given");
     }
