@@ -101,5 +101,7 @@ impl<B: Blake3 + ?Sized> core::hash::Hasher for Blake3Hasher<'_, B> {
         self.0.update(bytes);
     }
 
-    crate::fixed_width_writes!();
+    // Unqualified: a `macro_export` macro is not reachable by `crate::` path inside its own
+    // crate; it is in textual scope here, below its definition.
+    fixed_width_writes!();
 }

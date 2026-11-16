@@ -96,12 +96,11 @@ pub enum ObserveWrite {
 #[cfg_attr(not(test), allow(dead_code, reason = "only the tests plant a bug"))]
 pub enum Plant {
     None,
-    /// `observe` stores the slot word to the stub before it stores the body word, so a thread
-    /// can reach the stub and read a body word that is not the current body.
-    StubBeforeBody,
     /// `publish` moves an observed slot's word off its stub to the new body, so a function
     /// under observation stops being counted or marked without `plain`.
     PublishDropsStub,
+    /// `publish` leaves the body word stale, so a slot's stub reaches the body it replaced.
+    PublishSkipsBody,
 }
 
 /// One function the overlay keeps the two words of.
@@ -159,7 +158,9 @@ impl Observe {
     pub fn publish(&mut self, slot: Slot, body: Addr, out: &mut Vec<ObserveWrite, Kept>) {
         let func = &mut self.funcs[slot.0 as usize];
         func.body = Some(body);
-        out.push(ObserveWrite::Body { slot, body });
+        if self.plant != Plant::PublishSkipsBody {
+            out.push(ObserveWrite::Body { slot, body });
+        }
         match func.word {
             // A stub stays in the slot: it reads the body word just written.
             Slotword::Stub { .. } if self.plant != Plant::PublishDropsStub => {}
@@ -188,12 +189,6 @@ impl Observe {
                 continue;
             };
             let stub = Slotword::Stub { kind, at: at(slot) };
-            if self.plant == Plant::StubBeforeBody {
-                func.word = stub;
-                out.push(ObserveWrite::Slot { slot, to: stub });
-                out.push(ObserveWrite::Body { slot, body });
-                continue;
-            }
             // The body word first: the stub reads it, so it must hold the current body before
             // the slot word points a thread at the stub.
             out.push(ObserveWrite::Body { slot, body });

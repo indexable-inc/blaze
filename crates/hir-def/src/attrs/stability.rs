@@ -743,7 +743,7 @@ fn parent(db: &Db, def: AttrDefId) -> Option<StabilityDef> {
     let container = match def {
         AttrDefId::ModuleId(module) => {
             let def_map = module.def_map(db);
-            return match def_map.module(db, module).parent {
+            return match def_map.module(db, module).parent(db) {
                 Some(parent) => in_module(db, parent),
                 None => Some(block_owner(db, def_map.block_id()?)),
             };
@@ -778,7 +778,9 @@ fn parent(db: &Db, def: AttrDefId) -> Option<StabilityDef> {
 fn in_module(db: &Db, module: ModuleId) -> Option<StabilityDef> {
     let def_map = module.def_map(db);
     match def_map.block_id() {
-        Some(block) if def_map.module(db, module).parent.is_none() => Some(block_owner(db, block)),
+        Some(block) if def_map.module(db, module).parent(db).is_none() => {
+            Some(block_owner(db, block))
+        }
         _ => Some(AttrDefId::ModuleId(module).into()),
     }
 }
@@ -792,9 +794,9 @@ fn block_owner<'db>(db: &'db Db, block: BlockIdLt<'db>) -> StabilityDef {
     let ast_id = block.ast_id(db);
     let no_owner =
         || -> ! { panic!("no definition of its module holds the block at {ast_id:?} with items") };
-    // A block of a crate given by its address whose file has no text: refused, typed.
-    crate::nameres::frozen::pages::demand_text(db, block.module(db).krate(db), ast_id.file_id);
-    let node =InFile::new(ast_id.file_id, ast_id.to_view(db).syntax())
+    // A block of a crate without text: a typed stop.
+    crate::nameres::demand_text(db, block.module(db).krate(db), "the owner of a block");
+    let node = InFile::new(ast_id.file_id, ast_id.to_view(db).syntax())
         .parent_ancestors_with_macros_view(db)
         .find(|it| is_definition(it.value.kind()))
         .unwrap_or_else(|| no_owner());

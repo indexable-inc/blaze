@@ -1,33 +1,33 @@
 //! [`Parent`]: the `blaze run` process's side of a running program. It is alive exactly as long
 //! as the program, and holds nothing a record does not rebuild.
 //!
-//! The unit of work is a [`Version`]: one slot's function with a set of [`Hooks`] (none for the
-//! plain version). Its code record is keyed by [`VersionKey`] (function, tier, hooks), so each
-//! version is made once and shared by every run.
+//! The unit of work is a slot's function. Its code record is keyed by [`CodeKey`] (function,
+//! tier) and holds no instrumentation, so each is made once and shared by every run whatever
+//! any run observes.
 //!
 //! - **The start.** [`Parent::start`] is given what must have code before the program's first
 //!   instruction (the entry, and what runs before `main`: the start sections' initializers) and
 //!   what the last run's record says ran. The first are wanted at once; [`Effect::Begin`] goes
 //!   out when each is published, [`Effect::NoStart`] when one has no code.
-//! - **A need.** A thread called a stub whose record the program does not hold. The slot's
-//!   wanted version is looked up by key ([`Effect::Lookup`]); found, it is published; absent,
-//!   compiled by the [`Compiler`] ([`Effect::Compile`]), then published. However many threads
-//!   ask, and however often, one compile of a version is in flight at a time (single flight),
-//!   and each asker is answered with the same outcome after the publish.
+//! - **A need.** A thread called a need stub whose record the program does not hold. The slot's
+//!   record is looked up by key ([`Effect::Lookup`]); found, it is published; absent, compiled
+//!   by the [`Compiler`] ([`Effect::Compile`]), then published. However many threads ask, and
+//!   however often, one compile of a function is in flight at a time (single flight), and each
+//!   asker is answered with the same outcome after the publish.
 //! - **No compile waits.** A compile returns its record or the records it lacks
-//!   ([`Compiled::Need`]). The version is then blocked and holds no worker; each lacking record
+//!   ([`Compiled::Need`]). The function is then blocked and holds no worker; each lacking record
 //!   is made once however many compiles lack it ([`Effect::Make`], [`Parent::made`]), and the
 //!   compile is entered again from the top once it lacks nothing.
 //! - **Speculation.** The callees of each function published, and what the last run ran, are
 //!   wanted at lower priorities ([`Priority`]). A background compile never takes the last free
 //!   worker, so a thread's own function never waits behind speculation.
-//! - **Toggles.** The viewer turns hooks on or off for a function or a set ([`Parent::toggle`]):
-//!   the version with the new hooks is found or made at [`Priority::Toggled`] while the slot
-//!   keeps running what it ran, then swapped in. With every hook off the slot returns to its
-//!   plain version, at the best tier made ([`Parent::tiered`]). A hooked version that does not
-//!   compile refuses the toggle ([`Effect::Untoggled`]); the function keeps what it ran.
-//! - **Failure (rule 20).** A function whose plain version does not compile fails every caller
-//!   with its typed [`CompileError`]; nothing else stops. The run goes on.
+//! - **Hooks.** The viewer turns hooks on or off for a function or a set ([`Parent::toggle`]):
+//!   each slot's hooks are kept here and sent as [`Effect::Hooks`], which the program's control
+//!   thread makes a hook stub in front of the code (`Slots::observe`, `Slots::plain`). Nothing is
+//!   compiled, so a toggle cannot fail and takes effect at the slot's next call, before its code
+//!   exists too (the stub then jumps to the need stub).
+//! - **Failure (rule 20).** A function that does not compile fails every caller with its typed
+//!   [`CompileError`]; nothing else stops. The run goes on.
 //! - **Bounds (rule 18).** A compile, with its re-entries, runs against one deadline on the
 //!   driver's clock ([`Config::compile_bound`]); past it, its askers are failed with
 //!   [`Why::Overran`]. Waiters are capped ([`Config::most_waiters`]).
@@ -46,8 +46,8 @@ use blaze_own::{SortedMap, Vec, VecDeque, soa};
 use crate::registry::RunEvent;
 use crate::tier::{Identities, Inlined, usable_planted};
 use crate::{
-    CodeId, CodeRef, CompileError, Hooks, InstanceKey, Made, Nanos, Plant, RecordKey, SlotId,
-    ThreadId, Tier, Version, VersionKey, Why,
+    CodeId, CodeKey, CodeRef, CompileError, Hooks, InstanceKey, Made, Nanos, Plant, RecordKey,
+    SlotId, ThreadId, Tier, Why,
 };
 
 /// What a compile is for, the most urgent first.
@@ -55,15 +55,13 @@ use crate::{
 pub enum Priority {
     /// A thread waits for it, or the start does.
     Asked = 0,
-    /// The viewer turned a hook on or off for it.
-    Toggled = 1,
     /// A function just published calls it.
-    Callee = 2,
+    Callee = 1,
     /// The last run ran it.
-    History = 3,
+    History = 2,
 }
 
-const PRIORITIES: [Priority; 4] = [Priority::Asked, Priority::Toggled, Priority::Callee, Priority::History];
+const PRIORITIES: [Priority; 3] = [Priority::Asked, Priority::Callee, Priority::History];
 
 /// One function of the program's manifest, by slot.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -91,7 +89,7 @@ pub struct Read {
     pub digest: [u8; 32],
 }
 
-/// What the compiler made of one version: its fast-tier code record (written to the store by
+/// What the compiler made of one function: its fast-tier code record (written to the store by
 /// the compile's task before it ends), the slots its code calls through, and its read list.
 pub struct FastRecord<A: Allocator> {
     pub code: CodeRef,
@@ -103,7 +101,7 @@ pub struct FastRecord<A: Allocator> {
 /// from the new item layer, bottom.md). A pure function of what it reads: it returns its record
 /// or the records it lacks, and never waits. Its driver calls it for each [`Effect::Compile`].
 pub trait Compiler<A: Allocator + Clone> {
-    fn compile(&mut self, version: VersionKey, alloc: A) -> Result<Made<FastRecord<A>, A>, Why>;
+    fn compile(&mut self, key: CodeKey, alloc: A) -> Result<Made<FastRecord<A>, A>, Why>;
 }
 
 /// How one entry of a compile ended, as its driver hands it back.
@@ -113,8 +111,8 @@ pub enum Compiled<'r, A: Allocator> {
     Failed(Why),
 }
 
-/// What a lookup found in the store: the version's fast record by key, and for the plain
-/// version the optimized one by its address, if either is there.
+/// What a lookup found in the store: the function's fast record by key, and the optimized one
+/// by its address, if either is there.
 #[derive(Clone, Copy, Debug)]
 pub struct Found<'a> {
     pub fast: CodeRef,
@@ -131,7 +129,7 @@ pub struct FoundOptimized<'a> {
 /// The answer a waiting thread is given.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Answer {
-    /// The slot's word names code: call through it again.
+    /// The slot's body word names code: call through the slot again.
     Code { tier: Tier },
     /// The function has no code: the call fails with this.
     Failed(CompileError),
@@ -141,18 +139,19 @@ pub enum Answer {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Effect {
     /// Look `key`'s records up, then call [`Parent::looked`].
-    Lookup { version: Version, key: VersionKey },
+    Lookup { slot: SlotId, key: CodeKey },
     /// Run the compiler on a worker, then call [`Parent::compiled`]. Past `deadline` the
     /// parent's [`Parent::tick`] fails its askers.
-    Compile { version: Version, key: VersionKey, priority: Priority, deadline: Nanos },
+    Compile { slot: SlotId, key: CodeKey, priority: Priority, deadline: Nanos },
     /// Make the record `key` (by the store or by its task), then call [`Parent::made`].
     Make { key: RecordKey, priority: Priority },
-    /// Tell the program to place `code` in `slot` (`Slots::publish`).
-    Publish { slot: SlotId, tier: Tier, hooks: Hooks, code: CodeRef },
+    /// Tell the program to place `code` as `slot`'s body (`Slots::publish`).
+    Publish { slot: SlotId, tier: Tier, code: CodeRef },
+    /// Tell the program `slot` is to run with `hooks` (all of them, not a change): its hook stub
+    /// goes in or out (`Slots::observe`, `Slots::plain`).
+    Hooks { slot: SlotId, hooks: Hooks },
     /// Wake `thread`, which waits on `slot`.
     Answer { thread: ThreadId, slot: SlotId, answer: Answer },
-    /// A toggle to `hooks` was refused: that version has no code; the slot keeps what it runs.
-    Untoggled { slot: SlotId, hooks: Hooks, error: CompileError },
     /// Everything the start needs is published: run the entry.
     Begin,
     /// A function the start needs has no code: the program does not start.
@@ -168,15 +167,15 @@ pub enum Error {
     Config { what: &'static str, value: u64 },
     NoSlot { slot: SlotId, slots: u32 },
     TooManyWaiters { most: u32, slot: SlotId },
-    /// A lookup's answer for a version that was not being looked up.
-    NotLooking { version: Version },
-    /// A compile's end for a version that was not compiling.
-    NotCompiling { version: Version },
+    /// A lookup's answer for a slot that was not being looked up.
+    NotLooking { slot: SlotId },
+    /// A compile's end for a slot that was not compiling.
+    NotCompiling { slot: SlotId },
     /// A `Need` that names nothing: the compile could never be entered again.
-    EmptyNeed { version: Version },
+    EmptyNeed { slot: SlotId },
     /// A record made that no compile lacked.
     NotNeeded { key: RecordKey },
-    /// Optimized code for a slot whose plain version has no fast code.
+    /// Optimized code for a slot with no fast code.
     NotReady { slot: SlotId },
     StartedTwice,
 }
@@ -191,21 +190,15 @@ impl fmt::Display for Error {
             Error::TooManyWaiters { most, slot } => {
                 write!(f, "more than {most} asks waiting at once, at slot {}", slot.0)
             }
-            Error::NotLooking { version } => write!(
-                f,
-                "a lookup ended for slot {} hooks {:#x}, which was not being looked up",
-                version.slot.0, version.hooks.0
-            ),
-            Error::NotCompiling { version } => write!(
-                f,
-                "a compile ended for slot {} hooks {:#x}, which was not compiling",
-                version.slot.0, version.hooks.0
-            ),
-            Error::EmptyNeed { version } => write!(
-                f,
-                "the compile of slot {} hooks {:#x} lacked nothing and returned no record",
-                version.slot.0, version.hooks.0
-            ),
+            Error::NotLooking { slot } => {
+                write!(f, "a lookup ended for slot {}, which was not being looked up", slot.0)
+            }
+            Error::NotCompiling { slot } => {
+                write!(f, "a compile ended for slot {}, which was not compiling", slot.0)
+            }
+            Error::EmptyNeed { slot } => {
+                write!(f, "the compile of slot {} lacked nothing and returned no record", slot.0)
+            }
             Error::NotNeeded { key } => {
                 write!(f, "record {:02x?} was made and no compile lacked it", &key.0[..8])
             }
@@ -247,14 +240,12 @@ enum Asker {
 }
 
 soa! {
-    /// One slot as the parent keeps it: the function it runs, its plain version's state, the
-    /// hooks it is to run with, and those of what its word names (`None` while a stub). By
-    /// columns: the clock's pass reads `plains` alone, a toggle `wanted` and `shown`.
+    /// One slot as the parent keeps it: the function it runs, its code's state, and the hooks
+    /// the viewer asked for. By columns: the clock's pass reads `states` alone.
     struct Row, Rows, RowRef {
         function: Function => functions / functions_mut,
-        plain: State => plains / plains_mut,
-        wanted: Hooks => wanted / wanted_mut,
-        shown: Option<Hooks> => shown / shown_mut,
+        state: State => states / states_mut,
+        hooks: Hooks => hooks / hooks_mut,
     }
 }
 
@@ -266,13 +257,11 @@ pub struct Parent<A: Allocator + Clone> {
     table: Rows<A>,
     /// Each instance's code identity, sorted once at the start and never inserted into.
     ids: SortedMap<InstanceKey, CodeId, A>,
-    /// Each hooked version asked for; absent is unasked. Sorted: one insert a toggled slot.
-    hooked: SortedMap<Version, State, A>,
-    /// Who waits for which version, in the order they asked.
-    waiters: Vec<(Version, Asker), A>,
-    queues: [VecDeque<Version, A>; 4],
-    /// Each record being made, and the versions whose compiles lack it: the few in flight.
-    making: SortedMap<RecordKey, Vec<Version, A>, A>,
+    /// Who waits for which slot, in the order they asked.
+    waiters: Vec<(SlotId, Asker), A>,
+    queues: [VecDeque<SlotId, A>; 3],
+    /// Each record being made, and the slots whose compiles lack it: the few in flight.
+    making: SortedMap<RecordKey, Vec<SlotId, A>, A>,
     running: u32,
     running_background: u32,
     start: Start,
@@ -302,7 +291,7 @@ impl<A: Allocator + Clone> Parent<A> {
         let n = functions.len();
         let mut table = Rows::with_capacity_in(n, alloc.clone());
         for function in functions {
-            table.push(Row { function: *function, plain: State::Unasked, wanted: Hooks::NONE, shown: None });
+            table.push(Row { function: *function, state: State::Unasked, hooks: Hooks::NONE });
         }
         let mut pairs = Vec::with_capacity_in(n, alloc.clone());
         pairs.extend(functions.iter().map(|function| (function.instance, function.code)));
@@ -313,14 +302,8 @@ impl<A: Allocator + Clone> Parent<A> {
             config,
             table,
             ids,
-            hooked: SortedMap::new_in(alloc.clone()),
             waiters: Vec::new_in(alloc.clone()),
-            queues: [
-                VecDeque::new_in(alloc.clone()),
-                VecDeque::new_in(alloc.clone()),
-                VecDeque::new_in(alloc.clone()),
-                VecDeque::new_in(alloc.clone()),
-            ],
+            queues: [VecDeque::new_in(alloc.clone()), VecDeque::new_in(alloc.clone()), VecDeque::new_in(alloc.clone())],
             making: SortedMap::new_in(alloc.clone()),
             alloc,
             running: 0,
@@ -347,42 +330,16 @@ impl<A: Allocator + Clone> Parent<A> {
         }
     }
 
-    /// Where a hooked version's state is kept: by the version (the planted bug forgets the slot).
-    fn home(&self, version: Version) -> Version {
-        match self.plant {
-            Plant::VersionsByHooks => Version { slot: SlotId(0), hooks: version.hooks },
-            _ => version,
-        }
+    fn state(&self, slot: SlotId) -> State {
+        self.table.states()[slot.index()]
     }
 
-    fn state(&self, version: Version) -> State {
-        match version.hooks.is_none() {
-            true => self.table.plains()[version.slot.index()],
-            false => self.hooked.get(&self.home(version)).copied().unwrap_or(State::Unasked),
-        }
+    fn set(&mut self, slot: SlotId, state: State) {
+        self.table.states_mut()[slot.index()] = state;
     }
 
-    fn set(&mut self, version: Version, state: State) {
-        match version.hooks.is_none() {
-            true => self.table.plains_mut()[version.slot.index()] = state,
-            false => {
-                let home = self.home(version);
-                self.hooked.insert(home, state);
-            }
-        }
-    }
-
-    fn key(&self, version: Version) -> VersionKey {
-        VersionKey {
-            function: self.instance(version.slot),
-            tier: Tier::Fast,
-            hooks: version.hooks,
-        }
-    }
-
-    /// The version `slot` is to run now.
-    fn current(&self, slot: SlotId) -> Version {
-        Version { slot, hooks: self.table.wanted()[slot.index()] }
+    fn key(&self, slot: SlotId) -> CodeKey {
+        CodeKey { function: self.instance(slot), tier: Tier::Fast }
     }
 
     pub fn function(&self, slot: SlotId) -> Option<Function> {
@@ -394,17 +351,17 @@ impl<A: Allocator + Clone> Parent<A> {
         self.compiles
     }
 
-    /// Whether `slot`'s plain version has code, and at which tier.
+    /// Whether `slot` has code, and at which tier.
     pub fn ready(&self, slot: SlotId) -> Option<Tier> {
-        match self.table.plains().get(slot.index()) {
+        match self.table.states().get(slot.index()) {
             Some(State::Ready { tier, .. }) => Some(*tier),
             _ => None,
         }
     }
 
-    /// The hooks `slot` is to run with, and those of what its word names now.
-    pub fn hooks(&self, slot: SlotId) -> Option<(Hooks, Option<Hooks>)> {
-        Some((*self.table.wanted().get(slot.index())?, self.table.shown()[slot.index()]))
+    /// The hooks `slot` is to run with.
+    pub fn hooks(&self, slot: SlotId) -> Option<Hooks> {
+        self.table.hooks().get(slot.index()).copied()
     }
 
     /// The start: `needed` must have code before the first instruction; `history` ran last time.
@@ -424,11 +381,10 @@ impl<A: Allocator + Clone> Parent<A> {
         self.now = now;
         self.start = Start::Waiting { left: 0 };
         for slot in needed {
-            let version = self.current(*slot);
-            if self.waiters.iter().any(|it| *it == (version, Asker::Start)) {
+            if self.waiters.iter().any(|it| *it == (*slot, Asker::Start)) {
                 continue;
             }
-            match self.state(version) {
+            match self.state(*slot) {
                 State::Ready { .. } => continue,
                 State::Failed { error, .. } => {
                     self.refuse_start(error, out);
@@ -436,21 +392,21 @@ impl<A: Allocator + Clone> Parent<A> {
                 }
                 _ => {}
             }
-            self.wait(version, Asker::Start)?;
+            self.wait(*slot, Asker::Start)?;
             if let Start::Waiting { left } = &mut self.start {
                 *left += 1;
             }
-            self.want(version, Priority::Asked, out);
+            self.want(*slot, Priority::Asked, out);
         }
         for slot in history {
-            self.want(self.current(*slot), Priority::History, out);
+            self.want(*slot, Priority::History, out);
         }
         self.begin_if_ready(out);
         self.pump(out);
         Ok(())
     }
 
-    /// `thread` called `slot`'s stub.
+    /// `thread` called `slot`'s need stub.
     pub fn need(
         &mut self,
         thread: ThreadId,
@@ -460,8 +416,7 @@ impl<A: Allocator + Clone> Parent<A> {
     ) -> Result<(), Error> {
         self.check(slot)?;
         self.now = self.now.max(now);
-        let version = self.current(slot);
-        match self.state(version) {
+        match self.state(slot) {
             State::Ready { tier, .. } => {
                 out.push(Effect::Answer { thread, slot, answer: Answer::Code { tier } });
             }
@@ -469,25 +424,25 @@ impl<A: Allocator + Clone> Parent<A> {
                 out.push(Effect::Answer { thread, slot, answer: Answer::Failed(error) });
             }
             State::Compiling { priority, deadline } if self.plant == Plant::CompileTwice => {
-                self.wait(version, Asker::Thread(thread))?;
-                let key = self.key(version);
-                out.push(Effect::Compile { version, key, priority, deadline });
+                self.wait(slot, Asker::Thread(thread))?;
+                let key = self.key(slot);
+                out.push(Effect::Compile { slot, key, priority, deadline });
             }
             State::Unasked
             | State::Looking { .. }
             | State::Queued { .. }
             | State::Compiling { .. }
             | State::Blocked { .. } => {
-                self.wait(version, Asker::Thread(thread))?;
-                self.want(version, Priority::Asked, out);
+                self.wait(slot, Asker::Thread(thread))?;
+                self.want(slot, Priority::Asked, out);
             }
         }
         self.pump(out);
         Ok(())
     }
 
-    /// The viewer turned `hooks` on or off for each of `slots`: each slot's new version is found
-    /// or made, then swapped in; the slot runs what it ran until then.
+    /// The viewer turned `hooks` on or off for each of `slots`: each slot whose hooks change is
+    /// sent its whole set. Nothing is compiled.
     pub fn toggle(
         &mut self,
         slots: &[SlotId],
@@ -499,71 +454,54 @@ impl<A: Allocator + Clone> Parent<A> {
             self.check(*slot)?;
         }
         for slot in slots {
-            let was = self.table.wanted()[slot.index()];
+            let was = self.table.hooks()[slot.index()];
             let now = was.with(hooks, on);
-            if now == was {
+            if now == was || (now.is_none() && self.plant == Plant::OffKeepsHooks) {
                 continue;
             }
-            if now.is_none() && self.plant == Plant::OffKeepsHooks {
-                continue;
-            }
-            self.table.wanted_mut()[slot.index()] = now;
-            // A function never called has nothing to swap: its first need asks for this version.
-            let Some(shown) = self.table.shown()[slot.index()] else { continue };
-            if shown == now {
-                continue;
-            }
-            let version = Version { slot: *slot, hooks: now };
-            match self.state(version) {
-                State::Ready { tier, code } => self.show(version, tier, code, out),
-                State::Failed { error, .. } => self.untoggle(version, error, out),
-                _ => self.want(version, Priority::Toggled, out),
-            }
+            self.table.hooks_mut()[slot.index()] = now;
+            out.push(Effect::Hooks { slot: *slot, hooks: now });
         }
-        self.pump(out);
         Ok(())
     }
 
-    /// The tier made optimized `code` for `slot`'s plain version: its best plain code from now,
-    /// shown at once unless the slot runs with hooks.
+    /// The tier made optimized `code` for `slot`: its code from now, published at once (a stub
+    /// in front of it stays in front of the new body).
     pub fn tiered(&mut self, slot: SlotId, code: CodeRef, out: &mut Vec<Effect, A>) -> Result<(), Error> {
         self.check(slot)?;
-        let version = Version { slot, hooks: Hooks::NONE };
-        let State::Ready { .. } = self.table.plains()[slot.index()] else {
+        let State::Ready { .. } = self.state(slot) else {
             return Err(Error::NotReady { slot });
         };
-        self.table.plains_mut()[slot.index()] = State::Ready { tier: Tier::Optimized, code };
-        if self.table.wanted()[slot.index()].is_none() {
-            self.show(version, Tier::Optimized, code, out);
-        }
+        self.set(slot, State::Ready { tier: Tier::Optimized, code });
+        out.push(Effect::Publish { slot, tier: Tier::Optimized, code });
         Ok(())
     }
 
-    fn wait(&mut self, version: Version, asker: Asker) -> Result<(), Error> {
-        if self.waiters.contains(&(version, asker)) {
+    fn wait(&mut self, slot: SlotId, asker: Asker) -> Result<(), Error> {
+        if self.waiters.contains(&(slot, asker)) {
             return Ok(());
         }
         if self.waiters.len() >= self.config.most_waiters as usize {
-            return Err(Error::TooManyWaiters { most: self.config.most_waiters, slot: version.slot });
+            return Err(Error::TooManyWaiters { most: self.config.most_waiters, slot });
         }
-        self.waiters.push((version, asker));
+        self.waiters.push((slot, asker));
         Ok(())
     }
 
-    /// Wants `version` at `priority`: looked up first, or moved up in its queue.
-    fn want(&mut self, version: Version, priority: Priority, out: &mut Vec<Effect, A>) {
-        match self.state(version) {
+    /// Wants `slot` at `priority`: looked up first, or moved up in its queue.
+    fn want(&mut self, slot: SlotId, priority: Priority, out: &mut Vec<Effect, A>) {
+        match self.state(slot) {
             State::Unasked => {
-                self.set(version, State::Looking { priority });
-                let key = self.key(version);
-                out.push(Effect::Lookup { version, key });
+                self.set(slot, State::Looking { priority });
+                let key = self.key(slot);
+                out.push(Effect::Lookup { slot, key });
             }
             State::Looking { priority: was } if priority < was => {
-                self.set(version, State::Looking { priority });
+                self.set(slot, State::Looking { priority });
             }
             State::Queued { priority: was, deadline } if priority < was => {
-                self.set(version, State::Queued { priority, deadline });
-                self.queues[priority as usize].push_back(version);
+                self.set(slot, State::Queued { priority, deadline });
+                self.queues[priority as usize].push_back(slot);
             }
             State::Looking { .. }
             | State::Queued { .. }
@@ -574,54 +512,53 @@ impl<A: Allocator + Clone> Parent<A> {
         }
     }
 
-    /// The store's answer to [`Effect::Lookup`] for `version`.
+    /// The store's answer to [`Effect::Lookup`] for `slot`.
     pub fn looked(
         &mut self,
-        version: Version,
+        slot: SlotId,
         found: Option<Found<'_>>,
         out: &mut Vec<Effect, A>,
     ) -> Result<(), Error> {
-        self.check(version.slot)?;
-        let State::Looking { priority } = self.state(version) else {
-            return Err(Error::NotLooking { version });
+        self.check(slot)?;
+        let State::Looking { priority } = self.state(slot) else {
+            return Err(Error::NotLooking { slot });
         };
         match found {
             Some(found) => {
-                let optimized = found.optimized.filter(|it| {
-                    version.hooks.is_none() && usable_planted(it.inlined, &*self, self.plant).is_ok()
-                });
+                let optimized =
+                    found.optimized.filter(|it| usable_planted(it.inlined, &*self, self.plant).is_ok());
                 let (tier, code) = match optimized {
                     Some(optimized) => (Tier::Optimized, optimized.code),
                     None => (Tier::Fast, found.fast),
                 };
-                self.has_code(version, tier, code, found.callees, out);
+                self.has_code(slot, tier, code, found.callees, out);
             }
             None => {
-                self.set(version, State::Queued { priority, deadline: None });
-                self.queues[priority as usize].push_back(version);
+                self.set(slot, State::Queued { priority, deadline: None });
+                self.queues[priority as usize].push_back(slot);
             }
         }
         self.pump(out);
         Ok(())
     }
 
-    /// The end of one entry of [`Effect::Compile`] for `version`.
+    /// The end of one entry of [`Effect::Compile`] for `slot`.
     pub fn compiled(
         &mut self,
-        version: Version,
+        slot: SlotId,
         ended: Compiled<'_, A>,
         now: Nanos,
         out: &mut Vec<Effect, A>,
     ) -> Result<(), Error> {
-        self.check(version.slot)?;
+        self.check(slot)?;
         self.now = self.now.max(now);
-        let (priority, deadline, late) = match self.state(version) {
+        let (priority, deadline, late) = match self.state(slot) {
             State::Compiling { priority, deadline } => (priority, deadline, false),
             State::Failed { compiling: Some(priority), error } => {
-                self.set(version, State::Failed { error, compiling: None });
+                self.set(slot, State::Failed { error, compiling: None });
                 (priority, self.now, true)
             }
-            _ => return Err(Error::NotCompiling { version }),
+            _ => return Err(Error::NotCompiling { slot }),
         };
         self.running -= 1;
         if priority != Priority::Asked {
@@ -630,32 +567,32 @@ impl<A: Allocator + Clone> Parent<A> {
         match ended {
             // A late success still serves every later caller; the early ones were failed.
             Compiled::Record(record) => {
-                self.has_code(version, Tier::Fast, record.code, &record.callees, out);
+                self.has_code(slot, Tier::Fast, record.code, &record.callees, out);
             }
             Compiled::Need(_) | Compiled::Failed(_) if late => {}
             Compiled::Need(keys) => {
                 if keys.is_empty() {
-                    return Err(Error::EmptyNeed { version });
+                    return Err(Error::EmptyNeed { slot });
                 }
                 let mut left = 0;
                 for key in keys {
                     match self.making.get_mut(key) {
-                        Some(versions) if versions.contains(&version) => continue,
-                        Some(versions) => versions.push(version),
+                        Some(slots) if slots.contains(&slot) => continue,
+                        Some(slots) => slots.push(slot),
                         None => {
-                            let mut versions = Vec::new_in(self.alloc.clone());
-                            versions.push(version);
-                            self.making.insert(*key, versions);
+                            let mut slots = Vec::new_in(self.alloc.clone());
+                            slots.push(slot);
+                            self.making.insert(*key, slots);
                             out.push(Effect::Make { key: *key, priority });
                         }
                     }
                     left += 1;
                 }
-                self.set(version, State::Blocked { priority, deadline, left });
+                self.set(slot, State::Blocked { priority, deadline, left });
             }
             Compiled::Failed(why) => {
-                let error = CompileError { function: self.instance(version.slot), slot: version.slot, why };
-                self.fail(version, error, out);
+                let error = CompileError { function: self.instance(slot), slot, why };
+                self.fail(slot, error, out);
             }
         }
         self.pump(out);
@@ -665,22 +602,22 @@ impl<A: Allocator + Clone> Parent<A> {
     /// The record `key` was made (or could not be): each compile that lacked it is entered again
     /// once it lacks nothing, or fails with the record's error.
     pub fn made(&mut self, key: RecordKey, result: Result<(), Why>, out: &mut Vec<Effect, A>) -> Result<(), Error> {
-        let Some(versions) = self.making.remove(&key) else {
+        let Some(slots) = self.making.remove(&key) else {
             return Err(Error::NotNeeded { key });
         };
-        for version in versions {
-            let State::Blocked { priority, deadline, left } = self.state(version) else { continue };
+        for slot in slots {
+            let State::Blocked { priority, deadline, left } = self.state(slot) else { continue };
             match result {
                 Err(why) => {
-                    let function = self.instance(version.slot);
-                    self.fail(version, CompileError { function, slot: version.slot, why }, out);
+                    let function = self.instance(slot);
+                    self.fail(slot, CompileError { function, slot, why }, out);
                 }
                 Ok(()) if left > 1 && self.plant != Plant::ReenterEarly => {
-                    self.set(version, State::Blocked { priority, deadline, left: left - 1 });
+                    self.set(slot, State::Blocked { priority, deadline, left: left - 1 });
                 }
                 Ok(()) => {
-                    self.set(version, State::Queued { priority, deadline: Some(deadline) });
-                    self.queues[priority as usize].push_front(version);
+                    self.set(slot, State::Queued { priority, deadline: Some(deadline) });
+                    self.queues[priority as usize].push_front(slot);
                 }
             }
         }
@@ -692,101 +629,57 @@ impl<A: Allocator + Clone> Parent<A> {
     pub fn tick(&mut self, now: Nanos, out: &mut Vec<Effect, A>) {
         self.now = self.now.max(now);
         let mut over = Vec::new_in(self.alloc.clone());
-        let each = (0..self.table.len()).map(|at| Version { slot: SlotId(at as u32), hooks: Hooks::NONE });
-        for version in each.chain(self.hooked.keys().copied()) {
-            let (deadline, holds) = match self.state(version) {
+        for (at, state) in self.table.states().iter().enumerate() {
+            let (deadline, holds) = match *state {
                 State::Compiling { priority, deadline } => (deadline, Some(priority)),
                 State::Blocked { deadline, .. } => (deadline, None),
                 State::Queued { deadline: Some(deadline), .. } => (deadline, None),
                 _ => continue,
             };
             if deadline <= self.now {
-                over.push((version, holds));
+                over.push((SlotId(at as u32), holds));
             }
         }
-        for (version, holds) in over {
+        for (slot, holds) in over {
             let why = Why::Overran { bound: self.config.compile_bound };
-            let function = self.instance(version.slot);
-            let error = CompileError { function, slot: version.slot, why };
-            self.fail(version, error, out);
-            self.set(version, State::Failed { error, compiling: holds });
+            let error = CompileError { function: self.instance(slot), slot, why };
+            self.fail(slot, error, out);
+            self.set(slot, State::Failed { error, compiling: holds });
         }
         self.pump(out);
     }
 
-    /// `version` has code: kept, shown if it is what its slot is to run, its askers answered,
-    /// its callees wanted.
-    fn has_code(&mut self, version: Version, tier: Tier, code: CodeRef, callees: &[SlotId], out: &mut Vec<Effect, A>) {
-        self.set(version, State::Ready { tier, code });
-        let function = self.instance(version.slot);
+    /// `slot` has code: kept, published, its askers answered, its callees wanted.
+    fn has_code(&mut self, slot: SlotId, tier: Tier, code: CodeRef, callees: &[SlotId], out: &mut Vec<Effect, A>) {
+        self.set(slot, State::Ready { tier, code });
+        let function = self.instance(slot);
         out.push(Effect::Say(match tier {
             Tier::Fast => RunEvent::Published { function },
             Tier::Optimized => RunEvent::Tiered { function },
         }));
-        if self.current(version.slot) == version {
-            self.show(version, tier, code, out);
-        }
-        self.answer(version, Answer::Code { tier }, out);
+        out.push(Effect::Publish { slot, tier, code });
+        self.answer(slot, Answer::Code { tier }, out);
         for callee in callees {
             if callee.index() < self.table.len() {
-                self.want(self.current(*callee), Priority::Callee, out);
+                self.want(*callee, Priority::Callee, out);
             }
         }
     }
 
-    /// Swaps `version`'s code into its slot's word.
-    fn show(&mut self, version: Version, tier: Tier, code: CodeRef, out: &mut Vec<Effect, A>) {
-        let slot = version.slot;
-        self.table.shown_mut()[slot.index()] = Some(version.hooks);
-        out.push(Effect::Publish { slot, tier, hooks: version.hooks, code });
-    }
-
-    fn fail(&mut self, version: Version, error: CompileError, out: &mut Vec<Effect, A>) {
-        self.set(version, State::Failed { error, compiling: None });
+    fn fail(&mut self, slot: SlotId, error: CompileError, out: &mut Vec<Effect, A>) {
+        self.set(slot, State::Failed { error, compiling: None });
         out.push(Effect::Say(RunEvent::Failed { function: error.function }));
-        if !version.hooks.is_none() {
-            self.untoggle(version, error, out);
-            return;
-        }
-        self.answer(version, Answer::Failed(error), out);
+        self.answer(slot, Answer::Failed(error), out);
         if self.plant == Plant::StopOnFailure {
             out.push(Effect::Stop(error));
         }
     }
 
-    /// A hooked version has no code: the toggle is refused, the slot is to run what it shows (or
-    /// its plain version), and anyone waiting for the hooked one waits for that instead.
-    fn untoggle(&mut self, version: Version, error: CompileError, out: &mut Vec<Effect, A>) {
-        let slot = version.slot;
-        if self.table.wanted()[slot.index()] == version.hooks {
-            let shown = self.table.shown()[slot.index()].unwrap_or(Hooks::NONE);
-            self.table.wanted_mut()[slot.index()] = shown;
-        }
-        out.push(Effect::Untoggled { slot, hooks: version.hooks, error });
-        let instead = self.current(slot);
-        let mut moved = false;
-        for (waits, _) in &mut self.waiters {
-            if *waits == version {
-                *waits = instead;
-                moved = true;
-            }
-        }
-        if !moved {
-            return;
-        }
-        match self.state(instead) {
-            State::Ready { tier, .. } => self.answer(instead, Answer::Code { tier }, out),
-            State::Failed { error, .. } => self.answer(instead, Answer::Failed(error), out),
-            _ => self.want(instead, Priority::Asked, out),
-        }
-    }
-
-    /// Answers `version`'s waiters in the order they asked, and the start if it waited.
-    fn answer(&mut self, version: Version, answer: Answer, out: &mut Vec<Effect, A>) {
+    /// Answers `slot`'s waiters in the order they asked, and the start if it waited.
+    fn answer(&mut self, slot: SlotId, answer: Answer, out: &mut Vec<Effect, A>) {
         let mut start = false;
-        let slot = version.slot;
         self.waiters.retain(|(waits, asker)| {
-            if *waits != version {
+            if *waits != slot {
                 return true;
             }
             match asker {
@@ -835,18 +728,18 @@ impl<A: Allocator + Clone> Parent<A> {
                 {
                     break;
                 }
-                let Some(version) = self.queues[priority as usize].pop_front() else { break };
-                let State::Queued { priority: at, deadline } = self.state(version) else { continue };
+                let Some(slot) = self.queues[priority as usize].pop_front() else { break };
+                let State::Queued { priority: at, deadline } = self.state(slot) else { continue };
                 if at != priority {
                     continue;
                 }
                 let deadline = deadline.unwrap_or(self.now.after(self.config.compile_bound));
-                self.set(version, State::Compiling { priority, deadline });
+                self.set(slot, State::Compiling { priority, deadline });
                 self.running += 1;
                 self.running_background += u32::from(background);
                 self.compiles += 1;
-                let key = self.key(version);
-                out.push(Effect::Compile { version, key, priority, deadline });
+                let key = self.key(slot);
+                out.push(Effect::Compile { slot, key, priority, deadline });
                 out.push(Effect::Say(RunEvent::Compiling { function: key.function }));
             }
         }

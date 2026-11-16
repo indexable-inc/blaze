@@ -150,13 +150,13 @@ pub(crate) fn block_scope_stop<T>(db: &Db, module: ModuleId, method: &'static st
     // A block is in an item's body, and every item is in a module with a key.
     let mut around = module.to_db(db);
     let item = loop {
+        if let Some(key) = around.key(db) {
+            break key;
+        }
         around = match around.containing_module(db) {
             Some(it) => it,
             None => panic!("module {module:?}: a block module with no keyed module around it"),
         };
-        if let Some(key) = around.key(db) {
-            break key;
-        }
     };
     Err(SurfaceError::NotBuilt(NotBuilt { method, item })).or_need()
 }

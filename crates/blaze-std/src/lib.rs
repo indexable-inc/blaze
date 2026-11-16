@@ -116,6 +116,7 @@
     contracts,
     core_intrinsics,
     custom_inner_attributes,
+    fn_static,
     freeze,
     generic_atomic,
     macro_attr,
@@ -176,6 +177,8 @@ pub mod entry;
 pub mod env;
 /// Who decides how a pure function is computed: `Eval` and its providers, memo points, keys.
 pub mod eval;
+/// Flat values: `Flat`, bytes that mean the same on any thread, process or machine.
+pub mod flat;
 pub mod fs;
 pub mod gpu;
 pub mod host;

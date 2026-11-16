@@ -711,6 +711,11 @@ impl Code {
         use std::os::fd::AsRawFd;
 
         self.within("fallocate(PUNCH_HOLE)", at, len)?;
+        // Whole pages only: a hole in part of a page would zero bytes of a body still live.
+        let page = page()?;
+        if at % page != 0 || len % page != 0 {
+            return Err(SysError { call: "fallocate(PUNCH_HOLE)", errno: libc::EINVAL, at, len });
+        }
         let (Ok(from), Ok(length)) = (libc::off_t::try_from(at), libc::off_t::try_from(len)) else {
             return Err(SysError { call: "fallocate(PUNCH_HOLE)", errno: libc::EFBIG, at, len });
         };

@@ -26,7 +26,7 @@ use crate::world::{PClause, Reads, Shape, World};
 /// rustc's default `recursion_limit`: the autoderef bound (E0055 past it).
 pub(crate) const RECURSION_LIMIT: u32 = 128;
 
-/// A planted bug for the read-list property (`tests::reads`): outside tests there is none.
+/// A planted bug for the read-list property (`tests::read_list_property`): outside tests there is none.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Plant {
     None,

@@ -100,12 +100,13 @@ with its item-relative byte range (rule 71). Locals are resolved by the body's l
 (`Expr::Local(pat)`, as rustc's resolver does before typeck); every other path is resolved by the
 driver through `World` (type-relative paths, `Type::item`, are typeck's, as in rustc).
 
-The machine is `Machine` (machine.rs): a stack of `Frame { node, state, expect, then, saved }`.
+The machine is `Machine` (machine.rs): a stack of `Frame { node, state, expect, then, saved, a, b, c, t, u, l }`.
 `node` is an expression, a pattern, a statement or a block; `state` is the step of that node's
 rule (a `u8`); `expect` its `Expectation` (`None`, `HasType(t)`, `Castable(t)`,
 `RvalueLikeUnsized(t)`, as rustc's); `then` is where the result goes: nothing, a coercion to a
 type, an equality demand, or a `CoerceMany` site; `saved` holds the divergence flag rustc saves
-around each expression. A rule never calls the checker of a child: it pushes itself back with
+around each expression; `a`, `b`, `c` (`u32`), `t`, `u` (`Ty`) and `l` (`TyList`) are the rule's
+own registers between states (an arm index, a coercion site, a scrutinee type, the formals). A rule never calls the checker of a child: it pushes itself back with
 the next state and then the child, and the child's type comes back in one register. No native
 recursion follows the expression tree, so depth is bounded by the frame column, sized from the
 body (`4 * nodes + 64`), whose overflow is a typed `CheckError`, not a crash.
@@ -138,7 +139,9 @@ All state is plain data in columns of `u32` indices and `Ty` handles, so a run c
 - `types`: a `PortableTys` table, hash-consed by structure, so equal types are equal indices and
   the bytes depend on structure and walk order only, never on a context's handles;
 - `expr_ty` and `pat_ty`: one `PTy` per expression and pattern; `local_ty` per binding;
-- `adjust`: per expression, a range of `Adjust` steps (`NeverToAny`, `Deref(builtin or
+Sparse facts are `blaze_own::Soa` tables sorted by expression, so a lookup scans one column:
+
+- `adjusts`: per expression, consecutive `Adjust` steps (`NeverToAny`, `Deref(builtin or
   overloaded)`, `Borrow(mutbl, two_phase)`, `ReifyFnPointer`, `Unsize`), each with its target;
 - `callees`: per call and method call, the item and its generic arguments;
 - `fields`: per field access, the variant and field index (tuples too);
@@ -174,6 +177,9 @@ type language. Each item says what it becomes:
 - `may_hold(obligation, reads)`: `predicate_may_hold` in a probe, for the method probe.
 - `normalize(trait, self, args, name, reads)`: an alias normalized now if selectable, for
   overloaded deref and operator outputs.
+- `closure_hint(var, [Fn, FnMut, FnOnce], Output)`: the inputs of the first pending
+  `var: Fn*<(..)>` obligation and the term of a pending `Output` projection, for a closure's
+  expected signature (`deduce_closure_signature`).
 
 From blaze-ty the driver also needs the **portable type form** (`PNode`/`PTy` here): a table of
 nodes with children before parents, items by key, generic parameters by index, and a hole
@@ -203,8 +209,8 @@ well-formedness obligations; `?` and the other desugarings as the body's lowerin
 
 Through `blaze_sim::check`, on generated bodies over a generated world:
 
-- **Determinism**: two runs, with type contexts that number variables differently, give equal
-  records.
+- **Determinism**: two runs of one body over one world, each with a fresh type context, give
+  equal records.
 - **The read list is complete**: change an answer of the world that the read list does not hold,
   and the record is unchanged; change one it holds, and the read list's hash for it differs. A
   planted bug (a field lookup through `peek_unrecorded`) must be caught (`blaze_sim::control`).

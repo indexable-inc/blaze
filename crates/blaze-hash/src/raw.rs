@@ -154,7 +154,7 @@ impl<T, A: Allocator> RawTable<T, A> {
         debug_assert!(group < self.groups);
         // SAFETY: `group < groups`, and the table's allocation holds `groups` words, written
         // when it was made.
-        Ctrl(unsafe { *self.ctrl.as_ptr().add(group) })
+        Ctrl::<SLOTS>(unsafe { *self.ctrl.as_ptr().add(group) })
     }
 
     #[inline]
@@ -309,7 +309,7 @@ impl<T, A: Allocator> RawTable<T, A> {
             let hash = hasher(unsafe { &*value });
             let at = vacant(hash, groups, |group| {
                 // SAFETY: `group < groups`, the new allocation's words, all written.
-                Ctrl(unsafe { *ctrl.as_ptr().add(group) })
+                Ctrl::<SLOTS>(unsafe { *ctrl.as_ptr().add(group) })
             });
             // SAFETY: `at` is an empty slot of the new allocation; the value is copied, and
             // the old slot is never read or dropped again once the move completes.
@@ -352,7 +352,7 @@ impl<T, A: Allocator> RawTable<T, A> {
     /// Marks every slot empty, the values already moved out.
     fn clear_no_drop(&mut self) {
         for group in 0..self.groups {
-            self.set_word(group, Ctrl(0));
+            self.set_word(group, Ctrl::<SLOTS>(0));
         }
         self.items = 0;
         self.growth_left = limit(self.groups);
@@ -392,10 +392,20 @@ impl<T, A: Allocator> RawTable<T, A> {
         }
     }
 
-    /// Every value taken out, the allocation kept.
+    /// Every value taken out, the allocation kept. The drain holds the allocation while it
+    /// walks and the table looks empty meanwhile, so a drain that is leaked (`mem::forget`)
+    /// leaks the allocation and the values not yet taken, and the table stays a valid empty
+    /// one: it never sees a slot whose value was moved out.
     #[inline]
     pub(crate) fn drain(&mut self) -> Drain<'_, T, A> {
-        Drain { live: self.live(), table: self }
+        let live = self.live();
+        let held = Held { ctrl: self.ctrl, slots: self.slots, groups: self.groups };
+        self.ctrl = NonNull::dangling();
+        self.slots = NonNull::dangling();
+        self.groups = 0;
+        self.items = 0;
+        self.growth_left = 0;
+        Drain { live, held, table: self }
     }
 }
 
@@ -660,20 +670,35 @@ impl<T, A: Allocator> Drop for IntoIter<T, A> {
     }
 }
 
+/// The allocation a [`Drain`] took from its table, given back by its drop.
+struct Held<T> {
+    ctrl: NonNull<u64>,
+    slots: NonNull<T>,
+    groups: usize,
+}
+
 /// A table's values taken by value, leaving it empty with its allocation.
 pub(crate) struct Drain<'a, T, A: Allocator> {
     live: Live,
+    held: Held<T>,
     table: &'a mut RawTable<T, A>,
 }
+
+// SAFETY: a `Drain` owns the values it has not yet taken and borrows the table mutably, as
+// a `&mut RawTable` would.
+unsafe impl<T: Send, A: Allocator + Send> Send for Drain<'_, T, A> {}
+// SAFETY: as above; `&Drain` reaches no value.
+unsafe impl<T: Sync, A: Allocator + Sync> Sync for Drain<'_, T, A> {}
 
 impl<T, A: Allocator> Iterator for Drain<'_, T, A> {
     type Item = T;
 
     #[inline]
     fn next(&mut self) -> Option<T> {
-        let index = self.live.next(self.table)?;
-        // SAFETY: `index` was live and is read once; the drop marks every slot empty.
-        Some(unsafe { self.table.slot_ptr(index).read() })
+        let index = self.live.next_in(self.held.ctrl, self.held.groups)?;
+        // SAFETY: `index` was live in the held allocation and is read once; the drop marks
+        // every slot empty before the table sees the allocation again.
+        Some(unsafe { self.held.slots.as_ptr().add(index).read() })
     }
 
     #[inline]

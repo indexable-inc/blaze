@@ -1,11 +1,10 @@
 //! [`Parent::toggle`] against a viewer that turns hooks on and off for functions and sets of
 //! them while threads call them, lookups and compiles ending in any order.
 //!
-//! The oracle: every code a slot is given computes what that slot's function computes (a hook
-//! adds what it observes, never changes the result); a slot is never given the code it runs
-//! again; once everything asked is done, each called slot runs the version with exactly the
-//! hooks the toggles asked for, and one with every hook off runs its plain version, the very
-//! record it ran before any toggle.
+//! The oracle: a toggle compiles and looks up nothing (a hook is a stub, never code); every code
+//! a slot is given is its one record, keyed by function and tier alone, and never the code it
+//! runs again; at every step each slot's hooks, as the program was last told them, are exactly
+//! what the toggles asked for, and a slot with every hook off was told so.
 
 use std::alloc::Global;
 use std::collections::BTreeMap;
@@ -18,20 +17,14 @@ use super::oracle;
 use super::parent::functions;
 use crate::parent::{Compiled, Config as ParentConfig, Effect, FastRecord, Found, Parent};
 use crate::viewer;
-use crate::{CodeRef, Hooks, Nanos, Plant, SlotId, ThreadId, Version};
+use crate::{CodeRef, Hooks, Nanos, Plant, SlotId, ThreadId};
 
 const FUNCTIONS: u32 = 3;
 const HOOKS: [Hooks; 3] = [Hooks::TRACE, Hooks::COUNTS, Hooks::BREAK];
 
-/// The record the compiler makes for a version: its slot and hooks are in its key.
-fn code_of(version: Version) -> CodeRef {
-    CodeRef(key(10_000 + u64::from(version.slot.0) * 64 + u64::from(version.hooks.0)))
-}
-
-/// What running `code` computes: its function's result, whatever hooks it has.
-fn computes(code: CodeRef) -> u64 {
-    let n = u64::from_le_bytes(code.0[..8].try_into().unwrap_or([0; 8]));
-    (n - 10_000) / 64 * 7 + 1
+/// A slot's one code record.
+fn code_of(slot: SlotId) -> CodeRef {
+    CodeRef(key(10_000 + u64::from(slot.0)))
 }
 
 fn refused(error: crate::parent::Error) -> Broke {
@@ -46,36 +39,48 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     let mut out = Own::new_in(Global);
     parent.start(&[], &[], Nanos(0), &mut out).map_err(refused)?;
     let mut wanted = [Hooks::NONE; FUNCTIONS as usize];
+    let mut told = [Hooks::NONE; FUNCTIONS as usize];
     let mut words: [Option<CodeRef>; FUNCTIONS as usize] = [None; FUNCTIONS as usize];
-    let mut lookups: Vec<Version> = Vec::new();
-    let mut compiles: Vec<Version> = Vec::new();
+    let mut lookups: Vec<SlotId> = Vec::new();
+    let mut compiles: Vec<SlotId> = Vec::new();
     let mut waiting: BTreeMap<ThreadId, SlotId> = BTreeMap::new();
     let steps = tape.range(1..100, "steps");
     let mut step = 0;
+    let mut toggled = false;
     loop {
         for effect in out.drain(..) {
             match effect {
-                Effect::Lookup { version, .. } => lookups.push(version),
-                Effect::Compile { version, .. } => compiles.push(version),
+                Effect::Lookup { slot, .. } | Effect::Compile { slot, .. } if toggled => {
+                    return Err(Broke::Oracle(format!("a toggle looked up or compiled slot {}", slot.0)));
+                }
+                Effect::Lookup { slot, .. } => lookups.push(slot),
+                Effect::Compile { slot, .. } => compiles.push(slot),
                 Effect::Publish { slot, code, .. } => {
-                    let function = slot.0 as u64 * 7 + 1;
-                    oracle(computes(code) == function, || {
-                        format!("a toggle changed what slot {} computes: {} for {function}", slot.0, computes(code))
-                    })?;
+                    oracle(code == code_of(slot), || format!("slot {} was given code not its own", slot.0))?;
                     oracle(words[slot.index()] != Some(code), || {
                         format!("slot {} was given the code it runs again", slot.0)
                     })?;
                     words[slot.index()] = Some(code);
                 }
+                Effect::Hooks { slot, hooks } => told[slot.index()] = hooks,
                 Effect::Answer { thread, .. } => {
                     waiting.remove(&thread);
                 }
-                Effect::Make { .. } | Effect::Untoggled { .. } | Effect::NoStart(_) | Effect::Stop(_) => {
+                Effect::Make { .. } | Effect::NoStart(_) | Effect::Stop(_) => {
                     return Err(Broke::Harness(format!("{effect:?} with no failure and nothing lacking")));
                 }
                 Effect::Begin | Effect::Say(_) => {}
             }
         }
+        for at in 0..FUNCTIONS as usize {
+            let (want, got) = (wanted[at], told[at]);
+            if want.is_none() {
+                oracle(got.is_none(), || format!("off did not return slot {at} to no hooks: {:#x}", got.0))?;
+            } else {
+                oracle(got == want, || format!("slot {at} runs hooks {:#x}, not the {:#x} asked", got.0, want.0))?;
+            }
+        }
+        toggled = false;
         step += 1;
         if step >= steps && lookups.is_empty() && compiles.is_empty() {
             break;
@@ -103,39 +108,26 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
                     wanted[slot.index()] = wanted[slot.index()].with(hooks, on);
                 }
                 parent.toggle(&set, hooks, on, &mut out).map_err(refused)?;
+                toggled = true;
             }
             2 if !lookups.is_empty() => {
-                let version = lookups.remove(tape.index(lookups.len(), "lookup"));
-                let found = tape.coin("in the store").then(|| Found { fast: code_of(version), callees: &[], optimized: None });
-                parent.looked(version, found, &mut out).map_err(refused)?;
+                let slot = lookups.remove(tape.index(lookups.len(), "lookup"));
+                let found = tape.coin("in the store").then(|| Found { fast: code_of(slot), callees: &[], optimized: None });
+                parent.looked(slot, found, &mut out).map_err(refused)?;
             }
             3 if !compiles.is_empty() => {
-                let version = compiles.remove(tape.index(compiles.len(), "compile"));
-                let record = FastRecord { code: code_of(version), callees: Own::new_in(Global), reads: Own::new_in(Global) };
-                parent.compiled(version, Compiled::Record(&record), Nanos(step), &mut out).map_err(refused)?;
+                let slot = compiles.remove(tape.index(compiles.len(), "compile"));
+                let record = FastRecord { code: code_of(slot), callees: Own::new_in(Global), reads: Own::new_in(Global) };
+                parent.compiled(slot, Compiled::Record(&record), Nanos(step), &mut out).map_err(refused)?;
             }
             _ => continue,
         }
     }
-    oracle(waiting.is_empty(), || format!("{} calls were never answered", waiting.len()))?;
-    for at in 0..FUNCTIONS {
-        let slot = SlotId(at);
-        let Some(code) = words[slot.index()] else { continue };
-        let want = wanted[slot.index()];
-        let plain = code_of(Version { slot, hooks: Hooks::NONE });
-        if want.is_none() {
-            oracle(code == plain, || format!("off did not return slot {} to its plain version", slot.0))?;
-        } else {
-            oracle(code == code_of(Version { slot, hooks: want }), || {
-                format!("a toggle left slot {} running other hooks than {:#x}", slot.0, want.0)
-            })?;
-        }
-    }
-    Ok(())
+    oracle(waiting.is_empty(), || format!("{} calls were never answered", waiting.len()))
 }
 
 #[test]
-fn a_toggle_changes_what_runs_never_what_it_computes() {
+fn a_toggle_changes_only_the_hooks_and_compiles_nothing() {
     check(Config::cases(500), |tape| run(tape, Plant::None));
 }
 
@@ -144,7 +136,7 @@ fn a_toggle_changes_what_runs_never_what_it_computes() {
 #[test]
 fn a_toggle_request_reads_back_and_only_its_shortest_form_does() {
     check(Config::cases(300), |tape| {
-        let hooks = Hooks(tape.next_u32("hooks") as u16);
+        let hooks = Hooks(tape.next_u32("hooks") as u16 & Hooks::ALL.0);
         let on = tape.coin("on");
         let slots: Vec<SlotId> = (0..tape.below(6, "slots")).map(|_| SlotId(tape.next_u32("slot"))).collect();
         let mut bytes = Own::new_in(Global);
@@ -175,9 +167,4 @@ fn a_toggle_request_reads_back_and_only_its_shortest_form_does() {
 #[test]
 fn the_oracle_catches_a_slot_left_hooked_after_off() {
     control(Config::cases(4000), Plant::None, Plant::OffKeepsHooks, "off did not return", run);
-}
-
-#[test]
-fn the_oracle_catches_versions_keyed_without_their_function() {
-    control(Config::cases(4000), Plant::None, Plant::VersionsByHooks, "a toggle changed what", run);
 }

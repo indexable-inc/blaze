@@ -129,6 +129,14 @@ fn token(name: &str) -> bool {
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
 
+/// A header that may come once: a second one is ambiguous, and refused.
+fn once<'a>(slot: &mut Option<&'a str>, value: &'a str) -> Result<(), Status> {
+    match slot.replace(value) {
+        None => Ok(()),
+        Some(_) => Err(Status::BadRequest),
+    }
+}
+
 /// The request at the start of `input`, or what it breaks.
 pub fn parse(input: &[u8]) -> Result<Parsed<'_>, Status> {
     let scan = &input[..input.len().min(MOST_HEAD + 4)];
@@ -202,20 +210,16 @@ pub fn parse(input: &[u8]) -> Result<Parsed<'_>, Status> {
             return Err(Status::BadRequest);
         }
         let value = value.trim_matches(|c| c == ' ' || c == '\t');
-        let once = |slot: &mut Option<&str>| match slot.replace(value) {
-            None => Ok(()),
-            Some(_) => Err(Status::BadRequest),
-        };
         if name.eq_ignore_ascii_case("host") {
-            once(&mut request.host)?;
+            once(&mut request.host, value)?;
         } else if name.eq_ignore_ascii_case("origin") {
-            once(&mut request.origin)?;
+            once(&mut request.origin, value)?;
         } else if name.eq_ignore_ascii_case("authorization") {
-            once(&mut request.authorization)?;
+            once(&mut request.authorization, value)?;
         } else if name.eq_ignore_ascii_case("last-event-id") {
-            once(&mut request.last_event_id)?;
+            once(&mut request.last_event_id, value)?;
         } else if name.eq_ignore_ascii_case("access-control-request-method") {
-            once(&mut request.preflight)?;
+            once(&mut request.preflight, value)?;
         } else if name.eq_ignore_ascii_case("access-control-request-private-network") {
             request.private_network = value.eq_ignore_ascii_case("true");
         } else if name.eq_ignore_ascii_case("transfer-encoding") {

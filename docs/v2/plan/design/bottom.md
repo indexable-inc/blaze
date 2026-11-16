@@ -237,9 +237,17 @@ cold.
   [proc-macros.md](proc-macros.md)). blaze-expand hands a `ProcCall` (kind, input, attribute
   arguments) to a runner it does not hold and takes back `Produced`: tokens, origins and the
   outside reads the sandbox recorded. The sandbox is the wasm module's WASI imports: no network,
-  reads only through the runner, each one a read of the expansion's record. Open: the runner is
-  Wasmtime (`vendor/wasmtime`, an exception, section 13) until a wasm interpreter of our own
-  exists (third-party.md, option 1); which one runs at the switch is not decided.
+  reads only through the runner, each one a read of the expansion's record. Decided (Andrew,
+  2026-11-15 20:20): proc macros are the long tail, not a path to make fast. In order: (1) the
+  derives that make up most calls in real workspaces (serde's, thiserror's, clap's, the std
+  ones) are builtins in blaze-expand, used only when the macro crate's content digest is one
+  the builtin was written against, so the result is the macro's own; (2) every other proc
+  macro runs in the vendored Wasmtime (`vendor/wasmtime`, kept: no interpreter of our own is
+  planned until a profile shows the runner is where the time goes); (3) an expansion is a
+  record keyed by its input, so a call runs once and is shared; (4) a proc macro that
+  compile-time reflection replaces is an advice finding naming the reflection form
+  (rule 56), an error only in blaze's own crates. A workspace's dependencies still need
+  (2): reth and tempo cannot be built without it (rule 4).
 - **Build scripts** run sandboxed (rule 9) as a `ScriptRun` record ([target.md](target.md)):
   keyed by the script's program, its package, its declared environment and the settings, with its
   traced outside reads. blaze-build-script holds the environment cargo gives, the parse of what
@@ -405,7 +413,8 @@ The exceptions, each dated 2026-11-15:
 | Exception | What it is | How it ends |
 |---|---|---|
 | The trait solver (`vendor/rustc_next_trait_solver`, `rustc_type_ir` and their small dependencies: arrayvec, bitflags, derive-where, ena, indexmap, ra-ap-rustc_index, rustc-hash, smallvec, thin-vec, tracing) | a fork of the Rust project's solver | becomes ours by stripping its dependencies and marking it `ours = true`; it is NOT rewritten from a blank page |
-| Wasmtime (`vendor/wasmtime`) | the proc-macro runner (rule 10) | a wasm interpreter of our own, then a wasm-to-LIR translator if profiles ask |
+| Wasmtime (`vendor/wasmtime`) | the proc-macro runner (rule 10) | stays vendored (Andrew, 2026-11-15 20:20: vendoring is fine for the hard ones); replaced only if a profile names it |
+| zstd (`vendor/zstd-sys`, C) | compression of stored records | stays vendored; first measure whether records should be compressed at all |
 | LLVM | the optimizing backend | the Rust bindings go (declared `extern "C"` from LLVM's headers); LLVM stays a C++ library until blaze's own backend is the top tier |
 | What third-party.md marks hard | TLS and signatures, zstd, the profile's file format, tree-sitter, Cargo's formats | the option third-party.md names for each |
 

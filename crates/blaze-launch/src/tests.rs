@@ -3,6 +3,7 @@
 //! ([`wire`]); and here, what one call of the core refuses and what the area gives back.
 
 mod image;
+mod observe;
 mod record;
 mod sim;
 mod wire;

@@ -10,14 +10,12 @@ use intern::Symbol;
 use std::alloc::Global;
 
 use crate::{
-    AssocItemId, AttrDefId, HasModule, ModuleDefId, ModuleId,
+    AssocItemId, AttrDefId, ModuleDefId, ModuleId,
     attrs::AttrFlags,
-    item_scope::ItemScope,
+    item_scope::{ItemScope, item_scope},
     nameres::{
         assoc::{ImplItems, TraitItems},
-        crate_def_map, crate_local_def_map,
-        demand::{self, Look},
-        frozen,
+        crate_def_map, crate_extern_prelude,
     },
 };
 
@@ -74,19 +72,27 @@ fn settle(mut by_name: FrameMap<'_>, mut duplicates: Duplicates<'_>) -> Diagnost
 }
 
 /// The diagnostic items of `krate`'s own items: every item rustc's `diagnostic_items` visits
-/// (the crate's HIR owners: its modules, their items, the items of traits, impls and `extern`
-/// blocks, macros, `use`s and `extern crate`s, and those declared in bodies). Lowers only the
-/// bodies that may declare one ([`demand::walk_bodies_saying`]): those whose text says
-/// `rustc_diagnostic_item` or names a macro that may write it.
+/// (the crate's HIR owners: its modules, their items, the items of traits and impls, macros,
+/// `use`s and `extern crate`s), each module reached from the root through its scope's
+/// declarations.
 ///
-/// A crate served from its image reads the table its image holds
-/// ([`frozen::served_diagnostic_items`]): no module's scope, no page of its def map and no
-/// item's attributes. Only a crate that is not served is walked.
+/// Off the crate's text: no record holds a crate's diagnostic items yet (reconnect.md, "What
+/// the new-layer crates lack"), so of a crate without text a typed stop. Two kinds of owner
+/// are not visited, both listed there: the items declared in bodies (the scope of a block is
+/// in no record; the attribute needs `#![feature(rustc_attrs)]`, so a crate with it stops
+/// rather than answer without them) and an `extern` block itself (the records list its items
+/// under its module, and no block).
 #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
 pub fn crate_diagnostic_items(db: &Db, krate: Crate) -> DiagnosticItems {
     let _p = tracing::info_span!("crate_diagnostic_items_query").entered();
-    if let Some(served) = frozen::served_diagnostic_items(db, krate) {
-        return served;
+    crate::nameres::demand_text(db, krate, "the diagnostic items of a crate without text");
+    let def_map = crate_def_map(db, krate);
+    if def_map.features(db).is_enabled(&intern::sym::rustc_attrs) {
+        crate::nameres::block_scope_stop::<()>(
+            db,
+            def_map.root_module_id(),
+            "the diagnostic items declared in a crate's bodies",
+        );
     }
     blaze_mem::frame::current(|frame| {
         let mut collect = Collect {
@@ -94,16 +100,16 @@ pub fn crate_diagnostic_items(db: &Db, krate: Crate) -> DiagnosticItems {
             by_name: hashbrown::HashMap::with_hasher_in(FixedState, frame),
             duplicates: Vec::new_in(frame),
         };
-        for (module, data) in crate_def_map(db, krate).modules(db) {
-            collect.module(module, data.scope(db));
+        let mut work = Vec::new_in(frame);
+        work.push(def_map.root_module_id());
+        while let Some(module) = work.pop() {
+            let scope = item_scope(db, module);
+            collect.module(module, scope);
+            work.extend(scope.declarations().filter_map(|def| match def {
+                ModuleDefId::ModuleId(child) => Some(child),
+                _ => None,
+            }));
         }
-        demand::walk_bodies_saying(db, krate, Look::DiagnosticItems, |_, blocks| {
-            for &(_, def_map) in &blocks.blocks {
-                for (module, data) in def_map.modules(db) {
-                    collect.module(module, data.scope(db));
-                }
-            }
-        });
         settle(collect.by_name, collect.duplicates)
     })
 }
@@ -126,7 +132,7 @@ pub fn diagnostic_items(db: &Db, krate: Crate) -> DiagnosticItems {
         let mut at = 0;
         while let Some(&from) = queue.get(at) {
             at += 1;
-            for (_, (module, _)) in crate_local_def_map(db, from).local(db).extern_prelude() {
+            for (_, (module, _)) in crate_extern_prelude(db, from).iter() {
                 let dep = module.krate(db);
                 if seen.insert(dep) {
                     queue.push(dep);
@@ -204,21 +210,11 @@ impl Collect<'_, '_> {
             self.item(it);
             self.assoc(&ImplItems::of(db, it).0.items);
         }
-        for it in scope.extern_blocks() {
-            self.item(AttrDefId::ExternBlockId(it));
-        }
         for it in scope.extern_crate_decls() {
             self.item(it);
         }
         for it in scope.use_decls() {
             self.item(it);
-        }
-        for (_, macros) in scope.legacy_macros() {
-            for &it in macros {
-                if it.module(db) == module {
-                    self.item(it);
-                }
-            }
         }
     }
 }

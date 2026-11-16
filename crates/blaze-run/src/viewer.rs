@@ -27,7 +27,8 @@ const TRUE: u8 = 0xf5;
 /// A request, without its slots (pushed to the caller's buffer).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Request {
-    /// Turn `hooks` on or off for each slot pushed.
+    /// Turn `hooks` on or off for each slot pushed: their hook stubs go in or out; nothing is
+    /// compiled.
     Toggle { hooks: Hooks, on: bool },
 }
 
@@ -41,6 +42,8 @@ pub enum Bad {
     Version { found: u64 },
     Kind { found: u64 },
     TooLarge { at: usize, what: &'static str, found: u64 },
+    /// Hooks with a bit no hook has ([`Hooks::ALL`]).
+    NoSuchHook { at: usize, found: u64 },
     TooMany { slots: u64, most: usize },
     Trailing { at: usize },
 }
@@ -60,6 +63,11 @@ impl fmt::Display for Bad {
             Bad::TooLarge { at, what, found } => {
                 write!(f, "a viewer request's {what} at byte {at} is {found}, past its type")
             }
+            Bad::NoSuchHook { at, found } => write!(
+                f,
+                "a viewer request's hooks at byte {at} are {found:#x}, past every hook there is ({:#x})",
+                Hooks::ALL.0
+            ),
             Bad::TooMany { slots, most } => {
                 write!(f, "a viewer request names {slots} slots, past the cap of {most}")
             }
@@ -165,6 +173,9 @@ pub fn read<A: Allocator>(bytes: &[u8], most_slots: usize, slots: &mut Vec<SlotI
     let at = reader.at;
     let found = reader.head(UINT, "hooks")?;
     let hooks = Hooks(u16::try_from(found).map_err(|_| Bad::TooLarge { at, what: "hooks", found })?);
+    if hooks.0 & !Hooks::ALL.0 != 0 {
+        return Err(Bad::NoSuchHook { at, found });
+    }
     let at = reader.at;
     let on = match reader.byte()? {
         TRUE => true,

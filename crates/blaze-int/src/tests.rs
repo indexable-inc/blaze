@@ -2,14 +2,15 @@
 //! minimum and maximum and one inside each, 0, 1 and its wrap of -1, its middle, and the
 //! target's minimum and maximum and one past each where the source holds them. Against std as
 //! the oracle: `narrow` agrees with `TryFrom`, `truncate` and `widen` with `as`, a widening
-//! round-trips through `TryFrom`, `saturate` is `TryFrom` clamped, and a narrowing of two
+//! round-trips through `TryFrom`, `saturate` is `TryFrom` clamped, `narrow_or_stop` is
+//! `narrow` where it fits, and a narrowing of two
 //! fixed-width types fails at some edge (else it would be a widening the table missed). The
 //! table names each other type once per source, and `truncate`'s targets are `narrow`'s with
 //! no more bits.
 
 use std::{panic, string::String};
 
-use crate::{Cast, Narrowed, Value, idx, len32, prelude::*};
+use crate::{Cast, Int, Narrowed, Value, idx, len32};
 
 /// The 12 primitive integer types.
 const TYPES: [&str; 12] = ["u8", "u16", "u32", "u64", "u128", "usize", "i8", "i16", "i32", "i64", "i128", "isize"];
@@ -113,7 +114,7 @@ macro_rules! check_truncate {
         assert!(<$t>::BITS <= <$s>::BITS, "{} -> {} truncates into more bits", stringify!($s), stringify!($t));
         for v in edges!($s, $t) {
             assert_eq!(Cast::<$s, $t>::truncate(v), v as $t, "{} -> {} truncate of {v} is not `as`", stringify!($s), stringify!($t));
-            assert_eq!(v.truncate::<$t>(), v as $t);
+            assert_eq!(v.truncate_to::<$t>(), v as $t);
         }
     };
 }
@@ -162,4 +163,14 @@ fn conversions_are_const() {
     assert_eq!(len32(5), Ok(5));
     let negative = (-3i64).narrow::<u16>().expect_err("-3 is not a u16");
     assert_eq!(std::format!("{negative}"), "the i64 -3 does not fit in u16");
+}
+
+/// What `as` does in one step across a sign and a width is two named steps: sign-extend then
+/// reinterpret, or reinterpret then zero-extend.
+#[test]
+fn a_cast_across_sign_and_width_is_two_steps() {
+    for v in [i32::MIN, -1, 0, 1, i32::MAX] {
+        assert_eq!(v.widen_to::<i64>().cast_unsigned(), v as u64);
+        assert_eq!(v.cast_unsigned().widen_to::<u64>(), u64::from(v as u32));
+    }
 }

@@ -2,8 +2,8 @@
 //!
 //! ```text
 //! let scope = cx.scope();
-//! let a = scope.spawn("a", TASK_FRAME, |cx| read(cx, &dir));
-//! let b = scope.spawn("b", TASK_FRAME, |cx| read(cx, &dir));
+//! let a = scope.may_overlap("a", TASK_FRAME, |cx| read(cx, &dir));
+//! let b = scope.may_overlap("b", TASK_FRAME, |cx| read(cx, &dir));
 //! let (a, b) = (a.join(cx), b.join(cx));
 //! scope.join(cx)?;
 //! ```
@@ -31,7 +31,7 @@
 //! "Fibers and `Send`"). rustc checks `Send` across an `.await`, not across a fiber's wait: a
 //! task that holds an `Rc`, a lock guard or a thread-local borrow, waits and resumes on another
 //! thread is a data race rustc accepts. So, as rustc builds bstd: a new task may be placed on
-//! any worker ([`Scope::spawn`] places it, and [`crate::par`] spreads its chunks that way), and
+//! any worker ([`Scope::may_overlap`] places it, and [`crate::par`] spreads its chunks that way), and
 //! once it has started, every wait it resumes from resumes it there. Under `Inline` that holds
 //! by construction (a task runs on its spawner's thread to its end); a debug build checks it at
 //! every resume, and the simulation test `placement` holds a planted migration against it. The

@@ -27,6 +27,9 @@ fn clangs_frames_give_clangs_encodings() {
     assert_eq!(compact_aarch64(&d), Some(0x0400_0300));
     // A frame record and nothing else.
     assert_eq!(compact_aarch64(&clang_frame(&[])), Some(compact::FRAME));
+    // A pair not saved leaves no gap: the next saved pair takes its place (as `d8` takes
+    // -24 above).
+    assert_eq!(compact_aarch64(&clang_frame(&[(21, 22)])), Some(compact::FRAME | 0x002));
     // A leaf with no rows: frameless, no stack (clang's `leaf`: 0x02000000).
     assert_eq!(compact_aarch64(&[]), Some(compact::FRAMELESS));
 }
@@ -84,9 +87,9 @@ fn what_the_encoding_cannot_hold_keeps_dwarf() {
     let mut x18 = clang_frame(&[(19, 20)]);
     x18.push((0x18, Offset(18, -40)));
     refused(&x18, "a register outside the pairs");
-    let mut skipped = clang_frame(&[]);
-    skipped.extend([(0x18, Offset(21, -24)), (0x18, Offset(22, -32))]);
-    refused(&skipped, "x21/x22 where x19/x20 go");
+    let mut gap = clang_frame(&[]);
+    gap.extend([(0x18, Offset(21, -40)), (0x18, Offset(22, -48))]);
+    refused(&gap, "a gap where x19/x20 would go");
     refused(&[(4, Cfa(1, 0))], "a CFA on another register");
     refused(&[(4, Cfa(29, 32))], "a CFA on x29 at another offset");
     refused(&[(4, RestoreState)], "a restore with nothing remembered");

@@ -18,8 +18,7 @@ use blaze_sim::{Broke, Config, Tape, check, control};
 use super::{harness, key, oracle};
 use crate::parent::{Answer, Compiled, Config as ParentConfig, Effect, FastRecord, Found, Function, Parent};
 use crate::{
-    CodeId, CodeRef, FindingsRef, Hooks, InstanceKey, Nanos, Plant, RecordKey, SlotId, ThreadId,
-    Version, Why,
+    CodeId, CodeRef, FindingsRef, InstanceKey, Nanos, Plant, RecordKey, SlotId, ThreadId, Why,
 };
 
 const FUNCTIONS: u32 = 6;
@@ -35,10 +34,6 @@ fn code_of(slot: SlotId) -> CodeRef {
 /// What function `n` calls: the next one, and the one after.
 fn callees_of(slot: SlotId) -> [SlotId; 2] {
     [SlotId((slot.0 + 1) % FUNCTIONS), SlotId((slot.0 + 2) % FUNCTIONS)]
-}
-
-fn plain(slot: SlotId) -> Version {
-    Version { slot, hooks: Hooks::NONE }
 }
 
 pub(super) fn functions() -> Vec<Function> {
@@ -66,9 +61,8 @@ impl World {
     fn see(&mut self, effects: &mut Own<Effect, Global>, failing: Option<SlotId>) -> Result<(), Broke> {
         for effect in effects.drain(..) {
             match effect {
-                Effect::Lookup { version, .. } => self.lookups.push(version.slot),
-                Effect::Compile { version, .. } => {
-                    let slot = version.slot;
+                Effect::Lookup { slot, .. } => self.lookups.push(slot),
+                Effect::Compile { slot, .. } => {
                     oracle(!self.compiles.contains(&slot), || format!("slot {} was compiled twice at once", slot.0))?;
                     if let Some(lacked) = self.blocked.remove(&slot) {
                         let early = lacked.iter().find(|it| !self.made.contains(*it));
@@ -107,8 +101,8 @@ impl World {
                 Effect::Stop(error) => {
                     return Err(Broke::Oracle(format!("the run stopped at slot {}'s failed compile", error.slot.0)));
                 }
-                Effect::Untoggled { slot, .. } => {
-                    return Err(Broke::Harness(format!("slot {} untoggled with no toggle", slot.0)));
+                Effect::Hooks { slot, .. } => {
+                    return Err(Broke::Harness(format!("slot {} given hooks with no toggle", slot.0)));
                 }
                 Effect::Say(_) => {}
             }
@@ -172,7 +166,7 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
                 let slot = world.lookups.remove(tape.index(world.lookups.len(), "lookup"));
                 let callees = callees_of(slot);
                 let found = store.contains(&slot).then(|| Found { fast: code_of(slot), callees: &callees, optimized: None });
-                parent.looked(plain(slot), found, &mut out).map_err(harness)?;
+                parent.looked(slot, found, &mut out).map_err(harness)?;
             }
             2 if !world.compiles.is_empty() => {
                 let slot = world.compiles.remove(tape.index(world.compiles.len(), "compile"));
@@ -190,7 +184,7 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
                     store.insert(slot);
                     Compiled::Record(&record)
                 };
-                parent.compiled(plain(slot), ended, now, &mut out).map_err(harness)?;
+                parent.compiled(slot, ended, now, &mut out).map_err(harness)?;
             }
             3 if !world.makes.is_empty() => {
                 let made = world.makes.remove(tape.index(world.makes.len(), "made"));
@@ -239,7 +233,7 @@ fn an_overrun_compile_fails_its_askers_and_a_late_success_serves_later_ones() {
     parent.start(&[], &[], Nanos(0), &mut out).expect("started");
     out.clear();
     parent.need(ThreadId(1), SlotId(0), Nanos(0), &mut out).expect("needed");
-    parent.looked(plain(SlotId(0)), None, &mut out).expect("looked");
+    parent.looked(SlotId(0), None, &mut out).expect("looked");
     out.clear();
     parent.tick(Nanos(11), &mut out);
     let failed = out.iter().any(|effect| {
@@ -249,7 +243,7 @@ fn an_overrun_compile_fails_its_askers_and_a_late_success_serves_later_ones() {
     assert!(failed, "the asker was not failed past the bound: {out:?}");
     out.clear();
     let record = FastRecord { code: CodeRef(key(5)), callees: Own::new_in(Global), reads: Own::new_in(Global) };
-    parent.compiled(plain(SlotId(0)), Compiled::Record(&record), Nanos(12), &mut out).expect("a late end");
+    parent.compiled(SlotId(0), Compiled::Record(&record), Nanos(12), &mut out).expect("a late end");
     assert!(out.iter().any(|effect| matches!(effect, Effect::Publish { .. })), "{out:?}");
     out.clear();
     parent.need(ThreadId(2), SlotId(0), Nanos(13), &mut out).expect("needed again");

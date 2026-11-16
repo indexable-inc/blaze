@@ -1,14 +1,15 @@
 //! [`Tests`]: what each test entered, and which tests an edit affects.
 //!
-//! A test run is a program run whose entry calls each test. While a test runs, the functions it
-//! enters are marked: one byte a slot in the test's lane table (a lane is one test worker's; the
-//! fast tier's prologue stores 1 to `lanes[lane][slot]`, the lane read from a thread-local the
-//! test harness sets and a thread the test starts inherits). At the test's end the control thread
-//! reads the bytes set and clears them ([`entered`]); an optimized body counts as entering each
-//! body it absorbed, since their prologues no longer run. Each test's record lists the code
-//! identities it entered (blaze-keyed's `TestRun`, whose asks they are), and [`Tests`] keeps the
-//! postings from each identity to the tests that entered it, so [`Tests::affected`] is one lookup
-//! per changed identity, never a scan of the tests.
+//! A test run is a program run whose entry calls each test. Nothing in a function's code marks
+//! it: while tests run, each slot word is a mark stub ([`crate::Watch::MARK`]), which stores 1 to
+//! the slot's byte in the calling thread's bitmap and jumps through the body word. At a test's
+//! end the control thread reads the bytes set in the bitmaps of the test's threads (its worker
+//! and the threads it started) and clears them; [`entered`] takes those slots and adds, for each
+//! optimized body among them, what the optimizer inlined into it, since an inlined callee is
+//! never called through its own slot. Each test's record lists the code identities it entered
+//! (blaze-keyed's `TestRun`, whose asks they are), and [`Tests`] keeps the postings from each
+//! identity to the tests that entered it, so [`Tests::affected`] is one lookup per changed
+//! identity, never a scan of the tests.
 
 #![blaze::sans_io]
 

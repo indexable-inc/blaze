@@ -164,8 +164,8 @@ fn draw_case(tape: &Tape) -> Case {
 fn draw_expr(
     tape: &Tape,
     body: &mut BodyBuf,
-    locals: &Vec<(PatId, Option<u32>), Global>,
-    structs: &Vec<ToyStruct, Global>,
+    locals: &[(PatId, Option<u32>)],
+    structs: &[ToyStruct],
 ) -> (ExprId, Option<u32>) {
     let (p, s) = locals[tape.index(locals.len(), "local")];
     match tape.below(6, "expr") {
