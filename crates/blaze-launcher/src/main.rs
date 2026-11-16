@@ -1,20 +1,17 @@
-//! blaze's launcher: the process a program built for `edit` runs in
+//! blaze's launcher: the process a program runs in under `blaze run` and `blaze test`
 //! (docs/v2/plan/design/launcher.md, section 2).
 //!
-//! The file at cargo's path (`target/debug/hello`) is a clone of this binary; beside it, the
-//! sidecar `hello.blaze-program` names the program and the socket of the daemon that built
-//! it. Started, with the program's own arguments and environment, the launcher:
+//! The file a program runs from is a clone of this binary; beside it, the sidecar
+//! `<exe>.blaze-program` names the program and the socket of the process that serves its code
+//! records. Started, with the program's own arguments and environment, the launcher:
 //!
-//! 1. reads the sidecar and the program's start file (`hello.blaze-start`, the image of its
-//!    start the daemon placed beside it, where there is one) and connects to the daemon. With
-//!    no daemon listening it starts from the start file and asks no one until a first call
-//!    the image does not hold, which starts the daemon the sidecar names; with no start file
-//!    either, it starts that daemon now; with a sidecar that names none, it stops and says so;
+//! 1. reads the sidecar and connects to the socket it names; with nothing listening there it
+//!    stops and says so;
 //! 2. maps its code area and starts its control thread, which says `Hello` and from then on
 //!    is the one thread that writes code (`blaze_launch_rt::control`);
-//! 3. waits for the daemon's word to start, runs the program's initializers as the system's
-//!    loader would (`argc`, `argv`, `envp`), and calls its `main(argc, argv)` on this, the
-//!    process's first thread;
+//! 3. waits for the word to start, runs the program's initializers as the system's loader
+//!    would (`argc`, `argv`, `envp`), and calls its `main(argc, argv)` on this, the process's
+//!    first thread;
 //! 4. ends with what `main` returned, through `exit`, as a linked program's start code does.
 //!
 //! The program is this process: its arguments, environment, descriptors, signals and exit
@@ -22,8 +19,7 @@
 //! code here until it is first called.
 //!
 //! Told to start again (an edit that cannot be applied to a running program), the control
-//! thread `execv`s this file with the same arguments: the same process id and terminal, on
-//! the code the daemon has now.
+//! thread `execv`s this file with the same arguments: the same process id and terminal.
 
 // The launcher's own messages go to its stderr, as a loader's do: it has no other channel.
 #![cfg(any(
@@ -38,7 +34,6 @@ use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
 use blaze_launch::wire::ProgramId;
-use blaze_launch_rt::control::{Held, Join};
 use blaze_launch_rt::{Config, Driver, Loaded};
 
 /// The exit status of a launcher that could not start its program: as a shell's for a
@@ -54,14 +49,9 @@ fn stop(status: i32, why: &str) -> ! {
 
 /// What a sidecar says.
 struct Sidecar {
-    /// The socket of the daemon that built the program.
+    /// The socket of the process that serves the program's code records.
     socket: PathBuf,
     program: ProgramId,
-    /// The daemon's own `blaze`, which starts one again; `None` in a sidecar before it said.
-    blaze: Option<PathBuf>,
-    /// The daemon's state directory and the `BLAZE_HOME` it was started with (`None`: none).
-    state: Option<PathBuf>,
-    home: Option<PathBuf>,
 }
 
 /// The sidecar beside `exe`, `<exe>.blaze-program`: one `name=value` a line.
@@ -71,30 +61,25 @@ fn sidecar(exe: &Path) -> Result<Sidecar, String> {
     let path = PathBuf::from(path);
     let text = std::fs::read_to_string(&path).map_err(|why| {
         format!(
-            "{} is a program built by blaze for `edit` (a clone of blaze's launcher) and its sidecar {} \
-             does not read: {why}. Build it again with blaze",
+            "{} is a clone of blaze's launcher and its sidecar {} does not read: {why}. Run it with \
+             `blaze run`",
             exe.display(),
             path.display()
         )
     })?;
     let line = |name: &str| text.lines().find_map(|line| line.strip_prefix(name)?.strip_prefix('='));
     let field = |name: &str| {
-        line(name).ok_or_else(|| {
-            format!("the sidecar {} has no `{name}`: build the program again with blaze", path.display())
-        })
+        line(name).ok_or_else(|| format!("the sidecar {} has no `{name}`: run the program with `blaze run`", path.display()))
     };
     let socket = PathBuf::from(field("socket")?);
     let hex = field("program")?;
     let Some(id) = hex32(hex) else {
         return Err(format!(
-            "the sidecar {} names program `{hex}`, which is no 64 hex digits: build the program again with blaze",
+            "the sidecar {} names program `{hex}`, which is no 64 hex digits: run the program with `blaze run`",
             path.display()
         ));
     };
-    // The three a daemon writes since a launcher could start one: a sidecar without them is
-    // read as before, and a launcher of it needs its daemon listening.
-    let named = |name: &str| line(name).filter(|it| !it.is_empty()).map(PathBuf::from);
-    Ok(Sidecar { socket, program: ProgramId(id), blaze: named("blaze"), state: named("state"), home: named("home") })
+    Ok(Sidecar { socket, program: ProgramId(id) })
 }
 
 /// 64 hex digits as 32 bytes.
@@ -113,99 +98,15 @@ fn hex32(hex: &str) -> Option<[u8; 32]> {
     whole.then_some(id)
 }
 
-/// The start file's head: `"bzstart1" | [32] check | [32] program | [32] record`
-/// (blaze-launch-host's `start::HEAD`).
-const START_HEAD: usize = 104;
-
-/// The start file's trailer: `u64 at | u64 len | "bzstartE"`, the frame's place in it.
-const START_TRAILER: usize = 24;
-
-/// A start file read whole: its bytes, where its `Tell::Image` frame is in them, and its
-/// image's check word.
-struct StartFile {
-    bytes: Vec<u8>,
-    frame: std::ops::Range<usize>,
-    check: [u8; 32],
-}
-
-/// The program's start file, `<exe>.blaze-start`, read whole where it is there: the image the
-/// daemon placed beside the program once it was durable, of the build the program's file is
-/// of (the daemon removes it when a build gives the program another). `None`: no file. A file
-/// of another program, or whose trailer does not name a frame inside it, stops the launcher
-/// naming why: the daemon writes it whole or not at all.
-fn start_file(exe: &Path, program: &ProgramId) -> Result<Option<StartFile>, String> {
-    let mut path = exe.as_os_str().to_owned();
-    path.push(".blaze-start");
-    let path = PathBuf::from(path);
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(why) if why.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(why) => return Err(format!("the program's start file {} does not read: {why}", path.display())),
-    };
-    let bad = |what: String| format!("the program's start file {} {what}: build the program again with blaze", path.display());
-    if bytes.len() < START_HEAD + START_TRAILER || &bytes[..8] != b"bzstart1" {
-        return Err(bad(format!("is no start image of this layout ({} bytes)", bytes.len())));
-    }
-    let id = |at: usize| <[u8; 32]>::try_from(&bytes[at..at + 32]).expect("32 bytes");
-    let check = id(8);
-    if id(40) != program.0 {
-        return Err(bad(format!(
-            "is of program {}, and its sidecar names program {}",
-            hex(&id(40)),
-            hex(&program.0)
-        )));
-    }
-    let tail = bytes.len() - START_TRAILER;
-    let word = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().expect("8 bytes"));
-    if &bytes[tail + 16..] != b"bzstartE" {
-        return Err(bad(format!("has no trailer at byte {tail}")));
-    }
-    let (at, len) = (word(tail), word(tail + 8));
-    let frame = usize::try_from(at)
-        .ok()
-        .zip(usize::try_from(len).ok())
-        .and_then(|(at, len)| Some(at..at.checked_add(len)?))
-        .filter(|frame| frame.start >= START_HEAD && frame.end <= tail);
-    match frame {
-        Some(frame) => Ok(Some(StartFile { bytes, frame, check })),
-        None => Err(bad(format!("names a frame of {len} bytes at byte {at}, which is not between its head and its trailer at {tail}"))),
-    }
-}
-
-/// 32 bytes as hex.
-fn hex(id: &[u8; 32]) -> String {
-    id.iter().map(|it| format!("{it:02x}")).collect() // alloc: an error's name, once
-}
-
-/// What starts the daemon the sidecar names and connects to it: `None` where the sidecar
-/// does not say how (one written before a launcher could).
-fn joiner(side: &Sidecar) -> Option<Box<dyn FnMut() -> Result<UnixStream, String> + Send>> {
-    let (blaze, state) = (side.blaze.clone()?, side.state.clone()?); // clone: the closure's own, once a process
-    let homes = blaze_client::start::Homes {
-        socket: side.socket.clone(), // clone: as above
-        state,
-        home: side.home.clone(), // clone: as above
-    };
-    Some(Box::new(move || {
-        use blaze_core::wait::{Clock as _, Deadline, Monotonic};
-        let clock = Monotonic::new();
-        let deadline = Deadline::after(clock.now(), blaze_launch_rt::control::JOIN_WITHIN);
-        blaze_client::start::daemon(&homes, &blaze, deadline, &clock)
-            .map_err(|why| format!("starting the daemon with {}: {why}", blaze.display()))?;
-        UnixStream::connect(&homes.socket)
-            .map_err(|why| format!("the daemon started and does not answer at {}: {why}", homes.socket.display()))
-    }))
-}
-
-/// The path this process was started from, read once at its start: a build places a new
-/// file at the path while the program runs, and the file this process maps is then one the
-/// system no longer names.
+/// The path this process was started from, read once at its start: a new file may be placed
+/// at the path while the program runs, and the file this process maps is then one the system
+/// no longer names.
 static STARTED_FROM: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// Starts the program again in place: the file at the path this process was started from,
 /// with this process's arguments and environment. It does not return: where the program
 /// cannot be started again the process ends, saying why, since what it would run on is code
-/// the daemon has replaced (rule `no-fallback`).
+/// that was replaced (rule `no-fallback`).
 fn restart(why: &str) -> String {
     let _ = writeln!(std::io::stderr().lock(), "blaze: restart needed: {why}");
     let Some(exe) = STARTED_FROM.get() else {
@@ -246,34 +147,17 @@ fn main() {
         Err(why) => stop(CANNOT_RUN, &why),
     };
     let program = side.program;
-    let start_file = match start_file(&exe, &program) {
-        Ok(found) => found,
-        Err(why) => stop(CANNOT_RUN, &why),
-    };
-    // A daemon listening is asked; with none, the program starts from its start file and a
-    // daemon is started at its first call the image does not hold; with no start file either,
-    // one is started now, where the sidecar says how.
-    let join = match UnixStream::connect(&side.socket) {
-        Ok(socket) => Join::Now(socket),
-        Err(why) => match (blaze_client::start::nothing_listens(&why), &start_file, joiner(&side)) {
-            (true, Some(_), Some(join)) => Join::Later(join),
-            (true, None, Some(mut join)) => match join() {
-                Ok(socket) => Join::Now(socket),
-                Err(started) => stop(
-                    CANNOT_RUN,
-                    &format!("{} runs under blaze's launcher, no daemon answers at {}, and {started}", exe.display(), side.socket.display()),
-                ),
-            },
-            _ => stop(
-                CANNOT_RUN,
-                &format!(
-                    "{} runs under blaze's launcher, and the daemon that built it does not answer at {}: {why}. \
-                     Build it again (`blaze build` or `blaze run`), which starts the daemon",
-                    exe.display(),
-                    side.socket.display()
-                ),
+    let socket = match UnixStream::connect(&side.socket) {
+        Ok(socket) => socket,
+        Err(why) => stop(
+            CANNOT_RUN,
+            &format!(
+                "{} runs under blaze's launcher, and nothing serves its code at {}: {why}. Run it with \
+                 `blaze run`",
+                exe.display(),
+                side.socket.display()
             ),
-        },
+        ),
     };
     let driver = match Driver::new(Config::PROGRAM) {
         Ok(driver) => driver,
@@ -292,8 +176,7 @@ fn main() {
             Ok(records) => records,
             Err(why) => stop(CANNOT_RUN, &format!("the launcher could not map the program's data: {why}")),
         };
-        let held = start_file.as_ref().map(|file| Held { frame: &file.bytes[file.frame.clone()], check: file.check });
-        let (_driver, served) = blaze_launch_rt::run(driver, join, held, program, &mut records, ready, restart);
+        let (_driver, served) = blaze_launch_rt::run(driver, socket, None, program, &mut records, ready, restart);
         if let Err(why) = served {
             stop(101, &format!("the launcher stopped serving code: {why}"));
         }
@@ -301,8 +184,8 @@ fn main() {
     if let Err(why) = control {
         stop(CANNOT_RUN, &format!("the launcher's control thread did not start: {why}"));
     }
-    // The wait: for the daemon's word to start the program (its statics are defined), or
-    // for why it cannot; it ends when the daemon answers or its socket closes.
+    // The wait: for the word to start the program (its statics are defined), or for why it
+    // cannot; it ends when the other side answers or its socket closes.
     let start = match start.recv() {
         Ok(Ok(start)) => start,
         Ok(Err(why)) => stop(CANNOT_RUN, &format!("{} cannot start: {why}", exe.display())),

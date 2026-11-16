@@ -485,7 +485,7 @@ fn tier_zero_code_runs_in_the_launcher_compiled_on_first_call_and_edited_while_i
         let served =
             blaze_launch_rt::run(
                 driver,
-                blaze_launch_rt::control::Join::Now(ours),
+                ours,
                 None,
                 ProgramId([3; 32]),
                 &mut records,

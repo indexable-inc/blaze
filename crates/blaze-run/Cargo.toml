@@ -1,0 +1,25 @@
+[package]
+name = "blaze-run"
+description = "`blaze run` and `blaze test` as sans-IO state machines (docs/v2/plan/design/run.md): the parent that answers a running program's needs, the program's slot words and epochs, heat and the optimizing tier, the registry of live runs and its event stream, and the test index that says which tests an edit affects"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+# No dependency: the crate's small types (keys, record handles, slots, threads) are its own
+# until the crates that own them are built on the new item layer; lib.rs says which each becomes.
+[dependencies]
+
+[dev-dependencies]
+# `check` and `control`: every machine's simulation and its planted-bug controls.
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

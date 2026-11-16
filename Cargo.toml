@@ -323,6 +323,7 @@ blaze-file-items = { path = "crates/blaze-file-items" } # A file's text to its o
 blaze-surface = { path = "crates/blaze-surface" }
 # The fresh core's vocabulary: record kinds, keys, the store, memo, executor and driver interfaces.
 blaze-keyed = { path = "crates/blaze-keyed" }
+blaze-run = { path = "crates/blaze-run" } # `blaze run`/`blaze test` as sans-IO machines (docs/v2/plan/design/run.md).
 # The host of the keyed driver (docs/v2/plan/design/host.md): a unit's keys from its own text,
 # the front end's tasks, and the process that performs the driver's effects.
 blaze-unitkey = { path = "crates/blaze-unitkey" }
