@@ -16,7 +16,7 @@
 
 use std::{fmt, hash, marker::PhantomData};
 
-use blaze_mem::swiss::Index;
+use blaze_swiss::Index;
 
 #[allow(
     clippy::disallowed_types,
@@ -42,6 +42,10 @@ pub use blaze_radix as radix;
 pub use blaze_rng as rng;
 mod std_hash;
 mod sync;
+// serde's forms of the IDs, for the crates above that persist them with serde: behind the
+// `serde` feature, which they turn on (the root manifest's entry), so this crate depends on no
+// crate from outside the workspace (docs/v2/plan/design/bottom.md, "Also decided on 2026-11-15").
+#[cfg(feature = "serde")]
 mod wire;
 
 pub use blaze_hash::fixed_width_writes;
@@ -73,10 +77,10 @@ impl ContentId {
     /// `inputs.iter().map(|it| ContentId::of(domain, it))`, many inputs a SIMD lane each.
     ///
     /// An input of at most one BLAKE3 chunk (1 KiB) is hashed as one chunk: its blocks
-    /// before the last go through `hash_many` beside the other inputs with as many (AVX-512
-    /// hashes 16 at once, NEON 4), and its last block, whatever its length, is compressed
-    /// beside seven other inputs' last blocks. A longer input goes through the hasher, which
-    /// uses SIMD within it.
+    /// before the last are compressed beside the other inputs with as many (16 at once on
+    /// AVX-512, 8 elsewhere), and its last block, whatever its length, beside other inputs'
+    /// last blocks. A longer input goes through the hasher, which hashes its whole chunks
+    /// side by side.
     pub fn of_many(domain: &'static str, inputs: &[&[u8]]) -> Vec<ContentId> {
         many::of_many(context_key(domain), inputs)
     }
@@ -331,7 +335,7 @@ pub trait Interner<T>: Sync {
 }
 
 /// The [`Interner`] of blaze v2: values in an append-only arena of chunks that never move,
-/// found by content ID in one of [`shard_count`] [`blaze_mem::swiss::Index`]es.
+/// found by content ID in one of [`shard_count`] [`blaze_swiss::Index`]es.
 ///
 /// [`Interner::get`], [`Interner::content`] and [`Interner::find`] take no lock. Interning a
 /// new value computes it first, then locks the one shard its content ID falls in only to look
@@ -892,7 +896,7 @@ mod model {
     struct Model {
         interner: Sharded<Counted>,
         ids: Vec<ContentId>,
-        made: blaze_core::lock::Lock<Vec<Arc<AtomicBool>>>,
+        made: Lock<Vec<Arc<AtomicBool>>>,
         history: History<Set>,
     }
 
@@ -904,7 +908,7 @@ mod model {
             Arc::new(Model {
                 interner: Sharded::new(),
                 ids,
-                made: blaze_core::lock::Lock::new("ids.test.made", Vec::new()),
+                made: Lock::new("ids.test.made", Vec::new()),
                 history: History::new(),
             })
         }

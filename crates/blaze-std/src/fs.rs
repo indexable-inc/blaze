@@ -767,12 +767,11 @@ impl Dir<ReadWrite> {
     /// driver's to bound, with an effect blaze-core does not have yet.
     ///
     /// The contract: the directory it gives has at most `bytes` left, whatever it is inside.
-    pub fn quota(&self, bytes: u64) -> (r: Dir<ReadWrite>)
-        ensures match r.quota_left() {
-            Some(left) => left <= bytes,
-            None => false,
-        }
-    {
+    #[core::contracts::ensures(move |r: &Dir<ReadWrite>| match r.quota_left() {
+        Some(left) => left <= bytes,
+        None => false,
+    })]
+    pub fn quota(&self, bytes: u64) -> Dir<ReadWrite> {
         // clone: authority held, narrowed: a refcount each, the budget this one is inside too.
         let quota = Some(Budget::new(bytes, self.quota.clone()));
         Dir { io: self.io.clone(), base: self.base.clone(), quota, rights: PhantomData }

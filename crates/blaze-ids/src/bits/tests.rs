@@ -1,7 +1,9 @@
 use std::{collections::BTreeSet, sync::Arc, thread};
 
 use blaze_sim::Config;
+#[cfg(feature = "smallvec")]
 use smallvec::SmallVec;
+#[cfg(feature = "thin-vec")]
 use thin_vec::ThinVec;
 
 use crate::rng::SplitMix64;
@@ -286,6 +288,7 @@ fn bits_are_a_set() {
 }
 
 /// hir-def's lists of impls: a bit per position pushed beside the list, past its end clear.
+#[cfg(feature = "thin-vec")]
 #[test]
 fn a_set_kept_beside_a_list_has_the_lists_words() {
     let mut beside = Bits::<ThinVec<u64>>::default();
@@ -300,6 +303,7 @@ fn a_set_kept_beside_a_list_has_the_lists_words() {
 }
 
 /// hir-def's enum variants: inline up to 64, cut to the variants kept.
+#[cfg(feature = "smallvec")]
 #[test]
 fn a_small_set_is_inline_and_truncates() {
     let mut set = Bits::<SmallVec<[u64; 1]>>::new(130);

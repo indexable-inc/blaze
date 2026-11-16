@@ -23,8 +23,14 @@
 
 use std::{alloc::Allocator, fmt, hash, iter::FusedIterator, marker::PhantomData, ops::Range};
 
+// The storage and persistence of crates from outside the workspace, each behind the feature
+// of its name, which the crates above that use them turn on (the root manifest's entry): this
+// crate itself depends on none (docs/v2/plan/design/bottom.md, "Also decided on 2026-11-15").
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+#[cfg(feature = "smallvec")]
 use smallvec::SmallVec;
+#[cfg(feature = "thin-vec")]
 use thin_vec::ThinVec;
 
 use crate::sync::atomic::{AtomicU64, Ordering};
@@ -202,6 +208,7 @@ impl WordsMut for &mut [u64] {
     }
 }
 
+#[cfg(feature = "smallvec")]
 impl<const N: usize> Words for SmallVec<[u64; N]>
 where
     [u64; N]: smallvec::Array<Item = u64>,
@@ -212,6 +219,7 @@ where
     }
 }
 
+#[cfg(feature = "smallvec")]
 impl<const N: usize> WordsMut for SmallVec<[u64; N]>
 where
     [u64; N]: smallvec::Array<Item = u64>,
@@ -222,6 +230,7 @@ where
     }
 }
 
+#[cfg(feature = "smallvec")]
 impl<const N: usize> GrowWords for SmallVec<[u64; N]>
 where
     [u64; N]: smallvec::Array<Item = u64>,
@@ -235,6 +244,7 @@ where
     }
 }
 
+#[cfg(feature = "thin-vec")]
 impl Words for ThinVec<u64> {
     #[inline]
     fn words(&self) -> &[u64] {
@@ -242,6 +252,7 @@ impl Words for ThinVec<u64> {
     }
 }
 
+#[cfg(feature = "thin-vec")]
 impl WordsMut for ThinVec<u64> {
     #[inline]
     fn words_mut(&mut self) -> &mut [u64] {
@@ -249,6 +260,7 @@ impl WordsMut for ThinVec<u64> {
     }
 }
 
+#[cfg(feature = "thin-vec")]
 impl GrowWords for ThinVec<u64> {
     fn resize_words(&mut self, len: usize) {
         self.resize(len, 0); // alloc: a growable set's words, grown to its domain once
@@ -731,12 +743,14 @@ impl<S: Words, I> fmt::Debug for Bits<S, I> {
 }
 
 /// Its words, as `S` writes them: a `Vec` set persists as the `Vec`.
+#[cfg(feature = "serde")]
 impl<S: Serialize, I> Serialize for Bits<S, I> {
     fn serialize<Z: Serializer>(&self, serializer: Z) -> Result<Z::Ok, Z::Error> {
         self.words.serialize(serializer)
     }
 }
 
+#[cfg(feature = "serde")]
 impl<'de, S: Deserialize<'de>, I> Deserialize<'de> for Bits<S, I> {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         S::deserialize(deserializer).map(Bits::from_words)

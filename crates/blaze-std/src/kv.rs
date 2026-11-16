@@ -113,14 +113,13 @@ impl Key {
     /// `raw` as a key, or why it is none.
     ///
     /// The contract: a key is 1 to [`KEY_MOST`] bytes.
+    #[core::contracts::ensures(|r: &Result<Key, KeyError>| match r {
+        Ok(key) => !key.as_str().is_empty() && key.as_str().len() <= KEY_MOST,
+        Err(_) => true,
+    })]
     #[blaze::pure]
     #[blaze::nonblocking]
-    pub fn new(raw: &str) -> (r: Result<Key, KeyError>)
-        ensures match &r {
-            Ok(key) => !key.as_str().is_empty() && key.as_str().len() <= KEY_MOST,
-            Err(_) => true,
-        }
-    {
+    pub fn new(raw: &str) -> Result<Key, KeyError> {
         if let Some(why) = refused(raw) {
             // alloc: an error's message.
             return Err(KeyError { key: raw.to_owned(), why });

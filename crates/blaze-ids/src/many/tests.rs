@@ -1,6 +1,6 @@
 //! The leading blocks are the same chaining values however many lanes compress them, and on
 //! AVX-512 when the CPU has it; the last blocks are the same IDs at every width and on every
-//! x86 path; the register transposes are the scalar one.
+//! x86 path; the register transposes (`blaze_blake3::lanes`') are the scalar one.
 
 use super::*;
 
@@ -9,13 +9,6 @@ fn noise(len: usize, seed: u64) -> Vec<u8> {
     (0..len).map(|_| rng.next_u64() as u8).collect()
 }
 
-#[cfg(all(
-    target_endian = "little",
-    any(
-        all(target_arch = "x86_64", target_os = "linux"),
-        all(target_arch = "aarch64", any(target_os = "linux", target_os = "macos")),
-    ),
-))]
 #[test]
 fn leading_blocks_are_alike_at_every_width() {
     let key = words_of(&b3::context_key("blaze v2 many lanes 1"));
@@ -31,7 +24,7 @@ fn leading_blocks_are_alike_at_every_width() {
             leading_lanes(&key, &inputs, &members, blocks, &mut dispatched);
             assert_eq!(eight, sixteen, "{blocks} blocks, {count} members");
             assert_eq!(eight, dispatched, "{blocks} blocks, {count} members");
-            #[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+            #[cfg(target_arch = "x86_64")]
             {
                 if std::arch::is_x86_feature_detected!("avx512f") {
                     let mut wide = Vec::new();

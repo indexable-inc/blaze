@@ -656,6 +656,9 @@ unexpected_cfgs = { level = "warn", check-cfg = [
     'cfg(bootstrap)',
     "cfg(no_async_drops)",
     "cfg(blaze_check)",
+    # Set by blaze for every crate it compiles: what needs blaze's extensions (crates/blaze-std;
+    # docs/v2/plan/design/std.md, "Two builders").
+    "cfg(blaze)",
 ] }
 unused_extern_crates = "warn"
 unused_lifetimes = "warn"

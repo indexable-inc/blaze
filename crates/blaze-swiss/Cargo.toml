@@ -1,0 +1,27 @@
+[package]
+name = "blaze-swiss"
+description = "The SwissTable group probe every interner's table shares, and `Index`, the lock-free-read table of `u32`s on it; no dependencies, so the bottom of the tree reaches it (moved from blaze-mem's `swiss`)"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+
+[target.'cfg(blaze_check)'.dependencies]
+blaze-check.workspace = true
+
+[dev-dependencies]
+blaze-alloc-count.workspace = true
+blaze-rng.workspace = true
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

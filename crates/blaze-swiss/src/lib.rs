@@ -1,8 +1,9 @@
 //! The SwissTable group probe every interner's table shares (docs/v2/plan/design/data.md,
 //! "interner and memo lookups"): `intern`'s arena store and mapped index, and the query engine's
-//! interned key map. `intern` re-exports it as `intern::swiss`; it lives here, a
-//! leaf every table's crate already depends on, so `blaze-query` and `blaze-ids` reach it without
-//! `intern`'s image and format crates.
+//! interned key map. `blaze-mem` re-exports it as `blaze_mem::swiss` and `intern` as
+//! `intern::swiss`; it is a crate of its own with no dependencies, so `blaze-ids`, at the bottom
+//! of the tree, reaches it without `blaze-mem`'s allocators, channels and system calls
+//! (docs/v2/plan/design/bottom.md, "Also decided on 2026-11-15").
 //!
 //! A table is a power of two of groups; a group is a [`Ctrl`] word of tag bytes beside its
 //! slots. A lookup of `hash` starts at the group `hash & mask` and goes on group by group
@@ -18,10 +19,25 @@
 //! one table built on them here: `u32`s naming a column the caller keeps, which every
 //! interner keyed by an index (`blaze_ids::Sharded`, the hash-conser, base-db's tables) uses.
 
-use crate::sync::{
+#![deny(unsafe_code)]
+
+// The atomics are `std`'s, or under `cfg(blaze_check)` the model checker's
+// (docs/v2/plan/design/model-checker.md "The switch").
+#[cfg(blaze_check)]
+use blaze_check::sync::{
     OnceLock,
     atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
+#[cfg(not(blaze_check))]
+use std::sync::{
+    OnceLock,
+    atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
+};
+
+/// Counts allocations so the probe's tests hold it to none.
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: blaze_alloc_count::Counting = blaze_alloc_count::Counting;
 
 /// The tag of an empty slot.
 pub const EMPTY: u8 = 0;
@@ -612,12 +628,10 @@ mod tests {
     #[test]
     #[expect(
         clippy::disallowed_types,
-        reason = "below blaze-core: blaze-mem is a dependency of blaze-core; the test's one writer at a time, which `Index` asks of its caller: a test thread, not the allocator"
+        reason = "below blaze-core and its named locks, with no dependencies: the test's one writer at a time, which `Index` asks of its caller, a test thread"
     )]
     fn readers_race_a_growing_index() {
-        use std::sync::atomic::AtomicU64 as Key;
-
-        use parking_lot::Mutex;
+        use std::sync::{Mutex, atomic::AtomicU64 as Key};
 
         const KEYS: usize = 20_000;
         let index = Index::new();
@@ -628,7 +642,7 @@ mod tests {
             if let Some(value) = index.find(hash_of(key), is) {
                 return value;
             }
-            let mut len = len.lock();
+            let mut len = len.lock().expect("the test's writer lock: no writer panicked");
             if let Some(value) = index.find(hash_of(key), is) {
                 return value;
             }
@@ -658,7 +672,7 @@ mod tests {
                 });
             }
         });
-        assert_eq!(*len.lock(), KEYS / 2);
+        assert_eq!(*len.lock().expect("the test's writer lock: no writer panicked"), KEYS / 2);
     }
 
     /// A probe reads one line: every group of every level starts on a 32-byte boundary, so its
@@ -713,7 +727,7 @@ mod tests {
     }
 }
 
-/// Under the model checker (`RUSTFLAGS="--cfg blaze_check" blaze test -p blaze-mem --release
+/// Under the model checker (`RUSTFLAGS="--cfg blaze_check" blaze test -p blaze-swiss --release
 /// model_swiss`): one writer filling an [`Index`]'s first table and growing it while a reader
 /// finds a value from before the growth and one inserted during it.
 #[cfg(all(test, blaze_check))]

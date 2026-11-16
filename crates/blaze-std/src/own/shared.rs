@@ -57,6 +57,10 @@ macro_rules! shared {
             /// the value comes back from the last [`release`](Self::release).
             #[blaze::consumes]
             pub fn holding(value: T) -> $name<T> {
+                // Under rustc `Acyclic` is held of every type (own.rs): the walk is asserted
+                // here, for the instance, as it is compiled.
+                #[cfg(not(blaze))]
+                let () = const { assert!(super::reach::none::<T, super::reach::Cycle>()) };
                 $name { inner: $inner::new(value) }
             }
 

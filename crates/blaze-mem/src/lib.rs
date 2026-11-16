@@ -76,7 +76,9 @@ pub mod region_vec;
 pub mod revision;
 pub mod scratch;
 mod stack;
-pub mod swiss;
+/// The SwissTable group probe, a crate of its own below this one (`blaze-swiss`), so the bottom
+/// of the tree (`blaze-ids`) reaches it without this crate's dependencies.
+pub use blaze_swiss as swiss;
 pub mod syscalls;
 mod sync;
 pub mod tag;

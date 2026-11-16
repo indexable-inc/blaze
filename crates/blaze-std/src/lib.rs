@@ -101,15 +101,17 @@
 // A field marked `#[blaze::policy]` (a cost or a guarantee its maker decides) is never chosen
 // by a `Default` or a `new()` that takes nothing (std.md, "The second rule").
 #![warn(blaze::default_policy)]
+// Two builders (std.md, "Two builders"): what is plain Rust is compiled by rustc and by blaze;
+// what needs blaze's extensions is under `cfg(blaze)`, the cfg blaze sets for every crate it
+// compiles, each with a plain form under `cfg(not(blaze))` that says what the extension adds.
+#![cfg_attr(blaze, feature(blaze_comptime, blaze_const_exprs, blaze_verify))]
 #![feature(
     allocator_ext,
     atomic_internals,
-    blaze_comptime,
-    blaze_const_exprs,
-    blaze_verify,
     coerce_unsized,
     const_cmp,
     const_trait_impl,
+    contracts,
     core_intrinsics,
     custom_inner_attributes,
     generic_atomic,
@@ -128,13 +130,20 @@
               has to name; `rustc_attrs` for `#[rustc_comptime]` on `own`'s walk, which calls \
               reflection's compile-time-only functions and so is compile-time-only itself"
 )]
+#![allow(
+    incomplete_features,
+    reason = "`contracts`: nightly's `#[core::contracts::ensures]`, the one contract form both \
+              builders read"
+)]
 #![register_tool(blaze)]
 
 // Contracts (ledger V3; docs/v2/plan/design/contracts.md): bstd's functions state what they
-// promise as native `requires` and `ensures` clauses (`blaze_verify`), checked in the dev and
-// test profiles. The first are on `budget`, `clock`, `kv` and `fs` (std.md, "Contracts");
-// each `ensures` names only its return and by-value arguments, which is what the lowering is
-// known to take.
+// promise as nightly's `#[core::contracts::ensures(..)]`, which rustc and blaze both read (blaze
+// lowers it as the pinned nightly does: contracts.md, part 0), and which both run under
+// `cfg(contract_checks)` (`-Zcontract-checks`). The native `requires`/`ensures` clauses
+// (`blaze_verify`) are syntax rustc cannot parse, so they wait until blaze is the only builder;
+// `blaze::native_contracts` then rewrites these. The first are on `budget`, `clock`, `kv` and
+// `fs` (std.md, "Contracts"); each `ensures` names only its return and by-value arguments.
 extern crate alloc;
 
 pub mod args;

@@ -27,12 +27,11 @@ impl Instant {
     /// once zero then, unsaid).
     ///
     /// The contract: it answers exactly when `earlier` is not the later one.
+    #[core::contracts::ensures(move |r: &Option<Duration>| r.is_some() == (earlier.0 <= self.0))]
     #[blaze::pure]
     #[blaze::noalloc]
     #[blaze::nonblocking]
-    pub fn since(self, earlier: Instant) -> (r: Option<Duration>)
-        ensures r.is_some() == (earlier.0 <= self.0)
-    {
+    pub fn since(self, earlier: Instant) -> Option<Duration> {
         self.0.checked_sub(earlier.0)
     }
 

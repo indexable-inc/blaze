@@ -52,11 +52,21 @@ pub use reach::{
 pub use shared::{LocalShared, Released, Shared};
 pub use shares::Shares;
 
-// SAFETY: the walk for `Cycle` cleared `T`: from a `T`, through everything it owns, no
-// counted pointer that can be set after the value exists leads back to `T`, and nothing on the
-// way was a type the walk could not see into. A value owns itself only through such a pointer
-// (reach.rs, `Cycle`).
-unsafe impl<T: ?Sized> Acyclic for T where const { none::<T, Cycle>() } {}
+/// The derived impls of [`Acyclic`] and [`NoCapability`], bounded by `where const`, which is
+/// blaze's syntax (`blaze_const_exprs`) and which rustc cannot parse: compiled by blaze only.
+#[cfg(blaze)]
+mod extended;
+
+// Under rustc (std.md, "Two builders"): no `where const` bound, so each property is held of
+// every type, and the walk runs where a handle is made instead, as a `const` assertion of the
+// instance (`Shared::holding`, `Shares::new`): the same walk and the same refusal, met when the
+// instance is compiled rather than at the bound. Weaker: generic code that only names the
+// bound checks nothing, and under rustc every `dyn` type is vouched for by `Acyclic`.
+// SAFETY: not a promise under rustc, which checks no linear value either: each handle over an
+// acyclic type asserts the walk's answer as it is compiled (above), and code that needs the
+// property for soundness is built by blaze.
+#[cfg(not(blaze))]
+unsafe impl<T: ?Sized> Acyclic for T {}
 
 /// A value that lets its holder reach something outside the program: the disk, the network,
 /// the clock. bstd's capabilities implement it; a type that wraps one implements it too.
@@ -85,9 +95,10 @@ impl Question for AnyCapability {
 #[marker]
 pub unsafe trait NoCapability {}
 
-// SAFETY: the walk for `AnyCapability` found no type that implements `Capability` in, owned
-// by or borrowed by a `T`, and saw into every type on the way.
-unsafe impl<T: ?Sized> NoCapability for T where const { none::<T, AnyCapability>() } {}
+// SAFETY: under rustc, as `Acyclic`'s plain impl above: the property is not derived, and code
+// that needs it asserts `none::<T, AnyCapability>()` in a `const` or is built by blaze.
+#[cfg(not(blaze))]
+unsafe impl<T: ?Sized> NoCapability for T {}
 
 /// Is a [`Secret`](crate::keys::Secret) reachable from the type? For an event or a log record:
 /// `const _: () = assert!(none::<Event, AnySecret>());`.

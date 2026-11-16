@@ -1,5 +1,7 @@
 //! Reflection as the walk reads it ([`reach`](super::reach)): `core::mem::type_info` and
-//! `core::reflect`, each fact one small function over a `TypeId`. The front end's tests give
+//! `core::reflect`, each fact one small function over a `TypeId`. Every fact but [`name`] is
+//! the pinned nightly's own `type_info`, so the walk runs under rustc too; `core::reflect` is
+//! blaze's, and [`name`] has a plain form under `cfg(not(blaze))`. The front end's tests give
 //! the walk the same functions over the intrinsics alone, so this file is the only part of the
 //! walk they do not evaluate.
 //!
@@ -141,12 +143,27 @@ pub fn implements(id: TypeId, marker: TypeId) -> bool {
 }
 
 /// The type as a diagnostic names it (`Shared<Parent>`).
+#[cfg(blaze)]
 #[rustc_comptime]
 #[blaze::nopanic]
 #[blaze::noalloc]
 #[blaze::nonblocking]
 pub fn name(id: TypeId) -> &'static str {
     core::reflect::name_of(id)
+}
+
+/// The type as a diagnostic names it, under rustc: its reflection names no type from a
+/// `TypeId` (`core::reflect::name_of` is blaze's), so a refusal under rustc says where the walk
+/// went by field and variant names only, and this stands for each type. The walk decides the
+/// same; only its message is poorer (std.md, "Two builders").
+#[cfg(not(blaze))]
+#[rustc_comptime]
+#[blaze::nopanic]
+#[blaze::noalloc]
+#[blaze::nonblocking]
+pub fn name(id: TypeId) -> &'static str {
+    let _ = id;
+    "a type rustc's reflection does not name"
 }
 
 /// The first `len` bytes of `bytes` as text.
