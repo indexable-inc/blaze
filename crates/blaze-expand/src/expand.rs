@@ -12,7 +12,7 @@ use crate::{
     def::{LocalInner, MacroDef, MacroKind, ProcKind},
     derive,
     error::{ExpandError, Stream, Unbuilt},
-    expansion::{Diagnostic, Expanded, Expansion, Origin, PathScope},
+    expansion::{Diagnostic, Expanded, Expansion, TokenOrigin, PathScope},
     nested,
     tokens::{Ctx, CtxNode, Delim, Spacing, Text, TokenKind, Transparency},
 };
@@ -134,7 +134,7 @@ impl<A: Allocator + Clone> Out<'_, A> {
         &mut self,
         kind: TokenKind,
         text: &str,
-        origin: Origin,
+        origin: TokenOrigin,
     ) -> Result<(), ExpandError> {
         let ctx = self.ctx_for(origin)?;
         self.exp.tokens.push(kind, text, ctx)?;
@@ -142,28 +142,28 @@ impl<A: Allocator + Clone> Out<'_, A> {
         Ok(())
     }
 
-    fn ctx_for(&mut self, origin: Origin) -> Result<Ctx, ExpandError> {
+    fn ctx_for(&mut self, origin: TokenOrigin) -> Result<Ctx, ExpandError> {
         let (def, call) = (self.def, self.call);
         let foreign = ExpandError::ForeignOrigin { origin };
         let tokens = &mut self.exp.tokens;
         let ctx = match origin {
-            Origin::Input(at) => {
+            TokenOrigin::Input(at) => {
                 let input = call.input();
                 let token = input.tokens().get(at as usize).ok_or(foreign)?;
                 tokens.import_ctx(input, token.ctx)?
             }
-            Origin::AttrArgs(at) => {
+            TokenOrigin::AttrArgs(at) => {
                 let args = call.attr_args().ok_or(foreign)?;
                 let token = args.tokens().get(at as usize).ok_or(foreign)?;
                 tokens.import_ctx(args, token.ctx)?
             }
-            Origin::Def(at) => {
+            TokenOrigin::Def(at) => {
                 let body = def.body();
                 let token = body.tokens().get(at as usize).ok_or(foreign)?;
                 let parent = tokens.import_ctx(body, token.ctx)?;
                 tokens.context(CtxNode { parent, mark: def.mark(def.transparency()) })?
             }
-            Origin::Params(at) => {
+            TokenOrigin::Params(at) => {
                 let params = def.params().ok_or(foreign)?;
                 let token = params.tokens().get(at as usize).ok_or(foreign)?;
                 let parent = tokens.import_ctx(params, token.ctx)?;
@@ -171,11 +171,11 @@ impl<A: Allocator + Clone> Out<'_, A> {
             }
             // rustc's `def_site`: the root, marked opaque; `call_site` and `mixed_site`: the
             // call's own context, marked.
-            Origin::Made(Transparency::Opaque) => {
+            TokenOrigin::Made(Transparency::Opaque) => {
                 let parent = Ctx::root(def.edition());
                 tokens.context(CtxNode { parent, mark: def.mark(Transparency::Opaque) })?
             }
-            Origin::Made(transparency) => {
+            TokenOrigin::Made(transparency) => {
                 let parent = tokens.import_ctx(call.input(), call.site.ctx)?;
                 tokens.context(CtxNode { parent, mark: def.mark(transparency) })?
             }
@@ -190,7 +190,7 @@ impl<A: Allocator + Clone> Out<'_, A> {
         text: &str,
         transparency: Transparency,
     ) -> Result<(), ExpandError> {
-        self.push(kind, text, Origin::Made(transparency))
+        self.push(kind, text, TokenOrigin::Made(transparency))
     }
 
     /// `#[automatically_derived]`, made def-site.
@@ -231,7 +231,7 @@ impl<A: Allocator + Clone> Out<'_, A> {
         if self.def.at().local_inner == LocalInner::Yes {
             for call in calls.iter_mut() {
                 let single = call.path.end - call.path.start == 1;
-                let from_def = matches!(self.exp.origins[call.path.start as usize], Origin::Def(_));
+                let from_def = matches!(self.exp.origins[call.path.start as usize], TokenOrigin::Def(_));
                 if single && from_def {
                     call.scope = PathScope::DefCrate;
                 }

@@ -6,9 +6,8 @@
 //! with its own, so cloning an `Arc` asks `A: AllocatorClone` (clones are equivalent: memory
 //! from one may be freed by another), as std's does.
 //!
-//! Not here yet: `new_cyclic`, `into_raw`/`from_raw` (finding the value inside an unsized
-//! block needs `align_of_val_raw`), `make_mut` and `from` for unsized values (they need
-//! `CloneToUninit`), and `Weak::new` without a block.
+//! Not here yet: `make_mut` and `from` for unsized values (they need `CloneToUninit`), and
+//! `Weak::new` without a block.
 
 use core::{
     alloc::{Allocator, AllocatorClone, Layout, StaticAllocator},
@@ -133,6 +132,37 @@ impl<T, A: Allocator> Arc<T, A> {
         // SAFETY: a fresh block of `Inner<T>`'s layout, empty.
         unsafe { ptr.as_ptr().write(inner) };
         Ok(Arc { ptr, alloc, _owns: PhantomData })
+    }
+
+    /// A value made by `make` from a [`Weak`] to its own block, for a value that refers to
+    /// itself. The `Weak` (and its clones) upgrade to nothing until `make` returns. A panic in
+    /// `make` frees the block, which holds no value then.
+    pub fn new_cyclic_in(make: impl FnOnce(&Weak<T, A>) -> T, alloc: A) -> Arc<T, A> {
+        let layout = Layout::new::<Inner<T>>();
+        let Ok(block) = alloc.allocate(layout) else {
+            fail(AllocFailure::Refused { what: type_name::<T>(), layout });
+        };
+        let ptr = block.cast::<Inner<T>>();
+        // SAFETY: a fresh block of `Inner<T>`'s layout: its counts are written, its value left
+        // for `make`; strong 0 says there is no value to reach.
+        unsafe {
+            (&raw mut (*ptr.as_ptr()).strong).write(AtomicUsize::new(0));
+            (&raw mut (*ptr.as_ptr()).weak).write(AtomicUsize::new(1));
+        }
+        // The owners' shared weak reference, lent to `make`; dropped by a panic in it, which
+        // frees the block without touching the value.
+        let weak = Weak { ptr, alloc };
+        let value = make(&weak);
+        // SAFETY: the value's place is empty and no owner reaches it while strong is 0.
+        unsafe { (&raw mut (*ptr.as_ptr()).value).write(value) };
+        // Release: the value's write happens before any `upgrade` that sees the count (its
+        // exchange acquires).
+        weak.strong().store(1, Release);
+        let weak = ManuallyDrop::new(weak);
+        // SAFETY: `weak` is never dropped: its weak reference becomes the owners' shared one,
+        // and its allocator moves out once.
+        let alloc = unsafe { ptr::read(&weak.alloc) };
+        Arc { ptr, alloc, _owns: PhantomData }
     }
 
     /// `value` shared and pinned: the block never moves and a `StaticAllocator` never reuses it
@@ -397,6 +427,51 @@ impl<T: ?Sized, A: Allocator> Arc<T, A> {
     pub fn allocator(this: &Arc<T, A>) -> &A {
         &this.alloc
     }
+
+    /// This owner as a pointer to the value and its allocator; [`Arc::from_raw_in`] takes them
+    /// back. The count is kept: until then the value is leaked.
+    pub fn into_raw_with_allocator(this: Arc<T, A>) -> (*const T, A) {
+        let this = ManuallyDrop::new(this);
+        let value = Arc::as_ptr(&this);
+        // SAFETY: `this` is never dropped, so its allocator moves out once.
+        (value, unsafe { ptr::read(&this.alloc) })
+    }
+
+    /// An owner back from [`Arc::into_raw_with_allocator`].
+    ///
+    /// # Safety
+    ///
+    /// `value` came from `Arc::into_raw_with_allocator` of an `Arc<T, A>` (an unsizing cast of
+    /// the pointer between, as `*const [U; N]` to `*const [U]`, keeps the layout and is fine),
+    /// its owner is not taken back twice, and `alloc` is that allocator or an equivalent one.
+    pub unsafe fn from_raw_in(value: *const T, alloc: A) -> Arc<T, A> {
+        // SAFETY: from a live block (the caller's promise), as `value_block` needs.
+        let ptr = unsafe { value_block(value) };
+        Arc { ptr, alloc, _owns: PhantomData }
+    }
+}
+
+/// The offset of a value aligned to `align` in a block: the header's size rounded up to it, as
+/// `repr(C)` places the last field.
+fn value_offset(align: usize) -> usize {
+    let header = Layout::new::<Inner<()>>().size();
+    header.next_multiple_of(align)
+}
+
+/// The block of the value at `value`.
+///
+/// # Safety
+///
+/// `value` points to the value of a live block (its value dropped or not), with metadata
+/// valid for it.
+unsafe fn value_block<T: ?Sized>(value: *const T) -> NonNull<Inner<T>> {
+    // SAFETY: the metadata is valid (the caller's promise); only the alignment is read.
+    let align = unsafe { Layout::for_value_raw(value) }.align();
+    // SAFETY: the block begins `value_offset(align)` bytes before its value, in one
+    // allocation; the metadata carries over.
+    let block = unsafe { value.byte_sub(value_offset(align)) } as *mut Inner<T>;
+    // SAFETY: inside a block, so not null.
+    unsafe { NonNull::new_unchecked(block) }
 }
 
 impl<T: ?Sized, A: AllocatorClone> Clone for Arc<T, A> {
@@ -490,6 +565,33 @@ impl<T: ?Sized, A: Allocator> Weak<T, A> {
 
     pub fn ptr_eq(&self, other: &Weak<T, A>) -> bool {
         ptr::addr_eq(self.ptr.as_ptr(), other.ptr.as_ptr())
+    }
+
+    /// Where the value is, or was: a pointer only to compare or to hand to
+    /// [`Weak::from_raw_in`], never to read through unless an `Arc` is known to live.
+    pub fn as_ptr(&self) -> *const T {
+        // SAFETY: the block is live (the invariant); a place, no reference made, so a dropped
+        // value is fine.
+        unsafe { &raw const (*self.ptr.as_ptr()).value }
+    }
+
+    /// This weak reference as a pointer and its allocator; the weak count is kept.
+    pub fn into_raw_with_allocator(self) -> (*const T, A) {
+        let this = ManuallyDrop::new(self);
+        let value = this.as_ptr();
+        // SAFETY: `this` is never dropped, so its allocator moves out once.
+        (value, unsafe { ptr::read(&this.alloc) })
+    }
+
+    /// A weak reference back from [`Weak::into_raw_with_allocator`].
+    ///
+    /// # Safety
+    ///
+    /// As [`Arc::from_raw_in`], for a pointer a `Weak` gave.
+    pub unsafe fn from_raw_in(value: *const T, alloc: A) -> Weak<T, A> {
+        // SAFETY: the weak count kept the block live (the caller's promise).
+        let ptr = unsafe { value_block(value) };
+        Weak { ptr, alloc }
     }
 }
 

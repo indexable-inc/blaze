@@ -16,9 +16,14 @@ doctest = false
 # The crate's small types (keys, record handles, slots, threads) are its own until the crates
 # that own them are built on the new item layer; lib.rs says which each becomes.
 [dependencies]
-# `events`: a run's event stream as records in columns. Its `record!` names `::std`, so the
-# crate is std (no `no_std`).
+# `events`: a run's event stream as records in columns. Its `record!` names `::std`, the one
+# reason the crate links std.
 blaze-format.workspace = true
+# Every collection: `Vec`, `VecDeque`, `SortedMap`, `SortedSet`, `Soa` (no `alloc`).
+blaze-own.workspace = true
+# The two insert-heavy maps (the tier's reverse map, the suite's postings), where a sorted
+# vector would shift its tail on almost every insert.
+blaze-hash.workspace = true
 
 [dev-dependencies]
 # `check` and `control`: every machine's simulation and its planted-bug controls.

@@ -14,7 +14,6 @@ members = [
 exclude = [
     # Parked (docs/v2/plan/parked.md): kept on disk, out of the build until the new item layer
     # (docs/v2/plan/design/bottom.md) gives what each waits on. The list there says why.
-    "crates/base-db",
     "crates/blaze-cargo",
     "crates/blaze-certify",
     "crates/blaze-codegen",

@@ -26,12 +26,22 @@
 
 #![blaze::sans_io]
 
-use alloc::collections::{BTreeMap, VecDeque};
-use alloc::vec::Vec;
-use core::alloc::{Allocator, AllocatorClone};
+use core::alloc::Allocator;
 use core::fmt;
 
+use blaze_hash::HashMap;
+use blaze_own::{SortedMap, Vec, VecDeque, soa};
+
 use crate::{CodeId, CodeRef, CompileError, InstanceKey, Made, Plant, RecordKey, SlotId, Snapshot, Why};
+
+soa! {
+    /// One slot as the tier sees it: its state, and the instance it runs once it is hot (set by
+    /// [`Tier::hot`] before any state but `Fast`).
+    struct Row, Rows, RowRef {
+        state: State => states / states_mut,
+        instance: Option<InstanceKey> => instances / instances_mut,
+    }
+}
 
 /// One callee body an optimized record absorbed, with the code identity it had then.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -56,7 +66,7 @@ pub struct Callee {
 
 /// The optimizing backend (the real one comes from codegen's top tier, function grain). A pure
 /// function of what it reads: it returns its record, or what it lacks, and never waits.
-pub trait Optimizer<A: AllocatorClone> {
+pub trait Optimizer<A: Allocator + Clone> {
     /// `instance` optimized, with any of `callees` (and, through them, their callees) inlined.
     /// The result lists every body absorbed with the identity it read; a body missing from the
     /// list is a stale-code bug of the optimizer's.
@@ -194,40 +204,52 @@ enum State {
 }
 
 /// The optimizing tier of one run. See the module's documentation.
-pub struct Tier<A: AllocatorClone> {
+pub struct Tier<A: Allocator + Clone> {
     alloc: A,
-    state: Vec<State, A>,
-    instances: BTreeMap<SlotId, InstanceKey, A>,
+    slots: Rows<A>,
     queue: VecDeque<SlotId, A>,
     workers: u32,
     running: u32,
     snapshot: Snapshot,
-    records: BTreeMap<SlotId, Optimized<A>, A>,
-    inlined_into: BTreeMap<CodeId, Vec<SlotId, A>, A>,
-    /// Each record being made, and the jobs that lack it.
-    making: BTreeMap<RecordKey, Vec<SlotId, A>, A>,
+    /// Sorted by slot: one insert a hot function, the few the tier ever optimizes.
+    records: SortedMap<SlotId, Optimized<A>, A>,
+    /// Hashed, not sorted: every record adds a key for each body it absorbed, in no order, so a
+    /// sorted vector would shift its tail on almost every insert.
+    inlined_into: HashMap<CodeId, Vec<SlotId, A>, A>,
+    /// Each record being made, and the jobs that lack it: the few in flight.
+    making: SortedMap<RecordKey, Vec<SlotId, A>, A>,
 }
 
-impl<A: AllocatorClone> Tier<A> {
+impl<A: Allocator + Clone> Tier<A> {
     /// A tier of `slots` functions running at most `workers` optimizations at once.
     pub fn new(slots: u32, workers: u32, snapshot: Snapshot, alloc: A) -> Result<Tier<A>, Error> {
         if workers == 0 {
             return Err(Error::Config { what: "no worker" });
         }
-        let mut state = Vec::new_in(alloc.clone());
-        state.resize(slots as usize, State::Fast);
+        let mut rows = Rows::with_capacity_in(slots as usize, alloc.clone());
+        for _ in 0..slots {
+            rows.push(Row { state: State::Fast, instance: None });
+        }
         Ok(Tier {
-            state,
-            instances: BTreeMap::new_in(alloc.clone()),
+            slots: rows,
             queue: VecDeque::new_in(alloc.clone()),
             workers,
             running: 0,
             snapshot,
-            records: BTreeMap::new_in(alloc.clone()),
-            inlined_into: BTreeMap::new_in(alloc.clone()),
-            making: BTreeMap::new_in(alloc.clone()),
+            records: SortedMap::new_in(alloc.clone()),
+            inlined_into: HashMap::new_in(alloc.clone()),
+            making: SortedMap::new_in(alloc.clone()),
             alloc,
         })
+    }
+
+    fn state(&mut self, slot: SlotId) -> &mut State {
+        &mut self.slots.states_mut()[slot.index()]
+    }
+
+    /// The instance a slot past `Fast` runs: [`Tier::hot`] set it before the state left `Fast`.
+    fn instance(&self, slot: SlotId) -> InstanceKey {
+        self.slots.instances()[slot.index()].expect("a slot past `Fast` was given its instance by `hot`")
     }
 
     /// `slot`, which runs `instance`, is hot: queued, and started if a worker is free.
@@ -237,16 +259,16 @@ impl<A: AllocatorClone> Tier<A> {
         instance: InstanceKey,
         out: &mut Vec<Effect, A>,
     ) -> Result<(), Error> {
-        let slots = self.state.len() as u32;
+        let slots = self.slots.len() as u32;
         let snapshot = self.snapshot;
-        let Some(state) = self.state.get_mut(slot.index()) else {
+        let Some(state) = self.slots.states_mut().get_mut(slot.index()) else {
             return Err(Error::NoSlot { slot, slots });
         };
         if *state != State::Fast {
             return Err(Error::Twice { slot });
         }
         *state = State::Queued { snapshot };
-        self.instances.insert(slot, instance);
+        self.slots.instances_mut()[slot.index()] = Some(instance);
         self.queue.push_back(slot);
         self.pump(out);
         Ok(())
@@ -255,15 +277,15 @@ impl<A: AllocatorClone> Tier<A> {
     fn pump(&mut self, out: &mut Vec<Effect, A>) {
         while self.running < self.workers {
             let Some(slot) = self.queue.pop_front() else { return };
-            let State::Queued { snapshot } = self.state[slot.index()] else { continue };
+            let State::Queued { snapshot } = *self.state(slot) else { continue };
             if snapshot < self.snapshot {
-                self.state[slot.index()] = State::Dropped;
+                *self.state(slot) = State::Dropped;
                 out.push(Effect::Dropped { slot, snapshot });
                 continue;
             }
-            self.state[slot.index()] = State::Optimizing { snapshot };
+            *self.state(slot) = State::Optimizing { snapshot };
             self.running += 1;
-            let instance = self.instances[&slot];
+            let instance = self.instance(slot);
             out.push(Effect::Optimize(Job { slot, instance, snapshot }));
         }
     }
@@ -271,12 +293,12 @@ impl<A: AllocatorClone> Tier<A> {
     /// The end of one entry of `job`.
     pub fn done(&mut self, job: Job, ended: Ended<'_, A>, out: &mut Vec<Effect, A>) -> Result<(), Error> {
         let Job { slot, snapshot, instance } = job;
-        if self.state.get(slot.index()) != Some(&State::Optimizing { snapshot }) {
+        if self.slots.states().get(slot.index()) != Some(&State::Optimizing { snapshot }) {
             return Err(Error::NotRunning { slot, snapshot });
         }
         self.running -= 1;
         if snapshot < self.snapshot {
-            self.state[slot.index()] = State::Dropped;
+            *self.state(slot) = State::Dropped;
             out.push(Effect::Dropped { slot, snapshot });
             self.pump(out);
             return Ok(());
@@ -294,13 +316,13 @@ impl<A: AllocatorClone> Tier<A> {
                 }
                 let code = optimized.code;
                 self.records.insert(slot, optimized);
-                self.state[slot.index()] = State::Optimized;
+                *self.state(slot) = State::Optimized;
                 out.push(Effect::File { slot });
                 out.push(Effect::Publish { slot, code });
             }
             Ended::Need(keys) => {
                 if keys.is_empty() {
-                    self.state[slot.index()] = State::Failed;
+                    *self.state(slot) = State::Failed;
                     return Err(Error::EmptyNeed { slot });
                 }
                 let mut left = 0;
@@ -317,10 +339,10 @@ impl<A: AllocatorClone> Tier<A> {
                     }
                     left += 1;
                 }
-                self.state[slot.index()] = State::Blocked { snapshot, left };
+                *self.state(slot) = State::Blocked { snapshot, left };
             }
             Ended::Failed(why) => {
-                self.state[slot.index()] = State::Failed;
+                *self.state(slot) = State::Failed;
                 let error = CompileError { function: instance, slot, why };
                 out.push(Effect::Failed { slot, error });
             }
@@ -336,18 +358,18 @@ impl<A: AllocatorClone> Tier<A> {
             return Err(Error::NotNeeded { key });
         };
         for slot in jobs {
-            let State::Blocked { snapshot, left } = self.state[slot.index()] else { continue };
+            let State::Blocked { snapshot, left } = *self.state(slot) else { continue };
             match result {
                 Err(why) => {
-                    self.state[slot.index()] = State::Failed;
-                    let error = CompileError { function: self.instances[&slot], slot, why };
+                    *self.state(slot) = State::Failed;
+                    let error = CompileError { function: self.instance(slot), slot, why };
                     out.push(Effect::Failed { slot, error });
                 }
                 Ok(()) if left > 1 => {
-                    self.state[slot.index()] = State::Blocked { snapshot, left: left - 1 };
+                    *self.state(slot) = State::Blocked { snapshot, left: left - 1 };
                 }
                 Ok(()) => {
-                    self.state[slot.index()] = State::Queued { snapshot };
+                    *self.state(slot) = State::Queued { snapshot };
                     self.queue.push_front(slot);
                 }
             }
@@ -363,9 +385,10 @@ impl<A: AllocatorClone> Tier<A> {
             return Err(Error::NotNewer { asked: snapshot, at: self.snapshot });
         }
         self.snapshot = snapshot;
+        let states = self.slots.states_mut();
         for slot in self.queue.drain(..) {
-            if let State::Queued { .. } = self.state[slot.index()] {
-                self.state[slot.index()] = State::Dropped;
+            if let State::Queued { .. } = states[slot.index()] {
+                states[slot.index()] = State::Dropped;
             }
         }
         Ok(())

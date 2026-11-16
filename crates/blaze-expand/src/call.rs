@@ -8,13 +8,8 @@ use crate::{
     tokens::{Ctx, Edition, Sink, TokenStream},
 };
 
-/// The three kinds of macro call.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum CallShape {
-    FnLike,
-    Attr,
-    Derive,
-}
+/// The three kinds of macro call: the schema's one `CallShape`.
+pub use blaze_surface::CallShape;
 
 /// A call's tokens by its kind.
 pub enum CallKind<'a, A: Allocator> {
@@ -162,11 +157,7 @@ impl<'a, A: Allocator> Call<'a, A> {
 
     /// The call's canonical bytes: its kind, call site, eager facts and every stream.
     pub(crate) fn encode<S: Sink>(&self, out: &mut S) {
-        let shape = match self.shape() {
-            CallShape::FnLike => 0,
-            CallShape::Attr => 1,
-            CallShape::Derive => 2,
-        };
+        let shape = self.shape().byte();
         let inside = match self.eager.inside {
             Inside::Plain => 0,
             Inside::EagerInput => 1,

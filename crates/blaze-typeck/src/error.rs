@@ -10,6 +10,8 @@ use crate::world::Question;
 pub enum Limit {
     /// The frame column: `4 * nodes + 64` frames.
     Frames,
+    /// The walk's steps: `16 * (nodes + 1) + 1024` frame pops.
+    Steps,
     /// A hash table past `u32::MAX / 2` entries.
     Table,
     /// The solver's rounds over pending obligations.

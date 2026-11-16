@@ -57,7 +57,7 @@ impl RecordKind {
 }
 
 /// Why [`Records::insert`] refused a buffer.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum InsertError {
     /// The bytes are not a record of the kind given.
     Format { kind: RecordKind, error: FormatError },
@@ -206,6 +206,36 @@ impl Records {
     /// The proof this snapshot holds, if it holds a crate's text.
     pub fn text_proof(&self) -> Option<HasText> {
         self.text
+    }
+
+    /// The `KeyIndex` page of `module`: its items and the items inside them.
+    pub fn page(&self, module: ItemKey) -> Result<KeyIndexView<'_>, SurfaceError> {
+        let buffer = self.of_item(RecordKind::KeyIndex, module)?;
+        Ok(checked(RecordKind::KeyIndex, KeyIndexView::read(buffer)))
+    }
+
+    /// The items whose parent is `parent` (a module's items, a trait's or an impl's associated
+    /// items, an enum's variants, a struct's fields), in the order they are written: one read of
+    /// the page of `module`, the module `parent` is in (or `parent` itself for a module). Pushed
+    /// onto `out`, which the caller owns, so a walk reuses one buffer. blaze-surface has no
+    /// `AssocItems` record yet (reconnect.md, "What the new-layer crates lack"): this is its
+    /// stand-in over the page that already lists every member with its parent.
+    pub fn members(
+        &self,
+        module: ItemKey,
+        parent: ItemKey,
+        out: &mut Vec<(blaze_surface::Place, ItemKey), Global>,
+    ) -> Result<(), SurfaceError> {
+        let start = out.len();
+        out.extend(
+            self.page(module)?
+                .entries()
+                .filter(|entry| entry.parent == Some(parent))
+                .map(|entry| (entry.place, entry.key)),
+        );
+        // A file's rows are in source order, so the place orders the members as written.
+        out[start..].sort_unstable();
+        Ok(())
     }
 }
 

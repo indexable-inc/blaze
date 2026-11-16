@@ -35,10 +35,10 @@ use core::fmt;
 use blaze_format::FormatError;
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 
-use crate::graph::{CrateFlags, CrateGraphView, CrateIndex};
-use crate::index::{BucketHash, BucketKey, BucketView, DirectoryView, NoImplsOfView};
-use crate::row::ImplRow;
-use crate::shape::SelfShape;
+use blaze_surface::{
+    BucketHash, BucketKey, BucketView, CrateFlags, CrateGraphView, CrateIndex, DirectoryView, ImplRow,
+    NoImplsOfView, SelfShape,
+};
 
 /// Where a lookup gets a crate's impl records: their bytes, read in place, each at an address
 /// aligned to `blaze_format::ALIGN`. An implementation holds what it has fetched or mapped,
@@ -357,7 +357,7 @@ impl<'g, 'c, C: ImplRecords> Candidates<'g, 'c, C> {
                 record: RecordKind::NoImplsOf,
                 error,
             })?;
-            let filter = NoImplsOfView::open(bytes).map_err(|error| ImplLookupError::Format {
+            let filter = NoImplsOfView::read(bytes).map_err(|error| ImplLookupError::Format {
                 krate,
                 record: RecordKind::NoImplsOf,
                 error,
@@ -407,7 +407,7 @@ fn open_want<'c, C: ImplRecords>(
                 record: RecordKind::Directory,
                 error,
             })?;
-            let directory = DirectoryView::open(bytes).map_err(|error| ImplLookupError::Format {
+            let directory = DirectoryView::read(bytes).map_err(|error| ImplLookupError::Format {
                 krate,
                 record: RecordKind::Directory,
                 error,
@@ -432,7 +432,7 @@ fn open_want<'c, C: ImplRecords>(
         error,
     })?;
     cx.note(ImplRead::Bucket { krate, bucket: hit.bucket });
-    let bucket = BucketView::open(bytes).map_err(|error| ImplLookupError::Format {
+    let bucket = BucketView::read(bytes).map_err(|error| ImplLookupError::Format {
         krate,
         record: RecordKind::Bucket,
         error,

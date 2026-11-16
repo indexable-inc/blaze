@@ -495,7 +495,7 @@ pub fn render(view: &View, args: &Map<String, Value>) -> Result<String, ViewErro
     }
     let out = render_in(view, |name| args.get(name), NoBuild::Unknown, Global)?;
     // The bytes move into the std `String` callers take, with no copy.
-    match String::from_utf8(out.into_bytes()) {
+    match String::from_utf8(blaze_mem::text::into_std_bytes(out)) {
         Ok(it) => Ok(it),
         Err(_) => unreachable!("a `blaze_mem::String` holds UTF-8"),
     }

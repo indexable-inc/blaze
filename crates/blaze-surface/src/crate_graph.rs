@@ -18,20 +18,26 @@
 //!
 //! | field | holds |
 //! |---|---|
-//! | `crates` | `CrateRow` per crate in index order: key, its edges' run, edition, flags |
+//! | `crates` | `CrateRow` per crate in index order: key, its edges' run, edition (its year), flags |
 //! | `edges` | `EdgeRow` per edge, each crate's run sorted by extern name: name's range, the dependency's index, flags |
 //! | `names` | the extern names' bytes, UTF-8, back to back |
 //! | `prefixes` | `PrefixRow` per crate sorted by key prefix: the prefix and the crate's index |
 //! | `closure` | row `i`, `words` words: bit `j` when crate `i` loads crate `j` (`i` loads itself) |
 //! | `dependents` | the transpose: bit `i` of row `j` when crate `i` loads crate `j` |
+//!
+//! The record is built here and read here; the lookups across it (`blaze_impls::candidates`,
+//! `blaze_impls::lang_item`) are blaze-impls'.
 
-use alloc::vec::Vec;
 use core::alloc::Allocator;
 use core::fmt;
 use core::mem::offset_of;
 
 use blaze_format::{FormatError, Part, Record, SchemaHash, Slice, Writer, schema_of};
 use blaze_id::{ContentId, CrateItemKey};
+use blaze_own::Vec;
+
+use crate::column::RecordBytes;
+use crate::kind::Edition;
 
 /// The most crates a graph holds: each bit matrix is `n * n` bits, 8 MiB at this bound.
 pub const MAX_CRATES: usize = 8192;
@@ -41,6 +47,27 @@ pub const MAX_EXTERN_NAME: usize = 255;
 
 /// The most edges a graph holds.
 const MAX_EDGES: usize = 1 << 20;
+
+/// An edition's year, as a crate row holds it.
+const fn year_of(edition: Edition) -> u16 {
+    match edition {
+        Edition::E2015 => 2015,
+        Edition::E2018 => 2018,
+        Edition::E2021 => 2021,
+        Edition::E2024 => 2024,
+    }
+}
+
+/// The edition of a year a crate row holds; `None` for a year no edition is.
+const fn edition_of_year(year: u16) -> Option<Edition> {
+    match year {
+        2015 => Some(Edition::E2015),
+        2018 => Some(Edition::E2018),
+        2021 => Some(Edition::E2021),
+        2024 => Some(Edition::E2024),
+        _ => None,
+    }
+}
 
 /// A crate's place in one graph record: meaningful only with the record that gave it. A
 /// view's methods index by it and panic on one past the graph's end, which only an index of
@@ -57,8 +84,9 @@ impl CrateIndex {
         self.0 as usize
     }
 
-    /// The index at bit `at` of a row of this graph's: what a walk over a row gives.
-    pub(crate) const fn of_bit(at: usize) -> CrateIndex {
+    /// The index at bit `at` of a row of this graph's ([`CrateGraphView::closure_row`],
+    /// [`CrateGraphView::dependents_row`]): what a walk over a row gives.
+    pub const fn of_bit(at: usize) -> CrateIndex {
         CrateIndex(at as u32)
     }
 }
@@ -76,7 +104,7 @@ impl CrateFlags {
     /// (`#[rustc_has_incoherent_inherent_impls]` types' and primitives').
     pub const LANG: CrateFlags = CrateFlags(1 << 1);
     /// A crate that may define lang items: a crate of the language, or one with
-    /// `#![feature(lang_items)]`, from its roots. [`crate::lang_item`] reads these alone.
+    /// `#![feature(lang_items)]`, from its roots. `blaze_impls::lang_item` reads these alone.
     pub const LANG_ITEMS: CrateFlags = CrateFlags(1 << 2);
 
     const ALL: u16 = (1 << 3) - 1;
@@ -137,36 +165,6 @@ impl EdgeFlags {
 
     pub const fn contains(self, other: EdgeFlags) -> bool {
         self.0 & other.0 == other.0
-    }
-}
-
-/// A crate's edition, written as its year.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
-pub enum Edition {
-    E2015,
-    E2018,
-    E2021,
-    E2024,
-}
-
-impl Edition {
-    pub const fn year(self) -> u16 {
-        match self {
-            Edition::E2015 => 2015,
-            Edition::E2018 => 2018,
-            Edition::E2021 => 2021,
-            Edition::E2024 => 2024,
-        }
-    }
-
-    pub const fn from_year(year: u16) -> Option<Edition> {
-        match year {
-            2015 => Some(Edition::E2015),
-            2018 => Some(Edition::E2018),
-            2021 => Some(Edition::E2021),
-            2024 => Some(Edition::E2024),
-            _ => None,
-        }
     }
 }
 
@@ -310,19 +308,12 @@ pub(crate) fn slice_field<T>(record_at: u64, offset: usize, target: u64, len: us
     Slice::between(record_at + offset as u64, target, len)
 }
 
-/// A `Vec` of `len` copies of `value` in `alloc`.
-pub(crate) fn filled<T: Copy, A: Allocator>(len: usize, value: T, alloc: A) -> Vec<T, A> {
-    let mut out = Vec::with_capacity_in(len, alloc);
-    out.resize(len, value);
-    out
-}
-
 /// The graph of `crates`, in any order, as one buffer in `alloc`: equal bytes for every order
 /// of the same crates and of each crate's dependencies.
 pub fn build_crate_graph<A: Allocator + Clone>(
     crates: &[CrateInput<'_>],
     alloc: A,
-) -> Result<Vec<u8, A>, GraphError> {
+) -> Result<RecordBytes<A>, GraphError> {
     let n = crates.len();
     if n > MAX_CRATES {
         return Err(GraphError::TooManyCrates { count: n });
@@ -350,7 +341,7 @@ pub fn build_crate_graph<A: Allocator + Clone>(
             return Err(GraphError::PrefixClash { first, second });
         }
     }
-    let mut rank = filled(n, 0u32, alloc.clone());
+    let mut rank = Vec::from_elem_in(0u32, n, alloc.clone());
     for (r, &p) in by_key.iter().enumerate() {
         rank[p as usize] = r as u32;
     }
@@ -361,7 +352,7 @@ pub fn build_crate_graph<A: Allocator + Clone>(
             .map(|r| by_key[r] as usize)
     };
     // Each edge's target, by input place, in each crate's run of `starts`.
-    let mut starts = filled(n + 1, 0usize, alloc.clone());
+    let mut starts = Vec::from_elem_in(0usize, n + 1, alloc.clone());
     let mut targets: Vec<u32, A> = Vec::with_capacity_in(edge_count, alloc.clone());
     for (p, krate) in crates.iter().enumerate() {
         starts[p] = targets.len();
@@ -380,7 +371,7 @@ pub fn build_crate_graph<A: Allocator + Clone>(
     }
     starts[n] = targets.len();
     // Who depends on each crate, by input place: the reverse edges, as runs.
-    let mut rev_starts = filled(n + 1, 0usize, alloc.clone());
+    let mut rev_starts = Vec::from_elem_in(0usize, n + 1, alloc.clone());
     for &q in &targets {
         rev_starts[q as usize + 1] += 1;
     }
@@ -388,7 +379,7 @@ pub fn build_crate_graph<A: Allocator + Clone>(
         rev_starts[q + 1] += rev_starts[q];
     }
     let mut rev_fill = rev_starts.clone();
-    let mut rev = filled(targets.len(), 0u32, alloc.clone());
+    let mut rev = Vec::from_elem_in(0u32, targets.len(), alloc.clone());
     for p in 0..n {
         for &q in &targets[starts[p]..starts[p + 1]] {
             rev[rev_fill[q as usize]] = p as u32;
@@ -396,8 +387,8 @@ pub fn build_crate_graph<A: Allocator + Clone>(
         }
     }
     // Kahn's order, the ready crate of least key first: a bit per rank.
-    let mut remaining = filled(n, 0usize, alloc.clone());
-    let mut ready = filled(words_for(n), 0u64, alloc.clone());
+    let mut remaining = Vec::from_elem_in(0usize, n, alloc.clone());
+    let mut ready = Vec::from_elem_in(0u64, words_for(n), alloc.clone());
     for p in 0..n {
         remaining[p] = starts[p + 1] - starts[p];
         if remaining[p] == 0 {
@@ -406,7 +397,7 @@ pub fn build_crate_graph<A: Allocator + Clone>(
         }
     }
     const UNPLACED: u32 = u32::MAX;
-    let mut index = filled(n, UNPLACED, alloc.clone());
+    let mut index = Vec::from_elem_in(UNPLACED, n, alloc.clone());
     let mut order: Vec<u32, A> = Vec::with_capacity_in(n, alloc.clone());
     for i in 0..n {
         let Some(word) = ready.iter().position(|&it| it != 0) else {
@@ -455,7 +446,7 @@ pub fn build_crate_graph<A: Allocator + Clone>(
             key: krate.key.0,
             edges_at: edge_rows.len() as u32,
             edges_len: slots.len() as u32,
-            edition: krate.edition.year(),
+            edition: year_of(krate.edition),
             flags: krate.flags.bits(),
         });
         for &slot in &slots {
@@ -471,7 +462,7 @@ pub fn build_crate_graph<A: Allocator + Clone>(
     }
     // What each crate loads, its dependencies' rows before its own; and the transpose.
     let words = words_for(n);
-    let mut closure = filled(n * words, 0u64, alloc.clone());
+    let mut closure = Vec::from_elem_in(0u64, n * words, alloc.clone());
     for i in 0..n {
         let (done, rest) = closure.split_at_mut(i * words);
         let row = &mut rest[..words];
@@ -487,7 +478,7 @@ pub fn build_crate_graph<A: Allocator + Clone>(
             }
         }
     }
-    let mut dependents = filled(n * words, 0u64, alloc.clone());
+    let mut dependents = Vec::from_elem_in(0u64, n * words, alloc.clone());
     for i in 0..n {
         for j in (Members { words: &closure[i * words..(i + 1) * words], at: 0, bits: 0 }) {
             dependents[j.at() * words + i / 64] |= 1 << (i % 64);
@@ -555,7 +546,7 @@ impl Iterator for Members<'_> {
     }
 }
 
-/// A crate graph read in place, its every index checked once when opened: what a view's
+/// A crate graph read in place, its every index checked once when read: what a view's
 /// methods read is in bounds.
 #[derive(Clone, Copy, Debug)]
 pub struct CrateGraphView<'a> {
@@ -571,7 +562,7 @@ pub struct CrateGraphView<'a> {
 impl<'a> CrateGraphView<'a> {
     /// The graph in `buffer`, which [`build_crate_graph`] wrote: its schema and layout
     /// checked, and every index and name in it.
-    pub fn open(buffer: &'a [u8]) -> Result<CrateGraphView<'a>, FormatError> {
+    pub fn read(buffer: &'a [u8]) -> Result<CrateGraphView<'a>, FormatError> {
         let root = blaze_format::open_as::<GraphRoot>(buffer, GRAPH_SCHEMA)?;
         let at = blaze_format::header(buffer)?.root;
         let bad = |what: &'static str| FormatError::Invalid { at, what };
@@ -595,7 +586,7 @@ impl<'a> CrateGraphView<'a> {
             return Err(bad("a crate graph with a prefix row count that is not its crates'"));
         }
         for (i, krate) in view.crates.iter().enumerate() {
-            if Edition::from_year(krate.edition).is_none() {
+            if edition_of_year(krate.edition).is_none() {
                 return Err(bad("a crate of an edition blaze does not know"));
             }
             if CrateFlags::from_bits(krate.flags).is_none() {
@@ -654,9 +645,9 @@ impl<'a> CrateGraphView<'a> {
     }
 
     pub fn edition(&self, of: CrateIndex) -> Edition {
-        match Edition::from_year(self.crates[of.at()].edition) {
+        match edition_of_year(self.crates[of.at()].edition) {
             Some(edition) => edition,
-            None => unreachable!("an edition checked when the graph was opened"),
+            None => unreachable!("an edition checked when the graph was read"),
         }
     }
 
@@ -672,7 +663,7 @@ impl<'a> CrateGraphView<'a> {
             let bytes = &names[edge.name_at as usize..][..edge.name_len as usize];
             let name = match core::str::from_utf8(bytes) {
                 Ok(name) => name,
-                Err(_) => unreachable!("a name checked when the graph was opened"),
+                Err(_) => unreachable!("a name checked when the graph was read"),
             };
             Dep { on: CrateIndex(edge.dep), name, flags: EdgeFlags(edge.flags as u16) }
         })
@@ -689,12 +680,15 @@ impl<'a> CrateGraphView<'a> {
         self.crate_of_prefix(key.prefix()).filter(|&it| self.key(it) == key)
     }
 
-    pub(crate) fn closure_row(&self, of: CrateIndex) -> &'a [u64] {
+    /// The bit row of what `of` loads, [`CrateGraphView::closure`] as words (bit `j` for
+    /// [`CrateIndex::of_bit`]`(j)`): what a lookup ANDs with other rows.
+    pub fn closure_row(&self, of: CrateIndex) -> &'a [u64] {
         let closure: &'a [u64] = self.closure;
         &closure[of.at() * self.words..][..self.words]
     }
 
-    pub(crate) fn dependents_row(&self, of: CrateIndex) -> &'a [u64] {
+    /// The bit row of the crates that load `of`, [`CrateGraphView::dependents`] as words.
+    pub fn dependents_row(&self, of: CrateIndex) -> &'a [u64] {
         let dependents: &'a [u64] = self.dependents;
         &dependents[of.at() * self.words..][..self.words]
     }

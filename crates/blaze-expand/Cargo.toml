@@ -19,6 +19,11 @@ doctest = false
 blaze-id.workspace = true
 # `Writer`, `Slice`, `open_as`, `leb`: the expansion's stored record (its columns, read back).
 blaze-format.workspace = true
+# The schema's words (`Edition`, `CallShape`, `Range`, `MacroKind` and the builtin and proc
+# macro names) and the `MacroDef` record a `MacroDefinition` is written to and read from.
+blaze-surface.workspace = true
+# `Vec`: every owning collection, in the allocator the caller names.
+blaze-own.workspace = true
 # `Hasher`: the keys and a definition's content hash.
 blaze-ids.workspace = true
 # `frame::task`: the task frame mbe writes its output tree into.

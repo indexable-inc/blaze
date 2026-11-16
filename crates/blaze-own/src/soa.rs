@@ -39,7 +39,7 @@
 //! grows, holds many fields, and lives in any allocator. A blaze-mem column of rows that wants
 //! several fields is several columns indexed alike.
 //!
-//! Not here yet: `Clone`, `Debug`, `insert`/`remove` in the middle, `retain`, `extend`.
+//! Not here yet: `extend`, `drain`.
 
 pub use core::alloc::Allocator;
 use core::{
@@ -282,6 +282,46 @@ unsafe fn permute_one<T>(column: *mut T, order: &[usize], scratch: *mut T) {
     // SAFETY: the scratch now holds every row, in order; the column's rows are moved-from, so
     // they are overwritten without a drop.
     unsafe { ptr::copy_nonoverlapping(scratch, column, order.len()) };
+}
+
+/// Moves `rows` rows of every column from row `from` to row `to`, bitwise; the ranges may
+/// overlap.
+///
+/// # Safety
+///
+/// Both ranges are below the capacity of the block `cols` is in; the source holds values, which
+/// the caller then counts at the destination.
+unsafe fn shift<C: Columns>(cols: Cols, from: usize, to: usize, rows: usize) {
+    for (field, info) in C::FIELDS.iter().enumerate() {
+        let start = cols.starts[field];
+        // SAFETY: both ranges are in the column (the caller's promise); `copy` allows the
+        // overlap. A field sized 0 copies no bytes.
+        unsafe { ptr::copy(start.add(from * info.size), start.add(to * info.size), rows * info.size) };
+    }
+}
+
+/// The state of a [`Soa::retain`]: rows below `write` are kept, `write..read` are empty,
+/// `read..total` not yet seen.
+struct Compact<'a, C: Columns> {
+    len: &'a mut usize,
+    cols: Cols,
+    read: usize,
+    write: usize,
+    total: usize,
+    _rows: PhantomData<C>,
+}
+
+impl<C: Columns> Compact<'_, C> {
+    /// Moves the rows not yet seen down to the kept ones and sets the length: the end of a
+    /// compaction, or its unwinding.
+    fn finish(c: Compact<'_, C>) {
+        let unseen = c.total - c.read;
+        if c.read != c.write {
+            // SAFETY: rows `read..total` hold values; `write..` below them are empty.
+            unsafe { shift::<C>(c.cols, c.read, c.write, unseen) };
+        }
+        *c.len = c.write + unseen;
+    }
 }
 
 // The `@` arms come first, so a recursive call never tries the main arm.
@@ -619,6 +659,79 @@ impl<C: Columns, A: Allocator> Soa<C, A> {
         self.truncate(0);
     }
 
+    /// Puts `new` at `row`, moving the rows after it back one: `O(len - row)` per column.
+    #[track_caller]
+    pub fn insert(&mut self, row: usize, new: C) {
+        if row > self.len {
+            out_of_bounds("Soa::insert", row, self.len);
+        }
+        if self.len == self.cap {
+            self.reserve(1);
+        }
+        // SAFETY: `len < cap`: rows `row..len` move to `row + 1..len + 1`, in the capacity; row
+        // `row` is then empty and written.
+        unsafe {
+            shift::<C>(self.cols, row, row + 1, self.len - row);
+            new.write(self.cols, row);
+        }
+        self.len += 1;
+    }
+
+    /// Takes row `row` out, moving the rows after it forward one.
+    #[track_caller]
+    pub fn remove(&mut self, row: usize) -> C {
+        if row >= self.len {
+            out_of_bounds("Soa::remove", row, self.len);
+        }
+        // SAFETY: row `row` holds values, read out once; rows `row + 1..len` then move into its
+        // place and the length stops counting the last.
+        unsafe {
+            let taken = C::read(self.cols, row);
+            shift::<C>(self.cols, row + 1, row, self.len - row - 1);
+            self.len -= 1;
+            taken
+        }
+    }
+
+    /// Keeps the rows `keep(self, row)` says yes to, in order.
+    ///
+    /// `keep` is asked of every row first, with the vector whole (a panic in it changes
+    /// nothing); then the rows said no to are dropped and the rest moved down, a panicking drop
+    /// keeping the rows not yet seen. Memory: one flag per row, from the vector's allocator.
+    pub fn retain(&mut self, mut keep: impl FnMut(&Soa<C, A>, usize) -> bool) {
+        let len = self.len;
+        // The flags borrow only the allocator, which the compaction below does not touch.
+        let mut kept = Vec::with_capacity_in(len, &self.alloc);
+        for row in 0..len {
+            kept.push(keep(self, row));
+        }
+        if kept.iter().all(|&k| k) {
+            return;
+        }
+        let cols = self.cols;
+        // Nothing counts as in the vector while it is compacted; the guard sets the length.
+        self.len = 0;
+        let compact = Compact::<C> { len: &mut self.len, cols, read: 0, write: 0, total: len, _rows: PhantomData };
+        let mut at = DropGuard::new(compact, Compact::finish);
+        while at.read < len {
+            let read = at.read;
+            // Counted as gone before its drop, so a panic there does not drop it again.
+            at.read += 1;
+            if !kept[read] {
+                // SAFETY: row `read` holds values no longer counted, read out once; dropping the
+                // tuple drops every field, a panic in one among the ways.
+                drop(unsafe { C::read(cols, read) });
+                continue;
+            }
+            let write = at.write;
+            if read != write {
+                // SAFETY: row `read` holds values; row `write < read` was emptied.
+                unsafe { shift::<C>(cols, read, write, 1) };
+            }
+            at.write += 1;
+        }
+    }
+
     /// Column `I`, one slice of every row's field `I`.
     pub fn column<const I: usize>(&self) -> &[<C as ColumnAt<I>>::T]
     where
@@ -701,6 +814,29 @@ unsafe impl<#[may_dangle] C: Columns, A: Allocator> Drop for Soa<C, A> {
         });
         // SAFETY: rows `0..len` hold values, dropped once; nothing reads them after.
         unsafe { C::drop_rows(cols, 0, len) };
+    }
+}
+
+impl<C: CloneColumns, A: Allocator + Clone> Clone for Soa<C, A> {
+    /// Each row cloned in turn into a block of exactly `len` rows; a panicking clone drops the
+    /// clones made and frees the block.
+    fn clone(&self) -> Soa<C, A> {
+        let mut out = Soa::with_capacity_in(self.len, self.alloc.clone());
+        for row in self.iter() {
+            out.push(C::clone_row(row));
+        }
+        out
+    }
+}
+
+impl<C: DebugColumns, A: Allocator> fmt::Debug for Soa<C, A> {
+    /// As a list of rows, each a tuple of its fields.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut list = f.debug_list();
+        for row in self.iter() {
+            C::debug_row(row, &mut list);
+        }
+        list.finish()
     }
 }
 
@@ -873,6 +1009,24 @@ macro_rules! soa {
                 $Row::__from_columns(self.raw.swap_remove(row))
             }
 
+            #[track_caller]
+            pub fn insert(&mut self, row: usize, new: $Row) {
+                self.raw.insert(row, new.__into_columns());
+            }
+
+            #[track_caller]
+            pub fn remove(&mut self, row: usize) -> $Row {
+                $Row::__from_columns(self.raw.remove(row))
+            }
+
+            /// Keeps the rows `keep` says yes to; costs and panics as `Soa::retain`'s.
+            pub fn retain(&mut self, mut keep: impl FnMut($Ref<'_>) -> bool) {
+                self.raw.retain(|rows, row| match rows.get(row) {
+                    Some(columns) => keep($Ref::__from_columns(columns)),
+                    None => unreachable!("retain asks only for rows below the length"),
+                });
+            }
+
             pub fn truncate(&mut self, len: usize) {
                 self.raw.truncate(len);
             }
@@ -910,6 +1064,26 @@ macro_rules! soa {
                     self.raw.column_mut::<{ $crate::soa::index_of($Row::__SOA_FIELDS, stringify!($field)) }>()
                 }
             )+
+        }
+
+        // Bounded through `A`, so a row type whose fields are not all `Clone` (or `Debug`) just
+        // goes without the impl.
+        impl<A: $crate::soa::Allocator> Clone for $Vec<A>
+        where
+            $crate::soa::Soa<($($ty,)+), A>: Clone,
+        {
+            fn clone(&self) -> $Vec<A> {
+                $Vec { raw: self.raw.clone() }
+            }
+        }
+
+        impl<A: $crate::soa::Allocator> core::fmt::Debug for $Vec<A>
+        where
+            $crate::soa::Soa<($($ty,)+), A>: core::fmt::Debug,
+        {
+            fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+                core::fmt::Debug::fmt(&self.raw, f)
+            }
         }
     };
 }

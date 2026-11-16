@@ -1,8 +1,7 @@
 //! [`Rc`] and [`Weak`]: [`Arc`](crate::Arc)'s shape counted on one thread, with plain cells
 //! for counts. Neither is `Send` or `Sync` (the `NonNull` inside makes them neither).
 //!
-//! Not here yet, as for `Arc`: `new_cyclic`, `into_raw`/`from_raw`, `make_mut` for unsized
-//! values, `Weak::new` without a block.
+//! Not here yet, as for `Arc`: `make_mut` for unsized values, `Weak::new` without a block.
 
 use core::{
     alloc::{Allocator, AllocatorClone, Layout, StaticAllocator},
@@ -104,6 +103,30 @@ impl<T, A: Allocator> Rc<T, A> {
         // SAFETY: a fresh block of `Inner<T>`'s layout, empty.
         unsafe { ptr.as_ptr().write(inner) };
         Ok(Rc { ptr, alloc, _owns: PhantomData })
+    }
+
+    /// As [`Arc::new_cyclic_in`](crate::Arc::new_cyclic_in).
+    pub fn new_cyclic_in(make: impl FnOnce(&Weak<T, A>) -> T, alloc: A) -> Rc<T, A> {
+        let layout = Layout::new::<Inner<T>>();
+        let Ok(block) = alloc.allocate(layout) else {
+            fail(AllocFailure::Refused { what: type_name::<T>(), layout });
+        };
+        let ptr = block.cast::<Inner<T>>();
+        // SAFETY: a fresh block of `Inner<T>`'s layout: counts written, value left for `make`.
+        unsafe {
+            (&raw mut (*ptr.as_ptr()).strong).write(Cell::new(0));
+            (&raw mut (*ptr.as_ptr()).weak).write(Cell::new(1));
+        }
+        // The owners' shared weak reference; a panic in `make` drops it, freeing the block.
+        let weak = Weak { ptr, alloc };
+        let value = make(&weak);
+        // SAFETY: the value's place is empty and nothing reaches it while strong is 0.
+        unsafe { (&raw mut (*ptr.as_ptr()).value).write(value) };
+        weak.strong().set(1);
+        let weak = ManuallyDrop::new(weak);
+        // SAFETY: `weak` is never dropped; its allocator moves out once.
+        let alloc = unsafe { ptr::read(&weak.alloc) };
+        Rc { ptr, alloc, _owns: PhantomData }
     }
 
     /// As [`Arc::pin_in`](crate::Arc::pin_in).
@@ -276,6 +299,41 @@ impl<T: ?Sized, A: Allocator> Rc<T, A> {
     pub fn allocator(this: &Rc<T, A>) -> &A {
         &this.alloc
     }
+
+    /// As [`Arc::into_raw_with_allocator`](crate::Arc::into_raw_with_allocator).
+    pub fn into_raw_with_allocator(this: Rc<T, A>) -> (*const T, A) {
+        let this = ManuallyDrop::new(this);
+        let value = Rc::as_ptr(&this);
+        // SAFETY: `this` is never dropped, so its allocator moves out once.
+        (value, unsafe { ptr::read(&this.alloc) })
+    }
+
+    /// An owner back from [`Rc::into_raw_with_allocator`].
+    ///
+    /// # Safety
+    ///
+    /// As [`Arc::from_raw_in`](crate::Arc::from_raw_in), for an `Rc`.
+    pub unsafe fn from_raw_in(value: *const T, alloc: A) -> Rc<T, A> {
+        // SAFETY: from a live block (the caller's promise).
+        let ptr = unsafe { value_block(value) };
+        Rc { ptr, alloc, _owns: PhantomData }
+    }
+}
+
+/// The block of the value at `value`: the header's size rounded up to the value's alignment
+/// before it, as `repr(C)` places the last field.
+///
+/// # Safety
+///
+/// `value` points to the value of a live block (dropped or not), with metadata valid for it.
+unsafe fn value_block<T: ?Sized>(value: *const T) -> NonNull<Inner<T>> {
+    // SAFETY: the metadata is valid (the caller's promise); only the alignment is read.
+    let align = unsafe { Layout::for_value_raw(value) }.align();
+    let offset = Layout::new::<Inner<()>>().size().next_multiple_of(align);
+    // SAFETY: the block begins `offset` bytes before its value, in one allocation.
+    let block = unsafe { value.byte_sub(offset) } as *mut Inner<T>;
+    // SAFETY: inside a block, so not null.
+    unsafe { NonNull::new_unchecked(block) }
 }
 
 impl<T: ?Sized, A: AllocatorClone> Clone for Rc<T, A> {
@@ -337,6 +395,28 @@ impl<T: ?Sized, A: Allocator> Weak<T, A> {
 
     pub fn ptr_eq(&self, other: &Weak<T, A>) -> bool {
         ptr::addr_eq(self.ptr.as_ptr(), other.ptr.as_ptr())
+    }
+
+    /// Where the value is, or was; as [`arc::Weak::as_ptr`](crate::arc::Weak::as_ptr).
+    pub fn as_ptr(&self) -> *const T {
+        // SAFETY: the block is live; a place, no reference made.
+        unsafe { &raw const (*self.ptr.as_ptr()).value }
+    }
+
+    pub fn into_raw_with_allocator(self) -> (*const T, A) {
+        let this = ManuallyDrop::new(self);
+        let value = this.as_ptr();
+        // SAFETY: `this` is never dropped, so its allocator moves out once.
+        (value, unsafe { ptr::read(&this.alloc) })
+    }
+
+    /// # Safety
+    ///
+    /// As [`Rc::from_raw_in`], for a pointer a `Weak` gave.
+    pub unsafe fn from_raw_in(value: *const T, alloc: A) -> Weak<T, A> {
+        // SAFETY: the weak count kept the block live (the caller's promise).
+        let ptr = unsafe { value_block(value) };
+        Weak { ptr, alloc }
     }
 }
 

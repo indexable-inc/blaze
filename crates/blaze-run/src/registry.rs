@@ -13,9 +13,10 @@
 
 #![blaze::sans_io]
 
-use alloc::vec::Vec;
 use core::alloc::Allocator;
 use core::fmt;
+
+use blaze_own::{Vec, soa};
 
 use crate::{CheckoutKey, InstanceKey, Nanos, Plant, TestId};
 
@@ -36,15 +37,17 @@ pub struct Name {
     pub start: ProcessStart,
 }
 
-/// One live run, as its file holds it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Entry {
-    pub name: Name,
-    pub checkout: CheckoutKey,
-    /// The program's entry instance.
-    pub program: InstanceKey,
-    /// When it began, on the run's own clock.
-    pub began: Nanos,
+soa! {
+    /// One live run, as its file holds it: its name, the checkout it is of, the program's entry
+    /// instance and when it began, on the run's own clock. A read lists them as [`Entries`], by
+    /// columns: a viewer picks runs by checkout or program, scanning that column alone.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Entry, Entries, EntryRef {
+        pub name: Name => names / names_mut,
+        pub checkout: CheckoutKey => checkouts / checkouts_mut,
+        pub program: InstanceKey => programs / programs_mut,
+        pub began: Nanos => begans / begans_mut,
+    }
 }
 
 /// The bytes of an entry: a version word, then the fields in order, little-endian.
@@ -213,16 +216,15 @@ impl Registry {
         Ok(())
     }
 
-    /// The directory as listed: the live runs into `live`, sorted by name; each entry of a dead
-    /// process removed.
-    pub fn read<A: Allocator, P: Processes>(
+    /// The directory as listed: the live runs pushed to `live`, which is then sorted by name;
+    /// each entry of a dead process removed.
+    pub fn read<A: Allocator, B: Allocator, P: Processes>(
         &self,
         listing: &[(Name, &[u8])],
         processes: &P,
-        live: &mut Vec<Entry, A>,
+        live: &mut Entries<B>,
         out: &mut Vec<Effect, A>,
     ) -> Result<(), Error> {
-        let first = live.len();
         for (file, bytes) in listing {
             let entry = Entry::decode(bytes).map_err(|bad| Error::BadEntry { name: *file, bad })?;
             if entry.name != *file {
@@ -239,7 +241,7 @@ impl Registry {
                 out.push(Effect::Remove { name: entry.name });
             }
         }
-        live[first..].sort_unstable_by_key(|entry| entry.name);
+        live.sort_by_key(|entry| *entry.name);
         Ok(())
     }
 }

@@ -178,30 +178,11 @@ pub trait TypeCtx {
         name: Name,
         reads: &mut Reads<'_, W, A>,
     ) -> Result<Option<Ty>, Stop>;
-}
 
-/// Runs `f` in a snapshot that is always rolled back, whichever way `f` returns
-/// (`InferCtxt::probe`). The rollback is a `DropGuard`, so a `?` inside rolls back too.
-pub(crate) fn probe<C: TypeCtx, R>(ty: &mut C, f: impl FnOnce(&mut C) -> R) -> R {
-    let snap = ty.snapshot();
-    let mut guard = core::mem::DropGuard::new((ty, snap), |(ty, snap)| C::rollback_to(ty, snap));
-    f(&mut *guard.0)
-}
-
-/// Runs `f` in a snapshot kept when it returns `Ok(Some(_))` and rolled back otherwise
-/// (`InferCtxt::commit_if_ok`).
-pub(crate) fn commit_if<C: TypeCtx, T, E>(
-    ty: &mut C,
-    f: impl FnOnce(&mut C) -> Result<Option<T>, E>,
-) -> Result<Option<T>, E> {
-    let snap = ty.snapshot();
-    let mut guard = core::mem::DropGuard::new((ty, snap), |(ty, snap)| C::rollback_to(ty, snap));
-    match f(&mut *guard.0) {
-        Ok(Some(v)) => {
-            let (ty, snap) = core::mem::DropGuard::dismiss(guard);
-            ty.commit(snap);
-            Ok(Some(v))
-        }
-        other => other,
-    }
+    /// The closure-signature hint of `var` from pending obligations
+    /// (`deduce_closure_signature`): the inputs and output of the first pending
+    /// `var: Fn*<(inputs..)>` obligation (`fn_traits` is `[Fn, FnMut, FnOnce]`): the inputs'
+    /// tuple elements, and the term of a pending `<var as FnOnce<..>>::Output` projection
+    /// (`output` is its name) if there is one. `None` when no such obligation is pending.
+    fn closure_hint(&mut self, var: Ty, fn_traits: [ItemKey; 3], output: Name) -> Option<(TyList, Option<Ty>)>;
 }

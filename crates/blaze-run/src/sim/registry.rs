@@ -6,11 +6,12 @@ use std::alloc::Global;
 use std::collections::BTreeMap;
 
 use blaze_format::Aligned;
+use blaze_own::Vec as Own;
 use blaze_sim::{Broke, Config, Tape, check, control};
 
 use super::{harness, key, oracle};
 use crate::events;
-use crate::registry::{Effect, Entry, Name, Pid, ProcessStart, Processes, Registry, RunEvent};
+use crate::registry::{Effect, Entries, Entry, Name, Pid, ProcessStart, Processes, Registry, RunEvent};
 use crate::{CheckoutKey, InstanceKey, Nanos, Plant, TestId};
 
 const PIDS: u32 = 3;
@@ -24,7 +25,7 @@ impl Processes for Table {
     }
 }
 
-fn apply(effects: &mut Vec<Effect, Global>, directory: &mut BTreeMap<Name, Vec<u8>>) {
+fn apply(effects: &mut Own<Effect, Global>, directory: &mut BTreeMap<Name, Vec<u8>>) {
     for effect in effects.drain(..) {
         match effect {
             Effect::Put { name, bytes } => {
@@ -42,7 +43,7 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     let mut table = Table(BTreeMap::new());
     let mut runs: BTreeMap<Pid, Registry> = BTreeMap::new();
     let mut directory: BTreeMap<Name, Vec<u8>> = BTreeMap::new();
-    let mut effects = Vec::new_in(Global);
+    let mut effects = Own::new_in(Global);
     let mut starts = 0u64;
     let steps = tape.range(1..80, "steps");
     for _ in 0..steps {
@@ -81,9 +82,9 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
                 registry.plant = plant;
                 let listing: Vec<(Name, &[u8])> =
                     directory.iter().map(|(name, bytes)| (*name, bytes.as_slice())).collect();
-                let mut live = Vec::new_in(Global);
+                let mut live = Entries::new_in(Global);
                 registry.read(&listing, &table, &mut live, &mut effects).map_err(harness)?;
-                for entry in &live {
+                for entry in live.iter() {
                     oracle(table.start_of(entry.name.pid) == Some(entry.name.start), || {
                         format!(
                             "a read listed run {}-{}, a dead run",
@@ -137,7 +138,7 @@ fn a_batch_of_events_reads_back_as_written() {
         // Equal events are equal bytes (rule 25).
         oracle(events::write(&events, Global) == bytes, || "a batch written twice differs".into())?;
         let aligned = Aligned::copy_from(&bytes);
-        let mut back = Vec::new_in(Global);
+        let mut back = Own::new_in(Global);
         let read = events::read(&aligned, &mut back);
         oracle(read.is_ok() && back.as_slice() == events.as_slice(), || {
             format!("{events:?} read back as {back:?} ({read:?})")

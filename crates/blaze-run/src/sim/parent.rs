@@ -12,6 +12,7 @@
 use std::alloc::Global;
 use std::collections::{BTreeMap, BTreeSet};
 
+use blaze_own::Vec as Own;
 use blaze_sim::{Broke, Config, Tape, check, control};
 
 use super::{harness, key, oracle};
@@ -62,7 +63,7 @@ struct World {
 }
 
 impl World {
-    fn see(&mut self, effects: &mut Vec<Effect, Global>, failing: Option<SlotId>) -> Result<(), Broke> {
+    fn see(&mut self, effects: &mut Own<Effect, Global>, failing: Option<SlotId>) -> Result<(), Broke> {
         for effect in effects.drain(..) {
             match effect {
                 Effect::Lookup { version, .. } => self.lookups.push(version.slot),
@@ -145,7 +146,7 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
         .map(|_| (0..KEYS).filter(|_| tape.one_in(3, "lacks")).map(|n| RecordKey(key(50 + n))).collect())
         .collect();
     let mut world = World::default();
-    let mut out = Vec::new_in(Global);
+    let mut out = Own::new_in(Global);
     let mut now = Nanos(0);
     let history: Vec<SlotId> = (0..FUNCTIONS).filter(|_| tape.one_in(3, "ran last time")).map(SlotId).collect();
     parent.start(&[SlotId(0)], &history, now, &mut out).map_err(harness)?;
@@ -175,9 +176,9 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
             }
             2 if !world.compiles.is_empty() => {
                 let slot = world.compiles.remove(tape.index(world.compiles.len(), "compile"));
-                let mut callees = Vec::new_in(Global);
+                let mut callees = Own::new_in(Global);
                 callees.extend_from_slice(&callees_of(slot));
-                let record = FastRecord { code: code_of(slot), callees, reads: Vec::new_in(Global) };
+                let record = FastRecord { code: code_of(slot), callees, reads: Own::new_in(Global) };
                 let missing: Vec<RecordKey> =
                     lacks[slot.index()].iter().filter(|it| !world.made.contains(*it)).copied().collect();
                 let ended = if failing == Some(slot) {
@@ -234,7 +235,7 @@ fn an_overrun_compile_fails_its_askers_and_a_late_success_serves_later_ones() {
     let functions = [Function { instance: InstanceKey(key(0)), code: CodeId(key(100)) }];
     let config = ParentConfig { workers: 2, compile_bound: Nanos(10), most_waiters: 8 };
     let mut parent = Parent::new(&functions, config, Global).expect("a parent");
-    let mut out = Vec::new_in(Global);
+    let mut out = Own::new_in(Global);
     parent.start(&[], &[], Nanos(0), &mut out).expect("started");
     out.clear();
     parent.need(ThreadId(1), SlotId(0), Nanos(0), &mut out).expect("needed");
@@ -247,7 +248,7 @@ fn an_overrun_compile_fails_its_askers_and_a_late_success_serves_later_ones() {
     });
     assert!(failed, "the asker was not failed past the bound: {out:?}");
     out.clear();
-    let record = FastRecord { code: CodeRef(key(5)), callees: Vec::new_in(Global), reads: Vec::new_in(Global) };
+    let record = FastRecord { code: CodeRef(key(5)), callees: Own::new_in(Global), reads: Own::new_in(Global) };
     parent.compiled(plain(SlotId(0)), Compiled::Record(&record), Nanos(12), &mut out).expect("a late end");
     assert!(out.iter().any(|effect| matches!(effect, Effect::Publish { .. })), "{out:?}");
     out.clear();

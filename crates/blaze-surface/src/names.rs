@@ -1,5 +1,6 @@
 //! The other records name resolution reads (docs/v2/plan/design/bottom.md, "The other records
-//! names need"): [`TextualEntry`], [`ModuleFile`], [`CrateRoot`] and [`MacroDef`].
+//! names need"): [`TextualEntry`], [`ModuleFile`] and [`CrateRoot`]; [`crate::MacroDef`] is in
+//! its own module with the macro words.
 
 use core::alloc::Allocator;
 use core::mem::offset_of;
@@ -12,7 +13,7 @@ use crate::column::{
     key_of_word, key_word, text_of,
 };
 use crate::error::BuildError;
-use crate::kind::{Edition, ItemIndex, MacroKind, Place, PlaceTag};
+use crate::kind::{Edition, ItemIndex};
 
 blaze_format::record! {
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -452,143 +453,5 @@ impl<'a> CrateRootView<'a> {
     pub fn tools(&self) -> impl Iterator<Item = &'a str> + use<'a> {
         let strings = self.strings;
         self.tools.iter().map(move |text| text_of(strings, *text))
-    }
-}
-
-blaze_format::record! {
-    #[derive(Clone, Copy, Debug)]
-    pub(crate) struct MacroDefRoot: 1 {
-        pub(crate) item: ContentId,
-        pub(crate) body: ContentId,
-        pub(crate) origin: ContentId,
-        pub(crate) name: Text,
-        pub(crate) index: u32,
-        pub(crate) helpers: Slice<Text>,
-        pub(crate) strings: Slice<u8>,
-        pub(crate) kind: MacroKind,
-        pub(crate) place: PlaceTag,
-        pub(crate) placed: bool,
-        pub(crate) exported: bool,
-        pub(crate) local_inner: bool,
-        pub(crate) pad: [u8; 3],
-    }
-}
-
-/// What a macro definition is.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct MacroDefHead<'a> {
-    /// The macro's item.
-    pub item: ItemKey,
-    pub name: &'a str,
-    /// The digest of the definition's tokens: what an `Expansion` is keyed by (the
-    /// definition's content, not its item key, so a moved macro keeps its expansions).
-    pub body: ContentId,
-    /// Where it is written; `None` for a builtin macro.
-    pub place: Option<Place>,
-    pub kind: MacroKind,
-    /// `#[macro_export]`.
-    pub exported: bool,
-    /// `#[macro_export(local_inner_macros)]`.
-    pub local_inner: bool,
-}
-
-/// The writer of one macro's [`MacroDef`]: its head and, for a derive, its helper attributes in
-/// the order `attributes(..)` lists them (the source's order, which fixes the bytes).
-pub struct MacroDef<'a, A: Allocator + Clone> {
-    head: MacroDefHead<'a>,
-    helpers: Vec<Text, A>,
-    staging: Strings<A>,
-    alloc: A,
-}
-
-impl<'a, A: Allocator + Clone> MacroDef<'a, A> {
-    pub fn new_in(head: MacroDefHead<'a>, alloc: A) -> MacroDef<'a, A> {
-        MacroDef {
-            head,
-            helpers: Vec::new_in(alloc.clone()),
-            staging: Strings::new_in(alloc.clone()),
-            alloc,
-        }
-    }
-
-    /// A derive's helper attribute.
-    pub fn helper(&mut self, name: &str) -> Result<(), BuildError> {
-        let name = self.staging.push(name, "MacroDef strings")?;
-        self.helpers.push(name);
-        Ok(())
-    }
-
-    pub fn finish(mut self) -> Result<Vec<u8, A>, BuildError> {
-        let mut strings = Strings::new_in(self.alloc.clone());
-        let name = strings.push(self.head.name, "MacroDef strings")?;
-        for text in &mut self.helpers {
-            *text = strings.moved(&self.staging, *text, "MacroDef strings")?;
-        }
-        let mut out = Writer::new_in(<MacroDefRoot as blaze_format::Record>::SCHEMA, self.alloc.clone());
-        let text = Column::push(&mut out, strings.bytes());
-        let helpers = Column::push(&mut out, &self.helpers);
-        let head = self.head;
-        let (place, origin, index) = match head.place {
-            Some(place) => place.to_record(),
-            None => (PlaceTag::File, ContentId([0; 32]), NONE),
-        };
-        Ok(finish_with(out, |at| MacroDefRoot {
-            item: head.item.0,
-            body: head.body,
-            origin,
-            name,
-            index,
-            helpers: helpers.slice(at, offset_of!(MacroDefRoot, helpers)),
-            strings: text.slice(at, offset_of!(MacroDefRoot, strings)),
-            kind: head.kind,
-            place,
-            placed: head.place.is_some(),
-            exported: head.exported,
-            local_inner: head.local_inner,
-            pad: [0; 3],
-        }))
-    }
-}
-
-/// A [`MacroDef`] record read in place.
-#[derive(Clone, Copy, Debug)]
-pub struct MacroDefView<'a> {
-    head: MacroDefHead<'a>,
-    helpers: &'a [Text],
-    strings: &'a str,
-}
-
-impl<'a> MacroDefView<'a> {
-    pub fn read(buffer: &'a [u8]) -> Result<MacroDefView<'a>, FormatError> {
-        let root = blaze_format::open::<MacroDefRoot>(buffer)?;
-        let strings = root.strings.as_str(buffer)?;
-        check_text(strings, root.name, root, buffer)?;
-        let helpers = root.helpers.follow(buffer)?;
-        for text in helpers {
-            check_text(strings, *text, text, buffer)?;
-        }
-        Ok(MacroDefView {
-            head: MacroDefHead {
-                item: ItemKey(root.item),
-                name: text_of(strings, root.name),
-                body: root.body,
-                place: root.placed.then(|| Place::from_record(root.place, root.origin, root.index)),
-                kind: root.kind,
-                exported: root.exported,
-                local_inner: root.local_inner,
-            },
-            helpers,
-            strings,
-        })
-    }
-
-    pub fn head(&self) -> MacroDefHead<'a> {
-        self.head
-    }
-
-    /// A derive's helper attributes, in the order it lists them.
-    pub fn helpers(&self) -> impl Iterator<Item = &'a str> + use<'a> {
-        let strings = self.strings;
-        self.helpers.iter().map(move |text| text_of(strings, *text))
     }
 }

@@ -2,7 +2,7 @@
 //! allowed, in the allocator it is given. What the type table hash-conses with and the driver
 //! caches exports in. Iteration order is never observed: it has no iterator.
 
-use alloc::vec::Vec;
+use blaze_own::Vec;
 use core::alloc::Allocator;
 
 use crate::error::{CheckError, Limit};

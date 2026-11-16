@@ -9,65 +9,28 @@
 
 use core::alloc::Allocator;
 
-use alloc::{alloc::Global, vec::Vec};
+use blaze_own::Vec;
 
 use blaze_id::{ContentId, CrateItemKey, ItemKey, Portable};
 use span::{EditionedFileId, FileId, ROOT_ERASED_FILE_AST_ID, SpanAnchor, SyntaxContext};
 
 use crate::error::{LexError, StreamError, Table};
 
-/// The edition a token is read in.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub enum Edition {
-    E2015,
-    E2018,
-    E2021,
-    E2024,
-}
+/// The edition a token is read in: the schema's one `Edition`.
+pub use blaze_surface::Edition;
 
-impl Edition {
-    const ALL: [Edition; 4] = [Edition::E2015, Edition::E2018, Edition::E2021, Edition::E2024];
-
-    pub(crate) fn byte(self) -> u8 {
-        match self {
-            Edition::E2015 => 0,
-            Edition::E2018 => 1,
-            Edition::E2021 => 2,
-            Edition::E2024 => 3,
-        }
-    }
-
-    pub(crate) fn to_span(self) -> span::Edition {
-        match self {
-            Edition::E2015 => span::Edition::Edition2015,
-            Edition::E2018 => span::Edition::Edition2018,
-            Edition::E2021 => span::Edition::Edition2021,
-            Edition::E2024 => span::Edition::Edition2024,
-        }
+/// `edition` as the span crate's, for mbe and the lexer.
+pub(crate) fn span_edition(edition: Edition) -> span::Edition {
+    match edition {
+        Edition::E2015 => span::Edition::Edition2015,
+        Edition::E2018 => span::Edition::Edition2018,
+        Edition::E2021 => span::Edition::Edition2021,
+        Edition::E2024 => span::Edition::Edition2024,
     }
 }
 
-/// How an expansion's mark resolves names (rustc's `Transparency`).
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub enum Transparency {
-    /// Resolved at the call site (`Span::call_site`, `macro` hygiene opt-outs).
-    Transparent,
-    /// Locals, labels and `$crate` at the definition, everything else at the call site
-    /// (`macro_rules!`, `Span::mixed_site`).
-    SemiOpaque,
-    /// Resolved at the definition (`macro`, `Span::def_site`).
-    Opaque,
-}
-
-impl Transparency {
-    pub(crate) fn byte(self) -> u8 {
-        match self {
-            Transparency::Transparent => 0,
-            Transparency::SemiOpaque => 1,
-            Transparency::Opaque => 2,
-        }
-    }
-}
+/// How an expansion's mark resolves names, and where a macro is defined: the schema's own.
+pub use blaze_surface::{DefSite, Transparency};
 
 /// A group's delimiter.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -535,7 +498,7 @@ impl<A: Allocator> TokenStream<A> {
 
     /// The first token at which the delimiters do not pair up, if any.
     pub(crate) fn unbalanced(&self) -> Option<u32> {
-        let mut open: Vec<Delim, Global> = Vec::new_in(Global);
+        let mut open = Vec::new_in(self.tokens.allocator());
         for (at, token) in self.tokens.iter().enumerate() {
             match token.kind {
                 TokenKind::Open(delim) => open.push(delim),
@@ -725,11 +688,11 @@ pub fn lex<A: Allocator + Clone>(
     alloc: A,
 ) -> Result<TokenStream<A>, LexError> {
     let anchor = SpanAnchor {
-        file_id: EditionedFileId::new(FileId::from_raw(0), edition.to_span()),
+        file_id: EditionedFileId::new(FileId::from_raw(0), span_edition(edition)),
         ast_id: ROOT_ERASED_FILE_AST_ID,
     };
-    let root = SyntaxContext::root(edition.to_span());
-    let tree = syntax_bridge::parse_to_token_tree(edition.to_span(), anchor, root, text)
+    let root = SyntaxContext::root(span_edition(edition));
+    let tree = syntax_bridge::parse_to_token_tree(span_edition(edition), anchor, root, text)
         .ok_or(LexError::Refused { edition })?;
     let mut out = TokenStream::new_in(alloc);
     let mut last = None;
@@ -812,8 +775,6 @@ fn joined_to<A: Allocator + Clone>(
     }
 }
 
-// SAFETY: a closed enum of four editions; it names nothing interned.
-unsafe impl Portable for Edition {}
 // SAFETY: a closed enum; it names nothing interned.
 unsafe impl Portable for Transparency {}
 // SAFETY: a closed enum; it names nothing interned.

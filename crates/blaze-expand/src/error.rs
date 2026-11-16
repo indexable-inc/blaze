@@ -8,7 +8,7 @@ use crate::{
     call::CallShape,
     cx::HostError,
     def::{BuiltinAttr, BuiltinFn},
-    expansion::Origin,
+    expansion::TokenOrigin,
     tokens::Edition,
 };
 
@@ -101,7 +101,7 @@ pub enum ExpandError {
     /// A span came back from mbe or a derive that this crate did not give it.
     ForeignSpan { role: u32 },
     /// An origin names a token its stream does not have.
-    ForeignOrigin { origin: Origin },
+    ForeignOrigin { origin: TokenOrigin },
     /// A stream's delimiters do not pair up: its token `token` closes nothing or is left open.
     Unbalanced { stream: Stream, token: u32 },
     /// A stream given as input holds a context marked [`crate::MarkOf::This`]: an expansion's

@@ -3,7 +3,7 @@
 //! before parents in one node column, lists of children in one side column. Becomes blaze-ty's
 //! portable type table; what this crate needs of it is exactly this shape.
 
-use alloc::vec::Vec;
+use blaze_own::Vec;
 use core::alloc::Allocator;
 
 use crate::error::{CheckError, Malformed};

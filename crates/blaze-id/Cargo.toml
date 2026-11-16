@@ -15,9 +15,9 @@ repository.workspace = true
 
 [features]
 # serde's forms of the keys, for the crates above that persist them with serde (the root
-# manifest's entry turns it on): with it off, this crate depends only on workspace crates that
-# depend on no crate from outside it (docs/v2/plan/design/bottom.md, "Also decided on
-# 2026-11-15").
+# manifest's entry turns it on): with it off, this crate's whole graph is workspace crates
+# (blaze-ids, blaze-hash, blaze-blake3, blaze-radix, blaze-rng, blaze-swiss) and one crate from
+# outside it, hashbrown, which blaze-hash's tables are and which depends on nothing itself (docs/v2/plan/design/bottom.md, "Also decided on 2026-11-15").
 serde = ["dep:serde", "blaze-ids/serde"]
 
 [dependencies]

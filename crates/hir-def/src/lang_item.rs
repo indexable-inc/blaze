@@ -12,7 +12,7 @@ use crate::{
     ItemContainerId, MacroId, ModuleDefId, StaticId, StructId, TraitId, TypeAliasId, UnionId,
     attrs::AttrFlags,
     key::FromKey,
-    nameres::DefMap,
+    nameres::{DefMap, ModuleScope},
 };
 use base_db::{ItemKey, OrNeed};
 use blaze_surface::{ItemKind, Items};
@@ -113,18 +113,18 @@ fn resolve_core_path(
     name: Symbol,
     ns: blaze_surface::Namespace,
 ) -> Option<ItemKey> {
-    let mut current = core_def_map.module(db, core_def_map.root_module_id());
+    let mut current = ModuleScope::of(core_def_map.root_module_id());
     for module in modules {
-        let target = current.scope(db).get(db, blaze_surface::Namespace::Types, &Name::new_symbol_root(*module))?;
+        let target = current.get(db, blaze_surface::Namespace::Types, &Name::new_symbol_root(*module))?;
         let blaze_surface::Target::Item(key) = target else { return None };
         if !key.is_of(core_def_map.krate().key(db)) {
             return None;
         }
-        current = core_def_map.module(db, crate::key::module_of_key(db, key));
+        current = ModuleScope::of(crate::key::module_of_key(db, key));
     }
-    match current.scope(db).get(db, ns, &Name::new_symbol_root(name))? {
+    match current.get(db, ns, &Name::new_symbol_root(name))? {
         blaze_surface::Target::Item(key) => Some(key),
-        blaze_surface::Target::Undetermined | blaze_surface::Target::Ambiguous => None,
+        blaze_surface::Target::Undetermined | blaze_surface::Target::Ambiguous(..) => None,
     }
 }
 

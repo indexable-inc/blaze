@@ -7,7 +7,9 @@ use std::alloc::Global;
 use blaze_format::{Aligned, FormatError};
 use blaze_id::{ContentId, CrateItemKey, ItemKey, NoItem};
 
-use crate::crate_facts::{CrateGraphView, LangItemsView, NoImplsOfView};
+use crate::crate_graph::CrateGraphView;
+use crate::impl_index::NoImplsOfView;
+use crate::lang_items::LangItemsView;
 use crate::error::SurfaceError;
 use crate::file_items::FileItemsView;
 use crate::items::{Items, Source};
@@ -87,7 +89,11 @@ impl MemSurface {
             Fact::MacroDef => MacroDefView::read(&buffer)?.head().item.0,
             Fact::KeyIndex => KeyIndexView::read(&buffer)?.module().0,
             Fact::LangItems => LangItemsView::read(&buffer)?.krate().0,
-            Fact::CrateGraph => CrateGraphView::read(&buffer)?.root().0,
+            // One graph per build, of every crate: filed under the crate this surface is of.
+            Fact::CrateGraph => {
+                CrateGraphView::read(&buffer)?;
+                self.krate.0
+            }
             Fact::NoImplsOf => NoImplsOfView::read(&buffer)?.krate().0,
         };
         self.records.retain(|(held, at, _)| (*held, *at) != (fact, key));

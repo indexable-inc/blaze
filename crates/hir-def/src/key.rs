@@ -17,10 +17,15 @@ use intern::sym;
 use span::AstIdNode;
 use syntax::{AstNode, AstPtr, TextRange, TextSize};
 
+use std::alloc::Global;
+
+use hir_expand::MacroCallStyles;
+
 use crate::{
-    AssocItemLoc, ConstId, EnumId, EnumVariantId, EnumVariantLoc, ExternCrateId, FunctionId,
-    ImplId, Intern, ItemContainerId, ItemLoc, Lookup, ModuleId, ModuleIdLt, StaticId, StructId,
-    TraitId, TypeAliasId, UnionId, UseId,
+    AdtId, AssocItemLoc, ConstId, EnumId, EnumVariantId, EnumVariantLoc, ExternCrateId,
+    FunctionId, ImplId, Intern, ItemContainerId, ItemLoc, Lookup, Macro2Loc, MacroExpander,
+    MacroId, MacroRulesLoc, MacroRulesLocFlags, ModuleDefId, ModuleId, ModuleIdLt, ProcMacroLoc,
+    StaticId, StructId, TraitId, TypeAliasId, UnionId, UseId,
 };
 
 /// The crate an item key is of, which the task holds; one it does not is a stop naming the
@@ -237,4 +242,117 @@ pub fn ast_id_of<N: AstIdNode>(db: &Db, key: ItemKey) -> AstId<N> {
     let hir_file = HirFileId::from(file_id);
     let id = hir_file.ast_id_map(db).ast_id_for_ptr(AstPtr::new(&node));
     AstId::new(hir_file, id)
+}
+
+/// What a scope binding's target is, as the type checker names it: by the item's kind. An
+/// `impl`, a `use` and a field are bound in no namespace; one a record names so is a broken
+/// record, which this names.
+pub fn module_def_of_key(db: &Db, key: ItemKey) -> ModuleDefId {
+    match db.items().kind(key).or_need() {
+        ItemKind::Function => ModuleDefId::FunctionId(FunctionId::of_key(db, key)),
+        ItemKind::Struct => ModuleDefId::AdtId(AdtId::StructId(StructId::of_key(db, key))),
+        ItemKind::Enum => ModuleDefId::AdtId(AdtId::EnumId(EnumId::of_key(db, key))),
+        ItemKind::Union => ModuleDefId::AdtId(AdtId::UnionId(UnionId::of_key(db, key))),
+        ItemKind::Trait => ModuleDefId::TraitId(TraitId::of_key(db, key)),
+        ItemKind::Const => ModuleDefId::ConstId(ConstId::of_key(db, key)),
+        ItemKind::Static => ModuleDefId::StaticId(StaticId::of_key(db, key)),
+        ItemKind::TypeAlias => ModuleDefId::TypeAliasId(TypeAliasId::of_key(db, key)),
+        ItemKind::Module => ModuleDefId::ModuleId(module_of_key(db, key)),
+        ItemKind::Variant => ModuleDefId::EnumVariantId(EnumVariantId::of_key(db, key)),
+        ItemKind::Macro => ModuleDefId::MacroId(macro_of_key(db, key)),
+        kind @ (ItemKind::Impl | ItemKind::Use | ItemKind::ExternCrate | ItemKind::Field) => {
+            panic!("item {key:x}: a scope binds it, but a {} is bound in no namespace", kind.name())
+        }
+    }
+}
+
+/// The macro a `MacroDef` record describes, as the id the expander is asked through. The
+/// flags a macro's attributes set (`#[allow_internal_unsafe]`, `#[rustc_macro_edition_2021]`)
+/// are not in the record's head yet (reconnect.md, "What the new-layer crates lack"); they are
+/// read by expansion, which runs from `Expansion` records, never from these ids.
+pub fn macro_of_key(db: &Db, key: ItemKey) -> MacroId {
+    use hir_expand::{
+        builtin::{find_builtin_attr, find_builtin_derive, find_builtin_macro},
+        proc_macro::{CustomProcMacroExpander, ProcMacroKind, ProcMacros},
+    };
+    use blaze_surface::MacroKind;
+
+    let def = db.items().macro_def(key).or_need();
+    let head = def.head();
+    let container = module_container_of(db, key);
+    let krate = container.krate(db);
+    let edition = krate.data(db).edition;
+    let name = Name::new_symbol_root(intern::Symbol::intern(head.name));
+    let declarative = MacroExpander::Declarative { styles: MacroCallStyles::FN_LIKE };
+    let proc_macro = |kind: ProcMacroKind| {
+        let listed = ProcMacros::get_for_crate(db, krate)
+            .and_then(|macros| macros.macros())
+            .and_then(|macros| macros.iter().position(|it| it.name == *name.symbol()));
+        let expander = match listed {
+            Some(at) => CustomProcMacroExpander::new(at as u32),
+            None => CustomProcMacroExpander::missing_expander(),
+        };
+        MacroId::ProcMacroId(ProcMacroLoc { container, key, expander, kind, edition }.intern(db))
+    };
+    match head.kind {
+        MacroKind::Rules => {
+            let mut flags = MacroRulesLocFlags::empty();
+            flags.set(MacroRulesLocFlags::LOCAL_INNER, head.local_inner);
+            let loc = MacroRulesLoc { container, key, expander: declarative, flags, edition };
+            MacroId::MacroRulesId(loc.intern(db))
+        }
+        MacroKind::Macro2 => {
+            let loc = Macro2Loc { container, key, expander: declarative, allow_internal_unsafe: false, edition };
+            MacroId::Macro2Id(loc.intern(db))
+        }
+        MacroKind::Builtin => {
+            let expander = match find_builtin_macro(&name) {
+                Some(either::Either::Left(it)) => MacroExpander::BuiltIn(it),
+                Some(either::Either::Right(it)) => MacroExpander::BuiltInEager(it),
+                None => match (find_builtin_attr(&name), find_builtin_derive(&name)) {
+                    (Some(it), _) => MacroExpander::BuiltInAttr(it),
+                    (None, Some(it)) => MacroExpander::BuiltInDerive(it),
+                    (None, None) => MacroExpander::UnimplementedBuiltIn,
+                },
+            };
+            let loc = Macro2Loc { container, key, expander, allow_internal_unsafe: false, edition };
+            MacroId::Macro2Id(loc.intern(db))
+        }
+        MacroKind::ProcBang => proc_macro(ProcMacroKind::Bang),
+        MacroKind::ProcAttr => proc_macro(ProcMacroKind::Attr),
+        MacroKind::ProcDerive => proc_macro(ProcMacroKind::CustomDerive),
+    }
+}
+
+/// The module an item is in: itself for a module, else the nearest module above it.
+pub fn module_around(db: &Db, key: ItemKey) -> ItemKey {
+    let items = db.items();
+    let mut at = key;
+    // Each turn moves one parent up, ending at a module (a crate root has no parent and is one).
+    loop {
+        if items.kind(at).or_need() == ItemKind::Module {
+            return at;
+        }
+        match items.parent(at).or_need() {
+            Some(parent) => at = parent,
+            None => panic!("item {key:x}: its parents end at {at:x}, which is no module"),
+        }
+    }
+}
+
+/// The items inside `parent` (a module's, a trait's or an impl's associated items, an enum's
+/// variants, a struct's fields), in the order they are written, onto `out`: one read of the
+/// key-index page of the module around it ([`base_db::Records::members`]).
+pub fn members_into(db: &Db, parent: ItemKey, out: &mut Vec<(Place, ItemKey), Global>) {
+    let module = module_around(db, parent);
+    db.items().members(module, parent, out).or_need();
+}
+
+/// [`members_into`] into a new list, keys only.
+pub fn members(db: &Db, parent: ItemKey) -> Vec<ItemKey, Global> {
+    let mut placed = Vec::new_in(Global);
+    members_into(db, parent, &mut placed);
+    let mut keys = Vec::with_capacity_in(placed.len(), Global);
+    keys.extend(placed.into_iter().map(|(_, key)| key));
+    keys
 }

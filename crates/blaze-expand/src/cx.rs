@@ -5,11 +5,11 @@
 use core::alloc::Allocator;
 use core::fmt;
 
-use alloc::vec::Vec;
+use blaze_own::Vec;
 
 use crate::{
     def::{MacroDef, ProcKind},
-    expansion::{Origin, Reads},
+    expansion::{TokenOrigin, Reads},
     tokens::TokenStream,
 };
 
@@ -87,7 +87,7 @@ pub struct ProcCall<'a, A: Allocator> {
 /// made (env vars, files), recorded by the sandbox.
 pub struct Produced<A: Allocator> {
     pub tokens: TokenStream<A>,
-    pub origins: Vec<Origin, A>,
+    pub origins: Vec<TokenOrigin, A>,
     pub reads: Reads<A>,
 }
 

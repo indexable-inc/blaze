@@ -5,7 +5,9 @@ use core::alloc::Allocator;
 
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 
-use crate::crate_facts::{CrateGraphView, LangItemsView, NoImplsOfView};
+use crate::crate_graph::CrateGraphView;
+use crate::impl_index::NoImplsOfView;
+use crate::lang_items::LangItemsView;
 use crate::error::{NotBuilt, SurfaceError};
 use crate::file_items::{FileItem, FileItemsView};
 use crate::key_index::KeyEntry;

@@ -10,7 +10,7 @@
 
 use core::{alloc::Allocator, ops::Range};
 
-use alloc::vec::Vec;
+use blaze_own::Vec;
 
 use crate::tokens::{Delim, Raw, Spacing, Token, TokenKind, TokenStream};
 

@@ -2,7 +2,7 @@
 //! item is read by [`crate::adt`], and each impl is written straight into the expansion. What
 //! the impl names of the item (its name, a variant's, a field's, the generic parameters, the
 //! predicates, the field types' `T::Assoc` paths) is the item's own token, of origin
-//! [`Origin::Input`], so it keeps the item's hygiene and edition; what the derive writes is
+//! [`TokenOrigin::Input`], so it keeps the item's hygiene and edition; what the derive writes is
 //! made def-site ([`Transparency::Opaque`]), as rustc's derives write at `def_site`.
 //!
 //! The call's [`DeriveFacts`] say the rest: an item that also derives `Copy` and has no type
@@ -17,7 +17,7 @@ use crate::{
     def::BuiltinDerive,
     error::ExpandError,
     expand::Out,
-    expansion::{Diagnostic, Origin},
+    expansion::{Diagnostic, TokenOrigin},
     literal::{self, Buf},
     tokens::{Delim, LitKind, Raw, Spacing, TokenKind, TokenStream, Transparency, index},
 };
@@ -159,7 +159,7 @@ impl<A: Allocator + Clone> W<'_, '_, A> {
     /// The item's token at `at`.
     fn input(&mut self, at: usize) -> Written {
         let token = &self.input.tokens()[at];
-        self.out.push(token.kind, self.input.text_of(token), Origin::Input(index(at)))
+        self.out.push(token.kind, self.input.text_of(token), TokenOrigin::Input(index(at)))
     }
 
     /// The item's tokens `range`, the last one not joined to what is written after it.
@@ -171,7 +171,7 @@ impl<A: Allocator + Clone> W<'_, '_, A> {
             } else {
                 token.kind
             };
-            self.out.push(kind, self.input.text_of(token), Origin::Input(index(at)))?;
+            self.out.push(kind, self.input.text_of(token), TokenOrigin::Input(index(at)))?;
         }
         Ok(())
     }

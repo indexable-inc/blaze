@@ -9,6 +9,7 @@
 use std::alloc::Global;
 use std::collections::VecDeque;
 
+use blaze_own::Vec as Own;
 use blaze_sim::{Broke, Config, Tape, check, control};
 
 use super::{harness, key, oracle};
@@ -68,7 +69,7 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
         epoch: 0,
     };
     let mut pending: VecDeque<Write> = VecDeque::new();
-    let mut out = Vec::new_in(Global);
+    let mut out = Own::new_in(Global);
     let mut threads: Vec<Thread> = Vec::new();
     let mut next_thread = 0u64;
     let mut next_code = 0u64;

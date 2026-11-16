@@ -9,9 +9,10 @@
 
 #![blaze::sans_io]
 
-use alloc::vec::Vec;
+use blaze_own::Vec;
 use core::alloc::Allocator;
 
+use crate::columns::columns_eq;
 use crate::error::Stop;
 use crate::hash::{ContentHash, StableHasher};
 use crate::ids::{FloatTy, IntTy, ItemKey, LangItem, List, Mutbl, Name, PathIdx, ScopeId, UintTy};
@@ -256,11 +257,14 @@ pub trait World {
 
 /// The read list: each question asked and the content hash of its answer, sorted and
 /// deduplicated at the end of the run. Two columns.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct ReadList<A: Allocator + Clone> {
     pub questions: Vec<Question, A>,
     pub hashes: Vec<u64, A>,
 }
+
+columns_eq!(ReadList { questions, hashes });
+columns_eq!(Needs { questions });
 
 impl<A: Allocator + Clone> ReadList<A> {
     /// The hash recorded for `q`, if it was read.
@@ -278,7 +282,7 @@ impl<A: Allocator + Clone> ReadList<A> {
 }
 
 /// The questions a check needed: what the next check of the body fetches up front.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone)]
 pub struct Needs<A: Allocator + Clone> {
     pub questions: Vec<Question, A>,
 }

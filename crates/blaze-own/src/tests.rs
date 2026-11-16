@@ -6,7 +6,12 @@
 //!
 //! The counting allocator writes a pattern into every block it hands out, so a planted bug that
 //! reads a slot never written reads defined bytes (the oracle sees the wrong value) rather than
-//! uninitialized memory. The tests use no `unsafe` but the allocator's.
+//! uninitialized memory. The tests use no `unsafe` but the allocator's and the raw-pointer round
+//! trips', whose contracts they keep.
+//!
+//! The tests named for one hard spot (`make_mut` with only a `Weak`, `get_mut` against another
+//! thread's reads, growth from every wrap, the columns' places) are small and wait on nothing
+//! timed, so they mean the same under Miri, whose race detector checks the orderings.
 
 use core::{
     alloc::{AllocError, Allocator, Layout},
@@ -69,6 +74,11 @@ impl Counting {
 
     fn allocs(&self) -> usize {
         self.lock().allocs
+    }
+
+    /// Every live block: its address and the layout it was made with.
+    fn live_layouts(&self) -> StdVec<(usize, Layout)> {
+        self.lock().live.iter().map(|(&addr, &layout)| (addr, layout)).collect()
     }
 
     /// The allocation after `granted` more is refused (once).
@@ -780,6 +790,229 @@ fn arc_unique_paths() -> Result<(), Broke> {
     alloc.check()
 }
 
+/// `make_mut` when only a `Weak` shares: a refused block leaves owner and `Weak` as they were;
+/// a granted one moves the value (no clone), the `Weak` upgrades to nothing, and the old block
+/// lives exactly as long as the `Weak`.
+#[test]
+fn arc_make_mut_with_only_a_weak() -> Result<(), Broke> {
+    tokens::fresh();
+    let alloc = Counting::new();
+    {
+        let mut a = Arc::new_in(Token::new(1), &alloc);
+        let weak = Arc::downgrade(&a);
+        let before = Arc::as_ptr(&a);
+        alloc.refuse_after(0);
+        panics(|| {
+            Arc::make_mut(&mut a);
+        })?;
+        if Arc::strong_count(&a) != 1 || Arc::as_ptr(&a) != before || a.value != 1 {
+            return Err(Broke::Oracle(String::from("a refused make_mut changed the owner")));
+        }
+        let Some(again) = weak.upgrade() else {
+            return Err(Broke::Oracle(String::from("a refused make_mut left the Weak dangling")));
+        };
+        drop(again);
+        Arc::make_mut(&mut a).value = 2;
+        if Arc::as_ptr(&a) == before || a.value != 2 || weak.upgrade().is_some() {
+            return Err(Broke::Oracle(String::from("make_mut with only a Weak did not move the value")));
+        }
+        // Moved, not cloned: one token.
+        tokens::check(1)?;
+        if alloc.live() != 2 {
+            return Err(Broke::Oracle(format!("{} blocks live; the old one is the Weak's", alloc.live())));
+        }
+        drop(weak);
+        if alloc.live() != 1 {
+            return Err(Broke::Oracle(String::from("the old block outlived its last Weak")));
+        }
+        if Arc::get_mut(&mut a).is_none() {
+            return Err(Broke::Oracle(String::from("the moved Arc is not unique")));
+        }
+    }
+    tokens::check(0)?;
+    alloc.check()
+}
+
+/// `get_mut` writes only after another thread's reads through an owner and through a `Weak`
+/// are over: under Miri, a missing acquire in `is_unique` or a missing release in a drop is a
+/// data race on the value.
+#[test]
+fn arc_get_mut_waits_for_the_others_reads() -> Result<(), Broke> {
+    let alloc = Counting::new();
+    {
+        let mut a = Arc::new_in(7u64, &alloc);
+        let other = a.clone();
+        let weak = Arc::downgrade(&a);
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                let through_owner = *other;
+                let through_weak = weak.upgrade().map(|b| *b);
+                assert_eq!((through_owner, through_weak), (7, Some(7)), "the other thread read a changed value");
+                drop(other);
+                drop(weak);
+            });
+            // Bounded by count, not time: the other thread finishes in a few steps.
+            for _ in 0..1_000_000 {
+                if let Some(value) = Arc::get_mut(&mut a) {
+                    *value = 8;
+                    return Ok(());
+                }
+                std::thread::yield_now();
+            }
+            Err(Broke::Harness(String::from("get_mut never saw the other thread's owners go")))
+        })?;
+        if *a != 8 || Arc::strong_count(&a) != 1 || Arc::weak_count(&a) != 0 {
+            return Err(Broke::Oracle(String::from("the counts are off after get_mut")));
+        }
+    }
+    alloc.check()
+}
+
+/// A value that refers to itself through a `Weak`.
+struct Node<'a> {
+    me: crate::arc::Weak<Node<'a>, &'a Counting>,
+    token: Token,
+}
+
+struct RcNode<'a> {
+    me: crate::rc::Weak<RcNode<'a>, &'a Counting>,
+    token: Token,
+}
+
+#[test]
+fn new_cyclic_refers_to_itself_and_frees() -> Result<(), Broke> {
+    tokens::fresh();
+    let alloc = Counting::new();
+    {
+        let node = Arc::new_cyclic_in(
+            |me| {
+                assert!(me.upgrade().is_none(), "the Weak upgraded before the value was made");
+                Node { me: me.clone(), token: Token::new(1) }
+            },
+            &alloc,
+        );
+        let Some(itself) = node.me.upgrade() else {
+            return Err(Broke::Oracle(String::from("the cyclic Weak does not upgrade")));
+        };
+        if !Arc::ptr_eq(&itself, &node) || itself.token.value != 1 || Arc::weak_count(&node) != 1 {
+            return Err(Broke::Oracle(String::from("the cyclic Weak points elsewhere")));
+        }
+        drop((itself, node));
+        let rc = Rc::new_cyclic_in(|me| RcNode { me: me.clone(), token: Token::new(2) }, &alloc);
+        match rc.me.upgrade() {
+            Some(itself) if Rc::ptr_eq(&itself, &rc) && itself.token.value == 2 => {}
+            _ => return Err(Broke::Oracle(String::from("the cyclic rc::Weak points elsewhere"))),
+        }
+        drop(rc);
+        tokens::check(0)?;
+        // A panic in the maker frees the block, which holds no value.
+        panics(|| drop(Arc::<Node<'_>, &Counting>::new_cyclic_in(|_| panic!("a planned panic in the maker"), &alloc)))?;
+        panics(|| drop(Rc::<RcNode<'_>, &Counting>::new_cyclic_in(|_| panic!("a planned panic in the maker"), &alloc)))?;
+    }
+    tokens::check(0)?;
+    alloc.check()
+}
+
+#[test]
+fn raw_pointers_round_trip() -> Result<(), Broke> {
+    tokens::fresh();
+    let alloc = Counting::new();
+    {
+        // Over-aligned (the value sits 64 bytes in), byte-aligned, and unsized values.
+        let (wide, a) = Arc::into_raw_with_allocator(Arc::new_in(Wide(5), &alloc));
+        if wide.addr() % 64 != 0 {
+            return Err(Broke::Oracle(String::from("the raw pointer is misaligned")));
+        }
+        // SAFETY: from `into_raw_with_allocator` of this type and allocator, taken back once.
+        let wide = unsafe { Arc::from_raw_in(wide, a) };
+        let (byte, a) = Arc::into_raw_with_allocator(Arc::new_in(3u8, &alloc));
+        // SAFETY: as above.
+        let byte = unsafe { Arc::from_raw_in(byte, a) };
+        let slice = Arc::from_slice_in(&[Token::new(1), Token::new(2)], &alloc);
+        let weak = Arc::downgrade(&slice);
+        let (raw, a) = Arc::into_raw_with_allocator(slice);
+        // SAFETY: as above.
+        let slice = unsafe { Arc::from_raw_in(raw, a) };
+        let (raw_weak, a) = weak.into_raw_with_allocator();
+        if !core::ptr::addr_eq(raw_weak, Arc::as_ptr(&slice)) {
+            return Err(Broke::Oracle(String::from("a Weak's pointer is not its value's")));
+        }
+        // SAFETY: from a `Weak`'s `into_raw_with_allocator`, taken back once.
+        let weak = unsafe { crate::arc::Weak::from_raw_in(raw_weak, a) };
+        let speaker: Arc<dyn Speak, &Counting> = Arc::new_in(Token::new(9), &alloc);
+        let (raw, a) = Arc::into_raw_with_allocator(speaker);
+        // SAFETY: as above.
+        let speaker = unsafe { Arc::from_raw_in(raw, a) };
+        if wide.0 != 5 || *byte != 3 || speaker.word() != 9 || Arc::strong_count(&slice) != 1 {
+            return Err(Broke::Oracle(String::from("a value changed in a round trip")));
+        }
+        let upgraded = weak.upgrade();
+        same("a slice through a round trip", upgraded.iter().flat_map(|s| s.iter()).map(|t| t.value), [1, 2].into_iter())?;
+        drop(upgraded);
+        drop((wide, byte, slice, weak, speaker));
+        let (raw, a) = Rc::into_raw_with_allocator(Rc::new_in(Wide(6), &alloc));
+        // SAFETY: as above, for an `Rc`.
+        let rc = unsafe { Rc::from_raw_in(raw, a) };
+        let (raw, a) = Rc::downgrade(&rc).into_raw_with_allocator();
+        // SAFETY: as above, for an `rc::Weak`.
+        let rc_weak = unsafe { crate::rc::Weak::from_raw_in(raw, a) };
+        if rc.0 != 6 || rc_weak.upgrade().map(|r| r.0) != Some(6) {
+            return Err(Broke::Oracle(String::from("an Rc changed in a round trip")));
+        }
+    }
+    tokens::check(0)?;
+    alloc.check()
+}
+
+#[test]
+fn boxed_closures_are_called_once_and_freed() -> Result<(), Broke> {
+    tokens::fresh();
+    let alloc = Counting::new();
+    {
+        let token = Token::new(3);
+        let once: Box<dyn crate::CallOnce<(u64,), Output = u64>, &Counting> =
+            Box::new_in(move |x: u64| token.value + x, &alloc);
+        if once(4) != 7 {
+            return Err(Broke::Oracle(String::from("a boxed one-shot closure returned the wrong value")));
+        }
+        // The call consumed the closure: its token is gone and its block freed.
+        tokens::check(0)?;
+        if alloc.live() != 0 {
+            return Err(Broke::Oracle(String::from("a called box was not freed")));
+        }
+        let token = Token::new(5);
+        let never: Box<dyn crate::CallOnce<(), Output = u64>, &Counting> = Box::new_in(move || token.value, &alloc);
+        drop(never);
+        tokens::check(0)?;
+        let token = Token::new(6);
+        let panicking: Box<dyn crate::CallOnce<(), Output = ()>, &Counting> = Box::new_in(
+            move || {
+                let _held = token;
+                panic!("a planned panic in a boxed closure");
+            },
+            &alloc,
+        );
+        panics(|| panicking())?;
+        tokens::check(0)?;
+        // A sized closure in a box is called by every closure trait.
+        let mut count = 0;
+        let mut counter = Box::new_in(|| count += 1, &alloc);
+        counter();
+        counter();
+        drop(counter);
+        if count != 2 {
+            return Err(Broke::Oracle(String::from("a boxed FnMut was not called twice")));
+        }
+        // A `dyn Fn` is no `CallOnce` (that is for sized closures): it is called through `Deref`.
+        let speak: Box<dyn Fn(u64) -> u64, &Counting> = Box::new_in(|x: u64| x * 2, &alloc);
+        if speak(21) != 42 {
+            return Err(Broke::Oracle(String::from("a boxed dyn Fn returned the wrong value")));
+        }
+    }
+    tokens::check(0)?;
+    alloc.check()
+}
+
 #[test]
 fn arc_slice_frees_everything_when_clone_panics() -> Result<(), Broke> {
     tokens::fresh();
@@ -871,10 +1104,49 @@ fn deque_case(tape: &Tape) -> Result<(), Broke> {
         for _ in 0..tape.index(64, "steps") {
             let len = model.len();
             let v = tape.below(100, "value");
-            match tape.below(12, "op") {
+            match tape.below(15, "op") {
                 0 | 1 => {
                     ours.push_back(Token::new(v));
                     model.push_back(v);
+                }
+                12 => {
+                    let (from, to) = bounds(tape, len);
+                    let taken = tape.index(to - from + 1, "taken");
+                    let back = tape.below(2, "from the back") == 1;
+                    let mut drain = ours.drain(from..to);
+                    let mut model_drain = model.drain(from..to);
+                    for _ in 0..taken {
+                        let (o, m) = if back {
+                            (drain.next_back(), model_drain.next_back())
+                        } else {
+                            (drain.next(), model_drain.next())
+                        };
+                        same("drain", o.map(|t| t.value).into_iter(), m.into_iter())?;
+                    }
+                }
+                13 => {
+                    let keep = tape.below(3, "keep") + 2;
+                    ours.retain(|t| t.value % keep != 0);
+                    model.retain(|v| v % keep != 0);
+                }
+                14 => {
+                    let mut other: VecDeque<Token, &Counting> = VecDeque::new_in(&alloc);
+                    let mut model_other = std::collections::VecDeque::new();
+                    for i in 0..tape.index(6, "appended") {
+                        // Wrapped sometimes, so the copy crosses the other ring's end.
+                        if i % 2 == 0 {
+                            other.push_back(Token::new(v + i as u64));
+                            model_other.push_back(v + i as u64);
+                        } else {
+                            other.push_front(Token::new(v + i as u64));
+                            model_other.push_front(v + i as u64);
+                        }
+                    }
+                    ours.append(&mut other);
+                    model.append(&mut model_other);
+                    if !other.is_empty() {
+                        return Err(Broke::Oracle(String::from("append left values in the other ring")));
+                    }
                 }
                 2 | 3 => {
                     ours.push_front(Token::new(v));
@@ -901,10 +1173,11 @@ fn deque_case(tape: &Tape) -> Result<(), Broke> {
                     same("make_contiguous", contiguous.into_iter(), model.make_contiguous().iter().copied())?;
                 }
                 10 => ours.reserve(tape.index(10, "additional")),
-                _ => {
+                11 => {
                     ours.clear();
                     model.clear();
                 }
+                _ => {}
             }
             same("the ring", ours.iter().map(|t| t.value), model.iter().copied())?;
             same("the ring backwards", ours.iter().rev().map(|t| t.value), model.iter().rev().copied())?;
@@ -965,6 +1238,99 @@ fn deque_frees_everything_when_a_drop_panics_across_the_wrap() -> Result<(), Bro
     panics(|| ring.truncate(1))?;
     same("after a drop panicked in truncate", ring.iter().map(|t| t.value), [3].into_iter())?;
     tokens::check(1)?;
+    drop(ring);
+    tokens::check(0)?;
+    alloc.check()
+}
+
+/// Growth from every place the head can be, at every length, by a little and by a lot: the
+/// ring's state when it grows is the whole input of `unwrap_after_grow`, and this covers it for
+/// small capacities.
+#[test]
+fn deque_grows_from_every_wrap() -> Result<(), Broke> {
+    tokens::fresh();
+    let alloc = Counting::new();
+    for asked in [1usize, 2, 3, 4, 7, 8] {
+        let cap = VecDeque::<Token, &Counting>::with_capacity_in(asked, &alloc).capacity();
+        for head in 0..cap {
+            for len in 0..=cap {
+                for more in [1, 2, cap + 1] {
+                    let mut ours: VecDeque<Token, &Counting> = VecDeque::with_capacity_in(cap, &alloc);
+                    let mut model = std::collections::VecDeque::new();
+                    // `head` fillers go in first and out as the values come, so the head ends
+                    // at slot `head` without the ring growing.
+                    for i in 0..head {
+                        ours.push_back(Token::new(1000 + i as u64));
+                    }
+                    let mut fillers = head;
+                    for i in 0..len as u64 {
+                        if ours.len() == cap {
+                            drop(ours.pop_front());
+                            fillers -= 1;
+                        }
+                        ours.push_back(Token::new(i));
+                        model.push_back(i);
+                    }
+                    for _ in 0..fillers {
+                        drop(ours.pop_front());
+                    }
+                    if ours.capacity() != cap {
+                        return Err(Broke::Harness(String::from("the ring grew while it was set up")));
+                    }
+                    ours.reserve(cap - len + more);
+                    if ours.capacity() < cap + more {
+                        return Err(Broke::Oracle(String::from("reserve left too little room")));
+                    }
+                    same("a ring just grown", ours.iter().map(|t| t.value), model.iter().copied())?;
+                    for i in 0..(cap + more) as u64 {
+                        if i % 2 == 0 {
+                            ours.push_back(Token::new(100 + i));
+                            model.push_back(100 + i);
+                        } else {
+                            ours.push_front(Token::new(100 + i));
+                            model.push_front(100 + i);
+                        }
+                    }
+                    same("a grown ring, pushed at both ends", ours.iter().map(|t| t.value), model.iter().copied())?;
+                    tokens::check(model.len())?;
+                }
+            }
+        }
+    }
+    tokens::check(0)?;
+    alloc.check()
+}
+
+#[test]
+fn deque_drain_and_retain_keep_order_when_a_drop_panics() -> Result<(), Broke> {
+    tokens::fresh();
+    let alloc = Counting::new();
+    let wrapped = || {
+        let mut ring: VecDeque<Token, &Counting> = VecDeque::with_capacity_in(8, &alloc);
+        for i in 0..4 {
+            ring.push_front(Token::new(i));
+            ring.push_back(Token::new(10 + i));
+        }
+        // Front to back: 3 2 1 0 10 11 12 13, wrapped around the end of the buffer.
+        ring
+    };
+    let mut ring = wrapped();
+    tokens::panic_on_drop(0);
+    // 2 1 0 10 11 are dropped by the drain, 0 panicking; the gap still closes.
+    panics(|| drop(ring.drain(1..6)))?;
+    same("after a drop panicked in a drain", ring.iter().map(|t| t.value), [3, 12, 13].into_iter())?;
+    tokens::check(3)?;
+    drop(ring);
+    let mut ring = wrapped();
+    // Odd values go; 1's drop panics after 3's: the rest are kept.
+    tokens::panic_on_drop(1);
+    panics(|| ring.retain(|t| t.value % 2 == 0))?;
+    same("after a drop panicked in retain", ring.iter().map(|t| t.value), [2, 0, 10, 11, 12, 13].into_iter())?;
+    tokens::check(6)?;
+    // A drain from each side of the middle moves the shorter side.
+    drop(ring.drain(4..5));
+    drop(ring.drain(0..1));
+    same("after two drains", ring.iter().map(|t| t.value), [0, 10, 11, 13].into_iter())?;
     drop(ring);
     tokens::check(0)?;
     alloc.check()
@@ -1123,7 +1489,22 @@ fn soa_case(tape: &Tape) -> Result<(), Broke> {
             let tag = tape.below(5, "tag") as u8;
             let capacity = ours.capacity();
             let allocs = alloc.allocs();
-            match tape.below(9, "op") {
+            match tape.below(12, "op") {
+                8 => {
+                    let at = tape.index(len + 1, "at");
+                    ours.insert(at, row(id, tag));
+                    model.insert(at, model_row(id, tag));
+                }
+                9 if len > 0 => {
+                    let at = tape.index(len, "at");
+                    let r = ours.remove(at);
+                    same("remove", [(r.id, r.token.value, r.tag, r.wide)].into_iter(), [model.remove(at)].into_iter())?;
+                }
+                10 => {
+                    let tag = tape.below(5, "kept tag") as u8;
+                    ours.retain(|r| *r.tag != tag);
+                    model.retain(|m| m.2 != tag);
+                }
                 0..=2 => {
                     ours.push(row(id, tag));
                     model.push(model_row(id, tag));
@@ -1174,6 +1555,9 @@ fn soa_case(tape: &Tape) -> Result<(), Broke> {
         if let Some(first) = ours.get(0) {
             same("get", [unrow(first)].into_iter(), model.first().copied().into_iter())?;
         }
+        let copy = ours.clone();
+        same("a clone", copy.iter().map(unrow), model.iter().copied())?;
+        tokens::check(2 * model.len())?;
     }
     tokens::check(0)?;
     alloc.check()
@@ -1251,6 +1635,160 @@ fn soa_of_fields_sized_zero_never_allocates() -> Result<(), Broke> {
     }
     if alloc.allocs() != 0 {
         return Err(Broke::Oracle(format!("{} allocations for rows sized 0", alloc.allocs())));
+    }
+    alloc.check()
+}
+
+soa! {
+    /// Fields of every alignment, declared out of order, and one sized 0.
+    struct Mixed, Mixeds, MixedRef {
+        byte: u8 => bytes / bytes_mut,
+        word: u64 => words / words_mut,
+        half: u16 => halves / halves_mut,
+        wide: Wide => wides / wides_mut,
+        unit: () => units / units_mut,
+    }
+}
+
+/// The block is one allocation of `75 * capacity` bytes at 64; its columns sit in descending
+/// alignment (wide at the start, then word, half, byte), each at its prefix times the capacity.
+/// A row of only fields sized 0 starts at a pointer aligned to its most aligned field, and
+/// every operation on it touches no memory.
+#[test]
+fn soa_columns_sit_where_the_layout_says() -> Result<(), Broke> {
+    let alloc = Counting::new();
+    {
+        let mut rows = Mixeds::new_in(&alloc);
+        for i in 0..9u16 {
+            rows.push(Mixed { byte: i as u8, word: u64::from(i) << 40, half: i * 3, wide: Wide(u32::from(i)), unit: () });
+            let cap = rows.capacity();
+            let blocks = alloc.live_layouts();
+            let [(base, layout)] = blocks.as_slice() else {
+                return Err(Broke::Oracle(format!("{} blocks for one vector", blocks.len())));
+            };
+            let want = (75 * cap, 64);
+            if (layout.size(), layout.align()) != want {
+                return Err(Broke::Oracle(format!("the block is {layout:?}, not {want:?}, at capacity {cap}")));
+            }
+            let places = [
+                ("wide", rows.wides().as_ptr().addr(), 0),
+                ("word", rows.words().as_ptr().addr(), 64 * cap),
+                ("half", rows.halves().as_ptr().addr(), 72 * cap),
+                ("byte", rows.bytes().as_ptr().addr(), 74 * cap),
+            ];
+            for (name, at, offset) in places {
+                if at != base + offset {
+                    return Err(Broke::Oracle(format!("the {name} column is at {}, not {offset}", at.wrapping_sub(*base))));
+                }
+            }
+            same("the halves", rows.halves().iter().copied(), (0..=i).map(|j| j * 3))?;
+            same("the words", rows.words().iter().copied(), (0..=i).map(|j| u64::from(j) << 40))?;
+        }
+        same("the capacities grown through", [rows.capacity()].into_iter(), [16].into_iter())?;
+    }
+    {
+        let mut rows = Nothings::new_in(&alloc);
+        if rows.bs().as_ptr().addr() % 8 != 0 || rows.as_().as_ptr().addr() % 8 != 0 {
+            return Err(Broke::Oracle(String::from("the rows sized 0 start misaligned")));
+        }
+        for _ in 0..5 {
+            rows.push(Nothing { a: (), b: [] });
+        }
+        rows.insert(2, Nothing { a: (), b: [] });
+        let _ = rows.remove(0);
+        let _ = rows.swap_remove(1);
+        rows.retain(|_| true);
+        let _ = rows.pop();
+        let copy = rows.clone();
+        if rows.len() != 3 || copy.len() != 3 || rows.iter().count() != 3 || rows.bs().as_ptr().addr() % 8 != 0 {
+            return Err(Broke::Oracle(String::from("rows sized 0 lost count or alignment")));
+        }
+    }
+    // Three for growth to 16; one for `retain`'s flags, the only memory rows sized 0 take.
+    if alloc.allocs() != 4 {
+        return Err(Broke::Oracle(format!("{} allocations, not 3 for growth to 16 and 1 for retain", alloc.allocs())));
+    }
+    alloc.check()
+}
+
+#[test]
+fn soa_debug_and_insert_remove() -> Result<(), Broke> {
+    let alloc = Counting::new();
+    {
+        let mut pairs = Pairs::new_in(&alloc);
+        pairs.push(Pair { big: 1, small: 10 });
+        pairs.push(Pair { big: 3, small: 30 });
+        pairs.insert(1, Pair { big: 2, small: 20 });
+        pairs.insert(3, Pair { big: 4, small: 40 });
+        let text = format!("{pairs:?}");
+        if text != "[(1, 10), (2, 20), (3, 30), (4, 40)]" {
+            return Err(Broke::Oracle(format!("Debug of a vector of pairs: {text}")));
+        }
+        let gone = pairs.remove(0);
+        same("after remove", pairs.bigs().iter().copied(), [2, 3, 4].into_iter())?;
+        same("the removed row", [(gone.big, gone.small)].into_iter(), [(1, 10)].into_iter())?;
+        pairs.retain(|p| *p.big != 3);
+        same("after retain", pairs.smalls().iter().copied(), [20, 40].into_iter())?;
+    }
+    alloc.check()
+}
+
+#[test]
+fn soa_retain_keeps_the_unseen_when_a_drop_panics() -> Result<(), Broke> {
+    tokens::fresh();
+    let alloc = Counting::new();
+    let mut rows = Rows::with_capacity_in(10, &alloc);
+    for id in 0..10 {
+        rows.push(row(id, 0));
+    }
+    // Odd rows go; 3's drop panics after 1's: 4 to 9 are not yet seen and stay.
+    tokens::panic_on_drop(3);
+    panics(|| rows.retain(|r| *r.id % 2 == 0))?;
+    same("after a drop panicked in retain", rows.ids().iter().copied(), [0, 2, 4, 5, 6, 7, 8, 9].into_iter())?;
+    same("the tokens moved with their rows", rows.tokens().iter().map(|t| t.value), [0, 2, 4, 5, 6, 7, 8, 9].into_iter())?;
+    tokens::check(8)?;
+    // A panic in the predicate changes nothing.
+    panics(|| rows.retain(|r| if *r.id == 5 { panic!("a planned panic in the predicate") } else { true }))?;
+    same("after a predicate panicked", rows.ids().iter().copied(), [0, 2, 4, 5, 6, 7, 8, 9].into_iter())?;
+    drop(rows);
+    tokens::check(0)?;
+    alloc.check()
+}
+
+// ---------------------------------------------------------------------------------------------
+// String.
+
+#[test]
+fn string_stays_utf8_and_frees() -> Result<(), Broke> {
+    let alloc = Counting::new();
+    {
+        let mut text = crate::String::new_in(&alloc);
+        for ch in ['a', 'é', '日', '🦀'] {
+            text.push(ch);
+        }
+        text.push_str("本");
+        if text != "aé日🦀本" || text.pop() != Some('本') || text.pop() != Some('🦀') {
+            return Err(Broke::Oracle(format!("pushes and pops gave {text:?}")));
+        }
+        panics(|| text.truncate(2))?;
+        text.truncate(3);
+        if text != "aé" {
+            return Err(Broke::Oracle(format!("truncate gave {text:?}")));
+        }
+        if crate::String::from_utf8(text.clone().into_bytes()).is_err() {
+            return Err(Broke::Oracle(String::from("from_utf8 refused a string's own bytes")));
+        }
+        let refused = crate::String::from_utf8(vec_in![&alloc; b'a', 0xff]);
+        if refused.map_err(|e| e.utf8_error().valid_up_to()).err() != Some(1) {
+            return Err(Broke::Oracle(String::from("from_utf8 took bytes that are not UTF-8")));
+        }
+        let boxed = text.into_boxed_str();
+        let formatted = format_in!(&alloc, "{}-{:03}", &*boxed, 7);
+        let mut buf = crate::String::with_capacity_in(16, &alloc);
+        format_into!(&mut buf, "{}!", formatted);
+        if &*buf != "aé-007!" || buf.capacity() != 16 {
+            return Err(Broke::Oracle(format!("format_in and format_into gave {buf:?}")));
+        }
     }
     alloc.check()
 }

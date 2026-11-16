@@ -10,7 +10,7 @@ use blaze_expand::{
     AlsoCopy, BuiltinDerive, BuiltinFn, Call, CallKind, CallShape, CallSite, Constness, Ctx, DefAt,
     DefSite, Delim, DeriveFacts, Diagnostic, Eager, Edition, ExpandCx, ExpandError, Expanded,
     Expansion, Export, Hole, HoleOf, HostAsk, HostError, HostWhy, IncludeAs, Included, Inside,
-    LitKind, LocalInner, MacroDef, MarkOf, NestedKind, Origin, Place, PlaceOf, ProcCall, ProcKind,
+    LitKind, LocalInner, MacroDef, MarkOf, NestedKind, TokenOrigin, Place, PlaceOf, ProcCall, ProcKind,
     Produced, Raw, ReadAnswer, ReadKind, Reads, Spacing, TokenKind, TokenStream, call_key, expand,
     expansion_key, find_calls, lex,
 };
@@ -80,7 +80,7 @@ impl ExpandCx for TestCx {
         let mut origins = Vec::new_in(alloc.clone());
         for at in 0..call.input.len() {
             tokens.push_from(call.input, at).map_err(|_| FAILED)?;
-            origins.push(Origin::Input(u32::try_from(at).map_err(|_| FAILED)?));
+            origins.push(TokenOrigin::Input(u32::try_from(at).map_err(|_| FAILED)?));
         }
         let mut reads = Reads::new_in(alloc);
         let name = def.proc_name().ok_or(FAILED)?;
@@ -184,8 +184,8 @@ fn a_repetition_is_transcribed() {
     let exp = call_fn(&rules("($($x:ident),*) => { $(let $x = 1;)* }", 1), "a, b, c", &cx);
     assert_eq!(show(&exp.tokens), "let a = 1 ; let b = 1 ; let c = 1 ;");
     // `a` is the call's, `let` the definition's.
-    assert_eq!(exp.origins[1], Origin::Input(0));
-    assert!(matches!(exp.origins[0], Origin::Def(_)));
+    assert_eq!(exp.origins[1], TokenOrigin::Input(0));
+    assert!(matches!(exp.origins[0], TokenOrigin::Def(_)));
     assert_eq!(exp.hygiene(1).mark, None);
     assert_eq!(exp.hygiene(0).mark.map(|it| it.of), Some(MarkOf::This));
 }
@@ -368,7 +368,7 @@ fn include_lexes_its_file_at_the_call_site() {
     // The byte order mark is not a token.
     assert_eq!(show(&exp.tokens), "fn f ( ) -> u8 { 1 }");
     assert!(
-        exp.origins.iter().all(|it| *it == Origin::Made(blaze_expand::Transparency::Transparent))
+        exp.origins.iter().all(|it| *it == TokenOrigin::Made(blaze_expand::Transparency::Transparent))
     );
     let read = exp.reads.list()[0];
     assert_eq!((read.kind, exp.reads.subject(&read)), (ReadKind::IncludeStr, "m.rs"));
@@ -527,7 +527,7 @@ fn debug_and_clone_derive_their_impls() {
     assert!(text.contains("Clone") && text.contains("clone"), "{text}");
     // The item's name is the item's token.
     let name = clone.tokens.tokens().iter().position(|it| clone.tokens.text_of(it) == "S");
-    assert_eq!(name.map(|at| clone.origins[at]), Some(Origin::Input(1)));
+    assert_eq!(name.map(|at| clone.origins[at]), Some(TokenOrigin::Input(1)));
 }
 
 #[test]
@@ -547,7 +547,7 @@ fn partial_eq_bounds_parameters_predicates_and_assoc_types() {
     assert!(text.contains("_unused => true }"), "{text}");
     // `T::Out` is the item's tokens, not made ones.
     let out = exp.tokens.tokens().iter().position(|it| exp.tokens.text_of(it) == "Out");
-    assert!(matches!(out.map(|at| exp.origins[at]), Some(Origin::Input(_))));
+    assert!(matches!(out.map(|at| exp.origins[at]), Some(TokenOrigin::Input(_))));
 }
 
 #[test]
@@ -607,7 +607,7 @@ fn an_attribute_call_takes_its_args_and_item() {
         exp.origins
             .iter()
             .enumerate()
-            .all(|(at, it)| u32::try_from(at).map(Origin::Input) == Ok(*it))
+            .all(|(at, it)| u32::try_from(at).map(TokenOrigin::Input) == Ok(*it))
     );
     assert_eq!(exp.reads.list()[0].kind, ReadKind::ProcMacro);
 

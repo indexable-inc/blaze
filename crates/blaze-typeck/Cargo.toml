@@ -13,9 +13,11 @@ repository.workspace = true
 [lib]
 doctest = false
 
-# No dependencies: the crate is at zero third-party crates and names no workspace crate yet. The
-# traits it needs from `crates/blaze-ty` are defined in `src/ty.rs` until that crate exists.
+# Zero third-party crates. The traits it needs from `crates/blaze-ty` are defined in `src/ty.rs`
+# until that crate exists.
 [dependencies]
+# `Vec`: every column, queue and the work stack, in the allocator the caller gives; no `alloc`.
+blaze-own.workspace = true
 
 [dev-dependencies]
 # `check`, `control`: the properties of typeck.md, "Proof".

@@ -8,7 +8,7 @@
 
 use core::alloc::Allocator;
 
-use alloc::vec::Vec;
+use blaze_own::Vec;
 
 use blaze_id::ContentId;
 
@@ -20,7 +20,7 @@ use crate::{
     error::{ExpandError, Stream, Unbuilt},
     expand::Out,
     expansion::{
-        Diagnostic, Hole, HoleOf, IncludeFailure, NestedCall, NestedKind, Origin, ReadAnswer,
+        Diagnostic, Hole, HoleOf, IncludeFailure, NestedCall, NestedKind, TokenOrigin, ReadAnswer,
         ReadKind,
     },
     literal::{self, Buf, LitError},
@@ -79,14 +79,14 @@ pub(crate) fn expand<A: Allocator + Clone>(
 /// token's origin.
 struct Args<'s, A: Allocator> {
     stream: &'s TokenStream<A>,
-    from: Option<&'s [Origin]>,
+    from: Option<&'s [TokenOrigin]>,
 }
 
 impl<A: Allocator> Args<'_, A> {
-    fn origin(&self, at: usize) -> Origin {
+    fn origin(&self, at: usize) -> TokenOrigin {
         match self.from {
             Some(from) => from[at],
-            None => Origin::Input(index(at)),
+            None => TokenOrigin::Input(index(at)),
         }
     }
 
@@ -247,20 +247,20 @@ fn eager<A: Allocator + Clone>(
     for (n, (nested, answer)) in calls.iter().zip(answers.iter()).enumerate() {
         while at < nested.path.start as usize {
             stream.push_from(input, at)?;
-            from.push(Origin::Input(index(at)));
+            from.push(TokenOrigin::Input(index(at)));
             at += 1;
         }
         let in_answer =
             |error| ExpandError::Stream { stream: Some(Stream::Answer(index(n))), error };
         for token in 0..answer.len() {
             stream.push_from(*answer, token).map_err(in_answer)?;
-            from.push(Origin::Input(nested.path.start));
+            from.push(TokenOrigin::Input(nested.path.start));
         }
         at = nested.args.end as usize;
     }
     while at < input.len() {
         stream.push_from(input, at)?;
-        from.push(Origin::Input(index(at)));
+        from.push(TokenOrigin::Input(index(at)));
         at += 1;
     }
     run_eager(which, &Args { stream: &stream, from: Some(&from) }, out, cx)?;
@@ -292,7 +292,7 @@ fn run_eager<A: Allocator + Clone>(
 fn refuse<A: Allocator + Clone>(
     out: &mut Out<'_, A>,
     message: &str,
-    at: Option<Origin>,
+    at: Option<TokenOrigin>,
 ) -> Result<(), ExpandError> {
     let message = out.note(message)?;
     out.diagnose(Diagnostic::Builtin { message, at });
@@ -300,7 +300,7 @@ fn refuse<A: Allocator + Clone>(
 }
 
 /// Where argument token `at` is, or the end of the input.
-fn at_token<A: Allocator>(args: &Args<'_, A>, at: usize) -> Option<Origin> {
+fn at_token<A: Allocator>(args: &Args<'_, A>, at: usize) -> Option<TokenOrigin> {
     (at < args.stream.len()).then(|| args.origin(at))
 }
 
@@ -309,7 +309,7 @@ fn string_arg<A: Allocator + Clone>(
     args: &Args<'_, A>,
     range: core::ops::Range<usize>,
     value: &mut Buf<A>,
-) -> Result<(), (LitError, Option<Origin>)> {
+) -> Result<(), (LitError, Option<TokenOrigin>)> {
     match args.atom(range) {
         Atom::Lit { kind, text, suffix_len, negative: false, at } => {
             literal::string_value(kind, text, suffix_len, value)
@@ -425,8 +425,8 @@ fn bytes_array<A: Allocator, B: Allocator + Clone>(
     inside: core::ops::Range<usize>,
     value: &mut Vec<u8, B>,
     alloc: B,
-) -> Result<(), (&'static str, Option<Origin>)> {
-    let element = |range: core::ops::Range<usize>| -> Result<u8, (&'static str, Option<Origin>)> {
+) -> Result<(), (&'static str, Option<TokenOrigin>)> {
+    let element = |range: core::ops::Range<usize>| -> Result<u8, (&'static str, Option<TokenOrigin>)> {
         if args.bracketed(&range).is_some() {
             return Err(("cannot concatenate a doubly nested array", at_token(args, range.start)));
         }
@@ -652,7 +652,7 @@ fn assert<A: Allocator + Clone>(out: &mut Out<'_, A>) -> Result<(), ExpandError>
     out.made(TokenKind::Open(Delim::Paren), "", MADE)?;
     for at in cond.clone() {
         let token = input.tokens()[at];
-        out.push(token.kind, input.text_of(&token), Origin::Input(index(at)))?;
+        out.push(token.kind, input.text_of(&token), TokenOrigin::Input(index(at)))?;
     }
     out.made(TokenKind::Close(Delim::Paren), "", MADE)?;
     out.made(TokenKind::Open(Delim::Brace), "", MADE)?;
@@ -668,7 +668,7 @@ fn assert<A: Allocator + Clone>(out: &mut Out<'_, A>) -> Result<(), ExpandError>
             out.made(TokenKind::Open(Delim::Paren), "", MADE)?;
             for at in message {
                 let token = input.tokens()[at];
-                out.push(token.kind, input.text_of(&token), Origin::Input(index(at)))?;
+                out.push(token.kind, input.text_of(&token), TokenOrigin::Input(index(at)))?;
             }
             out.made(TokenKind::Close(Delim::Paren), "", MADE)?;
         }
@@ -718,7 +718,7 @@ fn cfg_select<A: Allocator + Clone>(
             }
             at += 1;
         };
-        let input_at = |at: usize| (at < tokens.len()).then(|| Origin::Input(index(at)));
+        let input_at = |at: usize| (at < tokens.len()).then(|| TokenOrigin::Input(index(at)));
         let Some(arrow) = arrow else {
             let message = "expected `=>` after a `cfg_select!` predicate";
             return refuse(out, message, input_at(start));
@@ -766,7 +766,7 @@ fn cfg_select<A: Allocator + Clone>(
     };
     for at in body {
         let token = tokens[at];
-        out.push(token.kind, input.text_of(&token), Origin::Input(index(at)))?;
+        out.push(token.kind, input.text_of(&token), TokenOrigin::Input(index(at)))?;
     }
     Ok(())
 }
@@ -893,7 +893,7 @@ fn place<A: Allocator + Clone>(
     of: HoleOf,
 ) -> Result<(), ExpandError> {
     if !out.call.input().is_empty() {
-        return refuse(out, "takes no arguments", Some(Origin::Input(0)));
+        return refuse(out, "takes no arguments", Some(TokenOrigin::Input(0)));
     }
     let number = matches!(of, HoleOf::Line | HoleOf::Column);
     if out.call.eager.inside == Inside::Plain {
@@ -956,7 +956,7 @@ fn panic<A: Allocator + Clone>(out: &mut Out<'_, A>, name: &str) -> Result<(), E
     out.made(TokenKind::Open(Delim::Paren), "", MADE)?;
     let input = out.call.input();
     for (at, token) in input.tokens().iter().enumerate() {
-        out.push(token.kind, input.text_of(token), Origin::Input(index(at)))?;
+        out.push(token.kind, input.text_of(token), TokenOrigin::Input(index(at)))?;
     }
     out.made(TokenKind::Close(Delim::Paren), "", MADE)
 }

@@ -10,10 +10,20 @@
 
 #![blaze::sans_io]
 
-use alloc::vec::Vec;
-use core::alloc::AllocatorClone;
+use core::alloc::Allocator;
+
+use blaze_own::{Vec, soa};
 
 use crate::{Nanos, Plant, SlotId};
+
+soa! {
+    /// One slot's heat: its count this period, and whether it was given to the tier (once, for
+    /// the run). The decay scans `counts` alone.
+    struct Row, Rows, RowRef {
+        count: u32 => counts / counts_mut,
+        queued: bool => queued / queued_mut,
+    }
+}
 
 /// The heat's parameters.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -51,17 +61,15 @@ impl core::fmt::Display for Error {
 impl core::error::Error for Error {}
 
 /// The counts of one program's slots. See the module's documentation.
-pub struct Heat<A: AllocatorClone> {
+pub struct Heat<A: Allocator> {
     config: Config,
-    counts: Vec<u32, A>,
-    /// Whether a slot was given to the tier: once, for the run.
-    queued: Vec<bool, A>,
+    slots: Rows<A>,
     /// The start of the period the counts are in.
     since: Nanos,
     pub(crate) plant: Plant,
 }
 
-impl<A: AllocatorClone> Heat<A> {
+impl<A: Allocator> Heat<A> {
     pub fn new(slots: u32, config: Config, start: Nanos, alloc: A) -> Result<Heat<A>, Error> {
         if config.bound == 0 {
             return Err(Error::Config { what: "a bound of 0 makes every function hot", value: 0 });
@@ -75,11 +83,11 @@ impl<A: AllocatorClone> Heat<A> {
                 value: u64::from(config.shift),
             });
         }
-        let mut counts = Vec::new_in(alloc.clone());
-        counts.resize(slots as usize, 0);
-        let mut queued = Vec::new_in(alloc);
-        queued.resize(slots as usize, false);
-        Ok(Heat { config, counts, queued, since: start, plant: Plant::None })
+        let mut rows = Rows::with_capacity_in(slots as usize, alloc);
+        for _ in 0..slots {
+            rows.push(Row { count: 0, queued: false });
+        }
+        Ok(Heat { config, slots: rows, since: start, plant: Plant::None })
     }
 
     /// The decay up to `now`: one shift for each whole period since the last.
@@ -93,7 +101,7 @@ impl<A: AllocatorClone> Heat<A> {
         }
         self.since = Nanos(self.since.0 + periods * self.config.period.0);
         let shift = periods.saturating_mul(u64::from(self.config.shift));
-        for count in &mut self.counts {
+        for count in self.slots.counts_mut() {
             *count = if shift >= 32 { 0 } else { *count >> shift };
         }
         Ok(())
@@ -101,14 +109,15 @@ impl<A: AllocatorClone> Heat<A> {
 
     /// `by` more calls of `slot` in this period. Pushes `slot` to `hot` the one time it becomes
     /// hot.
-    pub fn charge(&mut self, slot: SlotId, by: u32, hot: &mut Vec<SlotId, A>) -> Result<(), Error> {
-        let slots = self.counts.len() as u32;
-        let Some(count) = self.counts.get_mut(slot.index()) else {
+    pub fn charge<B: Allocator>(&mut self, slot: SlotId, by: u32, hot: &mut Vec<SlotId, B>) -> Result<(), Error> {
+        let slots = self.slots.len() as u32;
+        let Some(count) = self.slots.counts_mut().get_mut(slot.index()) else {
             return Err(Error::NoSlot { slot, slots });
         };
         *count = count.saturating_add(by);
-        let queued = &mut self.queued[slot.index()];
-        if *count >= self.config.bound && (!*queued || self.plant == Plant::HotTwice) {
+        let hot_now = *count >= self.config.bound;
+        let queued = &mut self.slots.queued_mut()[slot.index()];
+        if hot_now && (!*queued || self.plant == Plant::HotTwice) {
             *queued = true;
             hot.push(slot);
         }
@@ -116,6 +125,6 @@ impl<A: AllocatorClone> Heat<A> {
     }
 
     pub fn count(&self, slot: SlotId) -> Option<u32> {
-        self.counts.get(slot.index()).copied()
+        self.slots.counts().get(slot.index()).copied()
     }
 }

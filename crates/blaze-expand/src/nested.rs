@@ -8,7 +8,7 @@
 
 use core::alloc::Allocator;
 
-use alloc::vec::Vec;
+use blaze_own::Vec;
 
 use crate::{
     error::StreamError,

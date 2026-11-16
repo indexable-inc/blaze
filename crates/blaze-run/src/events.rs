@@ -12,12 +12,12 @@
 
 #![allow(unsafe_code, reason = "blaze-format's `record!` writes `unsafe impl Record`, its layout asserted")]
 
-use alloc::vec::Vec;
 use core::alloc::Allocator;
 use core::fmt;
 use core::mem::offset_of;
 
 use blaze_format::{FormatError, Record, Slice, Writer, open, record};
+use blaze_own::Vec;
 
 use crate::registry::RunEvent;
 use crate::{CheckoutKey, InstanceKey, Nanos, TestId};
@@ -103,8 +103,10 @@ fn column<T: Record, A: Allocator>(
     (start, len)
 }
 
-/// `events` as one batch buffer in `alloc`. Equal events in equal order are equal bytes.
-pub fn write<A: Allocator>(events: &[RunEvent], alloc: A) -> Vec<u8, A> {
+/// `events` as one batch buffer in `alloc`. Equal events in equal order are equal bytes. The
+/// buffer is `std`'s vector because blaze-format's `Writer` still hands one back: blaze-own lacks
+/// nothing here, blaze-format has yet to move onto it.
+pub fn write<A: Allocator>(events: &[RunEvent], alloc: A) -> std::vec::Vec<u8, A> {
     let mut writer = Writer::new_in(Batch::SCHEMA, alloc);
     let kinds = column(&mut writer, events, |event| Some(row(event).0));
     let at = column(&mut writer, events, |event| Some(row(event).1));

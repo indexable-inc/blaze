@@ -26,6 +26,8 @@ blaze-id.workspace = true
 blaze-format.workspace = true
 # `HashMap`: a task's table from item keys to its local numbers.
 blaze-hash.workspace = true
+# `Vec`, `Soa`: every builder's rows, in the allocator its caller names.
+blaze-own.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true

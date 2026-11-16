@@ -16,6 +16,11 @@ doctest = false
 # Nothing: `core` only. A dependency here would be a dependency of every crate's collections.
 [dependencies]
 
+[features]
+# `AsRef<OsStr>` and `AsRef<Path>` for `String`, which only this crate may write (the orphan
+# rule) and only std has; blaze-mem turns it on.
+std = []
+
 [dev-dependencies]
 # The tree's property engine; itself depends only on blaze-rng, which depends on nothing.
 blaze-sim.workspace = true

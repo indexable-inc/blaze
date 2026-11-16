@@ -4,7 +4,7 @@
 //! its anchor's file is the stream's role ([`Role`]), its range starts at twice its index
 //! (and is two long when the token is joint with the next, so mbe's `joined` check of two
 //! source tokens holds), and its context is the root of its edition. Every span that comes
-//! back maps to an [`Origin`]; one of another anchor is refused.
+//! back maps to a [`TokenOrigin`]; one of another anchor is refused.
 
 use core::alloc::Allocator;
 
@@ -17,8 +17,10 @@ use span::{
 use crate::{
     error::{ExpandError, Stream, StreamError, Table},
     expand::Out,
-    expansion::Origin,
-    tokens::{Delim, Edition, LitKind, Raw, Spacing, TokenKind, TokenStream, Transparency},
+    expansion::TokenOrigin,
+    tokens::{
+        Delim, Edition, LitKind, Raw, Spacing, TokenKind, TokenStream, Transparency, span_edition,
+    },
 };
 
 /// Which stream a span's token is of.
@@ -52,10 +54,10 @@ fn span_of(role: Role, at: usize, edition: Edition, spacing: Spacing) -> Result<
     Ok(Span {
         range: TextRange::new(TextSize::from(start), TextSize::from(end)),
         anchor: SpanAnchor {
-            file_id: EditionedFileId::new(FileId::from_raw(role.raw()), edition.to_span()),
+            file_id: EditionedFileId::new(FileId::from_raw(role.raw()), span_edition(edition)),
             ast_id: ROOT_ERASED_FILE_AST_ID,
         },
-        ctx: SyntaxContext::root(edition.to_span()),
+        ctx: SyntaxContext::root(span_edition(edition)),
     })
 }
 
@@ -109,15 +111,15 @@ pub(crate) fn to_tt<A: Allocator>(
 
 /// The origin a span given by [`to_tt`] or [`site_span`] names; a site span is a token made
 /// with `made`.
-pub(crate) fn origin_of(span: Span, made: Transparency) -> Result<Origin, ExpandError> {
+pub(crate) fn origin_of(span: Span, made: Transparency) -> Result<TokenOrigin, ExpandError> {
     let role = span.anchor.file_id.file_id().index();
     let at = u32::from(span.range.start()) / 2;
     match role {
-        0 => Ok(Origin::Input(at)),
-        1 => Ok(Origin::AttrArgs(at)),
-        2 => Ok(Origin::Def(at)),
-        3 => Ok(Origin::Params(at)),
-        4 => Ok(Origin::Made(made)),
+        0 => Ok(TokenOrigin::Input(at)),
+        1 => Ok(TokenOrigin::AttrArgs(at)),
+        2 => Ok(TokenOrigin::Def(at)),
+        3 => Ok(TokenOrigin::Params(at)),
+        4 => Ok(TokenOrigin::Made(made)),
         _ => Err(ExpandError::ForeignSpan { role }),
     }
 }

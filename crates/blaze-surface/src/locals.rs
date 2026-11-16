@@ -9,6 +9,7 @@ use core::marker::PhantomData;
 
 use blaze_hash::HashMap;
 use blaze_id::ItemKey;
+use blaze_own::Vec;
 
 use crate::error::SurfaceError;
 

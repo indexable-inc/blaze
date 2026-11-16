@@ -6,8 +6,9 @@ use core::mem::offset_of;
 
 use blaze_format::{FormatError, Slice, Writer};
 use blaze_id::{ContentId, ItemKey};
+use blaze_own::Vec;
 
-use crate::column::{Column, check_increasing, finish_with, key_of_word, key_word};
+use crate::column::{Column, RecordBytes, check_increasing, finish_with, key_of_word, key_word};
 use crate::error::BuildError;
 use crate::kind::{Place, PlaceTag};
 
@@ -67,7 +68,7 @@ impl<A: Allocator + Clone> KeyIndex<A> {
         });
     }
 
-    pub fn finish(mut self) -> Result<Vec<u8, A>, BuildError> {
+    pub fn finish(mut self) -> Result<RecordBytes<A>, BuildError> {
         self.rows.sort_unstable_by_key(|row| (row.key, row.parent, row.origin, row.index, row.place));
         self.rows.dedup();
         if let Some(pair) = self.rows.windows(2).find(|pair| pair[0].key == pair[1].key) {

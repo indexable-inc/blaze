@@ -23,7 +23,7 @@
 //! # Positions (rule 71)
 //!
 //! Nothing here holds a byte offset. A token of an expansion names where it came from by
-//! [`Origin`]: an index into the call's input, the attribute's arguments, the definition's
+//! [`TokenOrigin`]: an index into the call's input, the attribute's arguments, the definition's
 //! body or parameters, or made by the expansion with a transparency. `line!()`, `column!()`,
 //! `file!()` and `module_path!()` outside eager input expand to a placeholder token and a
 //! [`Hole`] naming it; the reader that places the expansion fills it from the outermost call's
@@ -83,7 +83,7 @@ pub use crate::{
     expand::{Prepared, expand, expand_prepared, prepare},
     expansion::{
         Diagnostic, Expanded, Expansion, Hole, HoleOf, IncludeFailure, NestedCall, NestedKind,
-        Origin, PathScope, Range, Read, ReadAnswer, ReadKind, Reads,
+        TokenOrigin, PathScope, Range, Read, ReadAnswer, ReadKind, Reads,
     },
     key::{CallKey, ExpansionKey, call_key, expansion_key},
     limit::{Depth, LimitReached, RecursionLimit},

@@ -223,7 +223,7 @@ fn graph_of(world: &World) -> Result<Aligned, Broke> {
 }
 
 fn open_graph(bytes: &Aligned) -> Result<CrateGraphView<'_>, Broke> {
-    CrateGraphView::open(bytes).map_err(harness)
+    CrateGraphView::read(bytes).map_err(harness)
 }
 
 fn index_of(graph: &CrateGraphView<'_>, key: CrateItemKey) -> Result<CrateIndex, Broke> {
@@ -572,7 +572,7 @@ fn no_impls_of_never_says_none(tape: &Tape, filter: Filter) -> Result<(), Broke>
             _ => built.no_impls_of.clone(),
         };
         let bytes = Aligned::copy_from(&filter_bytes);
-        let view = NoImplsOfView::open(&bytes).map_err(harness)?;
+        let view = NoImplsOfView::read(&bytes).map_err(harness)?;
         for row in rows {
             if let Some(trait_) = row.trait_ {
                 if !view.may_hold_trait(trait_) {
@@ -586,7 +586,7 @@ fn no_impls_of_never_says_none(tape: &Tape, filter: Filter) -> Result<(), Broke>
         }
         // And the directory agrees: every row is in the bucket it names.
         let directory_bytes = Aligned::copy_from(&built.directory);
-        let directory = DirectoryView::open(&directory_bytes).map_err(harness)?;
+        let directory = DirectoryView::read(&directory_bytes).map_err(harness)?;
         for row in rows {
             let key = BucketKey::of(row);
             let hit = directory
@@ -598,7 +598,7 @@ fn no_impls_of_never_says_none(tape: &Tape, filter: Filter) -> Result<(), Broke>
                 .find(|it| it.id == hit.bucket)
                 .ok_or_else(|| harness("a directory names a bucket not built"))?;
             let bucket_bytes = Aligned::copy_from(&bucket.bytes);
-            let view = BucketView::open(&bucket_bytes).map_err(harness)?;
+            let view = BucketView::read(&bucket_bytes).map_err(harness)?;
             let read = view.find(row.impl_).map(|it| it.map_err(harness)).transpose()?;
             if view.key() != key || read != Some(*row) {
                 return Err(Broke::Oracle(format!("the bucket of {row:?} read back {read:?}")));
@@ -678,7 +678,7 @@ fn sysroot(extra_in_alloc: &[&str]) -> Sysroot {
 #[test]
 fn a_lang_item_is_found_across_three_crates() {
     let sysroot = sysroot(&[]);
-    let graph = match CrateGraphView::open(&sysroot.graph) {
+    let graph = match CrateGraphView::read(&sysroot.graph) {
         Ok(graph) => graph,
         Err(error) => panic!("the sysroot's graph does not open: {error}"),
     };
@@ -711,7 +711,7 @@ fn a_lang_item_is_found_across_three_crates() {
 #[test]
 fn a_duplicate_lang_item_is_the_typed_error() {
     let sysroot = sysroot(&["sized"]);
-    let graph = match CrateGraphView::open(&sysroot.graph) {
+    let graph = match CrateGraphView::read(&sysroot.graph) {
         Ok(graph) => graph,
         Err(error) => panic!("the sysroot's graph does not open: {error}"),
     };

@@ -4,6 +4,7 @@
 use std::alloc::Global;
 use std::collections::{BTreeMap, BTreeSet};
 
+use blaze_own::Vec as Own;
 use blaze_sim::{Broke, Config, Tape, check, control};
 
 use super::{key, oracle};
@@ -42,7 +43,7 @@ fn run(tape: &Tape, plant: Plant) -> Result<(), Broke> {
             _ => {
                 let changed: Vec<CodeId> =
                     (0..BODIES).filter(|_| tape.one_in(3, "changed")).map(body).collect();
-                let mut got = Vec::new_in(Global);
+                let mut got = Own::new_in(Global);
                 tests.affected(&changed, &mut got);
                 let want: Vec<TestId> = known
                     .iter()
@@ -80,7 +81,7 @@ fn entered_reads_the_marks_and_what_optimized_bodies_absorbed() {
         let absorbed: Vec<Vec<CodeId>> = (0..slots)
             .map(|_| (0..BODIES).filter(|_| tape.one_in(4, "absorbed")).map(body).collect())
             .collect();
-        let mut got = Vec::new_in(Global);
+        let mut got = Own::new_in(Global);
         entered(&marks, &ids, |slot: SlotId| absorbed[slot.index()].as_slice(), &mut got);
         let mut want = BTreeSet::new();
         for at in 0..slots {

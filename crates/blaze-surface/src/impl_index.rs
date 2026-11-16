@@ -24,16 +24,17 @@
 //! Adding an impl changes its one bucket, the directory and, when its trait or bucket is new
 //! to the crate, `NoImplsOf`: no other bucket, and no other crate's records.
 
-use alloc::vec::Vec;
 use core::alloc::Allocator;
 use core::fmt;
 use core::mem::offset_of;
 
 use blaze_format::{FormatError, Part, Record, SchemaHash, Slice, Writer, schema_of};
 use blaze_id::{ContentId, CrateItemKey, ItemKey, Portable};
+use blaze_own::Vec;
 
-use crate::graph::slice_field;
-use crate::row::{ImplFlags, ImplRow};
+use crate::column::RecordBytes;
+use crate::crate_graph::slice_field;
+use crate::impl_row::{ImplFlags, ImplRow};
 use crate::shape::SelfShape;
 
 /// The most impl rows one crate's index holds.
@@ -274,15 +275,15 @@ pub struct Bucket<A: Allocator> {
     pub id: ContentId,
     pub hash: BucketHash,
     pub key: BucketKey,
-    pub bytes: Vec<u8, A>,
+    pub bytes: RecordBytes<A>,
 }
 
 /// A crate's impl index as [`build_impl_index`] writes it: three kinds of record, each a
 /// buffer of its own. The buckets are in the directory's order.
 #[derive(Clone, Debug)]
 pub struct CrateImpls<A: Allocator> {
-    pub directory: Vec<u8, A>,
-    pub no_impls_of: Vec<u8, A>,
+    pub directory: RecordBytes<A>,
+    pub no_impls_of: RecordBytes<A>,
     pub buckets: Vec<Bucket<A>, A>,
 }
 
@@ -381,7 +382,7 @@ pub fn build_impl_index<A: Allocator + Clone>(
     })
 }
 
-fn write_bucket<A: Allocator>(hash: BucketHash, key: BucketKey, rows: &[StoredRow], alloc: A) -> Vec<u8, A> {
+fn write_bucket<A: Allocator>(hash: BucketHash, key: BucketKey, rows: &[StoredRow], alloc: A) -> RecordBytes<A> {
     let (kind, trait_, shape) = key.parts();
     let mut out = Writer::new_in(BUCKET_SCHEMA, alloc);
     let rows_at = out.push_slice(rows);
@@ -398,7 +399,7 @@ fn write_bucket<A: Allocator>(hash: BucketHash, key: BucketKey, rows: &[StoredRo
     out.finish(at)
 }
 
-fn write_directory<A: Allocator>(krate: CrateItemKey, entries: &[DirEntry], alloc: A) -> Vec<u8, A> {
+fn write_directory<A: Allocator>(krate: CrateItemKey, entries: &[DirEntry], alloc: A) -> RecordBytes<A> {
     let mut out = Writer::new_in(DIRECTORY_SCHEMA, alloc);
     let entries_at = out.push_slice(entries);
     let at = out.next::<DirectoryRoot>();
@@ -411,7 +412,7 @@ fn write_directory<A: Allocator>(krate: CrateItemKey, entries: &[DirEntry], allo
     out.finish(at)
 }
 
-fn write_no_impls<A: Allocator>(krate: CrateItemKey, traits: &[u64], buckets: &[u64], alloc: A) -> Vec<u8, A> {
+fn write_no_impls<A: Allocator>(krate: CrateItemKey, traits: &[u64], buckets: &[u64], alloc: A) -> RecordBytes<A> {
     let mut out = Writer::new_in(NO_IMPLS_SCHEMA, alloc);
     let traits_at = out.push_slice(traits);
     let buckets_at = out.push_slice(buckets);
@@ -445,7 +446,7 @@ pub struct DirectoryView<'a> {
 impl<'a> DirectoryView<'a> {
     /// The directory in `buffer`, its schema and layout checked: O(1), the entries being
     /// plain.
-    pub fn open(buffer: &'a [u8]) -> Result<DirectoryView<'a>, FormatError> {
+    pub fn read(buffer: &'a [u8]) -> Result<DirectoryView<'a>, FormatError> {
         let root = blaze_format::open_as::<DirectoryRoot>(buffer, DIRECTORY_SCHEMA)?;
         Ok(DirectoryView { krate: CrateItemKey(root.krate), entries: root.entries.follow(buffer)? })
     }
@@ -493,7 +494,7 @@ pub struct BucketView<'a> {
 impl<'a> BucketView<'a> {
     /// The bucket in `buffer`, its schema, layout and key checked: O(1), the rows being plain;
     /// a row's flags are checked when it is read.
-    pub fn open(buffer: &'a [u8]) -> Result<BucketView<'a>, FormatError> {
+    pub fn read(buffer: &'a [u8]) -> Result<BucketView<'a>, FormatError> {
         let root = blaze_format::open_as::<BucketRoot>(buffer, BUCKET_SCHEMA)?;
         let at = blaze_format::header(buffer)?.root;
         let Some(key) = BucketKey::from_parts(root.kind, root.trait_.0, root.shape) else {
@@ -550,7 +551,7 @@ pub struct NoImplsOfView<'a> {
 
 impl<'a> NoImplsOfView<'a> {
     /// The record in `buffer`, its schema and layout checked: O(1).
-    pub fn open(buffer: &'a [u8]) -> Result<NoImplsOfView<'a>, FormatError> {
+    pub fn read(buffer: &'a [u8]) -> Result<NoImplsOfView<'a>, FormatError> {
         let root = blaze_format::open_as::<NoImplsRoot>(buffer, NO_IMPLS_SCHEMA)?;
         Ok(NoImplsOfView {
             krate: CrateItemKey(root.krate),

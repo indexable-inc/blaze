@@ -158,7 +158,7 @@ impl<A: Allocator> std::fmt::Debug for PlanFailed<A> {
 
 /// Why bytes did not read (a decoder's words), copied into `alloc`.
 fn unread<A: Allocator>(why: &str, alloc: A) -> PlanFailed<A> {
-    PlanFailed::Unread(blaze_mem::String::from_str_in(why, alloc).into_boxed_str())
+    PlanFailed::Unread(blaze_mem::text::into_std_boxed_str(blaze_mem::String::from_str_in(why, alloc)))
 }
 
 /// An instance as a plan task is asked for it: the plan's name and the ask its task reads back

@@ -19,9 +19,11 @@
 //! | [`SortedMap`], [`SortedSet`] | ordered by key, a sorted vector searched by halving |
 //! | [`Cow`] | borrowed or owned, copied into the allocator the caller names when it must own |
 //! | [`Soa`], [`soa!`] | a struct-of-arrays vector: one packed column per field in one allocation; the macro names its rows and columns |
+//! | [`String`], [`format_in!`], [`format_into!`] | UTF-8 text over [`Vec<u8, A>`](Vec); `blaze_mem` re-exports it, keeping only `OsString` and `PathBuf` |
 //!
-//! Text (`String<A>`, `format_in!`, `format_into!`) is `blaze_mem::text`'s; it moves here
-//! onto this crate's [`Vec`] when blaze-mem moves onto this crate, so text keeps one home.
+//! The one cargo feature, `std` (off by default; blaze-mem turns it on), adds what only this
+//! crate may write by the orphan rule and only std has: `AsRef<OsStr>` and `AsRef<Path>` for
+//! [`String`]. Nothing else of std is used.
 //!
 //! # Allocation failure
 //!
@@ -42,6 +44,8 @@
 //! | `coerce_unsized` | `Box<T, A>` to `Box<dyn Trait, A>` and `Box<[T; N], A>` to `Box<[T], A>`, the same for [`Arc`], [`Rc`] and their `Weak`s |
 //! | `unsize` | the `Unsize` bound of those impls |
 //! | `dropck_eyepatch` | `#[may_dangle]` on the `Drop` of every owner, so a `Vec<&'a T, A>` may be dropped after `'a` ends, as std's may |
+//! | `fn_traits`, `unboxed_closures` | `FnOnce`, `FnMut` and `Fn` for a [`Box`] of a [`CallOnce`] closure, so a boxed one-shot closure is called as `b(x)` |
+//! | `tuple_trait` | the `Tuple` bound on those impls' argument lists |
 //! | `register_tool`, `custom_inner_attributes` | `#![blaze::trust]`, blaze's lint attribute; inert under rustc |
 //!
 //! Stable on the pinned nightly and used without a gate: `core::alloc::Allocator`,
@@ -63,6 +67,7 @@
 
 #![no_std]
 #![feature(allocator_ext, coerce_unsized, unsize, dropck_eyepatch)]
+#![feature(fn_traits, unboxed_closures, tuple_trait)]
 // blaze's lints (`blaze::trust`) name their tool; inert under rustc.
 #![feature(register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
@@ -71,8 +76,9 @@
     reason = "the owning types themselves: a buffer's allocation and its initialized prefix (`RawBuf`, `soa::RawSoa`), a box's block, a counted block's header and value; each block names the invariant it relies on"
 )]
 
-// Tests compare against std's types and use its threads; the crate itself never sees `std`.
-#[cfg(test)]
+// Tests compare against std's types and use its threads; the crate itself sees `std` only for
+// the two impls of the `std` feature.
+#[cfg(any(test, feature = "std"))]
 extern crate std;
 
 // `macro_use`: the crate's own code names `vec_in!` and `soa!` by textual scope; a path
@@ -91,6 +97,7 @@ pub mod rc;
 #[macro_use]
 pub mod soa;
 pub mod sorted;
+pub mod text;
 pub mod vec;
 
 // A test-only switch that plants a known bug, for the oracles' controls (rule 53).
@@ -98,7 +105,7 @@ pub mod vec;
 mod plant;
 
 pub use arc::Arc;
-pub use boxed::Box;
+pub use boxed::{Box, CallOnce};
 pub use cow::{Cow, ToOwnedIn};
 pub use deque::VecDeque;
 pub use error::AllocFailure;
@@ -106,6 +113,7 @@ pub use raw::RawBuf;
 pub use rc::Rc;
 pub use soa::Soa;
 pub use sorted::{SortedMap, SortedSet};
+pub use text::{FromUtf8Error, String};
 pub use vec::{CollectIn, Refused, Vec};
 
 #[cfg(test)]

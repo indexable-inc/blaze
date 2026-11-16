@@ -6,7 +6,7 @@
 use core::alloc::Allocator;
 use core::fmt;
 
-use alloc::vec::Vec;
+use blaze_own::Vec;
 
 use crate::tokens::LitKind;
 

@@ -12,9 +12,11 @@
 
 #![blaze::sans_io]
 
-use alloc::collections::{BTreeMap, BTreeSet};
-use alloc::vec::Vec;
-use core::alloc::{Allocator, AllocatorClone};
+use core::alloc::Allocator;
+use core::mem;
+
+use blaze_hash::HashMap;
+use blaze_own::{SortedSet, Soa, Vec};
 
 use crate::{CodeId, Plant, SlotId, TestId};
 
@@ -37,6 +39,11 @@ pub fn entered<'a, A: Allocator>(
         }
         out.extend_from_slice(absorbed(SlotId(at as u32)));
     }
+    sort_tail(out, first);
+}
+
+/// Sorts what `out` holds from `first` on, and keeps each value once.
+fn sort_tail<T: Ord + Copy, A: Allocator>(out: &mut Vec<T, A>, first: usize) {
     out[first..].sort_unstable();
     let mut kept = first;
     for at in first..out.len() {
@@ -55,40 +62,60 @@ pub enum Verdict {
     Failed,
 }
 
+/// Column numbers of [`Tests`]'s table.
+const TEST: usize = 0;
+const VERDICT: usize = 1;
+const ENTERED: usize = 2;
+
 /// One suite's index. See the module's documentation.
-pub struct Tests<A: AllocatorClone> {
+pub struct Tests<A: Allocator + Clone> {
     alloc: A,
-    /// Each test of the suite, by the identities it entered and its verdict, once it ran.
-    records: BTreeMap<TestId, (Verdict, Vec<CodeId, A>), A>,
-    /// Every test the suite has, run or not.
-    known: BTreeSet<TestId, A>,
-    postings: BTreeMap<CodeId, BTreeSet<TestId, A>, A>,
+    /// Every test the suite has, sorted by its id, a row each: its id, its last verdict (none
+    /// before it ran) and the identities it entered then. Columns, since `affected` scans the
+    /// verdicts alone and a lookup halves the ids alone.
+    tests: Soa<(TestId, Option<Verdict>, Vec<CodeId, A>), A>,
+    /// From each identity to the tests that entered it. Hashed: every record adds a posting for
+    /// each body it entered, thousands in no order, which a sorted vector would shift for.
+    postings: HashMap<CodeId, SortedSet<TestId, A>, A>,
     pub(crate) plant: Plant,
 }
 
-impl<A: AllocatorClone> Tests<A> {
+impl<A: Allocator + Clone> Tests<A> {
     pub fn new(alloc: A) -> Tests<A> {
         Tests {
-            records: BTreeMap::new_in(alloc.clone()),
-            known: BTreeSet::new_in(alloc.clone()),
-            postings: BTreeMap::new_in(alloc.clone()),
+            tests: Soa::new_in(alloc.clone()),
+            postings: HashMap::new_in(alloc.clone()),
             alloc,
             plant: Plant::None,
         }
     }
 
+    /// The row of `test`, made (with no verdict) if the suite did not have it. Tests declared in
+    /// id order are each an append.
+    fn row(&mut self, test: TestId) -> usize {
+        match self.tests.column::<TEST>().binary_search(&test) {
+            Ok(row) => row,
+            Err(row) => {
+                self.tests.insert(row, (test, None, Vec::new_in(self.alloc.clone())));
+                row
+            }
+        }
+    }
+
     /// The suite has `test` (its entry lists it).
     pub fn declare(&mut self, test: TestId) {
-        self.known.insert(test);
+        self.row(test);
     }
 
     /// `test` ended with `verdict`, having entered `entered` (sorted, each once): its record,
     /// replacing the last.
     pub fn record(&mut self, test: TestId, verdict: Verdict, entered: &[CodeId]) {
-        self.known.insert(test);
-        if let Some((_, old)) = self.records.remove(&test)
-            && self.plant != Plant::StalePostings
-        {
+        let row = self.row(test);
+        let kept = Vec::from_slice_in(entered, self.alloc.clone());
+        let old = mem::replace(&mut self.tests.column_mut::<ENTERED>()[row], kept);
+        let was_recorded = self.tests.column::<VERDICT>()[row].is_some();
+        self.tests.column_mut::<VERDICT>()[row] = Some(verdict);
+        if was_recorded && self.plant != Plant::StalePostings {
             for id in &old {
                 if let Some(tests) = self.postings.get_mut(id) {
                     tests.remove(&test);
@@ -101,28 +128,31 @@ impl<A: AllocatorClone> Tests<A> {
         for id in entered {
             self.postings
                 .entry(*id)
-                .or_insert_with(|| BTreeSet::new_in(self.alloc.clone()))
+                .or_insert_with(|| SortedSet::new_in(self.alloc.clone()))
                 .insert(test);
         }
-        let mut kept = Vec::with_capacity_in(entered.len(), self.alloc.clone());
-        kept.extend_from_slice(entered);
-        self.records.insert(test, (verdict, kept));
     }
 
     pub fn verdict(&self, test: TestId) -> Option<Verdict> {
-        self.records.get(&test).map(|(verdict, _)| *verdict)
+        let row = self.tests.column::<TEST>().binary_search(&test).ok()?;
+        self.tests.column::<VERDICT>()[row]
     }
 
     /// The tests an edit that changed the bodies `changed` must run again, sorted: each that
     /// entered one of them, and each that has no record yet.
-    pub fn affected(&self, changed: &[CodeId], out: &mut Vec<TestId, A>) {
-        let mut set = BTreeSet::new_in(self.alloc.clone());
+    pub fn affected<B: Allocator>(&self, changed: &[CodeId], out: &mut Vec<TestId, B>) {
+        let first = out.len();
         for id in changed {
             if let Some(tests) = self.postings.get(id) {
-                set.extend(tests.iter().copied());
+                out.extend_from_slice(tests.as_slice());
             }
         }
-        set.extend(self.known.iter().filter(|test| !self.records.contains_key(*test)).copied());
-        out.extend(set);
+        let ids = self.tests.column::<TEST>();
+        for (row, verdict) in self.tests.column::<VERDICT>().iter().enumerate() {
+            if verdict.is_none() {
+                out.push(ids[row]);
+            }
+        }
+        sort_tail(out, first);
     }
 }

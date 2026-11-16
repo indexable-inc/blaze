@@ -3,9 +3,15 @@
 //! The compiler's own box moves its value out with `*b`; this one moves it out with
 //! [`Box::into_inner`] (docs/v2/plan/design/bottom.md, "Known cost"). It unsizes as std's does
 //! (`Box<T, A>` to `Box<dyn Trait, A>`, `Box<[T; N], A>` to `Box<[T], A>`), and a `Box<dyn Fn()>`
-//! is called as `b()` through `Deref`. Not yet: calling a `Box<dyn FnOnce()>` (it needs
-//! `unsized_fn_params`) and `self: Box<Self, A>` receivers (`dispatch_from_dyn` admits only an
-//! allocator sized 0).
+//! is called as `b()` through `Deref`.
+//!
+//! A boxed closure called once: std's `Box<dyn FnOnce()>` moves the unsized closure out by the
+//! compiler's `*b`, which no library box has. The primitive here is [`CallOnce`], a trait every
+//! sized `FnOnce` has, whose call takes the closure by `&mut` and leaves its place moved-from;
+//! a `Box<F, A>` is `FnOnce` (and `FnMut`, `Fn` when `F` is) for every `F: CallOnce`, so
+//! `Box<dyn CallOnce<(u32,), Output = R>, A>` is the boxed one-shot closure, called as `b(7)`.
+//! Not yet: `self: Box<Self, A>` receivers (`dispatch_from_dyn` admits only an allocator sized
+//! 0).
 
 use core::{
     alloc::{Allocator, Layout, StaticAllocator},
@@ -14,7 +20,7 @@ use core::{
     cmp::Ordering,
     fmt,
     hash::{Hash, Hasher},
-    marker::{PhantomData, Unsize},
+    marker::{PhantomData, Tuple, Unsize},
     mem::{DropGuard, ManuallyDrop, size_of},
     ops::{CoerceUnsized, Deref, DerefMut},
     pin::Pin,
@@ -310,6 +316,60 @@ impl<T: ?Sized, A: Allocator> Borrow<T> for Box<T, A> {
 impl<T: ?Sized, A: Allocator> BorrowMut<T> for Box<T, A> {
     fn borrow_mut(&mut self) -> &mut T {
         self
+    }
+}
+
+/// A closure that can be called once in place: the primitive under a boxed one-shot closure
+/// (see the module). Every sized `FnOnce` has it; `dyn CallOnce<Args, Output = R>` is the
+/// unsized form a [`Box`] holds.
+pub trait CallOnce<Args: Tuple>: FnOnce<Args> {
+    /// Calls the closure, moving it out of its place.
+    ///
+    /// # Safety
+    ///
+    /// `*self` is moved-from after: never used or dropped again (its memory may be freed).
+    unsafe fn call_once_in_place(&mut self, args: Args) -> Self::Output;
+}
+
+impl<Args: Tuple, F: FnOnce<Args>> CallOnce<Args> for F {
+    unsafe fn call_once_in_place(&mut self, args: Args) -> F::Output {
+        // SAFETY: the place is moved-from after (the caller's promise), so this is its one move.
+        let closure = unsafe { ptr::read(self) };
+        closure.call_once(args)
+    }
+}
+
+impl<Args: Tuple, F: ?Sized + CallOnce<Args>, A: Allocator> FnOnce<Args> for Box<F, A> {
+    type Output = F::Output;
+
+    extern "rust-call" fn call_once(self, args: Args) -> F::Output {
+        let (ptr, alloc) = Box::into_non_null_with_allocator(self);
+        // SAFETY: the box's value is live, so its metadata is valid.
+        let layout = unsafe { Layout::for_value_raw(ptr.as_ptr()) };
+        // The block is freed after the call, a panic in it among the ways, without dropping the
+        // moved-from closure.
+        let _free = DropGuard::new(alloc, move |alloc| {
+            if layout.size() != 0 {
+                // SAFETY: the box's block, from `alloc` for `layout` (the box's invariant),
+                // freed once.
+                unsafe { alloc.deallocate(ptr.cast(), layout) };
+            }
+        });
+        // SAFETY: the closure is live and owned here; it is moved-from after, and only its
+        // block is freed.
+        unsafe { (*ptr.as_ptr()).call_once_in_place(args) }
+    }
+}
+
+impl<Args: Tuple, F: ?Sized + FnMut<Args> + CallOnce<Args>, A: Allocator> FnMut<Args> for Box<F, A> {
+    extern "rust-call" fn call_mut(&mut self, args: Args) -> <F as FnOnce<Args>>::Output {
+        (**self).call_mut(args)
+    }
+}
+
+impl<Args: Tuple, F: ?Sized + Fn<Args> + CallOnce<Args>, A: Allocator> Fn<Args> for Box<F, A> {
+    extern "rust-call" fn call(&self, args: Args) -> <F as FnOnce<Args>>::Output {
+        (**self).call(args)
     }
 }
 

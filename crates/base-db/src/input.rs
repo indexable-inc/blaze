@@ -33,8 +33,10 @@ impl CrateName {
 
     /// A crate name, each dash written as an underscore.
     pub fn normalize_dashes(name: &str) -> CrateName {
-        let mut text = String::with_capacity_in(name.len(), Global);
-        text.extend(name.chars().map(|c| if c == '-' { '_' } else { c }));
+        let mut text = blaze_mem::String::with_capacity_in(name.len(), Global);
+        for c in name.chars() {
+            text.push(if c == '-' { '_' } else { c });
+        }
         Self(Symbol::intern(&text))
     }
 
@@ -492,11 +494,9 @@ pub struct Env {
 
 impl Env {
     pub fn set(&mut self, name: &str, value: &str) {
-        let mut key = String::with_capacity_in(name.len(), Global);
-        key.push_str(name);
-        let mut text = String::with_capacity_in(value.len(), Global);
-        text.push_str(value);
-        self.entries.insert(key.into_boxed_str(), text.into_boxed_str());
+        let key = blaze_mem::text::into_std_boxed_str(blaze_mem::String::from_str_in(name, Global));
+        let text = blaze_mem::text::into_std_boxed_str(blaze_mem::String::from_str_in(value, Global));
+        self.entries.insert(key, text);
     }
 
     pub fn get(&self, name: &str) -> Option<&str> {

@@ -10,11 +10,10 @@ use blaze_sim::{Broke, Config, Tape};
 
 use crate::testing::{Fact, MemSurface};
 use crate::{
-    AnyItem, Binding, ByteRange, CrateGraph, CrateGraphView, CrateRoot, CrateRootHead,
-    CrateRootView, DeclaredName, Edition, ExportClass, FileItem, FileItems, FileItemsView, HasText,
-    ItemIndex, ItemKind, Items, KeyEntry, KeyIndex, KeyIndexView, LangItems, LangItemsView,
-    LocalTable, MacroCall, MacroDef, MacroDefHead, MacroDefView, MacroKind, ModDecl, ModuleDecls,
-    ModuleDeclsView, ModuleFile, ModuleFileView, ModuleScope, Namespace, NoImplsOf, NoImplsOfView,
+    AnyItem, Binding, ByteRange, CrateRoot, CrateRootHead, CrateRootView, DeclaredName, Edition,
+    ExportClass, FileItem, FileItems, FileItemsView, HasText, ItemIndex, ItemKind, Items, KeyEntry,
+    KeyIndex, KeyIndexView, LocalTable, MacroCall, MacroDef, MacroDefHead, MacroDefView, MacroKind,
+    ModDecl, ModuleDecls, ModuleDeclsView, ModuleFile, ModuleFileView, ModuleScope, Namespace,
     NotBuilt, Origin, Place, ScopeView, Source, SurfaceError, Target, TextualEntry,
     TextualEntryView, UseLeaf, Visibility,
 };
@@ -551,38 +550,3 @@ fn a_macro_def_reads_back_with_its_helpers_in_order() {
     assert_eq!(MacroDefView::read(&buffer).expect("a written record").head(), builtin);
 }
 
-#[test]
-fn lang_items_a_crate_graph_and_impls_read_back() {
-    let mut lang = LangItems::new_in(KRATE, Global);
-    lang.item("sized", key(1)).expect("small");
-    lang.item("copy", key(2)).expect("small");
-    let buffer = Aligned::copy_from(&lang.finish().expect("distinct names"));
-    let view = LangItemsView::read(&buffer).expect("a written record");
-    assert_eq!((view.get("copy"), view.get("sized"), view.get("drop")), (Some(key(2)), Some(key(1)), None));
-
-    let (core, std) = (CrateItemKey(ContentId([7; 32])), CrateItemKey(ContentId([9; 32])));
-    let mut graph = CrateGraph::new_in(KRATE, Global);
-    graph.krate(std, "std").expect("small");
-    graph.krate(KRATE, "app").expect("small");
-    graph.krate(core, "core").expect("small");
-    graph.dep(KRATE, std, "std").expect("small");
-    graph.dep(KRATE, core, "core").expect("small");
-    graph.dep(std, core, "core").expect("small");
-    let buffer = Aligned::copy_from(&graph.finish().expect("a closed graph"));
-    let view = CrateGraphView::read(&buffer).expect("a written record");
-    assert!(view.crates().eq([(KRATE, "app"), (core, "core"), (std, "std")]));
-    assert!(view.deps_of(KRATE).eq([("core", core), ("std", std)]));
-    assert_eq!((view.dep(std, "core"), view.dep(core, "std")), (Some(core), None));
-    let mut open = CrateGraph::new_in(KRATE, Global);
-    open.krate(KRATE, "app").expect("small");
-    open.dep(KRATE, core, "core").expect("small");
-    assert!(matches!(open.finish().err(), Some(crate::BuildError::Unknown { .. })));
-
-    let mut impls = NoImplsOf::new_in(KRATE, Global);
-    impls.implements(key(9));
-    impls.implements(key(4));
-    impls.implements(key(9));
-    let buffer = Aligned::copy_from(&impls.finish().expect("small"));
-    let view = NoImplsOfView::read(&buffer).expect("a written record");
-    assert!(!view.has_no_impl_of(key(4)) && !view.has_no_impl_of(key(9)) && view.has_no_impl_of(key(5)));
-}

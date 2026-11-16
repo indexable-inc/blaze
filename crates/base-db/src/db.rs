@@ -121,9 +121,8 @@ impl Includes {
 
     /// `path`, written in `anchor`, names `file`.
     pub fn path(&mut self, anchor: FileId, path: &str, file: FileId) {
-        let mut text = String::with_capacity_in(path.len(), Global);
-        text.push_str(path);
-        self.paths.push((anchor, text.into_boxed_str(), file));
+        let text = blaze_mem::text::into_std_boxed_str(blaze_mem::String::from_str_in(path, Global));
+        self.paths.push((anchor, text, file));
     }
 
     /// `file`, which is not UTF-8, is `bytes`.
@@ -259,7 +258,7 @@ impl Db {
     /// another crate: its text is never the asker's to read (docs/v2/plan/design/bottom.md,
     /// point 5).
     pub fn file_text(&self, file: FileId) -> FileText {
-        FileText::new(self, file)
+        FileText::new(self, self.file_content(file))
     }
 
     /// Whether the task holds the text of `file`: a file of the crate it compiles.
@@ -285,15 +284,14 @@ impl Db {
     /// UTF-8.
     pub fn included_bytes(&self, file: FileId) -> Option<&[u8]> {
         if self.has_file_text(file) {
-            return Some(self.text_of(file).as_bytes());
+            return Some(self.text_of_content(self.file_content(file)).as_bytes());
         }
         let bytes = &self.includes.bytes;
         let at = bytes.binary_search_by_key(&file, |(at, _)| *at).ok()?;
         Some(&bytes[at].1)
     }
 
-    fn text_of(&self, file: FileId) -> &syntax::Text {
-        let content = self.file_content(file);
+    fn text_of_content(&self, content: ContentId) -> &syntax::Text {
         let Some(proof) = self.records.text_proof() else {
             return Err(SurfaceError::NoFileRecord { fact: "text", file: content }).or_need();
         };
@@ -314,17 +312,19 @@ impl blaze_memo::Database for Db {
     }
 }
 
-/// A file's text as a memo value: what [`line_index`] and the parse are keyed by.
+/// A file's text as a memo value: what [`line_index`] and the parse are keyed by. Keyed by
+/// the file's content, never its dense [`FileId`] (a number of this task's table, which a key
+/// must not hold: rule 21).
 #[blaze_memo::interned(debug, unsafe(no_lifetime))]
 pub struct FileText {
     #[returns(copy)]
-    pub file: FileId,
+    pub content: ContentId,
 }
 
 impl FileText {
     /// The text: a file of the crate the task compiles, or a [`crate::Need`] stop.
     pub fn text(self, db: &Db) -> &syntax::Text {
-        db.text_of(self.file(db))
+        db.text_of_content(self.content(db))
     }
 }
 

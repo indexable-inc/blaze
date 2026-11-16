@@ -21,14 +21,20 @@
 //! The ids below are this crate's own so that it compiles alone today; each says the type it
 //! becomes when the crate that owns that type is on the new item layer (bottom.md).
 
-#![feature(allocator_api, btreemap_alloc, register_tool, custom_inner_attributes)]
+// The tests keep std's prelude; the crate itself is built without it.
+#![cfg_attr(not(test), no_std)]
+#![feature(allocator_api, register_tool, custom_inner_attributes)]
 #![register_tool(blaze)]
 #![blaze::sans_io]
 #![deny(blaze::sans_io_core)]
 // Denied, not forbidden: `events` takes blaze-format's `record!`, whose impl is unsafe.
 #![deny(unsafe_code)]
 
-extern crate alloc;
+// The one reason this crate links `std`: blaze-format's `record!` (in `events`) names
+// `::std::vec::Vec`. The crate's own code sees only `core` (no std prelude: `#![no_std]`), so
+// nothing else can reach `std`; this goes when the macro names `core` and blaze-own.
+#[cfg(not(test))]
+extern crate std;
 
 pub mod events;
 pub mod heat;
@@ -42,8 +48,9 @@ pub mod viewer;
 #[cfg(test)]
 mod sim;
 
-use alloc::vec::Vec;
 use core::alloc::Allocator;
+
+use blaze_own::Vec;
 use core::fmt;
 
 /// A function's slot: its index in the program's table of words, fixed for the run. Becomes

@@ -28,7 +28,7 @@
 //! every bucket key.
 //!
 //! The bytes: a `Def` is its key's 32 bytes. Every other shape has a first 8 bytes of zero,
-//! which no crate's key prefix is ([`crate::GraphError::ReservedPrefix`] refuses one), then a
+//! which no crate's key prefix is ([`crate::crate_graph::GraphError::ReservedPrefix`] refuses one), then a
 //! tag at byte 8, a width or mutability at byte 9 and an arity at bytes 12..16, the rest zero.
 
 use core::fmt;
@@ -119,7 +119,7 @@ impl fmt::Display for ShapeError {
         match self {
             ShapeError::ReservedPrefix { key } => write!(
                 f,
-                "the item key {key:x} begins with 8 zero bytes, which mark a self shape with no definition (blaze_impls::SelfShape)"
+                "the item key {key:x} begins with 8 zero bytes, which mark a self shape with no definition (blaze_surface::SelfShape)"
             ),
             ShapeError::Bytes { what } => write!(f, "not a self shape: {what}"),
         }

@@ -5,8 +5,14 @@ use core::alloc::Allocator;
 use core::ops::Range;
 
 use blaze_format::{FormatError, Record, Slice, Writer};
+use blaze_own::Vec;
 
 use crate::error::BuildError;
+
+/// A finished record's bytes, as blaze-format's [`Writer::finish`] hands them back: its
+/// `std` vector until blaze-format moves onto blaze-own, the one place this crate names `std`'s
+/// collections outside a `record!` expansion.
+pub type RecordBytes<A> = std::vec::Vec<u8, A>;
 
 /// No row: a parent at the top, an item index not given.
 pub(crate) const NONE: u32 = u32::MAX;
@@ -84,7 +90,7 @@ impl Column {
 pub(crate) fn finish_with<R: Record, A: Allocator>(
     mut out: Writer<A>,
     make: impl FnOnce(u64) -> R,
-) -> Vec<u8, A> {
+) -> RecordBytes<A> {
     let at = out.next::<R>();
     let root = make(at);
     let written = out.push(&root);

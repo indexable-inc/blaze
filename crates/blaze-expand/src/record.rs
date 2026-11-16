@@ -17,7 +17,7 @@ use core::alloc::Allocator;
 use core::fmt;
 use core::mem::size_of;
 
-use alloc::vec::Vec;
+use blaze_own::Vec;
 
 use blaze_format::{FormatError, Part, Record, SchemaHash, Slice, Writer, leb};
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
@@ -25,7 +25,7 @@ use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use crate::{
     error::StreamError,
     expansion::{
-        Diagnostic, Expansion, Hole, HoleOf, IncludeFailure, NestedCall, NestedKind, Origin,
+        Diagnostic, Expansion, Hole, HoleOf, IncludeFailure, NestedCall, NestedKind, TokenOrigin,
         PathScope, Range, ReadAnswer, ReadKind,
     },
     tokens::{
@@ -193,36 +193,19 @@ fn token_word(kind: TokenKind) -> u32 {
     }
 }
 
-fn transparency_bits(transparency: Transparency) -> u8 {
-    match transparency {
-        Transparency::Transparent => 0,
-        Transparency::SemiOpaque => 1,
-        Transparency::Opaque => 2,
-    }
-}
-
-fn edition_bits(edition: Edition) -> u8 {
-    match edition {
-        Edition::E2015 => 0,
-        Edition::E2018 => 1,
-        Edition::E2021 => 2,
-        Edition::E2024 => 3,
-    }
-}
-
-fn origin_word(origin: Origin) -> u64 {
+fn origin_word(origin: TokenOrigin) -> u64 {
     let (tag, value) = match origin {
-        Origin::Input(at) => (0, at),
-        Origin::AttrArgs(at) => (1, at),
-        Origin::Def(at) => (2, at),
-        Origin::Params(at) => (3, at),
-        Origin::Made(transparency) => (4, u32::from(transparency_bits(transparency))),
+        TokenOrigin::Input(at) => (0, at),
+        TokenOrigin::AttrArgs(at) => (1, at),
+        TokenOrigin::Def(at) => (2, at),
+        TokenOrigin::Params(at) => (3, at),
+        TokenOrigin::Made(transparency) => (4, u32::from(transparency.byte())),
     };
     u64::from(value) << 3 | tag
 }
 
 /// An optional origin: 0 for none, else its word plus one.
-fn origin_option(origin: Option<Origin>) -> u64 {
+fn origin_option(origin: Option<TokenOrigin>) -> u64 {
     origin.map_or(0, |origin| origin_word(origin) + 1)
 }
 
@@ -265,39 +248,11 @@ impl<A: Allocator> Columns<A> {
 impl<A: Allocator> Expansion<A> {
     /// The expansion as a record: one blaze-format buffer of [`EXPANSION_SCHEMA`] in `alloc`.
     /// Equal expansions give equal bytes.
-    pub fn write_record<B: Allocator + Clone>(&self, alloc: B) -> Vec<u8, B> {
+    pub fn write_record<B: Allocator + Clone>(&self, alloc: B) -> RecordBytes<B> {
         let mut c = Columns::new_in(&alloc);
-        let tokens = &self.tokens;
-        for token in tokens.tokens() {
-            c.put(RecordColumn::Tokens, &token_word(token.kind).to_le_bytes());
-            let text = tokens.text_of(token);
-            c.put(RecordColumn::Text, text.as_bytes());
-            c.leb(RecordColumn::TextLens, wide(text.len()));
-            c.leb(RecordColumn::Ctxs, u64::from(token.ctx.raw()));
-            if let TokenKind::Literal { suffix_len, .. } = token.kind {
-                c.leb(RecordColumn::Suffixes, u64::from(suffix_len));
-            }
-        }
+        write_stream(&mut c, &self.tokens);
         for origin in self.origins.iter() {
             c.leb(RecordColumn::Origins, origin_word(*origin));
-        }
-        for node in tokens.contexts() {
-            let Mark { of, transparency, edition, site } = node.mark;
-            c.leb(RecordColumn::Contexts, u64::from(node.parent.raw()));
-            let outer = u8::from(matches!(of, MarkOf::Outer(_)));
-            let module = u8::from(site.module.is_some());
-            let flags = outer
-                | transparency_bits(transparency) << 1
-                | edition_bits(edition) << 3
-                | module << 5;
-            c.put(RecordColumn::Contexts, &[flags]);
-            if let MarkOf::Outer(key) = of {
-                c.put(RecordColumn::Contexts, &key.0);
-            }
-            c.put(RecordColumn::Contexts, &site.krate.0.0);
-            if let Some(module) = site.module {
-                c.put(RecordColumn::Contexts, &module.0.0);
-            }
         }
         for nested in self.nested.iter() {
             let kind = match nested.kind {
@@ -365,30 +320,121 @@ impl<A: Allocator> Expansion<A> {
         }
         c.put(RecordColumn::Notes, &self.notes);
         c.leb(RecordColumn::Arm, self.arm.map_or(0, |arm| u64::from(arm) + 1));
-
-        let mut out = Writer::new_in(EXPANSION_SCHEMA, alloc);
-        let mut places = [(0u64, 0usize); COLUMNS];
-        for (place, bytes) in places.iter_mut().zip(c.columns.iter()) {
-            if !bytes.is_empty() {
-                *place = (out.push_slice(&bytes[..]), bytes.len());
-            }
-        }
-        let root_at = out.next::<Root>();
-        let field = wide(size_of::<Slice<u8>>());
-        let root: Root = core::array::from_fn(|i| match places[i] {
-            (_, 0) => Slice::EMPTY,
-            (at, len) => Slice::between(root_at + wide(i) * field, at, len),
-        });
-        let written = out.push(&root);
-        debug_assert_eq!(written, root_at);
-        out.finish(root_at)
+        finish_columns(&c, EXPANSION_SCHEMA, alloc)
     }
+}
+
+impl<A: Allocator> TokenStream<A> {
+    /// The stream alone as a record: one blaze-format buffer of [`STREAM_SCHEMA`] in `alloc`,
+    /// the stream columns of an expansion record ([`RecordColumn::Tokens`] to
+    /// [`RecordColumn::Contexts`]) and every other column empty. What a macro definition's
+    /// body and parameters are stored as, each by its [`TokenStream::record_id`]. Equal streams
+    /// give equal bytes.
+    pub fn write_record<B: Allocator + Clone>(&self, alloc: B) -> RecordBytes<B> {
+        let mut c = Columns::new_in(&alloc);
+        write_stream(&mut c, self);
+        finish_columns(&c, STREAM_SCHEMA, alloc)
+    }
+}
+
+impl<A: Allocator + Clone> TokenStream<A> {
+    /// The stream a [`TokenStream::write_record`] buffer holds, in `alloc`, checked once.
+    pub fn read_record(buffer: &[u8], alloc: A) -> Result<TokenStream<A>, RecordError> {
+        let mut r = open_columns(buffer, STREAM_SCHEMA)?;
+        let stream = read_tokens(&mut r, alloc)?;
+        for col in &r.columns {
+            col.done()?;
+        }
+        Ok(stream)
+    }
+}
+
+/// The digest a stream record is stored and named by: of its bytes, in its own domain.
+pub fn stream_record_id(bytes: &[u8]) -> ContentId {
+    blaze_ids::Hasher::new("blaze v2 expand token stream record 1").part(bytes).finish()
+}
+
+/// The schema of a token stream stored alone ([`TokenStream::write_record`]).
+pub const STREAM_SCHEMA: SchemaHash = blaze_format::schema_of(&[
+    Part::Str("blaze-expand TokenStream"),
+    Part::U64(1),
+    Part::Schema(<Root as Record>::SCHEMA),
+]);
+
+/// A finished record's bytes, as blaze-format's `Writer::finish` hands them back: its `std`
+/// vector until blaze-format moves onto blaze-own.
+pub type RecordBytes<B> = blaze_surface::RecordBytes<B>;
+
+/// The stream's columns: each token's entry, text, length, context and suffix, then the
+/// context table.
+fn write_stream<A: Allocator, B: Allocator>(c: &mut Columns<B>, tokens: &TokenStream<A>) {
+    for token in tokens.tokens() {
+        c.put(RecordColumn::Tokens, &token_word(token.kind).to_le_bytes());
+        let text = tokens.text_of(token);
+        c.put(RecordColumn::Text, text.as_bytes());
+        c.leb(RecordColumn::TextLens, wide(text.len()));
+        c.leb(RecordColumn::Ctxs, u64::from(token.ctx.raw()));
+        if let TokenKind::Literal { suffix_len, .. } = token.kind {
+            c.leb(RecordColumn::Suffixes, u64::from(suffix_len));
+        }
+    }
+    for node in tokens.contexts() {
+        let Mark { of, transparency, edition, site } = node.mark;
+        c.leb(RecordColumn::Contexts, u64::from(node.parent.raw()));
+        let outer = u8::from(matches!(of, MarkOf::Outer(_)));
+        let module = u8::from(site.module.is_some());
+        let flags = outer | transparency.byte() << 1 | edition.byte() << 3 | module << 5;
+        c.put(RecordColumn::Contexts, &[flags]);
+        if let MarkOf::Outer(key) = of {
+            c.put(RecordColumn::Contexts, &key.0);
+        }
+        c.put(RecordColumn::Contexts, &site.krate.0.0);
+        if let Some(module) = site.module {
+            c.put(RecordColumn::Contexts, &module.0.0);
+        }
+    }
+}
+
+/// The columns as one buffer of `schema`: each non-empty column's bytes, then the root.
+fn finish_columns<A: Allocator, B: Allocator + Clone>(
+    c: &Columns<A>,
+    schema: SchemaHash,
+    alloc: B,
+) -> RecordBytes<B> {
+    let mut out = Writer::new_in(schema, alloc);
+    let mut places = [(0u64, 0usize); COLUMNS];
+    for (place, bytes) in places.iter_mut().zip(c.columns.iter()) {
+        if !bytes.is_empty() {
+            *place = (out.push_slice(&bytes[..]), bytes.len());
+        }
+    }
+    let root_at = out.next::<Root>();
+    let field = wide(size_of::<Slice<u8>>());
+    let root: Root = core::array::from_fn(|i| match places[i] {
+        (_, 0) => Slice::EMPTY,
+        (at, len) => Slice::between(root_at + wide(i) * field, at, len),
+    });
+    let written = out.push(&root);
+    debug_assert_eq!(written, root_at);
+    out.finish(root_at)
+}
+
+/// A buffer of `schema` opened: each column's bytes, none read yet.
+fn open_columns(buffer: &[u8], schema: SchemaHash) -> Result<Reader<'_>, RecordError> {
+    let root = blaze_format::open_as::<Root>(buffer, schema)?;
+    let mut bytes: [&[u8]; COLUMNS] = [&[]; COLUMNS];
+    for (place, slice) in bytes.iter_mut().zip(root.iter()) {
+        *place = slice.follow(buffer)?;
+    }
+    Ok(Reader {
+        columns: core::array::from_fn(|i| Col { column: RecordColumn::ALL[i], bytes: bytes[i], at: 0 }),
+    })
 }
 
 fn write_diagnostic<A: Allocator>(c: &mut Columns<A>, diagnostic: Diagnostic) {
     let column = RecordColumn::Diagnostics;
     let tag = |c: &mut Columns<A>, tag: u8| c.put(column, &[tag]);
-    let origin = |c: &mut Columns<A>, at: Option<Origin>| c.leb(column, origin_option(at));
+    let origin = |c: &mut Columns<A>, at: Option<TokenOrigin>| c.leb(column, origin_option(at));
     match diagnostic {
         Diagnostic::NoRuleMatched { rules, token, expected, at } => {
             tag(c, 0);
@@ -583,25 +629,18 @@ fn token_of(word: u32) -> Option<TokenKind> {
     (token_word(kind) == word).then_some(kind)
 }
 
-fn transparency_of(bits: u8) -> Option<Transparency> {
-    [Transparency::Transparent, Transparency::SemiOpaque, Transparency::Opaque]
-        .get(usize::from(bits))
-        .copied()
-}
-
 fn edition_of(bits: u64) -> Option<Edition> {
-    let editions = [Edition::E2015, Edition::E2018, Edition::E2021, Edition::E2024];
-    editions.get(usize::try_from(bits).ok()?).copied()
+    Edition::from_byte(u8::try_from(bits).ok()?)
 }
 
-fn origin_of(word: u64) -> Option<Origin> {
+fn origin_of(word: u64) -> Option<TokenOrigin> {
     let value = u32::try_from(word >> 3).ok()?;
     Some(match word & 0b111 {
-        0 => Origin::Input(value),
-        1 => Origin::AttrArgs(value),
-        2 => Origin::Def(value),
-        3 => Origin::Params(value),
-        4 => Origin::Made(transparency_of(u8::try_from(value).ok()?)?),
+        0 => TokenOrigin::Input(value),
+        1 => TokenOrigin::AttrArgs(value),
+        2 => TokenOrigin::Def(value),
+        3 => TokenOrigin::Params(value),
+        4 => TokenOrigin::Made(Transparency::from_byte(u8::try_from(value).ok()?)?),
         _ => return None,
     })
 }
@@ -630,18 +669,7 @@ impl<A: Allocator + Clone> Expansion<A> {
     /// equal to the expansion written, and refused with the column and byte otherwise. The
     /// buffer is aligned as blaze-format buffers are (to 4 bytes at least).
     pub fn read_record(buffer: &[u8], alloc: A) -> Result<Expansion<A>, RecordError> {
-        let root = blaze_format::open_as::<Root>(buffer, EXPANSION_SCHEMA)?;
-        let mut bytes: [&[u8]; COLUMNS] = [&[]; COLUMNS];
-        for (place, slice) in bytes.iter_mut().zip(root.iter()) {
-            *place = slice.follow(buffer)?;
-        }
-        let mut r = Reader {
-            columns: core::array::from_fn(|i| Col {
-                column: RecordColumn::ALL[i],
-                bytes: bytes[i],
-                at: 0,
-            }),
-        };
+        let mut r = open_columns(buffer, EXPANSION_SCHEMA)?;
         let mut exp = Expansion::new_in(alloc.clone());
         let tokens = read_tokens(&mut r, alloc.clone())?;
         let len = tokens.len();
@@ -732,7 +760,7 @@ fn read_tokens<A: Allocator + Clone>(
         let parent =
             ctx_of(parent, &nodes).ok_or_else(|| contexts.bad("a parent context not before it"))?;
         let flags = contexts.byte()?;
-        let transparency = transparency_of(flags >> 1 & 0b11)
+        let transparency = Transparency::from_byte(flags >> 1 & 0b11)
             .ok_or_else(|| contexts.bad("a mark of no transparency"))?;
         let edition = edition_of(u64::from(flags >> 3 & 0b11))
             .ok_or_else(|| contexts.bad("a mark of no edition"))?;
@@ -855,7 +883,7 @@ fn read_diagnostics<A: Allocator + Clone>(
             }),
         }
     };
-    let origin = |col: &mut Col<'_>| -> Result<Option<Origin>, RecordError> {
+    let origin = |col: &mut Col<'_>| -> Result<Option<TokenOrigin>, RecordError> {
         match col.u64()? {
             0 => Ok(None),
             word => origin_of(word - 1).map(Some).ok_or_else(|| col.bad("an origin of no kind")),

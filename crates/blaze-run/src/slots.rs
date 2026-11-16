@@ -26,9 +26,10 @@
 
 #![blaze::sans_io]
 
-use alloc::vec::Vec;
-use core::alloc::{Allocator, AllocatorClone};
+use core::alloc::Allocator;
 use core::fmt;
+
+use blaze_own::Vec;
 
 use crate::{CodeRef, Hooks, Plant, SlotId, ThreadId, Tier};
 
@@ -181,7 +182,7 @@ pub struct Found {
 }
 
 /// The table of one program. See the module's documentation.
-pub struct Slots<A: AllocatorClone> {
+pub struct Slots<A: Allocator + Clone> {
     alloc: A,
     words: Vec<Word, A>,
     bodies: Vec<Placed, A>,
@@ -194,7 +195,7 @@ pub struct Slots<A: AllocatorClone> {
     pub(crate) plant: Plant,
 }
 
-impl<A: AllocatorClone> Slots<A> {
+impl<A: Allocator + Clone> Slots<A> {
     /// A table of `slots` stubs, whose area numbers at most `most_bodies` bodies, in `alloc`.
     pub fn new(slots: u32, most_bodies: u32, alloc: A) -> Result<Slots<A>, Error> {
         if slots == 0 {
@@ -206,8 +207,8 @@ impl<A: AllocatorClone> Slots<A> {
                 value: u64::from(most_bodies),
             });
         }
-        let mut words = Vec::new_in(alloc.clone());
-        words.resize(slots as usize, Word::STUB);
+        // One column a slot, so a plain vector: a call loads its word and nothing beside it.
+        let words = Vec::from_elem_in(Word::STUB, slots as usize, alloc.clone());
         Ok(Slots {
             words,
             bodies: Vec::new_in(alloc.clone()),

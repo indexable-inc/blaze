@@ -38,10 +38,10 @@
 
 #![blaze::sans_io]
 
-use alloc::collections::{BTreeMap, VecDeque};
-use alloc::vec::Vec;
-use core::alloc::{Allocator, AllocatorClone};
+use core::alloc::Allocator;
 use core::fmt;
+
+use blaze_own::{SortedMap, Vec, VecDeque, soa};
 
 use crate::registry::RunEvent;
 use crate::tier::{Identities, Inlined, usable_planted};
@@ -102,7 +102,7 @@ pub struct FastRecord<A: Allocator> {
 /// The fast tier's compiler: the type checker and codegen behind one call (the real one comes
 /// from the new item layer, bottom.md). A pure function of what it reads: it returns its record
 /// or the records it lacks, and never waits. Its driver calls it for each [`Effect::Compile`].
-pub trait Compiler<A: AllocatorClone> {
+pub trait Compiler<A: Allocator + Clone> {
     fn compile(&mut self, version: VersionKey, alloc: A) -> Result<Made<FastRecord<A>, A>, Why>;
 }
 
@@ -246,25 +246,33 @@ enum Asker {
     Thread(ThreadId),
 }
 
+soa! {
+    /// One slot as the parent keeps it: the function it runs, its plain version's state, the
+    /// hooks it is to run with, and those of what its word names (`None` while a stub). By
+    /// columns: the clock's pass reads `plains` alone, a toggle `wanted` and `shown`.
+    struct Row, Rows, RowRef {
+        function: Function => functions / functions_mut,
+        plain: State => plains / plains_mut,
+        wanted: Hooks => wanted / wanted_mut,
+        shown: Option<Hooks> => shown / shown_mut,
+    }
+}
+
 /// One program's parent. See the module's documentation.
-pub struct Parent<A: AllocatorClone> {
+pub struct Parent<A: Allocator + Clone> {
     alloc: A,
     config: Config,
-    functions: Vec<Function, A>,
-    ids: BTreeMap<InstanceKey, CodeId, A>,
-    /// Each slot's plain version.
-    plain: Vec<State, A>,
-    /// Each hooked version asked for; absent is unasked.
-    hooked: BTreeMap<Version, State, A>,
-    /// The hooks each slot is to run with.
-    wanted: Vec<Hooks, A>,
-    /// The hooks of what each slot's word names; `None` while it is a stub.
-    shown: Vec<Option<Hooks>, A>,
+    /// A row a slot, by columns ([`Row`]).
+    table: Rows<A>,
+    /// Each instance's code identity, sorted once at the start and never inserted into.
+    ids: SortedMap<InstanceKey, CodeId, A>,
+    /// Each hooked version asked for; absent is unasked. Sorted: one insert a toggled slot.
+    hooked: SortedMap<Version, State, A>,
     /// Who waits for which version, in the order they asked.
     waiters: Vec<(Version, Asker), A>,
     queues: [VecDeque<Version, A>; 4],
-    /// Each record being made, and the versions whose compiles lack it.
-    making: BTreeMap<RecordKey, Vec<Version, A>, A>,
+    /// Each record being made, and the versions whose compiles lack it: the few in flight.
+    making: SortedMap<RecordKey, Vec<Version, A>, A>,
     running: u32,
     running_background: u32,
     start: Start,
@@ -273,13 +281,13 @@ pub struct Parent<A: AllocatorClone> {
     pub(crate) plant: Plant,
 }
 
-impl<A: AllocatorClone> Identities for Parent<A> {
+impl<A: Allocator + Clone> Identities for Parent<A> {
     fn code_id(&self, instance: InstanceKey) -> Option<CodeId> {
         self.ids.get(&instance).copied()
     }
 }
 
-impl<A: AllocatorClone> Parent<A> {
+impl<A: Allocator + Clone> Parent<A> {
     /// The parent of a program whose slots run `functions`, in `alloc`.
     pub fn new(functions: &[Function], config: Config, alloc: A) -> Result<Parent<A>, Error> {
         if config.workers < 2 {
@@ -292,26 +300,20 @@ impl<A: AllocatorClone> Parent<A> {
             return Err(Error::Config { what: "a bound of 0", value: 0 });
         }
         let n = functions.len();
-        let mut all = Vec::with_capacity_in(n, alloc.clone());
-        all.extend_from_slice(functions);
-        let mut ids = BTreeMap::new_in(alloc.clone());
+        let mut table = Rows::with_capacity_in(n, alloc.clone());
         for function in functions {
-            ids.insert(function.instance, function.code);
+            table.push(Row { function: *function, plain: State::Unasked, wanted: Hooks::NONE, shown: None });
         }
-        let mut plain = Vec::with_capacity_in(n, alloc.clone());
-        plain.resize(n, State::Unasked);
-        let mut wanted = Vec::with_capacity_in(n, alloc.clone());
-        wanted.resize(n, Hooks::NONE);
-        let mut shown = Vec::with_capacity_in(n, alloc.clone());
-        shown.resize(n, None);
+        let mut pairs = Vec::with_capacity_in(n, alloc.clone());
+        pairs.extend(functions.iter().map(|function| (function.instance, function.code)));
+        pairs.sort_unstable_by_key(|(instance, _)| *instance);
+        let ids = SortedMap::from_sorted(pairs)
+            .map_err(|twice| Error::Config { what: "two slots run one instance", value: twice.at as u64 })?;
         Ok(Parent {
             config,
-            functions: all,
+            table,
             ids,
-            plain,
-            hooked: BTreeMap::new_in(alloc.clone()),
-            wanted,
-            shown,
+            hooked: SortedMap::new_in(alloc.clone()),
             waiters: Vec::new_in(alloc.clone()),
             queues: [
                 VecDeque::new_in(alloc.clone()),
@@ -319,7 +321,7 @@ impl<A: AllocatorClone> Parent<A> {
                 VecDeque::new_in(alloc.clone()),
                 VecDeque::new_in(alloc.clone()),
             ],
-            making: BTreeMap::new_in(alloc.clone()),
+            making: SortedMap::new_in(alloc.clone()),
             alloc,
             running: 0,
             running_background: 0,
@@ -331,11 +333,15 @@ impl<A: AllocatorClone> Parent<A> {
     }
 
     fn slots(&self) -> u32 {
-        self.functions.len() as u32
+        self.table.len() as u32
+    }
+
+    fn instance(&self, slot: SlotId) -> InstanceKey {
+        self.table.functions()[slot.index()].instance
     }
 
     fn check(&self, slot: SlotId) -> Result<(), Error> {
-        match slot.index() < self.functions.len() {
+        match slot.index() < self.table.len() {
             true => Ok(()),
             false => Err(Error::NoSlot { slot, slots: self.slots() }),
         }
@@ -351,14 +357,14 @@ impl<A: AllocatorClone> Parent<A> {
 
     fn state(&self, version: Version) -> State {
         match version.hooks.is_none() {
-            true => self.plain[version.slot.index()],
+            true => self.table.plains()[version.slot.index()],
             false => self.hooked.get(&self.home(version)).copied().unwrap_or(State::Unasked),
         }
     }
 
     fn set(&mut self, version: Version, state: State) {
         match version.hooks.is_none() {
-            true => self.plain[version.slot.index()] = state,
+            true => self.table.plains_mut()[version.slot.index()] = state,
             false => {
                 let home = self.home(version);
                 self.hooked.insert(home, state);
@@ -368,7 +374,7 @@ impl<A: AllocatorClone> Parent<A> {
 
     fn key(&self, version: Version) -> VersionKey {
         VersionKey {
-            function: self.functions[version.slot.index()].instance,
+            function: self.instance(version.slot),
             tier: Tier::Fast,
             hooks: version.hooks,
         }
@@ -376,11 +382,11 @@ impl<A: AllocatorClone> Parent<A> {
 
     /// The version `slot` is to run now.
     fn current(&self, slot: SlotId) -> Version {
-        Version { slot, hooks: self.wanted[slot.index()] }
+        Version { slot, hooks: self.table.wanted()[slot.index()] }
     }
 
     pub fn function(&self, slot: SlotId) -> Option<Function> {
-        self.functions.get(slot.index()).copied()
+        self.table.functions().get(slot.index()).copied()
     }
 
     /// How many compile entries were started (re-entries after a `Need` included).
@@ -390,7 +396,7 @@ impl<A: AllocatorClone> Parent<A> {
 
     /// Whether `slot`'s plain version has code, and at which tier.
     pub fn ready(&self, slot: SlotId) -> Option<Tier> {
-        match self.plain.get(slot.index()) {
+        match self.table.plains().get(slot.index()) {
             Some(State::Ready { tier, .. }) => Some(*tier),
             _ => None,
         }
@@ -398,7 +404,7 @@ impl<A: AllocatorClone> Parent<A> {
 
     /// The hooks `slot` is to run with, and those of what its word names now.
     pub fn hooks(&self, slot: SlotId) -> Option<(Hooks, Option<Hooks>)> {
-        Some((*self.wanted.get(slot.index())?, self.shown[slot.index()]))
+        Some((*self.table.wanted().get(slot.index())?, self.table.shown()[slot.index()]))
     }
 
     /// The start: `needed` must have code before the first instruction; `history` ran last time.
@@ -493,7 +499,7 @@ impl<A: AllocatorClone> Parent<A> {
             self.check(*slot)?;
         }
         for slot in slots {
-            let was = self.wanted[slot.index()];
+            let was = self.table.wanted()[slot.index()];
             let now = was.with(hooks, on);
             if now == was {
                 continue;
@@ -501,9 +507,9 @@ impl<A: AllocatorClone> Parent<A> {
             if now.is_none() && self.plant == Plant::OffKeepsHooks {
                 continue;
             }
-            self.wanted[slot.index()] = now;
+            self.table.wanted_mut()[slot.index()] = now;
             // A function never called has nothing to swap: its first need asks for this version.
-            let Some(shown) = self.shown[slot.index()] else { continue };
+            let Some(shown) = self.table.shown()[slot.index()] else { continue };
             if shown == now {
                 continue;
             }
@@ -523,11 +529,11 @@ impl<A: AllocatorClone> Parent<A> {
     pub fn tiered(&mut self, slot: SlotId, code: CodeRef, out: &mut Vec<Effect, A>) -> Result<(), Error> {
         self.check(slot)?;
         let version = Version { slot, hooks: Hooks::NONE };
-        let State::Ready { .. } = self.plain[slot.index()] else {
+        let State::Ready { .. } = self.table.plains()[slot.index()] else {
             return Err(Error::NotReady { slot });
         };
-        self.plain[slot.index()] = State::Ready { tier: Tier::Optimized, code };
-        if self.wanted[slot.index()].is_none() {
+        self.table.plains_mut()[slot.index()] = State::Ready { tier: Tier::Optimized, code };
+        if self.table.wanted()[slot.index()].is_none() {
             self.show(version, Tier::Optimized, code, out);
         }
         Ok(())
@@ -648,7 +654,7 @@ impl<A: AllocatorClone> Parent<A> {
                 self.set(version, State::Blocked { priority, deadline, left });
             }
             Compiled::Failed(why) => {
-                let error = CompileError { function: self.functions[version.slot.index()].instance, slot: version.slot, why };
+                let error = CompileError { function: self.instance(version.slot), slot: version.slot, why };
                 self.fail(version, error, out);
             }
         }
@@ -666,7 +672,7 @@ impl<A: AllocatorClone> Parent<A> {
             let State::Blocked { priority, deadline, left } = self.state(version) else { continue };
             match result {
                 Err(why) => {
-                    let function = self.functions[version.slot.index()].instance;
+                    let function = self.instance(version.slot);
                     self.fail(version, CompileError { function, slot: version.slot, why }, out);
                 }
                 Ok(()) if left > 1 && self.plant != Plant::ReenterEarly => {
@@ -686,7 +692,7 @@ impl<A: AllocatorClone> Parent<A> {
     pub fn tick(&mut self, now: Nanos, out: &mut Vec<Effect, A>) {
         self.now = self.now.max(now);
         let mut over = Vec::new_in(self.alloc.clone());
-        let each = (0..self.plain.len()).map(|at| Version { slot: SlotId(at as u32), hooks: Hooks::NONE });
+        let each = (0..self.table.len()).map(|at| Version { slot: SlotId(at as u32), hooks: Hooks::NONE });
         for version in each.chain(self.hooked.keys().copied()) {
             let (deadline, holds) = match self.state(version) {
                 State::Compiling { priority, deadline } => (deadline, Some(priority)),
@@ -700,7 +706,7 @@ impl<A: AllocatorClone> Parent<A> {
         }
         for (version, holds) in over {
             let why = Why::Overran { bound: self.config.compile_bound };
-            let function = self.functions[version.slot.index()].instance;
+            let function = self.instance(version.slot);
             let error = CompileError { function, slot: version.slot, why };
             self.fail(version, error, out);
             self.set(version, State::Failed { error, compiling: holds });
@@ -712,7 +718,7 @@ impl<A: AllocatorClone> Parent<A> {
     /// its callees wanted.
     fn has_code(&mut self, version: Version, tier: Tier, code: CodeRef, callees: &[SlotId], out: &mut Vec<Effect, A>) {
         self.set(version, State::Ready { tier, code });
-        let function = self.functions[version.slot.index()].instance;
+        let function = self.instance(version.slot);
         out.push(Effect::Say(match tier {
             Tier::Fast => RunEvent::Published { function },
             Tier::Optimized => RunEvent::Tiered { function },
@@ -722,7 +728,7 @@ impl<A: AllocatorClone> Parent<A> {
         }
         self.answer(version, Answer::Code { tier }, out);
         for callee in callees {
-            if callee.index() < self.functions.len() {
+            if callee.index() < self.table.len() {
                 self.want(self.current(*callee), Priority::Callee, out);
             }
         }
@@ -731,7 +737,7 @@ impl<A: AllocatorClone> Parent<A> {
     /// Swaps `version`'s code into its slot's word.
     fn show(&mut self, version: Version, tier: Tier, code: CodeRef, out: &mut Vec<Effect, A>) {
         let slot = version.slot;
-        self.shown[slot.index()] = Some(version.hooks);
+        self.table.shown_mut()[slot.index()] = Some(version.hooks);
         out.push(Effect::Publish { slot, tier, hooks: version.hooks, code });
     }
 
@@ -752,8 +758,9 @@ impl<A: AllocatorClone> Parent<A> {
     /// its plain version), and anyone waiting for the hooked one waits for that instead.
     fn untoggle(&mut self, version: Version, error: CompileError, out: &mut Vec<Effect, A>) {
         let slot = version.slot;
-        if self.wanted[slot.index()] == version.hooks {
-            self.wanted[slot.index()] = self.shown[slot.index()].unwrap_or(Hooks::NONE);
+        if self.table.wanted()[slot.index()] == version.hooks {
+            let shown = self.table.shown()[slot.index()].unwrap_or(Hooks::NONE);
+            self.table.wanted_mut()[slot.index()] = shown;
         }
         out.push(Effect::Untoggled { slot, hooks: version.hooks, error });
         let instead = self.current(slot);

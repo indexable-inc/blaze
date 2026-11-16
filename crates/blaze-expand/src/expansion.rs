@@ -3,7 +3,7 @@
 use core::alloc::Allocator;
 use core::fmt;
 
-use alloc::vec::Vec;
+use blaze_own::Vec;
 
 use blaze_id::{ContentId, Portable};
 
@@ -16,7 +16,7 @@ use crate::{
 /// definition's streams, or made by the expansion. Never an offset (rule 71): the reader maps
 /// an index to a place through the stream it placed.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum Origin {
+pub enum TokenOrigin {
     /// The token at this index of the call's input ([`crate::Call::input`]).
     Input(u32),
     /// Of the attribute's arguments.
@@ -29,40 +29,27 @@ pub enum Origin {
     Made(Transparency),
 }
 
-impl Origin {
+impl TokenOrigin {
     fn encode<S: Sink>(self, out: &mut S) {
         let (tag, value) = match self {
-            Origin::Input(at) => (0, at),
-            Origin::AttrArgs(at) => (1, at),
-            Origin::Def(at) => (2, at),
-            Origin::Params(at) => (3, at),
-            Origin::Made(transparency) => (4, u32::from(transparency.byte())),
+            TokenOrigin::Input(at) => (0, at),
+            TokenOrigin::AttrArgs(at) => (1, at),
+            TokenOrigin::Def(at) => (2, at),
+            TokenOrigin::Params(at) => (3, at),
+            TokenOrigin::Made(transparency) => (4, u32::from(transparency.byte())),
         };
         out.put(&[tag]);
         out.put(&value.to_be_bytes());
     }
 }
 
-/// Tokens `start..end` of a stream.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub struct Range {
-    pub start: u32,
-    pub end: u32,
-}
+/// Tokens `start..end` of a stream: the schema's one `Range`, here counting tokens.
+pub use blaze_surface::Range;
 
-impl Range {
-    pub fn to_usize(self) -> core::ops::Range<usize> {
-        self.start as usize..self.end as usize
-    }
-
-    pub fn contains(self, at: u32) -> bool {
-        self.start <= at && at < self.end
-    }
-
-    fn encode<S: Sink>(self, out: &mut S) {
-        out.put(&self.start.to_be_bytes());
-        out.put(&self.end.to_be_bytes());
-    }
+/// A range's canonical bytes, in a key or a content hash.
+fn encode_range<S: Sink>(range: Range, out: &mut S) {
+    out.put(&range.start.to_be_bytes());
+    out.put(&range.end.to_be_bytes());
 }
 
 /// What a nested macro call is.
@@ -118,14 +105,14 @@ impl NestedCall {
             PathScope::DefCrate => 1,
         };
         out.put(&[kind, scope]);
-        self.path.encode(out);
+        encode_range(self.path, out);
         out.put(&self.name.map_or(u32::MAX, |it| it).to_be_bytes());
-        self.args.encode(out);
+        encode_range(self.args, out);
         match self.params {
             None => out.put(&[0]),
             Some(params) => {
                 out.put(&[1]);
-                params.encode(out);
+                encode_range(params, out);
             }
         }
     }
@@ -305,15 +292,15 @@ pub enum Diagnostic {
     /// No rule of the `rules` rules matched. `token` is the token the rule that got furthest
     /// stopped at (`None` at the end of the input), `expected` what that rule wanted there,
     /// both as rustc words them; `at` where.
-    NoRuleMatched { rules: u32, token: Option<Text>, expected: Text, at: Option<Origin> },
+    NoRuleMatched { rules: u32, token: Option<Text>, expected: Text, at: Option<TokenOrigin> },
     /// A rule matched and its transcription failed (a binding used at the wrong depth).
-    Binding { message: Text, at: Option<Origin> },
+    Binding { message: Text, at: Option<TokenOrigin> },
     /// A rule left input unmatched.
-    LeftoverTokens { at: Option<Origin> },
+    LeftoverTokens { at: Option<TokenOrigin> },
     /// The matcher's own bound was hit.
     LimitExceeded,
     /// An unexpected token in a rule.
-    UnexpectedToken { at: Option<Origin> },
+    UnexpectedToken { at: Option<TokenOrigin> },
     /// The definition's rules do not parse.
     BadDefinition { message: Text },
     /// `compile_error!(message)`.
@@ -325,7 +312,7 @@ pub enum Diagnostic {
     /// A builtin derive refused the item.
     Derive { message: Text },
     /// A builtin macro's arguments are not what it takes.
-    Builtin { message: Text, at: Option<Origin> },
+    Builtin { message: Text, at: Option<TokenOrigin> },
 }
 
 /// One macro call's expansion.
@@ -334,7 +321,7 @@ pub struct Expansion<A: Allocator> {
     /// The tokens, position-independent.
     pub tokens: TokenStream<A>,
     /// Each token's origin, a column parallel to `tokens`.
-    pub origins: Vec<Origin, A>,
+    pub origins: Vec<TokenOrigin, A>,
     /// The macro calls in `tokens`, not expanded.
     pub nested: Vec<NestedCall, A>,
     /// The placeholders the reader fills.
@@ -433,7 +420,7 @@ impl<A: Allocator> Expansion<A> {
             out.put(&crate::tokens::index(text.len()).to_be_bytes());
             out.put(text.as_bytes());
         };
-        let origin = |out: &mut S, at: Option<Origin>| match at {
+        let origin = |out: &mut S, at: Option<TokenOrigin>| match at {
             None => out.put(&[0]),
             Some(origin) => {
                 out.put(&[1]);
@@ -528,9 +515,7 @@ pub enum Expanded<A: Allocator> {
 }
 
 // SAFETY: indices of the expansion's own streams and a closed enum.
-unsafe impl Portable for Origin {}
-// SAFETY: two indices.
-unsafe impl Portable for Range {}
+unsafe impl Portable for TokenOrigin {}
 // SAFETY: closed enums.
 unsafe impl Portable for NestedKind {}
 // SAFETY: closed enums.
@@ -551,7 +536,7 @@ unsafe impl Portable for Read {}
 unsafe impl<A: Allocator> Portable for Reads<A> {}
 // SAFETY: a closed enum.
 unsafe impl Portable for IncludeFailure {}
-// SAFETY: counts, ranges of the expansion's notes and `Origin`s.
+// SAFETY: counts, ranges of the expansion's notes and `TokenOrigin`s.
 unsafe impl Portable for Diagnostic {}
 // SAFETY: every field is `Portable`: a token stream, columns of the types above, UTF-8
 // bytes and an index. No span, interned symbol or arena pointer is in it.

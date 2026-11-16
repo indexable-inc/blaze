@@ -88,9 +88,8 @@ use crate::{
     expr_store::ExpressionStoreSourceMap,
     hir::generics::{GenericParams, LocalLifetimeParamId, LocalTypeOrConstParamId},
     nameres::{
-        LocalDefMap,
         assoc::{ImplItems, TraitItems},
-        block_def_map, crate_def_map, crate_local_def_map,
+        block_def_map, crate_def_map,
         diagnostics::DefDiagnostics,
     },
     signatures::{EnumVariants, InactiveEnumVariantCode, VariantFields},
@@ -727,20 +726,6 @@ impl<'db> ModuleIdLt<'db> {
         }
     }
 
-    pub(crate) fn local_def_map(self, db: &'db Db) -> (&'db DefMap, &'db LocalDefMap) {
-        match self.block(db) {
-            Some(block) => (block_def_map(db, block.to_static()), self.only_local_def_map(db)),
-            None => {
-                let def_map = crate_local_def_map(db, self.krate(db));
-                (def_map.def_map(db), def_map.local(db))
-            }
-        }
-    }
-
-    pub(crate) fn only_local_def_map(self, db: &'db Db) -> &'db LocalDefMap {
-        crate_local_def_map(db, self.krate(db)).local(db)
-    }
-
     pub fn crate_def_map(self, db: &'db Db) -> &'db DefMap {
         crate_def_map(db, self.krate(db))
     }
@@ -777,7 +762,7 @@ impl ModuleId {
     /// `#[prelude_import]` naming it if one does: its crate's, which the resolver reads for a
     /// block's modules too.
     pub fn prelude(self, db: &Db) -> Option<(ModuleId, Option<UseId>)> {
-        crate_def_map(db, self.krate(db)).prelude()
+        crate_def_map(db, self.krate(db)).prelude(db)
     }
 
     /// The extern prelude of this module's crate, in the order its crates were added: each
@@ -786,16 +771,21 @@ impl ModuleId {
         self,
         db: &'db Db,
     ) -> impl DoubleEndedIterator<Item = (&'db Name, (ModuleId, Option<ExternCrateId>))> + 'db {
-        crate_local_def_map(db, self.krate(db)).local(db).extern_prelude()
+        nameres::crate_extern_prelude(db, self.krate(db)).iter().map(|(name, at)| (name, *at))
     }
 
     /// The `#[macro_use]` prelude of this module's crate: each macro name, the macro and the
-    /// `extern crate` it is imported through (none for one of the standard prelude).
+    /// `extern crate` it is imported through. Not built: no record lists a crate's
+    /// `#[macro_use]` imports (reconnect.md, "What the new-layer crates lack").
     pub fn macro_use_prelude(
         self,
         db: &Db,
-    ) -> &blaze_hash::HashMap<Name, (MacroId, Option<ExternCrateId>), std::alloc::Global> {
-        crate_def_map(db, self.krate(db)).macro_use_prelude()
+    ) -> std::iter::Empty<(&Name, (MacroId, Option<ExternCrateId>))> {
+        let item = nameres::scope_key(db, crate_def_map(db, self.krate(db)).root_module_id());
+        base_db::OrNeed::or_need(Err::<(), _>(base_db::SurfaceError::NotBuilt(
+            blaze_surface::NotBuilt { method: "ModuleId::macro_use_prelude", item },
+        )));
+        std::iter::empty()
     }
 }
 

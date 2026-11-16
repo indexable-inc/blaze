@@ -4,7 +4,7 @@
 
 use core::alloc::Allocator;
 
-use alloc::vec::Vec;
+use blaze_own::Vec;
 
 use blaze_id::{ContentId, CrateItemKey, Portable};
 use blaze_ids::Hasher;

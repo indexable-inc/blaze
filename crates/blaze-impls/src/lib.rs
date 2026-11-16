@@ -24,39 +24,28 @@
 //! Nothing here is ambient: every builder takes its allocator, every record its bytes, and
 //! the bytes a builder writes are a function of the set of its inputs, in any order.
 //!
-//! It is `no_std` on `core` and `alloc`, as blaze-id is; `std` is named only because
-//! blaze-format's `record!` names `::std::vec::Vec` in what it expands to.
+//! The records, their builders and their views are blaze-surface's; this crate is the lookups
+//! over them, on `core` alone: it allocates nothing.
 
 #![no_std]
-#![feature(allocator_api)]
 
-extern crate alloc;
-// `blaze_format::record!` expands to `::std::vec::Vec`: the one reason `std` is linked.
-extern crate std;
-
-mod graph;
-mod index;
 mod lang;
 mod lookup;
-mod row;
-mod shape;
 
-pub use crate::graph::{
-    CrateFlags, CrateGraphView, CrateIndex, CrateInput, Dep, DepInput, Edition, EdgeFlags,
-    GRAPH_SCHEMA, GraphError, MAX_CRATES, MAX_EXTERN_NAME, Members, build_crate_graph,
+// The records themselves, and their builders and views, are blaze-surface's (one home per
+// record, rule 30): re-exported so a lookup's caller names one crate.
+pub use blaze_surface::{
+    BUCKET_SCHEMA, Bucket, BucketHash, BucketKey, BucketView, CrateFlags, CrateGraphView,
+    CrateImpls, CrateIndex, CrateInput, DIRECTORY_SCHEMA, Dep, DepInput, DirHit, DirectoryView,
+    EdgeFlags, Edition, FloatWidth, GRAPH_SCHEMA, GraphError, ImplFlags, ImplIndexError, ImplRow,
+    IntWidth, LANG_SCHEMA, LangItemsError, LangItemsView, LangName, LangNameError, MAX_CRATES,
+    MAX_EXTERN_NAME, MAX_ROWS, Members, Mutability, NO_IMPLS_SCHEMA, NoImplsOfView, SelfShape,
+    Shape, ShapeError, UintWidth, UnknownFlags, build_crate_graph, build_impl_index,
+    build_lang_items, trait_mark,
 };
-pub use crate::index::{
-    Bucket, BucketHash, BucketKey, BucketView, CrateImpls, DIRECTORY_SCHEMA, BUCKET_SCHEMA,
-    DirHit, DirectoryView, ImplIndexError, MAX_ROWS, NO_IMPLS_SCHEMA, NoImplsOfView,
-    build_impl_index, trait_mark,
-};
-pub use crate::lang::{
-    LANG_SCHEMA, LangError, LangItem, LangItemsError, LangItemsView, LangName, LangNameError,
-    LangRead, LangRecords, build_lang_items, lang_item,
-};
+
+pub use crate::lang::{LangError, LangItem, LangRead, LangRecords, lang_item};
 pub use crate::lookup::{
     Candidates, ImplLookupError, ImplRead, ImplRecords, Incoherent, Probe, RecordKind, candidates,
     inherent_candidates,
 };
-pub use crate::row::{ImplFlags, ImplRow, UnknownFlags};
-pub use crate::shape::{FloatWidth, IntWidth, Mutability, SelfShape, Shape, ShapeError, UintWidth};

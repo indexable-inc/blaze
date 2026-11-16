@@ -1,0 +1,35 @@
+[package]
+name = "blaze-drive"
+description = "The driver of one command on the new item layer as a sans-IO machine (docs/v2/plan/design/drive.md): the certificate first, tasks keyed from text that return their record or Need, one flight per key, validity by read list checked forward from what changed through the answer pages' reverse index, dependencies as records only, findings placed when printed, and the production Items/Source over the records a task holds"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# Vec, SortedMap, VecDeque with the allocator always named: the crate's only collections.
+blaze-own.workspace = true
+# `ItemKey`, `CrateItemKey`, `ContentId`: every item and file is named by its key.
+blaze-id = { path = "../blaze-id" }
+# `Hasher`: the BLAKE3 every key is. By path: the workspace entry turns on serde adapters.
+blaze-ids = { path = "../blaze-ids" }
+# `Resolver`: the ModuleScope task steps it (scope_task.rs).
+blaze-scope.workspace = true
+# `VersionKey`, `RecordKey`: run's compiles become Code names (run.rs).
+blaze-run.workspace = true
+# The record views the production `Items`/`Source` reads (items.rs).
+blaze-surface.workspace = true
+
+[dev-dependencies]
+# `check` and `control`: the request's simulation and its planted-bug controls.
+blaze-sim.workspace = true
+
+[lints]
+workspace = true

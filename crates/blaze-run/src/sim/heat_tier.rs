@@ -8,6 +8,7 @@
 use std::alloc::Global;
 use std::collections::{BTreeMap, BTreeSet};
 
+use blaze_own::Vec as Own;
 use blaze_sim::{Broke, Config, Tape, check, control};
 
 use super::{harness, key, oracle};
@@ -31,8 +32,8 @@ fn heated(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     let mut crossed = BTreeSet::new();
     let mut since = 0u64;
     let mut now = 0u64;
-    let mut hot = Vec::new_in(Global);
-    let mut effects = Vec::new_in(Global);
+    let mut hot = Own::new_in(Global);
+    let mut effects = Own::new_in(Global);
     let mut running: Vec<Job> = Vec::new();
     let mut optimized: BTreeMap<SlotId, u32> = BTreeMap::new();
     let mut snapshot = Snapshot(0);
@@ -66,7 +67,7 @@ fn heated(tape: &Tape, plant: Plant) -> Result<(), Broke> {
             }
             2 if !running.is_empty() => {
                 let job = running.remove(tape.index(running.len(), "ended"));
-                let mut inlined = Vec::new_in(Global);
+                let mut inlined = Own::new_in(Global);
                 inlined.push(Inlined { instance: InstanceKey(key(99)), code: CodeId(key(98)) });
                 let lacks = [RecordKey(key(60 + u64::from(job.slot.0)))];
                 let ended = if !lacked.contains(&job.slot) && tape.coin("lacks a record") {
@@ -159,7 +160,7 @@ impl Optimizer<Global> for InlinesAll {
         callees: &[Callee],
         alloc: Global,
     ) -> Result<Made<Optimized<Global>, Global>, Why> {
-        let mut inlined = Vec::with_capacity_in(callees.len(), alloc);
+        let mut inlined = Own::with_capacity_in(callees.len(), alloc);
         inlined.extend(callees.iter().map(|callee| Inlined { instance: callee.instance, code: callee.code }));
         let mut code = instance.0;
         code[31] = 0xee;
@@ -177,7 +178,7 @@ fn reloaded(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     ];
     // Run one: f is hot; the optimizer absorbs g and h at their identities of run one.
     let mut tier = tier::Tier::new(3, 1, Snapshot(0), Global).map_err(harness)?;
-    let mut effects = Vec::new_in(Global);
+    let mut effects = Own::new_in(Global);
     tier.hot(f, instance(f), &mut effects).map_err(harness)?;
     let Some(tier::Effect::Optimize(job)) = effects.pop() else {
         return Err(Broke::Harness("the tier did not start f".into()));
@@ -207,7 +208,7 @@ fn reloaded(tape: &Tape, plant: Plant) -> Result<(), Broke> {
     let config = ParentConfig { workers: 2, compile_bound: Nanos(1 << 40), most_waiters: 8 };
     let mut parent = Parent::new(&second, config, Global).map_err(harness)?;
     parent.plant = plant;
-    let mut out = Vec::new_in(Global);
+    let mut out = Own::new_in(Global);
     parent.start(&[f], &[], Nanos(0), &mut out).map_err(harness)?;
     out.clear();
     let fast = CodeRef(key(700));

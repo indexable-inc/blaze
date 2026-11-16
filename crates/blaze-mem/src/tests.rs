@@ -2799,7 +2799,7 @@ fn a_frame_string_stays_utf8_across_pushes_pops_and_truncation() {
         assert_eq!(text, "aé");
         let bytes = text.clone().into_bytes();
         assert!(text::String::from_utf8(bytes).is_ok());
-        let mut bad: Vec<u8, &Frame> = Vec::new_in(frame);
+        let mut bad: blaze_own::Vec<u8, &Frame> = blaze_own::Vec::new_in(frame);
         bad.extend_from_slice(b"a\xff");
         let refused = text::String::from_utf8(bad).expect_err("0xff is not UTF-8");
         assert_eq!(refused.utf8_error().valid_up_to(), 1);

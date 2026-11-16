@@ -545,7 +545,7 @@ impl<T, A: Allocator> Drop for Drain<'_, T, A> {
         self.front = self.back;
         // The gap closes after the values left are dropped, a panic in one among the ways; the
         // second run is dropped after the first, the same way.
-        let _close = DropGuard::new(self, |drain: &mut Drain<'_, T, A>| drain.close());
+        let _close = DropGuard::new(self, |drain| drain.close());
         let _second = DropGuard::new(second, |run| {
             // SAFETY: the run's slots hold values not given out, which nothing counts now;
             // each dropped once.
