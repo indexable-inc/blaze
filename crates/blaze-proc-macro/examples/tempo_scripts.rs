@@ -225,7 +225,7 @@ fn main() {
         }
     };
 
-    let runtime = ScriptRuntime::new(&store).unwrap_or_else(|e| panic!("{e}"));
+    let runtime = script_runtime(&store).unwrap_or_else(|e| panic!("{e}"));
     let table = Arc::new(pinned_rows(TARGET, KNOWN, alloc).to_vec());
     let setting = Setting { store: &store, target: TARGET, host: TARGET, table: Arc::clone(&table), c_mode: CMode::Deferred };
     let units = &graph.units;

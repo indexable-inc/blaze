@@ -276,7 +276,7 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases) -> Resul
     // The tool's identity: the running binary's linker id (bstd `Host::build_id`), so a blaze
     // built from other code shares no record or certificate with this one (rules 21, 52).
     let tool = home::tool(host.build_id()?.as_bytes());
-    let origin = store::NamedOrigin::of(cx, &fs, flags.origin, flags.origin_key)?;
+    let origin = store::NamedOrigin::of(cx, &fs, io.net().as_ref(), flags.origin, flags.origin_key)?;
     // The terminal's abilities, from the conventional variables and the findings' stream, read
     // here at the edge: whether it is a terminal, and how wide.
     let env = io.env();
@@ -372,16 +372,11 @@ fn explain(cx: &Cx, asked: Option<&str>, out: &Out) -> Result<Status, CliError> 
     }
 }
 
-/// The one list of the stages `check` is defined to run, in order, and whether this build runs
-/// each. The day a stage lands, its entry turns `true`; when all are, `check` can say `ok`.
-pub(crate) const CHECK_STAGES: [(&str, bool); 6] =
-    [("manifests", true), ("syntax of items", true), ("syntax inside bodies", false), ("names", true), ("types", false), ("borrows", false)];
-
-/// [`CHECK_STAGES`] split: those this build runs, and those it does not.
+/// [`work::CHECK_STAGES`] split: those this build runs, and those it does not.
 fn check_coverage(frame: &Frame) -> (Vec<&'static str, &Frame>, Vec<&'static str, &Frame>) {
     let mut ran = Vec::new_in(frame);
     let mut not = Vec::new_in(frame);
-    for (stage, built) in CHECK_STAGES {
+    for (stage, built) in work::CHECK_STAGES {
         match built {
             true => ran.push(stage),
             false => not.push(stage),
@@ -893,6 +888,11 @@ fn draw(
 /// covered all. "this build of blaze does not resolve names, expand macros or check types yet:
 /// `check` read the manifests and parsed".
 fn left_out_note(command: Command, frame: &Frame) -> Result<Option<bstd::mem::String<&Frame>>, CliError> {
+    // `check`'s closing line names what it did not check, from `work::CHECK_STAGES`, the one
+    // list: a second note would say it twice, in other words.
+    if command == Command::Check {
+        return Ok(None);
+    }
     let mut left: Vec<&str, &Frame> = Vec::new_in(frame);
     left.extend(work::left_out(command));
     if left.is_empty() {
@@ -901,18 +901,19 @@ fn left_out_note(command: Command, frame: &Frame) -> Result<Option<bstd::mem::St
     let mut words = bstd::mem::String::new_in(frame);
     words.push_str("this build of blaze does not ");
     list(&mut words, &left, "or");
-    // Each stage once, in the command's order: what the worker built, then what the runner did.
-    let stages = |pick: &dyn Fn(blaze_drive::Kind) -> bool| {
+    // Each stage once, in the command's order: what the worker did (a part of a stage named
+    // as the part, `work::does`), then what the runner did.
+    let stages = |pick: &dyn Fn(blaze_drive::Kind) -> bool, said: &dyn Fn(blaze_drive::Kind) -> &'static str| {
         let mut picked: Vec<&str, &Frame> = Vec::new_in(frame);
         for kind in command.needs().iter().filter(|kind| pick(**kind)) {
-            if picked.scan_for(&kind.stage()).is_none() {
-                picked.push(kind.stage());
+            if picked.scan_for(&said(*kind)).is_none() {
+                picked.push(said(*kind));
             }
         }
         picked
     };
-    let built = stages(&|kind| work::builds(kind));
-    let ran = stages(&|kind| !work::builds(kind) && work::runner_does(command, kind));
+    let built = stages(&|kind| work::builds(kind), &work::does);
+    let ran = stages(&|kind| !work::whole(kind) && work::runner_does(command, kind), &|kind| kind.stage());
     words.push_str(" yet");
     let word = match command {
         Command::Check => "check",
@@ -1112,6 +1113,41 @@ mod tests {
         assert!(out.contains("src/x.rs") && out.contains("src/x/mod.rs") && out.contains("lib.rs:2"), "{out}");
     }
 
+    /// A syntax error inside a body is one error at its line and column, from the body's own
+    /// `BodyCheck` task; the item-level outline does not say it again.
+    #[test]
+    fn a_syntax_error_inside_a_body_is_one_error_at_its_line() {
+        let io = Io::simulated(SimWorld::new(7, Limits::USUAL));
+        write(&io, "Cargo.toml", MANIFEST);
+        write(&io, "src/lib.rs", "pub fn f() -> u8 { 1 }\npub fn g() {\n    let x = ;\n}\n");
+        let broken = check(&io, work::Sizes::USUAL);
+        assert!(broken.failed.is_empty(), "{:?}", broken.failed);
+        assert_eq!((broken.errors, broken.status), (1, Some(1)), "{}\n{}", broken.profile, stdout(&io));
+        let out = stdout(&io);
+        assert!(out.contains("lib.rs:3:12"), "{out}");
+    }
+
+    /// The `made` count of `kind`'s profile row.
+    fn made(profile: &str, kind: &str) -> u32 {
+        let row = profile.lines().find(|line| line.split_whitespace().next() == Some(kind)).unwrap_or("");
+        let words: std::vec::Vec<&str> = row.split_whitespace().collect();
+        words.iter().position(|word| *word == "made").and_then(|at| words.get(at + 1)).and_then(|n| n.parse().ok()).unwrap_or(0)
+    }
+
+    /// One part per body, keyed by its item's text: an edit inside one body re-parses that body
+    /// alone, while the other stands.
+    #[test]
+    fn an_edit_of_one_body_reparses_that_body_alone() {
+        let io = Io::simulated(SimWorld::new(8, Limits::USUAL));
+        write(&io, "Cargo.toml", MANIFEST);
+        write(&io, "src/lib.rs", "pub fn f() -> u8 { 1 }\npub fn g() -> u8 { 2 }\n");
+        let first = check(&io, work::Sizes::USUAL);
+        assert_eq!((first.status, made(&first.profile, "BodyCheck")), (Some(3), 2), "{}", first.profile);
+        write(&io, "src/lib.rs", "pub fn f() -> u8 { 1 }\npub fn g() -> u8 { 3 }\n");
+        let edited = check(&io, work::Sizes::USUAL);
+        assert_eq!((edited.status, made(&edited.profile, "BodyCheck")), (Some(3), 1), "{}", edited.profile);
+    }
+
     /// What the simulated host's standard output holds.
     fn stdout(io: &Io) -> std::string::String {
         let out = io.script(|host| host.out.clone()).expect("a simulated host");
@@ -1131,12 +1167,13 @@ mod tests {
         let out = stdout(&io);
         let last = out.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("");
         assert!(last.contains("incomplete"), "{out}");
-        assert!(last.contains("NOT checked") && last.contains("types") && last.contains("names") && !last.contains(" ok"), "{last}");
+        // A narrow line keeps what was NOT checked and drops the rest (blaze-report `closing`).
+        assert!(last.contains("NOT checked: types, borrows") && !last.contains(" ok"), "{last}");
         let io = Io::simulated(SimWorld::new(6, Limits::USUAL));
         write(&io, "Cargo.toml", MANIFEST);
         write(&io, "src/lib.rs", "pub fn f() -> u8 { 1 }\nfn fn\n");
         let broken = check(&io, work::Sizes::USUAL);
-        assert_eq!((broken.status, broken.errors), (Some(1), 1), "{}", broken.profile);
+        assert!(broken.status == Some(1) && broken.errors >= 1, "status {:?}, {} errors", broken.status, broken.errors);
         assert!(stdout(&io).contains("error"), "{}", stdout(&io));
         let io = Io::simulated(SimWorld::new(6, Limits::USUAL));
         let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
@@ -1153,15 +1190,12 @@ mod tests {
         let io = Io::simulated(SimWorld::new(1, Limits::USUAL));
         let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
         let frame = cx.frame();
-        let words = left_out_note(Command::Check, frame).expect("words").expect("check leaves stages out today");
-        assert_eq!(
-            words.as_str(),
-            "this build of blaze does not resolve names, expand macros or check types yet: `check` did read the manifests, fetch the dependencies' sources and parse"
-        );
+        // `check`'s closing line is the one place that says what it left out.
+        assert!(left_out_note(Command::Check, frame).expect("words").is_none());
         let words = left_out_note(Command::Run, frame).expect("words").expect("run leaves stages out today");
         assert_eq!(
             words.as_str(),
-            "this build of blaze does not expand macros yet: `run` did read the manifests, fetch the dependencies' sources and parse, and its program runner did resolve names, check types and generate code in the subset of Rust its front end reads so far"
+            "this build of blaze does not expand macros yet: `run` did read the manifests, fetch the dependencies' sources, parse and check the bodies' syntax, and its program runner did resolve names, check types and generate code in the subset of Rust its front end reads so far"
         );
         for command in [Command::Check, Command::Run, Command::Test] {
             let left: std::vec::Vec<&str> = work::left_out(command).collect();

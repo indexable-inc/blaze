@@ -26,6 +26,10 @@ use bstd::mem::Bytes;
 use bstd::out::Out;
 use bstd::path::Path;
 use bstd::Deadline;
+use bstd::net::{Addr, Net};
+use bstd::url::Url;
+use blaze_h1::{Limits as H1Limits, Range as H1Range, Redirects};
+use blaze_h1_net::{Ask, Client, FetchWhy, NoTls};
 
 use crate::CliError;
 
@@ -569,8 +573,21 @@ impl Store for PackStore {
 /// local store. The folder is beneath the start directory; the key is the one Ed25519 public
 /// key whose signed head is believed.
 pub struct NamedOrigin {
-    folder: Dir<ReadWrite>,
+    at: OriginAt,
     check: OneKey,
+}
+
+/// Where a named origin's objects are: a folder, or an `http://` base address.
+enum OriginAt {
+    Folder(Dir<ReadWrite>),
+    Http(HttpAt),
+}
+
+/// An `http://host:port/prefix` origin: the base it was given, and the network narrowed to
+/// that one address (nothing else is reached; nothing ambient).
+pub struct HttpAt {
+    base: Url,
+    net: Net,
 }
 
 /// The one trusted key of a named origin, owned, as the read path's head check.
@@ -587,13 +604,20 @@ impl HeadCheck for OneKey {
 impl NamedOrigin {
     /// The origin the arguments name (main.rs reads them): `--origin` and `--origin-key`
     /// together or neither.
-    pub fn of(cx: &Cx, fs: &Fs, folder: Option<&str>, key: Option<&str>) -> Result<Option<NamedOrigin>, CliError> {
+    pub fn of(cx: &Cx, fs: &Fs, net: Option<&Net>, folder: Option<&str>, key: Option<&str>) -> Result<Option<NamedOrigin>, CliError> {
         match (folder, key) {
             (None, None) => Ok(None),
             (Some(folder), Some(key)) => {
                 let key = PublicKey::from_hex(key).ok_or(CliError::Usage("--origin-key is not 64 hex digits (an Ed25519 public key)"))?;
-                let folder = fs.open_dir(cx, &Path::new(folder)?)?;
-                Ok(Some(NamedOrigin { folder, check: OneKey { keys: [key] } }))
+                let at = if folder.starts_with("https://") {
+                    return Err(CliError::Usage("--origin https://: blaze-h1-net has no TLS yet (its `NoTls`); name an http:// origin or a folder"));
+                } else if folder.starts_with("http://") {
+                    let net = net.ok_or(CliError::Usage("--origin http://: this host offers no network"))?;
+                    OriginAt::Http(HttpAt::of(folder, net)?)
+                } else {
+                    OriginAt::Folder(fs.open_dir(cx, &Path::new(folder)?)?)
+                };
+                Ok(Some(NamedOrigin { at, check: OneKey { keys: [key] } }))
             }
             _ => Err(CliError::Usage("--origin and --origin-key are named together")),
         }
@@ -634,6 +658,81 @@ impl Origin for FolderOrigin<'_> {
         let cx = self.cx.until(Deadline::at(Duration::from_nanos(deadline_ns)));
         let file = self.folder.open_read(&cx, &path).map_err(failed)?;
         file.read_into(into, at).wait(&cx).map_err(failed)
+    }
+}
+
+impl HttpAt {
+    /// The origin at `base` (`http://host:port[/prefix]`), the network narrowed to its address.
+    fn of(base: &str, net: &Net) -> Result<HttpAt, CliError> {
+        let base = Url::parse(base.trim_end_matches('/')).map_err(|_| CliError::Usage("--origin http://: not a URL"))?;
+        let origin = base.origin().ok_or(CliError::Usage("--origin http://: the URL names no host"))?;
+        // clone: the origin's address, a refcount.
+        let net = net.connect_only(&Addr::Tcp(origin.at().clone()));
+        Ok(HttpAt { base, net })
+    }
+}
+
+/// An `http://` origin: each ask one ranged GET of `<base>/<object name>` through blaze-h1-net
+/// on bstd's `Net` (remote-read.md, "HTTP in the tree"). The reply is bounded before it is read
+/// (`most_body` is the ask's length), its `Content-Range` must be the range asked (blaze-h1's
+/// `Response::ranged`), a redirect is refused (`most: 0`), and the ask's deadline ends every
+/// wait. A 404 is `Missing`, a 416 (asked past the object's end) no bytes, anything else
+/// `Unreadable` (blaze-h1-net's tests name each refusal). Nothing here trusts the bytes: the
+/// read machine checks the signed head and the digest chain.
+struct HttpOrigin<'o> {
+    cx: &'o Cx,
+    at: &'o HttpAt,
+    /// The URL's text and the reply's body, reused from ask to ask.
+    url: blaze_own::Vec<u8, Global>,
+    body: blaze_own::Vec<u8, Global>,
+}
+
+impl<'o> HttpOrigin<'o> {
+    fn new(cx: &'o Cx, at: &'o HttpAt) -> HttpOrigin<'o> {
+        HttpOrigin { cx, at, url: blaze_own::Vec::new_in(Global), body: blaze_own::Vec::new_in(Global) }
+    }
+}
+
+impl Origin for HttpOrigin<'_> {
+    fn read(&mut self, object: &Object, at: u64, into: &mut [u8], deadline_ns: u64) -> Result<usize, OriginError> {
+        if into.is_empty() {
+            return Ok(0);
+        }
+        // The name is built from a digest's hex only (`Object::name`): nothing fetched is a path.
+        let name = object.name();
+        self.url.clear();
+        let joined = [self.at.base.as_str().as_bytes(), b"/", name.as_str().as_bytes()];
+        for part in joined {
+            self.url.try_extend_from_slice(part).map_err(|_| OriginError::Unreadable)?;
+        }
+        let text = core::str::from_utf8(&self.url).map_err(|_| OriginError::Unreadable)?;
+        let url = Url::parse(text).map_err(|_| OriginError::Unreadable)?;
+        let limits = H1Limits { most_head: 16 << 10, most_headers: 64, most_body: into.len() as u64 };
+        let redirects = Redirects { most: 0, cross_scheme: false, cross_origin: false };
+        let client = Client { net: &self.at.net, tls: &NoTls, limits, redirects, agent: "blaze", alloc: Global };
+        let range = H1Range { first: at, last: Some(at + into.len() as u64 - 1) };
+        let ask = Ask { method: "GET", url: &url, headers: &[], body: &[], range: Some(range) };
+        let cx = self.cx.until(Deadline::at(Duration::from_nanos(deadline_ns)));
+        self.body.clear();
+        match client.send(&cx, &ask, &mut self.body) {
+            Ok(_) => {
+                // `most_body` held the body to `into.len()`.
+                let got = self.body.len().min(into.len());
+                into[..got].copy_from_slice(&self.body[..got]);
+                Ok(got)
+            }
+            Err(error) => {
+                let status = match &error.why {
+                    FetchWhy::Http(blaze_h1::Error { why: blaze_h1::Why::RangeStatus { status }, .. }) => Some(*status),
+                    _ => None,
+                };
+                match status {
+                    Some(404) => Err(OriginError::Missing),
+                    Some(416) => Ok(0),
+                    _ => Err(OriginError::Unreadable),
+                }
+            }
+        }
     }
 }
 
@@ -847,10 +946,13 @@ impl<S: Sharing> Store for Layered<'_, S> {
         let began = remote.now_ns();
         let clock = remote.clock.clone();
         let mut now = || u64::try_from(clock.now().since_start().as_nanos()).unwrap_or(u64::MAX);
-        let mut origin = FolderOrigin { cx, folder: &remote.named.folder };
         // A batch of one key: the request asks one record at a time (blaze-drive's `Get`).
         // `BatchError` is only a batch past `keys_most` or one begun mid-batch: neither can be.
-        fetch(&mut remote.reader, &mut origin, &mut now, core::slice::from_ref(&key.0), remote.alloc).map_err(|error| CliError::Remote(RemoteError::Batch(error)))?;
+        let fetched = match &remote.named.at {
+            OriginAt::Folder(folder) => fetch(&mut remote.reader, &mut FolderOrigin { cx, folder }, &mut now, core::slice::from_ref(&key.0), remote.alloc),
+            OriginAt::Http(at) => fetch(&mut remote.reader, &mut HttpOrigin::new(cx, at), &mut now, core::slice::from_ref(&key.0), remote.alloc),
+        };
+        fetched.map_err(|error| CliError::Remote(RemoteError::Batch(error)))?;
         let answer = remote.reader.answer(0);
         let found = match answer {
             Answer::Found { .. } => {

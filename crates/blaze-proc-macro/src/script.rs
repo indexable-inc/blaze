@@ -324,8 +324,9 @@ impl std::hash::Hasher for Bytes {
 }
 
 impl ScriptRuntime {
-    /// The runtime keeping compiled modules and records under `store`.
-    pub fn new(store: &Path) -> Result<ScriptRuntime, RuntimeError> {
+    /// The runtime keeping compiled modules under `store` and its records in `records`
+    /// ([`DirStore::build_scripts`] over the same folder, through the caller's world).
+    pub fn new(store: &Path, records: DirStore) -> Result<ScriptRuntime, RuntimeError> {
         let mut config = Config::new();
         config
             .cranelift_opt_level(OptLevel::Speed)
@@ -347,7 +348,7 @@ impl ScriptRuntime {
         let mut linker = Linker::new(&engine);
         imports(&mut linker).map_err(RuntimeError::Link)?;
         blaze_wasi::link::<W32, ScriptHost>(&mut linker).map_err(RuntimeError::Link)?;
-        Ok(ScriptRuntime { engine, linker, code_id, store: store.to_owned(), records: DirStore::at(store, "build-script/records") })
+        Ok(ScriptRuntime { engine, linker, code_id, store: store.to_owned(), records })
     }
 
     /// `wasm`, the module of `package`'s script, compiled for this host: from its compiled

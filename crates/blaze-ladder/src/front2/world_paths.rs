@@ -6,7 +6,7 @@
 use std::alloc::Global;
 use std::vec::Vec;
 
-use blaze_typeck::{Def, Fetch, Name, PNode, PathRes, Prim};
+use blaze_typeck::{Def, Fetch, Name, PNode, PTy, PathRes, Prim};
 
 use super::heads::Want;
 use super::keys::checker_of;
@@ -75,22 +75,63 @@ impl BodyWorld<'_, '_> {
                 }
                 Def::Trait(k)
             }
-            Kind::TypeAlias => return self.gap(Gap::TypeAlias(target.key)),
+            // The Reference, "Type aliases": "A type alias defines a new name for an existing
+            // type"; "A type alias to a tuple-struct or unit-struct cannot be used to qualify
+            // that type's constructor". A body path's alias is its aliased type when that type
+            // is a path the checker names (`Def`): an ADT whose arguments are the alias's own
+            // parameters in order (the segment's arguments then go to the ADT unchanged), or
+            // a built-in type. Any other aliased type is the gap naming the alias.
+            Kind::TypeAlias => match self.store.maps.aliases.get(&target.key) {
+                None => return self.fill(Fill::Store(Want::Head(target.key))),
+                Some(None) => {
+                    let why = self.store.maps.alias_gaps.get(&target.key).map_or_else(|| "(no why recorded)".into(), |w| format!("{w:?}").into_boxed_str());
+                    return self.gap(Gap::AliasHead(target.key, why));
+                }
+                Some(&Some((generics, ty))) => match self.alias_def(generics, ty) {
+                    Some(d) => d,
+                    None => return self.gap(Gap::TypeAlias(target.key)),
+                },
+            },
             // A built-in type in a body path (`u8::MAX`, `str::len`): the names library's
             // answer mapped through the one table (`PRIMS`); the checker looks the next segment
             // up on it. blaze's wide ints have no checker type yet.
-            Kind::Builtin(name) => match super::types::PRIMS.iter().find(|(p, _)| *p == name).map(|(_, n)| *n) {
-                Some(PNode::Bool) => Def::Prim(Prim::Bool),
-                Some(PNode::Char) => Def::Prim(Prim::Char),
-                Some(PNode::Str) => Def::Prim(Prim::Str),
-                Some(PNode::Int(i)) => Def::Prim(Prim::Int(i)),
-                Some(PNode::Uint(u)) => Def::Prim(Prim::Uint(u)),
-                Some(PNode::Float(f)) => Def::Prim(Prim::Float(f)),
-                _ => return self.gap(Gap::BuiltinTypePath(written.join("::").into_boxed_str())),
+            Kind::Builtin(name) => match super::types::PRIMS.iter().find(|(p, _)| *p == name).and_then(|(_, n)| prim_of(*n)) {
+                Some(p) => Def::Prim(p),
+                None => return self.gap(Gap::BuiltinTypePath(written.join("::").into_boxed_str())),
             },
             Kind::WideInt { .. } => return self.gap(Gap::BuiltinTypePath(written.join("::").into_boxed_str())),
             Kind::Module | Kind::Macro | Kind::TraitAlias | Kind::Other(_) => return Ok(None),
         };
         Ok(Some(PathRes { def, consumed }))
+    }
+
+    /// The path `Def` of an alias with `generics` parameters whose aliased type is `ty`: the
+    /// ADT when its arguments are exactly the alias's parameters in order (`type A<T> = B<T>`),
+    /// a built-in type when the alias has none; `None` for any other type (`B<T, X>`: the
+    /// `X` a path to `B` cannot carry).
+    fn alias_def(&self, generics: u32, ty: PTy) -> Option<Def> {
+        let view = self.store.tys.view();
+        match *view.nodes.get(ty.0 as usize)? {
+            PNode::Adt(k, args) => {
+                let args = view.list(args).ok()?;
+                let own = |(i, a): (usize, &PTy)| matches!(view.nodes.get(a.0 as usize), Some(PNode::Param(p) | PNode::ConstParam(p)) if *p as usize == i);
+                (args.len() == generics as usize && args.iter().enumerate().all(own)).then_some(Def::Adt(k))
+            }
+            n if generics == 0 => prim_of(n).map(Def::Prim),
+            _ => None,
+        }
+    }
+}
+
+/// The built-in type a path can name for a type node (the Reference, "Primitive types").
+fn prim_of(n: PNode) -> Option<Prim> {
+    match n {
+        PNode::Bool => Some(Prim::Bool),
+        PNode::Char => Some(Prim::Char),
+        PNode::Str => Some(Prim::Str),
+        PNode::Int(i) => Some(Prim::Int(i)),
+        PNode::Uint(u) => Some(Prim::Uint(u)),
+        PNode::Float(f) => Some(Prim::Float(f)),
+        _ => None,
     }
 }

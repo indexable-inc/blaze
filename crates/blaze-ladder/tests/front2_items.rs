@@ -234,6 +234,32 @@ fn main() {}
     }
 }
 
+/// A type alias in a body path (the Reference, "Type aliases": "A type alias defines a new name
+/// for an existing type"; "A type alias to a tuple-struct or unit-struct cannot be used to
+/// qualify that type's constructor"): `Same::<u8>::new()`, `Plain { x }`, `Int::MAX` resolve to
+/// the aliased type; `Fixed::new()` (`type Fixed = P<u16>`, arguments the path cannot carry) is
+/// the gap naming the alias, never a looser `P<_>`. Before the fix each was "gap TypeAlias".
+#[test]
+fn a_type_alias_in_a_body_path_is_its_type() {
+    const TEXT: &str = "struct P<T> { x: T }
+impl<T> P<T> { fn new(x: T) -> P<T> { P { x } } }
+struct Q { x: u8 }
+type Same<T> = P<T>;
+type Plain = Q;
+type Int = u32;
+type Fixed = P<u16>;
+fn same() -> P<u8> { Same::<u8>::new(1) }
+fn plain() -> u8 { let q = Plain { x: 3 }; q.x }
+fn int() -> u32 { Int::MAX }
+fn fixed() -> P<u16> { Fixed::new(2) }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["same", "plain", "int", "fixed"]);
+    println!("alias paths: {got:?}");
+    all_clean("alias paths", &got[..3]);
+    assert!(got[3].1.contains("aliases a type with fixed arguments"), "{got:?}");
+}
+
 /// A negative impl is a head with its polarity (rustc's `negative_impls`, which core uses for
 /// `impl<T: ?Sized> !Send for *const T`): `S: Send` with `impl !Send for S` does not hold
 /// (E0277), `u8: Send` does. Before the fix the head was refused "a negative impl".
@@ -250,7 +276,7 @@ fn main() {}
     let got = check_fns(TEXT, &["holds", "not_send"]);
     println!("negative: {got:?}");
     assert_eq!(got[0].1, "clean", "{got:?}");
-    assert!(got[1].1.starts_with("diags") && got[1].1.contains("E0277"), "{got:?}");
+    assert!(got[1].1.contains("diagnostics") && got[1].1.contains("E0277") && got[1].1.contains("`S: Send`"), "{got:?}");
 }
 
 /// Reduction probe for the census's `Malformed/Sort` (bstd::blobs `from_key`).

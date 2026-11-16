@@ -273,8 +273,37 @@ Named questions (their answers' shapes):
 - Not yet: may_dangle, union fields, the per-place `Copy` and `Drop` facts from the type checker;
   tier two is dense (bits per point); a sparse form for large bodies when one is measured.
 
+- crates/blaze-flow-lower (section 10): the lowering. Four fixtures go through the real type
+  checker (moved twice, moved once, move while borrowed, move after last use). Each has a control
+  with a planted bug (`AllCopy`, `NoRelate`) that hides the finding, and each prints the findings
+  it gets. Both crates use blaze-own (no `alloc`).
+- The census (crates/blaze-ladder/tests/flow_census.rs; first run, flow-census-1.txt in
+  port27/flow-1116), whose head line reads: "bstd: clean bodies 2116; lowered 1247; refused 869;
+  tier one accepts 924; tier two accepts 9; findings 1323 (in 314 bodies)". Per lowered body in a
+  debug build: lowering 57.7 µs, move check 118.8 µs, tier one 151.6 µs. Tier two takes 46.4 ms
+  per body sent (323 sent): it is dense and is the floor's problem.
+  Refusals by form: CallWritesLifetimes 377 (H1), UnknownAdt 322, Closure 130,
+  ElisionAmbiguous 32, OrPatternBinding 3, PeelUnderAdtField 3, StructUpdate 2. Findings: 1180
+  UnprovenOutlives and 143 Invalidated. No move findings.
+
 ## For a successor
 
-Next: the lowering from the typed body (needs the questions in section 7) and constraint
-generation from types with variance; then real bodies from the census, measuring how many bodies
-tier one accepts (the claim "almost every body" is not yet measured).
+Step 5 has not started. Every finding is a false positive, because bstd compiles. Take the
+classes largest first, each with a fixture in crates/blaze-flow-lower/src/tests.rs that fails
+without its fix.
+- UnprovenOutlives (1180): it shows on bodies whose signature names no lifetime, such as
+  `clone` returning `{ *self }`, `eq` on `(self, other)`, and `File { io: io.clone(), .. }`.
+  Leads to check first:
+  - `return_place` gives the output fresh placeholders when elision does not decide. It should
+    give them only for positions the signature writes; an output with no reference positions
+    needs none.
+  - Is an ADT's `lifetimes` set to true for derive-generated impls (`__dollar_crate_...`
+    heads)? The census reads a `'` anywhere in the head's text.
+  - A tuple or aggregate of references should relate covariantly, never both ways (`relate`
+    only treats the first position as covariant).
+  Print one flow (`Flow::print`) for `<impl Written>::of` and read where the subset to a
+  placeholder comes from.
+- Invalidated (143): read the examples in the census file, the lines after "FINDINGS".
+- UnknownAdt (322): the census Facts answers only ADTs the store has made. It should
+  `ensure(Want::Adt)` each ADT key before asking.
+- Closures (130) come next, once the findings are zero.

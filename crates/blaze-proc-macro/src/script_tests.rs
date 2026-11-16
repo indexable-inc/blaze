@@ -20,10 +20,17 @@ use blaze_own::Alloc;
 use blaze_sim::{Broke, Config, Tape};
 
 use crate::{
+    record::{DirStore, native_world},
     script::{LoadedScript, ScriptError, ScriptLimit, ScriptRuntime, ScriptWhy},
     script_sandbox::{GitView, Read, Refusal, Script, SpawnRefusal, Tree, answer_now},
 };
 use blaze_build_script::git;
+
+/// The runtime over the folder `store`, its records through a world over that folder.
+fn runtime_at(store: &std::path::Path) -> Result<ScriptRuntime, std::string::String> {
+    let (io, root) = native_world(store).map_err(|error| error.to_string())?;
+    ScriptRuntime::new(store, DirStore::build_scripts(&io, &root)).map_err(|error| error.to_string())
+}
 
 /// A fresh folder under the system's temporary one, by this process and a count.
 fn folder(name: &str) -> PathBuf {
@@ -281,7 +288,7 @@ fn load(runtime: &ScriptRuntime, name: &str, body: &[u8]) -> LoadedScript {
 
 /// The error of running `body` as the package `name`.
 fn stopped(name: &str, body: &[u8]) -> ScriptError {
-    let runtime = ScriptRuntime::new(&folder("store")).expect("the runtime");
+    let runtime = runtime_at(&folder("store")).expect("the runtime");
     let loaded = load(&runtime, name, body);
     let vars = env_of("0");
     match runtime.run(&loaded, script(name, tree(0, 0), vars.clone()), &as_env(&vars), Alloc::global()) {
@@ -295,7 +302,7 @@ fn stopped(name: &str, body: &[u8]) -> ScriptError {
 
 #[test]
 fn a_well_behaved_script_runs_and_its_second_run_is_the_record() {
-    let runtime = ScriptRuntime::new(&folder("store")).expect("the runtime");
+    let runtime = runtime_at(&folder("store")).expect("the runtime");
     let mut body = open(A_TXT, 0, 2);
     body.extend(print_cfg());
     let loaded = load(&runtime, "good", &body);
@@ -627,7 +634,7 @@ fn invalidation(runtime: &ScriptRuntime, loaded: &[LoadedScript; 3], tape: &Tape
 /// One case on a fresh store: the three modules (read `a.txt`, read `b.txt`, read nothing;
 /// each prints a cfg) loaded, then [`invalidation`].
 fn case(tape: &Tape, plant: Plant) -> Result<(), Broke> {
-    let runtime = ScriptRuntime::new(&folder("store")).map_err(|e| Broke::Harness(e.to_string()))?;
+    let runtime = runtime_at(&folder("store")).map_err(|e| Broke::Harness(e.to_string()))?;
     let body = |read: Option<(i64, i64)>| {
         let mut body = read.map_or_else(Vec::new, |path| open(path, 0, 2));
         body.extend(print_cfg());

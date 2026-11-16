@@ -853,7 +853,17 @@ once; the plant `RanUnderCondition` (an asker served a fork it does not imply) i
       `close`: the closing line and status in one function `command` and the test helper `ask`
       both call (`Checked.status`); `CHECK_STAGES` splits "syntax of items" (built) from
       "syntax inside bodies" (not); tests `a_missing_module_file_is_one_finding_at_its_mod_line`,
-      `a_clean_check_says_incomplete_and_exits_3`. Pass on (not this lane's files):
+      `a_clean_check_says_incomplete_and_exits_3`. blaze-report `closing` puts "NOT checked"
+      before "no errors in": a narrow line dropped the NOT list ("incomplete · no errors in:
+      manifests, syntax of items, names", seen); now "incomplete · NOT checked: syntax inside
+      bodies, types, borrows". Runs (mixcheck: blaze-proc-macro script.rs:446 E0277 is
+      broken underneath): "mixcheck test blaze-cli: exit 101; 46 passed, 1 failed", the one
+      `records_outlive_the_packs_merge` ("a repeat after the merge: certified false, 2 runs":
+      packs are store.rs, likely the Shared cache lane's; not proven). absent_module off: both
+      missing-module tests "Drive(NoFile { .. })"; on: pass. `held` planted to libraries only:
+      `a_signature_edit_in_a_binary_reruns_its_names` "left: 0"; restored: passes.
+      blaze-report test: one failure, `no_crate_has_more_of_stds_print_macros` (other crates'
+      rows in tests/prints.txt). Left: (3b), (3c) below; a release smoke run. Pass on (not this lane's files):
       scripts/src/bin/smoke.rs:45 and :163 (`Step::Check` expects exit 0; now 3);
       docs/terminal.md:162 ("one `ok` or `failed` line always").
       (3b) plan, not written: a `BodyCheck` part per fn/const/static item with a body in

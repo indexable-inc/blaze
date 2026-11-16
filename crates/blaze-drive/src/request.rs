@@ -337,6 +337,8 @@ pub struct Task<'a> {
     pub place: u32,
     /// A `FileItems` task's file, an index for [`Request::path`].
     pub file: Option<u32>,
+    /// The edition its file is read in: a `FileItems` task's own file's, an item's task's
+    /// home file's; 0 for a task of no file.
     pub edition: u8,
     /// Its inputs: last time's read list first, then what it needed since.
     pub inputs: Vec<Input, Alloc<'a>>,
@@ -1933,10 +1935,13 @@ impl<'a> Request<'a> {
         failed.sort_unstable();
         failed.dedup();
         members.extend_from_slice(&job.members);
-        let edition = match job.locate {
-            Some(Locate::File { edition }) => edition,
-            _ => 0,
+        // A file's own, or an item's home file's: an item's task (a body's check) reads its
+        // text in the edition its file is read in.
+        let file_edition = |locate: Option<Locate>| match locate {
+            Some(Locate::File { edition }) => Some(edition),
+            _ => None,
         };
+        let edition = file_edition(job.locate).or_else(|| self.jobs.get(&job.home).and_then(|home| file_edition(home.locate))).unwrap_or(0);
         // A file's outline and a manifest's units read their file; the root units read the root
         // manifest.
         let file = base.text_file().and_then(|file| self.file_index(&file.subject)).map(|i| i as u32);

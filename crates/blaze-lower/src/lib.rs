@@ -1,5 +1,25 @@
 //! # For a successor
 //!
+//! State (2026-11-16, ~10:45 by the build clock, relay runner after the one below; handing on).
+//! STEP 1 PROVEN: blaze-lower "110 passed"; `a_pattern_type_expands_to_its_one_form` fails with
+//! the `PATTERN_TYPE` arm removed ("left: 0 right: 2"); front2_bounds "1 passed", front2_main
+//! "5 passed"; front2_items "7 passed, 2 failed" (`a_refused_impl_is_a_named_gap`,
+//! `a_negative_impl_is_a_head`: impls, not pattern types; other lanes' WIP). Census NOT rerun.
+//! STEP 2 FIXED: `$crate` in a body expansion lost its crate at the text boundary: blaze-expand
+//! `body_words` wrote `$crate`, and the ladder's `to_path` read it as the BODY's crate. Now a
+//! marked `$crate` is written as `DollarCrate(mark.site.krate)` (`__dollar_crate_<hex>`; one home
+//! moved to blaze-surface macro_def.rs, re-exported by blaze-scope task/lower.rs); machine.rs
+//! `library_macro` accepts it. Fixture scoped_tests `a_value_path_a_nested_expansion_writes_
+//! names_the_defining_crate` failed without it (`$crate::deep::f` -> user's ItemKey(d1fa2cbf2a39),
+//! dep's is 5650bb2226d6); blaze-lower "113 passed", blaze-expand "56 passed" (mixcheck: blaze-
+//! solve alias.rs:526 E0004 broke lanecheck). front2_panics: only `a2` left (`if false {
+//! core::intrinsics::abort() }` then `panic!`: its printout not seen: run with --nocapture).
+//! Coordinator's 275 x E0425 in core `ptr::add` (`assert_unsafe_precondition!`): fixtures show
+//! `::dep` through `extern crate self as dep;` and an `$kind` path segment RESOLVE; the third
+//! suspect is the cause by reading: the macro defines `const fn precondition_check` IN the body's
+//! block, and no body-local item exists in blaze-typeck, typeck.rs or front2 (`BodyWorld::
+//! resolve_path` ignores its `ScopeId`): the type checker's lanes. Steps 3, 4 NOT started.
+//!
 //! State (2026-11-16, ~13:00, relay runner after the one below; budget spent, handing on).
 //! FIRST (coordinator, ahead of everything): a `panic!`/`assert!` in any crate OTHER than core
 //! leaves `$crate::panicking::panic_fmt` unresolved (front2_panics.rs, user crate on

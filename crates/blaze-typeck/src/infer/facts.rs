@@ -30,7 +30,7 @@ use blaze_solve::term::{
 use crate::error::{CheckError, Malformed, Stop};
 use crate::hash::{ContentHash, StableHasher};
 use crate::ids::{FloatTy, IntTy, ItemKey, LangItem, Mutbl, Name, UintTy};
-use crate::portable::{PNode, PTys};
+use crate::portable::{PNode, PTy, PTys};
 use crate::world::{AdtKind, PClause, Question, Reads, Shape, World};
 
 /// The solver's def of `<_ as trait_>::name`.
@@ -120,6 +120,75 @@ struct OpaqueRow {
     digest: u64,
 }
 
+/// What the conversions of one cache did: tables, entries converted, entries the answers'
+/// roots reach, entries offered (the tables' lengths).
+#[derive(Clone, Copy, Default)]
+struct Converted {
+    tables: u64,
+    converted: u64,
+    reached: u64,
+    offered: u64,
+}
+
+/// A record's table being converted: the question it answered (named by errors), its number
+/// in the call's memo, and its terms.
+#[derive(Clone, Copy)]
+struct Conv<'t> {
+    q: Question,
+    tab: u32,
+    t: PTys<'t>,
+}
+
+/// Calls `f` with each child of `n` in `t` (a list's terms in order). A `ConstValue`'s type
+/// is read in place by the conversion, never converted, so it is no child here.
+fn children(t: PTys<'_>, n: PNode, mut f: impl FnMut(u32) -> Result<(), CheckError>) -> Result<(), Stop> {
+    let mut list = |l: crate::ids::List, f: &mut dyn FnMut(u32) -> Result<(), CheckError>| -> Result<(), Stop> {
+        for i in l.range() {
+            let p = t.lists.get(i).ok_or(CheckError::Malformed(Malformed::TypeOrder { node: i as u32, child: i as u32 }))?;
+            f(p.0)?;
+        }
+        Ok(())
+    };
+    match n {
+        PNode::Bool
+        | PNode::Char
+        | PNode::Int(_)
+        | PNode::Uint(_)
+        | PNode::Float(_)
+        | PNode::Str
+        | PNode::Never
+        | PNode::Param(_)
+        | PNode::ConstParam(_)
+        | PNode::ConstValue { .. }
+        | PNode::Error
+        | PNode::ExAuto(_)
+        | PNode::Closure(..)
+        | PNode::Future(..)
+        | PNode::Infer => Ok(()),
+        PNode::Ref(_, p) | PNode::Ptr(_, p) | PNode::Slice(p) => Ok(f(p.0)?),
+        PNode::Array(e, len) => {
+            f(e.0)?;
+            Ok(f(len.0)?)
+        }
+        PNode::Pat(b, l) => {
+            f(b.0)?;
+            list(l, &mut f)
+        }
+        PNode::Tuple(l)
+        | PNode::Adt(_, l)
+        | PNode::FnDef(_, l)
+        | PNode::FnPtr(l, _)
+        | PNode::Opaque(_, l)
+        | PNode::Dynamic(l)
+        | PNode::ExTrait(_, l)
+        | PNode::Alias { args: l, .. } => list(l, &mut f),
+        PNode::ExProj { args, term, .. } => {
+            list(args, &mut f)?;
+            Ok(f(term.0)?)
+        }
+    }
+}
+
 /// The solver's facts, read through the body's `Reads` (see the module).
 pub struct FactCache<'a> {
     alloc: Alloc<'a>,
@@ -151,6 +220,18 @@ pub struct FactCache<'a> {
     /// a hash of the terms; a second set of arguments under one key is refused (rule 21).
     holds: HashMap<(u128, u64), (Span, ConstHolds), Alloc<'a>>,
     cond_args: Vec<STy, Alloc<'a>>,
+    /// What `table` did, for the tally (asks.rs `Tally`): read by `fill`.
+    counted: Converted,
+    /// The record tables this call has converted from, each to its number in `memo`.
+    seen: HashMap<(usize, usize), u32, Alloc<'a>>,
+    /// A record table's node (its table's number, its index) to the solver term converted
+    /// from it: each node an answer reaches is converted once per call (the cache lives for
+    /// one check), and an answer whose roots were converted costs a lookup per root.
+    memo: HashMap<(u32, u32), STy, Alloc<'a>>,
+    /// The call's erased region, once a node needed it.
+    erased: Option<STy>,
+    /// `ty`'s work list: a node and whether its children were pushed.
+    work: Vec<(u32, bool), Alloc<'a>>,
     /// A planted bug (`suite::control_first_impl_taken`): an impl bucket keeps only its first impl.
     #[cfg(test)]
     pub(crate) first_impl_only: bool,
@@ -375,6 +456,11 @@ impl<'a> FactCache<'a> {
             conditions: Vec::new_in(alloc),
             holds: HashMap::new_in(alloc),
             cond_args: Vec::new_in(alloc),
+            counted: Converted::default(),
+            seen: HashMap::new_in(alloc),
+            memo: HashMap::new_in(alloc),
+            erased: None,
+            work: Vec::new_in(alloc),
             #[cfg(test)]
             first_impl_only: false,
             #[cfg(test)]
@@ -451,6 +537,22 @@ impl<'a> FactCache<'a> {
         if self.has(q) {
             return Ok(());
         }
+        let at = reads.stamp();
+        let before = self.counted;
+        let out = self.fill_one(q, reads);
+        let end = reads.stamp();
+        let c = self.counted;
+        if let Some(t) = reads.tally() {
+            t.conversions += c.tables - before.tables;
+            t.entries_converted += c.converted - before.converted;
+            t.entries_reached += c.reached - before.reached;
+            t.entries_offered += c.offered - before.offered;
+            t.convert_ns += end.saturating_sub(at);
+        }
+        out
+    }
+
+    fn fill_one<W: World>(&mut self, q: SQ, reads: &mut Reads<'_, '_, W>) -> Result<(), Stop> {
         match q {
             SQ::TraitDef(d) => self.fill_trait(ItemKey(d.0), reads),
             SQ::Impls(d, s) => {
@@ -504,20 +606,100 @@ impl<'a> FactCache<'a> {
     /// Converts `t` into the answer's portable table, which starts at `por`: an erased region
     /// first, then `t`'s nodes one for one (an array's length is its own node). Returns the
     /// answer-relative index of `t`'s node 0 and of its list 0.
-    fn table(&mut self, q: Question, t: PTys<'_>, por: Por) -> Result<(u32, u32), Stop> {
-        let base = por.nodes.start as usize;
-        let lbase = por.lists.start as usize;
-        let erased = (self.nodes.len() - base) as u32;
-        self.nodes.push(K::ReErased);
-        let off = (self.nodes.len() - base) as u32;
-        let loff = (self.lists.len() - lbase) as u32;
-        for p in t.lists {
-            self.lists.push(STy(off + p.0));
+    fn table<'t>(&mut self, q: Question, t: PTys<'t>) -> Conv<'t> {
+        self.counted.tables += 1;
+        self.counted.offered += t.nodes.len() as u64;
+        // The table's identity for this call's memo: the world's answers are borrowed for the
+        // whole call, so two answers whose tables start at one address are one table (the
+        // address is never part of a key, a record or an output; it only finds the memo).
+        let id = (t.nodes.as_ptr() as usize, t.lists.as_ptr() as usize);
+        let next = self.seen.len() as u32;
+        let tab = *self.seen.entry(id).or_insert(next);
+        Conv { q, tab, t }
+    }
+
+    /// The call's one erased region node.
+    fn erased(&mut self) -> STy {
+        match self.erased {
+            Some(e) => e,
+            None => {
+                let e = STy(self.nodes.len() as u32);
+                self.nodes.push(K::ReErased);
+                self.erased = Some(e);
+                e
+            }
         }
-        let list = |l: crate::ids::List| SList { start: loff + l.start, len: l.len };
-        let ty = |p: crate::portable::PTy| STy(off + p.0);
-        for n in t.nodes {
-            let k = match *n {
+    }
+
+    /// The solver term of `root` of `c`'s table: converted with every node it reaches that
+    /// this call has not converted yet, children first, by a work list; a lookup when it has.
+    /// A child must come before its parent in the table (as the solver's portable tables
+    /// require), so the walk ends.
+    fn ty(&mut self, c: Conv<'_>, root: PTy) -> Result<STy, Stop> {
+        if let Some(&s) = self.memo.get(&(c.tab, root.0)) {
+            self.counted.reached += 1;
+            return Ok(s);
+        }
+        self.work.clear();
+        self.work.push((root.0, false));
+        while let Some((n, expanded)) = self.work.pop() {
+            if self.memo.contains_key(&(c.tab, n)) {
+                continue;
+            }
+            let node = c.t.node(PTy(n)).map_err(Stop::from)?;
+            if !expanded {
+                self.work.push((n, true));
+                let work = &mut self.work;
+                children(c.t, node, |ch| {
+                    if ch >= n {
+                        return Err(CheckError::Malformed(Malformed::TypeOrder { node: n, child: ch }));
+                    }
+                    work.push((ch, false));
+                    Ok(())
+                })?;
+                continue;
+            }
+            let k = self.convert(c, node)?;
+            let s = STy(self.nodes.len() as u32);
+            self.nodes.push(k);
+            self.memo.insert((c.tab, n), s);
+            self.counted.converted += 1;
+            self.counted.reached += 1;
+        }
+        self.memo.get(&(c.tab, root.0)).copied().ok_or(CheckError::Malformed(Malformed::TypeOrder { node: root.0, child: root.0 }).into())
+    }
+
+    /// The list `l` of `c`'s table as a list of solver terms, its terms converted first.
+    fn list(&mut self, c: Conv<'_>, l: crate::ids::List) -> Result<SList, Stop> {
+        let mut terms: Vec<STy, Alloc<'a>> = Vec::with_capacity_in(l.len as usize, self.alloc);
+        for i in l.range() {
+            let p = *c.t.lists.get(i as usize).ok_or(CheckError::Malformed(Malformed::NoRecord(c.q)))?;
+            terms.push(self.ty(c, p)?);
+        }
+        let start = self.lists.len() as u32;
+        self.lists.extend_from_slice(&terms);
+        Ok(SList { start, len: l.len })
+    }
+
+    /// The solver node of `n`, whose children are converted already.
+    fn convert(&mut self, c: Conv<'_>, n: PNode) -> Result<K, Stop> {
+        let (q, t, tab) = (c.q, c.t, c.tab);
+        let erased = self.erased().0;
+        let memo = &self.memo;
+        let lists = &mut self.lists;
+        let ty = |p: PTy| -> Result<STy, Stop> {
+            memo.get(&(tab, p.0)).copied().ok_or(CheckError::Malformed(Malformed::TypeOrder { node: p.0, child: p.0 }).into())
+        };
+        let mut list = |l: crate::ids::List| -> Result<SList, Stop> {
+            let start = lists.len() as u32;
+            for i in l.range() {
+                let p = *t.lists.get(i as usize).ok_or(CheckError::Malformed(Malformed::NoRecord(q)))?;
+                lists.push(ty(p)?);
+            }
+            Ok(SList { start, len: l.len })
+        };
+        {
+            let k = match n {
                 PNode::Bool => K::Bool,
                 PNode::Char => K::Char,
                 PNode::Int(i) => K::Int(int(i)),
@@ -525,15 +707,15 @@ impl<'a> FactCache<'a> {
                 PNode::Float(f) => K::Float(float(f)),
                 PNode::Str => K::Str,
                 PNode::Never => K::Never,
-                PNode::Tuple(l) => K::Tuple(list(l)),
-                PNode::Ref(m, p) => K::Ref(STy(erased), ty(p), mutbl(m)),
-                PNode::Ptr(m, p) => K::RawPtr(ty(p), mutbl(m)),
-                PNode::Array(e, n) => K::Array(ty(e), ty(n)),
-                PNode::Slice(e) => K::Slice(ty(e)),
-                PNode::Pat(b, l) => K::Pat(ty(b), list(l)),
-                PNode::Adt(k, l) => K::Adt(SDef(k.0), list(l)),
-                PNode::FnDef(k, l) => K::FnDef(SDef(k.0), list(l)),
-                PNode::FnPtr(l, h) => K::FnPtr(list(l), h),
+                PNode::Tuple(l) => K::Tuple(list(l)?),
+                PNode::Ref(m, p) => K::Ref(STy(erased), ty(p)?, mutbl(m)),
+                PNode::Ptr(m, p) => K::RawPtr(ty(p)?, mutbl(m)),
+                PNode::Array(e, n) => K::Array(ty(e)?, ty(n)?),
+                PNode::Slice(e) => K::Slice(ty(e)?),
+                PNode::Pat(b, l) => K::Pat(ty(b)?, list(l)?),
+                PNode::Adt(k, l) => K::Adt(SDef(k.0), list(l)?),
+                PNode::FnDef(k, l) => K::FnDef(SDef(k.0), list(l)?),
+                PNode::FnPtr(l, h) => K::FnPtr(list(l)?, h),
                 PNode::Param(i) => K::Param(i),
                 PNode::ConstParam(i) => K::ConstParam(i),
                 PNode::ConstValue { ty: vt, bits } => {
@@ -551,70 +733,64 @@ impl<'a> FactCache<'a> {
                 PNode::Alias { trait_, name, args } => {
                     let d = assoc_def(trait_, name);
                     self.names.insert(d, (trait_, name));
-                    K::Alias(Rigid::No, SAlias::Projection, SDef(d), list(args))
+                    K::Alias(Rigid::No, SAlias::Projection, SDef(d), list(args)?)
                 }
-                PNode::Opaque(k, l) => K::Alias(Rigid::No, SAlias::Opaque, SDef(k.0), list(l)),
+                PNode::Opaque(k, l) => K::Alias(Rigid::No, SAlias::Opaque, SDef(k.0), list(l)?),
                 PNode::Error => K::Error,
-                PNode::Dynamic(l) => K::Dynamic(list(l), STy(erased)),
-                PNode::ExTrait(k, l) => K::ExTrait(SDef(k.0), list(l)),
+                PNode::Dynamic(l) => K::Dynamic(list(l)?, STy(erased)),
+                PNode::ExTrait(k, l) => K::ExTrait(SDef(k.0), list(l)?),
                 PNode::ExProj { trait_, name, args, term } => {
                     let d = assoc_def(trait_, name);
                     self.names.insert(d, (trait_, name));
-                    K::ExProj(SDef(d), list(args), ty(term))
+                    K::ExProj(SDef(d), list(args)?, ty(term)?)
                 }
                 PNode::ExAuto(k) => K::ExAuto(SDef(k.0)),
                 PNode::Closure(..) | PNode::Future(..) | PNode::Infer => {
                     return Err(CheckError::Malformed(Malformed::BodyTypeInRecord(q)).into());
                 }
             };
-            self.nodes.push(k);
+            Ok(k)
         }
-        Ok((off, loff))
     }
 
-    /// Converts clauses over a table converted at `(off, loff)` into `self.preds`.
-    fn clauses(&mut self, cs: &[PClause], off: u32, loff: u32, base: usize) {
-        for c in cs {
-            let p = match *c {
-                PClause::Trait { trait_, args } => Pred::Trait {
-                    trait_: SDef(trait_.0),
-                    args: SList { start: loff + args.start, len: args.len },
-                    polarity: Polarity::Positive,
-                },
+    /// Converts clauses over `c`'s table into `self.preds`, converting what they reach.
+    fn clauses(&mut self, cs: &[PClause], c: Conv<'_>) -> Result<(), Stop> {
+        for cl in cs {
+            let p = match *cl {
+                PClause::Trait { trait_, args } => {
+                    Pred::Trait { trait_: SDef(trait_.0), args: self.list(c, args)?, polarity: Polarity::Positive }
+                }
                 PClause::Projection { trait_, args, name, term } => {
                     let d = assoc_def(trait_, name);
                     self.names.insert(d, (trait_, name));
-                    let alias = (self.nodes.len() - base) as u32;
-                    self.nodes.push(K::Alias(
-                        Rigid::No,
-                        SAlias::Projection,
-                        SDef(d),
-                        SList { start: loff + args.start, len: args.len },
-                    ));
-                    Pred::Projection { alias: STy(alias), term: STy(off + term.0) }
+                    let args = self.list(c, args)?;
+                    let term = self.ty(c, term)?;
+                    let alias = self.nodes.len() as u32;
+                    self.nodes.push(K::Alias(Rigid::No, SAlias::Projection, SDef(d), args));
+                    Pred::Projection { alias: STy(alias), term }
                 }
                 PClause::Const { cond, args } => {
                     #[cfg(test)]
                     if self.drop_const_clauses {
                         continue;
                     }
-                    Pred::ConstHolds { cond: SDef(cond.0), args: SList { start: loff + args.start, len: args.len } }
+                    Pred::ConstHolds { cond: SDef(cond.0), args: self.list(c, args)? }
                 }
             };
             self.preds.push(p);
         }
+        Ok(())
     }
 
+    /// An answer's portable table is the call's whole converted table (its handles are
+    /// absolute): every node an answer reaches was converted into it, once per call.
     fn start(&self) -> Por {
-        Por {
-            nodes: Span { start: self.nodes.len() as u32, len: 0 },
-            lists: Span { start: self.lists.len() as u32, len: 0 },
-        }
+        Por::default()
     }
 
     fn end(&self, mut p: Por) -> Por {
-        p.nodes.len = self.nodes.len() as u32 - p.nodes.start;
-        p.lists.len = self.lists.len() as u32 - p.lists.start;
+        p.nodes.len = self.nodes.len() as u32;
+        p.lists.len = self.lists.len() as u32;
         p
     }
 
@@ -622,21 +798,19 @@ impl<'a> FactCache<'a> {
         let q = Question::TraitDef(k);
         let Some(t) = reads.trait_def(k)? else { return Err(CheckError::Malformed(Malformed::NoRecord(q)).into()) };
         let por = self.start();
-        let (off, loff) = self.table(q, t.types, por)?;
+        let c = self.table(q, t.types);
         let supers = self.preds.len();
-        self.clauses(t.supertraits, off, loff, por.nodes.start as usize);
+        self.clauses(t.supertraits, c)?;
         let supers = Span::of(&self.preds, supers);
         let assoc = self.assoc_tys.len();
         for a in t.assoc_types {
             let d = assoc_def(k, a.name);
             self.names.insert(d, (k, a.name));
-            self.assoc_tys.push(AssocTy {
-                def: SDef(d),
-                own_generics: 0,
-                bounds_start: 0,
-                bounds_len: 0,
-                default: a.default.map(|p| STy(off + p.0)),
-            });
+            let default = match a.default {
+                Some(p) => Some(self.ty(c, p)?),
+                None => None,
+            };
+            self.assoc_tys.push(AssocTy { def: SDef(d), own_generics: 0, bounds_start: 0, bounds_len: 0, default });
         }
         let assoc = Span::of(&self.assoc_tys, assoc);
         let f = t.flags;
@@ -676,26 +850,28 @@ impl<'a> FactCache<'a> {
         let Some(trait_) = h.trait_ else { return Err(CheckError::Malformed(Malformed::NoRecord(q)).into()) };
         let wc = reads.predicates(k)?;
         let por = self.start();
-        let base = por.nodes.start as usize;
-        let (off, loff) = self.table(q, h.types, por)?;
+        let c = self.table(q, h.types);
         // The trait's arguments, self first: a list of its own.
-        let args_at = (self.lists.len() - por.lists.start as usize) as u32;
-        self.lists.push(STy(off + h.self_ty.0));
+        let self_ty = self.ty(c, h.self_ty)?;
+        let mut terms: Vec<STy, Alloc<'a>> = Vec::with_capacity_in(h.trait_args.list().len as usize + 1, self.alloc);
+        terms.push(self_ty);
         for i in h.trait_args.list().range() {
-            let p = h.types.lists.get(i).ok_or(CheckError::Malformed(Malformed::NoRecord(q)))?;
-            self.lists.push(STy(off + p.0));
+            let p = *h.types.lists.get(i).ok_or(CheckError::Malformed(Malformed::NoRecord(q)))?;
+            terms.push(self.ty(c, p)?);
         }
-        let args = SList { start: args_at, len: h.trait_args.list().len + 1 };
+        let args = SList { start: self.lists.len() as u32, len: terms.len() as u32 };
+        self.lists.extend_from_slice(&terms);
         let assoc = self.impl_assoc.len();
         for &(name, v) in h.assoc_types {
             let d = assoc_def(trait_, name);
             self.names.insert(d, (trait_, name));
-            self.impl_assoc.push(ImplAssoc { trait_item: SDef(d), value: STy(off + v.0), own_generics: 0, is_default: false });
+            let value = self.ty(c, v)?;
+            self.impl_assoc.push(ImplAssoc { trait_item: SDef(d), value, own_generics: 0, is_default: false });
         }
         let assoc = Span::of(&self.impl_assoc, assoc);
-        let (woff, wloff) = self.table(Question::Predicates(k), wc.types, por)?;
+        let wcc = self.table(Question::Predicates(k), wc.types);
         let wheres = self.preds.len();
-        self.clauses(wc.clauses, woff, wloff, base);
+        self.clauses(wc.clauses, wcc)?;
         let wheres = Span::of(&self.preds, wheres);
         for c in wc.clauses {
             if let PClause::Const { cond, .. } = *c {
@@ -740,15 +916,15 @@ impl<'a> FactCache<'a> {
             flags |= AdtFlags::HAS_DROP;
         }
         let por = self.start();
-        let base = por.nodes.start as usize;
-        let (off, _) = self.table(q, a.types, por)?;
+        let c = self.table(q, a.types);
         let fields = self.fields.len();
         let variants = self.variants.len();
         for v in a.variants {
             let at = (self.fields.len() - fields) as u32;
             for i in v.fields.range() {
                 let f = a.fields.get(i).ok_or(CheckError::Malformed(Malformed::NoRecord(q)))?;
-                self.fields.push(STy(off + f.ty.0));
+                let ty = self.ty(c, f.ty)?;
+                self.fields.push(ty);
             }
             self.variants.push((at, v.fields.len));
         }
@@ -769,9 +945,9 @@ impl<'a> FactCache<'a> {
         };
         let fields = Span::of(&self.fields, fields);
         let variants = Span::of(&self.variants, variants);
-        let (woff, wloff) = self.table(Question::Predicates(k), wc.types, por)?;
+        let wcc = self.table(Question::Predicates(k), wc.types);
         let wheres = self.preds.len();
-        self.clauses(wc.clauses, woff, wloff, base);
+        self.clauses(wc.clauses, wcc)?;
         let wheres = Span::of(&self.preds, wheres);
         let row = AdtRow {
             flags: AdtFlags(flags),
@@ -792,12 +968,14 @@ impl<'a> FactCache<'a> {
         let q = Question::FnSig(k);
         let Some(s) = reads.fn_sig(k)? else { return Err(CheckError::Malformed(Malformed::NoRecord(q)).into()) };
         let por = self.start();
-        let (off, _) = self.table(q, s.types, por)?;
-        let at = (self.lists.len() - por.lists.start as usize) as u32;
-        for p in s.inputs {
-            self.lists.push(STy(off + p.0));
+        let c = self.table(q, s.types);
+        let mut terms: Vec<STy, Alloc<'a>> = Vec::with_capacity_in(s.inputs.len() + 1, self.alloc);
+        for &p in s.inputs {
+            terms.push(self.ty(c, p)?);
         }
-        self.lists.push(STy(off + s.output.0));
+        terms.push(self.ty(c, s.output)?);
+        let at = self.lists.len() as u32;
+        self.lists.extend_from_slice(&terms);
         let io = SList { start: at, len: s.inputs.len() as u32 + 1 };
         // `FnSig::is_fn_trait_compatible` reads the safety and the ABI from the header.
         let mut flags = 0;
@@ -866,17 +1044,16 @@ impl<'a> FactCache<'a> {
         let hidden = reads.opaque_hidden(k)?;
         let bounds = reads.predicates(k)?;
         let por = self.start();
-        let base = por.nodes.start as usize;
         let hidden_ty = match hidden {
             Some(h) => {
-                let (off, _) = self.table(q, h.types, por)?;
-                Some(STy(off + h.ty.0))
+                let c = self.table(q, h.types);
+                Some(self.ty(c, h.ty)?)
             }
             None => None,
         };
-        let (boff, bloff) = self.table(Question::Predicates(k), bounds.types, por)?;
+        let bc = self.table(Question::Predicates(k), bounds.types);
         let start = self.preds.len();
-        self.clauses(bounds.clauses, boff, bloff, base);
+        self.clauses(bounds.clauses, bc)?;
         let mut d = digest("blaze-typeck opaque bounds", &bounds);
         if let Some(h) = hidden {
             d ^= digest("blaze-typeck opaque hidden", &h);

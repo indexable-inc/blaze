@@ -23,3 +23,7 @@ blaze-h1.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+# The driver's simulation: property cases and its planted-bug control.
+blaze-sim.workspace = true

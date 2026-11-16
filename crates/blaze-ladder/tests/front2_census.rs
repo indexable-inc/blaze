@@ -144,12 +144,59 @@ fn short(s: &str, n: usize) -> String {
     }
 }
 
-fn gap_class(g: &Gap) -> String {
+/// The trait an impl's text names, its last segment without arguments (`impl<T> ops::Deref<X>
+/// for Box<T>` -> `Deref`); `(inherent)` without ` for `.
+fn impl_trait(text: &str) -> String {
+    let Some(at) = text.find("impl") else { return "(no impl text)".into() };
+    let rest = &text[at + 4..];
+    let (mut depth, mut i) = (0i32, 0usize);
+    let b = rest.as_bytes();
+    // Skip the impl's own generics.
+    let rest = if rest.trim_start().starts_with('<') {
+        while i < b.len() {
+            match b[i] {
+                b'<' => depth += 1,
+                b'>' if i > 0 && b[i - 1] == b'-' => {}
+                b'>' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        i += 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        &rest[i..]
+    } else {
+        rest
+    };
+    let Some(f) = rest.find(" for ") else { return "(inherent)".into() };
+    let path = rest[..f].trim().trim_start_matches(['!', '?']).trim_start_matches("const ");
+    let path = path.split('<').next().unwrap_or(path);
+    path.rsplit("::").next().unwrap_or(path).trim().to_string()
+}
+
+/// A refused header's reason as a class: its `Why` (after the item's key), the named form cut.
+fn refusal_reason(why: &str) -> String {
+    let after = why.split_once("): ").map_or(why, |x| x.1);
+    let n = nest(after);
+    match n.split_once(" \"") {
+        Some((v, q)) => format!("{v} \"{}", short(q, 40)),
+        None => n,
+    }
+}
+
+fn gap_class(g: &Gap, names: &Names<'_>) -> String {
     match g {
         Gap::Lang(_, s) => format!("gap Lang: {s}"),
         Gap::BuiltinTypePath(s) => format!("gap BuiltinTypePath: {s}"),
         Gap::UnreadImpl(_, s) => format!("gap UnreadImpl: {}", short(s, 50)),
-        Gap::RefusedImpl { why, .. } => format!("gap RefusedImpl: {}", short(why, 70)),
+        Gap::RefusedImpl { impl_, why, .. } => {
+            let tr = names.item_text(*impl_).map_or("(no text)".to_string(), |t| impl_trait(t.text));
+            format!("gap RefusedImpl [{tr}]: {}", refusal_reason(why))
+        }
         Gap::FnHead(_, s) => format!("gap FnHead: {}", nest(s)),
         Gap::Unspelled(u) => format!("gap Unspelled: {}", nest(&format!("{u:?}"))),
         Gap::Resolve(e) => format!("gap Resolve: {}", nest(&format!("{e:?}"))),
@@ -174,10 +221,10 @@ fn source_at(text: &str, start: u32, end: u32) -> String {
 
 /// A failure's class and its line; `text` is the body's item text, whose ranges a diagnostic
 /// gives.
-fn fail_class(e: &CheckFail, text: &str) -> (String, String) {
+fn fail_class(e: &CheckFail, text: &str, names: &Names<'_>) -> (String, String) {
     match e {
         CheckFail::Gap { gaps, .. } => {
-            let first = gaps.first().map_or("gap (empty list)".to_string(), gap_class);
+            let first = gaps.first().map_or("gap (empty list)".to_string(), |g| gap_class(g, names));
             (first, format!("{} gaps; the first: {}", gaps.len(), gaps.first().map(|g| short(&format!("{g}"), 300)).unwrap_or_default()))
         }
         CheckFail::Diags { diags, .. } => {
@@ -264,7 +311,7 @@ fn take<'n>(r: &mut Records<'_, 'n>, prepared: &Prepares<'n>, t: Target<'_>) -> 
         // relative to it), else the free item's.
         Err(e) => {
             let text = r.store.fns.get(&body.owner).map(|f| f.text).or_else(|| r.names.item_text(body.item).map(|t| t.text)).unwrap_or("");
-            Err(fail_class(&e, text))
+            Err(fail_class(&e, text, r.names))
         }
     }
 }
@@ -528,6 +575,35 @@ fn census_crate<'n>(names: &'n Names<'n>, front: &mut Front2<'n>, krate: usize, 
         }
         for x in ex {
             out.push_str(&format!("         e.g. {x}\n"));
+        }
+    }
+    // The refused impls behind "gap RefusedImpl" bodies, by the refusal's reason and by trait:
+    // what each heads lane has to build.
+    {
+        let (mut by_reason, mut by_trait, mut by_both): (BTreeMap<&str, usize>, BTreeMap<&str, usize>, BTreeMap<(&str, &str), usize>) = Default::default();
+        for (class, (n, _)) in &classes {
+            let Some(rest) = class.strip_prefix("gap RefusedImpl [") else { continue };
+            let Some((tr, reason)) = rest.split_once("]: ") else { continue };
+            *by_reason.entry(reason).or_insert(0) += n;
+            *by_trait.entry(tr).or_insert(0) += n;
+            *by_both.entry((reason, tr)).or_insert(0) += n;
+        }
+        let largest = |m: Vec<(String, usize)>| {
+            let mut m = m;
+            m.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+            m
+        };
+        out.push_str("REFUSED IMPLS (bodies stopped by a refused candidate impl), by reason:\n");
+        for (r, n) in largest(by_reason.iter().map(|(r, n)| (r.to_string(), *n)).collect()) {
+            out.push_str(&format!("{n:6} {r}\n"));
+        }
+        out.push_str("by trait:\n");
+        for (t, n) in largest(by_trait.iter().map(|(t, n)| (t.to_string(), *n)).collect()) {
+            out.push_str(&format!("{n:6} {t}\n"));
+        }
+        out.push_str("by reason and trait:\n");
+        for (rt, n) in largest(by_both.iter().map(|((r, t), n)| (format!("{t} <- {r}"), *n)).collect()) {
+            out.push_str(&format!("{n:6} {rt}\n"));
         }
     }
     out.push_str(&format!("crate {cname}: {:?}\n", start.elapsed()));

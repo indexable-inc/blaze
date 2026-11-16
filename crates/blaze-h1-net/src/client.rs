@@ -242,6 +242,7 @@ impl<T: Tls, A: Allocator + Clone> Client<'_, T, A> {
                 checked = true;
                 if let Some(asked) = ask.range
                     && !is_redirect(response.status())
+                    && !crate::plant::range_unchecked()
                 {
                     range = Some(response.ranged(asked).map_err(FetchWhy::Http)?);
                 }

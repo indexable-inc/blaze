@@ -11,7 +11,7 @@
 
 use blaze_own::{Alloc, Soa, Vec};
 
-use crate::asks::{Ask, AskLog, Clock, Cursor};
+use crate::asks::{Ask, AskLog, Clock, Cursor, Tally, Tallying, question_kind};
 use crate::body::BodyView;
 use crate::columns::columns_eq;
 use crate::error::{CheckError, Malformed, Stop};
@@ -595,6 +595,8 @@ pub struct Reads<'w, 'a, W: World> {
     entries: Vec<(Question, u64), Alloc<'a>>,
     /// The ask log, when the run measures re-entry (asks.rs); `None` otherwise.
     log: Option<AskRecorder<'w, 'a>>,
+    /// The tally, when the run counts (asks.rs `Tally`); `None` otherwise.
+    tally: Option<Tallying<'w>>,
 }
 
 /// The ask log being written, with the clock it reads and where the walk is.
@@ -627,14 +629,29 @@ pub fn ground_args_digest(args: &[PTy], types: PTys<'_>) -> u64 {
 impl<'w, 'a, W: World> Reads<'w, 'a, W> {
     /// The recorder for one run.
     pub(crate) fn new_in(world: &'w W, alloc: Alloc<'a>) -> Reads<'w, 'a, W> {
-        Reads { world, entries: Vec::new_in(alloc), log: None }
+        Reads { world, entries: Vec::new_in(alloc), log: None, tally: None }
+    }
+
+    /// The recorder for one run that also keeps `tally`, reading `clock`.
+    pub(crate) fn counted_in(world: &'w W, tally: &'w mut Tally, clock: &'w dyn Clock, alloc: Alloc<'a>) -> Reads<'w, 'a, W> {
+        Reads { world, entries: Vec::new_in(alloc), log: None, tally: Some(Tallying { tally, clock }) }
+    }
+
+    /// The tally's clock now, when the run counts (0 otherwise).
+    pub(crate) fn stamp(&self) -> u64 {
+        self.tally.as_ref().map_or(0, |t| t.clock.now_ns())
+    }
+
+    /// The tally, when the run counts.
+    pub(crate) fn tally(&mut self) -> Option<&mut Tally> {
+        self.tally.as_mut().map(|t| &mut *t.tally)
     }
 
     /// The recorder for one run that also writes the ask log, reading `clock`.
     pub(crate) fn logged_in(world: &'w W, clock: &'w dyn Clock, alloc: Alloc<'a>) -> Reads<'w, 'a, W> {
         let start_ns = clock.now_ns();
         let log = AskRecorder { asks: Vec::new_in(alloc), clock, start_ns, cursor: Cursor::default() };
-        Reads { world, entries: Vec::new_in(alloc), log: Some(log) }
+        Reads { world, entries: Vec::new_in(alloc), log: Some(log), tally: None }
     }
 
     /// Whether the run writes the ask log (the machine then reports where it is).
@@ -670,7 +687,8 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
 
     /// The one seam every read of another item's record goes through: asks the world, logs
     /// the ask when measuring, and enters the answer's hash into the read list.
-    fn record<T: ContentHash>(&mut self, q: Question, got: Fetch<T>) -> Result<T, Stop> {
+    fn record<T: ContentHash>(&mut self, q: Question, got: Fetch<T>, asked_at: u64) -> Result<T, Stop> {
+        let answered_at = self.stamp();
         if let Some(l) = &mut self.log {
             l.asks.push(Ask {
                 question: q,
@@ -685,9 +703,24 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
         match got {
             Ok(v) => {
                 self.entries.push((q, hash_of("answer", &v)));
+                self.count(q, false, asked_at, answered_at);
                 Ok(v)
             }
-            Err(Missing) => Err(Stop::Need(q)),
+            Err(Missing) => {
+                self.count(q, true, asked_at, answered_at);
+                Err(Stop::Need(q))
+            }
+        }
+    }
+
+    /// Counts one ask into the tally, when the run counts.
+    fn count(&mut self, q: Question, missing: bool, asked_at: u64, answered_at: u64) {
+        if let Some(t) = &mut self.tally {
+            let hashed_at = t.clock.now_ns();
+            t.tally.asks[question_kind(q)] += 1;
+            t.tally.missing += missing as u64;
+            t.tally.world_ns += answered_at.saturating_sub(asked_at);
+            t.tally.hash_ns += hashed_at.saturating_sub(answered_at);
         }
     }
 
@@ -761,30 +794,35 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
     }
 
     pub fn fn_sig(&mut self, item: ItemKey) -> Result<Option<FnSig<'w>>, Stop> {
-        let got = self.world.fn_sig(Self::seal(), item);
-        self.record(Question::FnSig(item), got)
+        let asked_at = self.stamp();
+                let got = self.world.fn_sig(Self::seal(), item);
+        self.record(Question::FnSig(item), got, asked_at)
     }
 
     pub fn predicates(&mut self, item: ItemKey) -> Result<Predicates<'w>, Stop> {
-        let got = self.world.predicates(Self::seal(), item);
-        self.record(Question::Predicates(item), got)
+        let asked_at = self.stamp();
+                let got = self.world.predicates(Self::seal(), item);
+        self.record(Question::Predicates(item), got, asked_at)
     }
 
     pub fn adt(&mut self, item: ItemKey) -> Result<Option<Adt<'w>>, Stop> {
-        let got = self.world.adt(Self::seal(), item);
-        self.record(Question::Adt(item), got)
+        let asked_at = self.stamp();
+                let got = self.world.adt(Self::seal(), item);
+        self.record(Question::Adt(item), got, asked_at)
     }
 
     pub fn impls_of(&mut self, trait_: ItemKey, shape: Shape) -> Result<&'w [ItemKey], Stop> {
-        let got = self.world.impls_of(Self::seal(), trait_, shape);
-        self.record(Question::ImplsOf(trait_, shape), got)
+        let asked_at = self.stamp();
+                let got = self.world.impls_of(Self::seal(), trait_, shape);
+        self.record(Question::ImplsOf(trait_, shape), got, asked_at)
     }
 
     /// An impl's header, checked where it enters: a trait impl's arguments after `Self` must
     /// number the trait's parameters besides `Self` (`CheckError::ImplTraitArity` names it).
     pub fn impl_header(&mut self, item: ItemKey) -> Result<Option<ImplHeader<'w>>, Stop> {
-        let got = self.world.impl_header(Self::seal(), item);
-        let h = self.record(Question::ImplHeader(item), got)?;
+        let asked_at = self.stamp();
+                let got = self.world.impl_header(Self::seal(), item);
+        let h = self.record(Question::ImplHeader(item), got, asked_at)?;
         if let Some(ImplHeader { trait_: Some(trait_), trait_args, .. }) = h {
             let Some(def) = self.trait_def(trait_)? else {
                 return Err(CheckError::Malformed(Malformed::NoRecord(Question::TraitDef(trait_))).into());
@@ -798,18 +836,21 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
     }
 
     pub fn inherent(&mut self, shape: Shape, name: Name) -> Result<&'w [AssocItem], Stop> {
-        let got = self.world.inherent(Self::seal(), shape, name);
-        self.record(Question::Inherent(shape, name), got)
+        let asked_at = self.stamp();
+                let got = self.world.inherent(Self::seal(), shape, name);
+        self.record(Question::Inherent(shape, name), got, asked_at)
     }
 
     pub fn assoc_item(&mut self, container: ItemKey, name: Name) -> Result<Option<AssocItem>, Stop> {
-        let got = self.world.assoc_item(Self::seal(), container, name);
-        self.record(Question::AssocItem(container, name), got)
+        let asked_at = self.stamp();
+                let got = self.world.assoc_item(Self::seal(), container, name);
+        self.record(Question::AssocItem(container, name), got, asked_at)
     }
 
     pub fn traits_in_scope(&mut self, scope: ScopeId) -> Result<&'w [ItemKey], Stop> {
-        let got = self.world.traits_in_scope(Self::seal(), scope);
-        self.record(Question::TraitsInScope(scope), got)
+        let asked_at = self.stamp();
+                let got = self.world.traits_in_scope(Self::seal(), scope);
+        self.record(Question::TraitsInScope(scope), got, asked_at)
     }
 
     pub fn resolve_path(
@@ -818,53 +859,63 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
         path: PathIdx,
         segments: &[Name],
     ) -> Result<Option<PathRes>, Stop> {
-        let got = self.world.resolve_path(Self::seal(), scope, path, segments);
-        self.record(Question::Path(scope, path), got)
+        let asked_at = self.stamp();
+                let got = self.world.resolve_path(Self::seal(), scope, path, segments);
+        self.record(Question::Path(scope, path), got, asked_at)
     }
 
     pub fn lang_item(&mut self, item: LangItem) -> Result<Option<ItemKey>, Stop> {
-        let got = self.world.lang_item(Self::seal(), item);
-        self.record(Question::Lang(item), got)
+        let asked_at = self.stamp();
+                let got = self.world.lang_item(Self::seal(), item);
+        self.record(Question::Lang(item), got, asked_at)
     }
 
     pub fn lang_path(&mut self, item: LangItem) -> Result<Option<Def>, Stop> {
-        let got = self.world.lang_path(Self::seal(), item);
-        self.record(Question::LangPath(item), got)
+        let asked_at = self.stamp();
+                let got = self.world.lang_path(Self::seal(), item);
+        self.record(Question::LangPath(item), got, asked_at)
     }
 
     pub fn const_value(&mut self, item: ItemKey) -> Result<Option<u64>, Stop> {
-        let got = self.world.const_value(Self::seal(), item);
-        self.record(Question::Const(item), got)
+        let asked_at = self.stamp();
+                let got = self.world.const_value(Self::seal(), item);
+        self.record(Question::Const(item), got, asked_at)
     }
 
     pub fn opaque_hidden(&mut self, item: ItemKey) -> Result<Option<Hidden<'w>>, Stop> {
-        let got = self.world.opaque_hidden(Self::seal(), item);
-        self.record(Question::Opaque(item), got)
+        let asked_at = self.stamp();
+                let got = self.world.opaque_hidden(Self::seal(), item);
+        self.record(Question::Opaque(item), got, asked_at)
     }
 
     pub fn attrs(&mut self, item: ItemKey) -> Result<TypeAttrs, Stop> {
-        let got = self.world.attrs(Self::seal(), item);
-        self.record(Question::Attrs(item), got)
+        let asked_at = self.stamp();
+                let got = self.world.attrs(Self::seal(), item);
+        self.record(Question::Attrs(item), got, asked_at)
     }
 
     pub fn trait_def(&mut self, trait_: ItemKey) -> Result<Option<TraitDef<'w>>, Stop> {
-        let got = self.world.trait_def(Self::seal(), trait_);
-        self.record(Question::TraitDef(trait_), got)
+        let asked_at = self.stamp();
+                let got = self.world.trait_def(Self::seal(), trait_);
+        self.record(Question::TraitDef(trait_), got, asked_at)
     }
 
     pub fn assoc_parent(&mut self, item: ItemKey) -> Result<Option<AssocParent>, Stop> {
-        let got = self.world.assoc_parent(Self::seal(), item);
-        self.record(Question::AssocParent(item), got)
+        let asked_at = self.stamp();
+                let got = self.world.assoc_parent(Self::seal(), item);
+        self.record(Question::AssocParent(item), got, asked_at)
     }
 
     pub fn const_holds(&mut self, cond: ItemKey, args: &[PTy], types: PTys<'_>) -> Result<ConstHolds, Stop> {
-        let got = self.world.const_holds(Self::seal(), cond, args, types);
-        self.record(Question::ConstHolds(cond, ground_args_digest(args, types)), got)
+        let asked_at = self.stamp();
+                let got = self.world.const_holds(Self::seal(), cond, args, types);
+        self.record(Question::ConstHolds(cond, ground_args_digest(args, types)), got, asked_at)
     }
 
     pub fn const_params(&mut self, item: ItemKey) -> Result<ConstParams<'w>, Stop> {
-        let got = self.world.const_params(Self::seal(), item);
-        self.record(Question::ConstParams(item), got)
+        let asked_at = self.stamp();
+                let got = self.world.const_params(Self::seal(), item);
+        self.record(Question::ConstParams(item), got, asked_at)
     }
 
     /// The test build's one backdoor: an ADT read that is not recorded. Only the planted bug

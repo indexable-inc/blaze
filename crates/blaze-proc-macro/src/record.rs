@@ -17,11 +17,15 @@
 //! The folder is `<store>/proc-macro/records/list/<id>`, the chain's slots (blaze-record's
 //! [`walk`]); a put never replaces bytes, and other bytes under a held key are refused.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
+use bstd::args::ArgList;
 use bstd::cx::Cx;
+use bstd::env::Vars;
 use bstd::fs::{Content, Dir, Durable, FsError, FsKind, ReadWrite};
-use bstd::mem::Bytes;
+use bstd::io::{Io, Limits, NativeWorld, OpenError};
+use bstd::mem::{Bytes, TASK_FRAME};
+use core::time::Duration;
 use bstd::path::Path as BPath;
 
 use blaze_expand::{
@@ -43,85 +47,95 @@ use crate::{
 const SEAL: &str = "blaze expansion record seal 1";
 const SEAL_LEN: usize = 32;
 
-/// Where a [`DirStore`]'s files live, its one effect seam (rule 78): [`OnDir`], the effect
-/// layer's directory, the end state; [`Ambient`], `std::fs` under a path, the interim form the
-/// callers still make (DEBT: goes when `blaze_expand::ExpandCx` hands a `Cx` to a run, so
-/// `ProcMacros` can hold an `OnDir`; NOTES.md of bstd-1116).
-pub trait RecordFiles {
-    /// The bytes at `name` (`list/<hex>`), none when nothing is there.
-    fn read(&self, name: &str) -> Result<Option<Vec<u8>>, FilesError>;
-    /// `name` made to hold `bytes`, replaced all at once for a reader (never a part), nothing
-    /// synced: after a power cut it holds what it held, or any prefix of `bytes`.
-    fn publish(&self, name: &str, bytes: &[u8]) -> Result<(), FilesError>;
-}
+/// How long one record read or publish may take (rule 18): a record is a small file, so a
+/// minute is a hang, failed by the effect layer naming the record.
+const RECORD_BUDGET: Duration = Duration::from_secs(60);
 
-/// The effect layer's directory under a task's context: the records' end-state home.
-pub struct OnDir<'c> {
-    pub cx: &'c Cx,
+/// The records' one home: a directory of the effect layer, with the world it came from.
+///
+/// It holds the world (`Io`), not a task's `Cx`: a `Cx` is one task's and not `Sync`, while
+/// the store is shared by every worker expanding, and `blaze_expand::ExpandCx::run_proc_macro`
+/// hands no `Cx` down (its 25 implementors sit in six lanes' crates). So each read or publish
+/// is its own root context from this world, ending [`RECORD_BUDGET`] from its start: the
+/// authority is passed in (rule 75); what it lacks is the caller's cancel (DEBT: when a run
+/// carries its task's `Cx`, it takes that one; NOTES.md of bstd-1116).
+pub struct OnDir {
+    pub io: Io,
     pub dir: Dir<ReadWrite>,
 }
 
-impl RecordFiles for OnDir<'_> {
-    fn read(&self, name: &str) -> Result<Option<Vec<u8>>, FilesError> {
-        let path = BPath::new(name).map_err(|_| FilesError::Name { name: name.to_owned() })?;
-        let mut into = Bytes::new_in(self.cx.frame(), "an expansion record read back");
-        match self.dir.read_all(self.cx, &path, &mut into) {
+impl OnDir {
+    fn path(name: &RecordName) -> Result<BPath, FilesError> {
+        BPath::new(name.as_str()).map_err(|_| FilesError::Name { name: *name })
+    }
+
+    fn cx(&self, name: &RecordName) -> Result<Cx, FilesError> {
+        self.io.cx(RECORD_BUDGET, TASK_FRAME).map_err(|_| FilesError::Stopped { name: *name })
+    }
+
+    /// The bytes at `name`, none when nothing is there.
+    fn read(&self, name: &RecordName) -> Result<Option<Vec<u8>>, FilesError> {
+        let cx = self.cx(name)?;
+        let mut into = Bytes::new_in(cx.frame(), "an expansion record read back");
+        match self.dir.read_all(&cx, &Self::path(name)?, &mut into) {
             Ok(_) => Ok(Some(into.as_slice().to_vec())),
             Err(error) if error.kind == FsKind::NotFound => Ok(None),
             Err(error) => Err(FilesError::Effect(error)),
         }
     }
 
-    fn publish(&self, name: &str, bytes: &[u8]) -> Result<(), FilesError> {
-        let path = BPath::new(name).map_err(|_| FilesError::Name { name: name.to_owned() })?;
-        self.dir.publish(self.cx, &path, Content::bytes(bytes), Durable::No).map(|_| ()).map_err(FilesError::Effect)
+    /// `name` made to hold `body` then `seal`, replaced all at once for a reader (never a
+    /// part), nothing synced: after a power cut it holds what it held, or a torn part.
+    fn publish(&self, name: &RecordName, body: &[u8], seal: &[u8; SEAL_LEN]) -> Result<(), FilesError> {
+        let cx = self.cx(name)?;
+        let mut whole = Bytes::new_in(cx.frame(), "an expansion record and its seal");
+        whole.try_extend(body).and_then(|()| whole.try_extend(seal)).map_err(|_| FilesError::Stopped { name: *name })?;
+        self.dir.publish(&cx, &Self::path(name)?, Content::bytes(whole.as_slice()), Durable::No).map(|_| ()).map_err(FilesError::Effect)
     }
 }
 
-/// `std::fs` under a folder: the interim form (DEBT, see [`RecordFiles`]); the same records,
-/// sealed and checked as [`OnDir`]'s, so only the effect route differs.
-pub struct Ambient {
-    root: PathBuf,
-}
-
-impl RecordFiles for Ambient {
-    fn read(&self, name: &str) -> Result<Option<Vec<u8>>, FilesError> {
-        let path = self.root.join(name);
-        match std::fs::read(&path) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(FilesError::Ambient { path, error }),
-        }
-    }
-
-    fn publish(&self, name: &str, bytes: &[u8]) -> Result<(), FilesError> {
-        let path = self.root.join(name);
-        let ambient = |error| FilesError::Ambient { path: path.clone(), error };
-        let dir = path.parent().unwrap_or(&self.root);
-        std::fs::create_dir_all(dir).map_err(ambient)?;
-        let staging = dir.join(format!(".{}.{}", std::process::id(), path.file_name().and_then(|it| it.to_str()).unwrap_or("record")));
-        std::fs::write(&staging, bytes).map_err(ambient)?;
-        std::fs::rename(&staging, &path).map_err(ambient)
-    }
+/// A world over the folder `store` for a program's start (an example, a test), and that
+/// folder, its root. A command's driver hands its own world instead.
+pub fn native_world(store: &Path) -> Result<(Io, Dir<ReadWrite>), FilesError> {
+    let io = Io::native(NativeWorld {
+        root: store,
+        threads: 1,
+        env: Vars::given(Vec::new()),
+        args: ArgList::given(Vec::new()),
+        host_name: std::sync::Arc::from(""),
+        seed: Some(0),
+        above: 0,
+        limits: Limits::USUAL,
+    })
+    .map_err(FilesError::World)?;
+    let root = io.need_fs().map_err(|_| FilesError::NoTree)?.root();
+    Ok((io, root))
 }
 
 /// A record file that could not be read or written, naming it.
 #[derive(Debug)]
 pub enum FilesError {
-    Ambient { path: PathBuf, error: std::io::Error },
+    /// The world over the store's folder could not be opened (the names examples' wrapper).
+    World(OpenError),
+    /// The world has no file tree to hold the records.
+    NoTree,
     Effect(FsError),
     /// A record's name the effect layer refuses as a path.
-    Name { name: String },
+    Name { name: RecordName },
     /// `name` holds a whole record of other bytes than the put's (rule 21).
-    OtherBytes { name: String },
+    OtherBytes { name: RecordName },
+    /// The task's frame refused the bytes of `name`'s record.
+    Stopped { name: RecordName },
 }
 
 impl std::fmt::Display for FilesError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FilesError::Ambient { path, error } => write!(f, "the record {}: {error}", path.display()),
+            FilesError::World(error) => write!(f, "the records' folder: {error}"),
+            FilesError::NoTree => f.write_str("the records' world has no file tree"),
             FilesError::Effect(error) => write!(f, "a record: {error}"),
-            FilesError::Name { name } => write!(f, "the record name {name:?} is no path under the store"),
+            FilesError::Name { name } => write!(f, "the record name {name} is no path under the store"),
+            FilesError::Stopped { name } => write!(f, "the record {name}: the task's frame refused its bytes"),
             FilesError::OtherBytes { name } => write!(f, "the record {name} holds other bytes than its put's (rule 21)"),
         }
     }
@@ -137,51 +151,89 @@ pub enum RecordPlant {
 
 /// The folder store of records: each file the record's bytes then their [`SEAL`], published
 /// whole (a reader sees all or none) and taken back only when the seal matches.
-pub struct DirStore<F: RecordFiles = Ambient> {
-    files: F,
+pub struct DirStore {
+    files: OnDir,
     tally: Tally,
     plant: RecordPlant,
 }
 
 impl DirStore {
-    /// The expansion records, under `<store>/proc-macro/records`.
+    /// The expansion records, `proc-macro/records` beneath the store's folder `store`.
+    pub fn expansions(io: &Io, store: &Dir<ReadWrite>) -> DirStore {
+        DirStore::within(io, store, "proc-macro/records")
+    }
+
+    /// The build scripts' records, `build-script/records` beneath the store's folder `store`.
+    pub fn build_scripts(io: &Io, store: &Dir<ReadWrite>) -> DirStore {
+        DirStore::within(io, store, "build-script/records")
+    }
+
+    fn within(io: &Io, store: &Dir<ReadWrite>, at: &'static str) -> DirStore {
+        let at = BPath::new(at).expect("a records folder's name is a relative path by construction");
+        // clone: the world, a refcount.
+        DirStore::on(OnDir { io: io.clone(), dir: store.subdir(&at) }, RecordPlant::None)
+    }
+
+    /// The expansion records under `<store>/proc-macro/records`, over a world opened here.
+    /// DEBT, for removal: kept only for the names lane's examples (blaze-real
+    /// examples/names_load, blaze-world examples/names.rs), which hand no world; every other
+    /// caller makes [`DirStore::expansions`] from its own.
     pub fn new(store: &Path) -> DirStore {
-        DirStore::at(store, "proc-macro/records")
+        match native_world(store) {
+            Ok((io, root)) => DirStore::expansions(&io, &root),
+            Err(error) => panic!("the expansion records at {}: {error}", store.display()),
+        }
     }
 
-    /// Records of another kind of run under `<store>/<within>` (`build-script/records`).
-    pub fn at(store: &Path, within: &str) -> DirStore {
-        DirStore::on(Ambient { root: store.join(within) }, RecordPlant::None)
-    }
-}
-
-impl<F: RecordFiles> DirStore<F> {
     /// The store over `files`; `plant` is [`RecordPlant::None`] but in the simulation.
-    pub fn on(files: F, plant: RecordPlant) -> DirStore<F> {
+    pub fn on(files: OnDir, plant: RecordPlant) -> DirStore {
         DirStore { files, tally: Tally::default(), plant }
     }
 
-    fn name(kind: Kind, key: &ContentId) -> String {
-        let kind = match kind {
-            Kind::List => "list/",
-            Kind::Answer => "answer/",
+    fn name(kind: Kind, key: &ContentId) -> RecordName {
+        let kind: &[u8] = match kind {
+            Kind::List => b"list/",
+            Kind::Answer => b"answer/",
         };
-        let mut name = String::with_capacity(kind.len() + 64);
-        name.push_str(kind);
+        let mut name = RecordName { bytes: [0; 71], len: 0 };
+        name.bytes[..kind.len()].copy_from_slice(kind);
+        let mut at = kind.len();
         for byte in key.0 {
-            name.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
-            name.push(char::from_digit(u32::from(byte & 15), 16).unwrap_or('0'));
+            name.bytes[at] = b"0123456789abcdef"[usize::from(byte >> 4)];
+            name.bytes[at + 1] = b"0123456789abcdef"[usize::from(byte & 15)];
+            at += 2;
         }
+        name.len = at as u8;
         name
     }
 }
 
-impl<F: RecordFiles> Store for DirStore<F> {
+/// A record's file name, `list/<64 hex>` or `answer/<64 hex>`, inline: no allocation a lookup.
+#[derive(Clone, Copy, Debug)]
+pub struct RecordName {
+    bytes: [u8; 71],
+    len: u8,
+}
+
+impl RecordName {
+    pub fn as_str(&self) -> &str {
+        core::str::from_utf8(&self.bytes[..usize::from(self.len)]).expect("a record name is ASCII by construction")
+    }
+}
+
+impl std::fmt::Display for RecordName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Store for DirStore {
     type Held = Vec<u8>;
     type Error = FilesError;
 
     fn get(&self, kind: Kind, key: &ContentId) -> Result<Option<Vec<u8>>, FilesError> {
         let Some(mut bytes) = self.files.read(&Self::name(kind, key))? else { return Ok(None) };
+        // A torn file (any prefix of a publish, or zeros where a sector was lost) is a miss.
         let Some(body_len) = bytes.len().checked_sub(SEAL_LEN) else { return Ok(None) };
         let sealed = ContentId::of(SEAL, &bytes[..body_len]).0 == bytes[body_len..];
         if !sealed && self.plant != RecordPlant::SealSkipped {
@@ -196,10 +248,7 @@ impl<F: RecordFiles> Store for DirStore<F> {
         if let Some(held) = self.get(kind, &key)? {
             return if held == bytes { Ok(()) } else { Err(FilesError::OtherBytes { name }) };
         }
-        let mut sealed = Vec::with_capacity(bytes.len() + SEAL_LEN);
-        sealed.extend_from_slice(bytes);
-        sealed.extend_from_slice(&ContentId::of(SEAL, bytes).0);
-        self.files.publish(&name, &sealed)
+        self.files.publish(&name, bytes, &ContentId::of(SEAL, bytes).0)
     }
 
     fn bytes(held: &Vec<u8>) -> &[u8] {
@@ -664,10 +713,10 @@ fn current(list: ListRef<'_>, package: &Package, valued: &mut u64) -> Result<boo
 
 /// The answer of `base` under what its reads are in `package` now, decoded in `alloc`. A hit
 /// on the base's first list is one read of one file: the list holds the answer.
-pub fn find<'a, F: RecordFiles>(store: &DirStore<F>, base: &ContentId, package: &Package, edition: Edition, alloc: Alloc<'a>) -> Result<Option<Produced<'a>>, RecordError> {
+pub fn find<'a>(store: &DirStore, base: &ContentId, package: &Package, edition: Edition, alloc: Alloc<'a>) -> Result<Option<Produced<'a>>, RecordError> {
     let corrupt = |Corrupt(what)| RecordError::Corrupt { base: *base, what };
     let mut valued = 0;
-    let walked = walk::<DirStore<F>, Produced<'a>, RecordError, _>(store, Bounds::STANDARD, base, |_at, _bytes, list| {
+    let walked = walk::<DirStore, Produced<'a>, RecordError, _>(store, Bounds::STANDARD, base, |_at, _bytes, list| {
         if !current(list, package, &mut valued).map_err(corrupt)? {
             return Ok(None);
         }
@@ -683,14 +732,14 @@ pub fn find<'a, F: RecordFiles>(store: &DirStore<F>, base: &ContentId, package: 
 /// Keeps `produced` under `base`: one read-list naming its reads, whose note holds the digest
 /// each had and the answer. A list of the same reads and digests with another answer already
 /// under `base` is refused ([`RecordError::TwoAnswers`]).
-pub fn keep<F: RecordFiles>(store: &DirStore<F>, base: ContentId, produced: &Produced<'_>) -> Result<(), RecordError> {
+pub fn keep(store: &DirStore, base: ContentId, produced: &Produced<'_>) -> Result<(), RecordError> {
     let reads = &produced.reads;
     let list = record_bytes(base, produced)?;
     let mine = ListRef::open(&list, &base).map_err(|why| blaze_record::Error::List { at: blaze_record::Slot { generation: 0, n: 0 }, why })?;
     // The note's head, the layout and the digests: equal heads under equal reads are one
     // key's two values when the rest differs.
     let head = 4 + reads.list().iter().map(|read| if matches!(read.answer, ReadAnswer::Digest(_)) { 33 } else { 1 }).sum::<usize>();
-    let walked = walk::<DirStore<F>, (), RecordError, _>(store, Bounds::STANDARD, &base, |_at, _bytes, held| {
+    let walked = walk::<DirStore, (), RecordError, _>(store, Bounds::STANDARD, &base, |_at, _bytes, held| {
         let same_reads = held.len() == mine.len() && held.reads().eq(mine.reads());
         let same_head = held.note().get(..head) == mine.note().get(..head);
         Ok((same_reads && same_head && held.note() != mine.note()).then_some(()))

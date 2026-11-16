@@ -22,6 +22,8 @@ blaze-drive.workspace = true
 blaze-std.workspace = true
 # `outline`: a file's text to its items, the `FileItems` task's work.
 blaze-file-items.workspace = true
+# A body's parse for its `BodyCheck` task: the entry blaze-lower's `lower_body` parses with.
+parser.workspace = true
 # `Edition`, `ItemDetail`, `ItemKind`: the outline's value types.
 blaze-surface.workspace = true
 # `BlazeEdition`: the one home of the blaze editions' spellings (std.md, "The blaze edition").
@@ -39,6 +41,10 @@ blaze-ladder.workspace = true
 # The shared cache's read path (remote-read.md): a named origin folder read by range, checked
 # against a signed head. Without `bucket`: no HTTP client, no TLS, in this binary's graph.
 blaze-remote = { workspace = true, default-features = false }
+# An `http://` origin (store.rs `HttpOrigin`): blaze-h1's HTTP/1.1 core run by blaze-h1-net on
+# bstd's `Net`: ranged GETs, bounded replies, no TLS stack.
+blaze-h1.workspace = true
+blaze-h1-net.workspace = true
 # The findings' frames, their wording table and the closing line (blaze_report::frame).
 blaze-report.workspace = true
 # The workspace's layout (`layout::Layout`), sans-IO: members, targets, dependencies, each on its
@@ -82,6 +88,11 @@ sandbox = ["blaze-proc-macro/runtime"]
 [dev-dependencies]
 # `check` and `control`: the sweep's simulation and its planted-bug control.
 blaze-sim.workspace = true
+# The HTTP origin's test publishes a signed origin (`read::publish`, behind `sign`) of segments
+# sealed by blaze-cas.
+blaze-remote = { workspace = true, default-features = false, features = ["sign"] }
+blaze-cas.workspace = true
+blaze-keyed.workspace = true
 
 [lints]
 workspace = true

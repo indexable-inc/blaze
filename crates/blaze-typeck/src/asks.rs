@@ -55,6 +55,128 @@ pub(crate) struct Cursor {
     pub ground_goal: bool,
 }
 
+/// The question kinds the tally counts apart, in [`Question`]'s declaration order.
+pub const QUESTION_KINDS: [&str; 18] = [
+    "FnSig",
+    "Predicates",
+    "Adt",
+    "ImplsOf",
+    "ImplHeader",
+    "Inherent",
+    "AssocItem",
+    "TraitsInScope",
+    "Path",
+    "Lang",
+    "LangPath",
+    "Const",
+    "Opaque",
+    "Attrs",
+    "TraitDef",
+    "AssocParent",
+    "ConstHolds",
+    "ConstParams",
+];
+
+/// The index of `q`'s kind in [`QUESTION_KINDS`].
+pub const fn question_kind(q: Question) -> usize {
+    match q {
+        Question::FnSig(_) => 0,
+        Question::Predicates(_) => 1,
+        Question::Adt(_) => 2,
+        Question::ImplsOf(..) => 3,
+        Question::ImplHeader(_) => 4,
+        Question::Inherent(..) => 5,
+        Question::AssocItem(..) => 6,
+        Question::TraitsInScope(_) => 7,
+        Question::Path(..) => 8,
+        Question::Lang(_) => 9,
+        Question::LangPath(_) => 10,
+        Question::Const(_) => 11,
+        Question::Opaque(_) => 12,
+        Question::Attrs(_) => 13,
+        Question::TraitDef(_) => 14,
+        Question::AssocParent(_) => 15,
+        Question::ConstHolds(..) => 16,
+        Question::ConstParams(_) => 17,
+    }
+}
+
+/// The ask log's summary form: the same seam (`Reads::record`) counts what a run asked and
+/// what the answers cost instead of listing every ask, so it can stay on for a whole crate.
+/// Summed over every check it is passed to (a caller diffs two copies for one body). Times are
+/// read from the caller's clock (rule 75); none of this is an input to any answer.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Tally {
+    /// Checks run (a body's rounds: each `Outcome::Need` is followed by another check).
+    pub checks: u64,
+    /// Questions asked of the world, by [`QUESTION_KINDS`].
+    pub asks: [u64; 18],
+    /// Questions the world had no answer for.
+    pub missing: u64,
+    /// Record tables converted into the solver's facts (one per answer with a table).
+    pub conversions: u64,
+    /// Table entries converted into solver terms.
+    pub entries_converted: u64,
+    /// Table entries the answers' own roots reach (each counted once per conversion).
+    pub entries_reached: u64,
+    /// Table entries offered with the answers (the tables' lengths, summed per conversion).
+    pub entries_offered: u64,
+    /// Time inside the world's answers.
+    pub world_ns: u64,
+    /// Time hashing answers into the read list.
+    pub hash_ns: u64,
+    /// Time converting answers' tables into solver facts.
+    pub convert_ns: u64,
+    /// Time inside the checks, all of the above included.
+    pub check_ns: u64,
+}
+
+impl Tally {
+    /// Adds `o` into `self`.
+    pub fn add(&mut self, o: &Tally) {
+        self.checks += o.checks;
+        for (a, b) in self.asks.iter_mut().zip(o.asks.iter()) {
+            *a += *b;
+        }
+        self.missing += o.missing;
+        self.conversions += o.conversions;
+        self.entries_converted += o.entries_converted;
+        self.entries_reached += o.entries_reached;
+        self.entries_offered += o.entries_offered;
+        self.world_ns += o.world_ns;
+        self.hash_ns += o.hash_ns;
+        self.convert_ns += o.convert_ns;
+        self.check_ns += o.check_ns;
+    }
+
+    /// `self - earlier`: what happened between two readings of one tally.
+    pub fn since(&self, earlier: &Tally) -> Tally {
+        let mut asks = [0u64; 18];
+        for (i, a) in asks.iter_mut().enumerate() {
+            *a = self.asks[i] - earlier.asks[i];
+        }
+        Tally {
+            checks: self.checks - earlier.checks,
+            asks,
+            missing: self.missing - earlier.missing,
+            conversions: self.conversions - earlier.conversions,
+            entries_converted: self.entries_converted - earlier.entries_converted,
+            entries_reached: self.entries_reached - earlier.entries_reached,
+            entries_offered: self.entries_offered - earlier.entries_offered,
+            world_ns: self.world_ns - earlier.world_ns,
+            hash_ns: self.hash_ns - earlier.hash_ns,
+            convert_ns: self.convert_ns - earlier.convert_ns,
+            check_ns: self.check_ns - earlier.check_ns,
+        }
+    }
+}
+
+/// A tally being kept, with the clock it reads.
+pub(crate) struct Tallying<'w> {
+    pub tally: &'w mut Tally,
+    pub clock: &'w dyn Clock,
+}
+
 /// The order in which a cold body's records arrive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Order {

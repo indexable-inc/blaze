@@ -55,8 +55,12 @@ pub enum Gap {
     Lang(tc::LangItem, &'static str),
     /// A const's value, an opaque type's hidden type, a `where const` condition's value.
     BodyRecord(tc::Question),
-    /// A type alias named in a body path.
+    /// A type alias named in a body path whose aliased type is no path `Def` (an ADT with
+    /// arguments other than the alias's own parameters in order: `type A<T> = B<T, X>`): the
+    /// checker's `Def` has no form for a type with its arguments fixed.
     TypeAlias(LibKey),
+    /// A type alias named in a body path whose head was refused: the alias and why.
+    AliasHead(LibKey, Box<str>),
     /// An associated type of an impl, asked as an associated item (its key is not made yet).
     ImplAssocType(ItemKey, Name),
     /// A name the body's lowering holds no text for.
@@ -87,7 +91,8 @@ impl core::fmt::Display for Gap {
             Gap::Lang(item, why) => write!(f, "the path of lang item {item:?}: {why}"),
             Gap::BuiltinTypePath(p) => write!(f, "the body path `{p}` starts at a built-in type; the checker's `Def` has no primitive type to resolve it on"),
             Gap::BodyRecord(q) => write!(f, "the body record {q:?} (a const's value, a hidden type, a condition) is not made yet"),
-            Gap::TypeAlias(k) => write!(f, "the type alias {k:x} named in a body path is not taken yet"),
+            Gap::TypeAlias(k) => write!(f, "the type alias {k:x} named in a body path aliases a type with fixed arguments; the checker's `Def` has no form for it"),
+            Gap::AliasHead(k, why) => write!(f, "the type alias {k:x} named in a body path has a refused head: {why}"),
             Gap::ImplAssocType(k, n) => write!(f, "the associated type {n:?} of impl {k:?} has no key yet"),
             Gap::Unspelled(u) => write!(f, "the body names {:?}, whose text its lowering does not hold", u.0),
             Gap::Resolve(e) => write!(f, "{e}"),
@@ -184,7 +189,8 @@ impl<'w, 'n> BodyWorld<'w, 'n> {
     /// The gap of a candidate impl whose header failed: unread as written, else refused.
     fn failed_impl(&self, k: LibKey, why: &str) -> Gap {
         match self.buckets.is_some_and(|b| b.is_unread(k)) {
-            true => Gap::UnreadImpl(k, why.into()),
+            // The place leads the why: a census cuts the text, and the impl is to be found.
+            true => Gap::UnreadImpl(k, format!("at {}: {why}", item_place(self.names, k)).into_boxed_str()),
             false => Gap::RefusedImpl { impl_: k, place: item_place(self.names, k), why: why.into() },
         }
     }

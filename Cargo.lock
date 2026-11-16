@@ -403,13 +403,17 @@ dependencies = [
 name = "blaze-cli"
 version = "0.0.0"
 dependencies = [
+ "blaze-cas",
  "blaze-core",
  "blaze-drive",
  "blaze-fetch",
  "blaze-file-items",
+ "blaze-h1",
+ "blaze-h1-net",
  "blaze-http",
  "blaze-id",
  "blaze-ids",
+ "blaze-keyed",
  "blaze-ladder",
  "blaze-manifest",
  "blaze-mem",
@@ -426,6 +430,7 @@ dependencies = [
  "blaze-unit-graph",
  "blaze-world",
  "edition",
+ "parser",
 ]
 
 [[package]]
@@ -794,6 +799,7 @@ version = "0.0.0"
 dependencies = [
  "blaze-h1",
  "blaze-own",
+ "blaze-sim",
  "blaze-std",
 ]
 

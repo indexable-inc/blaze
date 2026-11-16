@@ -53,7 +53,7 @@ use blaze_own::Alloc;
 
 pub use infer::{InferCtx, InferSnapshot};
 pub use instance::{ResolveError, Resolved, resolve_instance, select_impl};
-pub use asks::{Ask, AskLog, Clock, Order, R_THRESHOLD, Restarts, entries_histogram, restarts};
+pub use asks::{Ask, AskLog, Clock, Order, QUESTION_KINDS, R_THRESHOLD, Restarts, Tally, entries_histogram, question_kind, restarts};
 pub use body::{
     Anchor, Arm, BinOp, BindAnn, BodyPath, BodyView, Capture, CoroutineKind, Expr, FieldInit, FieldPat, FmtTrait, FmtUse,
     IntSuffix, Lit, Pat, Segment, Stmt, UnOp,
@@ -126,6 +126,29 @@ pub fn check_logged<'a, 'w, W: World, C: TypeCtx>(
     let (o, log) = run(body, reads, ty, hints, Plant::None, alloc)?;
     let log = log.ok_or(CheckError::Malformed(Malformed::HoleInAnswer))?;
     Ok((o, log))
+}
+
+/// `check` that also adds what it asked and what the answers cost into `tally` (asks.rs
+/// `Tally`), reading `clock`. The outcome equals `check`'s.
+pub fn check_counted<'a, 'w, W: World, C: TypeCtx>(
+    body: &BodyView<'_>,
+    world: &'w W,
+    ty: &mut C,
+    hints: &Needs<'_>,
+    tally: &'w mut Tally,
+    clock: &'w dyn Clock,
+    alloc: Alloc<'a>,
+) -> Result<Outcome<'a>, CheckError> {
+    let start = clock.now_ns();
+    let mut mine = Tally::default();
+    let out = {
+        let reads = Reads::counted_in(world, &mut mine, clock, alloc);
+        run(body, reads, ty, hints, Plant::None, alloc).map(|(o, _)| o)
+    };
+    mine.checks = 1;
+    mine.check_ns = clock.now_ns().saturating_sub(start);
+    tally.add(&mine);
+    out
 }
 
 fn run<'a, 'w, W: World, C: TypeCtx>(

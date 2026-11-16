@@ -127,6 +127,17 @@ pub enum BuildOrder {
 /// records it needs. The records are answered from `r.store`'s table, which holds no body's
 /// type: a body's check reads the same records whatever was checked before it.
 pub fn check_body(r: &mut Records<'_, '_>, body: &Body<'_>, scope: &BodyScope<'_>) -> Result<tc::Checked<'static>, CheckFail> {
+    check_body_counted(r, body, scope, None)
+}
+
+/// `check_body` that adds each round's questions and costs into a tally (blaze-typeck asks.rs
+/// `Tally`), reading the caller's clock: a measurement, never an input to the outcome.
+pub fn check_body_counted(
+    r: &mut Records<'_, '_>,
+    body: &Body<'_>,
+    scope: &BodyScope<'_>,
+    mut count: Option<(&mut tc::Tally, &dyn tc::Clock)>,
+) -> Result<tc::Checked<'static>, CheckFail> {
     let owner = body.typeck.owner;
     let mut hints = Needs::new_in(Alloc::global());
     let mut all_gaps: Vec<Gap, Global> = Vec::new_in(Global);
@@ -134,7 +145,11 @@ pub fn check_body(r: &mut Records<'_, '_>, body: &Body<'_>, scope: &BodyScope<'_
         let view: BodyView<'_> = body.typeck.view(body.tys.view());
         let world = world_at(r, scope);
         let mut cx = InferCtx::new_in(Alloc::global());
-        let out = tc::check(&view, &world, &mut cx, &hints, Alloc::global()).map_err(|error| CheckFail::Check { owner, error })?;
+        let out = match &mut count {
+            Some((tally, clock)) => tc::check_counted(&view, &world, &mut cx, &hints, tally, *clock, Alloc::global()),
+            None => tc::check(&view, &world, &mut cx, &hints, Alloc::global()),
+        }
+        .map_err(|error| CheckFail::Check { owner, error })?;
         let mut fills = world.fills.into_inner();
         if r.order == BuildOrder::Reversed {
             fills.reverse();

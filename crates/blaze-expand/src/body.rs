@@ -167,7 +167,7 @@ pub fn body_words<'a>(stream: &TokenStream<'_>, this: ContentId, alloc: Alloc<'a
         // back by the path reader wherever the body is resolved. The same text through any
         // number of nested expansions: the mark is the expansion that wrote the token.
         match (token.kind, stream.hygiene(token.ctx).mark) {
-            (TokenKind::Ident { .. }, Some(mark)) if stream.text_of(token) == "$crate" && core::hint::black_box(false) => {
+            (TokenKind::Ident { .. }, Some(mark)) if stream.text_of(token) == "$crate" => {
                 use core::fmt::Write as _;
                 // An `AString` takes every write.
                 let _ = write!(text, "{}", blaze_surface::DollarCrate(mark.site.krate));

@@ -286,8 +286,19 @@ The machine store's counts are profile rows now (`machine found .. written ..; p
 whole ..` in `.blaze/v2/profile.txt`), not a stderr line: `a_clean_run_says_nothing_of_its_own`
 "1 passed, 0 failed".
 
+**Measured** (release `blaze-shared`, greenmix 2447ae6fec, `exp2.sh`: home a sibling of the
+projects, never beneath the start; load 52 to 55, so times are not comparable with e2's):
+- e3 (hello): A cold `37 runs, 20 store reads (0 found)`, 10604.145 ms; B cold `9 runs, 33 store
+  reads (27 found)`, 48.974 ms, 104,481,536 bytes; no "machine store off" line; the home holds
+  `v2/shared/becd65ae35c954f6` and `boot`. B again: `0 runs`, 1.280 ms, profile row
+  `machine found 0 written 0; packs 1 read whole 0`.
+- e4 (hello + cfg-if 1.0.4 from the registry): A cold "names resolved for 16 crates", `42 runs`,
+  4575.374 ms, 701,761,072 bytes; B cold `11 runs, 36 store reads (29 found)`, 238.628 ms,
+  109,593,704 bytes, and NO names line: cfg-if's records came from the machine store too.
+
 **Next, in order:**
-0. MEASURE (not done: the first greenmix waited 1200 s on the build lock; a second was started
+0. MEASURE what is left (the whole-pack read's share: B cold in a NEW boot against the same
+   boot; and at low load). Earlier note, kept: (not done: the first greenmix waited 1200 s on the build lock; a second was started
    at hand-on and keeps its binary as `blaze-shared`): `port27/shared-1116/exp2.sh e3
    <blaze-shared> proto` and `exp2.sh e4 <blaze-shared> proto-cfg` (a home beside, not under,
    the projects; `check .` from inside each; b run twice). Quote: no "machine store off" line;
@@ -306,6 +317,47 @@ whole ..` in `.blaze/v2/profile.txt`), not a stderr line: `a_clean_run_says_noth
    per key, the misses as ONE `fetch(reader, origin, clock, &missed, alloc)`, then `got` for
    each key in the order asked, which steps `Event::Got`. Floor 5 origin reads where
    one-at-a-time gets make 19.
+
+## HTTP in the tree (third runner, 2026-11-16: facts by search)
+
+1. bstd `Net` (blaze-std/src/net.rs:216) is blaze-core effects: `connect` (`Effect::Connect`),
+   `Conn::send_all`/`recv`/`finish`, `listen`/`accept`, `connect_only` narrowing, `limit` byte
+   budgets, `roots` (`Effect::Roots`, :322). Waits end at the `Cx`'s deadline (`cx.until`). The
+   simulation runs sockets (blaze-core/src/sim.rs:2966 `Listen`, :2995 `Connect`).
+2. blaze-h1 is the one HTTP/1.1 core, sans-IO, `no_std`: `write_request`, `Response` fed in
+   pieces under `Limits`, `Response::ranged` (the `Content-Range` check), `Follow`/`Redirects`.
+3. Its drivers over bstd `Net`: blaze-h1-net `Client::send` (one request a connection, ranges
+   checked, redirects by policy, `Tls` seam with `NoTls`; no caller before this leg) and bstd
+   `requests::Http::over` (blaze-std/src/requests.rs:306, behind bstd's `net` feature; one
+   request a connection, no redirects, no ranges, `https` refused).
+4. blaze-http `Client` (client.rs) is a second machine ABOVE blaze-h1 (client.rs:42, :61 use
+   `blaze_h1::Response`, `write_request`): pool, keep-alive, redirects, gzip, proxies, rustls
+   sans-IO with roots from `blaze_core::trust::system` (roots.rs:49). It does not call
+   `ranged`. Its `driver::Loop` is sans-IO over blaze-core `Effect`s; it leaves bstd's `Io` at
+   `Handle::spawn` (driver.rs:620: its own thread and its own `effects::native` driver) and
+   `proxy_env.rs:14` (`std::env::var_os`). `h3/mod.rs:88` `std::net::SocketAddr` is a type only.
+5. blaze-fetch is sans-IO (`Effect::Http`, fetch.rs:128); its `FetchIo` is blaze-cli
+   fetch.rs:418 over `blaze_http::driver::Handle::spawn` (fetch.rs:571), roots by
+   `blaze_http::roots::system` (:569), waits in `mailbox::block_on` (:472): off bstd's `Io`.
+6. blaze-remote `http.rs`/`http3.rs` (`Bucket` over blaze-http, S3 and HTTP/3) are behind its
+   `bucket` feature (lib.rs:108); blaze-cli takes blaze-remote with `default-features = false`:
+   not in the binary, not live from the command. The read path's `Origin` had one live form,
+   the folder (blaze-cli store.rs `FolderOrigin`).
+
+**The duplicate (for the coordinator; nothing deleted).** One parser already (blaze-h1); the
+duplication is three drivers of it: blaze-h1-net (newest, 2026-11-15; on `Net`; checks ranges;
+TLS a seam, none written), bstd `Http::over` (on `Net`; a capability with sim/handler
+providers; no ranges/redirects), blaze-http `Client`+`driver` (oldest, 2026-11-04; has pool,
+gzip, proxies, rustls TLS, a byte-level test suite; no range check; own thread off bstd).
+Proposed one home: blaze-http's `Client` machine (it has what a real fetch needs: TLS, pool,
+redirects) gains the `ranged` check and is run by ONE driver on bstd `Net` (the `Http::over`
+provider), its `Handle::spawn` thread and blaze-h1-net deleted; until then the origin rides
+blaze-h1-net, the only driver on `Net` with ranges.
+
+**Built here: the origin over HTTP is an adapter.** blaze-cli store.rs `HttpOrigin` implements
+`Origin` with blaze-h1-net `Client::send`: a ranged GET of `<base>/<digest-hex name>` per ask,
+`Limits.most_body` the ask's length, redirects `most: 0` (a 3xx is `RedirectsOver`), the
+ask's deadline as `cx.until`, `Net::connect_only(origin)`; `--origin http://host:port/prefix`.
 
 ## Not built
 

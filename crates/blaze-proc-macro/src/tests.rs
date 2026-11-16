@@ -24,6 +24,12 @@ use crate::{
 
 const EDITION: Edition = Edition::E2024;
 
+/// The expansion records under the folder `store`, through a world over that folder.
+fn records_at(store: &Path) -> DirStore {
+    let (io, root) = crate::record::native_world(store).unwrap_or_else(|error| panic!("the records at {}: {error}", store.display()));
+    DirStore::expansions(&io, &root)
+}
+
 /// A fresh folder under the system's temporary one, by this process and a count.
 fn folder(name: &str) -> PathBuf {
     // One count for the process: tests run on several threads at once.
@@ -351,7 +357,7 @@ enum Plant {
 fn invalidation(setup: &Setup, tape: &Tape, plant: Plant) -> Result<(), Broke> {
     let harness = |e: &dyn std::fmt::Debug| Broke::Harness(format!("{e:?}"));
     let root = folder("ws");
-    let store = DirStore::new(&folder("records"));
+    let store = records_at(&folder("records"));
     let mut values = [0u8; 4];
     for value in &mut values {
         *value = tape.int_in(0u8..=3, "value");
@@ -642,7 +648,7 @@ fn a_module_that_traps_fails_its_call_with_a_typed_error() {
     assert!(error.to_string().contains("m0") && error.to_string().contains("test-macros"), "{error}");
 
     let store_dir = folder("trap-hook");
-    let records = DirStore::new(&store_dir);
+    let records = records_at(&store_dir);
     let key = crate::hook::crate_key(&setup.module.key);
     let mut procs = crate::hook::ProcMacros::new(&setup.runtime, &records, Limits::STANDARD);
     procs.add_crate(key, "test-macros", "0.0.0", Ok(module(wasm(&[op::UNREACHABLE]), 1)));
@@ -693,10 +699,10 @@ fn an_answer_of_another_host_version_is_not_read() {
     let old = crate::record::base_key_under(crate::record::HOST_VERSION - 1, &setup.module.wasm_sha256, export, EDITION, &call);
     let now = base_key(&setup.module.wasm_sha256, export, EDITION, &call);
     assert_ne!(old, now);
-    let old_store = DirStore::new(&folder("host-version-old"));
+    let old_store = records_at(&folder("host-version-old"));
     keep(&old_store, old, &produced).expect("kept under the old version");
     assert!(find(&old_store, &now, &pkg, EDITION, Alloc::global()).expect("read").is_none(), "the old host's answer was read");
-    let store = DirStore::new(&folder("host-version-now"));
+    let store = records_at(&folder("host-version-now"));
     keep(&store, now, &produced).expect("kept under this version");
     assert!(find(&store, &now, &pkg, EDITION, Alloc::global()).expect("read").is_some(), "control: this version's answer is found");
 }
@@ -734,7 +740,7 @@ fn proc_def(krate: blaze_id::CrateItemKey, name: &str) -> blaze_expand::MacroDef
 fn a_missing_module_is_one_finding_per_crate() {
     let runtime = Runtime::new().expect("the runtime");
     let store_dir = folder("missing");
-    let records = DirStore::new(&store_dir);
+    let records = records_at(&store_dir);
     let key = crate::hook::crate_key("absent");
     let mut procs = crate::hook::ProcMacros::new(&runtime, &records, Limits::STANDARD);
     let missing = crate::module::ModuleError::Missing { name: "gone-macros".to_owned(), version: "1.2.3".to_owned(), key: "absent".to_owned() };

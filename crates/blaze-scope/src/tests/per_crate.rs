@@ -440,3 +440,89 @@ fn an_inline_module_s_path_is_a_directory_relative_to_its_file_s_folder() {
         assert!(text.contains("Exemplar") && !text.contains("Unresolved") && !text.contains("NotFound"), "crate `{}`: the module under the inline `#[path]` resolves:\n{text}", c.names.name);
     }
 }
+
+/// `c` with `shut` made public: `a`'s `pub use c::m::shut` now resolves, so `a`'s records
+/// move although `a`'s text did not (what a found-but-stale `a` would miss).
+static TEXTS_SHUT: Texts = Texts(&[
+    &[("/a/lib.rs", A)],
+    &[("/b/lib.rs", B)],
+    &[("/c/lib.rs", "#![no_core]\n#[macro_export]\nmacro_rules! from_c { () => { pub fn made_by_c() {} } }\npub mod m {\n    pub struct Thing;\n    pub fn shut() {}\n    pub enum Way { Up, Down(u8) }\n    pub mod deep { pub fn far() {} }\n}\npub use m::deep::*;\n")],
+    &[("/mac/lib.rs", MAC)],
+]);
+
+/// One kept solve in [`MemKept`]: its file's text, its read list, its two records.
+#[derive(Clone, Copy)]
+struct KeptSolve {
+    text: &'static str,
+    read: &'static [(usize, ContentId)],
+    record: &'static [u8],
+    inner: &'static [u8],
+}
+
+/// A [`Kept`](crate::crate_scope::Kept) in memory: crate `i`'s solve is found when its one
+/// file's text and every exports digest it read are unchanged. `planted`: the read list is not
+/// recorded (a dependent is found although a crate it read changed).
+struct MemKept {
+    now: std::sync::Mutex<&'static Texts>,
+    kept: std::sync::Mutex<Vec<Option<KeptSolve>>>,
+    planted: bool,
+    found: std::sync::atomic::AtomicUsize,
+}
+
+impl crate::crate_scope::Kept for MemKept {
+    fn find(&self, krate: usize, exports: &dyn Fn(usize) -> Option<ContentId>) -> Option<(&[u8], &[u8])> {
+        let solve = self.kept.lock().unwrap_or_else(|p| panic!("kept: {p}"))[krate]?;
+        let now = *self.now.lock().unwrap_or_else(|p| panic!("now: {p}"));
+        let same = now.0[krate][0].1 == solve.text && solve.read.iter().all(|&(g, d)| exports(g) == Some(d));
+        same.then(|| {
+            self.found.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (solve.record, solve.inner)
+        })
+    }
+
+    fn made(&self, krate: usize, record: &[u8], inner: &[u8], read: &[(usize, ContentId)]) {
+        let now = *self.now.lock().unwrap_or_else(|p| panic!("now: {p}"));
+        let read: &'static [(usize, ContentId)] = if self.planted { &[] } else { Vec::leak(read.to_vec()) };
+        let solve = KeptSolve { text: now.0[krate][0].1, read, record: Vec::leak(record.to_vec()), inner: Vec::leak(inner.to_vec()) };
+        self.kept.lock().unwrap_or_else(|p| panic!("kept: {p}"))[krate] = Some(solve);
+    }
+}
+
+/// The early cutoff's oracle: after each edit of `c` (a body, a private item, a new public
+/// item), solving with the unedited run's kept solves gives every crate the same two records
+/// as a cold solve of the edited set, and finds the crates the edit cannot move. Planted: a
+/// read list not recorded finds `a` stale after `shut` is made public.
+#[test]
+fn kept_solves_are_found_only_when_their_reads_hold_and_equal_a_cold_solve() {
+    use crate::crate_scope::{Solved, resolve_kept};
+    let crates = crates();
+    let g = Alloc::global();
+    let bytes = |s: &Solved<'static>| match s {
+        Solved::Solved(c) => (c.record.to_vec(), c.inner.to_vec()),
+        Solved::Found { record, inner } => (record.to_vec(), inner.to_vec()),
+    };
+    for planted in [false, true] {
+        let mut stale = Vec::new();
+        for (what, edited) in [("body", &TEXTS_BODY), ("private", &TEXTS_PRIV), ("public", &TEXTS_PUB), ("shut made public", &TEXTS_SHUT)] {
+            let kept = MemKept { now: std::sync::Mutex::new(&TEXTS), kept: std::sync::Mutex::new(vec![None; crates.len()]), planted, found: 0.into() };
+            resolve_kept(&crates, Sysroot::default(), &TEXTS, &Serial, &Ready::serial(WAIT), &kept, g).unwrap_or_else(|e| panic!("first run: {e:?}"));
+            assert!(kept.found.load(std::sync::atomic::Ordering::Relaxed) == 0, "nothing is kept before the first run");
+            *kept.now.lock().unwrap_or_else(|p| panic!("now: {p}")) = edited;
+            let (again, _) = resolve_kept(&crates, Sysroot::default(), edited, &Serial, &Ready::serial(WAIT), &kept, g).unwrap_or_else(|e| panic!("{what}: {e:?}"));
+            let (cold, _) = resolve_by_records(&crates, Sysroot::default(), edited, &Serial, &Ready::serial(WAIT), g).unwrap_or_else(|e| panic!("{what} cold: {e:?}"));
+            for (i, (a, c)) in again.iter().zip(cold.iter()).enumerate() {
+                if bytes(a) != (c.record.to_vec(), c.inner.to_vec()) {
+                    stale.push(format!("{what}: crate `{}`", crates[i].name));
+                }
+            }
+            // `c` is solved again (its text moved); `mac` reads nothing that moved.
+            let solved: Vec<&str> = again.iter().enumerate().filter(|(_, s)| matches!(s, Solved::Solved(_))).map(|(i, _)| crates[i].name).collect();
+            assert!(solved.contains(&"c") && !solved.contains(&"mac"), "{what} (planted {planted}): solved {solved:?}");
+        }
+        if planted {
+            assert!(!stale.is_empty(), "the planted bug (no read list) was not caught");
+        } else {
+            assert!(stale.is_empty(), "kept solves differ from a cold solve: {stale:?}");
+        }
+    }
+}

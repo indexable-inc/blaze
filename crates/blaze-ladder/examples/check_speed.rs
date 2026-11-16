@@ -12,8 +12,10 @@
 //! 6. with `--threads N`: every body from empty records per thread, on 1 thread and on N;
 //! then the peak footprint by phase (getrusage) and the ratio to the no-world floor.
 //! Every line is printed in a fixed order (no map order), so two runs compare line by line.
-//! Times inside one body's check are not split here: front2 and blaze-typeck keep no counter of
-//! rounds, questions or table conversions on this path (the run says so).
+//! Inside one body's check, blaze-typeck's tally (asks.rs `Tally`, through
+//! `check_body_counted`) counts rounds, questions by kind, table conversions and their entries,
+//! and splits the time between the world's answers, hashing them and the rest; each pass prints
+//! the sums. Fills per round (the records front2 makes between rounds) are not counted.
 
 use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -23,7 +25,8 @@ use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::Front2;
 use blaze_ladder::front2::body::{BodyError, lower_fn, lower_member};
 use blaze_ladder::front2::buckets::Buckets;
-use blaze_ladder::front2::check::{BuildOrder, Records, check_body, eval_len};
+use blaze_ladder::front2::check::{BuildOrder, Records, check_body_counted, eval_len};
+use blaze_typeck::{Clock, QUESTION_KINDS, Tally};
 use blaze_ladder::front2::consts::Consts;
 use blaze_ladder::front2::heads::{HeadError, Store, Want};
 use blaze_ladder::front2::keys::{MemberKind, checker_of};
@@ -121,6 +124,67 @@ struct Rec {
     heads_made: usize,
     /// Type-table nodes the store gained over this body.
     nodes_made: usize,
+    /// What the body's check asked and what the answers cost (blaze-typeck's `Tally`).
+    tally: Tally,
+}
+
+/// The tally's clock (rule 75: the example gives it): nanoseconds since the run started.
+struct Mono(Instant);
+
+impl Clock for Mono {
+    fn now_ns(&self) -> u64 {
+        self.0.elapsed().as_nanos() as u64
+    }
+}
+
+/// The counters of `recs` summed: rounds, questions by kind, conversions, and where the
+/// check's time went.
+fn tally_lines(label: &str, recs: &[&Rec], out: &mut String) {
+    let mut t = Tally::default();
+    for r in recs {
+        t.add(&r.tally);
+    }
+    let rounds: Vec<u64> = recs.iter().map(|r| r.tally.checks).collect();
+    let mut hist = [0usize; 6];
+    for &n in &rounds {
+        hist[(n.max(1) as usize - 1).min(5)] += 1;
+    }
+    out.push_str(&format!(
+        "{label} rounds: {} checks for {} bodies; bodies by rounds 1:{} 2:{} 3:{} 4:{} 5:{} 6+:{}\n",
+        t.checks,
+        recs.len(),
+        hist[0],
+        hist[1],
+        hist[2],
+        hist[3],
+        hist[4],
+        hist[5]
+    ));
+    let mut asks = String::new();
+    let mut total = 0;
+    for (i, name) in QUESTION_KINDS.iter().enumerate() {
+        total += t.asks[i];
+        if t.asks[i] > 0 {
+            asks.push_str(&format!(" {name} {};", t.asks[i]));
+        }
+    }
+    out.push_str(&format!("{label} questions: {total} ({} missing), {:.1} per check:{asks}\n", t.missing, total as f64 / t.checks.max(1) as f64));
+    out.push_str(&format!(
+        "{label} table conversions {}: entries converted {}; entries reached {}; entries offered {} ({:.0} per conversion)\n",
+        t.conversions,
+        t.entries_converted,
+        t.entries_reached,
+        t.entries_offered,
+        t.entries_offered as f64 / t.conversions.max(1) as f64
+    ));
+    out.push_str(&format!(
+        "{label} time in checks {}: world answers {}, hashing answers {}, the rest (walk, solver, conversions) {}; of all, facts fills (their asks included) {}\n",
+        ms(t.check_ns),
+        ms(t.world_ns),
+        ms(t.hash_ns),
+        ms(t.check_ns.saturating_sub(t.world_ns + t.hash_ns)),
+        ms(t.convert_ns)
+    ));
 }
 
 fn heads_of(s: &Store<'_>) -> usize {
@@ -223,7 +287,8 @@ fn make<'n>(r: &mut Records<'_, 'n>, w: Want) -> bool {
 fn one<'n>(names: &'n Names<'n>, front: &mut Front2<'n>, st: &mut St<'n>, prepared: &Prepares<'n>, t: Target<'_>) -> Rec {
     let resolver = front.resolver;
     let (h0, n0) = (heads_of(&st.store), st.store.tys.len());
-    let mut rec = Rec { container_ns: 0, lower_ns: 0, check_ns: 0, outcome: Outcome::Panic, heads_made: 0, nodes_made: 0 };
+    let mut rec = Rec { container_ns: 0, lower_ns: 0, check_ns: 0, outcome: Outcome::Panic, heads_made: 0, nodes_made: 0, tally: Tally::default() };
+    let clock = Mono(Instant::now());
     let St { store, buckets, consts, containers, failed_containers } = st;
     let mut r = Records { names, keys: &mut front.keys, index: &front.index, store, buckets, order: BuildOrder::AsAsked, consts: Some((consts, prepared)) };
     let got = catch_unwind(AssertUnwindSafe(|| -> Outcome {
@@ -285,7 +350,7 @@ fn one<'n>(names: &'n Names<'n>, front: &mut Front2<'n>, st: &mut St<'n>, prepar
         let scope = body.scope(&spell);
         rec.lower_ns = ns(l0);
         let k0 = Instant::now();
-        let got = check_body(&mut r, &body, &scope);
+        let got = check_body_counted(&mut r, &body, &scope, Some((&mut rec.tally, &clock)));
         rec.check_ns = ns(k0);
         match got {
             Ok(done) if done.diags.is_empty() => Outcome::Clean,
@@ -320,6 +385,7 @@ fn pass_lines(label: &str, recs: &[Rec], out: &mut String) {
     out.push_str(&format!("{}\n", dist(&format!("{label} check per body"), checked.iter().map(|r| r.check_ns).collect())));
     out.push_str(&format!("{}\n", dist(&format!("{label} check per clean body"), checked.iter().filter(|r| r.outcome == Outcome::Clean).map(|r| r.check_ns).collect())));
     out.push_str(&format!("{}\n", dist(&format!("{label} lower per body"), lowered.iter().map(|r| r.lower_ns).collect())));
+    tally_lines(label, &checked, out);
     let grew = recs.iter().filter(|r| r.heads_made > 0).count();
     out.push_str(&format!(
         "{label} records made: heads {} by {grew} bodies, table nodes {}\n",
@@ -721,7 +787,7 @@ fn main() {
         }
     }
 
-    out.push_str("not counted (no counter on this path): rounds per check_body, world questions per round, fills per round, facts.rs `table` conversions and entries converted, time inside BodyWorld answers vs the solver\n");
+    out.push_str("not counted (no counter on this path): fills per round (the records front2 makes between rounds)\n");
     out.push_str(&format!("check_speed {cname}: done in {}; load after {:.2}; peak rss {:.0} MB\n", ms(ns(start)), load(), maxrss_mb()));
     print!("{out}");
 }

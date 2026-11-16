@@ -1149,18 +1149,27 @@ fn build_from<P: FrontEnd>(program: &mut P, surveyed: Option<(&mut Vec<(Box<str>
                     let mut cx = LayoutCx { ground: &mut ground, facts: &adts, scratch: Alloc::global() };
                     let id = layouts.of(t.concrete, &mut cx).map_err(|e| fail(VtableFail::Layout(e)))?;
                     let (size, align) = (layouts.get(id).size, layouts.get(id).align_bytes());
-                    let glue_item = program.fn_lang(FnLang::DropInPlace).ok_or_else(|| fail(VtableFail::NoDropGlue))?;
-                    let glue = Instance { item: glue_item, args: ground.intern_list(&[t.concrete]).map_err(|_| full())? };
+                    // Word 0: `drop_in_place::<T>` (a no-op glue when `T` needs none). With no
+                    // glue fn AND no `Drop` trait, no type of the program can need drop: word 0
+                    // is 0, which the built object drop skips (walk.rs `dyn_glue`).
+                    let glue = match program.fn_lang(FnLang::DropInPlace) {
+                        Some(item) => Some(Instance { item, args: ground.intern_list(&[t.concrete]).map_err(|_| full())? }),
+                        None => match program.lang_item(LangItem::Drop).map_err(RunError::Lang)? {
+                            None => None,
+                            Some(_) => return Err(fail(VtableFail::NoDropGlue)),
+                        },
+                    };
+                    let glue_item = glue.map(|g| g.item);
                     let mut targs = Vec::new_in(Global);
                     targs.extend_from_slice(ground.view().list(t.args).map_err(|_| full())?);
-                    let table = Vtable::build(&shape, t.concrete, &targs, size, align, Some(glue), &mut ground, Global)
+                    let table = Vtable::build(&shape, t.concrete, &targs, size, align, glue, &mut ground, Global)
                         .map_err(|e| fail(VtableFail::Build(e)))?;
                     let mut words = Vec::with_capacity_in(table.relocs.len(), Global);
                     for &(offset, to) in table.relocs.iter() {
                         let word = match to {
                             VtableTarget::Fn(f) => {
                                 // A trait method runs as the selected impl's; the glue is itself.
-                                let (item, args) = match f.item == glue_item {
+                                let (item, args) = match Some(f.item) == glue_item {
                                     true => (f.item, f.args),
                                     false => program
                                         .resolve(i, f.item, f.args, &mut ground)

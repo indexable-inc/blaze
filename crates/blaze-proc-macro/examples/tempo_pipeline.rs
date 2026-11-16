@@ -580,7 +580,7 @@ fn main() {
     let lock = read_lock(&lock_text);
     let mut built = modules(store, checkout);
     let runtime = Runtime::new().expect("the runtime");
-    let records = DirStore::new(&out);
+    let records = expansion_records(&out);
     let mut procs = ProcMacros::new(&runtime, &records, Limits::STANDARD);
     let mut macros = Vec::new();
     let mut labels = HashMap::new();

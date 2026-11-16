@@ -15,8 +15,15 @@
 #![feature(register_tool)]
 #![register_tool(blaze)]
 
+#[cfg(test)]
+extern crate std;
+
 mod client;
+mod plant;
 mod tls;
+
+#[cfg(test)]
+mod tests;
 
 pub use client::{Ask, Client, FetchError, FetchWhy, Got};
 pub use tls::{NoStream, NoTls, Plain, Stream, StreamError, Tls, TlsError, TlsOp};

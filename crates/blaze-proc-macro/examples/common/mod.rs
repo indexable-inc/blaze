@@ -5,8 +5,15 @@ use std::path::{Path, PathBuf};
 
 use blaze_proc_macro::{
     module::{CrateId, ModuleRecord, Source, files_digest, lock_closure, package_files, read_module},
+    record::{DirStore, native_world},
     sandbox::{Files, PACKAGE, Package},
 };
+
+/// The expansion records under the folder `store`, through a world this program opens over it.
+pub fn expansion_records(store: &Path) -> DirStore {
+    let (io, root) = native_world(store).unwrap_or_else(|error| panic!("the records at {}: {error}", store.display()));
+    DirStore::expansions(&io, &root)
+}
 
 /// The modules in the store, read through their identities: a key the crate computes
 /// differently from the builder's reads as missing.

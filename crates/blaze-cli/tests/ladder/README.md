@@ -1192,6 +1192,23 @@ Twenty-second port lane (2026-11-16 ~10:30; handing on).
 - NOT DONE: step 3 (the entry's proof with the append off), the rungs and `--test ladder` were
   NOT rerun after these changes (owed first thing: `"--test ladder_front2"`, `"--test ladder"`).
 
+Twenty-third port lane (2026-11-16 ~11:00; handing on).
+- RAN: rungs-U "7c-main-io: PASS (status 0, stdout byte-equal)", all 14 must-keep PASS; `--test
+  ladder` "1 passed, 0 failed". list-AA: "his main's diagnostics: 0 []", "REACHABLE: 1785 of
+  2295 .. 1288 calls not followed"; "BUILDS: no survey: front2: `..::call_once`'s ABI RustCall
+  is neither Rust nor C" (program-wide refusal). Fixed: program.rs files a non-Rust/C ABI fn in
+  the survey's `left_out` (a run still refuses). body.rs `lower_at`: `Refused::NoBody` is
+  `BodyError::NoBody` (40 intrinsics met before their head were counted as lowering failures).
+- VTABLES BUILT AND PLACED: run.rs `Reached` (instances/tabled/keys, `slot`) and `Tables`; each
+  `Built::vtables` ref made once per program (`Shape::of` + `Vtable::build`, supertraits off the
+  first chain first by a stack), method words resolved like calls (`program.resolve`), word 0
+  `drop_in_place::<T>` (0 only when the program has neither the glue fn nor a `Drop` trait),
+  `RunError::Vtable { why: VtableFail }`. place.rs `VtableImage`/`VtableWord`, `Vtables`:
+  written into leaked memory before the edit; slot words filled from `place.thunk` on the first
+  `RelocTo::Vtable`. ladder_front2 runs `7b-dyn` and `front2/f3-dyn` (blaze-2026.11: the test now
+  passes the toolchain shelf for a blaze edition). f3-dyn is refused by the expansion lane's
+  class (`ptr::add`'s `ub_checks` E0425), see rungs-X.
+
 #### Heads lane (2026-11-16, first runner; handing on)
 
 - DONE, step 1 (poisoned records). Root cause: body lowering interned a body's own types
@@ -1290,6 +1307,28 @@ Twenty-second port lane (2026-11-16 ~10:30; handing on).
   checked before it on shared records; it passed after I moved `assoc_bound` last, but other
   lanes' edits landed in between, so the cause is NOT proved: a lead on the Sort class.
 
+#### Heads lane: types and bounds (2026-11-16, third runner; a7cbddfadf1488259)
+
+- DONE, trait aliases (the unstable book, `trait_alias`: used as a bound "is equivalent to" its
+  right-hand side; core: `pub trait Thin = Pointee<Metadata = ()> + PointeeSized;`). resolve.rs
+  has `Kind::TraitAlias` (was folded into `Kind::Trait`). Head: types.rs `TraitAliasHead`
+  (generics with `Self`, clauses over `Param(0..)`, its trait clauses on `Self` by LibKey), made
+  by heads.rs `Store::trait_alias` (`predicates` with `sized = None`: no implied `Sized`); an
+  alias inside is made first (`Why::Need`), so a use substitutes once; a cycle of aliases is
+  `HeadError::Cycle` from `ensure`'s work list. Use: types.rs `bound_target` (trait or alias,
+  one resolution), `alias_clauses`, `trait_args`, `subst_clause`; preds.rs `one_bound` expands
+  (an alias states no sizedness: core writes `T: PointeeSized + Thin`), `param_bound` gives
+  `T::X` through its traits, dyn_ty.rs `dyn Alias` expands to the object of its traits and
+  projections. `trait_at` refuses an alias by name where ONE trait is needed (an impl's trait).
+- Fixtures (front2_bounds.rs, 28 bodies + the cycle): "5 passed" with front2_dyn, front2_order,
+  ladder_front2. Without `Kind::TraitAlias`: "thin: no head: Cycle([ItemKey(560c2f11428c)])"
+  and 11 more fails. Census heads-3 (core): "built 46859 (96.3%)" (was 46607, 95.8%: other
+  lanes' changes are in it too); the trait-alias rows are gone ("1 1 100.0% trait alias").
+- LEFT: `Alias<Name = T>` on an alias, `?Alias`, alias generic defaults: typed refusals.
+  `T::X<A>` (2: GAT projections with type args): the checker's `PNode::Alias` has no own args.
+  Return-position `impl Trait` (16): the checker's `OpaqueDef.generics` is still 0
+  (blaze-typeck infer/facts.rs `opaque`: "does not carry its generics yet"); not built here.
+
 #### Heads lane: items (2026-11-16, first runner; handing on)
 
 - Const generics are built in every head. `heads::own_generics` gives each const param its
@@ -1368,6 +1407,32 @@ Twenty-second port lane (2026-11-16 ~10:30; handing on).
   per trait: core `From` 168 of 224, `ToBytes` 61 of 61, `Default` 34 of 129, `Clone` 15 of
   103. alloc's Clone, Deref and Try heads all build. `SelfTy::Ty` now carries the impl's
   trait (that lane's edit to `impl_`).
+
+##### Third runner (2026-11-16, ~11:00; handing on)
+
+- THE NUMBER: census-gen-3 (bstd): "HEAD crate bstd: bodies 2309, clean 2136 (92.5%)" (was
+  1054). Classes: 74 E0425, 21 gap TypeAlias, 16 FnHead ConstPath `size_of::<Self>()`, 13
+  E0599, 8+7+3 `impl Trait` in return position, 7 E0283, 7 `Tr<N>` const param in a type
+  position. RefusedImpl in bstd: only 3 bodies, `PartialEq <- ConstPath (mem::size_of::<usize>())`.
+- The census prints a "REFUSED IMPLS" table (by reason, by trait, by both); a RefusedImpl
+  class is now "gap RefusedImpl [Trait]: Why/form" (`impl_trait`, `refusal_reason`).
+- Negative impls: `Buckets::answer` and check.rs `make_once` now always list a trait's
+  negative impls as candidates (the solver reads polarity). Without it `not_send` was
+  "clean"; now "E0277 .. `S: Send`". Fixture `a_negative_impl_is_a_head` passes.
+- `a_refused_impl_is_a_named_gap`: `W<3>: Tr` is ALSO the gap (the world answers a shape's
+  impls whole, `World::impls_of`); the fixture says so. A proof by a built impl beside a
+  refused candidate needs the checker's API: its lane's question, not asked yet.
+- Type aliases in BODY paths (world_paths.rs `alias_def`, `prim_of`): an alias whose aliased
+  type is an ADT over exactly its own params in order, or a built-in type, is that `Def`;
+  a refused alias head is `Gap::AliasHead(alias, why)`; any other alias stays
+  `Gap::TypeAlias` (reworded). Fixture `a_type_alias_in_a_body_path_is_its_type` passes
+  ("10 passed, 0 failed"); with `alias_def` disabled: "alias paths: same: .. 1 gaps", FAILED.
+  The 21 bstd ones are likely `Arc`-like aliases with a fixed or defaulted argument
+  (`Arc<T>` = `sync::Arc<T, Global>`): a value path must FIX that argument, so `Def::Adt`
+  would be wrong; it needs a checker `Def` carrying a type (the checker lane's).
+- NOT DONE: step 4 (const expressions in signatures: every bstd one is `size_of::<X>()`,
+  needing the evaluator to run a generic call with layout), step 5 (trait consts, enum-typed
+  const params), the alloc and core census. census-gen-3 ran BEFORE the alias fix.
 
 ## For a successor lane (2026-11-16 03:20, rung 8: the port onto real names)
 

@@ -332,7 +332,7 @@ fn macro_for<'m>(modules: &'m [ModuleRecord], text: &str, call: &Call, name: &st
 fn pass(checkout: &Path, modules: &[ModuleRecord], records: &Path, label: &str, show: bool) -> BTreeMap<String, Stats> {
     let edition = Edition::E2024;
     let runtime = Runtime::new().expect("the runtime");
-    let store = DirStore::new(records);
+    let store = expansion_records(records);
     let mut loaded: BTreeMap<String, std::sync::Arc<Loaded>> = BTreeMap::new();
     let mut stats: BTreeMap<String, Stats> = BTreeMap::new();
     let mut shown = false;

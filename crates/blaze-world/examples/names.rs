@@ -1211,7 +1211,12 @@ fn main() {
         let lock_text = std::str::from_utf8(lock_bytes).expect("Cargo.lock is UTF-8");
         let procs: &'static Procs = Box::leak(Box::new(procs_of(FsPath::new(&store), FsPath::new(&out), &root, world, graph, lock, lock_text, &paths, &mut packages)));
         // Every module compiled or loaded from its compiled record before resolution starts:
-        // no worker waits on a compile.
+        // no worker waits on a compile. With `--records` a module is loaded by the first call
+        // a solved crate makes ([`Runtime::load`]): a found crate calls nothing, so a repeat
+        // with nothing changed loads none (r19-b: 697.8 ms of a 1069.7 ms run, 0 crates solved).
+        if flag("--records").is_some() {
+            return procs;
+        }
         let workers = threads.iter().copied().max().unwrap_or(1);
         let started = std::time::Instant::now();
         let compiled = procs.procs.load_all(workers).unwrap_or_else(|e| panic!("the proc-macro modules: {e}"));

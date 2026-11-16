@@ -290,7 +290,7 @@ pub fn run_batches<'f, 'r>(
         let mut of_batch = std::vec::Vec::with_capacity_in(batch.tasks.len(), Global);
         for (_, task) in batch.tasks.iter() {
             of_batch.push(match task.name.kind {
-                Kind::FileItems => Some(match job_of(req, facts, task, frame) {
+                Kind::FileItems | Kind::BodyCheck => Some(match job_of(req, facts, task, frame) {
                     Ok(job) => Ok(scope.may_overlap("outline", task_frame, {
                         let clock = &clock;
                         move |cx: &Cx| Ok::<_, core::convert::Infallible>(pooled(cx, root, &job, clock))
@@ -491,19 +491,48 @@ pub(crate) fn run_one<'f, 'b>(
 /// Whether this worker builds tasks of `kind`: the one place that says so. `run` answers every
 /// other kind `NotBuilt`, and the command's closing note names the stages its kinds leave out
 /// (`left_out`). A new kind is added here and in `run`'s match together.
-pub fn builds(kind: Kind) -> bool {
+pub const fn builds(kind: Kind) -> bool {
     match kind {
-        Kind::Units | Kind::UnitGraph | Kind::Fetch | Kind::FileItems | Kind::Surface | Kind::MacroModule | Kind::CrateScope => true,
-        Kind::ModuleScope
-        | Kind::Group
-        | Kind::Expansion
-        | Kind::Signature
-        | Kind::ImplBucket
-        | Kind::BodyCheck
-        | Kind::Code
-        | Kind::Test => false,
+        Kind::Units
+        | Kind::UnitGraph
+        | Kind::Fetch
+        | Kind::FileItems
+        | Kind::Surface
+        | Kind::MacroModule
+        | Kind::CrateScope
+        | Kind::BodyCheck => true,
+        Kind::ModuleScope | Kind::Group | Kind::Expansion | Kind::Signature | Kind::ImplBucket | Kind::Code | Kind::Test => false,
     }
 }
+
+/// Whether the task this worker runs for `kind` does the whole of `kind.stage()`: a
+/// `BodyCheck` task parses its body here, and checks none of its types or borrows, so it is
+/// built ([`builds`]) but not whole, and no note counts it as types checked.
+pub const fn whole(kind: Kind) -> bool {
+    builds(kind) && !matches!(kind, Kind::BodyCheck)
+}
+
+/// What this worker's task of `kind` does, in the words of a note: `kind.stage()` when it is
+/// [`whole`], else the part it does.
+pub fn does(kind: Kind) -> &'static str {
+    match kind {
+        Kind::BodyCheck => "check the bodies' syntax",
+        _ => kind.stage(),
+    }
+}
+
+/// The one list of the stages `check` is defined to run, in order, and whether this build runs
+/// each, derived from the kinds this worker builds: the closing line's "NOT checked" and
+/// `blaze explain 3` read it. When all are `true`, `check` can say `ok`.
+pub(crate) const CHECK_STAGES: [(&str, bool); 6] = [
+    ("manifests", builds(Kind::Units) && builds(Kind::UnitGraph)),
+    ("syntax of items", builds(Kind::FileItems)),
+    ("syntax inside bodies", builds(Kind::BodyCheck)),
+    ("names", builds(Kind::CrateScope)),
+    // A body's types are its `BodyCheck` task's, an item's its `Signature`'s.
+    ("types", whole(Kind::Signature) && whole(Kind::ImplBucket) && whole(Kind::BodyCheck)),
+    ("borrows", whole(Kind::BodyCheck)),
+];
 
 /// Whether `command`'s program runner (blaze_ladder) does `kind`'s work for the code the program
 /// reaches, in the subset of Rust its front end reads: `run` only. Macro expansion and the
@@ -513,9 +542,10 @@ pub fn runner_does(command: blaze_drive::Command, kind: Kind) -> bool {
         && matches!(kind, Kind::ModuleScope | Kind::Group | Kind::Signature | Kind::ImplBucket | Kind::BodyCheck | Kind::Code)
 }
 
-/// Whether `command` covers `kind` in this build: the worker builds it, or the runner does it.
+/// Whether `command` covers `kind` in this build: the worker does the whole of it, or the
+/// runner does it.
 pub fn covers(command: blaze_drive::Command, kind: Kind) -> bool {
-    builds(kind) || runner_does(command, kind)
+    whole(kind) || runner_does(command, kind)
 }
 
 /// The stages `command` is defined to cover that this build leaves out, each named once, in
@@ -585,7 +615,7 @@ fn run<'f, 'b>(
             // read this command.
             None => Ok(Did::Failed(TaskFailure { name: task.name, why: Why::Refused { what: "a `Fetch` task with no lock read this command", rule: "fetch.rs" } })),
         },
-        Kind::FileItems => unreachable!("FileItems tasks run on the pool, in `answer_batch`"),
+        Kind::FileItems | Kind::BodyCheck => unreachable!("{:?} tasks run on the pool, in `answer_batch`", task.name.kind),
         // A file's surface: its out is its source, the digest its file's outline made; it holds
         // no bytes of its own. Its `CrateScope` readers compare that out.
         Kind::Surface => {
@@ -622,15 +652,19 @@ struct Job<'a> {
     flags: u8,
     edition: u8,
     plant: Plant,
+    /// A `BodyCheck` job's item: where it starts in the file (its part's place).
+    body: Option<u32>,
 }
 
-/// The `FileItems` job of `task`, or the refusal that fails it. Its slot's path is copied into
-/// the request's `frame`: the job outlives the steps of the batches answered before it joins.
+/// The `FileItems` or `BodyCheck` job of `task`, or the refusal that fails it. Its slot's path
+/// (a body's home file's) is copied into the request's `frame`: the job outlives the steps of
+/// the batches answered before it joins.
 fn job_of<'f>(req: &Request<'_>, facts: &Facts<'_, impl crate::sweep::Stamps>, task: &Task<'_>, frame: &'f Frame) -> Result<Job<'f>, &'static str> {
-    let index = task.file.ok_or("a FileItems task with no file")?;
-    let slot: &'f [u8] = Vec::from_slice_in(req.path(index), frame).leak();
+    let path = req.file_of(task).ok_or("a file's or a body's task with no file")?;
+    let slot: &'f [u8] = Vec::from_slice_in(path, frame).leak();
     let slot = core::str::from_utf8(slot).map_err(|_| "a path is not UTF-8")?;
-    Ok(Job { name: task.name, slot, flags: facts.found.flags(slot.as_bytes()), edition: task.edition, plant: facts.plant })
+    let body = (task.name.kind == Kind::BodyCheck).then_some(task.place);
+    Ok(Job { name: task.name, slot, flags: facts.found.flags(slot.as_bytes()), edition: task.edition, plant: facts.plant, body })
 }
 
 /// A file's outline as its `FileItems` record, worked in `scratch` and built in `into`: the
@@ -697,10 +731,23 @@ fn outline_file<A: Allocator + Copy>(cx: &Cx, root: &Dir<ReadWrite>, job: &Job<'
             // (drive.md, "SPEC, the NAMES step"). A body edit leaves its source, so it stands.
             let surface = outline.surface();
             parts.push(Part { name: Name::new(Kind::Surface, job.name.subject), locate: Locate::Source(surface), place: 0 });
+            // Each body its own part, keyed by its item's text: an edit of one body re-parses
+            // that one ([`body_syntax`]). Its syntax errors are its record's alone.
+            let mut bodies = Vec::new_in(scratch);
+            for item in outline.items() {
+                if let Some(body) = checked_body(&outline, item) {
+                    let name = body_name(job.name, &outline, item, text);
+                    parts.push(Part { name, locate: Locate::Source(item.hash), place: item.range.start });
+                    bodies.push((item.range.start + body.start, item.range.start + body.end));
+                }
+            }
             parts.sort_unstable_by_key(|part| part.name);
             let mut findings = Vec::new_in(held);
             let mut messages = Vec::new_in(held);
             for error in outline.errors() {
+                if bodies.iter().any(|(start, end)| *start <= error.range.start && error.range.start < *end) {
+                    continue;
+                }
                 let at = messages.len();
                 messages.extend_from_slice(outline.message(error).as_bytes());
                 findings.push((SYNTAX, error.range.start, error.range.end, at, messages.len()));
@@ -713,6 +760,113 @@ fn outline_file<A: Allocator + Copy>(cx: &Cx, root: &Dir<ReadWrite>, job: &Job<'
             Ok(Ok(Record { name: job.name, out, parts, findings, messages, payload, paths, path_bytes, reads: Vec::new_in(held) }))
         }
     }
+}
+
+/// The domain of a `BodyCheck` part's subject ([`body_name`]).
+const BODY_DOMAIN: &str = "blaze-cli body check name 1";
+
+/// Whether `item` is a body's own entry: a `fn`, `const` or `static` with a body, under none:
+/// an item written inside a body is parsed with it, never twice. Its body range, entry-relative.
+fn checked_body(outline: &blaze_file_items::Outline<'_>, item: &blaze_surface::Item) -> Option<blaze_surface::Range> {
+    let holds = |kind: ItemKind| matches!(kind, ItemKind::Function | ItemKind::Const | ItemKind::Static);
+    if !holds(item.kind()) {
+        return None;
+    }
+    let body = item.body?;
+    let mut parent = item.parent;
+    while let Some(at) = parent {
+        let up = outline.item(at);
+        if holds(up.kind()) {
+            return None;
+        }
+        parent = up.parent;
+    }
+    Some(body)
+}
+
+/// A body's name: its file's subject and its entry's chain up to the file (each kind, name as
+/// written and disambiguator), so it stands while other items move and its own text changes.
+fn body_name(file: Name, outline: &blaze_file_items::Outline<'_>, item: &blaze_surface::Item, text: &str) -> Name {
+    let mut h = blaze_ids::Hasher::new(BODY_DOMAIN);
+    h.update(&file.subject.0);
+    let mut at = Some(item);
+    while let Some(entry) = at {
+        let name = entry.name.map_or("", |range| entry.text(text, range));
+        h.update(&[entry.kind() as u8]).update(&(name.len() as u32).to_le_bytes()).update(name.as_bytes()).update(&entry.disambiguator.to_le_bytes());
+        at = entry.parent.map(|up| outline.item(up));
+    }
+    Name::new(Kind::BodyCheck, h.finish())
+}
+
+/// The parser's edition of a part's edition byte.
+fn parser_edition(edition: Edition) -> parser::Edition {
+    match edition {
+        Edition::E2015 => parser::Edition::Edition2015,
+        Edition::E2018 => parser::Edition::Edition2018,
+        Edition::E2021 => parser::Edition::Edition2021,
+        Edition::E2024 => parser::Edition::Edition2024,
+    }
+}
+
+/// A body's syntax as its `BodyCheck` record: its entry found at `place` in its file's outline,
+/// its text parsed by the entry blaze-lower's `lower_body` parses a body with
+/// (`Reparser::top_level_item().parse`), each lexer and parser error inside the body a
+/// [`SYNTAX`] finding relative to the entry (rule 71). Errors before the body are the file's
+/// outline's. Its out is the entry's text digest: what it says follows from that text.
+fn body_syntax<A: Allocator + Copy>(cx: &Cx, root: &Dir<ReadWrite>, job: &Job<'_>, place: u32, scratch: &Frame, into: A) -> Result<Result<Record<A>, Why>, Unread> {
+    let real = crate::sweep::real_path(job.slot, job.flags, scratch);
+    let path = core::str::from_utf8(&real).map_err(|_| Unread::Text("a path is not UTF-8"))?;
+    let mut bytes = Bytes::new_in(scratch, "a source file");
+    root.read_all(cx, &Path::new(path)?, &mut bytes)?;
+    let text = core::str::from_utf8(bytes.as_slice()).map_err(|_| Unread::Text("a source file is not UTF-8"))?;
+    if u32::try_from(text.len()).is_err() {
+        return Err(Unread::Text("a source file past 4 GiB"));
+    }
+    let edition = Edition::from_byte(job.edition).ok_or(Unread::Text("a body's home file has no edition byte"))?;
+    let erased = blaze_own::Erased::new(scratch);
+    let outline = blaze_file_items::outline(text, edition, erased.handle());
+    let found = outline.items().iter().find(|item| item.range.start == place && checked_body(&outline, item).is_some());
+    let Some((item, body)) = found.and_then(|item| Some((item, checked_body(&outline, item)?))) else {
+        return Ok(Err(Why::Refused { what: "a body's part whose file holds no body at its place", rule: "blaze-cli work.rs, body_syntax" }));
+    };
+    let entry = item.range.of(text);
+    let pe = parser_edition(edition);
+    let lexed = parser::LexedStr::new(pe, entry);
+    let input = lexed.to_input(pe);
+    let output = parser::Reparser::top_level_item().parse(input.tokens());
+    let mut made = Record::new_in(job.name, into);
+    for (token, message) in lexed.errors() {
+        let range = lexed.text_range(token);
+        if range.start as u32 >= body.start {
+            made.find(SYNTAX, (range.start as u32, range.end as u32), &[message]);
+        }
+    }
+    // The parser's steps over the lexer's tokens, trivia skipped: an error is placed at the end
+    // of the last token taken before it (blaze-file-items walk.rs reads the outline's so).
+    let (mut next, mut end) = (0usize, 0usize);
+    let mut take = |next: &mut usize, end: &mut usize| {
+        while *next < lexed.len() && lexed.kind(*next).is_trivia() {
+            *next += 1;
+        }
+        if *next < lexed.len() {
+            *end = lexed.text_range(*next).end;
+            *next += 1;
+        }
+    };
+    for step in output.iter() {
+        match step {
+            parser::Step::Token { n_input_tokens, .. } => (0..n_input_tokens).for_each(|_| take(&mut next, &mut end)),
+            parser::Step::FloatSplit { .. } => take(&mut next, &mut end),
+            parser::Step::Enter { .. } | parser::Step::Exit => {}
+            parser::Step::Error { msg } => {
+                if end as u32 >= body.start {
+                    made.find(SYNTAX, (end as u32, end as u32), &[msg]);
+                }
+            }
+        }
+    }
+    made.out = item.hash;
+    Ok(Ok(made))
 }
 
 
@@ -804,7 +958,10 @@ struct Pooled {
 fn pooled(cx: &Cx, root: &Dir<ReadWrite>, job: &Job<'_>, clock: &bstd::clock::Clock) -> Pooled {
     let began = clock.now();
     let scratch = cx.frame();
-    let ran = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| outline_file(cx, root, job, scratch, Global)));
+    let ran = std::panic::catch_unwind(core::panic::AssertUnwindSafe(|| match job.body {
+        None => outline_file(cx, root, job, scratch, Global),
+        Some(place) => body_syntax(cx, root, job, place, scratch, Global),
+    }));
     let (used, limit) = (scratch.peak(), scratch.reserved());
     let did = match ran {
         Ok(Ok(done)) => Ok(done),

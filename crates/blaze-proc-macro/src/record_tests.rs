@@ -24,7 +24,7 @@ fn payload(k: u32) -> std::vec::Vec<u8> {
 
 /// Every key: a miss, or its whole value. A finding panics: it fails the seed (an error is a
 /// restart, as a failed command is).
-fn oracle(store: &DirStore<OnDir<'_>>) -> Result<(), std::string::String> {
+fn oracle(store: &DirStore) -> Result<(), std::string::String> {
     for k in 0..KEYS {
         match store.get(Kind::List, &key(k)) {
             Ok(Some(bytes)) => assert!(bytes == payload(k), "record oracle: key {k} read back as other bytes ({} for {})", bytes.len(), payload(k).len()),
@@ -36,9 +36,10 @@ fn oracle(store: &DirStore<OnDir<'_>>) -> Result<(), std::string::String> {
 }
 
 /// One start: the oracle on what the folder holds, every put, the oracle again.
-fn program(cx: &Cx, io: &Io, plant: RecordPlant) -> Result<(), std::string::String> {
+fn program(io: &Io, plant: RecordPlant) -> Result<(), std::string::String> {
     let dir = io.need_fs().map_err(|missing| missing.to_string())?.root();
-    let store = DirStore::on(OnDir { cx, dir }, plant);
+    // clone: the world, a refcount.
+    let store = DirStore::on(OnDir { io: io.clone(), dir }, plant);
     oracle(&store)?;
     for k in 0..KEYS {
         store.put(Kind::List, key(k), &payload(k)).map_err(|error| error.to_string())?;
@@ -47,8 +48,8 @@ fn program(cx: &Cx, io: &Io, plant: RecordPlant) -> Result<(), std::string::Stri
 }
 
 fn crashes(count: u32, plant: RecordPlant) -> Result<bstd::test::Passed, bstd::test::Failed> {
-    seeded("blaze-proc-macro", module_path!(), "records_crash", Seeds::DEFAULT.from(0, count), Given::NOTHING, |cx: &Cx, io: Io| {
-        program(cx, &io, plant)
+    seeded("blaze-proc-macro", module_path!(), "records_crash", Seeds::DEFAULT.from(0, count), Given::NOTHING, |_: &Cx, io: Io| {
+        program(&io, plant)
     })
 }
 

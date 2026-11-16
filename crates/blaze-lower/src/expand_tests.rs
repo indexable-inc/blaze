@@ -475,7 +475,11 @@ impl crate::Sink for Records {
         if !(unhandled.is_empty() && view.diags.is_empty()) {
             out = format!("UNCLEAN {unhandled:?} {:?}\n{out}", view.diags);
         }
-        self.0.push((String::from(item.item_text()), what, out));
+        // An expansion writes its `$crate` as its defining crate's one identifier (blaze-expand's
+        // `body_words`); the records here are read back with [`at`]'s crate, every macro's in
+        // these tests, as `$crate`: another crate's identifier stays as written.
+        let own = format!("{}", blaze_surface::DollarCrate(at().site.krate));
+        self.0.push((item.item_text().replace(&own, "$crate"), what, out.replace(&own, "$crate")));
     }
 
     fn refused(&mut self, _: &crate::ItemRef<'_>, refusal: crate::Refusal<'_>) {
