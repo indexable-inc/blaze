@@ -5,7 +5,9 @@
 //! The function it makes is the baseline tier's input: every local and every value that
 //! outlives its expression lives in a LIR stack slot (`slot_addr`, `load`, `store`); `if`,
 //! `match`, `loop`, `break`, `continue` and `return` are blocks and branches; a call of a fn
-//! item is a `call` of function reference `place`, where `refs[place]` is the callee's item.
+//! item is a `call` of function reference `place`, where `refs[place]` is the callee's
+//! [`Instance`]. A generic fn's body is checked once and built once per instance ([`Subst`]):
+//! every type is grounded at the instance's arguments before it is laid out.
 //! A Rust-ABI function uses the target's C convention over its lowered signature (blaze-lir's
 //! `Conv`). The walk of the body uses explicit stacks: no recursion on the input.
 //!
@@ -23,6 +25,7 @@
 
 #![feature(allocator_api)]
 
+pub mod instance;
 mod walk;
 
 #[cfg(test)]
@@ -32,7 +35,19 @@ use core::alloc::Allocator;
 use core::fmt;
 
 use blaze_lir::{Func, VerifyError};
-use blaze_typeck::{Adt, BodyView, Checked, ExprId, FnSig, ItemKey, PatId};
+use blaze_typeck::{Adt, BodyView, Checked, ExprId, FnSig, ItemKey, PTy, PatId, PortableTys};
+
+pub use instance::{Instance, ground};
+
+/// The instance being built: its generic arguments, types of `ground`, the program's one table
+/// of ground types. Every type the build lays out is first carried into `ground` with each
+/// `Param(i)` replaced by `args[i]`; a non-generic fn is the instance with no arguments.
+pub struct Subst<'g, 't> {
+    pub args: &'g [PTy],
+    pub ground: &'g mut PortableTys<'t>,
+    /// The allocator of grounding's scratch columns.
+    pub scratch: blaze_own::Alloc<'g>,
+}
 
 /// What the build reads from outside the body form: the structs a body's types name (their
 /// fields, for layout), and the values of the body's literals, which blaze-typeck's body form
@@ -69,8 +84,9 @@ pub trait Adts {
 pub struct Built<A: Allocator> {
     /// The function, verified.
     pub func: Func<A>,
-    /// By function reference place: the callee's item.
-    pub refs: Vec<ItemKey, A>,
+    /// By function reference place: the callee instance, its arguments in the ground table.
+    /// Two calls of one instance share one place.
+    pub refs: Vec<Instance, A>,
 }
 
 /// Why a body was not built.
@@ -123,16 +139,22 @@ impl fmt::Display for BuildError {
 
 impl core::error::Error for BuildError {}
 
-/// Builds `body`, checked as `checked`, of a fn whose signature is `sig`, in `alloc`.
+/// Builds the instance `subst` names of `body`, checked once generically as `checked`, of a fn
+/// whose signature is `sig`, in `alloc`.
 pub fn build<A: Allocator + Clone>(
     body: &BodyView<'_>,
     checked: &Checked<'_>,
     sig: &FnSig<'_>,
+    subst: &mut Subst<'_, '_>,
     adts: &dyn Adts,
     alloc: A,
 ) -> Result<Built<A>, BuildError> {
     if !checked.diags.is_empty() {
         return Err(BuildError::Diagnostics { count: u32::try_from(checked.diags.len()).unwrap_or(u32::MAX) });
     }
-    walk::build(body, checked, sig, adts, alloc)
+    let generics = sig.parent_count.checked_add(sig.own_count).ok_or(BuildError::Malformed { what: "a generic count past u32" })?;
+    if subst.args.len() != generics as usize {
+        return Err(BuildError::Malformed { what: "an instance whose argument count is not its fn's generic count" });
+    }
+    walk::build(body, checked, sig, subst, adts, alloc)
 }

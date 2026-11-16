@@ -58,7 +58,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use blaze_core::{
-    Completion, DIRECT_ALIGN, Done, Effect, FileName, IoError, Mapping, Meta, S_IFDIR, S_IFREG,
+    Completion, DIRECT_ALIGN, DirName, Done, Effect, FileName, IoError, Mapping, Meta, S_IFDIR, S_IFREG,
     Stamp, spans,
 };
 use blaze_ids::{ContentId, Hasher};
@@ -475,11 +475,12 @@ impl Files {
     }
 
     /// Every file and directory under `dir`, at any depth, sorted by name ([`Effect::List`]).
-    fn list(&self, dir: &FileName) -> Done {
-        if self.live.contains_key(dir.as_str()) {
+    fn list(&self, dir: &DirName) -> Done {
+        if dir.name().is_some_and(|name| self.live.contains_key(name.as_str())) {
             return Done::Failed(IoError(format!("{dir}: not a directory")));
         }
-        let under = format!("{dir}/");
+        // The root's names have no prefix.
+        let under = dir.name().map_or_else(String::new, |name| format!("{name}/"));
         let mut listed: BTreeMap<String, Meta> = BTreeMap::new();
         for (name, ino) in self.live.iter().filter(|(name, _)| name.starts_with(&under)) {
             for (at, _) in name[under.len()..].match_indices('/') {
@@ -492,7 +493,8 @@ impl Files {
                 Meta { len: inode.live.len() as u64, dir: false, modified_ns: inode.changes };
             listed.insert(name.clone(), meta);
         }
-        if listed.is_empty() {
+        // The root is always there, empty or not.
+        if listed.is_empty() && dir.name().is_some() {
             return Done::Failed(IoError(format!("{dir}: no such directory")));
         }
         Done::Listed(
@@ -939,7 +941,7 @@ impl CrashFs {
             // Begun to be written, with nothing of it durable or ordered: a crash tears what
             // it covered as before.
             Effect::WriteBack { file, .. } => there(file, Done::WrittenBack),
-            Effect::SyncDir { dir, .. } => match files.is_dir(dir.as_str()) {
+            Effect::SyncDir { dir, .. } => match dir.name().is_none_or(|name| files.is_dir(name.as_str())) {
                 true => Done::Synced,
                 false => Done::Failed(IoError(format!("{dir}: no such directory"))),
             },
@@ -977,7 +979,8 @@ impl CrashFs {
                 self.epoch += 1;
             }
             Effect::SyncDir { dir, .. } => {
-                self.commit_entries(Some(dir.as_str()));
+                // The root's entries are those whose directory is `""` (`dir_of`).
+                self.commit_entries(Some(dir.name().map_or("", FileName::as_str)));
                 self.flushed(asked);
             }
             Effect::Write { file, .. } => {

@@ -206,7 +206,8 @@ fn export(db: &Db, instance: &Instance, env: &StoredParamEnvAndCrate) -> Option<
     // clone: a refcount of the interned arguments, which the shared table keeps as its key
     let key = (instance.def, instance.args.clone(), instance.checked);
     // clone: the slot's `Arc`, so the table's guard is let go before the export is built
-    let slot = EXPORTS.pin().get_or_insert_with(key, Arc::default).clone();
+    // clone (of the key, on a miss only): the table keeps it
+    let slot = EXPORTS.pin().get_or_insert_with(&key, |key| (key.clone(), Arc::default())).clone();
     slot.get_or_init(|| {
         let start = stdx::time::Instant::now();
         let built = build(db, instance, env).map(Arc::new);

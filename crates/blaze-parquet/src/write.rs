@@ -76,7 +76,7 @@ impl Options {
         created_by: "blaze-parquet",
         encoding: Encoding::Auto,
         dictionary_bytes: 1 << 20,
-        compression: Compression::None,
+        compression: Compression::HOT,
     };
 }
 

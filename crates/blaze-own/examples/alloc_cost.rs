@@ -252,13 +252,13 @@ fn fast_paths() {
         best(|| per_value(|| {
             let mut v = into.borrow_mut();
             v.clear();
-            v.insert_many(0, black_box(&words));
+            v.insert_slice_shift(0, black_box(&words));
             black_box(v.as_slice());
         })),
         best(|| per_value(|| {
             let mut v = plain_into.borrow_mut();
             v.clear();
-            v.insert_many(0, black_box(&plain_words));
+            v.insert_slice_shift(0, black_box(&plain_words));
             black_box(v.as_slice());
         })),
     );
@@ -274,8 +274,8 @@ fn fast_paths() {
     );
     row(
         "position of an absent byte",
-        best(|| per_value(|| drop(black_box(black_box(&byte_vec).position(&3))))),
-        best(|| per_value(|| drop(black_box(black_box(&plain_byte_vec).position(&Plain(3)))))),
+        best(|| per_value(|| drop(black_box(black_box(&byte_vec).scan_for(&3))))),
+        best(|| per_value(|| drop(black_box(black_box(&plain_byte_vec).scan_for(&Plain(3)))))),
     );
     row(
         "Soa<(u8, u32)> clone_in",

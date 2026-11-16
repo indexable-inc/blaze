@@ -10,7 +10,11 @@
 //! sequence of words written post-order with back-references to repeated nodes, items as their
 //! 32-byte keys, so the key is the same in every task's arena and can key a shared cache.
 //! The canonical term and its key are made in one walk ([`walk`]): a node's words are written
-//! at its exit, from its canonical node, so the term is read once.
+//! at its exit, from its canonical node, so the term is read once. Measured (examples/cost.rs,
+//! this Mac, 2026-11-15, alternated with the two-walk version under the same load): a 6-node
+//! goal with 3 variables, 110 to 118 ns, from 127 to 132. The floor is the walk (6 nodes, a
+//! key lookup and insert each), 3 variable-map entries and 3 interns of canonical variables
+//! (hot hits, about 10 ns each), about 60 ns: ratio about 1.9.
 //! Deviation: type variables carry no sub-unification root (rustc's `sub_root`): blaze-ty
 //! records two-variable subtyping as a goal and has no sub-unification table.
 

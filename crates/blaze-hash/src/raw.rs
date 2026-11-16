@@ -28,7 +28,7 @@ use core::{
 };
 
 use blaze_own::AllocFailure;
-use blaze_swiss::{Ctrl, DEAD, EMPTY, Slots, find, home, live_tag, vacant};
+use blaze_swiss::{At, Ctrl, DEAD, EMPTY, Slots, find, find_or_vacant, home, live_tag, vacant};
 
 /// Slots per group: one control word holds eight tags.
 pub(crate) const SLOTS: usize = 8;
@@ -257,6 +257,12 @@ impl<T, A: Allocator> RawTable<T, A> {
         }
     }
 
+    /// How many more values go in before the table is made again.
+    #[inline]
+    pub(crate) fn growth_left(&self) -> usize {
+        self.growth_left
+    }
+
     /// Puts `value` of `hash` in a new slot, which it returns; `hasher` hashes a held value if
     /// the table is made again first. The caller has checked no equal value is held.
     #[inline]
@@ -277,8 +283,39 @@ impl<T, A: Allocator> RawTable<T, A> {
     fn insert_no_grow(&mut self, hash: u64, value: T) -> usize {
         debug_assert!(self.growth_left > 0);
         let at = vacant(hash, self.groups, |group| self.word(group));
+        self.insert_at(at, hash, value)
+    }
+
+    /// The live slot of `hash` whose value `eq` accepts, or else the empty slot an insert of
+    /// it takes ([`RawTable::insert_at`]), from one probe. The table has room for one more
+    /// (`growth_left > 0`), so the vacancy needs no growth first.
+    #[inline]
+    pub(crate) fn find_or_vacant(
+        &self,
+        hash: u64,
+        mut eq: impl FnMut(&T) -> bool,
+    ) -> Result<usize, At<SLOTS>> {
+        debug_assert!(self.growth_left > 0);
+        find_or_vacant(hash, live_tag(hash), self.groups, |group| self.word(group), |at| {
+            let index = at.index();
+            eq(self.get(index)).then_some(index)
+        })
+    }
+
+    /// Puts `value` of `hash` in the empty slot `at`, which a [`RawTable::find_or_vacant`] of
+    /// `hash` returned with no change to the table since: its index.
+    #[inline]
+    pub(crate) fn insert_at(&mut self, at: At<SLOTS>, hash: u64, value: T) -> usize {
+        debug_assert!(self.growth_left > 0);
+        // Checked, not assumed: a vacancy of another table or from before a change would
+        // write out of bounds or over a value. One compare on a word in cache.
+        assert!(
+            at.group < self.groups && at.slot < SLOTS && self.word(at.group).tag_at(at.slot) == EMPTY,
+            "blaze_hash: an insert at a slot that is not this table's vacancy"
+        );
         let index = at.index();
-        // SAFETY: `vacant` returned an empty slot, which holds no value to overwrite.
+        // SAFETY: slot `index` is in the allocation (`group < groups`, `slot < SLOTS`) and its
+        // tag is EMPTY, so it holds no value to overwrite.
         unsafe { self.slot_ptr(index).write(value) };
         self.set_word(at.group, at.tagged(live_tag(hash)));
         self.items += 1;

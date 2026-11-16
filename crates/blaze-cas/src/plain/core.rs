@@ -1311,7 +1311,7 @@ impl Plain {
             return false;
         }
         self.phase = Phase::Listing;
-        effects.push(Effect::List { dir: self.cfg.dir.clone(), tag: self.tag(LIST, 0) });
+        effects.push(Effect::List { dir: self.cfg.dir.clone().into(), tag: self.tag(LIST, 0) });
         true
     }
 
@@ -2212,7 +2212,7 @@ impl Plain {
                         // directory still holds failed to read (an error); one a power cut took
                         // is the same as torn.
                         let why = fail("reading a manifest", &log, &done).unwrap_or_else(|| unexpected("reading a manifest"));
-                        effects.push(Effect::List { dir: self.cfg.dir.clone(), tag: self.tag(LIST, 0) });
+                        effects.push(Effect::List { dir: self.cfg.dir.clone().into(), tag: self.tag(LIST, 0) });
                         self.phase = Phase::CheckLog { ctx, slots, at, why };
                         return Ok(());
                     }
@@ -2313,7 +2313,7 @@ impl Plain {
                     if self.unopened.is_empty() {
                         self.mapped(then, effects);
                     } else {
-                        effects.push(Effect::List { dir: self.cfg.dir.clone(), tag: self.tag(LIST, 0) });
+                        effects.push(Effect::List { dir: self.cfg.dir.clone().into(), tag: self.tag(LIST, 0) });
                         self.phase = Phase::CheckMaps { then };
                     }
                 }
@@ -2570,7 +2570,7 @@ impl Plain {
                 }
                 if fell_back {
                     self.phase = Phase::Orphans { left: 0 };
-                    effects.push(Effect::List { dir: self.cfg.dir.clone(), tag: self.tag(LIST, 0) });
+                    effects.push(Effect::List { dir: self.cfg.dir.clone().into(), tag: self.tag(LIST, 0) });
                 } else {
                     self.map_new(Then::Open, effects);
                 }

@@ -343,7 +343,7 @@ impl Take {
                 Done::Stat(Some(_)) => {
                     let tag = self.tag();
                     // clone: a refcount
-                    effects.push(Effect::List { dir: look.dir.clone(), tag });
+                    effects.push(Effect::List { dir: look.dir.clone().into(), tag });
                     look.step = Step::List(tag);
                     false
                 }

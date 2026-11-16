@@ -7,6 +7,17 @@ pub(crate) enum Plant {
     Clean,
     /// The two-digit table is read one pair off: `r` writes the digits of `r + 1`.
     DigitPairOffByOne,
+    /// The debug walk writes every named field as `field`.
+    DebugFieldNameLost,
+}
+
+/// The name the debug walk writes for a field.
+#[inline]
+pub(crate) fn field_name(name: &'static str) -> &'static str {
+    match PLANTED.with(Cell::get) {
+        Plant::DebugFieldNameLost => "field",
+        _ => name,
+    }
 }
 
 std::thread_local! {
@@ -17,8 +28,8 @@ std::thread_local! {
 #[inline]
 pub(crate) fn digit_pair(r: usize) -> usize {
     match PLANTED.with(Cell::get) {
-        Plant::Clean => r,
         Plant::DigitPairOffByOne => (r + 1) % 100,
+        _ => r,
     }
 }
 

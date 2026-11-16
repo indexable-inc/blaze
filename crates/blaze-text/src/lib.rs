@@ -68,11 +68,23 @@
 #![feature(register_tool, custom_inner_attributes)]
 // `core::simd`: digit runs, escape scanning and hex encoding (`simd`).
 #![feature(portable_simd)]
+// The debug form read by reflection (`debug`): `type_info` to read a type and find its own
+// form, `core_intrinsics` for `discriminant_value` and the reflection intrinsics
+// `type_name`, `rustc_attrs` for `#[rustc_comptime]` on what calls reflection's
+// compile-time-only functions, `const_heap` to keep its tables as exact-size slices,
+// `ptr_metadata` to call a field's type through its vtable.
+#![feature(type_info, core_intrinsics, rustc_attrs, const_heap, ptr_metadata)]
+#![allow(
+    internal_features,
+    reason = "`core_intrinsics` and `rustc_attrs` for the reflection the debug form is read by (`debug`)"
+)]
 #![register_tool(blaze)]
 #![blaze::sans_io]
 #![blaze::trust(
     unsafe,
-    reason = "one block: ASCII bytes the crate wrote from its own digit tables viewed as `str` (`ascii::Ascii::as_str`)"
+    reason = "two places: ASCII bytes the crate wrote from its own digit tables viewed as `str` \
+              (`ascii::Ascii::as_str`), and the debug walk, which reads a value through the form \
+              its type's reflection gave (`debug`)"
 )]
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -84,6 +96,7 @@ extern crate std;
 pub mod adapt;
 mod ascii;
 mod big;
+mod debug;
 pub mod escape;
 pub mod float;
 pub mod human;
@@ -113,9 +126,10 @@ mod plant;
 mod tests;
 
 pub use adapt::{PutDisplay, Shown};
+pub use debug::DebugForm;
 pub use float::Float;
 pub use int::Integer;
 pub use parse::{IntSyntax, Parse, ParseError, Unquoted, parse_all, parse_int, parse_quoted_in};
-pub use put::{Count, Put};
-pub use show::{Bytes, Fixed, Hex, Nanos, Quoted, Show};
+pub use put::{Count, Put, text_exact_in, text_in};
+pub use show::{Bytes, Dbg, Fixed, Hex, Nanos, Quoted, Show, ShowWith, show_with};
 pub use write::Writes;

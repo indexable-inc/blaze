@@ -138,9 +138,9 @@ impl<T, const N: usize> FixedVec<T, N> {
     ///
     /// When `index > len`.
     #[track_caller]
-    pub fn insert(&mut self, index: usize, value: T) -> Result<(), Full<T>> {
+    pub fn insert_shift(&mut self, index: usize, value: T) -> Result<(), Full<T>> {
         if index > self.len {
-            out_of_bounds("FixedVec::insert", index, self.len);
+            out_of_bounds("FixedVec::insert_shift", index, self.len);
         }
         if self.len == N {
             return Err(Full { value, cap: N });
@@ -162,9 +162,9 @@ impl<T, const N: usize> FixedVec<T, N> {
     ///
     /// When `index >= len`.
     #[track_caller]
-    pub fn remove(&mut self, index: usize) -> T {
+    pub fn remove_shift(&mut self, index: usize) -> T {
         if index >= self.len {
-            out_of_bounds("FixedVec::remove", index, self.len);
+            out_of_bounds("FixedVec::remove_shift", index, self.len);
         }
         self.len -= 1;
         // SAFETY: `index` held a value, read once; slots `index + 1..=len` move down over it.
@@ -182,9 +182,9 @@ impl<T, const N: usize> FixedVec<T, N> {
     ///
     /// When `index >= len`.
     #[track_caller]
-    pub fn swap_remove(&mut self, index: usize) -> T {
+    pub fn remove_swap(&mut self, index: usize) -> T {
         if index >= self.len {
-            out_of_bounds("FixedVec::swap_remove", index, self.len);
+            out_of_bounds("FixedVec::remove_swap", index, self.len);
         }
         let last = self.len - 1;
         self.as_mut_slice().swap(index, last);
@@ -215,37 +215,39 @@ impl<T, const N: usize> FixedVec<T, N> {
     /// Keeps the values `keep` says yes to, in order. A panic in `keep` or in a drop keeps the
     /// values not yet seen, after the ones kept.
     pub fn retain(&mut self, mut keep: impl FnMut(&mut T) -> bool) {
-        /// Slots `..write` kept, `write..read` empty, `read..len` not yet seen.
-        struct Compact<'a, T, const N: usize> {
-            vec: &'a mut FixedVec<T, N>,
+        /// Slots `..write` kept, `write..read` empty, `read..total` not yet seen. Every slot is
+        /// reached from `base`, taken once: a second borrow of the slots (`first_mut`) would
+        /// end the pointers taken from the first under the aliasing model, as Miri found.
+        struct Compact<'a, T> {
+            base: *mut T,
+            len: &'a mut usize,
             read: usize,
             write: usize,
-            len: usize,
+            total: usize,
         }
-        impl<T, const N: usize> Drop for Compact<'_, T, N> {
+        impl<T> Drop for Compact<'_, T> {
             fn drop(&mut self) {
-                let unseen = self.len - self.read;
+                let unseen = self.total - self.read;
                 // SAFETY: the unseen slots move down to right after the kept ones; `copy`
                 // allows the overlap.
-                unsafe {
-                    let first = self.vec.first_mut();
-                    ptr::copy(first.add(self.read), first.add(self.write), unseen);
-                }
-                self.vec.len = self.write + unseen;
+                unsafe { ptr::copy(self.base.add(self.read), self.base.add(self.write), unseen) };
+                *self.len = self.write + unseen;
             }
         }
-        let len = self.len;
-        // Nothing counts as held while the slots are in motion.
+        let total = self.len;
+        // Nothing counts as held while the slots are in motion. The base and the length are
+        // borrowed apart: two fields.
         self.len = 0;
-        let mut at = Compact { vec: self, read: 0, write: 0, len };
-        while at.read < at.len {
-            // SAFETY: `read < len` holds a value not yet seen.
-            let slot = unsafe { at.vec.first_mut().add(at.read) };
+        let base = self.slots.as_mut_ptr().cast::<T>();
+        let mut at = Compact { base, len: &mut self.len, read: 0, write: 0, total };
+        while at.read < at.total {
+            // SAFETY: `read < total <= N` holds a value not yet seen.
+            let slot = unsafe { at.base.add(at.read) };
             // SAFETY: as above; no other reference to it is live.
             if keep(unsafe { &mut *slot }) {
                 if at.read != at.write {
                     // SAFETY: `write < read`: an empty slot; the value moves.
-                    unsafe { ptr::copy_nonoverlapping(slot, at.vec.first_mut().add(at.write), 1) };
+                    unsafe { ptr::copy_nonoverlapping(slot, at.base.add(at.write), 1) };
                 }
                 at.write += 1;
                 at.read += 1;
@@ -256,6 +258,30 @@ impl<T, const N: usize> FixedVec<T, N> {
                 unsafe { ptr::drop_in_place(slot) };
             }
         }
+    }
+}
+
+/// The old names, whose cost the name did not say; each forwards to the one that says it.
+impl<T, const N: usize> FixedVec<T, N> {
+    #[deprecated(note = "linear: use `insert_shift`, which says so")]
+    #[track_caller]
+    #[inline]
+    pub fn insert(&mut self, index: usize, value: T) -> Result<(), Full<T>> {
+        self.insert_shift(index, value)
+    }
+
+    #[deprecated(note = "linear: use `remove_shift`, or `remove_swap` when order does not matter")]
+    #[track_caller]
+    #[inline]
+    pub fn remove(&mut self, index: usize) -> T {
+        self.remove_shift(index)
+    }
+
+    #[deprecated(note = "renamed `remove_swap`, beside `remove_shift`")]
+    #[track_caller]
+    #[inline]
+    pub fn swap_remove(&mut self, index: usize) -> T {
+        self.remove_swap(index)
     }
 }
 

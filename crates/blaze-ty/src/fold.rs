@@ -10,6 +10,17 @@
 //! and interns it only when one changed, so a pass over a term it does not change allocates
 //! nothing. Every walk is skipped where the flags say the hook cannot apply.
 //!
+//! Cost (examples/cost.rs, this Mac, 2026-11-15, alternated with the version before under the
+//! same load). Over a million list elements all changed: 36.5 ns an element, from 89; the
+//! memo in L1 and the batched intern of a list's elements are both needed (81 with only the
+//! first, 104 with only the second, 42 without the batch's prefetch). The floor is about one
+//! independent cold hit a node (16 ns measured for lookups that do not wait on each other)
+//! plus the walk's frames, about 20 ns: ratio about 1.8. A deep chain where every node
+//! changes: 34 ns a node (30 to 33 before; neither the memo nor the deferral is the 2 ns, both
+//! tested apart, and the cause is not found); each node's intern waits on its child's, so the
+//! floor is a dependent hit (10 ns hot) plus the frames, about 15: ratio about 2.3. An
+//! untouched subtree is one load of its flags (3.6 ns a field over a wide tuple).
+//!
 //! The engine also tracks what generalization needs: the variance of each position
 //! (rustc_type_ir/src/relate.rs, `structurally_relate_tys`) and whether the node is under an
 //! alias. One table of child positions ([`position`]) is shared with relate (`crate::relate`).
@@ -161,6 +172,8 @@ struct Frame {
     ctx: u8,
     op: u8,
     rule: u8,
+    /// An element of a list: a rebuilt row is interned at the list's exit, with its siblings.
+    in_list: bool,
 }
 
 /// A result not interned yet: its place on the result stack and its memo key.
@@ -176,10 +189,12 @@ const NO_MEMO: u64 = u64::MAX;
 
 /// One engine's stacks and memo.
 ///
-/// A rebuilt row is not interned at its own exit but at its parent's, with its siblings',
-/// through [`Tys::intern_many`]: siblings' rows do not depend on each other, so their probes'
-/// cache misses overlap. `want` and `pend` are the rows waiting, in result-stack order, so a
-/// node's children's are a suffix.
+/// A rebuilt row that is a list's element is not interned at its own exit but at the list's,
+/// with its siblings', through [`Tys::intern_many`]: siblings' rows do not depend on each
+/// other, so their probes' cache misses overlap. Other rows are interned at their exit: a
+/// row's one or two children gain little from a batch, and deferring them measured slower on
+/// a deep chain. `want` and `pend` are the rows waiting, in result-stack order, so a list's
+/// elements' are a suffix.
 pub(crate) struct Stacks<'a> {
     stack: Vec<Frame, Alloc<'a>>,
     out: Vec<Node, Alloc<'a>>,
@@ -201,8 +216,16 @@ impl<'a> Stacks<'a> {
 
     /// Interns the waiting rows at result positions `at` and above, into their places and the
     /// memo.
-    #[inline]
+    #[inline(always)]
     fn resolve_from(&mut self, tys: &mut Tys<'_>, at: u32) {
+        if !self.want.is_empty() {
+            self.resolve_slow(tys, at);
+        }
+    }
+
+    /// [`Stacks::resolve_from`]'s batch, out of the walk's loop.
+    #[inline(never)]
+    fn resolve_slow(&mut self, tys: &mut Tys<'_>, at: u32) {
         let from = self.pend.partition_point(|p| p.at < at);
         if from == self.want.len() {
             return;
@@ -269,7 +292,7 @@ fn run_on<H: Hook>(
     st.memo.clear();
     st.want.clear();
     st.pend.clear();
-    st.stack.push(Frame { node: root, depth: 0, def: 0, base: 0, ctx, op: ENTER, rule: RULE_SAME });
+    st.stack.push(Frame { node: root, depth: 0, def: 0, base: 0, ctx, op: ENTER, rule: RULE_SAME, in_list: false });
     while let Some(f) = st.stack.pop() {
         match f.op {
             ENTER => {
@@ -310,11 +333,12 @@ fn run_on<H: Hook>(
                 }
             }
             EXIT => {
-                st.resolve_from(tys, f.base);
                 let base = ix(f.base);
                 let n = f.node;
                 let key = if f.rule == RULE_SAME { memo_key(n, f.depth, f.ctx) } else { None };
                 let result = if n.tag() == TAG_LIST {
+                    // Only a list's children wait to be interned.
+                    st.resolve_from(tys, f.base);
                     let l = n.list();
                     let same = {
                         let old = tys.list(l);
@@ -343,8 +367,10 @@ fn run_on<H: Hook>(
                     let nb = if d.b == Role::Child { st.out[i].bits() } else { b };
                     if na == a && nb == b {
                         n
+                    } else if !f.in_list {
+                        tys.intern_node(n.tag(), k, na, nb)
                     } else {
-                        // Interned at the parent's exit, with its siblings; `n` holds the place.
+                        // Interned at the list's exit, with its siblings; `n` holds the place.
                         st.out.truncate(base);
                         st.out.push(n);
                         st.want.push(Want { tag: n.tag(), kind: k, a: na, b: nb });
@@ -399,6 +425,7 @@ fn descend(st: &mut Stacks<'_>, tys: &Tys<'_>, vo: &mut dyn VarianceOf, f: Frame
                 ctx: ctx_of(ev) | alias,
                 op: ENTER,
                 rule: RULE_SAME,
+                in_list: true,
             });
         }
         return;
@@ -410,11 +437,13 @@ fn descend(st: &mut Stacks<'_>, tys: &Tys<'_>, vo: &mut dyn VarianceOf, f: Frame
     let def = if d.a == Role::Def { a } else { 0 };
     if d.b == Role::Child {
         let (pv, rule) = position(n.tag(), k, true);
-        st.stack.push(Frame { node: Node(b), depth, def, base: 0, ctx: ctx_of(v.xform(pv)) | alias, op: ENTER, rule });
+        let ctx = ctx_of(v.xform(pv)) | alias;
+        st.stack.push(Frame { node: Node(b), depth, def, base: 0, ctx, op: ENTER, rule, in_list: false });
     }
     if d.a == Role::Child {
         let (pv, rule) = position(n.tag(), k, false);
-        st.stack.push(Frame { node: Node(a), depth, def, base: 0, ctx: ctx_of(v.xform(pv)) | alias, op: ENTER, rule });
+        let ctx = ctx_of(v.xform(pv)) | alias;
+        st.stack.push(Frame { node: Node(a), depth, def, base: 0, ctx, op: ENTER, rule, in_list: false });
     }
 }
 

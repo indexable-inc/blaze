@@ -157,7 +157,7 @@ fn effects_of(step: Step) -> Vec<Effect> {
         Step::Rename { from, to } => {
             vec![Effect::Rename { from: sim_name(&from), to: sim_name(&to), tag }]
         }
-        Step::SyncDir { dir } => vec![Effect::SyncDir { dir: sim_name(&dir), tag }],
+        Step::SyncDir { dir } => vec![Effect::SyncDir { dir: sim_name(&dir).into(), tag }],
         Step::Done => Vec::new(),
     }
 }

@@ -77,6 +77,38 @@ mod threads {
         });
     }
 
+    /// The shared map's `get_or_insert_with` on a tape of `str` keys is `get`, then `insert` on
+    /// a miss; `make` runs once per key put and never on a hit.
+    #[test]
+    fn get_or_insert_with_is_get_then_insert() {
+        use blaze_sim::Config;
+
+        blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
+            let map: SharedMap<std::string::String, u64> = SharedMap::default();
+            let pinned = map.pin();
+            let mut model = std::collections::BTreeMap::new();
+            let (mut made, mut put) = (0usize, 0usize);
+            let range = 1 + tape.below(100, "range");
+            for step in 0..tape.below(if cfg!(miri) { 60 } else { 400 }, "steps") {
+                let name = std::format!("k{}", tape.below(range, "key"));
+                if tape.one_in(6, "remove") {
+                    assert_eq!(pinned.remove(name.as_str()).copied(), model.remove(&name));
+                    continue;
+                }
+                let expected = *model.entry(name.clone()).or_insert_with(|| {
+                    put += 1;
+                    step
+                });
+                let got = pinned.get_or_insert_with(name.as_str(), |key| {
+                    made += 1;
+                    (std::string::String::from(key), step)
+                });
+                assert_eq!(*got, expected, "{name} at step {step}");
+            }
+            assert_eq!(made, put, "`make` once per key put, never on a hit");
+        });
+    }
+
     #[test]
     fn every_key_is_found_after_its_insert_and_gone_after_its_remove() {
         let map: Arc<SharedMap<usize, usize>> = Arc::new(SharedMap::default());

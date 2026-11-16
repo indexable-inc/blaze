@@ -7,7 +7,8 @@
 //! about 21 bytes a type before growth's slack (columns grow by doubling). An intern hit is a
 //! hash, one group's cache line and one row's: in a loop where each lookup waits on the last,
 //! about six dependent L1 loads (about 30 cycles) hot, and two cache misses cold. A fold over
-//! a subtree its flags say is untouched costs one load of the flags.
+//! a subtree its flags say is untouched costs one load of the flags. A fold over a list's
+//! elements interns them as a batch, prefetched (`Tys::intern_many`), so their misses overlap.
 
 #![feature(allocator_api)]
 #![expect(clippy::print_stdout, reason = "a measurement tool prints its table")]

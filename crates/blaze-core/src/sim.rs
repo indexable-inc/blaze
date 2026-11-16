@@ -528,7 +528,7 @@ pub struct Sim {
     /// Lists of this directory wait until [`Sim::release_lists`] ([`Sim::hold_lists`]).
     hold_lists: Option<FileName>,
     /// The lists it holds, each listed as the directory is when released.
-    held_lists: Vec<(FileName, Tag)>,
+    held_lists: Vec<(crate::DirName, Tag)>,
     /// The next this many lists of this directory fail ([`Sim::fail_lists`]).
     fail_lists: Option<(FileName, u32)>,
     /// Writes, truncates and syncs of files under this directory each take this long
@@ -1328,15 +1328,16 @@ impl Sim {
     /// The files under `dir` and the directories they imply, as a disk would list them. As for
     /// a stat, a directory is there while some file is under it; a name that is a file and has
     /// files under it is listed as the file.
-    fn list(&self, dir: &FileName) -> Done {
-        if self.files.contains_key(dir) {
+    /// The root ([`crate::DirName::Root`]) is always there, and lists every name.
+    fn list(&self, dir: &crate::DirName) -> Done {
+        if dir.name().is_some_and(|name| self.files.contains_key(name)) {
             // alloc: an error's message.
             return Done::Failed(IoError(format!("{dir}: not a directory")));
         }
-        let start = dir.as_str().len() + 1;
+        let start = dir.start();
         // alloc: the listing, which the completion carries.
         let mut listed: Vec<(FileName, Meta)> = Vec::new();
-        for (file, sim) in self.files.iter().filter(|(it, _)| it.is_under(dir)) {
+        for (file, sim) in self.files.iter().filter(|(it, _)| dir.holds(it)) {
             for (at, _) in file.as_str()[start..].match_indices('/') {
                 let inner = FileName::new(&file.as_str()[..start + at]).expect("a part of a name");
                 let modified_ns = self.disk.mtime(&inner).unwrap_or(0);
@@ -1357,7 +1358,7 @@ impl Sim {
             // clone: a name of the listing.
             listed.push((made.clone(), Meta { len: 0, dir: true, modified_ns }));
         }
-        if listed.is_empty() && self.was_made(dir) {
+        if listed.is_empty() && dir.name().is_none_or(|name| self.was_made(name)) {
             return Done::Listed(listed);
         }
         if listed.is_empty() {
@@ -2783,7 +2784,7 @@ impl Driver for Sim {
                 continue;
             }
             if let (Effect::List { dir, tag }, Some(held)) = (&effect, &self.hold_lists)
-                && dir == held
+                && dir.name() == Some(held)
             {
                 // clone: the held list keeps its directory's name
                 self.held_lists.push((dir.clone(), *tag));
@@ -2791,7 +2792,7 @@ impl Driver for Sim {
             }
             if let (Effect::List { dir, tag }, Some((failing, left))) =
                 (&effect, &mut self.fail_lists)
-                && dir == failing
+                && dir.name() == Some(&*failing)
                 && *left > 0
             {
                 *left -= 1;
@@ -3360,7 +3361,7 @@ mod tests {
             let mut seen = BTreeMap::new();
             let mut effects = vec![
                 Effect::Stat { file: file.clone(), tag: Tag(2) },
-                Effect::List { dir: name("target"), tag: Tag(3) },
+                Effect::List { dir: name("target").into(), tag: Tag(3) },
             ];
             run_until_idle(&mut sim, &mut effects, |it, _| _ = seen.insert(it.tag.0, it.done))
             .expect("the effects end");
@@ -3560,7 +3561,7 @@ mod tests {
         sim.change(&name("src/a/d.rs"), b"1");
         sim.change(&name("src/e"), b"");
         sim.change(&name("other"), b"x");
-        let Done::Listed(listed) = sim.list(&name("src")) else { panic!() };
+        let Done::Listed(listed) = sim.list(&name("src").into()) else { panic!() };
         let shown: Vec<(&str, bool, u64)> =
             listed.iter().map(|(file, meta)| (file.as_str(), meta.dir, meta.len)).collect();
         assert_eq!(
@@ -3573,8 +3574,11 @@ mod tests {
                 ("src/e", false, 0)
             ]
         );
-        assert!(matches!(sim.list(&name("other")), Done::Failed(_)));
-        assert!(matches!(sim.list(&name("none")), Done::Failed(_)));
+        assert!(matches!(sim.list(&name("other").into()), Done::Failed(_)));
+        assert!(matches!(sim.list(&name("none").into()), Done::Failed(_)));
+        // The root is always there and lists every name.
+        let Done::Listed(all) = sim.list(&crate::DirName::Root) else { panic!() };
+        assert_eq!(all.iter().filter(|(_, meta)| !meta.dir).count(), 4);
     }
 
     #[test]

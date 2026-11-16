@@ -121,7 +121,7 @@ impl<'s> NameParts<'s> {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Entry {
     name: Range<u32>,
     kind: VarKind,
@@ -219,9 +219,9 @@ impl<'a> SpaceBuilder<'a> {
         var_of.try_reserve_exact(entries.len())?;
         var_of.resize(entries.len(), 0);
         for &e in sorted.iter() {
-            let entry = entries[idx(e)];
+            let entry = &entries[idx(e)];
             let same = vars.last().is_some_and(|last: &VarInfo| {
-                &pool[idx(last.name.start)..idx(last.name.end)] == name(&entry)
+                &pool[idx(last.name.start)..idx(last.name.end)] == name(entry)
             });
             if same {
                 let at = vars.len() - 1;
@@ -232,8 +232,9 @@ impl<'a> SpaceBuilder<'a> {
                 if vars.len() >= usize::from(crate::MOST_VARS) {
                     return Err(SpaceError::TooManyVars { vars: vars.len() + 1 });
                 }
-                let key = VarKey::of(name(&entry));
-                vars.try_push(VarInfo { name: entry.name, kind: entry.kind, key }).map_err(|r| SpaceError::Alloc(r.why))?;
+                let key = VarKey::of(name(entry));
+                vars.try_push(VarInfo { name: entry.name.clone(), kind: entry.kind, key })
+                    .map_err(|r| SpaceError::Alloc(r.why))?;
             }
             var_of[idx(e)] = (vars.len() - 1).narrow_or_stop::<u16>();
         }

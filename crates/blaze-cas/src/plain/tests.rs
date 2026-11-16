@@ -653,7 +653,7 @@ fn describe(who: usize, effect: &Effect) -> Asked {
         Effect::Truncate { file, len, .. } => ("truncate", file, format!(" to {len}")),
         Effect::Sync { file, .. } => ("sync", file, String::new()),
         Effect::Lock { file, mode, .. } => ("lock", file, format!(" {mode:?}")),
-        Effect::List { dir, .. } => ("list", dir, String::new()),
+        Effect::List { dir, .. } => ("list", dir.name().expect("the store lists a directory beneath the root"), String::new()),
         Effect::Map { file, .. } => ("map", file, String::new()),
         Effect::Remove { file, .. } => ("remove", file, String::new()),
         Effect::Unlock { lock, .. } => return Asked { who, kind: "unlock", file: String::new(), what: format!("of the lock asked as t{}", lock.0) },
@@ -1469,7 +1469,7 @@ fn the_oracle_catches_a_full_check_made_twice_in_one_boot() {
 
 /// The files of `dir`, by name, with their bytes.
 fn files(sim: &mut Sim) -> BTreeMap<String, Vec<u8>> {
-    let Done::Listed(listed) = ask(sim, Effect::List { dir: dir(), tag: EffectTag(OWN + 1) }) else { panic!("a listing") };
+    let Done::Listed(listed) = ask(sim, Effect::List { dir: dir().into(), tag: EffectTag(OWN + 1) }) else { panic!("a listing") };
     listed.into_iter().filter(|(_, meta)| !meta.dir).map(|(name, _)| (name.as_str().to_owned(), sim.contents(&name))).collect()
 }
 

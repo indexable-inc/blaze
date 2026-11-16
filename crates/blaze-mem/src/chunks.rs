@@ -69,8 +69,97 @@ const PLACES: usize = 1 + MAX_NODES as usize;
 const _: () = assert!(COUNT <= 1 << SHIFT);
 const _: () = assert!(((PLACES as u64) << SHIFT) < crate::stack::NONE as u64);
 
+/// The chunks of one segment of a space: 4 GiB on macOS, the whole space elsewhere. Measured
+/// on macOS (arm64, 2026-11-15, blaze-mem's `Kind::Reserve` counter): a `PROT_NONE`
+/// reservation costs in proportion to its size, about 1.1 us a GiB (4 GiB 7 us, 64 GiB 98 us,
+/// 256 GiB 290 us), so one 256 GiB space made a command's first allocation cost 0.3 ms. A space
+/// is therefore reserved a segment at a time, each when its first chunk is carved: the cost is
+/// in proportion to the chunks used. Linux reserves a readable, writable range in constant
+/// time and keeps one segment, so its huge pages and NUMA placement are as they were.
+const SEGMENT_CHUNKS: u32 = match (cfg!(target_os = "linux"), COUNT < 2048) {
+    (false, false) => 2048,
+    _ => COUNT,
+};
+
+/// The segments of a space, at most.
+const SEGMENTS: usize = COUNT.div_ceil(SEGMENT_CHUNKS) as usize;
+
+/// A space's address space: segments of `per` chunks, each reserved when its first chunk is
+/// carved. A chunk's segment and offset follow from its local index, so a chunk never moves
+/// and the stacks and links keep numbering chunks as one space.
+struct Segments {
+    per: u32,
+    /// The chunks the space holds, at most: past them a carve is `Exhausted`.
+    count: u32,
+    /// The NUMA node each segment is reserved on, if any.
+    node: Option<u32>,
+    tag: Tag,
+    regions: [OnceLock<Result<Region, String>>; SEGMENTS],
+}
+
+impl Segments {
+    const fn new(per: u32, count: u32, node: Option<u32>, tag: Tag) -> Segments {
+        Segments { per, count, node, tag, regions: [const { OnceLock::new() }; SEGMENTS] }
+    }
+
+    fn split(&self, local: u32) -> (usize, usize) {
+        ((local / self.per) as usize, (local % self.per) as usize * CHUNK)
+    }
+
+    /// Chunk `local`'s segment, reserved now when it is the first chunk carved there.
+    fn reserve(&self, local: u32) -> Result<&Region, MemError> {
+        let (segment, _) = self.split(local);
+        let bytes = self.per as usize * CHUNK;
+        let Some(slot) = self.regions.get(segment) else {
+            return Err(MemError::Exhausted { tag: self.tag, reserved: SPACE_BYTES, wanted: (local as usize + 1) * CHUNK });
+        };
+        let made = slot.get_or_init(|| {
+            let region = match self.node {
+                None => Region::reserve_huge(bytes, self.tag),
+                Some(node) => Region::reserve_huge_on(bytes, node, self.tag),
+            };
+            region.map_err(|error| error.to_string()) // alloc: once, when a segment cannot be reserved
+        });
+        match made {
+            Ok(region) => Ok(region),
+            Err(message) => Err(MemError::Reserve { tag: self.tag, bytes, os: std::io::Error::other(message.as_str()) }),
+        }
+    }
+
+    /// Chunk `local`'s segment, reserved when it was carved.
+    fn made(&self, local: u32) -> &Region {
+        let (segment, _) = self.split(local);
+        match self.regions.get(segment).and_then(OnceLock::get) {
+            Some(Ok(region)) => region,
+            _ => unreachable!("chunk {local} was carved before its segment was reserved"),
+        }
+    }
+
+    fn at(&self, local: u32) -> NonNull<u8> {
+        self.made(local).at(self.split(local).1)
+    }
+
+    /// Chunk `local` committed whole: its segment reserved, and committed up to its end.
+    fn ensure(&self, local: u32) -> Result<(), MemError> {
+        let region = self.reserve(local)?;
+        region.ensure(self.split(local).1 + CHUNK)
+    }
+
+    fn reuse(&self, local: u32) -> Result<(), MemError> {
+        self.made(local).reuse(self.split(local).1, CHUNK)
+    }
+
+    /// # Safety
+    ///
+    /// As [`Region::purge`]: no one holds chunk `local` or reads it before writing it.
+    unsafe fn purge(&self, local: u32) -> usize {
+        // SAFETY: the caller's.
+        unsafe { self.made(local).purge(self.split(local).1, CHUNK) }
+    }
+}
+
 struct Space {
-    region: Region,
+    segments: Segments,
     links: LinkTable,
     carved: AtomicU32,
     /// Chunks given back, their pages resident: at most `most`, about.
@@ -126,22 +215,22 @@ pub fn thread_node() -> Option<u32> {
 
 fn space(place: usize) -> Result<&'static Space, MemError> {
     let space = SPACES[place].get_or_init(|| {
-        let region = match place {
-            0 => Region::reserve_huge(SPACE_BYTES, Tag::Chunks),
-            node => Region::reserve_huge_on(SPACE_BYTES, node as u32 - 1, Tag::Chunks),
+        let node = match place {
+            0 => None,
+            node => Some(node as u32 - 1),
         };
-        let made = region.and_then(|region| {
-            Ok(Space {
-                region,
-                links: LinkTable::new(COUNT, Tag::Chunks)?,
-                carved: AtomicU32::new(0),
-                warm: Stack::new(),
-                warm_count: AtomicU32::new(0),
-                keep: WARM_KEEP,
-                most: WARM_MOST,
-                cold: Stack::new(),
-                cold_count: AtomicU32::new(0),
-            })
+        // No address space yet: each segment is reserved when its first chunk is carved.
+        let segments = Segments::new(SEGMENT_CHUNKS, COUNT, node, Tag::Chunks);
+        let made = LinkTable::new(COUNT, Tag::Chunks).map(|links| Space {
+            segments,
+            links,
+            carved: AtomicU32::new(0),
+            warm: Stack::new(),
+            warm_count: AtomicU32::new(0),
+            keep: WARM_KEEP,
+            most: WARM_MOST,
+            cold: Stack::new(),
+            cold_count: AtomicU32::new(0),
         });
         made.map_err(|error| error.to_string()) // alloc: once, when a space cannot be reserved
     });
@@ -186,7 +275,7 @@ impl Chunk {
 
     /// The chunk's first byte; the chunk is `CHUNK` bytes, committed, aligned to `CHUNK`.
     pub(crate) fn ptr(&self) -> NonNull<u8> {
-        made(place_of(self.0)).region.at(local_of(self.0) as usize * CHUNK)
+        made(place_of(self.0)).segments.at(local_of(self.0))
     }
 
     /// The chunk `index` names, which the caller holds (it took it and linked it in a list
@@ -209,15 +298,16 @@ pub(crate) fn take(owner: Tag) -> Result<Chunk, MemError> {
 #[cold]
 fn carve(space: &Space) -> Result<u32, MemError> {
     let local = space.carved.fetch_add(1, Ordering::Relaxed);
-    if local >= COUNT {
-        space.carved.store(COUNT, Ordering::Relaxed);
+    let count = space.segments.count;
+    if local >= count {
+        space.carved.store(count, Ordering::Relaxed);
         return Err(MemError::Exhausted {
-            tag: Tag::Chunks,
-            reserved: SPACE_BYTES,
+            tag: space.segments.tag,
+            reserved: count as usize * CHUNK,
             wanted: (local as usize + 1) * CHUNK,
         });
     }
-    space.region.ensure((local as usize + 1) * CHUNK)?;
+    space.segments.ensure(local)?;
     // SAFETY: `local` came from the `fetch_add` just now, so no other thread has it.
     unsafe { space.links.init(local) }?;
     Ok(local)
@@ -339,7 +429,7 @@ impl Space {
         }
         match self.cold.pop(&self.links) {
             Some(local) => {
-                if let Err(error) = self.region.reuse(local as usize * CHUNK, CHUNK) {
+                if let Err(error) = self.segments.reuse(local) {
                     self.cold.push(local, &self.links);
                     return Err(error);
                 }
@@ -388,7 +478,7 @@ impl Space {
         // SAFETY: the chunk was given up (by its owner, or popped off the warm cache), so no one
         // holds it or reads its contents before writing them; it is touched again only through
         // a take, which `reuse`s a cold chunk first.
-        let given = unsafe { self.region.purge(local as usize * CHUNK, CHUNK) };
+        let given = unsafe { self.segments.purge(local) };
         self.cache_purged(local, given)
     }
 
@@ -430,8 +520,7 @@ mod tests {
     fn a_space_trims_its_warm_chunks_to_keep_once_they_pass_most() {
         const CHUNKS: u32 = 8;
         let space = Space {
-            region: Region::reserve_huge(CHUNKS as usize * CHUNK, Tag::Solver)
-                .expect("a test's space"),
+            segments: Segments::new(CHUNKS, CHUNKS, None, Tag::Solver),
             links: LinkTable::new(CHUNKS, Tag::Solver).expect("its links"),
             carved: AtomicU32::new(0),
             warm: Stack::new(),
@@ -473,6 +562,47 @@ mod tests {
         assert_eq!(warm(), 0);
     }
 
+    /// A space reserves address space a segment at a time, as chunks are carved in it (macOS
+    /// charges a reservation by its size: 290 us for the 256 GiB space at once). Removing the
+    /// cause: a space of two segments of four whose chunks stay in the first reserves only the
+    /// first; the fifth chunk reserves the second. Chunks are distinct, aligned and whole, and
+    /// past the space's count a carve is `Exhausted`.
+    #[test]
+    fn a_space_reserves_only_the_segments_its_chunks_are_in() {
+        const PER: u32 = 4;
+        const CHUNKS: u32 = 2 * PER;
+        let space = Space {
+            segments: Segments::new(PER, CHUNKS, None, Tag::Solver),
+            links: LinkTable::new(CHUNKS, Tag::Solver).expect("its links"),
+            carved: AtomicU32::new(0),
+            warm: Stack::new(),
+            warm_count: AtomicU32::new(0),
+            keep: 0,
+            most: CHUNKS,
+            cold: Stack::new(),
+            cold_count: AtomicU32::new(0),
+        };
+        let reserved = || space.segments.regions.iter().filter(|slot| slot.get().is_some()).count();
+        assert_eq!(reserved(), 0, "a space made reserves nothing");
+        let mut taken: Vec<u32> = (0..PER).map(|_| space.take().expect("a chunk")).collect();
+        assert_eq!(reserved(), 1, "four chunks are the first segment's");
+        taken.push(space.take().expect("a chunk"));
+        assert_eq!(reserved(), 2, "the fifth chunk reserves the second segment");
+        taken.extend((PER + 1..CHUNKS).map(|_| space.take().expect("a chunk")));
+        assert!(
+            matches!(space.take(), Err(MemError::Exhausted { .. })),
+            "past the space's count a carve is refused"
+        );
+        let mut at: Vec<usize> = taken.iter().map(|local| space.segments.at(*local).addr().get()).collect();
+        assert!(at.iter().all(|a| a % CHUNK == 0), "each chunk is aligned to a chunk");
+        for (local, addr) in taken.iter().zip(&at) {
+            // SAFETY: the chunk is the test's, committed whole: its last byte is written.
+            unsafe { (*addr as *mut u8).add(CHUNK - 1).write(*local as u8) };
+        }
+        at.sort_unstable();
+        assert!(at.windows(2).all(|w| w[1] - w[0] >= CHUNK), "no two chunks overlap");
+    }
+
     /// memcap3 review F1: a chunk whose purge gave nothing back (hugetlb pool pages under
     /// `Pages::Reserved`, a refused advice, a target with no purge) keeps its pages resident,
     /// so it is cached warm and stays in the footprint: none of its bytes count as purged
@@ -482,8 +612,7 @@ mod tests {
     fn a_chunk_whose_purge_gave_nothing_back_stays_warm_and_in_the_footprint() {
         const CHUNKS: u32 = 4;
         let space = Space {
-            region: Region::reserve_huge(CHUNKS as usize * CHUNK, Tag::Solver)
-                .expect("a test's space"),
+            segments: Segments::new(CHUNKS, CHUNKS, None, Tag::Solver),
             links: LinkTable::new(CHUNKS, Tag::Solver).expect("its links"),
             carved: AtomicU32::new(0),
             warm: Stack::new(),

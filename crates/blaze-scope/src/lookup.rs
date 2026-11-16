@@ -18,10 +18,11 @@ use crate::error::ResolveError;
 use crate::facts::{Name, ScopeFacts};
 use crate::read::{NameAnswer, Read};
 use crate::resolver::{
-    Amb, At, CallState, Cached, Env, Hit, ImportOutcome, Item, Layer, NsRes, Plan, Query, Res,
-    Resolver, Scan, Sink, Slot, Source, MAX_MODULE_DEPTH,
+    Amb, At, CallState, Cached, Env, Hit, ImportOutcome, Item, Layer, Mark, Memo, NsRes, Plan,
+    Query, Res, Resolver, Scan, Sink, Slot, Source, MAX_MODULE_DEPTH,
 };
 use crate::scope::SeenFrom;
+use crate::watch::Kind;
 
 /// What a path is resolved for: a 2015 `use` path begins at the crate root.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -94,23 +95,26 @@ fn seg(i: usize) -> u32 {
     u32::try_from(i).unwrap_or(u32::MAX)
 }
 
-/// Computes the group's least fixpoint for `key` into `sink.memo`: for each fellow `f` and
-/// each member `i` with a glob of `f`, what `f` binds the name to as `i` sees it, each value
-/// from the table's last values, from none, until a round changes nothing. A round past the
-/// bound sets `sink.overrun`, which the pass stops on.
-fn group_fixpoint<'a, N: Name>(
-    key: (Namespace, N, Option<(ItemKey, u32)>),
-    env: Env<'_, 'a, N>,
-    sink: &mut Sink<'a, N>,
-    alloc: Alloc<'a>,
-) {
+/// The glob edges among members that the binding of a name in member `from` can depend on:
+/// every edge into `from`, and backward from each edge's source, every edge into it. Sorted,
+/// as `(source, importer)`.
+fn glob_closure<'a, N: Name>(from: usize, env: Env<'_, 'a, N>, alloc: Alloc<'a>) -> AVec<'a, (usize, usize)> {
+    let mut inside: AVec<'a, bool> = Vec::with_capacity_in(env.members.len(), alloc.clone());
+    inside.resize(env.members.len(), false);
+    let mut stack: AVec<'a, usize> = Vec::new_in(alloc.clone());
     let mut edges: AVec<'a, (usize, usize)> = Vec::new_in(alloc);
-    for (i, m) in env.members.iter().enumerate() {
-        for g in m.globs.iter() {
+    inside[from] = true;
+    stack.push(from);
+    while let Some(y) = stack.pop() {
+        for g in env.members[y].globs.iter() {
             if let Source::Resolved { def, .. } = &g.source {
-                if let Some(f) = env.index(def.key) {
-                    if f != i {
-                        edges.push((f, i));
+                if let Some(x) = env.index(def.key) {
+                    if x != y {
+                        edges.push((x, y));
+                        if !inside[x] {
+                            inside[x] = true;
+                            stack.push(x);
+                        }
                     }
                 }
             }
@@ -118,30 +122,74 @@ fn group_fixpoint<'a, N: Name>(
     }
     edges.sort_unstable();
     edges.dedup();
-    let mut table = Vec::with_capacity_in(edges.len(), alloc);
-    table.extend(edges.iter().map(|&(f, i)| (f, i, Res::None)));
-    sink.memo.insert(key, table);
+    edges
+}
+
+/// Extends the group's least fixpoint for `key` in `sink.memo` over `edges` (a backward-closed
+/// set: a value depends only on edges into its source, all in the table once this returns):
+/// for each new edge, a fellow `f` and an importer `i`, what `f` binds the name to as `i` sees
+/// it, from none, each round from the table's last values, until a round changes nothing.
+/// Values already in the table are final. A round past the bound sets `sink.overrun`, which
+/// the pass stops on.
+fn group_fixpoint<'a, N: Name>(
+    key: (Namespace, N, Option<(ItemKey, u32)>),
+    edges: &[(usize, usize)],
+    env: Env<'_, 'a, N>,
+    sink: &mut Sink<'a, N>,
+    alloc: Alloc<'a>,
+) {
+    let start = (sink.touched.len(), sink.need.len(), sink.waits.len());
+    let memo = sink
+        .memo
+        .entry(key)
+        .or_insert_with(|| Memo { table: Vec::new_in(alloc.clone()), keys: Vec::new_in(alloc.clone()), unsettled: false });
+    let mut fresh: AVec<'a, (usize, usize)> = Vec::new_in(alloc.clone());
+    for &(f, i) in edges.iter() {
+        if memo.table.binary_search_by(|&(tf, ti, _)| (tf, ti).cmp(&(f, i))).is_err() {
+            fresh.push((f, i));
+        }
+    }
+    memo.table.extend(fresh.iter().map(|&(f, i)| (f, i, Res::None)));
+    memo.table.sort_unstable_by_key(|&(f, i, _)| (f, i));
     let (ns, name, ignore) = key;
     // Each value only rises (none, a binding, a wider or ambiguous one, undetermined), so a
     // few rounds per edge settle it.
-    let bound = 4 * edges.len() + 4;
+    let bound = 4 * fresh.len() + 4;
+    sink.stats.fixpoints += 1;
+    sink.computing.push(key);
+    let mut settled = false;
     for _ in 0..bound {
         let mut changed = false;
-        for (k, &(f, i)) in edges.iter().enumerate() {
+        for &(f, i) in fresh.iter() {
+            sink.stats.fixpoint_evals += 1;
             let q = Query { asker: env.members[i].asker(), restricted: false, ignore };
             let r = env.members[f].lookup_module(ns, name, q, env, sink);
-            if let Some(table) = sink.memo.get_mut(&key) {
-                if table[k].2 != r {
-                    table[k].2 = r;
-                    changed = true;
+            if let Some(memo) = sink.memo.get_mut(&key) {
+                if let Ok(k) = memo.table.binary_search_by(|&(tf, ti, _)| (tf, ti).cmp(&(f, i))) {
+                    if memo.table[k].2 != r {
+                        memo.table[k].2 = r;
+                        changed = true;
+                    }
                 }
             }
         }
         if !changed {
-            return;
+            settled = true;
+            break;
         }
     }
-    sink.overrun = true;
+    sink.computing.pop();
+    if !settled {
+        sink.overrun = true;
+    }
+    let unsettled = sink.need.len() > start.1 || sink.waits.len() > start.2;
+    let Sink { memo, touched, .. } = sink;
+    if let Some(memo) = memo.get_mut(&key) {
+        memo.keys.extend_from_slice(&touched[start.0..]);
+        memo.keys.sort_unstable();
+        memo.keys.dedup();
+        memo.unsettled |= unsettled;
+    }
 }
 
 impl<'a, N: Name> Resolver<'a, N> {
@@ -167,6 +215,8 @@ impl<'a, N: Name> Resolver<'a, N> {
         env: Env<'_, 'a, N>,
         sink: &mut Sink<'a, N>,
     ) -> Res {
+        sink.stats.lookups += 1;
+        sink.touch(self.module, Some(name));
         if let Some(e) = self.defs.get(&(ns, name)) {
             return Res::Found(e.hit());
         }
@@ -386,13 +436,42 @@ impl<'a, N: Name> Resolver<'a, N> {
             sink.overrun = true;
             return Res::Wait;
         };
-        let key = (ns, name, ignore);
-        if !sink.memo.contains_key(&key) {
-            group_fixpoint(key, env, sink, self.alloc);
-        }
-        let found = sink.memo.get(&key).and_then(|table| {
-            table.binary_search_by(|&(tf, ti, _)| (tf, ti).cmp(&(f, me))).ok().map(|k| table[k].2)
+        // The ignored import matters only where it binds this name, in a module whose bindings
+        // the fixpoint reads: otherwise the fixpoint is the one with no import ignored, shared.
+        let ignore = ignore.filter(|&(m, i)| {
+            env.fellow(m).is_none_or(|r| r.imports.get(i as usize).is_none_or(|imp| imp.bound == Some(name)))
         });
+        let at = |sink: &Sink<'a, N>, key| {
+            sink.memo.get(&key).and_then(|memo: &Memo<'a, N>| {
+                let t = &memo.table;
+                t.binary_search_by(|&(tf, ti, _)| (tf, ti).cmp(&(f, me))).ok().map(|k| t[k].2)
+            })
+        };
+        let mut key = (ns, name, ignore);
+        let mut found = at(sink, key);
+        if found.is_none() {
+            let edges = glob_closure(me, env, self.alloc);
+            if let Some((m, _)) = ignore {
+                let read = env.index(m).is_some_and(|mi| edges.iter().any(|&(x, _)| x == mi));
+                if !read {
+                    key = (ns, name, None);
+                    found = at(sink, key);
+                }
+            }
+            if found.is_none() {
+                group_fixpoint(key, &edges, env, sink, self.alloc);
+                found = at(sink, key);
+            }
+        }
+        // A fixpoint being computed keeps what it reads itself; any other is replayed into the
+        // record of the item being planned.
+        if sink.scan == Scan::Early && !sink.computing.contains(&key) {
+            let Sink { memo, touched, unsettled, .. } = sink;
+            if let Some(memo) = memo.get(&key) {
+                touched.extend_from_slice(&memo.keys);
+                *unsettled |= memo.unsettled;
+            }
+        }
         match found {
             Some(r) => r,
             None => {
@@ -707,6 +786,7 @@ impl<'a, N: Name> Resolver<'a, N> {
     /// expanded calls and `#[macro_use]` children, out through the call a fragment expands,
     /// then the module's entry.
     fn textual(&self, name: N, at: At, env: Env<'_, 'a, N>, sink: &mut Sink<'a, N>) -> Res {
+        sink.touch(self.module, None);
         let mut frag = at.frag;
         let mut end = at.slot as usize;
         loop {
@@ -784,6 +864,7 @@ impl<'a, N: Name> Resolver<'a, N> {
     fn textual_out(&self, name: N, child: ItemKey, env: Env<'_, 'a, N>, sink: &mut Sink<'a, N>) -> Tex {
         if child != self.module {
             if let Some(f) = env.fellow(child) {
+                sink.touch(child, None);
                 let len = f.frags[0].slots.len();
                 return match f.textual_back(name, 0, len, env, sink) {
                     Tex::Hit(hit) => {
@@ -810,6 +891,7 @@ impl<'a, N: Name> Resolver<'a, N> {
     fn textual_entry(&self, name: N, env: Env<'_, 'a, N>, sink: &mut Sink<'a, N>) -> Res {
         let Some(&parent) = self.chain.get(1) else { return Res::None };
         if let Some(p) = env.fellow(parent) {
+            sink.touch(parent, None);
             return match p.find_mod(self.module) {
                 Some(at) => match p.textual(name, at, env, sink) {
                     Res::Found(hit) => {
@@ -1216,30 +1298,72 @@ impl<'a, N: Name> Resolver<'a, N> {
 
     /// Plans one pass: every import, glob and call that can move, from the state as it is (in
     /// a `Force` pass, only the calls).
+    /// Starts planning one item: it reads its own module's fragments, globs and calls.
+    fn begin_item(&self, sink: &mut Sink<'a, N>) -> Mark {
+        sink.stats.plans += 1;
+        let mark = sink.begin();
+        sink.touch(self.module, None);
+        mark
+    }
+
+    /// Whether item `i` of `kind` is clean: planned early, not sticky, and nothing it read
+    /// changed since. Its last plan's wait, if so.
+    fn clean(&self, kind: Kind, i: usize, env: Env<'_, 'a, N>) -> Option<bool> {
+        let w = crate::watch::watch(&self.stamps, kind, i)?;
+        let epoch = w.epoch?;
+        if w.sticky {
+            return None;
+        }
+        for &(module, name) in w.keys.iter() {
+            let stamps = if module == self.module { &self.stamps } else { &env.fellow(module)?.stamps };
+            if stamps.changed(name, epoch) {
+                return None;
+            }
+        }
+        Some(w.wait)
+    }
+
     pub(crate) fn plan<F: ScopeFacts<Name = N>>(
         &self,
         facts: &F,
         env: Env<'_, 'a, N>,
         sink: &mut Sink<'a, N>,
-    ) -> Result<Plan<'a>, ResolveError> {
+    ) -> Result<Plan<'a, N>, ResolveError> {
         let a = self.alloc.clone();
         let mut plan = Plan {
+            watched: Vec::new_in(a.clone()),
             imports: Vec::new_in(a.clone()),
             globs: Vec::new_in(a.clone()),
             calls: Vec::new_in(a.clone()),
             waiting: Vec::new_in(a),
             upto: self.upto(),
         };
+        let early = sink.scan == Scan::Early;
         if sink.scan != Scan::Force {
             for g in 0..self.globs.len() {
                 match &self.globs[g].source {
                     Source::Pending => {
+                        if early {
+                            if let Some(wait) = self.clean(Kind::Glob, g, env) {
+                                sink.stats.skipped += 1;
+                                if wait {
+                                    plan.waiting.push(Item::Glob(seg(g)));
+                                }
+                                continue;
+                            }
+                        }
+                        let mark = self.begin_item(sink);
                         let o = self.resolve_glob(g, facts, env, sink)?;
                         if o.wait {
                             plan.waiting.push(Item::Glob(seg(g)));
                         }
+                        let moved = o.source.is_some();
                         if let Some(source) = o.source {
                             plan.globs.push((seg(g), source, o.first));
+                        }
+                        if early {
+                            let w = sink.end(mark, self.stamps.clock, o.wait, moved, self.alloc);
+                            plan.watched.push((Kind::Glob, seg(g), w));
                         }
                     }
                     Source::Resolved { def, classes, .. } => {
@@ -1259,6 +1383,16 @@ impl<'a, N: Name> Resolver<'a, N> {
                 if stored.done() {
                     continue;
                 }
+                if early {
+                    if let Some(wait) = self.clean(Kind::Import, i, env) {
+                        sink.stats.skipped += 1;
+                        if wait {
+                            plan.waiting.push(Item::Import(seg(i)));
+                        }
+                        continue;
+                    }
+                }
+                let mark = self.begin_item(sink);
                 let o = self.resolve_import(i, env, sink);
                 if o.wait {
                     plan.waiting.push(Item::Import(seg(i)));
@@ -1270,8 +1404,13 @@ impl<'a, N: Name> Resolver<'a, N> {
                     }
                 }
                 let failed = stored.failed.or(o.failed);
-                if ns != stored.ns || failed != stored.failed {
+                let moved = ns != stored.ns || failed != stored.failed;
+                if moved {
                     plan.imports.push((seg(i), ns, failed, o.first));
+                }
+                if early {
+                    let w = sink.end(mark, self.stamps.clock, o.wait, moved, self.alloc);
+                    plan.watched.push((Kind::Import, seg(i), w));
                 }
             }
         }
@@ -1279,12 +1418,27 @@ impl<'a, N: Name> Resolver<'a, N> {
             if self.calls[c].state != CallState::Pending {
                 continue;
             }
+            if early {
+                if let Some(wait) = self.clean(Kind::Call, c, env) {
+                    sink.stats.skipped += 1;
+                    if wait {
+                        plan.waiting.push(Item::Call(seg(c)));
+                    }
+                    continue;
+                }
+            }
+            let mark = self.begin_item(sink);
             let o = self.resolve_call(c, env, sink);
             if o.wait {
                 plan.waiting.push(Item::Call(seg(c)));
             }
+            let moved = o.state.is_some();
             if let Some(state) = o.state {
                 plan.calls.push((seg(c), state, o.first));
+            }
+            if early {
+                let w = sink.end(mark, self.stamps.clock, o.wait, moved, self.alloc);
+                plan.watched.push((Kind::Call, seg(c), w));
             }
         }
         plan.waiting.sort_unstable();

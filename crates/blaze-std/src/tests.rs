@@ -119,6 +119,7 @@ mod requests;
 mod scopes;
 mod simtest;
 mod swap;
+mod syncs;
 mod unfinished;
 mod world;
 

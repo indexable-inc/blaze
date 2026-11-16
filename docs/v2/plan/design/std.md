@@ -746,8 +746,8 @@ substitute:
 | wanted | today | needs |
 |---|---|---|
 | `Durable::Started` | built: the change is made, then `Effect::WriteBack` (all-1110's effect: `sync_file_range` on Linux, `fsync` without `F_FULLFSYNC` on Apple's) is handed over and not waited for; a name change also begins its directory's `Effect::SyncDir` | nothing; `F_BARRIERFSYNC` on macOS comes with blaze-sys's macOS layer |
-| a name made durable after a remove, a create or `sync_names` on a real disk | built: `Effect::SyncDir` (`fsync` of the directory), waited for; refused on Windows, naming it, and for names directly beneath the driver's root (`FsKind::NoNameSync`: no `FileName` names the root) | a handle for the root (the opens beneath a handle, `core-effects-1109`); the Windows call |
-| an unsynced rename or publish that costs no sync on a real disk | the native rename syncs its directories itself, so `Durable::No` is true of the promise and not yet of the price | a rename effect that does not sync |
+| a name made durable after a remove, a create or `sync_names` on a real disk | built: `Effect::SyncDir` (`fsync` of the directory), waited for, the driver's root included (`DirName::Root`); refused on Windows, naming it | the Windows call |
+| an unsynced rename or publish that costs no sync on a real disk | built: an `_unsynced` call renames by `Effect::RenameUnsynced`; only a `_synced` one by the syncing `Effect::Rename`. The unsynced rename takes the caller's `Unsynced`, the synced one gives the proof `sync_names` takes; `tests/syncs.rs` asserts each call's effects, with a plant for each mistake | |
 | a read that does not copy | `Done::Read` hands back a buffer the driver made, copied into the caller's `Bytes` | the page pool (`file.pin`, S1f) |
 | a write that does not copy | each write's bytes are copied once into the effect, which owns them | registered buffers (`WriteFrom`), with S4 |
 
@@ -1851,6 +1851,30 @@ is used: crates/blaze-memchr (search), blaze-swiss (group probe), blaze-lex (lex
 skipping, UTF-8), blaze-solve (candidate fingerprints), blaze-text (digits), blaze-columns
 (bit-unpacking), blaze-blake3 (its own intrinsics, by rule 2).
 
+### What std makes easy to get slow, and bstd's form
+
+Each row is a mistake that ordinary Rust code makes without noticing, because the short name
+hides the cost. bstd's form says the cost or removes it; being longer or unusual is accepted.
+State as of 2026-11-15.
+
+| what std makes easy | what it costs | bstd's form | state |
+|---|---|---|---|
+| `Vec<Vec<T>>`, `Vec<String>`, `HashMap<K, Vec<V>>` | an allocation and a pointer a row; rows scattered over the heap | `Lists<T>`: one array of items and one of row ends; `Texts`: one byte buffer and its offsets; a multimap as sorted pairs | to build, blaze-own |
+| `map.entry(key.to_string())` | the key is allocated on every hit | `get_or_insert_with(&key, make)`: the owned key is made only on a miss | to build |
+| `v.remove(i)`, `v.insert(0, x)`, `v.contains(&x)`, `s.chars().nth(i)` | linear work behind a short name; quadratic in a loop | the name says the cost: `remove_shift`, `remove_swap`, `insert_shift`, `scan_for`; text has no `nth` | to build; old names deprecated first |
+| one `Vec` grown to a gigabyte | each doubling copies everything and holds old and new at once | `Segs<T>`: append-only segments, nothing moves, an index is two shifts | to build |
+| `Arc::clone` in a hot path on many cores | every clone writes one shared cache line | borrow from the scope; `share()` is visible; a biased count (the owning thread counts without atomics) where a handle must travel | measure on 18 and 128 cores, then build |
+| `read_dir`, then `metadata` on each entry | a system call a file | the names and stamps of a directory in one call | being built |
+| `File::open(path)` from the root each time, then `read_to_end` | a path walk a component, an `fstat`, a buffer filled with zeros first | open relative to a `Dir`; the size from the stamp; read into unfilled capacity; a small file in one open, read, close | partly there |
+| `sync_all` by habit; a rename that syncs | about 5 ms a file on macOS | durability is in the type; derived data is unsynced by default | a bstd bug of exactly this kind was found on 2026-11-15 (unsynced publishes renamed through the syncing rename); fixed, and asserted per call by `tests/syncs.rs` |
+| `println!`, `eprintln!` | a lock and a write a call; stderr is unbuffered | one buffer a command, flushed when full, at the end, or a line at a time only to a terminal | to build |
+| dropping everything before exit | freeing memory the kernel frees faster | a command prints its answer and exits; frames are not unwound at exit | to check on the exit path |
+| `available_parallelism()`, `Instant::now()`, `RandomState::new()` in hot code | files read, a clock call or a seed drawn, each call | the topology, the clock and the seed are values made once and passed (rule 75) | there |
+| a 300-byte struct moved by value through layers | a copy a hop | built in place (`make`); the nightly `large_assignments` lint with a limit | lint to turn on |
+| a `String` for every short text | 24 bytes and a heap block each; equality follows a pointer | interned ids for names; for columns of text a 16-byte string (length, a 4-byte prefix, inline up to 12 bytes) | to build with the query engine |
+| fresh memory for each task | a page fault every 16 KiB | a worker's frame is reset, not returned; large pages for big tables on Linux | to measure on Linux |
+| per-thread counters side by side | false sharing | `PerWorker<T>` padded to the target's cache line (128 bytes on Apple silicon) | to check |
+
 ## Prior art
 
 cap-std and WASI preopens (directories with no ambient authority), Zig's `std.Io` (IO passed
@@ -1858,3 +1882,101 @@ explicitly, swappable for tests), Trio and Kotlin (structured concurrency, cance
 TigerBeetle and FoundationDB (one IO interface, deterministic simulation), quinn-proto and wasm-host's guest ABI (protocols and programs as explicit state machines over ops and events), Austral and Pony
 (capabilities in the language), E and Fuchsia (narrowing, handles with rights), Capsicum and
 Landlock (the OS side).
+
+## Nightly features blaze's own code uses
+
+The owner, 2026-11-15: use any nightly feature that makes blaze better. Each row below was
+probed at the pin, `nightly-2026-10-27` (rustc 1.101.0-nightly 16d1ffac1), on an M-series
+Mac, with a small program of the kind blaze writes, one file each in
+/Volumes/Projects/blaze-int-1112-notes/nightly-probes/ (`run.sh <file>` builds with
+`-O -C target-cpu=native`, runs it and keeps the log in `out/`). Times are the best of 5 to 9
+runs, one machine, one day. The noise band matters: two functions that compiled to the same
+instructions measured 0.84 to 1.04 of each other (hints.rs), so a ratio inside 0.90 to 1.10
+is no effect until a profile says otherwise.
+
+Already used in the new crates, not probed again: allocator_api, portable_simd,
+min_specialization, trivial_clone, type_info, thread_local, rustc_attrs, dropck_eyepatch,
+coerce_unsized and unsize, fn_traits, const_trait_impl, register_tool, custom_inner_attributes.
+Also already on in live crates: decl_macro (hir-def), macro_attr (blaze-cli, blaze-std),
+contracts (blaze-std; see its row), fn_delegation (blaze-fmt).
+
+### Speed
+
+| feature | at the pin | what it buys | where | verdict | the probe's number |
+|---|---|---|---|---|---|
+| `loop_match` | incomplete | a state machine whose transitions are direct jumps: `loop { match }` goes back through a compare tree on the state every byte | blaze-lex's lexer, blaze-deflate's inflate loop, blaze-json, blaze-cbor, blaze-h1's parser | try behind a measured twin (incomplete: `#![allow(incomplete_features)]` with the reason) | a byte-class tokenizer over 64 MB: 38.8 ms against 112.1 ms (0.346, 1730 against 598 MB/s); no jump table in either, the plain one re-tests the state at its loop head (loop_match.rs) |
+| `explicit_tail_calls` with `extern "rust-preserve-none"` | incomplete; plain unstable | a threaded interpreter: each handler ends in `become` to the next, compiled to `br x0` with no frame on the hot path, the interpreter's state in callee-saved registers | any bytecode or MIR interpreter (const eval, the tier-0 runner) | try behind a measured twin | 0.280 against 0.475 ns an instruction (0.590), 350M instructions (tail_calls.rs) |
+| `core_intrinsics` `prefetch_read_data` | internal | the next lookups' lines requested before they are needed | a chain of dependent lookups whose addresses are known a batch ahead (a store index walk, a probe sequence) | try behind a measured twin; not for independent lookups | dependent chain into 256 MB: 117.36 to 4.15 ns a lookup (0.035); independent lookups: 3.66 against 3.68 (out-of-order execution already overlaps them) (prefetch.rs) |
+| `StaticSearch` with prefetch (blaze-kit) | as above | tried in the crate, reverted | blaze-kit | not yet | prefetching all 17 children each level: 1.5 to 2.7 times slower; a batched `lower_bounds` of 8 with the next node prefetched: 42.58 to 37.57 ns at 63.5M keys (0.88) but 2.04 to 3.87 at 1,000 and slower at every size below 4M in the crate's example (static_search.rs; the probe's own baseline was `#[inline(never)]` and overstated the gain) |
+| `core::hint::select_unpredictable` | stable | a select where LLVM would branch | only where the assembly shows a branch | use when the assembly asks | binary search: the plain `if` already compiles to `csel`, the two functions are the same instructions (hints.rs) |
+| `core::hint::cold_path`, `likely`/`unlikely` | stable; `likely_unlikely` unstable | block layout of the rare arm | rare arms in hot loops | no measured effect; use only with a twin | probe loop with tombstones: 0.913 to 1.033 (cold_path), 0.935 to 0.966 (unlikely); blaze-text's float specials and escape controls: f64 Display 28.8 to 28.1 ns, Debug 35.1 to 34.7, under the 5% bar, reverted (cold_error.rs, hints.rs, blaze-text cost) |
+| `extern "rust-cold"` (`rust_cold_cc`) | plain unstable | an error path the caller calls and then goes on from: the callee saves everything, so the caller spills less | a lexer or parser that records an error and continues | try behind a measured twin | the recovering loop: 66 to 58 instructions, 15 to 7 stack saves and loads; time 0.962 (noise); an error path that returns is a tail branch already, no change (cold_error.rs) |
+| `#[optimize(size)]` | stable | smaller cold code | cold constructors | use on cold code for size, not speed | 0.947 and 1.029 (noise) (cold_error.rs) |
+| `gen_blocks` | plain unstable | an iterator written as a loop with `yield` | set-bit walks (blaze-kit's `ChunkedBitSet`), worklists, tree walks | use now where the iterator's size does not matter | 64M bits: 24.79 against 24.97 ms (0.993); the state is 64 bytes against the hand-written 32 (gen_blocks.rs) |
+| `fn_align`, `static_align` | plain unstable | `#[rustc_align(64)]` on a function, `#[rustc_align_static(64)]` on a static: a hot loop or table on its own line, so benchmarks stop moving with unrelated code | hot loops measured by cost examples; lookup tables | use now on measured hot code | the aligned function and static sit at 0 mod 64; the plain static at 32 (align.rs) |
+| `vec_push_within_capacity` | plain unstable | a push that refuses instead of growing | std `Vec` callers that sized ahead (blaze-own's vectors have their own `try_`) | use now | 0.251 against 0.250 ns a push (1.005) (library.rs) |
+| `unix_file_vectored_at` | plain unstable | `pwritev`/`preadv` from std | the store's record writes and reads | use now | wrote and read 9 bytes in two slices at an offset (library.rs) |
+
+### Language
+
+| feature | at the pin | what it buys | where | verdict | the probe's result |
+|---|---|---|---|---|---|
+| `macro_derive`, `macro_attr`, `macro_metavar_expr`, `macro_metavar_expr_concat` | plain unstable | derives and attributes in `macro_rules!`: no proc-macro crate, nothing to sandbox or compile to wasm | small derives (field counts and names, getters, variant names), span attributes | use now for items without generics; a generic item must be parsed by hand (not probed) | a struct's 3 fields and names, `get_<field>` getters by `${concat}`, `${index()}`, an enum's 3 variant names, a `#[traced("kit")]` attribute: all right (macros.rs) |
+| `decl_macro` (`pub macro`) | plain unstable | a macro that is an item: named by path, private by default | every crate with a tool attribute at its root (agents/annoyances/crate-root-tool-attribute-hides-macros.json) | use now in place of `#[macro_export]` in such crates | under `#![blaze::sans_io]`: `crate::macros::value!` from another module and from another crate both compile; the `#[macro_export]` twin is refused with the recorded error (decl_macro_root.rs, decl_macro_lib.rs, macro_export_root.rs) |
+| `fn_delegation` | plain unstable | `reuse Trait::{a, b} { self.0 }` forwards a trait through a newtype | newtype ids and wrappers in blaze-kit and blaze-own | use now | three methods forwarded, right answers (ergonomics.rs) |
+| `default_field_values` | plain unstable | `Opts { x: 1, .. }` with defaults at the field | options whose defaults are decisions; not bounds the caller must choose (`Limits` stays without) | use now | right (ergonomics.rs) |
+| `deref_patterns` | plain unstable | match through an interned handle | the front end's interned types | use now; the type needs `unsafe impl DerefPure` (`deref_pure_trait`), an obligation to state | right through a user `Deref` (ergonomics.rs) |
+| `arbitrary_self_types` | plain unstable | methods on a handle (`self: Handle<'_, Node>`) through `Receiver` | arena and table handles | use now | right (ergonomics.rs) |
+| `super_let`, `try_blocks`, `impl_trait_in_assoc_type` | plain unstable | a borrowed temporary from a block; `?` without a closure; an unboxed iterator type in a trait | everywhere they read better | use now | right (ergonomics.rs) |
+| `const_closures` | plain unstable | closures called at compile time | `const` tables built by a function | use now; the bound needs `[const] Destruct` (`const_destruct`) | right (ergonomics.rs) |
+| `step_trait` | plain unstable | `a..b` of typed ids iterates ids | blaze-kit's `id!` types | use now (five methods to write, `forward_overflowing` and `backward_overflowing` among them) | `ItemId(3)..ItemId(7)` gives four ids (ids.rs) |
+| `pattern_types` | internal | a niche without a transform | ids | not yet: no gain | `Option` of a `u32 is 0..=0xFFFF_FFFE` is 4 bytes and sums 16M at 0.998 of blaze-kit's complement `NonMax`; `#[rustc_layout_scalar_valid_range_end]` is gone at the pin ("cannot find attribute") (ids.rs) |
+| `unsafe_fields` | incomplete | a field whose every write is an `unsafe` block: an obligation the type states (rule 76) | lengths and counts that memory safety rests on (blaze-own, blaze-kit's `InlineVec`) | try in one crate | right (incomplete.rs) |
+| `generic_const_items`, `sized_hierarchy` | incomplete; plain unstable | `const SLOTS<T>`; a `MetaSized` bound | per-type constants; size-of-value bounds | try where it reads better | right (incomplete.rs) |
+| `ergonomic_clones` | incomplete | `.use` and `use ||` | none | not yet: blaze keeps each clone explicit with its reason | right (incomplete.rs) |
+| `coroutines` | plain unstable | resumable functions | none | not yet: blaze writes sans-IO machines by hand (rule 14), `gen` covers iterators | right (incomplete.rs) |
+| `guard_patterns` | incomplete | a guard inside an or-pattern | none | **never at this pin: wrong code** | `(b'"' if !in_string) \| b'\''` matched every byte (`'7'` and `'x'` too) and the guard's variable was reported unused, with and without `-O`; the arm-guard twin is right (guard_patterns_bug.rs) |
+| `contracts` | incomplete | `requires`/`ensures` on a function | invariants stated once (rule 53) | not yet: off by default (a broken `ensures` returned unchecked); with `-Zcontract-checks=yes` a broken one is a non-unwinding panic that aborts the process (rule 20 wants one job failed); an `ensures` closure may not borrow an argument ("requires that `'1` must outlive `'static`"); blaze-std turns it on: check what it relies on | cost on a hot call 0.979 to 0.985 (noise) (contracts.rs) |
+| `custom_test_frameworks` | plain unstable | `#[test_case]` items handed to a runner of ours | gathering `blaze_sim::check` cases | not now: the cases are functions already | the runner got both cases (test_frameworks.rs) |
+
+### Library
+
+| feature | verdict | the probe's result (library.rs) |
+|---|---|---|
+| `iter_array_chunks` | use now on iterators (slices have the stable `as_chunks`) | right |
+| `maybe_uninit_fill` | use now | right |
+| `ascii_char` | use in blaze-text for ASCII-only buffers | right |
+| `uint_gather_scatter_bits` (`extract_bits`, `deposit_bits`) | try for packed keys; cost on arm64 not measured | a 12-bit field out and back, right |
+| `nonpoison_mutex` | not used: blaze's locks are its own (rule 12); note it is not `RefUnwindSafe` | the value after a panic under the lock is kept |
+| `sync_unsafe_cell` | use now for statics with their own synchronization | right |
+| `thread_spawn_hook` | not yet: an ambient hook (rule 75) | the hook ran for the named child |
+| `ptr_metadata` | use now | a slice pointer's length round-trips |
+| `const_heap` | try for compile-time tables | a 4-element table allocated in `const` |
+
+### Two more
+
+| feature | at the pin | what it buys | where | verdict | the probe's result |
+|---|---|---|---|---|---|
+| `large_assignments` with `#![move_size_limit = "N"]` | plain unstable | a warning at every move of a value over N bytes, after monomorphization | a ratchet over the whole tree, a limit per crate | use now at 256 as a finding, not a deny: it names real copies | a 300-byte struct through three functions: at 128 and 256, 7 warnings in a debug build (each of the three passes, the construction, the request's 496-byte profile made and returned) and 4 at `-O` (the passes inside the `#[inline(never)]` functions are gone); none at 1024; none without the attribute. Mirrors of blaze-drive's `Profile` (496 bytes, `Copy`, returned by value from the request) and `Request` (520) pass both 128 and 256; its `Condition` (66 bytes) passes neither; by `-Zprint-type-sizes`, 3 of the probe's 65 types are over 128 bytes, 3 over 256, none over 1024 (large_moves.rs) |
+| `read_buf`, `core_io_borrowed_buf` (`Read::read_buf` into a `BorrowedBuf` of `Vec::spare_capacity_mut`) | plain unstable | reading into capacity without zeroing it first | the store's record reads into a frame | use now where the caller sizes the buffer itself; `read_to_end` already reads unzeroed | 64 MB from the page cache: 2.73 ms, `read_to_end` 2.80 (1.022), zero then `read_exact` 3.04 (1.112) (read_buf.rs) |
+
+No probe panicked the compiler; no `rustc-ice-*.txt` was left.
+
+### Flags for building blaze itself
+
+The coordinator runs these on the whole tree; each names what to measure.
+
+- `-Zthreads=N`, the parallel front end: a cold `cargo check` of the workspace at N = 1, 8 and
+  the core count, wall time and peak memory; worth it if the critical-path crates (blaze-own,
+  blaze-hash, the front end) check faster without memory passing the ceiling.
+- `-Zcodegen-backend=cranelift` for test builds: `cargo test --no-run` time against LLVM at
+  `opt-level=0`, and that every test still passes; the tests' own run time is the cost.
+- cargo's checksum freshness (`-Zchecksum-freshness`): the incremental rebuild after a
+  `touch` with no content change, which mtimes rebuild and checksums do not; measure the no-op
+  build time.
+- `-Zprint-type-sizes`: one pass over the tree, sorted by size, the types above 64 bytes that
+  are held per item; each fat type found is a cost example's row.
+- `-Zrandomize-layout` in test builds: any test that starts failing relied on a layout no type
+  promised; the count of failures is the measure.
+- Miri's many-seeds mode (`-Zmiri-many-seeds`): the crates with `unsafe` (blaze-own,
+  blaze-kit, blaze-swiss) under 64 seeds; the measure is seeds that fail.

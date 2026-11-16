@@ -13,7 +13,7 @@
 //! | piece | what |
 //! |---|---|
 //! | [`Space`], [`SpaceBuilder`] | the request's variables in one stable order (by name), each with a [`VarKey`] from its name; the configurations it allows ([`Space::valid_in`]): one of the targets, and the features closed under Cargo's implications |
-//! | [`Bdd`], [`Cond`] | the arena (columns `var`, `low`, `high`; a unique table; a direct-mapped `ite` cache; a node cap) and an id into it, complement in the low bit |
+//! | [`Bdd`], [`Cond`] | the arena (rows of `var`, `low`, `high`; a unique table; a direct-mapped `ite` cache; a node cap) and an id into it, complement in the low bit |
 //! | [`Bdd::ite`] and the rest | `and`, `or`, `not`, `implies`, `restrict`, `exists`, `support`, `sat_count`, `any_sat`, with explicit stacks, no recursion |
 //! | [`isop`] | an irredundant sum of products (Minato-Morreale), printed in Rust's cfg syntax |
 //! | [`portable`] | a condition as rows of (variable key, low, high) in one canonical order; import refuses malformed rows by name |
@@ -38,13 +38,19 @@
 //!
 //! # The floor (rule 67), and the worst case
 //!
-//! One `ite` step that misses the cache is two cofactor reads, one cache probe and one
-//! unique-table probe: four to six loads, two of them likely cache misses once the arena
-//! outgrows L2, so 10 to 20 ns a step; inside L1, about 3 ns. A step that hits the cache is
-//! one probe. The cost example (`examples/cost.rs`) measures ns per step and states the
-//! ratio. Memory: 10 bytes a node in the columns, 8 in the unique table at its worst load (half
-//! full), 8 more in the traversal columns once a traversal ran; the cache is fixed at
-//! 16 bytes x 2^`cache_bits`.
+//! One `ite` step that misses the cache is up to three node reads (one row each: a node is a
+//! 12-byte row, not three columns, since every read wants all three fields), one cache probe and
+//! one unique-table probe (a slot holds the node's hash beside its number, so a probe reads the
+//! node only when the hashes agree). Inside L1 that is about 3 ns. Once the arena outgrows the
+//! last-level cache the cache probe and the unique-table probe are each a DRAM miss at random
+//! addresses that do not depend on each other, so the floor is about one DRAM latency a step,
+//! 80 to 100 ns on Apple silicon. Measured (`examples/cost.rs`, 32 variables, the arena at 6.2
+//! M nodes and 228 MB): 93 ns a step, so 0.9 to 1.2 times that floor; as three columns with a
+//! bare-number unique table it was 108. Real cfg conditions stay in L2 (the roots of tokio and
+//! rustix: 7k and 38k nodes, `valid` included), where lowering is dominated by finding the
+//! atom's variable by name, not by steps. Memory: 12 bytes a node, 16 in the unique table at
+//! its worst load (half full), 8 more in the traversal columns once a traversal ran; the cache
+//! is fixed at 16 bytes x 2^`cache_bits`.
 //!
 //! The variable order is fixed by name and never reordered (determinism over size): two builders
 //! of one key make the same nodes in the same order. A function's diagram can be exponential in

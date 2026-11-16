@@ -499,7 +499,7 @@ fn a_directory_made_is_listed_stated_and_removed_empty() {
     let mut effects = vec![Effect::MakeDir { dir: name("x"), tag: Tag(1) }];
     run_until_idle(&mut sim, &mut effects, |it, _| answers.push(it.done)).unwrap();
     let mut effects = vec![
-        Effect::List { dir: name("x"), tag: Tag(2) },
+        Effect::List { dir: name("x").into(), tag: Tag(2) },
         Effect::Stat { file: name("x"), tag: Tag(3) },
         Effect::MakeDir { dir: name("x/y/z"), tag: Tag(4) },
         Effect::MakeDir { dir: name("x"), tag: Tag(5) },

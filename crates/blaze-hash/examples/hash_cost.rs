@@ -215,61 +215,131 @@ fn miss_costs(words: usize) -> (f64, f64) {
     (latency, gather)
 }
 
-/// ns per lookup of `get_many` over `queries`, `B` at a time.
-fn batched<const B: usize>(map: &HashMap<u64, u32, Global>, queries: &[u64]) -> f64 {
+/// About 200 instructions of work that touches no memory: 50 rounds of a dependent
+/// xor-shift-multiply, so a lookup after it is outside the core's out-of-order window.
+#[inline(always)]
+fn work(seed: u64) -> u64 {
+    let mut x = seed;
+    for _ in 0..50 {
+        x = (x ^ (x >> 29)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    }
+    x
+}
+
+/// What a caller does with a lookup's answer: the three shapes measured.
+#[derive(Clone, Copy, PartialEq)]
+enum Shape {
+    /// Nothing: a tight loop of independent lookups, the control (out-of-order execution
+    /// already overlaps their misses).
+    Tight,
+    /// [`work`] before each lookup.
+    Work,
+    /// A second, dependent load: the record the found id names.
+    TwoStep,
+}
+
+/// One query's result under `shape`, the lookup's answer given.
+#[inline(always)]
+fn finish(shape: Shape, records: &[[u64; 4]], key: u64, value: Option<&u32>) -> u64 {
+    match (shape, value) {
+        (Shape::Tight, value) => u64::from(value.is_some()),
+        (Shape::Work, value) => work(key) ^ u64::from(value.copied().unwrap_or(0)),
+        (Shape::TwoStep, Some(&id)) => records[id as usize][0],
+        (Shape::TwoStep, None) => 0,
+    }
+}
+
+/// ns per query, one lookup at a time.
+fn shape_one(shape: Shape, map: &HashMap<u64, u32, Global>, records: &[[u64; 4]], queries: &[u64]) -> f64 {
     best_ns(queries.len(), || {
-        let mut found = 0;
-        for chunk in queries.chunks_exact(B) {
-            let keys: [&u64; B] = std::array::from_fn(|at| &chunk[at]);
-            found += map.get_many(keys).iter().filter(|value| value.is_some()).count();
+        let mut sum = 0u64;
+        for &key in queries {
+            sum = sum.wrapping_add(finish(shape, records, key, map.get(&key)));
         }
-        found
+        sum as usize
     })
 }
 
-/// Lookups one at a time against batches of 4 to 32 (`get_many`) and the slice form
-/// (`get_many_into`, a pipeline 8 keys deep), on a `HashMap<u64, u32>` of 10^3, 10^5 and
-/// 10^7 entries, with 2^20 random hits and misses; the floor is the misses a lookup takes on
-/// a table larger than the cache (a hit: its home control word and its slot's line, two; a
-/// miss: the word, one) times one overlapped miss, and the ratio is the best form's time
-/// over it.
+/// ns per query, `B` lookups at a time by `get_many`; for the two-step shape every found
+/// record's load is started before any is read.
+fn shape_batched<const B: usize>(
+    shape: Shape,
+    map: &HashMap<u64, u32, Global>,
+    records: &[[u64; 4]],
+    queries: &[u64],
+) -> f64 {
+    best_ns(queries.len(), || {
+        let mut sum = 0u64;
+        for chunk in queries.chunks_exact(B) {
+            let keys: [&u64; B] = std::array::from_fn(|at| &chunk[at]);
+            let values = map.get_many(keys);
+            if shape == Shape::TwoStep {
+                for &id in values.iter().flatten() {
+                    blaze_swiss::prefetch(records.as_ptr().wrapping_add(*id as usize));
+                }
+            }
+            for (&key, value) in chunk.iter().zip(values) {
+                sum = sum.wrapping_add(finish(shape, records, key, value));
+            }
+        }
+        sum as usize
+    })
+}
+
+/// Lookups one at a time against `get_many` batches of 4 to 32 on a `HashMap<u64, u32>` of
+/// 10^3, 10^5 and 10^7 entries, 2^20 random queries, in the three [`Shape`]s; and, for the
+/// tight loop, the slice form (`get_many_into`, a pipeline 8 keys deep). The floor, on a
+/// table past the cache, is the misses a query takes at one overlapped miss each (a hit: the
+/// control word and the slot's line; a miss: the word; the two-step shape: those and the
+/// record), plus the work alone for that shape.
 fn batch_rows() {
     let (latency, gather) = miss_costs(1 << 25);
+    let work_alone = best_ns(1 << 20, || {
+        (0..1u64 << 20).fold(0u64, |sum, at| sum.wrapping_add(work(black_box(at)))) as usize
+    });
     println!(
         "a miss over 256 MB: {latency:.1} ns alone, {gather:.2} ns overlapped ({:.1} misses \
-         out at once); a lookup's floor on a table past the cache: 2 misses, {:.2} ns",
+         out at once); the work alone: {work_alone:.2} ns",
         latency / gather,
-        2.0 * gather
     );
     println!(
-        "{:>9} {:<4} | {:>7} | {:>7} {:>7} {:>7} {:>7} | {:>7} | {:>7} {:>6}",
-        "entries", "", "one", "4", "8", "16", "32", "pipe8", "best/1", "/floor"
+        "{:>9} {:<10} | {:>7} | {:>7} {:>7} {:>7} {:>7} | {:>7} | {:>7} {:>6}",
+        "entries", "shape", "one", "4", "8", "16", "32", "pipe8", "best/1", "/floor"
     );
     for n in [1_000, 100_000, 10_000_000] {
         let (held, missed) = keys::<u64>(n);
         let mut map: HashMap<u64, u32, Global> = HashMap::with_capacity_in(n, Global);
         map.extend(held.iter().enumerate().map(|(at, key)| (*key, at as u32)));
+        let records: Vec<[u64; 4]> = (0..n as u64).map(|at| [at; 4]).collect();
         let pick = |from: &[u64], salt: u64| -> Vec<u64> {
             (0..1u64 << 20).map(|at| from[(splitmix(at ^ salt) % n as u64) as usize]).collect()
         };
-        for (label, queries) in [("hit", pick(&held, 1)), ("miss", pick(&missed, 2))] {
-            let one = best_ns(queries.len(), || {
-                queries.iter().filter(|key| map.get(*key).is_some()).count()
-            });
+        let (hits, misses) = (pick(&held, 1), pick(&missed, 2));
+        let rows = [
+            ("tight hit", Shape::Tight, &hits, 2.0 * gather),
+            ("tight miss", Shape::Tight, &misses, gather),
+            ("work hit", Shape::Work, &hits, work_alone + 2.0 * gather),
+            ("two-step", Shape::TwoStep, &hits, 3.0 * gather),
+        ];
+        for (label, shape, queries, floor) in rows {
+            let one = shape_one(shape, &map, &records, queries);
             let many = [
-                batched::<4>(&map, &queries),
-                batched::<8>(&map, &queries),
-                batched::<16>(&map, &queries),
-                batched::<32>(&map, &queries),
+                shape_batched::<4>(shape, &map, &records, queries),
+                shape_batched::<8>(shape, &map, &records, queries),
+                shape_batched::<16>(shape, &map, &records, queries),
+                shape_batched::<32>(shape, &map, &records, queries),
             ];
-            let mut out = vec![None; queries.len()];
-            let slice = best_ns(queries.len(), || {
-                map.get_many_into(&queries, &mut out);
-                out.iter().filter(|value| value.is_some()).count()
+            let slice = (shape == Shape::Tight).then(|| {
+                let mut out = vec![None; queries.len()];
+                best_ns(queries.len(), || {
+                    map.get_many_into(queries, &mut out);
+                    out.iter().filter(|value| value.is_some()).count()
+                })
             });
-            let best = many.iter().copied().fold(slice, f64::min);
+            let best = many.iter().copied().fold(slice.unwrap_or(f64::INFINITY), f64::min);
+            let slice = slice.map_or_else(|| "-".to_owned(), |ns| format!("{ns:.2}"));
             println!(
-                "{:>9} {:<4} | {:>7.2} | {:>7.2} {:>7.2} {:>7.2} {:>7.2} | {:>7.2} | {:>7.2} {:>6.2}",
+                "{:>9} {:<10} | {:>7.2} | {:>7.2} {:>7.2} {:>7.2} {:>7.2} | {:>7} | {:>7.2} {:>6.2}",
                 n,
                 label,
                 one,
@@ -279,10 +349,40 @@ fn batch_rows() {
                 many[3],
                 slice,
                 one / best,
-                best / (if label == "hit" { 2.0 } else { 1.0 } * gather)
+                best / floor
             );
         }
     }
+    owned_key_rows();
+}
+
+/// A hit on a `HashMap<String, u32>` of 10^5 names asked with a `&str`: `get_or_insert_with`
+/// (no owned key on a hit) against `entry(key.to_owned())` (one `String` made per call).
+fn owned_key_rows() {
+    let names: Vec<String> = (0..100_000u64).map(|at| format!("name-{}", splitmix(at))).collect();
+    let mut map: HashMap<String, u32, Global> = HashMap::new_in(Global);
+    map.extend(names.iter().enumerate().map(|(at, name)| (name.clone(), at as u32)));
+    let queries: Vec<&str> =
+        (0..1u64 << 20).map(|at| names[(splitmix(at ^ 4) % 100_000) as usize].as_str()).collect();
+    let borrowed = best_ns(queries.len(), || {
+        let mut sum = 0u32;
+        for &name in &queries {
+            sum = sum.wrapping_add(*map.get_or_insert_with(name, |name| (name.to_owned(), 0)));
+        }
+        sum as usize
+    });
+    let owned = best_ns(queries.len(), || {
+        let mut sum = 0u32;
+        for &name in &queries {
+            sum = sum.wrapping_add(*map.entry(name.to_owned()).or_insert(0));
+        }
+        sum as usize
+    });
+    println!(
+        "\nhit on HashMap<String, u32> of 10^5 by &str: get_or_insert_with {borrowed:.2} ns, \
+         entry(key.to_owned()) {owned:.2} ns ({:.1} times)",
+        owned / borrowed
+    );
 }
 
 fn main() {

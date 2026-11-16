@@ -630,7 +630,7 @@ impl Read {
                         }
                         Ok(Done::Stat(None)) => {
                             let dir = cx.dir.clone(); // clone: a refcount
-                            cx.ask(Wait::Files, |tag| Effect::List { dir, tag });
+                            cx.ask(Wait::Files, |tag| Effect::List { dir: dir.into(), tag });
                             self.stage = Reading::List;
                         }
                         Ok(other) => {
@@ -1660,7 +1660,7 @@ impl Reap {
                         }
                         Ok(Done::Stat(Some(_))) => {
                             let dir = cx.file(PINS);
-                            cx.ask(Wait::Reap, |tag| Effect::List { dir, tag });
+                            cx.ask(Wait::Reap, |tag| Effect::List { dir: dir.into(), tag });
                             self.stage = Reaping::ListPins;
                             return Step::Pending;
                         }
@@ -2766,7 +2766,7 @@ impl Open {
                     Step::Ready(Ok(held)) => {
                         self.held = Some(held);
                         let dir = cx.dir.clone(); // clone: a refcount
-                        cx.ask(Wait::Files, |tag| Effect::List { dir, tag });
+                        cx.ask(Wait::Files, |tag| Effect::List { dir: dir.into(), tag });
                         self.stage = Opening::List;
                         return Step::Pending;
                     }
@@ -3532,7 +3532,7 @@ impl RecoverDead {
                         st.seq = last.max(manifest.flushed()) + 1;
                         st.manifest = manifest;
                         let dir = cx.dir.clone(); // clone: a refcount
-                        cx.ask(Wait::Files, |tag| Effect::List { dir, tag });
+                        cx.ask(Wait::Files, |tag| Effect::List { dir: dir.into(), tag });
                         self.stage = Dying::List;
                         return Step::Pending;
                     }
@@ -3624,7 +3624,7 @@ impl PinJob {
                     match check(only(done.take()), || cx.path(PINS), doing) {
                         Ok(Done::Stat(Some(_))) => {
                             let dir = cx.file(PINS);
-                            cx.ask(Wait::Files, |tag| Effect::List { dir, tag });
+                            cx.ask(Wait::Files, |tag| Effect::List { dir: dir.into(), tag });
                             self.stage = Pinning::List;
                             return Step::Pending;
                         }

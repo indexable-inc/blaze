@@ -654,11 +654,11 @@ impl<C: Columns, A: Allocator> Soa<C, A> {
         drop(self.replace(row, new));
     }
 
-    /// Takes row `row` out and puts the last row in its place.
+    /// Takes row `row` out and puts the last row in its place: constant time, the order changed.
     #[track_caller]
-    pub fn swap_remove(&mut self, row: usize) -> C {
+    pub fn remove_swap(&mut self, row: usize) -> C {
         if row >= self.len {
-            out_of_bounds("Soa::swap_remove", row, self.len);
+            out_of_bounds("Soa::remove_swap", row, self.len);
         }
         let last = self.len - 1;
         // SAFETY: `row` and `last` hold values. `row` is read out; when they differ, the last
@@ -691,9 +691,9 @@ impl<C: Columns, A: Allocator> Soa<C, A> {
 
     /// Puts `new` at `row`, moving the rows after it back one: `O(len - row)` per column.
     #[track_caller]
-    pub fn insert(&mut self, row: usize, new: C) {
+    pub fn insert_shift(&mut self, row: usize, new: C) {
         if row > self.len {
-            out_of_bounds("Soa::insert", row, self.len);
+            out_of_bounds("Soa::insert_shift", row, self.len);
         }
         if self.len == self.cap {
             self.reserve(1);
@@ -707,11 +707,11 @@ impl<C: Columns, A: Allocator> Soa<C, A> {
         self.len += 1;
     }
 
-    /// Takes row `row` out, moving the rows after it forward one.
+    /// Takes row `row` out, moving the rows after it forward one: `O(len - row)` per column.
     #[track_caller]
-    pub fn remove(&mut self, row: usize) -> C {
+    pub fn remove_shift(&mut self, row: usize) -> C {
         if row >= self.len {
-            out_of_bounds("Soa::remove", row, self.len);
+            out_of_bounds("Soa::remove_shift", row, self.len);
         }
         // SAFETY: row `row` holds values, read out once; rows `row + 1..len` then move into its
         // place and the length stops counting the last.
@@ -844,6 +844,30 @@ unsafe impl<#[may_dangle] C: Columns, A: Allocator> Drop for Soa<C, A> {
         });
         // SAFETY: rows `0..len` hold values, dropped once; nothing reads them after.
         unsafe { C::drop_rows(cols, 0, len) };
+    }
+}
+
+/// The old names, whose cost the name did not say; each forwards to the one that says it.
+impl<C: Columns, A: Allocator> Soa<C, A> {
+    #[deprecated(note = "renamed `remove_swap`, beside `remove_shift`")]
+    #[track_caller]
+    #[inline]
+    pub fn swap_remove(&mut self, row: usize) -> C {
+        self.remove_swap(row)
+    }
+
+    #[deprecated(note = "linear: use `insert_shift`, which says so")]
+    #[track_caller]
+    #[inline]
+    pub fn insert(&mut self, row: usize, new: C) {
+        self.insert_shift(row, new);
+    }
+
+    #[deprecated(note = "linear: use `remove_shift`, or `remove_swap` when order does not matter")]
+    #[track_caller]
+    #[inline]
+    pub fn remove(&mut self, row: usize) -> C {
+        self.remove_shift(row)
     }
 }
 
@@ -1063,19 +1087,40 @@ macro_rules! soa {
                 self.raw.set(row, new.__into_columns());
             }
 
+            /// Costs and panics as `Soa::remove_swap`'s.
+            #[track_caller]
+            pub fn remove_swap(&mut self, row: usize) -> $Row {
+                $Row::__from_columns(self.raw.remove_swap(row))
+            }
+
+            /// Costs and panics as `Soa::insert_shift`'s: linear.
+            #[track_caller]
+            pub fn insert_shift(&mut self, row: usize, new: $Row) {
+                self.raw.insert_shift(row, new.__into_columns());
+            }
+
+            /// Costs and panics as `Soa::remove_shift`'s: linear.
+            #[track_caller]
+            pub fn remove_shift(&mut self, row: usize) -> $Row {
+                $Row::__from_columns(self.raw.remove_shift(row))
+            }
+
+            #[deprecated(note = "renamed `remove_swap`, beside `remove_shift`")]
             #[track_caller]
             pub fn swap_remove(&mut self, row: usize) -> $Row {
-                $Row::__from_columns(self.raw.swap_remove(row))
+                self.remove_swap(row)
             }
 
+            #[deprecated(note = "linear: use `insert_shift`, which says so")]
             #[track_caller]
             pub fn insert(&mut self, row: usize, new: $Row) {
-                self.raw.insert(row, new.__into_columns());
+                self.insert_shift(row, new);
             }
 
+            #[deprecated(note = "linear: use `remove_shift`, or `remove_swap` when order does not matter")]
             #[track_caller]
             pub fn remove(&mut self, row: usize) -> $Row {
-                $Row::__from_columns(self.raw.remove(row))
+                self.remove_shift(row)
             }
 
             /// Keeps the rows `keep` says yes to; costs and panics as `Soa::retain`'s.

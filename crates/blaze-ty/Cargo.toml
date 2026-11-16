@@ -1,6 +1,6 @@
 [package]
 name = "blaze-ty"
-description = "blaze's type representation and inference tables, written new: one arena per type-checking task in columns (a type is a 4-byte id, hash-consed through a 16-wide SIMD tag probe), flags computed at intern time, union-find variable tables under one undo log, an iterative relate with variance, the occurs check and generalization, folding and substitution with a per-pass memo, canonicalization for the trait solver, the portable form for records and printing; `no_std`, no recursion, no `unsafe`"
+description = "blaze's type representation and inference tables, written new: one arena per type-checking task in columns (a type is a 4-byte id, hash-consed through a SIMD tag probe of 24-slot cache-line groups), flags computed at intern time, union-find variable tables under one undo log, an iterative relate with variance, the occurs check and generalization, folding and substitution with a per-pass memo, canonicalization for the trait solver, the portable form for records and printing; `no_std`, no recursion, no `unsafe`"
 publish = false
 
 version.workspace = true

@@ -205,7 +205,14 @@ struct Open {
     holds_items: bool,
     attrs: AttrSpan,
     children: u32,
+    /// Where its child entries' digests start in [`Walk::closed`].
+    closed_from: usize,
 }
+
+/// The tag of a run of an entry's own bytes in its digest.
+const BYTES: u8 = 0;
+/// The tag of a child entry's digest in its parent's.
+const CHILD: u8 = 1;
 
 struct Walk<'t, 'l, 'a> {
     /// The file. The lexer's tokens are the skeleton's (crate::skeleton), the same as the
@@ -510,6 +517,7 @@ impl<'t, 'l, 'a> Walk<'t, 'l, 'a> {
             holds_items: false,
             attrs: AttrSpan { start: at, end: at },
             children: 0,
+            closed_from: self.closed.len(),
         });
     }
 
@@ -733,13 +741,38 @@ impl<'t, 'l, 'a> Walk<'t, 'l, 'a> {
         let count = self.siblings.entry(key).or_insert(0);
         let disambiguator = *count;
         *count += 1;
-        // The digests are of the entry's bytes; the signature's is the prefix's, read from the
-        // same hasher at the cut.
+        // The Merkle step (crate docs, "Identity"): the entry's own bytes, each child entry's
+        // digest where the child stands, and the signature's digest read from the same hasher
+        // at the cut. Every byte goes through one hasher, its innermost entry's.
         let mut digest = Hasher::new(ITEM_DOMAIN);
-        digest.update(&[self.edition]).update(&bytes[at(start)..at(signature_end)]);
-        let signature_hash = digest.finish();
-        digest.update(&bytes[at(signature_end)..at(end)]);
+        digest.update(&[self.edition]);
+        let mut fed = start;
+        let mut signature_hash = None;
+        for &(child, child_digest) in &self.closed[open.closed_from..] {
+            if signature_hash.is_none() && signature_end <= child.start {
+                digest.update(&[BYTES]).part(&bytes[at(fed)..at(signature_end)]);
+                signature_hash = Some(digest.finish());
+                fed = signature_end;
+            }
+            digest.update(&[BYTES]).part(&bytes[at(fed)..at(child.start)]);
+            digest.update(&[CHILD]).id(&child_digest);
+            fed = child.end;
+        }
+        let signature_hash = match signature_hash {
+            Some(signature_hash) => signature_hash,
+            None => {
+                assert!(fed <= signature_end, "an entry's signature ends outside its children");
+                digest.update(&[BYTES]).part(&bytes[at(fed)..at(signature_end)]);
+                fed = signature_end;
+                digest.finish()
+            }
+        };
+        digest.update(&[BYTES]).part(&bytes[at(fed)..at(end)]);
         let hash = digest.finish();
+        self.closed.truncate(open.closed_from);
+        if open.parent.is_some() {
+            self.closed.push((Range::new(start, end), hash));
+        }
         let after = u32::try_from(self.out.items.len()).expect("an outline's entries are counted in u32");
         self.out.items[open.index.at()] = Item {
             detail: kind,

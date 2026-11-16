@@ -697,9 +697,9 @@ impl Sim {
     /// The directories made under `dir`, `dir` not one of them.
     pub(super) fn made_under<'a>(
         &'a self,
-        dir: &'a FileName,
+        dir: &'a crate::DirName,
     ) -> impl Iterator<Item = &'a FileName> + 'a {
-        self.host.made.iter().filter(move |it| *it != dir && it.is_under(dir))
+        self.host.made.iter().filter(move |it| dir.name() != Some(*it) && dir.holds(it))
     }
 
     /// Whether `dir` is a directory made.

@@ -256,11 +256,16 @@ once; the plant `RanUnderCondition` (an asker served a fork it does not imply) i
 
 ## The system side (blaze-cli)
 
-- **Sweep.** Behind one trait (`sweep::Sweeper`), so blaze-solo's parallel stat sweep (its lane)
-  plugs in: it answers every file's (path, content id, changed) and the gone ones. Today's
-  implementation is bstd's `Dir::list` and a read and hash of every file: bstd's `Meta` has no
-  stamp, so Relax's stat rule cannot run yet (gap). The leaf table is written after `WriteLast`, so a
-  crash between them reports more files changed, never fewer. Its lanes: `Config::workers`.
+- **Sweep.** `sweep::StatSweep<S: Stamps>`: list, then read and hash only a file whose stamp
+  (len, mtime, ctime, ino, dev) is unknown, differs from its leaf row (path, stamp, digest;
+  `BCL2`), or is racy (changed within the clock's granularity of the sweep: stored unknown, so
+  hashed again next time). Today `FromMeta` knows no stamp (bstd's `Meta` has none: the blaze-std
+  lane's), so every file is read; the simulation test proves an unchanged, settled tree reads no
+  byte, with a planted racy-stamp bug caught. The leaf table goes after `WriteLast`: a crash
+  reports more files changed, never fewer. **Floor** (a million lines, about 4,000 files in 500
+  directories): a stat per file in directory batches (`getattrlistbulk`; batched `statx`) on
+  every core, (dirs x t_dir + files x t_stat) / cores, no byte read. Measured on reth at a named
+  commit: a repeat check's `sweep` phase against those calls timed alone; the ratio goes here.
 - **Store.** Behind one trait (`store::Store`: `get_into`, `put`, `after_answer`). The open it
   is to call is blaze-cas's `plain::Driven::open(root, settings)`, then
   `Driven::machine(&[checkout, home])` before any put to a shared namespace (a value naming the
@@ -268,29 +273,23 @@ once; the plant `RanUnderCondition` (an asker served a fork it does not imply) i
   (`get_into`). After the answer is printed, never waited on by it: `seal()`, then `compact(n)`.
   The profile logs `report().sealed` and `report().checked`. Not reached yet: `Driven` takes
   std's `Path` and `Vec`, and blaze-cli reaches the system only through bstd, so it needs a bstd
-  driver of the plain store (gap, blaze-cas's lane). Until then the trait's one implementation is
-  one file per record under `.blaze/v2/records/`, written whole through bstd. This is a stand-in:
-  it is not the floor above and is not measured against it.
+  driver of the plain store (gap, blaze-cas's lane). Until then: a file per record under
+  `.blaze/v2/records/`, a stand-in not measured against the floor above.
 - **Units.** A small reader of `[package] edition` and the default targets (`src/lib.rs`,
   `src/main.rs`, `src/bin/*.rs`). It refuses by line any table other than package, profile and
-  lints, and any dependency or build script (blaze-manifest is std and third-party). Gap: target
-  discovery reads the file list, and the units' source holds only the manifests. So a crate root
-  added without a manifest edit is outside the build until the manifest changes. The fix is the
-  key: the root candidates' presence goes into the units' source.
+  lints, and any dependency or build script. Gap: a crate root added without a manifest edit is
+  outside the build (the units' source holds only manifests); fix: root candidates in its key.
 - **Tasks today** (`work.rs`): `Units`, and `FileItems` (blaze-file-items' outline). A file's
   record is its `FileItems` record bytes, each `mod x;` is a `Locate::File` part (`x.rs` by
   rustc's rule; `x/mod.rs` and `#[path]` are not looked for yet), and each syntax error is a
-  finding. No item part is listed until blaze-typeck's `Signature` and `BodyCheck` tasks exist.
-  So `blaze check` today is a syntax check of every file the crate roots reach. Every other kind
-  answers `Failed`, naming itself. Runs go one at a time on the cli's thread (not yet ported to
-  batches); the pool waits on bstd (above).
+  finding: until blaze-typeck's tasks exist, `blaze check` is a syntax check of every file the
+  roots reach; other kinds answer `Failed`. Runs go one at a time (the pool waits on bstd).
 - **Printing.** `file:line:col` from the file's line table at print time (`lines.rs`).
 - **Profile.** Per kind: standing, found, made, fetched, entries, time; gets, hits, puts, pages;
   segments; then `phases` (each phase of the command in order, ns, on the clock `main` is
   handed) and `request` (steps and each effect kind summed). Written in place after the answer
   is printed, never synced. **Repeat-check floor:** one open, one read, a stat per file, a print:
-  0.3 ms in main. Debug, 2026-11-15: 0.96 ms (ratio 3.2): the frame's first chunk 0.31, the
-  sweep (reads and hashes every file) 0.29. A directory sync on every publish cost 5 ms each.
+  0.3 ms in main. Debug, 2026-11-15: 0.96 ms (3.2x): frame's first chunk 0.31, sweep 0.29.
 - `export` and `build` say they are not built.
 
 ## Not decided here

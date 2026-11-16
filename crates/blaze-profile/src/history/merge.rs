@@ -1,6 +1,6 @@
 //! A merge's bytes: the rows of Parquet files of one schema as one file, their column chunks
-//! copied as they are, with no decode and no re-encode, so row groups stay the size their flush
-//! wrote. Pure: the inputs are bytes in memory (a mapping of each, [`Input::of`]) and the
+//! copied with no decode and no re-encode of their values (only their pages compressed, a
+//! merge being cold), so row groups stay the size their flush wrote. Pure: the inputs are bytes in memory (a mapping of each, [`Input::of`]) and the
 //! output is handed out a piece at a time ([`Concat::next`]) for its writer to append. Who
 //! reads and writes the files is its caller: the history's core ([`super::files`]) through
 //! effects, the gate through its own files. The copying is [`blaze_parquet::Concat`]'s; this is
@@ -76,10 +76,13 @@ impl From<blaze_parquet::Failed> for Failed {
 impl Concat {
     /// The merge of `inputs` (at least one, all of the first one's schema). Its metadata says
     /// the rows the inputs' footers held ([`MERGED_ROWS`]), and the first input's other keys
-    /// (`blaze.schema`, `blaze.table`, `blaze.clock`).
+    /// (`blaze.schema`, `blaze.table`, `blaze.clock`). A merge is a cold file: its pages are
+    /// zstd ([`blaze_parquet::Compression::COLD`]), a build's own files' recompressed.
     pub(crate) fn new(inputs: Vec<Input>) -> Result<Concat, Failed> {
         let inputs = blaze_own::Vec::from_iter_in(inputs.into_iter().map(|it| it.0), Global);
-        blaze_parquet::Concat::new(inputs, MERGED_ROWS, PIECE, Global).map(Concat).map_err(Failed::from)
+        blaze_parquet::Concat::new(inputs, MERGED_ROWS, PIECE, blaze_parquet::Compression::COLD, Global)
+            .map(Concat)
+            .map_err(Failed::from)
     }
 
     /// The next piece of the output's bytes, `None` once it was all handed out: at least

@@ -131,6 +131,16 @@ pub trait Writes: Put {
         self
     }
 
+    /// `x` in `{:?}`'s layout, read from its type by reflection: `Point { x: 1, y: 2 }`,
+    /// `Some("a\n")`, `[1, 2]`, `(1,)`; a type's own [`crate::DebugForm`] where it has one. No
+    /// derive and no bound; what reflection cannot read stops the build naming the type.
+    #[inline]
+    fn debug<T: ?Sized>(&mut self, x: &T) -> &mut Self {
+        let mut sink: &mut Self = self;
+        crate::debug::debug(x, &mut sink);
+        self
+    }
+
     /// Exactly `places` places, rounded half to even from the exact value, as `{:.places}`.
     #[inline]
     fn float_fixed<F: Float>(&mut self, x: F, places: usize) -> &mut Self {

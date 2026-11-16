@@ -2055,8 +2055,8 @@ mod tests {
                     18 => {
                         Effect::Rename { from: file.clone(), to: name("vfs/moved"), tag: Tag(19) }
                     }
-                    19 => Effect::List { dir: name("vfs"), tag: Tag(20) },
-                    20 => Effect::List { dir: name("missing"), tag: Tag(21) },
+                    19 => Effect::List { dir: name("vfs").into(), tag: Tag(20) },
+                    20 => Effect::List { dir: name("missing").into(), tag: Tag(21) },
                     21 => Effect::WriteAt {
                         file: name("missing"),
                         at: 0,

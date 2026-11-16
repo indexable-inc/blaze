@@ -67,6 +67,7 @@ pub(crate) fn expand(
         BuiltinDerive::PartialEq => w.derive_partial_eq(),
         BuiltinDerive::Ord => w.derive_ord(false),
         BuiltinDerive::PartialOrd => w.derive_ord(true),
+        BuiltinDerive::ConstParamTy => w.derive_const_param_ty(),
     }
 }
 
@@ -321,6 +322,13 @@ impl<'a> W<'_, '_, 'a> {
     /// A marker trait's impl: `Copy`, `Eq`.
     fn marker(&mut self, path: &str, copy: bool) -> Written {
         self.header(path, true, copy)?;
+        self.code("{ }")
+    }
+
+    /// `impl<T: ConstParamTy_> ConstParamTy_ for S<T> { }`: never const, as the trait is no
+    /// const trait, whether called by `derive` or `derive_const`.
+    fn derive_const_param_ty(&mut self) -> Written {
+        self.header_as("$crate::marker::ConstParamTy_", true, false, Constness::NotConst)?;
         self.code("{ }")
     }
 

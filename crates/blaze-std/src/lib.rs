@@ -552,6 +552,8 @@ pub(crate) enum Plant {
     PublishBeforeRename,
     /// A `_synced` file call skips the sync of its directory's names.
     DurableSkipsNameSync,
+    /// An `_unsynced` rename or publish renames through the syncing `Effect::Rename`.
+    UnsyncedRenameSyncs,
     /// `Written::flush` asks for the flush and hands out its `Flushed` without waiting for it.
     FlushedBeforeFlush,
     /// `Flushed::clone_to` does not look at whether its file was changed behind it.

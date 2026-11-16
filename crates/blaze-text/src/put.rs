@@ -110,3 +110,25 @@ impl Put for Count {
         self.chars += 1;
     }
 }
+
+/// A string in `alloc` from one chain of writers, so a format site is one expression:
+/// `text_in(Global, |out| out.str("x = ").int(x))`. It grows as it is written; for one
+/// allocation at the exact size, [`text_exact_in`].
+#[inline]
+pub fn text_in<A: Allocator>(alloc: A, write: impl for<'o> FnOnce(&'o mut String<A>) -> &'o mut String<A>) -> String<A> {
+    let mut out = String::new_in(alloc);
+    write(&mut out);
+    out
+}
+
+/// A string in `alloc` from one chain of writers, allocated once at its exact size: the chain
+/// is run twice, first into a [`Count`], then into a string of that capacity. For a string
+/// that is kept (a key, a record's text), where `text_in`'s growth would leave slack.
+#[inline]
+pub fn text_exact_in<A: Allocator>(alloc: A, write: impl for<'o> Fn(&'o mut dyn Put) -> &'o mut dyn Put) -> String<A> {
+    let mut count = Count::new();
+    write(&mut count);
+    let mut out = String::with_capacity_in(count.bytes, alloc);
+    write(&mut out);
+    out
+}

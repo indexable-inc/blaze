@@ -57,6 +57,7 @@ impl<'a, N: Name> Resolver<'a, N> {
         facts: &F,
         env: Env<'_, 'a, N>,
         fellows: &[ItemKey],
+        stats: &mut crate::resolver::FillStats,
     ) -> Result<Finish<'a, N>, ResolveError> {
         let a = self.alloc.clone();
         let mut sink = Sink::new_in(a, Scan::Final);
@@ -106,6 +107,9 @@ impl<'a, N: Name> Resolver<'a, N> {
                 },
             }
         }
+        sink.stats.finals += 1;
+        stats.add(&sink.stats);
+        sink.stats = crate::resolver::FillStats::default();
         sink.check(self.module)?;
         undetermined.sort_unstable_by(|x, y| self.tree_cmp(x.0, y.0).then(x.1.cmp(&y.1)));
         undetermined.dedup_by(|x, y| x.1 == y.1);

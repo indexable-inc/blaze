@@ -23,7 +23,8 @@ use blaze_format::Aligned;
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_impls::{
     BucketKey, BucketView, CrateFlags, CrateGraphView, CrateImpls, CrateIndex, CrateInput,
-    DepInput, DirectoryView, EdgeFlags, Edition, ImplFlags, ImplRead, ImplRecords, ImplRow,
+    DepInput, DirectoryView, EdgeFlags, Edition, ImplFlags, ImplIndexError, ImplRead,
+    ImplRecords, ImplRow,
     Incoherent, IntWidth, LangError, LangItem, LangItemsError, LangItemsView, LangName,
     LangNameError, LangRead, LangRecords, MAX_LANG_NAME,
     Mutability, NoImplsOfView, RecordKind, SelfShape, Shape, build_crate_graph, build_impl_index,
@@ -485,6 +486,57 @@ fn a_miss_reads_no_bucket_and_every_read_is_noted() {
         }
         Ok(())
     });
+}
+
+/// `const impl<I: [const] Iterator<Item: IntoIterator>> Flatten<I> { .. }`
+/// (core/src/iter/adapters/flatten.rs:189) is an inherent impl's own form: filed as any
+/// inherent impl. An impl refused (an inherent `unsafe impl`, an impl given twice) is a
+/// finding on that impl, and the crate's other impls are filed: one failure fails one impl.
+#[test]
+fn an_inherent_const_impl_is_filed_and_a_refused_impl_fails_alone() {
+    let krate = crate_key(0);
+    let flatten = shape(Shape::Def(item(krate, KIND_ADT, 0)));
+    let row = |n: usize, trait_: Option<ItemKey>, flags: ImplFlags| ImplRow {
+        impl_: item(krate, KIND_IMPL, n),
+        trait_,
+        shape: flatten,
+        flags,
+        header: ContentId::of("blaze-impls test header", &n.to_le_bytes()),
+    };
+    let const_inherent = row(0, None, ImplFlags::CONST);
+    let unsafe_inherent = row(1, None, ImplFlags::UNSAFE);
+    let twice = row(2, Some(item(krate, KIND_TRAIT, 0)), ImplFlags::NONE);
+    let plain = row(3, Some(item(krate, KIND_TRAIT, 1)), ImplFlags::CONST);
+    let rows = [twice, const_inherent, unsafe_inherent, plain, twice];
+    let built = build_impl_index(krate, &rows, Alloc::global())
+        .unwrap_or_else(|error| panic!("one refused impl refused the crate's index: {error}"));
+    let mut refused: Vec<ImplIndexError> = built.refused.iter().copied().collect();
+    refused.sort_by_key(|it| format!("{it:?}"));
+    let mut expected = vec![
+        ImplIndexError::InherentFlags { impl_: unsafe_inherent.impl_, flags: ImplFlags::UNSAFE },
+        ImplIndexError::DuplicateImpl { impl_: twice.impl_ },
+    ];
+    expected.sort_by_key(|it| format!("{it:?}"));
+    assert_eq!(refused, expected);
+    let filed: Vec<ImplRow> = built
+        .buckets
+        .iter()
+        .flat_map(|bucket| {
+            let bytes = Aligned::copy_from(&bucket.bytes);
+            let view = BucketView::read(&bytes).expect("a built bucket reads back");
+            (0..view.len())
+                .map(|at| view.row(at).expect("a row in range").expect("a built row reads back"))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert!(filed.contains(&const_inherent), "{filed:?}");
+    assert!(filed.contains(&plain), "{filed:?}");
+    assert_eq!(filed.len(), 2, "{filed:?}");
+    // The same rows in another order write the same index and the same findings.
+    let reversed: Vec<ImplRow> = rows.iter().rev().copied().collect();
+    let again = build_impl_index(krate, &reversed, Alloc::global()).expect("as above");
+    assert_eq!(again.directory, built.directory);
+    assert_eq!(again.refused[..], built.refused[..]);
 }
 
 /// Each bucket's key and content id, by key.

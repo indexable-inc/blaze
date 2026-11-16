@@ -40,7 +40,7 @@ use bstd::{Cx, Io, entry::Error};
 use crate::checkout::Checkout;
 use crate::phases::Phases;
 use crate::store::{FileStore, Store};
-use crate::sweep::{Leaves, ReadAll, Sweeper};
+use crate::sweep::{FromMeta, Leaf, Leaves, StatSweep, Sweeper};
 
 /// Why a command stopped: each names its thing (rule 19).
 #[derive(Debug)]
@@ -147,7 +147,7 @@ fn command(cx: &Cx, io: &Io, out: &Out, err: &Out, phases: &mut Phases) -> Resul
     // The frame's first allocation takes its first chunk from blaze-mem: its own phase, so the
     // line says what that costs apart from the arguments' parse.
     drop(Vec::<u8, &Frame>::with_capacity_in(1, frame));
-    phases.mark("frame's first chunk");
+    phases.first_chunk();
     let dir = match checkout::checkout(args.get(2), frame)? {
         Checkout::Under(dir) => dir,
         Checkout::Here => return Err(CliError::Here),
@@ -207,7 +207,7 @@ fn request(
     let leaves = Leaves::read(&cx, root, frame)?;
     phases.mark("leaf table");
     let mut swept = Vec::new_in(frame);
-    ReadAll.sweep(&cx, root, frame, &mut swept)?;
+    StatSweep { stamps: FromMeta, plant: sweep::Plant::None }.sweep(&cx, root, &leaves, frame, &mut swept)?;
     phases.mark("sweep");
     let mut files: Vec<FileEntry<'_>, &Frame> = Vec::with_capacity_in(swept.len(), frame);
     for leaf in swept.iter() {
@@ -300,7 +300,7 @@ fn request(
             }
             Effect::WriteLast { bytes } => {
                 root.publish(&cx, &last_path, bstd::fs::Content::bytes(&bytes), bstd::fs::Durable::No)?;
-                leaves_after(&cx, root, &files, frame)?;
+                leaves_after(&cx, root, &swept, frame)?;
                 phases.request.write_last += phases.since(at);
             }
             Effect::Done(mut answer) => {
@@ -316,6 +316,6 @@ fn request(
 }
 
 /// The leaf table goes after `last`: a crash between them reports more files changed, never fewer.
-fn leaves_after(cx: &Cx, root: &Dir<ReadWrite>, files: &[FileEntry<'_>], frame: &Frame) -> Result<(), CliError> {
-    Leaves::write(cx, root, files, frame)
+fn leaves_after(cx: &Cx, root: &Dir<ReadWrite>, swept: &[Leaf<'_>], frame: &Frame) -> Result<(), CliError> {
+    Leaves::write(cx, root, swept, frame)
 }

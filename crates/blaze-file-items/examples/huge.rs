@@ -95,8 +95,11 @@ fn main() {
         let mut count = 0;
         for _ in 0..3 {
             let start = Instant::now();
-            let ranges = split_top_level(&text, Alloc::global());
+            let split_ranges = split_top_level(&text, Alloc::global());
             let split = ms(start);
+            // The workers read the ranges from a column over the global heap, which is `Sync`.
+            let mut ranges = Vec::<Range, Global>::with_capacity_in(split_ranges.len(), Global);
+            ranges.extend_from_slice(&split_ranges);
             let next = AtomicUsize::new(0);
             let made = std::sync::Mutex::new(Vec::<Made, Global>::with_capacity_in(ranges.len(), Global));
             let start_parts = Instant::now();

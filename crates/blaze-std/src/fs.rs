@@ -63,12 +63,15 @@
 //!   beneath its directory by the name's form (no root, no `..`), not by the kernel's
 //!   resolution: a symbolic link inside a directory is followed by the driver. Both need an
 //!   open that returns a handle with rights, resolved beneath a directory.
-//! - A real driver's rename syncs its directories itself, so a rename, and a publish, costs
-//!   that sync whatever [`Durable`] says: `Durable::No` is honest about what is promised, not
-//!   yet about what is paid. It needs a rename effect that does not sync.
+//! - A rename is one of two effects: an `_unsynced` call's is `Effect::RenameUnsynced`,
+//!   which syncs nothing; a `_synced` call's is `Effect::Rename`, which on a real driver
+//!   syncs both directories (`F_FULLFSYNC` on macOS) before it completes, so its
+//!   `sync_names` pays no second sync there. Which one goes is the call's types: the unsynced
+//!   rename takes the caller's [`Unsynced`], the synced one gives the proof `sync_names`
+//!   takes.
 //! - A directory's names are synced by an effect (`Effect::SyncDir`), which every `_synced`
-//!   name change and [`Dir::sync_names`] wait for. The driver's root itself has no name an
-//!   effect can carry: a name directly beneath it is [`FsKind::NoNameSync`] on a real driver.
+//!   name change and [`Dir::sync_names`] wait for; the driver's root is named
+//!   `DirName::Root` there, so a name directly beneath it is synced as any other.
 //! - [`Unsynced::Started`] begins the file's write-back (`Effect::WriteBack`) once the
 //!   change is made, and for a name change its directory's sync (`Effect::SyncDir`), and
 //!   waits for neither: their ends are dropped as they arrive. A write-back makes no file, so
@@ -81,7 +84,7 @@
 use alloc::{format, string::String, sync::Arc, vec::Vec};
 use core::{fmt, marker::PhantomData, num::NonZero};
 
-use blaze_core::{Done, Effect, FileName};
+use blaze_core::{DirName, Done, Effect, FileName, Tag};
 use blaze_mem::Frame;
 
 use crate::{
@@ -397,11 +400,6 @@ pub enum FsKind {
     Stopped(Stopped),
     /// The directory it came from has a quota ([`Dir::quota`]) with no room for it.
     OverQuota(Over),
-    /// The names directly beneath the driver's root were to be made durable, and no effect
-    /// can name the root to sync it (a `FileName` names something beneath it): refused,
-    /// never said durable. The change itself was made. A name in any directory beneath the
-    /// root is synced ([`blaze_core::Effect::SyncDir`]).
-    NoNameSync,
     /// A [`Flushed`] was to be cloned and its file was changed after the flush it stands
     /// for (by effect `changed_at` of this world; the flush saw `flushed_at`): the clone
     /// would make the kernel write the new bytes out first. Nothing was cloned.
@@ -434,12 +432,6 @@ impl fmt::Display for FsError {
             ),
             FsKind::Stopped(stopped) => write!(f, "bstd::fs {op} of {path}: {stopped}"),
             FsKind::OverQuota(over) => write!(f, "bstd::fs {op} of {path}: its directory's quota: {over}"),
-            FsKind::NoNameSync => write!(
-                f,
-                "bstd::fs {op} of {path}: its directory is the driver's root, whose names no effect can \
-                 sync (a name beneath a directory of the root is synced): the change was made and is not \
-                 said durable (rule no-fallback)"
-            ),
             FsKind::Stale { flushed_at, changed_at } => write!(
                 f,
                 "bstd::fs {op} of {path}: the file was changed after it was flushed (the flush saw \
@@ -470,7 +462,7 @@ impl FsError {
     pub fn stopped(&self) -> Option<&Stopped> {
         match &self.kind {
             FsKind::Stopped(stopped) => Some(stopped),
-            FsKind::NotFound | FsKind::IsADirectory | FsKind::NotADirectory | FsKind::Exists | FsKind::OverQuota(..) | FsKind::NoNameSync | FsKind::Stale { .. } | FsKind::Driver(..) | FsKind::Answered(..) => None,
+            FsKind::NotFound | FsKind::IsADirectory | FsKind::NotADirectory | FsKind::Exists | FsKind::OverQuota(..) | FsKind::Stale { .. } | FsKind::Driver(..) | FsKind::Answered(..) => None,
         }
     }
 }
@@ -492,7 +484,7 @@ fn call(
     cx: &Cx,
     op: FsOp,
     path: &FileName,
-    effect: impl FnOnce(blaze_core::Tag) -> Effect,
+    effect: impl FnOnce(Tag) -> Effect,
 ) -> Result<Done, FsError> {
     io.call(cx, effect).map_err(|stopped| FsError::new(op, path, FsKind::Stopped(stopped)))
 }
@@ -540,28 +532,30 @@ fn started(io: &Io, name: &FileName, unsynced: Unsynced) {
 
 /// What an `_unsynced` call does once its change to a name (a rename, a remove) is made:
 /// for [`Unsynced::Started`] the sync of `name`'s directory is begun ([`Effect::SyncDir`])
-/// and not waited for. The names of the driver's root, which no effect can name, are left.
+/// and not waited for; of a name directly beneath the driver's root, the root's.
 fn names_started(io: &Io, name: &FileName, unsynced: Unsynced) {
-    match (unsynced, FileName::new(dir_of(name))) {
-        (Unsynced::Started, Some(dir)) => {
+    match unsynced {
+        Unsynced::Started => {
+            let dir = FileName::new(dir_of(name)).map_or(DirName::Root, DirName::Named);
             let tag = io.submit(|tag| Effect::SyncDir { dir, tag });
             io.forget(tag, Ends::Once);
         }
-        (Unsynced::Started, None) | (Unsynced::No, _) => {}
+        Unsynced::No => {}
     }
 }
 
 /// The names of `name`'s directory made durable and waited for, for a `_synced` call: the
-/// directory's sync ([`Effect::SyncDir`]). `renamed` says the name change was a rename: a
-/// real driver's rename has synced its directories itself by the time it completes, so no
-/// second sync is paid there. A name directly beneath the driver's root has no directory an
-/// effect can name: [`FsKind::NoNameSync`] on a real driver (the simulation's ledger is told
-/// directly).
-fn sync_names(io: &Io, cx: &Cx, op: FsOp, name: &FileName, renamed: bool) -> Result<(), FsError> {
+/// directory's sync ([`Effect::SyncDir`]). `renamed` is the proof that the name change was
+/// a syncing rename ([`rename_synced`]): a real driver's has synced its directories itself by
+/// the time it completes, so no second sync is paid there. A name directly beneath the
+/// driver's root syncs the root ([`DirName::Root`]).
+fn sync_names(io: &Io, cx: &Cx, op: FsOp, name: &FileName, renamed: Option<Renamed>) -> Result<(), FsError> {
     if io.plant() == Plant::DurableSkipsNameSync {
         return Ok(());
     }
-    if renamed && io.rename_syncs_names() {
+    if let Some(Renamed(())) = renamed
+        && io.rename_syncs_names()
+    {
         return Ok(());
     }
     sync_dir(io, cx, op, name, dir_of(name))
@@ -569,13 +563,8 @@ fn sync_names(io: &Io, cx: &Cx, op: FsOp, name: &FileName, renamed: bool) -> Res
 
 /// The directory `dir`'s names synced and waited for, on behalf of the call `op` on `path`.
 fn sync_dir(io: &Io, cx: &Cx, op: FsOp, path: &FileName, dir: &str) -> Result<(), FsError> {
-    let Some(named) = FileName::new(dir) else {
-        cx.stopped_by(io.now()).map_err(|stopped| FsError::new(op, path, FsKind::Stopped(stopped)))?;
-        return match io.names_synced(dir) {
-            true => Ok(()),
-            false => Err(FsError::new(op, path, FsKind::NoNameSync)),
-        };
-    };
+    // The driver's root (`dir` empty) is synced as any directory: `DirName::Root`.
+    let named = FileName::new(dir).map_or(DirName::Root, DirName::Named);
     match call(io, cx, op, path, |tag| Effect::SyncDir { dir: named, tag })? {
         Done::Synced => {
             io.names_synced(dir);
@@ -605,11 +594,53 @@ fn truncate(io: &Io, cx: &Cx, op: FsOp, name: &FileName, len: u64) -> Result<(),
     }
 }
 
-/// `from` renamed over `to`: a reader sees the old `to` or the new.
-fn rename(io: &Io, cx: &Cx, op: FsOp, from: &FileName, to: &FileName) -> Result<(), FsError> {
+/// Proof that a durable call's rename completed through [`Effect::Rename`], which on a real
+/// driver syncs the directories of both names before it completes: what [`sync_names`] takes
+/// to skip a second sync there. Only [`rename_synced`] makes one, so an `_unsynced` call that
+/// reached for the syncing rename holds a proof it has no use for (`must_use`), and an
+/// `_unsynced` call that renames at all must hand over its [`Unsynced`] ([`rename_unsynced`]).
+#[must_use = "a durable rename's names are made durable only through `sync_names`, which takes this"]
+struct Renamed(());
+
+/// `from` renamed over `to` with nothing synced ([`Effect::RenameUnsynced`]): a reader sees
+/// the old `to` or the new, and a crash may undo it. Its `Unsynced` is the caller's own
+/// policy, which only an `_unsynced` call holds: a durable call cannot reach this rename
+/// without making one up, nor an unsynced call the syncing one without dropping a
+/// [`Renamed`].
+fn rename_unsynced(io: &Io, cx: &Cx, op: FsOp, from: &FileName, to: &FileName, _: Unsynced) -> Result<(), FsError> {
+    if io.plant() == Plant::UnsyncedRenameSyncs {
+        return rename_by(io, cx, op, from, to, |from, to, tag| Effect::Rename { from, to, tag });
+    }
+    rename_by(io, cx, op, from, to, |from, to, tag| Effect::RenameUnsynced { from, to, tag })
+}
+
+/// `from` renamed over `to` by [`Effect::Rename`]: on a real driver both directories' names
+/// are synced by the time it completes (`F_FULLFSYNC` on macOS), which the [`Renamed`] it
+/// gives says to [`sync_names`].
+fn rename_synced(io: &Io, cx: &Cx, op: FsOp, from: &FileName, to: &FileName) -> Result<Renamed, FsError> {
+    rename_by(io, cx, op, from, to, |from, to, tag| Effect::Rename { from, to, tag })?;
+    Ok(Renamed(()))
+}
+
+/// The one place bstd submits a rename, as `effect` makes it; only [`rename_unsynced`] and
+/// [`rename_synced`] call it. Under [`Plant::PublishBeforeRename`] a publish's rename is
+/// handed to the driver and not waited for: the planted bug of the durability tests.
+fn rename_by(
+    io: &Io,
+    cx: &Cx,
+    op: FsOp,
+    from: &FileName,
+    to: &FileName,
+    effect: fn(FileName, FileName, Tag) -> Effect,
+) -> Result<(), FsError> {
     // clone: the effect's names, refcounts.
     let (old, new) = (from.clone(), to.clone());
-    match call(io, cx, op, from, |tag| Effect::Rename { from: old, to: new, tag })? {
+    if op == FsOp::Publish && io.plant() == Plant::PublishBeforeRename {
+        let tag = io.submit(|tag| effect(old, new, tag));
+        io.forget(tag, Ends::Once);
+        return Ok(());
+    }
+    match call(io, cx, op, from, |tag| effect(old, new, tag))? {
         Done::Renamed => Ok(()),
         done => Err(unexpected(op, from, done)),
     }
@@ -818,7 +849,7 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
         let base = match self.io.plant() {
             // clone: the planted bug keeps the parent's name, a refcount.
             Plant::SubdirKeepsParent => self.base.clone(),
-            Plant::None | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned | Plant::ParJoinsInRunOrder | Plant::FreezeLeaks | Plant::SwapFreesAtOnce | Plant::FlightComputesTwice | Plant::ChanPassesCapacity | Plant::PublishOnceOverwrites | Plant::OrderTokenTwice | Plant::TaskMigrates => self.beneath(path),
+            Plant::None | Plant::OpenCreates | Plant::LexicalParent | Plant::WaitIgnoresDeadline | Plant::UntilWidens | Plant::WaitIgnoresCancel | Plant::ArenaUnlimited | Plant::SyncSkipped | Plant::EnvOnlyReplaces | Plant::CancelSkipsWait | Plant::CloseSkipsSync | Plant::JoinDropsFailure | Plant::OffersIgnored | Plant::OnlyWidens | Plant::KvPutUnsynced | Plant::LocalDropsChunk | Plant::HttpOnlyIgnored | Plant::BudgetCheckedAfter | Plant::KeyIgnoresLast | Plant::MemoNeverEvicts | Plant::MemoSharesPoints | Plant::NestedUnderGrandparent | Plant::PublishBeforeRename | Plant::DurableSkipsNameSync | Plant::UnsyncedRenameSyncs | Plant::FlushedBeforeFlush | Plant::StaleFlushedCloned | Plant::ParJoinsInRunOrder | Plant::FreezeLeaks | Plant::SwapFreesAtOnce | Plant::FlightComputesTwice | Plant::ChanPassesCapacity | Plant::PublishOnceOverwrites | Plant::OrderTokenTwice | Plant::TaskMigrates => self.beneath(path),
         };
         // clone: the quota shared, a refcount.
         Dir { io: self.io.clone(), base, quota: self.quota.clone(), rights: PhantomData }
@@ -855,7 +886,7 @@ impl<#[blaze::linear] P: Rights> Dir<P> {
             Some(_) => {}
         }
         // clone: the effect's name, a refcount.
-        let dir = self.base.clone();
+        let dir = DirName::Named(self.base.clone());
         let listed = match call(&self.io, cx, FsOp::List, &self.base, |tag| Effect::List { dir, tag })? {
             Done::Listed(listed) => listed,
             done => return Err(unexpected(FsOp::List, &self.base, done)),
@@ -1026,20 +1057,6 @@ impl Dir<ReadWrite> {
         Ok((temp, how))
     }
 
-    /// The temporary file `temp` renamed over `name`: the moment a reader stops seeing the
-    /// old contents and sees the new. Under [`Plant::PublishBeforeRename`] the rename is
-    /// handed to the driver and not waited for: the planted bug of the durability tests.
-    fn swap_in(&self, cx: &Cx, temp: &FileName, name: &FileName) -> Result<(), FsError> {
-        if self.io.plant() == Plant::PublishBeforeRename {
-            // clone: the effect's names, refcounts.
-            let (from, to) = (temp.clone(), name.clone());
-            let tag = self.io.submit(|tag| Effect::Rename { from, to, tag });
-            self.io.forget(tag, Ends::Once);
-            return Ok(());
-        }
-        rename(&self.io, cx, FsOp::Publish, temp, name)
-    }
-
     /// `path` made to hold `content`, replaced all at once, as durable as `durable` says:
     /// [`Dir::publish_unsynced`] or [`Dir::publish_synced`], chosen at run time. It waits for
     /// the device exactly when `durable` is [`Durable::Yes`]; code that must never wait for
@@ -1077,7 +1094,8 @@ impl Dir<ReadWrite> {
     ) -> Result<Published<Written>, FsError> {
         let name = self.beneath(path);
         let (temp, how) = self.place(cx, &name, content)?;
-        self.swap_in(cx, &temp, &name)?;
+        // The moment a reader stops seeing the old contents and sees the new; nothing synced.
+        rename_unsynced(&self.io, cx, FsOp::Publish, &temp, &name, unsynced)?;
         started(&self.io, &name, unsynced);
         names_started(&self.io, &name, unsynced);
         cx.event(how.says());
@@ -1092,8 +1110,8 @@ impl Dir<ReadWrite> {
         let name = self.beneath(path);
         let (temp, how) = self.place(cx, &name, content)?;
         let flushed = Written::of(&self.io, temp).flush(cx)?;
-        self.swap_in(cx, flushed.name(), &name)?;
-        sync_names(&self.io, cx, FsOp::Publish, &name, true)?;
+        let renamed = rename_synced(&self.io, cx, FsOp::Publish, flushed.name(), &name)?;
+        sync_names(&self.io, cx, FsOp::Publish, &name, Some(renamed))?;
         cx.event(how.says());
         // The name's generation is its rename's: the bytes were flushed as the temporary file,
         // and nothing changed them since.
@@ -1123,7 +1141,7 @@ impl Dir<ReadWrite> {
     pub fn remove_synced(&self, cx: &Cx, path: &Path) -> Result<(), FsError> {
         let name = self.beneath(path);
         remove(&self.io, cx, FsOp::Remove, &name)?;
-        sync_names(&self.io, cx, FsOp::Remove, &name, false)
+        sync_names(&self.io, cx, FsOp::Remove, &name, None)
     }
 
     /// `from` renamed over `to`, both beneath this directory, replacing what `to` held all
@@ -1148,7 +1166,7 @@ impl Dir<ReadWrite> {
         unsynced: Unsynced,
     ) -> Result<(), FsError> {
         let (from, to) = (self.beneath(from), self.beneath(to));
-        rename(&self.io, cx, FsOp::Rename, &from, &to)?;
+        rename_unsynced(&self.io, cx, FsOp::Rename, &from, &to, unsynced)?;
         started(&self.io, &to, unsynced);
         names_started(&self.io, &to, unsynced);
         Ok(())
@@ -1161,16 +1179,15 @@ impl Dir<ReadWrite> {
     /// it ([`Dir::publish_synced`]).
     pub fn rename_replacing_synced(&self, cx: &Cx, from: &Path, to: &Path) -> Result<(), FsError> {
         let (from, to) = (self.beneath(from), self.beneath(to));
-        rename(&self.io, cx, FsOp::Rename, &from, &to)?;
+        let renamed = rename_synced(&self.io, cx, FsOp::Rename, &from, &to)?;
         flush_wait(&self.io, cx, FsOp::Rename, &to)?;
-        sync_names(&self.io, cx, FsOp::Rename, &to, true)
+        sync_names(&self.io, cx, FsOp::Rename, &to, Some(renamed))
     }
 
     /// The names directly in this directory made durable: every file made in it, renamed
     /// into it or removed from it by a call that has returned stays so through a crash. It
     /// waits for the device ([`blaze_core::Effect::SyncDir`]). A file's bytes are its own
-    /// flush. The driver's root itself, which no effect can name, is
-    /// [`FsKind::NoNameSync`] on a real driver.
+    /// flush. The driver's root is synced as any directory (`DirName::Root`).
     pub fn sync_names(&self, cx: &Cx) -> Result<(), FsError> {
         if self.io.plant() == Plant::DurableSkipsNameSync {
             return Ok(());
@@ -1630,7 +1647,7 @@ impl File<ReadWrite> {
         }
         flush_wait(&io, cx, FsOp::Close, &name)?;
         if made {
-            sync_names(&io, cx, FsOp::Close, &name, false)?;
+            sync_names(&io, cx, FsOp::Close, &name, None)?;
         }
         Ok(Flushed::of(&io, name, seen))
     }

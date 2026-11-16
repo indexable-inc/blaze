@@ -82,6 +82,8 @@ byte_enum! {
         PartialOrd = 6 => "PartialOrd",
         Eq = 7 => "Eq",
         PartialEq = 8 => "PartialEq",
+        /// `#[derive(ConstParamTy)]`: an impl of `core::marker::ConstParamTy_`.
+        ConstParamTy = 9 => "ConstParamTy",
     }
 }
 

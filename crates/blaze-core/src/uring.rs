@@ -2296,7 +2296,7 @@ impl Uring {
                 Effect::WriteBack { file, .. } => ("write back", file.as_str()),
                 Effect::Prewarm { file, .. } => ("prewarm", file.as_str()),
                 Effect::CopyData { from, .. } => ("copy the data of", from.as_str()),
-                Effect::List { dir, .. } => ("list", dir.as_str()),
+                Effect::List { dir, .. } => ("list", dir.name().map_or(".", crate::FileName::as_str)),
                 Effect::Private { dir, .. } => ("make private", dir.as_str()),
                 _ => ("carry out", ""),
             };
@@ -3768,8 +3768,8 @@ mod tests {
         let mut driver = Uring::new(&root).unwrap();
         let name = |it: &str| FileName::new(it).unwrap();
         let mut effects: Vec<Effect> =
-            (0..16).map(|n| Effect::List { dir: name("tree"), tag: Tag(n) }).collect();
-        effects.push(Effect::List { dir: name("missing"), tag: Tag(16) });
+            (0..16).map(|n| Effect::List { dir: name("tree").into(), tag: Tag(n) }).collect();
+        effects.push(Effect::List { dir: name("missing").into(), tag: Tag(16) });
         effects.push(Effect::Timer { after: Duration::from_secs(60), tag: Tag(17) });
         driver.submit(&mut effects);
         let started = Instant::now();

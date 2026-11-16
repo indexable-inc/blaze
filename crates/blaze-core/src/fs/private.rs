@@ -23,7 +23,8 @@ pub(crate) fn private(dir: &Path, name: &FileName) -> io::Result<Option<(FileNam
     }
     os::close(dir)?;
     let start = name.as_str().len() + 1;
-    for (file, _) in super::list(dir, name)? {
+    // clone: the listing's name of the store, a refcount.
+    for (file, _) in super::list(dir, &crate::DirName::Named(name.clone()))? {
         // alloc: once per file of the store, at its open
         let path = dir.join(&file.as_str()[start..]);
         match os::under(&path, &gate) {

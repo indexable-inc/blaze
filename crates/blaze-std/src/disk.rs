@@ -7,7 +7,8 @@
 //!   source was not flushed (`forced_writeback`). A test of an edit path asserts the last is
 //!   zero, with no real disk.
 //! - **Which names a crash may undo.** blaze-core's simulation keeps every completed rename,
-//!   remove and create through a crash. On a real disk a name is durable only once its
+//!   remove and create through a crash, but for an unsynced rename (`Effect::RenameUnsynced`),
+//!   which it may undo itself and the ledger leaves to it. On a real disk a name is durable only once its
 //!   directory is synced, so the ledger keeps each name change made since the last name sync
 //!   that covers it, oldest first, and [`Disk::crashed`] undoes a seeded suffix of them, as a
 //!   journal that had committed only a prefix would.
@@ -170,6 +171,17 @@ impl Disk {
         }
     }
 
+    /// `from` renamed over `to`: a file's unflushed bytes go where it goes, and what `to`
+    /// held unflushed is gone with it.
+    fn moved(&mut self, from: &FileName, to: &FileName) {
+        let moved = self.take_dirty(from);
+        self.take_dirty(to);
+        if moved > 0 {
+            // clone: the ledger's name of the file, a refcount.
+            self.dirty.push((to.clone(), moved));
+        }
+    }
+
     /// `effect` is handed to the driver now.
     pub(crate) fn submitted(&mut self, sim: &Sim, effect: &Effect) {
         match effect {
@@ -216,14 +228,13 @@ impl Disk {
                 let before = sim.exists(to).then(|| sim.contents(to));
                 // clone: the ledger's names of the files, refcounts.
                 self.naming.push((*tag, NameChange::Renamed { from: from.clone(), to: to.clone(), before }));
-                // A file's unflushed bytes go where it goes.
-                let moved = self.take_dirty(from);
-                self.take_dirty(to);
-                if moved > 0 {
-                    // clone: the ledger's name of the file, a refcount.
-                    self.dirty.push((to.clone(), moved));
-                }
+                self.moved(from, to);
             }
+            // blaze-core's simulation itself may undo a rename that waited for no sync at a
+            // crash (its `Undo`, until a sync covers the file), so the ledger records no name
+            // change for it: undoing it twice would move a file that is not there. It counts
+            // no device wait, which is the point of it.
+            Effect::RenameUnsynced { from, to, .. } => self.moved(from, to),
             Effect::Remove { file, tag } => {
                 if sim.exists(file) {
                     // alloc: a simulated crash's undo, the bytes the remove drops.
@@ -247,7 +258,7 @@ impl Disk {
             // A prewarm asks the page cache to read ahead and is not waited for: no byte is
             // written, read for a caller or flushed, and no name changes.
             Effect::Prewarm { .. } => {}
-            Effect::ReadInto { .. } | Effect::ReadMany { .. } | Effect::WriteFrom { .. } | Effect::ReadLink { .. } | Effect::SyncDir { .. } | Effect::WriteUnsynced { .. } | Effect::List { .. } | Effect::RenameUnsynced { .. } | Effect::Mode { .. } | Effect::Seal { .. } | Effect::Private { .. } | Effect::Times { .. } | Effect::Stat { .. } | Effect::Lstat { .. } | Effect::Lock { .. } | Effect::Unlock { .. } | Effect::Watch { .. } | Effect::Journal { .. } | Effect::Unwatch { .. } | Effect::Stamp { .. } | Effect::Entries { .. } | Effect::Flush { .. } | Effect::Timer { .. } | Effect::Map { .. } | Effect::Spawn { .. } | Effect::Kill { .. } | Effect::Listen { .. } | Effect::Unlisten { .. } | Effect::Connect { .. } | Effect::Recv { .. } | Effect::Send { .. } | Effect::Hangup { .. } | Effect::Pressure { .. } | Effect::Bind { .. } | Effect::SendTo { .. } | Effect::RecvFrom { .. } | Effect::Unbind { .. } | Effect::Resolve { .. } | Effect::ReadStdin { .. } | Effect::WriteOut { .. } | Effect::Now { .. } | Effect::Random { .. } | Effect::MakeDir { .. } | Effect::RemoveDir { .. } => {}
+            Effect::ReadInto { .. } | Effect::ReadMany { .. } | Effect::WriteFrom { .. } | Effect::ReadLink { .. } | Effect::SyncDir { .. } | Effect::WriteUnsynced { .. } | Effect::List { .. } | Effect::Mode { .. } | Effect::Seal { .. } | Effect::Private { .. } | Effect::Times { .. } | Effect::Stat { .. } | Effect::Lstat { .. } | Effect::Lock { .. } | Effect::Unlock { .. } | Effect::Watch { .. } | Effect::Journal { .. } | Effect::Unwatch { .. } | Effect::Stamp { .. } | Effect::Entries { .. } | Effect::Flush { .. } | Effect::Timer { .. } | Effect::Map { .. } | Effect::Spawn { .. } | Effect::Kill { .. } | Effect::Listen { .. } | Effect::Unlisten { .. } | Effect::Connect { .. } | Effect::Recv { .. } | Effect::Send { .. } | Effect::Hangup { .. } | Effect::Pressure { .. } | Effect::Bind { .. } | Effect::SendTo { .. } | Effect::RecvFrom { .. } | Effect::Unbind { .. } | Effect::Resolve { .. } | Effect::ReadStdin { .. } | Effect::WriteOut { .. } | Effect::Now { .. } | Effect::Random { .. } | Effect::MakeDir { .. } | Effect::RemoveDir { .. } => {}
         }
     }
 

@@ -1103,6 +1103,22 @@ fn at<R>(
     })
 }
 
+/// `f` of the directory `dir` under `root` ([`crate::DirName::Root`] is `root` itself), joined
+/// in the thread's path buffer.
+fn at_dir<R>(
+    root: &Path,
+    dir: &crate::DirName,
+    f: impl FnOnce(&Path) -> io::Result<R>,
+) -> io::Result<R> {
+    blaze_mem::scratch::with_path(|path| {
+        path.push(root);
+        if let Some(name) = dir.name() {
+            path.push(name.as_str());
+        }
+        f(path)
+    })
+}
+
 /// A file effect done with blocking calls, for this driver's threads and for the drivers that
 /// keep their file calls on threads. Allocates only what its completion carries. Reads into
 /// memory read through `kept`'s descriptors; an effect that changes what is under a name closes
@@ -1308,7 +1324,7 @@ fn run_kept(root: &Path, kept: &Descriptors, effect: Effect) -> io::Result<Done>
             fs::sync(path)?;
             Ok(Done::Synced)
         }),
-        Effect::SyncDir { dir, .. } => at(root, &dir, |path| {
+        Effect::SyncDir { dir, .. } => at_dir(root, &dir, |path| {
             fs::sync_dir(path)?;
             Ok(Done::Synced)
         }),
@@ -1394,7 +1410,7 @@ fn run_kept(root: &Path, kept: &Descriptors, effect: Effect) -> io::Result<Done>
         Effect::Entries { dir, .. } => {
             Ok(Done::Entries(at(root, &dir, |path| crate::iocp::entries(path, &dir))?))
         }
-        Effect::List { dir, .. } => Ok(Done::Listed(at(root, &dir, |path| fs::list(path, &dir))?)),
+        Effect::List { dir, .. } => Ok(Done::Listed(at_dir(root, &dir, |path| fs::list(path, &dir))?)),
         Effect::Remove { file, .. } => at(root, &file, |path| {
             fs::remove(path)?;
             Ok(Done::Removed)

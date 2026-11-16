@@ -44,6 +44,10 @@
 //! | `Alloc`, `SharedAlloc`, `Erased` (the handle) | `handle`'s tests: `*_through_a_handle`, `a_handle_is_one_word_and_copies_are_the_same_allocator`, `a_handle_of_an_inline_buffer_grows_in_place_and_refuses_when_full`, `a_vector_over_a_shared_handle_crosses_threads`, `the_global_handle_allocates` |
 //! | the testing allocators (`testing`) | every `*_fail_cleanly_at_every_allocation`, `every_failure_catches_a_swallowed_refusal_and_a_leak` |
 
+// The cases still call the old names (`insert`, `remove`, `swap_remove`), which forward to the
+// ones that say the cost: they test both until the callers move.
+#![allow(deprecated, reason = "the old names forward to the new ones and are tested through them")]
+
 use core::{
     alloc::{AllocError, Allocator, Layout},
     ptr::NonNull,

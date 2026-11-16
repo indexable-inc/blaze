@@ -7,7 +7,7 @@ status: current
 A walking skeleton: `blaze run <dir>` runs a program end to end on the new layer, one rung at a
 time (docs/v2/plan/design/bottom.md section 16). Each rung is a project directory here with its
 source and an `expected` file; a rung is done when
-`bash /Volumes/Projects/blaze-int-1112-notes/ladderrun.sh <rung dir> run .` prints what `expected`
+`bash /Volumes/Projects/blaze-int-1112-notes/ladderrun.sh crates/blaze-cli/tests/ladder run <rung>` prints what `expected`
 says.
 
 `expected`: line 1 is `status <n>`, the process's exit status; line 2 is `stdout`; every byte
@@ -26,6 +26,30 @@ blaze-ty's real types and blaze-solve's trait solving (formatting is `fmt::Argum
 `dyn Write`, generics, closures, traits with associated types), monomorphization (an instance's
 LIR per substitution), floats and aggregates in the backend, statics and thread-locals in
 placement, unwinding, and `lang_start`.
+
+## The plan from rung 4 to `println!` (written 2026-11-15)
+
+One rung switches on one real layer. Each line gives the program, the layer, the shortcuts
+(numbered as in the list below) it deletes or adds, and what another lane's crate must provide.
+Facts are as of 2026-11-15:
+- blaze-ty has type data and a `TyCx` but no body walker and no `TypeCtx` (crates/blaze-ty/src/lib.rs).
+- blaze-solve wants `Tys` and `Facts` from its caller; only its tests implement them (src/tys.rs, src/facts.rs).
+- blaze-emit takes only integers and pointers, at most 8 arguments and one return, with no data
+  relocations, statics or TLS.
+- blaze-typeck's `TyView` has no `dyn` (typeck.md, "`TypeCtx`").
+
+| rung | program | layer switched on | shortcuts | owed by another lane |
+|---|---|---|---|---|
+| 5-generics | a generic fn, and a generic struct local to a generic fn; instances at i32, u8 and i64 | monomorphization: one body checked once, built per instance; arguments interned in one ground table (blaze-build `instance`) | deletes none; adds 12 | none |
+| 6-aggregates | structs, tuples and arrays passed and returned by value; references; field and index places; moves and copies | aggregates through the backend: `sret`/`byval` and compound values in blaze-emit, places in blaze-build | narrows 10 | none (blaze-emit, blaze-build are the ladder's) |
+| 7-traits | a trait with two impls, static dispatch, a `Drop` impl and drops in scope order | blaze-ty and blaze-solve in place of `ToyCtx`; trait-method instances; drop elaboration in blaze-build | deletes 3 | **a `TypeCtx` over blaze-ty that implements blaze-solve's `Tys` and `Facts` (solve.md, the wiring section). It does not exist and has no owner: this is the critical path.** |
+| 7b-dyn | a `dyn Trait` call through a reference | vtables as data with relocations; `dyn` in typeck | none | blaze-typeck: `dyn` in `TyView`; blaze-emit: data relocations |
+| 8-core | `#![no_std]` against the real `core`: `Option`, `match`, a `for` over a range | blaze-lower and blaze-scope over the real `core`; only reached bodies built; the item layer's `World` from records; work as tasks at item grain | deletes 2, 1, 9; narrows 5 | blaze-lower: lang-item paths into `BodyView` (typeck.md, "Owed to blaze-lower", 1); blaze-scope: correct on `core` (bottom.md: 9 syntax errors in `core` not yet read); the item layer: records for signatures, ADTs and impls |
+| 9-statics | a `static`, a `thread_local!`, a `panic!` that aborts with `panic_handler` | statics and TLS in placement (blaze-launch-rt) and blaze-emit; data relocations | none | blaze-launch-rt: static and TLS records |
+| 10-println | `std`, `fn main() { println!("hello") }` | `format_args!`, `alloc` and `std`, `lang_start`, panic=abort first; the program in a child process | deletes 7, 4, 6 | blaze-lower: `FormatArgs` (owed list, 5); blaze-launch / blaze-run: the child and `Loaded` symbol records; the allocator shim |
+
+After rung 10, still open: 8 (the layout query), 10 (the Rust ABI), 11 (mini-core operators
+become real `core`'s at rung 8), 12 (instances as records), and unwinding.
 
 ## The route (decided 2026-11-15, 22:00)
 
@@ -78,6 +102,9 @@ placement, unwinding, and `lang_start`.
     trait is absent (rules/op.rs). Whether nightly takes these programs as written is not
     checked here (nothing may run rustc); if it does not, the rungs gain mini-core's operator
     traits and impls once the lowering takes traits and impls.
+12. Instances are told apart in memory, by item and interned ground arguments (blaze-build
+    `instance`). They are not records keyed by code identity and arguments, and the item key is
+    shortcut 2's path hash, not code identity.
 
 ## Log
 

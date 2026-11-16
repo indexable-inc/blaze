@@ -37,7 +37,7 @@ use blaze_file_items::{Outline, outline, syntax_kind};
 use blaze_id::{ContentId, CrateItemKey, ItemKey};
 use blaze_own::{AVec, Alloc};
 use blaze_scope::{
-    Answer, ExpandRequest, Group, NameAnswer, Read, RecordFacts, Reply, ResolveError, Resolved,
+    Answer, ExpandRequest, FillStats, Group, NameAnswer, Read, RecordFacts, Reply, ResolveError, Resolved,
     Resolver, ScopeFacts, Step,
 };
 use blaze_surface::testing::{Fact, MemSurface};
@@ -2411,7 +2411,19 @@ fn step(m: &mut Machine, facts: &Facts<'_>, replies: &[Reply<'_, N>]) -> Result<
             Step::Done(d) => Out::Done(d.into_iter().collect()),
         },
     })
+    .inspect(|out| {
+        if let Out::Done(d) = out {
+            let stats = match m {
+                Machine::One(r) => r.stats(),
+                Machine::Many(g) => g.stats(),
+            };
+            FILL_WORK.lock().expect("the fill work's lock").push((d.len(), stats));
+        }
+    })
 }
+
+/// Each finished machine's work: its module count and its counts.
+static FILL_WORK: std::sync::Mutex<Vec<(usize, FillStats)>> = std::sync::Mutex::new(Vec::new());
 
 enum State {
     Fresh(ItemKey),
@@ -3290,6 +3302,25 @@ fn run_crate(dir: &std::path::Path, counts: &[usize]) {
     let expanded = res.run.expanded.lock().expect("the expanded counts' lock").clone();
     let expansions: usize = expanded.values().sum();
     let expansion_count = res.run.expansions.lock().expect("the expansions' lock").len();
+    {
+        let mut work = FILL_WORK.lock().expect("the fill work's lock");
+        work.sort_by(|a, b| b.1.lookups.cmp(&a.1.lookups));
+        let mut total = FillStats::default();
+        for (_, s) in work.iter() {
+            total.add(s);
+        }
+        let line = |s: &FillStats| {
+            format!(
+                "passes {}, relax rounds {}, plans {}, lookups {}, fixpoints {} ({} edge evals), finals {}",
+                s.passes, s.relax_rounds, s.plans, s.lookups, s.fixpoints, s.fixpoint_evals, s.finals
+            )
+        };
+        println!("    work (all machines, every run): {}", line(&total));
+        for (n, s) in work.iter().take(3) {
+            println!("      a machine of {n} modules: {}", line(s));
+        }
+        work.clear();
+    }
     println!(
         "    rounds {} ({} steps), groups {} (largest: {} modules{}), {}",
         res.rounds,

@@ -184,6 +184,9 @@ fn ops_case(tape: &Tape) -> Result<(), Broke> {
         if bdd.implies(c, other.0).map_err(harness)? != t.within(other.1) {
             return Err(Broke::Oracle(format!("implies is not inclusion for {op}")));
         }
+        if bdd.disjoint(c, other.0).map_err(harness)? != (t.map2(other.1, |x, y| x && y).count() == 0) {
+            return Err(Broke::Oracle(format!("disjoint is not an empty intersection for {op}")));
+        }
         let within = t.map2(valid.1, |x, y| x && y);
         if bdd.sat_count(c, valid.0).map_err(harness)? != within.count() {
             return Err(Broke::Oracle(format!("sat_count is not the popcount for {op}")));

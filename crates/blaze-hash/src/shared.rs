@@ -418,7 +418,7 @@ impl<K, V, S: BuildHasher> Pinned<'_, K, V, S> {
     /// slot loaded, then the entry each points at, then each probed. A lookup here is two
     /// dependent misses (the slot, then its boxed entry), so a batch on tables larger than the
     /// cache waits about two misses in all rather than two per key.
-    fn each_entry<'s, 'k, Q: ?Sized + Hash + Equivalent<K>, const CHUNK: usize>(
+    fn each_entry<'s, 'k, Q: ?Sized + Hash + Equivalent<K> + 'k, const CHUNK: usize>(
         &'s self,
         count: usize,
         key: impl Fn(usize) -> &'k Q,
@@ -538,13 +538,30 @@ impl<K: Hash + Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: BuildHas
         }
     }
 
-    /// The value of `key`, or else `make()`'s, put now; `make` runs outside the shard's lock,
-    /// and its value is dropped if another thread put the key first.
-    pub fn get_or_insert_with(&self, key: K, make: impl FnOnce() -> V) -> &V {
-        if let Some(held) = self.get(&key) {
-            return held;
+    /// The value of `key`, or else the value of the entry `make(key)` builds, put now: the
+    /// owned key and the value are made only on a miss, and `key` is hashed once. `make` runs
+    /// outside the shard's lock; what it built is dropped if another thread put the key
+    /// first, and both get the first's. `make` must return a key equal to `key` (checked in
+    /// debug builds). A miss probes twice, without and then under the lock: another writer
+    /// may have put the key between. Never allocates on a hit.
+    pub fn get_or_insert_with<Q: ?Sized + Hash + Equivalent<K>>(
+        &self,
+        key: &Q,
+        make: impl FnOnce(&Q) -> (K, V),
+    ) -> &V {
+        let hash = self.map.hasher.hash_one(key);
+        if let Some(entry) = self.shard_of(hash).current().and_then(|table| table.find(hash, key)) {
+            return &entry.value;
         }
-        self.get_or_insert(key, make())
+        let (owned, value) = make(key);
+        debug_assert!(
+            key.equivalent(&owned) && self.map.hasher.hash_one(&owned) == hash,
+            "get_or_insert_with: `make` built a key that is not equal to the one asked"
+        );
+        match self.write_hashed(hash, owned, value, Held::Keep, Plant::None) {
+            Wrote::Inserted(entry) | Wrote::Kept(entry, _) => &entry.value,
+            Wrote::Replaced(_) => unreachable!("a write that keeps what is held replaced it"),
+        }
     }
 
     /// Takes `key` out; its value, readable while this pin lives.
@@ -660,6 +677,11 @@ impl<K: Hash + Eq + Send + Sync + 'static, V: Send + Sync + 'static, S: BuildHas
     /// Puts `key` and `value` under the shard's lock, doing `held` to a slot that holds the key.
     fn write(&self, key: K, value: V, held: Held, plant: Plant) -> Wrote<'_, K, V> {
         let hash = self.map.hasher.hash_one(&key);
+        self.write_hashed(hash, key, value, held, plant)
+    }
+
+    /// [`Pinned::write`] of a key whose hash the caller has: `hash` is `key`'s.
+    fn write_hashed(&self, hash: u64, key: K, value: V, held: Held, plant: Plant) -> Wrote<'_, K, V> {
         let shard = self.shard_of(hash);
         let horizon = self.horizon(shard);
         let (wrote, passed) = {

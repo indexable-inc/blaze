@@ -421,11 +421,12 @@ impl<T, A: Allocator> VecDeque<T, A> {
         self.len += n;
     }
 
-    /// Puts `value` at `index` from the front, moving the values after it back one.
+    /// Puts `value` at `index` from the front, moving the `len - index` values after it back
+    /// one: linear.
     #[track_caller]
-    pub fn insert(&mut self, index: usize, value: T) {
+    pub fn insert_shift(&mut self, index: usize, value: T) {
         if index > self.len {
-            out_of_bounds("VecDeque::insert", index, self.len);
+            out_of_bounds("VecDeque::insert_shift", index, self.len);
         }
         if self.len == self.buf.capacity() {
             self.reserve(1);
@@ -442,8 +443,8 @@ impl<T, A: Allocator> VecDeque<T, A> {
         self.len += 1;
     }
 
-    /// Takes the value at `index` out, moving the values after it forward one.
-    pub fn remove(&mut self, index: usize) -> Option<T> {
+    /// Takes the value at `index` out, moving the values after it forward one: linear.
+    pub fn remove_shift(&mut self, index: usize) -> Option<T> {
         if index >= self.len {
             return None;
         }
@@ -632,6 +633,22 @@ impl<T, A: Allocator> IndexMut<usize> for VecDeque<T, A> {
             Some(value) => value,
             None => out_of_bounds("VecDeque::index_mut", index, len),
         }
+    }
+}
+
+/// The old names, whose cost the name did not say; each forwards to the one that says it.
+impl<T, A: Allocator> VecDeque<T, A> {
+    #[deprecated(note = "linear: use `insert_shift`, which says so")]
+    #[track_caller]
+    #[inline]
+    pub fn insert(&mut self, index: usize, value: T) {
+        self.insert_shift(index, value);
+    }
+
+    #[deprecated(note = "linear: use `remove_shift`, which says so")]
+    #[inline]
+    pub fn remove(&mut self, index: usize) -> Option<T> {
+        self.remove_shift(index)
     }
 }
 

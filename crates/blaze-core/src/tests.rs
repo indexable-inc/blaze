@@ -93,10 +93,10 @@ fn script(driver: &mut impl Driver) -> BTreeMap<u64, String> {
                 tag: Tag(19),
             },
             19 => Effect::Stat { file: name("store/a/value"), tag: Tag(20) },
-            20 => Effect::List { dir: name("store"), tag: Tag(21) },
+            20 => Effect::List { dir: name("store").into(), tag: Tag(21) },
             21 => Effect::WriteAt { file: name("missing"), at: 0, bytes: vec![1], tag: Tag(22) },
             22 => Effect::Rename { from: name("missing"), to: name("out/m"), tag: Tag(23) },
-            23 => Effect::List { dir: name("missing"), tag: Tag(24) },
+            23 => Effect::List { dir: name("missing").into(), tag: Tag(24) },
             // The effects whose calls are blaze-sys's on Linux (`fs/linux.rs`): a cut, a read
             // of a range that runs past the end, a sync, and an append after them. (A ranged
             // read of a file that is not there is not in the script: the simulation reads it
@@ -110,7 +110,7 @@ fn script(driver: &mut impl Driver) -> BTreeMap<u64, String> {
             // names synced.
             29 => Effect::WriteBack { file: name("store/a/moved"), tag: Tag(30) },
             30 => Effect::WriteBack { file: name("missing"), tag: Tag(31) },
-            31 => Effect::SyncDir { dir: name("store/a"), tag: Tag(32) },
+            31 => Effect::SyncDir { dir: name("store/a").into(), tag: Tag(32) },
             // A barrier of a file that is there, and of one it makes (as a sync makes it).
             32 => Effect::Barrier { file: name("store/a/moved"), tag: Tag(33) },
             33 => Effect::Barrier { file: name("store/a/ordered"), tag: Tag(34) },
@@ -538,7 +538,7 @@ fn times(driver: &mut impl Driver) -> BTreeMap<u64, String> {
             2 => Effect::Stat { file: name("target/build/output"), tag: Tag(3) },
             3 => Effect::Times { file: name("target/build"), modified_ns: earlier, tag: Tag(4) },
             4 => Effect::Stat { file: name("target/build"), tag: Tag(5) },
-            5 => Effect::List { dir: name("target"), tag: Tag(6) },
+            5 => Effect::List { dir: name("target").into(), tag: Tag(6) },
             6 => {
                 Effect::Times { file: name("target/never-written"), modified_ns: TIME, tag: Tag(7) }
             }

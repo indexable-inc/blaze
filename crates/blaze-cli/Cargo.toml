@@ -28,9 +28,16 @@ blaze-surface.workspace = true
 blaze-ids = { path = "../blaze-ids" }
 # Vec, SortedMap, VecDeque in the command's frame.
 blaze-own.workspace = true
+# `syscalls::snapshot`: the memory layer's own system calls, counted and timed, for the profile's
+# `memory` line (rule 17).
+blaze-mem.workspace = true
 # `blaze run`'s program after its check: the walking skeleton's straight line, lower to call
 # (tests/ladder/README.md).
 blaze-ladder.workspace = true
+
+[dev-dependencies]
+# `check` and `control`: the sweep's simulation and its planted-bug control.
+blaze-sim.workspace = true
 
 [lints]
 workspace = true

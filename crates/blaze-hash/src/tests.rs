@@ -548,3 +548,51 @@ fn get_many_is_get_of_each() {
         }
     });
 }
+
+/// `get_or_insert_with` on a tape of `str` keys (with removals between, so dead slots and
+/// full tables are met) is `get`, then `insert` on a miss, against a map driven that way;
+/// its `make` runs once per key it puts, and never for a held key. The set's form likewise.
+#[test]
+fn get_or_insert_with_is_get_then_insert() {
+    blaze_sim::check(Config::cases(if cfg!(miri) { 16 } else { 256 }), |tape| {
+        let mut ours: HashMap<std::string::String, u64, Global> = HashMap::new_in(Global);
+        let mut model: HashMap<std::string::String, u64, Global> = HashMap::new_in(Global);
+        let mut set: crate::HashSet<std::string::String, Global> = crate::HashSet::new_in(Global);
+        let (mut made, mut put, mut set_made) = (0usize, 0usize, 0usize);
+        let range = 1 + tape.below(200, "range");
+        for step in 0..tape.below(if cfg!(miri) { 80 } else { 600 }, "steps") {
+            let name = std::format!("k{}", tape.below(range, "key"));
+            if tape.one_in(6, "remove") {
+                assert_eq!(ours.remove(name.as_str()), model.remove(name.as_str()));
+                set.remove(name.as_str());
+                continue;
+            }
+            let expected = match model.get(name.as_str()) {
+                Some(&held) => held,
+                None => {
+                    model.insert(name.clone(), step);
+                    put += 1;
+                    step
+                }
+            };
+            let got = ours.get_or_insert_with(name.as_str(), |key| {
+                made += 1;
+                (std::string::String::from(key), step)
+            });
+            assert_eq!(*got, expected, "{name} at step {step}");
+            let held = set.get_or_insert_with(name.as_str(), |key| {
+                set_made += 1;
+                std::string::String::from(key)
+            });
+            assert_eq!(held, &name);
+            assert_eq!(ours.len(), model.len());
+        }
+        assert_eq!(made, put, "`make` once per key put, never on a hit");
+        assert_eq!(set_made, put, "the set's `make` likewise");
+        for (key, value) in model.iter() {
+            assert_eq!(ours.get(key.as_str()), Some(value));
+        }
+        let tried = ours.try_get_or_insert_with("absent-key", |key| (std::string::String::from(key), 7));
+        assert_eq!(tried.ok().map(|value| *value), Some(7));
+    });
+}

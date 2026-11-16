@@ -255,16 +255,17 @@ impl<T, A: Allocator> Vec<T, A> {
         Some(unsafe { ptr::read(self.buf.ptr().add(self.len)) })
     }
 
-    /// Puts `value` at `index`, moving the values after it up one.
+    /// Puts `value` at `index`, moving the `len - index` values after it up one: linear, so
+    /// quadratic in a loop (build in order and sort, or push and `remove_swap`).
     ///
     /// # Panics
     ///
     /// When `index > len()`, or there is no memory.
     #[track_caller]
-    pub fn insert(&mut self, index: usize, value: T) {
+    pub fn insert_shift(&mut self, index: usize, value: T) {
         let len = self.len;
         if index > len {
-            out_of_bounds("Vec::insert", index, len);
+            out_of_bounds("Vec::insert_shift", index, len);
         }
         if len == self.buf.capacity() {
             self.buf.reserve(len, 1);
@@ -279,16 +280,18 @@ impl<T, A: Allocator> Vec<T, A> {
         self.len = len + 1;
     }
 
-    /// Takes the value at `index` out, moving the values after it down one.
+    /// Takes the value at `index` out, moving the `len - index - 1` values after it down one:
+    /// linear, so quadratic in a loop (`remove_swap` when order does not matter, `retain` for
+    /// many).
     ///
     /// # Panics
     ///
     /// When `index >= len()`.
     #[track_caller]
-    pub fn remove(&mut self, index: usize) -> T {
+    pub fn remove_shift(&mut self, index: usize) -> T {
         let len = self.len;
         if index >= len {
-            out_of_bounds("Vec::remove", index, len);
+            out_of_bounds("Vec::remove_shift", index, len);
         }
         // SAFETY: `index < len`: the value is read out once, then the values after it move down
         // over its slot, and the length drops by one.
@@ -301,16 +304,17 @@ impl<T, A: Allocator> Vec<T, A> {
         }
     }
 
-    /// Takes the value at `index` out and puts the last value in its place.
+    /// Takes the value at `index` out and puts the last value in its place: constant time, the
+    /// order changed.
     ///
     /// # Panics
     ///
     /// When `index >= len()`.
     #[track_caller]
-    pub fn swap_remove(&mut self, index: usize) -> T {
+    pub fn remove_swap(&mut self, index: usize) -> T {
         let len = self.len;
         if index >= len {
-            out_of_bounds("Vec::swap_remove", index, len);
+            out_of_bounds("Vec::remove_swap", index, len);
         }
         // SAFETY: `index < len`: the value is read out once, the last value moves into its slot
         // (the same slot when it is the last, which `copy` allows), and the length drops by one.
@@ -378,33 +382,33 @@ impl<T, A: Allocator> Vec<T, A> {
         unsafe { <T as CloneSlice>::clone_to(values, base, &mut self.len) };
     }
 
-    /// Puts clones of `values` at `index`, moving the values after it up by their count; one
-    /// block copy for `Copy` values. A clone that panics leaves the ones made before it, and the
-    /// values after `index` closed up behind them.
+    /// Puts clones of `values` at `index`, moving the `len - index` values after it up by their
+    /// count (linear in the tail); one block copy for `TrivialClone` values. A clone that panics
+    /// leaves the ones made before it, and the values after `index` closed up behind them.
     ///
     /// # Panics
     ///
     /// When `index > len()`, or there is no memory.
     #[track_caller]
-    pub fn insert_many(&mut self, index: usize, values: &[T])
+    pub fn insert_slice_shift(&mut self, index: usize, values: &[T])
     where
         T: Clone,
     {
         if index > self.len {
-            out_of_bounds("Vec::insert_many", index, self.len);
+            out_of_bounds("Vec::insert_slice_shift", index, self.len);
         }
         self.reserve(values.len());
         // SAFETY: `index <= len` and room for `values` was reserved.
         unsafe { self.insert_cloned(index, values) };
     }
 
-    /// [`Vec::insert_many`], or the [`AllocFailure`] with the vector as it was.
+    /// [`Vec::insert_slice_shift`], or the [`AllocFailure`] with the vector as it was.
     ///
     /// # Panics
     ///
     /// When `index > len()`.
     #[track_caller]
-    pub fn try_insert_many(&mut self, index: usize, values: &[T]) -> Result<(), AllocFailure>
+    pub fn try_insert_slice_shift(&mut self, index: usize, values: &[T]) -> Result<(), AllocFailure>
     where
         T: Clone,
     {
@@ -444,19 +448,11 @@ impl<T, A: Allocator> Vec<T, A> {
         unsafe { <T as CloneSlice>::clone_to(values, base.add(index), &mut gap.1) };
     }
 
-    /// Whether a value equals `needle`: blaze-memchr's vector search for `u8`, `i8` and `bool`,
-    /// `==` per value otherwise ([`Find`]).
+    /// The index of the first value equal to `needle`, by a linear scan: blaze-memchr's vector
+    /// search for `u8`, `i8` and `bool`, `==` per value otherwise ([`Find`]). For repeated
+    /// lookups keep the values sorted (`SortedSet`) or in a map.
     #[inline]
-    pub fn contains(&self, needle: &T) -> bool
-    where
-        T: PartialEq,
-    {
-        self.position(needle).is_some()
-    }
-
-    /// The index of the first value equal to `needle`, as [`Vec::contains`] searches.
-    #[inline]
-    pub fn position(&self, needle: &T) -> Option<usize>
+    pub fn scan_for(&self, needle: &T) -> Option<usize>
     where
         T: PartialEq,
     {
@@ -826,6 +822,70 @@ impl<T, A: Allocator> Vec<T, A> {
             Ok(copy) => copy,
             Err(failure) => fail(failure),
         }
+    }
+}
+
+/// The old names, whose cost the name did not say: each forwards to the name that says it, and
+/// goes when its callers have moved (docs/v2/plan/design/std.md, "What std makes easy to get
+/// slow").
+impl<T, A: Allocator> Vec<T, A> {
+    #[deprecated(note = "linear: use `insert_shift`, which says so")]
+    #[track_caller]
+    #[inline]
+    pub fn insert(&mut self, index: usize, value: T) {
+        self.insert_shift(index, value);
+    }
+
+    #[deprecated(note = "linear: use `remove_shift`, or `remove_swap` when order does not matter")]
+    #[track_caller]
+    #[inline]
+    pub fn remove(&mut self, index: usize) -> T {
+        self.remove_shift(index)
+    }
+
+    #[deprecated(note = "renamed `remove_swap`, beside `remove_shift`")]
+    #[track_caller]
+    #[inline]
+    pub fn swap_remove(&mut self, index: usize) -> T {
+        self.remove_swap(index)
+    }
+
+    #[deprecated(note = "linear in the tail: use `insert_slice_shift`")]
+    #[track_caller]
+    #[inline]
+    pub fn insert_many(&mut self, index: usize, values: &[T])
+    where
+        T: Clone,
+    {
+        self.insert_slice_shift(index, values);
+    }
+
+    #[deprecated(note = "linear in the tail: use `try_insert_slice_shift`")]
+    #[track_caller]
+    #[inline]
+    pub fn try_insert_many(&mut self, index: usize, values: &[T]) -> Result<(), AllocFailure>
+    where
+        T: Clone,
+    {
+        self.try_insert_slice_shift(index, values)
+    }
+
+    #[deprecated(note = "a linear scan: use `scan_for(needle).is_some()`")]
+    #[inline]
+    pub fn contains(&self, needle: &T) -> bool
+    where
+        T: PartialEq,
+    {
+        self.scan_for(needle).is_some()
+    }
+
+    #[deprecated(note = "a linear scan: use `scan_for`")]
+    #[inline]
+    pub fn position(&self, needle: &T) -> Option<usize>
+    where
+        T: PartialEq,
+    {
+        self.scan_for(needle)
     }
 }
 

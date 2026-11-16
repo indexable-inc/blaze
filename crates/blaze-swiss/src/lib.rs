@@ -214,17 +214,31 @@ pub fn find<const SLOTS: usize, T>(
     mut ctrl: impl FnMut(usize) -> Ctrl<SLOTS>,
     mut hit: impl FnMut(At<SLOTS>) -> Option<T>,
 ) -> Option<T> {
+    find_or_vacant(hash, tag, groups, ctrl, hit).ok()
+}
+
+/// [`find`], and on a miss the slot an insert of `hash` takes: the first empty slot of the
+/// group the probe stopped at, which is where [`vacant`] would put it. So a get-or-insert
+/// probes once either way; the vacancy holds until the table changes.
+#[inline]
+pub fn find_or_vacant<const SLOTS: usize, T>(
+    hash: u64,
+    tag: u8,
+    groups: usize,
+    mut ctrl: impl FnMut(usize) -> Ctrl<SLOTS>,
+    mut hit: impl FnMut(At<SLOTS>) -> Option<T>,
+) -> Result<T, At<SLOTS>> {
     let mask = groups - 1;
     let mut group = home(hash, groups);
     loop {
         let word = ctrl(group);
         for slot in word.matching(tag) {
             if let Some(found) = hit(At { group, slot, ctrl: word }) {
-                return Some(found);
+                return Ok(found);
             }
         }
-        if word.empty().any() {
-            return None;
+        if let Some(slot) = word.empty().first() {
+            return Err(At { group, slot, ctrl: word });
         }
         group = (group + 1) & mask;
     }

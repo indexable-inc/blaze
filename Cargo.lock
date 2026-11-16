@@ -404,7 +404,9 @@ dependencies = [
  "blaze-file-items",
  "blaze-ids",
  "blaze-ladder",
+ "blaze-mem",
  "blaze-own",
+ "blaze-sim",
  "blaze-std",
  "blaze-surface",
 ]
@@ -1484,6 +1486,7 @@ dependencies = [
  "blaze-sha256",
  "blaze-sim",
  "blaze-spin",
+ "blaze-text",
  "http",
  "objc2-core-foundation",
  "objc2-core-media",

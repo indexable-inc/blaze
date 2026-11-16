@@ -6746,7 +6746,7 @@ impl Store {
                             );
                         }
                         let tag = self.tags.ask(Op::ListPlaced);
-                        effects.push(Effect::List { dir: self.placed_dir(), tag });
+                        effects.push(Effect::List { dir: self.placed_dir().into(), tag });
                     }
                     Err(why) => {
                         let file = self.names_file();

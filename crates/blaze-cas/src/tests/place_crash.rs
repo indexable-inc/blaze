@@ -282,7 +282,7 @@ impl World {
     /// and every path placed since the last open with a derived value names its file.
     fn bounded(&mut self) -> Result<(), String> {
         let mut listed = None;
-        let mut effects = vec![Effect::List { dir: name("store/placed"), tag: Tag(u64::MAX - 7) }];
+        let mut effects = vec![Effect::List { dir: name("store/placed").into(), tag: Tag(u64::MAX - 7) }];
         run_until_idle(&mut self.sim, &mut effects, |completion, _| {
             if completion.tag == Tag(u64::MAX - 7) {
                 listed = Some(completion.done);

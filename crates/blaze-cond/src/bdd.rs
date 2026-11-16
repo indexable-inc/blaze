@@ -143,6 +143,7 @@ pub type Witness<'a> = AVec<'a, (Var, bool)>;
 const EMPTY: u32 = u32::MAX;
 const OP_RESTRICT: u32 = u32::MAX - 1;
 const OP_EXISTS: u32 = u32::MAX - 2;
+const OP_DISJOINT: u32 = u32::MAX - 3;
 
 /// One cache entry: an operation's operands and its result. `c` is `ite`'s `h`, or the tag of
 /// another operation (above every id, as [`MOST_NODES`] keeps ids below 2^31).
@@ -224,11 +225,34 @@ fn normalize(mut f: Cond, mut g: Cond, mut h: Cond) -> Norm {
 }
 
 #[inline]
-fn hash3(a: u32, b: u32, c: u32) -> usize {
+fn hash64(a: u32, b: u32, c: u32) -> u64 {
     let h = a.widen_to::<u64>().wrapping_mul(0x9E37_79B9_7F4A_7C15)
         ^ b.widen_to::<u64>().wrapping_mul(0xC2B2_AE3D_27D4_EB4F)
         ^ c.widen_to::<u64>().wrapping_mul(0x1656_67B1_9E37_79F9);
-    (h ^ (h >> 31)).truncate_to::<usize>()
+    h ^ (h >> 31)
+}
+
+#[inline]
+fn hash3(a: u32, b: u32, c: u32) -> usize {
+    hash64(a, b, c).truncate_to::<usize>()
+}
+
+/// A unique-table slot: the node's hash in the high half, its number in the low; 0 is empty.
+/// A probe compares hashes first and reads the node only when they agree, so a probe that
+/// passes other nodes touches the table's line alone.
+#[inline]
+fn slot_of(hash: u64, node: u32) -> u64 {
+    (hash & 0xFFFF_FFFF_0000_0000) | node.widen_to::<u64>()
+}
+
+/// One node: `if var { high } else { low }`. A row, not three columns: every read of a node
+/// reads all three, so a row is one cache line where columns are three (with the hash-tagged
+/// unique table, the cost example's random case went from 108 to 93 ns a step).
+#[derive(Clone, Copy)]
+struct Node {
+    low: u32,
+    high: u32,
+    var: u16,
 }
 
 fn spush<T>(v: &mut AVec<'_, T>, x: T) -> Result<(), CondError> {
@@ -239,16 +263,17 @@ fn spush<T>(v: &mut AVec<'_, T>, x: T) -> Result<(), CondError> {
 pub struct Bdd<'a> {
     vars: u16,
     cap: u32,
-    var: AVec<'a, u16>,
-    low: AVec<'a, u32>,
-    high: AVec<'a, u32>,
-    /// Open addressing over node numbers, 0 empty (node 0, the constant, is never in it); at
-    /// most half full.
-    unique: AVec<'a, u32>,
+    node: AVec<'a, Node>,
+    /// Open addressing over nodes ([`slot_of`]), 0 empty (node 0, the constant, is never in
+    /// it); at most half full.
+    unique: AVec<'a, u64>,
     cache: AVec<'a, Entry>,
     cache_mask: usize,
     frames: AVec<'a, Frame>,
     results: AVec<'a, Cond>,
+    /// [`Bdd::disjoint`]'s pairs still to check, and the marks of pairs proven once their
+    /// cofactors are.
+    pairs: AVec<'a, (Cond, Cond, bool)>,
     /// Traversals: a node is visited in this traversal when its stamp is `epoch`; `slot` is
     /// its place in `order`, from 1.
     stamp: AVec<'a, u32>,
@@ -274,14 +299,13 @@ impl<'a> Bdd<'a> {
         let mut bdd = Bdd {
             vars,
             cap: limits.nodes,
-            var: AVec::new_in(alloc),
-            low: AVec::new_in(alloc),
-            high: AVec::new_in(alloc),
+            node: AVec::new_in(alloc),
             unique: AVec::new_in(alloc),
             cache: AVec::new_in(alloc),
             cache_mask: (1usize << limits.cache_bits) - 1,
             frames: AVec::new_in(alloc),
             results: AVec::new_in(alloc),
+            pairs: AVec::new_in(alloc),
             stamp: AVec::new_in(alloc),
             slot: AVec::new_in(alloc),
             epoch: 0,
@@ -292,9 +316,7 @@ impl<'a> Bdd<'a> {
             alloc,
         };
         // Node 0: the constant true; its variable is after every other.
-        spush(&mut bdd.var, TERMINAL)?;
-        spush(&mut bdd.low, 0)?;
-        spush(&mut bdd.high, 0)?;
+        spush(&mut bdd.node, Node { low: 0, high: 0, var: TERMINAL })?;
         bdd.unique.try_reserve_exact(1024)?;
         bdd.unique.resize(1024, 0);
         let entries = 1usize << limits.cache_bits;
@@ -315,17 +337,17 @@ impl<'a> Bdd<'a> {
 
     /// Nodes held, the constant included.
     pub fn nodes(&self) -> usize {
-        self.var.len()
+        self.node.len()
     }
 
     pub fn stats(&self) -> Stats {
         self.stats
     }
 
-    /// Bytes the arena holds now: its columns, unique table, cache and traversal scratch.
+    /// Bytes the arena holds now: its nodes, unique table, cache and traversal scratch.
     pub fn bytes(&self) -> usize {
-        self.var.capacity() * 2
-            + (self.low.capacity() + self.high.capacity() + self.unique.capacity()) * 4
+        self.node.capacity() * size_of::<Node>()
+            + self.unique.capacity() * 8
             + self.cache.capacity() * 16
             + (self.stamp.capacity() + self.slot.capacity() + self.order.capacity()) * 4
             + self.counts.capacity() * 16
@@ -341,24 +363,24 @@ impl<'a> Bdd<'a> {
 
     /// The variable a condition tests first, `None` for a constant.
     pub fn top(&self, f: Cond) -> Option<Var> {
-        let v = self.var[idx(f.node())];
+        let v = self.node[idx(f.node())].var;
         (v != TERMINAL).then_some(Var(v))
     }
 
     #[inline]
     fn level(&self, f: Cond) -> u16 {
-        self.var[idx(f.node())]
+        self.node[idx(f.node())].var
     }
 
     /// The cofactors of `f` by `v`, `(low, high)`, when `f` tests `v` first; else `f` twice.
     #[inline]
     fn cof(&self, f: Cond, v: u16) -> (Cond, Cond) {
-        let n = idx(f.node());
-        if self.var[n] != v {
+        let n = self.node[idx(f.node())];
+        if n.var != v {
             return (f, f);
         }
         let c = f.0 & 1;
-        (Cond(self.low[n] ^ c), Cond(self.high[n] ^ c))
+        (Cond(n.low ^ c), Cond(n.high ^ c))
     }
 
     /// The node `(var, low, high)`, made or found: reduced, its high edge regular.
@@ -372,31 +394,31 @@ impl<'a> Bdd<'a> {
             (low, high, false)
         };
         let mask = self.unique.len() - 1;
-        let mut at = hash3(u32::from(var), low.0, high.0) & mask;
+        let hash = hash64(u32::from(var), low.0, high.0);
+        let tag = hash & 0xFFFF_FFFF_0000_0000;
+        let mut at = hash.truncate_to::<usize>() & mask;
         loop {
             let slot = self.unique[at];
             if slot == 0 {
                 break;
             }
-            let n = idx(slot);
-            if self.var[n] == var && self.low[n] == low.0 && self.high[n] == high.0 {
-                return Ok(Cond(slot << 1).neg_if(neg));
+            if slot & 0xFFFF_FFFF_0000_0000 == tag {
+                let n = slot.truncate_to::<u32>();
+                let node = self.node[idx(n)];
+                if node.var == var && node.low == low.0 && node.high == high.0 {
+                    return Ok(Cond(n << 1).neg_if(neg));
+                }
             }
             at = (at + 1) & mask;
         }
-        let n = self.var.len();
+        let n = self.node.len();
         if n >= idx(self.cap) {
             return Err(CondError::NodeCap { cap: self.cap });
         }
-        self.var.try_reserve(1)?;
-        self.low.try_reserve(1)?;
-        self.high.try_reserve(1)?;
-        self.var.push(var);
-        self.low.push(low.0);
-        self.high.push(high.0);
+        spush(&mut self.node, Node { low: low.0, high: high.0, var })?;
         // `n` is below the cap, which is below 2^30.
         let n32 = n.narrow_or_stop::<u32>();
-        self.unique[at] = n32;
+        self.unique[at] = slot_of(hash, n32);
         if n * 2 > self.unique.len() {
             self.grow_unique()?;
         }
@@ -406,16 +428,17 @@ impl<'a> Bdd<'a> {
     /// Doubles the unique table and puts every node back.
     fn grow_unique(&mut self) -> Result<(), CondError> {
         let len = self.unique.len() * 2;
-        let mut table: AVec<'a, u32> = AVec::new_in(self.alloc);
+        let mut table: AVec<'a, u64> = AVec::new_in(self.alloc);
         table.try_reserve_exact(len)?;
         table.resize(len, 0);
         let mask = len - 1;
-        for n in 1..self.var.len() {
-            let mut at = hash3(u32::from(self.var[n]), self.low[n], self.high[n]) & mask;
+        for (n, node) in self.node.iter().enumerate().skip(1) {
+            let hash = hash64(u32::from(node.var), node.low, node.high);
+            let mut at = hash.truncate_to::<usize>() & mask;
             while table[at] != 0 {
                 at = (at + 1) & mask;
             }
-            table[at] = n.narrow_or_stop::<u32>();
+            table[at] = slot_of(hash, n.narrow_or_stop::<u32>());
         }
         self.unique = table;
         Ok(())
@@ -515,7 +538,7 @@ impl<'a> Bdd<'a> {
                     let top = self.level(f);
                     // Variables of the cube before `f`'s first are not in `f`.
                     while !cube.is_true() && self.level(cube) < top {
-                        cube = Cond(self.high[idx(cube.node())]);
+                        cube = Cond(self.node[idx(cube.node())].high);
                     }
                     if cube.is_true() {
                         spush(&mut self.results, f)?;
@@ -529,7 +552,7 @@ impl<'a> Bdd<'a> {
                     self.stats.steps += 1;
                     let (low, high) = self.cof(f, top);
                     let quantify = self.level(cube) == top;
-                    let rest = if quantify { Cond(self.high[idx(cube.node())]) } else { cube };
+                    let rest = if quantify { Cond(self.node[idx(cube.node())].high) } else { cube };
                     spush(&mut self.frames, Frame::ExistsJoin { f, cube, var: top, quantify })?;
                     spush(&mut self.frames, Frame::Exists { f: high, cube: rest })?;
                     spush(&mut self.frames, Frame::Exists { f: low, cube: rest })?;
@@ -577,12 +600,44 @@ impl<'a> Bdd<'a> {
         self.ite(a, b.not(), b)
     }
 
-    /// Whether every configuration `a` admits, `b` admits.
+    /// Whether every configuration `a` admits, `b` admits: `a & !b` is empty, decided without
+    /// making a node ([`disjoint`](Bdd::disjoint)).
     pub fn implies(&mut self, a: Cond, b: Cond) -> Result<bool, CondError> {
-        if a.is_false() || b.is_true() || a == b {
-            return Ok(true);
+        self.disjoint(a, b.not())
+    }
+
+    /// Whether no configuration satisfies both: a walk over pairs of cofactors that stops at the
+    /// first pair both satisfy, makes no node, and caches each pair it proves disjoint.
+    pub fn disjoint(&mut self, a: Cond, b: Cond) -> Result<bool, CondError> {
+        self.pairs.clear();
+        spush(&mut self.pairs, (a, b, false))?;
+        while let Some((f, g, done)) = self.pairs.pop() {
+            let (f, g) = if f <= g { (f, g) } else { (g, f) };
+            if done {
+                self.cache_put(f.0, g.0, OP_DISJOINT, Cond::TRUE);
+                continue;
+            }
+            if f.is_false() || g.is_false() || f == g.not() {
+                continue;
+            }
+            // A function that is not false is satisfiable: true with it, or itself twice, is not
+            // disjoint.
+            if f.is_true() || g.is_true() || f == g {
+                return Ok(false);
+            }
+            if self.cache_get(f.0, g.0, OP_DISJOINT).is_some() {
+                self.stats.hits += 1;
+                continue;
+            }
+            self.stats.steps += 1;
+            let var = self.level(f).min(self.level(g));
+            let (f0, f1) = self.cof(f, var);
+            let (g0, g1) = self.cof(g, var);
+            spush(&mut self.pairs, (f, g, true))?;
+            spush(&mut self.pairs, (f1, g1, false))?;
+            spush(&mut self.pairs, (f0, g0, false))?;
         }
-        Ok(self.and(a, b.not())?.is_false())
+        Ok(true)
     }
 
     /// `f` with `var` fixed at `value`.
@@ -615,14 +670,15 @@ impl<'a> Bdd<'a> {
         while !e.is_const() {
             let n = idx(e.node());
             let c = e.0 & 1;
-            e = Cond(if value(Var(self.var[n])) { self.high[n] } else { self.low[n] } ^ c);
+            let node = self.node[n];
+            e = Cond(if value(Var(node.var)) { node.high } else { node.low } ^ c);
         }
         e.is_true()
     }
 
     /// Readies the traversal columns for every node and starts a traversal.
     fn begin(&mut self) -> Result<(), CondError> {
-        let n = self.var.len();
+        let n = self.node.len();
         if self.stamp.len() < n {
             self.stamp.try_reserve(n - self.stamp.len())?;
             self.stamp.resize(n, 0);
@@ -659,7 +715,7 @@ impl<'a> Bdd<'a> {
             }
             self.stamp[at] = self.epoch;
             spush(&mut self.walk, (n, true))?;
-            let (low, high) = (self.low[at] >> 1, self.high[at] >> 1);
+            let (low, high) = (self.node[at].low >> 1, self.node[at].high >> 1);
             if high != 0 && self.stamp[idx(high)] != self.epoch {
                 spush(&mut self.walk, (high, false))?;
             }
@@ -673,7 +729,8 @@ impl<'a> Bdd<'a> {
     /// The node `n`'s variable and edges, for the portable form.
     pub(crate) fn node_of(&self, n: u32) -> (u16, Cond, Cond) {
         let at = idx(n);
-        (self.var[at], Cond(self.low[at]), Cond(self.high[at]))
+        let node = self.node[at];
+        (node.var, Cond(node.low), Cond(node.high))
     }
 
     /// Edge `e` with its node renamed to its traversal slot: what a row refers to.
@@ -696,7 +753,7 @@ impl<'a> Bdd<'a> {
         seen.try_reserve_exact(words)?;
         seen.resize(words, 0);
         for &n in self.order.iter() {
-            let v = self.var[idx(n)];
+            let v = self.node[idx(n)].var;
             seen[usize::from(v / 64)] |= 1 << (v % 64);
         }
         for (w, &bits) in seen.iter().enumerate() {
@@ -729,9 +786,10 @@ impl<'a> Bdd<'a> {
         };
         for i in 0..self.order.len() {
             let at = idx(self.order[i]);
-            let v = u32::from(self.var[at]);
-            let (ml, ll) = from(self, Cond(self.low[at]));
-            let (mh, lh) = from(self, Cond(self.high[at]));
+            let node = self.node[at];
+            let v = u32::from(node.var);
+            let (ml, ll) = from(self, Cond(node.low));
+            let (mh, lh) = from(self, Cond(node.high));
             self.counts.push((ml << (ll - v - 1)) + (mh << (lh - v - 1)));
         }
         let (m, l) = from(self, f);
@@ -755,11 +813,12 @@ impl<'a> Bdd<'a> {
         while !e.is_const() {
             let at = idx(e.node());
             let c = e.0 & 1;
-            let low = Cond(self.low[at] ^ c);
-            let v = Var(self.var[at]);
+            let node = self.node[at];
+            let low = Cond(node.low ^ c);
+            let v = Var(node.var);
             if low.is_false() {
                 out.try_push((v, true)).map_err(|r| CondError::Alloc(r.why))?;
-                e = Cond(self.high[at] ^ c);
+                e = Cond(node.high ^ c);
             } else {
                 out.try_push((v, false)).map_err(|r| CondError::Alloc(r.why))?;
                 e = low;

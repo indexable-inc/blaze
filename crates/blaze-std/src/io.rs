@@ -223,6 +223,9 @@ struct World {
     /// Every file an effect named, and whether the effect changes it, while `record` is on: a
     /// test's view of where its capabilities reached.
     touched: Vec<(FileName, bool)>,
+    /// Every effect handed to the driver, in order, while `record` is on: a test's view of
+    /// what a call asked of the device.
+    asked: Vec<Effect>,
     record: bool,
     /// For each file whose bytes or name an effect of this world changed, the number of the
     /// last effect that did (its tag, plus one): the file's generation, which a
@@ -552,6 +555,7 @@ impl Io {
             rng: SplitMix64::new(seed),
             // alloc: none until a test records.
             touched: Vec::new(),
+            asked: Vec::new(),
             record: false,
             // alloc: none until a file is changed.
             changed: BTreeMap::new(),
@@ -1027,6 +1031,12 @@ impl Io {
         self.world.lock().touched.clone()
     }
 
+    /// The effects handed to the driver since [`Io::record`], in order, the record emptied.
+    #[cfg(test)]
+    pub(crate) fn asked(&self) -> Vec<Effect> {
+        core::mem::take(&mut self.world.lock().asked)
+    }
+
     /// `effect` of a fresh tag, handed to the driver, then waited for under `cx`: one call.
     /// A `cx` that stopped already asks nothing of the driver.
     pub(crate) fn call(&self, cx: &Cx, effect: impl FnOnce(Tag) -> Effect) -> Result<Done, Stopped> {
@@ -1043,6 +1053,8 @@ impl Io {
         let effect = effect(tag);
         if world.record {
             touch(&mut world.touched, &effect);
+            // clone: a test's record of what was asked.
+            world.asked.push(effect.clone());
         }
         change(&mut world.changed, &effect, tag.0 + 1);
         let World { driver, effects, disk, .. } = &mut *world;
@@ -1243,11 +1255,19 @@ fn touch(touched: &mut Vec<(FileName, bool)>, effect: &Effect) {
             named(like, false);
             named(file, false);
         }
-        Effect::List { dir, .. } | Effect::Entries { dir, .. } | Effect::Watch { dir, .. } => named(dir, false),
-        Effect::Private { dir, .. }
-        | Effect::MakeDir { dir, .. }
-        | Effect::RemoveDir { dir, .. }
-        | Effect::SyncDir { dir, .. } => named(dir, true),
+        Effect::Entries { dir, .. } | Effect::Watch { dir, .. } => named(dir, false),
+        Effect::Private { dir, .. } | Effect::MakeDir { dir, .. } | Effect::RemoveDir { dir, .. } => named(dir, true),
+        // The root has no name to record.
+        Effect::List { dir, .. } => {
+            if let Some(dir) = dir.name() {
+                named(dir, false);
+            }
+        }
+        Effect::SyncDir { dir, .. } => {
+            if let Some(dir) = dir.name() {
+                named(dir, true);
+            }
+        }
         Effect::Journal { dir, .. } => named(dir, false),
         // A batch of reads names each part's file, and changes none.
         Effect::ReadMany { parts, .. } => {
@@ -1291,6 +1311,7 @@ fn change(changed: &mut BTreeMap<FileName, u64>, effect: &Effect, stamp: u64) {
         Effect::Append { file, .. }
         | Effect::Truncate { file, .. }
         | Effect::Write { file, .. }
+        | Effect::WriteUnsynced { file, .. }
         | Effect::WriteAt { file, .. }
         | Effect::WriteFrom { file, .. } => {
             // clone: the table's key, a refcount.
@@ -1299,7 +1320,8 @@ fn change(changed: &mut BTreeMap<FileName, u64>, effect: &Effect, stamp: u64) {
         Effect::Remove { file, .. } => {
             changed.remove(file);
         }
-        Effect::Rename { from, to, .. } => {
+        // A rename changes the names whether or not it syncs them.
+        Effect::Rename { from, to, .. } | Effect::RenameUnsynced { from, to, .. } => {
             changed.remove(from);
             // clone: the table's key, a refcount.
             changed.insert(to.clone(), stamp);
@@ -1311,7 +1333,7 @@ fn change(changed: &mut BTreeMap<FileName, u64>, effect: &Effect, stamp: u64) {
         // Everything else leaves every file's bytes and names as they were: a barrier orders
         // what was written and a prewarm asks the page cache to read ahead, as a sync and a
         // write-back change no byte.
-        Effect::ReadAll { .. } | Effect::Read { .. } | Effect::ReadInto { .. } | Effect::ReadMany { .. } | Effect::ReadLink { .. } | Effect::Sync { .. } | Effect::Barrier { .. } | Effect::Prewarm { .. } | Effect::WriteBack { .. } | Effect::SyncDir { .. } | Effect::WriteUnsynced { .. } | Effect::List { .. } | Effect::RenameUnsynced { .. } | Effect::Mode { .. } | Effect::Seal { .. } | Effect::Private { .. } | Effect::Times { .. } | Effect::Stat { .. } | Effect::Lstat { .. } | Effect::Lock { .. } | Effect::Unlock { .. } | Effect::Watch { .. } | Effect::Journal { .. } | Effect::Unwatch { .. } | Effect::Stamp { .. } | Effect::Entries { .. } | Effect::Flush { .. } | Effect::Timer { .. } | Effect::Map { .. } | Effect::Spawn { .. } | Effect::Kill { .. } | Effect::Listen { .. } | Effect::Unlisten { .. } | Effect::Connect { .. } | Effect::Recv { .. } | Effect::Send { .. } | Effect::Hangup { .. } | Effect::Pressure { .. } | Effect::Bind { .. } | Effect::SendTo { .. } | Effect::RecvFrom { .. } | Effect::Unbind { .. } | Effect::Resolve { .. } | Effect::ReadStdin { .. } | Effect::WriteOut { .. } | Effect::Now { .. } | Effect::Random { .. } | Effect::MakeDir { .. } | Effect::RemoveDir { .. } => {}
+        Effect::ReadAll { .. } | Effect::Read { .. } | Effect::ReadInto { .. } | Effect::ReadMany { .. } | Effect::ReadLink { .. } | Effect::Sync { .. } | Effect::Barrier { .. } | Effect::Prewarm { .. } | Effect::WriteBack { .. } | Effect::SyncDir { .. } | Effect::List { .. } | Effect::Mode { .. } | Effect::Seal { .. } | Effect::Private { .. } | Effect::Times { .. } | Effect::Stat { .. } | Effect::Lstat { .. } | Effect::Lock { .. } | Effect::Unlock { .. } | Effect::Watch { .. } | Effect::Journal { .. } | Effect::Unwatch { .. } | Effect::Stamp { .. } | Effect::Entries { .. } | Effect::Flush { .. } | Effect::Timer { .. } | Effect::Map { .. } | Effect::Spawn { .. } | Effect::Kill { .. } | Effect::Listen { .. } | Effect::Unlisten { .. } | Effect::Connect { .. } | Effect::Recv { .. } | Effect::Send { .. } | Effect::Hangup { .. } | Effect::Pressure { .. } | Effect::Bind { .. } | Effect::SendTo { .. } | Effect::RecvFrom { .. } | Effect::Unbind { .. } | Effect::Resolve { .. } | Effect::ReadStdin { .. } | Effect::WriteOut { .. } | Effect::Now { .. } | Effect::Random { .. } | Effect::MakeDir { .. } | Effect::RemoveDir { .. } => {}
     }
 }
 

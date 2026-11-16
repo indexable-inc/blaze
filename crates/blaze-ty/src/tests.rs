@@ -603,6 +603,30 @@ fn aliases_defer_unless_structural() {
 
 /// A million nested references: every walk runs on its own stack, so none grows the thread's.
 #[test]
+fn a_shared_dag_is_walked_once_per_node() {
+    // `T(k) = (T(k-1), T(k-1))`: 64 levels, 2^64 paths and 129 distinct nodes. Substitution,
+    // canonicalization and resolution must each visit a node a bounded number of times: a
+    // fold that lost the memo, or a deferred intern that kept a sibling's result from it,
+    // would not finish.
+    const LEVELS: usize = 64;
+    let mut cx = TyCx::new_in(Alloc::global());
+    let v = cx.next_ty_var();
+    let (mut with_param, mut with_var, mut plain) = (cx.tys.param(0), v, Ty::BOOL);
+    for _ in 0..LEVELS {
+        with_param = cx.tys.tuple_of(&[with_param, with_param]);
+        with_var = cx.tys.tuple_of(&[with_var, with_var]);
+        plain = cx.tys.tuple_of(&[plain, plain]);
+    }
+    let args = cx.tys.mk_ty_list(&[Ty::BOOL]);
+    assert_eq!(cx.subst_ty(with_param, args), Ok(plain));
+    let mut buf = CanonBuf::new_in(Alloc::global());
+    let c = cx.canonicalize(with_var.node(), Mode::Input { param_env: false }, &mut buf);
+    assert!(matches!(c, Ok(c) if c.vars == 1), "{c:?}");
+    assert_eq!(cx.eq(v.arg(), Ty::BOOL.arg(), &mut AllInvariant), Ok(true));
+    assert_eq!(cx.resolve_ty(with_var), plain);
+}
+
+#[test]
 fn a_million_deep_chain_walks_without_stack_growth() {
     const DEPTH: usize = 1_000_000;
     let mut cx = TyCx::new_in(Alloc::global());

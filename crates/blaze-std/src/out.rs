@@ -125,6 +125,33 @@ impl Out {
         self.say(cx, format_args!("{what}"))
     }
 
+    /// A chain of blaze-text writers and a line feed, written as [`Out::line`] writes: one
+    /// write when at most [`HELD`] bytes. What `println!` becomes:
+    /// `out.line_with(cx, |o| o.str("x = ").int(x))?`.
+    pub fn line_with(&self, cx: &Cx, write: impl for<'o, 'h> FnOnce(&'o mut Held<'h>) -> &'o mut Held<'h>) -> Result<(), OutError> {
+        self.held(cx, |held| {
+            blaze_text::Put::put_byte(write(held), b'\n');
+        })
+    }
+
+    /// A chain of blaze-text writers, with nothing after it: one write when at most [`HELD`]
+    /// bytes. What `print!` becomes.
+    pub fn write_with(&self, cx: &Cx, write: impl for<'o, 'h> FnOnce(&'o mut Held<'h>) -> &'o mut Held<'h>) -> Result<(), OutError> {
+        self.held(cx, |held| {
+            write(held);
+        })
+    }
+
+    fn held(&self, cx: &Cx, fill: impl FnOnce(&mut Held<'_>)) -> Result<(), OutError> {
+        let mut held = Held { out: self, cx, bytes: [0; HELD], len: 0, failed: None };
+        fill(&mut held);
+        held.flush();
+        match held.failed {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     /// Every byte of `bytes`, in order, as one write, or an error.
     pub fn write_all(&self, cx: &Cx, bytes: &[u8]) -> Result<(), OutError> {
         self.parts(cx, &[bytes])
@@ -163,8 +190,10 @@ impl fmt::Debug for Out {
 }
 
 /// What one `line` or `write` formats into: [`HELD`] bytes, handed over when full and when
-/// the call ends. It never leaves its call, so nothing it holds can be lost.
-struct Held<'a> {
+/// the call ends. It never leaves its call, so nothing it holds can be lost. A
+/// `blaze_text::Put`, so [`Out::line_with`]'s chain writes straight into it; after a failed
+/// write it takes nothing more, and the call returns the failure.
+pub struct Held<'a> {
     out: &'a Out,
     cx: &'a Cx,
     bytes: [u8; HELD],
@@ -182,12 +211,14 @@ impl Held<'_> {
     }
 }
 
-impl fmt::Write for Held<'_> {
-    fn write_str(&mut self, text: &str) -> fmt::Result {
-        let mut rest = text.as_bytes();
+impl Held<'_> {
+    /// `bytes` after what is held, handed over each time `HELD` fill; `false` once a write
+    /// failed.
+    fn take(&mut self, bytes: &[u8]) -> bool {
+        let mut rest = bytes;
         while !rest.is_empty() {
             if self.failed.is_some() {
-                return Err(fmt::Error);
+                return false;
             }
             if self.len == HELD {
                 self.flush();
@@ -198,7 +229,24 @@ impl fmt::Write for Held<'_> {
             self.len += take;
             rest = &rest[take..];
         }
-        Ok(())
+        self.failed.is_none()
+    }
+}
+
+impl fmt::Write for Held<'_> {
+    fn write_str(&mut self, text: &str) -> fmt::Result {
+        match self.take(text.as_bytes()) {
+            true => Ok(()),
+            false => Err(fmt::Error),
+        }
+    }
+}
+
+/// A failed write is kept in the `Held` and returned by the call that made it.
+impl blaze_text::Put for Held<'_> {
+    #[inline]
+    fn put_str(&mut self, text: &str) {
+        let _ = self.take(text.as_bytes());
     }
 }
 

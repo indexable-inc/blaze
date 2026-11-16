@@ -172,6 +172,39 @@ impl<T: Eq, S: KeyHash<T>, A: Allocator> Set<T, S, A> {
         self.0.get_key_value(value).map(|(it, ())| it)
     }
 
+    /// The held element equal to `value`, or else `make(value)`, added now: the owned element
+    /// is made only when none is held, with one hash and one probe either way. `make` must
+    /// return an element equal to `value` (checked in debug builds); a refused allocation is
+    /// a panic naming it.
+    #[inline]
+    pub fn get_or_insert_with<Q: ?Sized + Equivalent<T>>(
+        &mut self,
+        value: &Q,
+        make: impl FnOnce(&Q) -> T,
+    ) -> &T
+    where
+        S: KeyHash<Q>,
+    {
+        match self.0.try_slot_or_insert_with(value, |value| (make(value), ())) {
+            Ok(index) => &self.0.table.get(index).0,
+            Err(failure) => crate::raw::fail(failure),
+        }
+    }
+
+    /// [`Set::get_or_insert_with`], a refused allocation returned (and `make` not called).
+    #[inline]
+    pub fn try_get_or_insert_with<Q: ?Sized + Equivalent<T>>(
+        &mut self,
+        value: &Q,
+        make: impl FnOnce(&Q) -> T,
+    ) -> Result<&T, AllocFailure>
+    where
+        S: KeyHash<Q>,
+    {
+        let index = self.0.try_slot_or_insert_with(value, |value| (make(value), ()))?;
+        Ok(&self.0.table.get(index).0)
+    }
+
     /// Starts loading what a [`Set::get`] or [`Set::contains`] of `value` reads first, as
     /// [`Map::prefetch`].
     #[inline]

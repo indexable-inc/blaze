@@ -5,8 +5,10 @@
 //! Paths resolve in the body's module: an item of that module, a `mod` path, `crate::`,
 //! `self::` and `super::` ([`Program::resolve`]). A fn is `Def::Fn`, a struct `Def::Adt` (the
 //! checker takes it for a struct literal), a trait `Def::Trait`; a module alone is no value.
-//! Lang items are the traits marked `#[lang = ".."]`. The subset has no impls, generics,
-//! consts or opaque types, so those questions answer empty, as the toy world's do.
+//! Lang items are the traits marked `#[lang = ".."]`. Fns and structs may take type parameters
+//! (`FnSig::own_count`, `Adt::generics`), without bounds, so every item's predicates are empty.
+//! The subset has no impls, consts or opaque types, so those questions answer empty, as the toy
+//! world's do.
 
 use blaze_typeck::{
     Adt, AssocItem, Def, Fetch, FnSig, Hidden, ImplHeader, ItemKey, LangItem, Name, PClause, PTys, PathIdx, PathRes,

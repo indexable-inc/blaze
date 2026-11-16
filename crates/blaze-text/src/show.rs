@@ -245,6 +245,16 @@ impl Show for Bytes {
     }
 }
 
+/// Any value in `{:?}`'s layout, as [`Writes::debug`]: what `{:?}` was at a format site.
+pub struct Dbg<'a, T: ?Sized>(pub &'a T);
+
+impl<T: ?Sized> Show for Dbg<'_, T> {
+    #[inline]
+    fn show<P: Put + ?Sized>(&self, out: &mut P) {
+        out.debug(self.0);
+    }
+}
+
 /// Text as a quoted Rust literal, as [`Writes::escaped`].
 #[derive(Clone, Copy, Debug)]
 pub struct Quoted<'a>(pub &'a str);
@@ -253,5 +263,23 @@ impl Show for Quoted<'_> {
     #[inline]
     fn show<P: Put + ?Sized>(&self, out: &mut P) {
         out.escaped(self.0);
+    }
+}
+
+/// A [`Show`] made from a writing closure: what was `format_args!(..)` handed on to be
+/// written later. As large as what the closure captures; zero-sized when it captures nothing.
+pub struct ShowWith<F: Fn(&mut dyn Put)>(pub F);
+
+/// `show_with(|out| _ = out.str("x = ").int(x))`: a value that writes itself by the closure.
+#[inline]
+pub fn show_with<F: Fn(&mut dyn Put)>(write: F) -> ShowWith<F> {
+    ShowWith(write)
+}
+
+impl<F: Fn(&mut dyn Put)> Show for ShowWith<F> {
+    #[inline]
+    fn show<P: Put + ?Sized>(&self, out: &mut P) {
+        let mut sink: &mut P = out;
+        (self.0)(&mut sink);
     }
 }

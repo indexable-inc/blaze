@@ -127,6 +127,66 @@ fn modules() {
 }
 
 #[test]
+fn generics() {
+    let p = check_rung("5-generics");
+    let f = |path: &str| p.fns.iter().position(|f| f.path.as_ref() == path).expect(path);
+    for (path, n) in [("pick", 1), ("second", 1), ("pick_second", 1), ("main", 0)] {
+        assert_eq!(p.sig(f(path)).own_count, n, "{path}");
+    }
+    // `pick<T>(c: bool, a: T, b: T) -> T`.
+    let sig = p.sig(f("pick"));
+    let node = |t: blaze_typeck::PTy| sig.types.nodes[t.0 as usize];
+    assert_eq!(node(sig.inputs[1]), PNode::Param(0));
+    assert_eq!(node(sig.output), PNode::Param(0));
+    let pair = p.adt(p.structs[0].key).expect("Pair");
+    assert_eq!(pair.generics, 1);
+    assert!(pair.fields.iter().all(|fl| pair.types.nodes[fl.ty.0 as usize] == PNode::Param(0)));
+}
+
+#[test]
+fn written_type_arguments_check() {
+    let text = "struct P<T> { a: T }\nfn id<T>(x: T) -> T { x }\nfn get<U>(p: P<U>) -> U { p.a }\n\
+                fn main() { let p: P<u8> = P::<u8> { a: id::<u8>(1) }; let _y: u8 = get(p); }";
+    let files = [SourceFile { path: "src/main.rs", text }];
+    let p = lower::lower(&files, "src/main.rs").unwrap_or_else(|e| panic!("{}", e.located(&files)));
+    for (i, f) in p.fns.iter().enumerate() {
+        let body = f.body.as_ref().expect("a body");
+        let out = blaze_typeck::check(
+            &body.view(f.key),
+            &p.world(i),
+            &mut ToyCtx::new(),
+            &Needs::new_in(Alloc::global()),
+            Alloc::global(),
+        );
+        match out {
+            Ok(Outcome::Done(c)) => assert!(c.diags.is_empty(), "`{}`: diagnostics {:?}", f.path, c.diags),
+            Ok(Outcome::Need(n)) => panic!("`{}`: the world missed {:?}", f.path, n.questions),
+            Err(e) => panic!("`{}`: {e:?}", f.path),
+        }
+    }
+}
+
+#[test]
+fn generics_outside_the_subset_are_named() {
+    let refused = |text: &str| {
+        let files = [SourceFile { path: "src/main.rs", text }];
+        lower::lower(&files, "src/main.rs").err().expect("refused")
+    };
+    let what = |text: &str| match refused(text) {
+        LowerError::Unsupported { what, .. } => what,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(what("fn f<'a>() {}"), "a lifetime parameter");
+    assert_eq!(what("fn f<const N: usize>() {}"), "a const generic parameter");
+    assert_eq!(what("trait C {}\nfn f<T: C>() {}"), "a trait bound");
+    assert_eq!(what("fn f<T>() where T: Sized {}"), "a `where` clause");
+    let err = refused("struct P<T> { a: T }\nfn f(p: P) {}");
+    assert!(matches!(err, LowerError::GenericArgCount { want: 1, got: 0, .. }), "{err:?}");
+    let err = refused("fn f<T, T>() {}");
+    assert!(matches!(err, LowerError::DuplicateParam { ref name, .. } if name.as_ref() == "T"), "{err:?}");
+}
+
+#[test]
 fn a_closure_is_a_typed_error() {
     let text = "fn main() { let f = |x: i32| x; }";
     let files = [SourceFile { path: "src/main.rs", text }];

@@ -16,7 +16,7 @@ use blaze_typeck::{
     Seal, Segment, Shape, Stmt, StmtId, TypeAttrs, UintTy, Variant, World,
 };
 
-use crate::{Adts, Built};
+use crate::{Adts, Built, Instance, Subst};
 
 /// A body under construction, with the literal values its form does not hold.
 struct BodyBuf {
@@ -154,12 +154,15 @@ impl BodyBuf {
 struct Fun {
     key: ItemKey,
     name: Name,
+    /// Its own generic parameters, `Param(0..generics)` in its types.
+    generics: u32,
     inputs: Vec<PTy, Global>,
     output: PTy,
 }
 
 struct Struct {
     key: ItemKey,
+    generics: u32,
     variants: Vec<Variant, Global>,
     fields: Vec<Field, Global>,
 }
@@ -181,16 +184,24 @@ impl TestWorld {
     }
 
     fn func(&mut self, key: u128, name: &str, inputs: &[PNode], output: PNode) {
+        self.generic_func(key, name, 0, inputs, output);
+    }
+
+    fn generic_func(&mut self, key: u128, name: &str, generics: u32, inputs: &[PNode], output: PNode) {
         let mut ins = Vec::new_in(Global);
         for &n in inputs {
             let t = self.ty(n);
             ins.push(t);
         }
         let output = self.ty(output);
-        self.fns.push(Fun { key: ItemKey(key), name: Name::of(name), inputs: ins, output });
+        self.fns.push(Fun { key: ItemKey(key), name: Name::of(name), generics, inputs: ins, output });
     }
 
     fn strukt(&mut self, key: u128, name: &str, fields: &[(&str, PNode)]) {
+        self.generic_strukt(key, name, 0, fields);
+    }
+
+    fn generic_strukt(&mut self, key: u128, name: &str, generics: u32, fields: &[(&str, PNode)]) {
         let mut fs = Vec::new_in(Global);
         for &(n, t) in fields {
             let ty = self.ty(t);
@@ -203,13 +214,13 @@ impl TestWorld {
             ctor: CtorKind::Braces,
             fields: List { start: 0, len: fs.len() as u32 },
         });
-        self.structs.push(Struct { key: ItemKey(key), variants, fields: fs });
+        self.structs.push(Struct { key: ItemKey(key), generics, variants, fields: fs });
     }
 
     fn sig(&self, key: ItemKey) -> Option<FnSig<'_>> {
         self.fns.iter().find(|f| f.key == key).map(|f| FnSig {
             parent_count: 0,
-            own_count: 0,
+            own_count: f.generics,
             self_param: false,
             inputs: &f.inputs,
             output: f.output,
@@ -220,7 +231,7 @@ impl TestWorld {
     fn adt_of(&self, key: ItemKey) -> Option<Adt<'_>> {
         self.structs.iter().find(|s| s.key == key).map(|s| Adt {
             kind: AdtKind::Struct,
-            generics: 0,
+            generics: s.generics,
             variants: &s.variants,
             fields: &s.fields,
             types: self.types.view(),
@@ -307,9 +318,23 @@ impl Adts for TestAdts<'_> {
 
 const MAIN: ItemKey = ItemKey(1);
 
-/// Checks and builds `body` of `MAIN`.
+/// Checks and builds `body` of `MAIN`, a non-generic fn: the instance with no arguments.
 fn build(world: &TestWorld, body: &BodyBuf, root: ExprId) -> Result<Built<Global>, String> {
-    let view = body.view(MAIN, root);
+    let mut ground = PortableTys::new_in(Alloc::global());
+    build_instance(world, body, MAIN, root, &[], &mut ground)
+}
+
+/// Checks `body` of `owner` once, generically, and builds its instance at `args` (types of
+/// `ground`).
+fn build_instance(
+    world: &TestWorld,
+    body: &BodyBuf,
+    owner: ItemKey,
+    root: ExprId,
+    args: &[PTy],
+    ground: &mut PortableTys<'static>,
+) -> Result<Built<Global>, String> {
+    let view = body.view(owner, root);
     let mut ty = ToyCtx::new();
     let checked = match blaze_typeck::check(&view, world, &mut ty, &Needs::new_in(Alloc::global()), Alloc::global()) {
         Ok(Outcome::Done(c)) => c,
@@ -319,8 +344,9 @@ fn build(world: &TestWorld, body: &BodyBuf, root: ExprId) -> Result<Built<Global
     if !checked.diags.is_empty() {
         return Err(format!("diagnostics: {:?}", checked.diags));
     }
-    let sig = world.sig(MAIN).ok_or_else(|| String::from("no signature for main"))?;
-    let built = crate::build(&view, &checked, &sig, &TestAdts { world, body }, Global)
+    let sig = world.sig(owner).ok_or_else(|| String::from("no signature for the owner"))?;
+    let mut subst = Subst { args, ground, scratch: Alloc::global() };
+    let built = crate::build(&view, &checked, &sig, &mut subst, &TestAdts { world, body }, Global)
         .map_err(|error| format!("the build failed: {error}"))?;
     blaze_lir::verify(built.func.view()).map_err(|error| format!("does not verify: {error}"))?;
     Ok(built)
@@ -512,10 +538,125 @@ fn a_call_names_its_callee() {
     let args = b.exprs_list(&[arg]);
     let root = b.e(Expr::Call { callee, args });
     let built = build(&w, &b, root).unwrap_or_else(|e| panic!("{e}"));
-    assert_eq!(built.refs.as_slice(), &[ItemKey(7)]);
+    assert_eq!(built.refs.as_slice(), &[Instance { item: ItemKey(7), args: List::EMPTY }]);
     let text = blaze_lir::print(built.func.view());
     assert!(text.contains("ref ref0 = func 0"), "{text}");
     assert!(text.lines().any(|l| l.contains("call") && l.contains("ref0")), "{text}");
+}
+
+const U8: PNode = PNode::Uint(UintTy::U8);
+const T: PNode = PNode::Param(0);
+const PICK: ItemKey = ItemKey(2);
+
+/// `fn pick<T>(c: bool, a: T, b: T) -> T { if c { a } else { b } }`, in `w` and as a body.
+fn pick(w: &mut TestWorld) -> (BodyBuf, ExprId) {
+    w.generic_func(2, "pick", 1, &[PNode::Bool, T, T], T);
+    let mut b = BodyBuf::new();
+    let c = b.bind("c");
+    let a = b.bind("a");
+    let bb = b.bind("b");
+    b.params.extend_from_slice(&[c, a, bb]);
+    let cond = b.local(c);
+    let a_e = b.local(a);
+    let then = b.block(&[], Some(a_e));
+    let b_e = b.local(bb);
+    let else_ = b.block(&[], Some(b_e));
+    let root = b.e(Expr::If { cond, then, else_: Some(else_) });
+    (b, root)
+}
+
+/// `pick` checked once, built at `i32` and at `u8`: two functions, each correct at its width.
+#[test]
+fn a_generic_fn_is_built_once_per_instance() {
+    let mut w = TestWorld::new();
+    let (b, root) = pick(&mut w);
+    let mut g = PortableTys::new_in(Alloc::global());
+    let i32_ = g.intern(I32).expect("a type interns");
+    let u8_ = g.intern(U8).expect("a type interns");
+    let at_i32 = build_instance(&w, &b, PICK, root, &[i32_], &mut g).unwrap_or_else(|e| panic!("{e}"));
+    let at_u8 = build_instance(&w, &b, PICK, root, &[u8_], &mut g).unwrap_or_else(|e| panic!("{e}"));
+    let (t32, t8) = (blaze_lir::print(at_i32.func.view()), blaze_lir::print(at_u8.func.view()));
+    assert_ne!(t32, t8, "one function for two instances");
+    assert_eq!(one(&at_i32, &[Val::Int(1), Val::Int(30), Val::Int(1)]), 30);
+    assert_eq!(one(&at_i32, &[Val::Int(0), Val::Int(30), Val::Int(0xFFFF_FFFF)]), 0xFFFF_FFFF);
+    assert_eq!(one(&at_u8, &[Val::Int(1), Val::Int(7), Val::Int(200)]), 7);
+    assert_eq!(one(&at_u8, &[Val::Int(0), Val::Int(7), Val::Int(200)]), 200);
+}
+
+/// `struct Pair<T> { a: T, b: T }`; `fn second<T>(a: T, b: T) -> T { let p = Pair { a, b };
+/// let q = Pair { a: p.b, b: p.a }; q.a }` at `u8` and at `i64`: `Pair` laid out per argument.
+#[test]
+fn a_generic_struct_is_laid_out_at_its_arguments() {
+    let mut w = TestWorld::new();
+    w.generic_func(3, "second", 1, &[T, T], T);
+    w.generic_strukt(9, "Pair", 1, &[("a", T), ("b", T)]);
+    let mut b = BodyBuf::new();
+    let a = b.bind("a");
+    let bb = b.bind("b");
+    b.params.extend_from_slice(&[a, bb]);
+    let p = b.bind("p");
+    let q = b.bind("q");
+    let pair = |b: &mut BodyBuf, x: ExprId, y: ExprId| {
+        let path = b.path("Pair");
+        let start = b.field_inits.len() as u32;
+        b.field_inits.push(FieldInit { name: Name::of("a"), expr: x });
+        b.field_inits.push(FieldInit { name: Name::of("b"), expr: y });
+        b.e(Expr::Struct { path, fields: List { start, len: 2 }, base: None })
+    };
+    let field = |b: &mut BodyBuf, of: PatId, name: &str| {
+        let base = b.local(of);
+        b.e(Expr::Field { base, name: Name::of(name) })
+    };
+    let a_e = b.local(a);
+    let b_e = b.local(bb);
+    let p_lit = pair(&mut b, a_e, b_e);
+    let pb = field(&mut b, p, "b");
+    let pa = field(&mut b, p, "a");
+    let q_lit = pair(&mut b, pb, pa);
+    let qa = field(&mut b, q, "a");
+    let root = b.block(
+        &[
+            Stmt::Let { pat: p, ty: None, init: Some(p_lit), else_: None },
+            Stmt::Let { pat: q, ty: None, init: Some(q_lit), else_: None },
+        ],
+        Some(qa),
+    );
+    let mut g = PortableTys::new_in(Alloc::global());
+    let u8_ = g.intern(U8).expect("a type interns");
+    let i64_ = g.intern(PNode::Int(IntTy::I64)).expect("a type interns");
+    let at_u8 = build_instance(&w, &b, ItemKey(3), root, &[u8_], &mut g).unwrap_or_else(|e| panic!("{e}"));
+    let at_i64 = build_instance(&w, &b, ItemKey(3), root, &[i64_], &mut g).unwrap_or_else(|e| panic!("{e}"));
+    let largest = |built: &Built<Global>| built.func.view().slots.iter().map(|s| s.size).max();
+    assert_eq!(largest(&at_u8), Some(2), "Pair<u8> is two bytes\n{}", blaze_lir::print(at_u8.func.view()));
+    assert_eq!(largest(&at_i64), Some(16), "Pair<i64> is sixteen bytes\n{}", blaze_lir::print(at_i64.func.view()));
+    assert_eq!(one(&at_u8, &[Val::Int(5), Val::Int(9)]), 9);
+    assert_eq!(one(&at_i64, &[Val::Int(5), Val::Int(1 << 40)]), 1 << 40);
+}
+
+/// `fn main() -> u8 { pick(true, 1u8, 2u8) + pick(false, 3u8, 4u8) }`: one instance, one place.
+#[test]
+fn two_calls_of_one_instance_share_one_ref() {
+    let mut w = TestWorld::new();
+    w.func(1, "main", &[], U8);
+    pick(&mut w);
+    let mut b = BodyBuf::new();
+    let call = |b: &mut BodyBuf, c: bool, x: u128, y: u128| {
+        let path = b.path("pick");
+        let callee = b.e(Expr::Path(path));
+        let c = b.e(Expr::Lit(Lit::Bool(c)));
+        let x = b.int(x, Some(IntSuffix::Uint(UintTy::U8)));
+        let y = b.int(y, Some(IntSuffix::Uint(UintTy::U8)));
+        let args = b.exprs_list(&[c, x, y]);
+        b.e(Expr::Call { callee, args })
+    };
+    let first = call(&mut b, true, 1, 2);
+    let second = call(&mut b, false, 3, 4);
+    let root = b.bin(BinOp::Add, first, second);
+    let mut g = PortableTys::new_in(Alloc::global());
+    let built = build_instance(&w, &b, MAIN, root, &[], &mut g).unwrap_or_else(|e| panic!("{e}"));
+    let u8_ = g.intern(U8).expect("a type interns");
+    let args = g.intern_list(&[u8_]).expect("a list interns");
+    assert_eq!(built.refs.as_slice(), &[Instance { item: PICK, args }]);
 }
 
 /// One random arithmetic tree over suffixed literals of one type, built in postfix order.

@@ -498,3 +498,183 @@ fn show_and_columns() {
     assert_eq!(format!("[{:^7}]", Shown("ab")), "[  ab   ]");
     assert_eq!(text(|o| _ = o.repeat('-', 20).repeat('é', 2)), "--------------------éé");
 }
+
+// The debug form read by reflection, against `#[derive(Debug)]` and `core::fmt`'s `{:?}`.
+
+#[derive(Debug, Clone, Copy)]
+struct Point {
+    x: i32,
+    y: f64,
+}
+
+#[derive(Debug)]
+struct Pair(u8, &'static str);
+
+#[derive(Debug)]
+struct Unit;
+
+#[derive(Debug)]
+struct Generic<T> {
+    inner: T,
+}
+
+#[derive(Debug)]
+enum Shape {
+    Empty,
+    Dot(Point),
+    Line { from: Point, to: Point, label: Option<&'static str> },
+    Many(u16, i64, char),
+}
+
+#[derive(Debug)]
+struct Everything {
+    shape: Shape,
+    small: (u8,),
+    tuple: (bool, u128, i8),
+    unit: (),
+    array: [u16; 3],
+    empty: [u8; 0],
+    slice: &'static [i16],
+    text: &'static str,
+    nested: Option<Option<bool>>,
+    result: Result<u32, Pair>,
+    boxed_ref: &'static Unit,
+    generic: Generic<Option<&'static str>>,
+    big: i128,
+    float: f32,
+}
+
+const SHAPES: [Shape; 4] = [
+    Shape::Empty,
+    Shape::Dot(Point { x: -3, y: 0.5 }),
+    Shape::Line { from: Point { x: 1, y: 1e20 }, to: Point { x: i32::MIN, y: -0.0 }, label: Some("a \"b\"\n\t\\") },
+    Shape::Many(65_535, i64::MIN, '\''),
+];
+
+fn debug_oracle<T: core::fmt::Debug>(x: &T) -> Result<(), Broke> { let ours = text(|o| _ = o.debug(x));
+let core = format!("{x:?}");
+match ours == core {
+    true => Ok(()),
+    false => Err(Broke::Oracle(format!("blaze-text's debug form wrote {ours:?}, `{{:?}}` {core:?}"))),
+} }
+
+fn everything(tape: &Tape) -> Everything {
+    static SLICES: [&[i16]; 3] = [&[], &[-1], &[1, -32768, 32767]];
+    static TEXTS: [&str; 5] = ["", "plain", "quote \" and 'tick'", "tab\tnul\0bell\u{7}", "é ünïcode"];
+    static CHARS: [char; 6] = ['a', '\'', '"', '\n', '\u{1b}', 'é'];
+    let shape = match tape.below(4, "shape") {
+        0 => Shape::Empty,
+        1 => Shape::Dot(Point { x: tape.next_u32("x").cast_signed(), y: tape.f64("y") }),
+        2 => Shape::Line {
+            from: Point { x: 0, y: tape.f64("from") },
+            to: Point { x: -1, y: f64::from_bits(tape.next_u64("to")) },
+            label: match tape.coin("label") {
+                true => Some(*tape.one_of(&TEXTS, "label")),
+                false => None,
+            },
+        },
+        _ => Shape::Many(
+            u16::try_from(tape.below(65_536, "u16")).unwrap_or(0),
+            tape.next_u64("i64").cast_signed(),
+            *tape.one_of(&CHARS, "char"),
+        ),
+    };
+    Everything {
+        shape,
+        small: (u8::try_from(tape.below(256, "u8")).unwrap_or(0),),
+        tuple: (tape.coin("bool"), tape.u128("u128"), i8::try_from(tape.below(256, "i8")).unwrap_or(0).wrapping_sub(0)),
+        unit: (),
+        array: [1, 2, u16::try_from(tape.below(65_536, "u16")).unwrap_or(0)],
+        empty: [],
+        slice: tape.one_of(&SLICES, "slice"),
+        text: tape.one_of(&TEXTS, "text"),
+        nested: match tape.below(3, "nested") {
+            0 => None,
+            1 => Some(None),
+            _ => Some(Some(tape.coin("inner"))),
+        },
+        result: match tape.coin("ok") {
+            true => Ok(tape.next_u32("ok")),
+            false => Err(Pair(7, tape.one_of(&TEXTS, "pair"))),
+        },
+        boxed_ref: &Unit,
+        generic: Generic { inner: tape.coin("generic").then_some("g") },
+        big: tape.u128("i128").cast_signed(),
+        float: f32::from_bits(tape.next_u32("f32")),
+    }
+}
+
+#[test]
+fn debug_form_matches_derive_debug() {
+    for shape in &SHAPES {
+        debug_oracle(shape).unwrap_or_else(|broke| panic!("{broke:?}"));
+    }
+    
+    debug_oracle(&(1u8, "a")).unwrap_or_else(|broke| panic!("{broke:?}"));
+    debug_oracle(&()).unwrap_or_else(|broke| panic!("{broke:?}"));
+    debug_oracle(&Unit).unwrap_or_else(|broke| panic!("{broke:?}"));
+    debug_oracle(&Some(&5u64)).unwrap_or_else(|broke| panic!("{broke:?}"));
+    debug_oracle(&core::marker::PhantomData::<u32>).unwrap_or_else(|broke| panic!("{broke:?}"));
+    
+    blaze_sim::check(Config::cases(1000), |tape: &Tape| debug_oracle(&everything(tape)));
+}
+
+#[test]
+fn the_debug_oracle_catches_a_lost_field_name() {
+    let run = |tape: &Tape, p: Plant| plant::with(p, || debug_oracle(&everything(tape)));
+    blaze_sim::control(Config::cases(50), Plant::Clean, Plant::DebugFieldNameLost, "blaze-text's debug form wrote", run);
+}
+
+struct Celsius(f64);
+
+impl crate::DebugForm for Celsius {
+    fn debug_form(&self, out: &mut dyn Put) {
+        out.float(self.0).str(" °C");
+    }
+}
+
+#[test]
+fn debug_form_takes_a_types_own_and_owned_collections() {
+    #[derive(Debug)]
+    struct Reading {
+        at: u32,
+    }
+    let mut v: Vec<Reading, Global> = Vec::new_in(Global);
+    v.push(Reading { at: 1 });
+    v.push(Reading { at: 2 });
+    let mut s = String::new_in(Global);
+    s.push_str("hi\n");
+    assert_eq!(text(|o| _ = o.debug(&v)), "[Reading { at: 1 }, Reading { at: 2 }]");
+    assert_eq!(text(|o| _ = o.debug(&s)), "\"hi\\n\"");
+    assert_eq!(text(|o| _ = o.debug(&(Celsius(21.5), 3u8))), "(21.5 °C, 3)");
+    assert_eq!(text(|o| _ = o.debug(&Some(Celsius(-1.0)))), "Some(-1 °C)");
+    assert_eq!(text(|o| _ = o.debug("str")), "\"str\"");
+    assert_eq!(text(|o| _ = o.debug(&[1u8, 2][..])), "[1, 2]");
+    assert_eq!(text(|o| _ = o.show(&crate::Dbg(&Some(1.0f64)))), "Some(1.0)");
+}
+
+// One expression per format site: `text_in`, `text_exact_in`, `show_with`.
+
+#[test]
+fn text_in_and_show_with_match_format() {
+    assert_eq!(size_of_val(&crate::show_with(|out| _ = out.str("static"))), 0);
+    blaze_sim::check(Config::cases(500), |tape: &Tape| {
+        let n = tape.next_u64("n");
+        let x = tape.f64("x");
+        let name = *tape.one_of(&["", "a", "naïve", "tab\t"], "name");
+        let want = format!("{name}: {n} of {x} ({:?})", name);
+        let grown = crate::text_in(Global, |out| out.str(name).str(": ").int(n).str(" of ").float(x).str(" (").escaped(name).byte(b')'));
+        let exact = crate::text_exact_in(Global, |out| out.str(name).str(": ").int(n).str(" of ").float(x).str(" (").escaped(name).byte(b')'));
+        let later = crate::show_with(|out| _ = out.str(name).str(": ").int(n).str(" of ").float(x).str(" (").escaped(name).byte(b')'));
+        let shown = text(|o| _ = o.show(&later));
+        for (what, got) in [("text_in", grown.as_str()), ("text_exact_in", exact.as_str()), ("show_with", shown.as_str())] {
+            if got != want {
+                return Err(Broke::Oracle(format!("{what} wrote {got:?}, format! {want:?}")));
+            }
+        }
+        if exact.capacity() != exact.len() {
+            return Err(Broke::Oracle(format!("text_exact_in kept {} bytes for {}", exact.capacity(), exact.len())));
+        }
+        Ok(())
+    });
+}

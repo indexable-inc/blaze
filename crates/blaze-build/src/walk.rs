@@ -7,15 +7,19 @@ use core::alloc::Allocator;
 use blaze_lir::builder::{MemAttrs, Param, Variadic};
 use blaze_lir::func::{BlockKind, Conv, Ext, RefKind, SlotId, SlotKind};
 use blaze_lir::{Block, Builder, Flags, Full, IntCond, Op, Ty, Value};
+use blaze_own::Alloc;
 use blaze_typeck::{
-    AdjustKind, AdtKind, BinOp, BodyView, Checked, Expr, ExprId, FnSig, IntTy, ItemKey, Lit, Name, PNode, PTy,
-    PTys, Pat, PatId, Stmt, StmtId, UintTy, UnOp,
+    AdjustKind, AdtKind, BinOp, BodyView, Checked, Expr, ExprId, FnSig, IntTy, Lit, Name, PNode, PTy, PTys, Pat,
+    PatId, PortableTys, Stmt, StmtId, UintTy, UnOp,
 };
 
-use crate::{Adts, BuildError, Built};
+use crate::{Adts, BuildError, Built, Instance, Subst, ground};
 
 /// The target's pointer width: the ladder runs on AArch64.
 const PTR_BITS: u32 = 64;
+
+/// A record type not grounded yet, in `Walk::grounded`.
+const UNGROUNDED: PTy = PTy(u32::MAX);
 
 /// How a Rust type is held.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -56,11 +60,23 @@ enum V {
 enum TyErr {
     Unsupported(&'static str),
     Malformed(&'static str),
+    /// Grounding refused it with an error of its own.
+    Other(BuildError),
 }
 
-/// A struct's layout: its fields in `layout_fields[first..first + len]`.
+/// Grounding's refusals as type errors, to be placed where the type was met.
+fn ground_err(error: BuildError) -> TyErr {
+    match error {
+        BuildError::UnsupportedSig { what } => TyErr::Unsupported(what),
+        BuildError::Malformed { what } => TyErr::Malformed(what),
+        other => TyErr::Other(other),
+    }
+}
+
+/// A struct's layout at its arguments: its fields in `layout_fields[first..first + len]`.
 struct Layout {
-    key: ItemKey,
+    /// The struct type, `Adt(key, args)` of the ground table.
+    ty: PTy,
     size: u32,
     /// log2 of the alignment.
     align: u8,
@@ -136,14 +152,23 @@ enum Task {
     Ref,
 }
 
-struct Walk<'x, 'c, A: Allocator + Clone> {
+struct Walk<'x, 'c, 't, A: Allocator + Clone> {
     body: &'x BodyView<'x>,
     checked: &'x Checked<'c>,
+    /// The record's types: generic, read only to be grounded (and for the shape of a node,
+    /// which the check fixed for every instance).
     types: PTys<'x>,
+    /// The instance's arguments, types of `ground`.
+    args: &'x [PTy],
+    /// The program's ground table: every type the walk lays out is one of it.
+    ground: &'x mut PortableTys<'t>,
+    scratch: Alloc<'x>,
+    /// Per record type: its ground type, or `UNGROUNDED`.
+    grounded: Vec<PTy, A>,
     adts: &'x dyn Adts,
     alloc: A,
     b: Builder<A, Full>,
-    refs: Vec<ItemKey, A>,
+    refs: Vec<Instance, A>,
     layouts: Vec<Layout, A>,
     layout_fields: Vec<(Name, u32, Repr), A>,
     /// Per pattern: the binding's slot and how its value is held.
@@ -220,9 +245,12 @@ pub(crate) fn build<A: Allocator + Clone>(
     body: &BodyView<'_>,
     checked: &Checked<'_>,
     sig: &FnSig<'_>,
+    subst: &mut Subst<'_, '_>,
     adts: &dyn Adts,
     alloc: A,
 ) -> Result<Built<A>, BuildError> {
+    let mut grounded = Vec::with_capacity_in(checked.types.len(), alloc.clone());
+    grounded.resize(checked.types.len(), UNGROUNDED);
     let mut break_target = Vec::with_capacity_in(body.exprs.len(), alloc.clone());
     break_target.resize(body.exprs.len(), false);
     for e in body.exprs {
@@ -238,6 +266,10 @@ pub(crate) fn build<A: Allocator + Clone>(
         body,
         checked,
         types: checked.types.view(),
+        args: subst.args,
+        ground: &mut *subst.ground,
+        scratch: subst.scratch,
+        grounded,
         adts,
         alloc: alloc.clone(),
         b: Builder::new_in(PTR_BITS, alloc.clone()),
@@ -265,41 +297,61 @@ pub(crate) fn build<A: Allocator + Clone>(
     Ok(Built { func, refs })
 }
 
-impl<'x, 'c, A: Allocator + Clone> Walk<'x, 'c, A> {
+impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
     // Types.
 
-    fn find_layout(&self, key: ItemKey) -> Option<u32> {
-        self.layouts.iter().position(|l| l.key == key).map(|it| it as u32)
+    /// `t` of table `from` (a signature's, a struct's), grounded at the instance's arguments.
+    fn ground_in(&mut self, from: PTys<'_>, t: PTy) -> Result<PTy, TyErr> {
+        ground(from, t, self.args, self.ground, self.scratch).map_err(ground_err)
     }
 
-    /// How a type of table `types` is held.
-    fn repr(&mut self, types: PTys<'_>, t: PTy) -> Result<Repr, TyErr> {
-        let node = types.node(t).map_err(|_| TyErr::Malformed("a type past its table"))?;
-        Ok(match node {
+    /// Type `t` of the record, grounded at the instance's arguments, once per type.
+    fn ground_ty(&mut self, t: PTy) -> Result<PTy, TyErr> {
+        let at = t.0 as usize;
+        let found = *self.grounded.get(at).ok_or(TyErr::Malformed("a type past its table"))?;
+        if found != UNGROUNDED {
+            return Ok(found);
+        }
+        let types = self.types;
+        let g = self.ground_in(types, t)?;
+        self.grounded[at] = g;
+        Ok(g)
+    }
+
+    /// The node of ground type `g`.
+    fn ground_node(&self, g: PTy) -> Result<PNode, TyErr> {
+        self.ground.view().node(g).map_err(|_| TyErr::Malformed("a type past the ground table"))
+    }
+
+    /// The ground node of record type `t`, met at `e`.
+    fn node_at(&mut self, e: ExprId, t: PTy) -> Result<PNode, BuildError> {
+        let g = self.ground_ty(t).map_err(|error| Self::ty_err(e, error))?;
+        self.ground_node(g).map_err(|error| Self::ty_err(e, error))
+    }
+
+    fn find_layout(&self, ty: PTy) -> Option<u32> {
+        self.layouts.iter().position(|l| l.ty == ty).map(|it| it as u32)
+    }
+
+    /// How ground type `g` is held.
+    fn repr(&mut self, g: PTy) -> Result<Repr, TyErr> {
+        Ok(match self.ground_node(g)? {
             PNode::Bool => Repr::Bool,
             PNode::Int(i) => Repr::Int { ty: int_ty(i)?, signed: true },
             PNode::Uint(u) => Repr::Int { ty: uint_ty(u)?, signed: false },
             PNode::Never | PNode::FnDef(..) => Repr::None,
             PNode::Tuple(l) if l.len == 0 => Repr::None,
             PNode::Tuple(_) => return Err(TyErr::Unsupported("a tuple")),
-            PNode::Ref(_, inner) | PNode::Ptr(_, inner) => {
-                match types.node(inner).map_err(|_| TyErr::Malformed("a type past its table"))? {
-                    PNode::Str | PNode::Slice(_) => {
-                        return Err(TyErr::Unsupported("a pointer to an unsized type (a wide pointer)"));
-                    }
-                    PNode::Param(_) | PNode::Alias { .. } | PNode::Opaque(..) => {
-                        return Err(TyErr::Unsupported("a pointer to a generic type"));
-                    }
-                    PNode::Infer | PNode::Error => return Err(TyErr::Malformed("an unresolved type in the record")),
-                    _ => Repr::Ptr,
+            PNode::Ref(_, inner) | PNode::Ptr(_, inner) => match self.ground_node(inner)? {
+                PNode::Str | PNode::Slice(_) => {
+                    return Err(TyErr::Unsupported("a pointer to an unsized type (a wide pointer)"));
                 }
-            }
-            PNode::Adt(key, args) => {
-                if args.len != 0 {
-                    return Err(TyErr::Unsupported("a generic struct"));
+                PNode::Param(_) | PNode::Alias { .. } | PNode::Opaque(..) | PNode::Infer | PNode::Error => {
+                    return Err(TyErr::Malformed("a type the ground table does not hold"));
                 }
-                Repr::Struct(self.layout(key)?)
-            }
+                _ => Repr::Ptr,
+            },
+            PNode::Adt(..) => Repr::Struct(self.layout(g)?),
             PNode::Char => return Err(TyErr::Unsupported("char")),
             PNode::Float(_) => return Err(TyErr::Unsupported("a float")),
             PNode::Str => return Err(TyErr::Unsupported("str")),
@@ -307,10 +359,9 @@ impl<'x, 'c, A: Allocator + Clone> Walk<'x, 'c, A> {
             PNode::Slice(_) => return Err(TyErr::Unsupported("a slice")),
             PNode::FnPtr(_) => return Err(TyErr::Unsupported("a fn pointer")),
             PNode::Closure(..) => return Err(TyErr::Unsupported("a closure")),
-            PNode::Param(_) => return Err(TyErr::Unsupported("a generic parameter")),
-            PNode::Alias { .. } => return Err(TyErr::Unsupported("an associated type")),
-            PNode::Opaque(..) => return Err(TyErr::Unsupported("an opaque type")),
-            PNode::Infer | PNode::Error => return Err(TyErr::Malformed("an unresolved type in the record")),
+            PNode::Param(_) | PNode::Alias { .. } | PNode::Opaque(..) | PNode::Infer | PNode::Error => {
+                return Err(TyErr::Malformed("a type the ground table does not hold"));
+            }
         })
     }
 
@@ -331,38 +382,52 @@ impl<'x, 'c, A: Allocator + Clone> Walk<'x, 'c, A> {
         }
     }
 
-    /// The layout of struct `key`, its nested structs first, by a work list.
-    fn layout(&mut self, key: ItemKey) -> Result<u32, TyErr> {
-        if let Some(found) = self.find_layout(key) {
+    /// The layout of ground struct type `g` at its arguments, its nested structs first, by a
+    /// work list. A field's type is grounded at the struct's own arguments.
+    fn layout(&mut self, g: PTy) -> Result<u32, TyErr> {
+        if let Some(found) = self.find_layout(g) {
             return Ok(found);
         }
         let mut todo = Vec::new_in(self.alloc.clone());
-        todo.push(key);
-        while let Some(&k) = todo.last() {
-            if self.find_layout(k).is_some() {
+        let mut args: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        let mut field_tys: Vec<PTy, A> = Vec::new_in(self.alloc.clone());
+        todo.push(g);
+        while let Some(&t) = todo.last() {
+            if self.find_layout(t).is_some() {
                 todo.pop();
                 continue;
             }
-            let adt = self.adts.adt(k).ok_or(TyErr::Malformed("a struct the build's `Adts` does not know"))?;
+            let PNode::Adt(k, l) = self.ground_node(t)? else {
+                return Err(TyErr::Malformed("a layout asked of other than a struct"));
+            };
+            args.clear();
+            args.extend_from_slice(self.ground.view().list(l).map_err(|_| TyErr::Malformed("a list past the ground table"))?);
+            let adts = self.adts;
+            let adt = adts.adt(k).ok_or(TyErr::Malformed("a struct the build's `Adts` does not know"))?;
             match adt.kind {
                 AdtKind::Struct => {}
                 AdtKind::Enum => return Err(TyErr::Unsupported("an enum")),
                 AdtKind::Union => return Err(TyErr::Unsupported("a union")),
             }
-            if adt.generics != 0 {
-                return Err(TyErr::Unsupported("a generic struct"));
+            if adt.generics as usize != args.len() {
+                return Err(TyErr::Malformed("a struct type whose argument count is not its struct's generic count"));
             }
             let [variant] = adt.variants else {
                 return Err(TyErr::Malformed("a struct without exactly one variant"));
             };
             let fields =
                 adt.fields.get(variant.fields.range()).ok_or(TyErr::Malformed("a struct's fields past their column"))?;
-            let mut missing = None;
+            field_tys.clear();
             for f in fields {
-                if let Ok(PNode::Adt(inner, _)) = adt.types.node(f.ty)
-                    && self.find_layout(inner).is_none()
+                let ft = ground(adt.types, f.ty, &args, self.ground, self.scratch).map_err(ground_err)?;
+                field_tys.push(ft);
+            }
+            let mut missing = None;
+            for &ft in field_tys.iter() {
+                if let PNode::Adt(..) = self.ground_node(ft)?
+                    && self.find_layout(ft).is_none()
                 {
-                    missing = Some(inner);
+                    missing = Some(ft);
                     break;
                 }
             }
@@ -375,8 +440,8 @@ impl<'x, 'c, A: Allocator + Clone> Walk<'x, 'c, A> {
             }
             let first = self.layout_fields.len() as u32;
             let (mut size, mut align) = (0u32, 0u8);
-            for f in fields {
-                let repr = self.repr(adt.types, f.ty)?;
+            for (f, &ft) in fields.iter().zip(field_tys.iter()) {
+                let repr = self.repr(ft)?;
                 let (s, a) = self.size_align(repr);
                 let at = align_up(size, a).ok_or(TyErr::Unsupported("a struct of 4 GiB or more"))?;
                 self.layout_fields.push((f.name, at, repr));
@@ -386,23 +451,23 @@ impl<'x, 'c, A: Allocator + Clone> Walk<'x, 'c, A> {
             let size = align_up(size, align)
                 .filter(|&s| s <= i32::MAX as u32)
                 .ok_or(TyErr::Unsupported("a struct of 2 GiB or more"))?;
-            self.layouts.push(Layout { key: k, size, align, first, len: fields.len() as u32 });
+            self.layouts.push(Layout { ty: t, size, align, first, len: fields.len() as u32 });
             todo.pop();
         }
-        self.find_layout(key).ok_or(TyErr::Malformed("a struct whose layout was not made"))
+        self.find_layout(g).ok_or(TyErr::Malformed("a struct whose layout was not made"))
     }
 
     fn ty_err(e: ExprId, error: TyErr) -> BuildError {
         match error {
             TyErr::Unsupported(what) => BuildError::UnsupportedType { expr: e, what },
             TyErr::Malformed(what) => malformed(what),
+            TyErr::Other(error) => error,
         }
     }
 
-    /// How a type of the record is held, met at `e`.
+    /// How a type of the record is held in this instance, met at `e`.
     fn repr_at(&mut self, e: ExprId, t: PTy) -> Result<Repr, BuildError> {
-        let types = self.types;
-        self.repr(types, t).map_err(|error| Self::ty_err(e, error))
+        self.ground_ty(t).and_then(|g| self.repr(g)).map_err(|error| Self::ty_err(e, error))
     }
 
     fn expr(&self, e: ExprId) -> Result<Expr, BuildError> {
@@ -629,10 +694,10 @@ impl<'x, 'c, A: Allocator + Clone> Walk<'x, 'c, A> {
             return Ok(found);
         }
         let t = *self.checked.local_ty.get(p.ix()).ok_or(malformed("a binding without a type in the record"))?;
-        let types = self.types;
-        let repr = self.repr(types, t).map_err(|error| match error {
+        let repr = self.ground_ty(t).and_then(|g| self.repr(g)).map_err(|error| match error {
             TyErr::Unsupported(what) => BuildError::UnsupportedPat { pat: p, what },
             TyErr::Malformed(what) => malformed(what),
+            TyErr::Other(error) => error,
         })?;
         let (size, align) = self.size_align(repr);
         let slot = self.b.slot(size, align, SlotKind::Named);
@@ -653,9 +718,6 @@ impl<'x, 'c, A: Allocator + Clone> Walk<'x, 'c, A> {
     // The function.
 
     fn run(&mut self, sig: &FnSig<'_>) -> Result<(), BuildError> {
-        if sig.parent_count != 0 || sig.own_count != 0 {
-            return Err(BuildError::UnsupportedSig { what: "a generic fn" });
-        }
         if sig.self_param {
             return Err(BuildError::UnsupportedSig { what: "a method" });
         }
@@ -665,11 +727,12 @@ impl<'x, 'c, A: Allocator + Clone> Walk<'x, 'c, A> {
         let sig_err = |error: TyErr| match error {
             TyErr::Unsupported(what) => BuildError::UnsupportedSig { what },
             TyErr::Malformed(what) => malformed(what),
+            TyErr::Other(error) => error,
         };
         let mut params = Vec::with_capacity_in(sig.inputs.len(), self.alloc.clone());
         let mut reprs = Vec::with_capacity_in(sig.inputs.len(), self.alloc.clone());
         for &t in sig.inputs {
-            let repr = self.repr(sig.types, t).map_err(sig_err)?;
+            let repr = self.ground_in(sig.types, t).and_then(|g| self.repr(g)).map_err(sig_err)?;
             match repr {
                 Repr::Struct(_) => return Err(BuildError::UnsupportedSig { what: "a struct passed by value" }),
                 Repr::None => {}
@@ -677,7 +740,7 @@ impl<'x, 'c, A: Allocator + Clone> Walk<'x, 'c, A> {
             }
             reprs.push(repr);
         }
-        self.ret = self.repr(sig.types, sig.output).map_err(sig_err)?;
+        self.ret = self.ground_in(sig.types, sig.output).and_then(|g| self.repr(g)).map_err(sig_err)?;
         let mut rets = Vec::with_capacity_in(1, self.alloc.clone());
         match self.ret {
             Repr::Struct(_) => return Err(BuildError::UnsupportedSig { what: "a struct returned by value" }),
@@ -1013,8 +1076,8 @@ impl<'x, 'c, A: Allocator + Clone> Walk<'x, 'c, A> {
             // A reborrow (`&*r`, `&mut *r` to `*const`/`*mut`): the same pointer.
             [AdjustKind::Deref { overloaded: None }, AdjustKind::Borrow { .. }] => {
                 let t = self.expr_ty(e)?;
-                match self.types.node(t) {
-                    Ok(PNode::Ref(..) | PNode::Ptr(..)) => Ok(()),
+                match self.node_at(e, t)? {
+                    PNode::Ref(..) | PNode::Ptr(..) => Ok(()),
                     _ => Err(unsupported(e, "a borrow of a dereference of a non-pointer")),
                 }
             }
@@ -1113,8 +1176,8 @@ impl<'x, 'c, A: Allocator + Clone> Walk<'x, 'c, A> {
             }
             Expr::Path(_) => {
                 let t = self.expr_ty(e)?;
-                match self.types.node(t) {
-                    Ok(PNode::FnDef(..)) => self.vals.push(V::None),
+                match self.node_at(e, t)? {
+                    PNode::FnDef(..) => self.vals.push(V::None),
                     _ => return Err(unsupported(e, "a path to other than a fn item (a const, a static, a unit struct)")),
                 }
             }
@@ -1180,9 +1243,8 @@ impl<'x, 'c, A: Allocator + Clone> Walk<'x, 'c, A> {
             }
             Expr::Call { callee, args } => {
                 let t = self.expr_ty(callee)?;
-                match self.types.node(t) {
-                    Ok(PNode::FnDef(_, generics)) if generics.len == 0 => {}
-                    Ok(PNode::FnDef(..)) => return Err(unsupported(e, "a call of a generic fn")),
+                match self.node_at(callee, t)? {
+                    PNode::FnDef(..) => {}
                     _ => return Err(unsupported(e, "a call of other than a fn item (a fn pointer, a closure)")),
                 }
                 let list = self.body.expr_lists.get(args.range()).ok_or(malformed("a call's arguments past `expr_lists`"))?;
@@ -1200,8 +1262,8 @@ impl<'x, 'c, A: Allocator + Clone> Walk<'x, 'c, A> {
             }
             Expr::Unary { op: UnOp::Deref, operand } => {
                 let t = self.adjusted_ty(operand)?;
-                match self.types.node(t) {
-                    Ok(PNode::Ptr(..) | PNode::Ref(..)) => {}
+                match self.node_at(operand, t)? {
+                    PNode::Ptr(..) | PNode::Ref(..) => {}
                     _ => return Err(unsupported(e, "an overloaded dereference")),
                 }
                 self.work.push(Task::Deref(e));
@@ -1433,9 +1495,11 @@ impl<'x, 'c, A: Allocator + Clone> Walk<'x, 'c, A> {
             return Err(malformed("a call's arguments missing from the value stack (a build bug)"));
         }
         let t = self.expr_ty(callee)?;
-        let Ok(PNode::FnDef(key, _)) = self.types.node(t) else {
+        // The callee instance: its item and its call's arguments, grounded at this instance's.
+        let PNode::FnDef(item, args) = self.node_at(callee, t)? else {
             return Err(malformed("a call whose callee is not a fn item"));
         };
+        let instance = Instance { item, args };
         let mut params = Vec::with_capacity_in(n, self.alloc.clone());
         let mut values = Vec::with_capacity_in(n, self.alloc.clone());
         let base = self.vals.len() - n;
@@ -1460,10 +1524,10 @@ impl<'x, 'c, A: Allocator + Clone> Walk<'x, 'c, A> {
             Repr::Struct(_) => return Err(unsupported(e, "a struct returned by value")),
             scalar => rets.push(abi_param(scalar, scalar.scalar().unwrap_or(Ty::I8))),
         }
-        let place = match self.refs.iter().position(|&k| k == key) {
+        let place = match self.refs.iter().position(|&k| k == instance) {
             Some(at) => at as u32,
             None => {
-                self.refs.push(key);
+                self.refs.push(instance);
                 (self.refs.len() - 1) as u32
             }
         };
@@ -1471,7 +1535,7 @@ impl<'x, 'c, A: Allocator + Clone> Walk<'x, 'c, A> {
         let sig = self.b.sig(Conv::C, Variadic::No, &params, &rets);
         let r = self.b.call(Flags::NONE, reference, sig, &values);
         let ty = self.expr_ty(e)?;
-        if let Ok(PNode::Never) = self.types.node(ty) {
+        if let PNode::Never = self.node_at(e, ty)? {
             self.b.unreachable();
             self.dead_block();
             self.vals.push(V::None);

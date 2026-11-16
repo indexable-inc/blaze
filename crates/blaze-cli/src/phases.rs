@@ -21,6 +21,22 @@ pub struct Phases {
     len: usize,
     /// Inside the request: the machine's steps and each kind of effect performed, summed.
     pub request: Effects,
+    /// The memory layer's system calls since the process began, when the frame's first chunk
+    /// was taken ([`Phases::first_chunk`]).
+    first_chunk: Option<Syscalls>,
+    /// The same, when `main` began.
+    at_main: Syscalls,
+}
+
+type Syscalls = [(blaze_mem::syscalls::Kind, blaze_mem::syscalls::Calls); blaze_mem::syscalls::KINDS.len()];
+
+/// One `memory` line: each kind of call made so far, as calls and nanoseconds.
+fn memory_line(f: &mut fmt::Formatter<'_>, label: &str, calls: &Syscalls) -> fmt::Result {
+    write!(f, "memory       {label}:")?;
+    for (kind, c) in calls.iter().filter(|(_, c)| c.calls > 0) {
+        write!(f, " {} {}x {} ns (most {})", kind.name(), c.calls, c.ns, c.max_ns)?;
+    }
+    writeln!(f)
 }
 
 /// Nanoseconds spent performing each kind of effect, and the machine's own steps.
@@ -46,7 +62,16 @@ impl Phases {
             rows: [("", 0); MOST],
             len: 0,
             request: Effects::default(),
+            first_chunk: None,
+            at_main: blaze_mem::syscalls::snapshot(),
         }
+    }
+
+    /// The frame's first chunk is taken: marks it as a phase and keeps the memory layer's calls
+    /// so far.
+    pub fn first_chunk(&mut self) {
+        self.mark("frame's first chunk");
+        self.first_chunk = Some(blaze_mem::syscalls::snapshot());
     }
 
     pub fn now(&self) -> Instant {
@@ -95,6 +120,11 @@ impl fmt::Display for Phases {
             f,
             "request      steps {} gets {} puts {} runs {} publish {} prints {} write last {} (ns)",
             r.steps, r.gets, r.puts, r.runs, r.publish, r.prints, r.write_last
-        )
+        )?;
+        memory_line(f, "by main", &self.at_main)?;
+        if let Some(calls) = &self.first_chunk {
+            memory_line(f, "by the first chunk", calls)?;
+        }
+        memory_line(f, "by the profile", &blaze_mem::syscalls::snapshot())
     }
 }

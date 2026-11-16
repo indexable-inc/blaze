@@ -32,6 +32,29 @@
 //! metadata is the caller's (`blaze.schema`, `blaze.table`, `blaze.clock`). Same batches in,
 //! same bytes out: nothing of the machine or the clock is written.
 //!
+//! # Which codec
+//!
+//! Measured by `tests/measure.rs` (release, Apple M5 Max, 2026-11-15) on 174 old profile
+//! files of one build session (2 981 361 rows of 31 tables; arrow-rs wrote them in 28.60 MB,
+//! dictionary and delta encodings under zstd). Speeds are of the 588 MB the tables are as
+//! PLAIN, uncompressed; read is a full scan into batches:
+//!
+//! | pages | bytes | write | read |
+//! |---|---|---|---|
+//! | PLAIN, none | 588.06 MB | 1475 MB/s | 1768 MB/s |
+//! | encoded, none | 150.65 MB | 701 MB/s | 1728 MB/s |
+//! | encoded, LZ4_RAW | 30.72 MB | 641 MB/s | 1097 MB/s |
+//! | encoded, zstd 1 | 24.88 MB | 553 MB/s | 1106 MB/s |
+//! | encoded, zstd 3 | 24.67 MB | 545 MB/s | 1109 MB/s |
+//!
+//! A build's files are encoded only ([`Compression::HOT`]): LZ4_RAW saves 80% of the bytes but
+//! costs 9% of the write (7% to 11% over three runs), past the 5% a build's own files may
+//! spend. A merged or cold file is zstd 3 ([`Compression::COLD`], a merge recompresses its
+//! inputs' pages), under arrow-rs's 28.60 MB. 105 MB of the 150.65 is one column, `spans.function`:
+//! 214 MB of text, 77 663 distinct values up to 64 KB each (Debug prints of macro call ids),
+//! which no dictionary or delta encoding shrinks and zstd takes to 2.5 MB; without it the
+//! encoded files are 45.5 MB.
+//!
 //! # What is read ([`File`])
 //!
 //! The files this crate writes and DuckDB's uncompressed answers (`COPY ... (FORMAT parquet,

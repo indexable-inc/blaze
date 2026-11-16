@@ -153,24 +153,31 @@ impl BucketKey {
     }
 }
 
-/// Why rows are not a crate's impl index.
+/// Why rows are not a crate's impl index ([`ImplIndexError::TooManyRows`],
+/// [`ImplIndexError::BucketHashClash`]), or why one row is left out of it (the others, each
+/// naming its impl, in [`CrateImpls::refused`]): one refused impl is a finding on that impl,
+/// never an empty index for the crate.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ImplIndexError {
     TooManyRows { krate: CrateItemKey, count: usize },
     /// An impl whose key is not of the crate whose index is built.
     ForeignImpl { krate: CrateItemKey, impl_: ItemKey },
-    /// One impl given twice.
+    /// One impl given twice: every row of it is left out, so the index is the same for every
+    /// order of the rows.
     DuplicateImpl { impl_: ItemKey },
     /// An impl for a placeholder: a goal's shape, which no impl's self type simplifies to.
     PlaceholderSelf { impl_: ItemKey },
     /// `impl<T> T { .. }`: an inherent impl for a parameter (rustc's E0118).
     InherentBlanket { impl_: ItemKey },
-    /// An inherent impl with a flag only a trait impl has (`unsafe`, `!`, `default`,
-    /// `const`, a reservation, a derive).
+    /// An inherent impl with a flag only a trait impl has (`unsafe`, `!`, `default`, a
+    /// reservation, a derive). `const impl Type { .. }` is an inherent impl's own form.
     InherentFlags { impl_: ItemKey, flags: ImplFlags },
     /// Two bucket keys with one hash: `first` and `second` are an impl of each.
     BucketHashClash { first: ItemKey, second: ItemKey },
 }
+
+/// The flags an inherent impl may have: `const impl Type { .. }`.
+const INHERENT_FLAGS: ImplFlags = ImplFlags::CONST;
 
 impl fmt::Display for ImplIndexError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -284,6 +291,8 @@ pub struct CrateImpls<'a> {
     pub directory: RecordBytes<'a>,
     pub no_impls_of: RecordBytes<'a>,
     pub buckets: AVec<'a, Bucket<'a>>,
+    /// The rows left out, each a finding on its impl, by impl key: the index holds the rest.
+    pub refused: AVec<'a, ImplIndexError>,
 }
 
 /// Refuses `row` as a row of `krate`'s index.
@@ -299,7 +308,7 @@ fn check_row(krate: CrateItemKey, row: &ImplRow) -> Result<(), ImplIndexError> {
         if row.shape.is_blanket() {
             return Err(ImplIndexError::InherentBlanket { impl_ });
         }
-        if !row.flags.is_empty() {
+        if !INHERENT_FLAGS.contains(row.flags) {
             return Err(ImplIndexError::InherentFlags { impl_, flags: row.flags });
         }
     }
@@ -307,7 +316,9 @@ fn check_row(krate: CrateItemKey, row: &ImplRow) -> Result<(), ImplIndexError> {
 }
 
 /// `krate`'s impl index of `rows`, in any order, its buffers in `alloc`: equal bytes for
-/// every order of the same rows.
+/// every order of the same rows. A row [`check_row`] refuses, or an impl given twice, is
+/// left out and named in [`CrateImpls::refused`]; only a bound of the whole index
+/// ([`ImplIndexError::TooManyRows`], [`ImplIndexError::BucketHashClash`]) refuses it all.
 pub fn build_impl_index<'a>(
     krate: CrateItemKey,
     rows: &[ImplRow],
@@ -316,14 +327,24 @@ pub fn build_impl_index<'a>(
     if rows.len() > MAX_ROWS {
         return Err(ImplIndexError::TooManyRows { krate, count: rows.len() });
     }
-    rows.iter().try_for_each(|row| check_row(krate, row))?;
-    let mut impls: AVec<'a, ItemKey> = AVec::with_capacity_in(rows.len(), alloc);
-    impls.extend(rows.iter().map(|row| row.impl_));
-    impls.sort_unstable();
-    if let Some(pair) = impls.windows(2).find(|pair| pair[0] == pair[1]) {
-        return Err(ImplIndexError::DuplicateImpl { impl_: pair[0] });
+    // The rows by impl key: a key given twice is refused whole, whichever row came first.
+    let mut sorted: AVec<'a, ImplRow> = AVec::with_capacity_in(rows.len(), alloc);
+    sorted.extend(rows.iter().copied());
+    sorted.sort_unstable();
+    let mut kept: AVec<'a, ImplRow> = AVec::with_capacity_in(rows.len(), alloc);
+    let mut refused: AVec<'a, ImplIndexError> = AVec::new_in(alloc);
+    for group in sorted.chunk_by(|a, b| a.impl_ == b.impl_) {
+        match group {
+            [row] => match check_row(krate, row) {
+                Ok(()) => kept.push(*row),
+                Err(error) => refused.push(error),
+            },
+            [row, ..] => refused.push(ImplIndexError::DuplicateImpl { impl_: row.impl_ }),
+            [] => unreachable!("`chunk_by` yields no empty group"),
+        }
     }
-    drop(impls);
+    drop(sorted);
+    let rows = &kept[..];
     // Every row with its bucket, by the bucket's hash and then the impl's key.
     let mut keyed: AVec<'a, (BucketHash, BucketKey, ImplRow)> =
         AVec::with_capacity_in(rows.len(), alloc);
@@ -378,6 +399,7 @@ pub fn build_impl_index<'a>(
         directory: write_directory(krate, &entries, alloc),
         no_impls_of: write_no_impls(krate, &traits, &marks, alloc),
         buckets,
+        refused,
     })
 }
 

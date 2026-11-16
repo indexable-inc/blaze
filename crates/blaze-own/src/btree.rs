@@ -1049,6 +1049,57 @@ impl<K: Ord, V, A: Allocator> BTreeMap<K, V, A> {
         self.find(key).is_some()
     }
 
+    /// The value under `key`; on a miss, `make(key)` gives the owned key and its value, put in
+    /// where the one search left off. So the owned key is made only on a miss, where
+    /// `map.entry(key.to_owned())` makes it on every hit.
+    ///
+    /// # Panics
+    ///
+    /// When `make` gives a key not equal to `key` (it would sit out of order), or there is no
+    /// memory.
+    #[track_caller]
+    pub fn get_or_insert_with<Q: Ord + ?Sized>(&mut self, key: &Q, make: impl FnOnce(&Q) -> (K, V)) -> &mut V
+    where
+        K: Borrow<Q>,
+    {
+        match self.try_get_or_insert_with(key, make) {
+            Ok(value) => value,
+            Err(refused) => fail(refused.why),
+        }
+    }
+
+    /// [`BTreeMap::get_or_insert_with`], or the made pair handed back when a node could not be
+    /// had, with the map as it was.
+    ///
+    /// # Panics
+    ///
+    /// When `make` gives a key not equal to `key`.
+    #[track_caller]
+    pub fn try_get_or_insert_with<Q: Ord + ?Sized>(
+        &mut self,
+        key: &Q,
+        make: impl FnOnce(&Q) -> (K, V),
+    ) -> Result<&mut V, Refused<(K, V)>>
+    where
+        K: Borrow<Q>,
+    {
+        let gap = match self.root {
+            None => None,
+            // SAFETY: the tree is live.
+            Some(root) => match unsafe { search_tree(root, self.height, key) } {
+                // SAFETY: an entry of this map, borrowed mutably with it.
+                Ok(at) => return Ok(unsafe { &mut *val_at(at.node, at.idx) }),
+                Err(gap) => Some(gap),
+            },
+        };
+        let (owned, value) = make(key);
+        if owned.borrow().cmp(key) != Ordering::Equal {
+            panic!("BTreeMap::get_or_insert_with: `make` gave a key not equal to the one looked up");
+        }
+        // The gap is where any key equal to `key` goes, and nothing changed the map since.
+        VacantEntry { key: owned, gap, map: self }.try_insert(value)
+    }
+
     /// The entry for `key`, there or not.
     pub fn entry(&mut self, key: K) -> Entry<'_, K, V, A> {
         let Some(root) = self.root else { return Entry::Vacant(VacantEntry { key, gap: None, map: self }) };

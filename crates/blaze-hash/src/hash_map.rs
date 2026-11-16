@@ -268,12 +268,17 @@ impl<K: Eq, V, S: KeyHash<K>, A: Allocator> Map<K, V, S, A> {
     /// lookups' cache misses overlap instead of queueing. Duplicates and absent keys are
     /// answered as `get` answers them.
     ///
-    /// When it pays (`examples/hash_cost.rs batch`, `HashMap<u64, u32>` on an M-series Mac):
-    /// keys that are mostly held, on a table past the cache, in batches of 4: 1.3 times the
-    /// lookups a second of `get` one at a time at 10^7 entries. It loses where the keys are
-    /// mostly absent (0.65 times: the slot line it prefetches is wasted bandwidth), and at 8
-    /// or more keys on a table the cache holds (10^3 to 10^5 entries: up to 0.6 times); 4 on
-    /// such a table is even. `get` in a loop already overlaps some misses out of order.
+    /// When it pays (`examples/hash_cost.rs batch`, `HashMap<u64, u32>` of 10^7 entries on an
+    /// M-series Mac, against `get` one at a time), by what the caller does with each answer:
+    /// - work between lookups (about 200 instructions a key, so the next lookup is past the
+    ///   out-of-order window): batches of 4 to 8, 1.17 times;
+    /// - a second load from the answer (an id, then its record), with the batch's records
+    ///   prefetched before any is read: batches of 16 to 32, 1.33 times;
+    /// - a tight loop of independent lookups (the control): 1.16 times at 4 for held keys,
+    ///   and 0.65 to 0.83 times for absent ones (the slot line prefetched is wasted).
+    ///
+    /// It loses on a table the cache holds (10^3 to 10^5 entries: 0.83 to 1.03 times in
+    /// every shape), so it is for tables past the cache and keys mostly held.
     #[inline]
     pub fn get_many<Q: ?Sized + Equivalent<K>, const N: usize>(
         &self,
@@ -349,6 +354,75 @@ impl<K: Eq, V, S: KeyHash<K>, A: Allocator> Map<K, V, S, A> {
     {
         let index = self.find(key)?;
         Some(self.table.remove(index))
+    }
+
+    /// The slot of `key`, or else of the entry `make(key)` builds, put now: one hash and one
+    /// probe either way (a probe that misses ends at the slot the entry takes), and the owned
+    /// key and value made only on a miss. Allocates only on a miss into a full table.
+    #[inline]
+    pub(crate) fn try_slot_or_insert_with<Q: ?Sized + Equivalent<K>>(
+        &mut self,
+        key: &Q,
+        make: impl FnOnce(&Q) -> (K, V),
+    ) -> Result<usize, AllocFailure>
+    where
+        S: KeyHash<Q>,
+    {
+        let hash = <S as KeyHash<Q>>::hash_key(&self.hasher, key);
+        if self.table.growth_left() == 0 {
+            // A miss grows the table, after which its vacancy is another: find first, so a
+            // hit allocates nothing, and probe the grown table once on a miss.
+            if let Some(index) = self.table.find(hash, |(held, _)| key.equivalent(held)) {
+                return Ok(index);
+            }
+            self.table.try_reserve(1, by_key(&self.hasher))?;
+        }
+        match self.table.find_or_vacant(hash, |(held, _)| key.equivalent(held)) {
+            Ok(index) => Ok(index),
+            Err(vacancy) => {
+                let entry = make(key);
+                debug_assert!(
+                    key.equivalent(&entry.0)
+                        && <S as KeyHash<K>>::hash_key(&self.hasher, &entry.0) == hash,
+                    "get_or_insert_with: `make` built a key that is not equal to the one asked"
+                );
+                Ok(self.table.insert_at(vacancy, hash, entry))
+            }
+        }
+    }
+
+    /// The value of `key`, or else the value of the entry `make(key)` builds, put now: the
+    /// owned key and the value are made only on a miss, with one hash and one probe either
+    /// way. What `map.entry(key.to_owned()).or_insert_with(..)` does, without the owned key
+    /// on a hit. `make` must return a key equal to `key` (checked in debug builds); a refused
+    /// allocation is a panic naming it.
+    #[inline]
+    pub fn get_or_insert_with<Q: ?Sized + Equivalent<K>>(
+        &mut self,
+        key: &Q,
+        make: impl FnOnce(&Q) -> (K, V),
+    ) -> &mut V
+    where
+        S: KeyHash<Q>,
+    {
+        match self.try_slot_or_insert_with(key, make) {
+            Ok(index) => &mut self.table.get_mut(index).1,
+            Err(failure) => raw::fail(failure),
+        }
+    }
+
+    /// [`Map::get_or_insert_with`], a refused allocation returned (and `make` not called).
+    #[inline]
+    pub fn try_get_or_insert_with<Q: ?Sized + Equivalent<K>>(
+        &mut self,
+        key: &Q,
+        make: impl FnOnce(&Q) -> (K, V),
+    ) -> Result<&mut V, AllocFailure>
+    where
+        S: KeyHash<Q>,
+    {
+        let index = self.try_slot_or_insert_with(key, make)?;
+        Ok(&mut self.table.get_mut(index).1)
     }
 
     /// The entry of `key`, to read, fill or change in place.

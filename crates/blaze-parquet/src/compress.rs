@@ -21,6 +21,13 @@ pub enum Compression {
 }
 
 impl Compression {
+    /// A file a build writes: its encodings alone ([`Options::DEFAULT`](crate::Options::DEFAULT);
+    /// LZ4_RAW cost more than 5% of the write, the crate doc's table).
+    pub const HOT: Compression = Compression::None;
+    /// A file merged or gone cold: zstd at its default level (level 1 was 1% larger and no
+    /// faster to read, the crate doc's table).
+    pub const COLD: Compression = Compression::Zstd { level: 3 };
+
     /// The footer's `CompressionCodec`.
     pub(crate) fn codec(self) -> i32 {
         match self {

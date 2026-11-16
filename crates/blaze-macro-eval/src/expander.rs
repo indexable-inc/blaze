@@ -426,7 +426,7 @@ impl Library {
     fn session(&self, db: &Db, calling: Crate) -> Arc<SessionOf> {
         let now = blaze_memo::Database::memo(db).snapshot_epoch();
         // clone: the session's handle, held for one call
-        let session = Arc::clone(self.sessions.pin().get_or_insert_with(calling, SessionOf::new));
+        let session = Arc::clone(self.sessions.pin().get_or_insert_with(&calling, |&calling| (calling, SessionOf::new())));
         {
             let mut held = session.lock();
             if held.at != Some(now) {

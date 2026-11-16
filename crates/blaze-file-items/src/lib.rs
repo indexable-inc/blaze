@@ -57,6 +57,20 @@
 //! one skip of the file plus one BLAKE3 pass over each byte times the number of entries
 //! enclosing it.
 //!
+//! Measured 2026-11-15, one run on the owner's Mac, `examples/time.rs` over library/ (3,130
+//! files, 57.0 MB, one thread): the outline took 1,005.7 ms before (token digests, bodies
+//! skipped by the parser but lexed) and 769.6 ms after (74 MB/s). The floor: a skip of 57.0 MB
+//! at 3,391.6 MB/s (blaze-lex's `cost`) is 16.8 ms, BLAKE3 over every byte once is 77.4 ms
+//! (736 MB/s, `blaze_blake3`), 94.2 ms in all: the outline is 8.2x the floor. A sample of the
+//! run puts about a sixth of the time in BLAKE3 (entries nested in an impl or a module are
+//! hashed again inside it), a ninth in the token scans of the split and the skeleton, and the
+//! rest in `LexedStr`, the parser and the walk over the text outside skipped bodies.
+//!
+//! `examples/huge.rs`, the same day, a 10.0 MB file of 745 library files as modules: a cold
+//! outline in 120.0 ms on one thread and 14.1 ms on 18 (split 4.5 ms on one, parts 8.9 ms on
+//! 18, assembly 0.8 ms); an edit to one part with every other part's outline in hand, 17.8 ms,
+//! of which the digest of every part to look it up is 12.6 ms and the split 4.5 ms.
+//!
 //! # A file is outlined item by item
 //!
 //! 1. [`split_top_level`] cuts a file at its top-level item boundaries by a structural scan, no

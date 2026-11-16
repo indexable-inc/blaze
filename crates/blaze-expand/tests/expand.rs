@@ -638,6 +638,21 @@ fn derive_const_writes_a_const_impl_with_const_bounds() {
 }
 
 #[test]
+fn const_param_ty_derives_a_plain_marker_impl() {
+    // As `core::marker` writes `#[derive(ConstParamTy)]`, and never const under `derive_const`.
+    for facts in [DeriveFacts::PLAIN, DeriveFacts { copy: AlsoCopy::No, constness: Constness::Const }]
+    {
+        let exp = derive_with(BuiltinDerive::ConstParamTy, "enum E<T> { A(T), B }", facts);
+        assert!(exp.diagnostics.is_empty(), "{:?}", exp.diagnostics);
+        let text = show(&exp.tokens);
+        let header = "impl < T : $crate :: marker :: ConstParamTy_ , > \
+                      $crate :: marker :: ConstParamTy_ for E < T , > { }";
+        assert!(text.contains(header), "{text}");
+    }
+    assert_eq!(BuiltinDerive::ConstParamTy.name(), "ConstParamTy");
+}
+
+#[test]
 fn debug_and_clone_derive_their_impls() {
     let debug = derive(BuiltinDerive::Debug, "struct S { a: u32 }");
     let text = show(&debug.tokens);

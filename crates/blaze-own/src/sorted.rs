@@ -121,10 +121,59 @@ impl<K: Ord, V, A: Allocator> SortedMap<K, V, A> {
         match self.find(&key) {
             Ok(at) => Some(core::mem::replace(&mut self.entries[at].1, value)),
             Err(at) => {
-                self.entries.insert(at, (key, value));
+                self.entries.insert_shift(at, (key, value));
                 None
             }
         }
+    }
+
+    /// The value under `key`; on a miss, `make(key)` gives the owned key and its value, put in
+    /// where the one search left off. So the owned key is made only on a miss, where
+    /// `map.entry(key.to_owned())` makes it on every hit. `O(n)` moves on a miss.
+    ///
+    /// # Panics
+    ///
+    /// When `make` gives a key not equal to `key` (it would sit out of order), or there is no
+    /// memory.
+    #[track_caller]
+    pub fn get_or_insert_with<Q: Ord + ?Sized>(&mut self, key: &Q, make: impl FnOnce(&Q) -> (K, V)) -> &mut V
+    where
+        K: Borrow<Q>,
+    {
+        match self.try_get_or_insert_with(key, make) {
+            Ok(value) => value,
+            Err(refused) => fail(refused.why),
+        }
+    }
+
+    /// [`SortedMap::get_or_insert_with`], or the made pair handed back with the
+    /// [`AllocFailure`] when the map must grow and cannot; the map is as it was.
+    ///
+    /// # Panics
+    ///
+    /// When `make` gives a key not equal to `key`.
+    #[track_caller]
+    pub fn try_get_or_insert_with<Q: Ord + ?Sized>(
+        &mut self,
+        key: &Q,
+        make: impl FnOnce(&Q) -> (K, V),
+    ) -> Result<&mut V, Refused<(K, V)>>
+    where
+        K: Borrow<Q>,
+    {
+        let at = match self.find(key) {
+            Ok(at) => return Ok(&mut self.entries[at].1),
+            Err(at) => at,
+        };
+        let (owned, value) = make(key);
+        if owned.borrow().cmp(key) != Ordering::Equal {
+            panic!("SortedMap::get_or_insert_with: `make` gave a key not equal to the one looked up");
+        }
+        if let Err(why) = self.entries.try_reserve(1) {
+            return Err(Refused { value: (owned, value), why });
+        }
+        self.entries.insert_shift(at, (owned, value));
+        Ok(&mut self.entries[at].1)
     }
 
     /// The place of `key`, found once: [`Entry::or_insert_with`], [`Entry::and_modify`] and the
@@ -145,7 +194,7 @@ impl<K: Ord, V, A: Allocator> SortedMap<K, V, A> {
                 if let Err(why) = self.entries.try_reserve(1) {
                     return Err(Refused { value: (key, value), why });
                 }
-                self.entries.insert(at, (key, value));
+                self.entries.insert_shift(at, (key, value));
                 Ok(None)
             }
         }
@@ -163,7 +212,7 @@ impl<K: Ord, V, A: Allocator> SortedMap<K, V, A> {
         K: Borrow<Q>,
     {
         let at = self.find(key).ok()?;
-        Some(self.entries.remove(at))
+        Some(self.entries.remove_shift(at))
     }
 
     pub fn first_key_value(&self) -> Option<(&K, &V)> {
@@ -175,7 +224,7 @@ impl<K: Ord, V, A: Allocator> SortedMap<K, V, A> {
     }
 
     pub fn pop_first(&mut self) -> Option<(K, V)> {
-        if self.entries.is_empty() { None } else { Some(self.entries.remove(0)) }
+        if self.entries.is_empty() { None } else { Some(self.entries.remove_shift(0)) }
     }
 
     pub fn pop_last(&mut self) -> Option<(K, V)> {
@@ -324,7 +373,7 @@ impl<'a, K, V, A: Allocator> OccupiedEntry<'a, K, V, A> {
     }
 
     pub fn remove_entry(self) -> (K, V) {
-        self.map.entries.remove(self.at)
+        self.map.entries.remove_shift(self.at)
     }
 
     pub fn remove(self) -> V {
@@ -344,7 +393,7 @@ impl<'a, K, V, A: Allocator> VacantEntry<'a, K, V, A> {
     /// Puts `value` under the key, `O(n)` moves; panics as `Vec::insert` when it cannot grow.
     pub fn insert(self, value: V) -> &'a mut V {
         let VacantEntry { map, at, key } = self;
-        map.entries.insert(at, (key, value));
+        map.entries.insert_shift(at, (key, value));
         &mut map.entries[at].1
     }
 }
@@ -589,7 +638,7 @@ impl<T: Ord, A: Allocator> SortedSet<T, A> {
         match self.find(&value) {
             Ok(_) => false,
             Err(at) => {
-                self.values.insert(at, value);
+                self.values.insert_shift(at, value);
                 true
             }
         }
@@ -607,7 +656,7 @@ impl<T: Ord, A: Allocator> SortedSet<T, A> {
         T: Borrow<Q>,
     {
         let at = self.find(value).ok()?;
-        Some(self.values.remove(at))
+        Some(self.values.remove_shift(at))
     }
 
     pub fn first(&self) -> Option<&T> {

@@ -511,7 +511,7 @@ fn draw(tape: &Tape, memory: &Memory, tag: u64) -> Effect {
         7 => Effect::Write { file: file(), bytes: bytes(), tag },
         8 => Effect::Rename { from: file(), to: file(), tag },
         9 => Effect::Remove { file: file(), tag },
-        10 => Effect::SyncDir { dir: FileName::new("w").expect("a name"), tag },
+        10 => Effect::SyncDir { dir: FileName::new("w").expect("a name").into(), tag },
         11 => Effect::WriteBack { file: file(), tag },
         _ => {
             // Whole sectors of the test's memory, at a sector's offset in the file.

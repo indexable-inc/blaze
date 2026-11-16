@@ -96,8 +96,8 @@ fn specialized_case_in(tape: &Tape, alloc: &Counting) -> Result<(), Broke> {
 
     // `insert_many`, anywhere up to the end.
     let at = tape.index(fast.len() + 1, "at");
-    fast.insert_many(at, &head);
-    generic.insert_many(at, &plain_head);
+    fast.insert_slice_shift(at, &head);
+    generic.insert_slice_shift(at, &plain_head);
     equal("insert_many", &fast, &unwrap(&generic))?;
 
     // `clone`, `clone_in`.
@@ -143,16 +143,16 @@ fn specialized_case_in(tape: &Tape, alloc: &Counting) -> Result<(), Broke> {
     let fast_flags = Vec::from_slice_in(&flags, alloc);
     let plain_flags = Vec::from_iter_in(flags.iter().copied().map(Plain), alloc);
     let found = [
-        (fast_bytes.position(&needle), plain_bytes.position(&Plain(needle))),
-        (fast_signed.position(&((needle as i8) - 3)), plain_signed.position(&Plain((needle as i8) - 3))),
-        (fast_flags.position(&(needle % 2 == 0)), plain_flags.position(&Plain(needle % 2 == 0))),
+        (fast_bytes.scan_for(&needle), plain_bytes.scan_for(&Plain(needle))),
+        (fast_signed.scan_for(&((needle as i8) - 3)), plain_signed.scan_for(&Plain((needle as i8) - 3))),
+        (fast_flags.scan_for(&(needle % 2 == 0)), plain_flags.scan_for(&Plain(needle % 2 == 0))),
     ];
     for (k, (fast, generic)) in found.iter().enumerate() {
         if fast != generic {
             return Err(Broke::Oracle(format!("position over kind {k}: {fast:?}, generic {generic:?}")));
         }
     }
-    if fast_bytes.contains(&needle) != bytes.contains(&needle) {
+    if fast_bytes.scan_for(&needle).is_some() != bytes.contains(&needle) {
         return Err(Broke::Oracle(format!("contains({needle}) differs from the model")));
     }
 
@@ -235,7 +235,7 @@ fn insert_many_frees_everything_when_a_clone_panics() -> Result<(), Broke> {
         let mut vec = ten(&alloc);
         let values: StdVec<Token> = (100..106).map(Token::new).collect();
         tokens::panic_on_clone(103);
-        panics(|| vec.insert_many(4, &values))?;
+        panics(|| vec.insert_slice_shift(4, &values))?;
         // The three clones made stay, at 4..7, and the tail closes up behind them.
         let seen: StdVec<u64> = vec.iter().map(|t| t.value).collect();
         let model: StdVec<u64> = (0..4).chain(100..103).chain(4..10).collect();

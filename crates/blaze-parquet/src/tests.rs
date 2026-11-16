@@ -296,7 +296,7 @@ fn a_merge_holds_every_input_row_and_counts_them() {
         [Input::open(a.as_slice(), &Global).unwrap(), Input::open(b.as_slice(), &Global).unwrap()],
         Global,
     );
-    let merged = Concat::new(inputs, "rows", 1, Global).unwrap().all().unwrap();
+    let merged = Concat::new(inputs, "rows", 1, Compression::None, Global).unwrap().all().unwrap();
     let read = File::open(&merged, Global).unwrap();
     assert_eq!((read.num_rows(), read.row_groups()), (6, 4));
     assert_eq!(read.value("rows"), Some("6"));
@@ -309,6 +309,30 @@ fn a_merge_holds_every_input_row_and_counts_them() {
 }
 
 #[test]
+fn a_merge_recompresses_chunks_of_another_codec() {
+    let want = [rows(&[many(3000)]), rows(&[many(3000)])].concat();
+    for from in CODECS {
+        for to in CODECS {
+            let options = Options { row_group_rows: 1000, page_rows: 300, compression: from, ..Options::DEFAULT };
+            let a = write(&fields(), &[many(3000)], &[], options, Global).unwrap();
+            let b = write(&fields(), &[many(3000)], &[], Options { compression: to, ..options }, Global).unwrap();
+            let inputs = Vec::from_iter_in(
+                [Input::open(a.as_slice(), &Global).unwrap(), Input::open(b.as_slice(), &Global).unwrap()],
+                Global,
+            );
+            let merged = Concat::new(inputs, "rows", 1 << 16, to, Global).unwrap().all().unwrap();
+            let read = File::open(&merged, Global).unwrap();
+            for group in read.meta().row_groups.iter() {
+                let sum: i64 = group.columns.iter().map(|it| it.meta.as_ref().unwrap().total_compressed_size).sum();
+                assert_eq!(group.total_compressed_size, Some(sum));
+                assert!(group.columns.iter().all(|it| it.meta.as_ref().unwrap().codec == to.codec()));
+            }
+            assert_eq!(rows(&read.read_all().unwrap()), want, "{from:?} to {to:?}");
+        }
+    }
+}
+
+#[test]
 fn a_merge_of_another_schema_is_refused() {
     let a = write(&fields(), &[three(true)], &[], Options::DEFAULT, Global).unwrap();
     let other = [Field::new("flag", Type::One(Scalar::Bool), true)];
@@ -317,7 +341,7 @@ fn a_merge_of_another_schema_is_refused() {
         [Input::open(a.as_slice(), &Global).unwrap(), Input::open(b.as_slice(), &Global).unwrap()],
         Global,
     );
-    let err = Concat::new(inputs, "rows", 1 << 20, Global).unwrap().all().unwrap_err();
+    let err = Concat::new(inputs, "rows", 1 << 20, Compression::None, Global).unwrap().all().unwrap_err();
     assert_eq!((err.input, err.error), (Some(1), ParquetError::SchemaDiffers));
 }
 

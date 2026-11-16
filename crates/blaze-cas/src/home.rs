@@ -158,7 +158,7 @@ impl Store {
         effects.push(Effect::Sync { file, tag });
         let tag = self.tags.ask(Op::HomeSynced { content, round });
         // durable: the file's name, which its rename made with no sync
-        effects.push(Effect::SyncDir { dir: self.placed_dir(), tag });
+        effects.push(Effect::SyncDir { dir: self.placed_dir().into(), tag });
     }
 
     /// A sync of the whole file of `content` or of `placed/` answered ([`Store::home_ready`]).

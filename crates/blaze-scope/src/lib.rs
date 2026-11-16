@@ -55,6 +55,7 @@ mod lookup;
 mod read;
 mod resolver;
 mod scope;
+mod watch;
 
 #[cfg(test)]
 mod tests;
@@ -64,7 +65,7 @@ pub use error::ResolveError;
 pub use facts::{Name, RecordFacts, ScopeFacts};
 pub use group::Group;
 pub use read::{Answer, ExpandRequest, NameAnswer, Read, Reply, Step};
-pub use resolver::{MAX_EXPANSIONS, MAX_MODULE_DEPTH, RECURSION_LIMIT, Resolver};
+pub use resolver::{FillStats, MAX_EXPANSIONS, MAX_MODULE_DEPTH, RECURSION_LIMIT, Resolver};
 pub use scope::{ReadEntry, ReadList, Resolved, Saw};
 
 // The item layer's words and working forms, from their one home.

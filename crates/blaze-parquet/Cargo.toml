@@ -26,5 +26,9 @@ blaze-kit.workspace = true
 # binary links already.
 zstd.workspace = true
 
+[dev-dependencies]
+# The measurement's global allocator handle for blaze-columns' encoders (tests/measure.rs).
+blaze-own = { workspace = true, features = ["std"] }
+
 [lints]
 workspace = true

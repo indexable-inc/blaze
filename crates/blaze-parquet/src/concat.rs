@@ -1,6 +1,7 @@
 //! A merge: Parquet files of one schema as one file, each row group's column chunks copied as
-//! their bytes are (whatever their pages' encoding or codec), with only the offsets moved in
-//! the new footer. Page indexes and bloom filters are not carried (this crate writes neither).
+//! their bytes are (whatever their pages' encoding) with only the offsets moved in the new
+//! footer, or, where a chunk is of another codec than the merge's, its pages recompressed.
+//! Page indexes and bloom filters are not carried (this crate writes neither).
 
 use core::{alloc::Allocator, fmt::Write};
 
@@ -8,7 +9,7 @@ use blaze_int::Int;
 use blaze_own::{String, Vec};
 
 use crate::{
-    MAGIC, ParquetError,
+    Compression, MAGIC, ParquetError, compress,
     meta::{self, ColumnChunk, FileMeta, KeyValue, RowGroup},
     read,
 };
@@ -60,13 +61,70 @@ pub struct Concat<B: AsRef<[u8]>, A: Allocator + Clone> {
     /// The rows the inputs' footers said, so far.
     rows: i64,
     done: bool,
+    /// The output's pages' codec, and a page's bytes as they are recompressed into it.
+    compression: Compression,
+    plain: Vec<u8, A>,
+    packed: Vec<u8, A>,
+}
+
+/// The pages of the column chunk `raw` (of codec `codec`) appended to `out` in `to`, each page
+/// decompressed and compressed again with its header's sizes rewritten (its encoding as it
+/// was); where its first data page and its dictionary page now start in `out`.
+fn recode<A: Allocator>(
+    name: &str,
+    raw: &[u8],
+    codec: i32,
+    to: Compression,
+    out: &mut Vec<u8, A>,
+    (plain, packed): (&mut Vec<u8, A>, &mut Vec<u8, A>),
+) -> Result<(usize, Option<usize>), ParquetError> {
+    let corrupt = |what| ParquetError::Corrupt { column: crate::column_name(name), what };
+    let mut at = 0;
+    let (mut data, mut dictionary) = (None, None);
+    while at < raw.len() {
+        let (mut header, header_len) = meta::read_page_header(&raw[at..])?;
+        if header.ty == meta::page::DATA_PAGE_V2 || header.ty == meta::page::INDEX_PAGE {
+            return Err(ParquetError::Unsupported {
+                column: crate::column_name(name),
+                what: "a merge that recompresses a v2 data page or an index page",
+                code: header.ty.into(),
+            });
+        }
+        let len = header.compressed_page_size.narrow::<usize>().map_err(|_| corrupt("a page of negative size"))?;
+        let stored = raw.get(at + header_len..at + header_len + len).ok_or_else(|| corrupt("a page past its chunk"))?;
+        at += header_len + len;
+        let size = header.uncompressed_page_size.narrow::<usize>().map_err(|_| corrupt("a page of negative size"))?;
+        plain.clear();
+        let body: &[u8] = if compress::decompress(name, codec, stored, size, plain)? { plain } else { stored };
+        packed.clear();
+        let body: &[u8] = if to.compress(body, packed)? { packed } else { body };
+        header.compressed_page_size =
+            body.len().narrow::<i32>().map_err(|_| ParquetError::TooLarge { column: crate::column_name(name), what: "a page past 2 GiB" })?;
+        if header.ty == meta::page::DICTIONARY_PAGE {
+            dictionary.get_or_insert(out.len());
+        } else {
+            data.get_or_insert(out.len());
+        }
+        meta::write_page_header(out, &header, None);
+        out.extend_from_slice(body);
+    }
+    Ok((data.ok_or_else(|| corrupt("a column chunk of no data page"))?, dictionary))
 }
 
 impl<B: AsRef<[u8]>, A: Allocator + Clone> Concat<B, A> {
     /// The merge of `inputs` (at least one, all of the first one's schema). Its metadata is the
     /// first input's, but for `rows_key`, which says the rows the inputs' footers held. The
-    /// output is handed out in pieces of at least `piece` bytes.
-    pub fn new(inputs: Vec<Input<B, A>, A>, rows_key: &'static str, piece: usize, alloc: A) -> Result<Concat<B, A>, Failed> {
+    /// output is handed out in pieces of at least `piece` bytes. Its pages are compressed as
+    /// `compression` says: a chunk already so is copied as its bytes are, another has each page
+    /// decompressed and compressed again (a merge of a build's uncompressed files into a cold
+    /// one under zstd).
+    pub fn new(
+        inputs: Vec<Input<B, A>, A>,
+        rows_key: &'static str,
+        piece: usize,
+        compression: Compression,
+        alloc: A,
+    ) -> Result<Concat<B, A>, Failed> {
         if inputs.is_empty() {
             return Err(Failed { input: None, doing: "starting a merge of no input", error: ParquetError::SchemaDiffers });
         }
@@ -74,6 +132,9 @@ impl<B: AsRef<[u8]>, A: Allocator + Clone> Concat<B, A> {
         out.extend_from_slice(&MAGIC);
         Ok(Concat {
             inputs,
+            compression,
+            plain: Vec::new_in(alloc.clone()),
+            packed: Vec::new_in(alloc.clone()),
             groups: Vec::new_in(alloc.clone()),
             alloc,
             rows_key,
@@ -110,6 +171,7 @@ impl<B: AsRef<[u8]>, A: Allocator + Clone> Concat<B, A> {
             let bytes = &input.bytes.as_ref()[..input.data_end];
             let mut columns = Vec::with_capacity_in(group.columns.len(), self.alloc.clone());
             let group_start = self.handed + self.out.len();
+            let mut compressed = 0i64;
             for chunk in group.columns.iter() {
                 let corrupt = |what| {
                     failed("copying a column chunk of the input", ParquetError::Corrupt { column: crate::column_name(""), what })
@@ -125,12 +187,32 @@ impl<B: AsRef<[u8]>, A: Allocator + Clone> Concat<B, A> {
                     .filter(|_| start >= MAGIC.len())
                     .ok_or_else(|| corrupt("a chunk past the input's data"))?;
                 let new_start = self.handed + self.out.len();
-                self.out.extend_from_slice(raw);
-                let shift = new_start.widen_to::<u64>().cast_signed() - column.start();
                 let mut column = column.clone();
-                column.data_page_offset += shift;
-                column.dictionary_page_offset = column.dictionary_page_offset.map(|it| it + shift);
-                column.index_page_offset = column.index_page_offset.map(|it| it + shift);
+                if column.codec == self.compression.codec() {
+                    self.out.extend_from_slice(raw);
+                    let shift = new_start.widen_to::<u64>().cast_signed() - column.start();
+                    column.data_page_offset += shift;
+                    column.dictionary_page_offset = column.dictionary_page_offset.map(|it| it + shift);
+                    column.index_page_offset = column.index_page_offset.map(|it| it + shift);
+                } else {
+                    let name = column.path.last().map_or("", |it| it.as_str());
+                    let (data, dictionary) = recode(
+                        name,
+                        raw,
+                        column.codec,
+                        self.compression,
+                        &mut self.out,
+                        (&mut self.plain, &mut self.packed),
+                    )
+                    .map_err(|error| failed("compressing a column chunk of the input", error))?;
+                    let offset = |at: usize| (self.handed + at).widen_to::<u64>().cast_signed();
+                    column.data_page_offset = offset(data);
+                    column.dictionary_page_offset = dictionary.map(offset);
+                    column.index_page_offset = None;
+                    column.codec = self.compression.codec();
+                    column.total_compressed_size = (self.handed + self.out.len() - new_start).widen_to::<u64>().cast_signed();
+                }
+                compressed += column.total_compressed_size;
                 columns.push(ColumnChunk {
                     file_path: None,
                     file_offset: new_start.widen_to::<u64>().cast_signed(),
@@ -143,7 +225,7 @@ impl<B: AsRef<[u8]>, A: Allocator + Clone> Concat<B, A> {
                 total_byte_size: group.total_byte_size,
                 num_rows: group.num_rows,
                 file_offset: Some(group_start.widen_to::<u64>().cast_signed()),
-                total_compressed_size: group.total_compressed_size,
+                total_compressed_size: group.total_compressed_size.map(|_| compressed),
                 ordinal,
             });
             self.at = (input_at, group_at + 1);

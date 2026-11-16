@@ -45,7 +45,9 @@ impl<'a, N: Name> Group<'a, N> {
             if m.finished {
                 return Err(ResolveError::Finished { module: m.module });
             }
-            // What a member waited on may now be a fellow, read live.
+            // What a member waited on may now be a fellow, read live: every plan is made again,
+            // on the group's clock.
+            m.stamps.reset();
             m.block_all();
         }
         Ok(Group { members, out: Outbox::new_in(alloc), alloc, finished: false })
@@ -78,6 +80,15 @@ impl<'a, N: Name> Group<'a, N> {
                 Ok(Step::Done(all))
             }
         }
+    }
+
+    /// The work of every step so far.
+    pub fn stats(&self) -> crate::resolver::FillStats {
+        let mut stats = self.out.stats;
+        for m in self.members.iter() {
+            stats.add(&m.out.stats);
+        }
+        stats
     }
 
     /// The members back, to join a larger group when this one meets another cycle.

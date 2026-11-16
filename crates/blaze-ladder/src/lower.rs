@@ -10,6 +10,12 @@
 //! signatures and fields go to the program's one type table; types written in a body to the
 //! body's. A type path naming a struct is resolved once every file is walked.
 //!
+//! Generics: a fn or struct may take type parameters without bounds (`fn f<T>`, `struct S<T>`);
+//! a `T` written in its signature, fields or body is `PNode::Param(i)` by its index (a ladder
+//! fn has no parent generics). Type arguments may be written on a struct type (`S<u8>`) and on
+//! a body path (`f::<u8>`). Lifetimes, const generics, bounds, defaults and `where` clauses
+//! are refused by name.
+//!
 //! `while c { b }` is `loop { if c { b } else { break } }`. An `unsafe { .. }` block is a block.
 //!
 //! Everything outside the subset is a [`LowerError`] naming it and its place, never skipped
@@ -69,6 +75,9 @@ pub struct FnItem {
     pub module: u32,
     /// `#[link_name = ".."]`.
     pub link_name: Option<Box<str, Global>>,
+    /// Its type parameters, `fn f<T, U>`: a `T` in its signature or body is
+    /// `PNode::Param(0)`. A ladder fn has no parent generics.
+    pub own_count: u32,
     name: Box<str, Global>,
     inputs: List,
     output: PTy,
@@ -91,6 +100,8 @@ pub struct StructItem {
     pub path: Box<str, Global>,
     pub file: u32,
     pub at: u32,
+    /// Its type parameters, `struct S<T>`: a `T` in a field is `PNode::Param(0)`.
+    pub generics: u32,
     variants: Vec<Variant, Global>,
     fields: Vec<Field, Global>,
 }
@@ -155,6 +166,8 @@ pub struct Body {
     segments: Vec<Segment, Global>,
     ty_nodes: Vec<PNode, Global>,
     ty_lists: Vec<PTy, Global>,
+    /// Paths' written generic arguments (`f::<u8>`), by `Segment::generic_args`.
+    type_lists: Vec<PTy, Global>,
     /// Per expression: an integer, byte or char literal's value.
     expr_values: Vec<u128, Global>,
     /// Per pattern: a literal pattern's value (its magnitude for `-lit`).
@@ -186,7 +199,7 @@ impl Body {
             paths: &self.paths,
             segments: &self.segments,
             types: PTys { nodes: &self.ty_nodes, lists: &self.ty_lists },
-            type_lists: &[],
+            type_lists: &self.type_lists,
             opt_types: &[],
         }
     }
@@ -220,7 +233,7 @@ impl Program {
         let item = &self.fns[f];
         FnSig {
             parent_count: 0,
-            own_count: 0,
+            own_count: item.own_count,
             self_param: false,
             inputs: &self.sig_inputs[item.inputs.range()],
             output: item.output,
@@ -250,7 +263,7 @@ impl Program {
     pub fn adt(&self, key: ItemKey) -> Option<Adt<'_>> {
         let &ItemRef::Struct(i) = self.by_key.get(&key)? else { return None };
         let s = &self.structs[i as usize];
-        Some(Adt { kind: AdtKind::Struct, generics: 0, variants: &s.variants, fields: &s.fields, types: self.types() })
+        Some(Adt { kind: AdtKind::Struct, generics: s.generics, variants: &s.variants, fields: &s.fields, types: self.types() })
     }
 
     /// A fn item's index in `fns`.
@@ -333,6 +346,10 @@ pub enum LowerError {
     UnresolvedType { file: u32, at: u32, name: Box<str, Global> },
     /// A type path that names an item that is not a struct.
     NotAType { file: u32, at: u32, name: Box<str, Global> },
+    /// A struct type written with another number of type arguments than it has parameters.
+    GenericArgCount { file: u32, at: u32, name: Box<str, Global>, want: u32, got: u32 },
+    /// Two type parameters of one name on one item.
+    DuplicateParam { file: u32, at: u32, name: Box<str, Global> },
 }
 
 impl LowerError {
@@ -346,7 +363,9 @@ impl LowerError {
             | LowerError::ModuleFileTwice { file, at, .. }
             | LowerError::Duplicate { file, at, .. }
             | LowerError::UnresolvedType { file, at, .. }
-            | LowerError::NotAType { file, at, .. } => Some((file, at)),
+            | LowerError::NotAType { file, at, .. }
+            | LowerError::GenericArgCount { file, at, .. }
+            | LowerError::DuplicateParam { file, at, .. } => Some((file, at)),
             LowerError::NoRootFile { .. } => None,
         }
     }
@@ -365,6 +384,10 @@ impl LowerError {
             LowerError::Duplicate { name, .. } => write!(f, "a second item named `{name}` in one module"),
             LowerError::UnresolvedType { name, .. } => write!(f, "the type `{name}` names nothing"),
             LowerError::NotAType { name, .. } => write!(f, "`{name}` is not a struct or a primitive type"),
+            LowerError::GenericArgCount { name, want, got, .. } => {
+                write!(f, "`{name}` is written with {got} type arguments; the struct takes {want}")
+            }
+            LowerError::DuplicateParam { name, .. } => write!(f, "a second type parameter named `{name}`"),
         }
     }
 
@@ -456,11 +479,23 @@ pub fn lower(files: &[SourceFile<'_>], root: &str) -> Result<Program, LowerError
     for fix in fixups.iter() {
         let res = program.resolve(fix.module, &fix.names);
         let key = match res {
-            Some((ItemRef::Struct(i), n)) if n as usize == fix.names.len() => program.structs[i as usize].key,
+            Some((ItemRef::Struct(i), n)) if n as usize == fix.names.len() => {
+                let s = &program.structs[i as usize];
+                if s.generics != fix.args.len {
+                    return Err(LowerError::GenericArgCount {
+                        file: fix.file,
+                        at: fix.at,
+                        name: fix.text.clone(),
+                        want: s.generics,
+                        got: fix.args.len,
+                    });
+                }
+                s.key
+            }
             Some(_) => return Err(LowerError::NotAType { file: fix.file, at: fix.at, name: fix.text.clone() }),
             None => return Err(LowerError::UnresolvedType { file: fix.file, at: fix.at, name: fix.text.clone() }),
         };
-        let node = PNode::Adt(key, List::EMPTY);
+        let node = PNode::Adt(key, fix.args);
         match fix.table {
             None => program.sig_nodes[fix.node as usize] = node,
             Some(f) => {
@@ -479,6 +514,8 @@ struct Fixup {
     node: u32,
     module: u32,
     names: Vec<Name, Global>,
+    /// The written type arguments, in the same table as `node`.
+    args: List,
     text: Box<str, Global>,
     file: u32,
     at: u32,
@@ -493,7 +530,10 @@ enum Val {
     Ty(PTy),
     /// Segments `start..start + len` of the walk's segment column, and the path's range.
     Path(u32, u32, u32, u32),
-    Seg(u32, u32),
+    /// A path segment, by its index in the walk's segment column.
+    Seg(u32),
+    /// `<A, B>` or `::<A, B>`: types `start..start + len` of the walk's argument column.
+    GenArgs(u32, u32),
     Name(u32, u32),
     Stmt(StmtId),
     Lit(LitVal),
@@ -583,6 +623,7 @@ impl BodyB {
                 segments: Vec::new_in(Global),
                 ty_nodes: Vec::new_in(Global),
                 ty_lists: Vec::new_in(Global),
+                type_lists: Vec::new_in(Global),
                 expr_values: Vec::new_in(Global),
                 pat_values: Vec::new_in(Global),
                 byte_strs: Vec::new_in(Global),
@@ -625,10 +666,23 @@ struct Walk<'w, 't> {
     vals: Vec<Val, Global>,
     /// The depth of the attribute or visibility whose subtree is kept as tokens.
     raw: Option<usize>,
-    /// Path segments' text ranges.
-    segs: Vec<(u32, u32), Global>,
+    /// Path segments: a path's are contiguous.
+    segs: Vec<SegText, Global>,
+    /// Segments' written generic arguments, in the table of where the path is.
+    arg_tys: Vec<PTy, Global>,
+    /// The type parameters of the open fn or struct, by index.
+    generics: Vec<Name, Global>,
     body: Option<BodyB>,
     extern_abi: Option<Abi>,
+}
+
+/// A path segment: its name's text range and its written generic arguments, if any.
+#[derive(Clone, Copy)]
+struct SegText {
+    start: u32,
+    end: u32,
+    /// `start..start + len` of [`Walk::arg_tys`].
+    args: Option<(u32, u32)>,
 }
 
 fn walk_file(
@@ -665,6 +719,8 @@ fn walk_file(
         vals: Vec::new_in(Global),
         raw: None,
         segs: Vec::new_in(Global),
+        arg_tys: Vec::new_in(Global),
+        generics: Vec::new_in(Global),
         body: None,
         extern_abi: None,
     };
@@ -910,11 +966,12 @@ impl<'w, 't> Walk<'w, 't> {
                 | FIELD_EXPR | RECORD_EXPR | RECORD_EXPR_FIELD_LIST | RECORD_EXPR_FIELD | IF_EXPR | BREAK_EXPR
                 | CONTINUE_EXPR | RETURN_EXPR | MATCH_EXPR | MATCH_ARM_LIST | MATCH_GUARD | WILDCARD_PAT
                 | IDENT_PAT | LITERAL_PAT | OR_PAT | RECORD_FIELD_LIST | RECORD_FIELD | ASSOC_ITEM_LIST
-                | EXTERN_ITEM_LIST | BLOCK_EXPR => {}
+                | EXTERN_ITEM_LIST | BLOCK_EXPR | TYPE_PARAM | GENERIC_ARG_LIST | TYPE_ARG => {}
                 STRUCT | TRAIT | MODULE | EXTERN_BLOCK => {
                     if parent != Some(SOURCE_FILE) {
                         return Err(self.unsupported(at, "an item that is not at a file's top level"));
                     }
+                    self.generics.clear();
                 }
                 FN => {
                     match parent {
@@ -922,8 +979,26 @@ impl<'w, 't> Walk<'w, 't> {
                         Some(ASSOC_ITEM_LIST) => return Err(self.unsupported(at, "a fn in a trait or impl")),
                         _ => return Err(self.unsupported(at, "a fn that is not at a file's top level")),
                     }
+                    self.generics.clear();
                     self.body = Some(BodyB::new(depth));
                 }
+                GENERIC_PARAM_LIST => {
+                    let grandparent = depth.checked_sub(2).and_then(|d| self.frames.get(d)).map(|f| f.kind);
+                    match (parent, grandparent) {
+                        (Some(FN), Some(EXTERN_ITEM_LIST)) => {
+                            return Err(self.unsupported(at, "type parameters on an extern fn"));
+                        }
+                        (Some(FN | STRUCT), _) => {}
+                        _ => return Err(self.unsupported(at, "type parameters on an item other than a fn or struct")),
+                    }
+                }
+                LIFETIME_PARAM => return Err(self.unsupported(at, "a lifetime parameter")),
+                CONST_PARAM => return Err(self.unsupported(at, "a const generic parameter")),
+                TYPE_BOUND_LIST => return Err(self.unsupported(at, "a trait bound")),
+                WHERE_CLAUSE => return Err(self.unsupported(at, "a `where` clause")),
+                LIFETIME_ARG => return Err(self.unsupported(at, "a lifetime argument")),
+                CONST_ARG => return Err(self.unsupported(at, "a const generic argument")),
+                ASSOC_TYPE_ARG => return Err(self.unsupported(at, "an associated type argument or bound")),
                 PARAM | LET_STMT | MATCH_ARM => mark = self.b(at)?.pending.len(),
                 STMT_LIST => {
                     let b = self.b(at)?;
@@ -946,9 +1021,6 @@ impl<'w, 't> Walk<'w, 't> {
                 METHOD_CALL_EXPR => return Err(self.unsupported(at, "a method call")),
                 FOR_EXPR => return Err(self.unsupported(at, "a `for` loop")),
                 MACRO_CALL | MACRO_EXPR | MACRO_STMTS => return Err(self.unsupported(at, "a macro call")),
-                GENERIC_PARAM_LIST | GENERIC_ARG_LIST | WHERE_CLAUSE => {
-                    return Err(self.unsupported(at, "generics"));
-                }
                 IMPL => return Err(self.unsupported(at, "an impl")),
                 USE => return Err(self.unsupported(at, "a `use` item")),
                 ITEM_LIST => return Err(self.unsupported(at, "an inline module")),
@@ -1184,21 +1256,34 @@ impl<'w, 't> Walk<'w, 't> {
     /// `BodyPath` the world resolves.
     fn body_path(&mut self, segs: (u32, u32), s: u32) -> Result<Result<PatId, PathIdx>, LowerError> {
         let (first, len) = segs;
-        let mut names: Vec<Name, Global> = Vec::new_in(Global);
+        let mut names: Vec<(Name, Option<(u32, u32)>), Global> = Vec::new_in(Global);
         for i in first..first + len {
-            let (a, b) = self.segs[i as usize];
-            names.push(name_of(self.text(a, b)));
+            let seg = self.segs[i as usize];
+            names.push((name_of(self.text(seg.start, seg.end)), seg.args));
         }
         let b = self.b(s)?;
         if len == 1 {
-            if let Some(&(_, p)) = b.bindings.iter().rev().find(|(n, _)| *n == names[0]) {
+            if let Some(&(_, p)) = b.bindings.iter().rev().find(|(n, _)| *n == names[0].0) {
+                if names[0].1.is_some() {
+                    return Err(self.unsupported(s, "generic arguments on a local"));
+                }
                 return Ok(Ok(p));
             }
         }
-        let segments = list_of(
-            &mut b.body.segments,
-            names.iter().map(|&name| Segment { name, generic_args: List::EMPTY, has_args: false }),
-        );
+        let mut segments_v: Vec<Segment, Global> = Vec::new_in(Global);
+        for &(name, args) in names.iter() {
+            let generic_args = match args {
+                Some((start, n)) => {
+                    let tys = &self.arg_tys[start as usize..(start + n) as usize];
+                    let b = self.body.as_mut().ok_or(LowerError::Syntax { file: self.file, at: s })?;
+                    list_of(&mut b.body.type_lists, tys.iter().copied())
+                }
+                None => List::EMPTY,
+            };
+            segments_v.push(Segment { name, generic_args, has_args: args.is_some() });
+        }
+        let b = self.b(s)?;
+        let segments = list_of(&mut b.body.segments, segments_v.iter().copied());
         let scope = b.scopes.last().copied().unwrap_or(ScopeId(0));
         let idx = PathIdx(len32(b.body.paths.len()));
         b.body.paths.push(BodyPath { scope, segments });
@@ -1274,19 +1359,78 @@ impl<'w, 't> Walk<'w, 't> {
                 Val::Name(a, b)
             }
             PATH_SEGMENT => {
-                let [Val::Name(a, b)] = kids else {
-                    return Err(self.unsupported(s, "a path segment with more than a name"));
+                let (a, b, args) = match kids {
+                    [Val::Name(a, b)] => (*a, *b, None),
+                    [Val::Name(a, b), Val::GenArgs(start, n)] => (*a, *b, Some((*start, *n))),
+                    _ => return Err(self.unsupported(s, "a path segment with more than a name and type arguments")),
                 };
-                self.segs.push((*a, *b));
-                Val::Seg(*a, *b)
+                self.segs.push(SegText { start: a, end: b, args });
+                Val::Seg(len32(self.segs.len()) - 1)
             }
             PATH => {
                 let (first, len) = match kids {
-                    [Val::Seg(..)] => (len32(self.segs.len()) - 1, 1),
-                    [Val::Path(first, len, ..), Val::Tok(COLON2, ..), Val::Seg(..)] => (*first, len + 1),
+                    [Val::Seg(i)] => (*i, 1),
+                    [Val::Path(first, len, ..), Val::Tok(COLON2, ..), Val::Seg(i)] => {
+                        if *i == first + len {
+                            (*first, len + 1)
+                        } else {
+                            // A type argument's path came between: copy the prefix and the
+                            // segment after it, so the path's segments are contiguous.
+                            let at = len32(self.segs.len());
+                            for j in *first..first + len {
+                                let seg = self.segs[j as usize];
+                                self.segs.push(seg);
+                            }
+                            let last = self.segs[*i as usize];
+                            self.segs.push(last);
+                            (at, len + 1)
+                        }
+                    }
                     _ => return Err(self.unsupported(s, "this path (a leading `::` or a qualified path)")),
                 };
                 Val::Path(first, len, s, e)
+            }
+            TYPE_PARAM => {
+                if has(EQ) {
+                    return Err(self.unsupported(s, "a type parameter's default"));
+                }
+                let [Val::Name(a, b)] = kids else { return Err(self.unsupported(s, "this type parameter")) };
+                Val::Name(*a, *b)
+            }
+            GENERIC_PARAM_LIST => {
+                for k in kids {
+                    match *k {
+                        Val::Tok(..) => {}
+                        Val::Name(a, b) => {
+                            let name = name_of(self.text(a, b));
+                            if self.generics.contains(&name) {
+                                return Err(LowerError::DuplicateParam {
+                                    file: self.file,
+                                    at: a,
+                                    name: boxed(self.text(a, b)),
+                                });
+                            }
+                            self.generics.push(name);
+                        }
+                        _ => return Err(self.unsupported(s, "this generic parameter")),
+                    }
+                }
+                return Ok(None);
+            }
+            TYPE_ARG => {
+                let [Val::Ty(t)] = kids else { return Err(syntax) };
+                Val::Ty(*t)
+            }
+            GENERIC_ARG_LIST => {
+                let start = len32(self.arg_tys.len());
+                for k in kids {
+                    match *k {
+                        Val::Tok(..) => {}
+                        Val::Ty(t) => self.arg_tys.push(t),
+                        _ => return Err(self.unsupported(s, "this generic argument")),
+                    }
+                }
+                Val::GenArgs(start, len32(self.arg_tys.len()) - start)
             }
             ABI => {
                 let abi = match kids {
@@ -1308,22 +1452,41 @@ impl<'w, 't> Walk<'w, 't> {
             // Types.
             PATH_TYPE => {
                 let [Val::Path(first, len, ..)] = kids else { return Err(syntax) };
-                let (a, b) = self.segs[*first as usize];
-                let one = self.text(a, b);
-                match primitive(one).filter(|_| *len == 1) {
+                let (first, len) = (*first, *len);
+                let last = self.segs[(first + len - 1) as usize];
+                if self.segs[first as usize..(first + len - 1) as usize].iter().any(|g| g.args.is_some()) {
+                    return Err(self.unsupported(s, "type arguments on a module in a type path"));
+                }
+                let one = self.text(last.start, last.end);
+                let param = self.generics.iter().position(|&g| g == name_of(one)).filter(|_| len == 1);
+                let prim = primitive(one).filter(|_| len == 1);
+                if (param.is_some() || prim.is_some()) && last.args.is_some() {
+                    return Err(self.unsupported(s, "type arguments on a type parameter or a primitive type"));
+                }
+                // A type parameter shadows a primitive or a struct of its name.
+                match param.map(|i| PNode::Param(len32(i))).or(prim) {
                     Some(n) => Val::Ty(self.ty(n)),
                     None => {
                         let mut names = Vec::new_in(Global);
-                        for i in *first..first + len {
-                            let (a, b) = self.segs[i as usize];
-                            names.push(name_of(self.text(a, b)));
+                        for i in first..first + len {
+                            let seg = self.segs[i as usize];
+                            names.push(name_of(self.text(seg.start, seg.end)));
                         }
+                        let args = match last.args {
+                            Some((start, n)) => {
+                                let mut tys: Vec<PTy, Global> = Vec::new_in(Global);
+                                tys.extend_from_slice(&self.arg_tys[start as usize..(start + n) as usize]);
+                                self.ty_list(tys.iter().copied())
+                            }
+                            None => List::EMPTY,
+                        };
                         let t = self.ty(PNode::Error);
                         let fix = Fixup {
                             table: None,
                             node: t.0,
                             module: self.module,
                             names,
+                            args,
                             text: boxed(self.text(s, e)),
                             file: self.file,
                             at: s,
@@ -1652,7 +1815,9 @@ impl<'w, 't> Walk<'w, 't> {
                 });
                 let i = len32(self.program.structs.len());
                 self.register(name, ItemRef::Struct(i), Some(key), s)?;
-                self.program.structs.push(StructItem { key, path, file: self.file, at: s, variants, fields });
+                let generics = len32(self.generics.len());
+                self.generics.clear();
+                self.program.structs.push(StructItem { key, path, file: self.file, at: s, generics, variants, fields });
                 return Ok(None);
             }
             TRAIT => {
@@ -1783,6 +1948,11 @@ impl<'w, 't> Walk<'w, 't> {
         };
         let is_unsafe = has(UNSAFE_KW) || (in_extern && !has(SAFE_KW));
         let no_mangle = kids.iter().any(|k| matches!(k, Val::Attr(Attr { kind: AttrKind::NoMangle, .. })));
+        let own_count = len32(self.generics.len());
+        self.generics.clear();
+        if no_mangle && own_count > 0 {
+            return Err(self.unsupported(s, "`#[no_mangle]` on a fn with type parameters"));
+        }
         let link_name = kids.iter().find_map(|k| match k {
             Val::Attr(Attr { kind: AttrKind::LinkName(x, y), .. }) => Some(boxed(self.text(*x, *y))),
             _ => None,
@@ -1834,6 +2004,7 @@ impl<'w, 't> Walk<'w, 't> {
             at: s,
             module: self.module,
             link_name,
+            own_count,
             name: boxed(name),
             inputs,
             output,

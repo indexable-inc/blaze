@@ -33,6 +33,8 @@ http.workspace = true
 blaze-ids.workspace = true
 # `sync`'s new primitives and `par`: Vec, VecDeque, Box, Arc with an allocator always named.
 blaze-own.workspace = true
+# `out::Held` is a `blaze_text::Put`: `Out::line_with` takes a chain of typed writers.
+blaze-text.workspace = true
 blaze-phf.workspace = true
 blaze-radix.workspace = true
 blaze-reclaim.workspace = true

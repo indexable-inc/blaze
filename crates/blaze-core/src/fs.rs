@@ -119,6 +119,19 @@ fn child_name(
     }
 }
 
+/// The name of the entry `name` directly in the driver's root, as [`child_name`] names one in a
+/// directory.
+fn root_child(name: &std::ffi::OsStr, path: impl FnOnce() -> PathBuf) -> io::Result<FileName> {
+    match name.to_str().and_then(FileName::new) {
+        Some(file) => Ok(file),
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            // alloc: an error path.
+            format!("{}: a name that is not UTF-8", path().display()),
+        )),
+    }
+}
+
 pub(crate) fn make_parent(path: &Path) -> io::Result<()> {
     match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => std::fs::create_dir_all(parent),
@@ -789,9 +802,9 @@ fn meta_of(meta: &std::fs::Metadata) -> Meta {
     }
 }
 
-/// Every file and directory under `dir` (named `name` under the root), sorted by name;
-/// symbolic links are not followed.
-pub(crate) fn list(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, Meta)>> {
+/// Every file and directory under `dir` (named `name` under the root, or the root itself),
+/// sorted by name; symbolic links are not followed.
+pub(crate) fn list(dir: &Path, name: &crate::DirName) -> io::Result<Vec<(FileName, Meta)>> {
     // alloc: the listing's payload.
     let mut found: Vec<(FileName, Meta)> = Vec::new();
     // Each directory still to read, by its index in `found`; `None` for `dir` itself.
@@ -802,7 +815,7 @@ pub(crate) fn list(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, Met
             path.push(dir);
             if let Some(at) = at {
                 let file: &FileName = &found[at].0;
-                path.push(&file.as_str()[name.as_str().len() + 1..]);
+                path.push(&file.as_str()[name.start()..]);
             }
             // alloc: once per directory, std's handle of it.
             std::fs::read_dir(&*path).map_err(|error| {
@@ -813,9 +826,14 @@ pub(crate) fn list(dir: &Path, name: &FileName) -> io::Result<Vec<(FileName, Met
             let entry = entry?;
             // Of the entry itself, not followed through a symlink.
             let meta = entry.metadata()?;
-            let under = at.map_or(name, |at| &found[at].0);
             // alloc: std's copy of the entry's name, and the name, the listing's payload.
-            let file = child_name(under, &entry.file_name(), || entry.path())?;
+            let file = match at {
+                Some(at) => child_name(&found[at].0, &entry.file_name(), || entry.path())?,
+                None => match name {
+                    crate::DirName::Named(dir) => child_name(dir, &entry.file_name(), || entry.path())?,
+                    crate::DirName::Root => root_child(&entry.file_name(), || entry.path())?,
+                },
+            };
             if meta.is_dir() {
                 todo.push(Some(found.len()));
             }
