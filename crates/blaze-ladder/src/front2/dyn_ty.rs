@@ -21,9 +21,11 @@ use super::source::NamesSource;
 use crate::resolve::{Ns, Paths};
 
 /// One written member's dyn-compatibility facts (`v` its lowered text), `module` where its
-/// names resolve, `sized` the `#[lang = "sized"]` trait. The checker decides from them
+/// names resolve, `sized` the `#[lang = "sized"]` trait, `pointers` the library's `Box`, `Rc`,
+/// `Arc` and `Pin` a typed receiver (`self: Pin<&mut Self>`) is read against
+/// ([`super::receiver::classify`]). The checker decides from them
 /// (`blaze_typeck::dyn_compat`, the rule's one home), through `TraitDef.members`.
-pub fn member<'n, S: NamesSource<'n>>(resolver: &Paths<S>, module: LibKey, sized: Option<LibKey>, detail: Member, v: &View<'_>) -> Result<MemberShape, Why> {
+pub fn member<'n, S: NamesSource<'n>>(resolver: &Paths<S>, module: LibKey, sized: Option<LibKey>, pointers: &super::receiver::Pointers, detail: Member, v: &View<'_>) -> Result<MemberShape, Why> {
     use blaze_lower::head;
     match detail {
         Member::Const => return Ok(MemberShape::Const),
@@ -31,6 +33,9 @@ pub fn member<'n, S: NamesSource<'n>>(resolver: &Paths<S>, module: LibKey, sized
         Member::Fn => {}
     }
     let mut receiver = Receiver::Absent;
+    // A typed receiver whose type is not read (an alias, a projection, a path that does not
+    // resolve): a named gap, unless `where Self: Sized` makes the method non-dispatchable.
+    let mut unread = None;
     let mut written = Vec::new_in(Global);
     for (k, &n) in v.rows(v.list(head::PARAMS))?.iter().enumerate() {
         let p = lf::Param::decode(n)?;
@@ -38,7 +43,13 @@ pub fn member<'n, S: NamesSource<'n>>(resolver: &Paths<S>, module: LibKey, sized
             (0, lf::SelfKind::Value) => receiver = Receiver::Value,
             (0, lf::SelfKind::Ref(blaze_typeck::Mutbl::Mut)) => receiver = Receiver::RefMut,
             (0, lf::SelfKind::Ref(_)) => receiver = Receiver::Ref,
-            (0, lf::SelfKind::Typed) => receiver = Receiver::Other,
+            (0, lf::SelfKind::Typed) => match p.ty {
+                Some(t) => match super::receiver::classify(resolver, module, pointers, v, t)? {
+                    Ok(r) => receiver = r,
+                    Err(u) => unread = Some(u),
+                },
+                None => unread = Some(Unread::TypedReceiver),
+            },
             _ => written.extend(p.ty.map(|t| (t, false))),
         }
     }
@@ -76,9 +87,8 @@ pub fn member<'n, S: NamesSource<'n>>(resolver: &Paths<S>, module: LibKey, sized
     if f.where_self_sized {
         return Ok(MemberShape::Fn(f));
     }
-    if receiver == Receiver::Other {
-        // `self: T`: which of the Reference's receiver types `T` is, is not read here.
-        return Ok(MemberShape::Unread(Unread::TypedReceiver));
+    if let Some(u) = unread {
+        return Ok(MemberShape::Unread(u));
     }
     if let Some(t) = v.head_opt(head::TY) {
         written.push((lf::TypeId(t), true));
@@ -292,7 +302,7 @@ fn after_self(tys: &mut PortableTys<'_>, args: List, erased: PTy, r: Range) -> R
 }
 
 /// `t` is the path `Self` alone.
-fn is_self(v: &View<'_>, t: lf::TypeId) -> Result<bool, Why> {
+pub(super) fn is_self(v: &View<'_>, t: lf::TypeId) -> Result<bool, Why> {
     let lf::TypeRef::Path(p) = v.ty(t)? else { return Ok(false) };
     let segs = v.segments(v.path(p)?)?;
     Ok(segs.len() == 1 && lf::Segment::decode(segs[0])?.kind == lf::SegKind::SelfTy)

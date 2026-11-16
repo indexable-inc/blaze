@@ -549,6 +549,16 @@ impl Instances {
                 }
             }
         }
+        // An overloaded dereference: the builder calls the selected `Deref::deref` /
+        // `DerefMut::deref_mut` impl fn (blaze-build walk.rs `deref_call`), which no checked
+        // body names (back_needs.rs `overloaded_deref`).
+        if needs.overloaded_deref {
+            for (lang, name) in [("deref", "deref"), ("deref_mut", "deref_mut")] {
+                if let Some(Ok(tr)) = r.index.lang(lang).map(|lib| r.keys.item(lib)) {
+                    traits.push((tr, Box::from(name)));
+                }
+            }
+        }
         // `.await`: the builder calls the selected `Future::poll` impl fn of the held future
         // (back_needs.rs `awaits`). A coroutine's own `poll` is the builder's, no impl's.
         if needs.awaits

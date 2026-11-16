@@ -1298,6 +1298,74 @@ once; the plant `RanUnderCondition` (an asker served a fork it does not imply) i
       the `walks_from` arm give `(last, leaves)`) and quote its line; greenbuild; in the
       clone run `check` cold and read which path `Unlisted` names, then a second build's
       `check` over the first's pointer and quote its `UnitGraph`/`CrateScope` rows; step 5.
+    - RUNNER 13 2026-11-16 (uncommitted; handed on at the context limit; run files in
+      port27/drive-1116/r13/: c1..c3 `.out`, `.err`, `.profile.txt`; binaries
+      port27/drive-1116/blaze-r13-a, -b, -c, each a greenmix of the live tree: greenbuild.sh
+      cannot build a mixcheck snapshot: "blaze-cli at 9544ef5819 did not build (exit 101)").
+      Green at 15:17: "mixcheck test blaze-drive: exit 0; 45 passed, 0 failed" (tree
+      2eda653e7d), blaze-cli's unit tests "97 passed" (tree 3cb7b2f0ee); the "1 failed" is
+      `--test command_rungs` ("hello-blaze: REFUSED: error[program-refused] src/main.rs:1:14
+      the type `Cx` names nothing"), the hello-world lane's, red before these changes too.
+      DONE 1: the first new test without the `walks_from` arm: "thread 'tests::a_check_after_
+      another_command_resolves_the_names' panicked at crates/blaze-cli/src/main.rs:1848:9: no
+      crate's names in the answer:", rows "Units standing 2", "FileItems standing 1" and no
+      `UnitGraph` or `CrateScope` row. Restored.
+      DONE 2, two causes of an unlisted read, both fixed: (a) blaze-r13-a: "the names of
+      package `blaze-diff` read `crates/blaze-diff/src/rules_gen.rs`, which no manifest's
+      targets and no file's `mod` lines list": lib.rs:31 `mod rules_gen { include!(
+      "rules_gen.rs"); }`. work.rs's outline task now lists an item-position
+      `include!("literal")`'s file as a part (`included_file`, `in_modules`); test
+      `an_included_file_is_a_part_of_the_file_that_includes_it` (its first form failed without
+      the arm with "FileItems standing 0 found 0 made 1"; a simulated project has no `core`,
+      so the names' side is shown by the real run only). Debt, in `included_file`'s doc: a
+      `mod x;` line inside an included file is looked for beside it; rustc looks from the
+      including module's directory. (b) blaze-r13-b: "the names of package `hir-ty-codegen`
+      read `crates/hir-ty-codegen.rs`": the root is `[lib] path = "mod.rs"` and names.rs
+      `slot_of` mapped every `x/mod.rs` to the slot `x.rs`. It now maps one only when the
+      resolve also looked at `x.rs` (a `mod x;` probe); test `a_crate_root_named_mod_rs_is_
+      read_under_its_own_path` (passes; NOT run without the fix). Owed: the texts interface
+      (blaze-world `SourceTexts::read`) saying how it reached a file, so this is told.
+      THE COLD CHECK NOW WALKS TO ITS END AND PANICS PRINTING (blaze-r13-c, tree 0326054d86
+      dirty, load 12.86, r13/c3.*): "task Units 0 181x", "task UnitGraph 51376 8x
+      218692375", "task Fetch 0 302x 107769037", "pooled FileItems (worker ns) 0 4704x
+      3218957225", "pooled BodyCheck (worker ns) 0 110514x 3482701625", "task CrateScope 0
+      3294x 35699494088", "effect print 655366 3487x"; then "thread 'main' panicked at
+      crates/blaze-own/src/raw.rs:80:29: blaze_own: the allocator refused 51064 bytes aligned
+      to 1 for `u8`" under `request` > `draw` > `print::listed`; "the command's frame:
+      67024084 of 67108864 bytes used .. request 2528540 · stopped 55064979"; "39.64 real
+      37.61 user", "13536428032 maximum resident set size", "546663010126 instructions
+      retired", exit 1, nothing on stdout. So: drawing 3,487 findings takes 55 MB of the
+      command's 64 MiB frame (nothing is given back a finding), and the names are 35.7 s of
+      the 39.6 on the main thread. MEMORY: the profile has no row for it: its frame lines
+      account 67 MB; the other 13.3 GB is outside every frame, in `Global` (names.rs `world`
+      and `Names::made`, leaked: the Gap table's "No per-command world"). The 3,487 findings
+      were never read (the panic came first): most are expected to be unresolved names.
+      DONE 4 (the end state of step 3's fix; no real run of it yet): one pointer a (tool,
+      shape) at `.blaze/v2/at/<16 hex of H(tool, shape)>`, 8 kept. blaze-drive NEW pointers.rs
+      (`PointerName::of`, `evicted`, `KEPT`); `Profile::forward`; sim.rs `each_tool_and_
+      shape_walks_forward_from_its_own_pointer` with `control_one_pointer_for_every_tool_and_
+      shape_is_caught` (`Plant::OneName`) and `a_checkout_keeps_the_pointers_written_last`
+      with `control_evicting_the_newest_pointer_is_caught` (`Plant::EvictNewest`): the four
+      are in the "45 passed". blaze-cli seal.rs `At`, `write(.., at, fresh, ..)`, `evict` (one
+      listing and one stat effect, only when the pointer was not there); main.rs `request`
+      reads its own pointer; test `a_fresh_pointer_past_the_cap_removes_one` (passes; NOT
+      run without `evict`). `walks_from` stays as the check of a pointer against its name. An
+      old `.blaze/v2/last` is not read and not removed.
+      ALSO: blaze-drive run.rs `code_name(function, tier)`: the hooks left the name (blaze-run
+      `Effect::Compile` carries none; no caller); test `a_code_name_is_its_instance_and_tier`.
+      `blaze export`'s wiring for main.rs is in its writer's message (ac46ae47065384afb):
+      `export` stays `NotBuilt` until the run path gives the reached records.
+      NOT DONE: 3 as a real run (two builds, the second's `UnitGraph`/`CrateScope` rows; by
+      name it now reads no other build's pointer); 5 (the three timings); 6; 7; the queued
+      items of runner 12's list; the `TestLib`/`TestBin` change as pieces; the lazy `lay`.
+      STATE LEFT: the clone has `.blaze/v2/packs` from c3 and no `at/`; the scratch home's own
+      store and r12/aside are as runner 12 left them. The COMMAND-CRATES INTEGRATOR
+      a9e02845f61bde508 is stopped; lanecheck's live tree was red beneath blaze-cli all
+      session (blaze-expand, blaze-build, blaze-file-items): every pass above is mixcheck's.
+      FIRST THING NEXT: `print::listed` and `draw` (print.rs, main.rs): draw each finding in
+      a scratch that is reset a finding (or stream it), so 3,487 findings fit; a full frame
+      there is `CliError`, never a panic (step 6's typed refusal); then the cold check again
+      with blaze-r13-c's successor for its closing line, then a repeat and step 3 and 5.
 - Owed, not now: `run` after `check` writes its own certificate, because the command is in
   the key. That costs 3.5 ms against the second run's 1.0 ms on hello-world. A coarse proof
   covers all under it: `check`'s certificate should stand for `run`'s check part.

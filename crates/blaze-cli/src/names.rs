@@ -310,10 +310,12 @@ fn unresolved(c: &blaze_scope::resolve::CrateNames<'_>, own: &mut blaze_own::Vec
     elsewhere
 }
 
-/// Where an [`UNRESOLVED`] finding is drawn: its file, its item's start there today (by the
-/// item's chain, in the file as it is) and the words. `None` for one with no file or whose item
-/// is no longer there: drawn at its crate's name.
-pub(crate) fn placed<'f>(cx: &Cx, root: &Dir<ReadWrite>, message: &'f [u8], frame: &'f Frame) -> Result<(Option<(&'f str, u32)>, &'f [u8]), CliError> {
+/// Where an [`UNRESOLVED`] finding is to be drawn, read from its message alone (no file is
+/// read here): its file, its item's chain and the edition the chain was made in, and the
+/// words. `None` for one with no file: drawn at its crate's name. The item's start in the file
+/// as it is today is found where the file is read, once for all its findings (print.rs
+/// `list`: one whose item is no longer there is drawn at its crate's name too).
+pub(crate) fn place_pieces(message: &[u8]) -> Result<(Option<(&str, u64, blaze_surface::Edition)>, &[u8]), CliError> {
     let mut pieces = message.splitn(PLACE_PIECES + 1, |b| *b == 0x1F);
     let (Some(path), Some(chain), Some(edition), Some(words)) = (pieces.next(), pieces.next(), pieces.next(), pieces.next()) else {
         return Err(CliError::Text { what: "an unresolved path's finding holds no place pieces" });
@@ -324,12 +326,7 @@ pub(crate) fn placed<'f>(cx: &Cx, root: &Dir<ReadWrite>, message: &'f [u8], fram
     let path = core::str::from_utf8(path).map_err(|_| CliError::Text { what: "a path is not UTF-8" })?;
     let chain = core::str::from_utf8(chain).ok().and_then(|hex| u64::from_str_radix(hex, 16).ok()).ok_or(CliError::Text { what: "an unresolved path's item digest is not hex" })?;
     let edition = edition.first().and_then(|b| b.checked_sub(b'0')).and_then(blaze_surface::Edition::from_byte).ok_or(CliError::Text { what: "an unresolved path's finding holds no edition" })?;
-    let mut bytes = Bytes::new_in(frame, "a file to place an unresolved path in");
-    root.read_all(cx, &Path::new(path)?, &mut bytes)?;
-    let text = core::str::from_utf8(blaze_own::Vec::from_slice_in(bytes.as_slice(), frame).leak()).map_err(|_| CliError::Text { what: "a source file is not UTF-8" })?;
-    let erased = blaze_own::Erased::new(frame);
-    let outline = blaze_file_items::outline(text, edition, erased.handle());
-    Ok((crate::work::item_by_chain(&outline, text, chain).map(|start| (path, start)), words))
+    Ok((Some((path, chain, edition)), words))
 }
 
 /// The names step's state for a command: the world, each crate by subject, and what the
@@ -540,16 +537,22 @@ impl<'w> SourceTexts<'w> for Recording<'_, 'w> {
 
 
 /// The surface name of a checkout file.
-/// The slot a module file is named by: `a/x.rs` for `a/x/mod.rs`, else the path itself. Debt:
-/// a `#[path]` naming a `mod.rs` file is a path part named by its own path, which this maps
-/// to a slot that lists nothing.
-fn slot_of(path: String) -> String {
+/// The name a file the resolver read is listed by: the slot `a/x.rs` for `a/x/mod.rs` found
+/// through `mod x;`, else the path itself. A `mod.rs` file is a slot's exactly when the
+/// resolve also looked at that slot (`probed`): `mod x;` looks at `a/x.rs` before
+/// `a/x/mod.rs`, while a crate root (`[lib] path = "mod.rs"`) and a `#[path]` naming a `mod.rs`
+/// file are opened by their own path and listed by it (units.rs, work.rs `module_file`).
+/// (Before 2026-11-16 every `mod.rs` was mapped: `hir-ty-codegen`'s root, `crates/
+/// hir-ty-codegen/mod.rs`, was asked for as `crates/hir-ty-codegen.rs`, which nothing lists.)
+/// Owed: the texts interface saying how it reached a file, so this is told, not inferred; a
+/// resolver that looked at `x/mod.rs` first would end in `Unlisted`, by name, never quietly.
+fn slot_of(path: String, probed: impl Fn(&str) -> bool) -> String {
     match path.strip_suffix("/mod.rs") {
         Some(stem) => {
             let mut slot = String::with_capacity(stem.len() + 3);
             slot.push_str(stem);
             slot.push_str(".rs");
-            slot
+            if probed(&slot) { slot } else { path }
         }
         None => path,
     }
@@ -733,10 +736,13 @@ pub(crate) fn run<'f, 'b>(
         sections::watch_tests(input.name, &payload, tests);
         // The drive names a module file by its slot (`x.rs` for `x/mod.rs` too, sweep.rs): a
         // read of either place is a read of the slot's `Surface`.
-        let mut files = texts.read.into_inner();
-        let mut absent = texts.absent.into_inner();
+        let (mut read, mut lacked) = (texts.read.into_inner(), texts.absent.into_inner());
+        read.sort_unstable();
+        lacked.sort_unstable();
+        let (mut files, mut absent) = (read.clone(), lacked.clone());
+        let looked = |slot: &str| [&read, &lacked].iter().any(|list| list.binary_search_by(|path| path.as_str().cmp(slot)).is_ok());
         for path in files.iter_mut().chain(absent.iter_mut()) {
-            *path = slot_of(core::mem::take(path));
+            *path = slot_of(core::mem::take(path), looked);
         }
         files.sort_unstable();
         files.dedup();

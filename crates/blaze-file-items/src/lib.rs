@@ -60,13 +60,15 @@
 //!
 //! The digests are of bytes, not of the token stream. The cost accepted: an edit to only the
 //! whitespace or a comment inside an item changes that item's digests, and the records keyed
-//! by them are made again, for that one item. What it buys: a `fn` body that can hold no item
-//! and no macro call is never lexed or parsed by the outline. Its end is found by
-//! `blaze_lex::skip_body` (bracket depth over a structural mask, about 3.4 GB/s on one core)
-//! and its bytes go to BLAKE3 as one slice (crate::skeleton). Positions stay byte offsets
-//! relative to the item, which the diagnostics read anyway. The floor of an outline is then
-//! one skip of the file plus one BLAKE3 pass over each byte (the Merkle step above; before
-//! it, a byte was hashed once for each entry enclosing it).
+//! by them are made again, for that one item. What it buys: an entry's bytes go to BLAKE3 as
+//! slices of the text, with no token of a `fn` body read for its digest. Positions stay byte
+//! offsets relative to the item, which the diagnostics read anyway.
+//!
+//! Since 2026-11-16 the text is lexed once, whole, and the item grammar itself decides what a
+//! `fn` body is and leaves it unparsed (crate::walk::rows; `Bodies::Skipped`): the path before
+//! it cut bodies out of the text unlexed by a reader of its own (`blaze_lex::skip_body` after
+//! "the first `{` after `fn` and a name"), and lost what the cut held where the grammar reads
+//! no `fn` body there (tests/rows.rs). The numbers below up to that date are that path's.
 //!
 //! Measured 2026-11-15, one run on the owner's Mac, `examples/time.rs` over library/ (3,130
 //! files, 57.0 MB, one thread): the outline took 1,005.7 ms before (token digests, bodies
@@ -114,17 +116,20 @@
 //!    by its part's base when read, and the top-level disambiguators recounted across parts
 //!    are a side table of the few that differ. An edit to one item costs the scan, one part,
 //!    and a step a part and a probe a top-level entry to assemble.
-//! 4. [`outline`], the cold path on one thread, walks each part straight into the file's one
-//!    outline, its ranges moved by the part's start as they are written, then takes every
-//!    entry's digests in fixed batches: no part has an outline of its own. Both it and 1 to 3
-//!    are tested equal to a whole-file walk on every file of library/.
+//! 4. [`outline`], the cold path on one thread, reads the whole file in one pass: one lex, the
+//!    tokens in columns the item grammar reads in place, a sink that writes each row as its
+//!    item closes (no list of events, no tree), then every entry's digests in fixed batches.
+//!    1 to 3 are tested equal to it (tests/outline.rs), and it to the outline with every body
+//!    parsed (examples/oracle.rs over library/ and tempo's packages). 2026-11-16, library/
+//!    on one thread: 360.5 ms (158 MB/s) beside 696.4 ms for the path it replaced.
+//! 5. [`outline_tokens`] is 4 for a text written from tokens (an expansion rendered): the
+//!    writer hands the tokens over ([`TokenColumns`]) and nothing is lexed.
 //!
 //! # Flags
 //!
-//! Each entry carries [`ItemFlags`] read from its own tokens in the walk's one token pass
-//! (crate::flags): `unsafe`, foreign code, inline assembly, and a macro call not yet expanded.
-//! A body the skeleton leaves unlexed is lexed for them only when its bytes hold the word
-//! `unsafe` or a `#`, the only forms a body with no item keyword and no call can hold.
+//! Each entry carries [`ItemFlags`] read from its own tokens in the one pass that fills the
+//! token columns (crate::flags): `unsafe`, foreign code, inline assembly, and a macro call not
+//! yet expanded. A body's tokens are read for them with the rest.
 //!
 //! # What the outline is the input of
 //!
@@ -136,8 +141,8 @@
 //! # Allocation
 //!
 //! What an outline keeps is in the allocator the caller names, at its exact size and copied
-//! there once. What it only works in (the outline as the walk grows it, the skeleton, the
-//! walk's stacks, the digests' key counts) is the worker's scratch (`blaze_mem::scratch`, on
+//! there once. What it only works in (the outline as the sink grows it, the token columns, the
+//! sink's stacks, the digests' key counts) is the worker's scratch (`blaze_mem::scratch`, on
 //! the global heap) kept at its high-water mark, like the lexer's and the parser's columns
 //! (tokens, input words, events); all are back on the shelf before [`outline`] returns. In a
 //! bump frame the kept columns, growing by turns, would copy each other at each doubling, and
@@ -170,7 +175,6 @@ mod flags;
 mod header;
 mod names_digest;
 pub mod nested;
-mod skeleton;
 mod split;
 mod walk;
 
@@ -221,23 +225,7 @@ pub const SURFACE_DOMAIN: &str = "blaze-cli surface v2";
 /// A `fn` body is read only as far as it may hold an item or a macro call ([`Bodies::Skipped`]):
 /// the syntax errors are those outside the bodies it leaves unread.
 pub fn outline<'a>(text: &str, edition: Edition, alloc: Alloc<'a>) -> Outline<'a> {
-    let parts = split_top_level(text, alloc);
-    walk::outline_parts::<SideBySide>(text, parts.iter().copied(), parser_edition(edition), Bodies::Skipped, alloc)
-}
-
-/// [`outline`] with its rows written by the item grammar's sink as each item closes
-/// (crate::walk::rows), no event list and no walk of one: the path under the oracle
-/// (examples/oracle.rs) until it is equal on every file, then [`outline`] itself.
-#[doc(hidden)]
-pub fn outline_rows<'a>(text: &str, edition: Edition, alloc: Alloc<'a>) -> Outline<'a> {
     walk::rows::outline::<SideBySide>(text, parser_edition(edition), Bodies::Skipped, alloc)
-}
-
-/// [`outline_rows`] with every body parsed with the rest ([`Bodies::Parsed`]): the same rows, and
-/// the findings inside the bodies too.
-#[doc(hidden)]
-pub fn outline_rows_with<'a>(text: &str, edition: Edition, bodies: Bodies, alloc: Alloc<'a>) -> Outline<'a> {
-    walk::rows::outline::<SideBySide>(text, parser_edition(edition), bodies, alloc)
 }
 
 /// The outline of `text`, a text written from tokens (an expansion rendered), read back with no
@@ -263,23 +251,25 @@ pub fn outline_tokens<'a>(
 pub use walk::rows::{TokenColumns, TokensRefused};
 
 /// The outline of one part of a file ([`split_top_level`]), from its bytes and the edition
-/// alone: positions are relative to the part's start, and the top-level disambiguators count
-/// only the part's entries until [`Assembled`] recounts them.
+/// alone: [`outline`] of the part's text, so positions are relative to the part's start, and
+/// the top-level disambiguators count only the part's entries until [`Assembled`] recounts
+/// them.
 pub fn outline_item<'a>(part: &str, edition: Edition, alloc: Alloc<'a>) -> Outline<'a> {
-    walk::outline::<SideBySide>(part, parser_edition(edition), Bodies::Skipped, alloc)
+    outline(part, edition, alloc)
 }
 
-/// The whole file walked at once, with `fn` bodies read as `bodies` says: the reference
-/// [`outline`] is tested equal to ([`Bodies::Skipped`]), and the reference that is to
-/// ([`Bodies::Parsed`]).
+/// [`outline`] with `fn` bodies read as `bodies` says: [`Bodies::Skipped`] is [`outline`], and
+/// [`Bodies::Parsed`], every body parsed with the rest, is the definition it is tested equal to
+/// in every row (tests/outline.rs `skipping_bodies_outlines_as_parsing_them`; examples/oracle.rs
+/// over the corpora).
 pub fn outline_with<'a>(text: &str, edition: Edition, bodies: Bodies, alloc: Alloc<'a>) -> Outline<'a> {
-    walk::outline::<SideBySide>(text, parser_edition(edition), bodies, alloc)
+    walk::rows::outline::<SideBySide>(text, parser_edition(edition), bodies, alloc)
 }
 
 /// [`outline_with`], its digests hashed by `C`: the seam [`SideBySide`] and its twin
 /// [`OneByOne`] are tested equal at.
 pub fn outline_hashed_by<'a, C: Compress>(text: &str, edition: Edition, bodies: Bodies, alloc: Alloc<'a>) -> Outline<'a> {
-    walk::outline::<C>(text, parser_edition(edition), bodies, alloc)
+    walk::rows::outline::<C>(text, parser_edition(edition), bodies, alloc)
 }
 
 pub use digest::{Compress, OneByOne, SideBySide, part_digests};

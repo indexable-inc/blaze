@@ -36,10 +36,13 @@
     reason = "the same heap: notes, failure texts and the report are `String`s for a person; blaze-sim sits below blaze-mem and cannot name its `String<A>`"
 )]
 
+pub mod board;
 pub mod check;
 pub mod control;
+pub mod differ;
 pub mod draw;
 pub mod flight;
+pub mod guided;
 pub mod search;
 pub mod shrink;
 pub mod tape;
@@ -50,6 +53,7 @@ mod tests;
 
 pub use check::{Outcome, check, check_given, search};
 pub use control::control;
+pub use differ::{Answer, Approved, Differ, Pair, Side, differ, differ_all};
 pub use draw::Any;
 pub use flight::{Flight, Nanos};
 pub use search::{

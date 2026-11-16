@@ -48,10 +48,11 @@ use core::hash::{Hash, Hasher as _};
 use std::alloc::Global;
 use std::boxed::Box;
 
-use blaze_build::Built;
+use blaze_build::tls;
 use blaze_code::record::{CodeView, DecodeError, MAGIC, RecordError, Symbol};
 use blaze_emit::{AddressWord, Isa, Named, Names, Os, Outside, RecordEmitError, emit_record_measured, no_address_word};
 use blaze_ids::{ContentId, Hasher};
+use blaze_lir::Func;
 use blaze_own::{AVec, Alloc, Vec};
 use blaze_run::Tier;
 use blaze_toolchain::ToolchainId;
@@ -321,6 +322,8 @@ pub enum CodeRecordError {
     Entry(EntryError),
     /// A found entry declares an instance tabled as `tabled`, which this program has no fn for.
     NoTabledFn { tabled: ItemKey },
+    /// The thread-local getter (blaze-build `tls::getter`) did not build.
+    Getter(blaze_lir::BuildError),
 }
 
 impl fmt::Display for CodeRecordError {
@@ -332,28 +335,30 @@ impl fmt::Display for CodeRecordError {
             CodeRecordError::Store(why) => why.fmt(f),
             CodeRecordError::Entry(why) => why.fmt(f),
             CodeRecordError::NoTabledFn { tabled } => write!(f, "a stored code record declares an instance of fn {:#x}, which the program does not have: the key missed an input (rule 21)", tabled.0),
+            CodeRecordError::Getter(why) => write!(f, "the thread-local getter did not build: {why}"),
         }
     }
 }
 
 impl core::error::Error for CodeRecordError {}
 
-/// One instance's entry: `built` (the instance's LIR and its reference tables) emitted for
-/// `isa` with its references named by `names`, sealed and encoded, then `declared`. The unit
-/// the parent makes for a stub's first call.
+/// One instance's entry: `func` (an instance's built LIR, blaze-build `Built::func`, or the
+/// thread-local getter's) emitted for `isa` with its references named by `names` (from the
+/// instance's reference tables), sealed and encoded, then `declared`. The unit the parent
+/// makes for a stub's first call.
 ///
 /// The form, little-endian: [`ENTRY_MAGIC`], [`ENTRY_FORM`] (4), the bytes of instructions at
 /// the code's start (4), the record's length (4) and bytes (blaze-code `Sealed::encode`), the
 /// count of declared instances (4), and each: its tabled fn's key (16), its name's length (4)
 /// and bytes, sorted by (tabled, name) and each once.
 pub fn make_entry<'a>(
-    built: &Built<Global>,
+    func: &Func<Global>,
     names: &InstanceNames<'_>,
     declared: &mut AVec<'_, Declared<'_>>,
     isa: Isa,
     alloc: Alloc<'a>,
 ) -> Result<AVec<'a, u8>, CodeRecordError> {
-    let (record, insts) = emit_record_measured(built.func.view(), names, isa, alloc).map_err(CodeRecordError::Emit)?;
+    let (record, insts) = emit_record_measured(func.view(), names, isa, alloc).map_err(CodeRecordError::Emit)?;
     // No landing pads or unwind word yet: the emitter refuses `Invoke` and `Resume` (piece 11).
     let sealed = record.seal().map_err(CodeRecordError::Seal)?;
     let mut code: AVec<'_, u8> = Vec::new_in(alloc);
@@ -374,6 +379,37 @@ pub fn make_entry<'a>(
         out.extend_from_slice(d.name);
     }
     Ok(out)
+}
+
+const GETTER_DOMAIN: &str = "blaze-ladder thread-local getter body 1";
+
+/// How a walk's [`Met`] names the thread-local getter.
+pub const GETTER_NAME: &str = "the thread-local getter";
+
+/// The thread-local getter's own key parts. One function a program, made by blaze-build's
+/// `tls::getter` from no text: its body digest is that generator's form (the domain, stepped
+/// when `tls::getter` changes) and the C functions it calls (`tls::IMPORTS`); it has no ground
+/// facts. Every record that touches a thread-local calls it by [`tls_getter_symbol`], so it is
+/// a program part the record walk makes once (run.rs `build_from`), not an instance a caller
+/// declares.
+pub fn getter_parts() -> KeyParts {
+    let mut body = Hasher::new(GETTER_DOMAIN);
+    for name in tls::IMPORTS {
+        body.part(name.as_bytes());
+    }
+    let mut ground = Hasher::new(GETTER_DOMAIN);
+    ground.part(b"no ground facts");
+    KeyParts { symbol: tls_getter_symbol(), body: body.finish(), ground: ground.finish() }
+}
+
+/// The thread-local getter's entry: its LIR emitted with its calls named as the C functions
+/// they are, declaring no instance.
+pub fn make_getter_entry<'a>(isa: Isa, alloc: Alloc<'a>) -> Result<AVec<'a, u8>, CodeRecordError> {
+    let func = tls::getter(Global).map_err(CodeRecordError::Getter)?;
+    let funcs = tls::IMPORTS.map(Callee::C);
+    let names = InstanceNames { funcs: &funcs, statics: &[], vtables: &[], tls: &[] };
+    let mut declared: AVec<'_, Declared<'_>> = Vec::new_in(alloc);
+    make_entry(&func, &names, &mut declared, isa, alloc)
 }
 
 /// Why an entry's bytes do not read.
@@ -592,6 +628,20 @@ pub struct RecordRun<'s> {
 impl<'s> RecordRun<'s> {
     pub fn new(store: &'s mut dyn CodeStore, builder: Builder) -> RecordRun<'s> {
         RecordRun { store, builder, met: std::vec::Vec::new() }
+    }
+
+    /// The thread-local getter's entry ([`getter_parts`]): found in the store, or made and put;
+    /// met as [`GETTER_NAME`].
+    pub fn getter(&mut self) -> Result<(), CodeRecordError> {
+        let parts = getter_parts();
+        let key = code_key(&parts, &self.builder);
+        let found = self.store.get(key).map_err(CodeRecordError::Store)?.is_some();
+        if !found {
+            let entry = make_getter_entry(self.builder.isa, Alloc::global())?;
+            self.store.put(key, &entry).map_err(CodeRecordError::Store)?;
+        }
+        self.met.push(Met { symbol: parts.symbol, key, parts, function: Box::from(GETTER_NAME), found });
+        Ok(())
     }
 
     /// Instances whose entries were made by this walk.

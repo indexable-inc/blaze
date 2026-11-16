@@ -1,13 +1,23 @@
 //! The outline lane's oracle: every `.rs` file under the directories given is outlined by the
-//! path that is the definition ([`reference`]) and by the path being built to replace it
-//! ([`candidate`]), and the two outlines are compared row for row (`Outline`'s `==`: entries
-//! with their keys and digests, attributes, findings and their messages, flags). A candidate may
-//! refuse a text by type; a refusal is counted by its kind and is never a difference. The run
-//! ends with one line of counts and exits 1 when any file differs.
+//! definition ([`reference`]: every body parsed with the rest, `Bodies::Parsed`) and by the
+//! path under test ([`candidate`]: `outline`, bodies left unparsed where the grammar can), and
+//! the two are compared: every row with its keys and digests, every attribute, the flags and
+//! what is derived from them equal, and each finding of the candidate one of the definition's.
+//! A candidate may refuse a text by type; a refusal is counted by its kind and is never a
+//! difference. Three more lines say what no comparison of two paths can:
+//!
+//! - "every key of the candidate, folded": one digest over every key the candidate made, in
+//!   order. A change that must move no key prints the same fold before and after (the path the
+//!   candidate replaced, a walk of the parser's events over a text with its `fn` bodies cut
+//!   out, was deleted 2026-11-16 at folds 3e0382dd16a6 for library/ and, for tempo's packages,
+//!   f516be093fef read as 2024 and 7b750af10a10 in each package's own edition).
+//! - "tokens handed over": each file written again from its tokens (tests/render) and outlined
+//!   from the tokens (`outline_tokens`) and from the text written: equal, or the run fails.
+//!
+//! The run ends with one line of counts and exits 1 when any file differs.
 //!
 //! To put a new path under the oracle, change the body of [`candidate`] and [`Refused`]: the
-//! rest stays. As it stands the candidate is the cold path of `outline` (split into top-level
-//! parts, each walked into the file's one outline) against the whole-file walk.
+//! rest stays.
 //!
 //! Arguments: directories, and `@file` for a file of directories, one a line. A file that is
 //! not UTF-8 is no source file: left out and counted.
@@ -16,7 +26,7 @@
 
 use std::{alloc::Global, collections::BTreeMap, path::PathBuf, time::Instant};
 
-use blaze_file_items::{Bodies, Outline, TokenColumns, chain_at, outline_rows, outline_tokens, outline_with};
+use blaze_file_items::{Bodies, Outline, TokenColumns, chain_at, outline, outline_tokens, outline_with};
 use blaze_own::Alloc;
 use blaze_surface::{Edition, ErrorOrigin, ItemIndex};
 
@@ -36,7 +46,7 @@ struct TokensProof {
 
 /// One file of the tokens proof: `text` written again from its tokens (tests/render: one line
 /// feed for every stretch between two tokens, comments gone), then outlined from the tokens
-/// handed over (`outline_tokens`) and from the text written (`outline_rows`). Equal is every
+/// handed over (`outline_tokens`) and from the text written (`outline`). Equal is every
 /// row, key, digest, attribute and flag, what is derived from them, and the parser's findings;
 /// the lexer's findings are the text path's alone.
 fn tokens_proof(
@@ -66,7 +76,7 @@ fn tokens_proof(
             return;
         }
     };
-    let from_text = outline_rows(again, edition, Alloc::global());
+    let from_text = outline(again, edition, Alloc::global());
     let parser_said = |of: &Outline<'_>| {
         let all: Vec<(u32, u32, String)> = of
             .errors()
@@ -102,9 +112,9 @@ enum Refused {
     TooLong,
 }
 
-/// The definition: the whole file walked at once from the parser's events.
+/// The definition: the outline with every body parsed with the rest.
 fn reference(text: &str, edition: Edition) -> Outline<'static> {
-    outline_with(text, edition, Bodies::Skipped, Alloc::global())
+    outline_with(text, edition, Bodies::Parsed, Alloc::global())
 }
 
 /// The path under test.
@@ -112,7 +122,7 @@ fn candidate(text: &str, edition: Edition) -> Result<Outline<'static>, Refused> 
     if u32::try_from(text.len()).is_err() {
         return Err(Refused::TooLong);
     }
-    Ok(outline_rows(text, edition, Alloc::global()))
+    Ok(outline(text, edition, Alloc::global()))
 }
 
 /// The edition of the package a file is in, for `--own-edition`: the `edition` of the nearest
@@ -180,6 +190,19 @@ fn own_edition(file: &std::path::Path, known: &mut BTreeMap<PathBuf, Edition>) -
     edition
 }
 
+/// Every finding of an outline by where it is, whose it is and what it says, sorted.
+fn said(of: &Outline<'_>) -> Vec<(u32, u32, u8, String)> {
+    let mut all: Vec<(u32, u32, u8, String)> =
+        of.errors().iter().map(|error| (error.range.start, error.range.end, error.origin as u8, of.message(error).to_owned())).collect();
+    all.sort();
+    all
+}
+
+/// Whether each finding of `few` is one of `many`, counted: two of a kind need two.
+fn within(few: &[(u32, u32, u8, String)], many: &[(u32, u32, u8, String)]) -> bool {
+    few.iter().all(|one| few.iter().filter(|it| *it == one).count() <= many.iter().filter(|it| *it == one).count())
+}
+
 /// Whether two outlines of `text` are equal in all but their findings: every row with its keys
 /// and digests, every attribute, the flags, and what is derived from them.
 fn rows_equal(old: &Outline<'_>, new: &Outline<'_>, text: &str) -> bool {
@@ -241,7 +264,6 @@ fn main() {
     let (mut read, mut not_utf8, mut bytes, mut entries, mut findings) = (0usize, 0usize, 0usize, 0usize, 0usize);
     let mut keys = blaze_ids::Hasher::new("blaze-file-items oracle: every key of the candidate");
     let (mut equal, mut different, mut refused_bytes) = (0usize, 0usize, 0usize);
-    let (mut findings_only, mut rows_differ) = (0usize, 0usize);
     let mut editions: BTreeMap<PathBuf, Edition> = BTreeMap::new();
     let mut by_edition = [0usize; 4];
     let mut refused: BTreeMap<Refused, usize> = BTreeMap::new();
@@ -289,47 +311,14 @@ fn main() {
                 *refused.entry(why).or_default() += 1;
                 refused_bytes += text.len();
             }
-            Ok(new) if new == old && derived_equal(&old, &new, &text) => equal += 1,
+            // Equal: every row, attribute, flag and digest, and what is derived from them; and
+            // each finding of the candidate is one of the definition's (a body left unparsed
+            // gives up the parser's findings inside it and nothing else: the lexer's are all
+            // there, the whole text being lexed either way).
+            Ok(new) if rows_equal(&old, &new, &text) && within(&said(&new), &said(&old)) => equal += 1,
             Ok(new) => {
-                // Not the reference's outline. The reference reads the text with some `{ .. }`
-                // groups cut out by its skeleton, a second reader of headers (the first `{`
-                // after `fn` and a name), and loses what the cut held where the grammar does
-                // not read that group as a `fn` body left unparsed. The candidate cuts nothing,
-                // so there it must be the outline of the text with every body parsed
-                // (`Bodies::Parsed`, the definition the skipping walk is tested against): every
-                // row, attribute, flag and digest equal to that, and its findings the
-                // reference's and no more than the full parse's. Counted in two classes, by
-                // whether a row moved or the findings alone; anything else is a difference.
-                let full = outline_with(&text, edition, Bodies::Parsed, Alloc::global());
-                let said = |of: &Outline<'_>| {
-                    let mut all: Vec<(u32, u32, u8, String)> = of
-                        .errors()
-                        .iter()
-                        .map(|error| (error.range.start, error.range.end, error.origin as u8, of.message(error).to_owned()))
-                        .collect();
-                    all.sort();
-                    all
-                };
-                let (least, got, most) = (said(&old), said(&new), said(&full));
-                let within = |few: &[(u32, u32, u8, String)], many: &[(u32, u32, u8, String)]| {
-                    few.iter().all(|one| few.iter().filter(|it| *it == one).count() <= many.iter().filter(|it| *it == one).count())
-                };
-                let as_full = rows_equal(&new, &full, &text) && within(&least, &got) && within(&got, &most);
-                let class = match (as_full, rows_equal(&old, &new, &text)) {
-                    (true, true) => &mut findings_only,
-                    (true, false) => &mut rows_differ,
-                    (false, _) => &mut different,
-                };
-                *class += 1;
-                if *class <= 8 {
-                    println!(
-                        "{}",
-                        match (as_full, rows_equal(&old, &new, &text)) {
-                            (true, true) => "AS THE FULL PARSE, findings alone:",
-                            (true, false) => "AS THE FULL PARSE, a row too:",
-                            (false, _) => "A DIFFERENCE:",
-                        }
-                    );
+                different += 1;
+                if different <= 8 {
                     // The first row that differs, both ways, so a difference names its item.
                     let at = old.items().iter().zip(new.items()).position(|(a, b)| a != b);
                     println!(
@@ -373,9 +362,6 @@ fn main() {
         by_edition[1],
         by_edition[2],
         by_edition[3]
-    );
-    println!(
-        "not the reference's but the full parse's, where the reference's skeleton cut a group the grammar does not read as a `fn` body left unparsed: {findings_only} files in the findings alone, {rows_differ} in a row too"
     );
     println!(
         "oracle: {read} files, {:.1} MB, {entries} entries, {findings} findings ({not_utf8} files not UTF-8 left out); {equal} equal, {different} different, {} refused ({:.1} MB); reference {:.1} ms, candidate {:.1} ms on one thread",

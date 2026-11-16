@@ -49,6 +49,7 @@ pub mod events;
 pub mod first_call;
 pub mod head;
 pub mod heat;
+pub mod judge;
 pub mod parent;
 pub mod plan;
 pub mod postings;

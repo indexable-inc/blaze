@@ -58,6 +58,10 @@ exclude = [
     # harness, its own workspace with its own lock: a macOS app and daemon blaze does not build
     # (crates/harness/README.md).
     "crates/harness",
+    # Experimental (2026-11-16, docs/v2/plan/design/hvbox.md): a Hypervisor.framework sandbox for
+    # build steps on macOS. Its own workspace with its own lock; nothing depends on it and
+    # nothing selects it.
+    "crates/blaze-hvbox",
     "demo",
     "harness",
     # The standard library's own workspace (docs/toolchain.md).

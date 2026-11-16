@@ -46,9 +46,9 @@ fn two_locals_and_a_call(panic: crate::Panic) -> String {
     blaze_lir::print(built.func.view())
 }
 
-/// The numbers of the `slotN` words in `line`, in order.
+/// The numbers of the `ssN` slot words in `line` (the printer's slot form), in order.
 fn slots_in(line: &str) -> impl Iterator<Item = u32> + '_ {
-    line.split(|c: char| !c.is_alphanumeric()).filter_map(|w| w.strip_prefix("slot")).filter_map(|n| n.parse().ok())
+    line.split(|c: char| !c.is_alphanumeric()).filter_map(|w| w.strip_prefix("ss")).filter_map(|n| n.parse().ok())
 }
 
 /// Under `Unwind`, `f()` is an `invoke` whose one `cleanup` block makes exactly two calls (the
@@ -70,15 +70,21 @@ fn a_call_that_may_unwind_drops_both_locals_in_reverse_order() {
     };
     assert_eq!(body.iter().filter(|l| l.contains("call")).count(), 2, "two drops in the cleanup:\n{text}");
     assert!(body.last().is_some_and(|l| l.contains("resume")), "the cleanup ends in resume:\n{text}");
+    // Each drop's argument (`call refN, sN, (vK)`) traced to its `vK = slot_addr ssM` line,
+    // wherever it is (the cleanup reuses addresses computed before the invoke).
     let mut dropped: Vec<u32, Global> = Vec::new_in(Global);
-    for line in body.iter().filter(|l| l.contains("slot_addr")) {
-        for s in slots_in(line) {
-            if !dropped.contains(&s) {
-                dropped.push(s);
-            }
-        }
+    for line in body.iter().filter(|l| l.contains("call")) {
+        let arg = line.rsplit('(').next().and_then(|a| a.split(')').next()).unwrap_or("").trim();
+        let def = format!("{arg} = ");
+        let slot = text
+            .lines()
+            .map(str::trim)
+            .find(|l| l.starts_with(def.as_str()) && l.contains("slot_addr"))
+            .and_then(|l| slots_in(l).next())
+            .unwrap_or_else(|| panic!("the drop's argument {arg} is no slot_addr: {body:?}\n{text}"));
+        dropped.push(slot);
     }
-    assert_eq!(dropped.len(), 2, "the cleanup addresses two slots:\n{text}");
+    assert_eq!(dropped.len(), 2, "the cleanup addresses two slots: {body:?}\n{text}");
     assert!(dropped[0] > dropped[1], "b (the later slot) drops first:\n{text}");
     let abort = two_locals_and_a_call(crate::Panic::Abort);
     assert!(!abort.contains("invoke") && !abort.contains(" cleanup:"), "no landing block under abort:\n{abort}");

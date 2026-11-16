@@ -102,6 +102,15 @@ pub trait SourceTexts<'a> {
         let _ = (krate, def, call, alloc);
         Err(REFUSED)
     }
+
+    /// The environment the crate at `krate` is compiled in ([`crate::crate_env::CrateEnv`]:
+    /// one per unit, made by `UnitCrates::env_of`): what `env!` and `option_env!` read, the
+    /// same for its items and its bodies. `None`: this source has none, and every `env!` of
+    /// the crate is refused by name, never answered unset.
+    fn crate_env(&self, krate: usize) -> Option<&crate::crate_env::CrateEnv<'a>> {
+        let _ = krate;
+        None
+    }
 }
 
 /// One crate to resolve. Its index in the slice given to [`resolve_crates`] is its
@@ -1592,8 +1601,12 @@ struct Host<'r, 'a, S> {
 const REFUSED: HostError = HostError { ask: HostAsk::ProcMacro, why: HostWhy::Refused };
 
 impl<'a, S: SourceTexts<'a>> ExpandCx for Host<'_, 'a, S> {
-    fn env(&self, _: &str) -> Result<Option<&str>, HostError> {
-        Ok(None)
+    /// The crate's environment ([`SourceTexts::crate_env`]), the one a body of the crate reads
+    /// too; a source without one, or a variable cargo sets whose value is not known, is refused
+    /// (rule 3), never answered unset.
+    fn env(&self, name: &str) -> Result<Option<&str>, HostError> {
+        let refused = HostError { ask: HostAsk::Env, why: HostWhy::Refused };
+        self.sources.crate_env(self.krate).ok_or(refused)?.get(name).map_err(|_| refused)
     }
 
     /// A predicate the cfg does not read is false, as the lowering takes it.

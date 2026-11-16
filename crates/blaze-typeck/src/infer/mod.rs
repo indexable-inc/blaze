@@ -583,7 +583,17 @@ impl<'a> TypeCtx for InferCtx<'a> {
             TyView::Opaque(k, l) => {
                 let d = self.terms.bdef(SDef(k.0));
                 let l = self.blist(l);
-                self.terms.cx.tys.alias(AliasKind::Opaque, d, l)
+                // RIGID: to the checker an opaque type is itself (the Reference, "Abstract
+                // return types": "a caller of the function is not permitted to know the
+                // concrete type"; the body that defines it has a variable instead:
+                // rules/opaque_def.rs). A non-rigid alias is unified LAZILY (the pair is
+                // deferred and counted as related), so a variable was never bound to an opaque
+                // (`let out = mk();` left `out` unknown, and `&mut out` then met `&mut dyn Tr`
+                // by plain unification, E0308 instead of the unsizing coercion), and an
+                // opaque "equalled" any type until the deferred pair failed. Its auto traits
+                // are still read from its hidden type (blaze-solve structural.rs matches the
+                // alias rigid or not).
+                self.terms.cx.tys.rigid_alias(AliasKind::Opaque, d, l)
             }
             TyView::Infer(v) | TyView::ConstInfer(v) => {
                 let kind = match v.kind {

@@ -309,6 +309,133 @@ fn body_checked<'n, S: NamesSource<'n>>(
     outcome(&check_body(&mut records, &body, &scope))
 }
 
+/// The terms under `roots` in `t` as text, in preorder, each node by its own content (never by
+/// its index: two stores number the same term differently). A work list; a diagnosis aid only.
+fn terms(t: blaze_typeck::PTys<'_>, roots: &[blaze_typeck::PTy]) -> String {
+    use blaze_typeck::PNode;
+    let mut out = String::new();
+    let mut work: Vec<blaze_typeck::PTy> = roots.iter().rev().copied().collect();
+    while let Some(p) = work.pop() {
+        let node = match t.node(p) {
+            Ok(node) => node,
+            Err(e) => {
+                out.push_str(&format!(" <no node: {e:?}>"));
+                continue;
+            }
+        };
+        let list = |l| t.list(l).map(|s| s.to_vec()).unwrap_or_default();
+        let (shown, kids): (String, Vec<blaze_typeck::PTy>) = match node {
+            PNode::Tuple(l) => ("Tuple".to_string(), list(l)),
+            PNode::Ref(m, x) => (format!("Ref({m:?})"), vec![x]),
+            PNode::Ptr(m, x) => (format!("Ptr({m:?})"), vec![x]),
+            PNode::Array(a, b) => ("Array".to_string(), vec![a, b]),
+            PNode::Slice(a) => ("Slice".to_string(), vec![a]),
+            PNode::Pat(a, l) => ("Pat".to_string(), [vec![a], list(l)].concat()),
+            PNode::Adt(k, l) => (format!("Adt({k:?})"), list(l)),
+            PNode::FnDef(k, l) => (format!("FnDef({k:?})"), list(l)),
+            PNode::FnPtr(l, h) => (format!("FnPtr({h:?})"), list(l)),
+            PNode::Closure { owner, ordinal, args } => (format!("Closure({owner:?}, {ordinal})"), list(args)),
+            PNode::Future(e, a, b) => (format!("Future({e:?})"), vec![a, b]),
+            PNode::Alias { trait_, name, args } => (format!("Alias({trait_:?}, {name:?})"), list(args)),
+            PNode::Opaque(k, l) => (format!("Opaque({k:?})"), list(l)),
+            PNode::ConstValue { ty, bits } => (format!("ConstValue({bits})"), vec![ty]),
+            PNode::Dynamic(l) => ("Dynamic".to_string(), list(l)),
+            PNode::ExTrait(k, l) => (format!("ExTrait({k:?})"), list(l)),
+            PNode::ExProj { trait_, name, args, term } => (format!("ExProj({trait_:?}, {name:?})"), [list(args), vec![term]].concat()),
+            other => (format!("{other:?}"), Vec::new()),
+        };
+        out.push_str(&format!(" {shown}/{}", kids.len()));
+        work.extend(kids.into_iter().rev());
+    }
+    out
+}
+
+/// Every head `store` holds, as text by the question that reads it (`FnSig <key>`, `Adt <key>`,
+/// `ImplHeader <key>`, `Predicates <key>`): the parts the checker's read-list digest covers,
+/// its terms by content ([`terms`]), and the item's text as `names` holds it. For telling
+/// which head two sources made differently (`FRONT2_RECORDS_DIFF`).
+fn heads_dump<'n, S: NamesSource<'n>>(names: S, keys: &Keys, store: &Store<'n>) -> std::collections::BTreeMap<String, String> {
+    use blaze_typeck::PClause;
+    let t = store.tys.view();
+    let text = |k: blaze_typeck::ItemKey| -> String {
+        let lib = keys.library_in(names, k);
+        let text = lib.and_then(|lib| names.text_of(lib));
+        let shown: String = text.map(|t| t.impl_header.unwrap_or(t.text).chars().take(700).collect()).unwrap_or_default();
+        format!("names key {:?} place {:?} text `{shown}`", lib.map(|l| format!("{l:x}")), lib.and_then(|l| names.place_of(l)).map(|p| (p.krate, p.at, p.item)))
+    };
+    let mut out = std::collections::BTreeMap::new();
+    for (k, f) in store.fns.iter() {
+        let shown: String = f.text.chars().take(700).collect();
+        out.insert(
+            format!("FnSig {k:?}"),
+            format!(
+                "parent {} own {} declared {} self_param {} header {:?}\n  inputs:{}\n  output:{}\n  fn text `{shown}`\n  {}",
+                f.parent,
+                f.own,
+                f.declared,
+                f.self_param,
+                f.header,
+                terms(t, &f.inputs),
+                terms(t, &[f.output]),
+                text(*k)
+            ),
+        );
+    }
+    // The same heads by their handles' numbers in the store's table (`RAW <question>`): what
+    // two stores that interned their terms in different orders hold differently.
+    for (k, f) in store.fns.iter() {
+        out.insert(format!("RAW FnSig {k:?}"), format!("inputs {:?} output {:?}", f.inputs, f.output));
+    }
+    for (k, a) in store.adts.iter() {
+        out.insert(format!("RAW Adt {k:?}"), format!("fields {:?}", a.fields));
+    }
+    for (k, i) in store.impls.iter() {
+        out.insert(format!("RAW ImplHeader {k:?}"), format!("self {:?} trait args {:?} assoc {:?}", i.self_ty, i.trait_args, i.assoc));
+    }
+    for (k, p) in store.preds.iter() {
+        out.insert(format!("RAW Predicates {k:?}"), format!("{:?}", p.clauses));
+    }
+    for (k, c) in store.ctors.iter() {
+        out.insert(format!("FnSig {k:?}"), format!("ctor of {:?} generics {}\n  inputs:{}\n  output:{}", c.adt, c.generics, terms(t, &c.inputs), terms(t, &[c.output])));
+    }
+    for (k, a) in store.adts.iter() {
+        let fields: Vec<String> = a.fields.iter().map(|f| format!("{:?}:{}", f.name, terms(t, &[f.ty]))).collect();
+        out.insert(format!("Adt {k:?}"), format!("kind {:?} generics {}\n  variants {:?}\n  fields {}\n  {}", a.kind, a.generics, a.variants, fields.join("\n         "), text(*k)));
+    }
+    for (k, i) in store.impls.iter() {
+        let args = t.list(i.trait_args.list()).map(|s| s.to_vec()).unwrap_or_default();
+        let assoc: Vec<String> = i.assoc.iter().map(|(n, ty)| format!("{n:?}:{}", terms(t, &[*ty]))).collect();
+        out.insert(
+            format!("ImplHeader {k:?}"),
+            format!(
+                "generics {} polarity {:?} trait {:?}\n  self:{}\n  trait args:{}\n  assoc {}\n  {}",
+                i.generics,
+                i.polarity,
+                i.trait_,
+                terms(t, &[i.self_ty]),
+                terms(t, &args),
+                assoc.join("\n        "),
+                text(*k)
+            ),
+        );
+    }
+    for (k, p) in store.preds.iter() {
+        let clauses: Vec<String> = p
+            .clauses
+            .iter()
+            .map(|c| match c {
+                PClause::Trait { trait_, args } => format!("Trait {trait_:?}:{}", terms(t, &t.list(*args).map(|s| s.to_vec()).unwrap_or_default())),
+                PClause::Projection { trait_, args, name, term } => {
+                    format!("Projection {trait_:?} {name:?}:{} =={}", terms(t, &t.list(*args).map(|s| s.to_vec()).unwrap_or_default()), terms(t, &[*term]))
+                }
+                PClause::Const { cond, args } => format!("Const {cond:?}:{}", terms(t, &t.list(*args).map(|s| s.to_vec()).unwrap_or_default())),
+            })
+            .collect();
+        out.insert(format!("Predicates {k:?}"), format!("conds {}\n  {}\n  {}", p.conds.len(), clauses.join("\n  "), text(*k)));
+    }
+    out
+}
+
 /// A reader over `kept` alone: its log, its frame and itself live for the test (leaked: a
 /// `Records` borrows itself for its whole life).
 fn reader(keys: &'static [CrateItemKey], crate_names: &'static [&'static str], kept: Kept) -> (&'static Records<'static>, &'static blaze_mem::Frame) {
@@ -350,7 +477,7 @@ fn records_answer_what_the_solved_names_answer() {
         }
         kept
     };
-    let (kept, kept_planted, kept_no_core, chosen, root, solved_items, solved_langs, solved_impls, solved_candidates, kept_bodies, kept_bodies_planted, kept_question, kept_question_text, solved_bodies, io) = {
+    let (kept, kept_planted, kept_no_core, chosen, root, solved_items, solved_langs, solved_impls, solved_candidates, kept_bodies, kept_bodies_planted, kept_question, kept_question_text, solved_bodies, io, solved_heads) = {
         let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
         let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
         let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command's frame");
@@ -394,6 +521,8 @@ fn records_answer_what_the_solved_names_answer() {
             make(&names, None),
             solved_bodies,
             io,
+            // The solved heads as text, only when a diff file is asked for.
+            std::env::var_os("FRONT2_RECORDS_DIFF").map(|_| heads_dump(&names, &front.keys, &store)),
         )
     };
 
@@ -460,7 +589,37 @@ fn records_answer_what_the_solved_names_answer() {
         if let Some(path) = std::env::var_os("FRONT2_RECORDS_DIFF")
             && (!errors.is_empty() || got != solved_bodies[i])
         {
-            let whole = format!("body {i} ({key:x})\nFILED BY THE RECORDS:\n{}\nOVER RECORDS:\n{got}\nOVER THE SOLVED NAMES:\n{}\n", errors.join("\n"), solved_bodies[i]);
+            // The heads the two stores hold differently, both texts: a read's digest that
+            // differs is one of these.
+            let mut heads = String::new();
+            if let Some(solved) = &solved_heads {
+                let over_records = heads_dump(body_records, &body_front.keys, &store);
+                // The digest the read list of `outcome` holds for `question` (`Kind ItemKey(n)`).
+                let digest_in = |outcome: &str, question: &str| -> Option<String> {
+                    let (kind, key) = question.split_once(' ')?;
+                    let row = format!("({kind}({key}), ");
+                    let at = outcome.find(&row)? + row.len();
+                    Some(outcome[at..].chars().take_while(|c| c.is_ascii_digit()).collect())
+                };
+                for (question, text) in over_records.iter().filter(|(q, _)| !q.starts_with("RAW ")) {
+                    let Some(s) = solved.get(question) else { continue };
+                    if s != text {
+                        heads.push_str(&format!("HEAD {question}: THE CONTENT DIFFERS\n OVER RECORDS: {text}\n SOLVED: {s}\n"));
+                    }
+                    let (a, b) = (digest_in(&got, question), digest_in(&solved_bodies[i], question));
+                    if a != b {
+                        let raw = format!("RAW {question}");
+                        heads.push_str(&format!(
+                            "READ {question}: digest over records {a:?}, solved {b:?}; content equal: {}\n CONTENT: {text}\n HANDLES OVER RECORDS: {:?}\n HANDLES SOLVED: {:?}\n",
+                            s == text,
+                            over_records.get(&raw),
+                            solved.get(&raw)
+                        ));
+                    }
+                }
+                heads.push_str(&format!("HEADS: {} over records, {} solved\n", over_records.len(), solved.len()));
+            }
+            let whole = format!("body {i} ({key:x})\nFILED BY THE RECORDS:\n{}\n{heads}OVER RECORDS:\n{got}\nOVER THE SOLVED NAMES:\n{}\n", errors.join("\n"), solved_bodies[i]);
             std::fs::write(&path, whole).expect("writing FRONT2_RECORDS_DIFF");
         }
         assert!(errors.is_empty(), "body {i} ({key:x}): the records filed {errors:?}");

@@ -717,10 +717,10 @@ impl blaze_scope::CellsSeam for PrintShadows {
         eprintln!(
             "cells seam: {krate}: old fill {:.2} ms, cells load {:.2} ms + solve {:.2} ms; bindings equal {}, differ {}, cells unknown {}; \
              old errors {}, cells failed {}, outside {}, undecided {}; dep reads {}, dep absent {}; \
-             calls the fill did not expand {} (first {:?}); cells {}, stalls {}",
+             calls the fill did not expand {} (first {:?}); cells {}, stalls {}; r6 errors {}, speculated {}",
             ms(s.old_fill), ms(s.cells_load), ms(s.cells_solve), s.equal, s.differ, s.unknown,
             s.old_errors, s.failed, s.outside, s.undecided, s.dep_reads, s.dep_absent,
-            s.not_expanded, s.first_not_expanded, s.cells, s.stalls,
+            s.not_expanded, s.first_not_expanded, s.cells, s.stalls, s.r6_errors, s.speculated,
         );
         let w = s.written;
         eprintln!(

@@ -173,6 +173,8 @@ pub struct BodyWorld<'w, 'n, S = &'n Names<'n>> {
     pub spell: &'w Spelling<'w>,
     /// The traits in scope at the body's module, sorted (checker keys).
     pub traits: &'w [ItemKey],
+    /// The traits in scope at the body's blocks whose list is not `traits` (a block's `use`).
+    pub blocks: &'w super::block_traits::BlockTraits,
     pub fills: RefCell<Vec<Fill, Global>>,
     pub gaps: RefCell<Vec<Gap, Global>>,
 }
@@ -427,8 +429,15 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
         Ok(extra.assoc.iter().find(|a| a.name == name).map(|a| AssocItem { container, item: a.item, kind: AssocKind::Type }))
     }
 
-    fn traits_in_scope(&self, _: Seal, _: ScopeId) -> Fetch<&[ItemKey]> {
-        Ok(self.traits)
+    /// The module's traits, or the block's when a `use` of the block or of one around it brings
+    /// in more ([`super::block_traits`]); a block whose imports are not known is the gap
+    /// naming the import.
+    fn traits_in_scope(&self, _: Seal, scope: ScopeId) -> Fetch<&[ItemKey]> {
+        match self.blocks.at(scope.0) {
+            super::block_traits::InScope::Module => Ok(self.traits),
+            super::block_traits::InScope::Traits(t) => Ok(t),
+            super::block_traits::InScope::Refused(gap) => self.gap(Gap::Local(gap)),
+        }
     }
 
     fn resolve_path(&self, _: Seal, scope: ScopeId, _: PathIdx, segments: &[Name]) -> Fetch<Option<PathRes>> {
@@ -449,14 +458,30 @@ impl<'n, S: NamesSource<'n>> World for BodyWorld<'_, 'n, S> {
             Some(ItemDetail::Fn { .. }) => Ok(Some(Def::Fn(checker_of(lib)))),
             Some(ItemDetail::Struct) => Ok(Some(Def::Adt(checker_of(lib)))),
             Some(_) => self.gap(Gap::Lang(item, "its item is of a kind a path to it is not answered for")),
-            // A lang fn of a trait (`Try::branch`, which `?` calls): the fn the trait's head
-            // files under its name.
+            // A lang item that is a member: the pinned library marks fns inside a trait
+            // (`Try::branch`, which `?` calls; `Iterator::next`) and fns inside an inherent impl
+            // (`RangeInclusive::new`, which `a..=b` calls, in `impl<Idx> RangeInclusive<Idx>`;
+            // `Pin::new_unchecked`, in `impl<Ptr: Deref> Pin<Ptr>`). Each is the fn its owner's
+            // record files under the member's name: a trait's head, an impl's header.
             None => {
                 if let Some((owner, name)) = self.resolver().member_of(lib) {
-                    let Some(t) = self.store.maps.traits.get(&owner) else { return self.fill(Fill::Store(Want::Head(owner))) };
-                    return match t.fns.iter().find(|(n, _)| *n == Name::of(name)) {
-                        Some(&(_, f)) => Ok(Some(Def::Fn(f))),
-                        None => self.gap(Gap::Fill(FillError::UnknownKey(checker_of(lib)))),
+                    let name = Name::of(name);
+                    return match self.resolver().detail(owner) {
+                        Some(ItemDetail::Trait) => {
+                            let Some(t) = self.store.maps.traits.get(&owner) else { return self.fill(Fill::Store(Want::Head(owner))) };
+                            match t.fns.iter().find(|(n, _)| *n == name) {
+                                Some(&(_, f)) => Ok(Some(Def::Fn(f))),
+                                None => self.gap(Gap::Fill(FillError::UnknownKey(checker_of(lib)))),
+                            }
+                        }
+                        Some(ItemDetail::Impl) => {
+                            let Some(i) = self.store.impls.get(&checker_of(owner)) else { return self.fill(Fill::Store(Want::Impl(owner))) };
+                            match i.fns.iter().find(|(n, _)| *n == name) {
+                                Some(&(_, f)) => Ok(Some(Def::Fn(f))),
+                                None => self.gap(Gap::Lang(item, "the impl holds no fn of its `#[lang]` name")),
+                            }
+                        }
+                        _ => self.gap(Gap::Lang(item, "its item is a member of neither a trait nor an impl")),
                     };
                 }
                 match self.enum_of(lib) {

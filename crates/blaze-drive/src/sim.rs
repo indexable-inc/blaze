@@ -1914,3 +1914,114 @@ fn a_failed_crate_leaves_its_dependents_without_a_record() {
         same_as_fresh(tape, &fixed, &store, &ended)
     });
 }
+
+// --- One pointer a (tool, shape) (pointers.rs) -------------------------------------------------
+
+use crate::pointers::{self, PointerName};
+
+/// The checkout's pointer folder as blaze-cli keeps it: a write removes what
+/// `pointers::evicted` names; the stamp is the count of writes (a file's modified time).
+#[derive(Default)]
+struct Pointers {
+    held: BTreeMap<PointerName, (u64, StdVec<u8>)>,
+    writes: u64,
+}
+
+impl Pointers {
+    fn write(&mut self, name: PointerName, bytes: StdVec<u8>, plant: pointers::Plant) {
+        let mut held: StdVec<(PointerName, u64)> = self.held.iter().map(|(name, (at, _))| (*name, *at)).collect();
+        let mut gone = Vec::new_in(Alloc::global());
+        pointers::evicted(&mut held, name, plant, &mut gone);
+        for name in gone.iter() {
+            self.held.remove(name);
+        }
+        self.writes += 1;
+        self.held.insert(name, (self.writes, bytes));
+    }
+}
+
+/// One command of the build `tool`: it reads its own pointer, answers and writes it. A command
+/// with no pointer has no leaf table either (they are one file): every file is new to it.
+fn command(
+    tape: &Tape,
+    world: &World,
+    before: Option<&World>,
+    store: &mut Store,
+    kept: &mut Pointers,
+    (tool, ask): (&'static [u8], Ask<'static>),
+    plant: pointers::Plant,
+) -> Result<(Answer, Ended), Broke> {
+    let name = PointerName::planted(config(1, tool).tool, &crate::request::shape_of(&ask), plant);
+    let last = kept.held.get(&name).map(|(_, bytes)| bytes.clone());
+    let before = if last.is_some() { before } else { None };
+    let (answer, ended) = finished(request_with(tape, world, before, store, last.as_deref(), Setup { tool, ask, ..setup(tape, Plant::None) })?)?;
+    if let Some(bytes) = &ended.last {
+        kept.write(name, bytes.clone(), plant);
+    }
+    Ok((answer, ended))
+}
+
+/// read-addressed.md, piece 1: tool A, another (a second build, or A's command of another
+/// shape), an edit, tool A: A walks forward from its own last answer and runs the one file and
+/// the one body, never from the units.
+fn own_pointer(tape: &Tape, plant: pointers::Plant) -> Result<(), Broke> {
+    let world = World::draw(tape);
+    let mut store = Store::default();
+    let mut kept = Pointers::default();
+    let other: (&'static [u8], Ask<'static>) = match tape.one_in(2, "the other is a shape") {
+        true => (SIM_TOOL, Ask { args: b"--another-shape", ..ASK }),
+        false => (b"another build", ASK),
+    };
+    command(tape, &world, None, &mut store, &mut kept, (SIM_TOOL, ASK), plant)?;
+    command(tape, &world, Some(&world), &mut store, &mut kept, other, plant)?;
+    let next = edit(tape, &world, 0, true);
+    let (answer, ended) = command(tape, &next, Some(&world), &mut store, &mut kept, (SIM_TOOL, ASK), plant)?;
+    oracle(answer.profile.forward, || format!("after another command, the first walked from the units: ran {:?}", ended.runs))?;
+    let ran = |kind| ended.runs.get(&kind).copied().unwrap_or(0);
+    oracle(ran(Kind::FileItems) == 1 && ran(Kind::BodyCheck) == 1 && ended.runs.len() == 2, || format!("a one-body edit after another command ran {:?}", ended.runs))
+}
+
+#[test]
+fn each_tool_and_shape_walks_forward_from_its_own_pointer() {
+    check(SimConfig::cases(200), |tape| own_pointer(tape, pointers::Plant::None));
+}
+
+#[test]
+fn control_one_pointer_for_every_tool_and_shape_is_caught() {
+    control(SimConfig::cases(200), pointers::Plant::None, pointers::Plant::OneName, "the first walked from the units", own_pointer);
+}
+
+const BUILDS: [&[u8]; 10] = [b"b0", b"b1", b"b2", b"b3", b"b4", b"b5", b"b6", b"b7", b"b8", b"b9"];
+
+/// More builds than `pointers::KEPT` in one checkout: the folder holds the `KEPT` written
+/// last; the newest repeats on its certificate; one whose pointer went answers again in full,
+/// with the findings it printed before.
+fn kept_pointers(tape: &Tape, plant: pointers::Plant) -> Result<(), Broke> {
+    let world = World::draw(tape);
+    let mut store = Store::default();
+    let mut kept = Pointers::default();
+    let mut first = None;
+    for tool in BUILDS {
+        let (_, ended) = command(tape, &world, Some(&world), &mut store, &mut kept, (tool, ASK), plant)?;
+        first.get_or_insert(ended);
+    }
+    let shape = crate::request::shape_of(&ASK);
+    let want: BTreeSet<PointerName> = BUILDS[BUILDS.len() - pointers::KEPT..].iter().map(|tool| PointerName::of(config(1, tool).tool, &shape)).collect();
+    let held: BTreeSet<PointerName> = kept.held.keys().copied().collect();
+    oracle(held == want, || format!("the folder holds {} pointers, {} of the {} written last", held.len(), held.intersection(&want).count(), pointers::KEPT))?;
+    let (newest, repeat) = command(tape, &world, Some(&world), &mut store, &mut kept, (BUILDS[BUILDS.len() - 1], ASK), plant)?;
+    oracle(newest.profile.certified && repeat.runs.is_empty(), || format!("the newest build's repeat ran {:?}", repeat.runs))?;
+    let (oldest, again) = command(tape, &world, Some(&world), &mut store, &mut kept, (BUILDS[0], ASK), plant)?;
+    let first = first.expect("ten builds ran");
+    oracle(!oldest.profile.forward && again.prints == first.prints, || String::from("a build whose pointer went printed other findings, or walked forward from no pointer"))
+}
+
+#[test]
+fn a_checkout_keeps_the_pointers_written_last() {
+    check(SimConfig::cases(60), |tape| kept_pointers(tape, pointers::Plant::None));
+}
+
+#[test]
+fn control_evicting_the_newest_pointer_is_caught() {
+    control(SimConfig::cases(60), pointers::Plant::None, pointers::Plant::EvictNewest, "written last", kept_pointers);
+}

@@ -45,6 +45,8 @@ pub struct BodyScope<'s> {
     pub spell: &'s Spelling<'s>,
     /// The traits in scope at `module`, checker keys, sorted.
     pub traits: &'s [ItemKey],
+    /// The traits in scope at the body's blocks whose list is not `traits`.
+    pub blocks: &'s super::block_traits::BlockTraits,
 }
 
 /// Why a body did not check.
@@ -394,6 +396,7 @@ pub(super) fn world_at<'w, 'n, S: NamesSource<'n>>(r: &'w Records<'_, 'n, S>, sc
         self_: scope.self_,
         spell: scope.spell,
         traits: scope.traits,
+        blocks: scope.blocks,
         fills: core::cell::RefCell::new(Vec::new_in(Global)),
         gaps: core::cell::RefCell::new(Vec::new_in(Global)),
     }

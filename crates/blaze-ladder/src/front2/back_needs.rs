@@ -75,11 +75,26 @@ pub(super) struct BackNeeds {
     pub(super) awaits: bool,
     /// Whether the `index` / `index_mut` trait fns were queued as declared already.
     index_declared: bool,
+    /// Whether a reached body holds an overloaded dereference (an adjustment `Deref` the check
+    /// recorded with a `Deref`/`DerefMut` method): the builder calls `Deref::deref` /
+    /// `DerefMut::deref_mut` (blaze-build walk.rs `deref_call`, `Adts::deref_fn`), which no
+    /// checked body names, so the trait fns are tabled as declared and their impls asked at
+    /// the program's shapes, as `Index`'s are.
+    pub(super) overloaded_deref: bool,
+    /// Whether the `deref` / `deref_mut` trait fns were queued as declared already.
+    deref_declared: bool,
 }
 
 impl BackNeeds {
     pub(super) const fn new() -> Self {
-        BackNeeds { fmt_done: [false; FMT_TRAITS], overloaded_index: false, awaits: false, index_declared: false }
+        BackNeeds {
+            fmt_done: [false; FMT_TRAITS],
+            overloaded_index: false,
+            awaits: false,
+            index_declared: false,
+            overloaded_deref: false,
+            deref_declared: false,
+        }
     }
 
     /// Reads checked body `c` of `owner` (its lowering `body`, when the caller has it: a
@@ -91,6 +106,24 @@ impl BackNeeds {
             let tc::Def::Fn(k) = *d else { continue };
             let of_trait = matches!(r.keys.origin(k), Some(Origin::Member { container, kind: MemberKind::Fn, .. }) if !r.store.impls.contains_key(container));
             queue.push((k, of_trait.then_some(Reached::AtInstance)));
+        }
+        // An overloaded dereference (`*w`, autoderef through `Deref`): the builder names the
+        // TRAIT's fn (`Adts::deref_fn`) and reads its ABI before resolving it to the impl's,
+        // as for an overloaded index below. Once per program.
+        if !self.overloaded_deref {
+            self.overloaded_deref = c.adjusts.column::<1>().iter().any(|k| matches!(k, tc::AdjustKind::Deref { overloaded: Some(_) }));
+        }
+        if self.overloaded_deref && !self.deref_declared {
+            self.deref_declared = true;
+            for (lang, name) in [("deref", "deref"), ("deref_mut", "deref_mut")] {
+                match lang_trait_fn(r, owner, lang, name) {
+                    Ok(Some(k)) => queue.push((k, Some(Reached::AtInstance))),
+                    // A program declaring no such lang trait: the checker records no
+                    // overloaded dereference through it.
+                    Ok(None) => {}
+                    Err((at, why)) => fns.push((at, Reached::Failed { class: Box::from("deref lang fn"), detail: why })),
+                }
+            }
         }
         let Some(body) = body else { return };
         let view = body.typeck.view(body.tys.view());
@@ -153,7 +186,7 @@ impl BackNeeds {
 fn lang_trait_fn(r: &mut Records<'_, '_>, owner: ItemKey, lang: &str, name: &str) -> Result<Option<ItemKey>, (ItemKey, Box<str>)> {
     let Some(lib) = r.index.lang(lang) else { return Ok(None) };
     let tr = checker_of(lib);
-    let refuse = |why: std::string::String| Err((tr, format!("the builder calls `{lang}` lang trait's `{name}` at an overloaded index: {why}").into_boxed_str()));
+    let refuse = |why: std::string::String| Err((tr, format!("the builder calls `{lang}` lang trait's `{name}` on its own (an overloaded index or dereference): {why}").into_boxed_str()));
     if let Err(clash) = r.keys.item(lib) {
         return refuse(format!("its key: {clash}"));
     }

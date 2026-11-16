@@ -19,6 +19,16 @@
 //! the calling body, to a block that declares `const fn precondition_check($($name:$ty),*) {..}`
 //! and then calls `precondition_check($($arg,)*)`: `local_macro` is its shape, and
 //! `core::ptr::read` and `core::ptr::write_bytes` (which call it) are checked by their paths.
+//!
+//! Traits imported in a block (front2 block_traits.rs). The Reference, "Use declarations"
+//! [items.use.intro]: "These declarations may appear in modules and blocks, usually at the
+//! top." [items.use.as-underscore.intro]: "Items can be imported without binding to a name by
+//! using an underscore with the form use path as _. This is particularly useful to import a
+//! trait so that its methods may be used without importing the trait's symbol". "Method call
+//! expressions": "Any of the methods provided by a visible trait implemented by T". Expected
+//! lines: `block_use_underscore: clean`, `block_use_named: clean`, `block_use_glob: clean`,
+//! `block_use_by_macro: clean`, `block_use_absent: clean (refused with NoMethod)`,
+//! `block_use_out_of_block: clean (refused with NoMethod)`.
 
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::Front2;
@@ -43,6 +53,19 @@ fn local_use() -> u8 { use core::cmp::max; max(1, 2) }
 fn local_shadows() -> u8 { fn outer() -> u8 { 5 } outer() }
 fn outer() -> bool { true }
 fn out_of_block(x: u8) -> u8 { { fn inner() -> u8 { 4 } } inner() }
+mod tr {
+    pub trait Twice { fn twice(&self) -> u8; }
+    impl Twice for u8 { fn twice(&self) -> u8 { *self * 2 } }
+}
+macro_rules! twice_of {
+    ($e:expr) => {{ use $crate::tr::Twice as _; $e.twice() }};
+}
+fn block_use_underscore(x: &u8) -> u8 { use core::ops::Not as _; x.not() }
+fn block_use_named(x: u8) -> u8 { { use crate::tr::Twice; x.twice() } }
+fn block_use_glob(x: u8) -> u8 { use crate::tr::*; x.twice() }
+fn block_use_by_macro(x: u8) -> u8 { twice_of!(x) }
+fn block_use_absent(x: &u8) -> u8 { x.not() }
+fn block_use_out_of_block(x: u8) -> u8 { { use crate::tr::Twice as _; } x.twice() }
 macro_rules! check_shape {
     ($e:expr) => {
         {
@@ -65,10 +88,17 @@ const CLEAN: &[(&str, &str)] = &[
     ("local_use", "a block's use declaration"),
     ("local_shadows", "a block's fn shadows the module's of the same name"),
     ("local_macro", "core's `assert_unsafe_precondition!` shape: an expansion's block declares a const fn and calls it"),
+    ("block_use_underscore", "a block's `use Trait as _;` puts the trait's methods in scope there"),
+    ("block_use_named", "an inner block's named `use` of a trait puts its methods in scope there"),
+    ("block_use_glob", "a block's glob `use` of a module puts the module's traits in scope there"),
+    ("block_use_by_macro", "tracing's shape: an expansion's block writes `use $crate::..::Trait as _;` and calls its method"),
 ];
 
-/// The bodies that must be refused, with the finding each must have.
-const REFUSED: &[(&str, &str)] = &[("out_of_block", "UnresolvedPath")];
+/// The bodies that must be refused, with the finding each must have. `block_use_absent` is
+/// `block_use_underscore` without its `use` (the cause removed: `Not` is in no prelude);
+/// `block_use_out_of_block` imports in an inner block and calls outside it (the Reference,
+/// "Use declarations": a block's import is in scope in that block only).
+const REFUSED: &[(&str, &str)] = &[("out_of_block", "UnresolvedPath"), ("block_use_absent", "NoMethod"), ("block_use_out_of_block", "NoMethod")];
 
 /// Library fns that use `assert_unsafe_precondition!`, by path from their crate's root.
 const LIBRARY: &[(&str, &[&str])] = &[("core", &["ptr", "read"]), ("core", &["ptr", "write_bytes"])];

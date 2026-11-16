@@ -9,6 +9,15 @@
 //! operator": on a non-pointer type `*x` is `*core::ops::Deref::deref(&x)` (`DerefMut` in a mutable
 //! place). "The question mark operator": `?` is `Try::branch` and, on a residual,
 //! `FromResidual::from_residual`, which for `Result` converts the error by `From`.
+//!
+//! "Range expressions": "The `..` and `..=` operators will construct an object of one of the
+//! `std::ops::Range` (or `core::ops::Range`) variants": `start..=end` is a
+//! `std::ops::RangeInclusive`, which `a..=b` makes by `RangeInclusive::new(a, b)`, the fn the
+//! pinned core marks `#[lang = "range_inclusive_new"]` inside the inherent `impl<Idx>
+//! RangeInclusive<Idx>`: a lang item that is a member of an impl, not of a trait (tempo census
+//! 13: 80 bodies `NotAHead .. is this item`). The run prints `range_inclusive_contains: clean`,
+//! `range_inclusive_for: clean` and `range_inclusive_wrong: clean` (refused with `Mismatch`, as
+//! it must be: a `RangeInclusive<u8>` is not a `u8`).
 
 use blaze_ladder::crates::{DirShelf, Inputs, Toolchain, UserCrate};
 use blaze_ladder::front2::Front2;
@@ -85,6 +94,9 @@ fn takes_bool(_: &bool) {}
 fn coerce_wrong(b: &Box<[u8]>) { takes_bool(b) }
 fn try_no_from(r: Result<(), E2>) -> Result<(), E> { r?; Ok(()) }
 fn option_in_result(o: Option<u8>) -> Result<u8, E> { let x = o?; Ok(x) }
+fn range_inclusive_contains(a: u8, b: u8) -> bool { (a..=b).contains(&a) }
+fn range_inclusive_for() { for _i in 0..=3u8 {} }
+fn range_inclusive_wrong(a: u8, b: u8) -> u8 { a..=b }
 ";
 
 /// The bodies that must check clean, each with what it proves. `vec_iter` and `try_same` come
@@ -123,6 +135,8 @@ const CLEAN: &[(&str, &str)] = &[
     ("mut_through", "`[u8]::sort` on `&mut Vec<u8>`: `DerefMut` for a `&mut self` method"),
     ("coerce_arg_two", "`&Arc<Vec<u8>>` coerced to `&[u8]`: two deref steps in a coercion"),
     ("takes", "`<[u8]>::len`"),
+    ("range_inclusive_contains", "`a..=b` is `RangeInclusive::new(a, b)`: a lang fn of an inherent impl"),
+    ("range_inclusive_for", "`for` over `0..=3u8`: `RangeInclusive::new`, then `IntoIterator::into_iter`"),
     ("main", "the entry"),
 ];
 
@@ -135,6 +149,7 @@ const REFUSED: &[(&str, &str)] = &[
     ("coerce_wrong", "Mismatch"),
     ("try_no_from", "Unsatisfied"),
     ("option_in_result", "Unsatisfied"),
+    ("range_inclusive_wrong", "Mismatch"),
 ];
 
 #[test]

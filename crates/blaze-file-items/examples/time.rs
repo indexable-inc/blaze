@@ -7,34 +7,16 @@
 
 use std::{alloc::Global, path::PathBuf, time::Instant};
 
-use blaze_file_items::{Bodies, OneByOne, SideBySide, outline, outline_hashed_by, outline_rows};
+use blaze_file_items::{Bodies, OneByOne, SideBySide, outline, outline_hashed_by};
 use blaze_own::Alloc;
 use blaze_surface::{Edition, ItemDetail};
 
 /// How many outlines of every file `--profile` runs.
 const PROFILE_ROUNDS: usize = 12;
 
-/// One of the two paths timed side by side.
-#[derive(Clone, Copy)]
-enum Path {
-    /// `outline`: the file split, each part walked from the parser's events.
-    Old,
-    /// `outline_rows`: the item grammar's sink writes the rows.
-    Rows,
-}
-
-impl std::fmt::Display for Path {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(match self {
-            Path::Old => "outline (events, then the walk)",
-            Path::Rows => "outline_rows (the grammar's sink)",
-        })
-    }
-}
-
-/// The entries `outline_rows` makes of `text`.
+/// The entries `outline` makes of `text`.
 fn rows(text: &str) -> usize {
-    outline_rows(text, Edition::E2024, Alloc::global()).items().len()
+    outline(text, Edition::E2024, Alloc::global()).items().len()
 }
 
 /// The CPU time this thread has used, in seconds: what a round costs whatever else the machine
@@ -76,11 +58,10 @@ fn load() -> std::string::String {
 fn main() {
     let mut files: Vec<PathBuf, Global> = Vec::new_in(Global);
     let mut stack: Vec<PathBuf, Global> = Vec::new_in(Global);
-    let mut profile = None;
+    let mut profile = false;
     for arg in std::env::args_os().skip(1) {
         match arg.to_str() {
-            Some("--profile=old") => profile = Some(Path::Old),
-            Some("--profile=rows") => profile = Some(Path::Rows),
+            Some("--profile" | "--profile=rows") => profile = true,
             _ => stack.push(PathBuf::from(arg)),
         }
     }
@@ -111,63 +92,50 @@ fn main() {
     }
     let bytes: usize = texts.iter().map(|it| it.len()).sum();
     let lines: usize = texts.iter().map(|it| it.lines().count()).sum();
-    // `--profile=old|rows` first: that path alone, round after round, for a sampling profiler
-    // to attach to (the process prints its id and runs for about `PROFILE_ROUNDS` outlines of
-    // everything).
-    if let Some(path) = profile {
-        println!("profile {path}: pid {}", std::process::id());
-        let start = Instant::now();
+    // `--profile` first: `outline` alone, round after round, and nothing else in the process:
+    // for a sampling profiler to attach to (the process prints its id), and for the
+    // instructions retired of `PROFILE_ROUNDS` outlines of everything (`/usr/bin/time -l`,
+    // which mixcheck.sh wraps a run in), the number a speed change is judged by on a loaded
+    // machine.
+    if profile {
+        println!("profile outline: pid {}", std::process::id());
+        let (start, start_cpu) = (Instant::now(), cpu());
         let mut items = 0usize;
         for _ in 0..PROFILE_ROUNDS {
             for text in &texts {
-                items += match path {
-                    Path::Old => outline(text, Edition::E2024, Alloc::global()).items().len(),
-                    Path::Rows => rows(text),
-                };
+                items += rows(text);
             }
         }
         println!(
-            "profile {path}: {PROFILE_ROUNDS} rounds, {items} items, {:.1} ms a round, load {}",
+            "profile outline: {PROFILE_ROUNDS} rounds, {items} items, {:.1} ms a round, {:.1} ms of CPU a round, load {}",
             start.elapsed().as_secs_f64() * 1e3 / PROFILE_ROUNDS as f64,
+            (cpu() - start_cpu) * 1e3 / PROFILE_ROUNDS as f64,
             load()
         );
         return;
     }
-    // The before and after of the outline lane: the path that is `outline` today (split, then
-    // each part walked from the parser's events) and the rows path (`outline_rows`: the item
-    // grammar's sink writes the rows), in one run, alternated, best of five, with the machine's
-    // load average when each best round ended.
-    let mut best = [(f64::MAX, std::string::String::new()), (f64::MAX, std::string::String::new())];
-    let mut best_cpu = [f64::MAX; 2];
-    let mut counts = [0usize; 2];
+    // `outline` over everything, best of five, with the machine's load average when the best
+    // round ended.
+    let mut best = (f64::MAX, std::string::String::new());
+    let (mut best_cpu, mut count) = (f64::MAX, 0usize);
     for _ in 0..5 {
-        for (slot, path) in [Path::Old, Path::Rows].into_iter().enumerate() {
-            let (start, start_cpu) = (Instant::now(), cpu());
-            let mut items = 0usize;
-            for text in &texts {
-                items += match path {
-                    Path::Old => outline(text, Edition::E2024, Alloc::global()).items().len(),
-                    Path::Rows => rows(text),
-                };
-            }
-            let (took, took_cpu) = (start.elapsed().as_secs_f64(), cpu() - start_cpu);
-            counts[slot] = items;
-            best_cpu[slot] = best_cpu[slot].min(took_cpu);
-            if took < best[slot].0 {
-                best[slot] = (took, load());
-            }
+        let (start, start_cpu) = (Instant::now(), cpu());
+        count = texts.iter().map(|text| rows(text)).sum();
+        let (took, took_cpu) = (start.elapsed().as_secs_f64(), cpu() - start_cpu);
+        best_cpu = best_cpu.min(took_cpu);
+        if took < best.0 {
+            best = (took, load());
         }
     }
-    for (((took, load), cpu), (path, items)) in best.iter().zip(best_cpu).zip([Path::Old, Path::Rows].into_iter().zip(counts)) {
-        println!(
-            "{path}: {} files, {:.1} MB, {items} items, {:.1} ms best of 5 on one thread ({:.0} MB/s), {:.1} ms of CPU, load {load}",
-            files.len(),
-            bytes as f64 / 1e6,
-            took * 1e3,
-            bytes as f64 / 1e6 / took,
-            cpu * 1e3,
-        );
-    }
+    println!(
+        "outline: {} files, {:.1} MB, {count} items, {:.1} ms best of 5 on one thread ({:.0} MB/s), {:.1} ms of CPU, load {}",
+        files.len(),
+        bytes as f64 / 1e6,
+        best.0 * 1e3,
+        bytes as f64 / 1e6 / best.0,
+        best_cpu * 1e3,
+        best.1,
+    );
     for round in 0..3 {
         let (mut items, mut errors, mut unhandled) = (0usize, 0usize, 0usize);
         let start = Instant::now();

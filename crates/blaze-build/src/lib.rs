@@ -578,6 +578,11 @@ pub enum BuildError {
     NoCleanup { what: &'static str },
     /// An expression outside the subset.
     Unsupported { expr: ExprId, what: &'static str },
+    /// Operator `op` at `expr` on operands of types `lhs` and `rhs` (their head nodes at this
+    /// instance; a unary operator has no `rhs`) that the build cannot give Rust's meaning:
+    /// `why` (walk/operators.rs: the check's callee row decides builtin or call, never how a
+    /// value is held).
+    Operator { expr: ExprId, op: &'static str, lhs: Option<blaze_typeck::PNode>, rhs: Option<blaze_typeck::PNode>, why: &'static str },
     /// A pattern outside the subset.
     UnsupportedPat { pat: PatId, what: &'static str },
     /// A type outside the subset, met at `expr`.
@@ -681,6 +686,14 @@ impl fmt::Display for BuildError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             BuildError::Unsupported { expr, what } => write!(f, "expression {}: {what} is not built to LIR yet", expr.0),
+            BuildError::Operator { expr, op, lhs, rhs: Some(rhs), why } => match lhs {
+                Some(lhs) => write!(f, "expression {}: operator `{op}` on {lhs:?} and {rhs:?}: {why}", expr.0),
+                None => write!(f, "expression {}: operator `{op}` on an unread type and {rhs:?}: {why}", expr.0),
+            },
+            BuildError::Operator { expr, op, lhs, rhs: None, why } => match lhs {
+                Some(lhs) => write!(f, "expression {}: operator `{op}` on {lhs:?}: {why}", expr.0),
+                None => write!(f, "expression {}: operator `{op}`: {why}", expr.0),
+            },
             BuildError::UnsupportedPat { pat, what } => write!(f, "pattern {}: {what} is not built to LIR yet", pat.0),
             BuildError::UnsupportedType { expr, what } => {
                 write!(f, "expression {}: a value of {what} is not built to LIR yet", expr.0)

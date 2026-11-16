@@ -79,41 +79,15 @@ pub fn area_of(finding: &Print<'_>) -> Area {
     }
 }
 
-/// A request's finding placed in today's text ([`Listed`]): its file read, its item found, its
-/// id made (its shown length is set once all are listed, `fix::lengths`), and its fix where one
-/// is certain: today, the toolchain's crate named again in a manifest, its line deleted.
-/// `edition` is the file's when it is Rust.
-#[expect(clippy::too_many_arguments, reason = "a finding's place found by the caller, each argument one part of it")]
-pub fn listed<'f>(
-    cx: &Cx,
-    root: &Dir<ReadWrite>,
-    path: Option<&str>,
-    place: u32,
-    message: &'f [u8],
-    edition: Option<blaze_surface::Edition>,
-    finding: &Print<'_>,
-    frame: &'f Frame,
-) -> Result<Listed<'f>, CliError> {
-    // The path kept with the finding, in the command's frame.
-    let path: Option<&'f str> = match path {
-        Some(path) => Some(core::str::from_utf8(Vec::from_slice_in(path.as_bytes(), frame).leak()).map_err(|_| CliError::Text { what: "a path is not UTF-8" })?),
-        None => None,
-    };
+/// One finding placed in its file's `text` ([`list`]): `place` its item's start there,
+/// `grammar` the file's outline when it is Rust, `read` the text's digest.
+fn placed_in<'f>(path: &'f str, text: &str, read: blaze_ids::ContentId, grammar: Option<&blaze_file_items::Outline<'_>>, place: u32, message: &'f [u8], finding: &Print<'_>) -> Result<Listed<'f>, CliError> {
     let area = area_of(finding);
     let code = words::wording(area, finding.rule).map_or("", |wording| wording.name);
-    let Some(path) = path else {
-        let about = format_in!(frame, "{}", finding.name);
-        let id = Id::of(about.as_bytes(), 0, &[], code, (finding.start, finding.end));
-        return Ok(Listed { path: None, about: finding.name, text: &[], area, rule: finding.rule, words: message, item: 0, start: finding.start, end: finding.end, id, fix: None });
-    };
-    let mut bytes = Bytes::new_in(frame, "a file to place a finding in");
-    root.read_all(cx, &Path::new(path)?, &mut bytes)?;
-    let text: &'f [u8] = Vec::from_slice_in(bytes.as_slice(), frame).leak();
     let start = place.saturating_add(finding.start).min(text.len() as u32);
     let end = place.saturating_add(finding.end).clamp(start, text.len() as u32);
-    let as_str = core::str::from_utf8(text).map_err(|_| CliError::Text { what: "a file with a finding is not UTF-8" })?;
-    let (item, item_end, chain) = crate::fix::item_of(as_str, start, edition, frame);
-    let id = Id::of(path.as_bytes(), chain, &text[item as usize..item_end as usize], code, (start - item, end - item));
+    let (item, item_end, chain) = crate::fix::item_in(grammar, text, start);
+    let id = Id::of(path.as_bytes(), chain, &text.as_bytes()[item as usize..item_end as usize], code, (start - item, end - item));
     let fix = match (area, finding.rule) {
         (Area::Cli, crate::units::TOOLCHAIN_NAMED) => {
             let name = core::str::from_utf8(message).map_err(|_| CliError::Text { what: "a finding's message is not UTF-8" })?;
@@ -121,13 +95,237 @@ pub fn listed<'f>(
         }
         _ => None,
     };
-    Ok(Listed { path: Some(path), about: finding.name, text, area, rule: finding.rule, words: message, item, start, end, id, fix })
+    Ok(Listed { path: Some(path), about: finding.name, read, area, rule: finding.rule, words: message, item, start, end, id, fix })
+}
+
+/// A finding of no file (or whose item is no longer in its file), listed at its name: its id
+/// is of the name. `one` holds the name's text while the id is made.
+fn unplaced<'f>(message: &'f [u8], finding: &Print<'_>, one: &Frame) -> Listed<'f> {
+    let area = area_of(finding);
+    let code = words::wording(area, finding.rule).map_or("", |wording| wording.name);
+    let about = format_in!(one, "{}", finding.name);
+    let id = Id::of(about.as_bytes(), 0, &[], code, (finding.start, finding.end));
+    Listed { path: None, about: finding.name, read: crate::fix::text_id(&[]), area, rule: finding.rule, words: message, item: 0, start: finding.start, end: finding.end, id, fix: None }
+}
+
+/// The memory a command's findings are placed and drawn in. One file's text and its outlines
+/// are in `file`, freed when the next file is read; one finding's drawing is in `one`, freed a
+/// finding. Nothing of a file or of a drawing is made in the command's frame, so what a command
+/// can list is bounded by the count of its findings (a [`Listed`], its words and a path a
+/// file), never by the sizes of their files or frames. (Before: each finding kept four copies
+/// of its file and two outlines in the command's frame, and blaze's own 3,487 findings filled
+/// its 64 MiB: drive.md, runner 13.)
+pub struct Scratch {
+    file: Frame,
+    one: Frame,
+    limit: usize,
+}
+
+/// What a [`Scratch`] frame says it is when a file does not fit it.
+const FILE_ARENA: &str = "the frame for one file's findings";
+
+impl Scratch {
+    /// Two frames of `limit` bytes each, reserved: no memory is taken until used.
+    pub fn new(limit: usize) -> Result<Scratch, CliError> {
+        let frame = |what| Frame::with_reserve(limit, bstd::mem::Tag::Other).map_err(|_| CliError::Text { what });
+        Ok(Scratch { file: frame("the frame for one file's findings could not be reserved")?, one: frame("the frame for one finding's drawing could not be reserved")?, limit })
+    }
+
+    /// The frame of one drawing, emptied: for a drawing that reads no file of its own.
+    pub fn one(&mut self) -> &Frame {
+        self.one.reset();
+        &self.one
+    }
+
+    /// Why the work on `path`'s findings stopped, from the frames as the stop left them.
+    fn stopped(&self, doing: &'static str, path: &str) -> CliError {
+        let (path, cut) = path_shown(path);
+        CliError::Draw(DrawError::Stopped { doing, path, cut, file: self.file.used(), one: self.one.used(), limit: self.limit })
+    }
+}
+
+/// The most of a path a [`DrawError`] holds.
+const PATH_SHOWN: usize = 160;
+
+/// A path as a [`DrawError`] holds it, and whether its start was cut: its end, when it is
+/// longer than [`PATH_SHOWN`] (the file's own name is there). Made without memory: the error
+/// may be that there is none.
+fn path_shown(path: &str) -> (blaze_own::FixedString<PATH_SHOWN>, bool) {
+    let mut cut = path.len().saturating_sub(PATH_SHOWN);
+    while !path.is_char_boundary(cut) {
+        cut += 1;
+    }
+    let mut shown = blaze_own::FixedString::new();
+    // Never refused: at most `PATH_SHOWN` bytes are left.
+    shown.try_push_str(&path[cut..]).ok();
+    (shown, cut > 0)
+}
+
+/// Why a command's findings were not all printed: each names the file (rule 19).
+#[derive(Debug)]
+pub enum DrawError {
+    /// The work on one file's findings panicked (its message is the panic hook's, above this):
+    /// the frames it had are named with what they held, because the one cause that is not a
+    /// bug of blaze is a file whose outline or drawing does not fit them (rule 20).
+    Stopped { doing: &'static str, path: blaze_own::FixedString<PATH_SHOWN>, cut: bool, file: usize, one: usize, limit: usize },
+    /// The file was written between the listing of its findings and their drawing: their
+    /// places are the old text's.
+    Changed { path: blaze_own::FixedString<PATH_SHOWN>, cut: bool },
+}
+
+impl core::fmt::Display for DrawError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let dots = |cut: &bool| if *cut { ".." } else { "" };
+        match self {
+            DrawError::Stopped { doing, path, cut, file, one, limit } => write!(
+                f,
+                "{doing} the findings of `{}{}` stopped (its message is above): {FILE_ARENA} held {file} and the frame for one finding's drawing {one} of {limit} bytes each; a file's text, outlines and one drawing must fit them (print.rs `Scratch`)",
+                dots(cut),
+                path.as_str()
+            ),
+            DrawError::Changed { path, cut } => write!(f, "`{}{}` was written while blaze drew its findings: their places are the old text's; run the command again", dots(cut), path.as_str()),
+        }
+    }
+}
+
+/// A finding of the request before any file is read: where it will be placed.
+#[derive(Clone, Copy)]
+pub struct Wanted<'f> {
+    /// The file it is drawn in ([`file_of`], or its message's: names.rs `place_pieces`).
+    pub path: Option<&'f str>,
+    pub place: Place,
+    /// Its words' pieces, kept with it.
+    pub words: &'f [u8],
+}
+
+/// How a finding's item is found in its file's text as it is today.
+#[derive(Clone, Copy)]
+pub enum Place {
+    /// The item's start, as the finding's task read it.
+    At(u32),
+    /// The item's chain, in the outline of this edition (a crate's unresolved path).
+    Chain(u64, blaze_surface::Edition),
+}
+
+/// Every finding of the request placed in today's text ([`Listed`]), pushed on `into` in the
+/// order of `prints`: its item found, its id made (its shown length is set once all are
+/// listed, `fix::lengths`), and its fix where one is certain: today, the toolchain's crate
+/// named again in a manifest, its line deleted. A file at a time, whatever the order they came
+/// in: its text is read once and its outline made once for all its findings, in `scratch`.
+pub fn list<'f>(cx: &Cx, root: &Dir<ReadWrite>, prints: &[Print<'_>], wanted: &[Wanted<'f>], scratch: &mut Scratch, frame: &'f Frame, into: &mut Vec<Listed<'f>, &'f Frame>) -> Result<(), CliError> {
+    const NO_ROOM: CliError = CliError::Text { what: "the command's frame has no room to list its findings: a finding takes a `Listed`, its words and (once a file) its path there" };
+    let first = into.len();
+    into.try_reserve(prints.len()).map_err(|_| NO_ROOM)?;
+    // By file (stable: a file's findings stay in the order they came), the fileless first.
+    let mut order: Vec<usize, &Frame> = Vec::try_with_capacity_in(prints.len(), frame).map_err(|_| NO_ROOM)?;
+    order.extend(0..prints.len());
+    order.sort_by_key(|&i| wanted[i].path);
+    let mut at = 0;
+    while at < order.len() {
+        let path = wanted[order[at]].path;
+        let run = &order[at..at + order[at..].iter().take_while(|&&i| wanted[i].path == path).count()];
+        at += run.len();
+        let Some(path) = path else {
+            for &i in run {
+                let listed = unplaced(wanted[i].words, &prints[i], scratch.one());
+                into.push(listed);
+            }
+            continue;
+        };
+        let (file, one) = (&scratch.file, &mut scratch.one);
+        let placed =crate::work::unwinding(|| -> Result<(), CliError> {
+            let mut bytes = Bytes::new_in(file, FILE_ARENA);
+            root.read_all(cx, &Path::new(path)?, &mut bytes)?;
+            let text = core::str::from_utf8(bytes.as_slice()).map_err(|_| CliError::Text { what: "a file with a finding is not UTF-8" })?;
+            let read = crate::fix::text_id(text.as_bytes());
+            let erased = blaze_own::Erased::new(file);
+            // The outline every id of the file is made from: one grammar for every file
+            // (fix.rs `ITEM_GRAMMAR`), so an id is a function of the text alone.
+            let grammar = path.ends_with(".rs").then(|| blaze_file_items::outline(text, crate::fix::ITEM_GRAMMAR, erased.handle()));
+            // The outline a chain is looked up in is its crate's edition's: made once for each
+            // edition the file's findings name (one, but for a file two crates share).
+            let mut of_edition: Option<(blaze_surface::Edition, blaze_file_items::Outline<'_>)> = None;
+            for &i in run {
+                one.reset();
+                let place = match wanted[i].place {
+                    Place::At(place) => Some(place),
+                    Place::Chain(chain, edition) => match &grammar {
+                        Some(outline) if edition == crate::fix::ITEM_GRAMMAR => crate::work::item_by_chain(outline, text, chain),
+                        _ => {
+                            if of_edition.as_ref().is_none_or(|(made, _)| *made != edition) {
+                                of_edition = Some((edition, blaze_file_items::outline(text, edition, erased.handle())));
+                            }
+                            of_edition.as_ref().and_then(|(_, outline)| crate::work::item_by_chain(outline, text, chain))
+                        }
+                    },
+                };
+                into.push(match place {
+                    Some(place) => placed_in(path, text, read, grammar.as_ref(), place, wanted[i].words, &prints[i])?,
+                    None => unplaced(wanted[i].words, &prints[i], one),
+                });
+            }
+            Ok(())
+        });
+        match placed {
+            Ok(done) => done?,
+            Err(crate::work::Panicked) => return Err(scratch.stopped("placing", path)),
+        }
+    }
+    // `into[first + k]` is the finding `order[k]`: each swapped to its own place.
+    for k in 0..order.len() {
+        while order[k] != k {
+            let to = order[k];
+            into.swap(first + k, first + to);
+            order.swap(k, to);
+        }
+    }
+    Ok(())
+}
+
+/// One file's listed findings (`which`, their indices in `shown.listed`), printed: the file
+/// read once into `scratch` and checked to be the text they were placed in, each finding drawn
+/// in a frame emptied for it. `path` is `None` for the findings of no file.
+pub fn file_findings(cx: &Cx, root: &Dir<ReadWrite>, path: Option<&str>, which: impl Iterator<Item = usize>, shown: &mut Shown<'_>, scratch: &mut Scratch, out: &Out) -> Result<(), CliError> {
+    // `--fix`'s first check prints nothing: nothing is read for it either.
+    let Some(path) = path.filter(|_| !shown.quiet) else {
+        for at in which {
+            let listed = shown.listed[at];
+            finding(cx, &listed, &[], shown, scratch.one(), out)?;
+        }
+        return Ok(());
+    };
+    scratch.file.reset();
+    let (file, one) = (&scratch.file, &mut scratch.one);
+    let drawn = crate::work::unwinding(|| -> Result<bool, CliError> {
+        let mut bytes = Bytes::new_in(file, FILE_ARENA);
+        root.read_all(cx, &Path::new(path)?, &mut bytes)?;
+        let read = crate::fix::text_id(bytes.as_slice());
+        for at in which {
+            let listed = shown.listed[at];
+            if listed.read != read {
+                return Ok(false);
+            }
+            one.reset();
+            finding(cx, &listed, bytes.as_slice(), shown, one, out)?;
+        }
+        Ok(true)
+    });
+    match drawn {
+        Ok(Ok(true)) => Ok(()),
+        Ok(Ok(false)) => {
+            let (path, cut) = path_shown(path);
+            Err(CliError::Draw(DrawError::Changed { path, cut }))
+        }
+        Ok(Err(error)) => Err(error),
+        Err(crate::work::Panicked) => Err(scratch.stopped("drawing", path)),
+    }
 }
 
 /// A listed finding printed in the command's view: drawn for a person (its frame, or off a
 /// terminal its line), or the agent's or JSON's plain lines. Its rule's words come from
-/// blaze-report's table, its arguments the message's pieces between 0x1F bytes.
-pub fn finding(cx: &Cx, l: &Listed<'_>, shown: &mut Shown<'_>, frame: &Frame, out: &Out) -> Result<(), CliError> {
+/// blaze-report's table, its arguments the message's pieces between 0x1F bytes. `text` is its
+/// file's, as it was listed in (unread for a finding of no file, or a quiet command).
+pub fn finding(cx: &Cx, l: &Listed<'_>, text: &[u8], shown: &mut Shown<'_>, frame: &Frame, out: &Out) -> Result<(), CliError> {
     if l.fix.is_some() {
         shown.fixes.push(l.id);
     }
@@ -157,7 +355,7 @@ pub fn finding(cx: &Cx, l: &Listed<'_>, shown: &mut Shown<'_>, frame: &Frame, ou
     };
     shown.file(path);
     let fix = l.fix.map(|change| (Edit { start: change.start, end: change.end, insert: change.insert }, change));
-    draw(cx, shown, Severity::Error, l.area, l.rule, message, path, l.text, Some(l.item), (l.start, l.end), None, fix, l.id.as_str(), frame, out)
+    draw(cx, shown, Severity::Error, l.area, l.rule, message, path, text, Some(l.item), (l.start, l.end), None, fix, l.id.as_str(), frame, out)
 }
 
 /// One plain finding into `line` in `view`.

@@ -317,3 +317,201 @@ fn self_of_a_braced_struct_is_not_a_value() {
     let d = written(differences(&fx, &b, &c, &want));
     assert!(d.is_empty(), "\n{}", d.join("\n"));
 }
+
+/// A variant named through `Self` or a type alias in a struct expression or pattern: tempo's
+/// "56 diag E0574" (reth_state_root_antithesis model.rs `Self::Account { address, account }`,
+/// precompiles test_util.rs `Self::Simple { admin, .. }`, zone_checker l2/events.rs
+/// `Self::TokenBurn { .. }`), reduced. The Reference, "Struct expressions": "A struct
+/// expression creates a struct, enum, or union value. It consists of a path to a struct, enum
+/// variant, or union item followed by the values for the fields of the item", with a
+/// type-relative variant among its own examples (`<Enum as Tr>::T::Tuple(); // OK`); "The
+/// field names can be decimal integer values to specify indices for constructing tuple
+/// structs", which these fixtures use (`Self::A { 0: x }`: the fixture's variants are
+/// tuple-shaped; the path step under test does not look at the variant's shape). "Paths",
+/// "`Self`": "In an implementation, it refers to the type being implemented."
+///
+/// ```text
+/// enum E { A(u8), B }
+/// impl E {
+///     fn f(e: E) -> u8 { match e { Self::A { 0: x } => x, Self::B { .. } => 0u8 } }
+///     fn g() -> E { Self::A { 0: 1u8 } }
+///     fn bad() -> E { Self::C { 0: 1u8 } }              // E0574: `C` is no variant of `E`
+/// }
+/// type Al = E;  fn h() -> E { Al::A { 0: 1u8 } }
+/// enum G<T> { A(T) }
+/// impl<T> G<T> { fn k() -> G<u8> { Self::A { 0: 1u8 } } }  // E0308: `Self` is `G<T>`
+/// ```
+///
+/// The world answers `Self` and `Al` with `Def::Adt` consuming one segment, as blaze-ladder
+/// front2/world_paths.rs does. Without the variant step in `Machine::struct_path`
+/// (rules/adt.rs) `f`, `g` and `h` are E0574; `bad` must stay E0574 (no variant named `C`);
+/// `k` must stay E0308 (a fix giving `Self` fresh arguments accepts it). Prints
+/// "self_struct_variant: clean".
+///
+/// The fixture's body builder has no struct expressions or patterns: these bodies take their
+/// paths, field lists and struct patterns from [`StructBody`], set on the view.
+struct StructBody {
+    paths: Vec<crate::body::BodyPath>,
+    segments: Vec<crate::body::Segment>,
+}
+
+impl StructBody {
+    fn new() -> StructBody {
+        StructBody { paths: Vec::new(), segments: Vec::new() }
+    }
+
+    /// A path `segments[0]::segments[1]..` with no generic arguments.
+    fn path(&mut self, segments: &[&str]) -> crate::ids::PathIdx {
+        let start = self.segments.len() as u32;
+        for s in segments {
+            self.segments.push(crate::body::Segment { name: crate::ids::Name::of(s), generic_args: crate::ids::List::EMPTY, has_args: false });
+        }
+        let at = self.paths.len() as u32;
+        let segs = crate::ids::List { start, len: segments.len() as u32 };
+        self.paths.push(crate::body::BodyPath { scope: crate::ids::ScopeId(0), segments: segs, lang: None, anchor: None });
+        crate::ids::PathIdx(at)
+    }
+}
+
+/// [`check_body`] over a view the caller completed.
+fn check_view(fx: &Fx, v: &crate::body::BodyView<'_>) -> crate::columns::Checked<'static> {
+    let mut cx = crate::infer::InferCtx::new_in(blaze_own::Alloc::global());
+    let hints = crate::world::Needs::new_in(blaze_own::Alloc::global());
+    match crate::check_with(v, fx, &mut cx, &hints, Plant::None, blaze_own::Alloc::global()) {
+        Ok(crate::Outcome::Done(c)) => c,
+        Ok(crate::Outcome::Need(n)) => panic!("`{}`: the world missed {:?}", fx.name_of(v.owner), n.questions),
+        Err(e) => panic!("`{}`: {e:?}", fx.name_of(v.owner)),
+    }
+}
+
+/// `Self::A { 0: <one> }` (or `<prefix>::<variant>`) as the body's struct expression, its
+/// field list the view's `field_inits[0..1]`.
+fn struct_expr(b: &mut Bb, sp: &mut StructBody, path: &[&str], one: ExprId) -> (ExprId, [crate::body::FieldInit; 1]) {
+    let p = sp.path(path);
+    let fields = crate::ids::List { start: 0, len: 1 };
+    let s = b.e(crate::body::Expr::Struct { path: p, fields, base: None });
+    (s, [crate::body::FieldInit { name: crate::ids::Name::of_index(0), expr: one }])
+}
+
+#[test]
+fn self_struct_variant() {
+    let mut fx = Fx::new();
+    let sized = fx.tr("Sized", 1, Vec::new(), &[]);
+    fx.lang(LangItem::Sized, sized);
+    let u8_ = fx.u8();
+    let (e, _) = fx.enum_("E", 0, &[("A", &[u8_]), ("B", &[])]);
+    let e_t = fx.adt(e, &[]);
+    fx.use_path("Self", Def::Adt(e));
+    fx.use_path("Al", Def::Adt(e));
+    let inherent = fx.imp("impl E", 0, e_t, None, &[], Vec::new());
+    let f = fx.impl_fn(inherent, "f", false, &[e_t], u8_);
+    let g = fx.impl_fn(inherent, "g", false, &[], e_t);
+    let bad = fx.impl_fn(inherent, "bad", false, &[], e_t);
+    let h = fx.func("h", 0, &[], e_t, Vec::new());
+    fx.finish();
+
+    // `fn g() -> E { Self::A { 0: 1u8 } }` and `fn h() -> E { Al::A { 0: 1u8 } }`: clean.
+    for (owner, prefix) in [(g, "Self"), (h, "Al")] {
+        let mut sp = StructBody::new();
+        let mut b = Bb::new();
+        let one = b.int(Some(IntSuffix::Uint(UintTy::U8)));
+        let (s, inits) = struct_expr(&mut b, &mut sp, &[prefix, "A"], one);
+        let root = b.block(&[], Some(s));
+        let mut v = b.view(owner, root);
+        v.paths = &sp.paths;
+        v.segments = &sp.segments;
+        v.field_inits = &inits;
+        let c = check_view(&fx, &v);
+        let want = Want { exprs: &[(ExprId(0), "u8"), (ExprId(1), "E"), (ExprId(2), "E")], pats: &[], diags: &[] };
+        let d = differences(&fx, &b, &c, &want);
+        assert!(d.is_empty(), "{prefix}::A {{ 0: 1u8 }}:\n{}", d.join("\n"));
+    }
+
+    // `fn f(e: E) -> u8 { match e { Self::A { 0: x } => x, Self::B { .. } => 0u8 } }`: clean.
+    // Patterns 2 and 3 are placeholders here, replaced by the struct patterns on the view.
+    let mut sp = StructBody::new();
+    let mut b = Bb::new();
+    let e_p = b.param("e");
+    let x = b.bind("x");
+    let arm_a = b.bind("arm_a");
+    let arm_b = b.bind("arm_b");
+    let scrutinee = b.local(e_p);
+    let x_use = b.local(x);
+    let zero = b.int(Some(IntSuffix::Uint(UintTy::U8)));
+    let m = b.match_(scrutinee, &[(arm_a, x_use), (arm_b, zero)]);
+    let root = b.block(&[], Some(m));
+    let path_a = sp.path(&["Self", "A"]);
+    let path_b = sp.path(&["Self", "B"]);
+    let bind = |name: &str| crate::body::Pat::Bind {
+        ann: crate::body::BindAnn { by_ref: None, mutable: false },
+        name: crate::ids::Name::of(name),
+        sub: None,
+    };
+    let pats = [
+        bind("e"),
+        bind("x"),
+        crate::body::Pat::Struct { path: path_a, fields: crate::ids::List { start: 0, len: 1 }, rest: false },
+        crate::body::Pat::Struct { path: path_b, fields: crate::ids::List { start: 1, len: 0 }, rest: true },
+    ];
+    assert_eq!((arm_a.0, arm_b.0), (2, 3), "the placeholders are patterns 2 and 3");
+    let field_pats = [crate::body::FieldPat { name: crate::ids::Name::of_index(0), pat: x }];
+    let mut v = b.view(f, root);
+    v.pats = &pats;
+    v.paths = &sp.paths;
+    v.segments = &sp.segments;
+    v.field_pats = &field_pats;
+    let c = check_view(&fx, &v);
+    let want = Want {
+        exprs: &[(ExprId(0), "E"), (ExprId(1), "u8"), (ExprId(2), "u8"), (ExprId(3), "u8"), (ExprId(4), "u8")],
+        pats: &[(e_p, "E"), (x, "u8")],
+        diags: &[],
+    };
+    let d = differences(&fx, &b, &c, &want);
+    assert!(d.is_empty(), "match e {{ Self::A {{ 0: x }} => x, Self::B {{ .. }} => 0u8 }}:\n{}", d.join("\n"));
+
+    // `fn bad() -> E { Self::C { 0: 1u8 } }`: E0574 at the struct expression, naming `C`.
+    let mut sp = StructBody::new();
+    let mut b = Bb::new();
+    let one = b.int(Some(IntSuffix::Uint(UintTy::U8)));
+    let (s, inits) = struct_expr(&mut b, &mut sp, &["Self", "C"], one);
+    let root = b.block(&[], Some(s));
+    let mut v = b.view(bad, root);
+    v.paths = &sp.paths;
+    v.segments = &sp.segments;
+    v.field_inits = &inits;
+    let c = check_view(&fx, &v);
+    let want = Want { exprs: &[], pats: &[], diags: &[(DiagCode::NotAStruct, s)] };
+    let d = written(differences(&fx, &b, &c, &want));
+    assert!(d.is_empty(), "Self::C {{ 0: 1u8 }}:\n{}", d.join("\n"));
+    let named = c.diags.iter().any(|d| d.code == DiagCode::NotAStruct && d.name == Some(crate::ids::Name::of("C")));
+    assert!(named, "E0574 must name `C`: {:?}", c.diags.iter().map(|d| (d.code, d.name)).collect::<Vec<_>>());
+
+    // `impl<T> G<T> { fn k() -> G<u8> { Self::A { 0: 1u8 } } }`: E0308, `Self` being `G<T>`.
+    let mut gx = Fx::new();
+    let sized = gx.tr("Sized", 1, Vec::new(), &[]);
+    gx.lang(LangItem::Sized, sized);
+    let u8_ = gx.u8();
+    let p0 = gx.param(0);
+    let (gk, _) = gx.enum_("G", 1, &[("A", &[p0])]);
+    let g_t = gx.adt(gk, &[p0]);
+    let g_u8 = gx.adt(gk, &[u8_]);
+    gx.use_path("Self", Def::Adt(gk));
+    let imp = gx.imp("impl<T> G<T>", 1, g_t, None, &[], Vec::new());
+    let k = gx.impl_fn(imp, "k", false, &[], g_u8);
+    gx.finish();
+    let mut sp = StructBody::new();
+    let mut b = Bb::new();
+    let one = b.int(Some(IntSuffix::Uint(UintTy::U8)));
+    let (s, inits) = struct_expr(&mut b, &mut sp, &["Self", "A"], one);
+    let root = b.block(&[], Some(s));
+    let mut v = b.view(k, root);
+    v.paths = &sp.paths;
+    v.segments = &sp.segments;
+    v.field_inits = &inits;
+    let c = check_view(&gx, &v);
+    let codes: Vec<DiagCode> = c.diags.iter().map(|d| d.code).collect();
+    assert!(codes.contains(&DiagCode::Mismatch), "k: want E0308 (`Self` is `G<T>`), got {codes:?}");
+    assert!(!codes.contains(&DiagCode::NotAStruct), "k: the variant step must find `A`, got {codes:?}");
+
+    std::println!("self_struct_variant: clean");
+}

@@ -9,8 +9,8 @@
 //! columns until the entry that holds them closes ([`Rows::take_flags`]). A node whose
 //! parent is a list (`Sink::start_list`: the file, or an entry's body) is an entry: its row is
 //! put down when it opens, so rows are in source order, and filled when it closes, from the
-//! nodes directly in it and the tokens between them ([`Rows::finish`]), by the rules
-//! [`super::Walk`] reads off the finished tree. What the grammar may still do to a finished
+//! nodes directly in it and the tokens between them ([`Rows::finish`]): the rows a reader of
+//! the finished tree would write. What the grammar may still do to a finished
 //! node is kept exact: a node wrapped after the fact (`precede`) takes its place in its
 //! parent's list, an abandoned node's children are its parent's, and the children of an
 //! abandoned entry are entries themselves, made from the nodes each kept below it.
@@ -240,6 +240,11 @@ impl<'a> Columns<'a> {
         self.starts.clear();
         self.ends.clear();
         self.flags.clear();
+    }
+
+    /// The tokens the columns have room for: the measure of what the worker's set holds.
+    pub(super) fn held(&self) -> usize {
+        self.words.capacity()
     }
 
     /// Fills the columns with the tokens of `lexed`.
@@ -477,7 +482,7 @@ impl Sink for Holds {
     }
 }
 
-/// What [`Rows::finish`] reads off an entry's direct children and tokens ([`super::Open`]).
+/// What [`Rows::finish`] reads off an entry's direct children and tokens.
 #[derive(Default)]
 struct Facts {
     head_start: Option<u32>,
@@ -616,8 +621,7 @@ impl Rows<'_, '_, '_> {
     }
 
     /// Fills `row`: the entry of `syntax` over tokens `start..end`, its children
-    /// `nodes[lo..hi]` ([`super::Walk::entry_child`], `direct_child`, `token` and
-    /// `close_entry`, read off the finished node).
+    /// `nodes[lo..hi]`, each child and each token directly in it read in order.
     #[expect(clippy::too_many_arguments, reason = "an entry's node, its children and its row")]
     fn finish(&mut self, syntax: SyntaxKind, start: u32, end: u32, lo: u32, hi: u32, row: u32, mut attrs: AttrSpan, list_at: u32, eager: bool) {
         let node = self.range(start, end);

@@ -36,6 +36,7 @@ mod index;
 mod lets;
 mod matches;
 mod numbers;
+mod operators;
 mod moves;
 mod slice_glue;
 mod strs;
@@ -62,7 +63,8 @@ const UNGROUNDED: PTy = PTy(u32::MAX);
 /// How a Rust type is held.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Repr {
-    /// `()`, `!`, a fn item: no value.
+    /// `()`, `!`, a fn item, a zero-sized aggregate with no drop glue in it: no value. Never a
+    /// type that needs drop (`Layout::placed`).
     None,
     Int { ty: Ty, signed: bool },
     /// An `f32` or `f64` (walk/numbers.rs).
@@ -70,7 +72,8 @@ enum Repr {
     /// An `i8` of 0 or 1.
     Bool,
     Ptr,
-    /// An aggregate of a non-zero size (a struct, a tuple, an array), by its row of `layouts`.
+    /// An aggregate held in memory (a struct, a tuple, an array), by its row of `layouts`: one
+    /// of a non-zero size, or a zero-sized one that is `Layout::placed`.
     Agg(u32),
 }
 
@@ -152,6 +155,13 @@ struct Layout {
     shape: Shape,
     /// It needs drop: it has a `Drop` impl, or a part that needs drop.
     needs_drop: bool,
+    /// It is held in memory whatever its size: it needs drop, or a part of it is `placed` (a
+    /// `ManuallyDrop<Guard>`, a union of one). Whether a value needs drop is a fact of its type,
+    /// never of its size (the Reference, `[destructors.intro]`: "When an initialized variable
+    /// or temporary goes out of scope, its destructor is run"), and a destructor takes the
+    /// value's address: so a zero-sized type with drop glue is an aggregate of no bytes
+    /// (`Repr::Agg`), which every path that carries an aggregate's drop carries too.
+    placed: bool,
     /// Its `Drop` impl's fn, as the `Drop` trait's `drop` (a call at `[ty]` runs the impl's).
     drop_fn: Option<ItemKey>,
     /// A union: its `Fields` overlap at offset 0, and its glue drops none of them.
@@ -334,6 +344,9 @@ enum Task {
     ArmEnd { m: u32 },
     MatchEnd,
     Call(ExprId),
+    /// The call of an operator the check recorded a callee for, its operands on the value
+    /// stack (walk/operators.rs).
+    OpCall(ExprId),
     Unary(ExprId, UnOp),
     Deref(ExprId),
     Binary(ExprId, BinOp),
@@ -815,7 +828,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 if self.has_unsized_tail(l) {
                     return Err(TyErr::Unsupported(unsized_tail::UNSIZED_BY_VALUE));
                 }
-                if self.layouts[l as usize].size == 0 { Repr::None } else { Repr::Agg(l) }
+                // No bytes and no destructor to hand an address to: no value. A zero-sized
+                // type that is `placed` (it, or a part of it, has drop glue) stays an aggregate.
+                let row = &self.layouts[l as usize];
+                if row.size == 0 && !row.placed { Repr::None } else { Repr::Agg(l) }
             }
             // A wide pointer (lib.rs, "Wide pointers") when its pointee is unsized, by `ls`.
             PNode::Ref(..) | PNode::Ptr(..) => {
@@ -1085,10 +1101,16 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 }
                 let at = self.find_layout(pt).ok_or(TyErr::Malformed("a part whose layout was not made"))?;
                 let part = &self.layouts[at as usize];
-                if part.needs_drop && part.size == 0 {
-                    return Err(TyErr::Unsupported("a zero-sized part whose type needs drop"));
-                }
                 needs_drop |= part.needs_drop;
+            }
+            // Held in memory (`Layout::placed`): by its own drop, or by a part's, kept or not.
+            let mut placed = needs_drop;
+            for &(_, pt) in parts.iter() {
+                if placed || !self.is_agg(pt)? {
+                    continue;
+                }
+                let at = self.find_layout(pt).ok_or(TyErr::Malformed("a part whose layout was not made"))?;
+                placed = self.layouts[at as usize].placed;
             }
             // A packed struct or union (the Reference, `[layout.repr.alignment.packed-fields]`:
             // "The alignments of each field, for the purpose of positioning fields, is the
@@ -1195,7 +1217,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     // Uninhabited: it never has a value to copy.
                     let leaves = if lt.uninhabited { 0 } else { most.saturating_add(1) };
                     let shape = Shape::Enum { id, first: vfirst, len: n as u32 };
-                    Layout { ty: t, size, align, leaves, shape, needs_drop, drop_fn, is_union }
+                    Layout { ty: t, size, align, leaves, shape, needs_drop, placed, drop_fn, is_union }
                 }
                 Some(n) => {
                     let elem = self.repr(parts[0].1)?;
@@ -1205,7 +1227,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     let stride = u32::try_from(stride).map_err(|_| too_big())?;
                     let len = u32::try_from(n).map_err(|_| TyErr::Unsupported("an array of 2^32 elements or more"))?;
                     let leaves = self.leaves(elem).saturating_mul(n);
-                    Layout { ty: t, size, align, leaves, shape: Shape::Array { elem, len, stride }, needs_drop, drop_fn, is_union }
+                    Layout { ty: t, size, align, leaves, shape: Shape::Array { elem, len, stride }, needs_drop, placed, drop_fn, is_union }
                 }
                 // A struct's or tuple's fields at `ls`'s offsets (a `repr(Rust)` one reordered by
                 // decreasing alignment), by declaration index.
@@ -1225,7 +1247,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     if unsized_tail {
                         self.unsized_tails.push(self.layouts.len() as u32);
                     }
-                    Layout { ty: t, size, align, leaves, shape: Shape::Fields { first, len }, needs_drop, drop_fn, is_union }
+                    Layout { ty: t, size, align, leaves, shape: Shape::Fields { first, len }, needs_drop, placed, drop_fn, is_union }
                 }
             };
             self.layouts.push(layout);
@@ -1802,7 +1824,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
         Ok(self.layouts[l as usize].needs_drop)
     }
 
-    /// Whether a value of `repr` needs drop.
+    /// Whether a value of `repr` needs drop: its type's answer, read from the type's own row.
+    /// `Repr::None` is never a type that needs drop (`repr` holds those as `Agg`, whatever
+    /// their size), so this equals `needs_drop` of the type for every type `repr` accepts.
     fn repr_needs_drop(&self, repr: Repr) -> bool {
         match repr {
             Repr::Agg(l) => self.layouts[l as usize].needs_drop,
@@ -1837,8 +1861,9 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             return Ok(());
         }
         let (_, repr) = self.slots[p.ix()].ok_or(malformed("a binding owned before it has a home"))?;
+        // `repr` holds every type that needs drop in memory (`Layout::placed`), whatever its size.
         if repr == Repr::None {
-            return Err(BuildError::UnsupportedPat { pat: p, what: "a zero-sized binding whose type needs drop" });
+            return Err(malformed("a binding whose type needs drop held as no value"));
         }
         if self.owned[p.ix()].is_some() {
             return Err(malformed("a binding owned twice"));
@@ -2300,6 +2325,8 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                     Expr::Ref { operand, .. } | Expr::RawRef { operand, .. } => operand.0 == c,
                     Expr::Field { base, .. } | Expr::TupleField { base, .. } | Expr::Index { base, .. } => base.0 == c,
                     Expr::AssignOp { lhs, .. } => lhs.0 == c,
+                    // [expr.cmp.place]: a comparison's operands are borrowed in place.
+                    Expr::Binary { op, lhs, rhs } if operators::comparison(op) => lhs.0 == c || rhs.0 == c,
                     // A place expression: matched in place, its arms' moves are marked below.
                     Expr::Match { scrutinee, .. } => scrutinee.0 == c,
                     // A `let` condition's scrutinee likewise (walk/lets.rs: nothing moves out).
@@ -3218,6 +3245,7 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.vals.push(v);
             }
             Task::Call(e) => self.call(e)?,
+            Task::OpCall(e) => self.operator_call(e)?,
             Task::Unary(e, op) => {
                 let v = self.pop()?;
                 let repr = self.expr_repr(e)?;
@@ -4690,7 +4718,13 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.work.push(Task::Deref(e));
                 self.work.push(Task::Eval(operand));
             }
+            // walk/operators.rs: an operator with the check's callee row is that call; one
+            // with none is the builtin operator, on its builtin scalar types only.
             Expr::Unary { op, operand } => {
+                if self.push_overloaded(e)? {
+                    return Ok(());
+                }
+                self.builtin_unary(e, op, operand)?;
                 self.work.push(Task::Unary(e, op));
                 self.work.push(Task::Eval(operand));
             }
@@ -4699,6 +4733,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
                 self.work.push(Task::Eval(lhs));
             }
             Expr::Binary { op, lhs, rhs } => {
+                if self.push_overloaded(e)? {
+                    return Ok(());
+                }
+                self.builtin_binary(e, op, lhs, rhs, false)?;
                 self.work.push(Task::Binary(e, op));
                 self.work.push(Task::Eval(rhs));
                 self.work.push(Task::Eval(lhs));
@@ -4719,6 +4757,10 @@ impl<'x, 'c, 't, A: Allocator + Clone> Walk<'x, 'c, 't, A> {
             }
             Expr::AssignOp { op, lhs, rhs } => {
                 self.refuse_mut_through_overloaded_index(lhs)?;
+                if self.push_overloaded(e)? {
+                    return Ok(());
+                }
+                self.builtin_binary(e, op, lhs, rhs, true)?;
                 self.work.push(Task::AssignOp(e, op));
                 self.work.push(Task::Place(lhs));
                 self.work.push(Task::Eval(rhs));

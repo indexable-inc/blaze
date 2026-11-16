@@ -1190,3 +1190,50 @@ fn r9a_builtin_type_beside_a_module_both_sides() {
         names(s, root, Namespace::Types, "u", Some(x)).and(no_errors(s, root))
     });
 }
+
+/// The textual scope reaches a block (the cell core's runner 15; tempo run c10-r14c: "calls
+/// the fill did not expand, summed: 332", 320 of them in serde_core): `macro_rules! far; mod b
+/// { const _: () = { far!{ fn x() {} } }; }`. A body's block that holds items is a module of
+/// its own with no `mod` line. The Reference, `macro.decl.scope.textual.intro`: "When
+/// `macro_rules!` is used to define a macro, the macro enters the scope after the definition
+/// (note that it can still be used recursively, since names are looked up from the invocation
+/// site), up until its surrounding scope, typically a module, is closed.", and
+/// `macro.decl.scope.textual.function-local`: "Macros can be declared and used locally inside
+/// functions as well, and work similarly". So `far!` in the block names the root's `far`, it is
+/// expanded, and `x` is an item of the block's module. The cell core's side of this is
+/// cells/tests.rs `a_blocks_module_reads_the_textual_scope_around_its_body`.
+#[test]
+fn x1_a_block_reads_the_textual_scope_around_it() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    w.rules(root, "far");
+    let b = w.module(root, "b", V::Pub);
+    let blk = w.module(b, "blk", V::Priv);
+    w.decls.get_mut(&b).expect("b's text").mods.retain(|c| c.module != blk);
+    let call = w.call(blk, "far", CallShape::FnLike);
+    let x = w.fun(call, "x", V::Pub);
+    rule("x1", &w, &|s| names(s, blk, Namespace::Values, "x", Some(x)));
+}
+
+/// `#[macro_export]` in the text of a module below one an expansion declared (the cell core's
+/// runner 15; tempo run c10-r14c: "'only_old': 0, 'only_cells': 21" in seven crates, each a
+/// root's macro the old core's written scope lacks: serde_core's `__private_serialize` in
+/// `private::doc`, whose `mod private;` is written by `crate_root!()`; nix's `sockopt_impl`
+/// under `feature! { pub mod socket; }`; tokio's `count!` under `cfg_macros! { mod select; }`).
+/// The Reference, `macro.decl.scope.macro_export.intro`: "The `macro_export` attribute exports
+/// the macro from the crate and makes it available in the root of the crate for path-based
+/// resolution." Nothing there depends on how the macro's module came to be. The crate:
+/// `macro_rules! mk; mk!{ mod p { pub mod d { #[macro_export] macro_rules! exp; } } }`: `exp`
+/// is a macro of the root. The cell core's side: cells/tests.rs
+/// `an_export_below_a_module_an_expansion_declared_is_in_the_root`.
+#[test]
+fn x2_an_export_below_a_module_an_expansion_declared_is_in_the_root() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    w.rules(root, "mk");
+    let call = w.call(root, "mk", CallShape::FnLike);
+    let p = w.module(call, "p", V::Priv);
+    let d = w.module(p, "d", V::Pub);
+    let exp = w.rules_with(d, "exp", true);
+    rule("x2", &w, &|s| names(s, root, Namespace::Macros, "exp", Some(exp)));
+}

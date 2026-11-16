@@ -10,7 +10,7 @@ use core::cell::RefCell;
 use std::alloc::Global;
 use std::vec::Vec;
 
-use blaze_build::data::{DataAlloc, DataRecord};
+use blaze_build::data::DataRecord;
 use blaze_build::layout::ReprAttrs;
 use blaze_build::{Abi, Intrinsic, StaticItem};
 use blaze_id::ItemKey as LibKey;
@@ -49,6 +49,7 @@ use crate::seam::{FnFacts, FrontEnd};
 mod float_text;
 pub mod suite;
 mod tabled;
+pub mod walk_report;
 
 /// What the new front end refuses of a program, by name: each a stage it stopped at or a
 /// question of the back half it cannot answer yet.
@@ -101,6 +102,10 @@ pub enum Front2Refusal {
     /// A lang item the back half asks for that core marks and front2 finds nothing under (or
     /// cannot read): the item and why.
     Lang { item: LangItem, why: &'static str },
+    /// A fn or item of the program's OWN crate that `main` reaches was left out by the survey
+    /// front ([`Front2Program::own_left_out`]): the program's own finding, so a run stops
+    /// before it starts (a library's left-out fn only stops a program that calls it).
+    OwnLeftOut { item: Box<str>, why: Box<str> },
 }
 
 impl core::fmt::Display for Front2Refusal {
@@ -135,6 +140,7 @@ impl core::fmt::Display for Front2Refusal {
             Front2Refusal::AdtRow { adt, why } => write!(f, "front2: the ADT `{adt}`'s row: {why}"),
             Front2Refusal::ObjectTrait { trait_, why } => write!(f, "front2: the trait `{trait_}` as a trait object sees it: {why}"),
             Front2Refusal::Lang { item, why } => write!(f, "front2: the lang item {item:?}: {why}"),
+            Front2Refusal::OwnLeftOut { item, why } => write!(f, "front2: `{item}`, of the program's own crate and reached from `main`, is not checked: {why}"),
             Front2Refusal::TwoEntries { symbol, first, second } => {
                 write!(f, "front2: `{first}) and `{second}) are both exported as `{symbol}`, the process's entry")
             }
@@ -224,6 +230,12 @@ pub struct Front2Program<'n> {
     /// The walk's steps ([`super::reach::Census::edges`]), sorted, once each: a root's static
     /// reach is read from them (program/suite.rs `Suite::reach_of`).
     edges: Vec<(ItemKey, ItemKey), Global>,
+    /// front2's constant evaluator, KEPT after the program is made (its checked constant
+    /// bodies, its records, its unit's tables) with the build's prepared macros: the seam's
+    /// `const_at` evaluates a constant or a const block at an instance's ground arguments
+    /// with it, checking a body or making an impl row it has not made yet (const_at.rs).
+    consts: Consts<'n>,
+    prepared: &'n Prepares<'n>,
 }
 
 /// Where a program's walk starts.
@@ -313,13 +325,17 @@ fn made_statics<'c>(
 /// what the builder's `Adts::const_value` asks), evaluated once by front2's evaluator
 /// (consts.rs `Consts::value`, the one that fills array lengths), in key order. Returns the
 /// records, sorted by key, and each constant the evaluator refused with its words (a nested
-/// evaluation included: `ConstFail` names the constant it stopped on). A generic constant's
-/// value at arguments is not asked here (the builder asks only at none).
+/// evaluation included: `ConstFail` names the constant it stopped on). A path the check
+/// recorded generic arguments for (`Checked::const_args`: a trait's constant, an inherent
+/// impl's over its generics) is not asked here: it has a value only at an instance's ground
+/// arguments, pulled by the build before it walks that instance (const_at.rs, the seam's
+/// `const_at`). Its body is checked then, by this same evaluator, which the program keeps.
 fn const_values<'c>(r: &mut Records<'_, '_>, bodies: impl Iterator<Item = &'c Checked<'static>>) -> (Vec<(ItemKey, DataRecord<Global>), Global>, Vec<(ItemKey, Box<str>), Global>) {
     let mut asked: Vec<ItemKey, Global> = Vec::new_in(Global);
     for c in bodies {
-        asked.extend(c.expr_defs.column::<1>().iter().filter_map(|d| match d {
-            tc::Def::Const(k) => Some(*k),
+        let at_args = c.const_args.column::<0>();
+        asked.extend(c.expr_defs.column::<0>().iter().zip(c.expr_defs.column::<1>().iter()).filter_map(|(e, d)| match d {
+            tc::Def::Const(k) if at_args.binary_search(e).is_err() => Some(*k),
             _ => None,
         }));
     }
@@ -332,17 +348,7 @@ fn const_values<'c>(r: &mut Records<'_, '_>, bodies: impl Iterator<Item = &'c Ch
             refused.push((k, Box::from("no evaluator: the program's records hold none")));
             continue;
         };
-        let made = consts.value(r, prepared, k).map(|record| {
-            let mut allocs = Vec::with_capacity_in(record.data.allocs.len(), Global);
-            for a in record.data.allocs.iter() {
-                let mut bytes = Vec::with_capacity_in(a.bytes.len(), Global);
-                bytes.extend_from_slice(&a.bytes);
-                let mut relocs = Vec::with_capacity_in(a.relocs.len(), Global);
-                relocs.extend_from_slice(&a.relocs);
-                allocs.push(DataAlloc { bytes, align: a.align, mutable: a.mutable, relocs });
-            }
-            DataRecord { allocs }
-        });
+        let made = consts.value(r, prepared, k).map(super::const_at::data_record);
         r.consts = Some((consts, prepared));
         match made {
             Ok(record) => values.push((k, record)),
@@ -477,6 +483,46 @@ impl<'n> Front2Program<'n> {
         Self::make(names, frame, user, Some(left_out))
     }
 
+    /// Of a program made by [`Front2Program::survey`]: the left-out fn or item of the
+    /// program's OWN crate (index 0 of the names) with the smallest key, named, and its cause;
+    /// `None` when every left-out key is a library's. A run refuses such a program before it
+    /// starts ([`crate::run::run_program`]): a finding in the program's own text is its
+    /// writer's to fix, while a library fn blaze cannot check yet stops only the program that
+    /// calls it. A member's crate is its container's (an impl's or a trait's).
+    pub fn own_left_out(&self) -> Option<(Box<str>, Box<str>)> {
+        use super::keys::Origin;
+        let names = self.front.names;
+        let mut found: Option<(ItemKey, &str)> = None;
+        for (&key, why) in self.left.iter() {
+            // A member's container is an item: two steps at most; a longer chain is no item's.
+            let mut at = key;
+            let mut lib = None;
+            for _ in 0..4 {
+                match self.front.keys.origin(at) {
+                    Some(Origin::Item(k)) => {
+                        lib = Some(*k);
+                        break;
+                    }
+                    Some(Origin::Member { container, .. }) => at = *container,
+                    None => break,
+                }
+            }
+            let own = lib.and_then(|lib| names.crate_of(lib)) == Some(0);
+            if own && found.is_none_or(|(least, _)| key < least) {
+                found = Some((key, &**why));
+            }
+        }
+        let (key, why) = found?;
+        let shown = match self.front.keys.origin(key) {
+            Some(Origin::Member { container, name, .. }) => match self.item_named(*container) {
+                Some(of) => format!("{of}::{name}").into_boxed_str(),
+                None => Box::from(&**name),
+            },
+            _ => self.item_named(key).unwrap_or_else(|| format!("{:#x}", key.0).into_boxed_str()),
+        };
+        Some((shown, Box::from(why)))
+    }
+
     fn make(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], left_out: Option<&mut Vec<(Box<str>, Box<str>), Global>>) -> Result<Front2Program<'n>, Front2Refusal> {
         Self::make_from(names, frame, user, left_out, Starts::Main).map(|made| made.program)
     }
@@ -502,6 +548,7 @@ impl<'n> Front2Program<'n> {
             }
         };
         let mut store = Store::new(front.index.lang("sized"), front.frame);
+        store.pointers = super::receiver::Pointers::find(&front.index, front.resolver);
         let mut buckets = None;
         let prepared = Prepares::new_in(Alloc::global());
         let mut mains: Vec<Body<'n>, Global> = Vec::with_capacity_in(roots.len(), Global);
@@ -790,7 +837,9 @@ impl<'n> Front2Program<'n> {
         // Each root's row: `None` for one left out (a survey) or that did not check.
         let mut rows: Vec<(ItemKey, Option<usize>), Global> = Vec::with_capacity_in(mains.len(), Global);
         rows.extend(mains.iter().map(|m| (m.owner, by_key.get(&m.owner).copied())));
-        let program = Front2Program { front, store, tys, buckets, fns, by_key, entry, objects, langs, left, const_values: values, statics, projection_why: core::cell::RefCell::new(None), edges };
+        // The evaluator is kept, not dropped: the build pulls constants at instances' ground
+        // arguments from it (`FrontEnd::const_at`, const_at.rs).
+        let program = Front2Program { front, store, tys, buckets, fns, by_key, entry, objects, langs, left, const_values: values, statics, projection_why: core::cell::RefCell::new(None), edges, consts, prepared };
         Ok(Made { program, roots: rows, shapes })
     }
 
@@ -814,6 +863,7 @@ impl<'n> Front2Program<'n> {
             self_: scope.self_,
             spell: scope.spell,
             traits: scope.traits,
+            blocks: scope.blocks,
             fills: RefCell::new(Vec::new_in(Global)),
             gaps: RefCell::new(Vec::new_in(Global)),
         };
@@ -844,6 +894,8 @@ fn exported_entry(names: &Names<'_>) -> Result<Option<LibKey>, Front2Refusal> {
         let Some(it) = names.item_text(key) else { continue };
         let at = placed(names, key).0;
         let shown = format!("{}` (file {}, byte {}", it.name.unwrap_or("_"), at.file, at.place);
+        // `symbols_of` reads a `#[no_mangle]` fn's export from the NAME it is given: the bare
+        // name here, never `shown` (which appends the place for the TwoEntries message).
         let export = symbols_of(names, key, it.text, &shown)?.export;
         let rank = match export.as_deref() {
             Some(HOSTED_START) => 0,
@@ -1221,6 +1273,39 @@ impl FrontEnd for Front2Program<'_> {
     fn const_record(&self, item: ItemKey) -> Option<&DataRecord<Global>> {
         let at = self.const_values.binary_search_by_key(&item, |(k, _)| *k).ok()?;
         Some(&self.const_values[at].1)
+    }
+
+    /// `need` at ground `args` (types of `from`) by the evaluator the program kept: a constant
+    /// read by path (`Consts::value_with_args`: a trait's constant selected at `args[0]`), or
+    /// a const block of a body (`Consts::block_value`, under the block's key over the owner's
+    /// text). The evaluator checks any body and makes any impl row the value needs.
+    fn const_at(&mut self, need: super::const_at::ConstNeed, from: tc::PTys<'_>, args: &[tc::PTy]) -> Result<DataRecord<Global>, super::const_at::ConstAtWhy> {
+        let mut records = Records {
+            names: self.front.names,
+            keys: &mut self.front.keys,
+            index: &self.front.index,
+            store: &mut self.store,
+            buckets: &mut self.buckets,
+            order: BuildOrder::AsAsked,
+            // As while `const_values` evaluates: a head's array length met inside this
+            // evaluation is `ConstFail::Nested`, never a second evaluation inside the first.
+            consts: None,
+        };
+        let made = match need {
+            super::const_at::ConstNeed::Item(item) => self.consts.value_with_args(&mut records, self.prepared, item, from, args, Alloc::global()),
+            super::const_at::ConstNeed::Block { owner, block } => {
+                let Some(text) = records.store.fns.get(&owner).map(|h| h.text) else {
+                    return Err(super::const_at::ConstAtWhy::Eval(super::consts::ConstFail::Body { item: owner, error: super::body::BodyError::NoHead(owner) }));
+                };
+                let key = super::const_at::block_key(owner, block, text);
+                self.consts.block_value(&mut records, self.prepared, owner, block, key, from, args, Alloc::global())
+            }
+        };
+        made.map(super::const_at::data_record).map_err(super::const_at::ConstAtWhy::Eval)
+    }
+
+    fn evaluates_at_args(&self) -> bool {
+        true
     }
 
     fn last_projection(&self) -> Option<Box<str>> {

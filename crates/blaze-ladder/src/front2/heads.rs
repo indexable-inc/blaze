@@ -438,6 +438,10 @@ pub struct Store<'n> {
     pub preds: HashMap<ItemKey, Preds, Global>,
     /// The `sized` lang trait: each own type parameter's implied bound.
     pub sized: Option<LibKey>,
+    /// The library's `Box`, `Rc`, `Arc` and `Pin`, a trait method's typed receiver is read
+    /// against for dyn compatibility ([`super::receiver::Pointers::find`]; set by the maker of
+    /// the store: [`Store::new`] leaves them not looked up, so every such receiver is a gap).
+    pub pointers: super::receiver::Pointers,
     /// Each trait's parts of the checker's `TraitDef` that need its members lowered.
     pub trait_defs: HashMap<ItemKey, TraitExtra, Global>,
     /// The member fns whose signature could not be made, by why: their container's head is
@@ -461,6 +465,11 @@ pub struct Store<'n> {
     /// `Store::fn_life`, `Store::adt_life`, `Store::container_life`): what the erased types
     /// above leave out and the borrow check reads.
     pub lives: super::lifetimes::Lives,
+    /// The run's sources a body's macro calls expand with ([`super::body_host::BodyHost`]:
+    /// the crate's environment, its texts, the proc-macro runner), the same item-level
+    /// expansion reads. `None` (as [`Store::new`] makes it): every `env!`, include and proc
+    /// macro in a body is refused by name. The command sets it once, before any body.
+    pub sources: Option<&'n dyn super::body_host::BodySources>,
 }
 
 /// A trait's clauses on `Self` and its associated types with their keys and defaults (in the
@@ -494,9 +503,20 @@ fn bad(key: LibKey) -> impl Fn(Why) -> HeadError {
 /// The fn's anonymous type parameters (the Reference, "Impl trait", "Anonymous type
 /// parameters"): each `impl Trait` in a parameter's type, numbered from `base` (after the
 /// declared generics) in order of appearance in the text, an outer one before those in its
-/// bounds' type arguments (`impl Into<impl Show>`: the `Into` one first). One inside an
-/// associated item constraint (`impl Iterator<Item = impl Show>`) is not walked to, so it stays
-/// refused where it is made. A work list, no recursion.
+/// bounds' type arguments (`impl Into<impl Show>`: the `Into` one first), and then those in its
+/// bounds' associated type bindings (`impl IntoIterator<Item = impl Into<u64>>`: the
+/// `IntoIterator` one, then the `Into<u64>` one; clap's `ArgGroup::args(self, ns: impl
+/// IntoIterator<Item = impl Into<Id>>)`). The Reference, "Impl trait": "`impl Trait` can only
+/// appear as a parameter or return type of a non-extern function": the inner one is in the
+/// parameter's type, so it is an anonymous type parameter too; its bounds are filed by
+/// `Preds::impl_bounds` from this list and the binding lowers to its `Param(i)` through
+/// `env.anon`. A binding's type follows the path's type arguments, which is text order: a
+/// binding is written after every argument of its segment, and only on a trait path's last
+/// segment. Not walked to, so refused where made ("an `impl Trait` type outside a fn's
+/// parameters and return type"): an `impl` in a parenthesized `Fn(..) -> ..` bound, in a
+/// binding's own arguments (`Out<impl X> = Y`) or under an associated type bound
+/// (`Item: Into<impl X>`). Note: `impl Into<impl Show>` is accepted here and refused by rustc
+/// (E0666); left as it is. A work list, no recursion.
 pub(super) fn anon_params(v: &View<'_>, base: u32, out: &mut Vec<(lf::TypeId, u32), Global>) -> Result<(), Why> {
     let mut todo: Vec<lf::TypeId, Global> = Vec::new_in(Global);
     let mut kids: Vec<lf::TypeId, Global> = Vec::new_in(Global);
@@ -509,7 +529,21 @@ pub(super) fn anon_params(v: &View<'_>, base: u32, out: &mut Vec<(lf::TypeId, u3
             out.push((t, base + out.len() as u32));
             for &b in v.rows(bounds)? {
                 if let lf::Bound::Trait { ty, .. } = lf::Bound::decode(b)? {
+                    // The path (its type arguments are its children), then its bindings' types.
                     kids.push(ty);
+                    if let lf::TypeRef::Path(p) = v.ty(ty)? {
+                        for &sn in v.segments(v.path(p)?)? {
+                            let s = lf::Segment::decode(sn)?;
+                            if !s.has_args || s.parenthesized {
+                                continue;
+                            }
+                            for &a in v.rows(s.args)? {
+                                if let lf::GenericArg::AssocType { ty: bound_ty, .. } = lf::GenericArg::decode(a)? {
+                                    kids.push(bound_ty);
+                                }
+                            }
+                        }
+                    }
                 }
             }
         } else {
@@ -695,6 +729,7 @@ impl<'n> Store<'n> {
             fns: HashMap::new_in(Global),
             preds: HashMap::new_in(Global),
             sized,
+            pointers: super::receiver::Pointers::NOT_LOOKED_UP,
             trait_defs: HashMap::new_in(Global),
             fn_gaps: HashMap::new_in(Global),
             ctors: HashMap::new_in(Global),
@@ -702,6 +737,7 @@ impl<'n> Store<'n> {
             opaques: HashMap::new_in(Global),
             locals: super::locals::Locals::new(frame),
             lives: super::lifetimes::Lives::new_in(Alloc::global()),
+            sources: None,
         }
     }
 
@@ -967,7 +1003,7 @@ impl<'n> Store<'n> {
                 ItemDetail::Const { .. } => DynMember::Const,
                 d => return Err(Why::Unsupported(crate::front::detail_name(d), whole)),
             };
-            let shape = super::dyn_ty::member(&b.resolver, module, self.sized, kind, &low.view())?;
+            let shape = super::dyn_ty::member(&b.resolver, module, self.sized, &self.pointers, kind, &low.view())?;
             members.push(tc::dyn_compat::MemberFacts { name: Name::of(m.name), shape });
         }
         for (name, own_params) in assoc_own {
@@ -1236,11 +1272,21 @@ impl<'n> Store<'n> {
         let b = Builder { resolver: Paths { names }, heads: &self.maps };
         let generics = own_generics(&b, &mut self.tys, module, v, 0, &mut ps, &mut cs)?;
         let env = Env { module, params: &ps, bounds: Bounds::Building(&[]), self_: SelfTy::None, self_assoc: &[], anon: &[], consts: &cs };
+        // The self type FIRST, then the bounds with `Self` known: the Reference, "Paths",
+        // "`Self`": "In an implementation, it refers to the type being implemented", the
+        // impl's where clauses included (ruint's `impl<.., T> UintTryTo<T> for Uint<BITS,
+        // LIMBS> where T: for<'a> TryFrom<&'a Self>`). A `T::X` in the self type is read
+        // through the bounds of `T` as written in this header (`Bounds::Building`:
+        // [`super::written`], by name), never through the lowered list, which needs `Self`.
+        // The self type itself naming `Self` has nothing to refer to: refused by that name.
+        let self_ty = b.ty(&mut self.tys, &env, v, lf::TypeId(v.head[head::SELF_TY])).map_err(|why| match why {
+            Why::Unsupported(super::types::SELF_HERE, r) => Why::Unsupported("an impl's self type naming `Self`", r),
+            other => other,
+        })?;
+        let env = Env { self_: SelfTy::Ty(self_ty, None), ..env };
         let mut bounds = Vec::new_in(Global);
         b.param_bounds(&mut self.tys, &env, v, 0, &mut bounds)?;
         let env = Env { bounds: Bounds::Done(&bounds), ..env };
-        let self_ty = b.ty(&mut self.tys, &env, v, lf::TypeId(v.head[head::SELF_TY]))?;
-        let env = Env { self_: SelfTy::Ty(self_ty, None), ..env };
         let (trait_, trait_args, written) = match v.head_opt(head::TRAIT) {
             Some(t) => {
                 // `trait_ref` gives a clause's arguments, `Self` first; the checker's

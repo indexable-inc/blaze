@@ -426,6 +426,13 @@ pub enum Def {
     /// A built-in type named by its path (the Reference, "Primitive types"; "Paths": `u32` in
     /// `u32::MAX` is a type, and the segment after it is its associated item).
     Prim(Prim),
+    /// `Self` in an impl whose self type is no struct, enum or union (a parameter, an array, a
+    /// primitive, a tuple, a reference): the self type of the impl the body is a member of (the
+    /// Reference, "Paths", "`Self`": "In an implementation, it refers to the type being
+    /// implemented."). The type itself is the impl header's ([`World::impl_header`]), a read
+    /// of its own, so this answer holds no type. An ADT's `Self` stays [`Def::Adt`], which
+    /// constructor and struct paths take.
+    SelfTy,
 }
 
 /// A built-in type a path can name: the first segment of `u32::MAX`, `str::len`,
@@ -1179,7 +1186,7 @@ impl<'w, 'a, W: World> Reads<'w, 'a, W> {
                 }
                 Def::Trait(k) => second.push(Question::TraitDef(k)),
                 Def::Const(k) | Def::Static(k, _) => second.push(Question::FnSig(k)),
-                Def::TyParam(_) | Def::Prim(_) => {}
+                Def::TyParam(_) | Def::Prim(_) | Def::SelfTy => {}
             }
         }
         for e in body.exprs {
@@ -1589,6 +1596,7 @@ impl ContentHash for Def {
                     }
                 }
             }
+            Def::SelfTy => h.tag(8),
         }
     }
 }

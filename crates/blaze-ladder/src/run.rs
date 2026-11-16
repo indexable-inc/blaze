@@ -85,6 +85,11 @@ pub enum RunError {
     /// failed, its ADT row was not made, it has no head): the cause, not the symptom ("no ABI",
     /// "no ADT row", "no callee"). `path` is its name where the front end gives it.
     LeftOut { function: Named, item: ItemKey, path: Option<Box<str>>, why: Box<str> },
+    /// A constant (or a `const { .. }` block) the instance of `function` reads, at the
+    /// instance's ground arguments, which the front end's evaluator refused before the walk
+    /// (front2/const_at.rs): the evaluator's own reason. `path` is the constant's (or the
+    /// block's owner's) name where the front end gives it.
+    ConstAt { function: Named, refusal: crate::front2::const_at::ConstAtRefusal, path: Option<Box<str>> },
     /// The build of `function` asked the seam to normalize a projection and got no type: `why`
     /// names the trait, `Self`'s form and the solver's error (the seam's `last_projection`).
     Projection { function: Named, why: Box<str> },
@@ -116,6 +121,9 @@ pub enum RunError {
     Edition { written: Box<str, Global> },
     /// The names library refused the program's crates (its error, as shown).
     Names { shown: Box<str, Global> },
+    /// The package's manifest does not say what the run needs of it (its name, its edition):
+    /// the command's reader's words (blaze-cli program.rs `package`).
+    Manifest { why: Box<str, Global> },
     /// The rule `entry-takes-roots` (D59): `main`'s shape has no entry module, or a finding
     /// inside the appended `__blaze_entry`, reported at `main`'s parameters in the root file
     /// `file` (the user never wrote the appended text).
@@ -166,6 +174,10 @@ impl core::fmt::Display for RunError {
                 Some(path) => write!(f, "`{function}` needs `{path}` ({:#x}), which the program left out: {why}", item.0),
                 None => write!(f, "`{function}` needs item {:#x}, which the program left out: {why}", item.0),
             },
+            RunError::ConstAt { function, refusal, path } => match path {
+                Some(path) => write!(f, "`{function}` reads `{path}`: {refusal}"),
+                None => write!(f, "`{function}`: {refusal}"),
+            },
             RunError::Resolve { function, callee, path, error } => match path {
                 Some(path) => write!(f, "`{function}` calls trait fn `{path}` ({:#x}): {error}", callee.0),
                 None => write!(f, "`{function}` calls trait fn {:#x}: {error}", callee.0),
@@ -193,6 +205,7 @@ impl core::fmt::Display for RunError {
             RunError::Crates(error) => write!(f, "the new front end's crates: {error}"),
             RunError::Edition { written } => write!(f, "the edition `{written}` is none the names library knows"),
             RunError::Names { shown } => write!(f, "the names library: {shown}"),
+            RunError::Manifest { why } => write!(f, "the package's manifest: {why}"),
             RunError::Entry { why, .. } => write!(f, "{why}"),
             RunError::NotBuilt { refusal, not_built, reached } => write!(
                 f,
@@ -285,6 +298,7 @@ impl RunError {
             | RunError::Vtable { ref function, .. }
             | RunError::MainShape { main: ref function, .. }
             | RunError::NoHost { start: ref function }
+            | RunError::ConstAt { ref function, .. }
             | RunError::Const { constant: ref function, .. } => Some(function.at),
             RunError::TooManyInstances
             | RunError::NoMain
@@ -294,6 +308,7 @@ impl RunError {
             | RunError::Front2(_)
             | RunError::Crates(_)
             | RunError::Edition { .. }
+            | RunError::Manifest { .. }
             | RunError::Names { .. } => None,
         }
     }
@@ -307,6 +322,10 @@ struct FrontAdts<'a, P>(&'a P, usize, &'a [(ItemKey, DataRecord<Global>)], &'a B
 /// literal's type) and every closure's facts.
 struct Bodies<'a> {
     checked: &'a [Option<Checked<'static>>],
+    /// Each constant and const block an instance built so far reads, at its ground arguments,
+    /// as the front end evaluated it before that instance's walk (front2/const_at.rs): what
+    /// [`FrontAdts`]'s `const_value` and `const_block_value` read.
+    const_at: crate::front2::const_at::ConstTable<Global>,
     closures: ClosureTable,
     /// Every async block's facts, the states of the coroutine instances built so far, and the
     /// library's async items (front2/coroutines.rs).
@@ -938,21 +957,31 @@ impl<P: FrontEnd> Adts for FrontAdts<'_, P> {
     /// constants (the two never both hold one: front2 tables no constant).
     ///
     /// `args` (the path's recorded arguments, ground at the instance: blaze-typeck
-    /// `Checked::const_args_of`) do not pick the record here: every record held was evaluated
-    /// at NO arguments, and the evaluator grounds each type it reads at the evaluation's
-    /// arguments, refusing a generic parameter it has none for (blaze-build instance.rs
-    /// `ground`: "a generic parameter with no argument"). So a record that exists read no
-    /// parameter, and its value is the same at every instance (an inherent `impl<T> W<T> {
-    /// const N: usize = 4; }`). A constant whose value reads its arguments (a trait's constant
-    /// selected at `Self`: `<T as SizedTypeProperties>::SIZE`) has no record (front2:
-    /// `ConstFail::TraitConstNoSelf`) and stays `NoConstValue` until front2 evaluates
-    /// constants at ground arguments (walk-AH Brief 9b).
+    /// `Checked::const_args_of`): a path with arguments reads the value pulled for this
+    /// instance before its walk, at exactly those arguments (front2/const_at.rs; the table is
+    /// keyed by the constant and its arguments, so `<u8 as P>::S` and `<Q as P>::S` are two
+    /// rows). A front end that evaluates no constant at arguments (the old front) pulls none;
+    /// its records were evaluated at NO arguments, and its evaluator refuses a generic
+    /// parameter it has none for, so such a record read no parameter and is the same at every
+    /// instance. front2 makes no record at no arguments for a path with arguments
+    /// (program.rs `const_values`): there the table is the only answer.
     fn const_value(&self, item: ItemKey, args: &[PTy]) -> Option<&DataRecord<Global>> {
-        let _ = args;
+        if !args.is_empty()
+            && let Some(record) = self.4.const_at.get(crate::front2::const_at::ConstNeed::Item(item), args)
+        {
+            return Some(record);
+        }
         match self.0.const_record(item) {
             Some(record) => Some(record),
             None => self.2.iter().find(|(k, _)| *k == item).map(|(_, record)| record),
         }
+    }
+
+    /// `const { .. }` block `block` of `owner` at the instance's ground arguments `args`: the
+    /// value pulled before the instance's walk (front2/const_at.rs), keyed by the block and its
+    /// arguments, so `const { size_of::<T>() }` at `u64` and at `u16` are two rows.
+    fn const_block_value(&self, owner: ItemKey, block: blaze_typeck::ExprId, args: &[PTy]) -> Option<&DataRecord<Global>> {
+        self.4.const_at.get(crate::front2::const_at::ConstNeed::Block { owner, block }, args)
     }
 
     fn intrinsic(&self, item: ItemKey) -> Option<Intrinsic> {
@@ -1028,10 +1057,24 @@ pub struct Built {
     /// With thread-locals: the getter's slot.
     getter: Option<u32>,
     /// By stub number: why the instance in that stub's slot was not built (crate::stub).
-    /// Empty unless the build stubbed its refusals ([`Refused::Stub`]).
+    /// Empty unless the build stubbed its refusals ([`build_stubbed`]).
     refused: Vec<RunError, Global>,
     /// The instances the entry reaches, built or not: the slots before the getter's.
     reached: u32,
+}
+
+impl Built {
+    /// Why each stubbed instance was not built, by stub number: empty unless the build stubbed
+    /// its refusals ([`build_stubbed`]). What a run that calls one stops with; read without
+    /// running by examples/hello_stops.rs, which lists them all.
+    pub fn refused(&self) -> &[RunError] {
+        &self.refused
+    }
+
+    /// The instances the entry reaches, built or stubbed.
+    pub fn reached(&self) -> u32 {
+        self.reached
+    }
 }
 
 /// The machine the code is emitted for. Every Apple M-series core implements FEAT_LSE
@@ -1228,6 +1271,68 @@ pub fn build_over(names: &blaze_scope::resolve::Names<'_>, files: &[SourceFile<'
     })
 }
 
+/// `blaze run`'s call on the new front end: the program of `files` built with a STUB for each
+/// reached function this build of blaze cannot make ([`build_stubbed`]), placed and its entry
+/// called. `Ok` is the program's own status with the two counts the command's closing note
+/// prints ([`Ran`]); a called stub is [`RunError::NotBuilt`] naming that function's refusal.
+pub fn run_program(files: &[SourceFile<'_>], root: &str, host: Option<NonNull<c_void>>, new: NewFront<'_>) -> Result<Ran, RunError> {
+    let tc = match new.shelf {
+        Some(shelf) => Toolchain::open(&mut DirShelf::new(shelf.into())).map_err(RunError::Crates)?,
+        None => Toolchain::none(),
+    };
+    let texts = ProgramTexts::new(files, root, new, &tc)?;
+    let user = texts.user();
+    let inputs = Inputs::new(&user, &tc).map_err(RunError::Crates)?;
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates).map_err(|e| RunError::Names { shown: std::format!("{e}").into_boxed_str() })?;
+    let built = build_stubbed(&names, files, &texts)?;
+    ran_built(built, host)
+}
+
+/// [`build_over`] for a run that starts although some reached function cannot be built: a
+/// function not yet compiled is a stub (docs/v2/plan/design/bottom.md, section 11), and the
+/// first call of a stub whose function blaze cannot build stops the program AT THAT CALL with
+/// an error naming the function and the refusal (crate::stub; [`RunError::NotBuilt`]).
+///
+/// This is not a fallback (rule 3): no other route is taken and nothing is skipped quietly. A
+/// function that is never called was never owed its code; one that is called and has none
+/// stops the program by name; and the run's answer carries how many reached functions are not
+/// built ([`Ran::not_built`] of [`Ran::reached`]), which the command prints.
+///
+/// The program is still refused BEFORE it starts when the finding is its own: its entry did
+/// not check (the strict front end names why), or a function or item of its own crate was left
+/// out ([`Front2Program::own_left_out`]). Only a library's function blaze cannot check or
+/// build is left behind a stub.
+pub fn build_stubbed(names: &blaze_scope::resolve::Names<'_>, files: &[SourceFile<'_>], texts: &ProgramTexts) -> Result<Built, RunError> {
+    let (root_file, appended) = (texts.root_file, texts.appended);
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).map_err(|e| RunError::Names { shown: std::format!("the command's frame: {e}").into_boxed_str() })?;
+    // The survey front leaves a fn it refuses out of the program (each caller's build then
+    // names it: [`RunError::LeftOut`]); its list of them is the seam's `left_out`, read there.
+    let mut left_out = Vec::new_in(Global);
+    let mut program = Front2Program::survey(names, &frame, files, &mut left_out).map_err(RunError::Front2)?;
+    if program.entry().is_none() {
+        // The entry did not check or could not be tabled: the strict front end stops at
+        // exactly that, and its refusal is the answer.
+        return Err(match Front2Program::new(names, &frame, files) {
+            Err(refusal) => RunError::Front2(refusal),
+            Ok(_) => RunError::NoMain,
+        });
+    }
+    if let Some((item, why)) = program.own_left_out() {
+        return Err(RunError::Front2(Front2Refusal::OwnLeftOut { item, why }));
+    }
+    let built = build_from(&mut program, None, None, true).map_err(|error| match (appended, error.function_at()) {
+        // As [`build_over`]: a finding inside text the user never wrote is at `main`'s parameters.
+        (Some(a), Some(at)) if at.file as usize == root_file && at.place >= a.user_len => RunError::Entry {
+            file: root_file as u32,
+            range: a.params,
+            why: std::format!("the entry module cannot call `main` with its roots ({}): {error}", crate::front2::entry::RULE).into_boxed_str(),
+        },
+        _ => error,
+    })?;
+    built.ok_or(RunError::NoMain)
+}
+
 /// [`build`], the `blaze::` attributes the front end read put in `blaze`.
 fn build_noting(files: &[SourceFile<'_>], root: &str, blaze: &mut BlazeAttrs) -> Result<Built, RunError> {
     let mut program = Front::new(files, root, blaze).map_err(|refusal| {
@@ -1243,18 +1348,19 @@ fn build_noting(files: &[SourceFile<'_>], root: &str, blaze: &mut BlazeAttrs) ->
 /// evaluated, instances built from the entry forward, emitted.
 pub fn build_with<P: FrontEnd>(program: &mut P) -> Result<Built, RunError> {
     // Only a survey goes on with no entry: a run's `None` is no `main`.
-    build_from(program, None, None)?.ok_or(RunError::NoMain)
+    build_from(program, None, None, false)?.ok_or(RunError::NoMain)
 }
 
 /// The run path's code records (code_records.rs; run.md pieces 3 and 7): every instance the
 /// entry reaches, each as one entry in `records.store` under its full key, computed before the
 /// work. An instance whose key the store holds is not built: its entry's declared instances are
 /// what the walk goes on to. A made instance's record names every target by symbol or C name;
-/// nothing is placed or run. `records.met` lists each instance met, in the walk's order.
-/// Thread-locals' getter and the program's vtables and statics are not made as records here
-/// (refused nowhere: they are data and one getter a program, placed by the launcher's piece).
+/// nothing is placed or run. `records.met` lists each instance met, in the walk's order, then
+/// the thread-local getter when the program has thread-locals: one function a program, made as
+/// its own record (`RecordRun::getter`) since no caller declares it. The program's vtables and
+/// statics are data, not records here: placed by the launcher's piece.
 pub fn build_records<P: FrontEnd>(program: &mut P, records: &mut crate::code_records::RecordRun<'_>) -> Result<(), RunError> {
-    build_from(program, None, Some(records))?;
+    build_from(program, None, Some(records), false)?;
     Ok(())
 }
 
@@ -1291,14 +1397,22 @@ pub struct SurveyCounts {
 /// walk goes on, so one refusal hides nothing behind it but the callees of the refused fn.
 pub fn build_survey<P: FrontEnd>(program: &mut P, refused: &mut Vec<(Box<str>, Box<str>), Global>) -> Result<SurveyCounts, RunError> {
     let mut counts = SurveyCounts { built: 0, tried: 0, no_instance: Vec::new_in(Global) };
-    build_from(program, Some((refused, &mut counts)), None)?;
+    build_from(program, Some((refused, &mut counts)), None, false)?;
     Ok(counts)
 }
 
 /// In a survey, `e` filed by its fn and typed name (a callee's prefixed `callee:`, the
-/// emitter's `emit:`) and the walk goes on; in a run, `e` stops it.
-fn filed(survey: &mut Option<&mut Vec<(Box<str>, Box<str>), Global>>, e: RunError) -> Result<(), RunError> {
-    let Some(out) = survey.as_deref_mut() else { return Err(e) };
+/// emitter's `emit:`) and the walk goes on; in the stub build, `e` kept as its slot's refusal
+/// ([`Stubs::keep`]) and the walk goes on; in a strict run, `e` stops it.
+fn filed(sink: &mut Sink<'_>, e: RunError) -> Result<(), RunError> {
+    if let Some(stubs) = sink.stubs.as_mut() {
+        if !stubbed(&e) {
+            return Err(e);
+        }
+        stubs.keep(e);
+        return Ok(());
+    }
+    let Some(out) = sink.survey.as_deref_mut() else { return Err(e) };
     let (function, class) = match &e {
         // The builder's refusal with its own words (a `Malformed`'s `what`), cut to one line.
         RunError::Build { function, error, .. } => {
@@ -1325,6 +1439,14 @@ fn filed(survey: &mut Option<&mut Vec<(Box<str>, Box<str>), Global>>, e: RunErro
         RunError::LeftOut { function, item, path, why } => {
             let shown = path.as_deref().map_or_else(|| format!("{:#x}", item.0), |p| format!("`{p}`"));
             let said = format!("left out: {shown}: {why}");
+            (function, Box::from(said.char_indices().nth(240).map_or(&*said, |(i, _)| &said[..i])))
+        }
+        // By the constant and the evaluator's reason, so each refused constant is one class.
+        RunError::ConstAt { function, refusal, path } => {
+            let said = match path {
+                Some(path) => format!("const at the instance: `{path}`: {refusal}"),
+                None => format!("const at the instance: {refusal}"),
+            };
             (function, Box::from(said.char_indices().nth(240).map_or(&*said, |(i, _)| &said[..i])))
         }
         // By the error's variant chain (`Check(Solve(Overflow`) and the callee's name, so each
@@ -1368,28 +1490,136 @@ struct Tables {
     images: Vec<VtableImage, Global>,
 }
 
-/// The reached instances: slot `n` is `instances[n]`, of fn `tabled[n]`, told apart by `keys[n]`.
+/// The reached instances: slot `n` is `instances[n]`, of fn `tabled[n]`, told apart by `keys[n]`
+/// (`None`: a reference the stub build could not resolve or key, in a slot of its own).
 struct Reached {
     instances: Vec<Instance, Global>,
     tabled: Vec<usize, Global>,
-    keys: Vec<InstanceKey, Global>,
+    keys: Vec<Option<InstanceKey>, Global>,
+    /// The stub build's unresolved references ([`Reached::unresolved`]): each one's slot and
+    /// refusal, in slot order; the walk takes a slot's refusal when it comes to that slot.
+    pre: Vec<(usize, Option<RunError>), Global>,
+    /// How many of `pre` the walk has passed.
+    pre_taken: usize,
 }
 
 impl Reached {
     /// `callee`'s slot (of fn `c`, key `key`): the one reached before under that key, else a new
     /// one at the end, built in its turn.
     fn slot(&mut self, callee: Instance, c: usize, key: InstanceKey) -> Result<u32, RunError> {
-        let slot = match self.keys.iter().position(|&known| known == key) {
+        let slot = match self.keys.iter().position(|&known| known == Some(key)) {
             Some(slot) => slot,
             None => {
                 self.instances.push(callee);
                 self.tabled.push(c);
-                self.keys.push(key);
+                self.keys.push(Some(key));
                 self.instances.len() - 1
             }
         };
         u32::try_from(slot).map_err(|_| RunError::TooManyInstances)
     }
+
+    /// A slot of its own for `called`, a reference of fn `caller` that has no instance (it did
+    /// not resolve, or has no key): the slot holds a stub with `refusal`, so the caller is built
+    /// and only a call through this reference stops the program.
+    fn unresolved(&mut self, called: Instance, caller: usize, refusal: RunError) -> Result<u32, RunError> {
+        let slot = self.instances.len();
+        self.instances.push(called);
+        self.tabled.push(caller);
+        self.keys.push(None);
+        self.pre.push((slot, Some(refusal)));
+        u32::try_from(slot).map_err(|_| RunError::TooManyInstances)
+    }
+
+    /// The refusal `slot` was made with, once: `Some` only for a slot of [`Reached::unresolved`].
+    fn refusal_of(&mut self, slot: usize) -> Option<RunError> {
+        let (at, refusal) = self.pre.get_mut(self.pre_taken)?;
+        if *at != slot {
+            return None;
+        }
+        self.pre_taken += 1;
+        refusal.take()
+    }
+}
+
+/// Where the walk of [`build_from`] puts a refusal it can go on from ([`filed`]): nowhere (a
+/// strict build stops at it), a survey's list, or the stub build's table.
+struct Sink<'a> {
+    survey: Option<&'a mut Vec<(Box<str>, Box<str>), Global>>,
+    stubs: Option<Stubs>,
+}
+
+/// The stub build's refusals ([`build_stubbed`]): each instance that could not be built keeps
+/// its FIRST refusal, and its slot holds a stub with that refusal's number (crate::stub).
+struct Stubs {
+    /// By stub number ([`Built::refused`]).
+    refused: Vec<RunError, Global>,
+    /// The slot the walk is at.
+    slot: usize,
+    /// The slot `refused`'s last is of.
+    last: Option<usize>,
+}
+
+impl Stubs {
+    /// `refusal` kept as the walk's slot's, unless that slot has one already.
+    fn keep(&mut self, refusal: RunError) {
+        if self.last != Some(self.slot) {
+            self.refused.push(refusal);
+            self.last = Some(self.slot);
+        }
+    }
+
+    /// The stub for `slot`, the last slot refused; `None` when `slot` kept no refusal.
+    fn body(&self, slot: usize) -> Option<Body> {
+        if self.last != Some(slot) {
+            return None;
+        }
+        let number = u32::try_from(self.refused.len().checked_sub(1)?).ok()?;
+        let mut code = Code::new_in(Global);
+        code.bytes.extend_from_slice(&crate::stub::code(number));
+        code.fixups.push(blaze_emit::Fixup { at: crate::stub::STOPS_AT, place: 0 });
+        code.fixups.push(blaze_emit::Fixup { at: crate::stub::STOP_AT, place: 1 });
+        let mut targets = Vec::with_capacity_in(2, Global);
+        targets.push(Target::Stops);
+        targets.push(Target::Stop);
+        Some(Body { code, targets, statics: Vec::new_in(Global), tls: Vec::new_in(Global), vtables: Vec::new_in(Global) })
+    }
+}
+
+/// A call of `called` by fn `caller` that has no instance (`refusal`): in the stub build a slot
+/// of its own holding a stub (`Some`: the caller is built, and stops only if it makes this
+/// call); else `refusal` goes to [`filed`] and the caller is left unbuilt (`None`).
+fn unresolved(sink: &mut Sink<'_>, reached: &mut Reached, called: Instance, caller: usize, refusal: RunError) -> Result<Option<u32>, RunError> {
+    if sink.stubs.is_some() && stubbed(&refusal) {
+        return reached.unresolved(called, caller, refusal).map(Some);
+    }
+    filed(sink, refusal)?;
+    Ok(None)
+}
+
+/// The stub build's own error: a slot of `function` left with neither a body nor a refusal, so
+/// slot `n` would not be `bodies[n]`.
+fn unstubbed(function: Named) -> RunError {
+    RunError::Build { function, error: BuildError::Malformed { what: "a slot the stub build left with neither a body nor a refusal" }, range: None }
+}
+
+/// Whether `e` is a refusal of ONE instance (the walk can go on past it): what a survey files
+/// and the stub build puts behind a stub. Any other error is the whole build's.
+fn stubbed(e: &RunError) -> bool {
+    matches!(
+        e,
+        RunError::Build { .. }
+            | RunError::ItemRefused { .. }
+            | RunError::NoAdt { .. }
+            | RunError::Emit { .. }
+            | RunError::CodeRecord { .. }
+            | RunError::Callee { .. }
+            | RunError::Projection { .. }
+            | RunError::LeftOut { .. }
+            | RunError::ConstAt { .. }
+            | RunError::Resolve { .. }
+            | RunError::Vtable { .. }
+    )
 }
 
 /// A refusal's typed name: its `Debug` form up to its first field.
@@ -1402,23 +1632,31 @@ fn class_of(debug: &str) -> Box<str> {
 ///
 /// With `records` ([`build_records`]): each instance is made as a code record into its store
 /// (or found there by key and not built), no body is kept, and the answer is `None`.
+///
+/// With `stub_refusals` ([`build_stubbed`]; never with a survey or `records`): an instance the
+/// walk cannot build keeps its first refusal and its slot holds a stub (crate::stub), and a
+/// reference that has no instance gets a stub slot of its own ([`unresolved`]): the answer's
+/// `refused` lists them by stub number.
 fn build_from<P: FrontEnd>(
     program: &mut P,
     surveyed: Option<(&mut Vec<(Box<str>, Box<str>), Global>, &mut SurveyCounts)>,
     mut records: Option<&mut crate::code_records::RecordRun<'_>>,
+    stub_refusals: bool,
 ) -> Result<Option<Built>, RunError> {
-    let (mut survey, mut counts) = match surveyed {
+    let (survey, mut counts) = match surveyed {
         Some((refused, counts)) => (Some(refused), Some(counts)),
         None => (None, None),
     };
-    let entry = match (program.entry(), &survey) {
+    let stubs = stub_refusals.then(|| Stubs { refused: Vec::new_in(Global), slot: 0, last: None });
+    let mut survey = Sink { survey, stubs };
+    let entry = match (program.entry(), survey.survey.is_some()) {
         (Some(main), _) => Some(main),
-        (None, Some(_)) => None,
-        (None, None) => return Err(RunError::NoMain),
+        (None, true) => None,
+        (None, false) => return Err(RunError::NoMain),
     };
     // A survey builds what the entry reaches whatever its shape (his `main` takes `cx, io`).
-    let start = match (&survey, entry) {
-        (None, Some(main)) => entry_shape(&*program, main)?,
+    let start = match (survey.survey.is_some(), entry) {
+        (false, Some(main)) => entry_shape(&*program, main)?,
         _ => Start::Plain(Entry::Unit),
     };
     if let Some(main) = entry
@@ -1427,8 +1665,11 @@ fn build_from<P: FrontEnd>(
         return Err(RunError::MainShape { main: program.function(main).named(), what: "it has no body" });
     }
     let checked = program.check_all()?;
-    let program = &*program;
-    let types = program.types();
+    // Kept mutable: between instances the loop pulls the constants the next instance needs at
+    // its ground arguments (`FrontEnd::const_at`, front2/const_at.rs); `program` is a shared
+    // borrow of it, taken again in each step of the loop and after it.
+    let program_mut = program;
+    let program = &*program_mut;
     let consts = eval_consts(program, &checked)?;
     let langs = BackLangs::of(program)?;
     let (image, tls_layout) = static_image(program, &consts)?;
@@ -1439,17 +1680,19 @@ fn build_from<P: FrontEnd>(
     // instance (`instance_key_normalized`): two instances that differ only there never share
     // one. A closure's `Fn*` method instance keys its owner's code at the owner's arguments,
     // then the method and the instance's own arguments ([`closure_key_args`]).
-    let checked_bodies = Bodies {
+    let mut checked_bodies = Bodies {
         checked: &checked,
         closures: ClosureTable::of(program, &checked),
         coroutines: crate::front2::coroutines::Coroutines::of(program, &checked, Alloc::global()),
+        const_at: crate::front2::const_at::ConstTable::new_in(Global),
     };
     // Each coroutine instance built, its three functions waiting for their slots.
     let mut coroutine_stash: Vec<BuiltParts, Global> = Vec::new_in(Global);
     // The instance key over the code identity `code`: `key_of`'s with the item's text (which
     // tells instances apart in this run), a record key's with the item's identity alone (its
     // ground facts: code_records.rs, part 3; the body is in the record key's body digest).
-    let key_with = |code: ContentId, c: usize, instance: Instance, ground: &mut PortableTys<'_>, facts: &dyn LayoutFacts| {
+    // `program` is a parameter, not captured: the loop takes `program_mut` between instances.
+    let key_with = |program: &P, code: ContentId, c: usize, instance: Instance, ground: &mut PortableTys<'_>, facts: &dyn LayoutFacts| {
         let fail = |error| match error {
             // A key's projection the seam did not answer: named by its cause.
             BuildError::Projection { .. } if let Some(why) = program.last_projection() => RunError::Projection { function: program.function(c).named(), why },
@@ -1468,39 +1711,41 @@ fn build_from<P: FrontEnd>(
         };
         blaze_build::instance_key_normalized(code, args, from, ground, facts, Alloc::global()).map_err(fail)
     };
-    let key_of = |c: usize, instance: Instance, ground: &mut PortableTys<'_>, facts: &dyn LayoutFacts| key_with(program.code_of(c), c, instance, ground, facts);
+    let key_of = |program: &P, c: usize, instance: Instance, ground: &mut PortableTys<'_>, facts: &dyn LayoutFacts| key_with(program, program.code_of(c), c, instance, ground, facts);
     let keyer = FrontAdts(program, entry.unwrap_or(0), &consts, &langs, &checked_bodies);
     // Slot `n` is the `n`th instance reached; `keys[n]` its key, by which instances are told apart.
     let mut reached = Reached {
         instances: Vec::with_capacity_in(program.fn_count(), Global),
         tabled: Vec::with_capacity_in(program.fn_count(), Global),
         keys: Vec::with_capacity_in(program.fn_count(), Global),
+        pre: Vec::new_in(Global),
+        pre_taken: 0,
     };
     let mut tables = Tables { refs: Vec::new_in(Global), images: Vec::new_in(Global) };
     let mut layouts = Layouts::new_in(Alloc::global());
     if let Some(main) = entry {
         reached.instances.push(Instance { item: program.function(main).key, args: List::EMPTY });
         reached.tabled.push(main);
-        let key = key_of(main, Instance { item: program.function(main).key, args: List::EMPTY }, &mut ground, &keyer)?;
-        reached.keys.push(key);
+        let key = key_of(program, main, Instance { item: program.function(main).key, args: List::EMPTY }, &mut ground, &keyer)?;
+        reached.keys.push(Some(key));
     }
     // A survey seeds every non-generic fn with a checked body, by key (the program's order,
     // never the asking's); a generic one is met at the instances built bodies call it at.
-    let generic = |c: usize| {
+    let generic = |program: &P, c: usize| {
         let sig = program.sig(c);
         sig.parent_count != 0 || sig.own_count != 0
     };
     if counts.is_some() {
         let mut seeds: Vec<(ItemKey, usize), Global> = Vec::new_in(Global);
         for c in 0..program.fn_count() {
-            if Some(c) != entry && program.function(c).body.is_some() && checked[c].is_some() && !generic(c) {
+            if Some(c) != entry && program.function(c).body.is_some() && checked[c].is_some() && !generic(program, c) {
                 seeds.push((program.function(c).key, c));
             }
         }
         seeds.sort_unstable_by_key(|s| s.0);
         for (item, c) in seeds {
             let instance = Instance { item, args: List::EMPTY };
-            let key = match key_of(c, instance, &mut ground, &keyer) {
+            let key = match key_of(program, c, instance, &mut ground, &keyer) {
                 Ok(k) => k,
                 Err(e) => {
                     filed(&mut survey, e)?;
@@ -1509,7 +1754,7 @@ fn build_from<P: FrontEnd>(
             };
             reached.instances.push(instance);
             reached.tabled.push(c);
-            reached.keys.push(key);
+            reached.keys.push(Some(key));
         }
     }
     let mut bodies = Vec::with_capacity_in(program.fn_count(), Global);
@@ -1518,8 +1763,32 @@ fn build_from<P: FrontEnd>(
     // The instance (by `at` after its step) the last coroutine demand was for, and how many
     // it has made: bounded (rule 18).
     let mut demands = (usize::MAX, 0usize);
+    // The constants each instance reads at its ground arguments (front2/const_at.rs), refilled
+    // per instance.
+    let mut const_needs = crate::front2::const_at::Needs::new_in(Global);
     while let Some(&instance) = reached.instances.get(at) {
+        // Shared borrows of the program for this step only: the step takes `program_mut` to
+        // pull its instance's constants before the walk.
+        let program = &*program_mut;
+        let types = program.types();
+        let keyer = FrontAdts(program, entry.unwrap_or(0), &consts, &langs, &checked_bodies);
         at += 1;
+        // The stub build: slot `n` is `bodies[n]`, so a slot whose step kept a refusal and left
+        // no body gets its stub before the next slot's step; a slot made for a reference with
+        // no instance ([`Reached::unresolved`]) is its refusal and nothing else.
+        if let Some(stubs) = survey.stubs.as_mut() {
+            if bodies.len() + 1 < at {
+                bodies.push(stubs.body(at - 2).ok_or_else(|| unstubbed(program.function(reached.tabled[at - 2]).named()))?);
+            }
+            if bodies.len() + 1 != at {
+                return Err(unstubbed(program.function(reached.tabled[at - 1]).named()));
+            }
+            stubs.slot = at - 1;
+            if let Some(refusal) = reached.refusal_of(at - 1) {
+                stubs.keep(refusal);
+                continue;
+            }
+        }
         // Each instance is pushed with its fn's index (`tabled`), so none is looked up again.
         let i = reached.tabled[at - 1];
         let function = program.function(i);
@@ -1537,7 +1806,7 @@ fn build_from<P: FrontEnd>(
                 let symbol = crate::symbols::fn_symbol(instance.item, instance.args, ground.view(), Alloc::global())
                     .map_err(|e| fail(crate::code_records::CodeRecordError::Symbol(e)))?;
                 let body_digest = crate::code_records::body_digest(function.text, Some(&done.reads), Alloc::global());
-                let facts = key_with(crate::symbols::item_identity(function.key), i, instance, &mut ground, &keyer)?;
+                let facts = key_with(program, crate::symbols::item_identity(function.key), i, instance, &mut ground, &keyer)?;
                 let parts = crate::code_records::KeyParts { symbol, body: body_digest, ground: facts.0 };
                 Some((parts, crate::code_records::code_key(&parts, &run.builder)))
             }
@@ -1561,13 +1830,49 @@ fn build_from<P: FrontEnd>(
                     .map_err(fail)?;
                 for &(tabled, callee) in declared.iter() {
                     let c = program.fn_index(tabled).ok_or_else(|| fail(CodeRecordError::NoTabledFn { tabled }))?;
-                    let k = key_of(c, callee, &mut ground, &keyer)?;
+                    let k = key_of(program, c, callee, &mut ground, &keyer)?;
                     reached.slot(callee, c, k)?;
                 }
                 run.met.push(crate::code_records::Met { symbol: parts.symbol, key, parts, function: format!("{}", name()).into_boxed_str(), found: true });
                 continue;
             }
         }
+        // The constants and const blocks this instance reads, at its ground arguments, PULLED
+        // from the front end before the walk (front2/const_at.rs): the walk's `Adts` only reads
+        // them. A plain instance's body only: a closure's, a coroutine's or a shim's instance is
+        // built at its owner's arguments, and the owner's instance, built first (it is what
+        // reaches them), pulled them. A need the evaluator refuses is this instance's refusal.
+        const_needs.clear();
+        if instance.item == function.key && program.evaluates_at_args() {
+            args.clear();
+            args.extend_from_slice(ground.view().list(instance.args).map_err(|_| RunError::Build { function: name(), error: BuildError::Malformed { what: "an instance's arguments past the ground table" }, range: None })?);
+            let view = body.view(types);
+            let facts = FrontAdts(program, i, &consts, &langs, &checked_bodies);
+            if let Err(error) = crate::front2::const_at::needs_of(&view, done, &args, &mut ground, &facts, Alloc::global(), &mut const_needs) {
+                filed(&mut survey, RunError::Build { function: name(), error, range: None })?;
+                continue;
+            }
+        }
+        let named = function.named();
+        if !const_needs.is_empty()
+            && let Err(refusal) = crate::front2::const_at::pull(&mut *program_mut, &const_needs, ground.view(), &mut checked_bodies.const_at)
+        {
+            let item = match refusal.need {
+                crate::front2::const_at::ConstNeed::Item(k) => k,
+                crate::front2::const_at::ConstNeed::Block { owner, .. } => owner,
+            };
+            let path = program_mut.item_named(item);
+            filed(&mut survey, RunError::ConstAt { function: named, refusal, path })?;
+            continue;
+        }
+        // The step's borrows again, after the pull.
+        let program = &*program_mut;
+        let types = program.types();
+        let function = program.function(i);
+        let name = || function.named();
+        let Some((body, _)) = function.body else {
+            return Err(RunError::Callee { function: named, callee: instance.item });
+        };
         args.clear();
         let malformed = |_| RunError::Build { function: name(), error: BuildError::Malformed { what: "an instance's arguments past the ground table" }, range: None };
         // A closure's `Fn*` method instance (`[closure, (A..)]`, tabled as its owner): built
@@ -1726,15 +2031,18 @@ fn build_from<P: FrontEnd>(
                 .or_else(|| closure_owner(program, &adts, called, &ground))
                 .or_else(|| crate::fn_shim::fn_shim_owner(program, &adts, called, &ground, i));
             if let Some(c) = tabled_as {
-                match key_of(c, called, &mut ground, &adts) {
+                match key_of(program, c, called, &mut ground, &adts) {
                     Ok(key) => {
                         via.push(Via::Slot);
                         targets.push(Target::Slot(reached.slot(called, c, key)?));
                     }
-                    Err(e) => {
-                        filed(&mut survey, e)?;
-                        broken = true;
-                    }
+                    Err(e) => match unresolved(&mut survey, &mut reached, called, i, e)? {
+                        Some(slot) => {
+                            via.push(Via::Slot);
+                            targets.push(Target::Slot(slot));
+                        }
+                        None => broken = true,
+                    },
                 }
                 continue;
             }
@@ -1742,25 +2050,41 @@ fn build_from<P: FrontEnd>(
             let (item, resolved) = match program.resolve(i, called.item, called.args, &mut ground) {
                 Ok(r) => r,
                 Err(error) => {
-                    filed(&mut survey, RunError::Resolve { function: name(), callee: called.item, path: program.item_named(called.item), error })?;
-                    broken = true;
+                    let refusal = RunError::Resolve { function: name(), callee: called.item, path: program.item_named(called.item), error };
+                    match unresolved(&mut survey, &mut reached, called, i, refusal)? {
+                        Some(slot) => {
+                            via.push(Via::Slot);
+                            targets.push(Target::Slot(slot));
+                        }
+                        None => broken = true,
+                    }
                     continue;
                 }
             };
             let callee = Instance { item, args: resolved };
             let Some(c) = program.fn_index(callee.item) else {
-                filed(&mut survey, callee_refusal(&*program, name(), callee.item))?;
-                broken = true;
+                match unresolved(&mut survey, &mut reached, callee, i, callee_refusal(&*program, name(), callee.item))? {
+                    Some(slot) => {
+                        via.push(Via::Slot);
+                        targets.push(Target::Slot(slot));
+                    }
+                    None => broken = true,
+                }
                 continue;
             };
             let target = program.function(c);
             if target.body.is_some() {
                 // A key the callee cannot have (a projection not normalized) refuses this caller.
-                let key = match key_of(c, callee, &mut ground, &adts) {
+                let key = match key_of(program, c, callee, &mut ground, &adts) {
                     Ok(k) => k,
                     Err(e) => {
-                        filed(&mut survey, e)?;
-                        broken = true;
+                        match unresolved(&mut survey, &mut reached, callee, i, e)? {
+                            Some(slot) => {
+                                via.push(Via::Slot);
+                                targets.push(Target::Slot(slot));
+                            }
+                            None => broken = true,
+                        }
                         continue;
                     }
                 };
@@ -1770,8 +2094,13 @@ fn build_from<P: FrontEnd>(
                 via.push(Via::Address);
                 targets.push(Target::Symbol(target.symbol.into()));
             } else {
-                filed(&mut survey, callee_refusal(&*program, name(), callee.item))?;
-                broken = true;
+                match unresolved(&mut survey, &mut reached, callee, i, callee_refusal(&*program, name(), callee.item))? {
+                    Some(slot) => {
+                        via.push(Via::Slot);
+                        targets.push(Target::Slot(slot));
+                    }
+                    None => broken = true,
+                }
             }
         }
         if broken {
@@ -1826,7 +2155,7 @@ fn build_from<P: FrontEnd>(
                             // A coroutine's own `Future::poll` or drop (`dyn Future` of an
                             // async block): the coroutine's function, tabled as its owner.
                             VtableTarget::Fn(f) if let Some(c) = crate::front2::coroutines::owner_of(program, &adts, f, &ground) => {
-                                let key = key_of(c, f, &mut ground, &adts)?;
+                                let key = key_of(program, c, f, &mut ground, &adts)?;
                                 VtableWord::Slot(reached.slot(f, c, key)?)
                             }
                             VtableTarget::Fn(f) => {
@@ -1841,7 +2170,7 @@ fn build_from<P: FrontEnd>(
                                 let Some(c) = c else {
                                     return Err(RunError::Callee { function: name(), callee: item });
                                 };
-                                let key = key_of(c, Instance { item, args }, &mut ground, &adts)?;
+                                let key = key_of(program, c, Instance { item, args }, &mut ground, &adts)?;
                                 VtableWord::Slot(reached.slot(Instance { item, args }, c, key)?)
                             }
                             VtableTarget::Super(s) => match tables.refs.iter().position(|r| *r == above(s)) {
@@ -1932,7 +2261,7 @@ fn build_from<P: FrontEnd>(
             for (tabled, bytes) in reaches.iter() {
                 declared.push(Declared { tabled: *tabled, name: &bytes[..] });
             }
-            let entry = crate::code_records::make_entry(&built, &names, &mut declared, run.builder.isa, Alloc::global()).map_err(fail)?;
+            let entry = crate::code_records::make_entry(&built.func, &names, &mut declared, run.builder.isa, Alloc::global()).map_err(fail)?;
             run.store.put(key, &entry).map_err(|e| fail(CodeRecordError::Store(e)))?;
             run.met.push(crate::code_records::Met { symbol: parts.symbol, key, parts, function: format!("{}", name()).into_boxed_str(), found: false });
             continue;
@@ -1955,9 +2284,28 @@ fn build_from<P: FrontEnd>(
         }
         bodies.push(Body { code, targets, statics: built.statics, tls: tls_at, vtables: table_of });
     }
-    // The record walk keeps no body: its answer is the store's entries and `met`.
-    if records.is_some() {
+    let program = &*program_mut;
+    // The record walk keeps no body: its answer is the store's entries and `met`. A program
+    // with thread-locals has one getter (the slot after every instance, below), which every
+    // record touching a thread-local calls by `tls_getter_symbol`: no caller declares it, so
+    // its record is made here, once. A record walk always has an entry: it takes no survey, so
+    // a program with no `main` stopped at `RunError::NoMain` above.
+    if let Some(run) = records.as_deref_mut() {
+        if let (Some(_), Some(main)) = (tls_layout.as_ref(), entry) {
+            run.getter().map_err(|error| RunError::CodeRecord { function: program.function(main).named(), error })?;
+        }
         return Ok(None);
+    }
+    // The stub build: the last slot's stub, as the loop's top makes each slot's before it; then
+    // every slot has its body (the getter's slot comes after them).
+    if let Some(stubs) = survey.stubs.as_ref() {
+        let slots = reached.instances.len();
+        if bodies.len() + 1 == slots {
+            bodies.push(stubs.body(slots - 1).ok_or_else(|| unstubbed(program.function(reached.tabled[slots - 1]).named()))?);
+        }
+        if bodies.len() != slots {
+            return Err(unstubbed(program.function(reached.tabled[bodies.len()]).named()));
+        }
     }
     if let Some(counts) = counts.as_deref_mut() {
         counts.built = bodies.len();
@@ -1966,7 +2314,7 @@ fn build_from<P: FrontEnd>(
         met.extend(reached.instances.iter().map(|i| (i.item, ())));
         for c in 0..program.fn_count() {
             let f = program.function(c);
-            if f.body.is_some() && checked[c].is_some() && generic(c) && !met.contains_key(&f.key) {
+            if f.body.is_some() && checked[c].is_some() && generic(program, c) && !met.contains_key(&f.key) {
                 counts.no_instance.push(format!("{}", f.named()).into_boxed_str());
             }
         }
@@ -1994,8 +2342,9 @@ fn build_from<P: FrontEnd>(
             Some(u32::try_from(bodies.len() - 1).map_err(|_| RunError::TooManyInstances)?)
         }
     };
-    // No build stubs a refusal yet (stub.rs is placed and called; the build's side is owed): every
-    // reached instance is built, and `reached` counts them.
+    // `reached` counts every slot before the getter's, built or stubbed; only the stub build
+    // has any refusal to list.
     let reached = u32::try_from(reached.instances.len()).map_err(|_| RunError::TooManyInstances)?;
-    Ok(Some(Built { bodies, vtables: tables.images, start, start_fn: program.function(main).named(), image, getter, refused: Vec::new_in(Global), reached }))
+    let refused = survey.stubs.map_or_else(|| Vec::new_in(Global), |stubs| stubs.refused);
+    Ok(Some(Built { bodies, vtables: tables.images, start, start_fn: program.function(main).named(), image, getter, refused, reached }))
 }

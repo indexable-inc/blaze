@@ -7,7 +7,7 @@
 
 #![feature(allocator_api)]
 
-use blaze_file_items::{Bodies, Outline, TokenColumns, TokensRefused, outline_rows, outline_rows_with, outline_tokens};
+use blaze_file_items::{Bodies, Outline, TokenColumns, TokensRefused, outline, outline_tokens, outline_with};
 use blaze_own::Alloc;
 use blaze_surface::{Edition, ErrorOrigin, Item, ItemDetail, ItemFlags, Range};
 
@@ -15,12 +15,12 @@ mod render;
 
 /// The outline, bodies left unparsed.
 fn unparsed(text: &str) -> Outline<'static> {
-    outline_rows(text, Edition::E2024, Alloc::global())
+    outline(text, Edition::E2024, Alloc::global())
 }
 
 /// The outline with every body parsed with the rest.
 fn parsed(text: &str) -> Outline<'static> {
-    outline_rows_with(text, Edition::E2024, Bodies::Parsed, Alloc::global())
+    outline_with(text, Edition::E2024, Bodies::Parsed, Alloc::global())
 }
 
 /// The first entry named `name`.
@@ -173,8 +173,8 @@ fn the_tokens_handed_over_read_as_their_text() {
     // two findings' worth of no operator, and those written together none.
     let (from_tokens, _, again) = both_ways(texts[0]);
     let findings = parser_said(&from_tokens);
-    let (b, c) = (again.find("const B").expect("B") as u32, again.find("const C").expect("C") as u32);
-    let d = again.find("const D").expect("D") as u32;
+    // A name and its `:` are written together, so they are in the text written as they were.
+    let (b, c, d) = (again.find("B:").expect("B") as u32, again.find("C:").expect("C") as u32, again.find("D:").expect("D") as u32);
     assert!(findings.iter().any(|(range, _)| range.start < b), "`> =` is no `>=`: {findings:?}");
     assert!(findings.iter().any(|(range, _)| range.start >= c && range.start < d), "`! =` is no `!=`: {findings:?}");
     assert!(findings.iter().all(|(range, _)| range.start < b || (range.start >= c && range.start < d)), "{findings:?}");

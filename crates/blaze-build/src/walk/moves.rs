@@ -621,6 +621,8 @@ impl<A: Allocator + Clone> Walk<'_, '_, '_, A> {
                         Expr::Ref { operand, .. } | Expr::RawRef { operand, .. } => operand.0 == c,
                         Expr::Field { base, .. } | Expr::TupleField { base, .. } | Expr::Index { base, .. } => base.0 == c,
                         Expr::Assign { lhs, .. } | Expr::AssignOp { lhs, .. } => lhs.0 == c,
+                        // [expr.cmp.place]: a comparison's operands are borrowed in place.
+                        Expr::Binary { op, lhs, rhs } if super::operators::comparison(op) => lhs.0 == c || rhs.0 == c,
                         Expr::Match { scrutinee, .. } => scrutinee.0 == c,
                         Expr::Let { init, .. } => init.0 == c,
                         _ => false,

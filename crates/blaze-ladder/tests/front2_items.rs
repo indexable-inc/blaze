@@ -530,6 +530,50 @@ fn main() {}
     assert!(unread[1].1.contains("unread as written"), "{unread:?}");
 }
 
+/// `Self` in an impl's where clauses is the impl's self type (the Reference, "Paths", "`Self`":
+/// "`Self`, with a capital \"S\", is used to refer to the current type being implemented or
+/// defined"; "In an implementation, it refers to the type being implemented."): `impl<T> Tr<T>
+/// for S where T: From<Self>` and ruint's from.rs:397 shape, `where T: for<'a> From<&'a Self>`
+/// (tempo census 13: "57 gap RefusedImpl [UintTryTo]: Unsupported \"`Self` here\""). The header
+/// builds because heads.rs `impl_` lowers the self type before the bounds; `by_value` and
+/// `by_ref` check clean. `REFUSED`: `impl Tr for W<Self>` names `Self` in the self type itself,
+/// where there is no type being implemented yet to refer to (rustc: "`Self` is not valid in the
+/// self type of an impl block"): the header stays refused, by its own name. A fix that gives
+/// `Self` some type everywhere fails the second.
+/// Without the fix the expected lines are "self in where: by_value: not checked: .. has a
+/// refused header: .. Unsupported(\"`Self` here\" .." and the same for `by_ref` (NOT RUN by the
+/// writer). With it: "self in where: by_value: clean", "self in where: by_ref: clean" and
+/// "self in where: refused: asks: not checked: .. has a refused header: .. an impl's self type
+/// naming `Self` ..".
+#[test]
+fn self_in_an_impls_where_clause_is_its_self_type() {
+    const TEXT: &str = "struct S;
+trait Tr<T> { fn g(self) -> u8; }
+trait Tr2<T> { fn h(self) -> u8; }
+impl<T> Tr<T> for S where T: From<Self> { fn g(self) -> u8 { 7 } }
+impl<T> Tr2<T> for S where T: for<'a> From<&'a Self> { fn h(self) -> u8 { 8 } }
+impl From<S> for u8 { fn from(_s: S) -> u8 { 1 } }
+impl<'a> From<&'a S> for u16 { fn from(_s: &'a S) -> u16 { 2 } }
+fn by_value(s: S) -> u8 { <S as Tr<u8>>::g(s) }
+fn by_ref(s: S) -> u8 { <S as Tr2<u16>>::h(s) }
+fn main() {}
+";
+    const REFUSED: &str = "struct W<T>(T);
+trait Tr { fn g(&self) -> u8 { 0 } }
+impl Tr for W<Self> {}
+fn need<T: Tr>(_t: T) {}
+fn asks() { need(W(1u8)) }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["by_value", "by_ref"]);
+    let refused = check_fns(REFUSED, &["asks"]);
+    for (n, o) in &refused {
+        println!("self in where: refused: {n}: {o}");
+    }
+    all_clean("self in where", &got);
+    assert!(refused[0].1.contains("has a refused header") && refused[0].1.contains("self type naming"), "{refused:?}");
+}
+
 /// A type alias's defaulted parameter left out of a path takes its default (the Reference,
 /// "Type aliases": "A type alias defines a new name for an existing type"; "Generic parameters":
 /// a type parameter with a default may be left out, the arguments before it put in): `Res<u8>`

@@ -159,3 +159,141 @@ fn dyn_types_through_front2() {
     let got = check_body(&mut records, &bad, &scope);
     assert!(matches!(got, Err(CheckFail::Diags { .. })), "`fn type_error() -> u8 {{ true }}` must not count as checked, got {:?}", got.map(|_| "checked clean"));
 }
+
+const RECEIVERS: &str = "extern crate alloc;
+use alloc::rc::Rc;
+use alloc::sync::Arc;
+use core::pin::Pin;
+fn main(cx: &Cx, io: Io) -> Result<(), Error> {
+    Ok(())
+}
+trait Recv {
+    fn by_ref(&self);
+    fn by_mut(&mut self);
+    fn by_value(self);
+    fn typed_ref(self: &Self);
+    fn typed_mut(self: &mut Self);
+    fn typed_value(self: Self);
+    fn boxed(self: Box<Self>);
+    fn rc(self: Rc<Self>);
+    fn arc(self: Arc<Self>);
+    fn pin_mut(self: Pin<&mut Self>);
+    fn pin_ref(self: Pin<&Self>);
+    fn pin_box(self: Pin<Box<Self>>);
+    fn pin_arc(self: core::pin::Pin<alloc::sync::Arc<Self>>);
+}
+struct MyBox<T: ?Sized>(*const T);
+impl<T: ?Sized> core::ops::Deref for MyBox<T> {
+    type Target = T;
+    fn deref(&self) -> &T { unsafe { &*self.0 } }
+}
+trait Mine { fn f(self: MyBox<Self>); }
+trait MineSized { fn f(self: MyBox<Self>) where Self: Sized; fn g(&self); }
+fn use_recv() { let _x: Option<&dyn Recv> = None; }
+fn use_future() { let _x: Option<&dyn core::future::Future<Output = u8>> = None; }
+fn use_mine_sized() { let _x: Option<&dyn MineSized> = None; }
+fn use_mine() { let _x: Option<&dyn Mine> = None; }
+fn f(x: core::pin::Pin<alloc::boxed::Box<dyn core::future::Future<Output = u8> + Send>>) {}
+async fn g() -> u8 { f(Box::pin(async { 1 })); 0 }
+";
+
+/// A typed receiver is read from its type as written and resolved (front2/receiver.rs
+/// `classify`, through dyn_ty.rs `member`). The Reference, "Traits", "Dyn compatibility":
+/// "Dispatchable functions must: ... Have a receiver with one of the following types: `&Self`
+/// (i.e. `&self`), `&mut Self` (i.e `&mut self`), `Box<Self>`, `Rc<Self>`, `Arc<Self>`,
+/// `Pin<P>` where `P` is one of the types above"; "Explicitly non-dispatchable functions
+/// require: Have a `where Self: Sized` bound (receiver type of `Self` (i.e. `self`) implies
+/// this)".
+///
+/// CLEAN: `dyn Recv` (every listed form, written as `self: T` too), `dyn Future` (core's
+/// `poll(self: Pin<&mut Self>, ..)`), `dyn MineSized` (`self: MyBox<Self>` with `where Self:
+/// Sized`), the head `f(Pin<Box<dyn Future<Output = u8> + Send>>)` and `g`'s call of it with
+/// `Box::pin(async { 1 })`. REFUSED: `dyn Mine` (`self: MyBox<Self>`, a user type without
+/// `DispatchFromDyn`): E0038. CONTROL (the cause removed): the same `use_recv` over a store whose
+/// pointer types were never looked up (`Pointers::NOT_LOOKED_UP`) is the checker's
+/// `DynUndecided`, not a clean body.
+///
+/// Prints, last: "receivers: 5 clean, `dyn Mine` refused (E0038), undecided without the pointer types".
+#[test]
+fn typed_receivers_through_front2() {
+    let home = std::env::var("HOME").expect("HOME is set");
+    let shelf = format!("{home}/.blaze/v2/toolchain");
+    let tc = Toolchain::open(&mut DirShelf::new(shelf.clone())).unwrap_or_else(|e| panic!("the toolchain at {shelf}: {e}"));
+    let files = [("/rcvs/src/main.rs".to_string(), RECEIVERS.to_string())];
+    let edition = edition::PackageEdition::of_manifest("blaze-2026.11").expect("a known edition");
+    let user = UserCrate { name: "rcvs", dir: "/rcvs/", root: "/rcvs/src/main.rs", files: &files, edition };
+    let inputs = Inputs::new(&user, &tc).unwrap_or_else(|e| panic!("the crates: {e}"));
+    let crates = inputs.crates();
+    let names = inputs.resolve(&crates).unwrap_or_else(|e| panic!("resolve_crates: {e}"));
+    let sources = [SourceFile { path: "src/main.rs", text: RECEIVERS }];
+    let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
+    let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+    let pointers = blaze_ladder::front2::receiver::Pointers::find(&front.index, front.resolver);
+    println!("pointers: {pointers:?}");
+    let mut store = Store::new(front.index.lang("sized"), front.frame);
+    store.pointers = pointers;
+    let root = names.root(0);
+    let lib = |name: &'static str| {
+        names::path(&names, root, Namespace::Values, Written { kind: PathKind::Plain, segments: &[name] }, Alloc::global())
+            .ok()
+            .and_then(|f| f.whole(1))
+            .map(|d| d.key)
+            .unwrap_or_else(|| panic!("`{name}` from the crate root"))
+    };
+    let prepared = Prepares::new_in(Alloc::global());
+    let mut buckets = None;
+    // (body, clean expected)
+    let cases: [(&'static str, bool); 6] = [
+        ("use_recv", true),
+        ("use_future", true),
+        ("use_mine_sized", true),
+        ("f", true),
+        ("g", true),
+        ("use_mine", false),
+    ];
+    let mut wrong = Vec::new();
+    let mut clean = 0usize;
+    for (name, want_clean) in cases {
+        if let Err(e) = store.ensure(&names, &mut front.keys, Want::Fn(lib(name))) {
+            wrong.push(format!("{name}: no head: {e:?}"));
+            continue;
+        }
+        let body = match lower_fn(&names, prepared, &mut front.keys, &mut store, lib(name)) {
+            Ok(b) => b,
+            Err(e) => {
+                wrong.push(format!("{name}: does not lower: {e}"));
+                continue;
+            }
+        };
+        let view = body.lowered.view();
+        let spell = Spelling::of(&view).expect("spelling");
+        let scope = body.scope(&spell);
+        let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: None };
+        let got = check_body(&mut records, &body, &scope);
+        match (want_clean, got) {
+            (true, Ok(_)) => clean += 1,
+            (false, Err(CheckFail::Diags { diags, .. })) if diags.iter().any(|(c, _, _)| *c == blaze_typeck::DiagCode::DynIncompatible) => {}
+            (true, other) => wrong.push(format!("{name}: clean expected, got {:?}", other.map(|_| "checked clean"))),
+            (false, other) => wrong.push(format!("{name}: E0038 expected (`self: MyBox<Self>` is no dispatchable receiver), got {:?}", other.map(|_| "checked clean"))),
+        }
+    }
+    for w in &wrong {
+        println!("{w}");
+    }
+    assert!(wrong.is_empty(), "{} of {} receiver cases wrong (printed above)", wrong.len(), cases.len());
+
+    // The control: the cause removed. A store that never looked up `Box`, `Rc`, `Arc` and `Pin`
+    // reads no typed receiver, so `dyn Recv` is the checker's named gap again.
+    let mut bare = Store::new(front.index.lang("sized"), front.frame);
+    let mut bare_buckets = None;
+    let k = lib("use_recv");
+    bare.ensure(&names, &mut front.keys, Want::Fn(k)).unwrap_or_else(|e| panic!("use_recv's head over the bare store: {e:?}"));
+    let body = lower_fn(&names, prepared, &mut front.keys, &mut bare, k).unwrap_or_else(|e| panic!("use_recv lowers over the bare store: {e}"));
+    let view = body.lowered.view();
+    let spell = Spelling::of(&view).expect("spelling");
+    let scope = body.scope(&spell);
+    let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut bare, buckets: &mut bare_buckets, order: BuildOrder::AsAsked, consts: None };
+    let got = format!("{:?}", check_body(&mut records, &body, &scope).map(|_| "checked clean"));
+    assert!(got.contains("DynUndecided"), "without the pointer types `dyn Recv` must stay undecided, got {got}");
+    println!("receivers: {clean} clean, `dyn Mine` refused (E0038), undecided without the pointer types");
+}

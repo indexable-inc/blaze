@@ -234,9 +234,64 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
     }
 
+    /// A primitive scalar type, known: an integer, a float, `bool` or `char`; never an inference
+    /// variable (an integer literal's included), a projection, a type parameter or the error
+    /// type.
+    fn is_primitive_scalar(&mut self, t: Ty) -> bool {
+        matches!(self.view(t), TyView::Int(_) | TyView::Uint(_) | TyView::Float(_) | TyView::Bool | TyView::Char)
+    }
+
+    /// Whether `lhs op rhs` is decided builtin by the two types alone: both are known primitive
+    /// scalar types (`is_primitive_scalar`) and the pair is one the operator is builtin on
+    /// (`is_builtin_binop`: the Reference's tables, `[expr.arith-logic.behavior]` for integers,
+    /// floats and `bool`, `[expr.cmp]` for the comparisons).
+    ///
+    /// Asking the trait first could not change the answer. (1) The final state already takes
+    /// the builtin operator for every pair `is_builtin_binop` accepts, whether or not the trait
+    /// obligation was registered; this is a subset of those pairs. (2) No other impl could be
+    /// picked: an `impl Add<u8> for i32` names a foreign trait and only primitive types, and
+    /// the Reference, `[items.impl.trait.orphan-rule.general]`, requires that "At least one of
+    /// the types `T0..=Tn` must be a local type" unless the trait is local: only the crate
+    /// that declares the operator traits can hold it, and for the primitive pairs it holds
+    /// the builtin operator itself (the pinned library, core/src/ops/arith.rs: `fn add(self,
+    /// other: $t) -> $t { self + other }`). (3) Nothing is left to infer: both types are known,
+    /// and `enforce_builtin` states the pair's result type.
+    fn settled_builtin_pair(&mut self, lhs: Ty, rhs: Ty, op: BinOp) -> bool {
+        self.is_primitive_scalar(lhs) && self.is_primitive_scalar(rhs) && self.is_builtin_binop(lhs, rhs, op)
+    }
+
+    /// `lookup_op_method` for `f.t op f.u`: asks whether the operator's trait may hold at the
+    /// operand types and, when it may, registers the obligation and projects `Output`. Sets
+    /// `f.a` (the trait's output) and `f.b` (1: registered; 2: the world has no such lang
+    /// trait, reported at the end unless the operator is builtin).
+    fn binop_lookup(&mut self, f: &mut Frame, e: ExprId, op: BinOp, assign: bool) -> Result<(), Stop> {
+        let Some(item) = op_lang(op, assign) else { return Ok(()) };
+        let Some(tr) = self.lang(item)? else {
+            f.b = 2;
+            return Ok(());
+        };
+        let args = self.mk_list(&[f.t, f.u])?;
+        let goal = Goal::Trait { trait_: tr, args };
+        // `lookup_method_in_trait`: only `predicate_may_hold`. A left side that is still a
+        // variable (`|a, b| a + b`) may hold: the obligation is registered ambiguous and
+        // `Output` projected, both settled by a later use.
+        if self.ty.may_hold(goal, &mut self.reads)? {
+            self.register_trait(tr, args, Cause::Expr(e))?;
+            let out = match category(op) {
+                Category::Comparison => self.common.bool_,
+                _ if assign => self.common.unit,
+                _ => self.project(tr, args, Name::of("Output"), Cause::Expr(e))?,
+            };
+            f.a = out.0;
+            f.b = 1;
+        }
+        Ok(())
+    }
+
     /// `check_overloaded_binop` and the builtin fast path. `f.t` holds the left type, `f.u` the
-    /// right variable, `f.a` the trait's output (a `Ty` index) and `f.b` whether the trait
-    /// obligation was registered.
+    /// right variable, `f.a` the trait's output (a `Ty` index) and `f.b` what was done about
+    /// the operator's trait (0: asked, does not hold; 1: registered; 2: no such lang trait;
+    /// 3: not asked yet, the left type being a known primitive scalar).
     fn binop(&mut self, mut f: Frame, e: ExprId, op: BinOp, lhs: ExprId, rhs: ExprId, assign: bool) -> Result<Flow, Stop> {
         match f.state {
             0 => {
@@ -251,37 +306,41 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 f.u = rhs_var;
                 f.b = 0;
                 f.a = self.common.err.0;
-                if let Some(item) = op_lang(op, assign) {
-                    // `f.b == 2`: the world has no `item`; reported at the end unless builtin.
-                    let tr = self.lang(item)?;
-                    if tr.is_none() {
-                        f.b = 2;
-                    }
-                    if let Some(tr) = tr {
-                        let args = self.mk_list(&[lhs_ty, rhs_var])?;
-                        let goal = Goal::Trait { trait_: tr, args };
-                        // `lookup_method_in_trait`: only `predicate_may_hold`. A left side that
-                        // is still a variable (`|a, b| a + b`) may hold: the obligation is
-                        // registered ambiguous and `Output` projected, both settled by a later use.
-                        if self.ty.may_hold(goal, &mut self.reads)? {
-                            self.register_trait(tr, args, Cause::Expr(e))?;
-                            let out = match category(op) {
-                                Category::Comparison => self.common.bool_,
-                                _ if assign => self.common.unit,
-                                _ => self.project(tr, args, Name::of("Output"), Cause::Expr(e))?,
-                            };
-                            f.a = out.0;
-                            f.b = 1;
-                        }
-                    }
+                if self.is_primitive_scalar(lhs_ty) {
+                    // `f.b == 3`: the left side is a primitive scalar type, known. The trait is
+                    // not asked yet: if the right side comes back a primitive scalar too and
+                    // the pair is the operator's builtin one, it never is (the final state).
+                    f.b = 3;
+                } else {
+                    self.binop_lookup(&mut f, e, op, assign)?;
                 }
                 self.resume(f, 2)?;
                 self.push_expr(rhs, Expectation::HasType(rhs_var), Then::Coerce { to: rhs_var, two_phase: false })?;
                 Ok(Flow::Wait)
             }
             _ => {
-                let lhs_ty = self.ty.shallow_resolve(f.t);
-                let rhs_ty = self.ty.shallow_resolve(f.u);
+                // rustc's `resolve_vars_with_obligations` on both sides: an operand whose type
+                // is a projection still pending (`count + t[1]`, `t[1]`'s type `<Table as
+                // Index<usize>>::Output`) is normalized BEFORE builtin is decided, so the
+                // builtin `+` on `i32` is found in a crate that declares no `add` lang trait.
+                let mut lhs_ty = self.try_structurally_resolve(f.t)?;
+                let mut rhs_ty = self.try_structurally_resolve(f.u)?;
+                if f.b == 3 {
+                    // Both operand types are known primitive scalars and the pair is the
+                    // operator's builtin one: the operator is the builtin one, with no callee
+                    // row, no obligation and no question to the solver (`settled_builtin_pair`
+                    // says why no answer can differ).
+                    if self.settled_builtin_pair(lhs_ty, rhs_ty, op) {
+                        let builtin = self.enforce_builtin(e, lhs_ty, rhs_ty, op, assign)?;
+                        return Ok(Flow::Done(builtin));
+                    }
+                    // Anything else (a reference, a type parameter, a type still unknown, an
+                    // ADT on the right): the trait is asked now, as state 1 asks it.
+                    f.b = 0;
+                    self.binop_lookup(&mut f, e, op, assign)?;
+                    lhs_ty = self.try_structurally_resolve(f.t)?;
+                    rhs_ty = self.try_structurally_resolve(f.u)?;
+                }
                 let out = Ty(f.a);
                 if !self.is_ty_var(lhs_ty) && !self.is_ty_var(rhs_ty) && self.is_builtin_binop(lhs_ty, rhs_ty, op) {
                     let builtin = self.enforce_builtin(e, lhs_ty, rhs_ty, op, assign)?;

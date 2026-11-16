@@ -32,7 +32,12 @@ impl<'n, S: super::source::NamesSource<'n>> BodyWorld<'_, 'n, S> {
                 SelfTy::Trait(_) => Some(PathRes { def: Def::TyParam(0), consumed: 1 }),
                 SelfTy::Ty(t, _) => match self.store.tys.view().nodes.get(t.0 as usize) {
                     Some(PNode::Adt(k, _)) => Some(PathRes { def: Def::Adt(*k), consumed: 1 }),
-                    _ => None,
+                    // Any other implementing type (a parameter, an array, a primitive, a
+                    // tuple, a reference): the Reference, "Paths", "`Self`": "In an
+                    // implementation, it refers to the type being implemented." The checker
+                    // reads the type from the impl's header (blaze-typeck rules/self_path.rs).
+                    Some(_) => Some(PathRes { def: Def::SelfTy, consumed: 1 }),
+                    None => None,
                 },
                 SelfTy::None => None,
             });

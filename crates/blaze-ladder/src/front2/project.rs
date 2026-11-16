@@ -149,7 +149,8 @@ impl<'n> ProjectWorld<'n> {
     /// the caller's, alive for the command.
     pub fn new(names: &'n Names<'n>, frame: &'n blaze_mem::Frame, user: &[SourceFile<'_>], alloc: Alloc<'n>) -> Result<ProjectWorld<'n>, FrontError> {
         let front = Front2::new(names, frame, user)?;
-        let store = Store::new(front.index.lang("sized"), frame);
+        let mut store = Store::new(front.index.lang("sized"), frame);
+        store.pointers = super::receiver::Pointers::find(&front.index, front.resolver);
         Ok(ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared: Prepares::new_in(alloc), alloc, by_chain: None })
     }
 }
@@ -161,7 +162,8 @@ impl<'n> ProjectWorld<'n, &'n source::Records<'n>> {
     /// each body, a verdict over a log that is not empty is void.
     pub fn from_records(records: &'n source::Records<'n>, frame: &'n blaze_mem::Frame, lang_crates: &[usize], alloc: Alloc<'n>) -> Result<ProjectWorld<'n, &'n source::Records<'n>>, FrontError> {
         let front = Front2::from_records(records, frame, lang_crates)?;
-        let store = Store::new(front.index.lang("sized"), frame);
+        let mut store = Store::new(front.index.lang("sized"), frame);
+        store.pointers = super::receiver::Pointers::find(&front.index, front.resolver);
         Ok(ProjectWorld { front, store, buckets: None, consts: Consts::default(), prepared: Prepares::new_in(alloc), alloc, by_chain: None })
     }
 }

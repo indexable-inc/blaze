@@ -154,6 +154,22 @@ pub trait FrontEnd {
     fn const_record(&self, _item: ItemKey) -> Option<&blaze_build::data::DataRecord<std::alloc::Global>> {
         None
     }
+    /// The value of `need` (a constant read by path, or a `const { .. }` block) at ground
+    /// arguments `args` (types of `from`, the build's ground table), evaluated now: the
+    /// build's instance loop pulls each need of an instance before it walks it
+    /// (front2/const_at.rs). The front end may check a body or make an impl row it has not
+    /// made yet. The default evaluates none: each need is refused by name. Asked only of a
+    /// front end whose [`FrontEnd::evaluates_at_args`] is true.
+    fn const_at(&mut self, need: crate::front2::const_at::ConstNeed, from: blaze_typeck::PTys<'_>, args: &[blaze_typeck::PTy]) -> Result<blaze_build::data::DataRecord<Global>, crate::front2::const_at::ConstAtWhy> {
+        let _ = (need, from, args);
+        Err(crate::front2::const_at::ConstAtWhy::NoEvaluator)
+    }
+    /// Whether the build pulls each instance's constants at its ground arguments from
+    /// [`FrontEnd::const_at`] (front2), or the front end evaluates constants only at no
+    /// arguments, as records the build reads (the old front: run.rs `eval_consts`).
+    fn evaluates_at_args(&self) -> bool {
+        false
+    }
     /// Every `static` item's record as the front end evaluated it, sorted by key (front2
     /// evaluates every static its bodies name, once, when the program is made: front2
     /// statics.rs); empty where it made none (the old front: run.rs `eval_consts` evaluates its

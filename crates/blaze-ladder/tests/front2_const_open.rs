@@ -241,3 +241,27 @@ fn main() {}
     let got = check_fns(TEXT, &["eight", "real", "seven"]);
     expect("repeat size_of", &got, &[true, true, false]);
 }
+
+/// Tempo census 13, brief 11 (`ConstFail::TraitConstNoSelf`: "the constant .. an array length
+/// names: TraitConstNoSelf"): a constant whose BODY reads a trait's constant by a qualified
+/// path. The Reference, "Paths", "Qualified paths": "Fully qualified paths allow for
+/// disambiguating the path for trait implementations and for specifying canonical paths": the
+/// path itself says `Self`, so the evaluator reads the trait's `N` at `[u8]` and the impl is
+/// selected (blaze-consteval machine/code.rs `qualified_const_args`; the same step that gives
+/// `size_of::<usize>()` its value). `four` must stay an error of the program (a `[u8; 3]`
+/// where `[u8; 4]` is written). NOT covered here, and still `TraitConstNoSelf`: a path the
+/// checker selects by type (`Self::N`, `T::N`, `<u8>::N`), which needs the checker's
+/// `Checked::const_args` read by the evaluator. Expected lines: "trait constant: three:
+/// clean", "trait constant: four: diags [..]".
+#[test]
+fn a_constant_whose_body_reads_a_trait_constant_has_its_value() {
+    const TEXT: &str = "trait Tr { const N: usize; }
+impl Tr for u8 { const N: usize = 3; }
+const A: usize = <u8 as Tr>::N;
+fn three() -> [u8; 3] { [0u8; A] }
+fn four() -> [u8; 4] { [0u8; A] }
+fn main() {}
+";
+    let got = check_fns(TEXT, &["three", "four"]);
+    expect("trait constant", &got, &[true, false]);
+}

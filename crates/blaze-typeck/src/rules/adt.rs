@@ -19,13 +19,17 @@
 
 use blaze_own::Alloc;
 
+use crate::body::Segment;
 use crate::diag::{At, DiagCode};
-use crate::error::Stop;
-use crate::ids::{ExprId, ItemKey, List, PathIdx};
+use crate::error::{CheckError, Stop};
+use crate::ids::{ExprId, ItemKey, List, Name, PathIdx};
 use crate::machine::{Expectation, Flow, Frame, Lower, Machine, Then};
 use crate::portable::PTy;
 use crate::ty::{Ty, TyList, TyView, TypeCtx};
-use crate::world::{AdtKind, Def, World};
+use crate::world::{AdtKind, Def, PathRes, World};
+
+/// The segment `Self` (the Reference, "Paths", "`Self`").
+const SELF_NAME: Name = Name::of("Self");
 
 impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
     /// The expected tuple's elements, if the expectation is a tuple. `f.l` holds them, `f.c`
@@ -135,6 +139,19 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
 
     /// `check_struct_path`: the ADT, the variant and its arguments, or `None` after a
     /// diagnostic.
+    ///
+    /// The path names a struct, a union or an enum variant (the Reference, "Struct
+    /// expressions": "A struct expression creates a struct, enum, or union value. It consists of
+    /// a path to a struct, enum variant, or union item followed by the values for the fields of
+    /// the item"; "Struct patterns": "Struct patterns match struct, enum, and union values"). A
+    /// variant may be named through a type: `Self::A { .. }` or `Alias::A { .. }` (the
+    /// Reference's own example there: `<Enum as Tr>::T::Tuple(); // OK`). The
+    /// world answers such a prefix as `Def::Adt` with one segment left; that segment is a
+    /// variant of the enum ([`Self::struct_variant`]). `Self`'s arguments are the impl's own
+    /// self type's ([`Self::self_struct_args`]), never fresh: `Self` is that type (the
+    /// Reference, "Paths", "`Self`": "In an implementation, it refers to the type being
+    /// implemented"). Still E0574: a struct or union prefix with a trailing segment, a name
+    /// that is no variant, a prefix that is no ADT, more than one trailing segment.
     pub(crate) fn struct_path(&mut self, at: At, path: PathIdx) -> Result<Option<(ItemKey, u32, TyList)>, Stop> {
         let bp = self.body.path(path)?;
         let segs = self.body.segment_list(bp.segments)?;
@@ -144,6 +161,11 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
         }
         let last = segs.last().map(|s| s.name);
         let res = self.path_res(bp, path, &names, at)?;
+        // The segments the world consumed: the last of them names the type.
+        let consumed = match &res {
+            Ok(r) => r.consumed as usize,
+            Err(_) => 0,
+        };
         let (k, variant, def) = match res {
             Ok(r) if r.consumed as usize == segs.len() => match r.def {
                 Def::Adt(k) => (k, None, r.def),
@@ -153,6 +175,13 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                     return Ok(None);
                 }
             },
+            // Type-relative: `Self::A`, `Alias::A`, the prefix an enum and `A` its variant.
+            Ok(PathRes { def: Def::Adt(k), consumed: c }) if c != 0 && c as usize + 1 == segs.len() => {
+                match self.struct_variant(at, k, segs[c as usize])? {
+                    Some((variant, def)) => (k, Some(variant), def),
+                    None => return Ok(None),
+                }
+            }
             Ok(_) => {
                 self.diag(DiagCode::NotAStruct, at, None, None, last);
                 return Ok(None);
@@ -174,10 +203,74 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 return Ok(None);
             }
         };
-        let written = segs.iter().rev().find(|s| s.has_args).copied();
-        let args = self.explicit_args(at, written, k, 0, adt.generics)?;
+        // `Self { .. }` and `Self::A { .. }`: the world consumed exactly the segment `Self`.
+        let by_self = consumed == 1 && segs.first().is_some_and(|s| s.name == SELF_NAME);
+        let args = if by_self {
+            if segs.first().is_some_and(|s| s.has_args) {
+                // The Reference, "Paths", "`Self`": "The Self path cannot include generic
+                // arguments (as in Self::<i32>)." Refused by name: rustc's E0109, for which the
+                // checker has no code.
+                return Err(CheckError::Unported("generic arguments on `Self` in a struct expression or pattern (E0109)").into());
+            }
+            match self.self_struct_args(at, k)? {
+                Some(args) => args,
+                None => return Ok(None),
+            }
+        } else {
+            let written = segs.iter().rev().find(|s| s.has_args).copied();
+            self.explicit_args(at, written, k, 0, adt.generics)?
+        };
         self.defs.push((at, def));
         Ok(Some((k, variant, args)))
+    }
+
+    /// The variant `seg` of the enum `k` that a type-relative struct path names (`Self::A`,
+    /// `Alias::A`): its index and its definition, or `None` after E0574 naming `seg` (`k` no
+    /// enum, or no variant of that name). Generic arguments on the variant's own segment of a
+    /// type-relative path are refused by name: rustc prohibits them there (E0109, "type
+    /// arguments are not allowed on this type"), and the checker has no code for it.
+    fn struct_variant(&mut self, at: At, k: ItemKey, seg: Segment) -> Result<Option<(u32, Def)>, Stop> {
+        let Some(adt) = self.reads.adt(k)? else {
+            self.diag(DiagCode::NotAStruct, at, None, None, Some(seg.name));
+            return Ok(None);
+        };
+        let found = match adt.kind {
+            AdtKind::Enum => adt.variants.iter().enumerate().find(|(_, v)| v.name == seg.name).map(|(i, v)| (i as u32, v.ctor)),
+            AdtKind::Struct | AdtKind::Union => None,
+        };
+        let Some((i, ctor)) = found else {
+            self.diag(DiagCode::NotAStruct, at, None, None, Some(seg.name));
+            return Ok(None);
+        };
+        if seg.has_args {
+            return Err(CheckError::Unported("generic arguments on a type-relative enum variant in a struct expression or pattern (E0109)").into());
+        }
+        Ok(Some((i, Def::Ctor { adt: k, variant: i, kind: ctor })))
+    }
+
+    /// `Self`'s generic arguments in a struct path: those of the impl's own self type as the
+    /// body sees them (`Self::A { .. }` in `impl<T> E<T>` builds `E<T>`, not `E` at fresh
+    /// arguments), as [`Self::self_ctor_value`] takes them for `Self` as a value. `None` after a
+    /// diagnostic: E0574 naming `Self` where the body is in no impl, or where the impl's self
+    /// type is not the ADT `adt` the world answered `Self` with.
+    fn self_struct_args(&mut self, at: At, adt: ItemKey) -> Result<Option<TyList>, Stop> {
+        let header = match self.reads.assoc_parent(self.body.owner)? {
+            Some(parent) => self.reads.impl_header(parent.container)?,
+            None => None,
+        };
+        let Some(h) = header else {
+            self.diag(DiagCode::NotAStruct, at, None, None, Some(SELF_NAME));
+            return Ok(None);
+        };
+        let self_ty = self.lower(h.types, h.self_ty, Lower::Body, at.cause())?;
+        let self_ty = self.try_structurally_resolve(self_ty)?;
+        match self.view(self_ty) {
+            TyView::Adt(k, args) if k == adt => Ok(Some(args)),
+            _ => {
+                self.diag(DiagCode::NotAStruct, at, None, Some(self_ty), Some(SELF_NAME));
+                Ok(None)
+            }
+        }
     }
 
     /// `check_expr_struct`. `f.t` is the struct's type, `f.l` its arguments, `f.c` the variant,

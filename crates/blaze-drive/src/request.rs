@@ -470,7 +470,7 @@ impl fmt::Display for DriveError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             DriveError::Wire { key, error } => write!(f, "the record at {key}: {error}"),
-            DriveError::LastFile(error) => write!(f, "the checkout's last answer .blaze/v2/last, of this build's form, is malformed: {error}"),
+            DriveError::LastFile(error) => write!(f, "the checkout's last answer (a pointer in .blaze/v2/at), of this build's form, is malformed: {error}"),
             DriveError::Unsorted { what } => write!(f, "{what} handed unsorted (drive.md: the sweep sorts by path)"),
             DriveError::NoFile { file, home } => write!(f, "{home} lists the file {file}, which is not in the checkout"),
             DriveError::NoPart { name, home } => write!(f, "a task wanted {name} of {home}, which does not list it"),
@@ -1227,6 +1227,7 @@ impl<'a> Request<'a> {
             self.get(last.cert, Purpose::OldCert, out);
             self.forward = last.shape == self.shape_digest;
         }
+        self.profile.forward = self.forward;
         if self.forward {
             // A changed or gone file seeds its outline. A seed no answer holds is outside the
             // build and goes (`locate`). A manifest is read by the layout alone: its change
@@ -1349,6 +1350,7 @@ impl<'a> Request<'a> {
                         self.last = None;
                         if self.forward {
                             self.forward = false;
+                            self.profile.forward = false;
                             self.add_root_units()?;
                         }
                     }

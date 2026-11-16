@@ -12,9 +12,12 @@
 
 pub mod anon;
 mod back_needs;
+pub mod block_traits;
 pub mod body;
+pub mod body_host;
 pub mod buckets;
 pub mod check;
+pub mod const_at;
 mod const_args_in_bounds;
 mod const_enum;
 mod const_open;
@@ -44,6 +47,7 @@ pub mod project;
 pub mod project_records;
 pub mod reach;
 pub mod reads;
+pub mod receiver;
 pub mod scoped;
 pub mod shared_keys;
 pub mod source;

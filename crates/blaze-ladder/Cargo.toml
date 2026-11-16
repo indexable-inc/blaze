@@ -41,6 +41,9 @@ blaze-ids = { path = "../blaze-ids" }
 blaze-code = { path = "../blaze-code" }
 # `Tier`: the tier a code record's key names (src/code_records.rs).
 blaze-run.workspace = true
+# `Func`: the LIR a code record is emitted from, an instance's or the thread-local getter's
+# (src/code_records.rs `make_entry`).
+blaze-lir.workspace = true
 # `dlsym`: an outside symbol's address in this process.
 libc.workspace = true
 # The program's crates: the toolchain's verified packs, their units and edition rule, and

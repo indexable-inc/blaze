@@ -324,6 +324,12 @@ pub(crate) enum CellPlant {
     /// with the stall (the core's answer until runner 14: objc2_core_foundation's
     /// `cf_objc2_type!` in `generated`, which globs its children and the root, which glob it).
     StallFailsGlobCall,
+    /// What a stalled call took while its module's globs were weakly undecided is never read
+    /// again: a glob that later brings another candidate of the name is no error.
+    SpeculationUnchecked,
+    /// At a stall a pending named import of the call's own name does not hold its lookup: the
+    /// globs' candidate or an outer one is taken past it.
+    StallPassesNamedImport,
 }
 
 type ModId = u32;
@@ -463,6 +469,36 @@ enum Skip {
     Call(ItemId),
     /// All of it: R6's inner scope, which growth by expansion alone does not hold.
     Growth,
+    /// All of it, and the module's glob imports not resolved yet: the weak view
+    /// ([`Cells::weak_view`]), read at a stall under a guess of its own.
+    Weak,
+}
+
+/// What holds the lookup of a plain first segment in its module ([`Cells::first_segment`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Hold {
+    /// Whatever is undecided there: the answer every order of evaluation gives.
+    Undecided,
+    /// A pending named import of the name alone: a stalled call's lookup, asked at a quiet point
+    /// (the one state every order reaches). A scope only weakly undecided (it binds nothing now;
+    /// only an expansion or a glob import not resolved yet could add the name) does not hold it:
+    /// the candidate its globs bring now is taken, else the lookup goes on outward, and what was
+    /// taken is validated when the run ends (Reference `names.resolution.expansion.speculation`).
+    NamedImport,
+}
+
+/// What a stalled call's lookup took while a scope was weakly undecided ([`Hold::NamedImport`]):
+/// kept only when the call is decided by it.
+#[derive(Clone, Copy)]
+enum Taken<N> {
+    /// R6's watch: a later write of the name into the module by an expansion that does not
+    /// enclose the call is the error.
+    Watch(ModId, Namespace, N, Def),
+    /// The module's `Globs` cell of the name, read again when the run ends: the definition
+    /// taken, and whether the globs brought it (else an outer scope did, and the globs had none).
+    Globs(CellId, Def, bool),
+    /// The error is known already (a definition an expansion wrote beside another candidate).
+    Error,
 }
 
 /// Where a module's own view of a name came from (R6, R7).
@@ -546,9 +582,14 @@ pub(crate) struct Cells<'a, N> {
     extern_watches: ABTreeMap<'a, N, AVec<'a, (ItemId, Def)>>,
     /// Every macro call by its key: a block's body written by an expansion is found by it.
     call_ids: ABTreeMap<'a, ItemKey, ItemId>,
-    /// The glob candidates stalled calls took ([`Cells::glob_call`]): the call, its module's
-    /// `Globs` cell of the macro's name and the definition taken, validated when the run ends.
-    speculated: AVec<'a, (ItemId, CellId, Def)>,
+    /// What stalled calls took while their module's globs were weakly undecided
+    /// ([`Hold::NamedImport`]): the call, its module's `Globs` cell of the name, the definition
+    /// taken and whether the globs brought it; validated when the run ends.
+    speculated: AVec<'a, (ItemId, CellId, Def, bool)>,
+    /// What the stalled call being asked has taken so far ([`Taken`]).
+    taken: AVec<'a, Taken<N>>,
+    /// A weak view whose fixed point did not settle: the stall's error.
+    weak_error: Option<CellError>,
 }
 
 /// A read of a cell by an item: decided, or the item now waits on it.
@@ -641,6 +682,8 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             extern_watches: ABTreeMap::new_in(alloc),
             call_ids: ABTreeMap::new_in(alloc),
             speculated: AVec::new_in(alloc),
+            taken: AVec::new_in(alloc),
+            weak_error: None,
         };
         // The dependencies by name before any text is read: an `extern crate` of any module
         // names one.
@@ -1431,6 +1474,8 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                                         }
                                     }
                                     Some(Some(_)) => {}
+                                    // The weak view: a glob not resolved yet brings nothing now.
+                                    Some(None) if skip == Skip::Weak => {}
                                     // A pending glob outside the group: an input not decided.
                                     Some(None) => return Step::Wait(Node::Item(i)),
                                     None => {}
@@ -1493,7 +1538,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 if self.plant != CellPlant::CallsNoGrowth && !(ns == Namespace::Macros && brought) {
                     for k in 0..self.modules[m as usize].calls.len() {
                         let j = self.modules[m as usize].calls[k];
-                        if skip == Skip::Call(j) || skip == Skip::Growth || self.items[j as usize].grown || guess.is_some_and(|g| g.items.contains_key(&j)) {
+                        if skip == Skip::Call(j) || matches!(skip, Skip::Growth | Skip::Weak) || self.items[j as usize].grown || guess.is_some_and(|g| g.items.contains_key(&j)) {
                             continue;
                         }
                         return Step::Wait(Node::Item(j));
@@ -1542,7 +1587,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             self.stats.max_evaluations = ev;
         }
         self.items[i as usize].waits.clear();
-        match self.try_item(i, None) {
+        match self.try_item(i, None, Hold::Undecided) {
             Step::Done(o) => self.settle(i, o),
             Step::Wait(_) => {
                 let waits = core::mem::replace(&mut self.items[i as usize].waits, AVec::new_in(self.alloc));
@@ -1558,7 +1603,8 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         }
     }
 
-    fn try_item(&mut self, i: ItemId, guess: Option<&Guess<'a>>) -> Step<Outcome> {
+    /// Item `i`'s answer from its reads; `hold`: what holds a plain first segment's lookup.
+    fn try_item(&mut self, i: ItemId, guess: Option<&Guess<'a>>, hold: Hold) -> Step<Outcome> {
         let (m, kind, glob, binds, ivis) = {
             let it = &self.items[i as usize];
             (it.module, it.kind, it.glob, it.binds, it.vis)
@@ -1656,7 +1702,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         for k in first..steps {
             let s = self.items[i as usize].segments[k];
             let v = if kind == PathKind::Plain && k == 0 {
-                match self.first_segment(m, Namespace::Types, s, i, guess) {
+                match self.first_segment(m, Namespace::Types, s, i, guess, hold) {
                     Step::Done(v) => v,
                     Step::Wait(n) => {
                         self.items[i as usize].waits.push(n);
@@ -1714,7 +1760,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             // the call reads its own view, which does not wait on its own growth.
             let v = if kind == PathKind::Plain && len == 1 {
                 // A one-segment call the textual scope missed: lexically, R6.
-                self.first_segment(m, Namespace::Macros, leaf, i, guess)
+                self.first_segment(m, Namespace::Macros, leaf, i, guess, hold)
             } else if cur == m {
                 match self.own_view(m, Namespace::Macros, leaf, i, Skip::Call(i), guess) {
                     Step::Done((v, _)) => Step::Done(v),
@@ -1781,7 +1827,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                         Read::Ready(Value::Found(def, if exported { Visibility::Public } else { Visibility::Crate(self.krate) }))
                     }
                     // Else the leaf is a first segment (R6-R8), in each namespace.
-                    None => match self.first_segment(m, ns, leaf, i, guess) {
+                    None => match self.first_segment(m, ns, leaf, i, guess, hold) {
                         Step::Done(v) => Read::Ready(v),
                         Step::Wait(n) => {
                             self.items[i as usize].waits.push(n);
@@ -1852,7 +1898,8 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     /// `Own` for the rest of `m`'s own bindings, `Glob` through a glob.
     fn own_view(&mut self, m: ModId, ns: Namespace, name: N, me: ItemId, skip: Skip, guess: Option<&Guess<'a>>) -> Step<(Value, From)> {
         let c = self.cell(m, ns, name, Layer::Full);
-        if skip != Skip::Growth
+        let whole = matches!(skip, Skip::Growth | Skip::Weak);
+        if !whole
             && let Some(v) = self.current(c, guess)
         {
             return Step::Done((v, From::Own));
@@ -1871,6 +1918,10 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             let o = match (self.items[j as usize].outcome, guess.and_then(|g| g.items.get(&j))) {
                 (Some(o), _) => Some(o),
                 (None, Some(&o)) => o,
+                (None, None) if skip == Skip::Weak && self.plant == CellPlant::StallPassesNamedImport => None,
+                // A named import that may still bind the name holds every view of it, the
+                // weak one too: what it binds shadows the globs' candidate and any outer one,
+                // so nothing is selected before it is decided.
                 (None, None) => return Step::Wait(Node::Item(j)),
             };
             match o {
@@ -1886,7 +1937,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             return Step::Done((Value::Outside, From::Own));
         }
         let g = self.cell(m, ns, name, Layer::Globs);
-        if skip != Skip::Growth
+        if !whole
             && let Some(v) = self.current(g, guess)
         {
             return Step::Done((v, From::Glob));
@@ -1895,6 +1946,82 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             Step::Done(v) => Step::Done((v, From::Glob)),
             Step::Wait(n) => Step::Wait(n),
         }
+    }
+
+    /// Module `m`'s own view of `name` in `ns` for the stalled call `me`, with every scope that
+    /// is only weakly undecided taken as it is now ([`Hold::NamedImport`]): the undecided cells
+    /// of `name` its globs reach through resolved glob imports are decided together, as their
+    /// least fixed point, with no call's growth and no unresolved glob import adding anything.
+    /// A pending named import of `name` in `m` or in a module those globs reach holds the view
+    /// (`Step::Wait`): it may bind the name, and nothing is taken before it is decided.
+    fn weak_view(&mut self, m: ModId, ns: Namespace, name: N, me: ItemId) -> Step<(Value, From)> {
+        match self.weak_guess(m, ns, name, me) {
+            Step::Done(view) => self.own_view(m, ns, name, me, Skip::Weak, Some(&view)),
+            Step::Wait(n) => Step::Wait(n),
+        }
+    }
+
+    /// What `m`'s globs bring of `name` in `ns` now, by the weak view's rule.
+    fn weak_globs(&mut self, m: ModId, ns: Namespace, name: N, me: ItemId) -> Step<Value> {
+        match self.weak_guess(m, ns, name, me) {
+            Step::Done(view) => {
+                let g = self.cell(m, ns, name, Layer::Globs);
+                self.cell_value(g, Some(&view), Skip::Weak)
+            }
+            Step::Wait(n) => Step::Wait(n),
+        }
+    }
+
+    /// The weak view's cells: every undecided cell of `name` in `ns` that `m`'s `Globs` cell
+    /// reaches through resolved glob imports, each with its value at their least fixed point.
+    fn weak_guess(&mut self, m: ModId, ns: Namespace, name: N, me: ItemId) -> Step<Guess<'a>> {
+        let alloc = self.alloc;
+        let mut view = Guess { cells: ABTreeMap::new_in(alloc), items: ABTreeMap::new_in(alloc) };
+        let mut todo: AVec<'a, CellId> = AVec::new_in(alloc);
+        todo.push(self.cell(m, ns, name, Layer::Globs));
+        let mut srcs: AVec<'a, ModId> = AVec::new_in(alloc);
+        while let Some(c) = todo.pop() {
+            if self.cells[c as usize].value.is_some() || view.cells.insert(c, None).is_some() {
+                continue;
+            }
+            let Cell { module, layer, .. } = self.cells[c as usize];
+            match layer {
+                Layer::Full => todo.push(self.cell(module, ns, name, Layer::Globs)),
+                Layer::Globs => {
+                    srcs.clear();
+                    srcs.extend(self.modules[module as usize].edges.values().map(|x| x.0));
+                    for &src in srcs.iter() {
+                        todo.push(self.cell(src, ns, name, Layer::Full));
+                    }
+                }
+            }
+        }
+        // Each value only rises (as in `fixpoint`), so the rounds are bounded.
+        let mut members: AVec<'a, CellId> = AVec::new_in(alloc);
+        members.extend(view.cells.keys().copied());
+        let bound = 4 * members.len() + 4;
+        let mut rounds = 0;
+        loop {
+            let mut changed = false;
+            for &c in members.iter() {
+                let v = match self.cell_value(c, Some(&view), Skip::Weak) {
+                    Step::Done(v) => Some(v).filter(|v| *v != Value::NotFound),
+                    Step::Wait(on) => return Step::Wait(on),
+                };
+                if view.cells.insert(c, v) != Some(v) {
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+            rounds += 1;
+            if rounds > bound {
+                self.weak_error = Some(CellError::NoFixpoint { module: self.modules[m as usize].key, cells: members.len() });
+                return Step::Wait(Node::Item(me));
+            }
+        }
+        Step::Done(view)
     }
 
     /// The first call of `m` not grown yet that may still write (not `me`, not one of a group
@@ -1977,8 +2104,18 @@ impl<'a, N: crate::Name> Cells<'a, N> {
     /// the outer binding is taken and a watch left), R7 (a pending import is waited for; a glob
     /// candidate beside a different outer one is an ambiguity, the same definition is one, D57),
     /// R8 (an extern-prelude name is final).
-    fn first_segment(&mut self, m: ModId, ns: Namespace, name: N, me: ItemId, guess: Option<&Guess<'a>>) -> Step<Value> {
-        let (inner, from) = match self.own_view(m, ns, name, me, Skip::Growth, guess) {
+    ///
+    /// `hold`: what holds the lookup in `m` ([`Hold`]). A stalled call asks with
+    /// [`Hold::NamedImport`]: `m`'s view is the weak one ([`Cells::weak_view`]), a candidate its
+    /// globs bring now is taken at once, a miss goes outward, and what was taken is left in
+    /// `self.taken` for the stall to keep (Reference `names.resolution.expansion.speculation`:
+    /// "All name resolution candidates selected during macro expansion are considered
+    /// speculative. Once the crate has been fully expanded, all speculative import resolutions
+    /// are validated to ensure that macro expansion did not introduce any new ambiguities.").
+    fn first_segment(&mut self, m: ModId, ns: Namespace, name: N, me: ItemId, guess: Option<&Guess<'a>>, hold: Hold) -> Step<Value> {
+        let weak = hold == Hold::NamedImport;
+        let view = if weak { self.weak_view(m, ns, name, me) } else { self.own_view(m, ns, name, me, Skip::Growth, guess) };
+        let (inner, from) = match view {
             Step::Done(x) => x,
             Step::Wait(n) => return Step::Wait(n),
         };
@@ -2020,16 +2157,20 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     // candidate, with the error (`...macros.ambiguity.more-expanded-vs-outer`).
                     let g = self.cell(m, ns, name, Layer::Globs);
                     let globbed = match self.current(g, guess) {
-                        Some(v) => v,
-                        None => match self.cell_value(g, guess, Skip::Growth) {
-                            Step::Done(v) => v,
-                            Step::Wait(n) => return Step::Wait(n),
-                        },
+                        Some(v) => Step::Done(v),
+                        None if weak => self.weak_globs(m, ns, name, me),
+                        None => self.cell_value(g, guess, Skip::Growth),
+                    };
+                    let globbed = match globbed {
+                        Step::Done(v) => v,
+                        Step::Wait(n) => return Step::Wait(n),
                     };
                     if let Value::Found(gd, _) | Value::Ambiguous(gd, _) = globbed
                         && gd != d
                     {
-                        if guess.is_none() {
+                        if weak {
+                            self.taken.push(Taken::Error);
+                        } else if guess.is_none() {
                             self.r6_error(me);
                         }
                         return Step::Done(globbed);
@@ -2044,14 +2185,27 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                     // that does not enclose the use, beside a different outer binding. The
                     // answer is the one every order gives: the outer binding, with the error at
                     // the expansion's definition (wide seed 8 with calls: the reference's).
-                    if guess.is_none() {
+                    if weak {
+                        self.taken.push(Taken::Error);
+                    } else if guess.is_none() {
                         self.r6_error(me);
                     }
                     if self.plant != CellPlant::InnerAfterWrite {
                         return Step::Done(o);
                     }
                 }
-                if from == From::Glob
+                if from == From::Glob && weak {
+                    // At a stall the candidate the globs bring now is selected (the rule quoted
+                    // below), whatever those globs still wait on: a later write of the name
+                    // into `m` is the watch's error, another answer of the globs the
+                    // validation's when the run ends.
+                    if !speculative || self.plant == CellPlant::StallFailsGlobCall {
+                        return Step::Wait(Node::Item(me));
+                    }
+                    let g = self.cell(m, ns, name, Layer::Globs);
+                    self.taken.push(Taken::Watch(m, ns, name, d));
+                    self.taken.push(Taken::Globs(g, d, true));
+                } else if from == From::Glob
                     && let Some(j) = self.growing(m, me, guess)
                 {
                     if !speculative {
@@ -2076,6 +2230,24 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             }
             Value::Outside => Step::Done(Value::Outside),
             Value::NotFound => match outer {
+                Some(o) if weak => {
+                    // The scope binds nothing now and is at most weakly undecided: the lookup
+                    // goes on outward and takes the first candidate, speculatively.
+                    let refused = match (o, ns) {
+                        (Value::Outside, _) => CellPlant::StallFailsOutside,
+                        (_, Namespace::Macros) => CellPlant::StallFailsOuterCall,
+                        (_, Namespace::Types | Namespace::Values) => CellPlant::StallFailsOuterPrefixCall,
+                    };
+                    if self.plant == refused {
+                        return Step::Wait(Node::Item(me));
+                    }
+                    if let Some(od) = outer_def {
+                        let g = self.cell(m, ns, name, Layer::Globs);
+                        self.taken.push(Taken::Watch(m, ns, name, od));
+                        self.taken.push(Taken::Globs(g, od, false));
+                    }
+                    Step::Done(o)
+                }
                 Some(o) => {
                     if self.plant == CellPlant::OutwardWaits
                         && let Some(j) = self.growing(m, me, guess)
@@ -2652,7 +2824,7 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                         Step::Done(v) => Step::Done(GuessStep::Cell(Some(v).filter(|v| *v != Value::NotFound))),
                         Step::Wait(on) => Step::Wait(on),
                     },
-                    Node::Item(i) => match self.try_item(i, Some(&guess)) {
+                    Node::Item(i) => match self.try_item(i, Some(&guess), Hold::Undecided) {
                         Step::Done(o) => Step::Done(GuessStep::Item(Some(o))),
                         Step::Wait(on) => Step::Wait(on),
                     },
@@ -2760,83 +2932,39 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         Ok(())
     }
 
-    /// A stalled plain call `a::..::m!` (item `i`) that only an outer scope answers: the
-    /// module's own view of `a` under `guess` is absent, an outer scope holds `a` as a module,
-    /// and every later segment is read from a cell decided already (a dependency's are decided
-    /// when made), never from a guess. The outer definition of `a` and the macro named.
-    fn outer_prefix_call(&mut self, i: ItemId, guess: &Guess<'a>) -> Option<(Def, Def)> {
-        let (m, len) = (self.items[i as usize].module, self.items[i as usize].segments.len());
-        let first = *self.items[i as usize].segments.first()?;
-        match self.own_view(m, Namespace::Types, first, i, Skip::Growth, Some(guess)) {
-            Step::Done((Value::NotFound, _)) => {}
-            Step::Done(_) | Step::Wait(_) => return None,
-        }
-        let Step::Done(Some(Value::Found(od, _))) = self.outer_of(Namespace::Types, first, Some(guess)) else { return None };
-        if od.kind != DefKind::Module {
-            return None;
-        }
-        let mut cur = self.module_at(od.key)?;
-        for k in 1..len {
-            let s = self.items[i as usize].segments[k];
-            let leaf = k + 1 == len;
-            let c = self.cell(cur, if leaf { Namespace::Macros } else { Namespace::Types }, s, Layer::Full);
-            let Some(Value::Found(d, vis)) = self.cells[c as usize].value else { return None };
-            if !self.visible(vis, m) {
-                return None;
-            }
-            if leaf {
-                return Some((od, d));
-            }
-            if d.kind != DefKind::Module {
-                return None;
-            }
-            cur = self.module_at(d.key)?;
-        }
-        None
-    }
-
-    /// A stalled one-segment call `name!` (item `i` of `m`) that the module's globs answer: no
-    /// textual candidate is open (its textual read waits on no call), the module's own view
-    /// under `guess` is `def` through its globs, and one of the module's glob sources holds
-    /// `def` decided already (a dependency's module is decided when made), never by the guess
-    /// alone. The module's `Globs` cell of the name, validated when the run ends.
-    fn glob_call(&mut self, i: ItemId, m: ModId, name: N, def: Def, guess: &Guess<'a>) -> Option<CellId> {
-        let at = self.items[i as usize].call?;
-        if !matches!(self.textual(at.frag, at.pos, name, None), Step::Done(None)) {
-            return None;
-        }
-        match self.own_view(m, Namespace::Macros, name, i, Skip::Growth, Some(guess)) {
-            Step::Done((Value::Found(d, _), From::Glob)) if d == def => {}
-            Step::Done(_) | Step::Wait(_) => return None,
-        }
-        let mut sources: AVec<'a, ModId> = AVec::new_in(self.alloc);
-        sources.extend(self.modules[m as usize].edges.iter().map(|e| e.1.0));
-        for &src in sources.iter() {
-            let c = self.cell(src, Namespace::Macros, name, Layer::Full);
-            if let Some(Value::Found(d, vis)) = self.cells[c as usize].value
-                && d == def
-                && self.visible(vis, m)
-            {
-                return Some(self.cell(m, Namespace::Macros, name, Layer::Globs));
-            }
-        }
-        None
-    }
-
     /// Reference `names.resolution.expansion.speculation`: "Once the crate has been fully
     /// expanded, all speculative import resolutions are validated to ensure that macro
-    /// expansion did not introduce any new ambiguities." Each glob candidate a stalled call
-    /// took is read again: another definition, an ambiguity or none is the error at the call.
+    /// expansion did not introduce any new ambiguities." What each stalled call took while its
+    /// module's globs were weakly undecided is read again in the module's `Globs` cell: a
+    /// candidate the globs brought must be their answer still; beside an outer scope's the
+    /// globs bring nothing, or that same definition (D57). Anything else is the error at the
+    /// call (`...ambiguity.glob-vs-outer`).
     fn validate_speculated(&mut self) {
+        if self.plant == CellPlant::SpeculationUnchecked {
+            return;
+        }
         for k in 0..self.speculated.len() {
-            let (i, g, def) = self.speculated[k];
+            let (i, g, def, globbed) = self.speculated[k];
             match self.cells[g as usize].value {
                 Some(Value::Found(d, _)) if d == def => {}
+                Some(Value::NotFound) if !globbed => {}
                 // Unknown here, or not decided: no other answer is shown.
                 Some(Value::Outside) | None => {}
                 Some(Value::Found(..) | Value::Ambiguous(..) | Value::NotFound) => self.r6_error(i),
             }
         }
+    }
+
+    /// A stalled call's answer with a weakly undecided scope not holding its lookup
+    /// ([`Hold::NamedImport`]): `calls`, the stalled group's calls, add nothing (a call of the
+    /// group before it in the text is weak too); every other read is of a decided cell. What
+    /// the lookup took is left in `self.taken`. The call's own wait list is put back.
+    fn stalled_call(&mut self, i: ItemId, calls: &Guess<'a>) -> Step<Outcome> {
+        self.taken.clear();
+        let waits = core::mem::replace(&mut self.items[i as usize].waits, AVec::new_in(self.alloc));
+        let step = self.try_item(i, Some(calls), Hold::NamedImport);
+        self.items[i as usize].waits = waits;
+        step
     }
 
     /// R5 over a sink holding a macro call, its least fixed point `guess` computed with the
@@ -2850,65 +2978,60 @@ impl<'a, N: crate::Name> Cells<'a, N> {
         // Calls are never decided from a guess: R5 fails them (the reference's sinks), and one
         // resolving under the guess would expand before an earlier call failed.
         let mut picked: AVec<'a, (ItemId, Outcome)> = AVec::new_in(alloc);
+        // The group's calls, adding nothing: what a stalled call is asked under.
+        let mut calls = Guess { cells: ABTreeMap::new_in(alloc), items: ABTreeMap::new_in(alloc) };
+        for &n in members {
+            if let Node::Item(i) = n
+                && self.items[i as usize].call.is_some()
+            {
+                calls.items.insert(i, None);
+            }
+        }
+        // What the picked calls took: kept with them (`taken` is one call's at a time).
+        let mut kept: AVec<'a, (ItemId, Taken<N>)> = AVec::new_in(alloc);
+        let queued = self.cell_queue.len();
         for &n in members {
             let Node::Item(i) = n else { continue };
-            match guess.items.get(&i) {
-                Some(&Some(o @ (Outcome::Named(_) | Outcome::Glob(_)))) if self.items[i as usize].call.is_none() => picked.push((i, o)),
-                // R6: a plain first segment the inner scope misses while that scope can grow by
-                // expansion alone takes the outer binding, whatever the group's calls write
-                // later (a later write is an ambiguity at it, never another answer). Stage 1
-                // follows no outer scope: the import or call is `Outside`, decided now, alone,
-                // and never failed by the stall (core's `cfg_select!`, `global_asm!`).
-                Some(&Some(Outcome::Outside)) if self.plant != CellPlant::StallFailsOutside => picked.push((i, Outcome::Outside)),
-                // R5 (2026-11-16): in a stalled member the undecided inner scope is absent, so a
-                // one-segment call goes outward and RESOLVES to what an outer scope holds (the
-                // standard prelude's `Clone` at a `#[derive(Clone)]` in a module whose globs wait
-                // on its own derives: core's `core_arch`). Only an outer answer is taken: one
-                // from a guessed inner value could still be shadowed or made ambiguous.
-                Some(&Some(Outcome::Called(def))) if self.plant != CellPlant::StallFailsOuterCall => {
-                    let it = &self.items[i as usize];
-                    if it.kind == PathKind::Plain && it.segments.len() == 1 {
-                        let (m, name) = (it.module, it.segments[0]);
-                        if let Step::Done(Some(Value::Found(d, _))) = self.outer_of(Namespace::Macros, name, Some(guess))
-                            && d == def
-                        {
-                            picked.push((i, Outcome::Called(def)));
-                            // R6's watch: a later write of `name` into `m` by an expansion that
-                            // does not enclose the call is the error.
-                            self.watches.entry((m, Namespace::Macros, name)).or_insert_with(|| AVec::new_in(alloc)).push((i, def));
-                        } else if self.plant != CellPlant::StallFailsGlobCall
-                            && let Some(g) = self.glob_call(i, m, name, def, guess)
-                        {
-                            // The macro namespace's glob candidate, decided in one of the
-                            // module's glob sources already, is selected now (Reference
-                            // `names.resolution.expansion.speculation`); a later write into `m`
-                            // is the watch's error, another answer of the globs the validation's.
-                            picked.push((i, Outcome::Called(def)));
-                            self.watches.entry((m, Namespace::Macros, name)).or_insert_with(|| AVec::new_in(alloc)).push((i, def));
-                            self.speculated.push((i, g, def));
-                        }
-                    } else if it.kind == PathKind::Plain && it.segments.len() >= 2 && self.plant != CellPlant::StallFailsOuterPrefixCall {
-                        // The same rule one segment earlier: `a::m!` whose `a` the stalled
-                        // module's own view lacks goes outward for `a` (the extern prelude's
-                        // crate), and the rest of the path is read from decided cells alone.
-                        let (m, first) = (it.module, it.segments[0]);
-                        if let Some((od, d)) = self.outer_prefix_call(i, guess)
-                            && d == def
-                        {
-                            picked.push((i, Outcome::Called(def)));
-                            // R6's watch on the first segment, in the type namespace.
-                            self.watches.entry((m, Namespace::Types, first)).or_insert_with(|| AVec::new_in(alloc)).push((i, od));
-                        }
-                    }
+            if self.items[i as usize].call.is_none() {
+                // An import: R5 as in `fixpoint`, its guess when the guess resolves it.
+                if let Some(&Some(o @ (Outcome::Named(_) | Outcome::Glob(_) | Outcome::Outside))) = guess.items.get(&i) {
+                    picked.push((i, o));
                 }
-                _ => {}
+                continue;
             }
+            // A call: the one rule of `first_segment` under `Hold::NamedImport`. A scope that is
+            // only weakly undecided does not hold its lookup (core's `core_arch`: a
+            // `#[derive(Clone)]` in a module whose globs wait on its own derives takes the
+            // standard prelude's; `cfg_select!` there is unknown, never failed), and nothing
+            // else is guessed: every later segment is read from a decided cell.
+            if let Step::Done(o @ (Outcome::Called(_) | Outcome::Outside)) = self.stalled_call(i, &calls) {
+                picked.push((i, o));
+                for k in 0..self.taken.len() {
+                    kept.push((i, self.taken[k]));
+                }
+            }
+        }
+        self.taken.clear();
+        if let Some(e) = self.weak_error.take() {
+            return Err(e);
         }
         if !picked.is_empty() {
             self.stats.stalls += 1;
+            for &(i, t) in kept.iter() {
+                match t {
+                    Taken::Watch(m, ns, name, def) => self.watches.entry((m, ns, name)).or_insert_with(|| AVec::new_in(alloc)).push((i, def)),
+                    Taken::Globs(g, def, globbed) => self.speculated.push((i, g, def, globbed)),
+                    Taken::Error => self.r6_error(i),
+                }
+            }
             for &(i, o) in picked.iter() {
                 self.settle(i, o);
             }
+            return Ok(());
+        }
+        if self.cell_queue.len() != queued {
+            // A stalled call's lookup made a cell no evaluation had made yet: it is tried
+            // first, and the group is asked again (a cell is made once, so this ends).
             return Ok(());
         }
         let mut spared: AVec<'a, ItemId> = AVec::new_in(alloc);
@@ -2941,8 +3064,6 @@ impl<'a, N: crate::Name> Cells<'a, N> {
                 self.stats.stalls += 1;
                 self.stats.spared += spared.len() as u64;
                 for &j in blocking.iter() {
-                    // TEMP-R14
-                    std::eprintln!("TEMP-R14 blocking fails call {:?} {:?} in {:x} guess {:?} waits {:?}", self.items[j as usize].kind, &self.items[j as usize].segments[..], self.modules[self.items[j as usize].module as usize].key, guess.items.get(&j), &self.items[j as usize].waits[..]);
                     self.stats.stalled_items += 1;
                     self.settle(j, Outcome::Failed(Unresolved::NotFound));
                 }
@@ -2971,30 +3092,6 @@ impl<'a, N: crate::Name> Cells<'a, N> {
             let Node::Item(i) = n else { continue };
             if spared.contains(&i) {
                 continue;
-            }
-            // TEMP-R14
-            if self.items[i as usize].call.is_some() {
-                std::eprintln!("TEMP-R14 stall fails call {:?} {:?} in {:x} guess {:?} members {}", self.items[i as usize].kind, &self.items[i as usize].segments[..], self.modules[self.items[i as usize].module as usize].key, guess.items.get(&i), members.len());
-                for &w in self.items[i as usize].waits.iter() {
-                    match w {
-                        Node::Cell(c) => {
-                            let ce = &self.cells[c as usize];
-                            std::eprintln!("TEMP-R14   waits cell {:x} {:?} {:?} {:?} on {:?}", self.modules[ce.module as usize].key, ce.ns, ce.name, ce.layer, ce.waiting_on);
-                        }
-                        Node::Item(j) => std::eprintln!("TEMP-R14   waits item {:?} {:?} call {}", self.items[j as usize].kind, &self.items[j as usize].segments[..], self.items[j as usize].call.is_some()),
-                    }
-                }
-                if members.len() < 40 {
-                    for &mn in members {
-                        match mn {
-                            Node::Cell(c) => {
-                                let ce = &self.cells[c as usize];
-                                std::eprintln!("TEMP-R14   member cell {:x} {:?} {:?} {:?} on {:?} guess {:?}", self.modules[ce.module as usize].key, ce.ns, ce.name, ce.layer, ce.waiting_on, guess.cells.get(&c));
-                            }
-                            Node::Item(j) => std::eprintln!("TEMP-R14   member item {j} {:?} {:?} call {} guess {:?}", self.items[j as usize].kind, &self.items[j as usize].segments[..], self.items[j as usize].call.is_some(), guess.items.get(&j)),
-                        }
-                    }
-                }
             }
             let o = if self.items[i as usize].call.is_some() {
                 Outcome::Failed(Unresolved::NotFound)

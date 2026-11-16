@@ -480,6 +480,43 @@ impl Search {
         search
     }
 
+    /// A search that starts at a failure another phase found (the guided phase, guided.rs): it
+    /// shrinks `record`, the failing case's record, and runs the least tape once more, as it does
+    /// for a failure of its own. The failure has no seed, since a guided case is a tape; `case` is
+    /// which case it was, from 1, of `config.cases`, the cases that phase ran.
+    #[blaze::pure]
+    #[blaze::nonblocking]
+    pub(crate) fn after_failure(
+        config: Config,
+        record: &Record,
+        failure: Failure,
+        case: u32,
+    ) -> Search {
+        let mut search = Search::new(config.given(Given::NOTHING));
+        // `new` of a run of no cases is already done: what follows replaces that.
+        search.verdict = None;
+        search.ran = case;
+        search.drew = true;
+        let found = Found { seed: None, case, failure, first_len: choices_of(record) };
+        if search.config.shrink_runs == 0 {
+            let cases = search.count;
+            search.done(Verdict::Failed(Failed {
+                seed: None,
+                case,
+                cases,
+                failure: found.failure,
+                first_len: found.first_len,
+                least: record.clone(),
+                shrink_runs: 0,
+            }));
+            return search;
+        }
+        search.shrinker = Some(Shrinker::new(record, search.config.shrink_runs));
+        search.found = Some(found);
+        search.stage = Stage::Shrink;
+        search
+    }
+
     /// The most choices a case of this search may draw.
     #[blaze::pure]
     #[blaze::nopanic]

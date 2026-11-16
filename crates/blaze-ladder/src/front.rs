@@ -2020,6 +2020,7 @@ pub(crate) fn detail_name(d: ItemDetail) -> &'static str {
         ItemDetail::MacroRules { .. } => "`macro_rules!`",
         ItemDetail::MacroDef => "a `macro` definition",
         ItemDetail::MacroCall { .. } => "a macro call in item position",
+        ItemDetail::Impl => "an impl",
         _ => "this item",
     }
 }

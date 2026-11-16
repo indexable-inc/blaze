@@ -8,8 +8,11 @@
 //! - every record of the hello-world rung, and of every running and support rung, names its
 //!   targets by symbol or C name only: no load of a literal word, every `adrp` a site row
 //!   (blaze-emit `no_address_word`, the emitter test's checker), every outside target with its
-//!   name kept; each declared instance's name decodes and encodes back to equal bytes; no two
-//!   different instances share a symbol:
+//!   name kept; every function target is an instance its caller declares, or the program's
+//!   thread-local getter (its own record, met once per rung with thread-locals and counted
+//!   among the instances), and either way has an entry; each declared instance's name decodes
+//!   and encodes back to equal bytes; no two different instances share a symbol. A failure
+//!   names its rung, its caller and its callee (fn, symbol and canonical instance name):
 //!   `hello: 1 instance, 1 record; targets: 0 by symbol, 1 C name (write); 0 literal words`
 //!   `corpus: <R> rungs, <N> instances, <S> distinct symbols, 0 literal words, 0 refused`
 //! - building twice gives equal keys and byte-equal entries, and a second build into the same
@@ -28,12 +31,12 @@
 
 mod rungs;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use blaze_code::record::Space;
+use blaze_code::record::{Space, Symbol};
 use blaze_emit::{Isa, Os};
 use blaze_ladder::code_records::{
-    Builder, CodeKey, CodeStore, EntryView, KeyPlant, MemoryStore, Met, RecordRun, Settings, code_key, code_key_planted,
+    Builder, CodeKey, CodeStore, EntryView, KeyPlant, MemoryStore, Met, RecordRun, Settings, code_key, code_key_planted, getter_parts,
 };
 use blaze_ladder::refusal::SourceFile;
 use blaze_ladder::run::{NewFront, build_records_new};
@@ -121,44 +124,76 @@ struct Targets {
     c_names: Vec<String>,
 }
 
-/// The entry under `key` in `store` holds the promises (module doc, first bullet), or the test
-/// stops naming the one broken; its targets.
-fn check_entry(store: &dyn CodeStore, met: &Met) -> Targets {
-    let bytes = store.get(met.key).expect("the store reads").unwrap_or_else(|| panic!("no entry for `{}` under {}", met.function, met.key));
-    let entry = EntryView::read(bytes).unwrap_or_else(|e| panic!("`{}`'s entry: {e}", met.function));
-    entry.no_address_word().unwrap_or_else(|e| panic!("`{}`: {e}", met.function));
+/// An instance's canonical name (symbols.rs `encode_instance`) as hex, its first 48 bytes.
+fn canonical(name: &[u8]) -> String {
+    let shown: String = name.iter().take(48).map(|b| format!("{b:02x}")).collect();
+    match name.len() > 48 {
+        true => format!("{shown}.. ({} bytes)", name.len()),
+        false => shown,
+    }
+}
+
+/// Who `symbol` is in a walk that met `all`: the fn it is tabled as (or the thread-local getter)
+/// and, when `declared` has it, its canonical instance name.
+fn who(symbol: Symbol, all: &[Met], declared: &BTreeMap<Symbol, Vec<u8>>) -> String {
+    let fname = all.iter().find(|m| m.symbol == symbol).map_or("an instance the walk never met", |m| &*m.function);
+    match declared.get(&symbol) {
+        Some(name) => format!("`{fname}` (symbol {symbol}, instance {})", canonical(name)),
+        None => format!("`{fname}` (symbol {symbol}, declared by no caller)"),
+    }
+}
+
+/// The entry under `met.key` in `store` holds the promises (module doc, first bullet), or an
+/// error naming the rung, the caller and the callee; its targets. `all` is every instance the
+/// walk met: a function target is a declared instance or the program's thread-local getter, and
+/// either way the walk met it, so its entry is in `store`.
+fn check_entry(rung: &str, store: &dyn CodeStore, met: &Met, all: &[Met]) -> Result<Targets, String> {
+    let caller = &met.function;
+    let bytes = store.get(met.key).map_err(|e| format!("{rung}: `{caller}`: the store: {e:?}"))?;
+    let bytes = bytes.ok_or_else(|| format!("{rung}: no entry for `{caller}` under {}", met.key))?;
+    let entry = EntryView::read(bytes).map_err(|e| format!("{rung}: `{caller}`'s entry: {e}"))?;
+    entry.no_address_word().map_err(|e| format!("{rung}: `{caller}`: {e}"))?;
     let record = entry.record;
     let mut out = Targets::default();
-    let mut declared = BTreeSet::new();
+    let mut declared: BTreeMap<Symbol, Vec<u8>> = BTreeMap::new();
     let mut ground = PortableTys::new_in(Alloc::global());
     entry
         .each_declared(
             |d| {
-                let (item, args) = decode_instance(d.name, &mut ground, Alloc::global()).map_err(|e| e.to_string())?;
+                let (item, args) = decode_instance(d.name, &mut ground, Alloc::global()).map_err(|e| format!("instance {}: {e}", canonical(d.name)))?;
                 let mut again: AVec<'_, u8> = OwnVec::new_in(Alloc::global());
-                encode_instance(item, args, ground.view(), Alloc::global(), &mut again).map_err(|e| e.to_string())?;
-                assert_eq!(&again[..], d.name, "`{}`: a declared instance's name decodes and encodes back to equal bytes", met.function);
-                declared.insert(fn_symbol_of_name(d.name));
+                encode_instance(item, args, ground.view(), Alloc::global(), &mut again).map_err(|e| format!("instance {}: {e}", canonical(d.name)))?;
+                if &again[..] != d.name {
+                    return Err(format!("instance {} encodes back as {}: not equal bytes", canonical(d.name), canonical(&again)));
+                }
+                declared.insert(fn_symbol_of_name(d.name), d.name.to_vec());
                 Ok(())
             },
             |e| e.to_string(),
         )
-        .unwrap_or_else(|e: String| panic!("`{}`'s declared instances: {e}", met.function));
+        .map_err(|e: String| format!("{rung}: `{caller}`'s declared instances: {e}"))?;
+    let getter = getter_parts().symbol;
     for i in 0..record.targets() {
         let target = record.target(i);
         match target.space {
             Space::Outside => {
-                let name = record.name(target.symbol).unwrap_or_else(|| panic!("`{}` names an outside symbol with no name kept", met.function));
+                let name = record.name(target.symbol).ok_or_else(|| format!("{rung}: `{caller}` names an outside symbol {} with no name kept", target.symbol))?;
                 out.c_names.push(name.to_string());
             }
             Space::Func => {
-                assert!(declared.contains(&target.symbol), "`{}` calls {} and declares no instance by that symbol: its parent could not make it", met.function, target.symbol);
+                let callee = who(target.symbol, all, &declared);
+                if target.symbol != getter && !declared.contains_key(&target.symbol) {
+                    return Err(format!("{rung}: `{caller}` calls {callee}: an undeclared callee, which its parent could not make"));
+                }
+                if !all.iter().any(|m| m.symbol == target.symbol) {
+                    return Err(format!("{rung}: `{caller}` calls {callee}, whose record the walk never made or found"));
+                }
                 out.by_symbol += 1;
             }
             Space::Static | Space::Vtable | Space::Tls => out.by_symbol += 1,
         }
     }
-    out
+    Ok(out)
 }
 
 /// The run path's piece 3 on the hello-world rung: prints
@@ -171,7 +206,7 @@ fn hello_records_name_targets_by_symbol() {
     let mut by_symbol = 0;
     let mut c_names = Vec::new();
     for m in &met {
-        let t = check_entry(&store, m);
+        let t = check_entry("3-hello", &store, m, &met).unwrap_or_else(|e| panic!("{e}"));
         by_symbol += t.by_symbol;
         c_names.extend(t.c_names);
     }
@@ -193,6 +228,9 @@ fn hello_records_name_targets_by_symbol() {
 fn every_rung_records_name_targets_by_symbol() {
     let (mut rungs, mut instances, mut symbols) = (0, 0, 0);
     let mut refused = Vec::new();
+    // Every broken promise, each naming its rung, caller and callee: all rungs are checked
+    // before the test stops, so one run names every failure.
+    let mut broken = Vec::new();
     for rung in RUNNING.iter().chain(SUPPORT) {
         let dir = ladder().join(rung);
         let mut store = MemoryStore::new_in(Alloc::global());
@@ -204,16 +242,25 @@ fn every_rung_records_name_targets_by_symbol() {
             }
         };
         for m in &met {
-            check_entry(&store, m);
+            if let Err(e) = check_entry(rung, &store, m, &met) {
+                broken.push(e);
+            }
         }
-        let distinct: BTreeSet<_> = met.iter().map(|m| m.symbol).collect();
-        assert_eq!(distinct.len(), met.len(), "{rung}: two instances share a symbol");
+        let mut by_symbol: BTreeMap<Symbol, Vec<&str>> = BTreeMap::new();
+        for m in &met {
+            by_symbol.entry(m.symbol).or_default().push(&m.function);
+        }
+        for (symbol, fns) in by_symbol.iter().filter(|(_, fns)| fns.len() > 1) {
+            broken.push(format!("{rung}: {} instances share symbol {symbol}: {}", fns.len(), fns.join(", ")));
+        }
+        let distinct = by_symbol.len();
         rungs += 1;
         instances += met.len();
-        symbols += distinct.len();
+        symbols += distinct;
     }
     let line = format!("corpus: {rungs} rungs, {instances} instances, {symbols} distinct symbols, 0 literal words, {} refused", refused.len());
     println!("{line}");
+    assert!(broken.is_empty(), "{} broken promises in the rungs' records:\n{}", broken.len(), broken.join("\n"));
     assert!(refused.is_empty(), "rungs whose records were not built:\n{}", refused.join("\n"));
 }
 

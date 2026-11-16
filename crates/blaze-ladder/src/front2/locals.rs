@@ -393,8 +393,10 @@ impl<'n> Locals<'n> {
                         let bound = match leaf.form {
                             UseForm::Named { rename: Rename::Same, .. } => leaf.segments.last().copied().unwrap_or(""),
                             UseForm::Named { rename: Rename::To(n), .. } => n,
-                            // `as _` binds no name.
-                            UseForm::Named { rename: Rename::Underscore, .. } => continue,
+                            // `as _` binds no name, but a trait it names is in scope for
+                            // method calls in the block (super::block_traits): its row is kept
+                            // under a name no identifier is, never found by `find`.
+                            UseForm::Named { rename: Rename::Underscore, .. } => super::block_traits::UNDERSCORE,
                             // A glob's row is kept under a name no identifier is, with the
                             // path before its `*`: a name of the body is looked up through it
                             // lazily, after the block's own items (super::glob_uses).

@@ -1,9 +1,7 @@
-//! The flags of an entry's tokens ([`ItemFlags`]), read in the one token pass the walk makes:
-//! a state machine fed each token that is not trivia, which answers the flags the token
-//! decides. A token's flags are its innermost open entry's (or the file's, outside every
-//! entry); a body the skeleton leaves unlexed is lexed for this alone when its bytes may set a
-//! flag (crate::skeleton), and fed to a fresh machine, which is where a whole-file walk stands
-//! after the body's `{`.
+//! The flags of an entry's tokens ([`ItemFlags`]), read in the one pass that fills the token
+//! columns (crate::walk::rows): a state machine fed each token of the text that is not trivia,
+//! a body's with the rest, which answers the flags the token decides. A token's flags are its
+//! innermost entry's (or the file's, outside every entry).
 //!
 //! What decides each flag, on tokens (a string, a comment or an identifier is one token, so the
 //! word inside one is never a keyword):

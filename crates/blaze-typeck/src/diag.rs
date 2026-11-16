@@ -114,6 +114,14 @@ pub enum DiagCode {
     DynIncompatible,
     /// E0057: a call through `Fn*` with the wrong number of arguments for its `Args` tuple.
     FnTraitArgCount,
+    /// E0220: `T::Assoc` where no trait of `T`'s bounds declares an associated type `Assoc`
+    /// (`name`); `found` is the prefix's type.
+    NoAssocTy,
+    /// E0221: `T::Assoc` where two traits of `T`'s bounds declare an associated type `Assoc`.
+    AmbiguousAssocTyInBounds,
+    /// E0223: `P::Assoc` where `P` is no parameter and no `Self` of a trait or of a trait's
+    /// impl, so no bound says which trait's `Assoc` is meant (`<P as Trait>::Assoc` does).
+    AmbiguousAssocTy,
 }
 
 impl DiagCode {
@@ -170,6 +178,9 @@ impl DiagCode {
             DiagCode::NotATrait => "E0404",
             DiagCode::DynIncompatible => "E0038",
             DiagCode::FnTraitArgCount => "E0057",
+            DiagCode::NoAssocTy => "E0220",
+            DiagCode::AmbiguousAssocTyInBounds => "E0221",
+            DiagCode::AmbiguousAssocTy => "E0223",
         }
     }
 }

@@ -106,7 +106,7 @@ fn the_checkers_fix_in_every_view_and_applied_by_id() {
     for view in [View::Agent, View::Json, View::Person] {
         let before = stdout(&io).len();
         let mut shown = print::Shown::new(blaze_report::frame::Caps::LINES, view, "/ws", frame);
-        print::finding(&cx, &listed[0], &mut shown, frame, &out).expect("drawn");
+        print::finding(&cx, &listed[0], OWNERS.as_bytes(), &mut shown, frame, &out).expect("drawn");
         print::closing(&cx, &shown, 1, 0, None, None, None, frame, &out).expect("closed");
         said.push(stdout(&io)[before..].to_owned());
     }
@@ -151,7 +151,7 @@ fn one(path: &'static str, text: &'static str, needle: &str, id: &str) -> Listed
     Listed {
         path: Some(path),
         about: blaze_drive::Name::file(path.as_bytes()),
-        text: text.as_bytes(),
+        read: fix::text_id(text.as_bytes()),
         area: Area::Cli,
         rule: units::TOOLCHAIN_NAMED,
         words: b"bstd",

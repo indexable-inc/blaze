@@ -3372,10 +3372,14 @@ mod places;
 mod casts;
 mod matches;
 mod guards;
+#[cfg(target_arch = "aarch64")]
+mod operators;
 mod moves;
 mod unwind;
 #[cfg(target_arch = "aarch64")]
 mod temps;
+#[cfg(target_arch = "aarch64")]
+mod zst_drops;
 mod lets;
 mod wide;
 mod index;

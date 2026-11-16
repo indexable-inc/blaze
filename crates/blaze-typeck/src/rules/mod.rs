@@ -31,6 +31,7 @@ pub(crate) mod method;
 pub(crate) mod op;
 pub(crate) mod opaque_def;
 pub(crate) mod pat;
+pub(crate) mod self_path;
 pub mod suggest;
 pub(crate) mod writeback;
 

@@ -148,8 +148,10 @@ pub(crate) struct Listed<'f> {
     /// The file it is drawn in; `None` for a finding of no file, drawn at [`Listed::about`].
     pub path: Option<&'f str>,
     pub about: Name,
-    /// The file's text as this command read it (empty for none).
-    pub text: &'f [u8],
+    /// The file's text as this command read it, by its digest ([`text_id`]; of no bytes for a
+    /// finding of no file). Never the text: a finding costs the command's frame this struct, and
+    /// a file is read again, into scratch, where it is drawn or fixed (print.rs `Scratch`).
+    pub read: blaze_ids::ContentId,
     pub area: Area,
     pub rule: u16,
     /// Its words' pieces, between 0x1F bytes.
@@ -180,11 +182,23 @@ impl Listed<'_> {
 pub(crate) const ITEM_GRAMMAR: blaze_surface::Edition = blaze_surface::Edition::E2024;
 
 pub(crate) fn item_of(text: &str, at: u32, edition: Option<blaze_surface::Edition>, frame: &Frame) -> (u32, u32, u64) {
-    if let Some(edition) = edition {
-        let erased = blaze_own::Erased::new(frame);
-        let outline = blaze_file_items::outline(text, edition, erased.handle());
-        if let Some(item) = crate::work::item_holding(&outline, at) {
-            return (item.range.start, item.range.end, crate::work::item_chain(&outline, item, text));
+    let erased = blaze_own::Erased::new(frame);
+    let outline = edition.map(|edition| blaze_file_items::outline(text, edition, erased.handle()));
+    item_in(outline.as_ref(), text, at)
+}
+
+/// The digest a [`Listed`] holds of its file's text: what `--fix` and the drawing compare the
+/// file as it is now against.
+pub(crate) fn text_id(text: &[u8]) -> blaze_ids::ContentId {
+    blaze_ids::ContentId::of("blaze-cli a finding's file text", text)
+}
+
+/// [`item_of`] over an outline its caller made (one a file, whatever its findings' count):
+/// `None` for a file that is not Rust.
+pub(crate) fn item_in(outline: Option<&blaze_file_items::Outline<'_>>, text: &str, at: u32) -> (u32, u32, u64) {
+    if let Some(outline) = outline {
+        if let Some(item) = crate::work::item_holding(outline, at) {
+            return (item.range.start, item.range.end, crate::work::item_chain(outline, item, text));
         }
     }
     let bytes = text.as_bytes();
@@ -340,7 +354,9 @@ pub(crate) fn apply<'f, 's, W: Writer>(cx: &Cx, root: &Dir<ReadWrite>, writer: &
             return Ok(Err(Refusal::Overlap { a: a.id, b: b.id }));
         }
     }
-    // Each file as it is now must be the text the ids were made from.
+    // Each file as it is now must be the text the ids were made from: read once, here, and
+    // kept for the write below (a finding holds its file's digest, never its text).
+    let mut texts: Vec<&[u8], &Frame> = Vec::new_in(frame);
     let mut start = 0;
     while start < chosen.len() {
         let path = listed[chosen[start]].path;
@@ -348,9 +364,10 @@ pub(crate) fn apply<'f, 's, W: Writer>(cx: &Cx, root: &Dir<ReadWrite>, writer: &
         let Some(path) = path else { return Ok(Err(Refusal::NoFix { id: listed[chosen[start]].id, code: listed[chosen[start]].code() })) };
         let mut now = Bytes::new_in(frame, "a file to fix");
         root.read_all(cx, &Path::new(path)?, &mut now)?;
-        if now.as_slice() != listed[chosen[start]].text {
+        if text_id(now.as_slice()) != listed[chosen[start]].read {
             return Ok(Err(Refusal::Changed { id: listed[chosen[start]].id }));
         }
+        texts.push(Vec::from_slice_in(now.as_slice(), frame).leak());
         start = end;
     }
     let mut fixed = Vec::with_capacity_in(chosen.len(), frame);
@@ -359,16 +376,21 @@ pub(crate) fn apply<'f, 's, W: Writer>(cx: &Cx, root: &Dir<ReadWrite>, writer: &
     while start < chosen.len() {
         let first = &listed[chosen[start]];
         let end = start + chosen[start..].iter().take_while(|&&at| listed[at].path == first.path).count();
-        let mut bytes: Vec<u8, &Frame> = Vec::with_capacity_in(first.text.len(), frame);
+        let text = texts[files as usize];
+        let mut bytes: Vec<u8, &Frame> = Vec::with_capacity_in(text.len(), frame);
         let mut from = 0usize;
         for &at in chosen[start..end].iter() {
             let Some(change) = listed[at].fix else { continue };
-            bytes.extend_from_slice(&first.text[from..change.start as usize]);
+            // A fix's range is in the text its digest names, which `text` is.
+            let (Some(kept), true) = (text.get(from..change.start as usize), change.end as usize <= text.len()) else {
+                return Err(CliError::Text { what: "a fix's range is outside its file" });
+            };
+            bytes.extend_from_slice(kept);
             bytes.extend_from_slice(change.insert.as_bytes());
             from = change.end as usize;
             fixed.push(listed[at].id);
         }
-        bytes.extend_from_slice(&first.text[from..]);
+        bytes.extend_from_slice(&text[from..]);
         writer.replace(cx, root, &Path::new(first.path.unwrap_or(""))?, &bytes)?;
         files += 1;
         start = end;
@@ -429,7 +451,7 @@ pub(crate) fn checker_findings<'f>(
         into.push(Listed {
             path: Some(path),
             about,
-            text,
+            read: text_id(text),
             area: Area::Types,
             rule: 425,
             words: written,

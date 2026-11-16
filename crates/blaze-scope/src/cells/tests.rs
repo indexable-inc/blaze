@@ -278,18 +278,41 @@ fn the_textual_scope_of_macro_rules() {
 
 /// R5 over calls, the refinement: `B` reads the textual scope past the earlier call `A`, and
 /// `A`'s path-based read waits on `B` (its module's growth): a sink of two calls. `A` fails
-/// first; `B` is spared that round, then resolves through the glob. `A` is `self::mx!`: a plain
-/// `mx!` would go outward at once (R6: its inner scope grows by expansion alone) and leave
-/// the sink without a stall.
+/// first; `B` is spared that round, then resolves through the glob. The crate: `mod defs { pub
+/// macro my; } m::zz!(); /* A */ mod m { pub use crate::defs::*; use crate::my; my!(); /* B */ }`.
+/// `A` reads `zz` in `m`, which `B` may still write; `B` is held at the stall by the pending
+/// named import of its own name (`use crate::my;` waits on the root's growth, `A`: Reference
+/// `names.resolution.expansion.speculation` makes only a candidate selected speculative, and a
+/// named import that may still bind the name is none yet), so the weak rule takes nothing for
+/// it and the round spares it. Once `A` has failed the import fails and `B` takes the glob's
+/// `my`. (Until runner 15 the fixture was `mod m { pub use crate::defs::*; self::mx!(); my!(); }`:
+/// there `B` is held by the text order alone, and since the stall asks each call with a weakly
+/// undecided scope not holding, it takes the glob's `my` at the stall itself and no round
+/// spares anything; its outcomes are asserted below as well.)
 #[test]
 fn a_stall_spares_the_later_call() {
+    let fn_like = crate::DefKind::Macro(crate::MacroShapes::FN_LIKE);
+    // The older fixture: the same two outcomes, with no call spared.
     let mut w = World::new();
     let root = w.root(1, Edition::E2021);
     let defs = w.module(root, "defs", V::Pub);
-    let my = w.item(defs, "my", Namespace::Macros, crate::DefKind::Macro(crate::MacroShapes::FN_LIKE), V::Pub);
+    let my = w.item(defs, "my", Namespace::Macros, fn_like, V::Pub);
     let m = w.module(root, "m", V::Pub);
     w.glob(m, "crate::defs", V::Pub);
     let a = w.call(m, "self::mx", crate::CallShape::FnLike);
+    let b = w.call(m, "my", crate::CallShape::FnLike);
+    let old = cells_of(&w, root, CellPlant::None);
+    assert!(!matches!(old.call_outcome(a), Some(Outcome::Called(_))), "{:?}", old.call_outcome(a));
+    assert!(matches!(old.call_outcome(b), Some(Outcome::Called(d)) if d.key == my), "{:?}", old.call_outcome(b));
+    assert_eq!(old.stats.r6_errors, 0);
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let defs = w.module(root, "defs", V::Pub);
+    let my = w.item(defs, "my", Namespace::Macros, fn_like, V::Pub);
+    let a = w.call(root, "m::zz", crate::CallShape::FnLike);
+    let m = w.module(root, "m", V::Pub);
+    w.glob(m, "crate::defs", V::Pub);
+    w.use_(m, "crate::my", V::Priv);
     let b = w.call(m, "my", crate::CallShape::FnLike);
     let ok = cells_of(&w, root, CellPlant::None);
     assert!(!matches!(ok.call_outcome(a), Some(Outcome::Called(_))), "{:?}", ok.call_outcome(a));
@@ -297,6 +320,13 @@ fn a_stall_spares_the_later_call() {
     assert_eq!(ok.stats.spared, 1);
     let bad = cells_of(&w, root, CellPlant::StallSparesNone);
     assert!(!matches!(bad.call_outcome(b), Some(Outcome::Called(_))), "the control");
+    // The hold itself: a stall that takes the glob's `my` past the pending `use crate::my;`
+    // spares nothing (Reference `names.resolution.expansion.expansion-order-stability`: "names
+    // in the fully expanded AST must resolve to the same definition regardless of the order in
+    // which macros are expanded and imports are resolved": what the import binds would shadow
+    // the glob's candidate, so the candidate is not selected before the import is decided).
+    let past = cells_of(&w, root, CellPlant::StallPassesNamedImport);
+    assert_eq!(past.stats.spared, 0, "the control StallPassesNamedImport: {:?}", past.call_outcome(b));
 }
 
 fn same_why(a: Unresolved, b: Unresolved) -> bool {
@@ -1319,10 +1349,12 @@ fn two_calls_named_through_a_glob_do_not_wait_on_each_other() {
     assert!(matches!(ok.call_outcome(b1), Some(Outcome::Called(d)) if d.key == d1), "{:?}", ok.call_outcome(b1));
     assert_eq!(ok.stats.r6_errors, 1, "the later write of `D1` into `b` is the error");
     let bad = cells_of(&w, root, CellPlant::MacroGlobWaits);
-    // The two wait on each other and the group stalls. Until runner 14 the stall failed its
-    // sink; since `a_stalled_call_a_decided_glob_source_names_resolves` the stall selects the
-    // decided glob candidate, so the control shows as the stall alone, and as `b1` below.
-    assert!(bad.stats.stalls > ok.stats.stalls, "the control MacroGlobWaits: {:?} {:?}, stalls {}", bad.call_outcome(c1), bad.call_outcome(c2), bad.stats.stalls);
+    // The two wait on each other, the group stalls and the stall fails a derive: the plant
+    // turns the one rule off (`first_segment`'s `speculative`), mid-run and at the stall alike.
+    // (Runner 14's separate stall pick did not know the plant, and this control had shrunk to
+    // the stall count; since the stall asks `first_segment` itself it fails a derive again.)
+    let failed = [c1, c2].iter().filter(|c| matches!(bad.call_outcome(**c), Some(Outcome::Failed(Unresolved::NotFound)))).count();
+    assert!(failed >= 1 && bad.stats.stalls > ok.stats.stalls, "the control MacroGlobWaits: {:?} {:?}, stalls {}", bad.call_outcome(c1), bad.call_outcome(c2), bad.stats.stalls);
     assert!(matches!(bad.call_outcome(b1), Some(Outcome::Called(d)) if d.key != d1) && bad.stats.r6_errors == 0, "the control MacroGlobWaits in `b`: {:?}", bad.call_outcome(b1));
 }
 
@@ -1498,4 +1530,74 @@ fn a_stalled_call_a_decided_glob_source_names_resolves() {
     assert_eq!(ok.stats.r6_errors, 0);
     let bad = with_dep(&w, root, dep, CellPlant::StallFailsGlobCall);
     assert!(matches!(bad.call_outcome(c1), Some(Outcome::Failed(Unresolved::NotFound))), "the control: {:?}", bad.call_outcome(c1));
+}
+
+/// Seven of tempo's crates (c10-r14c: "'only_old': 0, 'only_cells': 21": serde_core's
+/// `__private_serialize` in `private::doc`, whose `mod private;` is written by `crate_root!()`;
+/// nix's `sockopt_impl` under `feature! { pub mod socket; }`; tokio's `count!` under
+/// `cfg_macros! { mod select; }`; four commonware crates): the root's written scope holds the
+/// macro here and lacks it in the old core. The Reference, `macro.decl.scope.macro_export.intro`:
+/// "The `macro_export` attribute exports the macro from the crate and makes it available in the
+/// root of the crate for path-based resolution.", and `macro.decl.scope.path-based.visibility`:
+/// "`#[macro_export]` changes the implicit visibility to `pub`." So this core is right, and the
+/// old one is the fault (tests/name_rules.rs `x2`). The crate: `macro_rules! mk; mk!{ mod p {
+/// pub mod d { #[macro_export] macro_rules! exp; } } }`: `exp` is a public macro of the root,
+/// written with the origin `MacroExport`.
+/// Prints: "test cells::tests::an_export_below_a_module_an_expansion_declared_is_in_the_root ... ok".
+#[test]
+fn an_export_below_a_module_an_expansion_declared_is_in_the_root() {
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    w.rules(root, "mk");
+    let call = w.call(root, "mk", crate::CallShape::FnLike);
+    let p = w.module(call, "p", V::Priv);
+    let d = w.module(p, "d", V::Pub);
+    let exp = w.rules_with(d, "exp", true);
+    let mut c = cells_of(&w, root, CellPlant::None);
+    let got = c.ask(root, Namespace::Macros, "exp").expect("asks");
+    assert!(matches!(got, Some(Value::Found(def, crate::Visibility::Public)) if def.key == exp), "{got:?}");
+}
+
+/// The validation of what a stalled call took (runner 15: the stall asks `first_segment` with a
+/// weakly undecided scope not holding the lookup, so an outer candidate is taken while the
+/// module's globs may still bring the name). The Reference,
+/// `names.resolution.expansion.speculation`: "All name resolution candidates selected during
+/// macro expansion are considered speculative. Once the crate has been fully expanded, all
+/// speculative import resolutions are validated to ensure that macro expansion did not introduce
+/// any new ambiguities.", and `names.resolution.expansion.imports.ambiguity.glob-vs-outer`:
+/// "Names in imports and macro invocations may not be resolved through glob imports when there
+/// is another candidate available in an outer scope." The crate: the standard prelude holds a
+/// macro `Cl`; `mod m { use self::k::*; Cl!(); }`, and `Cl!()` writes `pub mod k { pub macro Cl; }`
+/// into `m`. The glob cannot resolve before the call expands (the sink of
+/// `a_stalled_call_an_outer_scope_provides_resolves`), the call takes the prelude's `Cl`, and
+/// its own expansion then brings another `Cl` through the glob: the error at the call, whose
+/// answer stays the prelude's. Beside it `mod n { use self::k::*; Cl!(); }` whose `Cl!()` writes
+/// `pub mod k { pub macro other; }`: no error. Control `SpeculationUnchecked`: no error at all.
+/// Prints: "test cells::tests::what_a_stalled_call_took_is_validated_when_the_run_ends ... ok".
+#[test]
+fn what_a_stalled_call_took_is_validated_when_the_run_ends() {
+    let fn_like = crate::DefKind::Macro(crate::MacroShapes::FN_LIKE);
+    let mut w = World::new();
+    let root = w.root(1, Edition::E2021);
+    let prelude = w.module(root, "prelude", V::Pub);
+    let cl = w.item(prelude, "Cl", Namespace::Macros, fn_like, V::Pub);
+    w.cr(root).head.prelude = Some(prelude);
+    let m = w.module(root, "m", V::Pub);
+    w.glob(m, "self::k", V::Priv);
+    let call = w.call(m, "Cl", crate::CallShape::FnLike);
+    let k = w.module(call, "k", V::Pub);
+    let inner = w.item(k, "Cl", Namespace::Macros, fn_like, V::Pub);
+    let n = w.module(root, "n", V::Pub);
+    w.glob(n, "self::k", V::Priv);
+    let quiet = w.call(n, "Cl", crate::CallShape::FnLike);
+    let k2 = w.module(quiet, "k", V::Pub);
+    w.item(k2, "other", Namespace::Macros, fn_like, V::Pub);
+    let mut ok = cells_of(&w, root, CellPlant::None);
+    assert!(matches!(ok.call_outcome(call), Some(Outcome::Called(d)) if d.key == cl), "{:?}", ok.call_outcome(call));
+    assert!(matches!(ok.call_outcome(quiet), Some(Outcome::Called(d)) if d.key == cl), "{:?}", ok.call_outcome(quiet));
+    assert_eq!(found(ok.ask(m, Namespace::Macros, "Cl").expect("asks")), Some(inner), "the glob brings the written `Cl` in the end");
+    assert_eq!(ok.stats.r6_errors, 1, "the error at `m`'s call alone");
+    let bad = cells_of(&w, root, CellPlant::SpeculationUnchecked);
+    assert!(matches!(bad.call_outcome(call), Some(Outcome::Called(d)) if d.key == cl), "{:?}", bad.call_outcome(call));
+    assert_eq!(bad.stats.r6_errors, 0, "the control SpeculationUnchecked");
 }

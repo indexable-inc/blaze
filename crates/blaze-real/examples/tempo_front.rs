@@ -37,6 +37,7 @@ use blaze_ladder::front2::check::{BuildOrder, CheckFail, Records, check_body, ev
 use blaze_ladder::front2::consts::Consts;
 use blaze_ladder::front2::heads::{HeadError, Store, Want};
 use blaze_ladder::front2::keys::{Keys, MemberKind, Origin, checker_of};
+use blaze_ladder::front2::receiver::Pointers;
 use blaze_ladder::front2::spell::Spelling;
 use blaze_ladder::front2::types::Why;
 use blaze_ladder::front2::world_items::Gap;
@@ -547,6 +548,7 @@ fn heads<'n>(names: &'n Names<'n>, front: &mut Front2<'n>, krate: usize, cname: 
 
     let prepared = Prepares::new_in(Alloc::global());
     let mut store = Store::new(front.index.lang("sized"), front.frame);
+    store.pointers = Pointers::find(&front.index, front.resolver);
     let mut buckets = None;
     let mut consts = Consts::default();
     // (kind, path, place, outcome)
@@ -764,7 +766,11 @@ struct Recs<'n> {
 }
 
 impl<'n> Recs<'n> {
-    fn new(sized: Option<blaze_id::ItemKey>, frame: &'n blaze_mem::Frame) -> Recs<'n> { Recs { store: Store::new(sized, frame), buckets: None, consts: Consts::default(), heads: BTreeMap::new(), blocked: (Vec::new(), false) } }
+    fn new(sized: Option<blaze_id::ItemKey>, pointers: Pointers, frame: &'n blaze_mem::Frame) -> Recs<'n> {
+        let mut store = Store::new(sized, frame);
+        store.pointers = pointers;
+        Recs { store, buckets: None, consts: Consts::default(), heads: BTreeMap::new(), blocked: (Vec::new(), false) }
+    }
 }
 
 fn one<'n>(names: &'n Names<'n>, front: &mut Front2<'n>, recs: &mut Recs<'n>, prepared: &Prepares<'n>, t: Target<'_>) -> Result<Option<()>, (String, String)> {
@@ -812,6 +818,7 @@ fn crates_in(names: &Names<'_>, keys: &Keys, store: &Store<'_>) -> BTreeSet<usiz
 #[expect(clippy::too_many_arguments, reason = "the run's settings")]
 fn bodies<'n>(
     names: &'n Names<'n>,
+    sources: &'n dyn blaze_ladder::front2::body_host::BodySources,
     front: &mut Front2<'n>,
     krate: usize,
     cname: &str,
@@ -865,7 +872,10 @@ fn bodies<'n>(
 
     let prepared = Prepares::new_in(Alloc::global());
     let sized = front.index.lang("sized");
-    let mut shared = Recs::new(sized, front.frame);
+    let pointers = Pointers::find(&front.index, front.resolver);
+    let mut shared = Recs::new(sized, pointers, front.frame);
+    // Bodies expand with the names' own sources: env, includes, proc macros (brief 13).
+    shared.store.sources = Some(sources);
     let mut classes: Table = BTreeMap::new();
     let (mut clean, mut checked, mut no_body, mut impl_only) = (0usize, 0usize, 0usize, 0usize);
     let mut stopped = None;
@@ -934,7 +944,8 @@ fn bodies<'n>(
         if start.elapsed().as_secs() > secs {
             break;
         }
-        let mut fresh = Recs::new(sized, front.frame);
+        let mut fresh = Recs::new(sized, pointers, front.frame);
+        fresh.store.sources = Some(sources);
         let got = one(names, front, &mut fresh, &prepared, e.target);
         if matches!(got, Ok(None)) {
             continue;
@@ -1055,7 +1066,7 @@ fn main() {
             let mut out = String::new();
             let heads_s = heads(names, &mut front, k, want, cap, &std_heads, &mut out);
             let mut mine: BTreeMap<blaze_id::ItemKey, Blocker> = BTreeMap::new();
-            let (bodies_s, reach_s) = bodies(names, &mut front, k, want, cap, reach, secs, &std_census, &mut mine, &mut out);
+            let (bodies_s, reach_s) = bodies(names, loaded.body_sources(), &mut front, k, want, cap, reach, secs, &std_census, &mut mine, &mut out);
             out.push_str(&print_blockers(names, &format!("BLOCKING IMPLS {want}"), &mine));
             for (key, b) in mine {
                 let all = blockers.entry(key).or_insert_with(|| Blocker { bodies: 0, only: 0, text: b.text.clone(), crates: BTreeSet::new(), first: b.first.clone() });

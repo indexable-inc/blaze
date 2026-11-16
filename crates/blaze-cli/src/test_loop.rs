@@ -86,6 +86,9 @@ pub(crate) enum CannotRun {
     BodiesNotBuilt,
     /// No zygote runs tests on this host yet (test.md piece 9).
     NoRunner,
+    /// No test sandbox is built for this host (Linux), and no test runs unsandboxed (rule 9):
+    /// test_run.rs `Runner` answers every run so without starting anything.
+    NoSandbox,
 }
 
 impl CannotRun {
@@ -93,6 +96,7 @@ impl CannotRun {
         match self {
             CannotRun::BodiesNotBuilt => "the code builder cannot build test bodies yet (test.md, piece 8)",
             CannotRun::NoRunner => "no zygote runs tests on this host yet (test.md, piece 9)",
+            CannotRun::NoSandbox => "no test sandbox is built for Linux yet, and blaze runs no test unsandboxed (rule 9; test.md, piece 9)",
         }
     }
 }

@@ -177,12 +177,10 @@ fn his_main_through_the_checker() {
 
     let sources = [SourceFile { path: "src/main.rs", text: MAIN }];
     let frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the command\x27s frame");
-        let mut front = Front2::new(&names, &frame, &sources).unwrap_or_else(|e| panic!("front2: {e}"));
+    let survey_frame = blaze_mem::Frame::new(blaze_mem::tag::Tag::Infer).expect("the survey's frame");
     let found = names::path(&names, names.root(0), Namespace::Values, Written { kind: PathKind::Plain, segments: &["main"] }, Alloc::global())
         .unwrap_or_else(|e| panic!("`main` from his crate root: {e}"));
     let main = found.whole(1).unwrap_or_else(|| panic!("`main` not named")).key;
-    let mut store = Store::new(front.index.lang("sized"), front.frame);
-    let mut buckets = None;
 
     let mut out = format!("front2 on his main: names resolved in {resolved:?}\n");
     // The variants his body reaches (`Ok`; `?` reaches lang variants): the key a path gives,
@@ -198,31 +196,48 @@ fn his_main_through_the_checker() {
     let ok_shown = ok.map(|k| format!("{k:x}"));
     let in_any = ok.map(|k| names.crates().iter().any(|c| c.tables.enums.values().any(|vs| vs.iter().any(|v| v.key == k))));
     out.push_str(&format!("probe: `Ok` is {ok_shown:?}, in some enums row: {in_any:?}; `Result`'s row: {row_keys:?}\n"));
+    // The walk (front2/program/walk_report.rs, which held no code of its own before: this
+    // test's, moved): his main lowered and checked, `REACHABLE:` and `BUILDS:`; a lowering
+    // that fails is its `WORK LIST (lowering ..)` line and nothing more. This test's own lines
+    // are written between the walk's by [`HisMain`].
     let prepared = Prepares::new_in(Alloc::global());
-    let body = match lower_fn(&names, prepared, &mut front.keys, &mut store, main) {
-        Ok(b) => b,
-        Err(e) => {
-            out.push_str(&format!("WORK LIST (lowering {}): {e}\n", shown(&names, &crate_names, main)));
-            report(out, start);
-            return;
-        }
-    };
-    let view = body.lowered.view();
-    let spell = Spelling::of(&view).unwrap_or_else(|e| panic!("spelling his main's names: {e:?}"));
-    let scope = body.scope(&spell);
-    let mut consts = Consts::default();
-    let mut records = Records { names: &names, keys: &mut front.keys, index: &front.index, store: &mut store, buckets: &mut buckets, order: BuildOrder::AsAsked, consts: Some((&mut consts, prepared)) };
-    let mut checked = check_body(&mut records, &body, &scope);
+    let world = World { names: &names, frame: &frame, survey_frame: &survey_frame, prepared, sources: &sources, crate_names: &crate_names };
+    let ask = Ask { roots: &[main], build_from: BuildFrom::Main, read: RootRead::Callees, label: "his main" };
+    let mut his = HisMain { names: &names, crate_names: &crate_names, frame: &frame, sources: &sources, main, ok };
+    walk(&world, &ask, &mut his, &mut out, Alloc::global()).unwrap_or_else(|e| panic!("{e}"));
+    report(out, start);
+}
+
+/// The hello world's own lines around the walk: the determinism check, the diagnostics and the
+/// `FRONT2_DUMP` dump after his main is checked; the ctor and `T::X` rules, the impls and the
+/// work list after `BUILDS:`. Each as this test has always printed it.
+struct HisMain<'n> {
+    names: &'n Names<'n>,
+    crate_names: &'n [&'n str],
+    frame: &'n blaze_mem::Frame,
+    sources: &'n [SourceFile<'n>],
+    main: blaze_id::ItemKey,
+    /// `Ok`'s key, from his root.
+    ok: Option<blaze_id::ItemKey>,
+}
+
+impl<'n> WalkHooks<'n> for HisMain<'n> {
+    fn checked(&mut self, at: &mut Stage<'_, '_, 'n>, sink: &mut dyn std::fmt::Write) -> std::fmt::Result {
+    let (names, crate_names, prepared, main) = (self.names, self.crate_names, at.prepared, self.main);
+    let records = &mut *at.records;
+    let body = &at.bodies[at.walked[0]];
+    let checked = &at.checked[0];
+    let mut out = String::new();
     // The check of one body is a function of the program alone: checked again from empty
     // records in this process, every noted item made in the REVERSED order, it must end the
     // same: its diagnostics, its gaps (or refusal) and its recorded callees.
     let first = outcome(&checked);
     {
         // The command's one frame (the names' lifetime is the frame's).
-        let mut front_r = Front2::new(&names, front.frame, &sources).unwrap_or_else(|e| panic!("front2 (reversed): {e}"));
+        let mut front_r = Front2::new(names, self.frame, self.sources).unwrap_or_else(|e| panic!("front2 (reversed): {e}"));
         let mut store_r = Store::new(front_r.index.lang("sized"), front_r.frame);
         let mut buckets_r = None;
-        let body_r = lower_fn(&names, prepared, &mut front_r.keys, &mut store_r, main).unwrap_or_else(|e| panic!("lowering main again: {e}"));
+        let body_r = lower_fn(names, prepared, &mut front_r.keys, &mut store_r, main).unwrap_or_else(|e| panic!("lowering main again: {e}"));
         let view_r = body_r.lowered.view();
         let spell_r = Spelling::of(&view_r).unwrap_or_else(|e| panic!("spelling his main's names again: {e:?}"));
         let scope_r = body_r.scope(&spell_r);

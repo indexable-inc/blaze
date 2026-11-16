@@ -1124,6 +1124,22 @@ impl Bb {
         self.e(Expr::Path(PathIdx(at)))
     }
 
+    /// A qualified value path `<ty as tr>::segments[0]..`, `tr` a trait's name in scope.
+    pub fn qpath_as(&mut self, ty: PTy, tr: &str, segments: &[&str]) -> ExprId {
+        let tstart = self.segments.len() as u32;
+        self.segments.push(Segment { name: Name::of(tr), generic_args: List::EMPTY, has_args: false });
+        let tpath = self.paths.len() as u32;
+        self.paths.push(BodyPath { scope: ScopeId(0), segments: List { start: tstart, len: 1 }, lang: None, anchor: None });
+        let start = self.segments.len() as u32;
+        for s in segments {
+            self.segments.push(Segment { name: Name::of(s), generic_args: List::EMPTY, has_args: false });
+        }
+        let at = self.paths.len() as u32;
+        let anchor = Some(crate::body::Anchor { ty, trait_: Some(PathIdx(tpath)) });
+        self.paths.push(BodyPath { scope: ScopeId(0), segments: List { start, len: segments.len() as u32 }, lang: None, anchor });
+        self.e(Expr::Path(PathIdx(at)))
+    }
+
     /// A desugaring's path to the lang item `l` (no segments).
     fn lang_path_idx(&mut self, l: LangItem) -> PathIdx {
         let at = self.paths.len() as u32;

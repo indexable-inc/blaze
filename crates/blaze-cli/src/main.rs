@@ -39,6 +39,7 @@ mod sweep;
 mod graph;
 mod test_args;
 mod test_loop;
+mod test_run;
 mod toolchain;
 mod units;
 mod work;
@@ -113,6 +114,9 @@ pub enum CliError {
     /// The command's own code panicked outside any task (a task's panic fails that task): its
     /// message is the panic hook's, above this on the error stream; the profile is written.
     Panicked { command: &'static str },
+    /// One file's findings could not be placed or drawn (print.rs `Scratch`): the file and the
+    /// frames are named.
+    Draw(print::DrawError),
 }
 
 impl fmt::Display for CliError {
@@ -127,7 +131,7 @@ impl fmt::Display for CliError {
             CliError::Out(error) => write!(f, "{error}"),
             CliError::Drive(error) => write!(f, "{error}"),
             CliError::Unlisted(unlisted) => write!(f, "{unlisted}"),
-            CliError::Leaves(error) => write!(f, "the checkout's leaf table (in .blaze/v2/last), of this build's form, is malformed: {error}"),
+            CliError::Leaves(error) => write!(f, "the checkout's leaf table (in a pointer of .blaze/v2/at), of this build's form, is malformed: {error}"),
             CliError::Text { what } => write!(f, "{what}"),
             CliError::Table(full) => write!(f, "{full}"),
             CliError::Program(error) => write!(f, "the program: {error}"),
@@ -139,6 +143,7 @@ impl fmt::Display for CliError {
             CliError::Shelf(error) => write!(f, "{error}"),
             CliError::Toolchain(error) => write!(f, "the pinned toolchain: {error}"),
             CliError::Panicked { command } => write!(f, "blaze {command} panicked (its message is above); what it had done is in .blaze/v2/profile.txt"),
+            CliError::Draw(error) => write!(f, "{error}"),
         }
     }
 }
@@ -263,7 +268,16 @@ fn main(cx: &Cx, io: Io) -> Result<Status, Error> {
     let err = io.need_err()?;
     phases.mark("output handles");
     // A failure is printed in one place, bstd's exit path (`error: ` and its message).
-    command(cx, &io, &out, &err, &mut phases).map_err(Error::from)
+    match command(cx, &io, &out, &err, &mut phases) {
+        // D86: the tool's own failure to build or start the program (or a stub that stopped
+        // it) exits `program::NOT_RUN`, apart from any status the program itself ends with.
+        // The line's form is bstd's exit path's: `error: ` and the message.
+        Err(error @ CliError::Ran { .. }) => {
+            err.line(cx, format_args!("error: {error}")).map_err(|e| Error::from(CliError::Out(e)))?;
+            Ok(Status(program::NOT_RUN))
+        }
+        other => other.map_err(Error::from),
+    }
 }
 
 /// Where blaze's own words go (findings, notes, the closing line): standard output for `check`
@@ -580,12 +594,24 @@ fn request<'f>(
     let began = phases.now();
     // The pointer file (seal.rs): one read for the last answer and the leaf table. Missing,
     // another form's or torn, it is absent: a note after the findings, and the request answers in full.
+    // It is this tool's, for this request's shape (`.blaze/v2/at/<name>`, blaze-drive
+    // pointers.rs): another build of blaze and another command each have their own, so neither
+    // takes the answer this one walks forward from.
     let mut pointer = Bytes::new_in(frame, "the pointer file");
-    let pointer_path = Path::new(seal::PATH)?;
+    let ask = Ask { command, args: b"", gate: Gate::Beside, space: Space::NONE };
+    let shape = blaze_drive::request::shape_of(&ask);
+    let pointer_at = seal::At::of(tool, &shape);
+    let pointer_path = pointer_at.path()?;
+    // No file there: writing it adds one to the folder, so the write first removes the
+    // pointers past the cap (seal.rs `write`).
+    let mut pointer_fresh = false;
     // Each a note after the findings (`draw`).
     let mut notices: Vec<Notice, &Frame> = Vec::new_in(frame);
     let (last, leaves) = match root.read_all(&cx, &pointer_path, &mut pointer) {
-        Err(error) if error.kind == bstd::fs::FsKind::NotFound => (None, Leaves::EMPTY),
+        Err(error) if error.kind == bstd::fs::FsKind::NotFound => {
+            pointer_fresh = true;
+            (None, Leaves::EMPTY)
+        }
         Err(error) => return Err(error.into()),
         Ok(_) => match home::current(seal::PATH, pointer.as_slice(), seal::SEAL_MAGIC) {
             Err(older) => {
@@ -614,14 +640,13 @@ fn request<'f>(
             },
         },
     };
-    // A pointer left by another build of blaze, or by another command (`test` before `check`),
+    // A pointer that says another tool or shape than its name does (two (tool, shape)s whose
+    // names' 64 bits collide; before the names, another build's or command's `.blaze/v2/last`)
     // is no answer of this request's: the machine does not walk forward from it, and the leaf
     // table beside it would keep the layout from being read here, so `Start` was handed no
     // dependency graph and no `UnitGraph`, `Fetch` or `CrateScope` ran, with "0 errors" over
     // the hole (blaze's own checkout after a new build, 2026-11-16). It is absent: the
-    // request starts cold. (Owed: one pointer a (tool, shape), read-addressed.md piece 1.)
-    let ask = Ask { command, args: b"", gate: Gate::Beside, space: Space::NONE };
-    let shape = blaze_drive::request::shape_of(&ask);
+    // request starts cold and writes its own over it.
     let (last, leaves) = match last {
         Some(bytes) if !blaze_drive::request::walks_from(bytes, tool, &shape).map_err(|error| CliError::Drive(DriveError::LastFile(error)))? => (None, Leaves::EMPTY),
         _ => (last, leaves),
@@ -885,7 +910,9 @@ fn request<'f>(
                 phases.request.puts += phases.since(at);
                 // The leaf table rides in the same write: a crash keeps both or neither.
                 let leaves = Leaves::bytes_in(&kept(&req, &followed, &facts.rows, frame), frame)?;
-                seal::write(&cx, root, &seal::seal(&bytes, &leaves, frame)?)?;
+                seal::write(&cx, root, &pointer_at, pointer_fresh, &seal::seal(&bytes, &leaves, frame)?, frame)?;
+                // A second write of this request's finds the file there.
+                pointer_fresh = false;
                 phases.request.write_last += phases.since(at);
             }
             Effect::Done(mut answer) => {
@@ -907,7 +934,11 @@ fn request<'f>(
         true => Some(program_refusals(&cx, root, &rows, frame)?),
         false => None,
     };
-    draw(&cx, root, &req, command, &facts.found, &prints, program.as_ref(), &failed, &notices, shown, frame, out)?;
+    // One file's findings at a time, in frames of a task's scratch size: freed a file and a
+    // finding, and gone with the drawing.
+    let mut scratch = print::Scratch::new(sizes.scratch)?;
+    draw(&cx, root, &req, command, &facts.found, &prints, program.as_ref(), &failed, &notices, shown, &mut scratch, frame, out)?;
+    drop(scratch);
     // The names step (names.rs): what this command resolved, never printed as errors.
     // Nothing follows a program that ran (`close`): its output is the command's, and a note
     // about the check's known gaps is `check`'s to say, not a clean run's.
@@ -934,7 +965,7 @@ fn request<'f>(
     Ok(Finished { answer, checked: u32::try_from(checked).unwrap_or(u32::MAX), high, failed, resolved, names_held })
 }
 
-const LAST: &str = ".blaze/v2/last";
+const LAST: &str = "a pointer in .blaze/v2/at (its last answer)";
 
 /// The machine's own step in the profile's frame rows (`Phases::took`): what it pushed to the
 /// effects list is counted here.
@@ -987,33 +1018,55 @@ fn draw<'f>(
     failed: &[work::Failed<'_>],
     notices: &[Notice],
     shown: &mut print::Shown<'f>,
+    scratch: &mut print::Scratch,
     frame: &'f Frame,
     out: &Out,
 ) -> Result<(), CliError> {
-    // (file, position, the request's finding or the program's refusal, its index).
-    let mut order: Vec<(Option<&str>, u32, bool, usize), &Frame> = Vec::new_in(frame);
+    const NO_ROOM: CliError = CliError::Text { what: "the command's frame has no room to list its findings: a finding takes a `Listed`, its words and its path there" };
     // Each finding placed in today's text with its id and fix (fix.rs): a crate's unresolved
     // path carries its file, item and edition in its message, placed now in the file as it is
-    // (names.rs `placed`; rule 71). The id's item is a Rust file's outline item read in one
-    // grammar for every file (fix.rs `ITEM_GRAMMAR`), so an id is a function of the text alone.
+    // (names.rs `place_pieces`; rule 71). The id's item is a Rust file's outline item read in
+    // one grammar for every file (fix.rs `ITEM_GRAMMAR`), so an id is a function of the text
+    // alone. Where each is to be placed is said first, from the findings alone; then the files
+    // are read, one at a time, in `scratch` (print.rs `list`): the command's frame keeps a
+    // `Listed`, the words and a path a finding, never a file's text or a drawing.
     let first = shown.listed.len();
     // THE CALL SITE of `fix::checker_findings`, owed to the TYPES stage (work.rs CHECK_STAGES
     // "types"): when a body's `BodyCheck` record carries the checker's `suggests`, each of its
     // holes becomes a listed finding with its id and fix here, beside the prints below.
-    for (i, finding) in prints.iter().enumerate() {
+    let mut wanted: Vec<print::Wanted<'f>, &Frame> = Vec::try_with_capacity_in(prints.len(), frame).map_err(|_| NO_ROOM)?;
+    let kept = |bytes: &[u8]| -> Result<&'f [u8], CliError> {
+        let mut copy: Vec<u8, &'f Frame> = Vec::try_with_capacity_in(bytes.len(), frame).map_err(|_| NO_ROOM)?;
+        copy.extend_from_slice(bytes);
+        Ok(copy.leak())
+    };
+    for finding in prints.iter() {
         let (path, place, words) = match finding.rule == names::UNRESOLVED && finding.file.is_none() {
-            true => match names::placed(cx, root, &finding.message, frame)? {
-                (Some((path, place)), words) => (Some(path), place, words),
-                (None, words) => (None, finding.place, words),
+            true => match names::place_pieces(&finding.message)? {
+                (Some((path, chain, edition)), words) => {
+                    // A crate's findings come sorted by file: the path is kept once a run.
+                    let path = match wanted.last().and_then(|last: &print::Wanted<'f>| last.path) {
+                        Some(last) if last == path => last,
+                        _ => core::str::from_utf8(kept(path.as_bytes())?).map_err(|_| CliError::Text { what: "a path is not UTF-8" })?,
+                    };
+                    (Some(path), print::Place::Chain(chain, edition), words)
+                }
+                (None, words) => (None, print::Place::At(finding.place), words),
             },
-            false => (print::file_of(req, found, finding, frame)?, finding.place, &finding.message[..]),
+            false => (print::file_of(req, found, finding, frame)?, print::Place::At(finding.place), &finding.message[..]),
         };
-        let edition = path.filter(|path| path.ends_with(".rs")).map(|_| fix::ITEM_GRAMMAR);
-        let words: &'f [u8] = Vec::from_slice_in(words, frame).leak();
-        shown.listed.push(print::listed(cx, root, path, place, words, edition, finding, frame)?);
-        order.push((path, place.saturating_add(finding.start), false, i));
+        wanted.push(print::Wanted { path, place, words: kept(words)? });
     }
+    print::list(cx, root, prints, &wanted, scratch, frame, &mut shown.listed)?;
     fix::lengths(&mut shown.listed[first..], frame);
+    // (file, position, the request's finding or the program's refusal, its index).
+    let mut order: Vec<(Option<&str>, u32, bool, usize), &Frame> = Vec::try_with_capacity_in(prints.len() + program.map_or(0, |program| program.refusals.len()), frame).map_err(|_| NO_ROOM)?;
+    for (i, finding) in prints.iter().enumerate() {
+        // A finding whose item is no longer in its file is listed at its name, with no file.
+        let listed = &shown.listed[first + i];
+        let at = if listed.path.is_some() { listed.start } else { finding.place.saturating_add(finding.start) };
+        order.push((listed.path, at, false, i));
+    }
     if let Some(program) = program {
         for (i, refusal) in program.refusals.iter().enumerate() {
             let path = refusal.file.and_then(|file| program.texts.get(file as usize)).map(|it| it.0);
@@ -1022,14 +1075,21 @@ fn draw<'f>(
     }
     let source = |path: Option<&str>| !path.is_some_and(|path| path == "Cargo.toml" || path.ends_with("/Cargo.toml"));
     order.sort_by(|a, b| (source(a.0), a.0, a.1, a.2).cmp(&(source(b.0), b.0, b.1, b.2)));
-    for &(path, _, of_program, i) in order.iter() {
-        match (of_program, program) {
-            (true, Some(program)) => print::refusal(cx, &program.refusals[i], &program.texts, shown, frame, out)?,
-            _ => {
-                let listed = shown.listed[first + i];
-                print::finding(cx, &listed, shown, frame, out)?;
+    // A file's findings are neighbours in that order: the file is read once for the run.
+    let mut at = 0;
+    while at < order.len() {
+        let (path, _, of_program, i) = order[at];
+        if of_program {
+            // Only a program's refusals are entered so, above.
+            if let Some(program) = program {
+                print::refusal(cx, &program.refusals[i], &program.texts, shown, scratch.one(), out)?;
             }
+            at += 1;
+            continue;
         }
+        let run = &order[at..at + order[at..].iter().take_while(|next| !next.2 && next.0 == path).count()];
+        at += run.len();
+        print::file_findings(cx, root, path, run.iter().map(|&(_, _, _, i)| first + i), shown, scratch, out)?;
     }
     // A failed task is the tool's, not the code's: named with its file, and the command fails
     // (its answer is not written, so the next command runs the task again).
@@ -1249,6 +1309,7 @@ mod tests {
         }
     }
 
+    mod draw_tests;
     mod extra_roots_tests;
     mod fix_tests;
     mod members_tests;
@@ -1318,7 +1379,13 @@ mod tests {
     /// The command as `command` runs it, in `view` (its lines drawn as off a terminal), with
     /// `--fix` when `fix` gives its selectors, the fixed files written through `W`.
     fn ask_view<W: fix::Writer + Default>(io: &Io, command: (Command, &'static str), sizes: work::Sizes, view: View, fix: Option<&[&str]>) -> Result<Checked, CliError> {
-        let cx = io.cx(BUDGET, TASK_FRAME).expect("a root context");
+        ask_framed::<W>(io, command, sizes, view, fix, TASK_FRAME)
+    }
+
+    /// [`ask_view`] with the command's own frame of `command_frame` bytes (a task's, as `main`
+    /// gives it, but for a test of what the command keeps there).
+    fn ask_framed<W: fix::Writer + Default>(io: &Io, command: (Command, &'static str), sizes: work::Sizes, view: View, fix: Option<&[&str]>, command_frame: usize) -> Result<Checked, CliError> {
+        let cx = io.cx(BUDGET, command_frame).expect("a root context");
         let frame = cx.frame();
         let root = io.need_fs().expect("files").open_dir(&cx, &Path::new("ws").expect("a path")).expect("open");
         let (out, err) = (io.need_out().expect("out"), io.need_err().expect("err"));
@@ -1894,5 +1961,24 @@ mod tests {
         };
         assert!(whole.failed.is_empty(), "{:?}", whole.failed);
         assert_eq!((made(&whole.profile, "FileItems"), made(&whole.profile, "BodyCheck")), (2, 3), "{}\n{}", stdout(&io), whole.profile);
+    }
+
+    /// A crate root at `<dir>/mod.rs` (`[lib] path = "lib/mod.rs"`; blaze's `hir-ty-codegen`)
+    /// is listed, and read by the names step, under its own path, while its module
+    /// `lib/inner/mod.rs`, found through `mod inner;`, is the slot `lib/inner.rs`. Without
+    /// `probed` in names.rs `slot_of` the request stops: "the names of package `rooted` read
+    /// `lib.rs`, which no manifest's targets and no file's `mod` lines list".
+    #[test]
+    fn a_crate_root_named_mod_rs_is_read_under_its_own_path() {
+        let io = Io::simulated(SimWorld::new(16, Limits::USUAL));
+        write(&io, "Cargo.toml", "[package]\nname = \"rooted\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\npath = \"lib/mod.rs\"\n");
+        write(&io, "lib/mod.rs", "mod inner;\npub use inner::A;\npub fn f() -> u8 { 1 }\n");
+        write(&io, "lib/inner/mod.rs", "pub struct A;\n");
+        let whole = match ask(&io, (Command::Check, "check"), work::Sizes::USUAL) {
+            Ok(whole) => whole,
+            Err(error) => panic!("the request stops: {error}"),
+        };
+        assert!(whole.failed.is_empty(), "{:?}", whole.failed);
+        assert_eq!((whole.errors, made(&whole.profile, "FileItems"), made(&whole.profile, "CrateScope") > 0), (0, 2, true), "{}\n{}", stdout(&io), whole.profile);
     }
 }

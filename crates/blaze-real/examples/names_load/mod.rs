@@ -83,6 +83,12 @@ pub struct Loaded {
 }
 
 impl Loaded {
+    /// The sources a body's macro calls expand with (front2's `Store::sources`): the same
+    /// texts, environment and proc-macro runner the names' items were expanded with.
+    pub fn body_sources(&self) -> &'static dyn blaze_ladder::front2::body_host::BodySources {
+        leak(blaze_ladder::front2::body_host::Sourced(self.texts))
+    }
+
     /// The bytes of the file `path` (the names' path space: [`blaze_scope::units::UnitCrate::shown_from`]
     /// then the path in the package) of crate `krate`, `None` when there is no such file.
     pub fn file_bytes(&self, krate: usize, path: &str) -> Option<&'static [u8]> {
@@ -240,6 +246,9 @@ struct Texts {
     /// from (a member's source root on disk, a fetched record's root).
     roots: Vec<(blaze_expand::SourceOrigin, String, Place)>,
     procs: Option<&'static Procs>,
+    /// By crate index: the environment `env!` reads in its items and bodies alike
+    /// (`UnitCrates::env_of`, after the scripts' records are joined).
+    envs: Vec<blaze_scope::crate_env::CrateEnv<'static>>,
 }
 
 /// The source root of the workspace at `root` (decision D60): the nearest folder at or above it
@@ -388,6 +397,10 @@ impl Texts {
 }
 
 impl SourceTexts<'static> for Texts {
+    fn crate_env(&self, krate: usize) -> Option<&blaze_scope::crate_env::CrateEnv<'static>> {
+        self.envs.get(krate)
+    }
+
     fn proc_macro_key(&self, krate: usize) -> Option<blaze_id::CrateItemKey> {
         self.procs?.keys.get(krate).copied().flatten()
     }
@@ -544,7 +557,11 @@ pub fn load(root: &Path, store: &Path, modules: Option<(&Path, &Path)>, scripts:
         }
         None => None,
     };
-    let texts: &'static Texts = leak(Texts { places, roots: read_roots, procs });
+    let mut envs = Vec::with_capacity(crates.crates.len());
+    for at in 0..crates.crates.len() {
+        envs.push(crates.env_of(at, graph, alloc).map_err(|e| LoadError::Crates(e.to_string()))?);
+    }
+    let texts: &'static Texts = leak(Texts { places, roots: read_roots, procs, envs });
     // `inputs` carries each joined record (`UnitCrates::join_scripts`, above).
     let scripts = script_list;
     let inputs = leak(crates.inputs());

@@ -133,10 +133,14 @@ fn two_same(b: bool) -> impl Clone { if b { return 1u8; } 2u8 }
 fn two_types(b: bool) -> impl Clone { if b { return 1u8; } \"a\" }
 fn lacks() -> impl Iterator<Item = u8> { 1u8 }
 fn use_wrap2() { let a = wrap(1u8); let b = wrap(true); let _c = need_clone(&a); let _d = need_clone(&b); }
+fn into_head(xs: impl IntoIterator<Item = impl Into<u64>>) -> u64 { 0 }
+fn use_into_head() -> u64 { into_head([1u8, 2]) }
+fn use_into_bad() -> u64 { into_head([1i64, 2]) }
+fn first_into(xs: impl IntoIterator<Item = impl Into<u64>>) -> u64 { match xs.into_iter().next() { Some(x) => x.into(), None => 0 } }
 ";
 
 /// The bodies that must check clean, each with what it proves.
-const CLEAN: [(&str, &str); 50] = [
+const CLEAN: [(&str, &str); 53] = [
     ("call_bound", "`F: Fn(u8) -> u16` on the parameter: `Fn<(u8,)>` and `Output = u16`"),
     ("call_where", "`where F: FnMut(u8)`: the output is `()`"),
     ("call_apit", "`impl FnOnce(u8, bool) -> u16` in argument position"),
@@ -212,14 +216,29 @@ const CLEAN: [(&str, &str); 50] = [
     ("two_same", "two return points of one type: one hidden type `u8`"),
     ("use_wrap2", "a generic fn's opaque at two instances (`u8`, `bool`): two different types, each `Clone`"),
     ("use_opt_next", "`Some(mut i) => i.next()`: a method through the bound of an opaque bound by a pattern inside `Option`"),
+    // An `impl Trait` in an associated type binding of a parameter's `impl Trait` (the
+    // Reference, "Impl trait", "Limitations": "`impl Trait` can only appear as a parameter or
+    // return type of a non-extern function"; "Anonymous type parameters": it "is syntactic
+    // sugar for a generic type parameter like `<T: Trait>`"): two anonymous parameters, the
+    // `IntoIterator` one first, the `Into<u64>` one second, `<P0 as IntoIterator>::Item == P1`.
+    // clap's `ArgGroup::args(self, ns: impl IntoIterator<Item = impl Into<Id>>)`. Without
+    // front2/heads.rs `anon_params` walking the binding, each is "no head: .. an `impl Trait`
+    // type outside a fn's parameters and return type".
+    ("into_head", "`fn into_head(xs: impl IntoIterator<Item = impl Into<u64>>)`: the head is built"),
+    ("use_into_head", "`into_head([1u8, 2])`: `P0 = [u8; 2]`, its `Item` `u8` is `P1`, `u8: Into<u64>`"),
+    ("first_into", "the inner anonymous parameter's `Into<u64>` bound gives `x.into()` its `u64`"),
 ];
 
 /// The bodies that must be refused, each with the diagnostic it must give.
-const REFUSED: [(&str, &str, &str); 4] = [
+const REFUSED: [(&str, &str, &str); 5] = [
     ("pointee_meta", "Unsatisfied", "`PointeeSized` states no size: `T: MetaSized` is E0277"),
     ("h", "Mismatch", "an async fn's body `\"a\"` against its written `u8`: E0308"),
     ("two_types", "Mismatch", "two return points of two types (`u8`, `&str`): \"one type\": E0308"),
     ("lacks", "Unsatisfied", "the hidden type `u8` is not `Iterator`: E0277 naming the bound"),
+    // The inner anonymous parameter's bound is the caller's to prove: `[i64; 2]`'s `Item` is
+    // `i64`, and core has no `From<i64> for u64`, so `i64: Into<u64>` is E0277. A fix that files
+    // the inner `impl` with no bounds checks this clean.
+    ("use_into_bad", "Unsatisfied", "`into_head([1i64, 2])`: `i64: Into<u64>` does not hold: E0277"),
 ];
 // `use_opt_next` was out of CLEAN at 11:10 with the checker's `DiagWithoutPlace { code:
 // Unsatisfied }`; reduced in blaze-typeck suite/opaque.rs (`a_method_on_an_opaque_bound_by_a_pattern`

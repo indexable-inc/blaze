@@ -313,12 +313,42 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
             }
             return self.value_def(at, cause, res.def, segs);
         }
-        if consumed + 1 != segs.len() || consumed == 0 {
+        if consumed == 0 {
             self.diag(DiagCode::UnresolvedPath, at, None, None, last_name);
             return Ok(self.common.err);
         }
-        // Type-relative: the consumed prefix names a type.
+        // Type-relative: the consumed prefix names a type. One segment after it is an
+        // associated item of that type; two are an associated type of the prefix, then an
+        // item of THAT type (`T::Assoc::f`, `Self::Error::new`: rules/self_path.rs, where the
+        // rules are quoted). A longer path would go through two associated types.
+        let after = segs.len() - consumed;
+        if after > 2 {
+            return Err(CheckError::Unported("a value path through two or more associated types (`T::A::B::f`)").into());
+        }
+        if after == 2 {
+            use crate::rules::self_path::AssocPrefix;
+            let prefix = match res.def {
+                Def::TyParam(i) => AssocPrefix::Param(i),
+                Def::SelfTy => AssocPrefix::ImplSelf,
+                Def::Adt(_) if consumed == 1 && segs[0].name == SELF_NAME => AssocPrefix::ImplSelf,
+                _ => AssocPrefix::Other,
+            };
+            let Some(projected) = self.assoc_ty_of_prefix(at, cause, prefix, segs[consumed])? else {
+                return Ok(self.common.err);
+            };
+            return self.assoc_value(at, cause, projected, segs[consumed + 1], bp.scope);
+        }
         let self_ty = match res.def {
+            // `Self` in an impl of a type that is no ADT (the Reference, "Paths", "`Self`": "In
+            // an implementation, it refers to the type being implemented."): the impl's self
+            // type; its items are found as any type's are (a parameter's through its bounds).
+            Def::SelfTy => match self.impl_self_ty(cause)? {
+                Some(t) => t,
+                None => {
+                    self.diag(DiagCode::UnresolvedPath, at, None, None, last_name);
+                    return Ok(self.common.err);
+                }
+            },
             Def::Adt(k) => {
                 let Some(adt) = self.reads.adt(k)? else {
                     self.diag(DiagCode::UnresolvedPath, at, None, None, last_name);
@@ -569,7 +599,7 @@ impl<'a, W: World, C: TypeCtx> Machine<'_, '_, '_, 'a, W, C> {
                 let empty = self.mk_list(&[])?;
                 self.lower(own.types, pt, Lower::Args(empty), cause)
             }
-            Def::Adt(_) | Def::Trait(_) | Def::Prim(_) => {
+            Def::Adt(_) | Def::Trait(_) | Def::Prim(_) | Def::SelfTy => {
                 self.diag(DiagCode::NotAValue, at, None, None, name);
                 Ok(self.common.err)
             }

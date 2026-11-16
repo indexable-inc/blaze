@@ -150,6 +150,12 @@ pub struct Shadowed<'a> {
     pub first_not_expanded: Option<ItemKey>,
     pub cells: u64,
     pub stalls: u64,
+    /// The uses the cell core reports a time-travel or glob-vs-outer error at (R6, and the
+    /// validation of what stalled calls took).
+    pub r6_errors: u64,
+    /// What stalled calls took while their module's globs were weakly undecided, validated
+    /// when the run ended.
+    pub speculated: u64,
     /// The first [`DIFFER_SHOWN`] differing bindings, in module key order.
     pub differ_first: AVec<'a, Differ<'a>>,
     /// The cell core's own written lists ([`super::write`]) against the old core's scopes.
@@ -419,6 +425,8 @@ pub(crate) fn shadow<'a, F: ScopeFacts<Name = &'a str>>(
         first_not_expanded: facts.first.get(),
         cells: c.stats.cells as u64,
         stalls: c.stats.stalls as u64,
+        r6_errors: c.stats.r6_errors as u64,
+        speculated: c.speculated.len() as u64,
         differ_first,
     })
 }

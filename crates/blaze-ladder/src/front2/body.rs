@@ -241,13 +241,16 @@ pub struct Body<'n> {
     pub self_: SelfTy,
     /// The traits in scope at `module`, checker keys, sorted.
     pub traits: Vec<ItemKey, Global>,
+    /// The traits in scope at each block whose list is not `traits`: the blocks' `use`s
+    /// ([`super::block_traits`]).
+    pub blocks: super::block_traits::BlockTraits,
 }
 
 impl<'n> Body<'n> {
     /// The scope the check loop resolves the body's paths in; `spell` is
     /// `Spelling::of(&self.lowered.view())`.
     pub fn scope<'s>(&'s self, spell: &'s Spelling<'s>) -> BodyScope<'s> {
-        BodyScope { owner: self.owner, module: self.module, params: &self.params, self_: &self.self_, spell, traits: &self.traits }
+        BodyScope { owner: self.owner, module: self.module, params: &self.params, self_: &self.self_, spell, traits: &self.traits, blocks: &self.blocks }
     }
 }
 
@@ -598,6 +601,7 @@ fn lower_member_into<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, 
     if let Some(own) = super::own_trait::of_member(store, container).map_err(|e| BodyError::NoHead(e.0))? {
         if let Err(at) = body.traits.binary_search(&own) {
             body.traits.insert(at, own);
+            body.blocks.add(own, Alloc::global());
         }
     }
     Ok(body)
@@ -625,7 +629,10 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     let atoms = names.cfg_atoms(krate).ok_or(BodyError::NoText(item))?;
 
     let scoped = ScopedBy { names, module, prepared: Some(prepared) };
-    let mut expand = ByName::with_names(&scoped, NoHost, Alloc::global());
+    // The crate's host, the one item-level expansion answers from (census 13, brief 13): env,
+    // includes, proc macros; `NoHost` refused them all.
+    let host = super::body_host::BodyHost::of(names, store.sources, krate, item, module, Alloc::global());
+    let mut expand = ByName::with_names(&scoped, host, Alloc::global());
     let mut values = ModuleValues { names, module, store: &mut *store, keys: &mut *keys, failed: None, krate, item, text, blocks: None };
     let lowered = blaze_lower::lower_body_expanding(text, edition, &mut CrateCfg(atoms), &mut values, &mut expand, Alloc::global());
     match values.failed {
@@ -711,6 +718,9 @@ fn lower_at<'n, S: NamesSource<'n>>(names: S, prepared: &Prepares<'n>, keys: &mu
     traits.extend(in_scope.iter().map(|&k| checker_of(k)));
     traits.sort_unstable();
     traits.dedup();
+    // The traits a block's `use` brings into scope there (tracing's `use
+    // $crate::__macro_support::Callsite as _;` in the block its macros expand to).
+    let blocks = super::block_traits::of(names, &store.locals, owner, module, krate, &traits, Alloc::global());
     drop(view);
-    Ok(Body { item, owner, module, lowered, typeck, tys, params, self_, traits })
+    Ok(Body { item, owner, module, lowered, typeck, tys, params, self_, traits, blocks })
 }

@@ -2362,6 +2362,21 @@ back, and normalized by a world question for the value once `args` is ground. Th
 exists: a filed head per anonymous constant, and `Consts::value_at` evaluates a root at arguments.
 Tests: crates/blaze-ladder/tests/front2_const_open.rs.
 
+Hand-on, 2026-11-16 (tempo census 13, brief 11, `TraitConstNoSelf`; nothing of this paragraph is
+built). The brief places the cause in consts.rs's settle loop; the need is made in blaze-consteval
+machine/code.rs, `raw`, arm `Expr::Path` / `Def::Const`, and consts.rs only refuses it. A
+QUALIFIED path (`<u8 as Tr>::N`, the brief's own test) already gets its arguments there from the
+path (`qualified_const_args`); test `a_constant_whose_body_reads_a_trait_constant_has_its_value`
+is written for it. What remains is a path the checker selects by type (`Self::N`, `T::N`,
+`<Q>::N`): its arguments are in `Checked::const_args` (`const_args_of(expr)`, a list of the
+record's `types`), which the evaluator does not read: `blaze_consteval::Typed` has no such
+column, and it is built by a struct literal in blaze-std src/eval.rs as well as by `Typed::new`,
+so adding the column is a two-crate batch. The end state is one home for a constant path's
+arguments: the arm reads `const_args_of(e)`, grounds each at the instance (`cg`), asks `resolve`,
+and `qualified_const_args` is deleted. front2/const_at.rs (D84) pulls the same rows for an
+instance's own body (`needs_of` over `Checked::const_args`); the evaluator's arm is the same
+question inside a constant's body and should take its rows the same way, not a second derivation.
+
 State at 14:35 (generic associated types): the checker's side is green (blaze-typeck "172 passed, 0
 failed", suite::gat 2, suite::holes 1). The front end compiles; `front2_bounds` at 14:26 had
 `gat_where` clean and `gat_bind`, `gat_impl` stopped by "the bounds of an associated type with type

@@ -171,17 +171,18 @@ fn a_defining_body_with_two_returns_of_one_type_is_clean() {
 }
 
 /// The planted bug: the output kept as the opaque itself (the state before rules/opaque_def.rs)
-/// makes `{ 1u8 }` fail: the rigid opaque against `u8` ends as an `Unsatisfied` with no place
-/// (run of 2026-11-16: "`d`: DiagWithoutPlace { code: Unsatisfied, name: None }"), so the test
-/// above checks the rule.
+/// makes `{ 1u8 }` fail: `u8` is not the opaque type itself, E0308 in the body, so the test
+/// above checks the rule. (While the checker made an opaque a NON-rigid alias the pair was
+/// deferred and ended as "DiagWithoutPlace { code: Unsatisfied, name: None }", run of
+/// 2026-11-16; an opaque is rigid now: infer/mod.rs `mk`.)
 #[test]
-#[should_panic(expected = "DiagWithoutPlace { code: Unsatisfied")]
 fn control_opaque_not_opened() {
     let (fx, d) = defining_world();
     let mut b = Bb::new();
     let one = b.int(Some(IntSuffix::Uint(UintTy::U8)));
     let root = b.block(&[], Some(one));
-    let _ = check_body(&fx, &b, d, root, Plant::OpaqueNotOpened, InferPlant::None);
+    let c = check_body(&fx, &b, d, root, Plant::OpaqueNotOpened, InferPlant::None);
+    assert!(c.diags.iter().any(|d| d.code == DiagCode::Mismatch), "the unopened opaque was not caught: {:?}", c.diags);
 }
 
 /// The same sentence: `{ return 1u8; "a" }` returns two types: E0308 at the second.

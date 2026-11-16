@@ -37,6 +37,7 @@ pub mod fetch_task;
 pub mod items;
 pub mod key;
 pub mod lines;
+pub mod pointers;
 pub mod profile;
 pub mod record;
 pub mod request;

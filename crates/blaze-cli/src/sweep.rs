@@ -556,7 +556,7 @@ impl<S: Stamps> Follow<S> {
 }
 
 /// What an [`Older`] leaf table is named as: it is the pointer file's second part (seal.rs).
-const LEAVES: &str = ".blaze/v2/last (its leaf table)";
+const LEAVES: &str = "a pointer in .blaze/v2/at (its leaf table)";
 /// What the last answer read, as rows read in place:
 ///
 /// ```text

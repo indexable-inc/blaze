@@ -258,6 +258,10 @@ pub struct TraitAliasHead {
     pub traits: Vec<(LibKey, List), Global>,
 }
 
+/// The refusal of a `Self` written where the [`Env`] has no `Self` ([`SelfTy::None`]): one
+/// name, so that heads.rs `impl_` can say which place it was (an impl's own self type).
+pub(super) const SELF_HERE: &str = "`Self` here";
+
 /// What `Self` is where the type is written.
 #[derive(Clone, Copy, Debug)]
 pub enum SelfTy {
@@ -935,7 +939,7 @@ impl<'b, 'n, H: Heads, S: NamesSource<'n>> Builder<'b, H, S> {
                     (None, Some((tr, args))) => self.self_assoc(tys, tr, args, Name::of(texts[1]), r, shown),
                     (None, None) => Err(program(format!("`{shown}` names no associated type of the impl"), r)),
                 },
-                _ => Err(Why::Unsupported("`Self` here", r)),
+                _ => Err(Why::Unsupported(SELF_HERE, r)),
             };
         }
         if !abs && texts.len() == 1 {

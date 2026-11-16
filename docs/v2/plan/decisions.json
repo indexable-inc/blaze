@@ -738,6 +738,46 @@
    "recommended": "Writers now for the pieces that need no test child: the case board and `check` from it (1, 2), `differ` (13), the coverage-guided search phase (8), judge-changed findings and the timeout formatter (19, 18a). The blaze-run planning pieces (3 to 6) wait until `blaze test` runs a plain test.",
    "why": "test.md said nothing about these kinds while blaze-sim was used by about fifty crates and unknown to the runner. Accepted with one caution passed to the test child's owner: treating monotonic and CPU clock reads as reusable trades a little soundness (a timing-dependent test keeps its pass) for any async test being reusable at all.",
    "state": "decided; writing"
+  },
+  {
+   "id": "D89",
+   "date": "2026-11-16",
+   "decision": "Three design points from the triage of tempo census 13 (port27 notes, census-13-briefs.md). (a) A workspace-member proc-macro crate's own dependencies ARE in the names world, as crates of a `macro` side (the cfg of wasm32-wasip1; the side is part of the crate's key), with the toolchain's `proc_macro`; a dependency's proc macro stays without its dependencies (its records come from the module store). (b) The bounds and where clauses on a generic associated type's own parameters are the associated item's own predicates: one list, proved at each use by the solver's well-formedness of the projection, assumed inside an impl's `type Out<T> = X` when `X` is checked; never kept unchecked. (c) `env!` reads one `CrateEnv` per unit, made from the lock and the manifest (package name and version, crate name, the manifest directory as the package's stable path, never a machine path, and OUT_DIR from the joined build-script record), the same for items and bodies, each read recorded in the read list; a name it lacks is the compile error.",
+   "recommended": "(c) is being written with brief 13; (a) after briefs 1 to 4 (memory to be measured: syn whole a second time); (b) by the writer who knows the GAT code.",
+   "why": "tempo_precompiles_macros (132 heads, 99 bodies) cannot be checked at all without (a); 47 bodies stop at (b); every proc macro and `env!` inside a function body fails today because bodies expand with a host that refuses everything.",
+   "state": "decided; (c) writing"
+  },
+  {
+   "id": "D90",
+   "date": "2026-11-16",
+   "decision": "An experimental Hypervisor.framework sandbox for macOS build steps is built as crates/blaze-hvbox: its own workspace, excluded from the repository's workspace, off by default, selected by nothing (the owner's request, relayed by another of his sessions: 'build it now', Opus, 'not enabled by default'; later 'ideally' also a Linux aarch64 host). A sans-IO core with host-neutral effects and an exit source not shaped like one hypervisor; a thin driver and a separately signed helper carry the entitlement, so `blaze` is unchanged. No fallback: a step it cannot run stops with a typed error; choosing it over sandbox-exec is an explicit setting at the `Sandbox` seam, added only after a plain C program has run to exit in the guest with output equal to the native run.",
+   "recommended": "One lane that builds and runs only its own crate, with rails on the owner's machine (an allow list of forwarded calls, a passed read set, one scratch write directory, no network, no root); spec first at docs/v2/plan/design/hvbox.md.",
+   "why": "The present macOS path for native build scripts gets a bare refusal from the kernel and records no reads; a layer every call passes through can name each refused path and record every read, miss and listing, which is what a step's result is keyed by. Open for the owner: where a Linux host gets an Apple userland from.",
+   "state": "decided; spec being written"
+  },
+  {
+   "id": "D91",
+   "date": "2026-11-16",
+   "decision": "No panic strategy is swapped silently. Until unwind entries are registered from code records, a program is built as today and a panic that is RAISED where the profile says unwind stops the run with blaze's own typed stop (exit status 125), naming the panic's place and that unwinding is not registered yet; only a program that actually panics is affected. The end state is registration (run.md piece 11, part C).",
+   "recommended": "The stop goes to the hello-world lane (the same mechanism as its stub that stops); registration to a writer after it.",
+   "why": "The test program x0-unwind-01 printed a wrong status (69, want 42): the ladder built it as panic=abort while the profile says unwind, and 69 is abort's right answer. Refusing every code record with landing pads would refuse every std program, since the start-up code reaches catch_unwind.",
+   "state": "decided; assigned"
+  },
+  {
+   "id": "D92",
+   "date": "2026-11-16",
+   "decision": "The owner's end state for build steps: a build script runs inside blaze's own execution (on LIR, or as a wasm module; build-scripts.md decides per class), and every command or native tool it spawns runs in the deterministic sandbox (crates/blaze-hvbox), so a step's outputs are the same for anyone on any host. No path runs build-time user code on the bare host.",
+   "recommended": "hvbox's spec names this as its role (the spawn seam of a build script hands a command to it); build-scripts.md's native class points at it once a plain C program has run to exit in the guest.",
+   "why": "The owner, 2026-11-16: 'build.rs will be run in something either directly in our MIR/LIR or in wasmtime ... commands and native stuff will go to our deterministic sandbox ... it should always be deterministic regardless of who uses them'.",
+   "state": "decided; hvbox experimental (D90)"
+  },
+  {
+   "id": "D93",
+   "date": "2026-11-16",
+   "decision": "What a sampler profile of the owner's hello world under `blaze run` showed (40 s of CPU on one thread, 27 GB peak) and what follows. (1) A body never copies the shared type table: its table is an overlay over the shared one and its working memory a frame reset per body (the copy was 21% of the time and, by its growth, the bulk of the memory). (2) An operator on two resolved builtin scalar types is builtin without a solver query (18% of the time). (3) `run` and `check` go through the driver's tasks and the store: names, heads, checked bodies and code are records read back, std's from the shared layer; the in-memory harness behind `blaze run` is an interim, not the path. (4) Bodies are checked on the pool, not one thread. (5) The new names solver becomes the writer (about twenty times faster on tempo). (6) The home is bounded (D87's pieces are no longer parked).",
+   "recommended": "One lane proves (1) by rerunning the same profile; every other piece goes to parallel write-only Opus writers from the architects' piece lists, planned in one wave file so no two writers share a function.",
+   "why": "The owner: 'WHY SO LONG? im scared ur thign is not sota', then 'fix EVERYTHING wrong with design and get parallel opus to fix this (no need to check just write code)'. The design's floors are a repeat in 2 to 3 ms and a body edit in about 4 ms (estimates); the measured run did none of what the design says because the command's run path is not connected to records.",
+   "state": "decided; writing"
   }
  ]
 }

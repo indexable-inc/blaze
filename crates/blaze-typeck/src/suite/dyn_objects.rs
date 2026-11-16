@@ -295,6 +295,33 @@ fn a_reference_to_an_opaque_unsizes_to_its_bounds_object() {
     assert!(got.ends_with("unsize -> &mut dyn Tr"), "adjustments `{got}`");
 }
 
+/// The same two sentences, at the site std's `default_hook` has: a BORROW EXPRESSION as a call's
+/// argument (`write(&mut out)`), where the borrow's operand is typed with the object type as
+/// its hint: `fn take(x: &mut dyn Tr)`, `fn d_arg(x: impl-Tr-of-mk_opq) { let out = x;
+/// take(&mut out) }`: no finding, and the argument's last adjustment is the unsize.
+/// Should print: "test suite::dyn_objects::a_borrow_of_an_opaque_local_unsizes_at_a_call ... ok".
+#[test]
+fn a_borrow_of_an_opaque_local_unsizes_at_a_call() {
+    let fx = objects_world(&[
+        ("take", |fx, o| fx.r(Mutbl::Mut, o.dyn_tr), |fx, _| fx.unit()),
+        ("d_arg", |_, o| o.opq, |fx, _| fx.unit()),
+    ]);
+    let mut b = Bb::new();
+    let x = b.param("x");
+    let init = b.local(x);
+    let out = b.bind("out");
+    let s = b.let_(out, None, init);
+    let take = b.path(&["take"]);
+    let operand = b.local(out);
+    let arg = b.borrow(Mutbl::Mut, operand);
+    let call = b.call(take, &[arg]);
+    let root = b.block(&[s], Some(call));
+    let c = check_body(&fx, &b, fx.key_of("d_arg"), root, Plant::None, InferPlant::None);
+    assert!(c.diags.is_empty(), "{:?}", c.diags);
+    let got = adjusts(&fx, &c, arg);
+    assert!(got.ends_with("unsize -> &mut dyn Tr"), "adjustments `{got}`");
+}
+
 /// The planted bug: the coercion does not ask the solver, so it invents `+ Send`.
 #[test]
 fn control_coercion_invents_auto() {

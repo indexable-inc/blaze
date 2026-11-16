@@ -57,6 +57,10 @@ use crate::plan::{Basis, Failure, Missed, NotKept, Outcome};
 use crate::result::{Ended, Failed, Finding, NotKeptWords, Refusal, Why};
 use crate::{Hex, TestId};
 
+/// The step trace of a timed-out or failed end-to-end test (test.md C, piece 18's formatter).
+pub mod steps;
+pub use steps::{StepTrace, step_trace, timed_out};
+
 /// How much of a failure's captured output is shown by default: its last 16 KiB.
 pub const DEFAULT_SHOWN: usize = 16 * 1024;
 

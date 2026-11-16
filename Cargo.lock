@@ -1032,6 +1032,7 @@ dependencies = [
  "blaze-ids",
  "blaze-launch",
  "blaze-launch-rt",
+ "blaze-lir",
  "blaze-lower",
  "blaze-mem",
  "blaze-own",

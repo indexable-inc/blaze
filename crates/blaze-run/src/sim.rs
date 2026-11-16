@@ -5,12 +5,14 @@
 mod declare;
 mod first_call;
 mod heat_tier;
+mod judge;
 mod parent;
 mod plan;
 mod registry;
 mod report;
 mod result;
 mod slots;
+mod steps;
 mod suite;
 mod toggle;
 mod zygote;
