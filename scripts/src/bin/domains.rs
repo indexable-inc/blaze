@@ -18,7 +18,8 @@
 //! left out too: a doc that names a domain does not write it.
 //!
 //! The rule: each domain is written at most once outside test code. Test code (a file under a
-//! `tests` or `benches` directory, a `tests.rs` or `test.rs`, an item under `#[cfg(test)]` or
+//! `tests` or `benches` directory, a `tests.rs` or `test.rs` or a sibling `<module>_tests.rs`
+//! (`#[cfg(test)] mod env_read_tests;`), an item under `#[cfg(test)]` or
 //! `#[cfg(all(test, ...))]`) may repeat a domain, its own or one it recomputes, as often as it
 //! likes: its hashes are compared with nothing kept. A literal of the domain form that is not a
 //! domain (a text file's header) is named in ALLOWED with the one place it is written and why; an
@@ -138,7 +139,9 @@ impl Patterns {
 
 fn test_path(parts: &[String]) -> bool {
     let (name, dirs) = parts.split_last().map_or(("", &[][..]), |(name, dirs)| (name.as_str(), dirs));
-    dirs.iter().any(|part| TEST_DIRS.contains(&part.as_str())) || TEST_FILES.contains(&name)
+    dirs.iter().any(|part| TEST_DIRS.contains(&part.as_str()))
+        || TEST_FILES.contains(&name)
+        || name.ends_with("_tests.rs")
 }
 
 /// `(root / "crates").rglob("*.rs")`, sorted as Python sorts paths (part by part), each as its
@@ -534,6 +537,17 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sibling `<module>_tests.rs` is test code, as `tests.rs` is; a file whose name only
+    /// contains `tests` is not.
+    #[test]
+    fn a_sibling_tests_file_is_test_code() {
+        let parts = |path: &str| path.split('/').map(str::to_owned).collect::<Vec<_>>();
+        assert!(test_path(&parts("crates/a/src/blaze/env_read_tests.rs")));
+        assert!(test_path(&parts("crates/a/src/tests.rs")));
+        assert!(!test_path(&parts("crates/a/src/tests_of.rs")));
+        assert!(!test_path(&parts("crates/a/src/env_read.rs")));
+    }
 
     /// A tree's domains for [`ledger_problems`]: each written once, outside tests.
     fn written(domains: &[&str]) -> BTreeMap<String, Vec<Site>> {

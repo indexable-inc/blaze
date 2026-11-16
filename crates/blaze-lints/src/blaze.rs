@@ -60,7 +60,6 @@ mod expect_tests;
 mod enum_vec_padded;
 mod env_read;
 #[cfg(test)]
-#[path = "blaze/env_read/tests.rs"]
 mod env_read_tests;
 mod error_debug;
 #[cfg(test)]
