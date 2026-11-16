@@ -243,6 +243,14 @@ Andrew: "we should have 0 third party and all the things you said worth adding".
   a record does not. It answers only the ix.dev origin, read-only, after a browser was paired
   once (the page shows a code, the next blaze command asks). The data goes to the browser and
   no further.
+- **Many machines on one page** (Andrew: "a monitor of what might be happening even on
+  multiple machines"). The viewer's events (a command began or ended, what it runs, compiles
+  or tests, on which machine and checkout, time and memory) are one stream. When an
+  organisation opts in, the viewer also sends that stream outward to a relay on ix.dev, tied
+  to an ix account, and the page shows every machine; machines make outgoing connections
+  only. Off by default; it carries activity, not code or names of items, unless chosen.
+  Makepad's devhub (not in Relax's repository) is the comparison: it keeps agents' runs alive
+  on warm machines, each with a warm cache at the tip.
 - **Relax's failures as a checklist.** Its `KNOWN_GAPS.md` and tests (MIT) are the list of
   Rust that trips a front end written from scratch; each is a test here.
 
