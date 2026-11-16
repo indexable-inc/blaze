@@ -110,7 +110,7 @@ fn format_restriction(
             }
             // FIXME use `segments_iter.intersperse("::").collect::<String>()` once
             // `#![feature(iter_intersperse)]` is re-stabilized.
-            let path = itertools::join(segments_iter, "::");
+            let path = stdx::iter::IterExt::join(&mut segments_iter, "::");
             let in_str = if *shorthand { "" } else { "in " };
 
             format!("{kw}({in_str}{path}) ")

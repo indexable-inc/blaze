@@ -12,10 +12,9 @@ use stdx::Either;
 use intern::{Symbol, sym};
 use stdx::iter::IterExt;
 use parser::SyntaxKind;
-use smallvec::SmallVec;
 use span::{Edition, Span};
 use syntax_bridge::{DocCommentDesugarMode, SpanMapper};
-use tracing::debug;
+use blaze_trace::debug;
 
 use crate::{
     BuiltinError, ExpandError, ExpandErrorKind, ExpandResult, MacroCallId, MacroCallKind,
@@ -156,7 +155,7 @@ fn with_item_attrs<'f>(
     item: &tt::TopSubtree,
     expanded: tt::TopSubtree<&'f Frame>,
 ) -> tt::TopSubtree<&'f Frame> {
-    // alloc: none unless the item has more than four such attributes
+    // alloc: none unless the item has such attributes
     let mut attrs = Vec::<tt::TokenTreesView<'_>>::new();
     let mut outer = item.token_trees().iter();
     loop {

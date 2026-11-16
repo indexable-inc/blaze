@@ -179,9 +179,55 @@ pub fn until<T>(
             None,
         )
     });
-    let waited = retry::drive(retry::Retry::new(what, deadline, clock.now()), &mut (clock, once));
+    let waited = unlisted(what, clock, deadline, once);
     drop(registered);
     waited
+}
+
+/// [`until`] without the wait-for graph's row: for a wait whose caller is the row already (a
+/// lock's acquire, a [`crate::lock::Signal`]'s wait), so a thread waits on one thing in the
+/// graph, and so a lock's wait asks nothing of the probe (whose own calls may take locks).
+pub(crate) fn unlisted<T>(
+    what: &'static str,
+    clock: &impl Clock,
+    deadline: Option<Deadline>,
+    once: impl FnMut(Option<Duration>) -> std::io::Result<Once<T>>,
+) -> Result<Waited<T>, WaitError> {
+    retry::drive(retry::Retry::new(what, deadline, clock.now()), &mut (clock, once))
+}
+
+/// Sleeps while `word` holds `expected`, until a [`word_wake`] of it or `deadline` on `clock`
+/// (forever for `None`): the futex of a lock's word ([`crate::lock::raw`]), which any number of
+/// threads of this process wait on at once. `Ready` when woken, when the word no longer held
+/// `expected` or on a return with nothing (the caller looks at the word again), `Deadline`
+/// once it passed. The kernel compares the word and blocks in one step, so a wake between the
+/// caller's look and its wait is not lost. No row in the wait-for graph: the lock's is the row.
+///
+/// - Linux: `futex(FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG)` directly, on either driver
+///   ([`choose`]): a lock is waited for by threads that have no ring, and by a thread whose
+///   ring is in use, so it needs none.
+/// - macOS: `os_sync_wait_on_address_with_deadline` (`wait/macos.rs`), as a park.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn word_wait(
+    what: &'static str,
+    word: &crate::atomic::AtomicU32,
+    expected: u32,
+    deadline: Option<Deadline>,
+    clock: &impl Clock,
+) -> Result<Waited<()>, WaitError> {
+    #[cfg(target_os = "linux")]
+    return direct::word_wait(what, word, expected, deadline, clock);
+    #[cfg(target_os = "macos")]
+    return macos::word_wait(what, word, expected, deadline, clock);
+}
+
+/// Wakes one thread sleeping in [`word_wait`] on `word`, or every one (`all`).
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn word_wake(word: &crate::atomic::AtomicU32, all: bool) {
+    #[cfg(target_os = "linux")]
+    direct::word_wake(word, all);
+    #[cfg(target_os = "macos")]
+    macos::word_wake(word, all);
 }
 
 /// Sleeps while the low 32 bits of `word` hold `expected`, until a [`wake_shared`] of it from

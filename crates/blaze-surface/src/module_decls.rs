@@ -489,7 +489,7 @@ impl<'a> ModuleDeclsView<'a> {
         let root = blaze_format::open::<ModuleDeclsRoot>(buffer)?;
         let strings = root.strings.as_str(buffer)?;
         let paths = Paths::read(root.paths.follow(buffer)?, root.segments.follow(buffer)?, strings, buffer)?;
-        check_text(strings, root.name, root, buffer)?;
+        check_text(strings, root.name, blaze_format::Verified::get(root), buffer)?;
         let items = root.items.follow(buffer)?;
         for row in items {
             check_text(strings, row.name, row, buffer)?;

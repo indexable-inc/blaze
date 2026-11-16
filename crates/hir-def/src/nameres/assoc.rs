@@ -11,7 +11,6 @@ use base_db::{Db, OrNeed};
 use blaze_surface::{ItemKind, Items};
 use hir_expand::{AstId, MacroCallId, name::Name};
 use syntax::ast;
-use thin_vec::ThinVec;
 
 use crate::{
     AssocItemId, ConstId, FunctionId, ImplId, TraitId, TypeAliasId,
@@ -44,7 +43,7 @@ fn assoc_items(db: &Db, parent: base_db::ItemKey) -> Box<[(Name, AssocItemId)], 
 pub struct TraitItems {
     pub items: Box<[(Name, AssocItemId)], Global>,
     /// The macro calls in the trait's item list: in `Expansion` records, none listed here.
-    pub macro_calls: ThinVec<(AstId<ast::Item>, MacroCallId)>,
+    pub macro_calls: Box<[(AstId<ast::Item>, MacroCallId)]>,
 }
 
 #[blaze_memo::tracked]
@@ -56,7 +55,7 @@ impl TraitItems {
 
     #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
     pub fn query_with_diagnostics(db: &Db, tr: TraitId) -> (TraitItems, DefDiagnostics) {
-        let items = TraitItems { items: assoc_items(db, tr.key(db)), macro_calls: ThinVec::new() };
+        let items = TraitItems { items: assoc_items(db, tr.key(db)), macro_calls: Box::default() };
         (items, DefDiagnostics::none())
     }
 
@@ -107,14 +106,14 @@ impl TraitItems {
 pub struct ImplItems {
     pub items: Box<[(Name, AssocItemId)], Global>,
     /// The macro calls in the impl's item list: in `Expansion` records, none listed here.
-    pub macro_calls: ThinVec<(AstId<ast::Item>, MacroCallId)>,
+    pub macro_calls: Box<[(AstId<ast::Item>, MacroCallId)]>,
 }
 
 #[blaze_memo::tracked]
 impl ImplItems {
     #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
     pub fn of(db: &Db, id: ImplId) -> (ImplItems, DefDiagnostics) {
-        let items = ImplItems { items: assoc_items(db, id.key(db)), macro_calls: ThinVec::new() };
+        let items = ImplItems { items: assoc_items(db, id.key(db)), macro_calls: Box::default() };
         (items, DefDiagnostics::none())
     }
 }

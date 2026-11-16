@@ -332,7 +332,10 @@ fn config() {
     assert_eq!(config.notify, terminal::Notify::Off);
     assert_eq!(config.notify_after_secs, 30);
     assert!(
-        Config::from_toml("[terminal]\ncolor = \"blue\"\n").unwrap_err().contains("terminal.color")
+        Config::from_toml("[terminal]\ncolor = \"blue\"\n")
+            .unwrap_err()
+            .to_string()
+            .contains("terminal.color` (line 2, column 9) takes")
     );
-    assert!(Config::from_toml("[terminal]\nbeep = true\n").unwrap_err().contains("`beep`"));
+    assert!(Config::from_toml("[terminal]\nbeep = true\n").unwrap_err().to_string().contains("`beep`"));
 }

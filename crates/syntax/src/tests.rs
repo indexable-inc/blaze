@@ -7,7 +7,7 @@ use std::{
 
 use ast::{HasModuleItem, HasName};
 use blaze_graph::par;
-use expect_test::expect_file;
+use test_utils::expect_file;
 use parser::Edition;
 use stdx::format_to_acc;
 use test_utils::{bench, bench_fixture, project_root};

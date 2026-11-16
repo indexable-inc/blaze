@@ -384,7 +384,7 @@ fn gzip_header_fields_and_bounds() {
 #[test]
 fn deflate_is_deterministic_across_runs() {
     // Equal input and level, equal bytes: the record keys of compressed records rest on it.
-    let data: StdVec<u8> = (0..300_000u32).map(|i| ((i * i) >> 7) as u8).collect();
+    let data: StdVec<u8> = (0..300_000u32).map(|i| (i.wrapping_mul(i) >> 7) as u8).collect();
     for level in [Level::Store, Level::Fast, Level::Default] {
         let a = compress(&data, level, &[]);
         let b = compress(&data, level, &[1, 2, 3, 65_536, 100_000]);

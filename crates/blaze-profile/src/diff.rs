@@ -590,7 +590,7 @@ errors gone:
             std::thread::spawn(move || {
                 let _build = crate::flight::building(build);
                 let _unit =
-                    tracing::info_span!(target: "blaze", "unit codegen", krate = "app").entered();
+                    blaze_trace::info_span!(target: "blaze", "unit codegen", krate = "app").entered();
                 blaze_graph::spin::busy(std::time::Duration::from_millis(ms));
             })
             .join()

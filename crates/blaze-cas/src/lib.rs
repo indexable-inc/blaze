@@ -107,7 +107,6 @@ use blaze_hash::{ByHash, ByHashSet, HashMap, HashSet};
 use blaze_ids::{ContentId, Hasher};
 use blaze_reclaim::{Grace, Limbo};
 pub use blaze_reclaim::{Guard, enter};
-use serde::{Deserialize, Serialize};
 use std::alloc::Global;
 
 pub use crate::disk::content_of;
@@ -238,7 +237,7 @@ const FAILURES_MOST: u32 = 8;
 const PACKS_MOST: usize = 1 << 16;
 
 /// What a value was made from, hashed.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct Key(pub ContentId);
 
 impl Key {
@@ -258,7 +257,7 @@ impl Key {
 }
 
 /// What kind of value: picks its compression dictionary and its pack.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub enum Kind {
     /// A query's result in the zero-copy format.
     Query,
@@ -823,7 +822,7 @@ enum PlacedFile {
         left: u32,
         failed: Option<String>,
         written: u64,
-        span: tracing::Span,
+        span: blaze_trace::Span,
     },
     /// Written (`written` bytes) or checked (none), being made read-only before anything
     /// clones it.
@@ -841,7 +840,7 @@ enum PlacedFile {
         written: u64,
         file: publish::Written,
         doomed: bool,
-        span: tracing::Span,
+        span: blaze_trace::Span,
     },
     /// There, read-only and written back (`file`, the one handle a clone is asked through,
     /// [`Flushed::clone_to`]): `cloning` clones of it are in flight, and it is removed once they
@@ -1215,7 +1214,7 @@ pub struct Store {
     placed: Vec<Placed>,
     /// Each place asked and not yet answered: its span (`place`), open from [`Store::place`]
     /// to its [`Placed`], which says how the bytes got there and how many.
-    place_spans: HashMap<Tag, tracing::Span, Global>, // alloc: the store's own table, for its life
+    place_spans: HashMap<Tag, blaze_trace::Span, Global>, // alloc: the store's own table, for its life
     /// The outputs being made of a clone of their base with ranges written
     /// ([`Content::Patch`]), by the tag their place was asked with.
     patching: HashMap<Tag, Patching, Global>, // alloc: the store's own table, for its life
@@ -1246,7 +1245,7 @@ pub struct Store {
     held: Vec<(ContentId, Waiter)>,
     /// Open while anything waits in `held` or `held_asks`, from the first held to the
     /// look's end or the store's break: the wait, named (every-wait-says-what).
-    look_wait: Option<tracing::Span>,
+    look_wait: Option<blaze_trace::Span>,
     /// Times the look through `placed/` has failed: its own bound ([`FAILURES_MOST`]), which
     /// other IO succeeding does not reset.
     look_tries: u32,
@@ -3887,16 +3886,16 @@ impl Store {
     /// for where it waits. No parent: it ends on a later completion, under whatever request
     /// is current then. `unvouched` says why a place that succeeded answers no stamp
     /// ([`Placed::stamp`], [`Store::vouch`]). One span shape for every route.
-    fn place_span(to: &FileName) -> tracing::Span {
-        tracing::info_span!(
+    fn place_span(to: &FileName) -> blaze_trace::Span {
+        blaze_trace::info_span!(
             target: "blaze",
             parent: None,
             "place",
             %to,
-            how = tracing::field::Empty,
-            bytes = tracing::field::Empty,
-            waits = tracing::field::Empty,
-            unvouched = tracing::field::Empty,
+            how = blaze_trace::field::Empty,
+            bytes = blaze_trace::field::Empty,
+            waits = blaze_trace::field::Empty,
+            unvouched = blaze_trace::field::Empty,
         )
     }
 
@@ -4883,12 +4882,12 @@ impl Store {
             let dir = self.placed_dir();
             // No parent: a request span current at the first hold would otherwise stay open
             // until the look ends, stretching its profile row.
-            self.look_wait = Some(tracing::info_span!(
+            self.look_wait = Some(blaze_trace::info_span!(
                 target: "blaze",
                 parent: None,
                 "places wait for the open's look through placed/",
                 %dir,
-                places = tracing::field::Empty,
+                places = blaze_trace::field::Empty,
             ));
         }
     }
@@ -4911,12 +4910,12 @@ impl Store {
             let what = format!(
                 "looking through it as the store opened, to sweep an earlier run's leftovers: {why}"
             );
-            tracing::error!(target: "blaze", %dir, "{what}");
+            blaze_trace::error!(target: "blaze", %dir, "{what}");
             return self.fail(dir, what);
         }
         let PlacedOnOpen { kept, kept_bytes, swept } = self.placed_on_open;
         let held = self.held.len();
-        tracing::info!(target: "blaze", %dir, kept, kept_bytes, swept, held, "placed files found at open");
+        blaze_trace::info!(target: "blaze", %dir, kept, kept_bytes, swept, held, "placed files found at open");
         self.look_wait_over();
         self.placed_looked = true;
         // The names the places answered meanwhile changed, over the listing read.
@@ -5005,7 +5004,7 @@ impl Store {
             }
         };
         self.place_by = Some(by);
-        tracing::info!(target: "blaze", dir = %self.tiers[0].dir, "{}", by.said());
+        blaze_trace::info!(target: "blaze", dir = %self.tiers[0].dir, "{}", by.said());
         for file in [file, clone] {
             // clone: the op and the effect each own the name; twice per open
             let tag = self.tags.ask(Op::Discard { file: file.clone() });
@@ -5036,7 +5035,7 @@ impl Store {
     /// A problem with a whole file kept to clone from, logged as it is found (it may be a disk
     /// that damages files, or a writer outside the daemon) and kept in [`Store::problems`].
     fn placed_problem(&mut self, what: String) {
-        tracing::warn!(target: "blaze", "{what}");
+        blaze_trace::warn!(target: "blaze", "{what}");
         self.problems.push(what);
     }
 
@@ -5817,13 +5816,13 @@ impl Store {
         let file = self.placed_file(&id);
         // No parent: the derive ends on a later completion, under whatever request is
         // current then.
-        let span = tracing::info_span!(
+        let span = blaze_trace::info_span!(
             target: "blaze",
             parent: None,
             "store derive",
             %file,
-            ranges = tracing::field::Empty,
-            bytes = tracing::field::Empty,
+            ranges = blaze_trace::field::Empty,
+            bytes = blaze_trace::field::Empty,
         );
         let state = PlacedFile::Deriving { waiting, left: 0, failed: None, written, span };
         self.files.insert(id, state);
@@ -6070,7 +6069,7 @@ impl Store {
         }
         // No parent: the write-back ends on a later completion, under whatever request is
         // current then.
-        let span = tracing::info_span!(
+        let span = blaze_trace::info_span!(
             target: "blaze",
             parent: None,
             "flush started",
@@ -6183,7 +6182,7 @@ impl Store {
             }
             (Op::Check { .. }, PlacedFile::Checking(waiting), Done::Mapped(mapping)) => {
                 let bytes = mapping.bytes().len();
-                let found = tracing::info_span!(target: "blaze", "placed check", %file, bytes)
+                let found = blaze_trace::info_span!(target: "blaze", "placed check", %file, bytes)
                     .in_scope(|| content_of(mapping.bytes()));
                 drop(mapping);
                 if found == content {
@@ -6668,7 +6667,7 @@ impl Store {
                          hash of its bytes, so what {to} holds cannot be checked"
                     )),
                     Done::Mapped(mapping) => {
-                        let found = tracing::info_span!(target: "blaze", "placed verify", %to)
+                        let found = blaze_trace::info_span!(target: "blaze", "placed verify", %to)
                             .in_scope(|| content_of(mapping.bytes()));
                         drop(mapping);
                         match found == content {
@@ -6735,7 +6734,7 @@ impl Store {
                             // names nothing, so the look keeps only the homes the head names,
                             // and no path holds a key until it is placed again. What a crash
                             // may leave, so no problem of the store's: said, not kept.
-                            tracing::info!(
+                            blaze_trace::info!(
                                 target: "blaze",
                                 file = %self.names_file(),
                                 "the listing of the names of the store's whole files fails its check (a crash cut its write): it names nothing, and the whole files no home needs are removed"
@@ -6748,7 +6747,7 @@ impl Store {
                         let file = self.names_file();
                         // alloc: the error that breaks the store
                         let what = format!("it is no listing of the names of the store's whole files: {why}");
-                        tracing::error!(target: "blaze", %file, "{what}");
+                        blaze_trace::error!(target: "blaze", %file, "{what}");
                         self.fail(file, what);
                     }
                 },

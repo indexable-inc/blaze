@@ -550,7 +550,7 @@ impl<'ast, 'psess, 'c> ModResolver<'ast, 'psess> {
                         // since rustfmt only operates on the AST pre-expansion. In this case we'll
                         // be overly permissive and just ignore the file not found error so rustfmt
                         // can still try formatting the input.
-                        tracing::warn!("Couldn't find file for mod {};`", mod_name.to_string());
+                        blaze_trace::warn!("Couldn't find file for mod {};`", mod_name.to_string());
                         return Ok(None);
                     }
 

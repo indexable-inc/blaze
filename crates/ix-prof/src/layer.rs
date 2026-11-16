@@ -7,7 +7,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use tracing::{
+use blaze_trace::{
     Subscriber,
     field::{Field, Visit},
     span::{Attributes, Id, Record},

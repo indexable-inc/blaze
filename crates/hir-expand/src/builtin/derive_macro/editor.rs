@@ -8,7 +8,6 @@ use blaze_mem::Frame;
 use stdx::Either;
 use stdx::iter::IterExt;
 use parser::SyntaxKind;
-use smallvec::SmallVec;
 use span::Span;
 use syntax::{
     TextRange, TextSize,
@@ -19,7 +18,7 @@ use syntax::{
     syntax_editor::{GetOrCreateWhereClause, SyntaxEditor},
 };
 use syntax_bridge::DocCommentDesugarMode;
-use tracing::debug;
+use blaze_trace::debug;
 
 use super::{
     AdtKind, AdtParam, AdtShape, BasicAdtInfo, FieldsKind, Variant, empty, len_u32,

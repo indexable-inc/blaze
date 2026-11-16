@@ -118,7 +118,7 @@ impl Flights {
 impl Follower {
     /// Waits until the leader ends or `most` passes.
     pub fn wait(&self, most: Duration) -> Waited {
-        let _span = tracing::info_span!(target: "blaze", "blaze-fetch waits for another request's download", pin = %self.pin).entered();
+        let _span = blaze_trace::info_span!(target: "blaze", "blaze-fetch waits for another request's download", pin = %self.pin).entered();
         let start = Instant::now();
         match self.ended.recv_timeout(most) {
             // Nothing is ever sent: the only end is the leader's sender dropping.

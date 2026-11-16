@@ -1,0 +1,25 @@
+[package]
+name = "blaze-parquet"
+description = "A minimal Parquet writer and reader, in place of the parquet and arrow crates: the profile's tables (blaze-columns batches) as Parquet files DuckDB reads (plain encoding, no compression, data page v1, optional columns' definition levels and lists' repetition levels in the RLE/bit-packed hybrid, column statistics, key-value metadata, the footer in Thrift's compact protocol written by hand); a reader of the files it writes and of DuckDB's uncompressed answers (dictionary pages too), bounded, with typed refusals for the rest; a merge that copies column chunks as they are; `no_std`, on blaze-own"
+publish = false
+
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[lib]
+doctest = false
+
+[dependencies]
+# What is written and read: batches of named columns.
+blaze-columns.workspace = true
+# Every buffer, in the allocator the caller names; the column a refusal names.
+blaze-own.workspace = true
+# Integer conversions that say what they do, in place of `as`.
+blaze-int.workspace = true
+
+[lints]
+workspace = true

@@ -5,7 +5,7 @@ use crate::{
     signatures::{FunctionSignature, StructSignature},
     test_db::TestDBExt,
 };
-use expect_test::{Expect, expect};
+use test_utils::{Expect, expect};
 use hir_expand::fixture;
 
 use super::super::*;

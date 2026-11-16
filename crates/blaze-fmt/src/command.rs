@@ -19,7 +19,9 @@ use std::path::{Path, PathBuf};
 
 use blaze_manifest::features::Edition;
 use blaze_manifest::metadata::root_manifest;
-use blaze_manifest::{Config, Context, Workspace};
+use blaze_manifest::{Config, Context, ManifestError, Workspace};
+
+use crate::FmtError;
 
 /// Runs `blaze fmt` with `args`, the words after `fmt`, and returns its exit code.
 pub fn main(args: Vec<String>) -> i32 {
@@ -93,7 +95,7 @@ fn picks_edition(args: &[String]) -> bool {
 
 /// The files `args` name, grouped by the edition of the target or package each belongs to
 /// (`None`: in no package), in a fixed order.
-fn by_edition(args: &[String]) -> anyhow::Result<BTreeMap<Option<Edition>, Vec<String>>> {
+fn by_edition(args: &[String]) -> Result<BTreeMap<Option<Edition>, Vec<String>>, FmtError> {
     let mut packages = Packages::default();
     let mut groups: BTreeMap<Option<Edition>, Vec<String>> = BTreeMap::new();
     for file in files_of(args) {
@@ -122,7 +124,7 @@ impl Packages {
     /// The edition `file` is formatted with: its target's when it is a target's source, else its
     /// package's (the member whose directory holds it most closely); `None` when it is in no
     /// package, or does not exist (rustfmt then says so, as for any file it can't open).
-    fn edition_of(&mut self, file: &Path) -> anyhow::Result<Option<Edition>> {
+    fn edition_of(&mut self, file: &Path) -> Result<Option<Edition>, FmtError> {
         let Ok(file) = file.canonicalize() else {
             return Ok(None);
         };
@@ -148,16 +150,15 @@ impl Packages {
     }
 
     /// The members of the workspace `manifest` is in, each workspace read once.
-    fn members(&mut self, manifest: &Path) -> anyhow::Result<&[Member]> {
+    fn members(&mut self, manifest: &Path) -> Result<&[Member], FmtError> {
         let root = match self.roots.get(manifest) {
             Some(root) => root.clone(),
             None => {
-                let (root, members) = read_members(manifest).map_err(|error| {
-                    anyhow::anyhow!(
-                        "reading the workspace of {} for the edition of the files in it: {error:#}",
-                        manifest.display()
-                    )
-                })?;
+                let (root, members) =
+                    read_members(manifest).map_err(|error| FmtError::Workspace {
+                        manifest: manifest.to_owned(),
+                        error,
+                    })?;
                 self.roots.insert(manifest.to_owned(), root.clone());
                 self.read.entry(root.clone()).or_insert(members);
                 root
@@ -169,7 +170,7 @@ impl Packages {
 
 /// The root of the workspace `manifest` is in, and its members, as blaze-manifest reads them
 /// (what cargo-fmt reads from `cargo metadata --no-deps`).
-fn read_members(manifest: &Path) -> anyhow::Result<(PathBuf, Vec<Member>)> {
+fn read_members(manifest: &Path) -> Result<(PathBuf, Vec<Member>), ManifestError> {
     let ctx = Context::new(Config::from_process()?);
     let ws = Workspace::new(&root_manifest(Some(manifest), &ctx)?, &ctx)?;
     let canonical = |path: &Path| path.canonicalize().unwrap_or_else(|_| path.to_owned());

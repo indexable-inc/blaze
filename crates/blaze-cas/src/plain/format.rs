@@ -368,11 +368,11 @@ pub(crate) fn seal_parts<'p>(namespace: Namespace, run: &[u8], index_at: u64, pa
 }
 
 /// A whole segment of `namespace` holding `records` (each its key and tag, and its payload):
-/// the payloads in the order given, the index sorted by key, the first of a duplicate key kept
-/// (the rest dropped unread: one key names one value, rule 21, which the store's put and a
-/// push's comparison enforce), laid out into `out` (cleared first) by the store's one writer
-/// ([`seal_parts`]). What it wrote, described. A commit of the same puts, in the same order,
-/// writes the same bytes.
+/// the payloads and the index in key order, the first given of a duplicate key kept (the rest
+/// dropped unread: one key names one value, rule 21, which the store's put and a push's
+/// comparison enforce), laid out into `out` (cleared first) by the store's one writer
+/// ([`seal_parts`]). What it wrote, described. A commit of the same records, put in any order
+/// on any workers, writes the same bytes.
 ///
 /// A segment of zero records is valid: header, no payloads, an empty index at [`HEADER`], the
 /// footer (176 bytes); [`check_segment`] accepts it and reads no record from it.
@@ -382,9 +382,9 @@ pub fn seal_segment<A: core::alloc::Allocator>(namespace: Namespace, records: &[
     // Stable: of two records of one key the first given stays first, and is the one kept.
     order.sort_by(|a, b| records[*a].0.key.cmp(&records[*b].0.key));
     order.dedup_by(|b, a| records[*a].0.key == records[*b].0.key);
-    // The payloads lie in the order given.
-    let mut laid = order.clone();
-    laid.sort_unstable();
+    // The payloads lie in key order, as a commit lays them: the bytes are the records', not
+    // the order they came in (rule 25).
+    let laid = order;
     let mut entries: Vec<Entry, Global> = Vec::with_capacity_in(laid.len(), Global);
     let mut at = HEADER as u64;
     for &i in &laid {

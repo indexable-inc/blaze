@@ -15,7 +15,7 @@ use std::{
 use blaze_format::Spans;
 use blaze_ids::{ContentId, radix};
 use blaze_mem::scratch::{self, Scratch};
-use stdx::{always, itertools::Itertools};
+use stdx::always;
 
 use crate::{
     EditionedFileId, ErasedFileAstId, ROOT_ERASED_FILE_AST_ID, Span, SyntaxContext, TextRange,
@@ -271,7 +271,7 @@ impl<A: Allocator + Clone> SpanMap<A> {
     /// fragments. The columns keep their capacity: a map that is kept is copied out at its
     /// length ([`SpanMap::copy_in`]).
     pub fn finish(&mut self) {
-        always!(self.ends.iter().array_windows().all(|[a, b]| a < b), "spans are not in order");
+        always!(self.ends.windows(2).all(|pair| pair[0] < pair[1]), "spans are not in order");
         self.sort_fragments();
     }
 

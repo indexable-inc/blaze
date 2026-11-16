@@ -1,4 +1,4 @@
-use expect_test::expect;
+use test_utils::expect;
 
 use crate::TopEntryPoint;
 
@@ -355,7 +355,7 @@ fn a_parse_allocates_its_buffers_not_per_token() {
 }
 
 #[track_caller]
-fn check(entry: TopEntryPoint, input: &str, expect: &expect_test::Expect) {
+fn check(entry: TopEntryPoint, input: &str, expect: &test_utils::Expect) {
     let (parsed, _errors) = super::parse(entry, input, crate::Edition::CURRENT);
     expect.assert_eq(&parsed)
 }

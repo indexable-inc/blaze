@@ -6,7 +6,7 @@
 use std::fmt::{self, Write as _};
 use std::path::{Path, PathBuf};
 
-use expect_test::expect_file;
+use test_utils::expect_file;
 use syntax::view::{self as ra, AstNode};
 
 use super::{DelimIndex, Lower};

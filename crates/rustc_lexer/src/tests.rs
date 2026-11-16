@@ -1,4 +1,4 @@
-use expect_test::{Expect, expect};
+use test_utils::{Expect, expect};
 
 use super::*;
 

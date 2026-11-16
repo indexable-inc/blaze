@@ -344,8 +344,22 @@ impl<A: Allocator> fmt::Debug for String<A> {
 }
 
 impl<A: Allocator + Clone> Clone for String<A> {
+    /// Allocates from the collection's own allocator: prefer `clone_in`.
     fn clone(&self) -> String<A> {
         String { bytes: self.bytes.clone() }
+    }
+}
+
+impl<A: Allocator> String<A> {
+    /// A copy of the text in another allocator, room for exactly its length.
+    pub fn try_clone_in<B: Allocator>(&self, alloc: B) -> Result<String<B>, AllocFailure> {
+        String::try_from_str_in(self.as_str(), alloc)
+    }
+
+    /// [`String::try_clone_in`], panicking with the [`AllocFailure`].
+    #[track_caller]
+    pub fn clone_in<B: Allocator>(&self, alloc: B) -> String<B> {
+        String::from_str_in(self.as_str(), alloc)
     }
 }
 

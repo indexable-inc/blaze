@@ -34,7 +34,6 @@ use syntax::{
         RangeItem, SlicePatComponents, Typed,
     },
 };
-use thin_vec::ThinVec;
 use tt::TextRange;
 
 use crate::{
@@ -670,7 +669,7 @@ pub struct ExprCollector<'db> {
 
     is_lowering_coroutine: bool,
 
-    for_type_binder: Option<ThinVec<Name>>,
+    for_type_binder: Option<Vec<Name>>,
 
     /// While an impl's header is lowered, how many lifetimes it has left out so far (`&T`,
     /// `'_`): each is a fresh early-bound lifetime parameter of the impl, as rustc's resolver
@@ -1778,18 +1777,18 @@ impl<'db> ExprCollector<'db> {
         self.store.paths_mut().push_names(names)
     }
 
-    fn lower_for_binder_opt(&mut self, binder: Option<ForBinder<'_>>) -> ThinVec<Name> {
+    fn lower_for_binder_opt(&mut self, binder: Option<ForBinder<'_>>) -> Vec<Name> {
         binder.map(|b| self.lower_for_binder(b)).unwrap_or_default()
     }
 
-    fn lower_for_binder(&mut self, binder: ForBinder<'_>) -> ThinVec<Name> {
+    fn lower_for_binder(&mut self, binder: ForBinder<'_>) -> Vec<Name> {
         match binder.generic_param_list() {
             Some(gpl) => gpl
                 .lifetime_params()
                 .flat_map(|lp| lp.lifetime().map(|lt| self.binder_lifetime_name(lt)))
                 // alloc: a `for<..>` type's binder, once per one written, kept by `FnType.binder`.
                 .collect(),
-            None => ThinVec::default(),
+            None => Vec::new(),
         }
     }
 

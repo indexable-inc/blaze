@@ -1712,6 +1712,55 @@ with its path, or put on the trusted list with a reason.
 - **No default for a cost or a guarantee** (the second rule); a policy that changes an effect
   is a function of its own.
 
+## What Rust's std got wrong, and what bstd does
+
+Andrew, 2026-11-15 20:54: "anything rust or rust stdlib got wrong? maybe try to fix these in our
+own std library (also consider things LLMs do that are explicit that could make non
+traditional code that can be optimized a lot)". std cannot change these: it is one library
+for every edition. bstd can. Status is as of that evening.
+
+| std's choice | what it costs | bstd | status |
+|---|---|---|---|
+| Ambient authority: any code opens files, sockets, the clock, the environment | nothing can be sandboxed, simulated or audited | capabilities handed to `main` | built |
+| A hidden global heap; `String` and most collections take no allocator | every byte unowned; no task memory | the allocator is named at every allocation | built for the new crates |
+| Allocation failure aborts the process | one big build kills the tool | `try_` forms; a failure fails one task | written; `every_failure` tests |
+| `Drop` cannot fail, take an argument, or be required | an unflushed writer loses data silently | values that must be finished | linear under blaze; a debug stop under rustc |
+| `Clone` is one word for a bit copy, a count bump and a deep copy | hidden allocation; 3,347 `// clone:` comments in this tree | `share()`, `clone_in(alloc)` | being added |
+| `as` converts silently; overflow wraps in release and stops in debug | 16,104 bare casts here | named conversions (`blaze-int`); checks by crate | written; ratchet |
+| Thread-locals are statics; `Mutex` poisons | hidden per-thread state, 233 `thread_local!` here | `PerWorker<T>`, a value; ranked locks | being built with the threaded layout |
+| `async`: `Pin`, wakers, cancellation by drop | cancel-safety bugs; no structure | tasks in scopes with deadlines | one thread built; many being built |
+| `fmt`: every `{}` goes through `fmt::Arguments` and `dyn Write`; `format!` allocates | slow, large, opaque to the optimizer | typed writers straight into a string (`push_u64`, `push_hex`, `Show`) | to build |
+| `Hash` feeds a `Hasher` field by field; SipHash with a random seed | slow hashing; map order differs per run | fixed seed (built); one hash of a flat value's bytes | to build |
+| `FromStr` cannot borrow from its input; `?` converts errors through `From` unseen | forced copies; hidden code at every `?` | `Parse<'a>`; conversions written out | to build |
+| `usize` for every index and length; any `usize` indexes any slice | twice the index memory; wrong-table bugs | typed 32-bit ids (built); an index type per table | partly |
+| Closures have no name | a task cannot be stored, keyed, sent to another machine or cached | a job is a function and a flat value of arguments (`Eval`) | designed |
+| Iterator adaptors are free only after heavy inlining | slow in a fast tier that does not inline | whole-slice and batch methods first; plain loops in hot code | to do |
+| Everything generic by default | each use compiles again | a concrete core under a thin generic shell; the allocator as a value, not a type parameter | to decide |
+| `println!` locks and flushes per line | slow tools | `Out` with a buffer the caller owns | built |
+| `Path`, `OsString`, `CStr`: one idea, six types | conversions and lossy fallbacks | typed names | built |
+
+### What an author that does not tire can write
+
+Much of Rust's library design buys brevity for a person typing. When the author is a model,
+length is free and the explicit form is the better one, because the compiler can see more:
+
+- **Facts stated once, used many times.** A contract on a function (`requires i < len`), a
+  proof-carrying index, a `Verified` view: the check moves to one place and every later use is
+  unchecked without `unsafe` at the use (rule 74).
+- **Effects on every function** (`pure`, `nonblocking`, `nopanic`, `noalloc`; bstd has 127
+  `pure` already): a pure function is cacheable by its code identity, reorderable and safe to
+  run in parallel, and a `nopanic` one needs no unwinding tables.
+- **Data laid out by hand**: columns instead of rows, 32-bit ids instead of pointers, batches
+  instead of one item per call, sizes counted before filling so nothing reallocates.
+- **Machines instead of sugar**: a state machine the simulation can replay, where a person
+  would have written `async`; an error set per function, where a person would have boxed.
+- **Specialized code where it pays**: a table for one key type instead of a generic map, a
+  hot path written out, because writing it twice costs nothing.
+- **Advice from the running program.** The run already counts calls and can see sizes and
+  types at hot call sites; the compiler knows which generic was made how many times and which
+  bounds checks it could not remove. Each is a finding record (rule 81) an agent can act on:
+  blaze tells the author where the explicit form would pay. Not built.
+
 ## Prior art
 
 cap-std and WASI preopens (directories with no ambient authority), Zig's `std.Io` (IO passed

@@ -197,7 +197,7 @@ fn is_text(k: SyntaxKind) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use expect_test::{Expect, expect};
+    use test_utils::{Expect, expect};
 
     fn check_pretty(#[rust_analyzer::rust_fixture] ra_fixture: &str, expect: &Expect) {
         let ra_fixture = stdx::trim_indent(ra_fixture);

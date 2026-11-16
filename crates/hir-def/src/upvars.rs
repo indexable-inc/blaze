@@ -281,7 +281,7 @@ impl StoreVisitor for UpvarsMentionedVisitor<'_, '_> {
 
 #[cfg(test)]
 mod tests {
-    use expect_test::{Expect, expect};
+    use test_utils::{Expect, expect};
     use hir_expand::fixture;
     use stdx::iter::IterExt;
     use span::Edition;

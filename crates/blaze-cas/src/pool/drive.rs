@@ -321,7 +321,7 @@ impl<G: Give + Send + Sync + 'static> Loader<G> {
     fn load(&self, load: Load) -> Result<(), LoadFailure> {
         // The miss, named: its pages and bytes are its fields, its time the span's.
         let bytes = u64::from(load.pages) * super::PAGE;
-        let span = tracing::info_span!(
+        let span = blaze_trace::info_span!(
             target: "blaze",
             "store pool load",
             first = load.first,
@@ -369,7 +369,7 @@ impl<G: Give + Send + Sync + 'static> Drop for Loader<G> {
         if let Some(thread) = self.thread.take() {
             let joined = wait(WaitOn::Channel("store pool loader ends its reads"), None, || thread.join());
             if joined.is_err() {
-                tracing::error!("the store pool's loader thread panicked");
+                blaze_trace::error!("the store pool's loader thread panicked");
             }
         }
     }

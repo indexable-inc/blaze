@@ -4,7 +4,7 @@ use std::ops::Deref;
 
 use crate::ast::{self, FnRetTy, Mutability, Term};
 use crate::span::{BytePos, Pos, Span, symbol::kw};
-use tracing::debug;
+use blaze_trace::debug;
 
 use crate::comment::{combine_strs_with_missing_comments, contains_comment};
 use crate::config::lists::*;

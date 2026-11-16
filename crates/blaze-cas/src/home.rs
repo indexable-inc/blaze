@@ -63,11 +63,11 @@ enum Step {
     Wanted,
     /// The file's and `placed/`'s syncs asked as `round`: `left` still in flight, `failed`
     /// the first that failed. `span`, the home's, open until its records moved or it gave up.
-    Syncing { round: u64, left: u8, failed: Option<String>, span: tracing::Span },
+    Syncing { round: u64, left: u8, failed: Option<String>, span: blaze_trace::Span },
     /// Synced; its mapping asked as `round`.
-    Mapping { round: u64, span: tracing::Span },
+    Mapping { round: u64, span: blaze_trace::Span },
     /// Mapped: its records move once each is in a pack and no commit is in flight.
-    Mapped { mapping: Mapping, span: tracing::Span },
+    Mapped { mapping: Mapping, span: blaze_trace::Span },
 }
 
 impl Store {
@@ -366,12 +366,12 @@ impl Store {
 
 /// The span of one home, from its syncs' ask to its records' move: no parent, since it ends
 /// on a later completion under whatever request is current then, and none waits for it.
-fn home_span(content: &ContentId) -> tracing::Span {
-    tracing::info_span!(
+fn home_span(content: &ContentId) -> blaze_trace::Span {
+    blaze_trace::info_span!(
         target: "blaze",
         parent: None,
         "placed file made its value's home",
         content = %format_args!("{content:x}"),
-        moved = tracing::field::Empty,
+        moved = blaze_trace::field::Empty,
     )
 }

@@ -8,7 +8,7 @@ use span::Span;
 use std::alloc::Global;
 use stdx::never;
 use syntax_bridge::DocCommentDesugarMode;
-use tracing::debug;
+use blaze_trace::debug;
 
 use crate::{
     ExpandError, ExpandErrorKind, ExpandResult,
@@ -1243,7 +1243,6 @@ pub(super) fn partial_ord_expand(
 /// they read it in place. Their parse is `editor.rs`' handle parse.
 pub(super) mod handle {
     use blaze_mem::Frame;
-    use smallvec::SmallVec;
     use span::Span;
     use syntax::ast::{self, AstNode, FieldList, HasAttrs, HasName};
     use syntax_bridge::DocCommentDesugarMode;

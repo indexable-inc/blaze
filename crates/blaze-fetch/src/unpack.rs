@@ -1,8 +1,12 @@
 //! blaze's one checked unpacker of a tar stream into a directory. A registry's `.crate`
 //! (blaze-registry's `download::unpack`, cargo's rules) and a pinned native input's archive
 //! (blaze-cargo's `serve::native`, read-only, links kept) both go through [`unpack`], each with
-//! its [`Rules`]. The caller decompresses, and bounds what it decompresses; this holds every
-//! entry to:
+//! its [`Rules`]. The caller decompresses, and bounds what it decompresses. The archive is read
+//! by blaze-tar's sans-IO [`blaze_tar::Reader`], fed the stream's bytes as they are read: it
+//! checks the format (headers, checksums, pax and GNU long names), refuses devices, FIFOs and
+//! sparse files, any path or link target that is absolute, has a `..`, a NUL or a `\`, and any
+//! symbolic link leaving the archive or a path through one, and holds files to the bounds
+//! below. On top of it, this holds every entry to:
 //!
 //! - one top directory, stripped: the one [`Rules::top`] names, or whichever the first entry is
 //!   under;
@@ -28,12 +32,15 @@
 //! by the disk, and the unpacking refused.
 
 use std::{
+    alloc::Global,
     collections::{BTreeMap, BTreeSet},
     fmt,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Component, Path},
 };
+
+use blaze_tar::{Event, Links, Reader};
 
 use crate::{
     digest::Blake3,
@@ -128,8 +135,9 @@ fn whole(why: impl Into<String>) -> UnpackRefused {
 }
 
 /// The tar stream `from` unpacked into `into`, a directory that is there (and no link), as the
-/// module says. The caller reads what is left of `from` after, if its format has a trailer.
-pub fn unpack(from: impl Read, into: &Path, rules: &Rules<'_>) -> Result<Unpacked, UnpackRefused> {
+/// module says. `from` is read a chunk at a time until the archive's end blocks, so what is
+/// left of it after may already be partly read.
+pub fn unpack(mut from: impl Read, into: &Path, rules: &Rules<'_>) -> Result<Unpacked, UnpackRefused> {
     match fs::symlink_metadata(into) {
         Ok(meta) if meta.is_dir() => {}
         Ok(_) => {
@@ -149,13 +157,77 @@ pub fn unpack(from: impl Read, into: &Path, rules: &Rules<'_>) -> Result<Unpacke
         links: Vec::new(),
         link_keys: BTreeSet::new(),
         buffer: vec![0; 1 << 16], // alloc: one copy buffer, once an archive
+        file: None,
     };
-    let mut archive = tar::Archive::new(from);
-    let read = |e: io::Error| whole(format!("reading the archive: {e}"));
-    for entry in archive.entries().map_err(read)? {
-        state.entry(entry.map_err(read)?)?;
+    let limits = blaze_tar::Limits {
+        // Saturated at the most a `u32` says: a caller's `usize::MAX` is no bound.
+        most_path: u32::try_from(rules.names.most_path).unwrap_or(u32::MAX),
+        // A pax header holds a path and a link target, each at most `most_path`, and a few
+        // short records (times, size).
+        most_meta: u32::try_from(rules.names.most_path.saturating_mul(2).saturating_add(1 << 16))
+            .unwrap_or(u32::MAX),
+        most_entry: rules.most_bytes,
+        most_total: rules.most_bytes,
+        // The reader counts metadata headers too: an entry has at most a pax header and a GNU
+        // long name and long link before it. `State` holds the entries themselves to the bound.
+        most_entries: u32::try_from(rules.most_entries.saturating_mul(4)).unwrap_or(u32::MAX),
+        links: if rules.links { Links::Inside } else { Links::Refuse },
+    };
+    let mut reader = Reader::new_in(limits, Global);
+    let refused = |e: blaze_tar::Error| whole(format!("reading the archive: {e}"));
+    let mut chunk = vec![0u8; 1 << 16]; // alloc: one read buffer, once an archive
+    let (mut at, mut have) = (0usize, 0usize);
+    loop {
+        if at == have {
+            have = read_some(&mut from, &mut chunk)?;
+            at = 0;
+            if have == 0 {
+                // The stream ended before the archive's end blocks.
+                reader.finish().map_err(refused)?;
+                return Err(whole("the archive's stream ended before its end blocks were read"));
+            }
+        }
+        let step = reader.step(&chunk[at..have]).map_err(refused)?;
+        at += step.consumed;
+        match step.event {
+            None => {}
+            Some(Event::End) => break,
+            Some(Event::Entry(entry)) => state.entry(&entry)?,
+            Some(Event::Data { bytes, last }) => state.data(bytes, last)?,
+        }
     }
     state.finish()
+}
+
+/// Some bytes of `from` into `chunk`; 0 at its end.
+fn read_some(from: &mut impl Read, chunk: &mut [u8]) -> Result<usize, UnpackRefused> {
+    loop {
+        match from.read(chunk) {
+            Ok(read) => return Ok(read),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(whole(format!("reading the archive: {e}"))),
+        }
+    }
+}
+
+/// A file being written as the reader hands out its bytes.
+struct Open {
+    path: String,
+    out: File,
+    hasher: blaze_ids::b3::Hasher,
+    len: u64,
+    size: u64,
+    exec: bool,
+    mode: u32,
+    mtime: u64,
+}
+
+/// What the reader's next bytes of a file are for.
+enum Current {
+    /// A file being written.
+    Write(Open),
+    /// A file left out ([`Rules::include`], [`Rules::skip`]): its bytes are read past.
+    Skip,
 }
 
 struct State<'r, 'a> {
@@ -175,6 +247,8 @@ struct State<'r, 'a> {
     /// Every link's key ([`Names::key`]), for [`State::stays_in`].
     link_keys: BTreeSet<String>,
     buffer: Vec<u8>,
+    /// The file whose bytes the reader hands out next, if its size is not 0.
+    file: Option<Current>,
 }
 
 /// The names an archive's entries take, held to [`NameRules`] as each comes, with no IO.
@@ -286,17 +360,6 @@ impl<'a> Names<'a> {
     }
 }
 
-/// Whether an entry is a directory: its type says so, or, as tar reads an old (pre-ustar) or
-/// GNU header, its name ends in `/` and it is no link.
-pub fn is_dir_entry(header: &tar::Header, name: &[u8]) -> bool {
-    let kind = header.entry_type();
-    kind.is_dir()
-        || (!kind.is_hard_link()
-            && !kind.is_symlink()
-            && header.as_ustar().is_none()
-            && name.ends_with(b"/"))
-}
-
 impl State<'_, '_> {
     /// Each directory of `dir` (a path under the root, or empty for the root) made, or checked
     /// to be one: never a link, as none is made before every directory is.
@@ -332,12 +395,12 @@ impl State<'_, '_> {
         path.rsplit_once('/').map_or("", |(parent, _)| parent)
     }
 
-    fn entry<R: Read>(&mut self, mut entry: tar::Entry<'_, R>) -> Result<(), UnpackRefused> {
-        let kind = entry.header().entry_type();
-        if kind.is_pax_global_extensions() {
-            return Ok(());
-        }
-        let is_dir = is_dir_entry(entry.header(), &entry.path_bytes());
+    /// An entry's header, as the reader hands it out; a file's bytes follow as [`State::data`].
+    fn entry(&mut self, entry: &blaze_tar::Entry<'_>) -> Result<(), UnpackRefused> {
+        let is_dir = entry.kind == blaze_tar::Kind::Dir;
+        let is_file = entry.kind == blaze_tar::Kind::File;
+        // A file's bytes come next: read past unless it is written below.
+        self.file = (is_file && entry.size > 0).then_some(Current::Skip);
         self.entries += 1;
         if self.entries > self.rules.most_entries {
             return Err(whole(format!(
@@ -345,15 +408,11 @@ impl State<'_, '_> {
                 self.rules.most_entries
             )));
         }
-        let name = entry.path_bytes().into_owned(); // alloc: an entry's name, once an entry
-        let Some(path) = self.names.under_top(&name)? else {
+        let Some(path) = self.names.under_top(entry.path.as_bytes())? else {
             if is_dir {
                 return Ok(());
             }
-            return Err(at(
-                &String::from_utf8_lossy(&name),
-                "is the top of the archive, and no directory",
-            ));
+            return Err(at(entry.path, "is the top of the archive, and no directory"));
         };
         if !(self.rules.include)(Path::new(&path)) {
             return Ok(());
@@ -361,8 +420,7 @@ impl State<'_, '_> {
         if path.rsplit('/').next().is_some_and(|it| self.rules.skip.contains(&it)) {
             return Ok(());
         }
-        let header_mode =
-            entry.header().mode().map_err(|e| at(&path, format!("has no mode: {e}")))?;
+        let header_mode = entry.mode;
         if is_dir {
             self.names.claim(&path, true)?;
             self.make_dirs(&path)?;
@@ -371,9 +429,9 @@ impl State<'_, '_> {
             }
             return Ok(());
         }
-        let is_file = kind.is_file() || kind == tar::EntryType::Continuous;
-        if !is_file && !(self.rules.links && (kind.is_hard_link() || kind.is_symlink())) {
-            return Err(at(&path, format!("is a {kind:?} entry, which this archive may not hold")));
+        // The reader refuses links under `Links::Refuse` already; held here too, by the rules.
+        if !is_file && !self.rules.links {
+            return Err(at(&path, "is a link, which this archive may not hold"));
         }
         let replaces = self.names.claim(&path, false)?;
         self.make_dirs(Self::parent(&path))?;
@@ -385,22 +443,18 @@ impl State<'_, '_> {
             self.out.remove(&path);
         }
         if is_file {
-            let size = entry.size();
+            let size = entry.size;
             self.add_bytes(size)?;
             let exec = header_mode & 0o111 != 0;
-            let mtime = entry.header().mtime().ok();
-            let (blake3, len) = self
-                .write_new(&dest, &mut (&mut entry).take(size), exec, header_mode, mtime)
-                .map_err(|e| at(&path, e))?;
-            if len != size {
-                return Err(at(&path, format!("ends after {len} of its {size} bytes")));
+            let out = self.create(&dest).map_err(|e| at(&path, e))?;
+            let hasher = blaze_ids::b3::Hasher::new();
+            let open = Open { path, out, hasher, len: 0, size, exec, mode: header_mode, mtime: entry.mtime };
+            match size {
+                0 => self.close(open)?,
+                _ => self.file = Some(Current::Write(open)),
             }
-            let kind = if exec { Kind::Exec } else { Kind::File };
-            self.out.insert(path.clone(), Entry { path, kind, blake3, len }); // clone: its key and its entry
-        } else if kind.is_hard_link() {
-            let target =
-                entry.link_name_bytes().ok_or_else(|| at(&path, "is a hard link to nothing"))?;
-            let Some(from) = self.names.under_top(&target)? else {
+        } else if let blaze_tar::Kind::HardLink { target } = entry.kind {
+            let Some(from) = self.names.under_top(target.as_bytes())? else {
                 return Err(at(&path, "is a hard link to the top directory"));
             };
             let source = self.names.spelled(&from).and_then(|it| self.out.get(it));
@@ -425,14 +479,40 @@ impl State<'_, '_> {
             }
             let kind = if exec { Kind::Exec } else { Kind::File };
             self.out.insert(path.clone(), Entry { path, kind, blake3, len }); // clone: its key and its entry
-        } else {
-            let target =
-                entry.link_name_bytes().ok_or_else(|| at(&path, "is a link to nothing"))?;
-            let target = String::from_utf8(target.into_owned())
-                .map_err(|_| at(&path, "is a link whose target is not UTF-8"))?;
+        } else if let blaze_tar::Kind::Symlink { target, .. } = entry.kind {
             self.link_keys.insert(self.names.key(&path));
-            self.links.push((path, target));
+            self.links.push((path, target.to_owned())); // alloc: once a link
         }
+        Ok(())
+    }
+
+    /// The next bytes of the file whose entry came last; `last` on its final piece.
+    fn data(&mut self, bytes: &[u8], last: bool) -> Result<(), UnpackRefused> {
+        match &mut self.file {
+            None => return Err(whole("the archive reader handed out file bytes with no file before them")),
+            Some(Current::Skip) => {}
+            Some(Current::Write(open)) => {
+                open.hasher.update(bytes);
+                open.out.write_all(bytes).map_err(|e| at(&open.path, format!("can't be written: {e}")))?;
+                open.len += bytes.len() as u64;
+            }
+        }
+        if last && let Some(Current::Write(open)) = self.file.take() {
+            self.close(open)?;
+        }
+        Ok(())
+    }
+
+    /// `open`, all its bytes in, given its mode (and time) and listed.
+    fn close(&mut self, open: Open) -> Result<(), UnpackRefused> {
+        let Open { path, out, hasher, len, size, exec, mode, mtime } = open;
+        if len != size {
+            return Err(at(&path, format!("ends after {len} of its {size} bytes")));
+        }
+        self.seal(&out, exec, mode, Some(mtime)).map_err(|e| at(&path, e))?;
+        let kind = if exec { Kind::Exec } else { Kind::File };
+        let blake3 = Blake3(hasher.finalize());
+        self.out.insert(path.clone(), Entry { path, kind, blake3, len }); // clone: its key and its entry
         Ok(())
     }
 
@@ -457,8 +537,28 @@ impl State<'_, '_> {
         mode: u32,
         mtime: Option<u64>,
     ) -> Result<(Blake3, u64), String> {
+        let mut out = self.create(dest)?;
+        let mut hasher = blaze_ids::b3::Hasher::new();
+        let mut len = 0u64;
+        loop {
+            let read = match from.read(&mut self.buffer) {
+                Ok(0) => break,
+                Ok(it) => it,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(format!("can't be read from its source: {e}")),
+            };
+            hasher.update(&self.buffer[..read]);
+            out.write_all(&self.buffer[..read]).map_err(|e| format!("can't be written: {e}"))?;
+            len += read as u64;
+        }
+        self.seal(&out, exec, mode, mtime)?;
+        Ok((Blake3(hasher.finalize()), len))
+    }
+
+    /// `dest` made, a new file.
+    fn create(&self, dest: &Path) -> Result<File, String> {
         let open = || OpenOptions::new().write(true).create_new(true).open(dest);
-        let mut out = match open() {
+        let out = match open() {
             // Another spelling of one name on a case-insensitive disk (`README` and `readme` on
             // APFS), which names alone don't fold under these rules: the later replaces it, as
             // tar writes it.
@@ -472,22 +572,15 @@ impl State<'_, '_> {
             }
             opened => opened.map_err(|e| format!("can't be made: {e}"))?,
         };
-        let mut hasher = blaze_ids::b3::Hasher::new();
-        let mut len = 0u64;
-        loop {
-            let read = match from.read(&mut self.buffer) {
-                Ok(0) => break,
-                Ok(it) => it,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Err(e) => return Err(format!("can't be read from the archive: {e}")),
-            };
-            hasher.update(&self.buffer[..read]);
-            out.write_all(&self.buffer[..read]).map_err(|e| format!("can't be written: {e}"))?;
-            len += read as u64;
-        }
+        Ok(out)
+    }
+
+    /// `out`, all its bytes written, given its mode (and time) as [`Rules::modes`] says, and
+    /// synced when [`Rules::sync`].
+    fn seal(&self, out: &File, exec: bool, mode: u32, mtime: Option<u64>) -> Result<(), String> {
         match self.rules.modes {
             Modes::ReadOnly => {
-                out.set_permissions(read_only(&out, exec).map_err(|e| format!("has no mode: {e}"))?)
+                out.set_permissions(read_only(out, exec).map_err(|e| format!("has no mode: {e}"))?)
             }
             Modes::Cargo { mask } => {
                 if let Some(mtime) = mtime {
@@ -495,10 +588,10 @@ impl State<'_, '_> {
                         i64::try_from(mtime.max(1)).unwrap_or(i64::MAX),
                         0,
                     );
-                    filetime::set_file_handle_times(&out, Some(time), Some(time))
+                    filetime::set_file_handle_times(out, Some(time), Some(time))
                         .map_err(|e| format!("can't be given its time: {e}"))?;
                 }
-                masked(&out, mode, mask)
+                masked(out, mode, mask)
             }
         }
         .map_err(|e| format!("can't be given its mode: {e}"))?;
@@ -506,7 +599,7 @@ impl State<'_, '_> {
             // durable: only where the caller's rules ask (`rules.sync`): an unpacked tree whose mark will say it is whole
             out.sync_all().map_err(|e| format!("can't be synced: {e}"))?;
         }
-        Ok((Blake3(hasher.finalize()), len))
+        Ok(())
     }
 
     /// Where `target`, the link's at `path`, lands under the root when resolved from its
@@ -859,25 +952,38 @@ fn make_writable(dir: &Path) -> io::Result<()> {
 mod tests {
     use super::*;
 
-    /// A tar entry whose name and link target are written as given, with no check: what a
-    /// hostile archive holds, which `tar::Builder` would refuse to write.
-    fn raw(kind: tar::EntryType, name: &str, link: &str, data: &[u8]) -> (tar::Header, Vec<u8>) {
-        let mut header = tar::Header::new_old();
-        header.as_old_mut().name[..name.len()].copy_from_slice(name.as_bytes());
-        header.as_old_mut().linkname[..link.len()].copy_from_slice(link.as_bytes());
-        header.set_entry_type(kind);
-        header.set_size(data.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-        (header, data.to_vec())
+    const REGULAR: u8 = b'0';
+    const SYMLINK: u8 = b'2';
+    const DIRECTORY: u8 = b'5';
+
+    /// An old (pre-ustar) tar entry, its header and its bytes padded to a block, whose name and
+    /// link target are written as given, with no check: what a hostile archive holds, which
+    /// blaze-tar's writer would refuse to write.
+    fn raw(kind: u8, name: &str, link: &str, data: &[u8]) -> Vec<u8> {
+        let mut header = [0u8; 512];
+        header[..name.len()].copy_from_slice(name.as_bytes());
+        header[100..108].copy_from_slice(b"0000644\0");
+        header[108..116].copy_from_slice(b"0000000\0");
+        header[116..124].copy_from_slice(b"0000000\0");
+        header[124..136].copy_from_slice(format!("{:011o}\0", data.len()).as_bytes());
+        header[136..148].copy_from_slice(b"00000000000\0");
+        header[156] = kind;
+        header[157..157 + link.len()].copy_from_slice(link.as_bytes());
+        // The checksum is the bytes' sum with its own field as spaces.
+        header[148..156].copy_from_slice(b"        ");
+        let sum: u32 = header.iter().map(|&b| u32::from(b)).sum();
+        header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        let mut entry = header.to_vec();
+        entry.extend_from_slice(data);
+        entry.resize(entry.len().next_multiple_of(512), 0);
+        entry
     }
 
-    fn tar(entries: &[(tar::Header, Vec<u8>)]) -> Vec<u8> {
-        let mut tar = tar::Builder::new(Vec::new());
-        for (header, data) in entries {
-            tar.append(header, data.as_slice()).unwrap();
-        }
-        tar.into_inner().unwrap()
+    /// `entries` end to end, then the two zero blocks that end an archive.
+    fn tar(entries: &[Vec<u8>]) -> Vec<u8> {
+        let mut tar = entries.concat();
+        tar.resize(tar.len() + 1024, 0);
+        tar
     }
 
     fn every(_: &Path) -> bool {
@@ -911,54 +1017,53 @@ mod tests {
     #[cfg(unix)] // Its well-formed archive has a link, which only Unix lays out.
     #[test]
     fn unpack_refuses_paths_out_of_the_root() {
-        use tar::EntryType::{Directory, Regular, Symlink};
-        let ok = || raw(Regular, "top/bin/tool", "", b"ok");
-        let hostile: [(&str, Vec<(tar::Header, Vec<u8>)>); 11] = [
+        let ok = || raw(REGULAR, "top/bin/tool", "", b"ok");
+        let hostile: [(&str, Vec<Vec<u8>>); 11] = [
             (
                 "`..`",
-                vec![raw(Directory, "top/", "", b""), raw(Regular, "top/../escaped", "", b"x")],
+                vec![raw(DIRECTORY, "top/", "", b""), raw(REGULAR, "top/../escaped", "", b"x")],
             ),
-            ("absolute", vec![raw(Regular, "/blaze-nowhere/escaped", "", b"x")]),
-            ("link out", vec![ok(), raw(Symlink, "top/lib/out", "../../..", b"")]),
+            ("absolute", vec![raw(REGULAR, "/blaze-nowhere/escaped", "", b"x")]),
+            ("link out", vec![ok(), raw(SYMLINK, "top/lib/out", "../../..", b"")]),
             (
                 "link through a link",
                 vec![
                     ok(),
-                    raw(Symlink, "top/a/up", "..", b""),
-                    raw(Symlink, "top/b", "a/up/..", b""),
+                    raw(SYMLINK, "top/a/up", "..", b""),
+                    raw(SYMLINK, "top/b", "a/up/..", b""),
                 ],
             ),
             (
                 "link through a link in another case",
                 vec![
                     ok(),
-                    raw(Symlink, "top/d/up", "..", b""),
-                    raw(Symlink, "top/A", "D/up/D/up/../../../escaped", b""),
+                    raw(SYMLINK, "top/d/up", "..", b""),
+                    raw(SYMLINK, "top/A", "D/up/D/up/../../../escaped", b""),
                 ],
             ),
             (
                 "under a link",
-                vec![raw(Symlink, "top/l", ".", b""), raw(Regular, "top/l/x", "", b"x")],
+                vec![raw(SYMLINK, "top/l", ".", b""), raw(REGULAR, "top/l/x", "", b"x")],
             ),
             (
                 "one name in two cases",
-                vec![raw(Regular, "top/d/x", "", b"x"), raw(Symlink, "top/D", "..", b"")],
+                vec![raw(REGULAR, "top/d/x", "", b"x"), raw(SYMLINK, "top/D", "..", b"")],
             ),
             (
                 "the mark in another case",
-                vec![ok(), raw(Symlink, "top/.Blaze-Native", "bin/tool", b"")],
+                vec![ok(), raw(SYMLINK, "top/.Blaze-Native", "bin/tool", b"")],
             ),
             (
                 "`ſ` as `s`",
-                vec![raw(Regular, "top/s/x", "", b"x"), raw(Symlink, "top/\u{17f}", "..", b"")],
+                vec![raw(REGULAR, "top/s/x", "", b"x"), raw(SYMLINK, "top/\u{17f}", "..", b"")],
             ),
             (
                 "`ß` as `ss`",
-                vec![raw(Regular, "top/ss", "", b"x"), raw(Regular, "top/\u{df}", "", b"y")],
+                vec![raw(REGULAR, "top/ss", "", b"x"), raw(REGULAR, "top/\u{df}", "", b"y")],
             ),
             (
                 "`ﬀ` as `ff`",
-                vec![raw(Regular, "top/ff", "", b"x"), raw(Regular, "top/\u{fb00}", "", b"y")],
+                vec![raw(REGULAR, "top/ff", "", b"x"), raw(REGULAR, "top/\u{fb00}", "", b"y")],
             ),
         ];
         for (what, entries) in hostile {
@@ -974,7 +1079,7 @@ mod tests {
         let scratch = tempfile::tempdir().unwrap();
         let into = scratch.path().join("layout");
         fs::create_dir(&into).unwrap();
-        let fine = [ok(), raw(Symlink, "top/bin/alias", "tool", b"")];
+        let fine = [ok(), raw(SYMLINK, "top/bin/alias", "tool", b"")];
         let unpacked = unpack(tar(&fine).as_slice(), &into, &layout_rules()).unwrap();
         assert_eq!(fs::read(into.join("bin/alias")).unwrap(), b"ok");
         assert_eq!(first_difference(&walk(&into, &[], true).unwrap(), &unpacked.entries), None);

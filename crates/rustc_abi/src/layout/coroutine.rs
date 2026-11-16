@@ -24,7 +24,7 @@ use std::ops::Deref;
 
 use rustc_index::bit_set::{BitMatrix, DenseBitSet};
 use rustc_index::{Idx, IndexSlice, IndexVec};
-use tracing::{debug, trace};
+use blaze_trace::{debug, trace};
 
 use crate::{
     BackendRepr, FieldsShape, HasDataLayout, Integer, LayoutData, Primitive, ReprOptions, Scalar,

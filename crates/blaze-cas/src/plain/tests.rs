@@ -41,7 +41,7 @@ use blaze_ids::ContentId;
 use blaze_keyed::{
     exec::RecordRef,
     kind::{Namespace, Tag, Tier},
-    store::{ENTRY, FOOTER, HEADER, Located, Refused, SegmentId, SegmentLen, SegmentRef, Source, Statement, StoreError, Verifier},
+    store::{ENTRY, FOOTER, HEADER, Located, Put, Refused, SegmentId, SegmentLen, SegmentRef, Source, Statement, StoreError, Verifier},
 };
 use blaze_sim::{Config as SimConfig, Tape};
 
@@ -49,6 +49,7 @@ use super::{
     core::{Committed, Plain, PlainConfig, Plant, TAGS},
     driven::{Driven, LocalDir},
     format::{self, Entry, FORMAT, SEGMENT_FORMAT, Slot, check_segment, seal_segment},
+    handle::{LaneId, PlainStore},
 };
 use crate::Key;
 
@@ -2278,6 +2279,173 @@ fn the_oracle_catches_a_segment_marked_scrubbed_before_its_walk_ends() {
         }
     }
     assert!(caught.is_some(), "no seed of 16 caught a segment marked scrubbed before its walk ended");
+}
+
+/// A key every worker puts each round, with equal bytes.
+const SHARED: u32 = 900_000;
+
+/// A durable store over `sim` behind the handle, opened with `plant` at `boot`.
+fn handle(sim: Sim, n: u64, boot: u64, plant: Plant) -> PlainStore<Sim> {
+    PlainStore::new(Driven::planted(sim, Path::new("/sim"), cfg(n, boot, true), plant).expect("an open with no cut and no failure"))
+}
+
+/// One history of the lanes (store-next.md, "Puts on every worker"): `workers` lanes put into
+/// one handle, each round its own keys and one key all of them put with equal bytes, in an
+/// order the seed turns; a reader's lane that puts nothing looks before and after each
+/// commit; the power is cut once after `cut_after` completions, and the machine comes back
+/// at a new boot. The oracle: a record whose commit's flip landed (the commit returned, or
+/// the generation it flipped to is this process's) reads back after every cut; no record is
+/// seen by another lane before its commit's flip; each worker sees its own puts at once; the
+/// key every worker put is one record of equal bytes.
+fn lanes(seed: u64, workers: u32, rounds: u32, cut_after: Option<u32>, plant: Plant) -> Result<(), String> {
+    let mut boot = 1;
+    let mut store = handle(Sim::new(seed, Faults::default()), 1, boot, plant);
+    store.writer().cut_after(cut_after);
+    let mut promised: BTreeSet<u32> = BTreeSet::new();
+    let mut ids: Vec<LaneId> = (0..workers).map(|_| store.lane().expect("under the cap")).collect();
+    let mut reader = store.lane().expect("under the cap");
+    let mut cut = false;
+    for round in 0..rounds {
+        let mut put: Vec<u32> = Vec::new_in(Global);
+        for turn in 0..workers {
+            let w = (turn + round + seed as u32) % workers;
+            let lane = ids[w as usize];
+            let mut keys: Vec<u32> = (0..3).map(|i| w * 10_000 + round * 10 + i).collect();
+            keys.push(SHARED + round);
+            for n in keys {
+                let got = store.put_in(lane, key(n), Namespace::LOCAL, TAG, &value(n));
+                if !matches!(got, Ok(Put::Written | Put::Same)) {
+                    return Err(format!("worker {w}'s put of record {n}: {got:?}"));
+                }
+                if store.get(Some(lane), &key(n), Global).map(|it| it.1) != Some(value(n)) {
+                    return Err(format!("worker {w} does not see its own put of record {n}"));
+                }
+                put.push(n);
+            }
+        }
+        for &n in put.iter().filter(|n| !promised.contains(n)) {
+            if store.get(Some(reader), &key(n), Global).is_some() {
+                return Err(format!("record {n} seen by another lane before its commit's flip"));
+            }
+        }
+        let before = store.writer().core().generation();
+        match store.commit_lanes() {
+            Ok(_) => {
+                promised.extend(put.iter().copied());
+                for &n in &put {
+                    if store.get(Some(reader), &key(n), Global).map(|it| it.1) != Some(value(n)) {
+                        return Err(format!("record {n} not seen by another lane after its commit returned"));
+                    }
+                }
+            }
+            Err(why) if !cut && cut_after.is_some() => {
+                if store.writer().core().generation() > before {
+                    // The flip landed before the cut: what it names is promised.
+                    promised.extend(put.iter().copied());
+                }
+                let _ = why;
+                cut = true;
+                let mut sim = store.into_writer().into_driver();
+                sim.crash();
+                boot += 1;
+                store = handle(sim, 2, boot, plant);
+                ids = (0..workers).map(|_| store.lane().expect("under the cap")).collect();
+                reader = store.lane().expect("under the cap");
+                for &n in &promised {
+                    if store.get(None, &key(n), Global).map(|it| it.1) != Some(value(n)) {
+                        return Err(format!("record {n}, promised by a flip that landed, does not read back after the power cut"));
+                    }
+                }
+            }
+            Err(why) => return Err(format!("a commit failed with no cut: {why}")),
+        }
+    }
+    // Every promise kept after a last cut, and the shared keys one record each.
+    let mut sim = store.into_writer().into_driver();
+    sim.crash();
+    let last = handle(sim, 99, boot + 1, Plant::None);
+    for &n in &promised {
+        if last.get(None, &key(n), Global).map(|it| it.1) != Some(value(n)) {
+            return Err(format!("record {n}, promised, does not read back at the next boot"));
+        }
+    }
+    let writer = last.writer();
+    for id in writer.core().segments().iter().map(|it| it.0) {
+        let (row, bytes) = writer.core().segment(id).expect("named");
+        let Some(bytes) = bytes else { continue };
+        let run = row.run(bytes);
+        let mut seen = BTreeSet::new();
+        for i in 0..row.count as usize {
+            if !seen.insert(Entry::read(&run[i * ENTRY..(i + 1) * ENTRY]).key) {
+                return Err(format!("segment {id:016x} indexes one key twice"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The invariant of puts on every worker: lanes and a reader interleaved, a power cut
+/// anywhere in a commit: no promise is lost, nothing is seen before its flip, a worker sees
+/// its own puts, and workers that put one key with equal bytes converge on one record.
+#[test]
+fn lanes_put_with_no_shared_lock_and_keep_every_flip_s_promise() {
+    blaze_sim::check(SimConfig::DEFAULT, |tape| {
+        let seed = tape.next_u64("sim seed");
+        let workers = tape.int_in(1..=8u32, "workers");
+        let rounds = tape.int_in(1..=5u32, "rounds");
+        let cut = tape.int_in(0..=1u32, "power cut") == 1;
+        let after = tape.int_in(0..=200u32, "cut after");
+        let outcome = lanes(seed, workers, rounds, cut.then_some(after), Plant::None);
+        assert!(outcome.is_ok(), "seed {seed}, {workers} workers, {rounds} rounds, cut {cut} after {after}: {outcome:?}");
+    });
+}
+
+/// The control: index entries published (the flip) before the segment's bytes are durable;
+/// a cut between the two loses what the flip promised, and the oracle catches it.
+#[test]
+fn the_oracle_catches_a_lane_commit_flipped_before_its_bytes_are_durable() {
+    let mut caught = None;
+    for seed in 0..64u64 {
+        for after in [10u32, 20, 30, 40, 50, 60] {
+            let honest = lanes(seed, 4, 3, Some(after), Plant::None);
+            assert!(honest.is_ok(), "seed {seed}, cut after {after}, without the plant: {honest:?}");
+            if caught.is_none() {
+                caught = lanes(seed, 4, 3, Some(after), Plant::FlipBeforeSync).err();
+            }
+        }
+        if caught.is_some() {
+            break;
+        }
+    }
+    assert!(caught.is_some(), "no seed caught a flip before its segment's sync");
+}
+
+/// Rule 25 across workers: the same records, split over other lanes and put in another order,
+/// commit to a segment of equal bytes.
+#[test]
+fn two_builders_on_other_lanes_write_equal_segments() {
+    let bytes_of = |seed: u64, workers: u32, reversed: bool| -> Vec<u8> {
+        let store = handle(Sim::new(seed, Faults::default()), 1, 1, Plant::None);
+        let ids: Vec<LaneId> = (0..workers).map(|_| store.lane().expect("under the cap")).collect();
+        let mut keys: Vec<u32> = (0..40).collect();
+        if reversed {
+            keys.reverse();
+        }
+        for (i, n) in keys.into_iter().enumerate() {
+            let lane = ids[i % workers as usize];
+            store.put_in(lane, key(n), Namespace::LOCAL, TAG, &value(n)).expect("a put");
+            // A second worker puts some keys again, with equal bytes.
+            if n % 7 == 0 {
+                store.put_in(ids[(i + 1) % workers as usize], key(n), Namespace::LOCAL, TAG, &value(n)).expect("a put");
+            }
+        }
+        store.commit_lanes().expect("a commit");
+        let writer = store.writer();
+        let segments = writer.core().segments();
+        assert_eq!(segments.len(), 1, "one namespace, one segment");
+        writer.core().segment(segments[0].0).and_then(|it| it.1).expect("mapped").to_vec()
+    };
+    assert_eq!(bytes_of(1, 1, false), bytes_of(2, 5, true), "two builders of the same records wrote other bytes");
 }
 
 /// A run of `n` test keys, sorted.

@@ -62,7 +62,7 @@ use std::cmp::min;
 
 use crate::ast;
 use crate::span::{BytePos, Span, symbol};
-use tracing::debug;
+use blaze_trace::debug;
 
 use crate::comment::{CharClasses, FullCodeCharKind, RichChar, rewrite_comment};
 use crate::config::{IndentStyle, StyleEdition};

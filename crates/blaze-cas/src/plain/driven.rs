@@ -171,6 +171,9 @@ pub struct Driven<D: Driver = Native> {
     own: Vec<Completion>,
     /// Each mapped segment opened once more for `pread` ([`Driven::get_into`]), native only.
     files: BTreeMap<FileName, std::fs::File>,
+    /// The test's power cut: completions left before every run stops ([`Driven::cut_after`]).
+    #[cfg(test)]
+    cut: Option<u32>,
 }
 
 impl Driven<Native> {
@@ -244,30 +247,61 @@ impl Driven<Native> {
 impl<D: Driver> Driven<D> {
     /// The store `cfg` names, opened on `driver` (whose root is `root`).
     pub fn with(driver: D, root: &Path, cfg: PlainConfig) -> Result<Driven<D>, StoreError> {
-        let mut it = Driven {
+        Driven::with_core(driver, root, Plain::new(cfg))
+    }
+
+    /// [`Driven::with`], its store opened with `plant`.
+    #[cfg(test)]
+    pub(crate) fn planted(driver: D, root: &Path, cfg: PlainConfig, plant: super::core::Plant) -> Result<Driven<D>, StoreError> {
+        let mut it = Driven::bare(driver, root, Plain::planted(cfg, plant));
+        it.core.open(&mut it.effects);
+        it.opened()
+    }
+
+    /// A power cut after `left` more completions (`None`: none): every run from then on
+    /// stops, as if the process and the machine went down there.
+    #[cfg(test)]
+    pub(crate) fn cut_after(&mut self, left: Option<u32>) {
+        self.cut = left;
+    }
+
+    fn bare(driver: D, root: &Path, core: Plain) -> Driven<D> {
+        Driven {
             driver,
             root: root.to_owned(),
-            core: Plain::new(cfg),
+            core,
             effects: Vec::new_in(Global),
             done: Vec::new_in(Global),
             own: Vec::new_in(Global),
             files: BTreeMap::new(),
-        };
+            #[cfg(test)]
+            cut: None,
+        }
+    }
+
+    fn with_core(driver: D, root: &Path, core: Plain) -> Result<Driven<D>, StoreError> {
+        let mut it = Driven::bare(driver, root, core);
         it.core.open(&mut it.effects);
+        it.opened()
+    }
+
+    /// The open (asked already) run to its end and its report handed.
+    fn opened(mut self) -> Result<Driven<D>, StoreError> {
+        let it = &mut self;
         it.run("opening the plain store")?;
         if !it.core.ready() {
             // Its driver went idle first.
             return Err(StoreError::Unfinished { what: "an open" });
         }
         for lost in &it.core.report().lost {
-            tracing::warn!(target: "blaze_cas::plain", file = %lost.file, records = ?lost.records, "lost in a power cut: {}", lost.why);
+            blaze_trace::warn!(target: "blaze_cas::plain", file = %lost.file, records = ?lost.records, "lost in a power cut: {}", lost.why);
         }
         // Handed: this open returns with its report ([`Driven::report`]), so the marks of the
         // losses it names may be cleared by this process's next flip (or
         // [`Driven::acknowledge`]). An open that fails hands nothing, and the marks stay for
         // the next.
         it.core.handed();
-        Ok(it)
+        Ok(self)
     }
 
     /// One flip that clears the "lost, not yet reported" marks of the losses this open
@@ -283,7 +317,7 @@ impl<D: Driver> Driven<D> {
 
     /// Runs until nothing is in flight, the store's completions to it, the driver's own kept.
     fn run(&mut self, what: &'static str) -> Result<(), StoreError> {
-        let _span = tracing::info_span!("plain.wait", what).entered();
+        let _span = blaze_trace::info_span!("plain.wait", what).entered();
         let mut since = self.driver.now();
         loop {
             self.driver.submit(&mut self.effects);
@@ -299,6 +333,14 @@ impl<D: Driver> Driven<D> {
             }
             let wall = self.driver.wall_ns();
             for completion in self.done.drain(..) {
+                #[cfg(test)]
+                if let Some(left) = &mut self.cut {
+                    if *left == 0 {
+                        // The power cut: this completion and the rest reach nothing.
+                        return Err(StoreError::Unfinished { what: "a run the test's power cut stopped" });
+                    }
+                    *left -= 1;
+                }
                 if self.core.owns(completion.tag) {
                     self.core.complete(completion, wall, &mut self.effects);
                 } else {

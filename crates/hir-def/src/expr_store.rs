@@ -25,7 +25,6 @@ use smallvec::SmallVec;
 use span::{Edition, SyntaxContext};
 use std::alloc::Global;
 use syntax::{AstPtr, SyntaxNodePtr, ast};
-use thin_vec::ThinVec;
 
 use crate::{
     AdtId, BlockId, ExpressionStoreOwnerId, GenericDefId,
@@ -245,7 +244,7 @@ pub struct ExpressionStore {
     type_hygiene: Option<Box<[(TypeRefId, HygieneId)]>>,
     /// [`ExpressionStore::macro_calls`]: here rather than in `expr_only`, as a signature's
     /// type macros make a store with calls and no expressions.
-    macro_calls: ThinVec<MacroCallId>,
+    macro_calls: Box<[MacroCallId]>,
 }
 
 /// The body of an item (function, const etc.) while it is lowered. Its columns, forward maps,
@@ -1421,7 +1420,7 @@ impl ExpressionStoreBuilder {
                             pat_field_map_back,
                             template_map,
                             expansions,
-                            diagnostics: ThinVec::from_iter(diagnostics),
+                            diagnostics: Box::from_iter(diagnostics),
                         })
                     });
                 ExpressionStoreSourceMap {
@@ -1524,7 +1523,7 @@ impl ExpressionStoreBuilder {
         let type_hygiene =
             (!scratch.type_hygiene.is_empty()).then(|| Box::<[_]>::from(&scratch.type_hygiene[..]));
         // alloc: the column's one exact copy, only for a store that met a macro call.
-        let macro_calls = ThinVec::from_iter(scratch.macro_calls.iter().copied());
+        let macro_calls = Box::<[_]>::from(&scratch.macro_calls[..]);
         scratch.give();
         (ExpressionStore { expr_only, types, lifetimes, type_hygiene, macro_calls }, source_map)
     }
@@ -1608,7 +1607,7 @@ impl ExpressionStore {
             + types.heap_bytes()
             + crate::heap::arena_bytes(lifetimes)
             + type_hygiene.as_deref().map_or(0, size_of_val)
-            + crate::heap::thin_vec_bytes(macro_calls)
+            + size_of_val::<[MacroCallId]>(macro_calls)
     }
 
     /// The store with nothing in it. A `static` rather than a `const`: boxed columns can't be
@@ -1631,7 +1630,7 @@ impl ExpressionStore {
             types: TypeColumns::default(),
             lifetimes: Arena::new(),
             type_hygiene: None,
-            macro_calls: ThinVec::new(),
+            macro_calls: Box::default(),
         }
     }
 

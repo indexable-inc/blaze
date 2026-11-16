@@ -142,7 +142,7 @@ pub(crate) struct Job<'a, F> {
 /// Runs `job` with the front end over its universe, under a span naming it.
 pub(crate) fn run_task<F: Front>(job: &Job<'_, F>) -> Result<Made, TaskFailed> {
     let task = job.task;
-    let _span = tracing::info_span!(target: "blaze", "host: task", what = what_of(task), unit = unit_of(task)).entered();
+    let _span = blaze_trace::info_span!(target: "blaze", "host: task", what = what_of(task), unit = unit_of(task)).entered();
     let tables = tables(&job.sources, &job.made).map_err(Unanswerable::failed)?;
     let universe = Universe { asker: unit_of(task), tables: &tables, outside: job.late };
     match task {

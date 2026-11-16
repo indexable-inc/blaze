@@ -7,12 +7,18 @@
 //!
 //! Neither parks a thread: `core` has no way to, and each wait here is on a few instructions
 //! of another thread (an initializer that hashes or allocates once, a holder that probes and
-//! inserts). A waiter spins with [`core::hint::spin_loop`], and a wait of [`SPIN_BOUND`]
-//! rounds is a hang, a panic naming the cell (rule bounded-progress): far past any honest
-//! initializer or holder, and never reached by a thread that was only descheduled for a while.
+//! inserts). A waiter backs off ([`Backoff`]): [`core::hint::spin_loop`] in rounds that double
+//! up to [`SPIN_STEPS`], so 128 waiters on one lock do not all write its line the instant it is
+//! released, then the scheduler's yield, through the hook the embedder installs once
+//! ([`install`]; with none, more spinning). A wait past its bound is a hang, a [`Hang`] naming
+//! the cell (rule bounded-progress): [`SPIN_BOUND`] rounds, or with a [`Clock`] installed, a
+//! budget in the embedder's ticks.
 //!
-//! In a model build (`cfg(blaze_check)`) both are the model checker's, so a model explores
-//! their interleavings (docs/v2/plan/design/model-checker.md, "The switch").
+//! In a model build (`cfg(blaze_check)`) both cells are the model checker's, and a backoff
+//! round is its `spin_loop`, a yield to every other thread, so a model explores their
+//! interleavings (docs/v2/plan/design/model-checker.md, "The switch").
+
+use core::fmt;
 
 /// The atomics of the tables here: `core`'s, or the model checker's in a model build.
 #[cfg(not(blaze_check))]
@@ -25,9 +31,188 @@ pub use blaze_check::sync::atomic;
 #[cfg(blaze_check)]
 pub use blaze_check::sync::OnceLock as Once;
 
-/// Spin rounds after which a wait on a [`Once`] or a [`Spin`] is a hang: at 1 to 50 ns a
-/// round, between a minute and two days, where every holder here is done in microseconds.
-pub const SPIN_BOUND: u64 = 1 << 36;
+/// Backoff rounds after which a wait on a [`Once`] or a [`Spin`] is a hang, where no [`Clock`]
+/// is installed. Sized for holders done in microseconds (a probe and an insert, a hash or one
+/// allocation; never an O(n) copy, which `blaze-ids` keeps outside its lock) with up to 128
+/// waiters on one cell: a round past the first [`SPIN_STEPS`] is `1 << SPIN_STEPS` spins or
+/// one yield, 0.1 to 10 µs, so the bound is between two minutes and three hours of waiting,
+/// where a waiter behind 127 others each holding 10 µs waits about a millisecond.
+pub const SPIN_BOUND: u64 = 1 << 30;
+
+/// Doublings of a waiter's spin before it yields: rounds of 1, 2, 4 .. 64 spins.
+pub const SPIN_STEPS: u32 = 6;
+
+/// A clock in the embedder's ticks, and the budget of them a wait may take before it is a
+/// hang: the bound of a [`Backoff`] once one is installed, in place of [`SPIN_BOUND`] rounds.
+#[derive(Clone, Copy)]
+pub struct Clock {
+    /// The time now, in ticks that only increase.
+    pub now: fn() -> u64,
+    /// Ticks a wait may take.
+    pub budget: u64,
+    /// What a tick is (`"ns"`), for the [`Hang`]'s message.
+    pub unit: &'static str,
+}
+
+/// What a waiter does once spinning has not been enough, set once by the embedder (the
+/// scheduler, or a test's `std`): the bottom of the tree has no scheduler to name.
+pub struct Waiting {
+    /// Lets another thread run: the scheduler's yield, or `std::thread::yield_now`.
+    pub yield_now: fn(),
+    /// The bound of a wait in ticks; `None` keeps the bound of [`SPIN_BOUND`] rounds.
+    pub clock: Option<Clock>,
+}
+
+/// [`install`] was called before: the hook is set once, so no wait sees it change midway.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AlreadyInstalled;
+
+impl fmt::Display for AlreadyInstalled {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("the waiting hook of blaze_swiss::sync was installed before")
+    }
+}
+
+/// Sets what every [`Backoff`] does past its spin, once per process.
+pub fn install(waiting: &'static Waiting) -> Result<(), AlreadyInstalled> {
+    hook::install(waiting)
+}
+
+/// A wait that went past its bound: the cell it was on and how long it waited.
+#[derive(Clone, Copy, Debug)]
+pub struct Hang {
+    /// The cell's name (`"ids.sharded.claim"`).
+    pub cell: &'static str,
+    pub waited: Waited,
+}
+
+/// How long a [`Hang`] waited, in what its bound counts.
+#[derive(Clone, Copy, Debug)]
+pub enum Waited {
+    Rounds(u64),
+    Ticks { ticks: u64, unit: &'static str },
+}
+
+impl fmt::Display for Hang {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.waited {
+            Waited::Rounds(rounds) => write!(
+                f,
+                "the wait on {} went past {rounds} backoff rounds, sized for holders of \
+                 microseconds and 128 waiters: a hang",
+                self.cell
+            ),
+            Waited::Ticks { ticks, unit } => write!(
+                f,
+                "the wait on {} took {ticks} {unit}, past the installed budget sized for \
+                 holders of microseconds and 128 waiters: a hang",
+                self.cell
+            ),
+        }
+    }
+}
+
+/// One waiter's backoff on one cell: call [`Backoff::snooze`] once per failed look.
+pub struct Backoff {
+    cell: &'static str,
+    rounds: u64,
+    /// When the yields began, in the installed clock's ticks.
+    since: Option<u64>,
+}
+
+impl Backoff {
+    pub const fn new(cell: &'static str) -> Backoff {
+        Backoff { cell, rounds: 0, since: None }
+    }
+
+    /// Waits one round: `1 << round` spins for the first [`SPIN_STEPS`] rounds, then the
+    /// installed yield (or `1 << SPIN_STEPS` spins). Panics with a [`Hang`] past the bound.
+    #[inline]
+    pub fn snooze(&mut self) {
+        self.rounds += 1;
+        if self.rounds <= u64::from(SPIN_STEPS) {
+            for _ in 0..1_u32 << (self.rounds - 1) {
+                spin_loop();
+            }
+            return;
+        }
+        self.yield_round();
+    }
+
+    #[cold]
+    fn yield_round(&mut self) {
+        let waiting = hook::installed();
+        match waiting.and_then(|it| it.clock) {
+            Some(clock) => {
+                let now = (clock.now)();
+                let since = *self.since.get_or_insert(now);
+                let ticks = now.saturating_sub(since);
+                if ticks > clock.budget {
+                    let waited = Waited::Ticks { ticks, unit: clock.unit };
+                    panic!("{}", Hang { cell: self.cell, waited });
+                }
+            }
+            None => {
+                if self.rounds >= SPIN_BOUND {
+                    panic!("{}", Hang { cell: self.cell, waited: Waited::Rounds(self.rounds) });
+                }
+            }
+        }
+        match waiting {
+            // A model build's spin is already a yield to every other thread.
+            Some(waiting) if !cfg!(blaze_check) => (waiting.yield_now)(),
+            _ => {
+                for _ in 0..1_u32 << SPIN_STEPS {
+                    spin_loop();
+                }
+            }
+        }
+    }
+}
+
+/// `core`'s spin hint, or the model checker's, which yields to every other thread.
+#[inline]
+fn spin_loop() {
+    #[cfg(not(blaze_check))]
+    core::hint::spin_loop();
+    #[cfg(blaze_check)]
+    blaze_check::hint::spin_loop();
+}
+
+#[allow(unsafe_code, reason = "the hook is a `&'static` kept as a pointer, read back as one")]
+mod hook {
+    use core::{
+        ptr,
+        sync::atomic::{AtomicPtr, Ordering},
+    };
+
+    use super::{AlreadyInstalled, Waiting};
+
+    /// `core`'s atomic in a model build too: the hook is set before any model runs, and its
+    /// interleavings are not the model's.
+    static WAITING: AtomicPtr<Waiting> = AtomicPtr::new(ptr::null_mut());
+
+    pub(super) fn install(waiting: &'static Waiting) -> Result<(), AlreadyInstalled> {
+        // Release: a waiter that loads the pointer sees the hook's fields.
+        WAITING
+            .compare_exchange(
+                ptr::null_mut(),
+                ptr::from_ref(waiting).cast_mut(),
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .map(|_| ())
+            .map_err(|_| AlreadyInstalled)
+    }
+
+    pub(super) fn installed() -> Option<&'static Waiting> {
+        // Acquire: pairs with `install`'s release.
+        let at = WAITING.load(Ordering::Acquire);
+        // SAFETY: the pointer is null or was stored from a `&'static Waiting`, and nothing
+        // writes through it: a shared borrow of it lives as long as the program.
+        unsafe { at.as_ref() }
+    }
+}
 
 #[cfg(not(blaze_check))]
 pub use own::{Once, Spin, SpinGuard};
@@ -44,13 +229,12 @@ mod own {
     use core::{
         cell::UnsafeCell,
         fmt,
-        hint::spin_loop,
         mem::MaybeUninit,
         ops::{Deref, DerefMut},
         sync::atomic::{AtomicBool, AtomicU8, Ordering},
     };
 
-    use super::SPIN_BOUND;
+    use super::Backoff;
 
     /// Nothing written, nobody writing.
     const EMPTY: u8 = 0;
@@ -60,8 +244,8 @@ mod own {
     const READY: u8 = 2;
 
     /// A value written at most once, then read by any thread with one acquire load: std's
-    /// `OnceLock` on `core` alone. A thread that asks while another writes spins until it is
-    /// done; an initializer that panics leaves the cell empty, and the next ask writes it.
+    /// `OnceLock` on `core` alone. A thread that asks while another writes backs off until it
+    /// is done; an initializer that panics leaves the cell empty, and the next ask writes it.
     pub struct Once<T> {
         state: AtomicU8,
         value: UnsafeCell<MaybeUninit<T>>,
@@ -158,7 +342,7 @@ mod own {
         /// The right to write the value, or `None` once another thread has written it: waits
         /// out a thread that is writing it now.
         fn claim(&self) -> Option<Claim<'_, T>> {
-            let mut rounds = 0_u64;
+            let mut backoff = Backoff::new("a once-cell's initializer");
             loop {
                 // Acquire on success: a claim after a panicked one sees its `EMPTY`; on
                 // failure, a `READY` seen here orders the value before our read of it.
@@ -170,14 +354,7 @@ mod own {
                 ) {
                     Ok(_) => return Some(Claim { cell: self }),
                     Err(READY) => return None,
-                    Err(_) => {
-                        rounds += 1;
-                        assert!(
-                            rounds < SPIN_BOUND,
-                            "a once-cell's initializer ran past {SPIN_BOUND} spin rounds: a hang"
-                        );
-                        spin_loop();
-                    }
+                    Err(_) => backoff.snooze(),
                 }
             }
         }
@@ -194,9 +371,11 @@ mod own {
 
     /// A lock named for what it guards (`"ids.sharded.claim"`), held for a few instructions:
     /// the API of `blaze_core::lock::Lock` that the bottom of the tree uses, on one atomic
-    /// flag. A waiter spins on a read of the flag, so it writes the holder's line only once the
-    /// lock is free. A holder that panics releases it with its value as its last write left
-    /// it: there is no poisoning, as in `parking_lot`'s lock.
+    /// flag. A waiter reads the flag between [`Backoff`] rounds, so it writes the holder's line
+    /// only once the lock is free, and waiters that missed one release try again at spread-out
+    /// times. Unfair: a waiter may be passed by later ones, so the bound, not an order, says
+    /// when a wait is a hang. A holder that panics releases it with its value as its last write
+    /// left it: there is no poisoning, as in `parking_lot`'s lock.
     pub struct Spin<T> {
         name: &'static str,
         held: AtomicBool,
@@ -217,20 +396,26 @@ mod own {
         /// The guard, once no other thread holds one.
         #[inline]
         pub fn lock(&self) -> SpinGuard<'_, T> {
-            let mut rounds = 0_u64;
             // Acquire: the last holder's writes to the value, released by its unlock.
-            while self.held.swap(true, Ordering::Acquire) {
-                while self.held.load(Ordering::Relaxed) {
-                    rounds += 1;
-                    assert!(
-                        rounds < SPIN_BOUND,
-                        "the lock {} was held past {SPIN_BOUND} spin rounds: a hang",
-                        self.name
-                    );
-                    spin_loop();
-                }
+            if !self.held.swap(true, Ordering::Acquire) {
+                return SpinGuard { lock: self };
             }
-            SpinGuard { lock: self }
+            self.lock_contended()
+        }
+
+        #[cold]
+        fn lock_contended(&self) -> SpinGuard<'_, T> {
+            let mut backoff = Backoff::new(self.name);
+            loop {
+                while self.held.load(Ordering::Relaxed) {
+                    backoff.snooze();
+                }
+                // Acquire: as in `lock`.
+                if !self.held.swap(true, Ordering::Acquire) {
+                    return SpinGuard { lock: self };
+                }
+                backoff.snooze();
+            }
         }
     }
 

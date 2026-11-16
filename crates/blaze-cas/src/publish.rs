@@ -295,7 +295,7 @@ pub(crate) struct Writing {
     /// The cut is made and its runs are at their writes (or it has none).
     cut: bool,
     /// The prewarm of the clone is in flight ([`Step::Warm`]), with its span.
-    warming: Option<tracing::Span>,
+    warming: Option<blaze_trace::Span>,
     /// The bytes its runs wrote.
     wrote: u64,
     /// The data bytes the kernel copied of the path's file ([`Base::Copy`]).
@@ -307,7 +307,7 @@ pub(crate) struct Writing {
     looked: Option<Stamp>,
     /// The step in flight, open from its effects asked to the last of their completions
     /// (slow-is-p0-traced): never entered, as the place's own span is not.
-    span: tracing::Span,
+    span: blaze_trace::Span,
     /// The planted bug of `tests::the_rename_waits_for_the_prewarm`: the rename is asked as
     /// the writes end, whatever the prewarm.
     #[cfg(test)]
@@ -410,8 +410,8 @@ pub(crate) enum Next {
 /// The span of one step of a [`Writing`] of `to`: `function` says which step, `bytes` what its
 /// writes carry. No parent: it is opened under whatever completion asked its effects and
 /// ends under another, as the place's own span does.
-fn step_span(to: &FileName, step: &'static str, bytes: u64) -> tracing::Span {
-    tracing::info_span!(target: "blaze", parent: None, "place step", function = step, %to, bytes)
+fn step_span(to: &FileName, step: &'static str, bytes: u64) -> blaze_trace::Span {
+    blaze_trace::info_span!(target: "blaze", parent: None, "place step", function = step, %to, bytes)
 }
 
 impl Writing {

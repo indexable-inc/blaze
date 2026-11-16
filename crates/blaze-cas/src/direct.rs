@@ -1519,13 +1519,13 @@ impl Direct {
         }
         let mut to_map = std::mem::take(&mut self.to_map);
         let first = to_map.first().map(|it| it.file.clone()); // clone: a refcount, for the span
-        let span = tracing::info_span!(
+        let span = blaze_trace::info_span!(
             target: "blaze",
             "store direct maps",
             files = to_map.len() as u64,
             asked = to_map.iter().filter(|it| it.slot.is_some()).count() as u64,
             file = first.as_ref().map(FileName::as_str),
-            bytes = tracing::field::Empty,
+            bytes = blaze_trace::field::Empty,
         );
         let _in = span.enter();
         let mut stalled = None;
@@ -1589,7 +1589,7 @@ impl Direct {
             let Some(miss) = missed else { continue };
             match ask.slot {
                 Some(slot) => self.unmapped.push((slot, miss)),
-                None => tracing::warn!(
+                None => blaze_trace::warn!(
                     target: "blaze",
                     file = ask.file.as_str(),
                     why = %miss,
@@ -2326,7 +2326,7 @@ impl Direct {
         most(&mut self.counts.widest_reads, &WIDEST_READS, self.plan.parts());
         // A device read's span: how many reads at once, the blocks and bytes they read, and
         // the records they were for.
-        let span = tracing::info_span!(
+        let span = blaze_trace::info_span!(
             target: "blaze",
             "store direct reads",
             reads = self.plan.parts(),

@@ -45,10 +45,10 @@ macro_rules! body_span {
         $crate::span_names::of_body(
             $db,
             $def,
-            ::tracing::info_span!(
+            ::blaze_trace::info_span!(
                 $name,
-                krate = ::tracing::field::Empty,
-                function = ::tracing::field::Empty
+                krate = ::blaze_trace::field::Empty,
+                function = ::blaze_trace::field::Empty
             ),
         )
     };
@@ -56,7 +56,7 @@ macro_rules! body_span {
 
 /// `span` with `def`'s crate and path written in it, if a subscriber records it. The span
 /// declares the fields `krate` and `function`.
-pub fn of_body(db: &Db, def: DefWithBodyId, span: tracing::Span) -> tracing::Span {
+pub fn of_body(db: &Db, def: DefWithBodyId, span: blaze_trace::Span) -> blaze_trace::Span {
     if !span.is_disabled() {
         name(db, def.krate(db), &span, |text| write_body_path(db, def, text));
     }
@@ -70,9 +70,9 @@ pub fn of_body(db: &Db, def: DefWithBodyId, span: tracing::Span) -> tracing::Spa
 pub fn of_body_then(
     db: &Db,
     def: DefWithBodyId,
-    span: tracing::Span,
+    span: blaze_trace::Span,
     then: impl FnOnce(&mut String),
-) -> tracing::Span {
+) -> blaze_trace::Span {
     if !span.is_disabled() {
         name(db, def.krate(db), &span, |text| {
             write_body_path(db, def, text);
@@ -113,8 +113,8 @@ pub fn of_inner(
     owner: ExpressionStoreOwnerId,
     expr: ExprId,
     inner: InnerBody,
-    span: tracing::Span,
-) -> tracing::Span {
+    span: blaze_trace::Span,
+) -> blaze_trace::Span {
     if !span.is_disabled() {
         name(db, owner.krate(db), &span, |text| write_inner_path(db, owner, expr, inner, text));
     }
@@ -124,7 +124,7 @@ pub fn of_inner(
 /// `span` named for the file `file` read as part of `krate`: the crate in `krate`, and in
 /// `function` the file's path (a macro file by its call, `{macro <id>}`), so the same file
 /// lowered for many crates reads as repeats of one key. The span declares `krate` and `function`.
-pub fn of_file(db: &Db, file: HirFileId, krate: Crate, span: tracing::Span) -> tracing::Span {
+pub fn of_file(db: &Db, file: HirFileId, krate: Crate, span: blaze_trace::Span) -> blaze_trace::Span {
     if !span.is_disabled() {
         name(db, krate, &span, |text| match file {
             HirFileId::FileId(it) => match db.path_for_file(it.file_id(db)) {
@@ -140,7 +140,7 @@ pub fn of_file(db: &Db, file: HirFileId, krate: Crate, span: tracing::Span) -> t
 /// Writes `krate`'s label ([`write_crate_label`]) and the path `path` writes in `span`'s fields
 /// `krate` and `function`, reading nothing into the running query. The path's queries may name
 /// spans of their own, so each span has its own buffer.
-fn name(db: &Db, krate: Crate, span: &tracing::Span, path: impl FnOnce(&mut String)) {
+fn name(db: &Db, krate: Crate, span: &blaze_trace::Span, path: impl FnOnce(&mut String)) {
     // alloc: only while a subscriber records the span, which interns it
     let mut text = String::new();
     span_text(db, &mut text, |db, text| write_crate_label(db, krate, text));
@@ -159,7 +159,7 @@ fn span_text(db: &Db, out: &mut String, write: impl FnOnce(&Db, &mut String)) {
 
 /// `span`, a span that declares `krate`, with `krate`'s label written in it
 /// ([`write_crate_label`]), reading nothing into the running query.
-pub fn with_crate(db: &Db, krate: Crate, span: tracing::Span) -> tracing::Span {
+pub fn with_crate(db: &Db, krate: Crate, span: blaze_trace::Span) -> blaze_trace::Span {
     if !span.is_disabled() {
         // alloc: only while a subscriber records the span, which interns it
         let mut text = String::new();

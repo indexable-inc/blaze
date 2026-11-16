@@ -19,6 +19,8 @@
 //! tmux_passthrough = false
 //! ```
 
+use std::alloc::Global;
+
 use crate::{
     Caps,
     palette::{Depth, Ground, Token},
@@ -75,21 +77,32 @@ impl Config {
 
     /// `[terminal]` of `text`, a `config.toml`; the defaults for what it does not set. An
     /// error names the key and what it takes.
-    pub fn from_toml(text: &str) -> Result<Config, String> {
-        let table: toml::Table =
-            toml::from_str(text).map_err(|error| format!("config.toml is not TOML: {error}"))?;
+    pub fn from_toml(text: &str) -> Result<Config, ConfigError> {
+        let doc = blaze_toml::Document::parse_in(text, blaze_toml::Limits::CARGO, Global).map_err(|error| {
+            let (line, col) = error.line_col(text);
+            ConfigError::NotToml { line, col, what: error.what }
+        })?;
         let mut config = Config::DEFAULT;
-        let Some(terminal) = table.get("terminal") else { return Ok(config) };
-        let Some(terminal) = terminal.as_table() else {
-            return Err("config.toml's `terminal` is not a table ([terminal])".to_owned()); // alloc: an error, once
-        };
-        for (key, value) in terminal {
+        let Some(terminal) = doc.root().get("terminal") else { return Ok(config) };
+        if !terminal.is_table() {
+            let (line, col) = terminal.line_col();
+            return Err(ConfigError::NotATable { line, col });
+        }
+        for value in terminal.children() {
+            let key = value.key();
             // alloc: an error, once
-            let bad = |wants: &str| {
-                format!("config.toml's `terminal.{key}` takes {wants}, not `{value}`")
+            let bad = |wants: &'static str| {
+                let (line, col) = value.line_col();
+                ConfigError::Takes {
+                    key: key.to_owned(),
+                    wants,
+                    found: text[value.span()].to_owned(),
+                    line,
+                    col,
+                }
             };
             let word = || value.as_str();
-            match key.as_str() {
+            match key {
                 "color" => {
                     config.color = match word() {
                         Some("auto") => Color::Auto,
@@ -104,7 +117,7 @@ impl Config {
                         Some("off") => Auto::Off,
                         _ => return Err(bad("\"auto\" or \"off\"")),
                     };
-                    match key.as_str() {
+                    match key {
                         "hyperlinks" => config.hyperlinks = it,
                         _ => config.progress = it,
                     }
@@ -135,17 +148,52 @@ impl Config {
                     config.tmux_passthrough = value.as_bool().ok_or_else(|| bad("true or false"))?
                 }
                 _ => {
+                    let (line, col) = value.line_col();
                     // alloc: an error, once
-                    return Err(format!(
-                        "config.toml's `terminal` has no `{key}`: it takes color, background, hyperlinks, \
-                         progress, notify, notify_after_secs and tmux_passthrough"
-                    ));
+                    return Err(ConfigError::Unknown { key: key.to_owned(), line, col });
                 }
             }
         }
         Ok(config)
     }
 }
+
+/// Why `[terminal]` of `config.toml` was not read: what, and where (1-based line and column).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ConfigError {
+    /// The file is not TOML.
+    NotToml { line: usize, col: usize, what: blaze_toml::What },
+    /// `terminal` is not a table.
+    NotATable { line: usize, col: usize },
+    /// `terminal.<key>` holds `found` (as written), where it takes `wants`.
+    Takes { key: String, wants: &'static str, found: String, line: usize, col: usize },
+    /// `terminal.<key>` is no setting.
+    Unknown { key: String, line: usize, col: usize },
+}
+
+impl core::fmt::Display for ConfigError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ConfigError::NotToml { line, col, what } => {
+                write!(f, "config.toml is not TOML: line {line}, column {col}: {what}")
+            }
+            ConfigError::NotATable { line, col } => {
+                write!(f, "config.toml's `terminal` (line {line}, column {col}) is not a table ([terminal])")
+            }
+            ConfigError::Takes { key, wants, found, line, col } => write!(
+                f,
+                "config.toml's `terminal.{key}` (line {line}, column {col}) takes {wants}, not `{found}`"
+            ),
+            ConfigError::Unknown { key, line, col } => write!(
+                f,
+                "config.toml's `terminal` has no `{key}` (line {line}, column {col}): it takes color, background, \
+                 hyperlinks, progress, notify, notify_after_secs and tmux_passthrough"
+            ),
+        }
+    }
+}
+
+impl core::error::Error for ConfigError {}
 
 /// How a notification is said.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

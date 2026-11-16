@@ -25,7 +25,7 @@ use std::fmt;
 use blaze_own::FixedString;
 use buffer::Cursor;
 use intern::Symbol;
-use stdx::{impl_from, itertools::Itertools as _};
+use stdx::impl_from;
 
 pub use span::Span;
 use span::{Extensions, SyntaxContext};
@@ -553,7 +553,8 @@ impl Literal {
 pub fn token_to_literal(text: &str, span: Span) -> Literal {
     use rustc_lexer::LiteralKind;
 
-    let token = rustc_lexer::tokenize(text, rustc_lexer::FrontmatterAllowed::No).next_tuple();
+    let token =
+        rustc_lexer::tokenize(text, rustc_lexer::FrontmatterAllowed::No).next().map(|token| (token,));
     let Some((rustc_lexer::Token {
         kind: rustc_lexer::TokenKind::Literal { kind, suffix_start },
         ..

@@ -6,7 +6,7 @@ use std::{borrow::Cow, iter};
 
 use crate::span::Span;
 use stdx::iter::{IterExt as _, MultiPeek, multipeek};
-use tracing::{debug, trace};
+use blaze_trace::{debug, trace};
 
 use crate::config::Config;
 use crate::rewrite::{RewriteContext, RewriteErrorExt, RewriteResult};

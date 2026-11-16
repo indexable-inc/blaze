@@ -3,12 +3,11 @@
 
 use std::{alloc::Global, path::Path};
 
+use blaze_data::{Cursor, FromValue, Shape, ShapeError};
 use blaze_keyed::kind::Namespace;
-use serde::Deserialize;
 
-/// The store's form.
-#[derive(Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
-#[serde(rename_all = "snake_case")]
+/// The store's form: `"packs"` or `"plain"` in the file.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Form {
     /// The content-addressed store of packs ([`crate::Store`]).
     #[default]
@@ -17,27 +16,48 @@ pub enum Form {
     Plain,
 }
 
-/// `<root>/store.json`.
-#[derive(Deserialize, Clone, PartialEq, Eq, Debug, Default)]
-#[serde(deny_unknown_fields)]
+impl<A: core::alloc::Allocator + Clone> FromValue<A> for Form {
+    fn from_value(c: &Cursor<'_, '_, A>) -> Result<Form, ShapeError<A>> {
+        match c.text()? {
+            "packs" => Ok(Form::Packs),
+            "plain" => Ok(Form::Plain),
+            _ => Err(c.error(Shape::OutOfRange { ty: "Form (\"packs\" or \"plain\")" })),
+        }
+    }
+}
+
+/// `<root>/store.json`: every field optional (the default), unknown fields refused.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct Settings {
-    #[serde(default)]
     pub form: Form,
     /// The plain store's byte cap, in MiB: compaction prunes past it. None: no cap.
-    #[serde(default)]
     pub cap_mib: Option<u64>,
     /// Sync every commit (a caller that needs a commit to survive a power cut; none today).
-    #[serde(default)]
     pub durable: bool,
     /// The organisation whose namespace ([`Namespace::named`]) this machine reads, after its
     /// own and before the public one. None: no organisation's.
-    #[serde(default)]
     pub org: Option<String>,
     /// This machine is a trusted writer (CI with the namespace's credentials): its puts may name
     /// the public namespace and the organisation's. Off (every developer's machine): everything
     /// it writes is [`Namespace::LOCAL`] and never leaves it.
-    #[serde(default)]
     pub trusted_writer: bool,
+}
+
+impl<A: core::alloc::Allocator + Clone> FromValue<A> for Settings {
+    fn from_value(c: &Cursor<'_, '_, A>) -> Result<Settings, ShapeError<A>> {
+        c.deny_unknown(&["form", "cap_mib", "durable", "org", "trusted_writer"])?;
+        let org = match c.field_opt("org")? {
+            Some(org) if !org.is_null() => Some(org.text()?.to_owned()),
+            _ => None,
+        };
+        Ok(Settings {
+            form: c.opt("form")?.unwrap_or_default(),
+            cap_mib: c.opt("cap_mib")?,
+            durable: c.opt("durable")?.unwrap_or(false),
+            org,
+            trusted_writer: c.opt("trusted_writer")?.unwrap_or(false),
+        })
+    }
 }
 
 /// The file's name under a root.
@@ -51,12 +71,15 @@ impl Settings {
         match std::fs::read(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
             Err(error) => Err(format!("{}: {error}", path.display())),
-            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
-                format!(
-                    "{}: {error}: it is `{{\"form\": \"packs\" | \"plain\", \"cap_mib\": N, \"durable\": bool, \"org\": \"name\", \"trusted_writer\": bool}}`",
-                    path.display()
-                )
-            }),
+            Ok(bytes) => blaze_json::read_in(&bytes, blaze_json::Limits::DEFAULT, Global)
+                .map_err(|error| error.to_string())
+                .and_then(|value| Cursor::root(&value, Global).get::<Settings>().map_err(|error| error.to_string()))
+                .map_err(|error| {
+                    format!(
+                        "{}: {error}: it is `{{\"form\": \"packs\" | \"plain\", \"cap_mib\": N, \"durable\": bool, \"org\": \"name\", \"trusted_writer\": bool}}`",
+                        path.display()
+                    )
+                }),
         }
     }
 

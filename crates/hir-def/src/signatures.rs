@@ -1,7 +1,7 @@
 //! Item signature IR definitions
 
 use base_db::{Db, EditionedFileId};
-use bitflags::bitflags;
+use blaze_bitflags::bitflags;
 use blaze_ids::bits::Bits;
 use blaze_mem::frame::Frame;
 use cfg::{CfgExpr, CfgOptions};
@@ -19,7 +19,6 @@ use syntax::{
     FlatTree, SyntaxKind, SyntaxNodePtr, T, TextRange, TextSize,
     view::{self as ast, AstNode, HasGenericParams, HasName, HasVisibility, IsString},
 };
-use thin_vec::ThinVec;
 use std::sync::Arc;
 
 use crate::{
@@ -51,7 +50,7 @@ fn as_name_opt(name: Option<ast::Name<'_>>) -> Name {
 /// `AttrFlags` bit, OR-ed together, with no branch per flag.
 macro_rules! flags_from_attrs {
     ($attrs:expr, $Flags:ident { $($attr:ident => $flag:ident),+ $(,)? }) => {{
-        type Bits = <$Flags as bitflags::Flags>::Bits;
+        type Bits = <$Flags as blaze_bitflags::Flags>::Bits;
         let attrs: AttrFlags = $attrs;
         let attrs = attrs.bits();
         $Flags::from_bits_retain(0 $(| {
@@ -1466,7 +1465,7 @@ impl EnumSignature {
         }
     }
 }
-bitflags::bitflags! {
+blaze_bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, Eq, PartialEq, Default, Hash)]
     pub struct ConstFlags: u8 {
         const HAS_BODY = 1 << 1;
@@ -1527,7 +1526,7 @@ impl ConstSignature {
     }
 }
 
-bitflags::bitflags! {
+blaze_bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, Eq, PartialEq, Default, Hash)]
     pub struct StaticFlags: u8 {
         const HAS_BODY = 1 << 1;
@@ -1583,7 +1582,7 @@ impl StaticSignature {
     }
 }
 
-bitflags::bitflags! {
+blaze_bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, Eq, PartialEq, Default, Hash)]
     pub struct ImplFlags: u8 {
         const NEGATIVE = 1 << 1;
@@ -1647,7 +1646,7 @@ impl ImplSignature {
     }
 }
 
-bitflags::bitflags! {
+blaze_bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, Eq, PartialEq, Default, Hash)]
     pub struct TraitFlags: u16 {
         const RUSTC_HAS_INCOHERENT_INHERENT_IMPLS = 1 << 1;
@@ -2465,12 +2464,11 @@ pub struct EnumVariants {
     explicit_discriminant: VariantBits,
 }
 
-/// One bit per variant, by index, kept inline up to 64 variants: no allocation for almost
-/// every enum. Bits past the last variant are zero, so equal sets are equal words.
-type VariantBits = Bits<SmallVec<[u64; 1]>>;
+/// One bit per variant, by index, in a word per 64 variants. Bits past the last variant are
+/// zero, so equal sets are equal words.
+type VariantBits = Bits<Vec<u64>>;
 
-// The inline word and its length, or a heap pointer and its length, plus the capacity. The
-// inline `u64` aligns it to 8 on every target, so the size is per target: checked on 64-bit.
+// A `Vec`'s pointer, capacity and length: the size is per target, checked on 64-bit.
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<VariantBits>() == 24);
 
@@ -2489,7 +2487,7 @@ impl Eq for EnumVariants {}
 #[blaze_memo::tracked]
 impl EnumVariants {
     #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
-    pub fn of(db: &Db, e: EnumId) -> (EnumVariants, ThinVec<InactiveEnumVariantCode>) {
+    pub fn of(db: &Db, e: EnumId) -> (EnumVariants, Box<[InactiveEnumVariantCode]>) {
         from_text(db, e, "the variants of an enum of a crate the task has no text of", || {
             Self::lower(db, e)
         })
@@ -2499,7 +2497,7 @@ impl EnumVariants {
 impl EnumVariants {
     /// The variants lowered from syntax: what [`EnumVariants::of`] gives when no image serves
     /// them, and what checking an image compares its record with.
-    pub(crate) fn lower(db: &Db, e: EnumId) -> (EnumVariants, ThinVec<InactiveEnumVariantCode>) {
+    pub(crate) fn lower(db: &Db, e: EnumId) -> (EnumVariants, Box<[InactiveEnumVariantCode]>) {
         blaze_mem::frame::current(|frame| {
             let loc = e.lookup(db);
             // The relative tree's ast ids are the file's: what a variant is interned by.
@@ -2517,7 +2515,7 @@ impl EnumVariants {
             let Some(list) = source.value.variant_list() else {
                 let variants = FxIndexMap::default();
                 let explicit_discriminant = VariantBits::default();
-                return (EnumVariants { variants, explicit_discriminant }, ThinVec::new());
+                return (EnumVariants { variants, explicit_discriminant }, Box::default());
             };
             let count = list.variants().count();
             let mut kept = Vec::with_capacity_in(count, frame);
@@ -2549,7 +2547,7 @@ impl EnumVariants {
             // alloc: the memo's map, exact unless a name is written twice (an error)
             let mut variants = FxIndexMap::with_capacity_in(kept.len(), std::alloc::Global);
             let kept_len = kept.len();
-            // alloc: the memo's bits, inline up to 64 variants
+            // alloc: the memo's bits, a word per 64 variants
             let mut explicit_discriminant = VariantBits::new(kept_len);
             for (name, enum_variant, shape, explicit) in kept {
                 // A name written twice keeps its first place and the last variant's value.
@@ -2561,8 +2559,7 @@ impl EnumVariants {
                 explicit_discriminant.shrink_to_fit();
             }
             // alloc: the memo's diagnostics, exact; none unless a variant is cfg'd out
-            let mut diagnostics = ThinVec::with_capacity(inactive.len());
-            diagnostics.extend(inactive);
+            let diagnostics = Box::from_iter(inactive);
             (EnumVariants { variants, explicit_discriminant }, diagnostics)
         })
     }
@@ -2573,7 +2570,7 @@ impl EnumVariants {
         variants: FxIndexMap<Name, (EnumVariantId, FieldsShape)>,
         explicit: &[bool],
     ) -> EnumVariants {
-        let mut explicit_discriminant = VariantBits::new(variants.len()); // alloc: inline up to 64 variants
+        let mut explicit_discriminant = VariantBits::new(variants.len()); // alloc: a word per 64 variants
         for (index, &it) in explicit.iter().enumerate() {
             explicit_discriminant.set(index, it);
         }
@@ -3054,8 +3051,8 @@ type const E: u8 = 0;
                 assert_eq!(bits.contains(index), value, "len {len} kept {kept} index {index}");
             }
         }
-        assert!(!VariantBits::new(64).into_words().spilled());
-        assert!(VariantBits::new(65).into_words().spilled());
+        assert_eq!(VariantBits::new(64).into_words().len(), 1);
+        assert_eq!(VariantBits::new(65).into_words().len(), 2);
     }
 }
 

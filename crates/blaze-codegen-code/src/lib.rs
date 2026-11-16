@@ -127,7 +127,7 @@
 //! answers `fn_info` (docs/v2/plan/design/code-identity.md, "Toolchain::id").
 
 // `#[expect(blaze::tmp_path)]` on the fixture's workspace; inert under rustc.
-#![feature(register_tool)]
+#![feature(allocator_api, register_tool)]
 #![register_tool(blaze)]
 
 pub mod coverage;
@@ -136,11 +136,14 @@ pub mod fixture;
 mod tests;
 
 use std::{
+    alloc::Global,
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
     process::Command,
     time::SystemTime,
 };
+
+use blaze_data::{Map, Value};
 
 /// The domain of the code identity; another formula is another domain.
 pub const DOMAIN: &str = "blaze v2 codegen code 3";
@@ -1197,7 +1200,7 @@ struct Local {
     name: String,
     version: String,
     dir: PathBuf,
-    manifest: toml::Table,
+    manifest: Map<Global>,
     /// The manifest of the workspace it inherits from (its own, or the nearest above it).
     workspace: Option<PathBuf>,
 }
@@ -1225,7 +1228,7 @@ pub struct Workspace {
     /// The manifests of its members.
     members: BTreeSet<PathBuf>,
     /// Workspace manifests by path, as read.
-    workspaces: BTreeMap<PathBuf, toml::Table>,
+    workspaces: BTreeMap<PathBuf, Map<Global>>,
     /// What the lock and every manifest read were just before they were read.
     stamps: BTreeMap<PathBuf, Stamp>,
 }
@@ -1234,11 +1237,16 @@ fn read(path: &Path) -> Result<Vec<u8>, String> {
     std::fs::read(path).map_err(|why| format!("reading {}: {why}", path.display()))
 }
 
-fn read_toml(path: &Path, stamps: &mut BTreeMap<PathBuf, Stamp>) -> Result<toml::Table, String> {
+/// The manifest or lock at `path`, read as TOML and lowered to its root table.
+fn read_toml(path: &Path, stamps: &mut BTreeMap<PathBuf, Stamp>) -> Result<Map<Global>, String> {
     let bytes = read_stamped(path, stamps)?;
     let text = String::from_utf8(bytes).map_err(|_| format!("{} is not UTF-8", path.display()))?;
-    text.parse::<toml::Table>()
-        .map_err(|why| format!("{} is no TOML: {}", path.display(), why.to_string().trim()))
+    let doc = blaze_toml::Document::parse_in(&text, blaze_toml::Limits::CARGO, Global)
+        .map_err(|why| format!("{} is no TOML: {}", path.display(), why.display(&text)))?;
+    match doc.to_value_in(Global) {
+        Value::Map(table) => Ok(table),
+        _ => unreachable!("a TOML document's root is a table"),
+    }
 }
 
 fn canonical(path: &Path) -> Result<PathBuf, String> {
@@ -1248,7 +1256,7 @@ fn canonical(path: &Path) -> Result<PathBuf, String> {
 /// The tables of `manifest` that list dependencies, with whether they are built into the
 /// package (normal and build dependencies) or only into its tests (dev-dependencies), every
 /// platform's.
-fn dependency_tables(manifest: &toml::Table) -> Vec<(bool, &toml::Table)> {
+fn dependency_tables(manifest: &Map<Global>) -> Vec<(bool, &Map<Global>)> {
     const KINDS: [(&str, bool); 5] = [
         ("dependencies", true),
         ("build-dependencies", true),
@@ -1258,14 +1266,14 @@ fn dependency_tables(manifest: &toml::Table) -> Vec<(bool, &toml::Table)> {
     ];
     let targets = manifest
         .get("target")
-        .and_then(toml::Value::as_table)
+        .and_then(Value::as_map)
         .into_iter()
-        .flat_map(|it| it.values())
-        .filter_map(toml::Value::as_table);
+        .flat_map(|it| it.iter().map(|(_, value)| value))
+        .filter_map(Value::as_map);
     let mut out = Vec::new();
     for table in std::iter::once(manifest).chain(targets) {
         for (kind, built) in KINDS {
-            if let Some(deps) = table.get(kind).and_then(toml::Value::as_table) {
+            if let Some(deps) = table.get(kind).and_then(Value::as_map) {
                 out.push((built, deps));
             }
         }
@@ -1275,27 +1283,27 @@ fn dependency_tables(manifest: &toml::Table) -> Vec<(bool, &toml::Table)> {
 
 /// The workspace's `[workspace.dependencies]` entry `key` names, if any.
 fn workspace_dependency<'a>(
-    workspace: Option<&'a toml::Table>,
+    workspace: Option<&'a Map<Global>>,
     key: &str,
-) -> Option<&'a toml::Value> {
+) -> Option<&'a Value<Global>> {
     workspace?.get("workspace")?.get("dependencies")?.get(key)
 }
 
 /// Whether a dependency entry inherits from the workspace (`key.workspace = true`).
-fn inherits(value: &toml::Value) -> bool {
-    value.get("workspace").and_then(toml::Value::as_bool) == Some(true)
+fn inherits(value: &Value<Global>) -> bool {
+    value.get("workspace").and_then(Value::as_bool) == Some(true)
 }
 
 /// The package a dependency entry `key = value` names: its `package`, the workspace entry's
 /// `package` when it inherits, else `key`.
-fn dependency_name(key: &str, value: &toml::Value, workspace: Option<&toml::Table>) -> String {
-    if let Some(package) = value.get("package").and_then(toml::Value::as_str) {
+fn dependency_name(key: &str, value: &Value<Global>, workspace: Option<&Map<Global>>) -> String {
+    if let Some(package) = value.get("package").and_then(Value::as_str) {
         return package.to_owned();
     }
     if inherits(value)
         && let Some(package) = workspace_dependency(workspace, key)
             .and_then(|it| it.get("package"))
-            .and_then(toml::Value::as_str)
+            .and_then(Value::as_str)
     {
         return package.to_owned();
     }
@@ -1307,10 +1315,10 @@ fn dependency_name(key: &str, value: &toml::Value, workspace: Option<&toml::Tabl
 fn dependency_path(
     dir: &Path,
     key: &str,
-    value: &toml::Value,
-    workspace: Option<(&Path, &toml::Table)>,
+    value: &Value<Global>,
+    workspace: Option<(&Path, &Map<Global>)>,
 ) -> Option<PathBuf> {
-    if let Some(path) = value.get("path").and_then(toml::Value::as_str) {
+    if let Some(path) = value.get("path").and_then(Value::as_str) {
         return Some(dir.join(path));
     }
     if inherits(value) {
@@ -1332,7 +1340,7 @@ impl Workspace {
         let program = program_manifest
             .get("package")
             .and_then(|it| it.get("name"))
-            .and_then(toml::Value::as_str)
+            .and_then(Value::as_str)
             .ok_or_else(|| {
                 format!("{} names no package", program_dir.join("Cargo.toml").display())
             })?
@@ -1352,14 +1360,17 @@ impl Workspace {
 
         // The members: `members` globs, less `exclude`.
         let table = workspaces[&root_manifest].clone();
-        let section =
-            table.get("workspace").and_then(toml::Value::as_table).cloned().unwrap_or_default();
+        let section = table
+            .get("workspace")
+            .and_then(Value::as_map)
+            .cloned()
+            .unwrap_or_else(|| Map::new_in(Global));
         let excluded: Vec<PathBuf> = section
             .get("exclude")
-            .and_then(toml::Value::as_array)
+            .and_then(Value::as_list)
             .into_iter()
             .flatten()
-            .filter_map(toml::Value::as_str)
+            .filter_map(Value::as_str)
             .map(|it| root.join(it))
             .collect();
         let mut members = BTreeSet::new();
@@ -1370,10 +1381,10 @@ impl Workspace {
         }
         for pattern in section
             .get("members")
-            .and_then(toml::Value::as_array)
+            .and_then(Value::as_list)
             .into_iter()
             .flatten()
-            .filter_map(toml::Value::as_str)
+            .filter_map(Value::as_str)
         {
             let full = root.join(pattern);
             let full = full.to_str().ok_or_else(|| format!("{} is not UTF-8", full.display()))?;
@@ -1393,26 +1404,26 @@ impl Workspace {
             }
         }
         // `path` entries of the root's workspace dependencies, patches and replacements.
-        let mut tables: Vec<&toml::Table> = Vec::new();
-        if let Some(deps) = section.get("dependencies").and_then(toml::Value::as_table) {
+        let mut tables: Vec<&Map<Global>> = Vec::new();
+        if let Some(deps) = section.get("dependencies").and_then(Value::as_map) {
             tables.push(deps);
         }
         for patches in table
             .get("patch")
-            .and_then(toml::Value::as_table)
+            .and_then(Value::as_map)
             .into_iter()
-            .flat_map(|it| it.values())
+            .flat_map(|it| it.iter().map(|(_, value)| value))
         {
-            if let Some(patches) = patches.as_table() {
+            if let Some(patches) = patches.as_map() {
                 tables.push(patches);
             }
         }
-        if let Some(replace) = table.get("replace").and_then(toml::Value::as_table) {
+        if let Some(replace) = table.get("replace").and_then(Value::as_map) {
             tables.push(replace);
         }
         for deps in tables {
-            for value in deps.values() {
-                if let Some(path) = value.get("path").and_then(toml::Value::as_str) {
+            for (_, value) in deps.iter() {
+                if let Some(path) = value.get("path").and_then(Value::as_str) {
                     queue.push(root.join(path));
                 }
             }
@@ -1432,18 +1443,18 @@ impl Workspace {
                 .as_ref()
                 .map(|path| (path.parent().unwrap_or(Path::new("")), &workspaces[path]));
             for (_, deps) in dependency_tables(&manifest) {
-                for (key, value) in deps {
+                for (key, value) in deps.iter() {
                     if let Some(path) = dependency_path(&dir, key, value, inherited) {
                         queue.push(path);
                     }
                 }
             }
-            let Some(package) = manifest.get("package").and_then(toml::Value::as_table) else {
+            let Some(package) = manifest.get("package").and_then(Value::as_map) else {
                 continue;
             };
             let name = package
                 .get("name")
-                .and_then(toml::Value::as_str)
+                .and_then(Value::as_str)
                 .ok_or_else(|| format!("{} names no package", manifest_path.display()))?
                 .to_owned();
             let version = match package.get("version") {
@@ -1731,7 +1742,7 @@ impl Workspace {
 /// table, read into `cache`.
 fn workspace_of(
     dir: &Path,
-    cache: &mut BTreeMap<PathBuf, toml::Table>,
+    cache: &mut BTreeMap<PathBuf, Map<Global>>,
     stamps: &mut BTreeMap<PathBuf, Stamp>,
 ) -> Result<Option<PathBuf>, String> {
     for ancestor in dir.ancestors() {
@@ -1758,20 +1769,20 @@ fn locked(path: &Path, stamps: &mut BTreeMap<PathBuf, Stamp>) -> Result<Vec<Lock
     let mut out = Vec::new();
     for package in table
         .get("package")
-        .and_then(toml::Value::as_array)
+        .and_then(Value::as_list)
         .ok_or_else(|| format!("{} lists no `[[package]]`", path.display()))?
     {
-        let field = |name: &str| package.get(name).and_then(toml::Value::as_str).map(str::to_owned);
+        let field = |name: &str| package.get(name).and_then(Value::as_str).map(str::to_owned);
         let name =
             field("name").ok_or_else(|| format!("a package of {} has no name", path.display()))?;
         let version = field("version")
             .ok_or_else(|| format!("{name} in {} has no version", path.display()))?;
         let dependencies = package
             .get("dependencies")
-            .and_then(toml::Value::as_array)
+            .and_then(Value::as_list)
             .into_iter()
             .flatten()
-            .filter_map(toml::Value::as_str)
+            .filter_map(Value::as_str)
             .map(str::to_owned)
             .collect();
         out.push(Locked {
@@ -2422,7 +2433,7 @@ fn lib_name(local: &Local) -> String {
         .manifest
         .get("lib")
         .and_then(|it| it.get("name"))
-        .and_then(toml::Value::as_str)
+        .and_then(Value::as_str)
         .unwrap_or(&local.name)
         .replace('-', "_")
 }
@@ -2432,17 +2443,17 @@ fn lib_name(local: &Local) -> String {
 fn built_dirs(local: &Local) -> Vec<PathBuf> {
     let mut paths: Vec<&str> = Vec::new();
     if let Some(path) =
-        local.manifest.get("lib").and_then(|it| it.get("path")).and_then(toml::Value::as_str)
+        local.manifest.get("lib").and_then(|it| it.get("path")).and_then(Value::as_str)
     {
         paths.push(path);
     }
-    for bin in local.manifest.get("bin").and_then(toml::Value::as_array).into_iter().flatten() {
-        if let Some(path) = bin.get("path").and_then(toml::Value::as_str) {
+    for bin in local.manifest.get("bin").and_then(Value::as_list).into_iter().flatten() {
+        if let Some(path) = bin.get("path").and_then(Value::as_str) {
             paths.push(path);
         }
     }
     if let Some(path) =
-        local.manifest.get("package").and_then(|it| it.get("build")).and_then(toml::Value::as_str)
+        local.manifest.get("package").and_then(|it| it.get("build")).and_then(Value::as_str)
     {
         paths.push(path);
     }

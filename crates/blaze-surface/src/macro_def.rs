@@ -362,12 +362,12 @@ impl<'a> MacroDefView<'a> {
     pub fn read(buffer: &'a [u8]) -> Result<MacroDefView<'a>, FormatError> {
         let root = blaze_format::open::<MacroDefRoot>(buffer)?;
         let strings = root.strings.as_str(buffer)?;
-        check_text(strings, root.name, root, buffer)?;
+        check_text(strings, root.name, blaze_format::Verified::get(root), buffer)?;
         let helpers = root.helpers.follow(buffer)?;
         for text in helpers {
             check_text(strings, *text, text, buffer)?;
         }
-        let at = at_of_record(root, buffer);
+        let at = at_of_record(blaze_format::Verified::get(root), buffer);
         let kind = MacroKind::from_record(root.kind, root.which, root.krate).ok_or(
             FormatError::Invalid {
                 at: field_at(at, offset_of!(MacroDefRoot, which)),

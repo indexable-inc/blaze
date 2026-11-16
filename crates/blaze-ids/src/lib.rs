@@ -362,15 +362,28 @@ pub struct Sharded<T> {
 /// How many indices a shard claims at a time.
 pub const BLOCK: u32 = 64;
 
-/// The shards of every [`Sharded`]: a power of two at least 4 times the cores, at least 4, so
-/// writers rarely meet on one shard and each shard's table, copied under its lock to grow,
-/// stays small.
-pub fn shard_count() -> usize {
-    static COUNT: Once<usize> = Once::new();
-    *COUNT.get_or_init(|| {
-        let cores = std::thread::available_parallelism().map_or(1, |it| it.get());
-        (cores * 4).next_power_of_two().max(4)
-    })
+/// How many shards a [`Sharded`] (or another sharded table) has: a power of two, made from the
+/// worker count its maker passes in, so nothing here asks the machine.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shards(u32);
+
+impl Shards {
+    /// Shards per worker, rounded up: with `w` writers on `4w` shards, two meet on one shard
+    /// about once in `4w` claims (a birthday bound per pair of claims in flight), and a shard's
+    /// share of the values, a quarter of a worker's, keeps its index growths small. Measured
+    /// against: change 8's bench in docs/v2/plan/design/parallel.md, not yet run.
+    pub const PER_WORKER: usize = 4;
+
+    /// `workers` (the scheduler's worker count) rounded up to a power of two, times
+    /// [`Shards::PER_WORKER`]: at least 4.
+    pub fn for_workers(workers: NonZeroUsize) -> Shards {
+        let count = workers.get().next_power_of_two() * Self::PER_WORKER;
+        Shards(u32::try_from(count).expect("a shard count below 2^32"))
+    }
+
+    pub fn count(self) -> usize {
+        self.0 as usize
+    }
 }
 
 /// Chunk `k` holds `FIRST << k` slots, so an index's chunk and place in it are arithmetic and
@@ -386,14 +399,22 @@ struct Claimed {
     end: u32,
 }
 
-/// One cache line pair per shard, so writers to neighbouring shards don't share a line.
-#[repr(align(128))]
+/// A value on cache lines of its own: 128 bytes on Apple silicon, whose lines are 128 bytes,
+/// and 64 elsewhere.
+#[cfg_attr(all(target_arch = "aarch64", target_vendor = "apple"), repr(C, align(128)))]
+#[cfg_attr(not(all(target_arch = "aarch64", target_vendor = "apple")), repr(C, align(64)))]
+struct Line<T>(T);
+
+/// Lines of its own per shard, so writers to neighbouring shards don't share a line, and the
+/// lock on a line apart from the index's level, which every find reads.
+#[cfg_attr(all(target_arch = "aarch64", target_vendor = "apple"), repr(C, align(128)))]
+#[cfg_attr(not(all(target_arch = "aarch64", target_vendor = "apple")), repr(C, align(64)))]
 struct Shard {
     /// The one lock of `Sharded`, held only to probe again, insert into the index and claim a
-    /// block of indices: a few hundred instructions, never across a call
+    /// block of indices: O(1), never the copy of a growth, never across a call
     /// (docs/v2/plan/design/concurrency.md), and a find never takes it. A spin lock, as
     /// nothing below this crate parks a thread.
-    lock: Spin<Claimed>,
+    lock: Line<Spin<Claimed>>,
     /// How many values the shard has, written under `lock`.
     len: AtomicU32,
     /// The shard's values by [`probe_hash`]: a find is one control word and one slot, then
@@ -417,14 +438,14 @@ fn chunk_of(raw: u32) -> (usize, usize) {
 }
 
 impl<T: Send + Sync> Sharded<T> {
-    pub fn new() -> Sharded<T> {
-        let count = shard_count();
+    pub fn new(shards: Shards) -> Sharded<T> {
+        let count = shards.count();
         Sharded {
             slots: std::array::from_fn(|_| Once::new()),
             next: AtomicU64::new(0),
             shards: (0..count)
                 .map(|_| Shard {
-                    lock: Spin::new("ids.sharded.claim", Claimed { next: 0, end: 0 }),
+                    lock: Line(Spin::new("ids.sharded.claim", Claimed { next: 0, end: 0 })),
                     len: AtomicU32::new(0),
                     index: Index::new_in(Global),
                 })
@@ -455,12 +476,6 @@ impl<T: Send + Sync> Sharded<T> {
     fn probe(&self, shard: &Shard, id: &ContentId) -> Option<Idx<T>> {
         let is = |raw: u32| self.slot(raw).expect("an index entry before its value").0 == *id;
         shard.index.find(probe_hash(id), is).map(Idx::from_raw)
-    }
-}
-
-impl<T: Send + Sync> Default for Sharded<T> {
-    fn default() -> Sharded<T> {
-        Sharded::new()
     }
 }
 

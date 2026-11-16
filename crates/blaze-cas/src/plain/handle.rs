@@ -381,8 +381,7 @@ impl<D: Driver> Store for PlainStore<D> {
     /// the page cache's bytes with no system call; `Driven::get_into` is the `pread` path for a
     /// caller with no mapping), else from the calling thread's own lane.
     fn read<K: Kind, A: Allocator>(&self, key: &KeyOf<K>, frame: A) -> Result<Option<Read<Proof, Vec<u8, A>>>, StoreError> {
-        let lane = if self.lanes.is_empty() { None } else { self.own_lane() };
-        match self.get(lane, &Key(key.id()), frame) {
+        match self.get(self.own_lane(),&Key(key.id()), frame) {
             None => Ok(None),
             Some((tag, _, _)) if tag != K::TAG => Err(StoreError::TwoValues { tag: K::TAG, key: key.id() }),
             Some((_, bytes, from)) => Ok(Some(Read { bytes, from })),

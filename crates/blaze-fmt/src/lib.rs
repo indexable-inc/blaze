@@ -1,6 +1,8 @@
 //! blaze's formatter: rustfmt's `src/lib.rs` at rust-lang/rust 12433c307 (MIT or Apache-2.0),
 //! with the rustc crates it loads from the sysroot replaced by [`ast`] and [`span`], which
 //! rust-analyzer's parser fills with the spans rustc would give each node.
+// blaze-toml and blaze-data take the allocator by name; a rustfmt.toml is read in `Global`.
+#![feature(allocator_api)]
 #![deny(rust_2018_idioms)]
 #![warn(unreachable_pub)]
 #![recursion_limit = "256"]
@@ -161,6 +163,46 @@ impl core::error::Error for ErrorKind {
             ErrorKind::ModuleResolutionError(e) => Some(e),
             _ => None,
         }
+    }
+}
+
+/// What `blaze fmt` stops on before any file is formatted: the workspace it reads for each
+/// file's edition, or for the targets to format, could not be read.
+#[derive(Debug)]
+pub enum FmtError {
+    /// blaze-manifest could not read the workspace.
+    Manifest(blaze_manifest::ManifestError),
+    /// The workspace of `manifest` could not be read for the edition of the files in it.
+    Workspace {
+        manifest: PathBuf,
+        error: blaze_manifest::ManifestError,
+    },
+}
+
+impl fmt::Display for FmtError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            FmtError::Manifest(error) => write!(f, "{error}"),
+            FmtError::Workspace { manifest, error } => write!(
+                f,
+                "reading the workspace of {} for the edition of the files in it: {error}",
+                manifest.display()
+            ),
+        }
+    }
+}
+
+impl core::error::Error for FmtError {
+    fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+        match self {
+            FmtError::Manifest(error) | FmtError::Workspace { error, .. } => Some(error),
+        }
+    }
+}
+
+impl From<blaze_manifest::ManifestError> for FmtError {
+    fn from(error: blaze_manifest::ManifestError) -> FmtError {
+        FmtError::Manifest(error)
     }
 }
 

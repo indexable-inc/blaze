@@ -450,7 +450,7 @@ fn reverse_fixups_<A: core::alloc::Allocator + Clone>(
 
 #[cfg(test)]
 mod tests {
-    use expect_test::{Expect, expect};
+    use test_utils::{Expect, expect};
     use span::{Edition, EditionedFileId, FileId};
     use syntax::TextRange;
     use syntax_bridge::DocCommentDesugarMode;

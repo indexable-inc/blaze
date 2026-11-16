@@ -331,7 +331,7 @@ pub(crate) fn str_literal(s: &str, span: Span) -> crate::tt::Literal {
 mod tests {
     use crate::tt;
     use ::tt::IdentIsRaw;
-    use expect_test::expect;
+    use test_utils::expect;
     use intern::Symbol;
     use span::{Edition, ROOT_ERASED_FILE_AST_ID, SpanAnchor, SyntaxContext};
     use syntax::{TextRange, TextSize};

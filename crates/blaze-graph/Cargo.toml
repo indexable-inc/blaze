@@ -47,7 +47,7 @@ blaze-check.workspace = true
 blaze-alloc-count.workspace = true
 blaze-ids.workspace = true
 blaze-sim.workspace = true
-expect-test.workspace = true
+test-utils.workspace = true
 
 # `Flights` under contention: N threads' keys spread over 128 shards, in one shard, and on one
 # key, in ns per operation.

@@ -83,7 +83,7 @@ impl Store {
         tiers
             + training
             + slots::<crate::Key, crate::read::Seg>(self.copy_homes.capacity())
-            + slots::<blaze_core::Tag, tracing::Span>(self.place_spans.capacity())
+            + slots::<blaze_core::Tag, blaze_trace::Span>(self.place_spans.capacity())
             + slots::<blaze_ids::ContentId, crate::PlacedFile>(self.files.capacity())
     }
 

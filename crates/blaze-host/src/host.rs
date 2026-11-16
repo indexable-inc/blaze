@@ -461,7 +461,7 @@ impl<'a, F: Front, S: Store, W: Files, I: Images> Host<'a, F, S, W, I> {
             if workers.any_finished() {
                 continue;
             }
-            let _span = tracing::info_span!(target: "blaze", "host: wait", waited_for = what, in_flight = self.in_flight).entered();
+            let _span = blaze_trace::info_span!(target: "blaze", "host: wait", waited_for = what, in_flight = self.in_flight).entered();
             let deadline = Deadline::after(self.clock.now(), self.request.stall);
             match workers.parker().park("host: a task to finish", Some(deadline), &self.clock).map_err(HostError::Wait)? {
                 Waited::Ready(()) => {}
@@ -528,7 +528,7 @@ impl<'a, F: Front, S: Store, W: Files, I: Images> Host<'a, F, S, W, I> {
             }
             Effect::Put { ticket, tag, key, namespace, bytes } => Ok(Reply::Put { ticket, put: self.put(tag, key, namespace, bytes)? }),
             Effect::Link { ticket, program, changes, plans, spans, payload } => {
-                let _span = tracing::info_span!(target: "blaze", "host: link", program, changes = changes.len(), spans = spans.len()).entered();
+                let _span = blaze_trace::info_span!(target: "blaze", "host: link", program, changes = changes.len(), spans = spans.len()).entered();
                 // Each row's new code, read once; a row that went has none.
                 let mut held = Vec::with_capacity_in(changes.len(), Global);
                 for change in changes {
@@ -581,7 +581,7 @@ impl<'a, F: Front, S: Store, W: Files, I: Images> Host<'a, F, S, W, I> {
                 Ok(Reply::Linked { ticket, outcome })
             }
             Effect::Image { ticket, program, from, to, patched } => {
-                let _span = tracing::info_span!(target: "blaze", "host: make program image", program, patched).entered();
+                let _span = blaze_trace::info_span!(target: "blaze", "host: make program image", program, patched).entered();
                 let (images, from) = (self.images, from.map(|from| from.id()));
                 let held = self.patches.binary_search_by_key(&program, |(held, _)| *held);
                 // A panic in the command's images fails this program alone (rule 20).
@@ -608,7 +608,7 @@ impl<'a, F: Front, S: Store, W: Files, I: Images> Host<'a, F, S, W, I> {
                 Ok(Reply::Imaged { ticket, outcome })
             }
             Effect::Place { ticket, program, image } => {
-                let _span = tracing::info_span!(target: "blaze", "host: place program path", program).entered();
+                let _span = blaze_trace::info_span!(target: "blaze", "host: place program path", program).entered();
                 let images = self.images;
                 let outcome = catch_unwind(AssertUnwindSafe(|| images.place(program, image.id())))
                     .unwrap_or(Err(TaskFailed::Panicked { what: "a program path's place" }));
@@ -678,7 +678,7 @@ impl<'a, F: Front, S: Store, W: Files, I: Images> Host<'a, F, S, W, I> {
 
     /// The answer now of each of `asks` as unit `unit` sees it, into [`Host::answers`].
     fn answer(&mut self, unit: u32, asks: &[ContentId], refs: &[TableRef], made: &[Fact]) -> Result<(), HostError> {
-        let _span = tracing::info_span!(target: "blaze", "host: answer", unit, asks = asks.len()).entered();
+        let _span = blaze_trace::info_span!(target: "blaze", "host: answer", unit, asks = asks.len()).entered();
         let sources = self.sources(refs)?;
         let tables = tables(&sources, made).map_err(|why| HostError::Answer { unit, why })?;
         let universe = Universe { asker: unit, tables: &tables, outside: self.late_of(unit)? };
@@ -880,7 +880,7 @@ impl<'a, F: Front, S: Store, W: Files, I: Images> Host<'a, F, S, W, I> {
             // The one commit of the request, before its last put is answered: a failed sync
             // fails the request by name (no retry).
             self.uncommitted = false;
-            let _span = tracing::info_span!(target: "blaze", "host: commit").entered();
+            let _span = blaze_trace::info_span!(target: "blaze", "host: commit").entered();
             if let Err(error) = store.commit() {
                 self.keep_error(error);
                 return Ok(Err(StoreFault { what: "the commit of the request's records" }));
@@ -895,7 +895,7 @@ impl<'a, F: Front, S: Store, W: Files, I: Images> Host<'a, F, S, W, I> {
             return Ok(());
         }
         self.uncommitted = false;
-        let _span = tracing::info_span!(target: "blaze", "host: commit").entered();
+        let _span = blaze_trace::info_span!(target: "blaze", "host: commit").entered();
         self.store.commit().map(|_generation| ())
     }
 
@@ -1063,7 +1063,7 @@ fn pooled<'a, 's, F: Front, S: Store, M: Memo, W: Files, I: Images, WK: Walker>(
         host.pump(driver, Some(&mut workers))
     });
     let stopped = {
-        let _span = tracing::info_span!(target: "blaze", "host: stop the pool", threads).entered();
+        let _span = blaze_trace::info_span!(target: "blaze", "host: stop the pool", threads).entered();
         pool.stop(Duration::from_secs(10))
     };
     let pumped = pumped?;

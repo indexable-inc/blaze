@@ -817,9 +817,34 @@ unsafe impl<#[may_dangle] C: Columns, A: Allocator> Drop for Soa<C, A> {
     }
 }
 
+impl<C: CloneColumns, A: Allocator> Soa<C, A> {
+    /// A copy in another allocator: every column in one block of exactly `len` rows in `alloc`,
+    /// each row cloned in turn (a row's fields are cloned by `Clone`, so a field that owns memory
+    /// copies into its own allocator; the columns are what moves to `alloc`). A refusal or a
+    /// panicking clone drops the rows made and frees the block.
+    pub fn try_clone_in<B: Allocator>(&self, alloc: B) -> Result<Soa<C, B>, AllocFailure> {
+        let mut out = Soa::try_with_capacity_in(self.len, alloc)?;
+        for row in self.iter() {
+            // The room is reserved: the push does not allocate.
+            out.push(C::clone_row(row));
+        }
+        Ok(out)
+    }
+
+    /// [`Soa::try_clone_in`], panicking with the [`AllocFailure`].
+    #[track_caller]
+    pub fn clone_in<B: Allocator>(&self, alloc: B) -> Soa<C, B> {
+        match self.try_clone_in(alloc) {
+            Ok(copy) => copy,
+            Err(failure) => fail(failure),
+        }
+    }
+}
+
 impl<C: CloneColumns, A: Allocator + Clone> Clone for Soa<C, A> {
-    /// Each row cloned in turn into a block of exactly `len` rows; a panicking clone drops the
-    /// clones made and frees the block.
+    /// Allocates from the collection's own allocator: prefer `clone_in`. Each row cloned in
+    /// turn into a block of exactly `len` rows; a panicking clone drops the clones made and
+    /// frees the block.
     fn clone(&self) -> Soa<C, A> {
         let mut out = Soa::with_capacity_in(self.len, self.alloc.clone());
         for row in self.iter() {
@@ -1078,8 +1103,31 @@ macro_rules! soa {
         where
             $crate::soa::Soa<($($ty,)+), A>: Clone,
         {
+            /// Allocates from the collection's own allocator: prefer `clone_in`.
             fn clone(&self) -> $Vec<A> {
                 $Vec { raw: self.raw.clone() }
+            }
+        }
+
+        // Bounded through `B` (a bound on the row tuple alone would be a trivial bound, an error
+        // for a row with a field that is not `Clone`), so such a row goes without these.
+        #[allow(dead_code)]
+        impl<A: $crate::soa::Allocator> $Vec<A> {
+            /// A copy in another allocator, as [`Soa::try_clone_in`]($crate::soa::Soa::try_clone_in).
+            pub fn try_clone_in<B: $crate::soa::Allocator>(&self, alloc: B) -> Result<$Vec<B>, $crate::AllocFailure>
+            where
+                $crate::soa::Soa<($($ty,)+), A>: $crate::make::CloneIn<B, In = $crate::soa::Soa<($($ty,)+), B>>,
+            {
+                Ok($Vec { raw: $crate::make::CloneIn::try_clone_in(&self.raw, alloc)? })
+            }
+
+            /// A copy in another allocator, as [`Soa::clone_in`]($crate::soa::Soa::clone_in).
+            #[track_caller]
+            pub fn clone_in<B: $crate::soa::Allocator>(&self, alloc: B) -> $Vec<B>
+            where
+                $crate::soa::Soa<($($ty,)+), A>: $crate::make::CloneIn<B, In = $crate::soa::Soa<($($ty,)+), B>>,
+            {
+                $Vec { raw: $crate::make::CloneIn::clone_in(&self.raw, alloc) }
             }
         }
 

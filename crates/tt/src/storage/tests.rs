@@ -983,9 +983,9 @@ fn lexed_files_match_the_old_encoding() {
 /// `token_to_literal` as it was before it stopped joining a number's text and suffix again.
 fn old_token_to_literal(text: &str, span: Span) -> Literal {
     use rustc_lexer::LiteralKind;
-    use stdx::itertools::Itertools as _;
 
-    let token = rustc_lexer::tokenize(text, rustc_lexer::FrontmatterAllowed::No).next_tuple();
+    let token =
+        rustc_lexer::tokenize(text, rustc_lexer::FrontmatterAllowed::No).next().map(|token| (token,));
     let Some((rustc_lexer::Token {
         kind: rustc_lexer::TokenKind::Literal { kind, suffix_start },
         ..

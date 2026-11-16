@@ -6,9 +6,9 @@
 //! and `}}` escape literal braces.
 
 use ast_merge_langs::Lang;
-use astlog_engine::{BuiltinAritySnafu, DslSnafu, Needs, Parsed, Sexpr, TemplateSyntax, Term};
+use astlog_engine::{Needs, Parsed, Sexpr, TemplateSyntax, Term};
 
-use crate::error::{Error, SourceError, UnknownLangNameSnafu};
+use crate::error::{Error, SourceError};
 
 /// The tree-sitter fact source, as the language sees it.
 #[derive(Debug)]
@@ -53,7 +53,7 @@ impl astlog_engine::Language for TreeSitter {
                 if args.len() != 3 {
                     return Err(Error::BuiltinArity {
                         line,
-                        name: head,
+                        name: head.to_owned(),
                         expected: 3usize,
                         got: args.len(),
                     });
@@ -81,7 +81,8 @@ impl astlog_engine::Language for TreeSitter {
 fn parse_match(args: &[Sexpr], line: usize) -> Result<Parsed<Atom>, Error> {
     let [Sexpr::Atom { text: lang_name, line: lang_line }, Sexpr::Str { text: query, .. }] = args
     else {
-        return Err(Error::Dsl { line, message: "match form is (match <lang> \"<query>\")" });
+        let message = "match form is (match <lang> \"<query>\")".to_owned();
+        return Err(Error::Dsl { line, message });
     };
     let mut captures: Vec<String> = Vec::new();
     for name in capture_names(query) {

@@ -277,7 +277,7 @@ impl Shared {
             return Ok(());
         }
         counts::bound_waited();
-        let span = tracing::info_span!(
+        let span = blaze_trace::info_span!(
             target: "blaze",
             "store pool: pinned bound",
             pinned = counts::pinned_now(),

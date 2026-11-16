@@ -20,4 +20,4 @@ unicode-properties = { workspace = true, features = ["emoji"] }
 unicode-ident.workspace = true
 
 [dev-dependencies]
-expect-test.workspace = true
+test-utils.workspace = true

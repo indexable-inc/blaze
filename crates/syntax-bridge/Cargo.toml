@@ -28,7 +28,6 @@ intern.workspace = true
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 blaze-ids.workspace = true
-expect-test.workspace = true
 test-utils.workspace = true
 
 [features]

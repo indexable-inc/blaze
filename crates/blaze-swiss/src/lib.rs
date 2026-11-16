@@ -36,7 +36,7 @@ use blaze_own::{Box, Vec};
 // (docs/v2/plan/design/model-checker.md "The switch"), as is the once-cell.
 use crate::sync::{
     Once,
-    atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering},
 };
 
 pub mod sync;
@@ -262,25 +262,128 @@ fn new_table<A: Allocator>(len: usize, alloc: A) -> Box<[Group], A> {
     groups.into_boxed_slice()
 }
 
+/// One level of an [`Index`]: its groups, and the log of the values inserted into them while
+/// the next level is built from them outside the writer's lock ([`Grow`]).
+struct Table<A: Allocator> {
+    groups: Box<[Group], A>,
+    /// One entry per group: more than the inserts a table takes between three quarters full,
+    /// where its growth starts, and seven eighths, where inserts wait for it ([`Full`]).
+    log: Box<[AtomicU32], A>,
+}
+
+impl<A: Allocator + Clone> Table<A> {
+    fn new_in(groups: usize, alloc: A) -> Table<A> {
+        // clone: the allocator's handle, once per level.
+        let mut log = Vec::with_capacity_in(groups, alloc.clone());
+        log.resize_with(groups, || AtomicU32::new(0));
+        Table { groups: new_table(groups, alloc), log: log.into_boxed_slice() }
+    }
+}
+
+/// Whether a table of `groups` takes its `len + 1`th value without starting to grow: at most
+/// three quarters full after it.
+fn below_growth(len: usize, groups: usize) -> bool {
+    (len + 1) * 4 <= groups * INDEX_SLOTS * 3
+}
+
+/// Whether a table of `groups` has room for its `len + 1`th value while it grows: at most
+/// seven eighths full after it, so a probe always meets an empty slot.
+fn below_full(len: usize, groups: usize) -> bool {
+    (len + 1) * 8 <= groups * INDEX_SLOTS * 7
+}
+
+/// Whether `groups` holds `value` under `hash`, for the one thread filling them.
+fn holds(groups: &[Group], hash: u64, value: u32) -> bool {
+    let ctrl = |at: usize| Ctrl::<INDEX_SLOTS>(groups[at].ctrl.load(Ordering::Relaxed));
+    find(hash, tag(hash), groups.len(), ctrl, |at| {
+        (groups[at.group].values[at.slot].load(Ordering::Relaxed) == value).then_some(())
+    })
+    .is_some()
+}
+
 /// A SwissTable of `u32`s, each naming a value in a column the caller keeps, found by a hash
 /// the caller computed once: what an interner keyed by a dense index puts beside its arena.
 ///
 /// A [`Index::find`] takes no lock and writes nothing: an acquire load of the level, one of
 /// the home group's word (almost always the only one) and one slot from the same 32 bytes, one
 /// cache line, then the caller's check, which reads its column only on a tag match (one in 128
-/// for another value). Inserts are the caller's to serialize (its shard's lock). A table fills to three
-/// quarters, then the next level, twice its size, is filled from it and published with one
-/// release store; the levels it outgrew stay readable, as a reader may be probing one, until
-/// [`Index::release_outgrown`] frees them with `&mut`. A value costs 7.1 to 14.2 bytes of
-/// table, and nothing is stored of its hash: growing asks the caller for it.
+/// for another value). Inserts are the caller's to serialize (its shard's lock).
+///
+/// A table that reaches three quarters full hands its writer a [`Grow`]: the next level, twice
+/// its size, is built from it outside the caller's lock ([`Grow::build`]), while other writers
+/// go on inserting into it to seven eighths full and log what they insert; then, under the
+/// lock again, [`Built::publish`] re-checks the log, copies what came in during the build and
+/// publishes the level with one release store. A reader never waits: it finishes on the level
+/// it loaded, and the levels outgrown stay readable until [`Index::release_outgrown`] frees
+/// them with `&mut`. So the lock is held for O(1) per insert and O(inserts during the build)
+/// per growth, never for the O(n) copy. A value costs 7.6 to 15.2 bytes of table and log, and
+/// nothing is stored of its hash: growing asks the caller for it. [`Index::insert`] does all
+/// of it in one call, for a writer whose lock nobody else waits on.
 ///
 /// Its tables are in the allocator `A`, which the maker names ([`Index::new_in`]); an index
 /// with no value has no table and allocates nothing.
 pub struct Index<A: Allocator + Clone> {
     /// How many levels are published; the last is in use.
     level: AtomicUsize,
-    tables: [Once<Box<[Group], A>>; LEVELS],
+    tables: [Once<Table<A>>; LEVELS],
+    /// A [`Grow`] of the level in use is out: written under the writer's lock, and cleared by
+    /// a [`Grow`] or [`Built`] dropped unpublished.
+    growing: AtomicBool,
+    /// Entries of the log of the level in use since its [`Grow`] began, written under the
+    /// writer's lock.
+    logged: AtomicUsize,
     alloc: A,
+}
+
+/// Room for one more value in an [`Index`], made under the writer's lock by
+/// [`Index::vacancy`]: [`Vacancy::fill`] puts it in.
+#[must_use = "a vacancy is room for one value; fill it under the same lock"]
+pub struct Vacancy<'a, A: Allocator + Clone> {
+    index: &'a Index<A>,
+    level: usize,
+    /// The log entry to write too, while a [`Grow`] of the level is out.
+    log: Option<usize>,
+    /// The growth this insert starts, handed to its writer.
+    grow: Option<Grow<'a, A>>,
+}
+
+/// The table in use is seven eighths full and its next level is being built: the writer
+/// unlocks, runs `grow` if it holds it (the grower before it panicked), and waits for
+/// [`Index::level`] to pass `level`.
+#[must_use = "an insert that met a full table did not happen"]
+pub struct Full<'a, A: Allocator + Clone> {
+    pub level: usize,
+    pub grow: Option<Grow<'a, A>>,
+}
+
+/// The right and duty to build the next level of an [`Index`], outside the writer's lock.
+/// Dropped unbuilt (its writer panicked), the next writer to insert starts the growth again.
+#[must_use = "a table at three quarters full grows only through its Grow"]
+pub struct Grow<'a, A: Allocator + Clone> {
+    growing: Growing<'a, A>,
+    level: usize,
+}
+
+/// A next level built from the one in use and the log up to `copied`; [`Built::publish`]
+/// finishes it under the writer's lock.
+#[must_use = "a built level is used only once published under the writer's lock"]
+pub struct Built<'a, A: Allocator + Clone> {
+    growing: Growing<'a, A>,
+    level: usize,
+    table: Table<A>,
+    copied: usize,
+}
+
+/// Clears `growing` when a growth ends, published or dropped.
+struct Growing<'a, A: Allocator + Clone> {
+    index: &'a Index<A>,
+}
+
+impl<A: Allocator + Clone> Drop for Growing<'_, A> {
+    fn drop(&mut self) {
+        // Release: a writer that sees no growth sees the level it published, if it did.
+        self.index.growing.store(false, Ordering::Release);
+    }
 }
 
 /// The ratchet's (tools/ratchets): an index in a default allocator, for the callers that made
@@ -301,12 +404,28 @@ impl<A: Allocator + Clone + Default> Index<A> {
 impl<A: Allocator + Clone> Index<A> {
     /// An empty index whose tables go in `alloc`: no allocation until the first insert.
     pub fn new_in(alloc: A) -> Index<A> {
-        Index { level: AtomicUsize::new(0), tables: core::array::from_fn(|_| Once::new()), alloc }
+        Index {
+            level: AtomicUsize::new(0),
+            tables: core::array::from_fn(|_| Once::new()),
+            growing: AtomicBool::new(false),
+            logged: AtomicUsize::new(0),
+            alloc,
+        }
+    }
+
+    fn table_at(&self, level: usize) -> Option<&Table<A>> {
+        let level = level.checked_sub(1)?;
+        Some(self.tables[level].get().expect("a published index level holds its table"))
     }
 
     fn at_level(&self, level: usize) -> Option<&[Group]> {
-        let level = level.checked_sub(1)?;
-        Some(self.tables[level].get().expect("a published index level holds its table"))
+        self.table_at(level).map(|table| &*table.groups)
+    }
+
+    /// How many levels are published: what a writer that met [`Full`] waits to see pass.
+    pub fn level(&self) -> usize {
+        // Acquire: a level seen is a table whose slots are seen.
+        self.level.load(Ordering::Acquire)
     }
 
     /// The value inserted under `hash` that `is` accepts. `is` is asked only of values whose
@@ -322,44 +441,70 @@ impl<A: Allocator + Clone> Index<A> {
         })
     }
 
-    /// Publishes `value` under `hash`, for the one writer at a time the caller lets in. `len` is
-    /// how many values the index held before this one, and `hash_of` the hash a held value was
-    /// inserted under, which growing asks for. Whatever `find`'s `is` reads of `value` must be
-    /// written before this call.
+    /// Publishes `value` under `hash` and, if that fills the table to three quarters, grows it
+    /// in place: for a writer no other thread waits on, or one whose lock is held for the
+    /// copy anyway. `len` is how many values the index held before this one, and `hash_of` the
+    /// hash a held value was inserted under, which growing asks for. Whatever `find`'s `is`
+    /// reads of `value` must be written before this call. A writer that others wait on calls
+    /// [`Index::vacancy`] and runs the [`Grow`] after unlocking.
     pub fn insert(&self, len: usize, hash: u64, value: u32, hash_of: impl Fn(u32) -> u64) {
-        let groups = self.table_for_one_more(len, hash_of);
-        put(groups, hash, value, Ordering::Release);
-    }
-
-    /// The table to insert one more value into, at most three quarters full after it.
-    fn table_for_one_more(&self, len: usize, hash_of: impl Fn(u32) -> u64) -> &[Group] {
-        // Relaxed: only the one writer stores `level`.
-        let level = self.level.load(Ordering::Relaxed);
-        let current = self.at_level(level);
-        if let Some(groups) = current
-            && (len + 1) * 4 <= groups.len() * INDEX_SLOTS * 3
-        {
-            return groups;
-        }
-        assert!(level < LEVELS, "an index of more than 2^32 values");
-        // clone: the allocator's handle, once per level.
-        let grown = new_table(1 << level, self.alloc.clone());
-        if let Some(old) = current {
-            // Relaxed: every write to the table was the writer's, and so ours.
-            for group in old {
-                for slot in Ctrl::<INDEX_SLOTS>(group.ctrl.load(Ordering::Relaxed)).full() {
-                    let value = group.values[slot].load(Ordering::Relaxed);
-                    put(&grown, hash_of(value), value, Ordering::Relaxed);
+        loop {
+            match self.vacancy(len) {
+                Ok(vacancy) => {
+                    if let Some(grow) = vacancy.fill(hash, value) {
+                        grow.build(&hash_of).publish(&hash_of);
+                    }
+                    return;
                 }
+                Err(Full { grow: Some(grow), .. }) => grow.build(&hash_of).publish(&hash_of),
+                Err(Full { level, grow: None }) => panic!(
+                    "Index::insert met level {level} growing in another thread: `insert` is \
+                     for a writer that grows its own index"
+                ),
             }
         }
-        if self.tables[level].set(grown).is_err() {
-            unreachable!("index level {level} published twice");
+    }
+
+    /// Room for one more value, for the one writer at a time the caller lets in; `len` is how
+    /// many values the index holds. O(1): the first table (one group) is made here, and every
+    /// later one by the [`Grow`] that fills it.
+    pub fn vacancy(&self, len: usize) -> Result<Vacancy<'_, A>, Full<'_, A>> {
+        // Relaxed: only the one writer stores `level`.
+        let level = self.level.load(Ordering::Relaxed);
+        let Some(table) = self.table_at(level) else {
+            // clone: the allocator's handle, once per index.
+            if self.tables[0].set(Table::new_in(1, self.alloc.clone())).is_err() {
+                unreachable!("index level 0 published twice");
+            }
+            // Release: a reader that loads the level sees the table's empty groups.
+            self.level.store(1, Ordering::Release);
+            return Ok(Vacancy { index: self, level: 1, log: None, grow: None });
+        };
+        let groups = table.groups.len();
+        // Acquire: a growth dropped unpublished outside the lock released its end.
+        if self.growing.load(Ordering::Acquire) {
+            // Relaxed: only the one writer stores `logged` while a growth is out.
+            let logged = self.logged.load(Ordering::Relaxed);
+            if below_full(len, groups) && logged < table.log.len() {
+                return Ok(Vacancy { index: self, level, log: Some(logged), grow: None });
+            }
+            return Err(Full { level, grow: None });
         }
-        // Release: a reader that loads the new level sees the table's slots and, through the
-        // caller's order, the values they name.
-        self.level.store(level + 1, Ordering::Release);
-        self.at_level(level + 1).expect("the level just published")
+        let room = below_full(len, groups);
+        if room && below_growth(len, groups) {
+            return Ok(Vacancy { index: self, level, log: None, grow: None });
+        }
+        assert!(level < LEVELS, "an index of more than 2^32 values");
+        self.growing.store(true, Ordering::Relaxed);
+        self.logged.store(0, Ordering::Relaxed);
+        let grow = Grow { growing: Growing { index: self }, level };
+        // The value that crosses three quarters goes in before the growth's scan, which sees
+        // it; past seven eighths (a growth before was dropped) it waits for this one.
+        if room {
+            Ok(Vacancy { index: self, level, log: None, grow: Some(grow) })
+        } else {
+            Err(Full { level, grow: Some(grow) })
+        }
     }
 
     /// How many values the table in use holds at most before it grows: 0 before the first insert.
@@ -373,6 +518,89 @@ impl<A: Allocator + Clone> Index<A> {
         let level = self.level.load(Ordering::Relaxed);
         for table in &mut self.tables[..level.saturating_sub(1)] {
             *table = Once::new();
+        }
+    }
+}
+
+impl<'a, A: Allocator + Clone> Vacancy<'a, A> {
+    /// Publishes `value` under `hash`, still under the lock that made the vacancy; whatever
+    /// `find`'s `is` reads of `value` must be written before. `Some`: this insert filled the
+    /// table to three quarters, and its writer runs the [`Grow`] once it unlocks.
+    pub fn fill(self, hash: u64, value: u32) -> Option<Grow<'a, A>> {
+        let index = self.index;
+        let table = index.table_at(self.level).expect("a vacancy's level is published");
+        put(&table.groups, hash, value, Ordering::Release);
+        if let Some(entry) = self.log {
+            table.log[entry].store(value, Ordering::Relaxed);
+            // Release: a grower that loads the count sees the entries below it.
+            index.logged.store(entry + 1, Ordering::Release);
+        }
+        self.grow
+    }
+}
+
+impl<'a, A: Allocator + Clone> Grow<'a, A> {
+    /// The next level, built outside the writer's lock from the level in use and the log so
+    /// far: O(n), while writers go on inserting into the level in use and readers probe it.
+    pub fn build(self, hash_of: impl Fn(u32) -> u64) -> Built<'a, A> {
+        let index = self.growing.index;
+        let level = self.level;
+        let from = index.table_at(level).expect("a growth's level is published");
+        let table = Table::new_in(1 << level, index.alloc.clone());
+        // Every value in `from` when the growth began: its writer handed us the growth, and
+        // its lock ordered what came before.
+        for group in &*from.groups {
+            // Acquire: a full slot's value was stored before its tag was released.
+            for slot in Ctrl::<INDEX_SLOTS>(group.ctrl.load(Ordering::Acquire)).full() {
+                let value = group.values[slot].load(Ordering::Relaxed);
+                put(&table.groups, hash_of(value), value, Ordering::Relaxed);
+            }
+        }
+        // Acquire: pairs with each logging writer's release of the count.
+        let copied = index.logged.load(Ordering::Acquire);
+        copy_log(&table, &from.log[..copied], &hash_of);
+        Built { growing: self.growing, level, table, copied }
+    }
+}
+
+impl<A: Allocator + Clone> Built<'_, A> {
+    /// Re-checks the log under the writer's lock, copies the values inserted since
+    /// [`Grow::build`] read it, and publishes the level: O(inserts during the build).
+    pub fn publish(self, hash_of: impl Fn(u32) -> u64) {
+        let index = self.growing.index;
+        let from = index.table_at(self.level).expect("a growth's level is published");
+        // Relaxed: the writer's lock, which we hold, ordered every logging insert.
+        let logged = index.logged.load(Ordering::Relaxed);
+        copy_log(&self.table, &from.log[self.copied..logged], &hash_of);
+        self.swap();
+    }
+
+    /// The planted bug of the model test: publishing what the build saw, without the re-check.
+    #[cfg(test)]
+    fn publish_without_recheck(self) {
+        self.swap();
+    }
+
+    fn swap(self) {
+        let Built { growing, level, table, copied: _ } = self;
+        let index = growing.index;
+        if index.tables[level].set(table).is_err() {
+            unreachable!("index level {level} published twice");
+        }
+        // Release: a reader that loads the new level sees the table's slots and, through the
+        // caller's order, the values they name.
+        index.level.store(level + 1, Ordering::Release);
+        drop(growing);
+    }
+}
+
+/// Puts each logged value not in `table` already: the build's scan may have seen it too.
+fn copy_log<A: Allocator>(table: &Table<A>, log: &[AtomicU32], hash_of: impl Fn(u32) -> u64) {
+    for entry in log {
+        let value = entry.load(Ordering::Relaxed);
+        let hash = hash_of(value);
+        if !holds(&table.groups, hash, value) {
+            put(&table.groups, hash, value, Ordering::Relaxed);
         }
     }
 }
@@ -714,7 +942,7 @@ mod tests {
         let levels = index.level.load(Ordering::Relaxed);
         assert!(levels > 5);
         for table in index.tables[..levels].iter().filter_map(Once::get) {
-            for group in table.iter() {
+            for group in table.groups.iter() {
                 let at = std::ptr::from_ref(group).addr();
                 assert_eq!(at / 64, (at + size_of::<Group>() - 1) / 64, "a group in one line");
             }
@@ -763,6 +991,7 @@ mod model {
     use blaze_check::thread;
 
     use super::*;
+    use crate::sync::Spin;
 
     /// Every value is its own key, all of one hash: one home group and one tag, so every probe
     /// asks the caller and four values fill the first table (one group of six) to three
@@ -796,5 +1025,70 @@ mod model {
                 );
             }
         });
+    }
+
+    /// Values in the third table (four groups of six) at which it starts to grow: the
+    /// nineteenth fills it past three quarters, and it takes up to twenty-one, seven eighths,
+    /// while the next is built.
+    const BEFORE_GROWTH: u32 = 18;
+
+    /// The swap of a growth built outside the writer's lock: one thread starts the growth,
+    /// builds the next level unlocked and publishes it under the lock, while another inserts
+    /// under the lock at any point of that. `recheck: false` is the planted bug, a publish that
+    /// does not re-check the log after the build: the other's value is lost in some schedule.
+    fn swap_keeps_an_insert_during_the_build(recheck: bool) {
+        blaze_check::model(move || {
+            let index = Arc::new(Index::new_in(Global));
+            for value in 0..BEFORE_GROWTH {
+                index.insert(value as usize, HASH, value, |_| HASH);
+            }
+            let len = Arc::new(Spin::new("swiss.test.writer", BEFORE_GROWTH as usize));
+            let grow = {
+                let mut len = len.lock();
+                let vacancy = index.vacancy(*len).expect("room below seven eighths");
+                let grow = vacancy.fill(HASH, BEFORE_GROWTH).expect("three quarters: a growth");
+                *len += 1;
+                grow
+            };
+            let other = {
+                let (index, len) = (index.clone(), len.clone());
+                thread::spawn(move || {
+                    let mut len = len.lock();
+                    let vacancy = index.vacancy(*len).expect("room below seven eighths");
+                    assert!(vacancy.fill(HASH, BEFORE_GROWTH + 1).is_none(), "one growth");
+                    *len += 1;
+                })
+            };
+            let built = grow.build(|_| HASH);
+            {
+                let _len = len.lock();
+                if recheck {
+                    built.publish(|_| HASH);
+                } else {
+                    built.publish_without_recheck();
+                }
+            }
+            other.join().unwrap();
+            assert_eq!(index.level(), 4, "one growth published");
+            for value in 0..BEFORE_GROWTH + 2 {
+                assert_eq!(
+                    index.find(HASH, |it| it == value),
+                    Some(value),
+                    "value {value} kept across the swap"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn model_swiss_swap_keeps_an_insert_during_the_build() {
+        swap_keeps_an_insert_during_the_build(true);
+    }
+
+    /// The control: without the re-check the model finds the lost insert.
+    #[test]
+    #[should_panic(expected = "kept across the swap")]
+    fn model_swiss_swap_without_recheck_loses_an_insert() {
+        swap_keeps_an_insert_during_the_build(false);
     }
 }

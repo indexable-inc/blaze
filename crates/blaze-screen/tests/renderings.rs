@@ -9,7 +9,7 @@ use blaze_report::{
     terminal::Terminal,
 };
 use blaze_screen::{Built, Caps, Command, Event, Options, Screen, Test, Verdict, Why, encode};
-use expect_test::expect_file;
+use test_utils::expect_file;
 
 fn why(wasted: bool) -> Why {
     Why {

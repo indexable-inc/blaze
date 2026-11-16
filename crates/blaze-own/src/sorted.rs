@@ -17,7 +17,11 @@ use core::{
     slice,
 };
 
-use crate::vec::{Refused, Vec};
+use crate::{
+    error::{AllocFailure, fail},
+    make::CloneIn,
+    vec::{Refused, Vec},
+};
 
 /// A map ordered by key, one sorted vector of `(key, value)`.
 ///
@@ -370,8 +374,42 @@ impl<K: Ord, V, A: Allocator> Extend<(K, V)> for SortedMap<K, V, A> {
 }
 
 impl<K: Clone, V: Clone, A: Allocator + Clone> Clone for SortedMap<K, V, A> {
+    /// Allocates from the collection's own allocator: prefer `clone_in`.
     fn clone(&self) -> SortedMap<K, V, A> {
         SortedMap { entries: self.entries.clone() }
+    }
+}
+
+impl<K, V, A: Allocator> SortedMap<K, V, A> {
+    /// A deep copy in another allocator: each key and value copied with [`CloneIn`] into
+    /// `alloc`, in place (a copy orders as its original, `CloneIn`'s contract, so nothing is
+    /// sorted again). A refusal drops what was copied.
+    pub fn try_clone_in<B: Allocator + Clone>(&self, alloc: B) -> Result<SortedMap<K::In, V::In, B>, AllocFailure>
+    where
+        K: CloneIn<B>,
+        V: CloneIn<B>,
+    {
+        let mut entries = Vec::try_with_capacity_in(self.entries.len(), alloc.clone())?;
+        for (key, value) in self.entries.as_slice() {
+            let key = key.try_clone_in(alloc.clone())?;
+            let value = value.try_clone_in(alloc.clone())?;
+            // The room is reserved: the push does not allocate.
+            entries.push((key, value));
+        }
+        Ok(SortedMap { entries })
+    }
+
+    /// [`SortedMap::try_clone_in`], panicking with the [`AllocFailure`].
+    #[track_caller]
+    pub fn clone_in<B: Allocator + Clone>(&self, alloc: B) -> SortedMap<K::In, V::In, B>
+    where
+        K: CloneIn<B>,
+        V: CloneIn<B>,
+    {
+        match self.try_clone_in(alloc) {
+            Ok(copy) => copy,
+            Err(failure) => fail(failure),
+        }
     }
 }
 
@@ -628,8 +666,28 @@ impl<T: Ord, A: Allocator> Extend<T> for SortedSet<T, A> {
 }
 
 impl<T: Clone, A: Allocator + Clone> Clone for SortedSet<T, A> {
+    /// Allocates from the collection's own allocator: prefer `clone_in`.
     fn clone(&self) -> SortedSet<T, A> {
         SortedSet { values: self.values.clone() }
+    }
+}
+
+impl<T, A: Allocator> SortedSet<T, A> {
+    /// A deep copy in another allocator, each value copied with [`CloneIn`] in place.
+    pub fn try_clone_in<B: Allocator + Clone>(&self, alloc: B) -> Result<SortedSet<T::In, B>, AllocFailure>
+    where
+        T: CloneIn<B>,
+    {
+        Ok(SortedSet { values: self.values.try_clone_in(alloc)? })
+    }
+
+    /// [`SortedSet::try_clone_in`], panicking with the [`AllocFailure`].
+    #[track_caller]
+    pub fn clone_in<B: Allocator + Clone>(&self, alloc: B) -> SortedSet<T::In, B>
+    where
+        T: CloneIn<B>,
+    {
+        SortedSet { values: self.values.clone_in(alloc) }
     }
 }
 

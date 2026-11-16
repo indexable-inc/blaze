@@ -70,7 +70,7 @@ fn target_of(db: &Db, key: ItemKey) -> Option<LangItemTarget> {
 /// task with a `Need` naming it.
 #[blaze_memo::tracked(returns(as_deref), mem_tag = Nameres)]
 pub fn crate_lang_items(db: &Db, krate: Crate) -> Option<Box<LangItems>> {
-    let _p = tracing::info_span!("crate_lang_items_query").entered();
+    let _p = blaze_trace::info_span!("crate_lang_items_query").entered();
     let view = db.items().lang_items(krate.key(db)).or_need();
     let mut lang_items = LangItems::default();
     for (name, key) in view.iter() {
@@ -92,7 +92,7 @@ pub fn crate_lang_items(db: &Db, krate: Crate) -> Option<Box<LangItems>> {
 /// lang items is read (`CrateFlags::LANG_ITEMS`): one row read, then one record per such crate.
 #[blaze_memo::tracked(returns(ref), mem_tag = Nameres)]
 pub fn lang_items(db: &Db, start_crate: Crate) -> LangItems {
-    let _p = tracing::info_span!("lang_items_query").entered();
+    let _p = blaze_trace::info_span!("lang_items_query").entered();
     let key = start_crate.key(db);
     let graph = db.items().crate_graph(key).or_need();
     let Some(start) = graph.index_of(key) else {

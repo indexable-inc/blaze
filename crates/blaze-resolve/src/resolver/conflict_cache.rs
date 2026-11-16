@@ -2,7 +2,7 @@ use crate::resolver::{HashMap, HashSet};
 use std::alloc::Global;
 use std::collections::BTreeMap;
 
-use tracing::trace;
+use blaze_trace::trace;
 
 use super::context::ResolverContext;
 use super::types::ConflictMap;

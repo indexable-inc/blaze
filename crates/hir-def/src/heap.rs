@@ -3,20 +3,10 @@
 //! drop, not by eviction.
 
 use la_arena::{Arena, ArenaMap, Idx};
-use thin_vec::ThinVec;
 
 /// A `Vec`'s buffer, its capacity's elements.
 pub(crate) fn vec_bytes<T>(vec: &Vec<T>) -> usize {
     vec.capacity() * size_of::<T>()
-}
-
-/// A `ThinVec`'s buffer, its header (length and capacity) and its capacity's elements; none
-/// while it has no capacity (the shared empty header).
-pub(crate) fn thin_vec_bytes<T>(vec: &ThinVec<T>) -> usize {
-    match vec.capacity() {
-        0 => 0,
-        capacity => 2 * size_of::<usize>() + capacity * size_of::<T>(),
-    }
 }
 
 /// An `ArenaMap`'s slots up to its last value (la_arena shows neither its length nor its

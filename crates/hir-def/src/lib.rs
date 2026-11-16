@@ -79,7 +79,6 @@ use rustc_abi::ExternAbi;
 use span::{AstIdNode, Edition, FileAstId, SyntaxContext};
 use stdx::impl_from;
 use syntax::{AstNode, ast};
-use thin_vec::ThinVec;
 
 use crate::{
     attrs::AttrFlags,
@@ -357,7 +356,7 @@ impl EnumId {
     pub fn enum_variants_with_diagnostics(
         self,
         db: &Db,
-    ) -> &(EnumVariants, ThinVec<InactiveEnumVariantCode>) {
+    ) -> &(EnumVariants, Box<[InactiveEnumVariantCode]>) {
         EnumVariants::of(db, self)
     }
 }
@@ -533,7 +532,7 @@ impl Hash for MacroRulesLoc {
     }
 }
 
-bitflags::bitflags! {
+blaze_bitflags::bitflags! {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct MacroRulesLocFlags: u8 {
         const ALLOW_INTERNAL_UNSAFE = 1 << 0;

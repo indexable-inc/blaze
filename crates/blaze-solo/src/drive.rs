@@ -48,7 +48,7 @@ pub fn drive<D: Driver, S: Durable + ?Sized>(
         done.clear();
         let since = driver.now();
         let got = {
-            let _span = tracing::info_span!(target: "blaze", "solo: wait for the command's effects", in_flight = driver.in_flight()).entered();
+            let _span = blaze_trace::info_span!(target: "blaze", "solo: wait for the command's effects", in_flight = driver.in_flight()).entered();
             driver.poll(&mut done, Deadline::after(since, STALL))
         };
         if got == 0 && Deadline::after(since, STALL).passed(driver.now()) {
@@ -66,7 +66,7 @@ pub fn drive<D: Driver, S: Durable + ?Sized>(
                 Poll::Pending => {}
                 Poll::Flush => {
                     let flushed = {
-                        let _span = tracing::info_span!(target: "blaze", "solo: wait for the store's flush").entered();
+                        let _span = blaze_trace::info_span!(target: "blaze", "solo: wait for the store's flush").entered();
                         store.flush()
                     };
                     let now = driver.now();

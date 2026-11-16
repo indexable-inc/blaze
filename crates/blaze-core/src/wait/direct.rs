@@ -97,24 +97,7 @@ impl<S: FutexCalls> Futex for Direct<'_, S> {
         deadline: Option<Deadline>,
         clock: &C,
     ) -> Result<Waited<()>, WaitError> {
-        until(what, clock, deadline, |left| {
-            // The absolute time of this call alone, from what is left now.
-            let at = match left {
-                Some(left) => Some(self.0.monotonic()?.saturating_add(left)),
-                None => None,
-            };
-            match self.0.futex_wait(word, expected, at) {
-                // Woken, or returned with nothing: the parker looks at the word again.
-                Ok(()) => Ok(Once::Ready(())),
-                Err(error) => match error.raw_os_error() {
-                    // The word no longer held `expected`: a wake came before the wait.
-                    Some(libc::EAGAIN) => Ok(Once::Ready(())),
-                    Some(libc::EINTR) => Ok(Once::Interrupted),
-                    Some(libc::ETIMEDOUT) => Ok(Once::TimedOut),
-                    _ => Err(error),
-                },
-            }
-        })
+        until(what, clock, deadline, |left| futex_once(self.0, word, expected, left))
     }
 
     fn wake(&self, word: &AtomicU32) {
@@ -124,6 +107,68 @@ impl<S: FutexCalls> Futex for Direct<'_, S> {
     fn switch(&self) {
         self.0.between();
     }
+}
+
+/// One `FUTEX_WAIT_BITSET` of `calls` on `word` while it holds `expected`, for at most `left`
+/// (no limit for `None`): the call of a park and of a lock's word alike.
+fn futex_once<S: FutexCalls>(
+    calls: &S,
+    word: &AtomicU32,
+    expected: u32,
+    left: Option<Duration>,
+) -> io::Result<Once<()>> {
+    // The absolute time of this call alone, from what is left now.
+    let at = match left {
+        Some(left) => Some(calls.monotonic()?.saturating_add(left)),
+        None => None,
+    };
+    match calls.futex_wait(word, expected, at) {
+        // Woken, or returned with nothing: the waiter looks at the word again.
+        Ok(()) => Ok(Once::Ready(())),
+        Err(error) => match error.raw_os_error() {
+            // The word no longer held `expected`: a wake came before the wait.
+            Some(libc::EAGAIN) => Ok(Once::Ready(())),
+            Some(libc::EINTR) => Ok(Once::Interrupted),
+            Some(libc::ETIMEDOUT) => Ok(Once::TimedOut),
+            _ => Err(error),
+        },
+    }
+}
+
+/// The wait of a lock's word ([`super::word_wait`]), on either driver: a direct
+/// `FUTEX_WAIT_BITSET`, never the thread's ring, so a lock waited for while the ring is in use
+/// (or in a thread that has none) needs no ring; and no row of its own in the wait-for graph
+/// (the lock's is the row).
+pub(crate) fn word_wait(
+    what: &'static str,
+    word: &AtomicU32,
+    expected: u32,
+    deadline: Option<Deadline>,
+    clock: &impl Clock,
+) -> Result<Waited<()>, WaitError> {
+    super::unlisted(what, clock, deadline, |left| futex_once(&Kernel, word, expected, left))
+}
+
+/// The wake of a lock's word: one `FUTEX_WAKE | FUTEX_PRIVATE_FLAG` of one waiter, or of every
+/// one (`all`).
+pub(crate) fn word_wake(word: &AtomicU32, all: bool) {
+    let count = match all {
+        true => i32::MAX,
+        false => 1,
+    };
+    // A wake of a live aligned word cannot fail; the count woken is not needed.
+    // SAFETY: a wake of a word of this process; the kernel reads no memory of it.
+    _ = unsafe {
+        libc::syscall(
+            libc::SYS_futex,
+            word.as_ptr(),
+            libc::FUTEX_WAKE | libc::FUTEX_PRIVATE_FLAG,
+            count,
+            ptr::null::<libc::timespec>(),
+            ptr::null::<u32>(),
+            0u32,
+        )
+    };
 }
 
 impl<S: ChildCalls> Children for Direct<'_, S> {

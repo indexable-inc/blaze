@@ -6,7 +6,6 @@ use base_db::{Crate, Db};
 use blaze_mem::Frame;
 use cfg::CfgExpr;
 use parser::T;
-use smallvec::SmallVec;
 use syntax::{
     NodeOrToken, WalkEvent,
     view::{self, AstNode as _, HasAttrs as _},
@@ -23,8 +22,8 @@ use crate::{
 struct ItemIsCfgedOut;
 
 /// The callback's answers that insert no tokens, keeping or skipping the token.
-const KEEP: (bool, Inserted) = (true, Inserted::new_const());
-const SKIP: (bool, Inserted) = (false, Inserted::new_const());
+const KEEP: (bool, Inserted) = (true, Inserted::new());
+const SKIP: (bool, Inserted) = (false, Inserted::new());
 
 /// An attribute `cfg_attr` leaves: where its text is.
 #[derive(Debug)]
@@ -152,7 +151,7 @@ macro_rules! macro_input_callback_impl {
                                     excl_span: attr
                                         .excl_token()
                                         .map(|token| span_map.span_for_range(token.text_range())),
-                                    expanded_attrs: SmallVec::new(),
+                                    expanded_attrs: Vec::new(),
                                     expanded_attrs_idx: 0,
                                     next_expanded_attr: NextExpandedAttrState::NotStarted,
                                 });

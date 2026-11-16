@@ -24,14 +24,14 @@ blaze-ids.workspace = true
 blaze-keyed.workspace = true
 blaze-mem.workspace = true
 blaze-reclaim.workspace = true
-blaze-serde.workspace = true
 blaze-spin.workspace = true
 crossbeam-channel.workspace = true
 crossbeam-queue.workspace = true
 libc.workspace = true
 lz4_flex.workspace = true
-serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
+# `store.json`, read as JSON into its typed value.
+blaze-data.workspace = true
+blaze-json.workspace = true
 tracing.workspace = true
 zstd.workspace = true
 

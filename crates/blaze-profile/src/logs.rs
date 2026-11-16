@@ -27,11 +27,11 @@ use crate::flight::{EventRow, FieldRow, FieldValue, Read};
 
 /// Whether an event of `target` named `name` at `level` is kept by the flight recorder (the
 /// module doc's rule).
-pub fn keeps_event(target: &str, name: &str, level: tracing::Level) -> bool {
+pub fn keeps_event(target: &str, name: &str, level: blaze_trace::Level) -> bool {
     match level {
-        tracing::Level::ERROR | tracing::Level::WARN => true,
-        tracing::Level::INFO => crate::keeps(target, name),
-        tracing::Level::DEBUG => blaze_debug(target),
+        blaze_trace::Level::ERROR | blaze_trace::Level::WARN => true,
+        blaze_trace::Level::INFO => crate::keeps(target, name),
+        blaze_trace::Level::DEBUG => blaze_debug(target),
         _ => false,
     }
 }
@@ -39,7 +39,7 @@ pub fn keeps_event(target: &str, name: &str, level: tracing::Level) -> bool {
 /// [`keeps_event`] of the level `tracing` names `level` (`"info"`, `"DEBUG"`, `"3"`): what a
 /// lint reads from a macro's text. False for a name that is no level's.
 pub fn keeps_event_named(target: &str, name: &str, level: &str) -> bool {
-    level.parse::<tracing::Level>().is_ok_and(|level| keeps_event(target, name, level))
+    level.parse::<blaze_trace::Level>().is_ok_and(|level| keeps_event(target, name, level))
 }
 
 /// Whether a DEBUG event of `target` is kept: its target is `blaze` or a path under it
@@ -218,7 +218,7 @@ impl Hold {
         let errors: Vec<u32> = read
             .events
             .iter()
-            .filter(|it| it.build != 0 && level(it.site) == Some(tracing::Level::ERROR))
+            .filter(|it| it.build != 0 && level(it.site) == Some(blaze_trace::Level::ERROR))
             .map(|it| it.build)
             .collect();
         for build in errors {
@@ -228,7 +228,7 @@ impl Hold {
         let held = &mut self.held;
         let (troubled, well) = (&self.troubled, &self.well);
         let fate = |build: u32, site: u16| match level(site) {
-            Some(tracing::Level::DEBUG) => match build {
+            Some(blaze_trace::Level::DEBUG) => match build {
                 0 => Fate::Drop,
                 _ if troubled.contains(&build) => Fate::Write,
                 _ if well.contains(&build) => Fate::Drop,
@@ -318,7 +318,7 @@ fn remember(set: &mut BTreeSet<u32>, build: u32) {
 }
 
 /// The level of the callsite `site`.
-fn level(site: u16) -> Option<tracing::Level> {
+fn level(site: u16) -> Option<blaze_trace::Level> {
     crate::flight::meta(site).map(|it| *it.level())
 }
 
@@ -456,7 +456,7 @@ mod tests {
         let read = std::thread::spawn(|| {
             let tid = crate::sampler::os_tid() as u32;
             let _build = flight::building(0x7a11);
-            tracing::info!(target: "blaze", n = -3i64, count = 7u64, ratio = 0.5, ok = true, label = "x", shown = ?[1, 2], "typed fields");
+            blaze_trace::info!(target: "blaze", n = -3i64, count = 7u64, ratio = 0.5, ok = true, label = "x", shown = ?[1, 2], "typed fields");
             mine(tid)
         })
         .join()
@@ -514,10 +514,10 @@ mod tests {
             let tid = crate::sampler::os_tid() as u32;
             for build in [ok, failed] {
                 let _build = flight::building(build);
-                tracing::debug!(target: "blaze", step = 1u64, "debug of a build");
-                tracing::info!(target: "blaze", step = 2u64, "info of a build");
+                blaze_trace::debug!(target: "blaze", step = 1u64, "debug of a build");
+                blaze_trace::info!(target: "blaze", step = 2u64, "info of a build");
             }
-            tracing::debug!(target: "blaze_fmt::hot", "a module path's debug is not kept");
+            blaze_trace::debug!(target: "blaze_fmt::hot", "a module path's debug is not kept");
             mine(tid)
         })
         .join()
@@ -535,7 +535,7 @@ mod tests {
         };
         assert_eq!(
             builds(&read),
-            [(ok, Some(tracing::Level::INFO)), (failed, Some(tracing::Level::INFO))],
+            [(ok, Some(blaze_trace::Level::INFO)), (failed, Some(blaze_trace::Level::INFO))],
             "debug rows held"
         );
         assert_eq!(read.fields.len(), 2, "the info events' fields");
@@ -546,7 +546,7 @@ mod tests {
         hold.sort(&mut next);
         assert_eq!(
             builds(&next),
-            [(failed, Some(tracing::Level::DEBUG))],
+            [(failed, Some(blaze_trace::Level::DEBUG))],
             "the failed build's debug row alone"
         );
         let [field] = next.fields.as_slice() else { panic!("its field: {:?}", next.fields) };
@@ -571,11 +571,11 @@ mod tests {
 
     #[test]
     fn warn_of_any_target_is_kept_and_debug_only_when_it_opts_in() {
-        assert!(keeps_event("hyper::proto", "event x.rs:1", tracing::Level::WARN));
-        assert!(!keeps_event("hyper::proto", "event x.rs:1", tracing::Level::INFO));
-        assert!(keeps_event("blaze::store", "event x.rs:1", tracing::Level::DEBUG));
-        assert!(!keeps_event("blaze_fmt", "event x.rs:1", tracing::Level::DEBUG));
-        assert!(!keeps_event("blaze", "event x.rs:1", tracing::Level::TRACE));
+        assert!(keeps_event("hyper::proto", "event x.rs:1", blaze_trace::Level::WARN));
+        assert!(!keeps_event("hyper::proto", "event x.rs:1", blaze_trace::Level::INFO));
+        assert!(keeps_event("blaze::store", "event x.rs:1", blaze_trace::Level::DEBUG));
+        assert!(!keeps_event("blaze_fmt", "event x.rs:1", blaze_trace::Level::DEBUG));
+        assert!(!keeps_event("blaze", "event x.rs:1", blaze_trace::Level::TRACE));
         assert!(keeps_event_named("anything", "event x.rs:1", "error"));
     }
 }

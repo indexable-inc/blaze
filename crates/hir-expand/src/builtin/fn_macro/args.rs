@@ -8,7 +8,6 @@ use std::borrow::Cow;
 use intern::{Symbol, sym};
 use stdx::iter::IterExt;
 use mbe::expect_fragment;
-use smallvec::SmallVec;
 use span::Span;
 use syntax::unescape::{unescape_byte, unescape_byte_str, unescape_char, unescape_str};
 

@@ -3,7 +3,7 @@
 
 use std::fmt::Write as _;
 
-use expect_test::expect_file;
+use test_utils::expect_file;
 use hir_expand::fixture;
 use la_arena::{Idx, RawIdx};
 use syntax::{SyntaxKind, TextRange};

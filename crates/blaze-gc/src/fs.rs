@@ -119,15 +119,15 @@ pub fn execute(
                     found: Err("its run ended before the scan began".to_owned()),
                 });
             }
-            let span = tracing::info_span!(
+            let span = blaze_trace::info_span!(
                 target: "blaze",
                 "gc scan",
                 run,
                 pressure = gate.map_or(0, |it| it.pressure),
                 after = after.as_deref().unwrap_or(""),
                 dirs,
-                objects = tracing::field::Empty,
-                bytes = tracing::field::Empty,
+                objects = blaze_trace::field::Empty,
+                bytes = blaze_trace::field::Empty,
             );
             let _entered = span.enter();
             let found = scan(areas, after.as_deref(), *dirs, *until_ns, clock, sizes);
@@ -139,14 +139,14 @@ pub fn execute(
         }
         Decision::Trash { run, path, to, class } => {
             let pressure = gate.map_or(0, |it| it.pressure);
-            let _span = tracing::info_span!(target: "blaze", "gc sweep", run, pressure, path = %path, to = %to).entered();
+            let _span = blaze_trace::info_span!(target: "blaze", "gc sweep", run, pressure, path = %path, to = %to).entered();
             let swept = trash(Path::new(path), Path::new(to), *class, gate.map(|it| (it, *run)));
             // clone: the answer's own path, once a rename
             Some(Answer::Trashed { run: *run, path: path.clone(), swept })
         }
         Decision::Unlink { run, path } => {
             let pressure = gate.map_or(0, |it| it.pressure);
-            let span = tracing::info_span!(target: "blaze", "gc unlink", run, pressure, path = %path, bytes = tracing::field::Empty).entered();
+            let span = blaze_trace::info_span!(target: "blaze", "gc unlink", run, pressure, path = %path, bytes = blaze_trace::field::Empty).entered();
             let done = match cancelled(*run) {
                 true => {
                     Err("its run ended before the unlink began; the next run unlinks it".to_owned())

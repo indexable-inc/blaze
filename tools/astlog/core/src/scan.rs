@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use blaze_hash::HashMap;
 use std::alloc::Global;
 
-use astlog_engine::{InternalSnafu, Lint, LintNoNodeSnafu, Segment, Severity};
+use astlog_engine::{Lint, Segment, Severity};
 
 use crate::corpus::{Corpus, Value};
 use crate::error::Error;

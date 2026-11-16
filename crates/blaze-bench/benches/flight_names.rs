@@ -44,7 +44,7 @@ fn round(threads: u64, distinct: bool) -> f64 {
                     let began = Instant::now();
                     for i in 0..SPANS {
                         let value = if distinct { i * threads + t } else { i % REPEATED };
-                        let span = tracing::info_span!(
+                        let span = blaze_trace::info_span!(
                             target: "blaze",
                             "names bench",
                             item = ?Item(value)

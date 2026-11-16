@@ -92,7 +92,7 @@ impl CfgOptions {
         for atom in diff.disable {
             let (CfgAtom::Flag(sym) | CfgAtom::KeyValue { key: sym, .. }) = &atom;
             if *sym == sym::true_ || *sym == sym::false_ {
-                tracing::error!(target: "blaze", "cannot remove `true` or `false` from cfg");
+                blaze_trace::error!(target: "blaze", "cannot remove `true` or `false` from cfg");
                 continue;
             }
             self.enabled.remove(&atom);
@@ -102,7 +102,7 @@ impl CfgOptions {
     fn insert_any_atom(&mut self, atom: CfgAtom) {
         let (CfgAtom::Flag(sym) | CfgAtom::KeyValue { key: sym, .. }) = &atom;
         if *sym == sym::true_ || *sym == sym::false_ {
-            tracing::error!(target: "blaze", "cannot insert `true` or `false` to cfg");
+            blaze_trace::error!(target: "blaze", "cannot insert `true` or `false` to cfg");
             return;
         }
         self.enabled.insert(atom);

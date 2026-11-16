@@ -23,6 +23,7 @@ use crate::plant::{self, Plant};
 use crate::{
     boxed::Box,
     error::{AllocFailure, fail},
+    make::CloneIn,
     raw::RawBuf,
 };
 
@@ -712,8 +713,37 @@ impl<T, I: SliceIndex<[T]>, A: Allocator> IndexMut<I> for Vec<T, A> {
 }
 
 impl<T: Clone, A: Allocator + Clone> Clone for Vec<T, A> {
+    /// Allocates from the collection's own allocator: prefer `clone_in`.
     fn clone(&self) -> Vec<T, A> {
         Vec::from_slice_in(self, self.allocator().clone())
+    }
+}
+
+impl<T, A: Allocator> Vec<T, A> {
+    /// A deep copy in another allocator: room for exactly the length in `alloc`, and each value
+    /// copied with [`CloneIn`] into `alloc` too. A refusal drops what was copied.
+    pub fn try_clone_in<B: Allocator + Clone>(&self, alloc: B) -> Result<Vec<T::In, B>, AllocFailure>
+    where
+        T: CloneIn<B>,
+    {
+        let mut out = Vec::try_with_capacity_in(self.len, alloc.clone())?;
+        for value in self.as_slice() {
+            // The room is reserved: the push does not allocate.
+            out.push(value.try_clone_in(alloc.clone())?);
+        }
+        Ok(out)
+    }
+
+    /// [`Vec::try_clone_in`], panicking with the [`AllocFailure`].
+    #[track_caller]
+    pub fn clone_in<B: Allocator + Clone>(&self, alloc: B) -> Vec<T::In, B>
+    where
+        T: CloneIn<B>,
+    {
+        match self.try_clone_in(alloc) {
+            Ok(copy) => copy,
+            Err(failure) => fail(failure),
+        }
     }
 }
 

@@ -1861,15 +1861,15 @@ impl Collector {
             return self.finish(Outcome::Stopped { phase: Phase::Mark, why, done: 0, left: 1 });
         }
         self.run.as_mut().expect("the run scanned").clock_ok = true;
-        let span = tracing::info_span!(
+        let span = blaze_trace::info_span!(
             target: "blaze",
             "gc mark",
             run,
             objects = inventory.objects.len(),
-            marked_objects = tracing::field::Empty,
-            marked_bytes = tracing::field::Empty,
-            planned_objects = tracing::field::Empty,
-            planned_bytes = tracing::field::Empty,
+            marked_objects = blaze_trace::field::Empty,
+            marked_bytes = blaze_trace::field::Empty,
+            planned_objects = blaze_trace::field::Empty,
+            planned_bytes = blaze_trace::field::Empty,
         );
         let _entered = span.enter();
         self.plan(inventory);
@@ -2421,7 +2421,7 @@ impl Collector {
                 });
             let run = self.run.as_mut().expect("the run pumped");
             if let Some(keep) = keep {
-                tracing::info!(target: "blaze", path = %step.path, "gc keeps what was rooted after the mark");
+                blaze_trace::info!(target: "blaze", path = %step.path, "gc keeps what was rooted after the mark");
                 run.verdicts[step.at].fate = Fate::Keep(keep);
                 keep_within(&mut run.verdicts, &step.path);
                 run.next += 1;
@@ -2668,7 +2668,7 @@ impl Collector {
         }
         // A slice that stopped before its scan came back (a deadline) leaves the cursor where it
         // was: the next goes on from there.
-        let span = tracing::info_span!(
+        let span = blaze_trace::info_span!(
             target: "blaze",
             "gc slice",
             run = report.run,
@@ -2685,7 +2685,7 @@ impl Collector {
             self.trusted_end_ns = Some(self.now);
         }
         self.repace();
-        tracing::info!(target: "blaze", "{report}");
+        blaze_trace::info!(target: "blaze", "{report}");
         // clone: the decision's copy and the one kept, once a run
         self.decisions.push(Decision::Record { report: report.clone() });
         self.reports.push_back(report);

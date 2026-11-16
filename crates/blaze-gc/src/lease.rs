@@ -305,7 +305,7 @@ impl Drop for Lease {
     reason = "a bounded wait on another process's lock, which has no wake to park on"
 )]
 fn lock_shared(mut file: File, dir: &Path) -> Result<Option<Locked>, String> {
-    let _span = tracing::info_span!(target: "blaze", "waits on the gc lease", dir = %dir.display())
+    let _span = blaze_trace::info_span!(target: "blaze", "waits on the gc lease", dir = %dir.display())
         .entered();
     let until = Instant::now() + SHARED_WAIT;
     let mut spin = blaze_spin::SpinWait::new();
@@ -343,7 +343,7 @@ fn wait_whole(
     since: &mut Option<(Instant, blaze_spin::SpinWait)>,
 ) -> Result<(), String> {
     let _span =
-        tracing::info_span!(target: "blaze", "waits on a lease file's nonce", dir = %dir.display())
+        blaze_trace::info_span!(target: "blaze", "waits on a lease file's nonce", dir = %dir.display())
             .entered();
     let (first, spin) = since.get_or_insert_with(|| (Instant::now(), blaze_spin::SpinWait::new()));
     if first.elapsed() >= GIVE_WAY {
@@ -423,7 +423,7 @@ fn rewrite_abandoned(file: &mut File, dir: &Path) -> Result<bool, String> {
     file.write_all(format!("{}\n", nonce()).as_bytes()).map_err(failed)?;
     // durable: a lease's nonce says who holds it: a crash must not leave a lease file with none, which reads as abandoned
     file.sync_all().map_err(failed)?;
-    tracing::warn!(target: "blaze", lease = %path.display(), "a lease file its maker left without a nonce was given a fresh one");
+    blaze_trace::warn!(target: "blaze", lease = %path.display(), "a lease file its maker left without a nonce was given a fresh one");
     Ok(true)
 }
 

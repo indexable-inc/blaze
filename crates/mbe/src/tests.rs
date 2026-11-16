@@ -2,7 +2,7 @@
 //! both stable `macro_rules!` macros as well as unstable `macro` macros.
 // FIXME: Move more of the nameres independent tests from
 // crates\hir-def\src\macro_expansion_tests\mod.rs to this
-use expect_test::expect;
+use test_utils::expect;
 use span::{
     Edition, EditionedFileId, FileId, ROOT_ERASED_FILE_AST_ID, Span, SpanAnchor, SyntaxContext,
 };
@@ -18,7 +18,7 @@ fn check_(
     decl: &str,
     arg: &str,
     render_debug: bool,
-    expect: &expect_test::Expect,
+    expect: &test_utils::Expect,
     parse: parser::TopEntryPoint,
 ) {
     let decl_tt = &syntax_bridge::parse_to_token_tree(
@@ -89,7 +89,7 @@ fn check(
     call_edition: Edition,
     decl: &str,
     arg: &str,
-    expect: &expect_test::Expect,
+    expect: &test_utils::Expect,
 ) {
     check_(
         def_edition,

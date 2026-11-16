@@ -231,10 +231,10 @@ fn file_item_tree_query(db: &Db, file_id: HirFileId, krate: Crate) -> Arc<ItemTr
         db,
         file_id,
         krate,
-        tracing::info_span!(
+        blaze_trace::info_span!(
             "file_item_tree_query",
-            krate = tracing::field::Empty,
-            function = tracing::field::Empty
+            krate = blaze_trace::field::Empty,
+            function = blaze_trace::field::Empty
         ),
     )
     .entered();
@@ -387,7 +387,7 @@ pub fn extern_crate_item(db: &Db, id: crate::ExternCrateId) -> ExternCrateItem<'
 
 #[blaze_memo::tracked(returns(ref), owns)]
 pub(crate) fn block_item_tree_query(db: &Db, block: BlockId, krate: Crate) -> ItemTree {
-    let _p = tracing::info_span!("block_item_tree_query", ?block).entered();
+    let _p = blaze_trace::info_span!("block_item_tree_query", ?block).entered();
     let ast_id = block.ast_id(db);
     // A block of a body written in a file is lowered from that body's syntax alone, which an
     // edit elsewhere in the file leaves as it is; any other (a signature's, a macro's body's,

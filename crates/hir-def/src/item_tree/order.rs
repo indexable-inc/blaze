@@ -41,7 +41,7 @@ pub struct BodyItem {
 /// made again only when the body is, and is equal (no reader reruns) while its items are.
 #[blaze_memo::tracked(returns(copy))]
 pub fn body_items<'db>(db: &'db Db, owner: DefWithBodyId) -> &'db [BodyItem] {
-    let _p = tracing::info_span!("body_items", ?owner).entered();
+    let _p = blaze_trace::info_span!("body_items", ?owner).entered();
     let body = Body::of(db, owner);
     let blocks = body.store.block_scopes();
     if blocks.is_empty() {

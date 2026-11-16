@@ -2,11 +2,23 @@
 //! own tree: Rust read as tokens, and only the files a crate is compiled from.
 
 use std::{
+    alloc::Global,
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
 };
 
+use blaze_data::{Map, Value};
+
 use crate::{CODEGEN, FRONT_END, Hook, Identity, RECORD};
+
+/// `text`, a manifest, read as TOML and lowered to its root table; `None` when it is no TOML.
+pub(super) fn toml_table(text: &str) -> Option<Map<Global>> {
+    let doc = blaze_toml::Document::parse_in(text, blaze_toml::Limits::CARGO, Global).ok()?;
+    match doc.to_value_in(Global) {
+        Value::Map(table) => Some(table),
+        _ => None,
+    }
+}
 
 /// A token of Rust, as far as the hooks need: comments are dropped, and a lifetime or a
 /// character is no token.

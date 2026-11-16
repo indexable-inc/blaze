@@ -10,7 +10,7 @@ use crate::span::{Span, Symbol, kw, sym};
 use syntax::unescape::{
     MixedUnit, unescape_byte, unescape_byte_str, unescape_c_str, unescape_char, unescape_str,
 };
-use tracing::debug;
+use blaze_trace::debug;
 
 use crate::ast::token::{self, Token};
 use crate::ast::{self, LitKind, MetaItemLit, StrStyle};

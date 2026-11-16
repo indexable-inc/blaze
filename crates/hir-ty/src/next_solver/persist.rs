@@ -2324,8 +2324,8 @@ mod tests {
         let at = HEADER_LEN as u64;
         // The view equals the bytes read out safely.
         let copied = u64::from_ne_bytes(bytes[HEADER_LEN..HEADER_LEN + 8].try_into().unwrap());
-        assert_eq!(*record_at::<u64>(&buffer, at).unwrap(), copied);
-        assert!(*record_at::<bool>(&buffer, at + 8).unwrap());
+        assert_eq!(**record_at::<u64>(&buffer, at).unwrap(), copied);
+        assert!(**record_at::<bool>(&buffer, at + 8).unwrap());
         assert!(record_at::<bool>(&buffer, at + 9).is_err(), "2 is no `bool`");
         assert!(record_at::<u64>(&buffer, at + 1).is_err(), "misaligned");
         assert!(record_at::<u64>(&buffer, at - 8).is_err(), "in the header");

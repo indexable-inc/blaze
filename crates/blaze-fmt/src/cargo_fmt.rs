@@ -444,7 +444,7 @@ struct Package {
 /// The workspace root and member packages of the workspace `manifest_path` (or the working
 /// directory) is in: what rustfmt reads from `cargo metadata --no-deps`.
 fn get_cargo_metadata(manifest_path: Option<&Path>) -> Result<(PathBuf, Vec<Package>), io::Error> {
-    let load = || -> anyhow::Result<(PathBuf, Vec<Package>)> {
+    let load = || -> Result<(PathBuf, Vec<Package>), crate::FmtError> {
         let ctx = Context::new(Config::from_process()?);
         let ws = Workspace::new(&root_manifest(manifest_path, &ctx)?, &ctx)?;
         let packages = ws
@@ -462,7 +462,7 @@ fn get_cargo_metadata(manifest_path: Option<&Path>) -> Result<(PathBuf, Vec<Pack
             .collect();
         Ok((ws.root().to_owned(), packages))
     };
-    load().map_err(|e| io::Error::other(format!("{e:#}")))
+    load().map_err(io::Error::other)
 }
 
 fn get_targets_root_only(

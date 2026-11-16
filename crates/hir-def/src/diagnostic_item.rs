@@ -84,7 +84,7 @@ fn settle(mut by_name: FrameMap<'_>, mut duplicates: Duplicates<'_>) -> Diagnost
 /// under its module, and no block).
 #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
 pub fn crate_diagnostic_items(db: &Db, krate: Crate) -> DiagnosticItems {
-    let _p = tracing::info_span!("crate_diagnostic_items_query").entered();
+    let _p = blaze_trace::info_span!("crate_diagnostic_items_query").entered();
     crate::nameres::demand_text(db, krate, "the diagnostic items of a crate without text");
     let def_map = crate_def_map(db, krate);
     if def_map.features(db).is_enabled(&intern::sym::rustc_attrs) {
@@ -119,7 +119,7 @@ pub fn crate_diagnostic_items(db: &Db, krate: Crate) -> DiagnosticItems {
 /// keeps the first; `duplicates` lists `krate`'s own and those across crates.
 #[blaze_memo::tracked(returns(ref), owns, mem_tag = Nameres)]
 pub fn diagnostic_items(db: &Db, krate: Crate) -> DiagnosticItems {
-    let _p = tracing::info_span!("diagnostic_items_query").entered();
+    let _p = blaze_trace::info_span!("diagnostic_items_query").entered();
     blaze_mem::frame::current(|frame| {
         let own = crate_diagnostic_items(db, krate);
         // `CrateData::dependencies` lists the sysroot crates even for `#![no_std]` and

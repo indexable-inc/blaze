@@ -40,7 +40,7 @@ impl NamedTempFile {
 impl Drop for NamedTempFile {
     fn drop(&mut self) {
         if self.delete_on_drop && std::fs::remove_file(&self.path).is_err() {
-            tracing::info!(target: "blaze", "cannot remove temporary file {}", self.path.display());
+            blaze_trace::info!(target: "blaze", "cannot remove temporary file {}", self.path.display());
         }
     }
 }

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use astlog_engine::{Planned, PlannedAction, TextKind};
 
 use crate::corpus::{Corpus, NodeRef};
-use crate::error::{Error, OverlappingEditsSnafu};
+use crate::error::{Error, SourceError};
 use crate::program::Action;
 
 pub use edit_applier::{Edit, FileRewrite};

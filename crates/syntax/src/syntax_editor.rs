@@ -573,7 +573,7 @@ fn is_ancestor_or_self_of_element(node: &SyntaxElement, ancestor: &SyntaxNode) -
 mod tests {
     use std::ops::Range;
 
-    use expect_test::expect;
+    use test_utils::expect;
 
     use crate::{
         AstNode, Text,

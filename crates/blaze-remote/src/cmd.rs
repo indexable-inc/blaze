@@ -21,11 +21,12 @@
 //!   `{"namespace": "public", "serial": N, "issued": unix_s, "keys": [{"key": "<64 hex>",
 //!   "roles": ["build", "root"], "from": unix_s, "until": unix_s}], "out": "<path>"}`.
 
-use std::path::Path;
+use std::{alloc::Global, path::Path};
 
 use blaze_cas::plain::{Driven, Namespace, Settings as StoreSettings};
-use serde::Deserialize;
+use blaze_data::{Cursor, FromValue, ShapeError};
 
+use crate::settings::{opt_text, read_json, texts};
 use crate::{
     bucket::{Bucket, Failure, drive},
     bundle::BundleId,
@@ -180,35 +181,41 @@ fn pull(root: &Path, env: Env<'_>, toolchain: &str, target: &str, cfg: &str, nam
     ))
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+/// `namespace` is `public` and `tier` `top` when absent; unknown fields refused.
 struct PushInput {
     toolchain: String,
-    #[serde(default = "public")]
     namespace: String,
     /// `top` or `fast` ([`tier_named`]).
-    #[serde(default = "top")]
     tier: String,
     bundle: Option<BundleInput>,
 }
 
-fn public() -> String {
-    "public".to_owned()
+impl FromValue<Global> for PushInput {
+    fn from_value(c: &Cursor<'_, '_, Global>) -> Result<PushInput, ShapeError<Global>> {
+        c.deny_unknown(&["toolchain", "namespace", "tier", "bundle"])?;
+        Ok(PushInput {
+            toolchain: c.field("toolchain")?.text()?.to_owned(),
+            namespace: opt_text(c, "namespace")?.unwrap_or_else(|| "public".to_owned()),
+            tier: opt_text(c, "tier")?.unwrap_or_else(|| "top".to_owned()),
+            bundle: c.opt("bundle")?,
+        })
+    }
 }
 
-fn top() -> String {
-    "top".to_owned()
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 struct BundleInput {
     target: String,
     cfg: String,
 }
 
+impl FromValue<Global> for BundleInput {
+    fn from_value(c: &Cursor<'_, '_, Global>) -> Result<BundleInput, ShapeError<Global>> {
+        c.deny_unknown(&["target", "cfg"])?;
+        Ok(BundleInput { target: c.field("target")?.text()?.to_owned(), cfg: c.field("cfg")?.text()?.to_owned() })
+    }
+}
+
 fn push(root: &Path, env: Env<'_>, json: &str, now_s: u64, connect: Connect<'_>) -> Result<String, String> {
-    let input: PushInput = serde_json::from_str(json).map_err(|e| format!("blaze cache push: {e}: {USAGE}"))?;
+    let input: PushInput = read_json(json.as_bytes()).map_err(|e| format!("blaze cache push: {e}: {USAGE}"))?;
     let settings = Settings::read(root, env)?;
     if settings.contacts().is_none() {
         return Err(contacts_nothing(&settings));
@@ -350,8 +357,7 @@ fn keys_public(root: &Path, env: Env<'_>) -> Result<String, String> {
     Ok(out)
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+/// Every field required; unknown fields refused.
 struct SignInput {
     namespace: String,
     serial: u64,
@@ -360,19 +366,48 @@ struct SignInput {
     out: std::path::PathBuf,
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
+impl FromValue<Global> for SignInput {
+    fn from_value(c: &Cursor<'_, '_, Global>) -> Result<SignInput, ShapeError<Global>> {
+        c.deny_unknown(&["namespace", "serial", "issued", "keys", "out"])?;
+        let mut keys = Vec::new();
+        c.field("keys")?.each(|it| {
+            keys.push(it.get::<KeyInput>()?);
+            Ok::<(), ShapeError<Global>>(())
+        })?;
+        Ok(SignInput {
+            namespace: c.field("namespace")?.text()?.to_owned(),
+            serial: c.req("serial")?,
+            issued: c.req("issued")?,
+            keys,
+            out: std::path::PathBuf::from(c.field("out")?.text()?),
+        })
+    }
+}
+
+/// `revoked` false when absent; unknown fields refused.
 struct KeyInput {
     key: String,
     roles: Vec<String>,
     from: u64,
     until: u64,
-    #[serde(default)]
     revoked: bool,
 }
 
+impl FromValue<Global> for KeyInput {
+    fn from_value(c: &Cursor<'_, '_, Global>) -> Result<KeyInput, ShapeError<Global>> {
+        c.deny_unknown(&["key", "roles", "from", "until", "revoked"])?;
+        Ok(KeyInput {
+            key: c.field("key")?.text()?.to_owned(),
+            roles: texts(&c.field("roles")?)?,
+            from: c.req("from")?,
+            until: c.req("until")?,
+            revoked: c.opt("revoked")?.unwrap_or(false),
+        })
+    }
+}
+
 fn keys_sign(env: Env<'_>, json: &str) -> Result<String, String> {
-    let input: SignInput = serde_json::from_str(json).map_err(|e| format!("blaze cache keys sign: {e}: {USAGE}"))?;
+    let input: SignInput = read_json(json.as_bytes()).map_err(|e| format!("blaze cache keys sign: {e}: {USAGE}"))?;
     let Some(anchor) = anchor_seed(env)? else {
         return Err(Failure::NotConfigured { missing: vec!["the anchor seed (BLAZE_CACHE_ANCHOR_SEED)".to_owned()] }.to_string());
     };

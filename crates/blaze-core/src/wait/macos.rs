@@ -128,56 +128,85 @@ impl Futex for Addresses {
         deadline: Option<Deadline>,
         clock: &C,
     ) -> Result<Waited<()>, WaitError> {
-        until(what, clock, deadline, |left| {
-            let addr = word.as_ptr().cast::<c_void>();
-            let value = u64::from(expected);
-            let got = match left {
-                // The absolute time of this call alone, from what is left now.
-                Some(left) => {
-                    let at = mach_after(left)?;
-                    // SAFETY: `word` is alive and aligned for the call, which only reads it;
-                    // the thread blocks until a wake of the address, a signal or `at`.
-                    unsafe {
-                        os_sync_wait_on_address_with_deadline(
-                            addr,
-                            value,
-                            WORD,
-                            PRIVATE,
-                            OS_CLOCK_MACH_ABSOLUTE_TIME,
-                            at,
-                        )
-                    }
-                }
-                // wakes: the parker's `unpark`, an `os_sync_wake_by_address_any` of this word
-                // SAFETY: as above, with no limit.
-                None => unsafe { os_sync_wait_on_address(addr, value, WORD, PRIVATE) },
-            };
-            // Woken, or the word no longer held `expected`: the parker looks at it again.
-            if got >= 0 {
-                return Ok(Once::Ready(()));
-            }
-            let error = io::Error::last_os_error();
-            match error.raw_os_error() {
-                Some(libc::EINTR) => Ok(Once::Interrupted),
-                Some(libc::ETIMEDOUT) => Ok(Once::TimedOut),
-                // The header's two transient returns under low memory (the kernel could not
-                // allocate, or could not page the word in to read it; the word is a live
-                // reference, so `EFAULT` is never a bad address): waited for again.
-                Some(libc::ENOMEM | libc::EFAULT) => Ok(Once::Spurious),
-                // alloc: an error.
-                _ => Err(io::Error::new(
-                    error.kind(),
-                    format!("os_sync_wait_on_address_with_deadline: {error}"),
-                )),
-            }
-        })
+        until(what, clock, deadline, |left| address_once(word, expected, left))
     }
 
     fn wake(&self, word: &AtomicU32) {
-        // `ENOENT`, no thread waits on the word, is not an error of a wake: the parker took
-        // its token before it blocked. Nothing else can fail a wake of a live aligned word.
-        // SAFETY: a wake of a word of this process; the kernel reads no memory of it.
-        _ = unsafe { os_sync_wake_by_address_any(word.as_ptr().cast(), WORD, PRIVATE) };
+        word_wake(word, false);
+    }
+}
+
+/// The wait of a lock's word ([`super::word_wait`]): the same call as a park's, any number of
+/// threads on one word, and no row of its own in the wait-for graph (the lock's is the row).
+pub(crate) fn word_wait(
+    what: &'static str,
+    word: &AtomicU32,
+    expected: u32,
+    deadline: Option<Deadline>,
+    clock: &impl Clock,
+) -> Result<Waited<()>, WaitError> {
+    super::unlisted(what, clock, deadline, |left| address_once(word, expected, left))
+}
+
+/// The wake of a word: one waiter (`os_sync_wake_by_address_any`) or every one
+/// (`os_sync_wake_by_address_all`), of this process.
+pub(crate) fn word_wake(word: &AtomicU32, all: bool) {
+    let addr = word.as_ptr().cast::<c_void>();
+    // `ENOENT`, no thread waits on the word, is not an error of a wake: the waiter looked at
+    // the word again before it blocked. Nothing else can fail a wake of a live aligned word.
+    // SAFETY: a wake of a word of this process; the kernel reads no memory of it.
+    _ = unsafe {
+        match all {
+            true => os_sync_wake_by_address_all(addr, WORD, PRIVATE),
+            false => os_sync_wake_by_address_any(addr, WORD, PRIVATE),
+        }
+    };
+}
+
+/// One wait on `word`'s address while it holds `expected`, for at most `left` (no limit for
+/// `None`): the call of a park and of a lock's word alike.
+fn address_once(word: &AtomicU32, expected: u32, left: Option<Duration>) -> io::Result<Once<()>> {
+    let addr = word.as_ptr().cast::<c_void>();
+    let value = u64::from(expected);
+    let got = match left {
+        // The absolute time of this call alone, from what is left now.
+        Some(left) => {
+            let at = mach_after(left)?;
+            // SAFETY: `word` is alive and aligned for the call, which only reads it; the thread
+            // blocks until a wake of the address, a signal or `at`.
+            unsafe {
+                os_sync_wait_on_address_with_deadline(
+                    addr,
+                    value,
+                    WORD,
+                    PRIVATE,
+                    OS_CLOCK_MACH_ABSOLUTE_TIME,
+                    at,
+                )
+            }
+        }
+        // wakes: the parker's `unpark` or a lock's release, an `os_sync_wake_by_address_*` of
+        // this word
+        // SAFETY: as above, with no limit.
+        None => unsafe { os_sync_wait_on_address(addr, value, WORD, PRIVATE) },
+    };
+    // Woken, or the word no longer held `expected`: the waiter looks at it again.
+    if got >= 0 {
+        return Ok(Once::Ready(()));
+    }
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::EINTR) => Ok(Once::Interrupted),
+        Some(libc::ETIMEDOUT) => Ok(Once::TimedOut),
+        // The header's two transient returns under low memory (the kernel could not allocate,
+        // or could not page the word in to read it; the word is a live reference, so `EFAULT`
+        // is never a bad address): waited for again.
+        Some(libc::ENOMEM | libc::EFAULT) => Ok(Once::Spurious),
+        // alloc: an error.
+        _ => Err(io::Error::new(
+            error.kind(),
+            format!("os_sync_wait_on_address_with_deadline: {error}"),
+        )),
     }
 }
 

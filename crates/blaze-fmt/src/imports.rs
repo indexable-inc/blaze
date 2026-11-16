@@ -6,7 +6,6 @@ use std::fmt;
 
 use core::hash::{Hash, Hasher};
 
-
 use crate::ast::{self, UseTreeKind};
 use crate::span::{
     BytePos, DUMMY_SP, Span,

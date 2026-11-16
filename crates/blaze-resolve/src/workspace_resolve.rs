@@ -11,7 +11,7 @@
 use anyhow::{Context as _, Result, anyhow};
 use blaze_hash::{HashMap, HashSet};
 use std::alloc::Global;
-use tracing::{debug, trace};
+use blaze_trace::{debug, trace};
 use url::Url;
 
 use crate::dependency::Dependency;
@@ -528,7 +528,7 @@ fn summary_for_patch(
         let what = "the registry's versions of a patch's dependency, for its error (bounded by the HTTP client's timeouts)";
         answer(what, source.query_vec(dep, QueryKind::Exact))
             .unwrap_or_else(|e| {
-                tracing::warn!("could not query {:?}: {:?}", dep, e);
+                blaze_trace::warn!("could not query {:?}: {:?}", dep, e);
                 Vec::new()
             })
             .into_iter()

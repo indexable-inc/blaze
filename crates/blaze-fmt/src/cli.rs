@@ -1,10 +1,7 @@
 //! `blaze fmt <files>`: rustfmt's `src/bin/main.rs` at rust-lang/rust 12433c307 (MIT or
 //! Apache-2.0), run in process with blaze's arguments instead of as a binary.
 
-use anyhow::{Result, format_err};
-
 use io::Error as IoError;
-use thiserror::Error;
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -12,7 +9,9 @@ use std::io::{self, Read, Write, stdout};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
-use crate::getopts::{Matches, Options};
+use crate::config::file_lines::FileLinesError;
+use crate::config::{ConfigError, ToTomlError};
+use crate::getopts::{Fail, Matches, Options};
 
 use crate::term;
 use crate::{
@@ -57,7 +56,7 @@ enum Operation {
 
 /// Rustfmt operations errors.
 #[derive(Debug)]
-pub enum OperationError {
+pub(crate) enum OperationError {
     /// An unknown help topic was requested.
     UnknownHelpTopic(String),
     /// An unknown print-config option was requested.
@@ -363,7 +362,7 @@ fn execute(opts: &Options, args: Vec<String>) -> Result<i32> {
         Operation::ConfigOutputCurrent { path } => {
             let path = match path {
                 Some(path) => path,
-                None => return Err(format_err!("PATH required for `--print-config current`")),
+                None => return Err(OperationError::CurrentConfigWithoutPath),
             };
 
             let file = PathBuf::from(path);
@@ -404,7 +403,7 @@ fn format_string(input: String, options: GetOptsOptions) -> Result<i32> {
                     .emit_mode(options.emit_mode.unwrap_or(EmitMode::Stdout));
             }
             Some(emit_mode) => {
-                return Err(OperationError::StdinBadEmit(emit_mode).into());
+                return Err(OperationError::StdinBadEmit(emit_mode));
             }
         }
     }
@@ -668,7 +667,7 @@ impl GetOptsOptions {
         options.verbose = matches.opt_present("verbose");
         options.quiet = matches.opt_present("quiet");
         if options.verbose && options.quiet {
-            return Err(format_err!("Can't use both `--verbose` and `--quiet`"));
+            return Err(OperationError::VerboseAndQuiet);
         }
 
         let rust_nightly = is_nightly();
@@ -698,12 +697,7 @@ impl GetOptsOptions {
                     unstable_options.push("`--file-lines`");
                 }
                 if !unstable_options.is_empty() {
-                    let s = if unstable_options.len() == 1 { "" } else { "s" };
-                    return Err(format_err!(
-                        "Unstable option{} ({}) used without `--unstable-features`",
-                        s,
-                        unstable_options.join(", "),
-                    ));
+                    return Err(OperationError::UnstableWithoutFeatures(unstable_options));
                 }
             }
         }
@@ -719,16 +713,13 @@ impl GetOptsOptions {
                     Some((middle, _)) => {
                         let (key, val) = (&key_val[..middle], &key_val[middle + 1..]);
                         if !Config::is_valid_key_val(key, val) {
-                            Err(format_err!("invalid key=val pair: `{}`", key_val))
+                            Err(OperationError::InvalidKeyVal(key_val.to_owned()))
                         } else {
                             Ok((key.to_string(), val.to_string()))
                         }
                     }
 
-                    None => Err(format_err!(
-                        "--config expects comma-separated list of key=val pairs, found `{}`",
-                        key_val
-                    )),
+                    None => Err(OperationError::ConfigNotKeyVal(key_val.to_owned())),
                 },
             )
             .collect::<Result<HashMap<_, _>, _>>()?;
@@ -736,7 +727,7 @@ impl GetOptsOptions {
         options.check = matches.opt_present("check");
         if let Some(ref emit_str) = matches.opt_str("emit") {
             if options.check {
-                return Err(format_err!("Invalid to use `--emit` and `--check`"));
+                return Err(OperationError::EmitAndCheck);
             }
 
             options.emit_mode = Some(emit_mode_from_emit_str(emit_str)?);
@@ -744,14 +735,10 @@ impl GetOptsOptions {
 
         if options.inline_config.contains_key("emit_mode") {
             if options.check {
-                return Err(format_err!(
-                    "Invalid to use `--config=emit_mode=<mode>` and `--check`"
-                ));
+                return Err(OperationError::EmitModeConfigAndCheck);
             }
             if options.emit_mode.is_some() {
-                return Err(format_err!(
-                    "Invalid to use `--config=emit_mode=<mode>` and `--emit`"
-                ));
+                return Err(OperationError::EmitModeConfigAndEmit);
             }
         }
 
@@ -774,10 +761,7 @@ impl GetOptsOptions {
         if !rust_nightly {
             if let Some(ref emit_mode) = options.emit_mode {
                 if !STABLE_EMIT_MODES.contains(emit_mode) {
-                    return Err(format_err!(
-                        "Invalid value for `--emit` - using an unstable \
-                         value without `--unstable-features`",
-                    ));
+                    return Err(OperationError::UnstableEmit);
                 }
             }
         }
@@ -785,7 +769,7 @@ impl GetOptsOptions {
         if let Some(ref color) = matches.opt_str("color") {
             match Color::from_str(color) {
                 Ok(color) => options.color = Some(color),
-                _ => return Err(format_err!("Invalid color: {}", color)),
+                _ => return Err(OperationError::InvalidColor(color.to_owned())),
             }
         }
 
@@ -892,7 +876,7 @@ fn edition_from_edition_str(edition_str: &str) -> Result<Edition> {
         "2018" => Ok(Edition::Edition2018),
         "2021" => Ok(Edition::Edition2021),
         "2024" => Ok(Edition::Edition2024),
-        _ => Err(format_err!("Invalid value for `--edition`")),
+        _ => Err(OperationError::InvalidEdition),
     }
 }
 
@@ -903,7 +887,7 @@ fn style_edition_from_style_edition_str(edition_str: &str) -> Result<StyleEditio
         "2021" => Ok(StyleEdition::Edition2021),
         "2024" => Ok(StyleEdition::Edition2024),
         "2027" => Ok(StyleEdition::Edition2027),
-        _ => Err(format_err!("Invalid value for `--style-edition`")),
+        _ => Err(OperationError::InvalidStyleEdition),
     }
 }
 
@@ -914,6 +898,6 @@ fn emit_mode_from_emit_str(emit_str: &str) -> Result<EmitMode> {
         "coverage" => Ok(EmitMode::Coverage),
         "checkstyle" => Ok(EmitMode::Checkstyle),
         "json" => Ok(EmitMode::Json),
-        _ => Err(format_err!("Invalid value for `--emit`")),
+        _ => Err(OperationError::InvalidEmit),
     }
 }

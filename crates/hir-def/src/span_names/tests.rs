@@ -208,33 +208,33 @@ impl Default for Named {
 
 struct Functions<'a>(&'a Lock<Vec<String>>);
 
-impl tracing::field::Visit for Functions<'_> {
-    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+impl blaze_trace::field::Visit for Functions<'_> {
+    fn record_str(&mut self, field: &blaze_trace::field::Field, value: &str) {
         if field.name() == "function" {
             self.0.lock().push(value.to_owned());
         }
     }
 
-    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+    fn record_debug(&mut self, _: &blaze_trace::field::Field, _: &dyn std::fmt::Debug) {}
 }
 
-impl tracing::Subscriber for &'static Named {
-    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+impl blaze_trace::Subscriber for &'static Named {
+    fn enabled(&self, _: &blaze_trace::Metadata<'_>) -> bool {
         true
     }
 
-    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-        tracing::span::Id::from_u64(self.next.fetch_add(1, Ordering::Relaxed) + 1)
+    fn new_span(&self, _: &blaze_trace::span::Attributes<'_>) -> blaze_trace::span::Id {
+        blaze_trace::span::Id::from_u64(self.next.fetch_add(1, Ordering::Relaxed) + 1)
     }
 
-    fn record(&self, _: &tracing::span::Id, values: &tracing::span::Record<'_>) {
+    fn record(&self, _: &blaze_trace::span::Id, values: &blaze_trace::span::Record<'_>) {
         values.record(&mut Functions(&self.functions));
     }
 
-    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
-    fn event(&self, _: &tracing::Event<'_>) {}
-    fn enter(&self, _: &tracing::span::Id) {}
-    fn exit(&self, _: &tracing::span::Id) {}
+    fn record_follows_from(&self, _: &blaze_trace::span::Id, _: &blaze_trace::span::Id) {}
+    fn event(&self, _: &blaze_trace::Event<'_>) {}
+    fn enter(&self, _: &blaze_trace::span::Id) {}
+    fn exit(&self, _: &blaze_trace::span::Id) {}
 }
 
 /// What a query that opens `def`'s body span and reads its body read, each row of its read
@@ -262,7 +262,7 @@ fn naming_a_span_reads_nothing_into_its_query() {
     let named: &'static Named = Box::leak(Box::default());
     for def in local_bodies(db) {
         let plain = reads_beside_a_named_span(db, def, false).clone();
-        let traced = tracing::subscriber::with_default(named, || {
+        let traced = blaze_trace::subscriber::with_default(named, || {
             reads_beside_a_named_span(db, def, true).clone()
         });
         assert_eq!(plain, traced, "naming {def:?}'s span changed what its query read");

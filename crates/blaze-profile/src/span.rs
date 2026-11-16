@@ -454,12 +454,12 @@ pub trait Span: Fields {
 
 /// The callsite of a kind: what its `tracing` metadata names, so a kind's site is one of the
 /// recorder's as any span's is ([`flight::register`]). No subscriber ever sees it.
-pub struct KindCallsite(pub &'static tracing::Metadata<'static>);
+pub struct KindCallsite(pub &'static blaze_trace::Metadata<'static>);
 
-impl tracing::callsite::Callsite for KindCallsite {
-    fn set_interest(&self, _: tracing::subscriber::Interest) {}
+impl blaze_trace::callsite::Callsite for KindCallsite {
+    fn set_interest(&self, _: blaze_trace::subscriber::Interest) {}
 
-    fn metadata(&self) -> &tracing::Metadata<'_> {
+    fn metadata(&self) -> &blaze_trace::Metadata<'_> {
         self.0
     }
 }
@@ -468,16 +468,16 @@ impl tracing::callsite::Callsite for KindCallsite {
 pub const fn kind_meta(
     name: &'static str,
     callsite: &'static KindCallsite,
-) -> tracing::Metadata<'static> {
-    tracing::Metadata::new(
+) -> blaze_trace::Metadata<'static> {
+    blaze_trace::Metadata::new(
         name,
         "blaze",
-        tracing::Level::INFO,
+        blaze_trace::Level::INFO,
         Some(file!()),
         Some(line!()),
         Some(module_path!()),
-        tracing::field::FieldSet::new(&[], tracing::callsite::Identifier(callsite)),
-        tracing::metadata::Kind::SPAN,
+        blaze_trace::field::FieldSet::new(&[], blaze_trace::callsite::Identifier(callsite)),
+        blaze_trace::metadata::Kind::SPAN,
     )
 }
 
@@ -492,7 +492,7 @@ impl SiteOnce {
     }
 
     #[inline]
-    pub fn get(&self, meta: &'static tracing::Metadata<'static>) -> Option<u16> {
+    pub fn get(&self, meta: &'static blaze_trace::Metadata<'static>) -> Option<u16> {
         match self.0.load(Ordering::Relaxed) {
             0 => self.register(meta),
             REFUSED => None,
@@ -501,7 +501,7 @@ impl SiteOnce {
     }
 
     #[cold]
-    fn register(&self, meta: &'static tracing::Metadata<'static>) -> Option<u16> {
+    fn register(&self, meta: &'static blaze_trace::Metadata<'static>) -> Option<u16> {
         let site = flight::register(meta);
         self.0.store(site.map_or(REFUSED, u32::from), Ordering::Relaxed);
         site
@@ -901,7 +901,7 @@ macro_rules! span_kinds {
     (@site $kname:literal) => {
         fn site() -> Option<u16> {
             static CALLSITE: KindCallsite = KindCallsite(&META);
-            static META: tracing::Metadata<'static> = kind_meta($kname, &CALLSITE);
+            static META: blaze_trace::Metadata<'static> = kind_meta($kname, &CALLSITE);
             static SITE: SiteOnce = SiteOnce::new();
             SITE.get(&META)
         }
@@ -1264,7 +1264,7 @@ mod tests {
         let tid = std::thread::spawn(|| {
             let what: &'static str = "its outputs, being placed";
             let held = Some((
-                tracing::info_span!(target: "blaze", "span kinds held, never entered", function = what, awaits = what),
+                blaze_trace::info_span!(target: "blaze", "span kinds held, never entered", function = what, awaits = what),
                 what,
             ));
             // Something else of the thread's between its start and its close.
@@ -1304,19 +1304,19 @@ mod tests {
         const NAME: &str = "span kinds with fields of no column";
         crate::install();
         let tid = std::thread::spawn(|| {
-            let span = tracing::info_span!(
+            let span = blaze_trace::info_span!(
                 target: "blaze",
                 "span kinds with fields of no column",
                 function = "place outputs",
                 what = "the image",
                 runs = 3,
-                why = tracing::field::Empty,
+                why = blaze_trace::field::Empty,
             );
             span.record("why", "memory is short");
             // Long enough for a row of its own: a span under `flight::FOLD_BELOW` is summed.
             std::thread::sleep(Duration::from_millis(2));
             drop(span);
-            let plain = tracing::info_span!(target: "blaze", "span kinds with no field");
+            let plain = blaze_trace::info_span!(target: "blaze", "span kinds with no field");
             std::thread::sleep(Duration::from_millis(2));
             drop(plain);
             crate::sampler::os_tid() as u32

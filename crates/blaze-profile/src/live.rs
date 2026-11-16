@@ -1164,7 +1164,7 @@ mod tests {
     fn a_feed_sends_what_closed_once() {
         crate::install();
         std::thread::spawn(|| {
-            let _span = tracing::info_span!(target: "blaze", "live once").entered();
+            let _span = blaze_trace::info_span!(target: "blaze", "live once").entered();
         })
         .join()
         .unwrap();

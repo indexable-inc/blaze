@@ -6,7 +6,7 @@ use std::{
 
 use blaze_hash::HashMap;
 use blaze_ids::rng::SplitMix64;
-use expect_test::expect;
+use test_utils::expect;
 use span::{Edition, Span};
 use syntax::{NodeOrToken, ast, view};
 use test_utils::extract_annotations;

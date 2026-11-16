@@ -1096,7 +1096,7 @@ name_set! {
     }
 }
 
-bitflags::bitflags! {
+blaze_bitflags::bitflags! {
     /// One word per item, field or generic parameter: 16 bytes, read with one bit test.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub struct AttrFlags: u128 {

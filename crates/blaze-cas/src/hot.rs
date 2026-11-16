@@ -224,13 +224,13 @@ impl Side {
         if held.saturating_add(bytes) <= budget {
             return None;
         }
-        let span = tracing::info_span!(
+        let span = blaze_trace::info_span!(
             target: "blaze",
             "store pool evict",
             held,
             budget,
             load = bytes,
-            freed = tracing::field::Empty,
+            freed = blaze_trace::field::Empty,
         );
         let _in = span.enter();
         let mut gate = self.gate.lock();
@@ -245,12 +245,12 @@ impl Side {
     /// At least `bytes` of the pool's pages given back, if the sweep finds them: the pool's
     /// `evict(bytes) -> freed`.
     pub(crate) fn evict(&self, bytes: u64) -> Swept {
-        let span = tracing::info_span!(
+        let span = blaze_trace::info_span!(
             target: "blaze",
             "store pool evict",
             asked = bytes,
-            freed = tracing::field::Empty,
-            visited = tracing::field::Empty,
+            freed = blaze_trace::field::Empty,
+            visited = blaze_trace::field::Empty,
         );
         let _in = span.enter();
         let mut gate = self.gate.lock();
@@ -266,11 +266,11 @@ impl Side {
     /// One lap of the sweep over the pool's pages ([`Sweep::lap`]): what was not read again
     /// since the sweep last came by is given back, what was stays for one lap more.
     pub(crate) fn trim(&self) -> Swept {
-        let span = tracing::info_span!(
+        let span = blaze_trace::info_span!(
             target: "blaze",
             "store pool trim",
-            freed = tracing::field::Empty,
-            visited = tracing::field::Empty,
+            freed = blaze_trace::field::Empty,
+            visited = blaze_trace::field::Empty,
         );
         let _in = span.enter();
         let mut gate = self.gate.lock();

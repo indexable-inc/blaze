@@ -1,6 +1,6 @@
 use base_db::EditionedFileId;
 use blaze_format::Persist;
-use expect_test::{Expect, expect};
+use test_utils::{Expect, expect};
 use hir_expand::HirFileId;
 use hir_expand::fixture;
 use span::Edition;

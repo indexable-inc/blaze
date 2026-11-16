@@ -20,7 +20,7 @@ use crate::ast::token::{Delimiter, Token, TokenKind};
 use crate::ast::tokenstream::{TokenStream, TokenStreamIter, TokenTree};
 use crate::ast_pretty as pprust;
 use crate::span::{BytePos, DUMMY_SP, Ident, Pos, Span, Symbol};
-use tracing::debug;
+use blaze_trace::debug;
 
 use crate::comment::{
     CharClasses, FindUncommented, FullCodeCharKind, LineClasses, contains_comment,

@@ -1475,12 +1475,12 @@ pub mod tokens {
 
 #[cfg(test)]
 mod tests {
-    use expect_test::expect;
+    use test_utils::expect;
 
     use super::*;
 
     #[track_caller]
-    fn check(node: impl AstNode, expect: expect_test::Expect) {
+    fn check(node: impl AstNode, expect: test_utils::Expect) {
         let node_debug = format!("{:#?}", node.syntax());
         expect.assert_eq(&node_debug);
     }

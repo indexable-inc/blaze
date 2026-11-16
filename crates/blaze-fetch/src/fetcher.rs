@@ -308,7 +308,7 @@ impl Fetcher {
             match attempts.next_decision() {
                 Decision::Ask { attempt } => {
                     let mut written = part.resume()?;
-                    let _span = tracing::info_span!(target: "blaze", "blaze-fetch download", url = %from, attempt, resumed_from = written).entered();
+                    let _span = blaze_trace::info_span!(target: "blaze", "blaze-fetch download", url = %from, attempt, resumed_from = written).entered();
                     let mut too_big = false;
                     let most = self.most;
                     let asked = self.net.get(url, headers, written, &mut |offset: u64, bytes: &[u8]| {
@@ -347,7 +347,7 @@ impl Fetcher {
                     }
                 }
                 Decision::Wait { until } => {
-                    let _span = tracing::info_span!(target: "blaze", "blaze-fetch waits to try again", url = %from).entered();
+                    let _span = blaze_trace::info_span!(target: "blaze", "blaze-fetch waits to try again", url = %from).entered();
                     wait_out(until.saturating_sub(start.elapsed()));
                 }
                 Decision::GiveUp { tries, last } => {
@@ -378,7 +378,7 @@ impl Fetcher {
         let scratch = Scratch::new(&self.scratch)?;
         let root = {
             let _span =
-                tracing::info_span!(target: "blaze", "blaze-fetch git checkout", repo = %from)
+                blaze_trace::info_span!(target: "blaze", "blaze-fetch git checkout", repo = %from)
                     .entered();
             git.checkout(repo, rev, &scratch.0).map_err(refused)?
         };
@@ -619,7 +619,7 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         if let Err(error) = remove_any(&self.0) {
-            tracing::warn!(dir = %self.0.display(), %error, "a git fetch's scratch directory was not removed");
+            blaze_trace::warn!(dir = %self.0.display(), %error, "a git fetch's scratch directory was not removed");
         }
     }
 }

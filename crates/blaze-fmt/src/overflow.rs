@@ -8,7 +8,7 @@ use crate::ast;
 use crate::ast::token::Delimiter;
 use crate::span::Span;
 use stdx::iter::IterExt;
-use tracing::debug;
+use blaze_trace::debug;
 
 use crate::closures;
 use crate::config::StyleEdition;

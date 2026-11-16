@@ -11,6 +11,7 @@
 
 mod assert_linear;
 pub mod bench_fixture;
+pub mod expect;
 mod fixture;
 
 use std::{
@@ -29,6 +30,7 @@ pub use dissimilar::diff as __diff;
 
 pub use crate::{
     assert_linear::AssertLinear,
+    expect::{Expect, ExpectFile},
     fixture::{Fixture, FixtureWithProjectMeta, MiniCore},
 };
 

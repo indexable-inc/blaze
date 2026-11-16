@@ -16,7 +16,9 @@
 //! | [`Arc`], [`arc::Weak`] | an atomically counted shared value |
 //! | [`Rc`], [`rc::Weak`] | the same, counted on one thread |
 //! | [`VecDeque`] | a ring buffer |
-//! | [`SortedMap`], [`SortedSet`] | ordered by key, a sorted vector searched by halving |
+//! | [`SortedMap`], [`SortedSet`] | ordered by key, a sorted vector searched by halving: for small or read-mostly maps |
+//! | [`BTreeMap`], [`BTreeSet`] | ordered by key, a B-tree of 15-entry nodes, keys and values in separate columns: for large or insert-heavy maps |
+//! | [`CloneIn`], [`Share`], [`DefaultIn`], [`FromIn`], [`IntoIn`], [`FromStrIn`] | std's `Clone`, `Default`, `From`, `Into` and `FromStr` with the allocator named; `Share` the copy that is another handle ([`make`]) |
 //! | [`Cow`] | borrowed or owned, copied into the allocator the caller names when it must own |
 //! | [`Soa`], [`soa!`] | a struct-of-arrays vector: one packed column per field in one allocation; the macro names its rows and columns |
 //! | [`String`], [`format_in!`], [`format_into!`] | UTF-8 text over [`Vec<u8, A>`](Vec); `blaze_mem` re-exports it, keeping only `OsString` and `PathBuf` |
@@ -97,10 +99,12 @@ mod macros;
 
 pub mod arc;
 pub mod boxed;
+pub mod btree;
 pub mod cow;
 pub mod deque;
 mod error;
 pub mod fixed;
+pub mod make;
 pub mod packed;
 pub mod raw;
 pub mod rc;
@@ -118,10 +122,12 @@ mod plant;
 
 pub use arc::Arc;
 pub use boxed::{Box, CallOnce};
+pub use btree::{BTreeMap, BTreeSet};
 pub use cow::{Cow, ToOwnedIn};
 pub use deque::VecDeque;
 pub use error::AllocFailure;
 pub use fixed::{FixedString, FixedVec, Full, Inline};
+pub use make::{CloneIn, DefaultIn, FromIn, FromStrIn, IntoIn, ParseIn, Share};
 pub use packed::{Pack, Packed};
 pub use raw::RawBuf;
 pub use rc::Rc;

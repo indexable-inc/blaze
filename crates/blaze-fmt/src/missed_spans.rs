@@ -1,7 +1,7 @@
 // Follows `src/tools/rustfmt/src/missed_spans.rs` at rust-lang/rust 12433c307 (MIT or Apache-2.0).
 
 use crate::span::{BytePos, Pos, Span};
-use tracing::debug;
+use blaze_trace::debug;
 
 use crate::comment::{CodeCharKind, CommentCodeSlices, is_last_comment_block, rewrite_comment};
 use crate::config::FileName;

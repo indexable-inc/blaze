@@ -743,7 +743,7 @@ pub(in crate::expr_store) struct ExpressionOnlySourceMap {
     //
     // We store diagnostics on the `ExpressionOnlySourceMap` because diagnostics are rare (except
     // maybe for cfgs, and they are also not common in type places).
-    pub(in crate::expr_store) diagnostics: thin_vec::ThinVec<ExpressionStoreDiagnostics>,
+    pub(in crate::expr_store) diagnostics: Box<[ExpressionStoreDiagnostics]>,
 }
 
 impl FormatTemplate {
@@ -797,7 +797,7 @@ impl ExpressionOnlySourceMap {
             + pat_field_map_back.heap_bytes()
             + template_map
             + expansions.heap_bytes()
-            + crate::heap::thin_vec_bytes(diagnostics)
+            + size_of_val::<[ExpressionStoreDiagnostics]>(diagnostics)
     }
 }
 

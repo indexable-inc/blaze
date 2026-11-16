@@ -9,7 +9,7 @@ use crate::{
     nameres::crate_def_map,
     test_db::{TestDB, TestDBExt},
 };
-use expect_test::{Expect, expect};
+use test_utils::{Expect, expect};
 use hir_expand::fixture;
 use la_arena::RawIdx;
 

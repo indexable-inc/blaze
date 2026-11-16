@@ -30,8 +30,8 @@ ring.workspace = true
 blaze-http.workspace = true
 http.workspace = true
 # Settings and the commands' typed input.
-serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
+blaze-data.workspace = true
+blaze-json.workspace = true
 
 [dev-dependencies]
 # An independent SHA-256 for the SigV4 test's own HMAC chain (the signer uses `ring`'s).

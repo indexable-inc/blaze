@@ -19,8 +19,6 @@ blaze-ids.workspace = true
 blaze-mem.workspace = true
 blaze-phf.workspace = true
 crossbeam-channel.workspace = true
-either.workspace = true
-itertools.workspace = true
 rustc_lexer.workspace = true
 syntax-tree.workspace = true
 rustc-literal-escaper.workspace = true
@@ -32,7 +30,6 @@ stdx.workspace = true
 [dev-dependencies]
 blaze-alloc-count.workspace = true
 blaze-graph.workspace = true
-expect-test.workspace = true
 rustc_apfloat.workspace = true
 
 test-utils.workspace = true

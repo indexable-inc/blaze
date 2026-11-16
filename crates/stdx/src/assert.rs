@@ -111,7 +111,7 @@ macro_rules! never {
 }
 
 #[doc(hidden)]
-pub use tracing::error as __tracing_error;
+pub use blaze_trace::error as __tracing_error;
 
 // --- Reported bugs ------------------------------------------------------------------------
 

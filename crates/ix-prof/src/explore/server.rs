@@ -119,7 +119,7 @@ impl Drop for Explorer {
             return;
         }
         if let Some(thread) = self.thread.take() {
-            let _wait = tracing::info_span!(target: "blaze::ix_prof", "join the explorer's thread", wait = "thread", on = self.shared.name).entered();
+            let _wait = blaze_trace::info_span!(target: "blaze::ix_prof", "join the explorer's thread", wait = "thread", on = self.shared.name).entered();
             _ = thread.join();
         }
     }
@@ -241,7 +241,7 @@ fn start(config: Config, identity: Identity, served: Served, rotation: Rotation,
         core.step(driver.now(), &mut effects);
         driver.submit(&mut effects);
         {
-            let _wait = tracing::info_span!(target: "blaze::ix_prof", "bind the explorer's socket", wait = "driver", on = config.name).entered();
+            let _wait = blaze_trace::info_span!(target: "blaze::ix_prof", "bind the explorer's socket", wait = "driver", on = config.name).entered();
             driver.poll(&mut done, blaze_core::wait::Deadline::after(driver.now(), START_WAIT));
         }
         for completion in done.drain(..) {
@@ -323,7 +323,7 @@ fn run(driver: &mut impl blaze_core::Driver, mut core: Loop, mut serving: Servin
         core.step(now, &mut effects);
         driver.submit(&mut effects);
         {
-            let _wait = tracing::info_span!(target: "blaze::ix_prof", "wait for the explorer's socket, timers and jobs", wait = "driver", on = shared.name).entered();
+            let _wait = blaze_trace::info_span!(target: "blaze::ix_prof", "wait for the explorer's socket, timers and jobs", wait = "driver", on = shared.name).entered();
             driver.poll(&mut done, core.deadline().min(serving.deadline()));
         }
         // What came is received at the time it came, not at the time the poll began.

@@ -412,7 +412,7 @@ mod tests {
             .name("spinner".to_owned())
             .spawn(|| {
                 // Both samplers sample threads that recorded a span (hold a ring).
-                drop(tracing::info_span!(target: "blaze", "spinning").entered());
+                drop(blaze_trace::info_span!(target: "blaze", "spinning").entered());
                 crate::flight::plot(crate::flight::Plot::Queued, 1);
                 spins_for_the_sampler(Instant::now() + std::time::Duration::from_millis(1500))
             })

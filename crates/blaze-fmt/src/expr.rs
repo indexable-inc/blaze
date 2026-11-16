@@ -7,7 +7,7 @@ use crate::ast::token::{Delimiter, Lit, LitKind};
 use crate::ast::{self, ForLoopKind, MatchKind, token};
 use crate::span::{BytePos, Span};
 use stdx::iter::IterExt;
-use tracing::debug;
+use blaze_trace::debug;
 
 use crate::chains::rewrite_chain;
 use crate::closures;

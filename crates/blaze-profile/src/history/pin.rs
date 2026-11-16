@@ -63,10 +63,10 @@ impl Drop for Pin {
             Ok(Outcome::Unpinned) => {}
             Ok(other) => {
                 let error = mismatch(self.core.dir(), "letting go of a reader's pin of", &other);
-                tracing::warn!(target: "blaze", "letting go of the reader's pin {named}: {error}");
+                blaze_trace::warn!(target: "blaze", "letting go of the reader's pin {named}: {error}");
             }
             Err(error) => {
-                tracing::warn!(target: "blaze", "letting go of the reader's pin {named}: {error}");
+                blaze_trace::warn!(target: "blaze", "letting go of the reader's pin {named}: {error}");
             }
         }
     }

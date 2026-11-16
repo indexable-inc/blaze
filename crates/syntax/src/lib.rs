@@ -504,7 +504,7 @@ impl ast::Expr {
     /// [`ast::Expr::parse`] under `extensions`, the syntax extensions of the crate whose
     /// source `text` is from.
     pub fn parse_with(text: &str, edition: Edition, extensions: Extensions) -> Parse<ast::Expr> {
-        let _p = tracing::info_span!(target: "blaze", "Expr::parse").entered();
+        let _p = blaze_trace::info_span!(target: "blaze", "Expr::parse").entered();
         let entry = parser::TopEntryPoint::Expr;
         let (tree, errors) = parsing::parse_text_at(&text.into(), entry, edition, extensions);
         let root = tree.root();
@@ -522,7 +522,7 @@ impl ast::MacroStmts {
     /// Parses `text` as the statements a macro call in statement position expands to, as
     /// rustc retries an expansion that is no expression (`failed_to_match_macro`).
     pub fn parse(text: &str, edition: Edition) -> Parse<ast::MacroStmts> {
-        let _p = tracing::info_span!(target: "blaze", "MacroStmts::parse").entered();
+        let _p = blaze_trace::info_span!(target: "blaze", "MacroStmts::parse").entered();
         let entry = parser::TopEntryPoint::MacroStmts;
         let (tree, errors) =
             parsing::parse_text_at(&text.into(), entry, edition, Extensions::NONE);
@@ -587,7 +587,7 @@ impl SourceFile {
         edition: Edition,
         extensions: Extensions,
     ) -> Parse<SourceFile> {
-        let _p = tracing::info_span!(target: "blaze", "SourceFile::parse").entered();
+        let _p = blaze_trace::info_span!(target: "blaze", "SourceFile::parse").entered();
         let (tree, errors) = parsing::parse_text(&text.into(), edition, extensions, false);
         let root = tree.root();
 
@@ -611,7 +611,7 @@ impl SourceFile {
         edition: Edition,
         extensions: Extensions,
     ) -> Parse<SourceFile> {
-        let _p = tracing::info_span!(target: "blaze", "SourceFile::parse_outline").entered();
+        let _p = blaze_trace::info_span!(target: "blaze", "SourceFile::parse_outline").entered();
         let (tree, errors) = parsing::parse_text(&text.into(), edition, extensions, true);
         let root = tree.root();
 

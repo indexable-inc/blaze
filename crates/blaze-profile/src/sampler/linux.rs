@@ -441,7 +441,7 @@ mod tests {
             // alloc: a test's thread name
             .name("span-spinner".to_owned())
             .spawn(|| {
-                let entered = tracing::info_span!(target: "blaze", "spinning in a span").entered();
+                let entered = blaze_trace::info_span!(target: "blaze", "spinning in a span").entered();
                 let ring = crate::flight::ring().expect("a thread that records spans has a ring");
                 let span = ring.innermost();
                 spins_in_a_span(Instant::now() + Duration::from_millis(1500));

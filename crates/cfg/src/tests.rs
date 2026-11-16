@@ -1,5 +1,5 @@
 use blaze_sim::{Config, Tape};
-use expect_test::{Expect, expect};
+use test_utils::{Expect, expect};
 use intern::Symbol;
 use syntax::{Edition, SourceFile, view, view::AstNode as _};
 use syntax_bridge::{

@@ -3,7 +3,7 @@
 use crate::ast;
 use crate::ast::visit::Visitor;
 use crate::span::{Symbol, sym};
-use tracing::debug;
+use blaze_trace::debug;
 
 use crate::attr::MetaVisitor;
 use crate::parse::macros::cfg_if::parse_cfg_if;

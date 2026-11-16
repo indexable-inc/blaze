@@ -23,7 +23,7 @@ unicode-width.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true
-expect-test.workspace = true
+test-utils.workspace = true
 serde_json.workspace = true
 
 [lints]

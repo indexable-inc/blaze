@@ -109,7 +109,7 @@ impl fmt::Display for At {
 /// moving lock waits to a row kind of their own is a change to this one function (and the view).
 pub fn record(wait: &LockWait) {
     let holder = wait.holder;
-    tracing::info!(
+    blaze_trace::info!(
         target: "blaze::lock",
         lock = wait.lock,
         value_type = wait.value_type,
@@ -639,7 +639,7 @@ mod tests {
 
     #[test]
     fn a_lock_wait_event_is_kept_by_the_recorder() {
-        assert!(crate::logs::keeps_event(TARGET, "event src/locks.rs:1", tracing::Level::INFO));
-        assert!(crate::logs::keeps_event(STALL_TARGET, "event src/x.rs:1", tracing::Level::INFO));
+        assert!(crate::logs::keeps_event(TARGET, "event src/locks.rs:1", blaze_trace::Level::INFO));
+        assert!(crate::logs::keeps_event(STALL_TARGET, "event src/x.rs:1", blaze_trace::Level::INFO));
     }
 }

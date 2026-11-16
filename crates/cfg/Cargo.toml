@@ -23,7 +23,7 @@ intern.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true
-expect-test.workspace = true
+test-utils.workspace = true
 
 # local deps
 syntax-bridge.workspace = true

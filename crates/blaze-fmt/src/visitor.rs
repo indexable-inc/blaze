@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use crate::ast::{self, token::Delimiter, visit};
 use crate::span::{BytePos, Ident, Pos, Span, symbol};
-use tracing::debug;
+use blaze_trace::debug;
 
 use crate::attr::*;
 use crate::comment::{

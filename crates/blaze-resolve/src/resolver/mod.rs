@@ -68,7 +68,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use std::alloc::Global;
-use tracing::{debug, trace};
+use blaze_trace::{debug, trace};
 
 use crate::interning::InternedString;
 use crate::lockfile;

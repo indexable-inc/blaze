@@ -7,7 +7,7 @@ use std::{cmp, iter};
 use rustc_hashes::Hash64;
 use rustc_index::Idx;
 use rustc_index::bit_set::BitMatrix;
-use tracing::{debug, trace};
+use blaze_trace::{debug, trace};
 
 use crate::{
     AbiAlign, Align, BackendLaneCount, BackendRepr, FieldsShape, HasDataLayout, IndexSlice,

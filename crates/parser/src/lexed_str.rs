@@ -131,7 +131,7 @@ impl<'a> LexedStr<'a> {
         edition: Edition,
         text: &'a str,
     ) -> LexedStr<'a> {
-        let _p = tracing::info_span!(target: "blaze", "LexedStr::new").entered();
+        let _p = blaze_trace::info_span!(target: "blaze", "LexedStr::new").entered();
         assert!(text.len() <= u32::MAX as usize, "a text of 4 GiB or more");
         let mut conv = Converter::new(edition, text);
         if HASH {

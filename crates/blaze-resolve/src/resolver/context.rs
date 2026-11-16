@@ -11,7 +11,7 @@ use crate::{Dependency, PackageId, Registry, Summary};
 use anyhow::format_err;
 use std::alloc::Global;
 use std::collections::BTreeSet;
-use tracing::debug;
+use blaze_trace::debug;
 
 // A `Context` is basically a bunch of local resolution information which is
 // kept around for all `BacktrackFrame` instances. As a result, this runs the

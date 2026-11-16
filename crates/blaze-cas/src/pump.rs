@@ -78,7 +78,7 @@ impl<D: Driver> Pump for Inline<'_, D> {
         // alloc: a pumped miss, a test's or a tool's, never the daemon's
         let mut out = Vec::new();
         let mut since = self.driver.now();
-        let span = tracing::info_span!(target: "blaze", "store pool pump", reads = left);
+        let span = blaze_trace::info_span!(target: "blaze", "store pool pump", reads = left);
         let _in = span.enter();
         // Bounded: each turn completes one of the effects or waits out part of the stall, which
         // ends it.

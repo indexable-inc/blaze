@@ -161,12 +161,12 @@ pub fn pass(
     to_free: &dyn Fn(u64) -> u64,
     sizes: &mut Sizes,
 ) -> Result<(Account, Vec<String>), String> {
-    let span = tracing::info_span!(
+    let span = blaze_trace::info_span!(
         target: "blaze",
         "gc home pass",
         pressure = asked.pressure,
-        bytes = tracing::field::Empty,
-        going = tracing::field::Empty,
+        bytes = blaze_trace::field::Empty,
+        going = blaze_trace::field::Empty,
     );
     let _entered = span.enter();
     fs::check_local(home)?;

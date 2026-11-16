@@ -3,7 +3,6 @@
 use blaze_hash::HashMap;
 use intern::Symbol;
 use std::alloc::Global;
-use stdx::itertools::Itertools;
 use syntax::view::{self as ast, AstNode as _, HasName as _};
 use syntax_bridge::{
     DocCommentDesugarMode, call_input,
@@ -24,9 +23,8 @@ fn benchmark_parse_macro_rules() {
     let rules = macro_rules_fixtures_tt();
     let hash: usize = {
         let _pt = bench("mbe parse macro rules");
-        rules
+        by_key(rules)
             .into_iter()
-            .sorted_by(|(a, _), (b, _)| a.cmp(b))
             .map(|(_, it)| {
                 DeclarativeMacro::parse_macro_rules(&it, |_| span::Edition::CURRENT).rules.len()
             })
@@ -58,10 +56,16 @@ fn benchmark_expand_macro_rules() {
     assert_eq!(hash, 450144);
 }
 
+/// A map's pairs in key order, so that a benchmark sees them the same way every run.
+fn by_key<K: Ord, V>(pairs: impl IntoIterator<Item = (K, V)>) -> Vec<(K, V)> {
+    let mut pairs: Vec<_> = pairs.into_iter().collect();
+    pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
+    pairs
+}
+
 pub(crate) fn macro_rules_fixtures() -> HashMap<String, DeclarativeMacro, Global> {
-    macro_rules_fixtures_tt()
+    by_key(macro_rules_fixtures_tt())
         .into_iter()
-        .sorted_by(|(a, _), (b, _)| a.cmp(b))
         .map(|(id, tt)| (id, DeclarativeMacro::parse_macro_rules(&tt, |_| span::Edition::CURRENT)))
         .collect()
 }
@@ -95,7 +99,7 @@ pub(crate) fn invocation_fixtures(
     let mut seed = 123456789;
     let mut res = Vec::new();
 
-    for (name, it) in rules.iter().sorted_by_key(|&(id, _)| id) {
+    for (name, it) in by_key(rules.iter()) {
         for rule in it.rules.iter() {
             // Generate twice
             for _ in 0..2 {

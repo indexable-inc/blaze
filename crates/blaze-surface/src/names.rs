@@ -204,7 +204,7 @@ impl<'a> ModuleFileView<'a> {
     pub fn read(buffer: &'a [u8]) -> Result<ModuleFileView<'a>, FormatError> {
         let root = blaze_format::open::<ModuleFileRoot>(buffer)?;
         let strings = root.strings.as_str(buffer)?;
-        check_text(strings, root.path, root, buffer)?;
+        check_text(strings, root.path, blaze_format::Verified::get(root), buffer)?;
         let absent = root.absent.follow(buffer)?;
         for text in absent {
             check_text(strings, *text, text, buffer)?;

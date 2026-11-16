@@ -509,9 +509,9 @@ fn killed_daemon(dir: &std::path::Path) -> ! {
             .name("worker stuck".to_owned())
             .spawn_scoped(scope, || {
                 let _build = crate::flight::building(1);
-                drop(tracing::info_span!(target: "blaze", "unit done", krate = "app").entered());
+                drop(blaze_trace::info_span!(target: "blaze", "unit done", krate = "app").entered());
                 let _unit =
-                    tracing::info_span!(target: "blaze", "unit bodies", krate = "app").entered();
+                    blaze_trace::info_span!(target: "blaze", "unit bodies", krate = "app").entered();
                 let awaits = crate::span::Name::of("the lock no one lets go");
                 let on = blaze_graph::wait::WaitKind::Key;
                 let _wait =

@@ -20,13 +20,11 @@ blaze-core.workspace = true
 blaze-id.workspace = true
 blaze-surface.workspace = true
 arrayvec.workspace = true
-bitflags.workspace = true
+blaze-bitflags.workspace = true
 blaze-hash.workspace = true
 cov-mark.workspace = true
 drop_bomb.workspace = true
-either.workspace = true
 hashbrown.workspace = true
-itertools.workspace = true
 la-arena.workspace = true
 tracing = { workspace = true, features = ["attributes"] }
 smallvec.workspace = true
@@ -70,7 +68,6 @@ blaze-alloc-count.workspace = true
 blaze-graph.workspace = true
 blaze-sim.workspace = true
 crossbeam-channel.workspace = true
-expect-test.workspace = true
 fst.workspace = true
 # The census of std's surfaces (`deps::std_census`): the one gather (`gather::gather`), the
 # tool id it is keyed under, and std's graph, cfg and target data from the one source the

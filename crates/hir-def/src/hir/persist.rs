@@ -31,11 +31,9 @@ use hir_expand::{
     name::Name,
 };
 use intern::{Internable, Interned, Symbol};
-use smallvec::SmallVec;
 use span::{Edition, ErasedFileAstId, FileAstId, Span, SpanAnchor, SyntaxContext};
 use std::alloc::Global;
 use syntax::{TextRange, TextSize};
-use thin_vec::ThinVec;
 
 use crate::hir::ExprOrPatIdPacked;
 
@@ -908,26 +906,6 @@ impl<T: Code> Code for Vec<T> {
 
     fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
         r.seq::<T, _>()
-    }
-}
-
-impl<T: Code> Code for ThinVec<T> {
-    fn put(&self, w: &mut Words) {
-        w.seq(self.iter());
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        r.seq::<T, _>()
-    }
-}
-
-impl<A: smallvec::Array<Item: Code>> Code for SmallVec<A> {
-    fn put(&self, w: &mut Words) {
-        w.seq(self.iter());
-    }
-
-    fn get(r: &mut Read<'_>) -> Result<Self, FormatError> {
-        r.seq::<A::Item, _>()
     }
 }
 

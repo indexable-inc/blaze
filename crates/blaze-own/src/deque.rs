@@ -21,7 +21,8 @@ use core::{
 #[cfg(test)]
 use crate::plant::{self, Plant};
 use crate::{
-    error::AllocFailure,
+    error::{AllocFailure, fail},
+    make::CloneIn,
     raw::RawBuf,
     vec::{Refused, out_of_bounds},
 };
@@ -615,10 +616,40 @@ impl<T, A: Allocator> IndexMut<usize> for VecDeque<T, A> {
 }
 
 impl<T: Clone, A: Allocator + Clone> Clone for VecDeque<T, A> {
+    /// Allocates from the collection's own allocator: prefer `clone_in`.
     fn clone(&self) -> VecDeque<T, A> {
         let mut out = VecDeque::with_capacity_in(self.len, self.allocator().clone());
         out.extend(self.iter().cloned());
         out
+    }
+}
+
+impl<T, A: Allocator> VecDeque<T, A> {
+    /// A deep copy in another allocator, front first, unwrapped: room for exactly the length in
+    /// `alloc`, each value copied with [`CloneIn`] into `alloc` too. A refusal drops what was
+    /// copied.
+    pub fn try_clone_in<B: Allocator + Clone>(&self, alloc: B) -> Result<VecDeque<T::In, B>, AllocFailure>
+    where
+        T: CloneIn<B>,
+    {
+        let mut out = VecDeque::try_with_capacity_in(self.len, alloc.clone())?;
+        for value in self.iter() {
+            // The room is reserved: the push does not allocate.
+            out.push_back(value.try_clone_in(alloc.clone())?);
+        }
+        Ok(out)
+    }
+
+    /// [`VecDeque::try_clone_in`], panicking with the [`AllocFailure`].
+    #[track_caller]
+    pub fn clone_in<B: Allocator + Clone>(&self, alloc: B) -> VecDeque<T::In, B>
+    where
+        T: CloneIn<B>,
+    {
+        match self.try_clone_in(alloc) {
+            Ok(copy) => copy,
+            Err(failure) => fail(failure),
+        }
     }
 }
 

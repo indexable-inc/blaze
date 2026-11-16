@@ -21,7 +21,6 @@ use hir_expand::{
 };
 use span::AstIdMap;
 use syntax::view::{self as ast, AstNode, HasAttrs, IsString};
-use thin_vec::ThinVec;
 use tt::{TextRange, TextSize};
 
 use crate::{macro_call_as_call_id, nameres::MacroSubNs, resolver::Resolver};
@@ -55,7 +54,7 @@ pub struct Docs {
     /// (as outline modules don't have inner attributes).
     outline_inner_docs_start: Option<TextSize>,
     /// All macro calls in `#[doc = ...]` attributes, recursively.
-    macro_calls: ThinVec<(AstId<syntax::ast::MacroCall>, MacroCallId)>,
+    macro_calls: Vec<(AstId<syntax::ast::MacroCall>, MacroCallId)>,
 }
 
 #[derive(Clone, Copy)]
@@ -133,7 +132,7 @@ impl Docs {
     pub fn heap_bytes(&self) -> usize {
         self.docs.capacity()
             + crate::heap::vec_bytes(&self.docs_source_map)
-            + crate::heap::thin_vec_bytes(&self.macro_calls)
+            + crate::heap::vec_bytes(&self.macro_calls)
     }
 
     #[inline]
@@ -613,7 +612,7 @@ struct DocMacroExpander<'db> {
 
 fn expand_doc_expr_via_macro_pipeline<'db>(
     expander: &mut DocMacroExpander<'db>,
-    macro_calls: &mut ThinVec<(AstId<syntax::ast::MacroCall>, MacroCallId)>,
+    macro_calls: &mut Vec<(AstId<syntax::ast::MacroCall>, MacroCallId)>,
     expr: ast::Expr<'_>,
 ) -> Option<String> {
     match expr {
@@ -634,7 +633,7 @@ fn expand_doc_expr_via_macro_pipeline<'db>(
 
 fn expand_doc_macro_call<'db>(
     expander: &mut DocMacroExpander<'db>,
-    macro_calls: &mut ThinVec<(AstId<syntax::ast::MacroCall>, MacroCallId)>,
+    macro_calls: &mut Vec<(AstId<syntax::ast::MacroCall>, MacroCallId)>,
     macro_call: ast::MacroCall<'_>,
 ) -> Option<String> {
     if expander.macro_depth >= expander.recursion_limit {
@@ -714,7 +713,7 @@ pub(crate) fn expand_attr_value<'db>(
         ast_id_map: file_id.ast_id_map(db),
         span_map: file_id.span_map(db),
     };
-    expand_doc_expr_via_macro_pipeline(&mut expander, &mut ThinVec::new(), value.value)
+    expand_doc_expr_via_macro_pipeline(&mut expander, &mut Vec::new(), value.value)
 }
 
 fn extend_with_attrs<'a, 'db>(
@@ -852,7 +851,7 @@ fn extract_docs_into<'a, 'db>(
         prefix_len: TextSize::new(0),
         inline_inner_docs_start: None,
         outline_inner_docs_start: None,
-        macro_calls: ThinVec::new(),
+        macro_calls: Vec::new(),
     };
 
     let mut cfg_options = None;
@@ -914,7 +913,7 @@ fn extract_docs_into<'a, 'db>(
     buffers.docs = std::mem::replace(&mut result.docs, docs);
     buffers.source_map = std::mem::replace(&mut result.docs_source_map, source_map);
     buffers.indent = indent.lines;
-    // A `#[doc = macro!()]` is rare: its calls keep the `ThinVec` they were pushed to.
+    // A `#[doc = macro!()]` is rare: its calls keep the vector they were pushed to, cut to its length.
     result.macro_calls.shrink_to_fit();
 
     // alloc: the memo's box, only for an item with docs
@@ -924,11 +923,10 @@ fn extract_docs_into<'a, 'db>(
 #[cfg(test)]
 mod tests {
     use blaze_ids::rng::SplitMix64;
-    use expect_test::expect;
+    use test_utils::expect;
     use hir_expand::InFile;
     use hir_expand::fixture;
     use syntax::view::{self as ast, AstNode, AstToken, block_may_start_with_inner_attr};
-    use thin_vec::ThinVec;
     use tt::{TextRange, TextSize};
 
     use super::{DocCommentKind, Docs, Indent, IsInnerDoc};
@@ -975,7 +973,7 @@ mod tests {
             prefix_len: TextSize::new(0),
             inline_inner_docs_start: None,
             outline_inner_docs_start: None,
-            macro_calls: ThinVec::new(),
+            macro_calls: Vec::new(),
         };
         let mut indent = Indent::default();
 
@@ -1154,7 +1152,7 @@ mod tests {
             prefix_len: TextSize::new(0),
             inline_inner_docs_start: None,
             outline_inner_docs_start: None,
-            macro_calls: ThinVec::new(),
+            macro_calls: Vec::new(),
         };
         let mut indent = Indent::default();
 
@@ -1224,7 +1222,7 @@ mod tests {
                 prefix_len: TextSize::new(0),
                 inline_inner_docs_start: None,
                 outline_inner_docs_start: None,
-                macro_calls: ThinVec::new(),
+                macro_calls: Vec::new(),
             };
             let mut indent = Indent::default();
             for _ in 0..1 + case % 6 {
@@ -1259,7 +1257,7 @@ mod tests {
             prefix_len: TextSize::new(0),
             inline_inner_docs_start: None,
             outline_inner_docs_start: None,
-            macro_calls: ThinVec::new(),
+            macro_calls: Vec::new(),
         };
         let mut indent = Indent::default();
         docs.extend_with_doc_comment(comment, &mut indent);
@@ -1271,7 +1269,7 @@ mod tests {
     #[test]
     fn block_doc_comment_stars() {
         #[track_caller]
-        fn check(source: &str, expect: &expect_test::Expect) {
+        fn check(source: &str, expect: &test_utils::Expect) {
             expect.assert_eq(&comment_docs(source).docs);
         }
 
@@ -1346,7 +1344,7 @@ mod tests {
             prefix_len: TextSize::new(0),
             inline_inner_docs_start: None,
             outline_inner_docs_start: None,
-            macro_calls: ThinVec::new(),
+            macro_calls: Vec::new(),
         };
         let mut indent = Indent::default();
         docs.extend_with_doc_attr(value, &mut indent);
@@ -1505,7 +1503,7 @@ mod tests {
                     prefix_len: TextSize::new(0),
                     inline_inner_docs_start: None,
                     outline_inner_docs_start: None,
-                    macro_calls: ThinVec::new(),
+                    macro_calls: Vec::new(),
                 };
                 let base = TextSize::new(3);
                 let kind = DocCommentKind::Sugared(shape);

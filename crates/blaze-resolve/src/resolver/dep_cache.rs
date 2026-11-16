@@ -33,7 +33,7 @@ use std::collections::BTreeSet;
 use std::fmt::Write;
 use std::rc::Rc;
 use std::task::Poll;
-use tracing::debug;
+use blaze_trace::debug;
 
 pub(super) struct RegistryQueryerAsync<'a, T: Registry> {
     pub registry: &'a T,

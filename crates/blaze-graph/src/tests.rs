@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use blaze_hash::{HashMap, HashSet};
 use blaze_ids::rng::SplitMix64;
 use blaze_protocol::events::{Event, NodeKind, NodeState, Record};
-use expect_test::{expect, expect_file};
+use test_utils::{expect, expect_file};
 use blaze_core::lock::Lock;
 use std::alloc::Global;
 

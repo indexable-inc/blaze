@@ -278,19 +278,19 @@ fn waiting_on(wait: Wait) -> &'static str {
 
 /// The span naming the wait `wait` of the history `dir` (every-wait-says-what); `None` for the
 /// waits on its plain reads and writes, which the job's own span covers.
-fn span_of(wait: Wait, dir: &Path) -> Option<tracing::span::EnteredSpan> {
+fn span_of(wait: Wait, dir: &Path) -> Option<blaze_trace::span::EnteredSpan> {
     match wait {
         Wait::ManifestLock => Some(
-            tracing::info_span!(
+            blaze_trace::info_span!(
                 target: "blaze",
                 "waits on the profile history's manifest lock",
                 dir = %dir.display()
             )
             .entered(),
         ),
-        Wait::Sync => Some(tracing::info_span!(target: "blaze", "profile fsync").entered()),
-        Wait::Merge => Some(tracing::info_span!(target: "blaze", "profile merge").entered()),
-        Wait::Reap => Some(tracing::info_span!(target: "blaze", "profile reap").entered()),
+        Wait::Sync => Some(blaze_trace::info_span!(target: "blaze", "profile fsync").entered()),
+        Wait::Merge => Some(blaze_trace::info_span!(target: "blaze", "profile merge").entered()),
+        Wait::Reap => Some(blaze_trace::info_span!(target: "blaze", "profile reap").entered()),
         Wait::Files | Wait::Nothing => None,
     }
 }
@@ -311,7 +311,7 @@ pub(crate) fn run<H: Host>(
     let mut done: Vec<Completion> = Vec::new();
     // The span open over the polls of one wait, and the wait it names.
     let mut spanned = Wait::Nothing;
-    let mut span: Option<tracing::span::EnteredSpan> = None;
+    let mut span: Option<blaze_trace::span::EnteredSpan> = None;
     let mut progressed = driver.now();
     loop {
         files.effects(&mut effects);

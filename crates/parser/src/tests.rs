@@ -10,7 +10,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use expect_test::expect_file;
+use test_utils::expect_file;
 
 use crate::{Edition, LexedStr, TopEntryPoint};
 

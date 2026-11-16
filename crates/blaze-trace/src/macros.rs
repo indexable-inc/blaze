@@ -153,46 +153,174 @@ macro_rules! event {
     };
 }
 
-macro_rules! level_macros {
-    ($($span:ident $event:ident $level:ident),*) => {
-        $(
-            /// A span at this level: `
-            #[doc = stringify!($span)]
-            /// !([target: ..,] [parent: ..,] "name" [, field]*)`.
-            #[macro_export]
-            macro_rules! $span {
-                (target: $$target:expr, parent: $$parent:expr, $$($$rest:tt)+) => {
-                    $crate::span!(target: $$target, parent: $$parent, $crate::Level::$level, $$($$rest)+)
-                };
-                (target: $$target:expr, $$($$rest:tt)+) => {
-                    $crate::span!(target: $$target, $crate::Level::$level, $$($$rest)+)
-                };
-                (parent: $$parent:expr, $$($$rest:tt)+) => {
-                    $crate::span!(parent: $$parent, $crate::Level::$level, $$($$rest)+)
-                };
-                ($$($$rest:tt)+) => {
-                    $crate::span!($crate::Level::$level, $$($$rest)+)
-                };
-            }
+/// A span at `ERROR`: `error_span!([target: ..,] [parent: ..,] "name" [, field]*)`.
+#[macro_export]
+macro_rules! error_span {
+    (target: $target:expr, parent: $parent:expr, $($rest:tt)+) => {
+        $crate::span!(target: $target, parent: $parent, $crate::Level::ERROR, $($rest)+)
+    };
+    (target: $target:expr, $($rest:tt)+) => {
+        $crate::span!(target: $target, $crate::Level::ERROR, $($rest)+)
+    };
+    (parent: $parent:expr, $($rest:tt)+) => {
+        $crate::span!(parent: $parent, $crate::Level::ERROR, $($rest)+)
+    };
+    ($($rest:tt)+) => {
+        $crate::span!($crate::Level::ERROR, $($rest)+)
+    };
+}
 
-            /// An event at this level: `
-            #[doc = stringify!($event)]
-            /// !([target: ..,] [parent: ..,] [field,]* ["fmt" [, arg]*])`.
-            #[macro_export]
-            macro_rules! $event {
-                (target: $$target:expr, parent: $$parent:expr, $$($$rest:tt)+) => {
-                    $crate::event!(target: $$target, parent: $$parent, $crate::Level::$level, $$($$rest)+)
-                };
-                (target: $$target:expr, $$($$rest:tt)+) => {
-                    $crate::event!(target: $$target, $crate::Level::$level, $$($$rest)+)
-                };
-                (parent: $$parent:expr, $$($$rest:tt)+) => {
-                    $crate::event!(parent: $$parent, $crate::Level::$level, $$($$rest)+)
-                };
-                ($$($$rest:tt)+) => {
-                    $crate::event!($crate::Level::$level, $$($$rest)+)
-                };
-            }
-        )*
+/// An event at `ERROR`: `error!([target: ..,] [parent: ..,] [field,]* ["fmt" [, arg]*])`.
+#[macro_export]
+macro_rules! error {
+    (target: $target:expr, parent: $parent:expr, $($rest:tt)+) => {
+        $crate::event!(target: $target, parent: $parent, $crate::Level::ERROR, $($rest)+)
+    };
+    (target: $target:expr, $($rest:tt)+) => {
+        $crate::event!(target: $target, $crate::Level::ERROR, $($rest)+)
+    };
+    (parent: $parent:expr, $($rest:tt)+) => {
+        $crate::event!(parent: $parent, $crate::Level::ERROR, $($rest)+)
+    };
+    ($($rest:tt)+) => {
+        $crate::event!($crate::Level::ERROR, $($rest)+)
+    };
+}
+
+/// A span at `WARN`: `warn_span!([target: ..,] [parent: ..,] "name" [, field]*)`.
+#[macro_export]
+macro_rules! warn_span {
+    (target: $target:expr, parent: $parent:expr, $($rest:tt)+) => {
+        $crate::span!(target: $target, parent: $parent, $crate::Level::WARN, $($rest)+)
+    };
+    (target: $target:expr, $($rest:tt)+) => {
+        $crate::span!(target: $target, $crate::Level::WARN, $($rest)+)
+    };
+    (parent: $parent:expr, $($rest:tt)+) => {
+        $crate::span!(parent: $parent, $crate::Level::WARN, $($rest)+)
+    };
+    ($($rest:tt)+) => {
+        $crate::span!($crate::Level::WARN, $($rest)+)
+    };
+}
+
+/// An event at `WARN`: `warn!([target: ..,] [parent: ..,] [field,]* ["fmt" [, arg]*])`.
+#[macro_export]
+macro_rules! warn {
+    (target: $target:expr, parent: $parent:expr, $($rest:tt)+) => {
+        $crate::event!(target: $target, parent: $parent, $crate::Level::WARN, $($rest)+)
+    };
+    (target: $target:expr, $($rest:tt)+) => {
+        $crate::event!(target: $target, $crate::Level::WARN, $($rest)+)
+    };
+    (parent: $parent:expr, $($rest:tt)+) => {
+        $crate::event!(parent: $parent, $crate::Level::WARN, $($rest)+)
+    };
+    ($($rest:tt)+) => {
+        $crate::event!($crate::Level::WARN, $($rest)+)
+    };
+}
+
+/// A span at `INFO`: `info_span!([target: ..,] [parent: ..,] "name" [, field]*)`.
+#[macro_export]
+macro_rules! info_span {
+    (target: $target:expr, parent: $parent:expr, $($rest:tt)+) => {
+        $crate::span!(target: $target, parent: $parent, $crate::Level::INFO, $($rest)+)
+    };
+    (target: $target:expr, $($rest:tt)+) => {
+        $crate::span!(target: $target, $crate::Level::INFO, $($rest)+)
+    };
+    (parent: $parent:expr, $($rest:tt)+) => {
+        $crate::span!(parent: $parent, $crate::Level::INFO, $($rest)+)
+    };
+    ($($rest:tt)+) => {
+        $crate::span!($crate::Level::INFO, $($rest)+)
+    };
+}
+
+/// An event at `INFO`: `info!([target: ..,] [parent: ..,] [field,]* ["fmt" [, arg]*])`.
+#[macro_export]
+macro_rules! info {
+    (target: $target:expr, parent: $parent:expr, $($rest:tt)+) => {
+        $crate::event!(target: $target, parent: $parent, $crate::Level::INFO, $($rest)+)
+    };
+    (target: $target:expr, $($rest:tt)+) => {
+        $crate::event!(target: $target, $crate::Level::INFO, $($rest)+)
+    };
+    (parent: $parent:expr, $($rest:tt)+) => {
+        $crate::event!(parent: $parent, $crate::Level::INFO, $($rest)+)
+    };
+    ($($rest:tt)+) => {
+        $crate::event!($crate::Level::INFO, $($rest)+)
+    };
+}
+
+/// A span at `DEBUG`: `debug_span!([target: ..,] [parent: ..,] "name" [, field]*)`.
+#[macro_export]
+macro_rules! debug_span {
+    (target: $target:expr, parent: $parent:expr, $($rest:tt)+) => {
+        $crate::span!(target: $target, parent: $parent, $crate::Level::DEBUG, $($rest)+)
+    };
+    (target: $target:expr, $($rest:tt)+) => {
+        $crate::span!(target: $target, $crate::Level::DEBUG, $($rest)+)
+    };
+    (parent: $parent:expr, $($rest:tt)+) => {
+        $crate::span!(parent: $parent, $crate::Level::DEBUG, $($rest)+)
+    };
+    ($($rest:tt)+) => {
+        $crate::span!($crate::Level::DEBUG, $($rest)+)
+    };
+}
+
+/// An event at `DEBUG`: `debug!([target: ..,] [parent: ..,] [field,]* ["fmt" [, arg]*])`.
+#[macro_export]
+macro_rules! debug {
+    (target: $target:expr, parent: $parent:expr, $($rest:tt)+) => {
+        $crate::event!(target: $target, parent: $parent, $crate::Level::DEBUG, $($rest)+)
+    };
+    (target: $target:expr, $($rest:tt)+) => {
+        $crate::event!(target: $target, $crate::Level::DEBUG, $($rest)+)
+    };
+    (parent: $parent:expr, $($rest:tt)+) => {
+        $crate::event!(parent: $parent, $crate::Level::DEBUG, $($rest)+)
+    };
+    ($($rest:tt)+) => {
+        $crate::event!($crate::Level::DEBUG, $($rest)+)
+    };
+}
+
+/// A span at `TRACE`, compiled out without debug assertions: `trace_span!([target: ..,]
+/// [parent: ..,] "name" [, field]*)`.
+#[macro_export]
+macro_rules! trace_span {
+    (target: $target:expr, parent: $parent:expr, $($rest:tt)+) => {
+        $crate::span!(target: $target, parent: $parent, $crate::Level::TRACE, $($rest)+)
+    };
+    (target: $target:expr, $($rest:tt)+) => {
+        $crate::span!(target: $target, $crate::Level::TRACE, $($rest)+)
+    };
+    (parent: $parent:expr, $($rest:tt)+) => {
+        $crate::span!(parent: $parent, $crate::Level::TRACE, $($rest)+)
+    };
+    ($($rest:tt)+) => {
+        $crate::span!($crate::Level::TRACE, $($rest)+)
+    };
+}
+
+/// An event at `TRACE`, compiled out without debug assertions: `trace!([target: ..,]
+/// [parent: ..,] [field,]* ["fmt" [, arg]*])`.
+#[macro_export]
+macro_rules! trace {
+    (target: $target:expr, parent: $parent:expr, $($rest:tt)+) => {
+        $crate::event!(target: $target, parent: $parent, $crate::Level::TRACE, $($rest)+)
+    };
+    (target: $target:expr, $($rest:tt)+) => {
+        $crate::event!(target: $target, $crate::Level::TRACE, $($rest)+)
+    };
+    (parent: $parent:expr, $($rest:tt)+) => {
+        $crate::event!(parent: $parent, $crate::Level::TRACE, $($rest)+)
+    };
+    ($($rest:tt)+) => {
+        $crate::event!($crate::Level::TRACE, $($rest)+)
     };
 }

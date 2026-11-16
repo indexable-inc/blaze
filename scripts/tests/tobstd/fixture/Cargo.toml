@@ -1,0 +1,11 @@
+[package]
+name = "tobstd-fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Its own workspace: the fixture is input for `tobstd`'s selftest, never a member of blaze's.
+[workspace]
+
+[lib]
+path = "src/lib.rs"

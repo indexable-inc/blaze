@@ -73,6 +73,8 @@ A wall is listed with its file and line, and nothing there is changed:
                 function pointer, or a closure's stand-in)
   entry         `main` or a test, with `entry` null
   error         (settle) a compile error that is not an E0061 this tool can act on
+  unmatched     (settle) an E0061 whose call no rule matched (inside a macro's tokens, or a
+                call shape the rules do not know); settle stops when a pass changes nothing
   steps         (settle) the step limit was reached with E0061s left
 The summary (standard output, JSON): sites converted per row, rows skipped and why, the
 functions that gained the parameter, the walls by kind, and settle's checks run.
@@ -398,16 +400,20 @@ fn rename_shapes(rows: &[Row], roots: &[String]) -> (Vec<Shape>, BTreeMap<String
             continue;
         }
         let from = &row.written;
-        if row.kind == "macro" {
-            shapes.push(Shape { row: from.clone(), rule: o(&[("pattern", s(&format!("{from}!($$$A)")))]), constraints: None, fix: format!("{to}!($$$A)"), is_type: false });
-        }
+        // The path node itself, whole (a pattern `std::fmt` matches no `use std::fmt;`): as an
+        // expression, a type, a macro's name, or the path of a longer one (`std::fmt` in
+        // `std::fmt::Debug`, whose items a rename keeps). A path in a `use` group
+        // (`use std::{fmt, mem}`) is written in pieces and is not matched.
+        let path = o(&[
+            ("any", J::A(vec![o(&[("kind", s("scoped_identifier"))]), o(&[("kind", s("scoped_type_identifier"))])])),
+            ("regex", s(&format!("^{from}$"))),
+        ]);
+        let in_use = o(&[("inside", o(&[("stopBy", s("end")), ("kind", s("use_declaration"))]))]);
         // Inline: everywhere but a `use`.
-        let not_use = o(&[("not", o(&[("inside", o(&[("stopBy", s("end")), ("kind", s("use_declaration"))]))]))]);
-        shapes.push(Shape { row: from.clone(), rule: all(o(&[("pattern", s(from))]), not_use), constraints: None, fix: to.clone(), is_type: false });
+        shapes.push(Shape { row: from.clone(), rule: all(path.clone(), o(&[("not", in_use.clone())])), constraints: None, fix: to.clone(), is_type: false });
         // In a `use` only when the name it binds stays: `use std::mem::swap;` to `core::mem::swap`.
         if from.rsplit("::").next() == to.rsplit("::").next() {
-            let in_use = o(&[("inside", o(&[("stopBy", s("end")), ("kind", s("use_declaration"))]))]);
-            shapes.push(Shape { row: from.clone(), rule: all(o(&[("pattern", s(from))]), in_use), constraints: None, fix: to.clone(), is_type: false });
+            shapes.push(Shape { row: from.clone(), rule: all(path, in_use), constraints: None, fix: to.clone(), is_type: false });
         }
     }
     (shapes, skipped)
@@ -1338,11 +1344,25 @@ fn run_mode(a: &Args) -> Result<Summary, ToolError> {
             let (shapes, skipped) = rename_shapes(&read_table(&text)?, &a.roots);
             out.skipped = skipped;
             let rules: Vec<Rule> = shapes.iter().enumerate().map(|(n, sh)| Rule { id: format!("r{n}"), rule: sh.rule.clone(), constraints: None, fix: Some(sh.fix.clone()), transform: None }).collect();
-            for m in grep.query(&rules, &files)? {
+            // A site is the outermost path a row names: `std::fmt::Debug` counts for its own
+            // row, not also for `std::fmt`'s (the matches come sorted by file and start).
+            let found = grep.query(&rules, &files)?;
+            let mut outer: Vec<&Match> = Vec::new();
+            for m in &found {
+                match outer.last_mut() {
+                    Some(last) if last.file == m.file && last.start == m.start => {
+                        if m.end > last.end {
+                            *last = m;
+                        }
+                    }
+                    _ => outer.push(m),
+                }
+            }
+            for m in outer {
                 let n: usize = m.rule.trim_start_matches('r').parse().unwrap_or(0);
                 *out.sites.entry(shapes[n].row.clone()).or_default() += 1;
             }
-            grep.apply(&rules, &files, 1)?;
+            grep.apply(&rules, &files, PASSES)?;
         }
         Mode::AddArg => {
             let text = std::fs::read_to_string(root.join(TABLE)).map_err(|e| ToolError::File { path: TABLE.to_owned(), why: e.to_string() })?;

@@ -699,7 +699,7 @@ mod tests {
         crate::install();
         std::thread::spawn(|| {
             let _build = flight::building(9);
-            let _span = tracing::info_span!(target: "blaze", "batched", krate = "app").entered();
+            let _span = blaze_trace::info_span!(target: "blaze", "batched", krate = "app").entered();
             flight::plot(flight::Plot::Queued, 4);
         })
         .join()
@@ -779,7 +779,7 @@ mod tests {
                         let _build = flight::building(31);
                         let krate = format!("round_trip_crate_{t}");
                         let function = format!("round_trip::{}::f", "segment".repeat(t * 3));
-                        let _span = tracing::info_span!(
+                        let _span = blaze_trace::info_span!(
                             target: "blaze",
                             "names round trip",
                             krate = krate.as_str(),
@@ -787,16 +787,16 @@ mod tests {
                         )
                         .entered();
                         let item = format!("round trip item {t}");
-                        tracing::info!(target: "blaze", item = item.as_str(), "round trip event {t}");
+                        blaze_trace::info!(target: "blaze", item = item.as_str(), "round trip event {t}");
                     })
                     .unwrap();
             }
             // Opened here, named and closed on another thread: its names go in as links.
-            let span = tracing::info_span!(
+            let span = blaze_trace::info_span!(
                 target: "blaze",
                 "names round trip moved",
                 krate = "round_trip_opened_here",
-                function = tracing::field::Empty
+                function = blaze_trace::field::Empty
             );
             std::thread::Builder::new()
                 .name("names round trip closer".to_owned())

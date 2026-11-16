@@ -9,16 +9,12 @@ use std::borrow::Cow;
 use std::ops::Range;
 
 use ast_merge_langs::Lang;
-use astlog_engine::{BodyAtom, Facts, InternalSnafu, Row};
+use astlog_engine::{BodyAtom, Facts, Row};
 use blaze_hash::HashMap;
-use snafu::ResultExt as _;
 use tree_sitter::StreamingIterator as _;
 
 use crate::corpus::{Corpus, NodeRef, Value};
-use crate::error::{
-    CaptureAbsentSnafu, CaptureIndexSnafu, Error, NotNodeSnafu, PredicateUnsupportedSnafu,
-    QuerySnafu,
-};
+use crate::error::{Error, SourceError};
 use crate::program::{Atom, MatchAtom, Program, TreeSitter};
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -144,8 +140,8 @@ impl Facts for TreeFacts<'_> {
                     } else {
                         "attached-sibling"
                     };
-                    return Err(SourceError::NotNode { line, name, arg: "the first argument", what })
-                        .map_err(Into::into);
+                    let arg = "the first argument";
+                    return Err(SourceError::NotNode { line, name, arg, what }.into());
                 };
                 let kind = self.value_text(kind);
                 let text = self.value_text(text);
@@ -192,7 +188,8 @@ fn materialize(corpus: &Corpus, m: &MatchAtom, line: usize) -> Result<Vec<Row<No
         return Err(SourceError::PredicateUnsupported { line }).map_err(Into::into);
     }
     let language = m.lang.to_tree_sitter();
-    let query = tree_sitter::Query::new(&language, &m.query).context(SourceError::Query { line })?;
+    let query = tree_sitter::Query::new(&language, &m.query)
+        .map_err(|source| SourceError::Query { line, source })?;
     let names = query.capture_names();
     let mut rows = Vec::new();
     for (file_index, file) in corpus.files.iter().enumerate() {

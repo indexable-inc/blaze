@@ -166,6 +166,23 @@ impl<T: Pack, A: Allocator, const K: usize> Packed<T, A, K> {
         }
         Some(iter)
     }
+
+    /// A copy in another allocator: the bytes and the checkpoints, each in a block of exactly
+    /// its length in `alloc`. Packed values own no memory, so nothing else is copied.
+    pub fn try_clone_in<B: Allocator + Clone>(&self, alloc: B) -> Result<Packed<T, B, K>, AllocFailure> {
+        let bytes = self.bytes.try_clone_in(alloc.clone())?;
+        let index = self.index.try_clone_in(alloc)?;
+        Ok(Packed { bytes, index, len: self.len, _values: PhantomData })
+    }
+
+    /// [`Packed::try_clone_in`], panicking with the [`AllocFailure`].
+    #[track_caller]
+    pub fn clone_in<B: Allocator + Clone>(&self, alloc: B) -> Packed<T, B, K> {
+        match self.try_clone_in(alloc) {
+            Ok(copy) => copy,
+            Err(failure) => fail(failure),
+        }
+    }
 }
 
 impl<T: Pack + fmt::Debug, A: Allocator, const K: usize> fmt::Debug for Packed<T, A, K> {

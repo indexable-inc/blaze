@@ -1131,7 +1131,7 @@ impl Windows {
             if given < whole {
                 // The kernel kept a suffix: it is resident still, and its file is going, so the
                 // bytes are counted until the window comes back.
-                tracing::warn!(?id, given, whole, "the store's pool retired a file the kernel kept pages of");
+                blaze_trace::warn!(?id, given, whole, "the store's pool retired a file the kernel kept pages of");
             }
         }
         for page in pages {

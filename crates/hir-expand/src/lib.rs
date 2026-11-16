@@ -811,7 +811,7 @@ impl MacroCallId {
         self,
         db: &Db,
     ) -> ExpandResult<(Parse<view::Untyped>, ExpansionSpanMap)> {
-        let _p = tracing::info_span!(target: "blaze", "parse_macro_expansion").entered();
+        let _p = blaze_trace::info_span!(target: "blaze", "parse_macro_expansion").entered();
         blaze_mem::frame::task(blaze_mem::Tag::Expand, |frame| {
             let loc = self.loc(db);
             // A refused call's empty tree is no expression, pattern or type: parsed as one it
@@ -971,7 +971,7 @@ impl MacroCallId {
         frame: &'f Frame,
         loc: &MacroCallLoc,
     ) -> ExpandResult<(Expansion<'db, 'f>, MatchedArmIndex, mbe::MadeIdents)> {
-        let _p = tracing::info_span!(target: "blaze", "macro_expand").entered();
+        let _p = blaze_trace::info_span!(target: "blaze", "macro_expand").entered();
 
         let mut made = mbe::MadeIdents::new();
         let ExpandResult { value: (tt, matched_arm), err } = match loc.def.kind {
@@ -1818,7 +1818,7 @@ impl<'db> ExpansionInfo<'db> {
     }
 
     pub fn new(db: &'db Db, macro_file: MacroCallId) -> ExpansionInfo<'db> {
-        let _p = tracing::info_span!(target: "blaze", "ExpansionInfo::new").entered();
+        let _p = blaze_trace::info_span!(target: "blaze", "ExpansionInfo::new").entered();
         let loc = macro_file.loc(db);
 
         let arg = loc.kind.arg_view(db);

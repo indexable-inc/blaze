@@ -109,7 +109,7 @@ impl Server {
         // One byte ends the accept loop's poll; a failed write (the loop already gone, its
         // end closed) leaves nothing to wake.
         let _ = (&self.wake).write_all(&[1]);
-        let _wait = tracing::info_span!(target: "blaze::ix_prof", "join", wait = "thread", on = "ix-prof-http").entered();
+        let _wait = blaze_trace::info_span!(target: "blaze::ix_prof", "join", wait = "thread", on = "ix-prof-http").entered();
         let _ = thread.join();
     }
 }
@@ -146,7 +146,7 @@ fn accept_loop(listener: &TcpListener, woken: &std::os::unix::net::UnixStream, t
         };
         let waited = {
             let _wait = backoff_ms
-                .map(|ms| tracing::info_span!(target: "blaze::ix_prof", "accept_backoff", wait = "timer", on = "ix-prof-http", ms).entered());
+                .map(|ms| blaze_trace::info_span!(target: "blaze::ix_prof", "accept_backoff", wait = "timer", on = "ix-prof-http", ms).entered());
             wait::readable(
                 "the ix-prof endpoint's listener or its stop byte",
                 &mut fds[..nfds],

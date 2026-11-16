@@ -705,9 +705,9 @@ mod tests {
         crate::install();
         std::thread::spawn(|| {
             let _build = flight::building(77);
-            let _outer = tracing::info_span!(target: "blaze", "sql outer").entered();
+            let _outer = blaze_trace::info_span!(target: "blaze", "sql outer").entered();
             let _inner =
-                tracing::info_span!(target: "blaze", "sql inner", function = "app::main").entered();
+                blaze_trace::info_span!(target: "blaze", "sql inner", function = "app::main").entered();
             flight::plot(flight::Plot::Queued, 3);
             for (job, deepest) in [(1, 40 << 10), (2, 900 << 10)] {
                 flight::fiber_stack(flight::FiberStack {

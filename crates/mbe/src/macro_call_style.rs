@@ -10,7 +10,7 @@ pub enum MacroCallStyle {
     Derive,
 }
 
-bitflags::bitflags! {
+blaze_bitflags::bitflags! {
     /// A set of `MacroCallStyle` values, allowing macros to indicate that
     /// they support more than one style.
     #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

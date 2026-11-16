@@ -611,7 +611,7 @@ pub enum InlineAsmKind {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct AsmOptions(u16);
-bitflags::bitflags! {
+blaze_bitflags::bitflags! {
     impl AsmOptions: u16 {
         const PURE            = 1 << 0;
         const NOMEM           = 1 << 1;
@@ -669,7 +669,7 @@ impl AsmOptions {
 
 impl std::fmt::Debug for AsmOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        bitflags::parser::to_writer(self, f)
+        blaze_bitflags::parser::to_writer(self, f)
     }
 }
 

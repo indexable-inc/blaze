@@ -30,15 +30,15 @@ fn benchmarks() -> impl IntoBenchmarks {
         benchmark_fn("record/root", |b| {
             recording();
             b.iter(|| {
-                let _span = tracing::info_span!(target: "blaze", "record root").entered();
+                let _span = blaze_trace::info_span!(target: "blaze", "record root").entered();
             })
         }),
         benchmark_fn("record/nested", |b| {
             recording();
-            let outer = tracing::info_span!(target: "blaze", "record outer").entered();
+            let outer = blaze_trace::info_span!(target: "blaze", "record outer").entered();
             b.iter(move || {
                 let _held = &outer;
-                let _span = tracing::info_span!(target: "blaze", "record nested").entered();
+                let _span = blaze_trace::info_span!(target: "blaze", "record nested").entered();
             })
         }),
     ]

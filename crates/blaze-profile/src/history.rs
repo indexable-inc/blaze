@@ -482,7 +482,7 @@ fn said_capped(capped: &files::Capped, said_over: &mut bool) {
         (0, _) => *said_over = false,
         (over, false) => {
             *said_over = true;
-            tracing::warn!(
+            blaze_trace::warn!(
                 target: "blaze",
                 over,
                 keep = KEEP_BUILDS,
@@ -497,7 +497,7 @@ fn said_capped(capped: &files::Capped, said_over: &mut bool) {
         return;
     }
     let [first_build, last_build] = capped.builds.unwrap_or([0, 0]);
-    tracing::warn!(
+    blaze_trace::warn!(
         target: "blaze",
         files = capped.files,
         rows = capped.rows,
@@ -1079,7 +1079,7 @@ impl History {
         // A record refused (another layout, another blaze) is set aside and said; it never
         // stops the history opening.
         for refused in &opened.crashes.refused {
-            tracing::warn!(target: "blaze", "{refused}");
+            blaze_trace::warn!(target: "blaze", "{refused}");
         }
         let mut said_over = false;
         said_capped(&opened.capped, &mut said_over);
@@ -1540,7 +1540,7 @@ impl History {
     pub fn flush(&mut self, build: Option<u64>) -> Result<Flushed, HistoryError> {
         // The record cost of the history itself: encoding and writing a flush's Parquet had no
         // span, so a slow flush read as uncovered time on the history's thread.
-        let _span = tracing::info_span!(target: "blaze", "profile flush").entered();
+        let _span = blaze_trace::info_span!(target: "blaze", "profile flush").entered();
         let (late, behind) = self.drained.take(&mut self.read, &mut self.cursor);
         // DEBUG events are held for their build's end, written if it was in trouble.
         self.hold.sort(&mut self.read);
@@ -1553,7 +1553,7 @@ impl History {
         let (lost, skipped) =
             (now.0.saturating_sub(self.told.0), now.1.saturating_sub(self.told.1));
         if lost != 0 || skipped != 0 {
-            tracing::warn!(
+            blaze_trace::warn!(
                 target: "blaze",
                 spans_lost = lost,
                 rows_skipped = skipped,
@@ -1801,7 +1801,7 @@ impl History {
             }
             // Never silent (rule 3): in the build's problems, and told to the daemon
             // (`History::take_failed`).
-            tracing::warn!(target: "blaze", "{error}");
+            blaze_trace::warn!(target: "blaze", "{error}");
         }
         self.deferred.append(&mut unwritten);
         let mut folded = vec![
@@ -2077,7 +2077,7 @@ impl History {
         flight::flush_committed(seq, self.read.at_ns);
         // One that can't be deleted is consumed already: the next open deletes it unread.
         for error in &undeleted {
-            tracing::warn!(target: "blaze", "{error}");
+            blaze_trace::warn!(target: "blaze", "{error}");
         }
         flushed.files = files;
         flushed.bytes = bytes;
@@ -2181,7 +2181,7 @@ impl Drop for History {
         if let Some((stop, drainer)) = self.drainer.take() {
             drop(stop);
             if drainer.join().is_err() {
-                tracing::error!(target: "blaze", "the profile history's drain thread (`blaze-drain`) of {} panicked", self.core.dir().display());
+                blaze_trace::error!(target: "blaze", "the profile history's drain thread (`blaze-drain`) of {} panicked", self.core.dir().display());
             }
         }
         // Every row written by the last flush: no postmortem is owed. One that failed leaves
@@ -2191,7 +2191,7 @@ impl Drop for History {
         }
         // What failed after a commit and no one took is said, never dropped unseen.
         for error in self.deferred.drain(..) {
-            tracing::error!(target: "blaze", "{error}");
+            blaze_trace::error!(target: "blaze", "{error}");
         }
     }
 }
@@ -2261,7 +2261,7 @@ fn drain(drained: &Drained, stop: &Receiver<()>, full: &Sender<()>) {
             Ok(()) | Err(RecvTimeoutError::Disconnected) => return,
         }
         due = Instant::now() + DRAIN;
-        let _span = tracing::info_span!(target: "blaze", "profile drain").entered();
+        let _span = blaze_trace::info_span!(target: "blaze", "profile drain").entered();
         let mut at = drained.0.lock();
         if at.read.rows() >= BACKLOG_ROWS {
             at.stopped = true;
@@ -2299,7 +2299,7 @@ fn in_row_batches<T>(
     let split = supervise::split(rows, BATCH_ROWS, make)?;
     if split.splits > 0 || split.dropped > 0 {
         let why = split.why.unwrap_or_default();
-        tracing::warn!(
+        blaze_trace::warn!(
             target: "blaze",
             table = table.name,
             rows = rows.len(),
@@ -3016,7 +3016,7 @@ mod tests {
         crate::install();
         std::thread::spawn(|| {
             let _build = flight::building(41);
-            let _span = tracing::info_span!(target: "blaze", "history flushed").entered();
+            let _span = blaze_trace::info_span!(target: "blaze", "history flushed").entered();
         })
         .join()
         .unwrap();
@@ -3071,7 +3071,7 @@ mod tests {
             let _build = flight::building(43);
             for _ in 0..bursts {
                 for _ in 0..burst {
-                    let _span = tracing::info_span!(target: "blaze", "history drained").entered();
+                    let _span = blaze_trace::info_span!(target: "blaze", "history drained").entered();
                 }
                 std::thread::sleep(3 * DRAIN);
             }
@@ -3155,7 +3155,7 @@ mod tests {
         let mut first = History::open(&dir, CAP_MOST, sampler::unsampled()).unwrap();
         std::thread::spawn(|| {
             let _build = flight::building(KILLED);
-            let _span = tracing::info_span!(target: "blaze", "history killed mid-build").entered();
+            let _span = blaze_trace::info_span!(target: "blaze", "history killed mid-build").entered();
         })
         .join()
         .unwrap();
