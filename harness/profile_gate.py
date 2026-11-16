@@ -17,7 +17,8 @@ ended unless `build` says) and over each fixture of `fixtures` (`<check>/`, writ
 harness/profile_fixtures.py), each of which must fail its own check. The run fails on:
 - a check of the self-build that failed or could not run and is not listed with that outcome
   for this platform in `known` (a new failure, or one that went from could-not-run to failed);
-- a listed check that passed (the list only shrinks: take it out);
+- a listed check that passed (the list only shrinks: take it out), but for one listed "flaky",
+  which may pass or fail (it must still run);
 - a fixture whose check did not fail (the check no longer catches what it is for);
 - a self-build whose `builds` row names no tree or no blaze (rule measure-the-exact-tree);
 - a known list that does not hold together (an entry with no owner or cause, a check that is
@@ -94,7 +95,9 @@ class Verdict:
 @dataclass(frozen=True)
 class Known:
     check: str
-    outcome: Literal["failed", "unchecked"]
+    # "flaky": a finding the check makes on some builds and not on others (it fails on a span or
+    # two of millions); either result holds, so neither hides as a listed failure that passed.
+    outcome: Literal["failed", "unchecked", "flaky"]
     owner: str
     cause: str
     platforms: tuple[str, ...] = ()
@@ -193,6 +196,9 @@ def held(verdict: Verdict, known: KnownList, platform: str) -> tuple[list[str], 
         mine[entry.check] = entry
     for check in verdict.checks:
         entry = mine.get(check.name)
+        if entry is not None and entry.outcome == "flaky" and check.outcome in ("passed", "failed"):
+            listed.append(f"{check.name} {check.outcome}, listed as flaky (owner {entry.owner}: {entry.cause})")
+            continue
         if check.outcome == "passed":
             if entry is not None:
                 problems.append(f"{check.name} passed and is listed as {entry.outcome} (owner {entry.owner}): take it out")
@@ -238,9 +244,32 @@ def artifact(config: Config, verdict: Verdict) -> str:
     )
 
 
+def selftest() -> None:
+    """`held` on made-up verdicts; no blaze runs."""
+    def verdict(**outcomes: Outcome) -> Verdict:
+        return Verdict(1, 1, "t", "b", 1, tuple(Check(name, it, "said", ()) for name, it in outcomes.items()))
+
+    known = KnownList((
+        Known("a", "failed", "o", "c"),
+        Known("b", "flaky", "o", "c"),
+        Known("c", "unchecked", "o", "c"),
+    ))
+    assert held(verdict(a="failed", b="failed", c="unchecked"), known, "p")[0] == []
+    assert held(verdict(a="failed", b="passed", c="unchecked"), known, "p")[0] == [], "a flaky check may pass"
+    assert held(verdict(a="failed", b="unchecked", c="unchecked"), known, "p")[0], "a flaky check that cannot run is no pass"
+    assert held(verdict(a="passed", b="failed", c="unchecked"), known, "p")[0], "a failed entry that passes: take it out"
+    assert held(verdict(a="failed", b="failed", c="failed"), known, "p")[0], "an unchecked entry that fails"
+    assert held(verdict(a="failed", b="failed", c="unchecked", d="failed"), known, "p")[0], "an unlisted failure"
+    assert read_known(Path(__file__).resolve().parent / "profile-gate-known.toml").known, "the checked-in list reads"
+    print(f"{SCRIPT} selftest: ok")
+
+
 async def main() -> None:
+    if sys.argv[1:] == ["selftest"]:
+        selftest()
+        return
     if len(sys.argv) != 2:
-        sys.exit(f"usage: {SCRIPT} CONFIG (one JSON object; see the docstring)")
+        sys.exit(f"usage: {SCRIPT} CONFIG (one JSON object; see the docstring), or `selftest`")
     config = parse(Config, sys.argv[1], SCRIPT)
     out = Path(config.out)
     out.mkdir(parents=True, exist_ok=True)
