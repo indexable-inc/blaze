@@ -1,9 +1,10 @@
 //! blaze's one lock home (rule `standard-structures`, docs/v2/plan/design/named-locks.md): a
 //! mutex [`Lock`], a reader-writer lock [`ReadLock`] and a condition [`Signal`], each named at
-//! construction (`Lock::new("store.packs", ..)`) and built on `parking_lot`. Every other lock
-//! in the tree is banned in `.clippy.toml`.
+//! construction (`Lock::new("store.packs", ..)`) and built on blaze's own word locks
+//! ([`raw`]: a futex word on Linux, the wait on an address on macOS). Every other lock in the
+//! tree is banned in `.clippy.toml`.
 //!
-//! The fast path is `parking_lot`'s: an uncontended acquire is its one compare-and-swap, and a
+//! The fast path is [`raw`]'s: an uncontended acquire is its one compare-and-swap, and a
 //! release adds one relaxed load of a counter on the same cache line. Nothing reads a clock,
 //! a thread-local or the profiler until an acquire has to wait. Then, on the slow path only:
 //!
@@ -28,11 +29,6 @@
 //! that never block, so a deterministic simulation drives the same recording code a real
 //! wait runs.
 
-#![expect(
-    clippy::disallowed_types,
-    reason = "the one lock home: it wraps parking_lot's locks, which are banned everywhere else"
-)]
-
 use std::{
     any::type_name,
     fmt,
@@ -44,6 +40,7 @@ use std::{
 };
 
 pub mod graph;
+pub(crate) mod raw;
 pub mod stall;
 #[cfg(test)]
 mod tests;
@@ -187,7 +184,7 @@ struct Contention {
     /// When the first of the current waiters began, on the probe's clock.
     since_ns: AtomicU64,
     /// The last holder that let go while someone waited, for the next waiter to take.
-    held: parking_lot::Mutex<Option<Held>>,
+    held: raw::Mutex<Option<Held>>,
 }
 
 impl Contention {
@@ -195,12 +192,12 @@ impl Contention {
         Contention {
             probe,
             since_ns: AtomicU64::new(0),
-            held: parking_lot::Mutex::new(None),
+            held: raw::Mutex::new(None),
         }
     }
 }
 
-/// What every lock carries besides the `parking_lot` lock: its name, how many wait for it now,
+/// What every lock carries besides its [`raw`] lock: its name, how many wait for it now,
 /// and its contention slot.
 struct Meta {
     name: &'static str,
@@ -404,10 +401,10 @@ impl Drop for Waiting<'_> {
 
 // --- Lock -------------------------------------------------------------------------------------
 
-/// A named mutex: `parking_lot::Mutex` whose waits the profile sees.
+/// A named mutex: a [`raw::Mutex`] whose waits the profile sees.
 pub struct Lock<T: ?Sized> {
     meta: Meta,
-    raw: parking_lot::Mutex<T>,
+    raw: raw::Mutex<T>,
 }
 
 /// The guard of a [`Lock`].
@@ -417,21 +414,21 @@ pub struct LockGuard<'a, T: ?Sized> {
     site: &'static Location<'static>,
     /// When it was taken, on the probe's clock; 0 when it was taken without waiting.
     acquired_ns: u64,
-    inner: parking_lot::MutexGuard<'a, T>,
+    inner: raw::MutexGuard<'a, T>,
 }
 
 impl<T> Lock<T> {
     /// A lock named `name` (what the profile and `blaze debug locks` call it: say what it
     /// guards, `"store.packs"`, `"sched.ready"`) holding `value`.
     pub const fn new(name: &'static str, value: T) -> Lock<T> {
-        let raw = parking_lot::Mutex::new(value);
+        let raw = raw::Mutex::new(value);
         Lock { meta: Meta::new(name, false), raw }
     }
 
     /// A lock on the recording path itself (the profiler's), which never records its waits:
     /// recording them would take it again.
     pub const fn unrecorded(name: &'static str, value: T) -> Lock<T> {
-        let raw = parking_lot::Mutex::new(value);
+        let raw = raw::Mutex::new(value);
         Lock { meta: Meta::new(name, true), raw }
     }
 
@@ -594,12 +591,12 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for Lock<T> {
 
 // --- ReadLock ---------------------------------------------------------------------------------
 
-/// A named reader-writer lock: `parking_lot::RwLock` whose waits the profile sees. Reach for it
+/// A named reader-writer lock: a [`raw::RwLock`] whose waits the profile sees. Reach for it
 /// only where reads hold the lock long; a value read often and written rarely is an arc-swap
 /// or RCU, never a `ReadLock` (`blaze debug locks` says which).
 pub struct ReadLock<T: ?Sized> {
     meta: Meta,
-    raw: parking_lot::RwLock<T>,
+    raw: raw::RwLock<T>,
 }
 
 /// A shared read of a [`ReadLock`].
@@ -608,7 +605,7 @@ pub struct ReadGuard<'a, T: ?Sized> {
     meta: &'a Meta,
     site: &'static Location<'static>,
     acquired_ns: u64,
-    inner: parking_lot::RwLockReadGuard<'a, T>,
+    inner: raw::RwLockReadGuard<'a, T>,
 }
 
 /// The exclusive write of a [`ReadLock`].
@@ -617,19 +614,19 @@ pub struct WriteGuard<'a, T: ?Sized> {
     meta: &'a Meta,
     site: &'static Location<'static>,
     acquired_ns: u64,
-    inner: parking_lot::RwLockWriteGuard<'a, T>,
+    inner: raw::RwLockWriteGuard<'a, T>,
 }
 
 impl<T> ReadLock<T> {
     /// A lock named `name` holding `value`; see [`Lock::new`].
     pub const fn new(name: &'static str, value: T) -> ReadLock<T> {
-        let raw = parking_lot::RwLock::new(value);
+        let raw = raw::RwLock::new(value);
         ReadLock { meta: Meta::new(name, false), raw }
     }
 
     /// A lock on the recording path itself; see [`Lock::unrecorded`].
     pub const fn unrecorded(name: &'static str, value: T) -> ReadLock<T> {
-        let raw = parking_lot::RwLock::new(value);
+        let raw = raw::RwLock::new(value);
         ReadLock { meta: Meta::new(name, true), raw }
     }
 
@@ -767,17 +764,18 @@ impl<T: ?Sized + fmt::Debug> fmt::Debug for ReadLock<T> {
 
 // --- Signal -----------------------------------------------------------------------------------
 
-/// A named condition on a [`Lock`]: `parking_lot::Condvar`, each wait inside a span naming it.
-/// Only a driver thread or the pool's idle park waits on one (`deadline-waits`): a fiber parks
-/// on the scheduler instead.
+/// A named condition on a [`Lock`]: a [`raw::Cond`], each wait inside a span naming it. Only
+/// a driver thread or the pool's idle park waits on one (`deadline-waits`): a fiber parks on
+/// the scheduler instead. A wait may end with no notify, as any condition's: wait in a loop on
+/// what it is for ([`Signal::wait_while`]).
 pub struct Signal {
     name: &'static str,
-    raw: parking_lot::Condvar,
+    raw: raw::Cond,
 }
 
 impl Signal {
     pub const fn new(name: &'static str) -> Signal {
-        let raw = parking_lot::Condvar::new();
+        let raw = raw::Cond::new();
         Signal { name, raw }
     }
 
@@ -814,30 +812,35 @@ impl Signal {
 
     /// Waits for a notify, letting `guard`'s lock go meanwhile.
     pub fn wait<T: ?Sized>(&self, guard: &mut LockGuard<'_, T>) {
-        self.span(None, || self.raw.wait(&mut guard.inner));
+        self.span(None, || _ = self.raw.wait(&mut guard.inner, None));
     }
 
     /// Waits while `condition` holds.
     pub fn wait_while<T: ?Sized>(
         &self,
         guard: &mut LockGuard<'_, T>,
-        condition: impl FnMut(&mut T) -> bool,
+        mut condition: impl FnMut(&mut T) -> bool,
     ) {
-        self.span(None, || self.raw.wait_while(&mut guard.inner, condition));
+        self.span(None, || {
+            while condition(&mut guard.inner) {
+                self.raw.wait(&mut guard.inner, None);
+            }
+        });
     }
 
     /// Waits for a notify by `deadline`: whether the deadline passed first.
     pub fn wait_until<T: ?Sized>(&self, guard: &mut LockGuard<'_, T>, deadline: Instant) -> bool {
         let left = deadline.saturating_duration_since(Instant::now());
-        self.span(Some(left), || self.raw.wait_until(&mut guard.inner, deadline).timed_out())
+        self.span(Some(left), || self.raw.wait(&mut guard.inner, Some(left)))
     }
 
     /// Waits for a notify for at most `most`: whether it passed first.
     pub fn wait_for<T: ?Sized>(&self, guard: &mut LockGuard<'_, T>, most: Duration) -> bool {
-        self.span(Some(most), || self.raw.wait_for(&mut guard.inner, most).timed_out())
+        self.span(Some(most), || self.raw.wait(&mut guard.inner, Some(most)))
     }
 
-    /// Waits while `condition` holds, by `deadline`: whether the deadline passed first.
+    /// Waits while `condition` holds, by `deadline`: whether the deadline passed first (with
+    /// `condition` still holding).
     pub fn wait_while_until<T: ?Sized>(
         &self,
         guard: &mut LockGuard<'_, T>,
@@ -845,29 +848,44 @@ impl Signal {
         deadline: Instant,
     ) -> bool {
         let left = deadline.saturating_duration_since(Instant::now());
-        self.span(Some(left), || {
-            self.raw.wait_while_until(&mut guard.inner, condition, deadline).timed_out()
-        })
+        self.span(Some(left), || Self::wait_while_within(&self.raw, guard, condition, deadline))
     }
 
-    /// Waits while `condition` holds, for at most `most`: whether it passed first.
+    /// Waits while `condition` holds, for at most `most`: whether it passed first (with
+    /// `condition` still holding).
     pub fn wait_while_for<T: ?Sized>(
         &self,
         guard: &mut LockGuard<'_, T>,
         condition: impl FnMut(&mut T) -> bool,
         most: Duration,
     ) -> bool {
-        self.span(Some(most), || {
-            self.raw.wait_while_for(&mut guard.inner, condition, most).timed_out()
-        })
+        let deadline = Instant::now() + most;
+        self.span(Some(most), || Self::wait_while_within(&self.raw, guard, condition, deadline))
     }
 
-    pub fn notify_one(&self) -> bool {
-        self.raw.notify_one()
+    /// The loop of the two waits above: each wait is given what is left of `deadline` now.
+    fn wait_while_within<T: ?Sized>(
+        raw: &raw::Cond,
+        guard: &mut LockGuard<'_, T>,
+        mut condition: impl FnMut(&mut T) -> bool,
+        deadline: Instant,
+    ) -> bool {
+        while condition(&mut guard.inner) {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return true;
+            }
+            raw.wait(&mut guard.inner, Some(left));
+        }
+        false
     }
 
-    pub fn notify_all(&self) -> usize {
-        self.raw.notify_all()
+    pub fn notify_one(&self) {
+        self.raw.notify(false);
+    }
+
+    pub fn notify_all(&self) {
+        self.raw.notify(true);
     }
 }
 

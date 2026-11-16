@@ -19,7 +19,7 @@ blaze-phf.workspace = true
 rustc_lexer.workspace = true
 rustc-literal-escaper.workspace = true
 stdx.workspace = true
-tracing.workspace = true
+blaze-trace.workspace = true
 
 edition.workspace = true
 winnow.workspace = true

@@ -1312,7 +1312,6 @@ pub(in crate::expr_store) mod tests {
     use blaze_hash::HashMap;
     use blaze_ids::rng::SplitMix64;
     use blaze_memo::Id;
-    use smallvec::SmallVec;
     use std::alloc::Global;
     use syntax::{SyntaxKind, TextSize};
 
@@ -1636,7 +1635,7 @@ pub(in crate::expr_store) mod tests {
     #[test]
     fn every_accessor_answers_as_its_pushes_do() {
         let mut builder = ExpressionStoreBuilder::new();
-        builder.inference_roots = Some(SmallVec::new());
+        builder.inference_roots = Some(Vec::new());
         let exprs: Vec<ExprId> = (0..6).map(|_| builder.alloc_expr(Expr::Missing)).collect();
         let pats: Vec<PatId> = (0..4).map(|_| builder.alloc_pat(Pat::Wild)).collect();
         let labels: Vec<LabelId> =

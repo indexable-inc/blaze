@@ -19,6 +19,8 @@ doctest = false
 # It reads `Cargo.lock` and the manifests itself (`toml`, `glob` for `members`): a build script
 # runs no cargo, whose `$CARGO` is blaze under blaze.
 [dependencies]
+blaze-data.workspace = true
+blaze-toml.workspace = true
 blake3.workspace = true
 glob.workspace = true
 toml.workspace = true

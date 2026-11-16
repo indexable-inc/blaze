@@ -39,8 +39,8 @@ use hir_expand::{
 use intern::Symbol;
 use stdx::iter::IterExt;
 use la_arena::ArenaMap;
+use blaze_own::FixedVec;
 use rustc_abi::ReprOptions;
-use smallvec::SmallVec;
 use span::AstIdNode;
 use std::alloc::Global;
 use syntax::{
@@ -1958,8 +1958,9 @@ fn is_blaze_pure(path: Option<ast::Path<'_>>) -> bool {
 
 /// What the arguments of `#[blaze::pure(..)]` say: nothing, or exactly `trusted = "why"`.
 fn pure_args(tt: ast::TokenTree<'_>) -> PureAttr {
-    // Without the delimiters, whitespace and comments.
-    let tokens: SmallVec<[NodeOrToken<_, _>; 4]> = TokenTreeChildren::new(tt).take(4).collect(); // alloc: inline, the few tokens of one attribute
+    // Without the delimiters, whitespace and comments: the first four, inline.
+    let mut tokens = FixedVec::<NodeOrToken<_, _>, 4>::new();
+    tokens.try_extend(TokenTreeChildren::new(tt).take(4)).expect("four taken, four slots");
     match tokens.as_slice() {
         [] => PureAttr::Checked,
         [NodeOrToken::Token(key), NodeOrToken::Token(eq), NodeOrToken::Token(value)]
@@ -1992,8 +1993,9 @@ pub enum DifferentiableAttr {
 /// What the arguments of `#[blaze::differentiable(..)]` say: nothing, `symbolic`, or
 /// `symbolic, fast_math`.
 fn differentiable_args(tt: ast::TokenTree<'_>) -> DifferentiableAttr {
-    // Without the delimiters, whitespace and comments.
-    let tokens: SmallVec<[NodeOrToken<_, _>; 4]> = TokenTreeChildren::new(tt).take(4).collect(); // alloc: inline, the few tokens of one attribute
+    // Without the delimiters, whitespace and comments: the first four, inline.
+    let mut tokens = FixedVec::<NodeOrToken<_, _>, 4>::new();
+    tokens.try_extend(TokenTreeChildren::new(tt).take(4)).expect("four taken, four slots");
     match tokens.as_slice() {
         [] => DifferentiableAttr::Auto,
         [NodeOrToken::Token(mode)]
@@ -2236,8 +2238,9 @@ fn is_blaze_bits(path: Option<ast::Path<'_>>) -> bool {
 /// What the arguments of `#[blaze::bits(..)]` say: nothing, or exactly one unsigned integer
 /// type of 8 to 128 bits.
 fn bits_args(tt: ast::TokenTree<'_>) -> BitsBacking {
-    // Without the delimiters, whitespace and comments.
-    let tokens: SmallVec<[NodeOrToken<_, _>; 2]> = TokenTreeChildren::new(tt).take(2).collect(); // alloc: inline, the few tokens of one attribute
+    // Without the delimiters, whitespace and comments: the first two, inline.
+    let mut tokens = FixedVec::<NodeOrToken<_, _>, 2>::new();
+    tokens.try_extend(TokenTreeChildren::new(tt).take(2)).expect("two taken, two slots");
     let integer = match tokens.as_slice() {
         [] => return BitsBacking::Smallest,
         [NodeOrToken::Token(ty)] if ty.kind() == SyntaxKind::IDENT => match ty.text() {
@@ -3717,7 +3720,7 @@ fn block_disabled_sanitizers(db: &Db, block: BlockId) -> u8 {
         ),
     };
     let mut cfg_options = None;
-    let mut sets = SmallVec::<[SanitizeSets; 4]>::new();
+    let mut sets = Vec::<SanitizeSets>::new();
     'walk: loop {
         while let Some(it) = node {
             let kind = it.kind();
@@ -3936,13 +3939,13 @@ enum DocAtom<'t> {
     /// For example, `#[doc(alias = "x")]` and `#[doc(alias = "y")]`.
     KeyValue { key: &'t str, value: Cow<'t, str> },
     /// eg. `#[doc(alias("x", "y"))]`
-    Alias(SmallVec<[Cow<'t, str>; 2]>),
+    Alias(Vec<Cow<'t, str>>),
 }
 
 impl<'t> DocAtom<'t> {
-    fn parse(tt: ast::TokenTree<'t>) -> SmallVec<[DocAtom<'t>; 1]> {
+    fn parse(tt: ast::TokenTree<'t>) -> Vec<DocAtom<'t>> {
         let mut iter = TokenTreeChildren::new(tt).peekable();
-        let mut result = SmallVec::new();
+        let mut result = Vec::new();
         while iter.peek().is_some() {
             if let Some(expr) = next_doc_expr(&mut iter) {
                 result.push(expr);

@@ -29,7 +29,7 @@ blaze-vfs.workspace = true
 # `SegQueue`: the finished tasks, pushed by workers and taken by the request's thread.
 crossbeam-queue.workspace = true
 # The spans every wait opens.
-tracing.workspace = true
+blaze-trace.workspace = true
 
 [dev-dependencies]
 # The real store the end-to-end tests run on.

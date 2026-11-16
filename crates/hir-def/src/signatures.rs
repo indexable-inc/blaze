@@ -13,7 +13,6 @@ use hir_expand::{
 use intern::{Symbol, sym};
 use la_arena::{Arena, Idx};
 use rustc_abi::{ExternAbi, IntegerType, ReprOptions};
-use smallvec::SmallVec;
 use span::{AstIdMap, AstIdNode, ROOT_ERASED_FILE_AST_ID, RealSpanMap};
 use syntax::{
     FlatTree, SyntaxKind, SyntaxNodePtr, T, TextRange, TextSize,

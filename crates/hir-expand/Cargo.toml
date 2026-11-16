@@ -15,7 +15,7 @@ doctest = false
 [dependencies]
 blaze-hash.workspace = true
 cov-mark.workspace = true
-tracing.workspace = true
+blaze-trace.workspace = true
 blaze-memo.workspace = true
 
 # local deps

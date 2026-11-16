@@ -29,7 +29,9 @@ struct Line<'a> {
     yanked: bool,
 }
 
-/// `line` read as an index entry, its strings borrowed from the value.
+/// `line` read as an index entry, its strings borrowed from the value. Its other keys (`deps`,
+/// `cksum`, `features`, `v`, ...) are let be on purpose: the line is the registry's format,
+/// which gains keys a reader must tolerate, so this reads the three it needs and no others.
 fn line_of(value: &blaze_data::Value<std::alloc::Global>) -> Result<Line<'_>, blaze_data::ShapeError<std::alloc::Global>> {
     let c = blaze_data::Cursor::root(value, std::alloc::Global);
     Ok(Line {

@@ -5,7 +5,7 @@
 //! grapheme clusters (the formatter's string breaks) and canonical decomposition, NFD (case- and
 //! normalization-insensitive path names in blaze-fetch).
 //!
-//! The tables are generated data ([`tables`]): sorted lists of disjoint inclusive code point
+//! The tables are generated data (`src/tables.rs`): sorted lists of disjoint inclusive code point
 //! ranges, read by binary search after an ASCII fast path. The generator is
 //! `scripts/src/bin/unicode_tables.rs`, run over the Unicode Character Database of
 //! [`UNICODE_VERSION`]; nothing here is edited by hand.
@@ -19,7 +19,6 @@ extern crate alloc;
 
 mod grapheme;
 mod nfd;
-#[rustfmt::skip]
 mod tables;
 mod width;
 

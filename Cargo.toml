@@ -445,7 +445,6 @@ la-arena = { version = "0.3.1" }
 # `blaze_usercode::roots`' one-pass scan of a run's written files for every spelling of its roots.
 aho-corasick = "1.1.5"
 anyhow = "1.0.104"
-arrayvec = "0.7.8"
 bitflags = "2.13.2"
 # Official BLAKE3: the reference blaze-blake3 (`blaze_ids::b3`) is tested and benched against,
 # and what the crates not yet moved to blaze-blake3 call. `neon`: aarch64 picks NEON at compile
@@ -520,11 +519,6 @@ serde_json = "1.0.154"
 # blaze-ci's webhook payload decode, validating at SIMD speed (docs/v2/plan.md).
 sonic-rs = { version = "0.5", default-features = false }
 rustc-literal-escaper = "0.0.8"
-smallvec = { version = "1.16.4", features = [
-    "const_new",
-    "union",
-    "const_generics",
-] }
 toml = "1.1.8"
 # Debug and trace callsites compile out of release builds: blaze's one subscriber there, the trace
 # recorder (crates/blaze-cargo/src/trace.rs), takes INFO and above.
@@ -560,7 +554,6 @@ windows-sys = { version = "0.61.2", features = [
     "Win32_System_SystemServices",
     "Win32_System_Threading",
 ] }
-thin-vec = "0.2.21"
 hashbrown = { version = "0.17.1", features = [
     "inline-more",
     "nightly",

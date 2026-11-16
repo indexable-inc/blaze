@@ -32,7 +32,7 @@ lz4_flex.workspace = true
 # `store.json`, read as JSON into its typed value.
 blaze-data.workspace = true
 blaze-json.workspace = true
-tracing.workspace = true
+blaze-trace.workspace = true
 zstd.workspace = true
 
 [features]

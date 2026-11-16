@@ -452,23 +452,9 @@ pub trait Span: Fields {
     fn site() -> Option<u16>;
 }
 
-/// The callsite of a kind: what its `tracing` metadata names, so a kind's site is one of the
-/// recorder's as any span's is ([`flight::register`]). No subscriber ever sees it.
-pub struct KindCallsite(pub &'static blaze_trace::Metadata<'static>);
-
-impl blaze_trace::callsite::Callsite for KindCallsite {
-    fn set_interest(&self, _: blaze_trace::subscriber::Interest) {}
-
-    fn metadata(&self) -> &blaze_trace::Metadata<'_> {
-        self.0
-    }
-}
-
-/// The metadata of the kind `name`: target `blaze`, info, no fields.
-pub const fn kind_meta(
-    name: &'static str,
-    callsite: &'static KindCallsite,
-) -> blaze_trace::Metadata<'static> {
+/// The site of the kind `name`: target `blaze`, info, no fields, so a kind's site is one of
+/// the recorder's as any span's is ([`flight::register`]). No sink ever sees it.
+pub const fn kind_meta(name: &'static str) -> blaze_trace::Metadata<'static> {
     blaze_trace::Metadata::new(
         name,
         "blaze",
@@ -476,8 +462,8 @@ pub const fn kind_meta(
         Some(file!()),
         Some(line!()),
         Some(module_path!()),
-        blaze_trace::field::FieldSet::new(&[], blaze_trace::callsite::Identifier(callsite)),
-        blaze_trace::metadata::Kind::SPAN,
+        blaze_trace::field::FieldSet::new(&[]),
+        blaze_trace::Kind::SPAN,
     )
 }
 
@@ -900,8 +886,7 @@ macro_rules! span_kinds {
 
     (@site $kname:literal) => {
         fn site() -> Option<u16> {
-            static CALLSITE: KindCallsite = KindCallsite(&META);
-            static META: blaze_trace::Metadata<'static> = kind_meta($kname, &CALLSITE);
+            static META: blaze_trace::Metadata<'static> = kind_meta($kname);
             static SITE: SiteOnce = SiteOnce::new();
             SITE.get(&META)
         }

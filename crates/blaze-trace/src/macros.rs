@@ -60,12 +60,13 @@ macro_rules! __span {
             $crate::field::FieldSet::new(&[$($n),*]),
             $crate::Kind::SPAN,
         );
-        match $crate::Level::compiled($level) {
-            false => $crate::Span::none(),
-            true => match $crate::enabled(&META) {
-                ::core::option::Option::Some(sink) => $crate::Span::new(sink, &META, $parent, &[$($v),*]),
-                ::core::option::Option::None => $crate::Span::none(),
-            },
+        if $crate::Level::compiled($level)
+            && $crate::wanted($level)
+            && let ::core::option::Option::Some(sink) = $crate::enabled(&META)
+        {
+            $crate::Span::new(sink, &META, $parent, &[$($v),*])
+        } else {
+            $crate::Span::none()
         }
     }};
     (@site $site:tt $ns:tt $vs:tt [$($message:tt)+]) => {
@@ -88,6 +89,7 @@ macro_rules! __event {
             $crate::Kind::EVENT,
         );
         if $crate::Level::compiled($level)
+            && $crate::wanted($level)
             && let ::core::option::Option::Some(sink) = $crate::enabled(&META)
         {
             $crate::Event::dispatch(sink, &META, $parent, &[$($v),*]);
@@ -105,6 +107,7 @@ macro_rules! __event {
             $crate::Kind::EVENT,
         );
         if $crate::Level::compiled($level)
+            && $crate::wanted($level)
             && let ::core::option::Option::Some(sink) = $crate::enabled(&META)
         {
             $crate::Event::dispatch(

@@ -4,7 +4,6 @@ use stdx::Either;
 use hir_expand::name::Name;
 use intern::Symbol;
 use rustc_parse_format as parse;
-use smallvec::{SmallVec, smallvec};
 use span::SyntaxContext;
 use syntax::{
     AstPtr, TextRange, ast,
@@ -198,7 +197,7 @@ pub(crate) fn parse(
     let mut parser =
         parse::Parser::new(&text, str_style, fmt_snippet, false, parse::ParseMode::Format);
 
-    let mut pieces = SmallVec::<[parse::Piece<'_>; 8]>::new();
+    let mut pieces = Vec::<parse::Piece<'_>>::new();
     while let Some(piece) = parser.next() {
         if !parser.errors.is_empty() {
             break;
@@ -223,8 +222,8 @@ pub(crate) fn parse(
         })
     };
 
-    // alloc: inline for up to 16 explicit arguments
-    let mut used: SmallVec<[bool; 16]> = smallvec![false; args.explicit_args().len()];
+    // alloc: a flag per explicit argument
+    let mut used: Vec<bool> = vec![false; args.explicit_args().len()];
     // alloc: pushed to only for a template with errors
     let mut invalid_refs = Vec::new();
     // alloc: pushed to only for a named argument used by position, which rustc lints

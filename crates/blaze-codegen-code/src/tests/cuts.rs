@@ -5,11 +5,14 @@
 //! modules too), as the hooks test does.
 
 use std::{
+    alloc::Global,
     collections::{BTreeMap, BTreeSet},
     path::Path,
 };
 
-use super::hooks::{Token, compiled, outside_tests, roots, tokens};
+use blaze_data::{Map, Value};
+
+use super::hooks::{Token, compiled, outside_tests, roots, tokens, toml_table};
 use crate::{IDENTITIES, Identity};
 
 /// Files of blaze-cargo that make a record: no cut may be named in them, whatever the reason.
@@ -23,35 +26,35 @@ fn crate_name(package: &str) -> String {
 
 /// The dependency of `manifest` (and its workspace's, for `workspace = true`) renamed from a cut
 /// package: a rename hides every use from the scan below.
-fn renamed(manifest: &toml::Table, workspace: &toml::Table, cut: &BTreeSet<&str>) -> Vec<String> {
+fn renamed(manifest: &Map<Global>, workspace: &Map<Global>, cut: &BTreeSet<&str>) -> Vec<String> {
     let inherited = workspace
         .get("workspace")
         .and_then(|it| it.get("dependencies"))
-        .and_then(toml::Value::as_table);
-    let mut tables: Vec<&toml::Table> = Vec::new();
+        .and_then(Value::as_map);
+    let mut tables: Vec<&Map<Global>> = Vec::new();
     for key in ["dependencies", "build-dependencies"] {
-        tables.extend(manifest.get(key).and_then(toml::Value::as_table));
+        tables.extend(manifest.get(key).and_then(Value::as_map));
     }
     for target in manifest
         .get("target")
-        .and_then(toml::Value::as_table)
+        .and_then(Value::as_map)
         .into_iter()
-        .flat_map(|it| it.values())
+        .flat_map(|it| it.iter().map(|(_, value)| value))
     {
         for key in ["dependencies", "build-dependencies"] {
-            tables.extend(target.get(key).and_then(toml::Value::as_table));
+            tables.extend(target.get(key).and_then(Value::as_map));
         }
     }
     let mut out = Vec::new();
     for table in tables {
-        for (key, value) in table {
-            let package = match value.get("package").and_then(toml::Value::as_str) {
+        for (key, value) in table.iter() {
+            let package = match value.get("package").and_then(Value::as_str) {
                 Some(package) => Some(package),
-                None if value.get("workspace").and_then(toml::Value::as_bool) == Some(true) => {
+                None if value.get("workspace").and_then(Value::as_bool) == Some(true) => {
                     inherited
                         .and_then(|it| it.get(key))
                         .and_then(|it| it.get("package"))
-                        .and_then(toml::Value::as_str)
+                        .and_then(Value::as_str)
                 }
                 None => None,
             };
@@ -73,11 +76,10 @@ fn uncovered(identities: &[&Identity]) -> Vec<String> {
     let engine = Path::new(env!("CARGO_MANIFEST_DIR")).join("../blaze-engine");
     let workspace = crate::Workspace::read(&engine).unwrap();
     let checkout: BTreeMap<&str, &Path> = workspace.checkout().into_iter().collect();
-    let top: toml::Table =
-        std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml"))
-            .unwrap()
-            .parse()
-            .unwrap();
+    let top = toml_table(
+        &std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.toml")).unwrap(),
+    )
+    .unwrap();
     let mut problems = Vec::new();
     for identity in identities.iter().filter(|it| !it.cut.is_empty()) {
         let cut_packages: BTreeSet<&str> = identity.cut.iter().map(|it| it.package).collect();
@@ -87,8 +89,7 @@ fn uncovered(identities: &[&Identity]) -> Vec<String> {
         let mut found: BTreeSet<(String, String, String)> = BTreeSet::new();
         for root in identity.roots {
             let Some(&dir) = checkout.get(root.package) else { continue };
-            let manifest: toml::Table =
-                std::fs::read_to_string(dir.join("Cargo.toml")).unwrap().parse().unwrap();
+            let manifest = toml_table(&std::fs::read_to_string(dir.join("Cargo.toml")).unwrap()).unwrap();
             for problem in renamed(&manifest, &top, &cut_packages) {
                 problems.push(format!("{}: {} {problem}", identity.what, root.package));
             }

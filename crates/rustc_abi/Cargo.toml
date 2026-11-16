@@ -20,7 +20,8 @@ nightly = []
 randomize = []
 
 [dependencies]
-bitflags.workspace = true
+# blaze's `bitflags!` under bitflags' name, so `src`, copied unchanged, names it as `bitflags::`.
+bitflags = { package = "blaze-bitflags", path = "../blaze-bitflags" }
 rustc_hashes.workspace = true
 rustc_index.workspace = true
-tracing = { workspace = true, features = ["default"] }
+blaze-trace.workspace = true

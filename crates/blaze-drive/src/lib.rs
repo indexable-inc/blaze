@@ -41,6 +41,7 @@ pub mod request;
 pub mod run;
 pub mod scope_task;
 pub mod settled;
+pub mod table;
 pub mod worker;
 mod wire;
 

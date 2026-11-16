@@ -8,8 +8,6 @@
 //! Pressure is in permille (0 to 1000), an integer, so the same inputs always give the same
 //! slices (rule 25).
 
-use blaze_serde::{Deserialize, Serialize};
-
 const MIB: u64 = 1 << 20;
 const GIB: u64 = 1 << 30;
 const SECOND: u64 = 1_000_000_000;
@@ -21,7 +19,7 @@ pub const FULL: u32 = 1000;
 /// unix, `GetDiskFreeSpaceExW` on Windows; `id` tells two areas on one volume apart from two
 /// volumes (`st_dev`; an APFS container's name on macOS, whose volumes share free space; the
 /// volume's serial number on Windows: [`crate::space::volume`]).
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Volume {
     pub id: u64,
     pub total_bytes: u64,
@@ -37,7 +35,7 @@ pub const BUDGET: (u64, u8) = (64 * GIB, 25);
 /// comfortable at max(15%, 30 GiB) free, the floor at max(10%, 20 GiB), and a budget for
 /// blaze's own bytes of 64 GiB or a quarter of the volume, whichever is less ([`BUDGET`]).
 /// Overridable in `<root>/gc.json` ([`crate::settings`]).
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Levels {
     pub comfortable_percent: u8,
     pub comfortable_bytes: u64,
@@ -149,7 +147,7 @@ fn percent(of: u64, percent: u8) -> u64 {
 
 /// How a slice's size and rate scale with pressure: each quantity goes linearly from its value
 /// at the start of pressure to its value at full.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Pace {
     /// Between slices: from `slow_gap_ns` near no pressure to `fast_gap_ns` at full.
     pub slow_gap_ns: u64,
@@ -188,7 +186,7 @@ impl Default for Pace {
 }
 
 /// One slice's bounds.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Slice {
     /// The pressure it was paced for, permille.
     pub pressure: u32,
@@ -249,7 +247,7 @@ impl Pace {
 /// Whether pressure collection is on, with its band: on once the pressure reaches the band's
 /// start, off once free space is past the band above comfortable. In between it keeps what it
 /// was, so a level crossed back and forth switches it at most once.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Hysteresis {
     pub on: bool,
 }

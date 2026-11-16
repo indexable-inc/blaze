@@ -13,6 +13,8 @@ repository.workspace = true
 # Every file of src/bin is a script, a binary cargo finds by its name; `selftest` is its test.
 
 [dependencies]
+blaze-data.workspace = true
+blaze-toml.workspace = true
 blaze-script.workspace = true
 # The workspace's one SHA-256, with no dependencies: `smoke` names the binary it ran by its hash.
 blaze-sha256.workspace = true

@@ -63,6 +63,7 @@ pub mod roots;
 pub mod roots_fs;
 pub mod settings;
 pub mod space;
+mod wire;
 
 #[cfg(test)]
 mod fs_tests;

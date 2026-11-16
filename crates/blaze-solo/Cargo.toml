@@ -43,7 +43,7 @@ blaze-own.workspace = true
 # `Edition`, `Extensions`: a file's reading.
 syntax.workspace = true
 # The driver's waits, each in a span naming it (rule 15).
-tracing.workspace = true
+blaze-trace.workspace = true
 
 [dev-dependencies]
 blaze-sim.workspace = true

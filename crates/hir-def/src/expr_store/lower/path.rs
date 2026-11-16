@@ -16,7 +16,6 @@ use hir_expand::{
     name::{AsName, Name},
 };
 use intern::sym;
-use smallvec::SmallVec;
 use span::SyntaxContext;
 use syntax::{
     AstPtr, ast as tag,
@@ -68,8 +67,8 @@ fn lower_path_on_stacks(
     let in_expansion = collector.expander.current_file_id().macro_file().is_some();
     // Each segment's context normalized to macros 2.0 (`ModPath::contexts`), pushed with it
     // (last first, as the segments are).
-    // alloc: none for up to 8 segments, on the stack
-    let mut contexts: SmallVec<[SyntaxContext; 8]> = SmallVec::new();
+    // alloc: the segments' contexts, one buffer per path
+    let mut contexts: Vec<SyntaxContext> = Vec::new();
     #[cfg(test)]
     let mut ast_segments = Vec::new(); // alloc: tests only, for `SEGMENT_LOWERING_MAP`
     #[cfg(test)]
@@ -313,14 +312,14 @@ fn lower_path_on_stacks(
         // resolution below can borrow the collector.
         let last_args =
             collector.stacks.path_generic_args[g0..].last().and_then(|&word| unslot(word));
-        let lifetime_args: Option<SmallVec<[LifetimeRefId; 4]>> = last_args.map(|args| {
+        let lifetime_args: Option<Vec<LifetimeRefId>> = last_args.map(|args| {
             let args = collector.store.paths().generic_args_at(args).args;
             args.iter()
                 .filter_map(|arg| match *arg {
                     GenericArg::Lifetime(lt_ref) => Some(lt_ref),
                     GenericArg::Type(_) | GenericArg::Const(_) => None,
                 })
-                .collect() // alloc: inline up to 4 lifetimes, and only in an argument-bound scope
+                .collect() // alloc: the lifetimes, only in an argument-bound scope
         });
         let type_alias_constrained_lifetimes =
             collector.get_constrained_lifetimes_if_type_alias(&mod_path, lifetime_args.as_deref());

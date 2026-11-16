@@ -21,7 +21,6 @@ use cfg::CfgExpr;
 use stdx::Either;
 use hir_expand::{InFile, MacroCallId, mod_path::ModPath, name::Name};
 use la_arena::Arena;
-use smallvec::SmallVec;
 use span::{Edition, SyntaxContext};
 use std::alloc::Global;
 use syntax::{AstPtr, SyntaxNodePtr, ast};
@@ -211,7 +210,7 @@ struct ExpressionOnlyStore {
     /// and it does not bother us because we use this list for two things: constructing `ExprScopes`, which
     /// works fine with nested exprs, and retrieving inference results, and we copy the inner const's inference
     /// into the outer const.
-    expr_roots: SmallVec<[ExprRoot; 1]>,
+    expr_roots: Vec<ExprRoot>,
 }
 
 impl ExpressionOnlyStore {
@@ -274,7 +273,7 @@ pub struct ExpressionStoreBuilder {
     with_syntax: Vec<u64>,
     /// blaze_verify's clause groups, in lowering order.
     pub(crate) spec_clauses: Vec<(ExprId, SpecClauseKind)>,
-    inference_roots: Option<SmallVec<[ExprRoot; 1]>>,
+    inference_roots: Option<Vec<ExprRoot>>,
 
     // AST expressions can create patterns in destructuring assignments. Therefore, `ExprSource` can also map
     // to `PatId`, and `PatId` can also map to `ExprSource` (the other way around is unaffected).
@@ -512,8 +511,8 @@ impl ComptimeForm {
 
 /// The stacks lowering collects a node's children on before it allocates the node, one per
 /// element type of a list. They are used in stack order: a nested node's children go above its
-/// parent's and are truncated away before the parent is allocated, so no list needs a `Vec`,
-/// `SmallVec` or `Box<[_]>` of its own.
+/// parent's and are truncated away before the parent is allocated, so no list needs a `Vec`
+/// or `Box<[_]>` of its own.
 ///
 /// To allocate a node from the lists above a mark, lowering moves the stacks out of the builder
 /// ([`ExpressionStoreBuilder::take_lists`], a move of a few `Vec` headers), builds the view from
@@ -1577,10 +1576,7 @@ impl ExpressionOnlyStore {
             spec_clauses,
             expr_roots,
         } = self;
-        let roots = match expr_roots.spilled() {
-            true => expr_roots.capacity() * size_of::<ExprRoot>(),
-            false => 0,
-        };
+        let roots = crate::heap::vec_bytes(expr_roots);
         columns.heap_bytes()
             + crate::heap::arena_bytes(bindings)
             + crate::heap::arena_bytes(labels)
@@ -2523,7 +2519,7 @@ mod scratch_tests {
     /// A small store: type refs, expressions and patterns made through the list stacks, and
     /// source maps with repeated pointers.
     fn lower_one(builder: &mut ExpressionStoreBuilder, shift: u32) {
-        builder.inference_roots = Some(SmallVec::new());
+        builder.inference_roots = Some(Vec::new());
         let unit = builder.alloc_type_ref(TypeRef::UNIT);
         let mark = builder.list_mark();
         builder.push_list_type(unit);
@@ -2682,10 +2678,10 @@ mod scratch_tests {
         empty_pool();
         let mut outer = ExpressionStoreBuilder::new();
         outer.alloc_expr(Expr::Missing);
-        outer.inference_roots = Some(SmallVec::new());
+        outer.inference_roots = Some(Vec::new());
         let mut inner = ExpressionStoreBuilder::new();
         inner.alloc_expr(Expr::Missing);
-        inner.inference_roots = Some(SmallVec::new());
+        inner.inference_roots = Some(Vec::new());
         let (outer_at, inner_at) =
             (outer.columns.expr_kind.as_ptr(), inner.columns.expr_kind.as_ptr());
         assert_ne!(outer_at, inner_at, "a nested builder has scratch of its own");
@@ -2735,7 +2731,7 @@ mod scratch_tests {
 
         empty_pool();
         let mut builder = ExpressionStoreBuilder::new();
-        builder.inference_roots = Some(SmallVec::new());
+        builder.inference_roots = Some(Vec::new());
         let missing = builder.alloc_expr(Expr::Missing);
         let wild = builder.alloc_pat(Pat::Wild);
         let first = Statement::Let {

@@ -14,6 +14,9 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+blaze-own.workspace = true
+blaze-data.workspace = true
+blaze-toml.workspace = true
 anyhow.workspace = true
 blaze-manifest.workspace = true
 cargo-util-schemas.workspace = true

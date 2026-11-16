@@ -78,7 +78,9 @@ pub fn began() -> Instant {
 /// Has every info-level span of the target `blaze` and every rust-analyzer query kept by the
 /// flight recorder, and carries fiber jobs' spans with them.
 pub fn install() {
-    _ = blaze_trace::subscriber::set_global_default(Recorder);
+    // The process's one entry sink (blaze_trace, "The one ambient hook"); a second install
+    // (another test of the same binary) finds it there already.
+    _ = blaze_trace::install(&Recorder);
     carry_with_fiber_jobs();
 }
 
@@ -347,11 +349,6 @@ pub fn keeps_level(level: &str) -> bool {
     level.parse::<blaze_trace::Level>().is_ok_and(|it| it <= LEVEL)
 }
 
-/// Whether spans of `meta` are kept; those that are get a site in the flight recorder.
-fn wants(meta: &'static blaze_trace::Metadata<'static>) -> bool {
-    Recorder::wanted(meta) && flight::register(meta).is_some()
-}
-
 /// The site of a callsite [`Recorder::enabled`] said yes to, given it here if it has none yet.
 /// tracing registers a callsite on the first thread to reach it; another thread that reaches
 /// it while that registration runs is asked [`Recorder::enabled`] instead and goes on to make
@@ -377,26 +374,15 @@ pub(crate) fn closed(id: u64) -> bool {
     flight::closed(id).is_some()
 }
 
-impl blaze_trace::Subscriber for Recorder {
-    fn register_callsite(
-        &self,
-        meta: &'static blaze_trace::Metadata<'static>,
-    ) -> blaze_trace::subscriber::Interest {
-        if wants(meta) {
-            blaze_trace::subscriber::Interest::always()
-        } else {
-            blaze_trace::subscriber::Interest::never()
-        }
+impl blaze_trace::Sink for Recorder {
+    /// Wanted ([`Recorder::wanted`]) and given a site in the flight recorder: DEBUG at most,
+    /// for the events of `blaze` targets that opt in ([`logs::keeps_event`]).
+    fn max_level(&self) -> blaze_trace::Level {
+        blaze_trace::Level::DEBUG
     }
 
-    fn max_level_hint(&self) -> Option<blaze_trace::level_filters::LevelFilter> {
-        // DEBUG for the events of `blaze` targets that opt in ([`logs::keeps_event`]); each
-        // callsite's interest decides the rest once.
-        Some(blaze_trace::level_filters::LevelFilter::DEBUG)
-    }
-
-    fn enabled(&self, meta: &blaze_trace::Metadata<'_>) -> bool {
-        Self::wanted(meta)
+    fn enabled(&self, meta: &'static blaze_trace::Metadata<'static>) -> bool {
+        Self::wanted(meta) && site_of(meta).is_some()
     }
 
     fn new_span(&self, span: &blaze_trace::span::Attributes<'_>) -> blaze_trace::span::Id {
@@ -411,8 +397,6 @@ impl blaze_trace::Subscriber for Recorder {
     fn record(&self, id: &blaze_trace::span::Id, values: &blaze_trace::span::Record<'_>) {
         flight::recorded(id.into_u64(), values);
     }
-
-    fn record_follows_from(&self, _: &blaze_trace::span::Id, _: &blaze_trace::span::Id) {}
 
     fn event(&self, event: &blaze_trace::Event<'_>) {
         if let Some(site) = site_of(event.metadata()) {

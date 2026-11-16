@@ -111,6 +111,15 @@ impl<T, const N: usize> FixedVec<T, N> {
         Ok(())
     }
 
+    /// Each of `values` pushed in order, stopping at the first with no room, which is handed
+    /// back; the values before it stay pushed and the rest of `values` is not read.
+    pub fn try_extend(&mut self, values: impl IntoIterator<Item = T>) -> Result<(), Full<T>> {
+        for value in values {
+            self.push(value)?;
+        }
+        Ok(())
+    }
+
     pub fn pop(&mut self) -> Option<T> {
         if self.len == 0 {
             return None;

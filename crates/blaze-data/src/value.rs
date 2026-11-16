@@ -146,6 +146,86 @@ pub enum Value<A: Allocator> {
     Map(Map<A>),
 }
 
+/// A drop without recursion, so a value read from untrusted bytes at any depth a reader
+/// accepts cannot overflow the stack as it goes: each container's descendants are moved into
+/// its own storage (a list's `Vec`, a map's entries) and taken out one at a time, so every
+/// value dropped meanwhile is a leaf or an emptied container. No memory is asked for but the
+/// growth of those, bounded by the values held.
+impl<A: Allocator> Drop for Value<A> {
+    fn drop(&mut self) {
+        match self {
+            Value::List(list) => drain_list(list),
+            Value::Map(map) => {
+                while let Some((_, mut child)) = map.pop_for_drop() {
+                    match &mut child {
+                        Value::List(list) => drain_list(list),
+                        Value::Map(inner) => {
+                            while let Some(entry) = inner.pop_for_drop() {
+                                map.push_for_drop(entry);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn drain_list<A: Allocator>(list: &mut Vec<Value<A>, A>) {
+    while let Some(mut child) = list.pop() {
+        match &mut child {
+            Value::List(inner) => {
+                while let Some(value) = inner.pop() {
+                    list.push(value);
+                }
+            }
+            Value::Map(inner) => {
+                while let Some((_, value)) = inner.pop_for_drop() {
+                    list.push(value);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Owners taken out. `Value` has a `Drop`, so `match v { Value::Map(m) => m, .. }` by value
+/// does not compile; these take the owner and leave an empty one in the same allocator.
+impl<A: Allocator + Clone> Value<A> {
+    pub fn into_text(mut self) -> Option<String<A>> {
+        match &mut self {
+            Value::Text(text) => {
+                let empty = String::new_in(text.allocator().clone());
+                Some(core::mem::replace(text, empty))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn into_bytes(mut self) -> Option<Vec<u8, A>> {
+        match &mut self {
+            Value::Bytes(bytes) => Some(bytes.split_off(0)),
+            _ => None,
+        }
+    }
+
+    pub fn into_list(mut self) -> Option<Vec<Value<A>, A>> {
+        match &mut self {
+            Value::List(list) => Some(list.split_off(0)),
+            _ => None,
+        }
+    }
+
+    pub fn into_map(mut self) -> Option<Map<A>> {
+        match &mut self {
+            Value::Map(map) => Some(map.take()),
+            _ => None,
+        }
+    }
+}
+
 impl<A: Allocator> Value<A> {
     pub fn kind(&self) -> Kind {
         match self {

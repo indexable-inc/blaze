@@ -7,7 +7,6 @@ use stdx::Either;
 use hir_expand::name::{AsName, Name};
 use intern::sym;
 use la_arena::Arena;
-use smallvec::SmallVec;
 use syntax::{
     AstPtr, SyntaxNodePtr, ast as tag,
     view::{self as ast, AstNode, HasName, HasTypeBounds},
@@ -329,8 +328,8 @@ impl GenericParamsCollector {
                 // Higher-Ranked Trait Bounds: one run of names, shared by the predicate's bounds.
                 let lifetimes =
                     pred.for_binder().and_then(|it| it.generic_param_list()).map(|param_list| {
-                        // alloc: inline up to 4, a binder's lifetimes before they are pushed
-                        let names: SmallVec<[Name; 4]> = param_list
+                        // alloc: a binder's lifetimes before they are pushed
+                        let names: Vec<Name> = param_list
                             .lifetime_params()
                             .map(|lifetime_param| {
                                 lifetime_param
@@ -548,8 +547,8 @@ impl ExprCollector<'_> {
         let Some(params) = binder.and_then(|it| it.generic_param_list()) else {
             return Names::EMPTY;
         };
-        // alloc: inline up to 4, a binder's lifetimes before they are pushed
-        let names: SmallVec<[Name; 4]> = params
+        // alloc: a binder's lifetimes before they are pushed
+        let names: Vec<Name> = params
             .lifetime_params()
             .flat_map(|lp| lp.lifetime().map(|lt| self.binder_lifetime_name(lt)))
             .collect();

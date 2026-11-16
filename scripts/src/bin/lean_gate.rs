@@ -351,14 +351,16 @@ fn lean_sources(root: &Path) -> Vec<String> {
 }
 
 fn mathlib_rev(lakefile: &str) -> Result<String, String> {
-    let data: toml::Table = toml::from_str(lakefile).map_err(|e| e.to_string())?;
-    for need in data.get("require").and_then(toml::Value::as_array).into_iter().flatten() {
+    let data = toml::parse(lakefile).map_err(|e| format!("lakefile.toml is not TOML: {}", e.display(lakefile)))?;
+    for need in data.get("require").and_then(toml::Value::as_list).into_iter().flatten() {
         if need.get("name").and_then(toml::Value::as_str) == Some("mathlib") {
-            return Ok(match need.get("rev") {
-                None => String::new(),
-                Some(toml::Value::String(rev)) => rev.clone(),
-                Some(other) => other.to_string(),
-            });
+            return match need.get("rev") {
+                None => Ok(String::new()),
+                Some(rev) => match rev.as_str() {
+                    Some(rev) => Ok(rev.to_owned()),
+                    None => Err(format!("lakefile.toml's mathlib `rev` is {}, not a string", rev.kind())),
+                },
+            };
         }
     }
     Ok(String::new())

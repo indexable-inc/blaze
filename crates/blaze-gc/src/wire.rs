@@ -2,8 +2,9 @@
 //! the shapes serde's derive gave them, so a ledger or record written before is read the same.
 //!
 //! - A struct is a map of its fields in declaration order; a field that was `#[serde(default)]`
-//!   may be missing, an `Option` may be missing or null, and fields no one asked for are let
-//!   be (serde's derive refused none here).
+//!   may be missing, an `Option` may be missing or null, and a field it does not know is
+//!   refused, naming it (serde's derive let such fields be; no blaze wrote one: the types have
+//!   only gained fields).
 //! - An enum is externally tagged: a unit variant is its name as text (`"Pinned"`), a struct
 //!   variant a map of its name to a map of its fields (`{"Head": {"checkout": ".."}}`), a newtype
 //!   variant a map of its name to the value (`{"Go": {"Unused": {"for_ns": 9}}}`).
@@ -208,6 +209,13 @@ impl FromValue<Global> for Reason {
     fn from_value(c: &C<'_, '_>) -> Result<Reason, E> {
         let (name, inner) = variant(c)?;
         let f = payload(c, inner, "Reason")?;
+        f.deny_unknown(match name {
+            "CheckoutGone" => &["checkout"][..],
+            "OverCap" => &["workspace", "cap_bytes"],
+            "OverBudget" => &["to_free_bytes"],
+            "Within" => &["dir"],
+            _ => &["for_ns"],
+        })?;
         match name {
             "CheckoutGone" => Ok(Reason::CheckoutGone { checkout: string(&f, "checkout")? }),
             "Unused" => Ok(Reason::Unused { for_ns: f.req("for_ns")? }),
@@ -263,6 +271,13 @@ impl FromValue<Global> for Keep {
             _ => {}
         }
         let f = payload(c, inner, "Keep")?;
+        f.deny_unknown(match name {
+            "Head" => &["checkout"][..],
+            "Held" => &["agent"],
+            "Grace" => &["left_ns"],
+            "NestedLeasedAtSweep" => &["dir"],
+            _ => &["why"],
+        })?;
         match name {
             "Head" => Ok(Keep::Head { checkout: string(&f, "checkout")? }),
             "Held" => Ok(Keep::Held { agent: f.req("agent")? }),
@@ -311,6 +326,7 @@ impl ToValue<Global> for Verdict {
 
 impl FromValue<Global> for Verdict {
     fn from_value(c: &C<'_, '_>) -> Result<Verdict, E> {
+        c.deny_unknown(&["path", "class", "bytes", "used_ns", "fate"])?;
         Ok(Verdict {
             path: string(c, "path")?,
             class: c.req("class")?,
@@ -339,6 +355,17 @@ impl ToValue<Global> for VolumeReport {
 
 impl FromValue<Global> for VolumeReport {
     fn from_value(c: &C<'_, '_>) -> Result<VolumeReport, E> {
+        c.deny_unknown(&[
+            "area",
+            "total_bytes",
+            "free_bytes",
+            "comfortable_bytes",
+            "floor_bytes",
+            "blaze_bytes",
+            "share_bytes",
+            "pressure",
+            "to_free_bytes",
+        ])?;
         Ok(VolumeReport {
             area: string(c, "area")?,
             total_bytes: c.req("total_bytes")?,
@@ -374,8 +401,9 @@ impl ToValue<Global> for NoSpace {
 
 impl FromValue<Global> for NoSpace {
     fn from_value(c: &C<'_, '_>) -> Result<NoSpace, E> {
+        c.deny_unknown(&["area", "free_bytes", "floor_bytes", "kept", "skipped"])?;
         let field = c.field("kept")?;
-        let mut kept = Vec::with_capacity(field.list()?.len());
+        let mut kept: Vec<(String, u64, Keep)> = Vec::with_capacity(field.list()?.len());
         field.each(|it| {
             if it.list()?.len() != 3 {
                 return unknown(&it, "(String, u64, Keep)");
@@ -415,6 +443,14 @@ impl FromValue<Global> for Stop {
     fn from_value(c: &C<'_, '_>) -> Result<Stop, E> {
         let (name, inner) = variant(c)?;
         let f = payload(c, inner, "Stop")?;
+        f.deny_unknown(match name {
+            "Fuel" => &["fuel"][..],
+            "Deadline" => &["run_ns"],
+            "ScanFailed" => &["why"],
+            "Slice" => &["bytes"],
+            "Clock" => &["now_ns", "newest_ns"],
+            _ => &["by"],
+        })?;
         match name {
             "Fuel" => Ok(Stop::Fuel { fuel: f.req("fuel")? }),
             "Deadline" => Ok(Stop::Deadline { run_ns: f.req("run_ns")? }),
@@ -448,12 +484,15 @@ impl FromValue<Global> for Outcome {
     fn from_value(c: &C<'_, '_>) -> Result<Outcome, E> {
         match variant(c)? {
             ("Done", None) => Ok(Outcome::Done),
-            ("Stopped", Some(f)) => Ok(Outcome::Stopped {
-                phase: f.req("phase")?,
-                why: f.req("why")?,
-                done: f.req("done")?,
-                left: f.req("left")?,
-            }),
+            ("Stopped", Some(f)) => {
+                f.deny_unknown(&["phase", "why", "done", "left"])?;
+                Ok(Outcome::Stopped {
+                    phase: f.req("phase")?,
+                    why: f.req("why")?,
+                    done: f.req("done")?,
+                    left: f.req("left")?,
+                })
+            }
             _ => unknown(c, "Outcome"),
         }
     }
@@ -491,6 +530,31 @@ impl ToValue<Global> for RunReport {
 
 impl FromValue<Global> for RunReport {
     fn from_value(c: &C<'_, '_>) -> Result<RunReport, E> {
+        c.deny_unknown(&[
+            "run",
+            "why",
+            "dry_run",
+            "started_ns",
+            "ended_ns",
+            "outcome",
+            "objects",
+            "total_bytes",
+            "marked_objects",
+            "marked_bytes",
+            "swept_objects",
+            "swept_bytes",
+            "kept_objects",
+            "kept_bytes",
+            "unlinked_objects",
+            "unlinked_bytes",
+            "over_budget_bytes",
+            "pressure",
+            "volumes",
+            "short",
+            "clock_checked",
+            "problems",
+            "verdicts",
+        ])?;
         Ok(RunReport {
             run: c.req("run")?,
             why: c.req("why")?,
@@ -531,6 +595,7 @@ impl ToValue<Global> for Ledger {
 
 impl FromValue<Global> for Ledger {
     fn from_value(c: &C<'_, '_>) -> Result<Ledger, E> {
+        c.deny_unknown(&["format", "last_end_ns", "runs"])?;
         Ok(Ledger { format: c.req("format")?, last_end_ns: c.opt("last_end_ns")?, runs: items(c, "runs", None)? })
     }
 }
@@ -555,7 +620,8 @@ impl ToValue<Global> for Record {
 
 impl FromValue<Global> for Record {
     fn from_value(c: &C<'_, '_>) -> Result<Record, E> {
-        let mut profiles = Vec::new();
+        c.deny_unknown(&["format", "checkout", "used_ns", "profiles"])?;
+        let mut profiles: Vec<(String, u64)> = Vec::new();
         if let Some(field) = c.field_opt("profiles")? {
             field.each(|it| {
                 if it.list()?.len() != 2 {

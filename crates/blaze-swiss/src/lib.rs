@@ -716,7 +716,7 @@ mod tests {
 
     #[test]
     fn words_agree_with_the_copies() {
-        blaze_sim::check(Config::DEFAULT, |tape| {
+        blaze_sim::check(Config::cases(CASES), |tape| {
             let bytes: [u8; 8] = tape.array("bytes", |tape| tape.int::<u8>("byte"));
             let tag: u8 = tape.int_in(0x80..=u8::MAX, "tag");
             agrees::<7>(bytes, tag);
@@ -729,11 +729,20 @@ mod tests {
     /// keys share few hashes, and `vacant` against the group `find` stops at.
     #[test]
     fn probes_agree_with_the_copies() {
-        blaze_sim::check(Config::DEFAULT, |tape| probes_agree(tape))
+        blaze_sim::check(Config::cases(CASES), |tape| probes_agree(tape))
+    }
+
+    /// Cases of each property: few under Miri, which interprets every one
+    /// (`cargo miri test -p blaze-swiss` in under five minutes).
+    const CASES: u32 = if cfg!(miri) { 16 } else { Config::DEFAULT.cases };
+
+    /// A bound that is `small` under Miri.
+    const fn sized<T: Copy>(full: T, small: T) -> T {
+        if cfg!(miri) { small } else { full }
     }
 
     fn probes_agree(tape: &Tape) {
-        let log_groups: u32 = tape.int_in(0..=5u32, "log groups");
+        let log_groups: u32 = tape.int_in(0..=sized(5u32, 2), "log groups");
         let fill: u64 = tape.int_in(3..=7u64, "fill eighths");
         let hash: u64 = tape.int("hash");
         const SLOTS: usize = 7;
@@ -846,14 +855,15 @@ mod tests {
     #[cfg(not(blaze_check))]
     #[test]
     fn index_agrees_with_a_map() {
-        for seed in 0..4u64 {
+        let (steps, distinct) = sized((40_000, 9_000), (600, 150));
+        for seed in 0..sized(4u64, 1) {
             let mut index = Index::new_in(Global);
             assert_eq!(index.capacity(), 0);
             let mut keys: Vec<u64> = Vec::new();
             let mut model: std::collections::BTreeMap<u64, u32> = std::collections::BTreeMap::new();
             let mut rng = blaze_rng::SplitMix64::new(seed);
-            for step in 0..40_000 {
-                let key = rng.below(9_000);
+            for step in 0..steps {
+                let key = rng.below(distinct);
                 let found = index.find(hash_of(key), |value| keys[value as usize] == key);
                 assert_eq!(found, model.get(&key).copied(), "seed {seed} step {step}");
                 if found.is_none() {
@@ -864,7 +874,7 @@ mod tests {
                     });
                     model.insert(key, value);
                 }
-                if step % 10_000 == 0 {
+                if step % (steps / 4) == 0 {
                     index.release_outgrown();
                 }
             }
@@ -887,7 +897,8 @@ mod tests {
     fn readers_race_a_growing_index() {
         use std::sync::{Mutex, atomic::AtomicU64 as Key};
 
-        const KEYS: usize = 20_000;
+        const KEYS: usize = sized(20_000, 400);
+        const EARLY: u64 = sized(100, 20);
         let index = Index::new_in(Global);
         let column: Box<[Key]> = (0..KEYS).map(|_| Key::new(u64::MAX)).collect();
         let len = Mutex::new(0usize);
@@ -908,16 +919,16 @@ mod tests {
             *len += 1;
             value
         };
-        let early: Vec<u32> = (0..100).map(intern).collect();
+        let early: Vec<u32> = (0..EARLY).map(intern).collect();
         std::thread::scope(|scope| {
-            for worker in 0..8u64 {
+            for worker in 0..sized(8u64, 3) {
                 let (intern, early, column, index) = (&intern, &early, &column, &index);
                 scope.spawn(move || {
                     for n in 0..KEYS as u64 / 2 {
                         let key = (n * 7 + worker * 131) % (KEYS as u64 / 2);
                         let value = intern(key);
                         assert_eq!(column[value as usize].load(Ordering::Relaxed), key);
-                        let first = (n % 100) as usize;
+                        let first = (n % EARLY) as usize;
                         let found = index.find(hash_of(first as u64), |it| {
                             column[it as usize].load(Ordering::Relaxed) == first as u64
                         });
@@ -935,7 +946,8 @@ mod tests {
     #[test]
     fn index_groups_never_straddle_a_line() {
         let index = Index::new_in(Global);
-        let keys: Vec<u64> = (0..5_000).collect();
+        // Under Miri, enough for six levels (the sixth grows past 144 values).
+        let keys: Vec<u64> = (0..sized(5_000, 200)).collect();
         for (len, &key) in keys.iter().enumerate() {
             index.insert(len, hash_of(key), len as u32, |value| hash_of(keys[value as usize]));
         }
@@ -953,7 +965,7 @@ mod tests {
     #[test]
     fn an_index_allocates_only_to_grow() {
         let index = blaze_alloc_count::assert_at_most(0, "a new index", || Index::new_in(Global));
-        let keys: Vec<u64> = (0..1_000).collect();
+        let keys: Vec<u64> = (0..sized(1_000, 100)).collect();
         for (len, &key) in keys.iter().enumerate() {
             index.insert(len, hash_of(key), len as u32, |value| hash_of(keys[value as usize]));
         }

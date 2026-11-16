@@ -49,25 +49,7 @@ impl<'p> At<'p> {
             Some(parent) => parent.write_steps(out)?,
             None => false,
         };
-        match self.step {
-            Step::Root => Ok(before),
-            Step::Key(key) => {
-                if before {
-                    out.write_char('.')?;
-                }
-                let bare = !key.is_empty()
-                    && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
-                match bare {
-                    true => out.write_str(key)?,
-                    false => write!(out, "{key:?}")?,
-                }
-                Ok(true)
-            }
-            Step::Index(index) => {
-                write!(out, "[{index}]")?;
-                Ok(true)
-            }
-        }
+        write_step(out, self.step, before)
     }
 
     fn render_in<A: Allocator>(&self, alloc: A) -> String<A> {
@@ -76,6 +58,30 @@ impl<'p> At<'p> {
             unreachable!("writing into a `String` does not fail");
         }
         out
+    }
+}
+
+/// One step of a path written as [`At::write_into`] writes it, after `before` (whether a step
+/// was written already); says whether anything is written now. A writer that walks a value
+/// with its own stack, not a chain of `At`s, writes its path step by step with this.
+pub fn write_step<W: fmt::Write + ?Sized>(out: &mut W, step: Step<'_>, before: bool) -> Result<bool, fmt::Error> {
+    match step {
+        Step::Root => Ok(before),
+        Step::Key(key) => {
+            if before {
+                out.write_char('.')?;
+            }
+            let bare = !key.is_empty() && key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-');
+            match bare {
+                true => out.write_str(key)?,
+                false => write!(out, "{key:?}")?,
+            }
+            Ok(true)
+        }
+        Step::Index(index) => {
+            write!(out, "[{index}]")?;
+            Ok(true)
+        }
     }
 }
 

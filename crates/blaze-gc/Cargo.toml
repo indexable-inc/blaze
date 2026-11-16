@@ -20,11 +20,12 @@ blaze-hash.workspace = true
 blaze-ids.workspace = true
 blaze-spin.workspace = true
 crossbeam-queue.workspace = true
-blaze-serde.workspace = true
-serde.workspace = true
-serde_json.workspace = true
+# The ledger's, a build dir's record's and gc.json's JSON (`src/wire.rs`).
+blaze-data.workspace = true
+blaze-json.workspace = true
+blaze-own.workspace = true
 stdx.workspace = true
-tracing.workspace = true
+blaze-trace.workspace = true
 
 [dev-dependencies]
 crossbeam-channel.workspace = true

@@ -14,7 +14,7 @@ doctest = false
 
 [dependencies]
 blaze-hash.workspace = true
-tracing.workspace = true
+blaze-trace.workspace = true
 
 # locals deps
 tt.workspace = true

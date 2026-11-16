@@ -19,7 +19,6 @@ use base_db::{Crate, CrateOrigin, Db, LangCrateOrigin};
 use hir_expand::{AstId, HirFileId, InFile, Lookup, attrs::expand_cfg_attr_view, name::Name};
 use intern::Symbol;
 use la_arena::{Idx, RawIdx};
-use smallvec::SmallVec;
 use span::{AstIdNode, ErasedFileAstId};
 use syntax::{
     NodeOrToken, SyntaxKind, T,
@@ -661,7 +660,7 @@ fn parse_unstable(items: &Items<'_>) -> Option<Stability> {
 }
 
 /// An attribute list's item: its key, and what follows it.
-type Items<'t> = SmallVec<[(ast::Token<'t>, Value<'t>); 4]>;
+type Items<'t> = Vec<(ast::Token<'t>, Value<'t>)>;
 
 enum Value<'t> {
     /// Nothing: `soft`.
@@ -675,8 +674,8 @@ enum Value<'t> {
 /// The items of an attribute's list, each starting with a name; `None` when one doesn't (a
 /// literal, rustc's "unsupported literal") or one is empty but the last.
 fn items(tt: ast::TokenTree<'_>) -> Option<Items<'_>> {
-    let mut tokens: SmallVec<[ast::Element<'_>; 16]> =
-        // alloc: a 16-element stack buffer; spills only for a longer attribute list
+    let mut tokens: Vec<ast::Element<'_>> =
+        // alloc: the list's tokens, once per attribute list
         tt.syntax().children_with_tokens().filter(|it| !it.kind().is_trivia()).skip(1).collect();
     if tokens.last().is_some_and(|it| it.kind() == T![')']) {
         tokens.pop();

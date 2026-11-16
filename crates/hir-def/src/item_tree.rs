@@ -336,7 +336,7 @@ pub fn use_item_trees(db: &Db, id: crate::UseId) -> UseItemTrees<'_> {
     };
     let mut trees = Vec::new(); // alloc: the result, one per tree (one for most items)
     // (tree, the index of its list in `trees`)
-    let mut stack: smallvec::SmallVec<[(UseTreeId, Option<u32>); 8]> = smallvec::SmallVec::new();
+    let mut stack: Vec<(UseTreeId, Option<u32>)> = Vec::new();
     stack.push((use_.use_tree, None));
     let mut next = 0u32;
     while let Some((at, parent)) = stack.pop() {

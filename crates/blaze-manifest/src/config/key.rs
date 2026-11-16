@@ -127,7 +127,10 @@ pub(crate) fn escape_key_part(part: &str) -> Cow<'_, str> {
     if part.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_')) {
         Cow::Borrowed(part)
     } else {
-        Cow::Owned(toml::Value::from(part).to_string())
+        // As cargo spells it: the part as a TOML string value, not as a TOML key.
+        let mut quoted = String::new();
+        super::toml_text::write_string(part, &mut quoted);
+        Cow::Owned(quoted)
     }
 }
 

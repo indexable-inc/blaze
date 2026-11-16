@@ -71,6 +71,7 @@ pub enum ConfigWhat {
     NotATable { key: String, found: &'static str, definition: Definition },
     Missing { key: String },
     MissingField { field: &'static str },
+    ExpectedTable,
     Expected { key: String, expected: &'static str, found: &'static str },
     InvalidFor { key: String, ty: &'static str, found: &'static str, definition: Definition },
     LoadKey { key: String },
@@ -236,11 +237,11 @@ impl fmt::Display for ConfigWhat {
             W::ZFlagUnknown { name } => write!(f, "blaze does not read `-Z {name}` yet"),
             W::NotATable { key, found, definition } => write!(
                 f,
-                "expected table for configuration key `{key}`, but found {found} in {}",
-                definition.located()
+                "expected table for configuration key `{key}`, but found {found} in {definition}"
             ),
             W::Missing { key } => write!(f, "missing config key `{key}`"),
             W::MissingField { field } => write!(f, "missing field `{field}`"),
+            W::ExpectedTable => f.write_str("expected table"),
             W::Expected { key, expected, found } => {
                 write!(f, "`{key}` expected {expected}, but found a {found}")
             }
@@ -408,7 +409,31 @@ impl fmt::Display for TomlError {
         writeln!(f, "{gutter} |")?;
         writeln!(f, "{number} | {}", self.text)?;
         writeln!(f, "{gutter} | {}^", " ".repeat(self.column.saturating_sub(1)))?;
-        write!(f, "{}", self.what)
+        match cargo_wording(self.what) {
+            Some(text) => f.write_str(text),
+            None => write!(f, "{}", self.what),
+        }
+    }
+}
+
+/// cargo's words (the `toml` crate's) for the refusals a config file most often meets, so that
+/// what cargo users know reads the same; blaze-toml's own for the rest.
+fn cargo_wording(what: blaze_toml::What) -> Option<&'static str> {
+    use blaze_toml::{Expected, What};
+    match what {
+        What::End { expected: Expected::CloseHeader }
+        | What::Unexpected { expected: Expected::CloseHeader, .. } => {
+            Some("unclosed table, expected `]`")
+        }
+        What::End { expected: Expected::CloseArrayHeader }
+        | What::Unexpected { expected: Expected::CloseArrayHeader, .. } => {
+            Some("unclosed array of tables, expected `]]`")
+        }
+        What::End { expected: Expected::Equals }
+        | What::Unexpected { expected: Expected::Equals, .. } => {
+            Some("key with no value, expected `=`")
+        }
+        _ => None,
     }
 }
 

@@ -22,7 +22,7 @@ crossbeam-channel.workspace = true
 rustc_lexer.workspace = true
 syntax-tree.workspace = true
 rustc-literal-escaper.workspace = true
-tracing.workspace = true
+blaze-trace.workspace = true
 
 parser.workspace = true
 stdx.workspace = true

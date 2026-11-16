@@ -19,15 +19,14 @@ doctest = false
 blaze-core.workspace = true
 blaze-id.workspace = true
 blaze-surface.workspace = true
-arrayvec.workspace = true
+blaze-own.workspace = true
 blaze-bitflags.workspace = true
 blaze-hash.workspace = true
 cov-mark.workspace = true
 drop_bomb.workspace = true
 hashbrown.workspace = true
 la-arena.workspace = true
-tracing = { workspace = true, features = ["attributes"] }
-smallvec.workspace = true
+blaze-trace.workspace = true
 rustc_apfloat.workspace = true
 
 rustc_parse_format.workspace = true
@@ -44,7 +43,6 @@ hir-expand.workspace = true
 cfg.workspace = true
 tt.workspace = true
 span.workspace = true
-thin-vec.workspace = true
 syntax-bridge.workspace = true
 blaze-format.workspace = true
 blaze-format-tiers.workspace = true

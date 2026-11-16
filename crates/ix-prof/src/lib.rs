@@ -7,7 +7,7 @@
 //!
 //! fn main() {
 //!     let _prof = ix_prof::start_from_env().expect("ix-prof"); // IX_PROF=<dir> turns it on
-//!     tracing_subscriber::registry().with(ix_prof::layer()).init(); // optional: spans
+//!     _ = blaze_trace::install(ix_prof::layer()); // optional: spans
 //!     // ...
 //! }
 //! ```

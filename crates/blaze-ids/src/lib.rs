@@ -14,14 +14,14 @@
 #![register_tool(blaze)]
 #![deny(unsafe_code)]
 
-use std::{alloc::Global, fmt, hash, marker::PhantomData};
+use std::{alloc::Global, fmt, hash, marker::PhantomData, num::NonZeroUsize};
 
 // The once-cell, the spin lock and the atomics are blaze-swiss's: `core`'s atomics, or the
 // model checker's in a model build (docs/v2/plan/design/model-checker.md, "The switch").
 use blaze_swiss::{
     Index,
     sync::{
-        Once, Spin,
+        Backoff, Once, Spin,
         atomic::{AtomicU32, AtomicU64, Ordering},
     },
 };
@@ -334,13 +334,16 @@ pub trait Interner<T>: Sync {
 }
 
 /// The [`Interner`] of blaze v2: values in an append-only arena of chunks that never move,
-/// found by content ID in one of [`shard_count`] [`blaze_swiss::Index`]es.
+/// found by content ID in one of its [`Shards`]' [`blaze_swiss::Index`]es.
 ///
 /// [`Interner::get`], [`Interner::content`] and [`Interner::find`] take no lock. Interning a
 /// new value computes it first, then locks the one shard its content ID falls in only to look
-/// again and insert (a racing loser's value is dropped). A shard's index grows by copying into
-/// one twice its size, published once full; the tables it outgrew are kept until the interner
-/// is dropped, as a reader may be probing one, so the tables cost at most twice the last one.
+/// again and insert (a racing loser's value is dropped): O(1) under the lock. A shard's index
+/// grows into one twice its size, built by the writer that filled it to three quarters after
+/// it unlocks, while others go on inserting, and swapped in under the lock with what they
+/// inserted meanwhile ([`blaze_swiss::Grow`]); the tables it outgrew are kept until the
+/// interner is dropped, as a reader may be probing one, so the tables cost at most twice the
+/// last one.
 ///
 /// Not `intern`'s interners: those key a value by its own bytes and live for the process;
 /// this one is keyed by a content ID its caller computed (so it hashes nothing), owns values
@@ -368,17 +371,17 @@ pub const BLOCK: u32 = 64;
 pub struct Shards(u32);
 
 impl Shards {
-    /// Shards per worker, rounded up: with `w` writers on `4w` shards, two meet on one shard
-    /// about once in `4w` claims (a birthday bound per pair of claims in flight), and a shard's
-    /// share of the values, a quarter of a worker's, keeps its index growths small. Measured
-    /// against: change 8's bench in docs/v2/plan/design/parallel.md, not yet run.
+    /// Shards per worker: four times as many shards as writers, so two writers rarely want
+    /// one shard at once, as in `blaze-hashcons`. Not measured yet: change 8's bench in
+    /// docs/v2/plan/design/parallel.md decides it.
     pub const PER_WORKER: usize = 4;
 
     /// `workers` (the scheduler's worker count) rounded up to a power of two, times
     /// [`Shards::PER_WORKER`]: at least 4.
-    pub fn for_workers(workers: NonZeroUsize) -> Shards {
+    pub const fn for_workers(workers: NonZeroUsize) -> Shards {
         let count = workers.get().next_power_of_two() * Self::PER_WORKER;
-        Shards(u32::try_from(count).expect("a shard count below 2^32"))
+        assert!(count <= u32::MAX as usize, "a shard count below 2^32");
+        Shards(count as u32)
     }
 
     pub fn count(self) -> usize {
@@ -486,30 +489,63 @@ impl<T: Send + Sync> Interner<T> for Sharded<T> {
         }
         let value = value();
         let shard = self.shard(&id);
-        let mut claimed = shard.lock.lock();
-        if let Some(found) = self.probe(shard, &id) {
-            return found;
-        }
-        let len = shard.len.load(Ordering::Relaxed);
-        if claimed.next == claimed.end {
-            let start = self.next.fetch_add(BLOCK as u64, Ordering::AcqRel);
-            assert!(start + BLOCK as u64 <= u32::MAX as u64, "an interner of 2^32 values");
-            *claimed = Claimed { next: start as u32, end: start as u32 + BLOCK };
-        }
-        let raw = claimed.next;
-        claimed.next += 1;
-        let (chunk, at) = chunk_of(raw);
-        let slots = self.slots[chunk]
-            // alloc: once per chunk of slots, each twice the last: amortized, never per intern
-            .get_or_init(|| (0..FIRST << chunk).map(|_| Once::new()).collect());
-        if slots[at].set((id, value)).is_err() {
-            unreachable!("index {raw} handed out twice");
-        }
         let hash_of =
             |raw: u32| probe_hash(&self.slot(raw).expect("an index entry before its value").0);
-        shard.index.insert(len as usize, probe_hash(&id), raw, hash_of);
-        shard.len.store(len + 1, Ordering::Relaxed);
-        Idx::from_raw(raw)
+        // The wait for a growth another writer is building, once the table is seven eighths
+        // full: rare, as the growth starts at three quarters.
+        let mut grown = Backoff::new("ids.sharded.growth");
+        loop {
+            let mut claimed = shard.lock.0.lock();
+            if let Some(found) = self.probe(shard, &id) {
+                return found;
+            }
+            let len = shard.len.load(Ordering::Relaxed);
+            let vacancy = match shard.index.vacancy(len as usize) {
+                Ok(vacancy) => vacancy,
+                Err(full) => {
+                    drop(claimed);
+                    match full.grow {
+                        // The writer that held it panicked: this one builds it instead.
+                        Some(grow) => {
+                            let built = grow.build(hash_of);
+                            let _claimed = shard.lock.0.lock();
+                            built.publish(hash_of);
+                        }
+                        None => {
+                            while shard.index.level() <= full.level {
+                                grown.snooze();
+                            }
+                        }
+                    }
+                    continue;
+                }
+            };
+            if claimed.next == claimed.end {
+                let start = self.next.fetch_add(BLOCK as u64, Ordering::AcqRel);
+                assert!(start + BLOCK as u64 <= u32::MAX as u64, "an interner of 2^32 values");
+                *claimed = Claimed { next: start as u32, end: start as u32 + BLOCK };
+            }
+            let raw = claimed.next;
+            claimed.next += 1;
+            let (chunk, at) = chunk_of(raw);
+            let slots = self.slots[chunk]
+                // alloc: once per chunk of slots, each twice the last: amortized, never per intern
+                .get_or_init(|| (0..FIRST << chunk).map(|_| Once::new()).collect());
+            if slots[at].set((id, value)).is_err() {
+                unreachable!("index {raw} handed out twice");
+            }
+            let grow = vacancy.fill(probe_hash(&id), raw);
+            shard.len.store(len + 1, Ordering::Relaxed);
+            drop(claimed);
+            // The O(n) copy, with the lock free: others insert into the old table meanwhile
+            // and the publish copies what they logged.
+            if let Some(grow) = grow {
+                let built = grow.build(hash_of);
+                let _claimed = shard.lock.0.lock();
+                built.publish(hash_of);
+            }
+            return Idx::from_raw(raw);
+        }
     }
 
     fn get(&self, idx: Idx<T>) -> &T {
@@ -533,6 +569,9 @@ impl<T: Send + Sync> Interner<T> for Sharded<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Four shards, as for one worker: few, so tests meet on shards and grow them.
+    const SHARDS: Shards = Shards::for_workers(NonZeroUsize::MIN);
 
     /// The tag-then-part each caller (base-db's `input.rs` and `lib.rs`, hir-def's `deps`,
     /// blaze-items' `key.rs`) wrote by hand before [`Hasher::opt_part`].
@@ -661,7 +700,7 @@ mod tests {
 
     #[test]
     fn ids_of_one_tag_are_told_apart_by_their_value() {
-        let interner = Sharded::<u32>::new();
+        let interner = Sharded::<u32>::new(SHARDS);
         let mut ids = Vec::new();
         for n in 0..200u32 {
             let mut bytes = [0; 32];
@@ -681,7 +720,7 @@ mod tests {
 
     #[test]
     fn a_find_in_an_empty_shard_makes_no_table() {
-        let interner = Sharded::<u8>::new();
+        let interner = Sharded::<u8>::new(SHARDS);
         assert_eq!(interner.find(&id(3)), None);
         assert!(interner.shards.iter().all(|shard| shard.index.capacity() == 0));
     }
@@ -716,16 +755,93 @@ mod tests {
     }
 
     #[test]
-    fn shards_are_a_power_of_two_of_at_least_four_per_core() {
+    fn shards_are_a_power_of_two_of_four_per_worker() {
+        for workers in [1, 2, 3, 8, 12, 128] {
+            let count = Shards::for_workers(NonZeroUsize::new(workers).unwrap()).count();
+            assert!(count.is_power_of_two() && count >= 4 * workers, "{workers}: {count}");
+            assert!(count < 8 * workers, "{workers}: {count}");
+        }
+        assert_eq!(Sharded::<u8>::new(SHARDS).shards.len(), SHARDS.count());
+    }
+
+    /// Every shard on lines of its own, and the lock on a line apart from the index.
+    #[cfg(not(blaze_check))]
+    #[test]
+    fn a_shard_keeps_its_lock_on_its_own_line() {
+        let line = if cfg!(all(target_arch = "aarch64", target_vendor = "apple")) { 128 } else { 64 };
+        assert_eq!(align_of::<Shard>(), line);
+        assert_eq!(size_of::<Shard>() % line, 0);
+        assert_eq!(size_of::<Line<Spin<Claimed>>>(), line);
+        assert_eq!(std::mem::offset_of!(Shard, len), line);
+    }
+
+    /// Real threads, 8 and as many as the machine has, interning overlapping keys into few
+    /// shards, so shards grow while others claim in them: every key gets exactly one index,
+    /// exactly one value per key is kept and every other one made is dropped, and `len` counts
+    /// the keys.
+    #[cfg(not(blaze_check))]
+    #[test]
+    fn threads_claim_each_key_exactly_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+
+        /// A value that counts its drops.
+        struct Made<'a> {
+            key: u64,
+            dropped: &'a AtomicUsize,
+        }
+
+        impl Drop for Made<'_> {
+            fn drop(&mut self) {
+                self.dropped.fetch_add(1, Relaxed);
+            }
+        }
+
+        const KEYS: u64 = if cfg!(miri) { 300 } else { 30_000 };
         let cores = std::thread::available_parallelism().map_or(1, |it| it.get());
-        let count = shard_count();
-        assert!(count.is_power_of_two() && count >= 4 && count >= 4 * cores, "{count}");
-        assert_eq!(Sharded::<u8>::new().shards.len(), count);
+        let counts = if cfg!(miri) { [2, 3] } else { [8, cores] };
+        for threads in counts {
+            let (made, dropped) = (AtomicUsize::new(0), AtomicUsize::new(0));
+            let interner = Sharded::<Made<'_>>::new(SHARDS);
+            let seen: Vec<Vec<(u64, Idx<Made<'_>>)>> = std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..threads as u64)
+                    .map(|worker| {
+                        let (interner, made, dropped) = (&interner, &made, &dropped);
+                        scope.spawn(move || {
+                            (0..KEYS)
+                                .map(|n| (n * 7 + worker * 4_099) % KEYS)
+                                .map(|key| {
+                                    let idx = interner.intern(id(key), || {
+                                        made.fetch_add(1, Relaxed);
+                                        Made { key, dropped }
+                                    });
+                                    (key, idx)
+                                })
+                                .collect()
+                        })
+                    })
+                    .collect();
+                workers.into_iter().map(|it| it.join().unwrap()).collect()
+            });
+            assert_eq!(interner.len(), KEYS as usize, "{threads} threads: keys claimed");
+            let mut raws: Vec<u32> =
+                (0..KEYS).map(|key| interner.find(&id(key)).unwrap().raw()).collect();
+            raws.sort_unstable();
+            raws.dedup();
+            assert_eq!(raws.len(), KEYS as usize, "{threads} threads: one index per key");
+            for (key, idx) in seen.iter().flatten() {
+                assert_eq!(interner.find(&id(*key)), Some(*idx), "{threads} threads: key {key}");
+                assert_eq!(interner.get(*idx).key, *key);
+            }
+            let (made, lost) = (made.load(Relaxed), dropped.load(Relaxed));
+            assert_eq!(made - lost, KEYS as usize, "{threads} threads: one value kept per key");
+            drop(interner);
+            assert_eq!(dropped.load(Relaxed), made, "{threads} threads: every value dropped");
+        }
     }
 
     #[test]
     fn a_value_may_intern_into_its_own_interner() {
-        let interner = Sharded::<u64>::new();
+        let interner = Sharded::<u64>::new(SHARDS);
         let outer = interner.intern(id(1), || *interner.get(interner.intern(id(2), || 2)) + 1);
         assert_eq!(*interner.get(outer), 3);
         assert_eq!(interner.find(&id(2)).map(|it| *interner.get(it)), Some(2));
@@ -735,7 +851,7 @@ mod tests {
     #[cfg(not(blaze_check))]
     #[test]
     fn indices_are_dense_but_for_each_shards_last_block() {
-        let interner = Sharded::<u64>::new();
+        let interner = Sharded::<u64>::new(SHARDS);
         for n in 0..30_000 {
             interner.intern(id(n), || n);
         }
@@ -774,7 +890,7 @@ mod tests {
     #[cfg(not(blaze_check))]
     #[test]
     fn an_interner_maps_both_ways() {
-        let interner = Sharded::<u64>::new();
+        let interner = Sharded::<u64>::new(SHARDS);
         let indices: Vec<_> = (0..20_000).map(|n| interner.intern(id(n), || n)).collect();
         assert_eq!(interner.len(), 20_000);
         for (n, &idx) in indices.iter().enumerate() {
@@ -791,7 +907,7 @@ mod tests {
     #[cfg(not(blaze_check))]
     #[test]
     fn values_never_move() {
-        let interner = Sharded::<String>::new();
+        let interner = Sharded::<String>::new(SHARDS);
         let first = interner.intern(id(0), || "zero".to_owned());
         let at = interner.get(first) as *const String;
         for n in 1..50_000 {
@@ -803,7 +919,7 @@ mod tests {
     #[cfg(not(blaze_check))]
     #[test]
     fn threads_intern_one_index_per_value() {
-        let interner = Sharded::<u64>::new();
+        let interner = Sharded::<u64>::new(SHARDS);
         let seen: Vec<Vec<Idx<u64>>> = std::thread::scope(|scope| {
             let workers: Vec<_> = (0..8u64)
                 .map(|worker| {
@@ -853,6 +969,9 @@ mod model {
     };
 
     use super::*;
+
+    /// Four shards: keys of shards 0 and 1 fall in two.
+    const SHARDS: Shards = Shards::for_workers(NonZeroUsize::MIN);
 
     /// An ID in shard `shard` (bits 0..32) whose probe starts from `tag` (bits 64..96; bits
     /// 96..128 are 0, so every key has one SwissTable tag), told apart by `key`.
@@ -918,7 +1037,7 @@ mod model {
             let ids =
                 keys.into_iter().zip(0..).map(|((shard, tag), key)| id(shard, tag, key)).collect();
             Arc::new(Model {
-                interner: Sharded::new(),
+                interner: Sharded::new(SHARDS),
                 ids,
                 made: Spin::new("ids.test.made", Vec::new()),
                 history: History::new(),
@@ -1027,30 +1146,31 @@ mod model {
         });
     }
 
-    /// Six keys fill a shard's first index table (eight slots) to three quarters, so whichever
-    /// of 6 and 7 goes in first grows it, while the other thread finds a key from before the
-    /// growth and races the insert.
+    /// Nine keys fill a shard's second index table (two groups of six) to three quarters, so
+    /// whichever of 9 and 10 goes in first starts its growth and builds the next table after
+    /// unlocking, while the other thread finds a key from before the growth and inserts the
+    /// other key before, during or after the build: the swap under the lock keeps it.
     #[test]
     fn model_growth_keeps_every_index() {
         blaze_check::model(|| {
-            let model = Model::new((0..8).map(|tag| (0, tag)));
+            let model = Model::new((0..11).map(|tag| (0, tag)));
             let before: Vec<Option<Idx<Counted>>> =
-                (0..6).map(|key| model.run(Op::Intern(key))).collect();
+                (0..9).map(|key| model.run(Op::Intern(key))).collect();
             let other = {
                 let model = model.clone();
-                thread::spawn(move || [Op::Intern(6), Op::Intern(7)].map(|op| model.run(op)))
+                thread::spawn(move || [Op::Intern(9), Op::Intern(10)].map(|op| model.run(op)))
             };
             let zero = model.run(Op::Find(0));
-            let seven = model.run(Op::Intern(7));
-            let six = model.run(Op::Find(6));
-            let [six_at, seven_at] = other.join().unwrap();
+            let ten = model.run(Op::Intern(10));
+            let nine = model.run(Op::Find(9));
+            let [nine_at, ten_at] = other.join().unwrap();
             assert_eq!(zero, before[0], "a key from before the growth is found at its index");
-            assert_eq!(seven, seven_at, "one index for key 7");
-            if six.is_some() {
-                assert_eq!(six, six_at, "key 6 found at its index");
+            assert_eq!(ten, ten_at, "one index for key 10");
+            if nine.is_some() {
+                assert_eq!(nine, nine_at, "key 9 found at its index");
             }
             let all: Vec<Option<Idx<Counted>>> =
-                before.iter().copied().chain([six_at, seven_at]).collect();
+                before.iter().copied().chain([nine_at, ten_at]).collect();
             for (key, &idx) in all.iter().enumerate() {
                 assert_eq!(
                     model.interner.find(&model.ids[key]),
@@ -1058,7 +1178,7 @@ mod model {
                     "key {key} kept across the growth"
                 );
             }
-            assert_eq!(model.interner.len(), 8);
+            assert_eq!(model.interner.len(), 11);
             Model::finish(model);
         });
     }

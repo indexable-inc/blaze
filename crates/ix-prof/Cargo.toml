@@ -19,15 +19,15 @@ doctest = false
 default = ["sampler", "layer"]
 # The CPU sampler thread (perf_event_open on Linux, thread_suspend on arm64 macOS).
 sampler = []
-# `ix_prof::layer()`, a `tracing_subscriber::Layer`.
-layer = ["dep:tracing-subscriber"]
+# `ix_prof::layer()`, a `blaze_trace::Sink`.
+layer = []
 # `/debug/pprof/*` and `/debug/pprof/live` on a loopback port. Its accept loop waits through
 # blaze-core's one deadline wait (rule deadline-waits).
 http = []
 # `ix_prof::explore`: the WebTransport server https://ix.dev/explore connects to on 127.0.0.1, for
 # any program with an `explore::Source` (the blaze daemon's is blaze-explore's).
 explore = [
-  "dep:base64",
+  "dep:blaze-base64",
   "dep:blaze-http",
   "dep:blaze-sha256",
   "dep:crossbeam-channel",
@@ -35,6 +35,9 @@ explore = [
 ]
 
 [dependencies]
+blaze-own.workspace = true
+# pprof bodies, gunzipped (`pprof`).
+blaze-deflate.workspace = true
 addr2line.workspace = true
 arrow-array.workspace = true
 arrow-ipc.workspace = true
@@ -46,7 +49,6 @@ blaze-core.workspace = true
 # stub, which only the jump table ties to its function (symbols.rs).
 blaze-inproc-rt.workspace = true
 crossbeam-queue.workspace = true
-flate2 = { workspace = true, features = ["rust_backend"] }
 # `endian-reader`: `EndianArcSlice`, the reader the symbolizer keeps DWARF in.
 gimli = { workspace = true, features = ["endian-reader"] }
 object.workspace = true
@@ -56,14 +58,13 @@ rustc-demangle.workspace = true
 # field by field: no JSON map is made in the session core (`explore::session`).
 serde.workspace = true
 serde_json.workspace = true
-tracing.workspace = true
-tracing-subscriber = { workspace = true, optional = true }
+blaze-trace.workspace = true
 # The explorer (feature `explore`): the certificate's hash in the link (base64url, SHA-256), the
 # certificate (rcgen), the request's stop (crossbeam-channel), and the WebTransport server:
 # blaze-http's sans-IO HTTP/3 core and its driver loop, run with the explorer's own sans-IO
 # machine (`explore::serving`) on one blaze-core driver; the jobs' results come back on a
 # crossbeam-queue. No async runtime.
-base64 = { workspace = true, optional = true }
+blaze-base64 = { workspace = true, optional = true }
 blaze-http = { workspace = true, optional = true }
 blaze-sha256 = { workspace = true, optional = true }
 crossbeam-channel = { workspace = true, optional = true }

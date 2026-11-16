@@ -29,11 +29,11 @@ stdx.workspace = true
 blaze-data.workspace = true
 blaze-json.workspace = true
 # The one checked unpacker of a tar stream (`unpack`), and the times cargo's rules give its files.
-tar.workspace = true
+blaze-tar.workspace = true
 filetime.workspace = true
 # SHA-512 only; SHA-256 is blaze-sha256's.
 sha2.workspace = true
-tracing.workspace = true
+blaze-trace.workspace = true
 # A tree's paths compared as a case- and normalization-insensitive disk (APFS) compares them.
 unicode-normalization.workspace = true
 

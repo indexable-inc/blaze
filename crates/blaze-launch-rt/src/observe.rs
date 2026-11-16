@@ -176,10 +176,17 @@ mod a64 {
     }
     /// `udf #0`: the padding after a stub's last branch, which nothing reaches.
     pub(super) const UDF: u32 = 0;
+    /// `mrs x<rt>, <sysreg>`: `sysreg` is the instruction with Rt = 0 ([`TPIDRRO_EL0`],
+    /// [`TPIDR_EL0`]), so the register is never left out of the word.
+    pub(super) const fn mrs(rt: u32, sysreg: u32) -> u32 {
+        sysreg | rt
+    }
+    /// `mrs x0, TPIDRRO_EL0` (op0 3, op1 3, CRn 13, CRm 0, op2 3): Rt is or-ed in by [`mrs`].
     #[cfg_attr(target_os = "linux", allow(dead_code, reason = "macOS's thread register"))]
-    pub(super) const TPIDRRO_EL0: u32 = 0xd53b_d060; // mrs x16, TPIDRRO_EL0
+    pub(super) const TPIDRRO_EL0: u32 = 0xd53b_d060;
+    /// `mrs x0, TPIDR_EL0` (op2 2): Rt is or-ed in by [`mrs`].
     #[cfg_attr(target_os = "macos", allow(dead_code, reason = "Linux's thread register"))]
-    pub(super) const TPIDR_EL0: u32 = 0xd53b_d040; // mrs x16, TPIDR_EL0
+    pub(super) const TPIDR_EL0: u32 = 0xd53b_d040;
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -247,9 +254,9 @@ pub fn mark(at: u64, tp_off: u32, slot: u32, body: u64) -> Result<[u8; MARK_STUB
     use a64::*;
 
     #[cfg(target_os = "macos")]
-    let mrs = TPIDRRO_EL0;
+    let tp = mrs(16, TPIDRRO_EL0);
     #[cfg(target_os = "linux")]
-    let mrs = TPIDR_EL0;
+    let tp = mrs(16, TPIDR_EL0);
     if tp_off % 8 != 0 || tp_off >= 1 << 15 {
         return Err(OutOfReach { what: "a mark stub's thread-pointer offset", from: at, to: u64::from(tp_off) });
     }
@@ -258,7 +265,8 @@ pub fn mark(at: u64, tp_off: u32, slot: u32, body: u64) -> Result<[u8; MARK_STUB
     }
     // Offsets (body `.quad` at 40):
     //  0 mrs  x16, tp
-    //  4 and  x16, x16, #~7        ; macOS keeps the CPU number in the low bits; harmless on Linux
+    //  4 and  x16, x16, #~7        ; older macOS kept the CPU number in the low bits; harmless
+    //                              ; where it is clean (macOS 27: the TSD base, measured 2026-11-15)
     //  8 ldr  x16, [x16, #tp_off]  ; this thread's bitmap base
     // 12 add  x16, x16, #slot_lo
     // 16 add  x16, x16, #slot_hi, lsl 12
@@ -269,7 +277,7 @@ pub fn mark(at: u64, tp_off: u32, slot: u32, body: u64) -> Result<[u8; MARK_STUB
     // 36 udf  #0
     // 40 .quad body
     let code: [u32; 10] = [
-        mrs,
+        tp,
         and_not7(16, 16),
         ldr_x(16, 16, tp_off),
         add_imm(16, 16, slot & 0xfff, false),
@@ -431,14 +439,14 @@ mod tests {
     fn a_mark_stub_encodes_to_known_bytes() {
         let bytes = mark(0x1000, 8, 0x12_3456, 0x1234_5678_0000_0010).expect("in reach");
         #[cfg(target_os = "macos")]
-        assert_eq!(word(&bytes, 0), 0xd53b_d060, "mrs x16, TPIDRRO_EL0");
+        assert_eq!(word(&bytes, 0), 0xd53b_d070, "mrs x16, TPIDRRO_EL0");
         #[cfg(target_os = "linux")]
-        assert_eq!(word(&bytes, 0), 0xd53b_d040, "mrs x16, TPIDR_EL0");
+        assert_eq!(word(&bytes, 0), 0xd53b_d050, "mrs x16, TPIDR_EL0");
         let expect: [(usize, u32, &str); 9] = [
             (4, 0x927d_f210, "and x16, x16, #~7"),
             (8, 0xf940_0610, "ldr x16, [x16, #8]"),
-            (12, 0x9100_0000 | (0x456 << 10) | (16 << 5) | 16, "add x16, x16, #0x456"),
-            (16, 0x9140_0000 | (0x123 << 10) | (16 << 5) | 16, "add x16, x16, #0x123, lsl 12"),
+            (12, 0x9111_5a10, "add x16, x16, #0x456"),
+            (16, 0x9144_8e10, "add x16, x16, #0x123, lsl 12"),
             (20, 0x5280_0031, "movz w17, #1"),
             (24, 0x3900_0211, "strb w17, [x16]"),
             (28, 0x5800_0070, "ldr x16, .+12"),
@@ -575,7 +583,7 @@ mod tests {
 
             // hook_entry is in the test binary, maybe beyond ±128 MiB: through a veneer.
             let veneer_at = 128u64;
-            code.write(veneer_at as usize, &veneer(hook_entry as usize as u64)).expect("veneer written");
+            code.write(veneer_at as usize, &veneer(hook_entry as *const () as usize as u64)).expect("veneer written");
             let hook_at = 192u64;
             let stub = hook_stub(base + hook_at, base + veneer_at, body).expect("in reach");
             code.write(hook_at as usize, &stub).expect("hook stub written");
@@ -591,13 +599,50 @@ mod tests {
             }
         }
 
-        /// Every stub's address.
-        fn stubs(&self) -> impl Iterator<Item = (Kind, u64)> {
-            #[cfg(target_os = "macos")]
-            let stubs = [(Kind::Count, self.count), (Kind::Mark, self.mark), (Kind::Hook, self.hook)];
-            #[cfg(not(target_os = "macos"))]
-            let stubs = [(Kind::Count, self.count), (Kind::Hook, self.hook)];
-            stubs.into_iter()
+        /// The address of the stub of `kind`, after checking the instructions it runs as
+        /// written in the run view against words hand-assembled (clang's assembler,
+        /// 2026-11-15), so a wrong encoding fails here instead of jumping wild.
+        fn stub(&self, kind: Kind) -> u64 {
+            let read = |at: u64, n: usize| -> [u32; 10] {
+                let mut words = [0u32; 10];
+                for (i, word) in words.iter_mut().take(n).enumerate() {
+                    // SAFETY: inside the run view, live with `code`, written by `Rig::new`.
+                    *word = unsafe { ((at as usize + 4 * i) as *const u32).read() };
+                }
+                words
+            };
+            match kind {
+                Kind::Count => {
+                    let words = read(self.count + 16, 10);
+                    let hand = [
+                        0xb940_0211, 0x3400_00b1, 0x5100_0631, 0xb900_0211, 0x5800_00d0, 0xd61f_0200, 0x5280_0031,
+                        0xb900_0a11, 0x5800_0050, 0xd61f_0200,
+                    ];
+                    assert_eq!(words, hand, "the count stub as it will run");
+                    self.count
+                }
+                #[cfg(target_os = "macos")]
+                Kind::Mark => {
+                    let words = read(self.mark, 10);
+                    // Word 2 is `ldr x16, [x16, #8 * key]`; MARKED is 5, so word 4 adds 0 << 12.
+                    let ldr = 0xf940_0210 | (u32::try_from(self.key).expect("a key") << 10);
+                    let hand = [
+                        0xd53b_d070, 0x927d_f210, ldr, 0x9100_1610, 0x9140_0210, 0x5280_0031, 0x3900_0211,
+                        0x5800_0070, 0xd61f_0200, 0,
+                    ];
+                    assert_eq!(words, hand, "the mark stub as it will run");
+                    self.mark
+                }
+                #[cfg(not(target_os = "macos"))]
+                Kind::Mark => panic!("the mark stub runs only on macOS here"),
+                Kind::Hook => {
+                    let words = read(self.hook, 1);
+                    assert_eq!(words[0], 0x1000_0010, "adr x16, .");
+                    let veneer = read(self.hook - 64, 2);
+                    assert_eq!(&veneer[..2], &[0x5800_0051, 0xd61f_0220], "the veneer as it will run");
+                    self.hook
+                }
+            }
         }
 
         fn counter(&self) -> Counter {
@@ -624,9 +669,11 @@ mod tests {
     /// call still reaches the body.
     #[test]
     fn a_count_stub_counts_down_and_queues_and_reaches_the_body() {
-        let rig = Rig::new(sixteen as usize as u64);
-        // SAFETY: the count stub forwards every argument register to `sixteen` unchanged.
-        let call: Sixteen = unsafe { core::mem::transmute::<usize, Sixteen>(rig.count as usize) };
+        let rig = Rig::new(sixteen as *const () as usize as u64);
+        let at = rig.stub(Kind::Count);
+        // SAFETY: the count stub, checked by `Rig::stub`, forwards every argument register to
+        // `sixteen` unchanged.
+        let call: Sixteen = unsafe { core::mem::transmute::<usize, Sixteen>(at as usize) };
         for n in 1..=5u32 {
             assert_eq!(call(1, 2, 3, 4, 5, 6, 7, 8, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0), sixteen(1, 2, 3, 4, 5, 6, 7, 8, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0));
             let seen = rig.counter();
@@ -635,11 +682,11 @@ mod tests {
         }
     }
 
-    /// Through each stub kind, sixteen argument registers reach the body as a direct call
-    /// passes them, and each stub wrote what it is for.
-    #[test]
-    fn every_stub_passes_eight_integer_and_eight_float_arguments() {
-        let rig = Rig::new(sixteen as usize as u64);
+    /// Through the stub of `kind`, sixteen argument registers reach the body as a direct call
+    /// passes them; returns the rig to check what the stub wrote.
+    fn sixteen_through(kind: Kind) -> Rig {
+        let rig = Rig::new(sixteen as *const () as usize as u64);
+        let at = rig.stub(kind);
         let args = (
             0x0101_0101_0101_0101u64,
             0x0202,
@@ -659,48 +706,77 @@ mod tests {
             f64::MAX,
         );
         let direct = sixteen(args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9, args.10, args.11, args.12, args.13, args.14, args.15);
-        let hooked = HOOKED.load(core::sync::atomic::Ordering::Relaxed);
-        for (kind, at) in rig.stubs() {
-            // SAFETY: each stub forwards every argument register to `sixteen` unchanged; the
-            // mapping is live with `rig`.
-            let call: Sixteen = unsafe { core::mem::transmute::<usize, Sixteen>(at as usize) };
-            let through = call(args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9, args.10, args.11, args.12, args.13, args.14, args.15);
-            assert_eq!(through, direct, "through the {kind:?} stub");
+        // SAFETY: the stub was checked against its hand-assembled words by `Rig::stub`; it
+        // forwards every argument register to `sixteen` unchanged; the mapping is live with
+        // `rig`.
+        let call: Sixteen = unsafe { core::mem::transmute::<usize, Sixteen>(at as usize) };
+        let through = call(args.0, args.1, args.2, args.3, args.4, args.5, args.6, args.7, args.8, args.9, args.10, args.11, args.12, args.13, args.14, args.15);
+        assert_eq!(through, direct, "through the {kind:?} stub");
+        rig
+    }
+
+    /// Through the stub of `kind`, x8 reaches the body unchanged, and a struct returned
+    /// through the x8 address arrives whole.
+    fn x8_through(kind: Kind) {
+        let echo = Rig::new(echo_x8 as *const () as usize as u64);
+        let at = echo.stub(kind);
+        let sent = 0x5a5a_0000_1234_5678u64 ^ at;
+        let got: u64;
+        // SAFETY: the stub was checked by `Rig::stub` and forwards to `echo_x8`, which returns
+        // x8 in x0 and touches nothing else; the C convention's clobbers (x30 among them)
+        // cover what the stub, the veneer and the hook trampoline write.
+        unsafe {
+            core::arch::asm!(
+                "blr {f}",
+                f = in(reg) at,
+                inout("x8") sent => _,
+                lateout("x0") got,
+                clobber_abi("C"),
+            );
         }
+        assert_eq!(got, sent, "x8 through the {kind:?} stub");
+
+        let rig = Rig::new(wide as *const () as usize as u64);
+        let at = rig.stub(kind);
+        let direct = wide(1, 2, 3, 4, 5, 6, 7, 8, 9.5);
+        // SAFETY: checked by `Rig::stub`; forwards every argument register and x8 to `wide`.
+        let call: WideFn = unsafe { core::mem::transmute::<usize, WideFn>(at as usize) };
+        assert_eq!(call(1, 2, 3, 4, 5, 6, 7, 8, 9.5), direct, "a struct by pointer through the {kind:?} stub");
+    }
+
+    #[test]
+    fn the_count_stub_passes_eight_integer_and_eight_float_arguments() {
+        let rig = sixteen_through(Kind::Count);
         assert_eq!(rig.counter().left, 2, "the count stub counted");
-        #[cfg(target_os = "macos")]
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_mark_stub_passes_eight_integer_and_eight_float_arguments() {
+        let rig = sixteen_through(Kind::Mark);
         assert_eq!(rig.marked(), 1, "the mark stub set its byte");
+    }
+
+    #[test]
+    fn the_hook_stub_passes_eight_integer_and_eight_float_arguments() {
+        let hooked = HOOKED.load(core::sync::atomic::Ordering::Relaxed);
+        sixteen_through(Kind::Hook);
         assert!(HOOKED.load(core::sync::atomic::Ordering::Relaxed) > hooked, "the hook ran");
     }
 
-    /// Through each stub kind, x8 reaches the body unchanged, and a struct returned through
-    /// the x8 address arrives whole.
     #[test]
-    fn every_stub_keeps_x8_and_a_struct_returned_by_pointer() {
-        let echo = Rig::new(echo_x8 as usize as u64);
-        for (kind, at) in echo.stubs() {
-            let sent = 0x5a5a_0000_1234_5678u64 ^ at;
-            let got: u64;
-            // SAFETY: the stub forwards to `echo_x8`, which returns x8 in x0 and touches
-            // nothing else; the C convention's clobbers cover what the stub and veneer write.
-            unsafe {
-                core::arch::asm!(
-                    "blr {f}",
-                    f = in(reg) at,
-                    inout("x8") sent => _,
-                    lateout("x0") got,
-                    clobber_abi("C"),
-                );
-            }
-            assert_eq!(got, sent, "x8 through the {kind:?} stub");
-        }
+    fn the_count_stub_keeps_x8_and_a_struct_returned_by_pointer() {
+        x8_through(Kind::Count);
+    }
 
-        let rig = Rig::new(wide as usize as u64);
-        let direct = wide(1, 2, 3, 4, 5, 6, 7, 8, 9.5);
-        for (kind, at) in rig.stubs() {
-            // SAFETY: each stub forwards every argument register and x8 to `wide` unchanged.
-            let call: WideFn = unsafe { core::mem::transmute::<usize, WideFn>(at as usize) };
-            assert_eq!(call(1, 2, 3, 4, 5, 6, 7, 8, 9.5), direct, "a struct by pointer through the {kind:?} stub");
-        }
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_mark_stub_keeps_x8_and_a_struct_returned_by_pointer() {
+        x8_through(Kind::Mark);
+    }
+
+    #[test]
+    fn the_hook_stub_keeps_x8_and_a_struct_returned_by_pointer() {
+        x8_through(Kind::Hook);
     }
 }

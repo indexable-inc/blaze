@@ -218,8 +218,8 @@ impl blaze_trace::field::Visit for Functions<'_> {
     fn record_debug(&mut self, _: &blaze_trace::field::Field, _: &dyn std::fmt::Debug) {}
 }
 
-impl blaze_trace::Subscriber for &'static Named {
-    fn enabled(&self, _: &blaze_trace::Metadata<'_>) -> bool {
+impl blaze_trace::Sink for Named {
+    fn enabled(&self, _: &'static blaze_trace::Metadata<'static>) -> bool {
         true
     }
 
@@ -231,7 +231,6 @@ impl blaze_trace::Subscriber for &'static Named {
         values.record(&mut Functions(&self.functions));
     }
 
-    fn record_follows_from(&self, _: &blaze_trace::span::Id, _: &blaze_trace::span::Id) {}
     fn event(&self, _: &blaze_trace::Event<'_>) {}
     fn enter(&self, _: &blaze_trace::span::Id) {}
     fn exit(&self, _: &blaze_trace::span::Id) {}
@@ -262,7 +261,7 @@ fn naming_a_span_reads_nothing_into_its_query() {
     let named: &'static Named = Box::leak(Box::default());
     for def in local_bodies(db) {
         let plain = reads_beside_a_named_span(db, def, false).clone();
-        let traced = blaze_trace::subscriber::with_default(named, || {
+        let traced = blaze_trace::with_thread_sink(named, || {
             reads_beside_a_named_span(db, def, true).clone()
         });
         assert_eq!(plain, traced, "naming {def:?}'s span changed what its query read");

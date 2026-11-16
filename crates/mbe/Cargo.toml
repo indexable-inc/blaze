@@ -17,7 +17,7 @@ blaze-hash.workspace = true
 cov-mark.workspace = true
 blaze-own.workspace = true
 rustc_lexer.workspace = true
-bitflags.workspace = true
+blaze-bitflags.workspace = true
 
 # local deps
 blaze-mem.workspace = true

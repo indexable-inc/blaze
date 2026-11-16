@@ -66,6 +66,8 @@ impl Level {
     pub const INFO: Level = Level(3);
     pub const DEBUG: Level = Level(4);
     pub const TRACE: Level = Level(5);
+    /// Below every level: what a sink that keeps nothing says ([`Sink::max_level`]).
+    pub const NONE: Level = Level(0);
 
     /// The most verbose level a site is compiled at: `TRACE` with debug assertions, `DEBUG`
     /// without (what `tracing`'s `release_max_level_debug` was).
@@ -84,7 +86,8 @@ impl Level {
             2 => "WARN",
             3 => "INFO",
             4 => "DEBUG",
-            _ => "TRACE",
+            5 => "TRACE",
+            _ => "NONE",
         }
     }
 }
@@ -509,6 +512,12 @@ impl<'a> Record<'a> {
 /// Called on the thread the span or event happens on; a span's [`Sink::try_close`] on the
 /// thread its last handle drops on.
 pub trait Sink: Sync {
+    /// The most verbose level it keeps anything of: installing it raises the process's group
+    /// flag ([`wanted`]) to it, so a site above every sink's level costs one relaxed load.
+    fn max_level(&self) -> Level {
+        Level::TRACE
+    }
+
     /// Whether it keeps `meta`'s spans or events: asked at every site reached, before any field
     /// is evaluated.
     fn enabled(&self, meta: &'static Metadata<'static>) -> bool;
@@ -544,6 +553,10 @@ pub trait Sink: Sync {
 pub struct Off;
 
 impl Sink for Off {
+    fn max_level(&self) -> Level {
+        Level::NONE
+    }
+
     fn enabled(&self, _: &'static Metadata<'static>) -> bool {
         false
     }
@@ -580,6 +593,22 @@ const EMPTY: u8 = 0;
 const WRITING: u8 = 1;
 const READY: u8 = 2;
 
+/// The group flag: the most verbose level any sink installed in this process keeps (0 while
+/// none is). Raised as a sink is installed and never lowered, so it only says "maybe": a site
+/// more verbose than it stops at one relaxed load, before the thread's sink is read.
+static MOST: AtomicU8 = AtomicU8::new(0);
+
+fn raise(sink: &dyn Sink) {
+    MOST.fetch_max(sink.max_level().0, Ordering::Relaxed);
+}
+
+/// Whether any sink of the process may keep a site at `level`: the first thing every macro
+/// asks after [`Level::compiled`], one relaxed load of a `static` and a branch.
+#[inline(always)]
+pub fn wanted(level: Level) -> bool {
+    level.0 <= MOST.load(Ordering::Relaxed)
+}
+
 /// The entry's sink was installed already: a process has one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Installed;
@@ -594,6 +623,7 @@ pub fn install(sink: &'static dyn Sink) -> Result<(), Installed> {
     // SAFETY: this call alone moved the state to WRITING, and no reader reads before READY.
     unsafe { *ENTRY.0.get() = Some(sink) };
     ENTRY_STATE.store(READY, Ordering::Release);
+    raise(sink);
     Ok(())
 }
 
@@ -608,6 +638,9 @@ fn entry() -> Option<&'static dyn Sink> {
 
 /// Sets the calling thread's own sink (`None`: the entry's again): the one it had.
 pub fn set_thread(sink: Option<&'static dyn Sink>) -> Option<&'static dyn Sink> {
+    if let Some(sink) = sink {
+        raise(sink);
+    }
     THREAD.replace(sink)
 }
 

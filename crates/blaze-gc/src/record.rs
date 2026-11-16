@@ -12,8 +12,6 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use blaze_serde::{Deserialize, Serialize};
-
 /// The record's file in its directory.
 pub const RECORD: &str = ".blaze-record";
 
@@ -25,7 +23,8 @@ pub const FORMAT: u32 = 1;
 /// writes it once.
 pub const TOUCH_EVERY_NS: u64 = 60_000_000_000;
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+/// Its JSON form is `crate::wire`'s.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Record {
     pub format: u32,
     /// The workspace root the dir is the build dir of, absolute; none for a standard library's
@@ -36,18 +35,17 @@ pub struct Record {
     /// Each directory in it a build used (a profile's, `debug`, or a target's, `<triple>`), by
     /// name, with when: a build that writes nothing still counts as a use of it. Sorted by name.
     /// Absent in a record written before it was: none.
-    #[serde(default)]
     pub profiles: Vec<(String, u64)>,
 }
 
 pub fn encode(record: &Record) -> Vec<u8> {
     // A record is a struct of a number, an optional string and a number: serializing it fails
     // for no input.
-    serde_json::to_vec_pretty(record).expect("a record serializes")
+    crate::wire::pretty(record)
 }
 
 pub fn decode(bytes: &[u8]) -> Result<Record, String> {
-    let record: Record = serde_json::from_slice(bytes)
+    let record: Record = crate::wire::read(bytes)
         .map_err(|error| format!("it does not read as a record: {error}"))?;
     if record.format != FORMAT {
         return Err(format!(

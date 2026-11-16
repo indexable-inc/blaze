@@ -1172,7 +1172,6 @@ pub(super) fn assert_body_round_trip(map: &BodySourceMap) {
 mod tests {
     use blaze_format::Aligned;
     use hir_expand::name::Name;
-    use smallvec::SmallVec;
 
     use super::{
         super::tests::{bodies, offset_in, with_word},
@@ -1260,7 +1259,7 @@ mod tests {
     /// macro file and the file again, bindings with several patterns and with none.
     fn by_hand() -> ExpressionStoreSourceMap {
         let mut builder = ExpressionStoreBuilder::new();
-        builder.inference_roots = Some(SmallVec::new());
+        builder.inference_roots = Some(Vec::new());
         let exprs: Vec<ExprId> = (0..6).map(|_| builder.alloc_expr(Expr::Missing)).collect();
         let pats: Vec<PatId> = (0..4).map(|_| builder.alloc_pat(Pat::Wild)).collect();
         let labels: Vec<LabelId> =

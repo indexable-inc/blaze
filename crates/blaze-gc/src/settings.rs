@@ -12,9 +12,9 @@
 //! daemon's start and `blaze cache gc`, naming it and the field; there is no default taken in
 //! its place.
 
-use std::path::Path;
+use std::{alloc::Global, path::Path};
 
-use blaze_serde::Deserialize;
+use blaze_data::{Cursor, FromValue, ShapeError};
 
 use crate::pace::Levels;
 
@@ -23,31 +23,49 @@ pub const SETTINGS: &str = "gc.json";
 
 const GIB: u64 = 1 << 30;
 
-#[derive(Deserialize, Default, Debug)]
-#[serde(deny_unknown_fields)]
+/// Every field optional; unknown fields refused.
+#[derive(Default, Debug)]
 struct Settings {
-    #[serde(default)]
     comfortable_percent: Option<u8>,
-    #[serde(default)]
     comfortable_gib: Option<u64>,
-    #[serde(default)]
     floor_percent: Option<u8>,
-    #[serde(default)]
     floor_gib: Option<u64>,
-    #[serde(default)]
     share_percent: Option<u8>,
     /// The absolute budget, in GiB, or (`budget_mib`, for a small disk or a test) in MiB;
     /// only one of the two.
-    #[serde(default)]
     budget_gib: Option<u64>,
-    #[serde(default)]
     budget_mib: Option<u64>,
     /// How long a pack of the daemon's store goes unused before records are forgotten out
     /// of it, in seconds (an hour unless set).
-    #[serde(default)]
     store_grace_s: Option<u64>,
-    #[serde(default)]
     auto: Option<bool>,
+}
+
+impl FromValue<Global> for Settings {
+    fn from_value(c: &Cursor<'_, '_, Global>) -> Result<Settings, ShapeError<Global>> {
+        c.deny_unknown(&[
+            "comfortable_percent",
+            "comfortable_gib",
+            "floor_percent",
+            "floor_gib",
+            "share_percent",
+            "budget_gib",
+            "budget_mib",
+            "store_grace_s",
+            "auto",
+        ])?;
+        Ok(Settings {
+            comfortable_percent: c.opt("comfortable_percent")?,
+            comfortable_gib: c.opt("comfortable_gib")?,
+            floor_percent: c.opt("floor_percent")?,
+            floor_gib: c.opt("floor_gib")?,
+            share_percent: c.opt("share_percent")?,
+            budget_gib: c.opt("budget_gib")?,
+            budget_mib: c.opt("budget_mib")?,
+            store_grace_s: c.opt("store_grace_s")?,
+            auto: c.opt("auto")?,
+        })
+    }
 }
 
 /// What `gc.json` sets.
@@ -71,7 +89,7 @@ impl GcSettings {
             }
             Err(error) => return Err(format!("reading {}: {error}", path.display())),
         };
-        let set: Settings = serde_json::from_slice(&bytes)
+        let set: Settings = crate::wire::read(&bytes)
             .map_err(|error| format!("{}: {error}", path.display()))?;
         // A free level of 100% or more is never met, so every run would be urgent; a share of
         // 0% would ask to free everything blaze holds (review C14).

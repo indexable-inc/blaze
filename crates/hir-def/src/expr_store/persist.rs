@@ -41,7 +41,6 @@ use hir_expand::{
 use intern::Symbol;
 use la_arena::{Arena, Idx, RawIdx};
 use rustc_abi::ExternAbi;
-use smallvec::SmallVec;
 use span::Edition;
 use std::alloc::Global;
 
@@ -1556,7 +1555,7 @@ impl<'a> ExpressionStoreRef<'a> {
                         pats_end: idx(root.pats_end),
                         bindings_end: idx(root.bindings_end),
                     })
-                    .collect::<SmallVec<_>>(),
+                    .collect::<Vec<_>>(),
             })),
         };
         let type_hygiene = (self.root.flags & HAS_TYPE_HYGIENE != 0).then(|| {

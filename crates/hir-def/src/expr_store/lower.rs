@@ -23,7 +23,6 @@ use hir_expand::{
 };
 use intern::{Symbol, sym};
 use rustc_abi::ExternAbi;
-use smallvec::SmallVec;
 use span::{AstIdMap, RealSpanMap, SyntaxContext};
 use std::alloc::Global;
 use syntax::{
@@ -576,7 +575,7 @@ pub(crate) fn lower_function(
                         }
                         param.ty()
                     })
-                    .collect::<SmallVec<[_; 8]>>();
+                    .collect::<Vec<_>>();
                 for p in p {
                     let ty = collector.lower_type_ref_opt(p, impl_trait_lower_fn);
                     collector.store.push_list_type(ty);
@@ -756,7 +755,7 @@ enum PatBoundCtx {
 #[derive(Debug)]
 struct BindingList {
     /// Inline for a pattern with at most one or-pattern level open.
-    ctxs: SmallVec<[(PatBoundCtx, HashMap<(Name, HygieneId), BindingId, Global>); 2]>,
+    ctxs: Vec<(PatBoundCtx, HashMap<(Name, HygieneId), BindingId, Global>)>,
     is_used: HashMap<BindingId, bool, Global>,
     reject_new: bool,
 }
@@ -764,7 +763,7 @@ struct BindingList {
 impl Default for BindingList {
     fn default() -> Self {
         BindingList {
-            ctxs: SmallVec::from_iter([(PatBoundCtx::Product, HashMap::new_in(Global))]),
+            ctxs: vec![(PatBoundCtx::Product, HashMap::new_in(Global))],
             is_used: HashMap::new_in(Global),
             reject_new: false,
         }
@@ -1033,7 +1032,7 @@ impl<'db> ExprCollector<'db> {
             given_blocks: None,
             block_owner: None,
         };
-        result.store.inference_roots = Some(SmallVec::new());
+        result.store.inference_roots = Some(Vec::new());
         result
     }
 
@@ -1327,10 +1326,9 @@ impl<'db> ExprCollector<'db> {
             // parser gave no name left out with its error. A visibility, an attribute or
             // `unsafe` on a field is the parser's error too.
             ast::Type::RecordType(inner) => {
-                // alloc: inline up to 8 fields, a record's names and defaults before they are
-                // pushed
-                let mut names: SmallVec<[Name; 8]> = SmallVec::new();
-                let mut defaults: SmallVec<[u32; 8]> = SmallVec::new();
+                // alloc: a record's names and defaults before they are pushed
+                let mut names: Vec<Name> = Vec::new();
+                let mut defaults: Vec<u32> = Vec::new();
                 let mark = self.store.list_mark();
                 let fields = inner.record_field_list().into_iter().flat_map(|it| it.fields());
                 for field in fields {
@@ -1772,8 +1770,8 @@ impl<'db> ExprCollector<'db> {
         let names = params
             .lifetime_params()
             .flat_map(|lp| lp.lifetime().map(|lt| self.binder_lifetime_name(lt)));
-        // alloc: inline up to 4, a binder's lifetimes before they are pushed
-        let names: SmallVec<[Name; 4]> = names.collect();
+        // alloc: a binder's lifetimes before they are pushed
+        let names: Vec<Name> = names.collect();
         self.store.paths_mut().push_names(names)
     }
 
@@ -3263,7 +3261,7 @@ impl<'db> ExprCollector<'db> {
     /// The path of the module being lowered, as `module_path!()` gives it.
     fn module_path(&self) -> Option<String> {
         let mut module = self.module;
-        let mut segments = SmallVec::<[&'static str; 8]>::new();
+        let mut segments = Vec::<&'static str>::new();
         while let Some(parent) = module.containing_module(self.db) {
             if !module.is_block_module(self.db) {
                 segments.push(module.name(self.db)?.symbol().as_str());

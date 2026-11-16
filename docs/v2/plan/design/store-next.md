@@ -109,6 +109,35 @@ as a control.
   - `commit` scans a worker's shared batch the same way. That refusal reaches the caller as
     `StoreError::Other` naming rule 25, because blaze-keyed has no row for it; a typed
     `StoreError::Machine` there is the next step, for blaze-keyed's owner.
+- **(g) Puts on every worker** (parallel.md change 4). `PlainStore` gives each worker a lane:
+  one `Held` batch per namespace, behind a lock that only its worker and the commit take.
+  `Store::put` uses the calling thread's lane; `PlainStore::lane` and `put_in` name lanes
+  explicitly. A put reads the mapped segments (lock-free) and its own lane, and nothing else.
+  Before, every put and every miss took the one writer lock. The only shared step is
+  `commit_lanes`. Under the writer lock it swaps each lane's batches out (the lane's lock is
+  held for the swap only) and lays them out as one segment per namespace. It writes and flips
+  them, publishes the table, and only then lets go of the taken batches.
+  - **Visible when.** A worker sees its own put at once. Every other reader sees it once its
+    commit's flip has landed and the table is published, never before. A miss that races the
+    commit's release asks the table again.
+  - **One flight.** The driver's second asker waits on the first asker's task and takes its
+    result in memory. That wait is on the task, not on the flip: a store read by the second
+    asker before the flip misses, so blaze-drive must hand the value over, never re-read it.
+  - **Equal bytes.** The commit lays payloads and index in key order, whatever the put order or
+    lane (`seal_segment` too: one layout). One key in two lanes with equal bytes is laid once;
+    with other bytes it is `TwoValues` (rule 21). Before, the layout followed put order, so two
+    builders could write other bytes (rule 25).
+  - **Crash.** A lane is memory only: puts not committed die with the process, and none was
+    promised. A commit cut before its flip leaves a segment no generation names: the open's
+    orphan pass reports and removes it. A commit cut after its flip leaves a named, unsealed
+    segment: the tail the open walks. No per-worker file exists to be half-written.
+  - **Segments at 128 workers.** Still one per namespace per commit, as parallel.md's
+    state-of-the-art row decides: per-worker files would add 128 probes per lookup after a
+    restart. Compaction and the page counts above are unchanged. The cost is one copy of each
+    payload into the layout (the bytes are written then anyway) and one sort of the commit's
+    entries.
+  - Machine needles: the handle copies them at open and refuses at the put. The commit scans
+    again with the writer's list, which `Driven::machine` may have grown.
 
 ## Left, and why
 
@@ -134,11 +163,13 @@ blaze-drive (another lane's crate; nothing there edited):
    boot) or the helper expires. A slice with `rot` carries a loss the profile records. The boot
    id passed as `PlainConfig::boot` is `kern.bootsessionuuid` on macOS and
    `/proc/sys/kernel/random/boot_id` on Linux, hashed to 64 bits.
-3. At open: `Driven::machine(&[checkout, home])` in each spelling the command knows, before any put
+3. Puts from the workers through `PlainStore` (each thread its lane); `commit` once per batch.
+   A one-flight waiter takes the first asker's value in memory, never by a store read.
+4. At open: `Driven::machine(&[checkout, home])` in each spelling the command knows, before any put
    to a shared namespace.
-4. The certificate: `locate` and one `pread` (`Driven::get_into`), not `get` (which faults the
+5. The certificate: `locate` and one `pread` (`Driven::get_into`), not `get` (which faults the
    payload's pages on first touch).
-5. Read `report().sealed` and `report().checked` into the profile: segments proved by row and
+6. Read `report().sealed` and `report().checked` into the profile: segments proved by row and
    checked whole this open.
 
 blaze-solo: pass `Config::lanes` as the number of file threads the native driver was made with
@@ -172,6 +203,16 @@ blaze-run's `Parent`:
     Boot 3 has every survivor to walk again.
   - Control `the_oracle_catches_a_segment_marked_scrubbed_before_its_walk_ends`
     (`Plant::ScrubMarkedEarly`).
+- `lanes_put_with_no_shared_lock_and_keep_every_flip_s_promise` (property, on `Sim`, durable).
+  - One to eight lanes put their own keys, plus one key all of them put with equal bytes, in an
+    order the seed turns. A reader's lane looks before and after each commit. One power cut
+    lands anywhere in a commit (`Driven::cut_after`), then a new boot.
+  - Oracle: a record whose flip landed reads back after every cut; none is seen by another lane
+    before its flip; each worker sees its own put at once; no segment indexes a key twice.
+  - Control `the_oracle_catches_a_lane_commit_flipped_before_its_bytes_are_durable`
+    (`Plant::FlipBeforeSync`).
+- `two_builders_on_other_lanes_write_equal_segments`: one lane against five, in reversed order,
+  give equal bytes.
 - `a_lookup_reads_only_the_pages_its_probes_land_on`: page counts for a run of 200,000, against the
   old lookup as the control. `a_lookup_finds_every_key_of_an_uneven_run` (property): clustered
   prefixes.

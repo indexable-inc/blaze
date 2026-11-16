@@ -36,6 +36,7 @@ mod eval;
 mod program;
 mod rewrite;
 mod scan;
+mod walk;
 
 #[cfg(test)]
 mod tests;

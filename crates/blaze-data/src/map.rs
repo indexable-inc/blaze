@@ -139,6 +139,34 @@ impl<A: Allocator> Map<A> {
         self.entries.get(index).map(|(k, v)| (k.as_str(), v))
     }
 
+    /// The entry at `index` in the sorted view: a walk with its own stack keeps an index, not
+    /// an iterator.
+    pub fn sorted_at(&self, index: usize) -> Option<(&str, &Value<A>)> {
+        let &i = self.order.get(index)?;
+        let (k, v) = &self.entries[i];
+        Some((k.as_str(), v))
+    }
+
+    /// All entries taken out, leaving this map empty in the same allocator.
+    pub fn take(&mut self) -> Map<A>
+    where
+        A: Clone,
+    {
+        Map { entries: self.entries.split_off(0), order: self.order.split_off(0) }
+    }
+
+    /// The last entry in insertion order taken out, the sorted index dropped: only for a drop,
+    /// which takes every entry and needs no lookup meanwhile.
+    pub(crate) fn pop_for_drop(&mut self) -> Option<(String<A>, Value<A>)> {
+        self.order.clear();
+        self.entries.pop()
+    }
+
+    /// An entry put back during a drop, not indexed (see `pop_for_drop`).
+    pub(crate) fn push_for_drop(&mut self, entry: (String<A>, Value<A>)) {
+        self.entries.push(entry);
+    }
+
     pub fn copy_in<B: Allocator + Clone>(&self, alloc: B) -> Map<B> {
         let mut entries = Vec::with_capacity_in(self.entries.len(), alloc.clone());
         for (k, v) in self.entries.iter() {

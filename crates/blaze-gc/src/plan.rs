@@ -25,7 +25,6 @@
 use std::{collections::VecDeque, fmt, ops::Range};
 
 use blaze_hash::HashMap;
-use blaze_serde::{Deserialize, Serialize};
 use std::alloc::Global;
 
 use crate::pace::{FULL, Hysteresis, Levels, Pace, Slice, Volume};
@@ -213,7 +212,7 @@ impl Config {
 }
 
 /// What an object is. The driver lists nothing else, so nothing else is ever collected.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Class {
     /// A workspace's build dir, `<home>/build/<workspace id>`: its own files (bytes), less its
     /// profiles, which are objects of their own.
@@ -287,7 +286,7 @@ pub struct Seen {
 }
 
 /// One volume as a run saw it: for `blaze cache gc --dry-run` and status.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct VolumeReport {
     /// The first area on it.
     pub area: String,
@@ -306,7 +305,7 @@ pub struct VolumeReport {
 
 /// A volume still below its floor after an urgent run: what holds the space, so a build that
 /// would fail for want of it says why (docs/gc.md, "Pacing").
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct NoSpace {
     pub area: String,
     pub free_bytes: u64,
@@ -315,7 +314,7 @@ pub struct NoSpace {
     pub kept: Vec<(String, u64, Keep)>,
     /// Areas this collector did not collect, each with who holds it (another daemon,
     /// `blaze cache gc`; [`Collector::skipped`]): what is there was not looked at (review N15).
-    #[serde(default)]
+    /// Absent in a ledger written before it was: none.
     pub skipped: Vec<String>,
 }
 
@@ -402,7 +401,7 @@ pub enum Priority {
 }
 
 /// Why a run started.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Trigger {
     /// A volume's free space is below comfortable, or blaze's bytes near its share ([`Levels`]).
     Pressure,
@@ -462,7 +461,7 @@ pub enum Swept {
 }
 
 /// Why an object goes.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Reason {
     /// A workspace whose checkout is gone.
     CheckoutGone { checkout: String },
@@ -484,7 +483,7 @@ pub enum Reason {
 }
 
 /// Why an object stays.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Keep {
     /// A live head builds this checkout.
     Head { checkout: String },
@@ -520,14 +519,14 @@ pub enum Keep {
 }
 
 /// What became of one object.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Fate {
     Go(Reason),
     Keep(Keep),
 }
 
 /// One object's fate in a run, with why.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Verdict {
     pub path: String,
     pub class: Class,
@@ -536,7 +535,7 @@ pub struct Verdict {
     pub fate: Fate,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Phase {
     Scan,
     Mark,
@@ -546,7 +545,7 @@ pub enum Phase {
     Unlink,
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Stop {
     /// It asked for [`Config::fuel`] renames and unlinks.
     Fuel { fuel: u32 },
@@ -566,7 +565,7 @@ pub enum Stop {
 }
 
 /// How a run ended.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Outcome {
     Done,
     /// In `phase`, for `why`, with `done` of its steps there done and `left` not.
@@ -584,7 +583,7 @@ fn clock_stop(outcome: &Outcome) -> bool {
 }
 
 /// What a run did.
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RunReport {
     pub run: u64,
     pub why: Trigger,
@@ -610,17 +609,14 @@ pub struct RunReport {
     /// What its volumes still needed freed once what was planned went; 0 when free space is
     /// comfortable.
     pub over_budget_bytes: u64,
-    /// The pressure it was paced for, permille.
-    #[serde(default)]
+    /// The pressure it was paced for, permille. This field, `volumes`, `short` and
+    /// `clock_checked` may be missing from an older ledger: their defaults (`crate::wire`).
     pub pressure: u32,
-    #[serde(default)]
     pub volumes: Vec<VolumeReport>,
     /// An urgent run that left a volume below its floor: what holds it.
-    #[serde(default)]
     pub short: Option<NoSpace>,
     /// Its scan came back and the clock check let it through: only such a run vouches for the
     /// clock ([`Collector::restore`]). A ledger from before this field reads as unchecked.
-    #[serde(default)]
     pub clock_checked: bool,
     pub problems: Vec<String>,
     /// Every object's fate, sorted by path. Left empty in the ledger.
@@ -696,8 +692,7 @@ impl RunReport {
                 "{:>10}  {}  {}\n",
                 size_text(verdict.bytes),
                 verdict.path,
-                serde_json::to_string(&verdict.fate)
-                    .unwrap_or_else(|error| format!("(unprintable: {error})"))
+                crate::wire::compact(&verdict.fate)
             ));
         }
         out

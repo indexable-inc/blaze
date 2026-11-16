@@ -14,7 +14,7 @@ doctest = false
 
 [dependencies]
 blaze-core.workspace = true
-tracing.workspace = true
+blaze-trace.workspace = true
 # Think twice before adding anything here
 
 [dev-dependencies]

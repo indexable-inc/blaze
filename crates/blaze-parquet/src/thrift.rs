@@ -129,6 +129,16 @@ impl<'a, A: Allocator> Struct<'a, A> {
         }
     }
 
+    /// A field of a list of `len` structs, each written by `each` alike.
+    pub(crate) fn repeated(&mut self, id: i16, len: usize, mut each: impl FnMut(&mut Struct<'_, A>)) {
+        self.list_head(id, STRUCT, len);
+        for _ in 0..len {
+            let mut inner = Struct { out: &mut *self.out, last: 0 };
+            each(&mut inner);
+            inner.end();
+        }
+    }
+
     pub(crate) fn i32s(&mut self, id: i16, items: impl ExactSizeIterator<Item = i32>) {
         self.list_head(id, I32, items.len());
         for item in items {

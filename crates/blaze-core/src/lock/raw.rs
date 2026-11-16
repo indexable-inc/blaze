@@ -26,7 +26,10 @@
 //! it), so every interleaving of these protocols is explored; `raw/tests.rs` checks each with a
 //! planted bug ([`Plant`]) the model must catch.
 
-#![allow(unsafe_code, reason = "a lock's data is reached through its word: each `unsafe` says what the word orders")]
+#![allow(
+    unsafe_code,
+    reason = "a lock's data is reached through its word: each `unsafe` says what the word orders"
+)]
 
 use std::{
     cell::UnsafeCell,
@@ -35,6 +38,7 @@ use std::{
     time::Duration,
 };
 
+#[cfg(not(blaze_check))]
 use blaze_spin::SpinWait;
 
 use crate::sync::atomic::{AtomicU32, Ordering};
@@ -54,6 +58,10 @@ pub(crate) enum Plant {
     /// A [`RwLock`]'s write release wakes no one when only readers wait: they sleep on.
     #[cfg(test)]
     ReadersUnwoken,
+    /// A [`Cond`] notify wakes without moving the sequence: a waiter that read it and let the
+    /// lock go, but is not yet asleep, sleeps through the notify.
+    #[cfg(test)]
+    SequenceUnmoved,
 }
 
 // --- Word ---------------------------------------------------------------------------------------
@@ -152,6 +160,7 @@ impl Word {
 
 /// Spins while `busy` says the word is held by a thread likely to let go soon, a few doubling
 /// rounds and never a yield: the word as last read.
+#[cfg(not(blaze_check))]
 #[inline]
 fn spin_while(word: &AtomicU32, busy: impl Fn(u32) -> bool) -> u32 {
     let mut spin = SpinWait::new();
@@ -161,6 +170,14 @@ fn spin_while(word: &AtomicU32, busy: impl Fn(u32) -> bool) -> u32 {
             return state;
         }
     }
+}
+
+/// In a model the spin is one look: it only reads, so it changes no outcome, and each of its
+/// rounds would be a schedule point the model explores for nothing.
+#[cfg(blaze_check)]
+fn spin_while(word: &AtomicU32, busy: impl Fn(u32) -> bool) -> u32 {
+    _ = busy;
+    word.load(Ordering::Relaxed)
 }
 
 /// The time left of `within` once `spent` has passed: `None` for no limit.
@@ -229,7 +246,7 @@ impl RawMutex {
         #[cfg(test)]
         let take = match plant {
             Plant::TakeAsUncontended => HELD,
-            Plant::None | Plant::ReadersUnwoken => CONTENDED,
+            Plant::None | Plant::ReadersUnwoken | Plant::SequenceUnmoved => CONTENDED,
         };
         #[cfg(not(test))]
         let take = {
@@ -265,17 +282,17 @@ impl RawMutex {
     }
 }
 
-/// The wall clock of a wait with a limit, read only on a slow path that has one.
-struct Clock(std::time::Instant);
+/// The clock of a wait with a limit, read only on a slow path that has one.
+struct Clock(crate::wait::Monotonic);
 
 impl Clock {
-    #[expect(clippy::disallowed_methods, reason = "a lock's timed wait, on its slow path only")]
     fn start() -> Clock {
-        Clock(std::time::Instant::now())
+        Clock(crate::wait::Monotonic::new())
     }
 
     fn spent(&self) -> Duration {
-        self.0.elapsed()
+        use crate::wait::Clock as _;
+        self.0.now()
     }
 }
 
@@ -822,7 +839,21 @@ impl Cond {
     }
 
     pub(crate) fn notify(&self, all: bool) {
-        self.seq.value.fetch_add(1, Ordering::Relaxed);
+        self.notify_with(all, Plant::None);
+    }
+
+    /// [`Cond::notify`], with a safeguard removed for a model test.
+    pub(crate) fn notify_with(&self, all: bool, plant: Plant) {
+        #[cfg(test)]
+        let moves = plant != Plant::SequenceUnmoved;
+        #[cfg(not(test))]
+        let moves = {
+            _ = plant;
+            true
+        };
+        if moves {
+            self.seq.value.fetch_add(1, Ordering::Relaxed);
+        }
         self.seq.wake(all);
     }
 }

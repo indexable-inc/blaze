@@ -18,6 +18,7 @@ use crate::answers::{self, Last, Page, Root, Row};
 use crate::key::{self, ABSENT, Key, Kind, Name, Tool};
 use crate::profile::Profile;
 use crate::record::{self, Finding, Locate, Part, Stored, Whole, WholeView};
+use crate::table::{Hashed, Set, Table, spread};
 use crate::wire::{NAME_BYTES, Reader, WireError, Writer};
 
 // --- What the caller gives and gets ---------------------------------------------------------
@@ -108,6 +109,12 @@ pub struct FileEntry<'a> {
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct Ticket(pub u64);
+
+impl Hashed for Ticket {
+    fn hash(&self) -> u64 {
+        spread(self.0)
+    }
+}
 
 /// One [`Effect::Run`]: a worker takes it whole and answers it whole.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
@@ -204,6 +211,15 @@ pub enum Class {
     /// after what the program waits on, before speculative work.
     Gate,
     Background,
+}
+
+const CLASSES: usize = 3;
+/// One ready ring per (class, kind).
+const RINGS: usize = CLASSES * crate::key::KINDS;
+
+/// The ring of `class` and `kind`, in run order.
+fn ring(class: Class, kind: Kind) -> usize {
+    class as usize * crate::key::KINDS + kind.index()
 }
 
 /// A record a task is handed: where it is and the digest a read of it records.
@@ -418,6 +434,13 @@ struct Job<A: Allocator> {
     redo: bool,
     entries: u32,
     settles: u32,
+    /// Bumped each time the job is queued or leaves the queue: a ring entry of another
+    /// generation is stale.
+    queue_gen: u32,
+    /// On one wait list since its last advance: an advance registers at most one wait, so the
+    /// lists hold at most one entry per advance (no `contains` scan) and a job is woken by the
+    /// first of its waits to settle, then waits again on the next.
+    parked: bool,
     /// The names its next run is handed, sorted.
     needs: Vec<Name, A>,
     /// The read names its value key is made of.
@@ -500,35 +523,45 @@ pub struct Request<A: Allocator + Clone> {
     root: Option<Root<A>>,
     root_loading: bool,
     root_waiters: Vec<Name, A>,
-    pages: SortedMap<u32, PageState<A>, A>,
-    page_waiters: SortedMap<u32, Vec<Name, A>, A>,
+    pages: Table<u32, PageState<A>, A>,
+    page_waiters: Table<u32, Vec<Name, A>, A>,
     /// Rows this run changed or made.
-    new: SortedMap<Name, Row<A>, A>,
+    new: Table<Name, Row<A>, A>,
     /// What each settled name is now.
-    now: SortedMap<Name, Now, A>,
+    now: Table<Name, Now, A>,
     /// Names a re-made home no longer lists.
-    dropped: SortedSet<Name, A>,
+    dropped: Set<Name, A>,
     /// The locates of the parts of homes loaded or made this run.
-    part_locs: SortedMap<Name, (Locate, u32, Name), A>,
-    /// Readers posted this run: read name to the names that read it.
-    posted: SortedMap<Name, Vec<Name, A>, A>,
+    part_locs: Table<Name, (Locate, u32, Name), A>,
+    /// Readers posted this run: read name to the names that read it (a name settled twice
+    /// posts twice; `dirty_readers` dedups).
+    posted: Table<Name, Vec<Name, A>, A>,
 
-    jobs: SortedMap<Name, Job<A>, A>,
+    jobs: Table<Name, Job<A>, A>,
+    /// Jobs settled: `jobs.len() - settled` is how many are not (no scan).
+    settled: usize,
     wake: VecDeque<Name, A>,
-    gets: SortedMap<Key, Vec<Purpose, A>, A>,
-    tickets: SortedMap<Ticket, (Name, BatchId), A>,
+    gets: Table<Key, Vec<Purpose, A>, A>,
+    tickets: Table<Ticket, (Name, BatchId), A>,
     next_ticket: u64,
-    /// Queued jobs, in run order: the person's first, then by kind (files, scopes, signatures,
-    /// bodies, code), then by home, so a batch is one home's tasks of one kind.
-    ready: SortedSet<(Class, Kind, Name, Name), A>,
-    /// Batches out: at most one per worker.
+    /// Queued jobs, one FIFO ring per (class, kind) in run order: the person's first, then by
+    /// kind (files, scopes, signatures, bodies, code). An entry is (name, the job's queue
+    /// generation); one whose generation is not the job's is stale and skipped, so a job leaves
+    /// the queue in O(1) (`unqueue`).
+    ready: Vec<VecDeque<(Name, u32), A>, A>,
+    /// Live entries per ring and in all.
+    ready_live: [u32; RINGS],
+    queued: usize,
+    /// Stale entries skipped: bounded by queue operations, counted for the linearity test.
+    ready_ops: u64,
+    /// Batches out: at most one per worker, so a sorted set of at most `workers`.
     batches: SortedSet<BatchId, A>,
     next_batch: u64,
     /// The settled table's writes this step, last write per name: flushed as `Publish` and
     /// `Unpublish` at the step's end, after every `Put` of the step.
-    publish: SortedMap<Name, Option<Input>, A>,
+    publish: Table<Name, Option<Input>, A>,
 
-    findings: SortedMap<Name, Held<A>, A>,
+    findings: Table<Name, Held<A>, A>,
     old_findings: SortedMap<Name, Held<A>, A>,
     old_findings_loading: bool,
     units_at: Option<Key>,
@@ -585,23 +618,33 @@ impl<A: Allocator + Clone> Request<A> {
             root: None,
             root_loading: false,
             root_waiters: Vec::new_in(a.clone()),
-            pages: SortedMap::new_in(a.clone()),
-            page_waiters: SortedMap::new_in(a.clone()),
-            new: SortedMap::new_in(a.clone()),
-            now: SortedMap::new_in(a.clone()),
-            dropped: SortedSet::new_in(a.clone()),
-            part_locs: SortedMap::new_in(a.clone()),
-            posted: SortedMap::new_in(a.clone()),
-            jobs: SortedMap::new_in(a.clone()),
+            pages: Table::new_in(a.clone()),
+            page_waiters: Table::new_in(a.clone()),
+            new: Table::new_in(a.clone()),
+            now: Table::new_in(a.clone()),
+            dropped: Set::new_in(a.clone()),
+            part_locs: Table::new_in(a.clone()),
+            posted: Table::new_in(a.clone()),
+            jobs: Table::new_in(a.clone()),
+            settled: 0,
             wake: VecDeque::new_in(a.clone()),
-            gets: SortedMap::new_in(a.clone()),
-            tickets: SortedMap::new_in(a.clone()),
+            gets: Table::new_in(a.clone()),
+            tickets: Table::new_in(a.clone()),
             next_ticket: 0,
-            ready: SortedSet::new_in(a.clone()),
+            ready: {
+                let mut rings = Vec::with_capacity_in(RINGS, a.clone());
+                for _ in 0..RINGS {
+                    rings.push(VecDeque::new_in(a.clone()));
+                }
+                rings
+            },
+            ready_live: [0; RINGS],
+            queued: 0,
+            ready_ops: 0,
             batches: SortedSet::new_in(a.clone()),
             next_batch: 0,
-            publish: SortedMap::new_in(a.clone()),
-            findings: SortedMap::new_in(a.clone()),
+            publish: Table::new_in(a.clone()),
+            findings: Table::new_in(a.clone()),
             old_findings: SortedMap::new_in(a.clone()),
             old_findings_loading: false,
             units_at: None,
@@ -1079,6 +1122,8 @@ impl<A: Allocator + Clone> Request<A> {
                 redo: false,
                 entries: 0,
                 settles: 0,
+                queue_gen: 0,
+                parked: false,
                 needs: Vec::new_in(a.clone()),
                 shape: Vec::new_in(a.clone()),
                 waiters: Vec::new_in(a.clone()),
@@ -1089,8 +1134,14 @@ impl<A: Allocator + Clone> Request<A> {
         Ok(())
     }
 
+    /// Every state change goes here, so the settled count is kept without a scan.
     fn set_state(&mut self, name: Name, state: State) {
         if let Some(job) = self.jobs.get_mut(&name) {
+            match (job.state == State::Settled, state == State::Settled) {
+                (false, true) => self.settled += 1,
+                (true, false) => self.settled -= 1,
+                _ => {}
+            }
             job.state = state;
         }
     }
@@ -1099,10 +1150,24 @@ impl<A: Allocator + Clone> Request<A> {
         self.jobs.get(&name).map(|job| job.state)
     }
 
+    /// Whether `waiter` may register a wait now: once per advance (`Job::parked`). A name with
+    /// no job (the cli's own) always may.
+    fn park(&mut self, waiter: Name) -> bool {
+        match self.jobs.get_mut(&waiter) {
+            Some(job) if job.parked => false,
+            Some(job) => {
+                job.parked = true;
+                true
+            }
+            None => true,
+        }
+    }
+
     fn wait_on(&mut self, target: Name, waiter: Name) {
-        if let Some(job) = self.jobs.get_mut(&target)
-            && !job.waiters.contains(&waiter)
-        {
+        if !self.jobs.contains_key(&target) || !self.park(waiter) {
+            return;
+        }
+        if let Some(job) = self.jobs.get_mut(&target) {
             job.waiters.push(waiter);
         }
     }
@@ -1115,18 +1180,37 @@ impl<A: Allocator + Clone> Request<A> {
         }
     }
 
+    /// The machine's own bookkeeping so far: probes of every table, ring entries skipped, wakes
+    /// and waits (the linearity test's count; parallel.md change 3).
+    pub fn bookkeeping(&self) -> u64 {
+        self.jobs.ops()
+            + self.now.ops()
+            + self.new.ops()
+            + self.dropped.ops()
+            + self.part_locs.ops()
+            + self.posted.ops()
+            + self.gets.ops()
+            + self.tickets.ops()
+            + self.publish.ops()
+            + self.findings.ops()
+            + self.pages.ops()
+            + self.page_waiters.ops()
+            + self.ready_ops
+    }
+
     /// Whether the old table is known for `name`: `Some(row or none)` when it is, `None` when
     /// `waiter` now waits for the root or the page.
     fn old_ready<B: Allocator>(&mut self, name: Name, waiter: Name, out: &mut Vec<Effect<A>, B>) -> bool {
         if self.last.is_none() {
             return true;
         }
-        let Some(root) = &self.root else {
-            if !self.root_waiters.contains(&waiter) {
+        if self.root.is_none() {
+            if self.park(waiter) {
                 self.root_waiters.push(waiter);
             }
             return false;
-        };
+        }
+        let Some(root) = &self.root else { return false };
         let index = answers::page_of(name, root.bits);
         match self.pages.get(&index) {
             Some(PageState::Loaded(_)) => true,
@@ -1151,6 +1235,9 @@ impl<A: Allocator + Clone> Request<A> {
     }
 
     fn page_wait(&mut self, index: u32, waiter: Name) {
+        if !self.park(waiter) {
+            return;
+        }
         match self.page_waiters.get_mut(&index) {
             Some(list) => list.push(waiter),
             None => {
@@ -1222,13 +1309,48 @@ impl<A: Allocator + Clone> Request<A> {
     }
 
     fn quiet(&self) -> bool {
-        self.wake.is_empty() && self.gets.is_empty() && self.tickets.is_empty() && self.ready.is_empty()
+        self.wake.is_empty() && self.gets.is_empty() && self.tickets.is_empty() && self.queued == 0
     }
 
-    /// Queue a job to run, keyed for its batch.
+    /// Queue a job to run: its class's ring of its kind, at the back.
     fn queue(&mut self, class: Class, name: Name) {
-        let home = self.jobs.get(&name).map_or(name, |job| job.home);
-        self.ready.insert((class, name.kind, home, name));
+        self.unqueue(name);
+        let Some(job) = self.jobs.get_mut(&name) else { return };
+        job.queue_gen = job.queue_gen.wrapping_add(1);
+        job.class = class;
+        let r = ring(class, name.kind);
+        self.ready[r].push_back((name, job.queue_gen));
+        self.ready_live[r] += 1;
+        self.queued += 1;
+    }
+
+    /// Take the job out of the queue if it is in it: its entry goes stale, skipped when reached.
+    fn unqueue(&mut self, name: Name) {
+        let Some(job) = self.jobs.get_mut(&name) else { return };
+        // An odd generation is in a ring; even is out.
+        if job.queue_gen & 1 == 0 {
+            return;
+        }
+        job.queue_gen = job.queue_gen.wrapping_add(1);
+        self.ready_live[ring(job.class, name.kind)] -= 1;
+        self.queued -= 1;
+    }
+
+    /// The next live entry of ring `r`, stale ones dropped.
+    fn pop_ready(&mut self, r: usize) -> Option<Name> {
+        while let Some((name, generation)) = self.ready[r].pop_front() {
+            self.ready_ops += 1;
+            let Some(job) = self.jobs.get_mut(&name) else { continue };
+            if job.queue_gen == generation {
+                job.queue_gen = job.queue_gen.wrapping_add(1);
+                self.ready_live[r] -= 1;
+                self.queued -= 1;
+                if job.state == State::Queued {
+                    return Some(name);
+                }
+            }
+        }
+        None
     }
 
     /// This run's mean time of a task of `kind`, or the default before one is measured.
@@ -1241,38 +1363,35 @@ impl<A: Allocator + Clone> Request<A> {
     }
 
     fn unsettled(&self) -> bool {
-        self.jobs.values().any(|job| job.state != State::Settled)
+        self.jobs.len() > self.settled
     }
 
     /// Batches out while workers are free: every foreground task before any background one
-    /// (the ready set sorts the person's first, so a background batch goes only when no
-    /// foreground task is queued). A batch is the next tasks of one class, kind and home, as
+    /// (the rings are in class order, so a background batch goes only when no foreground task
+    /// is queued). A batch is the next tasks of one class and kind in queue order (a home's
+    /// parts are queued together, so mostly one home's), as
     /// many as make [`TARGET_BATCH_NS`] at this run's mean time of the kind, and no more than
     /// an even share of that kind's queue over the free workers, so no worker idles while
     /// another holds a long batch.
     fn emit_ready<B: Allocator>(&mut self, out: &mut Vec<Effect<A>, B>) {
         let workers = self.config.workers.max(1) as usize;
         while self.batches.len() < workers {
-            let Some(&(class, kind, home, _)) = self.ready.iter().next() else { return };
+            // The first ring with a live entry: at most `RINGS` (33) looks, a constant.
+            let Some(r) = (0..RINGS).find(|r| self.ready_live[*r] > 0) else { return };
+            let kind = Kind::ALL[r % crate::key::KINDS];
             let free = workers - self.batches.len();
-            let of_kind = self.ready.iter().take_while(|(c, k, _, _)| *c == class && *k == kind).count();
+            let of_kind = self.ready_live[r] as usize;
             let by_time = usize::try_from(TARGET_BATCH_NS / self.task_ns(kind)).unwrap_or(MOST_BATCH);
             let size = by_time.clamp(1, MOST_BATCH).min(of_kind.div_ceil(free)).max(1);
-            let mut names = Vec::with_capacity_in(size, self.alloc.clone());
-            for (c, k, h, name) in self.ready.iter() {
-                if names.len() == size || *c != class || *k != kind {
-                    break;
-                }
-                // One home per batch while that home has tasks; then the next home's.
-                if *h != home && !names.is_empty() && size < of_kind {
-                    break;
-                }
-                names.push((*c, *k, *h, *name));
+            let mut tasks = Vec::with_capacity_in(size, self.alloc.clone());
+            while tasks.len() < size {
+                let Some(name) = self.pop_ready(r) else { break };
+                tasks.push(self.emit(name));
             }
-            let mut tasks = Vec::with_capacity_in(names.len(), self.alloc.clone());
-            for entry in names.iter() {
-                self.ready.remove(entry);
-                tasks.push(self.emit(entry.3));
+            if tasks.is_empty() {
+                // The live count said an entry was there: the counts are the machine's bug, and
+                // the request stalls visibly (`quiet` stays false) instead of spinning here.
+                return;
             }
             self.send(tasks, out);
         }
@@ -1334,7 +1453,9 @@ impl<A: Allocator + Clone> Request<A> {
     }
 
     fn advance<B: Allocator>(&mut self, name: Name, out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
-        let Some(state) = self.state(name) else { return Ok(()) };
+        let Some(job) = self.jobs.get_mut(&name) else { return Ok(()) };
+        job.parked = false;
+        let state = job.state;
         match state {
             State::Start => self.locate(name, out),
             State::Decide => self.decide(name, out),
@@ -1381,6 +1502,7 @@ impl<A: Allocator + Clone> Request<A> {
                 }
                 None if seed => {
                     // A changed file no answer holds: outside the build, until a module lists it.
+                    // It is in `Start`, so the settled count is untouched.
                     self.jobs.remove(&name);
                     return Ok(());
                 }
@@ -1701,9 +1823,9 @@ impl<A: Allocator + Clone> Request<A> {
                 Some(_) => {}
             }
         }
+        self.set_state(name, State::Settled);
         let job = self.jobs.get_mut(&name).expect("a job");
         job.settles += 1;
-        job.state = State::Settled;
         job.recheck = false;
         let redo = core::mem::replace(&mut job.redo, false) || stale;
         let entries = job.entries;
@@ -1761,10 +1883,8 @@ impl<A: Allocator + Clone> Request<A> {
     /// A job of a dropped name settles with no record.
     fn gone_job(&mut self, name: Name) {
         self.unsettle(name);
-        if let Some(job) = self.jobs.get_mut(&name) {
-            job.state = State::Settled;
-        }
-        self.ready.retain(|(_, _, _, queued)| *queued != name);
+        self.unqueue(name);
+        self.set_state(name, State::Settled);
         self.wake_waiters(name);
     }
 
@@ -1800,9 +1920,8 @@ impl<A: Allocator + Clone> Request<A> {
                 }
             }
             Some(State::Settled) => {
-                let job = self.jobs.get_mut(&name).expect("a job");
-                job.recheck = true;
-                job.state = State::Decide;
+                self.jobs.get_mut(&name).expect("a job").recheck = true;
+                self.set_state(name, State::Decide);
                 self.unsettle(name);
                 self.wake.push_back(name);
             }

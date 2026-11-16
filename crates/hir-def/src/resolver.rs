@@ -14,7 +14,6 @@ use hir_expand::{
     name::{AsName, Name},
 };
 use intern::{Symbol, sym};
-use smallvec::SmallVec;
 use span::SyntaxContext;
 use std::alloc::Global;
 use syntax::view::HasName;
@@ -49,7 +48,7 @@ use crate::{
 };
 
 /// What [`Resolver::names_in_scope`] returns: each name with its meanings, innermost first.
-pub type NamesInScope = FxIndexMap<Name, SmallVec<[ScopeDef; 1]>>;
+pub type NamesInScope = FxIndexMap<Name, Vec<ScopeDef>>;
 
 /// A stack of [`Scope`]s over the scope of a module. A body walk keeps one: entering an
 /// expression pushes its scopes onto the same stack and leaving truncates it
@@ -61,10 +60,10 @@ pub struct Resolver<'db> {
     ///
     /// When using, you generally want to process the scopes in reverse order,
     /// there's `scopes` *method* for that.
-    scopes: SmallVec<[Scope<'db>; 8]>,
+    scopes: Vec<Scope<'db>>,
     /// The expression scopes that [`Scope::ExprScope`] and [`Scope::MacroDefScope`] index: one
     /// per expression store the stack has held, so one in practice, kept inline.
-    expr_stores: SmallVec<[ExprStore<'db>; 1]>,
+    expr_stores: Vec<ExprStore<'db>>,
     module_scope: ModuleItemMap<'db>,
 }
 
@@ -1561,7 +1560,7 @@ pub trait HasResolver: Copy {
 impl HasResolver for ModuleId {
     fn resolver(self, db: &Db) -> Resolver<'_> {
         let mut module_id = self;
-        let mut scopes = SmallVec::new();
+        let mut scopes = Vec::new();
         // A block's module: its blocks, innermost first then reversed, so the stack holds
         // outer blocks first; the module scope is the first module with a key around them.
         while let Some(block) = module_id.block(db) {
@@ -1572,7 +1571,7 @@ impl HasResolver for ModuleId {
         let def_map = crate::nameres::crate_def_map(db, module_id.krate(db));
         Resolver {
             scopes,
-            expr_stores: SmallVec::new(),
+            expr_stores: Vec::new(),
             module_scope: ModuleItemMap { def_map, module_id },
         }
     }

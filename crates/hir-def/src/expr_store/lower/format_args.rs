@@ -2,11 +2,10 @@
 
 use std::fmt::Write as _;
 
-use arrayvec::ArrayString;
+use blaze_own::FixedString;
 use base_db::FxIndexSet;
 use hir_expand::name::{AsName, Name};
 use intern::{Symbol, sym};
-use smallvec::SmallVec;
 use span::SyntaxContext;
 use syntax::view::{self as ast, AstToken as _, HasName};
 
@@ -32,7 +31,7 @@ impl<'db> ExprCollector<'db> {
         syntax_ptr: ExprPtr,
     ) -> ExprId {
         let mut args = FormatArgumentsCollector::default();
-        let mut written = SmallVec::<[bool; 16]>::new();
+        let mut written = Vec::<bool>::new();
         f.args().for_each(|arg| {
             let expr = arg.expr();
             written.push(expr.is_some_and(is_written_literal));
@@ -435,7 +434,7 @@ impl<'db> ExprCollector<'db> {
     /// expand to placeholders the code generator puts the place in the source for, and a byte
     /// `b'x'`, which rustc leaves alone, lowers to what `120u8` does.
     fn inline_literals(&mut self, fmt: &mut FormatArgs, written: &[bool]) {
-        let mut remove = SmallVec::<[bool; 16]>::from_elem(false, fmt.arguments.arguments.len());
+        let mut remove = vec![false; fmt.arguments.arguments.len()];
         for piece in fmt.template.iter_mut() {
             let FormatArgsPiece::Placeholder(placeholder) = piece else { continue };
             let Ok(index) = placeholder.argument.index else { continue };
@@ -471,7 +470,7 @@ impl<'db> ExprCollector<'db> {
                 *next += usize::from(!remove);
                 Some(index)
             })
-            .collect::<SmallVec<[usize; 16]>>();
+            .collect::<Vec<usize>>();
         for_all_argument_indexes(&mut fmt.template, |index| *index = moved[*index]);
     }
 
@@ -484,7 +483,7 @@ impl<'db> ExprCollector<'db> {
         }
         let fits = |n: u128, max: u128| {
             (n <= max).then(|| {
-                let mut digits = ArrayString::<40>::new();
+                let mut digits = FixedString::<40>::new();
                 write!(digits, "{n}").expect("a u128 has at most 39 digits");
                 Symbol::intern(&digits)
             })

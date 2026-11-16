@@ -566,19 +566,19 @@ pub(super) fn compiled(root: &Path) -> Vec<PathBuf> {
 /// it is the program itself.
 pub(super) fn roots(dir: &Path, program: bool) -> Vec<PathBuf> {
     let text = std::fs::read_to_string(dir.join("Cargo.toml")).unwrap();
-    let manifest: toml::Table = text.parse().unwrap();
+    let manifest = toml_table(&text).unwrap();
     let mut out = Vec::new();
     let lib = manifest
         .get("lib")
         .and_then(|it| it.get("path"))
-        .and_then(toml::Value::as_str)
+        .and_then(Value::as_str)
         .unwrap_or("src/lib.rs");
     if dir.join(lib).is_file() {
         out.push(dir.join(lib));
     }
     if program {
-        for bin in manifest.get("bin").and_then(toml::Value::as_array).into_iter().flatten() {
-            if let Some(path) = bin.get("path").and_then(toml::Value::as_str) {
+        for bin in manifest.get("bin").and_then(Value::as_list).into_iter().flatten() {
+            if let Some(path) = bin.get("path").and_then(Value::as_str) {
                 out.push(dir.join(path));
             }
         }
@@ -668,7 +668,7 @@ fn crate_names(checkout: &BTreeMap<&str, &Path>) -> BTreeMap<String, String> {
     for (&name, &dir) in checkout {
         let lib = std::fs::read_to_string(dir.join("Cargo.toml"))
             .ok()
-            .and_then(|text| text.parse::<toml::Table>().ok())
+            .and_then(|text| toml_table(&text))
             .and_then(|manifest| {
                 manifest.get("lib")?.get("name")?.as_str().map(str::to_owned)
             });

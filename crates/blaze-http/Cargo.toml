@@ -14,15 +14,16 @@ repository.workspace = true
 doctest = false
 
 [dependencies]
+blaze-own.workspace = true
 blaze-core.workspace = true
 # A proxy's `Proxy-Authorization: Basic` credentials.
-base64.workspace = true
+blaze-base64.workspace = true
 # The SHA-256 of a pinned certificate (h3's `serverCertificateHashes` check).
 blaze-sha256.workspace = true
 # quinn-proto's datagram buffers.
 bytes.workspace = true
-# Gzip bodies, decoded as they come; the pure-Rust backend, as blaze-engine's.
-flate2 = { workspace = true, features = ["rust_backend"] }
+# Gzip bodies, decoded as they come.
+blaze-deflate.workspace = true
 # A request's method.
 http.workspace = true
 # An answer's head.

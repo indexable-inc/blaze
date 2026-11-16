@@ -2384,6 +2384,14 @@ impl<K: Ord + fmt::Debug, V, A: Allocator> BTreeMap<K, V, A> {
 }
 
 #[cfg(test)]
+impl<T: Ord + fmt::Debug, A: Allocator> BTreeSet<T, A> {
+    /// The map's invariants.
+    pub(crate) fn invariants(&self) -> Result<(), std::string::String> {
+        self.map.invariants()
+    }
+}
+
+#[cfg(test)]
 unsafe fn check_node<K: Ord + fmt::Debug, V>(
     node: Node<K, V>,
     height: usize,

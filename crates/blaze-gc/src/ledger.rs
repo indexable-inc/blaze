@@ -10,8 +10,6 @@
 
 use std::path::Path;
 
-use blaze_serde::{Deserialize, Serialize};
-
 use crate::plan::RunReport;
 
 /// The ledger's file in the daemon's state directory.
@@ -19,7 +17,8 @@ pub const LEDGER: &str = "gc-ledger.json";
 
 pub const FORMAT: u32 = 1;
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Debug)]
+/// Its JSON form is `crate::wire`'s.
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Ledger {
     pub format: u32,
     pub last_end_ns: Option<u64>,
@@ -29,11 +28,11 @@ pub struct Ledger {
 impl Ledger {
     pub fn encode(&self) -> Vec<u8> {
         // Numbers, strings, options, vectors and unit-or-struct enums: nothing that fails.
-        serde_json::to_vec_pretty(self).expect("a ledger serializes")
+        crate::wire::pretty(self)
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Ledger, String> {
-        let ledger: Ledger = serde_json::from_slice(bytes)
+        let ledger: Ledger = crate::wire::read(bytes)
             .map_err(|error| format!("it does not read as a ledger: {error}"))?;
         if ledger.format != FORMAT {
             return Err(format!(
