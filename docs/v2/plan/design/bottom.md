@@ -522,6 +522,39 @@ set is the per-name read list; blanket impls indexed under the trait); its known
 Not taken: absolute positions and paths in keys, crate-grain verdicts, raw in-memory structs as
 the stored form, whole-program memo flushes, ASTs kept alive, dependencies read from source.
 
+### More taken from Relax (second survey, 2026-11-15 20:00; file names are Relax's)
+
+Adopt, by value to the goal order:
+
+| What | Why | Size | Where in Relax |
+|---|---|---|---|
+| Relocated fields emitted as zeros, filled at install | code bytes do not depend on their address, so a code record is shareable and cacheable | small | backend rir.rs:542-760 |
+| Slot table: thunk, lazy stub, table word, tier record per id; a thunk head patched to a direct jump when in reach | first-call slots and hooks | medium | rir.rs:588; jit.rs:19596 |
+| Store file: two index slots with a header flip, append-only payloads, a new generation per rewrite, never renamed over | crash safety and restart | medium | compiler store.rs:1-38 |
+| Startup image: what ran before the first frame last time, relocations against identity tables, linked in one pass | warm restart | medium | cache/image.rs |
+| A backend memo keyed up to renaming of slots: generic instances that differ only in callees share one codegen result | cold time, memory | medium | bmemo.rs |
+| Two views of the same pages for W^X (memfd on Linux, `mach_vm_remap` on macOS), not `MAP_JIT`: a program's own `pthread_jit_write_protect_np` flips every `MAP_JIT` page of its thread | correctness | small | os/mem.rs:301, 672 |
+| An entry-mark thunk in the table word, a byte in a per-thread bitmap: which functions a test entered, at no cost outside live tests | incremental tests | small | harness_reach.rs |
+| Invalidated code in page-aligned groups set `PROT_NONE`, addresses never reused; a stale access parks its thread | safety of retirement | medium | invalid.rs |
+| Hooks (count, break, heap) as a patch group whose removal rolls back with no recompile | decide at run time | medium | instrument.rs; heap.rs |
+| Channels with credit flow control, a replay ring, a hub that reopens feeds by sequence number, an ssh relay | the monitor and the relay | medium | libs/remote |
+| A flight recorder of lock-free per-thread rings; a stack sampled once a wait passes a bound | the monitor | medium | flightrec.rs |
+| A fixed-table wait registry written only on blocking paths: why a program hangs | tooling | small | base waits.rs; hang.rs |
+| An unwind trailer per function instead of DWARF | cold time | medium | rir.rs:2340 |
+| A one-pass baseline register allocator and assembler for the fast tier | cold time | medium | regalloc.rs:3085 |
+| A process-wide CPU budget so a person's work never waits behind background builds | the edit loop on a Mac | small | libs/cpu_budget |
+| Random IR programs run through every tier and compared with an evaluator | correctness of tiers | medium | codegen tests/fuzz_tiers.rs |
+
+Also ready to adapt for "no third-party crates" (MIT, with sizes): TOML (2.8k lines), a small
+serializer (4.5k), strict JSON (0.8k), base64, inflate and deflate (5k, a miniz port), sha256,
+tar, an HTTP client over the OS's TLS (1k), git over smart HTTP (2.3k), an ELF/Mach-O/DWARF
+reader (1.9k), disassemblers for x64 and arm64 (5.7k).
+
+Not taken: a non-SSA IR for the top tier (their own list of why their code is slower starts
+with register copies); one owner thread that every change goes through (their waits of
+374 to 583 ms; against the 128-core rule); code that only grows (memory); running real cargo
+for C dependencies; their sandbox by address masking.
+
 ## 16. Ladder, referee, switch
 
 - **The ladder.** First rung: `blaze run` of `fn main() {}` through the launcher, on the new
