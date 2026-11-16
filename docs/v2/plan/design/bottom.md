@@ -181,6 +181,40 @@ Taken from it:
 Not taken: absolute positions and paths in keys, crate-grain verdicts, raw in-memory structs
 as the stored form, whole-program memo flushes, ASTs kept alive, dependencies read from source.
 
+## The commands: run, test, check, export
+
+Andrew, 2026-11-15 18:45: "no blaze build and just blaze export ... and blaze run / test /
+check that are fast"; "everything in JIT world".
+
+- **`blaze run` and `blaze test`** never write an executable. Code is records; the launcher
+  places them in the program's own process behind one slot word a function. A function not
+  yet compiled is a stub in its slot: the first call asks the program's helper for the code
+  record (found by key, or made then), which is published in the slot; what is likely to run
+  next is compiled behind it. There is no link step. A test run is a program run.
+- **Tiers.** The first code of a function is the fast tier, which calls through slots. A
+  background tier optimizes hot functions across functions (inlining). Its record lists, in
+  its read list, the code identity of every callee body it inlined, so an edit of a callee
+  makes the caller's optimized record stale and the caller runs its fast-tier record until
+  the tier makes it again. A better version of a function is one slot word written.
+- **`blaze check`** makes no code.
+- **`blaze export`** writes a native executable (Mach-O, ELF): every function the program
+  reaches, at the optimized tier, no stubs, laid out as the launcher lays them out and written
+  once, whole. It is not incremental and keeps nothing between runs: nobody edits through it.
+  It comes after `run`; until then the command says it is not built.
+- **Gone:** `blaze build`, the linker's patching of a file in place (kept slots in a file,
+  spare room, growth bounds, unwind tables patched, a signature made again per edit), and
+  compiling everything reachable before the first instruction runs.
+
+## Measured so far
+
+- `blaze_file_items::outline` (a file's text to its items, hashes and ranges; one thread, an
+  M-series Mac, release, 2026-11-15, bodies parsed in full): `core` 299 files, 180,413 lines,
+  13,443 items in 132.5 ms; `alloc` 64.2 ms; `std` 170.9 ms; all of `library/` (1.53 M lines,
+  207,552 items) 1,671 ms; blaze's own crates (2.63 M lines, 321,674 items) 3,332 ms: about
+  1 microsecond a line, 32 to 51 MB/s. On N cores it divides by N (a file is independent); with
+  bodies skipped it falls further. 9 syntax errors in `core` and 1,531 in blaze's crates are
+  syntax the outline does not read yet (it parses with no extensions): to fix.
+
 ## How it is built and proven
 
 - New crates beside the old: `blaze-id` (done), `blaze-surface` (the schema and the two
