@@ -128,7 +128,7 @@ impl<T: Tls, A: Allocator + Clone> Client<'_, T, A> {
         let origin = url.origin().ok_or(FetchWhy::NoAuthority)?;
         let mut authority = Vec::new_in(self.alloc.clone());
         write_authority(origin, true, &mut authority)?;
-        let authority = core::str::from_utf8(&authority).map_err(|_| FetchWhy::NoAuthority)?;
+        let authority = core::str::from_utf8(&authority).expect("`str`s joined are UTF-8");
         let from = blaze_h1::Origin { scheme: origin.scheme().as_str(), authority };
         let hop = follow
             .next(from, answer.status, answer.location.as_deref())
@@ -138,7 +138,7 @@ impl<T: Tls, A: Allocator + Clone> Client<'_, T, A> {
         for part in [hop.origin.scheme, "://", hop.origin.authority, hop.target] {
             text.try_extend_from_slice(part.as_bytes()).map_err(FetchWhy::Alloc)?;
         }
-        let text = core::str::from_utf8(&text).map_err(|_| FetchWhy::NoAuthority)?;
+        let text = core::str::from_utf8(&text).expect("`str`s joined are UTF-8");
         Url::parse(text).map_err(FetchWhy::Url)
     }
 
@@ -153,7 +153,7 @@ impl<T: Tls, A: Allocator + Clone> Client<'_, T, A> {
         let mut head = Vec::new_in(self.alloc.clone());
         let mut host = Vec::new_in(self.alloc.clone());
         write_authority(origin, false, &mut host)?;
-        let host = core::str::from_utf8(&host).map_err(|_| FetchWhy::NoAuthority)?;
+        let host = core::str::from_utf8(&host).expect("`str`s joined are UTF-8");
         let mut headers = Vec::new_in(self.alloc.clone());
         headers.try_reserve(ask.headers.len() + 1).map_err(FetchWhy::Alloc)?;
         headers.push(("User-Agent", self.agent));
@@ -279,8 +279,7 @@ struct Text {
 
 impl Text {
     fn as_str(&self) -> &str {
-        // Only `write_str` fills it, with whole `str`s.
-        core::str::from_utf8(&self.buf[..self.len]).unwrap_or("")
+        core::str::from_utf8(&self.buf[..self.len]).expect("only `write_str` fills it, with whole `str`s")
     }
 }
 

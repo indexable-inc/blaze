@@ -390,6 +390,7 @@ blaze-int = { path = "crates/blaze-int" } # Integer conversions that say what th
 # blaze's own data formats, on blaze-own and core only, in place of base64, serde_json,
 # toml/toml_edit and semver (docs/v2/plan/third-party.md).
 blaze-base64 = { path = "crates/blaze-base64" }
+blaze-cbor = { path = "crates/blaze-cbor" } # Deterministic CBOR (RFC 8949 4.2.1): the one home; blaze-pack and blaze-watch take it from here.
 blaze-data = { path = "crates/blaze-data" } # The one format-neutral value (CBOR, JSON, TOML) and `value!`.
 blaze-json = { path = "crates/blaze-json" }
 blaze-semver = { path = "crates/blaze-semver" }

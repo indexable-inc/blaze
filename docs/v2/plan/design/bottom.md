@@ -346,6 +346,22 @@ that are fast"; "everything in JIT world". The commands are `run`, `test`, `chec
   is a stub: its first call asks the run's parent for the code record (found by key, or made
   then), which is published in the slot; what is likely to run next is compiled behind it. No
   link step. A test run is a program run. **`blaze check`** makes no code.
+- **A run is a check too** (Andrew, 2026-11-15 20:43: "by default blaze run would fail if any
+  blaze check does not work ... so dont need separate check that you would infrequently run").
+  `blaze run` and `blaze test` fail when the check of their program fails, lints included, so
+  no tree is ever "green but unchecked". Scope: the workspace packages the program's package
+  depends on, whole (not only what the run reaches; not the rest of a monorepo, which
+  `blaze check` and CI cover). The mechanism is the coordinator's, to be confirmed by Andrew:
+  (1) a finding already stored from an earlier command costs nothing to know, so a tree known
+  bad never starts; (2) otherwise the program starts at once, and the rest of the check runs
+  beside it on the cores it leaves free; code is still checked before it first runs, item by
+  item; (3) the first error found stops the program, prints the findings and fails the
+  command, and a run that ends first waits for the check before it reports success: a test's
+  pass is not printed as a pass until then. The cost is in proportion to the edit: findings
+  are records, an unchanged item's are replayed, and on a fresh clone the proofs come from
+  the shared cache, so only the diff is checked. `--reached` is the opt-out for the middle of
+  a refactor (check only what runs), and it says so in its verdict. The plain alternative,
+  one flag away, is to finish the check before the program starts.
 - **`blaze export`** (later) writes one native executable (Mach-O, ELF): every function the
   program reaches, at the optimized tier, no stubs, laid out as the launcher lays them out,
   written once, whole. Not incremental; keeps nothing. Until built, the command says it is not.

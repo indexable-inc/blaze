@@ -17,6 +17,7 @@ use crate::{
     cx::Cx,
     hosted::{self, Refused},
     io::Io,
+    unfinished::Unfinished,
 };
 
 /// A terminal's size in cells.
@@ -170,6 +171,7 @@ impl Term {
 
     /// The terminal put in raw mode (keys come as pressed, nothing is echoed) until the guard
     /// is ended. One that is raw already is refused: two guards would each put it back.
+    #[track_caller]
     pub fn raw(&self, cx: &Cx) -> Result<RawMode, TermError> {
         let entered = hosted::call(&self.io, cx, |host| match host.term.raw {
             true => Err(Refused::Host("the terminal is in raw mode already")),
@@ -179,7 +181,10 @@ impl Term {
             }
         });
         match entered {
-            Ok(()) => Ok(RawMode { held: Held { io: self.io.clone(), on: true } }),
+            Ok(()) => Ok(RawMode {
+                held: Held { io: self.io.clone(), on: true },
+                unfinished: Unfinished::new("term::RawMode", "end(cx)"),
+            }),
             Err(kind) => Err(TermError { op: TermOp::Raw, kind }),
         }
     }
@@ -215,6 +220,7 @@ impl fmt::Debug for Term {
 #[must_use = "raw mode is ended with end(cx)"]
 pub struct RawMode {
     held: Held,
+    unfinished: Unfinished,
 }
 
 /// Raw mode's abandonment path.
@@ -237,6 +243,7 @@ impl RawMode {
     /// still leaves the terminal usable. The one way a `RawMode` ends.
     #[blaze::consumes]
     pub fn end(mut self, cx: &Cx) -> Result<(), TermError> {
+        self.unfinished.finished();
         self.held.on = false;
         cx.event("bstd::term: raw mode ended");
         match self.held.io.script(|host| host.term.raw = false) {

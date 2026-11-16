@@ -74,14 +74,44 @@ pub struct FileEntry<'a> {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
 pub struct Ticket(pub u64);
 
+/// One [`Effect::Run`]: a worker takes it whole and answers it whole.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Debug)]
+pub struct BatchId(pub u64);
+
+/// Tasks of one kind and one home, about [`TARGET_BATCH_NS`] of work together (drive.md,
+/// "Scheduling on many cores"): the coordinator's cost per task drops by the batch's size.
+#[derive(Debug)]
+pub struct Batch<A: Allocator> {
+    pub id: BatchId,
+    pub tasks: Vec<(Ticket, Task<A>), A>,
+}
+
+/// A batch is sized to about this much work, from this run's mean time of its kind.
+pub const TARGET_BATCH_NS: u64 = 1_000_000;
+/// A kind's time per task before any of it has been measured this run.
+pub const DEFAULT_TASK_NS: u64 = 50_000;
+/// The most tasks one batch holds.
+pub const MOST_BATCH: usize = 256;
+
 /// What happened.
 pub enum Event<'a> {
     /// The sweep's files, sorted by path; the paths gone since the last answer; the `last` file.
     Start { files: &'a [FileEntry<'a>], gone: &'a [&'a [u8]], last: Option<&'a [u8]> },
     /// A [`Effect::Get`]'s answer: the bytes at `key`, or none.
     Got { key: Key, bytes: Option<&'a [u8]> },
-    /// A [`Effect::Run`]'s answer.
-    Ran { ticket: Ticket, ran: Ran<'a> },
+    /// A [`Effect::Run`]'s answer: one outcome per task of the batch, together.
+    Ran { batch: BatchId, results: &'a [Outcome<'a>] },
+}
+
+/// One task's answer in a batch.
+pub struct Outcome<'a> {
+    pub ticket: Ticket,
+    pub ran: Ran<'a>,
+    /// Times the worker re-entered it in place, its needs answered from the settled table
+    /// (`worker::answer_in_place`): counted as entries, never seen by the coordinator.
+    pub in_place: u32,
+    /// Nanoseconds of its runs, as the worker measured (the machine has no clock, rule 75).
+    pub ns: u64,
 }
 
 /// What a task answered.
@@ -180,7 +210,12 @@ pub enum Effect<A: Allocator> {
     Get { key: Key },
     /// Write `bytes` at `key` once; bytes already there under the key stand.
     Put { key: Key, bytes: Vec<u8, A> },
-    Run { ticket: Ticket, task: Task<A> },
+    Run { batch: Batch<A> },
+    /// Write the name's row of the settled table (`Settled::publish`), after every `Put` before
+    /// it has completed: a worker that reads the row reads the record at once.
+    Publish(Input),
+    /// Clear the name's row of the settled table (`Settled::clear`): dirtied or dropped.
+    Unpublish(Name),
     Print(Print<A>),
     /// Replace the checkout's `last` file with `bytes`, after every `Put` before it.
     WriteLast { bytes: Vec<u8, A> },
@@ -225,6 +260,8 @@ pub enum DriveError {
     /// A task answered a record for a name no job asked.
     UnaskedOutput { name: Name, by: Name },
     UnknownTicket(Ticket),
+    /// An answer to a batch that is not out (answered twice, or never sent).
+    UnknownBatch(BatchId),
     UnaskedGet(Key),
     /// A job ran or settled more than `most_entries` times.
     Reentries { name: Name, key: Key, entries: u32, last_needs: [Option<Name>; 4] },
@@ -252,7 +289,8 @@ impl fmt::Display for DriveError {
             },
             DriveError::WrongRecord { key, asked, held } => write!(f, "the record at {key} is {held}'s, asked as {asked}'s (rule 21: a key covers every input)"),
             DriveError::UnaskedOutput { name, by } => write!(f, "{by} answered a record of {name}, which no job asked"),
-            DriveError::UnknownTicket(ticket) => write!(f, "an answer to run {}, which is not out", ticket.0),
+            DriveError::UnknownTicket(ticket) => write!(f, "an answer to run {}, which is not out in that batch", ticket.0),
+            DriveError::UnknownBatch(batch) => write!(f, "an answer to batch {}, which is not out (a batch is answered once)", batch.0),
             DriveError::UnaskedGet(key) => write!(f, "an answer to a get of {key}, which is not out"),
             DriveError::Reentries { name, key, entries, last_needs } => {
                 write!(f, "{name} (key {key}) was entered {entries} times (rule 18); its last needs:")?;
@@ -419,10 +457,17 @@ pub struct Request<A: Allocator + Clone> {
     jobs: SortedMap<Name, Job<A>, A>,
     wake: VecDeque<Name, A>,
     gets: SortedMap<Key, Vec<Purpose, A>, A>,
-    tickets: SortedMap<Ticket, Name, A>,
+    tickets: SortedMap<Ticket, (Name, BatchId), A>,
     next_ticket: u64,
-    ready: SortedSet<(Class, Name), A>,
-    running: u32,
+    /// Queued jobs, in run order: the person's first, then by kind (files, scopes, signatures,
+    /// bodies, code), then by home, so a batch is one home's tasks of one kind.
+    ready: SortedSet<(Class, Kind, Name, Name), A>,
+    /// Batches out: at most one per worker.
+    batches: SortedSet<BatchId, A>,
+    next_batch: u64,
+    /// The settled table's writes this step, last write per name: flushed as `Publish` and
+    /// `Unpublish` at the step's end, after every `Put` of the step.
+    publish: SortedMap<Name, Option<Input>, A>,
 
     findings: SortedMap<Name, Held<A>, A>,
     old_findings: SortedMap<Name, Held<A>, A>,
@@ -476,7 +521,9 @@ impl<A: Allocator + Clone> Request<A> {
             tickets: SortedMap::new_in(a.clone()),
             next_ticket: 0,
             ready: SortedSet::new_in(a.clone()),
-            running: 0,
+            batches: SortedSet::new_in(a.clone()),
+            next_batch: 0,
+            publish: SortedMap::new_in(a.clone()),
             findings: SortedMap::new_in(a.clone()),
             old_findings: SortedMap::new_in(a.clone()),
             old_findings_loading: false,
@@ -506,12 +553,60 @@ impl<A: Allocator + Clone> Request<A> {
         if self.phase == Phase::Answered {
             return Err(DriveError::Finished);
         }
+        self.profile.steps += 1;
         match event {
             Event::Start { files, gone, last } => self.start(files, gone, last, out)?,
             Event::Got { key, bytes } => self.got(key, bytes, out)?,
-            Event::Ran { ticket, ran } => self.ran(ticket, ran, out)?,
+            Event::Ran { batch, results } => self.ran_batch(batch, results, out)?,
         }
         self.pump(out)
+    }
+
+    /// The table's writes of this step, after its `Put`s.
+    fn flush_publish<B: Allocator>(&mut self, out: &mut Vec<Effect<A>, B>) {
+        let pending = core::mem::replace(&mut self.publish, SortedMap::new_in(self.alloc.clone()));
+        for (name, input) in pending.into_iter() {
+            out.push(match input {
+                Some(input) => Effect::Publish(input),
+                None => Effect::Unpublish(name),
+            });
+        }
+    }
+
+    fn ran_batch<B: Allocator>(&mut self, batch: BatchId, results: &[Outcome<'_>], out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
+        if !self.batches.remove(&batch) {
+            return Err(DriveError::UnknownBatch(batch));
+        }
+        self.profile.batches += 1;
+        for result in results {
+            match self.tickets.get(&result.ticket) {
+                Some((_, of)) if *of == batch => {}
+                _ => return Err(DriveError::UnknownTicket(result.ticket)),
+            }
+        }
+        for result in results {
+            let (name, _) = *self.tickets.get(&result.ticket).expect("checked above");
+            self.profile.ran(name.kind, result.ns);
+            if result.in_place > 0 {
+                self.profile.of(name.kind).entries += result.in_place;
+                self.profile.in_place += result.in_place;
+                if let Some(job) = self.jobs.get_mut(&name) {
+                    job.entries += result.in_place;
+                }
+            }
+            self.ran(result.ticket, &result.ran, out)?;
+        }
+        if self.plant == Plant::BatchTwice {
+            // The planted bug: the batch's records applied a second time, the check skipped.
+            for result in results {
+                if let Ran::Done(outputs) = result.ran {
+                    for output in outputs {
+                        self.made(output, out)?;
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     // --- Start and the certificate ------------------------------------------------------------
@@ -678,18 +773,26 @@ impl<A: Allocator + Clone> Request<A> {
         Ok(())
     }
 
-    fn ran<B: Allocator>(&mut self, ticket: Ticket, ran: Ran<'_>, out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
-        let name = self.tickets.remove(&ticket).ok_or(DriveError::UnknownTicket(ticket))?;
-        self.running = self.running.saturating_sub(1);
+    fn ran<B: Allocator>(&mut self, ticket: Ticket, ran: &Ran<'_>, out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
+        let (name, _) = self.tickets.remove(&ticket).ok_or(DriveError::UnknownTicket(ticket))?;
+        if let Some(job) = self.jobs.get(&name)
+            && job.entries > self.config.most_entries
+        {
+            let mut last_needs = [None; 4];
+            for (slot, need) in last_needs.iter_mut().zip(job.needs.iter()) {
+                *slot = Some(*need);
+            }
+            return Err(DriveError::Reentries { name, key: job.key, entries: job.entries, last_needs });
+        }
         // A run of a name its home dropped while it was out answers for nothing in the build:
         // not an error, and not quietly kept (its record is not written, its row is gone).
         if self.dropped.contains(&name) {
             return match ran {
-                Ran::Failed(failure) => Err(DriveError::Task(failure)),
+                Ran::Failed(failure) => Err(DriveError::Task(*failure)),
                 Ran::Done(_) | Ran::Need(_) => Ok(()),
             };
         }
-        match ran {
+        match *ran {
             Ran::Failed(failure) => Err(DriveError::Task(failure)),
             Ran::Done(outputs) => {
                 for output in outputs {
@@ -722,7 +825,9 @@ impl<A: Allocator + Clone> Request<A> {
                     } else if self.plant == Plant::DoubleFlight
                         && self.jobs.get(&want.name).is_some_and(|job| job.state == State::Running)
                     {
-                        self.emit(want.name, out);
+                        let mut tasks = Vec::new_in(self.alloc.clone());
+                        tasks.push(self.emit(want.name));
+                        self.send(tasks, out);
                     }
                     let job = self.jobs.get_mut(&name).expect("a running job's ticket names it");
                     if let Err(at) = job.needs.binary_search(&want.name) {
@@ -898,6 +1003,7 @@ impl<A: Allocator + Clone> Request<A> {
             if self.phase == Phase::Finishing && self.gets.is_empty() {
                 self.finish(out)?;
             }
+            self.flush_publish(out);
             return Ok(());
         }
     }
@@ -906,23 +1012,72 @@ impl<A: Allocator + Clone> Request<A> {
         self.wake.is_empty() && self.gets.is_empty() && self.tickets.is_empty() && self.ready.is_empty()
     }
 
+    /// Queue a job to run, keyed for its batch.
+    fn queue(&mut self, class: Class, name: Name) {
+        let home = self.jobs.get(&name).map_or(name, |job| job.home);
+        self.ready.insert((class, name.kind, home, name));
+    }
+
+    /// This run's mean time of a task of `kind`, or the default before one is measured.
+    fn task_ns(&self, kind: Kind) -> u64 {
+        let k = self.profile.kinds[kind.index()];
+        match (k.ns, k.entries) {
+            (ns, entries) if ns > 0 && entries > 0 => (ns / u64::from(entries)).max(1),
+            _ => DEFAULT_TASK_NS,
+        }
+    }
+
     fn unsettled(&self) -> bool {
         self.jobs.values().any(|job| job.state != State::Settled)
     }
 
-    /// Runs out while workers are free: every foreground task before any background one.
+    /// Batches out while workers are free: every foreground task before any background one
+    /// (the ready set sorts the person's first, so a background batch goes only when no
+    /// foreground task is queued). A batch is the next tasks of one class, kind and home, as
+    /// many as make [`TARGET_BATCH_NS`] at this run's mean time of the kind, and no more than
+    /// an even share of that kind's queue over the free workers, so no worker idles while
+    /// another holds a long batch.
     fn emit_ready<B: Allocator>(&mut self, out: &mut Vec<Effect<A>, B>) {
-        while self.running < self.config.workers.max(1) {
-            let Some(&(class, name)) = self.ready.iter().next() else { return };
-            if class == Class::Background && self.ready.iter().any(|(c, _)| *c == Class::Foreground) {
-                return;
+        let workers = self.config.workers.max(1) as usize;
+        while self.batches.len() < workers {
+            let Some(&(class, kind, home, _)) = self.ready.iter().next() else { return };
+            let free = workers - self.batches.len();
+            let of_kind = self.ready.iter().take_while(|(c, k, _, _)| *c == class && *k == kind).count();
+            let by_time = usize::try_from(TARGET_BATCH_NS / self.task_ns(kind)).unwrap_or(MOST_BATCH);
+            let size = by_time.clamp(1, MOST_BATCH).min(of_kind.div_ceil(free)).max(1);
+            let mut names = Vec::with_capacity_in(size, self.alloc.clone());
+            for (c, k, h, name) in self.ready.iter() {
+                if names.len() == size || *c != class || *k != kind {
+                    break;
+                }
+                // One home per batch while that home has tasks; then the next home's.
+                if *h != home && !names.is_empty() && size < of_kind {
+                    break;
+                }
+                names.push((*c, *k, *h, *name));
             }
-            self.ready.remove(&(class, name));
-            self.emit(name, out);
+            let mut tasks = Vec::with_capacity_in(names.len(), self.alloc.clone());
+            for entry in names.iter() {
+                self.ready.remove(entry);
+                tasks.push(self.emit(entry.3));
+            }
+            self.send(tasks, out);
         }
     }
 
-    fn emit<B: Allocator>(&mut self, name: Name, out: &mut Vec<Effect<A>, B>) {
+    fn send<B: Allocator>(&mut self, tasks: Vec<(Ticket, Task<A>), A>, out: &mut Vec<Effect<A>, B>) {
+        let id = BatchId(self.next_batch);
+        self.next_batch += 1;
+        for (ticket, _) in tasks.iter() {
+            if let Some(entry) = self.tickets.get_mut(ticket) {
+                entry.1 = id;
+            }
+        }
+        self.batches.insert(id);
+        out.push(Effect::Run { batch: Batch { id, tasks } });
+    }
+
+    fn emit(&mut self, name: Name) -> (Ticket, Task<A>) {
         let ticket = Ticket(self.next_ticket);
         self.next_ticket += 1;
         let a = self.alloc.clone();
@@ -960,9 +1115,9 @@ impl<A: Allocator + Clone> Request<A> {
         job.entries += 1;
         job.state = State::Running;
         self.profile.of(name.kind).entries += 1;
-        self.tickets.insert(ticket, name);
-        self.running += 1;
-        out.push(Effect::Run { ticket, task });
+        self.profile.tasks += 1;
+        self.tickets.insert(ticket, (name, BatchId(u64::MAX)));
+        (ticket, task)
     }
 
     fn advance<B: Allocator>(&mut self, name: Name, out: &mut Vec<Effect<A>, B>) -> Result<(), DriveError> {
@@ -1068,7 +1223,7 @@ impl<A: Allocator + Clone> Request<A> {
         let (key, recheck) = (job.key, job.recheck);
         if name.kind == Kind::Group {
             self.set_state(name, State::Queued);
-            self.ready.insert((Class::Foreground, name));
+            self.queue(Class::Foreground, name);
             return Ok(());
         }
         let row = self.current(name).map(|row| (row.key, row.reads.iter().map(|(n, _)| *n).collect_in(self.alloc.clone())));
@@ -1199,7 +1354,7 @@ impl<A: Allocator + Clone> Request<A> {
         }
         job.state = State::Queued;
         let class = job.class;
-        self.ready.insert((class, name));
+        self.queue(class, name);
         Ok(())
     }
 
@@ -1333,6 +1488,19 @@ impl<A: Allocator + Clone> Request<A> {
         job.state = State::Settled;
         job.recheck = false;
         let redo = core::mem::replace(&mut job.redo, false) || stale;
+        let entries = job.entries;
+        self.profile.entries_seen(entries);
+        // A record about to be decided again is not one a worker should read.
+        if !redo {
+            let input = Input { name, at: now.at, out: now.out };
+            match self.plant {
+                // The planted bug: the row published at once, ahead of the record's `Put`.
+                Plant::PublishBeforePut => out.push(Effect::Publish(input)),
+                _ => {
+                    self.publish.insert(name, Some(input));
+                }
+            }
+        }
         self.wake_waiters(name);
         if before.map(|b| b.out) != Some(now.out) {
             self.dirty_readers(name)?;
@@ -1361,13 +1529,21 @@ impl<A: Allocator + Clone> Request<A> {
         Ok(())
     }
 
+    /// `name` is no longer settled: out of `now`, and its row of the settled table cleared at
+    /// the step's end.
+    fn unsettle(&mut self, name: Name) {
+        if self.now.remove(&name).is_some() {
+            self.publish.insert(name, None);
+        }
+    }
+
     /// A job of a dropped name settles with no record.
     fn gone_job(&mut self, name: Name) {
-        self.now.remove(&name);
+        self.unsettle(name);
         if let Some(job) = self.jobs.get_mut(&name) {
             job.state = State::Settled;
         }
-        self.ready.retain(|(_, queued)| *queued != name);
+        self.ready.retain(|(_, _, _, queued)| *queued != name);
         self.wake_waiters(name);
     }
 
@@ -1406,7 +1582,7 @@ impl<A: Allocator + Clone> Request<A> {
                 let job = self.jobs.get_mut(&name).expect("a job");
                 job.recheck = true;
                 job.state = State::Decide;
-                self.now.remove(&name);
+                self.unsettle(name);
                 self.wake.push_back(name);
             }
             Some(State::Start | State::Decide) => {

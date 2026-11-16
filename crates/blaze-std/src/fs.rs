@@ -93,6 +93,7 @@ use crate::{
     mem::Bytes,
     path::Path,
     pending::{self, Pending},
+    unfinished::Unfinished,
 };
 
 mod sealed {
@@ -116,7 +117,25 @@ pub struct ReadOnly;
 /// directory stays an ordinary value.
 #[blaze::linear]
 #[derive(PartialEq, Eq, Debug)]
-pub struct ReadWrite(());
+pub struct ReadWrite(Unfinished);
+
+impl ReadWrite {
+    /// The right to change a file, held by the `File` its caller's caller opened.
+    #[track_caller]
+    fn held() -> ReadWrite {
+        ReadWrite(Unfinished::new("fs::File<ReadWrite>", "close(cx, durable), close_synced(cx) or close_unsynced(unsynced)"))
+    }
+
+    /// The file it was held by was closed: the one way a `ReadWrite` ends.
+    #[blaze::consumes]
+    #[blaze::nopanic]
+    #[blaze::noalloc]
+    #[blaze::nonblocking]
+    fn finished(self) {
+        let ReadWrite(unfinished) = self;
+        unfinished.finished();
+    }
+}
 
 impl Rights for ReadOnly {
     const WRITE: bool = false;
@@ -930,22 +949,24 @@ impl Dir<ReadOnly> {
 impl Dir<ReadWrite> {
     /// The file at `path`, read and write: finished with one of [`File::close`]'s forms. A
     /// missing one is [`FsKind::NotFound`]: an open never makes a file.
+    #[track_caller]
     pub fn open(&self, cx: &Cx, path: &Path) -> Result<File<ReadWrite>, FsError> {
         let name = self.beneath(path);
         self.found(cx, &name)?;
         // clone: the quota shared, a refcount.
-        Ok(File { io: self.io.clone(), name, quota: self.quota.clone(), made: false, rights: ReadWrite(()) })
+        Ok(File { io: self.io.clone(), name, quota: self.quota.clone(), made: false, rights: ReadWrite::held() })
     }
 
     /// The file at `path` made empty, in place (a file there is cut to nothing, not
     /// replaced: a reader of it sees it empty), and its directories made. Nothing of it is
     /// durable, its name included, until its close says so: finished with one of
     /// [`File::close`]'s forms. To replace a file all at once, [`Dir::publish`].
+    #[track_caller]
     pub fn create(&self, cx: &Cx, path: &Path) -> Result<File<ReadWrite>, FsError> {
         let name = self.beneath(path);
         truncate(&self.io, cx, FsOp::Create, &name, 0)?;
         // clone: the quota shared, a refcount.
-        Ok(File { io: self.io.clone(), name, quota: self.quota.clone(), made: true, rights: ReadWrite(()) })
+        Ok(File { io: self.io.clone(), name, quota: self.quota.clone(), made: true, rights: ReadWrite::held() })
     }
 
     /// That nothing is at `name`, for a call that makes a new file and never replaces one.
@@ -1391,6 +1412,7 @@ impl<#[blaze::linear] P: Rights> File<P> {
 
     /// A read of up to `into.len()` bytes at `at` into `into`, in flight: its outcome, once
     /// waited for, is how many bytes it read, fewer at the end of the file.
+    #[track_caller]
     pub fn read_into<'buf>(&'buf self, into: &'buf mut [u8], at: u64) -> Pending<'buf, Result<usize, FsError>> {
         // clone: the effect's name, a refcount.
         let file = self.name.clone();
@@ -1480,6 +1502,7 @@ impl File<ReadWrite> {
 
     /// A write of `from` at `at`, past the end making it longer, in flight; not flushed. The
     /// bytes are copied as it starts (see [`crate::pending`]), and stay lent until it ends.
+    #[track_caller]
     pub fn write_from<'buf>(&'buf self, from: &'buf [u8], at: u64) -> Pending<'buf, Result<(), FsError>> {
         let name = &self.name;
         let asked = from.len() as u64;
@@ -1589,7 +1612,7 @@ impl File<ReadWrite> {
     #[blaze::consumes]
     pub fn close_unsynced(self, unsynced: Unsynced) -> Result<Written, FsError> {
         let File { io, name, quota: _, made: _, rights } = self;
-        crate::consume(rights);
+        rights.finished();
         started(&io, &name, unsynced);
         Ok(Written::of(&io, name))
     }
@@ -1600,7 +1623,7 @@ impl File<ReadWrite> {
     #[blaze::consumes]
     pub fn close_synced(self, cx: &Cx) -> Result<Flushed, FsError> {
         let File { io, name, quota: _, made, rights } = self;
-        crate::consume(rights);
+        rights.finished();
         let seen = io.generation(&name);
         if io.plant() == Plant::CloseSkipsSync {
             return Ok(Flushed::of(&io, name, seen));
@@ -1641,6 +1664,7 @@ pub struct Buffered<'f, 'a> {
     file: &'f File<ReadWrite>,
     held: Bytes<'a>,
     capacity: usize,
+    unfinished: Unfinished,
 }
 
 impl File<ReadWrite> {
@@ -1648,6 +1672,7 @@ impl File<ReadWrite> {
     /// with [`Buffered::finish`]. With no room for it in `frame` it is
     /// [`Stopped::OutOfMemory`], naming the buffer.
     #[blaze::nonblocking]
+    #[track_caller]
     pub fn buffered<'f, 'a>(
         &'f self,
         frame: &'a Frame,
@@ -1656,7 +1681,12 @@ impl File<ReadWrite> {
         let mut held = Bytes::new_in(frame, "bstd::fs buffered");
         held.try_reserve(capacity.get())
             .map_err(|stopped| FsError::new(FsOp::Append, &self.name, FsKind::Stopped(stopped)))?;
-        Ok(Buffered { file: self, held, capacity: capacity.get() })
+        Ok(Buffered {
+            file: self,
+            held,
+            capacity: capacity.get(),
+            unfinished: Unfinished::new("fs::Buffered", "finish(cx)"),
+        })
     }
 }
 
@@ -1712,7 +1742,8 @@ impl Buffered<'_, '_> {
     /// one way a `Buffered` ends.
     #[blaze::consumes]
     pub fn finish(self, cx: &Cx) -> Result<usize, FsError> {
-        let Buffered { file, held, capacity: _ } = self;
+        let Buffered { file, held, capacity: _, unfinished } = self;
+        unfinished.finished();
         if held.is_empty() {
             return Ok(0);
         }

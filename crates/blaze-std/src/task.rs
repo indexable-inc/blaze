@@ -84,6 +84,7 @@ use crate::{
     rt::{catch_unwind, resume_unwind},
     cx::Cx,
     host::Exit,
+    unfinished::Unfinished,
 };
 
 /// How a waiting task's frames are stored (std.md, "Layouts").
@@ -262,6 +263,7 @@ impl Drop for Live {
 pub struct Scope<'p> {
     live: Live,
     parent: PhantomData<&'p Cx>,
+    unfinished: Unfinished,
 }
 
 /// One task of a scope, from [`Scope::may_overlap`] or [`Scope::must_overlap`]: finished by [`Task::join`], before its scope
@@ -273,10 +275,12 @@ pub struct Task<'s, T> {
     name: &'static str,
     outcome: Result<T, TaskError>,
     scope: PhantomData<&'s ()>,
+    unfinished: Unfinished,
 }
 
 impl<'p> Scope<'p> {
     /// The scope whose context is `cx`, from [`Cx::scope`].
+    #[track_caller]
     pub(crate) fn new(cx: Cx) -> Scope<'p> {
         let live = Live {
             cx,
@@ -287,7 +291,7 @@ impl<'p> Scope<'p> {
             workers: Cell::new(LAYOUT.workers()),
             armed: true,
         };
-        Scope { live, parent: PhantomData }
+        Scope { live, parent: PhantomData, unfinished: Unfinished::new("task::Scope", "join(cx)") }
     }
 
     /// Runs `task` as the task `name` of this scope, which may overlap what follows it or not:
@@ -300,6 +304,7 @@ impl<'p> Scope<'p> {
     /// `scratch` is the most bytes the task's frame (`cx.frame()`) hands out: an allocation
     /// past it is the task's [`Stopped::OutOfMemory`], naming the task. It is reserved as
     /// address space here and committed as it is used.
+    #[track_caller]
     pub fn may_overlap<T, E: fmt::Display>(
         &self,
         name: &'static str,
@@ -313,7 +318,7 @@ impl<'p> Scope<'p> {
             Err(blaze_mem::MemError::Reserve { .. } | blaze_mem::MemError::Commit { .. } | blaze_mem::MemError::Exhausted { .. } | blaze_mem::MemError::TooLarge { .. } | blaze_mem::MemError::Evict { .. }) => {
                 let stopped = Stopped::OutOfMemory { arena: name, asked: scratch };
                 let error = live.fail(name, TaskWhy::OutOfMemory(stopped));
-                return Task { name, outcome: Err(error), scope: PhantomData };
+                return Task { name, outcome: Err(error), scope: PhantomData, unfinished: Unfinished::new("task::Task", "join(cx)") };
             }
         };
         // A new task may go to any worker; once started it stays there (the module's doc).
@@ -334,7 +339,7 @@ impl<'p> Scope<'p> {
                 Err(payload) => Err(live.fail(name, TaskWhy::Panicked(said(&*payload)))),
             },
         };
-        Task { name, outcome, scope: PhantomData }
+        Task { name, outcome, scope: PhantomData, unfinished: Unfinished::new("task::Task", "join(cx)") }
     }
 
     /// Runs `task` as the task `name` of this scope, at the same time as what follows it: for
@@ -412,6 +417,7 @@ impl<'p> Scope<'p> {
     /// that wait stopped.
     #[blaze::consumes]
     pub fn join(mut self, cx: &Cx) -> Result<(), TaskError> {
+        self.unfinished.finished();
         self.live.armed = false;
         let failed = self.live.failed.borrow_mut().take();
         match self.live.settle(cx.deadline()) {
@@ -444,6 +450,7 @@ impl<T> Task<'_, T> {
     #[blaze::noalloc]
     #[blaze::nonblocking]
     pub fn join(self, _cx: &Cx) -> Result<T, TaskError> {
+        self.unfinished.finished();
         self.outcome
     }
 }

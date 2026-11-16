@@ -31,6 +31,7 @@ use crate::{
     path::Path,
     pending::{self, Pending},
     resolver::Resolver,
+    unfinished::Unfinished,
 };
 
 /// Where to connect or listen.
@@ -535,6 +536,7 @@ impl Net {
     }
 
     /// A connection to `at`: finished with [`Conn::finish`].
+    #[track_caller]
     pub fn connect(&self, cx: &Cx, at: &Addr) -> Result<Conn, NetError> {
         if !self.connect.allows(at) {
             return Err(error(NetOp::Connect, at, NetKind::NotAllowed));
@@ -553,6 +555,7 @@ impl Net {
 
     /// Listens on `at`: each connection made to it is [`Listener::accept`]ed. Finished with
     /// [`Listener::close`].
+    #[track_caller]
     pub fn listen(&self, cx: &Cx, at: &Addr) -> Result<Listener, NetError> {
         if !self.listen.allows(at) {
             return Err(error(NetOp::Listen, at, NetKind::NotAllowed));
@@ -562,7 +565,12 @@ impl Net {
         let tag = self.io.submit(|tag| Effect::Listen { at: address, tag });
         let listening = Listening { io: self.io.clone(), tag, open: true };
         // clone: the listener's address, for its errors; the budget shared, a refcount.
-        Ok(Listener { listening, at: at.clone(), budget: self.budget.clone() })
+        Ok(Listener {
+            listening,
+            at: at.clone(),
+            budget: self.budget.clone(),
+            unfinished: Unfinished::new("net::Listener", "close(cx)"),
+        })
     }
 }
 
@@ -575,6 +583,7 @@ pub struct Listener {
     at: Addr,
     /// The byte limit of the `Net` it came from, which its connections count against.
     budget: Option<Arc<Budget>>,
+    unfinished: Unfinished,
 }
 
 /// A listen's tag and its abandonment path.
@@ -597,6 +606,7 @@ impl Drop for Listening {
 
 impl Listener {
     /// The next connection made to it: finished with [`Conn::finish`].
+    #[track_caller]
     pub fn accept(&mut self, cx: &Cx) -> Result<Conn, NetError> {
         let listening = &mut self.listening;
         let done = cx
@@ -619,6 +629,7 @@ impl Listener {
     /// `Listener` ends.
     #[blaze::consumes]
     pub fn close(mut self, cx: &Cx) -> Result<(), NetError> {
+        self.unfinished.finished();
         let listening = &mut self.listening;
         if !listening.open {
             return Ok(());
@@ -660,6 +671,7 @@ pub struct Conn {
     peer: Addr,
     /// The byte limit of the `Net` it came from, which its sends and receives count against.
     budget: Option<Arc<Budget>>,
+    unfinished: Unfinished,
 }
 
 /// A connection's driver handle and its abandonment path.
@@ -681,8 +693,14 @@ impl Drop for Link {
 }
 
 impl Conn {
+    #[track_caller]
     fn new(io: &Io, conn: blaze_core::Conn, peer: Addr, budget: Option<Arc<Budget>>) -> Conn {
-        Conn { link: Link { io: io.clone(), conn, open: true }, peer, budget }
+        Conn {
+            link: Link { io: io.clone(), conn, open: true },
+            peer,
+            budget,
+            unfinished: Unfinished::new("net::Conn", "finish(cx)"),
+        }
     }
 
     #[blaze::nopanic]
@@ -696,6 +714,7 @@ impl Conn {
     /// [`crate::pending`]), and stay lent until it ends. Under a byte limit ([`Net::limit`])
     /// the bytes are taken from it before anything is sent; with no room for them the send
     /// never starts, and its outcome is [`NetKind::OverLimit`].
+    #[track_caller]
     pub fn write_from<'buf>(&'buf self, from: &'buf [u8]) -> Pending<'buf, Result<(), NetError>> {
         let conn = self.link.conn;
         let peer = &self.peer;
@@ -740,6 +759,7 @@ impl Conn {
     /// byte limit ([`Net::limit`]) it asks for no more than the limit has left, takes that
     /// much from it as it starts and gives back what did not come; with nothing left the
     /// receive never starts, and its outcome is [`NetKind::OverLimit`].
+    #[track_caller]
     pub fn read_into<'buf>(&'buf self, into: &'buf mut [u8]) -> Pending<'buf, Result<usize, NetError>> {
         let conn = self.link.conn;
         let peer = &self.peer;
@@ -807,6 +827,7 @@ impl Conn {
     /// driver's word that it is, or why not, op [`NetOp::Finish`]. The one way a `Conn` ends.
     #[blaze::consumes]
     pub fn finish(mut self, cx: &Cx) -> Result<(), NetError> {
+        self.unfinished.finished();
         self.link.open = false;
         let conn = self.link.conn;
         let done = self

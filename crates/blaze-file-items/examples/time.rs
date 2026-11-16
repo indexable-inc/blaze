@@ -61,4 +61,45 @@ fn main() {
             took.as_secs_f64() * 1e6 / lines as f64,
         );
     }
+    // The same work on N threads, each taking the next file from one shared counter (so big
+    // files do not unbalance a thread): what "divides by N" comes to on this machine. Every
+    // outline allocates from the global heap here, so its contention is in the number.
+    let most = std::thread::available_parallelism().map_or(1, |it| it.get());
+    let mut one = 0f64;
+    for threads in [1usize, 2, 4, 6, 8, 12, 16, 18, 24, 32, 64, 128] {
+        if threads > most {
+            break;
+        }
+        let mut best = f64::MAX;
+        let mut items = 0usize;
+        for _ in 0..3 {
+            let next = std::sync::atomic::AtomicUsize::new(0);
+            let made = std::sync::atomic::AtomicUsize::new(0);
+            let start = Instant::now();
+            std::thread::scope(|scope| {
+                for _ in 0..threads {
+                    scope.spawn(|| {
+                        let mut mine = 0usize;
+                        loop {
+                            let at = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            let Some(text) = texts.get(at) else { break };
+                            mine += outline(text, Edition::E2024, Global).items().len();
+                        }
+                        made.fetch_add(mine, std::sync::atomic::Ordering::Relaxed);
+                    });
+                }
+            });
+            best = best.min(start.elapsed().as_secs_f64());
+            items = made.load(std::sync::atomic::Ordering::Relaxed);
+        }
+        if threads == 1 {
+            one = best;
+        }
+        println!(
+            "threads {threads}: {:.1} ms best of 3, {items} items, {:.2}x of one thread, {:.0}% of ideal",
+            best * 1e3,
+            one / best,
+            100.0 * one / best / threads as f64,
+        );
+    }
 }

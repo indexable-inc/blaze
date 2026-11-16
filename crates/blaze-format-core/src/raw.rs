@@ -11,7 +11,7 @@
 use core::mem::{align_of, size_of, size_of_val};
 
 use crate::declared::{ByteEnum, FromByte, Layout};
-use crate::{FormatError, Record, Rel, Slice};
+use crate::{FormatError, Offset, Record, Rel, Slice, Text};
 
 /// A type every bit pattern of whose size is a value, viewed in place without a check of its
 /// own: a [`Rel`] or a [`Slice`] (an `i32`, a `u32` and a zero-sized marker), whose targets
@@ -22,10 +22,14 @@ use crate::{FormatError, Record, Rel, Slice};
 /// Every `size_of::<Self>()` bytes at `align_of::<Self>()` are a valid `Self`.
 pub(crate) unsafe trait AnyBits: Sized {}
 
-// SAFETY: `#[repr(C)]` of an `i32` and a `PhantomData`: every 4 bytes are one.
-unsafe impl<T> AnyBits for Rel<T> {}
-// SAFETY: `#[repr(C)]` of an `i32`, a `u32` and a `PhantomData`: every 8 bytes are one.
-unsafe impl<T> AnyBits for Slice<T> {}
+// SAFETY: `#[repr(C)]` of an `O` (an `i8`, `i16` or `i32`) and a `PhantomData`: every
+// `size_of::<O>()` bytes are one.
+unsafe impl<T, O: Offset> AnyBits for Rel<T, O> {}
+// SAFETY: `#[repr(C)]` of an `O`, an `O::Len` (the unsigned integer of `O`'s width, so no
+// padding) and a `PhantomData`: every `2 * size_of::<O>()` bytes are one.
+unsafe impl<T, O: Offset> AnyBits for Slice<T, O> {}
+// SAFETY: `#[repr(transparent)]` over a `Slice<u8, O>`, which any bits are.
+unsafe impl<O: Offset> AnyBits for Text<O> {}
 
 fn offset_in(bytes: &[u8], buffer: &[u8]) -> u64 {
     (bytes.as_ptr() as usize).wrapping_sub(buffer.as_ptr() as usize) as u64

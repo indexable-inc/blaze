@@ -45,9 +45,32 @@ pub struct Profile {
     /// (blaze-cas `report().sealed` / `.checked`, store-next.md): the caller's to fill.
     pub segments_sealed: u32,
     pub segments_checked: u32,
+    /// Scheduling (drive.md, "Scheduling on many cores"): tasks emitted, batches answered,
+    /// coordinator steps, re-entries a worker made in place from the settled table.
+    pub tasks: u32,
+    pub batches: u32,
+    pub steps: u32,
+    pub in_place: u32,
+    /// Jobs by how many times they were entered when they settled: 0, 1, 2, 3, 4, 5-8, 9-16,
+    /// more. A cold body's expected count is 1 or 2 (drive.md); a warm one's 1.
+    pub entries_hist: [u32; 8],
+    /// The caller's: nanoseconds the coordinator spent in `step`, and workers spent idle.
+    pub coordinator_ns: u64,
+    pub idle_ns: u64,
 }
 
 impl Profile {
+    /// A job settled after `entries` entries.
+    pub fn entries_seen(&mut self, entries: u32) {
+        let bucket = match entries {
+            0..=4 => entries as usize,
+            5..=8 => 5,
+            9..=16 => 6,
+            _ => 7,
+        };
+        self.entries_hist[bucket] += 1;
+    }
+
     pub fn of(&mut self, kind: Kind) -> &mut KindCounts {
         &mut self.kinds[kind.index()]
     }
@@ -99,6 +122,17 @@ impl fmt::Display for Profile {
             self.tests_reused,
             self.segments_sealed,
             self.segments_checked,
+        )?;
+        writeln!(
+            f,
+            "schedule     tasks {} batches {} steps {} in place {} coordinator {:.3} ms idle {:.3} ms; entries 0|1|2|3|4|5-8|9-16|more {:?}",
+            self.tasks,
+            self.batches,
+            self.steps,
+            self.in_place,
+            self.coordinator_ns as f64 / 1e6,
+            self.idle_ns as f64 / 1e6,
+            self.entries_hist,
         )
     }
 }

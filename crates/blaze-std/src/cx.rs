@@ -226,12 +226,14 @@ impl Cx {
     /// [`Scope::join`] it, which returns once each has ended, with the first that failed. A
     /// task may borrow from the frame that holds the scope. The scope is linear: leaving it
     /// unjoined is a compile error (docs/v2/plan/design/std.md, "Tasks and waiting").
+    #[track_caller]
     pub fn scope(&self) -> Scope<'_> {
         Scope::new(self.scoped())
     }
 
     /// `body` run with a scope of tasks inside this one, which is then joined: its result,
     /// or the first of its tasks that failed. The convenience over [`Cx::scope`].
+    #[track_caller]
     pub fn scope_with<'p, R>(&'p self, body: impl FnOnce(&Scope<'p>) -> R) -> Result<R, TaskError> {
         let scope = self.scope();
         let made = body(&scope);

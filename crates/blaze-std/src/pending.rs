@@ -32,6 +32,7 @@ use crate::{
     cx::Cx,
     io::{Ends, Io},
     trace::RecordKind,
+    unfinished::Unfinished,
 };
 
 /// What a `Pending` makes of its op's end: its outcome, given the lent buffer and the
@@ -50,6 +51,7 @@ pub struct Pending<'buf, T> {
     from: PhantomData<&'buf [u8]>,
     finish: Finish<'buf, T>,
     settle: Settle,
+    unfinished: Unfinished,
 }
 
 /// The op's tag and its abandonment path.
@@ -79,6 +81,7 @@ impl Drop for Settle {
 }
 
 /// `effect` handed to the driver now, its outcome made by `finish` once it ends.
+#[track_caller]
 pub(crate) fn start<'buf, T>(
     io: &Io,
     span: &'static str,
@@ -93,11 +96,13 @@ pub(crate) fn start<'buf, T>(
         // alloc: once per op, its outcome's maker (bounded: freed when the op is finished).
         finish: Box::new(finish),
         settle: Settle { io: io.clone(), tag: Some(tag), span, armed: true },
+        unfinished: Unfinished::new("Pending", "wait(cx) or cancel(cx, give_up)"),
     }
 }
 
 /// An op refused before it started (a write past its capability's budget): nothing is handed
 /// to the driver, and waiting for it or cancelling it gives `outcome` at once.
+#[track_caller]
 pub(crate) fn refused<'buf, T: 'buf>(io: &Io, span: &'static str, outcome: T) -> Pending<'buf, T> {
     Pending {
         into: &mut [],
@@ -105,6 +110,7 @@ pub(crate) fn refused<'buf, T: 'buf>(io: &Io, span: &'static str, outcome: T) ->
         // alloc: once per op, its outcome's holder (freed when the op is finished).
         finish: Box::new(move |_: &mut [u8], _| outcome),
         settle: Settle { io: io.clone(), tag: None, span, armed: true },
+        unfinished: Unfinished::new("Pending", "wait(cx) or cancel(cx, give_up)"),
     }
 }
 
@@ -114,7 +120,8 @@ impl<T> Pending<'_, T> {
     /// does, so nothing it does lands later).
     #[blaze::consumes]
     pub fn wait(self, cx: &Cx) -> T {
-        let Pending { into, from: _, finish, mut settle } = self;
+        let Pending { into, from: _, finish, mut settle, unfinished } = self;
+        unfinished.finished();
         settle.armed = false;
         let done = match settle.tag {
             Some(tag) => cx.wait(&settle.io, tag, Ends::Once),
@@ -132,7 +139,8 @@ impl<T> Pending<'_, T> {
     /// so). `cx` names the span the wait is recorded in.
     #[blaze::consumes]
     pub fn cancel(self, cx: &Cx, give_up: Deadline) -> T {
-        let Pending { into, from: _, finish, mut settle } = self;
+        let Pending { into, from: _, finish, mut settle, unfinished } = self;
+        unfinished.finished();
         settle.armed = false;
         let Some(tag) = settle.tag else {
             // Refused before it started: nothing is in flight to wait for.

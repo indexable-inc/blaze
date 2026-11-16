@@ -39,6 +39,8 @@ pub mod record;
 pub mod request;
 pub mod run;
 pub mod scope_task;
+pub mod settled;
+pub mod worker;
 mod wire;
 
 #[cfg(test)]
@@ -47,9 +49,10 @@ mod sim;
 pub use crate::key::{Key, Kind, Name, Tool};
 pub use crate::record::{Finding, Locate, Part};
 pub use crate::request::{
-    Answer, Ask, Builder, Class, Command, Config, DriveError, Effect, Event, FileEntry, Input,
-    Output, Print, Ran, Request, Task, TaskFailure, Ticket, Want,
+    Answer, Ask, Batch, BatchId, Builder, Class, Command, Config, DriveError, Effect, Event, FileEntry, Input,
+    Outcome, Output, Print, Ran, Request, Task, TaskFailure, Ticket, Want,
 };
+pub use crate::settled::{Settled, TableFull};
 pub use crate::wire::{WireError, WireWhy};
 
 /// A bug the simulation plants to show its oracle catches it (`blaze_sim::control`). Always
@@ -62,4 +65,9 @@ pub enum Plant {
     SkipChangedRead,
     /// A want of a name whose task is running starts a second run of the same key.
     DoubleFlight,
+    /// A batch's records are applied a second time, past the ticket check.
+    BatchTwice,
+    /// A settled row is published to the workers' table ahead of its record's `Put`: a worker
+    /// can answer a need before the record is written.
+    PublishBeforePut,
 }

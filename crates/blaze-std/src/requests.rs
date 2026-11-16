@@ -40,6 +40,7 @@ use crate::{
     narrow::Allowed,
     net::{Addr, Conn, Net, NetError},
     roots::Roots,
+    unfinished::Unfinished,
     url::{Origin, Url},
 };
 
@@ -330,6 +331,7 @@ impl Http {
     }
 
     /// `request` sent: its answer is read with [`Exchange::finish`].
+    #[track_caller]
     pub fn begin<'a>(&self, cx: &Cx, request: &Request<'a>) -> Result<Exchange<'a>, HttpError> {
         // clone: an error's name of its URL, refcounts.
         let refuse = |kind| HttpError { op: HttpOp::Begin, url: request.url.clone(), kind };
@@ -343,9 +345,9 @@ impl Http {
         }
         let (net, wire) = match &self.provider {
             // clone: the handler, a refcount.
-            Provider::Handler(handler) => return Ok(Exchange { request: *request, state: State::Handler(Arc::clone(handler)) }),
+            Provider::Handler(handler) => return Ok(Exchange::made(*request, State::Handler(Arc::clone(handler)))),
             // clone: the world, a refcount.
-            Provider::Host(io) => return Ok(Exchange { request: *request, state: State::Host(io.clone()) }),
+            Provider::Host(io) => return Ok(Exchange::made(*request, State::Host(io.clone()))),
             Provider::Over { net, wire, .. } => (net, *wire),
         };
         if origin.scheme().as_str() == "https" {
@@ -372,7 +374,7 @@ impl Http {
             Err(error) => return Err(refuse(HttpKind::Net(error))),
         };
         match conn.send_all(cx, &sent) {
-            Ok(()) => Ok(Exchange { request: *request, state: State::Wire(conn, wire) }),
+            Ok(()) => Ok(Exchange::made(*request, State::Wire(conn, wire))),
             Err(error) => {
                 // The send's failure is the one told; the hangup's would say less.
                 let _ = conn.finish(cx);
@@ -409,6 +411,7 @@ impl fmt::Debug for Http {
 pub struct Exchange<'a> {
     request: Request<'a>,
     state: State,
+    unfinished: Unfinished,
 }
 
 /// Where a request's answer comes from.
@@ -419,12 +422,19 @@ enum State {
     Wire(Conn, Wire),
 }
 
-impl Exchange<'_> {
+impl<'a> Exchange<'a> {
+    /// The request in flight, made where [`Http::begin`] was called.
+    #[track_caller]
+    fn made(request: Request<'a>, state: State) -> Exchange<'a> {
+        Exchange { request, state, unfinished: Unfinished::new("requests::Exchange", "finish(cx, into)") }
+    }
+
     /// The answer: its body added to `into` and its status. On an error `into` is as it was.
     /// A connection it was sent on is closed either way. The one way an `Exchange` ends.
     #[blaze::consumes]
     pub fn finish(self, cx: &Cx, into: &mut Bytes<'_>) -> Result<Response, HttpError> {
-        let Exchange { request, state } = self;
+        let Exchange { request, state, unfinished } = self;
+        unfinished.finished();
         let start = into.len();
         let answered = match state {
             State::Handler(handler) => handler(cx, &request, into).map_err(HttpKind::Stopped),

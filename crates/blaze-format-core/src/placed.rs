@@ -2,7 +2,7 @@
 
 use core::mem::{align_of, size_of};
 
-use crate::{Record, Slice, WriteBuffer, Writer, WriterIn};
+use crate::{Offset, Record, Slice, Unfit, WriteBuffer, Writer, WriterIn};
 
 /// Where a column was written: nowhere when it is empty.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -44,10 +44,18 @@ impl Placed {
         Placed { at, len }
     }
 
-    /// The slice of this column for a field that is written at `field_at`.
+    /// The slice of this column for a field that is written at `field_at`, after it: an `i32`
+    /// offset, which reaches across any buffer under 2 GiB. Panics past that, or when the field
+    /// is not after the column; a narrow slice is made by [`Placed::slice_as`].
     pub fn slice<T>(self, field_at: u64) -> Slice<T> {
+        self.slice_as(field_at).unwrap_or_else(|unfit| panic!("{unfit}"))
+    }
+
+    /// [`Placed::slice`] with an offset of `O`, refused when the column is too far back or too
+    /// long for it.
+    pub fn slice_as<T, O: Offset>(self, field_at: u64) -> Result<Slice<T, O>, Unfit> {
         match self.len {
-            0 => Slice::EMPTY,
+            0 => Ok(Slice::EMPTY),
             len => Slice::between(field_at, self.at, len),
         }
     }

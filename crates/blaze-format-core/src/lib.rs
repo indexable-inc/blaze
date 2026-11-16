@@ -51,10 +51,15 @@ extern crate alloc;
 extern crate std;
 
 pub mod declared;
+mod offset;
 mod placed;
+mod planted;
 mod raw;
 mod schema;
+mod verified;
 mod writer;
+#[cfg(test)]
+mod verified_tests;
 
 use core::{
     alloc::Allocator,
@@ -65,7 +70,9 @@ use core::{
 
 use blaze_ids::{ContentId, Fingerprint};
 
+pub use crate::offset::{Offset, Unfit};
 pub use crate::placed::Placed;
+pub use crate::verified::{Items, Text, Verified};
 pub use crate::schema::{Part, SCHEMA_DOMAIN, schema, schema_of};
 pub use crate::writer::{Own, WriteBuffer, Writer, WriterIn};
 #[cfg(feature = "alloc")]
@@ -443,63 +450,79 @@ impl<T: Record, O: Offset> Slice<T, O> {
 
     /// [`Slice::follow`], each `T` checked with all it reaches when `DEEP`: [`Record::check`].
     fn follow_as<'a, const DEEP: bool>(&'a self, buffer: &'a [u8]) -> Result<&'a [T], FormatError> {
-        if self.len == 0 {
+        if self.is_empty() {
             return Ok(&[]);
         }
         let at = position(self, buffer)?;
-        let target = target::<T>(at, self.offset, self.len, buffer)?;
-        let len = self.len as usize;
+        let count = O::count(self.len);
+        let target = target::<T>(at, self.offset.distance(), count, buffer)?;
+        let len = count as usize;
         raw::view_slice::<T, DEEP>(&buffer[target..target + size_of::<T>() * len], len, buffer)
     }
 }
 
-impl Slice<u8> {
+impl<O: Offset> Slice<u8, O> {
     /// The text this points at, refused when it is not UTF-8.
     pub fn as_str<'a>(&'a self, buffer: &'a [u8]) -> Result<&'a str, FormatError> {
         let bytes = self.follow(buffer)?;
-        core::str::from_utf8(bytes).map_err(|_| FormatError::Invalid {
-            at: (bytes.as_ptr() as usize).wrapping_sub(buffer.as_ptr() as usize) as u64,
-            what: "text that is not UTF-8",
-        })
+        utf8(bytes, buffer)
     }
 }
 
-// SAFETY: an `i32` and a zero-sized marker: every bit pattern is a `Rel`; `check` follows it
-// and checks the `T` it reaches.
-unsafe impl<T: Record> Record for Rel<T> {
-    const SCHEMA: SchemaHash = schema_of(&[Part::Str("Rel"), Part::Schema(T::SCHEMA)]);
+/// `bytes`, a part of `buffer`, as text, refused when it is not UTF-8.
+fn utf8<'a>(bytes: &'a [u8], buffer: &[u8]) -> Result<&'a str, FormatError> {
+    core::str::from_utf8(bytes).map_err(|_| FormatError::Invalid {
+        at: (bytes.as_ptr() as usize).wrapping_sub(buffer.as_ptr() as usize) as u64,
+        what: "text that is not UTF-8",
+    })
+}
+
+/// The schema of a reference named `name` to `of`: the default width adds no part, so a
+/// record of `i32` references keeps the hash it had before widths existed; another width adds
+/// its name.
+const fn reference_schema<O: Offset>(name: &str, of: SchemaHash) -> SchemaHash {
+    match O::WIDE {
+        true => schema_of(&[Part::Str(name), Part::Schema(of)]),
+        false => schema_of(&[Part::Str(name), Part::Str(O::NAME), Part::Schema(of)]),
+    }
+}
+
+// SAFETY: an `O` (an integer) and a zero-sized marker: every bit pattern is a `Rel`; `check`
+// follows it and checks the `T` it reaches.
+unsafe impl<T: Record, O: Offset> Record for Rel<T, O> {
+    const SCHEMA: SchemaHash = reference_schema::<O>("Rel", T::SCHEMA);
     const SHALLOW_PLAIN: bool = true;
     fn check(bytes: &[u8], buffer: &[u8]) -> Result<(), FormatError> {
-        raw::in_place::<Rel<T>>(bytes, buffer)?.follow_as::<true>(buffer).map(|_| ())
+        raw::in_place::<Rel<T, O>>(bytes, buffer)?.follow_as::<true>(buffer).map(|_| ())
     }
     fn check_shallow(bytes: &[u8], buffer: &[u8]) -> Result<(), FormatError> {
-        raw::in_place::<Rel<T>>(bytes, buffer).map(|_| ())
+        raw::in_place::<Rel<T, O>>(bytes, buffer).map(|_| ())
     }
     const COLUMNS: bool = !T::PLAIN;
-    fn columns<O: WordTables + ?Sized>(bytes: &[u8], buffer: &[u8], out: &mut O) {
-        let rel = raw::in_place::<Rel<T>>(bytes, buffer).expect("a checked Rel");
+    fn columns<W: WordTables + ?Sized>(bytes: &[u8], buffer: &[u8], out: &mut W) {
+        let rel = raw::in_place::<Rel<T, O>>(bytes, buffer).expect("a checked Rel");
         if let Some(target) = rel.get(buffer) {
             T::columns(bytes_of(target), buffer, out);
         }
     }
 }
 
-// SAFETY: an `i32`, a `u32` and a zero-sized marker: every bit pattern is a `Slice`; `check`
-// follows it and checks each `T` it reaches.
-unsafe impl<T: Record> Record for Slice<T> {
-    const SCHEMA: SchemaHash = schema_of(&[Part::Str("Slice"), Part::Schema(T::SCHEMA)]);
+// SAFETY: an `O` and an `O::Len` (integers of one width, so no padding) and a zero-sized
+// marker: every bit pattern is a `Slice`; `check` follows it and checks each `T` it reaches.
+unsafe impl<T: Record, O: Offset> Record for Slice<T, O> {
+    const SCHEMA: SchemaHash = reference_schema::<O>("Slice", T::SCHEMA);
     const SHALLOW_PLAIN: bool = true;
     fn check(bytes: &[u8], buffer: &[u8]) -> Result<(), FormatError> {
-        raw::in_place::<Slice<T>>(bytes, buffer)?.follow_as::<true>(buffer).map(|_| ())
+        raw::in_place::<Slice<T, O>>(bytes, buffer)?.follow_as::<true>(buffer).map(|_| ())
     }
     fn check_shallow(bytes: &[u8], buffer: &[u8]) -> Result<(), FormatError> {
-        raw::in_place::<Slice<T>>(bytes, buffer).map(|_| ())
+        raw::in_place::<Slice<T, O>>(bytes, buffer).map(|_| ())
     }
     // `!T::PLAIN`, not `T::COLUMNS`: a record may hold slices of itself, and `PLAIN` never
     // refers back to the type.
     const COLUMNS: bool = row_words::<T>() > 0 || !T::PLAIN;
-    fn columns<O: WordTables + ?Sized>(bytes: &[u8], buffer: &[u8], out: &mut O) {
-        let slice = raw::in_place::<Slice<T>>(bytes, buffer).expect("a checked Slice");
+    fn columns<W: WordTables + ?Sized>(bytes: &[u8], buffer: &[u8], out: &mut W) {
+        let slice = raw::in_place::<Slice<T, O>>(bytes, buffer).expect("a checked Slice");
         let items = slice.get(buffer);
         if row_words::<T>() > 0 && !items.is_empty() {
             let at = (items.as_ptr() as usize).wrapping_sub(buffer.as_ptr() as usize);
@@ -569,14 +592,14 @@ pub fn header(buffer: &[u8]) -> Result<Header, FormatError> {
 }
 
 /// The root `T` of `buffer`, after checking its header, its schema and every record reached
-/// from the root.
-pub fn open<T: Record>(buffer: &[u8]) -> Result<&T, FormatError> {
+/// from the root: a [`Verified`], whose reads check nothing again. It derefs to the `T`.
+pub fn open<T: Record>(buffer: &[u8]) -> Result<&Verified<T>, FormatError> {
     open_as::<T>(buffer, T::SCHEMA)
 }
 
 /// The root `R` of a buffer of schema `schema`, checked as [`open`] checks: what a
 /// `Persist::read` opens its buffer with, the buffer's schema being the `Persist` type's.
-pub fn open_as<R: Record>(buffer: &[u8], schema: SchemaHash) -> Result<&R, FormatError> {
+pub fn open_as<R: Record>(buffer: &[u8], schema: SchemaHash) -> Result<&Verified<R>, FormatError> {
     let header = header(buffer)?;
     if header.schema != schema {
         return Err(FormatError::Schema { found: header.schema, wanted: schema });
@@ -585,9 +608,10 @@ pub fn open_as<R: Record>(buffer: &[u8], schema: SchemaHash) -> Result<&R, Forma
 }
 
 /// The `R` at `at` in `buffer`, checked: past the header, inside the buffer, aligned for `R`,
-/// and accepted by [`Record::check`]. A record found by an offset of the caller's (a table
-/// placed beside the root); [`open_as`] reads the root with it.
-pub fn record_at<R: Record>(buffer: &[u8], at: u64) -> Result<&R, FormatError> {
+/// and accepted by [`Record::check`], which follows every reference it reaches. A record found
+/// by an offset of the caller's (a table placed beside the root); [`open_as`] reads the root
+/// with it. The one place a [`Verified`] is made from bytes.
+pub fn record_at<R: Record>(buffer: &[u8], at: u64) -> Result<&Verified<R>, FormatError> {
     let bad = || FormatError::OutOfBounds { at };
     let start = usize::try_from(at).map_err(|_| bad())?;
     let end = start
@@ -597,7 +621,13 @@ pub fn record_at<R: Record>(buffer: &[u8], at: u64) -> Result<&R, FormatError> {
     if !(buffer.as_ptr() as usize).wrapping_add(start).is_multiple_of(align_of::<R>()) {
         return Err(bad());
     }
-    raw::view::<R, true>(&buffer[start..end], buffer)
+    raw::view::<R, true>(&buffer[start..end], buffer)?;
+    // SAFETY: `Verified`'s invariant, for the buffer's bytes up to the `R`'s end: they start at
+    // the start of `buffer`, the `R` is their last `size_of::<R>()` bytes, aligned for it
+    // (checked above), and `R::check` (the deep one, `view::<R, true>`) accepted it against
+    // `buffer` with every reference it reaches, each target before its field and so inside
+    // these bytes.
+    Ok(unsafe { Verified::assume(&buffer[..end]) })
 }
 
 /// The domain of a buffer's content ID ([`buffer_id`]).
@@ -617,7 +647,7 @@ pub fn open_verified<R: Record>(
     buffer: &[u8],
     schema: SchemaHash,
     key: ContentId,
-) -> Result<&R, FormatError> {
+) -> Result<&Verified<R>, FormatError> {
     verify(buffer, key)?;
     open_as::<R>(buffer, schema)
 }

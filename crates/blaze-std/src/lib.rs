@@ -248,6 +248,8 @@ pub mod task;
 /// The terminal as a device: `Term`, its size, raw mode, styled text and keys.
 pub mod term;
 pub mod trace;
+/// The rustc debug build's check that a must-finish value was finished, not dropped.
+pub(crate) mod unfinished;
 pub mod video;
 /// Addresses as types: `Scheme`, `Origin`, `Url`.
 pub mod url;
@@ -486,15 +488,6 @@ impl fmt::Display for Stopped {
 }
 
 impl core::error::Error for Stopped {}
-
-/// Consumes a linear value that has no fields left to move out (a fieldless marker such as
-/// [`fs::ReadWrite`]): the one way such a value ends, besides its type's own consuming calls.
-#[blaze::consumes]
-#[blaze::pure]
-#[blaze::nopanic]
-#[blaze::noalloc]
-#[blaze::nonblocking]
-pub(crate) fn consume<#[blaze::linear] T>(_: T) {}
 
 /// A safeguard a test turns off to prove its oracle sees the bug (skill `testing`, planted-bug
 /// controls). Always [`Plant::None`] outside this crate's tests: only their constructor

@@ -32,6 +32,7 @@ use crate::{
     narrow::Allowed,
     net::{self, Addr, Conn, Listener, Net, NetError, NetKind, NetOp},
     path::Path,
+    unfinished::Unfinished,
 };
 
 /// What a call on an [`End`] was.
@@ -97,6 +98,7 @@ struct Link {
 #[must_use = "an end of a local pair is finished with finish(cx)"]
 pub struct End {
     half: Half,
+    unfinished: Unfinished,
 }
 
 /// An end's share of the pair and its abandonment path.
@@ -146,6 +148,7 @@ pub struct Pair {
 /// capacity of zero cannot be asked for (it was once raised to one unsaid). The two buffers
 /// are made in the global heap, once, here.
 #[blaze::nonblocking]
+#[track_caller]
 pub fn pair(name: &'static str, capacity: NonZero<usize>) -> Pair {
     let capacity = capacity.get();
     let pipe = |lock: &'static str| {
@@ -155,8 +158,14 @@ pub fn pair(name: &'static str, capacity: NonZero<usize>) -> Pair {
     };
     // alloc: once per pair, what its two ends share.
     let link = Arc::new(Link { name, forth: pipe("bstd.local.forth"), back: pipe("bstd.local.back") });
-    let first = End { half: Half { link: Arc::clone(&link), first: true, open: true } };
-    let second = End { half: Half { link, first: false, open: true } };
+    let first = End {
+        half: Half { link: Arc::clone(&link), first: true, open: true },
+        unfinished: Unfinished::new("local::End", "finish(cx)"),
+    };
+    let second = End {
+        half: Half { link, first: false, open: true },
+        unfinished: Unfinished::new("local::End", "finish(cx)"),
+    };
     Pair { first, second }
 }
 
@@ -241,6 +250,7 @@ impl End {
     /// nothing. The one way an `End` ends.
     #[blaze::consumes]
     pub fn finish(mut self, cx: &Cx) {
+        self.unfinished.finished();
         cx.event("bstd::local: an end finished");
         self.half.close();
     }
@@ -287,6 +297,7 @@ impl Local {
     }
 
     /// A connection to the socket at `path`: finished with [`Conn::finish`].
+    #[track_caller]
     pub fn connect(&self, cx: &Cx, path: &Path) -> Result<Conn, NetError> {
         let (addr, net) = self.socket(path);
         if !self.allowed.allows(path) {
@@ -296,6 +307,7 @@ impl Local {
     }
 
     /// Listens on the socket at `path`, making it: finished with [`Listener::close`].
+    #[track_caller]
     pub fn listen(&self, cx: &Cx, path: &Path) -> Result<Listener, NetError> {
         let (addr, net) = self.socket(path);
         if !self.listens || !self.allowed.allows(path) {

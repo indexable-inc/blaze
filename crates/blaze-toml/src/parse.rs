@@ -808,7 +808,7 @@ impl<'t, A: Allocator> Parser<'t, '_, A> {
                 return Ok((Kind::Float, value.to_bits()));
             }
         }
-        if sign.is_none() && self.b[i] == b'0' {
+        if sign.is_none() && self.b.get(i) == Some(&b'0') {
             let radix = match self.b.get(i + 1) {
                 Some(b'x') => 16,
                 Some(b'o') => 8,
